@@ -892,6 +892,25 @@ pub(crate) fn latched_multi_frame_names() -> Vec<String> {
     })
 }
 
+/// Origin and `(jitcode name, pc)` of each latched multi-frame level, for
+/// comparing the slot before and after a carrier abort tail.
+#[cfg(test)]
+pub(crate) fn latched_multi_frame_view() -> Option<(&'static str, Vec<(String, usize)>)> {
+    FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
+        slot.borrow().as_ref().map(|latched| {
+            (
+                latched.origin,
+                latched
+                    .framestack
+                    .frames
+                    .iter()
+                    .map(|frame| (frame.jitcode.name().to_string(), frame.pc))
+                    .collect(),
+            )
+        })
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn stage_test_helper_abort_image_at(
     jitcode: std::sync::Arc<majit_metainterp::jitcode::JitCode>,
@@ -3134,6 +3153,38 @@ enum InnermostMiframeBuild {
     TraceTooLong,
 }
 
+/// The innermost frame is the callee `ctx` is actively sub-walking. In a
+/// sub-walk its identity lives in `inline_callee_consts` — the copied
+/// `snapshot_sym` still points at the outer portal, so resolving off it
+/// pins the OUTER jitcode while `resume_pc` and the concrete banks are the
+/// callee's, landing the resume mid-op in the wrong code. Resolve the
+/// callee's own jitcode so all three share its coordinate space; fall back
+/// to `snapshot_sym` for a top-level (non-sub-walk) abort. A translated
+/// helper is its own `MIFrame` (`pyjitpl.py` `_interpret` /
+/// `blackhole.py` `convert_and_run_from_pyjitpl`): use that helper's
+/// jitcode, not the enclosing Python one.
+pub(crate) fn innermost_walk_jitcode<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
+    if ctx.fbw_mode.transparent_helper_subwalk {
+        helper_jitcode_arc(ctx.fbw_mode.transparent_helper_jitcode_index?)
+    } else if let Some(consts) = ctx.inline_callee_consts {
+        crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)
+            .map(|pjc| pjc.jitcode.clone())
+    } else if !ctx.fbw_mode.snapshot_sym.is_null() {
+        unsafe {
+            let jitcode = (*ctx.fbw_mode.snapshot_sym).jitcode();
+            if jitcode.is_null() {
+                None
+            } else {
+                Some((&(*jitcode).payload).jitcode.clone())
+            }
+        }
+    } else {
+        None
+    }
+}
+
 fn build_multi_frame_miframe<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     resume_pc: usize,
@@ -3199,44 +3250,9 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
         drop(session);
     }
 
-    // The innermost frame is the callee `ctx` is actively sub-walking. In a
-    // sub-walk its identity lives in `inline_callee_consts` — the copied
-    // `snapshot_sym` still points at the outer portal, so resolving off it
-    // pins the OUTER jitcode while `resume_pc` and the concrete banks are the
-    // callee's, landing the resume mid-op in the wrong code. Resolve the
-    // callee's own jitcode so all three share its coordinate space; fall back
-    // to `snapshot_sym` for a top-level (non-sub-walk) abort. A translated
-    // helper is its own `MIFrame` (`pyjitpl.py` `_interpret` /
-    // `blackhole.py` `convert_and_run_from_pyjitpl`): use that helper's
-    // jitcode, not the enclosing Python one.
-    let innermost_jitcode = if ctx.fbw_mode.transparent_helper_subwalk {
-        let Some(index) = ctx.fbw_mode.transparent_helper_jitcode_index else {
-            s2dbg!("origin={origin} innermost: helper has no jitcode index");
-            return None;
-        };
-        let Some(jc) = helper_jitcode_arc(index) else {
-            s2dbg!("origin={origin} innermost: helper jitcode {index} unresolved");
-            return None;
-        };
-        jc
-    } else if let Some(consts) = ctx.inline_callee_consts {
-        let Some(jc) = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index) else {
-            s2dbg!(
-                "origin={origin} innermost: no pyjitcode for callee jitcode_index={}",
-                consts.jitcode_index
-            );
-            return None;
-        };
-        jc.jitcode.clone()
-    } else {
-        unsafe {
-            let sym = &*ctx.fbw_mode.snapshot_sym;
-            if sym.jitcode().is_null() {
-                s2dbg!("origin={origin} innermost snapshot_sym jitcode null");
-                return None;
-            }
-            (&(*sym.jitcode()).payload).jitcode.clone()
-        }
+    let Some(innermost_jitcode) = innermost_walk_jitcode(ctx) else {
+        s2dbg!("origin={origin} innermost jitcode unresolved");
+        return None;
     };
     let innermost = match innermost_build {
         InnermostMiframeBuild::LiveMarker(lastop_result) => {

@@ -663,9 +663,9 @@ fn ref_copy_without_box(value: OpRef, live: Value) -> bool {
     value.is_none() && matches!(live, Value::Ref(_))
 }
 
-/// `_opimpl_setarrayitem_vable` stores `valuebox`; `write_box_at` unwraps
-/// `getint` / `getref_base` / `getfloatstorage`. `Void` and
-/// `Ref(NO_CONCRETE)` are not a stored box value.
+/// `_opimpl_setfield_vable` / `_opimpl_setarrayitem_vable` store `valuebox`;
+/// `write_box_at` unwraps `getint` / `getref_base` / `getfloatstorage`.
+/// `Void` and `Ref(NO_CONCRETE)` are not a stored box value.
 pub(crate) fn vable_store_concrete_is_reconstructable(live: Value) -> bool {
     match live {
         Value::Int(_) | Value::Float(_) => true,
@@ -1144,27 +1144,44 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
         _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
     };
     let descr = read_descr(code, op, 2, ctx)?;
-    let concrete = vable_value_concrete(code, op, 1, ctx, value_bank, value);
+    let captured = vable_value_concrete(code, op, 1, ctx, value_bank, value).unwrap_or(Value::Void);
     let inline_field_index = ctx
         .trace_ctx
         .virtualizable_info()
         .and_then(|info| info.static_field_by_descr(&descr));
-    // R7 parity: pyjitpl.py `_opimpl_setfield_vable(box,
-    // valuebox, fielddescr, pc)` threads orgpc through
-    // `_nonstandard_virtualizable(pc, ...)`; walker has `op.pc` for the
-    // JitCode PC, pass through.
-    let write = with_replace_frames(ctx, |ctx| {
-        let nonstandard = walker_nonstandard_virtualizable(ctx, op.pc, obj, &descr)?;
-        Ok(ctx
-            .trace_ctx
-            .vable_setfield_checked(nonstandard, obj, descr.clone(), value, concrete))
+    // `_opimpl_setfield_vable` (`pyjitpl.py`) takes
+    // `_nonstandard_virtualizable` first. The standard arm assigns
+    // `virtualizable_boxes[index] = valuebox` then
+    // `synchronize_virtualizable_at` → `write_box_at`. pyre also writes
+    // Int statics of the walk's own frame through
+    // `mirror_vable_static_int` when `own_frame_vable_store_target` hits.
+    // A nonstandard store records `setfield_gc` only
+    // (`vable_setfield_checked`); that arm does not unwrap the box.
+    //
+    // `walker_nonstandard_virtualizable` records `PTR_EQ` /
+    // `GUARD_VALUE` on the PendingEq path (`begin_nonstandard_virtualizable`
+    // + `walker_implement_guard_value`). Refuse a reconstructable-concrete
+    // hole after that decision, only on the standard arm, before
+    // `vable_setfield_checked` writes the shadow.
+    let nonstandard = with_replace_frames(ctx, |ctx| {
+        walker_nonstandard_virtualizable(ctx, op.pc, obj, &descr)
     })?;
+    if !nonstandard && let Some(err) = vable_store_unreconstructable(op.pc, value, captured) {
+        return Err(err);
+    }
+    // Standard: `captured` is a reconstructable `write_box_at` payload.
+    // Nonstandard ignores it (`_opimpl_setfield_gc_any`) and records
+    // `setfield_gc` only — pass the captured word rather than inventing a
+    // stamp for the standard store.
+    let write =
+        ctx.trace_ctx
+            .vable_setfield_checked(nonstandard, obj, descr.clone(), value, captured);
     // `_opimpl_setfield_vable` + `synchronize_virtualizable_at` write the
     // virtualizable the metainterp executes (`write_box_at`). This walk
     // mirrors that onto the frame [`own_frame_vable_store_target`] names;
     // an outer/nonstandard virtualizable is not this walk's frame.
-    if let (Some(Value::Int(value)), Some(field_index)) = (concrete, inline_field_index) {
-        mirror_vable_static_int(ctx, obj, field_index, value);
+    if let (Value::Int(int_value), Some(field_index)) = (captured, inline_field_index) {
+        mirror_vable_static_int(ctx, obj, field_index, int_value);
     }
     let _ = write;
     Ok((DispatchOutcome::Continue, op.next_pc))
@@ -1206,7 +1223,7 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
         return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
     }
     let descr = read_descr(code, op, 3, ctx)?;
-    let concrete = Some(Value::Int(imm));
+    let concrete = Value::Int(imm);
     let inline_field_index = ctx
         .trace_ctx
         .virtualizable_info()
@@ -1738,9 +1755,9 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     let encoded_captured =
         vable_value_concrete(code, op, 2, ctx, value_bank, encoded_value).unwrap_or(Value::Void);
     let mut store_root = VableStoreRoot::capture(encoded_captured);
-    // TOS recovery runs after `walker_promote_vable_array_index`. Pin that
-    // box's concrete now; recapturing the stamp after the promote is a
-    // from-space copy (`fwd=false free=true`).
+    // Pin a TOS-recovered box's concrete now; recapturing the stamp after
+    // `walker_promote_vable_array_index` is a from-space copy
+    // (`fwd=false free=true`).
     if encoded_value.is_none()
         && value_bank == 'r'
         && ctx.vstack_valid
@@ -1755,17 +1772,6 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
             store_root.recapture(tos_c);
         }
     }
-    let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 3, 5, ctx)?;
-    // As in the read path, only the standard virtualizable leg promotes the
-    // array index and needs the full walker-owned resume snapshot.
-    let nonstandard = with_replace_frames(ctx, |ctx| {
-        walker_nonstandard_virtualizable(ctx, op.pc, vable, &fdescr)
-    })?;
-    let index = if nonstandard {
-        index
-    } else {
-        walker_promote_vable_array_index(ctx, op.pc, index, index_value)?
-    };
     let mut value = encoded_value;
     // A STORE_FAST (`index < nlocals`) pops the operand-stack TOS and writes
     // it into a local slot.  When the popped value lives in an operand-stack
@@ -1794,13 +1800,50 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     let captured =
         vable_effective_value_concrete(code, op, 2, ctx, value_bank, encoded_value, value)
             .unwrap_or(Value::Void);
-    // Pre-call word passed into the recording call. The shadow is published
-    // from a later [`VableStoreRoot::live`] read: this local is not a root.
-    let concrete = if value_bank == 'r' {
+    // Pre-call word. Reconstructability is a property of this captured
+    // concrete (`Void` / `Ref(NO_CONCRETE)` vs a stored box value) and is
+    // known before `walker_promote_vable_array_index`. `VableStoreRoot`
+    // keeps a reconstructable Ref live across that promote so the store
+    // word can move.
+    let mut concrete = if value_bank == 'r' {
         store_root.live(captured)
     } else {
         captured
     };
+    let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 3, 5, ctx)?;
+    // `_opimpl_setarrayitem_vable` (`pyjitpl.py`) takes
+    // `_nonstandard_virtualizable` first. The standard arm assigns
+    // `virtualizable_boxes[index] = valuebox` then
+    // `synchronize_virtualizable_at` → `write_box_at`. pyre also writes
+    // the walk's own frame through `store_live_frame_array_slot` when
+    // `own_frame_vable_store_target` hits. A nonstandard store with no
+    // own-frame target records `getfield_gc_r` + `setarrayitem_gc` only
+    // (`vable_setarrayitem_impl`).
+    //
+    // `walker_nonstandard_virtualizable` records `PTR_EQ` /
+    // `GUARD_VALUE` on the PendingEq path (`begin_nonstandard_virtualizable`
+    // + `walker_implement_guard_value`), so refuse a reconstructable-concrete
+    // hole before that call when the store will write the live frame.
+    let own_frame_write = index_value >= 0 && own_frame_vable_store_target(ctx, vable).is_some();
+    if own_frame_write && let Some(err) = vable_store_unreconstructable(op.pc, value, concrete) {
+        return Err(err);
+    }
+    // As in the read path, only the standard virtualizable leg promotes the
+    // array index and needs the full walker-owned resume snapshot.
+    let nonstandard = with_replace_frames(ctx, |ctx| {
+        walker_nonstandard_virtualizable(ctx, op.pc, vable, &fdescr)
+    })?;
+    if !nonstandard && let Some(err) = vable_store_unreconstructable(op.pc, value, concrete) {
+        return Err(err);
+    }
+    let index = if nonstandard {
+        index
+    } else {
+        walker_promote_vable_array_index(ctx, op.pc, index, index_value)?
+    };
+    if value_bank == 'r' {
+        concrete = store_root.live(captured);
+    }
     let is_stack_push = value_bank == 'r' && vable_store_is_stack_push(ctx, index_value);
     let _write = match ctx.trace_ctx.vable_setarrayitem_checked(
         nonstandard,
@@ -1823,13 +1866,6 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     if index_value >= 0
         && let Some(frame) = own_frame_vable_store_target(ctx, vable)
     {
-        // `_opimpl_setarrayitem_vable` / `write_box_at` never store a box
-        // without a value. Decline before `store_live_frame_array_slot`,
-        // which would accept `Ref(NO_CONCRETE)` as an array word.
-        let live = live_after_vable_store(&store_root, value_bank, concrete);
-        if let Some(err) = vable_store_unreconstructable(op.pc, value, live) {
-            return Err(err);
-        }
         if let Some(frame) = durable_resume_frame(ctx, frame) {
             fbw_arm_durable_frame_undo(frame);
             fbw_note_generator_stack_store(GeneratorStackStore {
@@ -1843,6 +1879,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         }
         // Re-read after `vable_setarrayitem_checked`. The array store may
         // itself collect, so the shadow reads the pin again below.
+        let live = live_after_vable_store(&store_root, value_bank, concrete);
         crate::state::store_live_frame_array_slot(frame, index_value as usize, live);
         // Only this level's own frame: a store to a foreign vable must not
         // bind in `locals()` through this shadow. The published word is the

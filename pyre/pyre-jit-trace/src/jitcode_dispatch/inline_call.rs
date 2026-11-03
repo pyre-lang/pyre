@@ -9099,6 +9099,37 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     )
 }
 
+/// Seed an inlined callee's parameter boxes into [`CalleeLocalsShadow`].
+///
+/// `MIFrame.setup_call` copies the caller's argument boxes into the callee
+/// registers; every box has `getint()` / `getref_base()` / `getfloatstorage()`.
+/// A SOME argument without a reconstructable concrete
+/// ([`vable_store_concrete_is_reconstructable`]) would split the shadow into
+/// a 4e/4d hole; decline with [`DispatchError::VableArrayValueNotConcrete`]
+/// before any slot is written. A NONE argument is not a box;
+/// `set_opref(NONE)` / `set_concrete(Void)` leave the slot unwritten.
+pub(crate) fn seed_inline_param_shadows(
+    shadow: &mut CalleeLocalsShadow,
+    frame_reg: u16,
+    args: &[OpRef],
+    concretes: &[majit_ir::Value],
+    pc: usize,
+) -> Result<(), DispatchError> {
+    for (i, &opref) in args.iter().enumerate() {
+        let concrete = concretes.get(i).copied().unwrap_or(majit_ir::Value::Void);
+        if !opref.is_none() && !vable_store_concrete_is_reconstructable(concrete) {
+            return Err(DispatchError::VableArrayValueNotConcrete { pc, value: opref });
+        }
+    }
+    for (i, &opref) in args.iter().enumerate() {
+        let concrete = concretes.get(i).copied().unwrap_or(majit_ir::Value::Void);
+        let slot = i as i64;
+        shadow.set_opref(slot, opref);
+        shadow.set_concrete(frame_reg, slot, concrete);
+    }
+    Ok(())
+}
+
 /// The resolved-call inliner with an optional receiver for a nested call's
 /// result.  RPython's `MIFrame.finishframe` hands a returned box to the
 /// previous frame (`pyjitpl.py`) before that caller continues its
@@ -11835,17 +11866,28 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // residual wrote (`pyjitpl.py`).
                 shadow.frame_materialized = callee_frame_materialized_has_resume;
             }
-            for i in 0..seeded_locals {
-                let slot = i as i64;
-                let value = callee_args[i];
-                let concrete = sub_wc
-                    .trace_ctx
-                    .concrete_of_opref(callee_args[i])
-                    .unwrap_or(majit_ir::Value::Void);
+            // `MIFrame.setup_call` copies argument boxes that already carry
+            // values. Look each box up, then seed only when every SOME
+            // argument is reconstructable; otherwise decline before any
+            // shadow slot is written.
+            let concretes: Vec<majit_ir::Value> = (0..seeded_locals)
+                .map(|i| {
+                    sub_wc
+                        .trace_ctx
+                        .concrete_of_opref(callee_args[i])
+                        .unwrap_or(majit_ir::Value::Void)
+                })
+                .collect();
+            {
                 let mut state = sub_wc.frame_state.borrow_mut();
                 let shadow = state.callee_shadow.as_mut().unwrap();
-                shadow.set_opref(slot, value);
-                shadow.set_concrete(callee_portal_frame_reg, slot, concrete);
+                seed_inline_param_shadows(
+                    shadow,
+                    callee_portal_frame_reg,
+                    &callee_args[..seeded_locals],
+                    &concretes,
+                    op.pc,
+                )?;
             }
             // `MIFrame.registers_r` retains cell/freevar slots across a
             // may-force call just like ordinary locals.  The heapcache entry
@@ -22071,7 +22113,6 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                     if let Err(ref error) = result
                         && try_latch_effectful_helper_child_abort(
                             &mut self.frames,
-                            self.exchange.step_effect_count,
                             trace_ctx,
                             error,
                         )
@@ -22279,6 +22320,7 @@ enum TestHelperEffectKind {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TestHelperEffectWhen {
     BeforeWalk,
+    OnStep,
 }
 
 #[cfg(test)]
@@ -22289,6 +22331,7 @@ struct TestHelperArm {
     bump_when: TestHelperEffectWhen,
     abort_index: Option<usize>,
     abort_pc: Option<usize>,
+    abort_error_pc: Option<usize>,
 }
 
 #[cfg(test)]
@@ -22316,6 +22359,7 @@ pub(crate) fn arm_test_helper_journaled_then_abort(index: usize, abort_pc: usize
         bump_when: TestHelperEffectWhen::BeforeWalk,
         abort_index: Some(index),
         abort_pc: Some(abort_pc),
+        abort_error_pc: None,
     }));
 }
 
@@ -22327,6 +22371,26 @@ pub(crate) fn arm_test_helper_unjournaled_then_abort(index: usize, abort_pc: usi
         bump_when: TestHelperEffectWhen::BeforeWalk,
         abort_index: Some(index),
         abort_pc: Some(abort_pc),
+        abort_error_pc: None,
+    }));
+}
+
+/// Bump an unjournaled residual on `abort_index`'s aborting step, then
+/// fail that step with a `DispatchError` whose `stop_pc` is
+/// `abort_error_pc` rather than the executing op.
+#[cfg(test)]
+pub(crate) fn arm_test_helper_step_bump_then_abort_with_foreign_pc(
+    abort_index: usize,
+    abort_pc: usize,
+    abort_error_pc: usize,
+) {
+    set_test_helper_arm(Some(TestHelperArm {
+        bump_index: Some(abort_index),
+        bump_kind: TestHelperEffectKind::UnjournaledResidual,
+        bump_when: TestHelperEffectWhen::OnStep,
+        abort_index: Some(abort_index),
+        abort_pc: Some(abort_pc),
+        abort_error_pc: Some(abort_error_pc),
     }));
 }
 
@@ -22371,14 +22435,35 @@ pub(crate) fn maybe_test_helper_before_walk_bump(jitcode_index: Option<usize>) {
 pub(crate) fn maybe_test_helper_step_abort(
     jitcode_index: Option<usize>,
     pc: usize,
+    code: &[u8],
+    live_after_jit_pc: &mut usize,
 ) -> Option<DispatchError> {
     TEST_HELPER_ARM.with(|slot| {
+        let Some(mut arm) = slot.get() else {
+            return None;
+        };
+        if arm.bump_index == jitcode_index && arm.bump_when == TestHelperEffectWhen::OnStep {
+            apply_test_helper_effect(arm.bump_kind);
+            arm.bump_index = None;
+            slot.set(Some(arm));
+        }
         let Some(arm) = slot.get() else {
             return None;
         };
         if arm.abort_index == jitcode_index && arm.abort_pc == Some(pc) {
             slot.set(None);
-            return Some(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 });
+            let error_pc = arm.abort_error_pc.unwrap_or(pc);
+            if arm.abort_error_pc.is_some()
+                && let Some(op) = crate::jitcode_runtime::decode_op_at(code, error_pc)
+            {
+                // A nested walk's leftover `-live-` AFTER can equal `next_pc`
+                // of a coincidentally valid offset in this body.
+                *live_after_jit_pc = op.next_pc;
+            }
+            return Some(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                pc: error_pc,
+                symbolic: 0,
+            });
         }
         None
     })
@@ -22394,7 +22479,6 @@ pub(crate) fn maybe_test_helper_step_abort(
 /// is already null here, so splice the `self.frames` prefix directly.
 fn try_latch_effectful_helper_child_abort<'a, Sym: WalkSym>(
     frames: &mut [SubWalkFrame<'a, Sym>],
-    step_effect_count: usize,
     trace_ctx: &mut TraceCtx,
     error: &DispatchError,
 ) -> bool {
@@ -22425,12 +22509,23 @@ fn try_latch_effectful_helper_child_abort<'a, Sym: WalkSym>(
     }
     let (ancestors, child_slice) = frames.split_at_mut(n - 1);
     let child = &mut child_slice[0];
-    let fail_pc = error.stop_pc();
+    // `MIFrame._get_opimpl_method` (`pyjitpl.py`) keeps `self.pc` on the
+    // executing frame. `_copy_data_from_miframe` (`blackhole.py`) copies
+    // that pc. `error.stop_pc()` can be another jitcode's coordinate that
+    // happens to decode in `child.body.code`. The frame stamp is the op
+    // START plus the step-start effect count `walk` sampled with it;
+    // `helper_abort_resume_pc` decides the resume pc. That count is the
+    // same quantity `note_subwalk_driver_step` writes to
+    // `exchange.step_effect_count` (sampled at the start of this op,
+    // before the opimpl).
+    let Some(stamp) = child.frame_state.borrow().current_op_pc else {
+        return false;
+    };
     let Some(resume_pc) = super::helper_abort_resume_pc(
         child.body.code,
-        fail_pc,
+        stamp.pc,
         child.live_after_jit_pc,
-        step_effect_count,
+        stamp.effects_at_step,
     ) else {
         return false;
     };

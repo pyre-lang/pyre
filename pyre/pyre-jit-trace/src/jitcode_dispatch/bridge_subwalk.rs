@@ -1544,84 +1544,38 @@ fn seed_bridge_shadow_concrete(
     Ok(())
 }
 
-/// Keep-or-discard choice when the carrier region cannot be supplied.
-///
-/// `virtualizable.py write_boxes` always has every box, so a publish
-/// failure is a producer deviation tracked separately — not a state
-/// `blackhole.py convert_and_run_from_pyjitpl` can be in. A deeper
-/// helper's complete image must still resume.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CarrierPublishFailure {
-    KeepDeeperImage,
-    DiscardCarrierImage,
-}
-
-/// Who owns the latched image when carrier publish fails.
-///
-/// `image_latched_before` is [`abort_blackhole_latched`] sampled at
-/// [`latch_bridge_abort_and_publish_carrier_locals`] entry, before this
-/// tail's own latch. `accepted` is this call's own carrier latch.
-pub(crate) fn carrier_publish_failure_disposition(
-    image_latched_before: bool,
-    accepted: bool,
-) -> CarrierPublishFailure {
-    match (image_latched_before, accepted) {
-        (true, true) | (true, false) => CarrierPublishFailure::KeepDeeperImage,
-        (false, true) | (false, false) => CarrierPublishFailure::DiscardCarrierImage,
-    }
-}
-
-fn apply_carrier_publish_failure(
-    session: &std::cell::RefCell<WalkSession>,
-    image_latched_before: bool,
-    accepted: bool,
-) -> bool {
-    match carrier_publish_failure_disposition(image_latched_before, accepted) {
-        CarrierPublishFailure::KeepDeeperImage => accepted,
-        CarrierPublishFailure::DiscardCarrierImage => {
-            discard_staged_abort(session);
-            false
-        }
-    }
-}
-
 /// Abort-image decision for a reconstructed carrier, then publish its
 /// [`CalleeLocalsShadow`] onto the concrete `PyFrame` when a blackhole
 /// image will resume.
 ///
 /// `virtualizable.py write_boxes` always has every box before
 /// `blackhole.py convert_and_run_from_pyjitpl` copies MIFrame registers.
-/// A written slot without a reconstructable concrete half is a producer
-/// deviation tracked separately. On that hole, or a broken flush
-/// invariant, `debug_assert` and keep an image a deeper helper already
-/// latched; `discard_staged_abort` only the carrier image this call just
-/// staged. Discarding a complete deeper image would force guard replay,
-/// and `handle_guard_failure` converts through
-/// `run_blackhole_interp_to_cancel_tracing` without replaying.
+/// A written slot without a reconstructable concrete half, or a broken
+/// flush invariant, is a producer deviation: `debug_assert` and
+/// [`discard_staged_abort`]. A partial frame chain must not resume —
+/// the carrier is a level of that image, and resuming returns into the
+/// carrier and reads its unpublished (NULL) heap locals.
+/// `convert_and_run_from_pyjitpl` only ever resumes a complete frame
+/// chain.
 ///
-/// `blackhole_if_trace_too_long` stops in the innermost MIFrame. Preserve
-/// the image that frame already captured while the error unwinds, as `walk`
-/// does for TraceTooLong. Its pc is not a pc in this carrier: rebuilding
-/// here drops the intervening frames and resumes this frame with a
-/// different opcode's operand stack. `pyjitpl.py handle_guard_failure`
-/// converts the whole live stack through `run_blackhole_interp_to_cancel_tracing`
-/// without replay.
+/// `pyjitpl.py run_blackhole_interp_to_cancel_tracing` converts the live
+/// framestack once, from the frame where the abort happened. An image
+/// already latched before this tail runs is that conversion; this call
+/// does not replace it. The carrier's own latch (no image before entry)
+/// resumes at the pc [`helper_abort_resume_pc`] returns for this frame's
+/// `current_op_pc` stamp (op START) so the image matches `MIFrame.pc`
+/// after `MIFrame._get_opimpl_method` decode (`self.pc = position`).
 pub(crate) fn latch_bridge_abort_and_publish_carrier_locals<Sym: WalkSym>(
     sub_wc: &WalkContext<'_, '_, Sym>,
     error: &DispatchError,
     concrete_callee_frame: *mut pyre_interpreter::PyFrame,
     portal_frame_reg: u16,
 ) -> bool {
-    // Sampled at entry, before this tail's own latch, so a publish
-    // failure can tell a deeper helper's image from the carrier image
-    // staged below.
     let image_latched_before = abort_blackhole_latched();
-    let accepted = if matches!(error, DispatchError::TraceTooLong { .. }) && image_latched_before {
-        false
-    } else if image_latched_before && error.leaves_complete_image() {
-        // A deeper helper already staged its MIFrame. Replacing that
-        // image with a carrier-rooted latch would resume the CALL
-        // whose body already ran (`SwitchToBlackhole` just unwinds).
+    let accepted = if image_latched_before {
+        // The deeper helper already converted the live framestack
+        // (`run_blackhole_interp_to_cancel_tracing`). Replacing that
+        // image would resume the CALL whose body already ran.
         false
     } else if error.is_clean_decline() {
         // The refuse is a clean decline of a speculative inline
@@ -1630,20 +1584,31 @@ pub(crate) fn latch_bridge_abort_and_publish_carrier_locals<Sym: WalkSym>(
         // image is latched; the outermost `BinopRewindInlineGuard`
         // entry residualizes the operator.
         false
+    } else if let Some(stamp) = sub_wc.frame_state.borrow().current_op_pc {
+        match innermost_walk_jitcode(sub_wc).and_then(|jitcode| {
+            helper_abort_resume_pc(
+                &jitcode.code,
+                stamp.pc,
+                sub_wc.live_after_jit_pc,
+                stamp.effects_at_step,
+            )
+        }) {
+            Some(resume_pc) => latch_abort_blackhole(sub_wc, resume_pc, "bridge1361"),
+            None => false,
+        }
     } else {
-        latch_abort_blackhole(sub_wc, error.stop_pc(), "bridge1361")
+        false
     };
     // The carrier frame keeps locals in its shadow
     // (`InlineConcreteFrameGuard` is not installed on this walk).
     // `virtualizable.py write_boxes` always has every box before
     // `blackhole.py convert_and_run_from_pyjitpl` copies MIFrame registers.
-    // The blackhole resumes from whichever image is latched, deeper helper's
-    // or this carrier's; the carrier's locals live in `CalleeLocalsShadow`,
-    // so the region is flushed whenever any image will resume. A hole here
-    // is a producer deviation tracked separately: keep a deeper helper's
-    // already-latched image, and discard only the carrier image this call
-    // just staged. When no image is latched the walk's writes are discarded
-    // with it, so the flush stays off.
+    // The blackhole resumes from whichever image is latched; the
+    // carrier's locals live in `CalleeLocalsShadow`, so the region is
+    // flushed whenever any image will resume. A hole here is a producer
+    // deviation: discard the staged image rather than resume a partial
+    // frame chain. When no image is latched the walk's writes are
+    // discarded with it, so the flush stays off.
     if accepted || abort_blackhole_latched() {
         match publish_callee_locals_region(
             &sub_wc.frame_state,
@@ -1652,17 +1617,15 @@ pub(crate) fn latch_bridge_abort_and_publish_carrier_locals<Sym: WalkSym>(
         ) {
             CalleeLocalsPublish::Written => {}
             CalleeLocalsPublish::Unreconstructable => {
-                let result =
-                    apply_carrier_publish_failure(sub_wc.session, image_latched_before, accepted);
+                discard_staged_abort(sub_wc.session);
                 debug_assert!(
                     false,
                     "carrier shadow hole; the producer wrote a slot without a concrete value"
                 );
-                return result;
+                return false;
             }
             CalleeLocalsPublish::BrokenInvariant => {
-                let result =
-                    apply_carrier_publish_failure(sub_wc.session, image_latched_before, accepted);
+                discard_staged_abort(sub_wc.session);
                 debug_assert!(
                     false,
                     "carrier locals flush hit a broken invariant \
@@ -1670,7 +1633,7 @@ pub(crate) fn latch_bridge_abort_and_publish_carrier_locals<Sym: WalkSym>(
                      no shadow, frame_reg mismatch, stale Void, or \
                      store_pinned_frame_locals failure)"
                 );
-                return result;
+                return false;
             }
         }
     }
@@ -2811,6 +2774,50 @@ mod bridge_seed_tests {
         assert_eq!(
             seed_bridge_shadow_concrete(&mut shadow, 4, 0, OpRef::NONE, Value::Void, 0),
             Ok(())
+        );
+        assert!(shadow.opref.get(&0).is_none());
+        assert!(shadow.concrete.get(&0).is_none());
+    }
+
+    /// A reconstructed recipe whose box is `NO_CONCRETE` is declined at
+    /// `seed_bridge_shadow_concrete` rather than seeded from the captured
+    /// copy. `resume.py consume_boxes` never installs a box without a value.
+    #[test]
+    fn reconstruct_recipe_no_concrete_box_is_declined_by_bridge_seed() {
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let opref = OpRef::input_arg_ref(0);
+        let captured = Value::Ref(majit_ir::GcRef(0x5c100));
+        assert!(ctx.try_set_opref_concrete(opref, Value::Ref(majit_ir::GcRef::NO_CONCRETE)));
+        let recipe = majit_metainterp::ReconstructRecipe {
+            code_ptr: std::ptr::null(),
+            jitcode_index: 0,
+            jitcode_pc: 0,
+            nlocals: 1,
+            valuestackdepth: 0,
+            registers_i: Vec::new(),
+            registers_r: vec![opref],
+            registers_f: Vec::new(),
+            concrete_r: vec![captured],
+            registers_r_color: Vec::new(),
+            frame: OpRef::NONE,
+            nargs: 0,
+            ctor_tail: false,
+            len_tail: false,
+            rebuilt_frame: None,
+            rebuilt_ec: None,
+        };
+        let current = ctx.reconstruct_recipe_with_current_refs(&recipe);
+        assert_eq!(
+            current.concrete_r[0],
+            Value::Ref(majit_ir::GcRef::NO_CONCRETE)
+        );
+        let mut shadow = CalleeLocalsShadow::default();
+        assert_eq!(
+            seed_bridge_shadow_concrete(&mut shadow, 4, 0, opref, current.concrete_r[0], 0),
+            Err(DispatchError::VableArrayValueNotConcrete {
+                pc: 0,
+                value: opref
+            })
         );
         assert!(shadow.opref.get(&0).is_none());
         assert!(shadow.concrete.get(&0).is_none());

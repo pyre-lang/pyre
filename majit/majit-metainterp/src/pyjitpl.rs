@@ -7946,7 +7946,7 @@ impl<M: Clone> MetaInterp<M> {
         self.with_ctx_and_frames(|ctx, frames| {
             let nonstandard =
                 Self::nonstandard_on_frames(ctx, frames, pc, vable_opref, &fielddescr);
-            ctx.vable_setfield_checked(nonstandard, vable_opref, fielddescr, value, Some(concrete));
+            ctx.vable_setfield_checked(nonstandard, vable_opref, fielddescr, value, concrete);
         });
     }
 
@@ -7962,7 +7962,7 @@ impl<M: Clone> MetaInterp<M> {
         self.with_ctx_and_frames(|ctx, frames| {
             let nonstandard =
                 Self::nonstandard_on_frames(ctx, frames, pc, vable_opref, &fielddescr);
-            ctx.vable_setfield_checked(nonstandard, vable_opref, fielddescr, value, Some(concrete));
+            ctx.vable_setfield_checked(nonstandard, vable_opref, fielddescr, value, concrete);
         });
     }
 
@@ -7978,7 +7978,7 @@ impl<M: Clone> MetaInterp<M> {
         self.with_ctx_and_frames(|ctx, frames| {
             let nonstandard =
                 Self::nonstandard_on_frames(ctx, frames, pc, vable_opref, &fielddescr);
-            ctx.vable_setfield_checked(nonstandard, vable_opref, fielddescr, value, Some(concrete));
+            ctx.vable_setfield_checked(nonstandard, vable_opref, fielddescr, value, concrete);
         });
     }
 

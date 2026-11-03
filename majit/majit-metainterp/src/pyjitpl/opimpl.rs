@@ -1502,7 +1502,7 @@ where
             vable_opref,
             fielddescr,
             imm_box,
-            Some(Value::Int(imm)),
+            Value::Int(imm),
         );
         TraceAction::Continue
     }
@@ -1534,7 +1534,7 @@ where
             vable_opref,
             fielddescr,
             value,
-            Some(Value::Int(concrete)),
+            Value::Int(concrete),
         );
         TraceAction::Continue
     }
@@ -1566,7 +1566,7 @@ where
             vable_opref,
             fielddescr,
             value,
-            Some(Value::Ref(majit_ir::GcRef(concrete as usize))),
+            Value::Ref(majit_ir::GcRef(concrete as usize)),
         );
         TraceAction::Continue
     }
@@ -1598,7 +1598,7 @@ where
             vable_opref,
             fielddescr,
             value,
-            Some(Value::Float(f64::from_bits(concrete as u64))),
+            Value::Float(f64::from_bits(concrete as u64)),
         );
         TraceAction::Continue
     }

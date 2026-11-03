@@ -251,7 +251,7 @@ mod frame_state;
 mod register_bank;
 mod register_list;
 pub(crate) use frame_state::WalkFrameStateRoot;
-pub use frame_state::{WalkFrameState, WalkFrameStateData};
+pub use frame_state::{CurrentOpPc, WalkFrameState, WalkFrameStateData};
 pub use register_bank::RegisterBank;
 use register_bank::RegisterValues;
 pub(crate) use register_bank::{FrontendBoxArea, RegisterBankRoot, walk_frontend_box};
@@ -2109,7 +2109,7 @@ fn emit_traceback_node<Sym: WalkSym>(
             site.frame,
             last_instr_descr.clone(),
             last_instr_value,
-            Some(Value::Int(i64::from(site.last_instruction))),
+            Value::Int(i64::from(site.last_instruction)),
         ))
     })?;
     let _ = write;
@@ -5291,9 +5291,12 @@ pub fn step<Sym: WalkSym>(
     let op: DecodedOp = decode_op_at(code, pc).ok_or(DispatchError::UndecodableOpcode { pc })?;
     inline_call::note_subwalk_driver_step::<Sym>(op.opname, pc, ctx.trace_ctx.get_trace_position());
     #[cfg(test)]
-    if let Some(error) =
-        inline_call::maybe_test_helper_step_abort(ctx.fbw_mode.transparent_helper_jitcode_index, pc)
-    {
+    if let Some(error) = inline_call::maybe_test_helper_step_abort(
+        ctx.fbw_mode.transparent_helper_jitcode_index,
+        pc,
+        code,
+        &mut ctx.live_after_jit_pc,
+    ) {
         return Err(error);
     }
     // The walker mixes translated vable operations (which update the shadow)
@@ -5496,7 +5499,17 @@ pub fn walk<Sym: WalkSym>(
         // when this step's own sub-walk propagates.
         ctx.session.borrow_mut().crossed_inline_subwalk = false;
         let opcode_position = pc;
+        // `MIFrame._get_opimpl_method` (`pyjitpl.py`) decodes the args, then
+        // sets `self.pc = position` (the op END) before the opimpl. This stamp
+        // is the op START; `helper_abort_resume_pc` decides the resume pc that
+        // reproduces `MIFrame.pc`. `_copy_data_from_miframe` (`blackhole.py`)
+        // copies that pc; a propagated `DispatchError` may still carry another
+        // jitcode's coordinate.
         let effects_at_step = fbw_executed_effect_count();
+        ctx.frame_state.borrow_mut().current_op_pc = Some(CurrentOpPc {
+            pc: opcode_position,
+            effects_at_step,
+        });
         let (outcome, next_pc) = match step(code, pc, ctx) {
             Ok(stepped) => {
                 // `MetaInterp._interpret` checks the trace limit after

@@ -22,8 +22,8 @@ use super::*;
 /// the ordinary OpRef carrier rather than instead of it.
 ///
 /// A null and an all-ones word are both rejected: null is no object, and
-/// all-ones is the `vable_setfield` storage placeholder, which says "no
-/// concrete known" rather than naming one.
+/// all-ones is `GcRef::NO_CONCRETE`, an unresolved-ref sentinel rather
+/// than a live pointer.
 fn concrete_ref_operand_ptr<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,

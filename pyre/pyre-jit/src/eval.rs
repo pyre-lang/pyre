@@ -6335,6 +6335,13 @@ fn build_jit_driver_pair() -> JitDriverPair {
 /// the frame that was just forced, before the residual that forced it
 /// can allocate.
 ///
+/// Only after that resume-data write. `virtualref.py force_virtual`
+/// returns `vref.forced` without rewriting operand slots when `forced`
+/// is already set (`TOKEN_NONE`) or the token is `TOKEN_TRACING_RESCALL`.
+/// `pyframe.py popvalue` already stores None into a popped slot, which
+/// the walk mirrors; trimming a live inlined frame at the pop depth
+/// would NULL a just-pushed operand whose vsd bump has not landed.
+///
 /// `frame` must be the live address: a caller whose force can collect roots
 /// the frame across it and passes the reloaded root.
 fn trim_forced_pyframe_stack(frame: &mut pyre_interpreter::PyFrame) {
@@ -6460,6 +6467,7 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
             // frame on the shadow stack across it and reload it after, as
             // gctransform `push_roots` / `pop_roots` do for a GC local.
             let mut root = FrameRoot::new(&mut *(ptr as *mut PyFrame));
+            let mut materialized = false;
             info.force_virtualizable_if_necessary(ptr, |token| {
                 // `compile.py ResumeGuardForcedDescr.force_now` decodes
                 // the resume data with the same allocator ordinary guard failure
@@ -6478,8 +6486,15 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
                     eprintln!("[jit][force-hook] frame token=0x{token:x} frame={ptr:p}");
                 }
                 driver.force_virtualizable_token(token);
+                materialized = true;
             });
-            trim_forced_pyframe_stack(root.frame());
+            // Only the `force_now` arm rebuilt the frame from resume data;
+            // `virtualizable.py force_virtualizable_if_necessary` leaves the
+            // object untouched when `vable_token` is TOKEN_NONE, whose slot at
+            // `valuestackdepth` may be a store the next jitcode op counts in.
+            if materialized {
+                trim_forced_pyframe_stack(root.frame());
+            }
         };
         // Force the traced virtualizable only when the frame handed to Python
         // IS that virtualizable.  `flush_active_frame_escape` reports that.
@@ -16924,6 +16939,42 @@ mod tests {
         let mut visits = 0;
         unsafe { walk_active_trace_ref(&mut null, &mut |_| visits += 1) };
         assert_eq!(visits, 1, "a known null remains distinct from unknown");
+    }
+
+    /// A tracing-time vref (`virtualref.py force_virtual` TOKEN_NONE with
+    /// `forced` already set) must not `clear_stack_above(valuestackdepth)`:
+    /// that slot can hold a just-pushed operand whose vsd bump has not
+    /// landed (`pyframe.py pushvalue` stores then bumps).
+    #[test]
+    fn force_pyframe_vref_already_forced_keeps_word_at_valuestackdepth() {
+        use pyre_interpreter::compile_exec;
+        use pyre_object::intobject::w_int_new;
+
+        let _ = driver_pair();
+        let module =
+            compile_exec("def f(x):\n    return (x, x)\nf(1)\n").expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+        let mut frame = PyFrame::new(code);
+        let depth = frame.valuestackdepth;
+        assert!(
+            locals_w!(&*frame).len() > depth,
+            "fixture needs a slot at valuestackdepth"
+        );
+        let sentinel = w_int_new(0x51A7);
+        assert!(!sentinel.is_null());
+        frame.set_locals_w(depth, sentinel);
+        let frame_ptr = frame.as_mut_ptr();
+        let vref = majit_metainterp::virtualref::VirtualRefInfo::new()
+            .virtual_ref_during_tracing(frame_ptr as majit_gc::header::GCREF);
+        let forced = unsafe { force_pyframe_vref(vref as *mut PyFrame) };
+        assert!(
+            std::ptr::eq(forced, frame_ptr),
+            "already-forced vref must return the live frame"
+        );
+        assert!(
+            std::ptr::eq(locals_w!(&*frame)[depth], sentinel),
+            "force_pyframe_vref must keep the word at valuestackdepth when force_virtual short-circuits"
+        );
     }
 
     /// `resume.py virtuals_cache` is a GC-traced list. A HashMap of raw

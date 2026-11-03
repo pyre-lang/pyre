@@ -4631,6 +4631,616 @@ fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
     }
 }
 
+/// Drive `setarrayitem_vable_r` with a SOME value whose concrete is
+/// `Ref(NO_CONCRETE)`. `_opimpl_setarrayitem_vable` then `write_box_at`
+/// never store a box without a value, so the walk must decline before
+/// `walker_promote_vable_array_index` / `vable_setarrayitem_checked`.
+fn setarrayitem_vable_r_unreconstructable(own_frame: bool) {
+    use crate::state::ConcreteValue;
+    use pyre_interpreter::locals_w_mut;
+
+    let function = pyre_interpreter::compile_exec("def f(x):\n    return x\n").expect("compile");
+    let code_obj = function
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            pyre_interpreter::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
+                Some((**code).clone())
+            }
+            _ => None,
+        })
+        .expect("function code");
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code_obj);
+    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+    let sentinel = pyre_object::w_none();
+    {
+        let slots = locals_w_mut!(frame).as_mut_slice();
+        slots[0] = sentinel;
+    }
+
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let array_len = 3;
+    let slot_count = info.num_static_extra_boxes + array_len;
+    let standard = tc.const_ref(1);
+    let hole = tc.record_op(majit_ir::OpCode::NewWithVtable, &[]);
+    let initial_boxes = vec![hole; slot_count];
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        standard,
+        Value::Ref(majit_ir::GcRef(1)),
+        &initial_boxes,
+        &[],
+        &[array_len],
+    );
+    if !own_frame {
+        tc.set_virtualizable_heap_ptr(frame_ptr as *const u8);
+    }
+
+    let vable = if own_frame {
+        let vable = OpRef::input_arg_ref(0);
+        tc.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(frame_ptr)));
+        vable
+    } else {
+        standard
+    };
+    let value = tc.record_op(majit_ir::OpCode::NewWithVtable, &[]);
+    tc.set_opref_concrete(value, Value::Ref(majit_ir::GcRef::NO_CONCRETE));
+    let zero = tc.const_int(0);
+    let index = tc.record_op(majit_ir::OpCode::IntAdd, &[zero, zero]);
+    tc.set_opref_concrete(index, Value::Int(0));
+    assert!(!index.is_constant(), "the index box must be promotable");
+
+    let bh_array = majit_jitcode::jitcode::BhDescr::from_array_descr(
+        info.array_descrs[0]
+            .as_array_descr()
+            .expect("the fixture's array descr"),
+    );
+    let raw_pool = vec![
+        majit_metainterp::jitcode::RuntimeBhDescr::Descr(Box::new(
+            majit_jitcode::jitcode::BhDescr::VableArray { index: 0 },
+        )),
+        majit_metainterp::jitcode::RuntimeBhDescr::Descr(Box::new(bh_array)),
+    ];
+    let code: [u8; 8] = [0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x01, 0x00];
+    let op = DecodedOp {
+        key: "setarrayitem_vable_r/rirdd",
+        opname: "setarrayitem_vable_r",
+        argcodes: "rirdd",
+        pc: 0,
+        next_pc: code.len(),
+    };
+    let regs_r = vec![vable, OpRef::NONE, value];
+    let regs_i = vec![zero, index];
+    let shadow = own_frame.then_some(CalleeLocalsShadow {
+        fold_frame_reg: u16::MAX,
+        concrete_frame: frame_ptr,
+        frame_box: vable,
+        frame_materialized: false,
+        ..Default::default()
+    });
+    let flat = info.num_static_extra_boxes;
+    let box_before = tc.virtualizable_box_at(flat);
+    let ops_before = tc.num_ops();
+    let heap_before = crate::state::concrete_stack_value(frame_ptr, 0);
+    let descr_pool: Vec<DescrRef> = Vec::new();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: shadow,
+            concrete_registers_r: vec![ConcreteValue::Null; 3],
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::PerFn(&raw_pool),
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = setarrayitem_vable_via_metainterp(&code, &op, &mut wc, 'r');
+    let box_after = wc.trace_ctx.virtualizable_box_at(flat);
+    let ops_after = wc.trace_ctx.num_ops();
+    drop(wc);
+    let heap_after = crate::state::concrete_stack_value(frame_ptr, 0);
+    {
+        let slots = locals_w_mut!(frame).as_mut_slice();
+        slots[0] = sentinel;
+    }
+    assert_eq!(
+        result,
+        Err(DispatchError::VableArrayValueNotConcrete { pc: 0, value }),
+        "own_frame={own_frame}: unreconstructable store must decline"
+    );
+    assert_eq!(
+        box_after, box_before,
+        "own_frame={own_frame}: vable box must be unchanged"
+    );
+    assert_eq!(
+        ops_after, ops_before,
+        "own_frame={own_frame}: trace op count must be unchanged"
+    );
+    assert_eq!(
+        heap_after, heap_before,
+        "own_frame={own_frame}: heap/live array slot must be unchanged"
+    );
+}
+
+#[test]
+fn setarrayitem_vable_r_standard_refuses_unreconstructable_before_store() {
+    setarrayitem_vable_r_unreconstructable(false);
+}
+
+#[test]
+fn setarrayitem_vable_r_own_frame_refuses_unreconstructable_before_store() {
+    setarrayitem_vable_r_unreconstructable(true);
+}
+
+/// A nonstandard, non-own-frame `setarrayitem_vable_r` records
+/// `getfield_gc_r` + `setarrayitem_gc` (`vable_setarrayitem_impl`) and
+/// does not write a virtualizable box or live frame.
+/// `_opimpl_setarrayitem_vable` takes that arm after
+/// `_nonstandard_virtualizable` and never calls `write_box_at`, so a
+/// SOME value without a reconstructable concrete is not refused.
+#[test]
+fn setarrayitem_vable_r_nonstandard_records_unreconstructable_store() {
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let array_len = 3;
+    let slot_count = info.num_static_extra_boxes + array_len;
+    let standard = tc.const_ref(1);
+    let initial_boxes = vec![tc.const_null(); slot_count];
+    let initial_values = vec![Value::Ref(majit_ir::GcRef::NULL); slot_count];
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        standard,
+        Value::Ref(majit_ir::GcRef(1)),
+        &initial_boxes,
+        &initial_values,
+        &[array_len],
+    );
+    // Foreign virtualizable: `_nonstandard_virtualizable` Step 4 PTR_EQ.
+    let vable = OpRef::input_arg_ref(0);
+    tc.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(2)));
+    let value = tc.record_op(majit_ir::OpCode::NewWithVtable, &[]);
+    tc.set_opref_concrete(value, Value::Ref(majit_ir::GcRef::NO_CONCRETE));
+    let zero = tc.const_int(0);
+    let index = tc.record_op(majit_ir::OpCode::IntAdd, &[zero, zero]);
+    tc.set_opref_concrete(index, Value::Int(0));
+    assert!(!index.is_constant(), "the index box must be promotable");
+
+    let bh_array = majit_jitcode::jitcode::BhDescr::from_array_descr(
+        info.array_descrs[0]
+            .as_array_descr()
+            .expect("the fixture's array descr"),
+    );
+    let raw_pool = vec![
+        majit_metainterp::jitcode::RuntimeBhDescr::Descr(Box::new(
+            majit_jitcode::jitcode::BhDescr::VableArray { index: 0 },
+        )),
+        majit_metainterp::jitcode::RuntimeBhDescr::Descr(Box::new(bh_array)),
+    ];
+    let code: [u8; 8] = [0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x01, 0x00];
+    let op = DecodedOp {
+        key: "setarrayitem_vable_r/rirdd",
+        opname: "setarrayitem_vable_r",
+        argcodes: "rirdd",
+        pc: 0,
+        next_pc: code.len(),
+    };
+    let regs_r = vec![vable, OpRef::NONE, value];
+    let regs_i = vec![zero, index];
+    let flat = info.num_static_extra_boxes;
+    let box_before = tc.virtualizable_box_at(flat);
+    let ops_before = tc.num_ops();
+    let descr_pool: Vec<DescrRef> = Vec::new();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::PerFn(&raw_pool),
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = setarrayitem_vable_via_metainterp(&code, &op, &mut wc, 'r');
+    let box_after = wc.trace_ctx.virtualizable_box_at(flat);
+    let recorded_store = wc.trace_ctx.ops().iter().any(|recorded| {
+        recorded.opcode == majit_ir::OpCode::SetarrayitemGc
+            && recorded
+                .getarglist()
+                .get(2)
+                .is_some_and(|arg| arg.to_opref() == value)
+    });
+    let ops_after = wc.trace_ctx.num_ops();
+    drop(wc);
+    assert_eq!(
+        result.map(|(outcome, _)| outcome),
+        Ok(DispatchOutcome::Continue),
+        "nonstandard non-own-frame store must record, not refuse"
+    );
+    assert!(
+        recorded_store,
+        "nonstandard arm must record setarrayitem_gc of the value box"
+    );
+    assert!(
+        ops_after > ops_before,
+        "nonstandard arm records getfield_gc_r + setarrayitem_gc"
+    );
+    assert_eq!(
+        box_after, box_before,
+        "nonstandard arm must not sync virtualizable_boxes"
+    );
+}
+
+/// Drive `setfield_vable_i` with a SOME Int value box that has no
+/// reconstructable concrete. `_opimpl_setfield_vable` then `write_box_at`
+/// never store a box without a value, so the STANDARD arm must decline
+/// before `vable_setfield_checked`. The nonstandard arm records
+/// `setfield_gc` only and does not unwrap the box.
+fn setfield_vable_i_unreconstructable_setup(
+    standard_arm: bool,
+) -> (
+    TraceCtx,
+    Vec<DescrRef>,
+    OpRef,
+    OpRef,
+    [u8; 5],
+    Vec<OpRef>,
+    Vec<OpRef>,
+) {
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let array_len = 3;
+    let slot_count = info.num_static_extra_boxes + array_len;
+    let standard = tc.const_ref(1);
+    let initial_boxes = vec![tc.const_null(); slot_count];
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        standard,
+        Value::Ref(majit_ir::GcRef(1)),
+        &initial_boxes,
+        &[],
+        &[array_len],
+    );
+    let vable = if standard_arm {
+        standard
+    } else {
+        let vable = OpRef::input_arg_ref(0);
+        tc.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(2)));
+        vable
+    };
+    let zero = tc.const_int(0);
+    let value = tc.record_op(majit_ir::OpCode::IntAdd, &[zero, zero]);
+    assert!(
+        !value.is_constant(),
+        "the Int value box must be a recorded op"
+    );
+    assert!(
+        tc.lookup_opref_concrete(value).is_none(),
+        "the Int value box must have no reconstructable concrete"
+    );
+    let descr = info.static_field_descr(0);
+    let descr_pool: Vec<DescrRef> = vec![descr];
+    let code: [u8; 5] = [0x00, 0x00, 0x01, 0x00, 0x00];
+    let regs_r = vec![vable];
+    let regs_i = vec![zero, value];
+    (tc, descr_pool, vable, value, code, regs_r, regs_i)
+}
+
+#[test]
+fn setfield_vable_i_standard_refuses_unreconstructable_before_store() {
+    let (mut tc, descr_pool, _vable, value, code, regs_r, regs_i) =
+        setfield_vable_i_unreconstructable_setup(true);
+    let op = DecodedOp {
+        key: "setfield_vable_i/rid",
+        opname: "setfield_vable_i",
+        argcodes: "rid",
+        pc: 0,
+        next_pc: code.len(),
+    };
+    let box_before = tc.virtualizable_box_at(0);
+    let ops_before = tc.num_ops();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = setfield_vable_via_metainterp(&code, &op, &mut wc, 'i');
+    let box_after = wc.trace_ctx.virtualizable_box_at(0);
+    let ops_after = wc.trace_ctx.num_ops();
+    let stamped = wc.trace_ctx.lookup_opref_concrete(value);
+    drop(wc);
+    assert_eq!(
+        result,
+        Err(DispatchError::VableArrayValueNotConcrete { pc: 0, value }),
+        "standard arm must refuse an Int value box with no reconstructable concrete"
+    );
+    assert_eq!(
+        box_after, box_before,
+        "standard arm must not write the vable box"
+    );
+    assert_eq!(ops_after, ops_before, "standard arm must record no op");
+    assert!(
+        stamped.is_none(),
+        "standard arm must not stamp NO_CONCRETE onto the value box"
+    );
+}
+
+/// A nonstandard `setfield_vable_i` records `setfield_gc`
+/// (`vable_setfield_checked`) and does not write a virtualizable box.
+/// `_opimpl_setfield_vable` takes that arm after `_nonstandard_virtualizable`
+/// and never calls `write_box_at`, so a SOME Int value without a
+/// reconstructable concrete is not refused.
+#[test]
+fn setfield_vable_i_nonstandard_records_unreconstructable_store() {
+    let (mut tc, descr_pool, vable, value, code, regs_r, regs_i) =
+        setfield_vable_i_unreconstructable_setup(false);
+    let op = DecodedOp {
+        key: "setfield_vable_i/rid",
+        opname: "setfield_vable_i",
+        argcodes: "rid",
+        pc: 0,
+        next_pc: code.len(),
+    };
+    let box_before = tc.virtualizable_box_at(0);
+    let ops_before = tc.num_ops();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = setfield_vable_via_metainterp(&code, &op, &mut wc, 'i');
+    let box_after = wc.trace_ctx.virtualizable_box_at(0);
+    let recorded_store = wc.trace_ctx.ops().iter().any(|recorded| {
+        recorded.opcode == majit_ir::OpCode::SetfieldGc
+            && recorded.getarglist().len() == 2
+            && recorded.getarglist()[0].to_opref() == vable
+            && recorded.getarglist()[1].to_opref() == value
+    });
+    let ops_after = wc.trace_ctx.num_ops();
+    drop(wc);
+    assert_eq!(
+        result.map(|(outcome, _)| outcome),
+        Ok(DispatchOutcome::Continue),
+        "nonstandard arm must record, not refuse"
+    );
+    assert!(
+        recorded_store,
+        "nonstandard arm must record setfield_gc of the value box"
+    );
+    assert!(
+        ops_after > ops_before,
+        "nonstandard arm records setfield_gc"
+    );
+    assert_eq!(
+        box_after, box_before,
+        "nonstandard arm must not sync virtualizable_boxes"
+    );
+}
+
+/// `MIFrame.setup_call` copies argument boxes that already carry values.
+/// A SOME argument without a reconstructable concrete must decline before
+/// any shadow slot is written, so the publisher never sees a 4e/4d hole.
+#[test]
+fn seed_inline_param_shadows_declines_some_opref_with_void() {
+    use majit_ir::Value;
+
+    let mut shadow = CalleeLocalsShadow::default();
+    let boxed = OpRef::input_arg_ref(0);
+    assert_eq!(
+        seed_inline_param_shadows(&mut shadow, 4, &[boxed], &[Value::Void], 0),
+        Err(DispatchError::VableArrayValueNotConcrete {
+            pc: 0,
+            value: boxed
+        })
+    );
+    assert!(shadow.opref.get(&0).is_none());
+    assert!(shadow.concrete.get(&0).is_none());
+}
+
+#[test]
+fn seed_inline_param_shadows_declines_some_opref_with_no_concrete() {
+    use majit_ir::{GcRef, Value};
+
+    let mut shadow = CalleeLocalsShadow::default();
+    let boxed = OpRef::input_arg_ref(0);
+    assert_eq!(
+        seed_inline_param_shadows(
+            &mut shadow,
+            4,
+            &[boxed],
+            &[Value::Ref(GcRef::NO_CONCRETE)],
+            0
+        ),
+        Err(DispatchError::VableArrayValueNotConcrete {
+            pc: 0,
+            value: boxed
+        })
+    );
+    assert!(shadow.opref.get(&0).is_none());
+    assert!(shadow.concrete.get(&0).is_none());
+}
+
+#[test]
+fn seed_inline_param_shadows_declines_before_any_slot_is_written() {
+    use majit_ir::{GcRef, Value};
+
+    let mut shadow = CalleeLocalsShadow::default();
+    let first = OpRef::input_arg_ref(0);
+    let second = OpRef::input_arg_ref(1);
+    let copied = Value::Ref(GcRef(pyre_object::w_none() as usize));
+    assert_eq!(
+        seed_inline_param_shadows(&mut shadow, 4, &[first, second], &[copied, Value::Void], 12),
+        Err(DispatchError::VableArrayValueNotConcrete {
+            pc: 12,
+            value: second
+        })
+    );
+    assert!(shadow.opref.is_empty());
+    assert!(shadow.concrete.is_empty());
+}
+
+#[test]
+fn seed_inline_param_shadows_none_void_stays_absent() {
+    use majit_ir::Value;
+
+    let mut shadow = CalleeLocalsShadow::default();
+    assert_eq!(
+        seed_inline_param_shadows(&mut shadow, 4, &[OpRef::NONE], &[Value::Void], 0),
+        Ok(())
+    );
+    assert!(shadow.opref.get(&0).is_none());
+    assert!(shadow.concrete.get(&0).is_none());
+}
+
+#[test]
+fn seed_inline_param_shadows_seeds_reconstructable_args() {
+    use majit_ir::{GcRef, Value};
+
+    let mut shadow = CalleeLocalsShadow::default();
+    let boxed = OpRef::input_arg_ref(0);
+    let boxed_int = OpRef::input_arg_int(0);
+    let copied = Value::Ref(GcRef(pyre_object::w_none() as usize));
+    seed_inline_param_shadows(
+        &mut shadow,
+        4,
+        &[boxed, OpRef::NONE, boxed_int],
+        &[copied, Value::Void, Value::Int(7)],
+        0,
+    )
+    .unwrap();
+    assert_eq!(shadow.opref.get(&0).copied(), Some(boxed));
+    assert_eq!(
+        shadow
+            .concrete
+            .get(&0)
+            .map(|entry| (entry.frame_reg, entry.value)),
+        Some((4, copied))
+    );
+    assert!(shadow.opref.get(&1).is_none());
+    assert!(shadow.concrete.get(&1).is_none());
+    assert_eq!(shadow.opref.get(&2).copied(), Some(boxed_int));
+    assert_eq!(
+        shadow.concrete.get(&2).map(|entry| entry.value),
+        Some(Value::Int(7))
+    );
+}
+
 struct RetiredLocalRead {
     outcome: Result<DispatchOutcome, DispatchError>,
     /// Concrete stamped on the destination box.
@@ -20675,6 +21285,60 @@ fn helper_unjournaled_residual_then_later_abort_converts() {
     );
 }
 
+/// Driver fallback (`try_latch_effectful_helper_child_abort`) must resume at
+/// the child's executing op (`MIFrame._get_opimpl_method` `self.pc =
+/// position`; `_copy_data_from_miframe` copies that pc). A nested abort
+/// whose `stop_pc` is a valid offset in the child's jitcode is not that
+/// coordinate.
+#[test]
+fn helper_driver_latch_uses_child_op_pc_not_error_stop_pc() {
+    let executing_pc = 0;
+    let foreign_stop_pc = 4;
+    let (result, latched, replay_before, replay_after) = probe_nested_helper_later_abort(
+        "driver_latch_grandchild_foreign_pc",
+        "driver_latch_child_foreign_pc",
+        |grandchild, _child| {
+            super::inline_call::arm_test_helper_step_bump_then_abort_with_foreign_pc(
+                grandchild,
+                executing_pc,
+                foreign_stop_pc,
+            );
+        },
+    );
+    assert!(
+        matches!(
+            result,
+            Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc: 4, .. })
+        ),
+        "the propagated error keeps its nested stop_pc: {result:?}"
+    );
+    let latched_pc = latched.as_ref().and_then(|image| {
+        image
+            .framestack
+            .frames
+            .last()
+            .map(|frame| (image.origin, frame.jitcode.name().to_string(), frame.pc))
+    });
+    if let Some((origin, name, pc)) = &latched_pc {
+        assert_eq!(*origin, "mod2730-helper");
+        assert_eq!(name, "driver_latch_grandchild_foreign_pc");
+        assert_eq!(
+            *pc, executing_pc,
+            "MIFrame.pc is the child's executing op, not error.stop_pc()={foreign_stop_pc}"
+        );
+    }
+    assert!(
+        latched_pc
+            .as_ref()
+            .is_none_or(|(_, _, pc)| *pc != foreign_stop_pc && *pc != 8),
+        "must not resume at error.stop_pc() or that op's next_pc, got {latched_pc:?}"
+    );
+    assert_eq!(
+        replay_after, replay_before,
+        "SubWalkDriver must not replay the parent CALL after an unrewindable nested abort"
+    );
+}
+
 /// Finding 2: a helper JitCode is a real `MIFrame` identity. Filling its
 /// banks at a post-step pc is what `_copy_data_from_miframe` does for that
 /// frame; the blackhole then `setposition`s onto the helper body.
@@ -21333,6 +21997,203 @@ fn splice_success_keeps_the_staged_image() {
     reset_single_frame_blackhole();
 }
 
+/// Install a helper jitcode whose `startpoints` include every pc the
+/// carrier latch test will pass to `latch_abort_blackhole`. Unit-test
+/// WalkContexts leave `snapshot_sym` null, so the latch uses the
+/// `transparent_helper_subwalk` test path (`latch_test_helper_without_snapshot`).
+fn install_carrier_latch_helper(
+    name: &str,
+    startpoints: &[usize],
+) -> (std::sync::Arc<majit_metainterp::jitcode::JitCode>, usize) {
+    let code = residual_call_with_funcbox(0);
+    let mut points: Vec<usize> = startpoints.iter().copied().collect();
+    points.push(0);
+    points.push(code.len());
+    if let Some(op) = crate::jitcode_runtime::decode_op_at(&code, 0) {
+        points.push(op.next_pc);
+    }
+    points.sort_unstable();
+    points.dedup();
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new(name);
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some(points.into_iter().collect()),
+        ..Default::default()
+    });
+    let jitcode = std::sync::Arc::new(runtime_jc);
+    let py_code = pyre_interpreter::compile_exec("None").expect("test code should compile");
+    let key =
+        pyre_interpreter::w_code_new(Box::into_raw(Box::new(py_code)) as *const ()) as *const ();
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = jitcode.clone();
+    let installed = crate::state::install_jitcode_for(key, std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    let index = unsafe { (*installed).index as usize };
+    (jitcode, index)
+}
+
+fn with_carrier_abort_ctx<R>(
+    prepare_shadow: impl FnOnce(&mut CalleeLocalsShadow),
+    current_op_pc: Option<usize>,
+    helper_name: Option<&str>,
+    body: impl FnOnce(
+        &mut WalkContext<'_, '_, crate::state::PyreSym>,
+        *mut pyre_interpreter::PyFrame,
+        &std::cell::RefCell<WalkSession>,
+    ) -> R,
+) -> R {
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+
+    let function = pyre_interpreter::compile_exec("def f(x):\n    return x\n").expect("compile");
+    let code = function
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            pyre_interpreter::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
+                Some((**code).clone())
+            }
+            _ => None,
+        })
+        .expect("function code");
+    assert_eq!(
+        code.varnames.len(),
+        1,
+        "slot 0 must be inside the local region"
+    );
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code.clone());
+    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+    let raw = crate::state::concrete_stack_value(frame_ptr, 0).expect("locals array slot 0");
+    assert!(raw.is_null(), "the fixture must start from a NULL slot");
+
+    let mut shadow = CalleeLocalsShadow {
+        concrete_frame: frame_ptr,
+        code_ptr: &code,
+        ..Default::default()
+    };
+    prepare_shadow(&mut shadow);
+
+    let mut tc = fresh_trace_ctx();
+    // Install after `fresh_trace_ctx`: that helper seeds `guard_resume_test`
+    // into the jitcode table, and an earlier install's index can then name
+    // a different body.
+    let helper = helper_name.map(|name| install_carrier_latch_helper(name, &[0, 1]));
+    let helper_index = helper.as_ref().map(|(_, index)| *index);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let lookup = { move |_idx: usize| None };
+    let registers_r = RegisterBank::default();
+    let registers_i = RegisterBank::default();
+    let registers_f = RegisterBank::default();
+    let mut concrete_registers_i = [];
+    let current_op_pc = current_op_pc.map(|pc| CurrentOpPc {
+        pc,
+        effects_at_step: fbw_executed_effect_count(),
+    });
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: Some(shadow),
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            current_op_pc,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            inline_subwalk: true,
+            carrier_resume: true,
+            transparent_helper_subwalk: helper_index.is_some(),
+            transparent_helper_jitcode_index: helper_index,
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &registers_r,
+        registers_i: &registers_i,
+        registers_f: &registers_f,
+        concrete_registers_i: &mut concrete_registers_i,
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = body(
+        &mut wc,
+        frame_ptr as *mut pyre_interpreter::PyFrame,
+        &session,
+    );
+    drop(wc);
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+    result
+}
+
+/// Resume pc that `latch_abort_blackhole`'s test helper path will accept.
+/// `helper_jitcode_arc` prefers the build-time table, so a test-installed
+/// index may resolve to a different body; the end of that body is always
+/// an instruction boundary (`instruction_starts_at`).
+fn resolved_helper_resume_pc(index: usize) -> usize {
+    let jitcode = helper_jitcode_arc(index).expect("helper index resolves");
+    let end = jitcode.code.len();
+    assert_ne!(end, 0, "resolved helper body is not empty");
+    end
+}
+
+fn stamp_resolved_current_op_pc(wc: &WalkContext<'_, '_, crate::state::PyreSym>) -> usize {
+    let index = wc
+        .fbw_mode
+        .transparent_helper_jitcode_index
+        .expect("carrier latch tests install a helper");
+    let resume_pc = resolved_helper_resume_pc(index);
+    wc.frame_state.borrow_mut().current_op_pc = Some(CurrentOpPc {
+        pc: resume_pc,
+        effects_at_step: fbw_executed_effect_count(),
+    });
+    resume_pc
+}
+
+fn stamp_current_op_at(wc: &WalkContext<'_, '_, crate::state::PyreSym>, pc: usize) {
+    wc.frame_state.borrow_mut().current_op_pc = Some(CurrentOpPc {
+        pc,
+        effects_at_step: fbw_executed_effect_count(),
+    });
+}
+
+fn resolved_helper_op_at_zero(
+    wc: &WalkContext<'_, '_, crate::state::PyreSym>,
+) -> crate::jitcode_runtime::DecodedOp {
+    let index = wc
+        .fbw_mode
+        .transparent_helper_jitcode_index
+        .expect("carrier latch tests install a helper");
+    let jitcode = helper_jitcode_arc(index).expect("helper index resolves");
+    crate::jitcode_runtime::decode_op_at(&jitcode.code, 0)
+        .expect("resolved helper body decodes at opcode_position 0")
+}
+
+fn unreconstructable_opref_shadow(shadow: &mut CalleeLocalsShadow) {
+    shadow.set_opref(0, OpRef::ref_op(7));
+}
+
+fn reconstructable_none_shadow(shadow: &mut CalleeLocalsShadow) {
+    use majit_ir::{GcRef, Value};
+    shadow.set_concrete(0, 0, Value::Ref(GcRef(pyre_object::w_none() as usize)));
+}
+
 /// A nested helper already staged a complete image, so the carrier abort
 /// tail keeps that latch (`accepted = false`). The carrier's locals still
 /// live in `CalleeLocalsShadow`; `virtualizable.py write_boxes` publishes
@@ -21453,36 +22314,61 @@ fn carrier_abort_tail_publishes_shadow_when_a_helper_image_is_latched() {
     reset_single_frame_blackhole();
 }
 
-/// A publish failure keeps a deeper helper's image and discards only this
-/// call's own carrier latch. `image_latched_before` is sampled at tail
-/// entry; `accepted` is this call's own latch.
+/// A publish failure with no image latched before entry discards the
+/// carrier image this call just staged. `virtualizable.py write_boxes`
+/// always has every box; `blackhole.py convert_and_run_from_pyjitpl`
+/// only resumes a complete frame chain, so a hole is not a resume.
 #[test]
-fn carrier_publish_failure_disposition_keeps_or_discards_by_who_latched() {
-    use CarrierPublishFailure::{DiscardCarrierImage, KeepDeeperImage};
-
-    let cases = [
-        (true, false, KeepDeeperImage),
-        (true, true, KeepDeeperImage),
-        (false, true, DiscardCarrierImage),
-        (false, false, DiscardCarrierImage),
-    ];
-    for (image_latched_before, accepted, want) in cases {
-        assert_eq!(
-            carrier_publish_failure_disposition(image_latched_before, accepted),
-            want,
-            "image_latched_before={image_latched_before} accepted={accepted}"
-        );
-    }
+fn carrier_publish_failure_discards_carrier_image_when_nothing_was_latched() {
+    with_carrier_abort_ctx(
+        unreconstructable_opref_shadow,
+        None,
+        Some("carrier_publish_failure_no_prior"),
+        |wc, frame, session| {
+            stamp_resolved_current_op_pc(wc);
+            session.borrow_mut().abort_in_subwalk = true;
+            assert!(
+                !abort_blackhole_latched(),
+                "this case starts with no deeper image"
+            );
+            let error = DispatchError::AbortMarkerReached { pc: 0 };
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0)
+            }));
+            #[cfg(debug_assertions)]
+            {
+                assert!(
+                    outcome.is_err(),
+                    "the tail debug_asserts a carrier shadow hole"
+                );
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                assert!(
+                    matches!(outcome, Ok(false)),
+                    "an unreconstructable carrier region is not a carrier latch"
+                );
+            }
+            assert!(
+                !abort_blackhole_latched(),
+                "the carrier image is discarded with the unpublished locals"
+            );
+            assert!(
+                !session.borrow().abort_in_subwalk,
+                "discard_staged_abort drops the one-shot coordinate claim"
+            );
+        },
+    );
 }
 
 /// A written shadow slot with no reconstructable concrete (4e: opref and no
 /// concrete half; 4d: `GcRef::NO_CONCRETE`) cannot supply the carrier region.
 /// `virtualizable.py write_boxes` always has every box; the hole is a
-/// producer deviation tracked separately. A deeper helper already latched a
-/// complete image, so the abort tail keeps that image rather than forcing
-/// `handle_guard_failure` to replay from the guard.
+/// producer deviation. The carrier is a level of the latched frame chain, so
+/// `blackhole.py convert_and_run_from_pyjitpl` must not resume a partial
+/// image: discard whoever latched.
 #[test]
-fn carrier_abort_unreconstructable_shadow_keeps_a_deeper_latched_image() {
+fn carrier_abort_unreconstructable_shadow_discards_a_deeper_latched_image() {
     use majit_ir::{GcRef, Value};
 
     fn run(prepare_shadow: impl FnOnce(&mut CalleeLocalsShadow)) {
@@ -21596,12 +22482,12 @@ fn carrier_abort_unreconstructable_shadow_keeps_a_deeper_latched_image() {
             );
         }
         assert!(
-            abort_blackhole_latched(),
-            "the deeper helper image stays latched"
+            !abort_blackhole_latched(),
+            "a publish hole discards the deeper image; the carrier is a level of that chain"
         );
         assert!(
-            session.borrow().abort_in_subwalk,
-            "keeping the image leaves the one-shot coordinate claim"
+            !session.borrow().abort_in_subwalk,
+            "discard_staged_abort drops the one-shot coordinate claim"
         );
         let raw_after =
             crate::state::concrete_stack_value(frame_ptr, 0).expect("locals array slot 0");
@@ -21705,6 +22591,163 @@ fn carrier_abort_unreconstructable_shadow_asserts_a_producer_hole() {
         &error,
         frame_ptr as *mut pyre_interpreter::PyFrame,
         0,
+    );
+}
+
+/// A deeper image latched before entry is not replaced when the carrier
+/// abort is a non-complete-image error. `pyjitpl.py
+/// run_blackhole_interp_to_cancel_tracing` converts the live framestack
+/// once, from the frame where the abort happened.
+#[test]
+fn carrier_abort_does_not_overwrite_a_deeper_image_on_incomplete_error() {
+    let deeper = dummy_miframe("deeper-carrier-image", 42);
+    with_carrier_abort_ctx(
+        reconstructable_none_shadow,
+        None,
+        Some("carrier_overwrite_guard_helper"),
+        |wc, frame, session| {
+            stamp_resolved_current_op_pc(wc);
+            session.borrow_mut().abort_in_subwalk = true;
+            stage_test_helper_abort_image_at(deeper.jitcode.clone(), 42, "deeper-helper");
+            let before = latched_multi_frame_view().expect("deeper image staged");
+            assert_eq!(before.0, "deeper-helper");
+            assert_eq!(
+                before.1,
+                vec![("deeper-carrier-image".to_string(), 42)],
+                "the staged slot is the deeper helper image"
+            );
+            let error = DispatchError::AbortMarkerReached { pc: 0 };
+            assert!(
+                !error.leaves_complete_image() && !error.is_clean_decline(),
+                "the old else-branch latched over the deeper image on this class"
+            );
+            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            assert!(!accepted, "the carrier must not latch over a deeper image");
+            let after = latched_multi_frame_view().expect("deeper image still latched");
+            assert_eq!(
+                after, before,
+                "the multi-frame slot still holds the deeper image"
+            );
+        },
+    );
+}
+
+/// The carrier's own latch (no image before entry) resumes at the pc
+/// `helper_abort_resume_pc` returns for this frame's `current_op_pc`
+/// stamp (op START). `MIFrame._get_opimpl_method` (`pyjitpl.py`) sets
+/// `self.pc = position` after decode; `_copy_data_from_miframe`
+/// (`blackhole.py`) copies that pc. `error.stop_pc()` may belong to
+/// another jitcode.
+#[test]
+fn carrier_latch_uses_frame_current_op_pc_not_error_stop_pc() {
+    with_carrier_abort_ctx(
+        reconstructable_none_shadow,
+        None,
+        Some("carrier_latch_resume_pc"),
+        |wc, frame, _session| {
+            let resume_pc = stamp_resolved_current_op_pc(wc);
+            let error = DispatchError::AbortMarkerReached { pc: 0 };
+            assert_ne!(
+                error.stop_pc(),
+                resume_pc,
+                "the error coordinate is not this frame's op pc"
+            );
+            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            assert!(accepted, "the carrier latches at its own op pc");
+            let (origin, frames) = latched_multi_frame_view().expect("carrier image latched");
+            assert_eq!(origin, "bridge1361");
+            let top = frames
+                .last()
+                .expect("a latched carrier image has a top frame");
+            assert_eq!(
+                top.1, resume_pc,
+                "the carrier resumes at current_op_pc, not error.stop_pc"
+            );
+        },
+    );
+
+    with_carrier_abort_ctx(
+        reconstructable_none_shadow,
+        None,
+        Some("carrier_latch_unset_op_pc"),
+        |wc, frame, _session| {
+            let error = DispatchError::AbortMarkerReached { pc: 0 };
+            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            assert!(
+                !accepted,
+                "an unset current_op_pc is not a carrier latch; error.stop_pc is only a log"
+            );
+            assert!(
+                !abort_blackhole_latched(),
+                "no image is staged when this frame has not stamped an op pc"
+            );
+        },
+    );
+
+    with_carrier_abort_ctx(
+        reconstructable_none_shadow,
+        None,
+        Some("carrier_latch_completed_op"),
+        |wc, frame, _session| {
+            let op = resolved_helper_op_at_zero(wc);
+            stamp_current_op_at(wc, op.pc);
+            wc.live_after_jit_pc = op.next_pc;
+            let error = DispatchError::AbortMarkerReached { pc: 0 };
+            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            assert!(accepted, "a completed op latches at next_pc");
+            let (origin, frames) = latched_multi_frame_view().expect("carrier image latched");
+            assert_eq!(origin, "bridge1361");
+            let top = frames
+                .last()
+                .expect("a latched carrier image has a top frame");
+            assert_eq!(
+                top.1, op.next_pc,
+                "live_after_jit_pc == next_pc of current_op_pc resumes past the op"
+            );
+        },
+    );
+
+    with_carrier_abort_ctx(
+        reconstructable_none_shadow,
+        None,
+        Some("carrier_latch_no_effect_this_step"),
+        |wc, frame, _session| {
+            let op = resolved_helper_op_at_zero(wc);
+            stamp_current_op_at(wc, op.pc);
+            let error = DispatchError::AbortMarkerReached { pc: 0 };
+            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            assert!(accepted, "no effect this step latches at current_op_pc");
+            let (origin, frames) = latched_multi_frame_view().expect("carrier image latched");
+            assert_eq!(origin, "bridge1361");
+            let top = frames
+                .last()
+                .expect("a latched carrier image has a top frame");
+            assert_eq!(
+                top.1, op.pc,
+                "nothing applied this step resumes at the op start"
+            );
+        },
+    );
+
+    with_carrier_abort_ctx(
+        reconstructable_none_shadow,
+        None,
+        Some("carrier_latch_effect_without_live_after"),
+        |wc, frame, _session| {
+            let op = resolved_helper_op_at_zero(wc);
+            stamp_current_op_at(wc, op.pc);
+            fbw_bump_executed_effect("test-carrier-latch-effect-without-live-after");
+            let error = DispatchError::AbortMarkerReached { pc: 0 };
+            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            assert!(
+                !accepted,
+                "an effect without a published live_after is not a carrier latch"
+            );
+            assert!(
+                !abort_blackhole_latched(),
+                "no image is staged when helper_abort_resume_pc returns None"
+            );
+        },
     );
 }
 
