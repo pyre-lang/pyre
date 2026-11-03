@@ -5795,6 +5795,38 @@ fn may_force_call_value(
     }
 }
 
+/// Conjuncts of the transparent-helper may-force gate other than
+/// `helper_may_force_resumes_in_frame`. True means the residual is declined
+/// unless that pre-check reports the post-call guards resume in the helper.
+fn may_force_needs_helper_frame_resume<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    call_opcode: OpCode,
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    addr: i64,
+) -> bool {
+    ctx.fbw_mode.transparent_helper_subwalk
+        && call_opcode.is_call_may_force()
+        // These helpers are `dont_look_inside_cannot_raise`. Their
+        // call descr is still `EF_RANDOM_EFFECTS` because the graph
+        // is top, so the opcode is may-force. They do not call back
+        // into Python, so the post-call `GUARD_NOT_FORCED` does
+        // not fail and the call can be recorded.
+        && !records_inside_transparent_helper(addr)
+        && !pyre_interpreter::is_rewindable_root_bracket_residual(addr as usize)
+        // `do_residual_call` runs `executor.execute_varargs` on
+        // `call_external_function` (`ccall_*`), then
+        // `direct_call_release_gil` records `CALL_RELEASE_GIL_*`
+        // (`history.record_nospec`). The wrapper releases the GIL around
+        // the C call, so it does not re-enter Python and
+        // `GUARD_NOT_FORCED` cannot fail for a callback.
+        && !call_descr.get_extra_info().is_call_release_gil()
+        // `pyjitpl.py direct_libffi_call` executes `jit_ffi_call_impl_*`
+        // and records `call_release_gil`. The helper is
+        // `dont_look_inside` and does not re-enter Python; the forces
+        // guard belongs to the recorded release-gil op.
+        && call_descr.get_extra_info().oopspecindex != majit_ir::OopSpecIndex::LibffiCall
+}
+
 /// `executor.execute_varargs` for one residual, then the caller's
 /// `record_after_execute` hook.
 ///
@@ -5894,15 +5926,23 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // with such a parameter, so the descent declines before running one and
     // the interpreter makes the call with the argument whole.
     //
-    // A may-force residual inside a transparent helper is declined for the
-    // resume it would need.  Its GUARD_NOT_FORCED and GUARD_NO_EXCEPTION fail
-    // after the Python code it called back into has run: a callback that
-    // raises forces the caller's frame vref on `leave`, and so does one that
-    // escapes its frame.  `capture_resumedata` resumes such a guard inside the
-    // helper's own frame, past the call.  A transparent helper has no frame of
-    // its own, so its guards resume at the Python CALL that entered it, and
-    // the CALL runs the callback a second time -- or, with the exception still
-    // pending at that coordinate, lets it past the CALL's handler.
+    // A may-force residual inside a transparent helper is recorded when its
+    // post-call GUARD_NOT_FORCED / GUARD_NO_EXCEPTION number the helper
+    // section at the post-call `-live-` (`capture_resumedata` on the helper
+    // `MIFrame`). Otherwise it is declined for the resume it would need.
+    // Those guards fail after the Python code it called back into has run: a
+    // callback that raises forces the caller's frame vref on `leave`, and so
+    // does one that escapes its frame. When the helper section is not
+    // numbered, the guards resume at the Python CALL that entered it, and
+    // the CALL runs the callback a second time -- or, with the exception
+    // still pending at that coordinate, lets it past the CALL's handler.
+    // `blackhole_result`'s pc is the residual's next jitcode pc, the same
+    // value the later `ctx.live_after_jit_pc = op.next_pc` assigns before
+    // those guards are captured.
+    let post_call_pc = match blackhole_result {
+        Some((pc, _, _)) => pc,
+        None => usize::MAX,
+    };
     let unsupported_funcbox = if ctx.fbw_mode.inline_subwalk
         && allboxes.first().is_some_and(|b| b.is_constant())
         && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
@@ -5915,28 +5955,9 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             // A real funcptr reached here, so there is no hash to carry, and
             // zero is what this variant spells for that.
             Some(("abi-unsound-arg", addr, 0))
-        } else if ctx.fbw_mode.transparent_helper_subwalk
-            && call_opcode.is_call_may_force()
-            && !records_inside_transparent_helper(addr)
-            && !pyre_interpreter::is_rewindable_root_bracket_residual(addr as usize)
-            && !call_descr.get_extra_info().is_call_release_gil()
-            // `pyjitpl.py direct_libffi_call` executes `jit_ffi_call_impl_*`
-            // and records `call_release_gil`. The helper is
-            // `dont_look_inside` and does not re-enter Python; the forces
-            // guard belongs to the recorded release-gil op.
-            && call_descr.get_extra_info().oopspecindex != majit_ir::OopSpecIndex::LibffiCall
+        } else if may_force_needs_helper_frame_resume(ctx, call_opcode, call_descr, addr)
+            && !super::resume_snapshot::helper_may_force_resumes_in_frame(ctx, op_pc, post_call_pc)
         {
-            // These helpers are `dont_look_inside_cannot_raise`. Their
-            // call descr is still `EF_RANDOM_EFFECTS` because the graph
-            // is top, so the opcode is may-force. They do not call back
-            // into Python, so the guard the comment above is about does
-            // not fail and the call can be recorded.
-            // `do_residual_call` runs `executor.execute_varargs` on
-            // `call_external_function` (`ccall_*`), then
-            // `direct_call_release_gil` records `CALL_RELEASE_GIL_*`
-            // (`history.record_nospec`). The wrapper releases the GIL around
-            // the C call, so it does not re-enter Python and
-            // `GUARD_NOT_FORCED` cannot fail for a callback.
             Some(("may-force-in-transparent-helper", addr, 0))
         } else {
             None
@@ -10697,6 +10718,18 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
                 return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
                     pc: op_pc,
                     symbolic: addr,
+                });
+            }
+            // `do_residual_call` records after `execute_varargs`.
+            if ctx.fbw_mode.inline_subwalk
+                && allboxes.first().is_some_and(|b| b.is_constant())
+                && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
+                && may_force_needs_helper_frame_resume(ctx, call_opcode, call_descr, addr)
+            {
+                ctx.trace_ctx.cut_trace_with_snapshots(patch_pos);
+                return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                    pc: op_pc,
+                    symbolic: 0,
                 });
             }
             fbw_abort_nested_unjournaled_residual(ctx, op_pc, Some(cause))?;
