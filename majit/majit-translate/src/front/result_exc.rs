@@ -7515,10 +7515,21 @@ enum EnvAtHandler {
     Rebuild { env_var: Variable },
 }
 
-/// OverflowError handler: replay the pure path `P`, thread extras, then
+enum PathStep {
+    Op(usize, SpaceOperation),         // (block, op)
+    Link { pred: usize, succ: usize }, // goto edge crossed by the path
+}
+
+enum ReplayStep {
+    Op(SpaceOperation),
+    Rename { input: Variable, from: Variable },
+}
+
+/// OverflowError handler: replay the pure path `P` and renamed hop
+/// inputargs (`unsimplify.py` `split_block`), thread extras, then
 /// call the mapper with the remapped env.
 struct ToIntMapErrPlan {
-    ops: Vec<SpaceOperation>,
+    ops: Vec<ReplayStep>,
     extras: Vec<(Variable, LinkArg)>,
     env: EnvAtHandler,
 }
@@ -7662,7 +7673,8 @@ fn toint_carrier_vars(
 }
 
 /// Ops strictly between `jit_bigint_toint` and `map_err` on the unique
-/// single-exit goto chain `find_carrier_origin` walked. Carrier recasts
+/// single-exit goto chain `find_carrier_origin` walked, plus renamed
+/// hop inputargs (`unsimplify.py` `split_block`). Carrier recasts
 /// are the Result forwarding that fusion erases, not path effects
 /// (`unsimplify.py` `split_block` keeps the raising op).
 fn collect_toint_forward_path(
@@ -7670,19 +7682,21 @@ fn collect_toint_forward_path(
     origin: &CarrierOrigin,
     u: usize,
     map_err_idx: usize,
-) -> Result<Vec<(usize, SpaceOperation)>, String> {
+) -> Result<Vec<PathStep>, String> {
     let name = graph.name.clone();
     let decline = || format!("{name}: toint map_err path is not a unique single-exit goto chain");
     let mut path = Vec::new();
-    let push_ops =
-        |path: &mut Vec<(usize, SpaceOperation)>, block: usize, from: usize, to: usize| {
-            for idx in from..to {
-                if is_origin_recast(origin, block, idx) {
-                    continue;
-                }
-                path.push((block, graph.blocks[block].operations[idx].clone()));
+    let push_ops = |path: &mut Vec<PathStep>, block: usize, from: usize, to: usize| {
+        for idx in from..to {
+            if is_origin_recast(origin, block, idx) {
+                continue;
             }
-        };
+            path.push(PathStep::Op(
+                block,
+                graph.blocks[block].operations[idx].clone(),
+            ));
+        }
+    };
     if origin.a == u {
         if !is_single_exit_goto(graph, u) || origin.call_idx >= map_err_idx {
             return Err(decline());
@@ -7710,11 +7724,13 @@ fn collect_toint_forward_path(
         origin.call_idx + 1,
         graph.blocks[origin.a].operations.len(),
     );
+    let mut pred = origin.a;
     for &hop in &hops {
-        if hop == u {
-            continue;
+        path.push(PathStep::Link { pred, succ: hop });
+        if hop != u {
+            push_ops(&mut path, hop, 0, graph.blocks[hop].operations.len());
         }
-        push_ops(&mut path, hop, 0, graph.blocks[hop].operations.len());
+        pred = hop;
     }
     push_ops(&mut path, u, 0, map_err_idx);
     Ok(path)
@@ -7816,42 +7832,87 @@ fn plan_toint_map_err_path(
     let carrier = toint_carrier_vars(graph, origin, recv);
     let is_carrier = |var: &Variable| carrier.iter().any(|seen| seen == var);
     let mut fresh = Vec::new();
+    let mut aliases = Vec::new();
     let mut extras: Vec<(Variable, LinkArg)> = Vec::new();
-    for (block, op) in &path {
-        if is_exception_raising_op(&op.kind) || !env_slice_op_is_pure_construction(&op.kind, &fresh)
-        {
-            return Err(format!(
-                "{name}: toint map_err path is not a pure construction"
-            ));
-        }
-        for var in op_operand_vars(&op.kind) {
-            if is_carrier(&var) {
-                return Err(format!(
-                    "{name}: toint map_err path reads the jit_bigint_toint result"
-                ));
+    let mut ops = Vec::new();
+    for step in path {
+        match step {
+            PathStep::Link { pred, succ } => {
+                let args = graph.blocks[pred].exits[0].args.clone();
+                for (i, arg) in args.iter().enumerate() {
+                    let LinkArg::Value(v) = arg else {
+                        continue;
+                    };
+                    let Some(input) = graph.blocks[succ].inputargs.get(i).cloned() else {
+                        continue;
+                    };
+                    let target = if fresh.contains(v) {
+                        &mut fresh
+                    } else if aliases.contains(v) {
+                        &mut aliases
+                    } else {
+                        continue;
+                    };
+                    target.push(input.clone());
+                    ops.push(ReplayStep::Rename {
+                        input,
+                        from: v.clone(),
+                    });
+                }
             }
-            if fresh.iter().any(|seen| seen == &var) {
-                continue;
+            PathStep::Op(block, op) => {
+                let identity_of_external = env_identity_operand(&op.kind)
+                    .is_some_and(|operand| !fresh.iter().any(|seen| seen == operand));
+                let pure =
+                    identity_of_external || env_slice_op_is_pure_construction(&op.kind, &fresh);
+                if is_exception_raising_op(&op.kind) || !pure {
+                    return Err(format!(
+                        "{name}: toint map_err path is not a pure construction"
+                    ));
+                }
+                for var in op_operand_vars(&op.kind) {
+                    if is_carrier(&var) {
+                        return Err(format!(
+                            "{name}: toint map_err path reads the jit_bigint_toint result"
+                        ));
+                    }
+                    if fresh.iter().any(|seen| seen == &var)
+                        || aliases.iter().any(|seen| seen == &var)
+                    {
+                        continue;
+                    }
+                    if extras.iter().any(|(seen, _)| seen == &var) {
+                        continue;
+                    }
+                    let arg =
+                        resolve_path_external(graph, origin, block, &var).ok_or_else(|| {
+                            format!(
+                                "{name}: toint map_err path operand is not live at jit_bigint_toint"
+                            )
+                        })?;
+                    extras.push((var, arg));
+                }
+                if let Some(result) = op.result.clone() {
+                    if identity_of_external {
+                        aliases.push(result);
+                    } else {
+                        fresh.push(result);
+                    }
+                }
+                ops.push(ReplayStep::Op(op));
             }
-            if extras.iter().any(|(seen, _)| seen == &var) {
-                continue;
-            }
-            let arg = resolve_path_external(graph, origin, *block, &var).ok_or_else(|| {
-                format!("{name}: toint map_err path operand is not live at jit_bigint_toint")
-            })?;
-            extras.push((var, arg));
-        }
-        if let Some(result) = op.result.clone() {
-            fresh.push(result);
         }
     }
-    let ops: Vec<SpaceOperation> = path.into_iter().map(|(_, op)| op).collect();
+    let mut handler_fresh = fresh;
+    handler_fresh.extend(aliases);
     let env = if fn_item {
         EnvAtHandler::FnItem
     } else {
         match env {
             LinkArg::Const(constant) => EnvAtHandler::PassThrough(LinkArg::Const(constant.clone())),
-            LinkArg::Value(env_var) => env_at_handler_from_var(graph, origin, u, env_var, &fresh)?,
+            LinkArg::Value(env_var) => {
+                env_at_handler_from_var(graph, origin, u, env_var, &handler_fresh)?
+            }
         }
     };
     Ok(ToIntMapErrPlan { ops, extras, env })
@@ -7861,7 +7922,7 @@ fn emit_path_replay(
     graph: &mut FunctionGraph,
     e_id: BlockId,
     e_inputs: &[Variable],
-    ops: &[SpaceOperation],
+    ops: &[ReplayStep],
     extras: &[(Variable, LinkArg)],
 ) -> Vec<(Variable, Variable)> {
     let mut remap: Vec<(Variable, Variable)> = extras
@@ -7869,19 +7930,26 @@ fn emit_path_replay(
         .zip(e_inputs.iter())
         .map(|((path_var, _), input)| (path_var.clone(), input.clone()))
         .collect();
-    for op in ops {
-        let kind = {
-            let remap_var = |var: &Variable| linear_remap(&remap, var);
-            crate::inline::remap_op_kind(&op.kind, &remap_var)
-        };
-        let result = op.result.as_ref().map(|_| graph.alloc_value_var());
-        if let (Some(old), Some(fresh)) = (&op.result, &result) {
-            copy_concretetype(old, fresh);
-            remap.push((old.clone(), fresh.clone()));
+    for step in ops {
+        match step {
+            ReplayStep::Rename { input, from } => {
+                remap.push((input.clone(), linear_remap(&remap, from)));
+            }
+            ReplayStep::Op(op) => {
+                let kind = {
+                    let remap_var = |var: &Variable| linear_remap(&remap, var);
+                    crate::inline::remap_op_kind(&op.kind, &remap_var)
+                };
+                let result = op.result.as_ref().map(|_| graph.alloc_value_var());
+                if let (Some(old), Some(fresh)) = (&op.result, &result) {
+                    copy_concretetype(old, fresh);
+                    remap.push((old.clone(), fresh.clone()));
+                }
+                graph.blocks[e_id.0]
+                    .operations
+                    .push(SpaceOperation { result, kind });
+            }
         }
-        graph.blocks[e_id.0]
-            .operations
-            .push(SpaceOperation { result, kind });
     }
     remap
 }
@@ -7926,11 +7994,16 @@ fn exception_continuation_is_pure_construction(graph: &FunctionGraph, start: Blo
         }
         let mut fresh = incoming_fresh;
         for op in &body.operations[..check_end] {
-            if !env_slice_op_is_pure_construction(&op.kind, &fresh) {
+            let identity_of_external = env_identity_operand(&op.kind)
+                .is_some_and(|operand| !fresh.iter().any(|seen| seen == operand));
+            let pure = identity_of_external || env_slice_op_is_pure_construction(&op.kind, &fresh);
+            if !pure {
                 return false;
             }
             if let Some(result) = op.result.clone() {
-                fresh.push(result);
+                if !identity_of_external {
+                    fresh.push(result);
+                }
             }
         }
         if raises {
@@ -22444,6 +22517,141 @@ mod toint_overflow_tests {
                 base, alias_var,
                 "FieldWrite targets the rebuilt same_as alias"
             ),
+            other => panic!("expected FieldWrite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toint_map_err_external_copy_and_block_param_fuse() {
+        let (mut graph, r, mapped) =
+            map_err_question_graph(CallTarget::method("map_err", Some("Result".into())));
+        let a = graph.startblock;
+        let b = BlockId(producer_block_index(&graph, &mapped).expect("map_err block"));
+        let ctor_op = graph.blocks[b.0].operations.remove(0);
+        let env_m = ctor_op.result.clone().expect("closure env ctor");
+        let (m, m_args) = graph.create_block_with_arg_vars(3);
+        graph.blocks[m.0].operations.push(ctor_op);
+        let w_secs = graph.blocks[a.0].inputargs[0].clone();
+        let extra = graph.blocks[a.0].inputargs[1].clone();
+        graph.set_goto(a, m, vec![r.clone(), w_secs, extra]);
+        let env_b = graph.alloc_value_var();
+        copy_concretetype(&env_m, &env_b);
+        graph.blocks[b.0].inputargs.push(env_b.clone());
+        graph.set_goto(
+            m,
+            b,
+            vec![
+                m_args[0].clone(),
+                m_args[1].clone(),
+                m_args[2].clone(),
+                env_m.clone(),
+            ],
+        );
+        let extra_b = graph.blocks[b.0].inputargs[2].clone();
+        let alias = graph.alloc_value_var();
+        copy_concretetype(&extra_b, &alias);
+        graph.blocks[b.0].operations.insert(
+            0,
+            SpaceOperation {
+                result: Some(alias.clone()),
+                kind: OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: extra_b,
+                    result_ty: ValueType::Ref(None),
+                },
+            },
+        );
+        match &mut graph.blocks[b.0].operations[1].kind {
+            OpKind::FieldWrite { base, value, .. } => {
+                *base = env_b.clone();
+                *value = LinkArg::Value(alias);
+            }
+            other => panic!("expected FieldWrite, got {other:?}"),
+        }
+        match &mut graph.blocks[b.0].operations[2].kind {
+            OpKind::Call { args, .. } => args[1] = LinkArg::Value(env_b.clone()),
+            other => panic!("expected map_err, got {other:?}"),
+        }
+        let prefix_before = ops_before_toint(&graph);
+        let fused = fuse_toint_map_err_sites(
+            &mut graph,
+            &[(r, None, ValueType::Int)],
+            &[map_err_site(mapped)],
+        )
+        .expect("toint map_err fuses");
+        assert_eq!(fused.len(), 1);
+        assert_eq!(
+            ops_before_toint(&graph),
+            prefix_before,
+            "no op is inserted before jit_bigint_toint"
+        );
+        assert_toint_map_err_fused(&graph);
+        let producer = graph
+            .blocks
+            .iter()
+            .position(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| call_is_jit_bigint_toint(&op.kind))
+            })
+            .expect("jit_bigint_toint");
+        let mapper = &graph.blocks[overflow_exit(&graph, producer).target.0];
+        let ctor_idx = mapper
+            .operations
+            .iter()
+            .position(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::SyntheticTransparentCtor { name, .. },
+                        ..
+                    } if name == "fixture::closure"
+                )
+            })
+            .expect("OverflowError handler replays ctor");
+        let same_as_idx = mapper
+            .operations
+            .iter()
+            .position(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as"))
+            .expect("OverflowError handler replays same_as");
+        let write_idx = mapper
+            .operations
+            .iter()
+            .position(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, .. }
+                        if field.name == "__pos_0"
+                            && field.owner_root.as_deref() == Some("fixture::closure")
+                )
+            })
+            .expect("OverflowError handler replays FieldWrite");
+        let mapper_idx = mapper
+            .operations
+            .iter()
+            .position(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                        if name == "call_once"
+                )
+            })
+            .expect("OverflowError catch runs the mapper");
+        assert!(
+            ctor_idx < same_as_idx && same_as_idx < write_idx && write_idx < mapper_idx,
+            "ctor, same_as, and FieldWrite on the rebuilt env precede the mapper"
+        );
+        let ctor_var = mapper.operations[ctor_idx]
+            .result
+            .as_ref()
+            .expect("ctor result");
+        match &mapper.operations[write_idx].kind {
+            OpKind::FieldWrite { base, .. } => {
+                assert_eq!(base, ctor_var, "FieldWrite targets the rebuilt ctor result");
+                assert_ne!(base, &env_b, "FieldWrite base is not env_b");
+                assert_ne!(base, &env_m, "FieldWrite base is not env_m");
+            }
             other => panic!("expected FieldWrite, got {other:?}"),
         }
     }
