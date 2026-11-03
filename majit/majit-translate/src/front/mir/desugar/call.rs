@@ -3503,6 +3503,7 @@ impl<'a> Lowering<'a> {
                 // whole-program builder's pre-existing residual fallback is
                 // separate #346 work, not an implementation of atomic loads.
                 if args.len() == 2 && self.is_atomic_load(&reg) {
+                    let receiver_locals = self.atomic_receiver_through_copies(&arg_locals);
                     let ordering = arg_locals
                         .get(1)
                         .copied()
@@ -3517,8 +3518,17 @@ impl<'a> Lowering<'a> {
                         // pointer (Unsigned) onto the Signed memo.
                         // A recorded borrow through a rebound local stays
                         // unsupported: the re-read would name another object.
-                        if self.atomic_receiver_has_recorded_borrow(&arg_locals)
-                            && !self.atomic_referent_is_stable(&arg_locals)
+                        // A receiver copied from a recorded borrow, each local in the
+                        // chain copying one other local, resolves as that borrow. A
+                        // receiver that a definition reaching the call may
+                        // otherwise copy one into holds the field value, not its
+                        // address, and is unsupported.
+                        if (self.atomic_receiver_has_recorded_borrow(&receiver_locals)
+                            && !self.atomic_referent_is_stable(&receiver_locals))
+                            || self.atomic_receiver_may_copy_a_recorded_borrow(
+                                mir_bb,
+                                &receiver_locals,
+                            )
                         {
                             return Err(LowerError::Unsupported(
                                 "atomic load ordering Relaxed requires address-preserving ordered lowering"
@@ -3529,7 +3539,7 @@ impl<'a> Lowering<'a> {
                             mir_bb,
                             dest_local,
                             target,
-                            &arg_locals,
+                            &receiver_locals,
                         )? {
                             return Ok(());
                         }
@@ -3572,22 +3582,21 @@ impl<'a> Lowering<'a> {
                     // site through the recorded borrow (`atomic_ref_place`),
                     // so `record_quasiimmut_field` still guards it and the
                     // getfield executes as the Acquire load. A receiver with
-                    // no recorded borrow (a copied local, or an
-                    // `Atomic*::from_ptr` view) cannot be re-read there, so
-                    // it stays unsupported rather than reusing an earlier
-                    // read. A borrow whose place goes through a reassigned
-                    // local or a pointer read from a field also stays
-                    // unsupported.
+                    // no recorded borrow (an `Atomic*::from_ptr` view)
+                    // cannot be re-read there, so it stays unsupported
+                    // rather than reusing an earlier read. A borrow whose
+                    // place goes through a reassigned local or a pointer
+                    // read from a field also stays unsupported.
                     let is_acquire = ordering == Some("Acquire");
                     let ordering_label = ordering.unwrap_or("unknown").to_string();
                     if is_acquire
                         && self.atomic_receiver_is_quasi_immutable_field(&args[0])
-                        && self.atomic_referent_is_stable(&arg_locals)
+                        && self.atomic_referent_is_stable(&receiver_locals)
                         && self.bind_dest_to_recorded_atomic_load(
                             mir_bb,
                             dest_local,
                             target,
-                            &arg_locals,
+                            &receiver_locals,
                         )?
                     {
                         return Ok(());
@@ -3654,15 +3663,25 @@ impl<'a> Lowering<'a> {
                         // rebound local is unsupported: writing the place now
                         // would name another object.  The place is copied, not
                         // taken: one borrow stored through twice folds both times.
-                        if self.atomic_receiver_has_recorded_borrow(&arg_locals)
-                            && !self.atomic_referent_is_stable(&arg_locals)
+                        // A receiver copied from a recorded borrow, each local in the
+                        // chain copying one other local, resolves as that borrow. A
+                        // receiver that a definition reaching the call may
+                        // otherwise copy one into holds the field value, not its
+                        // address, and is unsupported.
+                        let receiver_locals = self.atomic_receiver_through_copies(&arg_locals);
+                        if (self.atomic_receiver_has_recorded_borrow(&receiver_locals)
+                            && !self.atomic_referent_is_stable(&receiver_locals))
+                            || self.atomic_receiver_may_copy_a_recorded_borrow(
+                                mir_bb,
+                                &receiver_locals,
+                            )
                         {
                             return Err(LowerError::Unsupported(format!(
                                 "atomic store ordering {} requires address-preserving ordered lowering",
                                 ordering.unwrap_or("unknown")
                             )));
                         }
-                        let referent = arg_locals
+                        let referent = receiver_locals
                             .first()
                             .copied()
                             .flatten()

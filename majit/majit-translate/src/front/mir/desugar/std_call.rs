@@ -2129,6 +2129,212 @@ impl<'a> Lowering<'a> {
             .is_some_and(|local| self.atomic_ref_place.contains_key(&local))
     }
 
+    /// `arg_locals` with `&self` replaced by the borrow recorded on
+    /// [`Lowering::atomic_ref_place`] it copies, when `&self` is a chain of
+    /// copies of one, each local copying a single other local
+    /// ([`Self::single_copy_source`]). A copy names the same
+    /// place as the borrow, so the arms resolve that place at the call.
+    pub(in crate::front::mir) fn atomic_receiver_through_copies(
+        &self,
+        arg_locals: &[Option<usize>],
+    ) -> Vec<Option<usize>> {
+        let mut locals = arg_locals.to_vec();
+        let Some(Some(mut local)) = locals.first().copied() else {
+            return locals;
+        };
+        let mut seen = Vec::new();
+        while !self.atomic_ref_place.contains_key(&local) {
+            if seen.contains(&local) {
+                return locals;
+            }
+            seen.push(local);
+            let Some(src) = self.single_copy_source(local) else {
+                return locals;
+            };
+            local = src;
+        }
+        locals[0] = Some(local);
+        locals
+    }
+
+    /// `&self` is not a recorded borrow, but a definition of it reaching the
+    /// call ([`Self::reaching_definitions`]), or a definition of a local such
+    /// a definition copies that reaches that copy, is a `copy` / `move` of
+    /// one. That definition holds the value the borrow aliased, not an
+    /// address, so neither `raw_load` nor the residual call can use the
+    /// receiver.
+    pub(in crate::front::mir) fn atomic_receiver_may_copy_a_recorded_borrow(
+        &self,
+        mir_bb: usize,
+        arg_locals: &[Option<usize>],
+    ) -> bool {
+        let Some(start) = arg_locals.first().copied().flatten() else {
+            return false;
+        };
+        if self.atomic_ref_place.contains_key(&start) {
+            return false;
+        }
+        let mut seen: Vec<(usize, usize, usize)> = Vec::new();
+        let mut work = vec![(start, mir_bb, self.body.body[mir_bb].statements.len())];
+        while let Some((local, bb, stmt)) = work.pop() {
+            for (def_bb, def_stmt) in self.reaching_definitions(local, bb, stmt) {
+                let Some(idx) = def_stmt else { continue }; // a call result is not a copy
+                let Ok(StmtKind::Assign(_, rvalue)) =
+                    self.body.body[def_bb].statements[idx].stmt_kind_ref()
+                else {
+                    continue;
+                };
+                let Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _) = rvalue else {
+                    continue;
+                };
+                let PlaceKind::Local(src) = place.kind else {
+                    continue;
+                };
+                if self.atomic_ref_place.contains_key(&(src as usize)) {
+                    return true;
+                }
+                let point = (src as usize, def_bb, idx);
+                if !seen.contains(&point) {
+                    seen.push(point);
+                    work.push(point);
+                }
+            }
+        }
+        false
+    }
+
+    /// The local every definition of `local` copies: each one is
+    /// `local = copy src` / `move src` with the same `src`, and `local` is
+    /// not a reassigned parameter, a call destination or mutably borrowed.
+    /// Definite initialisation puts a copy between any redefinition of
+    /// `src` and a use of `local`, so `local` names what `src` names.
+    fn single_copy_source(&self, local: usize) -> Option<usize> {
+        if self.reassigned_param_locals.contains(&local)
+            || self.mutably_borrowed_locals.contains(&local)
+        {
+            return None;
+        }
+        let mut found = None;
+        for (bb_idx, block) in self.body.body.iter().enumerate() {
+            if !self.forward_reached[bb_idx] {
+                continue;
+            }
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                let PlaceKind::Local(index) = dest.kind else {
+                    continue;
+                };
+                if index as usize != local {
+                    continue;
+                }
+                let Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _) = rvalue else {
+                    return None;
+                };
+                let PlaceKind::Local(src) = place.kind else {
+                    return None;
+                };
+                let src = src as usize;
+                if found.is_some_and(|existing| existing != src) {
+                    return None;
+                }
+                found = Some(src);
+            }
+            if matches!(
+                block.term_ref(self.llbc),
+                Ok(TermKind::Call { call, .. })
+                    if matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == local)
+            ) {
+                return None;
+            }
+        }
+        found
+    }
+
+    /// Definitions of `local` that reach the point just before statement
+    /// `stmt` of block `bb` (`stmt == statements.len()` is the terminator):
+    /// on each path back, the last statement assigning `local` kills every
+    /// earlier one. A path that reaches the entry with no definition
+    /// carries the incoming value and adds nothing. A call writing `local`
+    /// is listed as `(block, None)` and kills like an
+    /// assignment on its return edge; on its unwind edge it wrote nothing.
+    fn reaching_definitions(
+        &self,
+        local: usize,
+        bb: usize,
+        stmt: usize,
+    ) -> Vec<(usize, Option<usize>)> {
+        let statements = &self.body.body[bb].statements;
+        let end = stmt.min(statements.len());
+        for idx in (0..end).rev() {
+            let Ok(StmtKind::Assign(dest, _)) = statements[idx].stmt_kind_ref() else {
+                continue;
+            };
+            let PlaceKind::Local(index) = dest.kind else {
+                continue;
+            };
+            if index as usize == local {
+                return vec![(bb, Some(idx))];
+            }
+        }
+
+        let n = self.body.body.len();
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for p in 0..n {
+            if !self.forward_reached[p] {
+                continue;
+            }
+            for s in crate::front::mir::gcroot::block_successors(self.llbc, self.body, p) {
+                preds[s].push(p);
+            }
+        }
+
+        let mut defs = Vec::new();
+        let mut seen = vec![[false; 2]; n];
+        let mut work = Vec::new();
+        for &p in &preds[bb] {
+            work.push((p, bb));
+        }
+        while let Some((p, s)) = work.pop() {
+            let block = &self.body.body[p];
+            let returns_into = matches!(
+                block.term_ref(self.llbc),
+                Ok(TermKind::Call { call, target, .. })
+                    if matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == local)
+                        && *target as usize == s
+            );
+            if seen[p][usize::from(returns_into)] {
+                continue;
+            }
+            seen[p][usize::from(returns_into)] = true;
+            if returns_into {
+                defs.push((p, None));
+                continue;
+            }
+            let mut killed = false;
+            for idx in (0..block.statements.len()).rev() {
+                let Ok(StmtKind::Assign(dest, _)) = block.statements[idx].stmt_kind_ref() else {
+                    continue;
+                };
+                let PlaceKind::Local(index) = dest.kind else {
+                    continue;
+                };
+                if index as usize == local {
+                    defs.push((p, Some(idx)));
+                    killed = true;
+                    break;
+                }
+            }
+            if !killed {
+                for &pp in &preds[p] {
+                    work.push((pp, p));
+                }
+            }
+        }
+        defs
+    }
+
     fn recorded_place_is_stable(&self, place: &Place) -> bool {
         match &place.kind {
             PlaceKind::Global { .. } => true,

@@ -1203,6 +1203,15 @@ impl<'a> Lowering<'a> {
                         ty,
                     }
                 } else if let Some(index_payload) = v.as_object().and_then(|m| m.get("Index")) {
+                    if index_payload
+                        .get("from_end")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    {
+                        return Err(LowerError::Unsupported(format!(
+                            "bb{mir_bb}: suffix index store into an array with no length"
+                        )));
+                    }
                     let idx_var = self.index_offset_var(mir_bb, index_payload)?;
                     // The element place type of `GcRef` peels to the inner
                     // `usize`. A word built from an address cast is
@@ -1650,9 +1659,9 @@ impl<'a> Lowering<'a> {
     }
 
     /// Extract the `offset` operand from an `Index { offset, from_end }`
-    /// projection element and resolve it to a Variable. `from_end` is
-    /// ignored: backwards-from-end indexing only appears in slice patterns
-    /// at the moment, and the lowering uses the offset Variable directly.
+    /// projection element and resolve it to a Variable. A `from_end` index
+    /// names `len - offset`; callers that know the sequence length subtract
+    /// it ([`Self::emit_index_from_end`]), the generic array arms decline it.
     pub(in crate::front::mir) fn index_offset_var(
         &mut self,
         mir_bb: usize,
@@ -6468,6 +6477,15 @@ impl<'a> Lowering<'a> {
                 if let ProjectionElem::Tagged(v) = &elem
                     && let Some(index_payload) = v.as_object().and_then(|m| m.get("Index"))
                 {
+                    if index_payload
+                        .get("from_end")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    {
+                        return Err(LowerError::Unsupported(format!(
+                            "bb{mir_bb}: suffix index read from an array with no length"
+                        )));
+                    }
                     let idx_var = self.index_offset_var(mir_bb, index_payload)?;
                     let copied_bytes = self.graph.name.ends_with("::copied_byte_vec");
                     let string_byte_view = copied_bytes
