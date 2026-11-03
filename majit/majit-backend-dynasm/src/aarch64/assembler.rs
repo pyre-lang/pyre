@@ -5186,13 +5186,9 @@ impl<'a> AssemblerARM64<'a> {
 
         dynasm!(self.mc ; .arch aarch64 ; bl =>save_regs_label);
         if crate::trace_call_diag_id() == Some(self.trace_id) {
-            let fail_index = guard_token
-                .fail_descr
-                .as_fail_descr()
-                .map(|fd| fd.fail_index_per_trace())
-                .unwrap_or(u32::MAX);
+            let site = majit_ir::descr_identity(&guard_token.fail_descr);
             self.emit_push_all_volatile_regs();
-            self.emit_mov_imm64(0, 1_000_000 + i64::from(fail_index) * 10);
+            self.emit_mov_imm64(0, site as i64);
             dynasm!(self.mc ; .arch aarch64 ; mov x1, x29);
             self.emit_mov_imm64(
                 2,

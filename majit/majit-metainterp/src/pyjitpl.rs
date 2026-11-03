@@ -15640,20 +15640,6 @@ impl<M: Clone> MetaInterp<M> {
             .get_procedure_token_on_driver(compiling_jd, cell_token_key)
             .map_or(0, |tok| tok.get_retraced_count());
         let pending_bridge_rd: Option<PendingBridgeRd> = {
-            // `fail_descr.trace_id()` is the bridge origin's allocated
-            // id (non-zero per `alloc_trace_id` starting at 1).  RPython
-            // reaches the same value through the resumekey object's
-            // identity (`compile.py:1049 self.resumekey.original_jitcell_token`);
-            // pyre carries it as a u64 stamped at backend compile time.
-            // No `0` sentinel — the bridge proxy's `trace_id` is
-            // `fail_descr.trace_id()`, stamped at `record_loop_or_bridge`.
-            // Tests read the same descr (`compiled_guard_descr` /
-            // `as_fail_descr`).
-            let source_trace_id = fail_descr.trace_id();
-            debug_assert_ne!(
-                source_trace_id, 0,
-                "compile_bridge expects bridge origin descr.trace_id() to be a real allocated id, not the FINISH-singleton sentinel"
-            );
             // `compile.py compile_trace` reads `resumekey.get_resumestorage()`:
             // the source guard's rd_* pool is the descr's own, whether the
             // guard sits in the root loop or in a bridge the frontend never
