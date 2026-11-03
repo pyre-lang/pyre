@@ -18636,7 +18636,6 @@ pub(crate) fn bind_generator_resume_foriter_item<Sym: WalkSym>(
     iter_op: OpRef,
     caller_parent: InlineParentFrame,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    let root_pc = caller_parent.resume_pc.unwrap_or(op.next_pc);
     let finished = record_send_ex_finished_frame_guard(
         ctx,
         op.pc,
@@ -18648,11 +18647,10 @@ pub(crate) fn bind_generator_resume_foriter_item<Sym: WalkSym>(
     )?;
     if finished {
         // `_send_ex` after `_invoke_execute_frame`: a finished frame runs
-        // `self.frame_is_finished()` then StopIteration. `jit_next` collapses
-        // that to a null FOR_ITER dest. Walk the send_ex tail so
-        // `bh_send_ex_tail` is the dest (and executes the teardown on this
-        // iteration) instead of baking ConstPtr NULL.
-        return walk_send_ex_finished_tail(ctx, op, dst, item, iter_op, root_pc);
+        // `self.frame_is_finished()` then StopIteration. Descend
+        // `generator_frame_is_finished` as that branch, then bind the null
+        // dest `jit_next` collapses StopIteration to.
+        return walk_send_ex_finished_tail(ctx, op, dst, iter_op, frame_box, frame_root);
     }
     // The finished-frame guard records ops and captures resume data; both
     // can minor-collect. `_send_ex` / `PyFrame.FOR_ITER` keep the yielded
@@ -18664,59 +18662,55 @@ pub(crate) fn bind_generator_resume_foriter_item<Sym: WalkSym>(
     publish_generator_resume_foriter_item(ctx, op, dst, item, body_coord)
 }
 
-/// `_send_ex` tail after a finished frame: walk `bh_send_ex_tail` so the
-/// compiled FOR_ITER dest is the residual result, and the tracing iteration
-/// runs `frame_is_finished` through the executor.
+/// `_send_ex`'s finished-frame branch: descend `generator_frame_is_finished`
+/// (`frame_is_finished`), then bind the FOR_ITER dest to null.
 fn walk_send_ex_finished_tail<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     dst: usize,
-    item: OpRef,
     iter_op: OpRef,
-    root_pc: usize,
+    frame_box: OpRef,
+    frame_root: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    let snapshot_sym = ctx.fbw_mode.snapshot_sym;
-    let Some(sym) = (unsafe { snapshot_sym.as_ref() }) else {
+    const PATH: &str = "pyre_interpreter::baseobjspace::generator_frame_is_finished";
+    let Some(jitcode) = crate::jitcode_runtime::pathed_jitcode_cached(PATH) else {
         return Err(DispatchError::callee_inline_unsupported(op.pc));
     };
-    let Some((jitcode_index, resume_pc)) = send_ex_continuation_level() else {
+    let Some(body) = crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode.index()) else {
         return Err(DispatchError::callee_inline_unsupported(op.pc));
     };
-    let middle = majit_metainterp::ReconstructRecipe {
-        code_ptr: std::ptr::null(),
-        jitcode_index,
-        jitcode_pc: resume_pc as i32,
-        nlocals: 0,
-        valuestackdepth: 0,
-        registers_i: Vec::new(),
-        registers_r: vec![item, iter_op],
-        registers_f: Vec::new(),
-        concrete_r: Vec::new(),
-        registers_r_color: Vec::new(),
-        frame: OpRef::NONE,
-        nargs: 0,
-        len_tail: true,
-        ctor_tail: false,
-        rebuilt_frame: None,
-        rebuilt_ec: None,
+    let Some(gen_obj) = walker_concrete_ref_object(ctx, iter_op) else {
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
     };
-    let answer = match crate::trace::walk_len_operator_tail(
-        ctx.trace_ctx,
-        ctx.session,
-        sym,
-        root_pc,
-        &middle,
+    let frame = live_generator_frame(frame_root);
+    if frame.is_null() {
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
+    }
+    // `setup_call` splits by kind. `(gen_obj: r, frame: r, prompt: i)` is
+    // `arg_classes` "rri": ints `[prompt]`, refs `[gen_obj, frame]`.
+    let arg_classes = jitcode.calldescr().arg_classes.as_str();
+    let n_int = arg_classes.chars().filter(|&c| c == 'i').count();
+    let n_ref = arg_classes.chars().filter(|&c| c == 'r').count();
+    if n_int != 1 || n_ref != 2 {
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
+    }
+    let prompt_box = ctx.trace_ctx.const_int(0);
+    super::specialize::run_codewriter_helper_inline_call(
+        ctx,
+        op.pc,
+        &body,
+        &[prompt_box],
+        &[ConcreteValue::Int(0)],
+        &[iter_op, frame_box],
+        &[
+            ConcreteValue::Ref(gen_obj),
+            ConcreteValue::Ref(frame as pyre_object::PyObjectRef),
+        ],
         &[],
-        item,
-    ) {
-        Some(Ok(answer)) => answer,
-        Some(Err(_)) | None => return Err(DispatchError::callee_inline_unsupported(op.pc)),
-    };
-    let concrete = walker_concrete_ref_object(ctx, answer)
-        .map(ConcreteValue::Ref)
-        .unwrap_or(ConcreteValue::Null);
-    write_ref_reg(ctx, op.pc, dst, answer, concrete)?;
-    ctx.frame_state.borrow_mut().vstack_last_ref = answer;
+    )?;
+    let null_box = ctx.trace_ctx.const_null();
+    write_ref_reg(ctx, op.pc, dst, null_box, ConcreteValue::Null)?;
+    ctx.frame_state.borrow_mut().vstack_last_ref = null_box;
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
