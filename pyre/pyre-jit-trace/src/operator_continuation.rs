@@ -147,7 +147,7 @@ impl OperatorTail {
 
     /// The host function the level's residual call runs, and the result bank
     /// its `*_return` and the caller's call-result register share.
-    fn tail_call(self) -> (i64, char) {
+    pub(crate) fn tail_call(self) -> (i64, char) {
         match self {
             OperatorTail::Len => (
                 pyre_interpreter::residual_word_addr!(1, bh_len_tail) as i64,
@@ -263,7 +263,8 @@ pub extern "C" fn bh_format_tail(
 /// `w_call` is the tuple `(w_type, *args)`. The tail never re-enters
 /// `__new__`: it only runs `type_call_init_after_new`. A guard inside the
 /// inlined `__new__`, and a post-return class pin that fails, resume here
-/// with the `__new__` result already in r0.
+/// with the `__new__` result already in r0. A post-return keep check that
+/// fails at trace time records this helper as a residual call instead.
 pub extern "C" fn bh_type_call_new_tail(
     w_newobject: pyre_object::PyObjectRef,
     w_call: pyre_object::PyObjectRef,

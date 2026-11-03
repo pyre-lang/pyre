@@ -5556,13 +5556,14 @@ pub fn type_call_init_after_new(
 ) -> Result<PyObjectRef, PyError> {
     let args_len = args.len();
     let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_type);
-    for &arg in args {
-        let _ = pyre_object::gc_roots::pin_root(arg);
-    }
-    let instance_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_newobject);
+    // `pin_roots` publishes the whole livevar set before its forwarding
+    // query (`framework.py push_roots`).
+    let mut live = Vec::with_capacity(args_len + 2);
+    live.push(w_type);
+    live.extend_from_slice(args);
+    live.push(w_newobject);
+    let root_base = pyre_object::gc_roots::pin_roots(&live);
+    let instance_slot = root_base + 1 + args_len;
     let current_type = || pyre_object::gc_roots::shadow_stack_get(root_base);
     let extend_current_args = |dst: &mut Vec<PyObjectRef>| {
         for i in 0..args_len {

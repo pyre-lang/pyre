@@ -12548,14 +12548,19 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         format_receiver,
                     )?;
                 }
-                if operator_tail == Some(crate::operator_continuation::OperatorTail::TypeCallNew) {
+                let (value, concrete_for_shadow) = if operator_tail
+                    == Some(crate::operator_continuation::OperatorTail::TypeCallNew)
+                {
                     // Keep the `__new__` result only when `objectobject.py
                     // descr__init__` is a no-op: the looked-up `__init__` is
                     // `object.__init__` (or there is no init type), surplus
                     // args require a distinct `__new__`, and neither
                     // `__init__` nor `__new__` lives in a `typeobject.py
                     // write_cell` cell. The class pin covers a replacing
-                    // store; an in-place cell write moves no tag.
+                    // store; an in-place cell write moves no tag. The called
+                    // type and argument count come from the `(w_type, *args)`
+                    // receiver tuple (`typeobject.py descr_call` keeps `self`
+                    // and `__args__`), not from the callee's bound locals.
                     let keep_pinned = (|| -> Result<bool, DispatchError> {
                         let concrete = match concrete_for_shadow {
                             ConcreteValue::Ref(obj)
@@ -12567,10 +12572,27 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             }
                             _ => return Ok(false),
                         };
-                        let w_called_type = match callee_arg_concretes.first() {
-                            Some(ConcreteValue::Ref(t)) if !t.is_null() => *t,
+                        let Some(w_call_box) = format_receiver else {
+                            return Ok(false);
+                        };
+                        let w_call = match ctx.trace_ctx.concrete_of_opref(w_call_box) {
+                            Some(majit_ir::Value::Ref(gc))
+                                if gc != majit_ir::GcRef::NO_CONCRETE =>
+                            {
+                                gc.0 as pyre_object::PyObjectRef
+                            }
                             _ => return Ok(false),
                         };
+                        if w_call.is_null() || unsafe { !pyre_object::is_tuple(w_call) } {
+                            return Ok(false);
+                        }
+                        let w_call_items =
+                            unsafe { pyre_object::w_tuple_items_copy_as_vec(w_call) };
+                        let w_called_type = match w_call_items.first() {
+                            Some(&t) if !t.is_null() => t,
+                            _ => return Ok(false),
+                        };
+                        let has_surplus_args = w_call_items.len() > 1;
                         let w_object = pyre_interpreter::typedef::w_object();
                         let obj_init = unsafe {
                             pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__init__")
@@ -12584,7 +12606,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             return Ok(false);
                         }
                         if let Some(t) = init_type {
-                            if callee_arg_concretes.len() > 1 {
+                            if has_surplus_args {
                                 let found_new = unsafe {
                                     pyre_interpreter::baseobjspace::lookup_in_type(t, "__new__")
                                 };
@@ -12641,17 +12663,51 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             )?;
                         Ok(pinned.is_some())
                     })()?;
-                    if !keep_pinned {
-                        return abort_operator_tail_after_return(
-                            ctx,
-                            op.pc,
-                            operator_tail_caller.as_ref(),
-                            crate::operator_continuation::OperatorTail::TypeCallNew,
-                            value,
-                            format_receiver,
-                        );
+                    if keep_pinned {
+                        (value, concrete_for_shadow)
+                    } else {
+                        // Keep check failed: record `bh_type_call_new_tail` as a
+                        // residual `CallR` so `descr_call`'s `__init__` runs in
+                        // the trace (`pyjitpl.py do_residual_call` /
+                        // `handle_possible_exception`). The helper re-runs the
+                        // post-`__new__` checks at run time, so the call needs
+                        // no guard on the decision.
+                        let residual = match format_receiver {
+                            Some(w_call_box) => {
+                                super::residual_call::record_operator_tail_residual(
+                                    ctx,
+                                    op,
+                                    dst,
+                                    dst_bank,
+                                    crate::operator_continuation::OperatorTail::TypeCallNew,
+                                    value,
+                                    w_call_box,
+                                )?
+                            }
+                            None => super::residual_call::OperatorTailResidual::NotRun,
+                        };
+                        match residual {
+                            super::residual_call::OperatorTailResidual::Raised(raised) => {
+                                return Ok(Some(raised));
+                            }
+                            super::residual_call::OperatorTailResidual::Returned(result) => {
+                                (result, concrete_from_recorded_opref(ctx, result))
+                            }
+                            super::residual_call::OperatorTailResidual::NotRun => {
+                                return abort_operator_tail_after_return(
+                                    ctx,
+                                    op.pc,
+                                    operator_tail_caller.as_ref(),
+                                    crate::operator_continuation::OperatorTail::TypeCallNew,
+                                    value,
+                                    format_receiver,
+                                );
+                            }
+                        }
                     }
-                }
+                } else {
+                    (value, concrete_for_shadow)
+                };
                 if operator_tail == Some(crate::operator_continuation::OperatorTail::BinopLast) {
                     // `descroperation.py binop_impl` checks the last-arm
                     // `_invoke_binop` result after the call. NotImplemented
@@ -12716,11 +12772,20 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             format_receiver,
                         )?;
                         if let Some(operands) = operands {
-                            match super::residual_call::record_operator_tail_raising_residual(
-                                ctx, op, dst, dst_bank, value, operands,
+                            match super::residual_call::record_operator_tail_residual(
+                                ctx,
+                                op,
+                                dst,
+                                dst_bank,
+                                crate::operator_continuation::OperatorTail::BinopLast,
+                                value,
+                                operands,
                             )? {
-                                Some(raised) => return Ok(Some(raised)),
-                                None => {
+                                super::residual_call::OperatorTailResidual::Raised(raised) => {
+                                    return Ok(Some(raised));
+                                }
+                                super::residual_call::OperatorTailResidual::Returned(_)
+                                | super::residual_call::OperatorTailResidual::NotRun => {
                                     return abort_operator_tail_after_return(
                                         ctx,
                                         op.pc,
@@ -13121,14 +13186,12 @@ fn try_walker_inline_type_call_python_new<Sym: WalkSym>(
 
     let mut arg_concretes = vec![ConcreteValue::Ref(w_type), ConcreteValue::Null];
     let mut callee_arg_concretes = vec![ConcreteValue::Ref(w_type)];
-    let mut w_call_concretes = vec![w_type];
     for (i, &arg) in r_args[2..].iter().enumerate() {
         let Some(concrete) = walker_concrete_ref_object(ctx, arg) else {
             return type_call_decline(&format!("argument {i} is not a concrete ref"));
         };
         arg_concretes.push(ConcreteValue::Ref(concrete));
         callee_arg_concretes.push(ConcreteValue::Ref(concrete));
-        w_call_concretes.push(concrete);
     }
 
     let type_pin = residual_call::owner_root_if_gc(w_type as usize);
@@ -13138,11 +13201,24 @@ fn try_walker_inline_type_call_python_new<Sym: WalkSym>(
     let new_func_pin = residual_call::owner_root_if_gc(w_func as usize);
     let mut arg_pins = residual_call::PinnedConcretes::new(&arg_concretes);
     let mut callee_arg_pins = residual_call::PinnedConcretes::new(&callee_arg_concretes);
+    arg_pins.refresh(&mut arg_concretes);
+    callee_arg_pins.refresh(&mut callee_arg_concretes);
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    let type_const = ctx
+        .trace_ctx
+        .const_ref(pinned_obj(&type_pin, w_type) as i64);
     let mut w_call_items = vec![type_const];
     w_call_items.extend_from_slice(&r_args[2..]);
+    // The tuple is built from words reloaded after the pins
+    // (`framework.py gct_fv_gc_malloc` push_roots/pop_roots).
+    let mut w_call_concretes = Vec::with_capacity(callee_arg_concretes.len());
+    for value in &callee_arg_concretes {
+        let ConcreteValue::Ref(obj) = *value else {
+            return type_call_decline("w_call operand is not a ref");
+        };
+        w_call_concretes.push(obj);
+    }
     let w_call_concrete = pyre_object::w_tuple_new_array_backed(w_call_concretes);
     if w_call_concrete.is_null() {
         return type_call_decline("w_call tuple allocation failed");
@@ -19860,12 +19936,13 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
         ));
     }
 
-    let arg_concretes = vec![
+    let mut arg_concretes = vec![
         ConcreteValue::Ref(method),
         ConcreteValue::Null,
         ConcreteValue::Ref(concrete_receiver),
         ConcreteValue::Ref(concrete_other),
     ];
+    let mut arg_pins = residual_call::PinnedConcretes::new(&arg_concretes);
     // Rewind point for the `NotImplemented` arm below.  Nothing above this
     // line records IR or touches the heap cache.
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
@@ -19889,6 +19966,13 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     // allocation would fail `obj.raw() >= from` and residualize the dunder.
     let region_from = ctx.trace_ctx.get_trace_position()._index;
     let session = ctx.session;
+    // The last-arm decision stands on the other operand's type still resolving
+    // no further `_invoke_binop` impl; only its version tag witnesses that, and
+    // a zero tag is uncacheable and cannot be pinned (`typeobject.py mutated`
+    // replaces only a live tag). Keep NotImplemented speculative there.
+    let speculative_rewind = speculative_rewind
+        || (!std::ptr::eq(w_typ_other, w_class)
+            && unsafe { pyre_object::typeobject::w_type_get_version_tag(w_typ_other) } == 0);
     // Last-arm `_invoke_binop` is `perform_call`: do not wrap a rewind
     // guard, so `fbw_binop_rewind_refuse_commit` is a no-op and
     // `store_attr_direct` records. Speculative arms still wrap.
@@ -19900,10 +19984,18 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
         let w_tag = pyre_object::w_int_new(op_tag);
         let w_tag_pin = residual_call::owner_root_if_gc(w_tag as usize);
         let w_tag = pinned_obj(&w_tag_pin, w_tag);
+        // `framework.py gct_fv_gc_malloc`: reload live pointers after a collecting op.
+        arg_pins.refresh(&mut arg_concretes);
+        let ConcreteValue::Ref(live_receiver) = arg_concretes[2] else {
+            unreachable!("arg_concretes[2] is built as a Ref")
+        };
+        let ConcreteValue::Ref(live_other) = arg_concretes[3] else {
+            unreachable!("arg_concretes[3] is built as a Ref")
+        };
         let (lhs_box, rhs_box, concrete_lhs, concrete_rhs) = if receiver_is_lhs {
-            (receiver, other, concrete_receiver, concrete_other)
+            (receiver, other, live_receiver, live_other)
         } else {
-            (other, receiver, concrete_other, concrete_receiver)
+            (other, receiver, live_other, live_receiver)
         };
         let w_operands =
             pyre_object::w_tuple_new_array_backed(vec![concrete_lhs, concrete_rhs, w_tag]);
@@ -19911,6 +20003,7 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
             decline!("operand tuple allocation failed");
         }
         let w_operands_pin = residual_call::owner_root_if_gc(w_operands as usize);
+        arg_pins.refresh(&mut arg_concretes);
         let w_tag_const = ctx.trace_ctx.const_ref(w_tag as i64);
         let tuple_op = crate::helpers::emit_object_tuple_inline(
             ctx.trace_ctx,
@@ -19930,6 +20023,13 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
             cut_declined_subwalk(ctx, pre_fold_pos);
             decline!("operator-tail resume image not capturable");
         }
+        // `_call_binop_impl` last-arm decision is `lookup` /
+        // `lookup_where_with_method_cache`, which promotes the other
+        // operand's type version tag.
+        if !std::ptr::eq(w_typ_other, w_class) {
+            let other_type_const = ctx.trace_ctx.const_ref(w_typ_other as i64);
+            walker_pin_type_version_tag(ctx, op.pc, other_type_const)?;
+        }
         Some((w_tag_pin, w_operands_pin, tuple_op))
     };
     let (operator_tail, operator_tail_receiver) = match last_arm.as_ref() {
@@ -19938,6 +20038,13 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
             Some(*tuple_op),
         ),
         None => (None, None),
+    };
+    arg_pins.refresh(&mut arg_concretes);
+    let ConcreteValue::Ref(concrete_receiver) = arg_concretes[2] else {
+        unreachable!("arg_concretes[2] is built as a Ref")
+    };
+    let ConcreteValue::Ref(concrete_other) = arg_concretes[3] else {
+        unreachable!("arg_concretes[3] is built as a Ref")
     };
     let descent = try_walker_inline_resolved_user_call_inner(
         ctx,

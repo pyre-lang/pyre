@@ -36,6 +36,36 @@ class R:
         return 1
 
 
+class L2:
+    def __init__(self):
+        self.calls = 0
+
+    def __add__(self, other):
+        self.calls += 1
+        if self.calls % 1000 == 0:
+            return NotImplemented
+        return 1
+
+
+class R2:
+    pass
+
+
+def late_radd(n):
+    l = L2()
+    r = R2()
+    total = 0
+    errors = 0
+    for i in range(n):
+        if i == n // 2:
+            R2.__radd__ = lambda self, other: 7
+        try:
+            total += l + r
+        except TypeError:
+            errors += 1
+    return l.calls, errors, total
+
+
 def run(n):
     a = Acc(0)
     one = Acc(1)
@@ -70,4 +100,4 @@ def run(n):
     return a.calls, errors, total, msg, pmsg, r.calls, rerrors, rtotal, rmsg
 
 
-print(run(60000))
+print(run(60000), late_radd(60000))

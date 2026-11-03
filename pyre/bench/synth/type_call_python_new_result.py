@@ -174,3 +174,23 @@ def cell_run():
 
 
 print("cell", cell_run())
+
+
+class VarNewBase:
+    def __new__(*args):
+        return object.__new__(VarNewSub)
+
+
+class VarNewSub(VarNewBase):
+    def __init__(self, *args):
+        self.inited = len(args)
+
+
+def varargs_new(n):
+    total = 0
+    for i in range(n):
+        total += VarNewBase(i, i).inited
+    return total
+
+
+print("varargs_new", varargs_new(N))

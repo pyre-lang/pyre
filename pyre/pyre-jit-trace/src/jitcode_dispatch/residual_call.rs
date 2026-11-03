@@ -9104,56 +9104,66 @@ pub(crate) fn write_residual_call_result_to_dst<Sym: WalkSym>(
     Ok(())
 }
 
-/// Record `CallR` of `bh_binop_last_tail(value, operands)` and execute it.
+/// What [`record_operator_tail_residual`] recorded.
+pub(crate) enum OperatorTailResidual {
+    /// The tail raised: `GUARD_EXCEPTION` recorded, the frame unwinds.
+    Raised((DispatchOutcome, usize)),
+    /// The tail returned: the `CallR` result, already written to `dst`
+    /// and followed by `GUARD_NO_EXCEPTION`.
+    Returned(OpRef),
+    /// Nothing was recorded; the caller latches the tail instead.
+    NotRun,
+}
+
+/// Record `CallR` of the tail's helper ([`crate::operator_continuation::OperatorTail::tail_call`])
+/// on `(value, receiver)` for a tail that has a receiver.
 ///
-/// `descroperation.py binop_impl` raises the unsupported-operand TypeError
-/// after the last-arm `_invoke_binop` returns NotImplemented.
-/// `pyjitpl.py handle_possible_exception` records `GUARD_EXCEPTION` and
-/// `finishframe_exception`. Returns `Some(SubRaise)` when that raise is
-/// recorded; `None` when the residual did not execute-and-raise so the
-/// caller can latch the BinopLast tail.
-pub(crate) fn record_operator_tail_raising_residual<Sym: WalkSym>(
+/// `pyjitpl.py handle_possible_exception` decides `GUARD_EXCEPTION` vs
+/// `GUARD_NO_EXCEPTION`. Users: `descroperation.py binop_impl` (BinopLast,
+/// raises the unsupported-operand TypeError) and `typeobject.py descr_call`
+/// (TypeCallNew, runs `__init__`).
+pub(crate) fn record_operator_tail_residual<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     dst: usize,
     dst_bank: char,
+    tail: crate::operator_continuation::OperatorTail,
     value: OpRef,
-    operands: OpRef,
-) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    let _operands_pin = match ctx.trace_ctx.concrete_of_opref(operands) {
+    receiver: OpRef,
+) -> Result<OperatorTailResidual, DispatchError> {
+    let _value_pin = match ctx.trace_ctx.concrete_of_opref(value) {
         Some(Value::Ref(gc)) if gc != majit_ir::GcRef::NO_CONCRETE => owner_root_if_gc(gc.0),
         _ => None,
     };
-    let funcptr = ctx
-        .trace_ctx
-        .const_int(pyre_interpreter::residual_word_addr!(
-            2,
-            crate::operator_continuation::bh_binop_last_tail
-        ) as i64);
+    let _receiver_pin = match ctx.trace_ctx.concrete_of_opref(receiver) {
+        Some(Value::Ref(gc)) if gc != majit_ir::GcRef::NO_CONCRETE => owner_root_if_gc(gc.0),
+        _ => None,
+    };
+    let funcptr = ctx.trace_ctx.const_int(tail.tail_call().0);
     let descr = majit_metainterp::make_call_descr_with_effect(
         &[Type::Ref, Type::Ref],
         Type::Ref,
         majit_ir::EffectInfo::new(majit_ir::ExtraEffect::CanRaise, OopSpecIndex::None),
     );
-    let allboxes = [funcptr, value, operands];
+    let allboxes = [funcptr, value, receiver];
     // `dispatch_residual_call_iRd_kind` sets this before the post-call
     // `handle_possible_exception` guards so a later `?` still resumes past
     // the executed call (`helper_capability_gap_resume_pc`).
     ctx.live_after_jit_pc = op.next_pc;
-    record_binop_last_tail_call(ctx, op, dst, dst_bank, &allboxes, descr)
+    record_operator_tail_call(ctx, op, dst, dst_bank, &allboxes, descr)
 }
 
-/// Slice-taking half of [`record_operator_tail_raising_residual`]: the
+/// Slice-taking half of [`record_operator_tail_residual`]: the
 /// record hook and `try_execute_residual_call_via_executor_inner` both
 /// need `allboxes`, and a local `[OpRef; 3]` cannot be borrowed by both.
-fn record_binop_last_tail_call<Sym: WalkSym>(
+fn record_operator_tail_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     dst: usize,
     dst_bank: char,
     allboxes: &[OpRef],
     descr: DescrRef,
-) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+) -> Result<OperatorTailResidual, DispatchError> {
     let call_descr = descr
         .as_call_descr()
         .expect("make_call_descr_with_effect returns a CallDescr");
@@ -9184,27 +9194,39 @@ fn record_binop_last_tail_call<Sym: WalkSym>(
             Some(&mut record_call),
         ) {
             Ok(exec) => exec,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(OperatorTailResidual::NotRun),
         }
     };
-    let raised = match resid_exec {
-        ResidualExecOutcome::Executed(result) => result.is_err(),
-        ResidualExecOutcome::Declined(_) => false,
+    let executed_ok = match resid_exec {
+        ResidualExecOutcome::Executed(result) => Some(result.is_err()),
+        ResidualExecOutcome::Declined(_) => None,
     };
-    if !ran || !raised {
-        return Ok(None);
+    if executed_ok.is_none() || !ran {
+        return Ok(OperatorTailResidual::NotRun);
     }
     ctx.live_after_jit_pc = op.next_pc;
     write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
-    walker_record_guard_exception(ctx, op.pc)?;
-    let exc = ctx
-        .last_exc_value()
-        .expect("resid_raised implies last_exc_value seeded by the Err branch");
-    let exc_concrete = ctx.last_exc_value_concrete();
-    Ok(Some((
-        DispatchOutcome::SubRaise { exc, exc_concrete },
-        op.next_pc,
-    )))
+    if executed_ok == Some(true) {
+        walker_record_guard_exception(ctx, op.pc)?;
+        let exc = ctx
+            .last_exc_value()
+            .expect("resid_raised implies last_exc_value seeded by the Err branch");
+        let exc_concrete = ctx.last_exc_value_concrete();
+        return Ok(OperatorTailResidual::Raised((
+            DispatchOutcome::SubRaise { exc, exc_concrete },
+            op.next_pc,
+        )));
+    }
+    ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+    walker_capture_snapshot_for_last_guard_scoped(
+        ctx,
+        op.pc,
+        GuardCaptureScope {
+            residual_call_catch_resume: true,
+            ..GuardCaptureScope::default()
+        },
+    )?;
+    Ok(OperatorTailResidual::Returned(recorded))
 }
 
 pub(crate) fn residual_call_helper_kind_in_body(
