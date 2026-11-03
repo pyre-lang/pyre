@@ -4890,6 +4890,12 @@ pub trait MultipleFrozenPBCReprBase: CanBeNull {
     ///     frozendesc = self.rtyper.annotator.bookkeeper.getdesc(pbc)
     ///     return self.convert_desc(frozendesc)
     /// ```
+    ///
+    /// `Bookkeeper::getdesc_for_const` is the ConstValue counterpart of
+    /// `Bookkeeper.getdesc(pbc)`: `HostObject` reuses `getdesc`,
+    /// `Repr` (`Repr._freeze_`) builds a cached `FrozenDesc::prebuilt`.
+    /// Other values raise `AnnotatorError("unexpected prebuilt constant")`,
+    /// mapped to `TyperError` like neighbouring annotator errors.
     fn convert_const_multiple_frozen_pbc_base(
         &self,
         value: &ConstValue,
@@ -4897,13 +4903,6 @@ pub trait MultipleFrozenPBCReprBase: CanBeNull {
         if matches!(value, ConstValue::None) {
             return self.null_instance_constant();
         }
-        let ConstValue::HostObject(host) = value else {
-            return Err(TyperError::message(format!(
-                "{}.convert_const: non-None value must be a HostObject \
-                 (frozen pbc), got {value:?}",
-                self.class_name()
-            )));
-        };
         let rtyper = self.rtyper_weak().upgrade().ok_or_else(|| {
             TyperError::message(format!(
                 "{}.convert_const: rtyper weak ref dropped",
@@ -4918,7 +4917,7 @@ pub trait MultipleFrozenPBCReprBase: CanBeNull {
         })?;
         let desc = annotator
             .bookkeeper
-            .getdesc(host)
+            .getdesc_for_const(value)
             .map_err(|e| TyperError::message(e.to_string()))?;
         Repr::convert_desc(self, &desc)
     }
@@ -5118,9 +5117,16 @@ impl Repr for MultipleUnrelatedFrozenPBCRepr {
     ///         return convpbc
     /// ```
     ///
-    /// Routes the frozen desc through its concrete per-desc repr,
-    /// extracts the `_ptr`, and wraps it via `convert_pbc` (=
-    /// `fakeaddress`) into the `Address`-typed cache.
+    /// Routes the desc through its concrete per-desc repr, extracts the
+    /// `_ptr`, and wraps it via `convert_pbc` (= `fakeaddress`) into the
+    /// `Address`-typed cache.
+    ///
+    /// No Frozen-kind gate: `MultipleUnrelatedFrozenPBCRepr.convert_desc`
+    /// consumes the desc only as a cache key and as
+    /// `getrepr(SomePBC([desc]))` input. A FunctionDesc whose per-desc
+    /// repr is Void takes the `create_instance` arm. The
+    /// `ConstValue::LLPtr` extract is the return-shape adapter
+    /// (upstream `convert_desc` returns a raw `_ptr`).
     fn convert_desc(&self, desc: &DescEntry) -> Result<Constant, TyperError> {
         let desc_key = desc.desc_key();
         if let Some(cached) = self.converted_pbc_cache.borrow().get(&desc_key) {
@@ -5129,12 +5135,6 @@ impl Repr for MultipleUnrelatedFrozenPBCRepr {
                 LowLevelType::Address,
             ));
         }
-
-        let DescEntry::Frozen(_) = desc else {
-            return Err(TyperError::message(format!(
-                "MultipleUnrelatedFrozenPBCRepr.convert_desc: non-Frozen desc {desc:?}"
-            )));
-        };
 
         // upstream `r = self.rtyper.getrepr(annmodel.SomePBC([frozendesc]))`.
         let rtyper = self.rtyper.upgrade().ok_or_else(|| {
@@ -8965,19 +8965,45 @@ mod pbc_repr_tests {
         ));
     }
 
-    /// Non-HostObject non-None values surface a structured TyperError
-    /// — upstream rpbc.py convert_const only feeds HostObjects on the
-    /// non-None path, so non-HostObjects are upstream-impossible and
-    /// the Rust port rejects them up-front.
+    /// Non-prebuilt non-None values surface `Bookkeeper.getdesc`'s
+    /// `AnnotatorError("unexpected prebuilt constant")`, mapped to
+    /// `TyperError` — `MultipleFrozenPBCReprBase.convert_const` calls
+    /// `Bookkeeper.getdesc(pbc)` / `Bookkeeper::getdesc_for_const`.
     #[test]
-    fn multiple_unrelated_frozen_pbc_repr_convert_const_non_hostobject_rejected() {
+    fn multiple_unrelated_frozen_pbc_repr_convert_const_non_prebuilt_rejected() {
         let (_ann, rtyper) = make_rtyper();
         let r = MultipleUnrelatedFrozenPBCRepr::new(&rtyper);
         let err = r.convert_const(&ConstValue::Int(7)).unwrap_err();
         assert!(
-            err.to_string().contains("must be a HostObject"),
+            err.to_string().contains("unexpected prebuilt constant"),
             "rejection message must be specific, got {err}"
         );
+    }
+
+    /// `MultipleFrozenPBCReprBase.convert_const` on a `ConstValue::Repr`
+    /// (`Repr._freeze_`) equals `convert_desc(getdesc_for_const(repr))`.
+    #[test]
+    fn multiple_unrelated_frozen_pbc_repr_convert_const_repr_equals_convert_desc() {
+        use crate::flowspace::model::ReprConst;
+        use crate::translator::rtyper::rmodel::VoidRepr;
+        use std::sync::Arc;
+
+        let (ann, rtyper) = make_rtyper();
+        let r = MultipleUnrelatedFrozenPBCRepr::new(&rtyper);
+        let handle: Arc<dyn Repr> = Arc::new(VoidRepr::new());
+        let value = ConstValue::Repr(ReprConst::new(Arc::clone(&handle)));
+
+        let via_const = r
+            .convert_const(&value)
+            .expect("convert_const(ConstValue::Repr)");
+        let desc = ann
+            .bookkeeper
+            .getdesc_for_const(&value)
+            .expect("Bookkeeper::getdesc_for_const(Repr)");
+        let via_desc = r
+            .convert_desc(&desc)
+            .expect("convert_desc(getdesc_for_const(Repr))");
+        assert_eq!(via_const, via_desc);
     }
 
     /// `MultipleUnrelatedFrozenPBCRepr.convert_desc(frozendesc)`
@@ -9063,6 +9089,32 @@ mod pbc_repr_tests {
             matches!(c.value, ConstValue::LLPtr(_)),
             "expected a zero-field pbc instance pointer, got {:?}",
             c.value
+        );
+    }
+
+    /// MU analogue of
+    /// `multiple_frozen_pbc_repr_none_access_convert_desc_accepts_function_desc`.
+    /// `MultipleUnrelatedFrozenPBCRepr.convert_desc` has no Frozen kind
+    /// gate; a FunctionDesc's per-desc repr is `FunctionRepr` (Void), so
+    /// the body takes the `create_instance` arm.
+    #[test]
+    fn multiple_unrelated_frozen_pbc_repr_convert_desc_accepts_function_desc() {
+        let (ann, rtyper) = make_rtyper();
+        let r = MultipleUnrelatedFrozenPBCRepr::new(&rtyper);
+        let f = function_entry(&ann.bookkeeper, "func0");
+        let c = r
+            .convert_desc(&f)
+            .expect("MU convert_desc must accept a FunctionDesc");
+        assert_eq!(c.concretetype, Some(LowLevelType::Address));
+        let ConstValue::LLAddress(addr) = &c.value else {
+            panic!("expected LLAddress, got {:?}", c.value);
+        };
+        assert!(
+            matches!(
+                addr,
+                crate::translator::rtyper::lltypesystem::lltype::_address::Fake(_)
+            ),
+            "Void per-desc arm wraps a fresh `pbc` instance via fakeaddress"
         );
     }
 
