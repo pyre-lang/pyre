@@ -3585,10 +3585,10 @@ impl<'a> Lowering<'a> {
                         // pointer (Unsigned) onto the Signed memo.
                         // A recorded borrow through a rebound local stays
                         // unsupported: the re-read would name another object.
-                        // A receiver copied from a recorded borrow, each local in the
-                        // chain copying one other local, resolves as that borrow. A
-                        // receiver that a definition reaching the call may
-                        // otherwise copy one into holds the field value, not its
+                        // A receiver whose definitions all copy, possibly through
+                        // further copies, recorded borrows of one place resolves as
+                        // that borrow. A receiver that a definition reaching the call
+                        // may otherwise copy one into holds the field value, not its
                         // address, and is unsupported.
                         if (self.atomic_receiver_has_recorded_borrow(&receiver_locals)
                             && !self.atomic_referent_is_stable(&receiver_locals))
@@ -3730,10 +3730,10 @@ impl<'a> Lowering<'a> {
                         // rebound local is unsupported: writing the place now
                         // would name another object.  The place is copied, not
                         // taken: one borrow stored through twice folds both times.
-                        // A receiver copied from a recorded borrow, each local in the
-                        // chain copying one other local, resolves as that borrow. A
-                        // receiver that a definition reaching the call may
-                        // otherwise copy one into holds the field value, not its
+                        // A receiver whose definitions all copy, possibly through
+                        // further copies, recorded borrows of one place resolves as
+                        // that borrow. A receiver that a definition reaching the call
+                        // may otherwise copy one into holds the field value, not its
                         // address, and is unsupported.
                         let receiver_locals = self.atomic_receiver_through_copies(&arg_locals);
                         if (self.atomic_receiver_has_recorded_borrow(&receiver_locals)

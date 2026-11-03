@@ -2130,30 +2130,21 @@ impl<'a> Lowering<'a> {
     }
 
     /// `arg_locals` with `&self` replaced by the borrow recorded on
-    /// [`Lowering::atomic_ref_place`] it copies, when `&self` is a chain of
-    /// copies of one, each local copying a single other local
-    /// ([`Self::single_copy_source`]). A copy names the same
-    /// place as the borrow, so the arms resolve that place at the call.
+    /// [`Lowering::atomic_ref_place`] it copies, when `&self` resolves
+    /// to one through copies (`recorded_borrow_through_copies`). A copy
+    /// names the same place as the borrow, so the arms resolve that
+    /// place at the call.
     pub(in crate::front::mir) fn atomic_receiver_through_copies(
         &self,
         arg_locals: &[Option<usize>],
     ) -> Vec<Option<usize>> {
         let mut locals = arg_locals.to_vec();
-        let Some(Some(mut local)) = locals.first().copied() else {
+        let Some(Some(local)) = locals.first().copied() else {
             return locals;
         };
-        let mut seen = Vec::new();
-        while !self.atomic_ref_place.contains_key(&local) {
-            if seen.contains(&local) {
-                return locals;
-            }
-            seen.push(local);
-            let Some(src) = self.single_copy_source(local) else {
-                return locals;
-            };
-            local = src;
+        if let Some(r) = self.recorded_borrow_through_copies(local, &mut Vec::new()) {
+            locals[0] = Some(r);
         }
-        locals[0] = Some(local);
         locals
     }
 
@@ -2203,18 +2194,19 @@ impl<'a> Lowering<'a> {
         false
     }
 
-    /// The local every definition of `local` copies: each one is
-    /// `local = copy src` / `move src` with the same `src`, and `local` is
-    /// not a reassigned parameter, a call destination or mutably borrowed.
-    /// Definite initialisation puts a copy between any redefinition of
-    /// `src` and a use of `local`, so `local` names what `src` names.
-    fn single_copy_source(&self, local: usize) -> Option<usize> {
+    /// The locals the definitions of `local` copy: each definition is
+    /// `local = copy src` / `move src`, and `local` is not a reassigned
+    /// parameter, a call destination or mutably borrowed. Definite
+    /// initialisation puts a copy between any redefinition of a source
+    /// and a use of `local`, so `local` names what the last-run copy's
+    /// source names.
+    fn copy_sources(&self, local: usize) -> Option<Vec<usize>> {
         if self.reassigned_param_locals.contains(&local)
             || self.mutably_borrowed_locals.contains(&local)
         {
             return None;
         }
-        let mut found = None;
+        let mut found = Vec::new();
         for (bb_idx, block) in self.body.body.iter().enumerate() {
             if !self.forward_reached[bb_idx] {
                 continue;
@@ -2236,10 +2228,9 @@ impl<'a> Lowering<'a> {
                     return None;
                 };
                 let src = src as usize;
-                if found.is_some_and(|existing| existing != src) {
-                    return None;
+                if !found.contains(&src) {
+                    found.push(src);
                 }
-                found = Some(src);
             }
             if matches!(
                 block.term_ref(self.llbc),
@@ -2249,7 +2240,46 @@ impl<'a> Lowering<'a> {
                 return None;
             }
         }
-        found
+        if found.is_empty() { None } else { Some(found) }
+    }
+
+    /// The recorded borrow `local` resolves to through copies (see
+    /// `copy_sources`): `local` itself when recorded; otherwise the
+    /// borrow every source resolves to, when all of them resolve, are
+    /// stable (`atomic_referent_is_stable`) and record the same place
+    /// (`place_names_same`), so the place names one referent whichever
+    /// copy ran last.
+    fn recorded_borrow_through_copies(&self, local: usize, seen: &mut Vec<usize>) -> Option<usize> {
+        if self.atomic_ref_place.contains_key(&local) {
+            return Some(local);
+        }
+        if seen.contains(&local) {
+            return None;
+        }
+        seen.push(local);
+        let sources = self.copy_sources(local)?;
+        let mut resolved = Vec::new();
+        for src in sources {
+            resolved.push(self.recorded_borrow_through_copies(src, seen)?);
+        }
+        let first = *resolved.first()?;
+        if resolved.len() > 1 {
+            for &r in &resolved {
+                if !self.atomic_referent_is_stable(&[Some(r)]) {
+                    return None;
+                }
+                let Some(place_r) = self.atomic_ref_place.get(&r) else {
+                    return None;
+                };
+                let Some(place_first) = self.atomic_ref_place.get(&first) else {
+                    return None;
+                };
+                if !place_names_same(place_r, place_first) {
+                    return None;
+                }
+            }
+        }
+        Some(first)
     }
 
     /// Definitions of `local` that reach the point just before statement
@@ -8249,5 +8279,33 @@ impl<'a> Lowering<'a> {
             return Some(arg.clone());
         }
         None
+    }
+}
+
+/// `a` and `b` are the same place expression: the same local or global,
+/// through the same projections (field, deref, index by the same local,
+/// constant index). Types are not compared.
+fn place_names_same(a: &Place, b: &Place) -> bool {
+    match (&a.kind, &b.kind) {
+        (PlaceKind::Local(x), PlaceKind::Local(y)) => x == y,
+        (PlaceKind::Projection(ia, ea), PlaceKind::Projection(ib, eb)) => {
+            let elems_eq = match (ea, eb) {
+                (ProjectionElem::Atom(s), ProjectionElem::Atom(t)) => s == t,
+                (ProjectionElem::Tagged(v), ProjectionElem::Tagged(w)) => v == w,
+                _ => false,
+            };
+            elems_eq && place_names_same(ia, ib)
+        }
+        (
+            PlaceKind::Global {
+                generics: g1,
+                id: i1,
+            },
+            PlaceKind::Global {
+                generics: g2,
+                id: i2,
+            },
+        ) => i1 == i2 && g1 == g2,
+        _ => false,
     }
 }
