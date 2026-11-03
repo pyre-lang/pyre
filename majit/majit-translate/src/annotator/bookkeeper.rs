@@ -5571,13 +5571,36 @@ impl Bookkeeper {
             | ConstValue::SpecTag(_)
             | ConstValue::Atom(_)
             | ConstValue::Placeholder
-            | ConstValue::Opaque(_)
-            | ConstValue::Desc(_) => {
-                // Code / Graphs / SpecTag / Atom / Placeholder / Opaque /
-                // Desc cover internal flowspace / host-carrier values that
+            | ConstValue::Opaque(_) => {
+                // Code / Graphs / SpecTag / Atom / Placeholder / Opaque
+                // cover internal flowspace / host-carrier values that
                 // upstream never feeds into immutablevalue. Keep the
                 // fail-fast stub so any unexpected call-site surfaces
                 // a clear error rather than silent stub-SomePBC.
+                Err(AnnotatorError::new(format!(
+                    "Bookkeeper.immutablevalue({x:?}): internal ConstValue variant \
+                     has no upstream immutablevalue branch"
+                )))
+            }
+            ConstValue::Desc(_) => {
+                // `ConstValue::Desc` is `rpbc.py`
+                // `pairtype(MultipleFrozenPBCReprBase, SingleFrozenPBCRepr)
+                // .convert_from_to` → `inputconst(Void, r_pbc2.frozendesc)`.
+                // Upstream `bookkeeper.py` `immutablevalue` of that Python
+                // desc object is the user-instance arm
+                // (`SomeInstance(getuniqueclassdef(FrozenDesc))`) only
+                // because Desc is a non-`__builtin__` class; pyre has no
+                // such host ClassDef.
+                // `rtyper.py` `LowLevelOpList.gendirectcall` Void args
+                // then require `SomePBC | SomeNone` and would raise
+                // `TyperError("non-PBC Void argument")` on that
+                // SomeInstance.
+                // `bookkeeper.py` `getdesc` of a Desc instance is
+                // `AnnotatorError("unexpected prebuilt constant")`; pyre
+                // `getdesc_for_const` already matches. No production
+                // caller feeds `ConstValue::Desc` to `immutablevalue`
+                // (convert_from_to is rtyper-time; pyre `gendirectcall`
+                // does not yet call `annotation` on Void).
                 Err(AnnotatorError::new(format!(
                     "Bookkeeper.immutablevalue({x:?}): internal ConstValue variant \
                      has no upstream immutablevalue branch"
@@ -12172,6 +12195,25 @@ mod tests {
         };
         assert_eq!(mixed_pbc.descriptions.len(), 2);
         assert!(!mixed_pbc.is_constant());
+    }
+
+    #[test]
+    fn immutablevalue_desc_is_internal_error() {
+        let bk = Rc::new(Bookkeeper::new());
+        let desc = DescEntry::function(Rc::new(RefCell::new(FunctionDesc::new(
+            Rc::clone(&bk),
+            None,
+            "a",
+            Signature::new(vec![], None, None),
+            None,
+            None,
+        ))));
+        let x = ConstValue::Desc(crate::flowspace::model::DescConst::new(desc));
+        let err = bk
+            .immutablevalue(&x)
+            .expect_err("Desc has no host ClassDef");
+        let msg = err.to_string();
+        assert!(msg.contains("internal ConstValue"), "{msg}");
     }
 
     #[test]

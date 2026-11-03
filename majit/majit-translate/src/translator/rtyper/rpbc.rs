@@ -9621,9 +9621,11 @@ mod pbc_repr_tests {
 
         let (ann, rtyper) = make_rtyper();
         let f = frozen_entry(&ann.bookkeeper, "frozen0");
+        let inner = f.as_frozen().expect("frozen desc");
         let r_single: std::sync::Arc<dyn Repr> =
             std::sync::Arc::new(SingleFrozenPBCRepr::new(f.clone()));
         let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+        let before = Rc::strong_count(&inner);
 
         let r_mu: std::sync::Arc<dyn Repr> =
             std::sync::Arc::new(MultipleUnrelatedFrozenPBCRepr::new(&rtyper));
@@ -9642,6 +9644,7 @@ mod pbc_repr_tests {
             );
         };
         assert_eq!(d_mu.as_desc().desc_key(), f.desc_key());
+        drop(c_mu);
 
         let (a, b) = merge_frozen_pair(&ann.bookkeeper, "frozen1", "frozen2");
         let r_mf = getFrozenPBCRepr(&rtyper, &SomePBC::new(vec![a, b], false)).unwrap();
@@ -9661,6 +9664,16 @@ mod pbc_repr_tests {
             );
         };
         assert_eq!(d_mf.as_desc().desc_key(), f.desc_key());
+        drop(c_mf);
+
+        for _ in 0..32 {
+            let converted =
+                pair_convert_from_to(r_mu.as_ref(), r_single.as_ref(), &v_mu, &mut llops)
+                    .expect("MU × Single")
+                    .expect("Base × Single converts");
+            drop(converted);
+        }
+        assert_eq!(Rc::strong_count(&inner), before);
     }
 
     /// `pairtype(FunctionRepr, MultipleFrozenPBCRepr).convert_from_to`:
