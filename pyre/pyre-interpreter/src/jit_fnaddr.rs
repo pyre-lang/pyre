@@ -7234,8 +7234,9 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
 }
 
 /// Addresses of every `global_hook!` [`majit_gc::hook_cell::FnPtrCell`]
-/// static, captured in the defining crate. The front keys the emit by the
-/// GlobalDecl's type, not by a name list.
+/// static and every `oncelock_fn_static!` `OnceLock<fn>` static, captured
+/// in the defining crate. The front keys the emit by the GlobalDecl's
+/// type, not by a name list.
 pub fn jit_static_fnptrcell_addrs() -> Vec<(&'static str, i64)> {
     let mut v = Vec::new();
     majit_ir::helper_fnaddr::for_each_fnptrcell_static(|desc| {

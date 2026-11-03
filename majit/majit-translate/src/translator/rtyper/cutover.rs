@@ -9248,6 +9248,81 @@ mod tests {
         );
     }
 
+    /// A `OnceLock<fn() -> i64>` static is a prebuilt `ConstRefAddr`;
+    /// `get` is a signed-word `raw_load` of `Ptr(FuncType)` at the
+    /// payload offset (`history.getkind` `'int'`); calling the loaded
+    /// pointer is `SomePtr.call`.
+    #[test]
+    fn oncelock_fn_get_and_call_dual_gate_match_load_is_func_ptr_kind_i() {
+        let _lock = anchor_lock();
+        let mut graph = LegacyGraph::new("oncelock_fn_get_and_call");
+        let entry = graph.startblock;
+        let cell = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x1111), true)
+            .unwrap();
+        cell.set_concretetype(Some(LowLevelType::Address));
+        let offset = graph.push_op_var(entry, OpKind::ConstInt(8), true).unwrap();
+        let load = graph
+            .push_op_var(
+                entry,
+                OpKind::RawLoad {
+                    base: cell,
+                    offset,
+                    item_ty: ValueType::Int,
+                    itemsize: crate::layout::target_word_size(),
+                    is_item_signed: true,
+                },
+                true,
+            )
+            .unwrap();
+        let ft =
+            crate::annotator::bookkeeper::func_type_from_fn_spelling("fn() -> i64", &|_| false)
+                .expect("fn() -> i64 spelling");
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
+        load.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Func(ft),
+        }))));
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::IndirectCall {
+                    funcptr: load.clone(),
+                    args: vec![],
+                    graphs: None,
+                    family_key: None,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(result.clone()));
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let graphs = crate::codewriter::call::GraphStore::default();
+        let outcome = dual_gate_check_with_registry(&graph, &registry, &graphs).expect("dual-gate");
+        let DualGateOutcome::Match {
+            real_value_to_var, ..
+        } = outcome
+        else {
+            panic!("OnceLock<fn> get+call graph must Match, got {outcome:?}");
+        };
+        assert_eq!(kind_of_in(&real_value_to_var, &load), ConcreteType::Signed);
+        let typed = real_value_to_var.get(&load).expect("load in value_to_var");
+        match typed.concretetype() {
+            Some(LowLevelType::Ptr(p)) if matches!(p.TO, PtrTarget::Func(_)) => {}
+            other => panic!("load must be Ptr(FuncType), got {other:?}"),
+        }
+        match typed.annotation.borrow().as_ref().map(|rc| rc.as_ref()) {
+            Some(crate::annotator::model::SomeValue::Ptr(_)) => {}
+            other => panic!("load annotation must be SomePtr, got {other:?}"),
+        }
+        assert_eq!(
+            kind_of_in(&real_value_to_var, &result),
+            ConcreteType::Signed
+        );
+    }
+
     /// `warmspot.py check_access_directly_sanity`: a graph
     /// `collect_called_graphs(entry_point_graph)` reaches that is not
     /// in `jit_graphs` may not be `access_directly`.

@@ -204,12 +204,12 @@ pub struct FrameResumeArgs {
 }
 
 type EvalFn = fn(&mut PyFrame, Option<&mut FrameResumeArgs>) -> PyResult;
-static EVAL_OVERRIDE: OnceLock<EvalFn> = OnceLock::new();
+majit_gc::oncelock_fn_static!(static EVAL_OVERRIDE: OnceLock<EvalFn>);
 type ThreadEntryFn = fn();
-static THREAD_ENTRY_HOOK: OnceLock<ThreadEntryFn> = OnceLock::new();
+majit_gc::oncelock_fn_static!(static THREAD_ENTRY_HOOK: OnceLock<ThreadEntryFn>);
 
 type DepthBumpFn = fn() -> Option<Box<dyn std::any::Any>>;
-static DEPTH_BUMP_OVERRIDE: OnceLock<DepthBumpFn> = OnceLock::new();
+majit_gc::oncelock_fn_static!(static DEPTH_BUMP_OVERRIDE: OnceLock<DepthBumpFn>);
 
 thread_local! {
     /// Activation accounting for a thread that has no `ExecutionContext`
@@ -494,7 +494,7 @@ pub fn eval_current_frame_raw(frame: &mut PyFrame) -> PyObjectRef {
 // the JIT side registers a hook at boot that pyre-interpreter calls
 // through.  Mirrors the `EVAL_OVERRIDE` pattern above.
 type SetJitParamFn = fn(name: &str, value: i64);
-static SET_JIT_PARAM_HOOK: OnceLock<SetJitParamFn> = OnceLock::new();
+majit_gc::oncelock_fn_static!(static SET_JIT_PARAM_HOOK: OnceLock<SetJitParamFn>);
 
 /// Register the hook that forwards `set_jit_param` calls into the JIT
 /// runtime's `WarmState::set_param`. Called by pyre-jit at startup.
@@ -517,7 +517,7 @@ pub fn set_jit_param(name: &str, value: i64) {
 // routes through. The JIT owns the authoritative parser, so this forwards the
 // whole string and returns `Err(())` on a malformed string (rlib/jit.py).
 type SetJitParamStringFn = fn(text: &str) -> Result<(), ()>;
-static SET_JIT_PARAM_STRING_HOOK: OnceLock<SetJitParamStringFn> = OnceLock::new();
+majit_gc::oncelock_fn_static!(static SET_JIT_PARAM_STRING_HOOK: OnceLock<SetJitParamStringFn>);
 
 /// Register the hook that applies a JIT-parameter string via the JIT
 /// runtime's `set_user_param`. Called by pyre-jit at startup.
@@ -538,7 +538,7 @@ pub fn set_jit_param_string(text: &str) -> Result<(), ()> {
 // `jit.set_param(None, 'enable_opts', text)`. The value is one string,
 // not a comma-separated parameter list.
 type SetJitParamEnableOptsFn = fn(value: &str);
-static SET_JIT_PARAM_ENABLE_OPTS_HOOK: OnceLock<SetJitParamEnableOptsFn> = OnceLock::new();
+majit_gc::oncelock_fn_static!(static SET_JIT_PARAM_ENABLE_OPTS_HOOK: OnceLock<SetJitParamEnableOptsFn>);
 
 /// Register the hook that forwards `enable_opts` into
 /// `WarmState::set_param_enable_opts`. Called by pyre-jit at startup.
@@ -563,7 +563,7 @@ pub fn set_jit_param_enable_opts(value: &str) {
 /// `warmspot.py rewrite_can_enter_jits` inserts `can_enter_jit` at the start
 /// of a portal that has none; this hook is that `maybe_enter_jit` body.
 type UnpackMergeFn = fn(greenkey: PyObjectRef, w_iterator: PyObjectRef, items: PyObjectRef);
-static UNPACK_MERGE_HOOK: OnceLock<UnpackMergeFn> = OnceLock::new();
+majit_gc::oncelock_fn_static!(static UNPACK_MERGE_HOOK: OnceLock<UnpackMergeFn>);
 
 pub fn register_unpack_merge_hook(f: UnpackMergeFn) {
     let _ = UNPACK_MERGE_HOOK.set(f);
@@ -586,7 +586,7 @@ type GenEntryMergeFn = fn(
     w_arg: PyObjectRef,
     pycode: PyObjectRef,
 ) -> Option<Result<PyObjectRef, crate::PyError>>;
-static GENENTRY_MERGE_HOOK: OnceLock<GenEntryMergeFn> = OnceLock::new();
+majit_gc::oncelock_fn_static!(static GENENTRY_MERGE_HOOK: OnceLock<GenEntryMergeFn>);
 
 pub fn register_genentry_merge_hook(f: GenEntryMergeFn) {
     let _ = GENENTRY_MERGE_HOOK.set(f);
@@ -690,7 +690,7 @@ pub fn genentry_body_result_for(w_gen: PyObjectRef) -> Option<Result<PyObjectRef
 /// body runs directly — the no-JIT path.
 type UnpackPortalRunnerFn =
     fn(PyObjectRef, PyObjectRef, PyObjectRef) -> Result<PyObjectRef, crate::PyError>;
-static UNPACK_PORTAL_RUNNER_HOOK: OnceLock<UnpackPortalRunnerFn> = OnceLock::new();
+majit_gc::oncelock_fn_static!(static UNPACK_PORTAL_RUNNER_HOOK: OnceLock<UnpackPortalRunnerFn>);
 
 pub fn register_unpack_portal_runner_hook(f: UnpackPortalRunnerFn) {
     let _ = UNPACK_PORTAL_RUNNER_HOOK.set(f);

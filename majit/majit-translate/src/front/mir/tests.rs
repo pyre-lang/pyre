@@ -25847,7 +25847,7 @@ fn prebuilt_strategy_holder_keeps_its_instance_repr() {
     );
 
     // This registry row is the Python object returned by the accessor,
-    // not the opaque OnceLock global that initializes it. Do not infer
+    // not the OnceLock global that initializes it. Do not infer
     // the container's class from the registered object's address.
     let refs = [("noneobject::NONE_SINGLETON", addr)];
     let graph = crate::test_support::lower_function_with_static_addrs(

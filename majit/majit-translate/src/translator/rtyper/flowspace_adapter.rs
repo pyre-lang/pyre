@@ -540,7 +540,7 @@ fn const_ref_addr_define_hlvalue(addr: i64, result: &Variable) -> Hlvalue {
             LowLevelType::Void,
         ))
     } else if matches!(result.concretetype(), Some(LowLevelType::Address)) {
-        // A `FnPtrCell` static is a raw host address
+        // A `FnPtrCell` / `OnceLock<fn>` static is a raw host address
         // (`llmemory.Address`), not a GCREF singleton. `raw_load`
         // keeps an int-kinded addr (`inputarg_llop_intkind_or_signed`).
         use crate::translator::rtyper::lltypesystem::lltype::_address;
@@ -742,10 +742,10 @@ fn raw_item_lltype(
     })
 }
 
-/// `raw_load` TYPE. A dest stamped `Ptr(FuncType)` (`FnPtrCell::get`)
-/// keeps that lltype so `_LLOpEntry.compute_result_annotation` binds
-/// `SomePtr` while the machine descr stays a signed word
-/// (`history.getkind` `'int'`).
+/// `raw_load` TYPE. A dest stamped `Ptr(FuncType)` (`FnPtrCell::get` /
+/// `OnceLock<fn>::get`) keeps that lltype so
+/// `_LLOpEntry.compute_result_annotation` binds `SomePtr` while the
+/// machine descr stays a signed word (`history.getkind` `'int'`).
 fn raw_load_item_lltype(
     item_ty: &crate::model::ValueType,
     itemsize: usize,

@@ -4361,7 +4361,9 @@ pub fn funccall(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
 type ExcInfoDirectFn = fn(&mut crate::pyframe::PyFrame) -> PyObjectRef;
 static SYS_EXC_INFO_CODE: std::sync::atomic::AtomicPtr<PyObject> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-static SYS_EXC_INFO_DIRECT_FN: std::sync::OnceLock<ExcInfoDirectFn> = std::sync::OnceLock::new();
+majit_gc::oncelock_fn_static!(
+    static SYS_EXC_INFO_DIRECT_FN: std::sync::OnceLock<ExcInfoDirectFn>
+);
 
 /// Register the BuiltinCode pointer + direct helper for `sys.exc_info`.
 ///

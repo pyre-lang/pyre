@@ -3538,27 +3538,34 @@ impl<'a> Lowering<'a> {
                 // consumer LLBC, so the load is a word-sized `raw_load`
                 // at offset 0 rather than a field read.
                 if args.len() == 1 && self.is_fnptrcell_get(&reg) {
-                    let offset = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(offset.clone()),
-                        kind: OpKind::ConstInt(0),
-                    });
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
-                    stamp_fn_ptr_load_result(&res, &call.dest.ty, self.llbc);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::RawLoad {
-                            base: args[0].clone(),
-                            offset,
-                            item_ty: ValueType::Int,
-                            itemsize: crate::layout::target_word_size(),
-                            is_item_signed: true,
-                        },
-                    });
+                    let res =
+                        self.emit_signed_word_fn_ptr_load(bb_id, args[0].clone(), 0, &call.dest.ty);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `OnceLock::get` on a `OnceLock<fn>` receiver is a load
+                // of the payload word as `Option<F>` with `F: Ptr(FuncType)`
+                // (`NicheIntNull::FnPtr`, `history.getkind` `'int'`). Null
+                // / uninitialized is `None`. The offset is the LLBC layout
+                // of the `value` field. The initializer does not run
+                // (`bookkeeper.immutablevalue` is the prebuilt address, not
+                // a baked payload). Layout missing from the artefact leaves
+                // the Call so the miss names `OnceLock::get`.
+                if args.len() == 1
+                    && self.is_oncelock_fn_get(&reg, first_arg_ty.as_ref())
+                    && let Some(offset) = first_arg_ty
+                        .as_ref()
+                        .and_then(|ty| oncelock_fn_payload_offset(ty, self.llbc))
+                {
+                    let stamp_ty = first_arg_ty
+                        .as_ref()
+                        .and_then(|ty| tyref_adt_generics_type_arg(ty, 0, self.llbc));
+                    let stamp = stamp_ty.as_ref().unwrap_or(&call.dest.ty);
+                    let res =
+                        self.emit_signed_word_fn_ptr_load(bb_id, args[0].clone(), offset, stamp);
                     self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -9793,9 +9800,44 @@ fn passes_attr_as_rust_heap(formal: Option<&TyRef>, place: Option<&TyRef>, llbc:
     })
 }
 
-/// Stamp a `FnPtrCell::get` load dest as `Ptr(FuncType)` so `raw_load`'s
-/// TYPE constant annotates `SomePtr` (`lltype_to_annotation`) while
-/// `history.getkind` stays `'int'`.
+impl Lowering<'_> {
+    /// Signed-word `raw_load` of a fn-pointer niche (`FnPtrCell::get` at
+    /// offset 0, `OnceLock<fn>::get` at the LLBC payload offset).
+    fn emit_signed_word_fn_ptr_load(
+        &mut self,
+        bb_id: crate::model::BlockId,
+        base: Variable,
+        offset: i64,
+        stamp_ty: &TyRef,
+    ) -> Variable {
+        let offset_v = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(offset_v.clone()),
+            kind: OpKind::ConstInt(offset),
+        });
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        stamp_fn_ptr_load_result(&res, stamp_ty, self.llbc);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::RawLoad {
+                base,
+                offset: offset_v,
+                item_ty: ValueType::Int,
+                itemsize: crate::layout::target_word_size(),
+                is_item_signed: true,
+            },
+        });
+        res
+    }
+}
+
+/// Stamp a `FnPtrCell::get` / `OnceLock<fn>::get` load dest as
+/// `Ptr(FuncType)` so `raw_load`'s TYPE constant annotates `SomePtr`
+/// (`lltype_to_annotation`) while `history.getkind` stays `'int'`.
 fn stamp_fn_ptr_load_result(res: &Variable, dest_ty: &TyRef, llbc: &Llbc) {
     let ft = tyref_fn_ptr_spelling(dest_ty, llbc)
         .into_iter()

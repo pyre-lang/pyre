@@ -5608,6 +5608,45 @@ pub(in crate::front::mir) fn tyref_is_fnptrcell(ty: &TyRef, llbc: &Llbc) -> bool
         .is_some_and(|p| path_ends_with_segments(&p, "majit_gc::hook_cell::FnPtrCell"))
 }
 
+/// `std::sync::OnceLock<F>` (or `core::sync::once_lock::OnceLock<F>`)
+/// whose `F` is a bare function pointer. Keyed on the ADT path and
+/// generic 0, never on the static's name.
+pub(in crate::front::mir) fn tyref_is_oncelock_fn(ty: &TyRef, llbc: &Llbc) -> bool {
+    adt_path_of_tyref(ty, llbc)
+        .is_some_and(|p| path_ends_with_segments(&p, "sync::once_lock::OnceLock"))
+        && tyref_adt_generics_type_arg(ty, 0, llbc)
+            .is_some_and(|payload| tyref_is_bare_fn_ptr(&payload, llbc))
+}
+
+fn tyref_is_bare_fn_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc).is_some_and(|node| type_node_is_fn_ptr(node, llbc))
+}
+
+/// ADT `TypeDecl` of `ty`, after stripping `Ref` / hash-cons wrappers.
+pub(in crate::front::mir) fn tyref_type_decl<'a>(
+    ty: &'a TyRef,
+    llbc: &'a Llbc,
+) -> Option<&'a TypeDecl> {
+    let node = tyref_node(ty, llbc)?;
+    let node = strip_ty_wrappers(node, llbc)?;
+    llbc.type_by_id(adt_node_def_id(node)?)
+}
+
+/// Byte offset of the `OnceLock<fn>` payload word — the LLBC `value`
+/// field. `OnceLock` is `repr(Rust)` with a platform-dependent layout,
+/// so only Charon's computed layout may be used: the `value` field
+/// offset from `field_offsets` (`type_decl_struct_field_offset`). `None`
+/// when that offset is missing or unchosen; the caller must not fold
+/// `OnceLock::get`.
+pub(in crate::front::mir) fn oncelock_fn_payload_offset(ty: &TyRef, llbc: &Llbc) -> Option<i64> {
+    let td = tyref_type_decl(ty, llbc)?;
+    let fields = type_decl_struct_fields(td, llbc)?;
+    let idx = fields
+        .iter()
+        .position(|f| f.name.as_deref() == Some("value"))?;
+    type_decl_struct_field_offset(td, llbc, idx).and_then(|off| i64::try_from(off).ok())
+}
+
 /// Whether `td` declares a field named `name` — a struct field, or any
 /// enum variant's field (Model A flattens variant fields into the same
 /// class attr namespace).

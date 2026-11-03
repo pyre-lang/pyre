@@ -1965,6 +1965,416 @@ fn fnptrcell_get_lowers_to_signed_raw_load_of_func_ptr() {
     );
 }
 
+fn i64_fn_ptr() -> serde_json::Value {
+    serde_json::json!({
+        "FnPtr": {
+            "skip_binder": {
+                "inputs": [],
+                "output": {"Scalar": {"Integer": {"Signed": "I64"}}},
+                "is_unsafe": false
+            }
+        }
+    })
+}
+
+fn oncelock_fn_generics() -> serde_json::Value {
+    serde_json::json!({
+        "regions": [],
+        "types": [i64_fn_ptr()],
+        "const_generics": [],
+        "trait_refs": []
+    })
+}
+
+fn oncelock_fn_type_decl(
+    kind: serde_json::Value,
+    layout: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut td = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta_json(&["std", "sync", "once_lock", "OnceLock"], "", false),
+        "kind": kind
+    });
+    if let Some(layout) = layout {
+        td["layout"] = layout;
+    }
+    td
+}
+
+fn oncelock_fn_adt() -> serde_json::Value {
+    serde_json::json!({
+        "Adt": {"id": 0, "generics": oncelock_fn_generics()}
+    })
+}
+
+fn oncelock_fn_global_llbc(
+    kind: serde_json::Value,
+    layout: Option<serde_json::Value>,
+) -> majit_charon_reader::Llbc {
+    let cell_ty = oncelock_fn_adt();
+    let funs = vec![serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta_json(&["fixture", "read_cell"], "", true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": cell_ty},
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": cell_ty}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": cell_ty},
+                        {"Use": [{"Copy": {
+                            "kind": {"Global": {"generics": empty_generics(), "id": 1}},
+                            "ty": cell_ty
+                        }}, "No"]}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }}
+    })];
+    let globals = vec![
+        serde_json::Value::Null,
+        serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["fixture", "CELL"], "", true),
+            "global_kind": "Static",
+            "ty": cell_ty
+        }),
+    ];
+    llbc_with_types_funs_globals(
+        "fixture",
+        vec![oncelock_fn_type_decl(kind, layout)],
+        funs,
+        globals,
+    )
+}
+
+fn oncelock_fn_value_layout() -> serde_json::Value {
+    serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": 16,
+            "align": 8,
+            "variant_layouts": [{"field_offsets": [0, 8]}],
+            "repr": {"transparent": false}
+        }
+    }])
+}
+
+fn oncelock_fn_struct_kind() -> serde_json::Value {
+    serde_json::json!({"Struct": [
+        {"name": "once", "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}}, "attr_info": null},
+        {"name": "value", "ty": i64_fn_ptr(), "attr_info": null}
+    ]})
+}
+
+/// An Opaque `OnceLock<fn>` Global with a `refs` row is the cell's address,
+/// not a 0-arg Call to the static path.
+#[test]
+fn oncelock_fn_opaque_global_emits_bare_const_ref_addr() {
+    super::register_foldable_const_lits(Vec::new());
+    let llbc = oncelock_fn_global_llbc(serde_json::json!("Opaque"), None);
+    let graph = super::lower_function_with_static_addrs(&llbc, "read_cell", fnptrcell_refs())
+        .expect("OnceLock<fn> Global lowers");
+    assert_eq!(const_ref_addrs(&graph), vec![0x1111]);
+    let cell = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|op| match op.kind {
+            OpKind::ConstRefAddr(_) => op.result.clone(),
+            _ => None,
+        })
+        .expect("ConstRefAddr dest");
+    assert_eq!(
+        crate::model::FunctionGraph::concretetype_of(&cell),
+        crate::model::ConcreteType::Signed,
+        "llmemory.Address getkind is int"
+    );
+    assert!(
+        matches!(
+            cell.concretetype(),
+            Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Address)
+        ),
+        "OnceLock<fn> address is Address, got {:?}",
+        cell.concretetype()
+    );
+    assert_eq!(
+        nullary_calls_ending(&graph, "CELL"),
+        0,
+        "OnceLock<fn> Global must not residualize: {graph:?}"
+    );
+    assert!(
+        call_paths_in(&graph).iter().all(
+            |segments| segments.last().map(String::as_str) != Some("__cast_instance_intrinsic")
+        ),
+        "Opaque OnceLock<fn> must not wrap ConstRefAddr: {graph:?}"
+    );
+}
+
+/// A Struct-kind `OnceLock<fn>` still emits a bare ConstRefAddr: the type
+/// lane runs before `refs_static_struct_root` would wrap the address as
+/// `SomeInstance(OnceLock)`.
+#[test]
+fn oncelock_fn_struct_global_does_not_cast_instance() {
+    super::register_foldable_const_lits(Vec::new());
+    let llbc = oncelock_fn_global_llbc(oncelock_fn_struct_kind(), Some(oncelock_fn_value_layout()));
+    let graph = super::lower_function_with_static_addrs(&llbc, "read_cell", fnptrcell_refs())
+        .expect("Struct OnceLock<fn> Global lowers");
+    assert_eq!(const_ref_addrs(&graph), vec![0x1111]);
+    assert!(
+        call_paths_in(&graph).iter().all(
+            |segments| segments.last().map(String::as_str) != Some("__cast_instance_intrinsic")
+        ),
+        "OnceLock<fn> must not wrap ConstRefAddr as an instance: {graph:?}"
+    );
+}
+
+fn usize_scalar() -> serde_json::Value {
+    serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}})
+}
+
+fn oncelock_usize_global_llbc() -> majit_charon_reader::Llbc {
+    let generics = serde_json::json!({
+        "regions": [],
+        "types": [usize_scalar()],
+        "const_generics": [],
+        "trait_refs": []
+    });
+    let cell_ty = serde_json::json!({"Adt": {"id": 0, "generics": generics}});
+    let kind = serde_json::json!({"Struct": [
+        {"name": "once", "ty": {"Tuple": []}, "attr_info": null},
+        {"name": "value", "ty": usize_scalar(), "attr_info": null}
+    ]});
+    let funs = vec![serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta_json(&["fixture", "read_cell"], "", true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": cell_ty},
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": cell_ty}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": cell_ty},
+                        {"Use": [{"Copy": {
+                            "kind": {"Global": {"generics": empty_generics(), "id": 1}},
+                            "ty": cell_ty
+                        }}, "No"]}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }}
+    })];
+    let globals = vec![
+        serde_json::Value::Null,
+        serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["fixture", "CELL"], "", true),
+            "global_kind": "Static",
+            "ty": cell_ty
+        }),
+    ];
+    llbc_with_types_funs_globals(
+        "fixture",
+        vec![oncelock_fn_type_decl(
+            kind,
+            Some(oncelock_fn_value_layout()),
+        )],
+        funs,
+        globals,
+    )
+}
+
+/// A Struct `OnceLock<usize>` singleton Global's refs row is the
+/// initialized Python object (`bookkeeper.immutablevalue`), not the
+/// container. `refs_static_struct_root` must not wrap it as
+/// `SomeInstance(OnceLock)` or `get_or_init` loses its ConstRefAddr
+/// receiver.
+#[test]
+fn oncelock_usize_struct_global_does_not_cast_instance() {
+    super::register_foldable_const_lits(Vec::new());
+    let graph = super::lower_function_with_static_addrs(
+        &oncelock_usize_global_llbc(),
+        "read_cell",
+        fnptrcell_refs(),
+    )
+    .expect("Struct OnceLock<usize> Global lowers");
+    assert_eq!(const_ref_addrs(&graph), vec![0x1111]);
+    assert!(
+        call_paths_in(&graph).iter().all(|segments| {
+            segments.last().map(String::as_str) != Some("__cast_instance_intrinsic")
+        }),
+        "OnceLock<usize> must not wrap ConstRefAddr as an instance: {graph:?}"
+    );
+}
+
+fn oncelock_fn_get_llbc() -> majit_charon_reader::Llbc {
+    oncelock_fn_get_llbc_with_layout(Some(oncelock_fn_value_layout()))
+}
+
+fn oncelock_fn_get_llbc_with_layout(
+    layout: Option<serde_json::Value>,
+) -> majit_charon_reader::Llbc {
+    let cell = oncelock_fn_adt();
+    let cell_ref = serde_json::json!({"Ref": ["Erased", cell, "Shared"]});
+    let option_fn = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [i64_fn_ptr()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let generics = empty_generics();
+    let funs = vec![
+        serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "call_get"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [cell_ref], "output": option_fn},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": option_fn},
+                    {"index": 1, "name": "cell", "span": span_json(), "ty": cell_ref}
+                ]},
+                "body": [
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                            "args": [{"Copy": {"kind": {"Local": 1}, "ty": cell_ref}}],
+                            "dest": {"kind": {"Local": 0}, "ty": option_fn}
+                        },
+                        "target": 1,
+                        "on_unwind": 2
+                    }}}},
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span_json(), "kind": "Return"}},
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span_json(), "kind": "UnwindResume"}}
+                ]
+            }}
+        }),
+        serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["std", "sync", "once_lock", "<Impl>", "get"], "", false),
+            "signature": {"is_unsafe": false, "inputs": [cell_ref], "output": option_fn},
+            "body": "Opaque"
+        }),
+    ];
+    llbc_with_types(
+        "fixture",
+        vec![
+            oncelock_fn_type_decl(oncelock_fn_struct_kind(), layout),
+            option_enum(1),
+        ],
+        funs,
+    )
+}
+
+/// `OnceLock<fn>::get` is a signed word `raw_load` of `Ptr(FuncType)` at
+/// the LLBC `value` field offset (`NicheIntNull::FnPtr`,
+/// `history.getkind` `'int'`).
+#[test]
+fn oncelock_fn_get_lowers_to_signed_raw_load_of_func_ptr_at_value_offset() {
+    super::register_foldable_const_lits(Vec::new());
+    let llbc = oncelock_fn_get_llbc();
+    let graph = super::lower_function(&llbc, "call_get").expect("OnceLock::get lowers");
+    let loads: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter(|op| matches!(op.kind, OpKind::RawLoad { .. }))
+        .collect();
+    assert_eq!(loads.len(), 1, "exactly one RawLoad: {graph:?}");
+    match &loads[0].kind {
+        OpKind::RawLoad {
+            offset,
+            item_ty,
+            itemsize,
+            is_item_signed,
+            ..
+        } => {
+            assert_eq!(*item_ty, crate::model::ValueType::Int);
+            assert_eq!(*itemsize, crate::layout::target_word_size());
+            assert!(*is_item_signed, "fn-ptr load is signed kind 'i'");
+            let offset_consts: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .filter_map(|op| match (&op.kind, op.result.as_ref()) {
+                    (OpKind::ConstInt(n), Some(v)) if v.id() == offset.id() => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                offset_consts,
+                vec![8],
+                "value field offset from LLBC layout"
+            );
+        }
+        other => panic!("expected RawLoad, got {other:?}"),
+    }
+    let dest = loads[0].result.as_ref().expect("RawLoad dest");
+    match dest.concretetype() {
+        Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(p))
+            if matches!(
+                p.TO,
+                crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Func(_)
+            ) => {}
+        other => panic!("load dest must be Ptr(FuncType), got {other:?}"),
+    }
+    assert_eq!(
+        crate::model::FunctionGraph::concretetype_of(dest),
+        crate::model::ConcreteType::Signed,
+        "history.getkind of Ptr(FuncType) is int"
+    );
+    assert_eq!(
+        nullary_calls_ending(&graph, "get"),
+        0,
+        "OnceLock::get must not residualize: {graph:?}"
+    );
+}
+
+/// Generic `OnceLock` leaves Charon `field_offsets` `chosen: null`.
+/// `OnceLock` is `repr(Rust)` with a platform-dependent layout, so the
+/// fold requires Charon's chosen `value` offset and leaves the Call.
+#[test]
+fn oncelock_fn_get_value_offset_without_chosen_field_offsets() {
+    super::register_foldable_const_lits(Vec::new());
+    let llbc = oncelock_fn_get_llbc_with_layout(None);
+    let graph = super::lower_function(&llbc, "call_get")
+        .expect("OnceLock::get residualizes when value offset is unchosen");
+    let loads: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter(|op| matches!(op.kind, OpKind::RawLoad { .. }))
+        .collect();
+    assert_eq!(
+        loads.len(),
+        0,
+        "must not fold without chosen offsets: {graph:?}"
+    );
+    assert!(
+        call_paths_in(&graph)
+            .iter()
+            .any(|segments| segments.last().map(String::as_str) == Some("get")),
+        "OnceLock::get Call must stay: {graph:?}"
+    );
+}
+
 fn reader_fun_at(def_id: u64, path: &[&str], global_id: u64) -> serde_json::Value {
     let mut fun = reader_fun(path, global_id);
     fun["def_id"] = serde_json::json!(def_id);
