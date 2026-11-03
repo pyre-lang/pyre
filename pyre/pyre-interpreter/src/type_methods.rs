@@ -4048,17 +4048,6 @@ fn format_with_spec(mut val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate:
         // codes (`e`/`f`/`g`/`%`) format the `f64` conversion of the value.
         if pyre_object::is_int(val) || pyre_object::is_bool(val) || pyre_object::is_long(val) {
             let type_name = arg_type_name(val);
-            let owned;
-            let big = if pyre_object::is_bool(val) {
-                owned = BigInt::from(pyre_object::w_bool_get_value(val) as i64);
-                &owned
-            } else if pyre_object::is_int(val) {
-                owned = BigInt::from(pyre_object::w_int_get_value(val));
-                &owned
-            } else {
-                // newformat.py's `w_num.asbigint()` borrows `W_LongObject.num`.
-                pyre_object::w_long_get_value(val)
-            };
             let p = parse_spec(spec)?;
             validate_python314_spec_shape(&p, spec, &type_name, 'd')?;
             let parsed = FormatSpec::parse(&p.engine_spec);
@@ -4071,30 +4060,30 @@ fn format_with_spec(mut val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate:
                     "Negative zero coercion (z) not allowed in integer format specifier",
                 ));
             }
-            if spec.ends_with("c") && parsed.is_ok() {
-                return format_char(big, spec);
-            }
-            // A float presentation code formats the `f64` conversion (`n` and
-            // the integer bases keep full integer precision instead).  That
-            // conversion is `PyNumber_Float`, so a subclass overriding
-            // `__float__` decides the digits; reading the payload is the answer
-            // only when the receiver's Python class is the builtin.
+            // newformat.py format_int_or_long: `w_float = space.float(w_num)`
+            // then `_format_float` for `tp in "eEfFgG%"`. The bigint is built
+            // only for integer presentation types, after this arm returns.
             if matches!(p.ty, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%') {
-                if !pyre_object::is_exact_builtin_instance(val) {
-                    let w_float = crate::builtins::builtin_float(&[val])?;
-                    let f = pyre_object::floatobject::w_float_get_value(w_float);
-                    if f.is_nan() || f.is_infinite() {
-                        return format_nonfinite(f, spec);
-                    }
-                    return format_finite_float(f, spec);
-                }
-                let f = pyre_object::jit_bigint_to_f64_or_inf(big);
-                if f.is_infinite() {
-                    return Err(crate::PyError::overflow_error(
-                        "int too large to convert to float",
-                    ));
+                let w_float = crate::builtins::builtin_float(&[val])?;
+                let f = pyre_object::floatobject::w_float_get_value(w_float);
+                if f.is_nan() || f.is_infinite() {
+                    return format_nonfinite(f, spec);
                 }
                 return format_finite_float(f, spec);
+            }
+            let owned;
+            let big = if pyre_object::is_bool(val) {
+                owned = BigInt::from(pyre_object::w_bool_get_value(val) as i64);
+                &owned
+            } else if pyre_object::is_int(val) {
+                owned = BigInt::from(pyre_object::w_int_get_value(val));
+                &owned
+            } else {
+                // newformat.py's `w_num.asbigint()` borrows `W_LongObject.num`.
+                pyre_object::w_long_get_value(val)
+            };
+            if spec.ends_with("c") && parsed.is_ok() {
+                return format_char(big, spec);
             }
             parsed.map_err(|e| format_spec_err(e, spec, &type_name, true))?;
             return format_rbigint(big, spec, &type_name);

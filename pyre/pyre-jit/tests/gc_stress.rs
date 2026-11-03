@@ -161,6 +161,56 @@ for e in range(309, 1200):
     );
 }
 
+/// `format(int, ".2f")` used to build a nursery bigint from `val` before the
+/// float-presentation arm re-read `val`. A collection inside `RBigInt::fromint`
+/// left that local stale. `newformat.py` `format_int_or_long` converts with
+/// `space.float(w_num)` first and never builds the bigint for `eEfFgG%`.
+#[test]
+fn format_float_presentation_of_int_keeps_operand_across_bigint_alloc() {
+    const CHILD: &str = "PYRE_FORMAT_FLOAT_INT_GC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "format_float_presentation_of_int_keeps_operand_across_bigint_alloc",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated format-float-int GC-root regression");
+        assert!(
+            output.status.success(),
+            "format float presentation of int lost the operand across a collecting alloc:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+def g(a):
+    return format(a, ".2f")
+
+def f(xs):
+    out = None
+    for x in xs:
+        out = g(x)
+    return out
+
+# The loop goes hot, so the residual `format` call receives a freshly boxed
+# young int; a collection inside the formatter must not leave it stale.
+assert f([4] * 20000) == "4.00"
+assert format(10 ** 3, "e") == "1.000000e+03"
+"#,
+        "format_float_int_gc.py",
+        "format float presentation of int",
+        "format(int, '.2f') must keep the operand across a collecting bigint alloc",
+    );
+}
+
 /// `ResumeGuardForcedDescr.handle_async_forcing` runs before the residual
 /// returns. Its virtualizable image must not read the pending return value
 /// from a register home that compiled code has not written yet.
