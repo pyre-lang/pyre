@@ -55,7 +55,7 @@ use crate::front::result_exc::{
     split_diamond_exits,
 };
 use crate::model::{
-    CallTarget, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType,
+    CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType, overflowerror_exitcase,
 };
 
 /// The `core::num::<Impl>::checked_{add,sub,mul}` leaf the rewrite
@@ -171,17 +171,6 @@ pub(crate) struct CheckedArithOkOrElseSite {
     pub result_suffix: String,
     pub ok_payload_ty: ValueType,
     pub err_payload_ty: ValueType,
-}
-
-/// The typed `OverflowError` exitcase the `_ovf` block's overflow link
-/// carries — the handler analogue of [`crate::front::iter_next`]'s
-/// `StopIteration` exitcase, narrowed to the single exception `add_ovf` /
-/// `sub_ovf` / `mul_ovf` raises (`OpKind::AddOvf.canraise() =
-/// [OverflowError]`).  `ConstValue::builtin` resolves the class to a
-/// `HostObject`, the `Constant(HostObject(class))` shape
-/// `annrpython::flowin` matches.
-fn overflowerror_exitcase() -> ExitCase {
-    ExitCase::Const(ConstValue::builtin("OverflowError"))
 }
 
 fn int_const(i: i64) -> LinkArg {
@@ -881,7 +870,7 @@ fn rewire_checked_arith_ok_or_else(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::FieldDescriptor;
+    use crate::model::{ExitCase, FieldDescriptor};
 
     /// Build the minimal `checked_add` overflow-fallback diamond and assert
     /// the rewrite lowers it to `add_ovf` + a `LastException` block whose

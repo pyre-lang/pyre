@@ -2217,6 +2217,14 @@ pub fn error_carrier_exitcase() -> ExitCase {
     ExitCase::ErrorCarrier
 }
 
+/// `except OverflowError`. `ConstValue::builtin` resolves the class to a
+/// `HostObject`, the `Constant(HostObject(class))` shape
+/// `annrpython::flowin` matches. Shared by `add_ovf` / `sub_ovf` /
+/// `mul_ovf` and `rbigint.toint` (`rpython/rlib/rbigint.py`).
+pub fn overflowerror_exitcase() -> ExitCase {
+    ExitCase::Const(ConstValue::builtin("OverflowError"))
+}
+
 /// RPython `Link.args` items are Variables or Constants —
 /// `Link.args: List[Hlvalue]` (`flowspace/model.py`) where
 /// `Hlvalue = Variable | Constant`.  Both arms carry the

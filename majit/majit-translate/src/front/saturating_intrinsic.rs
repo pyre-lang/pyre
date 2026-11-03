@@ -8,7 +8,7 @@
 //! word-sized add wraps and tests `uint_lt(sum, a)`; narrower unsigned add
 //! tests `a > MAX - b`; sub floors at zero via `a < b`.
 
-use crate::flowspace::model::{ConstValue, Variable};
+use crate::flowspace::model::Variable;
 use crate::front::option_variant::{close_goto_mixed, map_source, reproduce_exit_args};
 use crate::model::{
     CallTarget, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, SpaceOperation,
@@ -80,7 +80,7 @@ pub(crate) fn unsigned_atom_max(atom: &str, word_bytes: usize) -> Option<u64> {
 }
 
 fn overflowerror_exitcase() -> ExitCase {
-    ExitCase::Const(ConstValue::builtin("OverflowError"))
+    crate::model::overflowerror_exitcase()
 }
 
 /// Signed `{i64,isize}::saturating_{add,sub}`: `*_ovf` + OverflowError

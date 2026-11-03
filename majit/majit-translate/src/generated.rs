@@ -250,7 +250,10 @@ fn build() -> AllJitCodes {
         &|_, _| None,
         &[],
         crate::HostStaticAddrs {
-            pytypes: &[("interp_exceptions::EXC_STOPITERATION_TYPE", 1)],
+            pytypes: &[
+                ("interp_exceptions::EXC_STOPITERATION_TYPE", 1),
+                ("interp_exceptions::EXC_OVERFLOW_ERROR_TYPE", 2),
+            ],
             ..crate::HostStaticAddrs::default()
         },
     );

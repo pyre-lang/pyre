@@ -4064,6 +4064,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     cpa1!(
         &mut entries,
+        "pyre_object::longobject::jit_bigint_toint",
+        "pyre_object::jit_bigint_toint",
+        pyre_object::jit_bigint_toint,
+    );
+    cpa1!(
+        &mut entries,
         "pyre_object::longobject::jit_bigint_hash",
         "pyre_object::jit_bigint_hash",
         pyre_object::jit_bigint_hash,
@@ -4073,12 +4079,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::longobject::jit_bigint_to_i64_value",
         "pyre_object::jit_bigint_to_i64_value",
         pyre_object::jit_bigint_to_i64_value,
-    );
-    pa1!(
-        &mut entries,
-        "pyre_object::longobject::jit_bigint_to_i64_value_or_zero",
-        "pyre_object::jit_bigint_to_i64_value_or_zero",
-        pyre_object::jit_bigint_to_i64_value_or_zero,
     );
     pa1!(
         &mut entries,

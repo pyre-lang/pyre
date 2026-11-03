@@ -6229,9 +6229,23 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 lo.graph.name, site.call_once_owner
             )));
         }
-        // Carrier map_err rewrite waits until after result_exc hung
-        // LastException on the dest-is-carrier call. Extra-simplify still
-        // runs first: it may rename the recorded result variable.
+        // `jit_bigint_toint().map_err(...)?` fuses onto the toint
+        // OverflowError catch before simplify and `result_exc`: the carrier
+        // map_err rewrite below would FieldRead `__discriminant` of the
+        // reminted i64. Every other carrier map_err rewrite waits until
+        // after result_exc hung LastException on the dest-is-carrier call.
+        let fused_toint_map_err =
+            if !lo.toint_call_results.is_empty() && !lo.result_map_err_sites.is_empty() {
+                crate::front::result_exc::fuse_toint_map_err_sites(
+                    &mut lo.graph,
+                    &lo.toint_call_results,
+                    &lo.result_map_err_sites,
+                )
+                .map_err(LowerError::Unsupported)?
+            } else {
+                Vec::new()
+            };
+        let toint_map_err_fused = fused_toint_map_err.len();
 
         // `map(it, f).collect()` denotes a loop. Rewrite it at the
         // construction site — where `f` is a concrete closure ADT —
@@ -6257,6 +6271,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             Vec::new()
         };
         if !lo.result_exc_call_results.is_empty()
+            || !lo.toint_call_results.is_empty()
+            || !lo.toint_combinator_sites.is_empty()
             || !lo.option_ok_or_else_try_sites.is_empty()
             || !lo.carrier_combinator_sites.is_empty()
             || !lo.result_map_err_sites.is_empty()
@@ -6325,13 +6341,26 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // `LastException` join (`try/except OperationError`, or the implicit
         // `AssertionError` panic for `core` `Result::expect`) before
         // [`catch_and_rewrap`] can rebuild a Result shell around the same call.
-        let result_unwrap_or_rewritten = if lo.carrier_combinator_sites.is_empty() {
-            0
-        } else {
-            crate::front::result_exc::rewire_carrier_combinator_sites(
-                &mut lo.graph,
-                &lo.carrier_combinator_sites,
-            )
+        // `Result<T, RBigIntError>::unwrap_or` uses the OverflowError catch
+        // of `jit_bigint_toint` (`rpython/rlib/rbigint.py` `rbigint.toint`).
+        let result_unwrap_or_rewritten = {
+            let overflow = if lo.toint_combinator_sites.is_empty() {
+                0
+            } else {
+                crate::front::result_exc::rewire_overflow_combinator_sites(
+                    &mut lo.graph,
+                    &lo.toint_combinator_sites,
+                )
+            };
+            let carrier = if lo.carrier_combinator_sites.is_empty() {
+                0
+            } else {
+                crate::front::result_exc::rewire_carrier_combinator_sites(
+                    &mut lo.graph,
+                    &lo.carrier_combinator_sites,
+                )
+            };
+            overflow + carrier
         };
         if !lo.result_exc_call_results.is_empty() {
             let carrier = static_addrs.error_carrier;
@@ -6351,22 +6380,53 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &conversions,
             )
             .map_err(LowerError::Unsupported)?;
-            let outcome = crate::front::result_exc::rewire_result_exc_call_sites(
+            // Fusion removed the map_err call; its dest may still be in
+            // `result_exc_call_results`. Skip it so the missing producer
+            // is not a graph-wide decline.
+            let remaining_exc: Vec<_> = lo
+                .result_exc_call_results
+                .iter()
+                .filter(|(var, _, _)| fused_toint_map_err.iter().all(|fused| fused != var))
+                .cloned()
+                .collect();
+            if !remaining_exc.is_empty() {
+                let outcome = crate::front::result_exc::rewire_result_exc_call_sites(
+                    &mut lo.graph,
+                    &remaining_exc,
+                    result_exc_callee,
+                    static_addrs.error_carrier,
+                )
+                .map_err(LowerError::Unsupported)?;
+                tail_forwarded_returns = outcome.tail_forwards;
+            }
+        }
+        if !lo.toint_call_results.is_empty() {
+            crate::front::result_exc::rewire_toint_call_sites(
                 &mut lo.graph,
-                &lo.result_exc_call_results,
-                result_exc_callee,
-                static_addrs.error_carrier,
+                &lo.toint_call_results,
             )
             .map_err(LowerError::Unsupported)?;
-            tail_forwarded_returns = outcome.tail_forwards;
         }
         // After result_exc: the dest-is-carrier call block now has
         // LastException. Err calls the mapper and raises; a declined
-        // site stays the extracted helper graph.
+        // site stays the extracted helper graph. Fused toint map_err
+        // sites are gone; skip them so the generic rewrite does not
+        // bind a leftover `map_err` in the same body.
+        let remaining_map_err: Vec<_> = lo
+            .result_map_err_sites
+            .iter()
+            .filter(|site| {
+                fused_toint_map_err
+                    .iter()
+                    .all(|fused| fused != &site.result_var)
+            })
+            .cloned()
+            .collect();
         let result_map_err_rewritten = crate::front::result_map_err::rewire_result_map_err_sites(
             &mut lo.graph,
-            &lo.result_map_err_sites,
-        );
+            &remaining_map_err,
+        ) + toint_map_err_fused;
+
         let option_ok_or_else_try_rewritten = if lo.option_ok_or_else_try_sites.is_empty() {
             0
         } else {
@@ -6702,6 +6762,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             .map_err(LowerError::Unsupported)?;
         }
         if !lo.result_exc_call_results.is_empty()
+            || !lo.toint_call_results.is_empty()
             || result_exc_callee
             || option_ok_or_else_try_rewritten > 0
             || result_unwrap_or_rewritten > 0

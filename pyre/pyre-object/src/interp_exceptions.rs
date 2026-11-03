@@ -2636,6 +2636,17 @@ pub fn publish_memory_error() {
     }
 }
 
+/// Raise OverflowError from a residual helper that is about to return a dummy.
+///
+/// `rbigint.toint` raises bare OverflowError (`rpython/rlib/rbigint.py`).
+/// Same publisher channel as [`publish_memory_error`]: the empty prebuilt
+/// instance (`rtyper/exceptiondata.py get_standard_ll_exc_instance`).
+pub fn publish_overflow_error() {
+    if let Some(publish) = RESIDUAL_EXC_PUBLISHER.get() {
+        publish(standard_exc_instance(ExcKind::OverflowError) as i64);
+    }
+}
+
 static STANDARD_EXC_INSTANCES: [std::sync::OnceLock<usize>; EXC_KIND_COUNT] =
     [const { std::sync::OnceLock::new() }; EXC_KIND_COUNT];
 

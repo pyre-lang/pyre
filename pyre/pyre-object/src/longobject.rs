@@ -461,13 +461,19 @@ pub fn jit_bigint_to_i64_value(num: &BigInt) -> i64 {
     })
 }
 
-/// `rbigint.toint()` payload for the runtime-fallible narrowing lowering:
-/// the value is read only on the fits (Ok) path, so out-of-range returns 0
-/// instead of panicking — the walker's discriminant switch discards it on
-/// the Err path. Companion of [`jit_bigint_to_i64_fits`].
-#[majit_macros::dont_look_inside]
-pub fn jit_bigint_to_i64_value_or_zero(num: &BigInt) -> i64 {
-    num.toint().unwrap_or(0)
+/// `rbigint.toint` (`rpython/rlib/rbigint.py`, `@jit.elidable`). Overflow
+/// publishes the standard empty OverflowError instance
+/// (`rtyper/exceptiondata.py get_standard_ll_exc_instance`) and returns
+/// dummy 0, unread on the exception edge.
+#[majit_macros::elidable]
+pub extern "C" fn jit_bigint_toint(num: *const BigInt) -> i64 {
+    match unsafe { (*num).toint() } {
+        Ok(v) => v,
+        Err(_) => {
+            crate::interp_exceptions::publish_overflow_error();
+            0
+        }
+    }
 }
 
 /// `rbigint.touint()` on a borrowed BigInt payload. Scalar half of the

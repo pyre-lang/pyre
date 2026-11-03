@@ -846,33 +846,16 @@ impl<'a> Lowering<'a> {
 
     /// Lower the runtime-fallible `i64::try_from(&RBigInt)`
     /// (a trait shell in the LLBC)
-    /// into its decomposed runtime-discriminant `Result` shape: a
-    /// `__discriminant` tag driven by `rbigint.fits_int()` and a
-    /// `__pos_0` payload holding the narrowed value.  Callers narrow a
-    /// list/str/bytes index or a byte value; overflow raises a Python
-    /// `IndexError`/`ValueError`, so the fallibility must survive the
-    /// lowering — a panic-residual swap would be a bit-exact regression.
+    /// to one elidable-can-raise residual (`jit_bigint_toint`) whose
+    /// overflow edge is `except OverflowError` (`rpython/rlib/rbigint.py`
+    /// `rbigint.toint`). Callers narrow a list/str/bytes index or a byte
+    /// value; overflow raises a Python `IndexError`/`ValueError`, so the
+    /// fallibility must survive the lowering.
     ///
     /// The arg type — not the module path — is the robust discriminator
     /// (same philosophy as the BigInt binary-operator retarget), so this
     /// guards on the exact `RBigInt` ADT identity rather than hard-matching a
     /// dependency path spelling.
-    ///
-    /// # Eager-payload panic hazard
-    /// [`Self::emit_tagged_pair_aggregate`] writes `__pos_0 = payload`
-    /// UNCONDITIONALLY in the call's block, before the consumer's
-    /// discriminant switch runs in a successor block.  A
-    /// [`jit_bigint_to_i64_value`] payload PANICS on overflow, so on a
-    /// non-fitting index (`lst[2**100]`) it would panic in the
-    /// walker/blackhole graph BEFORE the switch routes to the `Err` arm —
-    /// panic instead of `IndexError`.  `__pos_0` is read only on the
-    /// fits (`Ok`) path, so its value is dead on the `Err` path; the
-    /// payload op only needs to be TOTAL, not correct-on-overflow.  Hence
-    /// the non-trapping [`jit_bigint_to_i64_value_or_zero`] variant, which
-    /// returns 0 out of range.
-    ///
-    /// `Ok=0`/`Err=1`: `disc = (fits == 0)` is 0 when it fits (`Ok` tag)
-    /// and 1 otherwise (`Err` tag).
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -934,17 +917,14 @@ impl<'a> Lowering<'a> {
     }
 
     /// Lower the exact local `RBigInt::toint() -> Result<i64,
-    /// RBigIntError>` method to the same decomposed Result shape as
+    /// RBigIntError>` method to the same elidable-can-raise residual as
     /// [`Self::try_lower_bigint_i64_try_from`].
     ///
     /// RPython's `rbigint.toint` is an elidable, overflow-raising scalar
     /// operation (`rpython/rlib/rbigint.py`). Rust carries that
     /// exceptional edge as `Result`; a dependent LLBC cannot translate into
-    /// the pyre-object method body and otherwise leaves a classdef-less
-    /// residual Result. Its subsequent discriminant/`Ok.__pos_0` reads then
-    /// have no enum class to narrow. Preserve the source control flow by
-    /// materializing the runtime Result tag and payload, using the shared
-    /// non-trapping payload rule below.
+    /// the pyre-object method body. The intercept retargets the call to
+    /// `jit_bigint_toint` and records it for the OverflowError rewrite.
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -991,10 +971,11 @@ impl<'a> Lowering<'a> {
         self.emit_fallible_rbigint_to_i64(mir_bb, arg.clone(), dest_local, dest_ty, target)
     }
 
-    /// Emit the translated Result for a fallible signed-word RBigInt
-    /// conversion. Shared by Rust's direct `RBigInt::toint` spelling and the
-    /// `i64::try_from(&RBigInt)` trait spelling so their tags, class identity,
-    /// eager-payload safety, and residual ABI cannot drift apart.
+    /// Emit one elidable-can-raise `jit_bigint_toint` residual for a
+    /// fallible signed-word RBigInt conversion. Shared by Rust's direct
+    /// `RBigInt::toint` spelling and the `i64::try_from(&RBigInt)` trait
+    /// spelling so the residual ABI cannot drift apart. The OverflowError
+    /// rewrite (`front::result_exc`) stamps `LastException` on the call.
     pub(in crate::front::mir) fn emit_fallible_rbigint_to_i64(
         &mut self,
         mir_bb: usize,
@@ -1003,62 +984,18 @@ impl<'a> Lowering<'a> {
         dest_ty: &TyRef,
         target: usize,
     ) -> Result<bool, LowerError> {
-        // Resolve the destination `Result` decl so the FieldWrite owner
-        // matches what `resolve_aggregate_adt` records for a real `Ok(..)`
-        // construction site of the same type.
-        let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
-            return Ok(false);
-        };
-        let Some(td) = self.llbc.type_by_id(def_id) else {
-            return Ok(false);
-        };
-        // Route the runtime-discriminant tagged-pair ctor to the SAME
-        // per-instantiation enum root a static `Ok(..)`/`Err(..)` mints,
-        // by suffixing the bare template name with the `<X>` the
-        // destination `Result<X, E>` local carries.
-        // Fail-closed: no splitting generic yields "" → bare owner.
-        let owner = format!(
-            "{}{}",
-            td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
-        );
         let bb_id = self.emit_bb(mir_bb);
-
-        let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
-            let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(res.clone()),
-                kind,
-            });
-            res
-        };
-        // Non-trapping payload: read only on the fits (`Ok`) path, dead on
-        // the `Err` path, but eagerly evaluated in this block — must not
-        // panic on overflow (see the eager-payload hazard above).
-        let payload = push_op(
-            &mut self.graph,
-            OpKind::Call {
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec![
                         crate::runtime_names::crates::OBJECT.to_string(),
                         "longobject".to_string(),
-                        "jit_bigint_to_i64_value_or_zero".to_string(),
-                    ],
-                    fun_decl_id: None,
-                    specialization: crate::parse::GraphSpecialization::Regular,
-                },
-                args: crate::model::call_args(vec![arg.clone()]),
-                result_ty: ValueType::Int,
-            },
-        );
-        let fits = push_op(
-            &mut self.graph,
-            OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: vec![
-                        crate::runtime_names::crates::OBJECT.to_string(),
-                        "longobject".to_string(),
-                        "jit_bigint_to_i64_fits".to_string(),
+                        "jit_bigint_toint".to_string(),
                     ],
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
@@ -1066,31 +1003,15 @@ impl<'a> Lowering<'a> {
                 args: crate::model::call_args(vec![arg]),
                 result_ty: ValueType::Int,
             },
-        );
-        let zero = push_op(&mut self.graph, OpKind::ConstInt(0));
-        // `disc = (fits == 0)`: 0 when it fits (`Ok` tag), 1 otherwise
-        // (`Err` tag) — matching the `Ok=0`/`Err=1` convention.
-        let disc = push_op(
-            &mut self.graph,
-            OpKind::BinOp {
-                op: "eq".to_string(),
-                lhs: fits,
-                rhs: zero,
-                result_ty: ValueType::Int,
-            },
-        );
-        // Success is the `Ok` variant (discriminant 0).
-        let payload_owner =
-            Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
-        self.emit_tagged_pair_aggregate(
-            mir_bb,
-            &owner,
-            &payload_owner,
-            disc,
-            payload,
-            dest_local,
-            target,
-        )?;
+        });
+        self.local_var[dest_local] = Some(LocalValue::One(result.clone()));
+        let suffix =
+            crate::front::result_exc::tyref_result_instantiation_suffix(dest_ty, self.llbc);
+        self.toint_call_results
+            .push((result, suffix, ValueType::Int));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
         Ok(true)
     }
 
@@ -1436,7 +1357,7 @@ impl<'a> Lowering<'a> {
             result_owner: tuple_owner.clone(),
             owner_id: None,
             owner_path: Vec::new(),
-            ctor_name: tuple_owner,
+            ctor_name: tuple_owner.clone(),
             fields: (0..2)
                 .map(|i| AggregateField {
                     name: format!("__pos_{i}"),
@@ -1451,12 +1372,13 @@ impl<'a> Lowering<'a> {
         let disc = push_op(&mut self.graph, OpKind::ConstInt(0));
         let payload_owner =
             Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
-        self.emit_tagged_pair_aggregate(
+        self.emit_tagged_pair_aggregate_typed(
             mir_bb,
             &owner,
             &payload_owner,
             disc,
             payload,
+            ValueType::Ref(Some(tuple_owner)),
             dest_local,
             target,
         )?;

@@ -661,6 +661,29 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// Resolve `unwrap_or` on `Result<T, RBigIntError>` — the OverflowError
+    /// catch of `jit_bigint_toint` (`rpython/rlib/rbigint.py` `rbigint.toint`).
+    /// `None` when the receiver is not that Result.
+    pub(in crate::front::mir) fn recognize_overflow_combinator_site(
+        &self,
+        recv_ty: Option<&TyRef>,
+        result_var: &Variable,
+        catch: crate::front::result_exc::CarrierCatchKind,
+    ) -> Option<crate::front::result_exc::CarrierCombinatorSite> {
+        let recv_ty = recv_ty?;
+        let peeled = self.peel_to_option_or_result(recv_ty);
+        let recv_ty = peeled.as_ref().unwrap_or(recv_ty);
+        if !crate::front::result_exc::tyref_is_result_of_rbigint_error(recv_ty, self.llbc) {
+            return None;
+        }
+        let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
+        Some(crate::front::result_exc::CarrierCombinatorSite {
+            result_var: result_var.clone(),
+            payload_ty,
+            catch,
+        })
+    }
+
     /// Resolve the type-owned parts of an `Option::ok_or_else` continuation
     /// that `front::checked_arith` may fuse into a signed `*_ovf` edge.  The
     /// receiver and destination gates keep unrelated same-named methods out;

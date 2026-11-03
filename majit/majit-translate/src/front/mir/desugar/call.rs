@@ -8287,6 +8287,12 @@ impl<'a> Lowering<'a> {
                 crate::front::result_exc::CarrierCatchKind::JoinDefault,
             ) {
                 self.carrier_combinator_sites.push(site);
+            } else if let Some(site) = self.recognize_overflow_combinator_site(
+                first_arg_ty.as_ref(),
+                &result_var,
+                crate::front::result_exc::CarrierCatchKind::JoinDefault,
+            ) {
+                self.toint_combinator_sites.push(site);
             }
         }
         // Capture carrier `Result<T, PyError>::unwrap(res)` for

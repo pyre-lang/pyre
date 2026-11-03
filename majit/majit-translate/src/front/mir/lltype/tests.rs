@@ -1960,31 +1960,36 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
         attrs.get("bytecode::Constants"),
         Some(&vec![("__pos_0".to_string(), ValueType::Ref(None))])
     );
+    // A payload-carrying variant inherits the enum base's
+    // `__discriminant` as its first row (`rclass.py` InstanceRepr
+    // subclass with the super-field), then the payload field.
     assert_eq!(
         fields.fields.get("ConstantData::Integer"),
-        Some(&vec![crate::front::semantic::FieldRow::named(
-            "value", "BigInt"
-        )])
+        Some(&vec![
+            crate::front::semantic::FieldRow::named("__discriminant", "u64"),
+            crate::front::semantic::FieldRow::named("value", "BigInt"),
+        ])
     );
     assert_eq!(
         fields.fields.get("ConstantData::Complex"),
-        Some(&vec![crate::front::semantic::FieldRow::named(
-            "value",
-            "Complex<f64>"
-        )])
+        Some(&vec![
+            crate::front::semantic::FieldRow::named("__discriminant", "u64"),
+            crate::front::semantic::FieldRow::named("value", "Complex<f64>"),
+        ])
     );
     assert_eq!(
         fields.fields.get("ConstantData::Str"),
-        Some(&vec![crate::front::semantic::FieldRow::named(
-            "value", "Wtf8Buf"
-        )])
+        Some(&vec![
+            crate::front::semantic::FieldRow::named("__discriminant", "u64"),
+            crate::front::semantic::FieldRow::named("value", "Wtf8Buf"),
+        ])
     );
     assert_eq!(
         fields.fields.get("ConstantData::Code"),
-        Some(&vec![crate::front::semantic::FieldRow::named(
-            "code",
-            "Box<CodeObject>"
-        )])
+        Some(&vec![
+            crate::front::semantic::FieldRow::named("__discriminant", "u64"),
+            crate::front::semantic::FieldRow::named("code", "Box<CodeObject<ConstantData>>"),
+        ])
     );
     assert_eq!(
         fields.fields.get("Complex"),
@@ -2167,7 +2172,8 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
                         name,
                         class_root: Some(root),
                         ..
-                    } if name == "constant" && root == "ConstantData"
+                    } if name == "constant"
+                        && (root == "ConstantData" || root.ends_with("::ConstantData"))
                 )
             })
             .count(),
@@ -2219,13 +2225,10 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
         boxed_handlers, 1,
         "real LOAD_CONST bigint handler must use the RBigInt pointer boxing ABI"
     );
-    // PyPy walks `co_consts_w`, a list of GC pointers.  This function
-    // walks the compiler's `Vec<ConstantData>` instead, whose enum values
-    // are inline Rust aggregates and are wider than one target word.  No
-    // translation replaces that host container, so manufacturing a
-    // one-word ArrayRead would stride into the middle of an element.  Keep
-    // the Vec read residual until ConstantData is projected into the
-    // PyPy-shaped managed constants list.
+    // `load_const_value` receives `&ConstantData` already. Manufacturing a
+    // one-word ArrayRead of the compiler's `Vec<ConstantData>` would stride
+    // into the middle of an inline enum element; the graph must not grow
+    // one.
     assert_eq!(
         load_ops
             .iter()
@@ -2233,19 +2236,6 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
             .count(),
         0
     );
-    assert!(load_ops.iter().any(|op| {
-        matches!(
-            &op.kind,
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } if segments.ends_with(&[
-                "vec".to_string(),
-                "Vec".to_string(),
-                "index".to_string()
-            ])
-        )
-    }));
     assert!(!load_ops.iter().any(|op| {
         matches!(
             &op.kind,
@@ -2255,6 +2245,32 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
             } if segments.last().map(String::as_str) == Some("toint")
         )
     }));
+    let call_leaves: Vec<&str> = load_ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        load_ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("jit_bigint_toint")
+                )
+            })
+            .count(),
+        1,
+        "load_const_value calls jit_bigint_toint once; leaves={call_leaves:?}"
+    );
     for residual in ["jit_bigint_to_i64_value_or_zero", "jit_bigint_to_i64_fits"] {
         assert_eq!(
             load_ops
@@ -2269,8 +2285,8 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
                     )
                 })
                 .count(),
-            1,
-            "{residual} is called exactly once"
+            0,
+            "{residual} is not the load_const_value toint residual"
         );
     }
     assert_eq!(
@@ -2285,7 +2301,8 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
                     )
                 })
                 .count(),
-            1
+            0,
+            "load_const_value does not write a Result<i64,RBigIntError> discriminant"
         );
 }
 
