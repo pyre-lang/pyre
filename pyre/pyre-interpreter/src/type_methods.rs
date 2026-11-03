@@ -3453,12 +3453,63 @@ mod group_digits_tests {
     }
 }
 
-/// `FormatSpec::format_int`, with RPython rbigint as the value owner.
+/// `newformat.py` `INT_KIND` / `LONG_KIND`: the operand of `_format_int_or_long`.
+#[derive(Clone, Copy)]
+enum IntOrLong<'a> {
+    Int(i64),
+    Long(&'a BigInt),
+}
+
+/// `Formatter._int_to_base`: base 10 is `str(value)`; otherwise an unsigned
+/// digit loop. A negative value is negated as unsigned so `-sys.maxint-1`
+/// does not overflow.
 ///
+/// Do not emit `0b`/`0o`/`0x`: the caller adds the base prefix itself
+/// (upstream `_int_to_base` emits it and `_format_int_or_long` strips it
+/// again with `skip_leading`).
+fn int_to_base(base: u32, value: i64) -> String {
+    if base == 10 {
+        return value.to_string();
+    }
+    let negative = value < 0;
+    let mut v = value as u64;
+    if negative {
+        v = v.wrapping_neg();
+    }
+    let base = base as u64;
+    let mut digits = Vec::new();
+    loop {
+        let div = v / base;
+        let digit = v - div * base;
+        let ch = if digit < 10 {
+            (b'0' + digit as u8) as char
+        } else {
+            (b'a' + (digit as u8 - 10)) as char
+        };
+        digits.push(ch);
+        v = div;
+        if v == 0 {
+            break;
+        }
+    }
+    digits.reverse();
+    let mut result: String = digits.into_iter().collect();
+    if negative {
+        result.insert(0, '-');
+    }
+    result
+}
+
+/// `Formatter._format_int_or_long`: INT_KIND goes through `_int_to_base` on
+/// the machine word; LONG_KIND keeps `RBigInt.format` as the digit producer.
 /// The shared parser remains the authority for format-spec syntax and error
-/// ordering; radix conversion, grouping, signs, prefixes, and padding operate
-/// directly on rbigint digits.
-fn format_rbigint(num: &BigInt, spec: &Wtf8, type_name: &str) -> Result<Wtf8Buf, crate::PyError> {
+/// ordering; grouping, signs, prefixes, and padding operate on the produced
+/// digits.
+fn format_int_or_long_kind(
+    num: IntOrLong<'_>,
+    spec: &Wtf8,
+    type_name: &str,
+) -> Result<Wtf8Buf, crate::PyError> {
     let parsed = rustpython_common::format::FormatSpec::parse(spec)
         .map_err(|e| format_spec_err(e, spec, type_name, true))?;
     let p = parse_spec(spec)?;
@@ -3498,23 +3549,33 @@ fn format_rbigint(num: &BigInt, spec: &Wtf8, type_name: &str) -> Result<Wtf8Buf,
         16 => majit_rlib::rbigint::BASE16,
         _ => unreachable!("integer format uses radix 2, 8, 10, or 16"),
     };
-    let negative = num.int_lt(0);
-    // Only the decimal conversion is quadratic, so only it carries the
-    // `sys.set_int_max_str_digits` limit; the power-of-two radices are exempt.
-    let maxdigits = if radix == 10 {
-        crate::module::sys::state::int_max_str_digits()
-    } else {
-        0
+    let (negative, mut magnitude) = match num {
+        IntOrLong::Long(big) => {
+            let negative = big.int_lt(0);
+            // Only the decimal conversion is quadratic, so only it carries the
+            // `sys.set_int_max_str_digits` limit; the power-of-two radices are exempt.
+            let maxdigits = if radix == 10 {
+                crate::module::sys::state::int_max_str_digits()
+            } else {
+                0
+            };
+            let magnitude = big
+                .format(digits, "", "", maxdigits as i64)
+                .map_err(|error| match error {
+                    majit_rlib::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
+                    majit_rlib::rbigint::RBigIntError::MaxStrDigits => {
+                        crate::builtins::int_max_str_digits_error(maxdigits)
+                    }
+                    _ => unreachable!("validated radix formatting returned an unrelated error"),
+                })?;
+            (negative, magnitude)
+        }
+        IntOrLong::Int(v) => {
+            // An i64 has at most 20 decimal digits, below the minimum
+            // `int_max_str_digits` limit 640, so it can never trip.
+            (v < 0, int_to_base(radix, v))
+        }
     };
-    let mut magnitude =
-        num.format(digits, "", "", maxdigits as i64)
-            .map_err(|error| match error {
-                majit_rlib::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
-                majit_rlib::rbigint::RBigIntError::MaxStrDigits => {
-                    crate::builtins::int_max_str_digits_error(maxdigits)
-                }
-                _ => unreachable!("validated radix formatting returned an unrelated error"),
-            })?;
     if negative {
         debug_assert!(magnitude.starts_with('-'));
         magnitude.remove(0);
@@ -4052,10 +4113,10 @@ fn format_with_spec(mut val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate:
             validate_python314_spec_shape(&p, spec, &type_name, 'd')?;
             let parsed = FormatSpec::parse(&p.engine_spec);
             if p.no_neg_zero && matches!(p.ty, '\0' | 'b' | 'c' | 'd' | 'o' | 'x' | 'X' | 'n') {
-                // pypy/objspace/std/newformat.py format_int_or_long:
-                // `z` is meaningful only after conversion to a floating
-                // presentation type.  The sentence names the specifier it was
-                // read out of, the way the string arm below names its own.
+                // [3.15-spec] format_int_or_long raises "Negative zero coercion (z) not
+                // allowed"; the pinned stdlib's `int.__format__` names the specifier,
+                // "... in integer format specifier" (measured on 3.15.0). `z` is meaningful
+                // only after conversion to a floating presentation type.
                 return Err(crate::PyError::value_error(
                     "Negative zero coercion (z) not allowed in integer format specifier",
                 ));
@@ -4071,22 +4132,25 @@ fn format_with_spec(mut val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate:
                 }
                 return format_finite_float(f, spec);
             }
-            // The handle stays live across `RBigInt.format` (`_format` allocates),
-            // so it is owner-rooted the way `int_floordiv` does and read back
-            // through `&*owned`; `w_long_get_value` aliases `W_LongObject.num`,
-            // so the alias moves into the same root.
-            let owned = if pyre_object::is_bool(val) {
-                RBigIntGcRoot::new(BigInt::from(pyre_object::w_bool_get_value(val) as i64))
+            // newformat.py format_int_or_long: a machine int is INT_KIND and is read
+            // with `space.int_w`; only a long carries a bigint, kept live across
+            // `RBigInt.format` (`_format` allocates) in an owner root read back through
+            // `&*long_root`, the way `int_floordiv` does.
+            let long_root;
+            let num = if pyre_object::is_bool(val) {
+                IntOrLong::Int(pyre_object::w_bool_get_value(val) as i64)
             } else if pyre_object::is_int(val) {
-                RBigIntGcRoot::new(BigInt::from(pyre_object::w_int_get_value(val)))
+                IntOrLong::Int(pyre_object::w_int_get_value(val))
             } else {
-                RBigIntGcRoot::new(pyre_object::w_long_get_value(val).translated_alias())
+                long_root =
+                    RBigIntGcRoot::new(pyre_object::w_long_get_value(val).translated_alias());
+                IntOrLong::Long(&*long_root)
             };
             if spec.ends_with("c") && parsed.is_ok() {
-                return format_char(&*owned, spec);
+                return format_char(num, spec);
             }
             parsed.map_err(|e| format_spec_err(e, spec, &type_name, true))?;
-            return format_rbigint(&*owned, spec, &type_name);
+            return format_int_or_long_kind(num, spec, &type_name);
         }
         if pyre_object::is_float(val) {
             let v = pyre_object::floatobject::w_float_get_value(val);
@@ -4333,7 +4397,7 @@ fn format_surrogate_str(body: &Wtf8, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyEr
 /// that make no sense for a single character, map the value to its code
 /// point, then pad by code point.  The caller has already confirmed the
 /// spec parses and ends in `c`.
-fn format_char(num: &BigInt, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
+fn format_char(num: IntOrLong<'_>, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
     let p = parse_spec(spec)?;
     // Rejection order matches the reference: grouping, then precision, then
     // sign, then alternate form — each beats the value range check.
@@ -4360,9 +4424,12 @@ fn format_char(num: &BigInt, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
     // The code is read through `PyLong_AsLong`, so it is a C `long` -- 32 bits
     // on Windows -- that bounds it, and overflowing that is reported as the
     // conversion failing rather than as a code point out of range.
-    let code = (pyre_object::jit_bigint_to_i64_fits(num) != 0)
-        .then(|| pyre_object::jit_bigint_to_i64_value(num))
-        .filter(|code| core::ffi::c_long::try_from(*code).is_ok());
+    let code = match num {
+        IntOrLong::Int(v) => Some(v),
+        IntOrLong::Long(big) => (pyre_object::jit_bigint_to_i64_fits(big) != 0)
+            .then(|| pyre_object::jit_bigint_to_i64_value(big)),
+    }
+    .filter(|code| core::ffi::c_long::try_from(*code).is_ok());
     let Some(code) = code else {
         return Err(crate::PyError::overflow_error(
             "Python int too large to convert to C long",
