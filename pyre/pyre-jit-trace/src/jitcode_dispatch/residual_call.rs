@@ -5816,6 +5816,92 @@ pub(crate) enum AssemblerContinuationEscape {
     SendEx { call_pc: usize, generator: OpRef },
 }
 
+/// The executor's up-front refusal, decided before anything runs: the
+/// `(reason, funcptr, symbolic)` that makes
+/// [`try_execute_residual_call_via_executor_inner`] return
+/// `OrthodoxSubWalkTraceUnsupported` before executing the call.
+pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    call_opcode: OpCode,
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+) -> Option<(&'static str, i64, i64)> {
+    // Orthodox sub-jitcode walk safety (#171 wall-5d): a residual call whose
+    // funcbox is NULL or a `symbolic_fnaddr` placeholder — a 64-bit `DefaultHasher`
+    // hash of an in-body helper's `CallPath`/`CallTarget`, minted when
+    // `jit_trace_fnaddrs()` has no entry for it (e.g. the zero-arg
+    // `SyntheticTransparentCtor "Tuple"` unit constructor inside
+    // `w_list_append`) — must not be recorded while inlining a sub-jitcode
+    // body.  The production fall-throughs below leave such a call symbolic when
+    // folding declines, on the contract that it runs at runtime against live
+    // state; but a sub-walk's recorded trace is committed and compiled, so the
+    // backend bakes the hash as a code address and the trace branches straight
+    // to it -> SIGSEGV.  Decline the whole descent so it aborts gracefully at
+    // the first un-lowered helper.  Symbolic hashes carry the
+    // `SYMBOLIC_FNADDR_BASE` high-16-bit tag no real funcptr can carry.
+    //
+    // A published address is the weaker claim that the funcptr is real, not
+    // that its signature fits the residual ABI.  The executor writes one word
+    // per `arg_types()` entry, so a helper taking a fat pointer receives its
+    // second half from whichever register the caller last wrote, and reading
+    // that as a length dereferences an address nothing chose --- a fault
+    // inside the callee, past every check this walk makes.
+    // `is_abi_unsound_argument_residual` names exactly the helpers published
+    // with such a parameter, so the descent declines before running one and
+    // the interpreter makes the call with the argument whole.
+    //
+    // A may-force residual inside a transparent helper is declined for the
+    // resume it would need.  Its GUARD_NOT_FORCED and GUARD_NO_EXCEPTION fail
+    // after the Python code it called back into has run: a callback that
+    // raises forces the caller's frame vref on `leave`, and so does one that
+    // escapes its frame.  `capture_resumedata` resumes such a guard inside the
+    // helper's own frame, past the call.  A transparent helper has no frame of
+    // its own, so its guards resume at the Python CALL that entered it, and
+    // the CALL runs the callback a second time -- or, with the exception still
+    // pending at that coordinate, lets it past the CALL's handler.
+    if ctx.fbw_mode.inline_subwalk
+        && allboxes.first().is_some_and(|b| b.is_constant())
+        && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
+    {
+        if addr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(addr) {
+            // `symbolic` resolves against `symbolic_fnaddr_paths` in the
+            // build's jit metadata, so carry the hash for the report.
+            Some(("symbolic", addr, addr))
+        } else if pyre_interpreter::is_abi_unsound_argument_residual(addr as usize) {
+            // A real funcptr reached here, so there is no hash to carry, and
+            // zero is what this variant spells for that.
+            Some(("abi-unsound-arg", addr, 0))
+        } else if ctx.fbw_mode.transparent_helper_subwalk
+            && call_opcode.is_call_may_force()
+            && !records_inside_transparent_helper(addr)
+            && !pyre_interpreter::is_rewindable_root_bracket_residual(addr as usize)
+            && !call_descr.get_extra_info().is_call_release_gil()
+            // `pyjitpl.py direct_libffi_call` executes `jit_ffi_call_impl_*`
+            // and records `call_release_gil`. The helper is
+            // `dont_look_inside` and does not re-enter Python; the forces
+            // guard belongs to the recorded release-gil op.
+            && call_descr.get_extra_info().oopspecindex != majit_ir::OopSpecIndex::LibffiCall
+        {
+            // These helpers are `dont_look_inside_cannot_raise`. Their
+            // call descr is still `EF_RANDOM_EFFECTS` because the graph
+            // is top, so the opcode is may-force. They do not call back
+            // into Python, so the guard the comment above is about does
+            // not fail and the call can be recorded.
+            // `do_residual_call` runs `executor.execute_varargs` on
+            // `call_external_function` (`ccall_*`), then
+            // `direct_call_release_gil` records `CALL_RELEASE_GIL_*`
+            // (`history.record_nospec`). The wrapper releases the GIL around
+            // the C call, so it does not re-enter Python and
+            // `GUARD_NOT_FORCED` cannot fail for a callback.
+            Some(("may-force-in-transparent-helper", addr, 0))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
 /// `assembler_continuation_escape` is the `CALL_ASSEMBLER` CALL pc plus the
 /// box the synthesised tail still needs (constructor instance, or the
 /// generator `_send_ex` reads). An escape latches that tail plus the caller,
@@ -5870,80 +5956,8 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // (`declined_symbolic`): that leaves subsequent steps without the
     // concrete result `execute_varargs` would have produced.
 
-    // Orthodox sub-jitcode walk safety (#171 wall-5d): a residual call whose
-    // funcbox is NULL or a `symbolic_fnaddr` placeholder — a 64-bit `DefaultHasher`
-    // hash of an in-body helper's `CallPath`/`CallTarget`, minted when
-    // `jit_trace_fnaddrs()` has no entry for it (e.g. the zero-arg
-    // `SyntheticTransparentCtor "Tuple"` unit constructor inside
-    // `w_list_append`) — must not be recorded while inlining a sub-jitcode
-    // body.  The production fall-throughs below leave such a call symbolic when
-    // folding declines, on the contract that it runs at runtime against live
-    // state; but a sub-walk's recorded trace is committed and compiled, so the
-    // backend bakes the hash as a code address and the trace branches straight
-    // to it -> SIGSEGV.  Decline the whole descent so it aborts gracefully at
-    // the first un-lowered helper.  Symbolic hashes carry the
-    // `SYMBOLIC_FNADDR_BASE` high-16-bit tag no real funcptr can carry.
-    //
-    // A published address is the weaker claim that the funcptr is real, not
-    // that its signature fits the residual ABI.  The executor writes one word
-    // per `arg_types()` entry, so a helper taking a fat pointer receives its
-    // second half from whichever register the caller last wrote, and reading
-    // that as a length dereferences an address nothing chose --- a fault
-    // inside the callee, past every check this walk makes.
-    // `is_abi_unsound_argument_residual` names exactly the helpers published
-    // with such a parameter, so the descent declines before running one and
-    // the interpreter makes the call with the argument whole.
-    //
-    // A may-force residual inside a transparent helper is declined for the
-    // resume it would need.  Its GUARD_NOT_FORCED and GUARD_NO_EXCEPTION fail
-    // after the Python code it called back into has run: a callback that
-    // raises forces the caller's frame vref on `leave`, and so does one that
-    // escapes its frame.  `capture_resumedata` resumes such a guard inside the
-    // helper's own frame, past the call.  A transparent helper has no frame of
-    // its own, so its guards resume at the Python CALL that entered it, and
-    // the CALL runs the callback a second time -- or, with the exception still
-    // pending at that coordinate, lets it past the CALL's handler.
-    let unsupported_funcbox = if ctx.fbw_mode.inline_subwalk
-        && allboxes.first().is_some_and(|b| b.is_constant())
-        && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
-    {
-        if addr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(addr) {
-            // `symbolic` resolves against `symbolic_fnaddr_paths` in the
-            // build's jit metadata, so carry the hash for the report.
-            Some(("symbolic", addr, addr))
-        } else if pyre_interpreter::is_abi_unsound_argument_residual(addr as usize) {
-            // A real funcptr reached here, so there is no hash to carry, and
-            // zero is what this variant spells for that.
-            Some(("abi-unsound-arg", addr, 0))
-        } else if ctx.fbw_mode.transparent_helper_subwalk
-            && call_opcode.is_call_may_force()
-            && !records_inside_transparent_helper(addr)
-            && !pyre_interpreter::is_rewindable_root_bracket_residual(addr as usize)
-            && !call_descr.get_extra_info().is_call_release_gil()
-            // `pyjitpl.py direct_libffi_call` executes `jit_ffi_call_impl_*`
-            // and records `call_release_gil`. The helper is
-            // `dont_look_inside` and does not re-enter Python; the forces
-            // guard belongs to the recorded release-gil op.
-            && call_descr.get_extra_info().oopspecindex != majit_ir::OopSpecIndex::LibffiCall
-        {
-            // These helpers are `dont_look_inside_cannot_raise`. Their
-            // call descr is still `EF_RANDOM_EFFECTS` because the graph
-            // is top, so the opcode is may-force. They do not call back
-            // into Python, so the guard the comment above is about does
-            // not fail and the call can be recorded.
-            // `do_residual_call` runs `executor.execute_varargs` on
-            // `call_external_function` (`ccall_*`), then
-            // `direct_call_release_gil` records `CALL_RELEASE_GIL_*`
-            // (`history.record_nospec`). The wrapper releases the GIL around
-            // the C call, so it does not re-enter Python and
-            // `GUARD_NOT_FORCED` cannot fail for a callback.
-            Some(("may-force-in-transparent-helper", addr, 0))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let unsupported_funcbox =
+        residual_call_refused_up_front(ctx, call_opcode, allboxes, call_descr);
     if let Some((reason, addr, symbolic)) = unsupported_funcbox {
         // Every caller catches this variant to decline its whole fold, so
         // without a report here the helper that stopped the descent is
@@ -9111,6 +9125,8 @@ pub(crate) enum OperatorTailResidual {
     /// The tail returned: the call result, already written to `dst`
     /// and followed by `GUARD_NO_EXCEPTION`.
     Returned(OpRef),
+    /// The executor refuses the call up front, so it never ran; the caller latches the tail.
+    NotRun,
 }
 
 /// Record the tail's helper ([`crate::operator_continuation::OperatorTail::tail_call`])
@@ -9159,6 +9175,13 @@ pub(crate) fn record_operator_tail_residual<Sym: WalkSym>(
     let allboxes = [funcptr, value, receiver];
     let (call_opcode, can_raise, emit_guard_not_forced) =
         select_residual_call_opcode(&ei, dst_bank, "record_operator_tail_residual");
+    // A call the executor refuses up front never runs; leave the tail to the
+    // caller's latch (`blackhole.py convert_and_run_from_pyjitpl` resumes
+    // past `__new__`). Any later error comes after the call ran and
+    // propagates.
+    if residual_call_refused_up_front(ctx, call_opcode, &allboxes, call_descr).is_some() {
+        return Ok(OperatorTailResidual::NotRun);
+    }
     // `do_residual_call`: preparation, the concrete call, then
     // `vrefs_after_residual_call`, then `direct_call_may_force`.
     let recorded_residual = finish_dispatch_residual_call(

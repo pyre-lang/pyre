@@ -12671,30 +12671,36 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         // `handle_possible_exception`) so `descr_call`'s `__init__`
                         // runs in the trace. The helper re-runs the post-`__new__`
                         // checks at run time.
-                        let Some(w_call_box) = format_receiver else {
-                            return abort_operator_tail_after_return(
-                                ctx,
-                                op.pc,
-                                operator_tail_caller.as_ref(),
-                                crate::operator_continuation::OperatorTail::TypeCallNew,
-                                value,
-                                format_receiver,
-                            );
+                        let residual = match format_receiver {
+                            Some(w_call_box) => {
+                                super::residual_call::record_operator_tail_residual(
+                                    ctx,
+                                    op,
+                                    dst,
+                                    dst_bank,
+                                    crate::operator_continuation::OperatorTail::TypeCallNew,
+                                    value,
+                                    w_call_box,
+                                )?
+                            }
+                            None => super::residual_call::OperatorTailResidual::NotRun,
                         };
-                        match super::residual_call::record_operator_tail_residual(
-                            ctx,
-                            op,
-                            dst,
-                            dst_bank,
-                            crate::operator_continuation::OperatorTail::TypeCallNew,
-                            value,
-                            w_call_box,
-                        )? {
+                        match residual {
                             super::residual_call::OperatorTailResidual::Raised(raised) => {
                                 return Ok(Some(raised));
                             }
                             super::residual_call::OperatorTailResidual::Returned(result) => {
                                 (result, concrete_from_recorded_opref(ctx, result))
+                            }
+                            super::residual_call::OperatorTailResidual::NotRun => {
+                                return abort_operator_tail_after_return(
+                                    ctx,
+                                    op.pc,
+                                    operator_tail_caller.as_ref(),
+                                    crate::operator_continuation::OperatorTail::TypeCallNew,
+                                    value,
+                                    format_receiver,
+                                );
                             }
                         }
                     }
@@ -12777,7 +12783,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 super::residual_call::OperatorTailResidual::Raised(raised) => {
                                     return Ok(Some(raised));
                                 }
-                                super::residual_call::OperatorTailResidual::Returned(_) => {
+                                super::residual_call::OperatorTailResidual::Returned(_)
+                                | super::residual_call::OperatorTailResidual::NotRun => {
                                     return abort_operator_tail_after_return(
                                         ctx,
                                         op.pc,

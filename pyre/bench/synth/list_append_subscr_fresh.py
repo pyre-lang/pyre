@@ -13,4 +13,4 @@ def f(n):
     return acc
 
 
-print(f(18000000))
+print(f(45000000))
