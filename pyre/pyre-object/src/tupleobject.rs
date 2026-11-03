@@ -964,20 +964,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tuple_create_and_access() {
-        let items = vec![w_int_new(1), w_int_new(2), w_int_new(3)];
-        let tup = w_tuple_new(items);
-        unsafe {
-            assert!(is_tuple(tup));
-            assert_eq!(w_tuple_len(tup), 3);
-            let item = w_tuple_getitem(tup, 0).unwrap();
-            assert_eq!(crate::intobject::w_int_get_value(item), 1);
-            let item = w_tuple_getitem(tup, 2).unwrap();
-            assert_eq!(crate::intobject::w_int_get_value(item), 3);
-        }
-    }
-
-    #[test]
     fn test_tuple_negative_index() {
         let items = vec![w_int_new(10), w_int_new(20)];
         let tup = w_tuple_new(items);

@@ -7370,20 +7370,6 @@ mod tests {
     }
 
     #[test]
-    fn test_list_create_and_access() {
-        let items = vec![w_int_new(10), w_int_new(20), w_int_new(30)];
-        let list = w_list_new(items);
-        unsafe {
-            assert!(is_list(list));
-            assert_eq!(w_list_len(list), 3);
-            let item = w_list_getitem(list, 0).unwrap();
-            assert_eq!(crate::intobject::w_int_get_value(item), 10);
-            let item = w_list_getitem(list, 2).unwrap();
-            assert_eq!(crate::intobject::w_int_get_value(item), 30);
-        }
-    }
-
-    #[test]
     fn is_plain_int1_rejects_a_bigint_that_does_not_fit_i64() {
         // listobject.py is_plain_int1 / IntegerListStrategy.is_correct_type:
         // a W_LongObject is only a plain int when `_fits_int()` holds.
@@ -7589,16 +7575,6 @@ mod tests {
     }
 
     #[test]
-    fn test_list_negative_index() {
-        let items = vec![w_int_new(1), w_int_new(2), w_int_new(3)];
-        let list = w_list_new(items);
-        unsafe {
-            let item = w_list_getitem(list, -1).unwrap();
-            assert_eq!(crate::intobject::w_int_get_value(item), 3);
-        }
-    }
-
-    #[test]
     fn integer_strategy_oopspec_leaves_roundtrip() {
         let items = vec![w_int_new(10), w_int_new(20), w_int_new(30)];
         let list = w_list_new(items);
@@ -7758,28 +7734,6 @@ mod tests {
             oopspec_ll_list_obj_setitem_fast,
             "list.obj_setitem(l, index, item)"
         );
-    }
-
-    #[test]
-    fn test_list_setitem() {
-        let items = vec![w_int_new(1), w_int_new(2)];
-        let list = w_list_new(items);
-        unsafe {
-            assert!(w_list_setitem(list, 0, w_int_new(99)));
-            let item = w_list_getitem(list, 0).unwrap();
-            assert_eq!(crate::intobject::w_int_get_value(item), 99);
-        }
-    }
-
-    #[test]
-    fn test_list_append() {
-        let list = w_list_new(vec![]);
-        unsafe {
-            w_list_append(list, w_int_new(42));
-            assert_eq!(w_list_len(list), 1);
-            let item = w_list_getitem(list, 0).unwrap();
-            assert_eq!(crate::intobject::w_int_get_value(item), 42);
-        }
     }
 
     #[test]

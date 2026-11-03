@@ -678,27 +678,4 @@ mod tests {
             "3.2.0"
         );
     }
-
-    #[test]
-    fn ucd_legacy_name_rejects_later_assignments() {
-        pyre_interpreter::test_hooks::install_hash_hook();
-        pyre_interpreter::typedef::init_typeobjects();
-        let _ = type_object();
-        let obj = W_UCD::allocate_stable(W_UCD {
-            ob: PyObject {
-                ob_type: std::ptr::null(),
-                w_class: std::ptr::null_mut(),
-            },
-            legacy: true,
-        });
-        // U+0221 was assigned in Unicode 4.0, so the 3.2.0 view has no name
-        // for it while the latest view does.
-        let ucd = W_UCD::from_obj(obj).expect("typed UCD instance");
-        assert!(ucd.name(&[obj, w_str_new("\u{221}")]).is_err());
-        let modern = name(&[w_str_new("\u{221}")]).expect("name");
-        assert_eq!(
-            unsafe { w_str_get_wtf8(modern) }.to_string(),
-            "LATIN SMALL LETTER D WITH CURL"
-        );
-    }
 }

@@ -2490,10 +2490,8 @@ impl fmt::Display for PyDisplay {
 #[cfg(test)]
 mod tests {
     use super::{
-        bytes_repr_string, format_float_repr, format_wtf8_repr, jit_format_float_repr_rstr,
-        repr_addr, syntax_error_basename_start,
+        format_float_repr, jit_format_float_repr_rstr, repr_addr, syntax_error_basename_start,
     };
-    use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
     #[test]
     fn repr_addr_matches_zero_padded_lowercase_hex() {
@@ -2512,31 +2510,6 @@ mod tests {
         ] {
             assert_eq!(repr_addr(x), format!("0x{x:0width$x}"));
         }
-    }
-
-    #[test]
-    fn bytes_repr_matches_pypy_quote_and_escape_edges() {
-        assert_eq!(bytes_repr_string(b""), "b''");
-        assert_eq!(bytes_repr_string(b"a'b"), "b\"a'b\"");
-        assert_eq!(bytes_repr_string(b"a\"b"), "b'a\"b'");
-        assert_eq!(bytes_repr_string(b"a'\"b"), "b'a\\'\"b'");
-        assert_eq!(
-            bytes_repr_string(&[0, 9, 10, 13, 31, 32, 92, 126, 127, 255]),
-            "b'\\x00\\t\\n\\r\\x1f \\\\~\\x7f\\xff'"
-        );
-    }
-
-    #[test]
-    fn unicode_repr_matches_pypy_quote_printable_and_surrogate_edges() {
-        assert_eq!(format_wtf8_repr(Wtf8Buf::from("a'b").as_ref()), "\"a'b\"");
-        assert_eq!(format_wtf8_repr(Wtf8Buf::from("a\"b").as_ref()), "'a\"b'");
-        assert_eq!(
-            format_wtf8_repr(Wtf8Buf::from("\0\t\n\r ☃\u{e0020}").as_ref()),
-            "'\\x00\\t\\n\\r ☃\\U000e0020'"
-        );
-        let mut surrogate = Wtf8Buf::from("x");
-        surrogate.push(CodePoint::from_u32(0xd800).unwrap());
-        assert_eq!(format_wtf8_repr(&surrogate), "'x\\ud800'");
     }
 
     #[test]

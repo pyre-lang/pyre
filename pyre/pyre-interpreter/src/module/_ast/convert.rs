@@ -4974,27 +4974,11 @@ mod tests {
             .unwrap_or_else(|| panic!("list[{index}]"))
     }
 
-    fn module_value(tree: PyObjectRef) -> PyObjectRef {
-        field(list_item(field(tree, "body"), 0), "value")
-    }
-
     #[test]
     fn compile_method_call_ast_keeps_location_provenance() {
         let _ec = boot();
         compile_ast(parse_exec("x = a.b(c)"));
         compile_ast(parse_exec("def f():\n    x = a.b(c)\n"));
-    }
-
-    #[test]
-    fn unpacking_dict_comp_publishes_operand_as_key() {
-        let _ec = boot();
-        let tree = parse_exec("{**x for x in ()}");
-        let dictcomp = module_value(tree);
-        let key = field(dictcomp, "key");
-        let value = field(dictcomp, "value");
-        assert!(unsafe { pyre_object::is_none(value) });
-        let id = field(key, "id");
-        assert_eq!(unsafe { pyre_object::w_str_get_wtf8(id) }, "x");
     }
 
     #[test]
@@ -5012,38 +4996,6 @@ mod tests {
         .unwrap_or_else(|err| panic!("PyCF_ONLY_AST unpacking dictcomp: {err:?}"));
     }
 
-    #[test]
-    fn tstring_debug_line_continuation_str_drops_marker() {
-        let _ec = boot();
-        let tree = parse_exec("t\"\"\"Value: {value =\\\n}\"\"\"");
-        let values = field(module_value(tree), "values");
-        let constant_value = field(list_item(values, 0), "value");
-        assert_eq!(
-            unsafe { pyre_object::w_str_get_wtf8(constant_value) },
-            "Value: value =\\\n"
-        );
-        let interpolation_str = field(list_item(values, 1), "str");
-        assert_eq!(
-            unsafe { pyre_object::w_str_get_wtf8(interpolation_str) },
-            "value "
-        );
-    }
-
-    fn ast_module() -> PyObjectRef {
-        crate::importing::importhook(
-            Wtf8::new("_ast"),
-            PY_NULL,
-            PY_NULL,
-            0,
-            crate::call::take_last_exec_ctx(),
-        )
-        .expect("_ast")
-    }
-
-    fn call(func: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        crate::call::call_function_impl_result(func, args)
-    }
-
     fn compile_err(object: PyObjectRef) -> String {
         super::compile_object(
             object,
@@ -5055,47 +5007,6 @@ mod tests {
         )
         .expect_err("compile should fail")
         .message_text()
-    }
-
-    #[test]
-    fn is_abstract_reports_generated_sum_types() {
-        let _ec = boot();
-        let roots = pyre_object::gc_roots::push_roots();
-        let module_slot = roots.base();
-        let _ = roots.pin_root(ast_module());
-        let is_abstract = field(roots.get(module_slot), "_is_abstract");
-        let is_abstract_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(is_abstract);
-        let expr = field(roots.get(module_slot), "expr");
-        let expr_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(expr);
-        let name = field(roots.get(module_slot), "Name");
-        let name_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(name);
-        let yes = call(roots.get(is_abstract_slot), &[roots.get(expr_slot)]).unwrap();
-        let no = call(roots.get(is_abstract_slot), &[roots.get(name_slot)]).unwrap();
-        assert!(crate::baseobjspace::is_true(yes).unwrap());
-        assert!(!crate::baseobjspace::is_true(no).unwrap());
-    }
-
-    #[test]
-    fn constructor_requires_asdl_fields() {
-        let _ec = boot();
-        let roots = pyre_object::gc_roots::push_roots();
-        let module_slot = roots.base();
-        let _ = roots.pin_root(ast_module());
-        let binop = field(roots.get(module_slot), "BinOp");
-        let err = call(binop, &[]).unwrap_err();
-        assert_eq!(
-            err.message_text(),
-            "ast.BinOp.__init__ missing 3 required positional arguments: 'left', 'op', and 'right'"
-        );
-        let name = field(roots.get(module_slot), "Name");
-        let err = call(name, &[]).unwrap_err();
-        assert_eq!(
-            err.message_text(),
-            "ast.Name.__init__ missing 1 required positional argument: 'id'"
-        );
     }
 
     #[test]

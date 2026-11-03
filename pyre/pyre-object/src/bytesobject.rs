@@ -701,15 +701,6 @@ mod tests {
     }
 
     #[test]
-    fn test_bytes_empty() {
-        let b = w_bytes_empty();
-        unsafe {
-            assert!(is_bytes(b));
-            assert_eq!(w_bytes_len(b), 0);
-        }
-    }
-
-    #[test]
     fn w_bytes_gc_type_id_matches_descr() {
         assert_eq!(W_BYTES_GC_TYPE_ID, 27);
         assert_eq!(

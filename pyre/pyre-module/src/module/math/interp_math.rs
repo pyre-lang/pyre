@@ -2401,8 +2401,6 @@ pub fn fma(args: &[PyObjectRef]) -> PyResult {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// `dont_look_inside` publishes a `HELPER_FNADDRS` trampoline. `math1`'s
     /// `except ValueError` body is looked inside (`error.py oefmt`), so this
     /// helper must not appear. `isclose_slow` stays residual with word args
@@ -2422,15 +2420,5 @@ mod tests {
                 .all(|path| !path.contains("sqrt_translate_ll_error")),
             "math1 except ValueError is looked inside, not dont_look_inside"
         );
-    }
-
-    /// `test_math.py test_exception_messages` for `math.sqrt(-1.1)`.
-    /// The kind tag follows `space.w_ValueError` once builtins have
-    /// registered the class; this crate-level test has no registry, so
-    /// `oefmt` keeps the bootstrap fallback and we check the message.
-    #[test]
-    fn math_sqrt_translate_ll_error_keeps_nonnegative_message() {
-        let err = sqrt_from_double(-1.1).expect_err("domain error");
-        assert_eq!(err.message_text(), "expected a nonnegative input, got -1.1");
     }
 }

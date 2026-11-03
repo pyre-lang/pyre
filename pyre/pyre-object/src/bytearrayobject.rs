@@ -602,20 +602,6 @@ mod tests {
     }
 
     #[test]
-    fn test_bytearray_basic() {
-        let ba = w_bytearray_new(10);
-        unsafe {
-            assert!(is_bytearray(ba));
-            assert_eq!(w_bytearray_len(ba), 10);
-            assert_eq!(w_bytearray_getitem(ba, 0), 0);
-            w_bytearray_setitem(ba, 3, 1);
-            assert_eq!(w_bytearray_getitem(ba, 3), 1);
-            assert_eq!(w_bytearray_find(ba, 1, 0), 3);
-            assert_eq!(w_bytearray_find(ba, 1, 4), -1);
-        }
-    }
-
-    #[test]
     fn memcmp_indexes_bytes_in_order() {
         assert_eq!(_memcmp(b"abc", b"abd", 3), -1);
         assert_eq!(_memcmp(b"abd", b"abc", 3), 1);

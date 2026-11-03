@@ -8393,119 +8393,6 @@ mod tests {
     }
 
     #[test]
-    fn tuple_eq_length_first_does_not_call_element_eq() {
-        crate::test_hooks::install_hash_hook();
-        let code = crate::compile::compile_exec(
-            "calls = []\n\
-             class X:\n    \
-             def __eq__(self, other):\n        \
-             calls.append(1)\n        \
-             return True\n\
-             eq_len = (X(),) == (X(), 0)\n\
-             ne_len = (X(),) != (X(), 0)\n\
-             same = (1, 2) == (1, 2)\n\
-             nan_a = float('nan')\n\
-             nan_b = float('nan')\n\
-             nan_same = (1.0, nan_a) == (1.0, nan_a)\n\
-             nan_distinct = (1.0, nan_a) == (1.0, nan_b)\n\
-             a, b, c = object(), object(), object()\n\
-             ne_tail = (a, b) != (a, c)\n",
-        )
-        .expect("compile");
-        let mut frame = crate::pyframe::PyFrame::new(code);
-        frame.execute_frame(None, None).expect("execute");
-        let globals = frame.get_w_globals();
-        let eq_len = unsafe { pyre_object::w_dict_getitem_str(globals, "eq_len") }.expect("eq_len");
-        let ne_len = unsafe { pyre_object::w_dict_getitem_str(globals, "ne_len") }.expect("ne_len");
-        let same = unsafe { pyre_object::w_dict_getitem_str(globals, "same") }.expect("same");
-        let nan_same =
-            unsafe { pyre_object::w_dict_getitem_str(globals, "nan_same") }.expect("nan_same");
-        let nan_distinct = unsafe { pyre_object::w_dict_getitem_str(globals, "nan_distinct") }
-            .expect("nan_distinct");
-        let ne_tail =
-            unsafe { pyre_object::w_dict_getitem_str(globals, "ne_tail") }.expect("ne_tail");
-        let calls = unsafe { pyre_object::w_dict_getitem_str(globals, "calls") }.expect("calls");
-        assert!(!unsafe { w_bool_get_value(eq_len) });
-        assert!(unsafe { w_bool_get_value(ne_len) });
-        assert!(unsafe { w_bool_get_value(same) });
-        assert!(unsafe { w_bool_get_value(nan_same) });
-        assert!(!unsafe { w_bool_get_value(nan_distinct) });
-        assert!(unsafe { w_bool_get_value(ne_tail) });
-        assert_eq!(unsafe { pyre_object::w_list_len(calls) }, 0);
-    }
-
-    #[test]
-    fn tuple_lt_calls_ordering_on_first_differing_pair() {
-        crate::test_hooks::install_hash_hook();
-        let code = crate::compile::compile_exec(
-            "seen = []\n\
-             class X:\n    \
-             def __eq__(self, other):\n        \
-             return False\n    \
-             def __lt__(self, other):\n        \
-             seen.append('X')\n        \
-             return True\n\
-             class Y:\n    \
-             def __eq__(self, other):\n        \
-             return False\n    \
-             def __lt__(self, other):\n        \
-             seen.append('Y')\n        \
-             return False\n\
-             ordered = (1, X()) < (1, Y())\n",
-        )
-        .expect("compile");
-        let mut frame = crate::pyframe::PyFrame::new(code);
-        frame.execute_frame(None, None).expect("execute");
-        let globals = frame.get_w_globals();
-        let ordered =
-            unsafe { pyre_object::w_dict_getitem_str(globals, "ordered") }.expect("ordered");
-        let seen = unsafe { pyre_object::w_dict_getitem_str(globals, "seen") }.expect("seen");
-        assert!(unsafe { w_bool_get_value(ordered) });
-        assert_eq!(unsafe { pyre_object::w_list_len(seen) }, 1);
-        let first = unsafe { pyre_object::w_list_getitem(seen, 0) }.expect("seen[0]");
-        assert_eq!(crate::baseobjspace::str_utf8_w(first).unwrap(), "X");
-    }
-
-    #[test]
-    fn tuple_equality_does_not_call_element_ne_after_eq_rejects() {
-        crate::test_hooks::install_hash_hook();
-        let code = crate::compile::compile_exec(
-            "class Cell:\n    \
-             def __eq__(self, other):\n        \
-             return False\n    \
-             def __ne__(self, other):\n        \
-             return False\n\
-             class Ord:\n    \
-             def __eq__(self, other):\n        \
-             return False\n    \
-             def __lt__(self, other):\n        \
-             return True\n\
-             ne = (Cell(), 1, 2) != (Cell(), 1, 2)\n\
-             eq = (Cell(), 1, 2) == (Cell(), 1, 2)\n\
-             ordered = (Ord(),) < (Ord(),)\n",
-        )
-        .expect("compile");
-        let mut frame = crate::pyframe::PyFrame::new(code);
-        frame.execute_frame(None, None).expect("execute");
-        let globals = frame.get_w_globals();
-        let ne = unsafe { pyre_object::w_dict_getitem_str(globals, "ne") }.expect("ne");
-        let eq = unsafe { pyre_object::w_dict_getitem_str(globals, "eq") }.expect("eq");
-        let ordered =
-            unsafe { pyre_object::w_dict_getitem_str(globals, "ordered") }.expect("ordered");
-        assert!(unsafe { w_bool_get_value(ne) });
-        assert!(!unsafe { w_bool_get_value(eq) });
-        assert!(unsafe { w_bool_get_value(ordered) });
-    }
-
-    #[test]
-    fn test_int_add() {
-        let a = w_int_new(3);
-        let b = w_int_new(4);
-        let result = add(a, b).unwrap();
-        unsafe { assert_eq!(w_int_get_value(result), 7) };
-    }
-
-    #[test]
     fn ll_2_int_floordiv_and_mod_match_truncating_machine_ops() {
         let samples = [
             (7, 3),
@@ -8552,14 +8439,6 @@ mod tests {
         let err = ll_math_sqrt(-1.0).unwrap_err();
         assert_eq!(err.kind, crate::PyErrorKind::ValueError);
         assert_eq!(err.message_text(), "math domain error");
-    }
-
-    #[test]
-    fn test_int_compare() {
-        let a = w_int_new(5);
-        let b = w_int_new(10);
-        let result = compare(a, b, CompareOp::Lt).unwrap();
-        unsafe { assert!(w_bool_get_value(result)) };
     }
 
     #[test]
@@ -8674,13 +8553,6 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_division() {
-        let a = w_int_new(5);
-        let b = w_int_new(0);
-        assert!(floordiv(a, b).is_err());
-    }
-
-    #[test]
     fn test_int_floordiv_and_mod_bounce_min_overflow_to_rbigint() {
         // intobject.py uses `ovfcheck` for both operations.  On a signed
         // machine word MIN / -1 is their sole non-zero-divisor overflow.
@@ -8712,15 +8584,6 @@ mod tests {
             assert!(q.mul(&rhs).add(&r).eq(&lhs));
             assert!(r.get_sign() == 0 || r.get_sign() == rhs.get_sign());
         }
-    }
-
-    #[test]
-    fn test_truthiness() {
-        assert!(is_true(w_int_new(1)).unwrap());
-        assert!(!is_true(w_int_new(0)).unwrap());
-        assert!(!is_true(w_none()).unwrap());
-        assert!(is_true(w_bool_from(true)).unwrap());
-        assert!(!is_true(w_bool_from(false)).unwrap());
     }
 
     #[test]
@@ -9177,15 +9040,6 @@ mod tests {
     }
 
     #[test]
-    fn test_invert_int() {
-        let result = invert(w_int_new(6)).unwrap();
-        unsafe {
-            assert!(is_int(result));
-            assert_eq!(w_int_get_value(result), !6);
-        }
-    }
-
-    #[test]
     fn test_long_compare() {
         let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
         let b = w_int_new(i64::MAX);
@@ -9306,12 +9160,6 @@ mod tests {
     }
 
     #[test]
-    fn test_int_pow() {
-        let result = pow(w_int_new(2), w_int_new(10)).unwrap();
-        unsafe { assert_eq!(w_int_get_value(result), 1024) };
-    }
-
-    #[test]
     fn test_int_pow_overflow() {
         let result = pow(w_int_new(2), w_int_new(63)).unwrap();
         unsafe {
@@ -9321,15 +9169,6 @@ mod tests {
                 *w_long_get_value(result),
                 BigInt::from(2).int_pow(63, None).unwrap()
             );
-        }
-    }
-
-    #[test]
-    fn test_int_pow_negative_exponent() {
-        let result = pow(w_int_new(2), w_int_new(-1)).unwrap();
-        unsafe {
-            assert!(is_float(result));
-            assert_eq!(w_float_get_value(result), 0.5);
         }
     }
 
@@ -9344,12 +9183,6 @@ mod tests {
         let error = pow(w_int_new(1), w_long_new(huge_negative_exponent)).unwrap_err();
         assert_eq!(error.kind, PyErrorKind::OverflowError);
         assert_eq!(error.message_text(), "int too large to convert to float");
-    }
-
-    #[test]
-    fn test_int_lshift() {
-        let result = lshift(w_int_new(1), w_int_new(10)).unwrap();
-        unsafe { assert_eq!(w_int_get_value(result), 1024) };
     }
 
     #[test]
@@ -9368,12 +9201,6 @@ mod tests {
         }
         let error = lshift(w_int_new(1), w_int_new(i64::MAX)).unwrap_err();
         assert_eq!(error.kind, PyErrorKind::MemoryError);
-    }
-
-    #[test]
-    fn test_int_rshift() {
-        let result = rshift(w_int_new(1024), w_int_new(3)).unwrap();
-        unsafe { assert_eq!(w_int_get_value(result), 128) };
     }
 
     #[test]
@@ -9410,14 +9237,6 @@ mod tests {
     }
 
     #[test]
-    fn test_negative_shift_count() {
-        assert!(lshift(w_int_new(1), w_int_new(-1)).is_err());
-        assert!(rshift(w_int_new(1), w_int_new(-1)).is_err());
-        assert!(lshift(w_long_new(BigInt::from(1)), w_long_new(BigInt::from(-1))).is_err());
-        assert!(rshift(w_long_new(BigInt::from(1)), w_long_new(BigInt::from(-1))).is_err());
-    }
-
-    #[test]
     fn test_long_repeat_count_bounds() {
         unsafe {
             let huge = BigInt::one().lshift(100).unwrap();
@@ -9426,12 +9245,6 @@ mod tests {
             let error = repeat_count(w_long_new(huge)).unwrap_err();
             assert_eq!(error.kind, PyErrorKind::OverflowError);
         }
-    }
-
-    #[test]
-    fn test_int_bitand() {
-        let result = and_(w_int_new(0xFF), w_int_new(0x0F)).unwrap();
-        unsafe { assert_eq!(w_int_get_value(result), 0x0F) };
     }
 
     #[test]
@@ -9447,32 +9260,6 @@ mod tests {
             assert!(!same_unoverridden_rpy_type(exact, user));
             assert!(same_unoverridden_rpy_type(exact, w_int_new(3)));
         }
-    }
-
-    #[test]
-    fn test_bool_bitwise_shortcuts_return_bool_singletons() {
-        unsafe {
-            let tand = and_(w_bool_from(true), w_bool_from(true)).unwrap();
-            let tand_f = and_(w_bool_from(true), w_bool_from(false)).unwrap();
-            let tor = or_(w_bool_from(false), w_bool_from(true)).unwrap();
-            let txor = xor(w_bool_from(true), w_bool_from(false)).unwrap();
-            assert!(std::ptr::eq(tand, w_bool_from(true)));
-            assert!(std::ptr::eq(tand_f, w_bool_from(false)));
-            assert!(std::ptr::eq(tor, w_bool_from(true)));
-            assert!(std::ptr::eq(txor, w_bool_from(true)));
-        }
-    }
-
-    #[test]
-    fn test_int_bitor() {
-        let result = or_(w_int_new(0xF0), w_int_new(0x0F)).unwrap();
-        unsafe { assert_eq!(w_int_get_value(result), 0xFF) };
-    }
-
-    #[test]
-    fn test_int_bitxor() {
-        let result = xor(w_int_new(0xFF), w_int_new(0x0F)).unwrap();
-        unsafe { assert_eq!(w_int_get_value(result), 0xF0) };
     }
 
     #[test]

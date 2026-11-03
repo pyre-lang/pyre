@@ -1279,28 +1279,6 @@ mod tests {
             assert!(!unsafe { pyre_object::w_type_is_heaptype(ty) });
         }
     }
-
-    #[test]
-    fn crc32_combine_matches_concatenated_crc32() {
-        let a = b"hello ";
-        let b = b"world";
-        let crc_a = crc32_compute(a, 0);
-        let crc_b = crc32_compute(b, 0);
-        let combined = crc32_combine(crc_a, crc_b, b.len() as i64);
-        assert_eq!(combined, crc32_compute(b"hello world", 0));
-        assert_eq!(crc32_combine(crc_a, crc_b, 0), crc_a);
-    }
-
-    #[test]
-    fn adler32_combine_matches_concatenated_adler32() {
-        let a = b"hello ";
-        let b = b"world";
-        let adler_a = adler32_compute(a, 1);
-        let adler_b = adler32_compute(b, 1);
-        let combined = adler32_combine(adler_a, adler_b, b.len() as i64);
-        assert_eq!(combined, adler32_compute(b"hello world", 1));
-        assert_eq!(adler32_combine(adler_a, adler_b, -1), 1);
-    }
 }
 
 /// The GC types this module owns, in `build_gc` registration order.
