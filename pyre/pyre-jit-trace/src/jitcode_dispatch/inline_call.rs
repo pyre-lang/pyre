@@ -17258,13 +17258,9 @@ pub(super) fn generator_resume_yield<Sym: WalkSym>(
     // still in the slot, and the next `pushvalue_none` requires the slot to
     // be null. The compiled loop has to store that too: the GC scans the
     // array independently of `valuestackdepth`.
-    // SETFIELD_GC of last_instr can minor-collect; re-read the frame.
-    publish_generator_slot_null(
-        ctx,
-        live_generator_frame(resume.frame_root) as usize,
-        resume.frame_box,
-        top,
-    );
+    // SETFIELD_GC of last_instr can minor-collect; pass the root so
+    // `publish_generator_slot_null` re-reads the frame.
+    publish_generator_slot_null(ctx, resume.frame_root, resume.frame_box, top);
     Ok(Some(store.value))
 }
 
@@ -17556,23 +17552,22 @@ fn publish_generator_suspension<Sym: WalkSym>(
 /// then `SetarrayitemGc` of `PY_NULL`).
 fn publish_generator_slot_null<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
-    frame: usize,
+    frame_root: usize,
     frame_box: OpRef,
     index: usize,
 ) {
-    let frame = majit_gc::gc_current_object_address(frame);
+    let frame = live_generator_frame(frame_root);
     unsafe {
-        (*(frame as *mut pyre_interpreter::PyFrame)).set_locals_w(index, std::ptr::null_mut());
+        (*frame).set_locals_w(index, std::ptr::null_mut());
     }
     let locals_descr = crate::descr::pyframe_locals_cells_stack_descr();
     let locals_array =
         ctx.trace_ctx
             .record_op_with_descr(OpCode::GetfieldGcR, &[frame_box], locals_descr);
-    // GetfieldGcR appends to `Trace._ops` and can minor-collect. Follow
-    // the forwarding stub before reading `locals_cells_stack_w`.
-    let frame = majit_gc::gc_current_object_address(frame);
-    let array_ptr =
-        unsafe { (*(frame as *mut pyre_interpreter::PyFrame)).locals_cells_stack_w as usize };
+    // GetfieldGcR appends to `Trace._ops` and can minor-collect. Re-read
+    // the frame from its root before reading `locals_cells_stack_w`.
+    let frame = live_generator_frame(frame_root);
+    let array_ptr = unsafe { (*frame).locals_cells_stack_w as usize };
     ctx.trace_ctx.set_opref_concrete(
         locals_array,
         majit_ir::Value::Ref(majit_ir::GcRef(array_ptr)),
@@ -18895,7 +18890,6 @@ fn walk_generator_resume<Sym: WalkSym>(
         // Guard the code object, not the generator identity: a new
         // GeneratorIterator every outer iteration would never tick
         // `make_a_counter_per_value` to a bridge.
-        let pycode = pyre_object::gc_roots::shadow_stack_get(code_root);
         let pycode_descr = crate::descr::gc_cached_field_descr(
             "generator::GeneratorIterator",
             "pycode",
@@ -18911,6 +18905,7 @@ fn walk_generator_resume<Sym: WalkSym>(
         let pycode_op =
             ctx.trace_ctx
                 .record_op_with_descr(OpCode::GetfieldGcR, &[iter_op], pycode_descr);
+        let pycode = pyre_object::gc_roots::shadow_stack_get(code_root);
         ctx.trace_ctx.set_opref_concrete(
             pycode_op,
             majit_ir::Value::Ref(majit_ir::GcRef(pycode as usize)),
@@ -19001,14 +18996,9 @@ fn walk_generator_resume<Sym: WalkSym>(
     // The slot `pushvalue_none` just counted may still hold the object the
     // previous traced yield left behind. Recording already nulled it; the
     // compiled resume has to as well, before anything reads the frame back.
-    // `pushvalue_none` does not record; re-read anyway so this pointer is
-    // not a long-lived copy into the GetfieldGcR that follows.
-    publish_generator_slot_null(
-        ctx,
-        live_generator_frame(frame_root) as usize,
-        frame_box,
-        resumed_depth,
-    );
+    // `pushvalue_none` does not record; pass the root so the frame is
+    // re-read around the GetfieldGcR that follows.
+    publish_generator_slot_null(ctx, frame_root, frame_box, resumed_depth);
     // `publish_generator_slot_null` records GetfieldGcR / SetarrayitemGc
     // and can minor-collect. Re-read before naming the resume frame.
     let resume = GeneratorResumeSubwalk {
