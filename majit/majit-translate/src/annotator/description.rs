@@ -1788,7 +1788,11 @@ impl FunctionDesc {
                 super::specialize::specialize_arg_or_var(self, inputcells, parms)
             }
             Specializer::Argtype { parms } => {
-                super::specialize::specialize_argtype(self, inputcells, parms)
+                if super::specialize::is_bodyless_argtype_stub(self) {
+                    super::specialize::specialize_argtype_stub_result(self, inputcells, parms)
+                } else {
+                    super::specialize::specialize_argtype(self, inputcells, parms)
+                }
             }
             Specializer::Arglistitemtype { parms } => {
                 if parms.len() != 1 {
