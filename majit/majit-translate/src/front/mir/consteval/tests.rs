@@ -11,8 +11,8 @@ use majit_charon_reader::{Llbc, ullbc::NameSeg};
 
 use crate::front::mir::tests::{
     const_artifact, empty_generics, empty_llbc, fixture_llbc, init_fun, item_meta_json,
-    llbc_with_types, named_const_global, nullary_calls_ending, reader_fun, scalar_ty, span_json,
-    u32_ty, usize_ty,
+    llbc_with_types, llbc_with_types_funs_globals, named_const_global, nullary_calls_ending,
+    option_enum, reader_fun, scalar_ty, span_json, u32_ty, unit_fn_ptr, usize_ty,
 };
 
 /// `Isize`/`Usize` truncate to the target word (`lltype.py` `cast_primitive`).
@@ -1704,6 +1704,264 @@ fn function_local_static_globals_resolve_through_disambiguated_keys() {
             + nullary_calls_ending(&graph1, "OWNER#1"),
         0,
         "disambiguated statics must not remain residual calls: {graph0:?} {graph1:?}"
+    );
+}
+
+fn fnptrcell_type_decl(kind: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta_json(&["majit_gc", "hook_cell", "FnPtrCell"], "", true),
+        "kind": kind
+    })
+}
+
+fn fnptrcell_global_llbc(kind: serde_json::Value) -> majit_charon_reader::Llbc {
+    let cell_ty = serde_json::json!({
+        "Adt": {"id": 0, "generics": empty_generics()}
+    });
+    let funs = vec![serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta_json(&["fixture", "read_cell"], "", true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": cell_ty},
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": cell_ty}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": cell_ty},
+                        {"Use": [{"Copy": {
+                            "kind": {"Global": {"generics": empty_generics(), "id": 1}},
+                            "ty": cell_ty
+                        }}, "No"]}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }}
+    })];
+    let globals = vec![
+        serde_json::Value::Null,
+        serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["fixture", "CELL"], "", true),
+            "global_kind": "Static",
+            "ty": cell_ty
+        }),
+    ];
+    llbc_with_types_funs_globals("fixture", vec![fnptrcell_type_decl(kind)], funs, globals)
+}
+
+fn fnptrcell_refs() -> crate::HostStaticAddrs<'static> {
+    crate::HostStaticAddrs {
+        refs: &[("fixture::CELL", 0x1111)],
+        ..Default::default()
+    }
+}
+
+fn const_ref_addrs(graph: &crate::model::FunctionGraph) -> Vec<i64> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match op.kind {
+            OpKind::ConstRefAddr(addr) => Some(addr),
+            _ => None,
+        })
+        .collect()
+}
+
+fn call_paths_in(graph: &crate::model::FunctionGraph) -> Vec<Vec<String>> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath { segments, .. },
+                ..
+            } => Some(segments.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An Opaque `FnPtrCell` Global with a `refs` row is the cell's address,
+/// not a 0-arg Call to the static path.
+#[test]
+fn fnptrcell_opaque_global_emits_bare_const_ref_addr() {
+    super::register_foldable_const_lits(Vec::new());
+    let llbc = fnptrcell_global_llbc(serde_json::json!("Opaque"));
+    let graph = super::lower_function_with_static_addrs(&llbc, "read_cell", fnptrcell_refs())
+        .expect("FnPtrCell Global lowers");
+    assert_eq!(const_ref_addrs(&graph), vec![0x1111]);
+    let cell = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|op| match op.kind {
+            OpKind::ConstRefAddr(_) => op.result.clone(),
+            _ => None,
+        })
+        .expect("ConstRefAddr dest");
+    assert_eq!(
+        crate::model::FunctionGraph::concretetype_of(&cell),
+        crate::model::ConcreteType::Signed,
+        "llmemory.Address getkind is int"
+    );
+    assert!(
+        matches!(
+            cell.concretetype(),
+            Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Address)
+        ),
+        "FnPtrCell address is Address, got {:?}",
+        cell.concretetype()
+    );
+    assert_eq!(
+        nullary_calls_ending(&graph, "CELL"),
+        0,
+        "FnPtrCell Global must not residualize: {graph:?}"
+    );
+    assert!(
+        call_paths_in(&graph).iter().all(
+            |segments| segments.last().map(String::as_str) != Some("__cast_instance_intrinsic")
+        ),
+        "Opaque FnPtrCell must not wrap ConstRefAddr: {graph:?}"
+    );
+}
+
+/// A Struct-kind `FnPtrCell` still emits a bare ConstRefAddr: the type
+/// lane runs before `refs_static_struct_root` would wrap the address as
+/// `SomeInstance(FnPtrCell)`.
+#[test]
+fn fnptrcell_struct_global_does_not_cast_instance() {
+    super::register_foldable_const_lits(Vec::new());
+    let kind = serde_json::json!({"Struct": [{
+        "name": "ptr",
+        "ty": {"RawPtr": [{"Tuple": []}, "Mut"]},
+        "attr_info": null
+    }]});
+    let llbc = fnptrcell_global_llbc(kind);
+    let graph = super::lower_function_with_static_addrs(&llbc, "read_cell", fnptrcell_refs())
+        .expect("Struct FnPtrCell Global lowers");
+    assert_eq!(const_ref_addrs(&graph), vec![0x1111]);
+    assert!(
+        call_paths_in(&graph).iter().all(
+            |segments| segments.last().map(String::as_str) != Some("__cast_instance_intrinsic")
+        ),
+        "FnPtrCell must not wrap ConstRefAddr as an instance: {graph:?}"
+    );
+}
+
+fn fnptrcell_get_llbc() -> majit_charon_reader::Llbc {
+    let cell = serde_json::json!({
+        "Adt": {"id": 0, "generics": empty_generics()}
+    });
+    let cell_ref = serde_json::json!({"Ref": ["Erased", cell, "Shared"]});
+    let option_fn = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [unit_fn_ptr()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let generics = empty_generics();
+    let funs = vec![
+        serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "call_get"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [cell_ref], "output": option_fn},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": option_fn},
+                    {"index": 1, "name": "cell", "span": span_json(), "ty": cell_ref}
+                ]},
+                "body": [
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                            "args": [{"Copy": {"kind": {"Local": 1}, "ty": cell_ref}}],
+                            "dest": {"kind": {"Local": 0}, "ty": option_fn}
+                        },
+                        "target": 1,
+                        "on_unwind": 2
+                    }}}},
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span_json(), "kind": "Return"}},
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span_json(), "kind": "UnwindResume"}}
+                ]
+            }}
+        }),
+        serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["majit_gc", "hook_cell", "<Impl>", "get"], "", false),
+            "signature": {"is_unsafe": false, "inputs": [cell_ref], "output": option_fn},
+            "body": "Opaque"
+        }),
+    ];
+    llbc_with_types(
+        "fixture",
+        vec![
+            fnptrcell_type_decl(serde_json::json!("Opaque")),
+            option_enum(1),
+        ],
+        funs,
+    )
+}
+
+/// `FnPtrCell::get` is a signed word `raw_load` of `Ptr(FuncType)`
+/// (`NicheIntNull::FnPtr`, `history.getkind` `'int'`).
+#[test]
+fn fnptrcell_get_lowers_to_signed_raw_load_of_func_ptr() {
+    super::register_foldable_const_lits(Vec::new());
+    let llbc = fnptrcell_get_llbc();
+    let graph = super::lower_function(&llbc, "call_get").expect("FnPtrCell::get lowers");
+    let loads: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter(|op| matches!(op.kind, OpKind::RawLoad { .. }))
+        .collect();
+    assert_eq!(loads.len(), 1, "exactly one RawLoad: {graph:?}");
+    match &loads[0].kind {
+        OpKind::RawLoad {
+            item_ty,
+            itemsize,
+            is_item_signed,
+            ..
+        } => {
+            assert_eq!(*item_ty, crate::model::ValueType::Int);
+            assert_eq!(*itemsize, crate::layout::target_word_size());
+            assert!(*is_item_signed, "fn-ptr load is signed kind 'i'");
+        }
+        other => panic!("expected RawLoad, got {other:?}"),
+    }
+    let dest = loads[0].result.as_ref().expect("RawLoad dest");
+    match dest.concretetype() {
+        Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(p))
+            if matches!(
+                p.TO,
+                crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Func(_)
+            ) => {}
+        other => panic!("load dest must be Ptr(FuncType), got {other:?}"),
+    }
+    assert_eq!(
+        crate::model::FunctionGraph::concretetype_of(dest),
+        crate::model::ConcreteType::Signed,
+        "history.getkind of Ptr(FuncType) is int"
+    );
+    assert_eq!(
+        nullary_calls_ending(&graph, "get"),
+        0,
+        "FnPtrCell::get must not residualize: {graph:?}"
     );
 }
 

@@ -13612,6 +13612,27 @@ pub(in crate::front::mir) fn llbc_with_types(
     llbc_with_types_impls(crate_name, types, funs, vec![])
 }
 
+pub(in crate::front::mir) fn llbc_with_types_funs_globals(
+    crate_name: &str,
+    types: Vec<serde_json::Value>,
+    funs: Vec<serde_json::Value>,
+    globals: Vec<serde_json::Value>,
+) -> Llbc {
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": crate_name,
+            "type_decls": types,
+            "fun_decls": funs,
+            "global_decls": globals,
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+}
+
 pub(in crate::front::mir) fn llbc_with_types_impls(
     crate_name: &str,
     types: Vec<serde_json::Value>,

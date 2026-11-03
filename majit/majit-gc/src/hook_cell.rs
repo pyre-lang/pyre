@@ -121,6 +121,26 @@ macro_rules! global_hook {
         $(#[$attr])*
         $vis static $name: $crate::hook_cell::FnPtrCell<$fnty> =
             $crate::hook_cell::FnPtrCell::new();
+        $crate::paste::paste! {
+            #[cfg(not(target_arch = "wasm32"))]
+            #[::majit_ir::linkme::distributed_slice(::majit_ir::helper_fnaddr::FNPTRCELL_STATICS)]
+            #[linkme(crate = ::majit_ir::linkme)]
+            #[allow(non_upper_case_globals)]
+            static [<__FNPTRCELL_STATIC_ $name>]: ::majit_ir::helper_fnaddr::PrebuiltStaticAddr =
+                ::majit_ir::helper_fnaddr::PrebuiltStaticAddr::new(
+                    ::core::concat!(::core::module_path!(), "::", stringify!($name)),
+                    &$name as *const _ as *const (),
+                );
+            #[cfg(target_arch = "wasm32")]
+            #[::ctor::ctor(unsafe)]
+            #[allow(non_snake_case)]
+            fn [<__fnptrcell_register_ $name>]() {
+                ::majit_ir::helper_fnaddr::register_fnptrcell_static(
+                    ::core::concat!(::core::module_path!(), "::", stringify!($name)),
+                    &$name as *const _ as *const (),
+                );
+            }
+        }
     };
 }
 

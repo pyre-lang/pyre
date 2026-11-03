@@ -3530,6 +3530,41 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `FnPtrCell::get` (`hook_cell::FnPtrCell::get`) is an
+                // acquire load of the cell's `AtomicPtr` word. Null is
+                // `None`; a non-null word is `Some(F)` with `F` a
+                // `Ptr(FuncType)` (`NicheIntNull::FnPtr`,
+                // `history.getkind` `'int'`). The cell is opaque in
+                // consumer LLBC, so the load is a word-sized `raw_load`
+                // at offset 0 rather than a field read.
+                if args.len() == 1 && self.is_fnptrcell_get(&reg) {
+                    let offset = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(offset.clone()),
+                        kind: OpKind::ConstInt(0),
+                    });
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+                    stamp_fn_ptr_load_result(&res, &call.dest.ty, self.llbc);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::RawLoad {
+                            base: args[0].clone(),
+                            offset,
+                            item_ty: ValueType::Int,
+                            itemsize: crate::layout::target_word_size(),
+                            is_item_signed: true,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `Atomic*::from_ptr(p)` creates a borrowed atomic view over
                 // the same address; it neither allocates nor changes the
                 // pointer representation.  The translated object model keeps
@@ -9756,4 +9791,23 @@ fn passes_attr_as_rust_heap(formal: Option<&TyRef>, place: Option<&TyRef>, llbc:
             && !tyref_is_string_value(place, llbc)
             && tyref_is_rust_heap_string(place, llbc)
     })
+}
+
+/// Stamp a `FnPtrCell::get` load dest as `Ptr(FuncType)` so `raw_load`'s
+/// TYPE constant annotates `SomePtr` (`lltype_to_annotation`) while
+/// `history.getkind` stays `'int'`.
+fn stamp_fn_ptr_load_result(res: &Variable, dest_ty: &TyRef, llbc: &Llbc) {
+    let ft = tyref_fn_ptr_spelling(dest_ty, llbc)
+        .into_iter()
+        .chain(tyref_fn_ptr_input_class_root(dest_ty, llbc))
+        .find_map(|spelling| {
+            crate::annotator::bookkeeper::func_type_from_fn_spelling(&spelling, &|_| false)
+        });
+    let Some(ft) = ft else {
+        return;
+    };
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget};
+    res.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Func(ft),
+    }))));
 }

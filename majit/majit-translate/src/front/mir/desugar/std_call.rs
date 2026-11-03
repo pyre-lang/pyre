@@ -2361,6 +2361,24 @@ impl<'a> Lowering<'a> {
         Some(variants.get(variant_idx)?.name.clone())
     }
 
+    /// `FnPtrCell::get` (`hook_cell::FnPtrCell::get`). Keyed on the
+    /// receiver ADT path and the method leaf, never on the static's name.
+    pub(in crate::front::mir) fn is_fnptrcell_get(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        if fd.item_meta.name_path().rsplit("::").next() != Some("get") {
+            return false;
+        }
+        fd.signature
+            .inputs
+            .first()
+            .is_some_and(|t| tyref_is_fnptrcell(t, self.llbc))
+    }
+
     /// `core::sync::atomic::Atomic*::from_ptr(p)` is a layout-transparent
     /// pointer view.  Match the exact core associated function and require an
     /// atomic output wrapper so unrelated `from_ptr` constructors (notably

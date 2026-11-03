@@ -7323,6 +7323,29 @@ impl<'a> Lowering<'a> {
                     });
                     return Ok(res);
                 }
+                // A `FnPtrCell<F>` static (`global_hook!`) is a prebuilt
+                // constant (`bookkeeper.immutablevalue` of a module-level
+                // object). The cell is not a class instance: wrapping it in
+                // `__cast_instance_intrinsic` would mint
+                // `SomeInstance(FnPtrCell)` and drop the subsequent `get`
+                // load of `Option<Ptr(FuncType)>`. Emit the bare
+                // `ConstRefAddr`, keyed on the GlobalDecl's type.
+                if tyref_is_fnptrcell(&place_ty, self.llbc)
+                    && let Some(op @ OpKind::ConstRefAddr(_)) = self.static_addr_op(&segments)
+                {
+                    let bb_id = self.emit_bb(mir_bb);
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+                    res.set_concretetype(Some(
+                        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Address,
+                    ));
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: op,
+                    });
+                    return Ok(res);
+                }
                 // Bookkeeper.immutablevalue annotates a prebuilt instance
                 // with its class regardless of whether that class has fields.
                 // Preserve that owner on both unit strategy implementations

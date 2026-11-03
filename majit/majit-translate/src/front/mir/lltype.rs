@@ -5601,6 +5601,13 @@ pub(in crate::front::mir) fn adt_path_of_tyref(ty: &TyRef, llbc: &Llbc) -> Optio
     Some(llbc.type_by_id(id)?.item_meta.name_path())
 }
 
+/// `majit_gc::hook_cell::FnPtrCell<F>` — a `global_hook!` cell. Keyed on
+/// the ADT path, never on the static's name.
+pub(in crate::front::mir) fn tyref_is_fnptrcell(ty: &TyRef, llbc: &Llbc) -> bool {
+    adt_path_of_tyref(ty, llbc)
+        .is_some_and(|p| path_ends_with_segments(&p, "majit_gc::hook_cell::FnPtrCell"))
+}
+
 /// Whether `td` declares a field named `name` — a struct field, or any
 /// enum variant's field (Model A flattens variant fields into the same
 /// class attr namespace).
