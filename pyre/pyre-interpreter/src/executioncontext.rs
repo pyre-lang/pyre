@@ -612,7 +612,9 @@ pub fn maybe_register_user_finalizer(obj: PyObjectRef) {
 // `rgc.py`'s `may_ignore_finalizer` carries `@jit.dont_look_inside`.  Its
 // collector hook is runtime state, so the translated trace must retain one
 // residual call instead of reading the process-global hook while translating.
-#[majit_macros::dont_look_inside]
+// Its body is `llop.gc_ignore_finalizer`, whose `LLOp` has no `canraise`, so
+// the residual call cannot raise.
+#[majit_macros::dont_look_inside_cannot_raise]
 pub fn may_ignore_finalizer(obj: PyObjectRef) {
     pyre_object::gc_hook::try_gc_ignore_finalizer(obj);
 }
