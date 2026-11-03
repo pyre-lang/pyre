@@ -571,6 +571,7 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
     majit_gc::set_active_gc_shrink_array(Some(dynasm_gc_shrink_array));
     majit_gc::set_active_gc_varsize_layout(Some(dynasm_gc_varsize_layout));
     majit_gc::set_active_gc_is_nursery_object(Some(dynasm_gc_is_nursery_object));
+    majit_gc::set_active_gc_is_young_object(Some(dynasm_gc_is_young_object));
     // Assumption: the active GC does not move objects.
     // `has_gcrootmap() == false` is the predicate available
     // (`GcLLDescr_boehm.gcrootmap is None`; CelGc answers false because
@@ -588,6 +589,7 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
     majit_gc::set_active_write_barrier_from_array(Some(dynasm_gc_write_barrier_from_array));
     majit_gc::set_active_writebarrier_before_copy(Some(dynasm_gc_writebarrier_before_copy));
     majit_gc::set_active_write_barrier_managed(Some(dynasm_gc_write_barrier_managed));
+    majit_gc::set_active_remember_const_pool(Some(dynasm_remember_const_pool));
     majit_gc::set_active_finalizer_hooks(Some(dynasm_register_finalizer));
     majit_gc::set_active_finalizer_queue_table(Some(dynasm_finalizer_queues));
 }
@@ -1344,6 +1346,10 @@ fn dynasm_gc_write_barrier(obj: GcRef) {
     majit_gc::gc_sync::gc_op(|g| g.write_barrier(obj));
 }
 
+fn dynasm_remember_const_pool(pool: &Arc<majit_ir::SharedConstPool>) {
+    let _ = with_dynasm_active_gc_mut(|gc| gc.remember_const_pool(pool));
+}
+
 fn dynasm_gc_write_barrier_managed(obj: GcRef) {
     if gc_box::with_mut(|g| g.write_barrier_managed(obj)).is_some() {
         return;
@@ -1430,6 +1436,14 @@ fn dynasm_gc_is_nursery_object(addr: usize) -> bool {
     }
     majit_gc::gc_sync::is_initialized()
         && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_nursery_object(addr))
+}
+
+fn dynasm_gc_is_young_object(addr: usize) -> bool {
+    if let Some(r) = gc_box::with_reentrant_ref(|gc| gc.is_young_object(addr)) {
+        return r;
+    }
+    majit_gc::gc_sync::is_initialized()
+        && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_young_object(addr))
 }
 
 /// `gc.py:51` malloc-helper OOM signaling.
@@ -2297,6 +2311,16 @@ impl DynasmBackend {
         if let Some(clt) = token.compiled_loop_token() {
             let tracer: Arc<dyn std::any::Any + Send + Sync> = cells.clone();
             clt.asmmemmgr_gcreftracers.lock().push(tracer);
+            // `gcreftracer.py` `llop.gc_writebarrier(tr)`: each published
+            // descr's `rd_consts` enters the remembered set for one minor.
+            let _ = with_dynasm_active_gc_mut(|gc| {
+                for cell in cells.iter() {
+                    if let Some(pool) = cell.descr.as_fail_descr().and_then(|fd| fd.rd_consts_arc())
+                    {
+                        gc.remember_const_pool(&pool);
+                    }
+                }
+            });
         }
     }
 
@@ -3278,7 +3302,7 @@ impl Backend for DynasmBackend {
         let propagate_exception_path = self
             .arch_cpu_ext
             .ensure_propagate_exception_path(&self.descr_attachments);
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let frame_realloc_slowpath = self.arch_cpu_ext.ensure_frame_realloc_slowpath();
         #[cfg(target_arch = "x86_64")]
         let stack_check_slowpath = self
@@ -3316,7 +3340,7 @@ impl Backend for DynasmBackend {
             wb_slowpath,
             #[cfg(target_arch = "x86_64")]
             propagate_exception_path,
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             frame_realloc_slowpath,
             #[cfg(target_arch = "x86_64")]
             stack_check_slowpath,
@@ -3583,7 +3607,7 @@ impl Backend for DynasmBackend {
         let propagate_exception_path = self
             .arch_cpu_ext
             .ensure_propagate_exception_path(&self.descr_attachments);
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let frame_realloc_slowpath = self.arch_cpu_ext.ensure_frame_realloc_slowpath();
         #[cfg(target_arch = "x86_64")]
         let stack_check_slowpath = self
@@ -3621,7 +3645,7 @@ impl Backend for DynasmBackend {
             wb_slowpath,
             #[cfg(target_arch = "x86_64")]
             propagate_exception_path,
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             frame_realloc_slowpath,
             #[cfg(target_arch = "x86_64")]
             stack_check_slowpath,

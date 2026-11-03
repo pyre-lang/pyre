@@ -12,6 +12,7 @@ use bit_set::BitSet;
 /// - Lazy set emission: SETFIELD_GC is delayed until a guard or side-effecting op forces it
 /// - GUARD_NOT_INVALIDATED deduplication
 use std::cell::RefCell;
+use std::rc::{Rc, Weak};
 
 #[inline(always)]
 fn use_untranslated_heap_ordering() -> bool {
@@ -846,17 +847,44 @@ pub struct OptHeapState {
     /// consumed by subsequent GETFIELD_GC_*. Survives calls (guarded by
     /// GUARD_NOT_INVALIDATED).
     quasi_immut_cache: crate::FxIndexMap<(Operand, usize), OpRef>,
+    /// Weak handle to `OptHeap.state`, set at construction (`Rc::new_cyclic`).
+    /// `vstring.py` `optstring.emit_extra` re-enters `OptHeap.propagate_forward`
+    /// during `Optimizer.emit` `force_box`; `emit_extra` upgrades this to park
+    /// `self` so the nested walk sees the same caches.
+    home: Weak<RefCell<Option<OptHeapState>>>,
+    /// True only while `with_taken_state` holds the live value outside the
+    /// cell, outermost level.
+    taken: bool,
 }
 
 pub struct OptHeap {
-    state: RefCell<OptHeapState>,
+    state: Rc<RefCell<Option<OptHeapState>>>,
 }
 
 impl OptHeap {
     pub fn new() -> Self {
         Self {
-            state: RefCell::new(OptHeapState::new()),
+            state: Rc::new_cyclic(|weak| RefCell::new(Some(OptHeapState::new(weak.clone())))),
         }
+    }
+
+    /// Take `state` out of the RefCell for `propagate_forward` / `flush`,
+    /// leaving `None`. `emit_extra` parks it back so a nested
+    /// `OptHeap::propagate_forward` (`vstring.py` `optstring.emit_extra`
+    /// walking into heap during `Optimizer.emit` `force_box`) can re-enter,
+    /// as RPython does.
+    fn with_taken_state<R>(&self, f: impl FnOnce(&mut OptHeapState) -> R) -> R {
+        let mut state = self.state.borrow_mut().take().expect("OptHeap state taken");
+        let outermost = !state.taken;
+        if outermost {
+            state.taken = true;
+        }
+        let result = f(&mut state);
+        if outermost {
+            state.taken = false;
+        }
+        *self.state.borrow_mut() = Some(state);
+        result
     }
 
     pub(crate) fn header_field_slot(field_descr: &dyn majit_ir::FieldDescr) -> u32 {
@@ -869,7 +897,7 @@ impl OptHeap {
 }
 
 impl OptHeapState {
-    pub fn new() -> Self {
+    pub fn new(home: Weak<RefCell<Option<OptHeapState>>>) -> Self {
         OptHeapState {
             vrefinfo: crate::virtualref::VirtualRefInfo::new(),
             cached_fields: Vec::new(),
@@ -883,7 +911,13 @@ impl OptHeapState {
             cached_dict_reads: crate::FxIndexMap::default(),
             corresponding_array_descrs: crate::FxIndexMap::default(),
             quasi_immut_cache: crate::FxIndexMap::default(),
+            home,
+            taken: false,
         }
+    }
+
+    fn placeholder(&self) -> OptHeapState {
+        Self::new(self.home.clone())
     }
 
     fn cached_field_pos_for_descr(&self, descr: &DescrRef) -> Option<usize> {
@@ -1278,6 +1312,7 @@ impl OptHeapState {
     /// whose force_box loop (optimizer.py) is the single force point that
     /// appends the materialization directly ahead of the store.
     fn emit_lazy_setfield(
+        &mut self,
         opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         op: &majit_ir::OpRc,
         ctx: &mut OptContext,
@@ -1289,13 +1324,40 @@ impl OptHeapState {
         }
         // heap.py: emit_extra(op, emit=False) → next_optimization.
         // `_lazy_set` already holds this ResOperation; do not cls() again.
-        Self::emit_extra(opt, op.clone(), ctx);
+        self.emit_extra(opt, op.clone(), ctx);
     }
 
     /// `Optimization.emit_extra(op, emit=False)` from the heap pass.
-    /// Without an optimizer (a pass driven alone in a unit test) the op stays
-    /// on the `emit_extra` queue.
+    ///
+    /// `vstring.py` `optstring.emit_extra` walks the passes after OptString,
+    /// including this one, while a heap `emit_extra` is already on the stack
+    /// (`Optimizer.emit` `force_box` of a virtual string). RPython re-enters
+    /// OptHeap; the RefCell cannot. Park the live state back into `home`
+    /// for the walk so the nested `OptHeap::propagate_forward` sees the same
+    /// caches, then take it out again.
     fn emit_extra(
+        &mut self,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        op: majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) {
+        if self.taken {
+            let cell = self.home.upgrade().expect("OptHeap state home");
+            let mut live = self.placeholder();
+            std::mem::swap(self, &mut live);
+            // Park the live state. This is the only placeholder construction:
+            // `vstring.py` `optstring.emit_extra` re-enters
+            // `OptHeap.propagate_forward`.
+            cell.borrow_mut().replace(live);
+            Self::send_extra_after_heap(opt, op, ctx);
+            let mut live = cell.borrow_mut().take().expect("OptHeap state taken");
+            std::mem::swap(self, &mut live);
+        } else {
+            Self::send_extra_after_heap(opt, op, ctx);
+        }
+    }
+
+    fn send_extra_after_heap(
         opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         op: majit_ir::OpRc,
         ctx: &mut OptContext,
@@ -1309,7 +1371,8 @@ impl OptHeapState {
                 }
             }
             None => {
-                ctx.emit_extra_rc(ctx.current_pass_idx, op);
+                // no optimizer: a pass run alone has no chain after it; the op ends at `Optimizer.emit`
+                ctx.emit_rc(op);
             }
         }
     }
@@ -1795,7 +1858,7 @@ impl OptHeapState {
                 .any(|arg| arg.to_opref() == postponed.pos().get())
         });
         if needs_postponed && let Some(p) = self.postponed_op.take() {
-            Self::emit_extra(opt, OpRc::new(p), ctx);
+            self.emit_extra(opt, OpRc::new(p), ctx);
         }
     }
 
@@ -1910,7 +1973,7 @@ impl OptHeapState {
             self.emit_postponed_if_referenced(&pending_op, opt, ctx);
             let final_value = pending_op.arg(1);
             let put_back_op = pending_op.clone();
-            Self::emit_extra(opt, pending_op, ctx);
+            self.emit_extra(opt, pending_op, ctx);
             let obj_box = ctx.resolve_operand_operand(&obj);
             self.cached_fields[pos].2.register_info(&obj_box);
             ctx.structinfo_setfield(&put_back_op, field_idx, &final_value);
@@ -1946,7 +2009,7 @@ impl OptHeapState {
             let array_ref = pending_op.arg(0);
             let descr = pending_op.getdescr();
             let put_back_op = pending_op.clone();
-            Self::emit_extra(opt, pending_op, ctx);
+            self.emit_extra(opt, pending_op, ctx);
             self.cache_arrayitem(&array_ref, descr_idx, index, descr.as_ref());
             ctx.arrayinfo_setitem(&put_back_op, index as usize, &final_value);
         }
@@ -2315,10 +2378,10 @@ impl OptHeapState {
                     if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                         && let Some(p) = self.postponed_op.take()
                     {
-                        Self::emit_extra(opt, OpRc::new(p), ctx);
+                        self.emit_extra(opt, OpRc::new(p), ctx);
                     }
                 }
-                Self::emit_lazy_setfield(opt, &lazy_op, ctx);
+                self.emit_lazy_setfield(opt, &lazy_op, ctx);
                 // can_cache=True: put_field_back_to_info
                 let final_value = lazy_op.arg(1);
                 let lazy_obj_box = ctx.resolve_operand_operand(&lazy_op.arg(0));
@@ -2598,12 +2661,12 @@ impl OptHeapState {
                     if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                         && let Some(p) = self.postponed_op.take()
                     {
-                        Self::emit_extra(opt, OpRc::new(p), ctx);
+                        self.emit_extra(opt, OpRc::new(p), ctx);
                     }
                 }
                 // heap.py optheap.emit_extra(op, emit=False)
                 let put_back_op = lazy_op.clone();
-                Self::emit_lazy_setfield(opt, &lazy_op, ctx);
+                self.emit_lazy_setfield(opt, &lazy_op, ctx);
                 // heap.py:136-137 if not can_cache: return
                 if !can_cache {
                     return;
@@ -2767,12 +2830,12 @@ impl OptHeapState {
                     if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                         && let Some(p) = self.postponed_op.take()
                     {
-                        Self::emit_extra(opt, OpRc::new(p), ctx);
+                        self.emit_extra(opt, OpRc::new(p), ctx);
                     }
                 }
                 // heap.py optheap.emit_extra(op, emit=False)
                 let put_back_op = lazy_op.clone();
-                Self::emit_lazy_setfield(opt, &lazy_op, ctx);
+                self.emit_lazy_setfield(opt, &lazy_op, ctx);
                 // heap.py:136-137 if not can_cache: return
                 if !can_cache {
                     return;
@@ -2935,10 +2998,10 @@ impl OptHeapState {
                         if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                             && let Some(p) = self.postponed_op.take()
                         {
-                            Self::emit_extra(opt, OpRc::new(p), ctx);
+                            self.emit_extra(opt, OpRc::new(p), ctx);
                         }
                     }
-                    Self::emit_lazy_setfield(opt, &lazy_op, ctx);
+                    self.emit_lazy_setfield(opt, &lazy_op, ctx);
                     // can_cache=True: put_field_back_to_info
                     let final_value = lazy_op.arg(2);
                     let descr = lazy_op.getdescr();
@@ -3723,7 +3786,7 @@ impl OptHeapState {
                         op.pos().get()
                     );
                 }
-                Self::emit_extra(opt, OpRc::new(postponed), ctx);
+                self.emit_extra(opt, OpRc::new(postponed), ctx);
             }
         }
         // heap.py:419-423 — postpone comparison / ovf ops. CALL_MAY_FORCE is
@@ -3795,7 +3858,7 @@ impl OptHeapState {
         self.corresponding_array_descrs.clear();
         self.force_all_lazy_sets(opt, ctx);
         if let Some(postponed) = self.postponed_op.take() {
-            Self::emit_extra(opt, OpRc::new(postponed), ctx);
+            self.emit_extra(opt, OpRc::new(postponed), ctx);
         }
     }
 
@@ -4146,13 +4209,15 @@ impl Optimization for OptHeap {
         opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        self.state
-            .borrow_mut()
-            .propagate_forward(op, op_rc, opt, ctx)
+        self.with_taken_state(|state| state.propagate_forward(op, op_rc, opt, ctx))
     }
 
     fn setup(&self) {
-        self.state.borrow_mut().setup();
+        self.state
+            .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
+            .setup();
     }
 
     fn flush(
@@ -4160,7 +4225,7 @@ impl Optimization for OptHeap {
         opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) {
-        self.state.borrow_mut().flush(opt, ctx);
+        self.with_taken_state(|state| state.flush(opt, ctx));
     }
 
     fn produce_potential_short_preamble_ops(
@@ -4170,12 +4235,16 @@ impl Optimization for OptHeap {
     ) {
         self.state
             .borrow()
+            .as_ref()
+            .expect("OptHeap state taken")
             .produce_potential_short_preamble_ops(sb, ctx);
     }
 
     fn register_preamble_cached_field(&self, struct_box: &Operand, descr: &DescrRef) {
         self.state
             .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
             .register_preamble_cached_field(struct_box, descr);
     }
 
@@ -4187,6 +4256,8 @@ impl Optimization for OptHeap {
     ) {
         self.state
             .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
             .register_preamble_cached_arrayitem(array_box, descr, index);
     }
 
@@ -4195,19 +4266,35 @@ impl Optimization for OptHeap {
     }
 
     fn set_vrefinfo(&self, vrefinfo: crate::virtualref::VirtualRefInfo) {
-        self.state.borrow_mut().set_vrefinfo(vrefinfo);
+        self.state
+            .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
+            .set_vrefinfo(vrefinfo);
     }
 
     fn export_cached_fields(&self, ctx: &mut OptContext) -> Vec<(OpRef, DescrRef, OpRef)> {
-        self.state.borrow().export_cached_fields(ctx)
+        self.state
+            .borrow()
+            .as_ref()
+            .expect("OptHeap state taken")
+            .export_cached_fields(ctx)
     }
 
     fn import_cached_fields(&self, entries: &[(OpRef, DescrRef, OpRef)], ctx: &mut OptContext) {
-        self.state.borrow_mut().import_cached_fields(entries, ctx);
+        self.state
+            .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
+            .import_cached_fields(entries, ctx);
     }
 
     fn export_cached_arrayitems(&self, ctx: &mut OptContext) -> Vec<(OpRef, i64, DescrRef, OpRef)> {
-        self.state.borrow().export_cached_arrayitems(ctx)
+        self.state
+            .borrow()
+            .as_ref()
+            .expect("OptHeap state taken")
+            .export_cached_arrayitems(ctx)
     }
 
     fn import_cached_arrayitems(
@@ -4217,6 +4304,8 @@ impl Optimization for OptHeap {
     ) {
         self.state
             .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
             .import_cached_arrayitems(entries, ctx);
     }
 }
@@ -4829,8 +4918,16 @@ mod tests {
             );
         })
         .unwrap();
-        heap.state.borrow_mut().cache_field(&obj, &w_class_ref);
-        heap.state.borrow_mut().cache_field(&obj, &map_ref);
+        heap.state
+            .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
+            .cache_field(&obj, &w_class_ref);
+        heap.state
+            .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
+            .cache_field(&obj, &map_ref);
 
         let exported = heap.export_cached_fields(&mut ctx);
         assert!(
@@ -4916,10 +5013,22 @@ mod tests {
             );
         })
         .unwrap();
-        heap.state.borrow_mut().cache_field(&obj, &w_class_ref);
-        heap.state.borrow_mut().cache_field(&obj, &tracefunc_ref);
+        heap.state
+            .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
+            .cache_field(&obj, &w_class_ref);
+        heap.state
+            .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
+            .cache_field(&obj, &tracefunc_ref);
 
-        heap.state.borrow_mut().clean_caches(&mut ctx);
+        heap.state
+            .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
+            .clean_caches(&mut ctx);
 
         let exported = heap.export_cached_fields(&mut ctx);
         assert!(
@@ -4951,12 +5060,24 @@ mod tests {
         let mut heap = OptHeap::new();
         heap.state
             .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
             .cache_field(&rooted_resop_operand(Type::Int, 0), &descr_a);
         heap.state
             .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
             .cache_field(&rooted_resop_operand(Type::Int, 0), &descr_b);
 
-        assert_eq!(heap.state.borrow_mut().cached_fields.len(), 2);
+        assert_eq!(
+            heap.state
+                .borrow_mut()
+                .as_mut()
+                .expect("OptHeap state taken")
+                .cached_fields
+                .len(),
+            2
+        );
     }
 
     /// heap.py `serialize_optheap` drops an unforced `PreambleOp`:
@@ -4994,7 +5115,11 @@ mod tests {
             );
         })
         .unwrap();
-        heap.state.borrow_mut().cache_field(&obj, &descr);
+        heap.state
+            .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
+            .cache_field(&obj, &descr);
 
         let exported = heap.export_cached_fields(&mut ctx);
         assert!(
@@ -5214,6 +5339,8 @@ mod tests {
         let result = heap
             .state
             .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
             .optimize_getfield(&op, &op_rc, &mut None, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement_opref(pos2), p1);
@@ -5309,24 +5436,30 @@ mod tests {
         let result1 = heap
             .state
             .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
             .optimize_getfield(&op1, &op1_rc, &mut None, &mut ctx);
         assert!(matches!(result1, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement_opref(pos2), p1);
 
         // A call invalidates all mutable field caches.
-        heap.state.borrow_mut().clean_caches(&mut ctx);
+        heap.state
+            .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
+            .clean_caches(&mut ctx);
 
         // Second getfield on head after invalidation: must NOT return the
         // stale preamble value.  The import was consumed, so it should emit.
         let pos3 = ctx.reserve_pos_typed(Type::Ref);
         let mut op2 = Op::with_descr(OpCode::GetfieldGcR, &[p0_box], d_head.clone());
         op2.pos().set(pos3);
-        let result2 = heap.state.borrow_mut().optimize_getfield(
-            &op2,
-            &OpRc::new(op2.clone()),
-            &mut None,
-            &mut ctx,
-        );
+        let result2 = heap
+            .state
+            .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
+            .optimize_getfield(&op2, &OpRc::new(op2.clone()), &mut None, &mut ctx);
         assert!(
             matches!(result2, OptimizationResult::PassOn),
             "getfield after invalidation must emit, not reuse stale import"
@@ -5361,12 +5494,12 @@ mod tests {
                 .expect("constant receiver resolves to an operand"),
         );
 
-        let _ = heap.state.borrow_mut().optimize_getfield(
-            &op,
-            &OpRc::new(op.clone()),
-            &mut None,
-            &mut ctx,
-        );
+        let _ = heap
+            .state
+            .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
+            .optimize_getfield(&op, &OpRc::new(op.clone()), &mut None, &mut ctx);
     }
 
     /// Same shape as `test_getfield_read_after_read`, but through a descr that
@@ -5461,6 +5594,8 @@ mod tests {
             folded = matches!(
                 heap.state
                     .borrow_mut()
+                    .as_mut()
+                    .expect("OptHeap state taken")
                     .optimize_getfield(&op, &op_rc, &mut None, &mut ctx),
                 OptimizationResult::Remove
             );
@@ -6130,9 +6265,10 @@ mod tests {
             }
         }
 
-        // force_all_lazy at Jump drops lazy setarrayitems. Only Jump remains.
+        // force_all_lazy at Jump emits the lazy SetarrayitemGc. GetarrayitemGcI
+        // is cached. SetarrayitemGc + Jump.
         let opcodes: Vec<_> = ctx.new_operations.iter().map(|o| o.opcode).collect();
-        assert_eq!(opcodes, vec![OpCode::Jump]);
+        assert_eq!(opcodes, vec![OpCode::SetarrayitemGc, OpCode::Jump]);
     }
 
     /// `heap.py` `optimize_GETARRAYITEM_GC_PURE_I`: a constant-index miss
@@ -6566,6 +6702,8 @@ mod tests {
         let has_lazy_set = pass
             .state
             .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
             .get_cached_array_submap(majit_ir::descr::descr_identity(&d))
             .and_then(|s| s.const_get(3))
             .map(|cai| cai.lazy_set.is_some())
@@ -6940,9 +7078,10 @@ mod tests {
             }
         }
 
-        // force_all_lazy at Jump drops lazy setarrayitems. Only Jump remains.
+        // First SetarrayitemGc is dead (overwritten). Second is emitted as lazy
+        // set before Jump.
         let result_opcodes: Vec<_> = ctx.new_operations.iter().map(|o| o.opcode).collect();
-        assert_eq!(result_opcodes, vec![OpCode::Jump]);
+        assert_eq!(result_opcodes, vec![OpCode::SetarrayitemGc, OpCode::Jump]);
     }
 
     // ── Test 15: Overflow ops don't invalidate caches ──
@@ -7224,7 +7363,11 @@ mod tests {
         // descr is Type::Ref so the field source is ref-typed too.
         let pos100 = rooted_resop_operand(Type::Ref, 100);
         let val101 = rooted_resop_operand(Type::Ref, 101);
-        pass.state.borrow_mut().cache_field(&pos100, &descr);
+        pass.state
+            .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
+            .cache_field(&pos100, &descr);
 
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
             OpRef::ref_op(100),
@@ -8892,12 +9035,13 @@ mod tests {
             }
         }
 
-        // force_all_lazy at Jump drops lazy setarrayitems. Only Jump remains.
+        // force_all_lazy at Jump emits the lazy SetarrayitemGc. GetarrayitemGcI
+        // is cached. SetarrayitemGc + Jump.
         let opcodes: Vec<_> = ctx.new_operations.iter().map(|o| o.opcode).collect();
         assert_eq!(
             opcodes,
-            vec![OpCode::Jump],
-            "byte-array getitem should be cached after setitem; lazy set dropped at Jump"
+            vec![OpCode::SetarrayitemGc, OpCode::Jump],
+            "byte-array getitem should be cached after setitem; lazy set emitted at Jump"
         );
     }
 
@@ -9207,19 +9351,53 @@ mod tests {
         );
 
         let mut heap = OptHeap::new();
-        heap.state.borrow_mut().arrayitem_submap(&array1);
-        heap.state.borrow_mut().arrayitem_submap(&array2);
-        assert_eq!(heap.state.borrow_mut().cached_arrayitems.len(), 2);
+        heap.state
+            .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
+            .arrayitem_submap(&array1);
+        heap.state
+            .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
+            .arrayitem_submap(&array2);
+        assert_eq!(
+            heap.state
+                .borrow_mut()
+                .as_mut()
+                .expect("OptHeap state taken")
+                .cached_arrayitems
+                .len(),
+            2
+        );
 
-        heap.state.borrow_mut().corresponding_array_descrs.insert(
-            majit_ir::descr::descr_identity(&array1),
-            (array1.clone(), 1),
+        heap.state
+            .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
+            .corresponding_array_descrs
+            .insert(
+                majit_ir::descr::descr_identity(&array1),
+                (array1.clone(), 1),
+            );
+        heap.state
+            .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
+            .corresponding_array_descrs
+            .insert(
+                majit_ir::descr::descr_identity(&array2),
+                (array2.clone(), 2),
+            );
+        assert_eq!(
+            heap.state
+                .borrow_mut()
+                .as_mut()
+                .expect("OptHeap state taken")
+                .corresponding_array_descrs
+                .len(),
+            2
         );
-        heap.state.borrow_mut().corresponding_array_descrs.insert(
-            majit_ir::descr::descr_identity(&array2),
-            (array2.clone(), 2),
-        );
-        assert_eq!(heap.state.borrow_mut().corresponding_array_descrs.len(), 2);
     }
 
     /// heap.py:480-528 parity: FLAG_LOOKUP deduplicates consecutive dict lookups.
@@ -9256,11 +9434,14 @@ mod tests {
         );
         op1.setdescr(descr.clone());
         op1.pos().set(pos1);
-        assert!(!heap.state.borrow_mut()._optimize_call_dict_lookup(
-            &op1,
-            &OpRc::new(op1.clone()),
-            &mut ctx
-        ));
+        assert!(
+            !heap
+                .state
+                .borrow_mut()
+                .as_mut()
+                .expect("OptHeap state taken")
+                ._optimize_call_dict_lookup(&op1, &OpRc::new(op1.clone()), &mut ctx)
+        );
 
         // Second lookup with same dict+key — should be cached.
         let pos2 = ctx.reserve_pos_typed(Type::Int);
@@ -9281,10 +9462,18 @@ mod tests {
         assert!(
             heap.state
                 .borrow_mut()
+                .as_mut()
+                .expect("OptHeap state taken")
                 ._optimize_call_dict_lookup(&op2, &op2_rc, &mut ctx)
         );
         assert_eq!(ctx.get_replacement_opref(pos2), pos1);
-        assert!(heap.state.borrow_mut().last_emitted_removed);
+        assert!(
+            heap.state
+                .borrow_mut()
+                .as_mut()
+                .expect("OptHeap state taken")
+                .last_emitted_removed
+        );
     }
 
     /// heap.py:495-499 parity: FLAG_STORE reuses only if cached value >= 0.
@@ -9333,6 +9522,8 @@ mod tests {
             !heap
                 .state
                 .borrow_mut()
+                .as_mut()
+                .expect("OptHeap state taken")
                 ._optimize_call_dict_lookup(&op1, &op1_rc, &mut ctx)
         );
 
@@ -9355,6 +9546,8 @@ mod tests {
         assert!(
             heap.state
                 .borrow_mut()
+                .as_mut()
+                .expect("OptHeap state taken")
                 ._optimize_call_dict_lookup(&op2, &op2_rc, &mut ctx)
         );
         assert_eq!(ctx.get_replacement_opref(pos2), pos1);
@@ -9395,12 +9588,33 @@ mod tests {
         op1.pos().set(pos1);
         heap.state
             .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
             ._optimize_call_dict_lookup(&op1, &OpRc::new(op1.clone()), &mut ctx);
-        assert!(!heap.state.borrow_mut().cached_dict_reads.is_empty());
+        assert!(
+            !heap
+                .state
+                .borrow_mut()
+                .as_mut()
+                .expect("OptHeap state taken")
+                .cached_dict_reads
+                .is_empty()
+        );
 
         // clean_caches should clear it.
-        heap.state.borrow_mut().clean_caches(&mut ctx);
-        assert!(heap.state.borrow_mut().cached_dict_reads.is_empty());
+        heap.state
+            .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
+            .clean_caches(&mut ctx);
+        assert!(
+            heap.state
+                .borrow_mut()
+                .as_mut()
+                .expect("OptHeap state taken")
+                .cached_dict_reads
+                .is_empty()
+        );
 
         // Second lookup after clean — should NOT be cached.
         let pos2 = ctx.reserve_pos_typed(Type::Int);
@@ -9416,11 +9630,14 @@ mod tests {
         );
         op2.setdescr(descr.clone());
         op2.pos().set(pos2);
-        assert!(!heap.state.borrow_mut()._optimize_call_dict_lookup(
-            &op2,
-            &OpRc::new(op2.clone()),
-            &mut ctx
-        ));
+        assert!(
+            !heap
+                .state
+                .borrow_mut()
+                .as_mut()
+                .expect("OptHeap state taken")
+                ._optimize_call_dict_lookup(&op2, &OpRc::new(op2.clone()), &mut ctx)
+        );
     }
 
     /// util.py/127 args_dict() / args_eq parity: same_box treats two
@@ -9472,11 +9689,14 @@ mod tests {
         );
         op1.setdescr(descr.clone());
         op1.pos().set(pos1);
-        assert!(!heap.state.borrow_mut()._optimize_call_dict_lookup(
-            &op1,
-            &OpRc::new(op1.clone()),
-            &mut ctx
-        ));
+        assert!(
+            !heap
+                .state
+                .borrow_mut()
+                .as_mut()
+                .expect("OptHeap state taken")
+                ._optimize_call_dict_lookup(&op1, &OpRc::new(op1.clone()), &mut ctx)
+        );
 
         // Same value via a different const slot — must hit the cache.
         let pos2 = ctx.reserve_pos_typed(Type::Int);
@@ -9497,6 +9717,8 @@ mod tests {
         assert!(
             heap.state
                 .borrow_mut()
+                .as_mut()
+                .expect("OptHeap state taken")
                 ._optimize_call_dict_lookup(&op2, &op2_rc, &mut ctx)
         );
         assert_eq!(ctx.get_replacement_opref(pos2), pos1);
@@ -9516,7 +9738,11 @@ mod tests {
         let mut ctx = OptContext::new(256);
 
         // Seed the REMOVED sentinel as if a DICT_LOOKUP cache hit just fired.
-        heap.state.borrow_mut().last_emitted_removed = true;
+        heap.state
+            .borrow_mut()
+            .as_mut()
+            .expect("OptHeap state taken")
+            .last_emitted_removed = true;
 
         // OpCode::New is a PassOn arm in heap.rs (allocation tracking only).
         let new_pos = ctx.reserve_pos_typed(Type::Ref);
@@ -9526,7 +9752,12 @@ mod tests {
             heap.propagate_forward(&new_op, &OpRc::new(new_op.clone()), &mut None, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
         assert!(
-            !heap.state.borrow_mut().last_emitted_removed,
+            !heap
+                .state
+                .borrow_mut()
+                .as_mut()
+                .expect("OptHeap state taken")
+                .last_emitted_removed,
             "PassOn must clear last_emitted_removed (optimizer.py:86 fires before line 87 PASS_OP_ON)"
         );
 
@@ -9570,11 +9801,21 @@ mod tests {
         );
         op1.setdescr(descr.clone());
         op1.pos().set(pos1);
-        assert!(!heap.state.borrow_mut()._optimize_call_dict_lookup(
-            &op1,
-            &OpRc::new(op1.clone()),
-            &mut ctx
-        ));
-        assert!(heap.state.borrow_mut().cached_dict_reads.is_empty());
+        assert!(
+            !heap
+                .state
+                .borrow_mut()
+                .as_mut()
+                .expect("OptHeap state taken")
+                ._optimize_call_dict_lookup(&op1, &OpRc::new(op1.clone()), &mut ctx)
+        );
+        assert!(
+            heap.state
+                .borrow_mut()
+                .as_mut()
+                .expect("OptHeap state taken")
+                .cached_dict_reads
+                .is_empty()
+        );
     }
 }

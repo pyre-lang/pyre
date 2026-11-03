@@ -1691,7 +1691,8 @@ impl OptVirtualize {
             }
             token_op.pos().get()
         } else {
-            ctx.emit_extra_rc(ctx.current_pass_idx, token_op.clone())
+            // no optimizer: a pass run alone has no chain after it; the op ends at `Optimizer.emit`
+            ctx.emit_rc(token_op.clone())
         };
         if let Some(b) = ctx.get_box_replacement_operand_opt(token_ref) {
             ctx.set_ptr_info(&b, PtrInfo::nonnull());

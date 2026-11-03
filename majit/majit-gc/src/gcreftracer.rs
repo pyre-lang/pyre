@@ -464,6 +464,154 @@ mod tests {
     }
 
     #[test]
+    fn pending_const_pools_forward_once_then_leave_the_remembered_set() {
+        let _const_ptr_table = const_ptr_table_test_guard();
+        let mut owner = crate::collector::MiniMarkGC::with_config(crate::collector::GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..crate::collector::GcConfig::default()
+        });
+        let type_id = owner.register_type(crate::TypeInfo::simple(16));
+        let root = owner.alloc_with_type(type_id, 16);
+        unsafe { *(root.0 as *mut u64) = 0xA11C_E701 };
+        let pool = majit_ir::SharedConstPool::new(vec![majit_ir::Const::from_gcref(root)]);
+        owner.remember_const_pool(&pool);
+
+        owner.do_collect_nursery();
+        let majit_ir::Const::Ref(moved) = pool.as_slice()[0] else {
+            panic!("pool slot stays a Const::Ref");
+        };
+        assert_ne!(moved, root, "the owning MiniMark forwards the slot");
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xA11C_E701);
+
+        owner.do_collect_nursery();
+        assert_eq!(
+            owner.pending_const_pools_len(),
+            0,
+            "a second minor does not visit the pool again"
+        );
+        assert_eq!(pool.as_slice()[0].getref_base(), moved);
+    }
+
+    #[test]
+    fn shared_const_pool_is_remembered_once() {
+        let _const_ptr_table = const_ptr_table_test_guard();
+        let mut owner = crate::collector::MiniMarkGC::with_config(crate::collector::GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..crate::collector::GcConfig::default()
+        });
+        let type_id = owner.register_type(crate::TypeInfo::simple(16));
+        let root = owner.alloc_with_type(type_id, 16);
+        unsafe { *(root.0 as *mut u64) = 0xA11C_E703 };
+        let pool = majit_ir::SharedConstPool::new(vec![majit_ir::Const::from_gcref(root)]);
+        owner.remember_const_pool(&pool);
+        owner.remember_const_pool(&pool);
+        owner.remember_const_pool(&pool);
+        assert_eq!(owner.pending_const_pools_len(), 1);
+
+        owner.do_collect_nursery();
+        let majit_ir::Const::Ref(moved) = pool.as_slice()[0] else {
+            panic!("pool slot stays a Const::Ref");
+        };
+        assert_ne!(moved, root, "the owning MiniMark forwards the slot");
+        assert_eq!(owner.pending_const_pools_len(), 0);
+
+        owner.remember_const_pool(&pool);
+        assert_eq!(owner.pending_const_pools_len(), 1);
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xA11C_E703);
+    }
+
+    #[test]
+    fn pending_const_pools_stay_on_the_remembering_minimark() {
+        let _const_ptr_table = const_ptr_table_test_guard();
+        let mut owner = crate::collector::MiniMarkGC::with_config(crate::collector::GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..crate::collector::GcConfig::default()
+        });
+        let type_id = owner.register_type(crate::TypeInfo::simple(16));
+        let root = owner.alloc_with_type(type_id, 16);
+        unsafe { *(root.0 as *mut u64) = 0xA11C_E704 };
+        let pool = majit_ir::SharedConstPool::new(vec![majit_ir::Const::from_gcref(root)]);
+        owner.remember_const_pool(&pool);
+
+        let mut sibling = crate::collector::MiniMarkGC::with_config(crate::collector::GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..crate::collector::GcConfig::default()
+        });
+        sibling.do_collect_nursery();
+        assert_eq!(owner.pending_const_pools_len(), 1);
+        assert_eq!(sibling.pending_const_pools_len(), 0);
+        assert_eq!(
+            pool.as_slice()[0].getref_base(),
+            root,
+            "a sibling MiniMark must not drain this collector's pool"
+        );
+
+        sibling.remember_const_pool(&pool);
+        assert_eq!(sibling.pending_const_pools_len(), 1);
+        assert_eq!(owner.pending_const_pools_len(), 1);
+
+        owner.do_collect_nursery();
+        let majit_ir::Const::Ref(moved) = pool.as_slice()[0] else {
+            panic!("pool slot stays a Const::Ref");
+        };
+        assert_ne!(moved, root, "the owning MiniMark forwards the slot");
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xA11C_E704);
+        assert_eq!(
+            sibling.pending_const_pools_len(),
+            1,
+            "the sibling list is not drained by the owner's minor"
+        );
+    }
+
+    #[test]
+    fn pending_const_pool_ref_appended_after_drain_is_forwarded() {
+        let _const_ptr_table = const_ptr_table_test_guard();
+        let mut owner = crate::collector::MiniMarkGC::with_config(crate::collector::GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..crate::collector::GcConfig::default()
+        });
+        let type_id = owner.register_type(crate::TypeInfo::simple(16));
+        let first = owner.alloc_with_type(type_id, 16);
+        unsafe { *(first.0 as *mut u64) = 0xA11C_E705 };
+        let pool = majit_ir::SharedConstPool::new(vec![majit_ir::Const::from_gcref(first)]);
+        owner.remember_const_pool(&pool);
+        owner.do_collect_nursery();
+        assert_eq!(owner.pending_const_pools_len(), 0);
+        let majit_ir::Const::Ref(moved_first) = pool.as_slice()[0] else {
+            panic!("pool slot stays a Const::Ref");
+        };
+        assert_ne!(moved_first, first);
+
+        let young = owner.alloc_with_type(type_id, 16);
+        unsafe { *(young.0 as *mut u64) = 0xA11C_E706 };
+        let _hook = unsafe { crate::install_test_remember_const_pool_gc(&mut owner) };
+        unsafe {
+            pool.push_during_optimization(majit_ir::Const::from_gcref(young));
+        }
+        drop(_hook);
+        assert_eq!(
+            owner.pending_const_pools_len(),
+            1,
+            "the append path re-remembers the drained pool"
+        );
+
+        owner.do_collect_nursery();
+        let majit_ir::Const::Ref(moved_young) = pool.as_slice()[1] else {
+            panic!("appended slot stays a Const::Ref");
+        };
+        assert_ne!(
+            moved_young, young,
+            "the append-after-drain slot is forwarded"
+        );
+        assert_eq!(unsafe { *(moved_young.0 as *const u64) }, 0xA11C_E706);
+    }
+
+    #[test]
     fn pending_gc_table_pinned_slot_survives_second_minor() {
         let _const_ptr_table = const_ptr_table_test_guard();
         let mut owner = crate::collector::MiniMarkGC::with_config(crate::collector::GcConfig {

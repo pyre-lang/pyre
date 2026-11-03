@@ -1429,12 +1429,14 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_gc_owns_object(Some(wasm_gc_owns_object));
     majit_gc::set_active_gc_shrink_array(Some(wasm_gc_shrink_array));
     majit_gc::set_active_gc_varsize_layout(Some(wasm_gc_varsize_layout));
+    majit_gc::set_active_gc_is_young_object(Some(wasm_gc_is_young_object));
     majit_gc::set_active_gc_id_or_identityhash(Some(wasm_id_or_identityhash));
     majit_gc::set_active_write_barrier(Some(wasm_active_gc_write_barrier));
     majit_gc::set_active_write_barrier_before_move(Some(wasm_active_gc_write_barrier_before_move));
     majit_gc::set_active_write_barrier_from_array(Some(wasm_active_gc_write_barrier_from_array));
     majit_gc::set_active_writebarrier_before_copy(Some(wasm_active_gc_writebarrier_before_copy));
     majit_gc::set_active_write_barrier_managed(Some(wasm_active_gc_write_barrier_managed));
+    majit_gc::set_active_remember_const_pool(Some(wasm_remember_const_pool));
     majit_gc::set_active_get_objects(Some(wasm_get_objects));
     majit_gc::set_active_get_referents(Some(wasm_get_referents));
     majit_gc::set_active_subgraph_has_pending_finalizer(Some(wasm_subgraph_has_pending_finalizer));
@@ -2849,6 +2851,10 @@ pub(crate) fn wasm_active_gc_write_barrier(obj: GcRef) {
     with_wasm_active_gc_mut(|gc| gc.write_barrier(obj));
 }
 
+fn wasm_remember_const_pool(pool: &std::sync::Arc<majit_ir::SharedConstPool>) {
+    let _ = with_wasm_active_gc_mut(|gc| gc.remember_const_pool(pool));
+}
+
 fn wasm_active_gc_write_barrier_managed(obj: GcRef) {
     with_wasm_active_gc_mut(|gc| gc.write_barrier_managed(obj));
 }
@@ -2864,6 +2870,14 @@ pub(crate) fn wasm_gc_owns_object(addr: usize) -> bool {
     }
     majit_gc::gc_sync::is_initialized()
         && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr))
+}
+
+fn wasm_gc_is_young_object(addr: usize) -> bool {
+    if let Some(r) = gc_box::with_reentrant_ref(|gc| gc.is_young_object(addr)) {
+        return r;
+    }
+    majit_gc::gc_sync::is_initialized()
+        && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_young_object(addr))
 }
 
 /// `llop.shrink_array`.  This changes a GC-owned object's length word and must
@@ -3755,6 +3769,20 @@ impl WasmBackend {
                 descrs.iter().filter_map(|d| d.meta_descr.clone()).collect();
             let tracer: Arc<dyn std::any::Any + Send + Sync> = Arc::new(meta);
             clt.asmmemmgr_gcreftracers.lock().push(tracer);
+            // `gcreftracer.py` `llop.gc_writebarrier(tr)`: each published
+            // descr's `rd_consts` enters the remembered set for one minor.
+            let _ = with_wasm_active_gc_mut(|gc| {
+                for d in descrs {
+                    if let Some(pool) = d
+                        .meta_descr
+                        .as_ref()
+                        .and_then(|descr| descr.as_fail_descr())
+                        .and_then(|fd| fd.rd_consts_arc())
+                    {
+                        gc.remember_const_pool(&pool);
+                    }
+                }
+            });
         }
     }
 

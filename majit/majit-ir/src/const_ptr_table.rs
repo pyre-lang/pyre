@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering}
 
 use parking_lot::{Mutex, ReentrantMutex};
 
-use crate::value::{GcRef, gc_current_object_address, gc_id_or_identityhash};
+use crate::value::{GcRef, gc_current_object_address, gc_id_or_identityhash, gc_is_young_object};
 
 /// Live word of `addr`. `gc_current_object_address` follows a nursery
 /// forwarding stub (`_trace_drag_out`) without treating the address as a
@@ -285,6 +285,9 @@ fn table() -> parking_lot::MutexGuard<'static, Table> {
 /// intern is not a root: `history.py` `ConstPtr` dies with the holder.
 /// The intern-to-holder window is [`Table::young`], traced by
 /// [`collect_young_const_ptrs`] / [`trace_young_const_ptrs`].
+/// Only a young object of the calling thread's MiniMark enters that
+/// list (`incminimark.py` `is_young_object` / `remember_young_pointer`;
+/// `resumecode.py` `YOUNG_NUMBERINGS`).
 pub fn intern(addr: GcRef) -> u32 {
     if addr.is_null() {
         return 0;
@@ -323,7 +326,7 @@ fn intern_under(guard: &mut Table, addr: GcRef, hash: u64) -> u32 {
     let addr = live_gcref(addr);
     if let Some(idx) = find(guard, hash, addr.0) {
         stamp_reuse(guard, idx, addr, hash);
-        note_young(guard, idx);
+        note_young_if_young(guard, idx, addr);
         return idx;
     }
     // `find` keys `by_hash`. A nursery intern that hashed the nursery
@@ -334,7 +337,7 @@ fn intern_under(guard: &mut Table, addr: GcRef, hash: u64) -> u32 {
     // `value`).
     if let Some(idx) = find_by_addr(guard, addr.0) {
         stamp_reuse(guard, idx, addr, hash);
-        note_young(guard, idx);
+        note_young_if_young(guard, idx, addr);
         return idx;
     }
     let idx = if let Some(free_idx) = guard.free.pop() {
@@ -354,7 +357,7 @@ fn intern_under(guard: &mut Table, addr: GcRef, hash: u64) -> u32 {
     };
     insert_pair(&mut guard.by_hash, hash, idx);
     insert_pair(&mut guard.by_addr, addr.0 as u64, idx);
-    note_young(guard, idx);
+    note_young_if_young(guard, idx, addr);
     // Publish before releasing the intern lock so another thread that
     // finds this index cannot `resolve` a still-zero mirror.
     publish_slot(idx as usize, addr);
@@ -705,6 +708,15 @@ fn note_young(guard: &mut Table, idx: u32) {
     }
     guard.young_mark[i] = 1;
     guard.young.push(idx);
+}
+
+/// Queue `idx` only when `addr` is a young object of the calling
+/// thread's MiniMark. `incminimark.py` `remember_young_pointer` /
+/// `is_young_object`; `resumecode.py` `YOUNG_NUMBERINGS`.
+fn note_young_if_young(guard: &mut Table, idx: u32, addr: GcRef) {
+    if gc_is_young_object(addr.0) {
+        note_young(guard, idx);
+    }
 }
 
 /// Free a slot no holder stamped in this major. `history.py` drops
@@ -1246,6 +1258,10 @@ mod tests {
         let idx = intern(addr);
         begin_major_live();
         assert_eq!(intern(addr), idx);
+        // Fake addresses are not young on any MiniMark; put the slot on
+        // the remembered set the way a nursery intern of the active heap
+        // would (`resumecode.py` `YOUNG_NUMBERINGS`).
+        requeue_young(&[idx]);
         let young = take_owned_young(&mut |g| g.0 == addr.0);
         for young_idx in young {
             trace_index(young_idx, &mut |_| {});
@@ -1265,6 +1281,7 @@ mod tests {
         reclaim_unheld(0x6E6C_0010, 0x6E6C_0020);
         let mine = intern(GcRef(0x6E6C_0010));
         let other = intern(GcRef(0x6E6C_0020));
+        requeue_young(&[mine, other]);
         let mine_idxs = take_owned_young(&mut |g| g.0 == 0x6E6C_0010);
         for idx in mine_idxs {
             trace_index(idx, &mut |slot| {

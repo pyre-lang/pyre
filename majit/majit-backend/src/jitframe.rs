@@ -1525,6 +1525,7 @@ mod tests {
             fn drop(&mut self) {
                 NURSERY_CORPSE.store(0, Ordering::Release);
                 majit_gc::set_active_gc_is_nursery_object(None);
+                majit_gc::set_active_gc_is_young_object(None);
             }
         }
 
@@ -1542,6 +1543,7 @@ mod tests {
         assert!(gc.is_in_nursery(corpse as usize));
         NURSERY_CORPSE.store(corpse as usize, Ordering::Release);
         majit_gc::set_active_gc_is_nursery_object(Some(is_test_nursery));
+        majit_gc::set_active_gc_is_young_object(Some(is_test_nursery));
         let _hook = HookGuard;
         let info = JitFrameInfo::default();
         unsafe {

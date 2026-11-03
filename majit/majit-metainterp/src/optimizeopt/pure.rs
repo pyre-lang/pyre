@@ -811,36 +811,6 @@ impl OptPureState {
         true
     }
 
-    /// Hand a released `postponed_op` to the passes AFTER OptPure.
-    ///
-    /// pure.py releases the postponed OVF op as the
-    /// `DefaultOptimizationResult.op`, so `send_extra_operation`
-    /// (optimizer.py) carries it to `opt.next_optimization` —
-    /// OptEarlyForce and then OptHeap — exactly like any other op OptPure
-    /// passes on. Emitting it straight into `new_operations` would skip
-    /// OptHeap, whose own `emit()` override (heap.py) postpones
-    /// comparisons and flushes the pending one before the next op. Skipping
-    /// it strands a preceding comparison in `OptHeap::postponed_op`, which
-    /// then flushes BETWEEN the OVF op and its GUARD_NO_OVERFLOW — breaking
-    /// the adjacency `aarch64/assembler.py _walk_operations`
-    /// asserts and the backends rely on to read the overflow flags.
-    fn emit_postponed_downstream(
-        &mut self,
-        optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
-        postponed: OpRc,
-        ctx: &mut OptContext,
-    ) {
-        if let Some(opt) = optimizer.as_deref_mut() {
-            if let Err(crate::optimize::InvalidLoop(reason)) =
-                opt.send_extra_operation_after(ctx.current_pass_idx, &postponed, ctx)
-            {
-                ctx.signal_invalid_loop(reason);
-            }
-        } else {
-            ctx.emit_extra_rc(ctx.current_pass_idx, postponed);
-        }
-    }
-
     /// pure.py _same_args
     ///
     /// Compare two argument lists with optional skip-prefixes on each side
@@ -941,6 +911,45 @@ impl<'a> PureGate<'a> {
         self.guard = Some(shared.borrow_mut());
         forced
     }
+
+    /// Hand a released `postponed_op` to the passes AFTER OptPure.
+    ///
+    /// pure.py releases the postponed OVF op as the
+    /// `DefaultOptimizationResult.op`, so `send_extra_operation`
+    /// (optimizer.py) carries it to `opt.next_optimization` —
+    /// OptEarlyForce and then OptHeap — exactly like any other op OptPure
+    /// passes on. Emitting it straight into `new_operations` would skip
+    /// OptHeap, whose own `emit()` override (heap.py) postpones
+    /// comparisons and flushes the pending one before the next op. Skipping
+    /// it strands a preceding comparison in `OptHeap::postponed_op`, which
+    /// then flushes BETWEEN the OVF op and its GUARD_NO_OVERFLOW — breaking
+    /// the adjacency `aarch64/assembler.py _walk_operations`
+    /// asserts and the backends rely on to read the overflow flags.
+    ///
+    /// Drop the `RefMut` first: `vstring.py` `optstring.emit_extra` may
+    /// re-enter OptPure while this send is on the stack (`Optimizer.emit`
+    /// `force_box` of a virtual string), the same re-entry `force_virtual`
+    /// already drops for.
+    fn emit_postponed_downstream(
+        &mut self,
+        optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        postponed: OpRc,
+        ctx: &mut OptContext,
+    ) {
+        self.guard = None;
+        if let Some(opt) = optimizer.as_deref_mut() {
+            if let Err(crate::optimize::InvalidLoop(reason)) =
+                opt.send_extra_operation_after(ctx.current_pass_idx, &postponed, ctx)
+            {
+                ctx.signal_invalid_loop(reason);
+            }
+        } else {
+            // no optimizer: a pass run alone has no chain after it; the op ends at `Optimizer.emit`
+            ctx.emit_rc(postponed);
+        }
+        let shared = self.shared;
+        self.guard = Some(shared.borrow_mut());
+    }
 }
 
 impl Deref for PureGate<'_> {
@@ -963,7 +972,7 @@ impl DerefMut for PureGate<'_> {
 /// owning optimizer into `force_box_impl` (the `emit_extra` analogue).
 /// `Optimizer::force_box` is not used here: it would pop `potential_extra_op`
 /// again. No optimizer (direct `propagate_forward` tests): the trait
-/// `force_box` keeps the queued / final-emission path.
+/// `force_box` appends at `Optimizer.emit`.
 fn force_ptr_if_virtual(
     optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
     op: &Operand,

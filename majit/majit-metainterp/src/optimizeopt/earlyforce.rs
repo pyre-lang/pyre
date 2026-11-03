@@ -42,7 +42,7 @@ impl OptEarlyForce {
     /// and `emit_extra` runs immediately. This pass already popped
     /// `potential_extra_ops`, so it calls `force_box_impl` rather than
     /// `Optimizer::force_box` (which would pop again). Direct unit tests
-    /// pass no optimizer and keep the queue.
+    /// pass no optimizer and extras append at `Optimizer.emit`.
     fn propagate_inner(
         &mut self,
         optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,

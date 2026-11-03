@@ -638,6 +638,106 @@ pub(crate) fn build_wb_slowpath(
     Some((buffer, ptr))
 }
 
+/// `aarch64/assembler.py build_frame_realloc_slowpath` — once per CPU.
+///
+/// `_check_frame_depth` stores `gcmap` at `[sp+0]` and `depth` at `[sp+WORD]`
+/// then `BL`s this helper. Steps:
+/// a) store all registers in the jitframe
+/// b) fish for the arguments passed by the caller
+/// c) store the gcmap in the jitframe
+/// d) call realloc_frame
+/// e) set the fp to point to the new jitframe
+/// f) store the address of the new jitframe in the shadowstack
+/// c) set the gcmap field to 0 in the new jitframe
+/// g) restore registers and return
+pub(crate) fn build_frame_realloc_slowpath(
+    arena: &Arc<AsmMemoryManager>,
+) -> (codebuf::ArenaExecutableBuffer, usize) {
+    let mut mc = Assembler::new(0);
+    let word = WORD as u32;
+
+    // a)
+    push_all_regs_to_jitframe_raw(&mut mc, &[], true, false);
+
+    // b) `LDP x0, x1, [sp, 0]`: x0 = gcmap, x1 = depth. `STR lr, [sp, 0]`
+    // keeps the return address in the gcmap slot across `realloc_frame`.
+    dynasm!(mc ; .arch aarch64
+        ; ldp x0, x1, [sp]
+        ; str x30, [sp]
+        // c)
+        ; str x0, [x29, JF_GCMAP_OFS as u32]
+        ; mov x0, x29
+    );
+
+    // `_store_and_reset_exception(mc, None, r.x19, on_frame=True)`:
+    // jf_guard_exc ← *pos_exc_value; x19 ← *pos_exception; then clear both.
+    // `store_and_reset_exception_raw` always writes into two registers, so
+    // the on_frame sequence is the inlined body moved here.
+    let exc_value_addr = crate::jit_exc_value_addr() as i64;
+    let exc_type_addr = crate::jit_exc_type_addr() as i64;
+    crate::aarch64::codebuilder::emit_mov_imm64_to(&mut mc, 16, exc_value_addr);
+    dynasm!(mc ; .arch aarch64
+        ; ldr x16, [x16]
+        ; str x16, [x29, JF_GUARD_EXC_OFS as u32]
+    );
+    crate::aarch64::codebuilder::emit_mov_imm64_to(&mut mc, 16, exc_type_addr);
+    dynasm!(mc ; .arch aarch64
+        ; ldr x19, [x16]
+        ; str xzr, [x16]
+    );
+    crate::aarch64::codebuilder::emit_mov_imm64_to(&mut mc, 16, exc_value_addr);
+    dynasm!(mc ; .arch aarch64
+        ; str xzr, [x16]
+    );
+
+    // d) `BL realloc_frame` through ip1 (`blr x17`), matching the previous
+    // inlined body. x1 still holds depth; x19 is callee-saved across the C ABI.
+    let helper_addr = crate::runner::dynasm_realloc_frame as *const () as i64;
+    crate::aarch64::codebuilder::emit_mov_imm64_to(&mut mc, 17, helper_addr);
+    dynasm!(mc ; .arch aarch64
+        ; blr x17
+        // e)
+        ; mov x29, x0
+    );
+
+    // `_restore_exception(mc, None, r.x19)` uses x16/x17 for the
+    // jf_guard_exc round-trip and leaves x0 (the new frame) intact.
+    crate::aarch64::codebuilder::emit_mov_imm64_to(&mut mc, 16, exc_value_addr);
+    dynasm!(mc ; .arch aarch64
+        ; ldr x17, [x29, JF_GUARD_EXC_OFS as u32]
+        ; str x17, [x16]
+        ; str xzr, [x29, JF_GUARD_EXC_OFS as u32]
+    );
+    crate::aarch64::codebuilder::emit_mov_imm64_to(&mut mc, 16, exc_type_addr);
+    dynasm!(mc ; .arch aarch64
+        ; str x19, [x16]
+    );
+
+    // f) `_load_shadowstack_top` into x19 (free after restore); store x0,
+    // still the new frame because restore did not clobber it.
+    let rst_addr = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
+    crate::aarch64::codebuilder::emit_mov_imm64_to(&mut mc, 19, rst_addr);
+    dynasm!(mc ; .arch aarch64
+        ; ldr x19, [x19]
+        ; sub x19, x19, word
+        ; str x0, [x19]
+        // c) reset jf_gcmap
+        ; str xzr, [x29, JF_GCMAP_OFS as u32]
+    );
+
+    // g)
+    pop_all_regs_from_jitframe_raw(&mut mc, &[], true, false);
+    dynasm!(mc ; .arch aarch64
+        ; ldr x30, [sp]
+        ; add sp, sp, 2 * word
+        ; ret x30
+    );
+
+    let buffer = codebuf::finalize_executable(mc, arena).expect("frame_realloc_slowpath: finalize");
+    let ptr = codebuf::buffer_ptr(&buffer) as usize;
+    (buffer, ptr)
+}
+
 // ── Abstract condition codes ──
 // Architecture-independent CC values used throughout the assembler.
 // Converted to arch-specific encoding at emission time.
@@ -888,6 +988,8 @@ pub struct AssemblerARM64<'a> {
     /// helpers, indexed `withcards + 2 * withfloats`, with `[4]` the
     /// `for_frame` one.
     wb_slowpath: [usize; 5],
+    /// `AssemblerARM64._frame_realloc_slowpath`.
+    frame_realloc_slowpath: usize,
     /// `assembler.py` `datablockwrapper`. Float constants live here
     /// (`VFPRegisterManager.convert_to_imm` → `ConstFloatLoc`), not in
     /// the instruction stream.
@@ -1024,6 +1126,7 @@ impl<'a> AssemblerARM64<'a> {
         cpu_handle: crate::guard::CpuDescrHandle,
         malloc_slowpath_fixed: usize,
         wb_slowpath: [usize; 5],
+        frame_realloc_slowpath: usize,
         inputargs: &'a [InputArgRc],
         operations: &'a [OpRc],
     ) -> Self {
@@ -1079,6 +1182,7 @@ impl<'a> AssemblerARM64<'a> {
             gcref_table: Vec::new(),
             malloc_slowpath_fixed,
             wb_slowpath,
+            frame_realloc_slowpath,
             datablockwrapper,
         }
     }
@@ -1859,123 +1963,61 @@ impl<'a> AssemblerARM64<'a> {
         );
     }
 
-    /// aarch64/assembler.py `_check_frame_depth` +
-    /// `build_frame_realloc_slowpath` (assembler.py:434) — emit a dynamic
-    /// JITFRAME depth check at bridge entry.  If the in-flight frame is
-    /// shorter than the bridge's required depth, fall into an inlined
-    /// realloc slowpath that grows the frame via `dynasm_realloc_frame`.
-    ///
-    /// Mirrors the x86 port: the upstream backends `BL` a shared
-    /// `_frame_realloc_slowpath` stub, but pyre inlines its body so the
-    /// gcmap (a compile-time pointer) and the depth (a patchable
-    /// immediate) need not be marshalled through the stack.
+    /// aarch64/assembler.py `_check_frame_depth` — emit a dynamic JITFRAME
+    /// depth check at bridge entry.  If the in-flight frame is shorter than
+    /// the bridge's required depth, call the per-CPU `_frame_realloc_slowpath`
+    /// built by `build_frame_realloc_slowpath`.
     ///
     /// The depth immediate is materialized by `emit_mov_imm64_fixed4` as a
     /// fixed 4-instruction `movz/movk` block; `frame_depth_to_patch` records
-    /// each block offset (CMP operand + slowpath ARG1) and `patch_stack_checks`
-    /// rewrites all four words at finalize once `frame_depth` is final.
+    /// the CMP operand offset and `patch_stack_checks` rewrites all four
+    /// words at finalize once `frame_depth` is final.
     /// Unlike upstream's variable-length `gen_load_int` (which reserves
     /// `get_max_size_of_gen_load_int()` NOPs), this block is always four
     /// words, so no NOP padding is needed.  (The general `emit_mov_imm64`
     /// is variable length and would let the patch overrun the block.)
+    ///
+    /// `_frame_realloc_slowpath` saves and restores `lr` on the stack slot
+    /// this check reserved, so `blr` of the helper is safe.  `sub sp, sp, 16`
+    /// / the helper's `add sp, sp, 16` keep SP 16-byte aligned.
     fn emit_check_frame_depth(&mut self, gcmap: *mut usize) {
         let frame_len_ofs = (JF_FRAME_OFS + crate::jitframe::LENGTHOFS) as u32;
         let placeholder: i64 = 0xffffff;
 
-        // assembler.py:935 — LDR ip0, [fp, lenofs] — current frame length.
+        // `_check_frame_depth`: LDR ip0, [fp, lenofs] — current frame length.
         dynasm!(self.mc ; .arch aarch64
             ; ldr x16, [x29, frame_len_ofs]
         );
-        // assembler.py:936-941 — gen_load_int ip1, expected_size (patched).
+        // `gen_load_int ip1, expected_size` (patched).
         let cmp_imm_ofs = self.mc.offset().0;
         self.emit_mov_imm64_fixed4(17, placeholder);
         self.frame_depth_to_patch.push(cmp_imm_ofs);
 
-        // assembler.py:942-944 — CMP ip0, ip1; B.GE skip (fast path:
-        // frame length >= required depth → no realloc).
+        // CMP ip0, ip1; B.GE skip (fast path: frame length >= required depth).
         let continue_label = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64
             ; cmp x16, x17
             ; b.ge =>continue_label
+            ; sub sp, sp, 16
+            ; str x17, [sp, 8]
         );
-
-        // ── inlined build_frame_realloc_slowpath (assembler.py:434-493) ──
-        // a) store all registers in the jitframe.
-        self.push_all_regs_to_jitframe(&[], true);
-        // c) store the gcmap in the jitframe (push_gcmap bakes it as imm).
-        self.push_gcmap(gcmap);
-
-        // assembler.py:461 _store_and_reset_exception(None, x19, on_frame=True):
-        // jf_guard_exc ← *pos_exc_value (survives the realloc frame copy);
-        // x19 ← *pos_exception (callee-saved across the C call); then clear
-        // both globals so the helper sees no leftover state.  ip0/ip1 (x16/x17)
-        // are scratch and x19 is saved/restored by push/pop_all_regs.
-        let exc_value_addr = crate::jit_exc_value_addr() as i64;
-        let exc_type_addr = crate::jit_exc_type_addr() as i64;
-        self.emit_mov_imm64(16, exc_value_addr);
+        // `gen_load_int ip0, gcmap`; STR ip0, [sp, 0]. Depth travels
+        // x17 → stack → x1 inside the helper; only the CMP site is patched.
+        self.emit_mov_imm64(16, gcmap as i64);
         dynasm!(self.mc ; .arch aarch64
-            ; ldr x16, [x16]                            // x16 = *pos_exc_value
-            ; str x16, [x29, JF_GUARD_EXC_OFS as u32]   // jf_guard_exc = excval
+            ; str x16, [sp]
         );
-        self.emit_mov_imm64(16, exc_type_addr);
+        // `BL _frame_realloc_slowpath`, same shape as the `wb_slowpath` call
+        // (mov-imm + `blr`; x16 is dead after the gcmap store).
+        assert_ne!(
+            self.frame_realloc_slowpath, 0,
+            "_check_frame_depth without frame_realloc_slowpath"
+        );
+        self.emit_mov_imm64(16, self.frame_realloc_slowpath as i64);
         dynasm!(self.mc ; .arch aarch64
-            ; ldr x19, [x16]                            // x19 = *pos_exception
-            ; str xzr, [x16]                            // *pos_exception = 0
+            ; blr x16
+            ; =>continue_label
         );
-        self.emit_mov_imm64(16, exc_value_addr);
-        dynasm!(self.mc ; .arch aarch64
-            ; str xzr, [x16]                            // *pos_exc_value = 0
-        );
-
-        // assembler.py:458 MOV x0 = fp (arg0 = old frame).
-        dynasm!(self.mc ; .arch aarch64 ; mov x0, x29);
-        // assembler.py:447-449 arg1 = expected_size (depth), patched imm.
-        let arg1_imm_ofs = self.mc.offset().0;
-        self.emit_mov_imm64_fixed4(1, placeholder);
-        self.frame_depth_to_patch.push(arg1_imm_ofs);
-
-        // assembler.py:467 BL realloc_frame.  pyre bakes the C-ABI wrapper
-        // address as an immediate and calls through ip1.  `blr` clobbers lr
-        // (x30), which is safe here: a bridge reuses the originating loop's
-        // stack frame and reloads lr from it at `_call_footer`, treating lr
-        // as call-clobbered scratch throughout the body.
-        let helper_addr = crate::runner::dynasm_realloc_frame as *const () as i64;
-        self.emit_mov_imm64(17, helper_addr);
-        dynasm!(self.mc ; .arch aarch64
-            ; blr x17
-            ; mov x29, x0                               // fp = new jitframe
-        );
-
-        // assembler.py:473 _restore_exception(None, x19):
-        // *pos_exc_value ← jf_guard_exc (copied into the new frame);
-        // *pos_exception ← x19 (preserved across the C call).
-        self.emit_mov_imm64(16, exc_value_addr);
-        dynasm!(self.mc ; .arch aarch64
-            ; ldr x17, [x29, JF_GUARD_EXC_OFS as u32]   // x17 = jf_guard_exc
-            ; str x17, [x16]                            // *pos_exc_value = x17
-            ; str xzr, [x29, JF_GUARD_EXC_OFS as u32]   // reset jf_guard_exc
-        );
-        self.emit_mov_imm64(16, exc_type_addr);
-        dynasm!(self.mc ; .arch aarch64
-            ; str x19, [x16]                            // *pos_exception = x19
-        );
-
-        // assembler.py:476-480 — update the shadow-stack top entry so the
-        // GC visitor finds the post-realloc frame on the next minor
-        // collection.  x0 was clobbered by _restore_exception, so write fp.
-        let rst_addr = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
-        self.emit_mov_imm64(16, rst_addr);
-        dynasm!(self.mc ; .arch aarch64
-            ; ldr x16, [x16]            // x16 = *rst = root_stack_top
-            ; sub x16, x16, 8          // x16 = top - WORD
-            ; str x29, [x16]           // [top - WORD] = fp (new frame)
-        );
-
-        // assembler.py:483-487 — reset jf_gcmap to 0 + restore registers.
-        self.pop_gcmap();
-        self.pop_all_regs_from_jitframe(&[], true);
-
-        dynasm!(self.mc ; .arch aarch64 ; =>continue_label);
     }
 
     /// aarch64/assembler.py `patch_stack_checks` — rewrite each recorded
@@ -1989,14 +2031,14 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    /// aarch64/assembler.py:948 `_patch_frame_depth` — overwrite the
-    /// 4-instruction `movz/movk` block emitted by `emit_mov_imm64` with the
-    /// finalised frame depth.  Unlike x86's flat 32-bit immediate, the
-    /// aarch64 depth is materialised as four instruction words, so all four
-    /// are regenerated.  The destination register is recovered from the
-    /// original block (the CMP site targets x17, the ARG1 site x1) and
-    /// preserved.  The patched region needs an explicit icache flush since
-    /// `finalize()` made the buffer executable before this rewrite.
+    /// aarch64/assembler.py `_patch_frame_depth` — overwrite the
+    /// 4-instruction `movz/movk` block emitted by `emit_mov_imm64_fixed4`
+    /// with the finalised frame depth.  Unlike x86's flat 32-bit immediate,
+    /// the aarch64 depth is materialised as four instruction words, so all
+    /// four are regenerated.  The destination register is recovered from the
+    /// original block (always x17, the CMP site) and preserved.  The patched
+    /// region needs an explicit icache flush since `finalize()` made the
+    /// buffer executable before this rewrite.
     fn patch_frame_depth(adr: usize, allocated_depth: usize) {
         let rd = unsafe { (adr as *const u32).read() } & 0x1F;
         let words = Self::encode_mov_imm64_words(rd, allocated_depth as i64);

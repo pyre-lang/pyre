@@ -48,67 +48,6 @@ use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRc, OpRef, Type, Value};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
-/// `optimizer.py` extra-operations list. Almost always 0–2 ops (one
-/// lazy SETFIELD / force). Inline those so the first `VecDeque` grow
-/// (64 B) is gone.
-#[derive(Default)]
-pub(crate) struct ExtraQueue(smallvec::SmallVec<[(usize, majit_ir::OpRc); 2]>);
-
-impl ExtraQueue {
-    pub(crate) fn new() -> Self {
-        Self(smallvec::SmallVec::new())
-    }
-
-    pub(crate) fn push_back(&mut self, item: (usize, majit_ir::OpRc)) {
-        self.0.push(item);
-    }
-
-    pub(crate) fn push_front(&mut self, item: (usize, majit_ir::OpRc)) {
-        self.0.insert(0, item);
-    }
-
-    pub(crate) fn pop_front(&mut self) -> Option<(usize, majit_ir::OpRc)> {
-        if self.0.is_empty() {
-            None
-        } else {
-            Some(self.0.remove(0))
-        }
-    }
-
-    // optimizer.py extra-op queue back
-    #[cfg(test)]
-    pub(crate) fn back(&self) -> Option<&(usize, majit_ir::OpRc)> {
-        self.0.last()
-    }
-
-    pub(crate) fn remove(&mut self, at: usize) -> Option<(usize, majit_ir::OpRc)> {
-        (at < self.0.len()).then(|| self.0.remove(at))
-    }
-
-    pub(crate) fn iter(&self) -> std::slice::Iter<'_, (usize, majit_ir::OpRc)> {
-        self.0.iter()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-impl Extend<(usize, majit_ir::OpRc)> for ExtraQueue {
-    fn extend<T: IntoIterator<Item = (usize, majit_ir::OpRc)>>(&mut self, iter: T) {
-        self.0.extend(iter);
-    }
-}
-
-impl IntoIterator for ExtraQueue {
-    type Item = (usize, majit_ir::OpRc);
-    type IntoIter = smallvec::IntoIter<[(usize, majit_ir::OpRc); 2]>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
-    }
-}
-
 /// ConstPtr indexes created while an optimizer pass runs.
 ///
 /// `history.py` `ConstPtr.value` lives on the op the optimizer is rewriting.
@@ -1443,27 +1382,8 @@ pub struct OptContext {
     /// new_operations.len()` so freshly emitted ops never collide with
     /// inputargs or imported high-water marks.
     pub(crate) inputarg_base: u32,
-    /// Next unique op position for newly emitted or queued extra operations.
+    /// Next unique op position for newly emitted extra operations.
     pub(crate) next_pos: u32,
-    /// RPython emit_extra(op, emit=False) parity: ops queued to be
-    /// processed starting from a specific pass index (skipping earlier passes).
-    /// Used by heap's force_lazy_set to route ops through remaining passes
-    /// without re-entering the heap pass itself.
-    /// Held as `OpRc` (resoperation.py: emit_extra appends a ResOperation
-    /// object) so the queued op carries object identity into the drain.
-    pub(crate) extra_operations_after: ExtraQueue,
-    /// The queues `Optimizer::drain_extra_operations_from` is working through,
-    /// innermost last. The drain moves `extra_operations_after` aside before it
-    /// starts so that a nested drain only sees what was queued after it began —
-    /// that is what keeps `emit_extra`'d ops ahead of the op being propagated
-    /// (`optimizer.py`) instead of ahead of everything still parked.
-    ///
-    /// Parked here rather than in a local so `flush_queued_producer` can still
-    /// reach one entry: `info.py force_box` clears the virtual flag and
-    /// emits the allocation as one step, while pyre's `emit_op` only queues the
-    /// allocation when the force runs from a pass, so a store can be emitted
-    /// while the `NEW_WITH_VTABLE` that defines it is still parked.
-    pub(crate) extra_pending: Vec<ExtraQueue>,
     /// optimizer.py OptimizationResult: deferred postprocess for GUARD_CLASS.
     /// Set by rewrite pass, executed by emit_operation after the guard
     /// is added to new_operations (matching RPython's callback pattern).
@@ -1598,6 +1518,9 @@ pub struct OptContext {
     /// Used by force_at_the_end_of_preamble and force_box to route
     /// forced operations starting from earlyforce.next (= heap).
     pub optearlyforce_idx: usize,
+    /// vstring.py `OptString.setup`: `self.optimizer.optstring = self`.
+    /// Index of the OptString pass; `None` when the chain has none.
+    pub optstring_idx: Option<usize>,
     /// optimizer.py: pendingfields — deferred SetfieldGc/SetarrayitemGc ops
     /// where the stored value is virtual. Set by OptHeap.emitting_operation()
     /// before a guard, consumed by emit_operation() to encode into
@@ -2600,8 +2523,6 @@ impl OptContext {
             num_inputs: 0,
             inputarg_base: 0,
             next_pos: 0,
-            extra_operations_after: ExtraQueue::new(),
-            extra_pending: Vec::new(),
             pending_guard_class_postprocess: None,
             pending_mark_last_guard: None,
             pending_finish_guard_postprocess: None,
@@ -2625,6 +2546,7 @@ impl OptContext {
             building_bridge: false,
             current_pass_idx: 0,
             optearlyforce_idx: 0,
+            optstring_idx: None,
 
             in_final_emission: false,
             force_direct: false,
@@ -3284,8 +3206,6 @@ impl OptContext {
             num_inputs: num_inputs as u32,
             inputarg_base,
             next_pos: start_next_pos,
-            extra_operations_after: ExtraQueue::new(),
-            extra_pending: Vec::new(),
             pending_guard_class_postprocess: None,
             pending_mark_last_guard: None,
             pending_finish_guard_postprocess: None,
@@ -3309,6 +3229,7 @@ impl OptContext {
             building_bridge: false,
             current_pass_idx: 0,
             optearlyforce_idx: 0,
+            optstring_idx: None,
 
             in_final_emission: false,
             force_direct: false,
@@ -3412,14 +3333,10 @@ impl OptContext {
         OpRef::op_typed(pos, value.get_type())
     }
 
-    /// `emit_for_force` with the owning `Optimizer`, so a force-time STRLEN
-    /// or string store follows `Optimization.emit_extra` immediately
-    /// (`send_extra_operation_after`). Past the last pass the walk ends in
-    /// `Optimizer.emit`. `force_direct` or `in_final_emission`, when an
-    /// optimizer is present, appends through `Optimizer.emit_extra` → `emit` →
-    /// `emit_operation_inner`, which forces every argument before the append.
-    /// Without an optimizer the direct branch still `emit_rc`s and does not
-    /// force arguments (`force_box_inline` / tests).
+    /// `vstring.py` `optstring.emit_extra(op)` — walks the passes after
+    /// OptString (`optforce.optimizer.optstring`), whoever forced the string
+    /// and during final emission too; without an optimizer the op ends at
+    /// `Optimizer.emit`.
     pub(crate) fn emit_for_force_with(
         &mut self,
         optimizer: &mut Option<&mut optimizer::Optimizer>,
@@ -3428,37 +3345,27 @@ impl OptContext {
         self.emit_for_force_rc_with(optimizer, majit_ir::OpRc::new(op))
     }
 
-    /// `emit_for_force_rc` with the owning `Optimizer`. See `emit_for_force_with`.
+    /// `vstring.py` `optstring.emit_extra(op)` — walks the passes after
+    /// OptString (`optforce.optimizer.optstring`), whoever forced the string
+    /// and during final emission too; without an optimizer the op ends at
+    /// `Optimizer.emit`.
     pub(crate) fn emit_for_force_rc_with(
         &mut self,
         optimizer: &mut Option<&mut optimizer::Optimizer>,
         op: majit_ir::OpRc,
     ) -> OpRef {
-        let direct = self.in_final_emission || self.force_direct;
-        if direct {
-            if let Some(opt) = optimizer.as_deref_mut() {
-                // optimizer.py `Optimizer.emit_extra` → `emit` →
-                // `_emit_operation`. `clone` is the same box; `emit`
-                // assigns `pos` before returning it.
-                if let Err(crate::optimize::InvalidLoop(reason)) = opt.emit_extra(op.clone(), self)
-                {
-                    self.signal_invalid_loop(reason);
-                }
-                op.pos().get()
-            } else {
-                self.emit_rc(op)
-            }
-        } else if let Some(opt) = optimizer.as_deref_mut() {
-            // `vstring.py` `optstring.emit_extra` / `Optimization.emit_extra`:
-            // same entry index as `emit_extra_rc` (`current_pass_idx + 1`).
-            if let Err(crate::optimize::InvalidLoop(reason)) =
-                opt.send_extra_operation_after(self.current_pass_idx, &op, self)
-            {
+        if let Some(opt) = optimizer.as_deref_mut() {
+            if let Err(crate::optimize::InvalidLoop(reason)) = opt.send_extra_operation_after(
+                self.optstring_idx.unwrap_or(self.current_pass_idx),
+                &op,
+                self,
+            ) {
                 self.signal_invalid_loop(reason);
             }
             op.pos().get()
         } else {
-            self.emit_extra_rc(self.current_pass_idx, op)
+            // no optimizer: a pass run alone has no chain after it; the op ends at `Optimizer.emit`
+            self.emit_rc(op)
         }
     }
 
@@ -3505,9 +3412,8 @@ impl OptContext {
     /// emission uses `op_opref`.  Cached lgtop is stored on `info_opref`'s
     /// PtrInfo.
     ///
-    /// `getstrlen_for` with the owning `Optimizer`. Entry index stays
-    /// `current_pass_idx + 1` (`emit_for_force`); it is not retargeted at
-    /// `optstring`.
+    /// `getstrlen_for` with the owning `Optimizer`. `emit_for_force_rc_with`
+    /// walks the passes after OptString (`vstring.py` `optstring.emit_extra`).
     pub(crate) fn getstrlen_for_with(
         &mut self,
         optimizer: &mut Option<&mut optimizer::Optimizer>,
@@ -3590,9 +3496,8 @@ impl OptContext {
             self.set_str_lgtop(&b, result.clone());
         }
         // vstring.py StrPtrInfo.getstrlen: `string_optimizer.emit_extra(lengthop)`.
-        // Optimization.emit_extra → send_extra_operation down the rest of
-        // the chain; during force (`in_final_emission`) that lands in
-        // Optimizer.emit immediately, so the STRLEN precedes NEWSTR.
+        // Walks the passes after OptString, which pass STRLEN on to
+        // `Optimizer.emit` before the NEWSTR is emitted.
         // `emit_for_force_rc` is that routing.
         self.emit_for_force_rc_with(optimizer, lengthop.clone());
         result
@@ -3782,7 +3687,7 @@ impl OptContext {
     /// `optimizer.py Optimizer._emit_operation` appends the same `op`
     /// object it was handed. A recorder / extra / synthetic `OpRc` already
     /// registered at this position is reused; a genuinely new
-    /// `ResOperation` (`emit_extra`, `copy_and_change`) is cloned.
+    /// `ResOperation` (`copy_and_change`) is cloned.
     pub fn emit(&mut self, op: Op) -> OpRef {
         self.emit_impl(op)
     }
@@ -4058,7 +3963,7 @@ impl OptContext {
     /// producer once the op is emitted; a folded op stays as the chain host.
     /// When `materialize_operand_at` already minted a stand-in for this position,
     /// `op_rc` supersedes it (carrying its `_forwarded`) rather than skipping
-    /// registration — otherwise queued-pass reads resolve to the stale stand-in
+    /// registration — otherwise later-pass reads resolve to the stale stand-in
     /// while writes land on the unregistered `op_rc`, and emit's blind catch-up
     /// then clobbers those writes with the stand-in's slot. (InputArg / const /
     /// sentinel positions are excluded.)
@@ -4102,29 +4007,8 @@ impl OptContext {
         }
     }
 
-    /// RPython emit_extra(op, emit=False) parity: queue an operation to
-    /// be processed through passes AFTER the calling pass. Skips earlier
-    /// passes (including the caller) to avoid re-absorption loops.
-    /// `after_pass_idx`: index of the calling pass (op starts from idx+1).
-    pub fn emit_extra(&mut self, after_pass_idx: usize, op: Op) -> OpRef {
-        // emit_extra enters the chain at the pass AFTER the caller; the first
-        // re-processing pass is `after_pass_idx + 1`.
-        self.emit_extra_at(after_pass_idx + 1, OpRc::new(op))
-    }
-
-    /// `emit_extra` when the caller already holds the ResOperation object
-    /// (`heap.py _lazy_set = op` then `emit_extra(op)`). Queue that `OpRc`
-    /// instead of a second `cls()`.
-    pub fn emit_extra_rc(&mut self, after_pass_idx: usize, op: majit_ir::OpRc) -> OpRef {
-        self.emit_extra_at(after_pass_idx + 1, op)
-    }
-
-    /// Queue `op` to be (re)processed by the pass chain starting at
-    /// `start_pass`. `emit_extra` enters downstream of the caller; head
-    /// re-dispatch (`send_extra_operation`, optimizer.py with
-    /// `opt=first_optimization`) enters at pass 0.
     /// Assign a result position to an extra op and check the box-type
-    /// invariant. Shared by the queued `emit_extra` path and
+    /// invariant. Shared by `Optimizer::send_extra_operation` and
     /// `Optimizer::send_extra_operation_after`.
     pub(crate) fn assign_extra_pos(&mut self, op: &majit_ir::OpRc) {
         if op.pos().get().is_none() {
@@ -4133,46 +4017,11 @@ impl OptContext {
         } else {
             self.next_pos = self.next_pos.max(op.pos().get().raw().saturating_add(1));
         }
-        // Queued ops carry their intrinsic `op.type_`
-        // (resoperation.py:1693 parity). Once the queued op flushes
-        // through `propagate_one` into `new_operations`, `op_at` resolves
-        // its type without the side-table detour.
+        // Extra ops carry their intrinsic `op.type_`
+        // (`resoperation.py` `create_class_for_op` `res.type`). Once the op
+        // is in `new_operations`, `op_at` resolves its type without a
+        // side-table.
         Self::debug_assert_box_type_invariant(op);
-    }
-
-    fn emit_extra_at(&mut self, start_pass: usize, op: majit_ir::OpRc) -> OpRef {
-        self.assign_extra_pos(&op);
-        let pos_ref = op.pos().get();
-        // Register the queued op as the producer for its position so a fold
-        // through `make_equal_to(from_bound_op(op_rc), ..)` reaches a host
-        // `find_producer_op` resolves to.
-        self.register_extra_producer(&op);
-        self.extra_operations_after.push_back((start_pass, op));
-        pos_ref
-    }
-
-    /// optimizer.py send_extra_operation(op) with `opt=None`:
-    /// re-dispatch an operation from `first_optimization` (the head of the
-    /// pass chain, pass 0), so every pass — including those BEFORE the caller,
-    /// e.g. OptIntBounds — reprocesses it. `emit_for_force` only routes through
-    /// downstream passes, so a bound computed by an earlier pass is skipped.
-    pub fn send_extra_operation(&mut self, op: Op) -> OpRef {
-        if self.in_final_emission {
-            self.emit(op)
-        } else {
-            self.emit_extra_at(0, OpRc::new(op))
-        }
-    }
-
-    /// `send_extra_operation` when the caller already holds the ResOperation
-    /// object (`rewrite.py` sending each operation `intdiv` built). Queue
-    /// that `OpRc` so a box built on an earlier one stays bound to it.
-    pub fn send_extra_operation_rc(&mut self, op: majit_ir::OpRc) -> OpRef {
-        if self.in_final_emission {
-            self.emit_rc(op)
-        } else {
-            self.emit_extra_at(0, op)
-        }
     }
 
     pub fn initialize_imported_short_preamble_builder(
@@ -10062,14 +9911,6 @@ impl OptContext {
         for op in &self.phase1_emit_ops {
             walk_live_op(op, visitor);
         }
-        for (_, op) in self.extra_operations_after.iter() {
-            walk_live_op(op, visitor);
-        }
-        for queue in &self.extra_pending {
-            for (_, op) in queue.iter() {
-                walk_live_op(op, visitor);
-            }
-        }
         if let Some(op) = &self.patchguardop {
             walk_live_op(op, visitor);
         }
@@ -10306,9 +10147,8 @@ mod getstrlen_force_tests {
     use majit_ir::{OpCode, OpRef};
 
     /// vstring.py `StrPtrInfo.getstrlen`: `optstring.emit_extra(lengthop)`
-    /// during force (`in_final_emission`) lands in `Optimizer.emit`
-    /// immediately, so the STRLEN precedes NEWSTR. `emit_extra_rc` would
-    /// queue it after the NEWSTR/COPYSTRCONTENT that consume it.
+    /// walks the passes after OptString, which pass STRLEN on to
+    /// `Optimizer.emit` before the NEWSTR is emitted.
     #[test]
     fn getstrlen_during_force_emits_strlen_immediately() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(10, 0, 0, 50);
@@ -10329,14 +10169,120 @@ mod getstrlen_force_tests {
         );
         let _ = ctx.getstrlen_opref_with(&mut None, arg, 0);
         assert!(
-            ctx.extra_operations_after.is_empty(),
-            "force-time getstrlen must emit STRLEN immediately"
-        );
-        assert!(
             ctx.new_operations
                 .iter()
                 .any(|op| op.opcode == OpCode::Strlen),
             "STRLEN must land in new_operations during force"
+        );
+    }
+
+    /// Same getstrlen-during-force setup as
+    /// `getstrlen_during_force_emits_strlen_immediately`, with an Optimizer
+    /// whose chain contains the string pass. `Optimizer::force_box` of a
+    /// virtual concat (Ptr + empty Plain) emits STRLEN as NEWSTR's length.
+    #[test]
+    fn getstrlen_during_force_with_optimizer_emits_strlen_before_newstr() {
+        use crate::optimizeopt::info::{VStringConcatInfo, VStringPlainInfo};
+        use crate::optimizeopt::optimizer::Optimizer;
+
+        let mut optimizer = Optimizer::default_pipeline();
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(10, 0, 0, 50);
+        ctx.in_final_emission = true;
+        ctx.optstring_idx = None;
+        for (idx, name) in optimizer.pass_names().iter().enumerate() {
+            if *name == "string" {
+                ctx.optstring_idx = Some(idx);
+            }
+        }
+        assert!(
+            ctx.optstring_idx.is_some(),
+            "default pipeline includes the string pass"
+        );
+
+        let ptr = OpRef::ref_op(1);
+        let ptr_box = ctx.materialize_operand_at(ptr);
+        ctx.set_ptr_info(
+            &ptr_box,
+            PtrInfo::Str(StrPtrInfo {
+                lenbound: None,
+                lgtop: None,
+                mode: 0,
+                length: -1,
+                variant: VStringVariant::Ptr,
+                last_guard_pos: -1,
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+            }),
+        );
+
+        // Same opref-keyed box `getstrlen_opref_with` will look up for the
+        // empty concat child, so `_int_add(strlen, 0)` keeps the STRLEN box
+        // as NEWSTR's length.
+        let empty_box = ctx.materialize_operand_at(OpRef::ref_op(2));
+        ctx.set_ptr_info(
+            &empty_box,
+            PtrInfo::Str(StrPtrInfo {
+                lenbound: None,
+                lgtop: None,
+                mode: 0,
+                length: 0,
+                variant: VStringVariant::Plain(VStringPlainInfo { _chars: vec![] }),
+                last_guard_pos: -1,
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+            }),
+        );
+
+        let concat_box = ctx.materialize_operand_at(OpRef::ref_op(3));
+        ctx.set_ptr_info(
+            &concat_box,
+            PtrInfo::Str(StrPtrInfo {
+                lenbound: None,
+                lgtop: None,
+                mode: 0,
+                length: -1,
+                variant: VStringVariant::Concat(VStringConcatInfo {
+                    vleft: ptr_box,
+                    vright: empty_box,
+                    _is_virtual: true,
+                }),
+                last_guard_pos: -1,
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+            }),
+        );
+
+        let _ = optimizer.force_box(&concat_box, &mut ctx);
+
+        let strlen_at = ctx
+            .new_operations
+            .iter()
+            .position(|op| op.opcode == OpCode::Strlen);
+        let newstr_at = ctx
+            .new_operations
+            .iter()
+            .position(|op| op.opcode == OpCode::Newstr);
+        assert!(
+            strlen_at.is_some() && newstr_at.is_some(),
+            "force must emit STRLEN and NEWSTR; ops={:?}",
+            ctx.new_operations
+                .iter()
+                .map(|op| op.opcode)
+                .collect::<Vec<_>>()
+        );
+        let strlen_at = strlen_at.unwrap();
+        let newstr_at = newstr_at.unwrap();
+        assert!(
+            strlen_at < newstr_at,
+            "STRLEN must precede the NEWSTR that consumes it"
+        );
+        let strlen_pos = ctx.new_operations[strlen_at].pos().get();
+        let newstr_arg0 = ctx.new_operations[newstr_at].arg(0).to_opref();
+        assert_eq!(
+            newstr_arg0,
+            strlen_pos,
+            "NEWSTR arg 0 must be the STRLEN result; ops={:?}",
+            ctx.new_operations
+                .iter()
+                .map(|op| (op.opcode, op.pos().get()))
+                .collect::<Vec<_>>()
         );
     }
 }

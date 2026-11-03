@@ -19,6 +19,10 @@ pub(crate) struct Aarch64CpuExt {
     /// `AssemblerARM64.wb_slowpath`; `0` where no helper is built yet.
     wb_slowpath: [usize; 5],
     _wb_slowpath_buffers: Vec<ArenaExecutableBuffer>,
+    /// `build_frame_realloc_slowpath`: once per CPU. The per-bridge
+    /// `_check_frame_depth` calls this address.
+    frame_realloc_slowpath: Option<usize>,
+    _frame_realloc_slowpath_buffer: Option<ArenaExecutableBuffer>,
 }
 
 impl Aarch64CpuExt {
@@ -31,7 +35,25 @@ impl Aarch64CpuExt {
             _propagate_exception_path_buffer: None,
             wb_slowpath: [0; 5],
             _wb_slowpath_buffers: Vec::new(),
+            frame_realloc_slowpath: None,
+            _frame_realloc_slowpath_buffer: None,
         }
+    }
+
+    /// `build_frame_realloc_slowpath`, memoised once per CPU.
+    pub(crate) fn ensure_frame_realloc_slowpath(&mut self) -> usize {
+        if let Some(addr) = self.frame_realloc_slowpath {
+            return addr;
+        }
+        let (buffer, addr) =
+            super::assembler::build_frame_realloc_slowpath(&self.asm_memory_manager);
+        debug_assert!(
+            addr != 0,
+            "build_frame_realloc_slowpath returned a null entry"
+        );
+        self._frame_realloc_slowpath_buffer = Some(buffer);
+        self.frame_realloc_slowpath = Some(addr);
+        addr
     }
 
     fn ensure_propagate_exception_path(&mut self, cpu_handle: &CpuDescrHandle) -> usize {

@@ -603,15 +603,14 @@ pub(super) fn send_extra_operation_from(
     op: &OpRc,
     ctx: &mut OptContext,
 ) {
-    if ctx.in_final_emission {
-        ctx.emit_rc(op.clone());
-    } else if let Some(opt) = optimizer.as_deref_mut() {
+    if let Some(opt) = optimizer.as_deref_mut() {
         if let Err(crate::optimize::InvalidLoop(reason)) = opt.send_extra_operation_in_pass(op, ctx)
         {
             ctx.signal_invalid_loop(reason);
         }
     } else {
-        ctx.send_extra_operation_rc(op.clone());
+        // no optimizer: a pass run alone has no chain after it; the op ends at `Optimizer.emit`
+        ctx.emit_rc(op.clone());
     }
 }
 
@@ -2113,7 +2112,9 @@ impl Optimizer {
     }
 
     /// optimizer.py: flush()
-    /// Flush all passes' postponed state.
+    /// Flush all passes' postponed state. An `InvalidLoop` raised inside a
+    /// pass's flush (`heap.py` `OptHeap.flush` → `emit_extra`) unwinds
+    /// immediately, so later passes are not flushed.
     pub fn flush(&mut self, ctx: &mut OptContext) -> Result<(), crate::optimize::InvalidLoop> {
         for pass_idx in 0..self.passes.len() {
             // heap.flush() resolves the "next_optimization" emit_extra
@@ -2124,13 +2125,9 @@ impl Optimizer {
             ctx.current_pass_idx = pass_idx;
             let pass = Rc::clone(&self.passes[pass_idx]);
             pass.flush(&mut Some(&mut *self), ctx);
-            // RPython Optimization.emit_extra() routes newly forced ops to
-            // optimizer.send_extra_operation(op, self.next_optimization).
-            // During flush we must preserve that contract: each pass's flush
-            // output is processed only by downstream passes, never by the
-            // flushing pass again. send_extra_operation (via the drain) may
-            // raise InvalidLoop; propagate it like RPython's flush.
-            self.drain_extra_operations_from(pass_idx + 1, ctx)?;
+            if let Some(e) = ctx.take_invalid_loop() {
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -2147,6 +2144,8 @@ impl Optimizer {
     /// Send an extra operation through the pass chain as if it were
     /// a new operation from the trace. Used by passes that need to
     /// inject additional operations.
+    /// The walk enters optimizations, which force with themselves as `optforce`; the
+    /// Optimizer-as-`optforce` state (`Optimizer.emit_extra`) is cleared for it and restored.
     pub fn send_extra_operation(
         &mut self,
         op_rc: &OpRc,
@@ -2159,8 +2158,14 @@ impl Optimizer {
         // path registers via bind_input_resops; emit_extra does the same).
         ctx.register_extra_producer(op_rc);
         let saved = ctx.current_pass_idx;
+        let saved_in_final_emission = ctx.in_final_emission;
+        let saved_force_direct = ctx.force_direct;
+        ctx.in_final_emission = false;
+        ctx.force_direct = false;
         let result = self.propagate_from_pass(0, op_rc, ctx);
         ctx.current_pass_idx = saved;
+        ctx.in_final_emission = saved_in_final_emission;
+        ctx.force_direct = saved_force_direct;
         result
     }
 
@@ -2168,6 +2173,8 @@ impl Optimizer {
     /// optimization; the chain ends at the `Optimizer`, so a trailing
     /// streaming `OptUnroll` is not entered (same bound as
     /// `send_extra_operation_after`).
+    /// The walk enters optimizations, which force with themselves as `optforce`; the
+    /// Optimizer-as-`optforce` state (`Optimizer.emit_extra`) is cleared for it and restored.
     pub(super) fn send_extra_operation_in_pass(
         &mut self,
         op_rc: &OpRc,
@@ -2176,9 +2183,15 @@ impl Optimizer {
         ctx.assign_extra_pos(op_rc);
         ctx.register_extra_producer(op_rc);
         let saved = ctx.current_pass_idx;
+        let saved_in_final_emission = ctx.in_final_emission;
+        let saved_force_direct = ctx.force_direct;
+        ctx.in_final_emission = false;
+        ctx.force_direct = false;
         let end_pass = self.extra_operation_end_pass();
         let result = self.propagate_from_pass_range(0, end_pass, op_rc, ctx);
         ctx.current_pass_idx = saved;
+        ctx.in_final_emission = saved_in_final_emission;
+        ctx.force_direct = saved_force_direct;
         result
     }
 
@@ -2188,6 +2201,8 @@ impl Optimizer {
     /// `Optimizer.emit`. Restores `current_pass_idx`. Force-time emits
     /// (`info.py` `AbstractVirtualPtrInfo.force_box` `optforce.emit_extra`)
     /// come through here too.
+    /// The walk enters optimizations, which force with themselves as `optforce`; the
+    /// Optimizer-as-`optforce` state (`Optimizer.emit_extra`) is cleared for it and restored.
     pub(super) fn send_extra_operation_after(
         &mut self,
         after_pass_idx: usize,
@@ -2197,9 +2212,15 @@ impl Optimizer {
         ctx.assign_extra_pos(op);
         ctx.register_extra_producer(op);
         let saved = ctx.current_pass_idx;
+        let saved_in_final_emission = ctx.in_final_emission;
+        let saved_force_direct = ctx.force_direct;
+        ctx.in_final_emission = false;
+        ctx.force_direct = false;
         let end_pass = self.extra_operation_end_pass();
         let result = self.propagate_from_pass_range(after_pass_idx + 1, end_pass, op, ctx);
         ctx.current_pass_idx = saved;
+        ctx.in_final_emission = saved_in_final_emission;
+        ctx.force_direct = saved_force_direct;
         result
     }
 
@@ -3163,10 +3184,14 @@ impl Optimizer {
         // earlyforce.py:32: self.optimizer.optearlyforce = self
         // Find the EarlyForce pass index so force paths can route
         // emitted operations starting from earlyforce.next (= heap).
+        // vstring.py `OptString.setup`: `self.optimizer.optstring = self`.
+        ctx.optstring_idx = None;
         for (idx, pass) in self.passes.iter().enumerate() {
             if pass.name() == "earlyforce" {
                 ctx.optearlyforce_idx = idx;
-                break;
+            }
+            if pass.name() == "string" {
+                ctx.optstring_idx = Some(idx);
             }
         }
 
@@ -3898,11 +3923,8 @@ impl Optimizer {
             kept
         });
 
-        // Drain remaining extra ops. send_extra_operation may raise
-        // InvalidLoop; propagate it.
-        self.drain_extra_operations_from(0, &mut ctx)?;
         // Second finalize cascade also removed, on the same rationale:
-        // each emit_extra-queued op runs through `propagate_from_pass_range`
+        // each extra op runs through `propagate_from_pass_range`
         // which resolves its incoming args at input time via
         // `ctx.get_box_replacement`, and through `Optimizer::emit_operation`
         // which `force_box`es every arg. No retroactive walking of pre-existing
@@ -3916,8 +3938,8 @@ impl Optimizer {
         //   `[start_label] + preamble_ops + extra_same_as +
         //    extra_before_label + [label_op] + loop_ops`.
         // The SameAs aliases emitted in the JUMP-arg dedup loop above
-        // (`shortpreamble.py add_preamble_op extra_same_as`) and any `flush()` /
-        // `drain_extra_operations_from` ops that followed are structurally
+        // (`shortpreamble.py add_preamble_op extra_same_as`) and any `flush()`
+        // extras that followed are structurally
         // part of `extra_same_as`; upstream splices that list BETWEEN
         // `preamble_ops` and the label, so in pyre's single-phase flow
         // they must sit before the preamble-terminating JUMP. Move the
@@ -4978,97 +5000,6 @@ impl Optimizer {
         self.propagate_from_pass(0, op, ctx)
     }
 
-    fn drain_extra_operations_from(
-        &mut self,
-        _start_pass: usize,
-        ctx: &mut OptContext,
-    ) -> Result<(), crate::optimize::InvalidLoop> {
-        if ctx.extra_operations_after.is_empty() {
-            return Ok(());
-        }
-        // RPython `send_extra_operation` walks the list in place. Take the
-        // queued deque instead of copying each entry into a fresh one.
-        let pending = std::mem::take(&mut ctx.extra_operations_after);
-        // The level is parked on the context so `flush_queued_producer` can
-        // pull one entry out of it; this function runs nested inside itself
-        // (`propagate_from_pass_range` drains after every pass), and only the
-        // innermost level may absorb what the current propagate queues.
-        ctx.extra_pending.push(pending);
-        let result = self.drain_innermost_pending(ctx);
-        let unfinished = ctx
-            .extra_pending
-            .pop()
-            .expect("the active extra-operation drain level must remain installed");
-        if result.is_err() {
-            // `InvalidLoop` unwinds the recursive Rust drain in place of
-            // RPython's ordinary exception unwinding.  Keep both operations
-            // emitted by the failing propagation and the untouched tail from
-            // this level available to the caller's unwind.  Each outer level
-            // appends its own untouched tail in turn, so no parked producer is
-            // silently discarded.
-            ctx.extra_operations_after.extend(unfinished);
-        } else {
-            debug_assert!(unfinished.is_empty());
-        }
-        result
-    }
-
-    fn drain_innermost_pending(
-        &mut self,
-        ctx: &mut OptContext,
-    ) -> Result<(), crate::optimize::InvalidLoop> {
-        let end_pass = self.extra_operation_end_pass();
-        let level = ctx.extra_pending.len() - 1;
-        while let Some((from_pass, op)) = ctx.extra_pending[level].pop_front() {
-            self.propagate_from_pass_range(from_pass, end_pass, &op, ctx)?;
-            while let Some((start, op)) = ctx.extra_operations_after.pop_front() {
-                ctx.extra_pending[level].push_front((start, op));
-            }
-        }
-        Ok(())
-    }
-
-    /// `optimizer.py:623-625` forces every argument before the operation is
-    /// appended, and `info.py` `force_box` emits the allocation as it clears
-    /// the virtual flag — so a forced box's definition is already in
-    /// `_newoperations`. Pass-level `force_box` now does that itself
-    /// (`emit_extra` / `_force_elements`): the allocation and its field stores
-    /// propagate immediately and are not parked here.
-    ///
-    /// Extra operations from rewrite / virtualize / string / pure / heap
-    /// walk the chain immediately when an optimizer is present. A pass run
-    /// without one (unit tests) still parks on `extra_pending` /
-    /// `extra_operations_after`. Propagate that one parked definition here,
-    /// ahead of the operation that reads it. Everything else keeps its
-    /// queued order.
-    pub(super) fn flush_queued_producer(
-        &mut self,
-        opref: OpRef,
-        ctx: &mut OptContext,
-    ) -> Result<(), crate::optimize::InvalidLoop> {
-        if opref.is_none() || opref.is_constant() {
-            return Ok(());
-        }
-        let queued = ctx
-            .extra_operations_after
-            .iter()
-            .position(|(_, op)| op.pos().get() == opref)
-            .and_then(|at| ctx.extra_operations_after.remove(at))
-            .or_else(|| {
-                ctx.extra_pending.iter_mut().rev().find_map(|level| {
-                    level
-                        .iter()
-                        .position(|(_, op)| op.pos().get() == opref)
-                        .and_then(|at| level.remove(at))
-                })
-            });
-        let Some((from_pass, op)) = queued else {
-            return Ok(());
-        };
-        let end_pass = self.extra_operation_end_pass();
-        self.propagate_from_pass_range(from_pass, end_pass, &op, ctx)
-    }
-
     fn propagate_from_pass(
         &mut self,
         start_pass: usize,
@@ -5220,7 +5151,6 @@ impl Optimizer {
             if let Some(e) = ctx.take_invalid_loop() {
                 return Err(e);
             }
-            self.drain_extra_operations_from(pass_idx + 1, ctx)?;
             match result {
                 OptimizationResult::Emit(op) => {
                     // optimizer.py `send_extra_operation`: a pass's `emit(op)`
@@ -5545,15 +5475,6 @@ impl Optimizer {
         // read info off op.arg(i).
         for i in 0..op.num_args() {
             let arg = self.force_box(&op.arg(i), ctx);
-            if let Err(e) = self.flush_queued_producer(arg.to_opref(), ctx) {
-                Self::restore_emit_shelter(
-                    ctx,
-                    saved_in_final_emission,
-                    &mut saved_pending_mark,
-                    &mut saved_pending_class,
-                );
-                return Err(e);
-            }
             op.setarg(i, arg);
         }
         // force_box may force a virtual whose materialization defers an
@@ -6674,17 +6595,17 @@ mod tests {
         })
     }
 
-    struct QueueForceLikeExtraOps {
+    struct SendForceLikeExtraOps {
         queued: Cell<bool>,
         field_descr: majit_ir::DescrRef,
     }
 
-    impl Optimization for QueueForceLikeExtraOps {
+    impl Optimization for SendForceLikeExtraOps {
         fn propagate_forward(
             &self,
             op: &Op,
             _op_rc: &majit_ir::OpRc,
-            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+            opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
             ctx: &mut OptContext,
         ) -> OptimizationResult {
             if !self.queued.get() && op.opcode == OpCode::IntAdd {
@@ -6692,45 +6613,56 @@ mod tests {
 
                 // The IntAdd args are the only objects at those positions.
                 ctx.seed_boxes_canonical(&[op.arg(0), op.arg(1)]);
-                let alloc = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
-                let alloc_box = ctx.materialize_operand_at(alloc);
+                let alloc_op = OpRc::new(Op::new(OpCode::New, &[]));
+                opt.as_deref_mut()
+                    .unwrap()
+                    .send_extra_operation_after(ctx.current_pass_idx, &alloc_op, ctx)
+                    .expect("send extra New");
+                let alloc_box = ctx.materialize_operand_at(alloc_op.pos().get());
                 let value = op.arg(0);
                 let mut set = Op::new(OpCode::SetfieldGc, &[alloc_box, value]);
                 set.setdescr(self.field_descr.clone());
-                ctx.emit_extra(ctx.current_pass_idx, set);
+                opt.as_deref_mut()
+                    .unwrap()
+                    .send_extra_operation_after(ctx.current_pass_idx, &OpRc::new(set), ctx)
+                    .expect("send extra SetfieldGc");
             }
             OptimizationResult::PassOn
         }
 
         fn name(&self) -> &'static str {
-            "queue_force_like_extra_ops"
+            "send_force_like_extra_ops"
         }
     }
 
-    struct QueueRestartCandidate {
+    struct SendRestartCandidate {
         queued: Cell<bool>,
     }
 
-    impl Optimization for QueueRestartCandidate {
+    impl Optimization for SendRestartCandidate {
         fn propagate_forward(
             &self,
             op: &Op,
             _op_rc: &majit_ir::OpRc,
-            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+            opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
             ctx: &mut OptContext,
         ) -> OptimizationResult {
             if !self.queued.get() && op.opcode == OpCode::IntMul {
                 self.queued.set(true);
-                ctx.emit_extra(
-                    ctx.current_pass_idx,
-                    Op::new(OpCode::IntAdd, &[op.arg(0), op.arg(1)]),
-                );
+                opt.as_deref_mut()
+                    .unwrap()
+                    .send_extra_operation_after(
+                        ctx.current_pass_idx,
+                        &OpRc::new(Op::new(OpCode::IntAdd, &[op.arg(0), op.arg(1)])),
+                        ctx,
+                    )
+                    .expect("send extra IntAdd");
             }
             OptimizationResult::PassOn
         }
 
         fn name(&self) -> &'static str {
-            "queue_restart_candidate"
+            "send_restart_candidate"
         }
     }
 
@@ -6780,28 +6712,30 @@ mod tests {
         }
     }
 
-    struct QueueExtraThenInvalidate;
+    struct SendExtraThenInvalidate;
 
-    impl Optimization for QueueExtraThenInvalidate {
+    impl Optimization for SendExtraThenInvalidate {
         fn propagate_forward(
             &self,
             op: &Op,
             _op_rc: &majit_ir::OpRc,
-            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+            opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
             ctx: &mut OptContext,
         ) -> OptimizationResult {
             if op.opcode == OpCode::IntAdd {
-                ctx.emit_extra(
-                    ctx.current_pass_idx,
-                    Op::new(OpCode::IntMul, &[op.arg(0), op.arg(1)]),
-                );
-                ctx.signal_invalid_loop("test invalid loop while draining extras");
+                let mul = OpRc::new(Op::new(OpCode::IntMul, &[op.arg(0), op.arg(1)]));
+                mul.pos().set(OpRef::int_op(3));
+                opt.as_deref_mut()
+                    .unwrap()
+                    .send_extra_operation_after(ctx.current_pass_idx, &mul, ctx)
+                    .expect("send extra IntMul");
+                ctx.signal_invalid_loop("test invalid loop after sending extra");
             }
             OptimizationResult::PassOn
         }
 
         fn name(&self) -> &'static str {
-            "queue_extra_then_invalidate"
+            "send_extra_then_invalidate"
         }
     }
 
@@ -6822,32 +6756,60 @@ mod tests {
     }
 
     #[test]
-    fn invalid_loop_preserves_queued_and_unprocessed_extra_operations() {
+    fn invalid_loop_keeps_extra_operations_sent_before_it() {
         let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(QueueExtraThenInvalidate));
+        opt.add_pass(Box::new(SendExtraThenInvalidate));
         let mut ctx = OptContext::new(2);
         let lhs = rooted_resop_operand(Type::Int, 0);
         let rhs = rooted_resop_operand(Type::Int, 1);
-        let add = OpRc::new(Op::new(OpCode::IntAdd, &[lhs.clone(), rhs.clone()]));
-        let sub = OpRc::new(Op::new(OpCode::IntSub, &[lhs, rhs]));
-        // Result positions stay off the arg boxes. `emit_extra_at` would
-        // otherwise number a pos-less IntAdd as int_op(0), the same OpRef
-        // as `lhs`.
+        let add = OpRc::new(Op::new(OpCode::IntAdd, &[lhs, rhs]));
+        // Result positions stay off the arg boxes.
         add.pos().set(OpRef::int_op(2));
-        sub.pos().set(OpRef::int_op(3));
-        ctx.emit_extra_at(0, add);
-        ctx.emit_extra_at(0, sub);
 
-        let result = opt.drain_extra_operations_from(0, &mut ctx);
+        let result = opt.send_extra_operation(&add, &mut ctx);
 
         assert!(result.is_err());
-        assert!(ctx.extra_pending.is_empty());
-        let queued: Vec<_> = ctx
-            .extra_operations_after
-            .iter()
-            .map(|(_, op)| op.opcode)
-            .collect();
-        assert_eq!(queued, [OpCode::IntMul, OpCode::IntSub]);
+        let opcodes: Vec<_> = ctx.new_operations.iter().map(|op| op.opcode).collect();
+        assert_eq!(opcodes, [OpCode::IntMul]);
+    }
+
+    struct FlushSignalsInvalidLoop;
+
+    impl Optimization for FlushSignalsInvalidLoop {
+        fn propagate_forward(
+            &self,
+            _op: &Op,
+            _op_rc: &majit_ir::OpRc,
+            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+            _ctx: &mut OptContext,
+        ) -> OptimizationResult {
+            OptimizationResult::PassOn
+        }
+
+        fn flush(&self, _opt: &mut Option<&mut Optimizer>, ctx: &mut OptContext) {
+            ctx.signal_invalid_loop("test invalid loop at flush");
+        }
+
+        fn name(&self) -> &'static str {
+            "flush_signals_invalid_loop"
+        }
+    }
+
+    #[test]
+    fn flush_propagates_deferred_invalid_loop_and_skips_later_passes() {
+        let later_hits = Rc::new(Cell::new(0));
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(FlushSignalsInvalidLoop));
+        opt.add_pass(Box::new(FlushCounter {
+            hits: later_hits.clone(),
+        }));
+        let mut ctx = OptContext::new(0);
+        let result = opt.flush(&mut ctx);
+        assert!(matches!(
+            result,
+            Err(crate::optimize::InvalidLoop("test invalid loop at flush"))
+        ));
+        assert_eq!(later_hits.get(), 0);
     }
 
     #[test]
@@ -6855,7 +6817,7 @@ mod tests {
         let hits = Rc::new(Cell::new(0));
         let mut opt = Optimizer::new();
         opt.trace_inputargs = OpRef::inputarg_refs(&[majit_ir::Type::Int; 8]);
-        opt.add_pass(Box::new(QueueRestartCandidate {
+        opt.add_pass(Box::new(SendRestartCandidate {
             queued: Cell::new(false),
         }));
         opt.add_pass(Box::new(RestartIntAddAsSub));
@@ -7531,7 +7493,7 @@ mod tests {
     #[test]
     fn test_extra_ops_do_not_flow_into_unroll_buffer() {
         let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(QueueForceLikeExtraOps {
+        opt.add_pass(Box::new(SendForceLikeExtraOps {
             queued: Cell::new(false),
             field_descr: std::sync::Arc::new(TestDescr(1)),
         }));
@@ -7569,49 +7531,63 @@ mod tests {
         );
     }
 
-    struct QueueTwoForceLikePairs {
+    struct SendTwoForceLikePairs {
         queued: Cell<bool>,
         field_descr: majit_ir::DescrRef,
     }
 
-    impl Optimization for QueueTwoForceLikePairs {
+    impl Optimization for SendTwoForceLikePairs {
         fn propagate_forward(
             &self,
             op: &Op,
             _op_rc: &majit_ir::OpRc,
-            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+            opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
             ctx: &mut OptContext,
         ) -> OptimizationResult {
             if !self.queued.get() && op.opcode == OpCode::IntAdd {
                 self.queued.set(true);
 
                 ctx.seed_boxes_canonical(&[op.arg(0), op.arg(1)]);
-                let alloc_a = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
-                let alloc_a_box = ctx.materialize_operand_at(alloc_a);
+                let alloc_a_op = OpRc::new(Op::new(OpCode::New, &[]));
+                opt.as_deref_mut()
+                    .unwrap()
+                    .send_extra_operation_after(ctx.current_pass_idx, &alloc_a_op, ctx)
+                    .expect("send extra New A");
+                let alloc_a_box = ctx.materialize_operand_at(alloc_a_op.pos().get());
                 let value_a = op.arg(0);
                 let mut set_a = Op::new(OpCode::SetfieldGc, &[alloc_a_box, value_a]);
                 set_a.setdescr(self.field_descr.clone());
-                ctx.emit_extra(ctx.current_pass_idx, set_a);
+                opt.as_deref_mut()
+                    .unwrap()
+                    .send_extra_operation_after(ctx.current_pass_idx, &OpRc::new(set_a), ctx)
+                    .expect("send extra SetfieldGc A");
 
-                let alloc_b = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
-                let alloc_b_box = ctx.materialize_operand_at(alloc_b);
+                let alloc_b_op = OpRc::new(Op::new(OpCode::New, &[]));
+                opt.as_deref_mut()
+                    .unwrap()
+                    .send_extra_operation_after(ctx.current_pass_idx, &alloc_b_op, ctx)
+                    .expect("send extra New B");
+                let alloc_b_box = ctx.materialize_operand_at(alloc_b_op.pos().get());
                 let value_b = op.arg(1);
                 let mut set_b = Op::new(OpCode::SetfieldGc, &[alloc_b_box, value_b]);
                 set_b.setdescr(self.field_descr.clone());
-                ctx.emit_extra(ctx.current_pass_idx, set_b);
+                opt.as_deref_mut()
+                    .unwrap()
+                    .send_extra_operation_after(ctx.current_pass_idx, &OpRc::new(set_b), ctx)
+                    .expect("send extra SetfieldGc B");
             }
             OptimizationResult::PassOn
         }
 
         fn name(&self) -> &'static str {
-            "queue_two_force_like_pairs"
+            "send_two_force_like_pairs"
         }
     }
 
     #[test]
     fn test_force_like_extra_ops_preserve_new_before_matching_setfield() {
         let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(QueueTwoForceLikePairs {
+        opt.add_pass(Box::new(SendTwoForceLikePairs {
             queued: Cell::new(false),
             field_descr: std::sync::Arc::new(TestDescr(7)),
         }));
@@ -7659,7 +7635,7 @@ mod tests {
         opt.add_pass(Box::new(AddVirtualInputsOnce {
             added: Cell::new(false),
         }));
-        opt.add_pass(Box::new(QueueForceLikeExtraOps {
+        opt.add_pass(Box::new(SendForceLikeExtraOps {
             queued: Cell::new(false),
             field_descr: std::sync::Arc::new(TestDescr(9)),
         }));
@@ -8120,105 +8096,6 @@ mod tests {
                 ),
                 (OpCode::GuardNonnull, vec![OpRef::ref_op(10)], true),
             ]
-        );
-    }
-
-    #[test]
-    fn test_final_emission_flushes_parked_field_alloc_before_store() {
-        use crate::optimizeopt::info::{PtrInfo, VirtualStructInfo};
-
-        // Virtual struct V, field holds non-virtual box F. F's NewWithVtable
-        // is parked on an outer `extra_pending` level. Forcing V emits V's
-        // allocation, then F's allocation, then the SetfieldGc that stores
-        // F into V (`info.py` `force_box` then `_force_elements`).
-        let test_descr = std::sync::Arc::new(TestDescr(0));
-        let field_descr_typed: std::sync::Arc<dyn majit_ir::FieldDescr> = test_descr;
-        let descr: DescrRef = std::sync::Arc::new(
-            majit_ir::descr::SimpleSizeDescr::new(0, 16, 0)
-                .with_all_fielddescrs(vec![field_descr_typed]),
-        );
-        let f_descr: DescrRef =
-            std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(1, 24, 2));
-        let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref]);
-
-        let v_rc = OpRc::new(Op::with_descr(OpCode::New, &[], descr.clone()));
-        v_rc.pos().set(OpRef::ref_op(10));
-        ctx.register_extra_producer(&v_rc);
-
-        let f_rc = OpRc::new(Op::with_descr(OpCode::NewWithVtable, &[], f_descr));
-        f_rc.pos().set(OpRef::ref_op(20));
-        ctx.register_extra_producer(&f_rc);
-        let f_box = ctx.materialize_operand_at(OpRef::ref_op(20));
-        let v_box = ctx.materialize_operand_at(OpRef::ref_op(10));
-        ctx.set_ptr_info(
-            &v_box,
-            PtrInfo::VirtualStruct(VirtualStructInfo {
-                fields: vec![(0, f_box)].into(),
-                ..VirtualStructInfo::new(descr)
-            }),
-        );
-
-        let decoy = OpRc::new(Op::new(
-            OpCode::IntAdd,
-            &[
-                Operand::const_from_value(majit_ir::Value::Int(1)),
-                Operand::const_from_value(majit_ir::Value::Int(2)),
-            ],
-        ));
-        decoy.pos().set(OpRef::int_op(30));
-        let mut outer = crate::optimizeopt::ExtraQueue::new();
-        outer.push_back((4, f_rc));
-        ctx.extra_pending.push(outer);
-        let mut inner = crate::optimizeopt::ExtraQueue::new();
-        inner.push_back((4, decoy));
-        ctx.extra_pending.push(inner);
-
-        let mut opt = Optimizer::new();
-        let op = Op::new(
-            OpCode::GuardNonnull,
-            &[ctx.materialize_operand_at(OpRef::ref_op(10))],
-        );
-        let (mut seeded_ops, snapshots) =
-            super::super::seed_empty_guard_snapshots(std::slice::from_ref(&op));
-        ctx.snapshot_boxes = snapshots;
-        let op = seeded_ops.pop().unwrap();
-        let prior = OpRc::new(op.clone());
-        opt.emit_operation(op, &prior, &mut ctx, false)
-            .expect("emit");
-
-        let container_at = ctx
-            .new_operations
-            .iter()
-            .position(|op| op.opcode == OpCode::New && op.pos().get() == OpRef::ref_op(10));
-        let alloc_at = ctx.new_operations.iter().position(|op| {
-            op.opcode == OpCode::NewWithVtable && op.pos().get() == OpRef::ref_op(20)
-        });
-        let store_at = ctx.new_operations.iter().position(|op| {
-            op.opcode == OpCode::SetfieldGc
-                && op.num_args() >= 2
-                && op.arg(1).to_opref() == OpRef::ref_op(20)
-        });
-        assert!(
-            container_at.is_some()
-                && alloc_at.is_some()
-                && store_at.is_some()
-                && container_at.unwrap() < alloc_at.unwrap()
-                && alloc_at.unwrap() < store_at.unwrap(),
-            "container alloc, then F's NewWithVtable, then SetfieldGc; \
-             container={container_at:?} alloc={alloc_at:?} store={store_at:?} ops={:?}",
-            ctx.new_operations
-                .iter()
-                .map(|op| (op.opcode, op.pos().get()))
-                .collect::<Vec<_>>()
-        );
-        let still_parked = ctx.extra_pending.iter().any(|level| {
-            level
-                .iter()
-                .any(|(_, op)| op.pos().get() == OpRef::int_op(30))
-        });
-        assert!(
-            still_parked,
-            "only the field value's producer is flushed; the other parked op stays"
         );
     }
 

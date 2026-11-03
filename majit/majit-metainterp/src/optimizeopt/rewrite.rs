@@ -2759,15 +2759,9 @@ mod tests {
         }
     }
 
-    /// Whether the pass emitted `opcode`.  `intdiv` queues its sequence
-    /// through `emit_extra`, so it is still in `extra_operations_after` when
-    /// the pass returns.
+    /// Whether the pass emitted `opcode`.
     fn emitted_opcode(ctx: &OptContext, opcode: OpCode) -> bool {
-        ctx.new_operations
-            .iter()
-            .map(|op| op.opcode)
-            .chain(ctx.extra_operations_after.iter().map(|(_, op)| op.opcode))
-            .any(|emitted| emitted == opcode)
+        ctx.new_operations.iter().any(|op| op.opcode == opcode)
     }
 
     /// Whether the magic-number expansion ran.

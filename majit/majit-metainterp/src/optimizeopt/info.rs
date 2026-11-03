@@ -516,7 +516,7 @@ pub trait PtrInfoExt {
     ///
     /// Callers that own an `Optimizer` use `force_box_impl`. This signature
     /// stays for `force_box_inline` and direct unit tests, which have no
-    /// optimizer and keep the queued `emit_extra` path.
+    /// optimizer; extras append at `Optimizer.emit`.
     fn force_box(&mut self, op: &Operand, ctx: &mut crate::optimizeopt::OptContext) -> Operand;
 
     /// info.py: `_is_immutable_and_filled_with_constants`
@@ -1058,9 +1058,9 @@ impl PtrInfoExt for PtrInfo {
     /// info.py `force_box` / `_force_elements`: emit the allocation and the
     /// field stores through `emit_extra`.
     ///
-    /// `force_box_inline` and direct unit tests have no `Optimizer` and keep
-    /// the queued path. Passes that can see the owning optimizer call
-    /// `force_box_impl` (`optforce.optimizer`).
+    /// `force_box_inline` and direct unit tests have no `Optimizer`; extras
+    /// append at `Optimizer.emit`. Passes that can see the owning optimizer
+    /// call `force_box_impl` (`optforce.optimizer`).
     fn force_box(&mut self, op: &Operand, ctx: &mut crate::optimizeopt::OptContext) -> Operand {
         force_box_emit(self, op, ctx, None)
     }
@@ -1167,7 +1167,20 @@ fn force_box_emit(
         optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
     ) -> Operand {
         let value_box = ctx.resolve_operand_operand_opt(orig);
-        // optimizer.py:356-357: `info = op.get_forwarded()` then `if op.type ==
+        // info.py `_force_elements`: `subbox = optforce.optimizer.force_box(fld)`
+        // for every populated field. `optimizer.py` `Optimizer.force_box` does
+        // box replacement, `potential_extra_ops`, ConstInt synthesis, then
+        // `info.force_box`. `force_direct` selects Optimizer.emit_extra for the
+        // child and is restored afterwards.
+        if let Some(opt) = optimizer.as_deref_mut() {
+            let vb_op = value_box.unwrap_or_else(|| orig.clone());
+            let saved = ctx.force_direct;
+            ctx.force_direct = true;
+            let forced = opt.force_box(&vb_op, ctx);
+            ctx.force_direct = saved;
+            return ctx.resolve_operand_operand(&forced);
+        }
+        // optimizer.py: `info = op.get_forwarded()` then `if op.type ==
         // 'i' and info.is_constant(): return ConstInt(info.get_constant_int())`.
         // The const-int synthesis is gated on an info that is ALREADY forwarded
         // — force_box only reads the slot. `peek_intbound_box` reads the
@@ -1189,18 +1202,6 @@ fn force_box_emit(
         };
         if value_is_virtual {
             let vb_op = value_box.expect("recorder-populated");
-            // info.py `_force_elements`: `subbox = optforce.optimizer.force_box(fld)`.
-            // `Optimizer.force_box` defaults `optforce` to itself (`emit_extra`
-            // is `Optimizer.emit_extra`). Do not `take_ptr_info` first:
-            // `force_box` reads the virtual. `force_direct` selects that
-            // direct emit for the child and is restored afterwards.
-            if let Some(opt) = optimizer.as_deref_mut() {
-                let saved = ctx.force_direct;
-                ctx.force_direct = true;
-                let forced = opt.force_box(&vb_op, ctx);
-                ctx.force_direct = saved;
-                return ctx.resolve_operand_operand(&forced);
-            }
             let mut info = ctx.take_ptr_info(&vb_op).unwrap();
             let forced = force_box_emit(&mut info, &vb_op, ctx, None);
             return ctx.resolve_operand_operand(&forced);
@@ -1208,38 +1209,12 @@ fn force_box_emit(
         value_box.unwrap_or_else(|| orig.clone())
     }
 
-    /// `info.py` `_force_elements` calls `force_box(fld)` and then emits the
-    /// store. A non-virtual `fld` whose allocation is still parked in
-    /// `extra_pending` / `extra_operations_after` is flushed here, for that
-    /// one box, immediately before the store. The container itself was
-    /// already emitted by `emit_forced` and is not flushed. Pass-level
-    /// `force_box` no longer parks its own allocation; the flush remains for
-    /// other `emit_extra` producers.
-    fn flush_nonvirtual_field(
-        value: &Operand,
-        ctx: &mut crate::optimizeopt::OptContext,
-        optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
-    ) {
-        if ctx.is_virtual(value) {
-            return;
-        }
-        // No optimizer: tests and `force_box_inline` keep the queued order.
-        let Some(opt) = optimizer.as_mut() else {
-            return;
-        };
-        if let Err(crate::optimize::InvalidLoop(reason)) =
-            opt.flush_queued_producer(value.to_opref(), ctx)
-        {
-            ctx.signal_invalid_loop(reason);
-        }
-    }
-
     // info.py `optforce.emit_extra(op)`.
     // `force_direct` or `in_final_emission`: `Optimizer.emit_extra` →
     // `_emit_operation` (force each arg, then append).
     // Otherwise, with an optimizer: `Optimization.emit_extra` walks from the
     // next pass immediately (`send_extra_operation_after`) on this `OpRc`.
-    // Without an optimizer the op stays on the `emit_extra` queue.
+    // Without an optimizer the op ends at `Optimizer.emit`.
     // The op that landed is `Optimizer.getlastop`'s question (`emit_forced`).
     fn emit_op_rc(
         ctx: &mut crate::optimizeopt::OptContext,
@@ -1271,7 +1246,8 @@ fn force_box_emit(
                 ctx.signal_invalid_loop(reason);
             }
         } else {
-            ctx.emit_extra_rc(ctx.current_pass_idx, op.clone());
+            // no optimizer: a pass run alone has no chain after it; the op ends at `Optimizer.emit`
+            ctx.emit_rc(op.clone());
         }
         op
     }
@@ -1290,10 +1266,9 @@ fn force_box_emit(
     //       op.set_forwarded(newop)
     // `Optimizer.getlastop` is the emitted list (`_really_emitted_operation`
     // upstream; `new_operations.last()` here). No optimizer reads that same
-    // list. A queued `emit_extra` or a later `Remove` does not append this
-    // allocation, and `getlastop` would then name an unrelated earlier op, so
-    // it is read only once the allocation — or the `OpRc` a pass replaced it
-    // with — is in the list.
+    // list. A later `Remove` does not append this allocation, and `getlastop`
+    // would then name an unrelated earlier op, so it is read only once the
+    // allocation — or the `OpRc` a pass replaced it with — is in the list.
     fn allocation_was_emitted(
         ctx: &crate::optimizeopt::OptContext,
         alloc: &majit_ir::OpRc,
@@ -1493,9 +1468,6 @@ fn force_box_emit(
                 };
                 let (_, value_ref) = leftover.swap_remove(pos);
                 let value_ref = force_child(&value_ref, ctx, &mut optimizer);
-                // After force_box(fld): flush this one non-virtual producer,
-                // then emit SETFIELD_GC. Not a pre-walk of the field graph.
-                flush_nonvirtual_field(&value_ref, ctx, &mut optimizer);
                 if w_class_store_is_covered_by_alloc(&vinfo.descr, descr, &value_ref, ctx) {
                     continue;
                 }
@@ -1554,9 +1526,6 @@ fn force_box_emit(
                 };
                 let (_, value_ref) = leftover.swap_remove(pos);
                 let value_ref = force_child(&value_ref, ctx, &mut optimizer);
-                // After force_box(fld): flush this one non-virtual producer,
-                // then emit SETFIELD_GC. Not a pre-walk of the field graph.
-                flush_nonvirtual_field(&value_ref, ctx, &mut optimizer);
                 if w_class_store_is_covered_by_alloc(&vinfo.descr, descr, &value_ref, ctx) {
                     continue;
                 }
@@ -1625,8 +1594,7 @@ fn force_box_emit(
                 }
                 let subbox = force_child(&item_ref, ctx, &mut optimizer);
                 // info.py ArrayPtrInfo._force_elements: force_box(item) then
-                // SETARRAYITEM_GC. Flush only this item's parked producer.
-                flush_nonvirtual_field(&subbox, ctx, &mut optimizer);
+                // SETARRAYITEM_GC.
                 let idx_ref = Operand::const_(majit_ir::Const::Int(i as i64));
                 let arg_alloc = Operand::from_bound_op(&alloc_rc);
                 let arg_idx = idx_ref.clone();
@@ -1699,7 +1667,6 @@ fn force_box_emit(
                     }
                     let subbox = force_child(&value_ref, ctx, &mut optimizer);
                     // info.py ArrayStructInfo._force_elements: force_box(fld) then SETINTERIORFIELD_GC.
-                    flush_nonvirtual_field(&subbox, ctx, &mut optimizer);
                     let arg_alloc = Operand::from_bound_op(&alloc_rc);
                     let arg_idx = idx_ref.clone();
                     let arg_sub = ctx.resolve_operand_operand(&subbox);

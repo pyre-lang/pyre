@@ -14,6 +14,8 @@ pub use header::{
 pub fn install_const_ptr_table_walker() {
     shadow_stack::register_extra_root_walker(const_ptr_table_walker, "const_ptr_table");
     majit_ir::set_gc_current_object_address(Some(gc_current_object_address));
+    majit_ir::set_gc_is_young_object(Some(gc_is_young_object));
+    majit_ir::set_remember_const_pool(Some(gc_remember_const_pool));
 }
 
 fn const_ptr_table_walker(_visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {}
@@ -1297,6 +1299,15 @@ pub trait GcAllocator: Send {
         false
     }
 
+    /// incminimark.py `is_young_object`.
+    ///
+    /// Nursery membership or membership in `young_rawmalloced_objects`.
+    /// The default is nursery membership alone; MiniMark overrides it with
+    /// the inherent pair.
+    fn is_young_object(&self, addr: usize) -> bool {
+        self.is_nursery_object(addr)
+    }
+
     /// The nursery's `[start, end)`, when it is a fixed range for the life of
     /// this allocator.  `None` (the default) keeps callers on the full
     /// `is_nursery_object` query.
@@ -1390,6 +1401,11 @@ pub trait GcAllocator: Send {
     /// `gcreftracer.py` `llop.gc_writebarrier(tr)`: a newly written table
     /// enters this collector's remembered set for one minor.
     fn remember_gc_table(&mut self, _table: &std::sync::Arc<crate::GcTable>) {}
+
+    /// `incminimark.py` `write_barrier` for `ResumeGuardDescr.rd_consts`.
+    /// The pool enters this collector's `pending_const_pools` unless it is
+    /// already on this list (`Weak::ptr_eq`).
+    fn remember_const_pool(&mut self, _pool: &std::sync::Arc<majit_ir::SharedConstPool>) {}
 
     /// Whether the GC supports optimized conditional write barriers.
     ///
@@ -1835,6 +1851,10 @@ impl GcAllocator for GcHandle {
         gc_sync::gc_op(|gc| gc.remember_gc_table(table));
     }
 
+    fn remember_const_pool(&mut self, pool: &std::sync::Arc<majit_ir::SharedConstPool>) {
+        gc_sync::gc_op(|gc| gc.remember_const_pool(pool));
+    }
+
     fn alloc_nursery(&mut self, size: usize) -> GcRef {
         gc_sync::gc_op(|gc| gc.alloc_nursery(size))
     }
@@ -2110,6 +2130,9 @@ impl GcAllocator for GcHandle {
     }
     fn is_nursery_object(&self, addr: usize) -> bool {
         gc_sync::gc_query_reentrant(|gc| gc.is_nursery_object(addr))
+    }
+    fn is_young_object(&self, addr: usize) -> bool {
+        gc_sync::gc_query_reentrant(|gc| gc.is_young_object(addr))
     }
     fn nursery_free(&self) -> *mut u8 {
         gc_sync::gc_query_reentrant(|gc| gc.nursery_free())
@@ -4094,6 +4117,8 @@ pub fn active_minor_collections_since_major() -> usize {
 /// `std::alloc`-allocated ones.
 pub type GcOwnsObjectFn = fn(addr: usize) -> bool;
 pub type GcIsNurseryObjectFn = fn(addr: usize) -> bool;
+/// incminimark.py `is_young_object` — see [`GcAllocator::is_young_object`].
+pub type GcIsYoungObjectFn = fn(addr: usize) -> bool;
 /// `llop.shrink_array` — see [`GcAllocator::shrink_array`].
 pub type GcShrinkArrayFn = fn(addr: usize, smaller_length: usize) -> bool;
 /// Read-only TYPE_INFO query used by the four-argument `ll_arraymove`
@@ -4102,6 +4127,7 @@ pub type GcVarSizeLayoutFn = fn(addr: usize) -> Option<GcVarSizeLayout>;
 
 global_hook!(static ACTIVE_GC_OWNS_OBJECT: GcOwnsObjectFn);
 global_hook!(static ACTIVE_GC_IS_NURSERY_OBJECT: GcIsNurseryObjectFn);
+global_hook!(static ACTIVE_GC_IS_YOUNG_OBJECT: GcIsYoungObjectFn);
 global_hook!(static ACTIVE_GC_SHRINK_ARRAY: GcShrinkArrayFn);
 global_hook!(static ACTIVE_GC_VARSIZE_LAYOUT: GcVarSizeLayoutFn);
 
@@ -4113,6 +4139,11 @@ pub fn set_active_gc_owns_object(hook: Option<GcOwnsObjectFn>) {
 /// Install the active backend's nursery-membership predicate.
 pub fn set_active_gc_is_nursery_object(hook: Option<GcIsNurseryObjectFn>) {
     ACTIVE_GC_IS_NURSERY_OBJECT.set(hook);
+}
+
+/// Install the active backend's `is_young_object` trampoline.
+pub fn set_active_gc_is_young_object(hook: Option<GcIsYoungObjectFn>) {
+    ACTIVE_GC_IS_YOUNG_OBJECT.set(hook);
 }
 
 /// Install the active backend's in-place array shrink.
@@ -4370,6 +4401,39 @@ fn unpublished_is_nursery_object(addr: usize) -> bool {
         }
         None => false,
     }
+}
+
+/// Whether `addr` is a young object of the calling thread's MiniMark.
+///
+/// `incminimark.py` `remember_young_pointer` / `is_young_object`: a
+/// remembered-set entry is a young object of *this* heap.
+/// `resumecode.py` `YOUNG_NUMBERINGS` holds objects allocated in the
+/// nursery of the GC that collects them, or young-rawmalloced.
+/// Same collector dispatch as [`gc_current_object_address`]: per-thread
+/// `gc_box` first (the `ACTIVE_GC_IS_YOUNG_OBJECT` trampoline), then
+/// `gc_sync` under the GIL. `false` when neither is available or when
+/// called re-entrantly from inside a collection.
+fn gc_is_young_object(addr: usize) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    if gc_sync::in_gc_op() {
+        return false;
+    }
+    #[cfg(test)]
+    {
+        let p = TEST_IS_YOUNG_OBJECT_GC.load(std::sync::atomic::Ordering::Acquire);
+        if !p.is_null() {
+            return unsafe { (*p).is_young_object(addr) };
+        }
+    }
+    if let Some(f) = ACTIVE_GC_IS_YOUNG_OBJECT.get() {
+        return f(addr);
+    }
+    if gc_sync::is_initialized() && rgil::am_i_holding_the_gil() {
+        return gc_sync::gc_query_reentrant(|gc| gc.is_young_object(addr));
+    }
+    false
 }
 
 /// Return the current address for a managed object without treating it as a
@@ -4804,11 +4868,14 @@ pub type WriteBarrierFromArrayFn = fn(obj: GcRef, index: usize);
 pub type WritebarrierBeforeCopyFn =
     fn(source: GcRef, dest: GcRef, source_start: usize, dest_start: usize, length: usize) -> bool;
 
+pub type RememberConstPoolFn = fn(pool: &std::sync::Arc<majit_ir::SharedConstPool>);
+
 global_hook!(static ACTIVE_WRITE_BARRIER: WriteBarrierFn);
 global_hook!(static ACTIVE_WRITE_BARRIER_MANAGED: WriteBarrierFn);
 global_hook!(static ACTIVE_WRITE_BARRIER_BEFORE_MOVE: WriteBarrierFn);
 global_hook!(static ACTIVE_WRITE_BARRIER_FROM_ARRAY: WriteBarrierFromArrayFn);
 global_hook!(static ACTIVE_WRITEBARRIER_BEFORE_COPY: WritebarrierBeforeCopyFn);
+global_hook!(static ACTIVE_REMEMBER_CONST_POOL: RememberConstPoolFn);
 
 /// Install the active backend's write-barrier callback. Pass `None` to clear.
 pub fn set_active_write_barrier(hook: Option<WriteBarrierFn>) {
@@ -4833,6 +4900,12 @@ pub fn set_active_write_barrier_from_array(hook: Option<WriteBarrierFromArrayFn>
 /// Install the active backend's `writebarrier_before_copy`. Pass `None` to clear.
 pub fn set_active_writebarrier_before_copy(hook: Option<WritebarrierBeforeCopyFn>) {
     ACTIVE_WRITEBARRIER_BEFORE_COPY.set(hook);
+}
+
+/// Install the active backend's `ResumeGuardDescr.rd_consts` remember.
+/// Pass `None` to clear.
+pub fn set_active_remember_const_pool(hook: Option<RememberConstPoolFn>) {
+    ACTIVE_REMEMBER_CONST_POOL.set(hook);
 }
 
 /// Perform a write barrier through the active backend.
@@ -4892,6 +4965,93 @@ pub fn gc_write_barrier_from_array(obj: GcRef, index: usize) {
         return;
     }
     gc_write_barrier(obj);
+}
+
+/// `incminimark.py` `write_barrier` for a `Const::Ref` store into
+/// `ResumeDataLoopMemo.consts` / `ResumeGuardDescr.rd_consts`.
+///
+/// Same dispatch as [`gc_write_barrier_from_array`]: the active backend
+/// hook wins so a per-thread `gc_box` collector is remembered on, then
+/// `gc_sync` when the GIL is held and no `gc_op` is already on the stack.
+/// Tests that assign `rd_consts` without a collector or the GIL no-op.
+pub fn gc_remember_const_pool(pool: &std::sync::Arc<majit_ir::SharedConstPool>) {
+    #[cfg(test)]
+    {
+        let p = TEST_REMEMBER_CONST_POOL_GC.load(std::sync::atomic::Ordering::Acquire);
+        if !p.is_null() {
+            unsafe { (*p).remember_const_pool(pool) };
+            return;
+        }
+    }
+    if let Some(f) = ACTIVE_REMEMBER_CONST_POOL.get() {
+        f(pool);
+        return;
+    }
+    if gc_sync::is_initialized() && rgil::am_i_holding_the_gil() && !gc_sync::in_gc_op() {
+        gc_sync::gc_op(|gc| gc.remember_const_pool(pool));
+    }
+}
+
+#[cfg(test)]
+static TEST_REMEMBER_CONST_POOL_GC: std::sync::atomic::AtomicPtr<collector::MiniMarkGC> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+#[cfg(test)]
+static TEST_IS_YOUNG_OBJECT_GC: std::sync::atomic::AtomicPtr<collector::MiniMarkGC> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Point [`gc_remember_const_pool`] at `gc` until the guard drops.
+///
+/// `push_during_optimization` cannot name a MiniMark; the append-after-drain
+/// test is that write-barrier path for a local collector.
+#[cfg(test)]
+pub struct TestRememberConstPoolGuard {
+    prev: *mut collector::MiniMarkGC,
+}
+
+#[cfg(test)]
+impl Drop for TestRememberConstPoolGuard {
+    fn drop(&mut self) {
+        TEST_REMEMBER_CONST_POOL_GC.store(self.prev, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// # Safety
+/// `gc` must stay live and unaliased for `&mut` until the guard drops.
+#[cfg(test)]
+pub unsafe fn install_test_remember_const_pool_gc(
+    gc: *mut collector::MiniMarkGC,
+) -> TestRememberConstPoolGuard {
+    let prev = TEST_REMEMBER_CONST_POOL_GC.swap(gc, std::sync::atomic::Ordering::AcqRel);
+    TestRememberConstPoolGuard { prev }
+}
+
+/// Point [`gc_is_young_object`] at `gc` until the guard drops.
+///
+/// `const_ptr_table::intern` cannot name a MiniMark; tests that intern
+/// against a local collector install it here, matching
+/// [`install_test_remember_const_pool_gc`].
+#[cfg(test)]
+pub struct TestIsYoungObjectGuard {
+    prev: *mut collector::MiniMarkGC,
+}
+
+#[cfg(test)]
+impl Drop for TestIsYoungObjectGuard {
+    fn drop(&mut self) {
+        TEST_IS_YOUNG_OBJECT_GC.store(self.prev, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// # Safety
+/// `gc` must stay live until the guard drops. Do not form `&mut` to `gc`
+/// while the guard is held.
+#[cfg(test)]
+pub unsafe fn install_test_is_young_object_gc(
+    gc: *mut collector::MiniMarkGC,
+) -> TestIsYoungObjectGuard {
+    let prev = TEST_IS_YOUNG_OBJECT_GC.swap(gc, std::sync::atomic::Ordering::AcqRel);
+    TestIsYoungObjectGuard { prev }
 }
 
 /// incminimark.py `writebarrier_before_copy`.

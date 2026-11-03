@@ -224,12 +224,6 @@ impl Eq for Const {}
 pub struct SharedConstPool {
     values: std::cell::UnsafeCell<Vec<Const>>,
     visited_generation: std::sync::atomic::AtomicU64,
-    /// `incminimark.py:old_objects_pointing_to_young` for this off-GC
-    /// equivalent of `ResumeGuardDescr.rd_consts`.  Upstream's list is a GC
-    /// object, so assigning the freshly built pool takes the normal write
-    /// barrier.  Our immutable `Arc` needs the same one-minor remembered bit:
-    /// after that walk, every nursery referent has been promoted to oldgen.
-    minor_scan_pending: std::sync::atomic::AtomicBool,
 }
 
 unsafe impl Send for SharedConstPool {}
@@ -240,17 +234,7 @@ impl SharedConstPool {
         std::sync::Arc::new(Self {
             values: std::cell::UnsafeCell::new(values),
             visited_generation: std::sync::atomic::AtomicU64::new(0),
-            minor_scan_pending: std::sync::atomic::AtomicBool::new(true),
         })
-    }
-
-    /// Consume the write-barrier state for a minor root walk.
-    ///
-    /// `SharedConstPool` is immutable after publication except for GC
-    /// forwarding, so no later store can create another old-to-young edge.
-    pub fn take_minor_scan_pending(&self) -> bool {
-        self.minor_scan_pending
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn mark_visited_generation(&self, generation: u64) -> bool {
@@ -270,18 +254,19 @@ impl SharedConstPool {
     /// Append while the owning optimizer is still constructing its trace.
     ///
     /// RPython's `ResumeDataLoopMemo.consts` is one mutable list shared by
-    /// every guard storage in that optimizer.  The optimizer is single-
-    /// threaded and no resume-data reader can run until backend compilation
-    /// publishes the completed trace, so extending the list in that window is
-    /// the Rust analogue of `self.consts.append(const)`.
+    /// every guard storage in that optimizer (`resume.py`). A `Const::Ref`
+    /// store is `incminimark.py` `write_barrier` on that list: the installed
+    /// hook remembers the pool on the active MiniMark.
     ///
     /// # Safety
     /// No slice returned by [`SharedConstPool::as_slice`] may be live across
     /// this call.
-    pub unsafe fn push_during_optimization(&self, value: Const) {
+    pub unsafe fn push_during_optimization(self: &std::sync::Arc<Self>, value: Const) {
+        let is_ref = matches!(value, Const::Ref(_));
         unsafe { &mut *self.values.get() }.push(value);
-        self.minor_scan_pending
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if is_ref {
+            remember_const_pool(self);
+        }
     }
 
     /// # Safety
@@ -312,6 +297,34 @@ impl std::fmt::Debug for SharedConstPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list().entries(self.as_slice()).finish()
     }
+}
+
+/// `incminimark.py` `write_barrier` for a `Const::Ref` store into
+/// `ResumeDataLoopMemo.consts` / `ResumeGuardDescr.rd_consts`.
+/// `majit-ir` has no collector dependency; `majit-gc` installs the real
+/// remember next to `set_gc_current_object_address`.
+pub type RememberConstPoolFn = fn(&std::sync::Arc<SharedConstPool>);
+
+static REMEMBER_CONST_POOL: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Install or clear the process-global const-pool remember hook.
+#[inline]
+pub fn set_remember_const_pool(hook: Option<RememberConstPoolFn>) {
+    let raw: *mut () = match hook {
+        None => std::ptr::null_mut(),
+        Some(f) => unsafe { std::mem::transmute_copy::<RememberConstPoolFn, *mut ()>(&f) },
+    };
+    REMEMBER_CONST_POOL.store(raw, Ordering::Release);
+}
+
+#[inline]
+fn remember_const_pool(pool: &std::sync::Arc<SharedConstPool>) {
+    let p = REMEMBER_CONST_POOL.load(Ordering::Acquire);
+    if p.is_null() {
+        return;
+    }
+    let f: RememberConstPoolFn = unsafe { std::mem::transmute_copy(&p) };
+    f(pool);
 }
 
 impl Const {
@@ -996,6 +1009,40 @@ pub fn gc_current_object_address(addr: usize) -> usize {
         addr
     } else {
         let f: GcCurrentObjectAddressFn = unsafe { std::mem::transmute_copy(&p) };
+        f(addr)
+    }
+}
+
+/// Whether `addr` is a young object of the calling thread's MiniMark.
+///
+/// `incminimark.py` `remember_young_pointer` / `is_young_object`: a
+/// remembered-set entry is a young object of *this* heap.
+/// `resumecode.py` `YOUNG_NUMBERINGS` only ever holds objects allocated
+/// in the nursery of the GC that collects them. Unset, or a word that is
+/// not young there, is `false` — intern keeps the slot for identity and
+/// does not queue it.
+pub type GcIsYoungObjectFn = fn(usize) -> bool;
+
+static GC_IS_YOUNG_OBJECT: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Install or clear the process-global young-object hook.
+#[inline]
+pub fn set_gc_is_young_object(hook: Option<GcIsYoungObjectFn>) {
+    let raw: *mut () = match hook {
+        None => std::ptr::null_mut(),
+        Some(f) => unsafe { std::mem::transmute_copy::<GcIsYoungObjectFn, *mut ()>(&f) },
+    };
+    GC_IS_YOUNG_OBJECT.store(raw, Ordering::Release);
+}
+
+/// The installed young-object test, or `false` when the slot is clear.
+#[inline]
+pub fn gc_is_young_object(addr: usize) -> bool {
+    let p = GC_IS_YOUNG_OBJECT.load(Ordering::Acquire);
+    if p.is_null() {
+        false
+    } else {
+        let f: GcIsYoungObjectFn = unsafe { std::mem::transmute_copy(&p) };
         f(addr)
     }
 }
@@ -1990,18 +2037,6 @@ impl<T> CallArgWord for &mut T {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn shared_const_pool_minor_scan_is_a_one_shot_write_barrier() {
-        let pool = SharedConstPool::new(vec![Const::from_gcref(GcRef(0x1234))]);
-        assert!(pool.take_minor_scan_pending());
-        assert!(!pool.take_minor_scan_pending());
-
-        // A replacement pool represents a new `rd_consts` assignment and
-        // therefore starts with its own remembered young-edge state.
-        let replacement = SharedConstPool::new(Vec::new());
-        assert!(replacement.take_minor_scan_pending());
-    }
 
     #[test]
     fn inputarg_rc_leaves_the_64_byte_class() {

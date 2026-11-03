@@ -1170,6 +1170,12 @@ pub struct MiniMarkGC {
     /// pyre's tables are Rust-owned, so the same remembered-set entry lives
     /// here instead of a process-global list.
     pending_gc_tables: Vec<Weak<crate::GcTable>>,
+    /// `gcreftracer.py` `llop.gc_writebarrier(tr)` for a descr's `rd_consts`
+    /// list. Upstream the list is a GC object, so publishing it remembers
+    /// that object for one minor (`incminimark.py`
+    /// `collect_oldrefs_to_nursery`). The pool is Rust-owned, so the same
+    /// remembered-set entry lives here beside `pending_gc_tables`.
+    pending_const_pools: Vec<Weak<majit_ir::SharedConstPool>>,
     /// incminimark.py:355 `prebuilt_root_objects = AddressStack()`.
     /// Immortal objects enter exactly once, when their first pointer write
     /// clears NO_HEAP_PTRS in the write barrier.
@@ -1534,6 +1540,7 @@ impl MiniMarkGC {
             roots: RootSet::new(),
             old_objects_pointing_to_young: Vec::new(),
             pending_gc_tables: Vec::new(),
+            pending_const_pools: Vec::new(),
             prebuilt_root_objects: Vec::new(),
             root_snapshot_capacity: std::cell::Cell::new(0),
             totalroots_rpy: 0,
@@ -3659,6 +3666,16 @@ impl MiniMarkGC {
         self.oldgen.young_rawmalloced_contains(addr)
     }
 
+    /// incminimark.py `is_young_object`.
+    ///
+    /// Nursery object start or a young-rawmalloc of this heap. Reuses
+    /// `is_nursery_object_start` and `is_young_rawmalloced`, the tests
+    /// `owns_const_ptr_referent` / `can_move` already consult.
+    #[inline]
+    pub(crate) fn is_young_object(&self, addr: usize) -> bool {
+        self.is_nursery_object_start(addr) || self.is_young_rawmalloced(addr)
+    }
+
     /// incminimark.py `_visit_young_rawmalloced_object`.
     ///
     /// The minor reached a young rawmalloced object. Stamp
@@ -4022,6 +4039,7 @@ impl MiniMarkGC {
         // GCREFTRACER write-barrier analogue: tables remembered on *this*
         // MiniMark, consumed once like `old_objects_pointing_to_young`.
         self.collect_pending_gc_tables_to_nursery();
+        self.collect_pending_const_pools_to_nursery();
 
         // incminimark.py:1843-1862: while True loop —
         // collect_cardrefs_to_nursery, then collect_oldrefs_to_nursery.
@@ -10067,6 +10085,23 @@ impl MiniMarkGC {
         self.pending_gc_tables.push(Arc::downgrade(table));
     }
 
+    /// `incminimark.py` `write_barrier` + `_remember_young_pointer_inlined`
+    /// for `ResumeGuardDescr.rd_consts`. Upstream `GCFLAG_TRACK_YOUNG_PTRS`
+    /// lives on the object with one collector; `SharedConstPool` is a Rust
+    /// `Arc`, so "already on this collector's list" is `Weak::ptr_eq` against
+    /// this MiniMark's `pending_const_pools`.
+    pub fn remember_const_pool(&mut self, pool: &Arc<majit_ir::SharedConstPool>) {
+        let weak = Arc::downgrade(pool);
+        if self
+            .pending_const_pools
+            .iter()
+            .any(|w| Weak::ptr_eq(w, &weak))
+        {
+            return;
+        }
+        self.pending_const_pools.push(weak);
+    }
+
     /// Drain this MiniMark's table remembered set. Same consume as
     /// `collect_oldrefs_to_nursery` on `old_objects_pointing_to_young`.
     ///
@@ -10078,6 +10113,7 @@ impl MiniMarkGC {
     /// MiniMark's pending list is untouched (`gcreftracer` pending-owner
     /// test).
     fn collect_pending_gc_tables_to_nursery(&mut self) {
+        let _label = crate::shadow_stack::extra_area_scope("pending_gc_tables");
         let pending = std::mem::take(&mut self.pending_gc_tables);
         for table in pending.into_iter().filter_map(|w| w.upgrade()) {
             table.trace(&mut |r| self.drag_out_root(r));
@@ -10087,6 +10123,30 @@ impl MiniMarkGC {
                 .any(|g| !g.is_null() && self.can_move(*g))
             {
                 self.pending_gc_tables.push(Arc::downgrade(&table));
+            }
+        }
+    }
+
+    /// Drain this MiniMark's published-`rd_consts` remembered set. Same
+    /// consume as [`Self::collect_pending_gc_tables_to_nursery`].
+    /// `incminimark.py` `collect_oldrefs_to_nursery` traces then re-queues
+    /// while a slot is still young; membership is this list, not a
+    /// process-global flag.
+    fn collect_pending_const_pools_to_nursery(&mut self) {
+        let _label = crate::shadow_stack::extra_area_scope("pending_const_pools");
+        let pending = std::mem::take(&mut self.pending_const_pools);
+        for pool in pending.into_iter().filter_map(|w| w.upgrade()) {
+            // SAFETY: this is the exclusive minor-collection walker.
+            for slot in unsafe { pool.as_mut_vec_for_gc() } {
+                if let majit_ir::Const::Ref(gcref) = slot {
+                    self.drag_out_root(gcref);
+                }
+            }
+            if pool.as_slice().iter().any(|c| match c {
+                majit_ir::Const::Ref(g) => !g.is_null() && self.can_move(*g),
+                _ => false,
+            }) {
+                self.pending_const_pools.push(Arc::downgrade(&pool));
             }
         }
     }
@@ -10782,6 +10842,11 @@ impl MiniMarkGC {
     pub fn old_objects_pointing_to_young_len(&self) -> usize {
         self.old_objects_pointing_to_young.len()
     }
+
+    /// Published `rd_consts` pools still on this MiniMark's remembered set.
+    pub fn pending_const_pools_len(&self) -> usize {
+        self.pending_const_pools.len()
+    }
 }
 
 impl Default for MiniMarkGC {
@@ -10793,6 +10858,10 @@ impl Default for MiniMarkGC {
 impl GcAllocator for MiniMarkGC {
     fn remember_gc_table(&mut self, table: &Arc<crate::GcTable>) {
         MiniMarkGC::remember_gc_table(self, table);
+    }
+
+    fn remember_const_pool(&mut self, pool: &Arc<majit_ir::SharedConstPool>) {
+        MiniMarkGC::remember_const_pool(self, pool);
     }
 
     fn writebarrier_before_move(&mut self, obj: GcRef) {
@@ -11090,6 +11159,10 @@ impl GcAllocator for MiniMarkGC {
 
     fn is_nursery_object(&self, addr: usize) -> bool {
         self.is_nursery_object_start(addr)
+    }
+
+    fn is_young_object(&self, addr: usize) -> bool {
+        MiniMarkGC::is_young_object(self, addr)
     }
 
     fn nursery_bounds(&self) -> Option<(usize, usize)> {
@@ -11693,6 +11766,113 @@ mod tests {
             assert_eq!(majit_ir::const_ptr_table::resolve(idx), obj);
         }
         assert_ne!(majit_ir::const_ptr_table::resolve(idx), obj);
+    }
+
+    /// `incminimark.py` `remember_young_pointer` / `is_young_object`: a
+    /// host pointer or an old object of this heap is interned for identity
+    /// and does not enter `resumecode.py` `YOUNG_NUMBERINGS`.
+    #[test]
+    fn interning_a_ref_outside_the_active_minimark_is_not_remembered() {
+        let _const_ptr_table = const_ptr_table_test_guard();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        let type_id = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_with_type(type_id, 16);
+        let mut rooted = obj;
+        unsafe {
+            gc.roots.add(&mut rooted);
+        }
+        gc.do_collect_nursery();
+        gc.roots.clear();
+        let old = rooted;
+        assert!(
+            !gc.is_in_nursery(old.0),
+            "the rooted object is old after a minor"
+        );
+
+        let host = Box::leak(Box::new(0u64)) as *mut u64 as usize;
+        let (host_idx, old_idx) = {
+            let _active = unsafe { crate::install_test_is_young_object_gc(&mut gc) };
+            (
+                majit_ir::const_ptr_table::intern(GcRef(host)),
+                majit_ir::const_ptr_table::intern(old),
+            )
+        };
+        assert!(
+            !majit_ir::const_ptr_table::young_indexes().contains(&host_idx),
+            "a host pointer is not a young object of this MiniMark"
+        );
+        assert!(
+            !majit_ir::const_ptr_table::young_indexes().contains(&old_idx),
+            "an old object of this MiniMark is not queued"
+        );
+        let owned = majit_ir::const_ptr_table::take_owned_young(&mut |gcref| {
+            gc.owns_const_ptr_referent(gcref)
+        });
+        assert!(
+            !owned.contains(&host_idx) && !owned.contains(&old_idx),
+            "neither intern sits in this MiniMark's remembered set"
+        );
+    }
+
+    /// A nursery intern of the active MiniMark is `YOUNG_NUMBERINGS` and a
+    /// minor forwards the slot (`incminimark.py` `collect_oldrefs_to_nursery`).
+    #[test]
+    fn interning_a_young_object_of_the_active_minimark_is_remembered_and_forwarded() {
+        let _const_ptr_table = const_ptr_table_test_guard();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        let type_id = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_with_type(type_id, 16);
+        unsafe {
+            *(obj.0 as *mut u64) = 0xA11C_E711;
+        }
+        let idx = {
+            let _active = unsafe { crate::install_test_is_young_object_gc(&mut gc) };
+            majit_ir::const_ptr_table::intern(obj)
+        };
+        assert!(
+            majit_ir::const_ptr_table::young_indexes().contains(&idx),
+            "a nursery intern of the active MiniMark is remembered"
+        );
+        gc.do_collect_nursery();
+        let moved = majit_ir::const_ptr_table::resolve(idx);
+        assert_ne!(moved, obj, "the minor forwards the interned slot");
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xA11C_E711);
+    }
+
+    /// A young-rawmalloced intern of the active MiniMark is
+    /// `YOUNG_NUMBERINGS` (`incminimark.py` `is_young_object` /
+    /// `remember_young_pointer`).
+    #[test]
+    fn interning_a_young_rawmalloced_object_of_the_active_minimark_is_remembered() {
+        let _const_ptr_table = const_ptr_table_test_guard();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        let type_id = gc.register_type(TypeInfo::simple(16));
+        let payload = gc.config.large_object_threshold + 64;
+        let obj = gc.alloc_with_type(type_id, payload);
+        assert!(
+            gc.is_young_rawmalloced(obj.0),
+            "an oversized object from a collecting entry point is born young"
+        );
+        let idx = {
+            let _active = unsafe { crate::install_test_is_young_object_gc(&mut gc) };
+            majit_ir::const_ptr_table::intern(obj)
+        };
+        assert!(
+            majit_ir::const_ptr_table::young_indexes().contains(&idx),
+            "a young-rawmalloced intern of the active MiniMark is remembered"
+        );
     }
 
     /// A supplied environment answers a name the process does not define, and
@@ -15284,15 +15464,14 @@ mod tests {
         gc.start_incremental_cycle();
         assert_eq!(gc.gc_state, GcState::Marking);
         gc.rescan_major_nonstack_roots_and_drain();
-        // The intern table is process-global. Intern and drain young
-        // under one table lock so a sibling `MiniMarkGC` minor cannot
-        // `take_young` this slot first.
-        let (_idx, young) = majit_ir::const_ptr_table::intern_and_take_young(parent);
-        for idx in young {
-            majit_ir::const_ptr_table::trace_index(idx, &mut |gcref| {
-                gc.seed_major_extra_root(*gcref, "presweep_young_const_ptrs");
-            });
-        }
+        // Parent is old: intern keeps the slot for identity and does not
+        // queue it (`incminimark.py` `is_young_object`). Trace the holder
+        // directly so a sibling MiniMark cannot `take_young` a young intern
+        // of this index.
+        let idx = majit_ir::const_ptr_table::intern(parent);
+        majit_ir::const_ptr_table::trace_index(idx, &mut |gcref| {
+            gc.seed_major_extra_root(*gcref, "presweep_young_const_ptrs");
+        });
         gc.drain_marking_worklists();
         assert!(
             gc.incr_state.gray_stack.is_empty() && gc.incr_state.more_gray_stack.is_empty(),

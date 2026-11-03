@@ -3894,7 +3894,6 @@ mod tests {
             !before.borrow().contains(&OpCode::New),
             "passes before OptEarlyForce.next must not see the allocation"
         );
-        assert!(ctx.extra_operations_after.is_empty());
         assert!(ctx.new_operations.iter().any(|op| op.opcode == OpCode::New));
     }
 }

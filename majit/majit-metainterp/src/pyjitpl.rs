@@ -2265,16 +2265,17 @@ pub struct MetaInterp<M: Clone> {
     /// cache the frontend must not read.
     pub(crate) next_global_opref: u32,
     /// Aggregate write-barrier bit for the GC-traced graphs stored off-heap
-    /// on CLT `asmmemmgr_gcreftracers` and `TargetToken` virtual-state /
-    /// short-preamble fields (`ResumeGuardDescr.rd_consts`).
+    /// on `TargetToken` virtual-state / short-preamble fields.
     ///
     /// In RPython these owners are GC objects. MiniMark's write barrier puts
     /// the modified object on `old_objects_pointing_to_young`, so a minor
     /// collection never searches the whole compiled-loop graph merely to find
     /// each object's dirty bit. Pyre's Rust-owned graph has no GC header; this
     /// owner bit is its remembered-set boundary. Every compilation path arms
-    /// it before it can publish or mutate one of those fields, and the next
-    /// minor root walk consumes it. Major marking still scans everything.
+    /// it before it can mutate one of those fields, and the next minor root
+    /// walk consumes it. Major marking still scans everything. Published
+    /// `ResumeGuardDescr.rd_consts` pools enter MiniMark's remembered set
+    /// through `remember_const_pool` instead.
     compiled_graph_minor_scan_pending: bool,
     /// Recycled `ContinueRunningNormally` banks for compiled-entry FINISH
     /// and CRN handoff. `blackhole.py` `recycle_merge_point_args` keeps the
@@ -3731,19 +3732,14 @@ impl<M: Clone> MetaInterp<M> {
         fn visit_pool(
             pool: Option<&majit_ir::SharedConstPool>,
             generation: u64,
-            is_minor: bool,
             visitor: &mut dyn FnMut(&mut GcRef),
         ) {
             let Some(pool) = pool else { return };
-            // `compile.py:ResumeGuardDescr._attrs_` makes `rd_consts` an
-            // ordinary GC-traced field upstream.  Its write barrier puts the
-            // newly assigned list in MiniMark's remembered set for one minor;
-            // survivors are promoted directly to oldgen, so clean pools do
-            // not participate in later minor root walks.  Major marking still
-            // visits every pool below.
-            if is_minor && !pool.take_minor_scan_pending() {
-                return;
-            }
+            // `compile.py ResumeGuardDescr._attrs_` traces `rd_consts` as an
+            // ordinary GC field. A minor visit of a published pool comes from
+            // the remembered set (`remember_const_pool` /
+            // `gcreftracer.py` `llop.gc_writebarrier(tr)`); majors walk every
+            // pool here.
             // Each pool records the generation of the walk that last visited
             // it, so a pool reached twice in one walk is visited once without
             // a visit set.  The counter is process-global because
@@ -3775,39 +3771,41 @@ impl<M: Clone> MetaInterp<M> {
         // MiniMark enters `old_objects_pointing_to_young` directly; it does
         // not traverse the complete old object graph to inspect each owner's
         // dirty flag. `compiled_graph_minor_scan_pending` is the off-GC owner
-        // bit for this whole Rust graph, armed at every compilation boundary.
-        // Keep the per-pool/per-token bits below as the second-level exact
-        // filter when a publication did change only part of the graph.
+        // bit for TargetToken graphs, armed at every compilation boundary.
         let scan_compiled_graph =
             !is_minor || std::mem::take(&mut self.compiled_graph_minor_scan_pending);
         if scan_compiled_graph {
-            // `compile.py ResumeGuardDescr._attrs_` traces `rd_consts` on
-            // every guard descr, and a bridge's descrs are reachable only
-            // through the backend: `assembler.py gcreftracers.append(tracer)`
-            // pins them on the loop token's `asmmemmgr_gcreftracers`
-            // (`model.py CompiledLoopToken`).  Walk those tracers so root
-            // and bridge guard pools are roots for the token's lifetime.
-            // Dynasm registers `FailDescrStore` (shared via
-            // `Arc`, not cloned), cranelift and wasm `Vec<DescrRef>`;
-            // the other tracer kinds (GcTables) are rooted through
-            // the gcreftracer registry.
             let tokens = self.live_jitcell_tokens();
-            for token in &tokens {
-                let Some(clt) = token.compiled_loop_token() else {
-                    continue;
-                };
-                for tracer in clt.asmmemmgr_gcreftracers.lock().iter() {
-                    let mut visit_descr = |descr: &dyn majit_ir::Descr| {
-                        let pool = descr.as_fail_descr().and_then(|fd| fd.rd_consts_pool());
-                        visit_pool(pool, generation, is_minor, &mut visitor);
+            if !is_minor {
+                // `compile.py ResumeGuardDescr._attrs_` traces `rd_consts` on
+                // every guard descr, and a bridge's descrs are reachable only
+                // through the backend: `assembler.py gcreftracers.append(tracer)`
+                // pins them on the loop token's `asmmemmgr_gcreftracers`
+                // (`model.py CompiledLoopToken`). Majors walk those tracers so
+                // root and bridge guard pools are roots for the token's
+                // lifetime. A minor visit of a published pool comes from the
+                // remembered set (`remember_const_pool`).
+                // Dynasm registers `FailDescrStore` (shared via
+                // `Arc`, not cloned), cranelift and wasm `Vec<DescrRef>`;
+                // the other tracer kinds (GcTables) are rooted through
+                // the gcreftracer registry.
+                for token in &tokens {
+                    let Some(clt) = token.compiled_loop_token() else {
+                        continue;
                     };
-                    if let Some(store) = tracer.downcast_ref::<majit_ir::FailDescrStore>() {
-                        for cell in store.iter() {
-                            visit_descr(&*cell.descr);
-                        }
-                    } else if let Some(descrs) = tracer.downcast_ref::<Vec<DescrRef>>() {
-                        for descr in descrs {
-                            visit_descr(&**descr);
+                    for tracer in clt.asmmemmgr_gcreftracers.lock().iter() {
+                        let mut visit_descr = |descr: &dyn majit_ir::Descr| {
+                            let pool = descr.as_fail_descr().and_then(|fd| fd.rd_consts_pool());
+                            visit_pool(pool, generation, &mut visitor);
+                        };
+                        if let Some(store) = tracer.downcast_ref::<majit_ir::FailDescrStore>() {
+                            for cell in store.iter() {
+                                visit_descr(&*cell.descr);
+                            }
+                        } else if let Some(descrs) = tracer.downcast_ref::<Vec<DescrRef>>() {
+                            for descr in descrs {
+                                visit_descr(&**descr);
+                            }
                         }
                     }
                 }
@@ -3846,10 +3844,10 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Arm the off-GC compiled-graph write barrier around a compile that can
-    /// publish `ResumeGuardDescr.rd_consts` or mutate a `TargetToken` graph.
-    /// Compilation entry arms it for in-place mutations; every publication
-    /// arms it again, because a collection during compilation may have
-    /// consumed the entry-side bit before the new graph became reachable.
+    /// mutate a `TargetToken` graph. Compilation entry arms it for in-place
+    /// mutations; every publication arms it again, because a collection during
+    /// compilation may have consumed the entry-side bit before the new graph
+    /// became reachable. Published `rd_consts` pools use `remember_const_pool`.
     #[inline]
     fn remember_compiled_graph_write(&mut self) {
         self.compiled_graph_minor_scan_pending = true;
@@ -30921,9 +30919,9 @@ mod tests {
         assert_eq!(meta.forced_virtualizable, 0xB000);
     }
 
-    /// `incminimark.py old_objects_pointing_to_young`: the off-GC compiled
-    /// graph is absent from clean minor walks, is visited once after its
-    /// publication barrier fires, and remains visible to every major walk.
+    /// Published `rd_consts` pools are absent from a minor extra-root walk;
+    /// MiniMark's remembered set (`remember_const_pool`) visits them. A major
+    /// still walks every live pool here.
     #[test]
     fn compiled_graph_root_walk_consumes_its_aggregate_minor_barrier() {
         let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
@@ -30955,13 +30953,27 @@ mod tests {
 
         meta.remember_compiled_graph_write();
         let _wave = majit_ir::const_ptr_table::Wave::enter();
+        meta.walk_rd_consts_refs(|_| seen += 1);
+        assert_eq!(seen, 0, "a minor does not visit a published pool");
+        assert_eq!(
+            descr
+                .as_fail_descr()
+                .expect("resume guard")
+                .rd_consts_arc()
+                .expect("pool")[0]
+                .getref_base(),
+            GcRef(0x96_0000_1000)
+        );
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Major);
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
         meta.walk_rd_consts_refs(|slot| {
             seen += 1;
             if slot.0 == 0x96_0000_1000 {
                 *slot = GcRef(0x96_0000_2000);
             }
         });
-        assert_eq!(seen, 1, "a dirty pool traces its Const::Ref slot");
+        assert_eq!(seen, 1, "major marking traces the pool");
         assert_eq!(
             descr
                 .as_fail_descr()
@@ -30971,13 +30983,6 @@ mod tests {
                 .getref_base(),
             GcRef(0x96_0000_2000)
         );
-        meta.walk_rd_consts_refs(|_| seen += 1);
-        assert_eq!(seen, 1, "the publication barrier is consumed once");
-
-        set_extra_root_walk_kind(ExtraRootWalkKind::Major);
-        let _wave = majit_ir::const_ptr_table::Wave::enter();
-        meta.walk_rd_consts_refs(|_| seen += 1);
-        assert_eq!(seen, 2, "major marking traces the pool again");
     }
 
     /// `history.py TargetToken` is a GC object on
@@ -31200,6 +31205,11 @@ mod tests {
             .push(Arc::new(store) as Arc<dyn std::any::Any + Send + Sync>);
         let mut meta = MetaInterp::<()>::new(1);
         meta.memory_manager.keep_loop_alive(&token);
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Minor);
+        let mut seen = 0;
+        meta.walk_rd_consts_refs(|_| seen += 1);
+        assert_eq!(seen, 0, "a minor does not visit a published pool");
 
         set_extra_root_walk_kind(ExtraRootWalkKind::Major);
         let _wave = majit_ir::const_ptr_table::Wave::enter();
