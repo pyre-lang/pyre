@@ -6136,9 +6136,10 @@ pub(crate) use self::lltype::{
     fixed_array_index_identity, fnptr_indirect_enabled, host_rthread_threadlocalref_llop,
     is_flattened_storage_leaf, is_rstr_str_layout_declaration, is_str_family_class_root,
     is_str_length_field_class_root, is_str_oopspec_class_root,
-    items_block_accessor_returns_its_block, nonzero_option_zero, output_type_is_objectptr,
-    push_unichr, same_nominal_adt, strip_crate_prefix, type_decl_ref_adt_id, type_decl_ref_builtin,
-    type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
+    items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
+    output_type_is_objectptr, push_unichr, same_nominal_adt, strip_crate_prefix,
+    type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn,
+    unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;
@@ -6292,7 +6293,7 @@ fn result_exc_ok_is_unit(
     llbc: &Llbc,
     error_carrier: crate::ErrorCarrierSpec<'_>,
 ) -> bool {
-    crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, error_carrier)
+    crate::front::result_exc::tyref_lowers_as_result_exc(output, llbc, error_carrier)
         && crate::front::result_exc::tyref_result_ok_is_unit(output, llbc)
 }
 
@@ -6356,11 +6357,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     } else {
         &fd.signature.output
     };
-    let result_exc_callee = crate::front::result_exc::tyref_is_result_of_carrier(
+    let carrier_result_callee = crate::front::result_exc::tyref_is_result_of_carrier(
         output,
         llbc,
         static_addrs.error_carrier,
     );
+    let exception_sum =
+        crate::front::result_exc::exception_sum_of_result(output, llbc, static_addrs.error_carrier);
+    let result_exc_callee = carrier_result_callee || exception_sum.is_some();
     let result_exc_ok_is_unit =
         result_exc_callee && crate::front::result_exc::tyref_result_ok_is_unit(output, llbc);
     let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
@@ -6621,8 +6625,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         };
         if !lo.result_exc_call_results.is_empty() {
             let carrier = static_addrs.error_carrier;
-            let foreign_sites =
-                crate::front::result_exc::foreign_from_residual_sites(&lo.graph, carrier);
+            let foreign_sites = crate::front::result_exc::foreign_from_residual_sites_in(
+                &lo.graph,
+                carrier,
+                exception_sum.as_ref(),
+            );
             let mut conversions = Vec::with_capacity(foreign_sites.len());
             for site in &foreign_sites {
                 conversions.push(
@@ -6643,7 +6650,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             let remaining_exc: Vec<_> = lo
                 .result_exc_call_results
                 .iter()
-                .filter(|(var, _, _)| fused_toint_map_err.iter().all(|fused| fused != var))
+                .filter(|call| {
+                    fused_toint_map_err
+                        .iter()
+                        .all(|fused| fused != &call.result)
+                })
                 .cloned()
                 .collect();
             if !remaining_exc.is_empty() {
@@ -6685,10 +6696,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         ) + toint_map_err_fused;
 
         if result_exc_callee {
-            crate::front::result_exc::lower_result_exc_returns(
+            crate::front::result_exc::lower_result_exc_returns_for_sum(
                 &mut lo.graph,
                 tail_forwarded_returns,
                 static_addrs.error_carrier,
+                exception_sum.as_ref(),
             )
             .map_err(LowerError::Unsupported)?;
             if result_exc_ok_is_unit {
@@ -6798,10 +6810,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             // returns cannot certify these new returns: if none of them has a
             // supported shape, the callee must decline instead of exposing a
             // mixture of unwrapped values and Result shells to its callers.
-            crate::front::result_exc::lower_result_exc_returns(
+            crate::front::result_exc::lower_result_exc_returns_for_sum(
                 &mut lo.graph,
                 0,
                 static_addrs.error_carrier,
+                exception_sum.as_ref(),
             )
             .map_err(LowerError::Unsupported)?;
             crate::front::result_exc::fuse_kind_ctor_raise(&mut lo.graph);
@@ -6973,10 +6986,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // combinator's Result was consumed in-graph (`?` / `and_then`), not
         // that the callee has no returns.
         if result_exc_callee && option_ok_or_else_disc {
-            crate::front::result_exc::lower_result_exc_returns(
+            crate::front::result_exc::lower_result_exc_returns_for_sum(
                 &mut lo.graph,
                 1,
                 static_addrs.error_carrier,
+                exception_sum.as_ref(),
             )
             .map_err(LowerError::Unsupported)?;
             crate::front::result_exc::fuse_kind_ctor_raise(&mut lo.graph);
@@ -6989,7 +7003,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // can still rebuild shells, so this runs after both.
         // `exceptiontransform.py` `transform_completely` carries `T` on the
         // normal edge and raises on the error edge.
-        let scalar_shell_owners = if result_exc_callee {
+        let scalar_shell_owners = if carrier_result_callee {
             lo.resolve_result_owners(output)
         } else {
             None
@@ -7818,6 +7832,10 @@ fn block_reachable(graph: &FunctionGraph, target: BlockId) -> bool {
     }
     false
 }
+
+#[cfg(test)]
+#[path = "mir/exception_sum.rs"]
+mod exception_sum;
 
 #[cfg(test)]
 mod tests;

@@ -531,6 +531,49 @@ pub(crate) fn exception_class_enum_path_matches(stored: &str, query: &str) -> bo
     stripped != query && stored == stripped
 }
 
+/// Whether `name` is the base or a variant class of one hierarchy.
+///
+/// Accepted spellings are the qualname (`E`, `EB`), an enum-path
+/// spelling [`exception_class_enum_path_matches`] accepts, and
+/// `owner::variant` when `variant` is declared and `owner` is the
+/// enum path or the base qualname. The ctor stamps `synth::E::B`;
+/// the type of a marked value stamps the base leaf `E`.
+pub(crate) fn exception_class_variants_belong(
+    enum_path: &str,
+    variants: &[&str],
+    name: &str,
+) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let base = exception_class_qualname(enum_path, None);
+    if name == base || exception_class_enum_path_matches(enum_path, name) {
+        return true;
+    }
+    if variants
+        .iter()
+        .any(|variant| name == exception_class_qualname(enum_path, Some(variant)))
+    {
+        return true;
+    }
+    let Some((owner, variant)) = name.rsplit_once("::") else {
+        return false;
+    };
+    variants.contains(&variant)
+        && (exception_class_enum_path_matches(enum_path, owner) || owner == base)
+}
+
+/// Whether `name` belongs to any harvested `_exception_class_` hierarchy.
+///
+/// Empty `hints` matches nothing: an unmarked error stays on the
+/// carrier conversion.
+pub fn exception_class_name_belongs(hints: &[ExceptionClassHint], name: &str) -> bool {
+    hints.iter().any(|hint| {
+        let variants: Vec<&str> = hint.variants.iter().map(String::as_str).collect();
+        exception_class_variants_belong(&hint.enum_path, &variants, name)
+    })
+}
+
 /// Nesting edges in mint order.
 ///
 /// Each pair is `(variant, parent variant)`. `None` means the base class.
@@ -1665,6 +1708,28 @@ mod tests {
             "ArgErrMissing"
         );
         assert_eq!(exception_class_qualname("synth::E", Some("C")), "EC");
+    }
+
+    #[test]
+    fn exception_class_name_belongs_accepts_base_variant_and_ctor_path() {
+        let hints = vec![super::ExceptionClassHint {
+            enum_path: "synth::E".into(),
+            overrides: "C(B)".into(),
+            variants: vec!["A".into(), "B".into(), "C".into()],
+        }];
+        let belongs = |name: &str| super::exception_class_name_belongs(&hints, name);
+        assert!(belongs("E"));
+        assert!(belongs("EA"));
+        assert!(belongs("EB"));
+        assert!(belongs("EC"));
+        assert!(belongs("synth::E"));
+        assert!(belongs("fixture::synth::E"));
+        assert!(belongs("synth::E::B"));
+        assert!(belongs("E::B"));
+        assert!(!belongs("synth::T::Y"));
+        assert!(!belongs("synth::E::Y"));
+        assert!(!belongs(""));
+        assert!(!super::exception_class_name_belongs(&[], "E"));
     }
 
     #[test]

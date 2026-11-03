@@ -699,10 +699,15 @@ impl CodeWriter {
         };
         // The error carrier's `raise e` / `except OperationError as e`
         // edges, annotated as such, move to the runtime exception value
-        // before jtransform reads them.
+        // before jtransform reads them. Hierarchies are minted when the
+        // registry is built, so the raise guard can ask whether the
+        // raised value's class is one of them.
+        let registry = self.dual_gate_registry(callcontrol);
+        let belongs_bk = registry.bookkeeper().clone();
         crate::codewriter::error_carrier_edges::lower_error_carrier_edges(
             &mut graph_owned,
             &callcontrol.error_carrier().clone(),
+            &|name| belongs_bk.exception_class_name_belongs(name),
         );
         crate::translator::rtyper::rpbc::lower_indirect_calls(&mut graph_owned, callcontrol);
         #[cfg(debug_assertions)]
@@ -712,7 +717,6 @@ impl CodeWriter {
         // Catches both the Match-arm and Skip-arm graphs; the
         // companion fold in `flowspace_adapter::
         // legacy_const_define_hlvalue` only reaches Match-arm graphs.
-        let registry = self.dual_gate_registry(callcontrol);
         crate::translator::rtyper::unit_variant_fold::fold_unit_variant_ctors(
             &mut graph_owned,
             Some(registry.bookkeeper()),

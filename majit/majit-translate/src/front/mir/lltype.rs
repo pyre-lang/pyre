@@ -4103,7 +4103,7 @@ pub(in crate::front::mir) fn tyref_payload_enum_class_root_with(
 }
 
 /// Harvested `_exception_class_<Enum>` hints of one artefact.
-pub(in crate::front::mir) fn llbc_exception_class_hints(
+pub(crate) fn llbc_exception_class_hints(
     llbc: &Llbc,
 ) -> &Vec<crate::front::llbc_hints::ExceptionClassHint> {
     llbc_derived(llbc).exception_class_hints.get_or_init(|| {
@@ -4226,17 +4226,13 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
     // `RESULT == FUNC.RESULT` check).  `Result<(), PyError>` reaches the
     // unit arm the same way its callee reaches `widen_unit_return_to_void`.
     //
-    // Only a `PyError` carrier is lowered that way.  Any other `Result`
-    // stays a real ADT the callee returns whole and the caller matches on
+    // A carrier `Result` and an exception-sum `Result` are lowered that
+    // way (`tyref_lowers_as_result_exc`). Any other `Result` stays a real
+    // ADT the callee returns whole and the caller matches on
     // (`rbigint::_AsDouble -> Result<f64, RBigIntError>`), so projecting it
     // would name the payload's bank for a value that arrives as a
     // reference — the same disagreement in the other direction.
-    //
-    let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
-        crate::front::result_exc::tyref_result_ok(output, llbc)
-    } else {
-        None
-    };
+    let payload = crate::front::result_exc::result_exc_projected_ok(output, llbc, spec);
     let kind_src = payload.as_ref().unwrap_or(output);
     if is_unit_type(kind_src, llbc) {
         return Some("()".to_string());
@@ -4348,11 +4344,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
-        crate::front::result_exc::tyref_result_ok(output, llbc)
-    } else {
-        None
-    };
+    let payload = crate::front::result_exc::result_exc_projected_ok(output, llbc, spec);
     let ty = payload.as_ref().unwrap_or(output);
     if tyref_is_gcref_spelling(ty, llbc) {
         return None;
@@ -4400,11 +4392,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_can_be_none(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
-    let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
-        crate::front::result_exc::tyref_result_ok(output, llbc)
-    } else {
-        None
-    };
+    let payload = crate::front::result_exc::result_exc_projected_ok(output, llbc, spec);
     let ty = payload.as_ref().unwrap_or(output);
     registered_gc_ptr_class_root_with(
         ty,
@@ -4442,11 +4430,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_container_root(
     // reads. `encode_ascii` returns `Result<Vec<u8>, PyError>`; looking
     // at the Result ADT yields no Vec/slice spelling, so the stub was a
     // classdef-less `ref` that `List ∪ Instance` cannot merge.
-    let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
-        crate::front::result_exc::tyref_result_ok(output, llbc)
-    } else {
-        None
-    };
+    let payload = crate::front::result_exc::result_exc_projected_ok(output, llbc, spec);
     let ty = payload.as_ref().unwrap_or(output);
     // One-word-item `Vec` is `*mut Vec<…>` (`annotation_struct_field_type`);
     // `tyref_to_field_layout_string` writes `isize` and the stub would be
@@ -4499,11 +4483,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_is_str(
     llbc: &Llbc,
     spec: crate::ErrorCarrierSpec<'_>,
 ) -> bool {
-    let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
-        crate::front::result_exc::tyref_result_ok(output, llbc)
-    } else {
-        None
-    };
+    let payload = crate::front::result_exc::result_exc_projected_ok(output, llbc, spec);
     let ty = payload.as_ref().unwrap_or(output);
     tyref_is_string_value(ty, llbc)
         || tyref_raw_ptr_pointee_is_string_value(ty, llbc)
@@ -9993,9 +9973,7 @@ pub(in crate::front::mir) fn option_shared_ref_return_is_one_word(
 ) -> bool {
     let mut ty = ty;
     let owned;
-    if crate::front::result_exc::tyref_is_result_of_carrier(ty, llbc, spec)
-        && let Some(ok) = crate::front::result_exc::tyref_result_ok(ty, llbc)
-    {
+    if let Some(ok) = crate::front::result_exc::result_exc_projected_ok(ty, llbc, spec) {
         owned = ok;
         ty = &owned;
     }
@@ -10039,9 +10017,7 @@ pub(in crate::front::mir) fn option_raw_adt_ptr_return_is_one_word(
 ) -> bool {
     let mut ty = ty;
     let owned;
-    if crate::front::result_exc::tyref_is_result_of_carrier(ty, llbc, spec)
-        && let Some(ok) = crate::front::result_exc::tyref_result_ok(ty, llbc)
-    {
+    if let Some(ok) = crate::front::result_exc::result_exc_projected_ok(ty, llbc, spec) {
         owned = ok;
         ty = &owned;
     }

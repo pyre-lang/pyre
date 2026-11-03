@@ -243,11 +243,11 @@ impl<'a> Lowering<'a> {
                                 .is_some()
                                 .then(|| root.clone())
                         })
-                } else if crate::front::result_exc::tyref_is_result_of_carrier(
+                } else if crate::front::result_exc::tyref_lowers_as_result_exc(
                     &call.dest.ty,
                     self.llbc,
                     self.static_addrs.error_carrier,
-                ) || crate::front::result_exc::tyref_is_result_of_carrier(
+                ) || crate::front::result_exc::tyref_lowers_as_result_exc(
                     dest_class_ty,
                     self.llbc,
                     self.static_addrs.error_carrier,
@@ -7686,7 +7686,7 @@ impl<'a> Lowering<'a> {
             || unknown_family_indirect)
             && !captured_option_ok_or_else_try
             && !option_ok_or_else_method
-            && crate::front::result_exc::tyref_is_result_of_carrier(
+            && crate::front::result_exc::tyref_lowers_as_result_exc(
                 &call.dest.ty,
                 self.llbc,
                 self.static_addrs.error_carrier,
@@ -7725,7 +7725,16 @@ impl<'a> Lowering<'a> {
             );
             if !indirect_family_call || !payload_shares_shell_bank {
                 self.result_exc_call_results
-                    .push((result_var.clone(), suffix, payload_ty));
+                    .push(crate::front::result_exc::ResultExcCall {
+                        result: result_var.clone(),
+                        suffix,
+                        payload_ty,
+                        sum: crate::front::result_exc::exception_sum_of_result(
+                            &call.dest.ty,
+                            self.llbc,
+                            self.static_addrs.error_carrier,
+                        ),
+                    });
             }
         }
         // Capture `Iterator::next()` results (`Option<T>`-typed) for the

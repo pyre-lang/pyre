@@ -447,7 +447,7 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// lowering completes.  The paired `Option<String>` is the callee's
     /// per-instantiation `<…>` suffix (Ref-shaped payloads only) keying
     /// the rebuilt `Ok`/`Err` shells' ClassDef per instantiation.
-    pub(in crate::front::mir) result_exc_call_results: Vec<(Variable, Option<String>, ValueType)>,
+    pub(in crate::front::mir) result_exc_call_results: Vec<crate::front::result_exc::ResultExcCall>,
     /// Result `Variable`s of `RBigInt::toint` / `i64::try_from(&RBigInt)`
     /// intercepts retargeted to `jit_bigint_toint`. The OverflowError rewrite
     /// (`front::result_exc`) stamps `LastException` after the body lowers.

@@ -4340,6 +4340,29 @@ impl Bookkeeper {
             })
     }
 
+    /// Whether `name` is a class of a minted `_exception_class_` hierarchy.
+    ///
+    /// The same spellings as [`crate::front::llbc_hints::exception_class_name_belongs`]:
+    /// the base qualname, a variant qualname, an enum path
+    /// [`crate::front::llbc_hints::exception_class_enum_path_matches`]
+    /// accepts, and `owner::variant` for a declared variant. Empty when
+    /// nothing has been minted.
+    pub fn exception_class_name_belongs(&self, name: &str) -> bool {
+        let hierarchies = self.exception_class_hierarchies.borrow();
+        hierarchies.iter().any(|hierarchy| {
+            let variants: Vec<&str> = hierarchy
+                .variants
+                .iter()
+                .map(|(variant, _)| variant.as_str())
+                .collect();
+            crate::front::llbc_hints::exception_class_variants_belong(
+                &hierarchy.enum_path,
+                &variants,
+                name,
+            )
+        })
+    }
+
     /// Literal variant class names of the hierarchy `enum_path` names.
     ///
     /// Empty when no hierarchy matches. The strings are

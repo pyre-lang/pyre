@@ -1715,7 +1715,7 @@ pub(in crate::front::mir) fn spill_address_payloads(
     }
     // The carrier's `Err` is not the call result. A nested
     // `Result<T, Carrier>` is the same ABI for that `Err`.
-    if crate::front::result_exc::tyref_is_result_of_carrier(ty, llbc, spec) {
+    if crate::front::result_exc::tyref_lowers_as_result_exc(ty, llbc, spec) {
         return match crate::front::result_exc::tyref_result_ok(ty, llbc) {
             Some(ok) => SpillPayloads::Types(vec![ok]),
             None => SpillPayloads::Unclassified,
@@ -5078,9 +5078,7 @@ pub(in crate::front::mir) fn output_is_raw_scalar_address(
     if raw_scalar_address_value_type(output, llbc).is_some() {
         return true;
     }
-    if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec)
-        && let Some(ok) = crate::front::result_exc::tyref_result_ok(output, llbc)
-    {
+    if let Some(ok) = crate::front::result_exc::result_exc_projected_ok(output, llbc, spec) {
         return raw_scalar_address_value_type(&ok, llbc).is_some();
     }
     false
@@ -5101,11 +5099,7 @@ pub(in crate::front::mir) fn output_is_raw_address_word(
     if output_is_raw_scalar_address(output, llbc, spec) {
         return true;
     }
-    let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
-        crate::front::result_exc::tyref_result_ok(output, llbc)
-    } else {
-        None
-    };
+    let payload = crate::front::result_exc::result_exc_projected_ok(output, llbc, spec);
     let kind_src = payload.as_ref().unwrap_or(output);
     ty_is_raw_address(kind_src, llbc, gc_struct_ids, raw_alloc_flavor_structs)
 }

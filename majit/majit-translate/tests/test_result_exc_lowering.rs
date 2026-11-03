@@ -58,9 +58,13 @@ fn lower_function_to_runtime_edges(
     function_name: &str,
 ) -> Result<majit_translate::model::FunctionGraph, majit_translate::front::mir::LowerError> {
     let mut graph = lower_function(llbc, function_name)?;
+    let hints = majit_translate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
+        std::slice::from_ref(llbc),
+    );
     majit_translate::codewriter::error_carrier_edges::lower_error_carrier_edges(
         &mut graph,
         &majit_translate::OwnedErrorCarrierSpec::own(ERROR_CARRIER),
+        &|name| majit_translate::front::llbc_hints::exception_class_name_belongs(&hints, name),
     );
     Ok(graph)
 }
