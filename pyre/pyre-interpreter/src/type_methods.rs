@@ -3465,10 +3465,12 @@ enum IntOrLong<'a> {
 /// `-sys.maxint-1` does not overflow. Emits the `0b`/`0o`/`0x` prefix and a
 /// leading `-` (e.g. `-0x2a`); `_format_int_or_long` strips them again with
 /// `skip_leading`.
+#[majit_macros::jit_elidable]
 fn int_to_base(base: u32, value: i64) -> String {
     if base == 10 {
         return value.to_string();
     }
+    // This part is slow.
     let negative = value < 0;
     let base = base as u64;
     let mut value = value as u64;
@@ -4447,6 +4449,9 @@ fn format_char(num: IntOrLong<'_>, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyErro
         ));
     }
     if p.alt_form {
+        // [3.15-spec] newformat.py _format_int_or_long raises "Alternate form (#) not allowed
+        // with 'c' presentation type"; the pinned stdlib's int.__format__ raises this message
+        // (measured on 3.15.0).
         return Err(crate::PyError::value_error(
             "Alternate form (#) not allowed with integer format specifier 'c'",
         ));
@@ -4461,6 +4466,8 @@ fn format_char(num: IntOrLong<'_>, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyErro
     }
     .filter(|code| core::ffi::c_long::try_from(*code).is_ok());
     let Some(code) = code else {
+        // [3.15-spec] newformat.py _format_int_or_long raises "int too large to convert to int";
+        // the pinned stdlib's int.__format__ raises this message (measured on 3.15.0).
         return Err(crate::PyError::overflow_error(
             "Python int too large to convert to C long",
         ));
@@ -4468,6 +4475,9 @@ fn format_char(num: IntOrLong<'_>, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyErro
     let cp = match u32::try_from(code).ok().and_then(CodePoint::from_u32) {
         Some(cp) => cp,
         None => {
+            // [3.15-spec] newformat.py _format_int_or_long raises "%c arg not in
+            // range(0x10ffff)"; the pinned stdlib's int.__format__ raises this message (measured on
+            // 3.15.0).
             return Err(crate::PyError::overflow_error(
                 "%c arg not in range(0x110000)",
             ));

@@ -1358,10 +1358,10 @@ two-phase-annotate-skipped	pyre_interpreter::type_methods::extend_from_tuple
 two-phase-annotate-skipped	pyre_interpreter::type_methods::format_char
 two-phase-annotate-skipped	pyre_interpreter::type_methods::format_char::<Impl>::call_once
 two-phase-annotate-skipped	pyre_interpreter::type_methods::format_complex_component
+two-phase-annotate-skipped	pyre_interpreter::type_methods::format_int_or_long_kind
+two-phase-annotate-skipped	pyre_interpreter::type_methods::format_int_or_long_kind::<Impl>::call_once
 two-phase-annotate-skipped	pyre_interpreter::type_methods::format_must_return_str
 two-phase-annotate-skipped	pyre_interpreter::type_methods::format_nonfinite
-two-phase-annotate-skipped	pyre_interpreter::type_methods::format_rbigint
-two-phase-annotate-skipped	pyre_interpreter::type_methods::format_rbigint::<Impl>::call_once
 two-phase-annotate-skipped	pyre_interpreter::type_methods::format_w
 two-phase-annotate-skipped	pyre_interpreter::type_methods::format_w_slow
 two-phase-annotate-skipped	pyre_interpreter::type_methods::format_with_spec
