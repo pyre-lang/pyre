@@ -122,7 +122,6 @@ fn guard_failure_is_returned_without_fallback_or_recompilation() {
     // Native guard assembly writes AbstractFailDescr.rd_locs. Use the real
     // shared guard descriptor, not SimpleFailDescr (which lacks that slot).
     let descr = majit_backend::make_resume_guard_descr_typed(vec![Type::Int]);
-    let fail_index = descr.as_fail_descr().unwrap().fail_index();
     let guard = Op::with_descr(
         OpCode::GuardTrue,
         &[Operand::from_bound_op(&compare)],
@@ -147,7 +146,6 @@ fn guard_failure_is_returned_without_fallback_or_recompilation() {
         assert_eq!(result.typed_outputs, vec![Value::Int(input)]);
         if input <= 0 {
             assert!(Arc::ptr_eq(&result.descr_arc, &descr));
-            assert_eq!(result.fail_index, fail_index);
             let owner = majit_backend::descr_owning_jct(result.descr_arc.as_fail_descr().unwrap())
                 .expect(
                     "a guard must resolve its owner through the ordinary PyPy descriptor chain",

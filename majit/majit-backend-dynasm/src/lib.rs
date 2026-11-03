@@ -216,8 +216,7 @@ use std::sync::OnceLock;
 /// The receiving handler recovers the failed descr from `descr_addr`
 /// via `Backend::fail_descr_arc_from_addr` (`history.py:125`
 /// `cpu.get_latest_descr` parity) and derives the resume identity
-/// (`jct.green_key` / `descr.trace_id()` /
-/// `descr.fail_index_per_trace()`) from that Arc, mirroring
+/// from that descr object, mirroring
 /// `compile.py resume_in_blackhole(descr, deadframe)` where the descr
 /// is the sole identity carrier.  No surrogate triple crosses the C-ABI.
 ///
@@ -237,8 +236,7 @@ pub type BlackholeFn = fn(usize, *mut jitframe::JitFrame) -> Option<i64>;
 /// The receiving handler recovers the failed descr from `descr_addr`
 /// via `Backend::fail_descr_arc_from_addr` (`history.py:125`
 /// `cpu.get_latest_descr` parity) and derives the bridge source
-/// identity (`jct.green_key` / `descr.trace_id()` /
-/// `descr.fail_index_per_trace()`) from that Arc, mirroring
+/// identity from that descr object, mirroring
 /// `pyjitpl.py handle_guard_failure(self, resumedescr,
 /// deadframe)`.  No surrogate triple crosses the C-ABI.
 /// `pyjitpl.py handle_guard_failure(self, resumedescr, deadframe)`.
@@ -654,9 +652,6 @@ fn handle_fail_resume_guard(
     frame_ptr: *mut jitframe::JitFrame,
     _outer_green_key: u64,
 ) -> i64 {
-    let trace_id = descr.trace_id();
-    let fail_index = descr.fail_index_per_trace();
-
     let guard_value_operand = majit_backend::guard_value_counter_slot(descr)
         .map(|slot| unsafe { llmodel::get_int_value_direct(frame_ptr, slot) as i64 });
 
@@ -725,14 +720,16 @@ fn handle_fail_resume_guard(
     if let Some(bh_result) = bh_result {
         if majit_log_enabled() {
             eprintln!(
-                "[dynasm][ca-helper] resume-guard trace_id={trace_id} fail_index={fail_index} result=0x{bh_result:x}"
+                "[dynasm][ca-helper] resume-guard descr=0x{:x} result=0x{bh_result:x}",
+                descr as *const dyn majit_ir::FailDescr as *const () as usize,
             );
         }
         return bh_result;
     }
     if majit_log_enabled() {
         eprintln!(
-            "[dynasm][ca-helper] resume-guard trace_id={trace_id} fail_index={fail_index} fell through to 0 descr=0x{descr_raw:x} frame={frame_ptr:p} guard_exc=0x{:x}",
+            "[dynasm][ca-helper] resume-guard descr=0x{:x} fell through to 0 descr=0x{descr_raw:x} frame={frame_ptr:p} guard_exc=0x{:x}",
+            descr as *const dyn majit_ir::FailDescr as *const () as usize,
             unsafe { (*frame_ptr).jf_guard_exc }
         );
     }

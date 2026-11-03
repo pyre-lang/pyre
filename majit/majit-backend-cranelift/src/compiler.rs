@@ -2110,9 +2110,8 @@ fn rebuild_state_after_failure_dispatch(
         panic!(
             "cranelift_resumedata_deopt callback returned false for a runtime guard \
              failure — descr's meta_descr is not a ResumeGuardDescr or rd_numb is empty. \
-             trace_id={} fail_index_per_trace={} fail_arg_types_len={}",
-            fd.trace_id(),
-            fd.fail_index_per_trace(),
+             descr=0x{:x} fail_arg_types_len={}",
+            fd as *const dyn FailDescr as *const () as usize,
             fail_arg_types.len(),
         );
     }
@@ -19882,12 +19881,8 @@ impl CraneliftBackend {
         if majit_log_enabled() {
             let fail_descr_preview: Vec<(u32, usize)> = fail_descrs
                 .iter()
-                .map(|descr| {
-                    (
-                        as_fd(descr).fail_index_per_trace(),
-                        Arc::as_ptr(descr) as *const () as usize,
-                    )
-                })
+                .enumerate()
+                .map(|(i, descr)| (i as u32, Arc::as_ptr(descr) as *const () as usize))
                 .collect();
             eprintln!(
                 "[jit][compile-loop] trace_id={} header_pc={} entry={:p} body={:p} \
@@ -22256,8 +22251,6 @@ impl majit_backend::Backend for CraneliftBackend {
                     typed_outputs: typed_result,
                     savedata,
                     exception_value,
-                    fail_index: descr.fail_index(),
-                    trace_id: descr.trace_id(),
                     is_finish: descr.is_finish(),
                     is_exit_frame_with_exception: descr.is_exit_frame_with_exception(),
                     status: descr.get_status(),
@@ -22342,14 +22335,11 @@ impl majit_backend::Backend for CraneliftBackend {
                     }
                 }
 
-                let trace_id = fail_descr_fd.trace_id();
                 return majit_backend::RawExecResult {
                     outputs,
                     typed_outputs,
                     savedata,
                     exception_value: exception,
-                    fail_index,
-                    trace_id,
                     is_finish: true,
                     is_exit_frame_with_exception: fail_descr_fd.is_exit_frame_with_exception(),
                     status: fail_descr_fd.get_status(),
@@ -22370,9 +22360,9 @@ impl majit_backend::Backend for CraneliftBackend {
             assert!(
                 fail_descr_bridge_ref(fail_descr_fd).is_none(),
                 "execute_token_ints_raw observed a bridge attached to a \
-                 guard exit (trace_id={}, fail_index={}); in-code bridge \
+                 guard exit (descr=0x{:x}, exit={}); in-code bridge \
                  dispatch should have intercepted it",
-                fail_descr_fd.trace_id(),
+                fail_descr_fd as *const dyn FailDescr as *const () as usize,
                 fail_index,
             );
 
@@ -22402,14 +22392,11 @@ impl majit_backend::Backend for CraneliftBackend {
                 }
             }
 
-            let trace_id = fail_descr_fd.trace_id();
             return majit_backend::RawExecResult {
                 outputs,
                 typed_outputs,
                 savedata,
                 exception_value: exception,
-                fail_index,
-                trace_id,
                 is_finish: false,
                 is_exit_frame_with_exception: fail_descr_fd.is_exit_frame_with_exception(),
                 status: fail_descr_fd.get_status(),
@@ -29401,7 +29388,7 @@ mod tests {
 
         let raw = backend.execute_token_ints_raw(&token, &[1]);
         assert!(!raw.is_finish);
-        assert_eq!(raw.fail_index, 0);
+        assert_eq!(raw.descr_arc.as_fail_descr().unwrap().fail_index(), 0);
         assert_eq!(raw.outputs, vec![1]);
         assert_eq!(raw.typed_outputs, vec![Value::Int(1)]);
         assert_eq!(raw.savedata, None);
@@ -31965,7 +31952,7 @@ mod tests {
 
         let raw = backend.execute_token_ints_raw(&token, &[10, 1]);
         assert!(!raw.is_finish);
-        assert_eq!(raw.fail_index, 0);
+        assert_eq!(raw.descr_arc.as_fail_descr().unwrap().fail_index(), 0);
         assert_eq!(raw.outputs, vec![1, 10]);
         assert_eq!(raw.typed_outputs, vec![Value::Int(1), Value::Int(10)]);
         assert_eq!(raw.savedata, Some(GcRef(0xDADA)));

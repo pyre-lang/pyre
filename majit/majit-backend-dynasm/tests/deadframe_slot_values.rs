@@ -60,10 +60,9 @@ fn check_case(case: &Case) -> Vec<u16> {
     // If they left through different exits the value comparison below would be
     // meaningless, so establish that first.
     assert_eq!(
-        (raw.trace_id, raw.fail_index, raw.is_finish),
+        (majit_ir::descr_identity(&raw.descr_arc), raw.is_finish),
         (
-            descr.trace_id(),
-            descr.fail_index_per_trace(),
+            descr as *const dyn majit_ir::FailDescr as *const () as usize,
             descr.is_finish()
         ),
         "{name}: the raw run and the deadframe run left through different exits"

@@ -3305,16 +3305,15 @@ fn store_frame_info(token: &JitCellToken, depth: isize, size: isize) {
 fn bridge_code(token: &JitCellToken) -> (Vec<u8>, usize) {
     let clt = token.compiled_loop_token().expect("compiled loop token");
     let blocks = clt.asmmemmgr_blocks.lock();
+    // asmmemmgr_blocks holds only bridges; the loop's CompiledCode lives on the token.
     for block in blocks.iter().rev() {
         if let Some(code) =
             block.downcast_ref::<majit_backend_dynasm::x86::assembler::CompiledCode>()
         {
-            if code.source_guard.is_some() {
-                return (
-                    code.buffer.to_vec(),
-                    code.frame_depth.load(Ordering::Acquire),
-                );
-            }
+            return (
+                code.buffer.to_vec(),
+                code.frame_depth.load(Ordering::Acquire),
+            );
         }
     }
     panic!("bridge CompiledCode missing");
