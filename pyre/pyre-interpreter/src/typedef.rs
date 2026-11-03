@@ -32068,25 +32068,48 @@ fn convert_set_to_frozenset(w_obj: PyObjectRef) -> Option<PyObjectRef> {
     }
 }
 
+/// `W_BaseSetObject.descr_contains` / `_discard_from_set`:
+/// `e.match(space, space.w_TypeError)`.
+fn set_type_error_matched(err: &mut crate::PyError) -> bool {
+    if let Some(w_type_error) = crate::baseobjspace::cached_type_error() {
+        err.match_(pyre_object::PY_NULL, w_type_error)
+    } else {
+        err.kind == crate::PyErrorKind::TypeError
+    }
+}
+
 /// `setobject.py EmptySetStrategy.has_key` hashes the key ("make sure
 /// the key is hashable, issue 3824"), so membership hashes even against an
 /// empty set, unlike removal.
 ///
 /// `setobject.py W_BaseSetObject.descr_contains`.
 pub(crate) fn set_descr_contains(
-    mut w_set: PyObjectRef,
-    mut w_other: PyObjectRef,
+    w_set: PyObjectRef,
+    w_other: PyObjectRef,
 ) -> Result<bool, crate::PyError> {
-    match pyre_object::with_roots!(w_other, w_set => crate::type_methods::set_contains_checked(w_set, w_other))
-    {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let other_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_other);
+    let set_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_set);
+    match crate::type_methods::set_contains_checked(
+        pyre_object::gc_roots::shadow_stack_get(set_slot),
+        pyre_object::gc_roots::shadow_stack_get(other_slot),
+    ) {
         Ok(found) => Ok(found),
-        Err(e) => {
-            if e.kind == crate::PyErrorKind::TypeError
-                && let Some(w_f) = convert_set_to_frozenset(w_other)
-            {
-                return crate::type_methods::set_contains_checked(w_set, w_f);
+        Err(mut e) => {
+            if !set_type_error_matched(&mut e) {
+                return Err(e);
             }
-            Err(e)
+            let Some(w_f) =
+                convert_set_to_frozenset(pyre_object::gc_roots::shadow_stack_get(other_slot))
+            else {
+                return Err(e);
+            };
+            crate::type_methods::set_contains_checked(
+                pyre_object::gc_roots::shadow_stack_get(set_slot),
+                w_f,
+            )
         }
     }
 }
@@ -32109,20 +32132,27 @@ fn set_remove(w_set: PyObjectRef, w_item: PyObjectRef) -> Result<bool, crate::Py
 /// `setobject.py W_BaseSetObject._discard_from_set`. The trailing
 /// `switch_to_empty_strategy` runs inside `w_set_discard_key_checked` when a
 /// removal leaves the live table empty.
-fn set_discard_from_set(
-    mut w_set: PyObjectRef,
-    mut w_item: PyObjectRef,
-) -> Result<bool, crate::PyError> {
-    match pyre_object::with_roots!(w_item, w_set => set_remove(w_set, w_item)) {
+fn set_discard_from_set(w_set: PyObjectRef, w_item: PyObjectRef) -> Result<bool, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let item_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_item);
+    let set_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_set);
+    match set_remove(
+        pyre_object::gc_roots::shadow_stack_get(set_slot),
+        pyre_object::gc_roots::shadow_stack_get(item_slot),
+    ) {
         Ok(deleted) => Ok(deleted),
-        Err(e) => {
-            if e.kind != crate::PyErrorKind::TypeError {
+        Err(mut e) => {
+            if !set_type_error_matched(&mut e) {
                 return Err(e);
             }
-            match convert_set_to_frozenset(w_item) {
-                None => Err(e),
-                Some(w_f) => set_remove(w_set, w_f),
-            }
+            let Some(w_f) =
+                convert_set_to_frozenset(pyre_object::gc_roots::shadow_stack_get(item_slot))
+            else {
+                return Err(e);
+            };
+            set_remove(pyre_object::gc_roots::shadow_stack_get(set_slot), w_f)
         }
     }
 }
