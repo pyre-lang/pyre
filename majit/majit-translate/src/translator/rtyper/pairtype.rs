@@ -106,6 +106,10 @@ pub enum ReprClassId {
     BuiltinMethodRepr,
     /// `rpbc.py SingleFrozenPBCRepr`.
     SingleFrozenPBCRepr,
+    /// `rpbc.py MultipleFrozenPBCReprBase(CanBeNull, Repr)` — pairtype
+    /// class for `pairtype(MultipleFrozenPBCReprBase, SingleFrozenPBCRepr)`.
+    /// `CanBeNull` is a mixin and has no tag.
+    MultipleFrozenPBCReprBase,
     /// `rpbc.py MultipleUnrelatedFrozenPBCRepr`.
     MultipleUnrelatedFrozenPBCRepr,
     /// `rpbc.py MultipleFrozenPBCRepr`.
@@ -209,6 +213,8 @@ impl ReprClassId {
     /// |---|---|
     /// | `BoolRepr` | `BoolRepr → IntegerRepr → FloatRepr → Repr` |
     /// | `IntegerRepr` | `IntegerRepr → FloatRepr → Repr` |
+    /// | `MultipleFrozenPBCRepr` | `MultipleFrozenPBCRepr → MultipleFrozenPBCReprBase → Repr` |
+    /// | `MultipleUnrelatedFrozenPBCRepr` | `MultipleUnrelatedFrozenPBCRepr → MultipleFrozenPBCReprBase → Repr` |
     /// | any other | `Self → Repr` |
     pub fn mro(self) -> &'static [ReprClassId] {
         use ReprClassId::*;
@@ -233,8 +239,13 @@ impl ReprClassId {
             BuiltinFunctionRepr => &[BuiltinFunctionRepr, Repr],
             BuiltinMethodRepr => &[BuiltinMethodRepr, Repr],
             SingleFrozenPBCRepr => &[SingleFrozenPBCRepr, Repr],
-            MultipleUnrelatedFrozenPBCRepr => &[MultipleUnrelatedFrozenPBCRepr, Repr],
-            MultipleFrozenPBCRepr => &[MultipleFrozenPBCRepr, Repr],
+            MultipleFrozenPBCReprBase => &[MultipleFrozenPBCReprBase, Repr],
+            MultipleUnrelatedFrozenPBCRepr => &[
+                MultipleUnrelatedFrozenPBCRepr,
+                MultipleFrozenPBCReprBase,
+                Repr,
+            ],
+            MultipleFrozenPBCRepr => &[MultipleFrozenPBCRepr, MultipleFrozenPBCReprBase, Repr],
             MethodOfFrozenPBCRepr => &[MethodOfFrozenPBCRepr, Repr],
             MethodsPBCRepr => &[MethodsPBCRepr, Repr],
             ControlledInstanceRepr => &[ControlledInstanceRepr, Repr],
@@ -422,18 +433,49 @@ fn dispatch_convert_from_to(
         // FunctionRepr).convert_from_to: a frozen-PBC pointer feeding a
         // constant-function repr drops its runtime value and materialises
         // the target's own `s_pbc.const` at Void.
-        //
-        // The other five frozen-PBC pairs upstream registers
-        // (`MultipleFrozenPBCRepr` × `MultipleUnrelatedFrozenPBCRepr` /
-        // `MultipleFrozenPBCRepr`, `SingleFrozenPBCRepr` ×
-        // `MultipleFrozenPBCRepr`, `MultipleFrozenPBCReprBase` ×
-        // `SingleFrozenPBCRepr`, `FunctionRepr` ×
-        // `MultipleFrozenPBCRepr`) are still unported. The
-        // `MultipleFrozenPBCReprBase` one additionally needs that base in
-        // `pair_mro`, which currently sends both `Multiple*` reprs
-        // straight to `Repr`.
         (MultipleFrozenPBCRepr, FunctionRepr) => {
             super::rpbc::pair_multiple_frozen_pbc_function_repr_convert_from_to(r_to)
+        }
+        // rpbc.py — pairtype(MultipleFrozenPBCRepr,
+        // MultipleUnrelatedFrozenPBCRepr).convert_from_to:
+        // `llops.genop('cast_ptr_to_adr', [v], resulttype=Address)`.
+        (MultipleFrozenPBCRepr, MultipleUnrelatedFrozenPBCRepr) => {
+            super::rpbc::pair_multiple_frozen_pbc_multiple_unrelated_convert_from_to(v, llops)
+        }
+        // rpbc.py — pairtype(MultipleFrozenPBCRepr,
+        // MultipleFrozenPBCRepr).convert_from_to: identity when
+        // `access_set` matches, else NotImplemented.
+        (MultipleFrozenPBCRepr, MultipleFrozenPBCRepr) => {
+            super::rpbc::pair_multiple_frozen_pbc_multiple_frozen_pbc_convert_from_to(
+                r_from, r_to, v,
+            )
+        }
+        // rpbc.py — pairtype(SingleFrozenPBCRepr,
+        // MultipleFrozenPBCRepr).convert_from_to: access matches ⇒
+        // `Constant(r_pbc2.convert_desc(frozendesc1), r_pbc2.lowleveltype)`.
+        (SingleFrozenPBCRepr, MultipleFrozenPBCRepr) => {
+            super::rpbc::pair_single_frozen_pbc_multiple_frozen_pbc_convert_from_to(r_from, r_to)
+        }
+        // rpbc.py — pairtype(MultipleFrozenPBCReprBase,
+        // SingleFrozenPBCRepr).convert_from_to:
+        // `inputconst(Void, r_pbc2.frozendesc)`. Reached via MRO from
+        // both MultipleFrozenPBCRepr and MultipleUnrelatedFrozenPBCRepr.
+        (MultipleFrozenPBCReprBase, SingleFrozenPBCRepr) => {
+            super::rpbc::pair_multiple_frozen_pbc_base_single_frozen_pbc_convert_from_to(r_to)
+        }
+        // rpbc.py — pairtype(FunctionRepr,
+        // MultipleFrozenPBCRepr).convert_from_to: constant function ⇒
+        // `Constant(r_frozen2.convert_const(r_fn1.s_pbc.const), lltype)`.
+        (FunctionRepr, MultipleFrozenPBCRepr) => {
+            super::rpbc::pair_function_repr_multiple_frozen_pbc_convert_from_to(r_from, r_to)
+        }
+        // rpbc.py — pairtype(MethodOfFrozenPBCRepr,
+        // MethodOfFrozenPBCRepr).convert_from_to: delegates to
+        // `pair(r_from.r_im_self, r_to.r_im_self).convert_from_to`.
+        (MethodOfFrozenPBCRepr, MethodOfFrozenPBCRepr) => {
+            super::rpbc::pair_method_of_frozen_method_of_frozen_convert_from_to(
+                r_from, r_to, v, llops,
+            )
         }
         // rpbc.py — pairtype(FunctionsPBCRepr,
         // FunctionsPBCRepr).convert_from_to: upstream identity if
@@ -1476,6 +1518,37 @@ mod tests {
         let mro = pair_mro(NoneRepr, IntegerRepr);
         assert_eq!(mro.first().copied(), Some((NoneRepr, IntegerRepr)));
         assert_eq!(mro.last().copied(), Some((Repr, Repr)));
+    }
+
+    #[test]
+    fn pair_mro_multiple_frozen_pbc_walks_base_then_repr() {
+        // rpbc.py `class MultipleFrozenPBCReprBase(CanBeNull, Repr)` —
+        // `CanBeNull` is a mixin and is not a pairtype tag. Both
+        // Multiple subclasses walk through the base so
+        // `pairtype(MultipleFrozenPBCReprBase, SingleFrozenPBCRepr)`
+        // resolves.
+        use ReprClassId::*;
+        assert_eq!(
+            MultipleFrozenPBCRepr.mro(),
+            &[MultipleFrozenPBCRepr, MultipleFrozenPBCReprBase, Repr]
+        );
+        assert_eq!(
+            MultipleUnrelatedFrozenPBCRepr.mro(),
+            &[
+                MultipleUnrelatedFrozenPBCRepr,
+                MultipleFrozenPBCReprBase,
+                Repr
+            ]
+        );
+        let mro = pair_mro(MultipleFrozenPBCRepr, SingleFrozenPBCRepr);
+        assert_eq!(
+            mro.first().copied(),
+            Some((MultipleFrozenPBCRepr, SingleFrozenPBCRepr))
+        );
+        assert!(mro.contains(&(MultipleFrozenPBCReprBase, SingleFrozenPBCRepr)));
+        assert_eq!(mro.last().copied(), Some((Repr, Repr)));
+        let mro_mu = pair_mro(MultipleUnrelatedFrozenPBCRepr, SingleFrozenPBCRepr);
+        assert!(mro_mu.contains(&(MultipleFrozenPBCReprBase, SingleFrozenPBCRepr)));
     }
 
     #[test]

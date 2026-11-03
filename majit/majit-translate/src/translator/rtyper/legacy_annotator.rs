@@ -1088,6 +1088,13 @@ fn var_concretetype_is_ccharp(var: &Variable) -> bool {
     )
 }
 
+/// Skip-walker refusal for a merged Frozen PBC the four-kind bank cannot
+/// represent. `TyperError` Display / `panic!("{e}")` emit this text as the
+/// whole message (or as a prefix when `where` is attached). Dual-gate
+/// comparison matches this const, not a duplicate literal.
+pub(crate) const MULTIPLE_FROZEN_PBC_UNSUPPORTED: &str =
+    "MultipleFrozenPBCRepr is unsupported on this path (getFrozenPBCRepr)";
+
 /// `getFrozenPBCRepr`: `follow_link` / `mergeinputargs` union incoming
 /// annotations (`bookkeeper.immutablevalue` for a constant, `annotation(v)`
 /// for a variable). A FrozenDesc union with more than one desc,
@@ -1096,7 +1103,7 @@ fn var_concretetype_is_ccharp(var: &Variable) -> bool {
 /// that Ptr/Address, so refuse. Function/method/class PBCs are not this
 /// repr (`FunctionsPBCRepr` / `MethodsPBCRepr` / `ClassesPBCRepr`).
 pub(crate) fn multiple_frozen_pbc_unsupported() -> TyperError {
-    TyperError::message("MultipleFrozenPBCRepr is unsupported on this path (getFrozenPBCRepr)")
+    TyperError::message(MULTIPLE_FROZEN_PBC_UNSUPPORTED)
 }
 
 /// `getFrozenPBCRepr` decides from the dest annotation after
