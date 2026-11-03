@@ -360,7 +360,18 @@ pub(crate) fn dual_gate_check_with_registry(
         // comparison can still see the kinds the legacy walker *did*
         // resolve; leftover Unknown stays Unknown and is accepted as a
         // real-path refinement below.
-        if !msg.contains("setconcretetype: no binding") {
+        //
+        // The real path already chose the repr (`rpbc.py` `getFrozenPBCRepr`);
+        // the legacy walker has no Ptr/Address repr; upstream
+        // `codewriter.py` `transform_graph_to_jitcode` consumes the rtyper
+        // graph with no baseline. Match only the helper's own message after
+        // `TyperError` formatting (`panic!("{e}")` Display is the const as
+        // a prefix / whole message). `merge_some_pbc` may append the same
+        // text to a genuine UnionError (mixed Frozen+Function kinds); that
+        // string does not start with the const, so it stays `Err`.
+        if !msg.contains("setconcretetype: no binding")
+            && !msg.starts_with(super::legacy_annotator::MULTIPLE_FROZEN_PBC_UNSUPPORTED)
+        {
             return Err(format!(
                 "dual-gate baseline panicked (legacy walker crashed before \
                  comparison could run — comparison cannot validate the real \
@@ -9879,6 +9890,237 @@ mod tests {
              turns a build failure into a silent legacy-walker recovery"
         );
         assert!(!is_known_unported(msg));
+    }
+
+    fn repr_const(
+        handle: &std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr>,
+    ) -> ConstValue {
+        ConstValue::Repr(crate::flowspace::model::ReprConst::new(
+            std::sync::Arc::clone(handle),
+        ))
+    }
+
+    fn two_pred_const_phi(
+        name: &str,
+        left: ConstValue,
+        right: ConstValue,
+    ) -> (LegacyGraph, Variable) {
+        use crate::model::OpKind;
+        let mut graph = LegacyGraph::new(name);
+        let pred1 = graph.create_block();
+        let pred2 = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        // Startblock inputarg + Input op, same shape as
+        // `int_identity_getter`. A body `Input` that is not an
+        // inputarg is Skip-classified (`adapter cross-block body Input`).
+        let cond = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "switch".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph
+            .block_mut(graph.startblock)
+            .inputargs
+            .push(cond.clone());
+        setbinding(&cond, ValueType::Bool);
+        graph.set_branch(graph.startblock, cond, pred1, vec![], pred2, vec![]);
+        graph.set_goto_mixed(pred1, join, vec![LinkArg::Const(Constant::new(left))]);
+        graph.set_goto_mixed(pred2, join, vec![LinkArg::Const(Constant::new(right))]);
+        // `bool` of the phi keeps the join inputarg live for rtyping
+        // (`MultipleFrozenPBCRepr.rtype_bool` / `CanBeNull.rtype_bool`).
+        let _ = graph
+            .push_op_var(
+                join,
+                OpKind::UnaryOp {
+                    op: "bool".into(),
+                    operand: phi.clone(),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(join, Some(phi.clone()));
+        (graph, phi)
+    }
+
+    /// Two FrozenDesc `_freeze_` instances join at a phi. The real
+    /// path picks `MultipleFrozenPBCRepr` (`rpbc.py` `getFrozenPBCRepr`);
+    /// the legacy walker refuses with [`MULTIPLE_FROZEN_PBC_UNSUPPORTED`].
+    /// Dual-gate comparison treats that refusal like leftover Unknown.
+    #[test]
+    fn dual_gate_frozen_pbc_phi_matches_multiple_frozen_repr() {
+        use crate::annotator::description::DescEntry;
+        use crate::translator::rtyper::legacy_annotator::MULTIPLE_FROZEN_PBC_UNSUPPORTED;
+        use std::sync::Arc;
+
+        let _lock = anchor_lock();
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        // Two `_freeze_` instances of one class share `queryattrfamily() == None`.
+        let cls = HostObject::new_class("owner.FrozenPbcPhi", vec![]);
+        cls.class_set(
+            "_freeze_",
+            ConstValue::HostObject(HostObject::new_native_callable(
+                "owner.FrozenPbcPhi._freeze_",
+                Arc::new(|_| Ok(ConstValue::Bool(true))),
+            )),
+        );
+        let left = ConstValue::HostObject(HostObject::new_instance(cls.clone(), vec![]));
+        let right = ConstValue::HostObject(HostObject::new_instance(cls, vec![]));
+        let d1 = registry
+            .bookkeeper()
+            .getdesc_for_const(&left)
+            .expect("freeze instance is a FrozenDesc");
+        let d2 = registry
+            .bookkeeper()
+            .getdesc_for_const(&right)
+            .expect("freeze instance is a FrozenDesc");
+        assert!(matches!(d1, DescEntry::Frozen(_)));
+        assert!(matches!(d2, DescEntry::Frozen(_)));
+
+        let (graph, phi) = two_pred_const_phi("frozen_pbc_phi", left, right);
+        let graphs = crate::codewriter::call::GraphStore::default();
+        let outcome = dual_gate_check_with_registry(&graph, &registry, &graphs)
+            .unwrap_or_else(|e| panic!("dual-gate must not Err, got {e}"));
+        let DualGateOutcome::Match {
+            real_value_to_var,
+            real_constants,
+        } = outcome
+        else {
+            panic!("frozen-PBC phi must Match, got {outcome:?}");
+        };
+
+        let typed = real_value_to_var
+            .get(&phi)
+            .expect("phi has a real-path twin");
+        let (_, rtyper) = registry
+            .session_if_started()
+            .expect("dual-gate started the session");
+        let frozen_pbc_repr = |v: &Variable| {
+            if v.annotation.borrow().is_none() {
+                return None;
+            }
+            let r = rtyper.bindingrepr(&Hlvalue::Variable(v.clone())).ok()?;
+            matches!(
+                r.class_name(),
+                "MultipleFrozenPBCRepr" | "MultipleUnrelatedFrozenPBCRepr"
+            )
+            .then_some(r)
+        };
+        let repr = frozen_pbc_repr(typed)
+            .or_else(|| real_value_to_var.values().find_map(frozen_pbc_repr))
+            .or_else(|| {
+                rtyper
+                    .pbc_reprs
+                    .borrow()
+                    .values()
+                    .find(|r| {
+                        matches!(
+                            r.class_name(),
+                            "MultipleFrozenPBCRepr" | "MultipleUnrelatedFrozenPBCRepr"
+                        )
+                    })
+                    .cloned()
+            })
+            .expect("real path chose MultipleFrozenPBCRepr / MU");
+        let ll = typed
+            .concretetype()
+            .or_else(|| real_constants.get(&phi).cloned())
+            .unwrap_or_else(|| repr.lowleveltype().clone());
+        assert_eq!(repr.class_name(), "MultipleFrozenPBCRepr");
+        assert_eq!(repr.lowleveltype(), &ll);
+        assert_eq!(
+            crate::model::getkind(&ll),
+            ConcreteType::Signed,
+            "MultipleFrozenPBCRepr / MU lowleveltype projects to the int bank"
+        );
+        let LowLevelType::Ptr(ptr) = repr.lowleveltype() else {
+            panic!(
+                "MultipleFrozenPBCRepr.lowleveltype is Ptr(Struct pbc), got {:?}",
+                repr.lowleveltype()
+            );
+        };
+        let resolved = match &ptr.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::ForwardReference(fwd) => {
+                fwd.resolved().expect("pbc_type become after setup")
+            }
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(body) => {
+                LowLevelType::Struct(Box::new(body.clone()))
+            }
+            other => panic!("Ptr TO must be Struct pbc, got {other:?}"),
+        };
+        let LowLevelType::Struct(body) = resolved else {
+            panic!("resolved pbc_type must be Struct, got {resolved:?}");
+        };
+        assert_eq!(body._name, "pbc");
+        assert_eq!(
+            body._gckind,
+            crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
+        );
+        assert!(
+            !is_known_unported(MULTIPLE_FROZEN_PBC_UNSUPPORTED),
+            "the refusal must not be an UNPORTED_CATEGORIES Skip"
+        );
+    }
+
+    /// A genuine UnionError (mixed Frozen+Function, or any other union
+    /// failure) must stay `Err`. `merge_some_pbc` may append the refusal
+    /// text; that formatted panic does not start with the const, so the
+    /// dual-gate baseline exemption does not apply.
+    #[test]
+    fn dual_gate_union_error_is_not_frozen_pbc_refusal() {
+        use crate::translator::rtyper::legacy_annotator::{
+            MULTIPLE_FROZEN_PBC_UNSUPPORTED, multiple_frozen_pbc_unsupported,
+        };
+        use crate::translator::rtyper::rmodel::{Repr, VoidRepr};
+
+        let helper = multiple_frozen_pbc_unsupported().to_string();
+        assert_eq!(helper, MULTIPLE_FROZEN_PBC_UNSUPPORTED);
+        assert!(
+            helper.starts_with(MULTIPLE_FROZEN_PBC_UNSUPPORTED),
+            "TyperError Display of the helper is the const"
+        );
+        let union = format!(
+            "frozen_union_error_phi: UnionError: Frozen ∪ FunctionType — \
+             mixing several kinds of PBCs; {MULTIPLE_FROZEN_PBC_UNSUPPORTED}"
+        );
+        assert!(
+            union.contains(MULTIPLE_FROZEN_PBC_UNSUPPORTED),
+            "merge_some_pbc appends the refusal to a UnionError"
+        );
+        assert!(
+            !union.starts_with(MULTIPLE_FROZEN_PBC_UNSUPPORTED),
+            "the appended UnionError must not match the helper prefix"
+        );
+
+        let _lock = anchor_lock();
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let handle: std::sync::Arc<dyn Repr> = std::sync::Arc::new(VoidRepr::new());
+        let frozen = repr_const(&handle);
+        let func_graph = empty_return_graph("mixed_kind_fn");
+        let func = source_graph_func(&func_graph);
+        let entry = registry.get_or_register_with_func(
+            FunctionPathKey::from_segments(["owner", "mixed_kind_fn"]),
+            Signature::new(vec![], None, None),
+            func,
+        );
+        let function = ConstValue::HostObject(entry.host_object.clone());
+        let (graph, _) = two_pred_const_phi("frozen_union_error_phi", frozen, function);
+        let graphs = crate::codewriter::call::GraphStore::default();
+        let err = dual_gate_check_with_registry(&graph, &registry, &graphs)
+            .expect_err("a genuine UnionError must stay Err");
+        assert!(
+            err.contains("UnionError") || err.contains("mixing several kinds"),
+            "expected a UnionError payload, got {err}"
+        );
     }
 
     /// An annotator half that fails leaves the unwind carrying its
