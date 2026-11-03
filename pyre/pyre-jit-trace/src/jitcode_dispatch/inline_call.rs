@@ -18227,24 +18227,49 @@ fn descend_generatorentry<Sym: WalkSym>(
 ///               residual_call_r_r  bh_send_ex_tail(result, generator) -> answer
 ///               -live-                        [r0 live]
 ///               ref_return         answer
+///               load_const_i       prompt = 0
+///               inline_call_ir_v   generator_frame_is_finished(prompt, gen, frame)
+///   after_teardown:
+///               -live-                        []
+///               load_const_r       result = NULL
+///               ref_return         result
 /// ```
+///
+/// The second section is `_send_ex` after `frame_is_finished()`
+/// (`generator.py` `GeneratorOrCoroutine._send_ex`): the helper is void, so
+/// a snapshot captured inside it resumes into this tail at `after_teardown`
+/// and the remaining ops return the null dest `jit_next` collapses
+/// StopIteration to. The forward walker does not dispatch this jitcode; it
+/// descends the helper under that parent and writes the same null dest.
 const SEND_EX_RESULT_REG: u16 = 0;
 const SEND_EX_GENERATOR_REG: u16 = 1;
+const SEND_EX_FRAME_REG: u16 = 2;
+const SEND_EX_PROMPT_REG: u16 = 0;
 const SEND_EX_PLACEHOLDER_CALLEE: u16 = 0;
+const GENERATOR_FRAME_IS_FINISHED_PATH: &str =
+    "pyre_interpreter::baseobjspace::generator_frame_is_finished";
 
 thread_local! {
-    static SEND_EX_LEVEL: std::cell::OnceCell<Option<(i32, usize)>> =
+    static SEND_EX_LEVEL: std::cell::OnceCell<Option<(i32, usize, usize)>> =
         const { std::cell::OnceCell::new() };
 }
 
-fn send_ex_continuation_level() -> Option<(i32, usize)> {
+fn send_ex_continuation_full() -> Option<(i32, usize, usize)> {
     SEND_EX_LEVEL.with(|cell| *cell.get_or_init(build_send_ex_continuation))
+}
+
+fn send_ex_continuation_level() -> Option<(i32, usize)> {
+    send_ex_continuation_full().map(|(index, resume_pc, _)| (index, resume_pc))
+}
+
+fn send_ex_after_teardown_pc() -> Option<usize> {
+    send_ex_continuation_full().and_then(|(_, _, after)| (after != 0).then_some(after))
 }
 
 /// Whether `index` names the send_ex tail, without building it.
 pub(crate) fn send_ex_continuation_is_installed_level(index: i32) -> bool {
     SEND_EX_LEVEL
-        .with(|cell| matches!(cell.get(), Some(&Some((installed, _))) if installed == index))
+        .with(|cell| matches!(cell.get(), Some(&Some((installed, _, _))) if installed == index))
 }
 
 /// `_send_ex` after `_invoke_execute_frame`: finished frame → null the way
@@ -18284,7 +18309,7 @@ pub extern "C" fn bh_send_ex_tail(
     }
 }
 
-fn build_send_ex_continuation() -> Option<(i32, usize)> {
+fn build_send_ex_continuation() -> Option<(i32, usize, usize)> {
     let mut builder = JitCodeBuilder::new();
     builder.set_name("send_ex_tail");
     builder.inline_call_r_r(
@@ -18330,6 +18355,14 @@ fn build_send_ex_continuation() -> Option<(i32, usize)> {
     let after_call = builder.live_placeholder();
     builder.patch_live_offset(after_call, after_call_liveness);
     builder.ref_return(SEND_EX_RESULT_REG);
+
+    // Finished-arm section: `_send_ex` after `self.frame_is_finished()`.
+    // Appended after the first `ref_return`, so the first section's pcs and
+    // liveness stay put. The `inline_call` is the call whose return
+    // coordinate the helper level names; resume starts at the `-live-`
+    // after it.
+    let after_teardown = append_send_ex_finished_section(&mut builder).unwrap_or(0);
+
     let jitcode = builder.try_finish()?;
     let payload = std::sync::Arc::new(PyJitCode::from_core_degenerate(
         std::sync::Arc::new(jitcode),
@@ -18337,7 +18370,40 @@ fn build_send_ex_continuation() -> Option<(i32, usize)> {
         /* has_abort */ false,
     ));
     let index = crate::state::install_codeless_jitcode(payload);
-    Some((index, resume_pc))
+    Some((index, resume_pc, after_teardown))
+}
+
+/// Second section of `send_ex_tail`: void `inline_call` of
+/// `generator_frame_is_finished`, then `-live-` / null / `ref_return`.
+///
+/// Returns the after-teardown `-live-` pc, or `None` when the helper jitcode
+/// is missing or cannot be named as a sub-jitcode descr.
+fn append_send_ex_finished_section(builder: &mut JitCodeBuilder) -> Option<usize> {
+    let helper =
+        crate::jitcode_runtime::pathed_runtime_jitcode_cached(GENERATOR_FRAME_IS_FINISHED_PATH)?;
+    if helper.reads_identity_slots() {
+        return None;
+    }
+    // Intern before emitting so a missing liveness record cannot leave a
+    // half-written second section on the first-section builder.
+    let after_teardown_liveness = crate::state::intern_liveness(&[], &[], &[])?;
+    let helper_idx = builder.add_sub_jitcode_arc(helper);
+    builder.load_const_i_value(SEND_EX_PROMPT_REG, 0);
+    builder.inline_call_ir_v(
+        helper_idx,
+        &[(SEND_EX_PROMPT_REG, 0)],
+        &[(SEND_EX_GENERATOR_REG, 0), (SEND_EX_FRAME_REG, 1)],
+        None,
+    );
+    let after_teardown = builder.current_pos();
+    // Following ops: `load_const_r` writes r0, `ref_return` reads r0.
+    // `_compute_liveness_must_continue` therefore has an empty live set at
+    // this `-live-` (`load_const_r` kills r0; nothing later reads r1/r2/i0).
+    let after_teardown_live = builder.live_placeholder();
+    builder.patch_live_offset(after_teardown_live, after_teardown_liveness);
+    builder.load_const_r_value(SEND_EX_RESULT_REG, 0);
+    builder.ref_return(SEND_EX_RESULT_REG);
+    Some(after_teardown)
 }
 
 /// FOR_ITER caller → this tail → generator body. `generator` is the
@@ -18357,6 +18423,37 @@ pub(crate) fn send_ex_continuation_parent_frame(generator: OpRef) -> Option<Inli
         blackhole: None,
         resume_coord: ParentResumeCoord::Backxlat(resume_pc),
         resume_marker_jit_pc: Some(resume_pc),
+        boxes,
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
+        caller_py_pc: None,
+        result_slot,
+    })
+}
+
+/// `_send_ex` paused past `frame_is_finished()`: the after-teardown `-live-`
+/// of the finished section. Boxes match that marker's backward liveness
+/// (empty: the next ops load null into r0 and `ref_return` it).
+pub(crate) fn send_ex_finished_after_teardown_parent_frame(
+    _generator: OpRef,
+) -> Option<InlineParentFrame> {
+    let (jitcode_index, _, after_teardown) = send_ex_continuation_full()?;
+    if after_teardown == 0 {
+        return None;
+    }
+    let boxes = Vec::new();
+    let result_slot = super::call_result_slot(jitcode_index as u32, after_teardown, boxes.len());
+    Some(InlineParentFrame {
+        jitcode_index: jitcode_index as u32,
+        call_jitcode_pc: None,
+        call_pc: None,
+        resume_pc: Some(after_teardown),
+        call_stack_overrides: Vec::new(),
+        blackhole: None,
+        resume_coord: ParentResumeCoord::Backxlat(after_teardown),
+        resume_marker_jit_pc: Some(after_teardown),
         boxes,
         registers_r: None,
         registers_i: None,
@@ -18402,10 +18499,93 @@ mod send_ex_continuation_tests {
             startpoints.contains(&resume_pc),
             "the anchor must be addressable as a resume coordinate",
         );
+        let expected = if send_ex_after_teardown_pc().is_some() {
+            10
+        } else {
+            5
+        };
         assert_eq!(
             startpoints.len(),
-            5,
-            "startpoints must cover inline_call, -live-, residual_call, -live-, ref_return, got {startpoints:?}",
+            expected,
+            "startpoints must cover the first section (5) and, when the finished helper is installed, the teardown section (5 more), got {startpoints:?}",
+        );
+    }
+
+    /// After-teardown pc is the `-live-` immediately after the finished-arm
+    /// `inline_call`, then the null load and `ref_return`.
+    #[test]
+    fn after_teardown_is_live_directly_after_the_teardown_inline_call() {
+        let Some((index, resume_pc, after_teardown)) = send_ex_continuation_full() else {
+            return;
+        };
+        if after_teardown == 0 {
+            return;
+        }
+        let payload = crate::state::pyjitcode_for_jitcode_index(index)
+            .expect("the tail was just installed at this index");
+        let ops: Vec<_> =
+            crate::jitcode_runtime::decoded_ops(payload.jitcode.code.as_slice()).collect();
+        let teardown_idx = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| op.opname.starts_with("inline_call"))
+            .map(|(i, _)| i)
+            .nth(1)
+            .expect("finished section emits a second inline_call");
+        let teardown = &ops[teardown_idx];
+        assert!(
+            teardown.pc > resume_pc,
+            "teardown call sits in the second section",
+        );
+        assert_eq!(
+            teardown.result_argcode(),
+            'v',
+            "frame_is_finished is a void call",
+        );
+        let after = ops
+            .get(teardown_idx + 1)
+            .expect("teardown call has a following op");
+        assert_eq!(after.opname, "live", "after-teardown coordinate is -live-");
+        assert_eq!(after.pc, after_teardown, "after-teardown pc is that -live-",);
+        let startpoints = payload
+            .jitcode
+            .startpoints
+            .as_ref()
+            .expect("the builder records one startpoint per emitted instruction");
+        assert!(
+            startpoints.contains(&after_teardown),
+            "the after-teardown -live- must be addressable as a resume coordinate",
+        );
+        assert!(
+            payload
+                .jitcode
+                .can_decode_live_vars(after_teardown, crate::state::op_live()),
+            "the after-teardown -live- must decode its live vars",
+        );
+        let live = crate::state::try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+            index,
+            after_teardown as i32,
+        )
+        .expect("the after-teardown -live- must decode");
+        assert_eq!(live.int, Vec::<u32>::new());
+        assert_eq!(live.ref_, Vec::<u32>::new());
+        assert_eq!(live.float, Vec::<u32>::new());
+        let null_load = ops
+            .get(teardown_idx + 2)
+            .expect("null load follows the -live-");
+        assert_eq!(
+            null_load.opname, "ref_copy",
+            "null dest is a constant ref load",
+        );
+        let ret = ops
+            .get(teardown_idx + 3)
+            .expect("ref_return follows the null load");
+        assert_eq!(ret.opname, "ref_return");
+        assert_eq!(
+            payload
+                .resolve_resume_pc_with_jitcode_pc(after_teardown as i32, crate::state::op_live()),
+            Some(after_teardown),
+            "the parent loop must resolve the after-teardown anchor to itself",
         );
     }
 
@@ -18665,7 +18845,13 @@ pub(crate) fn bind_generator_resume_foriter_item<Sym: WalkSym>(
 }
 
 /// `_send_ex`'s finished-frame branch: descend `generator_frame_is_finished`
-/// (`frame_is_finished`), then bind the FOR_ITER dest to null.
+/// (`frame_is_finished`) under the send_ex after-teardown parent, then bind
+/// the FOR_ITER dest to null (the continuation's `load_const_r` / `ref_return`).
+///
+/// `HelperReturn::CallResult` is the void-return-into-a-parent-that-continues
+/// case: the send_ex parent is paused past a void `inline_call`
+/// (`CallResultSlot::Dead`), so `void_return` / `finishframe(None)` writes
+/// nothing and the parent runs the null / `ref_return` tail.
 fn walk_send_ex_finished_tail<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -18674,8 +18860,9 @@ fn walk_send_ex_finished_tail<Sym: WalkSym>(
     frame_box: OpRef,
     frame_root: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    const PATH: &str = "pyre_interpreter::baseobjspace::generator_frame_is_finished";
-    let Some(jitcode) = crate::jitcode_runtime::pathed_jitcode_cached(PATH) else {
+    let Some(jitcode) =
+        crate::jitcode_runtime::pathed_jitcode_cached(GENERATOR_FRAME_IS_FINISHED_PATH)
+    else {
         return Err(DispatchError::callee_inline_unsupported(op.pc));
     };
     let Some(body) = crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode.index()) else {
@@ -18696,20 +18883,26 @@ fn walk_send_ex_finished_tail<Sym: WalkSym>(
     if n_int != 1 || n_ref != 2 {
         return Err(DispatchError::callee_inline_unsupported(op.pc));
     }
+    let Some(after_teardown_parent) = send_ex_finished_after_teardown_parent_frame(iter_op) else {
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
+    };
     let prompt_box = ctx.trace_ctx.const_int(0);
-    super::specialize::run_codewriter_helper_inline_call(
+    let gen_concrete = ConcreteValue::Ref(gen_obj);
+    let frame = ConcreteValue::Ref(frame as pyre_object::PyObjectRef);
+    match super::specialize::run_codewriter_helper_inline_call_under_parent(
         ctx,
         op.pc,
         &body,
+        after_teardown_parent,
         &[prompt_box],
         &[ConcreteValue::Int(0)],
         &[iter_op, frame_box],
-        &[
-            ConcreteValue::Ref(gen_obj),
-            ConcreteValue::Ref(frame as pyre_object::PyObjectRef),
-        ],
+        &[gen_concrete, frame],
         &[],
-    )?;
+    )? {
+        DispatchOutcome::SubReturn { result: None } => {}
+        _ => return Err(DispatchError::callee_inline_unsupported(op.pc)),
+    }
     let null_box = ctx.trace_ctx.const_null();
     write_ref_reg(ctx, op.pc, dst, null_box, ConcreteValue::Null)?;
     ctx.frame_state.borrow_mut().vstack_last_ref = null_box;
