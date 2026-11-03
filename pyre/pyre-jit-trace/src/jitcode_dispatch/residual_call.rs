@@ -2779,7 +2779,73 @@ fn latch_constructor_assembler_escape<Sym: WalkSym>(
     last_exc_value: i64,
     raising_exception: bool,
 ) -> bool {
-    let origin = "ctor-assembler-escape";
+    let Some(tail_parent) = super::ctor_continuation_assembler_parent_frame(instance, init_result)
+    else {
+        latchdbg!("origin=ctor-assembler-escape tail");
+        return false;
+    };
+    latch_assembler_continuation_escape(
+        ctx,
+        call_pc,
+        tail_parent,
+        last_exc_value,
+        raising_exception,
+        "ctor-assembler-escape",
+        "ConstructorAssemblerEscapeLatched",
+    )
+}
+
+/// Latch the paused callers plus `_send_ex`'s assembler tail so a
+/// tracing-time vable escape during a generator-resume `CALL_ASSEMBLER`
+/// resumes inside `_send_ex` after `_invoke_execute_frame`.
+///
+/// `opimpl_jit_merge_point` pops only the recursive portal; `_send_ex`
+/// stays on the framestack, checks `frame_finished_execution`, and either
+/// returns the portal result or raises `StopIteration`. The assembler tail
+/// (`send_ex_continuation`) is that level: pending portal result and the
+/// generator already live, then `bh_send_ex_tail` and `ref_return`.
+fn latch_send_ex_assembler_escape<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    call_pc: usize,
+    generator: OpRef,
+    pending: OpRef,
+    last_exc_value: i64,
+    raising_exception: bool,
+) -> bool {
+    let Some(mut tail_parent) = super::send_ex_continuation_parent_frame(generator) else {
+        latchdbg!("origin=send-ex-assembler-escape tail");
+        return false;
+    };
+    match tail_parent.boxes.first_mut() {
+        Some(slot) => *slot = pending,
+        None => {
+            latchdbg!("origin=send-ex-assembler-escape pending-slot");
+            return false;
+        }
+    }
+    latch_assembler_continuation_escape(
+        ctx,
+        call_pc,
+        tail_parent,
+        last_exc_value,
+        raising_exception,
+        "send-ex-assembler-escape",
+        "SendExAssemblerEscapeLatched",
+    )
+}
+
+/// Paused callers plus a synthesised assembler-resume tail. Constructor and
+/// send_ex `CALL_ASSEMBLER` share this latch: `vable_after_residual_call`
+/// blackholes the framestack that `do_recursive_call` recorded the call in.
+fn latch_assembler_continuation_escape<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    call_pc: usize,
+    tail_parent: InlineParentFrame,
+    last_exc_value: i64,
+    raising_exception: bool,
+    origin: &'static str,
+    census: &'static str,
+) -> bool {
     let mirror_stack = if ctx.fbw_mode.inline_subwalk {
         let Some(mirror_stack) = capture_root_parent_resume_stack(ctx) else {
             latchdbg!("origin={origin} mf-root-parent-stack");
@@ -2823,11 +2889,6 @@ fn latch_constructor_assembler_escape<Sym: WalkSym>(
     };
     framestack.push(caller_mf.miframe);
     banks.push(caller_mf.banks);
-    let Some(tail_parent) = super::ctor_continuation_assembler_parent_frame(instance, init_result)
-    else {
-        latchdbg!("origin={origin} tail");
-        return false;
-    };
     let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(tail_parent.jitcode_index as i32)
     else {
         latchdbg!("origin={origin} tail-jitcode");
@@ -2859,7 +2920,7 @@ fn latch_constructor_assembler_escape<Sym: WalkSym>(
             call_pc,
         );
     }
-    census_record("ConstructorAssemblerEscapeLatched");
+    census_record(census);
     FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
         *slot.borrow_mut() = Some(LatchedMultiFrameBlackhole {
             framestack,
@@ -5730,10 +5791,19 @@ fn may_force_call_value(
 /// here; the caller then records a symbolic op on a decline
 /// (`!hook_state.ran`).
 ///
-/// `constructor_assembler_escape` is the constructor `CALL_ASSEMBLER` CALL pc
-/// and the instance `__new__` produced. An escape latches `descr_call`'s
-/// assembler tail plus the caller, rather than stamping `__init__`'s return
-/// into the CALL dest.
+/// Escape handoff for a `CALL_ASSEMBLER` whose result is not the caller's
+/// dest. Constructor: `descr_call`'s tail after `__init__`. Send-ex:
+/// `_send_ex`'s tail after the portal return (`frame_finished_execution`).
+#[derive(Clone, Copy)]
+pub(crate) enum AssemblerContinuationEscape {
+    Constructor { call_pc: usize, instance: OpRef },
+    SendEx { call_pc: usize, generator: OpRef },
+}
+
+/// `assembler_continuation_escape` is the `CALL_ASSEMBLER` CALL pc plus the
+/// box the synthesised tail still needs (constructor instance, or the
+/// generator `_send_ex` reads). An escape latches that tail plus the caller,
+/// rather than stamping the portal return into the CALL dest.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -5742,7 +5812,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     call_descr: &dyn majit_ir::descr::CallDescr,
     op_pc: usize,
     blackhole_result: Option<(usize, char, usize)>,
-    constructor_assembler_escape: Option<(usize, OpRef)>,
+    assembler_continuation_escape: Option<AssemblerContinuationEscape>,
     namespace_write_journaled: bool,
     mut record_after_execute: Option<
         &mut dyn FnMut(
@@ -5754,10 +5824,15 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // The hook, not the caller, births the op (`execute_and_record_varargs`
     // records after `executor.execute_varargs`). `OpRef::NONE` until then.
     let mut recorded = OpRef::NONE;
-    // Root the instance across the residual: a force inside `__init__` can
-    // collect, and the assembler tail still needs `w_newobject`.
-    let ctor_instance_pin = constructor_assembler_escape.and_then(|(_, instance)| {
-        match ctx.trace_ctx.concrete_of_opref(instance) {
+    // Root the tail's live box across the residual: a force inside `__init__`
+    // or the generator portal can collect, and the assembler tail still needs
+    // `w_newobject` / the generator `_send_ex` reads.
+    let assembler_tail_pin = assembler_continuation_escape.as_ref().and_then(|escape| {
+        let boxed = match *escape {
+            AssemblerContinuationEscape::Constructor { instance, .. } => instance,
+            AssemblerContinuationEscape::SendEx { generator, .. } => generator,
+        };
+        match ctx.trace_ctx.concrete_of_opref(boxed) {
             Some(majit_ir::Value::Ref(gc)) if gc != majit_ir::GcRef::NO_CONCRETE => {
                 owner_root_if_gc(gc.0)
             }
@@ -7255,7 +7330,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                     },
                     heap_write_odometer_before
                         .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before),
-                    blackhole_result.is_some() || constructor_assembler_escape.is_some(),
+                    blackhole_result.is_some() || assembler_continuation_escape.is_some(),
                     ctx.session.borrow().framestack.len(),
                     ctx.fbw_mode.inline_subwalk,
                     ctx.trace_ctx.is_bridge_trace,
@@ -7309,7 +7384,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                     odometer_unchanged,
                     committed_frame_escape_pc().is_none(),
                     !ctx.trace_ctx.is_bridge_trace,
-                    blackhole_result.is_some() || constructor_assembler_escape.is_some(),
+                    blackhole_result.is_some() || assembler_continuation_escape.is_some(),
                     !ctx.fbw_mode.snapshot_sym.is_null(),
                 );
             }
@@ -7357,17 +7432,21 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             // plus a non-idempotent store ahead of the escaping call — on the
             // replay path.
             if !ctx.fbw_mode.snapshot_sym.is_null()
-                && let Some((call_pc, instance_op)) = constructor_assembler_escape
+                && let Some(escape) = assembler_continuation_escape
             {
-                // `W_TypeObject.descr_call` is still on the framestack when
-                // `vable_after_residual_call` raises `ABORT_ESCAPE`. Resume
-                // in its tail (`assembler_resume_pc`) with the instance and
-                // `__init__`'s executed return, then let `_setup_return_value_r`
-                // fill the caller's dest.
-                let (instance, _live_instance_pin) = if let Some(pin) = ctor_instance_pin.as_ref() {
+                // `W_TypeObject.descr_call` / `_send_ex` is still on the
+                // framestack when `vable_after_residual_call` raises
+                // `ABORT_ESCAPE`. Resume in that tail with the portal result
+                // already written, then let `_setup_return_value_r` fill the
+                // caller's dest.
+                let boxed = match escape {
+                    AssemblerContinuationEscape::Constructor { instance, .. } => instance,
+                    AssemblerContinuationEscape::SendEx { generator, .. } => generator,
+                };
+                let (live_box, _live_pin) = if let Some(pin) = assembler_tail_pin.as_ref() {
                     (Some(OpRef::const_ptr(pin.get())), None)
                 } else {
-                    match ctx.trace_ctx.concrete_of_opref(instance_op) {
+                    match ctx.trace_ctx.concrete_of_opref(boxed) {
                         Some(majit_ir::Value::Ref(gc)) if gc != majit_ir::GcRef::NO_CONCRETE => {
                             let pin = owner_root_if_gc(gc.0);
                             let live = pin.as_ref().map_or(gc, |p| p.get());
@@ -7376,8 +7455,8 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                         _ => (None, None),
                     }
                 };
-                if let Some(instance) = instance {
-                    let (init_result, _init_pin, last_exc_value, raising_exception) =
+                if let Some(live_box) = live_box {
+                    let (portal_result, _result_pin, last_exc_value, raising_exception) =
                         match exec_result {
                             Ok(value) => {
                                 let pin = owner_root_if_gc(value as usize);
@@ -7386,16 +7465,38 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                             }
                             Err(exc) => (OpRef::const_ptr(majit_ir::GcRef::NULL), None, exc, true),
                         };
-                    let _ = latch_constructor_assembler_escape(
-                        ctx,
-                        call_pc,
-                        instance,
-                        init_result,
-                        last_exc_value,
-                        raising_exception,
-                    );
+                    match escape {
+                        AssemblerContinuationEscape::Constructor { call_pc, .. } => {
+                            let _ = latch_constructor_assembler_escape(
+                                ctx,
+                                call_pc,
+                                live_box,
+                                portal_result,
+                                last_exc_value,
+                                raising_exception,
+                            );
+                        }
+                        AssemblerContinuationEscape::SendEx { call_pc, .. } => {
+                            let _ = latch_send_ex_assembler_escape(
+                                ctx,
+                                call_pc,
+                                live_box,
+                                portal_result,
+                                last_exc_value,
+                                raising_exception,
+                            );
+                        }
+                    }
                 } else if fbw_debug_abort_enabled() {
-                    eprintln!("[latch-decline] origin=ctor-assembler-escape instance-concrete");
+                    let origin = match escape {
+                        AssemblerContinuationEscape::Constructor { .. } => {
+                            "ctor-assembler-escape instance-concrete"
+                        }
+                        AssemblerContinuationEscape::SendEx { .. } => {
+                            "send-ex-assembler-escape generator-concrete"
+                        }
+                    };
+                    eprintln!("[latch-decline] origin={origin}");
                 }
             } else if let Some((resume_pc, result_bank, result_color)) = blackhole_result
                 && !ctx.fbw_mode.snapshot_sym.is_null()

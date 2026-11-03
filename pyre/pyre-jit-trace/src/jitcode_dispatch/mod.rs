@@ -2417,6 +2417,10 @@ pub struct GeneratorResumeSubwalk {
     /// resumed from again after this yield.  Durable, so every walk-time write
     /// to it is journalled (`fbw_arm_durable_frame_undo`).
     pub frame: usize,
+    /// Shadow-stack slot of `frame`. Recording GETFIELD / GETARRAYITEM /
+    /// guards / snapshots can minor-collect; re-read through this root
+    /// rather than the copied pointer.
+    pub frame_root: usize,
     /// The generator body's `w_code`. `walk_generator_resume` passes this
     /// as the resume walk frame's `WalkFrameStateData.inline_w_code`
     /// (`MIFrame.setup(jitcode)`); merge points read that per-frame field.
@@ -8754,6 +8758,14 @@ pub(crate) struct GuardCaptureScope {
     /// check still runs `bh_check_init_returned_none` and `ref_return` of
     /// the instance (`W_TypeObject.descr_call` after `get_and_call_args`).
     pub constructor_assembler: Option<(OpRef, OpRef)>,
+
+    /// Generator-resume `CALL_ASSEMBLER`: the iterator and the portal result.
+    /// Assembler `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION` capture `_send_ex`'s
+    /// tail (`send_ex_continuation` assembler resume) above the FOR_ITER
+    /// caller, so a force still runs `bh_send_ex_tail`'s
+    /// `frame_finished_execution` check (`generator.py` `_send_ex` after
+    /// `_invoke_execute_frame`). The pending slot is the portal return.
+    pub send_ex_assembler: Option<(OpRef, OpRef)>,
 
     /// Select which already-recorded guard op receives the resume position.
     /// Needed whenever the guard being captured is not the last thing recorded:

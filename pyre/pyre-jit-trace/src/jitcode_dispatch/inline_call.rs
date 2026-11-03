@@ -4449,6 +4449,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     w_code: *const (),
     is_being_profiled: bool,
     constructor_result: Option<(OpRef, ConcreteValue)>,
+    send_ex_generator: Option<OpRef>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     let _ = nlocals;
     let Some(recorded) = record_walker_loop_callee_portal_call(
@@ -4464,6 +4465,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
         is_being_profiled,
         false,
         constructor_result,
+        send_ex_generator,
     )?
     else {
         // Recorder preflight missed after the prologue ran. The sub-walk
@@ -4542,6 +4544,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     is_being_profiled: bool,
     leave_callee_ec: bool,
     constructor_result: Option<(OpRef, ConcreteValue)>,
+    send_ex_generator: Option<OpRef>,
 ) -> Result<Option<WalkerLoopCalleePortalRecord>, DispatchError> {
     debug_assert!(callee_frame != OpRef::NONE && callee_ec != OpRef::NONE);
     // The bridge resume captures its after-call guards on the paused callers;
@@ -4760,16 +4763,27 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // A constructor is the exception: `__init__`'s return is not the CALL's
     // value (`W_TypeObject.descr_call` returns `w_newobject` after the None
     // check), so the escape image is the assembler tail plus the caller.
-    let blackhole_result = if constructor_result.is_some() {
+    // A generator resume is the same shape: the portal return is `_send_ex`'s
+    // pending result, not the FOR_ITER item, until `bh_send_ex_tail` checks
+    // `frame_finished_execution`.
+    let blackhole_result = if constructor_result.is_some() || send_ex_generator.is_some() {
         None
     } else {
         resume_pc
             .zip(dst)
             .map(|(next_pc, (bank, color))| (next_pc, bank, color))
     };
-    let constructor_assembler_escape = constructor_result
-        .as_ref()
-        .map(|(instance, _)| (pc, *instance));
+    let assembler_continuation_escape = if let Some((instance, _)) = constructor_result.as_ref() {
+        Some(AssemblerContinuationEscape::Constructor {
+            call_pc: pc,
+            instance: *instance,
+        })
+    } else {
+        send_ex_generator.map(|generator| AssemblerContinuationEscape::SendEx {
+            call_pc: pc,
+            generator,
+        })
+    };
     // Concrete half of the enter recorded above: `vm.py` `getframe` /
     // `executioncontext.py` `gettopframe_nohidden` walk `topframeref`
     // while the executor runs `do_recursive_call`. Publish the callee
@@ -4847,7 +4861,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
             portal_view,
             pc,
             blackhole_result,
-            constructor_assembler_escape,
+            assembler_continuation_escape,
             false,
             Some(&mut record_call),
         )
@@ -4946,9 +4960,10 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // records the call. A non-constructor captures the callers alone. A
     // constructor plants `descr_call`'s tail above them (`W_TypeObject.descr_call`
     // is still on `framestack` when `do_recursive_call` records
-    // `GUARD_NOT_FORCED`).
+    // `GUARD_NOT_FORCED`). A generator resume plants `_send_ex`'s tail
+    // (`generator.py` after `_invoke_execute_frame`).
     let scope = GuardCaptureScope {
-        finished_callee_result: if record_init_none_check {
+        finished_callee_result: if record_init_none_check || send_ex_generator.is_some() {
             None
         } else {
             dst.is_none().then_some(ca_result)
@@ -4956,6 +4971,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         constructor_assembler: constructor_result
             .as_ref()
             .map(|(instance, _)| (*instance, ca_result)),
+        send_ex_assembler: send_ex_generator.map(|generator| (generator, ca_result)),
         ..Default::default()
     };
 
@@ -12988,6 +13004,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
                 is_being_profiled,
                 constructor_result,
+                None,
             );
             record_deferred_portal_leave(deferred_portal_leave);
             emitted
@@ -17083,14 +17100,17 @@ pub(super) fn generator_resume_yield<Sym: WalkSym>(
     if op_pc != resume.yield_marker_jit_pc {
         return Ok(None);
     }
+    // The body walk recorded ops and can minor-collect. Re-read the
+    // generator frame from its root before touching it.
+    let frame = live_generator_frame(resume.frame_root) as usize;
     // `valuestackdepth` is absolute (`stack_base_absolute + stack length`), so
     // the value the opcode pops is the slot below the published depth.
     let Some(top) =
-        crate::state::concrete_stack_depth(resume.frame).and_then(|depth| depth.checked_sub(1))
+        crate::state::concrete_stack_depth(frame).and_then(|depth| depth.checked_sub(1))
     else {
         return Ok(None);
     };
-    let Some(store) = fbw_generator_stack_store_at(resume.frame, top) else {
+    let Some(store) = fbw_generator_stack_store_at(frame, top) else {
         return Ok(None);
     };
     // The marker leaves the frame in the state the INTERPRETER resumes on: the
@@ -17104,21 +17124,17 @@ pub(super) fn generator_resume_yield<Sym: WalkSym>(
     // through `durable_resume_frame` first — but arm again rather than depend
     // on that: the note is first-write-per-frame wins, so a redundant call
     // keeps the earlier, pre-walk image.
-    fbw_arm_durable_frame_undo(resume.frame);
+    fbw_arm_durable_frame_undo(frame);
     // The generator frame is a nonstandard virtualizable: the trace's
     // standard vable stays the caller's.  Write the suspension through
     // SETFIELD_GC on the generator frame so the compiled loop updates that
     // object, not the caller's `last_instr` / `valuestackdepth` slots.
+    publish_generator_suspension(ctx, frame, resume.frame_box, "valuestackdepth", top as i64);
+    // SETFIELD_GC of valuestackdepth can minor-collect. Re-read before the
+    // last_instr store writes through the live frame.
     publish_generator_suspension(
         ctx,
-        resume.frame,
-        resume.frame_box,
-        "valuestackdepth",
-        top as i64,
-    );
-    publish_generator_suspension(
-        ctx,
-        resume.frame,
+        live_generator_frame(resume.frame_root) as usize,
         resume.frame_box,
         "last_instr",
         resume.yield_py_pc as i64,
@@ -17128,7 +17144,13 @@ pub(super) fn generator_resume_yield<Sym: WalkSym>(
     // still in the slot, and the next `pushvalue_none` requires the slot to
     // be null. The compiled loop has to store that too: the GC scans the
     // array independently of `valuestackdepth`.
-    publish_generator_slot_null(ctx, resume.frame, resume.frame_box, top);
+    // SETFIELD_GC of last_instr can minor-collect; re-read the frame.
+    publish_generator_slot_null(
+        ctx,
+        live_generator_frame(resume.frame_root) as usize,
+        resume.frame_box,
+        top,
+    );
     Ok(Some(store.value))
 }
 
@@ -17424,6 +17446,7 @@ fn publish_generator_slot_null<Sym: WalkSym>(
     frame_box: OpRef,
     index: usize,
 ) {
+    let frame = majit_gc::gc_current_object_address(frame);
     unsafe {
         (*(frame as *mut pyre_interpreter::PyFrame)).set_locals_w(index, std::ptr::null_mut());
     }
@@ -17431,6 +17454,9 @@ fn publish_generator_slot_null<Sym: WalkSym>(
     let locals_array =
         ctx.trace_ctx
             .record_op_with_descr(OpCode::GetfieldGcR, &[frame_box], locals_descr);
+    // GetfieldGcR appends to `Trace._ops` and can minor-collect. Follow
+    // the forwarding stub before reading `locals_cells_stack_w`.
+    let frame = majit_gc::gc_current_object_address(frame);
     let array_ptr =
         unsafe { (*(frame as *mut pyre_interpreter::PyFrame)).locals_cells_stack_w as usize };
     ctx.trace_ctx.set_opref_concrete(
@@ -18083,7 +18109,7 @@ fn descend_generatorentry<Sym: WalkSym>(
 ///   0:          inline_call_r_r <placeholder> -> result
 ///   resume_pc:  -live-                        [r0 pending result, r1 generator]
 ///               residual_call_r_r  bh_send_ex_tail(result, generator) -> answer
-///               -live-
+///               -live-                        [r0 live]
 ///               ref_return         answer
 /// ```
 const SEND_EX_RESULT_REG: u16 = 0;
@@ -18151,7 +18177,6 @@ fn build_send_ex_continuation() -> Option<(i32, usize)> {
         Some(SEND_EX_RESULT_REG),
     );
     let resume_pc = builder.current_pos();
-    let live_empty = crate::state::intern_liveness(&[], &[], &[])?;
     let live_at_resume = crate::state::intern_liveness(
         &[],
         &[SEND_EX_RESULT_REG as u8, SEND_EX_GENERATOR_REG as u8],
@@ -18180,8 +18205,14 @@ fn build_send_ex_continuation() -> Option<(i32, usize)> {
         calldescr,
         SEND_EX_RESULT_REG,
     );
+    // `handle_residual_call` trails a raising residual with `-live-`. This
+    // is the after-call resume coordinate (`after_residual_guard_marker`).
+    // Live refs are the return register: `ref_return` reads
+    // `SEND_EX_RESULT_REG`, so backward liveness
+    // (`liveness.py` `_compute_liveness_must_continue`) names it here.
+    let after_call_liveness = crate::state::intern_liveness(&[], &[SEND_EX_RESULT_REG as u8], &[])?;
     let after_call = builder.live_placeholder();
-    builder.patch_live_offset(after_call, live_empty);
+    builder.patch_live_offset(after_call, after_call_liveness);
     builder.ref_return(SEND_EX_RESULT_REG);
     let jitcode = builder.try_finish()?;
     let payload = std::sync::Arc::new(PyJitCode::from_core_degenerate(
@@ -18285,6 +18316,94 @@ mod send_ex_continuation_tests {
             "the parent loop must resolve the anchor to itself",
         );
     }
+
+    /// `handle_residual_call` trails a raising residual with `-live-`.
+    /// `bh_send_ex_tail` is such a residual, and `ref_return` then reads
+    /// the answer, so that marker's live refs are `[SEND_EX_RESULT_REG]`.
+    #[test]
+    fn residual_call_is_followed_by_a_live_naming_the_return_register() {
+        let Some((index, _)) = send_ex_continuation_level() else {
+            return;
+        };
+        let payload = crate::state::pyjitcode_for_jitcode_index(index)
+            .expect("the tail was just installed at this index");
+        let ops: Vec<_> =
+            crate::jitcode_runtime::decoded_ops(payload.jitcode.code.as_slice()).collect();
+        let residual_idx = ops
+            .iter()
+            .position(|op| op.opname.starts_with("residual_call"))
+            .expect("the tail emits the send_ex residual");
+        let after = ops
+            .get(residual_idx + 1)
+            .expect("the residual has a following op");
+        assert_eq!(
+            after.opname, "live",
+            "handle_residual_call emits a trailing `-live-`",
+        );
+        let startpoints = payload
+            .jitcode
+            .startpoints
+            .as_ref()
+            .expect("the builder records one startpoint per emitted instruction");
+        assert!(
+            startpoints.contains(&after.pc),
+            "the after-call `-live-` must be addressable as a resume coordinate",
+        );
+        assert!(
+            payload
+                .jitcode
+                .can_decode_live_vars(after.pc, crate::state::op_live()),
+            "the after-call `-live-` must decode its live vars",
+        );
+        let live = crate::state::try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+            index,
+            after.pc as i32,
+        )
+        .expect("the after-call `-live-` must decode");
+        assert_eq!(live.int, Vec::<u32>::new(), "no int is live after the call");
+        assert_eq!(
+            live.ref_,
+            vec![SEND_EX_RESULT_REG as u32],
+            "only SEND_EX_RESULT_REG is live after the call",
+        );
+        assert_eq!(
+            live.float,
+            Vec::<u32>::new(),
+            "no float is live after the call",
+        );
+        assert_eq!(
+            crate::state::frame_value_count_at(index, after.pc as i32),
+            1,
+            "only SEND_EX_RESULT_REG is live after the call",
+        );
+    }
+}
+
+/// Re-read the generator frame from its shadow-stack root.
+///
+/// Recording GETFIELD / GETARRAYITEM / guards / snapshots appends to
+/// `opencoder.py Trace._ops` and can minor-collect. The collector rewrites
+/// the root slot; a copied `*mut PyFrame` is the pre-move address.
+fn live_generator_frame(frame_root: usize) -> *mut pyre_interpreter::PyFrame {
+    pyre_object::gc_roots::shadow_stack_get(frame_root) as *mut pyre_interpreter::PyFrame
+}
+
+/// `_send_ex` (`generator.py` `GeneratorOrCoroutine._send_ex`) reads
+/// `frame = self.frame` and handles `frame is None` first. Record
+/// `GuardNonnull` on the GETFIELD box, with a FOR_ITER resume snapshot,
+/// before any read through that box. `generate_guard` (`pyjitpl.py`)
+/// skips a Const subject: a known nonnull constant is already decided.
+pub(crate) fn record_send_ex_frame_nonnull_guard<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    frame_box: OpRef,
+) -> Result<(), DispatchError> {
+    if frame_box.is_constant() {
+        return Ok(());
+    }
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardNonnull, &[frame_box], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op_pc)
 }
 
 /// `_send_ex` after `_invoke_execute_frame`: `frame.frame_finished_execution`
@@ -18292,7 +18411,7 @@ mod send_ex_continuation_tests {
 /// resumes at the send_ex tail so `bh_send_ex_tail` returns the same
 /// null-or-item `jit_next` would. `item` is the portal result occupying the
 /// tail's pending slot (`boxes[0]`), including a CALL_ASSEMBLER dest.
-fn record_send_ex_finished_frame_guard<Sym: WalkSym>(
+pub(crate) fn record_send_ex_finished_frame_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     frame_box: OpRef,
@@ -18312,8 +18431,9 @@ fn record_send_ex_finished_frame_guard<Sym: WalkSym>(
     let finished_bits = ctx
         .trace_ctx
         .record_op(OpCode::IntAnd, &[flags, finished_bit]);
-    let gen_frame =
-        pyre_object::gc_roots::shadow_stack_get(frame_root) as *mut pyre_interpreter::PyFrame;
+    // GETFIELD of `flags` and the `int_and` append to the trace and can
+    // minor-collect. Re-read the frame from its root before the flags test.
+    let gen_frame = live_generator_frame(frame_root);
     let finished = !gen_frame.is_null() && unsafe { (*gen_frame).frame_finished_execution() };
     let bits_concrete = if finished {
         i64::from(pyre_interpreter::PyFrame::FLAG_FRAME_FINISHED)
@@ -18364,6 +18484,26 @@ fn record_send_ex_finished_frame_guard<Sym: WalkSym>(
     Ok(finished)
 }
 
+/// Cut a generator-resume walk so FOR_ITER residualizes. Effects already
+/// executed on the live frame cannot be undone; those abort.
+fn residualize_generator_resume_foriter<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    frame_root: usize,
+    executed_effects_before: usize,
+    pre_emit_pos: majit_metainterp::recorder::TracePosition,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    // The body walk recorded ops and can minor-collect. Rollback through
+    // the forwarded root, not a pointer copied before that walk.
+    fbw_durable_frame_rollback_one(live_generator_frame(frame_root) as usize);
+    if fbw_executed_effect_count() != executed_effects_before {
+        return Err(DispatchError::callee_inline_unsupported(op_pc));
+    }
+    ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+    ctx.trace_ctx.heap_cache_mut().reset();
+    Ok(None)
+}
+
 /// FOR_ITER dest after a generator-resume sub-walk returns.
 ///
 /// `_send_ex` returns the yielded item while the frame is still running;
@@ -18371,18 +18511,18 @@ fn record_send_ex_finished_frame_guard<Sym: WalkSym>(
 /// (yield or `return`) and a `do_recursive_call` assembler result feed this
 /// dest write after the same `frame_finished_execution` check.
 #[allow(clippy::too_many_arguments)]
-fn bind_generator_resume_foriter_item<Sym: WalkSym>(
+pub(crate) fn bind_generator_resume_foriter_item<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     dst: usize,
     item: OpRef,
-    concrete_item: pyre_object::PyObjectRef,
     body_coord: InflightForiterBody,
     frame_box: OpRef,
     frame_root: usize,
     iter_op: OpRef,
     caller_parent: InlineParentFrame,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let root_pc = caller_parent.resume_pc.unwrap_or(op.next_pc);
     let finished = record_send_ex_finished_frame_guard(
         ctx,
         op.pc,
@@ -18393,11 +18533,93 @@ fn bind_generator_resume_foriter_item<Sym: WalkSym>(
         caller_parent,
     )?;
     if finished {
-        let null_item = OpRef::const_ptr(majit_ir::GcRef::NULL);
-        write_ref_reg(ctx, op.pc, dst, null_item, ConcreteValue::Null)?;
-        ctx.frame_state.borrow_mut().vstack_last_ref = null_item;
-        return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+        // `_send_ex` after `_invoke_execute_frame`: a finished frame runs
+        // `self.frame_is_finished()` then StopIteration. `jit_next` collapses
+        // that to a null FOR_ITER dest. Walk the send_ex tail so
+        // `bh_send_ex_tail` is the dest (and executes the teardown on this
+        // iteration) instead of baking ConstPtr NULL.
+        return walk_send_ex_finished_tail(ctx, op, dst, item, iter_op, root_pc);
     }
+    // The finished-frame guard records ops and captures resume data; both
+    // can minor-collect. `_send_ex` / `PyFrame.FOR_ITER` keep the yielded
+    // object as a GC-managed reference (`pushvalue`). Re-read it from the
+    // live box (`getref_base`) before publishing: a copy taken before the
+    // recording is the pre-move address. `write_ref_reg` refreshes its own
+    // shadow from that box; `fbw_foriter_inflight_capture` stores the
+    // pointer verbatim, so it must receive the forwarded one.
+    publish_generator_resume_foriter_item(ctx, op, dst, item, body_coord)
+}
+
+/// `_send_ex` tail after a finished frame: walk `bh_send_ex_tail` so the
+/// compiled FOR_ITER dest is the residual result, and the tracing iteration
+/// runs `frame_is_finished` through the executor.
+fn walk_send_ex_finished_tail<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    dst: usize,
+    item: OpRef,
+    iter_op: OpRef,
+    root_pc: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let snapshot_sym = ctx.fbw_mode.snapshot_sym;
+    let Some(sym) = (unsafe { snapshot_sym.as_ref() }) else {
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
+    };
+    let Some((jitcode_index, resume_pc)) = send_ex_continuation_level() else {
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
+    };
+    let middle = majit_metainterp::ReconstructRecipe {
+        code_ptr: std::ptr::null(),
+        jitcode_index,
+        jitcode_pc: resume_pc as i32,
+        nlocals: 0,
+        valuestackdepth: 0,
+        registers_i: Vec::new(),
+        registers_r: vec![item, iter_op],
+        registers_f: Vec::new(),
+        concrete_r: Vec::new(),
+        registers_r_color: Vec::new(),
+        frame: OpRef::NONE,
+        nargs: 0,
+        len_tail: true,
+        ctor_tail: false,
+        rebuilt_frame: None,
+        rebuilt_ec: None,
+    };
+    let answer = match crate::trace::walk_len_operator_tail(
+        ctx.trace_ctx,
+        ctx.session,
+        sym,
+        root_pc,
+        &middle,
+        &[],
+        item,
+    ) {
+        Some(Ok(answer)) => answer,
+        Some(Err(_)) | None => return Err(DispatchError::callee_inline_unsupported(op.pc)),
+    };
+    let concrete = walker_concrete_ref_object(ctx, answer)
+        .map(ConcreteValue::Ref)
+        .unwrap_or(ConcreteValue::Null);
+    write_ref_reg(ctx, op.pc, dst, answer, concrete)?;
+    ctx.frame_state.borrow_mut().vstack_last_ref = answer;
+    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+}
+
+/// Write the yielded FOR_ITER item from the live box, after any recording
+/// that can minor-collect. SubReturn and CALL_ASSEMBLER both bind through
+/// [`bind_generator_resume_foriter_item`] once the box is known resolvable;
+/// SubReturn residualizes before that recording when it is not.
+pub(crate) fn publish_generator_resume_foriter_item<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    dst: usize,
+    item: OpRef,
+    body_coord: InflightForiterBody,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let Some(concrete_item) = walker_concrete_ref_object(ctx, item) else {
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
+    };
     write_ref_reg(ctx, op.pc, dst, item, ConcreteValue::Ref(concrete_item))?;
     fbw_foriter_inflight_capture(
         InflightForiterOwner::current(ctx.session),
@@ -18547,9 +18769,8 @@ fn walk_generator_resume<Sym: WalkSym>(
         }
     };
     let iter_obj = pyre_object::gc_roots::shadow_stack_get(iter_root);
-    let gen_frame =
-        pyre_object::gc_roots::shadow_stack_get(frame_root) as *mut pyre_interpreter::PyFrame;
-    if gen_frame.is_null() {
+    // `compute_inline_caller_frame` can intern ConstPtrs and minor-collect.
+    if live_generator_frame(frame_root).is_null() {
         gen_resume_decline("null_frame");
         return Ok(None);
     }
@@ -18591,8 +18812,6 @@ fn walk_generator_resume<Sym: WalkSym>(
             .record_guard(OpCode::GuardValue, &[pycode_op, pycode_const], 0);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
-    let gen_frame =
-        pyre_object::gc_roots::shadow_stack_get(frame_root) as *mut pyre_interpreter::PyFrame;
 
     // Load `gen.frame` from the guarded iterator so the compiled loop
     // re-reads the suspended frame each iteration instead of baking the
@@ -18617,10 +18836,19 @@ fn walk_generator_resume<Sym: WalkSym>(
     let frame_box =
         ctx.trace_ctx
             .record_op_with_descr(OpCode::GetfieldGcR, &[iter_op], frame_descr);
+    // GuardClass / pycode GuardValue / GetfieldGcR of `frame_ptr` can
+    // minor-collect. Stamp the forwarded address from the root.
     ctx.trace_ctx.set_opref_concrete(
         frame_box,
-        majit_ir::Value::Ref(majit_ir::GcRef(gen_frame as usize)),
+        majit_ir::Value::Ref(majit_ir::GcRef(live_generator_frame(frame_root) as usize)),
     );
+    // `_send_ex` (`generator.py` `GeneratorOrCoroutine._send_ex`) reads
+    // `frame = self.frame` and handles `frame is None` first. The pypy3
+    // trace is `getfield_gc_r(p, descr=<...inst_frame>)` then
+    // `guard_nonnull`. Capture while `inline_subwalk` is still the
+    // caller's so the snapshot is the FOR_ITER frame, matching the
+    // iterator GuardClass / pycode GuardValue snapshots above.
+    record_send_ex_frame_nonnull_guard(ctx, op.pc, frame_box)?;
     let last_instr_box = crate::state::opimpl_getfield_gc_i(
         ctx.trace_ctx,
         frame_box,
@@ -18640,8 +18868,11 @@ fn walk_generator_resume<Sym: WalkSym>(
     // `resume_execute_frame`: push the sent `None` and start at
     // `next_instr()`.  Arm the durable undo first so a declined walk
     // puts the frame back whole.
+    // GuardNonnull / last_instr GETFIELD / GuardValue snapshots can
+    // minor-collect. Re-read before mutating the live frame.
+    let gen_frame = live_generator_frame(frame_root);
     fbw_arm_durable_frame_undo(gen_frame as usize);
-    unsafe {
+    let resumed_depth = unsafe {
         // `pushvalue_none` (`pyframe.py`) counts a slot that `popvalue` already
         // set to None. A traced yield publishes the depth and leaves the
         // yielded int in that slot; clear it before the count.
@@ -18650,6 +18881,7 @@ fn walk_generator_resume<Sym: WalkSym>(
             (*gen_frame).set_locals_w(depth, std::ptr::null_mut());
         }
         (*gen_frame).pushvalue_none();
+        (*gen_frame).valuestackdepth.saturating_sub(1)
     };
 
     let saved_fbw_mode = ctx.fbw_mode.clone();
@@ -18661,10 +18893,19 @@ fn walk_generator_resume<Sym: WalkSym>(
     // The slot `pushvalue_none` just counted may still hold the object the
     // previous traced yield left behind. Recording already nulled it; the
     // compiled resume has to as well, before anything reads the frame back.
-    let resumed_depth = unsafe { (*gen_frame).valuestackdepth.saturating_sub(1) };
-    publish_generator_slot_null(ctx, gen_frame as usize, frame_box, resumed_depth);
+    // `pushvalue_none` does not record; re-read anyway so this pointer is
+    // not a long-lived copy into the GetfieldGcR that follows.
+    publish_generator_slot_null(
+        ctx,
+        live_generator_frame(frame_root) as usize,
+        frame_box,
+        resumed_depth,
+    );
+    // `publish_generator_slot_null` records GetfieldGcR / SetarrayitemGc
+    // and can minor-collect. Re-read before naming the resume frame.
     let resume = GeneratorResumeSubwalk {
-        frame: gen_frame as usize,
+        frame: live_generator_frame(frame_root) as usize,
+        frame_root,
         w_pycode: pyre_object::gc_roots::shadow_stack_get(code_root) as usize,
         frame_box,
         yield_marker_jit_pc: yield_marker,
@@ -18681,11 +18922,12 @@ fn walk_generator_resume<Sym: WalkSym>(
     let mut extra_ref_seeds: Vec<(usize, OpRef, ConcreteValue)> = Vec::new();
     let portal_frame_reg = pjc.metadata.portal_frame_reg;
     let portal_ec_reg = pjc.metadata.portal_ec_reg;
+    // `const_ref` of the execution context can intern and minor-collect.
     if portal_frame_reg != u16::MAX {
         extra_ref_seeds.push((
             portal_frame_reg as usize,
             frame_box,
-            ConcreteValue::Ref(gen_frame as pyre_object::PyObjectRef),
+            ConcreteValue::Ref(live_generator_frame(frame_root) as pyre_object::PyObjectRef),
         ));
     }
     if portal_ec_reg != u16::MAX {
@@ -18700,25 +18942,41 @@ fn walk_generator_resume<Sym: WalkSym>(
     if let Some(pcdep) =
         crate::state::pcdep_trivia_at(pjc.jitcode.index() as i32, resume_marker as i32)
     {
-        let frame_ref = unsafe { &*gen_frame };
         let locals_array = crate::state::frame_locals_cells_stack_array(ctx.trace_ctx, frame_box);
         for &(bank, color, slot) in &pcdep {
             if bank != 1 {
                 continue;
             }
-            if let Some(&value) = locals_w!(frame_ref).as_slice().get(slot as usize)
+            // GETFIELD of `locals_cells_stack_w` / GETARRAYITEM of a prior
+            // slot can minor-collect. Re-read the frame from its root, copy
+            // the slot, and drop the reference before the next recording
+            // (`pyjitpl.py` `_do_getarrayitem_gc_any` keeps the array in a
+            // frontend box).
+            let value = {
+                let frame_ref = unsafe { &*live_generator_frame(frame_root) };
+                locals_w!(frame_ref).as_slice().get(slot as usize).copied()
+            };
+            if let Some(value) = value
                 && !value.is_null()
             {
                 let index = ctx.trace_ctx.const_int(slot as i64);
                 let opref =
                     crate::state::trace_array_getitem_value(ctx.trace_ctx, locals_array, index);
+                // GETARRAYITEM can minor-collect; the box is the forwarded
+                // slot, the locals copy is the pre-move address.
+                let value = walker_concrete_ref_object(ctx, opref).unwrap_or(value);
                 extra_ref_seeds.push((color as usize, opref, ConcreteValue::Ref(value)));
             }
         }
         // A later `const_ref` intern can minor-collect; the `ConstPtr` slot
-        // is the forwarded copy of each seed.
+        // is the forwarded copy of each seed. The frame seed is not a
+        // constant: bake it from the root after the same window.
         for (_, opref, concrete) in &mut extra_ref_seeds {
-            if opref.is_constant()
+            if *opref == frame_box {
+                *concrete = ConcreteValue::Ref(
+                    live_generator_frame(frame_root) as pyre_object::PyObjectRef
+                );
+            } else if opref.is_constant()
                 && let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(*opref)
             {
                 *concrete = ConcreteValue::Ref(r.0 as pyre_object::PyObjectRef);
@@ -18735,7 +18993,9 @@ fn walk_generator_resume<Sym: WalkSym>(
 
     // Held through a SubReturn dest bind; dropped before CALL_ASSEMBLER
     // (`finishframe` already ended the inlined portal).
-    let mut inline_concrete = Some(InlineConcreteFrameGuard::enter(gen_frame));
+    let mut inline_concrete = Some(InlineConcreteFrameGuard::enter(live_generator_frame(
+        frame_root,
+    )));
     let (walk_result, deferred_portal_leave, is_being_profiled, caller_parent) = {
         // The image inside `parent_frame` was copied before the guards
         // and field reads above. Those recordings can minor-collect.
@@ -18777,6 +19037,16 @@ fn walk_generator_resume<Sym: WalkSym>(
                 caller_parent,
             )
         } else {
+            // `refresh_paused_parent_concretes` and the caller-image clone
+            // can minor-collect. Bake the forwarded generator frame into
+            // the portal-frame seed immediately before the sub-walk.
+            for (_, opref, concrete) in &mut extra_ref_seeds {
+                if *opref == frame_box {
+                    *concrete = ConcreteValue::Ref(
+                        live_generator_frame(frame_root) as pyre_object::PyObjectRef
+                    );
+                }
+            }
             let result = run_sub_jitcode_walk_from(
                 ctx,
                 op.pc,
@@ -18842,7 +19112,7 @@ fn walk_generator_resume<Sym: WalkSym>(
                     op.pc, resume_marker, yield_marker,
                 );
             }
-            fbw_durable_frame_rollback_one(gen_frame as usize);
+            fbw_durable_frame_rollback_one(live_generator_frame(frame_root) as usize);
             if fbw_executed_effect_count() != executed_effects_before {
                 return Err(error);
             }
@@ -18870,19 +19140,8 @@ fn walk_generator_resume<Sym: WalkSym>(
     ) {
         drop(inline_concrete.take());
     }
-    let (item, concrete_item) = match walk_result {
-        DispatchOutcome::SubReturn { result: Some(item) } => {
-            let Some(concrete_item) = walker_concrete_ref_object(ctx, item) else {
-                fbw_durable_frame_rollback_one(gen_frame as usize);
-                if fbw_executed_effect_count() != executed_effects_before {
-                    return Err(DispatchError::callee_inline_unsupported(op.pc));
-                }
-                ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
-                ctx.trace_ctx.heap_cache_mut().reset();
-                return Ok(None);
-            };
-            (item, concrete_item)
-        }
+    let (item, residualize_if_unstamped) = match walk_result {
+        DispatchOutcome::SubReturn { result: Some(item) } => (item, true),
         DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
             // `do_recursive_call(..., assembler_call=True)`: reds are
             // `[frame, ec]` (`PyPyJitDriver.reds`). The CALL_ASSEMBLER
@@ -18897,6 +19156,10 @@ fn walk_generator_resume<Sym: WalkSym>(
                 Some(token) => Some(token),
                 None => super::portal_assembler_token(w_code, target_pc, is_being_profiled),
             };
+            // `do_recursive_call` records CALL_ASSEMBLER in `_send_ex`,
+            // after `finishframe` popped only the portal. Pass the generator
+            // so GUARD_NOT_FORCED / GUARD_NO_EXCEPTION capture that tail
+            // above the FOR_ITER caller (`send_ex_continuation_parent_frame`).
             let emitted = emit_walker_loop_callee_call_assembler(
                 ctx,
                 op,
@@ -18910,6 +19173,7 @@ fn walk_generator_resume<Sym: WalkSym>(
                 w_code,
                 is_being_profiled,
                 None,
+                Some(iter_op),
             );
             record_deferred_portal_leave(deferred_portal_leave);
             match emitted? {
@@ -18920,27 +19184,39 @@ fn walk_generator_resume<Sym: WalkSym>(
             let Some(item) = ctx.registers_r.get(dst) else {
                 return Err(DispatchError::callee_inline_unsupported(op.pc));
             };
-            let Some(concrete_item) = walker_concrete_ref_object(ctx, item) else {
-                return Err(DispatchError::callee_inline_unsupported(op.pc));
-            };
-            (item, concrete_item)
+            (item, false)
         }
         _ => {
-            fbw_durable_frame_rollback_one(gen_frame as usize);
-            if fbw_executed_effect_count() != executed_effects_before {
-                return Err(DispatchError::callee_inline_unsupported(op.pc));
-            }
-            ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            return Ok(None);
+            return residualize_generator_resume_foriter(
+                ctx,
+                op.pc,
+                frame_root,
+                executed_effects_before,
+                pre_emit_pos,
+            );
         }
     };
+    // Availability only — do not keep the pointer. The finished-frame
+    // guard records ops and captures resume data; both can minor-collect,
+    // so the live box is re-read after that recording. SubReturn residualizes
+    // FOR_ITER when the box is unstamped; CALL_ASSEMBLER still errors.
+    if walker_concrete_ref_object(ctx, item).is_none() {
+        if residualize_if_unstamped {
+            return residualize_generator_resume_foriter(
+                ctx,
+                op.pc,
+                frame_root,
+                executed_effects_before,
+                pre_emit_pos,
+            );
+        }
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
+    }
     bind_generator_resume_foriter_item(
         ctx,
         op,
         dst,
         item,
-        concrete_item,
         body_coord,
         frame_box,
         frame_root,

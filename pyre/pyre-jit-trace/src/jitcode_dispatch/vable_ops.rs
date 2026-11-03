@@ -751,7 +751,11 @@ fn durable_resume_frame<Sym: WalkSym>(
     frame: usize,
 ) -> Option<usize> {
     let resume = ctx.fbw_mode.generator_resume?;
-    (frame != 0 && frame == resume.frame).then_some(frame)
+    // The body walk records ops and can minor-collect. `resume.frame` is a
+    // copy; the root slot is forwarded. Compare against the live address
+    // so a nursery generator frame still matches after a drag-out.
+    let live = pyre_object::gc_roots::shadow_stack_get(resume.frame_root) as usize;
+    (frame != 0 && frame == live).then_some(frame)
 }
 
 /// A push writes at the current `valuestackdepth`; a pop/clear decrements its

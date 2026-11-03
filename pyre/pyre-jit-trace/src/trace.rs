@@ -3012,10 +3012,14 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
 /// (`bh_send_ex_tail`'s generator, Format's receiver) keeps those boxes;
 /// `drive_bridge_frame_subwalk` then overwrites the call dest with
 /// `child_result`.
-fn walk_len_operator_tail<Sym: WalkSym>(
+///
+/// `sym` is the paused root (`WalkSym::jitcode` / live banks). The drain
+/// holds it mutably; the forward finished-frame arm of `_send_ex` has only
+/// `*const Sym` (`fbw_mode.snapshot_sym`) and the helper reads.
+pub(crate) fn walk_len_operator_tail<Sym: WalkSym>(
     ctx: &mut TraceCtx,
     session: &std::cell::RefCell<crate::jitcode_dispatch::WalkSession>,
-    sym: &mut Sym,
+    sym: &Sym,
     root_pc: usize,
     middle: &majit_metainterp::ReconstructRecipe,
     paused_parents: &[majit_metainterp::ReconstructRecipe],

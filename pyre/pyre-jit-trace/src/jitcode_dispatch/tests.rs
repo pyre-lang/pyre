@@ -663,6 +663,203 @@ fn send_ex_continuation_pending_slot_holds_the_portal_result() {
     assert_eq!(parent.boxes[1], generator);
 }
 
+#[test]
+fn send_ex_frame_nonnull_guard_records_unless_the_box_is_a_constant() {
+    // `_send_ex` (`generator.py` `GeneratorOrCoroutine._send_ex`) is
+    // `getfield_gc_r` of `inst_frame` then `guard_nonnull`. A ConstPtr
+    // subject is already decided (`pyjitpl.py` `generate_guard`).
+    let mut tc = fresh_trace_ctx();
+    let frame_box = dummy_ptr_eq_box(&mut tc);
+    with_hint_walk_context(
+        &mut tc,
+        &mut [frame_box],
+        &mut [ConcreteValue::Ref(
+            0xdead_beef_usize as *mut pyre_object::pyobject::PyObject,
+        )],
+        &mut [],
+        &mut [],
+        &mut [],
+        &[],
+        |wc| {
+            record_send_ex_frame_nonnull_guard(wc, 0, frame_box)
+                .expect("a live frame box records GuardNonnull");
+        },
+    );
+    let last = tc.ops().last().expect("recorded op");
+    assert_eq!(last.opcode, majit_ir::OpCode::GuardNonnull);
+    assert_eq!(last.num_args(), 1);
+    assert_eq!((&*last.getarglist())[0].to_opref(), frame_box);
+
+    let mut tc = fresh_trace_ctx();
+    let frame_box = OpRef::const_ptr(majit_ir::GcRef(0xdead_beef));
+    let ops_before = tc.num_ops();
+    with_hint_walk_context(
+        &mut tc,
+        &mut [frame_box],
+        &mut [ConcreteValue::Ref(
+            0xdead_beef_usize as *mut pyre_object::pyobject::PyObject,
+        )],
+        &mut [],
+        &mut [],
+        &mut [],
+        &[],
+        |wc| {
+            record_send_ex_frame_nonnull_guard(wc, 0, frame_box)
+                .expect("a known nonnull constant skips the guard");
+        },
+    );
+    assert_eq!(tc.num_ops(), ops_before);
+    assert!(
+        !tc.ops()
+            .iter()
+            .any(|op| op.opcode == majit_ir::OpCode::GuardNonnull),
+        "a ConstPtr frame is already decided; generate_guard skips it",
+    );
+}
+
+#[test]
+fn generator_resume_foriter_item_is_reread_from_the_live_box_after_the_finished_frame_guard() {
+    // The finished-frame guard records ops and captures resume data; both
+    // can minor-collect. A copy of the yielded pointer taken before that
+    // window is the pre-move address; `fbw_foriter_inflight_capture` stores
+    // the supplied pointer verbatim. Re-read from the live box after the
+    // recording (`getref_base`), the way `write_ref_reg` already refreshes
+    // its shadow.
+    //
+    // A minor collection cannot be forced inside `record_bytes` from this
+    // harness (`TraceCtx::for_test_types` records into a host buffer,
+    // `attach_live_byte_recorder` is a no-op under `cfg(test)`). Simulate
+    // the collector's writeback on the live box between the guard and the
+    // publish.
+    const OLD: usize = 0x9C_0000_1000;
+    const NEW: usize = 0x9C_0000_1080;
+    fbw_foriter_inflight_clear();
+    let mut tc = fresh_trace_ctx();
+    let item = OpRef::input_arg_ref(0);
+    tc.set_opref_concrete(item, Value::Ref(majit_ir::GcRef(OLD)));
+    let frame_box = dummy_ptr_eq_box(&mut tc);
+    let iter_op = OpRef::const_ptr(majit_ir::GcRef::NULL);
+    let caller_parent = send_ex_continuation_parent_frame(iter_op).expect("tail installs");
+    let op = DecodedOp {
+        key: "fixture/r",
+        opname: "fixture",
+        argcodes: "r",
+        pc: 0,
+        next_pc: 1,
+    };
+    let mut regs_r = [item];
+    let mut concrete_r = [ConcreteValue::Ref(OLD as pyre_object::PyObjectRef)];
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut [],
+        &mut [],
+        &mut [],
+        &[],
+        |wc| {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let frame_root = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
+            record_send_ex_finished_frame_guard(
+                wc,
+                op.pc,
+                frame_box,
+                frame_root,
+                iter_op,
+                item,
+                caller_parent,
+            )
+            .expect("finished-frame guard records");
+            wc.trace_ctx
+                .set_opref_concrete(item, Value::Ref(majit_ir::GcRef(NEW)));
+            publish_generator_resume_foriter_item(wc, &op, 0, item, InflightForiterBody::Py(1))
+                .expect("publish after the collection window");
+            assert_eq!(
+                fbw_foriter_inflight_take(0, 0, 0),
+                Some((NEW as pyre_object::PyObjectRef, 1)),
+                "in-flight capture must store the forwarded pointer, not the pre-move copy",
+            );
+        },
+    );
+    assert_eq!(
+        concrete_r[0],
+        ConcreteValue::Ref(NEW as pyre_object::PyObjectRef),
+        "FOR_ITER dest shadow must be the live box after the window",
+    );
+}
+
+#[test]
+fn generator_resume_finished_arm_does_not_bind_const_null() {
+    // `_send_ex` on a finished frame walks `bh_send_ex_tail` so the FOR_ITER
+    // dest is the residual result. A WalkContext with no snapshot_sym cannot
+    // start that drain; the arm must refuse rather than bake ConstPtr NULL.
+    use pyre_interpreter::compile_exec;
+
+    fbw_foriter_inflight_clear();
+    let code = compile_exec("None").expect("test code should compile");
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code);
+    frame.set_frame_finished_execution(true);
+    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::PyFrame;
+
+    let mut tc = fresh_trace_ctx();
+    let item = OpRef::input_arg_ref(0);
+    tc.set_opref_concrete(item, Value::Ref(majit_ir::GcRef(0x9C_0000_2000)));
+    let frame_box = dummy_ptr_eq_box(&mut tc);
+    let iter_op = OpRef::const_ptr(majit_ir::GcRef::NULL);
+    let caller_parent = send_ex_continuation_parent_frame(iter_op).expect("tail installs");
+    let op = DecodedOp {
+        key: "fixture/r",
+        opname: "fixture",
+        argcodes: "r",
+        pc: 0,
+        next_pc: 1,
+    };
+    let mut regs_r = [item];
+    let mut concrete_r = [ConcreteValue::Ref(
+        0x9C_0000_2000 as pyre_object::PyObjectRef,
+    )];
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut [],
+        &mut [],
+        &mut [],
+        &[],
+        |wc| {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let frame_root = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(frame_ptr as pyre_object::PyObjectRef);
+            let err = bind_generator_resume_foriter_item(
+                wc,
+                &op,
+                0,
+                item,
+                InflightForiterBody::Py(1),
+                frame_box,
+                frame_root,
+                iter_op,
+                caller_parent,
+            )
+            .expect_err("finished arm without a snapshot_sym must refuse");
+            assert!(
+                matches!(
+                    err,
+                    DispatchError::LoopBearingCalleeInlineUnsupported { pc: 0, .. }
+                ),
+                "finished arm must not bake ConstPtr NULL, got {err:?}",
+            );
+            assert_eq!(
+                wc.registers_r.get(0),
+                Some(item),
+                "FOR_ITER dest must stay the body result when the tail walk declines",
+            );
+        },
+    );
+    std::hint::black_box(&frame);
+}
+
 fn dummy_operator_tail_caller() -> InlineParentFrame {
     InlineParentFrame {
         jitcode_index: 0,
@@ -2230,6 +2427,7 @@ fn portal_may_force_records_the_callee_execution_context() {
         false,
         false,
         None,
+        None,
     )
     .expect("portal may-force residual")
     .expect("portal runner is wired");
@@ -2402,6 +2600,7 @@ fn loop_callee_portal_guard_not_forced_snapshot_abort_leaves_callee_ec() {
         false,
         true,
         None,
+        None,
     );
     assert!(
         wc.trace_ctx
@@ -2421,6 +2620,172 @@ fn loop_callee_portal_guard_not_forced_snapshot_abort_leaves_callee_ec() {
         "execute_frame finally restores topframeref when the snapshot aborts"
     );
     let _ = (frame, snapshot_sym);
+}
+
+/// Generator-resume `CALL_ASSEMBLER` records `GUARD_NOT_FORCED` after
+/// `finishframe` popped only the portal (`pyjitpl.py`
+/// `opimpl_jit_merge_point`). The snapshot must carry `_send_ex`'s tail
+/// so a deopt runs `bh_send_ex_tail` instead of binding the portal return
+/// as the FOR_ITER item.
+#[test]
+fn loop_callee_portal_call_assembler_guard_not_forced_snapshot_carries_send_ex_tail() {
+    use pyre_interpreter::compile_exec;
+
+    extern "C" fn portal_runner_stub() -> i64 {
+        0
+    }
+
+    let pair = crate::state::ensure_trace_test_driver();
+    {
+        let meta = pair.0.meta_interp_mut();
+        let wired = meta.staticdata.jitdrivers_sd.iter().any(|jd| {
+            jd.num_greens() > 0 && jd.portal_runner_adr != 0 && jd.portal_calldescr.is_some()
+        });
+        if !wired {
+            let mut jd = majit_metainterp::JitDriverStaticData::new(
+                vec![("pycode", Type::Ref)],
+                vec![("frame", Type::Ref), ("ec", Type::Ref)],
+            );
+            jd.portal_runner_adr = portal_runner_stub as *const () as i64;
+            meta.register_jitdriver_sd(jd);
+            meta.finish_setup_descrs_for_jitdrivers();
+        }
+    }
+
+    let raw_code = compile_exec("None").expect("test code should compile");
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code);
+    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+
+    let jitcode_index = test_outer_resume_jitcode_index();
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+    let callee_frame = OpRef::input_arg_ref(0);
+    let callee_ec = OpRef::input_arg_ref(1);
+    let generator = OpRef::const_ptr(majit_ir::GcRef::NULL);
+    let sentinel = 0xECu64;
+    tc.set_opref_concrete(
+        callee_frame,
+        majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr)),
+    );
+    tc.set_opref_concrete(
+        callee_ec,
+        majit_ir::Value::Ref(majit_ir::GcRef(sentinel as usize)),
+    );
+
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let caller_pc_word = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
+        .and_then(|payload| payload.resolve_resume_pc_with_jitcode_pc(0, crate::state::op_live()))
+        .expect("caller resume pc");
+    let caller_boxes =
+        vec![
+            OpRef::const_ptr(majit_ir::GcRef(0));
+            crate::state::frame_value_count_at(jitcode_index as i32, caller_pc_word as i32)
+        ];
+    let _caller = InlineFrameGuard::enter(
+        &session,
+        0,
+        false,
+        vec![InlineParentFrame {
+            jitcode_index: jitcode_index as u32,
+            call_jitcode_pc: None,
+            call_pc: None,
+            resume_pc: None,
+            call_stack_overrides: Vec::new(),
+            blackhole: None,
+            resume_coord: ParentResumeCoord::Backxlat(0),
+            resume_marker_jit_pc: Some(0),
+            boxes: caller_boxes,
+            registers_r: None,
+            registers_i: None,
+            registers_f: None,
+            frame_state: None,
+            caller_py_pc: None,
+            result_slot: CallResultSlot::Dead,
+        }],
+        0,
+    );
+    let r0 = tc.const_ref(1);
+    let regs_r = vec![r0];
+    let regs_i = Vec::new();
+    let regs_f = Vec::new();
+    let mut concrete_i = Vec::new();
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::new(regs_f.iter().copied()),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: jitcode_index,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    let recorded = super::inline_call::record_walker_loop_callee_portal_call(
+        &mut wc,
+        0,
+        Some(('r', 0)),
+        Some(0),
+        callee_frame,
+        callee_ec,
+        None,
+        0,
+        std::ptr::null(),
+        false,
+        false,
+        None,
+        Some(generator),
+    )
+    .expect("portal assembler residual")
+    .expect("portal runner is wired");
+
+    let guard = wc
+        .trace_ctx
+        .ops()
+        .iter()
+        .find(|op| op.opcode == majit_ir::OpCode::GuardNotForced)
+        .expect("GUARD_NOT_FORCED");
+    let resume_pos = guard.rd_resume_position();
+    assert!(resume_pos >= 0, "GUARD_NOT_FORCED must carry a snapshot");
+    let snapshot = wc
+        .trace_ctx
+        .get_snapshot(resume_pos)
+        .expect("GUARD_NOT_FORCED snapshot");
+    let tail = snapshot
+        .frames
+        .last()
+        .expect("snapshot has at least the send_ex tail");
+    assert!(
+        send_ex_continuation_is_installed_level(tail.jitcode_index as i32),
+        "innermost snapshot frame must be the send_ex tail, jitcode={}",
+        tail.jitcode_index
+    );
+    assert_eq!(
+        tail.boxes.len(),
+        2,
+        "send_ex resume liveness names the pending result and the generator"
+    );
+    assert!(
+        snapshot.frames.len() >= 2,
+        "FOR_ITER caller sits above the send_ex tail; frames={}",
+        snapshot.frames.len()
+    );
+    let _ = (recorded, frame);
 }
 
 /// `typeobject.py W_TypeObject.descr_call` raises `TypeError` after
@@ -2567,6 +2932,7 @@ fn loop_callee_portal_non_none_init_raises_without_aborting() {
         true,
         false,
         Some((instance, ConcreteValue::Ref(pyre_object::w_int_new(0)))),
+        None,
     );
     assert_ne!(
         recorded.as_ref().err(),
@@ -2761,6 +3127,7 @@ fn loop_callee_portal_none_init_records_the_none_check() {
         true,
         false,
         Some((instance, ConcreteValue::Ref(pyre_object::w_int_new(0)))),
+        None,
     );
     assert_ne!(
         recorded.as_ref().err(),
