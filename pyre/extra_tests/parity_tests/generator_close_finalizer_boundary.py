@@ -148,3 +148,37 @@ def check_close_keeps_retained_frame_locals():
 
 check_close_keeps_retained_frame_locals()
 print("OK")
+
+
+import types
+
+# A released local that holds a function of a module registered in sys.modules
+# does not release that module's namespace.  close() must not collect, so an
+# unrelated unreachable cycle with a finalizer is still unfinalized right after it.
+import gc
+import sys
+cycle_log = []
+class CycleOnDel:
+    def __del__(self):
+        cycle_log.append("cycle")
+class HeldOnDel:
+    def __del__(self):
+        cycle_log.append("held")
+other = types.ModuleType("generator_close_other_module")
+other.held = HeldOnDel()
+exec("def helper():\n    return held\n", other.__dict__)
+sys.modules["generator_close_other_module"] = other
+def holds_other_module_function():
+    fn = other.helper
+    assert fn() is other.held
+    yield 1
+cyc = CycleOnDel()
+cyc.self = cyc
+del cyc
+gen = holds_other_module_function()
+assert next(gen) == 1
+gen.close()
+assert cycle_log == [], cycle_log
+gc.collect()
+assert cycle_log == ["cycle"], cycle_log
+del sys.modules["generator_close_other_module"]

@@ -14,7 +14,8 @@
 The object's only reference is a local of the *inner* frame, so it becomes
 garbage when `close_yield_from` finishes that frame -- before the outer frame
 is finished. CPython's refcount boundary runs `__del__` there, and `close()`
-does not return until it has.
+does not return until it has. The file also covers a private-globals function
+released by `close()`.
 """
 
 
@@ -40,5 +41,29 @@ assert next(gen) == 1
 assert Probe.ran is False
 gen.close()
 assert Probe.ran is True, "the delegate's finalizer did not run before close() returned"
+
+# A function private to the generator owns its globals.  close() releases the
+# frame's locals, the function and that dict together, so the finalizer held in
+# the dict runs at close().
+import types
+
+finalized = []
+
+
+class LoggedOnDel:
+    def __del__(self):
+        finalized.append("del")
+
+
+def holds_private_globals():
+    fn = types.FunctionType(compile("victim", "<private>", "eval"), {"victim": LoggedOnDel()})
+    assert fn() is not None
+    yield 1
+
+
+gen = holds_private_globals()
+assert next(gen) == 1
+gen.close()
+assert finalized == ["del"], finalized
 
 print("OK")

@@ -23205,7 +23205,7 @@ pub unsafe fn generator_frame_is_finished(
 ) {
     use pyre_object::generator::*;
     let released_graph_has_finalizer =
-        prompt_finalization && frame.cleared_references_have_pending_finalizer();
+        prompt_finalization && frame.cleared_references_have_pending_finalizer(gen_obj);
     unsafe { w_generator_set_exhausted(gen_obj) };
     frame.set_frame_finished_execution(true);
     frame.w_yielding_from = PY_NULL;
@@ -23492,11 +23492,19 @@ pub struct GeneratorThrow {
     operr: Option<PyError>,
     throw_args: Option<([PyObjectRef; 3], usize)>,
     closing: bool,
+    /// `close()` came from the app-level method, not `_finalize_`: only then may the frame's
+    /// release take the prompt-finalization census (see `generator_close_impl`).
+    prompt_finalization: bool,
 }
 
 /// Whether `throw` carries `close()`'s flag. `0` is a plain sent value.
 unsafe fn generator_throw_closing(throw: usize) -> bool {
     throw != 0 && unsafe { (*(throw as *const GeneratorThrow)).closing }
+}
+
+/// Whether `throw` carries an app-level `close()`'s prompt-finalization request.
+unsafe fn generator_throw_prompt_finalization(throw: usize) -> bool {
+    throw != 0 && unsafe { (*(throw as *const GeneratorThrow)).prompt_finalization }
 }
 
 /// `generator.py` `_send_ex`, the `frame is None` arm:
@@ -23579,7 +23587,7 @@ pub fn genentry_raise_returned(
         generator_frame_is_finished(
             roots.get(gen_slot),
             &mut *frame,
-            generator_throw_closing(throw),
+            generator_throw_prompt_finalization(throw),
         );
         if is_async_generator(roots.get(gen_slot)) {
             return Err(PyError::stop_async_iteration());
@@ -23603,11 +23611,15 @@ pub fn generator_invoke_execute_frame_residual(
     w_inputvalue: PyObjectRef,
     throw: usize,
 ) -> PyResult {
-    let (operr, throw_args, closing) = if throw == 0 {
+    let (operr, throw_args, prompt_finalization) = if throw == 0 {
         (None, None, false)
     } else {
         let throw = unsafe { &mut *(throw as *mut GeneratorThrow) };
-        (throw.operr.take(), throw.throw_args.take(), throw.closing)
+        (
+            throw.operr.take(),
+            throw.throw_args.take(),
+            throw.prompt_finalization,
+        )
     };
     let w_inputvalue = if w_inputvalue.is_null() {
         None
@@ -23621,7 +23633,7 @@ pub fn generator_invoke_execute_frame_residual(
             w_inputvalue,
             operr,
             throw_args,
-            closing,
+            prompt_finalization,
         )
     }
 }
@@ -23639,7 +23651,7 @@ fn generator_send_ex(
 ) -> PyResult {
     use pyre_object::generator::*;
     if operr.is_some() || throw_args.is_some() || closing {
-        return generator_throw_ex(gen_obj, w_arg, operr, throw_args, closing);
+        return generator_throw_ex(gen_obj, w_arg, operr, throw_args, closing, closing);
     }
     unsafe {
         // `generator.py send_ex`: when already in a trace and the body
@@ -23668,11 +23680,13 @@ fn generator_throw_ex(
     operr: Option<PyError>,
     throw_args: Option<([PyObjectRef; 3], usize)>,
     closing: bool,
+    prompt_finalization: bool,
 ) -> PyResult {
     let mut throw = GeneratorThrow {
         operr,
         throw_args,
         closing,
+        prompt_finalization,
     };
     generator_send_ex_body(gen_obj, w_arg, &mut throw as *mut GeneratorThrow as usize)
 }
@@ -24808,13 +24822,12 @@ fn generator_close_impl(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResu
             .unwrap_or_else(|| PyError::new(PyErrorKind::GeneratorExit, String::new()))
     };
     let sent = pyre_object::with_roots!(gen_obj => {
-        generator_send_ex(gen_obj, w_none(), Some(err), None, true)
+        generator_throw_ex(gen_obj, w_none(), Some(err), None, true, prompt_finalizers)
     });
     // Taken unconditionally, so a census no arm below spends cannot be read by
-    // a later close.  `generator_send_ex` records one whenever it closes,
-    // while only an explicit app-level `close()` may spend it: inside
-    // `_finalize_`'s queue drain the boundary would re-enter the finalizer
-    // queue once per unreachable generator chain.
+    // a later close.  The census is only recorded when `prompt_finalizers` is
+    // set; inside `_finalize_`'s queue drain the boundary would re-enter the
+    // finalizer queue once per unreachable generator chain.
     let released_graph_has_finalizer = take_pending_close_finalizer() && prompt_finalizers;
     // The boundary collection runs `__del__`, so only an arm that has already
     // consumed the propagation root may take it. `Ok(_)` and the trailing

@@ -1609,18 +1609,13 @@ fn get_referents_via_active_runtime(obj: GcRef, visitor: majit_gc::GetObjectsVis
     }
 }
 
-fn subgraph_has_pending_finalizer_via_active_runtime(
-    roots: &[GcRef],
-    ignored_edges: &[(u32, usize)],
-) -> bool {
+fn subgraph_has_pending_finalizer_via_active_runtime(roots: &[GcRef], live: &[GcRef]) -> bool {
     if gc_box::present() {
-        return with_cranelift_gc(|gc| gc.subgraph_has_pending_finalizer(roots, ignored_edges))
+        return with_cranelift_gc(|gc| gc.subgraph_has_pending_finalizer(roots, live))
             .unwrap_or(false);
     }
     if majit_gc::gc_sync::is_initialized() {
-        return majit_gc::gc_sync::gc_op(|gc| {
-            gc.subgraph_has_pending_finalizer(roots, ignored_edges)
-        });
+        return majit_gc::gc_sync::gc_op(|gc| gc.subgraph_has_pending_finalizer(roots, live));
     }
     false
 }
