@@ -6238,7 +6238,49 @@ fn intern_class_key_from_registry(
             return intern_class_key_from_registry(reg, rest, false);
         }
     }
+    if lookup.contains('<') {
+        let template = majit_ir::descr::strip_generic_args(lookup);
+        if template.as_ref() != lookup {
+            // Bookkeeper.getdesc / getuniqueclassdef: one class object
+            // per class; generic instantiations are distinct class
+            // objects from the template. Resolve the template first,
+            // then reattach `<…>` so every name of one instantiation
+            // shares one ClassDesc.
+            let template_key = template.as_ref();
+            let resolved = intern_class_key_from_registry(reg, template_key, allow_crate_strip);
+            if resolved.as_str() != template_key
+                || matches!(reg.class_identity.get(template_key), Some(Some(_)))
+                || registry_declares_spelling(reg, template_key)
+            {
+                return reattach_instantiation_suffix(&resolved, lookup);
+            }
+        }
+    }
     lookup.to_string()
+}
+
+fn reattach_instantiation_suffix(registered_key: &str, spelled: &str) -> String {
+    if registered_key.contains('<') || !spelled.contains('<') {
+        return registered_key.to_string();
+    }
+    let Some(start) = spelled.find('<') else {
+        return registered_key.to_string();
+    };
+    let stripped = majit_ir::descr::strip_generic_args(spelled);
+    if stripped.len() >= spelled.len() {
+        return registered_key.to_string();
+    }
+    let removed = spelled.len() - stripped.len();
+    let inst = &spelled[start..start + removed];
+    let after_generic = &spelled[start + removed..];
+    if after_generic.starts_with("::") {
+        if registered_key.ends_with(after_generic) {
+            let base = &registered_key[..registered_key.len() - after_generic.len()];
+            return format!("{base}{inst}{after_generic}");
+        }
+        return format!("{registered_key}{inst}{after_generic}");
+    }
+    format!("{registered_key}{inst}")
 }
 
 fn unique_path_suffix_identity(
@@ -9069,6 +9111,111 @@ mod tests {
         let template = bk.intern_class_by_qualname("cell::Slot");
         assert_ne!(i64_host, template);
         assert_ne!(f64_host, template);
+    }
+
+    #[test]
+    fn intern_core_prefixed_and_crate_relative_rangeinclusive_instantiation_share_one_key() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.foreign_body_roots.push("core".to_string());
+        let rows = vec![
+            ("start".to_string(), "i64".to_string()),
+            ("end".to_string(), "i64".to_string()),
+        ];
+        reg.fields
+            .insert("core::ops::range::RangeInclusive".to_string(), rows.clone());
+        reg.fields
+            .insert("ops::range::RangeInclusive".to_string(), rows);
+        harvest_class_identity(
+            &mut reg,
+            "ops::range::RangeInclusive",
+            &[
+                "core::ops::range::RangeInclusive",
+                "ops::range::RangeInclusive",
+                "RangeInclusive",
+            ],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let core = bk.intern_class_key("core::ops::range::RangeInclusive<i64>");
+        let rel = bk.intern_class_key("ops::range::RangeInclusive<i64>");
+        assert_eq!(core, rel);
+        assert_eq!(core, "ops::range::RangeInclusive<i64>");
+        assert_ne!(
+            core,
+            bk.intern_class_key("ops::range::RangeInclusive"),
+            "instantiation must not collapse onto the template"
+        );
+        let core_host = bk.intern_class_by_qualname("core::ops::range::RangeInclusive<i64>");
+        let rel_host = bk.intern_class_by_qualname("ops::range::RangeInclusive<i64>");
+        assert_eq!(core_host, rel_host);
+    }
+
+    #[test]
+    fn intern_result_ok_leaf_and_crate_relative_instantiation_share_one_key() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.foreign_body_roots.push("core".to_string());
+        for key in [
+            "core::result::Result",
+            "result::Result",
+            "Result",
+            "core::result::Result::Ok",
+            "result::Result::Ok",
+            "Result::Ok",
+        ] {
+            reg.fields.insert(
+                key.to_string(),
+                vec![("__pos_0".to_string(), "??TypeVar".to_string())],
+            );
+        }
+        harvest_class_identity(
+            &mut reg,
+            "result::Result",
+            &["core::result::Result", "result::Result", "Result"],
+        );
+        harvest_class_identity(
+            &mut reg,
+            "result::Result::Ok",
+            &[
+                "core::result::Result::Ok",
+                "result::Result::Ok",
+                "Result::Ok",
+            ],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let leaf = bk.intern_class_key("Result<Vec<u8>,MemoryError>::Ok");
+        let rel = bk.intern_class_key("result::Result<Vec<u8>,MemoryError>::Ok");
+        let core = bk.intern_class_key("core::result::Result<Vec<u8>,MemoryError>::Ok");
+        assert_eq!(leaf, rel);
+        assert_eq!(core, rel);
+        assert_eq!(rel, "result::Result<Vec<u8>,MemoryError>::Ok");
+    }
+
+    #[test]
+    fn intern_alloc_prefixed_and_crate_relative_vec_instantiation_share_one_key() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.foreign_body_roots.push("alloc".to_string());
+        let rows = vec![
+            ("buf".to_string(), "*mut u8".to_string()),
+            ("len".to_string(), "usize".to_string()),
+        ];
+        reg.fields
+            .insert("alloc::vec::Vec".to_string(), rows.clone());
+        reg.fields.insert("vec::Vec".to_string(), rows);
+        harvest_class_identity(
+            &mut reg,
+            "vec::Vec",
+            &["alloc::vec::Vec", "vec::Vec", "Vec"],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let alloc = bk.intern_class_key("alloc::vec::Vec<u8>");
+        let rel = bk.intern_class_key("vec::Vec<u8>");
+        assert_eq!(alloc, rel);
+        assert_eq!(alloc, "vec::Vec<u8>");
     }
 
     #[test]
