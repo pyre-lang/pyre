@@ -5018,23 +5018,27 @@ fn make_std_stream(name: &'static str, fd: i32) -> Result<PyObjectRef, crate::Py
     // text and nothing else.  The count the caller gets back stays the length
     // of what it passed in.
     fn encode_stdio_text(
-        w_text: PyObjectRef,
+        mut w_text: PyObjectRef,
         stream_name: &str,
         encoding: &str,
         errors: &str,
     ) -> Result<Vec<u8>, crate::PyError> {
-        let text = unsafe { pyre_object::w_str_get_wtf8(w_text) };
         // The mode is read off the live stream, so the cheap test comes first:
         // text carrying no newline needs no mode and asks `sys` for nothing.
-        let newline = text
+        // `stdio_newline` can collect; pin `w_text` across it and re-read the
+        // payload afterwards.
+        let has_newline = unsafe { pyre_object::w_str_get_wtf8(w_text) }
             .as_bytes()
-            .contains(&b'\n')
-            .then(|| crate::stdio_newline(stream_name))
-            .flatten()
-            .filter(|nl| *nl != "\n");
+            .contains(&b'\n');
+        let newline = pyre_object::with_roots!(w_text => {
+            has_newline.then(|| crate::stdio_newline(stream_name))
+        })
+        .flatten()
+        .filter(|nl| *nl != "\n");
         let Some(newline) = newline else {
             return crate::type_methods::encode_object(w_text, encoding, errors);
         };
+        let text = unsafe { pyre_object::w_str_get_wtf8(w_text) };
         let mut out = rustpython_wtf8::Wtf8Buf::with_capacity(text.len() + 8);
         for point in text.code_points() {
             if point.to_u32() == u32::from(b'\n') {
@@ -5063,8 +5067,13 @@ fn make_std_stream(name: &'static str, fd: i32) -> Result<PyObjectRef, crate::Py
     // `backslashreplace` → escaped) instead of panicking in `w_str_get_value`.
     let write_fn = if to_stderr {
         crate::make_builtin_function("write", |args| {
+            let _args_roots = pyre_object::gc_roots::push_roots();
+            let args_sp = _args_roots.pin_roots(args);
             stdio_check_closed("__stderr__", CLOSED_TEXT_LAYER)?;
-            if let Some(mut s_obj) = pick_str(args) {
+            let args_now: Vec<_> = (0..args.len())
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(args_sp + i))
+                .collect();
+            if let Some(mut s_obj) = pick_str(&args_now) {
                 let (encoding, _) = pyre_object::with_roots!(s_obj => live_stdio_encoding_errors("stderr", "backslashreplace"))?;
                 let bytes = pyre_object::with_roots!(s_obj => encode_stdio_text(s_obj, "stderr", &encoding, "backslashreplace"))?;
                 // An embedder that installed a hook takes the bytes here;
@@ -5076,11 +5085,13 @@ fn make_std_stream(name: &'static str, fd: i32) -> Result<PyObjectRef, crate::Py
                     #[cfg(not(feature = "sandbox"))]
                     {
                         use std::io::Write;
-                        std::io::stderr().write_all(&bytes).map_err(|error| {
-                            crate::PyError::os_error_with_errno(
-                                error.raw_os_error().unwrap_or(EIO_FALLBACK),
-                                error.to_string(),
-                            )
+                        pyre_object::with_roots!(s_obj => {
+                            std::io::stderr().write_all(&bytes).map_err(|error| {
+                                crate::PyError::os_error_with_errno(
+                                    error.raw_os_error().unwrap_or(EIO_FALLBACK),
+                                    error.to_string(),
+                                )
+                            })
                         })?;
                     }
                     #[cfg(feature = "sandbox")]
@@ -5095,12 +5106,17 @@ fn make_std_stream(name: &'static str, fd: i32) -> Result<PyObjectRef, crate::Py
                 }
                 return Ok(w_int_new(unsafe { w_str_len(s_obj) } as i64));
             }
-            Err(reject_non_str(args))
+            Err(reject_non_str(&args_now))
         })
     } else {
         crate::make_builtin_function("write", |args| {
+            let _args_roots = pyre_object::gc_roots::push_roots();
+            let args_sp = _args_roots.pin_roots(args);
             stdio_check_closed("__stdout__", CLOSED_TEXT_LAYER)?;
-            if let Some(mut s_obj) = pick_str(args) {
+            let args_now: Vec<_> = (0..args.len())
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(args_sp + i))
+                .collect();
+            if let Some(mut s_obj) = pick_str(&args_now) {
                 let (encoding, errors) = pyre_object::with_roots!(s_obj => live_stdio_encoding_errors("stdout", "strict"))?;
                 let bytes = pyre_object::with_roots!(s_obj => encode_stdio_text(s_obj, "stdout", &encoding, &errors))?;
                 // Same seam `print` rides, so an embedder that captures stdout
@@ -5109,11 +5125,13 @@ fn make_std_stream(name: &'static str, fd: i32) -> Result<PyObjectRef, crate::Py
                     #[cfg(not(feature = "sandbox"))]
                     {
                         use std::io::Write;
-                        std::io::stdout().write_all(&bytes).map_err(|error| {
-                            crate::PyError::os_error_with_errno(
-                                error.raw_os_error().unwrap_or(EIO_FALLBACK),
-                                error.to_string(),
-                            )
+                        pyre_object::with_roots!(s_obj => {
+                            std::io::stdout().write_all(&bytes).map_err(|error| {
+                                crate::PyError::os_error_with_errno(
+                                    error.raw_os_error().unwrap_or(EIO_FALLBACK),
+                                    error.to_string(),
+                                )
+                            })
                         })?;
                     }
                     #[cfg(feature = "sandbox")]
@@ -5129,7 +5147,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> Result<PyObjectRef, crate::Py
                 }
                 return Ok(w_int_new(unsafe { w_str_len(s_obj) } as i64));
             }
-            Err(reject_non_str(args))
+            Err(reject_non_str(&args_now))
         })
     };
     let write_slot = pyre_object::gc_roots::shadow_stack_len();

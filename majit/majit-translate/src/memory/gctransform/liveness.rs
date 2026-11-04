@@ -3090,12 +3090,8 @@ pub fn scan(
             let CallKind::Fun(FunId::Regular { id: callee }) = &reg.kind else {
                 continue;
             };
-            let mut callee_node = cg.callee_node(llbc, &[], *callee, &reg.generics);
-            // A spec copy that can collect stays the generic FunDecl, the
-            // scan-side half of `CallGraph::demote_specializations_in`.
-            if callee_node != *callee && reach.contains(&callee_node) {
-                callee_node = *callee;
-            }
+            // `graphanalyze.py` `analyze_direct_call` on the specialized graph.
+            let callee_node = cg.callee_node(llbc, &[], *callee, &reg.generics);
             if !reach.contains(&callee_node) {
                 continue;
             }

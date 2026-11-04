@@ -558,13 +558,35 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     // `handler.py Handler.dump_traceback`.
                     #[cfg(all(any(unix, windows), feature = "host_env"))]
                     {
-                        let all_threads = int_arg(args, 1, 1)? as libc::c_int;
-                        let max_threads = int_arg(args, 2, 100)? as libc::c_int;
+                        // `int_arg` can collect; pin the slice words first.
+                        let _roots = pyre_object::gc_roots::push_roots();
+                        let args_sp = pyre_object::gc_roots::pin_roots(args);
+                        let all_threads = if args.len() > 1 {
+                            int_arg(
+                                &[pyre_object::gc_roots::shadow_stack_get(args_sp + 1)],
+                                0,
+                                1,
+                            )?
+                        } else {
+                            1
+                        } as libc::c_int;
+                        let max_threads = if args.len() > 2 {
+                            int_arg(
+                                &[pyre_object::gc_roots::shadow_stack_get(args_sp + 2)],
+                                0,
+                                100,
+                            )?
+                        } else {
+                            100
+                        } as libc::c_int;
                         let (fd, w_file) = faulthandler_get_fileno_and_file(
-                            args.first().copied().unwrap_or(pyre_object::PY_NULL),
+                            if args.is_empty() {
+                                pyre_object::PY_NULL
+                            } else {
+                                pyre_object::gc_roots::shadow_stack_get(args_sp)
+                            },
                         )?;
                         // `keepalive_until_here(w_file)`.
-                        let _roots = pyre_object::gc_roots::push_roots();
                         if !w_file.is_null() {
                             let _ = pyre_object::gc_roots::pin_root(w_file);
                         }

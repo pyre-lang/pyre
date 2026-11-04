@@ -9583,7 +9583,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         let err = std::io::Error::from_raw_os_error(
                             majit_rlib::rposix::get_saved_errno(),
                         );
-                        crate::builtins::eintr_retry_with(err, |e| io_err(e, ""))?;
+                        pyre_object::with_roots!(w_fd => {
+                            crate::builtins::eintr_retry_with(err, |e| io_err(e, ""))
+                        })?;
                     }
                     Ok(pyre_object::w_none())
                 },

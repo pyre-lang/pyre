@@ -178,8 +178,8 @@ mod imp {
         }
     }
 
-    fn ffi_type_for_arg(at: PyObjectRef) -> Result<FfiType, pyre_interpreter::PyError> {
-        if funcptr::argtype_is_pointer_kind(at) {
+    fn ffi_type_for_arg(mut at: PyObjectRef) -> Result<FfiType, pyre_interpreter::PyError> {
+        if pyre_object::with_roots!(at => funcptr::argtype_is_pointer_kind(at)) {
             return Ok(callproc::ffi_pointer_type());
         }
         if let Some(tc) = cdata::type_code_of(at)
@@ -369,8 +369,12 @@ mod imp {
                 cfield::callback_arg_value(Some(&tc), p)
             }));
         }
-        if let Some(size) = cdata::ctype_size_of(at) {
-            let inst = pyre_interpreter::call::type_call_instantiate(at, &[])?;
+        let at_slot = pyre_object::gc_roots::pin_roots(&[at]);
+        if let Some(size) = cdata::ctype_size_of(pyre_object::gc_roots::shadow_stack_get(at_slot)) {
+            let inst = pyre_interpreter::call::type_call_instantiate(
+                pyre_object::gc_roots::shadow_stack_get(at_slot),
+                &[],
+            )?;
             let inst_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(inst);
             let bytes = unsafe { cfield::borrow_memory(p.cast::<u8>(), size) };

@@ -952,7 +952,9 @@ impl ObjectConverter {
             let name = pyre_object::with_roots!(object => self.identifier(object, "name", node))?;
             let args =
                 pyre_object::with_roots!(object => self.required_field(object, "args", node))?;
-            let parameters = Box::new(self.recurse(|this| this.parameters(args))?);
+            let parameters = Box::new(
+                pyre_object::with_roots!(object => self.recurse(|this| this.parameters(args)))?,
+            );
             let body = pyre_object::with_roots!(object => self.body(object, "body", node))?;
             let decorator_list = pyre_object::with_roots!(object => self.decorators(object, node))?;
             let returns = pyre_object::with_roots!(object => self.opt_expr(object, "returns"))?;
@@ -1005,7 +1007,9 @@ impl ObjectConverter {
                 node_index,
                 range,
                 targets,
-                value: Box::new(self.recurse(|this| this.expr(value))?),
+                value: Box::new(
+                    pyre_object::with_roots!(object => self.recurse(|this| this.expr(value)))?,
+                ),
                 runtime_targets: None,
                 runtime_type_comment: self.opt_type_comment(object)?,
                 runtime_type_comment_bytes: None,
@@ -1609,7 +1613,8 @@ impl ObjectConverter {
 
     fn match_case(&mut self, mut object: PyObjectRef) -> AstResult<ast::MatchCase> {
         let pattern = pyre_object::with_roots!(object => self.required_field(object, "pattern", "match_case"))?;
-        let pattern = self.recurse(|this| this.pattern(pattern))?;
+        let pattern =
+            pyre_object::with_roots!(object => self.recurse(|this| this.pattern(pattern)))?;
         Ok(ast::MatchCase {
             range: Default::default(),
             node_index: Default::default(),
@@ -1725,9 +1730,11 @@ impl ObjectConverter {
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "MatchAs"))? {
             let pattern = pyre_object::with_roots!(object => self
-                .optional_field(object, "pattern"))?
-            .map(|value| self.recurse(|this| this.pattern(value)).map(Box::new))
-            .transpose()?;
+            .optional_field(object, "pattern")
+            .and_then(|opt| {
+                opt.map(|value| self.recurse(|this| this.pattern(value)).map(Box::new))
+                    .transpose()
+            }))?;
             Ok(ast::Pattern::MatchAs(ast::PatternMatchAs {
                 node_index,
                 range,
@@ -1895,11 +1902,13 @@ impl ObjectConverter {
             let mut left =
                 pyre_object::with_roots!(object => self.required_field(object, "left", "BinOp"))?;
             let mut right = pyre_object::with_roots!(left, object => self.required_field(object, "right", "BinOp"))?;
-            let op = pyre_object::with_roots!(left, right => self.required_field(object, "op", "BinOp"))?;
+            let mut op = pyre_object::with_roots!(left, right, object => self.required_field(object, "op", "BinOp"))?;
             Ok(ast::Expr::BinOp(ast::ExprBinOp {
                 node_index,
                 range,
-                left: Box::new(self.recurse(|this| this.expr(left))?),
+                left: Box::new(
+                    pyre_object::with_roots!(op, right, object => self.recurse(|this| this.expr(left)))?,
+                ),
                 op: pyre_object::with_roots!(right => self.operator(op))?,
                 right: Box::new(self.recurse(|this| this.expr(right))?),
             }))
@@ -1942,7 +1951,9 @@ impl ObjectConverter {
             Ok(ast::Expr::Attribute(ast::ExprAttribute {
                 node_index,
                 range,
-                value: Box::new(self.recurse(|this| this.expr(value))?),
+                value: Box::new(
+                    pyre_object::with_roots!(ctx, object => self.recurse(|this| this.expr(value)))?,
+                ),
                 attr: ast::Identifier::new(
                     pyre_object::with_roots!(ctx => self.string(object, "attr", "Attribute"))?,
                     Default::default(),
@@ -2023,7 +2034,8 @@ impl ObjectConverter {
         } else if pyre_object::with_roots!(object => self.is_node(object, "Lambda"))? {
             let args =
                 pyre_object::with_roots!(object => self.required_field(object, "args", "Lambda"))?;
-            let parameters = self.recurse(|this| this.parameters(args))?;
+            let parameters =
+                pyre_object::with_roots!(object => self.recurse(|this| this.parameters(args)))?;
             let body = self.req_expr(object, "body", "Lambda")?;
             Ok(ast::Expr::Lambda(ast::ExprLambda {
                 node_index,
@@ -2342,19 +2354,21 @@ impl ObjectConverter {
         let (range, node_index) =
             pyre_object::with_roots!(object => self.location(object, "keyword"))?.parts();
         let arg = pyre_object::with_roots!(object => self
-            .optional_field(object, "arg"))?
-        .map(|value| {
-            if !unsafe { pyre_object::is_str(value) } {
-                return Err(crate::PyError::type_error(
-                    "AST identifier must be of type str",
-                ));
-            }
-            Ok(ast::Identifier::new(
-                utf8_only(value)?.to_string(),
-                Default::default(),
-            ))
-        })
-        .transpose()?;
+        .optional_field(object, "arg")
+        .and_then(|opt| {
+            opt.map(|value| {
+                if !unsafe { pyre_object::is_str(value) } {
+                    return Err(crate::PyError::type_error(
+                        "AST identifier must be of type str",
+                    ));
+                }
+                Ok(ast::Identifier::new(
+                    utf8_only(value)?.to_string(),
+                    Default::default(),
+                ))
+            })
+            .transpose()
+        }))?;
         let value = self.required_field(object, "value", "keyword")?;
         Ok(ast::Keyword {
             node_index,

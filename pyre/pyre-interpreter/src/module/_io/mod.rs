@@ -1872,9 +1872,12 @@ crate::py_module! {
             crate::builtins::builtin_open(&[path, w_str_new("rb")])
         },
         "text_encoding"   / * = |args| {
-            let encoding = args.first().copied().unwrap_or_else(w_none);
-            let stacklevel = args.get(1).copied().map(crate::builtins::space_index_w)
-                .transpose()?.unwrap_or(2);
+            let mut encoding = args.first().copied().unwrap_or_else(w_none);
+            let stacklevel = pyre_object::with_roots!(encoding => {
+                args.get(1).copied().map(crate::builtins::space_index_w)
+            })
+            .transpose()?
+            .unwrap_or(2);
             text_encoding(encoding, stacklevel)
         },
     },

@@ -513,14 +513,6 @@ impl<'a> Builder<'a> {
                 self.graph.callers.entry(c).or_default().insert(caller);
             }
         }
-        let (py, _) = self
-            .graph
-            .seeds_for(super::framework::PYTHON_DISPATCH_SEEDS);
-        let (col, _) = self.graph.seeds_for(super::framework::COLLECTING_SEEDS);
-        let mut seeds = py;
-        seeds.extend(col);
-        let collecting = self.graph.reaching(&seeds);
-        self.graph.demote_specializations_in(&collecting);
         self.graph
     }
 }

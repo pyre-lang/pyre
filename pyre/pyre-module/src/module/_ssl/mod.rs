@@ -911,9 +911,11 @@ mod context_methods {
             if !unsafe { pyre_interpreter::baseobjspace::isinstance_str_w(value) } {
                 return Err(pyre_interpreter::PyError::type_error("str path expected"));
             }
-            let path = pyre_object::with_roots!(value => fs_path(value))?;
-            native_result(unsafe {
-                pyre_native::ssl::context_set_keylog_filename(self.backend, Some(&path))
+            pyre_object::with_roots!(value => {
+                let path = fs_path(value)?;
+                native_result(unsafe {
+                    pyre_native::ssl::context_set_keylog_filename(self.backend, Some(&path))
+                })
             })?;
             pyre_object::gc_hook::try_gc_write_barrier(
                 self as *mut W_SSLContext as pyre_object::gc_hook::GCREF,
@@ -1092,15 +1094,14 @@ mod context_methods {
                     cadata.unwrap_or(pyre_object::PY_NULL),
                 ]);
                 let path = fs_path(cafile);
-                let w = roots.get(base);
-                capath = if w.is_null() { None } else { Some(w) };
-                let w = roots.get(base + 1);
-                cadata = if w.is_null() { None } else { Some(w) };
-                drop(roots);
                 let path = path?;
                 native_result(unsafe {
                     pyre_native::ssl::context_load_verify_file(self.backend, &path)
                 })?;
+                let w = roots.get(base);
+                capath = if w.is_null() { None } else { Some(w) };
+                let w = roots.get(base + 1);
+                cadata = if w.is_null() { None } else { Some(w) };
             }
             if let Some(capath) = capath {
                 let roots = pyre_object::gc_roots::push_roots();

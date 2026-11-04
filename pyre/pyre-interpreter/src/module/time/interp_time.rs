@@ -370,10 +370,11 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 .ok_or_else(|| overflow(w_secs))?
         } else if pyre_object::pyobject::is_long(w_secs) {
             let big = pyre_object::longobject::w_long_get_value(w_secs);
-            i64::try_from(big)
-                .map_err(|_| overflow(w_secs))?
-                .checked_mul(SECS_TO_NS)
-                .ok_or_else(|| overflow(w_secs))?
+            pyre_object::with_roots!(w_secs => {
+                i64::try_from(big).map_err(|_| overflow(w_secs))
+            })?
+            .checked_mul(SECS_TO_NS)
+            .ok_or_else(|| overflow(w_secs))?
         } else if crate::builtins::index_check(w_secs) {
             // `pytime_from_object`: `PyIndex_Check` takes `PyLong_AsLongLong`
             // (`space.index`), so a huge int overflows rather than rounding

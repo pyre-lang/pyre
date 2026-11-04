@@ -533,10 +533,15 @@ fn invoke_callback(
             let _ = roots.pin_root(w_callback);
             // `ccallback.py W_ExternPython.invoke` `except Exception as e`:
             // the last-level attempt to recover.
-            if let Err(e) = unsafe { do_invoke(roots.get(base), ll_res.cast::<u8>(), ll_args) } {
+            if let Err(mut e) = unsafe { do_invoke(roots.get(base), ll_res.cast::<u8>(), ll_args) }
+            {
+                let e_slot = e.pin(&roots);
                 pyre_interpreter::host_seam::emit_stderr(b"SystemError: callback raised ");
+                e.reload(&roots, e_slot);
                 pyre_interpreter::host_seam::emit_stderr(e.to_string().as_bytes());
+                e.reload(&roots, e_slot);
                 pyre_interpreter::host_seam::emit_stderr(b"\n");
+                e.reload(&roots, e_slot);
                 write_error_return_value(
                     callback_arg(roots.get(base)).expect("root remains a callback"),
                     ll_res.cast::<u8>(),

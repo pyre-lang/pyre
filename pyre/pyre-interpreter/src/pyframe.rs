@@ -2088,11 +2088,7 @@ impl FrameBox {
         // `initialize_frame_scopes` / `init_cells` before
         // `GeneratorIterator(frame)`.  pyre wraps at call time, so the
         // prefix has to run here, before the generator is allocated.
-        self.run_generator_prologue()?;
-        let register_final = unsafe {
-            crate::pycode::w_code_yields_inside_try(self.pycode as pyre_object::PyObjectRef)
-        };
-        let is_coroutine = self.co_flags() & crate::astcompiler::consts::CO_COROUTINE != 0;
+        // `run_generator_prologue` can collect; pin name/qualname first.
         let _origin_roots = pyre_object::gc_roots::push_roots();
         // Static pins: an absent name, qualname or origin pins null.
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -2105,6 +2101,11 @@ impl FrameBox {
             Some(qualname) => qualname,
             None => pyre_object::PY_NULL,
         });
+        self.run_generator_prologue()?;
+        let register_final = unsafe {
+            crate::pycode::w_code_yields_inside_try(self.pycode as pyre_object::PyObjectRef)
+        };
+        let is_coroutine = self.co_flags() & crate::astcompiler::consts::CO_COROUTINE != 0;
         let origin = if is_coroutine {
             capture_coroutine_origin(crate::call::getexecutioncontext())
         } else {
@@ -7539,7 +7540,9 @@ pub fn report_stale_locals_array_holder(stale_addr: usize) -> bool {
     let mut depth = 0usize;
     let mut found = false;
     while !frame.is_null() && depth < 64 {
-        let frame_addr = frame as usize;
+        // `emit_stderr` can collect; do not carry `*mut PyFrame` across it.
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
+        let frame_addr = anchor.live() as usize;
         let owned =
             pyre_object::gc_hook::try_gc_owns_object(frame_addr as pyre_object::gc_hook::GCREF);
         if depth > 0 && !owned {
@@ -7552,7 +7555,7 @@ GC-owned; stopping rather than dereferencing an unvalidated f_backref\n"
             );
             break;
         }
-        let array = unsafe { (*frame).locals_cells_stack_w } as usize;
+        let array = unsafe { (*anchor.live()).locals_cells_stack_w } as usize;
         let nursery = majit_gc::gc_is_nursery_object(frame_addr);
         let (type_id, forwarded, tracks_young) = if owned {
             let header = unsafe { *majit_gc::header::header_of(frame_addr) };
@@ -7574,7 +7577,7 @@ type_id={type_id} frame_forwarded={forwarded} track_young_ptrs={tracks_young}\n"
             )
             .as_bytes(),
         );
-        frame = unsafe { (*frame).f_backref };
+        frame = unsafe { (*anchor.live()).f_backref };
         depth += 1;
     }
     found

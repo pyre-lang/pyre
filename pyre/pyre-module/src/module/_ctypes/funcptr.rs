@@ -1706,9 +1706,9 @@ fn callback_callable_repr(callable: PyObjectRef) -> rustpython_wtf8::Wtf8Buf {
 
 fn ignore_result_conversion_error(
     mut error: pyre_interpreter::PyError,
-    callable: PyObjectRef,
+    mut callable: PyObjectRef,
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    if !is_callback_ignored_error(&mut error) {
+    if !pyre_object::with_roots!(callable => is_callback_ignored_error(&mut error)) {
         return Err(error);
     }
     // [3.15-spec] restype conversion failure is unraisable
@@ -2054,13 +2054,15 @@ fn cfuncptr_call_from(
                         argtypes.len()
                     )));
                 }
-                let kind = classify_argtype(at).ok_or_else(|| {
-                    pyre_interpreter::PyError::type_error("argtype has no valid '_type_'")
-                })?;
+                let at_slot = pyre_object::gc_roots::pin_roots(&[at]);
+                let kind = classify_argtype(pyre_object::gc_roots::shadow_stack_get(at_slot))
+                    .ok_or_else(|| {
+                        pyre_interpreter::PyError::type_error("argtype has no valid '_type_'")
+                    })?;
                 kinds.push(kind);
                 owned.push(marshal_typed_arg(
                     pyre_object::gc_roots::shadow_stack_get(call_args_base + i),
-                    at,
+                    pyre_object::gc_roots::shadow_stack_get(at_slot),
                     kind,
                     &mut keepalive,
                 )?);
@@ -2478,11 +2480,13 @@ fn build_callargs(
         if !unsafe { pyre_object::is_tuple(item) } {
             return Err(malformed());
         }
-        let item_len = unsafe { pyre_object::w_tuple_len(item) };
-        let flag = unsafe { pyre_object::w_tuple_getitem(item, 0) }.ok_or_else(malformed)?;
+        let at_item = roots.pin_roots(&[at, item]);
+        let item_len = unsafe { pyre_object::w_tuple_len(roots.get(at_item + 1)) };
+        let flag = unsafe { pyre_object::w_tuple_getitem(roots.get(at_item + 1), 0) }
+            .ok_or_else(malformed)?;
         let flag = unsafe { pyre_object::w_int_get_value(flag) };
         let name = (item_len > 1)
-            .then(|| unsafe { pyre_object::w_tuple_getitem(item, 1) })
+            .then(|| unsafe { pyre_object::w_tuple_getitem(roots.get(at_item + 1), 1) })
             .flatten()
             .filter(|&n| unsafe { pyre_object::is_str(n) })
             .and_then(|n| {
@@ -2491,7 +2495,7 @@ fn build_callargs(
                     .map(str::to_string)
             });
         let defval = if item_len > 2 {
-            unsafe { pyre_object::w_tuple_getitem(item, 2) }
+            unsafe { pyre_object::w_tuple_getitem(roots.get(at_item + 1), 2) }
         } else {
             None
         };
@@ -2503,7 +2507,7 @@ fn build_callargs(
                 out.numretvals += 1;
                 match defval {
                     Some(defval) => defval,
-                    None => out_parameter(at)?,
+                    None => out_parameter(roots.get(at_item))?,
                 }
             }
             direction => {
@@ -2570,12 +2574,21 @@ fn get_arg(
 /// The instance an `out` parameter is given for the callee to write into.  The
 /// argtype points at the thing written, so that is what gets built — an array
 /// type being its own such thing.
-fn out_parameter(at: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    let info = stginfo::stginfo_of(at);
-    if info.is_some_and(|info| stginfo::stginfo_paramfunc(info) == ParamFunc::Array) {
+fn out_parameter(mut at: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let mut info = stginfo::stginfo_of(at).unwrap_or(pyre_object::PY_NULL);
+    if pyre_object::with_roots!(
+        at,
+        info => !info.is_null() && stginfo::stginfo_paramfunc(info) == ParamFunc::Array
+    ) {
         return pyre_interpreter::call::type_call_instantiate(at, &[]);
     }
-    match info.and_then(stginfo::stginfo_proto) {
+    match pyre_object::with_roots!(at, info => {
+        if info.is_null() {
+            None
+        } else {
+            stginfo::stginfo_proto(info)
+        }
+    }) {
         Some(proto) if unsafe { pyre_object::is_type(proto) } => {
             pyre_interpreter::call::type_call_instantiate(proto, &[])
         }
@@ -2718,24 +2731,23 @@ fn internal_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::
             "cast() argument 2 must be a pointer type",
         ));
     }
-    let target = args[2];
+    // The address read and the instance allocation both move.  The whole
+    // argument slice is pinned once; the source, the type, and the kept
+    // object are read from those slots afterwards.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::pin_roots(args);
     // `_ctypes.c cast_check_pointertype`: a pointer type, a function-pointer
     // type, or a simple type whose code is one of the pointer-shaped ones.
-    let is_pointer = stginfo::stginfo_of(target)
+    let is_pointer = stginfo::stginfo_of(pyre_object::gc_roots::shadow_stack_get(args_base + 2))
         .is_some_and(|i| stginfo::stginfo_paramfunc(i) == ParamFunc::Pointer)
-        || is_funcptr_type(target)
-        || cdata::type_code_of(target)
+        || is_funcptr_type(pyre_object::gc_roots::shadow_stack_get(args_base + 2))
+        || cdata::type_code_of(pyre_object::gc_roots::shadow_stack_get(args_base + 2))
             .is_some_and(|tc| matches!(tc.as_str(), "s" | "P" | "z" | "U" | "Z" | "X" | "O"));
     if !is_pointer {
         return Err(pyre_interpreter::PyError::type_error(
             "cast() argument 2 must be a pointer type",
         ));
     }
-    // The address read and the instance allocation both move.  The whole
-    // argument slice is pinned once; the source, the type, and the kept
-    // object are read from those slots afterwards.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let args_base = pyre_object::gc_roots::pin_roots(args);
     let address = argument_address(pyre_object::gc_roots::shadow_stack_get(args_base))?;
     let result = pyre_interpreter::call::type_call_instantiate(
         pyre_object::gc_roots::shadow_stack_get(args_base + 2),
@@ -3128,11 +3140,18 @@ pub(super) enum ArgKind {
 /// The three questions a marshalled argument asks — pointer? aggregate? which
 /// code? — all read the same `StgInfo` and the same `_type_`, so they are
 /// asked together and the reads happen once.
-pub(super) fn classify_argtype(at: PyObjectRef) -> Option<ArgKind> {
-    let info = stginfo::stginfo_of(at);
-    let paramfunc = info.map_or(ParamFunc::Other, stginfo::stginfo_paramfunc);
-    if info.is_some_and(|i| stginfo::stginfo_flags(i) & stginfo::TYPEFLAG_ISPOINTER != 0)
-        || paramfunc == ParamFunc::Array
+pub(super) fn classify_argtype(mut at: PyObjectRef) -> Option<ArgKind> {
+    let mut info = stginfo::stginfo_of(at).unwrap_or(pyre_object::PY_NULL);
+    let paramfunc = pyre_object::with_roots!(at, info => {
+        if info.is_null() {
+            ParamFunc::Other
+        } else {
+            stginfo::stginfo_paramfunc(info)
+        }
+    });
+    if pyre_object::with_roots!(at, info => {
+        !info.is_null() && stginfo::stginfo_flags(info) & stginfo::TYPEFLAG_ISPOINTER != 0
+    }) || paramfunc == ParamFunc::Array
     {
         return Some(ArgKind::Pointer);
     }
@@ -3290,10 +3309,12 @@ fn make_aggregate_instance(
     mut ty: PyObjectRef,
     bytes: &[u8],
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    let size = stginfo::stginfo_of(ty)
-        .map(stginfo::stginfo_size)
-        .unwrap_or(bytes.len());
-    let mut ba = pyre_object::with_roots!(ty => pyre_object::w_bytearray_new(size));
+    let (size, mut ba) = pyre_object::with_roots!(ty => {
+        let size = stginfo::stginfo_of(ty)
+            .map(stginfo::stginfo_size)
+            .unwrap_or(bytes.len());
+        (size, pyre_object::w_bytearray_new(size))
+    });
     let n = bytes.len().min(size);
     unsafe {
         pyre_object::w_bytearray_data_mut(ba)[..n].copy_from_slice(&bytes[..n]);
@@ -3335,10 +3356,10 @@ fn marshal_typed_arg(
 /// through and converts anything else, so a mismatched cdata cannot be
 /// reinterpreted through the wrong argtype.
 fn marshal_simple_arg(
-    arg: PyObjectRef,
+    mut arg: PyObjectRef,
     tc: TypeCode,
 ) -> Result<OwnedArg, pyre_interpreter::PyError> {
-    if let Some(bytes) = cdata::same_type_bytes(&tc, arg) {
+    if let Some(bytes) = pyre_object::with_roots!(arg => cdata::same_type_bytes(&tc, arg)) {
         return Ok(OwnedArg::Typed(tc, bytes));
     }
     let buf = cdata::encode_value(&tc, arg)?;
@@ -3348,7 +3369,7 @@ fn marshal_simple_arg(
 /// Marshal one argument with no explicit `argtype` (ConvParam / `_conv_param`
 /// defaults: None, bytes, str, int).
 fn marshal_default_arg(
-    arg: PyObjectRef,
+    mut arg: PyObjectRef,
     keepalive: &mut Vec<Vec<u8>>,
 ) -> Result<OwnedArg, pyre_interpreter::PyError> {
     // `byref()` carrier → the address it wraps.
@@ -3370,7 +3391,7 @@ fn marshal_default_arg(
     // Aggregate / pointer cdata: arrays and pointers decay to a pointer; a
     // struct/union with no `byref()` is passed by value.
     if cdata::is_cdata_instance(arg) {
-        match cdata_paramfunc(arg) {
+        match pyre_object::with_roots!(arg => cdata_paramfunc(arg)) {
             ParamFunc::Pointer => {
                 return Ok(OwnedArg::Pointer(cfield::read_pointer_from_buffer(
                     cdata::cdata_bytes(arg).unwrap_or(&[]),
@@ -3451,7 +3472,7 @@ fn pointer_argument_addr(
 /// `_Pointer`/`Array`/`Structure` instances, pointer-typed scalars, bytes, an
 /// integer address, or `None`.
 pub(super) fn resolve_pointer_addr(
-    arg: PyObjectRef,
+    mut arg: PyObjectRef,
     keepalive: &mut Vec<Vec<u8>>,
 ) -> Result<usize, pyre_interpreter::PyError> {
     if super::interp_ctypes::is_carg(arg) {
@@ -3468,12 +3489,14 @@ pub(super) fn resolve_pointer_addr(
     }
     if cdata::is_cdata_instance(arg) {
         // `_Pointer` → stored address; `Array`/`Structure` → buffer address.
-        return Ok(match cdata_paramfunc(arg) {
-            ParamFunc::Pointer => {
-                cfield::read_pointer_from_buffer(cdata::cdata_bytes(arg).unwrap_or(&[]))
-            }
-            _ => cdata::cdata_addr(arg).unwrap_or(0),
-        });
+        return Ok(
+            match pyre_object::with_roots!(arg => cdata_paramfunc(arg)) {
+                ParamFunc::Pointer => {
+                    cfield::read_pointer_from_buffer(cdata::cdata_bytes(arg).unwrap_or(&[]))
+                }
+                _ => cdata::cdata_addr(arg).unwrap_or(0),
+            },
+        );
     }
     if unsafe { pyre_object::is_none(arg) } {
         Ok(0)
