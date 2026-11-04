@@ -484,10 +484,9 @@ pub fn op_float_ge(args: &[ConstValue]) -> Option<ConstValue> {
 
 // llong_*
 //
-// Upstream `op_llong_*` (`opimpl.py op_llong_floordiv`) operates on `r_longlong_arg`,
-// which on 64-bit hosts aliases the regular Python int (see
-// `opimpl.py:23-28`: `if r_longlong is r_int: r_longlong_arg =
-// (r_longlong, int, long)`). The Rust port keeps the
+// Upstream `op_llong_*` (`op_llong_floordiv`) operates on `r_longlong_arg`,
+// which on 64-bit hosts aliases the regular Python int (`r_longlong is r_int`:
+// `r_longlong_arg = (r_longlong, int, long)`). The Rust port keeps the
 // [`ConstValue::Int(i64)`] carrier for `LowLevelType::SignedLongLong`
 // per `lltype.rs`, so every `llong_*` arm mirrors its
 // `int_*` counterpart. On 32-bit hosts this would diverge — convergence
@@ -2463,6 +2462,52 @@ pub fn get_op_impl(opname: &str) -> Option<FoldFn> {
     registry.get(opname).copied()
 }
 
+/// `op_int_floordiv` / `op_int_mod` divide plain Python `int`s (`x//y`,
+/// `x%y`) → `ZeroDivisionError: integer division or modulo by zero`.
+/// `op_llong_floordiv` / `op_llong_mod` take `r_longlong_arg` operands:
+/// on a 64-bit host `r_longlong is r_int`, so
+/// `r_longlong_arg = (r_longlong, int, long)` and a plain-int pair raises
+/// the integer message; on a 32-bit host `r_longlong_arg = r_longlong`
+/// and `base_int.__floordiv__` / `__mod__` raise
+/// `ZeroDivisionError: long division or modulo by zero`.
+/// `op_uint_*` / `op_ullong_*` (`ConstValue::UInt`, the `r_uint` /
+/// `r_ulonglong` wrappers) go through `base_int.__floordiv__` /
+/// `base_int.__mod__` (`long(self) // long(other)`) →
+/// `ZeroDivisionError: long division or modulo by zero`.
+/// Constfold (`get_op_impl`) still refuses to fold.
+fn op_int_div_result(opname: &str, args: &[ConstValue]) -> Option<Result<ConstValue, OpimplError>> {
+    let (zero, message) = match opname {
+        "int_floordiv" | "int_mod" => (
+            matches!(args, [ConstValue::Int(_), ConstValue::Int(0)]),
+            "ZeroDivisionError: integer division or modulo by zero",
+        ),
+        "llong_floordiv" | "llong_mod" => {
+            let message = if cfg!(target_pointer_width = "64") {
+                // `r_longlong is r_int` → `r_longlong_arg` includes plain int.
+                "ZeroDivisionError: integer division or modulo by zero"
+            } else {
+                "ZeroDivisionError: long division or modulo by zero"
+            };
+            (
+                matches!(args, [ConstValue::Int(_), ConstValue::Int(0)]),
+                message,
+            )
+        }
+        "uint_floordiv" | "uint_mod" | "ullong_floordiv" | "ullong_mod" => (
+            matches!(args, [ConstValue::UInt(_), ConstValue::UInt(0)]),
+            "ZeroDivisionError: long division or modulo by zero",
+        ),
+        _ => return None,
+    };
+    if zero {
+        Some(Err(OpimplError {
+            message: message.into(),
+        }))
+    } else {
+        None
+    }
+}
+
 /// `LLOp.fold` as `LLFrame.getoperationhandler` invokes it: the opimpl
 /// body runs and its exception escapes. `Ok(None)` means there is no
 /// `op_*` entry (not yet ported). `Err` is the exception the body
@@ -2474,6 +2519,9 @@ pub fn eval_op_impl(opname: &str, args: &[ConstValue]) -> Result<Option<ConstVal
     }
     if opname == "float_truediv" {
         return op_float_truediv_result(args).map(Some);
+    }
+    if let Some(result) = op_int_div_result(opname, args) {
+        return result.map(Some);
     }
     match get_op_impl(opname) {
         None => Ok(None),
@@ -3203,5 +3251,47 @@ mod tests {
         assert_eq!(f_uadd(&[u128c(u128::MAX), u128c(1)]), Some(u128c(0)));
         assert!(lllong_op_impl("lllong_add").is_some());
         assert!(lllong_op_impl("int_add").is_none());
+    }
+
+    #[test]
+    fn eval_op_impl_integer_div_zero_raises_zero_division() {
+        for (op, args) in [("int_floordiv", [i(7), i(0)]), ("int_mod", [i(7), i(0)])] {
+            let err = eval_op_impl(op, &args).expect_err(op);
+            assert_eq!(
+                err.message, "ZeroDivisionError: integer division or modulo by zero",
+                "{op}"
+            );
+        }
+        // `r_longlong is r_int` on 64-bit (`r_longlong_arg`); else `r_longlong`.
+        let llong_zero_msg = if cfg!(target_pointer_width = "64") {
+            "ZeroDivisionError: integer division or modulo by zero"
+        } else {
+            "ZeroDivisionError: long division or modulo by zero"
+        };
+        for (op, args) in [
+            ("llong_floordiv", [i(7), i(0)]),
+            ("llong_mod", [i(7), i(0)]),
+        ] {
+            let err = eval_op_impl(op, &args).expect_err(op);
+            assert_eq!(err.message, llong_zero_msg, "{op}");
+        }
+        for (op, args) in [
+            ("uint_floordiv", [u(7), u(0)]),
+            ("uint_mod", [u(7), u(0)]),
+            ("ullong_floordiv", [u(7), u(0)]),
+            ("ullong_mod", [u(7), u(0)]),
+        ] {
+            let err = eval_op_impl(op, &args).expect_err(op);
+            assert_eq!(
+                err.message, "ZeroDivisionError: long division or modulo by zero",
+                "{op}"
+            );
+        }
+        // `op_int_floordiv` is C-truncating: -7 / 2 == -3.
+        assert_eq!(
+            eval_op_impl("int_floordiv", &[i(-7), i(2)]).unwrap(),
+            Some(i(-3))
+        );
+        assert_eq!(get_op_impl("int_floordiv").unwrap()(&[i(7), i(0)]), None);
     }
 }

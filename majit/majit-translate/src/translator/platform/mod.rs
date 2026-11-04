@@ -8,19 +8,21 @@
 //! `log_errors`. `Platform.execute` keeps the upstream copy-or-replace env /
 //! library-path injection / CRLF-normalized `ExecutionResult` shape.
 
-use std::collections::HashMap;
-use std::ffi::OsString;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::tool::ansi_print::AnsiLogger;
 use crate::translator::tool::cbuild::ExternalCompilationInfo;
 use crate::translator::tool::taskengine::TaskError;
-use parking_lot::ReentrantMutex;
+use parking_lot::{ReentrantMutex, RwLock};
 
+mod arm;
 mod bsd;
 mod darwin;
 mod freebsd;
@@ -29,6 +31,8 @@ mod netbsd;
 mod openbsd;
 mod posix;
 mod windows;
+
+use posix::py_bytes_repr;
 
 /// `log = AnsiLogger("platform")` (`translator.platform`).
 pub static LOG: AnsiLogger = AnsiLogger::new("platform");
@@ -89,6 +93,19 @@ impl ExecutionResult {
     }
 }
 
+/// `Popen.returncode` (`runsubprocess._run`): the exit code, or `-N` when
+/// the child was terminated by signal `N`.
+fn popen_returncode(status: std::process::ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return -signal;
+        }
+    }
+    status.code().unwrap_or(-1)
+}
+
 /// Host subclass chosen by `platform.host_factory`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HostFamily {
@@ -145,8 +162,9 @@ pub struct Platform {
     pub name: String,
     class_name: &'static str,
     family: HostFamily,
-    /// `BasePosix.__init__` / `Platform.__init__`: `cc or os.environ.get('CC')`.
-    /// `None` means "use `cc::Build` host discovery" (no `CC` override).
+    /// `BasePosix.__init__`: `cc or os.environ.get('CC', self.DEFAULT_CC)`.
+    /// `MsvcPlatform.__init__`: always `Some` after construction.
+    /// `Platform.__init__(self, 'cl.exe')` when `cc is None`, else `self.cc = cc`.
     cc_command: Option<String>,
     /// Resolved on first `compile` / `key` / link (`try_get_compiler`).
     cc: OnceLock<Result<ResolvedTools, CompilationError>>,
@@ -154,6 +172,10 @@ pub struct Platform {
     link_path: PathBuf,
     /// `MsvcPlatform.masm` fallback (`ml.exe` / `ml64.exe`) before discovery.
     masm_path: PathBuf,
+    /// `MsvcPlatform.__init__`: `self.c_environ = os.environ.copy()` after
+    /// `patch_os_env`. `None` on every non-MSVC platform (`Platform.c_environ
+    /// = None`), MinGW included.
+    pub(super) c_environ: Option<Vec<(OsString, OsString)>>,
     pub relevant_environ: &'static [&'static str],
     pub log_errors: AtomicBool,
     host_triple: String,
@@ -173,6 +195,8 @@ pub struct Platform {
     exe_ext: &'static str,
     /// `Linux.so_ext` / `Darwin.so_ext` / `MsvcPlatform.so_ext`.
     so_ext: &'static str,
+    /// `ARM` scratchbox2 state (`arm.py`); `None` on every other platform.
+    sb2: Option<&'static arm::Sb2>,
 }
 
 impl Clone for Platform {
@@ -185,6 +209,7 @@ impl Clone for Platform {
             cc: self.cc.clone(),
             link_path: self.link_path.clone(),
             masm_path: self.masm_path.clone(),
+            c_environ: self.c_environ.clone(),
             relevant_environ: self.relevant_environ,
             log_errors: AtomicBool::new(self.log_errors.load(Ordering::Relaxed)),
             host_triple: self.host_triple.clone(),
@@ -195,7 +220,72 @@ impl Clone for Platform {
             extra_libs: self.extra_libs.clone(),
             exe_ext: self.exe_ext,
             so_ext: self.so_ext,
+            sb2: self.sb2.clone(),
         }
+    }
+}
+
+/// `Platform.__eq__`: same class and construction-state fields. The lazily
+/// filled `cc` cache is derived from `cc_command` and is not compared, so two
+/// platforms built from the same state stay equal whether or not one compiled.
+impl PartialEq for Platform {
+    fn eq(&self, other: &Self) -> bool {
+        self.class_name == other.class_name
+            && self.name == other.name
+            && self.family == other.family
+            && self.cc_command == other.cc_command
+            && self.link_path == other.link_path
+            && self.masm_path == other.masm_path
+            && c_environ_eq(&self.c_environ, &other.c_environ)
+            && self.relevant_environ == other.relevant_environ
+            && self.log_errors.load(Ordering::Relaxed) == other.log_errors.load(Ordering::Relaxed)
+            && self.host_triple == other.host_triple
+            && self.cflags == other.cflags
+            && self.link_flags == other.link_flags
+            && self.standalone_only == other.standalone_only
+            && self.shared_only == other.shared_only
+            && self.extra_libs == other.extra_libs
+            && self.exe_ext == other.exe_ext
+            && self.so_ext == other.so_ext
+            && self.sb2 == other.sb2
+    }
+}
+
+/// `Platform.__eq__` compares `__dict__`; `c_environ` is a dict, so equality
+/// ignores insertion order. The field stays a `Vec` so `Command::env`
+/// enumeration order is deterministic.
+fn c_environ_eq(
+    left: &Option<Vec<(OsString, OsString)>>,
+    right: &Option<Vec<(OsString, OsString)>>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => c_environ_as_map(left) == c_environ_as_map(right),
+        _ => false,
+    }
+}
+
+/// Windows `os.environ` upper-cases its keys, so `os.environ.copy()` snapshots
+/// compare names case-insensitively there; POSIX names are case-sensitive.
+fn c_environ_as_map(env: &[(OsString, OsString)]) -> BTreeMap<OsString, &OsString> {
+    env.iter()
+        .map(|(k, v)| {
+            let key = if cfg!(windows) {
+                k.to_ascii_uppercase()
+            } else {
+                k.clone()
+            };
+            (key, v)
+        })
+        .collect()
+}
+
+impl Eq for Platform {}
+
+/// `Platform.__hash__`: only `class_name` participates.
+impl std::hash::Hash for Platform {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.class_name, state);
     }
 }
 
@@ -212,6 +302,7 @@ impl Platform {
             cc: OnceLock::new(),
             link_path: spec.link_path,
             masm_path: spec.masm_path,
+            c_environ: None,
             relevant_environ: spec.relevant_environ,
             log_errors: AtomicBool::new(true),
             host_triple,
@@ -222,6 +313,7 @@ impl Platform {
             extra_libs: spec.extra_libs,
             exe_ext: spec.exe_ext,
             so_ext: spec.so_ext,
+            sb2: None,
         }
     }
 
@@ -268,6 +360,7 @@ impl Platform {
                     self.family,
                     &self.link_path,
                     &self.masm_path,
+                    self.c_environ.as_deref(),
                 )
             })
             .as_ref()
@@ -277,6 +370,8 @@ impl Platform {
     fn cc_path(&self) -> PathBuf {
         match self.cc.get() {
             Some(Ok(tools)) => tools.cc.path().to_path_buf(),
+            // Cache miss / discovery error: stored `self.cc`
+            // (`BasePosix.__init__` / `Platform.__init__(self, 'cl.exe')`).
             _ => PathBuf::from(
                 self.cc_command
                     .as_deref()
@@ -290,6 +385,18 @@ impl Platform {
     /// Discovery failure is encoded as `cc:<error>` and never panics.
     pub fn key(&self) -> String {
         let relevant = relevant_environ_values(self.relevant_environ);
+        // `Platform.key` (`'cc=%r' % self.cc`): ARM compilation never
+        // discovers a host compiler (`ARM._execute_c_compiler` passes the
+        // configured `cc` string to `sb2`), so `key()` must not either.
+        if self.sb2.is_some() {
+            return format_platform_key_configured(
+                self.class_name,
+                self.cc_command
+                    .as_deref()
+                    .unwrap_or_else(|| default_cc(self.family)),
+                &relevant,
+            );
+        }
         match self.resolve_cc() {
             Ok(tools) => format_platform_key(
                 self.class_name,
@@ -316,7 +423,10 @@ impl Platform {
         outputfilename: Option<&str>,
         standalone: bool,
     ) -> Result<PathBuf, CompilationError> {
-        self.resolve_cc()?;
+        // `ARM._execute_c_compiler` never discovers a host `cc`.
+        if self.sb2.is_none() {
+            self.resolve_cc()?;
+        }
         let ofiles = self._compile_o_files(c_files, eci, standalone)?;
         self._finish_linking(&ofiles, eci, outputfilename, standalone)
     }
@@ -438,13 +548,99 @@ impl Platform {
         prepend_pypy_localbase(self._preprocess_library_dirs(library_dirs), "lib")
     }
 
-    /// `Platform._preprocess_library_dirs` / BSD / NetBSD overrides.
+    /// `Platform._preprocess_library_dirs` / BSD / NetBSD / `ARM` overrides.
     fn _preprocess_library_dirs(&self, library_dirs: &[PathBuf]) -> Vec<PathBuf> {
+        if let Some(sb2) = self.sb2 {
+            let mut dirs = library_dirs.to_vec();
+            dirs.extend(sb2.available_librarydirs.iter().cloned().map(PathBuf::from));
+            return dirs;
+        }
         match self.family() {
             HostFamily::Freebsd | HostFamily::Openbsd => bsd::preprocess_library_dirs(library_dirs),
             HostFamily::Netbsd => netbsd::preprocess_library_dirs(library_dirs),
             _ => library_dirs.to_vec(),
         }
+    }
+
+    /// `Platform.include_dirs_for_libffi`.
+    pub fn include_dirs_for_libffi(&self) -> Result<Cow<'static, [OsString]>, posix::ValueError> {
+        self.include_dirs_for_libffi_from(std::env::var_os("PYPY_LOCALBASE"))
+    }
+
+    fn include_dirs_for_libffi_from(
+        &self,
+        pypy_localbase: Option<OsString>,
+    ) -> Result<Cow<'static, [OsString]>, posix::ValueError> {
+        if self.sb2.is_some() {
+            return arm::include_dirs_for_libffi(self);
+        }
+        Ok(Cow::Owned(prepend_pypy_localbase_strings(
+            self._include_dirs_for_libffi()?,
+            "include",
+            pypy_localbase,
+        )))
+    }
+
+    /// `Platform.library_dirs_for_libffi`.
+    pub fn library_dirs_for_libffi(&self) -> Result<Cow<'static, [OsString]>, posix::ValueError> {
+        self.library_dirs_for_libffi_from(std::env::var_os("PYPY_LOCALBASE"))
+    }
+
+    fn library_dirs_for_libffi_from(
+        &self,
+        pypy_localbase: Option<OsString>,
+    ) -> Result<Cow<'static, [OsString]>, posix::ValueError> {
+        if self.sb2.is_some() {
+            return arm::library_dirs_for_libffi(self);
+        }
+        Ok(Cow::Owned(prepend_pypy_localbase_strings(
+            self._library_dirs_for_libffi()?,
+            "lib",
+            pypy_localbase,
+        )))
+    }
+
+    /// `Platform._include_dirs_for_libffi` / Linux / Darwin / BSD / NetBSD /
+    /// `MingwPlatform` overrides.
+    fn _include_dirs_for_libffi(&self) -> Result<Vec<OsString>, posix::ValueError> {
+        match self.family() {
+            HostFamily::Linux => linux::_include_dirs_for_libffi(self),
+            HostFamily::Darwin => darwin::_include_dirs_for_libffi(self),
+            HostFamily::Freebsd | HostFamily::Openbsd => bsd::_include_dirs_for_libffi(self),
+            HostFamily::Netbsd => netbsd::_include_dirs_for_libffi(self),
+            HostFamily::Mingw => windows::_include_dirs_for_libffi(self),
+            HostFamily::Msvc => {
+                // `Platform._include_dirs_for_libffi` raises `NotImplementedError`.
+                panic!("Needs to be overwritten")
+            }
+        }
+    }
+
+    /// `Platform._library_dirs_for_libffi` / Linux / Darwin / BSD / NetBSD /
+    /// `MingwPlatform` overrides.
+    fn _library_dirs_for_libffi(&self) -> Result<Vec<OsString>, posix::ValueError> {
+        match self.family() {
+            HostFamily::Linux => linux::_library_dirs_for_libffi(self),
+            HostFamily::Darwin => darwin::_library_dirs_for_libffi(self),
+            HostFamily::Freebsd | HostFamily::Openbsd => bsd::_library_dirs_for_libffi(self),
+            HostFamily::Netbsd => netbsd::_library_dirs_for_libffi(self),
+            HostFamily::Mingw => windows::_library_dirs_for_libffi(self),
+            HostFamily::Msvc => {
+                // `Platform._library_dirs_for_libffi` raises `NotImplementedError`.
+                panic!("Needs to be overwritten")
+            }
+        }
+    }
+
+    /// `BasePosix._pkg_config`.
+    fn _pkg_config(
+        &self,
+        lib: &str,
+        opt: &str,
+        default: Vec<OsString>,
+        check_result_dir: bool,
+    ) -> Result<Vec<OsString>, posix::ValueError> {
+        posix::_pkg_config(lib, opt, default, check_result_dir)
     }
 
     /// `BasePosix._includedirs` / `MsvcPlatform._includedirs`.
@@ -546,15 +742,12 @@ impl Platform {
         args
     }
 
-    /// `g++` (`Platform._finish_linking`) / Darwin cxx `clang++`.
+    /// `g++` (`Platform._finish_linking`: `if eci.use_cpp_linker: cc_link = 'g++'      # XXX hard-coded so far`).
     pub(crate) fn cpp_linker_name(&self) -> &'static str {
-        match self.family() {
-            HostFamily::Darwin => "clang++",
-            _ => "g++",
-        }
+        "g++"
     }
 
-    /// Linker program for `_finish_linking` (`eci.use_cpp_linker` → g++/clang++;
+    /// Linker program for `_finish_linking` (`eci.use_cpp_linker` → `g++`;
     /// MSVC `_link` still runs `self.link`).
     pub(crate) fn cc_link_program(&self, eci: &ExternalCompilationInfo) -> PathBuf {
         if eci.use_cpp_linker {
@@ -592,14 +785,27 @@ impl Platform {
         let mut exe_name = dirname.join(&outputfilename);
         if standalone {
             if !self.exe_ext.is_empty() {
-                exe_name.set_extension(self.exe_ext);
+                let mut name = OsString::from(exe_name.as_os_str());
+                name.push(".");
+                name.push(self.exe_ext);
+                exe_name = PathBuf::from(name);
             }
-        } else if !self.so_ext.is_empty() {
-            exe_name.set_extension(self.so_ext);
+        } else {
+            let mut name = OsString::from(exe_name.as_os_str());
+            name.push(".");
+            name.push(self.so_ext);
+            exe_name = PathBuf::from(name);
         }
         let cc_link = self.cc_link_program(eci);
         let largs = self._link_args_from_eci(eci, standalone);
-        self._link(&cc_link, ofiles, &largs, standalone, &exe_name)?;
+        self._link(
+            &cc_link,
+            ofiles,
+            &largs,
+            standalone,
+            &exe_name,
+            eci.use_cpp_linker,
+        )?;
         Ok(exe_name)
     }
 
@@ -621,9 +827,25 @@ impl Platform {
         link_args: &[OsString],
         standalone: bool,
         exe_name: &Path,
+        use_cpp_linker: bool,
     ) -> Result<(), CompilationError> {
         let inv = self.link_invocation(cc, ofiles, link_args, standalone, exe_name);
-        self._execute_invocation(&inv, exe_name)
+        if let Some(sb2) = self.sb2 {
+            let cc = if use_cpp_linker {
+                self.cpp_linker_name()
+            } else {
+                self.cc_command
+                    .as_deref()
+                    .unwrap_or_else(|| default_cc(self.family))
+            };
+            return self._execute_arm_c_compiler(sb2, cc, &inv.args, exe_name);
+        }
+        // MSVC `_link` runs `self.link` and ignores `cc_link = 'g++'`.
+        self._execute_command(
+            self.link_command(&inv.program, use_cpp_linker && !self.is_msvc()),
+            &inv,
+            exe_name,
+        )
     }
 
     pub(crate) fn link_invocation(
@@ -668,7 +890,43 @@ impl Platform {
         inv: &CompilerInvocation,
         outname: &Path,
     ) -> Result<(), CompilationError> {
-        let mut cmd = self.spawn_compiler(&inv.program);
+        if let Some(sb2) = self.sb2 {
+            let cc = self
+                .cc_command
+                .as_deref()
+                .unwrap_or_else(|| default_cc(self.family));
+            return self._execute_arm_c_compiler(sb2, cc, &inv.args, outname);
+        }
+        self._execute_command(self.spawn_compiler(&inv.program), inv, outname)
+    }
+
+    fn _execute_arm_c_compiler(
+        &self,
+        sb2: &arm::Sb2,
+        cc: &str,
+        args: &[OsString],
+        outname: &Path,
+    ) -> Result<(), CompilationError> {
+        let mut cmd = arm::sb2_c_compiler_command(sb2, cc, args);
+        let output = cmd.output().map_err(|err| CompilationError {
+            out: String::new(),
+            err: format!("failed to spawn sb2: {err}"),
+        })?;
+        // ARM._execute_c_compiler: `_handle_error(returncode, stderr, stdout, outname)`.
+        self._handle_error(
+            popen_returncode(output.status),
+            output.stderr,
+            output.stdout,
+            outname,
+        )
+    }
+
+    fn _execute_command(
+        &self,
+        mut cmd: Command,
+        inv: &CompilerInvocation,
+        outname: &Path,
+    ) -> Result<(), CompilationError> {
         if let Some(cwd) = &inv.cwd {
             cmd.current_dir(cwd);
         }
@@ -678,38 +936,77 @@ impl Platform {
             err: format!("failed to spawn {}: {err}", inv.program.display()),
         })?;
         self._handle_error(
-            output.status.code().unwrap_or(-1),
+            popen_returncode(output.status),
             output.stdout,
             output.stderr,
             outname,
         )
     }
 
-    fn spawn_compiler(&self, program: &Path) -> Command {
-        if let Ok(tools) = self.resolve_cc() {
-            if program == tools.cc.path() {
-                return tools.cc.to_command();
-            }
-            if let Some(tool) = &tools.link_tool
-                && program == tool.path()
-            {
-                return tool.to_command();
-            }
-            if let Some(tool) = &tools.masm_tool
-                && program == tool.path()
-            {
-                return tool.to_command();
-            }
+    /// Linker `Command` for `_finish_linking`. `use_cpp_linker` is the
+    /// `cc_link = 'g++'` path: extra words of `CC` are not carried.
+    fn link_command(&self, program: &Path, use_cpp_linker: bool) -> Command {
+        if use_cpp_linker {
             let mut cmd = Command::new(program);
-            for (key, value) in tools.cc.env() {
-                cmd.env(key, value);
-            }
-            return cmd;
+            self.apply_c_environ(&mut cmd);
+            cmd
+        } else {
+            self.spawn_compiler(program)
         }
-        Command::new(program)
     }
 
-    /// `Platform._handle_error` / `MsvcPlatform._handle_error`.
+    fn spawn_compiler(&self, program: &Path) -> Command {
+        let mut cmd = Command::new(program);
+        match self.resolve_cc() {
+            Ok(tools) => {
+                let overlay_env = if program == tools.cc.path() {
+                    cmd.args(tools.cc.args());
+                    tools.cc.env()
+                } else if let Some(tool) = &tools.link_tool
+                    && program == tool.path()
+                {
+                    cmd.args(tool.args());
+                    tool.env()
+                } else if let Some(tool) = &tools.masm_tool
+                    && program == tool.path()
+                {
+                    cmd.args(tool.args());
+                    tool.env()
+                } else {
+                    tools.cc.env()
+                };
+                // All commands run with `env=self.c_environ`
+                // (`_execute_c_compiler`, `MsvcPlatform._link` / masm).
+                if let Some(environ) = &self.c_environ {
+                    Self::apply_environ(&mut cmd, environ);
+                } else {
+                    for (key, value) in overlay_env {
+                        cmd.env(key, value);
+                    }
+                }
+            }
+            Err(_) => {
+                self.apply_c_environ(&mut cmd);
+            }
+        }
+        cmd
+    }
+
+    fn apply_environ(cmd: &mut Command, environ: &[(OsString, OsString)]) {
+        cmd.env_clear();
+        for (name, value) in environ {
+            cmd.env(name, value);
+        }
+    }
+
+    fn apply_c_environ(&self, cmd: &mut Command) {
+        if let Some(environ) = &self.c_environ {
+            Self::apply_environ(cmd, environ);
+        }
+    }
+
+    /// `Platform._handle_error` / `MingwPlatform._handle_error` /
+    /// `MsvcPlatform._handle_error`.
     fn _handle_error(
         &self,
         returncode: i32,
@@ -718,17 +1015,27 @@ impl Platform {
         outname: &Path,
     ) -> Result<(), CompilationError> {
         if returncode != 0 {
-            let logged = if self.is_msvc() {
-                let mut combined = stdout.clone();
-                combined.extend_from_slice(&stderr);
-                combined
-            } else {
-                stderr.clone()
+            let (out, logged) = match self.family() {
+                HostFamily::Msvc => {
+                    let mut combined = stdout.clone();
+                    combined.extend_from_slice(&stderr);
+                    (stdout, combined)
+                }
+                HostFamily::Mingw => {
+                    let mut combined = stderr;
+                    combined.extend_from_slice(&stdout);
+                    (Vec::new(), combined)
+                }
+                _ => (stdout, stderr),
             };
             let errorfile = outname.with_extension("errors");
-            let _ = fs::write(&errorfile, &logged);
+            if let Err(io_err) = fs::write(&errorfile, &logged) {
+                // `Platform._handle_error` (`errorfile.write`): an I/O
+                // exception escapes uncaught and aborts the translation.
+                panic!("{}: {io_err}", errorfile.display());
+            }
             self.log_stderr_lines(&logged, false);
-            Err(CompilationError::new(stdout, logged))
+            Err(CompilationError::new(out, logged))
         } else {
             self.log_stderr_lines(&stderr, true);
             Ok(())
@@ -749,7 +1056,7 @@ impl Platform {
         }
     }
 
-    /// Port of upstream `Platform.execute`.
+    /// Port of upstream `Platform.execute` / `ARM.execute`.
     pub fn execute(
         &self,
         executable: impl AsRef<Path>,
@@ -757,6 +1064,32 @@ impl Platform {
         env: Option<&EnvMapping>,
         compilation_info: Option<&ExternalCompilationInfo>,
     ) -> Result<ExecutionResult, TaskError> {
+        if let Some(sb2) = self.sb2 {
+            let mut log_args = sb2.args.clone();
+            log_args.push(executable.as_ref().to_string_lossy().into_owned());
+            if let Some(args) = args {
+                log_args.extend(args.iter().cloned());
+            }
+            LOG.method("message", &format!("executing sb2 {}", log_args.join(" ")));
+            let mut command = Command::new("sb2");
+            command.args(&sb2.args);
+            command.arg(executable.as_ref());
+            if let Some(args) = args {
+                command.args(args);
+            }
+            if let Some(env) = env {
+                command.env_clear();
+                command.envs(env);
+            }
+            let output = command.output().map_err(|e| TaskError {
+                message: format!("platform Platform.execute failed to run sb2: {e}"),
+            })?;
+            return Ok(ExecutionResult::new(
+                popen_returncode(output.status),
+                output.stdout,
+                output.stderr,
+            ));
+        }
         execute(executable, args, env, compilation_info)
     }
 }
@@ -766,11 +1099,93 @@ impl Platform {
 /// calls.
 static CC_COMMAND_LOCK: ReentrantMutex<()> = ReentrantMutex::new(());
 
+/// Module-global `platform` (`set_platform` / `pick_platform`). Lazily the
+/// same `Arc` as `host` from `host_factory()`.
+static PLATFORM: RwLock<Option<Arc<Platform>>> = RwLock::new(None);
+/// Module-global `host` (`set_platform` rebinds it only when `new_platform ==
+/// "host"`).
+static HOST: RwLock<Option<Arc<Platform>>> = RwLock::new(None);
+
+/// `platform = host = host_factory()`: first access of either global binds
+/// both to the same `Arc`.
+fn ensure_initialised() {
+    let mut plat_slot = PLATFORM.write();
+    let mut host_slot = HOST.write();
+    if plat_slot.is_some() && host_slot.is_some() {
+        return;
+    }
+    let plat = Arc::new(host_platform());
+    if plat_slot.is_none() {
+        *plat_slot = Some(Arc::clone(&plat));
+    }
+    if host_slot.is_none() {
+        *host_slot = Some(plat);
+    }
+}
+
 /// Module-global `platform = host = host_factory()`. Construction records
 /// the `CC` command and does not discover a compiler.
-pub(crate) fn platform() -> &'static Platform {
-    static HOST: OnceLock<Platform> = OnceLock::new();
-    HOST.get_or_init(host_platform)
+pub(crate) fn platform() -> Arc<Platform> {
+    ensure_initialised();
+    Arc::clone(
+        PLATFORM
+            .read()
+            .as_ref()
+            .expect("ensure_initialised fills PLATFORM"),
+    )
+}
+
+/// Module-global `host` (`translator.platform.host`).
+pub(crate) fn host() -> Arc<Platform> {
+    ensure_initialised();
+    Arc::clone(HOST.read().as_ref().expect("ensure_initialised fills HOST"))
+}
+
+/// `is_host_build`: `host == platform` via `Platform.__eq__`.
+pub(crate) fn is_host_build() -> bool {
+    *host() == *platform()
+}
+
+/// `pick_platform(new_platform, cc)`. `"host"` is `host_factory(cc)`; `"arm"`
+/// is `ARM(cc)`; anything else is `ValueError("platform = %s")`.
+pub(crate) fn pick_platform(new_platform: &str, cc: Option<String>) -> Result<Platform, String> {
+    if new_platform == "host" {
+        Ok(match cc.as_deref() {
+            None | Some("") => host_platform(),
+            Some(_) => host_platform_with_cc(cc),
+        })
+    } else if new_platform == "arm" {
+        Ok(arm::arm_platform(cc))
+    } else {
+        Err(format!("platform = {new_platform}"))
+    }
+}
+
+/// `set_platform(new_platform, cc)`: rebind `platform`, and `host` when
+/// `new_platform == "host"`.
+pub(crate) fn set_platform(new_platform: &str, cc: Option<String>) -> Result<(), String> {
+    ensure_initialised();
+    let plat = pick_platform(new_platform, cc.clone())?;
+    let using_cc = plat
+        .cc_command
+        .clone()
+        .unwrap_or_else(|| default_cc(plat.family).to_string());
+    let arc = Arc::new(plat);
+    *PLATFORM.write() = Some(Arc::clone(&arc));
+    LOG.method(
+        "msg",
+        &format!(
+            "Set platform with {} cc={}, using cc={}, version={}",
+            py_bytes_repr(new_platform.as_bytes()),
+            cc.as_deref().unwrap_or("None"),
+            py_bytes_repr(using_cc.as_bytes()),
+            py_bytes_repr(b"Unknown"),
+        ),
+    );
+    if new_platform == "host" {
+        *HOST.write() = Some(arc);
+    }
+    Ok(())
 }
 
 fn host_platform() -> Platform {
@@ -780,11 +1195,40 @@ fn host_platform() -> Platform {
 
 fn host_platform_with_cc(cc_command: Option<String>) -> Platform {
     let host_triple = host_triple();
-    let mut plat = platform_for_family(host_family(), host_triple);
-    plat.class_name = host_class_name();
-    plat.name = host_platform_name();
-    plat.relevant_environ = host_relevant_environ();
-    plat.cc_command = cc_command;
+    // `_get_compiler_type` must see the raw `CC` value (unset vs set) before
+    // `BasePosix.__init__` applies `DEFAULT_CC`.
+    let family = if std::env::consts::OS == "windows" {
+        _get_compiler_type(cc_command.as_deref())
+    } else {
+        host_family()
+    };
+    let mut plat = if family == HostFamily::Msvc {
+        // `_get_compiler_type`: `if not cc: MsvcPlatform(x64)` (`cc is None`).
+        // `MsvcPlatform.__init__`: `if cc is None: find_msvc_env(...)`.
+        let msvc_cc = match cc_command.as_deref() {
+            None | Some("") => None,
+            Some(_) => cc_command.clone(),
+        };
+        let is_64 = cfg!(target_pointer_width = "64");
+        windows::msvc_platform(host_triple, is_64, msvc_cc)
+    } else {
+        platform_for_family(family, host_triple)
+    };
+    // Windows constructors already carry `MsvcPlatform` / `MingwPlatform`
+    // `class_name` and `msvc` / `mingw32` `name`; do not overwrite them.
+    if std::env::consts::OS != "windows" {
+        plat.class_name = host_class_name();
+        plat.name = host_platform_name();
+    }
+    plat.relevant_environ = match family {
+        HostFamily::Msvc => windows::RELEVANT_ENVIRON,
+        _ => posix::RELEVANT_ENVIRON,
+    };
+    if family != HostFamily::Msvc {
+        // `BasePosix.__init__`: `cc or os.environ.get('CC', self.DEFAULT_CC)`.
+        // A present `Some("")` is `os.environ.get` returning `''` and is kept.
+        plat.cc_command = Some(cc_command.unwrap_or_else(|| default_cc(family).to_string()));
+    }
     plat
 }
 
@@ -796,20 +1240,29 @@ fn platform_for_family(family: HostFamily, host_triple: String) -> Platform {
         HostFamily::Freebsd => freebsd::freebsd_platform(host_triple, is_64),
         HostFamily::Openbsd => openbsd::openbsd_platform(host_triple, is_64),
         HostFamily::Netbsd => netbsd::netbsd_platform(host_triple, is_64),
-        HostFamily::Msvc => windows::msvc_platform(host_triple, is_64),
+        HostFamily::Msvc => windows::msvc_platform(host_triple, is_64, None),
         HostFamily::Mingw => windows::mingw_platform(host_triple),
     }
 }
 
 fn snapshot_cc_command() -> Option<String> {
-    std::env::var("CC").ok().filter(|value| !value.is_empty())
+    std::env::var("CC").ok()
 }
 
+/// Upstream `DEFAULT_CC` (or the `__init__` default when the class has none):
+/// `Linux` inherits `BasePosix.DEFAULT_CC` (`gcc`); `Darwin.DEFAULT_CC`
+/// (`clang`); `Freebsd` inherits `BSD.DEFAULT_CC` (`clang`);
+/// `OpenBSD.DEFAULT_CC` (`cc`); `Netbsd.__init__` `get_env("CC", "gcc")`;
+/// `MingwPlatform.__init__` (`gcc`); `MsvcPlatform.__init__` passes
+/// `'cl.exe'` to `Platform.__init__` after `find_msvc_env` when `cc is None`.
 fn default_cc(family: HostFamily) -> &'static str {
     match family {
+        HostFamily::Linux => "gcc",
         HostFamily::Darwin => "clang",
-        HostFamily::Linux | HostFamily::Mingw => "gcc",
-        HostFamily::Freebsd | HostFamily::Openbsd | HostFamily::Netbsd => "cc",
+        HostFamily::Freebsd => "clang",
+        HostFamily::Openbsd => "cc",
+        HostFamily::Netbsd => "gcc",
+        HostFamily::Mingw => "gcc",
         HostFamily::Msvc => "cl.exe",
     }
 }
@@ -820,8 +1273,9 @@ fn discover_tools(
     family: HostFamily,
     fallback_link: &Path,
     fallback_masm: &Path,
+    c_environ: Option<&[(OsString, OsString)]>,
 ) -> Result<ResolvedTools, CompilationError> {
-    let cc = host_c_compiler(host_triple, cc_command)?;
+    let cc = host_c_compiler(host_triple, cc_command, c_environ)?;
     if family != HostFamily::Msvc {
         return Ok(ResolvedTools {
             cc,
@@ -839,8 +1293,10 @@ fn discover_tools(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("ml.exe");
-    let (link_tool, link_path) = windows::discover_msvc_sidecar(&cc, host_triple, link_name);
-    let (masm_tool, masm_path) = windows::discover_msvc_sidecar(&cc, host_triple, masm_name);
+    let (link_tool, link_path) =
+        windows::discover_msvc_sidecar(&cc, host_triple, link_name, c_environ);
+    let (masm_tool, masm_path) =
+        windows::discover_msvc_sidecar(&cc, host_triple, masm_name, c_environ);
     Ok(ResolvedTools {
         cc,
         link_tool,
@@ -851,10 +1307,12 @@ fn discover_tools(
 }
 
 /// `cc::Build` host-triple compiler selection. `cc_command` is the recorded
-/// `CC` override (`BasePosix.__init__`); `None` leaves discovery to `cc`.
-fn host_c_compiler(
+/// `CC` / `DEFAULT_CC` program (`BasePosix.__init__`); `None` is the
+/// `MsvcPlatform.__init__` `find_msvc_env` analog and leaves discovery to `cc`.
+pub(super) fn host_c_compiler(
     host_triple: &str,
     cc_command: Option<&str>,
+    c_environ: Option<&[(OsString, OsString)]>,
 ) -> Result<cc::Tool, CompilationError> {
     let mut build = cc::Build::new();
     build
@@ -864,20 +1322,38 @@ fn host_c_compiler(
         .cargo_metadata(false)
         .warnings(false);
     if let Some(cc) = cc_command {
-        let program = cc.split_whitespace().next().unwrap_or(cc);
-        if !compiler_exists(Path::new(program)) {
-            return Err(CompilationError {
-                out: String::new(),
-                err: format!("cannot find C compiler {program}"),
-            });
+        let mut words = cc.split_whitespace();
+        let program = words.next().unwrap_or(cc);
+        let program_path = Path::new(program);
+        let resolved = match resolve_compiler_on_path(program_path, c_environ) {
+            Some(path) => path,
+            None => {
+                return Err(CompilationError {
+                    out: String::new(),
+                    err: format!("cannot find C compiler {program}"),
+                });
+            }
+        };
+        // `Build::env` is not visible to `get_env` / `which` /
+        // `find_msvc_tools_find_tool` (those call `env::var_os`). When the
+        // snapshot is present, pass the snapshot-PATH absolute path so `cc`
+        // does not re-search the unpatched process PATH.
+        if c_environ.is_some() {
+            build.compiler(&resolved);
+        } else {
+            build.compiler(program);
         }
-        build.compiler(program);
+        // `Platform._execute_c_compiler`: `cclist = cc.split(); args = cclist[1:] + args`.
+        // `Build::flag` lands in `Tool::args()` / `to_command()`.
+        for extra in words {
+            build.flag(extra);
+        }
     }
     let tool = build.try_get_compiler().map_err(|err| CompilationError {
         out: String::new(),
         err: err.to_string(),
     })?;
-    if !compiler_exists(tool.path()) {
+    if !compiler_exists(tool.path(), c_environ) {
         return Err(CompilationError {
             out: String::new(),
             err: format!("cannot find C compiler {}", tool.path().display()),
@@ -886,33 +1362,188 @@ fn host_c_compiler(
     Ok(tool)
 }
 
-fn compiler_exists(path: &Path) -> bool {
-    if path.is_file() {
-        return true;
+fn compiler_exists(path: &Path, c_environ: Option<&[(OsString, OsString)]>) -> bool {
+    resolve_compiler_on_path(path, c_environ).is_some()
+}
+
+/// Snapshot keys match the OS-returned spelling. Windows env names are
+/// case-insensitive; POSIX names are case-sensitive.
+pub(super) fn env_name_eq(key: &OsString, name: &str) -> bool {
+    if key == std::ffi::OsStr::new(name) {
+        true
+    } else {
+        cfg!(windows) && key.to_str().is_some_and(|k| k.eq_ignore_ascii_case(name))
     }
-    if path.is_absolute() {
-        return false;
-    }
-    let Some(name) = path.file_name() else {
-        return false;
+}
+
+/// POSIX `execvp` / `Platform._execute_c_compiler`: a name is looked up on
+/// `PATH` only when it has no directory component. An absolute path or a
+/// path with a separator is used as given.
+fn path_has_directory_component(path: &Path) -> bool {
+    path.is_absolute() || path.components().count() > 1
+}
+
+/// Windows command-shell search sequence, reached through `_run_subprocess`
+/// (`runsubprocess.py` `_run`: `shell = shell_default`, `True` on win32) with
+/// `env=self.c_environ`. A name with an extension is matched exactly; a name
+/// without one gets each `PATHEXT` extension appended in order. A name with a
+/// directory component is looked up only there; a bare name is looked up in
+/// the current directory, then in each `PATH` entry (`;`-separated; a `"`
+/// toggles quoting and is dropped, and a `;` inside quotes belongs to the entry).
+fn shell_command_search(executable: &Path, path_var: &OsStr, pathext: &OsStr) -> Option<PathBuf> {
+    let exts: Vec<&OsStr> = if executable.extension().is_some() {
+        vec![OsStr::new("")]
+    } else {
+        pathext
+            .as_encoded_bytes()
+            .split(|&b| b == b';')
+            .filter(|piece| !piece.is_empty())
+            .map(|piece| {
+                // SAFETY: splitting on an ASCII byte yields valid encoded-bytes
+                // boundaries (documented on `OsStr::from_encoded_bytes_unchecked`).
+                unsafe { OsStr::from_encoded_bytes_unchecked(piece) }
+            })
+            .collect()
     };
-    let Ok(path_var) = std::env::var("PATH") else {
-        return false;
+
+    let candidate_name = |ext: &OsStr| {
+        let mut name = executable.as_os_str().to_os_string();
+        name.push(ext);
+        name
     };
-    std::env::split_paths(&path_var).any(|dir| {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return true;
+
+    if path_has_directory_component(executable) {
+        for ext in &exts {
+            let candidate = PathBuf::from(candidate_name(ext));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
-        cfg!(windows) && candidate.with_extension("exe").is_file()
-    })
+        return None;
+    }
+
+    for ext in &exts {
+        let candidate = PathBuf::from(candidate_name(ext));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    for dir in shell_path_entries(path_var) {
+        for ext in &exts {
+            let candidate = Path::new(&dir).join(candidate_name(ext));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Windows command-shell `PATH` entries: a `"` toggles quoting and is dropped;
+/// a `;` outside quotes ends the current entry, and a `;` inside quotes is kept.
+/// Empty entries are skipped. Models the shell that `_run_subprocess` `_run`
+/// reaches with `shell=True` on win32.
+fn shell_path_entries(path_var: &OsStr) -> Vec<OsString> {
+    let mut entries = Vec::new();
+    let mut current = Vec::new();
+    let mut in_quote = false;
+    for &b in path_var.as_encoded_bytes() {
+        if b == b'"' {
+            in_quote = !in_quote;
+        } else if b == b';' && !in_quote {
+            if !current.is_empty() {
+                // SAFETY: only ASCII bytes `"`/`;` are removed or split on, so
+                // the remaining pieces are valid encoded bytes per
+                // `OsStr::from_encoded_bytes_unchecked` docs.
+                entries.push(unsafe {
+                    OsString::from_encoded_bytes_unchecked(std::mem::take(&mut current))
+                });
+            }
+        } else {
+            current.push(b);
+        }
+    }
+    if !current.is_empty() {
+        // SAFETY: only ASCII bytes `"`/`;` are removed or split on, so the
+        // remaining pieces are valid encoded bytes per
+        // `OsStr::from_encoded_bytes_unchecked` docs.
+        entries.push(unsafe { OsString::from_encoded_bytes_unchecked(current) });
+    }
+    entries
+}
+
+/// Locate `path` as a compiler. Windows is the command-shell search
+/// sequence reached through `_run_subprocess` (`runsubprocess.py` `_run`:
+/// `shell = shell_default`, `True` on win32) with `env=self.c_environ`.
+/// POSIX (`execvp` / `Platform._execute_c_compiler`) returns a
+/// path with a directory component only when it is a file, and searches
+/// `PATH` for a bare name only. `PATH` is taken from `c_environ` when
+/// given (`MsvcPlatform.__init__` snapshot after `patch_os_env`) and the
+/// process `PATH` otherwise. Windows `PATHEXT` is taken from that snapshot
+/// or the process environment, defaulting to `.COM;.EXE;.BAT;.CMD`.
+pub(super) fn resolve_compiler_on_path(
+    path: &Path,
+    c_environ: Option<&[(OsString, OsString)]>,
+) -> Option<PathBuf> {
+    if cfg!(windows) {
+        let path_var = match c_environ {
+            Some(environ) => environ
+                .iter()
+                .find(|(key, _)| env_name_eq(key, "PATH"))
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default(),
+            None => std::env::var_os("PATH").unwrap_or_default(),
+        };
+        let pathext = match c_environ {
+            Some(environ) => environ
+                .iter()
+                .find(|(key, _)| env_name_eq(key, "PATHEXT"))
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD")),
+            None => {
+                std::env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"))
+            }
+        };
+        shell_command_search(path, &path_var, &pathext)
+    } else {
+        if path_has_directory_component(path) {
+            return path.is_file().then(|| path.to_path_buf());
+        }
+        let name = path.file_name()?;
+        let path_var = match c_environ {
+            Some(environ) => environ
+                .iter()
+                .find(|(key, _)| env_name_eq(key, "PATH"))
+                .map(|(_, value)| value.clone())?,
+            None => std::env::var_os("PATH")?,
+        };
+        std::env::split_paths(&path_var).find_map(|dir| {
+            let candidate = dir.join(name);
+            candidate.is_file().then_some(candidate)
+        })
+    }
 }
 
 pub(crate) fn host_triple() -> String {
     std::env::var("HOST").unwrap_or_else(|_| env!("MAJIT_TRANSLATE_HOST").to_string())
 }
 
-/// `sys.platform` / `os.name` dispatch in `translator.platform`.
+/// `_get_compiler_type` (`windows.py`): empty/missing `cc` → `MsvcPlatform`;
+/// `cc.startswith('mingw')` or `cc == 'gcc'` → `MingwPlatform`; else
+/// `MsvcPlatform`.
+fn _get_compiler_type(cc_command: Option<&str>) -> HostFamily {
+    let cc = cc_command.unwrap_or("");
+    if cc.is_empty() {
+        HostFamily::Msvc
+    } else if cc.starts_with("mingw") || cc == "gcc" {
+        HostFamily::Mingw
+    } else {
+        HostFamily::Msvc
+    }
+}
+
+/// `sys.platform` / `os.name` dispatch in `translator.platform`. On Windows
+/// the family follows `_get_compiler_type` over the recorded `CC` snapshot.
 pub(crate) fn host_family() -> HostFamily {
     match std::env::consts::OS {
         "linux" => HostFamily::Linux,
@@ -921,74 +1552,84 @@ pub(crate) fn host_family() -> HostFamily {
         "openbsd" => HostFamily::Openbsd,
         "netbsd" => HostFamily::Netbsd,
         "windows" => {
-            if cfg!(target_env = "msvc") {
-                HostFamily::Msvc
-            } else {
-                HostFamily::Mingw
-            }
+            let _guard = CC_COMMAND_LOCK.lock();
+            _get_compiler_type(snapshot_cc_command().as_deref())
         }
         _ => HostFamily::Linux,
     }
 }
 
+/// `name` of the object `host_factory()` returns (`Darwin_arm64.name` is
+/// `darwin_arm64`; `MsvcPlatform.name` is `msvc`; `MingwPlatform.name` is
+/// `mingw32`).
 fn host_platform_name() -> String {
-    if cfg!(target_env = "msvc") {
-        "msvc".to_string()
-    } else if cfg!(target_os = "macos") {
-        "darwin".to_string()
-    } else if cfg!(target_os = "linux") {
-        "linux".to_string()
-    } else {
-        std::env::consts::OS.to_string()
+    match host_class_name() {
+        "Darwin_arm64" => "darwin_arm64".to_string(),
+        "Darwin_x86_64" => "darwin_x86_64".to_string(),
+        "Darwin_i386" => "darwin_i386".to_string(),
+        "Darwin_PowerPC" => "darwin_powerpc".to_string(),
+        "Darwin" => "darwin".to_string(),
+        "Linux" => "linux".to_string(),
+        "MsvcPlatform" => "msvc".to_string(),
+        "MingwPlatform" => "mingw32".to_string(),
+        "Freebsd" | "Freebsd_64" => "freebsd".to_string(),
+        "OpenBSD" | "OpenBSD_64" => "openbsd".to_string(),
+        "Netbsd" | "Netbsd_64" => "netbsd".to_string(),
+        _ => std::env::consts::OS.to_string(),
     }
 }
 
+/// Class of the object `host_factory()` returns. `Windows` / `Windows_x64`
+/// are factory functions, so the Windows class is `MsvcPlatform` or
+/// `MingwPlatform`. Darwin uses `Darwin_arm64` / `Darwin_x86_64` /
+/// `Darwin_i386` / `Darwin_PowerPC` / `Darwin`.
 fn host_class_name() -> &'static str {
-    if cfg!(all(windows, target_env = "msvc")) {
-        if cfg!(target_pointer_width = "64") {
-            "Windows_x64"
-        } else {
-            "Windows"
+    match host_family() {
+        HostFamily::Linux => "Linux",
+        HostFamily::Darwin => {
+            if cfg!(target_arch = "aarch64") {
+                "Darwin_arm64"
+            } else if cfg!(target_arch = "x86_64") {
+                "Darwin_x86_64"
+            } else if cfg!(target_arch = "x86") {
+                "Darwin_i386"
+            } else if cfg!(any(target_arch = "powerpc", target_arch = "powerpc64")) {
+                "Darwin_PowerPC"
+            } else {
+                "Darwin"
+            }
         }
-    } else if cfg!(target_os = "macos") {
-        if cfg!(target_arch = "aarch64") {
-            "Darwin_arm64"
-        } else if cfg!(target_arch = "x86_64") {
-            "Darwin_x86_64"
-        } else {
-            "Darwin"
+        HostFamily::Freebsd => {
+            if cfg!(target_pointer_width = "64") {
+                "Freebsd_64"
+            } else {
+                "Freebsd"
+            }
         }
-    } else if cfg!(target_os = "linux") {
-        "Linux"
-    } else if cfg!(windows) {
-        "MingwPlatform"
-    } else if cfg!(target_os = "freebsd") {
-        if cfg!(target_pointer_width = "64") {
-            "Freebsd_64"
-        } else {
-            "Freebsd"
+        HostFamily::Openbsd => {
+            if cfg!(target_pointer_width = "64") {
+                "OpenBSD_64"
+            } else {
+                "OpenBSD"
+            }
         }
-    } else if cfg!(target_os = "openbsd") {
-        if cfg!(target_pointer_width = "64") {
-            "OpenBSD_64"
-        } else {
-            "OpenBSD"
+        HostFamily::Netbsd => {
+            if cfg!(target_pointer_width = "64") {
+                "Netbsd_64"
+            } else {
+                "Netbsd"
+            }
         }
-    } else if cfg!(target_os = "netbsd") {
-        if cfg!(target_pointer_width = "64") {
-            "Netbsd_64"
-        } else {
-            "Netbsd"
-        }
-    } else {
-        "Linux"
+        HostFamily::Msvc => "MsvcPlatform",
+        HostFamily::Mingw => "MingwPlatform",
     }
 }
 
 /// `BasePosix.relevant_environ` / `MsvcPlatform.relevant_environ`.
+/// `MingwPlatform` inherits `BasePosix.relevant_environ`.
 pub(crate) fn host_relevant_environ() -> &'static [&'static str] {
     match host_family() {
-        HostFamily::Msvc | HostFamily::Mingw => windows::RELEVANT_ENVIRON,
+        HostFamily::Msvc => windows::RELEVANT_ENVIRON,
         _ => posix::RELEVANT_ENVIRON,
     }
 }
@@ -1062,6 +1703,29 @@ pub(crate) fn format_platform_key_unresolved(
     bits.join(" ")
 }
 
+/// `Platform.key` from the configured `cc` string (ARM never discovers a host
+/// compiler, `ARM._execute_c_compiler`); bits and `%r` rendering as upstream.
+pub(crate) fn format_platform_key_configured(
+    class_name: &str,
+    cc: &str,
+    relevant_env: &[(&str, Option<OsString>)],
+) -> String {
+    let mut bits = Vec::new();
+    bits.push(class_name.to_string());
+    bits.push(format!("cc={}", py_bytes_repr(cc.as_bytes())));
+    for (name, value) in relevant_env {
+        bits.push(format!(
+            "{name}={}",
+            match value {
+                Some(v) => py_bytes_repr(v.as_encoded_bytes()),
+                None => "None".to_string(),
+            }
+        ));
+    }
+    bits.push(format!("sys.maxint={}", isize::MAX));
+    bits.join(" ")
+}
+
 /// Free-function helper for call sites that do not need a platform value.
 pub fn execute(
     executable: impl AsRef<Path>,
@@ -1113,19 +1777,61 @@ pub fn execute(
         ),
     })?;
     Ok(ExecutionResult::new(
-        output.status.code().unwrap_or(-1),
+        popen_returncode(output.status),
         output.stdout,
         output.stderr,
     ))
 }
 
 fn abs_path(path: &Path) -> PathBuf {
-    if path.is_absolute() {
+    let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()
             .map(|cwd| cwd.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
+    };
+    lexical_normpath(&joined)
+}
+
+/// `os.path.normpath` / `py.path.local`: collapse `.`, `..`, and duplicate
+/// separators lexically, without resolving symlinks (`canonicalize`).
+/// On POSIX, `posixpath.normpath` keeps a leading `//` (exactly two slashes)
+/// and collapses three or more to one.
+pub(super) fn lexical_normpath(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::Prefix(_) | Component::RootDir) => {}
+                _ => out.push(component),
+            },
+            component => out.push(component),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        #[cfg(unix)]
+        {
+            // `posixpath.normpath`: `initial_slashes = 2` when the path
+            // starts with exactly `//` (not `///`). Rebuild on `OsStr` bytes.
+            use std::os::unix::ffi::{OsStrExt, OsStringExt};
+            let raw = path.as_os_str().as_bytes();
+            if raw.starts_with(b"//") && !raw.starts_with(b"///") {
+                let out_bytes = out.as_os_str().as_bytes();
+                let rest = out_bytes.strip_prefix(b"/").unwrap_or(out_bytes);
+                let mut bytes = Vec::with_capacity(2 + rest.len());
+                bytes.extend_from_slice(b"//");
+                bytes.extend_from_slice(rest);
+                return PathBuf::from(OsString::from_vec(bytes));
+            }
+        }
+        out
     }
 }
 
@@ -1165,8 +1871,27 @@ fn prepend_pypy_localbase_from(
     }
 }
 
+/// `os.environ['PYPY_LOCALBASE'] + '/include'` (resp. `'/lib'`).
+fn prepend_pypy_localbase_strings(
+    dirs: Vec<OsString>,
+    suffix: &str,
+    localbase: Option<OsString>,
+) -> Vec<OsString> {
+    match localbase {
+        Some(localbase) => {
+            let mut s = localbase.clone();
+            s.push("/");
+            s.push(suffix);
+            let mut out = vec![s];
+            out.extend(dirs);
+            out
+        }
+        None => dirs,
+    }
+}
+
 /// Parent of the `rpython` package; `rpython.tool.version.rpythonroot`.
-fn rpythonroot() -> PathBuf {
+pub(super) fn rpythonroot() -> PathBuf {
     let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     root.pop();
     root.pop();
@@ -1179,6 +1904,7 @@ fn normalize_newlines(s: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::windows;
     use super::*;
     use std::fs;
 
@@ -1189,6 +1915,20 @@ mod tests {
         assert_eq!(result.returncode, 7);
         assert_eq!(result.out, "a\nb\n");
         assert_eq!(result.err, "e\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn popen_returncode_reports_signal_as_negative() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            popen_returncode(std::process::ExitStatus::from_raw(15)),
+            -15
+        );
+        assert_eq!(
+            popen_returncode(std::process::ExitStatus::from_raw(3 << 8)),
+            3
+        );
     }
 
     #[test]
@@ -1228,6 +1968,20 @@ mod tests {
     }
 
     #[test]
+    fn format_platform_key_configured_matches_upstream_repr() {
+        let key = format_platform_key_configured(
+            "ARM",
+            "gcc -O2",
+            &[("CC", None), ("CFLAGS", Some(OsString::from("it's")))],
+        );
+        let expected = format!(
+            "ARM cc='gcc -O2' CC=None CFLAGS=\"it's\" sys.maxint={}",
+            isize::MAX
+        );
+        assert_eq!(key, expected);
+    }
+
+    #[test]
     fn key_differs_when_compiler_args_differ() {
         let path = Path::new("cc");
         let triple = "x86_64-unknown-linux-gnu";
@@ -1254,7 +2008,7 @@ mod tests {
     #[test]
     fn relevant_environ_matches_host_family() {
         match host_family() {
-            HostFamily::Msvc | HostFamily::Mingw => {
+            HostFamily::Msvc => {
                 assert_eq!(host_relevant_environ(), &["PATH", "INCLUDE", "LIB"]);
             }
             _ => {
@@ -1264,6 +2018,11 @@ mod tests {
                 );
             }
         }
+        let mingw = windows::mingw_platform(host_triple());
+        assert_eq!(
+            mingw.relevant_environ,
+            &["CPATH", "LIBRARY_PATH", "C_INCLUDE_PATH"]
+        );
     }
 
     #[test]
@@ -1274,8 +2033,11 @@ mod tests {
         assert_eq!(host_family(), HostFamily::Linux);
         #[cfg(target_os = "freebsd")]
         assert_eq!(host_family(), HostFamily::Freebsd);
-        #[cfg(all(windows, target_env = "msvc"))]
-        assert_eq!(host_family(), HostFamily::Msvc);
+        #[cfg(windows)]
+        assert!(matches!(
+            host_family(),
+            HostFamily::Msvc | HostFamily::Mingw
+        ));
     }
 
     #[cfg(target_os = "macos")]
@@ -1302,6 +2064,147 @@ mod tests {
             std::process::id(),
             COMPILE_SEQ.fetch_add(1, Ordering::Relaxed)
         )
+    }
+
+    #[test]
+    fn compiler_exists_reads_snapshot_path() {
+        let dir = crate::tool::udir::udir().join(unique("cc-snap"));
+        fs::create_dir_all(&dir).unwrap();
+        let stem = unique("probe-cc");
+        let exe_name = if cfg!(windows) {
+            format!("{stem}.exe")
+        } else {
+            stem
+        };
+        let exe = dir.join(&exe_name);
+        fs::write(&exe, b"").unwrap();
+        let snapshot = [(OsString::from("PATH"), dir.as_os_str().to_os_string())];
+        assert!(
+            compiler_exists(Path::new(&exe_name), Some(&snapshot)),
+            "snapshot PATH must find {}",
+            exe.display()
+        );
+        let empty = [(OsString::from("PATH"), OsString::from(""))];
+        assert!(
+            !compiler_exists(Path::new(&exe_name), Some(&empty)),
+            "empty snapshot PATH must not find {}",
+            exe.display()
+        );
+    }
+
+    #[test]
+    fn resolve_compiler_on_path_does_not_search_path_for_dir_component() {
+        let dir = crate::tool::udir::udir().join(unique("cc-dir-comp"));
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("cc-name");
+        fs::write(&exe, b"").unwrap();
+        if cfg!(windows) {
+            fs::write(dir.join("cc-name.exe"), b"").unwrap();
+        }
+        let snapshot = [(OsString::from("PATH"), dir.as_os_str().to_os_string())];
+        assert_eq!(
+            resolve_compiler_on_path(Path::new("missing-dir/cc-name"), Some(&snapshot)),
+            None
+        );
+    }
+
+    #[test]
+    fn shell_command_search_keeps_exact_name() {
+        let dir = crate::tool::udir::udir().join(unique("shell-exact"));
+        fs::create_dir_all(&dir).unwrap();
+        let cl = dir.join("cl.exe");
+        fs::write(&cl, b"").unwrap();
+        fs::write(dir.join("cl.exe.exe"), b"").unwrap();
+        assert_eq!(
+            shell_command_search(&cl, OsStr::new(""), OsStr::new(".COM;.EXE")),
+            Some(cl)
+        );
+    }
+
+    #[test]
+    fn shell_command_search_appends_pathext_in_order() {
+        let dir = crate::tool::udir::udir().join(unique("shell-pathext"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("tool.BAT"), b"").unwrap();
+        fs::write(dir.join("tool.EXE"), b"").unwrap();
+        let pathext = OsStr::new(".COM;.EXE;.BAT");
+        assert_eq!(
+            shell_command_search(&dir.join("tool"), OsStr::new(""), pathext),
+            Some(dir.join("tool.EXE"))
+        );
+
+        let dir2 = crate::tool::udir::udir().join(unique("shell-pathext-bare"));
+        fs::create_dir_all(&dir2).unwrap();
+        fs::write(dir2.join("tool"), b"").unwrap();
+        assert_eq!(
+            shell_command_search(&dir2.join("tool"), OsStr::new(""), pathext),
+            None
+        );
+    }
+
+    #[test]
+    fn shell_command_search_bare_name_on_path() {
+        let dir = crate::tool::udir::udir().join(unique("shell-path"));
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("cc-bare.exe");
+        fs::write(&exe, b"").unwrap();
+        let pathext = OsStr::new(".COM;.EXE");
+        assert_eq!(
+            shell_command_search(Path::new("cc-bare.exe"), dir.as_os_str(), pathext),
+            Some(exe.clone())
+        );
+
+        let missing = dir.join("missing-path-entry");
+        assert!(!missing.exists());
+        let mut path_var = missing.into_os_string();
+        path_var.push(";");
+        path_var.push(dir.as_os_str());
+        assert_eq!(
+            shell_command_search(Path::new("cc-bare.exe"), &path_var, pathext),
+            Some(exe)
+        );
+    }
+
+    #[test]
+    fn shell_command_search_dir_component_does_not_search_path() {
+        let dir = crate::tool::udir::udir().join(unique("shell-dir-comp"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cc-x.exe"), b"").unwrap();
+        assert_eq!(
+            shell_command_search(
+                Path::new("missing-dir/cc-x.exe"),
+                dir.as_os_str(),
+                OsStr::new(".COM;.EXE")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn shell_path_entries_drops_quotes_and_splits_outside() {
+        assert_eq!(
+            shell_path_entries(OsStr::new("\"C:\\tools\";C:\\Windows")),
+            vec![OsString::from("C:\\tools"), OsString::from("C:\\Windows")]
+        );
+        assert_eq!(
+            shell_path_entries(OsStr::new("\"a;b\";c;;")),
+            vec![OsString::from("a;b"), OsString::from("c")]
+        );
+    }
+
+    #[test]
+    fn shell_command_search_quoted_path_entry() {
+        let dir = crate::tool::udir::udir().join(unique("shell-quoted"));
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("cc-q.exe");
+        fs::write(&exe, b"").unwrap();
+        let mut path_var = OsString::from("\"");
+        path_var.push(dir.as_os_str());
+        path_var.push("\"");
+        assert_eq!(
+            shell_command_search(Path::new("cc-q.exe"), &path_var, OsStr::new(".EXE")),
+            Some(exe)
+        );
     }
 
     fn write_udir(rel: &str, contents: &str) -> PathBuf {
@@ -1500,13 +2403,46 @@ mod tests {
     }
 
     #[test]
-    fn host_cpp_linker_name_matches_family() {
-        let plat = silent_host();
-        match plat.family() {
-            HostFamily::Darwin => assert_eq!(plat.cpp_linker_name(), "clang++"),
-            HostFamily::Msvc => assert_eq!(plat.cpp_linker_name(), "g++"),
-            _ => assert_eq!(plat.cpp_linker_name(), "g++"),
+    fn cpp_link_drops_cc_extra_words() {
+        let plat = host_platform_with_cc(Some("g++ -m32".into()));
+        plat.log_errors.store(false, Ordering::Relaxed);
+        if plat.is_msvc() {
+            return;
         }
+        let cc = plat.cc().expect("g++ must exist for this test");
+        let compile_cmd = plat.spawn_compiler(cc.path());
+        assert!(
+            compile_cmd.get_args().any(|arg| arg == "-m32"),
+            "compile keeps CC extra words: {:?}",
+            compile_cmd.get_args().collect::<Vec<_>>()
+        );
+        let eci = ExternalCompilationInfo {
+            use_cpp_linker: true,
+            ..ExternalCompilationInfo::default()
+        };
+        let link_cmd = plat.link_command(&plat.cc_link_program(&eci), true);
+        assert!(
+            link_cmd.get_args().all(|arg| arg != "-m32"),
+            "use_cpp_linker link drops CC extra words: {:?}",
+            link_cmd.get_args().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cpp_linker_is_gpp_on_every_family() {
+        for family in [
+            HostFamily::Linux,
+            HostFamily::Darwin,
+            HostFamily::Freebsd,
+            HostFamily::Openbsd,
+            HostFamily::Netbsd,
+            HostFamily::Msvc,
+            HostFamily::Mingw,
+        ] {
+            let plat = platform_for_family(family, host_triple());
+            assert_eq!(plat.cpp_linker_name(), "g++", "{family:?}");
+        }
+        let plat = silent_host();
         let eci = ExternalCompilationInfo {
             use_cpp_linker: true,
             ..ExternalCompilationInfo::default()
@@ -1560,6 +2496,68 @@ mod tests {
         let _ = plat.relevant_environ;
     }
 
+    #[test]
+    fn default_cc_matches_upstream_class_attribute() {
+        assert_eq!(default_cc(HostFamily::Linux), "gcc");
+        assert_eq!(default_cc(HostFamily::Darwin), "clang");
+        assert_eq!(default_cc(HostFamily::Freebsd), "clang");
+        assert_eq!(default_cc(HostFamily::Openbsd), "cc");
+        assert_eq!(default_cc(HostFamily::Netbsd), "gcc");
+        assert_eq!(default_cc(HostFamily::Mingw), "gcc");
+        assert_eq!(default_cc(HostFamily::Msvc), "cl.exe");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn host_platform_with_cc_none_applies_default_cc() {
+        let plat = host_platform_with_cc(None);
+        assert_eq!(plat.cc_command.as_deref(), Some(default_cc(host_family())));
+    }
+
+    #[test]
+    fn host_platform_with_cc_keeps_present_empty_string() {
+        let plat = host_platform_with_cc(Some(String::new()));
+        if plat.is_msvc() {
+            assert_eq!(plat.cc_command.as_deref(), Some("cl.exe"));
+            assert_eq!(plat.family, HostFamily::Msvc);
+        } else {
+            assert_eq!(plat.cc_command.as_deref(), Some(""));
+        }
+    }
+
+    #[test]
+    fn pick_platform_empty_cc_matches_none() {
+        let _guard = CC_COMMAND_LOCK.lock();
+        let empty = pick_platform("host", Some(String::new())).unwrap();
+        let none = pick_platform("host", None).unwrap();
+        assert_eq!(empty.cc_command, none.cc_command);
+        assert_eq!(empty, none);
+    }
+
+    #[test]
+    fn snapshot_cc_command_keeps_empty_env() {
+        let _guard = CC_COMMAND_LOCK.lock();
+        let prior = std::env::var_os("CC");
+        unsafe {
+            std::env::set_var("CC", "");
+        }
+        let snap = snapshot_cc_command();
+        let plat = host_platform();
+        unsafe {
+            match prior {
+                Some(value) => std::env::set_var("CC", value),
+                None => std::env::remove_var("CC"),
+            }
+        }
+        assert_eq!(snap.as_deref(), Some(""));
+        if plat.is_msvc() {
+            assert_eq!(plat.cc_command.as_deref(), Some("cl.exe"));
+            assert_eq!(plat.family, HostFamily::Msvc);
+        } else {
+            assert_eq!(plat.cc_command.as_deref(), Some(""));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn host_with_missing_cc_constructs_and_execute_works() {
@@ -1605,6 +2603,199 @@ mod tests {
         assert!(
             !err.err.is_empty() || !err.out.is_empty(),
             "expected CompilationError, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn platform_eq_ignores_lazy_cc_cache() {
+        let a = Platform::host();
+        let b = Platform::host();
+        assert_eq!(a, b);
+        let _ = a.key();
+        assert_eq!(a, b);
+        let c = host_platform_with_cc(Some("majit-platform-eq-other-cc".into()));
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn platform_eq_c_environ_ignores_order() {
+        let mut a = windows::msvc_platform(host_triple(), true, None);
+        let mut b = windows::msvc_platform(host_triple(), true, None);
+        a.c_environ = Some(vec![
+            (OsString::from("PATH"), OsString::from("a")),
+            (OsString::from("INCLUDE"), OsString::from("b")),
+        ]);
+        b.c_environ = Some(vec![
+            (OsString::from("INCLUDE"), OsString::from("b")),
+            (OsString::from("PATH"), OsString::from("a")),
+        ]);
+        assert_eq!(a, b);
+        b.c_environ = Some(vec![
+            (OsString::from("INCLUDE"), OsString::from("b")),
+            (OsString::from("PATH"), OsString::from("other")),
+        ]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn c_environ_eq_windows_keys_are_case_insensitive() {
+        let left = Some(vec![(OsString::from("Path"), OsString::from("x"))]);
+        let right = Some(vec![(OsString::from("PATH"), OsString::from("x"))]);
+        assert_eq!(c_environ_eq(&left, &right), cfg!(windows));
+    }
+
+    #[test]
+    fn get_compiler_type_matches_windows() {
+        assert_eq!(_get_compiler_type(None), HostFamily::Msvc);
+        assert_eq!(_get_compiler_type(Some("")), HostFamily::Msvc);
+        assert_eq!(_get_compiler_type(Some("gcc")), HostFamily::Mingw);
+        assert_eq!(_get_compiler_type(Some("mingw32-gcc")), HostFamily::Mingw);
+        assert_eq!(_get_compiler_type(Some("cl.exe")), HostFamily::Msvc);
+        assert_eq!(_get_compiler_type(Some("gcc-12")), HostFamily::Msvc);
+    }
+
+    #[test]
+    fn set_platform_host_binds_platform_and_host() {
+        let _guard = CC_COMMAND_LOCK.lock();
+        set_platform("host", None).expect("set_platform host");
+        assert_eq!(*platform(), *host());
+        assert!(is_host_build());
+        set_platform("host", None).expect("restore host platform");
+    }
+
+    #[test]
+    fn cc_command_extra_args_are_passed_to_compiler() {
+        let host = silent_host();
+        let Ok(cc) = host.cc() else {
+            return;
+        };
+        let program = cc.path().display().to_string();
+        // `_execute_c_compiler` splits `cc` on whitespace (`cc.split()`), so a
+        // compiler path containing whitespace cannot be spelled in `cc`.
+        if program.split_whitespace().nth(1).is_some() {
+            return;
+        }
+        let plat = host_platform_with_cc(Some(format!("{program} -DPYRE_CC_ARG_TEST=1")));
+        plat.log_errors.store(false, Ordering::Relaxed);
+        let cfile = write_udir(
+            &format!("{}.c", unique("cc-arg")),
+            "#ifndef PYRE_CC_ARG_TEST\n#error missing\n#endif\nint main(void){return 0;}\n",
+        );
+        plat.compile(
+            std::slice::from_ref(&cfile),
+            &ExternalCompilationInfo::default(),
+            None,
+            true,
+        )
+        .expect("CC extra args must reach the compiler");
+    }
+
+    #[test]
+    fn finish_linking_appends_so_ext_to_outputfilename() {
+        let plat = silent_host();
+        let cfile = write_udir(
+            &format!("{}.c", unique("debug-so")),
+            "int func(void) { return 1; }\n",
+        );
+        let dylib = plat
+            .compile(
+                std::slice::from_ref(&cfile),
+                &ExternalCompilationInfo::default(),
+                Some("probe.debug"),
+                false,
+            )
+            .expect("shared probe.debug");
+        let expected_suffix = format!("probe.debug.{}", plat.so_ext);
+        let name = dylib.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.ends_with(&expected_suffix),
+            "expected name to end with {expected_suffix}, got {name}"
+        );
+        assert!(dylib.exists(), "expected {}", dylib.display());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn lexical_normpath_keeps_exactly_two_leading_slashes() {
+        assert_eq!(
+            lexical_normpath(Path::new("//server/src/../a.c")),
+            PathBuf::from("//server/a.c")
+        );
+        assert_eq!(
+            lexical_normpath(Path::new("///x/./y")),
+            PathBuf::from("/x/y")
+        );
+        assert_eq!(
+            lexical_normpath(Path::new("/a/./b/../c")),
+            PathBuf::from("/a/c")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lexical_normpath_keeps_non_utf8_bytes_with_double_slash() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(
+            lexical_normpath(Path::new(OsStr::from_bytes(b"//srv/\xff/../a.c")))
+                .as_os_str()
+                .as_bytes(),
+            b"//srv/a.c"
+        );
+        assert_eq!(
+            lexical_normpath(Path::new(OsStr::from_bytes(b"//srv/\xff/a.c")))
+                .as_os_str()
+                .as_bytes(),
+            b"//srv/\xff/a.c"
+        );
+    }
+
+    #[test]
+    fn all_cfiles_normalises_lexical_duplicates() {
+        let plat = Platform::host();
+        let files = plat._all_cfiles(
+            &[
+                Path::new("src.c"),
+                Path::new("dir/../src.c"),
+                Path::new("./src.c"),
+            ],
+            &ExternalCompilationInfo::default(),
+        );
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn mingw_handle_error_appends_stdout_after_stderr() {
+        let plat = windows::mingw_platform(host_triple());
+        let dir = crate::tool::udir::udir().join(unique("mingw-err"));
+        fs::create_dir_all(&dir).unwrap();
+        let outname = dir.join("out.o");
+        let err = plat
+            ._handle_error(1, b"OUT".to_vec(), b"ERR".to_vec(), &outname)
+            .expect_err("nonzero returncode");
+        assert_eq!(err.out, "");
+        assert_eq!(err.err, "ERROUT");
+        let written = fs::read_to_string(outname.with_extension("errors")).unwrap();
+        assert_eq!(written, "ERROUT");
+    }
+
+    #[test]
+    #[should_panic(expected = ".errors")]
+    fn handle_error_write_failure_names_errors_file() {
+        let plat = windows::mingw_platform(host_triple());
+        let outname = crate::tool::udir::udir()
+            .join(unique("missing-dir"))
+            .join("nested")
+            .join("out.o");
+        let _ = plat._handle_error(1, b"OUT".to_vec(), b"ERR".to_vec(), &outname);
+    }
+
+    #[test]
+    fn pick_platform_bogus_errors() {
+        let err = pick_platform("bogus", None).expect_err("bogus platform");
+        assert!(
+            err.contains("platform = bogus"),
+            "expected platform = bogus in {err}"
         );
     }
 }

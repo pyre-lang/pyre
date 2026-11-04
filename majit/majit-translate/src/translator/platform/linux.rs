@@ -44,6 +44,30 @@ pub(super) fn linux_platform(host_triple: String, s390x: bool) -> Platform {
     )
 }
 
+/// `Linux._include_dirs_for_libffi`.
+pub(super) fn _include_dirs_for_libffi(
+    plat: &Platform,
+) -> Result<Vec<OsString>, super::posix::ValueError> {
+    plat._pkg_config(
+        "libffi",
+        "--cflags-only-I",
+        vec![OsString::from("/usr/include/libffi")],
+        true,
+    )
+}
+
+/// `Linux._library_dirs_for_libffi`.
+pub(super) fn _library_dirs_for_libffi(
+    plat: &Platform,
+) -> Result<Vec<OsString>, super::posix::ValueError> {
+    plat._pkg_config(
+        "libffi",
+        "--libs-only-L",
+        vec![OsString::from("/usr/lib/libffi")],
+        true,
+    )
+}
+
 /// `s390x.update_cflags`.
 pub(crate) fn s390x_update_cflags(mut cflags: Vec<OsString>) -> Vec<OsString> {
     let has_march = cflags

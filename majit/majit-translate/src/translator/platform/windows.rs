@@ -4,18 +4,23 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use super::{CompilerInvocation, FamilySpec, HostFamily, Platform, os_flags, prefixed_path};
+use super::{
+    CompilerInvocation, FamilySpec, HostFamily, Platform, env_name_eq, host_c_compiler, os_flags,
+    posix, prefixed_path, resolve_compiler_on_path, rpythonroot,
+};
 
 pub(super) const RELEVANT_ENVIRON: &[&str] = &["PATH", "INCLUDE", "LIB"];
 
-/// `MsvcPlatform` (`Windows` / `Windows_x64`).
-pub(super) fn msvc_platform(host_triple: String, x64: bool) -> Platform {
+/// `MsvcPlatform` returned by the `Windows` / `Windows_x64` factory functions.
+/// Those names are factories, not classes; `class_name` is `MsvcPlatform`.
+/// `x64` still selects `ml64.exe` vs `ml.exe`.
+pub(super) fn msvc_platform(host_triple: String, x64: bool, cc: Option<String>) -> Platform {
     let masm_name = if x64 { "ml64.exe" } else { "ml.exe" };
-    Platform::from_spec(
+    let mut plat = Platform::from_spec(
         host_triple,
         FamilySpec {
             name: "msvc".to_string(),
-            class_name: if x64 { "Windows_x64" } else { "Windows" },
+            class_name: "MsvcPlatform",
             family: HostFamily::Msvc,
             relevant_environ: RELEVANT_ENVIRON,
             cflags: os_flags(["/MD", "/O2"]),
@@ -33,7 +38,43 @@ pub(super) fn msvc_platform(host_triple: String, x64: bool) -> Platform {
             link_path: PathBuf::from("link.exe"),
             masm_path: PathBuf::from(masm_name),
         },
-    )
+    );
+    // `MsvcPlatform.__init__`: `patch_os_env(self.externals)` then
+    // `self.c_environ = os.environ.copy()` always run. Process-wide
+    // `set_var` is not used (unsafe in this edition and races other threads);
+    // the captured mapping is the snapshot. `if cc is None:` runs
+    // `find_msvc_env` (`host_c_compiler`) and
+    // `self.c_environ.update(msvc_compiler_environ)` (`merged_compiler_environ`);
+    // an empty/failed `msvc_compiler_environ` leaves the snapshot unchanged.
+    // Then `Platform.__init__(self, 'cl.exe')` whether or not `find_msvc_env`
+    // found an environment. `else: self.cc = cc`. After construction
+    // `cc_command` is always `Some`.
+    let patch = patch_os_env(&rpythonroot().join("externals"), |name| {
+        std::env::var(name).ok()
+    });
+    let mut c_environ: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    for (name, value) in patch {
+        let name_os = OsString::from(&name);
+        let value_os = OsString::from(value);
+        if let Some((_, existing)) = c_environ
+            .iter_mut()
+            .find(|(key, _)| env_name_eq(key, name.as_str()))
+        {
+            *existing = value_os;
+        } else {
+            c_environ.push((name_os, value_os));
+        }
+    }
+    if cc.is_none() {
+        if let Ok(tool) = host_c_compiler(&plat.host_triple, None, Some(&c_environ)) {
+            c_environ = merged_compiler_environ(Some(&c_environ), tool.env());
+        }
+        plat.cc_command = Some("cl.exe".to_string());
+    } else {
+        plat.cc_command = cc;
+    }
+    plat.c_environ = Some(c_environ);
+    plat
 }
 
 /// `MingwPlatform`.
@@ -44,7 +85,7 @@ pub(super) fn mingw_platform(host_triple: String) -> Platform {
             name: "mingw32".to_string(),
             class_name: "MingwPlatform",
             family: HostFamily::Mingw,
-            relevant_environ: RELEVANT_ENVIRON,
+            relevant_environ: posix::RELEVANT_ENVIRON,
             cflags: os_flags(["-O3"]),
             link_flags: Vec::new(),
             standalone_only: Vec::new(),
@@ -58,13 +99,98 @@ pub(super) fn mingw_platform(host_triple: String) -> Platform {
     )
 }
 
-/// `MsvcPlatform.link` / `MsvcPlatform.masm`: `cc::windows_registry::find_tool`
-/// then the directory of `cl.exe`.
+/// `MingwPlatform._include_dirs_for_libffi`.
+pub(super) fn _include_dirs_for_libffi(
+    _plat: &Platform,
+) -> Result<Vec<OsString>, posix::ValueError> {
+    Ok(Vec::new())
+}
+
+/// `MingwPlatform._library_dirs_for_libffi`.
+pub(super) fn _library_dirs_for_libffi(
+    _plat: &Platform,
+) -> Result<Vec<OsString>, posix::ValueError> {
+    Ok(Vec::new())
+}
+
+/// `_get_msvc_env`'s final loop. Keep only PATH/INCLUDE/LIB (`ukey` in
+/// that set); every other key is dropped. The stored name is the
+/// upper-cased `ukey`. PATH/INCLUDE/LIB append `existing` when non-empty
+/// (`os.environ.get` after `patch_os_env`, or the process environment
+/// when `existing` is `None`).
+pub(super) fn msvc_compiler_environ(
+    tool_env: &[(OsString, OsString)],
+    existing: Option<&[(OsString, OsString)]>,
+) -> Vec<(OsString, OsString)> {
+    let mut env = Vec::new();
+    for (key, value) in tool_env {
+        // `_get_msvc_env`: `ukey = key.upper()` then
+        // `if ukey in ('PATH', 'INCLUDE', 'LIB')`. `env_name_eq` covers the
+        // Windows-insensitive map; `eq_ignore_ascii_case` is `str.upper`.
+        let Some(name) = ["PATH", "INCLUDE", "LIB"].into_iter().find(|name| {
+            env_name_eq(key, name) || key.to_str().is_some_and(|k| k.eq_ignore_ascii_case(name))
+        }) else {
+            continue;
+        };
+        let mut value = value.clone();
+        let existing_value = match existing {
+            Some(environ) => environ
+                .iter()
+                .find(|(k, _)| env_name_eq(k, name))
+                .map(|(_, v)| v.clone()),
+            None => std::env::var_os(name),
+        };
+        if let Some(existing_value) = existing_value.filter(|v| !v.is_empty()) {
+            value = match value.to_str() {
+                Some(s) => OsString::from(s.trim_end_matches(';')),
+                None => value,
+            };
+            value.push(";");
+            value.push(&existing_value);
+        }
+        env.push((OsString::from(name), value));
+    }
+    env
+}
+
+/// `MsvcPlatform.__init__`: `self.c_environ.update(msvc_compiler_environ)`.
+/// `c_environ` is the snapshot after `patch_os_env` (or the process
+/// environment when absent); `tool_env` is `cc.env()`.
+pub(super) fn merged_compiler_environ(
+    c_environ: Option<&[(OsString, OsString)]>,
+    tool_env: &[(OsString, OsString)],
+) -> Vec<(OsString, OsString)> {
+    let mut merged = match c_environ {
+        Some(environ) => environ.to_vec(),
+        None => std::env::vars_os().collect(),
+    };
+    for (name, value) in msvc_compiler_environ(tool_env, c_environ) {
+        if let Some((_, existing)) = merged.iter_mut().find(|(key, _)| match name.to_str() {
+            Some(name_str) => env_name_eq(key, name_str),
+            None => key == &name,
+        }) {
+            *existing = value;
+        } else {
+            merged.push((name, value));
+        }
+    }
+    merged
+}
+
+/// `MsvcPlatform.link` / `MsvcPlatform.masm`: PATH from `self.c_environ`
+/// (`MsvcPlatform.__init__` `self.c_environ.update(msvc_compiler_environ)`),
+/// then `cc::windows_registry::find_tool`, then the directory of `cl.exe`.
 pub(super) fn discover_msvc_sidecar(
     cc: &cc::Tool,
     target: &str,
     name: &str,
+    c_environ: Option<&[(OsString, OsString)]>,
 ) -> (Option<cc::Tool>, PathBuf) {
+    // `_run_subprocess(..., env=self.c_environ)` after
+    // `self.c_environ.update(msvc_compiler_environ)`.
+    if let Some(found) = resolve_compiler_on_path(Path::new(name), c_environ) {
+        return (None, found);
+    }
     if let Some(tool) = cc::windows_registry::find_tool(target, name) {
         let path = tool.path().to_path_buf();
         return (Some(tool), path);
@@ -176,6 +302,35 @@ pub(super) fn msvc_exportsymbols_link_flags() -> Vec<OsString> {
     Vec::new()
 }
 
+/// `patch_os_env` (`windows.py`). Returns the `(name, new_value)` pairs
+/// upstream would write into `os.environ`. The `not in` tests are substring
+/// checks; PATH/INCLUDE/LIB use `;` and `\bin`/`\include`/`\lib` suffixes.
+pub(super) fn patch_os_env(
+    externals: &Path,
+    get: impl Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let externals = externals.to_string_lossy();
+    let binpath = format!(r"{externals}\bin");
+    let mut out = Vec::new();
+    // `patch_os_env` `os.environ['PATH']`.
+    let path = get("PATH").unwrap_or_else(|| panic!("KeyError: 'PATH'"));
+    if !path.contains(&binpath) {
+        out.push(("PATH".to_string(), format!("{binpath};{path}")));
+    }
+    let include = get("INCLUDE").unwrap_or_default();
+    if !include.contains(externals.as_ref()) {
+        out.push((
+            "INCLUDE".to_string(),
+            format!(r"{externals}\include;{include}"),
+        ));
+    }
+    let lib = get("LIB").unwrap_or_default();
+    if !lib.contains(externals.as_ref()) {
+        out.push(("LIB".to_string(), format!(r"{externals}\lib;{lib}")));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,7 +339,7 @@ mod tests {
     use std::path::Path;
 
     fn msvc_x64() -> Platform {
-        msvc_platform("x86_64-pc-windows-msvc".to_string(), true)
+        msvc_platform("x86_64-pc-windows-msvc".to_string(), true, None)
     }
 
     fn render(args: &[OsString]) -> Vec<String> {
@@ -309,5 +464,126 @@ mod tests {
         let compile = plat._compile_args_from_eci(&ExternalCompilationInfo::default(), true);
         assert!(compile.iter().any(|flag| flag == "-O3"));
         assert!(compile.iter().all(|flag| flag != "-pthread"));
+    }
+
+    #[test]
+    fn patch_os_env_prepends_missing_and_skips_present() {
+        let ext = Path::new(r"C:\externals");
+        let without_bin = |name: &str| match name {
+            "PATH" => Some(r"C:\Windows".to_string()),
+            _ => None,
+        };
+        let patched = patch_os_env(ext, without_bin);
+        let path = patched
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(path, Some(r"C:\externals\bin;C:\Windows"));
+        let include = patched
+            .iter()
+            .find(|(k, _)| k == "INCLUDE")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(include, Some(r"C:\externals\include;"));
+
+        let already = |name: &str| match name {
+            "PATH" => Some(r"C:\externals\bin;C:\Windows".to_string()),
+            "INCLUDE" => Some(r"C:\externals\include;".to_string()),
+            "LIB" => Some(r"C:\externals\lib;".to_string()),
+            _ => None,
+        };
+        let patched = patch_os_env(ext, already);
+        assert!(patched.iter().all(|(k, _)| k != "PATH"));
+    }
+
+    #[test]
+    #[should_panic(expected = "KeyError: 'PATH'")]
+    fn patch_os_env_requires_path() {
+        let ext = Path::new(r"C:\externals");
+        let _ = patch_os_env(ext, |_| None);
+    }
+
+    #[test]
+    fn msvc_c_environ_is_full_snapshot_mingw_is_none() {
+        let msvc = msvc_x64();
+        let env = msvc.c_environ.as_ref().expect("MsvcPlatform.c_environ");
+        assert!(
+            env.iter().any(|(k, _)| super::env_name_eq(k, "PATH")),
+            "captured c_environ includes PATH"
+        );
+        let mingw = mingw_platform("x86_64-pc-windows-gnu".to_string());
+        assert!(mingw.c_environ.is_none());
+    }
+
+    #[test]
+    fn msvc_explicit_cc_is_stored_and_skips_find_msvc_env() {
+        let plat = msvc_platform(
+            "x86_64-pc-windows-msvc".to_string(),
+            true,
+            Some("explicit-cl.exe".into()),
+        );
+        assert_eq!(plat.cc_command.as_deref(), Some("explicit-cl.exe"));
+        assert!(plat.c_environ.is_some());
+        let none = msvc_platform("x86_64-pc-windows-msvc".to_string(), true, None);
+        assert_eq!(none.cc_command.as_deref(), Some("cl.exe"));
+    }
+
+    #[test]
+    fn msvc_compiler_environ_keeps_only_path_include_lib() {
+        let tool = [
+            (OsString::from("PATH"), OsString::from(r"C:\vc\bin;")),
+            (OsString::from("FOO"), OsString::from("x")),
+        ];
+        let existing = [(
+            OsString::from("PATH"),
+            OsString::from(r"C:\ext\bin;C:\Windows"),
+        )];
+        let out = msvc_compiler_environ(&tool, Some(&existing));
+        let path = out
+            .iter()
+            .find(|(k, _)| env_name_eq(k, "PATH"))
+            .map(|(_, v)| v.as_os_str());
+        assert_eq!(
+            path,
+            Some(std::ffi::OsStr::new(r"C:\vc\bin;C:\ext\bin;C:\Windows"))
+        );
+        assert!(
+            out.iter().all(|(k, _)| !env_name_eq(k, "FOO")),
+            "FOO is dropped: {out:?}"
+        );
+
+        let tool = [(OsString::from("path"), OsString::from(r"C:\vc\bin"))];
+        let out = msvc_compiler_environ(&tool, Some(&[]));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, OsString::from("PATH"));
+        assert_eq!(out[0].1, OsString::from(r"C:\vc\bin"));
+
+        let tool = [(OsString::from("INCLUDE"), OsString::from(r"C:\vc\include"))];
+        let existing = [(OsString::from("PATH"), OsString::from(r"C:\Windows"))];
+        let out = msvc_compiler_environ(&tool, Some(&existing));
+        let include = out
+            .iter()
+            .find(|(k, _)| env_name_eq(k, "INCLUDE"))
+            .map(|(_, v)| v.as_os_str());
+        assert_eq!(include, Some(std::ffi::OsStr::new(r"C:\vc\include")));
+    }
+
+    #[test]
+    fn merged_compiler_environ_appends_snapshot_path() {
+        let snapshot = [
+            (OsString::from("PATH"), OsString::from("/orig")),
+            (OsString::from("X"), OsString::from("1")),
+        ];
+        let tool_env = [(OsString::from("PATH"), OsString::from("/tool:/orig"))];
+        let merged = merged_compiler_environ(Some(&snapshot), &tool_env);
+        let path = merged
+            .iter()
+            .find(|(k, _)| env_name_eq(k, "PATH"))
+            .map(|(_, v)| v.as_os_str());
+        assert_eq!(path, Some(std::ffi::OsStr::new("/tool:/orig;/orig")));
+        let x = merged
+            .iter()
+            .find(|(k, _)| env_name_eq(k, "X"))
+            .map(|(_, v)| v.as_os_str());
+        assert_eq!(x, Some(std::ffi::OsStr::new("1")));
     }
 }

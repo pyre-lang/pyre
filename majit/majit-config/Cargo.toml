@@ -8,5 +8,8 @@ description = "Rust port of rpython/config: translation and JIT option trees"
 
 [dependencies]
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 parking_lot = { workspace = true }

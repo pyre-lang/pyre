@@ -35,20 +35,21 @@ pub(super) fn openbsd_platform(host_triple: String, is_64: bool) -> Platform {
     )
 }
 
-/// `OpenBSD._libs`.
+/// `OpenBSD._libs`. Upstream `set(libraries + ("intl", "iconv"))` has
+/// unspecified order; first-seen order is the deterministic choice.
 pub(super) fn openbsd_libs(libraries: &[String]) -> Vec<OsString> {
-    let skip = ["crypt", "dl", "rt"];
-    let mut libs: Vec<String> = libraries
+    let mut seen = Vec::new();
+    for lib in libraries
         .iter()
-        .filter(|lib| !skip.contains(&lib.as_str()))
-        .cloned()
-        .collect();
-    for extra in ["intl", "iconv"] {
-        if !libs.iter().any(|lib| lib == extra) {
-            libs.push(extra.to_string());
+        .map(String::as_str)
+        .chain(["intl", "iconv"])
+    {
+        if !seen.iter().any(|existing| existing == lib) {
+            seen.push(lib.to_string());
         }
     }
-    libs.into_iter()
+    seen.into_iter()
+        .filter(|lib| lib != "crypt" && lib != "dl" && lib != "rt")
         .map(|lib| prefixed_path("-l", Path::new(&lib)))
         .collect()
 }
@@ -81,6 +82,28 @@ mod tests {
             !rendered
                 .iter()
                 .any(|lib| lib == "-lcrypt" || lib == "-lrt" || lib == "-ldl")
+        );
+    }
+
+    #[test]
+    fn openbsd_libs_first_seen_set_then_filter() {
+        let libs = openbsd_libs(&[
+            "m".to_string(),
+            "m".to_string(),
+            "intl".to_string(),
+            "crypt".to_string(),
+        ]);
+        let rendered: Vec<String> = libs
+            .iter()
+            .map(|lib| lib.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "-lm".to_string(),
+                "-lintl".to_string(),
+                "-liconv".to_string()
+            ]
         );
     }
 }
