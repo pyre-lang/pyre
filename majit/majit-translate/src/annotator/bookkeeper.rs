@@ -1413,14 +1413,32 @@ impl Bookkeeper {
     /// can project the registered `ClassDef.attrs` from struct-field
     /// metadata.
     ///
-    /// May be called before or after roots are registered:
+    /// May be called before or after roots are interned.
     /// [`Self::getuniqueclassdef_for_struct_root`] re-traverses and
     /// re-projects on every call, so a root cached before the registry
     /// arrived has its attrs back-filled on the next lookup (RPython grows
-    /// class attrs as annotation proceeds).  Idempotent: a second call
-    /// overwrites the previous registry.
+    /// class attrs as annotation proceeds).  A host interned before this
+    /// call stays reachable under the registry's resolved identity:
+    /// `bookkeeper.py` `Bookkeeper.getdesc` returns the existing
+    /// descriptor for that class object forever.  The host keeps the
+    /// name it was minted with.  Idempotent: a second call overwrites
+    /// the previous registry.
     pub fn set_struct_fields(&self, registry: Rc<crate::front::StructFieldRegistry>) {
-        *self.struct_fields.borrow_mut() = Some(registry);
+        *self.struct_fields.borrow_mut() = Some(registry.clone());
+        let old_keys: Vec<(String, HostObject)> = self
+            .struct_root_classes()
+            .iter()
+            .map(|(k, h)| (k.clone(), h.clone()))
+            .collect();
+        for (old_key, host) in old_keys {
+            let resolved = intern_class_key_from_registry(&registry, &old_key, true);
+            if resolved == old_key {
+                continue;
+            }
+            if !self.struct_root_classes.borrow().contains_key(&resolved) {
+                self.insert_struct_root_class(resolved, host);
+            }
+        }
     }
 
     /// Thread harvested `_alloc_flavor_ = raw` structs and stamp already
@@ -8703,6 +8721,88 @@ mod tests {
                 }),
             );
         }
+    }
+
+    #[test]
+    fn intern_before_registry_alias_keeps_the_published_host() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let first = bk.intern_class_by_qualname("T");
+        let first_cd = bk.getuniqueclassdef(&first).expect("ClassDef of T");
+        let mut reg = StructFieldRegistry::default();
+        let rows = vec![("x".to_string(), "i64".to_string())];
+        reg.fields.insert("T".to_string(), rows.clone());
+        reg.fields.insert("m::T".to_string(), rows);
+        harvest_class_identity(&mut reg, "m::T", &["T", "m::T"]);
+        bk.set_struct_fields(Rc::new(reg));
+        let again = bk.intern_class_by_qualname("T");
+        let qualified = bk.intern_class_by_qualname("m::T");
+        assert_eq!(first, again, "second intern of T keeps the published host");
+        assert_eq!(first, qualified, "m::T aliases onto that host");
+        let again_cd = bk
+            .getuniqueclassdef(&again)
+            .expect("ClassDef after registry");
+        assert!(
+            Rc::ptr_eq(&first_cd, &again_cd),
+            "ClassDef stays the one published before the registry"
+        );
+    }
+
+    #[test]
+    fn intern_before_registry_distinct_declaration_keeps_its_own_host() {
+        use crate::front::StructFieldRegistry;
+
+        let longer = "outer::m::T";
+        let shorter = "m::T";
+        let bk = bk();
+        let first_longer = bk.intern_class_by_qualname(longer);
+        let first_shorter = bk.intern_class_by_qualname(shorter);
+        assert_ne!(
+            first_longer, first_shorter,
+            "pre-registry intern of distinct spellings is two hosts"
+        );
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            longer.to_string(),
+            vec![("left".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            shorter.to_string(),
+            vec![("right".to_string(), "u8".to_string())],
+        );
+        harvest_class_identity(&mut reg, longer, &[longer]);
+        harvest_class_identity(&mut reg, shorter, &[shorter]);
+        bk.set_struct_fields(Rc::new(reg));
+
+        let again_longer = bk.intern_class_by_qualname(longer);
+        let again_shorter = bk.intern_class_by_qualname(shorter);
+        let leaf = bk.intern_class_by_qualname("T");
+        assert_eq!(
+            first_longer, again_longer,
+            "outer::m::T keeps its pre-registry host"
+        );
+        assert_eq!(
+            first_shorter, again_shorter,
+            "m::T keeps its pre-registry host"
+        );
+        assert_ne!(
+            leaf, first_longer,
+            "ambiguous T is not merged onto outer::m::T"
+        );
+        assert_ne!(leaf, first_shorter, "ambiguous T is not merged onto m::T");
+        let longer_cd = bk
+            .getuniqueclassdef(&again_longer)
+            .expect("outer::m::T classdef");
+        let shorter_cd = bk.getuniqueclassdef(&again_shorter).expect("m::T classdef");
+        let leaf_cd = bk.getuniqueclassdef(&leaf).expect("T classdef");
+        assert!(
+            !Rc::ptr_eq(&longer_cd, &shorter_cd),
+            "distinct declarations keep distinct ClassDefs"
+        );
+        assert!(
+            !Rc::ptr_eq(&leaf_cd, &longer_cd) && !Rc::ptr_eq(&leaf_cd, &shorter_cd),
+            "ambiguous T is not merged onto either ClassDef"
+        );
     }
 
     #[test]
