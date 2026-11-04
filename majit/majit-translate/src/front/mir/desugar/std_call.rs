@@ -3135,6 +3135,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::ArrayLen {
                             base: list.clone(),
                             array_type_id: Some("[u8]".to_string()),
+                            array: Some(crate::codewriter::call::gcarray_char()),
                             nolength: false,
                             gckind: crate::model::ArrayGcKind::Gc,
                         },

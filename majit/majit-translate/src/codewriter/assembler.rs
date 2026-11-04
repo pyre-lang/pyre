@@ -2209,11 +2209,13 @@ impl AssemblerEncode for Assembler {
                 length,
                 item_ty,
                 array_type_id,
+                array,
             }
             | OpKind::NewArrayClear {
                 length,
                 item_ty,
                 array_type_id,
+                array,
             } => {
                 let opname = if matches!(op.kind, OpKind::NewArray { .. }) {
                     "new_array"
@@ -2230,6 +2232,7 @@ impl AssemblerEncode for Assembler {
                 let descr_idx = self.emit_ready_descr(arraydescrof(
                     item_ty,
                     array_type_id,
+                    array,
                     Some(0),
                     callcontrol,
                 ));
@@ -2266,6 +2269,7 @@ impl AssemblerEncode for Assembler {
                 length,
                 item_ty,
                 array_type_id,
+                array,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(length, regallocs);
                 assert_eq!(kc, 'i', "newlist_clear length must be int-kind, got {kc:?}",);
@@ -2323,6 +2327,7 @@ impl AssemblerEncode for Assembler {
                 let descr_idx = self.emit_ready_descr(arraydescrof(
                     item_ty,
                     array_type_id,
+                    array,
                     Some(0),
                     callcontrol,
                 ));
@@ -2778,6 +2783,7 @@ impl AssemblerEncode for Assembler {
                 index,
                 item_ty,
                 array_type_id,
+                array,
                 nolength,
                 gckind,
                 pure,
@@ -2828,6 +2834,7 @@ impl AssemblerEncode for Assembler {
                 let descr_idx = self.emit_ready_descr(arraydescrof(
                     item_ty,
                     array_type_id,
+                    array,
                     len_offset,
                     callcontrol,
                 ));
@@ -2878,6 +2885,7 @@ impl AssemblerEncode for Assembler {
                 value,
                 item_ty,
                 array_type_id,
+                array,
                 nolength,
                 gckind,
             } => {
@@ -2958,6 +2966,7 @@ impl AssemblerEncode for Assembler {
                 let descr_idx = self.emit_ready_descr(arraydescrof(
                     item_ty,
                     array_type_id,
+                    array,
                     len_offset,
                     callcontrol,
                 ));
@@ -2990,6 +2999,7 @@ impl AssemblerEncode for Assembler {
                 field,
                 item_ty: _,
                 array_type_id,
+                array,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
                 assert_eq!(
@@ -3011,6 +3021,7 @@ impl AssemblerEncode for Assembler {
                 let descr = interiorfield_bh_descr(
                     callcontrol,
                     array_type_id,
+                    array,
                     &field.name,
                     &self.current_graph_name,
                 );
@@ -3044,6 +3055,7 @@ impl AssemblerEncode for Assembler {
                 value,
                 item_ty: _,
                 array_type_id,
+                array,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
                 assert_eq!(
@@ -3071,6 +3083,7 @@ impl AssemblerEncode for Assembler {
                 let descr = interiorfield_bh_descr(
                     callcontrol,
                     array_type_id,
+                    array,
                     &field.name,
                     &self.current_graph_name,
                 );
@@ -3092,6 +3105,7 @@ impl AssemblerEncode for Assembler {
             OpKind::ArrayLen {
                 base,
                 array_type_id,
+                array,
                 nolength,
                 gckind,
             } => {
@@ -3118,6 +3132,7 @@ impl AssemblerEncode for Assembler {
                 let descr = arraydescrof(
                     &crate::model::ValueType::Ref(None),
                     array_type_id,
+                    array,
                     len_offset,
                     callcontrol,
                 );
@@ -6559,6 +6574,7 @@ fn raw_carray_descrof(
 fn interiorfield_bh_descr(
     callcontrol: Option<&CallControl>,
     array_type_id: &Option<String>,
+    array: &Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
     field_name: &str,
     graph_name: &Option<String>,
 ) -> crate::jitcode::BhDescr {
@@ -6569,10 +6585,10 @@ fn interiorfield_bh_descr(
              graph {graph_name:?}, array {array_type_id:?}, field {field_name}"
         );
     };
-    let idx = cc
-        .descr_indices
-        .interiorfield_index(array_type_id, field_name);
-    let Some(descr) = cc.interiorfielddescrof(idx, array_type_id, field_name) else {
+    let intern_id = cc.intern_op_array(array, array_type_id);
+    let idx = cc.descr_indices.interiorfield_index(intern_id, field_name);
+    let Some(descr) = cc.interiorfielddescrof_with_array(idx, array_type_id, array, field_name)
+    else {
         panic!(
             "interiorfielddescrof returned no descr \
              (jtransform.py rewrite_op_getinteriorfield) — \
@@ -6603,18 +6619,19 @@ fn interiorfield_bh_descr(
 fn arraydescrof(
     ty: &crate::model::ValueType,
     array_type_id: &Option<String>,
+    array: &Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
     len_offset: Option<usize>,
     callcontrol: Option<&CallControl>,
 ) -> crate::jitcode::BhDescr {
     let ir_type = value_type_to_ir_type_for_descr(ty);
     if let Some(cc) = callcontrol {
-        // Route through `arraydescrof_for_type` so the bytecode emit
-        // path shares the same `(item_ty, array_type_id, len_offset) → ei_index`
-        // table as `writeanalyze` in `call.rs`; otherwise
-        // every emit-time descr lands at `ei_index = 0` and aliases
-        // distinct ARRAY identities at `force_from_effectinfo`
-        // (`heap.py:540-560`, `heap.rs`'s `array_effect_index`).
-        let descr = cc.arraydescrof_for_type(ty, array_type_id, ir_type, len_offset);
+        // Route through `arraydescrof_for_op` so the bytecode emit
+        // path shares the interned ARRAY `ei_index` table as
+        // `writeanalyze` in `call.rs`; otherwise every emit-time descr
+        // lands at `ei_index = 0` and aliases distinct ARRAY identities
+        // at `force_from_effectinfo` (`heap.py`, `heap.rs`
+        // `array_effect_index`).
+        let descr = cc.arraydescrof_for_op(ty, array_type_id, array, ir_type, len_offset);
         let array_descr = descr
             .as_array_descr()
             .expect("CallControl::arraydescrof must return an ArrayDescr");
@@ -7236,6 +7253,7 @@ mod tests {
         let descr = arraydescrof(
             &crate::model::ValueType::Float,
             &Some("[f32]".to_string()),
+            &None,
             None,
             None,
         );
@@ -7403,7 +7421,27 @@ mod tests {
             }));
             if matches!(part, VecFieldPart::Buf | VecFieldPart::FatData) {
                 assert!(crate::front::typestr::nolength_from_array_type_id(Some(id)));
-                let array = arraydescrof(&ValueType::Int, &Some(id.to_string()), None, Some(&cc));
+                let array_ll = match id {
+                    "Vec<u8>" => crate::codewriter::call::array_lltype_for_op_spelling(id),
+                    "Vec<i64>" => {
+                        use crate::flowspace::model::ConstValue;
+                        use crate::translator::rtyper::lltypesystem::lltype::{
+                            Array, LowLevelType,
+                        };
+                        Some(Array::gc_with_hints(
+                            LowLevelType::Signed,
+                            vec![("nolength".into(), ConstValue::Bool(true))],
+                        ))
+                    }
+                    other => panic!("unexpected vec items id {other}"),
+                };
+                let array = arraydescrof(
+                    &ValueType::Int,
+                    &Some(id.to_string()),
+                    &array_ll,
+                    None,
+                    Some(&cc),
+                );
                 match array {
                     crate::jitcode::BhDescr::Array {
                         base_size,
@@ -7762,6 +7800,7 @@ mod tests {
         let first = arraydescrof(
             &crate::model::ValueType::Ref(None),
             &Some(id.to_string()),
+            &None,
             Some(0),
             Some(&cc),
         );
@@ -7787,6 +7826,7 @@ mod tests {
         let wrapped = arraydescrof(
             &crate::model::ValueType::Ref(None),
             &Some("[*mut PyObject]".to_string()),
+            &None,
             Some(0),
             Some(&cc),
         );
@@ -7824,9 +7864,19 @@ mod tests {
             .force_register_keyed_array(LLType::Array(key), Arc::new(ad));
 
         let cc = CallControl::new();
+        let array = Some(
+            crate::translator::rtyper::lltypesystem::lltype::Array::gc_with_hints(
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::UnsignedLongLong,
+                vec![(
+                    "nolength".into(),
+                    crate::flowspace::model::ConstValue::Bool(true),
+                )],
+            ),
+        );
         let descr = arraydescrof(
             &crate::model::ValueType::Int,
             &Some(array_type_id.to_string()),
+            &array,
             None,
             Some(&cc),
         );
@@ -9648,6 +9698,7 @@ mod tests {
             length: length.clone(),
             item_ty: ValueType::Ref(None),
             array_type_id: Some("list_items".to_string()),
+            array: None,
         };
 
         // Run it through the inline var remap: length is rewritten via the
@@ -9667,6 +9718,7 @@ mod tests {
                 length: l,
                 item_ty,
                 array_type_id,
+                array: _,
             } => {
                 assert_eq!(*l, remapped_length, "length must be rewritten by remap");
                 assert!(matches!(item_ty, ValueType::Ref(None)));
@@ -11595,6 +11647,11 @@ mod tests {
                     length: length_var.clone(),
                     item_ty: ValueType::Int,
                     array_type_id: Some("list_items".to_string()),
+                    array: Some(
+                        crate::translator::rtyper::lltypesystem::lltype::Array::gc(
+                            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
+                        ),
+                    ),
                 },
                 true,
             )
@@ -11699,6 +11756,7 @@ mod tests {
                 value: crate::model::LinkArg::Value(value_var.clone()),
                 item_ty: ValueType::Unknown,
                 array_type_id: None,
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
             },
@@ -13371,6 +13429,7 @@ mod tests {
                 OpKind::ArrayLen {
                     base: base_var.clone(),
                     array_type_id: Some("*const i64".into()),
+                    array: None,
                     nolength: true,
                     // `rewrite_op_getarraysize` asserts `_gckind == 'gc'`
                     // before emitting `arraylen_gc`. This case is that
@@ -13432,6 +13491,7 @@ mod tests {
                 OpKind::ArrayLen {
                     base: array_var,
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                 },
@@ -13597,6 +13657,7 @@ mod tests {
                     index: index.clone(),
                     item_ty: ValueType::Int,
                     array_type_id: Some("[Signed]".to_string()),
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
@@ -13612,6 +13673,7 @@ mod tests {
                 value: LinkArg::Value(stored.clone()),
                 item_ty: ValueType::Int,
                 array_type_id: Some("[Signed]".to_string()),
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
             },
@@ -13623,6 +13685,7 @@ mod tests {
                 OpKind::ArrayLen {
                     base: array,
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                 },
@@ -13737,6 +13800,7 @@ mod tests {
                 value: stored,
                 item_ty: ValueType::Int,
                 array_type_id: Some("[Signed]".to_string()),
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
             },
@@ -13838,6 +13902,7 @@ mod tests {
                     index: index_var.clone(),
                     item_ty: ValueType::Unknown,
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
@@ -13955,6 +14020,7 @@ mod tests {
                     index: index_var.clone(),
                     item_ty: ValueType::Int,
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure,
@@ -14272,6 +14338,28 @@ mod tests {
         cc
     }
 
+    fn test_point_array() -> crate::translator::rtyper::lltypesystem::lltype::Array {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Struct};
+        Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+            "Point",
+            vec![
+                ("x".into(), LowLevelType::Signed),
+                (
+                    "p".into(),
+                    crate::translator::rtyper::rclass::OBJECTPTR.clone(),
+                ),
+            ],
+        ))))
+    }
+
+    fn test_missing_array() -> crate::translator::rtyper::lltypesystem::lltype::Array {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Struct};
+        Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+            "Missing",
+            vec![("x".into(), LowLevelType::Signed)],
+        ))))
+    }
+
     /// `jtransform.py rewrite_op_getinteriorfield` emits
     /// `getinteriorfield_gc_i/rid>i` plus an `InteriorFieldDescr` for the field.
     #[test]
@@ -14291,6 +14379,7 @@ mod tests {
                     field: FieldDescriptor::new("x", Some("Point".into())),
                     item_ty: ValueType::Int,
                     array_type_id: Some("Vec<Point>".into()),
+                    array: Some(test_point_array()),
                 },
                 true,
             )
@@ -14352,6 +14441,7 @@ mod tests {
                 value: value.clone(),
                 item_ty: ValueType::Ref(None),
                 array_type_id: Some("Vec<Point>".into()),
+                array: Some(test_point_array()),
             },
             false,
         );
@@ -14410,6 +14500,7 @@ mod tests {
                     field: FieldDescriptor::new("x", Some("Missing".into())),
                     item_ty: ValueType::Int,
                     array_type_id: Some("Vec<Missing>".into()),
+                    array: Some(test_missing_array()),
                 },
                 true,
             )

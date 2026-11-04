@@ -18913,6 +18913,7 @@ fn range_list_length_lowers_signed_to_usize_try_from() {
                 OpKind::ArrayRead {
                     item_ty: ValueType::Int,
                     array_type_id: Some(array_type_id),
+                    array: _,
                     ..
                 } if array_type_id == "[i64]"
             )),
@@ -19034,6 +19035,7 @@ fn range_list_length_lowers_signed_to_usize_try_from() {
                     Some(OpKind::ArrayRead {
                         item_ty: ValueType::Int,
                         array_type_id: Some(array_type_id),
+                        array: _,
                         ..
                     }) if array_type_id == "[i64]"
                 ),
@@ -19066,6 +19068,7 @@ fn range_list_length_lowers_signed_to_usize_try_from() {
                 OpKind::ArrayWrite {
                     item_ty: ValueType::Int,
                     array_type_id: Some(array_type_id),
+                    array: _,
                     ..
                 } if array_type_id == "[i64]"
             )),
@@ -19204,6 +19207,7 @@ fn unwrapped_array_pushes_lower_to_rpython_gcarray_writes() {
                 OpKind::ArrayWrite {
                     item_ty,
                     array_type_id: Some(array_type_id),
+                    array: _,
                     ..
                 } if array_type_id == expected_array && item_ty == &expected_item
             )),
@@ -19262,6 +19266,7 @@ fn unwrapped_array_pushes_lower_to_rpython_gcarray_writes() {
                 OpKind::ArrayRead {
                     item_ty: ValueType::Str,
                     array_type_id: Some(array_type_id),
+                    array: _,
                     ..
                 } if array_type_id == super::STRING_GCREF_GCARRAY_TYPE_ID
             )),
@@ -19273,6 +19278,7 @@ fn unwrapped_array_pushes_lower_to_rpython_gcarray_writes() {
                 OpKind::ArrayWrite {
                     item_ty: ValueType::Str,
                     array_type_id: Some(array_type_id),
+                    array: _,
                     ..
                 } if array_type_id == super::STRING_GCREF_GCARRAY_TYPE_ID
             )),
@@ -29298,6 +29304,7 @@ fn interior_field_read_of_ptr_add() {
         field,
         item_ty,
         array_type_id,
+        array: _,
     } = &reads[0].kind
     else {
         unreachable!()
@@ -29411,6 +29418,7 @@ fn interior_field_write_of_ptr_add() {
         field,
         item_ty,
         array_type_id,
+        array: _,
     } = &writes[0].kind
     else {
         unreachable!()
@@ -29712,6 +29720,7 @@ fn interior_field_write_of_const_int() {
         value,
         field,
         array_type_id,
+        array: _,
         ..
     } = ops
         .iter()
@@ -29806,6 +29815,7 @@ fn interior_field_two_reads_of_one_add() {
                 index,
                 field,
                 array_type_id,
+                array: _,
                 ..
             } => {
                 assert_eq!(base, &block.inputargs[0]);
@@ -29941,6 +29951,7 @@ fn interior_field_entry_ptr_reads_entries_header() {
         index,
         field,
         array_type_id,
+        array: _,
         ..
     } = block
         .operations
@@ -30066,6 +30077,7 @@ fn interior_field_entries_item_ptr_reuses_header_arg() {
         index,
         field,
         array_type_id,
+        array: _,
         ..
     } = block
         .operations
@@ -31451,6 +31463,7 @@ fn interior_field_entry_valid_real() {
             base,
             field,
             array_type_id,
+            array: _,
             ..
         } if field.name == "f_valid" => Some((base, array_type_id)),
         _ => None,
@@ -31973,6 +31986,7 @@ fn items_capacity_arraylen<'a>(ops: &'a [&'a SpaceOperation]) -> Option<&'a Spac
             &op.kind,
             OpKind::ArrayLen {
                 array_type_id: Some(id),
+                array: _,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 ..
@@ -32098,6 +32112,7 @@ fn ascii_setitem_writes_items_block() {
         OpKind::ArrayWrite {
             base,
             array_type_id: Some(array_type_id),
+            array: _,
             ..
         } if array_type_id == super::STRING_GCREF_GCARRAY_TYPE_ID => Some(base),
         _ => None,

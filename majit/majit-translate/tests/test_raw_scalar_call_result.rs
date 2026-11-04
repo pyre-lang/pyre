@@ -364,6 +364,7 @@ fn sizehint_i64_cast_stays_gcarray_write() {
                 OpKind::ArrayWrite {
                     item_ty: ValueType::Int,
                     array_type_id: Some(array_type_id),
+                    array: _,
                     ..
                 } if array_type_id == "[i64]"
             )

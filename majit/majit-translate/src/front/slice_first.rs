@@ -336,6 +336,10 @@ fn rewire_one_slice_first_site(
                     item_ty: site.payload_ty.clone(),
                     index: item_index,
                     array_type_id: site.array_type_id.clone(),
+                    array: site
+                        .array_type_id
+                        .as_deref()
+                        .and_then(crate::codewriter::call::array_lltype_for_op_spelling),
                     nolength: crate::front::typestr::nolength_from_array_type_id(
                         site.array_type_id.as_deref(),
                     ),
@@ -602,7 +606,7 @@ mod tests {
             .iter()
             .flat_map(|blk| &blk.operations)
             .filter_map(|op| match &op.kind {
-                OpKind::ArrayRead { array_type_id, .. } => Some(array_type_id.clone()),
+                OpKind::ArrayRead { array_type_id, array: _, .. } => Some(array_type_id.clone()),
                 _ => None,
             })
             .collect();
@@ -718,7 +722,7 @@ mod tests {
             .iter()
             .flat_map(|blk| &blk.operations)
             .filter_map(|op| match &op.kind {
-                OpKind::ArrayRead { array_type_id, .. } => Some(array_type_id.clone()),
+                OpKind::ArrayRead { array_type_id, array: _, .. } => Some(array_type_id.clone()),
                 _ => None,
             })
             .collect();
@@ -792,6 +796,7 @@ mod tests {
             .filter_map(|op| match &op.kind {
                 OpKind::ArrayLen {
                     array_type_id,
+                    array: _,
                     nolength,
                     ..
                 } => Some((array_type_id.clone(), *nolength)),

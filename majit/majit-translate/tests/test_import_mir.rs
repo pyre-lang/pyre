@@ -130,6 +130,7 @@ fn tuple_len_reads_the_fixed_list_not_the_items_block() {
             &op.kind,
             OpKind::ArrayLen {
                 array_type_id: Some(id),
+                array: _,
                 nolength: false,
                 gckind: ArrayGcKind::Gc,
                 ..
@@ -178,6 +179,7 @@ fn tuple_getitem_reads_the_fixed_list_not_the_items_block() {
             &op.kind,
             OpKind::ArrayRead {
                 array_type_id: Some(id),
+                array: _,
                 ..
             } if id == "majit::object_ref_gcarray"
         )),

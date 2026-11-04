@@ -307,12 +307,14 @@ fn push_newlist(
             length,
             item_ty: identity.item_ty.clone(),
             array_type_id: Some(identity.array_type_id.clone()),
+            array: crate::codewriter::call::array_lltype_for_op_spelling(&identity.array_type_id),
         }
     } else {
         OpKind::NewArray {
             length,
             item_ty: identity.item_ty.clone(),
             array_type_id: Some(identity.array_type_id.clone()),
+            array: crate::codewriter::call::array_lltype_for_op_spelling(&identity.array_type_id),
         }
     };
     push_value(graph, block, alloc, ConcreteType::GcRef)
@@ -379,6 +381,7 @@ fn build_jit_arm(names: &AllocAndSetNames, identity: &FixedArrayRepeat) -> Funct
             length: clear_args[0].clone(),
             item_ty: identity.item_ty.clone(),
             array_type_id: Some(identity.array_type_id.clone()),
+            array: crate::codewriter::call::array_lltype_for_op_spelling(&identity.array_type_id),
         },
         ConcreteType::GcRef,
     );
@@ -668,6 +671,7 @@ fn build_nonnull(names: &AllocAndSetNames, identity: &FixedArrayRepeat) -> Funct
             value: LinkArg::Value(b_item.clone()),
             item_ty: identity.item_ty.clone(),
             array_type_id: Some(identity.array_type_id.clone()),
+            array: crate::codewriter::call::array_lltype_for_op_spelling(&identity.array_type_id),
             nolength: false,
             gckind: crate::model::ArrayGcKind::Gc,
         },
