@@ -10276,8 +10276,16 @@ impl CallControl {
         let Some((_, graph)) = self.target_to_path_and_graph(target) else {
             return false;
         };
-        graph.return_type.as_deref() == Some("ref")
-            && self.declared_graph_result_type(&graph) == Some(Type::Int)
+        let Some(s) = graph.return_type.as_deref() else {
+            return false;
+        };
+        // `dont_look_inside_return_token` stamps `raw:<owner>` for a
+        // raw `Ptr` (`history.py` `getkind` `'int'`), including
+        // `direct_arrayitems`. `call.py` `getcalldescr` uses FUNC.RESULT.
+        if s.starts_with("raw:") && s.len() > 4 {
+            return true;
+        }
+        s == "ref" && self.declared_graph_result_type(&graph) == Some(Type::Int)
     }
 
     /// `call.py getcalldescr` reads `FUNC.RESULT`, including the pointee's

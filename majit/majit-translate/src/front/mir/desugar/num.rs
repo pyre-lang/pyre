@@ -501,6 +501,16 @@ impl<'a> Lowering<'a> {
             self.graph.set_goto(bb_id, target_bb, link_args);
             return Ok(true);
         }
+        if let Some(item) = self.non_gc_struct_raw_ptr_item_lltype(&call.dest.ty) {
+            let bb_id = self.emit_bb(mir_bb);
+            let ptr_ty = lltype_for_direct_ptradd_pointer(None, &item);
+            let res = emit_typed_nullptr(&mut self.graph, bb_id, ptr_ty);
+            self.local_var[dest_local] = Some(LocalValue::One(res));
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(true);
+        }
         if !is_core_ptr_null_fun_path(&path) {
             return Ok(false);
         }

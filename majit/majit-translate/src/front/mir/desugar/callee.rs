@@ -4068,6 +4068,504 @@ pub(in crate::front::mir) fn add_dest_used_only_as_struct_field(
     census.defs == 1 && census.fields >= 1 && census.other == 0
 }
 
+/// `ptr::add` dest used only through `&*dest` / `&mut *dest` reborrows.
+///
+/// A copy of the raw pointer, a second definition, a field use, or a
+/// `ptr::write` of the address keeps the add residual. `rptr.py`
+/// `pairtype(PtrRepr, IntegerRepr).rtype_getitem` InteriorPtr arm.
+pub(in crate::front::mir) fn add_dest_used_only_as_reborrow(
+    llbc: &Llbc,
+    body: &Unstructured,
+    dest: usize,
+) -> bool {
+    let census = dest_reborrow_census(llbc, body, dest);
+    census.defs == 1 && census.reborrows >= 1 && census.other == 0
+}
+
+/// `ptr::add` dest used only as the address of one `core::ptr::write`.
+///
+/// `rordereddict.py` `_ll_dict_setitem_lookup_done` field stores, not a
+/// residual `ptr::write` of `ENTRY`.
+pub(in crate::front::mir) fn add_dest_used_only_as_ptr_write(
+    llbc: &Llbc,
+    body: &Unstructured,
+    dest: usize,
+) -> bool {
+    let census = dest_ptr_write_census(llbc, body, dest);
+    census.defs == 1 && census.writes == 1 && census.other == 0
+}
+
+pub(in crate::front::mir) struct DestReborrowCensus {
+    pub(in crate::front::mir) defs: usize,
+    pub(in crate::front::mir) reborrows: usize,
+    pub(in crate::front::mir) other: usize,
+}
+
+pub(in crate::front::mir) struct DestPtrWriteCensus {
+    pub(in crate::front::mir) defs: usize,
+    pub(in crate::front::mir) writes: usize,
+    pub(in crate::front::mir) other: usize,
+}
+
+fn bump_dest_other(op: &Operand, dest: usize, other: &mut usize) {
+    if !matches!(operand_dest_ref(op, dest), DestRef::None) {
+        *other += 1;
+    }
+}
+
+fn classify_dest_def_or_other(place: &Place, dest: usize, defs: &mut usize, other: &mut usize) {
+    if matches!(place.kind, PlaceKind::Local(local) if local as usize == dest) {
+        *defs += 1;
+    } else if place_references_local(place, dest) {
+        *other += 1;
+    }
+}
+
+fn scan_rvalue_reborrow(rvalue: &Rvalue, dest: usize, reborrows: &mut usize, other: &mut usize) {
+    match rvalue {
+        Rvalue::Use(op, _)
+        | Rvalue::UnaryOp(_, op)
+        | Rvalue::Cast(_, op, _)
+        | Rvalue::Repeat { operand: op, .. }
+        | Rvalue::ShallowInitBox(op, _) => bump_dest_other(op, dest, other),
+        Rvalue::BinaryOp(_, lhs, rhs) => {
+            bump_dest_other(lhs, dest, other);
+            bump_dest_other(rhs, dest, other);
+        }
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+            if place_is_immediate_deref_of(place, dest) {
+                *reborrows += 1;
+            } else if place_references_local(place, dest) {
+                *other += 1;
+            }
+        }
+        Rvalue::Len(place) | Rvalue::Discriminant(place) => {
+            if place_references_local(place, dest) {
+                *other += 1;
+            }
+        }
+        Rvalue::Aggregate(_, operands) => {
+            for op in operands {
+                bump_dest_other(op, dest, other);
+            }
+        }
+        Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
+    }
+}
+
+fn scan_rvalue_mentions_dest(rvalue: &Rvalue, dest: usize, other: &mut usize) {
+    match rvalue {
+        Rvalue::Use(op, _)
+        | Rvalue::UnaryOp(_, op)
+        | Rvalue::Cast(_, op, _)
+        | Rvalue::Repeat { operand: op, .. }
+        | Rvalue::ShallowInitBox(op, _) => bump_dest_other(op, dest, other),
+        Rvalue::BinaryOp(_, lhs, rhs) => {
+            bump_dest_other(lhs, dest, other);
+            bump_dest_other(rhs, dest, other);
+        }
+        Rvalue::Ref { place, .. }
+        | Rvalue::RawPtr { place, .. }
+        | Rvalue::Len(place)
+        | Rvalue::Discriminant(place) => {
+            if place_references_local(place, dest) {
+                *other += 1;
+            }
+        }
+        Rvalue::Aggregate(_, operands) => {
+            for op in operands {
+                bump_dest_other(op, dest, other);
+            }
+        }
+        Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
+    }
+}
+
+fn call_is_core_ptr_write(call: &majit_charon_reader::ullbc::CallPayload, llbc: &Llbc) -> bool {
+    let CallFunc::Regular(reg) = &call.func else {
+        return false;
+    };
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    llbc.fn_by_id(*id)
+        .is_some_and(|fd| is_core_ptr_write_path(fd.item_meta.name_path().as_str()))
+}
+
+pub(in crate::front::mir) fn dest_reborrow_census(
+    llbc: &Llbc,
+    body: &Unstructured,
+    dest: usize,
+) -> DestReborrowCensus {
+    let mut census = DestReborrowCensus {
+        defs: 0,
+        reborrows: 0,
+        other: 0,
+    };
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            match stmt.stmt_kind_ref() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    scan_rvalue_reborrow(rvalue, dest, &mut census.reborrows, &mut census.other);
+                    classify_dest_def_or_other(place, dest, &mut census.defs, &mut census.other);
+                }
+                Ok(StmtKind::Assert(assert)) => {
+                    bump_dest_other(&assert.cond, dest, &mut census.other);
+                }
+                _ => {}
+            }
+        }
+        match bb.term_ref(llbc) {
+            Ok(TermKind::Switch { discr, .. }) => {
+                bump_dest_other(discr, dest, &mut census.other);
+            }
+            Ok(TermKind::Call { call, .. }) => {
+                if let CallFunc::Dynamic(op, _) = &call.func {
+                    bump_dest_other(op, dest, &mut census.other);
+                }
+                for arg in &call.args {
+                    bump_dest_other(arg, dest, &mut census.other);
+                }
+                classify_dest_def_or_other(&call.dest, dest, &mut census.defs, &mut census.other);
+            }
+            Ok(TermKind::Assert { assert, .. }) => {
+                bump_dest_other(&assert.cond, dest, &mut census.other);
+            }
+            _ => {}
+        }
+    }
+    census
+}
+
+pub(in crate::front::mir) fn dest_ptr_write_census(
+    llbc: &Llbc,
+    body: &Unstructured,
+    dest: usize,
+) -> DestPtrWriteCensus {
+    let mut census = DestPtrWriteCensus {
+        defs: 0,
+        writes: 0,
+        other: 0,
+    };
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            match stmt.stmt_kind_ref() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    scan_rvalue_mentions_dest(rvalue, dest, &mut census.other);
+                    classify_dest_def_or_other(place, dest, &mut census.defs, &mut census.other);
+                }
+                Ok(StmtKind::Assert(assert)) => {
+                    bump_dest_other(&assert.cond, dest, &mut census.other);
+                }
+                _ => {}
+            }
+        }
+        match bb.term_ref(llbc) {
+            Ok(TermKind::Switch { discr, .. }) => {
+                bump_dest_other(discr, dest, &mut census.other);
+            }
+            Ok(TermKind::Call { call, .. }) => {
+                if let CallFunc::Dynamic(op, _) = &call.func {
+                    bump_dest_other(op, dest, &mut census.other);
+                }
+                if call_is_core_ptr_write(call, llbc)
+                    && operand_local(call.args.first()) == Some(dest)
+                {
+                    census.writes += 1;
+                    for arg in call.args.iter().skip(1) {
+                        bump_dest_other(arg, dest, &mut census.other);
+                    }
+                } else {
+                    for arg in &call.args {
+                        bump_dest_other(arg, dest, &mut census.other);
+                    }
+                }
+                classify_dest_def_or_other(&call.dest, dest, &mut census.defs, &mut census.other);
+            }
+            Ok(TermKind::Assert { assert, .. }) => {
+                bump_dest_other(&assert.cond, dest, &mut census.other);
+            }
+            _ => {}
+        }
+    }
+    census
+}
+
+/// Unique `Assign` rvalue of `local`, when that is the only definition.
+/// A Call that writes `local` is a definition and declines.
+pub(in crate::front::mir) fn unique_local_assign_rvalue(
+    body: &Unstructured,
+    llbc: &Llbc,
+    local: usize,
+) -> Option<Rvalue> {
+    let mut found = None;
+    let mut defs = 0usize;
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            if let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref()
+                && matches!(place.kind, PlaceKind::Local(id) if id as usize == local)
+            {
+                defs += 1;
+                found = Some(rvalue.clone());
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
+            && matches!(call.dest.kind, PlaceKind::Local(id) if id as usize == local)
+        {
+            defs += 1;
+            found = None;
+        }
+    }
+    (defs == 1).then_some(())?;
+    found
+}
+
+pub(in crate::front::mir) fn follow_operand_to_aggregate(
+    body: &Unstructured,
+    llbc: &Llbc,
+    op: &Operand,
+) -> Option<(serde_json::Value, Vec<Operand>)> {
+    let mut local = operand_local(Some(op))?;
+    for _ in 0..8 {
+        match unique_local_assign_rvalue(body, llbc, local)? {
+            Rvalue::Use(next, _) => local = operand_local(Some(&next))?,
+            Rvalue::Aggregate(kind, ops) => return Some((kind, ops)),
+            _ => return None,
+        }
+    }
+    None
+}
+
+pub(in crate::front::mir) fn aggregate_adt_id(kind: &serde_json::Value) -> Option<u64> {
+    let adt = kind.get("Adt")?.as_array()?;
+    let head = adt.first()?;
+    head.as_u64()
+        .or_else(|| head.as_object().and_then(type_decl_ref_adt_id))
+}
+
+fn unique_ptr_write_value(llbc: &Llbc, body: &Unstructured, dest: usize) -> Option<Operand> {
+    let mut found = None;
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+            continue;
+        };
+        if !call_is_core_ptr_write(call, llbc) {
+            continue;
+        }
+        if operand_local(call.args.first()) != Some(dest) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = call.args.get(1).cloned();
+    }
+    found
+}
+
+/// Visible `Rvalue::Aggregate` of the add's struct pointee, used as the
+/// `ptr::write` value. A copy of an existing `ENTRY` is not this shape
+/// (`rordereddict.py` `_ll_dict_setitem_lookup_done` field stores).
+pub(in crate::front::mir) fn ptr_write_aggregate_of_pointee(
+    llbc: &Llbc,
+    body: &Unstructured,
+    dest: usize,
+    add_base_ty: &TyRef,
+) -> Option<Vec<Operand>> {
+    let pointee = tyref_peel_one_raw_ptr_node(add_base_ty, llbc)?;
+    let pointee_id = adt_node_def_id(pointee)?;
+    let value_op = unique_ptr_write_value(llbc, body, dest)?;
+    let (kind, ops) = follow_operand_to_aggregate(body, llbc, &value_op)?;
+    if aggregate_adt_id(&kind) != Some(pointee_id) {
+        return None;
+    }
+    // Charon struct aggregate is `Adt [TypeDeclRef, null, null]`;
+    // an enum variant carries a numeric index. Variant 0 is the first
+    // enum arm, also the spelling the unit tests use for a struct.
+    let variant = kind.get("Adt")?.as_array()?.get(1)?;
+    if !(variant.is_null() || variant.as_u64() == Some(0)) {
+        return None;
+    }
+    let decl = llbc.type_by_id(pointee_id)?;
+    let fields = type_decl_struct_fields(decl, llbc)?;
+    if fields.is_empty() || fields.len() != ops.len() {
+        return None;
+    }
+    Some(ops)
+}
+
+/// `PtrRepr.rtype_getitem` InteriorPtr result:
+/// `Ptr(Ptr(PARENT)._interior_ptr_type_with_index(TO))`
+/// (`rptr.py`, `lltype.py` `Ptr._interior_ptr_type_with_index`).
+pub(in crate::front::mir) fn interior_ptr_lltype(
+    array_type_id: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::{
+        Array, LowLevelType, Ptr, PtrTarget, Struct,
+    };
+    let leaf = array_type_id.strip_prefix("GcArray<")?.strip_suffix(">")?;
+    if leaf.is_empty() {
+        return None;
+    }
+    // GcArray item is a raw Struct (`lltype.py` Array.__init__ rejects a
+    // Gc container as OF). PARENT is GcArray; Interior is the GcStruct.
+    let item = LowLevelType::Struct(Box::new(Struct::new(leaf, vec![])));
+    let parent = Ptr {
+        TO: PtrTarget::Array(Array::gc(item.clone())),
+    };
+    Some(LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Struct(parent._interior_ptr_type_with_index(&item)),
+    })))
+}
+
+/// Recover `GcArray<{leaf}>` from an InteriorPtr concretetype.
+pub(in crate::front::mir) fn array_type_id_from_interior_lltype(
+    ct: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Option<String> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    let LowLevelType::Ptr(ptr) = ct else {
+        return None;
+    };
+    let PtrTarget::Struct(st) = &ptr.TO else {
+        return None;
+    };
+    match st._hints.get("interior_ptr_type") {
+        Some(crate::flowspace::model::ConstValue::Bool(true)) => {}
+        _ => return None,
+    }
+    let ptr_field = st.getattr_field_type("ptr")?;
+    let LowLevelType::Ptr(inner) = ptr_field else {
+        return None;
+    };
+    let PtrTarget::Array(arr) = inner.TO else {
+        return None;
+    };
+    let leaf = match arr.OF {
+        LowLevelType::Struct(s) => s._name,
+        _ => return None,
+    };
+    Some(format!("GcArray<{leaf}>"))
+}
+
+fn place_immediate_deref_local(place: &Place) -> Option<usize> {
+    let PlaceKind::Projection(inner, elem) = &place.kind else {
+        return None;
+    };
+    if !matches!(elem, ProjectionElem::Atom(s) if s == "Deref") {
+        return None;
+    }
+    match inner.kind {
+        PlaceKind::Local(i) => Some(i as usize),
+        _ => None,
+    }
+}
+
+/// Walk Use-copies and `&*local` / `&raw *local` reborrows from `local`
+/// until the dest of a `ptr::add`.
+///
+/// `RDict::entry_at` is `_4 = p.add(i); _3 = &* _4; _0 = &* _3`: Charon
+/// inserts a lifetime-adjusting reborrow of the `&*add` result, so a
+/// single Deref from `_0` lands on `_3`, not the add dest. `rptr.py`
+/// `InteriorPtrRepr.lowleveltype` is still `Ptr(Interior)` for that
+/// return.
+fn follow_reborrow_to_add_dest(
+    body: &Unstructured,
+    llbc: &Llbc,
+    mut local: usize,
+) -> Option<usize> {
+    for _ in 0..8 {
+        if ptr_add_def_site(llbc, body, local).is_some() {
+            return Some(local);
+        }
+        match unique_local_assign_rvalue(body, llbc, local) {
+            Some(Rvalue::Use(next, _)) => local = operand_local(Some(&next))?,
+            Some(Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. }) => {
+                local = place_immediate_deref_local(&place)?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// FUNC.RESULT of a callee whose return is `&*p.add(i)` of a GcArray
+/// struct pointee: `Ptr(Interior)` (`InteriorPtrRepr.lowleveltype`).
+pub(in crate::front::mir) fn callee_returns_interior_array_type_id(
+    fd: &FunDecl,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let body = fd.unstructured()?;
+    let add_dest = follow_reborrow_to_add_dest(&body, llbc, 0)?;
+    let (bb_idx, _) = ptr_add_def_site(llbc, &body, add_dest)?;
+    let TermKind::Call { call, .. } = body.body.get(bb_idx)?.term_ref(llbc).ok()? else {
+        return None;
+    };
+    let CallFunc::Regular(reg) = &call.func else {
+        return None;
+    };
+    struct_reborrow_ptr_add_trace(
+        reg,
+        call.args.len(),
+        operand_local(call.args.first()),
+        operand_tyref(call.args.first()?),
+        operand_local(call.args.get(1)),
+        add_dest,
+        &body,
+        llbc,
+        tombstoned,
+    )
+    .map(|traced| traced.array_type_id)
+}
+
+/// Array identity of a result the front end lowers as InteriorPtr.
+///
+/// Gate A (`try_lower_interior_ptr_add`) is `&*p.add(i)` (`entry_at`).
+/// `RDict::entry_ptr` is the same pointer into the GC entries array
+/// (`path_is_rordereddict_entry_ptr`); its signature is `*mut Entry`,
+/// whose pointee declaration would otherwise stamp `'i'`.
+pub(in crate::front::mir) fn callee_interior_ptr_array_type_id(
+    fd: &FunDecl,
+    output: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if let Some(array_type_id) = callee_returns_interior_array_type_id(fd, llbc, tombstoned) {
+        return Some(array_type_id);
+    }
+    if path_is_rordereddict_entry_ptr(&fd.item_meta.name_path()) {
+        return struct_pointee_array_type_id(output, llbc, tombstoned);
+    }
+    None
+}
+
+/// FUNC.RESULT / call dest of an InteriorPtr return: kind `'ref'`
+/// (`rptr.py` `InteriorPtrRepr`; `history.getkind` of `Ptr(Interior)`).
+pub(in crate::front::mir) fn fun_decl_result_is_interior_ptr(
+    fd: &FunDecl,
+    output: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> bool {
+    callee_interior_ptr_array_type_id(fd, output, llbc, tombstoned).is_some()
+}
+
 /// Header recovered from the add's base before any flowspace Variable exists.
 pub(in crate::front::mir) enum TracedPtrAddHeader {
     /// `entries_item_ptr(header)`. `local` is that argument, the GcEntries
@@ -4528,6 +5026,46 @@ pub(in crate::front::mir) fn trace_struct_ptr_add_header(
     None
 }
 
+/// Header walk shared by the field, reborrow, and `ptr::write` intercepts.
+/// The destination census is the caller's: this does not add path keys.
+#[allow(clippy::too_many_arguments)]
+fn struct_ptr_add_header_index(
+    reg: &RegularCall,
+    args_len: usize,
+    base_local: Option<usize>,
+    base_ty: Option<&TyRef>,
+    index_local: Option<usize>,
+    dest_local: usize,
+    body: &Unstructured,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<StructFieldPtrAdd> {
+    if args_len != 2 || !regular_call_is_ptr_add(reg, llbc) {
+        return None;
+    }
+    let base_local = base_local?;
+    let index_local = index_local?;
+    let array_type_id = struct_pointee_array_type_id(base_ty?, llbc, tombstoned)?;
+    let header = trace_struct_ptr_add_header(body, llbc, base_local)?;
+    let header_local = match &header {
+        TracedPtrAddHeader::EntriesItem { local } => *local,
+        TracedPtrAddHeader::EntryPtr { recv_local, .. } => *recv_local,
+    };
+    if !captured_local_reaches_field_uses(llbc, body, dest_local, index_local) {
+        return None;
+    }
+    if header_local != index_local
+        && !captured_local_reaches_field_uses(llbc, body, dest_local, header_local)
+    {
+        return None;
+    }
+    Some(StructFieldPtrAdd {
+        header,
+        index_local,
+        array_type_id,
+    })
+}
+
 /// Shared gate for the extra-live pass and the `ptr::add` intercept.
 ///
 /// Requires `ptr::add` (not `sub`), a MIR-local index, a named
@@ -4551,33 +5089,82 @@ pub(in crate::front::mir) fn struct_field_ptr_add_trace(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Option<StructFieldPtrAdd> {
-    if args_len != 2 || !regular_call_is_ptr_add(reg, llbc) {
-        return None;
-    }
-    let base_local = base_local?;
-    let index_local = index_local?;
-    let array_type_id = struct_pointee_array_type_id(base_ty?, llbc, tombstoned)?;
     if !add_dest_used_only_as_struct_field(llbc, body, dest_local) {
         return None;
     }
-    let header = trace_struct_ptr_add_header(body, llbc, base_local)?;
-    let header_local = match &header {
-        TracedPtrAddHeader::EntriesItem { local } => *local,
-        TracedPtrAddHeader::EntryPtr { recv_local, .. } => *recv_local,
-    };
-    if !captured_local_reaches_field_uses(llbc, body, dest_local, index_local) {
-        return None;
-    }
-    if header_local != index_local
-        && !captured_local_reaches_field_uses(llbc, body, dest_local, header_local)
-    {
-        return None;
-    }
-    Some(StructFieldPtrAdd {
-        header,
+    struct_ptr_add_header_index(
+        reg,
+        args_len,
+        base_local,
+        base_ty,
         index_local,
-        array_type_id,
-    })
+        dest_local,
+        body,
+        llbc,
+        tombstoned,
+    )
+}
+
+/// Gate A: `ptr::add` dest used only as `&*dest` / `&mut *dest`.
+///
+/// `rptr.py` `pairtype(PtrRepr, IntegerRepr).rtype_getitem` InteriorPtr arm.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::front::mir) fn struct_reborrow_ptr_add_trace(
+    reg: &RegularCall,
+    args_len: usize,
+    base_local: Option<usize>,
+    base_ty: Option<&TyRef>,
+    index_local: Option<usize>,
+    dest_local: usize,
+    body: &Unstructured,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<StructFieldPtrAdd> {
+    if !add_dest_used_only_as_reborrow(llbc, body, dest_local) {
+        return None;
+    }
+    struct_ptr_add_header_index(
+        reg,
+        args_len,
+        base_local,
+        base_ty,
+        index_local,
+        dest_local,
+        body,
+        llbc,
+        tombstoned,
+    )
+}
+
+/// Gate B: `ptr::add` dest used only as `core::ptr::write` of a visible
+/// aggregate of the pointee. `rordereddict.py` `_ll_dict_setitem_lookup_done`.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::front::mir) fn struct_write_ptr_add_trace(
+    reg: &RegularCall,
+    args_len: usize,
+    base_local: Option<usize>,
+    base_ty: Option<&TyRef>,
+    index_local: Option<usize>,
+    dest_local: usize,
+    body: &Unstructured,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<StructFieldPtrAdd> {
+    if !add_dest_used_only_as_ptr_write(llbc, body, dest_local) {
+        return None;
+    }
+    ptr_write_aggregate_of_pointee(llbc, body, dest_local, base_ty?)?;
+    struct_ptr_add_header_index(
+        reg,
+        args_len,
+        base_local,
+        base_ty,
+        index_local,
+        dest_local,
+        body,
+        llbc,
+        tombstoned,
+    )
 }
 
 pub(in crate::front::mir) fn block_has_struct_field_value_use(

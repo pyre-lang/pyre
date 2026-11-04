@@ -4949,6 +4949,13 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
             ) {
                 return Some(format!("raw:{root}"));
             }
+            // `direct_arrayitems` (`lltype.py`) of a GC array is a raw
+            // `Ptr` (`history.py` `getkind` `'int'`). Stamp `raw:<Item>`
+            // so `FUNC.RESULT` matches the CFG `int_return` and callers
+            // emit `inline_call_*_i` (`call.py` `getcalldescr`).
+            if let Some(root) = gc_array_item_struct_ptr_owner_root(kind_src, llbc, gc_struct_ids) {
+                return Some(format!("raw:{root}"));
+            }
             // `llmemory.GCREF` / `*mut GCREFOpaque` is `SomePtr(GCREF)`.
             // A registered GC pointer (`PyObjectRef`) stays `"ref"` so
             // `declared_return_annotation` intern's `annotationoftype`
@@ -14029,6 +14036,73 @@ pub(in crate::front::mir) fn tyref_shaped_tuple_root(ty: &TyRef, llbc: &Llbc) ->
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let suffix = tyref_tuple_suffix(&TyRef::Other(node.clone()), llbc);
     (!suffix.is_empty()).then(|| format!("Tuple{suffix}"))
+}
+
+/// ADT def id of the element of a `[T; N]` / `Array` field, after
+/// wrapper peel. `None` when `ty` is not a fixed array of a nominal
+/// struct (`GcEntries.items: [Entry; 0]`).
+pub(in crate::front::mir) fn tyref_array_elem_adt_def_id(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
+    let node = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc))?;
+    let arr = node.get("Array")?.as_array()?;
+    let elem = arr.first()?;
+    let elem = strip_ty_wrappers(elem, llbc).unwrap_or(elem);
+    adt_node_def_id(elem)
+}
+
+/// True when a declared GC struct has a `[item; N]` field whose
+/// element ADT is `item_def_id` (`lltype.py` `GcArray(ITEM)`,
+/// `direct_arrayitems`).
+pub(in crate::front::mir) fn gc_array_carries_item_struct(
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    item_def_id: u64,
+) -> bool {
+    llbc.iter_type_decls().any(|td| {
+        let TypeDeclKind::Struct(fields) = &td.kind else {
+            return false;
+        };
+        let name = strip_crate_prefix(&td.item_meta.name_path());
+        let sid = majit_ir::descr::StructId::from_canonical(&name);
+        if !struct_id_is_declared_gc(gc_struct_ids, sid, &name) {
+            return false;
+        }
+        fields
+            .iter()
+            .any(|field| tyref_array_elem_adt_def_id(&field.ty, llbc) == Some(item_def_id))
+    })
+}
+
+/// Class root of a `*mut Item` whose `Item` is a raw `lltype.Struct`
+/// stored as the `[T; N]` tail of a declared GC array (`GcEntries.items:
+/// [Entry; 0]`). `history.py` `getkind` of that `Ptr` is `'int'`.
+/// `None` for a vtable (`PyType`), rstr `STR` (`Utf8Str`), or a
+/// declared-GC pointee — those stay GC/STR refs.
+pub(in crate::front::mir) fn gc_array_item_struct_ptr_owner_root(
+    dest_ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> Option<String> {
+    let pointee = tyref_peel_one_raw_ptr_node(dest_ty, llbc)?;
+    if node_is_string_value(pointee, llbc) {
+        return None;
+    }
+    let id = adt_node_def_id(pointee)?;
+    let td = llbc.type_by_id(id)?;
+    if type_decl_is_builtin_adt(td) {
+        return None;
+    }
+    if !matches!(&td.kind, TypeDeclKind::Struct(_)) {
+        return None;
+    }
+    let name = strip_crate_prefix(&td.item_meta.name_path());
+    let sid = majit_ir::descr::StructId::from_canonical(&name);
+    if struct_id_is_declared_gc(gc_struct_ids, sid, &name) {
+        return None;
+    }
+    if !gc_array_carries_item_struct(llbc, gc_struct_ids, id) {
+        return None;
+    }
+    Some(adt_node_class_root_with(pointee, llbc, no_tombstoned_leaves()).unwrap_or(name))
 }
 
 /// The per-shape suffix for a fixed-size array destination

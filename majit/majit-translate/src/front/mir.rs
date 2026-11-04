@@ -2336,6 +2336,13 @@ impl CrateLoweringState {
             &mut struct_fields,
             gc_struct_ids,
         );
+        register_interior_ptr_type(
+            &mut known_struct_names,
+            &mut struct_fields,
+            &mut struct_field_attrs,
+            &mut exact_layouts,
+            &mut struct_ids,
+        );
 
         // Pass 2 paints each ADT as its bare leaf. A leaf `harden` withdrew
         // (`eval::Code` beside `module::struct::Code`) is not a class: the
@@ -3573,8 +3580,18 @@ impl SemanticFunctionHeader {
         // FUNC.RESULT as that kind so the signature matches the CFG
         // (`func_result_kind`); the Rust field is `usize` and would
         // otherwise leave a scalar token.
+        // An InteriorPtr return (`rptr.py` `InteriorPtrRepr`;
+        // `history.getkind` of `Ptr(Interior)` of a GcArray) is the
+        // same kind. The signature is `*mut Entry` / `&Entry`; the
+        // pointee declaration would stamp `'i'`
+        // (`gc_array_item_struct_ptr_owner_root`,
+        // `by_value_payload_annotation`). Body lowering is Gate A
+        // (`callee_returns_interior_array_type_id`) or
+        // `RDict::entry_ptr` (`path_is_rordereddict_entry_ptr`).
         let frame_anchor_result = tyref_is_frame_anchor(&signature.output, llbc);
-        let return_type = if frame_anchor_result {
+        let interior_ptr_result =
+            fun_decl_result_is_interior_ptr(fd, &signature.output, llbc, tombstoned_leaves);
+        let return_type = if frame_anchor_result || interior_ptr_result {
             Some("ref".to_string())
         } else if stamp_return_token {
             signature_token
@@ -3588,15 +3605,23 @@ impl SemanticFunctionHeader {
             )
         {
             signature_token
+        } else if gc_array_item_struct_ptr_owner_root(&signature.output, llbc, gc_struct_ids)
+            .is_some()
+        {
+            // CFG of `direct_arrayitems` is int (`jtransform.py`
+            // `rewrite_op_direct_ptradd` → `int_return`). Stamp
+            // `FUNC.RESULT` so a looked-inside caller does not emit
+            // `inline_call_r_r` against that `int_return`.
+            signature_token
         } else {
             None
         };
-        let residual_return_type = if frame_anchor_result {
+        let residual_return_type = if frame_anchor_result || interior_ptr_result {
             Some("ref".to_string())
         } else {
             residual_return_type
         };
-        let return_class_root = if frame_anchor_result {
+        let return_class_root = if frame_anchor_result || interior_ptr_result {
             None
         } else {
             dont_look_inside_return_class_root(
@@ -4368,6 +4393,115 @@ fn type_spelling_is_fixed_object_array(spelling: &str) -> bool {
 /// stripped (so the value matches the runtime def-path convention).
 /// `struct_field_attrs` maps the crate-stripped qualified struct name to
 /// its declaration-ordered `(field, ValueType)` register classes.
+/// `lltype.py` `Ptr._interior_ptr_type_with_index`: the translator-minted
+/// `GcStruct("Interior", ptr, index, hints={'interior_ptr_type': True})`.
+/// Assembler `OpKind::New { owner: "Interior" }` needs this Size descr.
+fn register_interior_ptr_type(
+    known_struct_names: &mut std::collections::HashSet<String>,
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    struct_field_attrs: &mut std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    exact_layouts: &mut std::collections::HashMap<
+        majit_ir::descr::StructId,
+        crate::front::semantic::ExactLayout,
+    >,
+    struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+) {
+    let rows = vec![
+        crate::front::semantic::FieldRow::named("ptr", "GCREF"),
+        crate::front::semantic::FieldRow::named("index", "i64"),
+    ];
+    struct_fields.fields.insert("Interior".to_string(), rows);
+    known_struct_names.insert("Interior".to_string());
+    let sid = majit_ir::descr::StructId::from_canonical("Interior");
+    record_struct_id(
+        struct_ids,
+        &mut struct_fields.class_identity,
+        "Interior".to_string(),
+        sid,
+        "Interior",
+    );
+    struct_field_attrs.insert(
+        "Interior".to_string(),
+        vec![
+            ("ptr".to_string(), ValueType::Ref(None)),
+            ("index".to_string(), ValueType::Int),
+        ],
+    );
+    let word = crate::layout::target_word_size() as u64;
+    let mut field_offsets = std::collections::HashMap::new();
+    field_offsets.insert("ptr".to_string(), 0);
+    field_offsets.insert("index".to_string(), word);
+    exact_layouts.insert(
+        sid,
+        crate::front::semantic::ExactLayout {
+            size: Some(2 * word),
+            align: Some(word),
+            field_offsets,
+            host: None,
+        },
+    );
+    intern_interior_ptr_size_descr();
+}
+
+/// `descr.py` `get_size_descr` + `gc.py` `GcLLDescr_framework.init_size_descr`
+/// for the translator-minted Interior GcStruct.
+///
+/// `make_simple_descr_group_keyed_with_headerless` is the declared-group
+/// mint: it interns `_cache_size[LLType::Struct(path_hash("Interior"))]`
+/// and `_cache_field` the same way a W_* group is published, then
+/// `register_keyed_size` runs `init_size_descr`. Assembler
+/// `OpKind::New { owner: "Interior" }` / `BhDescr::resolve_gc_tid` look
+/// that key up.
+fn intern_interior_ptr_size_descr() {
+    let word = crate::layout::target_word_size();
+    let cache_key = majit_ir::descr::path_hash("Interior");
+    let specs = [
+        majit_ir::descr::SimpleFieldDescrSpec {
+            index: u32::MAX,
+            field_key: "ptr".to_string(),
+            name: "Interior.ptr".to_string(),
+            offset: 0,
+            field_size: word,
+            field_type: majit_ir::Type::Ref,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            flag: majit_ir::ArrayFlag::Pointer,
+            virtualizable: false,
+            index_in_parent: 0,
+            is_class_word: Some(false),
+            load_is_acquire: false,
+            store_is_release: false,
+        },
+        majit_ir::descr::SimpleFieldDescrSpec {
+            index: u32::MAX,
+            field_key: "index".to_string(),
+            name: "Interior.index".to_string(),
+            offset: word,
+            field_size: word,
+            field_type: majit_ir::Type::Int,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            flag: majit_ir::ArrayFlag::Signed,
+            virtualizable: false,
+            index_in_parent: 1,
+            is_class_word: Some(false),
+            load_is_acquire: false,
+            store_is_release: false,
+        },
+    ];
+    let _group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+        u32::MAX,
+        2 * word,
+        0,
+        cache_key,
+        0,
+        true,
+        false,
+        &specs,
+        &[],
+    );
+}
+
 /// Record a `name → StructId` mapping in the resolver table, collapsing
 /// to `None` (ambiguous) if the same name already mapped to a different
 /// identity — i.e. two distinct type definitions share that spelling
@@ -6269,6 +6403,14 @@ fn derive_program_metadata(
             },
         );
     }
+
+    register_interior_ptr_type(
+        &mut known_struct_names,
+        &mut struct_fields,
+        &mut struct_field_attrs,
+        &mut exact_layouts,
+        &mut struct_ids,
+    );
 
     // Opaque TypeDecls are declared ADTs (`lltype.py` `OpaqueType` /
     // `Struct._first_struct`). Harvest them after the named field-row

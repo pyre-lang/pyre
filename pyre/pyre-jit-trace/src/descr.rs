@@ -1538,6 +1538,37 @@ pub fn rlist_size_descr() -> DescrRef {
     RLIST_DESCR_GROUP.size_descr.clone()
 }
 
+/// `lltype.py` `Ptr._interior_ptr_type_with_index`:
+/// `GcStruct("Interior", ('ptr', GCREF), ('index', Signed),
+/// hints={'interior_ptr_type': True})`.
+///
+/// Assembler `OpKind::New { owner: "Interior" }` serializes
+/// `BhDescr::Size { type_id: path_hash("Interior"), owner: "" }`.
+/// `force_declared_object_groups` publishes this group into `_cache_size`
+/// before `register_unresolved_struct_tids` (`descr.py` `get_size_descr` /
+/// `gc.py` `init_size_descr`). The mint tid is the truncated cache key
+/// (`struct_tid_is_unresolved`); the census stamps a dense collector tid
+/// whose `TypeInfo` is size 16 with gc-pointer offset `[0]`.
+static INTERIOR_PTR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    let cache_key = majit_ir::descr::path_hash("Interior");
+    build_bare_gcstruct_descr_group(
+        2 * WORD,
+        cache_key as u32,
+        &[
+            ("ptr", 0, WORD, Type::Ref, false, false, false),
+            ("index", WORD, 8, Type::Int, true, false, false),
+        ],
+        "Interior",
+    )
+});
+
+/// Force + return the Interior bare-GcStruct size descriptor, keyed at
+/// `path_hash("Interior")` so `New{"Interior"}` / `BhDescr::resolve_gc_tid`
+/// resolve it.
+pub fn interior_ptr_size_descr() -> DescrRef {
+    INTERIOR_PTR_DESCR_GROUP.size_descr.clone()
+}
+
 pub fn rlist_length_descr() -> DescrRef {
     field_descr_from_group(&RLIST_DESCR_GROUP, 0)
 }
@@ -14003,6 +14034,36 @@ mod tests {
     }
 
     #[test]
+    fn interior_ptr_descr_is_published_under_path_hash() {
+        force_declared_object_groups();
+        let size = interior_ptr_size_descr();
+        let sd = size.as_size_descr().expect("Interior is a SizeDescr");
+        assert_eq!(sd.size(), 2 * WORD);
+        assert!(sd.is_gc_managed());
+        assert!(!sd.headerless());
+        let traced: Vec<usize> = sd.gc_fielddescrs().iter().map(|f| f.offset()).collect();
+        assert_eq!(traced, vec![0]);
+        assert_eq!(sd.cache_key(), majit_ir::descr::path_hash("Interior"));
+        let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash("Interior"));
+        let resolved = majit_ir::descr::gc_cache()
+            .lock()
+            ._cache_size
+            .get(&key)
+            .cloned()
+            .expect("Interior descr registered under path_hash(\"Interior\")");
+        let resolved = resolved
+            .as_size_descr()
+            .expect("Interior resolved entry is a SizeDescr");
+        assert_eq!(resolved.size(), 2 * WORD);
+        let resolved_traced: Vec<usize> = resolved
+            .gc_fielddescrs()
+            .iter()
+            .map(|f| f.offset())
+            .collect();
+        assert_eq!(resolved_traced, vec![0]);
+    }
+
+    #[test]
     fn make_descr_from_bh_bridges_codewriter_box_payload_fields_to_group() {
         use majit_ir::descr::ArrayFlag;
         use majit_jitcode::jitcode::BhDescr;
@@ -16649,6 +16710,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
             LazyLock::force(&SPECIALISED_TUPLE_OO_DESCR_GROUP);
         },
     ),
+    ("Interior", || {
+        LazyLock::force(&INTERIOR_PTR_DESCR_GROUP);
+    }),
     ("object_array::ItemsBlock", || {
         LazyLock::force(&ITEMS_BLOCK_DESCR_GROUP);
     }),

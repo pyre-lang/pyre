@@ -587,8 +587,12 @@ fn place_is_planned_cell(place: &Place, cell_locals: &bit_set::BitSet) -> bool {
 
 /// Blocks that keep a cell pointer live. A local with no `StorageLive`
 /// is live on every forward-reached block. Otherwise the scope is the
-/// DFS from each `StorageLive` that stops at `StorageDead` (that block
-/// is in scope; its successors are not).
+/// blocks a `StorageLive` dominates, stopping at `StorageDead` (that
+/// block is in scope; its successors are not). `lltype.py`
+/// `ScopedAlloc.__enter__` allocates inside the region; a join with a
+/// path that never entered is not a use, so the cell is not live-in on
+/// the `bb0` edge (`FlowContext.mergeblock`). A loop after the alloc
+/// stays in: every path from entry still went through `StorageLive`.
 pub(in crate::front::mir) fn cell_scope_extra_live(
     llbc: &Llbc,
     body: &Unstructured,
@@ -599,7 +603,7 @@ pub(in crate::front::mir) fn cell_scope_extra_live(
     let mut extra = vec![Vec::new(); n_blocks];
     for local in &plan.locals {
         if plan.has_storage_live.contains(local) {
-            for bb in cell_storage_scope_blocks(llbc, body, local, n_blocks).iter() {
+            for bb in cell_storage_scope_blocks(llbc, body, local, n_blocks, forward).iter() {
                 extra[bb].push(local);
             }
         } else {
@@ -618,13 +622,16 @@ fn cell_storage_scope_blocks(
     body: &Unstructured,
     local: usize,
     n_blocks: usize,
+    forward: &[bool],
 ) -> bit_set::BitSet {
-    let mut lives = Vec::new();
+    let mut lives = bit_set::BitSet::with_capacity(n_blocks);
     let mut deads = bit_set::BitSet::with_capacity(n_blocks);
     for (bb, block) in body.body.iter().enumerate() {
         for stmt in &block.statements {
             match stmt.stmt_kind_ref() {
-                Ok(StmtKind::StorageLive(id)) if *id as usize == local => lives.push(bb),
+                Ok(StmtKind::StorageLive(id)) if *id as usize == local => {
+                    lives.insert(bb);
+                }
                 Ok(StmtKind::StorageDead(id)) if *id as usize == local => {
                     deads.insert(bb);
                 }
@@ -632,17 +639,54 @@ fn cell_storage_scope_blocks(
             }
         }
     }
-    let mut scope = bit_set::BitSet::with_capacity(n_blocks);
-    let mut stack = lives;
-    while let Some(bb) = stack.pop() {
-        if !scope.insert(bb) {
-            continue;
+    let mut preds = vec![Vec::new(); n_blocks];
+    for bb in 0..n_blocks {
+        for succ in successor_blocks(llbc, body, bb, true) {
+            if !preds[succ].contains(&bb) {
+                preds[succ].push(bb);
+            }
         }
+    }
+    // Reachability from `StorageLive` is an over-approx: a join with a
+    // never-allocated path is reachable, extra-live would treat it as a
+    // use, and the backward fixpoint would demand the cell live-in on
+    // `bb0`. Trim to the greatest set closed under "every reachable
+    // predecessor is in" (seeds stay). Least-fixpoint growth from the
+    // seeds stalls at a loop header whose latch is not yet in, so a
+    // loop after the alloc would drop the cell (`ScopedAlloc` of the
+    // enclosing region still holds it).
+    let mut scope = bit_set::BitSet::with_capacity(n_blocks);
+    let mut stack: Vec<usize> = lives.iter().collect();
+    for &bb in &stack {
+        scope.insert(bb);
+    }
+    while let Some(bb) = stack.pop() {
         if deads.contains(bb) {
             continue;
         }
         for succ in successor_blocks(llbc, body, bb, true) {
-            stack.push(succ);
+            if scope.insert(succ) {
+                stack.push(succ);
+            }
+        }
+    }
+    loop {
+        let drop: Vec<usize> = scope
+            .iter()
+            .filter(|&bb| {
+                if lives.contains(bb) {
+                    return false;
+                }
+                preds[bb].iter().any(|&pred| {
+                    forward.get(pred).copied().unwrap_or(false) && !scope.contains(pred)
+                })
+            })
+            .collect();
+        if drop.is_empty() {
+            break;
+        }
+        for bb in drop {
+            scope.remove(bb);
         }
     }
     scope
