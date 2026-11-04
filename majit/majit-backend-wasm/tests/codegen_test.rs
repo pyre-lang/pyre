@@ -653,7 +653,6 @@ fn compile_bridge_terminal_decline_invalidates_ca_callers() {
     // One bridge input against two fail-arg types: `frame_entry_reads_live_positions`
     // declines this shape, which is a structural `Unsupported`.
     let fail_descr = HostFailDescr {
-        fail_index: 0,
         arg_types: vec![Type::Int, Type::Int],
     };
     let err = backend
@@ -4836,9 +4835,6 @@ fn building_a_module_does_not_stamp_the_guard_cell_on_its_descr() {
         }
     }
     impl majit_ir::FailDescr for CellDescr {
-        fn fail_index(&self) -> u32 {
-            0
-        }
         fn fail_arg_types(&self) -> &[Type] {
             &self.types
         }
@@ -7421,13 +7417,11 @@ fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
 /// descr identity (`assemble_bridge`, `handle_guard_failure`).
 #[derive(Debug)]
 struct HostFailDescr {
-    fail_index: u32,
     arg_types: Vec<Type>,
 }
 
 fn stamp_host_fail_descr(loop_ops: &[OpRc]) -> std::sync::Arc<HostFailDescr> {
     let fail_descr = std::sync::Arc::new(HostFailDescr {
-        fail_index: 0,
         arg_types: vec![Type::Int, Type::Int],
     });
     loop_ops
@@ -7441,10 +7435,6 @@ fn stamp_host_fail_descr(loop_ops: &[OpRc]) -> std::sync::Arc<HostFailDescr> {
 impl majit_ir::Descr for HostFailDescr {}
 
 impl majit_ir::descr::FailDescr for HostFailDescr {
-    fn fail_index(&self) -> u32 {
-        self.fail_index
-    }
-
     fn fail_arg_types(&self) -> &[Type] {
         &self.arg_types
     }
@@ -7791,7 +7781,6 @@ fn a_bridge_compiled_after_the_owner_was_invalidated_starts_valid() {
     assert!(token.is_invalidated());
 
     let fail_descr = HostFailDescr {
-        fail_index: 0,
         arg_types: vec![Type::Int, Type::Int],
     };
     let declines_before = majit_backend_wasm::bridge_diag(50);
@@ -9084,9 +9073,6 @@ fn sparse_resume_positions_use_compact_exit_and_force_locations() {
         fn make_a_counter_per_value(&self, index: u32, _type_tag: u64) {
             self.counter
                 .store(index, std::sync::atomic::Ordering::Relaxed);
-        }
-        fn fail_index(&self) -> u32 {
-            0
         }
         fn rd_locs(&self) -> &[u16] {
             &self.locs

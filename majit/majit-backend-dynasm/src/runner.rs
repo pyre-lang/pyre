@@ -3675,8 +3675,9 @@ impl Backend for DynasmBackend {
         // `jitdriver.rs` `start_bridge_tracing` takes the bridge's inputarg
         // count from `fail_descr.fail_arg_types().len()`, while
         // `_update_bindings` zips that inputarg vector against this location
-        // vector, so both must come off the one descr. Reading the locations
-        // off a `(trace_id, fail_index)` lookup let the two lengths disagree —
+        // vector, so both must come off the one descr
+        // (`compute_unique_id(faildescr)` / `descr_identity`). Reading the
+        // locations off a different descr let the two lengths disagree —
         // measured on `pyre/bench/fannkuch.py`, 17 inputargs against 15
         // locations — and every inputarg past the shorter list then bound
         // nothing at all (`RegisterManager.loc: box InputArgInt(1844) not
@@ -5707,8 +5708,6 @@ mod tests {
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let failed = backend.execute_token(&token, &[Value::Ref(payload)]);
-        let _guard_fail_index = backend.get_latest_descr(&failed).fail_index();
-        let _guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = backend.get_latest_descr_arc(&failed);
 
         for ia in &inputargs {
@@ -5808,8 +5807,6 @@ mod tests {
             &token,
             &[Value::Ref(frame_payload), Value::Ref(second_payload)],
         );
-        let _guard_fail_index = backend.get_latest_descr(&failed).fail_index();
-        let _guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = backend.get_latest_descr_arc(&failed);
 
         for ia in &inputargs {

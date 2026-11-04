@@ -4,7 +4,6 @@
 /// executes them as ordinary function pointers.
 use indexmap::{IndexMap, IndexSet};
 use majit_ir::IndexMapExt;
-use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -35,8 +34,8 @@ use majit_ir::InputArg;
 use majit_ir::forwarding::ForwardingHost;
 use majit_ir::operand::Operand;
 use majit_ir::{
-    AccumInfo, CallDescr, DescrRef, EffectInfo, FailDescr, GcRef, InputArgRc, OopSpecIndex, Op,
-    OpCode, OpRc, OpRef, OpTypeIndex, Type, Value,
+    AccumInfo, CallDescr, DescrRef, EffectInfo, FailDescr, GcRef, HandleFailClass, InputArgRc,
+    OopSpecIndex, Op, OpCode, OpRc, OpRef, OpTypeIndex, Type, Value,
 };
 
 mod slice_x2_probe {
@@ -652,19 +651,10 @@ struct RegisteredLoopTarget {
     /// `looptoken._ll_function_addr = rawstart + functionpos`).
     body_ptr: *const u8,
     /// Frozen after compile — `Box<[T]>` reflects RPython's no-mutation
-    /// contract (compile.py record_loop_or_bridge).  Position
-    /// equals `descr.fail_index` by an invariant asserted at construction.
+    /// contract (compile.py record_loop_or_bridge). Compile-time position
+    /// pairs each GuardInfo with this vector; runtime identity is the
+    /// `jf_descr` descr (`llmodel.py get_latest_descr`).
     fail_descrs: Box<[DescrRef]>,
-    /// `FailDescrCell` thin wrappers, one per non-finish `fail_descrs[i]`
-    /// position.  `Arc<FailDescrCell>` is a thin pointer (concrete-typed)
-    /// so the address baked into JIT code (`jf_descr`) round-trips back
-    /// to the cell via `Arc::from_raw` (`majit_ir::recover_fail_descr_cell`)
-    /// without a process-global Weak registry.  Keep-alive root is this
-    /// field on `CompiledLoop`; the CLT drop releases the JIT code and
-    /// the cells together so a stale baked address never outlives its
-    /// cell.  Position-aligned with `fail_descrs` (singleton finish
-    /// emissions still get a wrapping cell so position equality holds).
-    fail_descr_cells: Arc<[Box<majit_ir::FailDescrCell>]>,
     num_inputs: usize,
     /// Reserved frame slots after the dense output region: GC ref roots plus
     /// demoted non-ref homes.  Frame depth is `max_output_slots + num_ref_roots`.
@@ -2453,7 +2443,6 @@ fn register_call_assembler_target(
         code_ptr: entry_code,
         body_ptr: entry_body,
         fail_descrs: compiled.fail_descrs.clone(),
-        fail_descr_cells: compiled.fail_descr_cells.clone(),
         num_inputs: compiled.num_inputs,
         num_ref_roots: compiled.num_ref_roots,
         max_output_slots: compiled.max_output_slots,
@@ -2681,16 +2670,14 @@ fn take_call_assembler_deadframe_from_handle(handle: u64) -> DeadFrame {
 /// handle lives in exit slot 0 and the slots are still in the frame the run
 /// returned, so `llmodel.py grab_exc_value`'s read-through-the-frame answers this
 /// without materialising the other slots first. The dispatch loops that call
-/// this reach it on every exit, and all but the sentinel one discard the
-/// vector unread.
-fn maybe_take_call_assembler_deadframe(fail_index: u32, exec: &JitExecResult) -> Option<DeadFrame> {
-    if fail_index != CALL_ASSEMBLER_DEADFRAME_SENTINEL {
-        return None;
+/// this reach it on every exit; a descr exit discards the vector unread.
+fn maybe_take_call_assembler_deadframe(exec: &JitExecResult) -> Option<DeadFrame> {
+    match exec.exit {
+        ResolvedExit::CallAssemblerDeadframe => Some(take_call_assembler_deadframe_from_handle(
+            exec.get_jf_int(0) as u64,
+        )),
+        ResolvedExit::Descr(_) => None,
     }
-
-    Some(take_call_assembler_deadframe_from_handle(
-        exec.get_jf_int(0) as u64,
-    ))
 }
 
 fn actual_call_assembler_result_kind(descr: &dyn FailDescr) -> Result<u64, BackendError> {
@@ -2751,8 +2738,7 @@ fn deadframe_from_jitframe(
 }
 
 /// `compile.py DoneWithThisFrameDescrRef`, and not
-/// `ExitFrameWithExceptionDescrRef` (also `fail_index() == u32::MAX` and
-/// `[Type::Ref]`, but `is_exit_frame_with_exception`).
+/// `ExitFrameWithExceptionDescrRef` (`is_exit_frame_with_exception`).
 fn is_done_with_this_frame_ref(descr: &dyn FailDescr) -> bool {
     descr.is_finish()
         && !descr.is_exit_frame_with_exception()
@@ -2841,7 +2827,6 @@ enum CompiledExit {
     Jump {
         dispatch_key: u32,
         code_ptr: *const u8,
-        fail_descrs: Box<[DescrRef]>,
         num_ref_roots: usize,
         max_output_slots: usize,
         inputs: Vec<i64>,
@@ -2849,61 +2834,17 @@ enum CompiledExit {
 }
 
 fn handle_compiled_exit(
-    compiled: &CompiledLoop,
-    mut exec: JitExecResult,
-    cur_fail_descrs: &[DescrRef],
+    exec: JitExecResult,
     cur_max_output_slots: usize,
     release_ref_finish: bool,
 ) -> CompiledExit {
-    let fail_index = exec.fail_index;
-    let direct_descr = exec.direct_descr.take();
-
-    if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &exec) {
+    if let Some(frame) = maybe_take_call_assembler_deadframe(&exec) {
         return CompiledExit::Done(Err(frame));
     }
-
-    let fail_descr = if let Some(descr) = direct_descr {
-        descr
-    } else if (fail_index as usize) < cur_fail_descrs.len() {
-        ExitDescr::owned(cur_fail_descrs[fail_index as usize].clone())
-    } else {
-        let found = compiled.fail_descrs.iter().find_map(|d| {
-            let guard = fail_descr_bridge_ref(as_fd(d));
-            guard.as_ref().and_then(|b| {
-                find_fail_descr_in_fail_descrs(&b.fail_descrs, b.trace_id, fail_index)
-            })
-        });
-        ExitDescr::owned(found.unwrap_or_else(|| {
-            cur_fail_descrs
-                .last()
-                .cloned()
-                .unwrap_or_else(|| compiled.fail_descrs[0].clone())
-        }))
+    let fail_descr = match &exec.exit {
+        ResolvedExit::CallAssemblerDeadframe => unreachable!(),
+        ResolvedExit::Descr(d) => d.clone(),
     };
-    // `compile.py` `_DoneWithThisFrameDescr.final_descr = True` is a
-    // class attribute, i.e. a field load after translation. The FINISH
-    // family answers `fail_index()` with `u32::MAX`
-    // (`majit-backend/src/finish_descrs.rs`) and the resolution above
-    // already keyed on that, so the three trait queries below would
-    // ask the descr what this word has already said. The arm is a
-    // SUPERSET of `is_finish()` — a `PropagateExceptionDescr` answers
-    // `u32::MAX` too and is not final — and it is right only because
-    // the fall-through return is byte-identical. Anything added
-    // between the two returns below has to be re-checked here.
-    debug_assert!(
-        fail_index != u32::MAX || {
-            let fd = fail_descr.as_fail_descr();
-            !fd.is_external_jump() && !fd.is_resume_guard() && !fd.is_resume_guard_copied()
-        },
-        "a u32::MAX fail_index must be a final or propagate descr, never a guard"
-    );
-    if fail_index == u32::MAX {
-        return CompiledExit::Done(release_ref_finish_or_deadframe(
-            release_ref_finish,
-            exec,
-            fail_descr,
-        ));
-    }
     let fail_descr_fd = fail_descr.as_fail_descr();
 
     if fail_descr_fd.is_external_jump() {
@@ -2921,13 +2862,13 @@ fn handle_compiled_exit(
         return CompiledExit::Jump {
             dispatch_key,
             code_ptr: target_entry.code_ptr,
-            fail_descrs: target_entry.fail_descrs.clone(),
             num_ref_roots: target_entry.num_ref_roots,
             max_output_slots: target_entry.max_output_slots,
             inputs,
         };
     }
-    if fail_descr_fd.is_finish() {
+    if fail_descr_fd.is_finish() || fail_descr_fd.handle_fail_class() == HandleFailClass::Propagate
+    {
         return CompiledExit::Done(release_ref_finish_or_deadframe(
             release_ref_finish,
             exec,
@@ -3028,8 +2969,6 @@ pub fn grab_exc_value_from_deadframe(frame: &DeadFrame) -> Result<GcRef, Backend
 
 fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64]) -> DeadFrame {
     let mut cur_code_ptr = target.code_ptr;
-    // Borrowed, not cloned — see `execute_with_inputs_at_dispatch_key`.
-    let mut cur_fail_descrs: Cow<'_, [DescrRef]> = Cow::Borrowed(&target.fail_descrs);
     let mut cur_num_ref_roots = target.num_ref_roots;
     let mut cur_max_output_slots = target.max_output_slots;
     let mut current_inputs = inputs.to_vec();
@@ -3048,7 +2987,6 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
     loop {
         let exec = run_compiled_code(
             cur_code_ptr,
-            &cur_fail_descrs,
             cur_num_ref_roots,
             cur_max_output_slots,
             0,
@@ -3056,15 +2994,14 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             attachments,
             cur_dispatch_key,
         );
-        let fail_index = exec.fail_index;
-        let direct_descr = exec.direct_descr.clone();
-
-        if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &exec) {
+        if let Some(frame) = maybe_take_call_assembler_deadframe(&exec) {
             return frame;
         }
 
-        let fail_descr = direct_descr
-            .unwrap_or_else(|| ExitDescr::owned(cur_fail_descrs[fail_index as usize].clone()));
+        let fail_descr = match &exec.exit {
+            ResolvedExit::CallAssemblerDeadframe => unreachable!(),
+            ResolvedExit::Descr(d) => d.clone(),
+        };
         let fail_descr_fd = fail_descr.as_fail_descr();
         if let Some(bridge) = fail_descr_bridge_ref(fail_descr_fd) {
             // Extracted here rather than beside `fail_index`: the exits that
@@ -3107,7 +3044,6 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                         .map(host_reentry_dispatch_key)
                         .unwrap_or(0);
                     cur_code_ptr = target_entry.code_ptr;
-                    cur_fail_descrs = Cow::Owned(target_entry.fail_descrs.to_vec());
                     cur_num_ref_roots = target_entry.num_ref_roots;
                     cur_max_output_slots = target_entry.max_output_slots;
                     continue;
@@ -4008,8 +3944,11 @@ fn call_assembler_shim_inner(
         );
     }
     let frame = execute_registered_loop_target(target, input_slice);
-    let descr =
-        get_latest_descr_from_deadframe(&frame).expect("get_latest_descr_from_deadframe failed");
+    let descr_arc = get_latest_descr_arc_from_deadframe(&frame)
+        .expect("get_latest_descr_arc_from_deadframe failed");
+    let descr = descr_arc
+        .as_fail_descr()
+        .expect("get_latest_descr_arc_from_deadframe returned a non-FailDescr Descr");
     if descr.is_finish() {
         unsafe {
             *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
@@ -4020,9 +3959,9 @@ fn call_assembler_shim_inner(
         return result;
     }
 
-    // RPython resume_in_blackhole parity: use blackhole to resume from
-    // the guard failure point instead of re-executing from scratch.
-    let fail_index = descr.fail_index();
+    // `compile.py resume_in_blackhole(descr, deadframe)`: the descr on
+    // the deadframe is already the failing object (`llmodel.py
+    // get_latest_descr`).
     let fail_types = descr.fail_arg_types();
     let fail_values: Vec<i64> = fail_types
         .iter()
@@ -4040,8 +3979,8 @@ fn call_assembler_shim_inner(
         .collect();
     if majit_log_enabled() {
         eprintln!(
-            "[ca-shim] guard fail_idx={} nvals={}",
-            fail_index,
+            "[ca-shim] guard descr={:#x} nvals={}",
+            majit_ir::descr_identity(&descr_arc),
             fail_values.len()
         );
     }
@@ -4049,48 +3988,28 @@ fn call_assembler_shim_inner(
         // resume.py blackhole_from_resumedata parity.
         let raw_num = fail_types.len();
         let mut bh_outputs = fail_values;
-        // Dispatch through on-demand callback.  No
-        // recovery_layout walker fallback — if the descr can't be
-        // looked up in fail_descrs (shouldn't happen for in-bounds
-        // fail_index per the producer's invariant) we leave bh_outputs
-        // as the raw fail_values so the bh_fn sees the JITed exit code's
-        // stored values unchanged (matches walker's None-recovery
-        // early-out semantics).
-        if let Some(fail_descr_arc) = target.fail_descrs.get(fail_index as usize) {
-            rebuild_state_after_failure_dispatch(
-                fail_descr_arc,
-                &mut bh_outputs,
-                fail_types,
-                raw_num,
-            );
-        }
+        rebuild_state_after_failure_dispatch(&descr_arc, &mut bh_outputs, fail_types, raw_num);
         // BH recovers its descr via
         // `Backend::fail_descr_arc_from_addr` → `recover_fail_descr_cell`
-        // which requires a `FailDescrCell` thin pointer.  Use the
-        // position-aligned cell from `target.fail_descr_cells`; fall back
-        // to a fresh wrap when only `fail_descrs` carries the descr.
-        // Both lookups must succeed — `recover_fail_descr_cell(0)` is UB,
-        // so an out-of-range `fail_index` here would corrupt the BH-side
-        // address recovery silently.
-        let bh_cell;
-        let descr_addr = if let Some(cell) = target.fail_descr_cells.get(fail_index as usize) {
-            majit_ir::FailDescrCell::thin_ptr(cell)
-        } else if let Some(fail_descr_arc) = target.fail_descrs.get(fail_index as usize) {
-            bh_cell = majit_ir::FailDescrCell::wrap(fail_descr_arc.clone());
-            majit_ir::FailDescrCell::thin_ptr(&bh_cell)
-        } else {
-            panic!(
-                "call_assembler BH dispatch: fail_index {} out of range \
-                 (fail_descr_cells.len()={}, fail_descrs.len()={})",
-                fail_index,
-                target.fail_descr_cells.len(),
-                target.fail_descrs.len()
-            );
-        };
+        // which requires a `FailDescrCell` thin pointer. Prefer the
+        // callee `jf_descr` word (`llmodel.py get_latest_descr`); wrap
+        // the Arc when that word is unset so the cell outlives `bh_fn`.
         let frame_ptr = frame
             .as_jitframe()
             .map(|jf| jf.jf_gcref().0 as *mut majit_backend::jitframe::JitFrame)
             .unwrap_or(std::ptr::null_mut());
+        let raw_descr = if frame_ptr.is_null() {
+            0
+        } else {
+            unsafe { majit_backend::llmodel::get_latest_descr(frame_ptr) }
+        };
+        let bh_cell;
+        let descr_addr = if raw_descr != 0 {
+            raw_descr
+        } else {
+            bh_cell = majit_ir::FailDescrCell::wrap(descr_arc.clone());
+            majit_ir::FailDescrCell::thin_ptr(&bh_cell)
+        };
         if let Some(result) = bh_fn(descr_addr, frame_ptr) {
             unsafe {
                 *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
@@ -8266,7 +8185,7 @@ fn emit_attached_loop_dispatch(
 
 /// genop_finish (assembler.py) parity:
 ///   1. save result to jf_frame[0]
-///   2. MOV [ebp + jf_descr], faildescrindex
+///   2. store the descr GCREF / FailDescrCell thin_ptr into jf_descr
 ///   3. _call_footer
 
 /// Move every block that only a guard exit can reach out of the trace body.
@@ -10192,8 +10111,9 @@ struct CompiledLoop {
     /// `patch_pending_failure_recoveries` after `materialize_loop`.
     pending_guard_tokens: Vec<(DescrRef, usize)>,
     fail_descrs: Box<[DescrRef]>,
-    /// Position-aligned `FailDescrCell` wrappers (see
-    /// `RegisteredLoopTarget::fail_descr_cells`).
+    /// Position-aligned `FailDescrCell` wrappers (`model.py
+    /// asmmemmgr_gcreftracers`). Keep-alive root for baked `jf_descr`
+    /// thin pointers (`majit_ir::recover_fail_descr_cell`).
     fail_descr_cells: Arc<[Box<majit_ir::FailDescrCell>]>,
     num_inputs: usize,
     num_ref_roots: usize,
@@ -10369,52 +10289,10 @@ pub(crate) fn fail_descr_set_external_jump_target(descr: &DescrRef, target: Desc
     as_fd(descr).set_external_jump_target(target);
 }
 
-fn find_fail_descr_in_fail_descrs(
-    fail_descrs: &[DescrRef],
-    trace_id: u64,
-    fail_index: u32,
-) -> Option<DescrRef> {
-    // Position is the canonical fail_index identity for a trace, matching
-    // PyPy's `assembler.py:227 self.faildescr.index = i` (Python has no
-    // per-emission `fail_index` on the descr itself).  Codegen increments
-    // the `fail_index` counter in lockstep with `fail_descrs.len()` at
-    // compiler.rs (`let fail_index = fail_descrs.len() as u32`), so
-    // every descr at position `i` has either `fail_index_per_trace == i`
-    // (production guard / external-JUMP) or the trait-default `0`
-    // (singleton FINISH descrs introduced by 7-Tβ3).  Use position
-    // directly so this function does not depend on the descr-internal
-    // accessor.
-    if let Some(descr) = fail_descrs.get(fail_index as usize)
-        && as_fd(descr).trace_id() == trace_id
-    {
-        return Some(descr.clone());
-    }
-    // A re-emission may have moved a descr off this positional index
-    // while leaving its (trace_id, fail_index_per_trace) identity
-    // intact. Scan by that identity before walking attached bridges.
-    for descr in fail_descrs {
-        let fd = as_fd(descr);
-        if fd.trace_id() == trace_id && fd.fail_index_per_trace() == fail_index {
-            return Some(descr.clone());
-        }
-    }
-    for descr in fail_descrs {
-        let bridge_guard = fail_descr_bridge_ref(as_fd(descr));
-        if let Some(bridge) = bridge_guard.as_ref()
-            && let Some(found) =
-                find_fail_descr_in_fail_descrs(&bridge.fail_descrs, trace_id, fail_index)
-        {
-            return Some(found);
-        }
-    }
-    None
-}
-
 /// Locate `fail_descr` in `fail_descrs` or a nested attached bridge's
 /// `fail_descrs` by `dyn FailDescr` data-pointer equality
 /// (`history.py` `AbstractFailDescr` object identity /
-/// `cpu.get_latest_descr`). Recurses the same tree as
-/// `find_fail_descr_in_fail_descrs`.
+/// `cpu.get_latest_descr`).
 fn find_fail_descr_by_identity(
     fail_descrs: &[DescrRef],
     fail_descr: &dyn FailDescr,
@@ -10468,7 +10346,6 @@ fn find_fail_descr_by_identity(
 ///   `Arc<PropagateExceptionDescr>` data pointer to `Arc::from_raw`
 ///   as a `FailDescrCell` would be undefined behavior.
 fn find_fail_descr_by_ptr(
-    _fail_descrs: &[DescrRef],
     descr_ptr: usize,
     propagate_exception_descr: Option<&DescrRef>,
 ) -> Option<DescrRef> {
@@ -10556,15 +10433,24 @@ impl FrameInputs<'_> {
     }
 }
 
-/// Result of `run_compiled_code` — RPython llmodel.py:328 parity.
+/// How a completed run names its exit. `llmodel.py execute_token` returns
+/// the frame; `get_latest_descr` reads `jf_descr`.
+enum ResolvedExit {
+    /// `jf_descr` word was `CALL_ASSEMBLER_DEADFRAME_SENTINEL`.
+    /// Slot 0 holds the host handle. Not a descr.
+    CallAssemblerDeadframe,
+    /// Recovered fail descr (guard, finish, propagate, jump).
+    Descr(ExitDescr),
+}
+
+/// Result of `run_compiled_code` — RPython `llmodel.py execute_token` parity.
 ///
 /// Instead of copying values out of jf_frame into Vec<i64>,
 /// the JitFrame GcRef is returned directly. Values stay in place.
 struct JitExecResult {
     jf_gcref: GcRef,
     heap_owner: Option<FrameHeapOwner>,
-    fail_index: u32,
-    direct_descr: Option<ExitDescr>,
+    exit: ResolvedExit,
 }
 
 impl JitExecResult {
@@ -10601,7 +10487,6 @@ fn host_reentry_dispatch_key(target_descr: &majit_ir::DescrRef) -> u32 {
 
 fn run_compiled_code(
     code_ptr: *const u8,
-    fail_descrs: &[DescrRef],
     num_ref_roots: usize,
     max_output_slots: usize,
     frame_info_depth: usize,
@@ -10617,7 +10502,6 @@ fn run_compiled_code(
     // a different guard region and make the budget compare meaningless.
     run_compiled_code_inner(
         code_ptr,
-        fail_descrs,
         num_ref_roots,
         max_output_slots,
         frame_info_depth,
@@ -10627,48 +10511,37 @@ fn run_compiled_code(
     )
 }
 
-/// `llmodel.py get_latest_descr`: the `(fail_index, descr)` a frame's
-/// `jf_descr` word names. Split out of `run_compiled_code_inner` so the probe
-/// can price it on its own.
+/// `llmodel.py get_latest_descr`: the descr a frame's `jf_descr` word
+/// names. Split out of `run_compiled_code_inner` so the probe can price
+/// it on its own.
 fn resolve_exit_descr(
     jf_descr_raw: i64,
-    fail_descrs: &[DescrRef],
     attachments: &'static CpuDescrAttachments,
-) -> (u32, Option<ExitDescr>) {
+) -> ResolvedExit {
     if jf_descr_raw == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
-        (CALL_ASSEMBLER_DEADFRAME_SENTINEL, None)
+        ResolvedExit::CallAssemblerDeadframe
     } else if jf_descr_raw == 0 {
-        (0u32, None)
+        // `llmodel.py get_latest_descr` / `MissingLatestDescrError`: a
+        // completed run must have written a descr pointer.
+        panic!("get_latest_descr: jf_descr is 0");
     } else if let Some(metainterp_finish) = match_metainterp_finish_descr(jf_descr_raw, attachments)
     {
         // `history.py AbstractDescr.show` / `cpu.get_latest_descr(deadframe)`:
         // `jf_descr` carries the metainterp `Arc<DoneWithThisFrameDescr*>`
-        // address (compiler.rs baking).  Return that *exact* Arc so the
-        // consumer sees the same identity `compile.py
-        // make_and_attach_done_descrs` attached on the cpu — not the
-        // process-global fallback static.
-        // Both are `Arc<DoneWithThisFrameDescrInt>` (no wrapper) so the
-        // trait-method dispatch is identical; only
-        // the Arc identity differs, and PyPy parity demands they match.
+        // address. Return that *exact* Arc so the consumer sees the same
+        // identity `compile.py make_and_attach_done_descrs` attached on
+        // the cpu — not the process-global fallback static.
         // Borrowed, see `ExitDescr`: the attached copy is `'static`.
-        (u32::MAX, Some(ExitDescr::borrowed(metainterp_finish)))
+        ResolvedExit::Descr(ExitDescr::borrowed(metainterp_finish))
     } else {
-        // `jf_descr_raw` is the metainterp `AbstractFailDescr` Arc's
-        // data pointer.  Resolve via the `fail_descrs` collection.
-        // Derive `fail_index` from
-        // the resolved Arc via the FailDescr trait — never dereference
-        // the raw pointer as a concrete type, since the meta side can
-        // be either `ResumeGuardDescr` or `DoneWithThisFrameDescr*`.
         let arc = find_fail_descr_by_ptr(
-            fail_descrs,
             jf_descr_raw as usize,
             attachments.propagate_exception_descr.as_ref(),
-        );
-        // The word is non-zero on this arm, and `find_fail_descr_by_ptr`
-        // answers every non-zero word — the cranelift singletons by
-        // identity, anything else through `recover_fail_descr_cell`.
-        let fi = arc.as_ref().map(|a| as_fd(a).fail_index()).unwrap_or(0);
-        (fi, arc.map(ExitDescr::owned))
+        )
+        .unwrap_or_else(|| {
+            panic!("get_latest_descr: non-zero jf_descr {jf_descr_raw:#x} did not resolve")
+        });
+        ResolvedExit::Descr(ExitDescr::owned(arc))
     }
 }
 
@@ -10736,7 +10609,6 @@ impl Drop for EntryArgRoots {
 
 fn run_compiled_code_inner(
     code_ptr: *const u8,
-    fail_descrs: &[DescrRef],
     num_ref_roots: usize,
     max_output_slots: usize,
     frame_info_depth: usize,
@@ -10944,39 +10816,39 @@ fn run_compiled_code_inner(
     let result_jf = jitframe_resolve(result_jf);
 
     // llmodel.py get_latest_descr: read jf_descr pointer from frame.
-    // RPython stores actual descr object pointer in jf_descr field and
-    // retrieves it via get_latest_descr() — no index lookup needed.
-    // We extract both the integer fail_index (for sentinel checks) and
-    // the Arc pointer (for direct descr propagation).
+    // RPython stores the descr object pointer in jf_descr and retrieves
+    // it via get_latest_descr() — no index lookup.
     let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
 
     // `PropagateExceptionDescr.handle_fail` runs in the metainterp exit
     // reader (`consume_executed_frame`). This frame keeps `jf_guard_exc`
     // and the propagate descr `_build_propagate_exception_path` wrote.
-    let (fail_index, direct_descr) = resolve_exit_descr(jf_descr_raw, fail_descrs, attachments);
+    let exit = resolve_exit_descr(jf_descr_raw, attachments);
     #[cfg(feature = "__execute-stage-probe")]
     if majit_backend::deadframe::probe_extra_stage()
         == majit_backend::deadframe::ProbeExtraStage::Descr
     {
         for _ in 0..majit_backend::deadframe::frame_build_repeats() {
-            std::hint::black_box(resolve_exit_descr(jf_descr_raw, fail_descrs, attachments));
+            std::hint::black_box(resolve_exit_descr(jf_descr_raw, attachments));
         }
     }
     #[cfg(feature = "__execute-stage-probe")]
     if majit_backend::deadframe::probe_extra_stage()
         == majit_backend::deadframe::ProbeExtraStage::Arc
-        && let Some(d) = direct_descr.as_ref()
+        && let ResolvedExit::Descr(d) = &exit
     {
         for _ in 0..majit_backend::deadframe::frame_build_repeats() {
             std::hint::black_box(d.clone());
         }
     }
     if log_enabled {
+        let (descr_id, is_ca_deadframe) = match &exit {
+            ResolvedExit::CallAssemblerDeadframe => (0usize, true),
+            ResolvedExit::Descr(d) => (majit_ir::descr_identity(&d.to_arc()), false),
+        };
         eprintln!(
-            "[post-call-descr] raw={:#x} fail_index={} matched_local={}",
-            jf_descr_raw,
-            fail_index,
-            direct_descr.is_some()
+            "[post-call-descr] raw={:#x} descr={:#x} is_call_assembler_deadframe={is_ca_deadframe}",
+            jf_descr_raw, descr_id,
         );
     }
 
@@ -10993,16 +10865,16 @@ fn run_compiled_code_inner(
     JitExecResult {
         jf_gcref,
         heap_owner,
-        fail_index,
-        direct_descr,
+        exit,
     }
 }
 
 struct GuardInfo {
     /// Source operation whose failure layout this metadata describes.
     source_op_index: usize,
-    /// This exit's ordinal within the trace, the number a `ResumeGuardDescr`
-    /// is keyed by and the one a merged region names as its `source_fail_index`.
+    /// Compile-time ordinal pairing this GuardInfo with `fail_descrs[i]`
+    /// while stamping `rd_locs` (`store_info_on_descr`). Runtime identity
+    /// is the `jf_descr` descr (`llmodel.py get_latest_descr`).
     fail_index: u32,
     can_have_bridge: bool,
     /// Guards may skip the store when `fail_locs` already names a current
@@ -11826,23 +11698,15 @@ impl CraneliftBackend {
     ) -> Result<usize, DeadFrame> {
         // Current trace state (equivalent to LLFrame.lltrace)
         let mut cur_code_ptr = compiled.entry_code_ptr.load(Ordering::Acquire) as *const u8;
-        // Borrowed, not cloned: the dispatch loop only READS this table, and
-        // the one writer is the external-JUMP re-entry below, which brings its
-        // own owned table. Cloning up front allocated once per entry into
-        // compiled code and bumped one `Arc` refcount per descr — measured at
-        // 64 B / 4 descrs (straight-line trace) and 96 B / 6 (loop) on cel's
-        // `price + qty * 2`.
-        let mut cur_fail_descrs: Cow<'_, [DescrRef]> = Cow::Borrowed(&compiled.fail_descrs);
         let mut cur_num_ref_roots = compiled.num_ref_roots;
         let mut cur_max_output_slots = compiled.max_output_slots;
         let mut cur_frame_info_depth = frame_info_depth;
-        // Held in whatever form the caller already has, for the same reason
-        // `cur_fail_descrs` is borrowed: the loop only READS the entry inputs,
-        // and the one writer is the external-JUMP re-entry below, which brings
-        // its own owned words. `run_compiled_code` stores these into the
-        // jitframe (`llmodel.py:306-315 set arguments in frame`), which is the
-        // one copy upstream makes; unwrapping the caller's values into a raw
-        // vector on the way in was a second one.
+        // Held in whatever form the caller already has: the loop only READS
+        // the entry inputs, and the one writer is the external-JUMP re-entry
+        // below, which brings its own owned words. `run_compiled_code` stores
+        // these into the jitframe (`llmodel.py execute_token`, "set arguments in frame"),
+        // which is the one copy upstream makes; unwrapping the caller's values
+        // into a raw vector on the way in was a second one.
         let mut cur_inputs: FrameInputs<'_> = inputs;
         // External-JUMP re-entry LABEL selector (host_reentry_dispatch_key);
         // 0 only for the initial entry — every external-JUMP re-entry,
@@ -11866,7 +11730,6 @@ impl CraneliftBackend {
         loop {
             let exec = run_compiled_code(
                 cur_code_ptr,
-                &cur_fail_descrs,
                 cur_num_ref_roots,
                 cur_max_output_slots,
                 cur_frame_info_depth,
@@ -11874,25 +11737,17 @@ impl CraneliftBackend {
                 attachments,
                 cur_dispatch_key,
             );
-            match handle_compiled_exit(
-                compiled,
-                exec,
-                &cur_fail_descrs,
-                cur_max_output_slots,
-                release_ref_finish,
-            ) {
+            match handle_compiled_exit(exec, cur_max_output_slots, release_ref_finish) {
                 CompiledExit::Done(result) => return result,
                 CompiledExit::Jump {
                     dispatch_key,
                     code_ptr,
-                    fail_descrs,
                     num_ref_roots,
                     max_output_slots,
                     inputs,
                 } => {
                     cur_dispatch_key = dispatch_key;
                     cur_code_ptr = code_ptr;
-                    cur_fail_descrs = Cow::Owned(fail_descrs.into_vec());
                     cur_num_ref_roots = num_ref_roots;
                     cur_inputs = FrameInputs::OwnedInts(inputs);
                     cur_max_output_slots = max_output_slots;
@@ -11916,7 +11771,6 @@ impl CraneliftBackend {
         // a compact `0..N` vector; the body loads `source_slots[i]`.
         let exec = run_compiled_code(
             bridge.code_ptr,
-            &bridge.fail_descrs,
             bridge.num_ref_roots,
             bridge.max_output_slots,
             0,
@@ -11924,21 +11778,24 @@ impl CraneliftBackend {
             attachments,
             0, // bridge entry (br_table preamble slot)
         );
-        let fail_index = exec.fail_index;
-        let direct_descr = exec.direct_descr.clone();
-
-        if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &exec) {
+        if let Some(frame) = maybe_take_call_assembler_deadframe(&exec) {
             return frame;
         }
 
-        let fail_descr = direct_descr
-            .unwrap_or_else(|| ExitDescr::owned(bridge.fail_descrs[fail_index as usize].clone()));
+        let fail_descr = match &exec.exit {
+            ResolvedExit::CallAssemblerDeadframe => unreachable!(),
+            ResolvedExit::Descr(d) => d.clone(),
+        };
         let fail_descr_fd = fail_descr.as_fail_descr();
 
         // RPython parity: FINISH exits in bridges return directly,
         // just like in execute_with_inputs. Without this, the FINISH
         // bridge's exit is misinterpreted as a guard failure.
-        if fail_descr_fd.is_finish() {
+        // `PropagateExceptionDescr.handle_fail` is the same Done exit
+        // (`compile.py`); `is_finish()` is false on that descr.
+        if fail_descr_fd.is_finish()
+            || fail_descr_fd.handle_fail_class() == HandleFailClass::Propagate
+        {
             // jf_guard_exc already written by emit_guard_exit.
             return deadframe_from_jitframe(exec.jf_gcref, fail_descr.clone(), exec.heap_owner);
         }
@@ -12535,7 +12392,6 @@ impl CraneliftBackend {
             &mut fail_descr_cells,
             &mut guard_infos,
             &mut max_output_slots,
-            trace_id,
             attached_descrs,
             merge.is_some(),
             &fail_arg_homes,
@@ -20012,22 +19868,11 @@ impl CraneliftBackend {
 
         // Freeze the fail_descrs vector. The collect_guards loop assigns
         // `fail_index = vec.len() as u32` immediately before pushing each
-        // descr, so position equals fail_index by construction; no later
-        // path mutates the vector. `Box<[T]>` reflects this contract in
-        // the type system (mirrors RPython compile.py's frozen
-        // descrs after record_loop_or_bridge).
-        // Position is the canonical fail_index identity (matching
-        // `llsupport/assembler.py`'s `_allgcrefs` index — PyPy does not
-        // carry per-emission `fail_index` on the descr itself).  Codegen
-        // increments the `fail_index` counter in lockstep with
-        // `fail_descrs.push`, so the contract is structural rather than
-        // descr-internal.  The earlier per-descr assertion was a pyre
-        // TODO removed: singleton FINISH descrs (the
-        // `DONE_WITH_THIS_FRAME_DESCR_*` cl statics whose
-        // `fail_index_per_trace()` is stamped once at module init) would
-        // mismatch their Vec position on every non-zero codegen, and
-        // The runtime lookup is position-based via
-        // `find_fail_descr_in_fail_descrs` rather than descr-internal.
+        // descr, so the compile-time ordinal pairs GuardInfo with
+        // `fail_descrs[i]`. No later path mutates the vector. `Box<[T]>`
+        // reflects this contract (compile.py frozen descrs after
+        // record_loop_or_bridge). Runtime identity is the `jf_descr`
+        // descr (`llmodel.py get_latest_descr` / `descr_identity`).
         let fail_descrs: Box<[DescrRef]> = fail_descrs.into_boxed_slice();
         let fail_descr_cells: Arc<[Box<majit_ir::FailDescrCell>]> = fail_descr_cells.into();
         // history.py:470-499 / x86/regalloc.py:1397 / x86/assembler.py fixup_target_tokens  allow-line-citation
@@ -20843,7 +20688,6 @@ fn collect_guards(
     fail_descr_cells: &mut Vec<Box<majit_ir::FailDescrCell>>,
     guard_infos: &mut Vec<GuardInfo>,
     max_output_slots: &mut usize,
-    trace_id: u64,
     attached_descrs: majit_backend::AttachedDescrPtrs,
     preserve_descrs: bool,
     homes: &FailArgHomes<'_>,
@@ -21146,24 +20990,15 @@ fn collect_guards(
                 // scaffolding bypassing the tracer/optimizer that
                 // normally stamps op.descr to a ResumeGuardDescr via
                 // store_final_boxes_in_guard) synthesize a
-                // ResumeGuardDescr so the descr identity exists for
-                // fail-index stamping.
+                // ResumeGuardDescr so the descr identity exists.
                 majit_backend::make_resume_guard_descr_typed(fail_arg_types.to_vec())
             };
-            // Stamp the per-trace fail_index and trace_id onto the
-            // metainterp ResumeGuardDescr.  `compile.py` gates the
-            // setters at the ResumeDescr family; non-Resume meta
-            // descrs skip the trait calls so the trait-default panic
-            // path stays unreached.
-            // Merged recompile does not stamp an existing descr. The
-            // original compile already published trace id, fail index,
-            // and fail-arg types.
+            // Merged recompile does not rewrite an existing descr. The
+            // original compile already published fail-arg types.
             if !preserve_descrs
                 && (descr.is_resume_guard() || descr.is_resume_guard_copied())
                 && let Some(fd) = descr.as_fail_descr()
             {
-                fd.set_fail_index_per_trace(fail_index);
-                fd.set_trace_id(trace_id);
                 if fd.fail_arg_types().is_empty() {
                     fd.set_fail_arg_types(fail_arg_types.to_vec());
                 }
@@ -21674,8 +21509,7 @@ impl CraneliftBackend {
         let descr_ptr = if gc_object { resolved } else { tip as *mut i64 };
         let descr_raw =
             unsafe { majit_backend::llmodel::get_latest_descr(descr_ptr as *const JitFrame) };
-        let (fail_index, direct_descr) =
-            resolve_exit_descr(descr_raw as i64, &compiled.fail_descrs, attachments);
+        let exit = resolve_exit_descr(descr_raw as i64, attachments);
         let mut exec = JitExecResult {
             jf_gcref: GcRef(resolved as usize),
             heap_owner: if gc_object {
@@ -21683,29 +21517,23 @@ impl CraneliftBackend {
             } else {
                 Some(FrameHeapOwner::of(head))
             },
-            fail_index,
-            direct_descr,
+            exit,
         };
-        let mut cur_fail_descrs: Cow<'_, [DescrRef]> = Cow::Borrowed(&compiled.fail_descrs);
         let mut cur_max_output_slots = compiled.max_output_slots;
         loop {
-            match handle_compiled_exit(compiled, exec, &cur_fail_descrs, cur_max_output_slots, true)
-            {
+            match handle_compiled_exit(exec, cur_max_output_slots, true) {
                 CompiledExit::Done(result) => return result,
                 CompiledExit::Jump {
                     dispatch_key,
                     code_ptr,
-                    fail_descrs,
                     num_ref_roots,
                     max_output_slots,
                     inputs,
                 } => {
-                    cur_fail_descrs = Cow::Owned(fail_descrs.into_vec());
                     cur_max_output_slots = max_output_slots;
                     let cur_inputs = FrameInputs::OwnedInts(inputs);
                     exec = run_compiled_code(
                         code_ptr,
-                        &cur_fail_descrs,
                         num_ref_roots,
                         cur_max_output_slots,
                         0,
@@ -22274,8 +22102,6 @@ impl majit_backend::Backend for CraneliftBackend {
         // mirrors that dispatch loop with one additional raw-output
         // termination per `execute_token_ints_raw`'s contract.
         let mut cur_code_ptr = compiled.entry_code_ptr.load(Ordering::Acquire) as *const u8;
-        // Borrowed, not cloned — see `execute_with_inputs_at_dispatch_key`.
-        let mut cur_fail_descrs: Cow<'_, [DescrRef]> = Cow::Borrowed(&compiled.fail_descrs);
         let mut cur_num_ref_roots = compiled.num_ref_roots;
         let mut cur_max_output_slots = compiled.max_output_slots;
         let mut cur_frame_info_depth = clt_frame_depth(token);
@@ -22289,7 +22115,6 @@ impl majit_backend::Backend for CraneliftBackend {
         loop {
             let exec = run_compiled_code(
                 cur_code_ptr,
-                &cur_fail_descrs,
                 cur_num_ref_roots,
                 cur_max_output_slots,
                 cur_frame_info_depth,
@@ -22297,8 +22122,6 @@ impl majit_backend::Backend for CraneliftBackend {
                 attachments,
                 cur_dispatch_key,
             );
-            let fail_index = exec.fail_index;
-            let direct_descr = exec.direct_descr.clone();
             // Kept eager here, unlike the dispatch loops above: this entry's
             // whole contract is to hand back the raw exit slots, so every exit
             // out of it reads the vector. The image covers ref-root and
@@ -22320,7 +22143,7 @@ impl majit_backend::Backend for CraneliftBackend {
             }
 
             // CALL_ASSEMBLER deadframe interception — exits raw dispatch.
-            if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &exec) {
+            if let Some(frame) = maybe_take_call_assembler_deadframe(&exec) {
                 let descr_arc = self.get_latest_descr_arc(&frame);
                 let descr: &dyn FailDescr = descr_arc
                     .as_fail_descr()
@@ -22369,23 +22192,9 @@ impl majit_backend::Backend for CraneliftBackend {
             }
 
             // llmodel.py get_latest_descr.
-            let fail_descr = if let Some(descr) = direct_descr {
-                descr
-            } else if (fail_index as usize) < cur_fail_descrs.len() {
-                ExitDescr::owned(cur_fail_descrs[fail_index as usize].clone())
-            } else {
-                let found = compiled.fail_descrs.iter().find_map(|d| {
-                    let guard = fail_descr_bridge_ref(as_fd(d));
-                    guard.as_ref().and_then(|b| {
-                        find_fail_descr_in_fail_descrs(&b.fail_descrs, b.trace_id, fail_index)
-                    })
-                });
-                ExitDescr::owned(found.unwrap_or_else(|| {
-                    cur_fail_descrs
-                        .last()
-                        .cloned()
-                        .unwrap_or_else(|| compiled.fail_descrs[0].clone())
-                }))
+            let fail_descr = match &exec.exit {
+                ResolvedExit::CallAssemblerDeadframe => unreachable!(),
+                ResolvedExit::Descr(d) => d.clone(),
             };
 
             let fail_descr_fd = fail_descr.as_fail_descr();
@@ -22409,7 +22218,6 @@ impl majit_backend::Backend for CraneliftBackend {
                     .map(host_reentry_dispatch_key)
                     .unwrap_or(0);
                 cur_code_ptr = target_entry.code_ptr;
-                cur_fail_descrs = Cow::Owned(target_entry.fail_descrs.to_vec());
                 cur_num_ref_roots = target_entry.num_ref_roots;
                 cur_max_output_slots = target_entry.max_output_slots;
                 cur_inputs = outputs;
@@ -22469,10 +22277,9 @@ impl majit_backend::Backend for CraneliftBackend {
             assert!(
                 fail_descr_bridge_ref(fail_descr_fd).is_none(),
                 "execute_token_ints_raw observed a bridge attached to a \
-                 guard exit (descr=0x{:x}, exit={}); in-code bridge \
+                 guard exit (descr=0x{:x}); in-code bridge \
                  dispatch should have intercepted it",
-                fail_descr_fd as *const dyn FailDescr as *const () as usize,
-                fail_index,
+                majit_ir::descr_identity(&fail_descr.to_arc()),
             );
 
             // llgraph/runner.py fail_guard without bridge —
@@ -23448,18 +23255,27 @@ mod tests {
         OpRc::new(o)
     }
 
-    /// Test helper: synthesise a `ResumeGuardDescr` with `trace_id`
-    /// stamped via the FailDescr trait setter, matching how
-    /// `_compile_one_block` constructs source-guard descrs at production
-    /// codegen time.  Mirrors PyPy's `compile.py ResumeGuardDescr()`
-    /// + `assembler.py:227 self.faildescr.index = i` pairing.
-    fn mk_test_resume_guard_descr(trace_id: u64, types: Vec<Type>) -> majit_ir::DescrRef {
-        let descr = majit_backend::make_resume_guard_descr_typed(types);
-        descr
-            .as_fail_descr()
-            .expect("ResumeGuardDescr always implements FailDescr")
-            .set_trace_id(trace_id);
-        descr
+    /// Test helper: synthesise a `ResumeGuardDescr`. Mirrors PyPy's
+    /// `compile.py ResumeGuardDescr()`.
+    fn mk_test_resume_guard_descr(types: Vec<Type>) -> majit_ir::DescrRef {
+        majit_backend::make_resume_guard_descr_typed(types)
+    }
+
+    fn compiled_fail_descr(token: &JitCellToken, index: usize) -> DescrRef {
+        token
+            .compiled
+            .get()
+            .and_then(|c| c.downcast_ref::<CompiledLoop>())
+            .expect("test token has a compiled loop")
+            .fail_descrs[index]
+            .clone()
+    }
+
+    fn latest_matches(backend: &CraneliftBackend, frame: &DeadFrame, expected: &DescrRef) {
+        assert_eq!(
+            majit_ir::descr_identity(&backend.get_latest_descr_arc(frame)),
+            majit_ir::descr_identity(expected),
+        );
     }
 
     /// First non-finish descr in `CompiledLoop.fail_descrs` — the loop
@@ -23504,7 +23320,7 @@ mod tests {
             [guard, finish]
         }
 
-        let descr = mk_test_resume_guard_descr(1, vec![]);
+        let descr = mk_test_resume_guard_descr(vec![]);
         let mut backend = CraneliftBackend::new();
         let token = JitCellToken::new(1);
         backend
@@ -23573,7 +23389,7 @@ mod tests {
             .compile_loop(&callee_inputargs, &caller_ops, &caller_token)
             .expect("caller installs an int result expectation");
 
-        let descr = mk_test_resume_guard_descr(1, vec![]);
+        let descr = mk_test_resume_guard_descr(vec![]);
         let fd = descr.as_fail_descr().expect("resume guard is a FailDescr");
         assert_eq!(fd.adr_jump_offset(), 0);
 
@@ -23750,11 +23566,9 @@ mod tests {
         if flag != 0 {
             let mut deadframe = force_token_to_dead_frame(GcRef(force_token as usize));
             let mut values = may_force_void_values().lock();
-            values.push(
-                get_latest_descr_from_deadframe(&deadframe)
-                    .unwrap()
-                    .fail_index() as i64,
-            );
+            values.push(majit_ir::descr_identity(
+                &get_latest_descr_arc_from_deadframe(&deadframe).unwrap(),
+            ) as i64);
             values.push(get_int_from_deadframe(&deadframe, 0).unwrap());
             values.push(get_int_from_deadframe(&deadframe, 1).unwrap());
             drop(values);
@@ -24354,7 +24168,6 @@ mod tests {
         assert!(Arc::ptr_eq(&descr, &propagate));
         let fd = descr.as_fail_descr().expect("propagate descr");
         assert!(!fd.is_finish());
-        assert_eq!(fd.fail_index(), u32::MAX);
         let grabbed = backend.grab_exc_value(&frame).0 as i64;
         assert_eq!(grabbed, exc);
         assert_eq!(
@@ -25530,8 +25343,8 @@ mod tests {
         unsafe { *(root.0 as *mut u64) = 0xD30F_0005 };
         let mut backend = backend_with_gc(gc);
         let label = make_label_descr(1_500_294);
-        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Ref]);
-        let enter_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let exit_descr = mk_test_resume_guard_descr(vec![Type::Ref]);
+        let enter_descr = mk_test_resume_guard_descr(vec![Type::Int]);
         for descr in [&exit_descr, &enter_descr] {
             descr
                 .as_fail_descr()
@@ -25612,7 +25425,7 @@ mod tests {
     fn closing_jump_into_merge_source_owner_uses_cells() {
         let mut backend = CraneliftBackend::new();
         let label_a = make_label_descr(1_500_296);
-        let enter_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let enter_descr = mk_test_resume_guard_descr(vec![Type::Int]);
         enter_descr
             .as_fail_descr()
             .unwrap()
@@ -26489,8 +26302,8 @@ mod tests {
         let n = OpRef::input_arg_int(0);
 
         let label_a = make_label_descr(1_500_410);
-        let exit_a = mk_test_resume_guard_descr(0, vec![Type::Int]);
-        let odd_a = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let exit_a = mk_test_resume_guard_descr(vec![Type::Int]);
+        let odd_a = mk_test_resume_guard_descr(vec![Type::Int]);
         stamp_one_loc(&exit_a);
         stamp_one_loc(&odd_a);
         let ops_a = vec![
@@ -26524,8 +26337,8 @@ mod tests {
         backend.compile_loop(&inputargs, &ops_a, &token_a).unwrap();
 
         let label_c = make_label_descr(1_500_411);
-        let exit_c = mk_test_resume_guard_descr(0, vec![Type::Int]);
-        let odd_c = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let exit_c = mk_test_resume_guard_descr(vec![Type::Int]);
+        let odd_c = mk_test_resume_guard_descr(vec![Type::Int]);
         stamp_one_loc(&exit_c);
         stamp_one_loc(&odd_c);
         let ops_c = vec![
@@ -26616,8 +26429,8 @@ mod tests {
         let n = OpRef::input_arg_int(0);
 
         let label_a = make_label_descr(1_500_430);
-        let exit_a = mk_test_resume_guard_descr(0, vec![Type::Int]);
-        let odd_a = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let exit_a = mk_test_resume_guard_descr(vec![Type::Int]);
+        let odd_a = mk_test_resume_guard_descr(vec![Type::Int]);
         stamp_one_loc(&exit_a);
         stamp_one_loc(&odd_a);
         let ops_a = vec![
@@ -26651,8 +26464,8 @@ mod tests {
         backend.compile_loop(&inputargs, &ops_a, &token_a).unwrap();
 
         let label_c = make_label_descr(1_500_431);
-        let exit_c = mk_test_resume_guard_descr(0, vec![Type::Int]);
-        let odd_c = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let exit_c = mk_test_resume_guard_descr(vec![Type::Int]);
+        let odd_c = mk_test_resume_guard_descr(vec![Type::Int]);
         stamp_one_loc(&exit_c);
         stamp_one_loc(&odd_c);
         let ops_c = vec![
@@ -26775,7 +26588,7 @@ mod tests {
         let n = OpRef::input_arg_int(0);
 
         let label_a = make_label_descr(1_500_420);
-        let to_c = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let to_c = mk_test_resume_guard_descr(vec![Type::Int]);
         stamp_one_loc(&to_c);
         let ops_a = vec![
             mk_op_with_descr(OpCode::Label, &[n], OpRef::NONE.raw(), label_a.clone()),
@@ -26788,7 +26601,7 @@ mod tests {
         backend.compile_loop(&inputargs, &ops_a, &token_a).unwrap();
 
         let label_c = make_label_descr(1_500_421);
-        let inv = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let inv = mk_test_resume_guard_descr(vec![Type::Int]);
         stamp_one_loc(&inv);
         let inv_op = Op::with_descr(OpCode::GuardNotInvalidated, &[], inv.clone());
         inv_op.pos().set(OpRef::void_op(10));
@@ -26879,7 +26692,7 @@ mod tests {
         }
 
         let label_l = make_label_descr(1_500_431);
-        let to_t = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let to_t = mk_test_resume_guard_descr(vec![Type::Int]);
         stamp_one_loc(&to_t);
         let ops_l = vec![
             mk_op_with_descr(OpCode::Label, &[n], OpRef::NONE.raw(), label_l.clone()),
@@ -27082,12 +26895,12 @@ mod tests {
     fn merged_bridge_jump_keeps_the_loop_exit() {
         let mut backend = CraneliftBackend::new();
         let label = make_label_descr(11);
-        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let exit_descr = mk_test_resume_guard_descr(vec![Type::Int]);
         exit_descr
             .as_fail_descr()
             .unwrap()
             .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
-        let odd_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let odd_descr = mk_test_resume_guard_descr(vec![Type::Int]);
         odd_descr
             .as_fail_descr()
             .unwrap()
@@ -27187,12 +27000,12 @@ mod tests {
         // be the failure edge, and the loop must exit at 108.
         let mut backend = CraneliftBackend::new();
         let label = make_label_descr(14);
-        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let exit_descr = mk_test_resume_guard_descr(vec![Type::Int]);
         exit_descr
             .as_fail_descr()
             .unwrap()
             .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
-        let odd_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let odd_descr = mk_test_resume_guard_descr(vec![Type::Int]);
         odd_descr
             .as_fail_descr()
             .unwrap()
@@ -27273,17 +27086,17 @@ mod tests {
     fn merged_bridge_guard_returns_its_own_descr() {
         let mut backend = CraneliftBackend::new();
         let label = make_label_descr(12);
-        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let exit_descr = mk_test_resume_guard_descr(vec![Type::Int]);
         exit_descr
             .as_fail_descr()
             .unwrap()
             .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
-        let odd_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let odd_descr = mk_test_resume_guard_descr(vec![Type::Int]);
         odd_descr
             .as_fail_descr()
             .unwrap()
             .set_rd_locs(majit_ir::RdLocs::from_vec(vec![0]));
-        let bridge_guard_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let bridge_guard_descr = mk_test_resume_guard_descr(vec![Type::Int]);
         bridge_guard_descr
             .as_fail_descr()
             .unwrap()
@@ -27399,9 +27212,9 @@ mod tests {
     fn merged_recompile_keeps_attached_bridge_patched() {
         let mut backend = CraneliftBackend::new();
         let label = make_label_descr(14);
-        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
-        let odd_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
-        let bridge_guard_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let exit_descr = mk_test_resume_guard_descr(vec![Type::Int]);
+        let odd_descr = mk_test_resume_guard_descr(vec![Type::Int]);
+        let bridge_guard_descr = mk_test_resume_guard_descr(vec![Type::Int]);
         let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op_with_descr(
@@ -27508,10 +27321,10 @@ mod tests {
     fn merged_guard_value_parks_its_operand_in_the_stamped_slot() {
         let mut backend = CraneliftBackend::new();
         let label = make_label_descr(15);
-        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
-        let odd_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
-        let value_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
-        let wide_descr = mk_test_resume_guard_descr(0, vec![Type::Int; 3]);
+        let exit_descr = mk_test_resume_guard_descr(vec![Type::Int]);
+        let odd_descr = mk_test_resume_guard_descr(vec![Type::Int]);
+        let value_descr = mk_test_resume_guard_descr(vec![Type::Int]);
+        let wide_descr = mk_test_resume_guard_descr(vec![Type::Int; 3]);
         let inputargs = vec![InputArg::new_int_rc(0)];
         let value_guard = Op::with_descr(
             OpCode::GuardValue,
@@ -27653,8 +27466,8 @@ mod tests {
         // Raw 1 is the int input's index. A ref at that raw is treated as an
         // input and is not demoted, so the carried box sits above the inputs.
         let carried = OpRef::ref_op(8);
-        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Ref]);
-        let odd_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let exit_descr = mk_test_resume_guard_descr(vec![Type::Ref]);
+        let odd_descr = mk_test_resume_guard_descr(vec![Type::Int]);
         let exit = Op::with_descr(
             OpCode::GuardTrue,
             &[rb(OpRef::int_op(3))],
@@ -27756,8 +27569,8 @@ mod tests {
         // fall-through; the loop exit must still report `i0`.
         let mut backend = CraneliftBackend::new();
         let label = make_label_descr(16);
-        let pre_descr = mk_test_resume_guard_descr(0, vec![Type::Int, Type::Int]);
-        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int, Type::Int]);
+        let pre_descr = mk_test_resume_guard_descr(vec![Type::Int, Type::Int]);
+        let exit_descr = mk_test_resume_guard_descr(vec![Type::Int, Type::Int]);
         let pre = Op::with_descr(
             OpCode::GuardTrue,
             &[rb(OpRef::int_op(2))],
@@ -27870,8 +27683,8 @@ mod tests {
     fn guard_no_exception_inside_bridge_stays_separate() {
         let mut backend = CraneliftBackend::new();
         let label = make_label_descr(16);
-        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
-        let odd_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let exit_descr = mk_test_resume_guard_descr(vec![Type::Int]);
+        let odd_descr = mk_test_resume_guard_descr(vec![Type::Int]);
         let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op_with_descr(
@@ -27964,9 +27777,9 @@ mod tests {
     fn guard_no_exception_source_bridge_stays_separate() {
         let mut backend = CraneliftBackend::new();
         let label = make_label_descr(17);
-        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
-        let exc_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
-        let hot_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let exit_descr = mk_test_resume_guard_descr(vec![Type::Int]);
+        let exc_descr = mk_test_resume_guard_descr(vec![Type::Int]);
+        let hot_descr = mk_test_resume_guard_descr(vec![Type::Int]);
         let noexc = Op::with_descr(OpCode::GuardNoException, &[], exc_descr.clone());
         noexc.pos().set(OpRef::void_op(12));
         noexc.set_fail_arg_types(vec![Type::Int]);
@@ -28084,7 +27897,7 @@ mod tests {
     fn guard_no_overflow_bridge_merges_on_a_no_exception_loop() {
         let mut backend = CraneliftBackend::new();
         let label = make_label_descr(18);
-        let ovf_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let ovf_descr = mk_test_resume_guard_descr(vec![Type::Int]);
         let ovf = Op::with_descr(OpCode::GuardNoOverflow, &[], ovf_descr.clone());
         ovf.pos().set(OpRef::void_op(11));
         ovf.set_fail_arg_types(vec![Type::Int]);
@@ -28158,7 +27971,7 @@ mod tests {
         let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut backend = CraneliftBackend::new();
         let label = make_label_descr(19);
-        let ovf_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let ovf_descr = mk_test_resume_guard_descr(vec![Type::Int]);
         let ovf = Op::with_descr(OpCode::GuardNoOverflow, &[], ovf_descr.clone());
         ovf.pos().set(OpRef::void_op(11));
         ovf.set_fail_arg_types(vec![Type::Int]);
@@ -28238,8 +28051,8 @@ mod tests {
         let _const_ptr_guard = const_ptr_gc_test_guard();
         let mut backend = CraneliftBackend::new();
         let label = make_label_descr(23);
-        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
-        let hot_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let exit_descr = mk_test_resume_guard_descr(vec![Type::Int]);
+        let hot_descr = mk_test_resume_guard_descr(vec![Type::Int]);
         let debug = Op::new(
             OpCode::DebugMergePoint,
             &[majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
@@ -28336,8 +28149,8 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let outer = make_label_descr(21);
         let inner = make_label_descr(22);
-        let exit_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
-        let hot_descr = mk_test_resume_guard_descr(0, vec![Type::Int]);
+        let exit_descr = mk_test_resume_guard_descr(vec![Type::Int]);
+        let hot_descr = mk_test_resume_guard_descr(vec![Type::Int]);
         let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op_with_descr(
@@ -29355,7 +29168,7 @@ mod tests {
         assert!(!jit_exc_is_pending());
 
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
-        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
         assert_eq!(backend.get_int_value(&frame, 0), 0);
         assert_eq!(exc_class_of(&backend, &frame), 0);
         assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
@@ -29394,7 +29207,7 @@ mod tests {
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
-        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
         assert_eq!(backend.get_int_value(&frame, 0), 1);
         assert_eq!(exc_class_of(&backend, &frame), 0x2222);
         assert!(!backend.grab_exc_value(&frame).is_null());
@@ -29437,7 +29250,7 @@ mod tests {
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
-        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
         assert_eq!(backend.get_int_value(&frame, 0), 1);
         assert_eq!(exc_class_of(&backend, &frame), 0x1111);
         assert!(!backend.grab_exc_value(&frame).is_null());
@@ -29488,18 +29301,16 @@ mod tests {
 
         let raw = backend.execute_token_ints_raw(&token, &[1]);
         assert!(!raw.is_finish);
-        assert_eq!(raw.descr_arc.as_fail_descr().unwrap().fail_index(), 0);
+        assert_eq!(
+            majit_ir::descr_identity(&raw.descr_arc),
+            majit_ir::descr_identity(&compiled_fail_descr(&token, 0)),
+        );
         assert_eq!(raw.outputs, vec![1]);
         assert_eq!(raw.typed_outputs, vec![Value::Int(1)]);
         assert_eq!(raw.savedata, None);
         // pyjitpl.py raise_if_successful: exc_class = ptr2int(exception_obj.typeptr)
         assert!(!raw.exception_value.is_null());
         assert_eq!(unsafe { *(raw.exception_value.0 as *const i64) }, 0x1111);
-        let fd = raw
-            .descr_arc
-            .as_fail_descr()
-            .expect("raw exit carries a FailDescr");
-        assert_eq!(fd.fail_index(), 0);
         assert!(!jit_exc_is_pending());
     }
 
@@ -30031,8 +29842,7 @@ mod tests {
         let token2 = JitCellToken::new(48);
         backend.compile_loop(&inputargs, &ops, &token2).unwrap();
         let frame2 = backend.execute_token(&token2, &[Value::Int(99)]);
-        let descr2 = backend.get_latest_descr(&frame2);
-        assert_eq!(descr2.fail_index(), 0); // guard failure
+        latest_matches(&backend, &frame2, &compiled_fail_descr(&token2, 0));
         assert_eq!(backend.get_int_value(&frame2, 0), 99);
     }
 
@@ -30688,10 +30498,10 @@ mod tests {
 
         object_words[0] = 0xDEAD_BEEFu64 as i64;
         let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr))]);
-        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
 
         let frame = backend.execute_token(&token, &[Value::Ref(GcRef(0))]);
-        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
     }
 
     // ── Overflow detection tests ──
@@ -30751,8 +30561,7 @@ mod tests {
 
         // i64::MAX + 1 overflows
         let frame = backend.execute_token(&token, &[Value::Int(i64::MAX), Value::Int(1)]);
-        let descr = backend.get_latest_descr(&frame);
-        assert_eq!(descr.fail_index(), 0); // guard failure (overflow)
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
     }
 
     #[test]
@@ -30780,8 +30589,7 @@ mod tests {
 
         // i64::MIN - 1 overflows
         let frame = backend.execute_token(&token, &[Value::Int(i64::MIN), Value::Int(1)]);
-        let descr = backend.get_latest_descr(&frame);
-        assert_eq!(descr.fail_index(), 0); // guard failure (overflow)
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
     }
 
     #[test]
@@ -30867,8 +30675,7 @@ mod tests {
 
         // i64::MAX * 2 overflows
         let frame = backend.execute_token(&token, &[Value::Int(i64::MAX), Value::Int(2)]);
-        let descr = backend.get_latest_descr(&frame);
-        assert_eq!(descr.fail_index(), 0); // guard failure (overflow)
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
     }
 
     #[test]
@@ -30903,8 +30710,7 @@ mod tests {
         let token2 = JitCellToken::new(87);
         backend.compile_loop(&inputargs, &ops, &token2).unwrap();
         let frame2 = backend.execute_token(&token2, &[Value::Int(1), Value::Int(2)]);
-        let descr2 = backend.get_latest_descr(&frame2);
-        assert_eq!(descr2.fail_index(), 0); // guard failure (no overflow)
+        latest_matches(&backend, &frame2, &compiled_fail_descr(&token2, 0));
     }
 
     // ── Getfield float test ──
@@ -31463,8 +31269,7 @@ mod tests {
 
         // First: verify guard fails when x = -5
         let frame = backend.execute_token(&token, &[Value::Int(-5)]);
-        let descr = backend.get_latest_descr(&frame);
-        assert_eq!(descr.fail_index(), 0); // guard_true is guard index 0
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
         assert_eq!(backend.get_int_value(&frame, 0), -5);
 
         // Now compile a bridge for guard 0: bridge takes x, returns x + 100
@@ -31553,8 +31358,7 @@ mod tests {
 
         // Without bridge: guard fails on x=0, y=42
         let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(42)]);
-        let descr = backend.get_latest_descr(&frame);
-        assert_eq!(descr.fail_index(), 0);
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
         assert_eq!(backend.get_int_value(&frame, 0), 0); // x
         assert_eq!(backend.get_int_value(&frame, 1), 42); // y
 
@@ -31650,8 +31454,7 @@ mod tests {
             &token,
             &[Value::Int(0), Value::Float(9.25), Value::Ref(GcRef(0xBEEF))],
         );
-        let descr = backend.get_latest_descr(&frame);
-        assert_eq!(descr.fail_index(), 0);
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
         assert_eq!(backend.get_float_value(&frame, 0), 9.25);
         assert_eq!(backend.get_ref_value(&frame, 1), GcRef(0xBEEF));
     }
@@ -31972,10 +31775,15 @@ mod tests {
         assert!(may_force_void_values().lock().is_empty());
 
         let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(1)]);
-        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
         assert_eq!(backend.get_int_value(&frame, 0), 1);
         assert_eq!(backend.get_int_value(&frame, 1), 10);
-        assert_eq!(*may_force_void_values().lock(), vec![0, 1, 10]);
+        let observed = may_force_void_values().lock().clone();
+        assert_eq!(
+            observed[0],
+            majit_ir::descr_identity(&compiled_fail_descr(&token, 0)) as i64
+        );
+        assert_eq!(&observed[1..], &[1i64, 10]);
         assert_eq!(backend.get_savedata_ref(&frame).unwrap(), GcRef(0xDADA));
     }
 
@@ -32052,17 +31860,20 @@ mod tests {
 
         let raw = backend.execute_token_ints_raw(&token, &[10, 1]);
         assert!(!raw.is_finish);
-        assert_eq!(raw.descr_arc.as_fail_descr().unwrap().fail_index(), 0);
+        assert_eq!(
+            majit_ir::descr_identity(&raw.descr_arc),
+            majit_ir::descr_identity(&compiled_fail_descr(&token, 0)),
+        );
         assert_eq!(raw.outputs, vec![1, 10]);
         assert_eq!(raw.typed_outputs, vec![Value::Int(1), Value::Int(10)]);
         assert_eq!(raw.savedata, Some(GcRef(0xDADA)));
         assert_eq!(raw.exception_value, GcRef::NULL);
-        let fd = raw
-            .descr_arc
-            .as_fail_descr()
-            .expect("raw exit carries a FailDescr");
-        assert_eq!(fd.fail_index(), 0);
-        assert_eq!(*may_force_void_values().lock(), vec![0, 1, 10]);
+        let observed = may_force_void_values().lock().clone();
+        assert_eq!(
+            observed[0],
+            majit_ir::descr_identity(&compiled_fail_descr(&token, 0)) as i64
+        );
+        assert_eq!(&observed[1..], &[1i64, 10]);
     }
 
     #[test]
@@ -32160,7 +31971,7 @@ mod tests {
         assert!(may_force_int_values().lock().is_empty());
 
         let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(1)]);
-        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
         assert_eq!(backend.get_int_value(&frame, 0), 1);
         assert_eq!(backend.get_int_value(&frame, 1), 42);
         assert_eq!(backend.get_int_value(&frame, 2), 10);
@@ -32212,7 +32023,7 @@ mod tests {
         assert!(may_force_float_values().lock().is_empty());
 
         let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(1)]);
-        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
         assert_eq!(backend.get_int_value(&frame, 0), 1);
         assert_eq!(backend.get_float_value(&frame, 1), 12.5);
         assert_eq!(backend.get_int_value(&frame, 2), 10);
@@ -34934,9 +34745,7 @@ mod tests {
         // After invalidation: guard fails, side-exits with the guard's fail args.
         let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(32)]);
         // The guard's fail_args are [OpRef::input_arg_int(0), OpRef::input_arg_int(1)] = the input values.
-        let descr = backend.get_latest_descr(&frame);
-        // fail_index 0 is the GuardNotInvalidated guard (first guard in the trace).
-        assert_eq!(descr.fail_index(), 0);
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
         assert_eq!(backend.get_int_value(&frame, 0), 10);
         assert_eq!(backend.get_int_value(&frame, 1), 32);
     }
@@ -34977,18 +34786,14 @@ mod tests {
         // Without invalidation: runs to completion (i reaches 1000000,
         // GuardTrue fails).
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
-        let descr = backend.get_latest_descr(&frame);
-        // fail_index 1 = GuardTrue (second guard)
-        assert_eq!(descr.fail_index(), 1);
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 1));
         assert_eq!(backend.get_int_value(&frame, 0), 999_999);
 
         // Now invalidate and run again: should fail at GuardNotInvalidated
         // on the first iteration.
         token.invalidate();
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
-        let descr = backend.get_latest_descr(&frame);
-        // fail_index 0 = GuardNotInvalidated (first guard)
-        assert_eq!(descr.fail_index(), 0);
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
         // i = 0 + 1 = 1 (only one iteration before guard fails)
         assert_eq!(backend.get_int_value(&frame, 0), 1);
     }
@@ -35018,7 +34823,7 @@ mod tests {
 
         // Before invalidation
         let frame = backend.execute_token(&token, &[Value::Int(99)]);
-        // Finish (fail_index 1)
+        assert!(backend.get_latest_descr(&frame).is_finish());
         assert_eq!(backend.get_int_value(&frame, 0), 99);
 
         // Invalidate via the Backend trait method
@@ -35027,8 +34832,7 @@ mod tests {
 
         // After invalidation: guard fails
         let frame = backend.execute_token(&token, &[Value::Int(99)]);
-        let descr = backend.get_latest_descr(&frame);
-        assert_eq!(descr.fail_index(), 0);
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
         assert_eq!(backend.get_int_value(&frame, 0), 99);
     }
 

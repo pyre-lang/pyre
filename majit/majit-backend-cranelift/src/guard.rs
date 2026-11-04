@@ -60,9 +60,8 @@ pub struct RetainedConstPtr {
 // codegen time (`majit_ir::recover_fail_descr_cell` in
 // `majit-ir/src/descr.rs`).  The strong refcount lives on
 // `CompiledLoop::fail_descr_cells` / `BridgeData::fail_descr_cells`
-// / `RegisteredLoopTarget::fail_descr_cells` for the life of the
-// CLT they belong to (`model.py:294`,
-// `llmodel.py free_loop_and_bridges`).
+// for the life of the CLT they belong to (`model.py
+// asmmemmgr_gcreftracers`, `llmodel.py free_loop_and_bridges`).
 
 /// Compiled bridge data attached to a guard's fail descriptor.
 ///
@@ -83,8 +82,9 @@ pub struct BridgeData {
     pub body_ptr: *const u8,
     /// Fail descriptors within the bridge (guards + finish).
     /// Frozen after compile — `Box<[T]>` reflects RPython's no-mutation
-    /// contract (compile.py record_loop_or_bridge). Position
-    /// equals `descr.fail_index` by an invariant asserted at construction.
+    /// contract (compile.py record_loop_or_bridge). Compile-time position
+    /// pairs each GuardInfo with this vector; runtime identity is the
+    /// `jf_descr` descr (`llmodel.py get_latest_descr`).
     pub fail_descrs: Box<[DescrRef]>,
     /// Position-aligned `FailDescrCell` wrappers (see
     /// `CompiledLoop::fail_descr_cells`).  Each cell pins the strong

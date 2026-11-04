@@ -634,10 +634,9 @@ impl GuardStrengthenOpt {
                 && fd.loop_version()
             {
                 // `version.py:32-36 leads_to[descr]` keys by descr
-                // identity.  Use `Descr::index()` (the globally
-                // unique `alloc_fail_index()` value) rather than
-                // `FailDescr::fail_index()` (per-trace, 0 until
-                // backend codegen).
+                // object identity (`compute_unique_id(faildescr)` /
+                // `descr_identity`).  Pyre uses `Descr::index()` (the
+                // globally unique `alloc_fail_index()` value).
                 info.track(descr.index(), version.clone());
             }
         }
@@ -736,9 +735,10 @@ impl GuardStrengthenOpt {
                     // guard.py:295: info.remove(other.op.getdescr())
                     // RPython: unconditional call. version.py:38-42 asserts
                     // descr is in leads_to — if not, it's a programming
-                    // error.  Key by `Descr::index()` (globally unique)
-                    // rather than `FailDescr::fail_index()` (per-trace, 0
-                    // pre-codegen).  Fail loud on missing/non-FailDescr
+                    // error.  A guard is identified by its descr object
+                    // (`compute_unique_id(faildescr)` / `descr_identity`);
+                    // pyre keys `leads_to` by `Descr::index()`.  Fail loud
+                    // on missing/non-FailDescr
                     // descr instead of silently desynchronizing
                     // `version_info` (stale `leads_to` entry).
                     let other_descr = other

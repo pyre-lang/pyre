@@ -58,6 +58,17 @@ fn make_descr(_index: u32) -> DescrRef {
     majit_backend::make_resume_guard_descr_typed(Vec::new())
 }
 
+fn latest_matches(
+    backend: &CraneliftBackend,
+    frame: &majit_backend::DeadFrame,
+    expected: &DescrRef,
+) {
+    assert_eq!(
+        majit_ir::descr_identity(&backend.get_latest_descr_arc(frame)),
+        majit_ir::descr_identity(expected),
+    );
+}
+
 /// Stamp the guard's recovery list. `runner_test.py` uses
 /// `op.setfailargs(...)` the same way `compile.py`
 /// `ResumeGuardDescr.store_final_boxes` does after numbering.
@@ -241,7 +252,8 @@ fn test_guard_failure_path() {
     let const_two = OpRef::const_int(2);
 
     let cmp = rec.record_op(OpCode::IntGt, &[x, const_zero]);
-    let guard = rec.record_guard(OpCode::GuardTrue, &[cmp], Some(make_descr(0)));
+    let guard_descr = make_descr(0);
+    let guard = rec.record_guard(OpCode::GuardTrue, &[cmp], Some(Arc::clone(&guard_descr)));
     let result = rec.record_op(OpCode::IntMul, &[x, const_two]);
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
@@ -265,16 +277,13 @@ fn test_guard_failure_path() {
 
     // Execute with x=-1: guard fails, DeadFrame has input arg values
     let frame = backend.execute_token(&token, &[Value::Int(-1)]);
-    let descr = backend.get_latest_descr(&frame);
-    // fail_index=0 means the guard_true failed (first guard/finish in the trace)
-    assert_eq!(descr.fail_index(), 0);
+    latest_matches(&backend, &frame, &guard_descr);
     // Guard failure saves input args: x=-1
     assert_eq!(backend.get_int_value(&frame, 0), -1);
 
     // Execute with x=0: 0 > 0 is false, guard fails
     let frame = backend.execute_token(&token, &[Value::Int(0)]);
-    let descr = backend.get_latest_descr(&frame);
-    assert_eq!(descr.fail_index(), 0);
+    latest_matches(&backend, &frame, &guard_descr);
     assert_eq!(backend.get_int_value(&frame, 0), 0);
 }
 
@@ -299,7 +308,8 @@ fn test_bridge_end_to_end() {
     let sum2 = rec.record_op(OpCode::IntAdd, &[sum, i]);
     let i2 = rec.record_op(OpCode::IntSub, &[i, const_one]);
     let cmp = rec.record_op(OpCode::IntGt, &[i2, const_zero]);
-    let guard = rec.record_guard(OpCode::GuardTrue, &[cmp], Some(make_descr(0)));
+    let guard_descr = make_descr(0);
+    let guard = rec.record_guard(OpCode::GuardTrue, &[cmp], Some(Arc::clone(&guard_descr)));
     rec.close_loop(&[i2, sum2]);
     let trace = rec.get_trace();
     set_guard_failargs(&trace, guard, &[i, sum]);
@@ -324,10 +334,10 @@ fn test_bridge_end_to_end() {
     //   iter5: i=1,sum=14 -> sum2=15, i2=0, fail
     // Guard saves input args (i=1, sum=14)
     let frame = backend.execute_token(&token, &[Value::Int(5), Value::Int(0)]);
-    let descr = backend.get_latest_descr(&frame);
-    assert_eq!(descr.fail_index(), 0);
+    latest_matches(&backend, &frame, &guard_descr);
     assert_eq!(backend.get_int_value(&frame, 0), 1); // i
     assert_eq!(backend.get_int_value(&frame, 1), 14); // sum
+    let descr = backend.get_latest_descr(&frame);
 
     // Now compile a bridge for the guard failure.
     // Bridge takes (i, sum) and returns sum * 2.
@@ -1940,7 +1950,8 @@ fn test_call_may_force_with_forcing_semantics() {
 
     let result = rec.record_op_with_descr(OpCode::CallMayForceI, &[fn_ptr, token_ref, flag], cd);
 
-    let guard = rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(0)));
+    let guard_descr = make_descr(0);
+    let guard = rec.record_guard(OpCode::GuardNotForced, &[], Some(Arc::clone(&guard_descr)));
 
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
@@ -1967,11 +1978,7 @@ fn test_call_may_force_with_forcing_semantics() {
 
     // flag=1 -> forced -> exits via GuardNotForced (descr 0)
     let frame = backend.execute_token(&token, &[Value::Int(1)]);
-    assert_eq!(
-        backend.get_latest_descr(&frame).fail_index(),
-        0,
-        "flag=1: should exit via GuardNotForced (descr 0)"
-    );
+    latest_matches(&backend, &frame, &guard_descr);
     // fail_args are [flag, result]; result is a preview snapshot taken
     // before the call (placeholder zero for forward-defined values).
     assert_eq!(
@@ -2002,9 +2009,19 @@ fn test_ffi_call_exception_propagation() {
     let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr, val], cd);
 
     // GuardNotForced: required immediately after CallReleaseGil
-    let not_forced = rec.record_guard(OpCode::GuardNotForced, &[], Some(make_descr(2)));
+    let not_forced_descr = make_descr(2);
+    let not_forced = rec.record_guard(
+        OpCode::GuardNotForced,
+        &[],
+        Some(Arc::clone(&not_forced_descr)),
+    );
     // GuardNoException: exits if jit_exc_get_value() != 0
-    let no_exc = rec.record_guard(OpCode::GuardNoException, &[], Some(make_descr(0)));
+    let no_exc_descr = make_descr(0);
+    let no_exc = rec.record_guard(
+        OpCode::GuardNoException,
+        &[],
+        Some(Arc::clone(&no_exc_descr)),
+    );
 
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
@@ -2027,13 +2044,9 @@ fn test_ffi_call_exception_propagation() {
     );
     assert_eq!(backend.get_int_value(&frame, 0), 0, "val=0: result = 0");
 
-    // val=99 -> exception raised -> exits via GuardNoException (fail_index=1)
+    // val=99 -> exception raised -> exits via GuardNoException
     let frame = backend.execute_token(&token, &[Value::Int(99)]);
-    assert_eq!(
-        backend.get_latest_descr(&frame).fail_index(),
-        1,
-        "val=99: should exit via GuardNoException (fail_index=1)"
-    );
+    latest_matches(&backend, &frame, &no_exc_descr);
     assert_eq!(
         backend.get_int_value(&frame, 0),
         99,
@@ -2055,7 +2068,8 @@ fn test_compiled_guard_failure_preserves_fail_args() {
 
     let result = rec.record_op(OpCode::IntAdd, &[x, const_5]);
     let cmp = rec.record_op(OpCode::IntLt, &[result, const_100]);
-    let guard = rec.record_guard(OpCode::GuardTrue, &[cmp], Some(make_descr(0)));
+    let guard_descr = make_descr(0);
+    let guard = rec.record_guard(OpCode::GuardTrue, &[cmp], Some(Arc::clone(&guard_descr)));
     rec.finish(&[result], make_descr(1));
     let trace = rec.get_trace();
     set_guard_failargs(&trace, guard, &[x]);
@@ -2075,8 +2089,7 @@ fn test_compiled_guard_failure_preserves_fail_args() {
 
     // x=200: guard fails (205 < 100 is false)
     let frame = backend.execute_token(&token, &[Value::Int(200)]);
-    let descr = backend.get_latest_descr(&frame);
-    assert_eq!(descr.fail_index(), 0, "x=200 should fail guard");
+    latest_matches(&backend, &frame, &guard_descr);
     // Guard saves input args: x=200
     assert_eq!(backend.get_int_value(&frame, 0), 200);
 }
@@ -2161,13 +2174,18 @@ fn test_compiled_callee_guard_failure_preserves_fail_args() {
     // Compile a callee trace with a guard that fails:
     //   input(x) -> cmp = x > 10 -> guard_true(cmp) -> finish(x)
     let callee_inputargs = vec![InputArg::new_int_rc(0)];
+    let callee_guard_descr = make_descr(0);
     let mut callee_ops = vec![
         Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]),
         Op::new(
             OpCode::IntGt,
             &[rb(OpRef::input_arg_int(0)), rb(OpRef::const_int(10))],
         ),
-        Op::with_descr(OpCode::GuardTrue, &[rb(OpRef::int_op(1))], make_descr(0)),
+        Op::with_descr(
+            OpCode::GuardTrue,
+            &[rb(OpRef::int_op(1))],
+            Arc::clone(&callee_guard_descr),
+        ),
         Op::with_descr(
             OpCode::Finish,
             &[rb(OpRef::input_arg_int(0))],
@@ -2195,8 +2213,7 @@ fn test_compiled_callee_guard_failure_preserves_fail_args() {
 
     // x=5: guard fails (5 > 10 is false)
     let frame = backend.execute_token(&callee_token, &[Value::Int(5)]);
-    let descr = backend.get_latest_descr(&frame);
-    assert_eq!(descr.fail_index(), 0);
+    latest_matches(&backend, &frame, &callee_guard_descr);
     assert_eq!(backend.get_int_value(&frame, 0), 5);
 }
 
@@ -2212,7 +2229,8 @@ fn test_compiled_guard_failure_preserves_int_and_float_fail_args() {
     let const_0 = OpRef::const_int(0);
 
     let cmp = rec.record_op(OpCode::IntGt, &[x_int, const_0]);
-    let guard = rec.record_guard(OpCode::GuardTrue, &[cmp], Some(make_descr(0)));
+    let guard_descr = make_descr(0);
+    let guard = rec.record_guard(OpCode::GuardTrue, &[cmp], Some(Arc::clone(&guard_descr)));
     rec.finish(&[x_int], make_descr(1));
     let trace = rec.get_trace();
     set_guard_failargs(&trace, guard, &[x_int, x_float]);
@@ -2234,7 +2252,7 @@ fn test_compiled_guard_failure_preserves_int_and_float_fail_args() {
     // x_int=-5, x_float=2.5: guard fails (-5 > 0 is false)
     let frame = backend.execute_token(&token, &[Value::Int(-5), Value::Float(2.5)]);
     let descr = backend.get_latest_descr(&frame);
-    assert_eq!(descr.fail_index(), 0);
+    latest_matches(&backend, &frame, &guard_descr);
     assert_eq!(backend.get_int_value(&frame, 0), -5);
     assert!(
         (backend.get_float_value(&frame, 1) - 2.5).abs() < 1e-10,

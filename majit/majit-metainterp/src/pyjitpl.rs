@@ -10118,7 +10118,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.keep_compiled_token_alive(&token);
                 // compile.py record_loop_or_bridge — record this loop's
                 // CALL_ASSEMBLER / JUMP keepalive targets.
-                self.record_loop_or_bridge(&token, &compiled_ops, trace_id);
+                self.record_loop_or_bridge(&token, &compiled_ops);
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compiled loop at key={}, num_inputs={}",
@@ -10126,11 +10126,6 @@ impl<M: Clone> MetaInterp<M> {
                         inputargs.len()
                     );
                 }
-                // `compile.py record_loop_or_bridge` already stamped
-                // `rd_loop_token` / `trace_id`. Stamp the per-trace
-                // `fail_index` onto each resume-guard descr
-                // (`stamp_guard_descr_trace_positions`).
-                compile::stamp_guard_descr_trace_positions(&compiled_ops);
                 self.take_back_all_descrs(std::mem::take(&mut unroll_opt.all_descrs));
                 // Box identity: raise the process-wide OpRef high-water so a
                 // later bridge of any loop sits above every previously
@@ -10688,8 +10683,9 @@ impl<M: Clone> MetaInterp<M> {
             // is `self.resumekey` (== the descr
             // `cpu.get_latest_descr(deadframe)` returned).  Pyre
             // carries it on `BridgeTraceInfo.source_descr`
-            // (populated by `start_retrace_from_guard`).  No
-            // `(trace_id, fail_index)` reverse lookup.
+            // (populated by `start_retrace_from_guard`).  A guard is
+            // identified by its descr object
+            // (`compute_unique_id(faildescr)` / `descr_identity`).
             let descr_arc = match self.bridge_info() {
                 Some(b) => b.source_descr.clone(),
                 None => {
@@ -11514,7 +11510,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 self.keep_compiled_token_alive(&token);
                 // compile.py record_loop_or_bridge.
-                self.record_loop_or_bridge(&token, &combined_ops, trace_id);
+                self.record_loop_or_bridge(&token, &combined_ops);
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compiled retrace at key={}, num_inputs={}",
@@ -11522,7 +11518,6 @@ impl<M: Clone> MetaInterp<M> {
                         inputargs.len()
                     );
                 }
-                compile::stamp_guard_descr_trace_positions(&combined_ops);
                 self.take_back_all_descrs(std::mem::take(&mut unroll_opt.all_descrs));
                 // Box identity: see compile_loop site.
                 self.next_global_opref = self.next_global_opref.max(
@@ -11760,7 +11755,7 @@ impl<M: Clone> MetaInterp<M> {
                 drop(_combined_live);
                 let mut combined_ops = combined_ops;
                 let _combined_live = self.publish_live_ops(&combined_ops);
-                self.record_loop_or_bridge(&source_jct, &combined_ops, bridge_trace_id);
+                self.record_loop_or_bridge(&source_jct, &combined_ops);
                 self.stats.retraces_compiled += 1;
                 if crate::majit_log_enabled() {
                     eprintln!(
@@ -11791,10 +11786,7 @@ impl<M: Clone> MetaInterp<M> {
                 // `compile.py send_bridge_to_backend`: the bridge is
                 // handed to the CPU and nothing is indexed in the
                 // frontend — its guards answer later failures off
-                // their own `ResumeGuardDescr`.  Only the per-trace
-                // `fail_index` stamp the pyre readers key
-                // on is applied here.
-                compile::stamp_guard_descr_trace_positions(&combined_ops);
+                // their own `ResumeGuardDescr`.
                 // Box identity: see compile_loop site.
                 let new_high_water = compute_next_global_opref(&inputargs, &combined_ops);
                 self.next_global_opref = self.next_global_opref.max(new_high_water);
@@ -12531,8 +12523,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.assign_guard_hashes(&optimized_ops);
                 self.keep_compiled_token_alive(&token);
                 // compile.py record_loop_or_bridge.
-                self.record_loop_or_bridge(&token, &optimized_ops, trace_id);
-                compile::stamp_guard_descr_trace_positions(&optimized_ops);
+                self.record_loop_or_bridge(&token, &optimized_ops);
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 // Box identity: see compile_loop site.
                 self.next_global_opref = self
@@ -12966,8 +12957,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.assign_guard_hashes(&compiled_ops);
                 self.keep_compiled_token_alive(&token);
                 // compile.py record_loop_or_bridge.
-                self.record_loop_or_bridge(&token, &compiled_ops, trace_id);
-                compile::stamp_guard_descr_trace_positions(&compiled_ops);
+                self.record_loop_or_bridge(&token, &compiled_ops);
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 // Box identity: see compile_loop site.
                 self.next_global_opref = self
@@ -14195,12 +14185,7 @@ impl<M: Clone> MetaInterp<M> {
     /// Each branch below cites its upstream line and, where pyre cannot
     /// yet match RPython 1:1, names the blocker that gates
     /// convergence.
-    fn record_loop_or_bridge(
-        &self,
-        original: &Arc<JitCellToken>,
-        ops: &[majit_ir::OpRc],
-        trace_id: u64,
-    ) {
+    fn record_loop_or_bridge(&self, original: &Arc<JitCellToken>, ops: &[majit_ir::OpRc]) {
         // `compile.py` `assert original_jitcell_token.generation > 0`.
         debug_assert!(
             original.generation.get() > 0,
@@ -14252,18 +14237,6 @@ impl<M: Clone> MetaInterp<M> {
             // metainterp descrs that override `set_rd_loop_token_clt`
             // (`set_rd_loop_token_clt` overrides).
             if descr.is_resume_guard() || descr.is_resume_guard_copied() {
-                // Pyre-only owning-trace stamp.  RPython resolves descr
-                // identity by `id(descr)` (`history.py:125`); pyre's
-                // runtime exit paths look up by `(trace_id, fail_index)`,
-                // so the owning trace_id is captured on the descr itself
-                // and read directly via `descr.trace_id()`.
-                descr
-                    .as_fail_descr()
-                    .expect(
-                        "compile.py:185 isinstance(descr, ResumeDescr) — \
-                         every ResumeDescr-family descr is a FailDescr",
-                    )
-                    .set_trace_id(trace_id);
                 if let Some(clt) = original.compiled_loop_token() {
                     let cloned = std::sync::Arc::clone(&clt);
                     let any_arc: std::sync::Arc<dyn std::any::Any + Send + Sync> = cloned;
@@ -15385,8 +15358,7 @@ impl<M: Clone> MetaInterp<M> {
                 if !self.last_quasi_immutable_deps.is_empty() {
                     crate::mc_diag_bump(76);
                 }
-                self.record_loop_or_bridge(&token, &optimized_ops, trace_id);
-                compile::stamp_guard_descr_trace_positions(&optimized_ops);
+                self.record_loop_or_bridge(&token, &optimized_ops);
                 // Box identity: see compile_loop site.
                 self.next_global_opref = self
                     .next_global_opref
@@ -15640,20 +15612,6 @@ impl<M: Clone> MetaInterp<M> {
             .get_procedure_token_on_driver(compiling_jd, cell_token_key)
             .map_or(0, |tok| tok.get_retraced_count());
         let pending_bridge_rd: Option<PendingBridgeRd> = {
-            // `fail_descr.trace_id()` is the bridge origin's allocated
-            // id (non-zero per `alloc_trace_id` starting at 1).  RPython
-            // reaches the same value through the resumekey object's
-            // identity (`compile.py:1049 self.resumekey.original_jitcell_token`);
-            // pyre carries it as a u64 stamped at backend compile time.
-            // No `0` sentinel — the bridge proxy's `trace_id` is
-            // `fail_descr.trace_id()`, stamped at `record_loop_or_bridge`.
-            // Tests read the same descr (`compiled_guard_descr` /
-            // `as_fail_descr`).
-            let source_trace_id = fail_descr.trace_id();
-            debug_assert_ne!(
-                source_trace_id, 0,
-                "compile_bridge expects bridge origin descr.trace_id() to be a real allocated id, not the FINISH-singleton sentinel"
-            );
             // `compile.py compile_trace` reads `resumekey.get_resumestorage()`:
             // the source guard's rd_* pool is the descr's own, whether the
             // guard sits in the root loop or in a bridge the frontend never
@@ -16181,11 +16139,10 @@ impl<M: Clone> MetaInterp<M> {
                 // latest token.
                 self.last_quasi_immutable_deps =
                     std::mem::take(&mut optimizer.quasi_immutable_deps);
-                self.record_loop_or_bridge(&source_jct, &optimized_ops, bridge_trace_id);
+                self.record_loop_or_bridge(&source_jct, &optimized_ops);
                 // `compile.py send_bridge_to_backend`: nothing is
                 // indexed in the frontend for a bridge — see the
                 // retrace site.
-                compile::stamp_guard_descr_trace_positions(&optimized_ops);
                 let new_high_water = compute_next_global_opref(bridge_inputargs, &optimized_ops);
                 self.next_global_opref = self.next_global_opref.max(new_high_water);
                 self.remember_compiled_graph_write();
@@ -16298,8 +16255,8 @@ impl<M: Clone> MetaInterp<M> {
         // Read the subtype tag off the descr stamped by
         // `store_final_boxes_in_guard` (`is_guard_exc()` — equivalent to
         // RPython's `isinstance(descr, ResumeGuardExcDescr)`).  The
-        // `descr_arc` here is the same Arc identity stamped onto the
-        // originating guard op (`stamp_guard_descr_trace_positions`),
+        // `descr_arc` here is the same Arc identity as the originating
+        // guard op (`compute_unique_id(faildescr)` / `descr_identity`),
         // so reading the subtype tag through it matches the previous
         // `op.descr.is_guard_exc()` walk.
         let is_exception_guard = descr_arc.is_guard_exc();
@@ -16464,8 +16421,8 @@ impl<M: Clone> MetaInterp<M> {
         // `pyjitpl.py` `handle_guard_failure(self, resumedescr,
         // deadframe)` parity: stash `self.resumekey` on MetaInterp so
         // every downstream lookup (bridge close, compile_trace_inner,
-        // ...) reads the source descr Arc directly instead of doing
-        // a `(trace_id, fail_index)` reverse lookup.  `code_ptr` is
+        // ...) reads the source descr Arc directly
+        // (`compute_unique_id(faildescr)` / `descr_identity`).  `code_ptr` is
         // populated by `start_bridge_tracing` (the production-path
         // wrapper); test-only entries leave it as 0 — only the
         // `green_key_from_code_ptr` recompute on `CloseLoopWithArgs`
@@ -31965,7 +31922,6 @@ mod tests {
         meta.backend
             .compile_loop(inputargs, &ops_rc, &token)
             .expect("loop should compile");
-        compile::stamp_guard_descr_trace_positions(&ops_rc);
 
         let token_arc = std::sync::Arc::new(token);
         compile::wire_clt_loop_token_wref(&token_arc);

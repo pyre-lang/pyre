@@ -220,7 +220,7 @@ pub struct RawExecResult {
     /// singletons return their attached Arc identity directly.
     /// Bridge consumers (`start_bridge_tracing`,
     /// `_trace_and_compile_from_bridge`) call `descr_arc.as_fail_descr()`
-    /// to read `rd_loop_token_clt` / `fail_index_per_trace` directly.
+    /// to read `rd_loop_token_clt` directly.
     pub descr_arc: Arc<dyn Descr>,
 }
 

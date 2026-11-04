@@ -170,11 +170,10 @@ impl LoopVersion {
             };
             if new_fd.loop_version() {
                 // `version.py:32-36 leads_to[descr]` keys by descr object
-                // identity.  Pyre uses `Descr::index()` — the globally
-                // unique `alloc_fail_index()` value baked at descr
-                // construction — instead of `FailDescr::fail_index()`
-                // which now returns the per-trace index and is `0` until
-                // backend codegen assigns it.
+                // identity (`compute_unique_id(faildescr)` /
+                // `descr_identity`).  Pyre uses `Descr::index()` — the
+                // globally unique `alloc_fail_index()` value baked at descr
+                // construction.
                 let old_fi = old_descr.index();
                 let toversion = info.leads_to.get(&old_fi).cloned();
                 if let Some(tv) = toversion {

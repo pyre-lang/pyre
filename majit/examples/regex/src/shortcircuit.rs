@@ -1202,7 +1202,8 @@ mod tests {
              cascade on this body is supposed to keep trailing the mark pattern",
         );
         // A full reset of the compile decision would grow ~`after[0]` every
-        // pass *and* retrace the same (trace_id, fail_index). The cascade
+        // pass *and* retrace the same guard descr
+        // (`compute_unique_id(faildescr)` / `descr_identity`). The cascade
         // grows at a similar rate from *new* sites; the unique-source check
         // lives in the dynasm `source=` diag, not in this total.
         let _ = deltas;

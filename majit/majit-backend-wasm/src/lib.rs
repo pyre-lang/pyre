@@ -5999,11 +5999,6 @@ impl majit_backend::Backend for WasmBackend {
         // lift (the host round-trip path still handles the CALL_ASSEMBLER).
         let ca_targets = bridge_call_assembler_target(ops);
         let ca_candidate = ca_deopt_helper_slot() != 0 && ca_targets.is_some();
-        // Metainterp stamp pair, kept for log/decline strings only. Guard
-        // identity is the descr object (`assemble_bridge`,
-        // `handle_guard_failure`).
-        let source_trace_id = fail_descr.trace_id();
-        let source_fail_index = fail_descr.fail_index();
 
         // Scalars read from the source loop up front, so the immutable borrow of
         // `original_token` is released before the `&mut self` codegen calls.
@@ -6370,8 +6365,7 @@ impl majit_backend::Backend for WasmBackend {
             // below consumes before the last `decline` call is out of scope.
             let bridge_trace_id = self.trace_counter;
             // Direct position in `fail_descrs`, or the merged-stream ordinal of
-            // the same descr once the parent region is attached. The stamp pair
-            // above is logs only.
+            // the same descr once the parent region is attached.
             let merged_source_fail_index = if is_direct {
                 source_pos.map(|pos| pos as u32)
             } else {
@@ -6388,10 +6382,16 @@ impl majit_backend::Backend for WasmBackend {
                         })
                 })
             };
+            // `assemble_bridge` / `compute_unique_id(faildescr)`: decline
+            // strings name the source descr object.
+            let source_descr_id = source_meta
+                .as_ref()
+                .map(majit_ir::descr_identity)
+                .unwrap_or(0);
             let decline = |reason: &str| {
                 record_inline_decline(format!(
-                    "bridge={bridge_trace_id} src={source_trace_id} fi={source_fail_index} \
-                     slot={external_jump_slot} key={external_jump_key} reason={reason}"
+                    "bridge={bridge_trace_id} src={source_descr_id:#x} slot={external_jump_slot} \
+                     key={external_jump_key} reason={reason}"
                 ));
             };
             if original_token.is_invalidated() {
@@ -7677,7 +7677,6 @@ mod tests {
         assert!(target_from_token(&token).is_some());
         assert!(failguard::label_target(&label_kept).is_some());
         let fail = FreeFailDescr {
-            fail_index: 0,
             arg_types: vec![majit_ir::Type::Int, majit_ir::Type::Int],
         };
         let bridge_advance = OpRc::new(majit_ir::Op::new(
@@ -7866,7 +7865,6 @@ mod tests {
         assert_eq!(still.key, published.key);
 
         let fail = FreeFailDescr {
-            fail_index: 0,
             arg_types: vec![majit_ir::Type::Int, majit_ir::Type::Int],
         };
         let bridge_advance = OpRc::new(majit_ir::Op::new(
@@ -7975,16 +7973,12 @@ mod tests {
 
     #[derive(Debug)]
     struct FreeFailDescr {
-        fail_index: u32,
         arg_types: Vec<majit_ir::Type>,
     }
 
     impl majit_ir::Descr for FreeFailDescr {}
 
     impl majit_ir::descr::FailDescr for FreeFailDescr {
-        fn fail_index(&self) -> u32 {
-            self.fail_index
-        }
         fn fail_arg_types(&self) -> &[majit_ir::Type] {
             &self.arg_types
         }
