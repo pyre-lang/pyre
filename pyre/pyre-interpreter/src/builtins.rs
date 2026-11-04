@@ -7459,19 +7459,6 @@ pub(crate) fn cell_slot_type_error(key: &str, value: PyObjectRef) -> crate::PyEr
     ))
 }
 
-/// typeobject.py `_create_new_type`.
-///
-/// `descr__new__` looks inside so `type(x)` stays in-trace; this body is a
-/// separate function so the 3-arg path is one residual `CALL_MAY_FORCE`.
-/// `_create_new_type` has no `@dont_look_inside`; `JitPolicy.look_inside_graph`
-/// residualizes it because the body has loops (`contains_loop` /
-/// `find_backedges`).  `W_TypeObject.__init__` is `@dont_look_inside`.
-/// `#[inline(never)]` keeps the helper a separate graph so rustc does not
-/// fold it into `type_descr_new`.
-///
-/// `ensure_module_attr` reads `caller.get_w_globals()` with no extra force:
-/// `w_globals` is frame-invariant (`restore_resume_state_from` leaves it
-/// out) so the heap slot is already current.  A hand-placed
 /// `PyAnyDict_Check`: a dict (including a dict subclass) or a
 /// `frozendict` (including a subclass).
 fn py_any_dict_check(w_obj: PyObjectRef) -> bool {
@@ -7485,6 +7472,19 @@ fn py_any_dict_check(w_obj: PyObjectRef) -> bool {
     }
 }
 
+/// typeobject.py `_create_new_type`.
+///
+/// `descr__new__` looks inside so `type(x)` stays in-trace; this body is a
+/// separate function so the 3-arg path is one residual `CALL_MAY_FORCE`.
+/// `_create_new_type` has no `@dont_look_inside`; `JitPolicy.look_inside_graph`
+/// residualizes it because the body has loops (`contains_loop` /
+/// `find_backedges`).  `W_TypeObject.__init__` is `@dont_look_inside`.
+/// `#[inline(never)]` keeps the helper a separate graph so rustc does not
+/// fold it into `type_descr_new`.
+///
+/// `ensure_module_attr` reads `caller.get_w_globals()` with no extra force:
+/// `w_globals` is frame-invariant (`restore_resume_state_from` leaves it
+/// out) so the heap slot is already current.  A hand-placed
 /// `jit_force_virtualizable` here aborted compiles that create a type
 /// (`ABORT_ESCAPE`) and scrambled virtual locals on loops that still compiled.
 #[inline(never)]
