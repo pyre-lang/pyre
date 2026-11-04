@@ -14353,6 +14353,182 @@ fn generic_residual_borrow_of_transparent_scalar_is_refused() {
     );
 }
 
+/// A `bitflags!` newtype registered as an unsigned scalar is the word.
+///
+/// `CodeFlags` is a Struct whose layout records `transparent: false`, so
+/// the linked kind — not `repr(transparent)` — is the scalar. Field
+/// reads of `.bits` / `.0` and `Self { bits: x }` are that word;
+/// `IntegerRepr.rtype_or_` emits `int_or`. RPython has no wrapper
+/// object (`r_uint`).
+#[test]
+fn registered_transparent_scalar_union_lowers_to_integer_ops() {
+    let span = fixture_span();
+    let flags_ty = serde_json::json!({
+        "Adt": {"id": 0, "generics": empty_generics(), "builtin": null}
+    });
+    let bits_ty = u32_ty();
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let field0 = |base: u64, base_ty: &serde_json::Value, field_ty: &serde_json::Value| {
+        serde_json::json!({
+            "kind": {"Projection": [
+                {"kind": {"Local": base}, "ty": base_ty},
+                {"Field": [null, 0]}
+            ]},
+            "ty": field_ty
+        })
+    };
+    let flags_decl = {
+        let mut decl = struct_decl(
+            0,
+            ident_path(&["fixture", "Flags"]),
+            serde_json::json!([{
+                "name": "bits",
+                "ty": bits_ty,
+                "attr_info": null
+            }]),
+            false,
+        );
+        decl["layout"] = serde_json::json!([{
+            "key": "fixture-target",
+            "value": {
+                "size": 4,
+                "align": 4,
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"repr_algo": "Rust", "transparent": false}
+            }
+        }]);
+        decl
+    };
+    let union_fn = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["fixture", "union"])),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [flags_ty, flags_ty],
+            "output": flags_ty
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 2, "locals": [
+                {"index": 0, "name": null, "span": span, "ty": flags_ty},
+                {"index": 1, "name": "self", "span": span, "ty": flags_ty},
+                {"index": 2, "name": "other", "span": span, "ty": flags_ty},
+                {"index": 3, "name": null, "span": span, "ty": bits_ty},
+                {"index": 4, "name": null, "span": span, "ty": bits_ty},
+                {"index": 5, "name": null, "span": span, "ty": bits_ty},
+                {"index": 6, "name": null, "span": span, "ty": flags_ty}
+            ]},
+            "body": [
+                {
+                    "statements": [
+                        {"span": span, "kind": {"Assign": [
+                            place(3, &bits_ty),
+                            {"Use": [{"Read": field0(1, &flags_ty, &bits_ty)}, "No"]}
+                        ]}},
+                        {"span": span, "kind": {"Assign": [
+                            place(4, &bits_ty),
+                            {"Use": [{"Read": field0(2, &flags_ty, &bits_ty)}, "No"]}
+                        ]}},
+                        {"span": span, "kind": {"Assign": [
+                            place(5, &bits_ty),
+                            {"BinaryOp": [
+                                "BitOr",
+                                {"Read": place(3, &bits_ty)},
+                                {"Read": place(4, &bits_ty)}
+                            ]}
+                        ]}}
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 0},
+                                "generics": empty_generics()
+                            }},
+                            "args": [
+                                {"Move": place(3, &bits_ty)},
+                                {"Move": place(4, &bits_ty)}
+                            ]
+                        },
+                        "dest": place(6, &flags_ty),
+                        "target": 1,
+                        "on_unwind": 2
+                    }}}
+                },
+                {
+                    "statements": [
+                        {"span": span, "kind": {"Assign": [
+                            place(0, &flags_ty),
+                            {"Aggregate": [
+                                {"Adt": [0, null, null]},
+                                [{"Move": place(5, &bits_ty)}]
+                            ]}
+                        ]}}
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": "Return"}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": "UnwindResume"}
+                }
+            ]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [flags_decl],
+            "fun_decls": [union_fn],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    llbc.register_transparent_scalar_kinds([(
+        "fixture::Flags".to_string(),
+        majit_charon_reader::TransparentScalarKind::Unsigned,
+    )]);
+    let graph = super::lower_function(&llbc, "union").expect("lower union");
+    let ops = graph_ops(&graph);
+    let dump = graph.dump();
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Input { name, ty: ValueType::Unsigned, .. } if name == "self"
+        )),
+        "registered Flags must intern as Unsigned, got {dump}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::BinOp { op: label, .. } if label == "bitor"
+        )),
+        "union must lower the payload `|` as bitor, got {dump}"
+    );
+    for op in &ops {
+        match &op.kind {
+            OpKind::FieldRead { field, .. } => {
+                panic!("getattr {} survived; graph={dump}", field.name);
+            }
+            OpKind::FieldWrite { field, .. } => {
+                panic!("setattr {} survived; graph={dump}", field.name);
+            }
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { .. },
+                ..
+            } => {
+                panic!("instantiate survived; graph={dump}");
+            }
+            _ => {}
+        }
+    }
+}
+
 pub(in crate::front::mir) fn ptr_ty() -> serde_json::Value {
     serde_json::json!({"RawPtr": [usize_ty(), "Const"]})
 }
@@ -35099,6 +35275,164 @@ fn deref_store_of_nested_struct_field_has_no_move_plan() {
     assert!(
         msg.contains("deref store is not a field, array element, or raw word"),
         "s_ty={s_ty:?} err={msg}"
+    );
+}
+
+/// `if let Some(p) = opt { *p = fresh; touch(&mut *p) }` through
+/// `Option<&mut Handle>` of a one-word GC handle. The Some payload and
+/// the TwoPhaseMut reborrow inherit the MutRef cell, so `*p = fresh` is
+/// `FieldWrite "value"` (`executioncontext.py` `_trace`).
+#[test]
+fn deref_store_through_option_mut_gc_handle_lowers() {
+    let handle_ty = interior_adt(1);
+    let payload_ty = interior_adt(2);
+    let mut_h = serde_json::json!({"Ref": ["Erased", handle_ty.clone(), "Mut"]});
+    let option_ty = option_adt_node(0, mut_h.clone());
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let handle_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["fixture", "Handle"], true),
+        "kind": {"Struct": [{
+            "name": null,
+            "ty": {"RawPtr": [payload_ty.clone(), "Mut"]},
+            "attr_info": null
+        }]},
+        "layout": interior_layout(8, &[0], true)
+    });
+    let payload_decl = serde_json::json!({
+        "def_id": 2,
+        "item_meta": interior_meta(&["fixture", "Payload"], true),
+        "kind": {"Struct": []}
+    });
+    let gctype_trait = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["majit_gc", "header", "GcType"], false),
+        "methods": []
+    });
+    let gctype_impl = serde_json::json!({
+        "impl_trait": {
+            "id": 0,
+            "generics": {"types": [{"Value": [2, payload_ty.clone()]}]}
+        }
+    });
+    let impl_seg = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": {"Value": [0, handle_ty.clone()]},
+        "kind": "InherentImplBlock"
+    }}});
+    let opt_place = interior_place(1, &option_ty);
+    let some_payload = serde_json::json!({
+        "kind": {"Projection": [opt_place.clone(), {"Field": [1, 0]}]},
+        "ty": mut_h.clone()
+    });
+    let p_place = interior_place(3, &mut_h);
+    let tmp_place = interior_place(4, &mut_h);
+    let touch = serde_json::json!({
+        "def_id": 1,
+        "item_meta": {
+            "name": [
+                {"Ident": ["fixture", 0]},
+                {"Ident": ["Handle", 0]},
+                impl_seg,
+                {"Ident": ["touch", 0]}
+            ],
+            "span": interior_span(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        },
+        "signature": {"is_unsafe": true, "inputs": [mut_h.clone()], "output": unit.clone()},
+        "body": {"Unstructured": {
+            "span": interior_span(),
+            "locals": {"arg_count": 1, "locals": [
+                interior_local(0, None, &unit),
+                interior_local(1, Some("self"), &mut_h)
+            ]},
+            "body": [interior_bb(vec![], interior_return())]
+        }}
+    });
+    let some_bb = interior_bb(
+        vec![
+            interior_assign(
+                p_place.clone(),
+                serde_json::json!({"Use": [{"Read": some_payload}, "No"]}),
+            ),
+            interior_assign(
+                interior_deref(3, &mut_h, &handle_ty),
+                serde_json::json!({
+                    "Use": [{"Move": interior_place(2, &handle_ty)}, "No"]
+                }),
+            ),
+            interior_assign(
+                tmp_place.clone(),
+                serde_json::json!({
+                    "Ref": {
+                        "place": interior_deref(3, &mut_h, &handle_ty),
+                        "kind": "TwoPhaseMut",
+                        "ptr_metadata": null
+                    }
+                }),
+            ),
+        ],
+        interior_call(
+            1,
+            vec![serde_json::json!({"Move": tmp_place})],
+            interior_place(0, &unit),
+            1,
+            2,
+        ),
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["fixture", "store_opt"], true),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [option_ty.clone(), handle_ty.clone()],
+            "output": unit.clone()
+        },
+        "body": {"Unstructured": {
+            "span": interior_span(),
+            "locals": {"arg_count": 2, "locals": [
+                interior_local(0, None, &unit),
+                interior_local(1, Some("opt"), &option_ty),
+                interior_local(2, Some("fresh"), &handle_ty),
+                interior_local(3, Some("p"), &mut_h),
+                interior_local(4, Some("tmp"), &mut_h)
+            ]},
+            "body": [
+                some_bb,
+                interior_bb(vec![], interior_return()),
+                interior_bb(vec![], interior_unwind())
+            ]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [option_enum(0), handle_decl, payload_decl],
+            "fun_decls": [caller, touch],
+            "global_decls": [],
+            "trait_decls": [gctype_trait],
+            "trait_impls": [gctype_impl]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let graph = super::lower_function(&llbc, "store_opt")
+        .unwrap_or_else(|err| panic!("lower store_opt: {err:?}"));
+    let ops = graph_ops(&graph);
+    let write_names: Vec<&str> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite { field, .. } => Some(field.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        write_names.contains(&"value"),
+        "deref store through Option<&mut Handle> is FieldWrite value; ops={ops:?}"
     );
 }
 

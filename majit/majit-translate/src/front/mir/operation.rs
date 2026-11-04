@@ -6704,14 +6704,16 @@ impl<'a> Lowering<'a> {
                     // An opaque dependency view has no field list, but the
                     // linked scalar bank still types the wrapper as its inner
                     // word. Charon spells the positional field `_0`
-                    // (`is_positional`); the front names it `__pos_0`.
+                    // (`is_positional`); the front names it `__pos_0`. A
+                    // registry-linked scalar whose layout omitted
+                    // `repr(transparent)` names its one word `.bits` / `.0`.
                     // A by-value integer newtype (`VersionTag(u64)`) is
                     // the same word (`history.getkind`).
                     // A `&Newtype` is an address: `(*self).0` loads that
                     // integer (`history.getkind` of the field). Aliasing
                     // the deref would return the Ref receiver as the
                     // payload.
-                    if (field_name == "__pos_0" || field_name == "_0")
+                    if is_transparent_scalar_payload_field_name(&field_name)
                         && tyref_transparent_inner_value_type(
                             &inner.ty,
                             self.llbc,
@@ -7878,6 +7880,27 @@ impl<'a> Lowering<'a> {
                         },
                     });
                     return Ok(loaded);
+                }
+                if let ProjectionElem::Tagged(v) = &elem
+                    && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
+                    && tyref_transparent_inner_value_type(
+                        &inner.ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    )
+                    .is_some()
+                    && indexed_field_parts(field_payload)
+                        .is_some_and(|(variant, idx)| variant.is_none() && idx == 0)
+                    && self.resolve_adt_field(&inner.ty, field_payload).is_none()
+                {
+                    // Opaque registered scalar: no field list, so the
+                    // `resolve_adt_field` peel above does not run. The
+                    // only projection is the payload word.
+                    let wrapper_ty = clone_tyref(&inner.ty);
+                    let base = self.resolve_place(mir_bb, *inner)?;
+                    return Ok(self.cast_off_error_carrier(mir_bb, &wrapper_ty, base));
                 }
                 if let ProjectionElem::Tagged(v) = &elem
                     && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))

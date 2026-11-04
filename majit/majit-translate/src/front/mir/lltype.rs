@@ -7660,19 +7660,32 @@ pub(in crate::front::mir) fn unique_nonzst_field(
     found
 }
 
-/// Index and name of the one sized field of a `#[repr(transparent)]` struct.
+/// Index and name of the one sized field of a `#[repr(transparent)]` struct
+/// or a type in the transparent-scalar registry.
 ///
 /// [`strip_ty_wrappers`] peels `&T` / `&mut T` and leaves `RawPtr` alone, so
 /// a borrow of the wrapper is the same word a fieldless-enum borrow is
 /// ([`tyref_is_borrowed_fieldless_enum`]). A raw pointer remains an address.
+/// `CodeFlags` is a Struct whose layout records `transparent: false`; the
+/// registry is that missing flag (`r_uint` / `IntegerRepr.rtype_or_`).
 pub(in crate::front::mir) fn transparent_nonzst_field(
     decl: &TypeDecl,
     llbc: &Llbc,
 ) -> Option<(usize, String)> {
-    if !decl.is_repr_transparent() {
+    if !decl.is_repr_transparent()
+        && llbc
+            .transparent_scalar_kind(&decl.item_meta.name_path())
+            .is_none()
+    {
         return None;
     }
     unique_nonzst_field(decl, llbc)
+}
+
+/// Payload field of a transparent-scalar ADT: the unique sized field, or
+/// the names Charon / `bitflags!` spell for that one word (`.bits`, `.0`).
+pub(in crate::front::mir) fn is_transparent_scalar_payload_field_name(name: &str) -> bool {
+    matches!(name, "bits" | "_0" | "__pos_0" | "0")
 }
 
 pub(in crate::front::mir) fn tyref_transparent_nonzst_field(
@@ -8198,15 +8211,14 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let id = adt_node_def_id(node)?;
     let decl = llbc.type_by_id(id)?;
-    // A foreign `Opaque` decl keeps `repr.transparent: false`: the defining
-    // crate is outside the extraction set, so the layout does not record the
-    // wrapper. The linked kind is that missing field.
-    // `apply_published_structs` turns that import into a `Struct` and does
-    // not copy `repr`, so the same false flag remains. Reading the copied
-    // field would retype the word; the kind stays the scalar table.
-    if (matches!(&decl.kind, TypeDeclKind::Opaque) || decl.published_struct_copy)
-        && let Some(kind) = llbc.transparent_scalar_kind(&decl.item_meta.name_path())
-    {
+    // The linked kind is the inner word. A foreign `Opaque` decl keeps
+    // `repr.transparent: false`; `apply_published_structs` turns that
+    // import into a `Struct` and does not copy `repr`. The interpreter
+    // artefact also keeps `CodeFlags` as a Struct with `transparent:
+    // false`. RPython stores those flags as `r_uint`
+    // (`IntegerRepr.rtype_or_`); reading a copied field would retype
+    // the word, so the kind stays the scalar table for every spelling.
+    if let Some(kind) = llbc.transparent_scalar_kind(&decl.item_meta.name_path()) {
         return Some(transparent_scalar_value_type(kind));
     }
     match &decl.kind {
@@ -11923,6 +11935,61 @@ pub(in crate::front::mir) fn gc_mut_ref_param_locals(
             continue;
         };
         if tyref_gc_mut_ref_cell_root(
+            &local.ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        )
+        .is_some()
+        {
+            params.insert(index);
+        }
+    }
+    params
+}
+
+/// `Option<&mut T>` occupies a MutRef cell in its Some payload when `T`
+/// is a GC pointer. The Option itself is not a cell:
+/// [`tyref_gc_mut_ref_cell_root`] / [`gc_mut_ref_param_root`] name `&mut T`.
+pub(in crate::front::mir) fn tyref_option_gc_mut_ref_cell_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let payload = crate::front::result_exc::tyref_option_payload(ty, llbc)?;
+    tyref_gc_mut_ref_cell_root(
+        &payload,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    )
+}
+
+/// Parameter locals declared `Option<&mut T>` whose payload would occupy
+/// a MutRef cell. Sibling of [`gc_mut_ref_param_locals`]: members stay
+/// Option-typed so [`gc_mut_ref_param_root`] keeps naming only `&mut T`.
+pub(in crate::front::mir) fn gc_mut_ref_option_param_locals(
+    locals: &majit_charon_reader::ullbc::Locals,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    self_dont_look_inside: bool,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<usize> {
+    if self_dont_look_inside {
+        return std::collections::HashSet::new();
+    }
+    let mut params = std::collections::HashSet::new();
+    let arg_count = locals.arg_count as usize;
+    for index in 1..=arg_count {
+        let Some(local) = locals.locals.get(index) else {
+            continue;
+        };
+        if tyref_option_gc_mut_ref_cell_root(
             &local.ty,
             llbc,
             tombstoned,

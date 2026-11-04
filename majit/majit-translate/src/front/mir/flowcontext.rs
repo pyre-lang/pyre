@@ -379,9 +379,20 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// same restriction [`Lowering::const_discriminant_locals`] carries:
     /// this map is not a flow-state.
     pub(in crate::front::mir) atomic_ref_place: std::collections::HashMap<usize, Place>,
-    /// Parameter locals declared `&mut T` where `T` is a GC reference.
-    /// The local holds the one-field cell, not the reference word.
+    /// Locals that hold a MutRef cell: `&mut T` parameters whose `T` is a
+    /// GC reference, whole-local copies of those, the Some payload of an
+    /// [`Self::gc_mut_ref_option_params`] member, and a reborrow
+    /// (`&mut *p` / `&TwoPhaseMut *p` / `&*p`) of a member. The local
+    /// holds the one-field cell, not the reference word.
+    ///
+    /// `_trace` unwraps `operr: Option<&mut OperationError>` then
+    /// reborrows it for `reload` / `normalize_exception`
+    /// (`executioncontext.py` `_trace`).
     pub(in crate::front::mir) gc_mut_ref_params: std::collections::HashSet<usize>,
+    /// Parameter locals declared `Option<&mut T>` whose payload would
+    /// occupy a MutRef cell. Members stay Option-typed so
+    /// [`Lowering::gc_mut_ref_param_root`] keeps naming only `&mut T`.
+    pub(in crate::front::mir) gc_mut_ref_option_params: std::collections::HashSet<usize>,
     /// MIR locals whose value is the address of a primitive, produced by a
     /// call that returns `&T` / `&mut T` (`MutexGuard::deref` → `&bool`).
     ///
@@ -1454,6 +1465,14 @@ impl<'a> Lowering<'a> {
             self_dont_look_inside,
             raw_alloc_flavor_structs,
         );
+        let gc_mut_ref_option_params = gc_mut_ref_option_param_locals(
+            &body.locals,
+            llbc,
+            tombstoned_leaves,
+            gc_struct_ids,
+            self_dont_look_inside,
+            raw_alloc_flavor_structs,
+        );
         let n_locals = body.locals.locals.len();
         let (len_shadow, str_view_locals, list_view_locals, list_view_fixed) =
             pair_len_shadows(body, llbc, &name, accum);
@@ -2133,6 +2152,7 @@ impl<'a> Lowering<'a> {
             fused_copy_struct_get_cf: std::collections::HashMap::new(),
             atomic_ref_place: std::collections::HashMap::new(),
             gc_mut_ref_params,
+            gc_mut_ref_option_params,
             scalar_address_locals: Vec::new(),
             cell_locals: cell_plan.locals,
             cell_descr: cell_plan.descr,
@@ -3226,6 +3246,40 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Copy cell / Option-cell provenance onto a single-assignment dest.
+    /// Multi-assigned dests stay out: the map is not a flow-state.
+    fn inherit_gc_mut_ref_provenance(&mut self, dest_local: usize, rvalue: &Rvalue) {
+        if self.multi_assigned_locals.contains(&dest_local) {
+            return;
+        }
+        match rvalue {
+            Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) => {
+                if let PlaceKind::Local(src_local) = src.kind {
+                    let src_local = src_local as usize;
+                    if self.gc_mut_ref_params.contains(&src_local) {
+                        self.gc_mut_ref_params.insert(dest_local);
+                    }
+                    if self.gc_mut_ref_option_params.contains(&src_local) {
+                        self.gc_mut_ref_option_params.insert(dest_local);
+                    }
+                }
+                if let Some(opt_local) = option_some_payload_local(src)
+                    && self.gc_mut_ref_option_params.contains(&opt_local)
+                {
+                    self.gc_mut_ref_params.insert(dest_local);
+                }
+            }
+            Rvalue::Ref { place, .. } => {
+                if let Some(cell) = deref_of_local(place)
+                    && self.gc_mut_ref_params.contains(&cell)
+                {
+                    self.gc_mut_ref_params.insert(dest_local);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub(in crate::front::mir) fn lower_assign(
         &mut self,
         mir_bb: usize,
@@ -3507,13 +3561,10 @@ impl<'a> Lowering<'a> {
                 }
                 // `let q = p` keeps the cell ABI. `gc_mut_ref_param_root`
                 // otherwise only names the original parameter local.
-                if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rvalue
-                    && !self.multi_assigned_locals.contains(&dest_local)
-                    && let PlaceKind::Local(src_local) = src.kind
-                    && self.gc_mut_ref_params.contains(&(src_local as usize))
-                {
-                    self.gc_mut_ref_params.insert(dest_local);
-                }
+                // An `Option<&mut T>` Some payload and a reborrow of a
+                // cell (`&mut *p`) inherit the same set; `_trace` unwraps
+                // `operr` that way (`executioncontext.py` `_trace`).
+                self.inherit_gc_mut_ref_provenance(dest_local, &rvalue);
                 // `_j = move _i` of a whole always-`Ok` local is the same
                 // payload, so `_j` keeps the constant tag its `expect` /
                 // `Discriminant` readers fold against (`with_roots!` returns
@@ -5018,6 +5069,65 @@ impl<'a> Lowering<'a> {
             self.block_list_view_conflict[row].insert(local_idx);
             self.block_entry_list_view_locals[row].remove(local_idx);
         }
+    }
+}
+
+/// `Some` payload of an `Option` place: field 0 of variant Some.
+///
+/// Charon spells that as `Field[1, 0]` on the Option, or `Downcast(1)`
+/// then `Field[null, 0]` (`if let Some(p) = opt`). A leading Deref
+/// covers `&Option`. Variant None (`Field[0, 0]`) is rejected.
+pub(in crate::front::mir) fn option_some_payload_local(place: &Place) -> Option<usize> {
+    let PlaceKind::Projection(inner, elem) = &place.kind else {
+        return None;
+    };
+    let field = elem.field_payload()?.as_array()?;
+    if field.len() != 2 || field[1].as_u64() != Some(0) {
+        return None;
+    }
+    if field[0].as_u64() == Some(0) {
+        return None;
+    }
+    if field[0].as_u64() == Some(1) {
+        return peel_option_base(inner, true);
+    }
+    if field[0].is_null() {
+        return peel_option_base(inner, false);
+    }
+    None
+}
+
+fn peel_option_base(place: &Place, mut saw_some: bool) -> Option<usize> {
+    let mut cur = place;
+    for _ in 0..8 {
+        match &cur.kind {
+            PlaceKind::Local(i) => return saw_some.then_some(*i as usize),
+            PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) if atom == "Deref" => {
+                cur = inner;
+            }
+            PlaceKind::Projection(inner, ProjectionElem::Tagged(v))
+                if v.get("Downcast").and_then(serde_json::Value::as_u64) == Some(1) =>
+            {
+                saw_some = true;
+                cur = inner;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// `*p` of a whole local `p`.
+pub(in crate::front::mir) fn deref_of_local(place: &Place) -> Option<usize> {
+    let PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) = &place.kind else {
+        return None;
+    };
+    if atom != "Deref" {
+        return None;
+    }
+    match &inner.kind {
+        PlaceKind::Local(i) => Some(*i as usize),
+        _ => None,
     }
 }
 

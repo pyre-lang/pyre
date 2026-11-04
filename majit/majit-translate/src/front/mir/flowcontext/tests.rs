@@ -11787,6 +11787,170 @@ fn mut_ref_cell_param_input_names_the_cell_unless_residual() {
     );
 }
 
+/// `Option<&mut T>` of a GC handle is an Option-cell source. Its Some
+/// payload local and a reborrow of that local join `gc_mut_ref_params`.
+/// `Option<&mut i64>` is not a source.
+#[test]
+fn gc_mut_ref_option_param_payload_and_reborrow_join_the_cell_set() {
+    use majit_charon_reader::ullbc::{Place, Rvalue};
+
+    let llbc = llbc_with_types("fixture", vec![option_enum(0)], vec![]);
+    let tomb = no_tombstoned_leaves();
+    let gc_struct_ids = std::collections::HashSet::new();
+    let raw_alloc = std::collections::HashSet::<String>::new();
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let pointee = serde_json::json!({"RawPtr": [{"Adt": {"id": 7}}, "Mut"]});
+    let mut_ref = serde_json::json!({"Ref": ["Erased", pointee.clone(), "Mut"]});
+    let option_ty = option_adt_node(0, mut_ref.clone());
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let mut_i64 = serde_json::json!({"Ref": ["Erased", i64_ty, "Mut"]});
+    let option_i64 = option_adt_node(0, mut_i64);
+    let unit = serde_json::json!({"Tuple": []});
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
+        serde_json::json!({
+            "index": index,
+            "name": name,
+            "span": span,
+            "ty": ty
+        })
+    };
+    let gc_locals: majit_charon_reader::ullbc::Locals = serde_json::from_value(serde_json::json!({
+        "arg_count": 1,
+        "locals": [
+            local(0, None, &unit),
+            local(1, Some("opt"), &option_ty),
+            local(2, Some("p"), &mut_ref),
+            local(3, Some("tmp"), &mut_ref)
+        ]
+    }))
+    .unwrap();
+    let option_cells = super::gc_mut_ref_option_param_locals(
+        &gc_locals,
+        &llbc,
+        tomb,
+        &gc_struct_ids,
+        false,
+        &raw_alloc,
+    );
+    assert!(
+        option_cells.contains(&1),
+        "Option<&mut GC-handle> is an Option-cell source"
+    );
+    let cells =
+        super::gc_mut_ref_param_locals(&gc_locals, &llbc, tomb, &gc_struct_ids, false, &raw_alloc);
+    assert!(
+        !cells.contains(&1),
+        "the Option parameter itself is not a cell"
+    );
+
+    let i64_locals: majit_charon_reader::ullbc::Locals =
+        serde_json::from_value(serde_json::json!({
+            "arg_count": 1,
+            "locals": [
+                local(0, None, &unit),
+                local(1, Some("opt"), &option_i64)
+            ]
+        }))
+        .unwrap();
+    let i64_option_cells = super::gc_mut_ref_option_param_locals(
+        &i64_locals,
+        &llbc,
+        tomb,
+        &gc_struct_ids,
+        false,
+        &raw_alloc,
+    );
+    assert!(
+        i64_option_cells.is_empty(),
+        "Option<&mut i64> is not a GC cell source"
+    );
+    let residual = super::gc_mut_ref_option_param_locals(
+        &gc_locals,
+        &llbc,
+        tomb,
+        &gc_struct_ids,
+        true,
+        &raw_alloc,
+    );
+    assert!(residual.is_empty());
+
+    let body: super::Unstructured = serde_json::from_value(serde_json::json!({
+        "span": span,
+        "locals": {
+            "arg_count": 1,
+            "locals": [
+                local(0, None, &unit),
+                local(1, Some("opt"), &option_ty),
+                local(2, Some("p"), &mut_ref),
+                local(3, Some("tmp"), &mut_ref)
+            ]
+        },
+        "body": [{
+            "statements": [],
+            "kind": "Regular",
+            "terminator": {"span": span, "kind": "Return"}
+        }]
+    }))
+    .unwrap();
+    let dont_look_inside = std::collections::HashSet::new();
+    let accum = super::AccumulatorFacts::build(&llbc, &body);
+    let mut lowering = super::Lowering::new(
+        &llbc,
+        "fixture::unwrap".into(),
+        &body,
+        crate::HostStaticAddrs::default(),
+        &[],
+        None,
+        &dont_look_inside,
+        tomb,
+        &gc_struct_ids,
+        super::no_immutable_fields(),
+        &raw_alloc,
+        &accum,
+        &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+        false,
+        false,
+    )
+    .unwrap();
+    assert!(lowering.gc_mut_ref_option_params.contains(&1));
+    assert!(!lowering.gc_mut_ref_params.contains(&1));
+
+    let opt_place = serde_json::json!({"kind": {"Local": 1}, "ty": option_ty});
+    let mut_place = serde_json::json!({"kind": {"Local": 2}, "ty": mut_ref});
+    let some_field = serde_json::json!({
+        "kind": {"Projection": [opt_place, {"Field": [1, 0]}]},
+        "ty": mut_ref
+    });
+    let p_dest: Place = serde_json::from_value(mut_place.clone()).unwrap();
+    let payload: Rvalue = serde_json::from_value(serde_json::json!({
+        "Use": [{"Read": some_field}, "No"]
+    }))
+    .unwrap();
+    let _ = lowering.lower_assign(0, p_dest, payload);
+    assert!(
+        lowering.gc_mut_ref_params.contains(&2),
+        "Some payload of an Option-cell param is a cell local"
+    );
+
+    let deref_p = serde_json::json!({
+        "kind": {"Projection": [mut_place, "Deref"]},
+        "ty": pointee
+    });
+    let tmp_dest: Place =
+        serde_json::from_value(serde_json::json!({"kind": {"Local": 3}, "ty": mut_ref})).unwrap();
+    let reborrow: Rvalue = serde_json::from_value(serde_json::json!({
+        "Ref": {"place": deref_p, "kind": "TwoPhaseMut", "ptr_metadata": null}
+    }))
+    .unwrap();
+    let _ = lowering.lower_assign(0, tmp_dest, reborrow);
+    assert!(
+        lowering.gc_mut_ref_params.contains(&3),
+        "TwoPhaseMut reborrow of a cell local stays a cell"
+    );
+}
+
 /// A residual callee — no body, or `dont_look_inside` — is not given a
 /// cell signature. The traced callee with the same `&mut` GC pointer is.
 #[test]
