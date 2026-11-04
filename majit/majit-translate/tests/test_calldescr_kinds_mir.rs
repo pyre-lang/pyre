@@ -11,12 +11,12 @@
 mod common;
 
 use common::{INTERPRETER_LLBC, OBJECT_LLBC, load_llbc};
+use common::{
+    build_semantic_program_from_llbcs_with_static_addrs_and_module_paths, lower_function,
+};
 use majit_charon_reader::Llbc;
 use majit_translate::{
     HostStaticAddrs,
-    front::mir::{
-        build_semantic_program_from_llbcs_with_static_addrs_and_module_paths, lower_function,
-    },
     model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType},
 };
 

@@ -8,9 +8,9 @@
 
 mod common;
 
+use common::build_semantic_program_from_llbcs_with_static_addrs_and_function_names;
 use common::{OBJECT_LLBC, load_llbc};
 use majit_translate::HostStaticAddrs;
-use majit_translate::front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names;
 use majit_translate::model::{CallTarget, OpKind};
 
 fn call_segments(target: &CallTarget) -> Option<&[String]> {

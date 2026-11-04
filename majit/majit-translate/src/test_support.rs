@@ -10,7 +10,8 @@ use std::sync::OnceLock;
 use majit_charon_reader::Llbc;
 
 use crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs;
-use crate::front::mir::LowerContext;
+use crate::front::mir::{LowerContext, LowerError, lower_fun_decl_with_static_addrs};
+use crate::model::FunctionGraph;
 use crate::runtime_names::artifacts;
 
 static STRUCT_REGISTRY_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
@@ -90,37 +91,209 @@ pub(crate) fn load_ullbc_if_present(path: &'static str) -> Option<&'static Llbc>
     Some(load_ullbc(path))
 }
 
-/// Derive [`LowerContext`] once per artefact in this test binary.
-///
-/// Mirrors `tests/common/mod.rs` `lower_context_for`. `LowerContext` is
-/// `Sync` so tests can park it in `OnceLock` (`front::mir::LowerContext`).
-pub(crate) fn lower_context_for(llbc: &'static Llbc) -> &'static LowerContext<'static> {
-    for path in [
-        artifacts::INTERPRETER_ULLBC,
-        artifacts::OBJECT_ULLBC,
-        artifacts::MODULE_ULLBC,
-        artifacts::JIT_ULLBC,
-        artifacts::MAJIT_RLIB_ULLBC,
-        artifacts::CHARON_CORPUS_ULLBC,
-    ] {
+const PRODUCTION_ULLBC_PATHS: &[&str] = &[
+    artifacts::INTERPRETER_ULLBC,
+    artifacts::OBJECT_ULLBC,
+    artifacts::MODULE_ULLBC,
+    artifacts::JIT_ULLBC,
+    artifacts::MAJIT_RLIB_ULLBC,
+    artifacts::CHARON_CORPUS_ULLBC,
+];
+
+fn as_production_llbc(llbc: &Llbc) -> Option<&'static Llbc> {
+    for path in PRODUCTION_ULLBC_PATHS {
         if let Some(loaded) = llbc_slot(path).get()
             && std::ptr::eq(llbc, loaded)
         {
-            return context_slot(path).get_or_init(|| {
-                if path.ends_with("pyre-interpreter.ullbc") || path.ends_with("pyre-module.ullbc") {
-                    LowerContext::new_with_dependency_raw_flavors(
-                        llbc,
-                        &harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(load_ullbc(
-                            artifacts::OBJECT_ULLBC,
-                        ))),
-                    )
-                } else {
-                    LowerContext::new(llbc)
-                }
-            });
+            return Some(loaded);
         }
     }
-    panic!("lower_context_for: llbc is not a production artefact from load_ullbc")
+    None
+}
+
+fn context_slot_for(llbc: &'static Llbc) -> &'static OnceLock<LowerContext<'static>> {
+    for path in PRODUCTION_ULLBC_PATHS {
+        if let Some(loaded) = llbc_slot(path).get()
+            && std::ptr::eq(llbc, loaded)
+        {
+            return context_slot(path);
+        }
+    }
+    panic!("llbc is not a production artefact from load_ullbc")
+}
+
+fn make_lower_context(llbc: &'static Llbc) -> LowerContext<'static> {
+    for path in PRODUCTION_ULLBC_PATHS {
+        if let Some(loaded) = llbc_slot(path).get()
+            && std::ptr::eq(llbc, loaded)
+        {
+            return if path.ends_with("pyre-interpreter.ullbc")
+                || path.ends_with("pyre-module.ullbc")
+            {
+                LowerContext::new_with_dependency_raw_flavors(
+                    llbc,
+                    &harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(load_ullbc(
+                        artifacts::OBJECT_ULLBC,
+                    ))),
+                )
+            } else {
+                LowerContext::new(llbc)
+            };
+        }
+    }
+    panic!("llbc is not a production artefact from load_ullbc")
+}
+
+fn cached_lower_context(llbc: &'static Llbc) -> &'static LowerContext<'static> {
+    context_slot_for(llbc)
+        .get()
+        .expect("ensure_link_baseline before reading the cached LowerContext")
+}
+
+/// Publish this artefact's own stack classification and `CodeFlags` once,
+/// then fill the cached [`LowerContext`]. Holds the write lock without
+/// restoring so the published baseline stays.
+pub(crate) fn ensure_link_baseline(llbc: &'static Llbc) {
+    let slot = context_slot_for(llbc);
+    if slot.get().is_some() {
+        return;
+    }
+    majit_charon_reader::with_llbc_link_write(std::iter::empty::<&Llbc>(), || {
+        if slot.get().is_some() {
+            return;
+        }
+        let _ = slot.get_or_init(|| make_lower_context(llbc));
+    });
+}
+
+/// `ensure_link_baseline` then the cached context, under the read lock.
+pub(crate) fn with_shared_lowering<R>(
+    llbc: &'static Llbc,
+    f: impl FnOnce(&'static LowerContext<'static>) -> R,
+) -> R {
+    ensure_link_baseline(llbc);
+    with_llbc_link_read(std::iter::once(llbc), || f(cached_lower_context(llbc)))
+}
+
+/// Shared artefacts use the cached context under the read lock; fixtures
+/// build a fresh [`LowerContext`].
+pub(crate) fn with_lowering<'a, R>(llbc: &'a Llbc, f: impl FnOnce(&LowerContext<'_>) -> R) -> R {
+    if let Some(shared) = as_production_llbc(llbc) {
+        with_shared_lowering(shared, |ctx| f(ctx))
+    } else {
+        let ctx = LowerContext::new(llbc);
+        f(&ctx)
+    }
+}
+
+pub(crate) fn with_llbc_link_write<'a, R>(
+    llbcs: impl IntoIterator<Item = &'a Llbc>,
+    f: impl FnOnce() -> R,
+) -> R {
+    majit_charon_reader::with_llbc_link_write(llbcs, f)
+}
+
+pub(crate) fn with_llbc_link_read<'a, R>(
+    llbcs: impl IntoIterator<Item = &'a Llbc>,
+    f: impl FnOnce() -> R,
+) -> R {
+    majit_charon_reader::with_llbc_link_read(llbcs, f)
+}
+
+/// Snapshot/restore shared artefacts under write. Fixtures run `f` as-is.
+pub(crate) fn with_shared_link_write<'a, R>(
+    llbcs: impl IntoIterator<Item = &'a Llbc>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let llbcs: Vec<&Llbc> = llbcs.into_iter().collect();
+    let shared: Vec<&'static Llbc> = llbcs
+        .iter()
+        .copied()
+        .filter_map(as_production_llbc)
+        .collect();
+    if shared.is_empty() {
+        f()
+    } else {
+        for llbc in &shared {
+            ensure_link_baseline(llbc);
+        }
+        with_llbc_link_write(shared, f)
+    }
+}
+
+pub(crate) fn lower_function<'a>(
+    llbc: &'a Llbc,
+    function_name: &str,
+) -> Result<FunctionGraph, LowerError> {
+    lower_function_with_static_addrs(llbc, function_name, crate::HostStaticAddrs::default())
+}
+
+pub(crate) fn lower_function_with_static_addrs<'a>(
+    llbc: &'a Llbc,
+    function_name: &str,
+    static_addrs: crate::HostStaticAddrs<'_>,
+) -> Result<FunctionGraph, LowerError> {
+    if let Some(shared) = as_production_llbc(llbc) {
+        with_shared_lowering(shared, |ctx| {
+            let fd = shared
+                .local_fn(function_name)
+                .ok_or_else(|| LowerError::FunctionNotFound(function_name.to_string()))?;
+            lower_fun_decl_with_static_addrs(ctx, fd, static_addrs)
+        })
+    } else {
+        crate::front::mir::lower_function_with_static_addrs(llbc, function_name, static_addrs)
+    }
+}
+
+pub(crate) fn build_semantic_program_from_llbc(
+    llbc: &Llbc,
+) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    with_shared_link_write(std::iter::once(llbc), || {
+        crate::front::mir::build_semantic_program_from_llbc(llbc)
+    })
+}
+
+pub(crate) fn build_semantic_program_from_llbcs(
+    llbcs: &[Llbc],
+) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    with_shared_link_write(llbcs.iter(), || {
+        crate::front::mir::build_semantic_program_from_llbcs(llbcs)
+    })
+}
+
+pub(crate) fn build_semantic_program_from_llbcs_with_static_addrs_and_function_names<
+    L: std::borrow::Borrow<Llbc>,
+>(
+    llbcs: &[L],
+    static_addrs: crate::HostStaticAddrs<'_>,
+    module_paths: &[&str],
+    function_names: &[&str],
+) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    with_shared_link_write(llbcs.iter().map(std::borrow::Borrow::borrow), || {
+        crate::front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+            llbcs,
+            static_addrs,
+            module_paths,
+            function_names,
+        )
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn build_semantic_program_from_llbcs_with_static_addrs_and_module_paths<
+    L: std::borrow::Borrow<Llbc>,
+>(
+    llbcs: &[L],
+    static_addrs: crate::HostStaticAddrs<'_>,
+    module_paths: &[&str],
+) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    with_shared_link_write(llbcs.iter().map(std::borrow::Borrow::borrow), || {
+        crate::front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
+            llbcs,
+            static_addrs,
+            module_paths,
+        )
+    })
 }
 
 pub(crate) fn corpus_ullbc() -> &'static Llbc {

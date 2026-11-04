@@ -671,8 +671,8 @@ fn real_stack_underflow_fmt_chain_collapses_to_str_concat() {
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    let graph =
-        super::lower_function(&llbc, "stack_underflow_error").expect("lower stack_underflow_error");
+    let graph = crate::test_support::lower_function(&llbc, "stack_underflow_error")
+        .expect("lower stack_underflow_error");
     let ops: Vec<_> = graph
         .blocks
         .iter()
@@ -743,7 +743,8 @@ fn arguments_from_str_nonconst_alias_real_constructor_args() {
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    let graph = super::lower_function(&llbc, "constructor_args").expect("lower constructor_args");
+    let graph = crate::test_support::lower_function(&llbc, "constructor_args")
+        .expect("lower constructor_args");
 
     let residual = graph
         .blocks
@@ -780,7 +781,7 @@ fn iter_next_fold_real_call_function_impl_result() {
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    let graph = super::lower_function(&llbc, "call_function_impl_result")
+    let graph = crate::test_support::lower_function(&llbc, "call_function_impl_result")
         .expect("lower call_function_impl_result");
 
     let count_call_leaf = |leaf: &[&str]| {
@@ -851,7 +852,7 @@ fn iter_next_fold_real_identity_null_niche() {
         "pyre_interpreter::display::py_repr_wtf8",
         "pyre_interpreter::baseobjspace::mutated",
     ] {
-        let graph = super::lower_function(&llbc, function)
+        let graph = crate::test_support::lower_function(&llbc, function)
             .unwrap_or_else(|e| panic!("lower {function}: {e}"));
         let count_call_leaf = |leaf: &[&str]| {
             graph
@@ -892,8 +893,8 @@ fn deque_index_reads_its_owner_without_a_fnonce_adapter() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
     let function = "pyre_interpreter::module::_collections::deque_index";
-    let graph =
-        super::lower_function(&llbc, function).unwrap_or_else(|e| panic!("lower {function}: {e}"));
+    let graph = crate::test_support::lower_function(&llbc, function)
+        .unwrap_or_else(|e| panic!("lower {function}: {e}"));
     assert_eq!(
         graph.block(graph.startblock).inputargs.len(),
         2,
@@ -940,7 +941,7 @@ fn memoryview_derivations_are_concrete_graphs() {
         "pyre_interpreter::builtins::w_memoryview_copy_derived",
         "pyre_interpreter::builtins::w_memoryview_readonly_derived",
     ] {
-        let graph = super::lower_function(&llbc, function)
+        let graph = crate::test_support::lower_function(&llbc, function)
             .unwrap_or_else(|e| panic!("lower {function}: {e}"));
         let calls: Vec<&[String]> = graph
             .blocks
@@ -981,7 +982,8 @@ fn pypyjitdriver_named_const_is_a_marker_receiver_constant() {
     use crate::model::{CallTarget, OpKind};
 
     let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::JIT_ULLBC);
-    let graph = super::lower_function(&llbc, "eval_loop_jit").expect("lower eval_loop_jit");
+    let graph =
+        crate::test_support::lower_function(&llbc, "eval_loop_jit").expect("lower eval_loop_jit");
     let driver_path = ["pyre_jit", "eval", "pypyjitdriver"];
 
     assert!(
@@ -1058,7 +1060,7 @@ fn bigint_i64_try_from_real_declines_u32_result() {
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    let graph = super::lower_function(&llbc, "char_arg").expect("lower char_arg");
+    let graph = crate::test_support::lower_function(&llbc, "char_arg").expect("lower char_arg");
 
     let calls: Vec<&[String]> = graph
         .blocks
@@ -1107,8 +1109,8 @@ fn i64_to_i32_try_from_real_sites_lower_to_checked_result() {
         ),
     ] {
         let llbc = crate::test_support::load_ullbc(path);
-        let graph =
-            super::lower_function(&llbc, fname).unwrap_or_else(|e| panic!("lower {fname}: {e:?}"));
+        let graph = crate::test_support::lower_function(&llbc, fname)
+            .unwrap_or_else(|e| panic!("lower {fname}: {e:?}"));
         assert!(
                 !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
                     matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
@@ -1150,7 +1152,7 @@ fn w_range_iter_i128_try_from_lowers_to_checked_result() {
     use crate::model::{CallTarget, OpKind};
 
     let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::OBJECT_ULLBC);
-    let graph = super::lower_function(&llbc, "w_range_iter")
+    let graph = crate::test_support::lower_function(&llbc, "w_range_iter")
         .unwrap_or_else(|e| panic!("lower w_range_iter: {e:?}"));
     assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
@@ -1189,7 +1191,8 @@ fn range_contains_lowers_as_method() {
     // `impl_method_owner` declines the Method hint for that shape, so
     // the call is a FunctionPath (`Bookkeeper.getdesc`).
     let llbc = range_contains_fixture();
-    let graph = super::lower_function(&llbc, "range_contains").expect("lower Range::contains");
+    let graph = crate::test_support::lower_function(&llbc, "range_contains")
+        .expect("lower Range::contains");
     let ops = graph_ops(&graph);
     assert!(
         ops.iter().any(|op| matches!(
@@ -1254,8 +1257,8 @@ fn fmt_collapse_long_literal_real_space_int() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
     for fname in ["space_int", "space_index"] {
-        let graph =
-            super::lower_function(&llbc, fname).unwrap_or_else(|e| panic!("lower {fname}: {e:?}"));
+        let graph = crate::test_support::lower_function(&llbc, fname)
+            .unwrap_or_else(|e| panic!("lower {fname}: {e:?}"));
         let fmt_calls = graph
             .blocks
             .iter()
@@ -1298,7 +1301,7 @@ fn vec_index_mut_fill_user_function_args_real() {
     use crate::model::{CallTarget, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    let graph = super::lower_function(&llbc, "fill_user_function_args")
+    let graph = crate::test_support::lower_function(&llbc, "fill_user_function_args")
         .expect("lower fill_user_function_args");
     let residual = graph
         .blocks
@@ -1344,7 +1347,7 @@ fn saturating_sub_generic_alias_real() {
     use crate::model::{CallTarget, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    let graph = super::lower_function(&llbc, "generic_alias_class_getitem")
+    let graph = crate::test_support::lower_function(&llbc, "generic_alias_class_getitem")
         .expect("lower generic_alias_class_getitem");
     let residual = graph
         .blocks
@@ -1396,7 +1399,8 @@ fn set_ref_set_locals_w_real() {
     use crate::model::{CallTarget, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    let graph = super::lower_function(&llbc, "set_locals_w").expect("lower set_locals_w");
+    let graph =
+        crate::test_support::lower_function(&llbc, "set_locals_w").expect("lower set_locals_w");
     let value_input_root = graph
         .blocks
         .iter()
@@ -1476,8 +1480,8 @@ fn we_are_jitted_lookup_in_type_where_real() {
     use crate::model::{CallTarget, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    let graph =
-        super::lower_function(&llbc, "lookup_in_type_where").expect("lower lookup_in_type_where");
+    let graph = crate::test_support::lower_function(&llbc, "lookup_in_type_where")
+        .expect("lower lookup_in_type_where");
     let we_are_jitted_residual = graph
         .blocks
         .iter()
@@ -1534,7 +1538,8 @@ fn call_intrinsic_1_debug_enum_fmt_real() {
     use crate::model::{CallTarget, ExitSwitch, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    let graph = super::lower_function(&llbc, "call_intrinsic_1").expect("lower call_intrinsic_1");
+    let graph = crate::test_support::lower_function(&llbc, "call_intrinsic_1")
+        .expect("lower call_intrinsic_1");
     let new_debug_residual = graph
         .blocks
         .iter()
@@ -1666,7 +1671,8 @@ fn niche_option_str_ne_lowers_to_string_binop() {
         }
     });
     let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("option-str fixture parses");
-    let graph = super::lower_function(&llbc, "cmp_option_str").expect("lower cmp_option_str");
+    let graph =
+        crate::test_support::lower_function(&llbc, "cmp_option_str").expect("lower cmp_option_str");
     let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
     assert_eq!(
         ops()
@@ -1706,8 +1712,11 @@ fn fieldless_enum_ne_fold_real_getattr_str_impl() {
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    let graph = super::lower_function(&llbc, "pyre_interpreter::baseobjspace::getattr_str_impl")
-        .expect("lower getattr_str_impl");
+    let graph = crate::test_support::lower_function(
+        &llbc,
+        "pyre_interpreter::baseobjspace::getattr_str_impl",
+    )
+    .expect("lower getattr_str_impl");
     let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
     assert_eq!(
         ops()
@@ -1740,7 +1749,7 @@ fn str_ne_fold_real_super_getattribute() {
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    let graph = super::lower_function(
+    let graph = crate::test_support::lower_function(
         &llbc,
         "pyre_interpreter::baseobjspace::super_getattribute_str",
     )
@@ -1790,8 +1799,8 @@ fn string_ref_eq_fold_real_is_w() {
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    let graph =
-        super::lower_function(&llbc, "pyre_interpreter::baseobjspace::is_w").expect("lower is_w");
+    let graph = crate::test_support::lower_function(&llbc, "pyre_interpreter::baseobjspace::is_w")
+        .expect("lower is_w");
     let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
     assert_eq!(
         ops()
@@ -1821,7 +1830,7 @@ fn niche_ptr_cmp_nonnull_ne_try_dispatch_binary_special() {
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    let graph = super::lower_function(
+    let graph = crate::test_support::lower_function(
         &llbc,
         "pyre_interpreter::objspace::descroperation::try_dispatch_binary_special",
     )
@@ -1862,8 +1871,9 @@ fn niche_ptr_cmp_option_ne_try_hash_value() {
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    let graph = super::lower_function(&llbc, "pyre_interpreter::builtins::try_hash_value")
-        .expect("lower try_hash_value");
+    let graph =
+        crate::test_support::lower_function(&llbc, "pyre_interpreter::builtins::try_hash_value")
+            .expect("lower try_hash_value");
     let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
     assert_eq!(
         ops()
@@ -1895,7 +1905,7 @@ fn niche_ptr_cmp_option_ref_stays_shutdown_module_private_name() {
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    let graph = super::lower_function(
+    let graph = crate::test_support::lower_function(
         &llbc,
         "pyre_interpreter::shutdown::shutdown_module_private_name",
     )
@@ -1934,8 +1944,8 @@ fn jit_constancy_probes_return_non_constant() {
     let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
     for probe in ["isconstant", "isvirtual"] {
-        let graph =
-            super::lower_function(&llbc, probe).unwrap_or_else(|e| panic!("lower {probe}: {e}"));
+        let graph = crate::test_support::lower_function(&llbc, probe)
+            .unwrap_or_else(|e| panic!("lower {probe}: {e}"));
         let non_constant_calls = graph
             .blocks
             .iter()
@@ -1971,7 +1981,8 @@ fn py_repr_wtf8_lifts_owned_wtf8buf_appends() {
         "/../../target/llbc/pyre-interpreter.ullbc"
     );
     let llbc = crate::test_support::load_ullbc(path);
-    let graph = super::lower_function(&llbc, "py_repr_wtf8").expect("lower py_repr_wtf8");
+    let graph =
+        crate::test_support::lower_function(&llbc, "py_repr_wtf8").expect("lower py_repr_wtf8");
     // Prove every append/build receiver is rooted at a builder ctor.
     // Start from every phi as a candidate and remove any phi fed by a
     // non-candidate; this greatest fixed point admits loop-carried
@@ -2121,7 +2132,7 @@ fn bind_kwargs_indexes_lower_to_array_reads() {
             .is_some_and(|values| values.iter().any(|hint| hint == "elidable")),
         "Signature.find_argname must retain PyPy's @jit.elidable marker"
     );
-    let graph = super::lower_function(&llbc, "parse_builtin_signature")
+    let graph = crate::test_support::lower_function(&llbc, "parse_builtin_signature")
         .expect("lower parse_builtin_signature");
 
     let residual_scalar_indexes: Vec<_> = graph
@@ -2245,7 +2256,7 @@ fn pypy_list_item_roots_have_no_residual_vec_index() {
     );
     let llbc = crate::test_support::load_ullbc(path);
     let residual_vec_indexes = |fname: &str| {
-        let graph = super::lower_function(&llbc, fname)
+        let graph = crate::test_support::lower_function(&llbc, fname)
             .unwrap_or_else(|err| panic!("lower {fname}: {err}"));
         graph
             .blocks
@@ -2303,7 +2314,7 @@ fn pypy_buffer_ranges_lower_to_getslice() {
     );
     let llbc = crate::test_support::load_ullbc(path);
     for fname in ["read_bytes", "parse_length_prefixed_protocols"] {
-        let graph = super::lower_function(&llbc, fname)
+        let graph = crate::test_support::lower_function(&llbc, fname)
             .unwrap_or_else(|err| panic!("lower {fname}: {err}"));
         assert!(
                 !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
@@ -2330,7 +2341,8 @@ fn check_len_result_uint_format_template_collapses() {
         "/../../target/llbc/pyre-interpreter.ullbc"
     );
     let llbc = crate::test_support::load_ullbc(path);
-    let graph = super::lower_function(&llbc, "_check_len_result").expect("lower _check_len_result");
+    let graph = crate::test_support::lower_function(&llbc, "_check_len_result")
+        .expect("lower _check_len_result");
     assert!(
         !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
             matches!(
@@ -2376,7 +2388,7 @@ fn deque_mutation_marker_uses_pypy_lock_identity_fields() {
         // the `RuntimeError` raise.
         "pyre_interpreter::module::_collections::lock_valid",
     ] {
-        let graph = super::lower_function(&llbc, name)
+        let graph = crate::test_support::lower_function(&llbc, name)
             .unwrap_or_else(|error| panic!("lower {name}: {error}"));
         assert!(
             !graph

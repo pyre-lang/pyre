@@ -8078,7 +8078,7 @@ mod tests {
         );
         let interpreter = crate::test_support::load_ullbc(interpreter_path);
         let object = crate::test_support::load_ullbc(object_path);
-        let program = crate::front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
             &[object, interpreter],
             crate::HostStaticAddrs::default(),
             &["pyframe"],
@@ -8136,7 +8136,7 @@ mod tests {
         let interpreter =
             crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
         let jit = crate::test_support::load_ullbc(crate::runtime_names::artifacts::JIT_ULLBC);
-        let program = crate::front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
             &[object, interpreter, jit],
             crate::HostStaticAddrs::default(),
             &["builtins"],

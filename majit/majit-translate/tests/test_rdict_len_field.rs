@@ -18,32 +18,21 @@
 //! table length are that header word, not `ll_vec_length` of the first
 //! storage word.
 
-use std::collections::HashSet;
-use std::sync::OnceLock;
+mod common;
 
-use majit_charon_reader::Llbc;
-use majit_translate::front::mir::{
-    LowerContext, build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
-    lower_fun_decl, lower_function,
+use std::collections::HashSet;
+
+use common::{
+    OBJECT_LLBC, build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
+    load_llbc_if_present, lower_function, with_shared_lowering,
 };
+use majit_charon_reader::Llbc;
+use majit_translate::front::mir::lower_fun_decl;
 use majit_translate::model::{CallTarget, FunctionGraph, OpKind};
 use majit_translate::{HostStaticAddrs, SemanticProgram};
 
-const OBJECT_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/llbc/pyre-object.ullbc"
-);
-
 fn object_llbc() -> Option<&'static Llbc> {
-    static LLBC: OnceLock<Option<Llbc>> = OnceLock::new();
-    LLBC.get_or_init(|| {
-        if !std::path::Path::new(OBJECT_LLBC).is_file() {
-            eprintln!("skipping: {OBJECT_LLBC} is missing; run `python3 scripts/extract-llbc.py`");
-            return None;
-        }
-        Some(Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc"))
-    })
-    .as_ref()
+    load_llbc_if_present(OBJECT_LLBC)
 }
 
 fn dump_if_requested(name: &str, graph: &FunctionGraph) {
@@ -185,43 +174,44 @@ fn identity_length_reads_num_live_items() {
     let Some(llbc) = object_llbc() else {
         return;
     };
-    let graph = lower_function(llbc, "identitydict::<Impl>::length")
-        .expect("lower identitydict::<Impl>::length");
-    dump_if_requested("identitydict_length", &graph);
-    let mut live_reads = 0usize;
-    let mut ll_vec_length = 0usize;
-    count_length_ops(&graph, &mut live_reads, &mut ll_vec_length);
-    let mut seen = HashSet::new();
-    let mut pending = callee_fun_decl_ids(&graph);
-    let context = LowerContext::new(llbc);
-    let mut dumps = vec![graph.dump()];
-    while let Some(id) = pending.pop() {
-        if !seen.insert(id) {
-            continue;
+    with_shared_lowering(llbc, |context| {
+        let graph = lower_function(llbc, "identitydict::<Impl>::length")
+            .expect("lower identitydict::<Impl>::length");
+        dump_if_requested("identitydict_length", &graph);
+        let mut live_reads = 0usize;
+        let mut ll_vec_length = 0usize;
+        count_length_ops(&graph, &mut live_reads, &mut ll_vec_length);
+        let mut seen = HashSet::new();
+        let mut pending = callee_fun_decl_ids(&graph);
+        let mut dumps = vec![graph.dump()];
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(fd) = llbc.fn_by_id(id) else {
+                continue;
+            };
+            let path = fd.item_meta.name_path();
+            if !(path.contains("rordereddict") || path.contains("identitydict")) {
+                continue;
+            }
+            let Ok(callee) = lower_fun_decl(context, fd) else {
+                continue;
+            };
+            count_length_ops(&callee, &mut live_reads, &mut ll_vec_length);
+            pending.extend(callee_fun_decl_ids(&callee));
+            dumps.push(callee.dump());
         }
-        let Some(fd) = llbc.fn_by_id(id) else {
-            continue;
-        };
-        let path = fd.item_meta.name_path();
-        if !(path.contains("rordereddict") || path.contains("identitydict")) {
-            continue;
-        }
-        let Ok(callee) = lower_fun_decl(&context, fd) else {
-            continue;
-        };
-        count_length_ops(&callee, &mut live_reads, &mut ll_vec_length);
-        pending.extend(callee_fun_decl_ids(&callee));
-        dumps.push(callee.dump());
-    }
-    let dump = dumps.join("\n--- callee ---\n");
-    assert!(
-        live_reads > 0,
-        "identity length must getfield num_live_items (`rordereddict.rtype_len`) somewhere in its call chain\n{dump}"
-    );
-    assert_eq!(
-        ll_vec_length, 0,
-        "identity length must not call ll_vec_length of the first storage word\n{dump}"
-    );
+        let dump = dumps.join("\n--- callee ---\n");
+        assert!(
+            live_reads > 0,
+            "identity length must getfield num_live_items (`rordereddict.rtype_len`) somewhere in its call chain\n{dump}"
+        );
+        assert_eq!(
+            ll_vec_length, 0,
+            "identity length must not call ll_vec_length of the first storage word\n{dump}"
+        );
+    });
 }
 
 #[test]
@@ -232,41 +222,42 @@ fn module_dict_len_reads_num_live_items() {
     // Storage `len` used to live on `ModuleDictStorage` (`celldict::<Impl>::len`).
     // That type is now `type ModuleDictStorage = RDict<…>`, so the module-dict
     // length that remains in `celldict` is `ModuleDictStrategy::length`.
-    let graph =
-        lower_function(llbc, "celldict::<Impl>::length").expect("lower celldict::<Impl>::length");
-    dump_if_requested("celldict_length", &graph);
-    let mut live_reads = 0usize;
-    let mut ll_vec_length = 0usize;
-    count_length_ops(&graph, &mut live_reads, &mut ll_vec_length);
-    let mut seen = HashSet::new();
-    let mut pending = callee_fun_decl_ids(&graph);
-    let context = LowerContext::new(llbc);
-    let mut dumps = vec![graph.dump()];
-    while let Some(id) = pending.pop() {
-        if !seen.insert(id) {
-            continue;
+    with_shared_lowering(llbc, |context| {
+        let graph = lower_function(llbc, "celldict::<Impl>::length")
+            .expect("lower celldict::<Impl>::length");
+        dump_if_requested("celldict_length", &graph);
+        let mut live_reads = 0usize;
+        let mut ll_vec_length = 0usize;
+        count_length_ops(&graph, &mut live_reads, &mut ll_vec_length);
+        let mut seen = HashSet::new();
+        let mut pending = callee_fun_decl_ids(&graph);
+        let mut dumps = vec![graph.dump()];
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(fd) = llbc.fn_by_id(id) else {
+                continue;
+            };
+            let path = fd.item_meta.name_path();
+            if !(path.contains("rordereddict") || path.contains("celldict")) {
+                continue;
+            }
+            let Ok(callee) = lower_fun_decl(context, fd) else {
+                continue;
+            };
+            count_length_ops(&callee, &mut live_reads, &mut ll_vec_length);
+            pending.extend(callee_fun_decl_ids(&callee));
+            dumps.push(callee.dump());
         }
-        let Some(fd) = llbc.fn_by_id(id) else {
-            continue;
-        };
-        let path = fd.item_meta.name_path();
-        if !(path.contains("rordereddict") || path.contains("celldict")) {
-            continue;
-        }
-        let Ok(callee) = lower_fun_decl(&context, fd) else {
-            continue;
-        };
-        count_length_ops(&callee, &mut live_reads, &mut ll_vec_length);
-        pending.extend(callee_fun_decl_ids(&callee));
-        dumps.push(callee.dump());
-    }
-    let dump = dumps.join("\n--- callee ---\n");
-    assert!(
-        live_reads > 0,
-        "module dict length must getfield num_live_items (`rordereddict.rtype_len`) somewhere in its call chain\n{dump}"
-    );
-    assert_eq!(
-        ll_vec_length, 0,
-        "module dict length must not call ll_vec_length of the first storage word\n{dump}"
-    );
+        let dump = dumps.join("\n--- callee ---\n");
+        assert!(
+            live_reads > 0,
+            "module dict length must getfield num_live_items (`rordereddict.rtype_len`) somewhere in its call chain\n{dump}"
+        );
+        assert_eq!(
+            ll_vec_length, 0,
+            "module dict length must not call ll_vec_length of the first storage word\n{dump}"
+        );
+    });
 }

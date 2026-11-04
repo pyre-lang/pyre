@@ -328,7 +328,7 @@ fn rust_vec_drop_of_definitely_init_vec_frees_at_the_drop() {
         super::vec_init_at_drop(&body, &llbc, 1, 1),
         super::VecInit::Init
     );
-    let graph = super::lower_function(&llbc, name).expect("lower drop_init_vec");
+    let graph = crate::test_support::lower_function(&llbc, name).expect("lower drop_init_vec");
     let leaves = owned_vec_leaves(&graph);
     assert!(owned_vec_has_alloc(&graph), "must allocate: {leaves:?}");
     assert!(
@@ -385,7 +385,8 @@ fn rust_vec_drop_after_move_into_call_does_not_free() {
         drop_term_is_goto(&body, &llbc, 2),
         "moved-out Drop becomes Goto"
     );
-    let graph = super::lower_function(&llbc, name).expect("lower drop_moved_into_call_vec");
+    let graph =
+        crate::test_support::lower_function(&llbc, name).expect("lower drop_moved_into_call_vec");
     let leaves = owned_vec_leaves(&graph);
     assert!(owned_vec_has_alloc(&graph), "must allocate: {leaves:?}");
     assert!(
@@ -469,7 +470,8 @@ fn rust_vec_drop_after_store_into_struct_does_not_free() {
         drop_term_is_goto(&body, &llbc, 2),
         "stored-into-struct Drop becomes Goto"
     );
-    let graph = super::lower_function(&llbc, name).expect("lower drop_stored_into_struct_vec");
+    let graph = crate::test_support::lower_function(&llbc, name)
+        .expect("lower drop_stored_into_struct_vec");
     let leaves = owned_vec_leaves(&graph);
     assert!(owned_vec_has_alloc(&graph), "must allocate: {leaves:?}");
     assert!(
@@ -540,7 +542,8 @@ fn rust_vec_drop_maybe_initialised_declines_without_free() {
         super::vec_init_at_drop(&body, &llbc, 4, 2),
         super::VecInit::Maybe
     );
-    let graph = super::lower_function(&llbc, name).expect("lower drop_maybe_init_vec");
+    let graph =
+        crate::test_support::lower_function(&llbc, name).expect("lower drop_maybe_init_vec");
     let leaves = owned_vec_leaves(&graph);
     assert!(owned_vec_has_alloc(&graph), "must allocate: {leaves:?}");
     assert!(

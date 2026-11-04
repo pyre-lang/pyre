@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{interpreter_llbc, lower_context_for};
+use common::{interpreter_llbc, with_shared_lowering};
 use majit_charon_reader::Llbc;
 use majit_translate::codewriter::call::CallControl;
 use majit_translate::codewriter::codewriter::CodeWriter;
@@ -50,8 +50,9 @@ fn lower_named(llbc: &Llbc, context: &LowerContext<'_>, leaf: &str) -> FunctionG
 /// when the artefact is absent so the tests degrade to a skip.
 fn lower_fast2locals() -> Option<FunctionGraph> {
     let llbc = interpreter_llbc()?;
-    let context = lower_context_for(llbc);
-    Some(lower_named(llbc, &context, "fast2locals"))
+    common::with_shared_lowering(llbc, |context| {
+        Some(lower_named(llbc, &context, "fast2locals"))
+    })
 }
 
 fn call_leafs(graph: &FunctionGraph) -> Vec<String> {
@@ -80,15 +81,16 @@ fn the_access_directly_marker_folds_out_of_the_type_lookup() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
-    let context = lower_context_for(llbc);
-    let graph = lower_named(llbc, &context, "typedef::type");
-    assert!(
-        call_leafs(&graph)
-            .iter()
-            .all(|leaf| leaf != "check_not_access_directly"),
-        "the marker must be aliased to its argument, got {:?}",
-        call_leafs(&graph)
-    );
+    common::with_shared_lowering(llbc, |context| {
+        let graph = lower_named(llbc, &context, "typedef::type");
+        assert!(
+            call_leafs(&graph)
+                .iter()
+                .all(|leaf| leaf != "check_not_access_directly"),
+            "the marker must be aliased to its argument, got {:?}",
+            call_leafs(&graph)
+        );
+    });
 }
 
 /// `GetSetProperty(PyFrame.fget_getdictscope)`: the wrapper carries the
@@ -99,38 +101,39 @@ fn f_locals_gateway_force_is_deleted_and_the_method_has_none() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
-    let context = lower_context_for(llbc);
-    let gateway = lower_named(
-        llbc,
-        &context,
-        "__majit_wrap_descr_typecheck_fget_getdictscope",
-    );
-    let method = lower_named(llbc, &context, "fget_getdictscope");
-    assert!(
-        call_leafs(&gateway)
-            .iter()
-            .any(|leaf| leaf == "jit_force_virtualizable"),
-        "gateway must spell the residual force as jit_force_virtualizable, got {:?}",
-        call_leafs(&gateway)
-    );
-    assert!(
-        call_leafs(&method)
-            .iter()
-            .all(|leaf| leaf != "jit_force_virtualizable"
-                && leaf != "force_frame"
-                && leaf != "force_frame_before_locals_read"),
-        "fget_getdictscope must match pyframe.py (no hand-placed force), got {:?}",
-        call_leafs(&method)
-    );
+    common::with_shared_lowering(llbc, |context| {
+        let gateway = lower_named(
+            llbc,
+            &context,
+            "__majit_wrap_descr_typecheck_fget_getdictscope",
+        );
+        let method = lower_named(llbc, &context, "fget_getdictscope");
+        assert!(
+            call_leafs(&gateway)
+                .iter()
+                .any(|leaf| leaf == "jit_force_virtualizable"),
+            "gateway must spell the residual force as jit_force_virtualizable, got {:?}",
+            call_leafs(&gateway)
+        );
+        assert!(
+            call_leafs(&method)
+                .iter()
+                .all(|leaf| leaf != "jit_force_virtualizable"
+                    && leaf != "force_frame"
+                    && leaf != "force_frame_before_locals_read"),
+            "fget_getdictscope must match pyframe.py (no hand-placed force), got {:?}",
+            call_leafs(&method)
+        );
 
-    let transformed = majit_translate::transform_graph(&gateway, &config());
-    assert!(
-        call_leafs(&transformed.graph)
-            .iter()
-            .all(|leaf| leaf != "jit_force_virtualizable"),
-        "rewrite_op_jit_force_virtualizable must delete the call, got {:?}",
-        call_leafs(&transformed.graph)
-    );
+        let transformed = majit_translate::transform_graph(&gateway, &config());
+        assert!(
+            call_leafs(&transformed.graph)
+                .iter()
+                .all(|leaf| leaf != "jit_force_virtualizable"),
+            "rewrite_op_jit_force_virtualizable must delete the call, got {:?}",
+            call_leafs(&transformed.graph)
+        );
+    });
 }
 
 /// Every frame getset whose body reaches a REDIRECTED field is an interp2app
@@ -149,37 +152,38 @@ fn every_redirected_frame_getter_carries_a_deletable_force() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
-    let context = lower_context_for(llbc);
-    for leaf in [
-        "__majit_wrap_descr_typecheck_get_w_globals",
-        "__majit_wrap_descr_typecheck_fget_f_lasti",
-        "__majit_wrap_descr_typecheck_fget_f_lineno",
-        "__majit_wrap_descr_typecheck_fset_f_lineno",
-        "__majit_wrap_descr_typecheck_fget_f_trace",
-        "__majit_wrap_descr_typecheck_fset_f_trace",
-        "__majit_wrap_descr_typecheck_fdel_f_trace",
-        "__majit_wrap_descr_typecheck_fget_f_trace_lines",
-        "__majit_wrap_descr_typecheck_fset_f_trace_lines",
-        "__majit_wrap_descr_typecheck_fget_f_trace_opcodes",
-        "__majit_wrap_descr_typecheck_fset_f_trace_opcodes",
-    ] {
-        let gateway = lower_named(llbc, &context, leaf);
-        let before = call_leafs(&gateway);
-        assert!(
-            before
-                .iter()
-                .any(|callee| callee == "jit_force_virtualizable"),
-            "{leaf} must retain the residual force in the interpreter graph, got {before:?}",
-        );
-        let transformed = majit_translate::transform_graph(&gateway, &config());
-        let after = call_leafs(&transformed.graph);
-        assert!(
-            after
-                .iter()
-                .all(|callee| callee != "jit_force_virtualizable"),
-            "{leaf}: rewrite_op_jit_force_virtualizable left the marker in jitcode: {after:?}",
-        );
-    }
+    common::with_shared_lowering(llbc, |context| {
+        for leaf in [
+            "__majit_wrap_descr_typecheck_get_w_globals",
+            "__majit_wrap_descr_typecheck_fget_f_lasti",
+            "__majit_wrap_descr_typecheck_fget_f_lineno",
+            "__majit_wrap_descr_typecheck_fset_f_lineno",
+            "__majit_wrap_descr_typecheck_fget_f_trace",
+            "__majit_wrap_descr_typecheck_fset_f_trace",
+            "__majit_wrap_descr_typecheck_fdel_f_trace",
+            "__majit_wrap_descr_typecheck_fget_f_trace_lines",
+            "__majit_wrap_descr_typecheck_fset_f_trace_lines",
+            "__majit_wrap_descr_typecheck_fget_f_trace_opcodes",
+            "__majit_wrap_descr_typecheck_fset_f_trace_opcodes",
+        ] {
+            let gateway = lower_named(llbc, &context, leaf);
+            let before = call_leafs(&gateway);
+            assert!(
+                before
+                    .iter()
+                    .any(|callee| callee == "jit_force_virtualizable"),
+                "{leaf} must retain the residual force in the interpreter graph, got {before:?}",
+            );
+            let transformed = majit_translate::transform_graph(&gateway, &config());
+            let after = call_leafs(&transformed.graph);
+            assert!(
+                after
+                    .iter()
+                    .all(|callee| callee != "jit_force_virtualizable"),
+                "{leaf}: rewrite_op_jit_force_virtualizable left the marker in jitcode: {after:?}",
+            );
+        }
+    });
 }
 
 /// The complement of [`every_redirected_frame_getter_carries_a_deletable_force`]:
@@ -201,23 +205,24 @@ fn the_gateways_outside_the_redirected_set_carry_no_force() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
-    let context = lower_context_for(llbc);
-    for leaf in [
-        "__majit_wrap_descr_typecheck_fget_f_code",
-        "__majit_wrap_descr_typecheck_fget_f_back",
-        "__majit_wrap_descr_typecheck_fget_f_builtins",
-        "__majit_wrap_descr_typecheck_get_generator",
-    ] {
-        let gateway = lower_named(llbc, &context, leaf);
-        let before = call_leafs(&gateway);
-        assert!(
-            before
-                .iter()
-                .all(|callee| callee != "jit_force_virtualizable"),
-            "{leaf} reads no field a trace can disagree about, so it must carry \
-             no force: {before:?}",
-        );
-    }
+    common::with_shared_lowering(llbc, |context| {
+        for leaf in [
+            "__majit_wrap_descr_typecheck_fget_f_code",
+            "__majit_wrap_descr_typecheck_fget_f_back",
+            "__majit_wrap_descr_typecheck_fget_f_builtins",
+            "__majit_wrap_descr_typecheck_get_generator",
+        ] {
+            let gateway = lower_named(llbc, &context, leaf);
+            let before = call_leafs(&gateway);
+            assert!(
+                before
+                    .iter()
+                    .all(|callee| callee != "jit_force_virtualizable"),
+                "{leaf} reads no field a trace can disagree about, so it must carry \
+                 no force: {before:?}",
+            );
+        }
+    });
 }
 
 /// The virtualizable configuration the production pipeline passes
@@ -301,7 +306,9 @@ fn fast2locals_assembles() {
     let cfg = config();
     let mut callcontrol = CallControl::new();
     let llbc = interpreter_llbc().expect("fast2locals_assembles already lowered from this LLBC");
-    callcontrol.set_struct_fields(lower_context_for(llbc).struct_field_registry());
+    callcontrol.set_struct_fields(with_shared_lowering(llbc, |ctx| {
+        ctx.struct_field_registry()
+    }));
     callcontrol.set_exc_pytype_rows(vec![(
         "interp_exceptions::EXC_STOPITERATION_TYPE".to_string(),
         1,

@@ -1116,8 +1116,8 @@ fn discover_foldable_const_lits_harvests_size_of_usize() {
             size_of_fun(1),
         ],
     );
-    let graph =
-        super::lower_function(&inline, "ptr_size").expect("lower size_of of *mut nominal ADT");
+    let graph = crate::test_support::lower_function(&inline, "ptr_size")
+        .expect("lower size_of of *mut nominal ADT");
     let word = crate::layout::target_word_size() as i64;
     assert!(
         graph
@@ -1146,8 +1146,8 @@ fn discover_foldable_const_lits_harvests_size_of_usize() {
             size_of_fun(1),
         ],
     );
-    let graph =
-        super::lower_function(&fat, "fat_ptr_size").expect("lower size_of of *mut Length ADT");
+    let graph = crate::test_support::lower_function(&fat, "fat_ptr_size")
+        .expect("lower size_of of *mut Length ADT");
     assert_eq!(
         nullary_calls_ending(&graph, "size_of"),
         1,
@@ -1255,7 +1255,8 @@ fn linked_foldable_const_lit_folds_foreign_composed_size_of() {
     );
     let llbcs = [defining, dependent];
     super::register_foldable_const_lits(Vec::new());
-    let unlinked = super::lower_function(&llbcs[1], "read_base").expect("unlinked lowers");
+    let unlinked =
+        crate::test_support::lower_function(&llbcs[1], "read_base").expect("unlinked lowers");
     assert!(
         folded_uints(&unlinked).is_empty(),
         "a Foreign size_of-arith const without a harvest must not fold: {unlinked:?}"
@@ -1267,7 +1268,7 @@ fn linked_foldable_const_lit_folds_foreign_composed_size_of() {
     );
 
     super::link_transparent_scalar_types(&llbcs);
-    let graph = super::lower_function(&llbcs[1], "read_base").expect("linked lowers");
+    let graph = crate::test_support::lower_function(&llbcs[1], "read_base").expect("linked lowers");
     let word = crate::layout::target_word_size() as u64;
     assert_eq!(folded_uints(&graph), vec![word * 2 + 1]);
     assert_eq!(
@@ -1314,7 +1315,8 @@ fn linked_foldable_const_lit_folds_foreign_global_to_literal() {
     );
     let llbcs = [defining, dependent];
     super::register_foldable_const_lits(Vec::new());
-    let unlinked = super::lower_function(&llbcs[1], "read_id").expect("unlinked lowers");
+    let unlinked =
+        crate::test_support::lower_function(&llbcs[1], "read_id").expect("unlinked lowers");
     assert!(
         folded_uints(&unlinked).is_empty(),
         "a Foreign const without a harvest must not fold: {unlinked:?}"
@@ -1326,7 +1328,7 @@ fn linked_foldable_const_lit_folds_foreign_global_to_literal() {
     );
 
     super::link_transparent_scalar_types(&llbcs);
-    let graph = super::lower_function(&llbcs[1], "read_id").expect("linked lowers");
+    let graph = crate::test_support::lower_function(&llbcs[1], "read_id").expect("linked lowers");
     assert_eq!(folded_uints(&graph), vec![185]);
     assert_eq!(
         nullary_calls_ending(&graph, "W_INT_USER_GC_TYPE_ID"),
@@ -1408,7 +1410,8 @@ fn linked_foldable_const_lit_local_body_wins_over_linked() {
         ]),
     );
     super::attach_foldable_const_lits(&local, &[("fixture::VALUE".into(), OpKind::ConstUInt(185))]);
-    let graph = super::lower_function(&local, "read_value").expect("local body lowers");
+    let graph =
+        crate::test_support::lower_function(&local, "read_value").expect("local body lowers");
     assert_eq!(folded_uints(&graph), vec![99]);
     assert_eq!(nullary_calls_ending(&graph, "VALUE"), 0);
 }
@@ -1449,8 +1452,8 @@ fn impl_associated_const_literal_is_not_shared_across_decl_ids() {
     );
     let llbcs = [a, b];
     super::link_transparent_scalar_types(&llbcs);
-    let ga = super::lower_function(&llbcs[0], "read_a").expect("a lowers");
-    let gb = super::lower_function(&llbcs[1], "read_b").expect("b lowers");
+    let ga = crate::test_support::lower_function(&llbcs[0], "read_a").expect("a lowers");
+    let gb = crate::test_support::lower_function(&llbcs[1], "read_b").expect("b lowers");
     assert_eq!(folded_uints(&ga), vec![1]);
     assert_eq!(folded_uints(&gb), vec![7]);
 }
@@ -1553,7 +1556,7 @@ fn opaque_f64_nan_global_read_folds_to_const_float() {
             named_const_global(1, &path, "", false, "NamedConst", 1)
         ]),
     );
-    let graph = super::lower_function(&artifact, "read_nan").expect("lower");
+    let graph = crate::test_support::lower_function(&artifact, "read_nan").expect("lower");
     let bits: Vec<u64> = graph
         .blocks
         .iter()
@@ -1669,10 +1672,12 @@ fn function_local_static_globals_resolve_through_disambiguated_keys() {
         refs: &refs,
         ..Default::default()
     };
-    let graph0 = super::lower_function_with_static_addrs(&artifact, "read_owner_0", addrs)
-        .expect("lower OWNER");
-    let graph1 = super::lower_function_with_static_addrs(&artifact, "read_owner_1", addrs)
-        .expect("lower OWNER#1");
+    let graph0 =
+        crate::test_support::lower_function_with_static_addrs(&artifact, "read_owner_0", addrs)
+            .expect("lower OWNER");
+    let graph1 =
+        crate::test_support::lower_function_with_static_addrs(&artifact, "read_owner_1", addrs)
+            .expect("lower OWNER#1");
     let addrs0: Vec<i64> = graph0
         .blocks
         .iter()

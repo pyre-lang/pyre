@@ -1,34 +1,22 @@
 //! `w_dict_lookup`'s `DictStrategy::getitem` reads `method_getitem` from
 //! the vtable word of `DictStrategyRef.imp`, not from the data pointer.
 
-use std::collections::HashSet;
-use std::sync::OnceLock;
+mod common;
 
+use std::collections::HashSet;
+
+use common::{OBJECT_LLBC, load_llbc_if_present, lower_function, with_shared_lowering};
 use majit_charon_reader::Llbc;
 use majit_translate::flowspace::model::Variable;
-use majit_translate::front::mir::lower_function;
 use majit_translate::model::{
     BlockId, CallTarget, ConcreteType, FunctionGraph, OpKind, SpaceOperation, ValueType,
     VecFieldPart,
 };
 
-const OBJECT_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/llbc/pyre-object.ullbc"
-);
-
 /// `None` means the artefact is absent. A checkout that has not extracted
 /// LLBC skips these tests instead of panicking on the missing file.
 fn object_llbc() -> Option<&'static Llbc> {
-    static LLBC: OnceLock<Option<Llbc>> = OnceLock::new();
-    LLBC.get_or_init(|| {
-        if !std::path::Path::new(OBJECT_LLBC).is_file() {
-            eprintln!("skipping: {OBJECT_LLBC} is missing; run `python3 scripts/extract-llbc.py`");
-            return None;
-        }
-        Some(Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc"))
-    })
-    .as_ref()
+    load_llbc_if_present(OBJECT_LLBC)
 }
 
 fn assert_vtable_reads(graph: &FunctionGraph, method_name: &str) {
@@ -192,9 +180,9 @@ fn w_dict_getitem_str_hashed_assembles_with_vtable_word() {
     let segments: Vec<String> = graph.name.split("::").map(str::to_string).collect();
     let path = majit_translate::CallPath::from_segments(segments);
     let mut callcontrol = majit_translate::codewriter::call::CallControl::new();
-    callcontrol.set_struct_fields(
-        majit_translate::front::mir::LowerContext::new(llbc).struct_field_registry(),
-    );
+    callcontrol.set_struct_fields(with_shared_lowering(llbc, |ctx| {
+        ctx.struct_field_registry()
+    }));
     callcontrol.register_function_graph(path.clone(), graph.clone());
     let mut codewriter = majit_translate::codewriter::codewriter::CodeWriter::new();
     let jitcode = std::sync::Arc::new(majit_translate::codewriter::jitcode::JitCode::new(
@@ -464,9 +452,9 @@ fn w_dict_len_indirect_call_receiver_kind_matches_zst_length_self() {
     let caller_path = majit_translate::CallPath::from_segments(caller_segments);
     let callee_path = majit_translate::CallPath::from_segments(callee_segments);
     let mut callcontrol = majit_translate::codewriter::call::CallControl::new();
-    callcontrol.set_struct_fields(
-        majit_translate::front::mir::LowerContext::new(llbc).struct_field_registry(),
-    );
+    callcontrol.set_struct_fields(with_shared_lowering(llbc, |ctx| {
+        ctx.struct_field_registry()
+    }));
     callcontrol.register_function_graph(caller_path.clone(), caller.clone());
     callcontrol.register_function_graph(callee_path.clone(), callee.clone());
     let cfg = majit_translate::GraphTransformConfig::default();

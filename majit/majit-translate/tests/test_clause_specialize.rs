@@ -7,13 +7,13 @@
 mod common;
 
 use common::{MODULE_LLBC, OBJECT_LLBC, load_llbc};
+use common::{
+    build_semantic_program_from_llbcs_with_static_addrs_and_function_names, lower_function,
+};
 use majit_charon_reader::Llbc;
 use majit_translate::{
     HostStaticAddrs,
     front::llbc_hints::harvest_hints_from_llbcs,
-    front::mir::{
-        build_semantic_program_from_llbcs_with_static_addrs_and_function_names, lower_function,
-    },
     model::{CallTarget, ConcreteType, FunctionGraph, OpKind, ValueType},
 };
 

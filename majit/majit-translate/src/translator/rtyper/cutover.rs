@@ -11944,8 +11944,8 @@ mod tests {
             ]));
 
         let llbc = raw_ptr_method_call_llbc();
-        let caller = crate::front::mir::lower_function(&llbc, "f").expect("lower f");
-        let mut method = crate::front::mir::lower_function(&llbc, "m").expect("lower m");
+        let caller = crate::test_support::lower_function(&llbc, "f").expect("lower f");
+        let mut method = crate::test_support::lower_function(&llbc, "m").expect("lower m");
         assert!(
             method.blocks.iter().any(|block| {
                 block.operations.iter().any(|op| {
@@ -15340,7 +15340,7 @@ mod tests {
             collect_atomic_load_llexternals, is_external_shaped_atomic_accessor,
         };
         let acquire = atomic_load_llbc(Some("Acquire"), true);
-        let decls = crate::front::mir::build_semantic_program_from_llbc(&acquire)
+        let decls = crate::test_support::build_semantic_program_from_llbc(&acquire)
             .expect("acquire fixture lowers")
             .atomic_load_decls;
         assert_eq!(decls.len(), 1);
@@ -15358,7 +15358,7 @@ mod tests {
         // An unlisted path whose body does not lower declares nothing: a
         // lowering failure is not an `llexternal` declaration.
         let pointer = atomic_load_llbc(Some("Acquire"), false);
-        let decls = crate::front::mir::build_semantic_program_from_llbc(&pointer)
+        let decls = crate::test_support::build_semantic_program_from_llbc(&pointer)
             .expect("pointer fixture lowers")
             .atomic_load_decls;
         assert!(decls.is_empty());
@@ -15366,7 +15366,7 @@ mod tests {
         // The path is declared an external whatever its body loads: an
         // `rffi.llexternal` is a declaration, not a lowering outcome.
         let relaxed = atomic_load_llbc(Some("Relaxed"), true);
-        let decls = crate::front::mir::build_semantic_program_from_llbc(&relaxed)
+        let decls = crate::test_support::build_semantic_program_from_llbc(&relaxed)
             .expect("relaxed fixture lowers")
             .atomic_load_decls;
         assert_eq!(decls.len(), 1);
@@ -15377,7 +15377,7 @@ mod tests {
     fn harvested_zero_arg_atomic_load_accessor_registers_as_extfunc_entry() {
         use crate::annotator::model::SomeValue;
         let acquire = atomic_load_llbc(Some("Acquire"), true);
-        let decls = crate::front::mir::build_semantic_program_from_llbc(&acquire)
+        let decls = crate::test_support::build_semantic_program_from_llbc(&acquire)
             .expect("acquire fixture lowers")
             .atomic_load_decls;
         let registry = std::rc::Rc::new(CallRegistry::new(std::rc::Rc::new(
@@ -15439,7 +15439,7 @@ mod tests {
         use crate::codewriter::type_state::ConcreteType;
         use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
         let acquire = atomic_load_llbc(Some("Acquire"), true);
-        let decls = crate::front::mir::build_semantic_program_from_llbc(&acquire)
+        let decls = crate::test_support::build_semantic_program_from_llbc(&acquire)
             .expect("acquire fixture lowers")
             .atomic_load_decls;
         let registry = std::rc::Rc::new(CallRegistry::new(std::rc::Rc::new(

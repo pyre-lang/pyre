@@ -2110,7 +2110,7 @@ mod tests {
     #[test]
     #[ignore]
     fn four_from_size_align_callers_have_no_residual() {
-        use crate::front::mir::lower_function;
+        use crate::test_support::lower_function;
 
         let object = crate::test_support::load_ullbc(crate::runtime_names::artifacts::OBJECT_ULLBC);
         let rlib =
