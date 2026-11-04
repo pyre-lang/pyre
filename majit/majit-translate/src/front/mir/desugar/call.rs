@@ -1017,6 +1017,13 @@ impl<'a> Lowering<'a> {
                 }
             }
         }
+        // FunDecl id of a Regular callee, captured before `call.func`
+        // is moved into the match. Gate A stamps `FUNC.RESULT` of
+        // `&*p.add(i)` as `Ptr(Interior)` (`InteriorPtrRepr.lowleveltype`).
+        let callee_fun_decl_id = match &call.func {
+            CallFunc::Regular(reg) => regular_call_fun_decl_id(&reg.kind),
+            _ => None,
+        };
         let op_kind = match (class, call.func) {
             (CallClass::Direct | CallClass::Trait, CallFunc::Regular(_))
                 if let Some(kind) = vec_extend_kind =>
@@ -2289,6 +2296,36 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                // Gate A: escaped `&*p.add(i)` / `&mut *p.add(i)` of a
+                // GcArray struct pointee is `PtrRepr.rtype_getitem`'s
+                // InteriorPtr arm (`rptr.py`): malloc Interior + setfield
+                // ptr + setfield index (`lltype.py`
+                // `Ptr._interior_ptr_type_with_index`).
+                if self.try_lower_interior_ptr_add(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    &arg_locals,
+                    first_arg_ty.as_ref(),
+                    dest_local,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                // Gate B add: `ptr::write(p.add(i), S{..})` records the
+                // GcArray header so the write emits `setinteriorfield`s
+                // (`rordereddict.py` `_ll_dict_setitem_lookup_done`).
+                if self.try_lower_struct_write_ptr_add(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    &arg_locals,
+                    first_arg_ty.as_ref(),
+                    dest_local,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 // Copy-struct `<[T]>::get(s, i)` used only as `get(i)?.field`
                 // is `ll_getitem_nonneg` + `getinteriorfield`. The Option
                 // dest stays a bounds bool, never a tagged aggregate.
@@ -2434,6 +2471,20 @@ impl<'a> Lowering<'a> {
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // Gate B write: `core::ptr::write(p.add(i), S{..})` as one
+                // `setinteriorfield` per field (`rordereddict.py`
+                // `_ll_dict_setitem_lookup_done`).
+                if self.try_lower_interior_aggregate_ptr_write(
+                    mir_bb,
+                    &reg,
+                    &arg_locals,
+                    &arg_operands,
+                    second_arg_ty.as_ref(),
+                    dest_local,
+                    target,
+                )? {
                     return Ok(());
                 }
                 // `core::ptr::write` of a Copy scalar or thin pointer is a
@@ -4110,8 +4161,12 @@ impl<'a> Lowering<'a> {
                     } else if dest_is_ref
                         && let Some((base, offset)) =
                             self.taken_array_field_address(bb_id, &args[0], Some(&call.dest.ty))?
-                        && let Some(root) =
-                            tyref_class_root_with(&call.dest.ty, self.llbc, self.tombstoned_leaves)
+                        && tyref_class_root_with(
+                            &call.dest.ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                        )
+                        .is_some()
                     {
                         // `addr_of_mut!((*header).items).cast()` is
                         // `direct_arrayitems` (`lltype.py`). The inlined
@@ -8530,6 +8585,29 @@ impl<'a> Lowering<'a> {
         if result_var.concretetype().is_none() {
             stamp_rust_vec_header(&result_var, &call.dest.ty, self.llbc);
         }
+        // Caller of `&*p.add(i)` (`entry_at`): FUNC.RESULT is
+        // `Ptr(Interior)` so `e.f_hash` / `e.key` lower through
+        // `InteriorPtrRepr.rtype_getattr` (`rptr.py`). Decided by the
+        // callee body's Gate A shape, never by function name.
+        // `RDict::entry_ptr` is the items pointer at index 0: callers
+        // `entry_ptr().add(slot)` recover the `entries` header
+        // (`header_producer` / `InteriorHeader::Entries`). Stamping
+        // that dest InteriorPtr would hide the header from Gate A.
+        // A method call is `CallKind::Trait` in MIR (`regular_call_fun_decl_id`
+        // is None); the resolved FunDecl id is on the Call target.
+        let interior_callee_id = callee_fun_decl_id.or_else(|| match &op_kind {
+            OpKind::Call { target, .. } => target.fun_decl_id(),
+            _ => None,
+        });
+        if result_var.concretetype().is_none()
+            && let Some(id) = interior_callee_id
+            && let Some(fd) = self.llbc.fn_by_id(id)
+            && let Some(array_type_id) =
+                callee_returns_interior_array_type_id(fd, self.llbc, self.tombstoned_leaves)
+            && let Some(ip_ty) = interior_ptr_lltype(&array_type_id)
+        {
+            result_var.set_concretetype(Some(ip_ty));
+        }
         // A Ref-banked items-block result (`rlist.py` `ll_items`) keeps
         // the `tyref_to_value_type_with` record; CCHARP is Int-banked.
         // Result-of-carrier dest is the Ok payload after rewire
@@ -9916,21 +9994,35 @@ impl<'a> Lowering<'a> {
         // `do_fixed_list_ll_arraycopy` reads the dest ARRAY, and without
         // it the residual `OS_ARRAYCOPY` lands on
         // `WriteAnalyzer.top_result` (`EF_RANDOM_EFFECTS`).
+        //
+        // `InteriorPtrRepr.lowleveltype` is `Ptr(Interior)`, not the
+        // Entry class (`rptr.py`). Recasting the Gate A result to Entry
+        // allocates a new Variable without the `interior_ptr_type` hint,
+        // so the caller's `e.f_hash` / `e.key` miss
+        // `InteriorPtrRepr.rtype_getattr` and `getfield` the 2-word
+        // Interior as if it were ENTRY.
         if !dest_is_cell && let Some(root) = recast_result_root {
             let root = if crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
                 "GCREF".to_string()
             } else {
                 root
             };
-            let narrowed = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            copy_concretetype(&result_var, &narrowed);
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(narrowed.clone()),
-                kind: crate::model::cast_instance_call(root, result_var.clone()),
-            });
-            self.local_var[dest_local] = Some(LocalValue::One(narrowed));
+            let interior = result_var
+                .concretetype()
+                .as_ref()
+                .and_then(array_type_id_from_interior_lltype)
+                .is_some();
+            if !interior {
+                let narrowed = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                copy_concretetype(&result_var, &narrowed);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(narrowed.clone()),
+                    kind: crate::model::cast_instance_call(root, result_var.clone()),
+                });
+                self.local_var[dest_local] = Some(LocalValue::One(narrowed));
+            }
         }
         // `from_raw_parts{,_mut}` of a pointer slice returns the data
         // address. `getkind` of that raw word is `int`, while every

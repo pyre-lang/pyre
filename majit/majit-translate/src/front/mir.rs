@@ -3476,6 +3476,13 @@ impl CrateLoweringState {
             gc_struct_ids,
             &tombstoned_leaves,
         );
+        register_interior_ptr_type(
+            &mut known_struct_names,
+            &mut struct_fields,
+            &mut struct_field_attrs,
+            &mut exact_layouts,
+            &mut struct_ids,
+        );
 
         // Pass 2 paints each ADT as its bare leaf. A leaf `harden` withdrew
         // (`eval::Code` beside `module::struct::Code`) is not a class: the
@@ -4972,45 +4979,72 @@ impl SemanticFunctionHeader {
         // A clause-spec copy may substitute a signature whose output
         // no longer looks like the empty-tuple ADT; the FunDecl's own
         // output is still unit. Either one is `FUNC.RESULT = void`.
-        let return_type =
-            if is_unit_type(&signature.output, llbc) || is_unit_type(&fd.signature.output, llbc) {
-                Some("()".to_string())
-            } else if stamp_return_token {
-                signature_token
-            } else if signature_token.as_deref().is_some_and(scalar_result_token)
-                && !output_is_raw_address_word(
-                    &signature.output,
-                    llbc,
-                    error_carrier,
-                    gc_struct_ids,
-                    raw_alloc_flavor_structs,
-                )
-            {
-                signature_token
-            } else if signature_token.as_deref()
-                == Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE)
-            {
-                signature_token
-            } else if signature_token
-                .as_deref()
-                .is_some_and(|s| s.starts_with("raw:") && s.len() > 4)
-            {
-                // `history.py` `getkind` of a raw `Ptr` is `'int'`. Stamp
-                // FUNC.RESULT on look-inside graphs too (`call.py`
-                // `RESULT == FUNC.RESULT`) so a frontend Ref dest rewrites
-                // to `inline_call_*_i`.
-                signature_token
-            } else {
-                None
-            };
-        let return_class_root = dont_look_inside_return_class_root(
-            &signature.output,
-            llbc,
-            error_carrier,
-            tombstoned_leaves,
-            gc_struct_ids,
-            raw_alloc_flavor_structs,
-        );
+        // An InteriorPtr return (`rptr.py` `InteriorPtrRepr`;
+        // `history.getkind` of `Ptr(Interior)` of a GcArray) is `'ref'`.
+        // The signature is `*mut Entry` / `&Entry`; the pointee
+        // declaration would stamp `'i'` (`gc_array_item_struct_ptr_owner_root`,
+        // `by_value_payload_annotation`). Body lowering is Gate A
+        // (`callee_returns_interior_array_type_id`) or
+        // `RDict::entry_ptr` (`path_is_rordereddict_entry_ptr`).
+        let interior_ptr_result =
+            fun_decl_result_is_interior_ptr(fd, &signature.output, llbc, tombstoned_leaves);
+        let return_type = if interior_ptr_result {
+            Some("ref".to_string())
+        } else if is_unit_type(&signature.output, llbc) || is_unit_type(&fd.signature.output, llbc) {
+            Some("()".to_string())
+        } else if stamp_return_token {
+            signature_token
+        } else if signature_token.as_deref().is_some_and(scalar_result_token)
+            && !output_is_raw_address_word(
+                &signature.output,
+                llbc,
+                error_carrier,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            )
+        {
+            signature_token
+        } else if signature_token.as_deref()
+            == Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE)
+        {
+            signature_token
+        } else if signature_token
+            .as_deref()
+            .is_some_and(|s| s.starts_with("raw:") && s.len() > 4)
+        {
+            // `history.py` `getkind` of a raw `Ptr` is `'int'`. Stamp
+            // FUNC.RESULT on look-inside graphs too (`call.py`
+            // `RESULT == FUNC.RESULT`) so a frontend Ref dest rewrites
+            // to `inline_call_*_i`.
+            signature_token
+        } else if gc_array_item_struct_ptr_owner_root(&signature.output, llbc, gc_struct_ids)
+            .is_some()
+        {
+            // CFG of `direct_arrayitems` is int (`jtransform.py`
+            // `rewrite_op_direct_ptradd` → `int_return`). Stamp
+            // `FUNC.RESULT` so a looked-inside caller does not emit
+            // `inline_call_r_r` against that `int_return`.
+            signature_token
+        } else {
+            None
+        };
+        let residual_return_type = if interior_ptr_result {
+            Some("ref".to_string())
+        } else {
+            residual_return_type
+        };
+        let return_class_root = if interior_ptr_result {
+            None
+        } else {
+            dont_look_inside_return_class_root(
+                &signature.output,
+                llbc,
+                error_carrier,
+                tombstoned_leaves,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            )
+        };
         let return_can_be_none = dont_look_inside_return_can_be_none(
             &signature.output,
             llbc,
@@ -5846,6 +5880,115 @@ pub(crate) fn type_spelling_is_typed_items_block(spelling: &str) -> bool {
 /// stripped (so the value matches the runtime def-path convention).
 /// `struct_field_attrs` maps the crate-stripped qualified struct name to
 /// its declaration-ordered `(field, ValueType)` register classes.
+/// `lltype.py` `Ptr._interior_ptr_type_with_index`: the translator-minted
+/// `GcStruct("Interior", ptr, index, hints={'interior_ptr_type': True})`.
+/// Assembler `OpKind::New { owner: "Interior" }` needs this Size descr.
+fn register_interior_ptr_type(
+    known_struct_names: &mut std::collections::HashSet<String>,
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    struct_field_attrs: &mut std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    exact_layouts: &mut std::collections::HashMap<
+        majit_ir::descr::StructId,
+        crate::front::semantic::ExactLayout,
+    >,
+    struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+) {
+    let rows = vec![
+        crate::front::semantic::FieldRow::named("ptr", "GCREF"),
+        crate::front::semantic::FieldRow::named("index", "i64"),
+    ];
+    struct_fields.fields.insert("Interior".to_string(), rows);
+    known_struct_names.insert("Interior".to_string());
+    let sid = majit_ir::descr::StructId::from_canonical("Interior");
+    record_struct_id(
+        struct_ids,
+        &mut struct_fields.class_identity,
+        "Interior".to_string(),
+        sid,
+        "Interior",
+    );
+    struct_field_attrs.insert(
+        "Interior".to_string(),
+        vec![
+            ("ptr".to_string(), ValueType::Ref(None)),
+            ("index".to_string(), ValueType::Int),
+        ],
+    );
+    let word = crate::layout::target_word_size() as u64;
+    let mut field_offsets = std::collections::HashMap::new();
+    field_offsets.insert("ptr".to_string(), 0);
+    field_offsets.insert("index".to_string(), word);
+    exact_layouts.insert(
+        sid,
+        crate::front::semantic::ExactLayout {
+            size: Some(2 * word),
+            align: Some(word),
+            field_offsets,
+            host: None,
+        },
+    );
+    intern_interior_ptr_size_descr();
+}
+
+/// `descr.py` `get_size_descr` + `gc.py` `GcLLDescr_framework.init_size_descr`
+/// for the translator-minted Interior GcStruct.
+///
+/// `make_simple_descr_group_keyed_with_headerless` is the declared-group
+/// mint: it interns `_cache_size[LLType::Struct(path_hash("Interior"))]`
+/// and `_cache_field` the same way a W_* group is published, then
+/// `register_keyed_size` runs `init_size_descr`. Assembler
+/// `OpKind::New { owner: "Interior" }` / `BhDescr::resolve_gc_tid` look
+/// that key up.
+fn intern_interior_ptr_size_descr() {
+    let word = crate::layout::target_word_size();
+    let cache_key = majit_ir::descr::path_hash("Interior");
+    let specs = [
+        majit_ir::descr::SimpleFieldDescrSpec {
+            index: u32::MAX,
+            field_key: "ptr".to_string(),
+            name: "Interior.ptr".to_string(),
+            offset: 0,
+            field_size: word,
+            field_type: majit_ir::Type::Ref,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            flag: majit_ir::ArrayFlag::Pointer,
+            virtualizable: false,
+            index_in_parent: 0,
+            is_class_word: Some(false),
+            load_is_acquire: false,
+            store_is_release: false,
+        },
+        majit_ir::descr::SimpleFieldDescrSpec {
+            index: u32::MAX,
+            field_key: "index".to_string(),
+            name: "Interior.index".to_string(),
+            offset: word,
+            field_size: word,
+            field_type: majit_ir::Type::Int,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            flag: majit_ir::ArrayFlag::Signed,
+            virtualizable: false,
+            index_in_parent: 1,
+            is_class_word: Some(false),
+            load_is_acquire: false,
+            store_is_release: false,
+        },
+    ];
+    let _group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+        u32::MAX,
+        2 * word,
+        0,
+        cache_key,
+        0,
+        true,
+        false,
+        &specs,
+        &[],
+    );
+}
+
 /// Record a `name → StructId` mapping in the resolver table, collapsing
 /// to `None` (ambiguous) if the same name already mapped to a different
 /// identity — i.e. two distinct type definitions share that spelling
@@ -8166,6 +8309,14 @@ fn derive_program_metadata(
             },
         );
     }
+
+    register_interior_ptr_type(
+        &mut known_struct_names,
+        &mut struct_fields,
+        &mut struct_field_attrs,
+        &mut exact_layouts,
+        &mut struct_ids,
+    );
 
     // Opaque TypeDecls are declared ADTs (`lltype.py` `OpaqueType` /
     // `Struct._first_struct`). Harvest them after the named field-row

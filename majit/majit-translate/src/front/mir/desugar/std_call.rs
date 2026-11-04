@@ -894,6 +894,48 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// Item `lltype` whose `sizeof` is the dest pointee, so
+    /// `rewrite_op_direct_ptradd` can read `TO.OF`. `direct_arrayitems`
+    /// (`lltype.py`) returns `_subarray` of `FixedSizeArray(ITEM, 1)`,
+    /// always raw; `history.py` `getkind` of that `Ptr` is `'int'`.
+    pub(in crate::front::mir) fn array_tail_item_lltype(
+        &self,
+        dest_ty: &TyRef,
+    ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+        tyref_peel_one_raw_ptr_node(dest_ty, self.llbc)
+            .or_else(|| tyref_peel_one_ref_node(dest_ty, self.llbc))
+            .or_else(|| {
+                tyref_node(dest_ty, self.llbc)
+                    .and_then(|node| strip_ty_indirections(node, self.llbc))
+            })
+            .and_then(|node| json_ty_byte_size(node, self.llbc))
+            .map(item_lltype_for_size)
+            .unwrap_or(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed)
+    }
+
+    /// `Ptr(lltype.Struct)` is raw even when the struct contains GC
+    /// fields (`TO._gckind == 'raw'`; only `GcStruct` is gc).
+    /// `null_mut` of that pointer is `lltype.nullptr` (`rbuiltin.py`
+    /// `rtype_null_raw`), the same int-kind word
+    /// [`Self::emit_array_tail_item_ptr`] returns for `direct_arrayitems`.
+    ///
+    /// Only a struct that is the element of a `[T; N]` field on a
+    /// declared GC array (`GcEntries.items: [Entry; 0]`,
+    /// `lltype.py` `GcArray`) is that item pointer. A vtable /
+    /// `OBJECT_VTABLE` (`PyType`) and rstr `STR` (`Utf8Str`) also lack
+    /// a `GcType` impl, but they are not array items: their `null_mut`
+    /// stays a GC/STR ref so it can join `(*obj).ob_type` /
+    /// `_ll_stringslice` (`history.py` `getkind` of `Ptr(GcStruct)` is
+    /// `'ref'`). Recasting those as a raw `CArrayPtr` emitted
+    /// `int_copy/c>r` (`ConstInt(0)` into a Ref register).
+    pub(in crate::front::mir) fn non_gc_struct_raw_ptr_item_lltype(
+        &self,
+        dest_ty: &TyRef,
+    ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+        gc_array_item_struct_ptr_owner_root(dest_ty, self.llbc, self.gc_struct_ids)
+            .map(|_| self.array_tail_item_lltype(dest_ty))
+    }
+
     /// `direct_arrayitems` (`lltype.py`) as `cast_ptr_to_int` + add +
     /// `cast_int_to_ptr`. The integer is not recorded in
     /// `cast_ptr_to_int_src`: the round-trip fold would drop `offset`.
@@ -6939,6 +6981,30 @@ impl<'a> Lowering<'a> {
             || self
                 .typed_items_elem_ptr_add(reg, args_len, arg_locals, first_arg_ty, dest_local)
                 .is_some()
+            || struct_reborrow_ptr_add_trace(
+                reg,
+                args_len,
+                arg_locals.first().copied().flatten(),
+                first_arg_ty,
+                arg_locals.get(1).copied().flatten(),
+                dest_local,
+                self.body,
+                self.llbc,
+                self.tombstoned_leaves,
+            )
+            .is_some()
+            || struct_write_ptr_add_trace(
+                reg,
+                args_len,
+                arg_locals.first().copied().flatten(),
+                first_arg_ty,
+                arg_locals.get(1).copied().flatten(),
+                dest_local,
+                self.body,
+                self.llbc,
+                self.tombstoned_leaves,
+            )
+            .is_some()
         // `u8_slice_elem_ptr_add` also matches a STR-view `as_ptr().add`.
         // `try_lower_byte_view_ptr_add` plants `__string_byte_getitem` on
         // the STR (`ll_stritem_nonneg`); that intercept must win so the
