@@ -956,7 +956,7 @@ impl FieldPathIndex {
     }
 }
 
-fn is_path_suffix(longer: &str, shorter: &str) -> bool {
+pub(crate) fn is_path_suffix(longer: &str, shorter: &str) -> bool {
     if longer.len() <= shorter.len() || !longer.ends_with(shorter) {
         return false;
     }

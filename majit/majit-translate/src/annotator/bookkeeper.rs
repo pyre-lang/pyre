@@ -1480,9 +1480,8 @@ impl Bookkeeper {
     /// prologue so a later `intern_class_by_qualname` header walk cannot
     /// freeze a different base.
     pub fn set_exception_carrier(&self, carrier_path: &str) {
-        *self.exception_carrier.borrow_mut() = (!carrier_path.is_empty()).then(|| {
-            majit_ir::descr::canonical_struct_name(&normalize_class_qualname(carrier_path))
-        });
+        *self.exception_carrier.borrow_mut() =
+            (!carrier_path.is_empty()).then(|| self.intern_class_key(carrier_path));
     }
 
     /// Intern the transparent handle as a subclass of the object class.
@@ -1496,8 +1495,7 @@ impl Bookkeeper {
         if handle_path.is_empty() {
             return;
         }
-        let handle_key =
-            majit_ir::descr::canonical_struct_name(&normalize_class_qualname(handle_path));
+        let handle_key = self.intern_class_key(handle_path);
         let Some(class_host) = self.exception_carrier_class() else {
             return;
         };
@@ -1518,7 +1516,7 @@ impl Bookkeeper {
     }
 
     pub(crate) fn exception_carrier_handle_key(&self, root: &str) -> bool {
-        let key = majit_ir::descr::canonical_struct_name(&normalize_class_qualname(root));
+        let key = self.intern_class_key(root);
         self.exception_carrier_handle.borrow().as_deref() == Some(key.as_str())
     }
 
@@ -3209,12 +3207,11 @@ impl Bookkeeper {
     /// `commonbase(base, variant) == base`, which is exactly what
     /// `pairtype(SomeInstance, SomeInstance).improve` (binaryop.py)
     /// needs to narrow a `SomeInstance(base)` to `SomeInstance(variant)`.
-    /// Identity is the canonical struct-root cache keyed by
-    /// `canonical_struct_name`; the base `enum_root` and the
-    /// `canon_root::variant` path ([`Self::intern_enum_variant_host`])
-    /// each normalise to one stable `HostObject`, so repeated calls
-    /// return the same `Rc` — and the variant `Rc` is the very one the
-    /// prologue pre-mint numbered.
+    /// Identity is the struct-root cache keyed by [`Self::intern_class_key`];
+    /// the base `enum_root` and the interned `{root}::{variant}` path
+    /// ([`Self::intern_enum_variant_host`]) each resolve to one stable
+    /// `HostObject`, so repeated calls return the same `Rc` — and the
+    /// variant `Rc` is the very one the prologue pre-mint numbered.
     pub fn getuniqueclassdef_for_enum_variant(
         self: &Rc<Self>,
         enum_root: &str,
@@ -3236,9 +3233,9 @@ impl Bookkeeper {
         // A getattr on a narrowed `SomeInstance(variant)` then resolves
         // the payload on the variant via the MRO (variant → base), with
         // the variant's own field type.  The rows are registered under
-        // the canonical variant key in `front::mir`.
-        let canon_root = majit_ir::descr::canonical_struct_name(enum_root);
-        let variant_path = format!("{canon_root}::{variant_name}");
+        // the interned variant key, the same spelling `intern_enum_variant_host`
+        // stored (`bookkeeper.py` `getuniqueclassdef` is one class object).
+        let variant_path = variant_host.qualname().to_string();
         self.project_struct_rows(&variant_path)?;
         // A variant payload can be the first place a dependency struct is
         // reached (`ConstantData::Complex.value: Complex<f64>`).  The payload
@@ -3363,17 +3360,18 @@ impl Bookkeeper {
     /// union to the base (losing the payload narrowing) and disagree on
     /// the payload attr/field owner.
     ///
-    /// The cache key is `canonical_struct_name(enum_root)::variant_name`.
+    /// The cache key is `{intern_class_key(enum_root)}::{variant_name}`.
     /// A leaf `enum_root` (`"Color"`, the ctor side, which carries the
-    /// enum leaf as its owner tail) and a canonical `enum_root`
-    /// (`"module::Color"`, the narrowing side, which reads the base
-    /// classdef's canonical name) normalise to the same key because
-    /// `canonical_struct_name` resolves the leaf through
-    /// `STRUCT_ORIGIN_REGISTRY` — the same normalisation the base itself
-    /// went through.
+    /// enum leaf as its owner tail) and a qualified `enum_root`
+    /// (`"module::Color"`, the narrowing side) normalise to the same key
+    /// because [`Self::intern_class_key`] resolves both against this
+    /// bookkeeper's `StructFieldRegistry` / `struct_root_classes`
+    /// (`bookkeeper.py` `getdesc` keys `descs` on `Constant(pyobj)`).
+    /// A name is never identity; `STRUCT_ID_BY_NAME` is an `lltype.Struct`
+    /// analog, not a class-identity source.
     ///
     /// `enum_root` must carry the LLBC instantiation suffix when the ADT
-    /// is generic (`Option<i64>`, not `Option`). `canonical_struct_name`
+    /// is generic (`Option<i64>`, not `Option`). [`Self::intern_class_key`]
     /// reattaches a `<…>` that is already on the spelling and otherwise
     /// leaves the name ungeneric, so two instantiations interned under
     /// the bare template share one `ClassDef` and their payloads union
@@ -3383,12 +3381,12 @@ impl Bookkeeper {
         enum_root: &str,
         variant_name: &str,
     ) -> HostObject {
-        let canon_root = majit_ir::descr::canonical_struct_name(enum_root);
+        let canon_root = self.intern_class_key(enum_root);
         // Field reads intern the crate-stripped template
-        // (`pyopcode::StepResult`). `normalize_class_qualname` reduces a
-        // still-prefixed spelling when StructId proves the same declaration
+        // (`pyopcode::StepResult`). `intern_class_key` reduces a
+        // still-prefixed spelling against this bookkeeper's registry
         // (`bookkeeper.py` `getuniqueclassdef(cls)` — one class per class).
-        let template = majit_ir::descr::strip_generic_args(&canon_root).into_owned();
+        let template = self.intern_class_key(&majit_ir::descr::strip_generic_args(&canon_root));
         let template_host = self.intern_class_by_qualname(&template);
         let enum_host = if canon_root == template {
             template_host
@@ -3814,18 +3812,14 @@ impl Bookkeeper {
     /// `tyref_class_root` seeds params with) so the subclass points at
     /// the same class Arc the rest of the session uses.
     ///
-    /// Each chain node's cache key is resolved through
-    /// `canonical_struct_name`, so the bare and qualified spellings of
-    /// one struct intern to one `HostObject` — name strings are a
-    /// resolution input, never the identity itself
-    /// (`getuniqueclassdef(cls)` keys by class object,
-    /// bookkeeper.py).  Crate-included `::` names and dotted
-    /// constructor qualnames shed exactly one local-crate segment and
-    /// converge on the crate-relative key before this walk; a bare leaf
-    /// whose origin was tombstoned by
-    /// `harden_duplicate_leaf_metadata` stays unresolved and keeps an
-    /// attrs-empty classdef because the field registry withdrew the
-    /// bare alias.
+    /// Each chain node's cache key is [`Self::intern_class_key`], so the
+    /// bare and qualified spellings of one struct intern to one
+    /// `HostObject` — name strings are a resolution input, never the
+    /// identity itself (`getuniqueclassdef(cls)` keys by class object,
+    /// bookkeeper.py).  Crate-included `::` names and dotted constructor
+    /// qualnames converge on this bookkeeper's unique registry key
+    /// before this walk; a bare leaf that is not a unique suffix of a
+    /// registered key stays unresolved and keeps an attrs-empty classdef.
     ///
     /// The header chain is collected iteratively with a revisit guard:
     /// registry field-type strings strip references
@@ -3840,16 +3834,16 @@ impl Bookkeeper {
         // Collect `name`'s embedded-header chain, outermost first,
         // stopping at an already-interned class (its Arc becomes the
         // deepest base) or at a chain end (scalar / unregistered /
-        // revisited first field).  The class-cache key is the canonical
-        // `module::Leaf` (`canonical_struct_name`); the field-registry
-        // lookup uses the raw spelling (the registry carries both
-        // qualified and bare keys).
+        // revisited first field).  The class-cache key is
+        // [`Self::intern_class_key`]; the field-registry lookup uses
+        // that same spelling (the registry carries both qualified and
+        // bare keys).
         let mut chain: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut base_host: Option<HostObject> = None;
-        let mut cur = normalize_class_qualname(name);
+        let mut cur = self.intern_class_key(name);
         loop {
-            let key = majit_ir::descr::canonical_struct_name(&cur);
+            let key = cur.clone();
             if let Some(existing) = self.struct_root_classes.borrow().get(&key) {
                 if chain.is_empty() {
                     return existing.clone();
@@ -3932,6 +3926,15 @@ impl Bookkeeper {
                                 || reg.is_enum_base(candidate)
                                 || reg.is_enum_base(&spelled)
                             {
+                                // Parent the variant to the registered enum
+                                // base (`enum_base_registry_key`), not a
+                                // crate-stripped leaf. `Bookkeeper.getdesc`
+                                // keys identity on the class object, not a
+                                // name spelling.
+                                let parent_key = reg
+                                    .enum_base_registry_key(candidate)
+                                    .or_else(|| reg.enum_base_registry_key(&spelled))
+                                    .unwrap_or_else(|| spelled.clone());
                                 if let Some(inst_parent) = inst_parent
                                     && inst_parent.contains('<')
                                 {
@@ -3939,9 +3942,9 @@ impl Bookkeeper {
                                         .find('<')
                                         .map(|i| &inst_parent[i..])
                                         .unwrap_or("");
-                                    return Some(format!("{spelled}{inst_suffix}"));
+                                    return Some(format!("{parent_key}{inst_suffix}"));
                                 }
-                                return Some(spelled);
+                                return Some(parent_key);
                             }
                             match candidate.split_once("::") {
                                 Some((_, rest)) => candidate = rest,
@@ -4052,31 +4055,22 @@ impl Bookkeeper {
                     return Some(parent.into_owned());
                 }
                 let leaf = parent.rsplit("::").next().unwrap_or(parent.as_ref());
+                if let Some(key) = unique_registered_intern_key(reg, parent.as_ref()) {
+                    return Some(key.to_string());
+                }
                 if !reg.fields.contains_key(leaf) {
                     return None;
                 }
-                let canon = majit_ir::descr::canonical_struct_name(leaf);
-                if !reg.fields.contains_key(&canon) {
-                    return None;
-                }
-                match (
-                    majit_ir::descr::struct_id_for_name(parent.as_ref()),
-                    majit_ir::descr::struct_id_for_name(&canon),
-                ) {
-                    (Some(parent_id), Some(canon_id)) if parent_id == canon_id => {
-                        Some(leaf.to_string())
-                    }
-                    _ => None,
-                }
+                unique_registered_intern_key(reg, leaf).map(str::to_string)
             });
             match next {
-                Some(n) => cur = n,
+                Some(n) => cur = self.intern_class_key(&n),
                 None => break,
             }
         }
         // Mint base-most first so each class links its base's Arc.
         for node in chain.iter().rev() {
-            let key = majit_ir::descr::canonical_struct_name(node);
+            let key = node.clone();
             let bases = match &base_host {
                 Some(base) => vec![base.clone()],
                 None => self.default_class_bases(&key),
@@ -4094,8 +4088,8 @@ impl Bookkeeper {
     }
 
     /// TODO: no upstream equivalent.  The closest thing upstream,
-    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py`,
-    /// `:353-363`), keys identity on the Python object; pyre has no such
+    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py`),
+    /// keys identity on the Python object; pyre has no such
     /// object and keys on a qualname.
     /// [`Self::intern_class_by_qualname`] with explicit `__bases__` for
     /// the first mint.  First-mint wins: a cache hit returns the
@@ -4108,14 +4102,14 @@ impl Bookkeeper {
         name: &str,
         bases: Vec<HostObject>,
     ) -> HostObject {
-        // Same normalization as [`Self::intern_class_by_qualname`]: both
+        // Same intern key as [`Self::intern_class_by_qualname`]: both
         // entry points answer one identity question, so they must derive one
         // key.  Keying only the base through the strip splits every enum
         // variant in two — `pyre_object::m::E` and `m::E` intern to one base
         // but to `pyre_object::m::E::Some` and `m::E::Some` — which is the
         // sibling-classdef split `intern_enum_variant_host`'s contract
         // forbids.
-        let key = majit_ir::descr::canonical_struct_name(&normalize_class_qualname(name));
+        let key = self.intern_class_key(name);
         if let Some(existing) = self.struct_root_classes.borrow().get(&key) {
             return existing.clone();
         }
@@ -5889,44 +5883,158 @@ fn is_bare_leaf_alias(key: &str, index: &QualifiedKeys<'_>) -> bool {
     }
 }
 
-/// One spelling rule for the class cache key, shared by
-/// [`Bookkeeper::intern_class_by_qualname`] and
-/// [`Bookkeeper::intern_class_by_qualname_with_bases`].
+/// Dotted constructor qualnames become `::` path spellings.
 ///
-/// A Rust declaration reaches the annotator under three spellings:
-/// crate-included `pyre_object::unicodeobject::W_UnicodeObject`,
-/// crate-relative `unicodeobject::W_UnicodeObject`, and a dotted constructor
-/// qualname.  RPython keys all reads and constructors on the one live class
-/// object (`bookkeeper.py` — `obj_key = Constant(pyobj)`), so normalize
-/// dots and strip one crate prefix only when StructId resolution proves that
-/// both spellings denote the same declaration.
-///
-/// Strip only while a module path survives.  A Rust `::` spelling is stripped
-/// only when the process-wide StructId resolver proves the full and
-/// crate-relative names denote the same declaration; class identity must not
-/// depend on the thread-local call-alias registry or on which pipeline last
-/// ran on this thread. Collapsing
-/// `pyre_object::PyObject` to the bare `PyObject` is what
-/// `harden_duplicate_leaf_metadata` exists to undo — the chain walk needs
-/// `ob_header` / `base` to reach the superclass, and a bare leaf collides
-/// across modules.
+/// Class intern keys are [`Bookkeeper::intern_class_key`]: this helper is
+/// only the shared dots-to-`::` step (`bookkeeper.py` `getdesc` keys
+/// `descs` on `Constant(pyobj)`; a name is never identity). Crate-prefix
+/// resolution lives on the bookkeeper so it can suffix-match this
+/// annotator's `StructFieldRegistry`, not `STRUCT_ID_BY_NAME`.
 pub(crate) fn normalize_class_qualname(name: &str) -> String {
-    let lookup = name.replace('.', "::");
-    lookup
-        .split_once("::")
-        .filter(|(_root, rest)| {
-            rest.contains("::")
-                && (name.contains('.')
-                    || matches!(
-                        (
-                            majit_ir::descr::struct_id_for_name(&lookup),
-                            majit_ir::descr::struct_id_for_name(rest),
-                        ),
-                        (Some(full), Some(relative)) if full == relative
-                    ))
-        })
-        .map(|(_, rest)| rest.to_string())
-        .unwrap_or(lookup)
+    name.replace('.', "::")
+}
+
+impl Bookkeeper {
+    /// Intern cache key for a host class spelling.
+    ///
+    /// RPython `Bookkeeper.getdesc` keys `descs` on `Constant(pyobj)` —
+    /// the live class object — and `getuniqueclassdef` is `getdesc` then
+    /// `ClassDesc.getuniqueclassdef`. A name is never identity. Pyre has a
+    /// string; this bookkeeper's `StructFieldRegistry` /
+    /// `struct_root_classes` is the per-annotator analog of resolving a
+    /// spelling to that object. `STRUCT_ID_BY_NAME` is an `lltype.Struct`
+    /// identity analog, not a class-identity source.
+    fn intern_class_key(&self, name: &str) -> String {
+        let lookup = normalize_class_qualname(name);
+        if lookup.is_empty() {
+            return lookup;
+        }
+        {
+            let classes = self.struct_root_classes.borrow();
+            if classes.contains_key(&lookup) {
+                return lookup;
+            }
+            // Promote to an already-interned *longer* spelling
+            // (`PyObject` after `pyobject::PyObject`). Never collapse a
+            // registry-exact qualified key onto a shorter interned alias
+            // (`module::struct::Code::Int` must not become `Code::Int`).
+            if let Some(key) = unique_suffix_key_owned(&lookup, classes.keys()) {
+                return reattach_instantiation_suffix(&key, &lookup);
+            }
+            let stripped = majit_ir::descr::strip_generic_args(&lookup);
+            if stripped.as_ref() != lookup.as_str() {
+                if classes.contains_key(stripped.as_ref()) {
+                    return reattach_instantiation_suffix(stripped.as_ref(), &lookup);
+                }
+                if let Some(key) = unique_suffix_key_owned(stripped.as_ref(), classes.keys()) {
+                    return reattach_instantiation_suffix(&key, &lookup);
+                }
+            }
+        }
+        if let Some(reg) = self.struct_fields.borrow().clone()
+            && let Some(key) = intern_key_from_registry(&reg, &lookup)
+        {
+            return key;
+        }
+        lookup
+    }
+}
+
+fn intern_key_from_registry(
+    reg: &crate::front::StructFieldRegistry,
+    lookup: &str,
+) -> Option<String> {
+    if let Some((k, _)) = reg.fields.get_key_value(lookup) {
+        return Some(k.clone());
+    }
+    if let Some(key) = unique_registered_intern_key(reg, lookup) {
+        return Some(reattach_instantiation_suffix(key, lookup));
+    }
+    let stripped = majit_ir::descr::strip_generic_args(lookup);
+    if stripped.as_ref() != lookup {
+        if let Some((k, _)) = reg.fields.get_key_value(stripped.as_ref()) {
+            return Some(reattach_instantiation_suffix(k, lookup));
+        }
+        if let Some(key) = unique_registered_intern_key(reg, stripped.as_ref()) {
+            return Some(reattach_instantiation_suffix(key, lookup));
+        }
+    }
+    let (_, rest) = lookup.split_once("::")?;
+    if !rest.contains("::") {
+        return None;
+    }
+    intern_key_from_registry(reg, rest)
+}
+
+fn unique_registered_intern_key<'a>(
+    reg: &'a crate::front::StructFieldRegistry,
+    owner: &str,
+) -> Option<&'a str> {
+    let key = unique_suffix_key_owned(owner, reg.fields.keys())?;
+    accept_intern_suffix_match(owner, &key)
+        .then(|| reg.fields.get_key_value(&key).map(|(k, _)| k.as_str()))
+        .flatten()
+}
+
+fn unique_suffix_key_owned(
+    owner: &str,
+    keys: impl Iterator<Item = impl AsRef<str>>,
+) -> Option<String> {
+    let leaf = owner.rsplit("::").next().unwrap_or(owner);
+    let mut found: Option<String> = None;
+    for key in keys {
+        let key = key.as_ref();
+        if key == owner {
+            continue;
+        }
+        let key_leaf = key.rsplit("::").next().unwrap_or(key);
+        if key_leaf != leaf {
+            continue;
+        }
+        if !accept_intern_suffix_match(owner, key) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(key.to_string());
+    }
+    found
+}
+
+fn accept_intern_suffix_match(lookup: &str, key: &str) -> bool {
+    if lookup == key {
+        return true;
+    }
+    // Promote `lookup` onto a unique longer registered/interned spelling
+    // (`celldict::StrKey` → `pyre_object::celldict::StrKey`). Collapsing
+    // a longer exact registry key onto a shorter interned alias
+    // (`module::struct::Code::Int` → `Code::Int`) is refused.
+    crate::front::semantic::is_path_suffix(key, lookup)
+}
+
+fn reattach_instantiation_suffix(registered_key: &str, spelled: &str) -> String {
+    if registered_key.contains('<') || !spelled.contains('<') {
+        return registered_key.to_string();
+    }
+    let Some(start) = spelled.find('<') else {
+        return registered_key.to_string();
+    };
+    let stripped = majit_ir::descr::strip_generic_args(spelled);
+    if stripped.len() >= spelled.len() {
+        return registered_key.to_string();
+    }
+    let removed = spelled.len() - stripped.len();
+    let inst = &spelled[start..start + removed];
+    let after_generic = &spelled[start + removed..];
+    if after_generic.starts_with("::") {
+        if registered_key.ends_with(after_generic) {
+            let base = &registered_key[..registered_key.len() - after_generic.len()];
+            return format!("{base}{inst}{after_generic}");
+        }
+        return format!("{registered_key}{inst}{after_generic}");
+    }
+    format!("{registered_key}{inst}")
 }
 
 /// `lltype.GCREF` and the Rust pointee of `*mut GCREFOpaque`.
@@ -8940,6 +9048,87 @@ mod tests {
         assert!(
             ok_cd.borrow().issubclass(&inst_cd),
             "prologue-minted Result<i32,E>::Ok must subclass the instantiation, Ok basedef={:?}",
+            ok_cd
+                .borrow()
+                .basedef
+                .as_ref()
+                .map(|c| c.borrow().name.clone())
+        );
+
+        let s_inst = SomeValue::Instance(SomeInstance::new(
+            Some(inst_cd.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let s_ok = SomeValue::Instance(SomeInstance::new(
+            Some(ok_cd.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let narrowed = crate::annotator::binaryop::improve(&s_inst, &s_ok);
+        match narrowed {
+            SomeValue::Instance(si) => assert!(
+                si.classdef.as_ref().is_some_and(|c| Rc::ptr_eq(c, &ok_cd)),
+                "improve(Result<i32,E>, Ok) must narrow to Ok, got {:?}",
+                si.classdef.as_ref().map(|c| c.borrow().name.clone())
+            ),
+            other => panic!("expected SomeInstance(Ok), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prologue_minted_generic_result_ok_subclasses_instantiation_under_dual_publish_struct_ids() {
+        // Dual-publish `Result::Ok` ≡ `result::Result::Ok` in
+        // `STRUCT_ID_BY_NAME` with no `Result` origin. Class intern keys
+        // come from this bookkeeper's registry (`Bookkeeper.getdesc`
+        // keys `descs` on `Constant(pyobj)`), so Ok still subclasses the
+        // instantiation when the layout-name table would have stripped
+        // the intern parent to the bare leaf.
+        use crate::annotator::model::{SomeInstance, SomeValue};
+        use crate::front::StructFieldRegistry;
+        let ok_id = majit_ir::descr::StructId::from_canonical("result::Result::Ok");
+        let enum_id = majit_ir::descr::StructId::from_canonical("result::Result");
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                ("result::Result".to_string(), Some(enum_id)),
+                ("Result".to_string(), Some(enum_id)),
+                ("result::Result::Ok".to_string(), Some(ok_id)),
+                ("Result::Ok".to_string(), Some(ok_id)),
+            ]));
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "result::Result".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        let inst = "result::Result<i32,TryFromIntError>";
+        reg.fields.insert(
+            inst.to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            format!("{inst}::Ok"),
+            vec![("__pos_0".to_string(), "i32".to_string())],
+        );
+        reg.fields.insert(
+            format!("{inst}::Err"),
+            vec![("__pos_0".to_string(), "TryFromIntError".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        for root in bk.struct_root_names() {
+            let _ = bk.getuniqueclassdef_for_struct_root(&root);
+        }
+
+        let inst_cd = bk
+            .getuniqueclassdef_for_struct_root(inst)
+            .expect("instantiation registers");
+        let ok_cd = bk
+            .getuniqueclassdef_for_enum_variant(inst, "Ok")
+            .expect("Ok registers");
+        assert!(
+            ok_cd.borrow().issubclass(&inst_cd),
+            "prologue-minted Result<i32,E>::Ok must subclass the instantiation under dual-publish StructId, Ok basedef={:?}",
             ok_cd
                 .borrow()
                 .basedef
