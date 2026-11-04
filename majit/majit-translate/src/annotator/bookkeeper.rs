@@ -4084,23 +4084,15 @@ impl Bookkeeper {
             }
         }
         // Mint base-most first so each class links its base's Arc.
-        // Cache on the intern key; ClassDef.name of the requested root is
-        // the spelling that interned it (`getuniqueclassdef` of an Input
-        // `class_root` "PyObject" keeps that name when the intern key is
-        // the dual-published qualified alias).
-        let requested = normalize_class_qualname(name);
+        // ClassDesc.__init__ names the class from the defining class
+        // object; the intern key is that object (`Bookkeeper.getdesc`).
         for node in chain.iter().rev() {
             let key = node.clone();
-            let class_name = if chain.first().map(String::as_str) == Some(node.as_str()) {
-                requested.clone()
-            } else {
-                key.clone()
-            };
             let bases = match &base_host {
                 Some(base) => vec![base.clone()],
                 None => self.default_class_bases(&key),
             };
-            let host = crate::flowspace::model::HostObject::new_class(class_name, bases);
+            let host = crate::flowspace::model::HostObject::new_class(key.clone(), bases);
             crate::virtualizable_decl::stamp_host_virtualizable(&host, &key);
             self.stamp_raw_alloc_flavor(&host, &key);
             self.stamp_immutable_fields(&host, &key);
@@ -6209,6 +6201,24 @@ fn intern_class_key_from_registry(
     if let Some(Some(ci)) = reg.class_identity.get(lookup) {
         return ci.spelling.clone();
     }
+    let template = majit_ir::descr::strip_generic_args(lookup);
+    if template.as_ref() != lookup {
+        // Bookkeeper.getdesc / getuniqueclassdef: one class object
+        // per class; generic instantiations are distinct class
+        // objects from the template. Resolve the template first,
+        // then reattach `<…>` so every name of one instantiation
+        // shares one ClassDesc. Runs before the exact-fields return
+        // so a harvested instantiation fields key still shares that
+        // object.
+        let template_key = template.as_ref();
+        let resolved = intern_class_key_from_registry(reg, template_key, allow_crate_strip);
+        if resolved.as_str() != template_key
+            || matches!(reg.class_identity.get(template_key), Some(Some(_)))
+            || registry_declares_spelling(reg, template_key)
+        {
+            return reattach_instantiation_suffix(&resolved, lookup);
+        }
+    }
     if reg.fields.get_key_value(lookup).is_some() {
         // A qualified exact key is identity (`m::T` vs `outer::m::T`).
         // A bare leaf may be harvest's dual-published alias of one
@@ -6236,24 +6246,6 @@ fn intern_class_key_from_registry(
             || registry_declares_spelling(reg, rest)
         {
             return intern_class_key_from_registry(reg, rest, false);
-        }
-    }
-    if lookup.contains('<') {
-        let template = majit_ir::descr::strip_generic_args(lookup);
-        if template.as_ref() != lookup {
-            // Bookkeeper.getdesc / getuniqueclassdef: one class object
-            // per class; generic instantiations are distinct class
-            // objects from the template. Resolve the template first,
-            // then reattach `<…>` so every name of one instantiation
-            // shares one ClassDesc.
-            let template_key = template.as_ref();
-            let resolved = intern_class_key_from_registry(reg, template_key, allow_crate_strip);
-            if resolved.as_str() != template_key
-                || matches!(reg.class_identity.get(template_key), Some(Some(_)))
-                || registry_declares_spelling(reg, template_key)
-            {
-                return reattach_instantiation_suffix(&resolved, lookup);
-            }
         }
     }
     lookup.to_string()
@@ -9216,6 +9208,113 @@ mod tests {
         let rel = bk.intern_class_key("vec::Vec<u8>");
         assert_eq!(alloc, rel);
         assert_eq!(alloc, "vec::Vec<u8>");
+    }
+
+    #[test]
+    fn intern_generic_enum_base_aliases_share_one_key_when_instantiation_fields_exist() {
+        // Bookkeeper.getdesc keys on the class object. Instantiation
+        // identity is the template plus its args; harvest writes
+        // suffixed enum-base fields without class_identity.
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.foreign_body_roots.push("core".to_string());
+        let disc = vec![("__discriminant".to_string(), "i64".to_string())];
+        for t in ["core::option::Option", "option::Option", "Option"] {
+            reg.fields.insert(t.to_string(), disc.clone());
+        }
+        harvest_class_identity(
+            &mut reg,
+            "option::Option",
+            &["core::option::Option", "option::Option", "Option"],
+        );
+        for inst in [
+            "core::option::Option<i64>",
+            "option::Option<i64>",
+            "Option<i64>",
+        ] {
+            reg.fields.insert(inst.to_string(), disc.clone());
+        }
+        bk.set_struct_fields(Rc::new(reg));
+        let core = bk.intern_class_key("core::option::Option<i64>");
+        let rel = bk.intern_class_key("option::Option<i64>");
+        let leaf = bk.intern_class_key("Option<i64>");
+        assert_eq!(core, rel);
+        assert_eq!(leaf, rel);
+        assert_eq!(core, "option::Option<i64>");
+        let core_host = bk.intern_class_by_qualname("core::option::Option<i64>");
+        let rel_host = bk.intern_class_by_qualname("option::Option<i64>");
+        let leaf_host = bk.intern_class_by_qualname("Option<i64>");
+        assert_eq!(core_host, rel_host);
+        assert_eq!(leaf_host, rel_host);
+        let core_cd = bk
+            .getuniqueclassdef(&core_host)
+            .expect("core Option<i64> classdef");
+        let rel_cd = bk
+            .getuniqueclassdef(&rel_host)
+            .expect("rel Option<i64> classdef");
+        let leaf_cd = bk
+            .getuniqueclassdef(&leaf_host)
+            .expect("leaf Option<i64> classdef");
+        assert!(Rc::ptr_eq(&core_cd, &rel_cd));
+        assert!(Rc::ptr_eq(&leaf_cd, &rel_cd));
+    }
+
+    #[test]
+    fn intern_cross_crate_generic_variants_stay_distinct() {
+        // Two TypeDecls. Bookkeeper.getdesc keys on the class object;
+        // instantiation identity is the template plus its args. Harvest
+        // after the fix keeps instantiation fields and omits
+        // class_identity derived from strip_crate_prefix.
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let rows = vec![("__pos_0".to_string(), "i64".to_string())];
+        for t in ["a::m::E::V", "b::m::E::V"] {
+            reg.fields.insert(t.to_string(), rows.clone());
+            harvest_class_identity(&mut reg, t, &[t]);
+        }
+        for key in ["a::m::E<i64>::V", "b::m::E<i64>::V", "m::E<i64>::V"] {
+            reg.fields.insert(key.to_string(), rows.clone());
+        }
+        bk.set_struct_fields(Rc::new(reg));
+        let a_key = bk.intern_class_key("a::m::E<i64>::V");
+        let b_key = bk.intern_class_key("b::m::E<i64>::V");
+        assert_ne!(
+            a_key, b_key,
+            "distinct declarations must keep distinct intern keys"
+        );
+        let a = bk.intern_class_by_qualname("a::m::E<i64>::V");
+        let b = bk.intern_class_by_qualname("b::m::E<i64>::V");
+        assert_ne!(a, b, "distinct declarations must keep distinct hosts");
+        let a_cd = bk.getuniqueclassdef(&a).expect("a::m::E<i64>::V classdef");
+        let b_cd = bk.getuniqueclassdef(&b).expect("b::m::E<i64>::V classdef");
+        assert!(
+            !Rc::ptr_eq(&a_cd, &b_cd),
+            "distinct declarations must keep distinct ClassDefs"
+        );
+    }
+
+    #[test]
+    fn intern_class_host_name_is_the_intern_key_not_the_requested_alias() {
+        // ClassDesc.__init__ names the class from the defining class
+        // object. The intern key is that object; a caller alias is not.
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "m::T".to_string(),
+            vec![("x".to_string(), "i64".to_string())],
+        );
+        harvest_class_identity(&mut reg, "m::T", &["m::T"]);
+        bk.set_struct_fields(Rc::new(reg));
+        assert_eq!(bk.intern_class_key("T"), "m::T");
+        let host = bk.intern_class_by_qualname("T");
+        assert_eq!(host.qualname(), "m::T");
+        let cd = bk.getuniqueclassdef(&host).expect("classdef");
+        assert_eq!(cd.borrow().name, "m::T");
+        let again = bk.intern_class_by_qualname("m::T");
+        assert_eq!(host, again);
     }
 
     #[test]

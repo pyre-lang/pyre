@@ -1325,13 +1325,13 @@ fn register_ref_enum_instantiation_rows(
                     .fields
                     .entry(key.clone())
                     .or_insert_with(|| rows.clone());
-                record_struct_id(
-                    struct_ids,
-                    &mut struct_fields.class_identity,
-                    key,
-                    sid,
-                    &identity,
-                );
+                // Layout id stays the crate-stripped spelling
+                // (`StructId::from_canonical_spelling`). Class identity
+                // is not published here: `Bookkeeper.getdesc` of a
+                // constructed generic is the template class object plus
+                // its args (`intern_class_key_from_registry` reattaches
+                // them).
+                record_layout_struct_id(struct_ids, key, sid);
             }
         }
         // Suffixed enum BASE (`{base}{suffix}`): copy the unsuffixed
@@ -3783,6 +3783,21 @@ fn type_spelling_is_fixed_object_array(spelling: &str) -> bool {
 /// to `None` (ambiguous) if the same name already mapped to a different
 /// identity — i.e. two distinct type definitions share that spelling
 /// (only possible for a bare leaf across modules).
+fn record_layout_struct_id(
+    table: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    name: String,
+    id: majit_ir::descr::StructId,
+) {
+    table
+        .entry(name)
+        .and_modify(|slot| {
+            if *slot != Some(id) {
+                *slot = None;
+            }
+        })
+        .or_insert(Some(id));
+}
+
 fn record_struct_id(
     table: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
     class_identity: &mut std::collections::HashMap<
@@ -3793,14 +3808,7 @@ fn record_struct_id(
     id: majit_ir::descr::StructId,
     identity_spelling: &str,
 ) {
-    table
-        .entry(name.clone())
-        .and_modify(|slot| {
-            if *slot != Some(id) {
-                *slot = None;
-            }
-        })
-        .or_insert(Some(id));
+    record_layout_struct_id(table, name.clone(), id);
     // One producer: the same harvest spelling `class_identity_spelling` /
     // `enum_ctor_class_identity` uses as the declaration's `struct_fields`
     // key. Two ids for one spelling collapse to `None`, matching
