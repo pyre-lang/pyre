@@ -4084,8 +4084,8 @@ const ATOMIC_PTR_ARGTYPE_EXTERNALS: &[(&[&str], &[&str], usize)] = &[
 
 /// Generic foreign externals whose result lltype is independent of the
 /// keyed argument. One graph per argument knowntype (`specialize.py`
-/// `specialize_argtype`); the fixed result is kept in the
-/// `GraphCacheKey::None` template that `cachedgraph` copies.
+/// `specialize_argtype`); the fixed result is kept in the source
+/// template that `cachedgraph` copies.
 const FIXED_RESULT_ARGTYPE_EXTERNALS: &[(&[&str], &[&str], usize, LowLevelType)] = &[
     // `core::cell::Cell::<T>::set(&self, val)` returns `()` — an in-place
     // store into the cell, `Void` result.
@@ -4271,11 +4271,11 @@ fn register_opaque_external_argtype(
 /// Register a bodyless foreign external with `specialize:argtype(i)`
 /// whose result lltype does not depend on the keyed argument.
 ///
-/// Builds the stub with [`build_stub_pygraph_for_lltype`] and prefills
-/// `GraphCacheKey::None` so `specialize_argtype` → `cachedgraph(key,
+/// Builds the stub with [`build_stub_pygraph_for_lltype`] and installs
+/// it as the source template so `specialize_argtype` → `cachedgraph(key,
 /// None, None)` copies that template per knowntype (`description.py`
 /// `cachedgraph`). [`register_opaque_external_argtype`] leaves the
-/// cache empty because the result is the keyed argument's type
+/// source template empty because the result is the keyed argument's type
 /// (`specialize_argtype_stub_result`).
 fn register_opaque_external_argtype_with_result(
     registry: &CallRegistry,
