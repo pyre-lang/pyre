@@ -1319,6 +1319,7 @@ fn consume_reconstructed_loop_header<Sym: WalkSym>(
         false,
         None,
         None,
+        None,
     ) {
         Ok(Some(recorded)) => {
             // `opimpl_jit_merge_point`: `finishframe(None, leave_portal_frame=False)`
@@ -2506,6 +2507,11 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             // always true.  `already_latched` is the one that matters — it means
             // this call replaced an inner frame's image with one rooted here.
             let already_latched = audit.then(abort_blackhole_latched);
+            // Keep an inner TraceTooLong image (`blackhole_if_trace_too_long`
+            // converts the frame that crossed the limit) and publish carrier
+            // shadow locals (`virtualizable.py write_boxes`) through main's
+            // helper. Relatching this reconstructed parent at `error.stop_pc()`
+            // would pair the nested pc with the parent's seed banks.
             let accepted = latch_bridge_abort_and_publish_carrier_locals(
                 &sub_wc,
                 error,

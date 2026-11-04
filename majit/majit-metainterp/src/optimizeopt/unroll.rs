@@ -553,6 +553,7 @@ impl UnrollOptimizer {
         opt.string_content_resolver = self.string_content_resolver.clone();
         opt.string_constant_alloc = self.string_constant_alloc.clone();
         opt.set_compile_live_op_roots_slot(self.compile_live_op_roots_slot);
+        self.register_resume_memo(opt);
     }
 
     fn publish_ops_span(&self, ops: &[majit_ir::OpRc]) -> super::LiveOpPublication {
@@ -739,7 +740,6 @@ impl UnrollOptimizer {
         }
         optimizer.published_short_preamble_producer_slot =
             self.compile_short_preamble_producer_slot;
-        self.register_resume_memo(optimizer);
         PublishedShortPreambleProducer {
             slot: self.compile_short_preamble_producer_slot,
             previous,
@@ -757,8 +757,10 @@ impl UnrollOptimizer {
     /// registers its own memo — `unroll.py optimize_preamble`'s as well as
     /// `optimize_peeled_loop`'s.
     ///
-    /// The handle is `Weak`, so a dropped `Optimizer` needs no withdrawal:
-    /// `MetaInterp::walk_rd_consts_refs` keeps only the ones that upgrade.
+    /// The handle is strong until `CompileSnapshotRootsGuard` drops: the
+    /// `Optimizer` local dies when `optimize_trace` returns, and
+    /// `backend.compile_loop` can collect before `compiled_loops` holds
+    /// the guard (`resume.py finish` / `storage.rd_consts = self.memo.consts`).
     fn register_resume_memo(&self, optimizer: &crate::optimizeopt::optimizer::Optimizer) {
         let Some(addr) = self.compile_resume_memos_slot else {
             return;
@@ -770,7 +772,7 @@ impl UnrollOptimizer {
         // registered root walker.
         unsafe {
             (*(addr as *mut Vec<crate::resume::LiveResumeMemo>))
-                .push(std::rc::Rc::downgrade(&optimizer.resumedata_memo));
+                .push(std::rc::Rc::clone(&optimizer.resumedata_memo));
         }
     }
 
@@ -970,7 +972,6 @@ impl UnrollOptimizer {
             // ── Phase 1: optimize_preamble (compile.py:275-276) ──
             let mut consts_p1 = constants.clone();
             let mut opt_p1 = self.phase_optimizer(vable_config.clone());
-            self.register_resume_memo(&opt_p1);
             opt_p1.all_descrs = std::mem::take(&mut self.all_descrs);
             opt_p1.callinfocollection = self.callinfocollection.clone();
             self.pin_inner_optimizer(&mut opt_p1);
@@ -5626,6 +5627,7 @@ fn assemble_peeled_trace_with_jump_args(
                     }
                     return;
                 }
+                let aliases_before = fallthrough_aliases.len();
                 push_fallthrough_same_as(
                     &mut fallthrough_aliases,
                     &stream_defs,
@@ -5635,13 +5637,40 @@ fn assemble_peeled_trace_with_jump_args(
                 );
                 // unroll.py `finalize_short_preamble`:
                 //   label_op.initarglist(label_op.getarglist() + sb.used_boxes)
-                // shortpreamble.py `add_preamble_op` also appends invented
-                // names to `extra_same_as`. `push_fallthrough_same_as` is
-                // that SameAs; the LABEL/JUMP slot is `used_boxes` and is
-                // appended even when the SameAs was just created, so a
-                // bridge that enters at LABEL still has the alias.
-                full_label_args.push(arg);
-                appended_label_args.push(arg);
+                // compile.py `compile_loop` splices `extra_same_as` and
+                // puts the invented-name box on the LABEL. Carry `arg`
+                // when it is already a preamble def (`stream_defs`) or
+                // when `push_fallthrough_same_as` just wrote a SameAs
+                // whose result is `arg` and whose source is a preamble
+                // def (`make_equal_to(source, arg)` /
+                // shortpreamble.py `invented_name`). IntBound.make_guards
+                // extra guards at JUMP (unroll.py `inline_short_preamble`
+                // / intutils.py `make_guards`, or vstring.py
+                // `StrPtrInfo.make_guards`) can mention a preamble box
+                // without the short-preamble builder having recorded it.
+                //
+                // A producer-less use-before-def (SameAs not pushed, or
+                // source not a preamble def) stays extra_before_label,
+                // not a LABEL slot: publishing that without a used_boxes
+                // entry makes every bridge JUMP (`_jump_to_existing_trace`
+                // `args + extra`) one arg short of the compiled LABEL.
+                //
+                // Bridge JUMP extras for these appends: the short-preamble
+                // builder is already closed at assembly (`used_boxes`
+                // cloned before `assemble_peeled_trace_with_jump_args`),
+                // so this kind is not recorded as a used_boxes entry.
+                // `vable_label_arg_recipes` rebuilds an appended inputarg
+                // static-scalar slot; otherwise the token is marked
+                // `label_tail_unrebuildable` and
+                // `_jump_to_existing_trace` skips it.
+                let just_pushed_alias = fallthrough_aliases.len() > aliases_before
+                    && fallthrough_aliases.last().is_some_and(|op| {
+                        op.pos().get() == arg && stream_defs.contains(&op.arg(0).to_opref())
+                    });
+                if stream_defs.contains(&arg) || just_pushed_alias {
+                    full_label_args.push(arg);
+                    appended_label_args.push(arg);
+                }
                 label_set.insert(arg);
             };
             for a in op.args_slice().iter() {
@@ -9702,6 +9731,107 @@ mod tests {
         assert!(
             jump_args.contains(&OpRef::int_op(20)),
             "JUMP must carry the preamble box into the LABEL slot, got {jump_args:?}"
+        );
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_carries_forwarded_alias_used_after_label() {
+        // preamble i3, make_equal_to(i3, i50), body IntAdd(i50),
+        // label_args=[i10]. compile.py `compile_loop` emits the
+        // invented-name SameAs and puts that box on the LABEL
+        // (`finalize_short_preamble` `used_boxes`).
+        let loop_descr = TargetToken::new_preamble(1).as_jump_target_descr();
+        let p1_ops = vec![{
+            let mut op = Op::new(
+                OpCode::IntAdd,
+                &[
+                    Operand::from_opref(OpRef::const_int(0)),
+                    Operand::from_opref(OpRef::const_int(1)),
+                ],
+            );
+            op.pos().set(OpRef::int_op(3));
+            op
+        }];
+        let p2_ops = vec![
+            {
+                let mut op = Op::new(
+                    OpCode::IntAdd,
+                    &[
+                        rooted_resop_operand(Type::Int, 50),
+                        Operand::from_opref(OpRef::const_int(1)),
+                    ],
+                );
+                op.pos().set(OpRef::int_op(4));
+                op
+            },
+            {
+                let mut jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 10)]);
+                jump.setdescr(loop_descr.clone());
+                jump
+            },
+        ];
+        let p1_ops_rc: Vec<majit_ir::OpRc> = p1_ops
+            .iter()
+            .map(|op| majit_ir::OpRc::new(op.clone()))
+            .collect();
+        let p2_ops_rc: Vec<majit_ir::OpRc> = p2_ops
+            .iter()
+            .map(|op| majit_ir::OpRc::new(op.clone()))
+            .collect();
+        let mut ctx = assemble_test_context(&p1_ops, &p2_ops, 1);
+        let src = ctx.materialize_operand_at(OpRef::int_op(3));
+        let dst = ctx.materialize_operand_at(OpRef::int_op(50));
+        ctx.make_equal_to(&src, &dst);
+        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+
+        let combined = assemble_peeled_trace_with_jump_args(
+            &p1_ops_rc,
+            &p2_ops_rc,
+            &[OpRef::int_op(10)],
+            &[OpRef::int_op(0)],
+            &[],
+            &[],
+            1,
+            0,
+            true,
+            &[],
+            &constants,
+            None,
+            Some(loop_descr),
+            &[],
+            &mut Vec::new(),
+            &mut ctx,
+        );
+
+        assert_assembled_loop_ssa_and_label_contract(&combined, &constants);
+
+        let label_idx = combined
+            .iter()
+            .position(|op| op.opcode == OpCode::Label)
+            .expect("Label");
+        let label_args: Vec<_> = combined[label_idx]
+            .args_slice()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        assert!(label_args.contains(&OpRef::int_op(10)));
+        assert!(
+            label_args.contains(&OpRef::int_op(50)),
+            "forwarded alias must be a LABEL slot, got {label_args:?}"
+        );
+        let jump_idx = combined
+            .iter()
+            .position(|op| op.opcode == OpCode::Jump)
+            .expect("Jump");
+        let jump_args: Vec<_> = combined[jump_idx]
+            .args_slice()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        assert_eq!(jump_args.len(), label_args.len());
+        assert!(
+            jump_args.contains(&OpRef::int_op(50)),
+            "JUMP must carry the forwarded alias into the LABEL slot, got {jump_args:?}"
         );
     }
 

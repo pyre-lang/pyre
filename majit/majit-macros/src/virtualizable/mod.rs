@@ -364,6 +364,7 @@ fn generate_layout_helpers(
     let frame_ident = frame_field
         .as_ref()
         .map_or_else(|| format_ident!("frame"), |f| f.clone());
+    let frame_setter = format_ident!("set_{}", frame_ident);
     let arr_type = array_item_type
         .as_ref()
         .map_or_else(|| format_ident!("Ref"), |t| t.clone());
@@ -599,7 +600,8 @@ fn generate_layout_helpers(
 
         /// Restore scalar fields from a Value slice (virtualizable layout).
         ///
-        /// Writes `state.frame`, `state.<inputarg>...` from `values[0..]`.
+        /// Writes the frame identity through `state.set_frame`, then
+        /// `state.<inputarg>...` from `values[0..]`.
         /// Returns the index of the first array slot in `values`.
         pub fn virt_restore_scalars(
             state: &mut #state_type,
@@ -608,14 +610,15 @@ fn generate_layout_helpers(
             if values.is_empty() {
                 return 0;
             }
-            state.#frame_ident = __value_to_usize(&values[0]);
+            state.#frame_setter(__value_to_usize(&values[0]));
             #(#restore_scalars)*
             #num_scalars
         }
 
         /// Restore scalar fields from a raw i64 slice (virtualizable layout).
         ///
-        /// Writes `state.frame`, `state.<inputarg>...` from `raw[0..]`.
+        /// Writes the frame identity through `state.set_frame`, then
+        /// `state.<inputarg>...` from `raw[0..]`.
         /// Returns the index of the first array slot in `raw`.
         ///
         /// virtualizable.py write_from_resume_data_partial parity: all entries must be present.
@@ -628,7 +631,7 @@ fn generate_layout_helpers(
                 "virt_restore_scalars_raw: raw.len()={} < num_scalars={}",
                 raw.len(), #num_scalars,
             );
-            state.#frame_ident = raw[0] as usize;
+            state.#frame_setter(raw[0] as usize);
             #(#restore_scalars_raw)*
             #num_scalars
         }

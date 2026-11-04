@@ -363,8 +363,8 @@ fn inline_snapshot_has_complete_parent_chain(n_parents: usize, n_callees: usize)
 /// construction.  `walk_generator_resume` is the remaining helper-shaped
 /// path: its body is portal-shaped, and pushing that level as a Python
 /// `InlineFrame` either `compile_tmp_callback`s a second loop
-/// (`cut_inlined_loop_backedge` `CALL_ASSEMBLER`) or walks the eval-loop
-/// `goto`s through to a miscompiled `FOR_ITER` item.  Until that merge
+/// (`opimpl_jit_merge_point`'s inlined CALL_ASSEMBLER cut) or walks the
+/// eval-loop `goto`s through to a miscompiled `FOR_ITER` item.  Until that merge
 /// point is `should_unroll_one_iteration` (`interp_jit.py`), this path
 /// keeps the empty-parents collapse.  A shorter chain falls through to
 /// the single-frame collapse, whose resume re-executes the entire call.
@@ -419,8 +419,14 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     if !ctx.trace_ctx.vable_snapshot_buildable() {
         return Err(DispatchError::GuardSnapshotVableUntyped { pc: op_pc });
     }
-    if let Some((instance, init_result)) = scope.constructor_assembler {
-        return walker_capture_constructor_assembler_guard(ctx, op_pc, instance, init_result);
+    if let Some((instance, init_result, caller)) = scope.constructor_assembler {
+        return walker_capture_constructor_assembler_guard(
+            ctx,
+            op_pc,
+            instance,
+            init_result,
+            caller,
+        );
     }
     if let Some((generator, pending)) = scope.send_ex_assembler {
         return walker_capture_send_ex_assembler_guard(ctx, op_pc, generator, pending);
@@ -509,7 +515,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 ctx,
                 op_pc,
                 after_residual_call,
-                scope,
+                &scope,
                 parent_frames,
             )? {
                 NumberedHelperGuard::Frames(frames) => {
@@ -2006,6 +2012,17 @@ pub(in crate::jitcode_dispatch) fn refresh_paused_parent_blackhole(parent: &mut 
     }
 }
 
+/// Forward captured parent Ref banks immediately before they become MIFrames.
+pub(in crate::jitcode_dispatch) fn refresh_framestack_parent_blackholes(
+    framestack: &mut [InlineFrame],
+) {
+    for frame in framestack {
+        for parent in &mut frame.parents {
+            refresh_paused_parent_blackhole(parent);
+        }
+    }
+}
+
 /// Re-read the paused caller's concrete image immediately before
 /// [`super::InlineFrameGuard`] publishes it. See
 /// [`refresh_paused_parent_blackhole`].
@@ -2116,6 +2133,9 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
     // gated on `fbw_debug_abort_enabled` like the rest of the walk's build
     // reporting, so a build without the flag pays three counter bumps and one
     // predictable branch.
+    //
+    // A missing live table is an empty live pass, not a declined capture:
+    // the sweep still fills remaining concretes.
     let mut swept = [0usize; 3];
     let paused = paused_python_live(ctx);
     let paused_regs_i = paused.as_ref().map(|live| live.registers_i.clone());
@@ -3229,7 +3249,7 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     after_residual_call: bool,
-    scope: GuardCaptureScope,
+    scope: &GuardCaptureScope,
     mut parent_frames: Vec<InlineParentFrame>,
 ) -> Result<NumberedHelperGuard, DispatchError> {
     parent_frames.push(helper_innermost_resume_frame(
@@ -3329,7 +3349,7 @@ fn helper_innermost_resume_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     after_residual_call: bool,
-    scope: GuardCaptureScope,
+    scope: &GuardCaptureScope,
 ) -> Result<InlineParentFrame, DispatchError> {
     let Some(jitcode_index) = ctx.fbw_mode.transparent_helper_jitcode_index else {
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
@@ -3517,10 +3537,11 @@ fn walker_capture_constructor_assembler_guard<Sym: WalkSym>(
     op_pc: usize,
     instance: OpRef,
     init_result: OpRef,
+    caller: Option<InlineParentFrame>,
 ) -> Result<(), DispatchError> {
     let tail = super::ctor_continuation_assembler_parent_frame(instance, init_result)
         .ok_or(DispatchError::callee_inline_unsupported(op_pc))?;
-    walker_capture_assembler_continuation_guard(ctx, op_pc, tail)
+    walker_capture_assembler_continuation_guard(ctx, op_pc, tail, caller)
 }
 
 /// `generator.py GeneratorOrCoroutine._send_ex` after `_invoke_execute_frame`:
@@ -3543,7 +3564,7 @@ fn walker_capture_send_ex_assembler_guard<Sym: WalkSym>(
         Some(slot) => *slot = pending,
         None => return Err(DispatchError::callee_inline_unsupported(op_pc)),
     }
-    walker_capture_assembler_continuation_guard(ctx, op_pc, tail)
+    walker_capture_assembler_continuation_guard(ctx, op_pc, tail, None)
 }
 
 /// Paused callers, then a synthesised assembler-resume tail as the innermost
@@ -3554,6 +3575,7 @@ fn walker_capture_assembler_continuation_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     tail: InlineParentFrame,
+    caller: Option<InlineParentFrame>,
 ) -> Result<(), DispatchError> {
     let mut parent_frames = {
         let session = ctx.session.borrow();
@@ -3563,13 +3585,23 @@ fn walker_capture_assembler_continuation_guard<Sym: WalkSym>(
             .flat_map(|frame| frame.parents.iter().cloned())
             .collect::<Vec<_>>()
     };
-    match compute_inline_caller_frame(ctx, op_pc) {
-        Ok(mut caller) => {
-            refresh_paused_parent_blackhole(&mut caller);
-            parent_frames.push(caller);
+    // `capture_resumedata` walks every `MetaInterp.framestack` entry.
+    // The constructor path passes the rooted `InlineParentFrame` taken
+    // before `InlineFrameGuard` dropped `__init__`; flattening `.parents`
+    // alone omits that current session frame. A walk without one still
+    // asks `compute_inline_caller_frame`.
+    if let Some(mut caller) = caller {
+        refresh_paused_parent_blackhole(&mut caller);
+        parent_frames.push(caller);
+    } else {
+        match compute_inline_caller_frame(ctx, op_pc) {
+            Ok(mut caller) => {
+                refresh_paused_parent_blackhole(&mut caller);
+                parent_frames.push(caller);
+            }
+            Err(_) if ctx.fbw_mode.snapshot_sym.is_null() => {}
+            Err(_) => return Err(DispatchError::callee_inline_unsupported(op_pc)),
         }
-        Err(_) if ctx.fbw_mode.snapshot_sym.is_null() => {}
-        Err(_) => return Err(DispatchError::callee_inline_unsupported(op_pc)),
     }
     parent_frames.push(tail);
     walker_capture_transparent_helper_snapshot(ctx, op_pc, parent_frames, GuardStampTarget::LastOp)
@@ -4039,20 +4071,6 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
                 }
             }
         }
-        // A dense fallthrough marker can name the NEXT Python opcode's result
-        // color before that opcode has executed.  RPython's sparse stream has
-        // no opcode-entry marker at this seam; the translated Ref bank slot is
-        // still its empty/null value and the next opcode overwrites it before
-        // any read.  Admit exactly that metadata-proven result color as NULL;
-        // every other missing live color still declines below.
-        if after_residual_call {
-            let marker_result = usize::try_from(callee_jitcode_pc)
-                .ok()
-                .and_then(|coord| callee_pjc.result_color_trivia_for_jitcode_pc(coord))
-                .filter(|&color| color != u16::MAX);
-            let null_ref = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
-            seed_missing_fallthrough_result(&mut recovered_regs_r, marker_result, null_ref);
-        }
     }
     let callee_boxes = collect_callee_active_boxes(
         ctx.registers_i,
@@ -4126,27 +4144,4 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             ),
     }
     Ok(())
-}
-
-/// Seed only the not-yet-defined result color carried by pyre's dense
-/// fallthrough marker.  Returns whether a hole was filled.
-pub(crate) fn seed_missing_fallthrough_result(
-    registers_r: &mut [OpRef],
-    marker_result: Option<u16>,
-    null_ref: OpRef,
-) -> bool {
-    let Some(dst) = marker_result
-        .filter(|&color| color != u16::MAX)
-        .map(usize::from)
-    else {
-        return false;
-    };
-    let Some(slot) = registers_r.get_mut(dst) else {
-        return false;
-    };
-    if !slot.is_none() {
-        return false;
-    }
-    *slot = null_ref;
-    true
 }
