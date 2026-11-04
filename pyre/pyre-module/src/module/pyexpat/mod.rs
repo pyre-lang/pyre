@@ -260,8 +260,8 @@ impl<'a> MiniXmlParser<'a> {
         // that completes in that window would reclaim them.
         let roots = pyre_object::gc_roots::push_roots();
         let mut version = String::new();
-        let standalone = w_int_new(-1);
-        let base = roots.pin_roots(&[w_none(), standalone]);
+        let mut encoding_slot = roots.pin_roots(&[w_none()]);
+        let mut standalone_slot = roots.pin_roots(&[w_int_new(-1)]);
         loop {
             self.skip_ws();
             if self.consume("?>") {
@@ -277,13 +277,18 @@ impl<'a> MiniXmlParser<'a> {
             let value = self.read_quoted()?;
             match key.as_str() {
                 "version" => version = value,
-                "encoding" => roots.set(base, w_str_new_managed(&value)),
-                "standalone" => roots.set(base + 1, w_int_new(if value == "yes" { 1 } else { 0 })),
+                "encoding" => {
+                    encoding_slot = roots.pin_roots(&[w_str_new_managed(&value)]);
+                }
+                "standalone" => {
+                    standalone_slot =
+                        roots.pin_roots(&[w_int_new(if value == "yes" { 1 } else { 0 })]);
+                }
                 _ => {}
             }
         }
         self.set_event_position(event_pos);
-        let encoding = roots.get(base);
+        let encoding = roots.get(encoding_slot);
         if let Some(enc) = unsafe {
             if is_none(encoding) {
                 None
@@ -295,10 +300,10 @@ impl<'a> MiniXmlParser<'a> {
         }
         self.handler_args("XmlDeclHandler")
             .arg(w_str_new_managed(&version))
-            .arg(roots.get(base))
-            .arg(roots.get(base + 1))
+            .arg(roots.get(encoding_slot))
+            .arg(roots.get(standalone_slot))
             .call()?;
-        let standalone = roots.get(base + 1);
+        let standalone = roots.get(standalone_slot);
         if unsafe { is_int(standalone) && w_int_get_value(standalone) == 0 } {
             pyre_interpreter::baseobjspace::setdictvalue_native(
                 self.parser(),

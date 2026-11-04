@@ -485,13 +485,18 @@ pub(super) fn cdata_from_address(
             "from_address() missing address",
         ));
     }
-    let mut cls = args[0];
-    let size = ctype_size_of(cls)
+    let arg_roots = pyre_object::gc_roots::push_roots();
+    let arg_base = arg_roots.pin_roots(args);
+    let size = ctype_size_of(arg_roots.get(arg_base))
         .filter(|&n| n != 0)
         .ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
-    let address =
-        pyre_object::with_roots!(cls => pyre_interpreter::baseobjspace::int_w(args[1]))? as usize;
-    Ok(make_at_address(cls, address, size, pyre_object::PY_NULL))
+    let address = pyre_interpreter::baseobjspace::int_w(arg_roots.get(arg_base + 1))? as usize;
+    Ok(make_at_address(
+        arg_roots.get(arg_base),
+        address,
+        size,
+        pyre_object::PY_NULL,
+    ))
 }
 
 fn cdata_from_buffer_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
@@ -946,8 +951,7 @@ pub(super) fn new_cdata_obj_from_bytes(
 }
 
 pub(super) fn ctype_size_of(mut cls: PyObjectRef) -> Option<usize> {
-    pyre_object::with_roots!(cls => super::stginfo::stginfo_of(cls))
-        .map(super::stginfo::stginfo_size)
+    pyre_object::with_roots!(cls => super::stginfo::stginfo_of(cls).map(super::stginfo::stginfo_size))
         .or_else(|| {
             pyre_object::with_roots!(cls => type_code_of(cls))
                 .and_then(|tc| cfield::simple_type_size(&tc))
@@ -1207,38 +1211,52 @@ fn ctype_leaf(mut cls: PyObjectRef) -> PyObjectRef {
 }
 
 pub(super) fn ctype_pep3118_format(mut cls: PyObjectRef, forced_big: Option<bool>) -> String {
-    let info = pyre_object::with_roots!(cls => super::stginfo::stginfo_of(cls));
-    let kind = info
-        .map(super::stginfo::stginfo_paramfunc)
-        .unwrap_or(ParamFunc::Other);
+    let mut info = pyre_object::with_roots!(cls => super::stginfo::stginfo_of(cls))
+        .unwrap_or(pyre_object::PY_NULL);
+    let kind = if info.is_null() {
+        ParamFunc::Other
+    } else {
+        pyre_object::with_roots!(cls, info => super::stginfo::stginfo_paramfunc(info))
+    };
     match kind {
-        ParamFunc::Array => info
-            .and_then(super::stginfo::stginfo_proto)
-            .map(|proto| ctype_pep3118_format(proto, forced_big))
-            .unwrap_or_else(|| "B".to_string()),
+        ParamFunc::Array => {
+            if info.is_null() {
+                "B".to_string()
+            } else {
+                pyre_object::with_roots!(cls, info => super::stginfo::stginfo_proto(info))
+                    .map(|proto| ctype_pep3118_format(proto, forced_big))
+                    .unwrap_or_else(|| "B".to_string())
+            }
+        }
         ParamFunc::Pointer => {
-            if let Some(snapshot) = info.and_then(super::stginfo::stginfo_format) {
+            if !info.is_null()
+                && let Some(snapshot) =
+                    pyre_object::with_roots!(cls, info => super::stginfo::stginfo_format(info))
+            {
                 return snapshot;
             }
-            let inner = info
-                .and_then(super::stginfo::stginfo_proto)
-                .map(|mut proto| {
-                    let shape = pyre_object::with_roots!(proto => ctype_shape(proto));
-                    let prefix = if shape.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            "({})",
-                            shape
-                                .iter()
-                                .map(usize::to_string)
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        )
-                    };
-                    format!("{prefix}{}", ctype_pep3118_format(proto, forced_big))
-                })
-                .unwrap_or_else(|| "B".to_string());
+            let inner = if info.is_null() {
+                None
+            } else {
+                pyre_object::with_roots!(cls, info => super::stginfo::stginfo_proto(info))
+            }
+            .map(|mut proto| {
+                let shape = pyre_object::with_roots!(proto => ctype_shape(proto));
+                let prefix = if shape.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "({})",
+                        shape
+                            .iter()
+                            .map(usize::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                };
+                format!("{prefix}{}", ctype_pep3118_format(proto, forced_big))
+            })
+            .unwrap_or_else(|| "B".to_string());
             format!("&{inner}")
         }
         ParamFunc::Struct => struct_pep3118_format(cls),
@@ -1262,7 +1280,9 @@ pub(super) fn ctype_pep3118_format(mut cls: PyObjectRef, forced_big: Option<bool
 }
 
 fn struct_pep3118_format(mut cls: PyObjectRef) -> String {
-    let big = super::stginfo::stginfo_of(cls).is_some_and(super::stginfo::stginfo_big_endian);
+    let big = pyre_object::with_roots!(
+        cls => super::stginfo::stginfo_of(cls).is_some_and(super::stginfo::stginfo_big_endian)
+    );
     let Some(fields) = (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_fields_") })
     else {
         return "B".to_string();

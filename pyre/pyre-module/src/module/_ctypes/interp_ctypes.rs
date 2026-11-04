@@ -964,11 +964,11 @@ fn ctypes_sizeof(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
     use super::cdata;
-    let obj = *args
+    let mut obj = *args
         .first()
         .ok_or_else(|| pyre_interpreter::PyError::type_error("sizeof() missing argument"))?;
     if unsafe { pyre_object::is_type(obj) } {
-        if let Some(size) = cdata::ctype_size_of(obj) {
+        if let Some(size) = pyre_object::with_roots!(obj => cdata::ctype_size_of(obj)) {
             return Ok(pyre_object::w_int_new(size as i64));
         }
         return if cdata::type_code_of(obj).is_some() {
@@ -1088,12 +1088,15 @@ fn ctypes_resize(
     let requested = pyre_interpreter::baseobjspace::int_w(
         pyre_object::gc_roots::shadow_stack_get(args_base + 1),
     )?;
-    let cls = unsafe {
+    let cls_slot = pyre_object::gc_roots::pin_roots(&[unsafe {
         pyre_object::w_instance_get_type(pyre_object::gc_roots::shadow_stack_get(args_base))
-    };
-    let min = stginfo::stginfo_of(cls)
+    }]);
+    let min = stginfo::stginfo_of(pyre_object::gc_roots::shadow_stack_get(cls_slot))
         .map(stginfo::stginfo_size)
-        .or_else(|| cdata::type_code_of(cls).and_then(|tc| cfield::simple_type_size(&tc)))
+        .or_else(|| {
+            cdata::type_code_of(pyre_object::gc_roots::shadow_stack_get(cls_slot))
+                .and_then(|tc| cfield::simple_type_size(&tc))
+        })
         .unwrap_or(0);
     if requested < min as i64 {
         return Err(pyre_interpreter::PyError::value_error(format!(
