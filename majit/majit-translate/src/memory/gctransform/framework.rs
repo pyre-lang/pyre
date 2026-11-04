@@ -316,52 +316,6 @@ impl CallGraph {
     ) -> u64 {
         super::instantiate::callee_node_for_call(self, llbc, caller_bindings, callee, generics)
     }
-
-    /// Fold specialized nodes in `collecting` back to their generic FunDecl.
-    ///
-    /// `graphanalyze.py` `analyze_direct_call` analyzes the specialized graph,
-    /// so a spec copy whose closure Regular-reaches a collecting seed is a
-    /// resolved collecting callee. Its call sites are real collecting calls
-    /// with no root bracket today (`unbracketed_calls`, `short_brackets`,
-    /// `frames_across_collecting`); until those sites get `push_roots` /
-    /// `with_roots!` / `FrameAnchor`, the spec node is folded back to the
-    /// generic `indirect` FunDecl and the call stays in the unresolved
-    /// buckets. Removing this fold and the matching remap in
-    /// `liveness.rs` goes together with bracketing those sites.
-    /// A spec that cannot collect is left in place and may drop `indirect`.
-    pub fn demote_specializations_in(&mut self, collecting: &HashSet<u64>) {
-        let mut rewrite: HashMap<u64, u64> = HashMap::new();
-        for (&(callee, _), &node) in &self.spec_memo {
-            if node != callee && collecting.contains(&node) {
-                rewrite.insert(node, callee);
-            }
-        }
-        if rewrite.is_empty() {
-            return;
-        }
-        for node in self.spec_memo.values_mut() {
-            if let Some(&generic) = rewrite.get(node) {
-                *node = generic;
-            }
-        }
-        for cs in self.callees.values_mut() {
-            let extra: Vec<u64> = cs.iter().filter_map(|c| rewrite.get(c).copied()).collect();
-            cs.retain(|c| !rewrite.contains_key(c));
-            cs.extend(extra);
-        }
-        for spec_id in rewrite.keys() {
-            self.names.remove(spec_id);
-            self.keys.remove(spec_id);
-            self.callees.remove(spec_id);
-            self.indirect.remove(spec_id);
-        }
-        self.callers.clear();
-        for (&caller, cs) in &self.callees {
-            for &c in cs {
-                self.callers.entry(c).or_default().insert(caller);
-            }
-        }
-    }
 }
 
 /// Whether a `CallKind::Trait` payload's trait reference is a `dyn` one.
