@@ -488,6 +488,20 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         let fd = group.field_descrs[selected].clone();
                         return (*offset, fd as majit_ir::DescrRef);
                     }
+                    // descr.py get_field_descr: cache[STRUCT][fieldname] hit
+                    // returns the interned Arc. Mint only when this STRUCT has
+                    // no row for `field_key`.
+                    let struct_key = majit_ir::descr::LLType::Struct(p.type_id);
+                    let cached = majit_ir::descr::gc_cache()
+                        .lock()
+                        ._cache_field
+                        .get(&struct_key)
+                        .and_then(|m| m.get(field_key))
+                        .cloned();
+                    if let Some(fd) = cached {
+                        let fd: majit_ir::DescrRef = fd;
+                        return (*offset, fd);
+                    }
                     // descr.py get_size_descr / get_field_descr: cache[STRUCT]
                     // is first-write-wins for a complete entry.
                     // `EC_DESCR_GROUP` already published
@@ -500,7 +514,6 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                     // with a nonzero incoming one, still goes through the
                     // group builder (`descr.py get_size_descr`,
                     // `pyjitpl.py execute_new_with_vtable`).
-                    let struct_key = majit_ir::descr::LLType::Struct(p.type_id);
                     let size_cached = majit_ir::descr::gc_cache()
                         .lock()
                         ._cache_size
