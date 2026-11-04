@@ -71,10 +71,14 @@ CORPUS_CRATES = (
 # line when nothing declined, and only one of them is a reading.
 CENSUS_BANNER = "=== majit decline census [analyze_pipeline]"
 
-# `[decline] {gate} {class} {subject}: {reason}`.  The class vocabulary is
-# bounded and contains no `": "`, and a graph name carries no space, so the
-# subject is the last token before the first `": "`.
+# `[decline] {gate} {class} {subject}: {reason}`.  The class is a bounded
+# vocabulary of one hyphenated token, optionally followed by a parenthesised
+# note; a graph name may carry spaces (trait-impl names such as
+# `<impl Trait<..>>`) but not `": "`.
 DECLINE = re.compile(r"^\[decline\] " + re.escape(GATE) + r" (?P<body>.*?): ", re.M)
+CLASS_SUBJECT = re.compile(
+    r"(?P<cls>[a-z][a-z0-9-]*(?: \([^)]*\))?) (?P<subject>.+)"
+)
 
 # The summary prints a gate header even when its only row is the ACCEPT arm.
 # That makes a genuine zero-Skip run distinguishable from a stale `GATE`
@@ -219,10 +223,10 @@ def parse(text: str) -> dict[str, set[str]]:
     found: dict[str, set[str]] = {}
     for m in DECLINE.finditer(text):
         body = m.group("body")
-        cls, _, subject = body.rpartition(" ")
-        if not cls:
+        split = CLASS_SUBJECT.fullmatch(body)
+        if not split:
             continue
-        found.setdefault(cls, set()).add(subject)
+        found.setdefault(split.group("cls"), set()).add(split.group("subject"))
     return found
 
 
