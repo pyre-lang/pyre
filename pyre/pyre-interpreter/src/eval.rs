@@ -1050,6 +1050,7 @@ unsafe fn walk_frame_value_slot(
     // SAFETY: `slot_ptr` points to live `GcRef` storage whose allocation
     // outlives this walk. The visitor reads, conditionally forwards, and
     // stores back a `GcRef` (same layout as `*mut PyObject`).
+    let _label = majit_gc::shadow_stack::extra_area_scope("pyframe.locals");
     visitor(unsafe { &mut *slot_ptr });
     // A caught exception bound to a local (`except X as e`) is
     // `malloc_typed`-immortal, so the visitor above is a no-op
@@ -1144,10 +1145,13 @@ pub unsafe fn walk_pyframe_roots_area(
     // preserves that ownership instead of resolving TLS on only the thread
     // which happened to initiate collection.
     unsafe {
-        walk_in_flight_exception_area(area.in_flight_exception, visitor);
-        walk_raw_exception_cell_area(area.bh_last_exception, visitor);
-        walk_raw_exception_cell_area(area.guard_exception, visitor);
-        walk_raw_exception_cell_area(area.jit_pending_exception, visitor);
+        {
+            let _exc = majit_gc::shadow_stack::extra_area_scope("pyframe.exc_fields");
+            walk_in_flight_exception_area(area.in_flight_exception, visitor);
+            walk_raw_exception_cell_area(area.bh_last_exception, visitor);
+            walk_raw_exception_cell_area(area.guard_exception, visitor);
+            walk_raw_exception_cell_area(area.jit_pending_exception, visitor);
+        }
         crate::call::walk_pending_call_error_area(area.pending_call_error, visitor);
         crate::baseobjspace::walk_pending_hash_error_area(area.pending_hash_error, visitor);
     }
@@ -1223,7 +1227,10 @@ pub unsafe fn walk_pyframe_roots_area(
             // GC-managed children just as `walk_in_flight_exception` does.
             // This is the post-PUSH_EXC_INFO owner of the same exception and
             // must preserve its traceback/frame graph identically.
-            unsafe { walk_raw_exception_roots((*ec).sys_exc_value, visitor) };
+            {
+                let _exc = majit_gc::shadow_stack::extra_area_scope("pyframe.exc_fields");
+                unsafe { walk_raw_exception_roots((*ec).sys_exc_value, visitor) };
+            }
             // `executioncontext.py:55` current_gen_or_coroutine is the head
             // of the running-generator chain.  The generator custom trace
             // follows each node's `previous_gen_or_coroutine` edge.
@@ -1260,6 +1267,7 @@ pub unsafe fn walk_pyframe_roots_area(
             if unsafe { !is_stdalloc_fallback_pyframe(frame) } {
                 break;
             }
+            let _stdalloc = majit_gc::shadow_stack::extra_area_scope("pyframe.stdalloc");
             // SAFETY: PyFrame pointers on the f_backref chain are valid
             // for the duration of the enclosing `eval_with_jit` call. A
             // minor collection is always synchronous with respect to the
