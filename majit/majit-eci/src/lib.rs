@@ -8,19 +8,24 @@ pub mod cdecl;
 pub mod parse;
 
 /// `rffi.py generate_macro_wrapper`. `args` and `result` are `gettype`
-/// templates; the function template is `result` with `@` replaced by
-/// `@(<params>)`, and `cdecl` places `pypy_macro_wrapper_{name}`. Empty
-/// `args` is `void`; a `void @` result omits `return`.
+/// templates. `LowLevelDatabase.gettype` FuncType skips `Void` (the resolved
+/// type), so `params` is the `(ty, name)` pairs whose `ty != "void @"`,
+/// `"void"` when none remain; `generate_macro_wrapper` still calls the macro
+/// with every `argN`. The function template is `result` with `@` replaced by
+/// `@(<params>)`, and `cdecl` places `pypy_macro_wrapper_{name}`. A `void @`
+/// result omits `return`.
 pub fn generate_macro_wrapper(name: &str, macro_: &str, args: &[String], result: &str) -> String {
     let argnames: Vec<String> = (0..args.len()).map(|i| format!("arg{i}")).collect();
-    let params = if args.is_empty() {
+    let params: Vec<String> = args
+        .iter()
+        .zip(&argnames)
+        .filter(|(ty, _)| ty.as_str() != "void @")
+        .map(|(ty, name)| cdecl::cdecl(ty, name))
+        .collect();
+    let params = if params.is_empty() {
         "void".to_string()
     } else {
-        args.iter()
-            .zip(&argnames)
-            .map(|(ty, name)| cdecl::cdecl(ty, name))
-            .collect::<Vec<_>>()
-            .join(", ")
+        params.join(", ")
     };
     let argnames = argnames.join(", ");
     let template = result.replace('@', &format!("@({params})"));
@@ -70,6 +75,41 @@ pub const _ATTRIBUTES: &[&str] = &[
 
 /// `ExternalCompilationInfo._DUPLICATES_OK`.
 pub const _DUPLICATES_OK: &[&str] = &["compile_extra", "link_extra"];
+
+/// `repr()` of a `str`: single quotes unless the text contains `'` and no `"`; escapes `\`, the chosen quote,
+/// `\t`, `\n`, `\r`, and other characters below U+0020 or U+007F as `\xNN`.
+fn py_repr(s: &str) -> String {
+    let quote = if s.contains('\'') && !s.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push(quote);
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if (c as u32) < 0x20 || c == '\u{007F}' => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let n = c as u32;
+                out.push('\\');
+                out.push('x');
+                out.push(HEX[(n >> 4) as usize] as char);
+                out.push(HEX[(n & 0xf) as usize] as char);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    out
+}
 
 impl ExternalCompilationInfo {
     fn field(&self, name: &str) -> &[String] {
@@ -156,16 +196,23 @@ impl ExternalCompilationInfo {
             if let Some(dir) = arg.strip_prefix("-I") {
                 include_dirs.push(dir.to_string());
             } else if let Some(macro_def) = arg.strip_prefix("-D") {
-                let (macro_name, value) = match macro_def.split_once('=') {
-                    Some((name, value)) => (name, value),
-                    None => (macro_def, "1"),
+                let parts: Vec<&str> = macro_def.split('=').collect();
+                let (macro_name, value) = match parts.as_slice() {
+                    [name] => (*name, "1"),
+                    [name, value] => (*name, *value),
+                    _ => {
+                        return Err("too many values to unpack (expected 2)".to_string());
+                    }
                 };
                 if macro_name == "_XOPEN_SOURCE" {
                     continue;
                 }
                 pre_include_bits.push(format!("#define {macro_name} {value}"));
             } else if arg.starts_with("-L") || arg.starts_with("-l") {
-                return Err(format!("linker flag found in compiler options: {arg:?}"));
+                return Err(format!(
+                    "linker flag found in compiler options: {}",
+                    py_repr(arg)
+                ));
             } else {
                 compile_extra.push(arg.to_string());
             }
@@ -189,7 +236,10 @@ impl ExternalCompilationInfo {
             } else if let Some(lib) = arg.strip_prefix("-l") {
                 libraries.push(lib.to_string());
             } else if arg.starts_with("-I") || arg.starts_with("-D") {
-                return Err(format!("compiler flag found in linker options: {arg:?}"));
+                return Err(format!(
+                    "compiler flag found in linker options: {}",
+                    py_repr(arg)
+                ));
             } else {
                 link_extra.push(arg.to_string());
             }
@@ -344,6 +394,10 @@ mod tests {
         assert_eq!(
             generate_macro_wrapper("FD_ZERO", "FD_ZERO", &["fd_set *@".into()], "void @"),
             "RPY_EXTERN void pypy_macro_wrapper_FD_ZERO(fd_set *arg0) { FD_ZERO(arg0); }"
+        );
+        assert_eq!(
+            generate_macro_wrapper("f", "F", &["void @".into(), "int @".into()], "int @"),
+            "RPY_EXTERN int pypy_macro_wrapper_f(int arg1) { return F(arg0, arg1); }"
         );
 
         let none: &[String] = &[];
@@ -515,6 +569,25 @@ mod tests {
             .unwrap(),
             "int (*@)(int)"
         );
+        let resolve_v = |path: &syn::Path, _: &[String]| -> Option<cdecl::Resolved> {
+            if path.segments.len() == 1 && path.segments[0].ident == "V" {
+                Some(cdecl::Resolved::Alias(
+                    syn::parse_str("()").unwrap(),
+                    vec![],
+                ))
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            cdecl::gettype(
+                &syn::parse_str("extern \"C\" fn(V, i32) -> i32").unwrap(),
+                none,
+                &resolve_v
+            )
+            .unwrap(),
+            "int (*@)(int)"
+        );
         assert_eq!(
             cdecl::gettype(
                 &syn::parse_str("extern \"C\" fn(())").unwrap(),
@@ -559,6 +632,111 @@ mod tests {
             .unwrap(),
             "char *@"
         );
+        #[cfg(all(target_pointer_width = "64", not(windows)))]
+        {
+            assert_eq!(
+                cdecl::gettype(
+                    &syn::parse_str("majit_rlib::rffi::LONG").unwrap(),
+                    none,
+                    &resolve_rffi
+                )
+                .unwrap(),
+                "Signed @"
+            );
+            assert_eq!(
+                cdecl::gettype(
+                    &syn::parse_str("majit_rlib::rffi::SIZE_T").unwrap(),
+                    none,
+                    &resolve_rffi
+                )
+                .unwrap(),
+                "size_t @"
+            );
+            assert_eq!(
+                cdecl::gettype(
+                    &syn::parse_str("majit_rlib::rffi::UNSIGNED").unwrap(),
+                    none,
+                    &resolve_rffi
+                )
+                .unwrap(),
+                "size_t @"
+            );
+            assert_eq!(
+                cdecl::gettype(
+                    &syn::parse_str("majit_rlib::rffi::INT").unwrap(),
+                    none,
+                    &resolve_rffi
+                )
+                .unwrap(),
+                "int @"
+            );
+            assert_eq!(
+                cdecl::gettype(&syn::parse_str("usize").unwrap(), none, &resolve_extern).unwrap(),
+                "size_t @"
+            );
+            assert_eq!(
+                cdecl::gettype(
+                    &syn::parse_str("libc::c_long").unwrap(),
+                    none,
+                    &resolve_extern
+                )
+                .unwrap(),
+                "Signed @"
+            );
+            assert_eq!(
+                cdecl::gettype(
+                    &syn::parse_str("libc::ssize_t").unwrap(),
+                    none,
+                    &resolve_extern
+                )
+                .unwrap(),
+                "Signed @"
+            );
+            assert_eq!(
+                cdecl::gettype(
+                    &syn::parse_str("libc::size_t").unwrap(),
+                    none,
+                    &resolve_extern
+                )
+                .unwrap(),
+                "size_t @"
+            );
+            assert_eq!(
+                cdecl::gettype(
+                    &syn::parse_str("libc::uintptr_t").unwrap(),
+                    none,
+                    &resolve_extern
+                )
+                .unwrap(),
+                "size_t @"
+            );
+            assert_eq!(
+                cdecl::gettype(&syn::parse_str("u8").unwrap(), none, &resolve_extern).unwrap(),
+                "unsigned char @"
+            );
+            assert_eq!(
+                cdecl::gettype(
+                    &syn::parse_str("majit_rlib::rffi::CHAR").unwrap(),
+                    none,
+                    &resolve_rffi
+                )
+                .unwrap(),
+                "char @"
+            );
+        }
+        let resolve_other_rffi = |path: &syn::Path, _: &[String]| -> Option<cdecl::Resolved> {
+            let segs: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+            Some(cdecl::Resolved::Extern(segs))
+        };
+        assert_eq!(
+            cdecl::gettype(
+                &syn::parse_str("other_crate::rffi::INT").unwrap(),
+                none,
+                &resolve_other_rffi
+            )
+            .unwrap(),
+            "INT @"
+        );
         let resolve_cycle = |path: &syn::Path, _: &[String]| -> Option<cdecl::Resolved> {
             if path.segments.len() != 1 {
                 return None;
@@ -587,11 +765,31 @@ mod tests {
             vec!["#define FOO 1".to_string(), "#define BAR 2".to_string()]
         );
         assert_eq!(flags.compile_extra, vec!["-O2".to_string()]);
-        assert!(ExternalCompilationInfo::from_compiler_flags("-lfoo").is_err());
+        assert!(ExternalCompilationInfo::from_compiler_flags("-DFOO=a=b").is_err());
+        assert!(ExternalCompilationInfo::from_compiler_flags("-D_XOPEN_SOURCE=a=b").is_err());
+        assert_eq!(
+            ExternalCompilationInfo::from_compiler_flags("-lfoo"),
+            Err("linker flag found in compiler options: '-lfoo'".to_string())
+        );
+        assert_eq!(
+            ExternalCompilationInfo::from_compiler_flags("-lfoo'"),
+            Err("linker flag found in compiler options: \"-lfoo'\"".to_string())
+        );
         let link = ExternalCompilationInfo::from_linker_flags("-L/y -lbar -Wl,-z").unwrap();
         assert_eq!(link.library_dirs, vec!["/y".to_string()]);
         assert_eq!(link.libraries, vec!["bar".to_string()]);
         assert_eq!(link.link_extra, vec!["-Wl,-z".to_string()]);
-        assert!(ExternalCompilationInfo::from_linker_flags("-DX").is_err());
+        assert_eq!(
+            ExternalCompilationInfo::from_linker_flags("-DX"),
+            Err("compiler flag found in linker options: '-DX'".to_string())
+        );
+        assert_eq!(
+            ExternalCompilationInfo::from_linker_flags("-DX'\""),
+            Err(r#"compiler flag found in linker options: '-DX\'"'"#.to_string())
+        );
+        assert_eq!(
+            ExternalCompilationInfo::from_linker_flags(r"-I\x"),
+            Err(r"compiler flag found in linker options: '-I\\x'".to_string())
+        );
     }
 }
