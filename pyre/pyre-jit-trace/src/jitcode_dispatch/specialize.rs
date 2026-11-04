@@ -16810,6 +16810,18 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     Ok((walk_result?, walk_start))
 }
 
+/// Append `parent` as the innermost parent of `level` and refuse CALL-entry
+/// resume. Collapsing to the FOR_ITER CALL entry would re-run `jit_next`
+/// after the teardown's effects.
+pub(crate) fn append_helper_parent(
+    mut level: HelperLevel,
+    parent: InlineParentFrame,
+) -> HelperLevel {
+    level.parents.push(parent);
+    level.call_entry = HelperCallEntry::Unavailable;
+    level
+}
+
 /// Execute a canonical helper reached through a real codewriter
 /// `inline_call_*` opcode with the same caller-boundary and descriptor-pool
 /// setup as specialization-driven orthodox descent.
@@ -16828,13 +16840,77 @@ pub(crate) fn run_codewriter_helper_inline_call<Sym: WalkSym>(
     ref_arg_concretes: &[ConcreteValue],
     float_args: &[OpRef],
 ) -> Result<DispatchOutcome, DispatchError> {
+    run_codewriter_helper_inline_call_body(
+        ctx,
+        op_pc,
+        sub_body,
+        None,
+        int_args,
+        int_arg_concretes,
+        ref_args,
+        ref_arg_concretes,
+        float_args,
+    )
+}
+
+/// Same as [`run_codewriter_helper_inline_call`], with `extra_parent`
+/// appended as the innermost parent of the helper level
+/// [`orthodox_helper_nested_entry`] computed for `op_pc`.
+///
+/// `call_entry` is [`HelperCallEntry::Unavailable`]: collapsing to the
+/// FOR_ITER CALL entry would re-run `jit_next` after the teardown's
+/// effects. A missing computed level is
+/// [`DispatchError::GuardResumeCoordinateUnavailable`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_codewriter_helper_inline_call_under_parent<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    sub_body: &SubJitCodeBody,
+    extra_parent: InlineParentFrame,
+    int_args: &[OpRef],
+    int_arg_concretes: &[ConcreteValue],
+    ref_args: &[OpRef],
+    ref_arg_concretes: &[ConcreteValue],
+    float_args: &[OpRef],
+) -> Result<DispatchOutcome, DispatchError> {
+    run_codewriter_helper_inline_call_body(
+        ctx,
+        op_pc,
+        sub_body,
+        Some(extra_parent),
+        int_args,
+        int_arg_concretes,
+        ref_args,
+        ref_arg_concretes,
+        float_args,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_codewriter_helper_inline_call_body<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    sub_body: &SubJitCodeBody,
+    extra_parent: Option<InlineParentFrame>,
+    int_args: &[OpRef],
+    int_arg_concretes: &[ConcreteValue],
+    ref_args: &[OpRef],
+    ref_arg_concretes: &[ConcreteValue],
+    float_args: &[OpRef],
+) -> Result<DispatchOutcome, DispatchError> {
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
     if sym_ptr.is_null() || unsafe { (&*sym_ptr).jitcode().is_null() } {
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     }
     let sym = unsafe { &*sym_ptr };
-    let nested_entry = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::CallResult)
+    let mut nested_entry = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::CallResult)
         .map_err(|_| DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })?;
+    if let Some(parent) = extra_parent {
+        let Some(level) = nested_entry.level.take() else {
+            return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
+        };
+        nested_entry.level = Some(append_helper_parent(level, parent));
+    }
     run_orthodox_helper_subwalk(
         ctx,
         op_pc,

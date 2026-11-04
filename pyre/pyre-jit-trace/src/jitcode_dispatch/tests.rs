@@ -663,6 +663,87 @@ fn send_ex_continuation_pending_slot_holds_the_portal_result() {
     assert_eq!(parent.boxes[1], generator);
 }
 
+/// Finished-arm helper parent chain is FOR_ITER caller → send_ex after
+/// teardown → helper. The unit harness has no `snapshot_sym`, so this
+/// checks the level the `_under_parent` path builds rather than capturing a
+/// guard snapshot inside the helper body.
+#[test]
+fn send_ex_finished_helper_level_is_foriter_then_after_teardown() {
+    let generator = OpRef::const_ptr(majit_ir::GcRef::NULL);
+    let caller = dummy_foriter_caller_parent();
+    let Some(after) = send_ex_finished_after_teardown_parent_frame(generator) else {
+        return;
+    };
+    let after_teardown = after.resume_pc;
+    let base = HelperLevel {
+        parents: vec![caller.clone()],
+        resume: HelperResume::Section,
+        call_entry: HelperCallEntry::CallerBoundary,
+        entry_array_len: None,
+        entry_trace_index: 0,
+    };
+    let level = append_helper_parent(base, after);
+    assert_eq!(level.parents.len(), 2, "FOR_ITER caller then send_ex");
+    assert_eq!(level.parents[0].jitcode_index, caller.jitcode_index);
+    assert_eq!(level.parents[0].resume_pc, caller.resume_pc);
+    let innermost = level
+        .parents
+        .last()
+        .expect("after-teardown is the innermost parent");
+    assert!(send_ex_continuation_is_installed_level(
+        innermost.jitcode_index as i32
+    ));
+    assert_eq!(innermost.resume_pc, after_teardown);
+    assert!(
+        matches!(level.call_entry, HelperCallEntry::Unavailable),
+        "collapsing to the FOR_ITER CALL entry would re-run jit_next",
+    );
+    assert_eq!(level.resume, HelperResume::Section);
+
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let _helper = InlineFrameGuard::enter_helper(&session, level);
+    let stack = session.borrow();
+    let helper_frame = stack
+        .framestack
+        .last()
+        .expect("enter_helper pushes the helper level");
+    assert_eq!(helper_frame.w_code, 0, "helper has no Python code");
+    assert_eq!(helper_frame.parents.len(), 2);
+    assert_eq!(helper_frame.parents[0].jitcode_index, caller.jitcode_index);
+    let helper_innermost = helper_frame
+        .parents
+        .last()
+        .expect("after-teardown is the innermost parent");
+    assert!(send_ex_continuation_is_installed_level(
+        helper_innermost.jitcode_index as i32
+    ));
+    assert_eq!(helper_innermost.resume_pc, after_teardown);
+    assert!(matches!(
+        helper_frame.helper_call_entry,
+        HelperCallEntry::Unavailable
+    ));
+}
+
+fn dummy_foriter_caller_parent() -> InlineParentFrame {
+    InlineParentFrame {
+        jitcode_index: 0xF0_11_E5,
+        call_jitcode_pc: Some(4),
+        call_pc: Some(4),
+        resume_pc: Some(8),
+        call_stack_overrides: Vec::new(),
+        blackhole: None,
+        resume_coord: ParentResumeCoord::Backxlat(8),
+        resume_marker_jit_pc: Some(8),
+        boxes: vec![OpRef::const_ptr(majit_ir::GcRef::NULL)],
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
+        caller_py_pc: None,
+        result_slot: CallResultSlot::At(0),
+    }
+}
+
 #[test]
 fn send_ex_frame_nonnull_guard_records_unless_the_box_is_a_constant() {
     // `_send_ex` (`generator.py` `GeneratorOrCoroutine._send_ex`) is
@@ -792,10 +873,13 @@ fn generator_resume_foriter_item_is_reread_from_the_live_box_after_the_finished_
 #[test]
 fn generator_resume_finished_arm_descends_frame_is_finished() {
     // `_send_ex` on a finished frame descends `generator_frame_is_finished`
-    // then binds a null FOR_ITER dest. This unit WalkContext has no
-    // `snapshot_sym`, so `run_codewriter_helper_inline_call` cannot start;
-    // the arm must propagate that descent error and leave the dest
-    // register unchanged rather than residualizing `bh_send_ex_tail`.
+    // under the after-teardown send_ex parent, then binds a null FOR_ITER
+    // dest. This unit WalkContext cannot record the helper body (no
+    // `snapshot_sym`, no executor residual), so the arm must propagate that
+    // descent error and leave the dest register unchanged rather than
+    // residualizing `bh_send_ex_tail`. The parent chain the descent would
+    // push is `send_ex_finished_helper_level_is_foriter_then_after_teardown`
+    // (`append_helper_parent` under `_under_parent`).
     use pyre_interpreter::compile_exec;
 
     fbw_foriter_inflight_clear();
@@ -849,12 +933,15 @@ fn generator_resume_finished_arm_descends_frame_is_finished() {
                 iter_op,
                 caller_parent,
             )
-            .expect_err("finished arm without a snapshot_sym must propagate the descent error");
+            .expect_err(
+                "finished arm without a recordable helper body must propagate the descent error",
+            );
             assert!(
                 matches!(
                     err,
-                    DispatchError::GuardResumeCoordinateUnavailable { pc: 0 }
-                        | DispatchError::LoopBearingCalleeInlineUnsupported { pc: 0, .. }
+                    DispatchError::GuardResumeCoordinateUnavailable { .. }
+                        | DispatchError::LoopBearingCalleeInlineUnsupported { .. }
+                        | DispatchError::OrthodoxSubWalkTraceUnsupported { .. }
                 ),
                 "finished arm must not residualize bh_send_ex_tail, got {err:?}",
             );
