@@ -341,6 +341,7 @@ fn byte_at(string_byte_view: bool, slice: Variable, index: Variable) -> OpKind {
             item_ty: ValueType::Int,
             index,
             array_type_id: Some("[u8]".to_string()),
+            array: Some(crate::codewriter::call::gcarray_char()),
             nolength: crate::front::typestr::nolength_from_array_type_id(Some("[u8]")),
             gckind: crate::front::typestr::gckind_from_array_type_id(Some("[u8]")),
             pure: false,
@@ -559,6 +560,7 @@ mod tests {
                         &op.kind,
                         OpKind::ArrayRead {
                             array_type_id: Some(id),
+                            array: _,
                             ..
                         } if id == "[u8]"
                     )

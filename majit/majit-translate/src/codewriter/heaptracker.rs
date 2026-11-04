@@ -6,9 +6,11 @@
 //! names, routing every descriptor operation through those existing caches
 //! instead of adding a side table.
 
-use crate::codewriter::call::{CallControl, extract_element_type_from_str, get_type_flag};
+use crate::codewriter::call::{
+    CallControl, array_type_id_of_lltype, extract_element_type_from_str, get_type_flag,
+};
 use crate::flowspace::model::ConstValue;
-use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, Struct};
+use crate::translator::rtyper::lltypesystem::lltype::{Array, GcKind, LowLevelType, Struct};
 
 #[derive(Debug, Clone, Default)]
 pub struct GcStructVTableCache<V> {
@@ -210,10 +212,13 @@ pub fn all_fielddescrs(
 
 pub fn all_interiorfielddescrs(
     gccache: &CallControl,
-    array_type_id: &str,
+    array: &Array,
 ) -> Result<Vec<majit_ir::descr::DescrRef>, majit_ir::UnsupportedFieldExc> {
-    let elem_name =
-        extract_element_type_from_str(array_type_id).unwrap_or_else(|| array_type_id.to_string());
+    let array_type_id = array_type_id_of_lltype(array);
+    let elem_name = match &array.OF {
+        LowLevelType::Struct(s) => s._name.clone(),
+        _ => extract_element_type_from_str(&array_type_id).unwrap_or_else(|| array_type_id.clone()),
+    };
     if let Some(layout) = gccache.struct_layout_for(&elem_name) {
         for field in &layout.fields {
             if field.field_type == majit_ir::value::Type::Void || field.name == "typeptr" {
@@ -251,11 +256,17 @@ pub fn all_interiorfielddescrs(
                 if field.field_type == majit_ir::value::Type::Void || field.name == "typeptr" {
                     continue;
                 }
-                let array_id = Some(array_type_id.to_string());
+                let spelling = Some(array_type_id.clone());
+                let intern_id = gccache.intern_array(array);
                 let idx = gccache
                     .descr_indices
-                    .interiorfield_index(&array_id, &field.name);
-                if let Some(descr) = gccache.interiorfielddescrof(idx, &array_id, &field.name) {
+                    .interiorfield_index(intern_id, &field.name);
+                if let Some(descr) = gccache.interiorfielddescrof_with_array(
+                    idx,
+                    &spelling,
+                    &Some(array.clone()),
+                    &field.name,
+                ) {
                     res.push(descr);
                 }
             }
@@ -271,11 +282,14 @@ pub fn all_interiorfielddescrs(
         if ir_type == majit_ir::value::Type::Void {
             continue;
         }
-        let array_id = Some(array_type_id.to_string());
+        let spelling = Some(array_type_id.clone());
+        let intern_id = gccache.intern_array(array);
         let idx = gccache
             .descr_indices
-            .interiorfield_index(&array_id, &row.name);
-        if let Some(descr) = gccache.interiorfielddescrof(idx, &array_id, &row.name) {
+            .interiorfield_index(intern_id, &row.name);
+        if let Some(descr) =
+            gccache.interiorfielddescrof_with_array(idx, &spelling, &Some(array.clone()), &row.name)
+        {
             res.push(descr);
         }
     }

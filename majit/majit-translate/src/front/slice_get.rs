@@ -426,6 +426,7 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
             item_ty: site.payload_ty.clone(),
             index: index_in_then,
             array_type_id: site.array_type_id.clone(),
+            array: None,
             nolength: crate::front::typestr::nolength_from_array_type_id(
                 site.array_type_id.as_deref(),
             ),

@@ -78,6 +78,12 @@ use crate::translator::translator::TranslationContext;
 /// required for `cast_opaque_ptr` back to StringRepr / InstanceRepr.
 pub(crate) const GCREF_RETURN_TYPE: &str = "gcref";
 
+/// Annotator-only residual stub: Charon `name_path` segments, signature,
+/// the pre-existing FUNC.RESULT token, and the declared result lltype
+/// when the LLBC signature supplies `ext_type.RESULT` (`rffi.py`
+/// `llexternal` / `extfunc.py` `register_external`).
+pub(crate) type ResidualStubSpec = (Vec<String>, Signature, Option<String>, Option<LowLevelType>);
+
 /// Residual FUNC.RESULT token for an rstr `STR` result (`ValueType::Str`):
 /// ref-kind, annotated `SomeString` and lowered `Ptr(STR)`.
 pub(crate) const STR_RETURN_TYPE: &str = "str";
@@ -2830,7 +2836,7 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
 ///    (`translator.buildflowgraph`) at the rtyper's `direct_call`.
 pub(crate) fn populate_call_registry_from_call_graphs(
     function_graphs: &crate::codewriter::call::GraphStore,
-    unsafe_fn_stubs: &[(Vec<String>, Signature, Option<String>)],
+    unsafe_fn_stubs: &[ResidualStubSpec],
     foreign_opaque_method_externals: &[(Vec<String>, Signature, crate::model::ValueType)],
     atomic_load_decls: &[crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl],
     registry: &Rc<CallRegistry>,
@@ -3107,12 +3113,19 @@ fn describe_declared_funcobj(
         crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
         return None;
     }
+    if let Some(existing) =
+        existing_graphstore_entry(store, registry, &path).or_else(|| registry.lookup_existing(key))
+    {
+        alias_graphstore_spellings(Some(store), registry, key, &existing);
+        return Some(existing);
+    }
     let signature = crate::codewriter::call::StoreCore::signature_from_graph(&graph);
     let entry = registry.get_or_register_with_func(
         key.clone(),
         signature.clone(),
         source_graph_func(&graph),
     );
+    alias_graphstore_spellings(Some(store), registry, key, &entry);
     publish_source_signature(&graph, &entry);
     seed_declared_funcptr_type(&graph, &entry);
     let body = store.body(&path).expect("a declared path names a funcobj");
@@ -3121,9 +3134,8 @@ fn describe_declared_funcobj(
 }
 
 /// Already-registered GraphStore alias of `path`'s funcobj, if any.
-/// `Bookkeeper.getdesc(pyobj)` identity: every spelling of one graph
-/// object is one FunctionDesc. Walks GraphStore alias paths; does not
-/// look up attributes by name.
+/// `Bookkeeper.getdesc(pyobj)` identity: every spelling of one GraphKey
+/// is one FunctionDesc. [`GraphStore::alias_paths`] is that set.
 fn existing_graphstore_entry(
     store: &crate::codewriter::call::GraphStore,
     registry: &CallRegistry,
@@ -3145,6 +3157,43 @@ fn alias_key_onto_entry(registry: &CallRegistry, key: &FunctionPathKey, entry: &
     };
     if canonical != *key {
         registry.alias(key.clone(), &canonical);
+    }
+}
+
+/// [`alias_key_onto_entry`] that skips when `key` is already a
+/// canonical row or already aliases some FunctionDesc
+/// (`bookkeeper.py Bookkeeper.getdesc` identity: do not mint a second
+/// desc, and do not panic on a spelling another callable already owns).
+fn try_alias_key_onto_entry(
+    registry: &CallRegistry,
+    key: &FunctionPathKey,
+    entry: &Rc<FunctionEntry>,
+) {
+    if registry.lookup_registered(key).is_some() {
+        return;
+    }
+    alias_key_onto_entry(registry, key, entry);
+}
+
+/// Point every GraphStore spelling of `key`'s funcobj at `entry`.
+/// A `FunctionPathKey` aliases an existing FunctionEntry only when
+/// GraphStore resolves that key to the same `GraphKey` as the entry's
+/// graph (`bookkeeper.py Bookkeeper.getdesc`).
+fn alias_graphstore_spellings(
+    store: Option<&crate::codewriter::call::GraphStore>,
+    registry: &CallRegistry,
+    key: &FunctionPathKey,
+    entry: &Rc<FunctionEntry>,
+) {
+    let Some(store) = store else {
+        return;
+    };
+    let Some(path) = graphstore_path_for_lookup_key(store, key) else {
+        return;
+    };
+    try_alias_key_onto_entry(registry, key, entry);
+    for alias in store.alias_paths(&path) {
+        try_alias_key_onto_entry(registry, &FunctionPathKey::from(&alias), entry);
     }
 }
 
@@ -3171,29 +3220,19 @@ fn alias_existing_lookup(registry: &CallRegistry, key: &FunctionPathKey) -> bool
 
 /// GraphStore spelling of the funcobj `key` names.
 ///
-/// A policy-opaque stub is keyed on Charon `name_path()`. Pass 1 registers
-/// `free_function_alias_paths` (`crate::m::f` and each local crate root).
-/// `canonical_dedup_key` / `callable_graph_path` / `strip_local_crate_prefix`
-/// treat a leading `crate` or local crate root as the same funcobj
-/// (`bookkeeper.py Bookkeeper.getdesc` identity). An unknown first
-/// segment is a different callable.
+/// A key aliases an entry only when GraphStore already resolves that
+/// key to a `GraphKey` (`bookkeeper.py Bookkeeper.getdesc` identity:
+/// two spellings share a desc when they are the same funcobj).
 fn graphstore_path_for_lookup_key(
     store: &crate::codewriter::call::GraphStore,
     key: &FunctionPathKey,
-    foreign_callables: &[(String, String)],
 ) -> Option<crate::parse::CallPath> {
     let path = key.to_call_path();
     if store.names_funcobj(&path) {
-        return Some(path);
+        Some(path)
+    } else {
+        None
     }
-    let stripped = canonical_dedup_key(&path, foreign_callables);
-    if stripped.as_slice() != key.segments() {
-        let stripped_path = path.with_segments(stripped);
-        if store.names_funcobj(&stripped_path) {
-            return Some(stripped_path);
-        }
-    }
-    None
 }
 
 /// Alias each policy-opaque stub key onto the GraphStore funcobj's
@@ -3202,10 +3241,9 @@ fn graphstore_path_for_lookup_key(
 fn alias_opaque_stub_keys_onto_graphstore(
     store: &crate::codewriter::call::GraphStore,
     registry: &Rc<CallRegistry>,
-    stubs: &[(Vec<String>, Signature, Option<String>)],
+    stubs: &[ResidualStubSpec],
 ) {
-    let foreign_callables = registry_foreign_callables(registry);
-    for (segments, _signature, _return_token) in stubs {
+    for (segments, _signature, _return_token, _return_lltype) in stubs {
         let key = FunctionPathKey::from_segments(segments.iter().cloned());
         if crate::translator::rtyper::call_registry::residual_inst_template_leaf(key.name())
             .is_some()
@@ -3215,11 +3253,11 @@ fn alias_opaque_stub_keys_onto_graphstore(
         if alias_existing_lookup(registry, &key) {
             continue;
         }
-        let Some(path) = graphstore_path_for_lookup_key(store, &key, &foreign_callables) else {
+        let Some(path) = graphstore_path_for_lookup_key(store, &key) else {
             continue;
         };
         if let Some(existing) = existing_graphstore_entry(store, registry, &path) {
-            alias_key_onto_entry(registry, &key, &existing);
+            alias_graphstore_spellings(Some(store), registry, &key, &existing);
             continue;
         }
         let Some(header) = store.funcobj_header(&path) else {
@@ -3237,11 +3275,7 @@ fn alias_opaque_stub_keys_onto_graphstore(
             signature.clone(),
             source_graph_func(&header),
         );
-        alias_key_onto_entry(registry, &key, &entry);
-        for alias in store.alias_paths(&path) {
-            let alias_key = FunctionPathKey::from(&alias);
-            alias_key_onto_entry(registry, &alias_key, &entry);
-        }
+        alias_graphstore_spellings(Some(store), registry, &key, &entry);
         publish_source_signature(&header, &entry);
         seed_declared_funcptr_type(&header, &entry);
         if let Some(body) = store.body(&path) {
@@ -3470,9 +3504,9 @@ fn source_graph_func(graph: &LegacyGraph) -> GraphFunc {
 /// `signature.argnames` are turned into named `Variable`s on the
 /// startblock; `return_lltype` is projected through
 /// [`crate::translator::rtyper::llannotation::lltype_to_annotation`]
-/// to a `SomeValue` shell (no `const_box`) attached to a fresh
-/// `Variable` carried on the Link to the returnblock.  Returns
-/// `None` when the return type is a container
+/// to a `SomeValue` shell (no `const_box`) attached to
+/// `FunctionGraph.getreturnvar()` and to a distinct Link arg.
+/// Returns `None` when the return type is a container
 /// (`Func` / `Struct` / `Array` / `Opaque` / `ForwardReference` /
 /// `FixedSizeArray`) or `Address` (no `SomeAddress` port yet) —
 /// the caller skips registration for that fn and the original
@@ -3486,9 +3520,11 @@ fn source_graph_func(graph: &LegacyGraph) -> GraphFunc {
 /// "known false" annotation and can mis-specialise downstream code
 /// that observes the callsite result.  Upstream `ExtRegistryEntry.
 /// compute_result_annotation` (`extregistry.py`) returns a
-/// `SomeXXX()` shell with no `const`; the pre-annotated Variable
-/// here carries exactly that shape via `binding(arg)` reading
-/// `v.annotation` directly (`annrpython.py`).
+/// `SomeXXX()` shell with no `const`; the pre-annotated return
+/// Variable carries exactly that shape via `recursivecall` reading
+/// `getreturnvar().annotation` (`annrpython.py`). The Link arg is a
+/// distinct Variable so `checkgraph` does not see one Variable in two
+/// blocks; `FunctionGraph::new`'s fresh return var stays unbound.
 ///
 /// Mirrors how `description.py __init__` test fixtures build a
 /// `FunctionDesc` with a minimal `PyGraph` body — the upstream
@@ -3589,13 +3625,26 @@ fn build_stub_pygraph_with_result_shell_and_func(
         .map(|n| Hlvalue::Variable(Variable::named(n)))
         .collect();
     let startblock = Block::shared(inputargs);
-    let mut graph_inner = crate::flowspace::model::FunctionGraph::new(name, startblock.clone());
+    let shell = Rc::new(return_someval);
+    // Link arg: a Variable carrying FUNC.RESULT, never a Constant
+    // (`Bookkeeper::immutableconstant` would leak `const_box`). Distinct
+    // from the returnblock inputarg (`checkgraph` "used in more than
+    // one block").
+    let stub_result = Variable::named("__unsafe_stub_result");
+    *stub_result.annotation.borrow_mut() = Some(Rc::clone(&shell));
+    // `annrpython.py` `recursivecall` reads `getreturnvar()` before
+    // `flowin`. Pre-annotate that Variable with FUNC.RESULT
+    // (`extfunc.py` `ExtFuncEntry.compute_result_annotation`).
+    let return_var = Variable::named("__unsafe_stub_return");
+    *return_var.annotation.borrow_mut() = Some(shell);
+    let mut graph_inner = crate::flowspace::model::FunctionGraph::with_return_var(
+        name,
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
     graph_inner.func = Some(func.clone());
-    let return_var = Variable::named("__unsafe_stub_result");
-    *return_var.annotation.borrow_mut() = Some(Rc::new(return_someval));
-    let return_hlvalue = Hlvalue::Variable(return_var);
     let link = Rc::new(RefCell::new(Link::new(
-        vec![return_hlvalue],
+        vec![Hlvalue::Variable(stub_result)],
         Some(graph_inner.returnblock.clone()),
         None,
     )));
@@ -3994,6 +4043,7 @@ fn return_token_to_lltype(token: Option<&str>) -> Option<LowLevelType> {
         // is `SomePtr`, resolved once layouts are on the bookkeeper.
         Some(s) if raw_owner_return_root(s).is_some() => Some(LowLevelType::Signed),
         Some("u64") => Some(LowLevelType::Unsigned),
+        Some("f32") => Some(LowLevelType::SingleFloat),
         Some("f64") => Some(LowLevelType::Float),
         _ => None,
     }
@@ -4131,12 +4181,12 @@ fn declared_funcptr_type_from_legacy(
 /// residual is seeded before `set_getdesc`.
 pub(crate) fn register_unsafe_fn_stubs(
     registry: &CallRegistry,
-    specs: &[(Vec<String>, Signature, Option<String>)],
+    specs: &[ResidualStubSpec],
     function_graphs: Option<&crate::codewriter::call::GraphStore>,
 ) {
     use crate::decline::gate::CALL_REGISTRY as REGISTRY_GATE;
     let foreign_callables = registry_foreign_callables(registry);
-    for (segments, signature, return_token) in specs {
+    for (segments, signature, return_token, return_lltype) in specs {
         // `collect_unsafe_fn_stubs_from_llbc` feeds opaque foreign decls
         // (`core::ptr::copy_nonoverlapping`, `std::alloc::alloc_zeroed`)
         // here, before they ever become a `SemanticFunction`. Declining
@@ -4162,28 +4212,94 @@ pub(crate) fn register_unsafe_fn_stubs(
             let _ = registry.lookup(&key);
             continue;
         }
-        if alias_existing_lookup(registry, &key) {
-            // Already registered via the function_graphs pass (e.g. a
-            // safe fn with the same path).  Don't overwrite; alias the
-            // Charon `name_path()` spelling onto that FunctionDesc.
-            continue;
-        }
         // A declared Void / `()` token is `s_None` through
         // `residual_return_annotation` → `default_someshell_for_lltype`
         // (`extfunc.py` `register_external` result `None` → `s_None`).
-        // A missing token (Unknown) falls through that helper.
-        let Some(result_shell) = raw_ptr_token_annotation(registry, return_token.as_deref())
-            .or_else(|| {
-                function_graphs.and_then(|store| {
-                    let path = crate::parse::CallPath::from_segments(segments.iter().cloned());
-                    let graph = store.declared_funcobj(&path)?;
-                    declared_return_annotation(registry, graph.as_ref())
-                })
+        // A missing collect token takes FUNC.RESULT from the declared
+        // lltype (`rffi.py` `llexternal` `ext_type.RESULT` /
+        // `extfunc.py` `register_external` `annotation(result)`).
+        let store_path =
+            function_graphs.and_then(|store| graphstore_path_for_lookup_key(store, &key));
+        let store_graph = store_path.as_ref().and_then(|path| {
+            function_graphs.and_then(|store| {
+                store
+                    .declared_funcobj(path)
+                    .or_else(|| store.funcobj_header(path))
             })
-            .or_else(|| {
-                residual_return_annotation(return_token.as_deref(), Some(registry.bookkeeper()))
+        });
+        // `annrpython.py` `recursivecall` walks a look-inside funcobj.
+        // A GraphStore header with `_jit_look_inside_ != False` is that
+        // funcobj even when the body is still lazy (`body.graph()` None).
+        // Requiring a loaded body residualized `pin` / `reload` as
+        // ExtFuncEntry stubs (`__unsafe_stub_result` used-before-def).
+        let has_look_inside_body = store_graph
+            .as_ref()
+            .is_some_and(|graph| graph.func.jit_look_inside != Some(false))
+            || declared_source_graph_func(function_graphs, segments, &foreign_callables)
+                .is_some_and(|func| func._jit_look_inside_ != Some(false));
+        let declared_token = return_token.as_deref().or_else(|| {
+            store_graph.as_ref().and_then(|graph| {
+                graph
+                    .residual_return_type
+                    .as_deref()
+                    .or(graph.return_type.as_deref())
             })
-        else {
+        });
+        let result_shell = return_lltype
+            .as_ref()
+            .and_then(default_someshell_for_lltype)
+            .or_else(|| raw_ptr_token_annotation(registry, declared_token))
+            .or_else(|| {
+                store_graph
+                    .as_ref()
+                    .and_then(|graph| declared_return_annotation(registry, graph.as_ref()))
+            })
+            .or_else(|| residual_return_annotation(declared_token, Some(registry.bookkeeper())));
+        if alias_existing_lookup(registry, &key) {
+            // Already registered via the function_graphs pass (e.g. a
+            // safe fn with the same path).  Don't overwrite; alias
+            // GraphStore spellings of the same GraphKey onto that
+            // FunctionDesc.
+            if let Some(entry) = registry.lookup_registered(&key) {
+                alias_graphstore_spellings(function_graphs, registry, &key, &entry);
+                // A bodyless residual already registered (`alias_opaque`)
+                // without `_signature_` still takes FUNC.RESULT from the
+                // declared lltype (`extfunc.py`
+                // `ExtFuncEntry.compute_result_annotation`). A look-inside
+                // wrapper keeps its GraphStore body (`annrpython.py`
+                // `recursivecall`).
+                if !has_look_inside_body
+                    && entry
+                        .host_object
+                        .user_function()
+                        .is_some_and(|func| func._jit_look_inside_ == Some(false))
+                    && let Some(result_shell) = result_shell
+                {
+                    let stub_pygraph = build_stub_pygraph_with_result_shell(
+                        segments.last().cloned().unwrap_or_default(),
+                        signature.clone(),
+                        result_shell.clone(),
+                    );
+                    entry.install_external_stub(stub_pygraph, result_shell);
+                }
+            }
+            continue;
+        }
+        if has_look_inside_body {
+            // `annrpython.py` `RPythonAnnotator.recursivecall`: a
+            // look-inside wrapper is annotated by walking its body.
+            // `describe_declared_funcobj` installs that GraphStore
+            // graph on first lookup. Do not mint a residual stub
+            // (`extfunc.py` `ExtFuncEntry` is the bodyless callee).
+            if let Some(path) = store_path.as_ref()
+                && let Some(existing) = function_graphs
+                    .and_then(|store| existing_graphstore_entry(store, registry, path))
+            {
+                alias_graphstore_spellings(function_graphs, registry, &key, &existing);
+            }
+            continue;
+        }
+        let Some(result_shell) = result_shell else {
             continue;
         };
         let stub_pygraph = build_stub_pygraph_with_result_shell(
@@ -4207,8 +4323,9 @@ pub(crate) fn register_unsafe_fn_stubs(
         // `register_external` residual: the JIT has no body to look inside
         // (`dont_look_inside` sets `_jit_look_inside_ = False`).
         graph_func._jit_look_inside_ = Some(false);
-        let entry = registry.get_or_register_with_func(key, signature.clone(), graph_func);
+        let entry = registry.get_or_register_with_func(key.clone(), signature.clone(), graph_func);
         entry.install_external_stub(stub_pygraph, result_shell);
+        alias_graphstore_spellings(function_graphs, registry, &key, &entry);
     }
 }
 
@@ -4563,12 +4680,14 @@ pub(crate) fn is_no_effect_external(segments: &[String]) -> bool {
 
 /// Register the [`NO_EFFECT_EXTERNALS`] table into `registry`.
 ///
-/// Same annotator-only, non-overwriting `register_opaque_external`
-/// carrier as [`register_foreign_stdlib_externals`]. The codewriter
-/// drops matching calls rather than residualizing them.
+/// These are bodyless `register_external` rows (`extfunc.py`
+/// `ExtFuncEntry`). An Impossible result `HarmlesslySwallowed` would
+/// skip the rest of a look-inside block (`annrpython.py` `flowin`),
+/// including the bodyless extern Call that follows
+/// (`icf_identity_token` then `__rffi_fp_*` in `ccall_*`).
 pub(crate) fn register_no_effect_externals(registry: &CallRegistry) {
     for (segments, argnames, return_lltype) in NO_EFFECT_EXTERNALS {
-        register_opaque_external(registry, segments, argnames, return_lltype.clone());
+        register_residual_signature_external(registry, segments, argnames, return_lltype.clone());
     }
 }
 
@@ -4586,6 +4705,50 @@ pub(crate) fn register_runtime_residual_externals(registry: &CallRegistry) {
         &[],
         crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
     );
+}
+
+/// Register one bodyless residual as `extfunc.py` `ExtFuncEntry`:
+/// `_jit_look_inside_ = False` and `_signature_` from the declared
+/// result lltype (`compute_result_annotation`).
+fn register_residual_signature_external(
+    registry: &CallRegistry,
+    segments: &[&str],
+    argnames: &[&str],
+    return_lltype: LowLevelType,
+) {
+    let signature = Signature::new(
+        argnames.iter().map(|n| (*n).to_string()).collect(),
+        None,
+        None,
+    );
+    let Some(result_shell) = default_someshell_for_lltype(&return_lltype) else {
+        return;
+    };
+    let stub_pygraph = build_stub_pygraph_with_result_shell(
+        segments.last().copied().unwrap_or_default().to_string(),
+        signature.clone(),
+        result_shell.clone(),
+    );
+    let key = FunctionPathKey::from_segments(segments.iter().map(|s| s.to_string()));
+    if alias_existing_lookup(registry, &key) {
+        if let Some(entry) = registry.lookup_registered(&key)
+            && entry
+                .host_object
+                .user_function()
+                .is_some_and(|func| func._jit_look_inside_ == Some(false))
+        {
+            entry.install_external_stub(stub_pygraph, result_shell);
+        }
+        return;
+    }
+    let mut graph_func = GraphFunc::new(
+        segments.last().copied().unwrap_or_default().to_string(),
+        Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
+    );
+    graph_func._jit_look_inside_ = Some(false);
+    registry
+        .get_or_register_with_func(key, signature, graph_func)
+        .install_external_stub(stub_pygraph, result_shell);
 }
 
 /// Register one opaque external through the annotator-only stub carrier.
@@ -4682,6 +4845,14 @@ fn register_opaque_external_argtype_with_result(
     );
     let key = FunctionPathKey::from_segments(segments.iter().map(|s| s.to_string()));
     if alias_existing_lookup(registry, &key) {
+        if let Some(entry) = registry.lookup_registered(&key)
+            && entry
+                .host_object
+                .user_function()
+                .is_some_and(|func| func._jit_look_inside_ == Some(false))
+        {
+            entry.install_external_stub(stub_pygraph.clone(), s_result);
+        }
         return;
     }
     let tag = format!("specialize:argtype({argtype_index})");
@@ -8465,6 +8636,7 @@ mod tests {
             vec!["pyobject".to_string(), "is_none".to_string()],
             Signature::new(vec!["obj".to_string()], None, None),
             Some("bool".to_string()),
+            None,
         )];
         for segments in [
             vec!["std", "alloc", "alloc_zeroed"],
@@ -8476,6 +8648,7 @@ mod tests {
                 segments.iter().map(|s| (*s).to_string()).collect(),
                 Signature::new(vec!["layout".to_string()], None, None),
                 Some("ref".to_string()),
+                None,
             ));
         }
         register_unsafe_fn_stubs(&stub_registry, &specs, None);
@@ -8573,6 +8746,7 @@ mod tests {
             vec!["pyobject".to_string(), "is_none".to_string()],
             Signature::new(vec!["obj".to_string()], None, None),
             Some("bool".to_string()),
+            None,
         )];
         for segments in [
             vec!["core", "ptr", "copy_nonoverlapping"],
@@ -8586,6 +8760,7 @@ mod tests {
                     None,
                     None,
                 ),
+                None,
                 None,
             ));
         }
@@ -10390,6 +10565,7 @@ mod tests {
                 ],
                 Signature::new(vec![], None, None),
                 Some("ref".to_string()),
+                None,
             )];
             populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
             let qualified_entry = registry
@@ -10441,14 +10617,25 @@ mod tests {
                 segments: vec!["eval".into(), "handle_exception_with_context".into()],
                 specialization: crate::parse::GraphSpecialization::Regular,
             };
+            let crate_path = crate::parse::CallPath::from_segments([
+                "pyre_interpreter",
+                "eval",
+                "handle_exception_with_context",
+            ]);
             let decls = FuncObjDeclarations::default();
             decls.push(DeclaredFuncObj {
-                path: qualified,
+                path: qualified.clone(),
                 graph: LazyGraph::built(graph),
                 transform: GraphTransform::default(),
             });
             let mut graphs = crate::codewriter::call::GraphStore::default();
             graphs.use_declarations(decls);
+            graphs.share_path(crate_path.clone(), &qualified);
+            assert_eq!(
+                graphs.key_for(&crate_path),
+                graphs.key_for(&qualified),
+                "share_path must bind both spellings to one GraphKey"
+            );
             let stubs = vec![(
                 vec![
                     "pyre_interpreter".into(),
@@ -10457,6 +10644,7 @@ mod tests {
                 ],
                 Signature::new(vec![], None, None),
                 Some("ref".to_string()),
+                None,
             )];
             populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
             let stub_entry = registry
@@ -10510,6 +10698,7 @@ mod tests {
             vec!["other".into(), "f".into()],
             Signature::new(vec![], None, None),
             Some("ref".to_string()),
+            None,
         )];
         populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
         let f_entry = registry
@@ -10573,6 +10762,7 @@ mod tests {
                     ],
                     sig.clone(),
                     Some("i64".to_string()),
+                    None,
                 ),
                 (
                     vec![
@@ -10582,6 +10772,7 @@ mod tests {
                     ],
                     sig.clone(),
                     Some("i64".to_string()),
+                    None,
                 ),
             ];
             populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
@@ -10676,6 +10867,7 @@ mod tests {
                 ],
                 Signature::new(vec![], None, None),
                 Some("ref".to_string()),
+                None,
             )];
             populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
             let stripped =
@@ -10860,6 +11052,7 @@ mod tests {
                 None,
             ),
             Some(token),
+            None,
         )];
         populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
         let key = FunctionPathKey::from_segments([
@@ -14842,6 +15035,7 @@ mod tests {
                     index: index.clone(),
                     item_ty: ValueType::Ref(None),
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
@@ -15594,6 +15788,7 @@ mod tests {
                     index: index.clone(),
                     item_ty: ValueType::Int,
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
@@ -17140,6 +17335,7 @@ mod tests {
             callee.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             Signature::new(vec!["kind".to_string()], None, None),
             Some("ref".to_string()),
+            None,
         )];
         let registry = std::rc::Rc::new(CallRegistry::new(std::rc::Rc::new(
             crate::annotator::bookkeeper::Bookkeeper::new(),
@@ -18355,6 +18551,339 @@ mod tests {
             }
             other => panic!("stub return must be Hlvalue::Variable, got {other:?}"),
         }
+        match graph.getreturnvar() {
+            Hlvalue::Variable(v) => {
+                let ann = v.annotation.borrow();
+                let s = ann
+                    .as_ref()
+                    .expect("getreturnvar must be pre-annotated for recursivecall");
+                match &**s {
+                    SomeValue::Bool(b) => assert!(
+                        b.base.const_box.is_none(),
+                        "getreturnvar SomeBool must not leak a const_box"
+                    ),
+                    other => panic!("expected SomeBool on getreturnvar, got {other:?}"),
+                }
+            }
+            other => panic!("getreturnvar must be Hlvalue::Variable, got {other:?}"),
+        }
+    }
+
+    fn bodyless_extern_wrapper_call_graph(
+        ext_segments: &[&str],
+        result_ty: ValueType,
+    ) -> (LegacyGraph, crate::flowspace::model::Variable) {
+        let mut graph = LegacyGraph::new("wrapper_return_ext");
+        let vars = mint_vars(&mut graph, 3);
+        let result = vars[2].clone();
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![crate::model::SpaceOperation {
+                result: Some(result.clone()),
+                kind: crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::function_path(ext_segments.iter().copied()),
+                    args: crate::model::call_args(vec![vars[1].clone()]),
+                    result_ty: result_ty.clone(),
+                },
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(result.clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: vec![result.clone()],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+        setbinding(&vars[1], result_ty);
+        (graph, result)
+    }
+
+    /// `extfunc.py` `ExtFuncEntry.compute_result_annotation` /
+    /// `signature.py` `_compute_annotation`: a bodyless extern stub's
+    /// declared FUNC.RESULT is `lltype_to_annotation` of that lltype.
+    /// A look-inside wrapper whose body is `return ext(x)` walks that
+    /// Call and keeps the annotation (`annrpython.py`
+    /// `RPythonAnnotator.recursivecall`).
+    #[test]
+    fn look_inside_wrapper_return_ext_annotates_declared_func_result() {
+        let _lock = anchor_lock();
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+
+        for (result_lltype, result_ty, name) in [
+            (LowLevelType::Signed, ValueType::Int, "bodyless_ext_i64"),
+            (LowLevelType::Float, ValueType::Float, "bodyless_ext_f64"),
+        ] {
+            let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+            let specs = vec![(
+                vec![name.to_string()],
+                Signature::new(vec!["x".to_string()], None, None),
+                None,
+                Some(result_lltype.clone()),
+            )];
+            register_unsafe_fn_stubs(&registry, &specs, None);
+            let (graph, result) = bodyless_extern_wrapper_call_graph(&[name], result_ty);
+            let (value_to_var, _) =
+                specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
+                    .expect("look-inside wrapper return ext(x) annotates");
+            let ann = value_to_var.get(&result).and_then(|typed| {
+                typed
+                    .annotation
+                    .borrow()
+                    .as_ref()
+                    .map(|cell| (**cell).clone())
+            });
+            match (&result_lltype, ann.as_ref()) {
+                (LowLevelType::Signed, Some(SomeValue::Integer(_)))
+                | (LowLevelType::Float, Some(SomeValue::Float(_))) => {}
+                _ => panic!(
+                    "declared {result_lltype:?} FUNC.RESULT must annotate as SomeInteger/SomeFloat, got {ann:?}"
+                ),
+            }
+            assert!(
+                !matches!(ann, Some(SomeValue::Impossible) | None),
+                "bodyless external result is never s_ImpossibleValue"
+            );
+        }
+    }
+
+    /// `ccall_*` `releasegil` wrappers Call a Void around-state residual
+    /// (`icf_identity_token` / `extfunc.py` `register_external` result
+    /// `None` → `s_None`) then the bodyless extern. An Impossible Void
+    /// Call `HarmlesslySwallowed` would skip the return link
+    /// (`annrpython.py` `flowin`).
+    #[test]
+    fn look_inside_wrapper_void_then_ext_annotates_declared_func_result() {
+        let _lock = anchor_lock();
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+
+        for (result_lltype, result_ty, name) in [
+            (LowLevelType::Signed, ValueType::Int, "bodyless_ext_i64"),
+            (LowLevelType::Float, ValueType::Float, "bodyless_ext_f64"),
+        ] {
+            let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+            register_no_effect_externals(&registry);
+            let specs = vec![(
+                vec![name.to_string()],
+                Signature::new(vec!["x".to_string()], None, None),
+                None,
+                Some(result_lltype.clone()),
+            )];
+            register_unsafe_fn_stubs(&registry, &specs, None);
+            let mut graph = LegacyGraph::new("wrapper_void_then_ext");
+            let vars = mint_vars(&mut graph, 4);
+            let discarded = vars[2].clone();
+            let result = vars[3].clone();
+            let startblock = Block {
+                id: graph.startblock,
+                inputargs: block_inputargs(&vars, &[1]),
+                operations: vec![
+                    crate::model::SpaceOperation {
+                        result: Some(discarded),
+                        kind: crate::model::OpKind::Call {
+                            target: crate::model::CallTarget::function_path([
+                                "majit_ir",
+                                "icf",
+                                "icf_identity_token",
+                            ]),
+                            args: crate::model::call_args(
+                                None::<crate::flowspace::model::Variable>,
+                            ),
+                            result_ty: ValueType::Void,
+                        },
+                    },
+                    crate::model::SpaceOperation {
+                        result: Some(result.clone()),
+                        kind: crate::model::OpKind::Call {
+                            target: crate::model::CallTarget::function_path([name]),
+                            args: crate::model::call_args(vec![vars[1].clone()]),
+                            result_ty: result_ty.clone(),
+                        },
+                    },
+                ],
+                exitswitch: None,
+                exits: vec![link_to_returnblock(
+                    vec![LinkArg::Value(result.clone())],
+                    graph.returnblock,
+                )],
+                framestate: None,
+                dead: false,
+            };
+            let returnblock = Block {
+                id: graph.returnblock,
+                inputargs: vec![result.clone()],
+                operations: vec![],
+                exitswitch: None,
+                exits: vec![],
+                framestate: None,
+                dead: false,
+            };
+            graph.blocks = vec![startblock, returnblock];
+            setbinding(&vars[1], result_ty);
+            let (value_to_var, _) =
+                specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
+                    .expect("look-inside wrapper void-then-ext(x) annotates");
+            let ann = value_to_var.get(&result).and_then(|typed| {
+                typed
+                    .annotation
+                    .borrow()
+                    .as_ref()
+                    .map(|cell| (**cell).clone())
+            });
+            match (&result_lltype, ann.as_ref()) {
+                (LowLevelType::Signed, Some(SomeValue::Integer(_)))
+                | (LowLevelType::Float, Some(SomeValue::Float(_))) => {}
+                _ => panic!(
+                    "declared {result_lltype:?} FUNC.RESULT must annotate as SomeInteger/SomeFloat, got {ann:?}"
+                ),
+            }
+        }
+    }
+
+    /// GraphStore `share_path` is `bookkeeper.py Bookkeeper.getdesc`
+    /// identity: two spellings of one funcobj share a `GraphKey` and one
+    /// FunctionEntry. Charon `name_path()` keys the residual on the
+    /// crate-prefixed spelling; a look-inside wrapper Call uses the
+    /// crate-stripped spelling.
+    #[test]
+    fn crate_stripped_wrapper_call_hits_bodyless_extern_stub_result() {
+        let _lock = anchor_lock();
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+
+        for (result_lltype, result_ty, leaf) in [
+            (LowLevelType::Signed, ValueType::Int, "bodyless_ext_i64"),
+            (LowLevelType::Float, ValueType::Float, "bodyless_ext_f64"),
+        ] {
+            let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+            let crate_path = crate::parse::CallPath::from_segments(["majit_rlib", "extmod", leaf]);
+            let stripped_path = crate::parse::CallPath::from_segments(["extmod", leaf]);
+            let mut header = empty_return_graph(leaf);
+            header.func.jit_look_inside = Some(false);
+            header.source_identity = Some(format!("majit_rlib::extmod::{leaf}"));
+            let mut graphs = crate::codewriter::call::GraphStore::default();
+            graphs.insert(crate_path.clone(), header);
+            graphs.share_path(stripped_path.clone(), &crate_path);
+            assert_eq!(
+                graphs.key_for(&crate_path),
+                graphs.key_for(&stripped_path),
+                "share_path must bind both spellings to one GraphKey"
+            );
+            assert!(graphs.key_for(&crate_path).is_some());
+
+            let specs = vec![(
+                vec![
+                    "majit_rlib".to_string(),
+                    "extmod".to_string(),
+                    leaf.to_string(),
+                ],
+                Signature::new(vec!["x".to_string()], None, None),
+                None,
+                Some(result_lltype.clone()),
+            )];
+            register_unsafe_fn_stubs(&registry, &specs, Some(&graphs));
+            let crate_entry = registry
+                .lookup(&FunctionPathKey::from(&crate_path))
+                .expect("crate-prefixed stub");
+            let stripped_entry = registry
+                .lookup(&FunctionPathKey::from(&stripped_path))
+                .expect("crate-stripped alias of the same GraphKey");
+            assert!(
+                Rc::ptr_eq(&crate_entry, &stripped_entry),
+                "one GraphKey is one FunctionEntry"
+            );
+
+            let (graph, result) =
+                bodyless_extern_wrapper_call_graph(&["extmod", leaf], result_ty.clone());
+            let (value_to_var, _) =
+                specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
+                    .expect("crate-stripped wrapper return ext(x) annotates");
+            let ann = value_to_var.get(&result).and_then(|typed| {
+                typed
+                    .annotation
+                    .borrow()
+                    .as_ref()
+                    .map(|cell| (**cell).clone())
+            });
+            match (&result_lltype, ann.as_ref()) {
+                (LowLevelType::Signed, Some(SomeValue::Integer(_)))
+                | (LowLevelType::Float, Some(SomeValue::Float(_))) => {}
+                _ => panic!(
+                    "declared {result_lltype:?} FUNC.RESULT must annotate as SomeInteger/SomeFloat, got {ann:?}"
+                ),
+            }
+            assert!(
+                !matches!(ann, Some(SomeValue::Impossible) | None),
+                "bodyless external result is never s_ImpossibleValue"
+            );
+        }
+    }
+
+    /// Two bodyless functions whose GraphKeys differ do not share a
+    /// FunctionEntry (`bookkeeper.py Bookkeeper.getdesc` object identity).
+    #[test]
+    fn distinct_bodyless_funcobjs_do_not_share_a_function_entry() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+
+        let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        let path_a = crate::parse::CallPath::from_segments(["a", "m", "f"]);
+        let path_b = crate::parse::CallPath::from_segments(["m", "f"]);
+        let mut graph_a = empty_return_graph("f");
+        graph_a.func.jit_look_inside = Some(false);
+        graph_a.source_identity = Some("a::m::f".into());
+        let mut graph_b = empty_return_graph("f");
+        graph_b.func.jit_look_inside = Some(false);
+        graph_b.source_identity = Some("m::f".into());
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.insert(path_a.clone(), graph_a);
+        graphs.insert(path_b.clone(), graph_b);
+        assert_ne!(
+            graphs.key_for(&path_a),
+            graphs.key_for(&path_b),
+            "distinct source_identity must yield distinct GraphKeys"
+        );
+        let sig = Signature::new(vec!["x".to_string()], None, None);
+        let specs = vec![
+            (
+                vec!["a".to_string(), "m".to_string(), "f".to_string()],
+                sig.clone(),
+                None,
+                Some(LowLevelType::Signed),
+            ),
+            (
+                vec!["m".to_string(), "f".to_string()],
+                sig,
+                None,
+                Some(LowLevelType::Signed),
+            ),
+        ];
+        register_unsafe_fn_stubs(&registry, &specs, Some(&graphs));
+        let entry_a = registry
+            .lookup(&FunctionPathKey::from(&path_a))
+            .expect("a::m::f stub");
+        let entry_b = registry
+            .lookup(&FunctionPathKey::from(&path_b))
+            .expect("m::f stub");
+        assert!(
+            !Rc::ptr_eq(&entry_a, &entry_b),
+            "distinct GraphKeys must not share a FunctionEntry"
+        );
     }
 
     #[test]
@@ -18368,16 +18897,19 @@ mod tests {
                 vec!["pyobject".to_string(), "is_none".to_string()],
                 Signature::new(vec!["obj".to_string()], None, None),
                 Some("bool".to_string()),
+                None,
             ),
             (
                 vec!["pyobject".to_string(), "is_int".to_string()],
                 Signature::new(vec!["obj".to_string()], None, None),
                 Some("bool".to_string()),
+                None,
             ),
             (
                 vec!["majit_gc".to_string(), "shadow_push".to_string()],
                 Signature::new(vec!["obj".to_string()], None, None),
                 Some("u64".to_string()),
+                None,
             ),
             // A token `residual_return_shell` declines — 128-bit has no
             // `getkind` at the codewriter boundary — so
@@ -18386,6 +18918,7 @@ mod tests {
                 vec!["pyobject".to_string(), "unsupported".to_string()],
                 Signature::new(vec!["x".to_string()], None, None),
                 Some("i128".to_string()),
+                None,
             ),
         ];
         register_unsafe_fn_stubs(&registry, &specs, None);
@@ -18425,6 +18958,7 @@ mod tests {
             vec!["pyobject".to_string(), "is_none".to_string()],
             Signature::new(vec!["obj".to_string()], None, None),
             Some("bool".to_string()),
+            None,
         )];
         register_unsafe_fn_stubs(&registry, &specs, None);
         let entry = registry
@@ -18459,6 +18993,7 @@ mod tests {
         use crate::translator::rtyper::call_registry::CallRegistry;
 
         let mut graph = empty_return_graph("is_none");
+        graph.func.jit_look_inside = Some(false);
         graph.return_type = Some("bool".into());
         let qualified = crate::parse::CallPath {
             segments: vec!["pyobject".into(), "is_none".into()],
@@ -18487,6 +19022,7 @@ mod tests {
             vec!["pyobject".to_string(), "is_none".to_string()],
             Signature::new(vec!["obj".to_string()], None, None),
             Some("bool".to_string()),
+            None,
         )];
         register_unsafe_fn_stubs(&registry, &specs, Some(&graphs));
         let entry = registry
@@ -19846,6 +20382,7 @@ mod tests {
             vec!["pyobject".to_string(), "is_none".to_string()],
             Signature::new(vec!["obj".to_string()], None, None),
             Some("bool".to_string()),
+            None,
         )];
         let bk = std::rc::Rc::new(Bookkeeper::new());
         let registry = CallRegistry::new(bk);
@@ -19887,6 +20424,7 @@ mod tests {
             vec!["pyobject".to_string(), "shared".to_string()],
             signature,
             Some("bool".to_string()),
+            None,
         )];
         register_unsafe_fn_stubs(&registry, &specs, None);
         assert_eq!(registry.len(), 1, "no new entry expected");

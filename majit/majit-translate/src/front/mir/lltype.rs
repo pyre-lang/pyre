@@ -631,11 +631,7 @@ pub fn collect_unsafe_fn_stubs_from_llbc(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     error_carrier: crate::ErrorCarrierSpec<'_>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
-) -> Vec<(
-    Vec<String>,
-    crate::flowspace::argument::Signature,
-    Option<String>,
-)> {
+) -> Vec<crate::translator::rtyper::cutover::ResidualStubSpec> {
     collect_fn_stubs_from_llbc_if(
         llbc,
         gc_struct_ids,
@@ -676,11 +672,7 @@ pub(crate) fn collect_policy_opaque_fn_stubs_from_llbc(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     error_carrier: crate::ErrorCarrierSpec<'_>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
-) -> Vec<(
-    Vec<String>,
-    crate::flowspace::argument::Signature,
-    Option<String>,
-)> {
+) -> Vec<crate::translator::rtyper::cutover::ResidualStubSpec> {
     let marked = policy_opaque_fn_set_of(llbc);
     collect_fn_stubs_from_llbc_if(
         llbc,
@@ -1004,11 +996,7 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
     include: impl Fn(&FunDecl) -> bool,
     admit_option_raw_adt_ptr: bool,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
-) -> Vec<(
-    Vec<String>,
-    crate::flowspace::argument::Signature,
-    Option<String>,
-)> {
+) -> Vec<crate::translator::rtyper::cutover::ResidualStubSpec> {
     use crate::flowspace::argument::Signature;
     let mut out = Vec::new();
     for fd in llbc.iter_local_fns() {
@@ -1037,7 +1025,10 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
         }
         // `"()"` is a declared unit (`residual_return_shell` → `s_None`).
         // `None` is unknown; `residual_return_shell` declines it.
-        // A token it declines keeps the original Skip.
+        // A bodyless extern then takes FUNC.RESULT as the LLBC fn
+        // signature lltype (`rffi.py` `llexternal` `ext_type.RESULT` /
+        // `extfunc.py` `register_external` `annotation(result)`).
+        // A token the shell declines keeps the original Skip.
         // `rffi.py llexternal`'s C pointer result is a raw address, even
         // when the C char type is u8. Rust's erased managed-byte-pointer
         // convention belongs to Rust bodies, not foreign declarations;
@@ -1053,9 +1044,19 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
                 raw_alloc_flavor_structs,
             )
         };
-        if crate::translator::rtyper::cutover::residual_return_shell(token.as_deref()).is_none() {
+        let result_lltype = if token.is_none() {
+            let lltype = tyref_to_external_lltype(&fd.signature.output, llbc);
+            if crate::translator::rtyper::cutover::default_someshell_for_lltype(&lltype).is_none() {
+                continue;
+            }
+            Some(lltype)
+        } else if crate::translator::rtyper::cutover::residual_return_shell(token.as_deref())
+            .is_none()
+        {
             continue;
-        }
+        } else {
+            None
+        };
         // The `ref` token collapses every non-`*mut PyObject` ADT onto one
         // GC-reference word, so on its own it would also admit a by-value
         // aggregate — `w_tuple_items_copy_as_vec` returns
@@ -1130,6 +1131,7 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
                 segments,
                 Signature::new(argnames.clone(), None, None),
                 token.clone(),
+                result_lltype.clone(),
             ));
         }
     }

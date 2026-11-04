@@ -4192,6 +4192,7 @@ mod tests {
                 OpKind::ArrayLen {
                     base,
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                 },

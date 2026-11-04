@@ -130,6 +130,7 @@ fn tuple_len_reads_the_fixed_list_not_the_items_block() {
             &op.kind,
             OpKind::ArrayLen {
                 array_type_id: Some(id),
+                array: _,
                 nolength: false,
                 gckind: ArrayGcKind::Gc,
                 ..
@@ -178,6 +179,7 @@ fn tuple_getitem_reads_the_fixed_list_not_the_items_block() {
             &op.kind,
             OpKind::ArrayRead {
                 array_type_id: Some(id),
+                array: _,
                 ..
             } if id == "majit::object_ref_gcarray"
         )),
@@ -403,6 +405,7 @@ fn pycode_code_ptr_is_raw_int_kind() {
         ],
         Signature::new(vec!["w_code".into(), "addrq".into()], None, None),
         Some("i64".into()),
+        None,
     ));
     for func in &program.functions {
         let path = if func.module_path.is_empty() {

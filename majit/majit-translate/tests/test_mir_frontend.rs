@@ -1602,6 +1602,7 @@ fn slot_read_shape(name: &str) -> SlotReadShape {
                 OpKind::ArrayRead {
                     item_ty,
                     array_type_id,
+                    array,
                     nolength,
                     ..
                 } => {

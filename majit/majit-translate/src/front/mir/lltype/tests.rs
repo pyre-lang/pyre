@@ -9815,18 +9815,10 @@ fn policy_opaque_nullable_pointer_option_is_a_residual_stub() {
         &std::collections::HashSet::<String>::new(),
     );
     fn leaf_of<'a>(
-        specs: &'a [(
-            Vec<String>,
-            crate::flowspace::argument::Signature,
-            Option<String>,
-        )],
+        specs: &'a [crate::translator::rtyper::cutover::ResidualStubSpec],
         leaf: &str,
-    ) -> Option<&'a (
-        Vec<String>,
-        crate::flowspace::argument::Signature,
-        Option<String>,
-    )> {
-        specs.iter().find(|(segments, _, _)| {
+    ) -> Option<&'a crate::translator::rtyper::cutover::ResidualStubSpec> {
+        specs.iter().find(|(segments, _, _, _)| {
             segments.len() == 3
                 && segments[0] == "fixture"
                 && segments[1] == "owner"
@@ -9896,9 +9888,9 @@ fn elidable_declaration_keeps_a_functiondesc_without_a_lowered_body() {
         "interp_exceptions",
         "lookup_exc_class_for_kind",
     ];
-    let (_, signature, token) = specs
+    let (_, signature, token, _) = specs
         .iter()
-        .find(|(segments, _, _)| {
+        .find(|(segments, _, _, _)| {
             segments
                 .iter()
                 .map(String::as_str)
@@ -9929,9 +9921,9 @@ fn getset_direct_residual_keeps_a_functiondesc_without_a_jitcode_body() {
         &std::collections::HashSet::<String>::new(),
     );
     let expected = ["pyre_interpreter", "typedef", "call_getset_fget_direct"];
-    let (_, signature, token) = specs
+    let (_, signature, token, _) = specs
         .iter()
-        .find(|(segments, _, _)| {
+        .find(|(segments, _, _, _)| {
             segments
                 .iter()
                 .map(String::as_str)
@@ -9968,9 +9960,9 @@ fn dont_look_inside_option_objectptr_residual_is_nullable_gcref() {
         &std::collections::HashSet::<String>::new(),
     );
     let expected = ["pyre_interpreter", "call", "metaclass_call_override"];
-    let (_, signature, token) = specs
+    let (_, signature, token, _) = specs
         .iter()
-        .find(|(segments, _, _)| {
+        .find(|(segments, _, _, _)| {
             segments
                 .iter()
                 .map(String::as_str)
@@ -10430,7 +10422,7 @@ fn foreign_byte_pointer_stub_keeps_the_c_address_bank() {
     let token = |leaf: &str| {
         specs
             .iter()
-            .find(|(path, _, _)| path.last().is_some_and(|p| p == leaf))
+            .find(|(path, _, _, _)| path.last().is_some_and(|p| p == leaf))
             .unwrap()
             .2
             .as_deref()

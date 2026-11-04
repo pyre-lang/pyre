@@ -337,6 +337,10 @@ mod tests {
             canonical_array_type_id("[*mut PyObject]").as_ref(),
             "majit::object_ref_gcarray"
         );
+        // `[str]` is `rlist.py` `get_itemarray_lowleveltype` after
+        // `rmodel.externalvsinternal(gcref=True)`: `GcArray(GCREF)`, a
+        // different ARRAY from `GcArray(OBJECTPTR)`.
+        assert_eq!(canonical_array_type_id("[str]").as_ref(), "[str]");
         assert_eq!(
             canonical_array_type_id("majit::object_ref_gcarray").as_ref(),
             "majit::object_ref_gcarray"

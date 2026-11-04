@@ -1104,6 +1104,7 @@ pub struct SemanticProgram {
         Vec<String>,
         crate::flowspace::argument::Signature,
         Option<String>,
+        Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
     )>,
     /// `(path-segments, Signature, result ValueType)` for every method on
     /// a foreign **opaque** ADT owner (`malachite_bigint::bigint::BigInt`,

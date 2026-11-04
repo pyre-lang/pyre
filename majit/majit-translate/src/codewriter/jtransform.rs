@@ -939,6 +939,14 @@ fn dict_lookup_entry_array_id(cc: &crate::call::CallControl) -> Option<String> {
     Some(format!("GcArray<{name}>"))
 }
 
+/// `DICT.entries.TO` (`rordereddict.py` `get_ll_dict`) when the dict
+/// Variable is rtyped.
+fn dict_lookup_entry_array(
+    dict: &crate::flowspace::model::Variable,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+    crate::codewriter::call::array_from_dict_entries(dict)
+}
+
 /// pyre's own driver receiver types, and the
 /// [`GraphTransformConfig::jitdriver_receiver_roots`] default. Each becomes its
 /// own portal via `portal_jd_index`. Another embedding pipeline names its
@@ -5383,6 +5391,12 @@ impl<'a> Transformer<'a> {
             OpKind::ArrayLen { base, .. } if self.config.lower_virtualizable => {
                 self.rewrite_op_getarraysize(op, base, graph_name)
             }
+            // ── rewrite_op_getinteriorfield ──
+            // `ARRAY = op.args[0].concretetype.TO` then
+            // `cpu.interiorfielddescrof(ARRAY, name)` (`jtransform.py`).
+            OpKind::InteriorFieldRead { base, .. } => self.rewrite_op_getinteriorfield(op, base),
+            // ── rewrite_op_setinteriorfield ──
+            OpKind::InteriorFieldWrite { base, .. } => self.rewrite_op_setinteriorfield(op, base),
             // ── rewrite_op_direct_call ──
             OpKind::Call {
                 target,
@@ -9115,6 +9129,9 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::ArrayLen {
                     base: base.clone(),
                     array_type_id: Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                    array: crate::codewriter::call::array_from_concretetype(
+                        base.concretetype().as_ref(),
+                    ),
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                 },
@@ -9480,6 +9497,7 @@ impl<'a> Transformer<'a> {
                 index,
                 item_ty,
                 array_type_id,
+                array,
                 nolength,
                 ..
             } => {
@@ -9503,6 +9521,7 @@ impl<'a> Transformer<'a> {
                             index: index.clone(),
                             item_ty: ValueType::Int,
                             array_type_id: array_type_id.clone(),
+                            array: array.clone(),
                             nolength: *nolength,
                             gckind: crate::model::ArrayGcKind::Raw,
                             pure: false,
@@ -9518,6 +9537,7 @@ impl<'a> Transformer<'a> {
                             index: index.clone(),
                             item_ty: ValueType::Int,
                             array_type_id: array_type_id.clone(),
+                            array: array.clone(),
                             nolength: *nolength,
                             gckind: crate::model::ArrayGcKind::Raw,
                             pure: false,
@@ -9538,6 +9558,7 @@ impl<'a> Transformer<'a> {
                 index,
                 value: crate::model::LinkArg::Value(value),
                 array_type_id,
+                array,
                 nolength,
                 ..
             } => {
@@ -9562,6 +9583,7 @@ impl<'a> Transformer<'a> {
                             value: crate::model::LinkArg::Value(word),
                             item_ty: ValueType::Int,
                             array_type_id: array_type_id.clone(),
+                            array: array.clone(),
                             nolength: *nolength,
                             gckind: crate::model::ArrayGcKind::Raw,
                         },
@@ -9639,16 +9661,29 @@ impl<'a> Transformer<'a> {
                 },
             }]);
         }
-        let (array_type_id, nolength, source_gckind, source_pure) = match &op.kind {
+        let (array_type_id, mut array, nolength, source_gckind, source_pure) = match &op.kind {
             OpKind::ArrayRead {
                 array_type_id,
+                array,
                 nolength,
                 gckind,
                 pure,
                 ..
-            } => (array_type_id.clone(), *nolength, *gckind, *pure),
+            } => (
+                array_type_id.clone(),
+                array.clone(),
+                *nolength,
+                *gckind,
+                *pure,
+            ),
             _ => unreachable!("rewrite_op_getarrayitem called on non-ArrayRead op"),
         };
+        let had_array = array.clone();
+        if let Some(from_ct) =
+            crate::codewriter::call::array_from_concretetype(base.concretetype().as_ref())
+        {
+            array = Some(from_ct);
+        }
         // `rewrite_op_getarrayitem`: `immut = ARRAY._immutable_field(None)`
         // → `pure = '_pure'`. The front leaves ordinary reads `pure: false`;
         // the array type's immutability lives on
@@ -9686,7 +9721,11 @@ impl<'a> Transformer<'a> {
         } else {
             false
         };
-        if &typed_item_ty != item_ty || pure != source_pure || gckind != source_gckind {
+        if &typed_item_ty != item_ty
+            || pure != source_pure
+            || gckind != source_gckind
+            || array != had_array
+        {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
                 kind: OpKind::ArrayRead {
@@ -9694,6 +9733,7 @@ impl<'a> Transformer<'a> {
                     index: index.clone(),
                     item_ty: typed_item_ty,
                     array_type_id,
+                    array,
                     nolength,
                     gckind,
                     pure,
@@ -9733,22 +9773,30 @@ impl<'a> Transformer<'a> {
             // `rewrite_op_getarraysize` asserts `_gckind == 'gc'` then
             // emits `arraylen_gc`. Stamp that from the operand, the same
             // way `rewrite_op_getarrayitem` stamps the item opcode.
-            let (array_type_id, nolength, source_gckind) = match &op.kind {
+            let (array_type_id, mut array, nolength, source_gckind) = match &op.kind {
                 OpKind::ArrayLen {
                     array_type_id,
+                    array,
                     nolength,
                     gckind,
                     ..
-                } => (array_type_id.clone(), *nolength, *gckind),
+                } => (array_type_id.clone(), array.clone(), *nolength, *gckind),
                 _ => unreachable!("rewrite_op_getarraysize called on non-ArrayLen op"),
             };
+            let had_array = array.clone();
+            if let Some(from_ct) =
+                crate::codewriter::call::array_from_concretetype(base.concretetype().as_ref())
+            {
+                array = Some(from_ct);
+            }
             let gckind = self.array_gckind_from_base(base, source_gckind);
-            if gckind != source_gckind {
+            if gckind != source_gckind || array != had_array {
                 return RewriteResult::Replace(vec![SpaceOperation {
                     result: op.result.clone(),
                     kind: OpKind::ArrayLen {
                         base: base.clone(),
                         array_type_id,
+                        array,
                         nolength,
                         gckind,
                     },
@@ -9834,20 +9882,27 @@ impl<'a> Transformer<'a> {
                 },
             ]);
         }
-        let (array_type_id, nolength, source_gckind) = match &op.kind {
+        let (array_type_id, mut array, nolength, source_gckind) = match &op.kind {
             OpKind::ArrayWrite {
                 array_type_id,
+                array,
                 nolength,
                 gckind,
                 ..
-            } => (array_type_id.clone(), *nolength, *gckind),
+            } => (array_type_id.clone(), array.clone(), *nolength, *gckind),
             _ => unreachable!("rewrite_op_setarrayitem called on non-ArrayWrite op"),
         };
+        let had_array = array.clone();
+        if let Some(from_ct) =
+            crate::codewriter::call::array_from_concretetype(base.concretetype().as_ref())
+        {
+            array = Some(from_ct);
+        }
         // `rewrite_op_setarrayitem` interpolates `ARRAY._gckind` into
         // `setarrayitem_{gckind}_*`. `ARRAY` is the operand's
         // `concretetype.TO`.
         let gckind = self.array_gckind_from_base(base, source_gckind);
-        if &typed_item_ty != item_ty || gckind != source_gckind {
+        if &typed_item_ty != item_ty || gckind != source_gckind || array != had_array {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
                 kind: OpKind::ArrayWrite {
@@ -9856,8 +9911,105 @@ impl<'a> Transformer<'a> {
                     value: value.clone(),
                     item_ty: typed_item_ty,
                     array_type_id,
+                    array,
                     nolength,
                     gckind,
+                },
+            }]);
+        }
+        RewriteResult::Keep
+    }
+
+    /// `jtransform.py rewrite_op_getinteriorfield`:
+    /// `ARRAY = op.args[0].concretetype.TO` then
+    /// `cpu.interiorfielddescrof(ARRAY, name)`.
+    fn rewrite_op_getinteriorfield(
+        &mut self,
+        op: &SpaceOperation,
+        base: &crate::flowspace::model::Variable,
+    ) -> RewriteResult {
+        let (array_type_id, mut array, index, field, item_ty) = match &op.kind {
+            OpKind::InteriorFieldRead {
+                array_type_id,
+                array,
+                index,
+                field,
+                item_ty,
+                ..
+            } => (
+                array_type_id.clone(),
+                array.clone(),
+                index.clone(),
+                field.clone(),
+                item_ty.clone(),
+            ),
+            _ => unreachable!("rewrite_op_getinteriorfield called on non-InteriorFieldRead op"),
+        };
+        let had_array = array.clone();
+        if let Some(from_ct) =
+            crate::codewriter::call::array_from_concretetype(base.concretetype().as_ref())
+        {
+            array = Some(from_ct);
+        }
+        if array != had_array {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::InteriorFieldRead {
+                    base: base.clone(),
+                    index,
+                    field,
+                    item_ty,
+                    array_type_id,
+                    array,
+                },
+            }]);
+        }
+        RewriteResult::Keep
+    }
+
+    /// `jtransform.py rewrite_op_setinteriorfield`:
+    /// `interiorfielddescrof(v_inst.concretetype.TO, c_field.value)`.
+    fn rewrite_op_setinteriorfield(
+        &mut self,
+        op: &SpaceOperation,
+        base: &crate::flowspace::model::Variable,
+    ) -> RewriteResult {
+        let (array_type_id, mut array, index, field, value, item_ty) = match &op.kind {
+            OpKind::InteriorFieldWrite {
+                array_type_id,
+                array,
+                index,
+                field,
+                value,
+                item_ty,
+                ..
+            } => (
+                array_type_id.clone(),
+                array.clone(),
+                index.clone(),
+                field.clone(),
+                value.clone(),
+                item_ty.clone(),
+            ),
+            _ => unreachable!("rewrite_op_setinteriorfield called on non-InteriorFieldWrite op"),
+        };
+        let had_array = array.clone();
+        if let Some(from_ct) =
+            crate::codewriter::call::array_from_concretetype(base.concretetype().as_ref())
+        {
+            array = Some(from_ct);
+        }
+        if array != had_array {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::InteriorFieldWrite {
+                    base: base.clone(),
+                    index,
+                    field,
+                    value,
+                    item_ty,
+                    array_type_id,
+                    array,
                 },
             }]);
         }
@@ -9902,6 +10054,7 @@ impl<'a> Transformer<'a> {
                     array_type_id: Some(crate::codewriter::call::array_type_id_of_lltype(&CArray(
                         LowLevelType::Char,
                     ))),
+                    array: Some(CArray(LowLevelType::Char)),
                     nolength: true,
                     gckind: crate::model::ArrayGcKind::Raw,
                     pure: false,
@@ -10583,17 +10736,21 @@ impl<'a> Transformer<'a> {
                 let length = graph
                     .alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
                 let item_ty = crate::front::mir::tuple_field_value_type(item);
+                let array_ll =
+                    crate::codewriter::call::array_from_concretetype(array.concretetype().as_ref());
                 let kind = if fixed_list_clears(item) {
                     OpKind::NewArrayClear {
                         length: length.clone(),
                         item_ty,
-                        array_type_id: Some(array_type_id),
+                        array_type_id: Some(array_type_id.clone()),
+                        array: array_ll,
                     }
                 } else {
                     OpKind::NewArray {
                         length: length.clone(),
                         item_ty,
-                        array_type_id: Some(array_type_id),
+                        array_type_id: Some(array_type_id.clone()),
+                        array: array_ll,
                     }
                 };
                 return RewriteResult::Replace(vec![
@@ -12269,9 +12426,11 @@ impl<'a> Transformer<'a> {
                     NewlistClearShape::Fixed {
                         item_ty,
                         array_type_id,
-                    } => Some(vec![cc.arraydescrof_for_type(
+                        array,
+                    } => Some(vec![cc.arraydescrof_for_op(
                         &item_ty,
                         &array_type_id,
+                        &array,
                         value_type_to_ir_type(&item_ty),
                         Some(0),
                     )]),
@@ -12394,6 +12553,7 @@ impl<'a> Transformer<'a> {
             }
             "list.int_getitem" => {
                 let l = args.first()?.clone();
+                let items_array = crate::codewriter::call::array_from_list_items(&l);
                 let index = args.get(1)?.clone();
                 let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
                 (
@@ -12418,6 +12578,7 @@ impl<'a> Transformer<'a> {
                                 index,
                                 item_ty: ValueType::Int,
                                 array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
+                                array: items_array.clone(),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                                 pure: false,
@@ -12437,6 +12598,7 @@ impl<'a> Transformer<'a> {
             // still move under a resize.
             "list.int_getitem_foldable" => {
                 let l = args.first()?.clone();
+                let items_array = crate::codewriter::call::array_from_list_items(&l);
                 let index = args.get(1)?.clone();
                 let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
                 (
@@ -12461,6 +12623,7 @@ impl<'a> Transformer<'a> {
                                 index,
                                 item_ty: ValueType::Int,
                                 array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
+                                array: items_array.clone(),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                                 pure: true,
@@ -12471,6 +12634,7 @@ impl<'a> Transformer<'a> {
             }
             "list.int_setitem" => {
                 let l = args.first()?.clone();
+                let items_array = crate::codewriter::call::array_from_list_items(&l);
                 let index = args.get(1)?.clone();
                 let value = args.get(2)?.clone();
                 let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
@@ -12497,6 +12661,7 @@ impl<'a> Transformer<'a> {
                                 value: crate::model::LinkArg::Value(value),
                                 item_ty: ValueType::Int,
                                 array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
+                                array: items_array.clone(),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                             },
@@ -12518,6 +12683,7 @@ impl<'a> Transformer<'a> {
                 // field instead classified the block pointer as a
                 // `StructPtrInfo` and exported an unrelated struct identity.
                 let l = args.first()?.clone();
+                let items_array = crate::codewriter::call::array_from_list_items(&l);
                 let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
                 (
                     "list.int_capacity → getfield_gc_r(int_items.block) + arraylen_gc(block)",
@@ -12539,6 +12705,7 @@ impl<'a> Transformer<'a> {
                             kind: OpKind::ArrayLen {
                                 base: block,
                                 array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
+                                array: items_array.clone(),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                             },
@@ -12608,6 +12775,7 @@ impl<'a> Transformer<'a> {
             }
             "list.float_getitem" => {
                 let l = args.first()?.clone();
+                let items_array = crate::codewriter::call::array_from_list_items(&l);
                 let index = args.get(1)?.clone();
                 let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
                 (
@@ -12632,6 +12800,7 @@ impl<'a> Transformer<'a> {
                                 index,
                                 item_ty: ValueType::Float,
                                 array_type_id: Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
+                                array: items_array.clone(),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                                 pure: false,
@@ -12642,6 +12811,7 @@ impl<'a> Transformer<'a> {
             }
             "list.float_setitem" => {
                 let l = args.first()?.clone();
+                let items_array = crate::codewriter::call::array_from_list_items(&l);
                 let index = args.get(1)?.clone();
                 let value = args.get(2)?.clone();
                 let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
@@ -12668,6 +12838,7 @@ impl<'a> Transformer<'a> {
                                 value: crate::model::LinkArg::Value(value),
                                 item_ty: ValueType::Float,
                                 array_type_id: Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
+                                array: items_array.clone(),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                             },
@@ -12681,6 +12852,7 @@ impl<'a> Transformer<'a> {
                 // See `list.int_capacity` above; the float strategy differs
                 // only in which backing block the length is taken from.
                 let l = args.first()?.clone();
+                let items_array = crate::codewriter::call::array_from_list_items(&l);
                 let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
                 (
                     "list.float_capacity → getfield_gc_r(float_items.block) + arraylen_gc(block)",
@@ -12702,6 +12874,7 @@ impl<'a> Transformer<'a> {
                             kind: OpKind::ArrayLen {
                                 base: block,
                                 array_type_id: Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
+                                array: items_array.clone(),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                             },
@@ -12770,6 +12943,7 @@ impl<'a> Transformer<'a> {
             }
             "list.obj_capacity" => {
                 let l = args.first()?.clone();
+                let items_array = crate::codewriter::call::array_from_list_items(&l);
                 let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
                 (
                     "list.obj_capacity → getfield_gc_r(items) + arraylen_gc(block)",
@@ -12796,6 +12970,7 @@ impl<'a> Transformer<'a> {
                                 array_type_id: Some(
                                     crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
                                 ),
+                                array: items_array.clone(),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                             },
@@ -12852,27 +13027,37 @@ impl<'a> Transformer<'a> {
                         NewlistClearShape::Resized {
                             item_ty,
                             array_type_id,
-                        } => (
-                            "newlist_clear → newlist_clear(count, arraydescr) \
+                            array,
+                        } => {
+                            let array = array;
+                            (
+                                "newlist_clear → newlist_clear(count, arraydescr) \
                          [resized list header]",
-                            OpKind::NewListClear {
-                                length,
-                                item_ty,
-                                array_type_id,
-                            },
-                        ),
+                                OpKind::NewListClear {
+                                    length,
+                                    item_ty,
+                                    array_type_id,
+                                    array,
+                                },
+                            )
+                        }
                         NewlistClearShape::Fixed {
                             item_ty,
                             array_type_id,
-                        } => (
-                            "newlist_clear → new_array_clear(count, arraydescr) \
+                            array,
+                        } => {
+                            let array = array;
+                            (
+                                "newlist_clear → new_array_clear(count, arraydescr) \
                          [fixed array]",
-                            OpKind::NewArrayClear {
-                                length,
-                                item_ty,
-                                array_type_id,
-                            },
-                        ),
+                                OpKind::NewArrayClear {
+                                    length,
+                                    item_ty,
+                                    array_type_id,
+                                    array,
+                                },
+                            )
+                        }
                         // OBJECTPTR / None fallback: a generic `OBJECTPTR`
                         // result (kind-collapsed `Ptr(GcStruct("object"))`)
                         // or a missing concretetype.  The allocation is
@@ -12889,6 +13074,7 @@ impl<'a> Transformer<'a> {
                                 array_type_id: Some(
                                     crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
                                 ),
+                                array: None,
                             },
                         ),
                     };
@@ -12923,9 +13109,11 @@ impl<'a> Transformer<'a> {
                     NewlistClearShape::Fixed {
                         item_ty,
                         array_type_id,
+                        array,
                     } => {
                         let (item_ty, array_type_id) =
                             arraydescr_of_fixed_array(item_ty, array_type_id);
+                        let array = array;
                         if matches!(item_ty, ValueType::Ref(_)) {
                             (
                                 "newlist → new_array_clear(length, arraydescr) \
@@ -12934,6 +13122,7 @@ impl<'a> Transformer<'a> {
                                     length,
                                     item_ty,
                                     array_type_id,
+                                    array,
                                 },
                             )
                         } else {
@@ -12943,6 +13132,7 @@ impl<'a> Transformer<'a> {
                                     length,
                                     item_ty,
                                     array_type_id,
+                                    array,
                                 },
                             )
                         }
@@ -12979,6 +13169,7 @@ impl<'a> Transformer<'a> {
             }
             "list.bytes_getitem" => {
                 let l = args.first()?.clone();
+                let items_array = crate::codewriter::call::array_from_list_items(&l);
                 let index = args.get(1)?.clone();
                 let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
                 (
@@ -13005,6 +13196,7 @@ impl<'a> Transformer<'a> {
                                 array_type_id: Some(
                                     crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
                                 ),
+                                array: items_array.clone(),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                                 pure: false,
@@ -13033,6 +13225,7 @@ impl<'a> Transformer<'a> {
             }
             "list.ascii_getitem" => {
                 let l = args.first()?.clone();
+                let items_array = crate::codewriter::call::array_from_list_items(&l);
                 let index = args.get(1)?.clone();
                 let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
                 (
@@ -13059,6 +13252,7 @@ impl<'a> Transformer<'a> {
                                 array_type_id: Some(
                                     crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
                                 ),
+                                array: items_array.clone(),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                                 pure: false,
@@ -13072,6 +13266,7 @@ impl<'a> Transformer<'a> {
                 // an ARRAY length. Same decomposition as `list.obj_capacity`;
                 // the block is AsciiListStrategy's erased `STR` array.
                 let l = args.first()?.clone();
+                let items_array = crate::codewriter::call::array_from_list_items(&l);
                 let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
                 (
                     "list.ascii_capacity → getfield_gc_r(ascii_items.block) + arraylen_gc(block)",
@@ -13095,6 +13290,7 @@ impl<'a> Transformer<'a> {
                                 array_type_id: Some(
                                     crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
                                 ),
+                                array: items_array.clone(),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                             },
@@ -13123,6 +13319,7 @@ impl<'a> Transformer<'a> {
             }
             "list.ascii_setitem" => {
                 let l = args.first()?.clone();
+                let items_array = crate::codewriter::call::array_from_list_items(&l);
                 let index = args.get(1)?.clone();
                 let value = args.get(2)?.clone();
                 let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
@@ -13151,6 +13348,7 @@ impl<'a> Transformer<'a> {
                                 array_type_id: Some(
                                     crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
                                 ),
+                                array: items_array.clone(),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                             },
@@ -13160,6 +13358,7 @@ impl<'a> Transformer<'a> {
             }
             "list.obj_getitem" => {
                 let l = args.first()?.clone();
+                let items_array = crate::codewriter::call::array_from_list_items(&l);
                 let index = args.get(1)?.clone();
                 let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
                 (
@@ -13183,6 +13382,7 @@ impl<'a> Transformer<'a> {
                                 array_type_id: Some(
                                     crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
                                 ),
+                                array: items_array.clone(),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                                 pure: false,
@@ -13193,6 +13393,7 @@ impl<'a> Transformer<'a> {
             }
             "list.obj_setitem" => {
                 let l = args.first()?.clone();
+                let items_array = crate::codewriter::call::array_from_list_items(&l);
                 let index = args.get(1)?.clone();
                 let value = args.get(2)?.clone();
                 let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
@@ -13218,6 +13419,7 @@ impl<'a> Transformer<'a> {
                                 array_type_id: Some(
                                     crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
                                 ),
+                                array: items_array.clone(),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                             },
@@ -13270,6 +13472,7 @@ impl<'a> Transformer<'a> {
         // `rust_vec_item_lltype` (`ARRAY.OF`); `descr.py` `get_type_flag`
         // reads its signedness and `sizeof` (`symbolic.get_array_token`).
         // The item leaf takes the length, and multiplies by that size inside.
+        let array = Some(rust_vec_item_array(item_ll));
         let array_type_id = Some(rust_vec_item_array_type_id(item_ll));
         let mut ops: Vec<SpaceOperation> = Vec::new();
         let const_int = raw_list_const_int;
@@ -13341,6 +13544,7 @@ impl<'a> Transformer<'a> {
                         index: index.clone(),
                         item_ty: item_ty.clone(),
                         array_type_id: array_type_id.clone(),
+                        array: array.clone(),
                         nolength: true,
                         gckind: crate::model::ArrayGcKind::Raw,
                         pure: false,
@@ -13386,6 +13590,7 @@ impl<'a> Transformer<'a> {
                         value: crate::model::LinkArg::Value(value),
                         item_ty,
                         array_type_id,
+                        array: array.clone(),
                         nolength: true,
                         gckind: crate::model::ArrayGcKind::Raw,
                     },
@@ -13540,7 +13745,7 @@ impl<'a> Transformer<'a> {
         let extradescrs = self
             .callcontrol
             .as_deref()
-            .and_then(Self::dict_lookup_extra_descrs);
+            .and_then(|cc| Self::dict_lookup_extra_descrs(cc, args));
         self._handle_oopspec_call(
             graph,
             op,
@@ -13555,21 +13760,31 @@ impl<'a> Transformer<'a> {
     }
 
     /// `cpu.fielddescrof(STRUCT, 'entries')` and `cpu.arraydescrof(STRUCT.entries.TO)`.
-    /// The harvest `register_ordereddict_i64_entry_rows` publishes the one
-    /// `Entry<i64, *mut PyObject>` `get_ll_dict` would have built.
-    fn dict_lookup_extra_descrs(cc: &crate::call::CallControl) -> Option<Vec<majit_ir::DescrRef>> {
+    /// `jtransform.py` `_handle_dict_lookup_call` reads
+    /// `op.args[1].concretetype.TO.entries.TO` when the dict Variable is
+    /// rtyped; otherwise the harvest dump key (`arraydescrof_for_type`).
+    fn dict_lookup_extra_descrs(
+        cc: &crate::call::CallControl,
+        args: &[crate::flowspace::model::Variable],
+    ) -> Option<Vec<majit_ir::DescrRef>> {
         let owner = dict_lookup_rdict_owner(cc)?;
-        let entry_array = dict_lookup_entry_array_id(cc)?;
         let field_idx = cc
             .descr_indices
             .field_index(&Some(owner.clone()), "entries");
         let field = cc.fielddescrof(field_idx, &owner, None, "entries")?;
-        let array = cc.arraydescrof_for_type(
-            &ValueType::Ref(None),
-            &Some(entry_array),
-            majit_ir::value::Type::Ref,
-            Some(0),
-        );
+        let array = args
+            .first()
+            .and_then(dict_lookup_entry_array)
+            .map(|arr| cc.arraydescrof_array(&arr))
+            .or_else(|| {
+                let entry_array = dict_lookup_entry_array_id(cc)?;
+                Some(cc.arraydescrof_for_type(
+                    &ValueType::Ref(None),
+                    &Some(entry_array),
+                    majit_ir::value::Type::Ref,
+                    Some(0),
+                ))
+            })?;
         Some(vec![field, array])
     }
 
@@ -15813,7 +16028,7 @@ fn rewrite_fixed_newlist(
     items: &[crate::flowspace::model::Variable],
     callcontrol: Option<&crate::call::CallControl>,
 ) -> RewriteResult {
-    let Some((item_ty, array_type_id, clears)) =
+    let Some((item_ty, array_type_id, clears, items_array)) =
         fixed_newlist_array(op.result.as_ref(), callcontrol)
     else {
         return RewriteResult::Keep;
@@ -15833,12 +16048,14 @@ fn rewrite_fixed_newlist(
             length,
             item_ty: item_ty.clone(),
             array_type_id: Some(array_type_id.clone()),
+            array: items_array.clone(),
         }
     } else {
         OpKind::NewArray {
             length,
             item_ty: item_ty.clone(),
             array_type_id: Some(array_type_id.clone()),
+            array: items_array.clone(),
         }
     };
     ops.push(SpaceOperation {
@@ -15869,6 +16086,7 @@ fn rewrite_fixed_newlist(
                 value: LinkArg::Value(item.clone()),
                 item_ty: item_ty.clone(),
                 array_type_id: Some(array_type_id.clone()),
+                array: items_array.clone(),
                 nolength,
                 gckind,
             },
@@ -15905,6 +16123,7 @@ fn rewrite_shaped_array_field(
         OpKind::FieldRead { base, .. } | OpKind::FieldWrite { base, .. } => base.clone(),
         _ => return None,
     };
+    let array_ll = crate::codewriter::call::array_from_concretetype(base.concretetype().as_ref());
     let index =
         graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
     let kind = if let Some(value) = value {
@@ -15913,7 +16132,8 @@ fn rewrite_shaped_array_field(
             index: index.clone(),
             value: value.clone(),
             item_ty,
-            array_type_id: Some(array_type_id),
+            array_type_id: Some(array_type_id.clone()),
+            array: array_ll,
             nolength: false,
             gckind: crate::model::ArrayGcKind::Gc,
         }
@@ -15922,7 +16142,8 @@ fn rewrite_shaped_array_field(
             base,
             index: index.clone(),
             item_ty,
-            array_type_id: Some(array_type_id),
+            array_type_id: Some(array_type_id.clone()),
+            array: array_ll,
             nolength: false,
             gckind: crate::model::ArrayGcKind::Gc,
             pure: false,
@@ -16404,28 +16625,34 @@ fn remap_op_renamings(
             length,
             item_ty,
             array_type_id,
+            array,
         } => OpKind::NewArray {
             length: remap_value(length, aliases),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
         },
         OpKind::NewArrayClear {
             length,
             item_ty,
             array_type_id,
+            array,
         } => OpKind::NewArrayClear {
             length: remap_value(length, aliases),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
         },
         OpKind::NewListClear {
             length,
             item_ty,
             array_type_id,
+            array,
         } => OpKind::NewListClear {
             length: remap_value(length, aliases),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
         },
         OpKind::GetSlice { args } => OpKind::GetSlice {
             args: args.iter().map(|a| remap_value(a, aliases)).collect(),
@@ -16537,6 +16764,7 @@ fn remap_op_renamings(
             index,
             item_ty,
             array_type_id,
+            array,
             nolength,
             gckind,
             pure,
@@ -16545,6 +16773,7 @@ fn remap_op_renamings(
             index: remap_value(index, aliases),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
             nolength: *nolength,
             gckind: *gckind,
             // Preserve the source foldable/immutable flag through the
@@ -16555,11 +16784,13 @@ fn remap_op_renamings(
         OpKind::ArrayLen {
             base,
             array_type_id,
+            array,
             nolength,
             gckind,
         } => OpKind::ArrayLen {
             base: remap_value(base, aliases),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
             nolength: *nolength,
             gckind: *gckind,
         },
@@ -16569,6 +16800,7 @@ fn remap_op_renamings(
             value,
             item_ty,
             array_type_id,
+            array,
             nolength,
             gckind,
         } => OpKind::ArrayWrite {
@@ -16577,6 +16809,7 @@ fn remap_op_renamings(
             value: remap_link_arg(value, aliases, constants),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
             nolength: *nolength,
             gckind: *gckind,
         },
@@ -16586,12 +16819,14 @@ fn remap_op_renamings(
             field,
             item_ty,
             array_type_id,
+            array,
         } => OpKind::InteriorFieldRead {
             base: remap_value(base, aliases),
             index: remap_value(index, aliases),
             field: field.clone(),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
         },
         OpKind::InteriorFieldWrite {
             base,
@@ -16600,6 +16835,7 @@ fn remap_op_renamings(
             value,
             item_ty,
             array_type_id,
+            array,
         } => OpKind::InteriorFieldWrite {
             base: remap_value(base, aliases),
             index: remap_value(index, aliases),
@@ -16607,6 +16843,7 @@ fn remap_op_renamings(
             value: remap_value(value, aliases),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
         },
         OpKind::Call {
             target,
@@ -17002,19 +17239,24 @@ fn raw_list_produced_const(
 /// that spelling stays `usize`. The identity is what lets `arraydescrof`
 /// read the flag and `sizeof(ARRAY.OF)`; without one, an int element is
 /// eight bytes wide.
-/// Same key `array_type_id_of_lltype` gives the raw ARRAY.
+/// The ARRAY is `rffi.CArray(ITEM)` (`rewrite_op_raw_store`); a GC-pointer
+/// item is stored as an untraced word, so `ITEM` is `Unsigned`.
+fn rust_vec_item_array(
+    item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> crate::translator::rtyper::lltypesystem::lltype::Array {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::lltypesystem::rffi::CArray;
+    if matches!(item, LowLevelType::Ptr(p) if p._needsgc()) {
+        CArray(LowLevelType::Unsigned)
+    } else {
+        CArray(item.clone())
+    }
+}
+
 fn rust_vec_item_array_type_id(
     item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
 ) -> String {
-    use crate::flowspace::model::ConstValue;
-    use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
-    if matches!(item, LowLevelType::Ptr(p) if p._needsgc()) {
-        return "Vec<usize>".to_string();
-    }
-    crate::codewriter::call::array_type_id_of_lltype(&Array::with_hints(
-        item.clone(),
-        vec![("nolength".into(), ConstValue::Bool(true))],
-    ))
+    crate::codewriter::call::array_type_id_of_lltype(&rust_vec_item_array(item))
 }
 
 /// Item buffer of a raw `Vec` header.
@@ -17601,12 +17843,14 @@ enum NewlistClearShape {
     Resized {
         item_ty: ValueType,
         array_type_id: Option<String>,
+        array: Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
     },
     /// Result is `Ptr(Array(ITEM))` — a bare fixed-size cleared array.
     /// `do_fixed_newlist_clear` (jtransform.py).
     Fixed {
         item_ty: ValueType,
         array_type_id: Option<String>,
+        array: Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
     },
     /// No concretetype, or a pointee that is neither the `"list"` struct
     /// nor an array (a generic `OBJECTPTR` from an untyped test).
@@ -17664,17 +17908,21 @@ fn newlist_clear_shape(
 
     /// The physical length-prefixed object array: a var-size GcStruct
     /// of exactly two fields, the first an integer length (`getkind`
-    /// Signed) and the last (`_arrayfld`) a `GcArray` of GC pointers,
-    /// or a registered rust layout with the same two-entry shape
-    /// (integer scalar then `[T; 0]` of GC pointers).  Extra header
-    /// fields before the trailing array put items at a different
-    /// offset than `OBJECT_REF_GCARRAY_TYPE_ID` (length word at
-    /// offset 0).  The resized `"list"` header is excluded by the
-    /// caller.
+    /// Signed) and the last (`_arrayfld`) an inlined RAW `Array` of GC
+    /// pointers (`Struct.__init__` cannot inline a Gc container past
+    /// the first field). `cpu.arraydescrof` intern `GcArray(OF)` of
+    /// that field (`rlist.py` items ARRAY), the same identity as
+    /// `OBJECT_REF_GCARRAY_TYPE_ID`. Extra header fields before the
+    /// trailing array put items at a different offset than
+    /// `OBJECT_REF_GCARRAY_TYPE_ID` (length word at offset 0). The
+    /// resized `"list"` header is excluded by the caller.
     fn object_items_array_id(
         s: &crate::translator::rtyper::lltypesystem::lltype::Struct,
         callcontrol: Option<&crate::call::CallControl>,
-    ) -> Option<String> {
+    ) -> Option<(
+        String,
+        Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
+    )> {
         if s._names.len() == 2
             && let Some(fld) = s._arrayfld.as_ref()
             && s._names.last() == Some(fld)
@@ -17686,7 +17934,12 @@ fn newlist_clear_shape(
             && let Some(LowLevelType::Array(a)) = s._flds.get(fld)
             && matches!(element_value_type(&a.OF), ValueType::Ref(_))
         {
-            return Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string());
+            return Some((
+                crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
+                Some(crate::translator::rtyper::lltypesystem::lltype::Array::gc(
+                    a.OF.clone(),
+                )),
+            ));
         }
         let fields = callcontrol.and_then(|cc| {
             cc.struct_field_entries(&s._name).or_else(|| {
@@ -17718,7 +17971,10 @@ fn newlist_clear_shape(
                 ValueType::Ref(_)
             )
         {
-            return Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string());
+            return Some((
+                crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
+                None,
+            ));
         }
         None
     }
@@ -17732,7 +17988,11 @@ fn newlist_clear_shape(
     fn typed_items_array_shape(
         s: &crate::translator::rtyper::lltypesystem::lltype::Struct,
         callcontrol: Option<&crate::call::CallControl>,
-    ) -> Option<(ValueType, String)> {
+    ) -> Option<(
+        ValueType,
+        String,
+        Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
+    )> {
         if s._names.len() == 2
             && let Some(fld) = s._arrayfld.as_ref()
             && s._names.last() == Some(fld)
@@ -17745,10 +18005,22 @@ fn newlist_clear_shape(
         {
             match element_value_type(&a.OF) {
                 ValueType::Int => {
-                    return Some((ValueType::Int, LIST_INT_ITEMS_ARRAY.to_string()));
+                    return Some((
+                        ValueType::Int,
+                        LIST_INT_ITEMS_ARRAY.to_string(),
+                        Some(crate::translator::rtyper::lltypesystem::lltype::Array::gc(
+                            a.OF.clone(),
+                        )),
+                    ));
                 }
                 ValueType::Float => {
-                    return Some((ValueType::Float, LIST_FLOAT_ITEMS_ARRAY.to_string()));
+                    return Some((
+                        ValueType::Float,
+                        LIST_FLOAT_ITEMS_ARRAY.to_string(),
+                        Some(crate::translator::rtyper::lltypesystem::lltype::Array::gc(
+                            a.OF.clone(),
+                        )),
+                    ));
                 }
                 _ => {}
             }
@@ -17774,9 +18046,9 @@ fn newlist_clear_shape(
         };
         match item {
             "i64" | "u64" | "isize" | "usize" => {
-                Some((ValueType::Int, LIST_INT_ITEMS_ARRAY.to_string()))
+                Some((ValueType::Int, LIST_INT_ITEMS_ARRAY.to_string(), None))
             }
-            "f64" => Some((ValueType::Float, LIST_FLOAT_ITEMS_ARRAY.to_string())),
+            "f64" => Some((ValueType::Float, LIST_FLOAT_ITEMS_ARRAY.to_string(), None)),
             _ => None,
         }
     }
@@ -17806,16 +18078,19 @@ fn newlist_clear_shape(
     if let Some(name) = result.and_then(instance_classdef_name) {
         let dummy =
             crate::translator::rtyper::lltypesystem::lltype::Struct::gc(name.as_str(), vec![]);
-        if object_items_array_id(&dummy, callcontrol).is_some() {
+        if let Some((array_type_id, array)) = object_items_array_id(&dummy, callcontrol) {
             return NewlistClearShape::Fixed {
                 item_ty: ValueType::Ref(None),
-                array_type_id: Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                array_type_id: Some(array_type_id),
+                array,
             };
         }
-        if let Some((item_ty, array_type_id)) = typed_items_array_shape(&dummy, callcontrol) {
+        if let Some((item_ty, array_type_id, array)) = typed_items_array_shape(&dummy, callcontrol)
+        {
             return NewlistClearShape::Fixed {
                 item_ty,
                 array_type_id: Some(array_type_id),
+                array,
             };
         }
     }
@@ -17844,7 +18119,8 @@ fn newlist_clear_shape(
             };
             NewlistClearShape::Resized {
                 item_ty: element_value_type(&a.OF),
-                array_type_id: None,
+                array_type_id: Some(crate::codewriter::call::array_type_id_of_lltype(&a)),
+                array: Some((*a).clone()),
             }
         }
         // Fixed layout: the pointee is the items array directly.
@@ -17853,19 +18129,23 @@ fn newlist_clear_shape(
         // slice allocates is the var-size struct arm below.
         LowLevelType::Array(a) => NewlistClearShape::Fixed {
             item_ty: element_value_type(&a.OF),
-            array_type_id: None,
+            array_type_id: Some(crate::codewriter::call::array_type_id_of_lltype(&a)),
+            array: Some((*a).clone()),
         },
         LowLevelType::Struct(s) => {
-            if let Some(array_type_id) = object_items_array_id(&s, callcontrol) {
+            if let Some((array_type_id, array)) = object_items_array_id(&s, callcontrol) {
                 return NewlistClearShape::Fixed {
                     item_ty: ValueType::Ref(None),
                     array_type_id: Some(array_type_id),
+                    array,
                 };
             }
-            if let Some((item_ty, array_type_id)) = typed_items_array_shape(&s, callcontrol) {
+            if let Some((item_ty, array_type_id, array)) = typed_items_array_shape(&s, callcontrol)
+            {
                 return NewlistClearShape::Fixed {
                     item_ty,
                     array_type_id: Some(array_type_id),
+                    array,
                 };
             }
             NewlistClearShape::Fallback
@@ -17903,16 +18183,22 @@ fn arraydescr_of_fixed_array(
 fn fixed_newlist_array(
     result: Option<&crate::flowspace::model::Variable>,
     callcontrol: Option<&crate::call::CallControl>,
-) -> Option<(ValueType, String, bool)> {
+) -> Option<(
+    ValueType,
+    String,
+    bool,
+    Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
+)> {
     match newlist_clear_shape(result, callcontrol) {
         NewlistClearShape::Fixed {
             item_ty,
             array_type_id,
+            array,
         } => {
             let (item_ty, array_type_id) = arraydescr_of_fixed_array(item_ty, array_type_id);
             let array_type_id = array_type_id?;
             let clears = matches!(item_ty, ValueType::Ref(_));
-            Some((item_ty, array_type_id, clears))
+            Some((item_ty, array_type_id, clears, array))
         }
         _ => None,
     }
@@ -19974,6 +20260,7 @@ mod tests {
                     index: index.clone(),
                     item_ty: ValueType::Ref(None),
                     array_type_id: Some("enum_slice".into()),
+                    array: None,
                     nolength: true,
                     gckind: crate::model::ArrayGcKind::Raw,
                     pure: false,
@@ -19992,6 +20279,7 @@ mod tests {
                 value: LinkArg::Value(empty),
                 item_ty: ValueType::Ref(None),
                 array_type_id: Some("enum_slice".into()),
+                array: None,
                 nolength: true,
                 gckind: crate::model::ArrayGcKind::Raw,
             },
@@ -23981,6 +24269,7 @@ mod tests {
                 index: index_var,
                 item_ty: ValueType::Int,
                 array_type_id: None,
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
@@ -24068,6 +24357,7 @@ mod tests {
                 index: index_var,
                 item_ty: ValueType::Int,
                 array_type_id: None,
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
@@ -24244,6 +24534,7 @@ mod tests {
             OpKind::ArrayLen {
                 base: array_var,
                 array_type_id: None,
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
             },
@@ -24928,6 +25219,7 @@ mod tests {
                 value: crate::model::LinkArg::Value(value_var.clone()),
                 item_ty: ValueType::Unknown,
                 array_type_id: None,
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
             },
@@ -24992,6 +25284,7 @@ mod tests {
                     index: index_var,
                     item_ty: ValueType::Unknown,
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
@@ -25030,6 +25323,7 @@ mod tests {
                     index,
                     item_ty: ValueType::Int,
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: built,
                     pure: false,
@@ -29677,6 +29971,7 @@ mod tests {
                 index,
                 item_ty: ValueType::Ref(None),
                 array_type_id: None,
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
@@ -29749,6 +30044,7 @@ mod tests {
                 index,
                 item_ty: ValueType::Ref(None),
                 array_type_id: None,
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
@@ -29817,6 +30113,7 @@ mod tests {
                 index,
                 item_ty: ValueType::Ref(None),
                 array_type_id: None,
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
@@ -29888,6 +30185,7 @@ mod tests {
                     index,
                     item_ty: ValueType::Int,
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: true,
@@ -31901,6 +32199,7 @@ mod tests {
                 index,
                 item_ty,
                 array_type_id,
+                array,
                 nolength,
                 gckind,
                 pure,
@@ -31912,6 +32211,7 @@ mod tests {
                     array_type_id.as_deref(),
                     Some(array_type_id_of_lltype(&CArray(LowLevelType::Char)).as_str())
                 );
+                assert_eq!(array, &Some(CArray(LowLevelType::Char)));
                 assert!(*nolength);
                 assert_eq!(*gckind, crate::model::ArrayGcKind::Raw);
                 assert!(!*pure);
@@ -32899,6 +33199,7 @@ mod tests {
             value: crate::model::LinkArg::Value(stored.clone()),
             item_ty: ValueType::Ref(None),
             array_type_id: None,
+            array: None,
             nolength: false,
             gckind: crate::model::ArrayGcKind::Gc,
         }
@@ -33163,6 +33464,7 @@ mod tests {
                 result: Some(result),
                 kind: OpKind::NewArrayClear {
                     array_type_id: Some(id),
+                    array: _,
                     item_ty: ValueType::Ref(None),
                     ..
                 },
@@ -33295,6 +33597,7 @@ mod tests {
                 &op.kind,
                 OpKind::NewArrayClear {
                     array_type_id: Some(id),
+                    array: _,
                     item_ty: ValueType::Ref(None),
                     ..
                 } if id == &expected
@@ -33313,6 +33616,7 @@ mod tests {
                     base,
                     value: LinkArg::Value(item),
                     array_type_id: Some(id),
+                    array: _,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     ..
@@ -33377,6 +33681,7 @@ mod tests {
                 kind,
                 OpKind::NewArrayClear {
                     array_type_id: Some(id),
+                    array: _,
                     item_ty: ValueType::Ref(None),
                     ..
                 } if id == &expected
@@ -33555,6 +33860,7 @@ mod tests {
                             &op.kind,
                             OpKind::ArrayWrite {
                                 array_type_id: Some(id),
+                                array: _,
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                                 ..
@@ -33572,6 +33878,7 @@ mod tests {
                             &op.kind,
                             OpKind::NewArray {
                                 array_type_id: Some(id),
+                                array: _,
                                 ..
                             } if id == "[i64]"
                         )
@@ -33608,6 +33915,7 @@ mod tests {
                             &op.kind,
                             OpKind::NewArrayClear {
                                 array_type_id: Some(id),
+                                array: _,
                                 ..
                             } if id == "[i64]"
                         )
@@ -33686,6 +33994,7 @@ mod tests {
                             &op.kind,
                             OpKind::NewArrayClear {
                                 array_type_id: Some(got),
+                                array: _,
                                 ..
                             } if got == id
                         )
@@ -33700,6 +34009,7 @@ mod tests {
                             &op.kind,
                             OpKind::ArrayWrite {
                                 array_type_id: Some(got),
+                                array: _,
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                                 ..
@@ -33739,6 +34049,7 @@ mod tests {
                     index,
                     item_ty: ValueType::Int,
                     array_type_id: Some("[i64]".to_string()),
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
@@ -33785,6 +34096,7 @@ mod tests {
                     index,
                     item_ty: ValueType::Int,
                     array_type_id: Some("[i64]".to_string()),
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
@@ -33862,6 +34174,7 @@ mod tests {
                     index,
                     item_ty: ValueType::Float,
                     array_type_id: Some("[f64]".to_string()),
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
@@ -34038,7 +34351,7 @@ mod tests {
             };
             assert!(ops.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::NewArrayClear { array_type_id: Some(id), item_ty: ValueType::Ref(None), .. }
+                OpKind::NewArrayClear { array_type_id: Some(id), array: _, item_ty: ValueType::Ref(None), .. }
                     if id == &expected
             )));
             let field = crate::model::FieldDescriptor::new("__pos_0", Some(owner.to_string()));
@@ -34063,7 +34376,7 @@ mod tests {
             };
             assert!(writes.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::ArrayWrite { array_type_id: Some(id), nolength: false, item_ty: ValueType::Ref(None), .. }
+                OpKind::ArrayWrite { array_type_id: Some(id), array: _, nolength: false, item_ty: ValueType::Ref(None), .. }
                     if id == &expected
             )));
         }
@@ -34175,7 +34488,7 @@ mod tests {
             };
             assert!(ops.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::NewArray { array_type_id: Some(id), item_ty: ValueType::Int, .. }
+                OpKind::NewArray { array_type_id: Some(id), array: _, item_ty: ValueType::Int, .. }
                     if id == &expected
             )));
             assert!(!fixed_list_clears("i64"));
@@ -34236,7 +34549,7 @@ mod tests {
             };
             assert!(writes.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::ArrayWrite { array_type_id: Some(id), nolength: false, .. } if id == &expected
+                OpKind::ArrayWrite { array_type_id: Some(id), array: _, nolength: false, .. } if id == &expected
             )));
             let inline = crate::model::FieldDescriptor::new("__pos_0", Some("[i64; 4]".into()));
             let inline_read = SpaceOperation {
@@ -34313,6 +34626,7 @@ mod tests {
                 index,
                 item_ty: ValueType::Int,
                 array_type_id: Some("[i64;4]".into()),
+                array: None,
                 nolength: true,
                 gckind: crate::model::ArrayGcKind::Raw,
                 pure: false,
@@ -38969,6 +39283,7 @@ mod tests {
                 index: read_index,
                 item_ty,
                 array_type_id,
+                array: _,
                 nolength,
                 gckind,
                 pure,
@@ -39024,6 +39339,7 @@ mod tests {
             let OpKind::ArrayWrite {
                 value,
                 array_type_id,
+                array: _,
                 nolength,
                 ..
             } = &write.kind
@@ -39083,6 +39399,7 @@ mod tests {
     /// element stays eight bytes wide.
     #[test]
     fn handle_list_call_rust_vec_item_descr_matches_allocation() {
+        use crate::codewriter::call::array_type_id_of_lltype;
         use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
         use majit_ir::descr::ArrayFlag;
         use majit_ir::rvec::VecItemKind;
@@ -39095,19 +39412,12 @@ mod tests {
                 VecItemKind::Float => LowLevelType::Float,
                 VecItemKind::Ref => GCREF.clone(),
             };
-            let array_type_id = Some(rust_vec_item_array_type_id(&item_ll));
-            let item_ty = match kind {
-                VecItemKind::Float => ValueType::Float,
-                VecItemKind::Int | VecItemKind::Ref => ValueType::Int,
-            };
-            let ir_type = match item_ty {
-                ValueType::Float => majit_ir::value::Type::Float,
-                _ => majit_ir::value::Type::Int,
-            };
-            let descr = cc.arraydescrof_for_type(&item_ty, &array_type_id, ir_type, None);
+            let array = rust_vec_item_array(&item_ll);
+            let array_type_id = Some(array_type_id_of_lltype(&array));
+            let descr = cc.arraydescrof_array(&array);
             let ad = descr
                 .as_array_descr()
-                .expect("arraydescrof_for_type must answer an ArrayDescr");
+                .expect("arraydescrof_array must answer an ArrayDescr");
             let elem = crate::codewriter::call::extract_element_type_from_str(
                 array_type_id.as_deref().unwrap(),
             )
@@ -39121,20 +39431,8 @@ mod tests {
             assert_eq!(ad.is_item_signed(), flag == ArrayFlag::Signed, "{kind:?}");
             assert!(!ad.is_array_of_pointers(), "{kind:?}");
         }
-        let unnamed_descr =
-            cc.arraydescrof_for_type(&ValueType::Int, &None, majit_ir::value::Type::Int, None);
-        let unnamed = unnamed_descr
-            .as_array_descr()
-            .expect("identity-less int descr");
-        assert_eq!(unnamed.item_size(), 8);
-        assert!(!unnamed.is_item_signed());
-        let signed_id = Some(rust_vec_item_array_type_id(&LowLevelType::Signed));
-        let signed_descr = cc.arraydescrof_for_type(
-            &ValueType::Int,
-            &signed_id,
-            majit_ir::value::Type::Int,
-            None,
-        );
+        let signed_arr = rust_vec_item_array(&LowLevelType::Signed);
+        let signed_descr = cc.arraydescrof_array(&signed_arr);
         let signed = signed_descr.as_array_descr().expect("Signed item descr");
         assert_eq!(signed.item_size(), word);
         assert!(signed.is_item_signed());
@@ -39143,13 +39441,8 @@ mod tests {
         let unsigned_item =
             crate::translator::rtyper::rrustvec::rust_vec_item_lltype(&unsigned_header)
                 .expect("usize item lltype");
-        let unsigned_id = Some(rust_vec_item_array_type_id(unsigned_item));
-        let unsigned_descr = cc.arraydescrof_for_type(
-            &ValueType::Int,
-            &unsigned_id,
-            majit_ir::value::Type::Int,
-            None,
-        );
+        let unsigned_arr = rust_vec_item_array(unsigned_item);
+        let unsigned_descr = cc.arraydescrof_array(&unsigned_arr);
         let unsigned = unsigned_descr
             .as_array_descr()
             .expect("Unsigned item descr");
@@ -39530,6 +39823,7 @@ mod tests {
                 length,
                 item_ty,
                 array_type_id,
+                array: _,
             } => {
                 assert_eq!(length, &count);
                 assert!(matches!(item_ty, ValueType::Ref(None)));
@@ -39600,13 +39894,15 @@ mod tests {
                 length,
                 item_ty,
                 array_type_id,
+                array,
             } => {
                 assert_eq!(length, &count);
                 assert!(
                     matches!(item_ty, ValueType::Int),
                     "int-element list items array must recover ValueType::Int, got {item_ty:?}"
                 );
-                assert_eq!(array_type_id, &None);
+                assert_eq!(array_type_id.as_deref(), Some(LIST_INT_ITEMS_ARRAY));
+                assert_eq!(array, &Some(Array::gc(LowLevelType::Signed)));
             }
             other => panic!("expected NewListClear, got {other:?}"),
         }
@@ -39657,6 +39953,7 @@ mod tests {
                 length,
                 item_ty,
                 array_type_id,
+                array,
             } => {
                 assert_eq!(length, &count);
                 assert!(
@@ -39664,7 +39961,8 @@ mod tests {
                     "int-element fixed array must recover ValueType::Int (NOT Ref(None)), \
                      got {item_ty:?}"
                 );
-                assert_eq!(array_type_id, &None);
+                assert_eq!(array_type_id.as_deref(), Some(LIST_INT_ITEMS_ARRAY));
+                assert_eq!(array, &Some(Array::gc(LowLevelType::Signed)));
             }
             other => panic!("expected NewArrayClear, got {other:?}"),
         }
@@ -39713,6 +40011,7 @@ mod tests {
                 length,
                 item_ty,
                 array_type_id,
+                array: _,
             } => {
                 assert_eq!(length, &count);
                 assert!(
@@ -39767,6 +40066,7 @@ mod tests {
                 length,
                 item_ty,
                 array_type_id,
+                array: _,
             } => {
                 assert_eq!(length, &count);
                 assert!(
@@ -39841,6 +40141,7 @@ mod tests {
                 length,
                 item_ty,
                 array_type_id,
+                array: _,
             } => {
                 assert_eq!(length, &count);
                 assert!(matches!(item_ty, ValueType::Int));
@@ -39974,6 +40275,7 @@ mod tests {
                 length,
                 item_ty,
                 array_type_id,
+                array: _,
             } => {
                 assert_eq!(length, &count);
                 assert!(
@@ -40049,6 +40351,7 @@ mod tests {
                 length,
                 item_ty,
                 array_type_id,
+                array: _,
             } => {
                 assert_eq!(length, &count);
                 assert!(matches!(item_ty, ValueType::Ref(None)));
@@ -40089,6 +40392,7 @@ mod tests {
             NewlistClearShape::Fixed {
                 item_ty,
                 array_type_id,
+                array: _,
             } => {
                 assert!(
                     matches!(item_ty, ValueType::Ref(None)),
@@ -40474,6 +40778,7 @@ mod tests {
                 index: idx,
                 item_ty,
                 array_type_id,
+                array: _,
                 nolength,
                 gckind,
                 pure,
@@ -40546,6 +40851,7 @@ mod tests {
                 index: idx,
                 item_ty,
                 array_type_id,
+                array: _,
                 nolength,
                 gckind,
                 pure,
@@ -40606,6 +40912,7 @@ mod tests {
                 value: written,
                 item_ty,
                 array_type_id,
+                array: _,
                 nolength,
                 gckind,
             } => {
@@ -40800,6 +41107,7 @@ mod tests {
                 value: written,
                 item_ty,
                 array_type_id,
+                array: _,
                 nolength,
                 gckind,
             } => {
@@ -40860,6 +41168,7 @@ mod tests {
             OpKind::ArrayLen {
                 base,
                 array_type_id,
+                array: _,
                 nolength,
                 gckind,
             } => {
@@ -41002,6 +41311,7 @@ mod tests {
                 value: written,
                 item_ty,
                 array_type_id,
+                array: _,
                 nolength,
                 gckind,
             } => {
@@ -41096,6 +41406,7 @@ mod tests {
         match &ops[1].kind {
             OpKind::ArrayLen {
                 array_type_id,
+                array: _,
                 nolength,
                 ..
             } => {

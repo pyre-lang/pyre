@@ -276,6 +276,7 @@ pub(crate) fn build_ll_join_chars_graph() -> FunctionGraph {
             item_ty: ValueType::Unsigned,
             index: i_body.clone(),
             array_type_id: Some("[u8]".to_string()),
+            array: Some(crate::codewriter::call::gcarray_char()),
             nolength: crate::front::typestr::nolength_from_array_type_id(Some("[u8]")),
             gckind: crate::front::typestr::gckind_from_array_type_id(Some("[u8]")),
             pure: false,
@@ -382,6 +383,7 @@ mod tests {
                         &op.kind,
                         OpKind::ArrayRead {
                             array_type_id: Some(id),
+                            array: _,
                             ..
                         } if id == "[u8]"
                     )

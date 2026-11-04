@@ -2215,6 +2215,11 @@ impl FunctionDesc {
 
         // upstream: `signature = getattr(self.pyobj, '_signature_', None)`
         //   `if signature: sigresult = enforce_signature_return(...)`.
+        // A residual stub's `annsignature.result` is `_signature_[1]`
+        // (`publish_residual_result_signature`). The stub shell may
+        // infer `s_ImpossibleValue`; Impossible is contained by every
+        // annotation, so the check passes and the returnblock is
+        // seeded with the declared result.
         if let Some(annsig) = &self.annsignature {
             let sigresult = super::signature::enforce_signature_return(
                 &self.name,
@@ -4464,6 +4469,72 @@ mod tests {
             defaults: RefCell::new(Some(Vec::new())),
             access_directly: std::cell::Cell::new(false),
         })
+    }
+
+    fn residual_function_desc(
+        bk: Rc<Bookkeeper>,
+        name: &str,
+        arg: &str,
+        s_result: SomeValue,
+    ) -> FunctionDesc {
+        use crate::flowspace::model::GraphFunc;
+        let mut host_func =
+            GraphFunc::new(name, Constant::new(ConstValue::Dict(Default::default())));
+        host_func._jit_look_inside_ = Some(false);
+        let sig = int_sig(&[arg]);
+        let mut fd = FunctionDesc::new(
+            bk,
+            Some(HostObject::new_user_function(host_func)),
+            name,
+            sig.clone(),
+            None,
+            None,
+        );
+        fd.install_external_stub(dont_look_inside_stub(name, sig), s_result);
+        fd
+    }
+
+    /// Residual stub with a declared Signed result: `pycall` walks
+    /// `recursivecall` then `_signature_` `enforce_signature_return`
+    /// (`description.py` `FunctionDesc.pycall`). The stub shell infers
+    /// Impossible, which every annotation contains, so the returnblock
+    /// is seeded with SomeInteger.
+    #[test]
+    fn residual_stub_pycall_annotates_returnblock_declared_signed() {
+        use crate::flowspace::model::Hlvalue;
+        let (_ann, bk) = ann_bk();
+        let declared = SomeValue::Integer(SomeInteger::default());
+        let fd = residual_function_desc(bk, "ll_os_open", "path", declared);
+        let result = fd
+            .pycall(
+                None,
+                &ArgumentsForTranslation::new(
+                    vec![Some(SomeValue::Integer(SomeInteger::default()))],
+                    None,
+                    None,
+                ),
+                &SomeValue::Impossible,
+                None,
+            )
+            .expect("residual pycall");
+        assert!(
+            matches!(result, SomeValue::Integer(_)),
+            "pycall result is SomeInteger, got {result:?}"
+        );
+        let graph = fd
+            .cachedgraph(GraphCacheKey::None, None, None)
+            .expect("residual stub");
+        let g = graph.graph.borrow();
+        match &g.returnblock.borrow().inputargs[0] {
+            Hlvalue::Variable(v) => {
+                let ann = v.annotation.borrow();
+                assert!(
+                    matches!(ann.as_deref(), Some(SomeValue::Integer(_))),
+                    "returnblock arg is SomeInteger, got {ann:?}"
+                );
+            }
+            other => panic!("expected Variable, got {other:?}"),
+        }
     }
 
     #[test]
