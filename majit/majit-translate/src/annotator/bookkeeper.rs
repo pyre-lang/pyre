@@ -9265,6 +9265,22 @@ mod tests {
     }
 
     #[test]
+    fn intern_class_key_joins_crate_prefixed_and_stripped_registry_keys() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let rows = vec![("id".to_string(), "i64".to_string())];
+        reg.fields.insert("cr::m::Key".to_string(), rows.clone());
+        reg.fields.insert("m::Key".to_string(), rows);
+        harvest_class_identity(&mut reg, "m::Key", &["cr::m::Key", "m::Key"]);
+        bk.set_struct_fields(Rc::new(reg));
+        let prefixed = bk.intern_class_key("cr::m::Key");
+        let stripped = bk.intern_class_key("m::Key");
+        assert_eq!(prefixed, stripped);
+        assert_eq!(prefixed, "m::Key");
+    }
+
+    #[test]
     fn intern_keeps_local_struct_instantiation_spelling_distinct() {
         // Distinct spellings intern separately (`bookkeeper.py`
         // `getuniqueclassdef`). Harvest omits the default type-arg suffix
