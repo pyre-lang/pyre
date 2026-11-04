@@ -2980,6 +2980,18 @@ impl WarmEnterState {
         (cell_key, token)
     }
 
+    /// Token half of [`Self::resolved_cell_procedure_token`] when `cell_key`
+    /// already names one cell.
+    ///
+    /// `warmstate.py maybe_compile_and_run` after `get_jitcell`: tests
+    /// `JC_TRACING | JC_TEMPORARY` then `cell.get_procedure_token()` on
+    /// that same cell. No second `comparekey` walk.
+    #[inline]
+    pub fn cell_procedure_token(&self, cell_key: u64) -> Option<Arc<JitCellToken>> {
+        self.cell_by_key(cell_key)
+            .and_then(|cell| Self::cell_entry_procedure_token(&cell))
+    }
+
     /// `maybe_compile_and_run` flag-first then `cell.get_procedure_token()`.
     /// `EnterJitAssembler` holds that owned token for the run.
     #[inline(always)]

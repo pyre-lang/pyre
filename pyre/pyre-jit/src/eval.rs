@@ -8034,6 +8034,15 @@ fn drive_portal_metatrace(
     use majit_metainterp::jitexc::JitException;
     use majit_metainterp::{JitArgKind, TraceAction};
 
+    // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING` skips
+    // this key only. A live session on another key or driver may still
+    // `bound_reached` a nested MetaInterp.
+    if driver.cell_is_tracing(green_key) {
+        return None;
+    }
+    // warmstate.py bound_reached: a nested MetaInterp run parks the outer
+    // attempt (history, framestack, heapcache, portal_call_depth, WalkSession
+    // journals, driver sym). Walker sub-walks do not enter here.
     let mut driver = NestedTraceGuard::enter(driver);
     pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
     let canonical =
@@ -8068,10 +8077,12 @@ fn drive_portal_metatrace(
     publish_kind0_descrs_before_trace();
     install_build_time_liveness_before_trace(driver.meta_interp_mut());
     driver.force_start_tracing(green_key, None, loop_header_pc, &mut jit_state, env);
-    let meta = driver.meta_interp_mut();
-    if !meta.is_tracing() {
+    if !driver.is_tracing() {
         return None;
     }
+    let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
+    driver.arm_close_on_drop(starting_tracing_key);
+    let meta = driver.meta_interp_mut();
     let args = {
         let ctx = meta.trace_ctx().unwrap();
         [
@@ -8323,6 +8334,16 @@ fn genentry_merge_point_jit(
     // `BaseJitCell.jitdriver_sd`). The red frame's `last_instr`
     // distinguishes yields.
     let green_key = genentry_resolved_cell_key(pycode);
+    // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING` skips
+    // this key only. A live session on another key or driver may still
+    // `bound_reached` a nested MetaInterp.
+    {
+        let (driver, _) = driver_pair();
+        let jd_no = pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX;
+        if driver.cell_is_tracing_on_driver(jd_no, green_key) {
+            return None;
+        }
+    }
     // warmstate.py `maybe_compile_and_run(increment_threshold, *args)` on
     // `generatorentry_driver`'s `jitdriver_sd.warmstate`: a compiled cell
     // is `EnterJitAssembler` on every call, a `JC_TEMPORARY` cell keeps
@@ -8375,9 +8396,10 @@ fn genentry_resolved_cell_key(pycode: pyre_object::PyObjectRef) -> u64 {
 /// Enter the `generatorentry` portal. The registered main jitcode is
 /// [`pyre_jit_trace::genentry_state::GENENTRY_PORTAL_KEY`]. NestedTracePark
 /// holds the outer attempt while this portal traces, matching a fresh
-/// MetaInterp. The machine walk from `jit_merge_point` runs
-/// `generator_send_ex_body` through the generator frame to the yield,
-/// which finishes with the yielded value.
+/// MetaInterp. `JC_TRACING` on this cell returns without nesting; a live
+/// session on another key parks and may `bound_reached`. The machine walk
+/// from `jit_merge_point` runs `generator_send_ex_body` through the
+/// generator frame to the yield, which finishes with the yielded value.
 ///
 /// `send_ex` has no back edge. `CloseLoop` is kept so a merge-point
 /// `goto` still compiles. `RunCompiled` enters the assembler here
@@ -8420,6 +8442,22 @@ fn drive_generatorentry_trace(
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.pin_roots(&[pycode, w_gen, w_arg]);
     // gct_direct_call: incoming GC refs are rooted before a collecting park.
+    // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING` skips
+    // this key only. A sibling jitdriver may `bound_reached` a nested
+    // MetaInterp. The cell is `jitdriver_sd.warmstate` for the descriptor
+    // `force_start_tracing` elects (`descriptor.index`).
+    let jd_no = jitcode
+        .jitdriver_sd()
+        .unwrap_or(pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX);
+    {
+        let (driver, _) = driver_pair();
+        if driver.cell_is_tracing_on_driver(jd_no, green_key) {
+            if dbg {
+                eprintln!("[jd2] bail: cell JC_TRACING");
+            }
+            return None;
+        }
+    }
     let _nested = NestedTracePark::enter();
     let pycode = roots.get(base);
     let w_gen = roots.get(base + 1);
@@ -8432,7 +8470,7 @@ fn drive_generatorentry_trace(
         let meta = driver.meta_interp_mut();
         let mut descriptor =
             pyre_jit_trace::genentry_state::GenEntryJitState::generatorentry_driver_descriptor();
-        descriptor.index = jitcode.jitdriver_sd();
+        descriptor.index = Some(jd_no);
         // greenargs are `JitCell(*greenargs)` of `_green_args_spec`
         // (`pycode`); `(0, 0)` is the no-raw-pair sentinel.
         // `force_start_tracing` keeps passing `Some((&gk.values, &gk.types))`
@@ -9026,7 +9064,19 @@ fn drive_unpack_iterable_trace(
     let w_iterator = roots.get(base + 1);
     let items = roots.get(base + 2);
     let (driver, _) = driver_pair();
-    let meta = driver.meta_interp_mut();
+    // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING` skips
+    // this key only. A sibling jitdriver may `bound_reached` a nested
+    // MetaInterp. The cell is `jitdriver_sd.warmstate` for the descriptor
+    // `force_start_tracing` elects (`descriptor.index`).
+    let jd_no = jitcode
+        .jitdriver_sd()
+        .unwrap_or(pyre_jit_trace::unpack_state::UNPACKITERABLE_JD_INDEX);
+    if driver.cell_is_tracing_on_driver(jd_no, green_key) {
+        if dbg {
+            eprintln!("[jd1] bail: cell JC_TRACING");
+        }
+        return;
+    }
 
     // Extracted merge-point reds: root_base, items_slot, RootScope cell.
     let live_values = pyre_jit_trace::unpack_state::jd1_live_values_at(portal_root_base);
@@ -9043,7 +9093,7 @@ fn drive_unpack_iterable_trace(
     // than as an error.
     let mut descriptor =
         pyre_jit_trace::unpack_state::UnpackJitState::unpackiterable_driver_descriptor();
-    descriptor.index = jitcode.jitdriver_sd();
+    descriptor.index = Some(jd_no);
 
     // The `(code_ptr, pc)` pair `green_key` was hashed from, not `(0, 0)`: a
     // zero `code_ptr` is the sentinel for "no raw pair available". Passing
@@ -9052,8 +9102,8 @@ fn drive_unpack_iterable_trace(
     // (`warmstate.py bound_reached`). `green_key` is `make_green_key` at
     // `(greenkey_raw, 0)` (above), so the pair reconstructs the identical hash.
     publish_kind0_descrs_before_trace();
-    install_build_time_liveness_before_trace(meta);
-    let action = meta.force_start_tracing(
+    install_build_time_liveness_before_trace(driver.meta_interp_mut());
+    let action = driver.meta_interp_mut().force_start_tracing(
         green_key,
         (greenkey_raw as usize, 0),
         None,
@@ -9069,6 +9119,7 @@ fn drive_unpack_iterable_trace(
         };
         eprintln!("[jd1] force_start_tracing -> {name}");
     }
+    let meta = driver.meta_interp_mut();
     // Live-path enter (on by default; see `jd1_enter_enabled`): on RunCompiled,
     // run the compiled drain loop with the shared `(w_iterator, items)` reds so
     // it drains `items` in compiled code (residual `next`/`append` executed on
