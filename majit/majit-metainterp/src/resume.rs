@@ -638,10 +638,11 @@ pub fn new_resume_storage(
     descr.as_fail_descr_arc().expect("resume guard descr")
 }
 
-/// `resume.py _prepare_pendingfields` read off `rd_pendingfields`: this
-/// guard's deferred writes as exit-slot sources, ready to replay against
-/// the deadframe.  Derived on demand from the guard-owned payload, so
-/// nothing is kept per guard for it.
+/// Summary of `rd_pendingfields` as exit-slot sources. The consume path
+/// (`eval.rs` `replay_pending_fields`, `ResumeDataDirectReader.prepare_guard_pendingfields`)
+/// iterates the tagged `GuardPendingFieldEntry` list and calls
+/// `ResumeDataDirectReader.decode_ref` at use; this helper must not be
+/// the source of Ref bits at resume.
 pub fn exit_pending_field_layouts(
     descr: &dyn majit_ir::FailDescr,
     num_failargs: i32,
@@ -730,6 +731,11 @@ pub fn exit_source_from_tagged(
         }
         majit_ir::resumedata::TAGINT => ExitValueSourceLayout::Constant(val as i64, Type::Int),
         majit_ir::resumedata::TAGCONST => {
+            // resume.py ResumeDataDirectReader.decode_ref: NULLREF is
+            // ConstPtr.null, not a pool index. A `-1` index would wrap.
+            if tagged == majit_ir::resumedata::NULLREF {
+                return ExitValueSourceLayout::Constant(0, Type::Ref);
+            }
             let idx = (val - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
             let c = rd_consts.get(idx).copied().unwrap_or(Const::Int(0));
             ExitValueSourceLayout::Constant(c.as_raw_i64(), c.get_type())
@@ -4303,6 +4309,16 @@ mod tests {
             vacated, tagged,
             "the pre-move address names nothing; a later object there must not \
              inherit the moved object's pool slot"
+        );
+    }
+
+    #[test]
+    fn exit_source_from_tagged_nullref_is_constant_ref_zero() {
+        let layout = super::exit_source_from_tagged(super::NULLREF, 0, &[], 0);
+        assert_eq!(
+            layout,
+            majit_backend::ExitValueSourceLayout::Constant(0, majit_ir::Type::Ref),
+            "resume.py ResumeDataDirectReader.decode_ref: NULLREF is ConstPtr.null"
         );
     }
 
