@@ -1193,6 +1193,9 @@ macro_rules! publish_helpers {
         $(, $A:ident)*
     ) => {
         // Every arity gets all six publishers; each call site uses one.
+        // `allow`, not `expect`: each expansion is linted on its own, and
+        // the arities whose publisher is called would leave an `expect`
+        // unfulfilled.
         #[inline]
         #[allow(dead_code)]
         fn $p<F, $($A: ResidualSlot + WasmWord,)* R: ResidualRet + WasmWord>(

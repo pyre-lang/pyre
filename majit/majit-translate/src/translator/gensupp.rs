@@ -270,7 +270,7 @@ pub(crate) struct LocalScope {
     /// [`Self::glob`]. The field is dead upstream too (no reader
     /// outside `__init__`), but preserved for structural parity per
     /// AGENTS.md: "an RPython object attribute is preserved as a Rust struct field".
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub(crate) parent: Option<Rc<LocalScope>>,
     /// RPython `_LocalScope.glob` (`gensupp.py`). Shared
     /// `Rc<RefCell<NameManager>>` so subsequent `uniquename` /

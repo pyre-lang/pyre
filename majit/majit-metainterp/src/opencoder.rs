@@ -3259,7 +3259,7 @@ impl Trace {
     }
 
     /// opencoder.py record_op3(opnum, argbox1, argbox2, argbox3, descr=None).
-    #[allow(dead_code)] // opencoder.py Trace.record_op3; current recorder callers use generic record_op
+    #[expect(dead_code)] // opencoder.py Trace.record_op3; current recorder callers use generic record_op
     pub(crate) fn record_op3(
         &mut self,
         opcode: OpCode,

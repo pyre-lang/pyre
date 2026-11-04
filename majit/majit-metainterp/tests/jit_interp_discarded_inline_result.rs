@@ -70,7 +70,7 @@ const OP_BACK: u8 = 4;
 
 // Named as the `jit_interp` state type; the macro lowers the interpreter body
 // into jitcode and never runs it, so nothing constructs the struct.
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct PopState {
     total: i64,
     sel: usize,
@@ -149,7 +149,7 @@ fn install() -> (majit_metainterp::JitCode, Vec<u8>) {
 /// discarding one.
 // Named as the `jit_interp` state type; the macro lowers the interpreter body
 // into jitcode and never runs it, so nothing constructs the struct.
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct DiscardOnlyState {
     total: i64,
     sel: usize,

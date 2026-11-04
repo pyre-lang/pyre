@@ -161,7 +161,7 @@ mod literal_for_unroll {
 
     // Named as the `jit_interp` state type; the macro lowers the interpreter body
     // into jitcode and never runs it, so nothing constructs the struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct LiteralForState {
         acc: i64,
     }
@@ -229,7 +229,7 @@ mod float_state_field_shape {
 
     // Named as the `jit_interp` state type; the macro lowers the interpreter body
     // into jitcode and never runs it, so nothing constructs the struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct FloatDispatchState {
         f: f64,
     }
@@ -286,7 +286,7 @@ mod or_pattern {
 
     // Named as the `jit_interp` state type; the macro lowers the interpreter body
     // into jitcode and never runs it, so nothing constructs the struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct OrDispatchState {
         a: i64,
     }
@@ -526,7 +526,7 @@ mod pre_promote {
 
     // Named as the `jit_interp` state type; the macro lowers the interpreter body
     // into jitcode and never runs it, so nothing constructs the struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct PromoteState {
         stackpos: i64,
     }
@@ -748,7 +748,7 @@ mod oparg_minimal {
 
     // Named as the `jit_interp` state type; the macro lowers the interpreter body
     // into jitcode and never runs it, so nothing constructs the struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct OpargState {
         last_instr: i64,
         acc: i64,
@@ -1310,7 +1310,7 @@ mod oparg_extended {
 
     // Named as the `jit_interp` state type; the macro lowers the interpreter body
     // into jitcode and never runs it, so nothing constructs the struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct OpargExtState {
         last_instr: i64,
         acc: i64,
@@ -1524,7 +1524,7 @@ mod oparg_with_pc_green {
 
     // Named as the `jit_interp` state type; the macro lowers the interpreter body
     // into jitcode and never runs it, so nothing constructs the struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct PcGreenState {
         last_instr: i64,
         acc: i64,
@@ -1776,7 +1776,7 @@ mod oparg_with_pypy_parity_greens {
 
     // Named as the `jit_interp` state type; the macro lowers the interpreter body
     // into jitcode and never runs it, so nothing constructs the struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct ParityState {
         last_instr: i64,
         acc: i64,
@@ -1925,7 +1925,7 @@ mod oparg_with_body_local_state_le_green {
 
     // Named as the `jit_interp` state type; the macro lowers the interpreter body
     // into jitcode and never runs it, so nothing constructs the struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct LeGreenState {
         f1: i64,
         f2: i64,
@@ -2125,7 +2125,7 @@ mod oparg_with_body_local_method_call_green {
         }
 
         // Called only inside the lowered interpreter body, which never runs.
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         fn len(&self) -> usize {
             self.bytes.len()
         }
@@ -2143,7 +2143,7 @@ mod oparg_with_body_local_method_call_green {
 
     // Named as the `jit_interp` state type; the macro lowers the interpreter body
     // into jitcode and never runs it, so nothing constructs the struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct MethodCallGreenState {
         f1: i64,
         a: i64,
@@ -2405,7 +2405,7 @@ mod oparg_with_full_4_green_parity {
 
     // Named as the `jit_interp` state type; the macro lowers the interpreter body
     // into jitcode and never runs it, so nothing constructs the struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct FullParityState {
         f1: i64,
         f2: i64,
@@ -2559,7 +2559,7 @@ mod residual_call_not_dropped {
     // loop body was dropped rather than aborting the arm.
     mod sidefx {
         // Called only inside the lowered interpreter body, which never runs.
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         pub fn noop() {}
     }
 
@@ -2568,7 +2568,7 @@ mod residual_call_not_dropped {
 
     // Named as the `jit_interp` state type; the macro lowers the interpreter body
     // into jitcode and never runs it, so nothing constructs the struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct CallState {
         acc: i64,
     }
@@ -2645,7 +2645,7 @@ mod float_compare_branch_gate {
 
     // Named as the `jit_interp` state type; the macro lowers the interpreter body
     // into jitcode and never runs it, so nothing constructs the struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct FloatCmpState {
         fa: f64,
         fb: f64,
@@ -2760,7 +2760,7 @@ mod huge_range_for_loop_falls_back {
 
     // Named as the `jit_interp` state type; the macro lowers the interpreter body
     // into jitcode and never runs it, so nothing constructs the struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct HugeState {
         acc: i64,
     }
@@ -2838,7 +2838,7 @@ mod degraded_arm_is_named_at_install {
 
     // Named as the `jit_interp` state type; the macro lowers the interpreter body
     // into jitcode and never runs it, so nothing constructs the struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct DegradedArmState {
         regs: VirtArray<i64>,
         fregs: VirtArray<f64>,

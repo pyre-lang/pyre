@@ -947,7 +947,7 @@ mod jit_struct {
     }
 
     // Read only through the `jit_struct` reflection the tests check.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     #[jit_struct]
     struct Stack {
         head: Option<Box<Node>>,

@@ -1603,7 +1603,7 @@ pub struct ResumedFrame {
 /// on TAGVIRTUAL/TAGCONST/TAGBOX/TAGSMALLINT; pyre's deadframe
 /// already contains typed Values, so we just box Int/Float to
 /// W_IntObject/W_FloatObject.
-#[allow(dead_code)] // resume.py ResumeDataDirectReader.decode_ref/getvirtual_ptr; current resume path decodes elsewhere
+#[expect(dead_code)] // resume.py ResumeDataDirectReader.decode_ref/getvirtual_ptr; current resume path decodes elsewhere
 fn materialize_virtual(val: &majit_ir::Value) -> i64 {
     use majit_ir::Value;
     match val {
@@ -1616,7 +1616,7 @@ fn materialize_virtual(val: &majit_ir::Value) -> i64 {
 
 /// resume.py _callback_i → next_int() → write_an_int.
 /// RPython trusts type discipline — no cross-type coercion.
-#[allow(dead_code)] // resume.py AbstractResumeDataReader._callback_i; current resume path writes typed values directly
+#[expect(dead_code)] // resume.py AbstractResumeDataReader._callback_i; current resume path writes typed values directly
 fn materialize_virtual_int(val: &majit_ir::Value) -> i64 {
     match val {
         majit_ir::Value::Int(v) => *v,
@@ -1626,7 +1626,7 @@ fn materialize_virtual_int(val: &majit_ir::Value) -> i64 {
 
 /// resume.py _callback_f → next_float() → write_a_float.
 /// RPython trusts type discipline — no cross-type coercion.
-#[allow(dead_code)] // resume.py AbstractResumeDataReader._callback_f; current resume path writes typed values directly
+#[expect(dead_code)] // resume.py AbstractResumeDataReader._callback_f; current resume path writes typed values directly
 fn materialize_virtual_float(val: &majit_ir::Value) -> i64 {
     match val {
         majit_ir::Value::Float(v) => v.to_bits() as i64,

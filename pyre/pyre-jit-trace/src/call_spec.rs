@@ -19,13 +19,13 @@ pub enum CallEffectKind {
     /// `graphanalyze.py` — reached through the only channel this side
     /// has for it: a spelling-keyed table, not a source attribute.
     ///
-    /// `#[allow(dead_code)]` because **no row uses this arm yet.** The rows
+    /// `#[expect(dead_code)]` because **no row uses this arm yet.** The rows
     /// are blocked on a callee census: a re-run on a fresh LLBC set names
     /// the callees and, decisively, their SEGMENTATION — and a
     /// `FunctionPath` override matches on the split, so a row written from a
     /// `::`-joined listing is a guess that fails silently. Delete the
     /// attribute along with the first row.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     Declared(DeclaredEffects),
 }
 
@@ -54,10 +54,10 @@ pub enum CallEffectKind {
 /// would delete the population this arm exists to serve, at compile time,
 /// while looking like a hardening.
 ///
-/// `#[allow(dead_code)]` for the same reason as `CallEffectKind::Declared`:
+/// `#[expect(dead_code)]` for the same reason as `CallEffectKind::Declared`:
 /// every member is *matched* by the translators, none is *constructed*, and
 /// none will be until the first row lands. Delete it with that row.
-#[allow(dead_code)]
+#[expect(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DeclaredExtraEffect {
     /// `EF_ELIDABLE_CANNOT_RAISE` — the row a pure primitive wants.

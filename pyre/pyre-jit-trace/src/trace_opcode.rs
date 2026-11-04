@@ -3150,7 +3150,7 @@ impl MIFrame {
 
     /// pyjitpl.py implement_guard_value parity.
     /// executor.py constant_from_op(box): dispatches on box.type.
-    #[allow(dead_code)] // pyjitpl.py MIFrame.implement_guard_value; current opcode paths emit the guard inline
+    #[expect(dead_code)] // pyjitpl.py MIFrame.implement_guard_value; current opcode paths emit the guard inline
     pub(crate) fn implement_guard_value(
         &mut self,
         ctx: &mut TraceCtx,

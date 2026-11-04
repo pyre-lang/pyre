@@ -2315,7 +2315,7 @@ static FLOAT_CONST_ABS: AlignedPdConst = AlignedPdConst([
 /// The `genop_*` methods here are line-by-line ports of the RPython emitters
 /// (`x86/assembler.py` `genop_*`).  Emission runs through `regalloc_perform`,
 /// which works from regalloc `arglocs`, so the ports whose opcode that
-/// dispatch reaches by another route carry `#[allow(dead_code)]`
+/// dispatch reaches by another route carry `#[expect(dead_code)]`
 /// individually.  They are annotated rather than deleted so the upstream
 /// method boundary stays where a later porter looks for it; the attribute is
 /// per method so the lint still reports anything else in this `impl` that
@@ -3078,7 +3078,7 @@ impl<'a> Assembler386<'a> {
     ///
     /// One in-memory subtract — no need to load the current top into a
     /// register, decrement, and store back.
-    #[allow(dead_code)] // x86/assembler.py Assembler386._call_footer_shadowstack; raw footer helper is dispatched today
+    #[expect(dead_code)] // x86/assembler.py Assembler386._call_footer_shadowstack; raw footer helper is dispatched today
     fn gen_footer_shadowstack(&mut self) {
         emit_footer_shadowstack_raw(&mut self.mc);
         // `emit_footer_shadowstack_raw` writes `X86_64_SCRATCH_REG`.
@@ -3548,7 +3548,7 @@ impl<'a> Assembler386<'a> {
         // Sync regalloc frame positions to opref_to_slot, the map `resolve_opref`
         // reads, once the walk is over. No live emitter reaches it any more: every remaining consumer
         // (`load_arg_to_rax` / `load_arg_to_rcx` and the
-        // genops that call them) is `#[allow(dead_code)]`, kept for the upstream
+        // genops that call them) is `#[expect(dead_code)]`, kept for the upstream
         // method boundary. The map cannot express what the regalloc actually
         // decides — `before_call` leaves a value bound to a callee-saved member
         // of the allocation pool in its register, with no frame slot at all — so
@@ -6410,7 +6410,7 @@ impl<'a> Assembler386<'a> {
     // genop_* — integer arithmetic
 
     /// INT_ADD: result = arg0 + arg1
-    #[allow(dead_code)] // x86/assembler.py genop_*; pyre's x86 regalloc emits these ops directly instead of dispatching to genop_*
+    #[expect(dead_code)] // x86/assembler.py genop_*; pyre's x86 regalloc emits these ops directly instead of dispatching to genop_*
     fn genop_int_add(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -6422,7 +6422,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// INT_SUB: result = arg0 - arg1
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_int_sub(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -6434,7 +6434,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// INT_MUL: result = arg0 * arg1
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_int_mul(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -6446,7 +6446,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// INT_AND: result = arg0 & arg1
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_int_and(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -6458,7 +6458,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// INT_OR: result = arg0 | arg1
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_int_or(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -6470,7 +6470,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// INT_XOR: result = arg0 ^ arg1
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_int_xor(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -6482,7 +6482,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// INT_NEG: result = -arg0
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_int_neg(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         dynasm!(self.mc
@@ -6493,7 +6493,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// INT_INVERT: result = ~arg0
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_int_invert(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         dynasm!(self.mc
@@ -6504,7 +6504,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// INT_LSHIFT: result = arg0 << arg1
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_int_lshift(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -6516,7 +6516,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// INT_RSHIFT: result = arg0 >> arg1 (arithmetic/signed)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_int_rshift(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -6528,7 +6528,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// UINT_RSHIFT: result = arg0 >> arg1 (logical/unsigned)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_uint_rshift(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -6543,21 +6543,21 @@ impl<'a> Assembler386<'a> {
 
     /// assembler.py genop_int_add_ovf — delegates to genop_int_add,
     /// then sets guard_success_cc = 'NO'. On x86, ADD always sets OF.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_int_add_ovf(&mut self, op: &Op) {
         self.genop_int_add(op); // ADD sets OF on x86
         self.guard_success_cc = Some(CC_NO);
     }
 
     /// assembler.py genop_int_sub_ovf.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_int_sub_ovf(&mut self, op: &Op) {
         self.genop_int_sub(op);
         self.guard_success_cc = Some(CC_NO);
     }
 
     /// assembler.py genop_int_mul_ovf.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_int_mul_ovf(&mut self, op: &Op) {
         self.genop_int_mul(op); // IMUL sets OF on x86
         self.guard_success_cc = Some(CC_NO);
@@ -6568,7 +6568,7 @@ impl<'a> Assembler386<'a> {
     /// Emit SETcc/CSET to materialize a boolean result.
     /// x64: SETcc AL; MOVZX EAX, AL
     /// aarch64: CSET X0, cc
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn emit_setcc_to_result(&mut self, cc: u8, result_opref: OpRef) {
         match cc {
             CC_L => dynasm!(self.mc ; .arch x64 ; setl al),
@@ -6593,7 +6593,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// INT_IS_TRUE: result = (arg0 != 0)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_int_is_true(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         dynasm!(self.mc
@@ -6607,7 +6607,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// INT_IS_ZERO: result = (arg0 == 0)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_int_is_zero(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         dynasm!(self.mc
@@ -6874,7 +6874,7 @@ impl<'a> Assembler386<'a> {
 
     /// Load a float value from `opref` into XMM0 (x64) / D0 (aarch64).
     /// Float values are stored as bit-cast i64 in frame slots.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn load_float_arg_to_d0(&mut self, opref: OpRef) {
         match self.resolve_opref(opref) {
             ResolvedArg::Slot(offset) => {
@@ -6889,7 +6889,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// Load a float value from `opref` into XMM1 (x64) / D1 (aarch64).
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn load_float_arg_to_d1(&mut self, opref: OpRef) {
         match self.resolve_opref(opref) {
             ResolvedArg::Slot(offset) => {
@@ -6904,7 +6904,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// Store XMM0 (x64) / D0 (aarch64) to the frame slot for `result_opref`.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn store_d0_to_result(&mut self, result_opref: OpRef) {
         let slot = self.allocate_slot(result_opref);
         let offset = Self::slot_offset(slot);
@@ -6916,7 +6916,7 @@ impl<'a> Assembler386<'a> {
     // aarch64/assembler.py float equivalents
 
     /// FLOAT_ADD: result = arg0 + arg1
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_float_add(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0).to_opref());
         self.load_float_arg_to_d1(op.arg(1).to_opref());
@@ -6928,7 +6928,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// FLOAT_SUB: result = arg0 - arg1
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_float_sub(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0).to_opref());
         self.load_float_arg_to_d1(op.arg(1).to_opref());
@@ -6940,7 +6940,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// FLOAT_MUL: result = arg0 * arg1
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_float_mul(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0).to_opref());
         self.load_float_arg_to_d1(op.arg(1).to_opref());
@@ -6952,7 +6952,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// FLOAT_TRUEDIV: result = arg0 / arg1
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_float_truediv(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0).to_opref());
         self.load_float_arg_to_d1(op.arg(1).to_opref());
@@ -6966,7 +6966,7 @@ impl<'a> Assembler386<'a> {
     /// FLOAT_NEG: result = -arg0
     /// x64: XOR with sign-bit mask (0x8000000000000000).
     /// aarch64: FNEG d0, d0.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_float_neg(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0).to_opref());
         // Load the sign-bit mask (0x8000_0000_0000_0000) into XMM1
@@ -6986,7 +6986,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// CAST_INT_TO_FLOAT: result = (f64)arg0
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_cast_int_to_float(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         // Break cvtsi2sd's false dependency on the destination's prior value
@@ -7003,7 +7003,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// CAST_FLOAT_TO_INT: result = (i64)arg0 (truncation)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_cast_float_to_int(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0).to_opref());
         dynasm!(self.mc
@@ -8296,7 +8296,7 @@ impl<'a> Assembler386<'a> {
     // genop_* — extended integer arithmetic
 
     /// UINT_MUL_HIGH: upper 64 bits of unsigned multiply
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_uint_mul_high(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -8312,7 +8312,7 @@ impl<'a> Assembler386<'a> {
     // genop_* — extended float operations
 
     /// FLOAT_ABS: result = |arg0|
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn genop_float_abs(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0).to_opref());
         let mask: i64 = i64::MAX; // 0x7FFF_FFFF_FFFF_FFFF

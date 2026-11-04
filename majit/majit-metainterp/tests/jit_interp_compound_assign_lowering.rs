@@ -17,7 +17,7 @@ const OP_COMPOUND_COMPUTEDIDX: u8 = 5;
 
 // Named as the `jit_interp` state type; the macro lowers the interpreter body
 // into jitcode and never runs it, so nothing constructs the struct.
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct CompoundAssignState {
     regs: VirtArray<i64>,
 }
@@ -112,7 +112,7 @@ mod float_control {
     /// the positive control for the degraded-arm recorder.
     // Named as the `jit_interp` state type; the macro lowers the interpreter body
     // into jitcode and never runs it, so nothing constructs the struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct FloatCompoundState {
         fregs: VirtArray<f64>,
     }

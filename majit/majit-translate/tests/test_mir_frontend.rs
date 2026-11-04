@@ -1705,7 +1705,7 @@ fn an_aggregate_element_index_declines_instead_of_striding_by_one_word() {
     // which leaves a niche free — so the `Pair` payload alone is two words
     // before any tag. The load-bearing claim is only "wider than one word",
     // which holds under any `repr(Rust)` layout choice.
-    #[allow(dead_code)] // a layout witness; only its size is read
+    #[expect(dead_code)] // a layout witness; only its size is read
     enum SlotValueLayout {
         Int(i64),
         Object(*const u8),

@@ -49,7 +49,7 @@ pub type Bytecode = [u8];
 
 // Named as the `jit_interp` state type; the macro lowers the interpreter body
 // into jitcode and never runs it, so nothing constructs the struct.
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct NamedState {
     a: i64,
 }
