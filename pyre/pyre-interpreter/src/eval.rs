@@ -979,26 +979,22 @@ pub fn capture_pyframe_root_area() -> *const () {
     PYFRAME_ROOT_AREA.with(|area| area as *const _ as *const ())
 }
 
-/// Whether `frame` is a collector-owned `PyFrame` rather than one of the
-/// header-prefixed `std::alloc` frames used by interpreter snapshots.
+/// Whether extra-area may field-walk `frame` as a stdalloc `PyFrame`.
 ///
-/// PyPy's `PyFrame` is a GC object: the root callback exposes the frame and
-/// the collector traces its fields later.  It never walks through a freshly
-/// copied frame during `collect_roots_in_nursery`, when only direct roots have
-/// been forwarded (`IncrementalMiniMarkGC.collect_roots_in_nursery`).  Pyre's
-/// explicit frame walker is needed only for the non-GC fallback.  Reading the
-/// header is safe for both representations because the fallback deliberately
-/// carries a zeroed `GcHeader` too (`alloc_fixed_array_with_header`'s frame
-/// counterpart in `pyframe.rs`).
+/// Only the header-prefixed `std::alloc` fallback (`type_id == 0`) is walked
+/// here. A collector-owned `PyFrame` (`PYFRAME_GC_TYPE_ID`) or `JitVirtualRef`
+/// has already been exposed through the slot visitor; its type tracer owns
+/// the interior edges. `raw_chain_next_frame` uses the same `type_id == 0`
+/// test to stop the chain (`virtualref.py is_virtual_ref`). Reading the
+/// header is safe for the fallback because it deliberately carries a zeroed
+/// `GcHeader` too (`alloc_fixed_array_with_header`'s frame counterpart in
+/// `pyframe.rs`).
 #[inline]
-unsafe fn is_gc_managed_pyframe(frame: *mut PyFrame) -> bool {
+unsafe fn is_stdalloc_fallback_pyframe(frame: *mut PyFrame) -> bool {
     if frame.is_null() {
         return false;
     }
-    unsafe {
-        (*majit_gc::header::header_of(frame as usize)).type_id()
-            == crate::pyframe::PYFRAME_GC_TYPE_ID
-    }
+    unsafe { (*majit_gc::header::header_of(frame as usize)).type_id() == 0 }
 }
 
 /// Continue only through the non-GC fallback frame chain.
@@ -1247,11 +1243,21 @@ pub unsafe fn walk_pyframe_roots_area(
         };
         visit_ec_slots(ambient_ec);
         while !frame.is_null() {
-            // A GC-managed PyFrame was exposed by the CURRENT_FRAME slot (or
-            // by the preceding raw frame's f_backref slot).  Stop here and let
-            // `pyframe_object_custom_trace` follow its fields after the
-            // collector reaches the gray/remembered-set phase.
-            if unsafe { is_gc_managed_pyframe(frame) } {
+            // `CURRENT_FRAME` is a frame-shaped slot: it can hold a
+            // `JitVirtualRef` in place of a `*mut PyFrame` (`virtualref.py
+            // is_virtual_ref`). Forward `forced` and stop — the vref is
+            // 24 bytes, and the stdalloc field walk below would read
+            // `f_backref` at `PYFRAME_F_BACKREF_OFFSET` past that object.
+            if unsafe { forward_virtual_ref_forced(frame as pyre_object::gc_hook::GCREF, visitor) }
+            {
+                break;
+            }
+            // A collector-owned PyFrame or any other non-zero type_id was
+            // exposed by the CURRENT_FRAME slot (or by the preceding raw
+            // frame's f_backref slot). Stop here and let the type tracer
+            // follow its fields after the gray/remembered-set phase. Same
+            // predicate as `raw_chain_next_frame`.
+            if unsafe { !is_stdalloc_fallback_pyframe(frame) } {
                 break;
             }
             // SAFETY: PyFrame pointers on the f_backref chain are valid
@@ -6714,6 +6720,60 @@ mod tests {
         }
 
         assert_eq!(visited, vec![slot_address, forced_address]);
+    }
+
+    // `CURRENT_FRAME` is the extra-area loop head and never goes through
+    // `raw_chain_next_frame`. A vref there must not be field-walked at
+    // `PyFrame` offsets (`f_backref` is past the 24-byte object).
+    #[test]
+    fn test_current_frame_virtual_ref_is_not_field_walked_as_pyframe() {
+        use majit_metainterp::virtualref::{JIT_VIRTUAL_REF_VTABLE, JitVirtualRef, ObjectHeader};
+
+        let _ = run_exec_frame("pass");
+        let previous = current_frame();
+        struct Restore(*mut PyFrame);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CURRENT_FRAME.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(previous);
+
+        let mut storage = vec![0usize; crate::pyframe::PYFRAME_W_BUILTIN_OFFSET / 8 + 2];
+        let vref_ptr = storage.as_mut_ptr() as *mut JitVirtualRef;
+        unsafe {
+            std::ptr::write(
+                vref_ptr,
+                JitVirtualRef {
+                    super_: ObjectHeader {
+                        typeptr: JIT_VIRTUAL_REF_VTABLE,
+                    },
+                    virtual_token: std::ptr::null_mut(),
+                    forced: 0x1000usize as pyre_object::GCREF,
+                },
+            );
+        }
+        let f_back_slot = unsafe {
+            (storage.as_mut_ptr() as *mut u8).add(crate::pyframe::PYFRAME_F_BACKREF_OFFSET) as usize
+        };
+        let forced_slot = unsafe { std::ptr::addr_of_mut!((*vref_ptr).forced) as usize };
+
+        CURRENT_FRAME.with(|c| c.set(vref_ptr as *mut PyFrame));
+        let mut visited = Vec::new();
+        unsafe {
+            walk_pyframe_roots_area(capture_pyframe_root_area(), &mut |root| {
+                visited.push(root as *mut majit_ir::GcRef as usize);
+            });
+        }
+
+        assert!(
+            visited.contains(&forced_slot),
+            "the vref forced slot must still be forwarded"
+        );
+        assert!(
+            !visited.contains(&f_back_slot),
+            "f_backref at PyFrame offset must not be read off a 24-byte vref"
+        );
     }
 
     // `exception_is_valid_obj_as_class_w` is a Rust predicate the raise path
