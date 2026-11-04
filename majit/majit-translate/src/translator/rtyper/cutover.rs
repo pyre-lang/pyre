@@ -3867,10 +3867,6 @@ fn declared_source_graph_func(
 /// opaque plumbing branches whose declared result lltype is faithful to
 /// the Rust signature (the residual call really does produce that type):
 ///
-/// - `core::mem::swap(&mut T, &mut T)` returns `()` — an in-place swap,
-///   `Void` result.
-/// - `core::cell::Cell::<T>::set(&self, val)` returns `()` — an
-///   in-place store into the cell, `Void` result.
 /// - `core::f64::<Impl>::is_infinite` / `core::f64::<Impl>::is_nan` /
 ///   `core::slice::<Impl>::is_empty` return `bool` — `Bool` result.
 /// - `std::f64::<Impl>::floor` / `std::f64::<Impl>::powf` /
@@ -3896,15 +3892,10 @@ fn declared_source_graph_func(
 /// mis-models the value and only migrates the failure to a deeper
 /// annotation wall, so they stay residual at the "not registered" Skip
 /// until their result type can be modeled.
+///
+/// Generic `T` leaves whose result is independent of `T` live in
+/// [`FIXED_RESULT_ARGTYPE_EXTERNALS`].
 const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
-    (&["core", "mem", "swap"], &["x", "y"], LowLevelType::Void),
-    // `mem::drop(x)` runs `x`'s destructor and returns `()`; the trace model
-    // does not model destructors (the `Drop` terminator lowers to a
-    // pass-through `Goto`), so a Void no-op stub is faithful.
-    (&["core", "mem", "drop"], &["x"], LowLevelType::Void),
-    // `mem::forget(x)` consumes `x` without running its destructor and returns
-    // `()`; same Void no-op shape as `mem::drop`.
-    (&["core", "mem", "forget"], &["x"], LowLevelType::Void),
     // `mem::size_of::<T>() -> usize`.  A concrete-type call is folded to a
     // `ConstInt` in the front end (`Lowering::lower_call` /
     // `size_align_const_from_tyexpr`); the residual reaching the rtyper is the
@@ -3932,11 +3923,6 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
     (
         &["sync", "atomic", "AtomicU8", "store"],
         &["self", "val", "order"],
-        LowLevelType::Void,
-    ),
-    (
-        &["cell", "Cell", "set"],
-        &["self", "val"],
         LowLevelType::Void,
     ),
     // `Cell::get(&self) -> T` copies the cell.  The residual is the scalar
@@ -4068,6 +4054,31 @@ const ATOMIC_PTR_ARGTYPE_EXTERNALS: &[(&[&str], &[&str], usize)] = &[
         1,
     ),
     (&["sync", "atomic", "AtomicPtr", "new"], &["v"], 0),
+];
+
+/// Generic foreign externals whose result lltype is independent of the
+/// keyed argument. One graph per argument knowntype (`specialize.py`
+/// `specialize_argtype`); the fixed result is kept in the
+/// `GraphCacheKey::None` template that `cachedgraph` copies.
+const FIXED_RESULT_ARGTYPE_EXTERNALS: &[(&[&str], &[&str], usize, LowLevelType)] = &[
+    // `core::cell::Cell::<T>::set(&self, val)` returns `()` — an in-place
+    // store into the cell, `Void` result.
+    (
+        &["cell", "Cell", "set"],
+        &["self", "val"],
+        1,
+        LowLevelType::Void,
+    ),
+    // `core::mem::swap(&mut T, &mut T)` returns `()` — an in-place swap,
+    // `Void` result.
+    (&["core", "mem", "swap"], &["x", "y"], 0, LowLevelType::Void),
+    // `mem::drop(x)` runs `x`'s destructor and returns `()`; the trace model
+    // does not model destructors (the `Drop` terminator lowers to a
+    // pass-through `Goto`), so a Void no-op stub is faithful.
+    (&["core", "mem", "drop"], &["x"], 0, LowLevelType::Void),
+    // `mem::forget(x)` consumes `x` without running its destructor and returns
+    // `()`; same Void no-op shape as `mem::drop`.
+    (&["core", "mem", "forget"], &["x"], 0, LowLevelType::Void),
 ];
 
 /// Zero-arg Void externals with no effects and no graph.
@@ -4231,6 +4242,58 @@ fn register_opaque_external_argtype(
     let _ = registry.get_or_register_with_func(key, signature, graph_func);
 }
 
+/// Register a bodyless foreign external with `specialize:argtype(i)`
+/// whose result lltype does not depend on the keyed argument.
+///
+/// Builds the stub with [`build_stub_pygraph_for_lltype`] and prefills
+/// `GraphCacheKey::None` so `specialize_argtype` → `cachedgraph(key,
+/// None, None)` copies that template per knowntype (`description.py`
+/// `cachedgraph`). [`register_opaque_external_argtype`] leaves the
+/// cache empty because the result is the keyed argument's type
+/// (`specialize_argtype_stub_result`).
+fn register_opaque_external_argtype_with_result(
+    registry: &CallRegistry,
+    segments: &[&str],
+    argnames: &[&str],
+    argtype_index: usize,
+    return_lltype: LowLevelType,
+) {
+    let signature = Signature::new(
+        argnames.iter().map(|n| (*n).to_string()).collect(),
+        None,
+        None,
+    );
+    let Some(mut stub_pygraph) = build_stub_pygraph_for_lltype(
+        segments.last().copied().unwrap_or_default().to_string(),
+        signature.clone(),
+        return_lltype,
+    ) else {
+        return;
+    };
+    let key = FunctionPathKey::from_segments(segments.iter().map(|s| s.to_string()));
+    if alias_existing_lookup(registry, &key) {
+        return;
+    }
+    let tag = format!("specialize:argtype({argtype_index})");
+    {
+        let mut graph = stub_pygraph.graph.borrow_mut();
+        if let Some(func) = graph.func.as_mut() {
+            func.annspecialcase = Some(tag.clone());
+        }
+    }
+    if let Some(stub) = Rc::get_mut(&mut stub_pygraph) {
+        stub.func.annspecialcase = Some(tag.clone());
+    }
+    let mut graph_func = GraphFunc::new(
+        segments.last().copied().unwrap_or_default().to_string(),
+        Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
+    );
+    graph_func.annspecialcase = Some(tag);
+    registry
+        .get_or_register_with_func(key, signature, graph_func)
+        .prefill_default_cache(stub_pygraph);
+}
+
 /// Declare the opaque MIR deref-write marker to the annotator.
 ///
 /// This is a two-parameter, `Void` external.  It is intentionally registered
@@ -4285,6 +4348,15 @@ fn register_saturating_arith_externals(registry: &CallRegistry) {
 pub(crate) fn register_foreign_stdlib_externals(registry: &CallRegistry) {
     for (segments, argnames, return_lltype) in FOREIGN_STDLIB_EXTERNALS {
         register_opaque_external(registry, segments, argnames, return_lltype.clone());
+    }
+    for (segments, argnames, argtype_index, return_lltype) in FIXED_RESULT_ARGTYPE_EXTERNALS {
+        register_opaque_external_argtype_with_result(
+            registry,
+            segments,
+            argnames,
+            *argtype_index,
+            return_lltype.clone(),
+        );
     }
     for (segments, argnames, argtype_index) in ATOMIC_PTR_ARGTYPE_EXTERNALS {
         register_opaque_external_argtype(registry, segments, argnames, *argtype_index);
@@ -16011,6 +16083,52 @@ mod tests {
     }
 
     #[test]
+    fn fixed_result_argtype_rows_register_template_cache() {
+        use crate::annotator::description::GraphCacheKey;
+        use crate::annotator::policy::Specializer;
+
+        let (_ann, registry) = pointer_atomic_argtype_registry();
+        for (segments, argnames, argtype_index, _) in FIXED_RESULT_ARGTYPE_EXTERNALS {
+            let entry = registry
+                .lookup(&FunctionPathKey::from_segments(segments.iter().copied()))
+                .unwrap_or_else(|| panic!("{segments:?} must register"));
+            let e2 = registry
+                .lookup(&FunctionPathKey::from_segments(segments.iter().copied()))
+                .expect("lookup identity");
+            assert!(std::rc::Rc::ptr_eq(&entry.function_desc, &e2.function_desc));
+            let fd = entry.function_desc.borrow();
+            assert_eq!(
+                fd.signature.argnames,
+                argnames
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect::<Vec<_>>(),
+                "{segments:?}"
+            );
+            assert!(
+                matches!(
+                    fd.specializer.as_ref(),
+                    Some(Specializer::Argtype { parms }) if parms.as_slice() == [*argtype_index]
+                ),
+                "{segments:?} is specialize:argtype({argtype_index}), got {:?}",
+                fd.specializer
+            );
+            assert!(
+                fd.cache.borrow().contains_key(&GraphCacheKey::None),
+                "{segments:?}: default cache holds the GraphCacheKey::None template"
+            );
+            let annspecialcase = fd
+                .base
+                .pyobj
+                .as_ref()
+                .and_then(|pyobj| pyobj.user_function())
+                .and_then(|func| func.annspecialcase.clone());
+            let expected = format!("specialize:argtype({argtype_index})");
+            assert_eq!(annspecialcase.as_deref(), Some(expected.as_str()));
+        }
+    }
+
+    #[test]
     fn pointer_atomic_swap_result_is_not_const_instance_of_val_classdef() {
         use crate::annotator::classdesc::ClassDef;
         use crate::annotator::model::{SomeObjectTrait, SomeValue, unionof};
@@ -16285,6 +16403,11 @@ mod tests {
         let mut seen = HashSet::new();
         let mut duplicates = Vec::new();
         for (segments, _, _) in FOREIGN_STDLIB_EXTERNALS {
+            if !seen.insert(*segments) {
+                duplicates.push(*segments);
+            }
+        }
+        for (segments, _, _, _) in FIXED_RESULT_ARGTYPE_EXTERNALS {
             if !seen.insert(*segments) {
                 duplicates.push(*segments);
             }

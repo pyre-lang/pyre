@@ -8865,6 +8865,76 @@ impl GuardExitShares {
     }
 }
 
+/// `enqueue_cond_call` peeks `operations[op_index + 1]`.
+/// `genop_guard_guard_no_exception` uses `_find_nearby_operation(-1)` for
+/// the same pairing.
+fn cond_call_expects_guard_no_exception(ops: &[OpRc], op_idx: usize) -> bool {
+    ops.get(op_idx + 1)
+        .is_some_and(|next| next.opcode == OpCode::GuardNoException)
+}
+
+/// `assembler.py` `generate_guard_no_exception`.
+/// Load `JIT_EXC_VALUE` and side-exit when it is non-zero.
+/// `genop_guard_guard_no_exception` emits this on the join unless the
+/// previous op was a `COND_CALL`; `CondCallSlowPath.generate_body` then
+/// emits it after the call returns.
+fn generate_guard_no_exception(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder,
+    opref_vars: &IndexMap<u32, Variable>,
+    info: &mut GuardInfo,
+    ref_root_slots: &[(u32, usize)],
+    stale_ref_vars: &IndexSet<u32>,
+    demoted_failarg_slots: &IndexMap<u32, i32>,
+    ref_root_base_ofs: i32,
+    ptr_type: cranelift_codegen::ir::Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+    fail_descrs: &[DescrRef],
+    merge_targets: &[(usize, cranelift_codegen::ir::Block)],
+    guard_exit_shares: &mut GuardExitShares,
+    preamble_phase: bool,
+) {
+    // Direct memory load from global JIT_EXC_VALUE (no TLS/host call).
+    let exc_addr = builder.ins().iconst(ptr_type, jit_exc_value_addr() as i64);
+    let exc_val = builder
+        .ins()
+        .load(cl_types::I64, MemFlagsData::trusted(), exc_addr, 0);
+    let zero = builder.ins().iconst(cl_types::I64, 0);
+    let has_exc = builder.ins().icmp(IntCC::NotEqual, exc_val, zero);
+    let exit_block = builder.create_block();
+    mark_exit_cold(builder, exit_block, info.source_op_index, merge_targets);
+    let cont_block = builder.create_block();
+    if preamble_phase {
+        builder.set_cold_block(cont_block);
+    }
+    builder
+        .ins()
+        .brif(has_exc, exit_block, &[], cont_block, &[]);
+
+    builder.switch_to_block(exit_block);
+    builder.seal_block(exit_block);
+    let cur_jf = builder.ins().get_pinned_reg(ptr_type);
+    emit_guard_exit(
+        module,
+        builder,
+        opref_vars,
+        cur_jf,
+        info,
+        ref_root_slots,
+        stale_ref_vars,
+        demoted_failarg_slots,
+        ref_root_base_ofs,
+        ptr_type,
+        call_conv,
+        fail_descrs,
+        merge_targets,
+        Some(guard_exit_shares),
+    );
+
+    builder.switch_to_block(cont_block);
+    builder.seal_block(cont_block);
+}
+
 fn emit_guard_exit(
     module: &mut JITModule,
     builder: &mut FunctionBuilder,
@@ -13351,6 +13421,10 @@ impl CraneliftBackend {
         let mut guard_exit_shares = GuardExitShares::default();
         let mut last_ovf_flag: Option<CValue> = None;
         let mut guard_success_cc: Option<GuardSuccessCc> = None;
+        // `genop_guard_guard_no_exception`: a `COND_CALL` that peeked
+        // `GUARD_NO_EXCEPTION` already emitted `generate_guard_no_exception`
+        // in `CondCallSlowPath`. The guard op then emits nothing.
+        let mut cond_call_consumed_guard_no_exception = false;
         let _nursery_inline_count: usize = 0; // reserved for future bridge inline support
 
         // RPython x86 backend parity: preamble runs ONCE per trace entry;
@@ -14611,58 +14685,35 @@ impl CraneliftBackend {
                 }
 
                 OpCode::GuardNoException => {
-                    let info = &mut guard_infos[guard_idx];
-                    guard_idx += 1;
-
-                    // Direct memory load from global JIT_EXC_VALUE (no TLS/host call).
-                    // RPython backend fuses this into the preceding CALL as an
-                    // inline flag check. We use a plain load from a known address.
-                    let exc_addr = builder.ins().iconst(ptr_type, jit_exc_value_addr() as i64);
-                    let exc_val = builder.ins().load(
-                        cl_types::I64,
-                        cranelift_codegen::ir::MemFlagsData::trusted(),
-                        exc_addr,
-                        0,
-                    );
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let has_exc = builder.ins().icmp(IntCC::NotEqual, exc_val, zero);
-                    let exit_block = builder.create_block();
-                    mark_exit_cold(
-                        &mut builder,
-                        exit_block,
-                        info.source_op_index,
-                        &merge_targets,
-                    );
-                    let cont_block = builder.create_block();
-                    if preamble_phase {
-                        builder.set_cold_block(cont_block);
+                    if cond_call_consumed_guard_no_exception {
+                        // `genop_guard_guard_no_exception`: the preceding
+                        // `COND_CALL` already emitted `generate_guard_no_exception`
+                        // at the end of `CondCallSlowPath`. The don't-call
+                        // edge never reaches the check. `guard_idx` still
+                        // advances so later guards keep their `guard_infos`
+                        // slots.
+                        cond_call_consumed_guard_no_exception = false;
+                        guard_idx += 1;
+                    } else {
+                        let info = &mut guard_infos[guard_idx];
+                        guard_idx += 1;
+                        generate_guard_no_exception(
+                            module,
+                            &mut builder,
+                            &opref_var_map,
+                            info,
+                            &ref_root_slots,
+                            &stale_ref_vars,
+                            &demoted_failarg_slots,
+                            ref_root_base_ofs,
+                            ptr_type,
+                            call_conv,
+                            &fail_descrs,
+                            &merge_targets,
+                            &mut guard_exit_shares,
+                            preamble_phase,
+                        );
                     }
-                    builder
-                        .ins()
-                        .brif(has_exc, exit_block, &[], cont_block, &[]);
-
-                    builder.switch_to_block(exit_block);
-                    builder.seal_block(exit_block);
-                    let cur_jf = builder.ins().get_pinned_reg(ptr_type);
-                    emit_guard_exit(
-                        module,
-                        &mut builder,
-                        &opref_var_map,
-                        cur_jf,
-                        info,
-                        &ref_root_slots,
-                        &stale_ref_vars,
-                        &demoted_failarg_slots,
-                        ref_root_base_ofs,
-                        ptr_type,
-                        call_conv,
-                        &fail_descrs,
-                        &merge_targets,
-                        Some(&mut guard_exit_shares),
-                    );
-
-                    builder.switch_to_block(cont_block);
-                    builder.seal_block(cont_block);
                 }
 
                 OpCode::GuardException => {
@@ -16514,6 +16565,29 @@ impl CraneliftBackend {
                         builder.ins().set_pinned_reg(jf_ptr);
                     }
 
+                    // `enqueue_cond_call` peeks the next op;
+                    // `CondCallSlowPath.generate_body` emits
+                    // `generate_guard_no_exception` after the call.
+                    if cond_call_expects_guard_no_exception(ops, op_idx) {
+                        generate_guard_no_exception(
+                            module,
+                            &mut builder,
+                            &opref_var_map,
+                            &mut guard_infos[guard_idx],
+                            &ref_root_slots,
+                            &stale_ref_vars,
+                            &demoted_failarg_slots,
+                            ref_root_base_ofs,
+                            ptr_type,
+                            call_conv,
+                            &fail_descrs,
+                            &merge_targets,
+                            &mut guard_exit_shares,
+                            preamble_phase,
+                        );
+                        cond_call_consumed_guard_no_exception = true;
+                    }
+
                     builder.ins().jump(cont_block, &[]);
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -16587,6 +16661,32 @@ impl CraneliftBackend {
                             call_conv,
                         );
                         builder.ins().set_pinned_reg(jf_ptr);
+                    }
+
+                    // `enqueue_cond_call` peeks the next op;
+                    // `CondCallSlowPath.generate_body` emits
+                    // `generate_guard_no_exception` after the call.
+                    if cond_call_expects_guard_no_exception(ops, op_idx) {
+                        // CondCallSlowPath.generate_body: result into `resloc`
+                        // before `generate_guard_no_exception`.
+                        builder.def_var(var(&opref_var_map, vi), call_result);
+                        generate_guard_no_exception(
+                            module,
+                            &mut builder,
+                            &opref_var_map,
+                            &mut guard_infos[guard_idx],
+                            &ref_root_slots,
+                            &stale_ref_vars,
+                            &demoted_failarg_slots,
+                            ref_root_base_ofs,
+                            ptr_type,
+                            call_conv,
+                            &fail_descrs,
+                            &merge_targets,
+                            &mut guard_exit_shares,
+                            preamble_phase,
+                        );
+                        cond_call_consumed_guard_no_exception = true;
                     }
 
                     builder
@@ -29245,6 +29345,113 @@ mod tests {
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         assert!(backend.get_latest_descr(&frame).is_finish());
         assert_eq!(backend.get_int_value(&frame, 0), 0);
+        assert_eq!(exc_class_of(&backend, &frame), 0);
+        assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
+        assert!(!jit_exc_is_pending());
+    }
+
+    #[test]
+    fn test_cond_call_n_guard_no_exception_checks_only_on_taken_path() {
+        let _exception_guard = exception_test_guard();
+        jit_exc_clear();
+        clear_test_exception_call_log();
+        set_test_exception_state(make_fake_exc(0x1111));
+
+        let mut backend = CraneliftBackend::new();
+        let descr = make_call_descr(vec![Type::Int], Type::Void);
+
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+            mk_op_with_descr(
+                OpCode::CondCallN,
+                &[
+                    OpRef::input_arg_int(0),
+                    OpRef::const_int(maybe_raise_test_exception as *const () as i64),
+                    OpRef::input_arg_int(0),
+                ],
+                OpRef::NONE.raw(),
+                descr,
+            ),
+            guard,
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+
+        let token = JitCellToken::new(40_002);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(1)]);
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
+        assert_eq!(backend.get_int_value(&frame, 0), 1);
+        assert_eq!(exc_class_of(&backend, &frame), 0x1111);
+        assert!(!backend.grab_exc_value(&frame).is_null());
+        assert!(!jit_exc_is_pending());
+
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 0);
+        assert_eq!(exc_class_of(&backend, &frame), 0);
+        assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
+        assert!(!jit_exc_is_pending());
+    }
+
+    #[test]
+    fn test_cond_call_value_i_guard_no_exception_failarg_is_call_result() {
+        let _exception_guard = exception_test_guard();
+        jit_exc_clear();
+        clear_test_exception_call_log();
+        set_test_exception_state(make_fake_exc(0x1111));
+
+        extern "C" fn fill_and_raise(a: i64) -> i64 {
+            let value = TEST_EXCEPTION_VALUE.with(Cell::get);
+            jit_exc_raise(value);
+            a * 10 + 7
+        }
+
+        let mut backend = CraneliftBackend::new();
+        let descr = make_call_descr(vec![Type::Int], Type::Int);
+
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::int_op(2))]);
+        let ops = vec![
+            mk_op(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+            ),
+            mk_op_with_descr(
+                OpCode::CondCallValueI,
+                &[
+                    OpRef::input_arg_int(0),
+                    OpRef::const_int(fill_and_raise as *const () as i64),
+                    OpRef::input_arg_int(1),
+                ],
+                2,
+                descr,
+            ),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
+        ];
+
+        let token = JitCellToken::new(40_003);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(5)]);
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
+        assert_eq!(backend.get_int_value(&frame, 0), 57);
+        assert_eq!(exc_class_of(&backend, &frame), 0x1111);
+        assert!(!backend.grab_exc_value(&frame).is_null());
+        assert!(!jit_exc_is_pending());
+
+        let frame = backend.execute_token(&token, &[Value::Int(1), Value::Int(5)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
         assert_eq!(exc_class_of(&backend, &frame), 0);
         assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
         assert!(!jit_exc_is_pending());

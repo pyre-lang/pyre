@@ -4145,10 +4145,10 @@ fn format_with_spec(mut val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate:
             validate_python314_spec_shape(&p, spec, &type_name, 'd')?;
             let parsed = FormatSpec::parse(&p.engine_spec);
             if p.no_neg_zero && matches!(p.ty, '\0' | 'b' | 'c' | 'd' | 'o' | 'x' | 'X' | 'n') {
-                // [3.15-spec] format_int_or_long raises "Negative zero coercion (z) not
-                // allowed"; the pinned stdlib's `int.__format__` names the specifier,
-                // "... in integer format specifier" (measured on 3.15.0). `z` is meaningful
-                // only after conversion to a floating presentation type.
+                // [3.15-spec] format_int_or_long raises "Negative zero coercion (z) not allowed";
+                // the pinned stdlib's `int.__format__` names the specifier, "... in integer format
+                // specifier" (format_long_internal, Objects/unicode_formatter.c at v3.15.0). `z` is
+                // meaningful only after conversion to a floating presentation type.
                 return Err(crate::PyError::value_error(
                     "Negative zero coercion (z) not allowed in integer format specifier",
                 ));
@@ -4449,9 +4449,9 @@ fn format_char(num: IntOrLong<'_>, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyErro
         ));
     }
     if p.alt_form {
-        // [3.15-spec] newformat.py _format_int_or_long raises "Alternate form (#) not allowed
-        // with 'c' presentation type"; the pinned stdlib's int.__format__ raises this message
-        // (measured on 3.15.0).
+        // [3.15-spec] newformat.py _format_int_or_long raises "Alternate form (#) not allowed with
+        // 'c' presentation type"; the pinned stdlib's int.__format__ raises this message
+        // (format_long_internal, Objects/unicode_formatter.c at v3.15.0).
         return Err(crate::PyError::value_error(
             "Alternate form (#) not allowed with integer format specifier 'c'",
         ));
@@ -4467,7 +4467,8 @@ fn format_char(num: IntOrLong<'_>, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyErro
     .filter(|code| core::ffi::c_long::try_from(*code).is_ok());
     let Some(code) = code else {
         // [3.15-spec] newformat.py _format_int_or_long raises "int too large to convert to int";
-        // the pinned stdlib's int.__format__ raises this message (measured on 3.15.0).
+        // the pinned stdlib's int.__format__ raises this message (PyLong_AsLong,
+        // Objects/longobject.c at v3.15.0).
         return Err(crate::PyError::overflow_error(
             "Python int too large to convert to C long",
         ));
@@ -4475,9 +4476,9 @@ fn format_char(num: IntOrLong<'_>, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyErro
     let cp = match u32::try_from(code).ok().and_then(CodePoint::from_u32) {
         Some(cp) => cp,
         None => {
-            // [3.15-spec] newformat.py _format_int_or_long raises "%c arg not in
-            // range(0x10ffff)"; the pinned stdlib's int.__format__ raises this message (measured on
-            // 3.15.0).
+            // [3.15-spec] newformat.py _format_int_or_long raises "%c arg not in range(0x10ffff)";
+            // the pinned stdlib's int.__format__ raises this message (format_long_internal,
+            // Objects/unicode_formatter.c at v3.15.0).
             return Err(crate::PyError::overflow_error(
                 "%c arg not in range(0x110000)",
             ));
