@@ -2093,27 +2093,26 @@ impl<'a> Lowering<'a> {
             && !self.mutably_borrowed_locals.contains(&local)
     }
 
-    /// An atomic load or store through `&self` resolves the borrowed place
-    /// at the call site. That names the object the Rust reference names
-    /// only when every pointer the place goes through is fixed between the
-    /// borrow and the call: single-assigned locals, field offsets, statics.
+    /// An atomic load or store through `&self` at the end of block `mir_bb`
+    /// resolves the borrowed place at the call site. That names the object
+    /// the Rust reference names only when no local the place reads is
+    /// written between the borrow and the call: `&self`, directly or
+    /// through copies, resolves to a recorded borrow
+    /// (`recorded_borrow_through_copies`).
     ///
     /// `InstanceRepr.getfield` / `InstanceRepr.setfield` act on the already
     /// evaluated instance.
     pub(in crate::front::mir) fn atomic_referent_is_stable(
         &self,
+        mir_bb: usize,
         arg_locals: &[Option<usize>],
     ) -> bool {
         let Some(local) = arg_locals.first().copied().flatten() else {
             return false;
         };
-        if !self.local_has_one_definition(local) {
-            return false;
-        }
-        let Some(place) = self.atomic_ref_place.get(&local) else {
-            return false;
-        };
-        self.recorded_place_is_stable(place)
+        let call = self.body.body[mir_bb].statements.len();
+        self.recorded_borrow_through_copies(local, mir_bb, call)
+            .is_some()
     }
 
     /// `&self` was bound as a borrow this body recorded on
@@ -2130,19 +2129,20 @@ impl<'a> Lowering<'a> {
     }
 
     /// `arg_locals` with `&self` replaced by the borrow recorded on
-    /// [`Lowering::atomic_ref_place`] it copies, when `&self` resolves
-    /// to one through copies (`recorded_borrow_through_copies`). A copy
-    /// names the same place as the borrow, so the arms resolve that
-    /// place at the call.
+    /// [`Lowering::atomic_ref_place`] it resolves to at the end of block
+    /// `mir_bb` (`recorded_borrow_through_copies`). A copy names the same
+    /// place as the borrow, so the arms resolve that place at the call.
     pub(in crate::front::mir) fn atomic_receiver_through_copies(
         &self,
+        mir_bb: usize,
         arg_locals: &[Option<usize>],
     ) -> Vec<Option<usize>> {
         let mut locals = arg_locals.to_vec();
         let Some(Some(local)) = locals.first().copied() else {
             return locals;
         };
-        if let Some(r) = self.recorded_borrow_through_copies(local) {
+        let call = self.body.body[mir_bb].statements.len();
+        if let Some(r) = self.recorded_borrow_through_copies(local, mir_bb, call) {
             locals[0] = Some(r);
         }
         locals
@@ -2194,12 +2194,10 @@ impl<'a> Lowering<'a> {
         false
     }
 
-    /// The locals the definitions of `local` copy: each definition is
-    /// `local = copy src` / `move src`, and `local` is not a reassigned
-    /// parameter, a call destination or mutably borrowed. Definite
-    /// initialisation puts a copy between any redefinition of a source
-    /// and a use of `local`, so `local` names what the last-run copy's
-    /// source names.
+    /// The locals the definitions of `local` anywhere in the body copy: each
+    /// definition is `local = copy src` / `move src`, and `local` is not a
+    /// reassigned parameter, a call destination or mutably borrowed.
+    /// `copy_root` follows it for a local with one definition.
     fn copy_sources(&self, local: usize) -> Option<Vec<usize>> {
         if self.reassigned_param_locals.contains(&local)
             || self.mutably_borrowed_locals.contains(&local)
@@ -2243,87 +2241,174 @@ impl<'a> Lowering<'a> {
         if found.is_empty() { None } else { Some(found) }
     }
 
-    /// The recorded borrow `local` resolves to through copies (see
-    /// `copy_sources`): `local` itself when recorded; otherwise the
-    /// borrow every source resolves to, when all of them resolve, are
-    /// stable (`atomic_referent_is_stable`) and record the same place
-    /// (`place_names_same`), so the place names one referent whichever
-    /// copy ran last. Walks with an explicit stack; a local already
-    /// resolved in the walk is reused, and only a local on the active
-    /// path is a cycle.
-    fn recorded_borrow_through_copies(&self, start: usize) -> Option<usize> {
+    /// The locals the definitions of `local` reaching the point just before
+    /// statement `stmt` of block `bb` copy (`reaching_definitions`), each
+    /// with the point of its copy. `None` when `local` is a parameter the
+    /// body assigns again or is mutably borrowed, when no definition
+    /// reaches, or when a reaching definition is a call or anything but a
+    /// `copy` / `move` of a local.
+    fn reaching_copy_sources(
+        &self,
+        local: usize,
+        bb: usize,
+        stmt: usize,
+    ) -> Option<Vec<(usize, usize, usize)>> {
+        if self.reassigned_param_locals.contains(&local)
+            || self.mutably_borrowed_locals.contains(&local)
+        {
+            return None;
+        }
+        let defs = self.reaching_definitions(local, bb, stmt);
+        if defs.is_empty() {
+            return None;
+        }
+        let mut found = Vec::new();
+        for (def_bb, def_stmt) in defs {
+            let idx = def_stmt?;
+            let Ok(StmtKind::Assign(_, rvalue)) =
+                self.body.body[def_bb].statements[idx].stmt_kind_ref()
+            else {
+                return None;
+            };
+            let Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _) = rvalue else {
+                return None;
+            };
+            let PlaceKind::Local(src) = place.kind else {
+                return None;
+            };
+            let source = (src as usize, def_bb, idx);
+            if !found.contains(&source) {
+                found.push(source);
+            }
+        }
+        Some(found)
+    }
+
+    /// The recorded borrow `local` resolves to at the point just before
+    /// statement `stmt` of block `bb`, when no local the borrow's place
+    /// reads is written between the borrow and that point:
+    /// - `local` itself when it is recorded (`borrow_reads_unchanged` since
+    ///   its definition);
+    /// - otherwise through the copies its definitions reaching the point
+    ///   make (`reaching_copy_sources`), and theirs in turn. Every recorded
+    ///   borrow reached is checked on each copy step, from the definition
+    ///   of the copying local to the point that reads it, and all of them
+    ///   must record the same place (`same_place_borrow`). The result is
+    ///   the borrow `same_place_borrow` chooses.
+    ///
+    /// Walks with an explicit stack of (local, point) frames; a frame
+    /// already resolved in the walk is reused, and only a frame on the
+    /// active path is a cycle.
+    fn recorded_borrow_through_copies(
+        &self,
+        start: usize,
+        bb: usize,
+        stmt: usize,
+    ) -> Option<usize> {
         if self.atomic_ref_place.contains_key(&start) {
-            return Some(start);
+            return self
+                .borrow_reads_unchanged(start, start, bb, stmt)
+                .then_some(start);
         }
         struct Frame {
             local: usize,
-            sources: Vec<usize>,
+            bb: usize,
+            stmt: usize,
+            sources: Vec<(usize, usize, usize)>,
             next: usize,
-            resolved: Vec<usize>,
+            borrows: Vec<usize>,
         }
-        // Locals already resolved in this walk, so a local two sources
-        // reach is resolved once.
-        let mut resolved_locals: Vec<(usize, usize)> = Vec::new();
-        // The active path: a source already on it is a cycle.
-        let mut frames: Vec<Frame> = Vec::new();
-        frames.push(Frame {
+        // Frames already resolved in this walk, with the recorded borrows
+        // they reach.
+        let mut resolved: Vec<((usize, usize, usize), Vec<usize>)> = Vec::new();
+        // The active path: a frame already on it is a cycle.
+        let mut frames: Vec<Frame> = vec![Frame {
             local: start,
-            sources: self.copy_sources(start)?,
+            bb,
+            stmt,
+            sources: self.reaching_copy_sources(start, bb, stmt)?,
             next: 0,
-            resolved: Vec::new(),
-        });
-        while !frames.is_empty() {
-            let i = frames.len() - 1;
+            borrows: Vec::new(),
+        }];
+        while let Some(i) = frames.len().checked_sub(1) {
             if frames[i].next < frames[i].sources.len() {
-                let src = frames[i].sources[frames[i].next];
+                let point = frames[i].sources[frames[i].next];
                 frames[i].next += 1;
-                if self.atomic_ref_place.contains_key(&src) {
-                    frames[i].resolved.push(src);
-                } else if let Some(&(_, r)) = resolved_locals.iter().find(|(l, _)| *l == src) {
-                    frames[i].resolved.push(r);
-                } else if frames.iter().any(|f| f.local == src) {
+                let (src, src_bb, src_stmt) = point;
+                let reached = if self.atomic_ref_place.contains_key(&src) {
+                    // The borrow is copied at `point`: no local its place
+                    // reads is written since the borrow.
+                    if !self.borrow_reads_unchanged(src, src, src_bb, src_stmt) {
+                        return None;
+                    }
+                    vec![src]
+                } else if let Some((_, borrows)) = resolved.iter().find(|(p, _)| *p == point) {
+                    borrows.clone()
+                } else if frames.iter().any(|f| (f.local, f.bb, f.stmt) == point) {
                     return None;
                 } else {
-                    let sources = self.copy_sources(src)?;
+                    let sources = self.reaching_copy_sources(src, src_bb, src_stmt)?;
                     frames.push(Frame {
                         local: src,
+                        bb: src_bb,
+                        stmt: src_stmt,
                         sources,
                         next: 0,
-                        resolved: Vec::new(),
+                        borrows: Vec::new(),
                     });
+                    continue;
+                };
+                for b in reached {
+                    if !frames[i].borrows.contains(&b) {
+                        frames[i].borrows.push(b);
+                    }
                 }
                 continue;
             }
-            let Some(frame) = frames.pop() else {
-                break;
-            };
-            let r = self.same_place_borrow(&frame.resolved)?;
-            resolved_locals.push((frame.local, r));
+            let frame = frames.pop()?;
+            // `frame.local` holds a copy of each borrow from its definition
+            // reaching the frame's point up to that point.
+            for &b in &frame.borrows {
+                if !self.borrow_reads_unchanged(b, frame.local, frame.bb, frame.stmt) {
+                    return None;
+                }
+            }
             match frames.last_mut() {
-                Some(parent) => parent.resolved.push(r),
-                None => return Some(r),
+                Some(parent) => {
+                    for &b in &frame.borrows {
+                        if !parent.borrows.contains(&b) {
+                            parent.borrows.push(b);
+                        }
+                    }
+                    resolved.push(((frame.local, frame.bb, frame.stmt), frame.borrows));
+                }
+                None => return self.same_place_borrow(&frame.borrows),
             }
         }
         None
     }
 
-    /// The first of `resolved`, when they are all one borrow or all stable
-    /// borrows recording the same place (`place_names_same`).
-    fn same_place_borrow(&self, resolved: &[usize]) -> Option<usize> {
-        let first = *resolved.first()?;
-        if resolved.len() > 1 {
-            for &r in resolved {
-                if !self.atomic_referent_is_stable(&[Some(r)]) {
-                    return None;
-                }
-                let place_r = self.atomic_ref_place.get(&r)?;
-                let place_first = self.atomic_ref_place.get(&first)?;
-                if !self.place_names_same(place_r, place_first) {
-                    return None;
-                }
+    /// A borrow among `borrows` that the arms can re-resolve at the call,
+    /// when they all record the same place (`place_names_same`): the first
+    /// whose place reads (`borrow_reads`) only locals bound in `local_var`
+    /// there. A local that only some predecessors of the call's block
+    /// assign is not bound at the call.
+    fn same_place_borrow(&self, borrows: &[usize]) -> Option<usize> {
+        let chosen = borrows.iter().copied().find(|&b| {
+            self.borrow_reads(b).is_some_and(|reads| {
+                reads
+                    .iter()
+                    .all(|&l| self.local_var.get(l).is_some_and(Option::is_some))
+            })
+        })?;
+        let place_chosen = self.atomic_ref_place.get(&chosen)?;
+        for r in borrows {
+            let place_r = self.atomic_ref_place.get(r)?;
+            if !self.place_names_same(place_r, place_chosen) {
+                return None;
             }
         }
-        Some(first)
+        Some(chosen)
     }
 
     /// `a` and `b` are the same place expression: locals with the same
@@ -2385,6 +2470,22 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// The predecessors of each block, over the blocks reached from the
+    /// entry.
+    fn block_predecessors(&self) -> Vec<Vec<usize>> {
+        let n = self.body.body.len();
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for p in 0..n {
+            if !self.forward_reached[p] {
+                continue;
+            }
+            for s in crate::front::mir::gcroot::block_successors(self.llbc, self.body, p) {
+                preds[s].push(p);
+            }
+        }
+        preds
+    }
+
     /// Definitions of `local` that reach the point just before statement
     /// `stmt` of block `bb` (`stmt == statements.len()` is the terminator):
     /// on each path back, the last statement assigning `local` kills every
@@ -2413,15 +2514,7 @@ impl<'a> Lowering<'a> {
         }
 
         let n = self.body.body.len();
-        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
-        for p in 0..n {
-            if !self.forward_reached[p] {
-                continue;
-            }
-            for s in crate::front::mir::gcroot::block_successors(self.llbc, self.body, p) {
-                preds[s].push(p);
-            }
-        }
+        let preds = self.block_predecessors();
 
         let mut defs = Vec::new();
         let mut seen = vec![[false; 2]; n];
@@ -2468,58 +2561,178 @@ impl<'a> Lowering<'a> {
         defs
     }
 
-    fn recorded_place_is_stable(&self, place: &Place) -> bool {
-        match &place.kind {
-            PlaceKind::Global { .. } => true,
-            PlaceKind::Local(l) => self.local_has_one_definition(*l as usize),
-            PlaceKind::Projection(inner, ProjectionElem::Tagged(v)) => {
-                let Some(obj) = v.as_object() else {
-                    return false;
-                };
-                if obj.contains_key("Field") {
-                    return self.recorded_place_is_stable(inner);
-                }
-                let Some(index) = obj.get("Index") else {
-                    return false;
-                };
-                self.index_offset_is_stable(index) && self.recorded_place_is_stable(inner)
-            }
-            PlaceKind::Projection(inner, ProjectionElem::Atom(name)) if name == "Deref" => {
-                let PlaceKind::Local(l) = &inner.kind else {
-                    return false;
-                };
-                let l = *l as usize;
-                if !self.local_has_one_definition(l) {
-                    return false;
-                }
-                match self.atomic_ref_place.get(&l) {
-                    Some(recorded) => self.recorded_place_is_stable(recorded),
-                    None => true,
-                }
-            }
-            PlaceKind::Projection(..) | PlaceKind::Unknown => false,
-        }
-    }
-
-    /// An `Index` projection's offset is a constant, or a local with one
-    /// definition for the whole body, so it names the same element at the
-    /// borrow and at the call. A suffix index (`from_end`) is not stable: the
-    /// element it names depends on the length.
-    fn index_offset_is_stable(&self, index: &serde_json::Value) -> bool {
-        if index.get("from_end").and_then(serde_json::Value::as_bool) == Some(true) {
-            return false;
-        }
-        let Some(offset) = index.get("offset") else {
+    /// No local the recorded borrow `borrow`'s place reads (`borrow_reads`)
+    /// is written after the definition of `from` reaching the point just
+    /// before statement `stmt` of block `bb` (`written_since_definition`).
+    fn borrow_reads_unchanged(&self, borrow: usize, from: usize, bb: usize, stmt: usize) -> bool {
+        let Some(reads) = self.borrow_reads(borrow) else {
             return false;
         };
-        match serde_json::from_value::<Operand>(offset.clone()) {
-            Ok(Operand::Const(_)) => true,
-            Ok(Operand::Copy(place) | Operand::Move(place)) => matches!(
-                place.kind,
-                PlaceKind::Local(local) if self.local_has_one_definition(local as usize)
-            ),
-            _ => false,
+        reads
+            .iter()
+            .all(|&l| !self.written_since_definition(l, from, bb, stmt))
+    }
+
+    /// The locals that re-resolving the recorded borrow `borrow`'s place at
+    /// the call reads: the base local, a local an `Index` offsets by, the
+    /// local a `Deref` reads. When that local is itself a recorded borrow,
+    /// `*l` re-resolves `l`'s place too, so the locals that place reads are
+    /// included, and none of them may be written between `l`'s definition
+    /// and the borrow that reads it (`written_since_definition`).
+    ///
+    /// `None` when the place cannot name the same element at the call: a
+    /// recorded borrow with more than one definition, a suffix index (the
+    /// element it names depends on the length), an offset that is neither
+    /// a constant nor a local, or another projection.
+    fn borrow_reads(&self, borrow: usize) -> Option<Vec<usize>> {
+        let mut reads: Vec<usize> = Vec::new();
+        // Recorded borrows still to read, each with the (from, bb, stmt)
+        // spans its reads must not be written in.
+        let mut pending: Vec<(usize, Vec<(usize, usize, usize)>)> = vec![(borrow, Vec::new())];
+        let mut seen: Vec<usize> = Vec::new();
+        while let Some((b, spans)) = pending.pop() {
+            if seen.contains(&b) || !self.local_has_one_definition(b) {
+                return None;
+            }
+            seen.push(b);
+            let place = self.atomic_ref_place.get(&b)?;
+            let (def_bb, def_stmt) = self.assignment_point(b)?;
+            let mut own: Vec<usize> = Vec::new();
+            let mut current = place.clone();
+            loop {
+                match current.kind {
+                    PlaceKind::Global { .. } => break,
+                    PlaceKind::Local(l) => {
+                        own.push(l as usize);
+                        break;
+                    }
+                    PlaceKind::Projection(inner, ProjectionElem::Tagged(v)) => {
+                        let obj = v.as_object()?;
+                        if let Some(index) = obj.get("Index") {
+                            own.extend(index_offset_read(index)?);
+                        } else if !obj.contains_key("Field") {
+                            return None;
+                        }
+                        current = *inner;
+                    }
+                    PlaceKind::Projection(inner, ProjectionElem::Atom(name)) if name == "Deref" => {
+                        let PlaceKind::Local(l) = inner.kind else {
+                            return None;
+                        };
+                        let l = l as usize;
+                        own.push(l);
+                        if self.atomic_ref_place.contains_key(&l) {
+                            let mut inner_spans = spans.clone();
+                            inner_spans.push((l, def_bb, def_stmt));
+                            pending.push((l, inner_spans));
+                        }
+                        break;
+                    }
+                    PlaceKind::Projection(..) | PlaceKind::Unknown => return None,
+                }
+            }
+            for &(from, bb, stmt) in &spans {
+                if own
+                    .iter()
+                    .any(|&l| self.written_since_definition(l, from, bb, stmt))
+                {
+                    return None;
+                }
+            }
+            reads.extend(own);
         }
+        Some(reads)
+    }
+
+    /// The statement assigning `local`, a local with one definition: its
+    /// block and index.
+    fn assignment_point(&self, local: usize) -> Option<(usize, usize)> {
+        for (bb_idx, block) in self.body.body.iter().enumerate() {
+            if !self.forward_reached[bb_idx] {
+                continue;
+            }
+            for (idx, stmt) in block.statements.iter().enumerate() {
+                if let Ok(StmtKind::Assign(dest, _)) = stmt.stmt_kind_ref()
+                    && let PlaceKind::Local(index) = dest.kind
+                    && index as usize == local
+                {
+                    return Some((bb_idx, idx));
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether the last statement of block `bb` before `end` that assigns
+    /// `local` or `from` assigns `local` (`Some(true)`) or `from`
+    /// (`Some(false)`); `None` when neither is assigned there.
+    fn last_assignment_among(
+        &self,
+        bb: usize,
+        end: usize,
+        local: usize,
+        from: usize,
+    ) -> Option<bool> {
+        let statements = &self.body.body[bb].statements;
+        for idx in (0..end.min(statements.len())).rev() {
+            let Ok(StmtKind::Assign(dest, _)) = statements[idx].stmt_kind_ref() else {
+                continue;
+            };
+            let PlaceKind::Local(index) = dest.kind else {
+                continue;
+            };
+            let index = index as usize;
+            if index == local {
+                return Some(true);
+            }
+            if index == from {
+                return Some(false);
+            }
+        }
+        None
+    }
+
+    /// `local` may be written after the definition of `from` reaching the
+    /// point just before statement `stmt` of block `bb`
+    /// (`stmt == statements.len()` is the terminator): walking back from
+    /// that point, a path meets an assignment of `local`, or a call writing
+    /// it on its return edge, before it meets one of `from`. A path that
+    /// reaches the entry first adds nothing; `from` then holds its incoming
+    /// value. A local the body borrows mutably may be written anywhere
+    /// (`mutably_borrowed_locals`).
+    fn written_since_definition(&self, local: usize, from: usize, bb: usize, stmt: usize) -> bool {
+        if self.mutably_borrowed_locals.contains(&local) {
+            return true;
+        }
+        if let Some(written) = self.last_assignment_among(bb, stmt, local, from) {
+            return written;
+        }
+        let preds = self.block_predecessors();
+        let mut scanned = vec![false; self.body.body.len()];
+        let mut work: Vec<(usize, usize)> = preds[bb].iter().map(|&p| (p, bb)).collect();
+        while let Some((p, s)) = work.pop() {
+            if let Ok(TermKind::Call { call, target, .. }) = self.body.body[p].term_ref(self.llbc)
+                && *target as usize == s
+                && let PlaceKind::Local(i) = call.dest.kind
+            {
+                if i as usize == local {
+                    return true;
+                }
+                if i as usize == from {
+                    continue;
+                }
+            }
+            if scanned[p] {
+                continue;
+            }
+            scanned[p] = true;
+            match self.last_assignment_among(p, usize::MAX, local, from) {
+                Some(true) => return true,
+                Some(false) => {}
+                None => work.extend(preds[p].iter().map(|&pp| (pp, p))),
+            }
+        }
+        false
     }
 
     /// `<core::sync::atomic::Atomic*>::store(&self, value, ordering)` — the
@@ -8382,5 +8595,23 @@ impl<'a> Lowering<'a> {
             return Some(arg.clone());
         }
         None
+    }
+}
+
+/// The local an `Index` projection offsets by, `Some(None)` for a constant
+/// offset, `None` for a suffix index (`from_end`: the element it names
+/// depends on the length) or any other offset.
+fn index_offset_read(index: &serde_json::Value) -> Option<Option<usize>> {
+    if index.get("from_end").and_then(serde_json::Value::as_bool) == Some(true) {
+        return None;
+    }
+    let offset = index.get("offset")?;
+    match serde_json::from_value::<Operand>(offset.clone()) {
+        Ok(Operand::Const(_)) => Some(None),
+        Ok(Operand::Copy(place) | Operand::Move(place)) => match place.kind {
+            PlaceKind::Local(local) => Some(Some(local as usize)),
+            _ => None,
+        },
+        _ => None,
     }
 }

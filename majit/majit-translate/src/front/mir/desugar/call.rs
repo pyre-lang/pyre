@@ -3570,7 +3570,7 @@ impl<'a> Lowering<'a> {
                 // whole-program builder's pre-existing residual fallback is
                 // separate #346 work, not an implementation of atomic loads.
                 if args.len() == 2 && self.is_atomic_load(&reg) {
-                    let receiver_locals = self.atomic_receiver_through_copies(&arg_locals);
+                    let receiver_locals = self.atomic_receiver_through_copies(mir_bb, &arg_locals);
                     let ordering = arg_locals
                         .get(1)
                         .copied()
@@ -3583,15 +3583,17 @@ impl<'a> Lowering<'a> {
                         // `from_ptr` identity leaves the field *address*;
                         // loading that word is `raw_load`, not aliasing the
                         // pointer (Unsigned) onto the Signed memo.
-                        // A recorded borrow through a rebound local stays
-                        // unsupported: the re-read would name another object.
-                        // A receiver whose definitions all copy, possibly through
-                        // further copies, recorded borrows of one place resolves as
-                        // that borrow. A receiver that a definition reaching the call
-                        // may otherwise copy one into holds the field value, not its
-                        // address, and is unsupported.
+                        // A recorded borrow whose place reads a local written
+                        // between the borrow and the call stays unsupported:
+                        // the re-read would name another object.
+                        // A receiver whose definitions reaching the call all
+                        // copy, possibly through further copies, recorded
+                        // borrows of one place resolves as that borrow. A
+                        // receiver that a definition reaching the call may
+                        // otherwise copy one into holds the field value, not
+                        // its address, and is unsupported.
                         if (self.atomic_receiver_has_recorded_borrow(&receiver_locals)
-                            && !self.atomic_referent_is_stable(&receiver_locals))
+                            && !self.atomic_referent_is_stable(mir_bb, &arg_locals))
                             || self.atomic_receiver_may_copy_a_recorded_borrow(
                                 mir_bb,
                                 &receiver_locals,
@@ -3652,13 +3654,14 @@ impl<'a> Lowering<'a> {
                     // no recorded borrow (an `Atomic*::from_ptr` view)
                     // cannot be re-read there, so it stays unsupported
                     // rather than reusing an earlier read. A borrow whose
-                    // place goes through a reassigned local or a pointer
-                    // read from a field also stays unsupported.
+                    // place reads a local written between the borrow and the
+                    // call, or goes through a pointer read from a field,
+                    // also stays unsupported.
                     let is_acquire = ordering == Some("Acquire");
                     let ordering_label = ordering.unwrap_or("unknown").to_string();
                     if is_acquire
                         && self.atomic_receiver_is_quasi_immutable_field(&args[0])
-                        && self.atomic_referent_is_stable(&receiver_locals)
+                        && self.atomic_referent_is_stable(mir_bb, &arg_locals)
                         && self.bind_dest_to_recorded_atomic_load(
                             mir_bb,
                             dest_local,
@@ -3726,18 +3729,21 @@ impl<'a> Lowering<'a> {
                         // through to the ordinary call path, which is what an
                         // unrecognised `store` already lowers to, rather than
                         // inventing a target or failing a graph that compiles
-                        // today.  A recorded borrow whose place goes through a
-                        // rebound local is unsupported: writing the place now
-                        // would name another object.  The place is copied, not
-                        // taken: one borrow stored through twice folds both times.
-                        // A receiver whose definitions all copy, possibly through
-                        // further copies, recorded borrows of one place resolves as
-                        // that borrow. A receiver that a definition reaching the call
-                        // may otherwise copy one into holds the field value, not its
-                        // address, and is unsupported.
-                        let receiver_locals = self.atomic_receiver_through_copies(&arg_locals);
+                        // today.  A recorded borrow whose place reads a local
+                        // written between the borrow and the call is
+                        // unsupported: writing the place now would name
+                        // another object.  The place is copied, not taken:
+                        // one borrow stored through twice folds both times.
+                        // A receiver whose definitions reaching the call all
+                        // copy, possibly through further copies, recorded
+                        // borrows of one place resolves as that borrow. A
+                        // receiver that a definition reaching the call may
+                        // otherwise copy one into holds the field value, not
+                        // its address, and is unsupported.
+                        let receiver_locals =
+                            self.atomic_receiver_through_copies(mir_bb, &arg_locals);
                         if (self.atomic_receiver_has_recorded_borrow(&receiver_locals)
-                            && !self.atomic_referent_is_stable(&receiver_locals))
+                            && !self.atomic_referent_is_stable(mir_bb, &arg_locals))
                             || self.atomic_receiver_may_copy_a_recorded_borrow(
                                 mir_bb,
                                 &receiver_locals,
