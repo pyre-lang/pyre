@@ -1375,34 +1375,11 @@ impl RPythonAnnotator {
             .collect()
     }
 
-    /// RPython `simplify(self, block_subset=None, extra_passes=None)`
-    /// (annrpython.py).
-    ///
-    /// Upstream body:
-    ///
-    /// ```python
-    /// transform.transform_graph(self, block_subset=block_subset,
-    ///                           extra_passes=extra_passes)
-    /// if block_subset is None:
-    ///     graphs = self.translator.graphs
-    /// else:
-    ///     graphs = {}
-    ///     for block in block_subset:
-    ///         graph = self.annotated.get(block)
-    ///         if graph:
-    ///             graphs[graph] = True
-    /// for graph in graphs:
-    ///     simplify.eliminate_empty_blocks(graph)
-    /// self.bookkeeper.compute_at_fixpoint()
-    /// if block_subset is None:
-    ///     perform_normalizations(self)
-    /// ```
-    ///
-    /// The Rust port routes the fixpoint call through the bookkeeper's
-    /// `compute_at_fixpoint`, invokes `eliminate_empty_blocks` over the
-    /// translator's graph set, and calls the normalizecalls driver on
-    /// the full-graph path.
-    pub(crate) fn simplify(
+    /// The per-graph part of [`Self::simplify`]: `transform_graph` over
+    /// `block_subset`, then `eliminate_empty_blocks` on each graph that owns
+    /// one of those blocks. [`Self::simplify`] follows it with
+    /// `compute_at_fixpoint` (and `perform_normalizations` without a subset).
+    pub(crate) fn simplify_graphs(
         &self,
         block_subset: Option<&[BlockRef]>,
         extra_passes: Option<&[super::super::translator::transform::TransformPass]>,
@@ -1440,6 +1417,41 @@ impl RPythonAnnotator {
             let fg = graph_ref.borrow();
             super::super::translator::simplify::eliminate_empty_blocks(&fg);
         }
+    }
+
+    /// RPython `simplify(self, block_subset=None, extra_passes=None)`
+    /// (annrpython.py).
+    ///
+    /// Upstream body:
+    ///
+    /// ```python
+    /// transform.transform_graph(self, block_subset=block_subset,
+    ///                           extra_passes=extra_passes)
+    /// if block_subset is None:
+    ///     graphs = self.translator.graphs
+    /// else:
+    ///     graphs = {}
+    ///     for block in block_subset:
+    ///         graph = self.annotated.get(block)
+    ///         if graph:
+    ///             graphs[graph] = True
+    /// for graph in graphs:
+    ///     simplify.eliminate_empty_blocks(graph)
+    /// self.bookkeeper.compute_at_fixpoint()
+    /// if block_subset is None:
+    ///     perform_normalizations(self)
+    /// ```
+    ///
+    /// The Rust port routes the fixpoint call through the bookkeeper's
+    /// `compute_at_fixpoint`, invokes `eliminate_empty_blocks` over the
+    /// translator's graph set, and calls the normalizecalls driver on
+    /// the full-graph path.
+    pub(crate) fn simplify(
+        &self,
+        block_subset: Option<&[BlockRef]>,
+        extra_passes: Option<&[super::super::translator::transform::TransformPass]>,
+    ) {
+        self.simplify_graphs(block_subset, extra_passes);
         // upstream: `self.bookkeeper.compute_at_fixpoint()`.
         // Upstream lets the call propagate any raised exception out
         // of `simplify` (see `annrpython.py:simplify` —

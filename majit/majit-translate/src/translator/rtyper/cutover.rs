@@ -5986,7 +5986,9 @@ fn run_phase_b_rtype_isolated(
 ///
 /// One call over `fully_annotated_blocks`. `block_subset is not None`
 /// skips `perform_normalizations` (`annrpython.py RPythonAnnotator.simplify`).
-/// A panic is retried per owning graph and recorded in `rtype_skipped`.
+/// A failing whole call is retried per graph through `simplify_graphs`,
+/// then `compute_at_fixpoint` runs once. Failures are recorded in
+/// `rtype_skipped`.
 fn run_annotator_simplify_isolated(
     annotator: &crate::annotator::annrpython::RPythonAnnotator,
     call_registry: &CallRegistry,
@@ -6053,7 +6055,7 @@ fn run_annotator_simplify_isolated(
     for gk in &order {
         let (gref, group) = &by_graph[gk];
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            annotator.simplify(Some(group), None);
+            annotator.simplify_graphs(Some(group), None);
         }));
         if let Err(payload) = result {
             simplify_fail += 1;
@@ -6068,6 +6070,12 @@ fn run_annotator_simplify_isolated(
             }
         }
     }
+    // `simplify`'s whole-program tail, once, after the per-graph retries
+    // (`annrpython.py RPythonAnnotator.simplify` runs it once per call).
+    annotator
+        .bookkeeper
+        .compute_at_fixpoint()
+        .unwrap_or_else(|err| std::panic::panic_any(err.in_stage("compute_at_fixpoint")));
     if rtyper_verbose_enabled() {
         eprintln!("[PREPASS simplify fail] count={simplify_fail}");
     }
