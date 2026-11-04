@@ -39,10 +39,10 @@
 //!   `Signature`.
 //! - The `bookkeeper.descs` pre-registration so any subsequent
 //!   `getdesc(host_object)` hits the cache.
-//! - The `FunctionDesc.cache` pre-fill (via `prefill_default_cache`)
-//!   so the rtyper's `cachedgraph` returns the lifted leaf
-//!   `PyGraph` and skips `buildflowgraph` (which requires a real
-//!   Python `__code__` body).
+//! - The source-template install (via `install_source_template`) so
+//!   `FunctionDesc.cachedgraph` copies the lifted leaf `PyGraph`
+//!   (`translator.buildflowgraph` analogue) and skips `buildflowgraph`
+//!   on a synthetic `GraphFunc` with no `HostCode`.
 //! - The path → entry cache so repeat lookups (and the
 //!   `translate_op` consumer) share one `Hlvalue::Constant` identity
 //!   across all callsites of the same path.
@@ -65,9 +65,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::annotator::bookkeeper::Bookkeeper;
-use crate::annotator::description::{
-    AnnSignature, FunctionDesc, GraphCacheKey, clone_lifted_graph,
-};
+use crate::annotator::description::{AnnSignature, FunctionDesc, copy_or_mint_unique_graph};
 use crate::annotator::model::{SomeInstance, SomeValue};
 use crate::annotator::signature::{ParamType, TypeMarker};
 use crate::flowspace::argument::Signature;
@@ -290,14 +288,27 @@ pub(crate) fn exception_object_result_annotation() -> SomeValue {
     SomeValue::Instance(SomeInstance::new(None, false, Default::default()))
 }
 
-fn publish_exception_object_result_signature(function_desc: &mut FunctionDesc) {
+/// Publish a residual stub's declared result as the desc's `_signature_`
+/// (`FunctionDesc.pycall` `_signature_` / `register_external` `s_result`).
+/// Does not overwrite an `annsignature` already present.
+pub(crate) fn publish_residual_result_signature(
+    function_desc: &mut FunctionDesc,
+    s_result: SomeValue,
+) {
+    if function_desc.annsignature.is_some() {
+        return;
+    }
     let signature_arg_count = function_desc.signature.argnames.len();
     function_desc.annsignature = Some(Rc::new(AnnSignature {
         params: (0..signature_arg_count)
             .map(|_| ParamType::Marker(TypeMarker::AnyType))
             .collect(),
-        result: ParamType::Annotation(Box::new(exception_object_result_annotation())),
+        result: ParamType::Annotation(Box::new(s_result)),
     }));
+}
+
+fn publish_exception_object_result_signature(function_desc: &mut FunctionDesc) {
+    publish_residual_result_signature(function_desc, exception_object_result_annotation());
 }
 
 /// Per-path registry entry.  Each entry owns:
@@ -338,31 +349,30 @@ impl FunctionEntry {
     /// first alias key may legitimately be only the bare leaf and therefore
     /// cannot establish this semantic fact by itself.
     pub(crate) fn publish_exception_object_result_signature(&self) {
-        publish_exception_object_result_signature(&mut self.function_desc.borrow_mut());
+        publish_residual_result_signature(
+            &mut self.function_desc.borrow_mut(),
+            exception_object_result_annotation(),
+        );
     }
 
-    /// Pre-fill the entry's `FunctionDesc.cache` for the default
-    /// specializer with no `*args` (the lookup key
-    /// `Specializer::Default + flatten_star_args(no vararg) ->
-    /// GraphCacheKey::None` produced by `default_specialize` at
-    /// `description.rs`).
-    ///
-    /// `cachedgraph` (`description.rs`) returns the cached
-    /// `Rc<PyGraph>` immediately when the key hits, so the
-    /// `buildgraph` path that requires a real `HostCode` body
-    /// (`description.rs`) is skipped — pyre's synthetic
-    /// `GraphFunc` has no `HostCode` and would fail there.
+    /// Publish a residual stub's declared result as this entry's
+    /// `_signature_` (`FunctionDesc.pycall` `_signature_` /
+    /// `register_external` `s_result`).
+    pub(crate) fn publish_residual_result_signature(&self, s_result: SomeValue) {
+        publish_residual_result_signature(&mut self.function_desc.borrow_mut(), s_result);
+    }
+
+    /// Install `pygraph` as this entry's source template (the code
+    /// object `FunctionDesc.buildgraph` / `translator.buildflowgraph`
+    /// reads). Does not write `_cache`; None enters `_cache` only when
+    /// a specializer requests it (`FunctionDesc.cachedgraph`).
     ///
     /// The producer (a later follow-on, or a test fixture) is
     /// responsible for constructing `pygraph` from pyre's
     /// `model::FunctionGraph` for this callee — see
     /// `cutover::lift_callee_to_pygraph`.
-    pub fn prefill_default_cache(&self, pygraph: Rc<PyGraph>) {
-        self.function_desc
-            .borrow()
-            .cache
-            .borrow_mut()
-            .insert(GraphCacheKey::None, pygraph);
+    pub fn install_source_template(&self, pygraph: Rc<PyGraph>) {
+        self.function_desc.borrow().install_source_template(pygraph);
     }
 
     /// Record a per-entry lift failure so consumers surfacing through
@@ -374,10 +384,10 @@ impl FunctionEntry {
 
     /// Read-side twin of [`record_lift_error`]: the recorded pyre-side
     /// lift failure message, or `None` when the entry's body lifted
-    /// cleanly. Asking builds the graph first.
+    /// cleanly. Asking runs [`FunctionDesc::source_template`].
     pub fn lift_error(&self) -> Option<String> {
         let fd = self.function_desc.borrow();
-        fd.build_source_graph();
+        let _ = fd.source_template();
         fd.lift_error_message()
     }
 
@@ -569,8 +579,10 @@ impl CallRegistry {
         *self.getdesc.borrow_mut() = Some(getdesc);
     }
 
-    /// Drop every lowered body whose graph was never asked for. The
-    /// annotator is complete; no graph is built after it.
+    /// Drop every pending lift whose graph was never asked for. A built
+    /// template stays: it is the code object
+    /// (`translator.buildflowgraph`). The annotator is complete; no
+    /// graph is built after it.
     pub fn release_source_graphs(&self) {
         for entry in self.entries.borrow().values() {
             entry.function_desc.borrow().release_source_graph();
@@ -1059,22 +1071,28 @@ impl CallRegistry {
             return Some(existing);
         }
         let signature = template.function_desc.borrow().signature.clone();
-        let pygraph = template
-            .function_desc
-            .borrow()
-            .cache
-            .borrow()
-            .get(&GraphCacheKey::None)
-            .cloned();
+        let pygraph = template.function_desc.borrow().source_template();
         let declared = template.declared_funcptr_type.borrow().clone();
         let annsignature = template.function_desc.borrow().annsignature.clone();
+        let residual_result = template.function_desc.borrow().residual_signature_result();
         let graph_func = template
             .host_object
             .user_function()?
             .with_new_name(key.name());
-        let entry = self.get_or_register_with_func(key.clone(), signature, graph_func);
+        let entry = self.get_or_register_with_func(key.clone(), signature.clone(), graph_func);
         if let Some(pygraph) = pygraph {
-            entry.prefill_default_cache(clone_lifted_graph(&pygraph, Some(key.name())));
+            // `copyvar` drops annotation. A residual template stub has
+            // no body to re-flow, so mint a fresh stub from the
+            // template desc's `_signature_` result
+            // (`FunctionDesc.pycall` `_signature_` /
+            // `register_external` `s_result`) into the inst desc's
+            // source-template slot.
+            entry.install_source_template(copy_or_mint_unique_graph(
+                &pygraph,
+                key.name(),
+                signature,
+                residual_result,
+            ));
         }
         *entry.declared_funcptr_type.borrow_mut() = declared;
         entry.function_desc.borrow_mut().annsignature = annsignature;
@@ -1122,10 +1140,13 @@ impl CallRegistry {
         self.session.borrow().clone()
     }
 
-    /// Find the canonical entry whose `FunctionDesc.cache` holds a
-    /// `PyGraph` wrapping exactly `graph` (flowspace graph identity).
-    /// Used by the failed-subject-scope repair in `cutover` to map a
-    /// poisoned shared callee graph back to its registry entry.
+    /// Find the canonical entry whose `FunctionDesc.cache` or built
+    /// source template holds a `PyGraph` wrapping exactly `graph`
+    /// (flowspace graph identity). Used by the failed-subject-scope
+    /// repair in `cutover` to map a poisoned shared callee graph back
+    /// to its registry entry. Reads `_cache` (requested graphs) and the
+    /// built code-object template; does not run a pending lift and does
+    /// not insert `GraphCacheKey::None`.
     pub fn find_entry_with_cached_graph(
         &self,
         graph: &crate::flowspace::model::GraphRef,
@@ -1136,8 +1157,18 @@ impl CallRegistry {
         sorted_entries.sort_by_cached_key(|(key, _)| key.segments().join("::"));
         for (key, entry) in sorted_entries {
             let fd = entry.function_desc.borrow();
-            let cache = fd.cache.borrow();
-            if cache.values().any(|pg| Rc::ptr_eq(&pg.graph, graph)) {
+            if fd
+                .cache
+                .borrow()
+                .values()
+                .any(|pg| Rc::ptr_eq(&pg.graph, graph))
+            {
+                return Some((key.clone(), entry.clone()));
+            }
+            if fd
+                .built_source_template()
+                .is_some_and(|pg| Rc::ptr_eq(&pg.graph, graph))
+            {
                 return Some((key.clone(), entry.clone()));
             }
         }
@@ -1443,26 +1474,25 @@ impl CallRegistry {
         entry
     }
 
-    /// Atomic register + cache prefill — the contract pyre callsites
-    /// actually require to reach the rtyper's `direct_call` chain
-    /// without falling through to upstream `description.py:1147-1169
-    /// buildgraph` (which delegates to
-    /// `translator.buildflowgraph(pyobj, false)` and would fail on
-    /// pyre's synthetic `GraphFunc`-without-`HostCode`).
+    /// Atomic register + source-template install — the contract pyre
+    /// callsites actually require to reach the rtyper's `direct_call`
+    /// chain without falling through to `FunctionDesc.buildgraph` /
+    /// `translator.buildflowgraph` (which would fail on pyre's
+    /// synthetic `GraphFunc`-without-`HostCode`).
     ///
     /// Bare `get_or_register` only inserts into `bookkeeper.descs`; a
-    /// caller that forgets the matching `prefill_default_cache` would
-    /// register the FunctionDesc but leave the `cachedgraph` lookup at
-    /// `description.rs` cold, causing `pair_simple_call` to
-    /// invoke `buildgraph` on the synthetic GraphFunc.  Upstream's
-    /// equivalent path (`Bookkeeper.getdesc(pyfunc) -> FunctionDesc`)
-    /// guarantees the FunctionDesc is paired with a real Python
-    /// `__code__` body that `buildflowgraph` can consume; pyre's port
-    /// has no analogue so the prefill is mandatory.  Producers should
-    /// prefer this entry over the two-step pair to avoid the trap.
+    /// caller that forgets the matching `install_source_template` would
+    /// register the FunctionDesc but leave `cachedgraph` without a
+    /// code-object analogue, causing `pair_simple_call` to invoke
+    /// `buildgraph` on the synthetic GraphFunc. Upstream's equivalent
+    /// path (`Bookkeeper.getdesc(pyfunc) -> FunctionDesc`) guarantees
+    /// the FunctionDesc is paired with a real Python `__code__` body
+    /// that `buildflowgraph` can consume; pyre's port has no analogue
+    /// so the template is mandatory. Producers should prefer this entry
+    /// over the two-step pair to avoid the trap.
     ///
     /// `pygraph` is the lifted leaf body (`cutover::lift_callee_to_pygraph`).
-    /// Re-registration with the same key replaces the cached pygraph
+    /// Re-registration with the same key replaces the source template
     /// and asserts on signature equality (same contract as
     /// [`Self::get_or_register`]).
     pub fn register_callee(
@@ -1472,7 +1502,7 @@ impl CallRegistry {
         pygraph: Rc<PyGraph>,
     ) -> Rc<FunctionEntry> {
         let entry = self.get_or_register(key, signature);
-        entry.prefill_default_cache(pygraph);
+        entry.install_source_template(pygraph);
         entry
     }
 
@@ -1596,6 +1626,7 @@ fn starts_with_uppercase(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::annotator::description::GraphCacheKey;
 
     fn signature(arg_names: &[&str]) -> Signature {
         Signature::new(
@@ -1786,7 +1817,7 @@ mod tests {
             template_sig.clone(),
             template_func,
         );
-        template.prefill_default_cache(make_pygraph("dispatch", template_sig.clone()));
+        template.install_source_template(make_pygraph("dispatch", template_sig.clone()));
 
         let inst = registry
             .lookup(&FunctionPathKey::from_segments([
@@ -1923,7 +1954,7 @@ mod tests {
                 sig.clone(),
                 func,
             );
-            template.prefill_default_cache(stub_pygraph_with_formals(
+            template.install_source_template(stub_pygraph_with_formals(
                 "pyre_object::gc_storage::gc_alloc_young_storage_box",
                 sig.clone(),
             ));
@@ -1950,18 +1981,12 @@ mod tests {
             let inst_none = inst_entry
                 .function_desc
                 .borrow()
-                .cache
-                .borrow()
-                .get(&GraphCacheKey::None)
-                .cloned()
+                .source_template()
                 .expect("inst stub");
             let tuple_none = tuple_entry
                 .function_desc
                 .borrow()
-                .cache
-                .borrow()
-                .get(&GraphCacheKey::None)
-                .cloned()
+                .source_template()
                 .expect("tuple stub");
             assert!(
                 !Rc::ptr_eq(&inst_none, &tuple_none),
@@ -2061,7 +2086,7 @@ mod tests {
                 sig.clone(),
                 func,
             );
-            template.prefill_default_cache(stub_pygraph_with_formals(
+            template.install_source_template(stub_pygraph_with_formals(
                 "pyre_object::gc_storage::gc_alloc_young_storage_box",
                 sig.clone(),
             ));
@@ -2647,18 +2672,27 @@ mod tests {
             signature(&["x"]),
             other,
         );
+        assert!(
+            !registry
+                .lookup(&key)
+                .expect("registered")
+                .function_desc
+                .borrow()
+                .cache
+                .borrow()
+                .contains_key(&GraphCacheKey::None),
+            "register_callee installs the source template, not `_cache[None]`"
+        );
         let (found_key, found_entry) = registry
             .find_entry_with_cached_graph(&pygraph.graph)
-            .expect("entry holding the cached graph must resolve");
+            .expect("entry holding the source template must resolve");
         assert_eq!(found_key, key);
         assert!(
             found_entry
                 .function_desc
                 .borrow()
-                .cache
-                .borrow()
-                .values()
-                .any(|pg| Rc::ptr_eq(&pg.graph, &pygraph.graph))
+                .built_source_template()
+                .is_some_and(|pg| Rc::ptr_eq(&pg.graph, &pygraph.graph))
         );
         let unknown = make_pygraph("h", signature(&["x"]));
         assert!(

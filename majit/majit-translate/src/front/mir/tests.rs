@@ -15614,6 +15614,232 @@ fn specialize_argtype_inst_of_generic_dont_look_inside_star_mut_t_gets_substitut
     );
 }
 
+/// Two generic `dont_look_inside` free functions in different modules
+/// share the residual inst leaf (`alloc__inst_*` at the same type).
+/// `FunctionDesc.cachedgraph` keeps one cache per desc, so both enqueue
+/// and lower as distinct graphs.
+#[test]
+fn same_inst_leaf_from_two_modules_lowers_distinct_graphs() {
+    let llbc = same_inst_leaf_two_modules_llbc();
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build two-module same-leaf residual inst fixture");
+    let insts: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|f| {
+            f.name
+                .rsplit("::")
+                .next()
+                .is_some_and(|leaf| leaf.starts_with("alloc__inst_") && leaf.contains("GcBox"))
+        })
+        .collect();
+    assert_eq!(
+        insts.len(),
+        2,
+        "each module's alloc instantiation is its own graph; names={:?} modules={:?}",
+        program
+            .functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>(),
+        program
+            .functions
+            .iter()
+            .map(|f| f.module_path.as_str())
+            .collect::<Vec<_>>(),
+    );
+    assert_ne!(insts[0].module_path, insts[1].module_path);
+    assert_eq!(insts[0].name, insts[1].name);
+    assert_ne!(insts[0].graph().name, insts[1].graph().name);
+    assert_ne!(insts[0].fun_decl_id, insts[1].fun_decl_id);
+}
+
+fn same_inst_leaf_two_modules_llbc() -> Llbc {
+    let t = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let unit = serde_json::json!({
+        "Adt": {
+            "builtin": "Tuple",
+            "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+        }
+    });
+    let gc_adt = interior_adt(0);
+    let star_mut_t = interior_raw_mut(t.clone());
+    let look_inside_false = |def_id: u64, module: &str, leaf: &str| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": interior_meta(
+                &["fixture", module, &format!("_jit_look_inside_{leaf}")],
+                true
+            ),
+            "global_kind": "NamedConst",
+            "ty": {"Scalar": "Bool"},
+            "value": [{"Bool": false}, {"Scalar": "Bool"}]
+        })
+    };
+    let call_generics = |ty: serde_json::Value| {
+        serde_json::json!({
+            "regions": [],
+            "types": [ty],
+            "const_generics": [],
+            "trait_refs": []
+        })
+    };
+    let return_from_make_ptr = |dest_ty: &serde_json::Value, type_arg: serde_json::Value| {
+        serde_json::json!({
+            "Unstructured": {
+                "span": interior_span(),
+                "locals": {
+                    "arg_count": 0,
+                    "locals": [interior_local(0, None, dest_ty)]
+                },
+                "body": [
+                    interior_bb(
+                        vec![],
+                        serde_json::json!({
+                            "span": interior_span(),
+                            "kind": {
+                                "Call": {
+                                    "call": {
+                                        "func": {
+                                            "Regular": {
+                                                "kind": {"Fun": 4},
+                                                "generics": call_generics(type_arg)
+                                            }
+                                        },
+                                        "args": [],
+                                        "dest": interior_place(0, dest_ty)
+                                    },
+                                    "target": 1,
+                                    "on_unwind": 2
+                                }
+                            }
+                        }),
+                    ),
+                    interior_bb(vec![], interior_return()),
+                    interior_bb(vec![], interior_unwind()),
+                ]
+            }
+        })
+    };
+    let generic_alloc = |def_id: u64, module: &str| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": interior_meta(&["fixture", module, "alloc"], true),
+            "generics": {
+                "regions": [],
+                "types": [{"index": 0, "name": "T"}],
+                "const_generics": [],
+                "trait_clauses": []
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [],
+                "output": star_mut_t.clone()
+            },
+            "body": return_from_make_ptr(&star_mut_t, t.clone())
+        })
+    };
+    let caller = |def_id: u64, name: &str, fun: u64| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": interior_meta(&["fixture", name], true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": unit.clone()},
+            "body": {
+                "Unstructured": {
+                    "span": interior_span(),
+                    "locals": {
+                        "arg_count": 0,
+                        "locals": [interior_local(0, None, &unit)]
+                    },
+                    "body": [
+                        interior_bb(
+                            vec![],
+                            serde_json::json!({
+                                "span": interior_span(),
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Fun": fun},
+                                                    "generics": call_generics(gc_adt.clone())
+                                                }
+                                            },
+                                            "args": [],
+                                            "dest": interior_place(0, &unit)
+                                        },
+                                        "target": 1,
+                                        "on_unwind": 2
+                                    }
+                                }
+                            }),
+                        ),
+                        interior_bb(vec![], interior_return()),
+                        interior_bb(vec![], interior_unwind()),
+                    ]
+                }
+            }
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                interior_struct(0, &["fixture", "GcBox"], &[("n", interior_i64())], 8, &[0], false),
+            ],
+            "fun_decls": [
+                generic_alloc(0, "mod_a"),
+                generic_alloc(1, "mod_b"),
+                caller(2, "call_a", 0),
+                caller(3, "call_b", 1),
+                serde_json::json!({
+                    "def_id": 4,
+                    "item_meta": interior_meta(&["core", "ptr", "null_mut"], false),
+                    "generics": {
+                        "regions": [],
+                        "types": [{"index": 0, "name": "T"}],
+                        "const_generics": [],
+                        "trait_clauses": []
+                    },
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [],
+                        "output": star_mut_t.clone()
+                    },
+                    "body": "Opaque"
+                }),
+            ],
+            "global_decls": [
+                look_inside_false(0, "mod_a", "alloc"),
+                look_inside_false(1, "mod_b", "alloc"),
+            ],
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": interior_meta(&["majit_gc", "header", "GcType"], false)
+            }],
+            "trait_impls": [{
+                "impl_trait": {
+                    "id": 0,
+                    "generics": {
+                        "types": [{"Value": [0, {"Adt": {
+                            "id": 0,
+                            "generics": {
+                                "regions": [],
+                                "types": [],
+                                "const_generics": [],
+                                "trait_refs": []
+                            }
+                        }}]}]
+                    }
+                }
+            }]
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("two-module same-leaf inst fixture parses")
+}
+
 fn specialize_argtype_inst_return_token_llbc() -> Llbc {
     let t = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
     let u32_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U32"}}});

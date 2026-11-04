@@ -347,13 +347,12 @@ impl TranslationContext {
         }
 
         // If the lift of this host's lowered body
-        // (`FunctionDesc::build_source_graph`) recorded a failure,
+        // (`FunctionDesc::source_template`) recorded a failure,
         // surface that error instead of the generic "missing code
         // object" fallback below.  Mirrors
-        // upstream `bookkeeper.getdesc → newfuncdesc → buildgraph`
+        // `bookkeeper.getdesc → newfuncdesc → FunctionDesc.buildgraph`
         // where the original construction error propagates from the
-        // lazy `cachedgraph` consumer
-        // (`rpython/annotator/description.py`).
+        // lazy `cachedgraph` consumer.
         if let Some(lift_err) = self._lift_errors.borrow().get(&func).cloned() {
             return Err(format!(
                 "buildflowgraph({}): source lift failed (recorded \

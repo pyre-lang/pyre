@@ -5038,9 +5038,18 @@ fn legacy_const_define_hlvalue(
             // `None`; the site then fails closed with the most specific
             // diagnosis, exactly as before.
             use crate::translator::rtyper::lltypesystem::lltype;
-            let graphs = entry.function_desc.borrow().getgraphs();
+            let fd = entry.function_desc.borrow();
+            // `FunctionDesc.getgraphs` is requested graphs only. A fn-const
+            // may take the address before any specializer requests a
+            // graph; the code-object template is that backlink
+            // (`translator.buildflowgraph`).
+            let maybe_graph = fd
+                .getgraphs()
+                .into_iter()
+                .next()
+                .or_else(|| fd.source_template());
+            drop(fd);
             let lift_error = entry.lift_error();
-            let maybe_graph = graphs.into_iter().next();
             // The declared LLBC signature is the one `FuncType` for this
             // Rust `fn` type (`getfunctionptr` / `FuncType` from the
             // graph's declared args). Prefer it over a rtyped

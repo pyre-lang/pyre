@@ -39,7 +39,7 @@ use super::model::{
 use super::policy::Specializer;
 use super::signature::ParamType;
 use crate::flowspace::argument::{CallShape, Signature};
-use crate::flowspace::model::{ConstValue, Constant, Hlvalue, HostObject, Variable, host_getattr};
+use crate::flowspace::model::{ConstValue, Constant, HostObject, host_getattr};
 use crate::flowspace::pygraph::PyGraph;
 use crate::tool::algo::unionfind::SharedUnionFindInfo;
 
@@ -1102,7 +1102,10 @@ pub struct FunctionDesc {
     /// RPython `self.specializer` (description.py:202).
     pub specializer: Option<Specializer>,
     /// RPython `self._cache` (description.py:203) — keyed by the
-    /// specialization result.
+    /// specialization result. Holds only graphs a specializer requested
+    /// through [`Self::cachedgraph`]. The lifted LLBC body / signature
+    /// stub is the code object in [`Self::source_graph`], not a cache
+    /// entry (`FunctionDesc.getgraphs` / `translator.buildflowgraph`).
     ///
     /// Upstream keys entries with arbitrary Python values
     /// (specializer-dependent). The Rust port mirrors that shape with
@@ -1120,11 +1123,10 @@ pub struct FunctionDesc {
     /// error here instead of falling through to `buildflowgraph`'s generic
     /// synthetic-function failure.
     pub(crate) lift_error: RefCell<Option<String>>,
-    /// The lowered Rust body this callable's default graph is lifted from,
-    /// until the graph is first observed. RPython builds a callable's graph
-    /// on the `cachedgraph` miss (`buildgraph` ->
-    /// `translator.buildflowgraph`), not when the callable becomes known;
-    /// the call registry installs the lift here instead of running it.
+    /// Code-object analogue of `translator.buildflowgraph`: a pending
+    /// `FnOnce` lift, or the memoized [`PyGraph`] that lift produced
+    /// (`FunctionDesc.buildgraph`). [`Self::source_template`] runs the
+    /// pending lift once; it never writes `_cache`.
     pub(crate) source_graph: RefCell<Option<SourceGraph>>,
     /// Upstream `self.pyobj._signature_` (description.py:294, :315).
     /// Carried on FunctionDesc rather than HostObject because
@@ -1201,53 +1203,114 @@ impl FunctionDesc {
         }
     }
 
+    /// `dont_look_inside` (`_jit_look_inside_ = False`) or elidable
+    /// (`_elidable_function_`) on this desc's funcobj. Same predicate
+    /// `install_source_graph` uses when it installs the unique
+    /// signature stub as the source template.
+    pub(crate) fn residualizes_as_signature_stub(&self) -> bool {
+        self.base
+            .pyobj
+            .as_ref()
+            .and_then(HostObject::user_function)
+            .is_some_and(|func| {
+                residualizes_as_signature_stub(
+                    func._jit_look_inside_ == Some(false),
+                    func._elidable_function_,
+                )
+            })
+    }
+
+    /// Declared result of a residual signature stub
+    /// (`FunctionDesc.pycall` `_signature_` / `register_external`
+    /// `s_result`). `Some(s)` only when this desc residualizes as a
+    /// signature stub and `annsignature` finishes to a result
+    /// annotation. `cachedgraph` mints a fresh stub from this value.
+    pub(crate) fn residual_signature_result(&self) -> Option<SomeValue> {
+        if !self.residualizes_as_signature_stub() {
+            return None;
+        }
+        let annsig = self.annsignature.as_ref()?;
+        super::signature::finish_type(&annsig.result, &self.base.bookkeeper, &self.name)
+            .ok()
+            .flatten()
+    }
+
     /// RPython `FunctionDesc.getgraphs()` (description.py).
     ///
-    /// Upstream reads `_cache` alone: it holds exactly the graphs
-    /// annotation built. The call registry installs every callable before
-    /// annotation and its default graph stays pending in
-    /// [`Self::source_graph`], so an observer of the cache builds that
-    /// graph first ([`Self::build_source_graph`]), as the registry's former
-    /// eager prefill of the default key did.
+    /// Upstream reads `_cache` alone: it holds exactly the graphs a
+    /// specializer requested (`FunctionDesc.cachedgraph`). The lifted
+    /// body / signature stub is the code object in
+    /// [`Self::source_template`], not a cache entry.
     pub fn getgraphs(&self) -> Vec<Rc<PyGraph>> {
-        self.build_source_graph();
         self.cache.borrow().values().cloned().collect()
     }
 
-    /// Install the lowered body the default graph is built from.
+    /// Install a pending lift of the lowered body
+    /// (`translator.buildflowgraph` analogue).
     pub(crate) fn set_source_graph(&self, source: SourceGraph) {
         *self.source_graph.borrow_mut() = Some(source);
     }
 
-    /// Build the default graph from the pending lowered body, once. The
-    /// graph lands in `_cache` under the default key; a failure lands in
-    /// `lift_error`, which the next `cachedgraph` surfaces.
-    pub(crate) fn build_source_graph(&self) {
-        let Some(SourceGraph(build)) = self.source_graph.borrow_mut().take() else {
-            return;
-        };
-        match build() {
-            Ok(pygraph) => {
-                self.cache.borrow_mut().insert(GraphCacheKey::None, pygraph);
-            }
-            Err(message) => {
-                if let (Some(annotator), Some(pyobj)) =
-                    (self.base.bookkeeper.try_annotator(), &self.base.pyobj)
-                {
-                    annotator
-                        .translator
-                        ._lift_errors
-                        .borrow_mut()
-                        .insert(pyobj.clone(), message.clone());
-                }
-                self.record_lift_error(message);
-            }
+    /// Install a built template in the code-object slot
+    /// (`FunctionDesc.buildgraph` / `translator.buildflowgraph`). Does
+    /// not write `_cache`.
+    pub(crate) fn install_source_template(&self, pygraph: Rc<PyGraph>) {
+        *self.source_graph.borrow_mut() = Some(SourceGraph::Built(pygraph));
+    }
+
+    /// Peek at a built source template without running a pending lift.
+    /// Used by identity lookups (`find_entry_with_cached_graph`) that
+    /// must not force `translator.buildflowgraph`.
+    pub(crate) fn built_source_template(&self) -> Option<Rc<PyGraph>> {
+        match &*self.source_graph.borrow() {
+            Some(SourceGraph::Built(pygraph)) => Some(pygraph.clone()),
+            _ => None,
         }
     }
 
-    /// Drop a lowered body whose graph nothing asked for.
+    /// The lifted LLBC body or signature stub that plays the role of the
+    /// code object `translator.buildflowgraph` reads
+    /// (`FunctionDesc.buildgraph`). Runs a pending lift once and
+    /// memoizes the product in [`Self::source_graph`]; a lift failure
+    /// records `lift_error`. Never writes `_cache`.
+    pub(crate) fn source_template(&self) -> Option<Rc<PyGraph>> {
+        let taken = self.source_graph.borrow_mut().take();
+        match taken {
+            Some(SourceGraph::Built(pygraph)) => {
+                *self.source_graph.borrow_mut() = Some(SourceGraph::Built(pygraph.clone()));
+                Some(pygraph)
+            }
+            Some(SourceGraph::Pending(build)) => match build() {
+                Ok(pygraph) => {
+                    *self.source_graph.borrow_mut() = Some(SourceGraph::Built(pygraph.clone()));
+                    Some(pygraph)
+                }
+                Err(message) => {
+                    if let (Some(annotator), Some(pyobj)) =
+                        (self.base.bookkeeper.try_annotator(), &self.base.pyobj)
+                    {
+                        annotator
+                            .translator
+                            ._lift_errors
+                            .borrow_mut()
+                            .insert(pyobj.clone(), message.clone());
+                    }
+                    self.record_lift_error(message);
+                    None
+                }
+            },
+            None => None,
+        }
+    }
+
+    /// Drop a pending lift whose graph nothing asked for. A built
+    /// template stays: it is the code object
+    /// (`translator.buildflowgraph`).
     pub(crate) fn release_source_graph(&self) {
-        self.source_graph.borrow_mut().take();
+        let mut slot = self.source_graph.borrow_mut();
+        if matches!(&*slot, Some(SourceGraph::Pending(_))) {
+            *slot = None;
+        }
     }
 
     /// Record a lift failure to be observed at the same
@@ -1421,37 +1484,61 @@ impl FunctionDesc {
         alt_name: Option<&str>,
         builder: Option<GraphBuilder<'_>>,
     ) -> Result<Rc<PyGraph>, AnnotatorError> {
-        self.build_source_graph();
         if let Some(existing) = self.cache.borrow().get(&key) {
-            // Append the lifted callee graph to `translator.graphs`,
-            // mirroring `buildflowgraph`'s build-time append
-            // (translator.py `self.graphs.append(graph)`). This is NOT
-            // a second append site: the MISS path below routes through
-            // `buildgraph` -> `buildflowgraph` (in `description.rs` /
-            // `translator.rs`), which already appends exactly like
-            // upstream. Only graphs lifted from a lowered body
-            // (`build_source_graph` above) or prefilled by the registry
-            // (`prefill_default_cache`) reach a HIT without ever passing
-            // through `buildflowgraph`, so those never entered
-            // `translator.graphs`. The first HIT is the demand point at
-            // which upstream's MISS -> build -> append fires, so appending
-            // on first HIT is the faithful compensation; the `Rc::ptr_eq`
-            // guard makes it fire once (upstream's `_cache` build-once), matching
-            // `buildflowgraph`'s walker-hit guard. The flowspace effect
-            // analyzers (`canraise::RaiseAnalyzer` et al.) then resolve
+            // Append the requested graph to `translator.graphs`,
+            // mirroring `translator.buildflowgraph`'s build-time append
+            // (`self.graphs.append(graph)`). This is NOT a second append
+            // site: the MISS path below either copies the source
+            // template (`FunctionDesc.buildgraph`) or routes through
+            // `buildgraph` -> `buildflowgraph`, which already appends.
+            // Graphs that entered `_cache` without that miss (test
+            // fixtures, a HIT after a session attaches) never passed
+            // through `buildflowgraph`. The first HIT is the demand
+            // point at which upstream's MISS -> build -> append fires,
+            // so appending on first HIT is the faithful compensation;
+            // the `Rc::ptr_eq` guard makes it fire once (upstream's
+            // `_cache` build-once), matching `buildflowgraph`'s
+            // walker-hit guard. The flowspace effect analyzers
+            // (`canraise::RaiseAnalyzer` et al.) then resolve
             // `funcobj.graph` through `translator.graphs` (graphanalyze.rs)
             // instead of falling to `top_result()`. `try_annotator` is
             // `None` only for a bare `Bookkeeper` with no attached session
             // (the leaf-lift registry and test fixtures), so the prod lift
             // at `codewriter.rs` is a no-op here and the append fires once a
             // session is attached.
-            if let Some(annotator) = self.base.bookkeeper.try_annotator() {
-                let mut graphs = annotator.translator.graphs.borrow_mut();
-                if !graphs.iter().any(|g| Rc::ptr_eq(g, &existing.graph)) {
-                    graphs.push(existing.graph.clone());
-                }
-            }
+            self.remember_in_translator_graphs(existing);
             return Ok(existing.clone());
+        }
+        // The lifted LLBC body / signature stub is the code object
+        // (`FunctionDesc.buildgraph` / `translator.buildflowgraph`).
+        // Upstream `cachedgraph` re-runs `buildgraph` per key. There is
+        // no Python code object to re-flow, so a miss with `builder is
+        // None` copies that template (`copygraph` / mint from
+        // `FunctionDesc.pycall` `_signature_` / `register_external`
+        // `s_result`). `GraphCacheKey::None` is the first
+        // `buildflowgraph`: insert the template `Rc` itself so a
+        // signature stub keeps its result annotation. Any other key
+        // copies. None enters `_cache` only when None is requested.
+        if builder.is_none()
+            && let Some(template) = self.source_template()
+        {
+            let graph = if matches!(&key, GraphCacheKey::None) {
+                template
+            } else {
+                let computed_alt_name = alt_name.map(str::to_string).or_else(|| {
+                    let postfix = Self::key_to_cache_name(&Self::nameof_cache_key(&key));
+                    Some(format!("{}__{}", self.name, postfix))
+                });
+                copy_or_mint_unique_graph(
+                    &template,
+                    computed_alt_name.as_deref().unwrap_or(self.name.as_str()),
+                    self.signature.clone(),
+                    self.residual_signature_result(),
+                )
+            };
+            self.cache.borrow_mut().insert(key, graph.clone());
+            self.remember_in_translator_graphs(&graph);
+            return Ok(graph);
         }
         if let Some(lift_err) = self.lift_error_message() {
             return Err(AnnotatorError::new(format!(
@@ -1459,30 +1546,6 @@ impl FunctionDesc {
                  lazy-failure error): {lift_err}",
                 self.name,
             )));
-        }
-        // Lifted (LLBC) functions have one lowered body, prefilled at
-        // `GraphCacheKey::None`. Upstream `cachedgraph` re-runs
-        // `buildgraph` per key (`description.py FunctionDesc.cachedgraph`
-        // → `translator.buildflowgraph`). There is no Python code
-        // object to re-flow, so clone that template with fresh
-        // Variables (`flowspace/model.py copygraph`).
-        if builder.is_none() && !matches!(&key, GraphCacheKey::None) {
-            let template = self.cache.borrow().get(&GraphCacheKey::None).cloned();
-            if let Some(template) = template {
-                let computed_alt_name = alt_name.map(str::to_string).or_else(|| {
-                    let postfix = Self::key_to_cache_name(&Self::nameof_cache_key(&key));
-                    Some(format!("{}__{}", self.name, postfix))
-                });
-                let cloned = clone_lifted_graph(&template, computed_alt_name.as_deref());
-                self.cache.borrow_mut().insert(key, cloned.clone());
-                if let Some(annotator) = self.base.bookkeeper.try_annotator() {
-                    let mut graphs = annotator.translator.graphs.borrow_mut();
-                    if !graphs.iter().any(|g| Rc::ptr_eq(g, &cloned.graph)) {
-                        graphs.push(cloned.graph.clone());
-                    }
-                }
-                return Ok(cloned);
-            }
         }
         let computed_alt_name = alt_name.map(str::to_string).or_else(|| {
             if matches!(&key, GraphCacheKey::None) {
@@ -1496,38 +1559,83 @@ impl FunctionDesc {
         self.cache.borrow_mut().insert(key, graph.clone());
         Ok(graph)
     }
+
+    fn remember_in_translator_graphs(&self, graph: &Rc<PyGraph>) {
+        if let Some(annotator) = self.base.bookkeeper.try_annotator() {
+            let mut graphs = annotator.translator.graphs.borrow_mut();
+            if !graphs.iter().any(|g| Rc::ptr_eq(g, &graph.graph)) {
+                graphs.push(graph.graph.clone());
+            }
+        }
+    }
 }
 
-/// A pending lift of a lowered Rust body into a callable's default graph
-/// ([`FunctionDesc::source_graph`]).
-pub(crate) struct SourceGraph(Box<dyn FnOnce() -> Result<Rc<PyGraph>, String>>);
+/// Code-object analogue of `translator.buildflowgraph`
+/// ([`FunctionDesc::source_graph`]): a pending lift, or the memoized
+/// [`PyGraph`] that lift produced (`FunctionDesc.buildgraph`).
+pub(crate) enum SourceGraph {
+    Pending(Box<dyn FnOnce() -> Result<Rc<PyGraph>, String>>),
+    Built(Rc<PyGraph>),
+}
 
 impl SourceGraph {
     pub(crate) fn new(build: impl FnOnce() -> Result<Rc<PyGraph>, String> + 'static) -> Self {
-        Self(Box::new(build))
+        Self::Pending(Box::new(build))
     }
 }
 
 impl std::fmt::Debug for SourceGraph {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SourceGraph(..)")
+        match self {
+            Self::Pending(_) => f.write_str("SourceGraph::Pending(..)"),
+            Self::Built(_) => f.write_str("SourceGraph::Built(..)"),
+        }
     }
 }
 
+/// `dont_look_inside` (`_jit_look_inside_ = False`) or elidable
+/// (`_elidable_function_`). `install_source_graph` residualizes the
+/// unique graph into a signature stub on this predicate;
+/// `cachedgraph` mints a fresh stub per key from
+/// [`FunctionDesc::residual_signature_result`] (`FunctionDesc.pycall`
+/// `_signature_` / `register_external` `s_result`) instead of
+/// `copygraph`.
+pub(crate) fn residualizes_as_signature_stub(dont_look_inside: bool, elidable: bool) -> bool {
+    dont_look_inside || elidable
+}
+
+/// Per-key residual signature stub: mint from the desc's declared
+/// `_signature_` result (`FunctionDesc.pycall` `_signature_` /
+/// `register_external` `s_result`) instead of `copygraph`. Look-inside
+/// bodies still `copygraph`.
+pub(crate) fn copy_or_mint_unique_graph(
+    template: &PyGraph,
+    alt_name: &str,
+    signature: crate::flowspace::argument::Signature,
+    residual_result: Option<SomeValue>,
+) -> Rc<PyGraph> {
+    if let Some(s) = residual_result {
+        return crate::translator::rtyper::cutover::build_stub_pygraph_for_somevalue_from_template(
+            alt_name.to_string(),
+            signature,
+            s,
+            template,
+        );
+    }
+    clone_lifted_graph(template, Some(alt_name))
+}
+
 /// Analogue of `translator.buildflowgraph` for a lifted LLBC body:
-/// `copygraph` (`flowspace/model.py`) with a new name.
+/// `copygraph` with a new name. `copyvar` keeps `concretetype` and
+/// drops `annotation` so a look-inside body re-flows for a new
+/// `cachedgraph` key.
 pub(crate) fn clone_lifted_graph(template: &PyGraph, alt_name: Option<&str>) -> Rc<PyGraph> {
     let template_graph = template.graph.borrow();
-    let (mut copied, varmap) = crate::flowspace::model::copygraph_with_varmap(
-        &template_graph,
-        false,
-        &HashMap::new(),
-        false,
-    );
+    let mut copied =
+        crate::flowspace::model::copygraph(&template_graph, false, &HashMap::new(), false);
     if let Some(name) = alt_name {
         copied.name = name.to_string();
     }
-    restore_signature_stub_annotations(&template_graph, &varmap);
     Rc::new(PyGraph {
         graph: Rc::new(RefCell::new(copied)),
         func: template.func.clone(),
@@ -1535,60 +1643,6 @@ pub(crate) fn clone_lifted_graph(template: &PyGraph, alt_name: Option<&str>) -> 
         defaults: RefCell::new(template.defaults.borrow().clone()),
         access_directly: std::cell::Cell::new(template.access_directly.get()),
     })
-}
-
-/// `copygraph` copyvar (`model.py`) keeps `concretetype` and drops
-/// `annotation` so a lifted body re-flows for a new `cachedgraph` key.
-/// A residual signature stub (`extfunc.py` `register_external`, the
-/// `dont_look_inside` unique graph `install_source_graph` prefills)
-/// has no operations; its return Variable is
-/// `ExtRegistryEntry.compute_result_annotation`. `specialize_argtype`
-/// still `cachedgraph`s per argument type (`func_with_new_name` copies
-/// `_annspecialcase_`). Dropping that annotation makes the specialized
-/// copy's result `s_ImpossibleValue` / Void.
-///
-/// Restore only the result shell (startblock→returnblock link args
-/// and `getreturnvar`). The unique stub's startblock inputargs are
-/// bound by later `complete()` of that graph; copying them onto a
-/// new key merges the unique callers into the specialized ones
-/// (`unionof` String ∪ Instance(StrKey)).
-#[expect(
-    clippy::mutable_key_type,
-    reason = "Eq and Hash use immutable identity; matches copygraph_with_varmap"
-)]
-fn restore_signature_stub_annotations(
-    template: &crate::flowspace::model::FunctionGraph,
-    varmap: &HashMap<Variable, Variable>,
-) {
-    if !template.startblock.borrow().operations.is_empty() {
-        return;
-    }
-    let restore_one = |src: &Variable| {
-        let Some(dst) = varmap.get(src) else {
-            return;
-        };
-        if let Some(ann) = src.annotation.borrow().as_ref() {
-            *dst.annotation.borrow_mut() = Some(ann.clone());
-        }
-    };
-    {
-        let start = template.startblock.borrow();
-        for link in &start.exits {
-            for arg in &link.borrow().args {
-                if let Some(Hlvalue::Variable(v)) = arg {
-                    restore_one(v);
-                }
-            }
-        }
-    }
-    {
-        let ret = template.returnblock.borrow();
-        for arg in &ret.inputargs {
-            if let Hlvalue::Variable(v) = arg {
-                restore_one(v);
-            }
-        }
-    }
 }
 
 /// Result of [`FunctionDesc::specialize`].
@@ -1790,8 +1844,8 @@ impl FunctionDesc {
     /// as an optional bool mirroring the same "attribute absent"
     /// default-to-False contract.
     pub fn getuniquegraph(&self) -> Result<Rc<PyGraph>, AnnotatorError> {
-        // A pending registry graph is built first; see `getgraphs`.
-        self.build_source_graph();
+        // `FunctionDesc.getgraphs` / `getuniquegraph` read `_cache`
+        // alone: requested graphs, not the code-object template.
         let cache = self.cache.borrow();
         if cache.len() != 1 {
             return Err(AnnotatorError::new(format!(
@@ -3236,6 +3290,7 @@ mod tests {
         SomeDict, SomeException, SomeInstance, SomeInteger, SomeIterator, SomeList, SomePBC,
         SomeString, SomeTuple, SomeValue,
     };
+    use crate::annotator::signature::TypeMarker;
     use crate::flowspace::argument::CallShape;
     use rustpython_compiler::{Mode, compile as rp_compile};
     use rustpython_compiler_core::bytecode::ConstantData;
@@ -3464,9 +3519,7 @@ mod tests {
     fn cachedgraph_clones_the_prefilled_lifted_template_per_key() {
         let fd = FunctionDesc::new(bk(), None, "isconstant", int_sig(&["value"]), None, None);
         let template = make_pygraph(int_sig(&["value"]), Some(Vec::new()));
-        fd.cache
-            .borrow_mut()
-            .insert(GraphCacheKey::None, template.clone());
+        fd.install_source_template(template.clone());
 
         let first = fd
             .cachedgraph(
@@ -3489,19 +3542,164 @@ mod tests {
             first.graph.borrow().name,
             "isconstant__call_location_g1_b2_i3"
         );
-        assert_eq!(fd.cache.borrow().len(), 3);
+        assert_eq!(fd.cache.borrow().len(), 2);
+        assert!(
+            !fd.cache.borrow().contains_key(&GraphCacheKey::None),
+            "specialized keys must not insert the unrequested None template"
+        );
     }
 
-    /// `specialize_argtype` `cachedgraph` clones the unique residual stub.
-    /// `copygraph` copyvar would drop `compute_result_annotation`; the
-    /// signature stub has no body to re-flow, so the declared result stays.
+    #[test]
+    fn cachedgraph_specialized_key_only_does_not_cache_none() {
+        let fd = FunctionDesc::new(bk(), None, "isconstant", int_sig(&["value"]), None, None);
+        let template = make_pygraph(int_sig(&["value"]), Some(Vec::new()));
+        fd.install_source_template(template);
+        let graph = fd
+            .cachedgraph(
+                GraphCacheKey::Position(PositionKey::new(1, 2, 3)),
+                None,
+                None,
+            )
+            .expect("specialized graph");
+        assert!(
+            !fd.cache.borrow().contains_key(&GraphCacheKey::None),
+            "AccessDirect / Position keys must not insert GraphCacheKey::None"
+        );
+        let graphs = fd.getgraphs();
+        assert_eq!(graphs.len(), 1);
+        assert!(Rc::ptr_eq(&graphs[0], &graph));
+    }
+
+    #[test]
+    fn getuniquegraph_one_specialized_key_with_template_is_unique() {
+        let fd = FunctionDesc::new(bk(), None, "f", int_sig(&["x"]), None, None);
+        let template = make_pygraph(int_sig(&["x"]), Some(Vec::new()));
+        fd.install_source_template(template);
+        let graph = fd
+            .cachedgraph(
+                GraphCacheKey::Position(PositionKey::new(1, 2, 3)),
+                None,
+                None,
+            )
+            .expect("specialized graph");
+        assert_eq!(fd.cache.borrow().len(), 1);
+        let unique = fd.getuniquegraph().expect("one requested graph is unique");
+        assert!(Rc::ptr_eq(&unique, &graph));
+    }
+
+    #[test]
+    fn cachedgraph_none_key_installs_the_template_itself() {
+        use crate::flowspace::model::{
+            Block, BlockRefExt, FunctionGraph, GraphFunc, Hlvalue, Link, Variable,
+        };
+
+        let mut host_func =
+            GraphFunc::new("stub", Constant::new(ConstValue::Dict(Default::default())));
+        host_func._jit_look_inside_ = Some(false);
+        let mut fd = FunctionDesc::new(
+            bk(),
+            Some(HostObject::new_user_function(host_func)),
+            "stub",
+            int_sig(&["x"]),
+            None,
+            None,
+        );
+        fd.annsignature = Some(Rc::new(AnnSignature {
+            params: vec![ParamType::Marker(TypeMarker::AnyType)],
+            result: ParamType::Annotation(Box::new(SomeValue::Integer(SomeInteger::default()))),
+        }));
+        let startblock = Block::shared(vec![Hlvalue::Variable(Variable::named("x"))]);
+        let func = GraphFunc::new("stub", Constant::new(ConstValue::Dict(Default::default())));
+        let mut graph_inner = FunctionGraph::new("stub", startblock.clone());
+        graph_inner.func = Some(func.clone());
+        let return_var = Variable::named("__unsafe_stub_result");
+        *return_var.annotation.borrow_mut() =
+            Some(Rc::new(SomeValue::Integer(SomeInteger::default())));
+        let link = Rc::new(RefCell::new(Link::new(
+            vec![Hlvalue::Variable(return_var)],
+            Some(graph_inner.returnblock.clone()),
+            None,
+        )));
+        startblock.closeblock(vec![link]);
+        let stub = Rc::new(PyGraph {
+            graph: Rc::new(RefCell::new(graph_inner)),
+            func,
+            signature: RefCell::new(int_sig(&["x"])),
+            defaults: RefCell::new(Some(Vec::new())),
+            access_directly: std::cell::Cell::new(false),
+        });
+        fd.install_source_template(stub.clone());
+
+        let none = fd
+            .cachedgraph(GraphCacheKey::None, None, None)
+            .expect("first buildflowgraph of a signature stub");
+        assert!(
+            Rc::ptr_eq(&none, &stub),
+            "cachedgraph(None) inserts the template Rc itself"
+        );
+        let link_ann = {
+            let g = none.graph.borrow();
+            let start = g.startblock.borrow();
+            let link = start.exits[0].borrow();
+            match &link.args[0] {
+                Some(Hlvalue::Variable(v)) => v.annotation.borrow().clone(),
+                _ => None,
+            }
+        };
+        assert!(
+            matches!(link_ann.as_deref(), Some(SomeValue::Integer(_))),
+            "signature stub None graph keeps its result annotation, got {link_ann:?}"
+        );
+    }
+
+    #[test]
+    fn getuniquenondirectgraph_access_direct_only_desc_has_no_regular_graph() {
+        let fd = FunctionDesc::new(bk(), None, "pop", int_sig(&["self"]), None, None);
+        let template = make_pygraph(int_sig(&["self"]), Some(Vec::new()));
+        fd.install_source_template(template);
+        fd.record_access_directly_graph()
+            .expect("AccessDirect cache clone");
+        assert!(
+            !fd.cache.borrow().contains_key(&GraphCacheKey::None),
+            "AccessDirect-only desc must not insert unrequested None"
+        );
+        let err = super::super::specialize::getuniquenondirectgraph(&fd)
+            .expect_err("AD-only desc has no regular graph");
+        assert!(
+            err.msg
+                .unwrap_or_default()
+                .contains("expected one non-direct graph, got 0")
+        );
+    }
+
+    /// `specialize_argtype` `cachedgraph` mints a fresh residual stub
+    /// from the desc's `_signature_` result (`FunctionDesc.pycall`
+    /// `_signature_` / `register_external` `s_result`). `copygraph`
+    /// copyvar would drop that annotation; the signature stub has no
+    /// body to re-flow, so the declared result stays.
     #[test]
     fn cachedgraph_keeps_signature_stub_return_annotation_per_key() {
         use crate::flowspace::model::{
             Block, BlockRefExt, FunctionGraph, GraphFunc, Hlvalue, Link, Variable,
         };
 
-        let fd = FunctionDesc::new(bk(), None, "alloc_box", int_sig(&["value"]), None, None);
+        let mut host_func = GraphFunc::new(
+            "alloc_box",
+            Constant::new(ConstValue::Dict(Default::default())),
+        );
+        host_func._jit_look_inside_ = Some(false);
+        let mut fd = FunctionDesc::new(
+            bk(),
+            Some(HostObject::new_user_function(host_func)),
+            "alloc_box",
+            int_sig(&["value"]),
+            None,
+            None,
+        );
+        fd.annsignature = Some(Rc::new(AnnSignature {
+            params: vec![ParamType::Marker(TypeMarker::AnyType)],
+            result: ParamType::Annotation(Box::new(SomeValue::Integer(SomeInteger::default()))),
+        }));
         let startblock = Block::shared(vec![Hlvalue::Variable(Variable::named("value"))]);
         let func = GraphFunc::new(
             "alloc_box",
@@ -3525,9 +3723,7 @@ mod tests {
             defaults: std::cell::RefCell::new(Some(Vec::new())),
             access_directly: std::cell::Cell::new(false),
         });
-        fd.cache
-            .borrow_mut()
-            .insert(GraphCacheKey::None, stub.clone());
+        fd.install_source_template(stub.clone());
         {
             let g = stub.graph.borrow();
             if let Hlvalue::Variable(v) = &g.startblock.borrow().inputargs[0] {
@@ -3554,7 +3750,7 @@ mod tests {
         };
         assert!(
             matches!(link_ann.as_deref(), Some(SomeValue::Integer(_))),
-            "specialize_argtype copy keeps the stub result shell, got {link_ann:?}"
+            "per-key stub keeps the published `_signature_` result, got {link_ann:?}"
         );
         let input_ann = {
             let g = cloned.graph.borrow();
@@ -3569,13 +3765,278 @@ mod tests {
         );
     }
 
+    /// Look-inside `fn id(x) -> x`: `copyvar` drops the unique graph's
+    /// annotation so a later `cachedgraph` key re-flows instead of
+    /// inheriting `SomeInteger` on input and the return link.
+    #[test]
+    fn cachedgraph_identity_graph_does_not_leak_unique_annotation_into_later_keys() {
+        use crate::flowspace::model::{
+            Block, BlockRefExt, FunctionGraph, GraphFunc, Hlvalue, Link, Variable,
+        };
+
+        let host_func = GraphFunc::new("id", Constant::new(ConstValue::Dict(Default::default())));
+        let fd = FunctionDesc::new(
+            bk(),
+            Some(HostObject::new_user_function(host_func)),
+            "id",
+            int_sig(&["x"]),
+            None,
+            None,
+        );
+        let x = Variable::named("x");
+        *x.annotation.borrow_mut() = Some(Rc::new(SomeValue::Integer(SomeInteger::default())));
+        let startblock = Block::shared(vec![Hlvalue::Variable(x.clone())]);
+        let func = GraphFunc::new("id", Constant::new(ConstValue::Dict(Default::default())));
+        let mut graph_inner = FunctionGraph::new("id", startblock.clone());
+        graph_inner.func = Some(func.clone());
+        let link = Rc::new(RefCell::new(Link::new(
+            vec![Hlvalue::Variable(x)],
+            Some(graph_inner.returnblock.clone()),
+            None,
+        )));
+        startblock.closeblock(vec![link]);
+        let identity = Rc::new(PyGraph {
+            graph: Rc::new(RefCell::new(graph_inner)),
+            func,
+            signature: RefCell::new(int_sig(&["x"])),
+            defaults: RefCell::new(Some(Vec::new())),
+            access_directly: std::cell::Cell::new(false),
+        });
+        fd.install_source_template(identity);
+
+        let input_and_link = |graph: &PyGraph| {
+            let g = graph.graph.borrow();
+            let start = g.startblock.borrow();
+            let input = match &start.inputargs[0] {
+                Hlvalue::Variable(v) => v.annotation.borrow().clone(),
+                _ => None,
+            };
+            let link = match &start.exits[0].borrow().args[0] {
+                Some(Hlvalue::Variable(v)) => v.annotation.borrow().clone(),
+                _ => None,
+            };
+            (input, link)
+        };
+
+        for key in [
+            GraphCacheKey::Tuple(vec![GraphCacheKey::String("i32".into())]),
+            GraphCacheKey::Tuple(vec![GraphCacheKey::String("str".into())]),
+        ] {
+            let copied = fd
+                .cachedgraph(key, None, None)
+                .expect("clone of look-inside identity graph");
+            let (input_ann, link_ann) = input_and_link(&copied);
+            assert!(
+                input_ann.is_none() && link_ann.is_none(),
+                "look-inside identity copy must not inherit unique SomeInteger, \
+                 input={input_ann:?} link={link_ann:?}"
+            );
+        }
+    }
+
+    /// A `dont_look_inside` desc whose unique graph is a lifted body
+    /// (ops, no `_signature_`) keeps those ops on a later `cachedgraph`
+    /// key. Minting from an annotated startblock exit would drop the body.
+    #[test]
+    fn cachedgraph_dont_look_inside_lifted_body_keeps_operations_per_key() {
+        use crate::flowspace::model::{
+            Block, BlockRefExt, FunctionGraph, GraphFunc, Hlvalue, Link, SpaceOperation, Variable,
+        };
+
+        let mut host_func =
+            GraphFunc::new("body", Constant::new(ConstValue::Dict(Default::default())));
+        host_func._jit_look_inside_ = Some(false);
+        let fd = FunctionDesc::new(
+            bk(),
+            Some(HostObject::new_user_function(host_func)),
+            "body",
+            int_sig(&["x"]),
+            None,
+            None,
+        );
+        assert!(fd.annsignature.is_none());
+        let x = Variable::named("x");
+        let startblock = Block::shared(vec![Hlvalue::Variable(x.clone())]);
+        let func = GraphFunc::new("body", Constant::new(ConstValue::Dict(Default::default())));
+        let mut graph_inner = FunctionGraph::new("body", startblock.clone());
+        graph_inner.func = Some(func.clone());
+        let tmp = Variable::named("t");
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "int_add",
+            vec![Hlvalue::Variable(x.clone()), Hlvalue::Variable(x.clone())],
+            Hlvalue::Variable(tmp),
+        ));
+        let return_var = Variable::named("r");
+        *return_var.annotation.borrow_mut() =
+            Some(Rc::new(SomeValue::Integer(SomeInteger::default())));
+        let link = Rc::new(RefCell::new(Link::new(
+            vec![Hlvalue::Variable(return_var)],
+            Some(graph_inner.returnblock.clone()),
+            None,
+        )));
+        startblock.closeblock(vec![link]);
+        let body = Rc::new(PyGraph {
+            graph: Rc::new(RefCell::new(graph_inner)),
+            func,
+            signature: RefCell::new(int_sig(&["x"])),
+            defaults: RefCell::new(Some(Vec::new())),
+            access_directly: std::cell::Cell::new(false),
+        });
+        fd.install_source_template(body);
+
+        let copied = fd
+            .cachedgraph(
+                GraphCacheKey::Tuple(vec![GraphCacheKey::String("i32".into())]),
+                None,
+                None,
+            )
+            .expect("clone of lifted body");
+        let ops = copied.graph.borrow().startblock.borrow().operations.len();
+        assert!(
+            ops >= 1,
+            "later key must keep the lifted body's operations, got {ops}"
+        );
+    }
+
+    /// The per-key stub's return annotation is the published
+    /// `_signature_` result, even when a startblock exit carries a
+    /// different annotation.
+    #[test]
+    fn cachedgraph_signature_stub_result_comes_from_annsignature() {
+        use crate::flowspace::model::{
+            Block, BlockRefExt, FunctionGraph, GraphFunc, Hlvalue, Link, Variable,
+        };
+
+        let mut host_func =
+            GraphFunc::new("stub", Constant::new(ConstValue::Dict(Default::default())));
+        host_func._jit_look_inside_ = Some(false);
+        let mut fd = FunctionDesc::new(
+            bk(),
+            Some(HostObject::new_user_function(host_func)),
+            "stub",
+            int_sig(&["x"]),
+            None,
+            None,
+        );
+        fd.annsignature = Some(Rc::new(AnnSignature {
+            params: vec![ParamType::Marker(TypeMarker::AnyType)],
+            result: ParamType::Annotation(Box::new(SomeValue::Integer(SomeInteger::default()))),
+        }));
+        let startblock = Block::shared(vec![Hlvalue::Variable(Variable::named("x"))]);
+        let func = GraphFunc::new("stub", Constant::new(ConstValue::Dict(Default::default())));
+        let mut graph_inner = FunctionGraph::new("stub", startblock.clone());
+        graph_inner.func = Some(func.clone());
+        let return_var = Variable::named("__unsafe_stub_result");
+        *return_var.annotation.borrow_mut() = Some(Rc::new(SomeValue::Bool(
+            crate::annotator::model::SomeBool::new(),
+        )));
+        let link = Rc::new(RefCell::new(Link::new(
+            vec![Hlvalue::Variable(return_var)],
+            Some(graph_inner.returnblock.clone()),
+            None,
+        )));
+        startblock.closeblock(vec![link]);
+        let stub = Rc::new(PyGraph {
+            graph: Rc::new(RefCell::new(graph_inner)),
+            func,
+            signature: RefCell::new(int_sig(&["x"])),
+            defaults: RefCell::new(Some(Vec::new())),
+            access_directly: std::cell::Cell::new(false),
+        });
+        fd.install_source_template(stub);
+
+        let minted = fd
+            .cachedgraph(
+                GraphCacheKey::Tuple(vec![GraphCacheKey::String("i32".into())]),
+                None,
+                None,
+            )
+            .expect("minted signature stub");
+        let link_ann = {
+            let g = minted.graph.borrow();
+            let start = g.startblock.borrow();
+            let link = start.exits[0].borrow();
+            match &link.args[0] {
+                Some(Hlvalue::Variable(v)) => v.annotation.borrow().clone(),
+                _ => None,
+            }
+        };
+        assert!(
+            matches!(link_ann.as_deref(), Some(SomeValue::Integer(_))),
+            "per-key stub result is the published SomeInteger, got {link_ann:?}"
+        );
+    }
+
+    /// A minted per-key stub keeps the template's func id, defaults and
+    /// `access_directly`.
+    #[test]
+    fn cachedgraph_minted_stub_keeps_template_func_defaults_and_access_directly() {
+        use crate::flowspace::model::{
+            Block, BlockRefExt, FunctionGraph, GraphFunc, Hlvalue, Link, Variable,
+        };
+
+        let mut host_func =
+            GraphFunc::new("stub", Constant::new(ConstValue::Dict(Default::default())));
+        host_func._jit_look_inside_ = Some(false);
+        let mut fd = FunctionDesc::new(
+            bk(),
+            Some(HostObject::new_user_function(host_func)),
+            "stub",
+            int_sig(&["x"]),
+            None,
+            None,
+        );
+        fd.annsignature = Some(Rc::new(AnnSignature {
+            params: vec![ParamType::Marker(TypeMarker::AnyType)],
+            result: ParamType::Annotation(Box::new(SomeValue::Integer(SomeInteger::default()))),
+        }));
+        let startblock = Block::shared(vec![Hlvalue::Variable(Variable::named("x"))]);
+        let func = GraphFunc::new("stub", Constant::new(ConstValue::Dict(Default::default())));
+        let template_func_id = func.id;
+        let mut graph_inner = FunctionGraph::new("stub", startblock.clone());
+        graph_inner.func = Some(func.clone());
+        let return_var = Variable::named("__unsafe_stub_result");
+        *return_var.annotation.borrow_mut() =
+            Some(Rc::new(SomeValue::Integer(SomeInteger::default())));
+        let link = Rc::new(RefCell::new(Link::new(
+            vec![Hlvalue::Variable(return_var)],
+            Some(graph_inner.returnblock.clone()),
+            None,
+        )));
+        startblock.closeblock(vec![link]);
+        let stub = Rc::new(PyGraph {
+            graph: Rc::new(RefCell::new(graph_inner)),
+            func,
+            signature: RefCell::new(int_sig(&["x"])),
+            defaults: RefCell::new(Some(vec![Constant::new(ConstValue::Int(7))])),
+            access_directly: std::cell::Cell::new(true),
+        });
+        fd.install_source_template(stub);
+
+        let minted = fd
+            .cachedgraph(
+                GraphCacheKey::Tuple(vec![GraphCacheKey::String("i32".into())]),
+                None,
+                None,
+            )
+            .expect("minted signature stub");
+        assert_eq!(minted.func.id, template_func_id);
+        assert_eq!(
+            minted
+                .defaults
+                .borrow()
+                .as_ref()
+                .map(|defaults| defaults.iter().map(|c| c.value.clone()).collect::<Vec<_>>()),
+            Some(vec![ConstValue::Int(7)])
+        );
+        assert!(minted.access_directly.get());
+    }
+
     #[test]
     fn record_access_directly_graph_inserts_the_access_direct_cache_key() {
         let fd = FunctionDesc::new(bk(), None, "pop", int_sig(&["self"]), None, None);
         let template = make_pygraph(int_sig(&["self"]), Some(Vec::new()));
-        fd.cache
-            .borrow_mut()
-            .insert(GraphCacheKey::None, template.clone());
+        fd.install_source_template(template.clone());
 
         let graph = fd
             .record_access_directly_graph()
@@ -3602,9 +4063,7 @@ mod tests {
     fn record_access_directly_graph_from_installs_the_provided_graph() {
         let fd = FunctionDesc::new(bk(), None, "pop", int_sig(&["self"]), None, None);
         let template = make_pygraph(int_sig(&["self"]), Some(Vec::new()));
-        fd.cache
-            .borrow_mut()
-            .insert(GraphCacheKey::None, template.clone());
+        fd.install_source_template(template.clone());
         let provided = make_pygraph(int_sig(&["self"]), Some(Vec::new()));
 
         let graph = fd
@@ -3619,9 +4078,7 @@ mod tests {
     fn record_access_directly_graph_from_keeps_an_existing_cache_graph() {
         let fd = FunctionDesc::new(bk(), None, "pop", int_sig(&["self"]), None, None);
         let template = make_pygraph(int_sig(&["self"]), Some(Vec::new()));
-        fd.cache
-            .borrow_mut()
-            .insert(GraphCacheKey::None, template.clone());
+        fd.install_source_template(template.clone());
         let first = fd
             .record_access_directly_graph()
             .expect("AccessDirect cache clone");
@@ -3846,10 +4303,8 @@ mod tests {
             ),
             "Bookkeeper.newfuncdesc must install specialize:argtype"
         );
-        fd.borrow().cache.borrow_mut().insert(
-            GraphCacheKey::None,
-            dont_look_inside_stub("alloc", signature),
-        );
+        fd.borrow()
+            .install_source_template(dont_look_inside_stub("alloc", signature));
 
         let inst = SomeValue::Instance(SomeInstance::new(
             Some(ClassDef::new_standalone("rordereddict::RDict", None)),

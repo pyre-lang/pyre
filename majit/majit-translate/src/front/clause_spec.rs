@@ -35,12 +35,16 @@ pub(crate) struct SpecRequest {
 }
 
 /// Instantiations reached from concrete call sites. The set is the
-/// cache: a key is recorded once, when the call is first seen.
+/// per-function cache: a key is recorded once, when that function's
+/// instantiation is first seen.
 pub(crate) struct SpecQueue {
     pending: VecDeque<SpecRequest>,
-    /// First request that claimed each leaf. A later request for the same
-    /// leaf is the same instantiation; one from another function is a clash.
-    seen: HashMap<String, SpecRequest>,
+    /// Per-function instantiation cache (`FunctionDesc.cachedgraph`).
+    /// Keyed by `(fn_id, leaf)`: one FunctionDesc owns one `_cache`, so
+    /// two functions never share a slot. A second request for the same
+    /// pair is the same instantiation; a different `fn_id` with the same
+    /// leaf is another desc and is enqueued.
+    seen: HashMap<(u64, String), SpecRequest>,
 }
 
 impl SpecQueue {
@@ -52,19 +56,15 @@ impl SpecQueue {
     }
 
     pub(crate) fn enqueue(&mut self, req: SpecRequest) -> bool {
-        // The leaf carries the hash of the rendered key, so a second request
-        // under it is the same instantiation even when its JSON spells a type
-        // through a different dedup id. Only a different function is a clash.
-        if let Some(first) = self.seen.get(&req.leaf) {
-            if first.fn_id != req.fn_id {
-                panic!(
-                    "specialized leaf {} claimed by two functions ({} and {})",
-                    req.leaf, first.fn_id, req.fn_id
-                );
-            }
+        // `FunctionDesc.cachedgraph` keys one graph per specializer key
+        // inside one desc. The leaf is that key's name; `fn_id` is the
+        // desc. Same pair is the same instantiation even when JSON spells
+        // a type through a different dedup id.
+        let key = (req.fn_id, req.leaf.clone());
+        if self.seen.contains_key(&key) {
             return false;
         }
-        self.seen.insert(req.leaf.clone(), req.clone());
+        self.seen.insert(key, req.clone());
         self.pending.push_back(req);
         true
     }
@@ -2433,6 +2433,43 @@ mod tests {
             names,
             vec!["fixture::Wrapper<*mut fixture::Inner>".to_string()]
         );
+    }
+
+    fn spec_request(fn_id: u64, leaf: &str) -> SpecRequest {
+        SpecRequest {
+            fn_id,
+            leaf: leaf.to_string(),
+            trait_refs: Vec::new(),
+            types: Vec::new(),
+            const_generics: Vec::new(),
+        }
+    }
+
+    /// Two FunctionDescs keep separate `cachedgraph` caches, so the same
+    /// residual inst leaf from two `fn_id`s is two instantiations.
+    #[test]
+    fn spec_queue_same_inst_leaf_from_two_fn_ids_enqueues_both() {
+        let mut queue = SpecQueue::new();
+        assert!(queue.enqueue(spec_request(1, "alloc__inst_u32")));
+        assert!(queue.enqueue(spec_request(2, "alloc__inst_u32")));
+        let first = queue.pop().expect("fn_id 1");
+        let second = queue.pop().expect("fn_id 2");
+        assert_eq!(first.fn_id, 1);
+        assert_eq!(first.leaf, "alloc__inst_u32");
+        assert_eq!(second.fn_id, 2);
+        assert_eq!(second.leaf, "alloc__inst_u32");
+        assert!(queue.pop().is_none());
+    }
+
+    /// The same `(fn_id, leaf)` is one `cachedgraph` key.
+    #[test]
+    fn spec_queue_same_fn_id_same_leaf_is_not_a_clash() {
+        let mut queue = SpecQueue::new();
+        let req = spec_request(1, "alloc__inst_u32");
+        assert!(queue.enqueue(req.clone()));
+        assert!(!queue.enqueue(req));
+        assert_eq!(queue.pop().expect("first").fn_id, 1);
+        assert!(queue.pop().is_none());
     }
 
     fn value_has_depth0_type_var(v: &Value) -> bool {

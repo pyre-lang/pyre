@@ -572,6 +572,15 @@ fn unpoison_failed_subject_callees(
                         *pg = fresh.clone();
                     }
                 }
+                {
+                    let mut slot = fd.source_graph.borrow_mut();
+                    if let Some(crate::annotator::description::SourceGraph::Built(pg)) =
+                        slot.as_mut()
+                        && Rc::ptr_eq(&pg.graph, &stale)
+                    {
+                        *pg = fresh.clone();
+                    }
+                }
                 if let Ok(family) = fd.base.getcallfamily() {
                     for table in family.borrow_mut().calltables.values_mut() {
                         for row in table.iter_mut() {
@@ -593,12 +602,19 @@ fn unpoison_failed_subject_callees(
                 // record the condition so later callers surface a lift
                 // error (Skip-classified) instead of the fixed-graph
                 // safety panic.
-                entry
-                    .function_desc
-                    .borrow()
-                    .cache
-                    .borrow_mut()
-                    .retain(|_, pg| !Rc::ptr_eq(&pg.graph, &stale));
+                {
+                    let fd = entry.function_desc.borrow();
+                    fd.cache
+                        .borrow_mut()
+                        .retain(|_, pg| !Rc::ptr_eq(&pg.graph, &stale));
+                    let mut slot = fd.source_graph.borrow_mut();
+                    if let Some(crate::annotator::description::SourceGraph::Built(pg)) =
+                        slot.as_ref()
+                        && Rc::ptr_eq(&pg.graph, &stale)
+                    {
+                        *slot = None;
+                    }
+                }
                 entry.record_lift_error(
                     "callee graph poisoned by a failed subject scope; no re-lift source"
                         .to_string(),
@@ -2351,9 +2367,10 @@ fn install_source_graph(
     // feed that jitcode pipeline, so lifting the body here is
     // upstream-dead work — and bodies marked opaque are typically
     // unliftable host plumbing (`OnceLock` init walks etc.) whose
-    // lift failure would poison every caller.  Prefill the same
+    // lift failure would poison every caller.  Install the same
     // signature-only stub pygraph `register_unsafe_fn_stubs` uses
-    // (the `ExtRegistryEntry.compute_result_annotation` shape) so
+    // (the `ExtRegistryEntry.compute_result_annotation` shape) as
+    // the source template so
     // callers annotate the declared result and the codewriter emits
     // the residual call via the fn's registered C ABI address
     // (`pyre/jit_fnaddr.rs`).  The FUNC.RESULT token is the canonical
@@ -2366,8 +2383,10 @@ fn install_source_graph(
     if entry.function_desc.borrow().is_memo() {
         return;
     }
-    let residualize = graph.hints.iter().any(|h| h == "dont_look_inside")
-        || graph.hints.iter().any(|h| h == "elidable");
+    let residualize = crate::annotator::description::residualizes_as_signature_stub(
+        graph.func.jit_look_inside == Some(false),
+        graph.func.elidable,
+    );
     if residualize {
         // The materialisers' raw `*mut PyObject` return is only their
         // residual-call ABI.  Their FunctionDesc carries the orthodox
@@ -2412,9 +2431,10 @@ fn install_source_graph(
             let stub = build_stub_pygraph_with_result_shell(
                 graph.name.clone(),
                 signature.clone(),
-                result_shell,
+                result_shell.clone(),
             );
-            entry.prefill_default_cache(stub);
+            entry.install_source_template(stub);
+            entry.publish_residual_result_signature(result_shell);
             return;
         }
     }
@@ -2467,9 +2487,9 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
 ///
 /// 1. `get_or_register` every entry's signature so HostObjects exist
 ///    before any callee body lifts.
-/// 2. `lift_callee_to_pygraph` + `prefill_default_cache` per entry
-///    so `cachedgraph` (`description.rs:1037-1039`) hits at the
-///    rtyper's `direct_call`.
+/// 2. `lift_callee_to_pygraph` + `install_source_template` per entry
+///    so `FunctionDesc.cachedgraph` copies the template
+///    (`translator.buildflowgraph`) at the rtyper's `direct_call`.
 pub(crate) fn populate_call_registry_from_call_graphs(
     function_graphs: &crate::codewriter::call::GraphStore,
     unsafe_fn_stubs: &[(Vec<String>, Signature, Option<String>)],
@@ -2903,17 +2923,15 @@ fn alias_opaque_stub_keys_onto_graphstore(
 
 /// Lift a pyre `model::FunctionGraph` (a callee that may appear on a
 /// `OpKind::Call::FunctionPath` callsite of some other graph) into a
-/// `Rc<PyGraph>` suitable for pre-filling the callee's
-/// `FunctionDesc.cache` (`description.rs:794`).
+/// `Rc<PyGraph>` suitable as the callee's source template
+/// (`FunctionDesc.buildgraph` / `translator.buildflowgraph`).
 ///
-/// `cachedgraph` (`description.rs:1037-1039`) returns the cached
-/// `Rc<PyGraph>` as soon as the lookup key matches, skipping the
-/// `buildgraph` path that delegates to
-/// `translator.buildflowgraph(pyobj, false)` — that delegation
-/// requires a real Python `__code__` body which pyre's surface-DSL
-/// callees do not have.  Pyre instead lifts the callee through the
-/// adapter and wraps the resulting flowspace `FunctionGraph` in a
-/// `PyGraph` here.
+/// `FunctionDesc.cachedgraph` copies that template on a miss with
+/// `builder is None`, skipping `buildgraph` →
+/// `translator.buildflowgraph` — that delegation requires a real
+/// Python `__code__` body which pyre's surface-DSL callees do not
+/// have. Pyre instead lifts the callee through the adapter and wraps
+/// the resulting flowspace `FunctionGraph` in a `PyGraph` here.
 ///
 /// `signature` is the callee's authoritative parameter `Signature`
 /// (the same one stored on the `FunctionDesc` in `CallRegistry`).
@@ -3037,8 +3055,11 @@ fn source_graph_func(graph: &LegacyGraph) -> GraphFunc {
     // `specialize.py default_specialize` and `jtransform` read these off
     // `funcdesc.pyobj` (`GraphFunc`). The legacy graph already projected
     // the source attributes onto `graph.func` (`FuncEffects`); copy them,
-    // do not re-derive from hint names.
+    // do not re-derive from hint names. `install_source_graph` /
+    // `cachedgraph` residualize on `_jit_look_inside_` and
+    // `_elidable_function_`.
     func._jit_look_inside_ = graph.func.jit_look_inside;
+    func._elidable_function_ = graph.func.elidable;
     func._jit_unroll_safe_ = graph.func.unroll_safe;
     func.annspecialcase = graph
         .hints
@@ -3122,6 +3143,27 @@ pub(crate) fn build_stub_pygraph_for_somevalue(
     build_stub_pygraph_with_result_shell(name, signature, return_someval)
 }
 
+/// Annotator-only stub whose return Variable carries `return_someval`,
+/// keeping `template.func`, `template.defaults` and
+/// `template.access_directly`. Per-key mint of a residual signature
+/// stub (`FunctionDesc.pycall` `_signature_` / `register_external`
+/// `s_result`).
+pub(crate) fn build_stub_pygraph_for_somevalue_from_template(
+    name: String,
+    signature: Signature,
+    return_someval: crate::annotator::model::SomeValue,
+    template: &PyGraph,
+) -> Rc<PyGraph> {
+    build_stub_pygraph_with_result_shell_and_func(
+        name,
+        signature,
+        return_someval,
+        template.func.clone(),
+        template.defaults.borrow().clone(),
+        template.access_directly.get(),
+    )
+}
+
 /// Build an annotator-only stub PyGraph whose return Variable carries
 /// `return_someval` directly.  Shared core of
 /// [`build_stub_pygraph_for_lltype`] (which projects an lltype through
@@ -3137,16 +3179,34 @@ fn build_stub_pygraph_with_result_shell(
     signature: Signature,
     return_someval: crate::annotator::model::SomeValue,
 ) -> Rc<PyGraph> {
+    let func = GraphFunc::new(
+        name.clone(),
+        Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
+    );
+    build_stub_pygraph_with_result_shell_and_func(
+        name,
+        signature,
+        return_someval,
+        func,
+        Some(Vec::new()),
+        false,
+    )
+}
+
+fn build_stub_pygraph_with_result_shell_and_func(
+    name: String,
+    signature: Signature,
+    return_someval: crate::annotator::model::SomeValue,
+    func: GraphFunc,
+    defaults: Option<Vec<Constant>>,
+    access_directly: bool,
+) -> Rc<PyGraph> {
     let inputargs: Vec<Hlvalue> = signature
         .argnames
         .iter()
         .map(|n| Hlvalue::Variable(Variable::named(n)))
         .collect();
     let startblock = Block::shared(inputargs);
-    let func = GraphFunc::new(
-        name.clone(),
-        Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
-    );
     let mut graph_inner = crate::flowspace::model::FunctionGraph::new(name, startblock.clone());
     graph_inner.func = Some(func.clone());
     let return_var = Variable::named("__unsafe_stub_result");
@@ -3162,8 +3222,8 @@ fn build_stub_pygraph_with_result_shell(
         graph: graph_inner.into_ref(),
         func,
         signature: RefCell::new(signature),
-        defaults: RefCell::new(Some(Vec::new())),
-        access_directly: Cell::new(false),
+        defaults: RefCell::new(defaults),
+        access_directly: Cell::new(access_directly),
     })
 }
 
@@ -3639,20 +3699,20 @@ fn declared_funcptr_type_from_legacy(
 /// while the rest of the batch lands.
 ///
 /// Mirrors `populate_call_registry_from_call_graphs`'s "register and
-/// prefill" contract but feeds from declarations rather than from the
-/// `function_graphs` `GraphStore`.  The two key
+/// install source template" contract but feeds from declarations rather
+/// than from the `function_graphs` `GraphStore`.  The two key
 /// differently, so both can hold the same fn; `CallControl::unsafe_fn_stubs`
 /// carries the measured split.
 ///
 /// **Annotator-only carrier — never reaches the codewriter.**
 /// The stub graph carries a single return link holding a pre-annotated
 /// Variable, suitable for `RPythonAnnotator` return-type inference via
-/// `cachedgraph` (see `call_registry::prefill_default_cache`).  It
+/// `FunctionDesc.cachedgraph` (see `install_source_template`).  It
 /// cannot become a compile candidate because it never lands in the
 /// container the codewriter reads: `build_stub_pygraph_with_result_shell`
 /// builds a `flowspace::model::FunctionGraph`, which
-/// `PyreFunctionEntry::prefill_default_cache` parks in the entry's
-/// `FunctionDesc.cache`, while `CallControl::find_all_graphs` and
+/// `FunctionEntry::install_source_template` parks in the entry's
+/// source-template slot, while `CallControl::find_all_graphs` and
 /// `CallControl::target_to_path_and_graph` resolve candidates out of
 /// `function_graphs` and hand `CodeWriter::transform_graph_to_jitcode` a
 /// `crate::model::FunctionGraph`.  Nothing on this path can put a stub
@@ -3724,17 +3784,27 @@ pub(crate) fn register_unsafe_fn_stubs(
         let stub_pygraph = build_stub_pygraph_with_result_shell(
             segments.last().cloned().unwrap_or_default(),
             signature.clone(),
-            result_shell,
+            result_shell.clone(),
         );
-        let graph_func = declared_source_graph_func(function_graphs, segments, &foreign_callables)
-            .unwrap_or_else(|| {
-                GraphFunc::new(
-                    segments.last().cloned().unwrap_or_default(),
-                    Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
-                )
-            });
+        let mut graph_func =
+            declared_source_graph_func(function_graphs, segments, &foreign_callables)
+                .unwrap_or_else(|| {
+                    let mut func = GraphFunc::new(
+                        segments.last().cloned().unwrap_or_default(),
+                        Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
+                    );
+                    // `register_external` residual: an `llexternal` the JIT
+                    // never looks inside (`dont_look_inside` sets
+                    // `_jit_look_inside_ = False`).
+                    func._jit_look_inside_ = Some(false);
+                    func
+                });
+        // `register_external` residual: the JIT has no body to look inside
+        // (`dont_look_inside` sets `_jit_look_inside_ = False`).
+        graph_func._jit_look_inside_ = Some(false);
         let entry = registry.get_or_register_with_func(key, signature.clone(), graph_func);
-        entry.prefill_default_cache(stub_pygraph);
+        entry.install_source_template(stub_pygraph);
+        entry.publish_residual_result_signature(result_shell);
     }
 }
 
@@ -3988,9 +4058,9 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
 
 /// Generic pointer-atomic methods whose declared result is the keyed
 /// argument's instantiated `*mut T`. One FunctionDesc, many cached
-/// graphs (`specialize.py` `specialize_argtype`). No prefilled
-/// `GraphCacheKey::None` Address stub: a unique Address shell would
-/// first-bind every instantiation.
+/// graphs (`specialize.py` `specialize_argtype`). No source-template
+/// Address stub: a unique Address shell would first-bind every
+/// instantiation.
 const ATOMIC_PTR_ARGTYPE_EXTERNALS: &[(&[&str], &[&str], usize)] = &[
     (
         &["sync", "atomic", "AtomicPtr", "swap"],
@@ -4134,9 +4204,10 @@ fn register_opaque_external(
 /// Register a bodyless foreign external with `specialize:argtype(i)`.
 ///
 /// `newfuncdesc_with_signature` reads `GraphFunc.annspecialcase`
-/// (`policy.py` `get_specializer`). The cache stays empty: prefilling
-/// `GraphCacheKey::None` would give every instantiation the same shell
-/// (`call_registry.rs` `register_callee` / `prefill_default_cache`).
+/// (`policy.py` `get_specializer`). The source template stays empty:
+/// installing a unique shell would give every instantiation the same
+/// graph (`call_registry.rs` `register_callee` /
+/// `install_source_template`).
 fn register_opaque_external_argtype(
     registry: &CallRegistry,
     segments: &[&str],
@@ -5418,10 +5489,10 @@ fn collect_called_from_entry(
 ///   `Rc::ptr_eq`). Phase A records the cache graph before annotate, so a
 ///   failed AccessDirect candidate still has that `find_all_graphs` graph.
 /// * Regular candidate: `FunctionDesc.cache[None]`, the graph
-///   `prefill_default_cache` / `cachedgraph(None)` stores. A regular
-///   subject's `TwoPhaseSubject.graph` is a fresh adapter lift and is
-///   not that cache entry; walking `desc.cache` can only match the
-///   cached `PyGraph`.
+///   `FunctionDesc.cachedgraph(None)` stores when None was requested.
+///   A regular subject's `TwoPhaseSubject.graph` is a fresh adapter
+///   lift and is not that cache entry; walking `desc.cache` can only
+///   match the cached `PyGraph`.
 ///
 /// The checked population is `collect_called_graphs(entry)` minus
 /// `jit_graphs`, not every `FunctionDesc` cache. `entry_point_graph` is
@@ -8674,6 +8745,46 @@ mod tests {
         let func = source_graph_func(&graph);
         assert_eq!(func._jit_look_inside_, Some(false));
         assert!(func._jit_unroll_safe_);
+    }
+
+    #[test]
+    fn source_graph_func_carries_legacy_elidable() {
+        let mut graph = LegacyGraph::new("h");
+        graph.func.elidable = true;
+        let func = source_graph_func(&graph);
+        assert!(func._elidable_function_);
+    }
+
+    /// `install_source_graph` residualizes from `graph.func` (`dont_look_inside`
+    /// / `elidable` set `_jit_look_inside_` / `_elidable_function_`), not
+    /// from a hint-string scan of `graph.hints`.
+    #[test]
+    fn install_source_graph_residualizes_from_func_projection() {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut graph = empty_return_graph("opaque");
+        graph.func.jit_look_inside = Some(false);
+        graph.return_type = Some("bool".into());
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.insert(crate::parse::CallPath::from_segments(["opaque"]), graph);
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        let entry = registry
+            .lookup(&FunctionPathKey::from_segments(["opaque"]))
+            .expect("registered");
+        assert_eq!(
+            entry.host_object.user_function().unwrap()._jit_look_inside_,
+            Some(false)
+        );
+        assert!(
+            entry.function_desc.borrow().source_template().is_some(),
+            "install_source_graph residualizes from graph.func.jit_look_inside"
+        );
+        assert!(
+            entry
+                .function_desc
+                .borrow()
+                .residualizes_as_signature_stub()
+        );
     }
 
     /// `specialize.py default_specialize` + `test_rvirtualizable
@@ -14485,11 +14596,8 @@ mod tests {
         let caller_pygraph = caller
             .function_desc
             .borrow()
-            .cache
-            .borrow()
-            .get(&crate::annotator::description::GraphCacheKey::None)
-            .cloned()
-            .expect("caller body lifted into the default cache");
+            .source_template()
+            .expect("caller body lifted into the source template");
         let callable = {
             let graph = caller_pygraph.graph.borrow();
             let start = graph.startblock.borrow();
@@ -14515,11 +14623,8 @@ mod tests {
         let stub = callee_entry
             .function_desc
             .borrow()
-            .cache
-            .borrow()
-            .get(&crate::annotator::description::GraphCacheKey::None)
-            .cloned()
-            .expect("the declaration stub is prefilled as the default cache entry");
+            .source_template()
+            .expect("the declaration stub is the source template");
         let graph = stub.graph.borrow();
         let start = graph.startblock.borrow();
         let link = start.exits[0].borrow();
@@ -14539,14 +14644,13 @@ mod tests {
         let _lock = anchor_lock();
         // Keystone linkage: after a real caller -> callee specialize,
         // the lifted callee `FunctionGraph` must live in the session
-        // `translator.graphs`.  Upstream reaches that state because
-        // `buildgraph -> buildflowgraph` appends every graph
-        // (`translator.py`); pyre's lazy-lift prefills
-        // `FunctionDesc.cache` via `lift_callee_to_pygraph` +
-        // `prefill_default_cache`, bypassing `buildflowgraph`, so the
-        // graph would otherwise never enter `translator.graphs`.
-        // `FunctionDesc.cachedgraph`'s hit path restores the invariant
-        // (description.rs:1058-1082).  This pins that the registration
+        // `translator.graphs`. Upstream reaches that state because
+        // `FunctionDesc.buildgraph` / `translator.buildflowgraph`
+        // appends every graph; pyre's lazy-lift installs the source
+        // template via `lift_callee_to_pygraph` +
+        // `install_source_template`. `FunctionDesc.cachedgraph`'s miss
+        // of the requested key copies that template and appends.
+        // This pins that the registration
         // actually fires through the shared-bookkeeper session and that
         // `funcobj.graph` (= the cached PyGraph's `graph`) is the exact
         // `Rc` now resolvable by the flowspace effect analyzers
@@ -15599,6 +15703,123 @@ mod tests {
         );
     }
 
+    /// `register_external` residual: an `unsafe fn` the JIT never looks
+    /// inside. The fallback `GraphFunc::new` (no GraphStore funcobj) still
+    /// carries `_jit_look_inside_ = False`.
+    #[test]
+    fn register_unsafe_fn_stubs_marks_fallback_graphfunc_dont_look_inside() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+        let bk = std::rc::Rc::new(Bookkeeper::new());
+        let registry = CallRegistry::new(bk);
+        let specs = vec![(
+            vec!["pyobject".to_string(), "is_none".to_string()],
+            Signature::new(vec!["obj".to_string()], None, None),
+            Some("bool".to_string()),
+        )];
+        register_unsafe_fn_stubs(&registry, &specs, None);
+        let entry = registry
+            .lookup(&FunctionPathKey::from_segments([
+                "pyobject".to_string(),
+                "is_none".to_string(),
+            ]))
+            .expect("stub registered");
+        assert_eq!(
+            entry.host_object.user_function().unwrap()._jit_look_inside_,
+            Some(false)
+        );
+        assert!(
+            entry
+                .function_desc
+                .borrow()
+                .residualizes_as_signature_stub()
+        );
+    }
+
+    /// `register_unsafe_fn_stubs` of a resolved declared funcobj
+    /// (`declared_source_graph_func`) publishes `_signature_`, marks
+    /// `_jit_look_inside_ = False` (`register_external`), and a later
+    /// `cachedgraph` key keeps that result annotation.
+    #[test]
+    fn register_unsafe_fn_stubs_declared_funcobj_publishes_signature() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::description::GraphCacheKey;
+        use crate::annotator::model::SomeValue;
+        use crate::codewriter::call::{DeclaredFuncObj, FuncObjDeclarations, GraphTransform};
+        use crate::model::LazyGraph;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+
+        let mut graph = empty_return_graph("is_none");
+        graph.return_type = Some("bool".into());
+        let qualified = crate::parse::CallPath {
+            segments: vec!["pyobject".into(), "is_none".into()],
+            specialization: crate::parse::GraphSpecialization::Regular,
+        };
+        let decls = FuncObjDeclarations::default();
+        decls.push(DeclaredFuncObj {
+            path: qualified,
+            graph: LazyGraph::built(graph),
+            transform: GraphTransform::default(),
+        });
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.use_declarations(decls);
+        assert!(
+            graphs
+                .declared_funcobj(&crate::parse::CallPath::from_segments([
+                    "pyobject", "is_none"
+                ]))
+                .is_some(),
+            "fixture must be a declared funcobj, not GraphStore::insert"
+        );
+
+        let bk = std::rc::Rc::new(Bookkeeper::new());
+        let registry = CallRegistry::new(bk);
+        let specs = vec![(
+            vec!["pyobject".to_string(), "is_none".to_string()],
+            Signature::new(vec!["obj".to_string()], None, None),
+            Some("bool".to_string()),
+        )];
+        register_unsafe_fn_stubs(&registry, &specs, Some(&graphs));
+        let entry = registry
+            .lookup(&FunctionPathKey::from_segments([
+                "pyobject".to_string(),
+                "is_none".to_string(),
+            ]))
+            .expect("stub registered");
+        assert!(
+            entry.function_desc.borrow().annsignature.is_some(),
+            "declared-funcobj stub publishes `_signature_`"
+        );
+        assert_eq!(
+            entry.host_object.user_function().unwrap()._jit_look_inside_,
+            Some(false)
+        );
+        let cloned = entry
+            .function_desc
+            .borrow()
+            .cachedgraph(
+                GraphCacheKey::Tuple(vec![GraphCacheKey::String("i32".into())]),
+                None,
+                None,
+            )
+            .expect("per-key stub");
+        let link_ann = {
+            let g = cloned.graph.borrow();
+            let start = g.startblock.borrow();
+            let link = start.exits[0].borrow();
+            match &link.args[0] {
+                Some(crate::flowspace::model::Hlvalue::Variable(v)) => {
+                    v.annotation.borrow().clone()
+                }
+                _ => None,
+            }
+        };
+        assert!(
+            matches!(link_ann.as_deref(), Some(SomeValue::Bool(_))),
+            "later key keeps the published result, got {link_ann:?}"
+        );
+    }
+
     #[test]
     fn allocate_ctors_are_not_skipped_by_name() {
         for segments in [
@@ -15675,7 +15896,7 @@ mod tests {
                 "{segments:?}"
             );
             assert!(
-                !entry.function_desc.borrow().cache.borrow().is_empty(),
+                entry.function_desc.borrow().source_template().is_some(),
                 "{segments:?}: annotator stub graph required"
             );
         }
@@ -15940,7 +16161,6 @@ mod tests {
 
     #[test]
     fn monomorphic_atomic_usize_swap_stays_unique_unsigned() {
-        use crate::annotator::description::GraphCacheKey;
         use crate::annotator::model::SomeValue;
         use crate::annotator::policy::Specializer;
 
@@ -15966,12 +16186,7 @@ mod tests {
             .and_then(|pyobj| pyobj.user_function())
             .and_then(|func| func.annspecialcase.clone());
         assert!(annspecialcase.is_none());
-        let pygraph = fd
-            .cache
-            .borrow()
-            .get(&GraphCacheKey::None)
-            .cloned()
-            .expect("unique Unsigned stub");
+        let pygraph = fd.source_template().expect("unique Unsigned stub");
         let (_prefix, result) = argtype_stub_link_result(&pygraph);
         let SomeValue::Integer(int) = result else {
             panic!("Unsigned stub result, got {result:?}");
@@ -16033,7 +16248,7 @@ mod tests {
             vec!["self".to_string(), "s".to_string()]
         );
         assert!(
-            !entry.function_desc.borrow().cache.borrow().is_empty(),
+            entry.function_desc.borrow().source_template().is_some(),
             "annotator stub graph required"
         );
         let push = registry
@@ -16419,11 +16634,7 @@ mod tests {
         let pygraph = entry
             .function_desc
             .borrow()
-            .cache
-            .borrow()
-            .values()
-            .next()
-            .cloned()
+            .source_template()
             .expect("annotator stub graph");
         let link = {
             let graph = pygraph.graph.borrow();
@@ -16780,8 +16991,8 @@ mod tests {
             vec!["ptr".to_string(), "value".to_string()]
         );
         assert!(
-            !entry.function_desc.borrow().cache.borrow().is_empty(),
-            "the annotator needs a cached stub graph for return inference"
+            entry.function_desc.borrow().source_template().is_some(),
+            "the annotator needs a source-template stub graph for return inference"
         );
         assert_eq!(registry.len(), 1);
     }
@@ -16924,11 +17135,8 @@ mod tests {
             let stub = entry
                 .function_desc
                 .borrow()
-                .cache
-                .borrow()
-                .get(&crate::annotator::description::GraphCacheKey::None)
-                .cloned()
-                .unwrap_or_else(|| panic!("{} stub is prefilled", row.name));
+                .source_template()
+                .unwrap_or_else(|| panic!("{} stub is the source template", row.name));
             let graph = stub.graph.borrow();
             let start = graph.startblock.borrow();
             let link = start.exits[0].borrow();
@@ -17025,11 +17233,8 @@ mod tests {
         let stub = entry
             .function_desc
             .borrow()
-            .cache
-            .borrow()
-            .get(&crate::annotator::description::GraphCacheKey::None)
-            .cloned()
-            .expect("accessor stub is prefilled");
+            .source_template()
+            .expect("accessor stub is the source template");
         let graph = stub.graph.borrow();
         let start = graph.startblock.borrow();
         let link = start.exits[0].borrow();
@@ -17224,11 +17429,8 @@ mod tests {
         let stub = entry
             .function_desc
             .borrow()
-            .cache
-            .borrow()
-            .get(&crate::annotator::description::GraphCacheKey::None)
-            .cloned()
-            .expect("accessor stub is prefilled");
+            .source_template()
+            .expect("accessor stub is the source template");
         let graph = stub.graph.borrow();
         let start = graph.startblock.borrow();
         let link = start.exits[0].borrow();

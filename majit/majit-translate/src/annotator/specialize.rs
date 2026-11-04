@@ -294,8 +294,7 @@ pub fn default_specialize(
 /// Returns the only cached graph whose specialization key is not
 /// `(AccessDirect, key)`.
 pub fn getuniquenondirectgraph(desc: &FunctionDesc) -> Result<Rc<PyGraph>, AnnotatorError> {
-    // A pending registry graph is built first; see `getgraphs`.
-    desc.build_source_graph();
+    // `FunctionDesc.getgraphs` reads `_cache` alone.
     let mut result = Vec::new();
     for (key, graph) in desc.cache.borrow().iter() {
         if !key.is_access_direct() {
@@ -423,11 +422,12 @@ pub fn specialize_argtype(
     maybe_star_args(funcdesc, GraphCacheKey::Tuple(key_parts), args_s)
 }
 
-/// Bodyless foreign stub: no `HostCode`, no pending lift, and no
-/// `GraphCacheKey::None` template (`description.py` `cachedgraph`
-/// clones that template when `builder is None`). An empty cache is
-/// not the test — the second knowntype must still take this path
-/// after the first graph is cached.
+/// Bodyless foreign stub: no source template (pending lift or built
+/// graph) and no `HostCode`. `FunctionDesc.cachedgraph` with
+/// `builder is None` copies `source_template()` (`translator.buildflowgraph`
+/// analogue); a bodyless `specialize:argtype` external must take the
+/// builder stub path. An empty `_cache` is not the test — the second
+/// knowntype must still take this path after the first graph is cached.
 pub(crate) fn is_bodyless_argtype_stub(funcdesc: &FunctionDesc) -> bool {
     if funcdesc.source_graph.borrow().is_some() {
         return false;
@@ -439,10 +439,7 @@ pub(crate) fn is_bodyless_argtype_stub(funcdesc: &FunctionDesc) -> bool {
         .and_then(|pyobj| pyobj.user_function())
         .and_then(|func| func.code.as_ref())
         .is_some();
-    if has_host_code {
-        return false;
-    }
-    !funcdesc.cache.borrow().contains_key(&GraphCacheKey::None)
+    !has_host_code
 }
 
 /// Specialize-miss path for a bodyless `specialize:argtype` external.
