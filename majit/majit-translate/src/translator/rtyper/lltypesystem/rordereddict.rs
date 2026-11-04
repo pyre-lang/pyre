@@ -165,7 +165,9 @@ fn index_slot_host_value(t: &LowLevelType, value: i64) -> Result<LowLevelValue, 
             let cv = cast_primitive(t, &ConstValue::Int(value))
                 .map_err(|e| TyperError::message(format!("rffi.cast(T, value): {e}")))?;
             match cv {
-                ConstValue::RInt(_, v, _) => Ok(LowLevelValue::Number(n.clone(), v)),
+                ConstValue::RInt(_, v, _) => {
+                    Ok(LowLevelValue::Number(n.clone(), v.small_or_unreachable()))
+                }
                 other => Err(TyperError::message(format!(
                     "rffi.cast(T, value) produced {other:?}"
                 ))),
@@ -11861,9 +11863,11 @@ fn indexes_signed_at(indexes: &_ptr, i: usize) -> Result<i64, TyperError> {
     match indexes.getitem(i).map_err(TyperError::message)? {
         LowLevelValue::Unsigned(n) => Ok(n as i64),
         LowLevelValue::Signed(n) => Ok(n),
-        LowLevelValue::Number(n, v) => {
-            Ok(crate::rlib::rarithmetic::rint_value(n._type, v).as_i64())
-        }
+        LowLevelValue::Number(n, v) => Ok(crate::rlib::rarithmetic::rint_value(
+            n._type,
+            &crate::rlib::rarithmetic::RIntPayload::Small(v),
+        )
+        .as_i64()),
         other => Err(TyperError::message(format!(
             "index slot is not an integer: {other:?}"
         ))),

@@ -30,7 +30,7 @@ use crate::flowspace::model::{
     HostObject, LinkRef, SpaceOperation, Variable,
 };
 use crate::rlib::rarithmetic::{
-    RIntValue, rint_normalize, rint_value, signed_int_overflow_message,
+    RIntPayload, RIntValue, rint_new, rint_value, signed_int_overflow_message,
 };
 use crate::tool::ansi_print::AnsiLogger;
 use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
@@ -274,7 +274,7 @@ impl LLValue {
             LLValue::Int(n) => *n != 0,
             LLValue::Int128(n) => *n != 0,
             LLValue::UInt128(u) => *u != 0,
-            LLValue::Number(c, v) => !rint_value(*c, *v).is_zero(),
+            LLValue::Number(c, v) => !rint_value(*c, &RIntPayload::Small(*v)).is_zero(),
             LLValue::Bool(b) => *b,
             LLValue::Float(bits) => f64::from_bits(*bits) != 0.0,
             LLValue::Str(s) => !s.is_empty(),
@@ -311,7 +311,7 @@ fn llvalue_from_constvalue(v: &ConstValue) -> LLValue {
         ConstValue::UInt(n) => LLValue::Int(*n as i64),
         ConstValue::Int128(n) => LLValue::Int128(*n),
         ConstValue::UInt128(u) => LLValue::UInt128(*u),
-        ConstValue::RInt(class, v, _) => rint_to_llvalue(*class, *v),
+        ConstValue::RInt(class, v, _) => rint_to_llvalue(*class, v.small_or_unreachable()),
         ConstValue::Bool(b) => LLValue::Bool(*b),
         ConstValue::Float(bits) => LLValue::Float(*bits),
         ConstValue::SingleFloat(bits) => singlefloat_to_llvalue(*bits),
@@ -353,7 +353,7 @@ fn constvalue_to_llvalue_of_type(
     cv: ConstValue,
 ) -> Result<LLValue, TaskError> {
     match (RESTYPE, cv) {
-        (_, ConstValue::RInt(n, v, _)) => Ok(rint_to_llvalue(n, v)),
+        (_, ConstValue::RInt(n, v, _)) => Ok(rint_to_llvalue(n, v.small_or_unreachable())),
         (LowLevelType::SingleFloat, ConstValue::SingleFloat(bits)) => {
             Ok(singlefloat_to_llvalue(bits))
         }
@@ -2842,9 +2842,12 @@ impl ExactInt {
 }
 
 fn exact_int_from_rint(class: RIntClass, v: i128) -> ExactInt {
-    match rint_value(class, v) {
+    match rint_value(class, &RIntPayload::Small(v)) {
         RIntValue::Signed(n) => ExactInt::I(n),
         RIntValue::Unsigned(u) => ExactInt::U(u),
+        RIntValue::SignedBig(_) | RIntValue::UnsignedBig(_) => {
+            unreachable!("wider than 128 bits never reaches the rtyper")
+        }
     }
 }
 
@@ -2864,7 +2867,7 @@ fn exact_int_of_llvalue(value: &LLValue) -> Option<ExactInt> {
 /// Primitive-cast source classification for a switch `llexitcase`.
 fn exact_int_of_const(case: &ConstValue) -> Option<ExactInt> {
     Some(match case {
-        ConstValue::RInt(c, v, _) => exact_int_from_rint(*c, *v),
+        ConstValue::RInt(c, v, _) => exact_int_from_rint(*c, v.small_or_unreachable()),
         ConstValue::Int(n) => ExactInt::I(*n as i128),
         ConstValue::UInt(n) => ExactInt::U(*n as u128),
         ConstValue::Int128(n) => ExactInt::I(*n),
@@ -2957,10 +2960,14 @@ fn number_cast(TGT: &LowLevelType, v: ExactInt) -> Result<LLValue, TaskError> {
             } else {
                 v.wrapping_i128()
             };
-            let v = rint_normalize(n._type, value).map_err(|e| TaskError {
+            match rint_new(n._type, value).map_err(|e| TaskError {
                 message: format!("OverflowError: {e}"),
-            })?;
-            Ok(rint_to_llvalue(n._type, v))
+            })? {
+                ConstValue::RInt(_, payload, _) => {
+                    Ok(rint_to_llvalue(n._type, payload.small_or_unreachable()))
+                }
+                other => unreachable!("rint_new returns RInt, got {other:?}"),
+            }
         }
         other => Err(TaskError {
             message: format!(

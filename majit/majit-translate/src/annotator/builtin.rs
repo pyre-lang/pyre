@@ -1057,7 +1057,8 @@ pub fn builtin_bool(
             ConstValue::UInt(n) => *n != 0,
             ConstValue::Int128(n) => *n != 0,
             ConstValue::UInt128(n) => *n != 0,
-            ConstValue::RInt(c, n, _) => !crate::rlib::rarithmetic::rint_value(*c, *n).is_zero(),
+            ConstValue::Long(n) => *n != malachite_bigint::BigInt::from(0),
+            ConstValue::RInt(c, n, _) => !crate::rlib::rarithmetic::rint_value(*c, n).is_zero(),
             ConstValue::Float(bits) => f64::from_bits(*bits) != 0.0,
             ConstValue::SingleFloat(_) => {
                 return Err(AnnotatorError::new(

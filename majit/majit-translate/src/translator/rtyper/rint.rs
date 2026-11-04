@@ -280,6 +280,7 @@ impl Repr for IntegerRepr {
                 | ConstValue::UInt(_)
                 | ConstValue::Int128(_)
                 | ConstValue::UInt128(_)
+                | ConstValue::Long(_)
                 | ConstValue::Bool(_)
                 | ConstValue::RInt(_, _, _) => {
                     let converted =

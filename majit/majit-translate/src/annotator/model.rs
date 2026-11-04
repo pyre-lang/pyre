@@ -52,6 +52,7 @@ use super::super::flowspace::model::{BlockKey, BlockRef, Constant, HostObject, V
 use super::bookkeeper::Bookkeeper;
 use super::classdesc::ClassDef;
 pub use crate::translator::rtyper::llannotation::{SomeInteriorPtr, SomeLLADTMeth};
+use malachite_bigint::BigInt;
 
 // State / TLS (model.py).
 
@@ -135,14 +136,8 @@ impl Hash for RIntClass {
 
 impl RIntClass {
     /// `MASK = (2 ** bits) - 1` on the class `build_int` constructs.
-    pub fn mask(&self) -> u128 {
-        if self.bits == 0 {
-            0
-        } else if self.bits >= 128 {
-            u128::MAX
-        } else {
-            (1u128 << self.bits) - 1
-        }
+    pub fn mask(&self) -> BigInt {
+        crate::rlib::rarithmetic::mask_bigint(self.bits)
     }
 }
 
@@ -636,7 +631,7 @@ impl SomeInteger {
         let unsigned = match knowntype {
             KnownType::Ruint | KnownType::ULongLong | KnownType::ULongLongLong => true,
             KnownType::Rint => false,
-            KnownType::RInt(c) => !c.sign && c.mask() > 0,
+            KnownType::RInt(c) => !c.sign && c.mask() > BigInt::from(0),
             _ => false,
         };
         SomeInteger {

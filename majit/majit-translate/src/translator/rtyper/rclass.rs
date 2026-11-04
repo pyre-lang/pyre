@@ -447,9 +447,8 @@ pub(crate) fn const_truthy(value: &ConstValue) -> bool {
         ConstValue::UInt(value) => *value != 0,
         ConstValue::Int128(value) => *value != 0,
         ConstValue::UInt128(value) => *value != 0,
-        ConstValue::RInt(c, value, _) => {
-            !crate::rlib::rarithmetic::rint_value(*c, *value).is_zero()
-        }
+        ConstValue::Long(value) => *value != malachite_bigint::BigInt::from(0),
+        ConstValue::RInt(c, value, _) => !crate::rlib::rarithmetic::rint_value(*c, value).is_zero(),
         ConstValue::Float(bits) => f64::from_bits(*bits) != 0.0,
         ConstValue::SingleFloat(_) => {
             panic!("TypeError: not supported on r_singlefloat instances")
@@ -859,9 +858,9 @@ pub(crate) fn constant_to_lowlevel_value(
         (LowLevelType::Unsigned, ConstValue::Int(n)) => {
             Ok(lltype::LowLevelValue::Unsigned(*n as u64))
         }
-        (LowLevelType::Number(n), ConstValue::RInt(c, v, _)) if n._type == *c => {
-            Ok(lltype::LowLevelValue::Number(n.clone(), *v))
-        }
+        (LowLevelType::Number(n), ConstValue::RInt(c, v, _)) if n._type == *c => Ok(
+            lltype::LowLevelValue::Number(n.clone(), v.small_or_unreachable()),
+        ),
         (LowLevelType::Signed, ConstValue::Bool(b)) => {
             Ok(lltype::LowLevelValue::Signed(i64::from(*b)))
         }

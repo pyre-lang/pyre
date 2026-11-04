@@ -948,8 +948,10 @@ fn canonical_integer_key(v: crate::rlib::rarithmetic::RIntValue) -> ConstValue {
         } else {
             ConstValue::Int128(n)
         }
+    } else if let crate::rlib::rarithmetic::RIntValue::Unsigned(u) = v {
+        ConstValue::UInt128(u)
     } else {
-        ConstValue::UInt128(v.as_u128())
+        ConstValue::host_int_from_bigint(v.to_bigint())
     }
 }
 
@@ -982,7 +984,8 @@ fn canonical_dict_key(cv: ConstValue) -> ConstValue {
         ConstValue::UInt(n) => canonical_integer_key(RIntValue::Unsigned(u128::from(n))),
         ConstValue::Int128(n) => canonical_integer_key(RIntValue::Signed(n)),
         ConstValue::UInt128(n) => canonical_integer_key(RIntValue::Unsigned(n)),
-        ConstValue::RInt(class, v, _) => canonical_integer_key(rint_value(class, v)),
+        ConstValue::Long(n) => ConstValue::Long(n),
+        ConstValue::RInt(class, v, _) => canonical_integer_key(rint_value(class, &v)),
         ConstValue::Float(bits) => {
             let f = f64::from_bits(bits);
             if f.is_finite() && f == f.trunc() && f >= i64::MIN as f64 && f < i64::MAX as f64 + 1.0
@@ -1028,6 +1031,7 @@ fn is_valid_contains_key(cv: &ConstValue) -> bool {
         | ConstValue::RInt(_, _, _)
         | ConstValue::Int128(_)
         | ConstValue::UInt128(_)
+        | ConstValue::Long(_)
         | ConstValue::Float(_)
         | ConstValue::SingleFloat(_)
         | ConstValue::LongFloat(_)

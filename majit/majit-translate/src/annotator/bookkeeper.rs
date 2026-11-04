@@ -5676,6 +5676,11 @@ impl Bookkeeper {
                 s.base.const_box = Some(Constant::new(ConstValue::UInt128(*i)));
                 Ok(SomeValue::Integer(s))
             }
+            ConstValue::Long(i) => {
+                let mut s = SomeInteger::new(*i >= malachite_bigint::BigInt::from(0), false);
+                s.base.const_box = Some(Constant::new(x.clone()));
+                Ok(SomeValue::Integer(s))
+            }
             ConstValue::RInt(_, _, _) => {
                 // `immutablevalue` consults `extregistry.is_registered(x)`
                 // (`bookkeeper.py`); `ForValuesEntry.compute_annotation`

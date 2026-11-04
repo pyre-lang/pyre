@@ -31,9 +31,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 
 use indexmap::IndexMap;
+use malachite_bigint::BigInt;
 
 use super::bytecode::HostCode;
 use crate::annotator::model::{RIntClass, SomeValue};
+use crate::rlib::rarithmetic::RIntPayload;
 use crate::translator::rtyper::lltypesystem::lltype::_ptr;
 
 // Exists to localise prepass nondeterminism (gh#1139).
@@ -3018,11 +3020,15 @@ pub enum ConstValue {
     Int128(i128),
     /// RPython `r_ulonglonglong` constant.
     UInt128(u128),
-    /// Instance of a `build_int` class (`r_uchar(5)`). The `i128` is
+    /// Host integer outside every fixed-width carrier above (Python's
+    /// unbounded `int`), e.g. `MASK` of a `build_int` class wider than
+    /// 128 bits.
+    Long(BigInt),
+    /// Instance of a `build_int` class (`r_uchar(5)`). The payload is
     /// already normalized by `rarithmetic.rint_new`. `RIntId` is the
     /// Python instance identity (`signed_int.__new__`); it is excluded
     /// from `PartialEq`/`Hash` so `Hashable.key` stays `(type, value)`.
-    RInt(RIntClass, i128, RIntId),
+    RInt(RIntClass, RIntPayload, RIntId),
     /// Python float constant. RPython stores the `f64` directly on
     /// `Constant.value`; Rust carries it as `f64::to_bits()` so the
     /// enum keeps its `Eq + Hash` derivation (IEEE 754 NaN violates
@@ -3392,6 +3398,7 @@ impl PartialEq for ConstValue {
             (ConstValue::UInt(a), ConstValue::UInt(b)) => a == b,
             (ConstValue::Int128(a), ConstValue::Int128(b)) => a == b,
             (ConstValue::UInt128(a), ConstValue::UInt128(b)) => a == b,
+            (ConstValue::Long(a), ConstValue::Long(b)) => a == b,
             (ConstValue::RInt(c1, a, _), ConstValue::RInt(c2, b, _)) => c1 == c2 && a == b,
             (ConstValue::Float(a), ConstValue::Float(b)) => a == b,
             (ConstValue::SingleFloat(a), ConstValue::SingleFloat(b)) => a == b,
@@ -3462,12 +3469,9 @@ impl std::fmt::Display for ConstValue {
             ConstValue::UInt(value) => write!(f, "{value}"),
             ConstValue::Int128(value) => write!(f, "{value}"),
             ConstValue::UInt128(value) => write!(f, "{value}"),
+            ConstValue::Long(value) => write!(f, "{value}"),
             ConstValue::RInt(class, value, _) => {
-                write!(
-                    f,
-                    "{}",
-                    crate::rlib::rarithmetic::rint_value(*class, *value)
-                )
+                write!(f, "{}", crate::rlib::rarithmetic::rint_value(*class, value))
             }
             ConstValue::Float(bits) => write!(f, "{}", f64::from_bits(*bits)),
             ConstValue::SingleFloat(bits) => {
@@ -3518,9 +3522,10 @@ impl Hash for ConstValue {
             ConstValue::UInt(value) => value.hash(state),
             ConstValue::Int128(value) => value.hash(state),
             ConstValue::UInt128(value) => value.hash(state),
+            ConstValue::Long(value) => value.hash(state),
             ConstValue::RInt(class, value, _) => {
                 class.hash(state);
-                crate::rlib::rarithmetic::rint_value(*class, *value).hash(state);
+                crate::rlib::rarithmetic::rint_value(*class, value).hash(state);
             }
             ConstValue::Float(bits) => bits.hash(state),
             ConstValue::SingleFloat(bits) => bits.hash(state),
@@ -4181,6 +4186,7 @@ fn const_value_variant_name(value: &ConstValue) -> &'static str {
         ConstValue::UInt(_) => "UInt",
         ConstValue::Int128(_) => "Int128",
         ConstValue::UInt128(_) => "UInt128",
+        ConstValue::Long(_) => "Long",
         ConstValue::RInt(_, _, _) => "RInt",
         ConstValue::Float(_) => "Float",
         ConstValue::SingleFloat(_) => "SingleFloat",
@@ -4275,8 +4281,25 @@ impl ConstValue {
 
     /// Fresh `build_int` instance (`signed_int.__new__` /
     /// `unsigned_int.__new__`). Each call mints a new [`RIntId`].
-    pub fn rint(class: RIntClass, value: i128) -> Self {
-        ConstValue::RInt(class, value, RIntId::mint())
+    /// `value` is the normalized integer (`rint_normalize`).
+    pub fn rint(class: RIntClass, value: impl Into<BigInt>) -> Self {
+        let payload = crate::rlib::rarithmetic::rint_payload_from_normalized(class, value.into());
+        ConstValue::RInt(class, payload, RIntId::mint())
+    }
+
+    /// Narrowest host-int carrier: Int, UInt, Int128, UInt128, then Long.
+    pub fn host_int_from_bigint(v: BigInt) -> ConstValue {
+        if let Ok(n) = i64::try_from(&v) {
+            ConstValue::Int(n)
+        } else if let Ok(n) = u64::try_from(&v) {
+            ConstValue::UInt(n)
+        } else if let Ok(n) = i128::try_from(&v) {
+            ConstValue::Int128(n)
+        } else if let Ok(n) = u128::try_from(&v) {
+            ConstValue::UInt128(n)
+        } else {
+            ConstValue::Long(v)
+        }
     }
 
     /// Python `is` on the wrapped object (`is__default`).
@@ -4410,8 +4433,9 @@ impl ConstValue {
             ConstValue::UInt(n) => Some(*n != 0),
             ConstValue::Int128(n) => Some(*n != 0),
             ConstValue::UInt128(n) => Some(*n != 0),
+            ConstValue::Long(n) => Some(*n != BigInt::from(0)),
             ConstValue::RInt(c, n, _) => {
-                Some(!crate::rlib::rarithmetic::rint_value(*c, *n).is_zero())
+                Some(!crate::rlib::rarithmetic::rint_value(*c, n).is_zero())
             }
             // Python `bool(float)` is `float != 0.0` (including -0.0
             // which equals 0.0 under IEEE 754).
@@ -4516,7 +4540,8 @@ impl ConstValue {
             ConstValue::Int(_)
             | ConstValue::UInt(_)
             | ConstValue::Int128(_)
-            | ConstValue::UInt128(_) => HOST_ENV.lookup_builtin("int"),
+            | ConstValue::UInt128(_)
+            | ConstValue::Long(_) => HOST_ENV.lookup_builtin("int"),
             ConstValue::RInt(c, _, _) => Some(crate::rlib::rarithmetic::rint_class_object(*c)),
             ConstValue::Float(_) => HOST_ENV.lookup_builtin("float"),
             ConstValue::SingleFloat(_) | ConstValue::LongFloat(_) => None,
@@ -6105,7 +6130,7 @@ pub(crate) fn exitcase_numeric_i128(exitcase: &Option<Hlvalue>) -> Option<i128> 
         Some(Hlvalue::Constant(c)) => match &c.value {
             ConstValue::Int(n) => Some(*n as i128),
             ConstValue::UInt(n) => Some(*n as i128),
-            ConstValue::RInt(c, n, _) => crate::rlib::rarithmetic::rint_value(*c, *n).as_i128(),
+            ConstValue::RInt(c, n, _) => crate::rlib::rarithmetic::rint_value(*c, n).as_i128(),
             ConstValue::Bool(flag) => Some(i128::from(*flag)),
             _ => None,
         },
@@ -7247,6 +7272,36 @@ mod tests {
         assert_ne!(cls, builtin_int);
         assert_eq!(cls.module_name(), Some("rpython.rlib.rarithmetic"));
         assert!(!Constant::new(value).foldable());
+    }
+
+    #[test]
+    fn host_int_from_bigint_picks_narrowest_carrier() {
+        assert_eq!(
+            ConstValue::host_int_from_bigint(BigInt::from(i64::MAX)),
+            ConstValue::Int(i64::MAX)
+        );
+        assert_eq!(
+            ConstValue::host_int_from_bigint(BigInt::from(i64::MAX) + 1),
+            ConstValue::UInt(i64::MAX as u64 + 1)
+        );
+        assert_eq!(
+            ConstValue::host_int_from_bigint(BigInt::from(u64::MAX) + 1),
+            ConstValue::Int128((u64::MAX as i128) + 1)
+        );
+        assert_eq!(
+            ConstValue::host_int_from_bigint(BigInt::from(u128::MAX)),
+            ConstValue::UInt128(u128::MAX)
+        );
+        let u128_max_plus_one: BigInt = BigInt::from(u128::MAX) + 1;
+        assert_eq!(
+            ConstValue::host_int_from_bigint(u128_max_plus_one.clone()),
+            ConstValue::Long(u128_max_plus_one)
+        );
+        let i128_min_minus_one: BigInt = BigInt::from(i128::MIN) - 1;
+        assert_eq!(
+            ConstValue::host_int_from_bigint(i128_min_minus_one.clone()),
+            ConstValue::Long(i128_min_minus_one)
+        );
     }
 
     #[test]

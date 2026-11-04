@@ -1858,6 +1858,7 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         ConstValue::UInt(_) => ValueType::Unsigned,
         ConstValue::Int128(_) => ValueType::Int128,
         ConstValue::UInt128(_) => ValueType::UInt128,
+        ConstValue::Long(_) => ValueType::Int,
         ConstValue::Float(_) | ConstValue::LongFloat(_) => ValueType::Float,
         ConstValue::SingleFloat(_) => ValueType::SingleFloat,
         ConstValue::Placeholder => ValueType::Unknown,

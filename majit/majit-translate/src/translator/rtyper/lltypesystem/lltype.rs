@@ -5590,9 +5590,10 @@ impl std::fmt::Display for CastWhateverError {
 /// RPython `lltype.typeOf` for a flow-graph `Constant.value`.
 pub fn typeOf_const(value: &ConstValue) -> Result<LowLevelType, CastWhateverError> {
     match value {
-        ConstValue::Int(_) | ConstValue::AddressOffset(_) | ConstValue::InheritanceId { .. } => {
-            Ok(LowLevelType::Signed)
-        }
+        ConstValue::Int(_)
+        | ConstValue::Long(_)
+        | ConstValue::AddressOffset(_)
+        | ConstValue::InheritanceId { .. } => Ok(LowLevelType::Signed),
         ConstValue::UInt(_) => Ok(LowLevelType::Unsigned),
         ConstValue::Int128(_) => Ok(LowLevelType::SignedLongLongLong),
         ConstValue::UInt128(_) => Ok(LowLevelType::UnsignedLongLongLong),
@@ -5711,9 +5712,15 @@ pub(crate) fn truncated_from_const(value: &ConstValue) -> Result<TruncatedInt, C
         ConstValue::UInt(n) => Ok(TruncatedInt::from_u128(*n as u128)),
         ConstValue::Int128(n) => Ok(TruncatedInt::from_i128(*n)),
         ConstValue::UInt128(n) => Ok(TruncatedInt::from_u128(*n)),
-        ConstValue::RInt(c, n, _) => Ok(match rint_value(*c, *n) {
+        ConstValue::Long(n) => Err(CastWhateverError::overflow_error(
+            signed_int_overflow_message(n, 128),
+        )),
+        ConstValue::RInt(c, n, _) => Ok(match rint_value(*c, n) {
             RIntValue::Signed(v) => TruncatedInt::from_i128(v),
             RIntValue::Unsigned(v) => TruncatedInt::from_u128(v),
+            RIntValue::SignedBig(_) | RIntValue::UnsignedBig(_) => {
+                unreachable!("wider than 128 bits never reaches the rtyper")
+            }
         }),
         // `cast_primitive`: `value = long(value)` only when `ORIG == Float`.
         // `r_singlefloat` / `r_longfloat` have no integer conversion.
@@ -5794,7 +5801,7 @@ pub(crate) fn const_as_f64(value: &ConstValue) -> Result<f64, CastWhateverError>
         ConstValue::UInt(n) => Ok(*n as f64),
         ConstValue::Int128(n) => Ok(*n as f64),
         ConstValue::UInt128(n) => Ok(*n as f64),
-        ConstValue::RInt(c, n, _) => Ok(rint_value(*c, *n).as_f64()),
+        ConstValue::RInt(c, n, _) => Ok(rint_value(*c, n).as_f64()),
         ConstValue::ByteStr(bytes) if bytes.len() == 1 => Ok(bytes[0] as f64),
         ConstValue::UniStr(s) => {
             let mut chars = s.chars();
@@ -10287,7 +10294,7 @@ mod tests {
         match (&schar_ty, minus_one) {
             (LowLevelType::Number(n), ConstValue::RInt(c, v, _)) => {
                 assert_eq!(c, n._type);
-                assert_eq!(v, -1);
+                assert_eq!(v, crate::rlib::rarithmetic::RIntPayload::Small(-1));
             }
             other => panic!("expected RInt(-1), got {other:?}"),
         }
