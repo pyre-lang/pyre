@@ -233,26 +233,25 @@ fn has_variadic_type_param_default(module: &ast::Mod) -> bool {
 /// `PyAst_CheckMode` for `func_type` (mode 3).  FunctionType is not a
 /// compiler `Mod`, so ONLY_AST returns the input after this check.
 pub fn check_func_type_ast(mut object: PyObjectRef) -> Result<(), crate::PyError> {
-    let ast_module = pyre_object::with_roots!(object => crate::importing::importhook(
+    let mut ast_module = pyre_object::with_roots!(object => crate::importing::importhook(
         rustpython_wtf8::Wtf8::new("_ast"),
         PY_NULL,
         PY_NULL,
         0,
         crate::call::take_last_exec_ctx(),
     ))?;
-    let _ast_module_roots = pyre_object::gc_roots::push_roots();
-    let ast_module_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(ast_module);
-    let converter = ObjectConverter {
-        ast_module: pyre_object::gc_roots::shadow_stack_get(ast_module_slot),
-        depth: 0,
-        carried_ignores: Vec::new(),
-        line_len: 0,
-        lines: Vec::new(),
-        columns: Vec::new(),
-        locations: core::cell::RefCell::new(None),
-    };
-    pyre_object::with_roots!(object => converter.check_root_mode(object, "FunctionType"))
+    pyre_object::with_roots!(object, ast_module => {
+        let converter = ObjectConverter {
+            ast_module,
+            depth: 0,
+            carried_ignores: Vec::new(),
+            line_len: 0,
+            lines: Vec::new(),
+            columns: Vec::new(),
+            locations: core::cell::RefCell::new(None),
+        };
+        converter.check_root_mode(object, "FunctionType")
+    })
 }
 
 /// Convert an interpreter-level `_ast` tree back into Ruff's compiler AST and
@@ -269,7 +268,7 @@ pub fn compile_object(
     let _compile_module_roots = pyre_object::gc_roots::push_roots();
     let compile_module_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(compile_module);
-    let ast_module = pyre_object::with_roots!(object => crate::importing::importhook(
+    let mut ast_module = pyre_object::with_roots!(object => crate::importing::importhook(
         rustpython_wtf8::Wtf8::new("_ast"),
         PY_NULL,
         PY_NULL,
@@ -285,12 +284,21 @@ pub fn compile_object(
         columns: Vec::new(),
         locations: core::cell::RefCell::new(None),
     };
-    pyre_object::with_roots!(object => converter.validate_module_mode(object, mode))?;
+    pyre_object::with_roots!(object, ast_module => {
+        converter.ast_module = ast_module;
+        converter.validate_module_mode(object, mode)
+    })?;
     // A tree that came from objects still needs a text whose ranges keep the
     // order of positions and which of them share a line.  The coordinates
     // themselves come from the location table.
-    let text = pyre_object::with_roots!(object => converter.synthetic_source(object))?;
-    let module = converter.module(object)?;
+    let text = pyre_object::with_roots!(object, ast_module => {
+        converter.ast_module = ast_module;
+        converter.synthetic_source(object)
+    })?;
+    let module = pyre_object::with_roots!(object, ast_module => {
+        converter.ast_module = ast_module;
+        converter.module(object)
+    })?;
     // compiling.py:73 — the tree is walked before it reaches the compiler.
     crate::astcompiler::validate::validate_ast(&module)?;
     let source_file =
@@ -415,9 +423,14 @@ pub fn preprocess_object_to_object(
     // A tree handed in as objects arrives without a text.  The synthetic
     // source keeps the order of positions and which share a line; the
     // coordinates themselves come from the location table.
-    let synthetic =
-        pyre_object::with_roots!(ast_module, object => converter.synthetic_source(object))?;
-    let mut module = pyre_object::with_roots!(ast_module => converter.module(object))?;
+    let synthetic = pyre_object::with_roots!(ast_module, object => {
+        converter.ast_module = ast_module;
+        converter.synthetic_source(object)
+    })?;
+    let mut module = pyre_object::with_roots!(ast_module, object => {
+        converter.ast_module = ast_module;
+        converter.module(object)
+    })?;
     crate::astcompiler::validate::validate_ast(&module)?;
     let mut locations = converter.take_locations().unwrap_or_default();
     preprocess_module_with_locations(&mut module, mode, opts, syntax_check_only, &mut locations)
@@ -686,8 +699,15 @@ impl ObjectConverter {
     }
 
     fn is_node(&self, mut object: PyObjectRef, name: &str) -> AstResult<bool> {
-        let ty = pyre_object::with_roots!(object => crate::baseobjspace::getattr_str(self.ast_module, name))?;
-        Ok(unsafe { crate::baseobjspace::isinstance_w(object, ty) })
+        let mut ast_module = self.ast_module;
+        let mut ty = pyre_object::with_roots!(
+            object,
+            ast_module => crate::baseobjspace::getattr_str(ast_module, name)
+        )?;
+        Ok(pyre_object::with_roots!(
+            object,
+            ty => unsafe { crate::baseobjspace::isinstance_w(object, ty) }
+        ))
     }
 
     fn field(&self, object: PyObjectRef, field: &str, node: &str) -> AstResult<PyObjectRef> {
@@ -804,11 +824,12 @@ impl ObjectConverter {
             pyre_object::with_roots!(object => self.int_field(object, "col_offset", node))?;
         let end_line = match pyre_object::with_roots!(object => self.optional_field(object, "end_lineno"))?
         {
-            Some(value) => pyre_object::with_roots!(object => self.obj_to_int(value))?,
+            Some(mut value) => pyre_object::with_roots!(object, value => self.obj_to_int(value))?,
             None => line,
         };
-        let end_column = match self.optional_field(object, "end_col_offset")? {
-            Some(value) => self.obj_to_int(value)?,
+        let end_column = match pyre_object::with_roots!(object => self.optional_field(object, "end_col_offset"))?
+        {
+            Some(mut value) => pyre_object::with_roots!(object, value => self.obj_to_int(value))?,
             None => column,
         };
 
@@ -950,10 +971,10 @@ impl ObjectConverter {
                 "FunctionDef"
             };
             let name = pyre_object::with_roots!(object => self.identifier(object, "name", node))?;
-            let args =
+            let mut args =
                 pyre_object::with_roots!(object => self.required_field(object, "args", node))?;
             let parameters = Box::new(
-                pyre_object::with_roots!(object => self.recurse(|this| this.parameters(args)))?,
+                pyre_object::with_roots!(object, args => self.recurse(|this| this.parameters(args)))?,
             );
             let body = pyre_object::with_roots!(object => self.body(object, "body", node))?;
             let decorator_list = pyre_object::with_roots!(object => self.decorators(object, node))?;
@@ -1001,14 +1022,14 @@ impl ObjectConverter {
                 self.recurse(|this| this.expr(value))
             })
             .collect::<Result<Vec<_>, _>>()?;
-            let value =
+            let mut value =
                 pyre_object::with_roots!(object => self.required_field(object, "value", "Assign"))?;
             Ok(ast::Stmt::Assign(ast::StmtAssign {
                 node_index,
                 range,
                 targets,
                 value: Box::new(
-                    pyre_object::with_roots!(object => self.recurse(|this| this.expr(value)))?,
+                    pyre_object::with_roots!(object, value => self.recurse(|this| this.expr(value)))?,
                 ),
                 runtime_targets: None,
                 runtime_type_comment: self.opt_type_comment(object)?,
@@ -1078,8 +1099,7 @@ impl ObjectConverter {
                 pyre_object::with_roots!(object => self.req_expr(object, "target", "AugAssign"))?;
             let mut op =
                 pyre_object::with_roots!(object => self.required_field(object, "op", "AugAssign"))?;
-            let value =
-                pyre_object::with_roots!(op => self.req_expr(object, "value", "AugAssign"))?;
+            let value = pyre_object::with_roots!(op, object => self.req_expr(object, "value", "AugAssign"))?;
             Ok(ast::Stmt::AugAssign(ast::StmtAugAssign {
                 node_index,
                 range,
@@ -1612,9 +1632,8 @@ impl ObjectConverter {
     }
 
     fn match_case(&mut self, mut object: PyObjectRef) -> AstResult<ast::MatchCase> {
-        let pattern = pyre_object::with_roots!(object => self.required_field(object, "pattern", "match_case"))?;
-        let pattern =
-            pyre_object::with_roots!(object => self.recurse(|this| this.pattern(pattern)))?;
+        let mut pattern = pyre_object::with_roots!(object => self.required_field(object, "pattern", "match_case"))?;
+        let pattern = pyre_object::with_roots!(object, pattern => self.recurse(|this| this.pattern(pattern)))?;
         Ok(ast::MatchCase {
             range: Default::default(),
             node_index: Default::default(),
@@ -1907,9 +1926,9 @@ impl ObjectConverter {
                 node_index,
                 range,
                 left: Box::new(
-                    pyre_object::with_roots!(op, right, object => self.recurse(|this| this.expr(left)))?,
+                    pyre_object::with_roots!(op, right, object, left => self.recurse(|this| this.expr(left)))?,
                 ),
-                op: pyre_object::with_roots!(right => self.operator(op))?,
+                op: pyre_object::with_roots!(right, op => self.operator(op))?,
                 right: Box::new(self.recurse(|this| this.expr(right))?),
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Call"))? {
@@ -1952,10 +1971,10 @@ impl ObjectConverter {
                 node_index,
                 range,
                 value: Box::new(
-                    pyre_object::with_roots!(ctx, object => self.recurse(|this| this.expr(value)))?,
+                    pyre_object::with_roots!(ctx, object, value => self.recurse(|this| this.expr(value)))?,
                 ),
                 attr: ast::Identifier::new(
-                    pyre_object::with_roots!(ctx => self.string(object, "attr", "Attribute"))?,
+                    pyre_object::with_roots!(ctx, object => self.string(object, "attr", "Attribute"))?,
                     Default::default(),
                 ),
                 ctx: self.context(ctx)?,
@@ -2032,10 +2051,9 @@ impl ObjectConverter {
                 value,
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Lambda"))? {
-            let args =
+            let mut args =
                 pyre_object::with_roots!(object => self.required_field(object, "args", "Lambda"))?;
-            let parameters =
-                pyre_object::with_roots!(object => self.recurse(|this| this.parameters(args)))?;
+            let parameters = pyre_object::with_roots!(object, args => self.recurse(|this| this.parameters(args)))?;
             let body = self.req_expr(object, "body", "Lambda")?;
             Ok(ast::Expr::Lambda(ast::ExprLambda {
                 node_index,

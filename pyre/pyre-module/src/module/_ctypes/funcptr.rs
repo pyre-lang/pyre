@@ -1269,14 +1269,16 @@ fn validate_paramflags(
             return Err(malformed());
         }
         if item_len > 1 {
-            let name = pyre_object::with_roots!(paramflags, at, flag => unsafe { pyre_object::w_tuple_getitem(item, 1) }).ok_or_else(malformed)?;
+            let name = pyre_object::with_roots!(paramflags, at, flag, item => unsafe { pyre_object::w_tuple_getitem(item, 1) }).ok_or_else(malformed)?;
             if !unsafe { pyre_object::is_none(name) } && !unsafe { pyre_object::is_str(name) } {
                 return Err(malformed());
             }
         }
         let flag = unsafe { pyre_object::w_int_get_value(flag) };
         match flag & PARAMFLAG_DIRECTION {
-            PARAMFLAG_FOUT => pyre_object::with_roots!(paramflags => check_outarg_type(at, i + 1))?,
+            PARAMFLAG_FOUT => {
+                pyre_object::with_roots!(paramflags, at => check_outarg_type(at, i + 1))?
+            }
             0 | PARAMFLAG_FIN | PARAMFLAG_FIN_FLCID | PARAMFLAG_FIN_FOUT => {}
             _ => {
                 return Err(pyre_interpreter::PyError::type_error(format!(
@@ -1636,9 +1638,9 @@ fn convert_one_callback_arg(
     }
 }
 
-fn python_callback_restype(obj: PyObjectRef) -> Option<PyObjectRef> {
+fn python_callback_restype(mut obj: PyObjectRef) -> Option<PyObjectRef> {
     let mut cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    let rt = pyre_object::with_roots!(cls => instance_get(obj, RESTYPE_KEY))
+    let rt = pyre_object::with_roots!(cls, obj => instance_get(obj, RESTYPE_KEY))
         .or_else(|| unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_restype_") })?;
     if unsafe { pyre_object::is_none(rt) } {
         None
@@ -2012,6 +2014,17 @@ fn cfuncptr_call_from(
     let com: Option<(usize, usize)> = None;
 
     let argtypes = resolve_argtypes(pyre_object::gc_roots::shadow_stack_get(self_slot));
+    let argtypes_is_none = argtypes.is_none();
+    let n_argtypes = argtypes.as_ref().map(|a| a.len()).unwrap_or(0);
+    // Pin the argtypes sequence before `instance_get` / `build_callargs`.
+    // Those are safepoints, and the marshal loop still needs these words
+    // after `build_callargs` pops its nested roots.  `pin_roots` of an empty
+    // slice is still a safepoint; skip it when there is nothing to hold.
+    let argtypes_base = if n_argtypes == 0 {
+        0
+    } else {
+        pyre_object::gc_roots::pin_roots(argtypes.as_deref().unwrap_or(&[]))
+    };
     let paramflags = instance_get(
         pyre_object::gc_roots::shadow_stack_get(self_slot),
         PARAMFLAGS_KEY,
@@ -2020,18 +2033,21 @@ fn cfuncptr_call_from(
     let paramflags_word = paramflags.unwrap_or(pyre_object::PY_NULL);
     let _paramflags_slot = pyre_object::gc_roots::pin_roots(&[paramflags_word]);
     let kwargs_now = has_kwargs.then(|| pyre_object::gc_roots::shadow_stack_get(kwargs_slot));
+    let mut argtypes_now = vec![pyre_object::PY_NULL; n_argtypes];
+    if n_argtypes > 0 {
+        pyre_object::gc_roots::shadow_stack_copy_range(argtypes_base, &mut argtypes_now);
+    }
     let mut callargs = build_callargs(
         pyre_object::gc_roots::shadow_stack_get(self_slot),
-        argtypes.as_deref(),
+        (!argtypes_is_none).then_some(argtypes_now.as_slice()),
         &reload_inargs(),
         kwargs_now,
         com.is_some(),
     )?;
     let n_call_args = callargs.args.len();
-    let call_args_base = {
-        let call_args = callargs.args.as_slice();
-        pyre_object::gc_roots::pin_roots(call_args)
-    };
+    // The callargs prefix stays a contiguous `base + i` run.  Argtypes
+    // already live in `argtypes_base`.
+    let call_args_base = pyre_object::gc_roots::pin_roots(&callargs.args);
 
     // Marshal arguments into owned scalar data.  `keepalive` owns any
     // null-terminated `bytes` copies that pointer args address; `owned` owns
@@ -2045,39 +2061,38 @@ fn cfuncptr_call_from(
     // What each declared argtype lowers to, kept so that a repeat call can run
     // from it instead of asking the types again.
     let mut kinds: Vec<ArgKind> = Vec::new();
-    match &argtypes {
-        Some(argtypes) => {
-            for (i, &at) in argtypes.iter().enumerate() {
-                if i >= n_call_args {
-                    return Err(pyre_interpreter::PyError::type_error(format!(
-                        "this function takes at least {} argument(s)",
-                        argtypes.len()
-                    )));
-                }
-                let at_slot = pyre_object::gc_roots::pin_roots(&[at]);
-                let kind = classify_argtype(pyre_object::gc_roots::shadow_stack_get(at_slot))
-                    .ok_or_else(|| {
-                        pyre_interpreter::PyError::type_error("argtype has no valid '_type_'")
-                    })?;
-                kinds.push(kind);
-                owned.push(marshal_typed_arg(
-                    pyre_object::gc_roots::shadow_stack_get(call_args_base + i),
-                    pyre_object::gc_roots::shadow_stack_get(at_slot),
-                    kind,
-                    &mut keepalive,
-                )?);
-            }
-            // Variadic tail (printf-style): arguments past the declared
-            // argtypes are marshalled by the default conversion rules.
-            for i in argtypes.len().min(n_call_args)..n_call_args {
+    match n_argtypes {
+        0 if argtypes_is_none => {
+            for i in 0..n_call_args {
                 owned.push(marshal_default_arg(
                     pyre_object::gc_roots::shadow_stack_get(call_args_base + i),
                     &mut keepalive,
                 )?);
             }
         }
-        None => {
-            for i in 0..n_call_args {
+        n_argtypes => {
+            for i in 0..n_argtypes {
+                if i >= n_call_args {
+                    return Err(pyre_interpreter::PyError::type_error(format!(
+                        "this function takes at least {n_argtypes} argument(s)",
+                    )));
+                }
+                let kind =
+                    classify_argtype(pyre_object::gc_roots::shadow_stack_get(argtypes_base + i))
+                        .ok_or_else(|| {
+                            pyre_interpreter::PyError::type_error("argtype has no valid '_type_'")
+                        })?;
+                kinds.push(kind);
+                owned.push(marshal_typed_arg(
+                    pyre_object::gc_roots::shadow_stack_get(call_args_base + i),
+                    pyre_object::gc_roots::shadow_stack_get(argtypes_base + i),
+                    kind,
+                    &mut keepalive,
+                )?);
+            }
+            // Variadic tail (printf-style): arguments past the declared
+            // argtypes are marshalled by the default conversion rules.
+            for i in n_argtypes.min(n_call_args)..n_call_args {
                 owned.push(marshal_default_arg(
                     pyre_object::gc_roots::shadow_stack_get(call_args_base + i),
                     &mut keepalive,
@@ -2088,7 +2103,7 @@ fn cfuncptr_call_from(
 
     let ret = resolve_restype(pyre_object::gc_roots::shadow_stack_get(self_slot))?;
     let flags = funcptr_flags(pyre_object::gc_roots::shadow_stack_get(self_slot));
-    let argtypecount = argtypes.as_ref().map(|a| a.len()).unwrap_or(0);
+    let argtypecount = n_argtypes;
     let result = invoke(
         pyre_object::gc_roots::shadow_stack_get(self_slot),
         call_address(addr, com),
@@ -2460,42 +2475,50 @@ fn build_callargs(
     // `paramflags` is the tuple the loop indexes on every turn, and the same
     // arbitrary Python runs between two of those reads.  A tuple relocates, so
     // it is pinned ahead of `base` -- the values below want a contiguous run
-    // starting there -- and read back at each index.
-    let paramflags_slot = roots.pin_roots(&[paramflags]);
+    // starting there -- and read back at each index.  `argtypes` is the same
+    // sequence `_convert_args` holds for the whole loop; `pin_roots` is itself
+    // a safepoint, so it shares the paramflags pin rather than sitting in a
+    // native local across that query.
+    let mut paramflags_and_argtypes = Vec::with_capacity(1 + argtypes.len());
+    paramflags_and_argtypes.push(paramflags);
+    paramflags_and_argtypes.extend_from_slice(argtypes);
+    let paramflags_slot = roots.pin_roots(&paramflags_and_argtypes);
+    let argtypes_base = paramflags_slot + 1;
     let base = pyre_object::gc_roots::shadow_stack_len();
     let mut index = 0;
-    for (i, &at) in argtypes.iter().enumerate() {
+    for i in 0..argtypes.len() {
         let malformed = || {
             pyre_interpreter::PyError::value_error(
                 "paramflags must have the same length as argtypes",
             )
         };
-        let item = unsafe {
+        let item_now = || unsafe {
             pyre_object::w_tuple_getitem(
                 pyre_object::gc_roots::shadow_stack_get(paramflags_slot),
                 i as i64,
             )
-        }
-        .ok_or_else(malformed)?;
+        };
+        let item = item_now().ok_or_else(malformed)?;
         if !unsafe { pyre_object::is_tuple(item) } {
             return Err(malformed());
         }
-        let at_item = roots.pin_roots(&[at, item]);
-        let item_len = unsafe { pyre_object::w_tuple_len(roots.get(at_item + 1)) };
-        let flag = unsafe { pyre_object::w_tuple_getitem(roots.get(at_item + 1), 0) }
+        let item_len = unsafe { pyre_object::w_tuple_len(item_now().ok_or_else(malformed)?) };
+        let flag = unsafe { pyre_object::w_tuple_getitem(item_now().ok_or_else(malformed)?, 0) }
             .ok_or_else(malformed)?;
         let flag = unsafe { pyre_object::w_int_get_value(flag) };
-        let name = (item_len > 1)
-            .then(|| unsafe { pyre_object::w_tuple_getitem(roots.get(at_item + 1), 1) })
-            .flatten()
-            .filter(|&n| unsafe { pyre_object::is_str(n) })
-            .and_then(|n| {
-                pyre_interpreter::baseobjspace::str_utf8_w(n)
-                    .ok()
-                    .map(str::to_string)
-            });
+        let name = if item_len > 1 {
+            unsafe { pyre_object::w_tuple_getitem(item_now().ok_or_else(malformed)?, 1) }
+        } else {
+            None
+        }
+        .filter(|&n| unsafe { pyre_object::is_str(n) })
+        .and_then(|n| {
+            pyre_interpreter::baseobjspace::str_utf8_w(n)
+                .ok()
+                .map(str::to_string)
+        });
         let defval = if item_len > 2 {
-            unsafe { pyre_object::w_tuple_getitem(roots.get(at_item + 1), 2) }
+            unsafe { pyre_object::w_tuple_getitem(item_now().ok_or_else(malformed)?, 2) }
         } else {
             None
         };
@@ -2507,7 +2530,9 @@ fn build_callargs(
                 out.numretvals += 1;
                 match defval {
                     Some(defval) => defval,
-                    None => out_parameter(roots.get(at_item))?,
+                    None => {
+                        out_parameter(pyre_object::gc_roots::shadow_stack_get(argtypes_base + i))?
+                    }
                 }
             }
             direction => {
@@ -3252,11 +3277,11 @@ pub(super) fn build_layout(mut t: PyObjectRef) -> Result<CTypeLayout, pyre_inter
         }
         ParamFunc::Pointer => Ok(CTypeLayout::Pointer),
         ParamFunc::Array => {
-            let element = pyre_object::with_roots!(info => stginfo::stginfo_proto(info))
+            let mut element = pyre_object::with_roots!(info, t => stginfo::stginfo_proto(info))
                 .ok_or_else(|| {
                     pyre_interpreter::PyError::type_error("array type has no element type")
                 })?;
-            let element = pyre_object::with_roots!(info => build_layout(element))?;
+            let element = pyre_object::with_roots!(info, t, element => build_layout(element))?;
             Ok(CTypeLayout::Array {
                 element: Box::new(element),
                 length: stginfo::stginfo_length(info),
@@ -3291,9 +3316,9 @@ pub(super) fn build_layout(mut t: PyObjectRef) -> Result<CTypeLayout, pyre_inter
 /// and snapshot the instance's buffer bytes (padded to the layout size).
 fn marshal_aggregate_arg(
     mut arg: PyObjectRef,
-    at: PyObjectRef,
+    mut at: PyObjectRef,
 ) -> Result<OwnedArg, pyre_interpreter::PyError> {
-    let layout = pyre_object::with_roots!(arg => build_layout(at))?;
+    let layout = pyre_object::with_roots!(arg, at => build_layout(at))?;
     let bytes = cdata::cdata_bytes(arg).ok_or_else(|| {
         pyre_interpreter::PyError::type_error(
             "by-value aggregate argument is not a ctypes instance",

@@ -1873,8 +1873,10 @@ crate::py_module! {
         },
         "text_encoding"   / * = |args| {
             let mut encoding = args.first().copied().unwrap_or_else(w_none);
-            let stacklevel = pyre_object::with_roots!(encoding => {
-                args.get(1).copied().map(crate::builtins::space_index_w)
+            let mut stacklevel_obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+            let has_stacklevel = args.get(1).is_some();
+            let stacklevel = pyre_object::with_roots!(encoding, stacklevel_obj => {
+                has_stacklevel.then(|| crate::builtins::space_index_w(stacklevel_obj))
             })
             .transpose()?
             .unwrap_or(2);

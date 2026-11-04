@@ -1090,24 +1090,25 @@ mod context_methods {
             if let Some(cafile) = cafile {
                 let roots = pyre_object::gc_roots::push_roots();
                 let base = roots.pin_roots(&[
+                    cafile,
                     capath.unwrap_or(pyre_object::PY_NULL),
                     cadata.unwrap_or(pyre_object::PY_NULL),
                 ]);
-                let path = fs_path(cafile);
+                let path = fs_path(roots.get(base));
                 let path = path?;
                 native_result(unsafe {
                     pyre_native::ssl::context_load_verify_file(self.backend, &path)
                 })?;
-                let w = roots.get(base);
-                capath = if w.is_null() { None } else { Some(w) };
                 let w = roots.get(base + 1);
+                capath = if w.is_null() { None } else { Some(w) };
+                let w = roots.get(base + 2);
                 cadata = if w.is_null() { None } else { Some(w) };
             }
             if let Some(capath) = capath {
                 let roots = pyre_object::gc_roots::push_roots();
-                let base = roots.pin_roots(&[cadata.unwrap_or(pyre_object::PY_NULL)]);
-                let path = fs_path(capath);
-                let w = roots.get(base);
+                let base = roots.pin_roots(&[capath, cadata.unwrap_or(pyre_object::PY_NULL)]);
+                let path = fs_path(roots.get(base));
+                let w = roots.get(base + 1);
                 cadata = if w.is_null() { None } else { Some(w) };
                 drop(roots);
                 let path = path?;

@@ -29343,16 +29343,26 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let signed_obj = bound(3).unwrap_or(pyre_object::PY_NULL);
     // `makebytesdata_w` — `__bytes__` takes precedence over the buffer /
     // iterable conversion and must itself return a bytes instance.
+    // `pin_roots` is a safepoint, so `cls` / `data_obj` share this pin with
+    // `signed` rather than sitting in native locals across it.
     let signed_roots = pyre_object::gc_roots::push_roots();
-    let signed_slot = signed_roots.pin_roots(&[signed_obj]);
+    let signed_slot = signed_roots.pin_roots(&[signed_obj, cls, data_obj]);
+    let cls_slot = signed_slot + 1;
+    let data_slot = signed_slot + 2;
+    cls = signed_roots.get(cls_slot);
+    data_obj = signed_roots.get(data_slot);
     let bytes_method = unsafe { crate::baseobjspace::lookup(data_obj, "__bytes__") };
+    cls = signed_roots.get(cls_slot);
+    data_obj = signed_roots.get(data_slot);
     // `_convert_from_buffer_or_iterable` — the buffer protocol, else an
     // iterable of ints.  A str is iterable but never a byte source, and
     // neither is an object with no iterator at all.
-    let bytes: Vec<u8> = if let Some(method) = bytes_method {
+    let bytes: Vec<u8> = if let Some(mut method) = bytes_method {
         let w_type = crate::typedef::r#type(data_obj).map_or(pyre_object::PY_NULL, |t| t.as_ptr());
+        cls = signed_roots.get(cls_slot);
+        data_obj = signed_roots.get(data_slot);
         let w_bytes = unsafe {
-            pyre_object::with_roots!(cls, data_obj => crate::baseobjspace::get_and_call_function(method, data_obj, w_type, &[]))?
+            pyre_object::with_roots!(cls, data_obj, method => crate::baseobjspace::get_and_call_function(method, data_obj, w_type, &[]))?
         };
         if !unsafe { pyre_object::bytesobject::is_bytes(w_bytes) } {
             return Err(unsafe {
@@ -29373,11 +29383,20 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // `PySequence_Fast` wording applies to the `iter(obj)` failure only:
         // a `TypeError` the iterator raises from `__next__` is that object's
         // error and keeps its own message and traceback.
-        let items =
-            pyre_object::with_roots!(cls => crate::builtins::sequence_fast(data_obj, &not_bytes))?;
-        let mut v = Vec::with_capacity(items.len());
-        for it in items {
-            let n = pyre_object::with_roots!(cls => crate::baseobjspace::int_w(it))?;
+        let items = pyre_object::with_roots!(
+            cls,
+            data_obj => crate::builtins::sequence_fast(data_obj, &not_bytes)
+        )?;
+        let n_items = items.len();
+        let items_base = signed_roots.pin_roots(&items);
+        cls = signed_roots.get(cls_slot);
+        let mut v = Vec::with_capacity(n_items);
+        for i in 0..n_items {
+            let n = pyre_object::with_roots!(
+                cls => crate::baseobjspace::int_w(
+                    pyre_object::gc_roots::shadow_stack_get(items_base + i)
+                )
+            )?;
             if !(0..=255).contains(&n) {
                 return Err(crate::PyError::value_error(
                     "bytes must be in range(0, 256)",
@@ -29387,15 +29406,15 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         }
         v
     };
-    let w_signed = signed_roots.get(signed_slot);
-    drop(signed_roots);
     let signed = pyre_object::with_roots!(cls => {
+        let w_signed = signed_roots.get(signed_slot);
         (!w_signed.is_null())
             .then_some(w_signed)
             .map(crate::baseobjspace::is_true)
             .transpose()
     })?
     .unwrap_or(false);
+    drop(signed_roots);
     // intobject.py:81-91 first tries the machine-word helper, then falls back
     // to the same linear rbigint.frombytes implementation for large input.
     let mut w_result = match majit_rlib::rbigint::frombytes_int(&bytes, byteorder, signed) {

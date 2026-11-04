@@ -1895,7 +1895,7 @@ pub fn normalize_raise_cause(mut cause: PyObjectRef) -> Result<RaiseCause, PyErr
     // A constructor that answers something other than an exception instance
     // is wrong whatever it answered: `None` is not the `from None` spelling,
     // which never reaches this branch because `None` is not a class.
-    let invalid = pyre_object::with_roots!(result => {
+    let invalid = pyre_object::with_roots!(result, cause => {
         (!unsafe { pyre_object::is_exception(result) })
             .then(|| crate::error::exception_from_call_type_error(cause, result))
     });

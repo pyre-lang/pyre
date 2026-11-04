@@ -343,9 +343,13 @@ mod imp {
         at: PyObjectRef,
         p: *const c_void,
     ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-        if funcptr::is_funcptr_type(at) {
+        let at_slot = pyre_object::gc_roots::pin_roots(&[at]);
+        if funcptr::is_funcptr_type(pyre_object::gc_roots::shadow_stack_get(at_slot)) {
             let address = unsafe { *(p as *const usize) };
-            let inst = pyre_interpreter::call::type_call_instantiate(at, &[])?;
+            let inst = pyre_interpreter::call::type_call_instantiate(
+                pyre_object::gc_roots::shadow_stack_get(at_slot),
+                &[],
+            )?;
             let inst_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(inst);
             funcptr::store_funcptr_addr(
@@ -354,8 +358,8 @@ mod imp {
             )?;
             return Ok(pyre_object::gc_roots::shadow_stack_get(inst_slot));
         }
-        if let Some(tc) = cdata::type_code_of(at)
-            && !funcptr::is_simple_subclass(at)
+        if let Some(tc) = cdata::type_code_of(pyre_object::gc_roots::shadow_stack_get(at_slot))
+            && !funcptr::is_simple_subclass(pyre_object::gc_roots::shadow_stack_get(at_slot))
         {
             if tc == "O" {
                 let num = unsafe { *(p as *const usize) };
@@ -369,7 +373,6 @@ mod imp {
                 cfield::callback_arg_value(Some(&tc), p)
             }));
         }
-        let at_slot = pyre_object::gc_roots::pin_roots(&[at]);
         if let Some(size) = cdata::ctype_size_of(pyre_object::gc_roots::shadow_stack_get(at_slot)) {
             let inst = pyre_interpreter::call::type_call_instantiate(
                 pyre_object::gc_roots::shadow_stack_get(at_slot),

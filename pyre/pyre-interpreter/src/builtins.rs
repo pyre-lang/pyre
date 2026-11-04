@@ -26616,12 +26616,20 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // that are not valid UTF-8, and the OS seam must receive them verbatim.
     // The resolved path owns a bracket of its own, above this one; this one
     // stays open until the resolved path is gone.  `is_true` on `closefd`
-    // can collect, so the path/opener words are published first.
+    // can collect, and `pin_roots` is itself a safepoint, so the path, opener,
+    // and closefd words share one pin.
     let opener_present = opener_obj.is_some();
+    let closefd_present = closefd_obj.is_some();
     let opener_word = opener_obj.unwrap_or(pyre_object::PY_NULL);
+    let closefd_word = closefd_obj.unwrap_or(pyre_object::PY_NULL);
     let path_roots = pyre_object::gc_roots::push_roots();
-    let path_base = path_roots.pin_roots(&[path_obj, opener_word]);
-    if closefd_obj.map(crate::baseobjspace::is_true).transpose()? == Some(false) {
+    let path_base = path_roots.pin_roots(&[path_obj, opener_word, closefd_word]);
+    if closefd_present
+        .then(|| path_roots.get(path_base + 2))
+        .map(crate::baseobjspace::is_true)
+        .transpose()?
+        == Some(false)
+    {
         return Err(crate::PyError::value_error(
             "Cannot use closefd=False with file name",
         ));
