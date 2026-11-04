@@ -437,10 +437,6 @@ pub struct Bookkeeper {
     /// where `t` is the already-resolved class object.  Used by
     /// [`Self::getuniqueclassdef_for_struct_root`].
     struct_root_classes: RefCell<HashMap<String, HostObject>>,
-    /// Keys of [`Self::struct_root_classes`] grouped by their last `::`
-    /// segment. Filled by [`Self::insert_struct_root_class`], the only
-    /// writer of `struct_root_classes`, which is never shrunk.
-    struct_root_class_leaves: RefCell<rustc_hash::FxHashMap<String, Vec<String>>>,
     /// Class key (`canonical_struct_name`) of the interpreter's error
     /// carrier object, the `Deref::Target` of the `E` of `Result<T, E>`.
     /// The object is what the program raises, so it is minted as an
@@ -1399,7 +1395,6 @@ impl Bookkeeper {
             enum_variant_by_discriminant: RefCell::new(None),
             enum_variant_stripped_keys: RefCell::new(Vec::new()),
             struct_root_classes: RefCell::new(HashMap::new()),
-            struct_root_class_leaves: RefCell::new(rustc_hash::FxHashMap::default()),
             exception_carrier: RefCell::new(None),
             exception_carrier_handle: RefCell::new(None),
             trait_unique_impls: RefCell::new(HashMap::new()),
@@ -1611,11 +1606,11 @@ impl Bookkeeper {
             return None;
         }
         {
-            let canonical = majit_ir::descr::canonical_struct_name(named_root.as_ref());
-            if !self.projected_struct_rows.borrow().contains(&canonical) {
+            let intern_key = self.intern_class_key(named_root.as_ref());
+            if !self.projected_struct_rows.borrow().contains(&intern_key) {
                 self.pending_struct_row_projection
                     .borrow_mut()
-                    .push(named_root.to_string());
+                    .push(intern_key);
             }
         }
         let host = self.intern_class_by_qualname(named_root.as_ref());
@@ -1787,7 +1782,7 @@ impl Bookkeeper {
             .borrow()
             .as_ref()
             .map(|reg| {
-                let index = QualifiedKeys::new(&reg.fields);
+                let index = QualifiedKeys::new(&reg.fields, &reg.class_identity);
                 reg.fields
                     .keys()
                     .filter(|k| !is_bare_leaf_alias(k, &index))
@@ -3389,10 +3384,9 @@ impl Bookkeeper {
     ///
     /// `enum_root` must carry the LLBC instantiation suffix when the ADT
     /// is generic (`Option<i64>`, not `Option`). [`Self::intern_class_key`]
-    /// reattaches a `<…>` that is already on the spelling and otherwise
-    /// leaves the name ungeneric, so two instantiations interned under
-    /// the bare template share one `ClassDef` and their payloads union
-    /// (`bookkeeper.py` `getuniqueclassdef(cls)` — one class per class).
+    /// returns the declaration identity spelling; two instantiations of
+    /// the bare template stay distinct (`bookkeeper.py`
+    /// `getuniqueclassdef(cls)` — one class per class).
     pub fn intern_enum_variant_host(
         self: &Rc<Self>,
         enum_root: &str,
@@ -3624,9 +3618,9 @@ impl Bookkeeper {
             }
         }
         // Bare and qualified spellings of one struct intern to the
-        // same canonical class — project its rows once.
-        let canonical = majit_ir::descr::canonical_struct_name(n);
-        if !self.projected_struct_rows.borrow_mut().insert(canonical) {
+        // same class — project its rows once onto that interned host.
+        let intern_key = self.intern_class_key(n);
+        if !self.projected_struct_rows.borrow_mut().insert(intern_key) {
             return Ok(());
         }
         let host = self.intern_class_by_qualname(n);
@@ -3868,7 +3862,12 @@ impl Bookkeeper {
                 base_host = Some(existing.clone());
                 break;
             }
-            seen.insert(cur.clone());
+            // `seen` holds resolved intern keys (`Bookkeeper.getdesc`).
+            // Insert before descending; a self-header or reference cycle
+            // re-resolves to a key already here and ends the walk.
+            if !seen.insert(cur.clone()) {
+                break;
+            }
             chain.push(cur.clone());
             let next = self.struct_fields.borrow().as_ref().and_then(|reg| {
                 // Constructor, crate-included, and crate-relative spellings
@@ -4065,34 +4064,43 @@ impl Bookkeeper {
                     .trim_start_matches("*const ")
                     .trim();
                 let parent = majit_ir::descr::strip_generic_args(parent);
-                if seen.contains(parent.as_ref()) {
-                    return None;
-                }
-                if reg.fields.contains_key(parent.as_ref()) {
+                if registry_declares_spelling(reg, parent.as_ref()) {
                     return Some(parent.into_owned());
                 }
                 let leaf = parent.rsplit("::").next().unwrap_or(parent.as_ref());
-                if let Some(key) = unique_registered_intern_key(reg, parent.as_ref()) {
-                    return Some(key.to_string());
+                if registry_declares_spelling(reg, leaf) {
+                    return Some(leaf.to_string());
                 }
-                if !reg.fields.contains_key(leaf) {
-                    return None;
-                }
-                unique_registered_intern_key(reg, leaf).map(str::to_string)
+                None
             });
             match next {
-                Some(n) => cur = self.intern_class_key(&n),
+                Some(n) => {
+                    cur = self.intern_class_key(&n);
+                    if seen.contains(&cur) {
+                        break;
+                    }
+                }
                 None => break,
             }
         }
         // Mint base-most first so each class links its base's Arc.
+        // Cache on the intern key; ClassDef.name of the requested root is
+        // the spelling that interned it (`getuniqueclassdef` of an Input
+        // `class_root` "PyObject" keeps that name when the intern key is
+        // the dual-published qualified alias).
+        let requested = normalize_class_qualname(name);
         for node in chain.iter().rev() {
             let key = node.clone();
+            let class_name = if chain.first().map(String::as_str) == Some(node.as_str()) {
+                requested.clone()
+            } else {
+                key.clone()
+            };
             let bases = match &base_host {
                 Some(base) => vec![base.clone()],
                 None => self.default_class_bases(&key),
             };
-            let host = crate::flowspace::model::HostObject::new_class(key.clone(), bases);
+            let host = crate::flowspace::model::HostObject::new_class(class_name, bases);
             crate::virtualizable_decl::stamp_host_virtualizable(&host, &key);
             self.stamp_raw_alloc_flavor(&host, &key);
             self.stamp_immutable_fields(&host, &key);
@@ -4985,11 +4993,11 @@ impl Bookkeeper {
         // pending drain projects its rows before any subject flow can
         // read the class's untyped FORCE shells.
         {
-            let canonical = majit_ir::descr::canonical_struct_name(named_root.as_ref());
-            if !self.projected_struct_rows.borrow().contains(&canonical) {
+            let intern_key = self.intern_class_key(named_root.as_ref());
+            if !self.projected_struct_rows.borrow().contains(&intern_key) {
                 self.pending_struct_row_projection
                     .borrow_mut()
-                    .push(named_root.to_string());
+                    .push(intern_key);
             }
         }
         let host = self.intern_class_by_qualname(named_root.as_ref());
@@ -6079,17 +6087,24 @@ struct QualifiedKeys<'a> {
     by_id: Vec<(majit_ir::descr::StructId, &'a str)>,
     /// `(last path segment, key, has struct id)` for every qualified key, sorted.
     by_leaf: Vec<(&'a str, &'a str, bool)>,
+    /// Registry declaration ids (`class_identity`), including bare leaves.
+    identity: &'a HashMap<String, Option<crate::front::semantic::ClassIdentity>>,
 }
 
 impl<'a> QualifiedKeys<'a> {
-    fn new(fields: &'a HashMap<String, Vec<crate::front::semantic::FieldRow>>) -> Self {
+    fn new(
+        fields: &'a HashMap<String, Vec<crate::front::semantic::FieldRow>>,
+        class_identity: &'a HashMap<String, Option<crate::front::semantic::ClassIdentity>>,
+    ) -> Self {
         let mut by_id = Vec::new();
         let mut by_leaf = Vec::new();
         for key in fields.keys() {
             if !key.contains("::") {
                 continue;
             }
-            let id = majit_ir::descr::struct_id_for_name(key);
+            let id = class_identity
+                .get(key)
+                .and_then(|slot| slot.as_ref().map(|ci| ci.id));
             if let Some(id) = id {
                 by_id.push((id, key.as_str()));
             }
@@ -6098,7 +6113,11 @@ impl<'a> QualifiedKeys<'a> {
         }
         by_id.sort_unstable();
         by_leaf.sort_unstable();
-        Self { by_id, by_leaf }
+        Self {
+            by_id,
+            by_leaf,
+            identity: class_identity,
+        }
     }
 }
 
@@ -6106,7 +6125,10 @@ fn is_bare_leaf_alias(key: &str, index: &QualifiedKeys<'_>) -> bool {
     if key.contains("::") || key.contains('<') {
         return false;
     }
-    let id_k = majit_ir::descr::struct_id_for_name(key);
+    let id_k = index
+        .identity
+        .get(key)
+        .and_then(|slot| slot.as_ref().map(|ci| ci.id));
     let leaf_start = index.by_leaf.partition_point(|&(leaf, _, _)| leaf < key);
     let leaf_end = index.by_leaf.partition_point(|&(leaf, _, _)| leaf <= key);
     let leaf_eq = &index.by_leaf[leaf_start..leaf_end];
@@ -6149,209 +6171,126 @@ pub(crate) fn normalize_class_qualname(name: &str) -> String {
 
 impl Bookkeeper {
     /// Read view of the struct-root class cache. Writers go through
-    /// [`Self::insert_struct_root_class`], which keeps
-    /// `struct_root_class_leaves` in sync.
+    /// [`Self::insert_struct_root_class`].
     pub fn struct_root_classes(&self) -> std::cell::Ref<'_, HashMap<String, HostObject>> {
         self.struct_root_classes.borrow()
     }
 
-    /// Insert into [`Self::struct_root_classes`], indexing a new key by its
-    /// last `::` segment.
+    /// Insert into [`Self::struct_root_classes`].
     fn insert_struct_root_class(&self, key: String, host: HostObject) {
-        let mut classes = self.struct_root_classes.borrow_mut();
-        if !classes.contains_key(&key) {
-            let leaf = key.rsplit("::").next().unwrap_or(key.as_str()).to_string();
-            self.struct_root_class_leaves
-                .borrow_mut()
-                .entry(leaf)
-                .or_default()
-                .push(key.clone());
-        }
-        classes.insert(key, host);
+        self.struct_root_classes.borrow_mut().insert(key, host);
     }
 
     /// Intern cache key for a host class spelling.
     ///
     /// RPython `Bookkeeper.getdesc` keys `descs` on `Constant(pyobj)` —
     /// the live class object — and `getuniqueclassdef` is `getdesc` then
-    /// `ClassDesc.getuniqueclassdef`. A name is never identity. Pyre has a
-    /// string; this bookkeeper's `StructFieldRegistry` /
-    /// `struct_root_classes` is the per-annotator analog of resolving a
-    /// spelling to that object. `STRUCT_ID_BY_NAME` is an `lltype.Struct`
-    /// identity analog, not a class-identity source.
+    /// `ClassDesc.getuniqueclassdef`. A name is never identity. Already-
+    /// interned classes are found by the key this returns; they are not
+    /// consulted as identity. `STRUCT_ID_BY_NAME` is an `lltype.Struct`
+    /// analog and is not read here.
     fn intern_class_key(&self, name: &str) -> String {
         let lookup = normalize_class_qualname(name);
         if lookup.is_empty() {
             return lookup;
         }
-        {
-            let classes = self.struct_root_classes.borrow();
-            let leaves = self.struct_root_class_leaves.borrow();
-            let bucket = |owner: &str| {
-                let leaf = owner.rsplit("::").next().unwrap_or(owner);
-                leaves.get(leaf).into_iter().flatten()
-            };
-            if classes.contains_key(&lookup) {
-                return lookup;
-            }
-            // Promote to an already-interned *longer* spelling
-            // (`PyObject` after `pyobject::PyObject`). Never collapse a
-            // registry-exact qualified key onto a shorter interned alias
-            // (`module::struct::Code::Int` must not become `Code::Int`).
-            if let Some(key) = unique_suffix_key_owned(&lookup, bucket(&lookup)) {
-                return reattach_instantiation_suffix(&key, &lookup);
-            }
-            let stripped = majit_ir::descr::strip_generic_args(&lookup);
-            if stripped.as_ref() != lookup.as_str() {
-                if classes.contains_key(stripped.as_ref()) {
-                    return reattach_instantiation_suffix(stripped.as_ref(), &lookup);
-                }
-                if let Some(key) =
-                    unique_suffix_key_owned(stripped.as_ref(), bucket(stripped.as_ref()))
-                {
-                    return reattach_instantiation_suffix(&key, &lookup);
-                }
-            }
-        }
-        if let Some(reg) = self.struct_fields.borrow().clone()
-            && let Some(key) = intern_key_from_registry(&reg, &lookup)
+        let Some(reg) = self.struct_fields.borrow().clone() else {
+            return lookup;
+        };
+        intern_class_key_from_registry(&reg, &lookup, true)
+    }
+}
+
+fn intern_class_key_from_registry(
+    reg: &crate::front::StructFieldRegistry,
+    lookup: &str,
+    allow_crate_strip: bool,
+) -> String {
+    if let Some(Some(ci)) = reg.class_identity.get(lookup) {
+        return ci.spelling.clone();
+    }
+    if reg.fields.get_key_value(lookup).is_some() {
+        // A qualified exact key is identity (`m::T` vs `outer::m::T`).
+        // A bare leaf may be harvest's dual-published alias of one
+        // qualified declaration (`is_bare_leaf_alias`); intern as that
+        // declaration so `[PyObject]` and `pyobject::PyObject` share a
+        // class (`Bookkeeper.getdesc`).
+        if !lookup.contains("::")
+            && let Some(key) = unique_path_suffix_identity(reg, lookup)
         {
             return key;
         }
-        lookup
+        return lookup.to_string();
     }
+    if let Some(key) = unique_path_suffix_identity(reg, lookup) {
+        return key;
+    }
+    if allow_crate_strip
+        && let Some(rest) = strip_registry_crate_prefix(reg, lookup)
+        && rest != lookup
+    {
+        return intern_class_key_from_registry(reg, rest, false);
+    }
+    lookup.to_string()
 }
 
-fn intern_key_from_registry(
+fn unique_path_suffix_identity(
     reg: &crate::front::StructFieldRegistry,
     lookup: &str,
 ) -> Option<String> {
-    // Crate-included spelling whose crate-stripped remainder is itself a
-    // registry key (`pyre_object::pyobject::PyObject` →
-    // `pyobject::PyObject`, `core::ops::range::RangeInclusive<char>` →
-    // `ops::range::RangeInclusive<char>`). A longer path whose remainder
-    // is not a key (`module::struct::Code::Int`) stays as given —
-    // collapsing it onto `Code::Int` is the intern-alias refusal in
-    // `accept_intern_suffix_match`. Instantiation suffixes are stripped
-    // only for the key probe; `reattach_instantiation_suffix` puts them
-    // back so `RangeInclusive<char>` does not share a ClassDef with
-    // unspecialized `RangeInclusive`.
-    if let Some((_, rest)) = lookup.split_once("::")
-        && rest.contains("::")
-    {
-        let rest_stripped = majit_ir::descr::strip_generic_args(rest);
-        if reg.fields.contains_key(rest) || reg.fields.contains_key(rest_stripped.as_ref()) {
-            return intern_key_from_registry(reg, rest)
-                .map(|k| reattach_instantiation_suffix(&k, lookup));
+    let suffix = format!("::{lookup}");
+    let leaf = lookup.rsplit("::").next().unwrap_or(lookup);
+    // A key ending in `::{lookup}` shares `lookup`'s last `::` segment.
+    reg.with_keys_by_last_segment(leaf, |keys| {
+        let mut distinct: HashSet<String> = HashSet::new();
+        let mut only: Option<String> = None;
+        for key in keys {
+            if !key.ends_with(&suffix) {
+                continue;
+            }
+            let mapped = match reg.class_identity.get(key) {
+                Some(Some(ci)) => ci.spelling.clone(),
+                _ => key.clone(),
+            };
+            if distinct.insert(mapped.clone()) {
+                if only.is_some() {
+                    return None;
+                }
+                only = Some(mapped);
+            }
         }
-    }
-    // Bare leaf: the dual-publish convenience alias (`PyType` beside
-    // `pyobject::PyType`) is a lookup spelling, not a second class
-    // (`bookkeeper.py` `getuniqueclassdef` keys on the class object).
-    // Exact-match of that alias first-minted a sibling ClassDef and
-    // `ClassDef::commonbase` then declined `PyType ∪ pyobject::PyType`.
-    if !lookup.contains("::")
-        && let Some(key) = unique_registered_intern_key(reg, lookup)
-    {
-        return Some(reattach_instantiation_suffix(key, lookup));
-    }
-    if let Some((k, _)) = reg.fields.get_key_value(lookup) {
-        return Some(k.clone());
-    }
-    if let Some(key) = unique_registered_intern_key(reg, lookup) {
-        return Some(reattach_instantiation_suffix(key, lookup));
-    }
-    let stripped = majit_ir::descr::strip_generic_args(lookup);
-    if stripped.as_ref() != lookup {
-        if let Some((k, _)) = reg.fields.get_key_value(stripped.as_ref()) {
-            return Some(reattach_instantiation_suffix(k, lookup));
-        }
-        if let Some(key) = unique_registered_intern_key(reg, stripped.as_ref()) {
-            return Some(reattach_instantiation_suffix(key, lookup));
-        }
-    }
-    let (_, rest) = lookup.split_once("::")?;
-    if !rest.contains("::") {
+        only.filter(|_| distinct.len() == 1)
+    })
+}
+
+/// Crate roots this registry lists: `foreign_body_roots` plus the local
+/// crate prefixes the header walk already strips (`pyre_interpreter` /
+/// `pyre_object` / `pyre_module` / `pyre_jit`). A module segment of a
+/// crate-relative key (`option` in `option::Option`) is not a crate root.
+fn strip_registry_crate_prefix<'a>(
+    reg: &'a crate::front::StructFieldRegistry,
+    lookup: &'a str,
+) -> Option<&'a str> {
+    let (root, rest) = lookup.split_once("::")?;
+    if rest.is_empty() {
         return None;
     }
-    intern_key_from_registry(reg, rest)
-}
-
-fn unique_registered_intern_key<'a>(
-    reg: &'a crate::front::StructFieldRegistry,
-    owner: &str,
-) -> Option<&'a str> {
-    let leaf = owner.rsplit("::").next().unwrap_or(owner);
-    let key =
-        reg.with_keys_by_last_segment(leaf, |keys| unique_suffix_key_owned(owner, keys.iter()))?;
-    accept_intern_suffix_match(owner, &key)
-        .then(|| reg.fields.get_key_value(&key).map(|(k, _)| k.as_str()))
-        .flatten()
-}
-
-/// The unique key other than `owner` that has `owner` as a `::` path
-/// suffix. Callers pass the keys sharing `owner`'s last `::` segment;
-/// a path-suffix match always has that segment.
-fn unique_suffix_key_owned(
-    owner: &str,
-    keys: impl Iterator<Item = impl AsRef<str>>,
-) -> Option<String> {
-    let mut found: Option<String> = None;
-    for key in keys {
-        let key = key.as_ref();
-        if key == owner || !accept_intern_suffix_match(owner, key) {
-            continue;
-        }
-        match found.as_deref() {
-            None => found = Some(key.to_string()),
-            // Crate-included and crate-stripped of one struct
-            // (`pyre_object::pyobject::PyObject` / `pyobject::PyObject`)
-            // are one class object (`getuniqueclassdef(cls)`). Keep the
-            // shorter intern key. Incomparable leaves (`a::Dup` /
-            // `b::Dup`) stay distinct.
-            Some(prev) if crate::front::semantic::is_path_suffix(key, prev) => {}
-            Some(prev) if crate::front::semantic::is_path_suffix(prev, key) => {
-                found = Some(key.to_string());
-            }
-            Some(_) => return None,
-        }
+    if reg.foreign_body_roots.iter().any(|r| r == root)
+        || root == "pyre_interpreter"
+        || root == "pyre_object"
+        || root == "pyre_module"
+        || root == "pyre_jit"
+    {
+        return Some(rest);
     }
-    found
+    None
 }
 
-fn accept_intern_suffix_match(lookup: &str, key: &str) -> bool {
-    if lookup == key {
+fn registry_declares_spelling(reg: &crate::front::StructFieldRegistry, lookup: &str) -> bool {
+    if reg.fields.get_key_value(lookup).is_some() {
         return true;
     }
-    // Promote `lookup` onto a unique longer registered/interned spelling
-    // (`celldict::StrKey` → `pyre_object::celldict::StrKey`). Collapsing
-    // a longer exact registry key onto a shorter interned alias
-    // (`module::struct::Code::Int` → `Code::Int`) is refused.
-    crate::front::semantic::is_path_suffix(key, lookup)
-}
-
-fn reattach_instantiation_suffix(registered_key: &str, spelled: &str) -> String {
-    if registered_key.contains('<') || !spelled.contains('<') {
-        return registered_key.to_string();
-    }
-    let Some(start) = spelled.find('<') else {
-        return registered_key.to_string();
-    };
-    let stripped = majit_ir::descr::strip_generic_args(spelled);
-    if stripped.len() >= spelled.len() {
-        return registered_key.to_string();
-    }
-    let removed = spelled.len() - stripped.len();
-    let inst = &spelled[start..start + removed];
-    let after_generic = &spelled[start + removed..];
-    if after_generic.starts_with("::") {
-        if registered_key.ends_with(after_generic) {
-            let base = &registered_key[..registered_key.len() - after_generic.len()];
-            return format!("{base}{inst}{after_generic}");
-        }
-        return format!("{registered_key}{inst}{after_generic}");
-    }
-    format!("{registered_key}{inst}")
+    unique_path_suffix_identity(reg, lookup).is_some()
 }
 
 /// `lltype.GCREF` and the Rust pointee of `*mut GCREFOpaque`.
@@ -8706,6 +8645,192 @@ mod tests {
             .getuniqueclassdef(&from_ctor)
             .expect("constructor-side StrKey classdef");
         assert!(Rc::ptr_eq(&field_class, &ctor_class));
+    }
+
+    fn harvest_class_identity(
+        reg: &mut crate::front::StructFieldRegistry,
+        identity: &str,
+        aliases: &[&str],
+    ) {
+        let id = majit_ir::descr::StructId::from_canonical(identity);
+        for alias in aliases {
+            reg.class_identity.insert(
+                (*alias).to_string(),
+                Some(crate::front::semantic::ClassIdentity {
+                    id,
+                    spelling: identity.to_string(),
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn intern_dual_exact_spellings_of_one_declaration_share_one_host() {
+        use crate::front::StructFieldRegistry;
+
+        let short = "celldict::StrKey";
+        let long = "pyre_object::celldict::StrKey";
+        let rows = vec![("__pos_0".to_string(), "*mut Utf8Str".to_string())];
+        for order in [[short, long], [long, short]] {
+            let bk = bk();
+            let mut reg = StructFieldRegistry::default();
+            reg.fields.insert(short.to_string(), rows.clone());
+            reg.fields.insert(long.to_string(), rows.clone());
+            harvest_class_identity(&mut reg, short, &[short, long]);
+            bk.set_struct_fields(Rc::new(reg));
+
+            let first = bk.intern_class_by_qualname(order[0]);
+            let second = bk.intern_class_by_qualname(order[1]);
+            assert_eq!(
+                first, second,
+                "one HostObject for both exact spellings, order {:?}",
+                order
+            );
+            let first_cd = bk.getuniqueclassdef(&first).expect("first StrKey classdef");
+            let second_cd = bk
+                .getuniqueclassdef(&second)
+                .expect("second StrKey classdef");
+            assert!(
+                Rc::ptr_eq(&first_cd, &second_cd),
+                "one ClassDef for both exact spellings, order {:?}",
+                order
+            );
+        }
+    }
+
+    #[test]
+    fn intern_exact_shorter_declaration_stays_distinct_from_already_interned_longer() {
+        use crate::front::StructFieldRegistry;
+
+        let longer = "outer::m::T";
+        let shorter = "m::T";
+        for order in [[longer, shorter], [shorter, longer]] {
+            let bk = bk();
+            let mut reg = StructFieldRegistry::default();
+            reg.fields.insert(
+                longer.to_string(),
+                vec![("left".to_string(), "i64".to_string())],
+            );
+            reg.fields.insert(
+                shorter.to_string(),
+                vec![("right".to_string(), "u8".to_string())],
+            );
+            harvest_class_identity(&mut reg, longer, &[longer]);
+            harvest_class_identity(&mut reg, shorter, &[shorter]);
+            bk.set_struct_fields(Rc::new(reg));
+
+            let first = bk.intern_class_by_qualname(order[0]);
+            let second = bk.intern_class_by_qualname(order[1]);
+            assert_ne!(
+                first, second,
+                "distinct declarations keep distinct hosts, order {:?}",
+                order
+            );
+            let first_cd = bk.getuniqueclassdef(&first).expect("first T classdef");
+            let second_cd = bk.getuniqueclassdef(&second).expect("second T classdef");
+            assert!(
+                !Rc::ptr_eq(&first_cd, &second_cd),
+                "distinct declarations keep distinct ClassDefs, order {:?}",
+                order
+            );
+        }
+    }
+
+    #[test]
+    fn union_crate_prefixed_and_crate_relative_spellings_of_one_id() {
+        use crate::annotator::model::{SomeInstance, SomeValue};
+        use crate::front::StructFieldRegistry;
+
+        let short = "celldict::StrKey";
+        let long = "pyre_object::celldict::StrKey";
+        let rows = vec![("__pos_0".to_string(), "*mut Utf8Str".to_string())];
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(short.to_string(), rows.clone());
+        reg.fields.insert(long.to_string(), rows);
+        harvest_class_identity(&mut reg, short, &[short, long]);
+        bk.set_struct_fields(Rc::new(reg));
+
+        let short_host = bk.intern_class_by_qualname(short);
+        let long_host = bk.intern_class_by_qualname(long);
+        let short_cd = bk
+            .getuniqueclassdef(&short_host)
+            .expect("crate-relative StrKey classdef");
+        let long_cd = bk
+            .getuniqueclassdef(&long_host)
+            .expect("crate-prefixed StrKey classdef");
+        let s_short = SomeValue::Instance(SomeInstance::new(
+            Some(short_cd.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let s_long = SomeValue::Instance(SomeInstance::new(
+            Some(long_cd.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        match union(&s_short, &s_long) {
+            Ok(SomeValue::Instance(si)) => {
+                assert!(
+                    si.classdef
+                        .as_ref()
+                        .is_some_and(|c| Rc::ptr_eq(c, &short_cd) || Rc::ptr_eq(c, &long_cd)),
+                    "union of one declaration must keep that class, got {:?}",
+                    si.classdef.as_ref().map(|c| c.borrow().name.clone())
+                );
+            }
+            other => panic!(
+                "union of crate-prefixed and crate-relative spellings of one id must be Ok, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn intern_self_header_pointer_does_not_reenter_seen() {
+        use crate::front::StructFieldRegistry;
+
+        let rows = vec![("base".to_string(), "*mut T".to_string())];
+        {
+            let bk = bk();
+            let mut reg = StructFieldRegistry::default();
+            reg.fields.insert("m::T".to_string(), rows.clone());
+            harvest_class_identity(&mut reg, "m::T", &["m::T"]);
+            bk.set_struct_fields(Rc::new(reg));
+            let host = bk.intern_class_by_qualname("m::T");
+            assert_eq!(
+                bk.struct_root_classes.borrow().len(),
+                1,
+                "self-header pointer intern's one host, got {:?}",
+                bk.struct_root_classes
+                    .borrow()
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+            let again = bk.intern_class_by_qualname("m::T");
+            assert_eq!(host, again);
+        }
+        {
+            let bk = bk();
+            let mut reg = StructFieldRegistry::default();
+            reg.fields.insert("m::T".to_string(), rows.clone());
+            reg.fields.insert("T".to_string(), rows);
+            harvest_class_identity(&mut reg, "m::T", &["m::T", "T"]);
+            bk.set_struct_fields(Rc::new(reg));
+            let host = bk.intern_class_by_qualname("m::T");
+            let leaf = bk.intern_class_by_qualname("T");
+            assert_eq!(host, leaf, "dual-published leaf is the same declaration");
+            assert_eq!(
+                bk.struct_root_classes.borrow().len(),
+                1,
+                "dual-published self-header intern's one host, got {:?}",
+                bk.struct_root_classes
+                    .borrow()
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

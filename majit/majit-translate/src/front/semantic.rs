@@ -345,6 +345,21 @@ pub(crate) fn instantiation_has_scalar_layout_arg(name: &str) -> bool {
         .any(|arg| type_arg_is_scalar_layout(arg))
 }
 
+/// Declaration identity for one harvested class spelling.
+///
+/// `id` is the `StructId` of the type declaration (`lltype.Struct` analog).
+/// `spelling` is that declaration's class-identity string as harvest
+/// defines it (`class_identity_spelling` / `enum_ctor_class_identity`) —
+/// the crate-stripped `module::Type` harvest uses as the `struct_fields`
+/// key. `Bookkeeper.getdesc` keys `descs` on `Constant(pyobj)`; a name is
+/// never identity, so every alias of one declaration stores the same
+/// `spelling`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClassIdentity {
+    pub id: majit_ir::descr::StructId,
+    pub spelling: String,
+}
+
 /// RPython: struct field type info for `heaptracker.all_interiorfielddescrs`.
 /// Maps struct_name → vec of field rows.
 /// `field_element_type` is the array element type when the field is an
@@ -354,6 +369,12 @@ pub(crate) fn instantiation_has_scalar_layout_arg(name: &str) -> bool {
 pub struct StructFieldRegistry {
     /// struct_name → [FieldRow]
     pub fields: FieldRows,
+    /// Spelling → declaration identity. Filled by the same harvest loop
+    /// that fills `SemanticProgram.struct_ids` (`record_struct_id`).
+    /// `Some` is one declaration; `None` is a spelling two ids share.
+    /// Empty on a hand-built fixture that never published identities.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub class_identity: HashMap<String, Option<ClassIdentity>>,
     /// Suffix buckets for the key set of `fields`. Built on the first query
     /// that needs them and reused while the key-set fingerprint still
     /// matches. Replacing the rows of an existing key does not change the
