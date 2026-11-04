@@ -415,6 +415,15 @@ impl CodeWriter {
                     "match-real-rtyper (ACCEPT, not a decline)",
                     &graph.name,
                 );
+                // The cut is a consequence of this published annotation
+                // (`transform.py` `transform_dead_code`). The comparer
+                // above ran on the uncut GraphStore; apply only now.
+                let registry = self.dual_gate_registry(callcontrol);
+                crate::translator::rtyper::cutover::apply_tdc_cut_on_publish_accept(
+                    &registry,
+                    callcontrol.function_graphs(),
+                    path,
+                );
                 // Commit each real-rtyper Variable's `concretetype`
                 // (LowLevelType) onto its placeholder on the graph's
                 // value table.  Mirrors RPython `rtyper.py setconcretetype v.concretetype = ...`
@@ -665,7 +674,17 @@ impl CodeWriter {
         // clone. That pass leaves a family with no registered impl as a
         // `CallTarget::Indirect` marker; the clone jtransform rewrites takes
         // it as the unknown family (`indirect_call` with `graphs=None`).
-        let mut graph_owned = graph.clone();
+        // Match may have cut the GraphStore graph (`transform_dead_code`);
+        // the drain clone was taken before publish, so re-read after accept.
+        let mut graph_owned = if real_value_to_var.is_some() {
+            callcontrol
+                .function_graphs()
+                .get(path)
+                .map(|g| FunctionGraph::clone(&g))
+                .unwrap_or_else(|| graph.clone())
+        } else {
+            graph.clone()
+        };
         // The error carrier's `raise e` / `except OperationError as e`
         // edges, annotated as such, move to the runtime exception value
         // before jtransform reads them.
@@ -1306,6 +1325,9 @@ impl CodeWriter {
                 drain_count,
             );
             crate::codewriter::transform_profile::dump_transform_phase_totals();
+        }
+        if let Some(registry) = self.real_rtyper_registry.borrow().as_ref() {
+            crate::translator::rtyper::cutover::emit_graphstore_tdc_cut_summary(registry);
         }
     }
 

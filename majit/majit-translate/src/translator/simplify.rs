@@ -110,7 +110,10 @@ pub fn eliminate_empty_blocks(graph: &FunctionGraph) {
                     .collect()
             };
 
-            // upstream: `link.args = [v.replace(subst) for v in exit.args]`.
+            // upstream: `link.args = [v.replace(subst) for v in exit.args]`;
+            // `link.target = exit.target`. Same `Link` object, so the
+            // GraphStore origin stays (`transform_dead_code` still names
+            // the incoming edge).
             let new_args: Vec<Option<Hlvalue>> = {
                 let exit = exit_ref.borrow();
                 exit.args
@@ -189,22 +192,10 @@ fn rename_op(op: &SpaceOperation, mapping: &HashMap<Variable, Hlvalue>) -> Space
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
 fn rename_link_args(link: &LinkRef, mapping: &HashMap<Variable, Hlvalue>) -> LinkRef {
-    // upstream's `link.replace(mapping)` path — rebuild a fresh Link
-    // with renamed args / last_exception / last_exc_value.
-    let src = link.borrow();
-    let mut newlink = crate::flowspace::model::Link::new_mergeable(
-        src.args
-            .iter()
-            .map(|a| a.as_ref().map(|v| rename_hl(v, mapping)))
-            .collect(),
-        src.target.clone(),
-        src.exitcase.clone(),
-    );
-    newlink.prevblock = src.prevblock.clone();
-    newlink.llexitcase = src.llexitcase.clone();
-    newlink.last_exception = src.last_exception.as_ref().map(|v| rename_hl(v, mapping));
-    newlink.last_exc_value = src.last_exc_value.as_ref().map(|v| rename_hl(v, mapping));
-    newlink.into_ref()
+    // `Link.replace` (`flowspace/model.py`); copies GraphStore origin so
+    // `join_blocks` / `simplify_exceptions` / `coalesce_bool` keep the
+    // successor's lift stamp for `transform_dead_code`.
+    link.borrow().replace(mapping).into_ref()
 }
 
 /// RPython `replace_exitswitch_by_constant(block, const)`
@@ -2798,7 +2789,9 @@ pub fn remove_trivial_links(graph: &FunctionGraph) {
             // upstream: `source.exitswitch = target.exitswitch`.
             let new_switch = target_rc.borrow().exitswitch.clone();
             prev_rc.borrow_mut().exitswitch = new_switch;
-            // upstream: `source.recloseblock(*target.exits)`.
+            // upstream: `source.recloseblock(*target.exits)`. Same
+            // `LinkRef`s, so origin still names the successor's
+            // GraphStore exits (`transform_dead_code`).
             let target_exits: Vec<LinkRef> = target_rc.borrow().exits.to_vec();
             prev_rc.recloseblock(target_exits);
             let source_exits: Vec<LinkRef> = prev_rc.borrow().exits.to_vec();

@@ -4821,6 +4821,14 @@ pub struct Link {
     pub last_exception: Option<Hlvalue>,
     /// RPython `Link.last_exc_value` — sibling of `last_exception`.
     pub last_exc_value: Option<Hlvalue>,
+    /// GraphStore origin stamped at lift
+    /// (`flowspace_adapter.rs` `function_graph_to_flowspace_inner`).
+    /// `Some((block, exit_index))` names GraphStore
+    /// `blocks[block].exits[exit_index]`; `None` is a later synthesized
+    /// edge (`Link::new`). `simplify.py` `remove_trivial_links` /
+    /// `join_blocks` keep this on the moved successor exits so
+    /// `transform_dead_code` can drop that GraphStore edge.
+    pub origin: Option<(crate::model::BlockId, usize)>,
 }
 
 impl std::fmt::Debug for Link {
@@ -4876,6 +4884,7 @@ impl Link {
             prevblock: None,
             last_exception: None,
             last_exc_value: None,
+            origin: None,
         }
     }
 
@@ -4926,6 +4935,7 @@ impl Link {
         newlink.last_exception = self.last_exception.as_ref().map(&rename);
         newlink.last_exc_value = self.last_exc_value.as_ref().map(&rename);
         newlink.llexitcase = self.llexitcase.clone();
+        newlink.origin = self.origin;
         newlink
     }
 
@@ -5994,6 +6004,7 @@ pub fn copygraph_with_varmap(
             newlink.last_exception = link.last_exception.as_ref().map(|x| copyhl(x, &mut varmap));
             newlink.last_exc_value = link.last_exc_value.as_ref().map(|x| copyhl(x, &mut varmap));
             newlink.llexitcase = link.llexitcase.clone();
+            newlink.origin = link.origin;
             newlinks.push(Rc::new(RefCell::new(newlink)));
         }
         newblock.borrow_mut().closeblock(newlinks);

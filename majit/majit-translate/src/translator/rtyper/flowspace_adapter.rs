@@ -6738,10 +6738,15 @@ fn function_graph_to_flowspace_inner(
             }
         }
 
-        // Translate exits.
+        // Translate exits. One flowspace `Link` per GraphStore `Link`,
+        // in `legacy_block.exits` order. Stamp GraphStore origin
+        // `(block, i)` on each; `transform_dead_code` later drops by
+        // that origin after `remove_trivial_links` / `join_blocks`
+        // move the successor's exits up. A length mismatch here is a
+        // lift bug: stop rather than guess.
         let mut translated_exits: Vec<flowspace_model::LinkRef> =
             Vec::with_capacity(legacy_block.exits.len());
-        for legacy_link in &legacy_block.exits {
+        for (exit_index, legacy_link) in legacy_block.exits.iter().enumerate() {
             let mut link_value_map = value_map.clone();
             let last_exception = legacy_link
                 .last_exception
@@ -6829,7 +6834,18 @@ fn function_graph_to_flowspace_inner(
             // `pre-rtyper` graph shape; the rtyper overwrites it anyway.
             link.extravars(last_exception, last_exc_value);
             link.prevblock = Some(Rc::downgrade(&block_ref));
+            link.origin = Some((legacy_block.id, exit_index));
             translated_exits.push(link.into_ref());
+        }
+        if translated_exits.len() != legacy_block.exits.len() {
+            return Err(TyperError::message(format!(
+                "function_graph_to_flowspace_inner: exit lift is not 1:1 \
+                 for {} block={:?}: GraphStore exits={} flowspace exits={}",
+                legacy.name,
+                legacy_block.id,
+                legacy_block.exits.len(),
+                translated_exits.len(),
+            )));
         }
 
         // Translate exitswitch.

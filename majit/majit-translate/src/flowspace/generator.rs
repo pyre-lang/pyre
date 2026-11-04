@@ -276,12 +276,26 @@ fn split_block(block: &BlockRef, index: usize) -> Result<LinkRef, FlowContextErr
     let mut new_exits = Vec::with_capacity(exits.len());
     for link_ref in exits {
         let link = link_ref.borrow();
+        // `unsimplify.py` `split_block` renames link args with
+        // `get_new_name` but leaves `link.last_exception` /
+        // `link.last_exc_value` alone: the link defines them.
         let new_args = link
             .args
             .iter()
             .map(|arg| {
-                arg.as_ref()
-                    .map(|value| get_new_name(value, &vars_produced_in_new_block, &mut varmap))
+                let is_last_exc = match arg {
+                    Some(a) => {
+                        Some(a) == link.last_exception.as_ref()
+                            || Some(a) == link.last_exc_value.as_ref()
+                    }
+                    None => false,
+                };
+                if is_last_exc {
+                    arg.clone()
+                } else {
+                    arg.as_ref()
+                        .map(|value| get_new_name(value, &vars_produced_in_new_block, &mut varmap))
+                }
             })
             .collect();
         let mut new_link =
@@ -289,6 +303,7 @@ fn split_block(block: &BlockRef, index: usize) -> Result<LinkRef, FlowContextErr
         new_link.last_exception = link.last_exception.clone();
         new_link.last_exc_value = link.last_exc_value.clone();
         new_link.llexitcase = link.llexitcase.clone();
+        new_link.origin = link.origin;
         new_exits.push(Rc::new(RefCell::new(new_link)));
     }
 
@@ -602,6 +617,7 @@ mod tests {
     use super::*;
     use crate::flowspace::argument::Signature;
     use crate::flowspace::bytecode::HostCode;
+    use crate::flowspace::model::BlockRefExt;
 
     fn empty_globals() -> Constant {
         Constant::new(ConstValue::Dict(Default::default()))
@@ -638,6 +654,53 @@ mod tests {
         for &(name, input, want) in cases {
             assert_eq!(get_variable_names(input), want, "case {name}");
         }
+    }
+
+    /// Host: `split_at_zero_moves_all_ops_to_new_block` (`unsimplify.rs`).
+    /// `unsimplify.py` `split_block` leaves `last_exc_value` unrenamed.
+    #[test]
+    fn split_block_leaves_last_exc_value_arg_unrenamed() {
+        let a = Variable::new();
+        let r = Variable::new();
+        let last_exc = Variable::new();
+        let last_val = Variable::new();
+        let block = Block::shared(vec![Hlvalue::Variable(a.clone())]);
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "int_neg",
+            vec![Hlvalue::Variable(a.clone())],
+            Hlvalue::Variable(r.clone()),
+        ));
+        let handler = Block::shared(vec![
+            Hlvalue::Variable(last_exc.clone()),
+            Hlvalue::Variable(last_val.clone()),
+        ]);
+        let mut exc_link = Link::new(
+            vec![
+                Hlvalue::Variable(last_exc.clone()),
+                Hlvalue::Variable(last_val.clone()),
+            ],
+            Some(handler),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::builtin(
+                "Exception",
+            )))),
+        );
+        exc_link.last_exception = Some(Hlvalue::Variable(last_exc.clone()));
+        exc_link.last_exc_value = Some(Hlvalue::Variable(last_val.clone()));
+        block.closeblock(vec![exc_link.into_ref()]);
+
+        let synth = split_block(&block, 0).expect("split_block");
+        let newblock = synth.borrow().target.clone().expect("new block");
+        let exits = newblock.borrow().exits.clone();
+        assert_eq!(exits.len(), 1);
+        let link = exits[0].borrow();
+        let Some(Hlvalue::Variable(arg_val)) = link.args[1].as_ref() else {
+            panic!("last_exc_value arg");
+        };
+        assert_eq!(arg_val.id(), last_val.id());
+        let Some(Hlvalue::Variable(extra_val)) = link.last_exc_value.as_ref() else {
+            panic!("last_exc_value extra");
+        };
+        assert_eq!(extra_val.id(), last_val.id());
     }
 
     #[test]

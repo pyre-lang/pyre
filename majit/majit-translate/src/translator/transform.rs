@@ -211,6 +211,82 @@ fn dedupe_blocks(blocks: &[BlockRef]) -> Vec<BlockRef> {
     out
 }
 
+/// `transform.py` `transform_dead_code`: `if link not in self.links_followed`.
+pub(crate) fn link_not_in_links_followed(ann: &RPythonAnnotator, link: &LinkRef) -> bool {
+    !ann.links_followed.borrow().contains_key(&LinkKey::of(link))
+}
+
+/// `transform.py` `transform_dead_code` after removing one unfollowed link:
+/// `if not block.exits: cutoff_alwaysraising_block` else
+/// `elif block.canraise and block.exits[0].exitcase is not None`.
+pub(crate) fn transform_dead_code_would_cutoff(
+    canraise: bool,
+    remaining_exits: &[LinkRef],
+) -> bool {
+    if remaining_exits.is_empty() {
+        true
+    } else if canraise {
+        remaining_exits[0].borrow().exitcase.is_some()
+    } else {
+        false
+    }
+}
+
+/// Partition used by `cutoff_alwaysraising_block`: annotated ops form a
+/// prefix of length `n`, the rest are unannotated.
+fn alwaysraising_partition(block: &crate::flowspace::model::Block) -> (Vec<bool>, usize, usize) {
+    let can_succeed: Vec<bool> = block
+        .operations
+        .iter()
+        .map(|op| match &op.result {
+            Hlvalue::Variable(v) => v.annotation.borrow().is_some(),
+            Hlvalue::Constant(_) => true,
+        })
+        .collect();
+    let n = can_succeed.iter().filter(|annotated| **annotated).count();
+    (can_succeed, n, block.operations.len())
+}
+
+/// `transform.py` `cutoff_alwaysraising_block` counts: `n = len(can_succeed)`.
+pub(crate) fn cutoff_alwaysraising_op_counts(
+    block: &crate::flowspace::model::Block,
+) -> (usize, usize) {
+    let (can_succeed, n, total) = alwaysraising_partition(block);
+    assert!(
+        can_succeed[..n].iter().all(|annotated| *annotated),
+        "cutoff_alwaysraising_block: annotated operations must form a prefix"
+    );
+    assert!(
+        can_succeed[n..].iter().all(|annotated| !*annotated),
+        "cutoff_alwaysraising_block: unannotated operations must form a suffix"
+    );
+    assert!(
+        n < total,
+        "cutoff_alwaysraising_block: no failing op (n={n}, total={total})"
+    );
+    (n, total)
+}
+
+/// Result Variable of `block.operations[n]` when the partition is valid.
+/// A block that would panic in `cutoff_alwaysraising_block` yields `None`.
+pub(crate) fn cutoff_alwaysraising_result_var(
+    block: &crate::flowspace::model::Block,
+) -> Option<Variable> {
+    let (can_succeed, n, total) = alwaysraising_partition(block);
+    if n >= total {
+        return None;
+    }
+    if !can_succeed[..n].iter().all(|annotated| *annotated)
+        || !can_succeed[n..].iter().all(|annotated| !*annotated)
+    {
+        return None;
+    }
+    match &block.operations[n].result {
+        Hlvalue::Variable(v) => Some(v.clone()),
+        _ => None,
+    }
+}
+
 /// RPython `transform_dead_code(self, block_subset)` from `transform.py`.
 ///
 /// ```python
@@ -244,33 +320,16 @@ pub fn transform_dead_code(ann: &RPythonAnnotator, block_subset: &[BlockRef]) {
         // rebinds the attribute which changes subsequent comparisons).
         let exits_snapshot: Vec<LinkRef> = block.borrow().exits.to_vec();
         for link in exits_snapshot {
-            let followed = ann
-                .links_followed
-                .borrow()
-                .contains_key(&LinkKey::of(&link));
-            if followed {
+            if !link_not_in_links_followed(ann, &link) {
                 continue;
             }
             // upstream: remove this link from block.exits.
-            {
+            let (canraise, remaining) = {
                 let mut blk = block.borrow_mut();
                 blk.exits.retain(|l| !Rc::ptr_eq(l, &link));
-            }
-            let no_exits_left = block.borrow().exits.is_empty();
-            let canraise = block.borrow().canraise();
-            let first_exitcase_nontrivial = {
-                let blk = block.borrow();
-                blk.exits
-                    .first()
-                    .map(|l| l.borrow().exitcase.is_some())
-                    .unwrap_or(false)
+                (blk.canraise(), blk.exits.clone())
             };
-
-            // upstream: `if not block.exits: cutoff_alwaysraising_block(...)`.
-            if no_exits_left {
-                cutoff_alwaysraising_block(ann, block);
-            } else if canraise && first_exitcase_nontrivial {
-                // upstream: `killed the non-exceptional path!`.
+            if transform_dead_code_would_cutoff(canraise, &remaining) {
                 cutoff_alwaysraising_block(ann, block);
             }
 
@@ -378,38 +437,12 @@ pub fn cutoff_alwaysraising_block(ann: &RPythonAnnotator, block: &BlockRef) {
     // Variable variant carries `annotation`.
     let (n, total) = {
         let blk = block.borrow();
-        let can_succeed: Vec<_> = blk
-            .operations
-            .iter()
-            .map(|op| match &op.result {
-                Hlvalue::Variable(v) => v.annotation.borrow().is_some(),
-                Hlvalue::Constant(_) => true,
-            })
-            .collect();
-        let n = can_succeed.iter().filter(|annotated| **annotated).count();
-        // transform.py::cutoff_alwaysraising_block checks both partitions:
-        // successfully annotated operations must precede the failing tail.
-        assert!(
-            can_succeed[..n].iter().all(|annotated| *annotated),
-            "cutoff_alwaysraising_block: annotated operations must form a prefix"
-        );
-        assert!(
-            can_succeed[n..].iter().all(|annotated| !*annotated),
-            "cutoff_alwaysraising_block: unannotated operations must form a suffix"
-        );
-        (n, blk.operations.len())
+        cutoff_alwaysraising_op_counts(&blk)
     };
     if crate::determinism_trace_enabled() {
         let trace = cutoff_block_trace_with_counts(ann, block, n, total);
         eprintln!("[DTRACE-CUT] {trace}");
     }
-    // transform.py::cutoff_alwaysraising_block: a successful operation prefix
-    // must end at an operation that cannot succeed. Missing followed links
-    // or preseeded annotations are not an alternative successful cutoff.
-    assert!(
-        n < total,
-        "cutoff_alwaysraising_block: no failing op (n={n}, total={total})"
-    );
 
     // upstream: `del block.operations[n+1:]`.
     block.borrow_mut().operations.truncate(n + 1);

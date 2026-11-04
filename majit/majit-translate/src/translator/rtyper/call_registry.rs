@@ -432,10 +432,36 @@ pub struct TwoPhaseSubject {
         HashMap<crate::flowspace::model::Variable, crate::flowspace::model::Hlvalue>,
     /// `function_graph_to_flowspace_inner` `block_map`: GraphStore
     /// `BlockId` → flowspace `BlockRef`. 1:1, including the canonical
-    /// return/except blocks. Phase B uses it to copy
-    /// `transform_dead_code` / `cutoff_alwaysraising_block` onto the
-    /// GraphStore copy the comparer and codewriter read.
+    /// return/except blocks. Phase B records the `transform_dead_code`
+    /// cut from this map's origins; GraphStore is cut only when
+    /// `dual_gate_publish_concretetypes` accepts the real annotation.
     pub block_map: HashMap<crate::model::BlockId, crate::flowspace::model::BlockRef>,
+}
+
+/// GraphStore view of `transform.py` `transform_dead_code` +
+/// `cutoff_alwaysraising_block`, recorded from flowspace `Link.origin`
+/// before `annotator.simplify` mutates the graph.
+#[derive(Clone)]
+pub struct GraphStoreTdcCut {
+    /// GraphStore `(block, exit_index)` to drop: origins of unfollowed
+    /// flowspace links whose GraphStore source `canraise()`, minus
+    /// origins that a followed copy still carries (`Link.copy` keeps
+    /// `origin`; `transform_dead_code` removes only the unfollowed
+    /// link objects). Several in one block: apply highest index first.
+    pub drop_exits: Vec<(crate::model::BlockId, usize)>,
+    /// Remaining followed origins of the same flowspace block after
+    /// `transform_dead_code` removed unfollowed links. Empty remaining
+    /// means `cutoff_alwaysraising_block` `recloseblock(errlink)` only.
+    pub keep_exits: Vec<(crate::model::BlockId, usize)>,
+    pub cutoff: bool,
+    pub cutoff_result: Option<crate::flowspace::model::Variable>,
+}
+
+/// Per-GraphStore-graph TDC plan, keyed on `GraphStore` identity.
+#[derive(Clone)]
+pub struct SubjectTdcPlan {
+    pub cuts: Vec<GraphStoreTdcCut>,
+    pub value_to_var: crate::translator::rtyper::flowspace_adapter::LegacyToTyped,
 }
 
 /// Whole-program two-phase type cache, keyed by subject [`CallPath`].
@@ -456,6 +482,16 @@ pub struct TwoPhaseTypeCache {
     /// Set once the prepass has run so publish consults the cache instead of
     /// re-running the real path. Cleared/absent ⟹ legacy per-graph behaviour.
     pub prepass_done: bool,
+    /// `transform_dead_code` plans recorded before `annotator.simplify`.
+    /// Applied to the GraphStore graph only when publish accepts.
+    pub tdc_plans: HashMap<crate::model::GraphKey, SubjectTdcPlan>,
+    /// GraphStore keys whose recorded TDC plan was applied on publish Match.
+    pub tdc_cut_applied: HashSet<crate::model::GraphKey>,
+    pub tdc_cut_links_removed: usize,
+    /// Graphs whose cutoff plan had an unmapped `value_to_var` op (or
+    /// missing `cutoff_result`). A partial cut is withheld
+    /// (`cutoff_alwaysraising_block` asserts its invariants).
+    pub tdc_cut_unresolved: usize,
 }
 
 /// Per-program registry. Constructed once per `analyze_program` /

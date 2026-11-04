@@ -97,6 +97,8 @@ pub fn insert_empty_block(link: &LinkRef, newops: Vec<SpaceOperation>) -> BlockR
         let mut nb = newblock.borrow_mut();
         nb.operations.extend(newops);
     }
+    // New outgoing edge (`Link::new`); GraphStore origin is None. The
+    // incoming `link` is retargeted in place and keeps its lift stamp.
     let exit = Link::new_mergeable(link_args.clone(), Some(target), None).into_ref();
     newblock.closeblock(vec![exit]);
     newblock.borrow_mut().renamevariables(&mapping);
