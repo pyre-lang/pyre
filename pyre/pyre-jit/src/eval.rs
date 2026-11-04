@@ -1175,6 +1175,9 @@ unsafe fn module_user_object_custom_trace(
 ///   * `mstrategy` → `DictStrategyRef`, whose traced `owner` points to
 ///     `ModuleDictStrategy.caches` while the module strategy is active
 ///
+/// `mutate_mstrategy` is a host `QuasiImmutField` (`quasiimmut.py
+/// QuasiImmut` is never a GC object), so this walk does not mention it.
+///
 /// After `switch_to_object_strategy`, the same `dstorage` field holds
 /// ObjectDictStorage and `mstrategy` points to the process-wide object holder,
 /// exactly like PyPy's `set_strategy` plus `dstorage` replacement.
@@ -1245,6 +1248,27 @@ unsafe fn module_dict_object_custom_trace(
     unsafe {
         pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(obj, &mut forward);
     }
+}
+
+/// Reclaim `W_ModuleDictObject.mstrategy?`'s hidden watcher on sweep.
+///
+/// `pyre_object::quasiimmut::QuasiImmutField` holds a host `QuasiImmut`
+/// and an out-of-line lock (`quasiimmut.py QuasiImmut` is not a GC object),
+/// so the custom trace does not walk it. A collector reclaiming the payload
+/// runs no Rust drop glue; without this a dict compiled against and never
+/// promoted still strands the instance. `QuasiImmutField::reclaim` drops
+/// exactly one strong count, so an in-flight compile holding its own clone
+/// keeps the instance alive.
+///
+/// # Safety
+///
+/// `obj_addr` must be a live `W_ModuleDictObject` payload the collector is
+/// sweeping, and the collector must call this exactly once. The destructor
+/// must not free `dstorage` / `mstrategy` storage boxes — those have their
+/// own tid drop glue (`storage_box_destructor`).
+unsafe fn module_dict_object_destructor(obj_addr: usize) {
+    let md = obj_addr as *const pyre_object::dictmultiobject::W_ModuleDictObject;
+    unsafe { (*md).mutate_mstrategy().reclaim() };
 }
 
 unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
@@ -3206,16 +3230,19 @@ fn build_gc() -> Box<MiniMarkGC> {
     // ModuleDictStrategy while that strategy is active. Register a custom
     // trace hook so the GC walks this indirect ownership chain — matching
     // the W_DictObject pattern.
-    // No `.with_destructor_fn`: all per-module storages are GC-managed storage
-    // boxes (off-GC storage) whose own tid drop glue
-    // (`storage_box_destructor`) is the sole reclaimer. A sweep-time module-dict
-    // destructor would race those boxes on the destructor list and double-free —
-    // exactly the regular-dict case above.
-    let w_module_dict_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
-        std::mem::size_of::<pyre_object::dictmultiobject::W_ModuleDictObject>(),
-        object_tid,
-        module_dict_object_custom_trace,
-    ));
+    // Storage boxes (`dstorage` / the per-module `mstrategy` holder) keep
+    // their own tid drop glue (`storage_box_destructor`). The destructor
+    // here reclaims only the host `mutate_mstrategy` watcher
+    // (`dictmultiobject.py W_ModuleDictObject._immutable_fields_ =
+    // ['mstrategy?']`); it must not free those boxes.
+    let w_module_dict_tid = gc.register_type(
+        TypeInfo::object_subclass_with_custom_trace(
+            std::mem::size_of::<pyre_object::dictmultiobject::W_ModuleDictObject>(),
+            object_tid,
+            module_dict_object_custom_trace,
+        )
+        .with_destructor_fn(module_dict_object_destructor),
+    );
     debug_assert_eq!(w_module_dict_tid, W_MODULE_DICT_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,

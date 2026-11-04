@@ -2625,6 +2625,115 @@ static W_DICT_STRATEGY_WORD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
     )
 });
 
+/// `dictmultiobject.py W_ModuleDictObject` field descrs. `descr.py get_field_descr`
+/// gives every field its `index`, publishes it in `_cache_field[STRUCT][fieldname]`,
+/// and attaches the parent `SizeDescr` (`get_size_descr`); `optimizer.py
+/// ensure_ptr_info_arg0` reads that parent.
+///
+/// One group, the shape `W_DICT_DESCR_GROUP` uses
+/// (`build_object_descr_group_with_def_path`). The cache_key is
+/// `path_hash("dictmultiobject::W_ModuleDictObject")`, the crate-stripped
+/// STRUCT spelling `DECLARED_GROUPS` and the analyzer's EffectInfo use
+/// (`front/mir.rs strip_crate_prefix`, `definition_path_type_id`).
+///
+/// `mstrategy` is `dictmultiobject.py W_ModuleDictObject._immutable_fields_
+/// = ['mstrategy?']`: `jtransform.py rewrite_op_getfield` emits
+/// `record_quasiimmut_field` on this field. Both flags match
+/// `ModuleDictStrategy.version` (`descr.py` `!= False`). The payload prefix
+/// (`dstorage` / `mstrategy` / `keys_version` / `clear_gen`) stays
+/// offset-identical to `W_DictObject`.
+///
+/// `mutate_mstrategy` is the hidden OBJECTPTR `rclass.py InstanceRepr._setup_repr`
+/// adds (`quasiimmut.py get_mutate_field_name`). `mutate_mstrategy_lock` is the
+/// second word `FUNCTION_DESCR_GROUP` declares for each `mutate_<name>`.
+static W_MODULE_DICT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_object::dictmultiobject::W_ModuleDictObject;
+    let mutate_offset = core::mem::offset_of!(W_ModuleDictObject, mutate_mstrategy);
+    let mutate_lock_offset = core::mem::offset_of!(W_ModuleDictObject, mutate_mstrategy_lock);
+    build_object_descr_group_with_def_path(
+        pyre_object::dictmultiobject::W_MODULE_DICT_OBJECT_SIZE,
+        W_MODULE_DICT_GC_TYPE_ID,
+        &pyre_object::dictmultiobject::MODULE_DICT_TYPE as *const _ as usize,
+        &[
+            (
+                "dstorage",
+                std::mem::offset_of!(pyre_object::dictmultiobject::W_ModuleDictObject, dstorage),
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "mstrategy",
+                std::mem::offset_of!(pyre_object::dictmultiobject::W_ModuleDictObject, mstrategy),
+                WORD,
+                Type::Ref,
+                false,
+                true,
+                true,
+            ),
+            (
+                "keys_version",
+                std::mem::offset_of!(
+                    pyre_object::dictmultiobject::W_ModuleDictObject,
+                    keys_version
+                ),
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "clear_gen",
+                std::mem::offset_of!(pyre_object::dictmultiobject::W_ModuleDictObject, clear_gen),
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "mutate_mstrategy",
+                mutate_offset,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "mutate_mstrategy_lock",
+                mutate_lock_offset,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
+        "W_ModuleDictObject",
+        "dictmultiobject::W_ModuleDictObject",
+    )
+});
+
+fn module_dict_object_field_descr(field_key: &str) -> DescrRef {
+    field_descr_from_group_named(&*W_MODULE_DICT_DESCR_GROUP, field_key)
+}
+
+/// `dictmultiobject.py W_ModuleDictObject.mstrategy` — quasi-immutable
+/// (`_immutable_fields_ = ['mstrategy?']`).
+pub fn module_dict_object_mstrategy_descr() -> DescrRef {
+    module_dict_object_field_descr("mstrategy")
+}
+
+/// Hidden `mutate_mstrategy` (`quasiimmut.py get_mutate_field_name` of
+/// `mstrategy?`).
+pub fn module_dict_object_mutate_mstrategy_descr() -> DescrRef {
+    module_dict_object_field_descr("mutate_mstrategy")
+}
+
 /// `W_DictViewObject` — `w_dict` back-pointer plus the Keys/Values/Items
 /// kind tag.  Three Python-visible types share this layout
 /// (`DICT_KEYS_TYPE` / `DICT_VALUES_TYPE` / `DICT_ITEMS_TYPE`); the size
@@ -5300,6 +5409,134 @@ pub fn is_module_dict_version_field(descr: &DescrRef) -> bool {
     };
     let module_parent = MODULE_DICT_STRATEGY_DESCR_GROUP.size_descr.clone() as DescrRef;
     std::sync::Arc::ptr_eq(&parent, &module_parent)
+}
+
+/// `DictStrategyRef` field descrs. `descr.py get_field_descr` gives every
+/// field its `index`, publishes it in `_cache_field[STRUCT][fieldname]`,
+/// and attaches the parent `SizeDescr` (`get_size_descr`); `optimizer.py
+/// ensure_ptr_info_arg0` reads that parent.
+///
+/// One group, the shape `MODULE_DICT_STRATEGY_DESCR_GROUP` uses
+/// (`make_simple_descr_group_keyed_with_headerless`). The cache_key is
+/// `path_hash("dictmultiobject::DictStrategyRef")`, the crate-stripped
+/// STRUCT spelling `DECLARED_GROUPS` and the analyzer's EffectInfo use
+/// (`front/mir.rs strip_crate_prefix`, `definition_path_type_id`).
+///
+/// `gc_alloc_storage_box` lays `[GcHeader | T]` and
+/// `register_leaf_storage_box` tags it with `dict_strategy_ref_gc_type_id`.
+/// `gc.py init_size_descr` stamps that same tid on the STRUCT SizeDescr, so
+/// `PtrInfo::Struct::make_guards` `GUARD_GC_TYPE` matches the live header.
+/// `is_gc_managed` matches that box. `headerless` is false once the tid is
+/// published (`build_gc`); a still-zero tid cannot name the header, so
+/// `GUARD_GC_TYPE` must not fire against type_id 0.
+///
+/// `kind` is the stored `StrategyKind` discriminant (`strategy_is` reads it
+/// as a getfield). `imp` is `&'static dyn DictStrategy`
+/// (`two_word_fat_struct`); its data word and vtable word are `imp` /
+/// `imp.vtable` (`VecFieldPart::FatVtable`). `owner` is the GC owner of a
+/// per-dict strategy instance. None of the fields is `_immutable_fields_`.
+static DICT_STRATEGY_REF_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
+    LazyLock::new(|| {
+        use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
+        use pyre_object::dictmultiobject::{DictStrategyRef, StrategyKind};
+        let kind_offset = core::mem::offset_of!(DictStrategyRef, kind);
+        let imp_offset = core::mem::offset_of!(DictStrategyRef, imp);
+        let owner_offset = core::mem::offset_of!(DictStrategyRef, owner);
+        let field = |index,
+                     field_key: &str,
+                     offset,
+                     field_size,
+                     field_type,
+                     is_immutable,
+                     is_quasi_immutable,
+                     flag,
+                     index_in_parent| {
+            SimpleFieldDescrSpec {
+                index,
+                field_key: field_key.to_string(),
+                name: format!("DictStrategyRef.{field_key}"),
+                offset,
+                field_size,
+                field_type,
+                is_immutable,
+                is_quasi_immutable,
+                flag,
+                virtualizable: false,
+                index_in_parent,
+                is_class_word: Some(false),
+                load_is_acquire: false,
+                store_is_release: false,
+            }
+        };
+        let specs = [
+            field(
+                u32::MAX,
+                "kind",
+                kind_offset,
+                core::mem::size_of::<StrategyKind>(),
+                Type::Int,
+                false,
+                false,
+                ArrayFlag::Signed,
+                0,
+            ),
+            field(
+                u32::MAX,
+                "imp",
+                imp_offset,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                ArrayFlag::Pointer,
+                1,
+            ),
+            field(
+                u32::MAX,
+                "imp.vtable",
+                imp_offset + WORD,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                ArrayFlag::Pointer,
+                2,
+            ),
+            field(
+                u32::MAX,
+                "owner",
+                owner_offset,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                ArrayFlag::Pointer,
+                3,
+            ),
+        ];
+        let cache_key = majit_ir::descr::path_hash("dictmultiobject::DictStrategyRef");
+        let type_id = pyre_object::dictmultiobject::dict_strategy_ref_gc_type_id();
+        let headerless = type_id == 0;
+        majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+            u32::MAX,
+            core::mem::size_of::<DictStrategyRef>(),
+            type_id,
+            cache_key,
+            0,
+            true,
+            headerless,
+            &specs,
+            &[],
+        )
+    });
+
+fn dict_strategy_ref_field_descr(field_key: &str) -> DescrRef {
+    DICT_STRATEGY_REF_DESCR_GROUP
+        .field_descrs
+        .iter()
+        .find(|descr| descr.field_key() == field_key)
+        .unwrap_or_else(|| panic!("DictStrategyRef.{field_key}"))
+        .clone() as DescrRef
 }
 
 /// Headerless SizeDescr group for one mapdict `?` field plus its hidden
@@ -8075,10 +8312,12 @@ pub fn unicode_index_storage_descr() -> DescrRef {
 static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     use pyre_interpreter::pycode::PyCode;
     // `is_immutable` follows `pycode.py PyCode._immutable_fields_` per field
-    // plus `code_ptr` (`jit_immutable_fields`). `co_name` / `co_qualname` are
-    // listed upstream but these slots are realized lazily, so they stay
-    // mutable. `w_filename` is realized in `PyCode.__init__` and listed
-    // immutable. `w_globals?` is filled on first execution and then promoted.
+    // plus `code_ptr` (`jit_immutable_fields`). `co_names_w[*]` is the interned
+    // name table; the field descr is immutable and the `[*]` item-pure flag
+    // lives on `jit_immutable_fields`. `co_name` / `co_qualname` are listed
+    // upstream but these slots are realized lazily, so they stay mutable.
+    // `w_filename` is realized in `PyCode.__init__` and listed immutable.
+    // `w_globals?` is filled on first execution and then promoted.
     let word_int = |key, offset, immutable| (key, offset, WORD, Type::Int, false, immutable, false);
     let word_ref =
         |key, offset, immutable, quasi| (key, offset, WORD, Type::Ref, false, immutable, quasi);
@@ -14023,6 +14262,79 @@ mod tests {
     }
 
     #[test]
+    fn dict_strategy_ref_field_descrs_share_stamped_parent() {
+        use pyre_object::dictmultiobject::{DictStrategyRef, StrategyKind};
+        let kind = dict_strategy_ref_field_descr("kind");
+        let owner = dict_strategy_ref_field_descr("owner");
+        let kind_field = kind.as_field_descr().expect("kind field descr");
+        let owner_field = owner.as_field_descr().expect("owner field descr");
+        let kind_parent = kind_field
+            .get_parent_descr()
+            .expect("kind parent SizeDescr");
+        let owner_parent = owner_field
+            .get_parent_descr()
+            .expect("owner parent SizeDescr");
+        assert!(
+            std::sync::Arc::ptr_eq(&kind_parent, &owner_parent),
+            "kind and owner share the DictStrategyRef SizeDescr",
+        );
+        let size = kind_parent.as_size_descr().expect("SizeDescr");
+        assert_eq!(size.size(), core::mem::size_of::<DictStrategyRef>());
+        // `gc.py init_size_descr` stamps the leaf-box tid
+        // `register_leaf_storage_box` assigned. Unit tests force the group
+        // with no collector, so both sides stay 0; a product `build_gc`
+        // publishes the live tid first.
+        assert_eq!(
+            size.type_id(),
+            pyre_object::dictmultiobject::dict_strategy_ref_gc_type_id(),
+        );
+        assert_eq!(size.headerless(), size.type_id() == 0);
+        assert_eq!(kind_field.field_key(), "kind");
+        assert_eq!(
+            kind_field.offset(),
+            core::mem::offset_of!(DictStrategyRef, kind),
+        );
+        assert_eq!(
+            kind_field.field_size(),
+            core::mem::size_of::<StrategyKind>()
+        );
+        assert_eq!(kind_field.field_type(), Type::Int);
+        assert!(!kind.is_always_pure());
+        assert!(!kind.is_quasi_immutable());
+        assert_eq!(owner_field.field_key(), "owner");
+        assert_eq!(
+            owner_field.offset(),
+            core::mem::offset_of!(DictStrategyRef, owner),
+        );
+        assert_eq!(owner_field.field_size(), WORD);
+        assert_eq!(owner_field.field_type(), Type::Ref);
+        assert!(!owner.is_always_pure());
+        assert!(!owner.is_quasi_immutable());
+        let imp = dict_strategy_ref_field_descr("imp");
+        let vtable = dict_strategy_ref_field_descr("imp.vtable");
+        let imp_field = imp.as_field_descr().expect("imp field descr");
+        let vtable_field = vtable.as_field_descr().expect("imp.vtable field descr");
+        assert_eq!(
+            imp_field.offset(),
+            core::mem::offset_of!(DictStrategyRef, imp),
+        );
+        assert_eq!(vtable_field.offset(), imp_field.offset() + WORD);
+        assert_eq!(imp_field.field_size(), WORD);
+        assert_eq!(vtable_field.field_size(), WORD);
+        assert_eq!(imp_field.field_type(), Type::Ref);
+        assert_eq!(vtable_field.field_type(), Type::Ref);
+        let group_parent = DICT_STRATEGY_REF_DESCR_GROUP.size_descr.clone() as DescrRef;
+        assert!(std::sync::Arc::ptr_eq(&kind_parent, &group_parent));
+        for (i, descr) in DICT_STRATEGY_REF_DESCR_GROUP
+            .field_descrs
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(descr.index_in_parent(), i, "{}", descr.field_key());
+        }
+    }
+
+    #[test]
     fn make_descr_from_bh_bridges_module_dict_mutate_version() {
         use majit_ir::descr::ArrayFlag;
         use majit_jitcode::jitcode::BhDescr;
@@ -14067,6 +14379,171 @@ mod tests {
             parent: None,
             name: "mutate_version".into(),
             owner: "ModuleDictStrategy".into(),
+            load_is_acquire: false,
+            store_is_release: false,
+        });
+        assert!(
+            !std::sync::Arc::ptr_eq(&narrow, &canonical),
+            "a size that is not the pointer word does not bridge",
+        );
+    }
+
+    #[test]
+    fn module_dict_object_mstrategy_descr_is_quasi_immutable() {
+        let mstrategy = module_dict_object_mstrategy_descr();
+        let mutate = module_dict_object_mutate_mstrategy_descr();
+        let mstrategy_field = mstrategy.as_field_descr().expect("mstrategy field descr");
+        let mutate_field = mutate
+            .as_field_descr()
+            .expect("mutate_mstrategy field descr");
+        let mstrategy_parent = mstrategy_field
+            .get_parent_descr()
+            .expect("mstrategy parent SizeDescr");
+        let mutate_parent = mutate_field
+            .get_parent_descr()
+            .expect("mutate_mstrategy parent SizeDescr");
+        assert!(
+            std::sync::Arc::ptr_eq(&mstrategy_parent, &mutate_parent),
+            "both fields share the W_ModuleDictObject SizeDescr",
+        );
+        assert_eq!(
+            mstrategy_parent.as_size_descr().map(|sd| sd.size()),
+            Some(pyre_object::dictmultiobject::W_MODULE_DICT_OBJECT_SIZE),
+        );
+        assert!(mstrategy.is_quasi_immutable());
+        assert!(mstrategy.is_always_pure());
+        assert!(!mutate.is_quasi_immutable());
+        assert_eq!(mstrategy_field.field_key(), "mstrategy");
+        assert_eq!(
+            mstrategy_field.offset(),
+            core::mem::offset_of!(pyre_object::dictmultiobject::W_ModuleDictObject, mstrategy),
+        );
+        assert_eq!(mstrategy_field.field_size(), WORD);
+        assert_eq!(mstrategy_field.field_type(), Type::Ref);
+        assert_eq!(mutate_field.field_key(), "mutate_mstrategy");
+        assert_eq!(
+            mutate_field.offset(),
+            core::mem::offset_of!(
+                pyre_object::dictmultiobject::W_ModuleDictObject,
+                mutate_mstrategy
+            ),
+        );
+        assert_eq!(mutate_field.field_size(), WORD);
+        assert_eq!(mutate_field.field_type(), Type::Ref);
+        let mutate_lock = module_dict_object_field_descr("mutate_mstrategy_lock");
+        let mutate_lock_field = mutate_lock
+            .as_field_descr()
+            .expect("mutate_mstrategy_lock field descr");
+        assert_eq!(mutate_lock_field.field_key(), "mutate_mstrategy_lock");
+        assert_eq!(
+            mutate_lock_field.offset(),
+            core::mem::offset_of!(
+                pyre_object::dictmultiobject::W_ModuleDictObject,
+                mutate_mstrategy_lock
+            ),
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &mutate_descr_for_quasi_field(&mstrategy).expect("parent lookup of mutate_mstrategy"),
+            &mutate
+        ));
+        assert_eq!(
+            W_MODULE_DICT_DESCR_GROUP.field_descrs[1].field_key(),
+            "mstrategy"
+        );
+        assert_eq!(
+            W_MODULE_DICT_DESCR_GROUP.field_descrs[4].field_key(),
+            "mutate_mstrategy"
+        );
+        assert_eq!(
+            W_MODULE_DICT_DESCR_GROUP.field_descrs[5].field_key(),
+            "mutate_mstrategy_lock"
+        );
+    }
+
+    #[test]
+    fn make_descr_from_bh_bridges_module_dict_object_mstrategy() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_jitcode::jitcode::BhDescr;
+
+        let canonical = module_dict_object_mstrategy_descr();
+        let offset =
+            core::mem::offset_of!(pyre_object::dictmultiobject::W_ModuleDictObject, mstrategy);
+        for owner in [
+            "W_ModuleDictObject",
+            "dictmultiobject::W_ModuleDictObject",
+            "pyre_object::dictmultiobject::W_ModuleDictObject",
+        ] {
+            let descr = make_descr_from_bh(&BhDescr::Field {
+                offset,
+                field_size: WORD,
+                field_type: Type::Ref,
+                field_flag: ArrayFlag::Pointer,
+                is_field_signed: false,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: Some(1),
+                parent: None,
+                name: "mstrategy".into(),
+                owner: owner.into(),
+                load_is_acquire: false,
+                store_is_release: false,
+            });
+            assert!(
+                std::sync::Arc::ptr_eq(&descr, &canonical),
+                "{owner}.mstrategy must bridge to the quasi descr",
+            );
+            assert!(descr.is_quasi_immutable());
+        }
+    }
+
+    #[test]
+    fn make_descr_from_bh_bridges_module_dict_object_mutate_mstrategy() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_jitcode::jitcode::BhDescr;
+
+        let canonical = module_dict_object_mutate_mstrategy_descr();
+        let offset = core::mem::offset_of!(
+            pyre_object::dictmultiobject::W_ModuleDictObject,
+            mutate_mstrategy
+        );
+        for owner in [
+            "W_ModuleDictObject",
+            "dictmultiobject::W_ModuleDictObject",
+            "pyre_object::dictmultiobject::W_ModuleDictObject",
+        ] {
+            let descr = make_descr_from_bh(&BhDescr::Field {
+                offset,
+                field_size: WORD,
+                field_type: Type::Ref,
+                field_flag: ArrayFlag::Pointer,
+                is_field_signed: false,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: Some(0),
+                parent: None,
+                name: "mutate_mstrategy".into(),
+                owner: owner.into(),
+                load_is_acquire: false,
+                store_is_release: false,
+            });
+            assert!(
+                std::sync::Arc::ptr_eq(&descr, &canonical),
+                "{owner}.mutate_mstrategy must bridge to the Type::Ref descr",
+            );
+        }
+
+        let narrow = make_descr_from_bh(&BhDescr::Field {
+            offset,
+            field_size: WORD / 2,
+            field_type: Type::Ref,
+            field_flag: ArrayFlag::Pointer,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: Some(0),
+            parent: None,
+            name: "mutate_mstrategy".into(),
+            owner: "W_ModuleDictObject".into(),
             load_is_acquire: false,
             store_is_release: false,
         });
@@ -14821,6 +15298,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn descr_from_set_member_bridges_module_dict_object_mstrategy() {
+        let canonical = module_dict_object_mstrategy_descr();
+        let lookup = descr_from_set_member(&majit_ir::effectinfo::DescrSetMember::Field {
+            struct_id: majit_ir::descr::path_hash(
+                "pyre_object::dictmultiobject::W_ModuleDictObject",
+            ),
+            field_name: "mstrategy".into(),
+        });
+        let SetMemberLookup::Resolved(descr) = lookup else {
+            panic!("mstrategy Field member must resolve");
+        };
+        assert!(
+            std::sync::Arc::ptr_eq(&descr, &canonical),
+            "mstrategy Field member must bridge to the quasi descr",
+        );
+        let mutate_lookup = descr_from_set_member(&majit_ir::effectinfo::DescrSetMember::Field {
+            struct_id: majit_ir::descr::path_hash(
+                "pyre_object::dictmultiobject::W_ModuleDictObject",
+            ),
+            field_name: "mutate_mstrategy".into(),
+        });
+        let SetMemberLookup::Resolved(mutate) = mutate_lookup else {
+            panic!("mutate_mstrategy Field member must resolve");
+        };
+        assert!(
+            std::sync::Arc::ptr_eq(&mutate, &module_dict_object_mutate_mstrategy_descr()),
+            "mutate_mstrategy Field member must bridge to the group row",
+        );
+    }
+
     /// The hand-lowered handler ops and translated execution-context helpers
     /// address the same three words through the same descriptor objects.
     /// `pypy/jit/backend/llsupport/descr.py GcCache.get_field_descr` has no
@@ -15328,6 +15836,12 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
         LazyLock::force(&W_DICT_LOOKUP_NS_DESCR);
         LazyLock::force(&W_DICT_STRATEGY_WORD_DESCR);
     }),
+    ("dictmultiobject::W_ModuleDictObject", || {
+        LazyLock::force(&W_MODULE_DICT_DESCR_GROUP);
+    }),
+    ("pyre_object::dictmultiobject::W_ModuleDictObject", || {
+        LazyLock::force(&W_MODULE_DICT_DESCR_GROUP);
+    }),
     ("dictmultiobject::W_DictViewObject", || {
         LazyLock::force(&W_DICT_VIEW_DESCR_GROUP);
     }),
@@ -15575,6 +16089,12 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("pyre_object::celldict::ModuleDictStrategy", || {
         LazyLock::force(&MODULE_DICT_STRATEGY_DESCR_GROUP);
+    }),
+    ("dictmultiobject::DictStrategyRef", || {
+        LazyLock::force(&DICT_STRATEGY_REF_DESCR_GROUP);
+    }),
+    ("pyre_object::dictmultiobject::DictStrategyRef", || {
+        LazyLock::force(&DICT_STRATEGY_REF_DESCR_GROUP);
     }),
     ("typeobject::W_TypeObject", || {
         LazyLock::force(&W_TYPE_OBJECT_DESCR_GROUP);
@@ -16867,6 +17387,65 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     return canonical;
                 }
             }
+            // `W_ModuleDictObject.mstrategy` is `dictmultiobject.py`
+            // `"mstrategy?"`. `jtransform.py rewrite_op_getfield` emits
+            // `record_quasiimmut_field` for the translated read; the generated
+            // `fielddescrof(W_ModuleDictObject, "mstrategy")` must be the
+            // canonical object so `state.rs quasi_immut_descr` recognises it
+            // by index. `mutate_mstrategy` is the hidden OBJECTPTR
+            // `rclass.py _setup_repr` adds for `mstrategy?`. The codewriter
+            // names the owner by leaf or by module path. Bridge to the
+            // pointer-sized `Type::Ref` descr before the generic parent
+            // lookup mints a twin. Lookup is by name
+            // (`descr.py get_field_descr(STRUCT, fieldname)`).
+            if owner.as_str() == "W_ModuleDictObject"
+                || owner.as_str().ends_with("::W_ModuleDictObject")
+            {
+                let leaf = field_key.rsplit('.').next().unwrap_or(field_key);
+                if let Some(canonical) = W_MODULE_DICT_DESCR_GROUP
+                    .field_descrs
+                    .iter()
+                    .find(|descr| descr.field_key() == leaf)
+                {
+                    let canonical = canonical.clone() as DescrRef;
+                    if let Some(field) = canonical.as_field_descr()
+                        && field.field_size() == *field_size
+                        && field.field_type() == *field_type
+                    {
+                        return canonical;
+                    }
+                }
+            }
+            // `DictStrategyRef` is the MiniMark box behind
+            // `W_ModuleDictObject.mstrategy`. `descr.py get_field_descr`
+            // returns one FieldDescr per `(STRUCT, fieldname)` whose parent
+            // SizeDescr carries `dict_strategy_ref_gc_type_id`. The
+            // codewriter names the owner by leaf or by module path; `imp`
+            // may arrive as a two-word fat STRUCT at the data-word offset.
+            if owner.as_str() == "DictStrategyRef" || owner.as_str().ends_with("::DictStrategyRef")
+            {
+                let lookup = if name.ends_with("imp.vtable") {
+                    Some("imp.vtable")
+                } else if name.as_str() == "kind" || name.ends_with(".kind") {
+                    Some("kind")
+                } else if name.as_str() == "owner" || name.ends_with(".owner") {
+                    Some("owner")
+                } else if name.as_str() == "imp" || name.ends_with(".imp") {
+                    Some("imp")
+                } else {
+                    None
+                };
+                if let Some(lookup) = lookup {
+                    let canonical = dict_strategy_ref_field_descr(lookup);
+                    if let Some(field) = canonical.as_field_descr()
+                        && field.offset() == *offset
+                        && (*field_size == field.field_size()
+                            || (lookup == "imp" && *field_size == 2 * WORD))
+                    {
+                        return canonical;
+                    }
+                }
+            }
             // `function.py Function._immutable_fields_` `?` reads assemble
             // `record_quasiimmut_field` with this group's `mutate_<name>`
             // (`quasiimmut.py get_mutate_field_name`). Bridge by
@@ -17900,6 +18479,27 @@ fn mint_field(
         }
     }
     if let majit_ir::descr::LLType::Struct(struct_id) = &struct_key
+        && is_w_module_dict_object_struct(*struct_id)
+        && let Some(canonical) = W_MODULE_DICT_DESCR_GROUP
+            .field_descrs
+            .iter()
+            .find(|descr| descr.field_key() == field_name)
+        && *field_size == canonical.field_size()
+    {
+        return Some(canonical.clone() as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
+    }
+    if let majit_ir::descr::LLType::Struct(struct_id) = &struct_key
+        && is_dict_strategy_ref_struct(*struct_id)
+        && let Some(canonical) = DICT_STRATEGY_REF_DESCR_GROUP
+            .field_descrs
+            .iter()
+            .find(|descr| descr.field_key() == field_name)
+        && (*field_size == canonical.field_size()
+            || (field_name == "imp" && *field_size == 2 * WORD))
+    {
+        return Some(canonical.clone() as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
+    }
+    if let majit_ir::descr::LLType::Struct(struct_id) = &struct_key
         && is_w_type_object_struct(*struct_id)
     {
         if let Some(canonical) = W_TYPE_OBJECT_DESCR_GROUP
@@ -18264,6 +18864,30 @@ fn is_module_dict_strategy_struct(struct_id: u64) -> bool {
     .any(|owner| struct_id == majit_ir::descr::path_hash(owner))
 }
 
+/// Whether `struct_id` names `W_ModuleDictObject` under one of the owner
+/// spellings `make_descr_from_bh` bridges.
+fn is_w_module_dict_object_struct(struct_id: u64) -> bool {
+    [
+        "W_ModuleDictObject",
+        "dictmultiobject::W_ModuleDictObject",
+        "pyre_object::dictmultiobject::W_ModuleDictObject",
+    ]
+    .into_iter()
+    .any(|owner| struct_id == majit_ir::descr::path_hash(owner))
+}
+
+/// Whether `struct_id` names `DictStrategyRef` under one of the owner
+/// spellings `make_descr_from_bh` bridges.
+fn is_dict_strategy_ref_struct(struct_id: u64) -> bool {
+    [
+        "DictStrategyRef",
+        "dictmultiobject::DictStrategyRef",
+        "pyre_object::dictmultiobject::DictStrategyRef",
+    ]
+    .into_iter()
+    .any(|owner| struct_id == majit_ir::descr::path_hash(owner))
+}
+
 /// Whether `struct_id` names `W_TypeObject` under one of the owner
 /// spellings `make_descr_from_bh` bridges.
 fn is_w_type_object_struct(struct_id: u64) -> bool {
@@ -18450,6 +19074,22 @@ pub(crate) fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) ->
             if field_name.as_str() == "mutate_version" && is_module_dict_strategy_struct(*struct_id)
             {
                 return SetMemberLookup::Resolved(module_dict_mutate_version_descr());
+            }
+            if is_w_module_dict_object_struct(*struct_id)
+                && let Some(canonical) = W_MODULE_DICT_DESCR_GROUP
+                    .field_descrs
+                    .iter()
+                    .find(|descr| descr.field_key() == field_name.as_str())
+            {
+                return SetMemberLookup::Resolved(canonical.clone() as DescrRef);
+            }
+            if is_dict_strategy_ref_struct(*struct_id)
+                && let Some(canonical) = DICT_STRATEGY_REF_DESCR_GROUP
+                    .field_descrs
+                    .iter()
+                    .find(|descr| descr.field_key() == field_name.as_str())
+            {
+                return SetMemberLookup::Resolved(canonical.clone() as DescrRef);
             }
             if is_w_type_object_struct(*struct_id)
                 && let Some(canonical) = W_TYPE_OBJECT_DESCR_GROUP

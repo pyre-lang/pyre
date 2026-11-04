@@ -569,9 +569,10 @@ pub const _immutable_fields_Signature: &str =
 /// the wrapper is published and never writes again. `PyFrame.getcode`
 /// promotes `self.pycode` and then reads that pointer; listing it here makes
 /// the read a constant, the same way `co_code` and `co_varnames` are
-/// immutable on `PyCode`. The body's name tables and kind bytes are
-/// [`_immutable_fields_CodeObject`]. `source_path` stays mutable
-/// (`fix_code_filenames`).
+/// immutable on `PyCode`. `co_names_w[*]` is the interned name table filled
+/// in `PyCode.__init__`; `getname_w` is a plain item read. The body's name
+/// tables and kind bytes are [`_immutable_fields_CodeObject`]. `source_path`
+/// stays mutable (`fix_code_filenames`).
 ///
 /// `PyCode._signature` is absent from `jit_immutable_fields`. A trace
 /// constant `PyCode` stays rooted only while it remains a `ConstPtr`
@@ -3832,7 +3833,7 @@ pub unsafe fn w_code_getname_w(w_code_obj: PyObjectRef, idx: usize) -> PyObjectR
 ///
 /// False for a null object, an empty name array (unusable `code_ptr`), and
 /// for [`crate::pyopcode::NO_NAMEINDEX`].
-pub(crate) unsafe fn w_code_name_index_covered(w_code_obj: PyObjectRef, idx: usize) -> bool {
+pub unsafe fn w_code_name_index_covered(w_code_obj: PyObjectRef, idx: usize) -> bool {
     if w_code_obj.is_null() {
         return false;
     }

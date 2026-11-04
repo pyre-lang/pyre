@@ -196,6 +196,172 @@ fn dict_entries_probe_hashed_word(
         .unwrap_or(pyre_object::PY_NULL)
 }
 
+/// Rebuild the rstr `STR` word `llmodel.py bh_call_r` passes for `&str`.
+unsafe fn str_from_rstr_word(word: i64) -> &'static str {
+    unsafe { core::str::from_utf8_unchecked(majit_ir::helper_fnaddr::rstr_payload(word)) }
+}
+
+/// Word-ABI residual for `w_dict_getitem_str_object_strategy_hashed`.
+/// `llmodel.py bh_call_r` passes `&str` as one rstr STR word.
+#[inline(never)]
+pub(crate) extern "C" fn w_dict_getitem_str_object_strategy_hashed_word(
+    obj: i64,
+    key: i64,
+    hash: i64,
+) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::w_dict_getitem_str_object_strategy_hashed_word");
+    let obj = obj as usize as pyre_object::PyObjectRef;
+    let key = unsafe { str_from_rstr_word(key) };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_getitem_str_object_strategy_hashed(obj, key, hash)
+            .unwrap_or(pyre_object::PY_NULL) as usize as i64
+    }
+}
+
+/// Word-ABI residual for `UnicodeDictStrategy.getitem_str`. Trait impl
+/// methods cannot emit a module-level trampoline from inside the impl.
+#[inline(never)]
+pub(crate) extern "C" fn unicode_dict_getitem_str_word(
+    _strategy: i64,
+    w_dict: i64,
+    key: i64,
+) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::unicode_dict_getitem_str_word");
+    let w_dict = w_dict as usize as pyre_object::PyObjectRef;
+    let key = unsafe { str_from_rstr_word(key) };
+    use pyre_object::dictmultiobject::DictStrategy;
+    unsafe { pyre_object::UNICODE_DICT_STRATEGY.getitem_str(w_dict, key) as usize as i64 }
+}
+
+/// Word-ABI residual for `UnicodeDictStrategy.getitem_str_hashed`.
+#[inline(never)]
+pub(crate) extern "C" fn unicode_dict_getitem_str_hashed_word(
+    _strategy: i64,
+    w_dict: i64,
+    key: i64,
+    hash: i64,
+) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::unicode_dict_getitem_str_hashed_word");
+    let w_dict = w_dict as usize as pyre_object::PyObjectRef;
+    let key = unsafe { str_from_rstr_word(key) };
+    use pyre_object::dictmultiobject::DictStrategy;
+    unsafe {
+        pyre_object::UNICODE_DICT_STRATEGY.getitem_str_hashed(w_dict, key, hash) as usize as i64
+    }
+}
+
+/// Word-ABI residual for `ObjectDictStrategy.getitem_str`.
+#[inline(never)]
+pub(crate) extern "C" fn object_dict_getitem_str_word(
+    _strategy: i64,
+    w_dict: i64,
+    key: i64,
+) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::object_dict_getitem_str_word");
+    let w_dict = w_dict as usize as pyre_object::PyObjectRef;
+    let key = unsafe { str_from_rstr_word(key) };
+    use pyre_object::dictmultiobject::DictStrategy;
+    unsafe { pyre_object::OBJECT_DICT_STRATEGY.getitem_str(w_dict, key) as usize as i64 }
+}
+
+/// Word-ABI residual for `ObjectDictStrategy.getitem_str_hashed`.
+#[inline(never)]
+pub(crate) extern "C" fn object_dict_getitem_str_hashed_word(
+    _strategy: i64,
+    w_dict: i64,
+    key: i64,
+    hash: i64,
+) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::object_dict_getitem_str_hashed_word");
+    let w_dict = w_dict as usize as pyre_object::PyObjectRef;
+    let key = unsafe { str_from_rstr_word(key) };
+    use pyre_object::dictmultiobject::DictStrategy;
+    unsafe {
+        pyre_object::OBJECT_DICT_STRATEGY.getitem_str_hashed(w_dict, key, hash) as usize as i64
+    }
+}
+
+/// One-word residual ABI for `PyFrame.load_global_value`
+/// (`pyopcode.py _load_global`); `llmodel.py bh_call_r` passes the `&str`
+/// as one rstr STR word.
+#[inline(never)]
+pub(crate) extern "C" fn pyframe_load_global_value_word(
+    frame: i64,
+    name: i64,
+    nameindex: i64,
+) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::pyframe_load_global_value_word");
+    let frame = unsafe { &mut *(frame as usize as *mut crate::pyframe::PyFrame) };
+    let name = unsafe { str_from_rstr_word(name) };
+    match <crate::pyframe::PyFrame as crate::pyopcode::NamespaceOpcodeHandler>::load_global_value(
+        frame,
+        name,
+        nameindex as usize,
+    ) {
+        Ok(v) => v as usize as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err) as usize as i64,
+    }
+}
+
+/// Word-ABI residual for `finditem_str_named`;
+/// `llmodel.py bh_call_r` passes the `&str` as one rstr STR word.
+#[inline(never)]
+pub(crate) extern "C" fn finditem_str_named_word(
+    obj: i64,
+    key: i64,
+    pycode: i64,
+    nameindex: i64,
+) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::finditem_str_named_word");
+    let key = unsafe { str_from_rstr_word(key) };
+    match crate::baseobjspace::finditem_str_named(
+        obj as usize as pyre_object::PyObjectRef,
+        key,
+        pycode as usize as pyre_object::PyObjectRef,
+        nameindex as usize,
+    ) {
+        Ok(Some(v)) => v as usize as i64,
+        Ok(None) => 0,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err) as usize as i64,
+    }
+}
+
+/// `celldict.py ModuleDictStrategy._getdictvalue_no_unwrapping_pure` has
+/// an elidable native call boundary. Adapt its `&str` and Option result
+/// to `llmodel.py bh_call_r` words; keep the actual dictionary lookup in
+/// the original method. Method decorators cannot emit a free fnaddr entry
+/// without their enclosing Self type, so this bridge names that type.
+#[inline(never)]
+pub(crate) extern "C" fn module_dict_getdictvalue_no_unwrapping_pure_word(
+    strategy: i64,
+    version: i64,
+    dict: i64,
+    key: i64,
+) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::module_dict_getdictvalue_no_unwrapping_pure_word");
+    let strategy = strategy as usize as *const pyre_object::celldict::ModuleDictStrategy;
+    let dict = dict as usize as pyre_object::PyObjectRef;
+    let key = unsafe { str_from_rstr_word(key) };
+    unsafe {
+        (*strategy)._getdictvalue_no_unwrapping_pure(
+            version as usize as *mut pyre_object::celldict::VersionTag,
+            dict,
+            key,
+        )
+    }
+    .unwrap_or(pyre_object::PY_NULL) as usize as i64
+}
+
+/// Word-ABI residual for `hash_str_hooked_bytes`. Rebuilds the `&[u8]`
+/// window `rstr.py LLHelpers._ll_strhash` already passes as pointer and
+/// length words, then calls the slice entry.
+#[inline(never)]
+pub(crate) extern "C" fn hash_str_hooked_bytes_word(ptr: i64, len: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::hash_str_hooked_bytes_word");
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as usize as *const u8, len as usize) };
+    pyre_object::dict_eq_hook::hash_str_hooked_bytes(bytes)
+}
+
 /// One-word residual ABI for `dict_entries_insert_hashed`.
 fn dict_entries_insert_hashed_word(
     entries: &mut pyre_object::ObjectDictStorage,
@@ -2304,6 +2470,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::opcode_ops::set_add_value",
         crate::opcode_ops::jit_opcode_ops_set_add_value,
     );
+    // LOAD_GLOBAL's `inline_call_ir_r` (`flatten.rs inline_call_targets`).
+    // The graph is `PyFrame.load_global_value`; this bridge is the one-word
+    // address blackhole `bh_call_r` calls. Argument order is the graph's
+    // (self, name, nameindex); the jitcode calldescr is i=[nameindex],
+    // r=[frame, name].
+    cp3!(
+        &mut entries,
+        "pyframe::PyFrame::<impl pyre_interpreter::pyopcode::NamespaceOpcodeHandler<pyre_interpreter::pyframe::PyFrame>>::load_global_value",
+        pyframe_load_global_value_word,
+    );
     // `try_hash_value` is a residual in every jitcode that calls it
     // (`set_add_value`'s non-int arm among them); this is its one-word bridge.
     cp1!(
@@ -2976,6 +3152,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::_pure_getdictvalue_no_unwrapping",
         crate::baseobjspace::__majit_call_target__pure_getdictvalue_no_unwrapping,
     );
+    cpa4!(
+        &mut entries,
+        "pyre_object::celldict::ModuleDictStrategy::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
+        "celldict::ModuleDictStrategy::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
+        module_dict_getdictvalue_no_unwrapping_pure_word,
+    );
     // The uncached arm's thin-pointer twins (`lookup_where_pair` under the
     // JIT): a boxed name in, a raw pointer (null for `None`) out.
     up2!(
@@ -3233,16 +3415,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::handle_fromlist",
         crate::importing::handle_fromlist_jit_abi,
     );
-    // `__import__` look-inside still residualises these: `finditem_str_named`
-    // has no jitcode (the `&str` + strategy dispatch is a symbolic hash),
-    // and the `dont_look_inside` miss / error arms need published addresses
-    // or the scan declines the wrapper after `sys_modules_dict`.
-    push_abi_unsound_argument_alias_pair(
+    // Nested `inline_call` of the `finditem_str_named` jitcode
+    // (`fully_bound_callee_body` / `pathed_runtime_jitcode_cached`).
+    // The graph is `baseobjspace::finditem_str_named`; this bridge is the
+    // one-word address blackhole `bh_call_r` calls. Argument order is the
+    // graph's (obj, key, pycode, nameindex). The `dont_look_inside` miss /
+    // error arms below stay ABI-unsound: their `&str` is still two words.
+    cp4!(
         &mut entries,
-        &mut abi_unsound_arguments,
         "pyre_interpreter::baseobjspace::finditem_str_named",
-        "pyre_interpreter::finditem_str_named",
-        crate::baseobjspace::finditem_str_named as *const (),
+        finditem_str_named_word,
     );
     push_abi_unsound_argument_alias_pair(
         &mut entries,
@@ -3616,14 +3798,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::pycode::w_code_lookup_exceptiontable",
         "pyre_interpreter::w_code_lookup_exceptiontable",
         crate::pycode::w_code_lookup_exceptiontable_jit_abi,
-    );
-    // `named_key_hash` residualizes `w_code_getname_w` (`dont_look_inside`).
-    // Without this row the codewriter mints a symbolic path hash and
-    // `interpret()` aborts the first LOAD_NAME / LOAD_GLOBAL walk.
-    up2!(
-        &mut entries,
-        "pyre_interpreter::pycode::w_code_getname_w",
-        crate::pycode::w_code_getname_w,
     );
     // `get_w_globals` is a quasi-immutable field read upstream. The body here
     // is an atomic load the translator declines, so the residual keeps the
@@ -4930,6 +5104,52 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::hash_str_hooked",
         pyre_object::dict_eq_hook::hash_str_hooked,
     );
+    // `hash_str_hooked_bytes` is a slice entry; residual calls pass the
+    // pointer/length words `rstr.py LLHelpers._ll_strhash` already has.
+    cpa2!(
+        &mut entries,
+        "pyre_object::dict_eq_hook::hash_str_hooked_bytes",
+        "pyre_object::hash_str_hooked_bytes",
+        hash_str_hooked_bytes_word,
+    );
+    // `rordereddict.py ll_call_lookup_function` keeps a nonvirtual table
+    // lookup residual. The look_inside_iff trampoline accepts STR as one
+    // word and returns the nullable value as one word (`llmodel.py bh_call_r`).
+    cpa3!(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_probe_str_trampoline",
+        "pyre_object::dict_entries_probe_str_trampoline",
+        pyre_object::dictmultiobject::__majit_call_target_dict_entries_probe_str_trampoline,
+    );
+    // `getitem_str` / hashed probe: native `&str` is two words; residual
+    // `bh_call_r` passes one rstr STR. Bind the word-ABI trampoline under
+    // the reloc path the codewriter records (`llmodel.py bh_call_r`).
+    cpa3!(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_getitem_str_object_strategy_hashed",
+        "pyre_object::w_dict_getitem_str_object_strategy_hashed",
+        w_dict_getitem_str_object_strategy_hashed_word,
+    );
+    cp3!(
+        &mut entries,
+        "dictmultiobject::UnicodeDictStrategy::<impl pyre_object::dictmultiobject::DictStrategy<pyre_object::dictmultiobject::UnicodeDictStrategy>>::getitem_str",
+        unicode_dict_getitem_str_word,
+    );
+    cp4!(
+        &mut entries,
+        "dictmultiobject::UnicodeDictStrategy::<impl pyre_object::dictmultiobject::DictStrategy<pyre_object::dictmultiobject::UnicodeDictStrategy>>::getitem_str_hashed",
+        unicode_dict_getitem_str_hashed_word,
+    );
+    cp3!(
+        &mut entries,
+        "dictmultiobject::ObjectDictStrategy::<impl pyre_object::dictmultiobject::DictStrategy<pyre_object::dictmultiobject::ObjectDictStrategy>>::getitem_str",
+        object_dict_getitem_str_word,
+    );
+    cp4!(
+        &mut entries,
+        "dictmultiobject::ObjectDictStrategy::<impl pyre_object::dictmultiobject::DictStrategy<pyre_object::dictmultiobject::ObjectDictStrategy>>::getitem_str_hashed",
+        object_dict_getitem_str_hashed_word,
+    );
     // Residual calls read one pointer word (`llmodel.py bh_call_r`).
     // The bridge maps None to NULL; the Option body stays for a traced call.
     pa2!(
@@ -5266,12 +5486,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::ExecutionContext::run_trace_func",
         crate::executioncontext::run_trace_func_jit_abi,
-    );
-    pa1!(
-        &mut entries,
-        "pyre_interpreter::executioncontext::execution_context_builtin_cache_get",
-        "pyre_interpreter::execution_context_builtin_cache_get",
-        crate::executioncontext::execution_context_builtin_cache_get,
     );
     cpa0!(
         &mut entries,
@@ -7091,13 +7305,17 @@ mod tests {
     use super::{
         dict_entries_insert_hashed_word, dict_entries_key_obj_at_word,
         dict_entries_probe_hashed_word, dict_entries_probe_object_word, dyn_impl_vtables,
-        is_abi_unsound_argument_residual, is_list_write_barrier, is_pyframe_operand_stack_accessor,
+        finditem_str_named_word, hash_str_hooked_bytes_word, is_abi_unsound_argument_residual,
+        is_list_write_barrier, is_pyframe_operand_stack_accessor,
         is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
-        jit_trace_fnaddrs, pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs,
+        jit_trace_fnaddrs, module_dict_getdictvalue_no_unwrapping_pure_word,
+        object_dict_getitem_str_hashed_word, object_dict_getitem_str_word,
+        pyframe_load_global_value_word, pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs,
         shadow_stack_get_word, shadow_stack_push_word, shadow_stack_try_pop_to_word,
-        w_dict_lookup_bytes_strategy_word, w_dict_lookup_identity_strategy_word,
-        w_dict_lookup_int_strategy_word, w_list_pop_end_inner_word, w_list_pop_end_word,
-        w_module_dict_lookup_object_entries_word,
+        unicode_dict_getitem_str_hashed_word, unicode_dict_getitem_str_word,
+        w_dict_getitem_str_object_strategy_hashed_word, w_dict_lookup_bytes_strategy_word,
+        w_dict_lookup_identity_strategy_word, w_dict_lookup_int_strategy_word,
+        w_list_pop_end_inner_word, w_list_pop_end_word, w_module_dict_lookup_object_entries_word,
     };
     use std::collections::HashMap;
 
@@ -7494,6 +7712,139 @@ mod tests {
     }
 
     #[test]
+    fn str_dict_probe_and_hash_residuals_use_their_word_abi() {
+        crate::typedef::init_typeobjects();
+        // This low-level test does not create a JitDriver, which normally
+        // registers the frontend's STR layout before residual calls run.
+        majit_ir::helper_fnaddr::set_rstr_payload_reader(
+            pyre_object::unicodeobject::rstr_payload_word,
+        );
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let probe: extern "C" fn(i64, i64, i64) -> i64 = unsafe {
+            std::mem::transmute(
+                bindings["pyre_object::dictmultiobject::dict_entries_probe_str_trampoline"]
+                    as usize,
+            )
+        };
+        let hash: extern "C" fn(i64, i64) -> i64 = hash_str_hooked_bytes_word;
+        assert_eq!(
+            bindings["pyre_object::dict_eq_hook::hash_str_hooked_bytes"],
+            hash_str_hooked_bytes_word as *const () as usize as i64,
+        );
+        assert_eq!(
+            bindings["pyre_object::hash_str_hooked_bytes"],
+            hash_str_hooked_bytes_word as *const () as usize as i64,
+        );
+        assert_ne!(
+            bindings["pyre_object::dict_eq_hook::hash_str_hooked_bytes"],
+            bindings["pyre_object::dict_eq_hook::hash_str_hooked"],
+        );
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.base();
+        let _ = roots.pin_root(pyre_object::w_dict_new());
+        let _ = roots.pin_root(pyre_object::w_str_new("issue2506_probe"));
+        let _ = roots.pin_root(pyre_object::w_str_new("issue2506_missing"));
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                roots.get(base),
+                "issue2506_probe",
+                pyre_object::w_none(),
+            );
+        }
+        let entries =
+            unsafe { pyre_object::dictmultiobject::w_dict_object_storage(roots.get(base)) };
+        for (slot, key, expected) in [
+            (base + 1, "issue2506_probe", pyre_object::w_none()),
+            (base + 2, "issue2506_missing", pyre_object::PY_NULL),
+        ] {
+            let digest = hash(key.as_ptr() as i64, key.len() as i64);
+            assert_eq!(digest, crate::builtins::hash_str_bytes(key.as_bytes()));
+            let payload = unsafe { pyre_object::unicodeobject::w_str_storage(roots.get(slot)) };
+            assert_eq!(
+                probe(entries as *const _ as i64, digest, payload as i64),
+                expected as i64
+            );
+        }
+        let module_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(pyre_object::dictmultiobject::w_module_dict_new());
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                roots.get(module_slot),
+                "issue2506_probe",
+                pyre_object::w_none(),
+            );
+        }
+        let pure: extern "C" fn(i64, i64, i64, i64) -> i64 =
+            module_dict_getdictvalue_no_unwrapping_pure_word;
+        assert_eq!(
+            bindings["celldict::ModuleDictStrategy::_orig__getdictvalue_no_unwrapping_pure_unlikely_name"],
+            module_dict_getdictvalue_no_unwrapping_pure_word as *const () as usize as i64,
+        );
+        let strategy = unsafe {
+            pyre_object::dictmultiobject::w_module_dict_strategy_or_null(roots.get(module_slot))
+        };
+        assert!(!strategy.is_null());
+        let version = unsafe { (*strategy).version as i64 };
+        let name = unsafe { pyre_object::unicodeobject::w_str_storage(roots.get(base + 1)) };
+        assert_eq!(
+            pure(
+                strategy as i64,
+                version,
+                roots.get(module_slot) as i64,
+                name as i64
+            ),
+            pyre_object::w_none() as i64,
+        );
+        let unicode_getitem: extern "C" fn(i64, i64, i64) -> i64 = unicode_dict_getitem_str_word;
+        assert_eq!(
+            bindings["dictmultiobject::UnicodeDictStrategy::<impl pyre_object::dictmultiobject::DictStrategy<pyre_object::dictmultiobject::UnicodeDictStrategy>>::getitem_str"],
+            unicode_dict_getitem_str_word as *const () as usize as i64,
+        );
+        let hashed_probe: extern "C" fn(i64, i64, i64) -> i64 =
+            w_dict_getitem_str_object_strategy_hashed_word;
+        assert_eq!(
+            bindings["pyre_object::dictmultiobject::w_dict_getitem_str_object_strategy_hashed"],
+            w_dict_getitem_str_object_strategy_hashed_word as *const () as usize as i64,
+        );
+        let digest = hash(
+            b"issue2506_probe".as_ptr() as i64,
+            b"issue2506_probe".len() as i64,
+        );
+        let unicode = &pyre_object::UNICODE_DICT_STRATEGY as *const _ as i64;
+        assert_eq!(
+            unicode_getitem(unicode, roots.get(base) as i64, name as i64),
+            pyre_object::w_none() as i64,
+        );
+        assert_eq!(
+            hashed_probe(roots.get(base) as i64, name as i64, digest),
+            pyre_object::w_none() as i64,
+        );
+        let raw_hashed = pyre_object::dictmultiobject::w_dict_getitem_str_object_strategy_hashed
+            as *const () as usize as i64;
+        assert_ne!(
+            bindings["pyre_object::dictmultiobject::w_dict_getitem_str_object_strategy_hashed"],
+            raw_hashed,
+            "must not publish the Option-returning Rust item"
+        );
+        for (path, expected) in [
+            (
+                "dictmultiobject::UnicodeDictStrategy::<impl pyre_object::dictmultiobject::DictStrategy<pyre_object::dictmultiobject::UnicodeDictStrategy>>::getitem_str_hashed",
+                unicode_dict_getitem_str_hashed_word as *const () as usize as i64,
+            ),
+            (
+                "dictmultiobject::ObjectDictStrategy::<impl pyre_object::dictmultiobject::DictStrategy<pyre_object::dictmultiobject::ObjectDictStrategy>>::getitem_str",
+                object_dict_getitem_str_word as *const () as usize as i64,
+            ),
+            (
+                "dictmultiobject::ObjectDictStrategy::<impl pyre_object::dictmultiobject::DictStrategy<pyre_object::dictmultiobject::ObjectDictStrategy>>::getitem_str_hashed",
+                object_dict_getitem_str_hashed_word as *const () as usize as i64,
+            ),
+        ] {
+            assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
+        }
+    }
+
+    #[test]
     fn dict_lookup_fnaddrs_are_the_one_word_bridges() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
         for (path, expected) in [
@@ -7688,6 +8039,14 @@ mod tests {
             (
                 "pyre_interpreter::opcode_ops::set_add_value",
                 crate::opcode_ops::jit_opcode_ops_set_add_value as *const () as usize as i64,
+            ),
+            (
+                "pyframe::PyFrame::<impl pyre_interpreter::pyopcode::NamespaceOpcodeHandler<pyre_interpreter::pyframe::PyFrame>>::load_global_value",
+                pyframe_load_global_value_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::baseobjspace::finditem_str_named",
+                finditem_str_named_word as *const () as usize as i64,
             ),
             (
                 "pyre_interpreter::builtins::try_hash_value",
@@ -8381,13 +8740,8 @@ mod tests {
     }
 
     #[test]
-    fn jit_trace_fnaddrs_covers_w_code_getname_w() {
+    fn jit_trace_fnaddrs_covers_w_code_get_w_globals() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let expected = crate::pycode::w_code_getname_w as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_interpreter::pycode::w_code_getname_w"],
-            expected,
-        );
         let globals = crate::pycode::w_code_get_w_globals as *const () as usize as i64;
         assert_eq!(
             bindings["pyre_interpreter::pycode::w_code_get_w_globals"],

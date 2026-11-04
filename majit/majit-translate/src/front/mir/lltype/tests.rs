@@ -5161,6 +5161,84 @@ fn build_hasher_default_without_layout_is_void_zst() {
     );
 }
 
+fn infallible_enum(def_id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": fixture_item_meta(ident_path(&["core", "convert", "Infallible"])),
+        "kind": {"Enum": []}
+    })
+}
+
+fn phantom_data_opaque(def_id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": fixture_item_meta(ident_path(&["core", "marker", "PhantomData"])),
+        "kind": "Opaque"
+    })
+}
+
+/// `Option<U>` is Void only when `U` is an uninhabited atom.
+/// `PhantomData<Infallible>` is Void via the PhantomData leaf.
+#[test]
+fn option_of_uninhabited_atom_is_void_zst() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            option_enum(0),
+            infallible_enum(1),
+            phantom_data_opaque(2),
+            type_decl_struct(3, &["alloc", "vec", "Vec"], vec![]),
+        ],
+        vec![],
+    );
+    let opt = |arg: serde_json::Value| TyRef::Other(option_adt_node(0, arg));
+
+    for (label, arg) in [
+        ("Never", serde_json::json!("Never")),
+        ("!", serde_json::json!("!")),
+        ("Infallible", adt_node(1)),
+        ("Value Never", serde_json::json!({"Value": [99, "Never"]})),
+    ] {
+        let ty = opt(arg);
+        assert!(super::tyref_is_option_of_uninhabited(&ty, &llbc), "{label}");
+        assert!(super::tyref_is_void_zst(&ty, &llbc), "{label}");
+        assert_eq!(
+            super::tyref_to_value_type(&ty, &llbc),
+            crate::model::ValueType::Void,
+            "{label}"
+        );
+    }
+
+    let opt_ptr = opt(serde_json::json!({"RawPtr": [adt_node(1), "Const"]}));
+    assert!(!super::tyref_is_option_of_uninhabited(&opt_ptr, &llbc));
+    assert_ne!(
+        super::tyref_to_value_type(&opt_ptr, &llbc),
+        crate::model::ValueType::Void
+    );
+
+    let opt_vec = opt(named_adt(3, vec![adt_node(1)]));
+    assert!(!super::tyref_is_option_of_uninhabited(&opt_vec, &llbc));
+    assert_ne!(
+        super::tyref_to_value_type(&opt_vec, &llbc),
+        crate::model::ValueType::Void
+    );
+
+    let phantom = named_adt(2, vec![adt_node(1)]);
+    let opt_phantom = opt(phantom.clone());
+    assert!(!super::tyref_is_option_of_uninhabited(&opt_phantom, &llbc));
+    assert_ne!(
+        super::tyref_to_value_type(&opt_phantom, &llbc),
+        crate::model::ValueType::Void
+    );
+
+    let phantom_ty = TyRef::Other(phantom);
+    assert!(
+        super::tyref_is_void_zst(&phantom_ty, &llbc),
+        "PhantomData<Infallible> is Void via PhantomData"
+    );
+    assert!(!super::tyref_is_option_of_uninhabited(&phantom_ty, &llbc));
+}
+
 #[test]
 fn empty_tuple_tyref_is_void() {
     // `()` is `lltype.Void` (`history.py` `getkind`). Charon emits

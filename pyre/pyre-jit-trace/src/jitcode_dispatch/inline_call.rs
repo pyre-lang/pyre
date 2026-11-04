@@ -618,6 +618,9 @@ enum FreshFrameGotoFold {
 /// itself not yielded. Ops reachable only through the other arm are dropped.
 /// The LOAD_FAST unbound-local test (`goto_if_not_ptr_nonzero` after
 /// `getarrayitem_vable_r`) folds to its bound arm the same way.
+/// Payload fields of a NonNull `FrameDebugData` are left as recorded
+/// `getfield_gc_r` / `goto_if_not_ptr_*` ops: `pyjitpl.py`
+/// `_establish_nullity` has no static admission fold of those fields.
 ///
 /// [`decoded_ops_on_fresh_frame`] is the null-`debugdata` fold. A callee
 /// built with a non-null payload uses [`decoded_ops_on_fresh_frame_kind`].
@@ -800,10 +803,6 @@ fn is_fresh_frame_debugdata_null_goto(
 /// Fold the constructor `debugdata` null-test and the LOAD_FAST unbound
 /// check (`pyopcode.py LOAD_FAST` as `emit_load_fast_checked!` flattens it:
 /// `getarrayitem_vable_r` of the local, then `goto_if_not_ptr_nonzero`).
-/// The `w_f_trace` null-test is left to the walker
-/// (`opimpl_goto_if_not_ptr_iszero` / `_establish_nullity` answers it from the
-/// heapcache-known PY_NULL of a fresh `FrameDebugData`). This scan is
-/// admission-only (`decoded_ops_on_fresh_frame_kind`).
 fn fresh_frame_goto_fold(
     code: &[u8],
     op: &DecodedOp,
@@ -1215,6 +1214,80 @@ mod seeded_frame_op_tests {
             .expect("body must decode");
         let names: Vec<&str> = ops.iter().map(|op| op.opname).collect();
         assert_eq!(names, ["getfield_vable_r", "live", "raise"]);
+    }
+
+    #[test]
+    fn fresh_frame_ops_do_not_fold_payload_field_ptr_goto_on_non_null_debugdata() {
+        let getfield_vable = insn("getfield_vable_r/rd>r");
+        let getfield_gc = insn("getfield_gc_r/rd>r");
+        let live = insn("live/");
+        let goto_z = insn("goto_if_not_ptr_iszero/rL");
+        let int_ret = insn("int_return/i");
+        let raise = insn("raise/r");
+        // pc 0: getfield_vable_r r0, descr0 -> r1
+        // pc 5: live/
+        // pc 8: goto_if_not_ptr_iszero r1, 15
+        // pc 13: raise r0  (debugdata-null arm)
+        // pc 15: getfield_gc_r r1, descr1 -> r2
+        // pc 20: live/
+        // pc 23: goto_if_not_ptr_iszero r2, 30
+        // pc 28: int_return i0
+        // pc 30: raise r0  (payload-field null arm)
+        let code = vec![
+            getfield_vable,
+            0,
+            0,
+            0,
+            1,
+            live,
+            0,
+            0,
+            goto_z,
+            1,
+            15,
+            0,
+            0,
+            raise,
+            0,
+            getfield_gc,
+            1,
+            1,
+            0,
+            2,
+            live,
+            0,
+            0,
+            goto_z,
+            2,
+            30,
+            0,
+            0,
+            int_ret,
+            0,
+            raise,
+            0,
+        ];
+        let descrs = vec![
+            crate::frame_layout::pyframe_static_field_descr(
+                crate::virtualizable_spec::DEBUGDATA_VABLE_FIELD_INDEX as u16,
+            ),
+            crate::descr::frame_debug_data_w_f_trace_descr(),
+        ];
+        let ops = decoded_ops_on_fresh_frame_kind(&code, &descrs, FreshFrameDebugdata::NonNull)
+            .expect("body must decode");
+        let names: Vec<&str> = ops.iter().map(|op| op.opname).collect();
+        assert_eq!(
+            names,
+            [
+                "getfield_vable_r",
+                "live",
+                "getfield_gc_r",
+                "live",
+                "goto_if_not_ptr_iszero",
+                "int_return",
+                "raise"
+            ]
+        );
     }
 
     #[test]

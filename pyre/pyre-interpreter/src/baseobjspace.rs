@@ -29,6 +29,38 @@ use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use crate::objspace::descroperation::user_overridden_class;
 pub use crate::objspace::descroperation::*;
 
+/// `baseobjspace.py ObjSpace.make_builtins` initializes `space.builtin`
+/// before any Python frame runs. `module.py Module.__init__` owns the
+/// dictionary; `function.py BuiltinFunction.w_moduleobj` points back to the
+/// defining module. Keep both owners rooted while attaching that identity.
+pub(crate) fn make_builtins(w_dict: PyObjectRef) -> PyObjectRef {
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    let _ = roots.pin_root(w_dict);
+    // Enumeration may realize wrapped keys and collect. Only owned key
+    // strings survive the Module allocation; values are looked up again.
+    let entries = unsafe { pyre_object::w_dict_str_entries(roots.get(dict_slot)) };
+    let mut keys = Vec::with_capacity(entries.len());
+    for (key, _) in entries {
+        keys.push(key);
+    }
+    let module = pyre_object::w_module_new_aliasing_dict(
+        pyre_object::w_str_new("builtins"),
+        roots.get(dict_slot),
+    );
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(module);
+    for key in keys {
+        if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(roots.get(dict_slot), &key) }
+        {
+            unsafe {
+                crate::function::builtin_function_set_module_obj(value, roots.get(module_slot))
+            };
+        }
+    }
+    roots.get(module_slot)
+}
+
 // ── Pending dict-key-callback error slot ─────────────────────────────
 // The `r_dict(eq_w, hash_w)` callbacks (`pyre_object_hash_w_trampoline`
 // / `pyre_object_eq_w_trampoline` in pyre-jit) cannot return a `Result`
@@ -5342,14 +5374,11 @@ pub(crate) fn zip_next_method(args: &[PyObjectRef]) -> PyResult {
     zip_next_w(zip_receiver(args, "__next__")?)
 }
 
-/// `objspace.py:752-753` / `:763-764` — the receiver gate both
-/// `StdObjSpace.finditem_str` and `StdObjSpace.finditem` apply before
-/// taking their shortcut: `isinstance(w_obj, W_DictMultiObject) and not
-/// w_obj.user_overridden_class`.  `is_dict` is the `isinstance` half (it
-/// answers the user-visible question, so a module dict passes); the exact
-/// class comparison is the `user_overridden_class` half, keeping a dict
-/// subclass — whose `__getitem__` or `__missing__` may override the probe
-/// — on the generic path.
+/// `objspace.py StdObjSpace.finditem_str` / `finditem` receiver gate:
+/// `isinstance(w_obj, W_DictMultiObject) and not w_obj.user_overridden_class`.
+/// A dict subclass instance is a `W_ObjectObject` with `DICT_DATA_SLOT` and
+/// its own typeptr, so `is_dict` (typeptr `DICT_TYPE` / `MODULE_DICT_TYPE`)
+/// is the whole answer — no class-word read.
 ///
 /// An exact `frozendict` shares the `W_DictObject` payload, so it takes
 /// the same shortcut. The test sits on the miss path: LOAD_GLOBAL's
@@ -5359,11 +5388,7 @@ pub(crate) fn zip_next_method(args: &[PyObjectRef]) -> PyResult {
 fn is_shortcut_dict(obj: PyObjectRef) -> bool {
     unsafe {
         if pyre_object::is_dict(obj) {
-            let Some(w_type) = crate::typedef::r#type(obj) else {
-                return false;
-            };
-            let dict_type = crate::typedef::gettypeobject(&pyre_object::DICT_TYPE);
-            return !dict_type.is_null() && std::ptr::eq(w_type.as_ptr(), dict_type);
+            return true;
         }
         // Exact `frozendict` is `ob_type == FROZENDICT_TYPE`; a subclass
         // stores its payload in a reserved slot and stays on the generic path.
@@ -6110,11 +6135,49 @@ pub fn finditem_str_named(
         // `sys.modules` read.  Under the JIT the compiled loop has already
         // pinned the dict identity; the interpreter keeps the locked wrapper.
         if majit_metainterp::jit::we_are_jitted() {
-            return Ok(pyre_object::dictmultiobject::nullable_to_option(unsafe {
-                pyre_object::dictmultiobject::w_dict_get_strategy(obj).getitem_str(obj, key)
-            }));
+            // `W_DictObject.get_strategy` is `return self.dstrategy` with no
+            // `jit.promote`. `W_DictMultiObject.getitem_str` is
+            // `get_strategy().getitem_str`. Every strategy implements
+            // `getitem_str_hashed` (Unicode/Object probe with the digest;
+            // Empty returns None; others discard the digest and run
+            // `getitem_str`). A key `__eq__`/`__hash__` can raise; drain
+            // then reads `pycode` for `wrapped_key`. Keep it rooted.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let base = pyre_object::gc_roots::pin_roots(&[pycode]);
+            let hash = named_key_hash(
+                key,
+                pyre_object::gc_roots::shadow_stack_get(base),
+                nameindex,
+            );
+            let hit = unsafe {
+                pyre_object::dictmultiobject::w_dict_get_strategy(obj)
+                    .getitem_str_hashed(obj, key, hash)
+            };
+            return finditem_str_drain(
+                key,
+                pyre_object::gc_roots::shadow_stack_get(base),
+                nameindex,
+                hit,
+            );
         }
-        return finditem_str_shortcut_interp(obj, key, pycode, nameindex);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[obj, pycode]);
+        let hash = named_key_hash(
+            key,
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            nameindex,
+        );
+        let hit = finditem_str_shortcut_interp_hit(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            key,
+            hash,
+        );
+        return finditem_str_drain(
+            key,
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            nameindex,
+            hit,
+        );
     }
     // `wrapped_key` realizes the code object's name slot, or interns a fresh
     // `w_str` for a caller that named none; either allocates.  Keep this arm
@@ -6126,7 +6189,9 @@ pub fn finditem_str_named(
 
 /// Interpreter-only shortcut-dict arm of [`finditem_str_named`]: hashed
 /// getitem plus the wrap-key hash-error recovery.  The wrap allocates, so
-/// the descent scan must not enter it after an effect.
+/// the descent scan must not enter it after an effect.  Residual ABI is
+/// `(obj, key, pycode, nameindex)`; the look-inside graph shares
+/// [`finditem_str_drain`] instead.
 #[majit_macros::dont_look_inside]
 pub(crate) fn finditem_str_shortcut_interp(
     obj: PyObjectRef,
@@ -6141,20 +6206,48 @@ pub(crate) fn finditem_str_shortcut_interp(
         pyre_object::gc_roots::shadow_stack_get(base + 1),
         nameindex,
     );
+    finditem_str_drain(
+        key,
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        nameindex,
+        finditem_str_shortcut_interp_hit(pyre_object::gc_roots::shadow_stack_get(base), key, hash),
+    )
+}
+
+/// Locked hashed getitem for the interpreter arm of [`finditem_str_named`].
+/// The lock is an effect, so the descent scan must not enter this after a
+/// red dict.  Drain sits in [`finditem_str_drain`] after the lookup returns.
+#[majit_macros::dont_look_inside]
+fn finditem_str_shortcut_interp_hit(obj: PyObjectRef, key: &str, hash: i64) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj]);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_getitem_str_checked_hashed(
+        pyre_object::dictmultiobject::w_dict_getitem_str_hashed(
             pyre_object::gc_roots::shadow_stack_get(base),
             key,
             hash,
         )
     }
-    .map_err(|_| {
-        take_pending_dict_key_error(wrapped_key(
-            key,
-            pyre_object::gc_roots::shadow_stack_get(base + 1),
-            nameindex,
-        ))
-    })
+    .unwrap_or(pyre_object::PY_NULL)
+}
+
+/// Shared tail of the shortcut-dict `finditem_str` probe: drain a pending
+/// `r_dict` key `__eq__`/`__hash__` error, then convert the nullable hit.
+/// `AbstractTypedStrategy.getitem` / `getitem_str` propagate that error
+/// through `r_dict`.  Sit here, after the lookup returns, so a later
+/// virtual `getitem_str` dispatch keeps the same recovery.
+fn finditem_str_drain(
+    key: &str,
+    pycode: PyObjectRef,
+    nameindex: usize,
+    hit: PyObjectRef,
+) -> Result<Option<PyObjectRef>, PyError> {
+    if unsafe { pyre_object::dictmultiobject::take_dict_key_error() } {
+        return Err(take_pending_dict_key_error(wrapped_key(
+            key, pycode, nameindex,
+        )));
+    }
+    Ok(pyre_object::dictmultiobject::nullable_to_option(hit))
 }
 
 /// `objspace.py StdObjSpace.finditem_str` generic arm: wrap the key and
@@ -27444,6 +27537,44 @@ mod tests {
         expected.push(rustpython_wtf8::CodePoint::from_char('n'));
         expected.push_str("' object has no getter");
         assert_eq!(surrogate.message_wtf8(), expected);
+    }
+
+    /// `objspace.py StdObjSpace.finditem_str`: a dict subclass is not
+    /// `W_DictMultiObject` here (own typeptr + `DICT_DATA_SLOT`), so it
+    /// misses `is_shortcut_dict`; a plain dict takes the shortcut.
+    #[test]
+    fn shortcut_dict_is_exact_dict_not_a_subclass_instance() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let roots = pyre_object::gc_roots::push_roots();
+        let slot = roots.base();
+        let _ = roots.pin_root(w_dict_new());
+        assert!(is_shortcut_dict(roots.get(slot)));
+
+        let _ = roots.pin_root(crate::typedef::gettypeobject(&pyre_object::DICT_TYPE));
+        let _ = roots.pin_root(w_str_new("DictSub"));
+        let _ = roots.pin_root(w_tuple_new(vec![roots.get(slot + 1)]));
+        let _ = roots.pin_root(w_dict_new());
+        let cls = crate::builtins::type_descr_new(&[
+            crate::typedef::w_type(),
+            roots.get(slot + 2),
+            roots.get(slot + 3),
+            roots.get(slot + 4),
+        ])
+        .expect("class DictSub(dict)");
+        let _ = roots.pin_root(cls);
+        crate::call::clear_call_error();
+        let _ = roots.pin_root(w_tuple_new(Vec::new()));
+        let obj = call(roots.get(slot + 5), roots.get(slot + 6), None);
+        assert!(
+            !obj.is_null(),
+            "DictSub(): {}",
+            crate::call::take_call_error()
+                .map(|err| err.message_text())
+                .unwrap_or_else(|| "null without error".to_string())
+        );
+        let _ = roots.pin_root(obj);
+        assert!(!is_shortcut_dict(roots.get(slot + 7)));
     }
 }
 

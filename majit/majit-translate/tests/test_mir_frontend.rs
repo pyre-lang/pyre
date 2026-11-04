@@ -2207,20 +2207,89 @@ fn a_borrowed_primitive_banks_by_its_container() {
             .collect()
     };
 
+    let slice_graph =
+        lower_function(llbc, "slice_get_tag_dispatch").expect("slice_get_tag_dispatch lowering");
+    let field_reads: Vec<(String, String)> = slice_graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } => Some((
+                field.owner_root.clone().unwrap_or_default(),
+                field.name.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        field_reads
+            .iter()
+            .all(|(owner, name)| !(name == "__pos_0" && owner.contains("::Break"))),
+        "Option<Never> residual is lltype.Void (`_names_without_voids`): Break.__pos_0 is not a FieldRead; got {field_reads:?}"
+    );
+    assert!(
+        field_reads.iter().all(|(owner, name)| {
+            let option_never_owner =
+                owner.ends_with("Option<Never>") && !owner.contains("ControlFlow");
+            !(name == "__discriminant" && option_never_owner)
+        }),
+        "Option<Never> residual is lltype.Void: Option<Never>.__discriminant is not a FieldRead; got {field_reads:?}"
+    );
     assert_eq!(
         payloads("slice_get_tag_dispatch"),
-        vec![
-            (
-                "ops::control_flow::ControlFlow<Option<Never>,u8>::Continue".to_string(),
-                ValueType::Unsigned
-            ),
-            (
-                "ops::control_flow::ControlFlow<Option<Never>,u8>::Break".to_string(),
-                ValueType::Ref(Some("option::Option<Never>".to_string()))
-            ),
-        ],
-        "Option<&u8> `?` is ControlFlow: Continue payload is the byte (Unsigned), Break is Option<Never>; was Option<u8>::Some while the rewrite inlined the diamond",
+        vec![(
+            "ops::control_flow::ControlFlow<Option<Never>,u8>::Continue".to_string(),
+            ValueType::Unsigned
+        ),],
+        "Option<&u8> `?` is ControlFlow: Continue payload is the byte (Unsigned); Break's Option<Never> residual is lltype.Void so the Break arm has no payload FieldRead",
     );
+
+    // Codewriter `get_type_flag`: Option of an uninhabited atom is Void;
+    // Option of a pointer or generic container is not.
+    {
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+        use majit_translate::StructLayout;
+        use std::collections::{HashMap, HashSet};
+        let empty_set = HashSet::new();
+        let empty_sizes = HashMap::new();
+        let empty_ranks = HashMap::new();
+        let field = |ty: &str| {
+            let layout = StructLayout::from_type_strings(
+                &[("f".into(), ty.into())],
+                &empty_set,
+                &empty_sizes,
+                &empty_sizes,
+                &empty_ranks,
+                &empty_set,
+            );
+            (
+                layout.fields[0].flag,
+                layout.fields[0].field_type,
+                layout.fields[0].size,
+            )
+        };
+        let void = (ArrayFlag::Void, Type::Void, 0);
+        for spelling in [
+            "Option<!>",
+            "Option<Never>",
+            "Option<core::convert::Infallible>",
+            "core::option::Option<Infallible>",
+        ] {
+            assert_eq!(field(spelling), void, "{spelling}");
+        }
+        for spelling in [
+            "core::option::Option<*const core::convert::Infallible>",
+            "Option<*const Infallible>",
+            "Option<Vec<Infallible>>",
+            "Option<PhantomData<Infallible>>",
+        ] {
+            let (flag, ty, _) = field(spelling);
+            assert_ne!(flag, ArrayFlag::Void, "{spelling}");
+            assert_ne!(ty, Type::Void, "{spelling}");
+        }
+        assert_eq!(field("PhantomData<Infallible>"), void);
+    }
     assert_eq!(
         payloads("range_start_index"),
         vec![

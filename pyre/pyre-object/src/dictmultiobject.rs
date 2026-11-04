@@ -900,8 +900,14 @@ pub struct DictKeyError;
 /// construction or `space.eq_w` during the bucket probe.  Reading clears
 /// both flags.  The concrete `PyError` rides the interpreter-side
 /// pending slot, retrieved via `take_pending_hash_error`.
+///
+/// Drain this where the lookup returns: `AbstractTypedStrategy.getitem` /
+/// `getitem_str` propagate the `r_dict` error there.
+///
+/// # Safety
+/// Thread-local flag read and clear; no pointer is dereferenced.
 #[inline]
-pub(crate) unsafe fn take_dict_key_error() -> bool {
+pub unsafe fn take_dict_key_error() -> bool {
     let hash = crate::dict_eq_hook::take_hash_error();
     let eq = crate::dict_eq_hook::take_eq_error();
     hash || eq
@@ -1432,8 +1438,7 @@ pub unsafe fn w_dict_get_strategy(
 #[inline]
 pub unsafe fn w_dict_set_strategy(obj: PyObjectRef, strategy: &'static DictStrategyRef) {
     if is_module_dict(obj) {
-        (*(obj as *mut W_ModuleDictObject)).mstrategy =
-            strategy as *const DictStrategyRef as *mut DictStrategyRef;
+        (*(obj as *mut W_ModuleDictObject)).set_strategy(strategy);
         dict_write_barrier(obj);
         return;
     }
@@ -1932,6 +1937,7 @@ pub fn alloc_dict_object(value: W_DictObject, stable: bool) -> PyObjectRef {
 pub static MODULE_DICT_TYPE: PyType = new_pytype("dict");
 
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("mstrategy?")]
 pub struct W_ModuleDictObject {
     pub ob_header: PyObject,
     /// `dstorage` from `W_DictMultiObject.__slots__` (`dictmultiobject.py`).
@@ -1939,8 +1945,9 @@ pub struct W_ModuleDictObject {
     /// Reassignment is a `setfield_gc`; its concrete type follows the live
     /// strategy exactly as `rerased` storage does upstream.
     pub dstorage: GCREF,
-    /// `mstrategy` from `W_ModuleDictObject.__slots__` (`:331`).
+    /// `mstrategy` from `W_ModuleDictObject.__slots__`.
     /// A GC-managed non-moving storage box (off-GC storage).
+    /// `dictmultiobject.py W_ModuleDictObject._immutable_fields_ = ['mstrategy?']`.
     pub mstrategy: *mut DictStrategyRef,
     /// Key-set mutation state corresponding to the live iterator held by
     /// PyPy's ModuleDictStrategy iterator implementation.
@@ -1950,7 +1957,22 @@ pub struct W_ModuleDictObject {
     /// ObjectDictStrategy operate on a module dict after PyPy's literal
     /// `mstrategy`/`dstorage` swap.
     pub clear_gen: usize,
+    /// Hidden `mutate_mstrategy` field `quasiimmut.py get_mutate_field_name`
+    /// names and `rclass.py InstanceRepr._setup_repr` adds as
+    /// `('mutate_' + name, OBJECTPTR)` for
+    /// `dictmultiobject.py W_ModuleDictObject._immutable_fields_ = ['mstrategy?']`.
+    /// Last field so the `W_DictObject` prefix (`dstorage` / strategy /
+    /// `keys_version` / `clear_gen`) stays at the same offsets.
+    pub mutate_mstrategy: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmut>,
+    pub mutate_mstrategy_lock: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmutLock>,
 }
+
+crate::quasi_immut_words!(W_ModuleDictObject, mutate_mstrategy, mutate_mstrategy_lock);
+
+/// Byte offset of `mutate_mstrategy` within [`W_ModuleDictObject`].
+/// `rclass.py InstanceRepr._setup_repr` / `quasiimmut.py get_mutate_field_name`.
+pub const MODULE_DICT_OBJECT_MUTATE_MSTRATEGY_OFFSET: usize =
+    std::mem::offset_of!(W_ModuleDictObject, mutate_mstrategy);
 
 /// GC type id assigned to `W_ModuleDictObject`.  Lands at slot 48,
 /// the first free id after the foreign-pytype loop in
@@ -1982,11 +2004,23 @@ impl W_DictMultiObject for W_ModuleDictObject {
         unsafe { (*self.mstrategy).imp }
     }
 
-    /// `dictmultiobject.py W_ModuleDictObject.set_strategy` (`:341-342`) —
-    /// the bare slot write.  `celldict.py switch_to_object_strategy`
-    /// (`:173-186`) is what composes it with the matching `dstorage` swap.
+    /// `dictmultiobject.py W_ModuleDictObject.set_strategy` — the slot write.
+    /// `rclass.py InstanceRepr.hook_setfield` emits `jit_force_quasi_immutable`
+    /// before the store to `mstrategy?`. Native invalidation is
+    /// `quasi_immut_store!`. `celldict.py switch_to_object_strategy`
+    /// composes it with the matching `dstorage` swap.
+    #[inline]
     fn set_strategy(&mut self, strategy: &'static DictStrategyRef) {
-        self.mstrategy = strategy as *const DictStrategyRef as *mut DictStrategyRef;
+        crate::quasi_immut_store!(self.mutate_mstrategy() =>
+            self.mstrategy = strategy as *const DictStrategyRef as *mut DictStrategyRef;
+        );
+    }
+}
+
+impl W_ModuleDictObject {
+    #[inline]
+    pub fn mutate_mstrategy(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(&self.mutate_mstrategy, &self.mutate_mstrategy_lock)
     }
 }
 
@@ -2053,6 +2087,8 @@ pub fn w_module_dict_new() -> PyObjectRef {
         mstrategy: roots.get(strategy_ref_slot) as *mut DictStrategyRef,
         keys_version: 0,
         clear_gen: 0,
+        mutate_mstrategy: crate::quasiimmut::null_mutate_word(),
+        mutate_mstrategy_lock: crate::quasiimmut::null_mutate_lock(),
     }) as PyObjectRef
 }
 
@@ -2316,7 +2352,7 @@ pub unsafe fn w_module_dict_switch_to_object_strategy(obj: PyObjectRef) {
     // recompile any trace keyed on the prior version.
     strategy.invalidate_caches();
     strategy.mutated();
-    raw.mstrategy = &OBJECT_DICT_STRATEGY_REF as *const DictStrategyRef as *mut DictStrategyRef;
+    raw.set_strategy(&OBJECT_DICT_STRATEGY_REF);
     raw.dstorage = new_storage as GCREF;
     dict_write_barrier(obj);
 }
@@ -7530,6 +7566,12 @@ impl DictStrategy for EmptyKwargsDictStrategy {
         EMPTY_DICT_STRATEGY.getitem(w_dict, w_key)
     }
 
+    /// `kwargsdict.py EmptyKwargsDictStrategy` inherits
+    /// `EmptyDictStrategy.getitem_str` (`return None`).
+    unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> PyObjectRef {
+        EMPTY_DICT_STRATEGY.getitem_str(w_dict, key)
+    }
+
     unsafe fn setitem(
         &self,
         mut w_dict: PyObjectRef,
@@ -7656,6 +7698,11 @@ impl DictStrategy for EmptyDictStrategy {
         // routed through a future Result-aware variant.  Tracked in
         // MEMORY as the "hash hook error propagation" epic.
         let _ = crate::dict_eq_hook::try_hash_w(w_key);
+        PY_NULL
+    }
+
+    /// `dictmultiobject.py EmptyDictStrategy.getitem_str` — `return None`.
+    unsafe fn getitem_str(&self, _w_dict: PyObjectRef, _key: &str) -> PyObjectRef {
         PY_NULL
     }
 
@@ -7840,7 +7887,10 @@ impl DictStrategy for ObjectDictStrategy {
     }
 
     /// `dictmultiobject.py ObjectDictStrategy.getitem_str` —
-    /// upstream just delegates to `getitem` after wrapping the key.
+    /// `AbstractTypedStrategy.getitem_str` wraps `newtext(key)` then
+    /// `getitem`. `StdObjSpace.finditem_str` / `W_DictMultiObject.getitem_str`
+    /// dispatch here; the hashed override is the body the trace descends
+    /// into (borrowed-str object-table probe).
     unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> PyObjectRef {
         self.getitem_str_hashed(w_dict, key, 0)
     }
@@ -8289,7 +8339,10 @@ impl DictStrategy for UnicodeDictStrategy {
         dict_write_barrier(roots.get(dict_slot));
     }
 
-    /// `dictmultiobject.py getitem_str` override.
+    /// `dictmultiobject.py UnicodeDictStrategy.getitem_str`.
+    /// `StdObjSpace.finditem_str` / `W_DictMultiObject.getitem_str` dispatch
+    /// here. The hashed override is the body the trace descends into: a
+    /// borrowed-str object-table probe rather than wrapping `newtext(key)`.
     unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> PyObjectRef {
         self.getitem_str_hashed(w_dict, key, 0)
     }
@@ -9138,5 +9191,44 @@ mod tests {
             <W_ModuleDictObject as crate::lltype::GcType>::SIZE,
             W_MODULE_DICT_OBJECT_SIZE
         );
+        assert_eq!(
+            std::mem::offset_of!(W_ModuleDictObject, dstorage),
+            std::mem::offset_of!(W_DictObject, dstorage),
+        );
+        assert_eq!(
+            std::mem::offset_of!(W_ModuleDictObject, keys_version),
+            std::mem::offset_of!(W_DictObject, keys_version),
+        );
+        assert_eq!(
+            std::mem::offset_of!(W_ModuleDictObject, clear_gen),
+            std::mem::offset_of!(W_DictObject, clear_gen),
+        );
+        assert_eq!(
+            MODULE_DICT_OBJECT_MUTATE_MSTRATEGY_OFFSET,
+            std::mem::offset_of!(W_ModuleDictObject, clear_gen) + std::mem::size_of::<usize>(),
+        );
+        assert_eq!(
+            W_MODULE_DICT_OBJECT_SIZE,
+            std::mem::offset_of!(W_ModuleDictObject, mutate_mstrategy_lock)
+                + std::mem::size_of::<usize>(),
+        );
+    }
+
+    #[test]
+    fn set_strategy_flips_registered_mstrategy_watchers() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let md = w_module_dict_new();
+        unsafe {
+            let raw = &mut *(md as *mut W_ModuleDictObject);
+            let flag = Arc::new(AtomicBool::new(false));
+            let token = crate::quasiimmut::test_loop_token(&flag);
+            raw.mutate_mstrategy()
+                .get_current_qmut_instance()
+                .register_loop_token(&token);
+            assert!(!flag.load(Ordering::Acquire));
+            raw.set_strategy(&OBJECT_DICT_STRATEGY_REF);
+            assert!(flag.load(Ordering::Acquire));
+        }
     }
 }

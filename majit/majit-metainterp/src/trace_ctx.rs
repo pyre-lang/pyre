@@ -6831,38 +6831,12 @@ impl TraceCtx {
         self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], descr)
     }
 
-    /// `heapcache.py is_nullity_known(box)`, supplying the `getref_base()`
-    /// reader its `Const` arm needs. `Some(true)` / `Some(false)` / `None` are
-    /// known-nonnull / known-null / unknown; only `Some(true)` is upstream's
-    /// truthy answer, for the reason spelled out at
-    /// [`Self::trace_assert_not_none`].
-    /// `if self.metainterp.heapcache.is_nullity_known(box):` — upstream's
-    /// *truthiness* test, which is not the same question as
-    /// [`Self::heapcache_nullity_known`] answering `Some`.
-    ///
-    /// `heapcache.py` returns `bool(box.getref_base())` for a `Const` and
-    /// `_check_flag(box, HF_KNOWN_NULLITY)` otherwise, and
-    /// `nullity_now_known` sets that flag for *either* nullity. So a
-    /// non-`Const` box already known to be **null** answers true here and
-    /// short-circuits, while a **null `Const`** answers false and falls
-    /// through. Reading `Some(true)` alone gets the second of those right and
-    /// the first wrong, and re-guards a box whose nullity is already settled.
+    /// `heapcache.py is_nullity_known(box)`: a `Const` answers
+    /// `bool(box.getref_base())` (a NULL constant is not known), else the
+    /// `HF_KNOWN_NULLITY` flag. The flag says nullity is established, never
+    /// which side; the side is `box.nonnull()`.
     pub fn heapcache_nullity_answered(&self, opref: OpRef) -> bool {
         self.heap_cache().is_nullity_known(opref)
-    }
-
-    pub fn heapcache_nullity_known(&self, opref: OpRef) -> Option<bool> {
-        if opref.is_constant() {
-            return Some(self.heap_cache().is_nullity_known(opref));
-        }
-        if !self.heap_cache().is_nullity_known(opref) {
-            return None;
-        }
-        match self.box_value(opref) {
-            Some(Value::Ref(g)) => Some(g.0 != 0),
-            Some(Value::Int(n)) => Some(n != 0),
-            _ => Some(true),
-        }
     }
 
     /// pyjitpl.py `opimpl_assert_not_none`:
@@ -6880,24 +6854,12 @@ impl TraceCtx {
     /// Mirrors RPython's `jit::assert_not_none` hint (rlib/jit.rs +
     /// rtyper/debug.py `ll_assert_not_none`). Cache hit short-circuits
     /// the record and bumps `HEAPCACHED_OPS`; cache miss records
-    /// `AssertNotNone` and stamps `nullity_now_known(true)` so subsequent
+    /// `AssertNotNone` and stamps `nullity_now_known` so subsequent
     /// nullity-aware sites (`_establish_nullity`, KnownClass guards) can
     /// skip their own checks.
     pub fn trace_assert_not_none(&mut self, opref: OpRef, concrete: i64) {
         // pyjitpl.py `if self.metainterp.heapcache.is_nullity_known(box):`
-        // — RPython's `is_nullity_known` (heapcache.py) returns
-        // `bool(box.getref_base())` for `Const` and `_check_flag(...
-        // HF_KNOWN_NULLITY)` otherwise.  `class_now_known` sets
-        // `HF_KNOWN_NULLITY` alongside `HF_KNOWN_CLASS` (line 470-473),
-        // so the flag semantically means "known to be non-null".
-        // The `if`-test therefore short-circuits only on truthy values
-        // — `Const` known-null returns `False` and falls through to
-        // `executor.do_assert_not_none`, which `fatalerror`s on null
-        // (executor.py:344-346).  Pyre's `is_nullity_known` returns
-        // `Some(true)` for known non-null, `Some(false)` for known
-        // null, `None` for unknown — match PyPy's semantics by
-        // short-circuiting only on `Some(true)`.
-        if self.heapcache_nullity_known(opref) == Some(true) {
+        if self.heap_cache().is_nullity_known(opref) {
             self.profiler().count_ops(
                 OpCode::AssertNotNone,
                 crate::pyjitpl::counters::HEAPCACHED_OPS,

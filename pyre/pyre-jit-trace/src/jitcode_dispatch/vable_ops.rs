@@ -1350,7 +1350,8 @@ pub(crate) fn vable_array_descrs_from_jitcode<Sym: WalkSym>(
 /// promoted box, so nothing downstream would otherwise see the pinned value.
 /// `pyjitpl.py MIFrame.implement_guard_value`: record `GUARD_VALUE` and
 /// capture the live framestack at the promote (`generate_guard` →
-/// `capture_resumedata`).
+/// `capture_resumedata`). A box that is already a `Const` is returned
+/// unchanged.
 pub(crate) fn walker_implement_guard_value<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,

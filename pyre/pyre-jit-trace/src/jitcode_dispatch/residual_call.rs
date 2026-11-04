@@ -10215,6 +10215,116 @@ fn try_do_residual_or_indirect_call<Sym: WalkSym>(
     let Some(jitcode) = crate::state::bytecode_for_address(addr as usize) else {
         return Ok(None);
     };
+    if fbw_debug_abort_enabled() {
+        eprintln!(
+            "[residual-indirect-call] pc={op_pc} addr={addr:#x} jitcode={} name={}",
+            jitcode.index(),
+            jitcode.name
+        );
+    }
+    try_perform_call(
+        ctx,
+        op_pc,
+        next_pc,
+        jitcode.as_ref(),
+        i_args,
+        r_args,
+        f_args,
+        dst,
+        dst_bank,
+    )
+}
+
+/// `pyopcode.py PyFrame._load_global` is an ordinary interpreter call.
+/// The legacy opcode lowering carries code/name-index operands instead of
+/// its `varname` STR. Bind those immutable operands to the generated
+/// `NamespaceOpcodeHandler::load_global_value` body, then use `perform_call`;
+/// no dictionary lookup or result is emitted here by hand.
+fn try_load_global_descent<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    next_pc: usize,
+    i_args: &[OpRef],
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let Some(jitcode) = crate::jitcode_runtime::pathed_runtime_jitcode_cached(
+        "pyframe::PyFrame::<impl pyre_interpreter::pyopcode::NamespaceOpcodeHandler<pyre_interpreter::pyframe::PyFrame>>::load_global_value",
+    ) else {
+        return Ok(None);
+    };
+    let (Some(&namei), Some(&w_code), Some(&frame)) =
+        (i_args.first(), r_args.get(1), r_args.get(2))
+    else {
+        return Ok(None);
+    };
+    if !matches!(ctx.trace_ctx.box_value(frame), Some(Value::Ref(p))
+        if !p.is_null() && p != majit_ir::GcRef::NO_CONCRETE)
+    {
+        return Ok(None);
+    }
+    // `pyopcode.py getname_w` is a plain read of the green code's immutable
+    // `co_names_w` slot. A concrete observation of a red operand does not
+    // establish that identity, so it cannot supply a constant name to the
+    // source body.
+    if !namei.is_constant() || !w_code.is_constant() {
+        return Ok(None);
+    }
+    let (Some(Value::Int(raw)), Some(Value::Ref(code))) = (
+        ctx.trace_ctx.box_value(namei),
+        ctx.trace_ctx.box_value(w_code),
+    ) else {
+        return Ok(None);
+    };
+    if raw < 0 || code.is_null() || code == majit_ir::GcRef::NO_CONCRETE {
+        return Ok(None);
+    }
+    let code = code.as_usize() as pyre_object::PyObjectRef;
+    if !unsafe { pyre_interpreter::is_code(code) } {
+        return Ok(None);
+    }
+    let name_index = (raw as usize) >> 1;
+    if !unsafe { pyre_interpreter::pycode::w_code_name_index_covered(code, name_index) } {
+        return Ok(None);
+    }
+    let name = unsafe { pyre_interpreter::pycode::w_code_getname_w(code, name_index) };
+    if name.is_null() {
+        return Ok(None);
+    }
+    // The translated &str parameter is an rstr STR, the same storage the
+    // source getname_w/text_w pair supplies. co_names_w roots its wrapper;
+    // const_ref gives the payload a moving-GC-aware operand of its own.
+    let storage = unsafe { pyre_object::unicodeobject::w_str_storage(name) };
+    let name = ctx.trace_ctx.const_ref(storage as i64);
+    let index = ctx.trace_ctx.const_int(name_index as i64);
+    try_perform_call(
+        ctx,
+        op_pc,
+        next_pc,
+        jitcode.as_ref(),
+        &[index],
+        &[frame, name],
+        &[],
+        dst,
+        dst_bank,
+    )
+}
+
+/// `pyjitpl.py MIFrame.perform_call`: enter one generated helper body with
+/// its own typed register banks. Shared by address-resolved calls and the
+/// interpreter-source body selected by an opcode lowering.
+fn try_perform_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    next_pc: usize,
+    jitcode: &majit_metainterp::jitcode::JitCode,
+    i_args: &[OpRef],
+    r_args: &[OpRef],
+    f_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     if ctx.fbw_mode.transparent_helper_jitcode_index == Some(jitcode.index()) {
         // Already walking this jitcode. `perform_call` would push
         // another `MIFrame`; the walker is one walk with a reentry flag.
@@ -10236,20 +10346,13 @@ fn try_do_residual_or_indirect_call<Sym: WalkSym>(
         // Extra args cannot be stored. Capability bound, not a callee filter.
         return Ok(None);
     }
-    if fbw_debug_abort_enabled() {
-        eprintln!(
-            "[residual-indirect-call] pc={op_pc} addr={addr:#x} jitcode={} name={}",
-            jitcode.index(),
-            jitcode.name
-        );
-    }
     let int_concretes = residual_arg_concretes(ctx, i_args);
     let ref_concretes = residual_arg_concretes(ctx, r_args);
-    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let effects_before = fbw_executed_effect_count();
-    let unjournaled_before = fbw_has_unjournaled_effect();
-    let saved_th_index = ctx.fbw_mode.transparent_helper_jitcode_index;
-    ctx.fbw_mode.transparent_helper_jitcode_index = Some(jitcode.index());
+    // `pyjitpl.py MIFrame.perform_call` leaves the caller's jitcode intact
+    // while `newframe` creates the callee. The boundary captures that
+    // caller at op_pc; run_sub_jitcode_walk installs the callee's index on
+    // its own frame. Installing it here made nested residual descents save
+    // the caller's pc against the callee's unrelated bytecode.
     let exc_before = ctx.last_exc_value();
     let walk = run_codewriter_helper_inline_call(
         ctx,
@@ -10261,26 +10364,14 @@ fn try_do_residual_or_indirect_call<Sym: WalkSym>(
         &ref_concretes,
         f_args,
     );
-    ctx.fbw_mode.transparent_helper_jitcode_index = saved_th_index;
     let walk_outcome = match walk {
         Ok(outcome) => outcome,
         Err(error) if abort_blackhole_latched() => return Err(error),
-        Err(DispatchError::GuardResumeCoordinateUnavailable { .. }) => {
-            // Resume has no coordinate for this subwalk, so the call
-            // stays residual (`do_residual_call`).
-            cut_declined_subwalk(ctx, pre_fold_pos);
-            return Ok(None);
-        }
         Err(DispatchError::OrthodoxSubWalkTraceUnsupported { symbolic, .. }) => {
-            let nothing_applied = fbw_executed_effect_count() == effects_before
-                && !unjournaled_before
-                && !fbw_has_unjournaled_effect();
-            if nothing_applied {
-                // Subwalk declined before mutating the trace: same as
-                // `do_residual_call` after a failed `perform_call`.
-                cut_declined_subwalk(ctx, pre_fold_pos);
-                return Ok(None);
-            }
+            // `perform_call` has entered this generated body. An unlowered
+            // operation aborts tracing; it does not change this call into a
+            // residual of the Rust function. In particular, a dyn method's
+            // native fat-argument ABI need not be the JitCode's word ABI.
             return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
                 pc: op_pc,
                 symbolic,
@@ -12559,6 +12650,14 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 }
             }
         }
+    }
+
+    if ctx.is_authoritative_executor
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadGlobal
+        && let Some(outcome) =
+            try_load_global_descent(ctx, op.pc, op.next_pc, &i_args, &r_args, dst, dst_bank)?
+    {
+        return Ok(outcome);
     }
 
     // LoadName fold: module-scope LOAD_NAME mirror of the LoadGlobal fold

@@ -3433,6 +3433,49 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
         config.promote_args
     };
 
+    match expand_elidable_promote(func, &promote_args_str) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// `rlib/jit.py elidable_promote` — `self = hint(self, promote=True)` then
+/// `_orig_func_unlikely_name(self, ...)`.  `&self` / `&mut self` bind the
+/// promoted pointer so the original is called through it (`ref_guard_value`
+/// on the GCREF).
+enum PromotedSelfKind {
+    Shared,
+    Exclusive,
+}
+
+impl PromotedSelfKind {
+    fn stmt(self) -> proc_macro2::TokenStream {
+        match self {
+            Self::Shared => quote! {
+                let __majit_self = unsafe { &*majit_ir::jit::promote(self as *const Self) };
+            },
+            Self::Exclusive => quote! {
+                let __majit_self = unsafe { &mut *majit_ir::jit::promote(self as *mut Self) };
+            },
+        }
+    }
+}
+
+fn promoted_self_kind(recv: &syn::Receiver) -> syn::Result<PromotedSelfKind> {
+    match (&recv.reference, &recv.mutability, &recv.colon_token) {
+        (Some(_), None, None) => Ok(PromotedSelfKind::Shared),
+        (Some(_), Some(_), None) => Ok(PromotedSelfKind::Exclusive),
+        _ => Err(syn::Error::new_spanned(
+            recv,
+            "elidable_promote: unsupported receiver",
+        )),
+    }
+}
+
+fn expand_elidable_promote(
+    func: ItemFn,
+    promote_args_str: &str,
+) -> syn::Result<proc_macro2::TokenStream> {
     let arg_count = func.sig.inputs.len();
     let promote_indices: Vec<usize> = if promote_args_str == "all" {
         (0..arg_count).collect()
@@ -3448,7 +3491,7 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
     let sig = &func.sig;
     let block = &func.block;
     let fn_name = &sig.ident;
-    // rlib/jit.py:196 — _orig_func_unlikely_name
+    // rlib/jit.py elidable_promote — `_orig_func_unlikely_name`
     let orig_name = format_ident!("_orig_{}_unlikely_name", fn_name);
     let output = &sig.output;
 
@@ -3473,29 +3516,46 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    // rlib/jit.py — promote each selected arg with both hints.
-    // promote_indices index into full arg list (including self), matching _get_args.
-    let promote_stmts: Vec<_> = promote_indices
-        .iter()
-        .filter_map(|&idx| {
-            if has_self && idx == 0 {
-                // rlib/jit.py — promote self by identity (guard_value on pointer)
-                Some(quote! {
-                    let _ = majit_ir::jit::promote(self as *const _ as usize);
-                })
-            } else {
-                let named_idx = if has_self { idx - 1 } else { idx };
-                named_args.get(named_idx).map(|name| {
-                    quote! { let #name = majit_ir::jit::promote(#name); }
-                })
+    let promote_self = has_self && promote_indices.contains(&0);
+    let promoted_self = if promote_self {
+        match sig.inputs.first() {
+            Some(FnArg::Receiver(recv)) => Some(promoted_self_kind(recv)?),
+            _ => {
+                return Err(syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "elidable_promote: unsupported receiver",
+                ));
             }
-        })
-        .collect();
+        }
+    } else {
+        None
+    };
+
+    // rlib/jit.py elidable_promote — promote each selected arg
+    // (`hint(arg, promote=True)`).  Indices cover the full arg list
+    // including self, matching `_get_args`.
+    let mut promote_stmts: Vec<proc_macro2::TokenStream> = Vec::new();
+    if let Some(kind) = promoted_self {
+        promote_stmts.push(kind.stmt());
+    }
+    for &idx in &promote_indices {
+        if has_self && idx == 0 {
+            continue;
+        }
+        let named_idx = if has_self { idx - 1 } else { idx };
+        if let Some(name) = named_args.get(named_idx) {
+            promote_stmts.push(quote! { let #name = majit_ir::jit::promote(#name); });
+        }
+    }
 
     let call_args: Vec<_> = param_names.clone();
     let orig_call = if has_self {
         let method_args = call_args.iter().skip(1);
-        quote! { self.#orig_name(#(#method_args),*) }
+        if promote_self {
+            quote! { __majit_self.#orig_name(#(#method_args),*) }
+        } else {
+            quote! { self.#orig_name(#(#method_args),*) }
+        }
     } else {
         quote! { #orig_name(#(#call_args),*) }
     };
@@ -3510,30 +3570,23 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
         ..func.clone()
     };
     let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&orig_func, true, Some(fn_name), "elidable", &[], false) {
-            Ok(Some((trace_name, concrete_name, tokens))) => {
+        match emit_helper_call_target_fn(&orig_func, true, Some(fn_name), "elidable", &[], false)? {
+            Some((trace_name, concrete_name, tokens)) => {
                 (Some(trace_name), Some(concrete_name), Some(tokens))
             }
-            Ok(None) => (None, None, None),
-            Err(err) => return err.to_compile_error().into(),
+            None => (None, None, None),
         };
     let policy_path = Path::from(orig_name.clone());
-    let policy_fn = match emit_helper_policy_fn(
+    let policy_fn = emit_helper_policy_fn(
         &policy_path,
         vis,
-        match helper_policy_tokens_for_fn(
+        helper_policy_tokens_for_fn(
             &orig_func,
             "elidable",
             trace_target_name.as_ref(),
             concrete_target_name.as_ref(),
-        ) {
-            Ok(tokens) => tokens,
-            Err(err) => return err.to_compile_error().into(),
-        },
-    ) {
-        Ok(tokens) => tokens,
-        Err(err) => return err.to_compile_error().into(),
-    };
+        )?,
+    )?;
 
     // `rlib/jit.py elidable(func)` — the ORIGINAL `func` is what
     // receives `_elidable_function_ = True`; `result` (the returned
@@ -3556,7 +3609,7 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let orig_body_markers = rpython_attribute_body_markers("elidable", &orig_func.sig);
 
-    let expanded = quote! {
+    Ok(quote! {
         // rlib/jit.py — elidable(func); original body hidden
         #[inline(never)]
         #[doc(hidden)]
@@ -3571,7 +3624,7 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
         #call_target_fn
         #policy_fn
 
-        // rlib/jit.py:188-200 — the decorated name IS the promoting wrapper
+        // rlib/jit.py elidable_promote — the decorated name IS the promoting wrapper
         #(#attrs)*
         #vis fn #fn_name(#(#full_params),*) #output {
             #(#promote_stmts)*
@@ -3579,9 +3632,7 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         #orig_elidable_const
-    };
-
-    expanded.into()
+    })
 }
 
 /// Parse helper for `#[elidable_promote(promote_args = "...")]`.
@@ -5478,6 +5529,90 @@ mod tests {
         );
         assert!(text.contains("stringify ! (leaf)"), "{text}");
     }
+
+    fn compact_tokens(tokens: &proc_macro2::TokenStream) -> String {
+        tokens
+            .to_string()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    #[test]
+    fn elidable_promote_shared_receiver_binds_promoted_pointer() {
+        let func = parse_fn("fn leaf(&self, x: i64) -> i64 { x }");
+        let tokens = expand_elidable_promote(func, "all").expect("expand");
+        let compact = compact_tokens(&tokens);
+        assert!(
+            compact.contains("let__majit_self=unsafe{&*majit_ir::jit::promote(selfas*constSelf)}"),
+            "{compact}"
+        );
+        assert!(
+            compact.contains("__majit_self._orig_leaf_unlikely_name(x)"),
+            "{compact}"
+        );
+        assert!(!compact.contains("asusize"), "{compact}");
+    }
+
+    #[test]
+    fn elidable_promote_mut_receiver_binds_promoted_pointer() {
+        let func = parse_fn("fn leaf(&mut self, x: i64) -> i64 { x }");
+        let tokens = expand_elidable_promote(func, "all").expect("expand");
+        let compact = compact_tokens(&tokens);
+        assert!(
+            compact.contains("let__majit_self=unsafe{&mut*majit_ir::jit::promote(selfas*mutSelf)}"),
+            "{compact}"
+        );
+        assert!(
+            compact.contains("__majit_self._orig_leaf_unlikely_name(x)"),
+            "{compact}"
+        );
+        assert!(!compact.contains("asusize"), "{compact}");
+    }
+
+    #[test]
+    fn elidable_promote_unpromoted_self_calls_through_self() {
+        let func = parse_fn("fn leaf(&self, x: i64) -> i64 { x }");
+        let tokens = expand_elidable_promote(func, "1").expect("expand");
+        let compact = compact_tokens(&tokens);
+        assert!(!compact.contains("__majit_self"), "{compact}");
+        assert!(
+            compact.contains("self._orig_leaf_unlikely_name(x)"),
+            "{compact}"
+        );
+        assert!(
+            compact.contains("letx=majit_ir::jit::promote(x)"),
+            "{compact}"
+        );
+    }
+
+    #[test]
+    fn elidable_promote_by_value_receiver_is_unsupported() {
+        let func = parse_fn("fn leaf(self, x: i64) -> i64 { x }");
+        let err = expand_elidable_promote(func, "all").unwrap_err();
+        assert_eq!(err.to_string(), "elidable_promote: unsupported receiver");
+    }
+
+    #[test]
+    fn elidable_promote_boxed_receiver_is_unsupported() {
+        let func = parse_fn("fn leaf(self: Box<Self>, x: i64) -> i64 { x }");
+        let err = expand_elidable_promote(func, "all").unwrap_err();
+        assert_eq!(err.to_string(), "elidable_promote: unsupported receiver");
+    }
+
+    #[test]
+    fn elidable_promote_free_function_promotes_args() {
+        let func = parse_fn("fn leaf(x: i64) -> i64 { x }");
+        let tokens = expand_elidable_promote(func, "all").expect("expand");
+        let compact = compact_tokens(&tokens);
+        assert!(!compact.contains("__majit_self"), "{compact}");
+        assert!(
+            compact.contains("letx=majit_ir::jit::promote(x)"),
+            "{compact}"
+        );
+        assert!(compact.contains("_orig_leaf_unlikely_name(x)"), "{compact}");
+        assert!(!compact.contains("asusize"), "{compact}");
+    }
     fn specialize_argtype_tokens(attr: &str, src: &str) -> proc_macro2::TokenStream {
         let args: SpecializeArgtypeArgs = syn::parse_str(attr).expect("indices parse");
         expand_specialize_argtype(&args.indices, &parse_fn(src))
@@ -5573,6 +5708,27 @@ mod tests {
             };
             item.ident == name && const_lit_str(item).as_deref() == Some(spec)
         })
+    }
+
+    #[test]
+    fn look_inside_iff_trampoline_has_word_abi_for_str_and_nullable_result() {
+        let func = parse_fn(
+            "pub unsafe fn lookup(entries: *const (), hash: i64, key: &str) -> Option<PyObjectRef> { None }",
+        );
+        let predicate: Path = syn::parse_str("lookup_iff").unwrap();
+        let items = parse_expansion_items(expand_look_inside_iff_item(predicate, func));
+        let target = expansion_fn(&items, "__majit_call_target_lookup_trampoline");
+        assert_eq!(target.sig.inputs.len(), 3);
+        for arg in &target.sig.inputs {
+            let FnArg::Typed(arg) = arg else {
+                panic!("word ABI cannot have a receiver");
+            };
+            let ty = &arg.ty;
+            assert_eq!(quote!(#ty).to_string(), "i64");
+        }
+        let output = &target.sig.output;
+        assert_eq!(quote!(#output).to_string(), "-> i64");
+        assert!(target.sig.abi.is_some(), "residual entry must have a C ABI");
     }
 
     /// `rlib/jit.py look_inside_iff`: `trampoline.oopspec = func.oopspec;

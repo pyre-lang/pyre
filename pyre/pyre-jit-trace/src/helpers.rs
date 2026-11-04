@@ -1931,11 +1931,9 @@ pub fn emit_new_pyframe_inline_with_params(
     // setfield for them; clear_gc_fields initializes these GC-reference slots,
     // so the fields read back as PY_NULL. No explicit store here.
     //
-    // `w_builtin` joins them: the frame constructor (pyframe.py) assigns
-    // `self.builtin` only under `honor__builtins__`, which
-    // `baseobjspace::HONOR_BUILTINS` leaves off, so the constructor writes
-    // nothing and every reader goes through `get_builtin`, which answers
-    // `space.builtin` for an unset slot.
+    // `w_builtin` joins them on ordinary frames: the field is unset except
+    // on honored frames, and `get_builtin` falls back to `space.builtin`
+    // when it is unset.  The constructor therefore writes nothing.
 
     Some(new_frame)
 }
@@ -2181,11 +2179,9 @@ pub fn emit_new_pyframe_inline_self_recursive(
     // setfield for them; clear_gc_fields initializes these GC-reference slots,
     // so the fields read back as PY_NULL. No explicit store here.
     //
-    // `w_builtin` joins them: the frame constructor (pyframe.py) assigns
-    // `self.builtin` only under `honor__builtins__`, which
-    // `baseobjspace::HONOR_BUILTINS` leaves off, so the constructor writes
-    // nothing and every reader goes through `get_builtin`, which answers
-    // `space.builtin` for an unset slot.
+    // `w_builtin` joins them on ordinary frames: the field is unset except
+    // on honored frames, and `get_builtin` falls back to `space.builtin`
+    // when it is unset.  The constructor therefore writes nothing.
 
     Some(new_frame)
 }

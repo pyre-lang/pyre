@@ -1116,6 +1116,26 @@ mod helper_fnaddr_registry {
         if flag == 0 { Err(PyError(3)) } else { Ok(x) }
     }
 
+    struct ProbeRecv(i64);
+
+    impl ProbeRecv {
+        #[elidable_promote]
+        fn value(&self) -> i64 {
+            self.0
+        }
+
+        #[elidable_promote]
+        fn add_mut(&mut self, n: i64) -> i64 {
+            self.0 += n;
+            self.0
+        }
+
+        #[elidable_promote(promote_args = "1")]
+        fn add(&self, n: i64) -> i64 {
+            self.0 + n
+        }
+    }
+
     #[test]
     fn registered_float_abi_trampolines_are_callable_through_published_address() {
         let mut found_ff = false;
@@ -1256,5 +1276,14 @@ mod helper_fnaddr_registry {
             found,
             "getfunctionptr trampoline was not registered under residual_word_result"
         );
+    }
+
+    #[test]
+    fn elidable_promote_method_calls_through_promoted_receiver() {
+        assert_eq!(ProbeRecv(4).value(), 4);
+        assert_eq!(ProbeRecv(4).add(3), 7);
+        let mut recv = ProbeRecv(4);
+        assert_eq!(recv.add_mut(3), 7);
+        assert_eq!(recv.value(), 7);
     }
 }

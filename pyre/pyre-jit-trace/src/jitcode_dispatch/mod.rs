@@ -7655,9 +7655,8 @@ fn walker_inline_frame_get_w_globals<Sym: WalkSym>(
         return Ok(None);
     }
     Ok(Some(crate::state::frame_get_globals_obj(
-        ctx.trace_ctx,
-        frame,
-    )))
+        ctx, op_pc, frame,
+    )?))
 }
 
 fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
@@ -12409,7 +12408,8 @@ fn walker_emit_guard_with_snapshot<Sym: WalkSym>(
         _ => None,
     };
     if let (Some(subject), Some(is_nonnull)) = (subject, nullity)
-        && ctx.trace_ctx.heapcache_nullity_known(subject) == Some(is_nonnull)
+        && ctx.trace_ctx.heap_cache().is_nullity_known(subject)
+        && crate::state::box_nonnull_value(ctx.trace_ctx, subject) == Some(is_nonnull)
     {
         return Ok(());
     }
@@ -12534,7 +12534,8 @@ fn walker_emit_anchored_fold_guard<Sym: WalkSym>(
         return Ok(true);
     }
     if let (Some(subject), Some(is_nonnull)) = (subject, nullity)
-        && ctx.trace_ctx.heapcache_nullity_known(subject) == Some(is_nonnull)
+        && ctx.trace_ctx.heap_cache().is_nullity_known(subject)
+        && crate::state::box_nonnull_value(ctx.trace_ctx, subject) == Some(is_nonnull)
     {
         return Ok(true);
     }
@@ -14950,8 +14951,9 @@ pub(super) fn walker_call_trace_hook_reads<Sym: WalkSym>(
     Ok(())
 }
 
-/// RPython `pyjitpl.py _establish_nullity(box, orgpc)` — the shared body
-/// behind `opimpl_goto_if_not_ptr_nonzero` / `opimpl_goto_if_not_ptr_iszero`:
+/// RPython `pyjitpl.py MIFrame._establish_nullity(box, orgpc)` — the shared
+/// body behind `opimpl_goto_if_not_ptr_nonzero` /
+/// `opimpl_goto_if_not_ptr_iszero`:
 ///
 ///   value = box.nonnull()
 ///   if heapcache.is_nullity_known(box):
@@ -14974,40 +14976,44 @@ pub(super) fn walker_call_trace_hook_reads<Sym: WalkSym>(
 /// stays walker-side because resume snapshots are —
 /// `walker_emit_guard_with_snapshot` is the walk's `generate_guard`.
 ///
-/// The heapcache check runs before `box.nonnull()`: upstream reads the
-/// concrete pointer unconditionally, but the walker knows it only through
-/// the concrete shadow, which may be absent even when a prior guard already
-/// proved the box's nullity. Consulting the cache first keeps the known
-/// answer from being lost to a missing shadow (the value is read lazily only
-/// on a cache miss).
-///
-/// Returns `box.nonnull()`.
-fn establish_nullity<Sym: WalkSym>(
-    code: &[u8],
-    op: &DecodedOp,
+/// `value` is already `box.nonnull()`. `heapcache.py is_nullity_known` is
+/// the boolean flag (a NULL constant is not known). The side is always
+/// `value`, never the flag.
+fn establish_nullity_with_value<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
     boxref: OpRef,
+    value: bool,
 ) -> Result<bool, DispatchError> {
-    // Pyre's `is_nullity_known` splits upstream's boolean into which side is
-    // known (`Some(true)` non-null, `Some(false)` null, `None` unknown). When
-    // the nullity is already known, the stored side *is* `box.nonnull()` — an
-    // SSA box's nullity is immutable — so the heapcache answers the branch
-    // without reading the pointer. This is consulted before the concrete
-    // shadow so a box whose nullity a prior guard proved still resolves even
-    // when its Ref shadow is absent.
-    let known = ctx.trace_ctx.heapcache_nullity_known(boxref);
-    if let Some(value) = known {
+    if ctx.trace_ctx.heap_cache().is_nullity_known(boxref) {
         ctx.trace_ctx.profiler().count_ops(
             OpCode::GuardNonnull,
             majit_metainterp::counters::HEAPCACHED_OPS,
         );
         return Ok(value);
     }
-    // Nullity not yet known: `box.nonnull()` reads the pointer itself. The
-    // walker knows it only through the concrete shadow, and an absent shadow
-    // is not evidence of either nullity, so decline rather than guess the
-    // branch direction.
-    //
+    if value {
+        if !ctx.trace_ctx.heap_cache().is_class_known(boxref) {
+            walker_emit_guard_with_snapshot(ctx, pc, OpCode::GuardNonnull, &[boxref])?;
+        }
+    } else if !boxref.is_constant() {
+        walker_emit_guard_with_snapshot(ctx, pc, OpCode::GuardIsnull, &[boxref])?;
+        let promoted = ctx.trace_ctx.const_ref(0);
+        vable_ops::walker_replace_box(ctx, boxref, promoted);
+    }
+    ctx.trace_ctx.heap_cache_mut().nullity_now_known(boxref);
+    Ok(value)
+}
+
+/// Register form of `_establish_nullity`: read `box.nonnull()` from the
+/// operand register (and the `cast_int_to_ptr` bits on the box when the
+/// register is Null), then share [`establish_nullity_with_value`].
+fn establish_nullity<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    boxref: OpRef,
+) -> Result<bool, DispatchError> {
     // `cast_int_to_ptr` of an aligned word publishes the bits on the box
     // (`unop_cast_record`) and leaves the register Null so `is_method`
     // cannot load `ob_type` from a non-object (`inline_call.rs` callable-slot
@@ -15034,82 +15040,24 @@ fn establish_nullity<Sym: WalkSym>(
         });
     };
     let value = bits != 0;
-    if value {
-        // A known class already implies non-null, so the guard is redundant.
-        if !ctx.trace_ctx.heap_cache().is_class_known(boxref) {
-            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[boxref])?;
-        }
-    } else if !boxref.is_constant() {
-        walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[boxref])?;
-        // `constant_from_op` of a proven-null ref is the null constant.
-        let promoted = ctx.trace_ctx.const_ref(0);
-        vable_ops::walker_replace_box(ctx, boxref, promoted);
-    }
-    ctx.trace_ctx.heap_cache_mut().nullity_now_known(boxref);
-    Ok(value)
+    establish_nullity_with_value(ctx, op.pc, boxref, value)
 }
 
 /// `_establish_nullity` (`pyjitpl.py`) for a box the walk already holds,
-/// not a `goto_if_not_ptr_*` operand register. Same guard plus
-/// `heapcache.nullity_now_known` sequence as [`establish_nullity`]: skip
-/// when `heapcache.is_nullity_known`, otherwise record `GUARD_NONNULL` /
-/// `GUARD_ISNULL` from the box's own bits. `None` when those bits are
-/// absent — the caller declines rather than guessing the arm.
+/// not a `goto_if_not_ptr_*` operand register. `value` comes from the box's
+/// own concrete; `None` when those bits are absent — the caller declines
+/// rather than assuming non-null.
 pub(super) fn establish_nullity_of_box<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     boxref: OpRef,
 ) -> Result<Option<bool>, DispatchError> {
-    let known = ctx.trace_ctx.heapcache_nullity_known(boxref);
-    if let Some(value) = known {
-        ctx.trace_ctx.profiler().count_ops(
-            OpCode::GuardNonnull,
-            majit_metainterp::counters::HEAPCACHED_OPS,
-        );
-        return Ok(Some(value));
-    }
-    if matches!(
-        ctx.trace_ctx.opcode_of(boxref),
-        Some(OpCode::New | OpCode::NewWithVtable)
-    ) {
-        // `heapcache.py new` sets `HF_KNOWN_NULLITY`; a fresh allocation is
-        // non-null even when the flag was not yet stamped on this box.
-        ctx.trace_ctx.heap_cache_mut().nullity_now_known(boxref);
-        return Ok(Some(true));
-    }
-    // `_establish_nullity` reads `box.nonnull()`. The walker knows it only
-    // through the concrete shadow on the box itself.
-    let ptr_bits = match ctx.trace_ctx.box_value(boxref) {
-        Some(majit_ir::Value::Ref(r)) => {
-            let bits = r.as_usize();
-            if r != majit_ir::GcRef::NO_CONCRETE && bits % std::mem::align_of::<usize>() == 0 {
-                Some(bits)
-            } else {
-                None
-            }
-        }
-        _ => match ctx.trace_ctx.concrete_of_opref(boxref) {
-            Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => {
-                Some(r.as_usize())
-            }
-            _ => None,
-        },
-    };
-    let Some(bits) = ptr_bits else {
+    let Some(value) = crate::state::box_nonnull_value(ctx.trace_ctx, boxref) else {
         return Ok(None);
     };
-    let value = bits != 0;
-    if value {
-        if !ctx.trace_ctx.heap_cache().is_class_known(boxref) {
-            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[boxref])?;
-        }
-    } else if !boxref.is_constant() {
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardIsnull, &[boxref])?;
-        let promoted = ctx.trace_ctx.const_ref(0);
-        vable_ops::walker_replace_box(ctx, boxref, promoted);
-    }
-    ctx.trace_ctx.heap_cache_mut().nullity_now_known(boxref);
-    Ok(Some(value))
+    Ok(Some(establish_nullity_with_value(
+        ctx, op_pc, boxref, value,
+    )?))
 }
 
 /// The unary members of the fused-goto family. `pyjitpl.py`
@@ -16745,7 +16693,7 @@ fn handle<Sym: WalkSym>(
         // Operand layout `r`: 1B ref reg.
         "assert_not_none/r" => {
             let opref = read_ref_reg(code, op, 0, ctx)?;
-            let known_nonnull = ctx.trace_ctx.heapcache_nullity_known(opref) == Some(true);
+            let known_nonnull = ctx.trace_ctx.heap_cache().is_nullity_known(opref);
             let concrete = if known_nonnull {
                 0
             } else {

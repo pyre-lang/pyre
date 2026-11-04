@@ -7493,13 +7493,14 @@ fn emit_int_ovf_to_long<Sym: WalkSym>(
 }
 
 /// The machine-int body of `int_add` / `int_sub` / `int_mul` / bitwise
-/// and of `int_floordiv` / `int_mod` (`descroperation.rs`): unbox,
-/// `int_*_ovf` or `int_and`/`or`/`xor` or the `OS_INT_PY_DIV` /
+/// `or`/`xor` and of `int_floordiv` / `int_mod` (`descroperation.rs`):
+/// unbox, `int_*_ovf` or `int_or`/`xor` or the `OS_INT_PY_DIV` /
 /// `OS_INT_PY_MOD` elidable, rebox.  Used when a helper walk cannot
 /// stamp its resume word (`GuardResumeCoordinateUnavailable`) so the
 /// call would otherwise become `CallMayForce`.  Does not walk
 /// `binary_value_from_tag` — that re-enters the same `add` inline and
-/// recurses.
+/// recurses.  `&` declines so `and_` / `_invoke_binop` /
+/// `_check_notimplemented` record (`intshortcut` is add/sub only).
 pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -7554,7 +7555,6 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
         Some(B::Add | B::InplaceAdd) => OpCode::IntAddOvf,
         Some(B::Subtract | B::InplaceSubtract) => OpCode::IntSubOvf,
         Some(B::Multiply | B::InplaceMultiply) => OpCode::IntMulOvf,
-        Some(B::And | B::InplaceAnd) => OpCode::IntAnd,
         Some(B::Or | B::InplaceOr) => OpCode::IntOr,
         Some(B::Xor | B::InplaceXor) => OpCode::IntXor,
         Some(B::FloorDivide | B::InplaceFloorDivide | B::Remainder | B::InplaceRemainder) => {
@@ -7629,7 +7629,6 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
     } else {
         let raw = ctx.trace_ctx.record_op(opcode, &[lhs_raw, rhs_raw]);
         let concrete = match opcode {
-            OpCode::IntAnd => la & rb,
             OpCode::IntOr => la | rb,
             OpCode::IntXor => la ^ rb,
             _ => return Ok(None),
@@ -7647,7 +7646,7 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
         .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
         .unwrap_or(rhs_obj);
     let both_bools = unsafe { pyre_object::is_bool(lhs_obj) && pyre_object::is_bool(rhs_obj) };
-    if both_bools && matches!(opcode, OpCode::IntAnd | OpCode::IntOr | OpCode::IntXor) {
+    if both_bools && matches!(opcode, OpCode::IntOr | OpCode::IntXor) {
         let observed = concrete != 0;
         let Some(boxed) = walker_newbool_guarded(ctx, op_pc, raw, observed, dst_bank)? else {
             return Ok(None);
@@ -20955,9 +20954,10 @@ pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
     let frame = unsafe { &*(frame_ptr as *const pyre_interpreter::pyframe::PyFrame) };
 
     if helper == majit_ir::RuntimeHelperKind::LoadImport {
-        // `PyFrame.get_builtin` returns this field directly on every normal
-        // frame.  The null/EC fallback is uncommon and remains residual.
-        let w_builtin = frame.w_builtin;
+        // The field selects between a picked builtin and `space.builtin`,
+        // so its nullity or identity is pinned.
+        let field = frame.w_builtin;
+        let w_builtin = frame.get_builtin();
         if w_builtin.is_null() || !unsafe { pyre_object::is_module(w_builtin) } {
             return Ok(false);
         }
@@ -20975,21 +20975,22 @@ pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
             return Ok(false);
         }
 
-        // The cell fold below bakes the builtin module's dict, so pin the
-        // frame field that owns that choice.  A custom per-frame builtin (or
-        // any future rebinding of the field) side-exits before using the old
-        // dict.  Rebinding builtins.__import__ itself is covered by the module
-        // dict's quasi-immutable version and mutable-cell read.
-        let live_builtin = crate::state::opimpl_getfield_gc_r(
+        let live = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             frame_op,
             crate::descr::pyframe_w_builtin_descr(),
         );
-        walker_guard_stamped_ref_unless_const(ctx, op_pc, live_builtin, w_builtin)?;
-        if live_builtin.is_constant()
-            && ctx.trace_ctx.const_value(live_builtin) != Some(w_builtin as i64)
-        {
-            return Ok(false);
+        if field.is_null() {
+            if !live.is_constant() {
+                walker_guard_stamped_isnull(ctx, op_pc, live)?;
+            } else if ctx.trace_ctx.const_value(live) != Some(0) {
+                return Ok(false);
+            }
+        } else {
+            walker_guard_stamped_ref_unless_const(ctx, op_pc, live, field)?;
+            if live.is_constant() && ctx.trace_ctx.const_value(live) != Some(field as i64) {
+                return Ok(false);
+            }
         }
         return emit_namespace_cell_fold(
             ctx, op_pc, dst, dst_bank, w_dict, slot, stored, false, true,

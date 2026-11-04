@@ -3085,27 +3085,50 @@ fn peel_infallible_result(ty: &str) -> String {
     ty.to_string()
 }
 
-/// Ok-type spellings of the `Try::branch` residual.
+/// Ok-type of `Result<Infallible, E>` / `Result<Never, E>` / Charon's
+/// `??scalar`. The Result argument is extracted by
+/// [`peel_infallible_result`]; this tests that argument as an atom.
 fn is_uninhabited_ok(ty: &str) -> bool {
-    matches!(ty, "Infallible" | "!" | "Never" | "??scalar")
+    type_spelling_is_uninhabited(ty) || type_leaf(ty) == "??scalar"
 }
 
-/// Declared type with no inhabitants: an uninhabited atom, or a unary
-/// generic of one (`Try::Residual` of a tagged Option is that Option of
-/// the uninhabited ok). `_names_without_voids` (`lltype.py`) drops that
-/// field; a constructor setattr of it is skipped. FieldWrite also skips
-/// via `tyref_is_void_zst` on the declared TyRef.
+/// Uninhabited atom: `!`, `Never`, `Infallible`, after stripping a
+/// leading `crate::` / `core::` / `std::` path
+/// (`core::convert::Infallible`). A unary generic (`Option<_>`,
+/// `Vec<_>`, `PhantomData<_>`) is not an atom; callers that have one
+/// extract the argument and test it here. `_names_without_voids`
+/// (`lltype.py`) drops a field whose translated type is Void.
 pub(crate) fn type_spelling_is_uninhabited(ty: &str) -> bool {
+    matches!(
+        path_peeled_uninhabited_atom(ty),
+        "!" | "Never" | "Infallible"
+    )
+}
+
+/// Last path segment when `ty` starts with `crate::` / `core::` /
+/// `std::`; otherwise the trimmed spelling. Generics, tuples, pointers,
+/// and references stay as written so they cannot match an atom name.
+fn path_peeled_uninhabited_atom(ty: &str) -> &str {
     let t = ty.trim();
-    if is_uninhabited_ok(t) {
-        return true;
+    if t.contains('<') || t.contains('(') || t.starts_with('*') || t.starts_with('&') {
+        return t;
     }
-    let (_head, args) = split_head_args(t);
-    if args.is_empty() {
-        return false;
+    let first = t.split("::").next().unwrap_or(t);
+    if matches!(first, "crate" | "core" | "std") {
+        t.rsplit("::").next().unwrap_or(t).trim()
+    } else {
+        t
     }
-    let inner = split_top_level(args);
-    inner.len() == 1 && is_uninhabited_ok(&inner[0])
+}
+
+/// Payload spelling of `Option<...>`. `Option<`, `core::option::Option<`,
+/// and `std::option::Option<` peel the same way.
+pub(crate) fn option_spelling_payload(ty: &str) -> Option<&str> {
+    let (head, rest) = ty.split_once('<')?;
+    if type_leaf(head) != "Option" {
+        return None;
+    }
+    rest.strip_suffix('>')
 }
 
 /// Leaf equality after a path prefix, with identical generic arguments.
@@ -3148,6 +3171,75 @@ fn split_top_level(args: &str) -> Vec<String> {
         out.push(args[start..].trim().to_string());
     }
     out
+}
+
+#[cfg(test)]
+mod uninhabited_atom_tests {
+    use super::{
+        is_uninhabited_ok, option_spelling_payload, peel_infallible_result,
+        type_spelling_is_uninhabited,
+    };
+
+    #[test]
+    fn type_spelling_is_uninhabited_accepts_path_peeled_atoms_only() {
+        for ty in [
+            "!",
+            "Never",
+            "Infallible",
+            "core::convert::Infallible",
+            "std::convert::Infallible",
+            "crate::convert::Infallible",
+        ] {
+            assert!(type_spelling_is_uninhabited(ty), "{ty}");
+        }
+        for ty in [
+            "Option<!>",
+            "Option<Never>",
+            "Option<Infallible>",
+            "Vec<Infallible>",
+            "PhantomData<Infallible>",
+            "*const Infallible",
+            "*const core::convert::Infallible",
+            "Result<Infallible, E>",
+        ] {
+            assert!(!type_spelling_is_uninhabited(ty), "{ty}");
+        }
+    }
+
+    #[test]
+    fn result_ok_argument_is_tested_as_an_atom() {
+        assert!(is_uninhabited_ok("Infallible"));
+        assert!(is_uninhabited_ok("core::convert::Infallible"));
+        assert!(is_uninhabited_ok("Never"));
+        assert!(is_uninhabited_ok("??scalar"));
+        assert!(!is_uninhabited_ok("Option<Infallible>"));
+        assert_eq!(
+            peel_infallible_result("Result<Infallible,E>"),
+            "E".to_string()
+        );
+        assert_eq!(
+            peel_infallible_result("Result<core::convert::Infallible,E>"),
+            "E".to_string()
+        );
+        assert_eq!(
+            peel_infallible_result("Result<Option<Infallible>,E>"),
+            "Result<Option<Infallible>,E>".to_string()
+        );
+    }
+
+    #[test]
+    fn option_spelling_payload_peels_qualified_option() {
+        assert_eq!(option_spelling_payload("Option<!>"), Some("!"));
+        assert_eq!(
+            option_spelling_payload("core::option::Option<Infallible>"),
+            Some("Infallible")
+        );
+        assert_eq!(
+            option_spelling_payload("std::option::Option<*const Infallible>"),
+            Some("*const Infallible")
+        );
+        assert_eq!(option_spelling_payload("Vec<Infallible>"), None);
+    }
 }
 
 fn is_from_impl_call(kind: &OpKind) -> bool {
