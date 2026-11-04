@@ -392,4 +392,224 @@ mod tests {
         assert_eq!(c_graphs.concretetype, Some(LowLevelType::Void));
         assert_eq!(c_graphs.value, ConstValue::None);
     }
+
+    fn object_class_registry() -> CallRegistry {
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "PyObject".to_string(),
+            vec![("ob_type".to_string(), "PyObjectRef".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+        CallRegistry::new(bk)
+    }
+
+    fn kind_of(
+        value_to_var: &crate::translator::rtyper::flowspace_adapter::LegacyToTyped,
+        var: &crate::flowspace::model::Variable,
+    ) -> crate::codewriter::type_state::ConcreteType {
+        let typed = value_to_var
+            .get(var)
+            .unwrap_or_else(|| panic!("value missing from value_to_var"));
+        let ll = typed
+            .concretetype()
+            .unwrap_or_else(|| panic!("Variable.concretetype not populated"));
+        crate::translator::rtyper::cutover::lowleveltype_to_concrete(&ll)
+            .unwrap_or_else(|_| panic!("lltype does not project to ConcreteType"))
+    }
+
+    /// `SomePtr.call` of a `Ptr(FuncType)` whose FUNC arg is
+    /// `rclass.OBJECTPTR`: a GC instance argument is taken as that
+    /// instance pointer (`annlowlevel.cast_instance_to_base_ptr`
+    /// adaptation in `SomePtr.call`) and the result is
+    /// `ll_to_annotation(FUNC.RESULT)`. Dual-gate Match; hop is
+    /// `indirect_call`; arg and result kinds are `'r'`.
+    #[test]
+    fn fnptr_objectptr_instance_arg_result_dual_gate_match() {
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::translator::rtyper::cutover::{DualGateOutcome, dual_gate_check_with_registry};
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+
+        let _lock = anchor_lock();
+        let mut graph = LegacyGraph::new("call_objectptr_fn");
+        let entry = graph.startblock;
+        let f_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "f".to_string(),
+                    ty: ValueType::Int,
+                    class_root: Some("fn(*mut PyObject) -> *mut PyObject".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        let ft = FuncType {
+            args: vec![OBJECTPTR.clone()],
+            result: OBJECTPTR.clone(),
+        };
+        f_var.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Func(ft),
+        }))));
+        let obj_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "obj".to_string(),
+                    ty: ValueType::Ref(Some("PyObject".to_string())),
+                    class_root: Some("PyObject".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, f_var.clone());
+        graph.push_inputarg_var(entry, obj_var.clone());
+        let r_var = graph
+            .push_op_var(
+                entry,
+                OpKind::IndirectCall {
+                    funcptr: f_var,
+                    args: vec![obj_var.clone()],
+                    graphs: None,
+                    family_key: None,
+                    result_ty: ValueType::Ref(Some("PyObject".to_string())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(r_var.clone()));
+
+        let registry = Rc::new(object_class_registry());
+        let graphs = crate::codewriter::call::GraphStore::default();
+        let outcome = dual_gate_check_with_registry(&graph, &registry, &graphs).expect("dual-gate");
+        let DualGateOutcome::Match {
+            real_value_to_var, ..
+        } = outcome
+        else {
+            panic!("OBJECTPTR instance-arg fn-ptr call must Match, got {outcome:?}");
+        };
+        assert_eq!(kind_of(&real_value_to_var, &obj_var), ConcreteType::GcRef);
+        assert_eq!(kind_of(&real_value_to_var, &r_var), ConcreteType::GcRef);
+        match real_value_to_var
+            .get(&r_var)
+            .expect("result in value_to_var")
+            .annotation
+            .borrow()
+            .as_ref()
+            .map(|rc| rc.as_ref())
+        {
+            Some(SomeValue::Instance(_)) => {}
+            other => panic!("FUNC.RESULT OBJECTPTR is the instance annotation, got {other:?}"),
+        }
+
+        let (ann, _) = registry.ensure_session().expect("session after dual-gate");
+        let graph_ref = ann
+            .annotated
+            .borrow()
+            .values()
+            .find_map(|g| g.clone())
+            .expect("specialized subject graph");
+        let start = graph_ref.borrow().startblock.clone();
+        let rtyped = start.borrow().operations.clone();
+        let indirect = rtyped
+            .iter()
+            .find(|op| op.opname == "indirect_call")
+            .expect("PtrRepr.rtype_simple_call emits indirect_call");
+        assert!(
+            indirect.args.len() >= 3,
+            "indirect_call is funcptr, OBJECTPTR arg, Void graphs"
+        );
+        let last = indirect.args.last().expect("trailing graphs arg");
+        let Hlvalue::Constant(c_graphs) = last else {
+            panic!("last arg must be inputconst(Void, None)");
+        };
+        assert_eq!(c_graphs.concretetype, Some(LowLevelType::Void));
+        assert_eq!(c_graphs.value, ConstValue::None);
+    }
+
+    /// `SomePtr.call` of a `Ptr(FuncType)` whose FUNC result is
+    /// `Signed`: dual-gate Match and result kind `'i'`.
+    #[test]
+    fn fnptr_signed_result_dual_gate_match() {
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::translator::rtyper::cutover::{DualGateOutcome, dual_gate_check_with_registry};
+
+        let _lock = anchor_lock();
+        let mut graph = LegacyGraph::new("call_signed_fn");
+        let entry = graph.startblock;
+        let f_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "f".to_string(),
+                    ty: ValueType::Int,
+                    class_root: Some("fn(i64) -> i64".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        let x_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "x".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, f_var.clone());
+        graph.push_inputarg_var(entry, x_var.clone());
+        let r_var = graph
+            .push_op_var(
+                entry,
+                OpKind::IndirectCall {
+                    funcptr: f_var,
+                    args: vec![x_var],
+                    graphs: None,
+                    family_key: None,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(r_var.clone()));
+
+        let registry = Rc::new(CallRegistry::new(Rc::new(Bookkeeper::new())));
+        let graphs = crate::codewriter::call::GraphStore::default();
+        let outcome = dual_gate_check_with_registry(&graph, &registry, &graphs).expect("dual-gate");
+        let DualGateOutcome::Match {
+            real_value_to_var, ..
+        } = outcome
+        else {
+            panic!("Signed-result fn-ptr call must Match, got {outcome:?}");
+        };
+        assert_eq!(kind_of(&real_value_to_var, &r_var), ConcreteType::Signed);
+        match real_value_to_var
+            .get(&r_var)
+            .expect("result in value_to_var")
+            .annotation
+            .borrow()
+            .as_ref()
+            .map(|rc| rc.as_ref())
+        {
+            Some(SomeValue::Integer(_)) => {}
+            other => panic!("FUNC.RESULT Signed is SomeInteger, got {other:?}"),
+        }
+
+        let (ann, _) = registry.ensure_session().expect("session after dual-gate");
+        let graph_ref = ann
+            .annotated
+            .borrow()
+            .values()
+            .find_map(|g| g.clone())
+            .expect("specialized subject graph");
+        let start = graph_ref.borrow().startblock.clone();
+        let rtyped = start.borrow().operations.clone();
+        assert!(
+            rtyped.iter().any(|op| op.opname == "indirect_call"),
+            "PtrRepr.rtype_simple_call emits indirect_call"
+        );
+    }
 }

@@ -6635,6 +6635,21 @@ fn split_paren_group(input: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// One-level pointer to `bool` (`*mut bool` / `*const bool` / `&mut bool`
+/// / `&bool`). `fn_ptr_tyref_to_lltype` returns `Signed` for that slot
+/// so `SomePtr.call` matches the call-site `SomeInteger` (`lltype.py`
+/// `_func` arg equality).
+fn one_level_ptr_to_bool_spelling(spelling: &str) -> bool {
+    let t = spelling.trim();
+    let inner = t
+        .strip_prefix("*mut ")
+        .or_else(|| t.strip_prefix("*const "))
+        .or_else(|| t.strip_prefix("&mut "))
+        .or_else(|| t.strip_prefix("& "))
+        .or_else(|| t.strip_prefix('&'));
+    inner.is_some_and(|s| s.trim() == "bool")
+}
+
 fn peel_ref_and_ptr_prefixes(spelling: &str) -> &str {
     let mut t = spelling.trim();
     loop {
@@ -6668,14 +6683,21 @@ fn result_ok_of_exception_carrier<'a>(
     }
 }
 
-/// Arg lltype of a fn-pointer spelling. Matches `valuetype_to_lltype` of
-/// the corresponding `ValueType` (`declared_funcptr_type_from_legacy`):
-/// integers / bool / float stay primitive; `str` is `STRPTR`; everything
-/// else — slices, ADTs, `Result`, pointers, `()` — is `OBJECTPTR`.
+/// Arg lltype of a fn-pointer spelling. Matches `fn_ptr_tyref_to_lltype`
+/// of the Charon `FnPtr` skip_binder: integers / bool / float stay
+/// primitive; `str` is `STRPTR`; a one-level pointer to `bool` is the
+/// slot address `Signed`; `GCREF` / `GCREFOpaque` is `GCREF`; everything
+/// else — slices, ADTs, `Result`, class pointers, `()` — is `OBJECTPTR`.
 fn fn_ptr_arg_lltype(
     spelling: &str,
 ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
     use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+    if one_level_ptr_to_bool_spelling(spelling) {
+        return LowLevelType::Signed;
+    }
+    if is_gcref_type_spelling(spelling) {
+        return GCREF.clone();
+    }
     let t = peel_ref_and_ptr_prefixes(spelling);
     match t {
         "i8" | "i16" | "i32" | "i64" | "isize" | "char" => LowLevelType::Signed,
@@ -6691,7 +6713,6 @@ fn fn_ptr_arg_lltype(
         "StringBuilder" => {
             crate::translator::rtyper::lltypesystem::rbuilder::STRINGBUILDERPTR.clone()
         }
-        "gcref" | "GCREF" => GCREF.clone(),
         other if is_fn_type_spelling(other) => LowLevelType::Signed,
         _ => crate::translator::rtyper::rclass::OBJECTPTR.clone(),
     }
@@ -6716,10 +6737,13 @@ fn fn_ptr_result_lltype(
     if t == "()" {
         return LowLevelType::Void;
     }
-    let peeled = peel_ref_and_ptr_prefixes(t);
-    if peeled == "gcref" || peeled == "GCREF" {
+    if one_level_ptr_to_bool_spelling(t) {
+        return LowLevelType::Signed;
+    }
+    if is_gcref_type_spelling(t) {
         return GCREF.clone();
     }
+    let peeled = peel_ref_and_ptr_prefixes(t);
     let vt = match peeled {
         "bool" => ValueType::Bool,
         "i8" | "i16" | "i32" | "i64" | "isize" | "char" => ValueType::Int,
@@ -7947,6 +7971,55 @@ mod tests {
                 result: LowLevelType::Signed,
             }),
             "carrier Result<i64, E> is Signed (`valuetype_to_lltype` of the payload)"
+        );
+    }
+
+    #[test]
+    fn fn_ptr_spelling_gcrefopaque_result_is_gcref() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, GCREF, LowLevelType, PtrTarget,
+        };
+
+        let expected = FuncType {
+            args: vec![LowLevelType::Unsigned, LowLevelType::Unsigned],
+            result: GCREF.clone(),
+        };
+        for spelling in [
+            "fn(u32, usize) -> *mut GCREFOpaque",
+            "fn(u32, usize) -> *mut header::GCREFOpaque",
+            "fn(u32, usize) -> *mut majit_gc::header::GCREFOpaque",
+            "fn(u32, usize) -> GCREF",
+            "unsafe fn(u32, usize) -> *mut GCREFOpaque",
+        ] {
+            let s = fn_ptr_somevalue_for_spelling(spelling)
+                .unwrap_or_else(|| panic!("{spelling}: fn-pointer spelling"));
+            let SomeValue::Ptr(p) = &s else {
+                panic!("{spelling}: must seed SomePtr, got {s:?}");
+            };
+            assert_eq!(
+                p.ll_ptrtype.TO,
+                PtrTarget::Func(expected.clone()),
+                "{spelling}: FUNC.RESULT is GCREF (`llmemory.py` GCREF = Ptr(GCREFOpaque))"
+            );
+        }
+
+        let bool_slot =
+            fn_ptr_somevalue_for_spelling("unsafe fn(u32, usize, *mut bool) -> *mut GCREFOpaque")
+                .expect("*mut bool slot spelling is a fn pointer");
+        let SomeValue::Ptr(p) = &bool_slot else {
+            panic!("*mut bool slot must seed SomePtr, got {bool_slot:?}");
+        };
+        assert_eq!(
+            p.ll_ptrtype.TO,
+            PtrTarget::Func(FuncType {
+                args: vec![
+                    LowLevelType::Unsigned,
+                    LowLevelType::Unsigned,
+                    LowLevelType::Signed,
+                ],
+                result: GCREF.clone(),
+            }),
+            "*mut bool FUNC arg is Signed; RESULT GCREFOpaque is GCREF"
         );
     }
 

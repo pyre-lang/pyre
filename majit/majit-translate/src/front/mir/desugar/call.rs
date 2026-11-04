@@ -9820,7 +9820,7 @@ impl Lowering<'_> {
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
-        stamp_fn_ptr_load_result(&res, stamp_ty, self.llbc);
+        stamp_fn_ptr(&res, stamp_ty, self.llbc, self.static_addrs.error_carrier);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(res.clone()),
             kind: OpKind::RawLoad {
@@ -9833,23 +9833,4 @@ impl Lowering<'_> {
         });
         res
     }
-}
-
-/// Stamp a `FnPtrCell::get` / `OnceLock<fn>::get` load dest as
-/// `Ptr(FuncType)` so `raw_load`'s TYPE constant annotates `SomePtr`
-/// (`lltype_to_annotation`) while `history.getkind` stays `'int'`.
-fn stamp_fn_ptr_load_result(res: &Variable, dest_ty: &TyRef, llbc: &Llbc) {
-    let ft = tyref_fn_ptr_spelling(dest_ty, llbc)
-        .into_iter()
-        .chain(tyref_fn_ptr_input_class_root(dest_ty, llbc))
-        .find_map(|spelling| {
-            crate::annotator::bookkeeper::func_type_from_fn_spelling(&spelling, &|_| false)
-        });
-    let Some(ft) = ft else {
-        return;
-    };
-    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget};
-    res.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
-        TO: PtrTarget::Func(ft),
-    }))));
 }
