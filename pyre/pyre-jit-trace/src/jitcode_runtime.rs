@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, LazyLock, Once, OnceLock};
 
-use majit_ir::{DescrRef, ExtraEffect};
+use majit_ir::{DescrRef, ExtraEffect, SwitchDescr};
 use majit_jitcode::artifacts::CompiledJitDriver;
 use majit_jitcode::jitcode::{BhDescr, DescrTable, JitCode};
 
@@ -3541,11 +3541,71 @@ pub fn decoded_ops(code: &[u8]) -> impl Iterator<Item = DecodedOp> + '_ {
 /// Instruction starts the blackhole can dispatch from `pc` on: the
 /// fallthrough of every instruction that does not end its block, plus every
 /// `L` label operand (`blackhole.py` `bhimpl_goto*` return the label or the
-/// next position). `catch_exception` `L` is followed like any other label.
-/// `None` when a reached instruction cannot be decoded or branches through a
-/// descr (`switch/id`), so the caller reads the whole body.
+/// next position), plus every `switch/id` arm (`bhimpl_switch` returns a
+/// `SwitchDictDescr.dict` target or the fall-through pc). `catch_exception`
+/// `L` is followed like any other label. `None` when a reached instruction
+/// cannot be decoded, so the caller reads the whole body.
 pub fn reachable_starts_from(code: &[u8], pc: usize) -> Option<Vec<usize>> {
-    reachable_starts_from_catch(code, pc, |_, _| true)
+    reachable_starts_from_catch(code, pc, None, |_, _| true)
+}
+
+/// Arm targets of `switch/id` (`blackhole.py` `bhimpl_switch`:
+/// `switchdict.dict` values). Fall-through is the op's `next_pc`, not a
+/// dict entry. `None` when the `d` operand is not a `SwitchDictDescr`.
+///
+/// Lookup order matches `blackhole.rs` `read_descr` / `call_op_extraeffect`:
+/// `JitCode::descr_at` (per-jitcode `exec.descrs`, then the process-global
+/// build-time pool), then `descr_ref_table` / `get_descr_by_index`.
+fn switch_arm_targets(
+    code: &[u8],
+    op: &DecodedOp,
+    jitcode: Option<&majit_metainterp::jitcode::JitCode>,
+) -> Option<Vec<usize>> {
+    let idx = decoded_op_descr_index(code, op)? as usize;
+    if let Some(frame_jc) = jitcode {
+        if let Some(entry) = frame_jc.descr_at(idx) {
+            return switch_targets_from_runtime_descr(entry);
+        }
+    }
+    if let Some(descr) = descr_ref_table().at(idx) {
+        if let Some(switch) = descr.as_switch_descr() {
+            return collect_switch_lookup(switch);
+        }
+    }
+    get_descr_by_index(idx).and_then(switch_targets_from_bh)
+}
+
+fn switch_targets_from_runtime_descr(
+    entry: &majit_metainterp::RuntimeBhDescr,
+) -> Option<Vec<usize>> {
+    if let Some(targets) = entry.as_bh_descr().and_then(switch_targets_from_bh) {
+        return Some(targets);
+    }
+    entry
+        .as_optimizer_descr()
+        .and_then(|descr| descr.as_switch_descr())
+        .and_then(collect_switch_lookup)
+}
+
+fn switch_targets_from_bh(bh: &BhDescr) -> Option<Vec<usize>> {
+    match bh {
+        BhDescr::Switch {
+            dict,
+            const_keys_in_order,
+        } => const_keys_in_order
+            .iter()
+            .map(|key| dict.get(key).copied())
+            .collect(),
+        _ => None,
+    }
+}
+
+fn collect_switch_lookup(switch: &dyn SwitchDescr) -> Option<Vec<usize>> {
+    switch
+        .const_keys_in_order()
+        .iter()
+        .map(|&key| switch.lookup(key))
+        .collect()
 }
 
 /// [`reachable_starts_from`] with a catch-handler policy.
@@ -3555,9 +3615,14 @@ pub fn reachable_starts_from(code: &[u8], pc: usize) -> Option<Vec<usize>> {
 /// `run()` successors from `pc` have been recorded, and again each time a
 /// newly followed handler reaches another catch. Existing callers pass
 /// `|_, _| true` so every `L` is still followed.
+///
+/// `jitcode` is the frame's JitCode so `switch/id` can read its
+/// `SwitchDictDescr` the way `read_descr` does. `None` uses the process-global
+/// descr pool only.
 pub fn reachable_starts_from_catch(
     code: &[u8],
     pc: usize,
+    jitcode: Option<&majit_metainterp::jitcode::JitCode>,
     follow_catch: impl Fn(usize, &std::collections::BTreeSet<usize>) -> bool,
 ) -> Option<Vec<usize>> {
     let mut seen = std::collections::BTreeSet::new();
@@ -3570,7 +3635,11 @@ pub fn reachable_starts_from_catch(
             }
             let op = decode_op_at(code, pc)?;
             if op.opname == "switch" {
-                return None;
+                // `bhimpl_switch`: every `SwitchDictDescr.dict` arm, plus
+                // fall-through (`KeyError` → `pc`). A missing or non-switch
+                // descr is undecodable, same as a bad opcode byte.
+                let targets = switch_arm_targets(code, &op, jitcode)?;
+                work.extend(targets);
             }
             let mut cursor = pc + 1;
             if op.opname != "live" {
@@ -3643,8 +3712,9 @@ pub fn blackhole_resume_reachable_starts(
     code: &[u8],
     pc: usize,
     in_flight_callee_may_raise: bool,
+    jitcode: Option<&majit_metainterp::jitcode::JitCode>,
 ) -> Option<Vec<usize>> {
-    reachable_starts_from_catch(code, pc, |catch_pc, seen| {
+    reachable_starts_from_catch(code, pc, jitcode, |catch_pc, seen| {
         catch_predecessor_is_reachable(code, catch_pc, seen)
             || (in_flight_callee_may_raise && catch_at_landing_pc(code, pc, catch_pc))
     })
@@ -3986,7 +4056,7 @@ pub(crate) fn blackhole_first_raising_opname_in(
     if in_flight_callee_may_raise && landing_catch_pc(code, pc).is_none() {
         return Some("<uncaught-callee>");
     }
-    match blackhole_resume_reachable_starts(code, pc, in_flight_callee_may_raise) {
+    match blackhole_resume_reachable_starts(code, pc, in_flight_callee_may_raise, None) {
         None => Some("<switch-or-undecodable>"),
         Some(starts) => {
             for &start in &starts {
@@ -5682,7 +5752,7 @@ mod tests {
     fn blackhole_resume_innermost_does_not_follow_unreachable_catch() {
         let code = catch_scan_fixture();
         assert_eq!(
-            blackhole_resume_reachable_starts(&code, 11, false),
+            blackhole_resume_reachable_starts(&code, 11, false, None),
             Some(vec![11, 14, 18]),
         );
     }
@@ -5691,7 +5761,7 @@ mod tests {
     fn blackhole_resume_non_innermost_follows_landing_catch_when_callee_may_raise() {
         let code = catch_scan_fixture();
         assert_eq!(
-            blackhole_resume_reachable_starts(&code, 11, true),
+            blackhole_resume_reachable_starts(&code, 11, true, None),
             Some(vec![11, 14, 18, 22]),
         );
     }
@@ -5700,7 +5770,7 @@ mod tests {
     fn blackhole_resume_non_innermost_skips_landing_catch_when_callee_cannot_raise() {
         let code = catch_scan_fixture();
         assert_eq!(
-            blackhole_resume_reachable_starts(&code, 11, false),
+            blackhole_resume_reachable_starts(&code, 11, false, None),
             Some(vec![11, 14, 18]),
         );
     }
@@ -5733,8 +5803,89 @@ mod tests {
         );
         let parent = catch_scan_fixture();
         assert_eq!(
-            blackhole_resume_reachable_starts(&parent, 11, callee_may_raise),
+            blackhole_resume_reachable_starts(&parent, 11, callee_may_raise, None),
             Some(vec![11, 14, 18]),
+        );
+    }
+
+    fn switch_scan_jitcode() -> majit_metainterp::jitcode::JitCode {
+        // Unreachable prefix, then switch, fall-through, two arms.
+        // `bhimpl_switch` jumps to a `SwitchDictDescr.dict` target or the
+        // fall-through pc; the prefix is not a successor of the switch.
+        let mut builder = majit_metainterp::JitCodeBuilder::new();
+        builder.emit_raise(0);
+        let case_a = builder.new_label();
+        let case_b = builder.new_label();
+        builder.switch(0, &[(1, case_a), (2, case_b)]);
+        builder.void_return();
+        builder.mark_label(case_a);
+        builder.void_return();
+        builder.mark_label(case_b);
+        builder.void_return();
+        builder.finish()
+    }
+
+    #[test]
+    fn blackhole_resume_follows_switch_arms_and_fallthrough() {
+        let jitcode = switch_scan_jitcode();
+        let code = jitcode.code.as_slice();
+        let switch = decoded_ops(code)
+            .find(|op| op.opname == "switch")
+            .expect("fixture emits switch/id");
+        assert!(
+            switch.pc > 0,
+            "prefix raise must sit before the switch so a whole-body scan would include it"
+        );
+        let fallthrough = switch.next_pc;
+        let idx =
+            decoded_op_descr_index(code, &switch).expect("switch/id has a d operand") as usize;
+        let arms = match jitcode.descr_at(idx).and_then(|entry| entry.as_bh_descr()) {
+            Some(BhDescr::Switch { dict, .. }) => {
+                let mut targets: Vec<usize> = dict.values().copied().collect();
+                targets.sort_unstable();
+                targets
+            }
+            other => panic!("switch d-arg must be SwitchDictDescr, got {other:?}"),
+        };
+        assert_eq!(arms.len(), 2, "fixture has two arms");
+        assert!(
+            !arms.contains(&fallthrough),
+            "arm targets are distinct from fall-through"
+        );
+
+        let mut expected = vec![switch.pc, fallthrough];
+        expected.extend(arms.iter().copied());
+        expected.sort_unstable();
+
+        assert_eq!(
+            blackhole_resume_reachable_starts(code, switch.pc, false, Some(&jitcode)),
+            Some(expected.clone()),
+        );
+        assert_eq!(
+            reachable_starts_from_catch(code, switch.pc, Some(&jitcode), |_, _| true),
+            Some(expected),
+        );
+        assert_eq!(
+            blackhole_resume_reachable_starts(code, fallthrough, false, Some(&jitcode)),
+            Some(vec![fallthrough]),
+        );
+        let starts_from_zero = blackhole_resume_reachable_starts(code, 0, false, Some(&jitcode))
+            .expect("prefix raise decodes");
+        assert!(
+            !starts_from_zero.contains(&switch.pc),
+            "raise ends the block; switch is not reachable from pc 0: {starts_from_zero:?}"
+        );
+    }
+
+    #[test]
+    fn blackhole_resume_returns_none_when_switch_descr_is_undecodable() {
+        let byte = *insns_opname_to_byte()
+            .get("switch/id")
+            .expect("switch/id must be in insns table");
+        let code = [byte, 0, 0xFF, 0xFF];
+        assert_eq!(
+            blackhole_resume_reachable_starts(&code, 0, false, None),
+            None,
         );
     }
 

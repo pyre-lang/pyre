@@ -7428,19 +7428,6 @@ pub(crate) fn cell_slot_type_error(key: &str, value: PyObjectRef) -> crate::PyEr
     ))
 }
 
-/// typeobject.py `_create_new_type`.
-///
-/// `descr__new__` looks inside so `type(x)` stays in-trace; this body is a
-/// separate function so the 3-arg path is one residual `CALL_MAY_FORCE`.
-/// `_create_new_type` has no `@dont_look_inside`; `JitPolicy.look_inside_graph`
-/// residualizes it because the body has loops (`contains_loop` /
-/// `find_backedges`).  `W_TypeObject.__init__` is `@dont_look_inside`.
-/// `#[inline(never)]` keeps the helper a separate graph so rustc does not
-/// fold it into `type_descr_new`.
-///
-/// `ensure_module_attr` reads `caller.get_w_globals()` with no extra force:
-/// `w_globals` is frame-invariant (`restore_resume_state_from` leaves it
-/// out) so the heap slot is already current.  A hand-placed
 /// `PyAnyDict_Check`: a dict (including a dict subclass) or a
 /// `frozendict` (including a subclass).
 fn py_any_dict_check(w_obj: PyObjectRef) -> bool {
@@ -7454,6 +7441,18 @@ fn py_any_dict_check(w_obj: PyObjectRef) -> bool {
     }
 }
 
+/// typeobject.py `_create_new_type`.
+///
+/// `descr__new__` looks inside so `type(x)` stays in-trace; this body is a
+/// separate function so the 3-arg path is one residual `CALL_MAY_FORCE`.
+/// `_create_new_type` has no `@dont_look_inside`; `JitPolicy.look_inside_graph`
+/// residualizes it because the body has loops (`contains_loop` /
+/// `find_backedges`).  `W_TypeObject.__init__` is `@dont_look_inside`.
+/// `#[inline(never)]` keeps the helper a separate graph so rustc does not
+/// fold it into `type_descr_new`.
+///
+/// `ensure_module_attr` calls `force_virtualizable_if_necessary` before
+/// `caller.get_w_globals()`.  A hand-placed
 /// `jit_force_virtualizable` here aborted compiles that create a type
 /// (`ABORT_ESCAPE`) and scrambled virtual locals on loops that still compiled.
 #[inline(never)]
@@ -7723,12 +7722,9 @@ fn type_create_new_type(
         // `ensure_module_attr` reaches the caller through
         // `getexecutioncontext().gettopframe_nohidden()`, so read it that way
         // rather than through the `CURRENT_FRAME` thread-local.  No force is
-        // owed here: the walk only dereferences the vref and follows
+        // owed on the walk: it only dereferences the vref and follows
         // `f_backref`, and `force_frame` belongs to the consumers that hand a
-        // frame to application code.  `w_globals` is a declared virtualizable
-        // field, but no walk writes it on the live frame —
-        // `restore_resume_state_from` leaves it and `pycode` out of the resume
-        // restore as frame-invariant — so its heap slot is already current.
+        // frame to application code.
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         if unsafe { pyre_object::w_dict_getitem_str(class_ns, "__module__") }.is_none() {
             let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
@@ -7738,14 +7734,27 @@ fn type_create_new_type(
                 unsafe { (*ec).gettopframe_nohidden() }
             };
             if !frame.is_null() {
-                let globals = unsafe { (*frame).get_w_globals() };
-                if !globals.is_null()
-                    && let Some(module) = crate::baseobjspace::finditem_str(globals, "__name__")?
-                {
-                    let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-                    unsafe {
-                        pyre_object::w_dict_setitem_str_no_proxy(class_ns, "__module__", module)
-                    };
+                // rvirtualizable.py hook_access_field / replace_force_virtualizable_with_call:
+                // the redirected-field read in this residual graph keeps the force call.
+                // `force_virtualizable_if_necessary` reaches no collection seed
+                // (TOKEN_NONE, tracing-rescall store, or the `force_frame`
+                // hook). The frame scan still treats that hook as unresolved,
+                // so re-read the caller from the EC after the force.
+                // `ensure_module_attr` obtained the frame from
+                // `gettopframe_nohidden`.
+                crate::executioncontext::force_virtualizable_if_necessary(frame);
+                let frame = unsafe { (*ec).gettopframe_nohidden() };
+                if !frame.is_null() {
+                    let globals = unsafe { (*frame).get_w_globals() };
+                    if !globals.is_null()
+                        && let Some(module) =
+                            crate::baseobjspace::finditem_str(globals, "__name__")?
+                    {
+                        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+                        unsafe {
+                            pyre_object::w_dict_setitem_str_no_proxy(class_ns, "__module__", module)
+                        };
+                    }
                 }
             }
         }

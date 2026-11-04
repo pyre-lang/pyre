@@ -2129,12 +2129,17 @@ fn blackhole_level_starts(
     frame: &majit_metainterp::MIFrame,
     in_flight_callee_may_raise: bool,
 ) -> Option<Vec<usize>> {
-    let code = &frame.jitcode.code;
+    let jitcode = frame.jitcode.as_ref();
     blackhole_scan_root_pcs(frame)
         .into_iter()
         .map(|start| {
             let follow_callee = in_flight_callee_may_raise && start == frame.pc;
-            crate::jitcode_runtime::blackhole_resume_reachable_starts(code, start, follow_callee)
+            crate::jitcode_runtime::blackhole_resume_reachable_starts(
+                &jitcode.code,
+                start,
+                follow_callee,
+                Some(jitcode),
+            )
         })
         .try_fold(Vec::new(), |mut all, starts| {
             all.extend(starts?);
@@ -2148,11 +2153,11 @@ fn blackhole_level_starts(
 }
 
 /// Remaining body from this level's resume pc may raise in
-/// `BlackholeInterpreter`. Conservative: a `switch`, an undecodable
-/// instruction, an uncaught in-flight callee, or any reachable op whose
-/// `bhimpl_*` is not on the cannot-raise allow-list. Call ops consult
-/// the descr EffectInfo (`call.py CallControl.getcalldescr`,
-/// `effectinfo.py EffectInfo.check_can_raise`).
+/// `BlackholeInterpreter`. Conservative: an undecodable instruction, an
+/// uncaught in-flight callee, or any reachable op whose `bhimpl_*` is not
+/// on the cannot-raise allow-list. Call ops consult the descr EffectInfo
+/// (`call.py CallControl.getcalldescr`, `effectinfo.py
+/// EffectInfo.check_can_raise`).
 fn level_may_raise(frame: &majit_metainterp::MIFrame, in_flight_callee_may_raise: bool) -> bool {
     if in_flight_callee_may_raise
         && crate::jitcode_runtime::landing_catch_pc(&frame.jitcode.code, frame.pc).is_none()
