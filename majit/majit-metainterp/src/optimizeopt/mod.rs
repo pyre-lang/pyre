@@ -7180,12 +7180,9 @@ impl OptContext {
             return None;
         }
         // optimizer.py: b = self.getintbound(op.getarg(0))
-        let Some(bound) = self
+        let bound = self
             .get_box_replacement_operand_opt(arg0_resolved)
-            .and_then(|b| self.peek_intbound_box(&b))
-        else {
-            return None;
-        };
+            .and_then(|b| self.peek_intbound_box(&b))?;
         if !bound.is_bool() {
             return None;
         }
@@ -9299,9 +9296,7 @@ impl OptContext {
         &mut self,
         op: &Operand,
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
-        let Some(gcref) = self.getptrinfo_handle(op).and_then(|h| h.constant_ref()) else {
-            return None;
-        };
+        let gcref = self.getptrinfo_handle(op).and_then(|h| h.constant_ref())?;
         if gcref.is_null() {
             return None;
         }
@@ -9319,9 +9314,7 @@ impl OptContext {
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
         use crate::optimizeopt::info::PtrInfo;
         // info.py:719: ref = self._const.getref_base()
-        let Some(gcref) = self.getptrinfo_handle(op).and_then(|h| h.constant_ref()) else {
-            return None;
-        };
+        let gcref = self.getptrinfo_handle(op).and_then(|h| h.constant_ref())?;
         // info.py:720-721: if not ref: raise InvalidLoop. Recorded as a
         // deferred signal (checked by the driver) and `None` returned so
         // callers take their existing "no info" path until the barrier aborts.

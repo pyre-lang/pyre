@@ -4155,9 +4155,7 @@ impl<S: JitState> JitDriver<S> {
     /// origin at the caller.
     pub fn compile_trace_entry_data(&mut self) -> Option<u64> {
         let original_green_key = self.meta.trace_ctx().map(|ctx| ctx.root_green_key())?;
-        if self.meta.trace_meta().is_none() {
-            return None;
-        }
+        self.meta.trace_meta()?;
         Some(original_green_key)
     }
 

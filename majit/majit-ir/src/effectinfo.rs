@@ -1048,9 +1048,9 @@ pub enum RuntimeHelperKind {
     ///
     /// The walker also folds an exact `int` plus a constant decimal spec
     /// (`:d` / `:05d` / `:5d`) to `ll_int2dec` + optional `ll_strconcat` pad
-    /// + residual `newutf8` — `newformat.py` `format_int_or_long` /
-    /// `_int_to_base` / `_fill_number`.  A bool, subclass, sign-interior
-    /// pad, or Python `__format__` stays residual or takes the inline.
+    ///   + residual `newutf8` — `newformat.py` `format_int_or_long` /
+    ///   `_int_to_base` / `_fill_number`.  A bool, subclass, sign-interior
+    ///   pad, or Python `__format__` stays residual or takes the inline.
     FormatWithSpec,
     /// `bh_unpack_sequence_fn(count, seq)` — the UNPACK_SEQUENCE validator
     /// emitted by the codewriter UNPACK_SEQUENCE arm.  Validates the exact

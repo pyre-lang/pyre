@@ -3412,7 +3412,7 @@ pub fn parse_builtin_signature(
     let pos_base = pyre_object::gc_roots::pin_roots(pos_args);
     let names_base = pyre_object::gc_roots::pin_roots(keyword_names_w);
     let values_base = pyre_object::gc_roots::pin_roots(keywords_w);
-    let defaults_base = defaults_w.map(|d| pyre_object::gc_roots::pin_roots(d));
+    let defaults_base = defaults_w.map(pyre_object::gc_roots::pin_roots);
     let kw_defs_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_kw_defs);
     // `Function.w_kw_defs` is filled at registration

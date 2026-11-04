@@ -140,7 +140,7 @@ impl RecentPureOps {
     ///
     /// Matching uses producer identity after forwarding, or constant value
     /// equality (`history.py Const.same_box`).
-
+    ///
     /// pure.py `lookup` + `force_preamble_op`: a PreambleOp slot is
     /// replaced in place with the forced body op.
     fn lookup_forcing(

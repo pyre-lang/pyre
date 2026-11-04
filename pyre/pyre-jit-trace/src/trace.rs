@@ -5142,7 +5142,7 @@ fn try_adopt_multi_frame_blackhole(
     }
     let _saved_link_roots = ResumeRefSliceRoots::arm(&mut saved_links);
     let restore_links = |saved: &[i64]| {
-        for pair in saved.chunks_exact(2) {
+        for pair in saved.as_chunks::<2>().0 {
             let callee = pair[0] as *mut pyre_interpreter::PyFrame;
             let f_back = pair[1] as *mut pyre_interpreter::PyFrame;
             relink_barrier(callee);

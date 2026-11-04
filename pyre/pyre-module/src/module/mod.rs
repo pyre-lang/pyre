@@ -67,7 +67,7 @@ pub mod _random;
 #[cfg(target_os = "macos")]
 pub mod _scproxy;
 #[allow(non_snake_case)]
-#[cfg(all(not(feature = "sandbox")))]
+#[cfg(not(feature = "sandbox"))]
 pub mod _socket;
 #[allow(non_snake_case)]
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
@@ -106,7 +106,7 @@ pub mod msvcrt;
 pub mod pyexpat;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod resource;
-#[cfg(all(not(feature = "sandbox")))]
+#[cfg(not(feature = "sandbox"))]
 pub mod select;
 #[cfg(all(unix, not(feature = "sandbox")))]
 pub mod syslog;

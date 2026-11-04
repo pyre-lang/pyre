@@ -34,6 +34,7 @@ pub(super) fn arm_platform(cc: Option<String>) -> Platform {
 
 /// Testable `ARM` constructor: `SB2` / `SB2OPT` / env `CC` are parameters
 /// instead of process environment. Does not touch `SB2_MODULE`.
+#[cfg(test)]
 pub(super) fn arm_platform_from(
     sb2_root: Option<OsString>,
     sb2opt: Option<String>,
@@ -180,6 +181,7 @@ impl Platform {
 
 /// `py.path.local.join`: strip leading `/` from each argument and
 /// `normpath` the result.
+#[cfg_attr(not(test), expect(dead_code))] // rpython/translator/platform/arm.py ARM._invent_new_name
 fn invent_join(basepath: &Path, name: &str) -> PathBuf {
     super::lexical_normpath(&basepath.join(name.trim_start_matches('/')))
 }

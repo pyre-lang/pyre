@@ -3688,18 +3688,16 @@ impl GcCache {
                 && !new_fields.is_empty()
                 && agrees
                 && !(descr_carries_collector_tid(&descr) && !descr_carries_collector_tid(&existing))
-            {
-                if let Some(sd) = existing
+                && let Some(sd) = existing
                     .as_any()
                     .and_then(|old| old.downcast_ref::<SimpleSizeDescr>())
-                {
-                    sd.assign_all_fielddescrs(new_fields);
-                    FIELD_MINT
-                        .fieldless_size_shell_upgrades
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    self.stamp_simple_size_descr(sd);
-                    return;
-                }
+            {
+                sd.assign_all_fielddescrs(new_fields);
+                FIELD_MINT
+                    .fieldless_size_shell_upgrades
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.stamp_simple_size_descr(sd);
+                return;
             }
         }
         // descr.py caches the SizeDescr. Multiple pyre producers may
@@ -10130,7 +10128,7 @@ mod register_keyed_size_authority_tests {
 
     #[test]
     fn keyed_group_keeps_the_class_key_when_a_vtable0_shell_occupies() {
-        let cache_key = 0x8fc6_60ad_eff3_a2e_u64;
+        let cache_key = 0x08fc_660a_deff_3a2e_u64;
         let _shell = {
             let mut gc = gc_cache().lock();
             gc.get_size_descr(LLType::struct_key(cache_key), 48, 0, false)
@@ -10629,7 +10627,7 @@ mod register_keyed_size_authority_tests {
     #[test]
     fn get_field_descr_keeps_the_first_cached_geometry() {
         let mut gc = GcCache::new();
-        let key = LLType::Struct(0x0A81_E_70_4E);
+        let key = LLType::Struct(0x0000_A81E_704E);
         gc._cache_size.insert(key.clone(), size_descr_at(4, 0, &[]));
         let first = gc.get_field_descr(
             key.clone(),
@@ -10802,7 +10800,7 @@ mod register_keyed_size_authority_tests {
     #[test]
     fn get_field_descr_adopts_listed_row_only_when_cache_is_vacant() {
         let mut gc = GcCache::new();
-        let key = LLType::Struct(0x0A81_E_70_5E);
+        let key = LLType::Struct(0x0000_A81E_705E);
         let listed = SimpleFieldDescr::new_with_name(
             1,
             64,
@@ -10879,7 +10877,7 @@ mod register_keyed_size_authority_tests {
     #[test]
     fn nested_same_geometry_keeps_two_cache_rows() {
         let mut gc = GcCache::new();
-        let key = LLType::Struct(0x0A81_E_70_6E);
+        let key = LLType::Struct(0x0000_A81E_706E);
         gc._cache_size.insert(key.clone(), size_descr_at(4, 0, &[]));
         let a = gc.get_field_descr(
             key.clone(),

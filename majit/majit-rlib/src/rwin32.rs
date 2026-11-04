@@ -8,7 +8,7 @@
 //! `os_symlink_impl`, `os_unlink_impl`, `os_createdirectory_impl`,
 //! `os_removedirectory_impl`): `eci.separate_module_files` are not ported yet.
 
-#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
+#![allow(non_camel_case_types, non_upper_case_globals)]
 
 use crate::rffi::{
     self, CCHARP, CWCHARP, INT, LONG, RFFI_SAVE_LASTERROR, SHORT, SIZE_T, UCHAR, UINT, UNSIGNED,

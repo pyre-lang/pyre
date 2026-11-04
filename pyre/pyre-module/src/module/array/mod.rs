@@ -1565,8 +1565,8 @@ fn array_tounicode_method(args: &[PyObjectRef]) -> PyResult {
     // surrogates and raises for the first value above U+10ffff. The same
     // shape implements `PyUnicode_FromWideChar`, used for `u` by v3.14.6.
     let mut wb = Wtf8Buf::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
-        let code = u32::from_ne_bytes(chunk.try_into().unwrap());
+    for chunk in bytes.as_chunks::<4>().0 {
+        let code = u32::from_ne_bytes(*chunk);
         let point = CodePoint::from_u32(code).ok_or_else(|| {
             PyError::value_error(format!(
                 "character U+{code:x} is not in range [U+0000; U+10ffff]"

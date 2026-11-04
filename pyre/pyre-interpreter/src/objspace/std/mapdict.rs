@@ -2028,16 +2028,11 @@ pub unsafe fn class_descr_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, 
     if !unsafe { crate::baseobjspace::has_object_getattribute(w_type) } {
         return None;
     }
-    let Some(actual_class_descr) =
-        (unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__class__") })
-    else {
-        return None;
-    };
-    let Some(object_class_descr) = (unsafe {
+    let actual_class_descr =
+        (unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__class__") })?;
+    let object_class_descr = (unsafe {
         crate::baseobjspace::lookup_in_type_where(crate::typedef::w_object(), "__class__")
-    }) else {
-        return None;
-    };
+    })?;
     if !std::ptr::eq(actual_class_descr, object_class_descr) {
         return None;
     }

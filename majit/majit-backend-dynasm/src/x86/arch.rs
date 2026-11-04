@@ -68,5 +68,5 @@ pub const DEFAULT_FRAME_BYTES: usize = (1 + FRAME_FIXED_SIZE) * WORD;
 // `SUB rsp, FRAME_FIXED_SIZE * WORD` turns the 8-mod-16 entry rsp into a
 // 0-mod-16 body. `(1 + FRAME_FIXED_SIZE) * WORD` stays 0 mod 16.
 const _: () = assert!(PASS_ON_MY_FRAME >= 12);
-const _: () = assert!(DEFAULT_FRAME_BYTES % 16 == 0);
+const _: () = assert!(DEFAULT_FRAME_BYTES.is_multiple_of(16));
 const _: () = assert!((FRAME_FIXED_SIZE * WORD) % 16 == 8);

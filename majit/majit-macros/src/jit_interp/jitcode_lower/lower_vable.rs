@@ -1882,9 +1882,7 @@ impl<'c> Lowerer<'c> {
         // Base must be a simple ident (a local variable), not `state.x.y`.
         // `(*ident).field` is that same ident: the parentheses are part of
         // the Rust spelling, because `*ident.field` binds the other way.
-        let Some(ident) = Self::field_base_ident(&field.base) else {
-            return None;
-        };
+        let ident = Self::field_base_ident(&field.base)?;
         let binding = self.bindings.get(&ident.to_string())?.clone();
         if !matches!(binding.kind, BindingKind::Ref) {
             return None;

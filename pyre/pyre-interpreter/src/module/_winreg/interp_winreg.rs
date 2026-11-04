@@ -510,8 +510,10 @@ fn check(code: u32) -> Result<PyObjectRef, pyre_interpreter::PyError> {
 }
 
 fn utf16_units(data: &[u8]) -> Vec<u16> {
-    data.chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+    data.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .collect()
 }
 

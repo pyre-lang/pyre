@@ -167,7 +167,7 @@ pub fn ffiobj_init(
 
     if !is_none_or_null(roots.get(ffi_slot + 1)) {
         let globals = pyre_interpreter::baseobjspace::fixedview(roots.get(ffi_slot + 1), -1)?;
-        if globals.len() % 2 != 0 {
+        if !globals.len().is_multiple_of(2) {
             return Err(PyError::value_error(
                 "CFFI packed globals must contain string/value pairs",
             ));

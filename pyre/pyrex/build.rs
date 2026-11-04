@@ -7,9 +7,8 @@ fn main() {
     // linker, not setrlimit, is what sizes the origin thread's stack on
     // darwin; keep the two figures the same so the interpreter's usable
     // stack is unchanged when it stays on that thread.
-    match target.as_str() {
-        "macos" => println!("cargo::rustc-link-arg-bins=-Wl,-stack_size,0x10000000"),
-        _ => {}
+    if target.as_str() == "macos" {
+        println!("cargo::rustc-link-arg-bins=-Wl,-stack_size,0x10000000");
     }
     let mut symbols = vec![
         "PyThreadState_SetAsyncExc".to_string(),

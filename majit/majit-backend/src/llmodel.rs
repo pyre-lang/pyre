@@ -446,7 +446,7 @@ pub unsafe fn write_int_at_mem(base: usize, ofs: usize, size: usize, newvalue: i
     unsafe {
         if release {
             debug_assert!(
-                size > 0 && addr % size == 0,
+                size > 0 && addr.is_multiple_of(size),
                 "release integer store requires natural alignment: addr={addr:#x} size={size}"
             );
             use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
@@ -551,7 +551,7 @@ pub unsafe fn read_int_at_mem(
     unsafe {
         if acquire {
             debug_assert!(
-                size > 0 && addr % size == 0,
+                size > 0 && addr.is_multiple_of(size),
                 "acquire integer load requires natural alignment: addr={addr:#x} size={size}"
             );
             use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};

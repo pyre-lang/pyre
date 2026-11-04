@@ -137,7 +137,7 @@ impl<'c> Lowerer<'c> {
             // `descr.py` `get_type_flag`: an `f64` field is the float flag,
             // so the write-set descr matches the getfield descr.
             let is_float =
-                config.array_fields.get(&key).is_none() && config.float_fields.contains(&key);
+                !config.array_fields.contains_key(&key) && config.float_fields.contains(&key);
             fields.push(quote! {
                 {
                     #__fcheck

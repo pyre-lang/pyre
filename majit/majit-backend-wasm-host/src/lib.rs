@@ -170,7 +170,7 @@ fn pair_base<T: HostState>(caller: &Caller<'_, T>, slot: u32) -> Result<u32> {
         )));
     }
     let size = table(caller)?.size(caller);
-    if (slot as u64) + 1 >= size || (slot as u64 - traces.trace_base) % 2 != 0 {
+    if (slot as u64) + 1 >= size || !(slot as u64 - traces.trace_base).is_multiple_of(2) {
         return Err(Error::msg(format!("slot {slot} is not a trace pair base")));
     }
     Ok(slot)

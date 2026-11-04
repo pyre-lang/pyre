@@ -8653,7 +8653,7 @@ mod tests {
     /// `warmspot.py check_access_directly_sanity`: a graph
     /// `collect_called_graphs(entry_point_graph)` reaches that is not
     /// in `jit_graphs` may not be `access_directly`.
-
+    ///
     /// The AccessDirect subject's origin is the identity-qualified
     /// FunctionDesc (`cachedgraph`), not the suffix-stripped plain path.
     #[test]

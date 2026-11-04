@@ -3590,9 +3590,7 @@ fn residual_callee_direct_emit_sig_at(
     func_arg: usize,
     expected: &TypedResidualSig,
 ) -> Option<TypedResidualSig> {
-    let Some(func_ptr) = op.getarglist().get(func_arg).map(|arg| arg.to_opref()) else {
-        return None;
-    };
+    let func_ptr = op.getarglist().get(func_arg).map(|arg| arg.to_opref())?;
     if !func_ptr.is_constant() {
         // The descr is the type, the same call the native backends emit.
         return Some(expected.clone());
@@ -10832,7 +10830,7 @@ pub fn has_label_param_entry(
         // reads occupy slots 1..=FROZEN_LABEL_PARAM_ARITY — slot 0 is the
         // dispatch key. A frame with exactly that many slots would let the last
         // load run off the end.
-        && frame.value_slots >= crate::FROZEN_LABEL_PARAM_ARITY + 1
+        && frame.value_slots > crate::FROZEN_LABEL_PARAM_ARITY
 }
 
 /// Per-label `(resume_safe, requires_own_frame)` metadata in ordinal order.

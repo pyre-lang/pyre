@@ -308,13 +308,11 @@ impl VrefVableBoxes {
     /// Live GCREF at store time (`setup_bridge_sym`). The guard is a root
     /// across `rebuild_portal_framestack_from_resumedata`.
     pub fn live_vable(&self, idx: usize, fallback: Value) -> Value {
-        let live = self
-            .vable_ref_roots
+        self.vable_ref_roots
             .get(idx)
             .and_then(|slot| slot.as_ref())
             .map(|g| Value::Ref(g.get()))
-            .unwrap_or(fallback);
-        live
+            .unwrap_or(fallback)
     }
 }
 

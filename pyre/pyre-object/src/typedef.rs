@@ -1104,7 +1104,7 @@ mod tests {
         let _restore = RestoreTypedefCensus::enter();
         let before = test_declaration_roots_len();
         let _layout_only = leak_typedef(&INSTANCE_TYPE, false, false);
-        assert!(test_declaration_roots_len() >= before + 1);
+        assert!(test_declaration_roots_len() > before);
         unsafe {
             let _declared =
                 TypeDef::from_rawdict("census_probe", vec![], IndexMap::new(), &INSTANCE_TYPE);

@@ -35,10 +35,10 @@ pub fn compile_eci(eci: &ExternalCompilationInfo, libname: &str) -> Result<(), c
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let cache = out_dir.join("eci").join(libname);
-    if let Err(err) = std::fs::remove_dir_all(&cache) {
-        if err.kind() != std::io::ErrorKind::NotFound {
-            panic!("{}: {err}", cache.display());
-        }
+    if let Err(err) = std::fs::remove_dir_all(&cache)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        panic!("{}: {err}", cache.display());
     }
     if let Err(err) = std::fs::create_dir_all(&cache) {
         panic!("{}: {err}", cache.display());

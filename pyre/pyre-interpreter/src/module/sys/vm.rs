@@ -2130,7 +2130,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "_getframemodulename",
                 |args| {
                     // Bound scope: optional `depth` (`PY_NULL` omitted).
-                    let depth = match args.get(0).copied().filter(|value| !value.is_null()) {
+                    let depth = match args.first().copied().filter(|value| !value.is_null()) {
                         Some(v) => {
                             crate::baseobjspace::int_w(crate::baseobjspace::space_index(v)?)?
                         }
@@ -3173,7 +3173,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 |args| {
                     // Bound scope: optional `exitcode` (`app.py` `exit(exitcode=None)`).
                     let exitcode = args
-                        .get(0)
+                        .first()
                         .copied()
                         .filter(|value| !value.is_null())
                         .unwrap_or_else(w_none);
@@ -3652,7 +3652,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "getunicodeinternedsize",
                 |args| {
                     // Bound scope: kw-only `_only_immortal` (`PY_NULL` omitted).
-                    let only_immortal = match args.get(0).copied().filter(|value| !value.is_null())
+                    let only_immortal = match args.first().copied().filter(|value| !value.is_null())
                     {
                         Some(value) => crate::baseobjspace::is_true(value)?,
                         None => false,

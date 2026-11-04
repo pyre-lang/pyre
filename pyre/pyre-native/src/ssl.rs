@@ -172,7 +172,6 @@ type CapathStamp = (std::path::PathBuf, Option<SystemTime>);
 
 static NEXT_CONTEXT_IDENTITY: AtomicUsize = AtomicUsize::new(1);
 
-#[allow(non_upper_case_globals)]
 pub use host_ssl::{
     ALERT_DESCRIPTION_ACCESS_DENIED, ALERT_DESCRIPTION_BAD_CERTIFICATE,
     ALERT_DESCRIPTION_BAD_CERTIFICATE_HASH_VALUE,
@@ -985,8 +984,10 @@ fn format_ip_address(ip: &[u8]) -> String {
     match ip.len() {
         4 => format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
         16 => ip
-            .chunks_exact(2)
-            .map(|part| format!("{:X}", u16::from_be_bytes([part[0], part[1]])))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|part| format!("{:X}", u16::from_be_bytes(*part)))
             .collect::<Vec<_>>()
             .join(":"),
         _ => "<invalid>".to_string(),

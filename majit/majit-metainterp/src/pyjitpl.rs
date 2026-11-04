@@ -5665,9 +5665,7 @@ impl<M: Clone> MetaInterp<M> {
         // Prefer the trace-bound `active_jitdriver_sd` (RPython
         // `self.jitdriver_sd`); fall back to scanning when an
         // init-time / test caller has not yet elected one.
-        let Some(idx) = self.resolve_active_jitdriver_sd_with_vinfo() else {
-            return None;
-        };
+        let idx = self.resolve_active_jitdriver_sd_with_vinfo()?;
         let jd_sd = &self.staticdata.jitdrivers_sd[idx];
         let info = std::sync::Arc::clone(
             jd_sd
@@ -9392,7 +9390,7 @@ impl<M: Clone> MetaInterp<M> {
                     *counts.entry(op.opcode).or_insert(0) += 1;
                 }
                 let mut sorted: Vec<_> = counts.into_iter().collect();
-                sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                sorted.sort_by_key(|a| std::cmp::Reverse(a.1));
                 for (opcode, count) in sorted.iter().take(15) {
                     eprintln!("  {:?}: {}", opcode, count);
                 }
@@ -9998,7 +9996,7 @@ impl<M: Clone> MetaInterp<M> {
                     *counts.entry(op.opcode).or_insert(0) += 1;
                 }
                 let mut sorted: Vec<_> = counts.into_iter().collect();
-                sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                sorted.sort_by_key(|a| std::cmp::Reverse(a.1));
                 eprintln!("[jit] after-opt op breakdown:");
                 for (opcode, count) in &sorted {
                     eprintln!("  {:?}: {}", opcode, count);
@@ -10030,7 +10028,7 @@ impl<M: Clone> MetaInterp<M> {
                         *counts.entry(op.opcode).or_insert(0) += 1;
                     }
                     let mut sorted: Vec<_> = counts.into_iter().collect();
-                    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                    sorted.sort_by_key(|a| std::cmp::Reverse(a.1));
                     for (opcode, count) in sorted.iter().take(15) {
                         crate::debug::debug_print(&format!("  {opcode:?}: {count}"));
                     }
@@ -13371,7 +13369,7 @@ impl<M: Clone> MetaInterp<M> {
     /// no cell, has no merge-point pc.
     pub fn merge_point_pc_for_driver_cell(&self, jd_no: usize, cell_key: u64) -> Option<usize> {
         let spec = self.staticdata.jitdrivers_sd.get(jd_no)?.green_args_spec();
-        if !spec.iter().any(|tp| *tp == majit_ir::GreenType::Int) {
+        if !spec.contains(&majit_ir::GreenType::Int) {
             return None;
         }
         let key = self

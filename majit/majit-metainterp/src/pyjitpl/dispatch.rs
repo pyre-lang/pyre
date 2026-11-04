@@ -3695,9 +3695,9 @@ where
             // greenkey)` uses that one `greenkey` for unique_id and
             // `portal_trace_positions`.
             let mut types = Vec::with_capacity(greens_i.len() + greens_r.len() + greens_f.len());
-            types.extend(std::iter::repeat(GreenType::Int).take(greens_i.len()));
-            types.extend(std::iter::repeat(GreenType::Ref).take(greens_r.len()));
-            types.extend(std::iter::repeat(GreenType::Float).take(greens_f.len()));
+            types.extend(std::iter::repeat_n(GreenType::Int, greens_i.len()));
+            types.extend(std::iter::repeat_n(GreenType::Ref, greens_r.len()));
+            types.extend(std::iter::repeat_n(GreenType::Float, greens_f.len()));
             let typed = GreenKey::with_types(green_values.clone(), types);
             let greenkey: crate::pyjitpl::PortalGreenKey = (typed.get_uhash(), typed);
             let mut portal_frame =

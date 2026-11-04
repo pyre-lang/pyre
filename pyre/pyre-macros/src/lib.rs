@@ -116,10 +116,8 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         param_names.push(param_name(idx, pat_type));
         // Optional iff it has a `#[default(...)]` or is `Option<T>`.
         let default_expr = arg_default(pat_type)?;
-        if is_kwonly {
-            if let Some(default_expr) = default_expr.clone() {
-                kwonly_default_pairs.push((param_names[idx].clone(), default_expr));
-            }
+        if is_kwonly && let Some(default_expr) = default_expr.clone() {
+            kwonly_default_pairs.push((param_names[idx].clone(), default_expr));
         }
         param_required.push(default_expr.is_none() && option_inner(&pat_type.ty).is_none());
         param_positional.push(!kwonly_tail && !is_kwargs);
@@ -2744,10 +2742,8 @@ fn expand_pyre_methods(
             param_names.push(pname.clone());
             // Optional iff it has a `#[default(...)]` or is `Option<T>`.
             let default_expr = arg_default(pt)?;
-            if is_kwonly {
-                if let Some(default_expr) = default_expr.clone() {
-                    kwonly_default_pairs.push((pname.clone(), default_expr));
-                }
+            if is_kwonly && let Some(default_expr) = default_expr.clone() {
+                kwonly_default_pairs.push((pname.clone(), default_expr));
             }
             param_required.push(default_expr.is_none() && option_inner(&pt.ty).is_none());
             param_positional.push(!kwonly_tail && !is_kwargs);

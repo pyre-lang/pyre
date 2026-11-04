@@ -1575,7 +1575,6 @@ pub extern "C" fn bh_store_subscr_fn(obj: PyObjectRef, key: PyObjectRef, value: 
         let exc_obj = err.to_exc_object();
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
         crate::runtime_ops::jit_publish_exception(exc_obj);
-        return;
     }
 }
 

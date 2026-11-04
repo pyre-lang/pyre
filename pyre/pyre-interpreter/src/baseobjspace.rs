@@ -12190,12 +12190,11 @@ fn name_content_hash(name: &Wtf8) -> u64 {
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let bytes = name.as_bytes();
     let mut hash = OFFSET ^ (bytes.len() as u64);
-    let mut chunks = bytes.chunks_exact(8);
-    for chunk in &mut chunks {
-        hash ^= u64::from_le_bytes(chunk.try_into().unwrap());
+    let (chunks, rest) = bytes.as_chunks::<8>();
+    for chunk in chunks {
+        hash ^= u64::from_le_bytes(*chunk);
         hash = hash.wrapping_mul(PRIME);
     }
-    let rest = chunks.remainder();
     if !rest.is_empty() {
         let mut tail = [0u8; 8];
         tail[..rest.len()].copy_from_slice(rest);
@@ -23303,17 +23302,16 @@ pub unsafe fn generator_invoke_execute_frame(
         ))),
         (_, operr) => operr,
     };
-    let throw_args = match throw_len {
-        Some(len) => Some((
+    let throw_args = throw_len.map(|len| {
+        (
             [
                 pyre_object::gc_roots::shadow_stack_get(gen_slot + 4),
                 pyre_object::gc_roots::shadow_stack_get(gen_slot + 5),
                 pyre_object::gc_roots::shadow_stack_get(gen_slot + 6),
             ],
             len,
-        )),
-        None => None,
-    };
+        )
+    });
     // generator.py `_invoke_execute_frame` → `frame.execute_frame(w_arg_or_err)`.
     // `execute_generator_frame` is look-inside and dispatches through
     // `get_eval_fn` the way `interp_jit.py dispatch` applies the jitdriver

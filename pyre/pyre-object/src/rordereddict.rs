@@ -2488,7 +2488,7 @@ mod tests {
             }
             assert!(d.index_len().is_power_of_two());
             assert!(
-                d.index_words().iter().any(|&ix| ix == FREE),
+                d.index_words().contains(&FREE),
                 "index table has no FREE slot left"
             );
         }

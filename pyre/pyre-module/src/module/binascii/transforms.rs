@@ -132,7 +132,7 @@ pub fn b2a_base32(
     }
     let mut out = Vec::with_capacity(ascii_len);
     let (full, rem) = data.split_at(data.len() - data.len() % 5);
-    for chunk in full.chunks_exact(5) {
+    for chunk in full.as_chunks::<5>().0 {
         let val = (u64::from(chunk[0]) << 32)
             | (u64::from(chunk[1]) << 24)
             | (u64::from(chunk[2]) << 16)
@@ -317,7 +317,7 @@ pub fn b2a_base85(
     }
     let mut out = Vec::with_capacity(out_len);
     let (full, rem) = data.split_at(data.len() - data.len() % 4);
-    for chunk in full.chunks_exact(4) {
+    for chunk in full.as_chunks::<4>().0 {
         let mut leftchar = (u32::from(chunk[0]) << 24)
             | (u32::from(chunk[1]) << 16)
             | (u32::from(chunk[2]) << 8)
@@ -400,7 +400,7 @@ pub fn b2a_ascii85(
         out.push(b'~');
     }
     let (full, rem) = data.split_at(data.len() - data.len() % 4);
-    for chunk in full.chunks_exact(4) {
+    for chunk in full.as_chunks::<4>().0 {
         let mut leftchar = (u32::from(chunk[0]) << 24)
             | (u32::from(chunk[1]) << 16)
             | (u32::from(chunk[2]) << 8)

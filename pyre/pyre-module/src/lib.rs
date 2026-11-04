@@ -112,7 +112,7 @@ pub fn install_optional_modules() {
         module::array::init_array_module,
         module::array::startup_array_module,
     );
-    #[cfg(all(not(feature = "sandbox")))]
+    #[cfg(not(feature = "sandbox"))]
     pyre_interpreter::importing::register_builtin_module("_socket", module::_socket::init);
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("_ssl", module::_ssl::init);
@@ -143,7 +143,7 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("pyexpat", module::pyexpat::init);
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("resource", module::resource::init);
-    #[cfg(all(not(feature = "sandbox")))]
+    #[cfg(not(feature = "sandbox"))]
     pyre_interpreter::importing::register_builtin_module("select", module::select::init);
     #[cfg(all(unix, not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("syslog", module::syslog::init);

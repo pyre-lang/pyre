@@ -18351,6 +18351,7 @@ fn send_ex_continuation_level() -> Option<(i32, usize)> {
     send_ex_continuation_full().map(|(index, resume_pc, _)| (index, resume_pc))
 }
 
+#[cfg(test)]
 fn send_ex_after_teardown_pc() -> Option<usize> {
     send_ex_continuation_full().and_then(|(_, _, after)| (after != 0).then_some(after))
 }

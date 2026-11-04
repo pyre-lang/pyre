@@ -1206,10 +1206,9 @@ pub fn materialize_bridge_virtual(
             // names and the array the interpreter resumes against are the
             // same object. Pin the `bh_new` result before `record_op*`
             // (`publish_new_virtual`): the Trace-pool append can collect.
-            let allocated = match cache.allocator() {
-                Some(allocator) => Some(allocator.bh_new_array_clear(*size, array_descr)),
-                None => None,
-            };
+            let allocated = cache
+                .allocator()
+                .map(|allocator| allocator.bh_new_array_clear(*size, array_descr));
             if allocated == Some(0) {
                 return OpRef::NONE;
             }
@@ -1890,7 +1889,7 @@ pub fn reconnect_virtualrefs(
 ) {
     let vrefinfo = crate::virtualref::VirtualRefInfo::new();
     let mut live_boxes = Vec::with_capacity(virtualref_boxes.len());
-    for pair in virtualref_boxes.chunks_exact(2) {
+    for pair in virtualref_boxes.as_chunks::<2>().0 {
         let (virt_op, decoded_virt) = pair[0];
         let (vref_op, decoded_vref) = pair[1];
         let virt_ptr = live_bridge_ref_addr(ctx, cache, virt_op).unwrap_or(decoded_virt);

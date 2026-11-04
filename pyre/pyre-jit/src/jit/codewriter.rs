@@ -13106,7 +13106,7 @@ impl CodeWriter {
                                     Kind::Ref,
                                     py_pc as i64,
                                 );
-                                for pair in items.chunks_exact(2) {
+                                for pair in items.as_chunks::<2>().0 {
                                     emit_graph_op_void(
                                         &current_block.block(),
                                         "dict_display_setitem",

@@ -658,10 +658,7 @@ extern "C" fn force_and_record(force_token: i64) {
             None => -2,
         }
     }));
-    let value = match recorded {
-        Ok(value) => value,
-        Err(_) => -3,
-    };
+    let value = recorded.unwrap_or(-3);
     FORCE_SEEN.with(|cell| cell.set(Some(value)));
 }
 
@@ -2467,10 +2464,7 @@ extern "C" fn force_caller_and_return(force_token: i64) -> i64 {
             None => -2,
         }
     }));
-    let value = match recorded {
-        Ok(value) => value,
-        Err(_) => -3,
-    };
+    let value = recorded.unwrap_or(-3);
     FORCE_SEEN.with(|cell| cell.set(Some(value)));
     7
 }

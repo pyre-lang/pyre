@@ -6,7 +6,7 @@
 //! (`suffix = 'W'`) is instantiated, and its members are the module-level items
 //! below. The entries ported so far are the ones `interp_nt` reads.
 
-#![allow(non_snake_case, non_camel_case_types)]
+#![allow(non_camel_case_types)]
 
 use crate::rffi::{CWCHARP, RFFI_SAVE_LASTERROR};
 use crate::rwin32::{BOOL, DWORD, FILETIME, HANDLE, LPSECURITY_ATTRIBUTES};

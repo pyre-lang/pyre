@@ -1453,8 +1453,7 @@ impl WarmEnterState {
              warmstate.py attach_procedure_to_interp ensure_jit_cell_at_key(greenkey) — use the `_for_key` twin",
         );
         cell.flags.set(cell.flags.get() & (!JcFlags::JC_TRACING));
-        let previous = cell.set_procedure_token(token, false);
-        previous
+        cell.set_procedure_token(token, false)
     }
 
     /// Typed form of [`Self::attach_procedure_to_interp`].
@@ -1472,8 +1471,7 @@ impl WarmEnterState {
             .lookup_chain_with_key_mut(key)
             .expect("ensure_cell_for_key just installed a cell matching this key");
         cell.flags.set(cell.flags.get() & (!JcFlags::JC_TRACING));
-        let previous = cell.set_procedure_token(token, false);
-        previous
+        cell.set_procedure_token(token, false)
     }
 
     /// warmstate.py `finally: cell.flags &= ~JC_TRACING` parity —
