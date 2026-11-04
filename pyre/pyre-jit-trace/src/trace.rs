@@ -3985,9 +3985,19 @@ fn cash_multi_frame_blackhole(
             })
             .collect::<Vec<_>>(),
     );
+    // This closure does not run `return_trace` / `ExecutionContext.leave`.
+    // Adopted Python levels finish through `bhimpl_jit_merge_point`'s
+    // recursive arm; `ll_portal_runner_shim`'s bracket already ran
+    // `pyframe.py execute_frame`'s inner and outer `finally` hooks
+    // (`portal_activation_bracketed`, `PortalLeaveOwner::CompiledTrace`).
+    // The bracket skips the chain half of `leave`, which this supplies.
+    // Convert's `bh_portal_runner_c` levels instead take
+    // `finish_per_code_blackhole_level` (`call_jit.rs`).
     let finish_level = |frame_ptr: i64, _exit: majit_metainterp::blackhole::LevelExit| {
         crate::state::finish_blackhole_level_frame(frame_ptr);
         if frame_ptr != 0 {
+            // `executioncontext.py leave`: `self.topframeref = frame.f_backref`
+            // before the caller's residuals run.
             unsafe {
                 (*ec).topframeref = (*(frame_ptr as *mut pyre_interpreter::PyFrame)).f_backref;
             }
