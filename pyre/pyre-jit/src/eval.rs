@@ -14301,6 +14301,172 @@ fn push_decoded_value(values: &mut Vec<Value>, value: Value) {
     }
 }
 
+/// resume.py ResumeDataDirectReader.decode_int
+fn decode_int(
+    tagged: i16,
+    dead_frame: &[Value],
+    num_failargs: i32,
+    rd_consts: &[majit_ir::Const],
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    virtuals_cache: &mut DirectVirtualsCache,
+    failarg_refs: Option<&[i64]>,
+) -> i64 {
+    let (num, tag) = majit_metainterp::resume::untag(tagged);
+    if tag == majit_ir::resumedata::TAGCONST {
+        // resume.py ResumeDataDirectReader.decode_int: TAGCONST -> consts[..].getint()
+        let ci = (num - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
+        rd_consts[ci].getint()
+    } else if tag == majit_ir::resumedata::TAGINT {
+        num as i64
+    } else if tag == majit_ir::resumedata::TAGVIRTUAL {
+        // resume.py ResumeDataDirectReader.decode_int: TAGVIRTUAL -> getvirtual_int(num)
+        let vidx = if num < 0 {
+            (rd_virtuals.map_or(0, |v| v.len()) as i32 + num) as usize
+        } else {
+            num as usize
+        };
+        match materialize_virtual_from_rd(
+            vidx,
+            dead_frame,
+            num_failargs,
+            rd_consts,
+            rd_virtuals,
+            virtuals_cache,
+            failarg_refs,
+        ) {
+            Value::Int(n) => n,
+            other => panic!(
+                "resume.py ResumeDataDirectReader.decode_int TAGVIRTUAL: \
+                 getvirtual_int expected Value::Int, got {other:?}"
+            ),
+        }
+    } else {
+        assert!(
+            tag == majit_ir::resumedata::TAGBOX,
+            "resume.py ResumeDataDirectReader.decode_int: assert tag == TAGBOX (got {tag})"
+        );
+        let idx = if num < 0 {
+            (num + num_failargs) as usize
+        } else {
+            num as usize
+        };
+        match dead_frame[idx] {
+            Value::Int(n) => n,
+            other => panic!(
+                "resume.py ResumeDataDirectReader.decode_int TAGBOX: \
+                 expected Value::Int, got {other:?}"
+            ),
+        }
+    }
+}
+
+/// resume.py ResumeDataDirectReader.decode_ref
+///
+/// TAGCONST reads `rd_consts[ci].getref_base()` at use, after any
+/// `allocate` that may have collected (`_prepare_pendingfields`).
+/// TAGBOX Refs re-read `failarg_refs` when the resume shadow stack
+/// forwarded that buffer; otherwise the deadframe slot.
+fn decode_ref(
+    tagged: i16,
+    dead_frame: &[Value],
+    num_failargs: i32,
+    rd_consts: &[majit_ir::Const],
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    virtuals_cache: &mut DirectVirtualsCache,
+    failarg_refs: Option<&[i64]>,
+) -> majit_ir::GcRef {
+    let (num, tag) = majit_metainterp::resume::untag(tagged);
+    if tag == majit_ir::resumedata::TAGCONST {
+        // resume.py ResumeDataDirectReader.decode_ref:
+        // TAGCONST (NULLREF -> null, else getref_base())
+        if tagged == majit_ir::resumedata::NULLREF {
+            return majit_ir::GcRef::NULL;
+        }
+        let ci = (num - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
+        rd_consts[ci].getref_base()
+    } else if tag == majit_ir::resumedata::TAGVIRTUAL {
+        // resume.py ResumeDataDirectReader.decode_ref: TAGVIRTUAL -> getvirtual_ptr
+        let vidx = if num < 0 {
+            (rd_virtuals.map_or(0, |v| v.len()) as i32 + num) as usize
+        } else {
+            num as usize
+        };
+        match materialize_virtual_from_rd(
+            vidx,
+            dead_frame,
+            num_failargs,
+            rd_consts,
+            rd_virtuals,
+            virtuals_cache,
+            failarg_refs,
+        ) {
+            Value::Ref(r) => r,
+            other => panic!(
+                "resume.py ResumeDataDirectReader.decode_ref TAGVIRTUAL: \
+                 getvirtual_ptr expected Value::Ref, got {other:?}"
+            ),
+        }
+    } else {
+        assert!(
+            tag == majit_ir::resumedata::TAGBOX,
+            "resume.py ResumeDataDirectReader.decode_ref: assert tag == TAGBOX (got {tag})"
+        );
+        let idx = if num < 0 {
+            (num + num_failargs) as usize
+        } else {
+            num as usize
+        };
+        // resume.py ResumeDataDirectReader.decode_ref TAGBOX:
+        // cpu.get_ref_value(self.deadframe, num). Replay roots a parallel
+        // failarg_refs buffer (`DeadFrameRefRoots`) and re-reads it after
+        // allocate, matching that deadframe slot.
+        if let Some(Value::Ref(_)) = dead_frame.get(idx) {
+            if let Some(refs) = failarg_refs {
+                return majit_ir::GcRef(refs[idx] as usize);
+            }
+        }
+        match dead_frame[idx] {
+            Value::Ref(r) => r,
+            other => panic!(
+                "resume.py ResumeDataDirectReader.decode_ref TAGBOX: \
+                 expected Value::Ref, got {other:?}"
+            ),
+        }
+    }
+}
+
+/// resume.py ResumeDataDirectReader.decode_float
+fn decode_float(
+    tagged: i16,
+    dead_frame: &[Value],
+    num_failargs: i32,
+    rd_consts: &[majit_ir::Const],
+) -> f64 {
+    let (num, tag) = majit_metainterp::resume::untag(tagged);
+    if tag == majit_ir::resumedata::TAGCONST {
+        // resume.py ResumeDataDirectReader.decode_float: TAGCONST -> getfloatstorage()
+        let ci = (num - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
+        f64::from_bits(rd_consts[ci].getfloatstorage() as u64)
+    } else {
+        assert!(
+            tag == majit_ir::resumedata::TAGBOX,
+            "resume.py ResumeDataDirectReader.decode_float: assert tag == TAGBOX (got {tag})"
+        );
+        let idx = if num < 0 {
+            (num + num_failargs) as usize
+        } else {
+            num as usize
+        };
+        match dead_frame[idx] {
+            Value::Float(f) => f,
+            other => panic!(
+                "resume.py ResumeDataDirectReader.decode_float TAGBOX: \
+                 expected Value::Float, got {other:?}"
+            ),
+        }
+    }
+}
+
 /// resume.py getvirtual_ptr parity.
 ///
 /// Lazily materializes a virtual from rd_virtuals[vidx].
@@ -14314,6 +14480,7 @@ fn materialize_virtual_from_rd(
     rd_consts: &[majit_ir::Const],
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     virtuals_cache: &mut DirectVirtualsCache,
+    failarg_refs: Option<&[i64]>,
 ) -> Value {
     // resume.py: v = self.virtuals_cache.get_ptr(index)
     if let Some(cached) = virtuals_cache.get(vidx) {
@@ -14325,155 +14492,6 @@ fn materialize_virtual_from_rd(
     // index; a corrupt resume stream (out-of-range vidx) raises IndexError here
     // rather than being swallowed as a NULL ref.
     let entry = &virtuals[vidx];
-    // resume.py ResumeDataDirectReader.decode_int / decode_ref / decode_float.
-    // TAGBOX: cpu.get_*_value(deadframe, num) — direct index; a corrupt
-    // stream (out-of-range num) raises here rather than being papered over
-    // with a 0. Nested virtuals are numbered negatively; getvirtual_*
-    // resolves them via Python negative list indexing into rd_virtuals.
-    fn decode_int(
-        tagged: i16,
-        dead_frame: &[Value],
-        num_failargs: i32,
-        rd_consts: &[majit_ir::Const],
-        rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
-        virtuals_cache: &mut DirectVirtualsCache,
-    ) -> i64 {
-        let (num, tag) = majit_metainterp::resume::untag(tagged);
-        if tag == majit_ir::resumedata::TAGCONST {
-            // resume.py ResumeDataDirectReader.decode_int: TAGCONST -> consts[..].getint()
-            let ci = (num - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
-            rd_consts[ci].getint()
-        } else if tag == majit_ir::resumedata::TAGINT {
-            num as i64
-        } else if tag == majit_ir::resumedata::TAGVIRTUAL {
-            // resume.py ResumeDataDirectReader.decode_int: TAGVIRTUAL -> getvirtual_int(num)
-            let vidx = if num < 0 {
-                (rd_virtuals.map_or(0, |v| v.len()) as i32 + num) as usize
-            } else {
-                num as usize
-            };
-            match materialize_virtual_from_rd(
-                vidx,
-                dead_frame,
-                num_failargs,
-                rd_consts,
-                rd_virtuals,
-                virtuals_cache,
-            ) {
-                Value::Int(n) => n,
-                other => panic!(
-                    "resume.py ResumeDataDirectReader.decode_int TAGVIRTUAL: \
-                     getvirtual_int expected Value::Int, got {other:?}"
-                ),
-            }
-        } else {
-            assert!(
-                tag == majit_ir::resumedata::TAGBOX,
-                "resume.py ResumeDataDirectReader.decode_int: assert tag == TAGBOX (got {tag})"
-            );
-            let idx = if num < 0 {
-                (num + num_failargs) as usize
-            } else {
-                num as usize
-            };
-            match dead_frame[idx] {
-                Value::Int(n) => n,
-                other => panic!(
-                    "resume.py ResumeDataDirectReader.decode_int TAGBOX: \
-                     expected Value::Int, got {other:?}"
-                ),
-            }
-        }
-    }
-
-    fn decode_ref(
-        tagged: i16,
-        dead_frame: &[Value],
-        num_failargs: i32,
-        rd_consts: &[majit_ir::Const],
-        rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
-        virtuals_cache: &mut DirectVirtualsCache,
-    ) -> majit_ir::GcRef {
-        let (num, tag) = majit_metainterp::resume::untag(tagged);
-        if tag == majit_ir::resumedata::TAGCONST {
-            // resume.py ResumeDataDirectReader.decode_ref:
-            // TAGCONST (NULLREF -> null, else getref_base())
-            if tagged == majit_ir::resumedata::NULLREF {
-                return majit_ir::GcRef::NULL;
-            }
-            let ci = (num - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
-            rd_consts[ci].getref_base()
-        } else if tag == majit_ir::resumedata::TAGVIRTUAL {
-            // resume.py ResumeDataDirectReader.decode_ref: TAGVIRTUAL -> getvirtual_ptr
-            let vidx = if num < 0 {
-                (rd_virtuals.map_or(0, |v| v.len()) as i32 + num) as usize
-            } else {
-                num as usize
-            };
-            match materialize_virtual_from_rd(
-                vidx,
-                dead_frame,
-                num_failargs,
-                rd_consts,
-                rd_virtuals,
-                virtuals_cache,
-            ) {
-                Value::Ref(r) => r,
-                other => panic!(
-                    "resume.py ResumeDataDirectReader.decode_ref TAGVIRTUAL: \
-                     getvirtual_ptr expected Value::Ref, got {other:?}"
-                ),
-            }
-        } else {
-            assert!(
-                tag == majit_ir::resumedata::TAGBOX,
-                "resume.py ResumeDataDirectReader.decode_ref: assert tag == TAGBOX (got {tag})"
-            );
-            let idx = if num < 0 {
-                (num + num_failargs) as usize
-            } else {
-                num as usize
-            };
-            match dead_frame[idx] {
-                Value::Ref(r) => r,
-                other => panic!(
-                    "resume.py ResumeDataDirectReader.decode_ref TAGBOX: \
-                     expected Value::Ref, got {other:?}"
-                ),
-            }
-        }
-    }
-
-    fn decode_float(
-        tagged: i16,
-        dead_frame: &[Value],
-        num_failargs: i32,
-        rd_consts: &[majit_ir::Const],
-    ) -> f64 {
-        let (num, tag) = majit_metainterp::resume::untag(tagged);
-        if tag == majit_ir::resumedata::TAGCONST {
-            // resume.py ResumeDataDirectReader.decode_float: TAGCONST -> getfloatstorage()
-            let ci = (num - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
-            f64::from_bits(rd_consts[ci].getfloatstorage() as u64)
-        } else {
-            assert!(
-                tag == majit_ir::resumedata::TAGBOX,
-                "resume.py ResumeDataDirectReader.decode_float: assert tag == TAGBOX (got {tag})"
-            );
-            let idx = if num < 0 {
-                (num + num_failargs) as usize
-            } else {
-                num as usize
-            };
-            match dead_frame[idx] {
-                Value::Float(f) => f,
-                other => panic!(
-                    "resume.py ResumeDataDirectReader.decode_float TAGBOX: \
-                     expected Value::Float, got {other:?}"
-                ),
-            }
-        }
-    }
     // resume.py AbstractVArrayInfo: dispatch by virtual kind.
     match entry.as_ref() {
         majit_ir::RdVirtualInfo::VArrayInfoClear {
@@ -14517,6 +14535,7 @@ fn materialize_virtual_from_rd(
                         rd_consts,
                         rd_virtuals,
                         virtuals_cache,
+                        failarg_refs,
                     )
                     .0 as i64;
                     // `resume.py` `bh_setarrayitem_gc_*`: re-read
@@ -14538,6 +14557,7 @@ fn materialize_virtual_from_rd(
                         rd_consts,
                         rd_virtuals,
                         virtuals_cache,
+                        failarg_refs,
                     );
                     let array = virtuals_cache.live_ptr(vidx) as i64;
                     bh_setarrayitem_int_from_descr(array, i, value, arraydescr);
@@ -14616,6 +14636,7 @@ fn materialize_virtual_from_rd(
                                 rd_consts,
                                 rd_virtuals,
                                 virtuals_cache,
+                                failarg_refs,
                             )
                             .0 as i64
                         }
@@ -14629,6 +14650,7 @@ fn materialize_virtual_from_rd(
                             rd_consts,
                             rd_virtuals,
                             virtuals_cache,
+                            failarg_refs,
                         ),
                     };
                     // resume.py: decoder.setinteriorfield(i, array, num, self.fielddescrs[j])
@@ -14713,6 +14735,7 @@ fn materialize_virtual_from_rd(
                         rd_consts,
                         rd_virtuals,
                         virtuals_cache,
+                        failarg_refs,
                     );
                     // resume.py:1550: self.cpu.bh_raw_store_i(buffer, offset, newvalue, descr)
                     backend.bh_raw_store_i(buffer, offset, ival, &bh_descr);
@@ -14735,6 +14758,7 @@ fn materialize_virtual_from_rd(
                 rd_consts,
                 rd_virtuals,
                 virtuals_cache,
+                failarg_refs,
             );
             // resume.py: buffer = decoder.int_add_const(base_buffer, self.offset)
             let result = Value::Int(base + *offset as i64);
@@ -14781,6 +14805,7 @@ fn materialize_virtual_from_rd(
                     rd_consts,
                     rd_virtuals,
                     virtuals_cache,
+                    failarg_refs,
                 );
                 let string = virtuals_cache.live_ptr(vidx) as i64;
                 if is_unicode {
@@ -14824,6 +14849,7 @@ fn materialize_virtual_from_rd(
                 rd_consts,
                 rd_virtuals,
                 virtuals_cache,
+                failarg_refs,
             );
             let left_root = if !left_ref.is_null() {
                 Some(majit_gc::shadow_stack::OwnerRootGuard::new(left_ref))
@@ -14837,6 +14863,7 @@ fn materialize_virtual_from_rd(
                 rd_consts,
                 rd_virtuals,
                 virtuals_cache,
+                failarg_refs,
             );
             let (driver, _) = driver_pair();
             let cic = driver
@@ -14901,6 +14928,7 @@ fn materialize_virtual_from_rd(
                 rd_consts,
                 rd_virtuals,
                 virtuals_cache,
+                failarg_refs,
             )
             .0 as i64;
             let start_val = decode_int(
@@ -14910,6 +14938,7 @@ fn materialize_virtual_from_rd(
                 rd_consts,
                 rd_virtuals,
                 virtuals_cache,
+                failarg_refs,
             );
             let length_val = decode_int(
                 fieldnums[2],
@@ -14918,6 +14947,7 @@ fn materialize_virtual_from_rd(
                 rd_consts,
                 rd_virtuals,
                 virtuals_cache,
+                failarg_refs,
             );
             // resume.py / 1501 — slice_string(str, start, start + length)
             // passes the stop index, not the length.
@@ -15108,6 +15138,7 @@ fn materialize_virtual_from_rd(
                     rd_consts,
                     rd_virtuals,
                     virtuals_cache,
+                    failarg_refs,
                 );
                 // `resume.py` `setfields`: re-read `virtuals_cache` after
                 // decode (`getvirtual_ptr` / `abstract_virtual_struct_info_setfields`).
@@ -15148,6 +15179,7 @@ fn materialize_virtual_from_rd(
                     rd_consts,
                     rd_virtuals,
                     virtuals_cache,
+                    failarg_refs,
                 );
                 let obj_ptr = virtuals_cache.live_ptr(vidx);
                 unsafe {
@@ -15485,6 +15517,7 @@ fn rebuild_typed_from_rd_numb(
                 rd_consts,
                 descr.rd_virtuals(),
                 virtuals_cache,
+                None,
             ),
             RebuiltValue::Unassigned => {
                 panic!("resume.py decode_box: UNINITIALIZED is not a live-register box")
@@ -15848,6 +15881,7 @@ fn build_resumed_frames(
                 rd_consts,
                 descr.rd_virtuals(),
                 virtuals_cache,
+                None,
             ),
             RebuiltValue::Unassigned => {
                 panic!("resume.py decode_box: UNINITIALIZED is not a live-register box")
@@ -16173,6 +16207,7 @@ fn _prepare_next_section(
                 rd_consts,
                 rd_virtuals,
                 virtuals_cache,
+                None,
             ),
             RebuiltValue::Unassigned => {
                 panic!("resume.py decode_box: UNINITIALIZED is not a live-register box")
@@ -16192,91 +16227,71 @@ fn _prepare_next_section(
 // remain expressible in the translator's RPython subset, which the
 // downcast-driven on-demand decode implementation is not).
 
-fn pending_source_raw_bits(value: Value) -> i64 {
-    match value {
-        Value::Int(i) => i,
-        Value::Float(f) => f.to_bits() as i64,
-        Value::Ref(r) => r.0 as i64,
-        Value::Void => 0,
-    }
-}
-
-/// Materialize a pending-field source. Virtuals go through
-/// `materialize_virtual_from_rd` (`resume.py getvirtual_ptr`).
-fn materialize_pending_source(
-    src: &majit_backend::ExitValueSourceLayout,
-    dead_frame_typed: &[Value],
+/// Decode a pending-field value tagged the way
+/// `ResumeDataDirectReader.setfield` / `setarrayitem` dispatch:
+/// Ref → `decode_ref`, Float → `decode_float`, else `decode_int`.
+fn decode_pending_value(
+    tagged: i16,
+    value_type: majit_ir::Type,
+    dead_frame: &[Value],
     num_failargs: i32,
     rd_consts: &[majit_ir::Const],
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     virtuals_cache: &mut DirectVirtualsCache,
-) -> Option<i64> {
-    match src {
-        majit_backend::ExitValueSourceLayout::ExitValue(idx) => dead_frame_typed
-            .get(*idx)
-            .cloned()
-            .map(pending_source_raw_bits),
-        majit_backend::ExitValueSourceLayout::Constant(c, _) => Some(*c),
-        majit_backend::ExitValueSourceLayout::Virtual(vidx) => {
-            Some(pending_source_raw_bits(materialize_virtual_from_rd(
-                *vidx,
-                dead_frame_typed,
+    failarg_refs: Option<&[i64]>,
+) -> i64 {
+    match value_type {
+        majit_ir::Type::Ref => {
+            decode_ref(
+                tagged,
+                dead_frame,
                 num_failargs,
                 rd_consts,
                 rd_virtuals,
                 virtuals_cache,
-            )))
+                failarg_refs,
+            )
+            .0 as i64
         }
-        majit_backend::ExitValueSourceLayout::Uninitialized
-        | majit_backend::ExitValueSourceLayout::Unavailable => None,
+        majit_ir::Type::Float => {
+            decode_float(tagged, dead_frame, num_failargs, rd_consts).to_bits() as i64
+        }
+        majit_ir::Type::Int | majit_ir::Type::Void => decode_int(
+            tagged,
+            dead_frame,
+            num_failargs,
+            rd_consts,
+            rd_virtuals,
+            virtuals_cache,
+            failarg_refs,
+        ),
     }
 }
 
-/// Re-read a pending-field source from its rooted slot after any allocation.
-/// Virtuals: `virtuals_cache.live_ptr`. TAGBOX fail-args: `failarg_refs`,
-/// forwarded in place by the resume shadow stack.
-fn live_pending_source(
-    src: &majit_backend::ExitValueSourceLayout,
-    dead_frame_typed: &[Value],
-    failarg_refs: &[i64],
-    virtuals_cache: &DirectVirtualsCache,
-) -> Option<i64> {
-    match src {
-        majit_backend::ExitValueSourceLayout::ExitValue(idx) => match dead_frame_typed.get(*idx) {
-            Some(Value::Ref(_)) => failarg_refs.get(*idx).copied(),
-            other => other.cloned().map(pending_source_raw_bits),
-        },
-        majit_backend::ExitValueSourceLayout::Constant(c, _) => Some(*c),
-        majit_backend::ExitValueSourceLayout::Virtual(vidx) => {
-            Some(virtuals_cache.live_ptr(*vidx) as i64)
-        }
-        majit_backend::ExitValueSourceLayout::Uninitialized
-        | majit_backend::ExitValueSourceLayout::Unavailable => None,
-    }
-}
-
-/// resume.py _prepare_pendingfields: replay deferred field writes.
+/// resume.py ResumeDataDirectReader._prepare_pendingfields: replay
+/// deferred SETFIELD_GC / SETARRAYITEM_GC stored in `rd_pendingfields`.
 ///
-/// After virtual materialization, pending SETFIELD_GC/SETARRAYITEM_GC
-/// ops stored in rd_pendingfields are replayed on the materialized objects.
-/// This ensures lazy field writes that were deferred during optimization
-/// take effect when the guard fires.
+/// Iterate the tagged `GuardPendingFieldEntry` list, not
+/// `exit_pending_field_layouts`. Decode the value first so a virtual
+/// `allocate` can collect, decode the target (`decode_ref` on
+/// `target_tagged`), then `setfield` / `setarrayitem` which decode the
+/// value again from the tag. TAGCONST Refs are
+/// `rd_consts[ci].getref_base()` at use (`ResumeDataDirectReader.decode_ref`).
 fn replay_pending_fields(
     dead_frame_typed: &[Value],
     descr: &dyn majit_ir::FailDescr,
     virtuals_cache: &mut DirectVirtualsCache,
 ) {
-    let num_failargs = descr.fail_arg_types().len() as i32;
-    // `resume.py _prepare_pendingfields` reads the list off the guard's
-    // `rd_pendingfields` (`ResumeGuardDescr.get_resumestorage`).
-    if descr.rd_pendingfields().is_none() {
+    // resume.py ResumeDataDirectReader._prepare_pendingfields reads the
+    // list off the guard's `rd_pendingfields`.
+    let Some(pendingfields) = descr.rd_pendingfields() else {
         return;
-    }
-    let pending = majit_metainterp::resume::exit_pending_field_layouts(descr, num_failargs);
-    if pending.is_empty() {
+    };
+    if pendingfields.is_empty() {
         return;
     }
 
+    let num_failargs = descr.fail_arg_types().len() as i32;
     let rd_consts: &[majit_ir::Const] = descr.rd_consts().unwrap_or(&[]);
     let rd_virtuals = descr.rd_virtuals();
 
@@ -16296,81 +16311,128 @@ fn replay_pending_fields(
         })
     };
 
-    for pf in pending.iter() {
-        // Materialize the value first. resume.py
-        // ResumeDataDirectReader._prepare_pendingfields does
-        // `struct = self.decode_ref(num)` then `setfield` (which decodes
-        // the value); every ref is GC-tracked so ordering does not matter.
-        // A virtual value's allocate can collect and move the target.
-        if materialize_pending_source(
-            &pf.value,
-            dead_frame_typed,
-            num_failargs,
-            rd_consts,
-            rd_virtuals,
-            virtuals_cache,
-        )
-        .is_none()
-        {
-            continue;
-        }
-        if materialize_pending_source(
-            &pf.target,
-            dead_frame_typed,
-            num_failargs,
-            rd_consts,
-            rd_virtuals,
-            virtuals_cache,
-        )
-        .is_none()
-        {
-            continue;
-        }
-        // Re-read both from rooted slots. Neither accessor allocates.
-        let Some(target_ptr) =
-            live_pending_source(&pf.target, dead_frame_typed, &failarg_refs, virtuals_cache)
-        else {
-            continue;
-        };
-        let Some(value_raw) =
-            live_pending_source(&pf.value, dead_frame_typed, &failarg_refs, virtuals_cache)
-        else {
-            continue;
-        };
-        if target_ptr == 0 {
-            continue; // null target — skip
-        }
-        // resume.py PENDINGFIELDSTRUCT.lldescr is always present in
-        // RPython — captured directly off the Setfield_gc / Setarrayitem_gc op
-        // that produced the pending field (heap.py force_lazy_sets_for_guard).
-        let descr = pf
+    for pf in pendingfields {
+        // resume.py PENDINGFIELDSTRUCT.lldescr is always present —
+        // captured off the Setfield_gc / Setarrayitem_gc that produced
+        // the pending field (heap.py force_lazy_sets_for_guard).
+        let field_descr = pf
             .descr
             .as_ref()
             .expect("resume.py `_prepare_pendingfields`: PENDINGFIELDSTRUCT.lldescr must be set");
-        // resume.py _prepare_pendingfields:
-        //   if itemindex < 0: setfield(struct, fieldnum, descr)
-        //   else:             setarrayitem(struct, itemindex, fieldnum, descr)
-        //
+        assert!(
+            pf.target_tagged != majit_ir::resumedata::UNASSIGNED
+                && pf.value_tagged != majit_ir::resumedata::UNASSIGNED,
+            "GuardPendingFieldEntry reached replay_pending_fields with \
+             UNASSIGNED tag (target_tagged={}, value_tagged={:?}); \
+             _add_pending_fields must have run before restore time",
+            pf.target_tagged,
+            pf.value_tagged,
+        );
+        // Decode the value first so materializing a virtual value can
+        // collect before we capture the target pointer. resume.py
+        // ResumeDataDirectReader._prepare_pendingfields does
+        // `struct = self.decode_ref(num)` then `setfield`/`setarrayitem`;
+        // every ref is GC-tracked so ordering does not matter. `setfield`
+        // / `setarrayitem` then decode the value again from the tag
+        // (`ResumeDataDirectReader.decode_ref`).
+        let (addr, value_type, value_size, target_ptr, value_raw) = if pf.item_index < 0 {
+            let fd = field_descr.as_field_descr().expect(
+                "resume.py `_prepare_pendingfields`: setfield pending field \
+                 must carry a FieldDescr",
+            );
+            let _ = decode_pending_value(
+                pf.value_tagged,
+                fd.field_type(),
+                dead_frame_typed,
+                num_failargs,
+                rd_consts,
+                rd_virtuals,
+                virtuals_cache,
+                Some(&failarg_refs),
+            );
+            let struct_ptr = decode_ref(
+                pf.target_tagged,
+                dead_frame_typed,
+                num_failargs,
+                rd_consts,
+                rd_virtuals,
+                virtuals_cache,
+                Some(&failarg_refs),
+            );
+            if struct_ptr.is_null() {
+                continue;
+            }
+            let value_raw = decode_pending_value(
+                pf.value_tagged,
+                fd.field_type(),
+                dead_frame_typed,
+                num_failargs,
+                rd_consts,
+                rd_virtuals,
+                virtuals_cache,
+                Some(&failarg_refs),
+            );
+            let addr = struct_ptr.0 + fd.offset();
+            (
+                addr,
+                fd.field_type(),
+                fd.field_size(),
+                struct_ptr.0,
+                value_raw,
+            )
+        } else {
+            let ad = field_descr.as_array_descr().expect(
+                "resume.py `_prepare_pendingfields`: setarrayitem pending \
+                 field must carry an ArrayDescr",
+            );
+            let _ = decode_pending_value(
+                pf.value_tagged,
+                ad.item_type(),
+                dead_frame_typed,
+                num_failargs,
+                rd_consts,
+                rd_virtuals,
+                virtuals_cache,
+                Some(&failarg_refs),
+            );
+            let struct_ptr = decode_ref(
+                pf.target_tagged,
+                dead_frame_typed,
+                num_failargs,
+                rd_consts,
+                rd_virtuals,
+                virtuals_cache,
+                Some(&failarg_refs),
+            );
+            if struct_ptr.is_null() {
+                continue;
+            }
+            let value_raw = decode_pending_value(
+                pf.value_tagged,
+                ad.item_type(),
+                dead_frame_typed,
+                num_failargs,
+                rd_consts,
+                rd_virtuals,
+                virtuals_cache,
+                Some(&failarg_refs),
+            );
+            let item_index = pf.item_index as usize;
+            let addr = struct_ptr.0 + ad.base_size() + item_index * ad.item_size();
+            (
+                addr,
+                ad.item_type(),
+                ad.item_size(),
+                struct_ptr.0,
+                value_raw,
+            )
+        };
         // resume.py setfield: descr.is_pointer_field()
         //   → bh_setfield_gc_r; is_float_field() → bh_setfield_gc_f;
         //   else → bh_setfield_gc_i.
         // resume.py setarrayitem_{int,ref,float}: dispatched by
         //   resume.py setarrayitem via arraydescr.is_array_of_pointers
         //   / is_array_of_floats.
-        let (addr, value_type, value_size) = if pf.is_array_item {
-            let ad = descr
-                .as_array_descr()
-                .expect("setarrayitem pending field must carry an ArrayDescr");
-            let item_index = pf.item_index.unwrap_or(0);
-            let addr = target_ptr as usize + ad.base_size() + item_index * ad.item_size();
-            (addr, ad.item_type(), ad.item_size())
-        } else {
-            let fd = descr
-                .as_field_descr()
-                .expect("setfield pending field must carry a FieldDescr");
-            let addr = target_ptr as usize + fd.offset();
-            (addr, fd.field_type(), fd.field_size())
-        };
         unsafe {
             match value_type {
                 majit_ir::Type::Ref => {
@@ -16379,7 +16441,7 @@ fn replay_pending_fields(
                     // ref stored into an existing old object is tracked by
                     // the next minor collection (`rd_pendingfields` can
                     // target pre-existing deadframe objects).
-                    majit_gc::gc_write_barrier(majit_ir::GcRef(target_ptr as usize));
+                    majit_gc::gc_write_barrier(majit_ir::GcRef(target_ptr));
                     std::ptr::write(addr as *mut usize, value_raw as usize);
                 }
                 majit_ir::Type::Float => {
@@ -16401,7 +16463,7 @@ fn replay_pending_fields(
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit] replay_pending_field: type={:?} size={} target={:#x} value={:#x}",
-                value_type, value_size, target_ptr as usize, value_raw as usize
+                value_type, value_size, target_ptr, value_raw as usize
             );
         }
     }
@@ -17115,6 +17177,215 @@ mod tests {
         assert_eq!(
             cache.live_ptr(0),
             (&mut field_target as *mut FieldTarget) as usize
+        );
+    }
+
+    #[derive(Debug)]
+    struct PoolMoveOnAllocDescr {
+        pool: std::sync::Arc<majit_ir::SharedConstPool>,
+        before: usize,
+        after: usize,
+    }
+
+    impl majit_ir::descr::Descr for PoolMoveOnAllocDescr {
+        fn as_size_descr(&self) -> Option<&dyn majit_ir::descr::SizeDescr> {
+            Some(self)
+        }
+    }
+
+    impl majit_ir::descr::SizeDescr for PoolMoveOnAllocDescr {
+        fn size(&self) -> usize {
+            // resume.py getvirtual_ptr allocate can collect; write the
+            // consts table the way walk_rd_consts_refs updates Const::Ref.
+            unsafe {
+                for c in self.pool.as_mut_vec_for_gc().iter_mut() {
+                    if let majit_ir::Const::Ref(slot) = c {
+                        if slot.0 == self.before {
+                            *slot = majit_ir::GcRef(self.after);
+                        }
+                    }
+                }
+            }
+            16
+        }
+        fn type_id(&self) -> u32 {
+            0
+        }
+        fn is_immutable(&self) -> bool {
+            false
+        }
+        fn is_gc_managed(&self) -> bool {
+            false
+        }
+    }
+
+    #[derive(Debug)]
+    struct ResumeRootMoveOnAllocDescr {
+        before: usize,
+        after: usize,
+    }
+
+    impl majit_ir::descr::Descr for ResumeRootMoveOnAllocDescr {
+        fn as_size_descr(&self) -> Option<&dyn majit_ir::descr::SizeDescr> {
+            Some(self)
+        }
+    }
+
+    impl majit_ir::descr::SizeDescr for ResumeRootMoveOnAllocDescr {
+        fn size(&self) -> usize {
+            majit_gc::shadow_stack::walk_resume_ref_roots(|root| {
+                if root.0 == self.before {
+                    root.0 = self.after;
+                }
+            });
+            16
+        }
+        fn type_id(&self) -> u32 {
+            0
+        }
+        fn is_immutable(&self) -> bool {
+            false
+        }
+        fn is_gc_managed(&self) -> bool {
+            false
+        }
+    }
+
+    /// TAGCONST pending-field targets are `rd_consts[i].getref_base()` at
+    /// use (`ResumeDataDirectReader.decode_ref`). A virtual value's
+    /// allocate can collect and forward the pool word; the store must hit
+    /// the forwarded object (`getconst_ref_reuses_the_pool_slot_after_a_move`).
+    #[test]
+    fn replay_pending_fields_rereads_tagconst_target_via_rd_consts() {
+        init_gc_subsystem();
+        #[repr(C)]
+        struct FieldTarget {
+            value: i64,
+        }
+
+        let mut before_obj = FieldTarget { value: 1 };
+        let mut after_obj = FieldTarget { value: 1 };
+        let before = (&mut before_obj as *mut FieldTarget) as usize;
+        let after = (&mut after_obj as *mut FieldTarget) as usize;
+        let pool =
+            majit_ir::SharedConstPool::new(vec![majit_ir::Const::Ref(majit_ir::GcRef(before))]);
+        let size_descr: majit_ir::DescrRef = std::sync::Arc::new(PoolMoveOnAllocDescr {
+            pool: pool.clone(),
+            before,
+            after,
+        });
+        let field_descr: majit_ir::DescrRef = std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new(1, 0, 8, Type::Ref, false),
+        );
+        let tagged_const = |index| {
+            majit_metainterp::resume::tag(index, majit_metainterp::resume::TAGCONST)
+                .expect("small const index is taggable")
+        };
+        let tagged_virtual = |index| {
+            majit_metainterp::resume::tag(index, majit_metainterp::resume::TAGVIRTUAL)
+                .expect("small virtual index is taggable")
+        };
+        let pending = vec![majit_ir::GuardPendingFieldEntry {
+            descr: Some(field_descr),
+            item_index: -1,
+            target: majit_ir::OpRef::input_arg_ref(0),
+            value: majit_ir::OpRef::input_arg_ref(0),
+            target_tagged: tagged_const(0),
+            value_tagged: tagged_virtual(0),
+        }];
+        let virtuals = vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VStructInfo {
+            typedescr: Some(size_descr),
+            type_id: 1,
+            fielddescrs: Vec::new(),
+            fieldnums: Vec::new(),
+            descr_size: 16,
+        })];
+        let storage = majit_metainterp::resume::new_resume_storage(
+            majit_ir::NumberingRef::from_bytes(&[]),
+            Vec::new(),
+            virtuals,
+            pending,
+        );
+        storage.set_rd_consts_arc(Some(pool));
+        storage.set_fail_arg_types(vec![]);
+        let mut cache = DirectVirtualsCache::new(1);
+
+        replay_pending_fields(&[], storage.as_ref(), &mut cache);
+
+        assert_eq!(
+            before_obj.value, 1,
+            "store must not hit the pre-move Const::Ref bits"
+        );
+        assert_eq!(
+            after_obj.value,
+            cache.live_ptr(0) as i64,
+            "store must hit rd_consts[0].getref_base() after allocate"
+        );
+    }
+
+    /// TAGBOX pending-field targets live in the rooted failarg buffer.
+    /// Re-read that slot after the value's allocate, matching
+    /// `ResumeDataDirectReader.decode_ref` TAGBOX (`cpu.get_ref_value`).
+    #[test]
+    fn replay_pending_fields_rereads_tagbox_target_after_value_alloc() {
+        init_gc_subsystem();
+        #[repr(C)]
+        struct FieldTarget {
+            value: i64,
+        }
+
+        let mut before_obj = FieldTarget { value: 1 };
+        let mut after_obj = FieldTarget { value: 1 };
+        let before = (&mut before_obj as *mut FieldTarget) as usize;
+        let after = (&mut after_obj as *mut FieldTarget) as usize;
+        let size_descr: majit_ir::DescrRef =
+            std::sync::Arc::new(ResumeRootMoveOnAllocDescr { before, after });
+        let field_descr: majit_ir::DescrRef = std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new(1, 0, 8, Type::Ref, false),
+        );
+        let tagged_box = |index| {
+            majit_metainterp::resume::tag(index, majit_metainterp::resume::TAGBOX)
+                .expect("small fail-argument index is taggable")
+        };
+        let tagged_virtual = |index| {
+            majit_metainterp::resume::tag(index, majit_metainterp::resume::TAGVIRTUAL)
+                .expect("small virtual index is taggable")
+        };
+        let pending = vec![majit_ir::GuardPendingFieldEntry {
+            descr: Some(field_descr),
+            item_index: -1,
+            target: majit_ir::OpRef::input_arg_ref(0),
+            value: majit_ir::OpRef::input_arg_ref(0),
+            target_tagged: tagged_box(0),
+            value_tagged: tagged_virtual(0),
+        }];
+        let virtuals = vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VStructInfo {
+            typedescr: Some(size_descr),
+            type_id: 1,
+            fielddescrs: Vec::new(),
+            fieldnums: Vec::new(),
+            descr_size: 16,
+        })];
+        let storage = majit_metainterp::resume::new_resume_storage(
+            majit_ir::NumberingRef::from_bytes(&[]),
+            Vec::new(),
+            virtuals,
+            pending,
+        );
+        storage.set_fail_arg_types(vec![Type::Ref]);
+        let values = [Value::Ref(majit_ir::GcRef(before))];
+        let mut cache = DirectVirtualsCache::new(1);
+
+        replay_pending_fields(&values, storage.as_ref(), &mut cache);
+
+        assert_eq!(
+            before_obj.value, 1,
+            "store must not hit the pre-move TAGBOX bits"
+        );
+        assert_eq!(
+            after_obj.value,
+            cache.live_ptr(0) as i64,
+            "store must hit the forwarded failarg_refs slot"
         );
     }
 

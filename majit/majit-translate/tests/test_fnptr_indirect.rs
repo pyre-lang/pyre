@@ -9,9 +9,9 @@
 
 mod common;
 
+use common::lower_function;
 use common::{CORPUS_LLBC, load_llbc};
 use majit_charon_reader::Llbc;
-use majit_translate::front::mir::lower_function;
 use majit_translate::model::{CallTarget, OpKind};
 
 /// The two corpus fixtures that call through a `fn`-pointer field: the

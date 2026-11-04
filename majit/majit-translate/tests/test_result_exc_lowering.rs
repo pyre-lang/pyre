@@ -4,7 +4,7 @@
 mod common;
 
 use common::{
-    INTERPRETER_LLBC, MODULE_LLBC, load_llbc, lower_context_for, lower_named_with_static_addrs,
+    INTERPRETER_LLBC, MODULE_LLBC, load_llbc, lower_named_with_static_addrs, with_shared_lowering,
 };
 use majit_charon_reader::Llbc;
 use majit_translate::codewriter::call::CallControl;
@@ -91,7 +91,9 @@ fn pinned_result_reload_assembles() {
     let graph = lower_function(interp(), name).expect("lower reload");
     let path = CallPath::from_segments(["pyre_interpreter", "executioncontext", "reload"]);
     let mut callcontrol = CallControl::new();
-    callcontrol.set_struct_fields(lower_context_for(interp()).struct_field_registry());
+    callcontrol.set_struct_fields(with_shared_lowering(interp(), |ctx| {
+        ctx.struct_field_registry()
+    }));
     callcontrol.register_function_graph(path.clone(), graph.clone());
     let mut codewriter = CodeWriter::new();
     let jitcode = std::sync::Arc::new(JitCode::new("reload"));

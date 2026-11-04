@@ -1230,7 +1230,7 @@ mod tests {
     fn utf8_payload_bytes_folds_header_length_view() {
         let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
         let llbc = crate::test_support::load_ullbc(path);
-        let graph = crate::front::mir::lower_function(
+        let graph = crate::test_support::lower_function(
             &llbc,
             "pyre_object::unicodeobject::utf8_payload_bytes",
         )

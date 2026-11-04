@@ -5131,7 +5131,7 @@ mod harvested_funcobj_hints_tests {
         );
 
         crate::local_crates::with_local_crate_root("pyre_module", || {
-            let graph = crate::front::mir::lower_function(
+            let graph = crate::test_support::lower_function(
                 &llbc,
                 "pyre_module::module::_cffi_backend::lib_obj::get_attr_elidable",
             )
@@ -5214,7 +5214,7 @@ mod harvested_funcobj_hints_tests {
                 "module::_cffi_backend::lib_obj::_orig_get_attr_elidable_unlikely_name",
             ];
             let orig_lowered = orig_names.iter().find_map(|name| {
-                crate::front::mir::lower_function(&llbc, name)
+                crate::test_support::lower_function(&llbc, name)
                     .ok()
                     .map(|g| (*name, g))
             });

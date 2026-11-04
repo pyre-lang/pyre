@@ -95,8 +95,8 @@ fn w_bytes_data_local_stays_str_view_for_rdict_get() {
         }}
     });
     let llbc = window_llbc(vec![rdict, w_bytes], vec![caller, w_bytes_data, get]);
-    let graph =
-        super::lower_function(&llbc, "w_bytes_data_rdict_get").expect("lower STR-view RDict::get");
+    let graph = crate::test_support::lower_function(&llbc, "w_bytes_data_rdict_get")
+        .expect("lower STR-view RDict::get");
     let leafs = window_call_leafs(&graph);
     assert!(
         !leafs.iter().any(|leaf| {
@@ -275,7 +275,8 @@ fn signed_byte_vec_as_ptr_converts_the_header_and_wraps_ccharp() {
             dest_ty,
             vec![vec_decl.clone()],
         );
-        let graph = super::lower_function(&llbc, caller).expect("lower Vec<i8> as_ptr");
+        let graph =
+            crate::test_support::lower_function(&llbc, caller).expect("lower Vec<i8> as_ptr");
         let ops = graph_ops(&graph);
         assert!(
             ops.iter().any(|op| matches!(

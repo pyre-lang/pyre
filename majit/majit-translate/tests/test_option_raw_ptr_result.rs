@@ -5,19 +5,17 @@
 //! return (`flatten.py` `make_return` via `history.getkind`) must use the
 //! same Option representation. `mmap_handle` is this shape on Windows.
 
+mod common;
+
+use common::{CORPUS_LLBC, build_semantic_program_from_llbc, load_llbc};
 use majit_charon_reader::Llbc;
 use majit_translate::codewriter::call::CallControl;
 use majit_translate::codewriter::codewriter::CodeWriter;
 use majit_translate::codewriter::jitcode::JitCode;
-use majit_translate::front::mir::build_semantic_program_from_llbc;
 use majit_translate::{CallPath, GraphTransformConfig};
-use std::sync::OnceLock;
-
-const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-corpus/corpus.ullbc");
 
 fn load_corpus() -> &'static Llbc {
-    static LLBC: OnceLock<Llbc> = OnceLock::new();
-    LLBC.get_or_init(|| Llbc::load(CORPUS).expect("load corpus.ullbc"))
+    load_llbc(CORPUS_LLBC)
 }
 
 fn assemble(leaf: &str) {

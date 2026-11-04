@@ -5,30 +5,18 @@
 //! `VecFieldPart::Len` getfield of that parent, not `ll_vec_length` of
 //! the first header word (the data pointer) plus `raw_load` at +16.
 
-use std::sync::OnceLock;
+mod common;
 
+use common::{
+    OBJECT_LLBC, build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
+    load_llbc_if_present, lower_function,
+};
 use majit_charon_reader::Llbc;
 use majit_translate::HostStaticAddrs;
-use majit_translate::front::mir::{
-    build_semantic_program_from_llbcs_with_static_addrs_and_function_names, lower_function,
-};
 use majit_translate::model::{CallTarget, FunctionGraph, OpKind, VecFieldPart};
 
-const OBJECT_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/llbc/pyre-object.ullbc"
-);
-
 fn object_llbc() -> Option<&'static Llbc> {
-    static LLBC: OnceLock<Option<Llbc>> = OnceLock::new();
-    LLBC.get_or_init(|| {
-        if !std::path::Path::new(OBJECT_LLBC).is_file() {
-            eprintln!("skipping: {OBJECT_LLBC} is missing; run `python3 scripts/extract-llbc.py`");
-            return None;
-        }
-        Some(Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc"))
-    })
-    .as_ref()
+    load_llbc_if_present(OBJECT_LLBC)
 }
 
 fn is_ll_vec_length(target: &CallTarget) -> bool {

@@ -57,9 +57,7 @@
 
 mod common;
 
-use common::{
-    INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, load_llbc, lower_context_for, lower_named,
-};
+use common::{INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, load_llbc, lower_named};
 use majit_charon_reader::ullbc::NameSeg;
 use majit_charon_reader::{FunDecl, Llbc};
 use majit_translate::{
@@ -207,18 +205,18 @@ fn assert_returned_call(graph: &FunctionGraph, leaf: &str) {
 #[test]
 fn call_returned_raw_scalar_pointer_is_int() {
     let llbc = load_llbc(INTERPRETER_LLBC);
-    let context = lower_context_for(llbc);
+    common::with_shared_lowering(llbc, |context| {
+        let inner = lower_fun_decl(&context, find_method(&llbc, "ticker_addr", "ActionFlag"))
+            .expect("lower ActionFlag::ticker_addr");
+        assert_returned_call(&inner, "as_ptr");
 
-    let inner = lower_fun_decl(&context, find_method(&llbc, "ticker_addr", "ActionFlag"))
-        .expect("lower ActionFlag::ticker_addr");
-    assert_returned_call(&inner, "as_ptr");
-
-    let producer = lower_fun_decl(
-        &context,
-        find_method(&llbc, "ticker_addr", "SpaceActionFlag"),
-    )
-    .expect("lower SpaceActionFlag::ticker_addr");
-    assert_returned_call(&producer, "ticker_addr");
+        let producer = lower_fun_decl(
+            &context,
+            find_method(&llbc, "ticker_addr", "SpaceActionFlag"),
+        )
+        .expect("lower SpaceActionFlag::ticker_addr");
+        assert_returned_call(&producer, "ticker_addr");
+    });
 }
 
 fn mapdict_fns<'a>(llbc: &'a Llbc, leaf: &str) -> Vec<&'a FunDecl> {
@@ -234,118 +232,121 @@ fn mapdict_fns<'a>(llbc: &'a Llbc, leaf: &str) -> Vec<&'a FunDecl> {
 #[test]
 fn mapdict_get_reads_slots_map_pointer_as_int() {
     let llbc = load_llbc(INTERPRETER_LLBC);
-    let context = lower_context_for(llbc);
-    let gets = mapdict_fns(&llbc, "_get_mapdict_map");
-    assert!(
-        !gets.is_empty(),
-        "mapdict _get_mapdict_map is in interpreter LLBC"
-    );
-    let mut saw_pos0 = false;
-    for fd in gets {
-        let graph = lower_fun_decl(&context, fd)
-            .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
-        let pos0: Vec<_> = ops(&graph)
+    common::with_shared_lowering(llbc, |context| {
+        let gets = mapdict_fns(&llbc, "_get_mapdict_map");
+        assert!(
+            !gets.is_empty(),
+            "mapdict _get_mapdict_map is in interpreter LLBC"
+        );
+        let mut saw_pos0 = false;
+        for fd in gets {
+            let graph = lower_fun_decl(&context, fd)
+                .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
+            let pos0: Vec<_> = ops(&graph)
+                .filter_map(|op| match &op.kind {
+                    OpKind::FieldRead { field, ty, .. } if field.name == "__pos_0" => Some(ty),
+                    _ => None,
+                })
+                .collect();
+            if pos0.is_empty() {
+                continue;
+            }
+            saw_pos0 = true;
+            assert!(
+                pos0.iter().all(|ty| matches!(ty, ValueType::Int)),
+                "{} slots().0 is *mut usize; getkind of a raw Ptr is int, got {pos0:?}",
+                graph.name
+            );
+        }
+        assert!(
+            saw_pos0,
+            "MapdictCarrier::_get_mapdict_map FieldReads slots().0"
+        );
+
+        let slots = mapdict_fns(&llbc, "slots");
+        assert_eq!(slots.len(), 1, "one MapdictCarrier::slots");
+        let slots = lower_fun_decl(&context, slots[0]).expect("lower MapdictCarrier::slots");
+        let writes: Vec<_> = ops(&slots)
             .filter_map(|op| match &op.kind {
-                OpKind::FieldRead { field, ty, .. } if field.name == "__pos_0" => Some(ty),
+                OpKind::FieldWrite { field, ty, .. } if field.name == "__pos_0" => Some(ty),
                 _ => None,
             })
             .collect();
-        if pos0.is_empty() {
-            continue;
-        }
-        saw_pos0 = true;
         assert!(
-            pos0.iter().all(|ty| matches!(ty, ValueType::Int)),
-            "{} slots().0 is *mut usize; getkind of a raw Ptr is int, got {pos0:?}",
-            graph.name
+            !writes.is_empty() && writes.iter().all(|ty| matches!(ty, ValueType::Int)),
+            "slots() stores *mut usize as int, got {writes:?}"
         );
-    }
-    assert!(
-        saw_pos0,
-        "MapdictCarrier::_get_mapdict_map FieldReads slots().0"
-    );
-
-    let slots = mapdict_fns(&llbc, "slots");
-    assert_eq!(slots.len(), 1, "one MapdictCarrier::slots");
-    let slots = lower_fun_decl(&context, slots[0]).expect("lower MapdictCarrier::slots");
-    let writes: Vec<_> = ops(&slots)
-        .filter_map(|op| match &op.kind {
-            OpKind::FieldWrite { field, ty, .. } if field.name == "__pos_0" => Some(ty),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        !writes.is_empty() && writes.iter().all(|ty| matches!(ty, ValueType::Int)),
-        "slots() stores *mut usize as int, got {writes:?}"
-    );
+    });
 }
 
 #[test]
 fn typed_array_base_call_stays_ref() {
     let llbc = load_llbc(OBJECT_LLBC);
-    let context = lower_context_for(llbc);
-    for path in [
-        "pyre_object::int_array::<Impl>::index",
-        "pyre_object::float_array::<Impl>::index",
-    ] {
-        let graph = lower_fun_decl(&context, find_exact(&llbc, path)).unwrap_or_else(|err| {
-            panic!("lower {path}: {err}");
-        });
-        let bases = call_results_named(&graph, "base");
-        assert!(
-            !bases.is_empty(),
-            "{path} must call base, ops in {}",
-            graph.name
-        );
-        assert!(
-            bases.iter().all(|ty| matches!(ty, ValueType::Ref(_))),
-            "{path} base() stays the GC block Ref, got {bases:?}"
-        );
-    }
+    common::with_shared_lowering(llbc, |context| {
+        for path in [
+            "pyre_object::int_array::<Impl>::index",
+            "pyre_object::float_array::<Impl>::index",
+        ] {
+            let graph = lower_fun_decl(&context, find_exact(&llbc, path)).unwrap_or_else(|err| {
+                panic!("lower {path}: {err}");
+            });
+            let bases = call_results_named(&graph, "base");
+            assert!(
+                !bases.is_empty(),
+                "{path} must call base, ops in {}",
+                graph.name
+            );
+            assert!(
+                bases.iter().all(|ty| matches!(ty, ValueType::Ref(_))),
+                "{path} base() stays the GC block Ref, got {bases:?}"
+            );
+        }
+    });
 }
 
 #[test]
 fn integer_cast_to_raw_scalar_stays_int() {
     let llbc = load_llbc(MODULE_LLBC);
-    let context = lower_context_for(llbc);
-    let graph = lower_fun_decl(&context, find_method(&llbc, "as_ptr", "HashStateStorage"))
-        .expect("lower HashStateStorage::as_ptr");
-    let leaves: Vec<_> = ops(&graph)
-        .filter_map(|op| call_result(&op.kind).and_then(|(_, leaf)| leaf))
-        .collect();
-    assert!(
-        leaves.contains(&"cast_ptr_to_int"),
-        "the field address still crosses into the integer, got {leaves:?}"
-    );
-    assert!(
-        !leaves.contains(&"cast_int_to_ptr"),
-        "usize as *const usize stays in the int bank, got {leaves:?} in {}",
-        graph.name
-    );
-    match root_op(&graph, &returned_var(&graph)) {
-        Some(OpKind::BinOp { result_ty, .. })
-            if matches!(result_ty, ValueType::Int | ValueType::Unsigned) => {}
-        // `rarithmetic.py` `intmask`: usize arithmetic is Unsigned, the
-        // `*const usize` return is the Signed address word
-        // (`history.py` `getkind` of a raw Ptr).
-        Some(OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            result_ty,
-            ..
-        }) if segments.last().map(String::as_str) == Some("intmask")
-            && matches!(result_ty, ValueType::Int | ValueType::Unsigned) => {}
-        other => panic!(
-            "{} must return the aligned integer word, got {other:?}",
+    common::with_shared_lowering(llbc, |context| {
+        let graph = lower_fun_decl(&context, find_method(&llbc, "as_ptr", "HashStateStorage"))
+            .expect("lower HashStateStorage::as_ptr");
+        let leaves: Vec<_> = ops(&graph)
+            .filter_map(|op| call_result(&op.kind).and_then(|(_, leaf)| leaf))
+            .collect();
+        assert!(
+            leaves.contains(&"cast_ptr_to_int"),
+            "the field address still crosses into the integer, got {leaves:?}"
+        );
+        assert!(
+            !leaves.contains(&"cast_int_to_ptr"),
+            "usize as *const usize stays in the int bank, got {leaves:?} in {}",
             graph.name
-        ),
-    }
+        );
+        match root_op(&graph, &returned_var(&graph)) {
+            Some(OpKind::BinOp { result_ty, .. })
+                if matches!(result_ty, ValueType::Int | ValueType::Unsigned) => {}
+            // `rarithmetic.py` `intmask`: usize arithmetic is Unsigned, the
+            // `*const usize` return is the Signed address word
+            // (`history.py` `getkind` of a raw Ptr).
+            Some(OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                result_ty,
+                ..
+            }) if segments.last().map(String::as_str) == Some("intmask")
+                && matches!(result_ty, ValueType::Int | ValueType::Unsigned) => {}
+            other => panic!(
+                "{} must return the aligned integer word, got {other:?}",
+                graph.name
+            ),
+        }
 
-    let widened = lower_fun_decl(
-        &context,
-        find_method(&llbc, "as_mut_ptr", "HashStateStorage"),
-    )
-    .expect("lower HashStateStorage::as_mut_ptr");
-    assert_returned_call(&widened, "as_ptr");
+        let widened = lower_fun_decl(
+            &context,
+            find_method(&llbc, "as_mut_ptr", "HashStateStorage"),
+        )
+        .expect("lower HashStateStorage::as_mut_ptr");
+        assert_returned_call(&widened, "as_ptr");
+    });
 }
 
 #[test]
@@ -411,121 +412,122 @@ fn call_returned_byte_pointer_stays_ref() {
 #[test]
 fn map_terminator_w_cls_overlay_cast_is_dest_typed_someptr() {
     let llbc = load_llbc(OBJECT_LLBC);
-    let context = lower_context_for(llbc);
-    let ranks = harvest_immutable_fields_from_llbcs(std::slice::from_ref(llbc));
-    assert!(
-        ranks.get("MapNodeTerminatorView").is_some_and(|fields| {
-            fields.iter().any(|(name, _)| name == "terminator")
-                && fields.iter().any(|(name, _)| name == "w_cls")
-        }),
-        "harvested _immutable_fields_ for MapNodeTerminatorView: {:?}",
-        ranks.get("MapNodeTerminatorView")
-    );
-    assert!(
-        ranks
-            .get("MapNodeAbstractAttribute")
-            .is_some_and(|fields| fields.iter().any(|(name, _)| name == "terminator")),
-        "harvested _immutable_fields_ for MapNodeAbstractAttribute: {:?}",
-        ranks.get("MapNodeAbstractAttribute")
-    );
-    let mut saw_dest_typed_struct = false;
-    let mut saw_terminator = false;
-    let mut saw_w_cls = false;
-    let mut saw_raw_overlay = false;
-    let mut saw_w_cls_gcref = false;
-    let mut saw_terminator_ptr = false;
-    let mut saw_overlay_hints = false;
-    let mut saw_pure_w_cls = false;
-    for leaf in ["map_terminator_w_cls", "instance_getclass"] {
-        let fns = mapdict_fns(&llbc, leaf);
-        assert!(!fns.is_empty(), "{leaf} is in pyre-object LLBC");
-        for fd in fns {
-            let graph = lower_fun_decl(&context, fd)
-                .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
-            for op in ops(&graph) {
-                if let OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    args,
-                    ..
-                } = &op.kind
-                    && segments.last().map(String::as_str) == Some("cast_int_to_ptr")
-                    && args.len() == 2
-                    && let LinkArg::Const(c) = &args[0]
-                    && let ConstValue::LowLevelType(ll) = &c.value
-                    && let LowLevelType::Ptr(ptr) = ll.as_ref()
-                    && let PtrTarget::Struct(st) = &ptr.TO
-                {
-                    saw_dest_typed_struct = true;
-                    if st._gckind == GcKind::Raw {
-                        saw_raw_overlay = true;
-                    }
-                    if let Some(w_cls_ty) = st._flds.get("w_cls")
-                        && w_cls_ty == &*GCREF
+    common::with_shared_lowering(llbc, |context| {
+        let ranks = harvest_immutable_fields_from_llbcs(std::slice::from_ref(llbc));
+        assert!(
+            ranks.get("MapNodeTerminatorView").is_some_and(|fields| {
+                fields.iter().any(|(name, _)| name == "terminator")
+                    && fields.iter().any(|(name, _)| name == "w_cls")
+            }),
+            "harvested _immutable_fields_ for MapNodeTerminatorView: {:?}",
+            ranks.get("MapNodeTerminatorView")
+        );
+        assert!(
+            ranks
+                .get("MapNodeAbstractAttribute")
+                .is_some_and(|fields| fields.iter().any(|(name, _)| name == "terminator")),
+            "harvested _immutable_fields_ for MapNodeAbstractAttribute: {:?}",
+            ranks.get("MapNodeAbstractAttribute")
+        );
+        let mut saw_dest_typed_struct = false;
+        let mut saw_terminator = false;
+        let mut saw_w_cls = false;
+        let mut saw_raw_overlay = false;
+        let mut saw_w_cls_gcref = false;
+        let mut saw_terminator_ptr = false;
+        let mut saw_overlay_hints = false;
+        let mut saw_pure_w_cls = false;
+        for leaf in ["map_terminator_w_cls", "instance_getclass"] {
+            let fns = mapdict_fns(&llbc, leaf);
+            assert!(!fns.is_empty(), "{leaf} is in pyre-object LLBC");
+            for fd in fns {
+                let graph = lower_fun_decl(&context, fd)
+                    .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
+                for op in ops(&graph) {
+                    if let OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        args,
+                        ..
+                    } = &op.kind
+                        && segments.last().map(String::as_str) == Some("cast_int_to_ptr")
+                        && args.len() == 2
+                        && let LinkArg::Const(c) = &args[0]
+                        && let ConstValue::LowLevelType(ll) = &c.value
+                        && let LowLevelType::Ptr(ptr) = ll.as_ref()
+                        && let PtrTarget::Struct(st) = &ptr.TO
                     {
-                        saw_w_cls_gcref = true;
+                        saw_dest_typed_struct = true;
+                        if st._gckind == GcKind::Raw {
+                            saw_raw_overlay = true;
+                        }
+                        if let Some(w_cls_ty) = st._flds.get("w_cls")
+                            && w_cls_ty == &*GCREF
+                        {
+                            saw_w_cls_gcref = true;
+                        }
+                        if let Some(term_ty) = st._flds.get("terminator")
+                            && matches!(term_ty, LowLevelType::Ptr(_))
+                            && term_ty != &*GCREF
+                        {
+                            saw_terminator_ptr = true;
+                        }
+                        if let Some(ConstValue::Dict(fields)) = st._hints.get("immutable_fields") {
+                            let has_terminator =
+                                fields.contains_key(&ConstValue::byte_str("terminator"));
+                            let has_w_cls = fields.contains_key(&ConstValue::byte_str("w_cls"));
+                            if has_terminator && (st._flds.get("w_cls").is_none() || has_w_cls) {
+                                saw_overlay_hints = true;
+                            }
+                        }
                     }
-                    if let Some(term_ty) = st._flds.get("terminator")
-                        && matches!(term_ty, LowLevelType::Ptr(_))
-                        && term_ty != &*GCREF
-                    {
-                        saw_terminator_ptr = true;
-                    }
-                    if let Some(ConstValue::Dict(fields)) = st._hints.get("immutable_fields") {
-                        let has_terminator =
-                            fields.contains_key(&ConstValue::byte_str("terminator"));
-                        let has_w_cls = fields.contains_key(&ConstValue::byte_str("w_cls"));
-                        if has_terminator && (st._flds.get("w_cls").is_none() || has_w_cls) {
-                            saw_overlay_hints = true;
+                    if let OpKind::FieldRead { field, .. } = &op.kind {
+                        if field.name == "terminator" {
+                            saw_terminator = true;
+                        }
+                        if field.name == "w_cls" {
+                            saw_w_cls = true;
                         }
                     }
                 }
-                if let OpKind::FieldRead { field, .. } = &op.kind {
-                    if field.name == "terminator" {
-                        saw_terminator = true;
+                let mut cc = CallControl::new();
+                cc.immutable_fields_by_struct = ranks.clone();
+                let out = Transformer::new(&GraphTransformConfig::default())
+                    .with_callcontrol(&mut cc)
+                    .transform(&graph);
+                for op in ops(&out.graph) {
+                    if let OpKind::FieldRead { field, pure, .. } = &op.kind
+                        && field.name == "w_cls"
+                        && *pure
+                    {
+                        saw_pure_w_cls = true;
                     }
-                    if field.name == "w_cls" {
-                        saw_w_cls = true;
-                    }
-                }
-            }
-            let mut cc = CallControl::new();
-            cc.immutable_fields_by_struct = ranks.clone();
-            let out = Transformer::new(&GraphTransformConfig::default())
-                .with_callcontrol(&mut cc)
-                .transform(&graph);
-            for op in ops(&out.graph) {
-                if let OpKind::FieldRead { field, pure, .. } = &op.kind
-                    && field.name == "w_cls"
-                    && *pure
-                {
-                    saw_pure_w_cls = true;
                 }
             }
         }
-    }
-    assert!(
-        saw_dest_typed_struct,
-        "overlay dest is 2-arg cast_int_to_ptr(Ptr(Struct ...), addr)"
-    );
-    assert!(saw_raw_overlay, "overlay Struct is GcKind::Raw");
-    assert!(saw_w_cls_gcref, "overlay w_cls field lltype is GCREF");
-    assert!(
-        saw_terminator_ptr,
-        "overlay terminator field is a raw Ptr, not Address"
-    );
-    assert!(
-        saw_overlay_hints,
-        "overlay Struct carries harvested immutable_fields hints"
-    );
-    assert!(
-        saw_terminator,
-        "overlay FieldRead terminator via SomePtr.getattr"
-    );
-    assert!(saw_w_cls, "overlay FieldRead w_cls via SomePtr.getattr");
-    assert!(
-        saw_pure_w_cls,
-        "jtransform rewrite_op_getfield marks w_cls as pure getfield_raw_r"
-    );
+        assert!(
+            saw_dest_typed_struct,
+            "overlay dest is 2-arg cast_int_to_ptr(Ptr(Struct ...), addr)"
+        );
+        assert!(saw_raw_overlay, "overlay Struct is GcKind::Raw");
+        assert!(saw_w_cls_gcref, "overlay w_cls field lltype is GCREF");
+        assert!(
+            saw_terminator_ptr,
+            "overlay terminator field is a raw Ptr, not Address"
+        );
+        assert!(
+            saw_overlay_hints,
+            "overlay Struct carries harvested immutable_fields hints"
+        );
+        assert!(
+            saw_terminator,
+            "overlay FieldRead terminator via SomePtr.getattr"
+        );
+        assert!(saw_w_cls, "overlay FieldRead w_cls via SomePtr.getattr");
+        assert!(
+            saw_pure_w_cls,
+            "jtransform rewrite_op_getfield marks w_cls as pure getfield_raw_r"
+        );
+    });
 }
 
 fn is_mapnode_leaf(root: &str) -> bool {
@@ -641,41 +643,43 @@ fn assert_mapnode_casts_are_word_operands(graph: &FunctionGraph) {
 #[test]
 fn instance_getclass_word_to_mapnode_is_int_cast_instance() {
     let llbc = load_llbc(OBJECT_LLBC);
-    let context = lower_context_for(llbc);
-    let fns = mapdict_fns(&llbc, "instance_getclass");
-    assert!(!fns.is_empty(), "instance_getclass is in pyre-object LLBC");
-    for fd in fns {
-        let graph = lower_fun_decl(&context, fd)
-            .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
-        assert_mapnode_casts_are_word_operands(&graph);
-    }
+    common::with_shared_lowering(llbc, |context| {
+        let fns = mapdict_fns(&llbc, "instance_getclass");
+        assert!(!fns.is_empty(), "instance_getclass is in pyre-object LLBC");
+        for fd in fns {
+            let graph = lower_fun_decl(&context, fd)
+                .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
+            assert_mapnode_casts_are_word_operands(&graph);
+        }
+    });
 
     let interp = load_llbc(INTERPRETER_LLBC);
-    let interp_ctx = lower_context_for(interp);
-    let terms = mapdict_fns(&interp, "_get_mapdict_map");
-    let mut checked_interp_graph = false;
-    for fd in terms {
-        let graph = lower_fun_decl(&interp_ctx, fd)
-            .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
-        let has_word_mapnode = ops(&graph).any(|op| {
-            majit_translate::model::cast_instance_root(&op.kind).is_some_and(is_mapnode_leaf)
-                && operand_is_word(
-                    &graph,
-                    match &op.kind {
-                        OpKind::Call { args, .. } => args.first().unwrap(),
-                        _ => return false,
-                    },
-                )
-        });
-        if has_word_mapnode {
-            assert_mapnode_casts_are_word_operands(&graph);
-            checked_interp_graph = true;
+    common::with_shared_lowering(interp, |interp_ctx| {
+        let terms = mapdict_fns(&interp, "_get_mapdict_map");
+        let mut checked_interp_graph = false;
+        for fd in terms {
+            let graph = lower_fun_decl(&interp_ctx, fd)
+                .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
+            let has_word_mapnode = ops(&graph).any(|op| {
+                majit_translate::model::cast_instance_root(&op.kind).is_some_and(is_mapnode_leaf)
+                    && operand_is_word(
+                        &graph,
+                        match &op.kind {
+                            OpKind::Call { args, .. } => args.first().unwrap(),
+                            _ => return false,
+                        },
+                    )
+            });
+            if has_word_mapnode {
+                assert_mapnode_casts_are_word_operands(&graph);
+                checked_interp_graph = true;
+            }
         }
-    }
-    assert!(
-        checked_interp_graph,
-        "_get_mapdict_map must keep a word-operand MapNode cast in at least one graph"
-    );
+        assert!(
+            checked_interp_graph,
+            "_get_mapdict_map must keep a word-operand MapNode cast in at least one graph"
+        );
+    });
 }
 
 fn i64_ty() -> Value {

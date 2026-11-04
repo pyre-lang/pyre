@@ -279,6 +279,10 @@ impl DedupBody {
 ///
 /// Tests that publish link state onto a shared parse restore it afterwards.
 pub struct LinkStateSnapshot {
+    transparent_scalar_kinds: Vec<(String, TransparentScalarKind)>,
+    foldable_const_lits: Vec<(u64, String)>,
+    eval_hook_graphs: Vec<String>,
+    exception_carrier: String,
     root_stack_effects: (Vec<String>, Vec<String>),
     stack_sensitive_fns: Vec<String>,
     stack_depth_neutral_fns: Vec<String>,
@@ -287,6 +291,98 @@ pub struct LinkStateSnapshot {
     stack_param_slots_fns: Vec<(String, Vec<u8>)>,
     stack_returns_index_fns: Vec<String>,
     stack_sensitive_ready: bool,
+    /// Sparse: `FunDecl.def_id` whose `returns_owned_scope` is true.
+    /// Default is false; restore clears every decl then sets these.
+    returns_owned_scope: Vec<u64>,
+}
+
+const LINK_HOLD_NONE: u8 = 0;
+const LINK_HOLD_READ: u8 = 1;
+const LINK_HOLD_WRITE: u8 = 2;
+
+static LLBC_LINK_LOCK: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
+
+thread_local! {
+    static LLBC_LINK_HOLD: std::cell::Cell<u8> = const { std::cell::Cell::new(LINK_HOLD_NONE) };
+}
+
+struct LinkHoldReset {
+    prev: u8,
+}
+
+impl Drop for LinkHoldReset {
+    fn drop(&mut self) {
+        LLBC_LINK_HOLD.with(|hold| hold.set(self.prev));
+    }
+}
+
+struct LinkStateRestore<'a> {
+    snapshots: Vec<(&'a Llbc, LinkStateSnapshot)>,
+}
+
+impl Drop for LinkStateRestore<'_> {
+    fn drop(&mut self) {
+        for (llbc, snapshot) in self.snapshots.drain(..) {
+            llbc.restore_link_state(snapshot);
+        }
+    }
+}
+
+/// Snapshot every listed artefact's link-side tables, run `f`, and restore
+/// them afterwards (including when `f` panics).
+///
+/// Nested write on the same thread skips a second lock acquire and still
+/// snapshots. Nested write under a read on the same thread panics.
+pub fn with_llbc_link_write<'a, R>(
+    llbcs: impl IntoIterator<Item = &'a Llbc>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let llbcs: Vec<&'a Llbc> = llbcs.into_iter().collect();
+    let run = || {
+        let snapshots = llbcs
+            .iter()
+            .copied()
+            .map(|llbc| (llbc, llbc.snapshot_link_state()))
+            .collect();
+        let _restore = LinkStateRestore { snapshots };
+        f()
+    };
+    match LLBC_LINK_HOLD.with(|hold| hold.get()) {
+        LINK_HOLD_WRITE => run(),
+        LINK_HOLD_READ => panic!(
+            "with_llbc_link_write nested under with_llbc_link_read on the same thread; \
+             take the write lock at the outermost frame"
+        ),
+        _ => {
+            let _lock = LLBC_LINK_LOCK.write();
+            LLBC_LINK_HOLD.with(|hold| hold.set(LINK_HOLD_WRITE));
+            let _reset = LinkHoldReset {
+                prev: LINK_HOLD_NONE,
+            };
+            run()
+        }
+    }
+}
+
+/// Hold the process-wide link-state read lock for the duration of `f`.
+///
+/// Nested read under a read or write on the same thread is a no-op.
+pub fn with_llbc_link_read<'a, R>(
+    llbcs: impl IntoIterator<Item = &'a Llbc>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let _llbcs = llbcs;
+    match LLBC_LINK_HOLD.with(|hold| hold.get()) {
+        LINK_HOLD_READ | LINK_HOLD_WRITE => f(),
+        _ => {
+            let _lock = LLBC_LINK_LOCK.read();
+            LLBC_LINK_HOLD.with(|hold| hold.set(LINK_HOLD_READ));
+            let _reset = LinkHoldReset {
+                prev: LINK_HOLD_NONE,
+            };
+            f()
+        }
+    }
 }
 
 impl Llbc {
@@ -631,6 +727,10 @@ impl Llbc {
     /// Tests that publish link state onto a shared parse restore it afterwards.
     pub fn snapshot_link_state(&self) -> LinkStateSnapshot {
         LinkStateSnapshot {
+            transparent_scalar_kinds: self.transparent_scalar_kinds.read().clone(),
+            foldable_const_lits: self.foldable_const_lits.read().clone(),
+            eval_hook_graphs: self.eval_hook_graphs.read().clone(),
+            exception_carrier: self.exception_carrier.read().clone(),
             root_stack_effects: self.root_stack_effects.read().clone(),
             stack_sensitive_fns: self.stack_sensitive_fns.read().clone(),
             stack_depth_neutral_fns: self.stack_depth_neutral_fns.read().clone(),
@@ -641,6 +741,14 @@ impl Llbc {
             stack_sensitive_ready: self
                 .stack_sensitive_ready
                 .load(std::sync::atomic::Ordering::Acquire),
+            returns_owned_scope: self
+                .iter_fun_decls()
+                .filter(|fd| {
+                    fd.returns_owned_scope
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                })
+                .map(|fd| fd.def_id)
+                .collect(),
         }
     }
 
@@ -648,6 +756,10 @@ impl Llbc {
     ///
     /// Tests that publish link state onto a shared parse restore it afterwards.
     pub fn restore_link_state(&self, snapshot: LinkStateSnapshot) {
+        *self.transparent_scalar_kinds.write() = snapshot.transparent_scalar_kinds;
+        *self.foldable_const_lits.write() = snapshot.foldable_const_lits;
+        *self.eval_hook_graphs.write() = snapshot.eval_hook_graphs;
+        *self.exception_carrier.write() = snapshot.exception_carrier;
         *self.root_stack_effects.write() = snapshot.root_stack_effects;
         *self.stack_sensitive_fns.write() = snapshot.stack_sensitive_fns;
         *self.stack_depth_neutral_fns.write() = snapshot.stack_depth_neutral_fns;
@@ -659,6 +771,19 @@ impl Llbc {
             snapshot.stack_sensitive_ready,
             std::sync::atomic::Ordering::Release,
         );
+        for fd in self.iter_fun_decls() {
+            fd.returns_owned_scope
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut ids = snapshot.returns_owned_scope;
+        ids.sort_unstable();
+        ids.dedup();
+        for fd in self.iter_fun_decls() {
+            if ids.binary_search(&fd.def_id).is_ok() {
+                fd.returns_owned_scope
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     /// The folded initializer stored on `def_id`, if this artefact has one.
@@ -1631,9 +1756,26 @@ mod tests {
         assert_eq!(provenance[2].as_u64(), Some(0));
     }
 
-    #[test]
-    fn restore_link_state_puts_every_snapshotted_table_back() {
-        let l = llbc("[]");
+    fn llbc_with_fun() -> Llbc {
+        let doc = r#"{"charon_version":"t","has_errors":false,
+            "translated":{"crate_name":"c","fun_decls":[{
+                "def_id":7,
+                "item_meta":{"name":[{"Ident":["f",0]}],
+                    "span":{"data":{"file_id":0,"beg":{"line":1,"col":0},"end":{"line":1,"col":1}}},
+                    "source_text":null,
+                    "attr_info":{"attributes":[],"inline":null,"rename":null,"public":true},
+                    "is_local":true},
+                "signature":{"is_unsafe":false,"inputs":[],"output":{"Deduplicated":0}},
+                "body":null
+            }]}}"#;
+        Llbc::from_slice(doc.as_bytes()).expect("fixture parses")
+    }
+
+    fn assert_link_state_is_empty(l: &Llbc) {
+        assert!(l.transparent_scalar_kind("CodeFlags").is_none());
+        assert!(l.foldable_const_lit(1).is_none());
+        assert!(l.eval_hook_graphs().is_empty());
+        assert!(l.exception_carrier().is_empty());
         assert!(!l.is_stack_sensitive_fn("p"));
         assert!(!l.is_stack_depth_neutral_fn("p"));
         assert!(!l.is_stack_leaves_above_fn("p"));
@@ -1642,8 +1784,20 @@ mod tests {
         assert!(l.stack_param_slots("p").is_none());
         assert_eq!(l.root_stack_effect("c", "p"), None);
         assert!(!l.stack_sensitive_fns_complete());
+        assert!(l.iter_fun_decls().all(|fd| {
+            !fd.returns_owned_scope
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }));
+    }
 
-        let snapshot = l.snapshot_link_state();
+    fn publish_every_link_table(l: &Llbc) {
+        l.register_transparent_scalar_kinds([(
+            "CodeFlags".into(),
+            TransparentScalarKind::Unsigned,
+        )]);
+        l.register_foldable_const_lit(1, "lit".into());
+        l.set_eval_hook_graphs(vec!["hook".into()]);
+        l.set_exception_carrier("Bookkeeper");
         l.set_root_stack_effects(vec!["c".into()], vec!["p".into()]);
         l.register_stack_sensitive_fns(["p".into()]);
         l.register_stack_depth_neutral_fns(["p".into()]);
@@ -1652,6 +1806,20 @@ mod tests {
         l.register_stack_param_slots_fns([("p".into(), vec![0])]);
         l.register_stack_returns_index_fns(["p".into()]);
         l.mark_stack_sensitive_fns_complete();
+        for fd in l.iter_fun_decls() {
+            fd.returns_owned_scope
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn assert_link_state_is_published(l: &Llbc) {
+        assert_eq!(
+            l.transparent_scalar_kind("CodeFlags"),
+            Some(TransparentScalarKind::Unsigned)
+        );
+        assert_eq!(l.foldable_const_lit(1).as_deref(), Some("lit"));
+        assert_eq!(l.eval_hook_graphs(), vec!["hook".to_string()]);
+        assert_eq!(l.exception_carrier(), "Bookkeeper");
         assert!(l.is_stack_sensitive_fn("p"));
         assert!(l.is_stack_depth_neutral_fn("p"));
         assert!(l.is_stack_leaves_above_fn("p"));
@@ -1660,15 +1828,37 @@ mod tests {
         assert_eq!(l.stack_param_slots("p").as_deref(), Some(&[0][..]));
         assert_eq!(l.root_stack_effect("c", "p"), Some(true));
         assert!(l.stack_sensitive_fns_complete());
+        assert!(l.iter_fun_decls().all(|fd| {
+            fd.returns_owned_scope
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }));
+    }
+
+    #[test]
+    fn restore_link_state_puts_every_snapshotted_table_back() {
+        let l = llbc_with_fun();
+        assert_link_state_is_empty(&l);
+
+        let snapshot = l.snapshot_link_state();
+        publish_every_link_table(&l);
+        assert_link_state_is_published(&l);
 
         l.restore_link_state(snapshot);
-        assert!(!l.is_stack_sensitive_fn("p"));
-        assert!(!l.is_stack_depth_neutral_fn("p"));
-        assert!(!l.is_stack_leaves_above_fn("p"));
-        assert!(!l.is_stack_observes_fn("p"));
-        assert!(!l.is_stack_returns_index_fn("p"));
-        assert!(l.stack_param_slots("p").is_none());
-        assert_eq!(l.root_stack_effect("c", "p"), None);
-        assert!(!l.stack_sensitive_fns_complete());
+        assert_link_state_is_empty(&l);
+    }
+
+    #[test]
+    fn with_llbc_link_write_restores_after_a_panic() {
+        let l = llbc_with_fun();
+        assert_link_state_is_empty(&l);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_llbc_link_write(std::iter::once(&l), || {
+                publish_every_link_table(&l);
+                assert_link_state_is_published(&l);
+                panic!("link-state write test");
+            })
+        }));
+        assert!(panicked.is_err());
+        assert_link_state_is_empty(&l);
     }
 }

@@ -376,13 +376,14 @@ fn str_family_dict_key_newtype_constructs_as_str() {
         "BytesKey(ptr) is the inner STR, not a nominal instance"
     );
 
-    let wrap_str = super::lower_function(&str_llbc, "wrap_str_key").expect("lower StrKey wrap");
-    let unwrap_str =
-        super::lower_function(&str_llbc, "unwrap_str_key").expect("lower StrKey unwrap");
-    let wrap_bytes =
-        super::lower_function(&bytes_llbc, "wrap_bytes_key").expect("lower BytesKey wrap");
-    let unwrap_bytes =
-        super::lower_function(&bytes_llbc, "unwrap_bytes_key").expect("lower BytesKey unwrap");
+    let wrap_str =
+        crate::test_support::lower_function(&str_llbc, "wrap_str_key").expect("lower StrKey wrap");
+    let unwrap_str = crate::test_support::lower_function(&str_llbc, "unwrap_str_key")
+        .expect("lower StrKey unwrap");
+    let wrap_bytes = crate::test_support::lower_function(&bytes_llbc, "wrap_bytes_key")
+        .expect("lower BytesKey wrap");
+    let unwrap_bytes = crate::test_support::lower_function(&bytes_llbc, "unwrap_bytes_key")
+        .expect("lower BytesKey unwrap");
     assert!(
         !graph_has_wrapper_ctor_or_pos0(&wrap_str),
         "StrKey(ptr) must not instantiate + setattr(__pos_0); graph={}",
@@ -414,8 +415,8 @@ fn str_family_dict_key_newtype_constructs_as_str() {
         !matches!(tyref_to_value_type(&wrapper, &lookalike), ValueType::Str),
         "other::StrKey is not the STR-family dict-key wrapper"
     );
-    let wrap_lookalike =
-        super::lower_function(&lookalike, "wrap_lookalike").expect("lower lookalike wrap");
+    let wrap_lookalike = crate::test_support::lower_function(&lookalike, "wrap_lookalike")
+        .expect("lower lookalike wrap");
     assert!(
         graph_has_wrapper_ctor_or_pos0(&wrap_lookalike),
         "a non-family pointer newtype keeps instantiate; graph={}",
@@ -434,7 +435,7 @@ fn function_new_impl_reload_emits_cast_instance_str() {
         return;
     };
     let graph =
-        crate::front::mir::lower_function(&llbc, "pyre_interpreter::function::function_new_impl")
+        crate::test_support::lower_function(&llbc, "pyre_interpreter::function::function_new_impl")
             .expect("lower function_new_impl");
     let casts: Vec<_> = graph
         .blocks
@@ -1367,7 +1368,7 @@ fn flavor_raw_struct_borrow_is_int_banked_with_class_root() {
             Some("ref"),
             "empty flavor set keeps the residual token as ref"
         );
-    let graph = super::lower_function(&llbc, "inspect").expect("lower inspect");
+    let graph = crate::test_support::lower_function(&llbc, "inspect").expect("lower inspect");
     let input = graph
         .blocks
         .iter()
@@ -2201,7 +2202,7 @@ fn unicode_storage_matches_real_object_llbc() {
         "W_UnicodeObject.value must project as PyPy's string-valued _utf8 field"
     );
 
-    let graph = super::lower_function(&llbc, "w_str_from_wtf8_managed")
+    let graph = crate::test_support::lower_function(&llbc, "w_str_from_wtf8_managed")
         .expect("lower managed string constructor");
     assert!(
         !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
@@ -2345,7 +2346,7 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
             ("im".to_string(), ValueType::Float),
         ])
     );
-    let constant_at = super::lower_function(&llbc, "constant_at")
+    let constant_at = crate::test_support::lower_function(&llbc, "constant_at")
         .expect("lower ConstantOpcodeHandler::constant_at");
     let constant_ops: Vec<_> = constant_at
         .blocks
@@ -2424,8 +2425,8 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
         }
     }
 
-    let getdocstring =
-        super::lower_function(&llbc, "code_getdocstring").expect("lower code_getdocstring");
+    let getdocstring = crate::test_support::lower_function(&llbc, "code_getdocstring")
+        .expect("lower code_getdocstring");
     let doc_ops: Vec<_> = getdocstring
         .blocks
         .iter()
@@ -2464,32 +2465,33 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
         !deref_ids.is_empty(),
         "code_getdocstring must call translated Constants::deref"
     );
-    let context = super::LowerContext::new(&llbc);
-    let mut deref_field_reads = 0usize;
-    for id in deref_ids {
-        let fd = llbc.fn_by_id(id).expect("Constants::deref FunDecl");
-        let deref_graph = super::lower_fun_decl(&context, fd)
-            .unwrap_or_else(|e| panic!("lower Constants::deref: {e:?}"));
-        deref_field_reads += deref_graph
-            .blocks
-            .iter()
-            .flat_map(|block| block.operations.iter())
-            .filter(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::FieldRead { field, .. }
-                        if field.name == "__pos_0"
-                            && field.owner_root.as_deref().is_some_and(|root| root.ends_with("Constants"))
-                )
-            })
-            .count();
-    }
-    assert!(
-        deref_field_reads >= 1,
-        "translated Constants::deref reads Constants.__pos_0"
-    );
+    crate::test_support::with_lowering(&llbc, |context| {
+        let mut deref_field_reads = 0usize;
+        for id in deref_ids {
+            let fd = llbc.fn_by_id(id).expect("Constants::deref FunDecl");
+            let deref_graph = super::lower_fun_decl(&context, fd)
+                .unwrap_or_else(|e| panic!("lower Constants::deref: {e:?}"));
+            deref_field_reads += deref_graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, .. }
+                            if field.name == "__pos_0"
+                                && field.owner_root.as_deref().is_some_and(|root| root.ends_with("Constants"))
+                    )
+                })
+                .count();
+        }
+        assert!(
+            deref_field_reads >= 1,
+            "translated Constants::deref reads Constants.__pos_0"
+        );
+    });
 
-    let load_const = super::lower_function(&llbc, "load_const_value")
+    let load_const = crate::test_support::lower_function(&llbc, "load_const_value")
         .expect("lower rbigint-consuming load_const_value");
     let load_ops: Vec<_> = load_const
         .blocks
@@ -2520,45 +2522,51 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
     // survive, and the existing GC reference must flow to
     // `w_long_from_raw`.
     let mut boxed_handlers = 0usize;
-    for fd in llbc.iter_local_fns().filter(|fd| {
-        fd.item_meta.name_path().ends_with("::bigint_constant") && fd.unstructured().is_some()
-    }) {
-        let graph = super::lower_fun_decl(&context, fd)
-            .unwrap_or_else(|e| panic!("lower {}: {e:?}", fd.item_meta.name_path()));
-        let calls: Vec<&[String]> = graph
-            .blocks
-            .iter()
-            .flat_map(|block| block.operations.iter())
-            .filter_map(|op| match &op.kind {
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } => Some(segments.as_slice()),
-                _ => None,
-            })
-            .collect();
-        if calls
-            .iter()
-            .any(|segments| segments.last().map(String::as_str) == Some("w_long_from_raw"))
-        {
-            boxed_handlers += 1;
-            assert!(!calls.iter().any(|segments| {
-                matches!(
-                    segments.last().map(String::as_str),
-                    Some("w_long_new" | "w_long_new_fresh_rbigint_handle" | "box_bigint_constant")
-                )
-            }));
+    crate::test_support::with_lowering(&llbc, |context| {
+        for fd in llbc.iter_local_fns().filter(|fd| {
+            fd.item_meta.name_path().ends_with("::bigint_constant") && fd.unstructured().is_some()
+        }) {
+            let graph = super::lower_fun_decl(context, fd)
+                .unwrap_or_else(|e| panic!("lower {}: {e:?}", fd.item_meta.name_path()));
+            let calls: Vec<&[String]> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .filter_map(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } => Some(segments.as_slice()),
+                    _ => None,
+                })
+                .collect();
+            if calls
+                .iter()
+                .any(|segments| segments.last().map(String::as_str) == Some("w_long_from_raw"))
+            {
+                boxed_handlers += 1;
+                assert!(!calls.iter().any(|segments| {
+                    matches!(
+                        segments.last().map(String::as_str),
+                        Some(
+                            "w_long_new"
+                                | "w_long_new_fresh_rbigint_handle"
+                                | "box_bigint_constant"
+                        )
+                    )
+                }));
+            }
         }
-    }
-    // The loop above filters to bodies (`unstructured().is_some()`), which
-    // drops the trait declaration and leaves the single impl. `== 1` reds if
-    // a second body-carrying impl appears: the inner ABI check runs only
-    // inside the `w_long_from_raw` arm, so a duplicate that reverted to the
-    // by-value ABI would fall out of that arm and go ungraded.
-    assert_eq!(
-        boxed_handlers, 1,
-        "real LOAD_CONST bigint handler must use the RBigInt pointer boxing ABI"
-    );
+        // The loop above filters to bodies (`unstructured().is_some()`), which
+        // drops the trait declaration and leaves the single impl. `== 1` reds if
+        // a second body-carrying impl appears: the inner ABI check runs only
+        // inside the `w_long_from_raw` arm, so a duplicate that reverted to the
+        // by-value ABI would fall out of that arm and go ungraded.
+        assert_eq!(
+            boxed_handlers, 1,
+            "real LOAD_CONST bigint handler must use the RBigInt pointer boxing ABI"
+        );
+    });
     // `load_const_value` receives `&ConstantData` already. Manufacturing a
     // one-word ArrayRead of the compiler's `Vec<ConstantData>` would stride
     // into the middle of an inline enum element; the graph must not grow
@@ -3683,7 +3691,8 @@ fn box_dyn_ptr_metadata_is_fat_meta() {
         }
     });
     let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
-    let graph = super::lower_function(&llbc, "read_box_dyn_meta").expect("lower read_box_dyn_meta");
+    let graph = crate::test_support::lower_function(&llbc, "read_box_dyn_meta")
+        .expect("lower read_box_dyn_meta");
     let fat_meta: Vec<_> = graph
         .blocks
         .iter()
@@ -4741,8 +4750,9 @@ fn spec_segments_distinguishes_inherent_and_trait_impl_methods() {
     );
 
     let inherent_graph =
-        super::lower_function(&llbc, "call_inherent").expect("lower call_inherent");
-    let trait_graph = super::lower_function(&llbc, "call_trait").expect("lower call_trait");
+        crate::test_support::lower_function(&llbc, "call_inherent").expect("lower call_inherent");
+    let trait_graph =
+        crate::test_support::lower_function(&llbc, "call_trait").expect("lower call_trait");
     let (inherent_id, inherent_bound) = first_call_binding(&inherent_graph);
     let (trait_id, trait_bound) = first_call_binding(&trait_graph);
     assert_eq!(inherent_id, Some(2));
@@ -5029,7 +5039,8 @@ fn assert_trait_clone_is_list(
     decls: Vec<serde_json::Value>,
 ) {
     let llbc = trait_clone_call_fixture(caller, self_ty, decls);
-    let graph = super::lower_function(&llbc, caller).expect("lower identity-element Vec Clone");
+    let graph = crate::test_support::lower_function(&llbc, caller)
+        .expect("lower identity-element Vec Clone");
     let ops = graph_ops(&graph);
     let leaves = call_leafs(&ops);
     assert!(
@@ -5864,7 +5875,7 @@ fn transparent_handle_enum_payload_store_is_one_fieldwrite() {
         .is_none(),
         "a transparent GC handle is a Ptr leaf, not an inlined STRUCT"
     );
-    let graph = super::lower_function(&llbc, "store_handle_into_enum_payload")
+    let graph = crate::test_support::lower_function(&llbc, "store_handle_into_enum_payload")
         .expect("lower store of a transparent handle into an enum payload");
     let writes: Vec<&str> = graph
         .blocks
@@ -5974,7 +5985,7 @@ fn transparent_handle_ctor_recasts_payload_to_carrier_before_field_store() {
         }
     });
     let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
-    let graph = super::lower_function(&llbc, "ctor_handle_from_object_cast")
+    let graph = crate::test_support::lower_function(&llbc, "ctor_handle_from_object_cast")
         .expect("lower transparent-handle Ctor of a PyObject-cast payload");
     let ops: Vec<_> = graph
         .blocks
@@ -6468,7 +6479,7 @@ fn linked_transparent_definition_types_opaque_dependency_view() {
     super::link_transparent_scalar_types(&llbcs);
     let jitdriver_receiver_roots =
         crate::codewriter::jtransform::default_jitdriver_receiver_roots();
-    super::build_semantic_program_from_llbc_with_static_addrs_filtered(
+    super::super::build_semantic_program_from_llbc_with_static_addrs_filtered(
         &llbcs[1],
         crate::HostStaticAddrs::default(),
         &jitdriver_receiver_roots,
@@ -6866,7 +6877,8 @@ fn raw_field_address_value_type_matches_field_read() {
 fn mut_u8_as_usize_emits_cast_ptr_to_int_then_r_uint() {
     let src = mut_u8_ty_json();
     let llbc = as_usize_cast_fixture("u8_as_usize", src, vec![], None);
-    let graph = super::lower_function(&llbc, "u8_as_usize").expect("lower *mut u8 as usize");
+    let graph =
+        crate::test_support::lower_function(&llbc, "u8_as_usize").expect("lower *mut u8 as usize");
     assert_cast_ptr_to_int_then_r_uint(&graph, "*mut u8 as usize");
     assert!(!tyref_is_ptr_to_int_cast_origin(
         &TyRef::Other(mut_u8_ty_json()),
@@ -7211,7 +7223,7 @@ fn option_map_or_keeps_regular_call_to_core_body() {
     let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
     };
-    let caller = super::lower_function(&llbc, "get_or_create_extra_locals")
+    let caller = crate::test_support::lower_function(&llbc, "get_or_create_extra_locals")
         .expect("lower get_or_create_extra_locals");
     let map_or_calls = caller
         .blocks
@@ -7237,89 +7249,14 @@ fn option_map_or_keeps_regular_call_to_core_body() {
         "caller keeps one regular call to the core map_or body, got {map_or_calls}"
     );
 
-    let ctx = super::LowerContext::new(&llbc);
-    let mut lowered_core_bodies = 0usize;
-    for fd in llbc.iter_fun_decls() {
-        if !fd.has_unstructured_body() {
-            continue;
-        }
-        let name_path = fd.item_meta.name_path();
-        if !name_path.ends_with("::option::<Impl>::map_or") {
-            continue;
-        }
-        let graph =
-            super::lower_fun_decl(&ctx, fd).unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
-        let has_disc = graph.blocks.iter().any(|block| {
-            matches!(block.exitswitch, Some(ExitSwitch::Value(_)))
-                || block.operations.iter().any(|op| {
-                    matches!(
-                        &op.kind,
-                        OpKind::FieldRead { field, .. } if field.name == "__discriminant"
-                    )
-                })
-                || block.operations.iter().any(
-                    |op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_" || op == "ne"),
-                )
-        });
-        assert!(has_disc, "{name_path}: core body matches on the Option tag");
-        let has_ft = graph.blocks.iter().any(|block| {
-            block.operations.iter().any(|op| match &op.kind {
-                OpKind::Call {
-                    target: CallTarget::Method { name, .. },
-                    ..
-                } => name == "call_once" || name == "call" || name == "call_mut",
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } => {
-                    let leaf = segments.last().map(String::as_str);
-                    leaf == Some("call_once") || leaf == Some("call") || leaf == Some("call_mut")
-                }
-                _ => false,
-            })
-        });
-        assert!(
-            has_ft,
-            "{name_path}: core body calls f(t); ops={:?}",
-            graph_ops(&graph)
-        );
-        lowered_core_bodies += 1;
-    }
-    assert_eq!(
-        lowered_core_bodies, 1,
-        "extracted map_or FunDecl bodies must lower, got {lowered_core_bodies}"
-    );
-}
-
-/// `Option::{map, and_then, unwrap_or_else, or_else, is_some_and}` stay
-/// regular calls to the extracted core bodies. The Option repr is
-/// unchanged; only the caller rewrite is gone (`guess_call_kind`
-/// regular). Each body matches on the receiver tag and calls `f(x)` /
-/// `f()`.
-#[test]
-fn option_map_family_keeps_regular_call_to_core_body() {
-    use crate::model::{CallTarget, ExitSwitch, OpKind};
-    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
-        return;
-    };
-    let ctx = super::LowerContext::new(&llbc);
-    let leaves = [
-        "map",
-        "and_then",
-        "unwrap_or_else",
-        "or_else",
-        "is_some_and",
-    ];
-    for leaf in leaves {
-        let suffix = format!("::option::<Impl>::{leaf}");
+    crate::test_support::with_lowering(&llbc, |ctx| {
         let mut lowered_core_bodies = 0usize;
         for fd in llbc.iter_fun_decls() {
             if !fd.has_unstructured_body() {
                 continue;
             }
             let name_path = fd.item_meta.name_path();
-            if !name_path.ends_with(&suffix) {
+            if !name_path.ends_with("::option::<Impl>::map_or") {
                 continue;
             }
             let graph = super::lower_fun_decl(&ctx, fd)
@@ -7357,18 +7294,97 @@ fn option_map_family_keeps_regular_call_to_core_body() {
             });
             assert!(
                 has_ft,
-                "{name_path}: core body calls f(x)/f(); ops={:?}",
+                "{name_path}: core body calls f(t); ops={:?}",
                 graph_ops(&graph)
             );
             lowered_core_bodies += 1;
         }
         assert_eq!(
             lowered_core_bodies, 1,
-            "extracted {leaf} FunDecl bodies must lower, got {lowered_core_bodies}"
+            "extracted map_or FunDecl bodies must lower, got {lowered_core_bodies}"
         );
-    }
+    });
+}
 
-    let caller = super::lower_function(&llbc, "install_applevel_builtins")
+/// `Option::{map, and_then, unwrap_or_else, or_else, is_some_and}` stay
+/// regular calls to the extracted core bodies. The Option repr is
+/// unchanged; only the caller rewrite is gone (`guess_call_kind`
+/// regular). Each body matches on the receiver tag and calls `f(x)` /
+/// `f()`.
+#[test]
+fn option_map_family_keeps_regular_call_to_core_body() {
+    use crate::model::{CallTarget, ExitSwitch, OpKind};
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    crate::test_support::with_lowering(&llbc, |ctx| {
+        let leaves = [
+            "map",
+            "and_then",
+            "unwrap_or_else",
+            "or_else",
+            "is_some_and",
+        ];
+        for leaf in leaves {
+            let suffix = format!("::option::<Impl>::{leaf}");
+            let mut lowered_core_bodies = 0usize;
+            for fd in llbc.iter_fun_decls() {
+                if !fd.has_unstructured_body() {
+                    continue;
+                }
+                let name_path = fd.item_meta.name_path();
+                if !name_path.ends_with(&suffix) {
+                    continue;
+                }
+                let graph = super::lower_fun_decl(&ctx, fd)
+                    .unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
+                let has_disc = graph.blocks.iter().any(|block| {
+                    matches!(block.exitswitch, Some(ExitSwitch::Value(_)))
+                        || block.operations.iter().any(|op| {
+                            matches!(
+                                &op.kind,
+                                OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+                            )
+                        })
+                        || block.operations.iter().any(
+                            |op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_" || op == "ne"),
+                        )
+                });
+                assert!(has_disc, "{name_path}: core body matches on the Option tag");
+                let has_ft = graph.blocks.iter().any(|block| {
+                    block.operations.iter().any(|op| match &op.kind {
+                        OpKind::Call {
+                            target: CallTarget::Method { name, .. },
+                            ..
+                        } => name == "call_once" || name == "call" || name == "call_mut",
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } => {
+                            let leaf = segments.last().map(String::as_str);
+                            leaf == Some("call_once")
+                                || leaf == Some("call")
+                                || leaf == Some("call_mut")
+                        }
+                        _ => false,
+                    })
+                });
+                assert!(
+                    has_ft,
+                    "{name_path}: core body calls f(x)/f(); ops={:?}",
+                    graph_ops(&graph)
+                );
+                lowered_core_bodies += 1;
+            }
+            assert_eq!(
+                lowered_core_bodies, 1,
+                "extracted {leaf} FunDecl bodies must lower, got {lowered_core_bodies}"
+            );
+        }
+    });
+
+    let caller = crate::test_support::lower_function(&llbc, "install_applevel_builtins")
         .expect("lower install_applevel_builtins");
     let is_some_and_calls = caller
         .blocks
@@ -8917,7 +8933,7 @@ fn mut_ref_gc_handle_method_is_function_path_cell() {
         .is_some(),
         "&mut Handle is a cell parameter"
     );
-    let graph = super::lower_function(&llbc, "caller").expect("lower caller");
+    let graph = crate::test_support::lower_function(&llbc, "caller").expect("lower caller");
     let ops: Vec<_> = graph
         .blocks
         .iter()

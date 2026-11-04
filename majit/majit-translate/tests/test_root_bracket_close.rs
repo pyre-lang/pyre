@@ -32,8 +32,8 @@
 mod common;
 
 use common::{
-    INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, interpreter_llbc, load_llbc, lower_context_for,
-    module_llbc, object_llbc, with_llbc_link_lock, with_llbc_link_state,
+    INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, interpreter_llbc, load_llbc, module_llbc,
+    object_llbc, with_llbc_link_state, with_shared_lowering, with_shared_lowering_many,
 };
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{PlaceKind, SwitchTargets, TermKind, TyRef, Unstructured};
@@ -60,7 +60,7 @@ fn lower_fun(llbc: &Llbc, context: &LowerContext<'_>, leaf: &str) -> FunctionGra
 }
 
 fn lower_named(llbc: &'static Llbc, leaf: &str) -> FunctionGraph {
-    with_llbc_link_lock(|| lower_fun(llbc, lower_context_for(llbc), leaf))
+    with_shared_lowering(llbc, |ctx| lower_fun(llbc, ctx, leaf))
 }
 
 /// Same class-static bucket the production driver stamps
@@ -72,9 +72,9 @@ fn lower_named_with_pytypes(
     leaf: &str,
     pytypes: &[(&str, i64)],
 ) -> FunctionGraph {
-    with_llbc_link_lock(|| {
+    with_shared_lowering(llbc, |ctx| {
         lower_fun_decl_with_static_addrs(
-            lower_context_for(llbc),
+            ctx,
             fun_decl_named(llbc, leaf),
             HostStaticAddrs {
                 pytypes,
@@ -157,9 +157,8 @@ fn bracket_closes_for_each_caller_shape() {
 #[test]
 fn bracket_closes_when_the_drop_is_not_adjacent_to_the_binding() {
     let Some(llbc) = object_llbc() else { return };
-    with_llbc_link_lock(|| {
+    with_shared_lowering(llbc, |context| {
         let mut bodies = 0usize;
-        let context = lower_context_for(llbc);
         let root_stack_state = RootStackState::new(llbc);
         for fd in llbc.iter_local_fns() {
             let Some(body) = fd.unstructured() else {
@@ -231,9 +230,8 @@ fn opener_blocks(llbc: &Llbc, body: &Unstructured) -> std::collections::HashMap<
 #[test]
 fn only_a_moved_out_or_erased_guard_keeps_its_bracket_open() {
     let Some(llbc) = object_llbc() else { return };
-    with_llbc_link_lock(|| {
+    with_shared_lowering(llbc, |context| {
         let mut dropping = 0usize;
-        let context = lower_context_for(llbc);
         let root_stack_state = RootStackState::new(llbc);
         let mut left_open: Vec<String> = Vec::new();
         let mut moved_out = 0usize;
@@ -331,20 +329,20 @@ fn ty_is_root_scope(llbc: &Llbc, ty: &TyRef) -> bool {
 /// for this to prove anything.
 #[test]
 fn nearly_every_dropped_bracket_closes() {
-    with_llbc_link_lock(|| {
+    let llbcs: Vec<&'static Llbc> = [object_llbc(), interpreter_llbc()]
+        .into_iter()
+        .flatten()
+        .collect();
+    with_shared_lowering_many(&llbcs, |ctxs| {
         // Derive metadata once per program and share each context across workers.
-        let programs: Vec<_> = [object_llbc(), interpreter_llbc()]
-            .into_iter()
-            .flatten()
-            .map(|llbc| (llbc, lower_context_for(llbc)))
-            .collect();
         let mut work: Vec<(
-            usize,
-            &LowerContext<'_>,
+            &'static Llbc,
+            &'static LowerContext<'static>,
             &majit_charon_reader::ullbc::FunDecl,
             usize,
         )> = Vec::new();
-        for (i, (llbc, context)) in programs.iter().enumerate() {
+        for (i, llbc) in llbcs.iter().enumerate() {
+            let context = ctxs[i];
             let root_stack_state = RootStackState::new(llbc);
             for fd in llbc.iter_local_fns() {
                 let Some(body) = fd.unstructured() else {
@@ -354,7 +352,7 @@ fn nearly_every_dropped_bracket_closes() {
                 if want == 0 {
                     continue;
                 }
-                work.push((i, context, fd, want));
+                work.push((*llbc, context, fd, want));
             }
         }
         let bodies = work.len();
@@ -364,19 +362,15 @@ fn nearly_every_dropped_bracket_closes() {
             .min(work.len().max(1));
         let chunk = work.len().div_ceil(threads).max(1);
         let results = std::thread::scope(|scope| {
-            let programs = &programs;
             let handles: Vec<_> = work
                 .chunks(chunk)
                 .map(|slice| {
                     scope.spawn(move || {
-                        let states: Vec<RootStackState> = programs
-                            .iter()
-                            .map(|(llbc, _)| RootStackState::new(llbc))
-                            .collect();
                         let mut closed = 0usize;
                         let mut short = Vec::new();
-                        for &(i, context, fd, want) in slice {
-                            let Ok(graph) = lower_fun_decl_with_root_stack(context, fd, &states[i])
+                        for &(llbc, context, fd, want) in slice {
+                            let state = RootStackState::new(llbc);
+                            let Ok(graph) = lower_fun_decl_with_root_stack(context, fd, &state)
                             else {
                                 continue;
                             };
@@ -530,7 +524,7 @@ fn ll_listslice_inner_is_depth_neutral() {
     let Some(llbc) = object_llbc() else {
         return;
     };
-    with_llbc_link_lock(|| {
+    with_llbc_link_state(llbc, || {
         majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
         let names = majit_translate::front::mir::discover_depth_neutral_fns(llbc);
         assert!(
@@ -549,7 +543,7 @@ fn ll_listslice_inner_bracket_is_scalar_replaced() {
     let Some(llbc) = object_llbc() else {
         return;
     };
-    with_llbc_link_lock(|| {
+    with_llbc_link_state(llbc, || {
         majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
         let graph = lower_named(llbc, "ll_listslice_inner");
         for leaf in [
@@ -577,7 +571,7 @@ fn eval_slice_index_is_depth_neutral() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
-    with_llbc_link_lock(|| {
+    with_llbc_link_state(llbc, || {
         majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
         let names = majit_translate::front::mir::discover_depth_neutral_fns(llbc);
         assert!(
@@ -609,7 +603,7 @@ fn zip_two_tuple_next_bracket_is_scalar_replaced() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
-    with_llbc_link_lock(|| {
+    with_llbc_link_state(llbc, || {
         majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
         let graph = lower_named(llbc, "zip_two_tuple_next");
         for leaf in [

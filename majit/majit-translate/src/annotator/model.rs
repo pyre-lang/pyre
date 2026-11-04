@@ -312,13 +312,10 @@ pub fn commonbase(cls1: KnownType, cls2: KnownType) -> KnownType {
 /// ambiguous constructor spellings: it fires only where `commonbase` is
 /// already None.
 ///
-/// It runs the intern's own key derivation — [`normalize_class_qualname`] then
-/// `canonical_struct_name` — rather than a second rule of its own.  A separate
-/// rule disagreed on exactly the spelling the intern was written for: the local
-/// dotted-only strip answered `false` for
-/// `("pyre_object::m::T", "m::T")` while the intern maps both to `m::T`.
-/// Upstream keys identity on the object in one place
-/// (`bookkeeper.py`), so one derivation is the shape to hold.
+/// It runs the intern's dotted-to-`::` spelling step — [`normalize_class_qualname`] —
+/// rather than a second rule of its own. Class intern keys are resolved on the
+/// bookkeeper (`Bookkeeper.getdesc` keys `descs` on `Constant(pyobj)`); this
+/// fallback only equates constructor dots with `::` of the same interned name.
 ///
 /// Caution carried forward: collapsing an `ob_header`-bearing `W_*` struct
 /// EARLY — that is, keying `struct_root_classes` on the collapse — starved its
@@ -334,12 +331,8 @@ fn unresolved_option_none_name(name: &str) -> bool {
 }
 
 fn same_struct_identity(a: &str, b: &str) -> bool {
-    fn identity(name: &str) -> String {
-        majit_ir::descr::canonical_struct_name(
-            &crate::annotator::bookkeeper::normalize_class_qualname(name),
-        )
-    }
-    identity(a) == identity(b)
+    crate::annotator::bookkeeper::normalize_class_qualname(a)
+        == crate::annotator::bookkeeper::normalize_class_qualname(b)
 }
 
 // SomeObject base — RPython `model.py`.

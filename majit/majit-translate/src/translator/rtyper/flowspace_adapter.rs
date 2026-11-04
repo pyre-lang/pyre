@@ -8923,7 +8923,7 @@ mod tests {
         let llbc = crate::test_support::load_ullbc(path);
         let mut all_sites = Vec::new();
         for name in ["w_str_cut", "str_byte_window"] {
-            let graph = crate::front::mir::lower_function(&llbc, name)
+            let graph = crate::test_support::lower_function(&llbc, name)
                 .unwrap_or_else(|err| panic!("lower {name}: {err}"));
             let sites = collect_strlen_sites(&graph);
             assert!(
@@ -10375,7 +10375,7 @@ mod tests {
     fn parse_builtin_signature_has_no_residual_vec_from_elem_after_adaptation() {
         let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = crate::test_support::load_ullbc(path);
-        let legacy = crate::front::mir::lower_function(&llbc, "parse_builtin_signature")
+        let legacy = crate::test_support::lower_function(&llbc, "parse_builtin_signature")
             .expect("lower parse_builtin_signature");
         let raw_from_elem = legacy
             .blocks

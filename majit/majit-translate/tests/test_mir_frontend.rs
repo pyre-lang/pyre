@@ -6,21 +6,15 @@
 mod common;
 
 use common::{
-    INTERPRETER_LLBC, JIT_LLBC, OBJECT_LLBC, RLIB_LLBC, load_llbc, lower_context_for, lower_named,
+    CORPUS_LLBC, INTERPRETER_LLBC, JIT_LLBC, OBJECT_LLBC, RLIB_LLBC, load_llbc, lower_named,
 };
+use common::{build_semantic_program_from_llbc, lower_function};
 use majit_charon_reader::Llbc;
-use majit_translate::front::mir::{LowerError, build_semantic_program_from_llbc, lower_function};
-use std::sync::OnceLock;
+use majit_translate::front::mir::LowerError;
 
-const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-corpus/corpus.ullbc",);
-
-/// Load `corpus.ullbc` once and share it across every test. `Llbc` is
-/// read-only after `load`, so a single parse behind a `OnceLock` is
-/// sufficient: `get_or_init` runs the load exactly once even under the
-/// concurrent test threads, and the lowering entry points only borrow it.
+/// Load `corpus.ullbc` once and share it across every test.
 fn load_corpus() -> &'static Llbc {
-    static LLBC: OnceLock<Llbc> = OnceLock::new();
-    LLBC.get_or_init(|| Llbc::load(CORPUS).expect("load corpus.ullbc"))
+    load_llbc(CORPUS_LLBC)
 }
 
 /// BFS the set of blocks reachable from the graph's startblock. Count
@@ -620,92 +614,93 @@ fn front_graph_carries_no_synthesized_exception_edges() {
     //      count of `UnwindResume` / `Abort` MIR terminators. A Call /
     //      Assert / Drop success block contributes zero such edges.
     use majit_charon_reader::ullbc::{TermKind, Unstructured};
-    use majit_translate::front::mir::{LowerContext, lower_fun_decl};
+    use majit_translate::front::mir::lower_fun_decl;
     use majit_translate::model::{CallTarget, ExitSwitch, OpKind};
 
     let llbc = load_corpus();
     let mut checked = 0usize;
-    let context = LowerContext::new(llbc);
-    for fd in llbc.iter_local_fns() {
-        let Some(body): Option<Unstructured> = fd.unstructured() else {
-            continue;
-        };
-        let graph = lower_fun_decl(&context, fd)
-            .unwrap_or_else(|e| panic!("{} failed to lower: {e}", fd.item_meta.name_path()));
-
-        // Invariant A.  The iterator `next`-diamond rewrite
-        // (`front::iter_next`) is the one sanctioned synthesized
-        // exception edge: a `for x in it` loop's `StopIteration` catch
-        // (the RPython `next` op raising at exhaustion).  Its block — the
-        // one carrying the `[__iter_next]` op — legitimately closes with
-        // `LastException`; every other block must still drop on_unwind
-        // rather than lower a try/except.
-        for b in &graph.blocks {
-            let is_next_handler = b.operations.iter().any(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments, .. },
-                        ..
-                    } if segments.len() == 1 && segments[0] == "__iter_next"
-                )
-            });
-            if is_next_handler {
+    common::with_lowering(llbc, |context| {
+        for fd in llbc.iter_local_fns() {
+            let Some(body): Option<Unstructured> = fd.unstructured() else {
                 continue;
-            }
-            assert!(
-                b.exitswitch != Some(ExitSwitch::LastException),
-                "{}: block {:?} carries a LastException exitswitch — a typed \
-                 exception-handler edge was synthesized; the MIR driver must \
-                 drop on_unwind, not lower it as try/except",
-                graph.name,
-                b.id,
-            );
-        }
+            };
+            let graph = lower_fun_decl(&context, fd)
+                .unwrap_or_else(|e| panic!("{} failed to lower: {e}", fd.item_meta.name_path()));
 
-        // Invariant B: no Call/Assert/Drop on_unwind edge leaks into the
-        // front graph, i.e. every live edge into the exceptblock is a bare
-        // panic-propagation raise (`UnwindResume` / `Abort` -> set_raise),
-        // so the live count never EXCEEDS the MIR's raise terminators.  It
-        // may be fewer: a graph that runs `clear_unreachable_blocks` (the
-        // iterator `next`-diamond and `?` rewrites do) prunes the dead
-        // panic-cleanup blocks the driver leaves unreachable — those
-        // pruned blocks were already dead exceptblock edges, never live
-        // control flow.  A leak, by contrast, sits in a REACHABLE success
-        // block and would push the live count above the raise count.
-        let raises_in_mir = body
-            .body
-            .iter()
-            .filter(|blk| {
-                matches!(
-                    blk.term(llbc),
-                    Ok(TermKind::UnwindResume)
-                        | Ok(TermKind::UnwindTerminate)
-                        | Ok(TermKind::Abort(_))
-                        | Ok(TermKind::UndefinedBehavior)
-                )
-            })
-            .count();
-        let edges_into_exceptblock = graph
-            .blocks
-            .iter()
-            .filter(|b| b.exits.iter().any(|l| l.target == graph.exceptblock))
-            .count();
+            // Invariant A.  The iterator `next`-diamond rewrite
+            // (`front::iter_next`) is the one sanctioned synthesized
+            // exception edge: a `for x in it` loop's `StopIteration` catch
+            // (the RPython `next` op raising at exhaustion).  Its block — the
+            // one carrying the `[__iter_next]` op — legitimately closes with
+            // `LastException`; every other block must still drop on_unwind
+            // rather than lower a try/except.
+            for b in &graph.blocks {
+                let is_next_handler = b.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if segments.len() == 1 && segments[0] == "__iter_next"
+                    )
+                });
+                if is_next_handler {
+                    continue;
+                }
+                assert!(
+                    b.exitswitch != Some(ExitSwitch::LastException),
+                    "{}: block {:?} carries a LastException exitswitch — a typed \
+                     exception-handler edge was synthesized; the MIR driver must \
+                     drop on_unwind, not lower it as try/except",
+                    graph.name,
+                    b.id,
+                );
+            }
+
+            // Invariant B: no Call/Assert/Drop on_unwind edge leaks into the
+            // front graph, i.e. every live edge into the exceptblock is a bare
+            // panic-propagation raise (`UnwindResume` / `Abort` -> set_raise),
+            // so the live count never EXCEEDS the MIR's raise terminators.  It
+            // may be fewer: a graph that runs `clear_unreachable_blocks` (the
+            // iterator `next`-diamond and `?` rewrites do) prunes the dead
+            // panic-cleanup blocks the driver leaves unreachable — those
+            // pruned blocks were already dead exceptblock edges, never live
+            // control flow.  A leak, by contrast, sits in a REACHABLE success
+            // block and would push the live count above the raise count.
+            let raises_in_mir = body
+                .body
+                .iter()
+                .filter(|blk| {
+                    matches!(
+                        blk.term(llbc),
+                        Ok(TermKind::UnwindResume)
+                            | Ok(TermKind::UnwindTerminate)
+                            | Ok(TermKind::Abort(_))
+                            | Ok(TermKind::UndefinedBehavior)
+                    )
+                })
+                .count();
+            let edges_into_exceptblock = graph
+                .blocks
+                .iter()
+                .filter(|b| b.exits.iter().any(|l| l.target == graph.exceptblock))
+                .count();
+            assert!(
+                edges_into_exceptblock <= raises_in_mir,
+                "{}: {} block(s) link to the exceptblock but the MIR has only {} \
+                 UnwindResume/Abort terminator(s) — a Call/Assert/Drop on_unwind \
+                 edge leaked into the front graph",
+                graph.name,
+                edges_into_exceptblock,
+                raises_in_mir,
+            );
+            checked += 1;
+        }
         assert!(
-            edges_into_exceptblock <= raises_in_mir,
-            "{}: {} block(s) link to the exceptblock but the MIR has only {} \
-             UnwindResume/Abort terminator(s) — a Call/Assert/Drop on_unwind \
-             edge leaked into the front graph",
-            graph.name,
-            edges_into_exceptblock,
-            raises_in_mir,
+            checked >= 4,
+            "expected to lower at least the 4 corpus shapes, got {checked}",
         );
-        checked += 1;
-    }
-    assert!(
-        checked >= 4,
-        "expected to lower at least the 4 corpus shapes, got {checked}",
-    );
+    });
 }
 
 /// `branch_loop_sum` iterates `&[i64]`, so the element `[__iter_next]`
@@ -913,7 +908,7 @@ fn branch_loop_sum_lifts_next_to_iter_next_op() {
 /// `then`'s `FnOnce::call_once` live in those graphs, not in the caller.
 #[test]
 fn bool_then_keeps_regular_call_to_core_body() {
-    use majit_translate::front::mir::{LowerContext, lower_fun_decl};
+    use majit_translate::front::mir::lower_fun_decl;
     use majit_translate::model::{CallTarget, ExitSwitch, FunctionGraph, OpKind};
 
     fn is_call_once(target: &CallTarget) -> bool {
@@ -1015,59 +1010,60 @@ fn bool_then_keeps_regular_call_to_core_body() {
     assert_eq!(none_ctor, 0, "then_some: None is built in the core body");
 
     let interpreter = load_llbc(INTERPRETER_LLBC);
-    let ctx = LowerContext::new(interpreter);
-    let mut lowered_then = 0usize;
-    let mut lowered_then_some = 0usize;
-    for fd in interpreter.iter_fun_decls() {
-        if !fd.has_unstructured_body() {
-            continue;
-        }
-        let path = fd.item_meta.name_path();
-        let is_then = path.ends_with("::bool::<Impl>::then");
-        let is_then_some = path.ends_with("::bool::<Impl>::then_some");
-        if !is_then && !is_then_some {
-            continue;
-        }
-        let graph = lower_fun_decl(&ctx, fd).unwrap_or_else(|e| panic!("lower {path}: {e}"));
-        let (call_once, bool_branches, some_ctor, none_ctor) = diamond_counts(&graph);
-        assert!(
-            bool_branches >= 1,
-            "{path}: core body branches on self (call_once={call_once}, \
-             branches={bool_branches}, some={some_ctor}, none={none_ctor})"
-        );
-        assert!(
-            some_ctor >= 1,
-            "{path}: then arm builds Some (call_once={call_once}, \
-             branches={bool_branches}, some={some_ctor}, none={none_ctor})"
-        );
-        assert!(
-            none_ctor >= 1,
-            "{path}: else arm builds None (call_once={call_once}, \
-             branches={bool_branches}, some={some_ctor}, none={none_ctor})"
-        );
-        if is_then {
+    common::with_lowering(interpreter, |ctx| {
+        let mut lowered_then = 0usize;
+        let mut lowered_then_some = 0usize;
+        for fd in interpreter.iter_fun_decls() {
+            if !fd.has_unstructured_body() {
+                continue;
+            }
+            let path = fd.item_meta.name_path();
+            let is_then = path.ends_with("::bool::<Impl>::then");
+            let is_then_some = path.ends_with("::bool::<Impl>::then_some");
+            if !is_then && !is_then_some {
+                continue;
+            }
+            let graph = lower_fun_decl(&ctx, fd).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+            let (call_once, bool_branches, some_ctor, none_ctor) = diamond_counts(&graph);
             assert!(
-                call_once >= 1,
-                "{path}: then arm invokes f() as call_once (call_once={call_once}, \
+                bool_branches >= 1,
+                "{path}: core body branches on self (call_once={call_once}, \
                  branches={bool_branches}, some={some_ctor}, none={none_ctor})"
             );
-            lowered_then += 1;
-        } else {
-            assert_eq!(
-                call_once, 0,
-                "{path}: then_some wraps the value, no call_once"
+            assert!(
+                some_ctor >= 1,
+                "{path}: then arm builds Some (call_once={call_once}, \
+                 branches={bool_branches}, some={some_ctor}, none={none_ctor})"
             );
-            lowered_then_some += 1;
+            assert!(
+                none_ctor >= 1,
+                "{path}: else arm builds None (call_once={call_once}, \
+                 branches={bool_branches}, some={some_ctor}, none={none_ctor})"
+            );
+            if is_then {
+                assert!(
+                    call_once >= 1,
+                    "{path}: then arm invokes f() as call_once (call_once={call_once}, \
+                     branches={bool_branches}, some={some_ctor}, none={none_ctor})"
+                );
+                lowered_then += 1;
+            } else {
+                assert_eq!(
+                    call_once, 0,
+                    "{path}: then_some wraps the value, no call_once"
+                );
+                lowered_then_some += 1;
+            }
         }
-    }
-    assert_eq!(
-        lowered_then, 1,
-        "extracted then FunDecl bodies must lower, got {lowered_then}"
-    );
-    assert_eq!(
-        lowered_then_some, 1,
-        "extracted then_some FunDecl bodies must lower, got {lowered_then_some}"
-    );
+        assert_eq!(
+            lowered_then, 1,
+            "extracted then FunDecl bodies must lower, got {lowered_then}"
+        );
+        assert_eq!(
+            lowered_then_some, 1,
+            "extracted then_some FunDecl bodies must lower, got {lowered_then_some}"
+        );
+    })
 }
 
 /// `option_question_mark`'s `let v = opt?` is a regular call of
@@ -1327,7 +1323,7 @@ fn boxing_cluster_fuses_once_the_class_address_resolves() {
 /// static's declared `ClassObject` root for pointer-identity comparisons.
 #[test]
 fn boxing_cluster_fuses_from_the_host_supplied_class_address() {
-    use majit_translate::front::mir::{LowerContext, lower_fun_decl_with_static_addrs};
+    use majit_translate::front::mir::lower_fun_decl_with_static_addrs;
     use majit_translate::model::{CallTarget, OpKind, ValueType};
 
     const CLASS_ADDR: i64 = 0x00C0_FFEE;
@@ -1338,111 +1334,115 @@ fn boxing_cluster_fuses_from_the_host_supplied_class_address() {
     };
 
     let fd = llbc.local_fn("w_new_int").expect("w_new_int in corpus");
-    let context = LowerContext::new(llbc);
-    let graph = lower_fun_decl_with_static_addrs(&context, fd, static_addrs).expect("lowering");
+    common::with_lowering(llbc, |context| {
+        let graph = lower_fun_decl_with_static_addrs(&context, fd, static_addrs).expect("lowering");
 
-    let mut fused = Vec::new();
-    let mut payload_stores = 0usize;
-    let mut residual_mallocs = 0usize;
-    let mut residual_class_reads = 0usize;
-    for b in &graph.blocks {
-        for op in &b.operations {
-            match &op.kind {
-                OpKind::NewWithVtable { owner, vtable } => fused.push((owner.clone(), *vtable)),
-                OpKind::FieldWrite { field, .. } if field.name == "intval" => payload_stores += 1,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } => match segments.last().map(String::as_str) {
-                    Some("malloc_typed") => residual_mallocs += 1,
-                    Some("INT_CLASS") => residual_class_reads += 1,
+        let mut fused = Vec::new();
+        let mut payload_stores = 0usize;
+        let mut residual_mallocs = 0usize;
+        let mut residual_class_reads = 0usize;
+        for b in &graph.blocks {
+            for op in &b.operations {
+                match &op.kind {
+                    OpKind::NewWithVtable { owner, vtable } => fused.push((owner.clone(), *vtable)),
+                    OpKind::FieldWrite { field, .. } if field.name == "intval" => {
+                        payload_stores += 1
+                    }
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } => match segments.last().map(String::as_str) {
+                        Some("malloc_typed") => residual_mallocs += 1,
+                        Some("INT_CLASS") => residual_class_reads += 1,
+                        _ => {}
+                    },
                     _ => {}
-                },
-                _ => {}
+                }
             }
         }
-    }
-    assert_eq!(
-        fused,
-        vec![("W_IntObject".to_string(), CLASS_ADDR)],
-        "the real lowering fuses to one NewWithVtable carrying the class pointer",
-    );
-    assert_eq!(
-        residual_mallocs, 0,
-        "no residual lltype::malloc_typed survives",
-    );
-    assert_eq!(
-        residual_class_reads, 0,
-        "the class-static read resolved to the host address, not a residual call",
-    );
-    // One, not the two the hand-substituted sibling sees: the whole-graph
-    // lowering runs `remove_dead_aggregates` after the fuse, so the
-    // orphaned aggregate store is already swept here.
-    assert_eq!(payload_stores, 1, "the intval payload store is re-emitted");
+        assert_eq!(
+            fused,
+            vec![("W_IntObject".to_string(), CLASS_ADDR)],
+            "the real lowering fuses to one NewWithVtable carrying the class pointer",
+        );
+        assert_eq!(
+            residual_mallocs, 0,
+            "no residual lltype::malloc_typed survives",
+        );
+        assert_eq!(
+            residual_class_reads, 0,
+            "the class-static read resolved to the host address, not a residual call",
+        );
+        // One, not the two the hand-substituted sibling sees: the whole-graph
+        // lowering runs `remove_dead_aggregates` after the fuse, so the
+        // orphaned aggregate store is already swept here.
+        assert_eq!(payload_stores, 1, "the intval payload store is re-emitted");
 
-    // `w_number_add` keeps the class-static narrowing live after lowering.
-    // Collect every narrowing so an incorrectly stamped root is reported as
-    // its own entry rather than disappearing from an expected-root search.
-    let add = llbc
-        .local_fn("w_number_add")
-        .expect("w_number_add in corpus");
-    let add_graph =
-        lower_fun_decl_with_static_addrs(&context, add, static_addrs).expect("lowering");
-    let mut narrow_roots = std::collections::BTreeMap::new();
-    let mut class_addr_narrowed = 0usize;
-    for b in &add_graph.blocks {
-        for op in &b.operations {
-            let OpKind::Call {
-                args, result_ty, ..
-            } = &op.kind
-            else {
-                continue;
-            };
-            let Some(root) = majit_translate::model::cast_instance_root(&op.kind) else {
-                continue;
-            };
-            let root = root.to_string();
-            *narrow_roots.entry(root.clone()).or_insert(0usize) += 1;
-            assert_eq!(
-                result_ty,
-                &ValueType::Ref(Some(root.clone())),
-                "a narrow's result type is its own root",
-            );
-            // The narrow whose operand is the host-supplied class address
-            // is the one this test is about.
-            let narrows_class_addr = add_graph
-                .blocks
-                .iter()
-                .flat_map(|b| &b.operations)
-                .any(|p| {
-                    p.result.as_ref()
-                        == args
-                            .first()
-                            .and_then(majit_translate::model::LinkArg::as_variable)
-                        && matches!(p.kind, OpKind::ConstRefAddr(a) if a == CLASS_ADDR)
-                });
-            if narrows_class_addr {
-                class_addr_narrowed += 1;
+        // `w_number_add` keeps the class-static narrowing live after lowering.
+        // Collect every narrowing so an incorrectly stamped root is reported as
+        // its own entry rather than disappearing from an expected-root search.
+        let add = llbc
+            .local_fn("w_number_add")
+            .expect("w_number_add in corpus");
+        let add_graph =
+            lower_fun_decl_with_static_addrs(&context, add, static_addrs).expect("lowering");
+        let mut narrow_roots = std::collections::BTreeMap::new();
+        let mut class_addr_narrowed = 0usize;
+        for b in &add_graph.blocks {
+            for op in &b.operations {
+                let OpKind::Call {
+                    args, result_ty, ..
+                } = &op.kind
+                else {
+                    continue;
+                };
+                let Some(root) = majit_translate::model::cast_instance_root(&op.kind) else {
+                    continue;
+                };
+                let root = root.to_string();
+                *narrow_roots.entry(root.clone()).or_insert(0usize) += 1;
                 assert_eq!(
-                    root, "ClassObject",
-                    "the class-static address narrows to the corpus's own class root",
+                    result_ty,
+                    &ValueType::Ref(Some(root.clone())),
+                    "a narrow's result type is its own root",
                 );
+                // The narrow whose operand is the host-supplied class address
+                // is the one this test is about.
+                let narrows_class_addr =
+                    add_graph
+                        .blocks
+                        .iter()
+                        .flat_map(|b| &b.operations)
+                        .any(|p| {
+                            p.result.as_ref()
+                                == args
+                                    .first()
+                                    .and_then(majit_translate::model::LinkArg::as_variable)
+                                && matches!(p.kind, OpKind::ConstRefAddr(a) if a == CLASS_ADDR)
+                        });
+                if narrows_class_addr {
+                    class_addr_narrowed += 1;
+                    assert_eq!(
+                        root, "ClassObject",
+                        "the class-static address narrows to the corpus's own class root",
+                    );
+                }
             }
         }
-    }
-    assert_eq!(
-        class_addr_narrowed, 1,
-        "the host-supplied class address is narrowed exactly once",
-    );
-    assert_eq!(
-        narrow_roots,
-        std::collections::BTreeMap::from([
-            ("ClassObject".to_string(), 1usize),
-            ("ObjectHeader".to_string(), 2),
-            ("W_IntObject".to_string(), 2),
-        ]),
-        "every narrow in the corpus carries a root the corpus itself declares",
-    );
+        assert_eq!(
+            class_addr_narrowed, 1,
+            "the host-supplied class address is narrowed exactly once",
+        );
+        assert_eq!(
+            narrow_roots,
+            std::collections::BTreeMap::from([
+                ("ClassObject".to_string(), 1usize),
+                ("ObjectHeader".to_string(), 2),
+                ("W_IntObject".to_string(), 2),
+            ]),
+            "every narrow in the corpus carries a root the corpus itself declares",
+        );
+    });
 }
 
 /// A header matching RPython's root object layout has a type pointer but no
@@ -1450,7 +1450,7 @@ fn boxing_cluster_fuses_from_the_host_supplied_class_address() {
 /// both layout registration and allocation fusion are covered.
 #[test]
 fn boxing_cluster_fuses_where_the_header_declares_no_class_word() {
-    use majit_translate::front::mir::{LowerContext, lower_fun_decl_with_static_addrs};
+    use majit_translate::front::mir::lower_fun_decl_with_static_addrs;
     use majit_translate::model::{CallTarget, OpKind};
 
     const CLASS_ADDR: i64 = 0x00C0_FFEE;
@@ -1463,49 +1463,50 @@ fn boxing_cluster_fuses_where_the_header_declares_no_class_word() {
     let fd = llbc
         .local_fn("w_new_type_only_int")
         .expect("w_new_type_only_int in corpus");
-    let context = LowerContext::new(llbc);
-    let graph = lower_fun_decl_with_static_addrs(&context, fd, static_addrs).expect("lowering");
+    common::with_lowering(llbc, |context| {
+        let graph = lower_fun_decl_with_static_addrs(&context, fd, static_addrs).expect("lowering");
 
-    let mut fused = Vec::new();
-    let mut payload_stores = 0usize;
-    let mut class_word_stores = 0usize;
-    let mut residual_mallocs = 0usize;
-    for b in &graph.blocks {
-        for op in &b.operations {
-            match &op.kind {
-                OpKind::NewWithVtable { owner, vtable } => fused.push((owner.clone(), *vtable)),
-                OpKind::FieldWrite { field, .. } => match field.name.as_str() {
-                    "intval" => payload_stores += 1,
-                    "w_class" => class_word_stores += 1,
+        let mut fused = Vec::new();
+        let mut payload_stores = 0usize;
+        let mut class_word_stores = 0usize;
+        let mut residual_mallocs = 0usize;
+        for b in &graph.blocks {
+            for op in &b.operations {
+                match &op.kind {
+                    OpKind::NewWithVtable { owner, vtable } => fused.push((owner.clone(), *vtable)),
+                    OpKind::FieldWrite { field, .. } => match field.name.as_str() {
+                        "intval" => payload_stores += 1,
+                        "w_class" => class_word_stores += 1,
+                        _ => {}
+                    },
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("malloc_typed") => {
+                        residual_mallocs += 1
+                    }
                     _ => {}
-                },
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } if segments.last().map(String::as_str) == Some("malloc_typed") => {
-                    residual_mallocs += 1
                 }
-                _ => {}
             }
         }
-    }
-    // The premise the arm rests on, asserted rather than assumed: nothing in
-    // this cluster writes a class word, so a fuse here can only have come
-    // through the no-class-word arm.
-    assert_eq!(
-        class_word_stores, 0,
-        "the one-word header's cluster stores no class word",
-    );
-    assert_eq!(
-        fused,
-        vec![("W_TypeOnlyIntObject".to_string(), CLASS_ADDR)],
-        "the one-word header's cluster fuses to one NewWithVtable",
-    );
-    assert_eq!(
-        residual_mallocs, 0,
-        "no residual lltype::malloc_typed survives",
-    );
-    assert_eq!(payload_stores, 1, "the intval payload store is re-emitted");
+        // The premise the arm rests on, asserted rather than assumed: nothing in
+        // this cluster writes a class word, so a fuse here can only have come
+        // through the no-class-word arm.
+        assert_eq!(
+            class_word_stores, 0,
+            "the one-word header's cluster stores no class word",
+        );
+        assert_eq!(
+            fused,
+            vec![("W_TypeOnlyIntObject".to_string(), CLASS_ADDR)],
+            "the one-word header's cluster fuses to one NewWithVtable",
+        );
+        assert_eq!(
+            residual_mallocs, 0,
+            "no residual lltype::malloc_typed survives",
+        );
+        assert_eq!(payload_stores, 1, "the intval payload store is re-emitted");
+    });
 }
 
 /// A pointer-identity type dispatch keeps its concrete arm as a direct call,
@@ -1850,7 +1851,7 @@ fn a_char_element_indexes_to_an_int_banked_array_read() {
 #[test]
 fn a_char_literal_default_joins_an_option_char_payload_in_the_int_bank() {
     use majit_translate::flowspace::model::Variable;
-    use majit_translate::front::mir::{LowerContext, lower_fun_decl};
+    use majit_translate::front::mir::lower_fun_decl;
     use majit_translate::model::{Block, CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
 
     fn unwrap_or_leaf(leaf: &str) -> bool {
@@ -2030,51 +2031,54 @@ fn a_char_literal_default_joins_an_option_char_payload_in_the_int_bank() {
         let blob = format!("{path}{inst}");
         blob.contains("char") || blob.contains("Char")
     }) {
-        let context = LowerContext::new(llbc);
-        let body =
-            lower_fun_decl(&context, fd).unwrap_or_else(|e| panic!("lower core unwrap_or: {e}"));
-        let producer = |var: &Variable| -> Option<&OpKind> {
-            body.blocks
-                .iter()
-                .flat_map(|b| b.operations.iter())
-                .find(|op| op.result.as_ref() == Some(var))
-                .map(|op| &op.kind)
-        };
-        let mut joins = 0;
-        for target in &body.blocks {
-            for (slot, _) in target.inputargs.iter().enumerate() {
-                let mut kinds = Vec::new();
-                for block in &body.blocks {
-                    for link in block.exits.iter().filter(|l| l.target == target.id) {
-                        let Some(LinkArg::Value(v)) = link.args.get(slot) else {
-                            continue;
-                        };
-                        match producer(v) {
-                            Some(OpKind::Input { ty, .. }) => kinds.push(("default", ty.clone())),
-                            Some(OpKind::FieldRead { field, ty, .. })
-                                if field.name == "__pos_0" =>
-                            {
-                                kinds.push(("payload", ty.clone()))
+        common::with_lowering(llbc, |context| {
+            let body = lower_fun_decl(&context, fd)
+                .unwrap_or_else(|e| panic!("lower core unwrap_or: {e}"));
+            let producer = |var: &Variable| -> Option<&OpKind> {
+                body.blocks
+                    .iter()
+                    .flat_map(|b| b.operations.iter())
+                    .find(|op| op.result.as_ref() == Some(var))
+                    .map(|op| &op.kind)
+            };
+            let mut joins = 0;
+            for target in &body.blocks {
+                for (slot, _) in target.inputargs.iter().enumerate() {
+                    let mut kinds = Vec::new();
+                    for block in &body.blocks {
+                        for link in block.exits.iter().filter(|l| l.target == target.id) {
+                            let Some(LinkArg::Value(v)) = link.args.get(slot) else {
+                                continue;
+                            };
+                            match producer(v) {
+                                Some(OpKind::Input { ty, .. }) => {
+                                    kinds.push(("default", ty.clone()))
+                                }
+                                Some(OpKind::FieldRead { field, ty, .. })
+                                    if field.name == "__pos_0" =>
+                                {
+                                    kinds.push(("payload", ty.clone()))
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
-                }
-                if kinds.iter().any(|(k, _)| *k == "default")
-                    && kinds.iter().any(|(k, _)| *k == "payload")
-                {
-                    joins += 1;
-                    assert!(
-                        kinds.iter().all(|(_, ty)| *ty == ValueType::Int),
-                        "both links into the unwrap_or join are int-kind, got {kinds:?}",
-                    );
+                    if kinds.iter().any(|(k, _)| *k == "default")
+                        && kinds.iter().any(|(k, _)| *k == "payload")
+                    {
+                        joins += 1;
+                        assert!(
+                            kinds.iter().all(|(_, ty)| *ty == ValueType::Int),
+                            "both links into the unwrap_or join are int-kind, got {kinds:?}",
+                        );
+                    }
                 }
             }
-        }
-        assert_eq!(
-            joins, 1,
-            "one block input joins the payload and the default parameter"
-        );
+            assert_eq!(
+                joins, 1,
+                "one block input joins the payload and the default parameter"
+            );
+        });
     }
 }
 
@@ -3215,22 +3219,23 @@ fn a_closure_indexes_its_captured_slice_through_the_pair() {
                 .ends_with("index_through_a_closure::<Impl>::call")
         })
         .expect("closure body");
-    let context = majit_translate::front::mir::LowerContext::new(llbc);
-    let graph = majit_translate::front::mir::lower_fun_decl(&context, fd).expect("lowering");
-    let ops: Vec<_> = graph.blocks.iter().flat_map(|b| &b.operations).collect();
-    assert!(
-        ops.iter().any(|op| matches!(
-            &op.kind,
-            OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                if segments.last().map(String::as_str) == Some("ll_slice_getitem_fast_r")
-        )),
-        "{ops:?}"
-    );
-    assert!(
-        !ops.iter()
-            .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
-        "{ops:?}"
-    );
+    common::with_lowering(llbc, |context| {
+        let graph = majit_translate::front::mir::lower_fun_decl(&context, fd).expect("lowering");
+        let ops: Vec<_> = graph.blocks.iter().flat_map(|b| &b.operations).collect();
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.last().map(String::as_str) == Some("ll_slice_getitem_fast_r")
+            )),
+            "{ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
+            "{ops:?}"
+        );
+    });
 }
 
 fn path_skips_impl_segments(segments: &[String]) -> Vec<&str> {
@@ -3383,89 +3388,90 @@ fn code_flags_methods_call_translated_bodies() {
                     .unwrap_or_else(|| "<missing>".to_string())
             )
         });
-    let context = lower_context_for(llbc);
-    let contains_graph = lower_fun_decl(context, contains_fd)
-        .unwrap_or_else(|e| panic!("lower CodeFlags::contains: {e}"));
-    let contains_ops: Vec<_> = contains_graph
-        .blocks
-        .iter()
-        .flat_map(|block| block.operations.iter())
-        .collect();
-    fn graph_has_bitand(ops: &[&majit_translate::model::SpaceOperation]) -> bool {
-        ops.iter()
-            .any(|op| matches!(&op.kind, OpKind::BinOp { op: label, .. } if label == "bitand"))
-    }
-    fn assert_no_residual_bits(ops: &[&majit_translate::model::SpaceOperation], who: &str) {
-        for op in ops {
-            let OpKind::Call {
-                target:
-                    CallTarget::FunctionPath {
-                        segments,
-                        fun_decl_id,
-                        ..
-                    },
-                ..
-            } = &op.kind
-            else {
-                continue;
-            };
-            if path_skips_impl_segments(segments).last() != Some(&"bits") {
-                continue;
-            }
-            assert!(
-                fun_decl_id.is_some(),
-                "{who} bits call lacks fun_decl_id, segs={segments:?}"
-            );
-        }
-    }
-    assert_no_residual_bits(&contains_ops, "CodeFlags::contains");
-    if !graph_has_bitand(&contains_ops) {
-        assert!(
-            contains_ops.iter().any(|op| matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } if path_ends_with_internal_bitflags_contains(segments)
-            )),
-            "CodeFlags::contains must bitand or call InternalBitFlags::contains, got {}",
-            contains_graph.dump()
-        );
-        let inner_fd = llbc
-            .iter_fun_decls()
-            .find(|fd| {
-                fd.has_unstructured_body()
-                    && fd.def_id != contains_id
-                    && fd.item_meta.name_path().ends_with("::<Impl>::contains")
-                    && fd
-                        .item_meta
-                        .name_path()
-                        .contains("rustpython_compiler_core::bytecode::_::")
-            })
-            .expect("InternalBitFlags impl contains");
-        let inner_graph = lower_fun_decl(context, inner_fd)
-            .unwrap_or_else(|e| panic!("lower InternalBitFlags::contains: {e}"));
-        let inner_ops: Vec<_> = inner_graph
+    common::with_shared_lowering(llbc, |context| {
+        let contains_graph = lower_fun_decl(context, contains_fd)
+            .unwrap_or_else(|e| panic!("lower CodeFlags::contains: {e}"));
+        let contains_ops: Vec<_> = contains_graph
             .blocks
             .iter()
             .flat_map(|block| block.operations.iter())
             .collect();
-        assert!(
-            inner_ops.iter().any(|op| matches!(
-                &op.kind,
-                OpKind::Input { class_root: Some(root), .. }
-                    if root.contains("InternalBitFlags")
-            )),
-            "sibling contains FunDecl must be InternalBitFlags, got {}",
-            inner_graph.dump()
-        );
-        assert!(
-            graph_has_bitand(&inner_ops),
-            "InternalBitFlags::contains must contain a bitand, got {}",
-            inner_graph.dump()
-        );
-        assert_no_residual_bits(&inner_ops, "InternalBitFlags::contains");
-    }
+        fn graph_has_bitand(ops: &[&majit_translate::model::SpaceOperation]) -> bool {
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op: label, .. } if label == "bitand"))
+        }
+        fn assert_no_residual_bits(ops: &[&majit_translate::model::SpaceOperation], who: &str) {
+            for op in ops {
+                let OpKind::Call {
+                    target:
+                        CallTarget::FunctionPath {
+                            segments,
+                            fun_decl_id,
+                            ..
+                        },
+                    ..
+                } = &op.kind
+                else {
+                    continue;
+                };
+                if path_skips_impl_segments(segments).last() != Some(&"bits") {
+                    continue;
+                }
+                assert!(
+                    fun_decl_id.is_some(),
+                    "{who} bits call lacks fun_decl_id, segs={segments:?}"
+                );
+            }
+        }
+        assert_no_residual_bits(&contains_ops, "CodeFlags::contains");
+        if !graph_has_bitand(&contains_ops) {
+            assert!(
+                contains_ops.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if path_ends_with_internal_bitflags_contains(segments)
+                )),
+                "CodeFlags::contains must bitand or call InternalBitFlags::contains, got {}",
+                contains_graph.dump()
+            );
+            let inner_fd = llbc
+                .iter_fun_decls()
+                .find(|fd| {
+                    fd.has_unstructured_body()
+                        && fd.def_id != contains_id
+                        && fd.item_meta.name_path().ends_with("::<Impl>::contains")
+                        && fd
+                            .item_meta
+                            .name_path()
+                            .contains("rustpython_compiler_core::bytecode::_::")
+                })
+                .expect("InternalBitFlags impl contains");
+            let inner_graph = lower_fun_decl(context, inner_fd)
+                .unwrap_or_else(|e| panic!("lower InternalBitFlags::contains: {e}"));
+            let inner_ops: Vec<_> = inner_graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .collect();
+            assert!(
+                inner_ops.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::Input { class_root: Some(root), .. }
+                        if root.contains("InternalBitFlags")
+                )),
+                "sibling contains FunDecl must be InternalBitFlags, got {}",
+                inner_graph.dump()
+            );
+            assert!(
+                graph_has_bitand(&inner_ops),
+                "InternalBitFlags::contains must contain a bitand, got {}",
+                inner_graph.dump()
+            );
+            assert_no_residual_bits(&inner_ops, "InternalBitFlags::contains");
+        }
+    });
 }
 
 /// `FrameBox::new` copies a by-value `PyFrame` with `core::ptr::write`.
@@ -3485,76 +3491,77 @@ fn frame_box_new_ptr_write_lowers_to_field_stores() {
                 .is_some_and(|text| text.starts_with("pub fn new(mut frame: PyFrame)"))
         })
         .expect("FrameBox::new");
-    let context = lower_context_for(llbc);
-    let graph = lower_fun_decl(&context, fd).expect("lower FrameBox::new");
-    assert!(
-        !graph
+    common::with_shared_lowering(llbc, |context| {
+        let graph = lower_fun_decl(&context, fd).expect("lower FrameBox::new");
+        assert!(
+            !graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if segments.iter().map(String::as_str).eq(["core", "ptr", "write"])
+                    )
+                }),
+            "FrameBox::new still has core::ptr::write"
+        );
+        let cast_results: std::collections::HashSet<u64> = graph
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
-            .any(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments, .. },
-                        ..
-                    } if segments.iter().map(String::as_str).eq(["core", "ptr", "write"])
-                )
-            }),
-        "FrameBox::new still has core::ptr::write"
-    );
-    let cast_results: std::collections::HashSet<u64> = graph
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-        .filter_map(|op| {
-            (majit_translate::model::cast_instance_root(&op.kind) == Some("pyframe::PyFrame"))
-                .then(|| op.result.as_ref().map(|var| var.id()))
-                .flatten()
-        })
-        .collect();
-    assert!(
-        graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .any(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::FieldWrite { base, field, .. }
-                        if cast_results.contains(&base.id()) && field.name == "pycode"
-                )
-            }),
-        "the PyFrame copy must store pycode into the cast destination"
-    );
-    assert!(
-        !graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .any(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::FieldWrite { field, .. } if field.name == "ob_header"
-                )
-            }),
-        "FrameBox::new must not store the inlined ob_header as one word"
-    );
-    assert!(
-        graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .any(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::FieldWrite { field, .. }
-                        if field.name == "w_class"
-                            && field.owner_root.as_deref() == Some("pyobject::PyObject")
-                )
-            }),
-        "offset-0 header is the `super` chain: inner PyObject descriptors"
-    );
+            .filter_map(|op| {
+                (majit_translate::model::cast_instance_root(&op.kind) == Some("pyframe::PyFrame"))
+                    .then(|| op.result.as_ref().map(|var| var.id()))
+                    .flatten()
+            })
+            .collect();
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { base, field, .. }
+                            if cast_results.contains(&base.id()) && field.name == "pycode"
+                    )
+                }),
+            "the PyFrame copy must store pycode into the cast destination"
+        );
+        assert!(
+            !graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { field, .. } if field.name == "ob_header"
+                    )
+                }),
+            "FrameBox::new must not store the inlined ob_header as one word"
+        );
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { field, .. }
+                            if field.name == "w_class"
+                                && field.owner_root.as_deref() == Some("pyobject::PyObject")
+                    )
+                }),
+            "offset-0 header is the `super` chain: inner PyObject descriptors"
+        );
+    });
 }
 
 /// `FrameBox::new` stores the operand of `OwnerRootGuard::new(r)` in
@@ -3571,284 +3578,284 @@ fn frame_box_owner_root_word_roundtrips() {
     use majit_translate::model::{FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
     let llbc = load_llbc(INTERPRETER_LLBC);
-    let context = lower_context_for(llbc);
-
-    fn value_id(arg: &LinkArg) -> Option<u64> {
-        match arg {
-            LinkArg::Value(var) => Some(var.id()),
-            LinkArg::Const(_) => None,
+    common::with_shared_lowering(llbc, |context| {
+        fn value_id(arg: &LinkArg) -> Option<u64> {
+            match arg {
+                LinkArg::Value(var) => Some(var.id()),
+                LinkArg::Const(_) => None,
+            }
         }
-    }
 
-    fn operand_ids(op: &SpaceOperation) -> Vec<u64> {
-        match &op.kind {
-            OpKind::Call { args, .. } => args.iter().filter_map(value_id).collect(),
-            OpKind::FieldRead { base, .. } => vec![base.id()],
-            OpKind::UnaryOp { operand, .. } => vec![operand.id()],
-            OpKind::BinOp { lhs, rhs, .. } => vec![lhs.id(), rhs.id()],
-            _ => Vec::new(),
-        }
-    }
-
-    fn op_result<'a>(graph: &'a FunctionGraph, id: u64) -> Option<&'a SpaceOperation> {
-        graph.blocks.iter().find_map(|block| {
-            block
-                .operations
-                .iter()
-                .find(|op| op.result.as_ref().is_some_and(|var| var.id() == id))
-        })
-    }
-
-    fn phi_sources(graph: &FunctionGraph, id: u64) -> Vec<u64> {
-        let Some(block) = graph
-            .blocks
-            .iter()
-            .find(|block| block.inputargs.iter().any(|var| var.id() == id))
-        else {
-            return Vec::new();
-        };
-        let pos = block
-            .inputargs
-            .iter()
-            .position(|var| var.id() == id)
-            .expect("input position");
-        graph
-            .blocks
-            .iter()
-            .flat_map(|pred| pred.exits.iter())
-            .filter(|link| link.target == block.id)
-            .filter_map(|link| link.args.get(pos).and_then(value_id))
-            .collect()
-    }
-
-    /// Field read reached only by forwarding block arguments and at
-    /// most one `__cast_instance_intrinsic` of that word onto the dest
-    /// class. The Some arm's operand must be the `owner_root` FieldRead.
-    fn pure_field_read<'a>(
-        graph: &'a FunctionGraph,
-        id: u64,
-        seen: &mut Vec<u64>,
-        through_instance: &mut bool,
-    ) -> &'a majit_translate::model::FieldDescriptor {
-        assert!(!seen.contains(&id), "cycle at v{id}");
-        seen.push(id);
-        if let Some(op) = op_result(graph, id) {
+        fn operand_ids(op: &SpaceOperation) -> Vec<u64> {
             match &op.kind {
-                OpKind::FieldRead { field, .. } => field,
-                OpKind::Call {
-                    target,
-                    args,
-                    result_ty,
-                } if call_target_text(target) == "__cast_instance_intrinsic" => {
-                    assert!(
-                        !*through_instance,
-                        "v{id} is a second __cast_instance_intrinsic, result_ty={result_ty:?}"
-                    );
-                    *through_instance = true;
-                    let operand = args.first().and_then(value_id).unwrap_or_else(|| {
-                        panic!("__cast_instance_intrinsic has no operand: {args:?}")
-                    });
-                    pure_field_read(graph, operand, seen, through_instance)
-                }
-                other => panic!("v{id} is {other:?}, not the owner_root word"),
-            }
-        } else {
-            let srcs = phi_sources(graph, id);
-            assert_eq!(
-                srcs.len(),
-                1,
-                "v{id} is not a forward of one field read: {srcs:?}"
-            );
-            pure_field_read(graph, srcs[0], seen, through_instance)
-        }
-    }
-
-    fn ancestors(graph: &FunctionGraph, start: u64) -> Vec<u64> {
-        let mut out = Vec::new();
-        let mut stack = vec![start];
-        while let Some(id) = stack.pop() {
-            if out.contains(&id) {
-                continue;
-            }
-            out.push(id);
-            if let Some(op) = op_result(graph, id) {
-                stack.extend(operand_ids(op));
-            } else {
-                stack.extend(phi_sources(graph, id));
+                OpKind::Call { args, .. } => args.iter().filter_map(value_id).collect(),
+                OpKind::FieldRead { base, .. } => vec![base.id()],
+                OpKind::UnaryOp { operand, .. } => vec![operand.id()],
+                OpKind::BinOp { lhs, rhs, .. } => vec![lhs.id(), rhs.id()],
+                _ => Vec::new(),
             }
         }
-        out
-    }
 
-    fn defining_op<'a>(graph: &'a FunctionGraph, start: u64) -> &'a SpaceOperation {
-        let mut id = start;
-        let mut seen = Vec::new();
-        loop {
+        fn op_result<'a>(graph: &'a FunctionGraph, id: u64) -> Option<&'a SpaceOperation> {
+            graph.blocks.iter().find_map(|block| {
+                block
+                    .operations
+                    .iter()
+                    .find(|op| op.result.as_ref().is_some_and(|var| var.id() == id))
+            })
+        }
+
+        fn phi_sources(graph: &FunctionGraph, id: u64) -> Vec<u64> {
+            let Some(block) = graph
+                .blocks
+                .iter()
+                .find(|block| block.inputargs.iter().any(|var| var.id() == id))
+            else {
+                return Vec::new();
+            };
+            let pos = block
+                .inputargs
+                .iter()
+                .position(|var| var.id() == id)
+                .expect("input position");
+            graph
+                .blocks
+                .iter()
+                .flat_map(|pred| pred.exits.iter())
+                .filter(|link| link.target == block.id)
+                .filter_map(|link| link.args.get(pos).and_then(value_id))
+                .collect()
+        }
+
+        /// Field read reached only by forwarding block arguments and at
+        /// most one `__cast_instance_intrinsic` of that word onto the dest
+        /// class. The Some arm's operand must be the `owner_root` FieldRead.
+        fn pure_field_read<'a>(
+            graph: &'a FunctionGraph,
+            id: u64,
+            seen: &mut Vec<u64>,
+            through_instance: &mut bool,
+        ) -> &'a majit_translate::model::FieldDescriptor {
             assert!(!seen.contains(&id), "cycle at v{id}");
             seen.push(id);
             if let Some(op) = op_result(graph, id) {
-                return op;
-            }
-            let srcs = phi_sources(graph, id);
-            assert_eq!(srcs.len(), 1, "v{id} has no single producer: {srcs:?}");
-            id = srcs[0];
-        }
-    }
-
-    fn lower_pyframe(llbc: &Llbc, context: &LowerContext<'_>, source: &str) -> FunctionGraph {
-        let fd = llbc
-            .iter_local_fns()
-            .find(|fd| {
-                fd.item_meta.name_path().contains("pyframe")
-                    && fd
-                        .item_meta
-                        .source_text
-                        .as_deref()
-                        .is_some_and(|text| text.starts_with(source))
-            })
-            .unwrap_or_else(|| panic!("missing {source}"));
-        lower_fun_decl(context, fd).unwrap_or_else(|err| panic!("lower {source}: {err}"))
-    }
-
-    fn calls_cast_int_to_ptr(graph: &FunctionGraph) -> bool {
-        graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .any(|op| match &op.kind {
-                OpKind::Call { target, .. } => {
-                    call_target_text(target).ends_with("cast_int_to_ptr")
+                match &op.kind {
+                    OpKind::FieldRead { field, .. } => field,
+                    OpKind::Call {
+                        target,
+                        args,
+                        result_ty,
+                    } if call_target_text(target) == "__cast_instance_intrinsic" => {
+                        assert!(
+                            !*through_instance,
+                            "v{id} is a second __cast_instance_intrinsic, result_ty={result_ty:?}"
+                        );
+                        *through_instance = true;
+                        let operand = args.first().and_then(value_id).unwrap_or_else(|| {
+                            panic!("__cast_instance_intrinsic has no operand: {args:?}")
+                        });
+                        pure_field_read(graph, operand, seen, through_instance)
+                    }
+                    other => panic!("v{id} is {other:?}, not the owner_root word"),
                 }
-                OpKind::UnaryOp { op, .. } => op == "cast_int_to_ptr",
-                _ => false,
-            })
-    }
-
-    let frame_ptr = lower_pyframe(&llbc, &context, "fn frame_ptr(&self)");
-    let live = reachable_blocks(&frame_ptr);
-    let mut arms = Vec::new();
-    for block in &frame_ptr.blocks {
-        if !live.contains(&block.id) {
-            continue;
+            } else {
+                let srcs = phi_sources(graph, id);
+                assert_eq!(
+                    srcs.len(),
+                    1,
+                    "v{id} is not a forward of one field read: {srcs:?}"
+                );
+                pure_field_read(graph, srcs[0], seen, through_instance)
+            }
         }
-        for link in &block.exits {
-            if link.target != frame_ptr.returnblock {
+
+        fn ancestors(graph: &FunctionGraph, start: u64) -> Vec<u64> {
+            let mut out = Vec::new();
+            let mut stack = vec![start];
+            while let Some(id) = stack.pop() {
+                if out.contains(&id) {
+                    continue;
+                }
+                out.push(id);
+                if let Some(op) = op_result(graph, id) {
+                    stack.extend(operand_ids(op));
+                } else {
+                    stack.extend(phi_sources(graph, id));
+                }
+            }
+            out
+        }
+
+        fn defining_op<'a>(graph: &'a FunctionGraph, start: u64) -> &'a SpaceOperation {
+            let mut id = start;
+            let mut seen = Vec::new();
+            loop {
+                assert!(!seen.contains(&id), "cycle at v{id}");
+                seen.push(id);
+                if let Some(op) = op_result(graph, id) {
+                    return op;
+                }
+                let srcs = phi_sources(graph, id);
+                assert_eq!(srcs.len(), 1, "v{id} has no single producer: {srcs:?}");
+                id = srcs[0];
+            }
+        }
+
+        fn lower_pyframe(llbc: &Llbc, context: &LowerContext<'_>, source: &str) -> FunctionGraph {
+            let fd = llbc
+                .iter_local_fns()
+                .find(|fd| {
+                    fd.item_meta.name_path().contains("pyframe")
+                        && fd
+                            .item_meta
+                            .source_text
+                            .as_deref()
+                            .is_some_and(|text| text.starts_with(source))
+                })
+                .unwrap_or_else(|| panic!("missing {source}"));
+            lower_fun_decl(context, fd).unwrap_or_else(|err| panic!("lower {source}: {err}"))
+        }
+
+        fn calls_cast_int_to_ptr(graph: &FunctionGraph) -> bool {
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| match &op.kind {
+                    OpKind::Call { target, .. } => {
+                        call_target_text(target).ends_with("cast_int_to_ptr")
+                    }
+                    OpKind::UnaryOp { op, .. } => op == "cast_int_to_ptr",
+                    _ => false,
+                })
+        }
+
+        let frame_ptr = lower_pyframe(&llbc, &context, "fn frame_ptr(&self)");
+        let live = reachable_blocks(&frame_ptr);
+        let mut arms = Vec::new();
+        for block in &frame_ptr.blocks {
+            if !live.contains(&block.id) {
                 continue;
             }
-            let arg = link
-                .args
-                .first()
-                .and_then(value_id)
-                .unwrap_or_else(|| panic!("frame_ptr return link has no value"));
-            let mut seen = Vec::new();
-            let mut through_instance = false;
-            let field = pure_field_read(&frame_ptr, arg, &mut seen, &mut through_instance);
-            if field.name == "owner_root" {
-                assert!(
-                    through_instance,
-                    "Some arm recasts the GCREF owner_root word onto PyFrame"
-                );
-            }
-            arms.push((field.name.clone(), field.taken_by_address));
-        }
-    }
-    assert!(
-        arms.iter()
-            .any(|(name, address)| name == "owner_root" && !address),
-        "Some arm must return the owner_root word, not an address or another value: {arms:?}"
-    );
-    assert!(
-        arms.iter().any(|(name, _)| name == "ptr"),
-        "None arm must return the ptr field: {arms:?}"
-    );
-    assert!(
-        !calls_cast_int_to_ptr(&frame_ptr),
-        "frame_ptr still casts the guard word through the integer bank"
-    );
-
-    let deref_mut = lower_pyframe(&llbc, &context, "fn deref_mut(&mut self)");
-    let live = reachable_blocks(&deref_mut);
-    let mut deref_returns = Vec::new();
-    for block in &deref_mut.blocks {
-        if !live.contains(&block.id) {
-            continue;
-        }
-        for link in &block.exits {
-            if link.target == deref_mut.returnblock {
-                deref_returns.push(
-                    link.args
-                        .first()
-                        .and_then(value_id)
-                        .unwrap_or_else(|| panic!("deref_mut return link has no value")),
-                );
-            }
-        }
-    }
-    assert_eq!(
-        deref_returns.len(),
-        1,
-        "deref_mut returns: {deref_returns:?}"
-    );
-    let ret_op = defining_op(&deref_mut, deref_returns[0]);
-    // `frame_ptr` is already `Ref(Some("pyframe::PyFrame"))`; the identity recast
-    // `result_narrow_root` used to emit is gone (`rclass.py`
-    // `getinstancerepr`). The Call dest is the return value.
-    let call_name = match &ret_op.kind {
-        OpKind::Call {
-            target,
-            result_ty: ValueType::Ref(Some(root)),
-            ..
-        } if root == "pyframe::PyFrame" => call_target_text(target),
-        other => panic!(
-            "deref_mut must return frame_ptr as Ref(Some(\"pyframe::PyFrame\")), got {other:?}"
-        ),
-    };
-    assert!(
-        call_name.ends_with("frame_ptr"),
-        "deref_mut must return frame_ptr's word, got {call_name}"
-    );
-    assert!(
-        !calls_cast_int_to_ptr(&deref_mut),
-        "deref_mut casts the frame pointer through the integer bank"
-    );
-
-    let new_graph = lower_pyframe(&llbc, &context, "pub fn new(mut frame: PyFrame)");
-    let mut owner_value = None;
-    let mut ptr_value = None;
-    for block in &new_graph.blocks {
-        for op in &block.operations {
-            if let OpKind::FieldWrite { field, value, .. } = &op.kind {
-                let LinkArg::Value(var) = value else {
-                    panic!("{} is a constant, not new(r)", field.name);
-                };
+            for link in &block.exits {
+                if link.target != frame_ptr.returnblock {
+                    continue;
+                }
+                let arg = link
+                    .args
+                    .first()
+                    .and_then(value_id)
+                    .unwrap_or_else(|| panic!("frame_ptr return link has no value"));
+                let mut seen = Vec::new();
+                let mut through_instance = false;
+                let field = pure_field_read(&frame_ptr, arg, &mut seen, &mut through_instance);
                 if field.name == "owner_root" {
-                    assert!(owner_value.is_none(), "two owner_root writes");
-                    owner_value = Some(var.id());
-                } else if field.name == "ptr" {
-                    assert!(ptr_value.is_none(), "two ptr writes");
-                    ptr_value = Some(var.id());
+                    assert!(
+                        through_instance,
+                        "Some arm recasts the GCREF owner_root word onto PyFrame"
+                    );
+                }
+                arms.push((field.name.clone(), field.taken_by_address));
+            }
+        }
+        assert!(
+            arms.iter()
+                .any(|(name, address)| name == "owner_root" && !address),
+            "Some arm must return the owner_root word, not an address or another value: {arms:?}"
+        );
+        assert!(
+            arms.iter().any(|(name, _)| name == "ptr"),
+            "None arm must return the ptr field: {arms:?}"
+        );
+        assert!(
+            !calls_cast_int_to_ptr(&frame_ptr),
+            "frame_ptr still casts the guard word through the integer bank"
+        );
+
+        let deref_mut = lower_pyframe(&llbc, &context, "fn deref_mut(&mut self)");
+        let live = reachable_blocks(&deref_mut);
+        let mut deref_returns = Vec::new();
+        for block in &deref_mut.blocks {
+            if !live.contains(&block.id) {
+                continue;
+            }
+            for link in &block.exits {
+                if link.target == deref_mut.returnblock {
+                    deref_returns.push(
+                        link.args
+                            .first()
+                            .and_then(value_id)
+                            .unwrap_or_else(|| panic!("deref_mut return link has no value")),
+                    );
                 }
             }
         }
-    }
-    let owner_value = owner_value.expect("FrameBox::new writes owner_root");
-    let ptr_value = ptr_value.expect("FrameBox::new writes ptr");
-    let stored = defining_op(&new_graph, owner_value);
-    assert_eq!(
-        majit_translate::model::cast_instance_root(&stored.kind),
-        Some("GCREF"),
-        "owner_root must receive the GcRef word new(r) lowers to, got {:?}",
-        stored.kind
-    );
-    let new_operand = operand_ids(stored)
-        .first()
-        .copied()
-        .expect("GCREF cast operand");
-    let ptr_ancestors = ancestors(&new_graph, ptr_value);
-    assert!(
-        ptr_ancestors.contains(&new_operand),
-        "owner_root's new(r) operand is not the frame pointer stored in ptr"
-    );
+        assert_eq!(
+            deref_returns.len(),
+            1,
+            "deref_mut returns: {deref_returns:?}"
+        );
+        let ret_op = defining_op(&deref_mut, deref_returns[0]);
+        // `frame_ptr` is already `Ref(Some("pyframe::PyFrame"))`; the identity recast
+        // `result_narrow_root` used to emit is gone (`rclass.py`
+        // `getinstancerepr`). The Call dest is the return value.
+        let call_name = match &ret_op.kind {
+            OpKind::Call {
+                target,
+                result_ty: ValueType::Ref(Some(root)),
+                ..
+            } if root == "pyframe::PyFrame" => call_target_text(target),
+            other => panic!(
+                "deref_mut must return frame_ptr as Ref(Some(\"pyframe::PyFrame\")), got {other:?}"
+            ),
+        };
+        assert!(
+            call_name.ends_with("frame_ptr"),
+            "deref_mut must return frame_ptr's word, got {call_name}"
+        );
+        assert!(
+            !calls_cast_int_to_ptr(&deref_mut),
+            "deref_mut casts the frame pointer through the integer bank"
+        );
+
+        let new_graph = lower_pyframe(&llbc, &context, "pub fn new(mut frame: PyFrame)");
+        let mut owner_value = None;
+        let mut ptr_value = None;
+        for block in &new_graph.blocks {
+            for op in &block.operations {
+                if let OpKind::FieldWrite { field, value, .. } = &op.kind {
+                    let LinkArg::Value(var) = value else {
+                        panic!("{} is a constant, not new(r)", field.name);
+                    };
+                    if field.name == "owner_root" {
+                        assert!(owner_value.is_none(), "two owner_root writes");
+                        owner_value = Some(var.id());
+                    } else if field.name == "ptr" {
+                        assert!(ptr_value.is_none(), "two ptr writes");
+                        ptr_value = Some(var.id());
+                    }
+                }
+            }
+        }
+        let owner_value = owner_value.expect("FrameBox::new writes owner_root");
+        let ptr_value = ptr_value.expect("FrameBox::new writes ptr");
+        let stored = defining_op(&new_graph, owner_value);
+        assert_eq!(
+            majit_translate::model::cast_instance_root(&stored.kind),
+            Some("GCREF"),
+            "owner_root must receive the GcRef word new(r) lowers to, got {:?}",
+            stored.kind
+        );
+        let new_operand = operand_ids(stored)
+            .first()
+            .copied()
+            .expect("GCREF cast operand");
+        let ptr_ancestors = ancestors(&new_graph, ptr_value);
+        assert!(
+            ptr_ancestors.contains(&new_operand),
+            "owner_root's new(r) operand is not the frame pointer stored in ptr"
+        );
+    });
 }
 
 /// `function_get_qualname_obj` force receiver is the CAST of the
@@ -3997,41 +4004,44 @@ fn frame_box_owner_root_guard_lowers_without_guard_calls() {
         "pub fn into_raw(mut self)",
         "pub unsafe fn from_raw(ptr: *mut PyFrame)",
     ];
-    let context = lower_context_for(llbc);
-    for source in sources {
-        let fd = llbc
-            .iter_local_fns()
-            .find(|fd| {
-                fd.item_meta.name_path().contains("pyframe")
-                    && fd
-                        .item_meta
-                        .source_text
-                        .as_deref()
-                        .is_some_and(|text| text.starts_with(source))
-            })
-            .unwrap_or_else(|| panic!("missing {source}"));
-        let graph = lower_fun_decl(&context, fd)
-            .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
-        let calls: Vec<String> = graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .filter_map(|op| match &op.kind {
-                OpKind::Call { target, .. } => Some(call_target_text(target)),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            !calls.iter().any(|call| call_names_owner_root_guard(call)),
-            "{source} still calls the guard: {calls:?}"
-        );
-        assert!(
-            !calls.iter().any(|call| {
-                call.ends_with("::take") || call.ends_with("::drop") || call.contains("DropGlue")
-            }),
-            "{source} still calls take/drop of the guard: {calls:?}"
-        );
-    }
+    common::with_shared_lowering(llbc, |context| {
+        for source in sources {
+            let fd = llbc
+                .iter_local_fns()
+                .find(|fd| {
+                    fd.item_meta.name_path().contains("pyframe")
+                        && fd
+                            .item_meta
+                            .source_text
+                            .as_deref()
+                            .is_some_and(|text| text.starts_with(source))
+                })
+                .unwrap_or_else(|| panic!("missing {source}"));
+            let graph = lower_fun_decl(&context, fd)
+                .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
+            let calls: Vec<String> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .filter_map(|op| match &op.kind {
+                    OpKind::Call { target, .. } => Some(call_target_text(target)),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !calls.iter().any(|call| call_names_owner_root_guard(call)),
+                "{source} still calls the guard: {calls:?}"
+            );
+            assert!(
+                !calls.iter().any(|call| {
+                    call.ends_with("::take")
+                        || call.ends_with("::drop")
+                        || call.contains("DropGlue")
+                }),
+                "{source} still calls take/drop of the guard: {calls:?}"
+            );
+        }
+    });
 }
 
 /// Graphs that pass a guard-containing pointer to a residual callee are

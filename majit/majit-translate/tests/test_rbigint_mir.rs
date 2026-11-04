@@ -8,18 +8,15 @@
 mod common;
 
 use common::{
-    INTERPRETER_LLBC, MODULE_LLBC, load_llbc, load_llbc_if_present, lower_named, rbigint_llbcs,
+    INTERPRETER_LLBC, MODULE_LLBC,
+    build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
+    build_semantic_program_from_llbcs_with_static_addrs_and_module_paths, load_llbc,
+    load_llbc_if_present, lower_named, rbigint_llbcs,
 };
 use majit_charon_reader::Llbc;
 use majit_translate::{
     HostStaticAddrs,
-    front::{
-        llbc_hints::harvest_hints_from_llbcs,
-        mir::{
-            build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
-            build_semantic_program_from_llbcs_with_static_addrs_and_module_paths,
-        },
-    },
+    front::llbc_hints::harvest_hints_from_llbcs,
     model::{CallTarget, OpKind, ValueType},
 };
 

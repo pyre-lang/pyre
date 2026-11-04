@@ -1154,7 +1154,7 @@ mod tests {
 
     #[test]
     fn lower_kind_of_canonical_exc_class_diverts_inclusive_range() {
-        use crate::front::mir::{
+        use crate::test_support::{
             build_semantic_program_from_llbcs_with_static_addrs_and_function_names, lower_function,
         };
         let path = concat!(
@@ -1668,7 +1668,7 @@ mod tests {
     /// latch (`FlowContext.mergeblock`).
     #[test]
     fn lower_range_for_loop_back_edge_defines_link_args() {
-        use crate::front::mir::lower_function;
+        use crate::test_support::lower_function;
         use majit_charon_reader::Llbc;
 
         let span = serde_json::json!({

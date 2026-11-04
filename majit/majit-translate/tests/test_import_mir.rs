@@ -3,11 +3,16 @@ mod common;
 use std::collections::HashSet;
 
 use common::{
-    INTERPRETER_LLBC, OBJECT_LLBC, RLIB_LLBC, load_llbc, lower_named, lower_named_with_static_addrs,
+    INTERPRETER_LLBC, OBJECT_LLBC, RLIB_LLBC,
+    build_semantic_program_from_llbcs_with_static_addrs_and_function_names, load_llbc, lower_named,
+    lower_named_with_static_addrs,
 };
 use majit_charon_reader::Llbc;
 use majit_translate::{
-    CallPath, ErrorCarrierSpec, FunctionGraph, HostStaticAddrs,
+    CallPath,
+    ErrorCarrierSpec,
+    FunctionGraph,
+    HostStaticAddrs,
     annotator::classdesc::register_struct_fields_with_layout,
     codewriter::{
         CodeWriter,
@@ -15,7 +20,7 @@ use majit_translate::{
         jtransform::{GraphTransformConfig, transform_graph},
     },
     flowspace::argument::Signature,
-    front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
+    // build_semantic_* on shared artefacts goes through common.
     model::{
         ArrayGcKind, CallTarget, ConcreteType, ExitSwitch, LinkArg, OpKind, ValueType, VecFieldPart,
     },
