@@ -2772,12 +2772,10 @@ pub(crate) fn eval_frame_plain_with_resume(
     }
 }
 
-/// Resume interpretation after compiled code guard failure.
-pub fn eval_loop_for_force(frame: &mut PyFrame) -> PyResult {
-    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
-    eval_loop(frame, ec, /* relink */ false)
-}
-
+/// The frame passed here is a `FrameBox` frame that a minor collection does
+/// not move. A JIT nursery frame is resumed through `eval_loop_jit`, which
+/// reloads it from the top shadow-stack root after a collecting call
+/// (`shadowstack.py` `ShadowStackFrameworkGCTransformer.pop_roots`).
 fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bool) -> PyResult {
     // Bump the monotonic frame eval-loop entry odometer: a user Python frame
     // is about to run bytecode.  The FBW FOR_ITER Option-C guard snapshots
