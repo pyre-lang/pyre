@@ -6229,7 +6229,14 @@ fn intern_class_key_from_registry(
         && let Some(rest) = strip_registry_crate_prefix(reg, lookup)
         && rest != lookup
     {
-        return intern_class_key_from_registry(reg, rest, false);
+        // Bookkeeper.getdesc keys on the class object. A crate prefix is
+        // dropped only when the remainder names a declaration this
+        // registry knows; an unknown spelling keeps its own identity.
+        if matches!(reg.class_identity.get(rest), Some(Some(_)))
+            || registry_declares_spelling(reg, rest)
+        {
+            return intern_class_key_from_registry(reg, rest, false);
+        }
     }
     lookup.to_string()
 }
@@ -8831,6 +8838,39 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn intern_unregistered_crate_prefixed_trait_keeps_full_spelling() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        bk.set_struct_fields(Rc::new(StructFieldRegistry::default()));
+        let spelling = "pyre_object::dictmultiobject::DictStrategy";
+        assert_eq!(bk.intern_class_key(spelling), spelling);
+    }
+
+    #[test]
+    fn intern_unregistered_crate_prefixed_trait_matches_family_base_key() {
+        use crate::front::StructFieldRegistry;
+        use indexmap::IndexMap;
+        let bk = bk();
+        bk.set_struct_fields(Rc::new(StructFieldRegistry::default()));
+        let spelling = "pyre_object::dictmultiobject::DictStrategy";
+        bk.register_trait_family(spelling, IndexMap::new(), vec![])
+            .unwrap();
+        let family = bk
+            .trait_family_bases
+            .borrow()
+            .get(spelling)
+            .cloned()
+            .expect("family base");
+        let interned = bk.intern_class_by_qualname(spelling);
+        assert_eq!(
+            interned,
+            family,
+            "CAST intern must hit the family host; intern_key={:?}",
+            bk.intern_class_key(spelling)
+        );
     }
 
     #[test]
