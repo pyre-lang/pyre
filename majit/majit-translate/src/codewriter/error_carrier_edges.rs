@@ -38,6 +38,7 @@ use crate::model::{
 pub fn lower_error_carrier_edges(
     graph: &mut FunctionGraph,
     carrier: &crate::OwnedErrorCarrierSpec,
+    class_belongs: &dyn Fn(&str) -> bool,
 ) {
     if carrier.carrier_path.is_empty() {
         return;
@@ -48,7 +49,7 @@ pub fn lower_error_carrier_edges(
     });
     lower_carrier_catches(graph, from_exc_object.as_deref());
     if let Some(to_exc_object) = carrier.to_exc_object.as_deref() {
-        lower_carrier_raises(graph, to_exc_object);
+        lower_carrier_raises(graph, to_exc_object, class_belongs);
         crate::front::result_exc::fuse_kind_ctor_raise(graph);
     }
 }
@@ -114,7 +115,11 @@ fn land_from_exc_object(
 }
 
 /// `raise e` → `raise to_exc_object(e)`.
-fn lower_carrier_raises(graph: &mut FunctionGraph, to_exc_object: &[String]) {
+fn lower_carrier_raises(
+    graph: &mut FunctionGraph,
+    to_exc_object: &[String],
+    class_belongs: &dyn Fn(&str) -> bool,
+) {
     let exceptblock = graph.exceptblock;
     for bi in 0..graph.blocks.len() {
         let block_id = graph.blocks[bi].id;
@@ -152,6 +157,16 @@ fn lower_carrier_raises(graph: &mut FunctionGraph, to_exc_object: &[String]) {
         }) else {
             continue;
         };
+        // A minted exception-class instance is already the runtime value.
+        // The class is the value's, not the constructor's.
+        // `to_exc_object` would wrap it in a second shell.
+        if crate::front::result_exc::raised_value_skips_exc_conversion(
+            graph,
+            &evalue,
+            class_belongs,
+        ) {
+            continue;
+        }
         // The raise below takes the type of the converted value instead.
         if !variable_used_outside(graph, bi, idx, &etype) {
             graph.blocks[bi].operations.remove(idx);
@@ -250,7 +265,7 @@ mod tests {
             )
             .unwrap();
         crate::front::exc_from_raise::set_raise_from_instance(&mut graph, entry, e.clone());
-        lower_error_carrier_edges(&mut graph, &carrier());
+        lower_error_carrier_edges(&mut graph, &carrier(), &|_| false);
 
         let block = &graph.blocks[entry.0];
         let names: Vec<_> = block
@@ -311,7 +326,7 @@ mod tests {
             Some(ExitSwitch::LastException),
             vec![Link::new_mixed(Vec::new(), normal, None), exc],
         );
-        lower_error_carrier_edges(&mut graph, &carrier());
+        lower_error_carrier_edges(&mut graph, &carrier(), &|_| false);
 
         let link = &graph.blocks[entry.0].exits[1];
         assert!(link.catches_all_exceptions());
@@ -362,7 +377,7 @@ mod tests {
             vec![Link::new_mixed(Vec::new(), normal, None), exc],
         );
         let nblocks = graph.blocks.len();
-        lower_error_carrier_edges(&mut graph, &carrier());
+        lower_error_carrier_edges(&mut graph, &carrier(), &|_| false);
 
         let link = &graph.blocks[entry.0].exits[1];
         assert!(link.catches_all_exceptions());
@@ -397,7 +412,7 @@ mod tests {
             )
             .unwrap();
         crate::front::exc_from_raise::set_raise_from_instance(&mut graph, entry, v_err);
-        lower_error_carrier_edges(&mut graph, &carrier());
+        lower_error_carrier_edges(&mut graph, &carrier(), &|_| false);
 
         let names: Vec<_> = graph.blocks[entry.0]
             .operations
@@ -456,7 +471,7 @@ mod tests {
             )
             .unwrap();
         crate::front::exc_from_raise::set_raise_from_instance(&mut graph, entry, v_cast);
-        lower_error_carrier_edges(&mut graph, &carrier());
+        lower_error_carrier_edges(&mut graph, &carrier(), &|_| false);
 
         let names: Vec<_> = graph.blocks[entry.0]
             .operations
@@ -495,7 +510,217 @@ mod tests {
             .unwrap();
         crate::front::exc_from_raise::set_raise_from_instance(&mut graph, entry, e);
         let before = format!("{graph:?}");
-        lower_error_carrier_edges(&mut graph, &crate::OwnedErrorCarrierSpec::default());
+        lower_error_carrier_edges(
+            &mut graph,
+            &crate::OwnedErrorCarrierSpec::default(),
+            &|_| false,
+        );
         assert_eq!(format!("{graph:?}"), before);
+    }
+
+    fn e_hints() -> Vec<crate::front::llbc_hints::ExceptionClassHint> {
+        vec![crate::front::llbc_hints::ExceptionClassHint {
+            enum_path: "synth::E".into(),
+            overrides: "C(B)".into(),
+            variants: vec!["A".into(), "B".into(), "C".into()],
+        }]
+    }
+
+    fn lower_with_e_hints(graph: &mut FunctionGraph) {
+        let hints = e_hints();
+        lower_error_carrier_edges(graph, &carrier(), &|name| {
+            crate::front::llbc_hints::exception_class_name_belongs(&hints, name)
+        });
+    }
+
+    fn call_leafs(graph: &FunctionGraph) -> Vec<String> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .filter_map(|op| call_segments(op).and_then(|segs| segs.last()).cloned())
+            .collect()
+    }
+
+    fn fresh_evalue(graph: &FunctionGraph) -> Variable {
+        let mut found = Vec::new();
+        for block in &graph.blocks {
+            for link in &block.exits {
+                if link.target != graph.exceptblock
+                    || link.last_exception.is_some()
+                    || link.last_exc_value.is_some()
+                {
+                    continue;
+                }
+                if let [LinkArg::Value(_), LinkArg::Value(evalue)] = link.args.as_slice() {
+                    found.push(evalue.clone());
+                }
+            }
+        }
+        assert_eq!(found.len(), 1, "{}", graph.dump());
+        found.pop().unwrap()
+    }
+
+    fn raise_variant(graph: &mut FunctionGraph, owner: &str, name: &str, class: &str) -> Variable {
+        let entry = graph.startblock;
+        let value = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec![owner.into()],
+                        name,
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(class.into())),
+                },
+                true,
+            )
+            .unwrap();
+        crate::front::exc_from_raise::set_raise_from_instance(graph, entry, value.clone());
+        value
+    }
+
+    /// A payload enum with no marker used to be skipped because its ctor
+    /// writes no `__discriminant`. Its class is not minted, so it converts.
+    #[test]
+    fn an_unmarked_payload_enum_ctor_still_converts() {
+        let mut graph = FunctionGraph::new("unmarked_enum");
+        let value = raise_variant(&mut graph, "synth::T", "Y", "synth::T::Y");
+        assert_eq!(
+            crate::front::result_exc::raised_value_class_name(&graph, &value).as_deref(),
+            Some("synth::T::Y")
+        );
+        lower_with_e_hints(&mut graph);
+        let leafs = call_leafs(&graph);
+        assert!(
+            leafs.iter().any(|leaf| leaf == "pyerror_to_exc_object"),
+            "unmarked enum must convert: {leafs:?}"
+        );
+    }
+
+    #[test]
+    fn a_marked_exception_ctor_skips_exc_conversion() {
+        let mut graph = FunctionGraph::new("marked_ctor");
+        let value = raise_variant(&mut graph, "synth::E", "B", "synth::E::B");
+        assert_eq!(
+            crate::front::result_exc::raised_value_class_name(&graph, &value).as_deref(),
+            Some("synth::E::B")
+        );
+        lower_with_e_hints(&mut graph);
+        assert_eq!(fresh_evalue(&graph), value);
+        assert!(
+            !call_leafs(&graph)
+                .iter()
+                .any(|leaf| leaf == "pyerror_to_exc_object"),
+            "{}",
+            graph.dump()
+        );
+    }
+
+    #[test]
+    fn a_marked_err_payload_field_read_skips_exc_conversion() {
+        let mut graph = FunctionGraph::new("marked_field");
+        let entry = graph.startblock;
+        let base = graph.alloc_value_var();
+        let value = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base,
+                    field: crate::model::FieldDescriptor::new(
+                        "__pos_0",
+                        Some("result::Result<u64,E>::Err".into()),
+                    ),
+                    ty: ValueType::Ref(Some("E".into())),
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        crate::front::exc_from_raise::set_raise_from_instance(&mut graph, entry, value.clone());
+        assert_eq!(
+            crate::front::result_exc::raised_value_class_name(&graph, &value).as_deref(),
+            Some("E")
+        );
+        lower_with_e_hints(&mut graph);
+        assert_eq!(fresh_evalue(&graph), value);
+        assert!(
+            !call_leafs(&graph)
+                .iter()
+                .any(|leaf| leaf == "pyerror_to_exc_object"),
+            "{}",
+            graph.dump()
+        );
+    }
+
+    #[test]
+    fn a_classless_block_input_converts_until_its_class_is_carried() {
+        let mut plain = FunctionGraph::new("phi_unstamped");
+        let entry = plain.startblock;
+        let made = plain
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["make_error"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (handler, inputs) = plain.create_block_with_arg_vars(1);
+        plain.set_goto(entry, handler, vec![made]);
+        let input = inputs[0].clone();
+        assert!(crate::front::result_exc::raised_value_class_name(&plain, &input).is_none());
+        crate::front::exc_from_raise::set_raise_from_instance(&mut plain, handler, input);
+        lower_with_e_hints(&mut plain);
+        assert!(
+            call_leafs(&plain)
+                .iter()
+                .any(|leaf| leaf == "pyerror_to_exc_object"),
+            "class-less input must convert\n{}",
+            plain.dump()
+        );
+
+        let mut stamped_graph = FunctionGraph::new("phi_stamped");
+        let entry = stamped_graph.startblock;
+        let made = stamped_graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["make_error"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (handler, inputs) = stamped_graph.create_block_with_arg_vars(1);
+        stamped_graph.set_goto(entry, handler, vec![made]);
+        let stamped = crate::front::result_exc::carry_raised_exception_class(
+            &mut stamped_graph,
+            handler,
+            inputs[0].clone(),
+            "E",
+        );
+        assert_eq!(
+            crate::front::result_exc::raised_value_class_name(&stamped_graph, &stamped).as_deref(),
+            Some("E")
+        );
+        crate::front::exc_from_raise::set_raise_from_instance(
+            &mut stamped_graph,
+            handler,
+            stamped.clone(),
+        );
+        lower_with_e_hints(&mut stamped_graph);
+        assert_eq!(fresh_evalue(&stamped_graph), stamped);
+        assert!(
+            !call_leafs(&stamped_graph)
+                .iter()
+                .any(|leaf| leaf == "pyerror_to_exc_object"),
+            "{}",
+            stamped_graph.dump()
+        );
     }
 }

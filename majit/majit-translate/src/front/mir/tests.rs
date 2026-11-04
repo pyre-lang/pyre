@@ -14721,6 +14721,7 @@ fn enum_metadata_keeps_named_empty_class_payload_and_drops_option_never() {
         &harvest_declared_gc_facts(&llbc).gc_struct_ids(),
         super::no_immutable_fields(),
         &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
+        &[],
     );
     let keys: Vec<_> = fields.fields.keys().collect();
     assert!(
@@ -27755,6 +27756,7 @@ pub(in crate::front::mir) fn some_ctor_shape() -> super::AggregateShape {
             narrow_root: None,
             window: false,
             raw_u8: false,
+            str_value: false,
         }],
     })
 }
@@ -27802,6 +27804,7 @@ pub(in crate::front::mir) fn ok_ctor_shape() -> super::AggregateShape {
             narrow_root: None,
             window: false,
             raw_u8: false,
+            str_value: false,
         }],
     })
 }
@@ -31318,3 +31321,6 @@ fn ascii_setitem_writes_items_block() {
         other => panic!("write base must be FieldRead block, got {other:?}"),
     }
 }
+
+#[path = "exception_class_use_tests.rs"]
+mod exception_class_use_tests;

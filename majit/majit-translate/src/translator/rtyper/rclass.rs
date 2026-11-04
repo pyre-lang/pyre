@@ -4665,6 +4665,92 @@ pub fn get_type_repr(rtyper: &RPythonTyper) -> Result<Arc<dyn Repr>, TyperError>
         })
 }
 
+/// `RPythonTyper._convert_link` for a class exitcase (`rtyper.py`):
+/// `link.llexitcase = get_type_repr(self).convert_const(exitcase)`.
+///
+/// The result is that class's `OBJECT_VTABLE` pointer
+/// (`ClassRepr.getvtable` / `cast_vtable_to_typeptr`). `ClassDef.repr`
+/// must already be set (`getclassrepr`) and `minid`/`maxid` must already
+/// be assigned (`assign_inheritance_ids`). This function does not assign
+/// ids: `fill_vtable_root` materialises the vtable, and a later
+/// `assign_inheritance_ids` must not renumber it.
+///
+/// Panics if the classdef is not ready, is not an exception class, or is
+/// a `HOST_ENV` builtin exception class. Builtin classes keep the pytype
+/// row (`ExitCase::Const`). A missing vtable is not stored as `None`.
+pub fn exception_class_llexitcase(classdef: &Rc<RefCell<ClassDef>>) -> ConstValue {
+    let (name, repr, minid, maxid, host, is_exception, is_builtin_host) = {
+        let cd = classdef.borrow();
+        let desc = cd.classdesc.borrow();
+        let host = desc.pyobj.clone();
+        let is_builtin_host = crate::flowspace::model::HOST_ENV
+            .lookup_exception_class(host.simple_name())
+            .is_some_and(|builtin| builtin == host);
+        (
+            cd.name.clone(),
+            cd.repr.clone(),
+            cd.minid,
+            cd.maxid,
+            host,
+            desc.is_exception_class(),
+            is_builtin_host,
+        )
+    };
+    if !is_exception {
+        panic!("exception_class_llexitcase: {name} is not an RPython exception class");
+    }
+    if is_builtin_host {
+        panic!(
+            "exception_class_llexitcase: {name} is a builtin host exception class; \
+             its llexitcase is the pytype row, not an RPython vtable"
+        );
+    }
+    let Some(repr) = repr else {
+        panic!(
+            "exception_class_llexitcase: ClassDef.repr is missing for {name} — \
+             call getclassrepr before with_llexitcase_from_exitcase"
+        );
+    };
+    if minid.is_none() || maxid.is_none() {
+        panic!(
+            "exception_class_llexitcase: inheritance ids are unset for {name} — \
+             call assign_inheritance_ids before with_llexitcase_from_exitcase"
+        );
+    }
+    Repr::setup(repr.as_ref() as &dyn Repr).unwrap_or_else(|err| {
+        panic!("exception_class_llexitcase: ClassRepr.setup failed for {name}: {err}")
+    });
+    let rtyper = repr.rtyper.upgrade().unwrap_or_else(|| {
+        panic!("exception_class_llexitcase: ClassRepr.rtyper expired for {name}")
+    });
+    let type_repr = get_type_repr(&rtyper).unwrap_or_else(|err| {
+        panic!("exception_class_llexitcase: get_type_repr failed for {name}: {err}")
+    });
+    let converted = type_repr
+        .convert_const(&ConstValue::HostObject(host))
+        .unwrap_or_else(|err| {
+            panic!(
+                "exception_class_llexitcase: get_type_repr().convert_const failed for {name}: {err}"
+            )
+        });
+    let ConstValue::LLPtr(ptr) = converted.value else {
+        panic!(
+            "exception_class_llexitcase: get_type_repr().convert_const for {name} \
+             did not yield an LLPtr vtable"
+        );
+    };
+    if !ptr.nonzero() {
+        panic!("exception_class_llexitcase: null vtable for {name}");
+    }
+    let to = LowLevelType::from(ptr._TYPE.TO.clone());
+    if to != *OBJECT_VTABLE {
+        panic!(
+            "exception_class_llexitcase: convert_const for {name} is not an OBJECT_VTABLE pointer"
+        );
+    }
+    ConstValue::LLPtr(ptr)
+}
+
 /// RPython `getclassrepr(rtyper, classdef)` (`rclass.py`).
 ///
 /// ```python

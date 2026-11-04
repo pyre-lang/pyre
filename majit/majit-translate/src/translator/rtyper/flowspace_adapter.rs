@@ -3067,6 +3067,9 @@ pub fn translate_op(
         | OpKind::ConstRefNull
         | OpKind::ConstNone
         | OpKind::ConstRefAddr(_) => Ok(Vec::new()),
+        // Class tokens are constants (`legacy_const_define_hlvalue`).
+        // Emitting them again would look up a result the define already owns.
+        OpKind::ConstRef(obj) if obj.is_class() => Ok(Vec::new()),
         // ─── Skipped: pyre JIT trace markers without a flowspace peer ───
         // `GuardTrue` / `GuardFalse` / `GuardValue` are JIT-side
         // assertions emitted by pyre's tracer — they constrain the
@@ -4290,7 +4293,15 @@ pub fn translate_op(
                                 }
                             })
                         };
-                        if in_variant_table {
+                        let exception_host = bk
+                            .exception_class_variant(&owner_qual, name)
+                            .or_else(|| {
+                                owner_tail.and_then(|tail| bk.exception_class_variant(tail, name))
+                            })
+                            .map(|classdef| classdef.borrow().classdesc.borrow().pyobj.clone());
+                        if let Some(host) = exception_host {
+                            host
+                        } else if in_variant_table {
                             // Keep `owner_qual`, generics included.  Interning
                             // under the bare registry key collapses every
                             // `Result<T, E>::Ok` onto one class and their
@@ -4881,6 +4892,12 @@ fn exitcase_to_hlvalue(
                 class,
             ))))
         }
+        // The class object, not the vtable. `flowin` on a canraise link
+        // calls `getuniqueclassdef` on this constant. No CLASSTYPE
+        // concretetype: same stamp as the carrier class constant.
+        Some(ExitCase::ExceptionClass(class)) => Some(Hlvalue::Constant(Constant::new(
+            ConstValue::HostObject(class.host_object()),
+        ))),
     })
 }
 
@@ -5175,6 +5192,25 @@ fn legacy_const_define_hlvalue(
             Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
                 ConstValue::HostObject(instance),
                 crate::translator::rtyper::rclass::OBJECTPTR.clone(),
+            ))))
+        }
+        OpKind::ConstRef(obj) if obj.is_class() => {
+            let registry = call_registry.unwrap_or_else(|| {
+                panic!(
+                    "class ConstRef `{}` requires a CallRegistry",
+                    obj.qualname()
+                )
+            });
+            let name = obj.qualname();
+            let host = registry
+                .bookkeeper()
+                .struct_root_classes
+                .borrow()
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| panic!("class ConstRef `{name}` is not an interned class"));
+            Ok(Some(Hlvalue::Constant(Constant::new(
+                ConstValue::HostObject(host),
             ))))
         }
         _ => Ok(None),
@@ -5482,6 +5518,27 @@ pub(crate) fn derive_subject_inputcells(
                     continue;
                 }
                 if let (Some(root), Some(bk)) = (class_root.as_ref(), bookkeeper) {
+                    // A marked enum parameter is the minted base class.
+                    // `getuniqueclassdef_for_struct_root` canonicalises the
+                    // leaf through `struct_origins` and would miss the
+                    // literal intern key.
+                    if let Some(classdef) =
+                        bk.exception_class_base(root.as_str()).or_else(|| match ty {
+                            crate::model::ValueType::Ref(Some(payload)) => {
+                                bk.exception_class_base(payload)
+                            }
+                            _ => None,
+                        })
+                    {
+                        cells.push(crate::annotator::model::SomeValue::Instance(
+                            crate::annotator::model::SomeInstance::new(
+                                Some(classdef),
+                                false,
+                                std::collections::BTreeMap::new(),
+                            ),
+                        ));
+                        continue;
+                    }
                     // A registered receiver-driven dispatch family (issue
                     // #346): a `dyn Trait` receiver whose bound-trait
                     // `class_root` names a family opted in through
@@ -6939,6 +6996,32 @@ mod tests {
     /// share state with an enclosing annotator.
     fn empty_call_registry() -> CallRegistry {
         CallRegistry::new(Rc::new(Bookkeeper::new()))
+    }
+
+    #[test]
+    fn exception_class_exitcase_maps_to_host_class_constant() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::{ConstValue, HOST_ENV, Hlvalue, HostObject};
+        use crate::model::{ExitCase, RPythonExceptionClass};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let base = HOST_ENV.lookup_builtin("Exception").expect("Exception");
+        let class = HostObject::new_class("synth.ExcBase", vec![base]);
+        let classdef = ann.bookkeeper.getuniqueclassdef(&class).expect("classdef");
+        let exitcase = ExitCase::ExceptionClass(RPythonExceptionClass::from_classdef(classdef));
+        let hl = exitcase_to_hlvalue(Some(&exitcase), &empty_call_registry())
+            .expect("adapter maps the class");
+        let Some(Hlvalue::Constant(constant)) = hl else {
+            panic!("exitcase must be a class constant, got {hl:?}");
+        };
+        assert!(
+            constant.concretetype.is_none(),
+            "class constant carries no CLASSTYPE concretetype"
+        );
+        let ConstValue::HostObject(mapped) = &constant.value else {
+            panic!("expected HostObject class, got {:?}", constant.value);
+        };
+        assert_eq!(mapped, &class);
     }
 
     fn call_registry_with_struct_field(owner: &str, field: &str, ty: &str) -> CallRegistry {
@@ -14849,5 +14932,220 @@ mod tests {
             &reg,
             "option::Option<fn() -> ()>"
         ));
+    }
+
+    fn synth_e_hint() -> crate::front::llbc_hints::ExceptionClassHint {
+        crate::front::llbc_hints::ExceptionClassHint {
+            enum_path: "synth::E".to_string(),
+            overrides: "C(B)".to_string(),
+            variants: ["A", "B", "C", "D"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        }
+    }
+
+    fn unwind_panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
+        match payload.downcast::<String>() {
+            Ok(text) => *text,
+            Err(payload) => match payload.downcast::<&str>() {
+                Ok(text) => (*text).to_string(),
+                Err(_) => panic!("panic payload was not a string"),
+            },
+        }
+    }
+
+    struct ClearStructOrigins;
+
+    impl Drop for ClearStructOrigins {
+        fn drop(&mut self) {
+            majit_ir::descr::register_struct_origins(HashMap::new());
+        }
+    }
+
+    #[test]
+    fn marked_exception_variant_ctor_instantiates_the_minted_class() {
+        let bk = Rc::new(Bookkeeper::new());
+        bk.mint_exception_class_hierarchies(&[synth_e_hint()]);
+        let registry = CallRegistry::new(Rc::clone(&bk));
+        for (name, tag, class_name) in [
+            ("A", 0i64, "EA"),
+            ("B", 1, "EB"),
+            ("C", 2, "EC"),
+            ("D", 3, "ED"),
+        ] {
+            let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+            let mut graph = LegacyGraph::new("marked_ctor");
+            let vars = mint_vars(&mut graph, 2);
+            value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+            let op = SpaceOperation {
+                result: Some(vars[1].clone()),
+                kind: OpKind::Call {
+                    target: crate::model::CallTarget::synthetic_transparent_enum_variant_ctor(
+                        vec!["synth::E".to_string()],
+                        name,
+                        tag,
+                    ),
+                    args: crate::model::call_args(Vec::new()),
+                    result_ty: ValueType::Ref(Some(format!("synth::E::{name}"))),
+                },
+            };
+            let translated =
+                translate_op(&op, &value_map, &registry).expect("marked ctor instantiates");
+            assert_eq!(translated.len(), 1, "{name}");
+            assert_eq!(translated[0].opname, "simple_call", "{name}");
+            let [
+                Hlvalue::Constant(Constant {
+                    value: ConstValue::HostObject(ref callable),
+                    ..
+                }),
+                Hlvalue::Constant(Constant {
+                    value: ConstValue::HostObject(ref class),
+                    ..
+                }),
+            ] = translated[0].args[..]
+            else {
+                panic!("{name}: expected simple_call(instantiate, class)");
+            };
+            assert_eq!(callable.qualname(), "rpython.rlib.objectmodel.instantiate");
+            assert!(class.is_class(), "{name}");
+            assert_eq!(class.qualname(), class_name);
+            let expected = bk
+                .exception_class_variant("synth::E", name)
+                .unwrap_or_else(|| panic!("{name} class"));
+            let pbc = bk
+                .immutablevalue(&ConstValue::HostObject(class.clone()))
+                .unwrap_or_else(|err| panic!("{name} class annotation: {err}"));
+            let kwds: HashMap<String, Option<SomeValue>> = HashMap::new();
+            let annotated =
+                crate::annotator::builtin::robjmodel_instantiate(&bk, &[Some(pbc)], &kwds)
+                    .unwrap_or_else(|err| panic!("{name} instantiate: {err}"));
+            let SomeValue::Instance(inst) = annotated else {
+                panic!("{name} instantiate is SomeInstance, got {annotated:?}");
+            };
+            let got = inst
+                .classdef
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} instance classdef"));
+            assert!(
+                Rc::ptr_eq(got, &expected),
+                "{name} instance is the minted variant class"
+            );
+        }
+    }
+
+    #[test]
+    fn class_constref_resolves_the_interned_exception_class() {
+        let bk = Rc::new(Bookkeeper::new());
+        bk.mint_exception_class_hierarchies(&[synth_e_hint()]);
+        let registry = CallRegistry::new(Rc::clone(&bk));
+        let interned = {
+            let classdef = bk.exception_class_variant("synth::E", "A").expect("EA");
+            let borrowed = classdef.borrow();
+            borrowed.classdesc.borrow().pyobj.clone()
+        };
+        let operand = HostObject::new_class("EA", Vec::new());
+        let op = SpaceOperation {
+            result: Some(Variable::new()),
+            kind: OpKind::ConstRef(operand.clone()),
+        };
+        let hl = super::legacy_const_define_hlvalue(&op, Some(&registry))
+            .expect("const define")
+            .expect("class ConstRef");
+        let Hlvalue::Constant(constant) = hl else {
+            panic!("class ConstRef is a constant, got {hl:?}");
+        };
+        let ConstValue::HostObject(host) = constant.value else {
+            panic!("expected host, got {:?}", constant.value);
+        };
+        assert_eq!(host, interned);
+        assert_ne!(host, operand);
+
+        let missing = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = super::legacy_const_define_hlvalue(&op, None);
+        }));
+        let message = unwind_panic_text(missing.expect_err("missing registry panics"));
+        assert!(
+            message.contains("class ConstRef `EA` requires a CallRegistry"),
+            "{message}"
+        );
+
+        let unknown = SpaceOperation {
+            result: Some(Variable::new()),
+            kind: OpKind::ConstRef(HostObject::new_class("NotMinted", Vec::new())),
+        };
+        let missing = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = super::legacy_const_define_hlvalue(&unknown, Some(&registry));
+        }));
+        let message = unwind_panic_text(missing.expect_err("unknown class panics"));
+        assert!(
+            message.contains("class ConstRef `NotMinted` is not an interned class"),
+            "{message}"
+        );
+
+        let instance = SpaceOperation {
+            result: Some(Variable::new()),
+            kind: OpKind::ConstRef(HostObject::new_instance(interned, Vec::new())),
+        };
+        let none = super::legacy_const_define_hlvalue(&instance, Some(&registry))
+            .expect("instance ConstRef");
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_marked_enum_as_the_base_class() {
+        let _origins = crate::test_support::register_struct_origins_serialized(HashMap::new());
+        let _clear = ClearStructOrigins;
+        let bk = Rc::new(Bookkeeper::new());
+        bk.mint_exception_class_hierarchies(&[synth_e_hint()]);
+        let mut origins = HashMap::new();
+        origins.insert("E".to_string(), "synth".to_string());
+        majit_ir::descr::register_struct_origins(origins);
+
+        let mut graph = LegacyGraph::new("take_e");
+        let entry = graph.startblock;
+        let cell = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "e".to_string(),
+                    ty: ValueType::Ref(Some("E".to_string())),
+                    class_root: Some("E".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, cell);
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("marked enum input seeds the base class");
+        let SomeValue::Instance(inst) = &cells[0] else {
+            panic!("input is SomeInstance, got {:?}", cells[0]);
+        };
+        let classdef = inst.classdef.as_ref().expect("base classdef");
+        let by_leaf = bk.exception_class_base("E").expect("origin leaf");
+        let by_path = bk.exception_class_base("synth::E").expect("stored path");
+        assert!(Rc::ptr_eq(classdef, &by_leaf));
+        assert!(Rc::ptr_eq(classdef, &by_path));
+    }
+
+    #[test]
+    fn translate_op_method_lowers_to_getattr_and_simple_call() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("call_classify");
+        let vars = mint_vars(&mut graph, 3);
+        value_map.insert(vars[0].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::method("classify", Some("E".to_string())),
+                args: crate::model::call_args(vec![vars[0].clone()]),
+                result_ty: ValueType::Unsigned,
+            },
+        };
+        let translated =
+            translate_op(&op, &value_map, &empty_call_registry()).expect("method call lowers");
+        let names: Vec<_> = translated.iter().map(|op| op.opname.as_str()).collect();
+        assert_eq!(names, ["getattr", "simple_call"]);
     }
 }

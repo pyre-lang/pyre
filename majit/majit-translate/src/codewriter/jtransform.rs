@@ -5187,6 +5187,29 @@ impl<'a> Transformer<'a> {
             OpKind::FieldWrite { field, value, .. } if is_rust_vec_header_len_write(field) => {
                 self.rewrite_rust_vec_header_len_write(op, value, graph)
             }
+            // `setfield` converts the operand to the field repr
+            // (`rtyper.py` `HighLevelOp.convertvar` →
+            // `pairtype(r_from, r_to).convert_from_to`). A `ValueType::Str`
+            // field (`Ptr(STR)`) written from a rust-heap `String`
+            // (`{cap, ptr, len}`) copies into `STR`. An operand that is
+            // already `Ptr(STR)` — a `Wtf8Buf` value — is that
+            // conversion's identity (`coerce_operand_to_rstr_str`), so
+            // this arm does not match and the write stays as it is.
+            // Not gated on `lower_virtualizable`.
+            OpKind::FieldWrite {
+                base,
+                field,
+                value,
+                ty,
+            } if *ty == ValueType::Str
+                && matches!(
+                    value,
+                    LinkArg::Value(operand)
+                        if crate::front::mir::interpolant_is_rust_heap_string(graph, operand)
+                ) =>
+            {
+                self.rewrite_rust_heap_string_setfield(graph, op, base, field, value)
+            }
             OpKind::FieldWrite {
                 field, value, ty, ..
             } if self.config.lower_virtualizable => {
@@ -7617,6 +7640,35 @@ impl<'a> Transformer<'a> {
         binop_name == "contains"
             && self.get_value_kind_var(lhs) == 'r'
             && self.get_value_kind_var(rhs) == 'r'
+    }
+
+    /// `setfield` of a `ValueType::Str` field from a rust-heap `String`.
+    /// The operand is still `{cap, ptr, len}`; the field is `Ptr(STR)`.
+    fn rewrite_rust_heap_string_setfield(
+        &mut self,
+        graph: &mut FunctionGraph,
+        op: &SpaceOperation,
+        base: &crate::flowspace::model::Variable,
+        field: &FieldDescriptor,
+        value: &LinkArg,
+    ) -> RewriteResult {
+        let LinkArg::Value(operand) = value else {
+            return RewriteResult::Keep;
+        };
+        let (coerced, mut ops) = self.coerce_operand_to_rstr_str(graph, operand);
+        if ops.is_empty() {
+            return RewriteResult::Keep;
+        }
+        ops.push(SpaceOperation {
+            result: op.result.clone(),
+            kind: OpKind::FieldWrite {
+                base: base.clone(),
+                field: field.clone(),
+                value: LinkArg::Value(coerced),
+                ty: ValueType::Str,
+            },
+        });
+        RewriteResult::Replace(ops)
     }
 
     /// Copy a rust-heap `String` (`{cap, ptr, len}`) into rstr `STR`

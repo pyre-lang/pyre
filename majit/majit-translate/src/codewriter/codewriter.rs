@@ -215,6 +215,18 @@ impl CodeWriter {
         } else {
             let _ = registry.bookkeeper().exception_carrier_class();
         }
+        // `_exception_class_<Enum>` (`argument.py` `class ArgErr(Exception)`).
+        // Mint after the carrier so the carrier's first base stays
+        // `Exception`, and before struct layouts. `getuniqueclassdef`
+        // wires `basedef` here. `assign_inheritance_ids` runs later, in
+        // `run_two_phase_prepass`'s inheritance-id barrier (after phase A,
+        // before phase B) and in `RPythonTyper::convert_helper_exception_links`
+        // after `finish_exceptiondata` and before `_convert_link`.
+        // `getclassrepr` (`rclass::getclassrepr`) is demand-driven and
+        // must follow those ids before `exception_class_llexitcase`.
+        registry
+            .bookkeeper()
+            .mint_exception_class_hierarchies(&callcontrol.exception_class_hints);
         // Before populate: a `raw:<owner>` stub result asks the bookkeeper
         // for `SomePtr` while the unsafe-fn stubs are registered.
         registry.set_struct_layouts(callcontrol.struct_layouts_handle());
@@ -687,10 +699,15 @@ impl CodeWriter {
         };
         // The error carrier's `raise e` / `except OperationError as e`
         // edges, annotated as such, move to the runtime exception value
-        // before jtransform reads them.
+        // before jtransform reads them. Hierarchies are minted when the
+        // registry is built, so the raise guard can ask whether the
+        // raised value's class is one of them.
+        let registry = self.dual_gate_registry(callcontrol);
+        let belongs_bk = registry.bookkeeper().clone();
         crate::codewriter::error_carrier_edges::lower_error_carrier_edges(
             &mut graph_owned,
             &callcontrol.error_carrier().clone(),
+            &|name| belongs_bk.exception_class_name_belongs(name),
         );
         crate::translator::rtyper::rpbc::lower_indirect_calls(&mut graph_owned, callcontrol);
         #[cfg(debug_assertions)]
@@ -700,7 +717,6 @@ impl CodeWriter {
         // Catches both the Match-arm and Skip-arm graphs; the
         // companion fold in `flowspace_adapter::
         // legacy_const_define_hlvalue` only reaches Match-arm graphs.
-        let registry = self.dual_gate_registry(callcontrol);
         crate::translator::rtyper::unit_variant_fold::fold_unit_variant_ctors(
             &mut graph_owned,
             Some(registry.bookkeeper()),
@@ -1828,5 +1844,46 @@ mod stamp_classdef_hints_tests {
         };
         let expected_path = crate::parse::CallPath::for_impl_method("PyFrame", "push_value");
         assert_eq!(target.resolved_path(), Some(&expected_path));
+    }
+}
+
+#[cfg(test)]
+mod exception_class_hierarchy_tests {
+    use super::CodeWriter;
+    use crate::front::llbc_hints::ExceptionClassHint;
+    use std::rc::Rc;
+
+    #[test]
+    fn dual_gate_registry_mints_declared_exception_hierarchy_once() {
+        let mut callcontrol = crate::call::CallControl::new();
+        callcontrol.exception_class_hints = vec![ExceptionClassHint {
+            enum_path: "E".to_string(),
+            overrides: "C(B)".to_string(),
+            variants: vec!["A".to_string(), "B".to_string(), "C".to_string()],
+        }];
+        callcontrol.set_error_carrier(crate::OwnedErrorCarrierSpec {
+            carrier_path: "error::PyErrorObject".to_string(),
+            ..Default::default()
+        });
+        let writer = CodeWriter::new();
+        let registry = writer.dual_gate_registry(&callcontrol);
+        let base = registry
+            .bookkeeper()
+            .exception_class_base("E")
+            .expect("minted base");
+        let child = registry
+            .bookkeeper()
+            .exception_class_variant("E", "C")
+            .expect("minted EC");
+        assert!(child.borrow().issubclass(&base));
+        let again = writer.dual_gate_registry(&callcontrol);
+        assert!(Rc::ptr_eq(registry.bookkeeper(), again.bookkeeper()));
+        assert!(Rc::ptr_eq(
+            &again
+                .bookkeeper()
+                .exception_class_base("E")
+                .expect("cached base"),
+            &base
+        ));
     }
 }

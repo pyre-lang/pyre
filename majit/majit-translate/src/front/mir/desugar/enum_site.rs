@@ -943,9 +943,41 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// `Result<_, E>` inside a function returning an exception sum is that
+    /// sum's `?`, not a value `Try::branch`. The enclosing return is local 0.
+    fn enclosing_sum_claims_error(&self, recv_ty: &TyRef) -> bool {
+        let Some(output) = self.body.locals.locals.first() else {
+            return false;
+        };
+        let Some(sum) = crate::front::result_exc::exception_sum_of_result(
+            &output.ty,
+            self.llbc,
+            self.static_addrs.error_carrier,
+        ) else {
+            return false;
+        };
+        let Some(err) = crate::front::result_exc::tyref_result_err(recv_ty, self.llbc) else {
+            return false;
+        };
+        crate::front::result_exc::exception_sum_claims_error(
+            &sum,
+            &tyref_to_ast_string(&err, self.llbc),
+            self.static_addrs.error_carrier.carrier_path,
+        )
+    }
+
+    fn result_try_excluded(&self, recv_ty: &TyRef) -> bool {
+        crate::front::result_exc::tyref_lowers_as_result_exc(
+            recv_ty,
+            self.llbc,
+            self.static_addrs.error_carrier,
+        ) || self.enclosing_sum_claims_error(recv_ty)
+    }
+
     /// Resolve `Try::branch(res)` where `res: Result<T, E>` and `E` is not the
     /// exception carrier.  Carrier Results stay on `result_exc`; a miss here
-    /// leaves the residual `branch` call.
+    /// leaves the residual `branch` call. An exception sum claims a marked
+    /// residual the same way: `From` is the identity and the instance is raised.
     pub(in crate::front::mir) fn recognize_result_try_site(
         &self,
         recv_ty: Option<&TyRef>,
@@ -953,11 +985,7 @@ impl<'a> Lowering<'a> {
     ) -> Option<ResultTrySite> {
         let recv_ty = self.peel_to_option_or_result(recv_ty?)?;
         if !crate::front::result_exc::tyref_is_result(&recv_ty, self.llbc)
-            || crate::front::result_exc::tyref_is_result_of_carrier(
-                &recv_ty,
-                self.llbc,
-                self.static_addrs.error_carrier,
-            )
+            || self.result_try_excluded(&recv_ty)
         {
             return None;
         }
@@ -996,11 +1024,7 @@ impl<'a> Lowering<'a> {
             return op_kind;
         };
         if !crate::front::result_exc::tyref_is_result(recv_ty, self.llbc)
-            || crate::front::result_exc::tyref_is_result_of_carrier(
-                recv_ty,
-                self.llbc,
-                self.static_addrs.error_carrier,
-            )
+            || self.result_try_excluded(recv_ty)
         {
             return op_kind;
         }

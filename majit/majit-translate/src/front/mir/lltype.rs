@@ -2148,6 +2148,17 @@ pub(in crate::front::mir) fn adt_def_is_raw_storage(
     let Some(td) = llbc.type_by_id(def_id) else {
         return false;
     };
+    // A marked exception-class enum is the minted class, not a raw word
+    // bag. `&E` must stay `Ref` so the parameter carries the class root.
+    // An unmarked enum keeps the raw-storage answer below.
+    if matches!(&td.kind, TypeDeclKind::Enum(_)) {
+        let path = td.item_meta.name_path();
+        let canon = strip_crate_prefix(&path);
+        if exception_class_hint_for_paths(llbc_exception_class_hints(llbc), &path, &canon).is_some()
+        {
+            return false;
+        }
+    }
     if struct_id_is_declared_gc(
         gc_struct_ids,
         struct_id_for_type_decl(td),
@@ -2828,6 +2839,11 @@ pub(in crate::front::mir) struct ValueTypeInputs {
 pub(in crate::front::mir) struct LlbcDerived {
     pub(in crate::front::mir) value_type_inputs: std::sync::OnceLock<ValueTypeInputs>,
     pub(in crate::front::mir) struct_decls_by_owner: std::sync::OnceLock<StructDeclsByOwner>,
+    /// `_exception_class_<Enum>` hints of this artefact. Paint reads them.
+    /// Registration receives the same harvest from the lowering entry.
+    /// A copied TypeDecl in a later crate does not see a marker that
+    /// lives only on the defining artefact.
+    exception_class_hints: std::sync::OnceLock<Vec<crate::front::llbc_hints::ExceptionClassHint>>,
 }
 
 pub(in crate::front::mir) fn llbc_derived(llbc: &Llbc) -> &LlbcDerived {
@@ -4077,7 +4093,62 @@ pub(in crate::front::mir) fn tyref_payload_enum_class_root_with(
     if !tyref_is_enum_free(ty, llbc) {
         return None;
     }
+    // A marked enum is an instance of the minted exception class. The
+    // literal leaf (`E`, `ArgErr`) is that class. The tagged ADT root
+    // stays the paint for every unmarked payload enum.
+    if let Some(leaf) = tyref_exception_class_leaf(ty, llbc) {
+        return Some(leaf);
+    }
     tyref_class_root_with(ty, llbc, tombstoned)
+}
+
+/// Harvested `_exception_class_<Enum>` hints of one artefact.
+pub(crate) fn llbc_exception_class_hints(
+    llbc: &Llbc,
+) -> &Vec<crate::front::llbc_hints::ExceptionClassHint> {
+    llbc_derived(llbc).exception_class_hints.get_or_init(|| {
+        crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(std::slice::from_ref(
+            llbc,
+        ))
+    })
+}
+
+/// The hint whose harvested identity names `name` or `canon_base`.
+///
+/// `name` is the TypeDecl path. `canon_base` is `strip_crate_prefix` of
+/// that path. Matching is [`exception_class_enum_path_matches`].
+pub(in crate::front::mir) fn exception_class_hint_for_paths<'a>(
+    hints: &'a [crate::front::llbc_hints::ExceptionClassHint],
+    name: &str,
+    canon_base: &str,
+) -> Option<&'a crate::front::llbc_hints::ExceptionClassHint> {
+    hints.iter().find(|hint| {
+        crate::front::llbc_hints::exception_class_enum_path_matches(&hint.enum_path, name)
+            || crate::front::llbc_hints::exception_class_enum_path_matches(
+                &hint.enum_path,
+                canon_base,
+            )
+    })
+}
+
+/// Literal base-class name of a marked exception-class enum, or `None`.
+///
+/// Fieldless enums stay the tag integer. The helper does not call
+/// [`tyref_payload_enum_class_root_with`].
+pub(in crate::front::mir) fn tyref_exception_class_leaf(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    if tyref_is_fieldless_enum_free(ty, llbc) || tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
+        return None;
+    }
+    if !tyref_is_enum_free(ty, llbc) {
+        return None;
+    }
+    let path = adt_path_of_tyref(ty, llbc)?;
+    let canon = strip_crate_prefix(&path);
+    let hint = exception_class_hint_for_paths(llbc_exception_class_hints(llbc), &path, &canon)?;
+    Some(crate::front::llbc_hints::exception_class_qualname(
+        &hint.enum_path,
+        None,
+    ))
 }
 
 /// Machine-scalar FUNC.RESULT spellings.  `"ref"` is not one: it collapses
@@ -4155,17 +4226,13 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
     // `RESULT == FUNC.RESULT` check).  `Result<(), PyError>` reaches the
     // unit arm the same way its callee reaches `widen_unit_return_to_void`.
     //
-    // Only a `PyError` carrier is lowered that way.  Any other `Result`
-    // stays a real ADT the callee returns whole and the caller matches on
+    // A carrier `Result` and an exception-sum `Result` are lowered that
+    // way (`tyref_lowers_as_result_exc`). Any other `Result` stays a real
+    // ADT the callee returns whole and the caller matches on
     // (`rbigint::_AsDouble -> Result<f64, RBigIntError>`), so projecting it
     // would name the payload's bank for a value that arrives as a
     // reference — the same disagreement in the other direction.
-    //
-    let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
-        crate::front::result_exc::tyref_result_ok(output, llbc)
-    } else {
-        None
-    };
+    let payload = crate::front::result_exc::result_exc_projected_ok(output, llbc, spec);
     let kind_src = payload.as_ref().unwrap_or(output);
     if is_unit_type(kind_src, llbc) {
         return Some("()".to_string());
@@ -4277,11 +4344,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
-        crate::front::result_exc::tyref_result_ok(output, llbc)
-    } else {
-        None
-    };
+    let payload = crate::front::result_exc::result_exc_projected_ok(output, llbc, spec);
     let ty = payload.as_ref().unwrap_or(output);
     if tyref_is_gcref_spelling(ty, llbc) {
         return None;
@@ -4329,11 +4392,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_can_be_none(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
-    let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
-        crate::front::result_exc::tyref_result_ok(output, llbc)
-    } else {
-        None
-    };
+    let payload = crate::front::result_exc::result_exc_projected_ok(output, llbc, spec);
     let ty = payload.as_ref().unwrap_or(output);
     registered_gc_ptr_class_root_with(
         ty,
@@ -4371,11 +4430,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_container_root(
     // reads. `encode_ascii` returns `Result<Vec<u8>, PyError>`; looking
     // at the Result ADT yields no Vec/slice spelling, so the stub was a
     // classdef-less `ref` that `List ∪ Instance` cannot merge.
-    let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
-        crate::front::result_exc::tyref_result_ok(output, llbc)
-    } else {
-        None
-    };
+    let payload = crate::front::result_exc::result_exc_projected_ok(output, llbc, spec);
     let ty = payload.as_ref().unwrap_or(output);
     // One-word-item `Vec` is `*mut Vec<…>` (`annotation_struct_field_type`);
     // `tyref_to_field_layout_string` writes `isize` and the stub would be
@@ -4428,11 +4483,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_is_str(
     llbc: &Llbc,
     spec: crate::ErrorCarrierSpec<'_>,
 ) -> bool {
-    let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
-        crate::front::result_exc::tyref_result_ok(output, llbc)
-    } else {
-        None
-    };
+    let payload = crate::front::result_exc::result_exc_projected_ok(output, llbc, spec);
     let ty = payload.as_ref().unwrap_or(output);
     tyref_is_string_value(ty, llbc)
         || tyref_raw_ptr_pointee_is_string_value(ty, llbc)
@@ -5166,6 +5217,84 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     Some(td)
 }
 
+/// By-value ADT after leaving `Ref` and `RawPtr` in place.
+///
+/// `Box<T>` and a thin box are addresses, not the pointee. [`strip_ty_wrappers`]
+/// peels `Ref`, so it is the wrong peel for this question.
+fn exception_class_by_value_adt<'a>(ty: &TyRef, llbc: &'a Llbc) -> Option<&'a TypeDecl> {
+    let node = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc))?;
+    let obj = node.as_object()?;
+    if obj.contains_key("Ref") || obj.contains_key("RawPtr") {
+        return None;
+    }
+    if type_node_is_thin_box(node, llbc) {
+        return None;
+    }
+    let id = adt_node_def_id(node)?;
+    let td = llbc.type_by_id(id)?;
+    if td.item_meta.name_path() == "alloc::boxed::Box" {
+        return None;
+    }
+    Some(td)
+}
+
+/// By-value `alloc::string::String`. A borrow or raw pointer is the
+/// address: [`exception_class_by_value_adt`] leaves `Ref` and `RawPtr`
+/// in place.
+pub(in crate::front::mir) fn tyref_is_by_value_alloc_string(ty: &TyRef, llbc: &Llbc) -> bool {
+    exception_class_by_value_adt(ty, llbc)
+        .is_some_and(|td| td.item_meta.name_path() == "alloc::string::String")
+}
+
+/// Whether a marked-enum variant field is one translated word.
+///
+/// A by-value `String` is one rstr word (`Ptr(STR)`). A `Vec` whose
+/// items are not one word, a by-value `VecDeque`, and a by-value
+/// raw-flavor or multi-word struct are not. A pointer or borrow of
+/// those types is the address. `Wtf8Buf`, a `Vec` of one-word items,
+/// scalars, and GC refs are.
+pub(in crate::front::mir) fn exception_class_attr_is_one_word(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> bool {
+    if tyref_is_by_value_alloc_string(ty, llbc) {
+        return true;
+    }
+    if tyref_is_string_value(ty, llbc) {
+        return true;
+    }
+    if super::views::tyref_rust_vec_item_kind(ty, llbc).is_some() {
+        return true;
+    }
+    if exception_class_by_value_adt(ty, llbc).is_some_and(|td| {
+        let path = td.item_meta.name_path();
+        path == "alloc::vec::Vec" || path == "alloc::collections::vec_deque::VecDeque"
+    }) {
+        return false;
+    }
+    let Some(td) = tyref_by_value_struct_decl(
+        ty,
+        llbc,
+        no_tombstoned_leaves(),
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) else {
+        return true;
+    };
+    let path = td.item_meta.name_path();
+    if crate::front::llbc_hints::alloc_flavor_raw_contains(raw_alloc_flavor_structs, &path) {
+        return false;
+    }
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let size = td
+        .layout_for_target(llbc, &target)
+        .and_then(|layout| layout.size);
+    let word = crate::layout::target_word_size() as u64;
+    matches!(size, Some(size) if size <= word)
+}
+
 /// `Struct` declarations of one artefact by owner spelling, for [`type_decl_by_owner_root`].
 pub(in crate::front::mir) struct StructDeclsByOwner {
     /// `(spelling, table position)` for each `Struct` decl's `name_path()` and its
@@ -5509,6 +5638,11 @@ pub(in crate::front::mir) fn tyref_input_class_root(
     }
     if let Some(ValueType::Ref(root)) = tyref_niche_option_payload_paint(ty, llbc, tombstoned) {
         return root;
+    }
+    // A marked enum parameter is the minted base class (`E`), not the
+    // tagged ADT identity. `derive_subject_inputcells` seeds that ClassDef.
+    if let Some(leaf) = tyref_exception_class_leaf(ty, llbc) {
+        return Some(leaf);
     }
     let leaf = tyref_class_root_with(ty, llbc, tombstoned);
     if leaf
@@ -6273,16 +6407,33 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
             } else {
                 return None;
             };
-            // A transparent GC handle wrapping `*mut registered` keeps
-            // the wrapper class (`transparent_deref_target_class` above,
-            // or `Ref(None)` plus the Input class_root). Peeling the
-            // inner pointer would intern the handle as the payload.
-            // STR-family dict-key wrappers (`celldict::StrKey` /
-            // `dictmultiobject::BytesKey`) are the inner STR pointer
-            // (`AbstractTypedStrategy.setitem` unwrap).
-            // `project_struct_field_type` already maps them to `s_str0()`
-            // (`is_str_family_class_root`); peel so construction is that
-            // SomeString, not `objectmodel.instantiate` + setattr `__pos_0`.
+            // The field's low-level value. A STR pointer (`*mut Utf8Str`,
+            // `*mut BytesBlock` — Charon erases the alias) is already
+            // `ValueType::Str`: `tyref_raw_ptr_pointee_is_string_value`
+            // runs before the GC-pointer arm of `tyref_to_value_type_with`.
+            // `registered_gc_ptr_class_root_with` answers for every raw
+            // pointer onto an ADT, which kept the wrapper as `SomeInstance`
+            // while `project_struct_field_type` and the str-family input
+            // seed record `SomeString`. The word is the STR (`ll_strhash`
+            // / `ll_streq`). Construction and `.0` are then the identity.
+            // A `*mut` object pointer (`IdentityKey`, `PyError`) types as
+            // `Ref`, so the GC-handle arm below still keeps the wrapper.
+            let inner = tyref_to_value_type_with(
+                &field.ty,
+                llbc,
+                tombstoned,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            );
+            if matches!(inner, ValueType::Str) {
+                return Some(inner);
+            }
+            // A STR-pointer field already returned above: the value is
+            // `ValueType::Str` from the field lltype, whatever the
+            // wrapper is named. A registered GC pointer that reaches
+            // this arm is a different word (`IdentityKey`, `PyError`).
+            // Peeling it would intern the handle as the payload, so the
+            // wrapper stays.
             if registered_gc_ptr_class_root_with(
                 &field.ty,
                 llbc,
@@ -6292,20 +6443,9 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
             )
             .is_some()
             {
-                // Same predicate `project_struct_field_type` uses. Do
-                // not run `class_identity_spelling`: that crate-peel
-                // turns `other::StrKey` into the family leaf `StrKey`.
-                if !is_str_family_class_root(&decl.item_meta.name_path()) {
-                    return None;
-                }
+                return None;
             }
-            Some(tyref_to_value_type_with(
-                &field.ty,
-                llbc,
-                tombstoned,
-                gc_struct_ids,
-                raw_alloc_flavor_structs,
-            ))
+            Some(inner)
         }
         _ => None,
     }
@@ -9840,9 +9980,7 @@ pub(in crate::front::mir) fn option_shared_ref_return_is_one_word(
 ) -> bool {
     let mut ty = ty;
     let owned;
-    if crate::front::result_exc::tyref_is_result_of_carrier(ty, llbc, spec)
-        && let Some(ok) = crate::front::result_exc::tyref_result_ok(ty, llbc)
-    {
+    if let Some(ok) = crate::front::result_exc::result_exc_projected_ok(ty, llbc, spec) {
         owned = ok;
         ty = &owned;
     }
@@ -9886,9 +10024,7 @@ pub(in crate::front::mir) fn option_raw_adt_ptr_return_is_one_word(
 ) -> bool {
     let mut ty = ty;
     let owned;
-    if crate::front::result_exc::tyref_is_result_of_carrier(ty, llbc, spec)
-        && let Some(ok) = crate::front::result_exc::tyref_result_ok(ty, llbc)
-    {
+    if let Some(ok) = crate::front::result_exc::result_exc_projected_ok(ty, llbc, spec) {
         owned = ok;
         ty = &owned;
     }

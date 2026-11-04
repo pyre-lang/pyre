@@ -26,7 +26,7 @@
 //!
 //! ## The two rules
 //!
-//! - **Callee rule** ([`lower_result_exc_returns`]): a scoped graph
+//! - **Callee rule** ([`lower_result_exc_returns_for_sum`]): a scoped graph
 //!   whose declared return is `Result<T, PyError>` stops building
 //!   `Ok`/`Err` shells.  `return Ok(v)` links `returnblock` with `v`;
 //!   `return Err(e)` closes the block towards `exceptblock` with
@@ -191,6 +191,286 @@ pub(crate) fn tyref_is_result_of_carrier(
         err_body = inner;
     }
     adt_path_of(err_body, llbc).is_some_and(|p| p == spec.carrier_path)
+}
+
+/// One payload of an exception sum: a marked exception-class enum, or the
+/// error carrier. Variant names are not part of the recognition.
+#[derive(Clone, Debug)]
+pub(crate) enum ExceptionSumPayload {
+    Marked {
+        enum_path: String,
+        base_class: String,
+        /// `(variant, qualname)` in declaration order.
+        classes: Vec<(String, String)>,
+    },
+    Carrier,
+}
+
+/// One variant of an exception sum, in declaration order.
+#[derive(Clone, Debug)]
+pub(crate) struct ExceptionSumVariant {
+    pub name: String,
+    pub discriminant: i64,
+    pub payload: ExceptionSumPayload,
+}
+
+/// `S` such that every variant is a single marked-enum or carrier payload,
+/// with at most one variant per payload type.
+///
+/// `identity` is the ctor owner (`class_identity_spelling`). `path` is the
+/// TypeDecl `name_path`, the text of an unsupported value use.
+#[derive(Clone, Debug)]
+pub(crate) struct ExceptionSum {
+    pub identity: String,
+    pub path: String,
+    pub variants: Vec<ExceptionSumVariant>,
+}
+
+/// `Result<T, S>` whose `S` is an exception sum, or `None`.
+///
+/// A carrier `Result` is not a sum. An empty enum is not a sum. A variant
+/// with any shape other than one bare marked-enum or carrier field rejects
+/// the whole enum (`SourceCompileError`, `io::Error`).
+pub(crate) fn exception_sum_of_result(
+    ty: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Option<ExceptionSum> {
+    if tyref_is_result_of_carrier(ty, llbc, spec) {
+        return None;
+    }
+    let err_slot = result_err_slot(ty, llbc)?;
+    let decl = bare_adt_decl(err_slot, llbc)?;
+    let majit_charon_reader::ullbc::TypeDeclKind::Enum(variants) = &decl.kind else {
+        return None;
+    };
+    if variants.is_empty() {
+        return None;
+    }
+    let hints = crate::front::mir::llbc_exception_class_hints(llbc);
+    let mut rows = Vec::with_capacity(variants.len());
+    let mut seen: Vec<String> = Vec::new();
+    for (index, variant) in variants.iter().enumerate() {
+        if variant.fields.len() != 1 {
+            return None;
+        }
+        let payload = sum_payload_of_ty(&variant.fields[0].ty, llbc, spec, hints)?;
+        let identity = payload_identity(&payload, spec.carrier_path);
+        if seen.iter().any(|have| have == &identity) {
+            return None;
+        }
+        seen.push(identity);
+        rows.push(ExceptionSumVariant {
+            name: variant.name.clone(),
+            discriminant: variant.discriminant_i64().unwrap_or(index as i64),
+            payload,
+        });
+    }
+    let path = decl.item_meta.name_path();
+    let identity = crate::front::mir::class_identity_spelling(
+        &path,
+        &crate::front::mir::tombstoned_leaves_of(llbc),
+    );
+    Some(ExceptionSum {
+        identity,
+        path,
+        variants: rows,
+    })
+}
+
+/// Carrier `Result` or an exception-sum `Result`. A carrier result does
+/// not scan the sum.
+pub(crate) fn tyref_lowers_as_result_exc(
+    ty: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> bool {
+    tyref_is_result_of_carrier(ty, llbc, spec) || exception_sum_of_result(ty, llbc, spec).is_some()
+}
+
+/// `Ok` payload when `ty` lowers as a result-exc `Result`.
+pub(crate) fn result_exc_projected_ok(
+    ty: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Option<TyRef> {
+    if tyref_lowers_as_result_exc(ty, llbc, spec) {
+        tyref_result_ok(ty, llbc)
+    } else {
+        None
+    }
+}
+
+/// Whether `query` names this sum, one of its marked payloads, or — when
+/// the sum has a carrier variant — the carrier. Leaf equality is only for
+/// this gate: a `?` residual spells the enum leaf (`S`, `E`).
+pub(crate) fn exception_sum_claims_error(
+    sum: &ExceptionSum,
+    query: &str,
+    carrier_path: &str,
+) -> bool {
+    if names_declared_type(&sum.identity, &sum.path, query) {
+        return true;
+    }
+    for variant in &sum.variants {
+        match &variant.payload {
+            ExceptionSumPayload::Marked {
+                enum_path,
+                base_class,
+                ..
+            } => {
+                if names_declared_type(enum_path, base_class, query) {
+                    return true;
+                }
+            }
+            ExceptionSumPayload::Carrier => {
+                if !carrier_path.is_empty()
+                    && names_declared_type(carrier_path, carrier_path, query)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn names_declared_type(identity: &str, path: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    if query == identity || query == path {
+        return true;
+    }
+    let leaf = type_leaf(query);
+    !leaf.is_empty() && (type_leaf(identity) == leaf || type_leaf(path) == leaf)
+}
+
+fn payload_identity(payload: &ExceptionSumPayload, carrier_path: &str) -> String {
+    match payload {
+        ExceptionSumPayload::Marked { enum_path, .. } => enum_path.clone(),
+        ExceptionSumPayload::Carrier => carrier_path.to_string(),
+    }
+}
+
+fn sum_payload_of_ty(
+    ty: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+    hints: &[crate::front::llbc_hints::ExceptionClassHint],
+) -> Option<ExceptionSumPayload> {
+    let slot = match ty {
+        TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
+        TyRef::Dedup { id } => llbc.dedup_body(*id)?,
+    };
+    let body = bare_json_type(slot, llbc)?;
+    let decl = bare_adt_decl(body, llbc)?;
+    if let Some(marked) = marked_enum_payload(decl, hints) {
+        return Some(marked);
+    }
+    field_json_is_carrier(body, llbc, spec).then_some(ExceptionSumPayload::Carrier)
+}
+
+fn marked_enum_payload(
+    decl: &majit_charon_reader::ullbc::TypeDecl,
+    hints: &[crate::front::llbc_hints::ExceptionClassHint],
+) -> Option<ExceptionSumPayload> {
+    let majit_charon_reader::ullbc::TypeDeclKind::Enum(variants) = &decl.kind else {
+        return None;
+    };
+    if variants.is_empty() || variants.iter().all(|variant| variant.fields.is_empty()) {
+        return None;
+    }
+    let path = decl.item_meta.name_path();
+    let canon = crate::front::mir::strip_crate_prefix(&path);
+    let hint = hints.iter().find(|hint| {
+        crate::front::llbc_hints::exception_class_enum_path_matches(&hint.enum_path, &path)
+            || crate::front::llbc_hints::exception_class_enum_path_matches(&hint.enum_path, &canon)
+    })?;
+    let classes = hint
+        .variants
+        .iter()
+        .map(|variant| {
+            (
+                variant.clone(),
+                crate::front::llbc_hints::exception_class_qualname(&hint.enum_path, Some(variant)),
+            )
+        })
+        .collect();
+    Some(ExceptionSumPayload::Marked {
+        enum_path: hint.enum_path.clone(),
+        base_class: crate::front::llbc_hints::exception_class_qualname(&hint.enum_path, None),
+        classes,
+    })
+}
+
+fn field_json_is_carrier(
+    body: &serde_json::Value,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> bool {
+    if spec.carrier_path.is_empty() {
+        return false;
+    }
+    let Some(mut err_body) = bare_json_type(body, llbc) else {
+        return false;
+    };
+    for _ in 0..spec.carrier_wrappers.len() {
+        let Some(path) = adt_path_of(err_body, llbc) else {
+            break;
+        };
+        if !spec.carrier_wrappers.contains(&path.as_str()) {
+            break;
+        }
+        let Some(inner) = err_body
+            .get("Adt")
+            .and_then(|adt| adt.as_object())
+            .and_then(|adt| crate::front::mir::type_decl_ref_generics(adt, llbc))
+            .and_then(|generics| generics.get("types"))
+            .and_then(|types| types.get(0))
+            .and_then(|slot| ty_json_body(slot, llbc))
+        else {
+            return false;
+        };
+        let Some(inner) = bare_json_type(inner, llbc) else {
+            return false;
+        };
+        err_body = inner;
+    }
+    adt_path_of(err_body, llbc).is_some_and(|path| path == spec.carrier_path)
+}
+
+fn bare_adt_decl<'a>(
+    slot: &'a serde_json::Value,
+    llbc: &'a Llbc,
+) -> Option<&'a majit_charon_reader::ullbc::TypeDecl> {
+    let body = bare_json_type(slot, llbc)?;
+    let id = crate::front::mir::type_decl_ref_adt_id(body.get("Adt")?.as_object()?)?;
+    llbc.type_by_id(id)
+}
+
+/// Peel `Deduplicated` / `Value` wrappers. A `Ref` or `RawPtr` is not a
+/// bare payload and rejects the sum.
+fn bare_json_type<'a>(
+    slot: &'a serde_json::Value,
+    llbc: &'a Llbc,
+) -> Option<&'a serde_json::Value> {
+    let mut body = ty_json_body(slot, llbc)?;
+    for _ in 0..24 {
+        if body.get("Ref").is_some() || body.get("RawPtr").is_some() {
+            return None;
+        }
+        if let Some(id) = body.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            body = llbc.dedup_body(id)?;
+            continue;
+        }
+        if let Some(arr) = body.get("Value").and_then(serde_json::Value::as_array) {
+            body = arr.get(1)?;
+            continue;
+        }
+        return Some(body);
+    }
+    None
 }
 
 /// True when `ty` is `core::option::Option<T>` — the return type of an
@@ -529,7 +809,7 @@ mod result_ctor_kind_tests {
 }
 
 /// `return Ok` / `return Err` that already forwards to `returnblock`.
-/// [`lower_result_exc_returns`] owns those.
+/// [`lower_result_exc_returns_for_sum`] owns those.
 fn leave_result_ctor_for_callee_rule(
     graph: &FunctionGraph,
     block: usize,
@@ -581,8 +861,945 @@ fn raise_merged_err_ctor(
     for close in closes {
         graph.push_op_var(block_id, close, true);
     }
+    // The merged-continue payload's class is not known at this site.
+    // A marked instance converts unless its own ops already name the class.
     crate::front::exc_from_raise::set_raise_from_instance(graph, block_id, payload);
     Ok(())
+}
+
+/// One scoped `Result` call captured for the caller rule.
+///
+/// `sum` is set when the call's destination is an exception sum. A carrier
+/// `Result` keeps `sum` empty and follows the existing rewrap path.
+#[derive(Clone)]
+pub(crate) struct ResultExcCall {
+    pub result: Variable,
+    pub suffix: Option<String>,
+    pub payload_ty: ValueType,
+    pub sum: Option<ExceptionSum>,
+}
+
+impl ResultExcCall {
+    pub(crate) fn new(result: Variable, suffix: Option<String>, payload_ty: ValueType) -> Self {
+        Self {
+            result,
+            suffix,
+            payload_ty,
+            sum: None,
+        }
+    }
+}
+
+pub(crate) trait ResultExcCalls {
+    fn calls(&self) -> Vec<ResultExcCall>;
+}
+
+impl<const N: usize> ResultExcCalls for [(Variable, Option<String>, ValueType); N] {
+    fn calls(&self) -> Vec<ResultExcCall> {
+        self.iter()
+            .map(|(result, suffix, payload_ty)| {
+                ResultExcCall::new(result.clone(), suffix.clone(), payload_ty.clone())
+            })
+            .collect()
+    }
+}
+
+impl ResultExcCalls for [(Variable, Option<String>, ValueType)] {
+    fn calls(&self) -> Vec<ResultExcCall> {
+        self.iter()
+            .map(|(result, suffix, payload_ty)| {
+                ResultExcCall::new(result.clone(), suffix.clone(), payload_ty.clone())
+            })
+            .collect()
+    }
+}
+
+impl ResultExcCalls for Vec<(Variable, Option<String>, ValueType)> {
+    fn calls(&self) -> Vec<ResultExcCall> {
+        self.as_slice().calls()
+    }
+}
+
+impl ResultExcCalls for [ResultExcCall] {
+    fn calls(&self) -> Vec<ResultExcCall> {
+        self.to_vec()
+    }
+}
+
+impl ResultExcCalls for Vec<ResultExcCall> {
+    fn calls(&self) -> Vec<ResultExcCall> {
+        self.clone()
+    }
+}
+
+fn sum_used_as_value(sum: &ExceptionSum) -> String {
+    format!("exception sum {} used as a value", sum.path)
+}
+
+fn call_sum<'a>(calls: &'a [ResultExcCall], result: &Variable) -> Option<&'a ExceptionSum> {
+    calls
+        .iter()
+        .find(|call| &call.result == result)
+        .and_then(|call| call.sum.as_ref())
+}
+
+/// `Method` or `FunctionPath` whose leaf is `from_residual`.
+///
+/// [`is_from_residual_call`] stays method-only: a carrier `FunctionPath`
+/// `from_residual` is already captured and must not start being deferred.
+pub(crate) fn call_is_from_residual(kind: &OpKind) -> bool {
+    match kind {
+        OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            ..
+        } => name == "from_residual",
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => segments.last().map(String::as_str) == Some("from_residual"),
+        _ => false,
+    }
+}
+
+fn ctor_owner_is_sum(owner_path: &[String], sum: &ExceptionSum) -> bool {
+    let joined = owner_path.join("::");
+    let base = joined.split('<').next().unwrap_or(joined.as_str());
+    if base == sum.identity || base == sum.path {
+        return true;
+    }
+    let stripped = crate::front::mir::strip_crate_prefix(base);
+    stripped == sum.identity || stripped == sum.path
+}
+
+fn sum_variant_of_ctor<'a>(
+    target: &CallTarget,
+    sum: &'a ExceptionSum,
+) -> Option<&'a ExceptionSumVariant> {
+    let CallTarget::SyntheticTransparentCtor {
+        name,
+        owner_path,
+        is_struct,
+        ..
+    } = target
+    else {
+        return None;
+    };
+    if *is_struct || !ctor_owner_is_sum(owner_path, sum) {
+        return None;
+    }
+    sum.variants.iter().find(|variant| variant.name == *name)
+}
+
+struct SumCtorLoc {
+    block: usize,
+    indices: Vec<usize>,
+    inner: Variable,
+    /// Base class when the variant payload is a marked exception enum.
+    /// `None` for the carrier variant.
+    class_name: Option<String>,
+}
+
+fn marked_base_class(variant: &ExceptionSumVariant) -> Option<String> {
+    match &variant.payload {
+        ExceptionSumPayload::Marked { base_class, .. } => Some(base_class.clone()),
+        ExceptionSumPayload::Carrier => None,
+    }
+}
+
+fn locate_sum_ctor(
+    graph: &FunctionGraph,
+    var: &Variable,
+    sum: &ExceptionSum,
+) -> Option<SumCtorLoc> {
+    let OpKind::Call { target, .. } = producing_op(graph, var)? else {
+        return None;
+    };
+    let variant = sum_variant_of_ctor(target, sum)?;
+    let class_name = marked_base_class(variant);
+    let block = producer_block_index(graph, var)?;
+    let ctor_idx = graph.blocks[block]
+        .operations
+        .iter()
+        .position(|op| op.result.as_ref() == Some(var))?;
+    let mut indices = vec![ctor_idx];
+    let mut inner = None;
+    for (index, op) in graph.blocks[block]
+        .operations
+        .iter()
+        .enumerate()
+        .skip(ctor_idx + 1)
+    {
+        let OpKind::FieldWrite {
+            base, field, value, ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if base != var {
+            continue;
+        }
+        if field.name == "__pos_0" {
+            inner = value.as_variable().cloned();
+            indices.push(index);
+        } else if field.name == "__discriminant" {
+            indices.push(index);
+        }
+    }
+    Some(SumCtorLoc {
+        block,
+        indices,
+        inner: inner?,
+        class_name,
+    })
+}
+
+fn field_write_value(graph: &FunctionGraph, base: &Variable, field: &str) -> Option<Variable> {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let OpKind::FieldWrite {
+                base: written,
+                field: desc,
+                value,
+                ..
+            } = &op.kind
+                && written == base
+                && desc.name == field
+            {
+                return value.as_variable().cloned();
+            }
+        }
+    }
+    None
+}
+
+fn peel_sum_ctor_from(
+    graph: &FunctionGraph,
+    start: &Variable,
+    sum: &ExceptionSum,
+) -> Option<SumCtorLoc> {
+    let mut current = start.clone();
+    let mut seen = Vec::new();
+    for _ in 0..32 {
+        if seen.iter().any(|var| var == &current) {
+            return None;
+        }
+        seen.push(current.clone());
+        if let Some(loc) = locate_sum_ctor(graph, &current, sum) {
+            return Some(loc);
+        }
+        let kind = producing_op(graph, &current)?;
+        match kind {
+            OpKind::FieldRead { base, field, .. } if field.name == "__pos_0" => {
+                if let Some(written) = field_write_value(graph, base, "__pos_0") {
+                    current = written;
+                } else {
+                    current = base.clone();
+                }
+            }
+            OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                current = operand.clone();
+            }
+            OpKind::Call { target, args, .. } if matches!(target, CallTarget::Method { name, .. } if name == "branch") =>
+            {
+                current = args.first()?.as_variable()?.clone();
+            }
+            OpKind::Call { target, .. } if result_ctor_kind(target) == Some(true) => {
+                current = field_write_value(graph, &current, "__pos_0")?;
+            }
+            OpKind::Call { args, .. } if is_recast_narrow(kind) => {
+                current = args.first()?.as_variable()?.clone();
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn delete_sum_ctor(graph: &mut FunctionGraph, loc: &SumCtorLoc) {
+    delete_ops(graph, loc.block, loc.indices.clone());
+}
+
+fn sum_ctor_only_returned_err(graph: &FunctionGraph, shell: &Variable) -> bool {
+    let mut err_ctor = None;
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if !op_operand_vars(&op.kind).iter().any(|var| var == shell) {
+                continue;
+            }
+            match &op.kind {
+                OpKind::FieldWrite { base, .. } if base == shell => {}
+                OpKind::FieldWrite {
+                    field, value, base, ..
+                } if field.name == "__pos_0" && value.as_variable() == Some(shell) => {
+                    let Some(OpKind::Call { target, .. }) = producing_op(graph, base) else {
+                        return false;
+                    };
+                    if result_ctor_kind(target) != Some(true) {
+                        return false;
+                    }
+                    if err_ctor.is_some() {
+                        return false;
+                    }
+                    err_ctor = Some(base.clone());
+                }
+                _ => return false,
+            }
+        }
+        for link in &block.exits {
+            if link.args.iter().any(|arg| arg.as_variable() == Some(shell)) {
+                return false;
+            }
+        }
+    }
+    let Some(err) = err_ctor else {
+        return false;
+    };
+    let Some(block) = producer_block_index(graph, &err) else {
+        return false;
+    };
+    shell_reaches_returnblock(graph, block, &err)
+}
+
+fn reject_reachable_sum_ctors(
+    graph: &FunctionGraph,
+    sum: &ExceptionSum,
+    exempt_returned_err: bool,
+) -> Result<(), String> {
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        if !block_reachable_from_start(graph, bi) {
+            continue;
+        }
+        for op in &block.operations {
+            let OpKind::Call { target, .. } = &op.kind else {
+                continue;
+            };
+            if sum_variant_of_ctor(target, sum).is_none() {
+                continue;
+            }
+            let Some(var) = op.result.as_ref() else {
+                return Err(sum_used_as_value(sum));
+            };
+            if exempt_returned_err && sum_ctor_only_returned_err(graph, var) {
+                continue;
+            }
+            return Err(sum_used_as_value(sum));
+        }
+    }
+    Ok(())
+}
+
+fn disc_switch_base(graph: &FunctionGraph, block: usize) -> Option<Variable> {
+    let ExitSwitch::Value(disc) = graph.blocks[block].exitswitch.clone()? else {
+        return None;
+    };
+    let OpKind::FieldRead { base, field, .. } = producing_op(graph, &disc)? else {
+        return None;
+    };
+    (field.name == "__discriminant").then(|| base.clone())
+}
+
+/// `var` is `base`, or an identity of it (`same_as`, `cast_pointer`,
+/// `__cast_instance_intrinsic`). A non-carrier `Result` payload read is
+/// `__pos_0` of that cast, not of the forwarded shell
+/// (`enum_payload_class` in `resolve_place`).
+fn value_aliases(graph: &FunctionGraph, mut var: Variable, base: &Variable) -> bool {
+    for _ in 0..8 {
+        if &var == base {
+            return true;
+        }
+        let Some(kind) = producing_op(graph, &var) else {
+            return false;
+        };
+        let next = if let OpKind::UnaryOp { op, operand, .. } = kind
+            && (op == "same_as" || op == "cast_pointer")
+        {
+            Some(operand.clone())
+        } else if (crate::model::cast_instance_root(kind).is_some()
+            || crate::model::cast_pointer_root(kind).is_some())
+            && let OpKind::Call { args, .. } = kind
+        {
+            args.first().and_then(LinkArg::as_variable).cloned()
+        } else {
+            None
+        };
+        let Some(next) = next else {
+            return false;
+        };
+        var = next;
+    }
+    false
+}
+
+fn switched_on(graph: &FunctionGraph, block: usize, expected: &Variable) -> bool {
+    disc_switch_base(graph, block).is_some_and(|base| value_aliases(graph, base, expected))
+}
+
+fn pos0_read_var(graph: &FunctionGraph, block: usize, base: &Variable) -> Option<Variable> {
+    graph.blocks[block]
+        .operations
+        .iter()
+        .find_map(|op| match &op.kind {
+            OpKind::FieldRead {
+                base: read_base,
+                field,
+                ..
+            } if field.name == "__pos_0" && value_aliases(graph, read_base.clone(), base) => {
+                op.result.clone()
+            }
+            _ => None,
+        })
+}
+
+fn isinstance_split(graph: &FunctionGraph, block: usize) -> Option<(String, usize, usize)> {
+    let class_name = graph.blocks[block].operations.iter().find_map(|op| {
+        let OpKind::IsInstance { class_carrier, .. } = &op.kind else {
+            return None;
+        };
+        let OpKind::ConstRef(obj) = producing_op(graph, class_carrier)? else {
+            return None;
+        };
+        Some(obj.simple_name().to_string())
+    })?;
+    let mut true_target = None;
+    let mut false_target = None;
+    for link in &graph.blocks[block].exits {
+        match &link.exitcase {
+            Some(ExitCase::Bool(true)) => true_target = Some(link.target.0),
+            Some(ExitCase::Bool(false)) => false_target = Some(link.target.0),
+            _ => return None,
+        }
+    }
+    Some((class_name, true_target?, false_target?))
+}
+
+fn skip_pure_forwards(graph: &FunctionGraph, mut block: usize) -> usize {
+    for _ in 0..8 {
+        if isinstance_split(graph, block).is_some() {
+            return block;
+        }
+        let body = &graph.blocks[block];
+        let pure = body.operations.iter().all(|op| match &op.kind {
+            OpKind::FieldRead { .. } => true,
+            OpKind::UnaryOp { op, .. } => op == "same_as",
+            _ => false,
+        });
+        if pure && body.exits.len() == 1 && body.exitswitch.is_none() {
+            block = body.exits[0].target.0;
+            continue;
+        }
+        return block;
+    }
+    block
+}
+
+fn marked_class_known(payload: &ExceptionSumPayload, class_name: &str) -> bool {
+    let ExceptionSumPayload::Marked {
+        base_class,
+        classes,
+        ..
+    } = payload
+    else {
+        return false;
+    };
+    class_name == base_class || classes.iter().any(|(_, qualname)| qualname == class_name)
+}
+
+fn cascade_class_handlers(
+    graph: &FunctionGraph,
+    start: usize,
+    payload: &ExceptionSumPayload,
+) -> Result<Vec<(String, usize)>, String> {
+    let ExceptionSumPayload::Marked { base_class, .. } = payload else {
+        return Err("exception sum carrier arm has no class cascade".to_string());
+    };
+    let mut block = skip_pure_forwards(graph, start);
+    let mut handlers = Vec::new();
+    for _ in 0..8 {
+        if let Some((name, true_target, false_target)) = isinstance_split(graph, block) {
+            if !marked_class_known(payload, &name) {
+                return Err(format!(
+                    "isinstance class {name} is not a variant of the exception sum"
+                ));
+            }
+            handlers.push((name, true_target));
+            block = skip_pure_forwards(graph, false_target);
+            continue;
+        }
+        handlers.push((base_class.clone(), block));
+        return Ok(handlers);
+    }
+    Err("exception class cascade did not end".to_string())
+}
+
+fn result_err_reaches_return(graph: &FunctionGraph, block: usize) -> bool {
+    graph.blocks[block].operations.iter().any(|op| {
+        let OpKind::Call { target, .. } = &op.kind else {
+            return false;
+        };
+        if result_ctor_kind(target) != Some(true) {
+            return false;
+        }
+        let Some(var) = op.result.as_ref() else {
+            return false;
+        };
+        shell_reaches_returnblock(graph, block, var)
+    })
+}
+
+fn block_calls_into(graph: &FunctionGraph, block: usize) -> bool {
+    graph.blocks[block]
+        .operations
+        .iter()
+        .any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == "into",
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("into"),
+            _ => false,
+        })
+}
+
+fn carrier_arm_reraises(graph: &FunctionGraph, start: usize) -> bool {
+    let mut block = start;
+    for _ in 0..6 {
+        if result_err_reaches_return(graph, block) || block_calls_into(graph, block) {
+            return true;
+        }
+        let body = &graph.blocks[block];
+        if body.exits.len() == 1 && body.exitswitch.is_none() {
+            block = body.exits[0].target.0;
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
+struct SumHandlerPlan {
+    class_name: Option<String>,
+    reraise: bool,
+    target: crate::model::BlockId,
+    /// `None` is the caught instance, substituted with `last_exc_value`.
+    args: Vec<Option<LinkArg>>,
+}
+
+struct SumMatchPlan {
+    ok_target: crate::model::BlockId,
+    ok_pos: Option<usize>,
+    ok_args: Vec<LinkArg>,
+    handlers: Vec<SumHandlerPlan>,
+}
+
+fn plan_handler_args(
+    graph: &FunctionGraph,
+    handler: usize,
+    call_block: usize,
+) -> Result<Vec<Option<LinkArg>>, String> {
+    let mut args = Vec::new();
+    let mut missed = 0usize;
+    for input in &graph.blocks[handler].inputargs {
+        match back_sub_arg_to(graph, handler, LinkArg::Value(input.clone()), call_block) {
+            Some(arg) => args.push(Some(arg)),
+            None => {
+                missed += 1;
+                args.push(None);
+            }
+        }
+    }
+    if missed != 1 {
+        return Err(format!(
+            "handler block {handler} binds {missed} caught values, expected 1"
+        ));
+    }
+    Ok(args)
+}
+
+fn map_sum_switch_arms(
+    graph: &FunctionGraph,
+    block: usize,
+    sum: &ExceptionSum,
+) -> Result<Vec<(usize, Link)>, String> {
+    let exits = &graph.blocks[block].exits;
+    let explicit: Vec<i64> = exits
+        .iter()
+        .filter_map(|link| match &link.exitcase {
+            Some(ExitCase::Const(ConstValue::Int(disc))) => Some(*disc),
+            _ => None,
+        })
+        .collect();
+    let missing: Vec<usize> = sum
+        .variants
+        .iter()
+        .enumerate()
+        .filter(|(_, variant)| !explicit.contains(&variant.discriminant))
+        .map(|(index, _)| index)
+        .collect();
+    let mut arms = Vec::new();
+    for link in exits {
+        let index = match &link.exitcase {
+            Some(ExitCase::Const(ConstValue::Int(disc))) => sum
+                .variants
+                .iter()
+                .position(|variant| variant.discriminant == *disc)
+                .ok_or_else(|| {
+                    format!("exception sum switch discriminant {disc} has no variant")
+                })?,
+            Some(ExitCase::Const(ConstValue::UniStr(label))) if label == "default" => {
+                if missing.len() != 1 {
+                    return Err(format!(
+                        "exception sum switch default covers {} variants",
+                        missing.len()
+                    ));
+                }
+                missing[0]
+            }
+            other => {
+                return Err(format!("exception sum switch exit {other:?}"));
+            }
+        };
+        arms.push((index, link.clone()));
+    }
+    Ok(arms)
+}
+
+fn plan_exception_sum_match(
+    graph: &FunctionGraph,
+    call_block: usize,
+    result: &Variable,
+    sum: &ExceptionSum,
+    name: &str,
+) -> Result<Option<SumMatchPlan>, String> {
+    let (switch_block, shell) = match follow_single_exit(graph, call_block, result) {
+        Ok(pair) => pair,
+        Err(_) => return Ok(None),
+    };
+    if disc_switch_base(graph, switch_block).as_ref() != Some(&shell) {
+        return Ok(None);
+    }
+    let (ok_link, err_link) = split_diamond_exits(&graph.blocks[switch_block].exits, name)?;
+    let err_shell = forward_alias(graph, &shell, &err_link)
+        .ok_or_else(|| format!("{name}: exception sum Err arm does not receive the Result"))?;
+    let err_block = err_link.target.0;
+    let payload_read = pos0_read_var(graph, err_block, &err_shell)
+        .ok_or_else(|| format!("{name}: exception sum Err arm lacks the __pos_0 read"))?;
+    let sum_block = if switched_on(graph, err_block, &payload_read) {
+        err_block
+    } else {
+        let (next, bound) = follow_single_exit(graph, err_block, &payload_read).map_err(|err| {
+            format!("{name}: exception sum payload does not reach its switch ({err})")
+        })?;
+        if !switched_on(graph, next, &bound) {
+            return Err(format!(
+                "{name}: exception sum payload is not switched on its discriminant"
+            ));
+        }
+        next
+    };
+    let variant_arms = map_sum_switch_arms(graph, sum_block, sum)?;
+    let mut handlers = Vec::new();
+    for (index, link) in variant_arms {
+        let payload = &sum.variants[index].payload;
+        let arm = link.target.0;
+        match payload {
+            ExceptionSumPayload::Carrier => {
+                if carrier_arm_reraises(graph, arm) {
+                    handlers.push(SumHandlerPlan {
+                        class_name: None,
+                        reraise: true,
+                        target: graph.exceptblock,
+                        args: Vec::new(),
+                    });
+                } else {
+                    let handler = skip_pure_forwards(graph, arm);
+                    handlers.push(SumHandlerPlan {
+                        class_name: None,
+                        reraise: false,
+                        target: crate::model::BlockId(handler),
+                        args: plan_handler_args(graph, handler, call_block)?,
+                    });
+                }
+            }
+            ExceptionSumPayload::Marked { .. } => {
+                for (class_name, handler) in cascade_class_handlers(graph, arm, payload)? {
+                    handlers.push(SumHandlerPlan {
+                        class_name: Some(class_name),
+                        reraise: false,
+                        target: crate::model::BlockId(handler),
+                        args: plan_handler_args(graph, handler, call_block)?,
+                    });
+                }
+            }
+        }
+    }
+    let ok_block = ok_link.target.0;
+    let ok_shell = forward_alias(graph, &shell, &ok_link);
+    let ok_pos = ok_shell.as_ref().and_then(|bound| {
+        graph.blocks[ok_block]
+            .inputargs
+            .iter()
+            .position(|input| input == bound)
+    });
+    if let Some(pos) = ok_pos {
+        let carrier = &graph.blocks[ok_block].inputargs[pos];
+        let readable = pos0_read_var(graph, ok_block, carrier).is_some();
+        let unused = !graph.blocks[ok_block]
+            .operations
+            .iter()
+            .any(|op| op_operand_vars(&op.kind).iter().any(|var| var == carrier));
+        if !readable && !unused {
+            return Err(format!(
+                "{name}: exception sum Ok arm uses the Result outside __pos_0"
+            ));
+        }
+    }
+    let mut ok_args = Vec::new();
+    for input in &graph.blocks[ok_block].inputargs {
+        let arg = back_sub_arg_to(graph, ok_block, LinkArg::Value(input.clone()), call_block)
+            .ok_or_else(|| {
+                format!("{name}: exception sum Ok arm value is not defined at the call")
+            })?;
+        ok_args.push(arg);
+    }
+    // Class arms stay in the caller's case order. The carrier arm is the
+    // last exception link (`guessexception` lists the classes, then the
+    // carrier).
+    handlers.sort_by_key(|handler| handler.class_name.is_none());
+    Ok(Some(SumMatchPlan {
+        ok_target: ok_link.target,
+        ok_pos: ok_pos.filter(|pos| {
+            let carrier = &graph.blocks[ok_block].inputargs[*pos];
+            pos0_read_var(graph, ok_block, carrier).is_some()
+        }),
+        ok_args,
+        handlers,
+    }))
+}
+
+fn replace_link_var(arg: LinkArg, from: &Variable, to: &Variable) -> LinkArg {
+    match arg {
+        LinkArg::Value(var) if var == *from => LinkArg::Value(to.clone()),
+        other => other,
+    }
+}
+
+fn install_exception_sum_match(
+    graph: &mut FunctionGraph,
+    call_block: usize,
+    result: &Variable,
+    payload_ty: &ValueType,
+    calls: &[ResultExcCall],
+    sum: &ExceptionSum,
+) -> Result<Option<SiteOutcome>, String> {
+    let name = graph.name.clone();
+    let Some(plan) = plan_exception_sum_match(graph, call_block, result, sum, &name)? else {
+        return Ok(None);
+    };
+    let payload = remint_call_as_payload(graph, call_block, result, payload_ty.clone());
+    if let Some(pos) = plan.ok_pos {
+        collapse_pos0_read(graph, plan.ok_target, pos, &name)?;
+    }
+    let exc_type = graph.alloc_value_var();
+    let exc_value = graph.alloc_value_var();
+    let mut exits = vec![Link::new_mixed(
+        plan.ok_args
+            .into_iter()
+            .map(|arg| replace_link_var(arg, result, &payload))
+            .collect(),
+        plan.ok_target,
+        None,
+    )];
+    for handler in plan.handlers {
+        let (target, args, exitcase) = if handler.reraise {
+            (
+                graph.exceptblock,
+                vec![
+                    LinkArg::Value(exc_type.clone()),
+                    LinkArg::Value(exc_value.clone()),
+                ],
+                Some(crate::model::exception_exitcase()),
+            )
+        } else if let Some(class_name) = handler.class_name {
+            let class = crate::model::RPythonExceptionClass::from_classdef(
+                crate::annotator::classdesc::ClassDef::new_standalone(class_name, None),
+            );
+            let args = handler
+                .args
+                .into_iter()
+                .map(|slot| match slot {
+                    Some(arg) => replace_link_var(arg, result, &payload),
+                    None => LinkArg::Value(exc_value.clone()),
+                })
+                .collect();
+            (handler.target, args, Some(ExitCase::ExceptionClass(class)))
+        } else {
+            let args = handler
+                .args
+                .into_iter()
+                .map(|slot| match slot {
+                    Some(arg) => replace_link_var(arg, result, &payload),
+                    None => LinkArg::Value(exc_value.clone()),
+                })
+                .collect();
+            (
+                handler.target,
+                args,
+                Some(crate::model::error_carrier_exitcase()),
+            )
+        };
+        let mut link = Link::new_mixed(args, target, exitcase);
+        link.last_exception = Some(LinkArg::Value(exc_type.clone()));
+        link.last_exc_value = Some(LinkArg::Value(exc_value.clone()));
+        exits.push(link);
+    }
+    graph.set_control_flow_metadata(BlockId(call_block), Some(ExitSwitch::LastException), exits);
+    separate_payload_from_shell(
+        graph,
+        call_block,
+        &payload,
+        &pending_result_vars(calls),
+        true,
+    )?;
+    Ok(Some(SiteOutcome::Rewrapped))
+}
+
+fn sum_from_residual_forwards(graph: &FunctionGraph, result: &Variable) -> bool {
+    let Some(kind) = producing_op(graph, result) else {
+        return false;
+    };
+    if !call_is_from_residual(kind) {
+        return false;
+    }
+    let Some(block) = producer_block_index(graph, result) else {
+        return false;
+    };
+    root_scope_closes_to_returnblock(graph, block, result).is_ok()
+}
+
+struct ResidualRaisePlan {
+    value: Variable,
+    delete: Option<SumCtorLoc>,
+    /// `Break` stored `Result<Infallible, E>`. Read `__pos_0` of
+    /// [`Self::read_base`] and raise that; `From` is the identity.
+    shell: Option<PeeledBreakShell>,
+    read_base: Variable,
+    /// Minted base class of the raised instance, when the plan knows it.
+    /// Absent for the carrier and for a value whose class is not a
+    /// marked variant.
+    class_name: Option<String>,
+}
+
+fn marked_base_for_error(sum: &ExceptionSum, error_ty: &str) -> Option<String> {
+    sum.variants
+        .iter()
+        .find_map(|variant| match &variant.payload {
+            ExceptionSumPayload::Marked {
+                enum_path,
+                base_class,
+                ..
+            } if names_declared_type(enum_path, base_class, error_ty) => Some(base_class.clone()),
+            _ => None,
+        })
+}
+
+/// The `__pos_0` read of `::Err` / `::Break` that [`residual_payload`]
+/// stops on. That variable is the instance when the banks match.
+fn residual_field_var(graph: &FunctionGraph, arg: &Variable) -> Option<Variable> {
+    let mut current = arg.clone();
+    let mut seen = Vec::new();
+    for _ in 0..32 {
+        if seen.iter().any(|var| var == &current) {
+            return None;
+        }
+        seen.push(current.clone());
+        let kind = producing_op(graph, &current)?;
+        match kind {
+            OpKind::FieldRead { field, .. }
+                if field.name == "__pos_0"
+                    && field.owner_root.as_deref().is_some_and(|owner| {
+                        owner_is_result_variant(owner, "Err") || owner.ends_with("::Break")
+                    }) =>
+            {
+                return Some(current);
+            }
+            OpKind::Call { args, .. }
+                if is_recast_narrow(kind)
+                    && let Some(src) = args.first().and_then(LinkArg::as_variable) =>
+            {
+                current = src.clone();
+            }
+            OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                current = operand.clone();
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn plan_sum_residual_raise(
+    graph: &FunctionGraph,
+    arg: &Variable,
+    sum: &ExceptionSum,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Result<ResidualRaisePlan, String> {
+    let read_base = arg.clone();
+    let planned = |value: Variable, delete: Option<SumCtorLoc>, class_name: Option<String>| {
+        let class_name =
+            class_name.or_else(|| delete.as_ref().and_then(|loc| loc.class_name.clone()));
+        ResidualRaisePlan {
+            value,
+            delete,
+            shell: None,
+            read_base: read_base.clone(),
+            class_name,
+        }
+    };
+    match residual_payload(graph, arg, spec.carrier_path, spec.carrier_wrappers) {
+        Ok(ResidualPayload::Foreign { error_ty, shell }) => {
+            if names_declared_type(&sum.identity, &sum.path, &error_ty) {
+                let loc =
+                    peel_sum_ctor_from(graph, arg, sum).ok_or_else(|| sum_used_as_value(sum))?;
+                let inner = loc.inner.clone();
+                return Ok(planned(inner, Some(loc), None));
+            }
+            if let Some(base) = marked_base_for_error(sum, &error_ty) {
+                if shell.is_some() {
+                    return Ok(ResidualRaisePlan {
+                        value: arg.clone(),
+                        delete: None,
+                        shell,
+                        read_base: read_base.clone(),
+                        class_name: Some(base),
+                    });
+                }
+                let value = residual_field_var(graph, arg).unwrap_or_else(|| arg.clone());
+                return Ok(planned(value, None, Some(base)));
+            }
+            Err(format!(
+                "from_residual would raise {error_ty} without From::from"
+            ))
+        }
+        Ok(ResidualPayload::Direct(var) | ResidualPayload::Converted(var)) => {
+            if let Some(loc) = peel_sum_ctor_from(graph, &var, sum) {
+                let inner = loc.inner.clone();
+                Ok(planned(inner, Some(loc), None))
+            } else {
+                Ok(planned(var, None, None))
+            }
+        }
+        Err(err) => {
+            if let Some(loc) = peel_sum_ctor_from(graph, arg, sum) {
+                let inner = loc.inner.clone();
+                Ok(planned(inner, Some(loc), None))
+            } else {
+                Err(format!("{} ({err})", sum_used_as_value(sum)))
+            }
+        }
+    }
 }
 
 /// Callee rule.  Rewrites every `Result::Ok` / `Result::Err` shell
@@ -598,10 +1815,13 @@ fn raise_merged_err_ctor(
 /// Fail-loud on any shape outside the known construction pattern —
 /// a scoped callee with an unrecognised return shape must break the
 /// build, not silently keep its shell.
-pub(crate) fn lower_result_exc_returns(
+///
+/// `sum` peels `S::Variant(e)` and raises `e`. `None` is the carrier rule.
+pub(crate) fn lower_result_exc_returns_for_sum(
     graph: &mut FunctionGraph,
     tail_forwarded_returns: usize,
     spec: crate::ErrorCarrierSpec<'_>,
+    sum: Option<&ExceptionSum>,
 ) -> Result<usize, String> {
     // Every `Err` below declines the WHOLE callee to a residual call.  The
     // message says why, but it travels out as `LowerError::Unsupported` and
@@ -616,7 +1836,7 @@ pub(crate) fn lower_result_exc_returns(
     // to a residual call (`jtransform.py`).  The fail-safe residual
     // is the same here — this only records the reason before it is
     // discarded, so the refusal stays countable.
-    let outcome = lower_result_exc_returns_inner(graph, tail_forwarded_returns, spec);
+    let outcome = lower_result_exc_returns_inner(graph, tail_forwarded_returns, spec, sum);
     match &outcome {
         Err(msg) => crate::decline::record_reason(
             RESULT_EXC_CALLEE_GATE,
@@ -654,10 +1874,26 @@ use crate::decline::gate::{
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
+fn finish_sum_returns(
+    graph: &FunctionGraph,
+    sum: Option<&ExceptionSum>,
+    rewritten: usize,
+) -> Result<usize, String> {
+    if let Some(sum) = sum {
+        reject_reachable_sum_ctors(graph, sum, false)?;
+    }
+    Ok(rewritten)
+}
+
+fn shift_index_after_deletes(idx: usize, deleted: &[usize]) -> usize {
+    idx - deleted.iter().filter(|earlier| **earlier < idx).count()
+}
+
 fn lower_result_exc_returns_inner(
     graph: &mut FunctionGraph,
     tail_forwarded_returns: usize,
     spec: crate::ErrorCarrierSpec<'_>,
+    sum: Option<&ExceptionSum>,
 ) -> Result<usize, String> {
     let nblocks = graph.blocks.len();
     let mut rewritten = 0usize;
@@ -961,6 +2197,29 @@ fn lower_result_exc_returns_inner(
             continue;
         }
 
+        // An exception sum's `Err(S::Variant(e))` raises `e`. The sum
+        // shell is not a value. Shift Result indices when the shell was
+        // built in this block, then delete it before the Result shell.
+        let mut ctor_idx = ctor_idx;
+        let mut fw_idx = fw_idx;
+        let mut discriminant_write_idx = discriminant_write_idx;
+        let mut raised = payload.clone();
+        let mut raised_class = None;
+        if is_err && let Some(sum) = sum {
+            let loc =
+                peel_sum_ctor_from(graph, &payload, sum).ok_or_else(|| sum_used_as_value(sum))?;
+            raised = loc.inner.clone();
+            raised_class = loc.class_name.clone();
+            if loc.block == bi {
+                let deleted = loc.indices.clone();
+                ctor_idx = shift_index_after_deletes(ctor_idx, &deleted);
+                fw_idx = fw_idx.map(|idx| shift_index_after_deletes(idx, &deleted));
+                discriminant_write_idx =
+                    discriminant_write_idx.map(|idx| shift_index_after_deletes(idx, &deleted));
+            }
+            delete_sum_ctor(graph, &loc);
+        }
+
         // Drop the ctor + payload and optional static discriminant writes
         // (higher index first).  A dead `ConstInt` producer for the tag is
         // removed by the ordinary dead-op sweep.  `Ok(())` becomes the unit
@@ -1000,7 +2259,10 @@ fn lower_result_exc_returns_inner(
             for close in root_scope_closes {
                 graph.push_op_var(block_id, close, true);
             }
-            crate::front::exc_from_raise::set_raise_from_instance(graph, block_id, payload);
+            if let Some(class_name) = raised_class.as_deref() {
+                raised = carry_raised_exception_class(graph, block_id, raised, class_name);
+            }
+            crate::front::exc_from_raise::set_raise_from_instance(graph, block_id, raised);
         } else {
             // `return Ok(v)` → forward the payload itself.
             for link in &mut graph.blocks[bi].exits {
@@ -1035,19 +2297,22 @@ fn lower_result_exc_returns_inner(
         // saw that site (it only records scoped `Result<T, PyError>`
         // callees), so there is no exception edge to install here.
         if has_tail_forwarded_call_result(graph) {
-            return Ok(0);
+            return finish_sum_returns(graph, sum, 0);
+        }
+        if let Some(sum) = sum {
+            reject_reachable_sum_ctors(graph, sum, false)?;
         }
         return Err(format!(
             "{}: scoped Result-of-PyError callee with no rewritable returns",
             graph.name
         ));
     }
-    Ok(rewritten)
+    finish_sum_returns(graph, sum, rewritten)
 }
 
 /// True when some block's `Call` result flows straight to `returnblock`
 /// through pure positional forwarding — the `return f(...)?` tail-forward
-/// shape.  Used by [`lower_result_exc_returns`] to accept scoped callees
+/// shape.  Used by [`lower_result_exc_returns_for_sum`] to accept scoped callees
 /// that forward an unscoped callee's `Result` directly (the caller-rule
 /// capture only records scoped callees, so such sites never reach
 /// `rewire_result_exc_call_sites`).
@@ -1067,7 +2332,7 @@ fn has_tail_forwarded_call_result(graph: &FunctionGraph) -> bool {
 
 /// A scoped `Result<T, PyError>` callee can return a shell it did not
 /// build. `return Ok(v)` / `return Err(e)` are rewritten by
-/// [`lower_result_exc_returns`]; `return v` where `v` is the `Some` payload
+/// [`lower_result_exc_returns_for_sum`]; `return v` where `v` is the `Some` payload
 /// of `Option<Result<T, PyError>>` (`space.index_w`'s `as_index_value`
 /// fast path, `baseobjspace.getdict`'s `local_getdict`) never constructs a
 /// ctor in this graph, so the returnblock keeps the `Result` aggregate.
@@ -1632,7 +2897,7 @@ fn split_result_shell_return(
         .expect("err payload read");
     // `return Err(e)` → `raise e`. The codewriter converts the raised
     // carrier (`codewriter::error_carrier_edges`), same as
-    // [`lower_result_exc_returns`].
+    // [`lower_result_exc_returns_for_sum`].
     crate::front::exc_from_raise::set_raise_from_instance(graph, err_bb, err_payload);
     Ok(())
 }
@@ -2680,6 +3945,172 @@ enum SiteOutcome {
     Fused,
 }
 
+fn usable_instance_class(name: &str) -> bool {
+    !name.is_empty()
+        && name != "object"
+        && name != "OBJECT"
+        && name != "Object"
+        && !crate::annotator::bookkeeper::is_gcref_type_spelling(name)
+}
+
+fn named_ref_class(ty: &ValueType) -> Option<String> {
+    match ty {
+        ValueType::Ref(Some(name)) if usable_instance_class(name) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// Class name on the annotator cell, when it names exactly one instance.
+/// Several `SomeException` classdefs are not one class.
+fn annotation_class_name(var: &Variable) -> Option<String> {
+    let annotation = var.annotation.borrow();
+    let value = annotation.as_ref()?;
+    let name = match value.as_ref() {
+        crate::annotator::model::SomeValue::Instance(inst) => inst
+            .classdef
+            .as_ref()
+            .map(|classdef| classdef.borrow().name.clone()),
+        crate::annotator::model::SomeValue::Exception(exc) if exc.classdefs.len() == 1 => {
+            Some(exc.classdefs[0].borrow().name.clone())
+        }
+        _ => None,
+    }?;
+    usable_instance_class(&name).then_some(name)
+}
+
+/// Class the op itself records, before any identity forward.
+///
+/// A `FieldRead` is not followed: its `ty` is the instance class
+/// (`E` for a marked `Result::Err` payload). `object` and `GCREF`
+/// are every `GcRef`, not a class.
+fn op_instance_class(kind: &OpKind) -> Option<String> {
+    match kind {
+        OpKind::FieldRead { field, ty, .. } => {
+            if field.owner_declared_gc == Some(false) {
+                return None;
+            }
+            named_ref_class(ty)
+        }
+        OpKind::Input { class_root, ty, .. } => class_root
+            .as_deref()
+            .filter(|name| usable_instance_class(name))
+            .map(str::to_string)
+            .or_else(|| named_ref_class(ty)),
+        OpKind::Call { result_ty, .. } => named_ref_class(result_ty).or_else(|| {
+            crate::model::cast_instance_root(kind)
+                .filter(|name| usable_instance_class(name))
+                .map(str::to_string)
+        }),
+        _ => None,
+    }
+}
+
+/// Operand of an identity op. Not a `FieldRead` and not an arbitrary call.
+fn identity_predecessor(kind: &OpKind) -> Option<Variable> {
+    match kind {
+        OpKind::UnaryOp { op, operand, .. }
+            if op == "same_as" || op == "cast_pointer" || op == "cast_int_to_ptr" =>
+        {
+            Some(operand.clone())
+        }
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments.last().map(String::as_str) == Some("cast_int_to_ptr")
+            || crate::model::cast_instance_root(kind).is_some()
+            || crate::model::cast_pointer_root(kind).is_some() =>
+        {
+            args.first().and_then(LinkArg::as_variable).cloned()
+        }
+        _ => None,
+    }
+}
+
+fn concretetype_struct_name(var: &Variable) -> Option<String> {
+    let cell = var.concretetype.borrow();
+    let ll = cell.as_ref()?;
+    let name = match ll {
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Struct(struc) => {
+            struc._name.as_str()
+        }
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(ptr) => match &ptr.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(struc) => {
+                struc._name.as_str()
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    usable_instance_class(name).then(|| name.to_string())
+}
+
+/// Class of the value a raise link carries.
+///
+/// Annotation, then the producing op's own type (`Ref` root, input
+/// `class_root`, or a cast root), following only identity ops. A
+/// struct `concretetype` name is the last resort, and `object` /
+/// `GCREF` never count. `None` means the class is not on the value.
+pub(crate) fn raised_value_class_name(graph: &FunctionGraph, evalue: &Variable) -> Option<String> {
+    let mut current = evalue.clone();
+    let mut seen = Vec::new();
+    for _ in 0..8 {
+        if seen.iter().any(|var| var == &current) {
+            break;
+        }
+        seen.push(current.clone());
+        if let Some(name) = annotation_class_name(&current) {
+            return Some(name);
+        }
+        let Some(kind) = producing_op(graph, &current) else {
+            break;
+        };
+        if let Some(name) = op_instance_class(kind) {
+            return Some(name);
+        }
+        let Some(next) = identity_predecessor(kind) else {
+            break;
+        };
+        current = next;
+    }
+    concretetype_struct_name(evalue).or_else(|| concretetype_struct_name(&current))
+}
+
+/// The raised value is already the runtime exception object when its
+/// class belongs to a minted `_exception_class_` hierarchy. How the
+/// value was built does not matter. A carrier and any other class
+/// still convert.
+pub(crate) fn raised_value_skips_exc_conversion(
+    graph: &FunctionGraph,
+    evalue: &Variable,
+    class_belongs: &dyn Fn(&str) -> bool,
+) -> bool {
+    raised_value_class_name(graph, evalue).is_some_and(|name| class_belongs(&name))
+}
+
+/// Keep `class_name` on `value` when the raise's own ops do not record it.
+///
+/// A block input has no producer and no concretetype. The cast is the
+/// class the guard reads. A value that already names a class, minted
+/// or not, is left as it is.
+pub(crate) fn carry_raised_exception_class(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    value: Variable,
+    class_name: &str,
+) -> Variable {
+    if class_name.is_empty() || raised_value_class_name(graph, &value).is_some() {
+        return value;
+    }
+    graph
+        .push_op_var(
+            block,
+            crate::model::cast_instance_call(class_name, value),
+            true,
+        )
+        .expect("exception-class stamp")
+}
+
 fn producing_op<'a>(graph: &'a FunctionGraph, var: &Variable) -> Option<&'a OpKind> {
     graph.blocks.iter().find_map(|block| {
         block
@@ -3264,7 +4695,7 @@ fn is_from_impl_call(kind: &OpKind) -> bool {
 /// `Result::Err`'s `__pos_0`. An unsuffixed owner, and a suffixed owner
 /// whose error argument is already the carrier, is that value.
 /// `FromResidual::from_residual` for a different error type is
-/// `Err(From::from(e))`; [`foreign_from_residual_sites`] inserts that
+/// `Err(From::from(e))`; [`foreign_from_residual_sites_in`] inserts that
 /// call, and this walk then returns its result.
 fn from_residual_carrier(
     graph: &FunctionGraph,
@@ -3474,9 +4905,15 @@ fn residual_payload(
 /// `exceptiontransform.py` `create_exception_handling` uses for
 /// `OperationError`. `FromResidual<Option<Infallible>>` (Option `?`)
 /// is the extracted `core::option::<Impl>::from_residual` body (`None`).
-pub(crate) fn foreign_from_residual_sites(
+///
+/// Residuals an enclosing exception sum already raises are skipped.
+/// `From<E> for S` is the identity on the instance, and a same-type or
+/// carrier residual is a reraise / the existing carrier propagation —
+/// none of them calls `From::from`.
+pub(crate) fn foreign_from_residual_sites_in(
     graph: &FunctionGraph,
     spec: crate::ErrorCarrierSpec<'_>,
+    sum: Option<&ExceptionSum>,
 ) -> Vec<ForeignFromSite> {
     let mut sites = Vec::new();
     for (bi, block) in graph.blocks.iter().enumerate() {
@@ -3504,6 +4941,10 @@ pub(crate) fn foreign_from_residual_sites(
             let ResidualPayload::Foreign { error_ty, shell } = payload else {
                 continue;
             };
+            if sum.is_some_and(|sum| exception_sum_claims_error(sum, &error_ty, spec.carrier_path))
+            {
+                continue;
+            }
             if !from_residual_is_result_residual(&op.kind, &error_ty) {
                 continue;
             }
@@ -3660,6 +5101,7 @@ fn raise_returned_from_residual(
     graph: &mut FunctionGraph,
     r: &Variable,
     spec: crate::ErrorCarrierSpec<'_>,
+    sum: Option<&ExceptionSum>,
 ) -> Result<(), String> {
     let name = graph.name.clone();
     let Some(block) = producer_block_index(graph, r) else {
@@ -3701,6 +5143,55 @@ fn raise_returned_from_residual(
             "{name}: from_residual result is read by an operation"
         ));
     }
+    if let Some(sum) = sum {
+        let ResidualRaisePlan {
+            value,
+            delete,
+            shell,
+            read_base,
+            class_name,
+        } = plan_sum_residual_raise(graph, &residual, sum, spec)
+            .map_err(|err| format!("{name}: {err}"))?;
+        if let Some(loc) = &delete {
+            delete_sum_ctor(graph, loc);
+        }
+        let op_idx = graph.blocks[block]
+            .operations
+            .iter()
+            .position(|op| op.result.as_ref() == Some(r))
+            .ok_or_else(|| format!("{name}: from_residual producer vanished"))?;
+        let raised = if let Some(shell) = shell {
+            let inner = graph.alloc_value_var();
+            graph.blocks[block].operations.insert(
+                op_idx,
+                SpaceOperation {
+                    result: Some(inner.clone()),
+                    kind: OpKind::FieldRead {
+                        base: read_base,
+                        field: FieldDescriptor::new("__pos_0", Some(shell.err_owner)),
+                        ty: shell.payload_ty,
+                        pure: true,
+                    },
+                },
+            );
+            graph.blocks[block].operations.remove(op_idx + 1);
+            inner
+        } else {
+            graph.blocks[block].operations.remove(op_idx);
+            value
+        };
+        let block_id = crate::model::BlockId(block);
+        for close in closes {
+            graph.push_op_var(block_id, close, true);
+        }
+        let raised = if let Some(class_name) = class_name.as_deref() {
+            carry_raised_exception_class(graph, block_id, raised, class_name)
+        } else {
+            raised
+        };
+        crate::front::exc_from_raise::set_raise_from_instance(graph, block_id, raised);
+        return Ok(());
+    }
     let carrier = from_residual_carrier(graph, &residual, spec.carrier_path, spec.carrier_wrappers)
         .map_err(|err| format!("{name}: {err}"))?;
     graph.blocks[block].operations.remove(op_idx);
@@ -3722,10 +5213,11 @@ fn raise_returned_from_residual(
 /// custom `match` consumer that gets the catch-and-rewrap treatment.
 pub(crate) fn rewire_result_exc_call_sites(
     graph: &mut FunctionGraph,
-    results: &[(Variable, Option<String>, ValueType)],
+    results: &impl ResultExcCalls,
     enclosing_scoped: bool,
     spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<RewireOutcome, String> {
+    let calls = results.calls();
     let mut outcome = RewireOutcome {
         diamonds: 0,
         tail_forwards: 0,
@@ -3736,7 +5228,10 @@ pub(crate) fn rewire_result_exc_call_sites(
     // in this loop would rewrite the break arm before a later `branch()`
     // diamond reads it.
     let mut deferred_from_residual: Vec<Variable> = Vec::new();
-    for (r, suffix, payload_ty) in results {
+    for call in &calls {
+        let r = &call.result;
+        let suffix = call.suffix.as_deref();
+        let payload_ty = &call.payload_ty;
         // Collection records every scoped Result call during body
         // lowering.  `simplify_lowered_graph` then folds
         // `we_are_jitted()` (`front::mir` `ConstBool(true)`) through
@@ -3763,18 +5258,23 @@ pub(crate) fn rewire_result_exc_call_sites(
             );
             return Err(msg);
         }
-        if from_residual_forwards_to_return(graph, r) {
+        let defer = if call.sum.is_some() {
+            sum_from_residual_forwards(graph, r)
+        } else {
+            from_residual_forwards_to_return(graph, r)
+        };
+        if defer {
             deferred_from_residual.push(r.clone());
             continue;
         }
         let site = rewire_one_call_site(
             graph,
             r,
-            suffix.as_deref().unwrap_or(""),
+            suffix.unwrap_or(""),
             payload_ty,
             enclosing_scoped,
             true,
-            results,
+            &calls,
             spec,
         );
         let site = match site {
@@ -3800,8 +5300,31 @@ pub(crate) fn rewire_result_exc_call_sites(
             SiteOutcome::Fused => outcome.fused += 1,
         }
     }
-    for r in deferred_from_residual {
-        raise_returned_from_residual(graph, &r, spec)?;
+    for r in &deferred_from_residual {
+        let sum = calls
+            .iter()
+            .find(|call| &call.result == r)
+            .and_then(|call| call.sum.as_ref());
+        raise_returned_from_residual(graph, r, spec, sum)?;
+    }
+    let mut scanned_paths: Vec<String> = Vec::new();
+    for call in &calls {
+        let Some(sum) = call.sum.as_ref() else {
+            continue;
+        };
+        if scanned_paths.iter().any(|path| path == &sum.path) {
+            continue;
+        }
+        scanned_paths.push(sum.path.clone());
+        if let Err(msg) = reject_reachable_sum_ctors(graph, sum, true) {
+            crate::decline::record_reason(
+                RESULT_EXC_CALLER_GATE,
+                "call-site-declined-to-residual",
+                &msg,
+                &graph.name,
+            );
+            return Err(msg);
+        }
     }
     split_trailing_ops_off_canraise_blocks(graph);
     Ok(outcome)
@@ -6277,13 +7800,16 @@ fn rewire_question_site(
     suffix: &str,
     payload_ty: &ValueType,
     allow_fallback: bool,
-    results: &[(Variable, Option<String>, ValueType)],
+    results: &[ResultExcCall],
     site: QuestionSite,
 ) -> Result<SiteOutcome, String> {
     let name = graph.name.clone();
     let rewrap = |graph: &mut FunctionGraph, reason: String| -> Result<SiteOutcome, String> {
         if !allow_fallback {
             return Err(reason);
+        }
+        if let Some(sum) = call_sum(results, r) {
+            return Err(sum_used_as_value(sum));
         }
         catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
         Ok(SiteOutcome::Rewrapped)
@@ -6513,9 +8039,10 @@ fn rewire_one_call_site(
     payload_ty: &ValueType,
     enclosing_scoped: bool,
     allow_fallback: bool,
-    results: &[(Variable, Option<String>, ValueType)],
+    results: &impl ResultExcCalls,
     spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<SiteOutcome, String> {
+    let calls = results.calls();
     let name = graph.name.clone();
     // Block A: contains the call producing `r`; closed by lower_call
     // with a single forwarding exit.
@@ -6534,6 +8061,13 @@ fn rewire_one_call_site(
     // link — `simplify.py`). Same collapse the checked-arith Option
     // path uses.
     collapse_trailing_recasts_onto(graph, a, r);
+    if let Some(sum) = call_sum(&calls, r) {
+        match install_exception_sum_match(graph, a, r, payload_ty, &calls, sum) {
+            Ok(Some(outcome)) => return Ok(outcome),
+            Ok(None) => {}
+            Err(err) => return Err(err),
+        }
+    }
     // Tail forward: the callee's Result flows straight to returnblock, or
     // through blocks that only close brackets.  Those closes also run when
     // the callee raises, so the call gains an exception edge that re-emits
@@ -6603,7 +8137,7 @@ fn rewire_one_call_site(
         // feed with a shell (`flowcontext.py` `guessexception` gives each
         // raising op its own normal value).
         if let Some(merge) = merged_forward_target(graph, a, r) {
-            return rewire_merged_target(graph, merge, results, &name);
+            return rewire_merged_target(graph, merge, &calls, &name);
         }
         let payload = remint_call_as_payload(graph, a, r, payload_ty.clone());
         replace_exit_value(graph, a, r, &payload);
@@ -6614,7 +8148,7 @@ fn rewire_one_call_site(
             Some(ExitSwitch::LastException),
             vec![normal, exc_link],
         );
-        separate_payload_from_shell(graph, a, &payload, &pending_result_vars(results), true)?;
+        separate_payload_from_shell(graph, a, &payload, &pending_result_vars(&calls), true)?;
         return Ok(SiteOutcome::TailForward);
     }
     // `let _ = f()`: nothing reads the `Result`, so the call block's exit
@@ -6623,6 +8157,9 @@ fn rewire_one_call_site(
     // successor, the flow shape of `try: f() except: pass`
     // (`flowcontext.py FlowContext.guessexception`).
     if allow_fallback && !variable_is_used(graph, r) {
+        if let Some(sum) = call_sum(&calls, r) {
+            return Err(sum_used_as_value(sum));
+        }
         catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
         return Ok(SiteOutcome::Rewrapped);
     }
@@ -6652,7 +8189,7 @@ fn rewire_one_call_site(
                 suffix,
                 payload_ty,
                 allow_fallback,
-                results,
+                &calls,
                 site,
             );
         }
@@ -6669,6 +8206,9 @@ fn rewire_one_call_site(
         // `catch_and_rewrap`.  The fusion is fail-safe: an `Err` from
         // `try_fuse_drain_match` MUST NOT propagate (that would decline the
         // whole graph); it converts here into the existing rewrap path.
+        if let Some(sum) = call_sum(&calls, r) {
+            return Err(sum_used_as_value(sum));
+        }
         match try_fuse_drain_match(graph, a, r, payload_ty, spec) {
             Ok(()) => return Ok(SiteOutcome::Fused),
             Err(msg) => {
@@ -6738,6 +8278,9 @@ fn rewire_one_call_site(
                 "{name}: Result::branch block {b} is shared by multiple predecessors"
             ));
         }
+        if let Some(sum) = call_sum(&calls, r) {
+            return Err(sum_used_as_value(sum));
+        }
         catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
         return Ok(SiteOutcome::Rewrapped);
     }
@@ -6752,7 +8295,7 @@ fn rewire_one_call_site(
             suffix,
             payload_ty,
             allow_fallback,
-            results,
+            &calls,
             QuestionSite {
                 hops: Vec::new(),
                 branch_block: b,
@@ -6783,6 +8326,9 @@ fn rewire_one_call_site(
                 return Err(format!(
                     "{name}: ControlFlow discriminant block {c} is shared by multiple predecessors"
                 ));
+            }
+            if let Some(sum) = call_sum(&calls, r) {
+                return Err(sum_used_as_value(sum));
             }
             catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
             return Ok(SiteOutcome::Rewrapped);
@@ -6829,7 +8375,7 @@ fn rewire_one_call_site(
         Some(link) => {
             let continue_target = link.target;
             if predecessor_exits(graph, continue_target.0).len() != 1 {
-                return rewire_merged_target(graph, continue_target, results, &name);
+                return rewire_merged_target(graph, continue_target, &calls, &name);
             }
             continue_target
         }
@@ -6876,7 +8422,7 @@ fn rewire_one_call_site(
     // `collapse_pos0_read` folded the payload read onto the shell phi.
     // The link now carries `T`; the phi has to be a fresh variable of
     // that kind, not the ControlFlow shell.
-    separate_payload_from_shell(graph, a, &payload, &pending_result_vars(results), true)?;
+    separate_payload_from_shell(graph, a, &payload, &pending_result_vars(&calls), true)?;
     insert_keepalive_block_on_normal_link(graph, a, keepalives);
     // Blocks B, C and the break arm are now unreachable; the dead-op
     // sweep leaves them to the reachability-walking consumers.
@@ -7053,6 +8599,9 @@ fn raise_link_through_closes(
                 true,
             );
         }
+        // `r_inputs[n + 1]` is the caught value, a block input. It may be
+        // the carrier. This planner does not know a minted class, so the
+        // fresh `type()` raise stays unstamped.
         crate::front::exc_from_raise::set_raise_from_instance(graph, r_id, r_inputs[n + 1].clone());
         let args = close_vars
             .into_iter()
@@ -12275,8 +13824,8 @@ fn remint_call_as_payload(
     payload
 }
 
-fn pending_result_vars(results: &[(Variable, Option<String>, ValueType)]) -> Vec<Variable> {
-    results.iter().map(|(var, _, _)| var.clone()).collect()
+fn pending_result_vars(results: &[ResultExcCall]) -> Vec<Variable> {
+    results.iter().map(|call| call.result.clone()).collect()
 }
 
 /// Links that target `block`, as `(source block, exit index)`.
@@ -12544,7 +14093,7 @@ enum SlotAction {
         payload_ty: ValueType,
     },
     Project(SlotProjection),
-    /// `return Ok` / `return Err`. [`lower_result_exc_returns`] owns it.
+    /// `return Ok` / `return Err`. [`lower_result_exc_returns_for_sum`] owns it.
     LeaveCtor,
     /// `return Err` at a merged continue. Raise here: see
     /// [`raise_err_ctor_at_merged_continue`].
@@ -12555,7 +14104,7 @@ fn classify_slot_value(
     graph: &FunctionGraph,
     source: usize,
     var: &Variable,
-    results: &[(Variable, Option<String>, ValueType)],
+    results: &[ResultExcCall],
     depth: usize,
 ) -> Result<SlotAction, String> {
     let name = graph.name.as_str();
@@ -12564,7 +14113,11 @@ fn classify_slot_value(
             "{name}: merged continue shell chain is longer than the block count"
         ));
     }
-    if let Some((_, _, payload_ty)) = results.iter().find(|(result, _, _)| result == var) {
+    if let Some(payload_ty) = results
+        .iter()
+        .find(|call| &call.result == var)
+        .map(|call| &call.payload_ty)
+    {
         let call_block = producer_block_index(graph, var).ok_or_else(|| {
             format!("{name}: merged continue call result in block {source} has no producer")
         })?;
@@ -12719,7 +14272,7 @@ fn plan_question_diamond(
     graph: &FunctionGraph,
     disc_block: usize,
     exit_index: usize,
-    results: &[(Variable, Option<String>, ValueType)],
+    results: &[ResultExcCall],
     name: &str,
 ) -> Result<DiamondPlan, String> {
     let (continue_link, break_link) = split_diamond_exits(&graph.blocks[disc_block].exits, name)?;
@@ -12822,8 +14375,8 @@ fn plan_question_diamond(
     }
     let payload_ty = results
         .iter()
-        .find(|(result, _, _)| *result == r)
-        .map(|(_, _, ty)| ty.clone())
+        .find(|call| call.result == r)
+        .map(|call| call.payload_ty.clone())
         .ok_or_else(|| format!("{name}: merged continue call result is not a scoped Result"))?;
     let (cf_forwarded, _recast_b) = peel_recast_chain_from(graph, branch_block, &cf);
     let (disc_target, cf_c) = follow_single_exit(graph, branch_block, &cf_forwarded)
@@ -13121,7 +14674,7 @@ fn sibling_link_passes_pending(
 fn rewire_merged_target(
     graph: &mut FunctionGraph,
     target: BlockId,
-    results: &[(Variable, Option<String>, ValueType)],
+    results: &[ResultExcCall],
     name: &str,
 ) -> Result<SiteOutcome, String> {
     let incoming = predecessor_exits(graph, target.0);
@@ -13384,7 +14937,7 @@ fn rewire_merged_target(
 /// them feeds is left alone so a later diamond still sees `__pos_0`.
 /// `project_sibling_ctors` splits a sibling `Ok`/`Continue` shell that
 /// does not itself forward to `returnblock` (`insert_empty_block`); a
-/// callee `return Ok` is rewritten by [`lower_result_exc_returns`] and
+/// callee `return Ok` is rewritten by [`lower_result_exc_returns_for_sum`] and
 /// must stay a ctor until that pass.
 fn separate_payload_from_shell(
     graph: &mut FunctionGraph,
@@ -13828,16 +15381,16 @@ pub(crate) fn collapse_pos0_read(
                 if *base == carrier && field.name == "__pos_0"
         )
     });
-    // `Some` / `Continue` often arrives as a downcast of the scrutinee
-    // (`cast(opt, Option<T>::Some)`) and the payload is `__pos_0` of that
-    // cast, not of the block input.
+    // `Some` / `Continue` / `Ok` often arrives as a downcast of the
+    // scrutinee (`cast(opt, Option<T>::Some)`, `cast(r, Result<T, E>::Ok)`)
+    // and the payload is `__pos_0` of that cast, not of the block input.
     let cast_then_payload = if direct_read.is_some() {
         None
     } else {
         let cast_idx = graph.blocks[ti].operations.iter().position(|op| {
             op_operand_vars(&op.kind).contains(&carrier)
                 && crate::model::cast_instance_root(&op.kind).is_some_and(|root| {
-                    matches!(root.rsplit("::").next(), Some("Some" | "Continue"))
+                    matches!(root.rsplit("::").next(), Some("Some" | "Continue" | "Ok"))
                 })
         });
         match cast_idx {
@@ -14494,7 +16047,7 @@ mod static_result_shell_tests {
     fn static_ok_tag_write_is_removed_with_the_result_shell() {
         let (mut graph, shell, payload) = ok_shell_with_tag(0);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+            lower_result_exc_returns_for_sum(&mut graph, 0, pyerror_spec(), None)
                 .expect("matching static tag lowers"),
             1
         );
@@ -14520,7 +16073,7 @@ mod static_result_shell_tests {
         graph.set_goto(entry, mid, vec![shell.clone()]);
         graph.set_return(mid, Some(shell_phi.clone()));
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+            lower_result_exc_returns_for_sum(&mut graph, 0, pyerror_spec(), None)
                 .expect("intermediate forward lowers"),
             1
         );
@@ -14704,7 +16257,7 @@ mod static_result_shell_tests {
     #[test]
     fn static_ok_with_err_tag_is_rejected() {
         let (mut graph, _, _) = ok_shell_with_tag(1);
-        let err = lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+        let err = lower_result_exc_returns_for_sum(&mut graph, 0, pyerror_spec(), None)
             .expect_err("mismatched variant tag must fail closed");
         assert!(err.contains("non-matching __discriminant write"));
     }
@@ -14733,7 +16286,7 @@ mod static_result_shell_tests {
         let returnblock = graph.returnblock;
         graph.set_goto(entry, returnblock, vec![shell.clone()]);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+            lower_result_exc_returns_for_sum(&mut graph, 0, pyerror_spec(), None)
                 .expect("payload-less Ok lowers"),
             1
         );
@@ -14774,7 +16327,7 @@ mod static_result_shell_tests {
         let returnblock = graph.returnblock;
         graph.set_goto(entry, returnblock, vec![shell.clone()]);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+            lower_result_exc_returns_for_sum(&mut graph, 0, pyerror_spec(), None)
                 .expect("payload-less Ok lowers"),
             1
         );
@@ -14811,7 +16364,7 @@ mod static_result_shell_tests {
             .expect("shell");
         let returnblock = graph.returnblock;
         graph.set_goto(entry, returnblock, vec![shell.clone()]);
-        let err = lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+        let err = lower_result_exc_returns_for_sum(&mut graph, 0, pyerror_spec(), None)
             .expect_err("payload Ok without __pos_0 must decline");
         assert!(
             err.contains("payload-bearing Result Ok ctor"),
@@ -14953,7 +16506,8 @@ mod static_result_shell_tests {
         let (mut graph, payload, ctor, forwarded) =
             mixed_forward_graph("Option<Result<*mut PyObject,PyError>>::Some");
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, pyerror_spec()).expect("mixed forward lowers"),
+            lower_result_exc_returns_for_sum(&mut graph, 0, pyerror_spec(), None)
+                .expect("mixed forward lowers"),
             2
         );
         let returned = return_link_values(&graph);
@@ -14975,7 +16529,8 @@ mod static_result_shell_tests {
         let (mut graph, entry, forwarded) =
             forward_only_graph("Option<Result<*mut PyObject,PyError>>::Some");
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, pyerror_spec()).expect("PyError shell splits"),
+            lower_result_exc_returns_for_sum(&mut graph, 0, pyerror_spec(), None)
+                .expect("PyError shell splits"),
             1
         );
         assert_ne!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
@@ -14991,7 +16546,8 @@ mod static_result_shell_tests {
         let (mut graph, _payload, _ctor, forwarded) =
             mixed_forward_graph("Option<Result<*mut PyObject,PyError>>::Some");
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, pyerror_spec()).expect("ctor and shell lower"),
+            lower_result_exc_returns_for_sum(&mut graph, 0, pyerror_spec(), None)
+                .expect("ctor and shell lower"),
             2
         );
         assert!(
@@ -15004,7 +16560,7 @@ mod static_result_shell_tests {
     #[test]
     fn result_ok_payload_read_is_not_a_forwarded_shell() {
         let (mut graph, entry, forwarded) = forward_only_graph("Result<*mut PyObject,PyError>::Ok");
-        let err = lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+        let err = lower_result_exc_returns_for_sum(&mut graph, 0, pyerror_spec(), None)
             .expect_err("an Ok payload read is already T");
         assert!(err.contains("no rewritable returns"));
         assert_eq!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
@@ -15019,7 +16575,7 @@ mod static_result_shell_tests {
     fn option_of_a_different_error_is_not_split() {
         let (mut graph, entry, forwarded) =
             forward_only_graph("Option<Result<i64,Utf8Error>>::Some");
-        let err = lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+        let err = lower_result_exc_returns_for_sum(&mut graph, 0, pyerror_spec(), None)
             .expect_err("Utf8Error is not the carrier");
         assert!(err.contains("no rewritable returns"));
         assert_eq!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
@@ -15095,7 +16651,7 @@ mod static_result_shell_tests {
         let ctor = push_ok_ctor(&mut graph, entry, forwarded.clone());
         graph.set_goto(entry, graph.returnblock, vec![ctor]);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+            lower_result_exc_returns_for_sum(&mut graph, 0, pyerror_spec(), None)
                 .expect("the ctor lowers and the payload stays"),
             1
         );
@@ -15112,7 +16668,8 @@ mod static_result_shell_tests {
         let (mut graph, _entry, forwarded) =
             forward_only_graph("Option<Result<*mut PyObject,PyError>>::Some");
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, pyerror_spec()).expect("forward lowers"),
+            lower_result_exc_returns_for_sum(&mut graph, 0, pyerror_spec(), None)
+                .expect("forward lowers"),
             1
         );
         assert!(
@@ -15262,7 +16819,7 @@ mod static_result_shell_tests {
         let returnblock = graph.returnblock;
         graph.set_goto(m, returnblock, vec![ret]);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+            lower_result_exc_returns_for_sum(&mut graph, 0, pyerror_spec(), None)
                 .expect("a consumed payload-less Err does not decline the callee"),
             1
         );
@@ -15286,7 +16843,7 @@ mod static_result_shell_tests {
         let (mut graph, m, pair) = tagged_pair_graph();
         let returnblock = graph.returnblock;
         graph.set_goto(m, returnblock, vec![pair]);
-        let err = lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+        let err = lower_result_exc_returns_for_sum(&mut graph, 0, pyerror_spec(), None)
             .expect_err("a returned Err without an exception value cannot lower");
         assert!(err.contains("Result Err ctor without a __pos_0 payload write"));
     }
@@ -15320,7 +16877,7 @@ mod static_result_shell_tests {
             .expect("zst err");
         graph.set_goto(entry, ret_block, vec![zst_err]);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+            lower_result_exc_returns_for_sum(&mut graph, 0, pyerror_spec(), None)
                 .expect("a consumed payload-less shell does not decline the callee"),
             1
         );
@@ -15380,7 +16937,7 @@ mod static_result_shell_tests {
     fn unit_ok_shell_returns_void_none() {
         let mut graph = unit_ok_shell();
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+            lower_result_exc_returns_for_sum(&mut graph, 0, pyerror_spec(), None)
                 .expect("a Void-payload Ok return lowers"),
             1
         );
@@ -19732,7 +21289,7 @@ mod from_residual_conversion_tests {
         };
         let (graph, _) = from_residual_tail("Result<i64,Box<InterpError>>::Err");
         assert!(
-            foreign_from_residual_sites(&graph, boxed_spec).is_empty(),
+            foreign_from_residual_sites_in(&graph, boxed_spec, None).is_empty(),
             "a boxed carrier is a reraise, not From::from"
         );
     }
@@ -19747,14 +21304,14 @@ mod from_residual_conversion_tests {
         ] {
             let (graph, _) = from_residual_tail(owner);
             assert!(
-                foreign_from_residual_sites(&graph, spec()).is_empty(),
+                foreign_from_residual_sites_in(&graph, spec(), None).is_empty(),
                 "{owner}: Option residual is return None, not From::from"
             );
         }
         let (graph, _) =
             from_residual_tail_with("ControlFlow<BytecodeCorruption,i64>::Break", "Option", 0);
         assert!(
-            foreign_from_residual_sites(&graph, spec()).is_empty(),
+            foreign_from_residual_sites_in(&graph, spec(), None).is_empty(),
             "Option FromResidual target is return None, not From::from"
         );
     }
@@ -19795,7 +21352,7 @@ mod from_residual_conversion_tests {
     fn a_long_copy_chain_still_reaches_the_foreign_break() {
         let (graph, _) =
             from_residual_tail_through_copies("ControlFlow<BytecodeCorruption,i64>::Break", 8);
-        let sites = foreign_from_residual_sites(&graph, spec());
+        let sites = foreign_from_residual_sites_in(&graph, spec(), None);
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].error_ty, "BytecodeCorruption");
         assert!(sites[0].shell.is_none());
@@ -19843,7 +21400,7 @@ mod from_residual_conversion_tests {
             Ok(_) => panic!("a copy cycle is not a carrier"),
         };
         assert!(err.contains("repeats a value"), "{err}");
-        assert!(foreign_from_residual_sites(&graph, spec()).is_empty());
+        assert!(foreign_from_residual_sites_in(&graph, spec(), None).is_empty());
     }
 
     #[test]
@@ -19851,7 +21408,7 @@ mod from_residual_conversion_tests {
         for pass_payload in [true, false] {
             let (mut graph, residual) =
                 from_residual_tail("ControlFlow<BytecodeCorruption,i64>::Break");
-            let sites = foreign_from_residual_sites(&graph, spec());
+            let sites = foreign_from_residual_sites_in(&graph, spec(), None);
             assert_eq!(sites.len(), 1);
             assert_eq!(sites[0].error_ty, "BytecodeCorruption");
             apply_foreign_from_residuals(
@@ -19985,7 +21542,7 @@ mod from_residual_conversion_tests {
     }
 
     fn apply_one(graph: &mut FunctionGraph, pass_payload: bool) -> Vec<ForeignFromSite> {
-        let sites = foreign_from_residual_sites(graph, spec());
+        let sites = foreign_from_residual_sites_in(graph, spec(), None);
         assert_eq!(sites.len(), 1);
         apply_foreign_from_residuals(
             graph,
@@ -20864,13 +22421,14 @@ mod merged_continue_tests {
             "literal Err must raise at the merged continue, not return"
         );
 
-        lower_result_exc_returns(
+        lower_result_exc_returns_for_sum(
             &mut graph,
             outcome.tail_forwards,
             crate::ErrorCarrierSpec {
                 carrier_path: "pyre_interpreter::error::PyError",
                 ..Default::default()
             },
+            None,
         )
         .expect("callee rule raises Err");
         assert!(

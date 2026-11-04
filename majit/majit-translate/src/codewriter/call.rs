@@ -4126,6 +4126,9 @@ pub struct CallControl {
     /// receive `class_set("_alloc_flavor_", "raw")` (`rclass.py
     /// getgcflavor`).
     pub raw_alloc_flavor_structs: HashSet<String>,
+    /// `_exception_class_<Enum>` rows. `CodeWriter::dual_gate_registry`
+    /// mints each hierarchy on the bookkeeper after the error carrier.
+    pub exception_class_hints: Vec<crate::front::llbc_hints::ExceptionClassHint>,
     /// `descr.py:364 is_pure = ARRAY_INSIDE._immutable_field(None)` parity.
     /// Pre-computed at `set_struct_fields` time by walking
     /// `immutable_fields_by_struct` for fields with `ImmutableRank::is_array()
@@ -4794,6 +4797,7 @@ impl CallControl {
             struct_layouts: Default::default(),
             immutable_fields_by_struct: HashMap::new(),
             raw_alloc_flavor_structs: HashSet::new(),
+            exception_class_hints: Vec::new(),
             immutable_array_types: HashSet::new(),
             unsafe_fn_stubs: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),

@@ -473,6 +473,342 @@ fn resolve_alloc_flavor_raw_identity(llbc: &Llbc, marker_path: &str, struct_name
     );
 }
 
+/// Marker-const prefix for an RPython exception class hierarchy.
+///
+/// `argument.py` `class ArgErr(Exception)` and its subclasses are one
+/// Rust enum in the interpreter. The const `_exception_class_<Enum>`
+/// declares that enum: a base class `<Enum>` (subclass of the host
+/// `Exception`) and one subclass `<Enum><Variant>` per variant. The
+/// const value is a whitespace-separated list of nesting overrides
+/// `Variant(ParentVariant)`; a variant that is absent derives from the
+/// base. An empty string is a flat hierarchy.
+const EXCEPTION_CLASS_PREFIX: &str = "_exception_class_";
+
+/// One `_exception_class_<Enum>` declaration.
+///
+/// `enum_path` is the class intern key `harvest_alloc_flavor_raw_from_llbcs`
+/// stores (`canonical_struct_name` of the crate-stripped TypeDecl path).
+/// `overrides` is the raw marker string. `variants` is the `TypeDecl`
+/// variant list in declaration order; the discriminant map is not that
+/// order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExceptionClassHint {
+    pub enum_path: String,
+    pub overrides: String,
+    pub variants: Vec<String>,
+}
+
+/// Leaf of an exception-class enum path (`argument::ArgErr` → `ArgErr`).
+pub(crate) fn exception_class_leaf(enum_path: &str) -> &str {
+    path_leaf_stripped(enum_path)
+}
+
+/// Class name of the hierarchy: the enum leaf, or that leaf concatenated
+/// with the variant name (`ArgErr` + `Missing` → `ArgErrMissing`).
+/// The names are derived here. They are not spelled in the translator.
+pub(crate) fn exception_class_qualname(enum_path: &str, variant: Option<&str>) -> String {
+    let leaf = path_leaf_stripped(enum_path);
+    match variant {
+        Some(variant) => format!("{leaf}{variant}"),
+        None => leaf.to_string(),
+    }
+}
+
+/// Whether `query` names the harvested enum identity `stored`.
+///
+/// Same comparisons as [`alloc_flavor_raw_identity_matches`]: the stored
+/// intern key, `canonical_struct_name` of the query (a bare leaf whose
+/// origin is registered), or the crate-stripped query.
+pub(crate) fn exception_class_enum_path_matches(stored: &str, query: &str) -> bool {
+    if stored == query {
+        return true;
+    }
+    let identity = majit_ir::descr::canonical_struct_name(query);
+    if stored == identity {
+        return true;
+    }
+    let stripped = strip_crate_prefix(query);
+    stripped != query && stored == stripped
+}
+
+/// Whether `name` is the base or a variant class of one hierarchy.
+///
+/// Accepted spellings are the qualname (`E`, `EB`), an enum-path
+/// spelling [`exception_class_enum_path_matches`] accepts, and
+/// `owner::variant` when `variant` is declared and `owner` is the
+/// enum path or the base qualname. The ctor stamps `synth::E::B`;
+/// the type of a marked value stamps the base leaf `E`.
+pub(crate) fn exception_class_variants_belong(
+    enum_path: &str,
+    variants: &[&str],
+    name: &str,
+) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let base = exception_class_qualname(enum_path, None);
+    if name == base || exception_class_enum_path_matches(enum_path, name) {
+        return true;
+    }
+    if variants
+        .iter()
+        .any(|variant| name == exception_class_qualname(enum_path, Some(variant)))
+    {
+        return true;
+    }
+    let Some((owner, variant)) = name.rsplit_once("::") else {
+        return false;
+    };
+    variants.contains(&variant)
+        && (exception_class_enum_path_matches(enum_path, owner) || owner == base)
+}
+
+/// Whether `name` belongs to any harvested `_exception_class_` hierarchy.
+///
+/// Empty `hints` matches nothing: an unmarked error stays on the
+/// carrier conversion.
+pub fn exception_class_name_belongs(hints: &[ExceptionClassHint], name: &str) -> bool {
+    hints.iter().any(|hint| {
+        let variants: Vec<&str> = hint.variants.iter().map(String::as_str).collect();
+        exception_class_variants_belong(&hint.enum_path, &variants, name)
+    })
+}
+
+/// Nesting edges in mint order.
+///
+/// Each pair is `(variant, parent variant)`. `None` means the base class.
+/// Declaration order is kept, except a child is emitted after its parent
+/// so `assign_inheritance_ids` sees the parent `ClassDef` first.
+/// Unknown variants, a cycle, a self-parent, a malformed token, and a
+/// duplicate override panic with `enum_name`.
+pub fn parse_exception_class_overrides(
+    enum_name: &str,
+    marker: &str,
+    variants_in_declaration_order: &[String],
+) -> Vec<(String, Option<String>)> {
+    let mut parent_of: Vec<Option<String>> = vec![None; variants_in_declaration_order.len()];
+    let mut overridden = vec![false; variants_in_declaration_order.len()];
+    for token in marker.split_whitespace() {
+        let (child, parent) = split_exception_override(enum_name, token);
+        if child == parent {
+            panic!("_exception_class_ {enum_name}: `{child}` cannot parent itself");
+        }
+        let child_index = variant_index(enum_name, variants_in_declaration_order, &child);
+        if !variants_in_declaration_order
+            .iter()
+            .any(|name| name == &parent)
+        {
+            panic!("_exception_class_ {enum_name}: unknown variant `{parent}`");
+        }
+        if overridden[child_index] {
+            panic!("_exception_class_ {enum_name}: duplicate override for `{child}`");
+        }
+        overridden[child_index] = true;
+        parent_of[child_index] = Some(parent);
+    }
+
+    let mut emitted = vec![false; variants_in_declaration_order.len()];
+    let mut order = Vec::with_capacity(variants_in_declaration_order.len());
+    while order.len() < variants_in_declaration_order.len() {
+        let next = variants_in_declaration_order
+            .iter()
+            .enumerate()
+            .find(|(index, _)| {
+                if emitted[*index] {
+                    return false;
+                }
+                match &parent_of[*index] {
+                    None => true,
+                    Some(parent) => variants_in_declaration_order
+                        .iter()
+                        .enumerate()
+                        .any(|(parent_index, name)| name == parent && emitted[parent_index]),
+                }
+            });
+        let Some((index, name)) = next else {
+            let pending: Vec<&str> = variants_in_declaration_order
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !emitted[*index])
+                .map(|(_, name)| name.as_str())
+                .collect();
+            panic!("_exception_class_ {enum_name}: cycle among {pending:?}");
+        };
+        order.push((name.clone(), parent_of[index].clone()));
+        emitted[index] = true;
+    }
+    order
+}
+
+fn variant_index(enum_name: &str, variants: &[String], name: &str) -> usize {
+    variants
+        .iter()
+        .position(|variant| variant == name)
+        .unwrap_or_else(|| panic!("_exception_class_ {enum_name}: unknown variant `{name}`"))
+}
+
+fn split_exception_override(enum_name: &str, token: &str) -> (String, String) {
+    let malformed =
+        || -> ! { panic!("_exception_class_ {enum_name}: malformed override `{token}`") };
+    let Some(open) = token.find('(') else {
+        malformed();
+    };
+    if !token.ends_with(')') || token.matches('(').count() != 1 || token.matches(')').count() != 1 {
+        malformed();
+    }
+    let child = &token[..open];
+    let parent = &token[open + 1..token.len() - 1];
+    if !is_exception_variant_ident(child) || !is_exception_variant_ident(parent) {
+        malformed();
+    }
+    (child.to_string(), parent.to_string())
+}
+
+fn is_exception_variant_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first == '_' || first.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+/// `_exception_class_<Enum>` markers in `llbcs`.
+///
+/// Resolved like [`harvest_alloc_flavor_raw_from_llbcs`]: one enum
+/// `TypeDecl` whose leaf matches the marker, or the unique one in the
+/// marker's module. The stored path is that decl's intern key. Variant
+/// names stay in `TypeDecl` order. A marker that does not resolve, is
+/// not an enum, or whose override list does not parse panics with the
+/// enum name.
+pub fn harvest_exception_class_hints_from_llbcs(llbcs: &[Llbc]) -> Vec<ExceptionClassHint> {
+    let mut out: Vec<ExceptionClassHint> = Vec::new();
+    for llbc in llbcs {
+        for gd in llbc.iter_global_decls() {
+            let path = gd.item_meta.name_path();
+            let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+            let Some(enum_name) = leaf.strip_prefix(EXCEPTION_CLASS_PREFIX) else {
+                continue;
+            };
+            if enum_name.is_empty() {
+                panic!("_exception_class_ marker `{path}` names an empty enum");
+            }
+            let overrides = global_marker_str(llbc, gd).unwrap_or_else(|| {
+                panic!(
+                    "_exception_class_ {enum_name}: marker `{path}` has an undecodable \
+                     string initializer; this signals a marker encoding/decoder drift"
+                )
+            });
+            let (enum_path, variants) = resolve_exception_class_enum(llbc, &path, enum_name);
+            let _ = parse_exception_class_overrides(enum_name, &overrides, &variants);
+            if out.iter().any(|hint| hint.enum_path == enum_path) {
+                panic!("_exception_class_ {enum_name}: duplicate hierarchy `{enum_path}`");
+            }
+            out.push(ExceptionClassHint {
+                enum_path,
+                overrides,
+                variants,
+            });
+        }
+    }
+    out
+}
+
+struct ExceptionEnumCandidate {
+    identity: String,
+    path: String,
+    variants: Vec<String>,
+}
+
+/// Resolve `_exception_class_<Enum>` to one enum intern key and its
+/// declaration-order variant names.
+fn resolve_exception_class_enum(
+    llbc: &Llbc,
+    marker_path: &str,
+    enum_name: &str,
+) -> (String, Vec<String>) {
+    let marker_stripped = strip_crate_prefix(marker_path);
+    let marker_module = path_module(&marker_stripped);
+    let mut candidates: Vec<ExceptionEnumCandidate> = Vec::new();
+    for td in llbc.iter_type_decls() {
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            continue;
+        };
+        let td_path = td.item_meta.name_path();
+        if path_leaf_stripped(&td_path) != enum_name {
+            continue;
+        }
+        let names: Vec<String> = variants
+            .iter()
+            .map(|variant| variant.name.clone())
+            .collect();
+        if names.iter().any(|name| name.is_empty()) {
+            panic!("_exception_class_ {enum_name}: empty variant name on `{td_path}`");
+        }
+        if names
+            .iter()
+            .enumerate()
+            .any(|(index, name)| names[..index].iter().any(|earlier| earlier == name))
+        {
+            panic!("_exception_class_ {enum_name}: duplicate variant `{td_path}`");
+        }
+        let identity = alloc_flavor_class_intern_key(&td_path);
+        if let Some(existing) = candidates
+            .iter()
+            .find(|candidate| candidate.identity == identity)
+        {
+            if existing.variants != names {
+                panic!(
+                    "_exception_class_ {enum_name}: enum `{identity}` has conflicting \
+                     variant lists"
+                );
+            }
+            continue;
+        }
+        candidates.push(ExceptionEnumCandidate {
+            identity,
+            path: td_path,
+            variants: names,
+        });
+    }
+    let chosen = if candidates.len() == 1 {
+        candidates.pop().expect("len == 1")
+    } else {
+        let all_named: Vec<String> = candidates
+            .iter()
+            .map(|candidate| candidate.path.clone())
+            .collect();
+        let mut in_module: Vec<ExceptionEnumCandidate> = Vec::new();
+        for candidate in candidates.drain(..) {
+            let stripped = strip_crate_prefix(&candidate.path);
+            if path_module(&stripped) == marker_module
+                && !in_module
+                    .iter()
+                    .any(|existing| existing.identity == candidate.identity)
+            {
+                in_module.push(candidate);
+            }
+        }
+        if in_module.len() == 1 {
+            in_module.pop().expect("len == 1")
+        } else {
+            let named: Vec<&str> = if in_module.is_empty() {
+                all_named.iter().map(String::as_str).collect()
+            } else {
+                in_module
+                    .iter()
+                    .map(|candidate| candidate.path.as_str())
+                    .collect()
+            };
+            panic!(
+                "_exception_class_ {enum_name}: marker `{marker_path}` does not resolve \
+                 to a unique enum TypeDecl (candidates: {named:?})"
+            );
+        }
+    };
+    (chosen.identity, chosen.variants)
+}
+
 /// Peel a one-word pointer spelling to its pointee.
 ///
 /// `*const T` / `*mut T` / `&mut T` / `&T` / `Box<T>` / `Arc<T>` /
@@ -898,7 +1234,11 @@ fn decode_bool_const(llbc: &Llbc, value: &serde_json::Value) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_str_const, marker_path_to_fn_path, parse_immutable_entry_list};
+    use super::{
+        ExceptionClassHint, decode_str_const, exception_class_enum_path_matches,
+        exception_class_qualname, harvest_exception_class_hints_from_llbcs, marker_path_to_fn_path,
+        parse_exception_class_overrides, parse_immutable_entry_list,
+    };
     use crate::model::ImmutableRank;
     use std::collections::{HashMap, HashSet};
 
@@ -1317,5 +1657,338 @@ mod tests {
             "mapdict::Other::Terminator"
         ));
         assert!(!super::alloc_flavor_raw_contains(&raw, "Terminator"));
+    }
+
+    fn names(variants: &[&str]) -> Vec<String> {
+        variants.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    #[test]
+    fn exception_class_override_empty_marker_keeps_declaration_order() {
+        let variants = names(&["A", "B", "C"]);
+        let flat = vec![
+            ("A".to_string(), None),
+            ("B".to_string(), None),
+            ("C".to_string(), None),
+        ];
+        assert_eq!(parse_exception_class_overrides("E", "", &variants), flat);
+        assert_eq!(
+            parse_exception_class_overrides("E", " \n\t", &variants),
+            flat
+        );
+    }
+
+    #[test]
+    fn exception_class_override_emits_parent_before_child() {
+        let declared = names(&["TooManyMethod", "TooMany", "Missing"]);
+        assert_eq!(
+            parse_exception_class_overrides("ArgErr", "TooManyMethod(TooMany)", &declared),
+            vec![
+                ("TooMany".to_string(), None),
+                ("TooManyMethod".to_string(), Some("TooMany".to_string())),
+                ("Missing".to_string(), None),
+            ]
+        );
+        let chain = names(&["C", "B", "A"]);
+        assert_eq!(
+            parse_exception_class_overrides("E", "C(B) B(A)", &chain),
+            vec![
+                ("A".to_string(), None),
+                ("B".to_string(), Some("A".to_string())),
+                ("C".to_string(), Some("B".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn exception_class_qualname_is_leaf_plus_variant() {
+        assert_eq!(exception_class_qualname("argument::ArgErr", None), "ArgErr");
+        assert_eq!(
+            exception_class_qualname("argument::ArgErr", Some("Missing")),
+            "ArgErrMissing"
+        );
+        assert_eq!(exception_class_qualname("synth::E", Some("C")), "EC");
+    }
+
+    #[test]
+    fn exception_class_name_belongs_accepts_base_variant_and_ctor_path() {
+        let hints = vec![super::ExceptionClassHint {
+            enum_path: "synth::E".into(),
+            overrides: "C(B)".into(),
+            variants: vec!["A".into(), "B".into(), "C".into()],
+        }];
+        let belongs = |name: &str| super::exception_class_name_belongs(&hints, name);
+        assert!(belongs("E"));
+        assert!(belongs("EA"));
+        assert!(belongs("EB"));
+        assert!(belongs("EC"));
+        assert!(belongs("synth::E"));
+        assert!(belongs("fixture::synth::E"));
+        assert!(belongs("synth::E::B"));
+        assert!(belongs("E::B"));
+        assert!(!belongs("synth::T::Y"));
+        assert!(!belongs("synth::E::Y"));
+        assert!(!belongs(""));
+        assert!(!super::exception_class_name_belongs(&[], "E"));
+    }
+
+    #[test]
+    fn exception_class_enum_path_matches_crate_prefix_not_a_shorter_stored_key() {
+        assert!(exception_class_enum_path_matches("E", "E"));
+        assert!(exception_class_enum_path_matches("E", "fixture::E"));
+        assert!(exception_class_enum_path_matches(
+            "synth::E",
+            "fixture::synth::E"
+        ));
+        // `strip_crate_prefix` drops the first segment, so a stored bare
+        // key matches `synth::E`. The stored qualified key does not match
+        // the bare leaf: the compare is stored-then-query only.
+        assert!(exception_class_enum_path_matches("E", "synth::E"));
+        assert!(!exception_class_enum_path_matches("synth::E", "E"));
+    }
+
+    #[test]
+    #[should_panic(expected = "_exception_class_ E:")]
+    fn exception_class_override_unknown_variant_panics() {
+        let _ = parse_exception_class_overrides("E", "Nope(A)", &names(&["A", "B"]));
+    }
+
+    #[test]
+    #[should_panic(expected = "_exception_class_ E:")]
+    fn exception_class_override_unknown_parent_panics() {
+        let _ = parse_exception_class_overrides("E", "A(Nope)", &names(&["A", "B"]));
+    }
+
+    #[test]
+    #[should_panic(expected = "_exception_class_ E:")]
+    fn exception_class_override_self_parent_panics() {
+        let _ = parse_exception_class_overrides("E", "A(A)", &names(&["A", "B"]));
+    }
+
+    #[test]
+    #[should_panic(expected = "_exception_class_ E:")]
+    fn exception_class_override_cycle_panics() {
+        let _ = parse_exception_class_overrides("E", "A(B) B(A)", &names(&["A", "B"]));
+    }
+
+    #[test]
+    #[should_panic(expected = "_exception_class_ E:")]
+    fn exception_class_override_duplicate_panics() {
+        let _ = parse_exception_class_overrides("E", "A(B) A(C)", &names(&["A", "B", "C"]));
+    }
+
+    #[test]
+    fn exception_class_override_malformed_tokens_panic() {
+        let variants = names(&["A", "B"]);
+        for marker in ["A", "A(", "(B)", "A()", "A(B)C", "1A(B)", "A(B C)"] {
+            let caught = std::panic::catch_unwind(|| {
+                let _ = parse_exception_class_overrides("E", marker, &variants);
+            });
+            let err = caught.unwrap_err();
+            let msg = err
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| err.downcast_ref::<&str>().copied())
+                .unwrap_or("");
+            assert!(
+                msg.contains("_exception_class_ E:"),
+                "{marker} panicked with {msg}"
+            );
+        }
+    }
+
+    fn item_meta(path: &[&str]) -> serde_json::Value {
+        let span = serde_json::json!({"data": {"file_id": 0,
+            "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        serde_json::json!({
+            "name": path.iter().map(|segment| serde_json::json!({"Ident": [segment, 0]})).collect::<Vec<_>>(),
+            "span": span,
+            "source_text": null,
+            "is_local": true,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })
+    }
+
+    fn enum_type(id: u64, path: &[&str], variants: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": id,
+            "item_meta": item_meta(path),
+            "kind": {"Enum": variants.iter().enumerate().map(|(index, name)| serde_json::json!({
+                "name": name,
+                "fields": [],
+                "discriminant": {"Scalar": {"Unsigned": ["U8", index.to_string()]}}
+            })).collect::<Vec<_>>()}
+        })
+    }
+
+    fn struct_type(id: u64, path: &[&str]) -> serde_json::Value {
+        let attr = serde_json::json!({
+            "attributes": [], "inline": null, "rename": null, "public": true
+        });
+        serde_json::json!({
+            "def_id": id,
+            "item_meta": item_meta(path),
+            "kind": {"Struct": [{
+                "name": "x",
+                "ty": {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                "attr_info": attr
+            }]}
+        })
+    }
+
+    fn marker_global(id: u64, path: &[&str], value: &str) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": id,
+            "item_meta": item_meta(path),
+            "global_kind": "NamedConst",
+            "value": {"Value": [1, [{"Str": value}, {"Deduplicated": 1}]]}
+        })
+    }
+
+    fn hint_llbc(
+        types: Vec<serde_json::Value>,
+        globals: Vec<serde_json::Value>,
+    ) -> majit_charon_reader::Llbc {
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": types,
+                "fun_decls": [],
+                "global_decls": globals,
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("hint fixture parses")
+    }
+
+    #[test]
+    fn harvest_exception_class_keeps_declaration_order_and_intern_key() {
+        let llbc = hint_llbc(
+            vec![enum_type(1, &["fixture", "synth", "E"], &["C", "B", "A"])],
+            vec![marker_global(
+                1,
+                &["fixture", "synth", "_exception_class_E"],
+                "C(B)",
+            )],
+        );
+        let hints = harvest_exception_class_hints_from_llbcs(std::slice::from_ref(&llbc));
+        assert_eq!(
+            hints,
+            vec![ExceptionClassHint {
+                enum_path: "synth::E".to_string(),
+                overrides: "C(B)".to_string(),
+                variants: names(&["C", "B", "A"]),
+            }]
+        );
+    }
+
+    #[test]
+    fn harvest_exception_class_ignores_same_leaf_struct() {
+        let llbc = hint_llbc(
+            vec![
+                struct_type(1, &["fixture", "other", "E"]),
+                enum_type(2, &["fixture", "synth", "E"], &["A"]),
+            ],
+            vec![marker_global(
+                1,
+                &["fixture", "synth", "_exception_class_E"],
+                "",
+            )],
+        );
+        let hints = harvest_exception_class_hints_from_llbcs(std::slice::from_ref(&llbc));
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].enum_path, "synth::E");
+        assert_eq!(hints[0].variants, names(&["A"]));
+    }
+
+    #[test]
+    fn harvest_exception_class_picks_the_marker_module() {
+        let llbc = hint_llbc(
+            vec![
+                enum_type(1, &["fixture", "a", "E"], &["OnlyA"]),
+                enum_type(2, &["fixture", "b", "E"], &["OnlyB"]),
+            ],
+            vec![marker_global(
+                1,
+                &["fixture", "a", "_exception_class_E"],
+                "",
+            )],
+        );
+        let hints = harvest_exception_class_hints_from_llbcs(std::slice::from_ref(&llbc));
+        assert_eq!(hints[0].enum_path, "a::E");
+        assert_eq!(hints[0].variants, names(&["OnlyA"]));
+    }
+
+    #[test]
+    fn crate_lowering_finish_copies_exception_class_hint() {
+        let llbc = hint_llbc(
+            vec![enum_type(1, &["fixture", "synth", "E"], &["C", "B", "A"])],
+            vec![marker_global(
+                1,
+                &["fixture", "synth", "_exception_class_E"],
+                "C(B)",
+            )],
+        );
+        let gc = std::collections::HashSet::<majit_ir::descr::StructId>::new();
+        let raw = std::collections::HashSet::<String>::new();
+        let state = crate::front::mir::CrateLoweringState::new(
+            &llbc,
+            &std::collections::HashSet::new(),
+            std::collections::HashMap::new(),
+            Default::default(),
+            &gc,
+            &raw,
+            None,
+            None,
+        );
+        let program = state.finish(Vec::new());
+        assert_eq!(program.exception_class_hints.len(), 1);
+        assert_eq!(program.exception_class_hints[0].enum_path, "synth::E");
+        assert_eq!(
+            program.exception_class_hints[0].variants,
+            names(&["C", "B", "A"])
+        );
+        assert_eq!(program.exception_class_hints[0].overrides, "C(B)");
+    }
+
+    #[test]
+    #[should_panic(expected = "_exception_class_ Gone:")]
+    fn harvest_exception_class_missing_enum_panics() {
+        let llbc = hint_llbc(
+            vec![],
+            vec![marker_global(1, &["fixture", "_exception_class_Gone"], "")],
+        );
+        let _ = harvest_exception_class_hints_from_llbcs(std::slice::from_ref(&llbc));
+    }
+
+    #[test]
+    #[should_panic(expected = "_exception_class_ E:")]
+    fn harvest_exception_class_bad_override_panics() {
+        let llbc = hint_llbc(
+            vec![enum_type(1, &["fixture", "E"], &["A"])],
+            vec![marker_global(
+                1,
+                &["fixture", "_exception_class_E"],
+                "Nope(A)",
+            )],
+        );
+        let _ = harvest_exception_class_hints_from_llbcs(std::slice::from_ref(&llbc));
+    }
+
+    #[test]
+    #[should_panic(expected = "_exception_class_ E:")]
+    fn harvest_exception_class_duplicate_hierarchy_panics() {
+        let llbc = hint_llbc(
+            vec![enum_type(1, &["fixture", "E"], &["A"])],
+            vec![
+                marker_global(1, &["fixture", "a", "_exception_class_E"], ""),
+                marker_global(2, &["fixture", "b", "_exception_class_E"], ""),
+            ],
+        );
+        let _ = harvest_exception_class_hints_from_llbcs(std::slice::from_ref(&llbc));
     }
 }

@@ -785,6 +785,31 @@ impl CallRegistry {
                 continue;
             }
             let qualified_owner = segs[..segs.len() - 1].join("::");
+            // A marked enum's inherent methods live on the literal base
+            // class, one function each. A variant field of the same
+            // spelling is that attr, not a method.
+            if let Some(base) = self
+                .bookkeeper
+                .exception_class_base(&qualified_owner)
+                .or_else(|| self.bookkeeper.exception_class_base(owner))
+            {
+                let variant_names = self
+                    .bookkeeper
+                    .exception_variant_class_names(&qualified_owner);
+                let clashes = variant_names.iter().any(|class_name| {
+                    reg.fields
+                        .get(class_name)
+                        .is_some_and(|rows| rows.iter().any(|row| row.name == *method))
+                });
+                if !clashes {
+                    let host = base.borrow().classdesc.borrow().pyobj.clone();
+                    host.class_set(
+                        method.clone(),
+                        ConstValue::HostObject(entry.host_object.clone()),
+                    );
+                }
+                continue;
+            }
             if reg.fields.contains_key(&qualified_owner)
                 && !reg.owner_or_variant_has_field(&qualified_owner, method)
             {
@@ -2814,5 +2839,144 @@ mod tests {
         assert!(leaf.class_get("right").is_none());
         assert_ne!(a, leaf);
         assert_ne!(b, leaf);
+    }
+
+    fn cloned_attr(
+        classdef: &Rc<RefCell<crate::annotator::classdesc::ClassDef>>,
+        name: &str,
+    ) -> Option<SomeValue> {
+        classdef
+            .borrow()
+            .attrs
+            .get(name)
+            .map(|attr| attr.s_value.clone())
+    }
+
+    fn class_pyobj(classdef: &Rc<RefCell<crate::annotator::classdesc::ClassDef>>) -> HostObject {
+        let borrowed = classdef.borrow();
+        borrowed.classdesc.borrow().pyobj.clone()
+    }
+
+    #[test]
+    fn seed_exception_class_method_lands_on_the_base_host() {
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "EA".to_string(),
+            vec![crate::front::semantic::FieldRow::named("n", "usize")],
+        );
+        fields.fields.insert(
+            "EB".to_string(),
+            vec![
+                crate::front::semantic::FieldRow::named("n", "usize"),
+                crate::front::semantic::FieldRow::named("flag", "bool"),
+            ],
+        );
+        fields.fields.insert(
+            "PT".to_string(),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0", "usize",
+            )],
+        );
+        fields.fields.insert(
+            "QB".to_string(),
+            vec![crate::front::semantic::FieldRow::named("n", "usize")],
+        );
+        fields.fields.insert(
+            "QC".to_string(),
+            vec![crate::front::semantic::FieldRow::named("extra", "bool")],
+        );
+        let registry = CallRegistry::new(Rc::clone(&bk));
+        registry.set_struct_fields(Rc::new(fields));
+        bk.mint_exception_class_hierarchies(&[
+            crate::front::llbc_hints::ExceptionClassHint {
+                enum_path: "synth::E".to_string(),
+                overrides: "C(B)".to_string(),
+                variants: vec![
+                    "A".to_string(),
+                    "B".to_string(),
+                    "C".to_string(),
+                    "D".to_string(),
+                ],
+            },
+            crate::front::llbc_hints::ExceptionClassHint {
+                enum_path: "synth::P".to_string(),
+                overrides: String::new(),
+                variants: vec!["T".to_string()],
+            },
+            crate::front::llbc_hints::ExceptionClassHint {
+                enum_path: "synth::Q".to_string(),
+                overrides: "C(B)".to_string(),
+                variants: vec!["B".to_string(), "C".to_string()],
+            },
+        ]);
+        let classify = registry.get_or_register(
+            FunctionPathKey::from_segments(["synth", "E", "classify"]),
+            signature(&["self"]),
+        );
+        let named_n = registry.get_or_register(
+            FunctionPathKey::from_segments(["synth", "E", "n"]),
+            signature(&["self"]),
+        );
+        registry.seed_struct_root_method_members();
+
+        let base = bk.exception_class_base("synth::E").expect("base E");
+        let base_host = class_pyobj(&base);
+        assert_eq!(
+            base_host.class_get("classify"),
+            Some(ConstValue::HostObject(classify.host_object.clone()))
+        );
+        assert_ne!(
+            base_host.class_get("n"),
+            Some(ConstValue::HostObject(named_n.host_object.clone()))
+        );
+        assert!(cloned_attr(&base, "n").is_none());
+        assert!(cloned_attr(&base, "flag").is_none());
+
+        let ea = bk.exception_class_variant("synth::E", "A").expect("EA");
+        let eb = bk.exception_class_variant("synth::E", "B").expect("EB");
+        let ec = bk.exception_class_variant("synth::E", "C").expect("EC");
+        let ed = bk.exception_class_variant("synth::E", "D").expect("ED");
+        assert_eq!(
+            cloned_attr(&ea, "n"),
+            Some(crate::annotator::model::s_uint())
+        );
+        assert!(cloned_attr(&ea, "flag").is_none());
+        assert_eq!(
+            cloned_attr(&eb, "n"),
+            Some(crate::annotator::model::s_uint())
+        );
+        assert_eq!(
+            cloned_attr(&eb, "flag"),
+            Some(crate::annotator::model::s_bool())
+        );
+        assert!(cloned_attr(&ec, "n").is_none());
+        assert!(cloned_attr(&ec, "flag").is_none());
+        assert!(ec.borrow().issubclass(&eb));
+        let ed_keys: Vec<_> = ed.borrow().attrs.keys().cloned().collect();
+        assert!(ed_keys.is_empty(), "ED attrs {ed_keys:?}");
+        assert!(class_pyobj(&ea).class_get("classify").is_none());
+        assert!(class_pyobj(&eb).class_get("classify").is_none());
+
+        let other = bk.intern_class_by_qualname("synth::E");
+        assert_ne!(other, base_host);
+        assert!(other.class_get("classify").is_none());
+
+        let pt = bk.exception_class_variant("synth::P", "T").expect("PT");
+        assert_eq!(
+            cloned_attr(&pt, "__pos_0"),
+            Some(crate::annotator::model::s_uint())
+        );
+        let qb = bk.exception_class_variant("synth::Q", "B").expect("QB");
+        let qc = bk.exception_class_variant("synth::Q", "C").expect("QC");
+        assert_eq!(
+            cloned_attr(&qb, "n"),
+            Some(crate::annotator::model::s_uint())
+        );
+        assert!(cloned_attr(&qc, "n").is_none());
+        assert_eq!(
+            cloned_attr(&qc, "extra"),
+            Some(crate::annotator::model::s_bool())
+        );
     }
 }

@@ -1365,6 +1365,7 @@ impl<'a> Lowering<'a> {
                     narrow_root: None,
                     window: false,
                     raw_u8: false,
+                    str_value: false,
                 })
                 .collect(),
         };

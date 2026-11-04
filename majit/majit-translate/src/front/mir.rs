@@ -426,6 +426,20 @@ pub(crate) fn absorb_semantic_program(
             }
             acc.raw_alloc_flavor_structs
                 .extend(prog.raw_alloc_flavor_structs);
+            for hint in prog.exception_class_hints {
+                if acc
+                    .exception_class_hints
+                    .iter()
+                    .any(|existing| existing.enum_path == hint.enum_path)
+                {
+                    let enum_name = crate::front::llbc_hints::exception_class_leaf(&hint.enum_path);
+                    panic!(
+                        "_exception_class_ {enum_name}: duplicate hierarchy `{}`",
+                        hint.enum_path
+                    );
+                }
+                acc.exception_class_hints.push(hint);
+            }
             acc.atomic_load_decls.extend(prog.atomic_load_decls);
         }
     }
@@ -566,6 +580,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             struct_fields: crate::front::semantic::StructFieldRegistry::default(),
             immutable_fields: std::collections::HashMap::new(),
             raw_alloc_flavor_structs: std::collections::HashSet::new(),
+            exception_class_hints: Vec::new(),
             enum_variant_by_discriminant: std::collections::HashMap::new(),
             struct_origins: std::collections::HashMap::new(),
             struct_field_attrs: std::collections::HashMap::new(),
@@ -1170,6 +1185,7 @@ fn register_ref_enum_instantiation_rows(
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
     struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    exception_class_hints: &[crate::front::llbc_hints::ExceptionClassHint],
 ) {
     for inst in insts {
         let Some(td) = llbc.type_by_id(inst.def_id) else {
@@ -1181,6 +1197,9 @@ fn register_ref_enum_instantiation_rows(
         let name = td.item_meta.name_path();
         let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
         let canon_base = strip_crate_prefix(&name);
+        if exception_class_hint_for_paths(exception_class_hints, &name, &canon_base).is_some() {
+            continue;
+        }
         // The bare leaf survives in `enum_variant_by_discriminant` only when
         // `harden_duplicate_leaf_metadata` did not withdraw it on cross-decl
         // collision; gate the ambiguous bare spellings on that, same as the
@@ -1698,6 +1717,11 @@ pub(crate) struct CrateLoweringState {
     /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
     /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
     raw_alloc_flavor_structs: std::collections::HashSet<String>,
+    /// `_exception_class_<Enum>` rows from this artefact. Bodies do not
+    /// read them. `finish` copies the vec; earlier crates stay out so
+    /// `absorb_semantic_program` is the only merge (a second copy of the
+    /// same intern key panics there).
+    exception_class_hints: Vec<crate::front::llbc_hints::ExceptionClassHint>,
     /// `_immutable_fields_<Struct>` harvested once for this artefact
     /// (`harvest_immutable_fields_from_llbcs`). Overlay dests and the
     /// raw-storage classifier look the struct up by the same keys the
@@ -1770,6 +1794,12 @@ impl CrateLoweringState {
             ));
         // Flavor is a program-wide class property; a dependency's raw classes count here too.
         raw_alloc_flavor_structs.extend(program_raw_alloc_flavor_structs.iter().cloned());
+        // This crate's markers only. A later crate's copy is merged by
+        // `absorb_semantic_program`, which rejects a repeated intern key.
+        let exception_class_hints =
+            crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
+                std::slice::from_ref(llbc),
+            );
         // ── Pass 1: walk type_decls + trait_decls ─────────────────────
         let (
             mut known_struct_names,
@@ -1785,6 +1815,7 @@ impl CrateLoweringState {
             gc_struct_ids,
             &immutable_fields,
             &raw_alloc_flavor_structs,
+            &exception_class_hints,
         );
         promote_cross_crate_stripped_keys(
             llbc,
@@ -1854,6 +1885,7 @@ impl CrateLoweringState {
             &mut struct_fields,
             &mut struct_ids,
             gc_struct_ids,
+            &exception_class_hints,
         );
         // Concrete `Entry<i64, *mut PyObject>` rows. The generic decl's
         // `key` is a type variable; extra descrs for `OS_DICT_LOOKUP`
@@ -1942,6 +1974,7 @@ impl CrateLoweringState {
             tombstoned_leaves,
             gc_struct_ids: gc_struct_ids.clone(),
             raw_alloc_flavor_structs,
+            exception_class_hints,
             immutable_fields,
             dont_look_inside,
             elidable_residual,
@@ -2677,6 +2710,7 @@ impl CrateLoweringState {
             // proc-macro hints).
             immutable_fields: std::collections::HashMap::new(),
             raw_alloc_flavor_structs: self.raw_alloc_flavor_structs.clone(),
+            exception_class_hints: self.exception_class_hints.clone(),
             enum_variant_by_discriminant,
             struct_origins,
             struct_field_attrs,
@@ -3900,11 +3934,136 @@ fn note_raw_word_owner(
     clippy::type_complexity,
     reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
 )]
+/// Variant fields of a marked exception-class enum, on the minted classes.
+///
+/// A name an ancestor already publishes is inherited and is not registered
+/// again. An empty variant and a variant whose fields are all inherited
+/// get no rows. The base class gets none. A field that is not one
+/// translated word panics with the enum, variant class, field, and type.
+fn register_exception_class_variant_fields(
+    td: &TypeDecl,
+    hint: &crate::front::llbc_hints::ExceptionClassHint,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    struct_field_attrs: &mut std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) {
+    let TypeDeclKind::Enum(variants) = &td.kind else {
+        return;
+    };
+    let enum_name = crate::front::llbc_hints::exception_class_leaf(&hint.enum_path);
+    let links = crate::front::llbc_hints::parse_exception_class_overrides(
+        enum_name,
+        &hint.overrides,
+        &hint.variants,
+    );
+    let mut published: Vec<(String, Vec<String>)> = Vec::with_capacity(variants.len());
+    for variant in variants {
+        let names = variant
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| field_decl_name(index, field))
+            .collect();
+        published.push((variant.name.clone(), names));
+    }
+    for variant_name in &hint.variants {
+        let Some(variant) = variants
+            .iter()
+            .find(|variant| variant.name == *variant_name)
+        else {
+            continue;
+        };
+        let class_name =
+            crate::front::llbc_hints::exception_class_qualname(&hint.enum_path, Some(variant_name));
+        let mut rows = Vec::new();
+        let mut attrs = Vec::new();
+        for (index, field) in variant.fields.iter().enumerate() {
+            let fname = field_decl_name(index, field);
+            if exception_ancestor_declares(&links, &published, variant_name, &fname) {
+                continue;
+            }
+            if !exception_class_attr_is_one_word(
+                &field.ty,
+                llbc,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            ) {
+                let spelling = tyref_to_ast_string(&field.ty, llbc);
+                panic!(
+                    "exception class {class_name}.{fname}: field type {spelling} is not a one-word attr"
+                );
+            }
+            // A by-value `alloc::string::String` is the rstr attr.
+            // `"str"` is the spelling `project_struct_field_type` already
+            // maps to `s_str0()` (`SomeString`). The register bank is
+            // `ValueType::Str` (`Ptr(STR)`). A borrow or raw pointer is
+            // not this helper, so it keeps the address row.
+            let by_value_string = tyref_is_by_value_alloc_string(&field.ty, llbc);
+            let row_ty = if by_value_string {
+                "str".to_string()
+            } else {
+                annotation_struct_field_type(
+                    &field.ty,
+                    llbc,
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                )
+            };
+            let attr_ty = if by_value_string {
+                ValueType::Str
+            } else {
+                tyref_to_attr_value_type_with(
+                    &field.ty,
+                    llbc,
+                    no_tombstoned_leaves(),
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                )
+            };
+            attrs.push((fname.clone(), attr_ty));
+            rows.push(field_row_from_decl(index, field, row_ty, llbc));
+        }
+        if rows.is_empty() {
+            continue;
+        }
+        struct_fields.fields.insert(class_name.clone(), rows);
+        struct_field_attrs.insert(class_name, attrs);
+    }
+}
+
+fn exception_ancestor_declares(
+    links: &[(String, Option<String>)],
+    published: &[(String, Vec<String>)],
+    variant: &str,
+    field: &str,
+) -> bool {
+    let mut current = links
+        .iter()
+        .find(|(name, _)| name == variant)
+        .and_then(|(_, parent)| parent.clone());
+    while let Some(parent) = current {
+        if published.iter().any(|(name, names)| {
+            name == &parent && names.iter().any(|candidate| candidate == field)
+        }) {
+            return true;
+        }
+        let next = parent.clone();
+        current = links
+            .iter()
+            .find(|(name, _)| name == &next)
+            .and_then(|(_, parent)| parent.clone());
+    }
+    false
+}
+
 fn derive_program_metadata(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    exception_class_hints: &[crate::front::llbc_hints::ExceptionClassHint],
 ) -> (
     std::collections::HashSet<String>,
     std::collections::HashSet<String>,
@@ -4198,6 +4357,20 @@ fn derive_program_metadata(
                 struct_origins.entry(leaf.clone()).or_insert(module);
                 known_struct_names.insert(name.clone());
                 known_struct_names.insert(leaf.clone());
+                let marked_hint =
+                    exception_class_hint_for_paths(exception_class_hints, &name, &canon_base);
+                if let Some(hint) = marked_hint {
+                    register_exception_class_variant_fields(
+                        td,
+                        hint,
+                        llbc,
+                        gc_struct_ids,
+                        raw_alloc_flavor_structs,
+                        &mut struct_fields,
+                        &mut struct_field_attrs,
+                    );
+                }
+                let marked = marked_hint.is_some();
                 // Register the enum base class in `struct_fields` with
                 // only the synthetic `__discriminant` tag — the sum-type
                 // base carries the discriminant, each variant subclass
@@ -4266,7 +4439,7 @@ fn derive_program_metadata(
                     && enum_layout
                         .as_ref()
                         .is_some_and(|layout| layout.has_branch_discriminant());
-                if !fieldless && !tag_recorded_but_unspellable {
+                if !fieldless && !tag_recorded_but_unspellable && !marked {
                     let discr_ty = discr_ty.unwrap_or("i64").to_string();
                     let rows: Vec<(String, String)> =
                         vec![("__discriminant".to_string(), discr_ty)];
@@ -4381,7 +4554,7 @@ fn derive_program_metadata(
                 let host = enum_layout
                     .as_ref()
                     .map(crate::front::host_layout::host_layout_from_type);
-                if !fieldless {
+                if !fieldless && !marked {
                     if explicit_sum_shell {
                         let mut base_offsets = std::collections::HashMap::new();
                         base_offsets.insert("__discriminant".to_string(), 0);
@@ -4412,8 +4585,9 @@ fn derive_program_metadata(
                 // Per-variant subclasses carry each variant's OWN payload
                 // fields; a fieldless enum has none, so it needs no variant
                 // subclass registration.  Only the payload-enum sum type
-                // reaches here.
-                if !fieldless {
+                // reaches here. A marked exception class projects its
+                // fields onto the minted variant classes instead.
+                if !fieldless && !marked {
                     for (vidx, v) in variants.iter().enumerate() {
                         let variant_qual = format!("{name}::{}", v.name);
                         let variant_leaf = format!("{leaf}::{}", v.name);
@@ -4592,19 +4766,22 @@ fn derive_program_metadata(
                 }
                 // discriminant → variant name, published under both the
                 // qualified path and the bare leaf so the opcode-dispatch
-                // extractor can resolve by either spelling.
-                let mut by_discr: std::collections::HashMap<i64, String> =
-                    std::collections::HashMap::new();
-                for v in variants {
-                    let variant_path = format!("{name}::{}", v.name);
-                    known_struct_names.insert(variant_path.clone());
-                    if let Some(d) = v.discriminant_i64() {
-                        by_discr.insert(d, v.name.clone());
+                // extractor can resolve by either spelling. A marked
+                // exception class has no tag and no `{enum}::{variant}` row.
+                if !marked {
+                    let mut by_discr: std::collections::HashMap<i64, String> =
+                        std::collections::HashMap::new();
+                    for v in variants {
+                        let variant_path = format!("{name}::{}", v.name);
+                        known_struct_names.insert(variant_path.clone());
+                        if let Some(d) = v.discriminant_i64() {
+                            by_discr.insert(d, v.name.clone());
+                        }
                     }
-                }
-                if !by_discr.is_empty() {
-                    enum_variant_by_discriminant.insert(name.clone(), by_discr.clone());
-                    enum_variant_by_discriminant.insert(leaf, by_discr);
+                    if !by_discr.is_empty() {
+                        enum_variant_by_discriminant.insert(name.clone(), by_discr.clone());
+                        enum_variant_by_discriminant.insert(leaf, by_discr);
+                    }
                 }
             }
             // A union's fields all start at offset 0 and only one is live,
@@ -5030,6 +5207,9 @@ impl DuplicateLeafFacts {
                 &harvest_declared_gc_facts(llbc).gc_struct_ids(),
                 no_immutable_fields(),
                 &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+                    std::slice::from_ref(llbc),
+                ),
+                &crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
                     std::slice::from_ref(llbc),
                 ),
             );
@@ -5599,6 +5779,9 @@ impl<'a> LowerContext<'a> {
             &gc_struct_ids,
             &immutable_fields,
             &raw_alloc_flavor_structs,
+            &crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
+                std::slice::from_ref(llbc),
+            ),
         );
         Self {
             llbc,
@@ -5967,9 +6150,10 @@ pub(crate) use self::lltype::{
     fixed_array_index_identity, fnptr_indirect_enabled, host_rthread_threadlocalref_llop,
     is_flattened_storage_leaf, is_rstr_str_layout_declaration, is_str_family_class_root,
     is_str_length_field_class_root, is_str_oopspec_class_root,
-    items_block_accessor_returns_its_block, nonzero_option_zero, output_type_is_objectptr,
-    push_unichr, same_nominal_adt, strip_crate_prefix, type_decl_ref_adt_id, type_decl_ref_builtin,
-    type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
+    items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
+    output_type_is_objectptr, push_unichr, same_nominal_adt, strip_crate_prefix,
+    type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn,
+    unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;
@@ -6123,7 +6307,7 @@ fn result_exc_ok_is_unit(
     llbc: &Llbc,
     error_carrier: crate::ErrorCarrierSpec<'_>,
 ) -> bool {
-    crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, error_carrier)
+    crate::front::result_exc::tyref_lowers_as_result_exc(output, llbc, error_carrier)
         && crate::front::result_exc::tyref_result_ok_is_unit(output, llbc)
 }
 
@@ -6187,11 +6371,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     } else {
         &fd.signature.output
     };
-    let result_exc_callee = crate::front::result_exc::tyref_is_result_of_carrier(
+    let carrier_result_callee = crate::front::result_exc::tyref_is_result_of_carrier(
         output,
         llbc,
         static_addrs.error_carrier,
     );
+    let exception_sum =
+        crate::front::result_exc::exception_sum_of_result(output, llbc, static_addrs.error_carrier);
+    let result_exc_callee = carrier_result_callee || exception_sum.is_some();
     let result_exc_ok_is_unit =
         result_exc_callee && crate::front::result_exc::tyref_result_ok_is_unit(output, llbc);
     let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
@@ -6452,8 +6639,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         };
         if !lo.result_exc_call_results.is_empty() {
             let carrier = static_addrs.error_carrier;
-            let foreign_sites =
-                crate::front::result_exc::foreign_from_residual_sites(&lo.graph, carrier);
+            let foreign_sites = crate::front::result_exc::foreign_from_residual_sites_in(
+                &lo.graph,
+                carrier,
+                exception_sum.as_ref(),
+            );
             let mut conversions = Vec::with_capacity(foreign_sites.len());
             for site in &foreign_sites {
                 conversions.push(
@@ -6474,7 +6664,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             let remaining_exc: Vec<_> = lo
                 .result_exc_call_results
                 .iter()
-                .filter(|(var, _, _)| fused_toint_map_err.iter().all(|fused| fused != var))
+                .filter(|call| {
+                    fused_toint_map_err
+                        .iter()
+                        .all(|fused| fused != &call.result)
+                })
                 .cloned()
                 .collect();
             if !remaining_exc.is_empty() {
@@ -6516,10 +6710,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         ) + toint_map_err_fused;
 
         if result_exc_callee {
-            crate::front::result_exc::lower_result_exc_returns(
+            crate::front::result_exc::lower_result_exc_returns_for_sum(
                 &mut lo.graph,
                 tail_forwarded_returns,
                 static_addrs.error_carrier,
+                exception_sum.as_ref(),
             )
             .map_err(LowerError::Unsupported)?;
             if result_exc_ok_is_unit {
@@ -6629,10 +6824,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             // returns cannot certify these new returns: if none of them has a
             // supported shape, the callee must decline instead of exposing a
             // mixture of unwrapped values and Result shells to its callers.
-            crate::front::result_exc::lower_result_exc_returns(
+            crate::front::result_exc::lower_result_exc_returns_for_sum(
                 &mut lo.graph,
                 0,
                 static_addrs.error_carrier,
+                exception_sum.as_ref(),
             )
             .map_err(LowerError::Unsupported)?;
             crate::front::result_exc::fuse_kind_ctor_raise(&mut lo.graph);
@@ -6804,10 +7000,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // combinator's Result was consumed in-graph (`?` / `and_then`), not
         // that the callee has no returns.
         if result_exc_callee && option_ok_or_else_disc {
-            crate::front::result_exc::lower_result_exc_returns(
+            crate::front::result_exc::lower_result_exc_returns_for_sum(
                 &mut lo.graph,
                 1,
                 static_addrs.error_carrier,
+                exception_sum.as_ref(),
             )
             .map_err(LowerError::Unsupported)?;
             crate::front::result_exc::fuse_kind_ctor_raise(&mut lo.graph);
@@ -6820,7 +7017,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // can still rebuild shells, so this runs after both.
         // `exceptiontransform.py` `transform_completely` carries `T` on the
         // normal edge and raises on the error edge.
-        let scalar_shell_owners = if result_exc_callee {
+        let scalar_shell_owners = if carrier_result_callee {
             lo.resolve_result_owners(output)
         } else {
             None
@@ -6960,6 +7157,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         lo.graph.thread_undefined_field_bases();
         // `flowcontext.py` `fixeggblocks`, once the body is a finished graph.
         lo.graph.fixeggblocks();
+        reject_rust_heap_string_attr_call(lo)?;
         Ok(())
     };
     // Framestate-threaded lowering (the GAP-B path that threads locals
@@ -7112,6 +7310,31 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         }
         Err(e) => Err(e),
     }
+}
+
+/// A by-value `String` exception attr is `Ptr(STR)`. A call that still
+/// passes that word into a rust-heap `String` ABI after format collapse
+/// is a miscompile: the callee would read `{cap, ptr, len}` off an rstr.
+fn reject_rust_heap_string_attr_call(lo: &Lowering<'_>) -> Result<(), LowerError> {
+    if lo.rust_heap_string_attr_call_results.is_empty() {
+        return Ok(());
+    }
+    for block in &lo.graph.blocks {
+        for op in &block.operations {
+            let Some(result) = op.result.as_ref() else {
+                continue;
+            };
+            if !lo.rust_heap_string_attr_call_results.contains(&result.id()) {
+                continue;
+            }
+            if matches!(op.kind, OpKind::Call { .. } | OpKind::CallResidual { .. }) {
+                return Err(LowerError::Unsupported(
+                    "String attr read as rust-heap String".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Order in which [`Lowering::lower`] walks the MIR basic blocks.
@@ -7649,6 +7872,10 @@ fn block_reachable(graph: &FunctionGraph, target: BlockId) -> bool {
     }
     false
 }
+
+#[cfg(test)]
+#[path = "mir/exception_sum.rs"]
+mod exception_sum;
 
 #[cfg(test)]
 mod tests;

@@ -857,7 +857,7 @@ fn init_someobject_defaults(
                     return item.clone();
                 }
                 // `tyref_transparent_inner_value_type` already stored this
-                // value as its integer. `__pos_0` is that word.
+                // value as its integer or STR. `__pos_0` is that word.
                 if super::model::erased_integer_positional_field(&s_self, &attr) {
                     return s_self.clone();
                 }
@@ -4595,6 +4595,11 @@ fn init_someinstance_overrides(
                 // case, the same value the classdef-less arm returns, so the
                 // read does not block the inference.
                 if attr == "__discriminant" {
+                    // The value is the exception instance. There is no tag
+                    // field and no variant-narrowing knowntypedata.
+                    if ann.bookkeeper.classdef_is_exception_class(classdef) {
+                        return s_attr;
+                    }
                     let mut si = match &s_attr {
                         SomeValue::Integer(si) => si.clone(),
                         _ => super::model::SomeInteger::new(true, false),

@@ -5263,6 +5263,7 @@ fn dict_strategy_ref_imp_layout_is_dyn_fat() {
         &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
         super::no_immutable_fields(),
         &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc)),
+        &[],
     );
     let spelling = ["dictmultiobject::DictStrategyRef", "DictStrategyRef"]
         .iter()
@@ -6667,6 +6668,7 @@ fn closure_capturing_fieldless_enum_annotates() {
         &gc_struct_ids,
         super::no_immutable_fields(),
         &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
+        &[],
     );
     let closure_key = "fixture::capture::closure";
     let attr_rows = attrs
@@ -6724,6 +6726,7 @@ fn closure_capturing_fieldless_enum_annotates() {
             &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
                 &llbc,
             )),
+            &[],
         )
         .2,
     ));
@@ -10486,6 +10489,7 @@ fn pyerror_exc_object_registry_retains_instance_ref() {
         &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
         super::no_immutable_fields(),
         &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc)),
+        &[],
     );
     let (owner, ty) = fields
         .fields

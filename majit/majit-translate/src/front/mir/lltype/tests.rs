@@ -229,6 +229,19 @@ fn family_ptr_newtype_llbc(
     wrap_name: &str,
     unwrap_name: &str,
 ) -> Llbc {
+    pointer_newtype_llbc(inner_path, wrapper_path, wrap_name, unwrap_name, false)
+}
+
+/// `gc_object` stores a `Vec` in the pointee (`adt_path_is_gc_container`),
+/// so `*mut T` is a GC object pointer. Scalar fields alone are raw storage
+/// and the wrapper would erase to that address.
+fn pointer_newtype_llbc(
+    inner_path: &[&str],
+    wrapper_path: &[&str],
+    wrap_name: &str,
+    unwrap_name: &str,
+    gc_object: bool,
+) -> Llbc {
     let inner_adt = serde_json::json!({
         "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
     });
@@ -236,13 +249,23 @@ fn family_ptr_newtype_llbc(
         "Adt": {"id": 1, "builtin": null, "generics": window_empty_generics()}
     });
     let inner_ptr = serde_json::json!({"RawPtr": [inner_adt.clone(), "Mut"]});
+    let inner_fields = if gc_object {
+        let vec_adt = serde_json::json!({
+            "Adt": {"id": 2, "builtin": null, "generics": window_empty_generics()}
+        });
+        serde_json::json!([
+            {"name": "items", "ty": vec_adt, "attr_info": null}
+        ])
+    } else {
+        serde_json::json!([
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": window_usize(), "attr_info": null}
+        ])
+    };
     let inner = serde_json::json!({
         "def_id": 0,
         "item_meta": window_meta(inner_path, true),
-        "kind": {"Struct": [
-            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
-            {"name": "length", "ty": window_usize(), "attr_info": null}
-        ]}
+        "kind": {"Struct": inner_fields}
     });
     let wrapper = serde_json::json!({
         "def_id": 1,
@@ -323,7 +346,15 @@ fn family_ptr_newtype_llbc(
             }]
         }}
     });
-    window_llbc(vec![inner, wrapper], vec![wrap, unwrap])
+    let mut types = vec![inner, wrapper];
+    if gc_object {
+        types.push(serde_json::json!({
+            "def_id": 2,
+            "item_meta": window_meta(&["alloc", "vec", "Vec"], false),
+            "kind": {"Struct": []}
+        }));
+    }
+    window_llbc(types, vec![wrap, unwrap])
 }
 
 fn wrapper_tyref() -> TyRef {
@@ -348,10 +379,13 @@ fn graph_has_wrapper_ctor_or_pos0(graph: &FunctionGraph) -> bool {
         })
 }
 
-/// `StrKey(ptr)` / `BytesKey(ptr)` construction is the inner STR pointer
-/// (`AbstractTypedStrategy.setitem` unwrap). `project_struct_field_type`
-/// already maps both to `s_str0()`; the Operand path must match so insert
-/// does not see `String ∪ Instance(StrKey|BytesKey)`.
+/// A transparent newtype is its field's low-level value.
+/// `StrKey(*mut Utf8Str)`, `BytesKey(*mut BytesBlock)`, and
+/// `other::StrKey(*mut Utf8Str)` are `ValueType::Str`: construction and
+/// `.0` are the identity (`AbstractTypedStrategy` keys by the unwrapped
+/// rstr). A transparent newtype over a non-STR GC object pointer stays a
+/// wrapper constructor. `ObjPtrKey(*mut Obj)` is also covered by
+/// `erased_str_ptr_newtype_annotates_somestring_on_construct_field_and_receiver`.
 #[test]
 fn str_family_dict_key_newtype_constructs_as_str() {
     let str_llbc = family_ptr_newtype_llbc(
@@ -412,15 +446,39 @@ fn str_family_dict_key_newtype_constructs_as_str() {
         "unwrap_lookalike",
     );
     assert!(
-        !matches!(tyref_to_value_type(&wrapper, &lookalike), ValueType::Str),
-        "other::StrKey is not the STR-family dict-key wrapper"
+        matches!(tyref_to_value_type(&wrapper, &lookalike), ValueType::Str),
+        "other::StrKey(*mut Utf8Str) is the inner STR"
     );
     let wrap_lookalike = crate::test_support::lower_function(&lookalike, "wrap_lookalike")
         .expect("lower lookalike wrap");
+    let unwrap_lookalike = crate::test_support::lower_function(&lookalike, "unwrap_lookalike")
+        .expect("lower lookalike unwrap");
     assert!(
-        graph_has_wrapper_ctor_or_pos0(&wrap_lookalike),
-        "a non-family pointer newtype keeps instantiate; graph={}",
+        !graph_has_wrapper_ctor_or_pos0(&wrap_lookalike),
+        "other::StrKey(ptr) is the STR pointer; graph={}",
         wrap_lookalike.dump()
+    );
+    assert!(
+        !graph_has_wrapper_ctor_or_pos0(&unwrap_lookalike),
+        "other::StrKey.0 is the STR pointer; graph={}",
+        unwrap_lookalike.dump()
+    );
+
+    // `rint.rs` `erased_str_ptr_newtype_annotates_somestring_on_construct_field_and_receiver`
+    // already annotates `ObjPtrKey(*mut Obj)` as a constructor.
+    let obj_llbc = pointer_newtype_llbc(
+        &["fixture", "Obj"],
+        &["fixture", "ObjPtrKey"],
+        "wrap_obj_ptr",
+        "unwrap_obj_ptr",
+        true,
+    );
+    let wrap_obj = crate::test_support::lower_function(&obj_llbc, "wrap_obj_ptr")
+        .expect("lower ObjPtrKey wrap");
+    assert!(
+        graph_has_wrapper_ctor_or_pos0(&wrap_obj),
+        "a transparent newtype over a non-STR GC object pointer stays a constructor; graph={}",
+        wrap_obj.dump()
     );
 }
 
@@ -2184,6 +2242,7 @@ fn unicode_storage_matches_real_object_llbc() {
         &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
         super::no_immutable_fields(),
         &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc)),
+        &[],
     );
     assert!(
         fields
@@ -2283,6 +2342,7 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
         &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
         super::no_immutable_fields(),
         &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc)),
+        &[],
     );
     assert_eq!(
         fields.fields.get("Constants"),
@@ -3286,6 +3346,7 @@ fn a_shelled_variant_carries_the_inherited_discriminant_as_its_first_row() {
         &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
         super::no_immutable_fields(),
         &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
+        &[],
     );
 
     assert_eq!(
@@ -8153,6 +8214,7 @@ fn type_parameter_fields_force_no_attribute_real() {
         &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
         super::no_immutable_fields(),
         &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc)),
+        &[],
     );
     let field = |owner: &str, name: &str| {
         attrs
