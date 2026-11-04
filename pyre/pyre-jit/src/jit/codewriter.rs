@@ -12543,7 +12543,7 @@ impl CodeWriter {
                             let stop_is_same = emit_graph_op_with_result(
                                 &mut graph,
                                 &stop_match.block(),
-                                "ptr_eq",
+                                "instance_ptr_eq",
                                 vec![
                                     stop_is_class.into(),
                                     pyobject_const_ref_value(stop_iteration).into(),
@@ -13527,15 +13527,17 @@ impl CodeWriter {
                         //
                         // Both variants jump on TRUE, so the exit wiring is
                         // identical to POP_JUMP_IF_TRUE; the only difference is
-                        // `ptr_eq` (POP_JUMP_IF_NONE) vs `ptr_ne`
-                        // (POP_JUMP_IF_NOT_NONE).  Neither can raise, so unlike
+                        // `instance_ptr_eq` (POP_JUMP_IF_NONE) vs `instance_ptr_ne`
+                        // (POP_JUMP_IF_NOT_NONE).  Both operands are W_Root
+                        // instances, so `jtransform.py rewrite_op_ptr_eq`
+                        // promotes the pair.  Neither can raise, so unlike
                         // the `bool`-based branches this needs no exception edge
                         // inside a `try` range.
                         Instruction::PopJumpIfNone { delta }
                         | Instruction::PopJumpIfNotNone { delta } => {
                             let identity_opname = match instruction {
-                                Instruction::PopJumpIfNone { .. } => "ptr_eq",
-                                _ => "ptr_ne",
+                                Instruction::PopJumpIfNone { .. } => "instance_ptr_eq",
+                                _ => "instance_ptr_ne",
                             };
                             let target_py_pc = pyre_interpreter::jump_target_forward(
                                 &code.instructions,
