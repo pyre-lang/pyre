@@ -271,37 +271,29 @@ mod tests {
     // `Box::from_raw` on `malloc_typed` output becomes unsound once
     // typed mallocs route through the managed allocator.
 
-    fn test_ii_layout_and_access() {
-        let t = w_specialised_tuple_ii_new(7, 11);
+    fn specialised_tuple_layouts_and_access() {
+        let ii = w_specialised_tuple_ii_new(7, 11);
         unsafe {
-            assert!(is_specialised_tuple_ii(t));
-            assert!(is_specialised_tuple(t));
-            assert!(!is_specialised_tuple_ff(t));
-            assert!(!is_specialised_tuple_oo(t));
-            assert_eq!(w_specialised_tuple_ii_getvalue(t, 0), 7);
-            assert_eq!(w_specialised_tuple_ii_getvalue(t, 1), 11);
+            assert!(is_specialised_tuple_ii(ii));
+            assert!(is_specialised_tuple(ii));
+            assert!(!is_specialised_tuple_ff(ii));
+            assert!(!is_specialised_tuple_oo(ii));
+            assert_eq!(w_specialised_tuple_ii_getvalue(ii, 0), 7);
+            assert_eq!(w_specialised_tuple_ii_getvalue(ii, 1), 11);
         }
-    }
-
-    #[test]
-    fn test_ff_layout_and_access() {
-        let t = w_specialised_tuple_ff_new(1.5, 2.25);
+        let ff = w_specialised_tuple_ff_new(1.5, 2.25);
         unsafe {
-            assert!(is_specialised_tuple_ff(t));
-            assert_eq!(w_specialised_tuple_ff_getvalue(t, 0), 1.5);
-            assert_eq!(w_specialised_tuple_ff_getvalue(t, 1), 2.25);
+            assert!(is_specialised_tuple_ff(ff));
+            assert_eq!(w_specialised_tuple_ff_getvalue(ff, 0), 1.5);
+            assert_eq!(w_specialised_tuple_ff_getvalue(ff, 1), 2.25);
         }
-    }
-
-    #[test]
-    fn test_oo_layout_and_access() {
         let a = w_int_new(100);
         let b = w_int_new(200);
-        let t = w_specialised_tuple_oo_new(a, b);
+        let oo = w_specialised_tuple_oo_new(a, b);
         unsafe {
-            assert!(is_specialised_tuple_oo(t));
-            assert_eq!(w_specialised_tuple_oo_getvalue(t, 0), a);
-            assert_eq!(w_specialised_tuple_oo_getvalue(t, 1), b);
+            assert!(is_specialised_tuple_oo(oo));
+            assert_eq!(w_specialised_tuple_oo_getvalue(oo, 0), a);
+            assert_eq!(w_specialised_tuple_oo_getvalue(oo, 1), b);
         }
     }
 

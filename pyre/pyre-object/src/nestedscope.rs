@@ -313,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cell_create() {
+    fn test_cell_create_and_set() {
         let cases = [("empty", PY_NULL), ("with_value", 0xDEAD as PyObjectRef)];
         for (name, value) in cases {
             let cell = w_cell_new(value, leak_family());
@@ -322,10 +322,6 @@ mod tests {
                 assert_eq!(w_cell_get(cell), value, "case {name}");
             }
         }
-    }
-
-    #[test]
-    fn test_cell_set() {
         let cell = w_cell_new(PY_NULL, leak_family());
         let value = 0xBEEF as PyObjectRef;
         unsafe {

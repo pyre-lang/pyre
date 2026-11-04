@@ -144,61 +144,27 @@ mod tests {
         PyPyJitPolicy::new()
     }
 
-    // `pypy/module/pypyjit/test/test_policy.py`, one test per upstream test.
+    // `pypy/module/pypyjit/test/test_policy.py`
 
     #[test]
-    fn test_id_any() {
-        assert!(looks_inside("pyre_object::intobject"));
-    }
-
-    #[test]
-    fn test_rlocale() {
-        assert!(!looks_inside("majit_rlib::rlocale"));
-    }
-
-    #[test]
-    fn test_astcompiler() {
-        assert!(!looks_inside("pyre_interpreter::astcompiler::ast"));
-    }
-
-    #[test]
-    fn test_pyparser() {
-        assert!(!looks_inside("pyre_interpreter::pyparser::parser"));
-    }
-
-    #[test]
-    fn test_property() {
-        assert!(looks_inside(
-            "pyre_interpreter::module::__builtin__::descriptor"
-        ));
-    }
-
-    #[test]
-    fn test_thread_local() {
-        assert!(looks_inside("pyre_interpreter::module::thread::os_local"));
-        assert!(looks_inside("pyre_interpreter::module::thread::os_thread"));
-    }
-
-    #[test]
-    fn test_time() {
-        assert!(looks_inside("pyre_interpreter::module::time::interp_time"));
-    }
-
-    #[test]
-    fn test_io() {
-        assert!(looks_inside(
-            "pyre_interpreter::module::_io::interp_bytesio"
-        ));
-    }
-
-    #[test]
-    fn test_thread() {
-        assert!(looks_inside("pyre_interpreter::module::thread::os_lock"));
-    }
-
-    #[test]
-    fn test_select() {
-        assert!(looks_inside("pyre_module::module::select::interp_select"));
+    fn look_inside_function_matches_upstream_policy_cases() {
+        for (module, inside) in [
+            ("pyre_object::intobject", true),
+            ("majit_rlib::rlocale", false),
+            ("majit_rlib::rsocket", false),
+            ("majit_rlib::_rsocket_rffi", true),
+            ("pyre_interpreter::astcompiler::ast", false),
+            ("pyre_interpreter::pyparser::parser", false),
+            ("pyre_interpreter::module::__builtin__::descriptor", true),
+            ("pyre_interpreter::module::thread::os_local", true),
+            ("pyre_interpreter::module::thread::os_thread", true),
+            ("pyre_interpreter::module::time::interp_time", true),
+            ("pyre_interpreter::module::_io::interp_bytesio", true),
+            ("pyre_interpreter::module::thread::os_lock", true),
+            ("pyre_module::module::select::interp_select", true),
+        ] {
+            assert_eq!(looks_inside(module), inside, "{module}");
+        }
     }
 
     #[test]
@@ -218,11 +184,7 @@ mod tests {
             assert!(policy.look_inside_pypy_module(&format!("{modname}::foo")));
         }
         assert!(!policy.look_inside_pypy_module("pypyjit::interp_resop"));
-    }
-
-    #[test]
-    fn test_see_jit_module() {
-        assert!(pypypolicy().look_inside_pypy_module("pypyjit::interp_jit"));
+        assert!(policy.look_inside_pypy_module("pypyjit::interp_jit"));
     }
 
     // The pyre-side mappings the upstream tests do not reach.
@@ -239,14 +201,6 @@ mod tests {
                 assert!(!looks_inside(&format!("{root}{modname}::moduledef")));
             }
         }
-    }
-
-    /// `rpython.rlib.rsocket` is matched exactly, like `rlocale`; its rffi
-    /// layer is not in the list.
-    #[test]
-    fn rsocket_is_rejected_and_its_rffi_layer_is_not() {
-        assert!(!looks_inside("majit_rlib::rsocket"));
-        assert!(looks_inside("majit_rlib::_rsocket_rffi"));
     }
 
     /// `func.__module__ or '?'`: a function with no module is looked into.

@@ -2719,14 +2719,12 @@ mod tests {
         assert!(std::ptr::eq(weakref_hash(weakref), first,));
     }
 
-    /// pypy/module/_weakref/interp__weakref.py force —
-    /// dead proxy must raise ReferenceError, not RuntimeError.
+    /// `force()`: dead proxy raises ReferenceError; a non-proxy is a no-op.
     #[test]
-    fn test_force_dead_proxy_raises_reference_error() {
+    fn test_force_dead_proxy_and_non_proxy() {
         let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let proxy = W_Proxy_new(pyre_object::w_none(), PY_NULL);
-        // Simulate a dead referent by setting the weak slot back to None.
         write_attr(proxy, ATTR_W_OBJ_WEAK, pyre_object::w_none());
         let err = force(proxy).unwrap_err();
         assert_eq!(err.kind, crate::PyErrorKind::ReferenceError);
@@ -2734,14 +2732,6 @@ mod tests {
             err.message_text(),
             "weakly-referenced object no longer exists"
         );
-    }
-
-    /// `force()` must be a no-op for any non-proxy operand. Otherwise the
-    /// `getattr` / `setattr` fast-path would impose proxy semantics on
-    /// every Python value.
-    #[test]
-    fn test_force_is_noop_for_non_proxy() {
-        crate::typedef::init_typeobjects();
         let plain = pyre_object::w_int_new(99);
         let result = force(plain).unwrap();
         assert!(std::ptr::eq(result, plain));

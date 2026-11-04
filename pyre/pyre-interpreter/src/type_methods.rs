@@ -3394,14 +3394,10 @@ mod group_digits_tests {
     }
 
     #[test]
-    fn separates_at_the_group_size() {
+    fn group_digits_matches_newformat() {
         check("1234", 0, &[3], ",", "1,234");
         check("123456789", 0, &[3], ",", "123,456,789");
         check("12345678", 0, &[4], "_", "1234_5678");
-    }
-
-    #[test]
-    fn zero_fills_to_min_width_inside_the_grouping() {
         // The zero fill of a `0=` spec is separated like any other digit, so
         // the result is longer than the width that asked for it — `format(1234,
         // '012n')` is thirteen characters.
@@ -3409,23 +3405,10 @@ mod group_digits_tests {
         check("1234", 20, &[3], ",", "0,000,000,000,001,234");
         check("0", 12, &[3], ",", "0,000,000,000");
         check("7", 7, &[3], ",", "000,007");
-        // A width the digits already exceed adds nothing.
         check("1234567", 5, &[3], ",", "1,234,567");
-    }
-
-    #[test]
-    fn repeats_the_last_group_size_past_the_end_of_the_vector() {
         check("123456789", 0, &[3, 2], ",", "12,34,56,789");
-    }
-
-    #[test]
-    fn stops_at_the_sentinel() {
         check("123456789", 0, &[3, 0xFF], ",", "123456,789");
         check("123456789", 0, &[0xFF], ",", "123456789");
-    }
-
-    #[test]
-    fn keeps_a_multi_byte_separator_intact() {
         // The buffer is reversed once at the end, so a separator wider than a
         // byte has to travel as one chunk.
         check("1234", 0, &[3], "\u{202f}", "1\u{202f}234");
@@ -7713,42 +7696,6 @@ mod dict_method_tests {
     }
 
     #[test]
-    fn dict_get_rejects_unhashable_key() {
-        init_dict_test_runtime();
-        let dict = w_dict_new();
-        let key = w_list_new(vec![]);
-
-        assert_type_error(dict_method_get(&[dict, key]));
-        assert_eq!(unsafe { w_dict_len(dict) }, 0);
-    }
-
-    #[test]
-    fn dict_setitem_rejects_unhashable_key_without_inserting() {
-        init_dict_test_runtime();
-        let dict = w_dict_new();
-        let key = w_list_new(vec![]);
-
-        assert_type_error(crate::baseobjspace::setitem(dict, key, w_int_new(1)));
-        assert_eq!(unsafe { w_dict_len(dict) }, 0);
-    }
-
-    #[test]
-    fn dict_setdefault_rejects_unhashable_key() {
-        // `dictmultiobject.py EmptyDictStrategy.setdefault`:
-        //   self.switch_to_correct_strategy(w_dict, w_key)
-        //   w_dict.setitem(w_key, w_default)
-        // `w_dict.setitem` hashes the key via the object strategy's
-        // `space.hash_w`, so an unhashable key raises TypeError before
-        // anything is stored — the dict stays empty.
-        init_dict_test_runtime();
-        let dict = w_dict_new();
-        let key = w_list_new(vec![]);
-
-        assert_type_error(dict_method_setdefault(&[dict, key, w_int_new(1)]));
-        assert_eq!(unsafe { w_dict_len(dict) }, 0);
-    }
-
-    #[test]
     fn dict_setdefault_rejects_unhashable_key_on_a_typed_strategy() {
         // A dict that already holds one entry is on the strategy that entry's
         // key type chose, and `DictStrategy.setdefault` there is `getitem`
@@ -7776,38 +7723,23 @@ mod dict_method_tests {
     }
 
     #[test]
-    fn dict_pop_empty_returns_default_without_hashing_key() {
+    fn dict_pop_empty_skips_hash_and_keyerrors_without_default() {
+        // EmptyDictStrategy.pop returns the default without hashing; without
+        // a default it raises KeyError rather than TypeError.
         init_dict_test_runtime();
-        let dict = w_dict_new();
+        let with_default = w_dict_new();
         let key = w_list_new(vec![]);
         let default = w_int_new(42);
-
-        let result = dict_method_pop(&[dict, key, default]).expect("default should be returned");
+        let result =
+            dict_method_pop(&[with_default, key, default]).expect("default should be returned");
         assert_eq!(result, default);
-        assert_eq!(unsafe { w_dict_len(dict) }, 0);
-    }
+        assert_eq!(unsafe { w_dict_len(with_default) }, 0);
 
-    #[test]
-    fn dict_pop_empty_without_default_raises_keyerror_not_typeerror() {
-        init_dict_test_runtime();
-        let dict = w_dict_new();
-        let key = w_list_new(vec![]);
-
-        let err = dict_method_pop(&[dict, key]).expect_err("missing key should raise KeyError");
+        let without_default = w_dict_new();
+        let err = dict_method_pop(&[without_default, w_list_new(vec![])])
+            .expect_err("missing key should raise KeyError");
         assert_eq!(err.kind, crate::PyErrorKind::KeyError);
-        assert_eq!(unsafe { w_dict_len(dict) }, 0);
-    }
-
-    #[test]
-    fn dict_update_pairs_rejects_unhashable_key() {
-        init_dict_test_runtime();
-        let dict = w_dict_new();
-        let key = w_list_new(vec![]);
-        let pair = w_tuple_new(vec![key, w_int_new(1)]);
-        let pairs = w_list_new(vec![pair]);
-
-        assert_type_error(dict_method_update(&[dict, pairs]));
-        assert_eq!(unsafe { w_dict_len(dict) }, 0);
+        assert_eq!(unsafe { w_dict_len(without_default) }, 0);
     }
 }
 

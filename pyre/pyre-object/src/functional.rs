@@ -784,65 +784,29 @@ mod range_iter_tests {
     use crate::intobject::w_int_get_value;
 
     #[test]
-    fn test_range_iter_basic() {
-        let iter = w_range_iter_new(0, 3, 1);
-        unsafe {
-            assert!(is_range_iter(iter));
-            assert!(!is_int(iter));
-
-            let v0 = w_range_iter_next(iter).unwrap();
-            assert_eq!(w_int_get_value(v0), 0);
-
-            let v1 = w_range_iter_next(iter).unwrap();
-            assert_eq!(w_int_get_value(v1), 1);
-
-            let v2 = w_range_iter_next(iter).unwrap();
-            assert_eq!(w_int_get_value(v2), 2);
-
-            assert!(w_range_iter_next(iter).is_none());
-        }
-    }
-
-    #[test]
-    fn test_range_iter_start_stop() {
-        let iter = w_range_iter_new(5, 3, 1);
-        unsafe {
-            let v0 = w_range_iter_next(iter).unwrap();
-            assert_eq!(w_int_get_value(v0), 5);
-
-            let v1 = w_range_iter_next(iter).unwrap();
-            assert_eq!(w_int_get_value(v1), 6);
-
-            let v2 = w_range_iter_next(iter).unwrap();
-            assert_eq!(w_int_get_value(v2), 7);
-
-            assert!(w_range_iter_next(iter).is_none());
-        }
-    }
-
-    #[test]
-    fn test_range_iter_negative_step() {
-        let iter = w_range_iter_new(5, 3, -1);
-        unsafe {
-            let v0 = w_range_iter_next(iter).unwrap();
-            assert_eq!(w_int_get_value(v0), 5);
-
-            let v1 = w_range_iter_next(iter).unwrap();
-            assert_eq!(w_int_get_value(v1), 4);
-
-            let v2 = w_range_iter_next(iter).unwrap();
-            assert_eq!(w_int_get_value(v2), 3);
-
-            assert!(w_range_iter_next(iter).is_none());
-        }
-    }
-
-    #[test]
-    fn test_range_iter_empty() {
-        let iter = w_range_iter_new(5, 0, 1);
-        unsafe {
-            assert!(!w_range_iter_has_next(iter));
-            assert!(w_range_iter_next(iter).is_none());
+    fn range_iter_walks_the_documented_shapes() {
+        let cases: &[(&str, i64, i64, i64, &[i64])] = &[
+            ("basic", 0, 3, 1, &[0, 1, 2]),
+            ("start_stop", 5, 3, 1, &[5, 6, 7]),
+            ("negative_step", 5, 3, -1, &[5, 4, 3]),
+            ("empty", 5, 0, 1, &[]),
+        ];
+        for &(name, start, remaining, step, expected) in cases {
+            let iter = w_range_iter_new(start, remaining, step);
+            unsafe {
+                if name == "basic" {
+                    assert!(is_range_iter(iter));
+                    assert!(!is_int(iter));
+                }
+                if expected.is_empty() {
+                    assert!(!w_range_iter_has_next(iter), "{name}");
+                }
+                for &want in expected {
+                    let v = w_range_iter_next(iter).unwrap();
+                    assert_eq!(w_int_get_value(v), want, "{name}");
+                }
+                assert!(w_range_iter_next(iter).is_none(), "{name}");
+            }
         }
     }
 
@@ -1695,25 +1659,6 @@ mod range_obj_tests {
     }
 
     #[test]
-    fn long_range_iter_yields_values() {
-        let it = w_long_range_iter_new(
-            crate::intobject::w_int_new(5),
-            crate::intobject::w_int_new(2),
-            crate::intobject::w_int_new(3),
-        );
-        unsafe {
-            assert!(is_long_range_iter(it));
-            let v0 = w_long_range_iter_next(it).unwrap();
-            assert_eq!(crate::intobject::w_int_get_value(v0), 5);
-            let v1 = w_long_range_iter_next(it).unwrap();
-            assert_eq!(crate::intobject::w_int_get_value(v1), 7);
-            let v2 = w_long_range_iter_next(it).unwrap();
-            assert_eq!(crate::intobject::w_int_get_value(v2), 9);
-            assert!(w_long_range_iter_next(it).is_none());
-        }
-    }
-
-    #[test]
     fn long_range_iter_len_has_next_next_machine_ints() {
         // Machine-int fields so `range_obj_to_bigint` allocates digits.
         let it = w_long_range_iter_new(
@@ -1722,6 +1667,7 @@ mod range_obj_tests {
             crate::intobject::w_int_new(3),
         );
         unsafe {
+            assert!(is_long_range_iter(it));
             assert_eq!(w_long_range_iter_len(it), BigInt::from(3));
             assert!(w_long_range_iter_has_next(it));
             let v0 = w_long_range_iter_next(it).unwrap();

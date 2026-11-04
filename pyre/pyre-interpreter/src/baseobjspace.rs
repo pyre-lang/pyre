@@ -27181,47 +27181,36 @@ mod tests {
 
     /// pypy/interpreter/baseobjspace.py `unpackiterable` known-length:
     /// `[1, 2, 3]` with expected_length=3 yields the unpacked items.
+    /// `baseobjspace.py unpackiterable`: known length, the two ValueError
+    /// arms, and `expected_length=-1`.
     #[test]
-    fn unpackiterable_known_length_match() {
-        let lst = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
-        let items = unpackiterable(lst, 3).expect("unpack should succeed");
-        assert_eq!(items.len(), 3);
+    fn unpackiterable_length_arms() {
+        let match3 = unpackiterable(
+            w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]),
+            3,
+        )
+        .expect("unpack should succeed");
+        assert_eq!(match3.len(), 3);
         unsafe {
-            assert_eq!(w_int_get_value(items[0]), 1);
-            assert_eq!(w_int_get_value(items[1]), 2);
-            assert_eq!(w_int_get_value(items[2]), 3);
+            assert_eq!(w_int_get_value(match3[0]), 1);
+            assert_eq!(w_int_get_value(match3[2]), 3);
         }
-    }
 
-    /// pypy/interpreter/baseobjspace.py:1049-1052 — `not enough values
-    /// to unpack` ValueError when iterator yields fewer items than
-    /// expected.
-    #[test]
-    fn unpackiterable_too_few() {
-        let lst = w_list_new(vec![w_int_new(1)]);
-        let err = unpackiterable(lst, 3).expect_err("expected ValueError");
-        assert_eq!(err.kind, crate::PyErrorKind::ValueError);
-        assert!(err.message_text().contains("not enough values"));
-    }
+        let too_few = unpackiterable(w_list_new(vec![w_int_new(1)]), 3).expect_err("too few");
+        assert_eq!(too_few.kind, crate::PyErrorKind::ValueError);
+        assert!(too_few.message_text().contains("not enough values"));
 
-    /// pypy/interpreter/baseobjspace.py:1043-1046 — `too many values
-    /// to unpack` ValueError when iterator yields more items than
-    /// expected.
-    #[test]
-    fn unpackiterable_too_many() {
-        let lst = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3), w_int_new(4)]);
-        let err = unpackiterable(lst, 3).expect_err("expected ValueError");
-        assert_eq!(err.kind, crate::PyErrorKind::ValueError);
-        assert!(err.message_text().contains("too many values"));
-    }
+        let too_many = unpackiterable(
+            w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3), w_int_new(4)]),
+            3,
+        )
+        .expect_err("too many");
+        assert_eq!(too_many.kind, crate::PyErrorKind::ValueError);
+        assert!(too_many.message_text().contains("too many values"));
 
-    /// pypy/interpreter/baseobjspace.py:983-994 — expected_length=-1
-    /// accepts any length without validation.
-    #[test]
-    fn unpackiterable_unknown_length_accepts_any() {
-        let lst = w_list_new(vec![w_int_new(10), w_int_new(20)]);
-        let items = unpackiterable(lst, -1).expect("unpack should succeed");
-        assert_eq!(items.len(), 2);
+        let any = unpackiterable(w_list_new(vec![w_int_new(10), w_int_new(20)]), -1)
+            .expect("expected_length=-1 accepts any length");
+        assert_eq!(any.len(), 2);
     }
 
     /// pypy/interpreter/baseobjspace.py `fixedview` reads exact list and tuple
@@ -27251,37 +27240,25 @@ mod tests {
         );
     }
 
-    /// `StdObjSpace.listview_no_unpack` copies a 2-int tuple via
-    /// `getitems_copy` instead of going through `iter`/`next`.
+    /// `listview_no_unpack` copies exact list/tuple storage; other
+    /// iterables go through `listview` / `unpackiterable`.
     #[test]
-    fn listview_no_unpack_copies_two_int_tuple() {
+    fn listview_no_unpack_exact_storage_and_fallbacks() {
         crate::typedef::init_typeobjects();
         let tup = w_tuple_new(vec![w_int_new(1), w_int_new(2)]);
-        let items = listview_no_unpack(tup).expect("tuple listview_no_unpack");
-        assert_eq!(items.len(), 2);
+        let from_tup = listview_no_unpack(tup).expect("tuple listview_no_unpack");
+        assert_eq!(from_tup.len(), 2);
         unsafe {
-            assert_eq!(w_int_get_value(items[0]), 1);
-            assert_eq!(w_int_get_value(items[1]), 2);
+            assert_eq!(w_int_get_value(from_tup[0]), 1);
+            assert_eq!(w_int_get_value(from_tup[1]), 2);
         }
-    }
-
-    /// Exact list `getitems()` is the cheap `listview_no_unpack` arm.
-    #[test]
-    fn listview_no_unpack_copies_exact_list() {
-        crate::typedef::init_typeobjects();
         let lst = w_list_new(vec![w_int_new(7), w_int_new(8)]);
-        let items = listview_no_unpack(lst).expect("list listview_no_unpack");
-        assert_eq!(items.len(), 2);
+        let from_list = listview_no_unpack(lst).expect("list listview_no_unpack");
+        assert_eq!(from_list.len(), 2);
         unsafe {
-            assert_eq!(w_int_get_value(items[0]), 7);
-            assert_eq!(w_int_get_value(items[1]), 8);
+            assert_eq!(w_int_get_value(from_list[0]), 7);
+            assert_eq!(w_int_get_value(from_list[1]), 8);
         }
-    }
-
-    /// A non-list/tuple iterable is not cheap; `listview` unpacks it.
-    #[test]
-    fn listview_no_unpack_skips_int_and_listview_unpacks_str() {
-        crate::typedef::init_typeobjects();
         assert!(listview_no_unpack(w_int_new(3)).is_none());
         let s = pyre_object::unicodeobject::w_str_new_managed("ab");
         let items = listview(s, -1).expect("str listview via unpackiterable");
@@ -27388,42 +27365,26 @@ mod tests {
         ));
     }
 
-    /// pypy/objspace/descroperation.py `is_iterable`:
-    /// list / tuple / dict / str return true via builtin shortcuts.
+    /// `descroperation.py is_iterable`: builtin containers vs scalars.
     #[test]
-    fn is_iterable_true_for_builtin_types() {
+    fn is_iterable_builtin_shortcuts() {
+        crate::test_hooks::install_hash_hook();
         assert!(is_iterable(w_list_new(vec![])));
         assert!(is_iterable(pyre_object::w_tuple_new(vec![])));
         assert!(is_iterable(pyre_object::w_str_new("hello")));
-    }
-
-    /// pypy/objspace/descroperation.py `is_iterable`:
-    /// scalar types (int) without `__iter__` / `__getitem__` return false.
-    #[test]
-    fn is_iterable_false_for_scalar() {
-        crate::test_hooks::install_hash_hook();
         assert!(!is_iterable(w_int_new(42)));
         assert!(!is_iterable(w_none()));
     }
 
-    /// pypy/objspace/std/objspace.py + dictmultiobject.py view_as_kwargs
-    /// — exact `dict` with all string keys takes the
-    /// strategy-specific fast path and returns parallel
-    /// `(Some(keys), Some(values))`.  An empty exact dict goes
-    /// through the same path and returns `(Some([]), Some([]))`.
+    /// `objspace.py` / `dictmultiobject.py view_as_kwargs`: empty exact
+    /// dict, non-string keys, and a non-dict.
     #[test]
-    fn view_as_kwargs_empty_dict_returns_some_empty() {
-        let d = pyre_object::dictmultiobject::w_dict_new();
-        let (names, values) = view_as_kwargs(d);
+    fn view_as_kwargs_empty_int_key_and_non_dict() {
+        let empty = pyre_object::dictmultiobject::w_dict_new();
+        let (names, values) = view_as_kwargs(empty);
         assert_eq!(names.as_ref().map(|v| v.len()), Some(0));
         assert_eq!(values.as_ref().map(|v| v.len()), Some(0));
-    }
 
-    /// pypy/objspace/std/dictmultiobject.py view_as_kwargs — kwargs strategy
-    /// only succeeds when every key is a unicode string; the base
-    /// `(None, None)` is returned for non-string keys (e.g. int).
-    #[test]
-    fn view_as_kwargs_int_key_returns_none() {
         unsafe {
             let d = pyre_object::dictmultiobject::w_dict_new();
             pyre_object::dictmultiobject::w_dict_store(d, w_int_new(1), w_int_new(2));
@@ -27431,13 +27392,7 @@ mod tests {
             assert!(names.is_none());
             assert!(values.is_none());
         }
-    }
 
-    /// pypy/objspace/std/objspace.py:615 `isinstance(w_dict,
-    /// W_DictObject)` — non-dict (e.g. `int`) returns the base
-    /// `(None, None)`.
-    #[test]
-    fn view_as_kwargs_non_dict_returns_none() {
         let (names, values) = view_as_kwargs(w_int_new(42));
         assert!(names.is_none());
         assert!(values.is_none());

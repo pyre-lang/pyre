@@ -6681,7 +6681,7 @@ mod tests {
     }
 
     #[test]
-    fn decompose_valuefmt_keeps_one_more_part_than_formats() {
+    fn decompose_valuefmt_parts_rejects_and_folds_percent() {
         // `error.py get_operrcls2` asserts `len(strings) == len(formats) + 1`
         // on what `decompose_valuefmt` hands back — including when a format
         // code sits at either end.
@@ -6698,26 +6698,21 @@ mod tests {
                 "{valuefmt:?} -> {strings:?} / {formats:?}"
             );
         }
-    }
-
-    #[test]
-    fn decompose_valuefmt_rejects_no_format_command() {
         for valuefmt in ["no format codes", ""] {
             let panic = std::panic::catch_unwind(|| super::decompose_valuefmt(valuefmt));
             assert!(panic.is_err(), "accepted {valuefmt:?}");
         }
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "invalid format string (only %8, %N, %R, %S, %T, %d or %s supported)"
-    )]
-    fn decompose_valuefmt_rejects_an_invalid_code() {
-        let _ = super::decompose_valuefmt("cannot use %q");
-    }
-
-    #[test]
-    fn decompose_valuefmt_folds_a_doubled_percent() {
+        let panic = std::panic::catch_unwind(|| super::decompose_valuefmt("cannot use %q"));
+        let payload = panic.expect_err("invalid %q must panic");
+        let text = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            text.contains("invalid format string (only %8, %N, %R, %S, %T, %d or %s supported)"),
+            "{text:?}"
+        );
         let (strings, formats) = super::decompose_valuefmt("100%% of %s");
         assert_eq!(strings, vec!["100% of ".to_string(), String::new()]);
         assert_eq!(formats, vec!["s".to_string()]);

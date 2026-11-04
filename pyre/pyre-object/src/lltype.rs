@@ -751,22 +751,10 @@ mod tests {
     // `Box::from_raw` cleanup.
 
     #[test]
-    fn malloc_returns_unique_pointers() {
+    fn malloc_writes_unique_payloads_behind_a_zeroed_gc_header() {
         let a = malloc(0u64);
         let b = malloc(0u64);
         assert_ne!(a as usize, b as usize);
-    }
-
-    #[test]
-    fn malloc_writes_value() {
-        let p = malloc(42u32);
-        unsafe {
-            assert_eq!(*p, 42);
-        }
-    }
-
-    #[test]
-    fn malloc_prepends_zeroed_gc_header() {
         let p = malloc(0x1234_5678_u64);
         unsafe {
             assert_eq!(*p, 0x1234_5678);

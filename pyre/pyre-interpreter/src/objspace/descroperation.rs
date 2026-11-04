@@ -8587,72 +8587,46 @@ mod tests {
     }
 
     #[test]
-    fn test_int_add_overflow() {
-        let a = w_int_new(i64::MAX);
-        let b = w_int_new(1);
-        let result = add(a, b).unwrap();
+    fn test_int_overflow_and_long_add_keep_long() {
         unsafe {
-            assert!(is_long(result));
+            let add_ovf = add(w_int_new(i64::MAX), w_int_new(1)).unwrap();
+            assert!(is_long(add_ovf));
             assert_eq!(
-                *w_long_get_value(result),
+                *w_long_get_value(add_ovf),
                 BigInt::from(i64::MAX) + BigInt::from(1)
             );
-        }
-    }
-
-    #[test]
-    fn test_int_sub_overflow() {
-        let a = w_int_new(i64::MIN);
-        let b = w_int_new(1);
-        let result = sub(a, b).unwrap();
-        unsafe {
-            assert!(is_long(result));
+            let sub_ovf = sub(w_int_new(i64::MIN), w_int_new(1)).unwrap();
+            assert!(is_long(sub_ovf));
             assert_eq!(
-                *w_long_get_value(result),
+                *w_long_get_value(sub_ovf),
                 BigInt::from(i64::MIN) - BigInt::from(1)
             );
-        }
-    }
-
-    #[test]
-    fn test_int_mul_overflow() {
-        let a = w_int_new(i64::MAX);
-        let b = w_int_new(2);
-        let result = mul(a, b).unwrap();
-        unsafe {
-            assert!(is_long(result));
+            let mul_ovf = mul(w_int_new(i64::MAX), w_int_new(2)).unwrap();
+            assert!(is_long(mul_ovf));
             assert_eq!(
-                *w_long_get_value(result),
+                *w_long_get_value(mul_ovf),
                 BigInt::from(i64::MAX) * BigInt::from(2)
             );
-        }
-    }
 
-    #[test]
-    fn test_long_add() {
-        let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
-        let b = w_int_new(100);
-        let result = add(a, b).unwrap();
-        unsafe {
-            assert!(is_long(result));
+            let mixed = add(
+                w_long_new(BigInt::from(i64::MAX) + BigInt::from(1)),
+                w_int_new(100),
+            )
+            .unwrap();
+            assert!(is_long(mixed));
             assert_eq!(
-                *w_long_get_value(result),
+                *w_long_get_value(mixed),
                 BigInt::from(i64::MAX) + BigInt::from(101)
             );
-        }
-    }
-
-    #[test]
-    fn test_long_add_keeps_long_when_fits() {
-        // long + int whose sum fits back in i64 stays a W_LongObject: `newlong`
-        // never demotes (withsmalllong=False), so a shrunk long keeps the long
-        // representation.
-        let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
-        let b = w_int_new(-1);
-        let result = add(a, b).unwrap();
-        unsafe {
-            assert!(is_long(result));
-            assert_eq!(*w_long_get_value(result), BigInt::from(i64::MAX));
+            // long + int whose sum fits i64 stays a W_LongObject: `newlong`
+            // never demotes (withsmalllong=False).
+            let kept = add(
+                w_long_new(BigInt::from(i64::MAX) + BigInt::from(1)),
+                w_int_new(-1),
+            )
+            .unwrap();
+            assert!(is_long(kept));
+            assert_eq!(*w_long_get_value(kept), BigInt::from(i64::MAX));
         }
     }
 
@@ -9125,9 +9099,27 @@ mod tests {
     }
 
     #[test]
-    fn test_long_truthiness() {
+    fn test_long_truthiness_bitand_and_invert() {
         assert!(is_true(w_long_new(BigInt::from(i64::MAX) + BigInt::from(1))).unwrap());
         assert!(!is_true(w_long_new(BigInt::from(0))).unwrap());
+        let anded = and_(
+            w_long_new(BigInt::from(i64::MAX) + BigInt::from(1)),
+            w_int_new(0xFF),
+        )
+        .unwrap();
+        // long & int keeps a W_LongObject even when the result fits (newlong).
+        unsafe {
+            assert!(is_long(anded));
+            assert_eq!(*w_long_get_value(anded), BigInt::from(0));
+        }
+        let inverted = invert(w_long_new(BigInt::from(i64::MAX) + BigInt::from(1))).unwrap();
+        unsafe {
+            assert!(is_long(inverted));
+            assert_eq!(
+                *w_long_get_value(inverted),
+                !(BigInt::from(i64::MAX) + BigInt::from(1))
+            );
+        }
     }
 
     #[test]
@@ -9160,7 +9152,7 @@ mod tests {
     }
 
     #[test]
-    fn test_int_pow_overflow() {
+    fn test_int_pow_and_lshift_overflow_to_long() {
         let result = pow(w_int_new(2), w_int_new(63)).unwrap();
         unsafe {
             // 2^63 overflows i64, should be long
@@ -9170,23 +9162,6 @@ mod tests {
                 BigInt::from(2).int_pow(63, None).unwrap()
             );
         }
-    }
-
-    #[test]
-    fn test_long_pow_negative_exponent_rejects_float_overflow() {
-        let huge = BigInt::one().lshift(2000).unwrap();
-        let error = pow(w_long_new(huge), w_int_new(-1)).unwrap_err();
-        assert_eq!(error.kind, PyErrorKind::OverflowError);
-        assert_eq!(error.message_text(), "int too large to convert to float");
-
-        let huge_negative_exponent = BigInt::one().lshift(2000).unwrap().neg();
-        let error = pow(w_int_new(1), w_long_new(huge_negative_exponent)).unwrap_err();
-        assert_eq!(error.kind, PyErrorKind::OverflowError);
-        assert_eq!(error.message_text(), "int too large to convert to float");
-    }
-
-    #[test]
-    fn test_int_lshift_overflow() {
         let result = lshift(w_int_new(1), w_int_new(64)).unwrap();
         unsafe {
             assert!(is_long(result));
@@ -9201,6 +9176,19 @@ mod tests {
         }
         let error = lshift(w_int_new(1), w_int_new(i64::MAX)).unwrap_err();
         assert_eq!(error.kind, PyErrorKind::MemoryError);
+    }
+
+    #[test]
+    fn test_long_pow_negative_exponent_rejects_float_overflow() {
+        let huge = BigInt::one().lshift(2000).unwrap();
+        let error = pow(w_long_new(huge), w_int_new(-1)).unwrap_err();
+        assert_eq!(error.kind, PyErrorKind::OverflowError);
+        assert_eq!(error.message_text(), "int too large to convert to float");
+
+        let huge_negative_exponent = BigInt::one().lshift(2000).unwrap().neg();
+        let error = pow(w_int_new(1), w_long_new(huge_negative_exponent)).unwrap_err();
+        assert_eq!(error.kind, PyErrorKind::OverflowError);
+        assert_eq!(error.message_text(), "int too large to convert to float");
     }
 
     #[test]
@@ -9259,31 +9247,6 @@ mod tests {
             assert!(!same_rpy_type(exact, user));
             assert!(!same_unoverridden_rpy_type(exact, user));
             assert!(same_unoverridden_rpy_type(exact, w_int_new(3)));
-        }
-    }
-
-    #[test]
-    fn test_long_bitand() {
-        let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
-        let b = w_int_new(0xFF);
-        let result = and_(a, b).unwrap();
-        // long & int keeps a W_LongObject even when the result fits (newlong).
-        unsafe {
-            assert!(is_long(result));
-            assert_eq!(*w_long_get_value(result), BigInt::from(0));
-        }
-    }
-
-    #[test]
-    fn test_invert_long() {
-        let a = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
-        let result = invert(a).unwrap();
-        unsafe {
-            assert!(is_long(result));
-            assert_eq!(
-                *w_long_get_value(result),
-                !(BigInt::from(i64::MAX) + BigInt::from(1))
-            );
         }
     }
 

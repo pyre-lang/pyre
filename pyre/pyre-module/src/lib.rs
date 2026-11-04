@@ -944,107 +944,80 @@ fn walk_optional_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 mod tests {
     use std::collections::HashMap;
 
-    /// `W_CTypePrimitiveLongDouble._copy_longdouble` is
-    /// `@jit.dont_look_inside`. The helper moved here with `_cffi_backend`.
+    /// `_cffi_backend` `dont_look_inside` helpers must publish residual
+    /// addresses under both crate spellings.
     #[cfg(all(
         not(target_arch = "wasm32"),
         feature = "host_env",
         not(feature = "sandbox")
     ))]
     #[test]
-    fn jit_trace_fnaddrs_covers_copy_longdouble() {
+    fn jit_trace_fnaddrs_covers_cffi_dont_look_inside() {
         crate::register();
         let bindings: HashMap<&'static str, i64> =
             pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
-        let expected =
-            crate::module::_cffi_backend::ctypeprim::copy_longdouble as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_module::module::_cffi_backend::ctypeprim::copy_longdouble"],
-            expected
-        );
-        assert_eq!(
-            bindings["pyre_interpreter::module::_cffi_backend::ctypeprim::copy_longdouble"],
-            expected
-        );
-    }
-
-    /// `misc.py _raw_memcopy_opaque` is `@jit.dont_look_inside`.
-    #[cfg(all(
-        not(target_arch = "wasm32"),
-        feature = "host_env",
-        not(feature = "sandbox")
-    ))]
-    #[test]
-    fn jit_trace_fnaddrs_covers_raw_memcopy_opaque() {
-        crate::register();
-        let bindings: HashMap<&'static str, i64> =
-            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
-        let expected =
-            crate::module::_cffi_backend::misc::raw_memcopy_opaque as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_module::module::_cffi_backend::misc::raw_memcopy_opaque"],
-            expected
-        );
-        assert_eq!(
-            bindings["pyre_interpreter::module::_cffi_backend::misc::raw_memcopy_opaque"],
-            expected
-        );
-    }
-
-    /// `rffi.cast(rffi.CCHARPP, data)[0] = value` is the `raw_write_ptr` oopspec.
-    #[cfg(all(
-        not(target_arch = "wasm32"),
-        feature = "host_env",
-        not(feature = "sandbox")
-    ))]
-    #[test]
-    fn jit_trace_fnaddrs_covers_raw_write_ptr() {
-        crate::register();
-        let bindings: HashMap<&'static str, i64> =
-            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
-        let expected =
-            crate::module::_cffi_backend::cdataobj::raw_write_ptr as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_module::module::_cffi_backend::cdataobj::raw_write_ptr"],
-            expected
-        );
-        assert_eq!(
-            bindings["pyre_interpreter::module::_cffi_backend::cdataobj::raw_write_ptr"],
-            expected
-        );
-    }
-
-    /// `_csv.Dialect`'s `type_object` accessor is `dont_look_inside`. It must
-    /// publish a residual address, or a traced type lookup residualizes to a
-    /// symbolic fnaddr and inline JIT descent aborts.
-    #[test]
-    fn jit_trace_fnaddrs_covers_csv_dialect_type_object() {
-        let bindings: HashMap<&'static str, i64> =
-            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
-        assert!(
-            bindings.contains_key("pyre_module::module::_csv::type_object"),
-            "_csv.Dialect type_object must publish a residual fnaddr",
-        );
-        assert!(
-            bindings.contains_key("module::_csv::type_object"),
-            "the crate-stripped alias must resolve too",
-        );
-    }
-
-    /// `#[pyre_methods]` wrappers in this crate must appear in the
-    /// process-global fnaddr table. The prepass reads the same table
-    /// from a host copy of this crate; a missing row here is the same
-    /// defect as a build script that forgot to link `pyre-module`.
-    #[test]
-    fn jit_trace_fnaddrs_covers_moved_hashlib_wrapper() {
-        let bindings: HashMap<&'static str, i64> =
-            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
-        assert!(
-            bindings.contains_key(
-                "pyre_module::module::_hashlib::hash_state_class::__majit_wrap___new__"
+        let cases: &[(&str, &str, i64)] = &[
+            (
+                "pyre_module::module::_cffi_backend::ctypeprim::copy_longdouble",
+                "pyre_interpreter::module::_cffi_backend::ctypeprim::copy_longdouble",
+                crate::module::_cffi_backend::ctypeprim::copy_longdouble as *const () as usize
+                    as i64,
             ),
-            "moved _hashlib #[pyre_methods] wrappers must publish residual fnaddrs",
-        );
+            (
+                "pyre_module::module::_cffi_backend::misc::raw_memcopy_opaque",
+                "pyre_interpreter::module::_cffi_backend::misc::raw_memcopy_opaque",
+                crate::module::_cffi_backend::misc::raw_memcopy_opaque as *const () as usize as i64,
+            ),
+            (
+                "pyre_module::module::_cffi_backend::cdataobj::raw_write_ptr",
+                "pyre_interpreter::module::_cffi_backend::cdataobj::raw_write_ptr",
+                crate::module::_cffi_backend::cdataobj::raw_write_ptr as *const () as usize as i64,
+            ),
+        ];
+        for (module_key, interpreter_key, expected) in cases {
+            assert_eq!(bindings[module_key], *expected);
+            assert_eq!(bindings[interpreter_key], *expected);
+        }
+    }
+
+    /// `#[pyre_methods]` wrappers and `dont_look_inside` accessors in this
+    /// crate must appear in the process-global fnaddr table.
+    #[test]
+    fn jit_trace_fnaddrs_covers_moved_wrappers() {
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        for (key, why) in [
+            (
+                "pyre_module::module::_csv::type_object",
+                "_csv.Dialect type_object must publish a residual fnaddr",
+            ),
+            (
+                "module::_csv::type_object",
+                "the crate-stripped alias must resolve too",
+            ),
+            (
+                "pyre_module::module::_hashlib::hash_state_class::__majit_wrap___new__",
+                "moved _hashlib #[pyre_methods] wrappers must publish residual fnaddrs",
+            ),
+            (
+                "pyre_module::module::_lzma::compressor_methods::__majit_wrap___new__",
+                "moved _lzma #[pyre_methods] wrappers must publish residual fnaddrs",
+            ),
+            (
+                "pyre_module::module::unicodedata::interp_ucd::__majit_wrap_category",
+                "moved unicodedata #[pyre_methods] wrappers must publish residual fnaddrs",
+            ),
+            (
+                "pyre_module::module::bz2::compressor_methods::__majit_wrap___new__",
+                "moved _bz2 #[pyre_methods] wrappers must publish residual fnaddrs",
+            ),
+            (
+                "pyre_module::module::_lsprof::profiler_methods::__majit_wrap___new__",
+                "moved _lsprof #[pyre_methods] wrappers must publish residual fnaddrs",
+            ),
+        ] {
+            assert!(bindings.contains_key(key), "{why}");
+        }
     }
 
     #[cfg(all(
@@ -1074,41 +1047,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn jit_trace_fnaddrs_covers_moved_lzma_wrapper() {
-        let bindings: HashMap<&'static str, i64> =
-            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
-        assert!(
-            bindings.contains_key(
-                "pyre_module::module::_lzma::compressor_methods::__majit_wrap___new__"
-            ),
-            "moved _lzma #[pyre_methods] wrappers must publish residual fnaddrs",
-        );
-    }
-
-    #[test]
-    fn jit_trace_fnaddrs_covers_moved_unicodedata_wrapper() {
-        let bindings: HashMap<&'static str, i64> =
-            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
-        assert!(
-            bindings.contains_key(
-                "pyre_module::module::unicodedata::interp_ucd::__majit_wrap_category"
-            ),
-            "moved unicodedata #[pyre_methods] wrappers must publish residual fnaddrs",
-        );
-    }
-
-    #[test]
-    fn jit_trace_fnaddrs_covers_moved_bz2_wrapper() {
-        let bindings: HashMap<&'static str, i64> =
-            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
-        assert!(
-            bindings
-                .contains_key("pyre_module::module::bz2::compressor_methods::__majit_wrap___new__"),
-            "moved _bz2 #[pyre_methods] wrappers must publish residual fnaddrs",
-        );
-    }
-
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     #[test]
     fn jit_trace_fnaddrs_covers_moved_ssl_wrapper() {
@@ -1119,18 +1057,6 @@ mod tests {
                 "pyre_module::module::_ssl::ssl_session_methods::__majit_wrap___new__"
             ),
             "moved _ssl #[pyre_methods] wrappers must publish residual fnaddrs",
-        );
-    }
-
-    #[test]
-    fn jit_trace_fnaddrs_covers_moved_lsprof_wrapper() {
-        let bindings: HashMap<&'static str, i64> =
-            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
-        assert!(
-            bindings.contains_key(
-                "pyre_module::module::_lsprof::profiler_methods::__majit_wrap___new__"
-            ),
-            "moved _lsprof #[pyre_methods] wrappers must publish residual fnaddrs",
         );
     }
 

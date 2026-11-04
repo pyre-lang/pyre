@@ -513,17 +513,12 @@ mod property_tests {
     use super::*;
 
     #[test]
-    fn test_property_create() {
+    fn property_reinit_replaces_accessors_and_clears_metadata() {
         let obj = w_property_new(PY_NULL, PY_NULL, PY_NULL, PY_NULL);
         unsafe {
             assert!(is_property(obj));
             assert!(!is_int(obj));
         }
-    }
-
-    #[test]
-    fn property_reinit_replaces_accessors_and_clears_metadata() {
-        let obj = w_property_new(PY_NULL, PY_NULL, PY_NULL, PY_NULL);
         let old_doc = crate::w_int_new(10);
         let old_name = crate::w_int_new(11);
         let fget = crate::w_int_new(1);

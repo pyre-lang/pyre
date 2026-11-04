@@ -1265,29 +1265,16 @@ mod tests {
     }
 
     #[test]
-    fn returns_none_when_unregistered() {
+    fn hook_register_clear_and_unregistered() {
         let _hook_lock = hook_test_guard();
         clear_gc_alloc_hook();
         assert!(try_gc_alloc(1, 16).is_none());
-    }
-
-    #[test]
-    fn invokes_registered_hook_with_args() {
-        let _hook_lock = hook_test_guard();
         register_gc_alloc_hook(mock_hook);
         let ptr = try_gc_alloc(7, 24);
         let call = last_mock_call();
         assert_eq!(ptr, Some(call.ptr));
         assert_eq!(call.type_id, 7);
         assert_eq!(call.payload_size, 24);
-        clear_gc_alloc_hook();
-    }
-
-    #[test]
-    fn clear_removes_hook() {
-        let _hook_lock = hook_test_guard();
-        register_gc_alloc_hook(mock_hook);
-        assert!(try_gc_alloc(1, 8).is_some());
         clear_gc_alloc_hook();
         assert!(try_gc_alloc(1, 8).is_none());
     }

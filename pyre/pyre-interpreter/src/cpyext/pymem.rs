@@ -215,15 +215,11 @@ mod tests {
     }
 
     /// A request past `PY_SSIZE_T_MAX` is refused rather than wrapped.
-    #[test]
-    fn an_oversized_request_is_refused() {
-        assert!(PyMem_Malloc(usize::MAX).is_null());
-        assert!(PyMem_Calloc(usize::MAX, 2).is_null());
-    }
-
     /// Freeing NULL is defined, as `free(NULL)` is.
     #[test]
-    fn freeing_null_is_allowed() {
+    fn oversized_and_null_free_are_defined() {
+        assert!(PyMem_Malloc(usize::MAX).is_null());
+        assert!(PyMem_Calloc(usize::MAX, 2).is_null());
         unsafe { PyMem_Free(std::ptr::null_mut()) };
         unsafe { PyMem_RawFree(std::ptr::null_mut()) };
     }
