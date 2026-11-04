@@ -5645,11 +5645,8 @@ impl PyFrame {
                 let gen_slot = roots.base();
                 let _ = roots.pin_root(w_gen);
                 crate::baseobjspace::generator_finalize(roots.get(gen_slot))?;
-                // CPython 3.14 `frame_clear_impl` finishes a never-started
-                // generator after `_PyGen_Finalize`, then clears the owned
-                // interpreter frame.  The suspended case was rejected above,
-                // so this is the same completion path used by close() and
-                // normal generator return, including severing `gi_frame`.
+                // Finish the generator (sever `gi_frame`) then drop this
+                // frame's slots.  The suspended case was rejected above.
                 unsafe {
                     crate::baseobjspace::generator_frame_is_finished(
                         roots.get(gen_slot),
@@ -5657,6 +5654,7 @@ impl PyFrame {
                         true,
                     )
                 };
+                self.clear_references();
                 crate::baseobjspace::generator_close_finalizer_boundary(
                     crate::baseobjspace::take_pending_close_finalizer(),
                 );
@@ -5678,9 +5676,11 @@ impl PyFrame {
         Ok(())
     }
 
-    /// Whether the graph behind an edge `_PyFrame_ClearExceptCode` is about to
-    /// release contains an app-level finalizer.  A false answer proves that a
-    /// prompt-finalization collection cannot run Python code.
+    /// Whether the graph this frame currently holds contains an app-level
+    /// finalizer.  Taken before `generator_frame_is_finished` cuts the
+    /// generator's frame slot, while the locals are still in place.  A false
+    /// answer proves that a prompt-finalization collection cannot run Python
+    /// code.
     #[majit_macros::dont_look_inside]
     pub(crate) fn cleared_references_have_pending_finalizer(&self) -> bool {
         if !majit_gc::gc_has_pending_finalizers() {

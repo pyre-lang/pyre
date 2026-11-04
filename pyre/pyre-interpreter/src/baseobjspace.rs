@@ -23088,20 +23088,17 @@ pub(crate) fn property_descr_delete_impl(args: &[PyObjectRef]) -> PyResult {
 /// and calls `rgc.may_ignore_finalizer(self)`.  Every path here still marks
 /// the generator exhausted, sets `frame_finished_execution`, cuts
 /// `f_backref` / `f_generator_wref`, and nulls the generator's frame slot.
-/// `clear_references` runs only when `prompt_finalization` is true
-/// (`close()`, `frame.clear()`, throw-closing), so locals drop and
-/// `generator_close_finalizer_boundary` can run `__del__` before close
-/// returns.  Normal exhaustion (`prompt_finalization` false: unpack
-/// completion, RETURN through `genentry_raise_returned` when not closing,
-/// `bh_send_ex_tail`) leaves the frame's locals intact; an escaped
-/// `gi_frame` remains a valid frame that still reports those locals.
+/// With `prompt_finalization` it also records whether the released graph has
+/// a pending finalizer, so `generator_close_finalizer_boundary` can collect
+/// and run `__del__` before `close()` returns.  It never clears the frame's
+/// slots, so a retained frame (`gi_frame`, `sys._getframe()`) keeps its
+/// locals; `frame.clear()` (`PyFrame::descr_clear`) clears them itself.
 ///
 /// Ordinary completion leaves finalization on the collector's own schedule.
-/// An explicit close first asks whether the graph behind the references being
-/// cleared contains a pending finalizer; only that case pays the full
-/// collection (`incminimark.collect(2)`) needed to discover nursery-born
-/// `hasuserdel` instances and reproduce the prompt refcount boundary of 3.14
-/// `gen_close`.
+/// An explicit close first asks whether the released graph contains a
+/// pending finalizer; only that case pays the full collection
+/// (`incminimark.collect(2)`) needed to discover nursery-born `hasuserdel`
+/// instances and run `__del__` before `close()` returns.
 pub unsafe fn generator_frame_is_finished(
     gen_obj: PyObjectRef,
     frame: &mut crate::pyframe::PyFrame,
@@ -23116,11 +23113,6 @@ pub unsafe fn generator_frame_is_finished(
     // Internal generator completion severs the owned frame directly.  Public
     // `frame.clear()` calls the generator finalizer first; routing completion
     // through it would report a normally closed coroutine as never awaited.
-    // Prompt-finalization is the path that drops locals so `__del__` can run
-    // before `close()` returns.
-    if prompt_finalization {
-        frame.clear_references();
-    }
     frame.f_backref = std::ptr::null_mut();
     // PyPy's `GeneratorOrCoroutine.frame_is_finished` (`generator.py`)
     // leaves `PyFrame.f_generator_wref` alone, but 3.15 `frame.f_generator`
@@ -23152,8 +23144,8 @@ pub unsafe fn generator_frame_is_finished(
 
 /// Whether any frame finished since the last read released a graph that can
 /// run application code -- the census [`generator_frame_is_finished`] takes
-/// before it clears a frame's references, held until `descr_close` is back on
-/// its own stack.
+/// before it cuts the generator's frame slot, held until `descr_close` is
+/// back on its own stack.
 ///
 /// The collection this gates runs `__del__`, so it cannot run from inside the
 /// teardown: `_invoke_execute_frame`'s `finally` has not restored the
