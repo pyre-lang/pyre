@@ -1889,7 +1889,7 @@ pub fn normalize_raise_cause(mut cause: PyObjectRef) -> Result<RaiseCause, PyErr
     // cause at all.
     // Same `RAISE_VARARGS` livevar as upstream's `w_cause`: the result-type
     // error below still reads the class after its constructor returned.
-    let result = pyre_object::with_roots!(cause => unsafe {
+    let mut result = pyre_object::with_roots!(cause => unsafe {
         crate::call_function(cause, &[])
     });
     if result.is_null() {
@@ -1900,8 +1900,10 @@ pub fn normalize_raise_cause(mut cause: PyObjectRef) -> Result<RaiseCause, PyErr
     // A constructor that answers something other than an exception instance
     // is wrong whatever it answered: `None` is not the `from None` spelling,
     // which never reaches this branch because `None` is not a class.
-    let invalid = (!unsafe { pyre_object::is_exception(result) })
-        .then(|| crate::error::exception_from_call_type_error(cause, result));
+    let invalid = pyre_object::with_roots!(result => {
+        (!unsafe { pyre_object::is_exception(result) })
+            .then(|| crate::error::exception_from_call_type_error(cause, result))
+    });
     Ok(RaiseCause {
         w_cause: result,
         invalid,
@@ -3514,14 +3516,16 @@ pub unsafe fn delete_name_w(frame: &mut PyFrame, w_name: PyObjectRef) -> Result<
 /// `w_name` must point to a valid `str` object.
 pub unsafe fn store_global_value_w(
     frame: &mut PyFrame,
-    w_name: PyObjectRef,
-    value: PyObjectRef,
+    mut w_name: PyObjectRef,
+    mut value: PyObjectRef,
 ) -> Result<(), PyError> {
     let hash = unsafe { pyre_object::unicodeobject::w_str_hash_memoized(w_name) };
-    let w_globals = frame.get_w_globals();
+    let mut w_globals = frame.get_w_globals();
     if !w_globals.is_null() {
-        let stored = unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_name) }
-            .is_some_and(|name| store_name_into_dict(w_globals, name, hash, value));
+        let stored = pyre_object::with_roots!(value, w_globals, w_name => unsafe {
+            pyre_object::unicodeobject::w_str_get_value_opt(w_name)
+                .is_some_and(|name| store_name_into_dict(w_globals, name, hash, value))
+        });
         if !stored {
             crate::baseobjspace::setitem(w_globals, w_name, value)?;
         }

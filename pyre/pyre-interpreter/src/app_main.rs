@@ -226,12 +226,15 @@ fn init_warnoptions(
         crate::call::call_function_impl_result(process, &[options])?;
         Ok(())
     })();
-    if let Err(e) = attempt
+    if let Err(mut e) = attempt
         && !is_import_error(&e)
     {
         // Through the same seam the traceback takes, so the two stay ordered
-        // on a mediated stderr.
+        // on a mediated stderr.  `emit_stderr` can collect; reload `e`.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let e_slot = e.pin(&_roots);
         crate::host_seam::emit_stderr(b"'import warnings' failed; traceback:\n");
+        e.reload(&_roots, e_slot);
         crate::eprint_exception(&e, true);
     }
 }

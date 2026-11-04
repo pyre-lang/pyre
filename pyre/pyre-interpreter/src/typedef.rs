@@ -29132,13 +29132,20 @@ fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "splitlines")?;
     // Bound scope: `self`, `keepends` (`PY_NULL` omitted).
-    let keepends = args
-        .get(1)
-        .copied()
-        .filter(|o| !o.is_null())
-        .map(crate::baseobjspace::is_true)
-        .transpose()?
-        .unwrap_or(false);
+    // `is_true` on `keepends` can collect; pin the receiver first so the
+    // later `bytes_like_data` / `cut_bytes_like` reads see the forwarded word.
+    let recv = args[0];
+    let keepends_obj = args.get(1).copied().filter(|o| !o.is_null());
+    let recv_roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = recv_roots.pin_roots(&[recv, keepends_obj.unwrap_or(pyre_object::PY_NULL)]);
+    let keepends = {
+        let o = recv_roots.get(recv_slot + 1);
+        if o.is_null() {
+            false
+        } else {
+            crate::baseobjspace::is_true(o)?
+        }
+    };
     // The gateway's `unwrap_spec(keepends=bool)` conversion runs before
     // `descr_splitlines` calls `_val`; observe any bytearray resize performed
     // by a re-entrant `__bool__`.
@@ -29146,10 +29153,8 @@ fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     // receiver's payload, which a collection may relocate.  The receiver is
     // rooted separately because `cut_bytes_like` preserves its concrete kind
     // and sometimes its identity.
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) }.to_vec();
-    let recv_roots = pyre_object::gc_roots::push_roots();
-    let recv_slot = recv_roots.publish(&[args[0]]);
-    recv_roots.normalize(recv_slot, 1);
+    let data =
+        unsafe { pyre_object::bytesobject::bytes_like_data(recv_roots.get(recv_slot)) }.to_vec();
     // Each `cut_bytes_like` allocates over the lines already cut.
     let mut parts = pyre_object::gc_roots::RootedItems::new();
     let mut start = 0usize;
@@ -29446,11 +29451,13 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     };
     let w_signed = signed_roots.get(signed_slot);
     drop(signed_roots);
-    let signed = (!w_signed.is_null())
-        .then_some(w_signed)
-        .map(crate::baseobjspace::is_true)
-        .transpose()?
-        .unwrap_or(false);
+    let signed = pyre_object::with_roots!(cls => {
+        (!w_signed.is_null())
+            .then_some(w_signed)
+            .map(crate::baseobjspace::is_true)
+            .transpose()
+    })?
+    .unwrap_or(false);
     // intobject.py:81-91 first tries the machine-word helper, then falls back
     // to the same linear rbigint.frombytes implementation for large input.
     let mut w_result = match majit_rlib::rbigint::frombytes_int(&bytes, byteorder, signed) {

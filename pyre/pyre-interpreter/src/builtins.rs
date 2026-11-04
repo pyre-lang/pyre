@@ -5651,16 +5651,20 @@ pub(crate) fn sys_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     // Route through the live `sys.stderr`, not directly through the host
     // seam: tests and applications are allowed to replace `sys.stderr` and
     // `sys.__excepthook__` must honor that replacement.
-    let stderr = crate::importing::get_interpreter_sys_module()
-        .and_then(|sys| crate::baseobjspace::getattr_str(sys, "stderr").ok());
     // Both renderers below run Python -- the stdlib one imports `traceback`,
     // the built-in one calls `__str__` on the chain -- so each of the three
     // objects that outlive them is published and read back from its slot; a
     // Rust local would still name the address it had before a collection moved
-    // the object.
+    // the object.  `getattr_str` on `sys.stderr` is the same collecting call.
     let _roots = pyre_object::gc_roots::push_roots();
+    let type_obj = args.first().copied().unwrap_or_else(w_none);
     let value_obj = args.get(1).copied().unwrap_or_else(w_none);
     let traceback_obj = args.get(2).copied().unwrap_or_else(w_none);
+    let args_sp = pyre_object::gc_roots::pin_roots(&[type_obj, value_obj, traceback_obj]);
+    let stderr = crate::importing::get_interpreter_sys_module()
+        .and_then(|sys| crate::baseobjspace::getattr_str(sys, "stderr").ok());
+    let value_obj = pyre_object::gc_roots::shadow_stack_get(args_sp + 1);
+    let traceback_obj = pyre_object::gc_roots::shadow_stack_get(args_sp + 2);
     let stderr_obj = match stderr {
         Some(stream) if !stream.is_null() => stream,
         _ => w_none(),
@@ -25993,9 +25997,14 @@ fn open_flags_for_mode(_mode: &str) -> i32 {
 /// PyPy `W_FileIO.descr_init`: immediately fstat every supplied/opened fd and
 /// reject directory descriptors before publishing the FileIO object.
 #[cfg(unix)]
-fn fileio_validate_fd(fd: i32, w_name: PyObjectRef) -> Result<FileioStatAtOpen, crate::PyError> {
-    let st = majit_rlib::rposix_stat::fstat(fd)
-        .map_err(|errno| crate::PyError::os_error_syscall(errno, pyre_object::PY_NULL))?;
+fn fileio_validate_fd(
+    fd: i32,
+    mut w_name: PyObjectRef,
+) -> Result<FileioStatAtOpen, crate::PyError> {
+    let st = pyre_object::with_roots!(w_name => {
+        majit_rlib::rposix_stat::fstat(fd)
+            .map_err(|errno| crate::PyError::os_error_syscall(errno, pyre_object::PY_NULL))
+    })?;
     if st.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFDIR as u32 {
         return Err(crate::PyError::os_error_syscall(libc::EISDIR, w_name));
     }
@@ -26607,19 +26616,20 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Ok(pyre_object::gc_roots::shadow_stack_get(wrapper_slot));
     }
 
+    // Keep the encoded bytes: surrogateescape code points can spell bytes
+    // that are not valid UTF-8, and the OS seam must receive them verbatim.
+    // The resolved path owns a bracket of its own, above this one; this one
+    // stays open until the resolved path is gone.  `is_true` on `closefd`
+    // can collect, so the path/opener words are published first.
+    let opener_present = opener_obj.is_some();
+    let opener_word = opener_obj.unwrap_or(pyre_object::PY_NULL);
+    let path_roots = pyre_object::gc_roots::push_roots();
+    let path_base = path_roots.pin_roots(&[path_obj, opener_word]);
     if closefd_obj.map(crate::baseobjspace::is_true).transpose()? == Some(false) {
         return Err(crate::PyError::value_error(
             "Cannot use closefd=False with file name",
         ));
     }
-
-    // Keep the encoded bytes: surrogateescape code points can spell bytes
-    // that are not valid UTF-8, and the OS seam must receive them verbatim.
-    // The resolved path owns a bracket of its own, above this one; this one
-    // stays open until the resolved path is gone.
-    let opener_present = opener_obj.is_some();
-    let path_roots = pyre_object::gc_roots::push_roots();
-    let path_base = path_roots.pin_roots(&[path_obj, opener_obj.unwrap_or(pyre_object::PY_NULL)]);
     let resolved_path = crate::gateway::fsencode_path_w(path_roots.get(path_base));
     let resolved_path = resolved_path?;
     let path_bytes = &resolved_path.as_bytes;

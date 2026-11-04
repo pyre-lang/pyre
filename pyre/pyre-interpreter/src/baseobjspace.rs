@@ -15284,10 +15284,16 @@ pub fn readonly_descr_attr_raise_is_stable(obj: PyObjectRef, name: &str) -> Opti
 /// per-class `GetSetProperty` descriptors and the instance-attribute store
 /// path.  `PY_NULL` means the name is not one this exception kind
 /// declares, so the caller falls back to the instance dict.
-pub(crate) fn exception_attr_set(mut obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
+pub(crate) fn exception_attr_set(
+    mut obj: PyObjectRef,
+    name: &str,
+    mut value: PyObjectRef,
+) -> PyResult {
     if matches!(name, "message" | "exceptions")
-        && crate::builtins::lookup_exc_class("BaseExceptionGroup")
-            .is_some_and(|base_group| isinstance(obj, base_group).unwrap_or(false))
+        && pyre_object::with_roots!(obj, value => {
+            crate::builtins::lookup_exc_class("BaseExceptionGroup")
+                .is_some_and(|base_group| isinstance(obj, base_group).unwrap_or(false))
+        })
     {
         return Err(PyError::attribute_error("readonly attribute"));
     }
@@ -25494,14 +25500,14 @@ fn warn_unawaited_coroutine(mut gen_obj: PyObjectRef) {
             .unwrap_or_else(|_| Wtf8Buf::from_string("<coroutine object>".to_string()));
     let where_desc = crate::display::wtf8_format!("while finalizing coroutine ", repr);
 
-    let w_warnings =
-        pyre_object::with_roots!(gen_obj => crate::importing::get_sys_module("warnings"));
-    let hook_result = w_warnings.and_then(|warnings| {
-        match findattr_result(warnings, "_warn_unawaited_coroutine") {
-            Ok(Some(hook)) => Some(crate::call::call_function_impl_result(hook, &[gen_obj])),
-            Ok(None) => None,
-            Err(err) => Some(Err(err)),
-        }
+    let hook_result = pyre_object::with_roots!(gen_obj => {
+        crate::importing::get_sys_module("warnings").and_then(|warnings| {
+            match findattr_result(warnings, "_warn_unawaited_coroutine") {
+                Ok(Some(hook)) => Some(crate::call::call_function_impl_result(hook, &[gen_obj])),
+                Ok(None) => None,
+                Err(err) => Some(Err(err)),
+            }
+        })
     });
     let warned = match hook_result {
         Some(Ok(_)) => true,
