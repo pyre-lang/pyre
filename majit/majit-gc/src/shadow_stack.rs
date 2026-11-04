@@ -1319,6 +1319,13 @@ pub fn shadow_stack_slot() -> ShadowStackSlot {
 }
 
 impl ShadowStackSlot {
+    /// The resolved cell address as one machine word, the form
+    /// [`cache_root_stack_slot`] stores and [`slot_from_cached`] reads back.
+    #[inline]
+    pub fn as_word(self) -> usize {
+        self.0 as usize
+    }
+
     /// `push` through this resolved handle: one store and a bump of
     /// `root_stack_top` (`ShadowStackRootWalker.push_stack`).
     #[inline]
@@ -1372,7 +1379,7 @@ impl ShadowStackSlot {
 #[inline]
 pub fn cache_root_stack_slot(cached: &Cell<usize>) {
     if cached.get() == 0 {
-        cached.set(shadow_stack_slot().0 as usize);
+        cached.set(shadow_stack_slot().as_word());
     }
 }
 
