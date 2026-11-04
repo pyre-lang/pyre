@@ -407,6 +407,37 @@ impl<K, V, S: Default> Default for RDict<K, V, S> {
     }
 }
 
+/// `ll_newdict` plus `ll_no_initial_index` (`rordereddict.py`).
+///
+/// Field stores into an already-malloc'd `dicttable`. Empty `indexes` /
+/// `entries` are null, pyre's spelling of `_ll_empty_array` length 0.
+/// Hasher is a ZST for every storage family that uses this helper.
+///
+/// Writes each field of `*d`. A whole-struct `ptr::write` of `RDict` would
+/// pass the 48-byte table by value.
+///
+/// `hash_builder` is `BuildHasherDefault<H>`, Void (`heaptracker.py`
+/// `_names_without_voids`). `ll_newdict` has no hasher field; a
+/// `ptr::write` of `S::default()` keeps `Default::default` as a residual
+/// in the look_inside graph.
+///
+/// `specialize_argtype(0)` (`specialize.py` `specialize_argtype`) without
+/// `dont_look_inside`: Charon extracts with `monomorphize: false`, so a
+/// generic `#[inline(always)]` body stays one FunDecl and the walker
+/// residualizes it. The hint splits a look_inside graph per `*mut RDict`.
+#[majit_macros::specialize_argtype(0)]
+#[inline(always)]
+pub unsafe fn rdict_ll_newdict_in_place<K, V, S: Default>(d: *mut RDict<K, V, S>) {
+    unsafe {
+        (*d).indexes = std::ptr::null_mut();
+        (*d).entries = std::ptr::null_mut();
+        (*d).num_live_items = 0;
+        (*d).num_ever_used_items = 0;
+        (*d).resize_counter = 0;
+        (*d).generation = 0;
+    }
+}
+
 impl<K, V, S> RDict<K, V, S> {
     /// Sized for `capacity` entries without a reindex, which is what
     /// `_ll_dict_resize_to` would have picked once they were all in

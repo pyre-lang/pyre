@@ -1197,6 +1197,7 @@ pub const W_DICT_GC_TYPE_ID: u32 = 29;
 /// promotion target.
 pub type ObjectDictStorage =
     crate::rordereddict::RDict<ObjectKey, PyObjectRef, ObjectKeyBuildHasher>;
+pub const OBJECT_DICT_STORAGE_SIZE: usize = std::mem::size_of::<ObjectDictStorage>();
 
 #[inline]
 pub fn object_dict_storage_new() -> ObjectDictStorage {
@@ -1243,6 +1244,7 @@ pub type IntKeyHash = std::hash::BuildHasherDefault<IntKeyHasher>;
 /// See [`BytesDictStorage`].
 pub type BytesKeyHash = ObjectKeyBuildHasher;
 pub type IntDictStorage = crate::rordereddict::RDict<i64, PyObjectRef, IntKeyHash>;
+pub const INT_DICT_STORAGE_SIZE: usize = std::mem::size_of::<IntDictStorage>();
 /// `BytesDictStrategy` backing — erased `Dict[str, W_Root]`
 /// (`dictmultiobject.py`). `unerase` yields [`BytesKey`], the block the
 /// wrapped `bytes` object holds.
@@ -1252,6 +1254,7 @@ pub type IntDictStorage = crate::rordereddict::RDict<i64, PyObjectRef, IntKeyHas
 /// hands it to the table unchanged, the way `ll_dict_lookup` takes
 /// `d.keyhash(key)` (`rordereddict.py`).
 pub type BytesDictStorage = crate::rordereddict::RDict<BytesKey, PyObjectRef, BytesKeyHash>;
+pub const BYTES_DICT_STORAGE_SIZE: usize = std::mem::size_of::<BytesDictStorage>();
 
 macro_rules! dict_storage_gc_type_id {
     ($atomic:ident, $setter:ident, $getter:ident, $ty:ty, $doc:literal) => {
@@ -7868,13 +7871,21 @@ impl DictStrategy for ObjectDictStrategy {
     fn get_empty_storage(&self) -> GCREF {
         // `dictmultiobject.py get_empty_storage`: erased `r_dict(dict_keys_equal,
         // hash_w)` = `GcStruct("dicttable")` (rdict.py), a nursery object.
-        // `kwargsdict.py get_empty_storage` already uses the young-nonmoving
-        // box; a born-old table stays on `old_objects_pointing_to_young` and
-        // keeps a discarded type's GetSets alive at every minor.
-        crate::gc_storage::gc_alloc_young_storage_box(
-            crate::dictmultiobject::object_dict_storage_new(),
-            crate::dictmultiobject::object_dict_storage_gc_type_id(),
-        ) as GCREF
+        // `ll_newdict`: malloc + field stores (`rordereddict.py`).
+        let tid = crate::dictmultiobject::object_dict_storage_gc_type_id();
+        let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw(
+            tid,
+            crate::dictmultiobject::OBJECT_DICT_STORAGE_SIZE,
+        );
+        let d = if raw.is_null() {
+            crate::gc_storage::malloc_raw_zeroed::<crate::dictmultiobject::ObjectDictStorage>()
+        } else {
+            raw as *mut crate::dictmultiobject::ObjectDictStorage
+        };
+        unsafe {
+            crate::rordereddict::rdict_ll_newdict_in_place(d);
+        }
+        d as GCREF
     }
 
     /// `dictmultiobject.py getitem` — `self.unerase
@@ -8055,12 +8066,21 @@ impl DictStrategy for BytesDictStrategy {
     /// off the `bytes` object.
     fn get_empty_storage(&self) -> GCREF {
         // `dictmultiobject.py get_empty_storage`: erased `{}` is a nursery
-        // `dicttable`. `ll_dict_grow`'s `d.entries = newitems` write barrier
-        // can remember a young `DICTENTRYARRAY` only from a MiniMark header.
-        crate::gc_storage::gc_alloc_young_storage_box(
-            crate::dictmultiobject::BytesDictStorage::new(),
-            crate::dictmultiobject::bytes_dict_storage_gc_type_id(),
-        ) as GCREF
+        // `dicttable`. `ll_newdict`: malloc + field stores.
+        let tid = crate::dictmultiobject::bytes_dict_storage_gc_type_id();
+        let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw(
+            tid,
+            crate::dictmultiobject::BYTES_DICT_STORAGE_SIZE,
+        );
+        let d = if raw.is_null() {
+            crate::gc_storage::malloc_raw_zeroed::<crate::dictmultiobject::BytesDictStorage>()
+        } else {
+            raw as *mut crate::dictmultiobject::BytesDictStorage
+        };
+        unsafe {
+            crate::rordereddict::rdict_ll_newdict_in_place(d);
+        }
+        d as GCREF
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.getitem`.
@@ -8270,13 +8290,21 @@ impl DictStrategy for UnicodeDictStrategy {
     fn get_empty_storage(&self) -> GCREF {
         // `dictmultiobject.py create_empty_unicode_key_dict`
         // returns an empty `r_dict(unicode_eq, unicode_hash)`, a nursery
-        // `dicttable`. Type namespaces (`type(name, (), {})`) land here
-        // on the first str store; a born-old box promoted the type at
-        // every minor through the remembered set.
-        crate::gc_storage::gc_alloc_young_storage_box(
-            crate::dictmultiobject::object_dict_storage_new(),
-            crate::dictmultiobject::object_dict_storage_gc_type_id(),
-        ) as GCREF
+        // `dicttable`. `ll_newdict`: malloc + field stores.
+        let tid = crate::dictmultiobject::object_dict_storage_gc_type_id();
+        let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw(
+            tid,
+            crate::dictmultiobject::OBJECT_DICT_STORAGE_SIZE,
+        );
+        let d = if raw.is_null() {
+            crate::gc_storage::malloc_raw_zeroed::<crate::dictmultiobject::ObjectDictStorage>()
+        } else {
+            raw as *mut crate::dictmultiobject::ObjectDictStorage
+        };
+        unsafe {
+            crate::rordereddict::rdict_ll_newdict_in_place(d);
+        }
+        d as GCREF
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.getitem`.
@@ -8541,11 +8569,21 @@ impl DictStrategy for IntDictStrategy {
     /// (`setfield_gc` on reassign).
     fn get_empty_storage(&self) -> GCREF {
         // `dictmultiobject.py IntDictStrategy.get_empty_storage`: erased `{}`
-        // is a nursery `dicttable`.
-        crate::gc_storage::gc_alloc_young_storage_box(
-            crate::dictmultiobject::IntDictStorage::new(),
-            crate::dictmultiobject::int_dict_storage_gc_type_id(),
-        ) as GCREF
+        // is a nursery `dicttable`. `ll_newdict`: malloc + field stores.
+        let tid = crate::dictmultiobject::int_dict_storage_gc_type_id();
+        let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw(
+            tid,
+            crate::dictmultiobject::INT_DICT_STORAGE_SIZE,
+        );
+        let d = if raw.is_null() {
+            crate::gc_storage::malloc_raw_zeroed::<crate::dictmultiobject::IntDictStorage>()
+        } else {
+            raw as *mut crate::dictmultiobject::IntDictStorage
+        };
+        unsafe {
+            crate::rordereddict::rdict_ll_newdict_in_place(d);
+        }
+        d as GCREF
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.getitem`.
