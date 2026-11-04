@@ -86,9 +86,6 @@ impl RdPayload {
         rd_virtuals: Option<Arc<[Rc<RdVirtualInfo>]>>,
         rd_pendingfields: Option<Arc<[GuardPendingFieldEntry]>>,
     ) -> Self {
-        if let Some(pool) = rd_consts.as_ref() {
-            majit_gc::gc_remember_const_pool(pool);
-        }
         Self {
             rd_numb: UnsafeCell::new(rd_numb),
             rd_consts: UnsafeCell::new(rd_consts),
@@ -108,7 +105,7 @@ impl RdPayload {
     /// `set_rd_*` which swap-replaces the whole slot), so sharing is
     /// safe and observably identical to RPython.
     pub fn deep_clone(&self) -> Self {
-        let cloned = Self {
+        Self {
             rd_numb: UnsafeCell::new(unsafe { (*self.rd_numb.get()).clone() }),
             rd_consts: UnsafeCell::new(unsafe { (*self.rd_consts.get()).clone() }),
             rd_virtuals: UnsafeCell::new(unsafe { (*self.rd_virtuals.get()).clone() }),
@@ -116,11 +113,7 @@ impl RdPayload {
             // The decoded list is a function of `rd_virtuals`. The clone
             // shares that slice and rebuilds the decoding on its next resume.
             shaped_virtuals: ShapedVirtuals::empty(),
-        };
-        if let Some(pool) = unsafe { (*cloned.rd_consts.get()).as_ref() } {
-            majit_gc::gc_remember_const_pool(pool);
         }
-        cloned
     }
 
     pub fn shaped_virtuals_any(&self) -> Option<&dyn std::any::Any> {
@@ -182,19 +175,10 @@ impl RdPayload {
         unsafe { (*self.rd_consts.get()).as_deref() }
     }
     pub fn set_rd_consts(&self, value: Option<Vec<Const>>) {
-        let pool = value.map(SharedConstPool::new);
-        unsafe { *self.rd_consts.get() = pool.clone() };
-        if let Some(pool) = pool.as_ref() {
-            // `compile.py` `ResumeGuardDescr._attrs_`: `rd_consts` is an
-            // ordinary GC list, so assigning it is `write_barrier`.
-            majit_gc::gc_remember_const_pool(pool);
-        }
+        unsafe { *self.rd_consts.get() = value.map(SharedConstPool::new) };
     }
     pub fn set_rd_consts_arc(&self, value: Option<Arc<SharedConstPool>>) {
-        unsafe { *self.rd_consts.get() = value.clone() };
-        if let Some(pool) = value.as_ref() {
-            majit_gc::gc_remember_const_pool(pool);
-        }
+        unsafe { *self.rd_consts.get() = value };
     }
 
     pub fn rd_virtuals(&self) -> Option<&[Rc<RdVirtualInfo>]> {

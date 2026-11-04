@@ -1137,6 +1137,10 @@ impl Default for FinalizerQueueTable {
     }
 }
 
+/// Process-unique MiniMark id, starting at 1 so 0 remains "not remembered"
+/// (`incminimark.py` `GCFLAG_TRACK_YOUNG_PTRS` set).
+static NEXT_MINIMARK_ID: AtomicUsize = AtomicUsize::new(1);
+
 /// The MiniMark generational GC.
 #[allow(non_snake_case)] // _T_IS_RPYTHON_INSTANCE_BYTE keeps the RPython spelling
 pub struct MiniMarkGC {
@@ -1170,12 +1174,16 @@ pub struct MiniMarkGC {
     /// pyre's tables are Rust-owned, so the same remembered-set entry lives
     /// here instead of a process-global list.
     pending_gc_tables: Vec<Weak<crate::GcTable>>,
-    /// `gcreftracer.py` `llop.gc_writebarrier(tr)` for a descr's `rd_consts`
-    /// list. Upstream the list is a GC object, so publishing it remembers
-    /// that object for one minor (`incminimark.py`
-    /// `collect_oldrefs_to_nursery`). The pool is Rust-owned, so the same
+    /// `incminimark.py` `write_barrier` for a descr's `rd_consts` list.
+    /// Upstream the list is a GC object; a store into it (or a newly
+    /// allocated list holding refs) remembers that object for one minor
+    /// (`collect_oldrefs_to_nursery`). The pool is Rust-owned, so the same
     /// remembered-set entry lives here beside `pending_gc_tables`.
     pending_const_pools: Vec<Weak<majit_ir::SharedConstPool>>,
+    /// Process-unique id for [`majit_ir::SharedConstPool::try_mark_remembered`].
+    /// `incminimark.py` `GCFLAG_TRACK_YOUNG_PTRS` lives on the object;
+    /// this id is the collector that currently holds the pool.
+    id: usize,
     /// incminimark.py:355 `prebuilt_root_objects = AddressStack()`.
     /// Immortal objects enter exactly once, when their first pointer write
     /// clears NO_HEAP_PTRS in the write barrier.
@@ -1541,6 +1549,7 @@ impl MiniMarkGC {
             old_objects_pointing_to_young: Vec::new(),
             pending_gc_tables: Vec::new(),
             pending_const_pools: Vec::new(),
+            id: NEXT_MINIMARK_ID.fetch_add(1, Ordering::Relaxed),
             prebuilt_root_objects: Vec::new(),
             root_snapshot_capacity: std::cell::Cell::new(0),
             totalroots_rpy: 0,
@@ -10111,20 +10120,14 @@ impl MiniMarkGC {
     }
 
     /// `incminimark.py` `write_barrier` + `_remember_young_pointer_inlined`
-    /// for `ResumeGuardDescr.rd_consts`. Upstream `GCFLAG_TRACK_YOUNG_PTRS`
-    /// lives on the object with one collector; `SharedConstPool` is a Rust
-    /// `Arc`, so "already on this collector's list" is `Weak::ptr_eq` against
-    /// this MiniMark's `pending_const_pools`.
+    /// for `ResumeGuardDescr.rd_consts`. `GCFLAG_TRACK_YOUNG_PTRS` is set
+    /// when `remembered_by` is 0; this CAS-clears it to `self.id` and
+    /// appends, matching the flag test + append + clear.
     pub fn remember_const_pool(&mut self, pool: &Arc<majit_ir::SharedConstPool>) {
-        let weak = Arc::downgrade(pool);
-        if self
-            .pending_const_pools
-            .iter()
-            .any(|w| Weak::ptr_eq(w, &weak))
-        {
+        if !pool.try_mark_remembered(self.id) {
             return;
         }
-        self.pending_const_pools.push(weak);
+        self.pending_const_pools.push(Arc::downgrade(pool));
     }
 
     /// Drain this MiniMark's table remembered set. Same consume as
@@ -10154,13 +10157,14 @@ impl MiniMarkGC {
 
     /// Drain this MiniMark's published-`rd_consts` remembered set. Same
     /// consume as [`Self::collect_pending_gc_tables_to_nursery`].
-    /// `incminimark.py` `collect_oldrefs_to_nursery` traces then re-queues
-    /// while a slot is still young; membership is this list, not a
-    /// process-global flag.
+    /// `incminimark.py` `collect_oldrefs_to_nursery` sets
+    /// `GCFLAG_TRACK_YOUNG_PTRS` back, traces, then re-queues while a
+    /// slot is still young.
     fn collect_pending_const_pools_to_nursery(&mut self) {
         let _label = crate::shadow_stack::extra_area_scope("pending_const_pools");
         let pending = std::mem::take(&mut self.pending_const_pools);
         for pool in pending.into_iter().filter_map(|w| w.upgrade()) {
+            pool.clear_remembered(self.id);
             // SAFETY: this is the exclusive minor-collection walker.
             for slot in unsafe { pool.as_mut_vec_for_gc() } {
                 if let majit_ir::Const::Ref(gcref) = slot {
@@ -10171,7 +10175,7 @@ impl MiniMarkGC {
                 majit_ir::Const::Ref(g) => !g.is_null() && self.can_move(*g),
                 _ => false,
             }) {
-                self.pending_const_pools.push(Arc::downgrade(&pool));
+                self.remember_const_pool(&pool);
             }
         }
     }

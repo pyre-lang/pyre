@@ -221,8 +221,11 @@ pub(crate) fn string_copy_parts_with(
     let resolved_box = ctx.resolve_operand_operand_opt(opref);
     let action = match resolved_box.as_ref().and_then(|b| ctx.getptrinfo(b)) {
         Some(info) => match info {
-            PtrInfo::Str(sinfo) if sinfo.is_virtual() => match &sinfo.variant {
-                VStringVariant::Plain(p) => Action::Plain(p._chars.to_vec()),
+            // vstring.py dispatches `string_copy_parts` by class, then
+            // `VStringPlainInfo` alone checks `is_virtual()`.
+            PtrInfo::Str(sinfo) => match &sinfo.variant {
+                VStringVariant::Plain(p) if sinfo.is_virtual() => Action::Plain(p._chars.to_vec()),
+                VStringVariant::Plain(_) => Action::NonVirtual,
                 VStringVariant::Slice(s) => Action::Slice {
                     s: s.s.clone(),
                     start: s.start.clone(),
@@ -288,6 +291,57 @@ pub(crate) fn string_copy_parts_with(
                 opt, ctx, &srcbox, targetbox, &zero, offsetbox, &lengthbox, mode, true,
             )
             .expect("need_next_offset=true always returns the offset")
+        }
+    }
+}
+
+/// vstring.py `StrPtrInfo.initialize_forced_string` /
+/// `VStringPlainInfo.initialize_forced_string`. Called from `force_box`
+/// after `_is_virtual = False`, so Plain still walks `_chars` (the
+/// override does not check `is_virtual()`). STRSETITEM goes through
+/// `optstring.emit_extra` (`emit_for_force_with`).
+pub(crate) fn initialize_forced_string_with(
+    opt: &mut Option<&mut Optimizer>,
+    info: &StrPtrInfo,
+    targetbox: &Operand,
+    offsetbox: &Operand,
+    mode: u8,
+    ctx: &mut OptContext,
+) -> Operand {
+    match &info.variant {
+        VStringVariant::Plain(p) => {
+            let mut offset = offsetbox.clone();
+            let one = Operand::const_(Const::Int(1));
+            let set_opcode = if mode != 0 {
+                OpCode::Unicodesetitem
+            } else {
+                OpCode::Strsetitem
+            };
+            for ch in &p._chars {
+                if let Some(ch_ref) = ch {
+                    let arg_char = ctx.resolve_operand_operand(ch_ref);
+                    let arg_target = ctx.resolve_operand_operand(targetbox);
+                    let arg_offset = ctx.resolve_operand_operand(&offset);
+                    let setitem_op = Op::new(
+                        set_opcode,
+                        &[arg_target.clone(), arg_offset.clone(), arg_char.clone()],
+                    );
+                    ctx.emit_for_force_with(opt, setitem_op);
+                }
+                offset = _int_add_with(opt, &offset, &one, ctx);
+            }
+            offset
+        }
+        VStringVariant::Slice(s) => copy_str_content_with(
+            opt, ctx, &s.s, targetbox, &s.start, offsetbox, &s.lgtop, mode, true,
+        )
+        .expect("need_next_offset=true always returns the offset"),
+        VStringVariant::Concat(c) => {
+            let offset = string_copy_parts_with(opt, &c.vleft, targetbox, offsetbox, mode, ctx);
+            string_copy_parts_with(opt, &c.vright, targetbox, &offset, mode, ctx)
+        }
+        VStringVariant::Ptr => {
+            string_copy_parts_with(opt, targetbox, targetbox, offsetbox, mode, ctx)
         }
     }
 }
@@ -363,7 +417,13 @@ impl OptString {
     }
 
     fn is_virtual_plain(&self, op: &Operand, ctx: &OptContext) -> bool {
+        // vstring.py `_optimize_COPYSTRCONTENT`:
+        // `isinstance(dst, VStringPlainInfo) and dst.is_virtual()`.
+        // After `StrPtrInfo.force_box` the same Plain info stays on the
+        // allocation with `_is_virtual = False`. `get_plain_info` is the
+        // ungated Plain reader; virtualness is the `_is_virtual` flag.
         self.get_plain_info(op, ctx).is_some()
+            && ctx.peek_ptr_info(op).is_some_and(|info| info.is_virtual())
     }
 
     fn get_concat_info(&self, op: &Operand, ctx: &OptContext) -> Option<VStringConcatInfo> {
@@ -666,6 +726,11 @@ impl OptString {
             && len >= 0
             && (len as usize) <= MAX_CONST_LEN
         {
+            // vstring.py `_optimize_NEWSTR`: `assert not op.get_forwarded()`.
+            debug_assert!(
+                ctx.peek_ptr_info(&Operand::from_bound_op(op_rc)).is_none(),
+                "vstring.py _optimize_NEWSTR: assert not op.get_forwarded()"
+            );
             // vstring.py: self.make_vstring_plain(op, mode, length)
             let b = Operand::from_bound_op(op_rc);
             {
@@ -676,6 +741,7 @@ impl OptString {
                         lgtop: None,
                         mode,
                         length: len as i32,
+                        _is_virtual: true,
                         variant: VStringVariant::Plain(VStringPlainInfo {
                             _chars: vec![None; len as usize],
                         }),
@@ -706,7 +772,7 @@ impl OptString {
     fn optimize_strsetitem(
         &mut self,
         op: &Op,
-        opt: &mut Option<&mut Optimizer>,
+        _opt: &mut Option<&mut Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let str_ref = ctx.resolve_operand_operand(&op.arg(0));
@@ -719,21 +785,25 @@ impl OptString {
             // `self.get_box_replacement(op.getarg(2))`, resolved before
             // `with_plain_info_mut` borrows `ctx`.
             let char_operand = ctx.resolve_operand_operand(&op.arg(2));
-            let did_write = self
-                .with_plain_info_mut(&str_ref, ctx, |info| {
-                    if i < info._chars.len() {
-                        info._chars[i] = Some(char_operand.clone());
-                        return true;
-                    }
-                    false
-                })
-                .unwrap_or(false);
-            if did_write {
-                return OptimizationResult::Remove;
+            // vstring.py `optimize_STRSETITEM`: `if opinfo and opinfo.is_virtual()`.
+            // A forced Plain keeps `_chars` but is no longer virtual.
+            if self.is_virtual_plain(&str_ref, ctx) {
+                let did_write = self
+                    .with_plain_info_mut(&str_ref, ctx, |info| {
+                        if i < info._chars.len() {
+                            info._chars[i] = Some(char_operand.clone());
+                            return true;
+                        }
+                        false
+                    })
+                    .unwrap_or(false);
+                if did_write {
+                    return OptimizationResult::Remove;
+                }
             }
         }
-        // Not virtual or index not constant -> force and emit.
-        self.force_if_virtual(opt, &str_ref, ctx);
+        // vstring.py: `self.make_nonnull(op.getarg(0)); return self.emit(op)`
+        ctx.make_nonnull(&str_ref);
         OptimizationResult::PassOn
     }
 
@@ -1164,10 +1234,10 @@ impl OptString {
                     lgtop: None,
                     mode,
                     length: -1,
+                    _is_virtual: true,
                     variant: VStringVariant::Concat(VStringConcatInfo {
                         vleft: vleft_box.clone(),
                         vright: vright_box.clone(),
-                        _is_virtual: true,
                     }),
                     last_guard_pos: -1,
                     avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -1212,6 +1282,7 @@ impl OptString {
                     lgtop: Some(lgtop.clone()),
                     mode,
                     length: -1,
+                    _is_virtual: true,
                     variant: VStringVariant::Slice(VStringSliceInfo {
                         s: s.clone(),
                         start,
@@ -1615,6 +1686,7 @@ impl OptString {
                     .and_then(|b| {
                         ctx.with_ptr_info_mut(b, |info| {
                             if let PtrInfo::Str(sinfo) = info
+                                && sinfo.is_virtual()
                                 && matches!(sinfo.variant, VStringVariant::Plain(_))
                             {
                                 // vstring.py: i1.shrink(length)
@@ -1913,6 +1985,7 @@ mod tests {
                 lgtop: None,
                 mode: 0,
                 length,
+                _is_virtual: true,
                 variant: VStringVariant::Plain(VStringPlainInfo { _chars: char_boxes }),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -1935,10 +2008,10 @@ mod tests {
                 lgtop: None,
                 mode: 0,
                 length: -1,
+                _is_virtual: true,
                 variant: VStringVariant::Concat(VStringConcatInfo {
                     vleft: vleft_box,
                     vright: vright_box,
-                    _is_virtual: true,
                 }),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -1963,6 +2036,7 @@ mod tests {
                 lgtop: Some(lgtop_box.clone()), // vstring.py:223: self.lgtop = length
                 mode: 0,
                 length: -1,
+                _is_virtual: true,
                 variant: VStringVariant::Slice(VStringSliceInfo {
                     s: s_box,
                     start: start_box,
@@ -2869,6 +2943,7 @@ mod tests {
                 lgtop: None,
                 mode: 0,
                 length: -1,
+                _is_virtual: false,
                 variant: VStringVariant::Ptr,
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -2952,6 +3027,7 @@ mod tests {
                 lgtop: None,
                 mode: 0,
                 length: -1,
+                _is_virtual: false,
                 variant: VStringVariant::Ptr,
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -3018,6 +3094,7 @@ mod tests {
                 lgtop: None,
                 mode: 0,
                 length: -1,
+                _is_virtual: false,
                 variant: VStringVariant::Ptr,
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),

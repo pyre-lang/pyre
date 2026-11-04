@@ -1407,8 +1407,9 @@ pub trait GcAllocator: Send {
     fn remember_gc_table(&mut self, _table: &std::sync::Arc<crate::GcTable>) {}
 
     /// `incminimark.py` `write_barrier` for `ResumeGuardDescr.rd_consts`.
-    /// The pool enters this collector's `pending_const_pools` unless it is
-    /// already on this list (`Weak::ptr_eq`).
+    /// The pool enters this collector's `pending_const_pools` unless
+    /// `GCFLAG_TRACK_YOUNG_PTRS` is already clear for this MiniMark
+    /// (`SharedConstPool::try_mark_remembered`).
     fn remember_const_pool(&mut self, _pool: &std::sync::Arc<majit_ir::SharedConstPool>) {}
 
     /// Whether the GC supports optimized conditional write barriers.
@@ -4426,13 +4427,9 @@ fn unpublished_is_nursery_object(addr: usize) -> bool {
 /// nursery of the GC that collects them, or young-rawmalloced.
 /// Same collector dispatch as [`gc_current_object_address`]: per-thread
 /// `gc_box` first (the `ACTIVE_GC_IS_YOUNG_OBJECT` trampoline), then
-/// `gc_sync` under the GIL. `false` when neither is available or when
-/// called re-entrantly from inside a collection.
+/// `gc_sync` under the GIL. `false` when neither is available.
 fn gc_is_young_object(addr: usize) -> bool {
     if addr == 0 {
-        return false;
-    }
-    if gc_sync::in_gc_op() {
         return false;
     }
     #[cfg(test)]

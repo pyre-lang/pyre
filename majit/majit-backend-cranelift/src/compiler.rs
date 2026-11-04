@@ -11377,15 +11377,6 @@ impl CraneliftBackend {
         if let Some(clt) = token.compiled_loop_token() {
             let tracer: Arc<dyn std::any::Any + Send + Sync> = Arc::new(descrs.to_vec());
             clt.asmmemmgr_gcreftracers.lock().push(tracer);
-            // `gcreftracer.py` `llop.gc_writebarrier(tr)`: each published
-            // descr's `rd_consts` enters the remembered set for one minor.
-            let _ = with_cranelift_gc(|gc| {
-                for descr in descrs {
-                    if let Some(pool) = descr.as_fail_descr().and_then(|fd| fd.rd_consts_arc()) {
-                        gc.remember_const_pool(&pool);
-                    }
-                }
-            });
         }
     }
 

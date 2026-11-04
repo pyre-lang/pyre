@@ -19,8 +19,8 @@ fn use_untranslated_heap_ordering() -> bool {
     cfg!(debug_assertions)
 }
 
-/// [`sort_descr_entries_untranslated`] for a caller that permutes an index
-/// list instead of the entries themselves.
+/// heap.py `if not we_are_translated(): items.sort(key=str, reverse=True)`
+/// for a caller that permutes an index list instead of the entries themselves.
 #[inline]
 fn sort_descr_entry_indices_untranslated<T>(entries: &[(u32, DescrRef, T)], order: &mut [usize]) {
     if use_untranslated_heap_ordering() {
@@ -1405,8 +1405,9 @@ impl OptHeapState {
             .enumerate()
             .filter_map(|(i, (_, _, cf))| cf.lazy_set.is_some().then_some(i))
             .collect();
-        // we_are_translated() == False sort path for test stability.
-        order.sort_by_key(|&i| descr_ptr(&self.cached_fields[i].1));
+        // heap.py `force_all_lazy_sets`: `if not we_are_translated():
+        // items.sort(key=str, reverse=True)`.
+        sort_descr_entry_indices_untranslated(&self.cached_fields, &mut order);
         for i in order {
             self.force_lazy_set_field_at(i, true, opt, ctx);
         }
@@ -1429,7 +1430,11 @@ impl OptHeapState {
             .iter()
             .map(|(idx, descr, submap)| {
                 let mut indexes: Vec<i64> = submap.const_keys();
-                indexes.sort();
+                // heap.py `force_all_lazy_sets`: `if not we_are_translated():
+                // items.sort(key=lambda item: item[0])`.
+                if use_untranslated_heap_ordering() {
+                    indexes.sort();
+                }
                 (*idx, descr.clone(), indexes)
             })
             .collect();
@@ -1747,12 +1752,9 @@ impl OptHeapState {
     ) -> OptimizationResult {
         let escaped_owners = self.call_argument_owner_closure(op, ctx);
         self.mark_escaped_varargs(op, ctx);
-        // STRUCTURAL ADAPTATION: RPython heap.py relies purely on EffectInfo
-        // here. Removing this pyre-specific direct-argument flush currently
-        // breaks synthetic correctness (`comprehensions.py`, and then wider
-        // dynasm/cranelift wrong-output failures). Keep it until the caller
-        // materialization path is ported enough that direct call arguments
-        // cannot observe stale lazy stores.
+        // Adaptation kept until flatten residuals carry
+        // `effectinfo.py` `effectinfo_from_writeanalyze` descrs.
+        // `heap.py` `emitting_operation` uses EffectInfo only.
         self.force_call_argument_lazy_sets(&escaped_owners, opt, ctx);
         // heapcache.py clear_caches_varargs.
         // Plain residual calls preserve cache entries for unescaped
@@ -1862,28 +1864,24 @@ impl OptHeapState {
         }
     }
 
-    /// Flush lazy stores for objects observable by a residual call: the
-    /// objects that escape as direct arguments (and their transitive
-    /// dependency closure), plus any trace-allocated object that has already
-    /// escaped. EffectInfo bitstrings describe global heap effects, but a
-    /// callee can still read fields from objects it receives explicitly or
-    /// reaches through the escaped heap.
+    /// Flush lazy stores for objects a residual call can observe: the
+    /// escaped-argument closure plus any trace-allocated object that has
+    /// already escaped.
     ///
-    /// Keep this selective: a lazy store on an object that is still UNESCAPED,
+    /// Adaptation kept until the codewriter's flatten residuals carry
+    /// `effectinfo.py` `effectinfo_from_writeanalyze` read/write descrs
+    /// (`pyre/pyre-jit/src/jit/flatten.rs` `effect_info_for_call_flavor`
+    /// mints an empty `CanRaise`). Upstream `heap.py` has no such flush.
+    ///
+    /// Keep this selective: a lazy store on an object that is still unescaped,
     /// or one this trace never allocated (e.g. an inputarg carrying
     /// loop-invariant state), must stay pending until the regular guard/JUMP
-    /// flush. A trace-allocated object that has escaped, however, is now
-    /// globally reachable — a residual call can observe its fields, so its
-    /// pending store must be materialized here (the role
-    /// `force_from_effectinfo` fills in RPython once the EffectInfo path is
-    /// fully ported). Storing such a value into an already-escaped container
-    /// (e.g. an int box into a forced array) escapes it via
-    /// `escape_from_write` WITHOUT recording it in the container's dependency
+    /// flush. A trace-allocated object that has escaped is globally reachable
+    /// — a residual call can observe its fields, so its pending store must be
+    /// materialized here. Storing such a value into an already-escaped
+    /// container (e.g. an int box into a forced array) escapes it via
+    /// `escape_from_write` without recording it in the container's dependency
     /// list, so the argument closure alone does not reach it.
-    ///
-    /// Do not remove as a cosmetic PyPy-parity cleanup. The direct parity
-    /// change was tested with `python3 pyre/check.py --synthetic-only` and
-    /// caused correctness failures.
     fn force_call_argument_lazy_sets(
         &mut self,
         escaped_owners: &[OpRef],
@@ -3513,8 +3511,8 @@ impl OptHeapState {
                 // `force_from_effectinfo` and return.
                 let escaped_owners = self.call_argument_owner_closure(op, ctx);
                 self.mark_escaped_varargs(op, ctx);
-                // See `emit_residual_call`: this pyre-specific flush is
-                // required for current synthetic correctness.
+                // See `emit_residual_call`: argument flush until flatten
+                // residuals carry `effectinfo_from_writeanalyze` descrs.
                 self.force_call_argument_lazy_sets(&escaped_owners, opt, ctx);
                 // Postpone the call — it will be emitted when GUARD_NOT_FORCED arrives.
                 self.postponed_op = Some(op.clone());
@@ -8403,6 +8401,88 @@ mod tests {
             gets_after,
             1,
             "a field read cached before an unanalyzed residual must not be reused after it; got {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_build_string_from_array_flushes_lazy_setarrayitem_before_call() {
+        // The BUILD_STRING residual's argument is the fragment array, so
+        // `force_call_argument_lazy_sets` emits the pending SETARRAYITEM_GC
+        // before the CALL. Empty `CanRaise` EffectInfo names no array descrs.
+        let array = byte_array_descr(60);
+        let mut ei = crate::call_descr::can_raise_effect_info();
+        ei.runtime_helper = majit_ir::RuntimeHelperKind::BuildStringFromArray;
+        let call_d = call_descr(82, ei);
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[
+                    rooted_inputarg_operand(Type::Ref, 110),
+                    Operand::const_from_value(majit_ir::Value::Int(0)),
+                    rooted_inputarg_operand(Type::Int, 111),
+                ],
+                array,
+            ),
+            Op::with_descr(
+                OpCode::CallR,
+                &[rooted_inputarg_operand(Type::Ref, 110)],
+                call_d,
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt_typed(&mut ops, &[111]);
+        let call_pos = result
+            .iter()
+            .position(|op| op.opcode == OpCode::CallR)
+            .expect("BUILD_STRING residual must survive");
+        let setarray_pos = result
+            .iter()
+            .position(|op| op.opcode == OpCode::SetarrayitemGc)
+            .expect("lazy setarrayitem_gc must be emitted");
+        assert!(
+            setarray_pos < call_pos,
+            "setarrayitem_gc must flush before BuildStringFromArray; got {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_empty_can_raise_keeps_unrelated_lazy_setarrayitem_across_call() {
+        // heap.py `force_from_effectinfo`: empty CanRaise names no array
+        // descrs, so an unrelated lazy SETARRAYITEM_GC stays pending until
+        // the JUMP flush.
+        let array = byte_array_descr(61);
+        let call_d = call_descr(84, crate::call_descr::can_raise_effect_info());
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[
+                    rooted_inputarg_operand(Type::Ref, 110),
+                    Operand::const_from_value(majit_ir::Value::Int(0)),
+                    rooted_inputarg_operand(Type::Int, 111),
+                ],
+                array,
+            ),
+            Op::with_descr(
+                OpCode::CallR,
+                &[rooted_inputarg_operand(Type::Ref, 200)],
+                call_d,
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt_typed(&mut ops, &[111]);
+        let call_pos = result
+            .iter()
+            .position(|op| op.opcode == OpCode::CallR)
+            .expect("CanRaise residual must survive");
+        let setarray_pos = result
+            .iter()
+            .position(|op| op.opcode == OpCode::SetarrayitemGc)
+            .expect("lazy setarrayitem_gc must still flush");
+        assert!(
+            setarray_pos > call_pos,
+            "empty CanRaise must leave SETARRAYITEM_GC lazy across the call; got {:?}",
             result.iter().map(|op| op.opcode).collect::<Vec<_>>()
         );
     }

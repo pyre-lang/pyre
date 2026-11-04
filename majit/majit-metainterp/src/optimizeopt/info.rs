@@ -1264,60 +1264,19 @@ fn force_box_emit(
     //   newop = optforce.optimizer.getlastop()
     //   if newop is not op:
     //       op.set_forwarded(newop)
-    // `Optimizer.getlastop` is the emitted list (`_really_emitted_operation`
-    // upstream; `new_operations.last()` here). No optimizer reads that same
-    // list. A later `Remove` does not append this allocation, and `getlastop`
-    // would then name an unrelated earlier op, so it is read only once the
-    // allocation — or the `OpRc` a pass replaced it with — is in the list.
-    fn allocation_was_emitted(
-        ctx: &crate::optimizeopt::OptContext,
-        alloc: &majit_ir::OpRc,
-        len_before: usize,
-    ) -> bool {
-        let suffix = &ctx.new_operations[len_before..];
-        if suffix.iter().any(|rc| OpRc::ptr_eq(rc, alloc)) {
-            return true;
-        }
-        if let majit_ir::forwarding::Forwarded::Op(target) =
-            Operand::from_bound_op(alloc).get_forwarded()
-        {
-            return suffix.iter().any(|rc| OpRc::ptr_eq(rc, &target));
-        }
-        false
-    }
-
-    /// `newop = optforce.optimizer.getlastop()` once `emit_extra` appended.
+    /// `newop = optforce.optimizer.getlastop()` after `emit_extra`.
     fn emitted_newop(
         ctx: &crate::optimizeopt::OptContext,
         optimizer: &Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         alloc: &majit_ir::OpRc,
-        len_before: usize,
     ) -> majit_ir::OpRc {
-        if !allocation_was_emitted(ctx, alloc, len_before) {
-            return alloc.clone();
-        }
-        let same = {
-            let via_getlastop = match optimizer {
-                Some(opt) => opt.getlastop(ctx).map(|op| op as *const Op),
-                None => ctx.new_operations.last().map(|rc| rc.as_ref() as *const Op),
-            };
-            let via_list = ctx.new_operations.last().map(|rc| rc.as_ref() as *const Op);
-            debug_assert_eq!(
-                via_getlastop, via_list,
-                "Optimizer.getlastop and new_operations.last() are one list"
-            );
-            match via_getlastop {
-                Some(ptr) => ptr == OpRc::as_ptr(alloc),
-                None => true,
-            }
-        };
-        if same {
-            alloc.clone()
-        } else {
-            ctx.new_operations
+        match optimizer {
+            Some(opt) => opt.getlastop_rc().unwrap_or_else(|| alloc.clone()),
+            None => ctx
+                .new_operations
                 .last()
                 .cloned()
-                .expect("an appended allocation has a getlastop")
+                .unwrap_or_else(|| alloc.clone()),
         }
     }
 
@@ -1329,12 +1288,11 @@ fn force_box_emit(
         let alloc = op
             .bound_op()
             .expect("a virtual is the result of an operation");
-        let len_before = ctx.new_operations.len();
         // op.set_forwarded(None)
         op.clear_forwarded();
         // optforce.emit_extra(op) — returns this OpRc, not getlastop.
         let alloc = emit_op_rc(ctx, optimizer, alloc);
-        let newop = emitted_newop(ctx, optimizer, &alloc, len_before);
+        let newop = emitted_newop(ctx, optimizer, &alloc);
         // if newop is not op: op.set_forwarded(newop)
         if !OpRc::ptr_eq(&newop, &alloc) {
             op.set_forwarded_op(&newop);
@@ -1782,33 +1740,35 @@ fn force_box_emit(
             let mode = sinfo.mode;
             let is_unicode = mode != 0;
 
-            // vstring.py: if self.mode is mode_string / else
+            // vstring.py `StrPtrInfo.force_box`: if self.mode is mode_string / else
             let c_s = if mode == crate::optimizeopt::vstring::mode_string {
-                // vstring.py:80-84
                 sinfo
                     .get_constant_string_spec(&*ctx, mode)
                     .and_then(|chars| crate::history::get_const_ptr_for_string(&chars, ctx))
             } else {
-                // vstring.py:86-90
                 sinfo
                     .get_constant_string_spec(&*ctx, mode)
                     .and_then(|chars| crate::history::get_const_ptr_for_unicode(&chars, ctx))
             };
             if let Some(gcref) = c_s {
-                // vstring.py:83: get_box_replacement(op).set_forwarded(c_s)
+                // vstring.py `StrPtrInfo.force_box`: get_box_replacement(op).set_forwarded(c_s)
                 ctx.make_constant_arg(op, Value::Ref(gcref));
                 return op.get_box_replacement(false);
             }
 
-            // vstring.py:91: self._is_virtual = False
-            let sinfo_full = match std::mem::replace(self_, PtrInfo::nonnull()) {
-                PtrInfo::Str(s) => s,
+            // vstring.py `StrPtrInfo.force_box`: self._is_virtual = False —
+            // same info object, variant (plain / slice / concat) kept for
+            // later folding.
+            let mut sinfo_full = match std::mem::replace(self_, PtrInfo::nonnull()) {
+                PtrInfo::Str(mut s) => {
+                    s._is_virtual = false;
+                    s
+                }
                 _ => unreachable!(),
             };
-            let variant = sinfo_full.variant;
 
             // vstring.py: lengthbox = self.getstrlen(op, optstring, mode)
-            let lengthbox = match &variant {
+            let lengthbox = match &sinfo_full.variant {
                 VStringVariant::Plain(info) => {
                     Operand::const_(majit_ir::Const::Int(info._chars.len() as i64))
                 }
@@ -1836,114 +1796,36 @@ fn force_box_emit(
                 OpCode::Newstr
             };
             let arg_length = lengthbox;
+            sinfo_full.lgtop = Some(arg_length.clone());
             let newstr_op = Op::new(new_opcode, std::slice::from_ref(&arg_length));
             // vstring.py `StrPtrInfo.force_box`:
             //   newop = ResOperation(mode.NEWSTR, [lengthbox])
             //   optforce.emit_extra(newop)
             //   newop = optforce.optimizer.getlastop()
             //   newop.set_forwarded(self)
-            // The fresh allocation is not the virtual's box, so this rebinds
-            // the local (there is no `if newop is not op` here). The original
-            // virtual is forwarded below. A queued emit or `Remove` leaves the
-            // fresh `OpRc`: `getlastop` would name an unrelated earlier op.
-            let len_before = ctx.new_operations.len();
             let fresh_rc = emit_op(ctx, &mut optimizer, newstr_op);
-            let newop_rc = emitted_newop(ctx, &optimizer, &fresh_rc, len_before);
+            let newop_rc = emitted_newop(ctx, &optimizer, &fresh_rc);
             let newop_box = Operand::from_bound_op(&newop_rc);
 
-            // vstring.py `newop.set_forwarded(self)` — unconditional, on getlastop.
-            ctx.set_ptr_info(
-                &newop_box,
-                PtrInfo::Str(StrPtrInfo {
-                    lenbound: sinfo_full.lenbound,
-                    lgtop: Some(arg_length.clone()), // `StrPtrInfo.force_box` keeps the computed length
-                    mode: sinfo_full.mode,
-                    length: sinfo_full.length,
-                    variant: VStringVariant::Ptr, // non-virtual
-                    last_guard_pos: sinfo_full.last_guard_pos,
-                    avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
-                }),
-            );
+            // vstring.py `newop.set_forwarded(self)` — same info, now
+            // non-virtual, on getlastop.
+            ctx.set_ptr_info(&newop_box, PtrInfo::Str(sinfo_full.clone()));
 
             // vstring.py `StrPtrInfo.force_box`: op = get_box_replacement(op);
             // op.set_forwarded(newop)
-            op.get_box_replacement(false).set_forwarded_op(&newop_rc);
+            let op_box = op.get_box_replacement(false);
+            op_box.set_forwarded_op(&newop_rc);
 
             // vstring.py: initialize_forced_string(op, optstring, op, CONST_0, mode)
             let zero = Operand::const_(majit_ir::Const::Int(0));
-            let set_opcode = if is_unicode {
-                OpCode::Unicodesetitem
-            } else {
-                OpCode::Strsetitem
-            };
-
-            match variant {
-                VStringVariant::Plain(info) => {
-                    // vstring.py VStringPlainInfo.initialize_forced_string
-                    let mut offset = zero.clone();
-                    let one = Operand::const_(majit_ir::Const::Int(1));
-                    let one = one.clone();
-                    for ch in &info._chars {
-                        if let Some(ch_ref) = ch {
-                            // vstring.py initialize_forced_string get_box_replacement(charbox) — walk the
-                            // char operand's own forwarding (object-native).
-                            let ch_resolved = ctx.resolve_operand_operand(ch_ref).to_opref();
-                            let arg_newop = Operand::from_bound_op(&newop_rc);
-                            let arg_offset = ctx.resolve_operand_operand(&offset);
-                            let arg_ch = ctx.materialize_operand_at(ch_resolved);
-                            let setitem_op = Op::new(
-                                set_opcode,
-                                &[arg_newop.clone(), arg_offset.clone(), arg_ch.clone()],
-                            );
-                            emit_op(ctx, &mut optimizer, setitem_op);
-                        }
-                        offset = crate::optimizeopt::vstring::_int_add_with(
-                            &mut optimizer,
-                            &offset,
-                            &one,
-                            ctx,
-                        );
-                    }
-                }
-                VStringVariant::Concat(info) => {
-                    // vstring.py VStringConcatInfo.string_copy_parts
-                    let newop_box = Operand::from_bound_op(&newop_rc);
-                    let zero_box = zero.clone();
-                    let offset = crate::optimizeopt::vstring::string_copy_parts_with(
-                        &mut optimizer,
-                        &info.vleft.clone(),
-                        &newop_box,
-                        &zero_box,
-                        mode,
-                        ctx,
-                    );
-                    crate::optimizeopt::vstring::string_copy_parts_with(
-                        &mut optimizer,
-                        &info.vright.clone(),
-                        &newop_box,
-                        &offset,
-                        mode,
-                        ctx,
-                    );
-                }
-                VStringVariant::Slice(info) => {
-                    // vstring.py VStringSliceInfo.string_copy_parts
-                    let newop_box = Operand::from_bound_op(&newop_rc);
-                    let zero_box = zero.clone();
-                    crate::optimizeopt::vstring::copy_str_content_with(
-                        &mut optimizer,
-                        ctx,
-                        &info.s.clone(),
-                        &newop_box,
-                        &info.start.clone(),
-                        &zero_box,
-                        &info.lgtop.clone(),
-                        mode,
-                        true,
-                    );
-                }
-                VStringVariant::Ptr => unreachable!(),
-            }
+            crate::optimizeopt::vstring::initialize_forced_string_with(
+                &mut optimizer,
+                &sinfo_full,
+                &op_box,
+                &zero,
+                mode,
+                ctx,
+            );
 
             Operand::from_bound_op(&newop_rc)
         }
@@ -1971,9 +1853,9 @@ fn force_box_emit(
 ///     for VirtualArray, etc.) — RPython's `_attrs_` is a hint to the
 ///     translator's slot allocator, not a parity constraint on the
 ///     storage *type*. Each pyre variant keeps its own typed `descr`.
-///   - `_is_virtual` collapses into the pyre enum tag itself
-///     (`PtrInfo::Virtual(_)` IS the truthy carrier of `_is_virtual`);
-///     no separate slot is needed.
+///   - `_is_virtual` collapses into the pyre enum tag for Virtual*
+///     variants. `StrPtrInfo` keeps the flag (`vstring.py` `StrPtrInfo.__init__`)
+///     so a forced plain/slice/concat stays the same info object.
 ///
 /// `make_virtual_info` (resume.py) reads `cached_vinfo` to
 /// dedup RdVirtualInfo allocations across multiple finish() calls
@@ -2465,9 +2347,8 @@ mod tests {
         }
     }
 
-    /// Postprocess appends a marker after `NEW` is in `new_operations`, so
-    /// `Optimizer.getlastop` is not the allocation. Production `NEW*` passes
-    /// do not do this; the pass exists to exercise the forward.
+    /// Postprocess appends a marker after `NEW` via `ctx.emit`, which does
+    /// not update `_really_emitted_operation`. `getlastop` stays the NEW.
     struct EmitAfterNew;
 
     impl crate::optimizeopt::Optimization for EmitAfterNew {
@@ -2575,10 +2456,68 @@ mod tests {
         assert!(!info.is_virtual());
     }
 
-    /// A later pass's postprocess appends after the allocation, so
-    /// `getlastop` is that marker and `op.set_forwarded(newop)` is taken.
+    /// A later pass's postprocess appends after the allocation via `ctx.emit`.
+    /// `getlastop` is `_really_emitted_operation` from `_emit_operation`, so
+    /// it stays the NEW; `ctx.emit` does not update it.
+    ///
+    /// `force_box_impl` with `current_pass_idx = 0` is a pass as `optforce`
+    /// (`Optimization.emit_extra` walks remaining). `Optimizer.force_box`
+    /// uses `optforce=self` and does not take this path.
     #[test]
     fn force_box_forwards_when_later_pass_emits_after_alloc() {
+        let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
+        opt.add_pass(Box::new(PassOnOpt));
+        opt.add_pass(Box::new(EmitAfterNew));
+        let mut ctx = OptContext::new(8);
+        ctx.current_pass_idx = 0;
+        ctx.in_final_emission = false;
+        ctx.force_direct = false;
+        let virtual_box = one_field_virtual_struct(&mut ctx);
+
+        let mut info = ctx.take_ptr_info(&virtual_box).unwrap();
+        let forced = super::force_box_impl(&mut info, &virtual_box, &mut ctx, &mut opt);
+
+        assert_eq!(
+            ctx.new_operations
+                .iter()
+                .map(|op| op.opcode)
+                .collect::<Vec<_>>(),
+            vec![OpCode::New, OpCode::IntAdd, OpCode::SetfieldGc]
+        );
+        let returned = forced.bound_op().expect("forced box is getlastop");
+        assert_eq!(returned.opcode, OpCode::New);
+        let alloc = ctx
+            .new_operations
+            .iter()
+            .find(|op| op.opcode == OpCode::New)
+            .expect("allocation emitted");
+        assert!(OpRc::ptr_eq(alloc, &returned));
+        assert!(
+            matches!(
+                virtual_box.get_forwarded(),
+                majit_ir::forwarding::Forwarded::Info(_)
+            ),
+            "newop is the allocation, so it is not forwarded elsewhere"
+        );
+        let setfield = ctx
+            .new_operations
+            .iter()
+            .find(|op| op.opcode == OpCode::SetfieldGc)
+            .expect("payload SETFIELD_GC");
+        let arg0 = setfield.arg(0).bound_op().expect("SETFIELD_GC arg0");
+        assert!(OpRc::ptr_eq(&arg0, &returned));
+        let info = ctx
+            .peek_ptr_info(&forced)
+            .expect("newop.set_forwarded(self)");
+        assert!(matches!(info, PtrInfo::Struct(_)));
+        assert!(!info.is_virtual());
+    }
+
+    /// optimizer.py `force_box(op, optforce=None)`: `optforce = self`, so
+    /// extras go through `Optimizer.emit_extra` → `_emit_operation` and do
+    /// not re-enter later passes.
+    #[test]
+    fn optimizer_force_box_emits_allocation_direct() {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(PassOnOpt));
         opt.add_pass(Box::new(EmitAfterNew));
@@ -2595,36 +2534,68 @@ mod tests {
                 .iter()
                 .map(|op| op.opcode)
                 .collect::<Vec<_>>(),
-            vec![OpCode::New, OpCode::IntAdd, OpCode::SetfieldGc]
+            vec![OpCode::New, OpCode::SetfieldGc]
         );
         let returned = forced.bound_op().expect("forced box is getlastop");
-        assert_eq!(returned.opcode, OpCode::IntAdd);
-        let marker = ctx
-            .new_operations
-            .iter()
-            .find(|op| op.opcode == OpCode::IntAdd)
-            .expect("postprocess marker");
-        assert!(OpRc::ptr_eq(marker, &returned));
-        match virtual_box.get_forwarded() {
-            majit_ir::forwarding::Forwarded::Op(target) => {
-                assert!(
-                    OpRc::ptr_eq(&target, &returned),
-                    "op.set_forwarded(newop) targets getlastop"
-                );
+        assert_eq!(returned.opcode, OpCode::New);
+    }
+
+    /// OptString `_optimize_NEWSTR` Removes a small-const NEWSTR. A force
+    /// through `Optimizer.force_box` (`optforce=self`) must not re-enter
+    /// that pass, or `getlastop()` would be a prior op and the allocation
+    /// would vanish.
+    #[test]
+    fn optimizer_force_box_does_not_revirtualize_newstr() {
+        use crate::optimizeopt::info::VStringPlainInfo;
+        use majit_ir::Const;
+
+        let mut opt = crate::optimizeopt::optimizer::Optimizer::default_pipeline();
+        let mut ctx = OptContext::new(16);
+        ctx.current_pass_idx = 0;
+        ctx.in_final_emission = false;
+        ctx.force_direct = false;
+        for (idx, name) in opt.pass_names().iter().enumerate() {
+            if *name == "string" {
+                ctx.optstring_idx = Some(idx);
             }
-            _ => panic!("allocation must forward to getlastop"),
+            if *name == "earlyforce" {
+                ctx.optearlyforce_idx = idx;
+            }
         }
-        let setfield = ctx
+        assert!(ctx.optstring_idx.is_some());
+
+        let chars = vec![
+            Some(Operand::const_(Const::Int(b'a' as i64))),
+            Some(Operand::const_(Const::Int(b'b' as i64))),
+        ];
+        let newstr_rc = OpRc::new(Op::new(OpCode::Newstr, &[Operand::const_(Const::Int(2))]));
+        let virtual_box = Operand::from_bound_op(&newstr_rc);
+        ctx.set_ptr_info(
+            &virtual_box,
+            PtrInfo::Str(StrPtrInfo {
+                lenbound: None,
+                lgtop: None,
+                mode: 0,
+                length: 2,
+                _is_virtual: true,
+                variant: VStringVariant::Plain(VStringPlainInfo { _chars: chars }),
+                last_guard_pos: -1,
+                avpi: AbstractVirtualPtrInfo::new(),
+            }),
+        );
+
+        let forced = opt.force_box(&virtual_box, &mut ctx);
+        let newstr_count = ctx
             .new_operations
             .iter()
-            .find(|op| op.opcode == OpCode::SetfieldGc)
-            .expect("payload SETFIELD_GC");
-        let arg0 = setfield.arg(0).bound_op().expect("SETFIELD_GC arg0");
-        assert!(OpRc::ptr_eq(&arg0, &returned));
+            .filter(|op| op.opcode == OpCode::Newstr)
+            .count();
+        assert_eq!(newstr_count, 1, "force NEWSTR must stay emitted");
+        let returned = forced.bound_op().expect("forced box is getlastop");
+        assert_eq!(returned.opcode, OpCode::Newstr);
         let info = ctx
             .peek_ptr_info(&forced)
             .expect("newop.set_forwarded(self)");
-        assert!(matches!(info, PtrInfo::Struct(_)));
         assert!(!info.is_virtual());
     }
 
@@ -2670,6 +2641,7 @@ mod tests {
             lgtop,
             mode: 0,
             length,
+            _is_virtual: true,
             variant,
             last_guard_pos: -1,
             avpi: AbstractVirtualPtrInfo::new(),
@@ -2850,6 +2822,7 @@ mod tests {
             lgtop: None,
             mode: 0,
             length: 2,
+            _is_virtual: true,
             variant: VStringVariant::Plain(VStringPlainInfo {
                 _chars: vec![None, None],
             }),
@@ -2863,6 +2836,7 @@ mod tests {
             lgtop: Some(ctx.materialize_operand_at(OpRef::int_op(3))), // vstring.py:223: self.lgtop = length
             mode: 0,
             length: -1,
+            _is_virtual: true,
             variant: VStringVariant::Slice(VStringSliceInfo {
                 s: ctx.materialize_operand_at(OpRef::int_op(1)),
                 start: ctx.materialize_operand_at(OpRef::int_op(2)),
@@ -2878,10 +2852,10 @@ mod tests {
             lgtop: None,
             mode: 0,
             length: -1,
+            _is_virtual: true,
             variant: VStringVariant::Concat(VStringConcatInfo {
                 vleft: ctx.materialize_operand_at(OpRef::int_op(4)),
                 vright: ctx.materialize_operand_at(OpRef::int_op(5)),
-                _is_virtual: true,
             }),
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -2893,6 +2867,7 @@ mod tests {
             lgtop: None,
             mode: 0,
             length: -1,
+            _is_virtual: false,
             variant: VStringVariant::Ptr,
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -2915,6 +2890,7 @@ mod tests {
             lgtop: None,
             mode: 0,
             length: 3,
+            _is_virtual: true,
             variant: VStringVariant::Plain(VStringPlainInfo {
                 _chars: vec![
                     Some(ctx.materialize_operand_at(OpRef::int_op(10))),
@@ -2956,6 +2932,7 @@ mod tests {
             lgtop: None,
             mode: 0,
             length: 1,
+            _is_virtual: true,
             variant: VStringVariant::Plain(VStringPlainInfo {
                 _chars: vec![Some(ctx.materialize_operand_at(ch))],
             }),
@@ -2996,6 +2973,7 @@ mod tests {
                 lgtop: None,
                 mode: 0,
                 length: 3,
+                _is_virtual: true,
                 variant: VStringVariant::Plain(VStringPlainInfo {
                     _chars: source_chars,
                 }),
@@ -3009,6 +2987,7 @@ mod tests {
             lgtop: Some(ctx.materialize_operand_at(OpRef::int_op(21))), // vstring.py:223: self.lgtop = length
             mode: 0,
             length: -1,
+            _is_virtual: true,
             variant: VStringVariant::Slice(VStringSliceInfo {
                 s: ctx.materialize_operand_at(source),
                 start: ctx.materialize_operand_at(OpRef::int_op(20)),
@@ -3029,10 +3008,10 @@ mod tests {
             lgtop: None,
             mode: 0,
             length: -1,
+            _is_virtual: true,
             variant: VStringVariant::Concat(VStringConcatInfo {
                 vleft: ctx.materialize_operand_at(source),
                 vright: ctx.materialize_operand_at(OpRef::int_op(2)),
-                _is_virtual: true,
             }),
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -3049,6 +3028,7 @@ mod tests {
                 lgtop: None,
                 mode: 0,
                 length: 2,
+                _is_virtual: true,
                 variant: VStringVariant::Plain(VStringPlainInfo { _chars: pos2_chars }),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),

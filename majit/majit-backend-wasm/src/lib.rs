@@ -3770,20 +3770,6 @@ impl WasmBackend {
                 descrs.iter().filter_map(|d| d.meta_descr.clone()).collect();
             let tracer: Arc<dyn std::any::Any + Send + Sync> = Arc::new(meta);
             clt.asmmemmgr_gcreftracers.lock().push(tracer);
-            // `gcreftracer.py` `llop.gc_writebarrier(tr)`: each published
-            // descr's `rd_consts` enters the remembered set for one minor.
-            let _ = with_wasm_active_gc_mut(|gc| {
-                for d in descrs {
-                    if let Some(pool) = d
-                        .meta_descr
-                        .as_ref()
-                        .and_then(|descr| descr.as_fail_descr())
-                        .and_then(|fd| fd.rd_consts_arc())
-                    {
-                        gc.remember_const_pool(&pool);
-                    }
-                }
-            });
         }
     }
 

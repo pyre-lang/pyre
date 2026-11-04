@@ -93,9 +93,10 @@ pub type StringConstantAllocator = std::sync::Arc<dyn Fn(&[i64], bool) -> GcRef 
 ///     for VirtualArray, etc.) — RPython's `_attrs_` is a hint to the
 ///     translator's slot allocator, not a parity constraint on the
 ///     storage *type*. Each pyre variant keeps its own typed `descr`.
-///   - `_is_virtual` collapses into the pyre enum tag itself
-///     (`PtrInfo::Virtual(_)` IS the truthy carrier of `_is_virtual`);
-///     no separate slot is needed.
+///   - `_is_virtual` collapses into the pyre enum tag for Virtual*
+///     variants (`PtrInfo::Virtual(_)` IS the truthy carrier). `StrPtrInfo`
+///     keeps the flag (`vstring.py` `StrPtrInfo.__init__`) so a forced
+///     plain/slice/concat stays the same info object with the flag cleared.
 ///
 /// `make_virtual_info` (resume.py) reads `cached_vinfo` to
 /// dedup RdVirtualInfo allocations across multiple finish() calls
@@ -128,6 +129,11 @@ pub struct StrPtrInfo {
     pub mode: u8,
     /// vstring.py: self.length — known exact length (-1 if unknown).
     pub length: i32,
+    /// vstring.py `StrPtrInfo.__init__` `_is_virtual`. Cleared in
+    /// `StrPtrInfo.force_box`; the variant (plain / slice / concat chars)
+    /// stays so later `strlen` / `strgetitem` / concat folding can still
+    /// read it.
+    pub _is_virtual: bool,
     /// vstring.py: subclass-specific state
     /// (`VStringPlainInfo` / `VStringSliceInfo` / `VStringConcatInfo`).
     pub variant: VStringVariant,
@@ -142,13 +148,11 @@ pub struct StrPtrInfo {
 }
 
 impl StrPtrInfo {
-    /// vstring.py / 227 / 278 `is_virtual()` on the string ptrinfo classes.
+    /// vstring.py `StrPtrInfo.is_virtual` / `VStringPlainInfo.is_virtual` /
+    /// `VStringSliceInfo.is_virtual` / `VStringConcatInfo.is_virtual` —
+    /// the inherited `_is_virtual` flag, not the variant tag.
     pub fn is_virtual(&self) -> bool {
-        match &self.variant {
-            VStringVariant::Ptr => false,
-            VStringVariant::Plain(_) | VStringVariant::Slice(_) => true,
-            VStringVariant::Concat(info) => info._is_virtual,
-        }
+        self._is_virtual
     }
 }
 
@@ -184,7 +188,6 @@ pub struct VStringSliceInfo {
 pub struct VStringConcatInfo {
     pub vleft: Operand,
     pub vright: Operand,
-    pub _is_virtual: bool,
 }
 
 /// A virtual object whose allocation has been removed.

@@ -224,6 +224,10 @@ impl Eq for Const {}
 pub struct SharedConstPool {
     values: std::cell::UnsafeCell<Vec<Const>>,
     visited_generation: std::sync::atomic::AtomicU64,
+    /// `incminimark.py` `GCFLAG_TRACK_YOUNG_PTRS` analogue.
+    /// 0: the flag is set (the pool is on no collector's list).
+    /// Nonzero: the MiniMark id whose `pending_const_pools` holds it.
+    remembered_by: std::sync::atomic::AtomicUsize,
 }
 
 unsafe impl Send for SharedConstPool {}
@@ -231,10 +235,47 @@ unsafe impl Sync for SharedConstPool {}
 
 impl SharedConstPool {
     pub fn new(values: Vec<Const>) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self {
+        let has_ref = values.iter().any(|c| matches!(c, Const::Ref(_)));
+        let arc = std::sync::Arc::new(Self {
             values: std::cell::UnsafeCell::new(values),
             visited_generation: std::sync::atomic::AtomicU64::new(0),
-        })
+            remembered_by: std::sync::atomic::AtomicUsize::new(0),
+        });
+        if has_ref {
+            // A freshly built list holding refs is traced by the next minor,
+            // like a young object (`incminimark.py` `write_barrier`).
+            remember_const_pool(&arc);
+        }
+        arc
+    }
+
+    /// Try to take `GCFLAG_TRACK_YOUNG_PTRS` for `id`.
+    ///
+    /// Returns true when the pool was not already marked with `id`, so the
+    /// caller should append it to that MiniMark's `pending_const_pools`.
+    pub fn try_mark_remembered(&self, id: usize) -> bool {
+        loop {
+            let cur = self.remembered_by.load(Ordering::Acquire);
+            if cur == id {
+                return false;
+            }
+            if self
+                .remembered_by
+                .compare_exchange_weak(cur, id, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    /// `incminimark.py` `collect_oldrefs_to_nursery` setting
+    /// `GCFLAG_TRACK_YOUNG_PTRS` back. A pool another MiniMark re-marked
+    /// keeps that mark (`compare_exchange` fails).
+    pub fn clear_remembered(&self, id: usize) {
+        let _ = self
+            .remembered_by
+            .compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire);
     }
 
     pub fn mark_visited_generation(&self, generation: u64) -> bool {

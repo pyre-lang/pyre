@@ -4936,6 +4936,7 @@ impl OptContext {
                 lgtop: None,
                 mode: sinfo.mode,
                 length: -1,
+                _is_virtual: false,
                 // unroll.py:86: StrPtrInfo(preamble_info.mode) — always
                 // rebuild a plain non-virtual StrPtrInfo; never carry
                 // the previous iteration's virtual variant across.
@@ -9794,6 +9795,7 @@ impl OptContext {
                 lgtop: None,
                 mode: 0,
                 length: -1,
+                _is_virtual: false,
                 variant: crate::optimizeopt::info::VStringVariant::Ptr,
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -9805,6 +9807,7 @@ impl OptContext {
                 lgtop: None,
                 mode: 1,
                 length: -1,
+                _is_virtual: false,
                 variant: crate::optimizeopt::info::VStringVariant::Ptr,
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -9869,6 +9872,7 @@ impl OptContext {
                 lgtop: None,
                 mode,
                 length: -1,
+                _is_virtual: false,
                 variant: crate::optimizeopt::info::VStringVariant::Ptr,
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -10162,6 +10166,7 @@ mod getstrlen_force_tests {
                 lgtop: None,
                 mode: 0,
                 length: -1,
+                _is_virtual: false,
                 variant: VStringVariant::Ptr,
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -10208,6 +10213,7 @@ mod getstrlen_force_tests {
                 lgtop: None,
                 mode: 0,
                 length: -1,
+                _is_virtual: false,
                 variant: VStringVariant::Ptr,
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -10225,6 +10231,7 @@ mod getstrlen_force_tests {
                 lgtop: None,
                 mode: 0,
                 length: 0,
+                _is_virtual: true,
                 variant: VStringVariant::Plain(VStringPlainInfo { _chars: vec![] }),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -10239,10 +10246,10 @@ mod getstrlen_force_tests {
                 lgtop: None,
                 mode: 0,
                 length: -1,
+                _is_virtual: true,
                 variant: VStringVariant::Concat(VStringConcatInfo {
                     vleft: ptr_box,
                     vright: empty_box,
-                    _is_virtual: true,
                 }),
                 last_guard_pos: -1,
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
@@ -11730,6 +11737,7 @@ mod constant_ptr_info_tests {
                 assert_eq!(sinfo.mode, 0);
                 assert_eq!(sinfo.length, -1);
                 assert!(sinfo.lenbound.is_none());
+                assert!(!sinfo.is_virtual());
                 assert!(matches!(sinfo.variant, VStringVariant::Ptr));
             }
             other => panic!("expected base StrPtrInfo, got {other:?}"),

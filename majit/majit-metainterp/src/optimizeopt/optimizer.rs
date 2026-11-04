@@ -366,6 +366,9 @@ pub struct Optimizer {
     /// the sharer, matching `compile.py:832
     /// ResumeGuardCopiedDescr(prev)` parity.
     last_guard_op_idx: Option<usize>,
+    /// optimizer.py `_really_emitted_operation` — last op appended by
+    /// `_emit_operation`. `getlastop` returns this, not `new_operations.last()`.
+    really_emitted_operation: Option<OpRc>,
     /// optimizer.py:241/304/632-634 `replaces_guard` — maps an emitted
     /// guard op to its replacement. RPython keys this dict by the guard
     /// `op` object itself (object identity); pyre keys by the guard op's
@@ -1428,6 +1431,7 @@ impl Optimizer {
             final_num_inputs: 0,
             call_pure_results: crate::optimizeopt::util::ArgsDict::default(),
             last_guard_op_idx: None,
+            really_emitted_operation: None,
             replaces_guard: crate::FxIndexMap::default(),
             pendingfields: Vec::new(),
             can_replace_guards: true,
@@ -2313,8 +2317,18 @@ impl Optimizer {
             // then `_force_elements`. A parked non-virtual field producer is
             // flushed there, immediately before that field's store — not by
             // walking the field graph before the container allocation.
+            //
+            // optimizer.py `force_box(op, optforce=None)`: `optforce = self`.
+            // `Optimizer.emit_extra` is `_emit_operation`, so the extra does
+            // not re-enter earlier passes. OptString `_optimize_NEWSTR` would
+            // otherwise Remove a small-const force NEWSTR and `getlastop()`
+            // would be a prior op. `force_at_the_end_of_preamble` passes
+            // `optforce=self.optearlyforce` and does not come through here.
             let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
+            let saved = ctx.force_direct;
+            ctx.force_direct = true;
             let forced = super::info::force_box_impl(&mut info, &resolved_box, ctx, self);
+            ctx.force_direct = saved;
             return ctx.resolve_operand_operand(&forced);
         }
         resolved_box
@@ -2459,11 +2473,20 @@ impl Optimizer {
                 | crate::optimizeopt::info::PtrInfo::VirtualRawSlice(_)
                 | crate::optimizeopt::info::PtrInfo::Str(_)
         ) {
+            // optimizer.py `force_box_for_end_of_preamble`:
+            // `info.force_at_the_end_of_preamble(box, self.optearlyforce, rec)`.
+            // `optforce` is OptEarlyForce, so `emit_extra` walks remaining
+            // after that pass (OptHeap). Not `Optimizer.force_box`, whose
+            // default `optforce=self` is `_emit_operation`.
             let saved = ctx.current_pass_idx;
+            let saved_direct = ctx.force_direct;
             ctx.current_pass_idx = ctx.optearlyforce_idx;
-            let result = self.force_box(&resolved, ctx);
+            ctx.force_direct = false;
+            let mut info = ctx.take_ptr_info(&resolved).unwrap();
+            let forced = super::info::force_box_impl(&mut info, &resolved, ctx, self);
             ctx.current_pass_idx = saved;
-            return result;
+            ctx.force_direct = saved_direct;
+            return ctx.resolve_operand_operand(&forced);
         }
 
         resolved
@@ -2493,9 +2516,14 @@ impl Optimizer {
         }
     }
 
-    /// optimizer.py: getlastop() — return the last emitted non-guard operation.
-    pub fn getlastop<'a>(&self, ctx: &'a OptContext) -> Option<&'a Op> {
-        ctx.new_operations.last().map(|rc| rc.as_ref())
+    /// optimizer.py `getlastop` — `_really_emitted_operation`.
+    pub fn getlastop(&self) -> Option<&Op> {
+        self.really_emitted_operation.as_ref().map(|rc| rc.as_ref())
+    }
+
+    /// optimizer.py `getlastop` as the emitted `OpRc`.
+    pub fn getlastop_rc(&self) -> Option<OpRc> {
+        self.really_emitted_operation.clone()
     }
 
     /// optimizer.py: get_count_of_ops()
@@ -4997,6 +5025,9 @@ impl Optimizer {
         op: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> Result<(), crate::optimize::InvalidLoop> {
+        // optimizer.py `_propagate_all_forward`: `_really_emitted_operation = None`
+        // at the start of each input op.
+        self.really_emitted_operation = None;
         self.propagate_from_pass(0, op, ctx)
     }
 
@@ -5619,6 +5650,9 @@ impl Optimizer {
         let op_result_type = op.result_type();
         let _ = reuse;
         let emitted_box = majit_ir::operand::Operand::from_bound_op(&op);
+        // optimizer.py `_emit_operation`: `self._really_emitted_operation = op`
+        // then `_newoperations.append(op)`.
+        self.really_emitted_operation = Some(op.clone());
         let emitted = ctx.emit_rc(op);
         // optimizer.py `self._emittedoperations[op] = None` — `ctx.emit_rc`
         // records the appended op so `as_operation` can later confirm it
