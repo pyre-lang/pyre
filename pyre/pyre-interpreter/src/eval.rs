@@ -2782,12 +2782,18 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bo
     // this around a residual call to detect a body effect that ran through
     // user code (a side-effecting getter / dunder / module top level).
     crate::call::bump_frame_entry_count();
-    // Count this interpreter activation so the JIT eval loop's GC safepoint
-    // stops firing once the nesting is deep enough to hide a root
-    // (PYRE_GC_INTERP root-completeness): module level and one called
-    // function's loop still collect, and an `eval_loop_jit` re-entered from
-    // inside an opcode handler observes depth >= 3 and skips collection.
-    // No-op when the flag is off.
+    // Count this interpreter activation for the dispatch-loop GC safepoint.
+    // `at_outermost_activation` admits the module frame (depth 1) and one
+    // nested activation (depth 2); a callback entered from a depth-1 opcode
+    // handler runs at depth 2 with that handler suspended. Operands stay on
+    // the frame value stack or are pinned (`with_roots!`), the interpreter
+    // frame is a `FrameBox` (young-nonmoving), and the result push goes
+    // through `FrameAnchor`; a handler that writes the frame after a
+    // collecting call through the pre-call `&mut` relies on the frame not
+    // moving. Upstream roots every live variable around a collecting call
+    // and reloads it (`framework.py` `BaseFrameworkGCTransformer.gct_direct_call`,
+    // `shadowstack.py` `ShadowStackFrameworkGCTransformer.push_roots` /
+    // `pop_roots`). No-op when the flag is off.
     let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
     if _eval_activation.armed() {
         // Publish the process-stable configuration in the breaker word once
@@ -7864,8 +7870,10 @@ result = (
     /// moving minor the dispatch-loop safepoint will run
     /// (`do_collect_nursery` / `minor_collection_with_major_progress` with
     /// `force_enabled=False`). An unreferenced nursery neighbour is not kept.
-    /// Depth ≤ 2 is the safepoint's root-completeness gate: opcode-handler
-    /// Rust locals are not rooted; assembler frames are rooted by gcmap.
+    /// Depth ≤ 2 is [`at_outermost_activation`]: the module frame and one
+    /// nested activation; a callback from a depth-1 opcode handler runs at
+    /// depth 2 with that handler suspended. Assembler frames are rooted by
+    /// gcmap.
     #[test]
     fn safepoint_depth_le_2_minor_forwards_frame_locals() {
         use majit_gc::GcAllocator;

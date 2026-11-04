@@ -17,13 +17,14 @@
 //! `minor_collection_with_major_progress` with `force_enabled=False`
 //! (`do_collect_nursery`): a moving minor, then one bounded
 //! `major_collection_step`. The depth ≤ 2 gate ([`at_outermost_activation`])
-//! exists because opcode-handler Rust locals are not rooted; assembler frames
-//! are rooted by gcmap. When to collect is not decided here: the safepoint asks
-//! the collector's own `threshold_reached` (incminimark.py), which weighs
-//! everything the collector is responsible for against the threshold
-//! `set_major_threshold_from` (incminimark.py) derived from the last major's
-//! survivors. Upstream asks that question in the allocator; pyre asks it here
-//! because here is where it can act on the answer.
+//! admits the module frame and one nested activation; a callback from a
+//! depth-1 opcode handler runs at depth 2 with that handler suspended.
+//! Assembler frames are rooted by gcmap. When to collect is not decided here:
+//! the safepoint asks the collector's own `threshold_reached` (incminimark.py),
+//! which weighs everything the collector is responsible for against the
+//! threshold `set_major_threshold_from` (incminimark.py) derived from the last
+//! major's survivors. Upstream asks that question in the allocator; pyre asks
+//! it here because here is where it can act on the answer.
 //!
 //! Enabled by default on every target. `PYRE_GC_INTERP=0` remains the explicit
 //! rollback switch.
@@ -47,8 +48,7 @@ static EXPLICIT_OLDGEN_REQUEST: AtomicBool = AtomicBool::new(false);
 thread_local! {
     /// Number of interpreter eval-loop activations currently on this
     /// thread's call stack (both the plain `eval_loop` and the JIT
-    /// `eval_loop_jit`). The dispatch-loop safepoint consults it so
-    /// a collection only fires at the OUTERMOST activation — see
+    /// `eval_loop_jit`). The dispatch-loop safepoint consults it through
     /// [`at_outermost_activation`].
     static EVAL_NESTING: Cell<u32> = const { Cell::new(0) };
 }
@@ -111,17 +111,20 @@ impl Drop for EvalActivationGuard {
 
 /// Whether the safepoint may fire at this eval-loop nesting depth.
 ///
-/// Depth 1 = module-level loop, depth 2 = one called function's loop.
-/// Both are safe: a Python CALL opcode completes before re-entering the
-/// eval loop, so no opcode handler holds a Rust-stack `PyObjectRef` across
-/// the boundary; the pyframe root walker sees the full `CURRENT_FRAME` /
-/// `f_backref` chain.
+/// The gate admits the module frame (depth 1) and one nested activation
+/// (depth 2). A callback entered from a depth-1 opcode handler (FOR_ITER
+/// `__next__`, BINARY_OP `__add__`, a builtin calling back) runs at depth 2
+/// with that handler suspended.
 ///
-/// Depth ≥ 3 = a callback re-entry from inside an opcode handler (e.g.
-/// FOR_ITER → `__getitem__`, exception handler, `_sre.sub` callable,
-/// `sorted` key). The outer handler holds live `PyObjectRef`s on the
-/// Rust stack that the walker cannot reach — a collection would free
-/// still-reachable old-gen objects. Block the safepoint there.
+/// Handler references stay valid across a moving minor today because operands
+/// remain on the frame value stack or are pinned (`with_roots!`), the
+/// interpreter frame is a `FrameBox` (young-nonmoving), and the result push
+/// goes through `FrameAnchor`. A handler that writes the frame after a
+/// collecting call through the pre-call `&mut` relies on the frame not moving.
+/// Upstream roots every live variable around a collecting call and reloads it
+/// (`framework.py` `BaseFrameworkGCTransformer.gct_direct_call`,
+/// `shadowstack.py` `ShadowStackFrameworkGCTransformer.push_roots` /
+/// `pop_roots`).
 ///
 /// Reads the runtime-mutable `EVAL_NESTING` thread-local, not a build-time
 /// constant, so the JIT residualizes the call instead of tracing into it
@@ -296,12 +299,18 @@ pub fn would_collect() -> bool {
 /// `incminimark.py` `minor_collection_with_major_progress` with
 /// `force_enabled=False`. Assembler frames are rooted by gcmap, so a moving
 /// minor with jitframes on the stack is already the `CALL_MALLOC_NURSERY`
-/// overflow path. The remaining move hazard is an unrooted native Rust-stack
-/// `PyObjectRef` in a bytecode handler. The safepoint fires at the first two
-/// eval activations and no deeper ([`at_outermost_activation`]) because
-/// opcode-handler Rust locals are not rooted: a Python callback re-entered
-/// from inside an opcode handler never triggers it. An explicit
-/// [`request_oldgen_collection`] still runs the non-moving old-gen major.
+/// overflow path. [`at_outermost_activation`] admits the module frame
+/// (depth 1) and one nested activation (depth 2); a callback entered from a
+/// depth-1 opcode handler runs at depth 2 with that handler suspended.
+/// Operands stay on the frame value stack or are pinned (`with_roots!`), the
+/// interpreter frame is a `FrameBox` (young-nonmoving), and the result push
+/// goes through `FrameAnchor`; a handler that writes the frame after a
+/// collecting call through the pre-call `&mut` relies on the frame not moving.
+/// Upstream roots every live variable around a collecting call and reloads it
+/// (`framework.py` `BaseFrameworkGCTransformer.gct_direct_call`,
+/// `shadowstack.py` `ShadowStackFrameworkGCTransformer.push_roots` /
+/// `pop_roots`). An explicit [`request_oldgen_collection`] still runs the
+/// non-moving old-gen major.
 ///
 /// Dispatches to the installed threshold and collection hooks, neither a
 /// build-time constant, so the JIT residualizes the call instead of tracing
