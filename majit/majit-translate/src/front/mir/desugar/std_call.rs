@@ -2471,19 +2471,21 @@ impl<'a> Lowering<'a> {
     }
 
     /// The predecessors of each block, over the blocks reached from the
-    /// entry.
-    fn block_predecessors(&self) -> Vec<Vec<usize>> {
-        let n = self.body.body.len();
-        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
-        for p in 0..n {
-            if !self.forward_reached[p] {
-                continue;
+    /// entry. Built once per body.
+    fn block_predecessors(&self) -> &[Vec<usize>] {
+        self.block_predecessors.get_or_init(|| {
+            let n = self.body.body.len();
+            let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+            for p in 0..n {
+                if !self.forward_reached[p] {
+                    continue;
+                }
+                for s in crate::front::mir::gcroot::block_successors(self.llbc, self.body, p) {
+                    preds[s].push(p);
+                }
             }
-            for s in crate::front::mir::gcroot::block_successors(self.llbc, self.body, p) {
-                preds[s].push(p);
-            }
-        }
-        preds
+            preds
+        })
     }
 
     /// Definitions of `local` that reach the point just before statement

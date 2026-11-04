@@ -184,6 +184,9 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// Root locals of some forward-reached projected `Assign` destination,
     /// for [`Self::local_has_projected_store`]; built on first query.
     pub(in crate::front::mir) projected_store_roots: std::cell::OnceCell<bit_set::BitSet>,
+    /// Predecessors of each MIR block, over the forward-reached blocks, for
+    /// [`Self::block_predecessors`]; built on first query.
+    pub(in crate::front::mir) block_predecessors: std::cell::OnceCell<Vec<Vec<usize>>>,
     /// MIR locals that are live when entering each block. Non-entry
     /// blocks receive these through `Block.inputargs`, and predecessor
     /// edges pass the matching current Variables via `Link.args`.
@@ -1485,6 +1488,7 @@ impl<'a> Lowering<'a> {
             forward_reached,
             call_dest_locals: std::cell::OnceCell::new(),
             projected_store_roots: std::cell::OnceCell::new(),
+            block_predecessors: std::cell::OnceCell::new(),
             block_live_in,
             block_entry_local_var,
             input_copied_from: std::collections::HashMap::new(),
