@@ -16110,7 +16110,6 @@ mod tests {
 
     #[test]
     fn fixed_result_argtype_rows_register_template_cache() {
-        use crate::annotator::description::GraphCacheKey;
         use crate::annotator::policy::Specializer;
 
         let (_ann, registry) = pointer_atomic_argtype_registry();
@@ -16140,8 +16139,8 @@ mod tests {
                 fd.specializer
             );
             assert!(
-                fd.cache.borrow().contains_key(&GraphCacheKey::None),
-                "{segments:?}: default cache holds the GraphCacheKey::None template"
+                fd.built_source_template().is_some(),
+                "{segments:?}: source template installed"
             );
             let annspecialcase = fd
                 .base

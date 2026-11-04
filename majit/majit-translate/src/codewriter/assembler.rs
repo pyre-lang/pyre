@@ -15040,15 +15040,15 @@ mod tests {
         );
     }
 
-    /// Literal class key `ArgErr` stays a different host from the origin
-    /// struct `argument::ArgErr` (`canonical_struct_name`).
+    /// Literal class key `ArgErr` stays a different host from the struct
+    /// `argument::ArgErr`.
     #[test]
     fn minted_exception_class_keeps_literal_key_beside_struct_origin() {
         let (ann, _rtyper) = fresh_exception_typer();
         let _guard = crate::test_support::register_struct_origins_serialized(
             std::collections::HashMap::from([("ArgErr".to_string(), "argument".to_string())]),
         );
-        let struct_host = ann.bookkeeper.intern_class_by_qualname("ArgErr");
+        let struct_host = ann.bookkeeper.intern_class_by_qualname("argument::ArgErr");
         assert_eq!(struct_host.qualname(), "argument::ArgErr");
         ann.bookkeeper.mint_exception_class_hierarchies(&[
             crate::front::llbc_hints::ExceptionClassHint {
