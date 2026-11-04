@@ -4317,7 +4317,7 @@ fn register_opaque_external_argtype_with_result(
     graph_func.annspecialcase = Some(tag);
     registry
         .get_or_register_with_func(key, signature, graph_func)
-        .prefill_default_cache(stub_pygraph);
+        .install_source_template(stub_pygraph);
 }
 
 /// Declare the opaque MIR deref-write marker to the annotator.
