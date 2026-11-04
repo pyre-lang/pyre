@@ -36,7 +36,7 @@ use super::argument::{ArgumentsForTranslation, simple_args};
 use super::classdesc::{ClassDef, ClassDesc};
 use super::description::{
     CallFamily, ClassAttrFamily, ClassDefKey, DescEntry, DescKey, FrozenAttrFamily, FrozenDesc,
-    FunctionDesc, MethodDesc,
+    FunctionDesc, MethodDesc, desc_as_host_instance,
 };
 use super::dictdef::{DictDef, DictKey};
 use super::listdef::ListDef;
@@ -5572,8 +5572,8 @@ impl Bookkeeper {
             | ConstValue::Atom(_)
             | ConstValue::Placeholder
             | ConstValue::Opaque(_) => {
-                // Code / Graphs / SpecTag / Atom / Placeholder cover
-                // internal flowspace / host-carrier values that
+                // Code / Graphs / SpecTag / Atom / Placeholder / Opaque
+                // cover internal flowspace / host-carrier values that
                 // upstream never feeds into immutablevalue. Keep the
                 // fail-fast stub so any unexpected call-site surfaces
                 // a clear error rather than silent stub-SomePBC.
@@ -5581,6 +5581,11 @@ impl Bookkeeper {
                     "Bookkeeper.immutablevalue({x:?}): internal ConstValue variant \
                      has no upstream immutablevalue branch"
                 )))
+            }
+            ConstValue::Desc(d) => {
+                // `bookkeeper.py` `immutablevalue` user-instance arm.
+                let host = desc_as_host_instance(&d.as_desc());
+                self.immutablevalue_hostobject(&host, x)
             }
         }
     }
@@ -8062,7 +8067,6 @@ mod tests {
     #[ignore]
     fn real_llbc_pyframe_locals_array_projects_typed_instance_items() {
         use crate::annotator::model::SomeValue;
-        use majit_charon_reader::Llbc;
 
         let interpreter_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -8072,8 +8076,8 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../target/llbc/pyre-object.ullbc"
         );
-        let interpreter = Llbc::load(interpreter_path).expect("load real interpreter LLBC");
-        let object = Llbc::load(object_path).expect("load real object LLBC");
+        let interpreter = crate::test_support::load_ullbc(interpreter_path);
+        let object = crate::test_support::load_ullbc(object_path);
         let program = crate::front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
             &[object, interpreter],
             crate::HostStaticAddrs::default(),
@@ -8127,13 +8131,11 @@ mod tests {
     fn real_merged_llbc_memoryview_closure_tuple_projects_instance_item() {
         use crate::annotator::model::SomeValue;
         use crate::translator::rtyper::rmodel::Repr;
-        use majit_charon_reader::Llbc;
 
-        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/llbc/");
-        let object = Llbc::load(format!("{root}pyre-object.ullbc")).expect("load real object LLBC");
-        let interpreter = Llbc::load(format!("{root}pyre-interpreter.ullbc"))
-            .expect("load real interpreter LLBC");
-        let jit = Llbc::load(format!("{root}pyre-jit.ullbc")).expect("load real jit LLBC");
+        let object = crate::test_support::load_ullbc(crate::runtime_names::artifacts::OBJECT_ULLBC);
+        let interpreter =
+            crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
+        let jit = crate::test_support::load_ullbc(crate::runtime_names::artifacts::JIT_ULLBC);
         let program = crate::front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
             &[object, interpreter, jit],
             crate::HostStaticAddrs::default(),
@@ -12171,6 +12173,212 @@ mod tests {
         };
         assert_eq!(mixed_pbc.descriptions.len(), 2);
         assert!(!mixed_pbc.is_constant());
+    }
+
+    fn desc_const(entry: DescEntry) -> ConstValue {
+        ConstValue::Desc(crate::flowspace::model::DescConst::new(entry))
+    }
+
+    fn function_desc_entry(bk: &Rc<Bookkeeper>, name: &str) -> DescEntry {
+        DescEntry::function(Rc::new(RefCell::new(FunctionDesc::new(
+            Rc::clone(bk),
+            None,
+            name,
+            Signature::new(vec![], None, None),
+            None,
+            None,
+        ))))
+    }
+
+    fn assert_immutablevalue_desc_user_instance(
+        bk: &Rc<Bookkeeper>,
+        entry: DescEntry,
+        classdef_name: &str,
+        basedef_name: &str,
+    ) {
+        use crate::annotator::description::{desc_as_host_instance, desc_host_class};
+
+        let host_class = desc_host_class(&entry);
+        let host_inst = desc_as_host_instance(&entry);
+        let x = desc_const(entry);
+        assert_eq!(x.class_of().as_ref(), Some(&host_class));
+        assert!(!Constant::new(x.clone()).foldable());
+
+        let s = bk.immutablevalue(&x).expect("Desc user-instance arm");
+        assert!(
+            !matches!(s, SomeValue::PBC(_)),
+            "not the _freeze_ arm: {s:?}"
+        );
+        let SomeValue::Instance(si) = &s else {
+            panic!("expected SomeInstance, got {s:?}");
+        };
+        assert_eq!(s.const_(), Some(&x));
+        let classdef = si.classdef.as_ref().expect("classdef");
+        assert_eq!(classdef.borrow().name, classdef_name);
+        assert!(
+            classdef
+                .borrow()
+                .instances_seen
+                .contains(&host_inst.identity_id())
+        );
+        let basedef = classdef
+            .borrow()
+            .basedef
+            .clone()
+            .unwrap_or_else(|| panic!("{classdef_name} basedef"));
+        assert_eq!(basedef.borrow().name, basedef_name);
+
+        let s2 = bk
+            .immutablevalue(&x)
+            .expect("second immutablevalue of the same Desc");
+        let SomeValue::Instance(si2) = &s2 else {
+            panic!("expected SomeInstance, got {s2:?}");
+        };
+        assert!(Rc::ptr_eq(
+            si2.classdef.as_ref().expect("classdef"),
+            classdef
+        ));
+        assert_eq!(classdef.borrow().instances_seen.len(), 1);
+    }
+
+    #[test]
+    fn immutablevalue_desc_routes_to_some_instance() {
+        use crate::annotator::description::{MemoDesc, MethodOfFrozenDesc, desc_host_class};
+        use crate::flowspace::model::HostObject;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+
+        let function = function_desc_entry(&bk, "a");
+        let memo = DescEntry::memo(Rc::new(RefCell::new(MemoDesc::new(
+            function_desc_entry(&bk, "memo")
+                .as_function()
+                .expect("function desc"),
+        ))));
+        let method = {
+            let fd = function
+                .as_func_entry()
+                .cloned()
+                .expect("function FuncDescEntry");
+            DescEntry::Method(bk.getmethoddesc(
+                &fd,
+                crate::annotator::description::ClassDefKey::from_raw(1),
+                Some(crate::annotator::description::ClassDefKey::from_raw(2)),
+                "m",
+                Default::default(),
+            ))
+        };
+        let frozen = DescEntry::Frozen(
+            bk.getfrozen(&HostObject::new_module("mod"))
+                .expect("FrozenDesc"),
+        );
+        let method_of_frozen = {
+            let fd = function_desc_entry(&bk, "m")
+                .as_func_entry()
+                .cloned()
+                .expect("function FuncDescEntry");
+            let frozendesc = bk
+                .getfrozen(&HostObject::new_module("frozen-mod"))
+                .expect("FrozenDesc");
+            DescEntry::MethodOfFrozen(Rc::new(RefCell::new(MethodOfFrozenDesc::new(
+                Rc::clone(&bk),
+                fd,
+                frozendesc,
+            ))))
+        };
+        let class = bk
+            .getdesc(&HostObject::new_class("pkg.Holder", vec![]))
+            .expect("ClassDesc for pkg.Holder");
+
+        let desc_cls = desc_host_class(&function)
+            .class_bases()
+            .and_then(|bases| bases.first().cloned())
+            .expect("FunctionDesc bases Desc");
+        assert_eq!(desc_cls.qualname(), "rpython.annotator.description.Desc");
+        assert!(desc_host_class(&function).is_subclass_of(&desc_cls));
+        assert!(desc_host_class(&memo).is_subclass_of(&desc_host_class(&function)));
+
+        assert_immutablevalue_desc_user_instance(
+            &bk,
+            function,
+            "rpython.annotator.description.FunctionDesc",
+            "rpython.annotator.description.Desc",
+        );
+        assert_immutablevalue_desc_user_instance(
+            &bk,
+            memo.clone(),
+            "rpython.annotator.description.MemoDesc",
+            "rpython.annotator.description.FunctionDesc",
+        );
+        let memo_s = bk
+            .immutablevalue(&desc_const(memo))
+            .expect("MemoDesc SomeInstance");
+        let SomeValue::Instance(memo_si) = &memo_s else {
+            panic!("expected SomeInstance, got {memo_s:?}");
+        };
+        let memo_function = memo_si
+            .classdef
+            .as_ref()
+            .expect("MemoDesc classdef")
+            .borrow()
+            .basedef
+            .clone()
+            .expect("MemoDesc basedef FunctionDesc");
+        assert_eq!(
+            memo_function
+                .borrow()
+                .basedef
+                .as_ref()
+                .expect("FunctionDesc basedef")
+                .borrow()
+                .name,
+            "rpython.annotator.description.Desc"
+        );
+        assert_immutablevalue_desc_user_instance(
+            &bk,
+            method,
+            "rpython.annotator.description.MethodDesc",
+            "rpython.annotator.description.Desc",
+        );
+        assert_immutablevalue_desc_user_instance(
+            &bk,
+            frozen,
+            "rpython.annotator.description.FrozenDesc",
+            "rpython.annotator.description.Desc",
+        );
+        assert_immutablevalue_desc_user_instance(
+            &bk,
+            method_of_frozen,
+            "rpython.annotator.description.MethodOfFrozenDesc",
+            "rpython.annotator.description.Desc",
+        );
+        assert_immutablevalue_desc_user_instance(
+            &bk,
+            class,
+            "rpython.annotator.classdesc.ClassDesc",
+            "rpython.annotator.description.Desc",
+        );
+    }
+
+    #[test]
+    fn getdesc_for_const_desc_is_unexpected_prebuilt_constant() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let x = desc_const(function_desc_entry(&bk, "a"));
+        bk.getdesc_for_const(&x)
+            .expect_err("unexpected prebuilt constant");
+    }
+
+    #[test]
+    fn const_value_desc_class_of_is_host_class() {
+        use crate::annotator::description::desc_host_class;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let entry = function_desc_entry(&bk, "a");
+        let x = desc_const(entry.clone());
+        assert_eq!(x.class_of().as_ref(), Some(&desc_host_class(&entry)));
+        assert!(!Constant::new(x).foldable());
     }
 
     #[test]

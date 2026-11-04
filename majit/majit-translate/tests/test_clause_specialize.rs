@@ -4,6 +4,9 @@
 //! The `ObjectKey` instantiation must reach `ObjectKey::eq`. The two
 //! graphs do not share a key.
 
+mod common;
+
+use common::{MODULE_LLBC, OBJECT_LLBC, load_llbc};
 use majit_charon_reader::Llbc;
 use majit_translate::{
     HostStaticAddrs,
@@ -14,20 +17,11 @@ use majit_translate::{
     model::{CallTarget, ConcreteType, FunctionGraph, OpKind, ValueType},
 };
 
-const OBJECT_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/llbc/pyre-object.ullbc"
-);
-const MODULE_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/llbc/pyre-module.ullbc"
-);
-
 #[test]
 fn rdict_string_and_objectkey_instantiations_resolve_distinct_eq() {
-    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    let llbc = load_llbc(OBJECT_LLBC);
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
-        &[llbc],
+        std::slice::from_ref(llbc),
         HostStaticAddrs::default(),
         &["celldict", "dictmultiobject", "rordereddict"],
         &[
@@ -123,9 +117,9 @@ fn mk_i64_and_string_spec_graphs_have_int_and_ref_returns() {
 /// trait method, and compares with the `str` eq.
 #[test]
 fn str_key_eqv_spec_calls_the_str_key_borrow_and_str_eq() {
-    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    let llbc = load_llbc(OBJECT_LLBC);
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
-        &[llbc],
+        std::slice::from_ref(llbc),
         HostStaticAddrs::default(),
         &["celldict", "dictmultiobject", "rordereddict"],
         &[
@@ -294,9 +288,9 @@ fn monomorphic_caller_specializes_by_value_type_only_generic() {
 /// `entries_item_ptr` still LowerErrors (no offset guess).
 #[test]
 fn dict_entries_value_set_at_binds_spec_entries_item_ptr() {
-    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    let llbc = load_llbc(OBJECT_LLBC);
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
-        &[llbc],
+        std::slice::from_ref(llbc),
         HostStaticAddrs::default(),
         &["dictmultiobject", "rordereddict", "rordereddict_entries"],
         &["dict_entries_value_set_at"],
@@ -348,8 +342,8 @@ fn dict_entries_value_set_at_binds_spec_entries_item_ptr() {
 /// raw pointer arithmetic or treating the shared integer storage as immutable.
 #[test]
 fn dict_indexes_keep_mutable_gc_array_reads_and_writes() {
-    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
-    let graph = lower_function(&llbc, "index_at").expect("lower index_at");
+    let llbc = load_llbc(OBJECT_LLBC);
+    let graph = lower_function(llbc, "index_at").expect("lower index_at");
     assert!(
         graph
             .blocks
@@ -392,8 +386,8 @@ fn dict_indexes_keep_mutable_gc_array_reads_and_writes() {
 /// (`rffi.py` `ptradd` is the primitive).
 #[test]
 fn set_mustfree_flag_does_not_specialize_ptradd_helpers() {
-    let llbc = Llbc::load(MODULE_LLBC).expect("load pyre-module.ullbc");
-    let graph = lower_function(&llbc, "set_mustfree_flag").expect("lower set_mustfree_flag");
+    let llbc = load_llbc(MODULE_LLBC);
+    let graph = lower_function(llbc, "set_mustfree_flag").expect("lower set_mustfree_flag");
     assert!(
         !graph_calls_core_ptr_arith_spec(&graph),
         "set_mustfree_flag must not bind add/sub/offset spec copies, ops {:?}",
@@ -407,8 +401,8 @@ fn set_mustfree_flag_does_not_specialize_ptradd_helpers() {
 /// sees `SomePtr`.
 #[test]
 fn int_array_remove_ptradd_rffi_casts_base() {
-    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
-    let graph = lower_function(&llbc, "int_array::<Impl>::remove").expect("lower IntArray::remove");
+    let llbc = load_llbc(OBJECT_LLBC);
+    let graph = lower_function(llbc, "int_array::<Impl>::remove").expect("lower IntArray::remove");
     assert!(
         graph_calls_leaf(&graph, "direct_ptradd"),
         "remove must emit direct_ptradd of the items pointer, ops {:?}",
@@ -477,10 +471,10 @@ fn spec_copy_keeps_bare_lltype_malloc_typed() {
 /// symbolic fnaddr.
 #[test]
 fn int_dict_lookup_orig_is_unroll_safe() {
-    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
-    let harvested = harvest_hints_from_llbcs(std::slice::from_ref(&llbc));
+    let llbc = load_llbc(OBJECT_LLBC);
+    let harvested = harvest_hints_from_llbcs(std::slice::from_ref(llbc));
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
-        std::slice::from_ref(&llbc),
+        std::slice::from_ref(llbc),
         HostStaticAddrs::default(),
         &["dictmultiobject", "rordereddict"],
         &[

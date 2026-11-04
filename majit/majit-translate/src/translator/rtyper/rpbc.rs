@@ -1326,7 +1326,7 @@ pub(crate) mod tests {
 // (rpbc.py `__extend__(pairtype(...))`) live alongside their
 // owning concrete reprs below.
 
-use crate::flowspace::model::{ConstValue, Constant, GraphKey, Hlvalue};
+use crate::flowspace::model::{ConstValue, Constant, DescConst, GraphKey, Hlvalue};
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{CanBeNull, Repr, ReprState};
@@ -4299,10 +4299,8 @@ pub(super) fn pair_multiple_frozen_pbc_base_single_frozen_pbc_convert_from_to(
                  r_to is not SingleFrozenPBCRepr",
             )
         })?;
-    // upstream: `return inputconst(Void, r_pbc2.frozendesc)`. Void
-    // `_contains_value` accepts any constant; the FrozenDesc object
-    // is the desc's `pyobj` (or None when the desc has no host object).
-    let value = r_pbc2.frozendesc.pyobj_const().unwrap_or(ConstValue::None);
+    // upstream: `return inputconst(Void, r_pbc2.frozendesc)`.
+    let value = ConstValue::Desc(DescConst::new(r_pbc2.frozendesc.clone()));
     let c = crate::translator::rtyper::rmodel::inputconst_from_lltype(&LowLevelType::Void, &value)?;
     Ok(Some(Hlvalue::Constant(c)))
 }
@@ -4892,6 +4890,12 @@ pub trait MultipleFrozenPBCReprBase: CanBeNull {
     ///     frozendesc = self.rtyper.annotator.bookkeeper.getdesc(pbc)
     ///     return self.convert_desc(frozendesc)
     /// ```
+    ///
+    /// `Bookkeeper::getdesc_for_const` is the ConstValue counterpart of
+    /// `Bookkeeper.getdesc(pbc)`: `HostObject` reuses `getdesc`,
+    /// `Repr` (`Repr._freeze_`) builds a cached `FrozenDesc::prebuilt`.
+    /// Other values raise `AnnotatorError("unexpected prebuilt constant")`,
+    /// mapped to `TyperError` like neighbouring annotator errors.
     fn convert_const_multiple_frozen_pbc_base(
         &self,
         value: &ConstValue,
@@ -4899,13 +4903,6 @@ pub trait MultipleFrozenPBCReprBase: CanBeNull {
         if matches!(value, ConstValue::None) {
             return self.null_instance_constant();
         }
-        let ConstValue::HostObject(host) = value else {
-            return Err(TyperError::message(format!(
-                "{}.convert_const: non-None value must be a HostObject \
-                 (frozen pbc), got {value:?}",
-                self.class_name()
-            )));
-        };
         let rtyper = self.rtyper_weak().upgrade().ok_or_else(|| {
             TyperError::message(format!(
                 "{}.convert_const: rtyper weak ref dropped",
@@ -4920,7 +4917,7 @@ pub trait MultipleFrozenPBCReprBase: CanBeNull {
         })?;
         let desc = annotator
             .bookkeeper
-            .getdesc(host)
+            .getdesc_for_const(value)
             .map_err(|e| TyperError::message(e.to_string()))?;
         Repr::convert_desc(self, &desc)
     }
@@ -5120,9 +5117,16 @@ impl Repr for MultipleUnrelatedFrozenPBCRepr {
     ///         return convpbc
     /// ```
     ///
-    /// Routes the frozen desc through its concrete per-desc repr,
-    /// extracts the `_ptr`, and wraps it via `convert_pbc` (=
-    /// `fakeaddress`) into the `Address`-typed cache.
+    /// Routes the desc through its concrete per-desc repr, extracts the
+    /// `_ptr`, and wraps it via `convert_pbc` (= `fakeaddress`) into the
+    /// `Address`-typed cache.
+    ///
+    /// No Frozen-kind gate: `MultipleUnrelatedFrozenPBCRepr.convert_desc`
+    /// consumes the desc only as a cache key and as
+    /// `getrepr(SomePBC([desc]))` input. A FunctionDesc whose per-desc
+    /// repr is Void takes the `create_instance` arm. The
+    /// `ConstValue::LLPtr` extract is the return-shape adapter
+    /// (upstream `convert_desc` returns a raw `_ptr`).
     fn convert_desc(&self, desc: &DescEntry) -> Result<Constant, TyperError> {
         let desc_key = desc.desc_key();
         if let Some(cached) = self.converted_pbc_cache.borrow().get(&desc_key) {
@@ -5131,12 +5135,6 @@ impl Repr for MultipleUnrelatedFrozenPBCRepr {
                 LowLevelType::Address,
             ));
         }
-
-        let DescEntry::Frozen(_) = desc else {
-            return Err(TyperError::message(format!(
-                "MultipleUnrelatedFrozenPBCRepr.convert_desc: non-Frozen desc {desc:?}"
-            )));
-        };
 
         // upstream `r = self.rtyper.getrepr(annmodel.SomePBC([frozendesc]))`.
         let rtyper = self.rtyper.upgrade().ok_or_else(|| {
@@ -8967,19 +8965,45 @@ mod pbc_repr_tests {
         ));
     }
 
-    /// Non-HostObject non-None values surface a structured TyperError
-    /// — upstream rpbc.py convert_const only feeds HostObjects on the
-    /// non-None path, so non-HostObjects are upstream-impossible and
-    /// the Rust port rejects them up-front.
+    /// Non-prebuilt non-None values surface `Bookkeeper.getdesc`'s
+    /// `AnnotatorError("unexpected prebuilt constant")`, mapped to
+    /// `TyperError` — `MultipleFrozenPBCReprBase.convert_const` calls
+    /// `Bookkeeper.getdesc(pbc)` / `Bookkeeper::getdesc_for_const`.
     #[test]
-    fn multiple_unrelated_frozen_pbc_repr_convert_const_non_hostobject_rejected() {
+    fn multiple_unrelated_frozen_pbc_repr_convert_const_non_prebuilt_rejected() {
         let (_ann, rtyper) = make_rtyper();
         let r = MultipleUnrelatedFrozenPBCRepr::new(&rtyper);
         let err = r.convert_const(&ConstValue::Int(7)).unwrap_err();
         assert!(
-            err.to_string().contains("must be a HostObject"),
+            err.to_string().contains("unexpected prebuilt constant"),
             "rejection message must be specific, got {err}"
         );
+    }
+
+    /// `MultipleFrozenPBCReprBase.convert_const` on a `ConstValue::Repr`
+    /// (`Repr._freeze_`) equals `convert_desc(getdesc_for_const(repr))`.
+    #[test]
+    fn multiple_unrelated_frozen_pbc_repr_convert_const_repr_equals_convert_desc() {
+        use crate::flowspace::model::ReprConst;
+        use crate::translator::rtyper::rmodel::VoidRepr;
+        use std::sync::Arc;
+
+        let (ann, rtyper) = make_rtyper();
+        let r = MultipleUnrelatedFrozenPBCRepr::new(&rtyper);
+        let handle: Arc<dyn Repr> = Arc::new(VoidRepr::new());
+        let value = ConstValue::Repr(ReprConst::new(Arc::clone(&handle)));
+
+        let via_const = r
+            .convert_const(&value)
+            .expect("convert_const(ConstValue::Repr)");
+        let desc = ann
+            .bookkeeper
+            .getdesc_for_const(&value)
+            .expect("Bookkeeper::getdesc_for_const(Repr)");
+        let via_desc = r
+            .convert_desc(&desc)
+            .expect("convert_desc(getdesc_for_const(Repr))");
+        assert_eq!(via_const, via_desc);
     }
 
     /// `MultipleUnrelatedFrozenPBCRepr.convert_desc(frozendesc)`
@@ -9065,6 +9089,32 @@ mod pbc_repr_tests {
             matches!(c.value, ConstValue::LLPtr(_)),
             "expected a zero-field pbc instance pointer, got {:?}",
             c.value
+        );
+    }
+
+    /// MU analogue of
+    /// `multiple_frozen_pbc_repr_none_access_convert_desc_accepts_function_desc`.
+    /// `MultipleUnrelatedFrozenPBCRepr.convert_desc` has no Frozen kind
+    /// gate; a FunctionDesc's per-desc repr is `FunctionRepr` (Void), so
+    /// the body takes the `create_instance` arm.
+    #[test]
+    fn multiple_unrelated_frozen_pbc_repr_convert_desc_accepts_function_desc() {
+        let (ann, rtyper) = make_rtyper();
+        let r = MultipleUnrelatedFrozenPBCRepr::new(&rtyper);
+        let f = function_entry(&ann.bookkeeper, "func0");
+        let c = r
+            .convert_desc(&f)
+            .expect("MU convert_desc must accept a FunctionDesc");
+        assert_eq!(c.concretetype, Some(LowLevelType::Address));
+        let ConstValue::LLAddress(addr) = &c.value else {
+            panic!("expected LLAddress, got {:?}", c.value);
+        };
+        assert!(
+            matches!(
+                addr,
+                crate::translator::rtyper::lltypesystem::lltype::_address::Fake(_)
+            ),
+            "Void per-desc arm wraps a fresh `pbc` instance via fakeaddress"
         );
     }
 
@@ -9571,10 +9621,11 @@ mod pbc_repr_tests {
 
         let (ann, rtyper) = make_rtyper();
         let f = frozen_entry(&ann.bookkeeper, "frozen0");
+        let inner = f.as_frozen().expect("frozen desc");
         let r_single: std::sync::Arc<dyn Repr> =
             std::sync::Arc::new(SingleFrozenPBCRepr::new(f.clone()));
-        let expected = f.pyobj_const().unwrap_or(ConstValue::None);
         let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+        let before = Rc::strong_count(&inner);
 
         let r_mu: std::sync::Arc<dyn Repr> =
             std::sync::Arc::new(MultipleUnrelatedFrozenPBCRepr::new(&rtyper));
@@ -9586,7 +9637,14 @@ mod pbc_repr_tests {
             panic!("Base × Single yields a Void Constant");
         };
         assert_eq!(c_mu.concretetype, Some(LowLevelType::Void));
-        assert_eq!(c_mu.value, expected);
+        let ConstValue::Desc(d_mu) = &c_mu.value else {
+            panic!(
+                "Base × Single yields ConstValue::Desc, got {:?}",
+                c_mu.value
+            );
+        };
+        assert_eq!(d_mu.as_desc().desc_key(), f.desc_key());
+        drop(c_mu);
 
         let (a, b) = merge_frozen_pair(&ann.bookkeeper, "frozen1", "frozen2");
         let r_mf = getFrozenPBCRepr(&rtyper, &SomePBC::new(vec![a, b], false)).unwrap();
@@ -9599,7 +9657,23 @@ mod pbc_repr_tests {
             panic!("Base × Single yields a Void Constant");
         };
         assert_eq!(c_mf.concretetype, Some(LowLevelType::Void));
-        assert_eq!(c_mf.value, expected);
+        let ConstValue::Desc(d_mf) = &c_mf.value else {
+            panic!(
+                "Base × Single yields ConstValue::Desc, got {:?}",
+                c_mf.value
+            );
+        };
+        assert_eq!(d_mf.as_desc().desc_key(), f.desc_key());
+        drop(c_mf);
+
+        for _ in 0..32 {
+            let converted =
+                pair_convert_from_to(r_mu.as_ref(), r_single.as_ref(), &v_mu, &mut llops)
+                    .expect("MU × Single")
+                    .expect("Base × Single converts");
+            drop(converted);
+        }
+        assert_eq!(Rc::strong_count(&inner), before);
     }
 
     /// `pairtype(FunctionRepr, MultipleFrozenPBCRepr).convert_from_to`:

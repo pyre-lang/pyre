@@ -1690,8 +1690,10 @@ pub(crate) fn constvalue_kind(cv: &ConstValue) -> char {
         // Bare-constant repr selection after annotation: one FrozenDesc
         // (`getFrozenPBCRepr` → `SingleFrozenPBCRepr`).
         // `SingleFrozenPBCRepr.lowleveltype` is `Void`; `history.getkind(Void)`
-        // is `"void"`.
-        ConstValue::Repr(_) => 'v',
+        // is `"void"`. `pairtype(MultipleFrozenPBCReprBase,
+        // SingleFrozenPBCRepr).convert_from_to` (`rpbc.py`) is
+        // `inputconst(Void, frozendesc)`.
+        ConstValue::Repr(_) | ConstValue::Desc(_) => 'v',
     }
 }
 

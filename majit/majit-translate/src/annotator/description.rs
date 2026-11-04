@@ -24,9 +24,10 @@
 //! `Rc::as_ptr` per variant.
 
 use indexmap::IndexMap;
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::argument::{ArgErr, ArgumentsForTranslation};
@@ -461,6 +462,10 @@ pub struct Desc {
     /// RPython `self.pyobj` (description.py:138). `None` matches
     /// upstream's `pyobj=None` default.
     pub pyobj: Option<HostObject>,
+    /// Interned host instance for `bookkeeper.py` `immutablevalue`
+    /// user-instance arm (`ClassDef.see_instance` keys `Hashable(x)`).
+    /// Empty dict; not a copy of the Desc `__dict__`.
+    host_instance: OnceCell<HostObject>,
 }
 
 impl Desc {
@@ -471,7 +476,14 @@ impl Desc {
             identity: alloc_desc_key(),
             bookkeeper,
             pyobj,
+            host_instance: OnceCell::new(),
         }
+    }
+
+    fn intern_host_instance(&self, class: HostObject) -> HostObject {
+        self.host_instance
+            .get_or_init(|| HostObject::new_instance(class, vec![]))
+            .clone()
     }
 
     /// RPython `Desc.querycallfamily()` (description.py).
@@ -994,6 +1006,78 @@ impl PartialEq for DescEntry {
 }
 
 impl Eq for DescEntry {}
+
+/// Process-wide intern of the Desc class objects used by
+/// `bookkeeper.py` `immutablevalue` (`getuniqueclassdef(x.__class__)`).
+/// One `HostObject::new_class` per upstream class, including the `Desc`
+/// base and `MemoDesc`. Not in `HOST_ENV`; empty class dicts.
+struct DescHostClasses {
+    function: HostObject,
+    memo: HostObject,
+    method: HostObject,
+    frozen: HostObject,
+    method_of_frozen: HostObject,
+    class_desc: HostObject,
+}
+
+static DESC_HOST_CLASSES: LazyLock<DescHostClasses> = LazyLock::new(|| {
+    let desc = HostObject::new_class("rpython.annotator.description.Desc", vec![]);
+    let function = HostObject::new_class(
+        "rpython.annotator.description.FunctionDesc",
+        vec![desc.clone()],
+    );
+    let memo = HostObject::new_class(
+        "rpython.annotator.description.MemoDesc",
+        vec![function.clone()],
+    );
+    let method = HostObject::new_class(
+        "rpython.annotator.description.MethodDesc",
+        vec![desc.clone()],
+    );
+    let frozen = HostObject::new_class(
+        "rpython.annotator.description.FrozenDesc",
+        vec![desc.clone()],
+    );
+    let method_of_frozen = HostObject::new_class(
+        "rpython.annotator.description.MethodOfFrozenDesc",
+        vec![desc.clone()],
+    );
+    let class_desc = HostObject::new_class("rpython.annotator.classdesc.ClassDesc", vec![desc]);
+    DescHostClasses {
+        function,
+        memo,
+        method,
+        frozen,
+        method_of_frozen,
+        class_desc,
+    }
+});
+
+/// Host class of this desc variant (`x.__class__` for
+/// `bookkeeper.py` `immutablevalue`).
+pub(crate) fn desc_host_class(entry: &DescEntry) -> HostObject {
+    match entry {
+        DescEntry::Func(fe) if fe.is_memo() => DESC_HOST_CLASSES.memo.clone(),
+        DescEntry::Func(_) => DESC_HOST_CLASSES.function.clone(),
+        DescEntry::Method(_) => DESC_HOST_CLASSES.method.clone(),
+        DescEntry::Frozen(_) => DESC_HOST_CLASSES.frozen.clone(),
+        DescEntry::MethodOfFrozen(_) => DESC_HOST_CLASSES.method_of_frozen.clone(),
+        DescEntry::Class(_) => DESC_HOST_CLASSES.class_desc.clone(),
+    }
+}
+
+/// Interned empty host instance of [`desc_host_class`] for
+/// `ClassDef.see_instance` (`Hashable(x)` / Arc identity).
+pub(crate) fn desc_as_host_instance(entry: &DescEntry) -> HostObject {
+    let class = desc_host_class(entry);
+    match entry {
+        DescEntry::Func(fe) => fe.func().borrow().base.intern_host_instance(class),
+        DescEntry::Method(rc) => rc.borrow().base.intern_host_instance(class),
+        DescEntry::Frozen(rc) => rc.borrow().base.intern_host_instance(class),
+        DescEntry::MethodOfFrozen(rc) => rc.borrow().base.intern_host_instance(class),
+        DescEntry::Class(rc) => rc.borrow().intern_host_instance(class),
+    }
+}
 
 /// RPython `class FunctionDesc(Desc)` (description.py).
 ///

@@ -2,9 +2,11 @@
 //! The full dispatcher acceptance test separately exercises assembly with all
 //! layouts and callees; this fixture isolates the source-lowering dependency.
 
-use majit_charon_reader::Llbc;
+mod common;
+
+use common::{INTERPRETER_LLBC, load_llbc, lower_context_for};
 use majit_translate::HostStaticAddrs;
-use majit_translate::front::mir::{LowerContext, lower_fun_decl_with_static_addrs};
+use majit_translate::front::mir::lower_fun_decl_with_static_addrs;
 use majit_translate::model::{CallTarget, OpKind, ValueType};
 
 fn leaf_is(name: &str, prefix: &str) -> bool {
@@ -13,22 +15,19 @@ fn leaf_is(name: &str, prefix: &str) -> bool {
 
 #[test]
 fn unicode_translate_error_borrow_chain_is_value_lowered() {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../target/llbc/pyre-interpreter.ullbc"
-    );
+    let path = INTERPRETER_LLBC;
     if !std::path::Path::new(path).is_file() {
         eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
         return;
     }
-    let llbc = Llbc::load(path).expect("load interpreter LLBC");
+    let llbc = load_llbc(path);
     let declaration = llbc
         .iter_local_fns()
         .find(|f| {
             f.item_meta.name_path() == "pyre_interpreter::display::unicode_translate_error_str"
         })
         .expect("unicode_translate_error_str exists in interpreter LLBC");
-    let context = LowerContext::new(&llbc);
+    let context = lower_context_for(llbc);
     let graph = lower_fun_decl_with_static_addrs(&context, declaration, HostStaticAddrs::default())
         .expect("lower unicode_translate_error_str, not reject the graph");
     let mut as_ref_calls = 0;

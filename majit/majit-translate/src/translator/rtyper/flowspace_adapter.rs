@@ -8891,13 +8891,11 @@ mod tests {
     /// Input rather than converting to a window first.
     #[test]
     fn strlen_arg_at_real_w_str_get_wtf8_sites_is_the_utf8_field() {
-        use majit_charon_reader::Llbc;
-
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../target/llbc/pyre-object.ullbc"
         );
-        let llbc = Llbc::load(path).expect("load real pyre-object LLBC");
+        let llbc = crate::test_support::load_ullbc(path);
         let mut all_sites = Vec::new();
         for name in ["w_str_cut", "str_byte_window"] {
             let graph = crate::front::mir::lower_function(&llbc, name)
@@ -10351,7 +10349,7 @@ mod tests {
     #[ignore]
     fn parse_builtin_signature_has_no_residual_vec_from_elem_after_adaptation() {
         let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-        let llbc = majit_charon_reader::Llbc::load(path).expect("load real LLBC");
+        let llbc = crate::test_support::load_ullbc(path);
         let legacy = crate::front::mir::lower_function(&llbc, "parse_builtin_signature")
             .expect("lower parse_builtin_signature");
         let raw_from_elem = legacy

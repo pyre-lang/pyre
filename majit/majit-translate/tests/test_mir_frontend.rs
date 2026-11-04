@@ -5,7 +5,9 @@
 
 mod common;
 
-use common::{INTERPRETER_LLBC, load_llbc, lower_context_for, lower_named};
+use common::{
+    INTERPRETER_LLBC, JIT_LLBC, OBJECT_LLBC, RLIB_LLBC, load_llbc, lower_context_for, lower_named,
+};
 use majit_charon_reader::Llbc;
 use majit_translate::front::mir::{LowerError, build_semantic_program_from_llbc, lower_function};
 use std::sync::OnceLock;
@@ -3973,18 +3975,14 @@ fn frame_box_owner_root_guard_lowers_without_guard_calls() {
 fn owner_root_guard_pointer_does_not_reach_a_residual_callee() {
     use majit_translate::front::mir::residual_owner_root_guard_escapes;
 
-    for artefact in [
-        "pyre-interpreter.ullbc",
-        "pyre-object.ullbc",
-        "majit-rlib.ullbc",
-        "pyre-jit.ullbc",
+    for (artefact, path) in [
+        ("pyre-interpreter.ullbc", INTERPRETER_LLBC),
+        ("pyre-object.ullbc", OBJECT_LLBC),
+        ("majit-rlib.ullbc", RLIB_LLBC),
+        ("pyre-jit.ullbc", JIT_LLBC),
     ] {
-        let path = format!(
-            "{}/../../target/llbc/{artefact}",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let llbc = Llbc::load(&path).unwrap_or_else(|err| panic!("load {artefact}: {err}"));
-        let mut escapes = residual_owner_root_guard_escapes(&llbc);
+        let llbc = load_llbc(path);
+        let mut escapes = residual_owner_root_guard_escapes(llbc);
         escapes.sort();
         escapes.dedup();
         assert!(

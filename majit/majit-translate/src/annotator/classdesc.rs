@@ -54,7 +54,7 @@
 
 use indexmap::{IndexMap, IndexSet};
 use parking_lot::RwLock;
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1043,6 +1043,9 @@ pub struct ClassDesc {
     /// tables (and the classdef numbering derived from them) is
     /// reproducible across runs.
     pub(crate) identity: super::description::DescKey,
+    /// Interned host instance for `bookkeeper.py` `immutablevalue`
+    /// user-instance arm (`ClassDef.see_instance` keys `Hashable(x)`).
+    host_instance: OnceCell<HostObject>,
     /// RPython `self.pyobj` — the live Python class object.
     pub pyobj: HostObject,
     /// RPython `self.name` — upstream `cls.__module__ + '.' + cls.__name__`.
@@ -1087,6 +1090,7 @@ impl ClassDesc {
     pub fn new_shell(bookkeeper: &Rc<Bookkeeper>, pyobj: HostObject, name: String) -> Self {
         ClassDesc {
             identity: super::description::alloc_desc_key(),
+            host_instance: OnceCell::new(),
             pyobj,
             name,
             basedesc: None,
@@ -1098,6 +1102,12 @@ impl ClassDesc {
             detect_invalid_attrs: None,
             bookkeeper: Rc::downgrade(bookkeeper),
         }
+    }
+
+    pub(crate) fn intern_host_instance(&self, class: HostObject) -> HostObject {
+        self.host_instance
+            .get_or_init(|| HostObject::new_instance(class, vec![]))
+            .clone()
     }
 
     /// RPython `ClassDesc.issubclass(self, other)` (classdesc.py).
@@ -1260,6 +1270,7 @@ impl ClassDesc {
         // Build `self` — subsequent mutation flows through interior mutability.
         let me = Rc::new(RefCell::new(ClassDesc {
             identity: super::description::alloc_desc_key(),
+            host_instance: OnceCell::new(),
             pyobj: cls.clone(),
             name,
             basedesc,

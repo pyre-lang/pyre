@@ -1905,7 +1905,7 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         // is `"void"`. `follow_link` does not build the annotation shell
         // from this arm (`valuetype_to_someshell(Void)` is BOTTOM); it
         // writes `bookkeeper.immutablevalue` (`SomePBC`).
-        ConstValue::Repr(_) => ValueType::Void,
+        ConstValue::Repr(_) | ConstValue::Desc(_) => ValueType::Void,
     }
 }
 

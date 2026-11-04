@@ -3144,15 +3144,20 @@ pub enum ConstValue {
     /// RPython `s_repr.const` when that constant is an `rmodel.Repr`
     /// (`rbuiltin.py` `rtype_hlinvoke`: `r_callable = s_repr.const`).
     Repr(ReprConst),
+    /// RPython `Constant(desc)` (`rpbc.py`
+    /// `pairtype(MultipleFrozenPBCReprBase, SingleFrozenPBCRepr)`).
+    /// Identity is the desc (`tool/uid.py` `Hashable` falls back to
+    /// object identity for a Desc).
+    Desc(DescConst),
 }
 
-/// Address of a leaked `Box<Arc<dyn Repr>>`, not the live object.
-/// Statics (`HOST_ENV`, `SPECIAL_CASES`, lltype tables) require
-/// `ConstValue: Send + Sync`; upstream stores the live repr on
+/// Sized `Rc<Arc<dyn Repr>>` stored as `Rc::into_raw`, so `ConstValue`
+/// stays `Send + Sync`. Statics (`HOST_ENV`, `SPECIAL_CASES`, lltype
+/// tables) require that; upstream stores the live repr on
 /// `Constant.value` (`rbuiltin.py` `rtype_hlinvoke`: `r_callable = s_repr.const`).
-#[derive(Clone)]
+/// Identity is the inner `Arc` data pointer.
 pub struct ReprConst {
-    /// `Box::into_raw(Box::new(Arc<dyn Repr>))` as an integer. Always
+    /// `Rc::into_raw(Rc::new(Arc<dyn Repr>))` as an integer. Always
     /// nonzero: only [`ReprConst::new`] constructs this type.
     leaked: usize,
     /// Data pointer of the inner `Arc`, captured at construction so
@@ -3164,7 +3169,7 @@ pub struct ReprConst {
 impl ReprConst {
     pub fn new(repr: Arc<dyn crate::translator::rtyper::rmodel::Repr>) -> Self {
         let data_ptr = Arc::as_ptr(&repr) as *const () as usize;
-        let leaked = Box::into_raw(Box::new(repr)) as usize;
+        let leaked = Rc::into_raw(Rc::new(repr)) as usize;
         ReprConst {
             leaked,
             data_ptr,
@@ -3173,15 +3178,51 @@ impl ReprConst {
     }
 
     pub fn as_repr(&self) -> Arc<dyn crate::translator::rtyper::rmodel::Repr> {
-        assert!(
-            std::thread::current().id() == self.thread,
+        assert_eq!(
+            std::thread::current().id(),
+            self.thread,
             "ReprConst::as_repr called off the creating thread"
         );
-        // SAFETY: `leaked` is the `Box::into_raw` address from
-        // `ReprConst::new` and is never freed. The thread check above
-        // confines the `!Send` Repr to the creating thread.
+        // SAFETY: `leaked` is `Rc::into_raw` of `Rc<Arc<dyn Repr>>`;
+        // Clone/Drop keep strong_count ≥ 1 while this handle lives;
+        // only the owner thread dereferences.
         unsafe {
             Arc::clone(&*(self.leaked as *const Arc<dyn crate::translator::rtyper::rmodel::Repr>))
+        }
+    }
+}
+
+impl Clone for ReprConst {
+    fn clone(&self) -> Self {
+        assert_eq!(
+            std::thread::current().id(),
+            self.thread,
+            "ReprConst::clone called off the creating thread"
+        );
+        unsafe {
+            Rc::increment_strong_count(
+                self.leaked as *const Arc<dyn crate::translator::rtyper::rmodel::Repr>,
+            );
+        }
+        ReprConst {
+            leaked: self.leaked,
+            data_ptr: self.data_ptr,
+            thread: self.thread,
+        }
+    }
+}
+
+impl Drop for ReprConst {
+    fn drop(&mut self) {
+        if std::thread::current().id() != self.thread {
+            // Other thread: leak the Rc. Leaking is safe; a count race is not.
+            // Same rule as lltype.rs OwnedGraph.
+            return;
+        }
+        unsafe {
+            drop(Rc::from_raw(
+                self.leaked as *const Arc<dyn crate::translator::rtyper::rmodel::Repr>,
+            ));
         }
     }
 }
@@ -3203,6 +3244,100 @@ impl Eq for ReprConst {}
 impl Hash for ReprConst {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.data_ptr.hash(state);
+    }
+}
+
+/// RPython `Constant(desc)` (`rpbc.py`
+/// `pairtype(MultipleFrozenPBCReprBase, SingleFrozenPBCRepr)`).
+/// Identity is the monotonic `DescKey` (`alloc_desc_key`), not an
+/// address; the `Rc` keeps the desc alive as upstream `Constant(desc)`
+/// does.
+pub struct DescConst {
+    /// `Rc::into_raw(Rc::new(desc: DescEntry))` as an integer. Always
+    /// nonzero: only [`DescConst::new`] constructs this type.
+    leaked: usize,
+    /// Captured `desc.desc_key()` so `PartialEq` / `Hash` / `Debug`
+    /// never dereference.
+    key: crate::annotator::description::DescKey,
+    thread: std::thread::ThreadId,
+}
+
+impl DescConst {
+    pub fn new(desc: crate::annotator::description::DescEntry) -> Self {
+        let key = desc.desc_key();
+        let leaked = Rc::into_raw(Rc::new(desc)) as usize;
+        DescConst {
+            leaked,
+            key,
+            thread: std::thread::current().id(),
+        }
+    }
+
+    pub fn as_desc(&self) -> crate::annotator::description::DescEntry {
+        assert_eq!(
+            std::thread::current().id(),
+            self.thread,
+            "DescConst::as_desc called off the creating thread"
+        );
+        // SAFETY: `leaked` is `Rc::into_raw` of `Rc<DescEntry>`;
+        // Clone/Drop keep strong_count ≥ 1 while this handle lives;
+        // only the owner thread dereferences.
+        unsafe { (*(self.leaked as *const crate::annotator::description::DescEntry)).clone() }
+    }
+}
+
+impl Clone for DescConst {
+    fn clone(&self) -> Self {
+        assert_eq!(
+            std::thread::current().id(),
+            self.thread,
+            "DescConst::clone called off the creating thread"
+        );
+        unsafe {
+            Rc::increment_strong_count(
+                self.leaked as *const crate::annotator::description::DescEntry,
+            );
+        }
+        DescConst {
+            leaked: self.leaked,
+            key: self.key,
+            thread: self.thread,
+        }
+    }
+}
+
+impl Drop for DescConst {
+    fn drop(&mut self) {
+        if std::thread::current().id() != self.thread {
+            // Other thread: leak the Rc. Leaking is safe; a count race is not.
+            // Same rule as lltype.rs OwnedGraph.
+            return;
+        }
+        unsafe {
+            drop(Rc::from_raw(
+                self.leaked as *const crate::annotator::description::DescEntry,
+            ));
+        }
+    }
+}
+
+impl std::fmt::Debug for DescConst {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DescConst({:?})", self.key)
+    }
+}
+
+impl PartialEq for DescConst {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for DescConst {}
+
+impl Hash for DescConst {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key.hash(state);
     }
 }
 
@@ -3293,6 +3428,7 @@ impl PartialEq for ConstValue {
             (ConstValue::HostObject(a), ConstValue::HostObject(b)) => a == b,
             (ConstValue::Opaque(a), ConstValue::Opaque(b)) => a == b,
             (ConstValue::Repr(a), ConstValue::Repr(b)) => a == b,
+            (ConstValue::Desc(a), ConstValue::Desc(b)) => a == b,
             (ConstValue::SpecTag(a), ConstValue::SpecTag(b)) => a == b,
             (ConstValue::AddressOffset(a), ConstValue::AddressOffset(b)) => a == b,
             (
@@ -3349,6 +3485,7 @@ impl std::fmt::Display for ConstValue {
             ConstValue::HostObject(obj) => write!(f, "{}", obj.qualname()),
             ConstValue::Opaque(_) => f.write_str("<opaque>"),
             ConstValue::Repr(repr) => write!(f, "<repr {:#x}>", repr.data_ptr),
+            ConstValue::Desc(desc) => write!(f, "<desc {:?}>", desc.key),
             ConstValue::Dict(_)
             | ConstValue::Tuple(_)
             | ConstValue::List(_)
@@ -3442,6 +3579,7 @@ impl Hash for ConstValue {
             ConstValue::HostObject(obj) => obj.hash(state),
             ConstValue::Opaque(opaque) => opaque.hash(state),
             ConstValue::Repr(repr) => repr.hash(state),
+            ConstValue::Desc(desc) => desc.hash(state),
             ConstValue::SpecTag(id) => id.hash(state),
             ConstValue::AddressOffset(offset) => offset.hash(state),
             ConstValue::InheritanceId {
@@ -4068,6 +4206,7 @@ fn const_value_variant_name(value: &ConstValue) -> &'static str {
         ConstValue::InheritanceId { .. } => "InheritanceId",
         ConstValue::Opaque(_) => "Opaque",
         ConstValue::Repr(_) => "Repr",
+        ConstValue::Desc(_) => "Desc",
     }
 }
 
@@ -4304,7 +4443,7 @@ impl ConstValue {
             ConstValue::SpecTag(_) => Some(true),
             ConstValue::AddressOffset(_) => Some(true),
             ConstValue::InheritanceId { .. } => Some(true),
-            ConstValue::Opaque(_) | ConstValue::Repr(_) => Some(true),
+            ConstValue::Opaque(_) | ConstValue::Repr(_) | ConstValue::Desc(_) => Some(true),
         }
     }
 
@@ -4391,6 +4530,9 @@ impl ConstValue {
             ConstValue::Code(_) => HOST_ENV.lookup_builtin("code"),
             ConstValue::Function(_) => HOST_ENV.lookup_builtin("function"),
             ConstValue::HostObject(obj) => obj.class_of(),
+            ConstValue::Desc(d) => {
+                Some(crate::annotator::description::desc_host_class(&d.as_desc()))
+            }
             ConstValue::Atom(_)
             | ConstValue::Placeholder
             | ConstValue::Graphs(_)
@@ -6435,6 +6577,20 @@ mod tests {
     }
 
     #[test]
+    fn repr_const_new_drop_reclaims_inner_strong() {
+        use crate::translator::rtyper::rmodel::VoidRepr;
+
+        let handle: Arc<dyn crate::translator::rtyper::rmodel::Repr> = Arc::new(VoidRepr::new());
+        let before = Arc::strong_count(&handle);
+        for _ in 0..32 {
+            let c = ReprConst::new(Arc::clone(&handle));
+            assert_eq!(Arc::strong_count(&handle), before + 1);
+            drop(c);
+            assert_eq!(Arc::strong_count(&handle), before);
+        }
+    }
+
+    #[test]
     fn repr_const_as_repr_panics_on_other_thread() {
         use crate::translator::rtyper::rmodel::VoidRepr;
 
@@ -6442,6 +6598,122 @@ mod tests {
         let carrier = ReprConst::new(handle);
         let result = std::thread::spawn(move || {
             let _ = carrier.as_repr();
+        })
+        .join();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn desc_const_identity_eq_hash_and_not_none() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::description::{DescEntry, FunctionDesc};
+        use crate::flowspace::argument::Signature;
+        use std::rc::Rc;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let desc = |name: &str| {
+            DescEntry::function(Rc::new(RefCell::new(FunctionDesc::new(
+                Rc::clone(&bk),
+                None,
+                name,
+                Signature::new(vec![], None, None),
+                None,
+                None,
+            ))))
+        };
+        let desc_a = desc("a");
+        let desc_b = desc("b");
+
+        let same_left = DescConst::new(desc_a.clone());
+        let same_right = DescConst::new(desc_a.clone());
+        let different = DescConst::new(desc_b);
+
+        assert_eq!(same_left, same_right);
+        assert_ne!(same_left, different);
+
+        let mut ha = DefaultHasher::new();
+        let mut hb = DefaultHasher::new();
+        same_left.hash(&mut ha);
+        same_right.hash(&mut hb);
+        assert_eq!(ha.finish(), hb.finish());
+
+        let mut hd = DefaultHasher::new();
+        different.hash(&mut hd);
+        assert_ne!(ha.finish(), hd.finish());
+
+        let value = ConstValue::Desc(DescConst::new(desc_a));
+        assert_ne!(value, ConstValue::None);
+    }
+
+    fn desc_const_function_desc(name: &str) -> crate::annotator::description::DescEntry {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::description::{DescEntry, FunctionDesc};
+        use crate::flowspace::argument::Signature;
+
+        let bk = Rc::new(Bookkeeper::new());
+        DescEntry::function(Rc::new(RefCell::new(FunctionDesc::new(
+            Rc::clone(&bk),
+            None,
+            name,
+            Signature::new(vec![], None, None),
+            None,
+            None,
+        ))))
+    }
+
+    #[test]
+    fn desc_const_new_drop_reclaims_inner_strong() {
+        let desc_a = desc_const_function_desc("a");
+        let inner = desc_a.as_function().expect("function desc");
+        let before = Rc::strong_count(&inner);
+        for _ in 0..32 {
+            let c = DescConst::new(desc_a.clone());
+            assert_eq!(Rc::strong_count(&inner), before + 1);
+            drop(c);
+            assert_eq!(Rc::strong_count(&inner), before);
+        }
+    }
+
+    #[test]
+    fn desc_const_clone_shares_one_outer_rc() {
+        let desc_a = desc_const_function_desc("a");
+        let inner = desc_a.as_function().expect("function desc");
+        let before = Rc::strong_count(&inner);
+        let c1 = DescConst::new(desc_a.clone());
+        assert_eq!(Rc::strong_count(&inner), before + 1);
+        let c2 = c1.clone();
+        assert_eq!(Rc::strong_count(&inner), before + 1);
+        drop(c1);
+        assert_eq!(Rc::strong_count(&inner), before + 1);
+        drop(c2);
+        assert_eq!(Rc::strong_count(&inner), before);
+    }
+
+    #[test]
+    fn desc_const_drop_on_other_thread_leaks() {
+        let desc_a = desc_const_function_desc("a");
+        let inner = desc_a.as_function().expect("function desc");
+        let before = Rc::strong_count(&inner);
+        let c = DescConst::new(desc_a.clone());
+        std::thread::spawn(move || drop(c)).join().unwrap();
+        assert_eq!(Rc::strong_count(&inner), before + 1);
+    }
+
+    #[test]
+    fn desc_const_clone_on_other_thread_panics() {
+        let c = DescConst::new(desc_const_function_desc("a"));
+        let join = std::thread::spawn(move || {
+            let _ = c.clone();
+        })
+        .join();
+        assert!(join.is_err());
+    }
+
+    #[test]
+    fn desc_const_as_desc_panics_on_other_thread() {
+        let carrier = DescConst::new(desc_const_function_desc("a"));
+        let result = std::thread::spawn(move || {
+            let _ = carrier.as_desc();
         })
         .join();
         assert!(result.is_err());

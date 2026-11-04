@@ -4945,9 +4945,9 @@ mod harvested_funcobj_hints_tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../target/llbc/majit-rlib.ullbc"
         );
-        let llbc = majit_charon_reader::Llbc::load(path).expect("load majit-rlib.ullbc");
+        let llbc = crate::test_support::load_ullbc(path);
         let harvested =
-            crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(&llbc));
+            crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc));
         crate::local_crates::with_local_crate_root("pyre_interpreter", || {
             let mut cc = CallControl::new();
             let graph = FunctionGraph::new("invert");
@@ -5118,9 +5118,9 @@ mod harvested_funcobj_hints_tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../target/llbc/pyre-module.ullbc"
         );
-        let llbc = majit_charon_reader::Llbc::load(path).expect("load pyre-module.ullbc");
+        let llbc = crate::test_support::load_ullbc(path);
         let harvested =
-            crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(&llbc));
+            crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc));
         let orig_key = "module::_cffi_backend::lib_obj::_orig_get_attr_elidable_unlikely_name";
         assert!(
             harvested
