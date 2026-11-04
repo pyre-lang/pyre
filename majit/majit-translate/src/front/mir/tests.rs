@@ -14721,6 +14721,7 @@ fn enum_metadata_keeps_named_empty_class_payload_and_drops_option_never() {
         &harvest_declared_gc_facts(&llbc).gc_struct_ids(),
         super::no_immutable_fields(),
         &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
+        &[],
     );
     let keys: Vec<_> = fields.fields.keys().collect();
     assert!(
