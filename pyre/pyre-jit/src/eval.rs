@@ -322,8 +322,9 @@ impl FrameView {
     }
 }
 
-/// Cell written by `cache_root_stack_slot` (`gc_enter_roots_frame`). Zero when
-/// the context is missing or the slot is not resolved yet.
+/// The `root_stack_slot` cell, which caches `shadow_stack_slot().as_word()`
+/// (`gc_enter_roots_frame`). Zero when the context is missing or the slot is
+/// not resolved yet.
 #[inline]
 fn cached_root_raw(ec: *const pyre_interpreter::PyExecutionContext) -> usize {
     if ec.is_null() {
@@ -11539,11 +11540,17 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
     // Re-read only after `perform_actions`, which can run signal Python.
     let mut marker_ec = pyre_interpreter::call::getexecutioncontext();
     // One EC per activation (`interp_jit.py` `PyFrame.dispatch`). The
-    // shadow-stack cell is the `gc_enter_roots_frame` cache: resolved once
-    // here, before the marker, so the pointer is not live across
+    // shadow-stack cell is the `gc_enter_roots_frame` cache: filled here
+    // once, before the marker, so the pointer is not live across
     // `split_before_jit_merge_point`. Later opcodes load that cell.
     if !marker_ec.is_null() {
-        majit_gc::shadow_stack::cache_root_stack_slot(unsafe { &(*marker_ec).root_stack_slot });
+        if unsafe { (*marker_ec).root_stack_slot.get() } == 0 {
+            unsafe {
+                (*marker_ec)
+                    .root_stack_slot
+                    .set(majit_gc::shadow_stack::shadow_stack_slot().as_word());
+            }
+        }
     }
 
     loop {
@@ -11555,7 +11562,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         f = if raw_slot == 0 {
             gc_roots::reload_top_root(f as *mut PyFrame as pyre_object::PyObjectRef) as *mut PyFrame
         } else {
-            // SAFETY: `raw_slot` is the word `cache_root_stack_slot` stored for this thread.
+            // SAFETY: `raw_slot` is this thread's cached `shadow_stack_slot().as_word()`.
             reload_loop_frame!(f, unsafe {
                 majit_gc::shadow_stack::slot_from_cached(raw_slot)
             })
@@ -11591,7 +11598,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         let root_slot = if marker_ec.is_null() {
             majit_gc::shadow_stack::shadow_stack_slot()
         } else {
-            // SAFETY: the word is `root_stack_slot` as `cache_root_stack_slot` stored for this thread.
+            // SAFETY: the word is this thread's cached `shadow_stack_slot().as_word()`.
             unsafe { majit_gc::shadow_stack::slot_from_cached((*marker_ec).root_stack_slot.get()) }
         };
         // `f` is the marker's red `frame` — the one frame value declared

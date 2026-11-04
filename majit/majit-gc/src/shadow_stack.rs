@@ -1320,7 +1320,7 @@ pub fn shadow_stack_slot() -> ShadowStackSlot {
 
 impl ShadowStackSlot {
     /// The resolved cell address as one machine word, the form
-    /// [`cache_root_stack_slot`] stores and [`slot_from_cached`] reads back.
+    /// a caller caches and [`slot_from_cached`] reads back.
     #[inline]
     pub fn as_word(self) -> usize {
         self.0 as usize
@@ -1371,25 +1371,13 @@ impl ShadowStackSlot {
     }
 }
 
-/// Remember this thread's [`ShadowStackSlot`] in `cached` when it is empty.
-///
-/// `shadowstack.py` `gc_enter_roots_frame` resolves the root stack once.
-/// The `SHADOW_STACK` cell is never reallocated, so later reads use the
-/// stored address instead of `LocalKey::with`.
-#[inline]
-pub fn cache_root_stack_slot(cached: &Cell<usize>) {
-    if cached.get() == 0 {
-        cached.set(shadow_stack_slot().as_word());
-    }
-}
-
-/// Slot previously stored by [`cache_root_stack_slot`].
+/// Slot previously stored by `shadow_stack_slot().as_word()`.
 ///
 /// A zero word has not been resolved yet and falls back to one resolve.
 ///
 /// # Safety
 ///
-/// `raw` is 0 or a word [`cache_root_stack_slot`] stored for the current
+/// `raw` is 0 or a word `shadow_stack_slot().as_word()` stored for the current
 /// thread.
 #[inline]
 pub unsafe fn slot_from_cached(raw: usize) -> ShadowStackSlot {
@@ -2666,12 +2654,16 @@ mod tests {
         let cached = Cell::new(0usize);
         let depth = depth();
         push(GcRef(0x1111));
-        cache_root_stack_slot(&cached);
+        if cached.get() == 0 {
+            cached.set(shadow_stack_slot().as_word());
+        }
         let raw = cached.get();
         assert_ne!(raw, 0);
-        cache_root_stack_slot(&cached);
+        if cached.get() == 0 {
+            cached.set(shadow_stack_slot().as_word());
+        }
         assert_eq!(cached.get(), raw);
-        // SAFETY: `raw` is the word `cache_root_stack_slot` stored for this thread.
+        // SAFETY: `raw` is the word `shadow_stack_slot().as_word()` stored for this thread.
         let slot = unsafe { slot_from_cached(raw) };
         assert_eq!(unsafe { slot_top_ref(slot) }, top_ref());
         assert_eq!(unsafe { slot_top_ref(slot) }.0, 0x1111);

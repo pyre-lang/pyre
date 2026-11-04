@@ -114,7 +114,7 @@ extern "C" fn shadow_stack_slot_word() -> i64 {
 extern "C" fn slot_from_cached_word(raw: i64) -> i64 {
     majit_ir::icf_identity!("jit_fnaddr::slot_from_cached_word");
     // SAFETY: the word is the residual operand the interpreter read
-    // from `root_stack_slot`, 0 or a slot `cache_root_stack_slot` stored for this thread.
+    // from `root_stack_slot`, 0 or a slot `shadow_stack_slot().as_word()` cached in `root_stack_slot` for this thread.
     unsafe { majit_gc::shadow_stack::slot_from_cached(raw as usize) }.as_word() as i64
 }
 

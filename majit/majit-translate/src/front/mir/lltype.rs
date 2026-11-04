@@ -5503,6 +5503,20 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     if tyref_one_word_handle_payload_field(ty, llbc, tombstoned).is_some() {
         return None;
     }
+    // A transparent wrapper over a scalar is that scalar's one-word field
+    // (`lltype.py` has no substruct for it), so it is not an inlined struct.
+    if matches!(
+        tyref_transparent_inner_value_type(
+            ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        ),
+        Some(ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::Float)
+    ) {
+        return None;
+    }
     Some(td)
 }
 
@@ -6740,6 +6754,23 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
             } else {
                 return None;
             };
+            let empty: &[serde_json::Value] = &[];
+            let generics = type_decl_ref_generics(node.get("Adt")?.as_object()?, llbc);
+            let types = generics
+                .and_then(|g| g.get("types"))
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(empty);
+            let const_generics = generics
+                .and_then(|g| g.get("const_generics"))
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(empty);
+            // The decl field is written over the wrapper's own type params;
+            // the instantiation's args are substituted first (the wrapper is
+            // monomorphic at the use site).
+            let field_ty =
+                crate::front::clause_spec::subst_tyref(&field.ty, llbc, types, const_generics);
             // The field's low-level value. A STR pointer (`*mut Utf8Str`,
             // `*mut BytesBlock` — Charon erases the alias) is already
             // `ValueType::Str`: `tyref_raw_ptr_pointee_is_string_value`
@@ -6752,7 +6783,7 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
             // A `*mut` object pointer (`IdentityKey`, `PyError`) types as
             // `Ref`, so the GC-handle arm below still keeps the wrapper.
             let inner = tyref_to_value_type_with(
-                &field.ty,
+                &field_ty,
                 llbc,
                 tombstoned,
                 gc_struct_ids,
@@ -6768,7 +6799,7 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
             // Peeling it would intern the handle as the payload, so the
             // wrapper stays.
             if registered_gc_ptr_class_root_with(
-                &field.ty,
+                &field_ty,
                 llbc,
                 tombstoned,
                 gc_struct_ids,

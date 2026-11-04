@@ -4526,11 +4526,6 @@ const RUNTIME_RESIDUAL_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         LowLevelType::Address,
     ),
     (
-        &["majit_gc", "shadow_stack", "cache_root_stack_slot"],
-        &["cached"],
-        LowLevelType::Void,
-    ),
-    (
         &["majit_gc", "shadow_stack", "shadow_stack_slot"],
         &[],
         LowLevelType::Address,
@@ -18499,7 +18494,6 @@ mod tests {
         for segments in [
             ["majit_ir", "eval_breaker_word", "set_gc_interp"].as_slice(),
             ["majit_gc", "shadow_stack", "slot_from_cached"].as_slice(),
-            ["majit_gc", "shadow_stack", "cache_root_stack_slot"].as_slice(),
             ["majit_gc", "shadow_stack", "shadow_stack_slot"].as_slice(),
         ] {
             assert!(

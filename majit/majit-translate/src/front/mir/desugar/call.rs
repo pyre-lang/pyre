@@ -5240,58 +5240,58 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // The read is the field's own `getfield` (`jtransform.py rewrite_op_getfield`)
-                // for a scalar `T`; upstream keeps such flags as plain attributes,
-                // e.g. `nestedscope.py CellFamily.ever_mutated`.
-                if args.len() == 1
-                    && self.is_cell_get(&reg)
+                // The read is the containing field's own `getfield`
+                // (`jtransform.py rewrite_op_getfield`); `Cell<T>` is
+                // transparent over `T`, e.g. `nestedscope.py
+                // CellFamily.ever_mutated` is a plain attribute.
+                if args.len() == 1 && self.is_cell_method(&reg, "get") {
+                    if let Some(slot) = self.mem_slot(arg_locals.first().copied().flatten()) {
+                        let v = self.read_mem_slot(mir_bb, &slot)?;
+                        self.local_var[dest_local] = Some(LocalValue::One(v));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
+                    // A borrow of a scalar `Cell<T>` is the word; `get` is
+                    // that word (`Rvalue::Ref` aliases the referent).
+                    if tyref_is_primitive_scalar(&call.dest.ty, self.llbc) {
+                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
+                }
+                // `Cell::set(&self, v)` is the containing field's own
+                // `setfield` (`jtransform.py rewrite_op_setfield`).
+                if args.len() == 2
+                    && self.is_cell_method(&reg, "set")
+                    && second_arg_ty
+                        .as_ref()
+                        .or(second_const_arg_ty.as_ref())
+                        .is_some_and(|ty| tyref_is_primitive_scalar(ty, self.llbc))
+                {
+                    if let Some(slot) = self.mem_slot(arg_locals.first().copied().flatten()) {
+                        self.write_mem_slot(mir_bb, slot, args[1].clone())?;
+                        self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
+                }
+                // `Cell::replace(&self, v)` is that field's `getfield` then
+                // `setfield` (`jtransform.py rewrite_op_getfield` /
+                // `rewrite_op_setfield`).
+                if args.len() == 2
+                    && self.is_cell_method(&reg, "replace")
                     && tyref_is_primitive_scalar(&call.dest.ty, self.llbc)
                 {
-                    let dest_ty = tyref_to_value_type_with(
-                        &call.dest.ty,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                        &self.raw_alloc_flavor_structs,
-                    );
-                    let field_kind = {
-                        let block = self.graph.block(bb_id);
-                        block.operations.iter().rev().find_map(|op| {
-                            let OpKind::FieldRead { field, .. } = &op.kind else {
-                                return None;
-                            };
-                            if op.result.as_ref() == Some(&args[0])
-                                && field.taken_by_address
-                                && field.vec_part.is_none()
-                                && !field.inline_vec
-                            {
-                                Some(op.kind.clone())
-                            } else {
-                                None
-                            }
-                        })
-                    };
-                    if let Some(OpKind::FieldRead {
-                        base,
-                        mut field,
-                        pure,
-                        ..
-                    }) = field_kind
-                    {
-                        field.taken_by_address = false;
-                        let res = self
-                            .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                            result: Some(res.clone()),
-                            kind: OpKind::FieldRead {
-                                base,
-                                field,
-                                ty: dest_ty,
-                                pure,
-                            },
-                        });
-                        self.local_var[dest_local] = Some(LocalValue::One(res));
+                    if let Some(slot) = self.mem_slot(arg_locals.first().copied().flatten()) {
+                        let old = self.read_mem_slot(mir_bb, &slot)?;
+                        self.write_mem_slot(mir_bb, slot, args[1].clone())?;
+                        self.local_var[dest_local] = Some(LocalValue::One(old));
                         let target_bb = self.block_id[target];
                         let link_args = self.edge_args(mir_bb, target)?;
                         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -8963,29 +8963,29 @@ impl<'a> Lowering<'a> {
         result
     }
 
-    /// `Cell<T>` is `#[repr(transparent)]` over `T`, so `get` of a field place
-    /// is that field's value read. `core::cell::Cell` only. `RefCell` /
-    /// `OnceCell` / `UnsafeCell` / `LazyCell` do not match: `OnceCell::get`
-    /// returns `Option<&T>`.
-    fn is_cell_get(&self, reg: &RegularCall) -> bool {
+    /// `Cell<T>` is `#[repr(transparent)]` over `T`, so `get` / `set` /
+    /// `replace` of a field place is that field's own `getfield` /
+    /// `setfield`. `core::cell::Cell` only. `RefCell` / `OnceCell` /
+    /// `UnsafeCell` / `LazyCell` do not match: `OnceCell::get` returns
+    /// `Option<&T>`.
+    fn is_cell_method(&self, reg: &RegularCall, method: &str) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        let leaf_is_get = |leaf: &str| leaf == "get";
         let owner_is_cell = |owner: &str| owner == "Cell" || owner.ends_with("::Cell");
         let path = fd.item_meta.name_path();
         if let Some((owner, leaf)) = path.rsplit_once("::")
-            && leaf_is_get(leaf)
+            && leaf == method
             && owner_is_cell(owner)
             && path.starts_with("core::cell::")
         {
             return true;
         }
         impl_method_owner_for_fundecl(self.llbc, fd).is_some_and(|(owner, leaf)| {
-            leaf_is_get(&leaf) && owner_is_cell(&owner) && path.starts_with("core::cell::")
+            leaf == method && owner_is_cell(&owner) && path.starts_with("core::cell::")
         })
     }
 

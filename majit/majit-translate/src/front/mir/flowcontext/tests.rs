@@ -2216,16 +2216,61 @@ fn cell_get_of_a_struct_field_is_that_fields_value_read() {
             }
         ]}
     });
+    let typevar_t = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let transparent_layout = serde_json::json!([{
+        "key": "x86_64-unknown-linux-gnu",
+        "value": {
+            "size": 8,
+            "align": 8,
+            "variant_layouts": [{"field_offsets": [0]}],
+            "repr": {"repr_algo": "Rust", "transparent": true}
+        }
+    }]);
+    let unsafecell_decl = serde_json::json!({
+        "def_id": 2,
+        "item_meta": window_meta(&["core", "cell", "UnsafeCell"], false),
+        "kind": {"Struct": [{
+            "name": "value",
+            "ty": typevar_t.clone(),
+            "attr_info": null
+        }]},
+        "layout": transparent_layout.clone()
+    });
     let cell_decl = serde_json::json!({
         "def_id": 1,
         "item_meta": window_meta(&["core", "cell", "Cell"], false),
-        "kind": "Opaque"
+        "kind": {"Struct": [{
+            "name": "value",
+            "ty": {
+                "Adt": {
+                    "id": 2,
+                    "builtin": null,
+                    "generics": {
+                        "regions": [],
+                        "types": [typevar_t],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            },
+            "attr_info": null
+        }]},
+        "layout": transparent_layout
+    });
+    let unit_ty = serde_json::json!({
+        "Adt": {"builtin": "Tuple", "generics": {"types": []}}
     });
     let cell_get = window_opaque_fun(
         2,
         &["core", "cell", "Cell", "get"],
         vec![cell_ref.clone()],
         bool_ty.clone(),
+    );
+    let cell_set = window_opaque_fun(
+        6,
+        &["core", "cell", "Cell", "set"],
+        vec![cell_ref.clone(), bool_ty.clone()],
+        unit_ty.clone(),
     );
     let user_cell_get = window_opaque_fun(
         4,
@@ -2350,6 +2395,49 @@ fn cell_get_of_a_struct_field_is_that_fields_value_read() {
             ]
         }}
     });
+    let call_set = serde_json::json!({"Call": {"call": {
+        "func": {"Regular": {
+            "kind": {"Fun": 6},
+            "generics": window_empty_generics()
+        }},
+        "args": [
+            {"Move": window_place(serde_json::json!({"Local": 2}), &cell_ref)},
+            {"Const": [{"Bool": true}, {"Scalar": "Bool"}]}
+        ],
+        "dest": window_place(serde_json::json!({"Local": 0}), &unit_ty)
+    }, "target": 2, "on_unwind": 1}});
+    let set_flag = serde_json::json!({
+        "def_id": 7,
+        "item_meta": window_meta(&["fixture", "set_flag"], true),
+        "signature": {"is_unsafe": false, "inputs": [s_ref.clone()], "output": unit_ty.clone()},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &unit_ty),
+                window_local(1, &s_ref),
+                window_local(2, &cell_ref)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 2}), &cell_ref),
+                            {"Ref": {
+                                "place": flag_place.clone(),
+                                "kind": "Shared",
+                                "ptr_metadata": null
+                            }}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": call_set}
+                },
+                unwind.clone(),
+                ret.clone()
+            ]
+        }}
+    });
     let user_get = serde_json::json!({
         "def_id": 5,
         "item_meta": window_meta(&["fixture", "user_get"], true),
@@ -2383,37 +2471,103 @@ fn cell_get_of_a_struct_field_is_that_fields_value_read() {
         }}
     });
     let llbc = window_llbc(
-        vec![s_decl, cell_decl],
-        vec![f, g, cell_get, h, user_cell_get, user_get],
+        vec![s_decl, cell_decl, unsafecell_decl],
+        vec![
+            f,
+            g,
+            cell_get,
+            h,
+            user_cell_get,
+            user_get,
+            cell_set,
+            set_flag,
+        ],
     );
+    let is_cell_value_descr = |field: &FieldDescriptor| {
+        field.name == "value"
+            && field.owner_root.as_deref().is_some_and(|owner| {
+                owner == "Cell" || owner.ends_with("::Cell") || owner.contains("cell::Cell")
+            })
+    };
+    let field_is_outer_flag = |field: &FieldDescriptor| {
+        field.name == "flag"
+            && field.owner_root.as_deref().is_some_and(|owner| {
+                (owner == "S" || owner.ends_with("::S")) && !owner.contains("Cell")
+            })
+    };
+    let call_target_ends_with = |op: &crate::model::SpaceOperation, leaf_name: &str| match &op.kind
+    {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => segments.last().is_some_and(|leaf| leaf == leaf_name),
+        OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            ..
+        } => name == leaf_name,
+        _ => false,
+    };
     let f_graph = crate::test_support::lower_function(&llbc, "f").expect("lower f");
     let f_ops: Vec<_> = f_graph
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
         .collect();
-    assert!(
-        f_ops.iter().any(|op| matches!(
-            &op.kind,
-            OpKind::FieldRead { field, ty, .. }
-                if field.name == "flag" && !field.taken_by_address && *ty == ValueType::Bool
-        )),
-        "f must FieldRead flag as a bool value; graph={}",
+    let s_input = f_ops
+        .iter()
+        .find_map(|op| match &op.kind {
+            OpKind::Input { .. } => op.result.clone(),
+            _ => None,
+        })
+        .expect("f has a struct input");
+    let flag_reads: Vec<_> = f_ops
+        .iter()
+        .filter(
+            |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field_is_outer_flag(field)),
+        )
+        .collect();
+    assert_eq!(
+        flag_reads.len(),
+        1,
+        "f must have exactly one FieldRead of outer flag; graph={}",
         f_graph.dump()
     );
-    let call_target_ends_with_get = |op: &crate::model::SpaceOperation| match &op.kind {
-        OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            ..
-        } => segments.last().is_some_and(|leaf| leaf.ends_with("get")),
-        OpKind::Call {
-            target: CallTarget::Method { name, .. },
-            ..
-        } => name.ends_with("get"),
-        _ => false,
-    };
+    match &flag_reads[0].kind {
+        OpKind::FieldRead {
+            base,
+            field,
+            ty,
+            pure,
+        } => {
+            assert_eq!(field.name, "flag");
+            assert!(!field.taken_by_address);
+            assert_eq!(*ty, ValueType::Bool);
+            assert!(
+                !*pure,
+                "Cell field read is not _pure; graph={}",
+                f_graph.dump()
+            );
+            assert_eq!(
+                base,
+                &s_input,
+                "flag is read from the struct input; graph={}",
+                f_graph.dump()
+            );
+        }
+        other => panic!("expected FieldRead, got {other:?}"),
+    }
     assert!(
-        f_ops.iter().all(|op| !call_target_ends_with_get(op)),
+        f_ops.iter().all(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } | OpKind::FieldWrite { field, .. } => {
+                !is_cell_value_descr(field)
+            }
+            _ => true,
+        }),
+        "f must not emit core::cell::Cell.value; graph={}",
+        f_graph.dump()
+    );
+    assert!(
+        f_ops.iter().all(|op| !call_target_ends_with(op, "get")),
         "f must not keep Cell::get as a Call; graph={}",
         f_graph.dump()
     );
@@ -2423,30 +2577,89 @@ fn cell_get_of_a_struct_field_is_that_fields_value_read() {
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
-            .any(call_target_ends_with_get),
-        "g(&Cell<bool>) keeps its Call; graph={}",
+            .all(|op| !call_target_ends_with(op, "get")),
+        "g(&Cell<bool>) is the bool word; graph={}",
         g_graph.dump()
     );
     let h_graph = crate::test_support::lower_function(&llbc, "h").expect("lower h");
-    assert!(
-        h_graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .any(call_target_ends_with_get),
-        "h(s.ptr.get()) of Cell<*mut u8> keeps its Call; graph={}",
+    let h_ops: Vec<_> = h_graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    let ptr_reads: Vec<_> = h_ops
+        .iter()
+        .filter(|op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "ptr"))
+        .collect();
+    assert_eq!(
+        ptr_reads.len(),
+        1,
+        "h must FieldRead outer ptr; graph={}",
         h_graph.dump()
     );
-    let user_graph =
-        crate::test_support::lower_function(&llbc, "user_get").expect("lower user_get");
     assert!(
-        user_graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .any(call_target_ends_with_get),
-        "a user Cell::get must keep its Call; graph={}",
-        user_graph.dump()
+        h_ops.iter().all(|op| !call_target_ends_with(op, "get")),
+        "h(s.ptr.get()) of Cell<*mut u8> is that field's value; graph={}",
+        h_graph.dump()
+    );
+    let user_err = crate::test_support::lower_function(&llbc, "user_get")
+        .expect_err("a residual callee cannot take &Cell<bool>");
+    let user_err = user_err.to_string();
+    assert!(
+        user_err.contains("repr(transparent) scalar"),
+        "user Cell::get must not fold as core::cell::Cell::get; got {user_err}"
+    );
+    let set_graph = crate::test_support::lower_function(&llbc, "set_flag").expect("lower set_flag");
+    let set_ops: Vec<_> = set_graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    let set_input = set_ops
+        .iter()
+        .find_map(|op| match &op.kind {
+            OpKind::Input { .. } => op.result.clone(),
+            _ => None,
+        })
+        .expect("set_flag has a struct input");
+    let flag_writes: Vec<_> = set_ops
+        .iter()
+        .filter(
+            |op| matches!(&op.kind, OpKind::FieldWrite { field, .. } if field_is_outer_flag(field)),
+        )
+        .collect();
+    assert_eq!(
+        flag_writes.len(),
+        1,
+        "set_flag must have exactly one FieldWrite of outer flag; graph={}",
+        set_graph.dump()
+    );
+    match &flag_writes[0].kind {
+        OpKind::FieldWrite { base, field, .. } => {
+            assert_eq!(field.name, "flag");
+            assert_eq!(
+                base,
+                &set_input,
+                "flag is written on the struct input; graph={}",
+                set_graph.dump()
+            );
+        }
+        other => panic!("expected FieldWrite, got {other:?}"),
+    }
+    assert!(
+        set_ops.iter().all(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } | OpKind::FieldWrite { field, .. } => {
+                !is_cell_value_descr(field)
+            }
+            _ => true,
+        }),
+        "set_flag must not emit core::cell::Cell.value; graph={}",
+        set_graph.dump()
+    );
+    assert!(
+        set_ops.iter().all(|op| !call_target_ends_with(op, "set")),
+        "set_flag must not keep Cell::set as a Call; graph={}",
+        set_graph.dump()
     );
 }
 
