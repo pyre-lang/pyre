@@ -6205,6 +6205,35 @@ fn intern_key_from_registry(
     reg: &crate::front::StructFieldRegistry,
     lookup: &str,
 ) -> Option<String> {
+    // Crate-included spelling whose crate-stripped remainder is itself a
+    // registry key (`pyre_object::pyobject::PyObject` →
+    // `pyobject::PyObject`, `core::ops::range::RangeInclusive<char>` →
+    // `ops::range::RangeInclusive<char>`). A longer path whose remainder
+    // is not a key (`module::struct::Code::Int`) stays as given —
+    // collapsing it onto `Code::Int` is the intern-alias refusal in
+    // `accept_intern_suffix_match`. Instantiation suffixes are stripped
+    // only for the key probe; `reattach_instantiation_suffix` puts them
+    // back so `RangeInclusive<char>` does not share a ClassDef with
+    // unspecialized `RangeInclusive`.
+    if let Some((_, rest)) = lookup.split_once("::")
+        && rest.contains("::")
+    {
+        let rest_stripped = majit_ir::descr::strip_generic_args(rest);
+        if reg.fields.contains_key(rest) || reg.fields.contains_key(rest_stripped.as_ref()) {
+            return intern_key_from_registry(reg, rest)
+                .map(|k| reattach_instantiation_suffix(&k, lookup));
+        }
+    }
+    // Bare leaf: the dual-publish convenience alias (`PyType` beside
+    // `pyobject::PyType`) is a lookup spelling, not a second class
+    // (`bookkeeper.py` `getuniqueclassdef` keys on the class object).
+    // Exact-match of that alias first-minted a sibling ClassDef and
+    // `ClassDef::commonbase` then declined `PyType ∪ pyobject::PyType`.
+    if !lookup.contains("::")
+        && let Some(key) = unique_registered_intern_key(reg, lookup)
+    {
+        return Some(reattach_instantiation_suffix(key, lookup));
+    }
     if let Some((k, _)) = reg.fields.get_key_value(lookup) {
         return Some(k.clone());
     }
@@ -6255,10 +6284,19 @@ fn unique_suffix_key_owned(
         if !accept_intern_suffix_match(owner, key) {
             continue;
         }
-        if found.is_some() {
-            return None;
+        match found.as_deref() {
+            None => found = Some(key.to_string()),
+            // Crate-included and crate-stripped of one struct
+            // (`pyre_object::pyobject::PyObject` / `pyobject::PyObject`)
+            // are one class object (`getuniqueclassdef(cls)`). Keep the
+            // shorter intern key. Incomparable leaves (`a::Dup` /
+            // `b::Dup`) stay distinct.
+            Some(prev) if crate::front::semantic::is_path_suffix(key, prev) => {}
+            Some(prev) if crate::front::semantic::is_path_suffix(prev, key) => {
+                found = Some(key.to_string());
+            }
+            Some(_) => return None,
         }
-        found = Some(key.to_string());
     }
     found
 }
