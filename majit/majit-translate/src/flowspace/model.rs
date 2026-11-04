@@ -4530,6 +4530,9 @@ impl ConstValue {
             ConstValue::Code(_) => HOST_ENV.lookup_builtin("code"),
             ConstValue::Function(_) => HOST_ENV.lookup_builtin("function"),
             ConstValue::HostObject(obj) => obj.class_of(),
+            ConstValue::Desc(d) => {
+                Some(crate::annotator::description::desc_host_class(&d.as_desc()))
+            }
             ConstValue::Atom(_)
             | ConstValue::Placeholder
             | ConstValue::Graphs(_)
@@ -4541,8 +4544,7 @@ impl ConstValue {
             | ConstValue::InheritanceId { .. }
             | ConstValue::SpecTag(_)
             | ConstValue::Opaque(_)
-            | ConstValue::Repr(_)
-            | ConstValue::Desc(_) => None,
+            | ConstValue::Repr(_) => None,
         }
     }
 
