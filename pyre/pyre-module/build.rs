@@ -346,48 +346,13 @@ fn candidate_from_flags(
     libs: &str,
     ncurses_prefix: bool,
 ) -> Option<majit_eci::ExternalCompilationInfo> {
-    let mut include_dirs = Vec::new();
-    let mut compile_extra = Vec::new();
-    for arg in cflags.split_whitespace() {
-        if let Some(dir) = arg.strip_prefix("-I") {
-            include_dirs.push(dir.to_string());
-        } else if let Some(macro_def) = arg.strip_prefix("-D") {
-            let macro_name = macro_def.split('=').next().unwrap_or(macro_def);
-            // `from_compiler_flags` skips `_XOPEN_SOURCE`.
-            if macro_name == "_XOPEN_SOURCE" {
-                continue;
-            }
-            compile_extra.push(arg.to_string());
-        } else if arg.starts_with("-L") || arg.starts_with("-l") {
-            return None;
-        } else {
-            compile_extra.push(arg.to_string());
-        }
-    }
-    let mut library_dirs = Vec::new();
-    let mut libraries = Vec::new();
-    let mut link_extra = Vec::new();
-    for arg in libs.split_whitespace() {
-        if let Some(dir) = arg.strip_prefix("-L") {
-            library_dirs.push(dir.to_string());
-        } else if let Some(lib) = arg.strip_prefix("-l") {
-            libraries.push(lib.to_string());
-        } else if arg.starts_with("-I") || arg.starts_with("-D") {
-            return None;
-        } else {
-            link_extra.push(arg.to_string());
-        }
-    }
-    let includes = apply_ncurses_prefix(ncurses_prefix);
-    Some(majit_eci::ExternalCompilationInfo {
-        include_dirs,
-        compile_extra,
-        library_dirs,
-        libraries,
-        link_extra,
-        includes,
+    let compile = majit_eci::ExternalCompilationInfo::from_compiler_flags(cflags).ok()?;
+    let link = majit_eci::ExternalCompilationInfo::from_linker_flags(libs).ok()?;
+    let includes = majit_eci::ExternalCompilationInfo {
+        includes: apply_ncurses_prefix(ncurses_prefix),
         ..majit_eci::ExternalCompilationInfo::default()
-    })
+    };
+    Some(compile.merge(&[&link, &includes]))
 }
 
 fn cflags_ldflags_grid() -> Vec<majit_eci::ExternalCompilationInfo> {
@@ -494,12 +459,9 @@ fn run_probe(eci: &majit_eci::ExternalCompilationInfo) -> Result<String, Vec<u8>
 }
 
 fn probe_source(eci: &majit_eci::ExternalCompilationInfo) -> String {
-    let mut src = String::from("#include <stdio.h>\n");
-    for h in &eci.includes {
-        src.push_str("#include <");
-        src.push_str(h);
-        src.push_str(">\n");
-    }
+    let mut src = String::new();
+    eci.write_c_header(&mut src);
+    src.push_str("#include <stdio.h>\n");
     src.push_str(
         "int main(void) {\n\
              void *volatile kept = 0;\n\

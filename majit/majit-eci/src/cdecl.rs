@@ -55,7 +55,7 @@ fn resolve_target(
 ) -> Result<(Type, Vec<String>), String> {
     let mut current = ty.clone();
     let mut module_path = module_path.to_vec();
-    let mut hops = 0;
+    let mut visited: Vec<(Vec<String>, String)> = Vec::new();
     loop {
         current = match current {
             Type::Paren(paren) => *paren.elem,
@@ -63,10 +63,12 @@ fn resolve_target(
             Type::Path(type_path) if type_path.qself.is_none() => {
                 match resolve(&type_path.path, &module_path) {
                     Some(Resolved::Alias(target, alias_module)) => {
-                        hops += 1;
-                        if hops > 64 {
-                            return Err("alias cycle".into());
+                        let path = &type_path.path;
+                        let key = (module_path.clone(), quote::quote!(#path).to_string());
+                        if visited.contains(&key) {
+                            return Err(format!("alias cycle: {}", key.1));
                         }
+                        visited.push(key);
                         module_path = alias_module;
                         target
                     }
@@ -78,49 +80,27 @@ fn resolve_target(
     }
 }
 
-/// `FuncType.__init__`: function arguments can only be primitive or pointer.
-pub fn functype_arg(
-    ty: &Type,
-    module_path: &[String],
-    resolve: &dyn Fn(&syn::Path, &[String]) -> Option<Resolved>,
-) -> Result<String, String> {
-    functype_slot(
-        ty,
-        module_path,
-        resolve,
-        "function arguments can only be primitive or pointer",
-    )
-}
-
 /// `FuncType.__init__`: function result can only be primitive or pointer.
 pub fn functype_result(
     ty: &Type,
     module_path: &[String],
     resolve: &dyn Fn(&syn::Path, &[String]) -> Option<Resolved>,
 ) -> Result<String, String> {
-    functype_slot(
-        ty,
-        module_path,
-        resolve,
-        "function result can only be primitive or pointer",
-    )
-}
-
-fn functype_slot(
-    ty: &Type,
-    module_path: &[String],
-    resolve: &dyn Fn(&syn::Path, &[String]) -> Option<Resolved>,
-    container_msg: &str,
-) -> Result<String, String> {
+    let container_msg = "function result can only be primitive or pointer";
     let (target, target_module) = resolve_target(ty, module_path, resolve)?;
     match &target {
         Type::Array(_) => return Err(container_msg.into()),
         Type::Path(type_path) if type_path.qself.is_none() => {
-            if matches!(
-                resolve(&type_path.path, &target_module),
-                Some(Resolved::LocalStruct(_))
-            ) {
-                return Err(container_msg.into());
+            match resolve(&type_path.path, &target_module) {
+                Some(Resolved::LocalStruct(_)) => return Err(container_msg.into()),
+                Some(Resolved::Extern(p)) => {
+                    if p.last()
+                        .is_some_and(|last| STRUCT_TAGS.contains(&last.as_str()))
+                    {
+                        return Err(container_msg.into());
+                    }
+                }
+                _ => {}
             }
         }
         _ => {}
@@ -142,10 +122,8 @@ pub fn gettype(
             // returns a pointer to the item.
             let (elem, elem_module) = resolve_target(&ptr.elem, module_path, resolve)?;
             let inner = match &elem {
-                Type::Array(arr) => {
-                    fixed_array_length(arr, ty)?;
-                    gettype(&arr.elem, &elem_module, resolve)?
-                }
+                // `FixedSizeArrayDefNode.getptrtype` does not use the length.
+                Type::Array(arr) => gettype(&arr.elem, &elem_module, resolve)?,
                 _ => gettype(&ptr.elem, module_path, resolve)?,
             };
             if ptr.const_token.is_some() {
@@ -169,14 +147,19 @@ pub fn gettype(
                 syn::ReturnType::Default => "void @".to_string(),
                 syn::ReturnType::Type(_, out) => functype_result(out, module_path, resolve)?,
             };
-            let params = if bare.inputs.is_empty() {
+            let mut parts = Vec::new();
+            for input in &bare.inputs {
+                // `LowLevelDatabase.gettype` FuncType: skip Void args.
+                if is_unit_type(&input.ty) {
+                    continue;
+                }
+                // There are external C functions eating raw structures, not pointers.
+                let t = gettype(&input.ty, module_path, resolve)?;
+                parts.push(cdecl(&t, ""));
+            }
+            let params = if parts.is_empty() {
                 "void".to_string()
             } else {
-                let mut parts = Vec::new();
-                for input in &bare.inputs {
-                    let t = functype_arg(&input.ty, module_path, resolve)?;
-                    parts.push(cdecl(&t, ""));
-                }
                 parts.join(", ")
             };
             Ok(result.replace('@', &format!("(*@)({params})")))
@@ -210,7 +193,14 @@ pub fn gettype(
                     gettype(&target, &alias_module, resolve)
                 }
                 Some(Resolved::Extern(p)) => match p.last() {
-                    Some(last) => Ok(format!("{} @", last_segment_c_type(last))),
+                    Some(last) => {
+                        let spelled = if p.iter().any(|s| s == "rffi") {
+                            rffi_type_template(last).map(|s| s.to_string())
+                        } else {
+                            None
+                        };
+                        Ok(spelled.unwrap_or_else(|| format!("{} @", last_segment_c_type(last))))
+                    }
                     None => Err(format!(
                         "cannot resolve type `{}` for generate_macro_wrapper",
                         tokens(ty)
@@ -239,6 +229,18 @@ pub fn gettype(
             "unsupported type for generate_macro_wrapper: {}",
             tokens(ty)
         )),
+    }
+}
+
+fn is_unit_type(ty: &Type) -> bool {
+    let mut t = ty;
+    loop {
+        match t {
+            Type::Paren(paren) => t = &paren.elem,
+            Type::Group(group) => t = &group.elem,
+            Type::Tuple(tuple) if tuple.elems.is_empty() => return true,
+            _ => return false,
+        }
     }
 }
 
@@ -294,6 +296,37 @@ fn option_of_bare_fn(path: &syn::Path) -> Option<&Type> {
             _ => return None,
         }
     }
+}
+
+/// `rffi.py` `TYPES`/`setup` and `CCHARP`: C type templates for the
+/// `majit_rlib::rffi` aliases.
+fn rffi_type_template(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "CHAR" => "char @",
+        "UCHAR" => "unsigned char @",
+        "SHORT" => "short @",
+        "USHORT" => "unsigned short @",
+        "INT" => "int @",
+        "UINT" => "unsigned int @",
+        "LONG" => "long @",
+        "ULONG" => "unsigned long @",
+        "LONGLONG" => "long long @",
+        "ULONGLONG" => "unsigned long long @",
+        "SIZE_T" => "size_t @",
+        "SSIZE_T" => "ssize_t @",
+        "SIGNED" => "Signed @",
+        "UNSIGNED" => "Unsigned @",
+        "DOUBLE" => "double @",
+        "FLOAT" => "float @",
+        "VOIDP" => "void *@",
+        "CONST_VOIDP" => "const void *@",
+        "CCHARP" => "char *@",
+        "CONST_CCHARP" => "const char *@",
+        "CCHARPP" => "char **@",
+        "CWCHARP" => "wchar_t *@",
+        "CWCHARPP" => "wchar_t **@",
+        _ => return None,
+    })
 }
 
 fn last_segment_c_type(name: &str) -> String {

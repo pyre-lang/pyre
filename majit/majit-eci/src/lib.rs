@@ -147,6 +147,61 @@ impl ExternalCompilationInfo {
         out
     }
 
+    /// `ExternalCompilationInfo.from_compiler_flags`.
+    pub fn from_compiler_flags(flags: &str) -> Result<Self, String> {
+        let mut pre_include_bits = Vec::new();
+        let mut include_dirs = Vec::new();
+        let mut compile_extra = Vec::new();
+        for arg in flags.split_whitespace() {
+            if let Some(dir) = arg.strip_prefix("-I") {
+                include_dirs.push(dir.to_string());
+            } else if let Some(macro_def) = arg.strip_prefix("-D") {
+                let (macro_name, value) = match macro_def.split_once('=') {
+                    Some((name, value)) => (name, value),
+                    None => (macro_def, "1"),
+                };
+                if macro_name == "_XOPEN_SOURCE" {
+                    continue;
+                }
+                pre_include_bits.push(format!("#define {macro_name} {value}"));
+            } else if arg.starts_with("-L") || arg.starts_with("-l") {
+                return Err(format!("linker flag found in compiler options: {arg:?}"));
+            } else {
+                compile_extra.push(arg.to_string());
+            }
+        }
+        Ok(ExternalCompilationInfo {
+            pre_include_bits,
+            include_dirs,
+            compile_extra,
+            ..ExternalCompilationInfo::default()
+        })
+    }
+
+    /// `ExternalCompilationInfo.from_linker_flags`.
+    pub fn from_linker_flags(flags: &str) -> Result<Self, String> {
+        let mut libraries = Vec::new();
+        let mut library_dirs = Vec::new();
+        let mut link_extra = Vec::new();
+        for arg in flags.split_whitespace() {
+            if let Some(dir) = arg.strip_prefix("-L") {
+                library_dirs.push(dir.to_string());
+            } else if let Some(lib) = arg.strip_prefix("-l") {
+                libraries.push(lib.to_string());
+            } else if arg.starts_with("-I") || arg.starts_with("-D") {
+                return Err(format!("compiler flag found in linker options: {arg:?}"));
+            } else {
+                link_extra.push(arg.to_string());
+            }
+        }
+        Ok(ExternalCompilationInfo {
+            libraries,
+            library_dirs,
+            link_extra,
+            ..ExternalCompilationInfo::default()
+        })
+    }
+
     /// `ExternalCompilationInfo.write_c_header`.
     pub fn write_c_header(&self, out: &mut String) {
         out.push_str(include_str!("precommondefs.h"));
@@ -387,6 +442,15 @@ mod tests {
                 .is_some_and(|e| e.starts_with("unsupported array length")),
             "{array_n:?}"
         );
+        assert_eq!(
+            cdecl::gettype(
+                &syn::parse_str("*mut [i32; N]").unwrap(),
+                none,
+                &resolve_extern
+            )
+            .unwrap(),
+            "int *@"
+        );
         let resolve_a_foo = |path: &syn::Path, _: &[String]| -> Option<cdecl::Resolved> {
             if path.segments.len() != 1 {
                 return None;
@@ -426,25 +490,108 @@ mod tests {
             "{result_a:?}"
         );
         assert_eq!(
-            cdecl::functype_arg(&syn::parse_str("Foo").unwrap(), none, &resolve_a_foo),
-            Err("function arguments can only be primitive or pointer".into())
-        );
-        assert_eq!(
-            cdecl::functype_arg(&syn::parse_str("*mut Foo").unwrap(), none, &resolve_a_foo)
-                .unwrap(),
+            cdecl::gettype(&syn::parse_str("*mut Foo").unwrap(), none, &resolve_a_foo).unwrap(),
             "struct Foo *@"
         );
         assert_eq!(
             cdecl::functype_result(&syn::parse_str("()").unwrap(), none, &resolve_a_foo).unwrap(),
             "void @"
         );
-        assert!(
+        assert_eq!(
             cdecl::gettype(
-                &syn::parse_str("extern \"C\" fn([i32; 4])").unwrap(),
+                &syn::parse_str("extern \"C\" fn(Foo, [i32; 4])").unwrap(),
                 none,
                 &resolve_a_foo
             )
-            .is_err()
+            .unwrap(),
+            "void (*@)(struct Foo, int [4])"
         );
+        assert_eq!(
+            cdecl::gettype(
+                &syn::parse_str("extern \"C\" fn((), i32) -> i32").unwrap(),
+                none,
+                &resolve_extern
+            )
+            .unwrap(),
+            "int (*@)(int)"
+        );
+        assert_eq!(
+            cdecl::gettype(
+                &syn::parse_str("extern \"C\" fn(())").unwrap(),
+                none,
+                &resolve_extern
+            )
+            .unwrap(),
+            "void (*@)(void)"
+        );
+        let result_stat = cdecl::functype_result(
+            &syn::parse_str("libc::stat").unwrap(),
+            none,
+            &resolve_extern,
+        );
+        assert_eq!(
+            result_stat,
+            Err("function result can only be primitive or pointer".into())
+        );
+        let resolve_rffi = |path: &syn::Path, _: &[String]| -> Option<cdecl::Resolved> {
+            let segs: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+            if segs.first().map(String::as_str) == Some("majit_rlib") {
+                Some(cdecl::Resolved::Extern(segs))
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            cdecl::gettype(
+                &syn::parse_str("majit_rlib::rffi::INT").unwrap(),
+                none,
+                &resolve_rffi
+            )
+            .unwrap(),
+            "int @"
+        );
+        assert_eq!(
+            cdecl::gettype(
+                &syn::parse_str("majit_rlib::rffi::CCHARP").unwrap(),
+                none,
+                &resolve_rffi
+            )
+            .unwrap(),
+            "char *@"
+        );
+        let resolve_cycle = |path: &syn::Path, _: &[String]| -> Option<cdecl::Resolved> {
+            if path.segments.len() != 1 {
+                return None;
+            }
+            match path.segments[0].ident.to_string().as_str() {
+                "X" => Some(cdecl::Resolved::Alias(syn::parse_str("Y").unwrap(), vec![])),
+                "Y" => Some(cdecl::Resolved::Alias(syn::parse_str("X").unwrap(), vec![])),
+                _ => None,
+            }
+        };
+        let cycle = cdecl::gettype(&syn::parse_str("*mut X").unwrap(), none, &resolve_cycle);
+        assert!(
+            cycle
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.starts_with("alias cycle")),
+            "{cycle:?}"
+        );
+        let flags = ExternalCompilationInfo::from_compiler_flags(
+            "-I/x -DFOO -DBAR=2 -D_XOPEN_SOURCE=700 -O2",
+        )
+        .unwrap();
+        assert_eq!(flags.include_dirs, vec!["/x".to_string()]);
+        assert_eq!(
+            flags.pre_include_bits,
+            vec!["#define FOO 1".to_string(), "#define BAR 2".to_string()]
+        );
+        assert_eq!(flags.compile_extra, vec!["-O2".to_string()]);
+        assert!(ExternalCompilationInfo::from_compiler_flags("-lfoo").is_err());
+        let link = ExternalCompilationInfo::from_linker_flags("-L/y -lbar -Wl,-z").unwrap();
+        assert_eq!(link.library_dirs, vec!["/y".to_string()]);
+        assert_eq!(link.libraries, vec!["bar".to_string()]);
+        assert_eq!(link.link_extra, vec!["-Wl,-z".to_string()]);
+        assert!(ExternalCompilationInfo::from_linker_flags("-DX").is_err());
     }
 }

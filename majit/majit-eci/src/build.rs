@@ -300,15 +300,14 @@ fn merge_macro_wrappers(collected: &mut CrateItems) {
                 .args
                 .iter()
                 .map(|ty| {
-                    crate::cdecl::functype_arg(ty, &item.module_path, &resolve).unwrap_or_else(
-                        |msg| {
-                            panic!(
-                                "{}: llexternal `{}`: {msg}",
-                                item.file_path.display(),
-                                item.head.name
-                            )
-                        },
-                    )
+                    // There are external C functions eating raw structures, not pointers.
+                    crate::cdecl::gettype(ty, &item.module_path, &resolve).unwrap_or_else(|msg| {
+                        panic!(
+                            "{}: llexternal `{}`: {msg}",
+                            item.file_path.display(),
+                            item.head.name
+                        )
+                    })
                 })
                 .collect();
             let result =
