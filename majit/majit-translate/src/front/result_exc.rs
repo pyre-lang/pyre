@@ -7635,6 +7635,18 @@ fn env_identity_operand(kind: &OpKind) -> Option<&Variable> {
     }
 }
 
+/// A niladic aggregate ctor allocates; an identity op forwards a fresh operand. Constants, including constant pointers, are not fresh.
+fn env_op_result_is_fresh(kind: &OpKind, fresh: &[Variable]) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            target: CallTarget::SyntheticTransparentCtor { .. },
+            args,
+            ..
+        } if args.is_empty()
+    ) || env_identity_operand(kind).is_some_and(|operand| fresh.iter().any(|seen| seen == operand))
+}
+
 fn is_single_exit_goto(graph: &FunctionGraph, block: usize) -> bool {
     let body = &graph.blocks[block];
     body.exitswitch.is_none() && body.exits.len() == 1 && body.exits[0].exitcase.is_none()
@@ -7832,6 +7844,8 @@ fn plan_toint_map_err_path(
     let carrier = toint_carrier_vars(graph, origin, recv);
     let is_carrier = |var: &Variable| carrier.iter().any(|seen| seen == var);
     let mut fresh = Vec::new();
+    // Replayed results that are not objects allocated on the path: identity
+    // copies of external values and constants.
     let mut aliases = Vec::new();
     let mut extras: Vec<(Variable, LinkArg)> = Vec::new();
     let mut ops = Vec::new();
@@ -7892,11 +7906,12 @@ fn plan_toint_map_err_path(
                         })?;
                     extras.push((var, arg));
                 }
+                let result_is_fresh = env_op_result_is_fresh(&op.kind, &fresh);
                 if let Some(result) = op.result.clone() {
-                    if identity_of_external {
-                        aliases.push(result);
-                    } else {
+                    if result_is_fresh {
                         fresh.push(result);
+                    } else {
+                        aliases.push(result);
                     }
                 }
                 ops.push(ReplayStep::Op(op));
@@ -8001,7 +8016,7 @@ fn exception_continuation_is_pure_construction(graph: &FunctionGraph, start: Blo
                 return false;
             }
             if let Some(result) = op.result.clone() {
-                if !identity_of_external {
+                if env_op_result_is_fresh(&op.kind, &fresh) {
                     fresh.push(result);
                 }
             }
@@ -22658,29 +22673,60 @@ mod toint_overflow_tests {
 
     #[test]
     fn toint_map_err_side_effect_in_path_declines() {
-        let (mut graph, r, mapped) =
-            map_err_question_graph(CallTarget::method("map_err", Some("Result".into())));
-        let u = producer_block_index(&graph, &mapped).expect("map_err block");
-        graph.blocks[u].operations.insert(
-            0,
-            SpaceOperation {
-                result: None,
-                kind: OpKind::Call {
-                    target: CallTarget::function_path(["side_effect"]),
-                    args: Vec::new(),
-                    result_ty: ValueType::Void,
-                },
-            },
-        );
-        let before = graph.clone();
-        let fused = fuse_toint_map_err_sites(
-            &mut graph,
-            &[(r, None, ValueType::Int)],
-            &[map_err_site(mapped)],
-        )
-        .expect("declined fusion is not a translation error");
-        assert_eq!(fused.len(), 0);
-        assert_eq!(graph, before, "side-effect in P leaves the graph unchanged");
+        for const_ptr_field_write in [false, true] {
+            let (mut graph, r, mapped) =
+                map_err_question_graph(CallTarget::method("map_err", Some("Result".into())));
+            let u = producer_block_index(&graph, &mapped).expect("map_err block");
+            if const_ptr_field_write {
+                let env = graph.blocks[u].operations[0]
+                    .result
+                    .clone()
+                    .expect("closure env ctor");
+                let p = graph.alloc_value_var();
+                copy_concretetype(&env, &p);
+                let value = graph.blocks[u].inputargs[1].clone();
+                graph.blocks[u].operations.insert(
+                    0,
+                    SpaceOperation {
+                        result: Some(p.clone()),
+                        kind: OpKind::ConstRefAddr(1),
+                    },
+                );
+                graph.blocks[u].operations.insert(
+                    1,
+                    SpaceOperation {
+                        result: None,
+                        kind: OpKind::FieldWrite {
+                            base: p,
+                            field: FieldDescriptor::new("__pos_0", Some("fixture::closure".into())),
+                            value: LinkArg::Value(value),
+                            ty: ValueType::Ref(None),
+                        },
+                    },
+                );
+            } else {
+                graph.blocks[u].operations.insert(
+                    0,
+                    SpaceOperation {
+                        result: None,
+                        kind: OpKind::Call {
+                            target: CallTarget::function_path(["side_effect"]),
+                            args: Vec::new(),
+                            result_ty: ValueType::Void,
+                        },
+                    },
+                );
+            }
+            let before = graph.clone();
+            let fused = fuse_toint_map_err_sites(
+                &mut graph,
+                &[(r, None, ValueType::Int)],
+                &[map_err_site(mapped)],
+            )
+            .expect("declined fusion is not a translation error");
+            assert_eq!(fused.len(), 0);
+            assert_eq!(graph, before, "side-effect in P leaves the graph unchanged");
+        }
     }
 
     #[test]
