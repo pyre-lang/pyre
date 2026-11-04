@@ -17,24 +17,6 @@
 
 use super::*;
 
-/// No generic total-depth bound by default: `perform_call` (`pyjitpl.py`)
-/// pushes an `MIFrame` per call. Recursion is bounded by
-/// `max_unroll_recursion` (`fbw_inline_recursion_count`) and the total by
-/// the trace limit (`blackhole_if_trace_too_long`).
-/// `PYRE_FBW_MULTIFRAME_DEPTH=N` lowers it to exercise shallow resume
-/// paths in tests. The raising-chain bound of 3 stays in
-/// `fbw_effective_multiframe_depth`.
-pub(crate) fn fbw_max_multiframe_depth() -> usize {
-    static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *DEPTH.get_or_init(|| {
-        std::env::var("PYRE_FBW_MULTIFRAME_DEPTH")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(usize::MAX)
-            .max(1)
-    })
-}
-
 /// Recursion depth of `w_code` on the walk's framestack —
 /// `opimpl_recursive_call` (`pyjitpl.py:1390-1402`) counting the portal frames
 /// already on `MetaInterp.framestack` before comparing against
@@ -74,13 +56,11 @@ fn inline_recursion_count(frames: &[InlineFrame], w_code: usize) -> usize {
 /// Whether the callee portal is already represented by any live inline
 /// frame, independently of `MIFrame.greenkey`.
 ///
-/// This is not the upstream recursive-unroll count above. It only keeps
-/// pyre's extra non-recursive call-chain valve from applying to a recursive
-/// portal. PyPy `_opimpl_recursive_call` has no such generic framestack cap;
-/// in particular a frame rebuilt by `resume.rebuild_from_resumedata` has a
-/// `None` greenkey (so it contributes zero to the max-unroll count) but a call
-/// back into the same portal is still recursive and must not acquire a second
-/// local bound.
+/// `_opimpl_recursive_call` counts matching greenkeys only. A frame rebuilt
+/// by `resume.rebuild_from_resumedata` has a `None` greenkey (so it
+/// contributes zero to the max-unroll count) but a call back into the same
+/// portal is still recursive: this predicate is the presence test used by
+/// the self-recursive-into-a-foreign-caller decline.
 pub(crate) fn fbw_recursive_portal_present<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     w_code: usize,
@@ -90,64 +70,6 @@ pub(crate) fn fbw_recursive_portal_present<Sym: WalkSym>(
 
 fn recursive_portal_present(frames: &[InlineFrame], w_code: usize) -> bool {
     frames.iter().any(|frame| frame.w_code == w_code)
-}
-
-/// True when two live frames share a `w_code`.  Used with
-/// [`fbw_effective_multiframe_depth`] so a leaf reached through two
-/// copies of the same intermediate is classified as recursive/duplicate
-/// (then bounded only by `max_unroll_recursion`) rather than as a
-/// distinct call chain.  `_opimpl_recursive_call` (`pyjitpl.py`) then
-/// `perform_call`s a different callable with no total-framestack cap.
-pub(crate) fn framestack_has_duplicate_w_code(frames: &[InlineFrame]) -> bool {
-    let mut seen = Vec::with_capacity(frames.len());
-    for frame in frames {
-        if frame.w_code == 0 {
-            continue;
-        }
-        if seen.contains(&frame.w_code) {
-            return true;
-        }
-        seen.push(frame.w_code);
-    }
-    false
-}
-
-/// Total inline-stack bound for a callee after its same-greenkey recursion
-/// count has already been checked against the live `max_unroll_recursion`.
-///
-/// PyPy `_opimpl_recursive_call` has no second, total-framestack depth gate:
-/// once a recursive portal is admitted, `memory_manager.max_unroll_recursion`
-/// is the sole value-returning recursion bound.  FBW's generic multiframe
-/// bound is unbounded unless lowered by `PYRE_FBW_MULTIFRAME_DEPTH`, and
-/// must not silently turn an upstream value of 7 into an effective 6 when
-/// an ambient inline frame is present.
-///
-/// Raising chains keep a shallower local bound on a *distinct* call chain
-/// because the carrier unwind crosses suspended frames.  `perform_call`
-/// (`pyjitpl.py`) has no such cap: it always pushes a new `MIFrame`.  A
-/// distinct `shape → mid → leaf` chain compiles the exception-edge bridge
-/// the way `finishframe_exception` does (`ChangeFrame` into the catching
-/// middle), so that shape is admitted to depth 3.  Recursive / duplicate
-/// raising *and* a value-returning leaf under an ambient self-rec unroll
-/// (duplicate `w_code` already on the stack) are bounded only by
-/// `max_unroll_recursion`: `_opimpl_recursive_call` `perform_call`s the
-/// new callable, and a middle `SubRaise` after `finishframe` is
-/// `finishframe_exception` over the remaining shallower frames.
-pub(crate) fn fbw_effective_multiframe_depth(
-    contains_raise: bool,
-    recursive_or_duplicate: bool,
-) -> usize {
-    if contains_raise {
-        if recursive_or_duplicate {
-            usize::MAX
-        } else {
-            3
-        }
-    } else if recursive_or_duplicate {
-        usize::MAX
-    } else {
-        fbw_max_multiframe_depth()
-    }
 }
 
 #[cfg(test)]
@@ -181,39 +103,25 @@ mod recursion_depth_policy_tests {
     }
 
     #[test]
-    fn value_returning_recursion_is_bounded_only_by_max_unroll_recursion() {
-        assert_eq!(fbw_effective_multiframe_depth(false, true), usize::MAX);
-    }
-
-    #[test]
     fn value_returning_leaf_under_selfrec_unroll_is_perform_call() {
         // Ambient duplicate `w_code` (the rec/step unroll) plus a new
-        // value-returning callee is `perform_call` (`pyjitpl.py`): no
-        // total-framestack cap.  Same `recursive_or_duplicate` bit the
-        // raising path already passed.
+        // callable: `_opimpl_recursive_call` counts the new portal at 0,
+        // so `perform_call` admits it. There is no total-framestack cap.
         let frames = [frame(7, true), frame(7, true), frame(9, false)];
-        assert!(framestack_has_duplicate_w_code(&frames));
-        assert_eq!(fbw_effective_multiframe_depth(false, true), usize::MAX);
+        assert_eq!(inline_recursion_count(&frames, 7), 2);
+        assert_eq!(inline_recursion_count(&frames, 9), 0);
     }
 
     #[test]
-    fn raising_recursion_is_bounded_only_by_max_unroll_recursion() {
-        assert_eq!(fbw_effective_multiframe_depth(true, true), usize::MAX);
-    }
-
-    #[test]
-    fn distinct_raising_chain_admits_the_three_frame_exception_edge() {
-        assert_eq!(fbw_effective_multiframe_depth(true, false), 3);
-    }
-
-    #[test]
-    fn duplicate_w_code_on_stack_is_the_selfrec_unroll_shape() {
-        let frames = [frame(7, true), frame(7, true), frame(9, false)];
-        assert!(framestack_has_duplicate_w_code(&frames));
-        assert!(!framestack_has_duplicate_w_code(&[
-            frame(7, true),
-            frame(9, false)
-        ]));
+    fn distinct_eight_deep_chain_is_not_refused_by_depth() {
+        // `_opimpl_recursive_call` counts same-portal greenkeys only.
+        // Eight distinct callees each contribute 1, so none hits
+        // `max_unroll_recursion` (default 7), and there is no second
+        // total-framestack cap that would refuse depth 8.
+        let frames: Vec<_> = (1..=8).map(|i| frame(i, true)).collect();
+        for i in 1..=8 {
+            assert_eq!(inline_recursion_count(&frames, i), 1);
+        }
     }
 }
 
