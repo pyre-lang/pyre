@@ -177,13 +177,23 @@ fn pyre_object_gc_collect_step_trampoline() -> (u8, u8) {
     (transition.old_state, transition.new_state)
 }
 
-/// Non-moving old-gen-only major trampoline for the interpreter GC safepoint.
-/// Bridges pyre-object's `try_gc_collect_oldgen` to
-/// `majit_gc::collect_oldgen_nonmoving`. Unlike the full-collect trampoline it
-/// runs no minor, so it reclaims stable-allocated interp int/float without
-/// moving the nursery — safe to fire under an active JIT.
+/// Non-moving old-gen-only major trampoline. Bridges pyre-object's
+/// `try_gc_collect_oldgen` to `majit_gc::collect_oldgen_nonmoving`. Nursery
+/// addresses stay put. Used by the explicit old-gen request. Automatic
+/// dispatch-loop collection is [`pyre_object_gc_collect_nursery_trampoline`].
+/// The depth ≤ 2 gate exists because opcode-handler Rust locals are not
+/// rooted; assembler frames are rooted by gcmap.
 fn pyre_object_gc_collect_oldgen_trampoline() {
     majit_gc::collect_oldgen_nonmoving();
+}
+
+/// Moving minor plus one bounded major step for the interpreter GC safepoint.
+/// Bridges pyre-object's `try_gc_minor_with_major_progress` to
+/// `majit_gc::collect_nursery_with_major_progress`.
+/// `incminimark.py` `minor_collection_with_major_progress` with
+/// `force_enabled=False`.
+fn pyre_object_gc_collect_nursery_trampoline() {
+    majit_gc::collect_nursery_with_major_progress();
 }
 
 /// Trampoline for the interpreter safepoint's next-major-threshold question
@@ -5811,6 +5821,9 @@ fn install_pyre_object_hooks() {
     pyre_object::register_gc_collect_hook(pyre_object_gc_collect_trampoline);
     pyre_object::gc_hook::register_gc_collect_step_hook(pyre_object_gc_collect_step_trampoline);
     pyre_object::gc_hook::register_gc_collect_oldgen_hook(pyre_object_gc_collect_oldgen_trampoline);
+    pyre_object::gc_hook::register_gc_minor_with_major_progress_hook(
+        pyre_object_gc_collect_nursery_trampoline,
+    );
     pyre_object::gc_hook::register_gc_major_threshold_reached_hook(
         pyre_object_gc_major_threshold_reached_trampoline,
     );

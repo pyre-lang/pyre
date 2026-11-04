@@ -3948,10 +3948,12 @@ pub fn total_memory_pressure() -> isize {
 }
 
 /// Process-global callback running a non-moving old-gen-only major collection
-/// (`GcAllocator::collect_oldgen_nonmoving`). The interpreter GC safepoint
-/// reaches it to reclaim stable-allocated interp int/float without moving the
-/// nursery — so it can fire under an active JIT (nursery non-empty), unlike
-/// the moving `collect_full`. No-op when no backend is installed.
+/// (`GcAllocator::collect_oldgen_nonmoving`). Nursery addresses stay put.
+/// Kept for the explicit old-gen request and the `nonmoving_major_*` tests.
+/// Automatic dispatch-loop collection is [`collect_nursery_with_major_progress`].
+/// The depth ≤ 2 gate exists because opcode-handler Rust locals are not
+/// rooted; assembler frames are rooted by gcmap. No-op when no backend is
+/// installed.
 pub type CollectOldgenFn = fn();
 
 global_hook!(static ACTIVE_COLLECT_OLDGEN: CollectOldgenFn);
@@ -3966,6 +3968,32 @@ pub fn set_active_collect_oldgen(hook: Option<CollectOldgenFn>) {
 /// GC. No-op when no backend has installed a hook.
 pub fn collect_oldgen_nonmoving() {
     if let Some(f) = ACTIVE_COLLECT_OLDGEN.get() {
+        f();
+    }
+}
+
+/// Process-global callback running a moving minor plus one bounded major
+/// step (`GcAllocator::collect_nursery` → `do_collect_nursery`).
+/// `incminimark.py` `minor_collection_with_major_progress` with
+/// `force_enabled=False`. The interpreter dispatch safepoint reaches it
+/// when `would_collect` holds. The depth ≤ 2 gate exists because
+/// opcode-handler Rust locals are not rooted; assembler frames are rooted
+/// by gcmap. No-op when no backend is installed.
+pub type CollectNurseryFn = fn();
+
+global_hook!(static ACTIVE_COLLECT_NURSERY: CollectNurseryFn);
+
+/// Install the active backend's minor-plus-major-progress trampoline. Pass
+/// `None` to clear.
+pub fn set_active_collect_nursery(hook: Option<CollectNurseryFn>) {
+    ACTIVE_COLLECT_NURSERY.set(hook);
+}
+
+/// Trigger `incminimark.py` `minor_collection_with_major_progress` with
+/// `force_enabled=False` on the active backend's GC. No-op when no backend
+/// has installed a hook.
+pub fn collect_nursery_with_major_progress() {
+    if let Some(f) = ACTIVE_COLLECT_NURSERY.get() {
         f();
     }
 }
