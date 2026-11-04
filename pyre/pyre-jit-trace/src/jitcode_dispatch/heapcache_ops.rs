@@ -1368,8 +1368,7 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
-/// `getfield_gc_<i|r>/rd>X` handler: read a Ref-bank source register
-/// + descr operand, consult the heapcache, and either return the
+/// `getfield_gc_<i|r>/rd>X` handler: read a Ref-bank source register + descr operand, consult the heapcache, and either return the
 /// cached field box (no IR op recorded) or record the appropriate
 /// `OpCode::GetfieldGc<I|R>` op and update the cache.
 ///

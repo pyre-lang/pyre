@@ -5994,8 +5994,7 @@ mod tests {
     /// (`invoke_around_handlers or has_callback`);
     /// `RandomEffectsAnalyzer.analyze_external_call` turns that into
     /// `EF_RANDOM_EFFECTS` on the release-gil calldescr. A lazy SETFIELD
-    /// therefore flushes before CALL_RELEASE_GIL, so GUARD_NOT_FORCED at
-    /// +1 stays adjacent (`assembler.py _store_force_index`).
+    /// therefore flushes before CALL_RELEASE_GIL, so GUARD_NOT_FORCED at +1 stays adjacent (`assembler.py _store_force_index`).
     #[test]
     fn test_lazy_set_flushes_before_call_release_gil_not_between_it_and_guard() {
         let field = descr(0);

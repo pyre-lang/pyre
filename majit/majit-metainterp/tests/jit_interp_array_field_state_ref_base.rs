@@ -123,10 +123,10 @@ fn dispatch_walk(program: &Bytecode, threshold: u32, stack: usize, ticks: i64) -
                 state.stack.data[state.sp] = state.ticks;
             }
             OP_STEP => {
-                state.sp = state.sp + 1i64;
+                state.sp += 1i64;
             }
             OP_TICK => {
-                state.ticks = state.ticks - 1i64;
+                state.ticks -= 1i64;
                 if state.ticks != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;
@@ -360,10 +360,10 @@ mod embedded_base {
                     state.stack.data[state.sp] = state.ticks;
                 }
                 OP_STEP => {
-                    state.sp = state.sp + 1i64;
+                    state.sp += 1i64;
                 }
                 OP_TICK => {
-                    state.ticks = state.ticks - 1i64;
+                    state.ticks -= 1i64;
                     if state.ticks != 0 {
                         can_enter_jit!(driver, 0usize, &mut state, program, || {});
                         pc = 0;

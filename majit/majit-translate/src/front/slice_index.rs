@@ -859,7 +859,7 @@ fn slice_marker_suffix(graph: &FunctionGraph, slice: &Variable) -> Option<String
             OpKind::Input {
                 class_root: Some(root),
                 ..
-            } if from_input.is_none() && op.result.as_ref().is_some_and(&same) => {
+            } if from_input.is_none() && op.result.as_ref().is_some_and(same) => {
                 from_input = identity_from_list_spelling(root);
             }
             _ => {}

@@ -29,7 +29,7 @@ pub(super) fn arm_platform(cc: Option<String>) -> Platform {
         let _guard = super::CC_COMMAND_LOCK.lock();
         super::snapshot_cc_command()
     };
-    arm_platform_with_sb2(&*SB2_MODULE, cc, env_cc)
+    arm_platform_with_sb2(&SB2_MODULE, cc, env_cc)
 }
 
 /// Testable `ARM` constructor: `SB2` / `SB2OPT` / env `CC` are parameters

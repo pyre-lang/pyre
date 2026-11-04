@@ -3859,10 +3859,6 @@ mod tests {
     }
 
     /// Flags dict `{flavor: raw, ...}` in the same shape as `gc_flavor_const`.
-    #[expect(
-        clippy::mutable_key_type,
-        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-    )]
     fn raw_flavor_const(extra: &[(&str, ConstValue)]) -> Hlvalue {
         use indexmap::IndexMap;
         let mut flags =
@@ -4624,7 +4620,7 @@ mod tests {
             let startblock = Block::shared(vec![]);
             let out = variable_with_lltype("out", LowLevelType::Signed);
             let graph = FlowGraph::with_return_var(
-                &format!("ll_test_{opname}_rint_uchar"),
+                format!("ll_test_{opname}_rint_uchar"),
                 startblock.clone(),
                 Hlvalue::Variable(out.clone()),
             );

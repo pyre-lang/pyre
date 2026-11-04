@@ -3804,10 +3804,6 @@ pub fn rtype_cast_weakrefptr_to_ptr(
 /// `ConstValue::Bool(true)`, which would collapse the wrapped value
 /// and lose the structural distinction between a Constant and a
 /// Variable carrier.
-#[expect(
-    clippy::mutable_key_type,
-    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-)]
 pub fn rtype_malloc(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::flowspace::model::Hlvalue;
     use crate::translator::rtyper::rmodel::impossible_repr;
@@ -3998,10 +3994,6 @@ pub fn rtype_malloc(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RType
 ///
 /// `i_flavor` is the required keyword index; absent or non-`'raw'`
 /// flavor surfaces a `TyperError` matching the upstream assertion.
-#[expect(
-    clippy::mutable_key_type,
-    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-)]
 pub fn rtype_free(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::flowspace::model::Hlvalue;
     use crate::translator::rtyper::rmodel::impossible_repr;
@@ -4096,10 +4088,6 @@ pub fn rtype_free(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeRe
 /// The `flags` Python dict is lowered to `ConstValue::Dict` keyed on
 /// the byte-string `"flavor"` with the `Flavor::llflavor()` byte-string
 /// as value, matching the runtime shape the `free` llop-handler reads.
-#[expect(
-    clippy::mutable_key_type,
-    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-)]
 pub fn rtype_free_non_gc_object(
     hop: &HighLevelOp,
     _kwds_i: &HashMap<String, usize>,

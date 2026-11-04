@@ -608,11 +608,10 @@ impl OptVirtualize {
                             // `new_with_vtable` with a CONSTANT vtable).
                             // Emitting the SETFIELD (`PassOn`) would leak this
                             // virtual into an emitted op and force it.
-                            if let Some(class_val) = value_as_constant {
-                                if vinfo.known_class.is_none() {
+                            if let Some(class_val) = value_as_constant
+                                && vinfo.known_class.is_none() {
                                     vinfo.known_class = Some(class_val as i64);
                                 }
-                            }
                             return Some(OptimizationResult::Remove);
                         }
                         // PyPy's typeptr never enters `_fields`: its class
@@ -3584,7 +3583,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Signed,
             "core::option::Option.__discriminant".to_string(),
-            "__discriminant".to_string(),
+            "__discriminant",
         )
         .with_parent_descr(parent.clone(), 0);
         let alias = majit_ir::SimpleFieldDescr::new_with_name(
@@ -3595,7 +3594,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Signed,
             "option::Option.__discriminant".to_string(),
-            "__discriminant".to_string(),
+            "__discriminant",
         )
         .with_parent_descr(parent.clone(), 0);
         assert!(
@@ -3612,7 +3611,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Signed,
             "other::Option.__discriminant".to_string(),
-            "__discriminant".to_string(),
+            "__discriminant",
         )
         .with_parent_descr(other_parent.clone(), 0);
         assert!(!slot_holds_field(&slot, &other));
@@ -3635,7 +3634,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Signed,
             "core::option::Option<i64>::Some.__discriminant".to_string(),
-            "__discriminant".to_string(),
+            "__discriminant",
         )
         .with_parent_descr(variant_parent.clone(), 0);
         let inherited = majit_ir::SimpleFieldDescr::new_with_name(
@@ -3646,7 +3645,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Signed,
             "core::option::Option<i64>.__discriminant".to_string(),
-            "__discriminant".to_string(),
+            "__discriminant",
         )
         .with_parent_descr(base_parent.clone(), 0);
         assert!(
@@ -3666,7 +3665,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Signed,
             "other::Option<i64>.__discriminant".to_string(),
-            "__discriminant".to_string(),
+            "__discriminant",
         )
         .with_parent_descr(base_parent, 0);
         assert!(!slot_holds_field(&slot, &unrelated));
@@ -3680,7 +3679,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Signed,
             "b::a::E.__discriminant".to_string(),
-            "__discriminant".to_string(),
+            "__discriminant",
         )
         .with_parent_descr(suffix_parent, 0);
         let collision_slot = majit_ir::SimpleFieldDescr::new_with_name(
@@ -3691,7 +3690,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Signed,
             "a::E::V.__discriminant".to_string(),
-            "__discriminant".to_string(),
+            "__discriminant",
         )
         .with_parent_descr(variant_parent.clone(), 0);
         assert!(
@@ -3721,7 +3720,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Unsigned,
             format!("{variant_owner}.__discriminant"),
-            "__discriminant".to_string(),
+            "__discriminant",
         )
         .with_parent_descr(variant_parent.clone(), 0);
         let field = majit_ir::SimpleFieldDescr::new_with_name(
@@ -3732,7 +3731,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Unsigned,
             format!("{base_owner}.__discriminant"),
-            "__discriminant".to_string(),
+            "__discriminant",
         )
         .with_parent_descr(base_parent.clone(), 0);
         assert!(
@@ -3761,7 +3760,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Unsigned,
             format!("{variant_owner}.__discriminant"),
-            "__discriminant".to_string(),
+            "__discriminant",
         )
         .with_parent_descr(foreign_parent.clone(), 0);
         assert!(
@@ -3789,7 +3788,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Pointer,
             "core::option::Option<Dynamic>::Some.__pos_0".to_string(),
-            "__pos_0".to_string(),
+            "__pos_0",
         )
         .with_parent_descr(variant_parent.clone(), 1);
         let template = majit_ir::SimpleFieldDescr::new_with_name(
@@ -3800,7 +3799,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Pointer,
             "Option::Some.__pos_0".to_string(),
-            "__pos_0".to_string(),
+            "__pos_0",
         )
         .with_parent_descr(template_parent.clone(), 1);
         assert!(slot_holds_field(&slot, &template));
@@ -3815,7 +3814,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Pointer,
             "core::result::Result<Dynamic,str>::Ok.__pos_0".to_string(),
-            "__pos_0".to_string(),
+            "__pos_0",
         )
         .with_parent_descr(variant_parent, 1);
         let err = majit_ir::SimpleFieldDescr::new_with_name(
@@ -3826,7 +3825,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Pointer,
             "Result::Err.__pos_0".to_string(),
-            "__pos_0".to_string(),
+            "__pos_0",
         )
         .with_parent_descr(template_parent, 1);
         assert!(!slot_holds_field(&ok, &err));
@@ -3889,7 +3888,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Pointer,
             "option::Option::Some.__pos_0".to_string(),
-            "__pos_0".to_string(),
+            "__pos_0",
         )
         .with_parent_descr(user_parent, 0);
         let shell = majit_ir::SimpleFieldDescr::new_with_name(
@@ -3900,7 +3899,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Pointer,
             "Option::Some.__pos_0".to_string(),
-            "__pos_0".to_string(),
+            "__pos_0",
         )
         .with_parent_descr(core_parent, 1);
         assert!(
@@ -4062,7 +4061,7 @@ mod tests {
                 false,
                 majit_ir::ArrayFlag::Pointer,
                 "W_DictObject.dstorage_as_gcref".to_string(),
-                "dstorage_as_gcref".to_string(),
+                "dstorage_as_gcref",
             )
             .with_index_in_parent(3),
         );
@@ -4075,7 +4074,7 @@ mod tests {
                 false,
                 majit_ir::ArrayFlag::Pointer,
                 "W_DictObject.dstorage".to_string(),
-                "dstorage".to_string(),
+                "dstorage",
             )
             .with_index_in_parent(4),
         );
@@ -4143,7 +4142,7 @@ mod tests {
                 false,
                 majit_ir::ArrayFlag::Pointer,
                 "PyObject.w_class".to_string(),
-                "w_class".to_string(),
+                "w_class",
             )
             .with_class_word(true)
             .with_index_in_parent(1),
@@ -4184,7 +4183,7 @@ mod tests {
                 false,
                 majit_ir::ArrayFlag::Signed,
                 format!("{owner}.{key}"),
-                key.to_string(),
+                key,
             )
             .with_parent_descr(parent.clone(), 0);
             (field, parent)
@@ -4239,7 +4238,7 @@ mod tests {
                 false,
                 majit_ir::ArrayFlag::Pointer,
                 format!("{owner}.{key}"),
-                key.to_string(),
+                key,
             )
             .with_parent_descr(parent.clone(), 4);
             (field, parent)
@@ -5004,7 +5003,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Pointer,
             "PyObject.ob_type".to_string(),
-            "ob_type".to_string(),
+            "ob_type",
         ));
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd),
@@ -5041,7 +5040,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Pointer,
             "PyObject.ob_type".to_string(),
-            "ob_type".to_string(),
+            "ob_type",
         ));
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], sd),
@@ -5225,7 +5224,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Signed,
             "object.typeptr".to_string(),
-            "typeptr".to_string(),
+            "typeptr",
         ));
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd),
@@ -5259,7 +5258,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Pointer,
             "PyObject.ob_type".to_string(),
-            "ob_type".to_string(),
+            "ob_type",
         ));
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd),
@@ -5297,7 +5296,7 @@ mod tests {
             false,
             majit_ir::ArrayFlag::Pointer,
             "PyObject.ob_type".to_string(),
-            "ob_type".to_string(),
+            "ob_type",
         ));
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd),

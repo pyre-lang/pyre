@@ -2382,18 +2382,16 @@ pub(in crate::front::mir) fn local_assignment_counts(
         for stmt in &bb.statements {
             if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref()
                 && let PlaceKind::Local(i) = place.kind
+                && let Some(count) = counts.get_mut(i as usize)
             {
-                if let Some(count) = counts.get_mut(i as usize) {
-                    *count += 1;
-                }
+                *count += 1;
             }
         }
         if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
             && let PlaceKind::Local(i) = call.dest.kind
+            && let Some(count) = counts.get_mut(i as usize)
         {
-            if let Some(count) = counts.get_mut(i as usize) {
-                *count += 1;
-            }
+            *count += 1;
         }
     }
     counts
@@ -2467,13 +2465,13 @@ pub(in crate::front::mir) fn const_struct_uses_are_field_reads(
         for stmt in &bb.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
-                    if rvalue_is_const_struct_alias_copy(&rvalue, &place, &aliases) {
+                    if rvalue_is_const_struct_alias_copy(rvalue, place, &aliases) {
                         continue;
                     }
-                    scan_rvalue_const_struct(&rvalue, &aliases, &mut fields, &mut other);
+                    scan_rvalue_const_struct(rvalue, &aliases, &mut fields, &mut other);
                     if matches!(place.kind, PlaceKind::Local(i) if aliases.contains(&(i as usize)))
                     {
-                    } else if place_is_const_struct_alias(&place, &aliases) {
+                    } else if place_is_const_struct_alias(place, &aliases) {
                         other += 1;
                     }
                 }
@@ -2487,7 +2485,7 @@ pub(in crate::front::mir) fn const_struct_uses_are_field_reads(
         }
         match bb.term_ref(llbc) {
             Ok(TermKind::Switch { discr, .. }) => bump_const_struct_use(
-                operand_const_struct_use(&discr, &aliases),
+                operand_const_struct_use(discr, &aliases),
                 &mut fields,
                 &mut other,
             ),

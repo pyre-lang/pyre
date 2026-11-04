@@ -80,10 +80,10 @@ fn dispatch_undrainable_post_loop(program: &Bytecode, threshold: u32, n: i64) ->
         pc += 1;
         match opcode {
             OP_ADD => {
-                state.acc = state.acc + state.cnt;
+                state.acc += state.cnt;
             }
             OP_DEC => {
-                state.cnt = state.cnt - 1;
+                state.cnt -= 1;
             }
             OP_BACK => {
                 let target = program[pc] as usize;
@@ -102,7 +102,7 @@ fn dispatch_undrainable_post_loop(program: &Bytecode, threshold: u32, n: i64) ->
     // Same shape as the `i64` sibling's epilogue — a scalar state store ahead
     // of the value the portal yields — with the store made self-reporting so
     // the `bool` return is itself the once-or-twice evidence.
-    state.ran = state.ran + 1;
+    state.ran += 1;
     state.ran == 1
 }
 

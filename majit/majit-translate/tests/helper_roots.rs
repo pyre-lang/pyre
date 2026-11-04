@@ -42,7 +42,7 @@ fn helper_roots_compile_their_callees_without_a_portal_or_unrelated_graphs() {
             .builtin_wrapper_indirect_graphs()
             .contains(&wrapper)
     );
-    call_control.find_helper_graphs(&mut DefaultJitPolicy::new(), &[helper.clone()]);
+    call_control.find_helper_graphs(&mut DefaultJitPolicy::new(), std::slice::from_ref(&helper));
     let jitcodes =
         CodeWriter::new().make_jitcodes(&mut call_control, &GraphTransformConfig::default());
     assert_eq!(jitcodes.in_order.len(), 2);

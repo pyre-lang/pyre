@@ -2028,10 +2028,10 @@ fn retrace_inputarg_boxes(renamed: &[OpRef], ops: &[majit_ir::OpRc]) -> Vec<Inpu
             .iter()
             .chain(op.guard_fail_args().unwrap_or(&[]))
         {
-            if arg.is_inputarg() {
-                if let Some(ia) = arg.bound_inputarg() {
-                    bound.entry(arg.to_opref()).or_insert(ia);
-                }
+            if arg.is_inputarg()
+                && let Some(ia) = arg.bound_inputarg()
+            {
+                bound.entry(arg.to_opref()).or_insert(ia);
             }
         }
     }
@@ -3618,10 +3618,9 @@ impl<M: Clone> MetaInterp<M> {
             .as_ref()
             .or(self.compile_tracing.as_ref())
             .and_then(|c| c.resumekey_original_loop_token().cloned())
+            && !tokens.iter().any(|seen| Arc::ptr_eq(seen, &token))
         {
-            if !tokens.iter().any(|seen| Arc::ptr_eq(seen, &token)) {
-                tokens.push(token);
-            }
+            tokens.push(token);
         }
         // `history.py JitCellToken.record_jump_to` keeps the JUMP
         // target alive through `_keepalive_jitcell_tokens` even after
@@ -5420,8 +5419,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// `call.py:46-47` `jd.index = idx; self.jitdrivers_sd.append(jd)` —
-    /// register a real portal `JitDriverStaticData` (greens/reds/virtualizable
-    /// + `portal_runner_adr`) so `compile_tmp_callback` / `do_recursive_call`
+    /// register a real portal `JitDriverStaticData` (greens/reds/virtualizable + `portal_runner_adr`) so `compile_tmp_callback` / `do_recursive_call`
     /// have a populated slot.  Wraps
     /// [`MetaInterpStaticData::register_jitdriver_sd`] with the disjoint
     /// `staticdata`/`backend` field borrow (mirrors `set_result_type`) so the
@@ -8379,7 +8377,6 @@ impl<M: Clone> MetaInterp<M> {
     /// A nested `compile_and_run_once` still has to park the attempt
     /// ([`Self::has_live_metainterp_attempt`]); `warmstate.py`
     /// `bound_reached` constructs a fresh MetaInterp instead.
-
     #[inline]
     pub fn is_tracing(&self) -> bool {
         self.tracing.is_some()
@@ -13563,10 +13560,8 @@ impl<M: Clone> MetaInterp<M> {
         let rd_loop_token = majit_backend::descr_owning_green_key(descr);
         Self::finish_compiled_run_io();
 
-        if !is_finish {
-            if let Some(fd) = descr_arc.as_fail_descr() {
-                self.record_guard_failure_event(green_key, fd, fd.is_back_edge_poll());
-            }
+        if !is_finish && let Some(fd) = descr_arc.as_fail_descr() {
+            self.record_guard_failure_event(green_key, fd, fd.is_back_edge_poll());
         }
 
         // FINISH descrs are singletons (`DONE_WITH_THIS_FRAME_DESCR_*` /
@@ -14407,18 +14402,18 @@ impl<M: Clone> MetaInterp<M> {
             // trait; including both keeps the stamp aligned with the 7
             // metainterp descrs that override `set_rd_loop_token_clt`
             // (`set_rd_loop_token_clt` overrides).
-            if descr.is_resume_guard() || descr.is_resume_guard_copied() {
-                if let Some(clt) = original.compiled_loop_token() {
-                    let cloned = std::sync::Arc::clone(&clt);
-                    let any_arc: std::sync::Arc<dyn std::any::Any + Send + Sync> = cloned;
-                    descr
-                        .as_fail_descr()
-                        .expect(
-                            "compile.py:185 isinstance(descr, ResumeDescr) — \
+            if (descr.is_resume_guard() || descr.is_resume_guard_copied())
+                && let Some(clt) = original.compiled_loop_token()
+            {
+                let cloned = std::sync::Arc::clone(&clt);
+                let any_arc: std::sync::Arc<dyn std::any::Any + Send + Sync> = cloned;
+                descr
+                    .as_fail_descr()
+                    .expect(
+                        "compile.py:185 isinstance(descr, ResumeDescr) — \
                                  every ResumeDescr-family descr is a FailDescr",
-                        )
-                        .set_rd_loop_token_clt(any_arc);
-                }
+                    )
+                    .set_rd_loop_token_clt(any_arc);
             }
 
             // `compile.py` `if isinstance(descr, ResumeDescr):
@@ -17040,8 +17035,7 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Check if a function call should be inlined during tracing.
     ///
-    /// Line-by-line port of `_opimpl_recursive_call` (pyjitpl.py)
-    /// + `do_recursive_call` (pyjitpl.py). Decision flow:
+    /// Line-by-line port of `_opimpl_recursive_call` (pyjitpl.py) + `do_recursive_call` (pyjitpl.py). Decision flow:
     ///
     /// 1. Not tracing → CALL_ASSEMBLER if compiled, else residual.
     /// 2. `!can_inline_callable` (cell has `JC_DONT_TRACE_HERE` or
@@ -19232,8 +19226,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `popping_jdindex` snapshot for why the index has to be threaded
     /// through here in pyre.
     ///
-    /// `self.history.record(rop.FINISH, ...)`
-    /// + `compile.compile_trace` are also driven from the
+    /// `self.history.record(rop.FINISH, ...)` + `compile.compile_trace` are also driven from the
     /// `TraceAction::Finish` dispatch (jitdriver.rs →
     /// `MetaInterp::finish_and_compile`) — pyre's recorder owns the
     /// finish/compile sequence and emits FINISH from there with the
@@ -27764,8 +27757,10 @@ mod metainterp_static_data_tests {
         );
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
-        let mut effect = majit_ir::EffectInfo::default();
-        effect.extraeffect = majit_ir::effectinfo::ExtraEffect::ForcesVirtualOrVirtualizable;
+        let effect = majit_ir::EffectInfo {
+            extraeffect: majit_ir::effectinfo::ExtraEffect::ForcesVirtualOrVirtualizable,
+            ..Default::default()
+        };
         let descr_view = StubCallDescr {
             arg_types: vec![],
             result_type: majit_ir::Type::Int,
@@ -29996,9 +29991,10 @@ mod tests {
             inputargs: Vec::new(),
         });
 
-        meta.walk_partial_trace_refs(|slot| match slot.0 {
-            0x97_0000_4000 => slot.0 = 0x97_0000_5000,
-            _ => {}
+        meta.walk_partial_trace_refs(|slot| {
+            if slot.0 == 0x97_0000_4000 {
+                slot.0 = 0x97_0000_5000
+            }
         });
 
         let ops = &meta.partial_trace.as_ref().unwrap().ops;
@@ -32237,7 +32233,7 @@ mod tests {
             .keep_loop_alive(&token_arc);
         let _ = meta
             .warm_state_for_driver(compiling_jd)
-            .ensure_cell_for_key(&green_key);
+            .ensure_cell_for_key(green_key);
         meta.warm_state_for_driver(compiling_jd)
             .attach_procedure_to_interp_for_key(green_key, std::sync::Arc::clone(&token_arc));
     }

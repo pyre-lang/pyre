@@ -1031,10 +1031,6 @@ impl<'a> Lowering<'a> {
     /// foreign-boundary port of `valid_up_to` / `error_len`; this adapter must
     /// not be generalized to such a call site by pretending that payload has
     /// an RPython layout.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
-    )]
     pub(in crate::front::mir) fn try_lower_wtf8_as_str(
         &mut self,
         mir_bb: usize,

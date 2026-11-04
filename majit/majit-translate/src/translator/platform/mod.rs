@@ -1749,10 +1749,10 @@ pub fn execute(
         command.envs(env);
         // Windows programs often require SystemRoot.
         #[cfg(windows)]
-        if !env.contains_key("SystemRoot") {
-            if let Ok(system_root) = std::env::var("SystemRoot") {
-                command.env("SystemRoot", system_root);
-            }
+        if !env.contains_key("SystemRoot")
+            && let Ok(system_root) = std::env::var("SystemRoot")
+        {
+            command.env("SystemRoot", system_root);
         }
     }
 

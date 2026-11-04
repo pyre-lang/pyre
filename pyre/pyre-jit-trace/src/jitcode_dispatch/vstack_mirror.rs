@@ -1254,32 +1254,29 @@ fn vstack_operand_shadow_occupied<Sym: WalkSym>(
         let Some(shadow) = state.callee_shadow.as_ref() else {
             return false;
         };
-        (first_slot..depth).any(
-            |s| match shadow.opref.get(&((stack_base + s) as i64)).copied() {
-                Some(value) if value != OpRef::NONE && !opref_is_null_const_ptr(value) => true,
-                _ => false,
-            },
-        )
+        (first_slot..depth).any(|s| {
+            matches!(
+                shadow.opref.get(&((stack_base + s) as i64)).copied(),
+                Some(value) if value != OpRef::NONE && !opref_is_null_const_ptr(value)
+            )
+        })
     } else {
         if ctx.fbw_mode.snapshot_sym.is_null() {
             return false;
         }
         let nlocals = unsafe { (*ctx.fbw_mode.snapshot_sym).nlocals() };
         let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-        (first_slot..depth).any(
-            |s| match ctx.trace_ctx.virtualizable_box_at(nvs + nlocals + s) {
+        (first_slot..depth).any(|s| {
+            matches!(
+                ctx.trace_ctx.virtualizable_box_at(nvs + nlocals + s),
                 Some(b)
                     if b != OpRef::NONE
                         && (!opref_is_null_const_ptr(b)
                             || ctx
                                 .trace_ctx
-                                .virtualizable_slot_stored_live_null(nvs + nlocals + s)) =>
-                {
-                    true
-                }
-                _ => false,
-            },
-        )
+                                .virtualizable_slot_stored_live_null(nvs + nlocals + s))
+            )
+        })
     }
 }
 

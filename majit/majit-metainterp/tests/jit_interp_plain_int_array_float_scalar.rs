@@ -67,7 +67,7 @@ fn mixed_cells_mainloop(program: &Bytecode, threshold: u32) -> i64 {
 
         match opcode {
             ADD_CELL => {
-                state.acc = state.acc + state.cells[0];
+                state.acc += state.cells[0];
             }
             ADD_F => {
                 // Compound assign with a float literal is the form the
@@ -75,7 +75,7 @@ fn mixed_cells_mainloop(program: &Bytecode, threshold: u32) -> i64 {
                 state.f += 0.5;
             }
             STEP => {
-                state.acc = state.acc + state.cells[0];
+                state.acc += state.cells[0];
                 state.f += 0.5;
             }
             BR_LT => {

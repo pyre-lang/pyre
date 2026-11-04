@@ -997,8 +997,7 @@ pub(crate) fn unop_cast_record<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
-/// Generic float-bank binop handler. Operand layout `ff>f` (1B src1
-/// + 1B src2 + 1B dst). RPython parity: same as `binop_int_record`
+/// Generic float-bank binop handler. Operand layout `ff>f` (1B src1 + 1B src2 + 1B dst). RPython parity: same as `binop_int_record`
 /// but on the float bank — `pyjitpl.py`'s exec-generated
 /// `opimpl_float_<binop>` reads two `f` regs, calls
 /// `self.execute(rop.<OPNUM>, b1, b2)`, and the trailing `>f`
@@ -1060,8 +1059,7 @@ pub(crate) fn binop_float_record<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
-/// Generic float-bank unary handler. Operand layout `f>f` (1B src
-/// + 1B dst). RPython equivalent: `bhimpl_float_neg(value)` →
+/// Generic float-bank unary handler. Operand layout `f>f` (1B src + 1B dst). RPython equivalent: `bhimpl_float_neg(value)` →
 /// `pyjitpl.py:execute(rop.FLOAT_NEG, value)`. Recording-only path
 /// is the same shape as `binop_float_record` minus one read.
 pub(crate) fn unop_float_record<Sym: WalkSym>(

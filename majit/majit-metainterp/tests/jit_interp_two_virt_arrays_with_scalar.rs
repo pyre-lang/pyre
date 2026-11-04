@@ -71,8 +71,8 @@ mod two_arrays_no_scalar {
             pc += 1;
 
             match opcode {
-                OP_ACC => state.fregs[0] = state.fregs[0] + 1.25,
-                OP_INC => state.iregs[0] = state.iregs[0] + 1,
+                OP_ACC => state.fregs[0] += 1.25,
+                OP_INC => state.iregs[0] += 1,
                 OP_JUMP_BACK => {
                     let target = program[pc] as usize;
                     pc += 1;
@@ -167,8 +167,8 @@ mod one_array_with_scalar {
             pc += 1;
 
             match opcode {
-                OP_ACC => state.acc = state.acc + 2,
-                OP_INC => state.iregs[0] = state.iregs[0] + 1,
+                OP_ACC => state.acc += 2,
+                OP_INC => state.iregs[0] += 1,
                 OP_JUMP_BACK => {
                     let target = program[pc] as usize;
                     pc += 1;
@@ -264,8 +264,8 @@ mod two_arrays_with_scalar {
             pc += 1;
 
             match opcode {
-                OP_ACC => state.fregs[0] = state.fregs[0] + 1.25,
-                OP_INC => state.iregs[0] = state.iregs[0] + 1,
+                OP_ACC => state.fregs[0] += 1.25,
+                OP_INC => state.iregs[0] += 1,
                 OP_JUMP_BACK => {
                     let target = program[pc] as usize;
                     pc += 1;
@@ -366,8 +366,8 @@ mod two_int_arrays_with_scalar {
             pc += 1;
 
             match opcode {
-                OP_ACC => state.aregs[0] = state.aregs[0] + 2,
-                OP_INC => state.iregs[0] = state.iregs[0] + 1,
+                OP_ACC => state.aregs[0] += 2,
+                OP_INC => state.iregs[0] += 1,
                 OP_JUMP_BACK => {
                     let target = program[pc] as usize;
                     pc += 1;
@@ -459,8 +459,8 @@ mod one_array_dead_scalar {
             pc += 1;
 
             match opcode {
-                OP_ACC => state.iregs[2] = state.iregs[2] + 2,
-                OP_INC => state.iregs[0] = state.iregs[0] + 1,
+                OP_ACC => state.iregs[2] += 2,
+                OP_INC => state.iregs[0] += 1,
                 OP_JUMP_BACK => {
                     let target = program[pc] as usize;
                     pc += 1;
@@ -555,8 +555,8 @@ mod two_arrays_live_scalar {
             pc += 1;
 
             match opcode {
-                OP_ACC => state.acc = state.acc + 2,
-                OP_INC => state.iregs[0] = state.iregs[0] + 1,
+                OP_ACC => state.acc += 2,
+                OP_INC => state.iregs[0] += 1,
                 OP_JUMP_BACK => {
                     let target = program[pc] as usize;
                     pc += 1;

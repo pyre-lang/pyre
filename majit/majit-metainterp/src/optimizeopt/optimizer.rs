@@ -7238,9 +7238,7 @@ mod tests {
         assert_eq!(names("unroll"), ["simplify"]);
         assert_eq!(names("aaa:bbb"), ["simplify"]);
         assert!(
-            !names("intbounds:rewrite:virtualize:string:pure:earlyforce")
-                .iter()
-                .any(|name| *name == "heap"),
+            !names("intbounds:rewrite:virtualize:string:pure:earlyforce").contains(&"heap"),
             "a chain built without heap has no heap pass",
         );
     }

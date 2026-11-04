@@ -80,16 +80,16 @@ fn scalar_acc_loop(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
         // keep `convert_and_run_from_pyjitpl` in the portal until it hits
         // the arm `inline_call`.
         for _ in 0..16 {
-            state.pad = state.pad + 1i64;
+            state.pad += 1i64;
         }
         let opcode = program[pc];
         match opcode {
             OP_ADD => {
-                state.acc = state.acc + ADD_BY;
+                state.acc += ADD_BY;
                 pc += 1;
             }
             OP_LOOP => {
-                state.ticks = state.ticks - 1i64;
+                state.ticks -= 1i64;
                 if state.ticks != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;

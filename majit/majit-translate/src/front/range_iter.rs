@@ -579,15 +579,12 @@ fn fix_iterator_phi_links(
     }
     for (bi, ei, pos) in fix {
         let src = crate::model::BlockId(bi);
-        let keep = match graph.blocks[bi].exits[ei].args.get(pos) {
+        let keep = matches!(
+            graph.blocks[bi].exits[ei].args.get(pos),
             Some(LinkArg::Value(v))
                 if graph.variable_defined_in_block(src, v)
-                    && iterator_alias_of(flow, v, iter_var, iter_phi) =>
-            {
-                true
-            }
-            _ => false,
-        };
+                    && iterator_alias_of(flow, v, iter_var, iter_phi)
+        );
         if keep {
             continue;
         }
@@ -1162,7 +1159,7 @@ mod tests {
             "/../../target/llbc/pyre-object.ullbc"
         );
         let llbc = crate::test_support::load_ullbc(path);
-        let graph = lower_function(&llbc, "kind_of_canonical_exc_class")
+        let graph = lower_function(llbc, "kind_of_canonical_exc_class")
             .expect("lower kind_of_canonical_exc_class");
         assert_kind_of_canonical_diverts(&graph);
 

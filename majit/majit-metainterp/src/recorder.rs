@@ -1061,10 +1061,10 @@ impl Trace {
     fn hold_const_indexes(&mut self, refs: &[OpRef]) -> usize {
         let base = self.live_const_indexes.len();
         for r in refs {
-            if let Some(index) = r.const_ptr_index() {
-                if index != 0 {
-                    self.live_const_indexes.push(index);
-                }
+            if let Some(index) = r.const_ptr_index()
+                && index != 0
+            {
+                self.live_const_indexes.push(index);
             }
         }
         base

@@ -1625,9 +1625,7 @@ impl<'a> Lowering<'a> {
                 };
                 let mut arms = Vec::with_capacity(variants.len());
                 for (vidx, variant) in variants.iter().enumerate() {
-                    let Some(discr_value) = variant.discriminant_i64() else {
-                        return None;
-                    };
+                    let discr_value = variant.discriminant_i64()?;
                     let variant_owner = format!("{leaf}::{}", variant.name);
                     let variant_id = majit_ir::descr::StructId::from_canonical(&format!(
                         "{canon}::{}",
@@ -1635,12 +1633,8 @@ impl<'a> Lowering<'a> {
                     ));
                     let mut candidates: Vec<MoveSpan> = Vec::new();
                     for (i, field) in variant.fields.iter().enumerate() {
-                        let Some(offset) = layout.field_offset(vidx, i) else {
-                            return None;
-                        };
-                        let Some((_, itemsize, _)) = self.span_raw_for_ty(&field.ty) else {
-                            return None;
-                        };
+                        let offset = layout.field_offset(vidx, i)?;
+                        let (_, itemsize, _) = self.span_raw_for_ty(&field.ty)?;
                         if itemsize == 0 {
                             continue;
                         }
@@ -3150,10 +3144,10 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         ptr: Variable,
     ) -> Variable {
-        if self.is_fat_box_var(&ptr) {
-            if let Ok((data, _)) = self.split_window_value(mir_bb, ptr.clone()) {
-                return data;
-            }
+        if self.is_fat_box_var(&ptr)
+            && let Ok((data, _)) = self.split_window_value(mir_bb, ptr.clone())
+        {
+            return data;
         }
         if ptr.concretetype().as_ref().is_some_and(lltype_is_ccharp) {
             return ptr;
@@ -3226,9 +3220,10 @@ impl<'a> Lowering<'a> {
                 LocalValue::Pair(ptr, len, _) if ptr == var => return Some(len.clone()),
                 LocalValue::One(ptr) if ptr == var => {
                     let shadow = self.len_shadow.get(local).copied().flatten()?;
-                    match self.local_var.get(shadow).and_then(|slot| slot.as_ref()) {
-                        Some(LocalValue::One(len)) => return Some(len.clone()),
-                        _ => {}
+                    if let Some(LocalValue::One(len)) =
+                        self.local_var.get(shadow).and_then(|slot| slot.as_ref())
+                    {
+                        return Some(len.clone());
                     }
                 }
                 _ => {}
@@ -3467,10 +3462,8 @@ impl<'a> Lowering<'a> {
                     if (v.get("Field").is_some() || v.get("Downcast").is_some())
                         && tyref_is_u8_window(&inner.ty, self.llbc)
             );
-        if window_place {
-            if let Some((ptr, len)) = self.pair_place_parts(mir_bb, place)? {
-                return Ok(Some((self.ensure_window_ccharp(mir_bb, ptr), len)));
-            }
+        if window_place && let Some((ptr, len)) = self.pair_place_parts(mir_bb, place)? {
+            return Ok(Some((self.ensure_window_ccharp(mir_bb, ptr), len)));
         }
         if self.operand_is_string_byte_view(op) || self.operand_is_list_view(op) {
             return Ok(None);
@@ -3857,22 +3850,20 @@ impl<'a> Lowering<'a> {
                 | "core::array::<Impl>::index"
                 | "core::array::<Impl>::index_mut"
         ) && args.len() == 2
-        {
-            if let Some(len) = pair_lens
+            && let Some(len) = pair_lens
                 .iter()
                 .find(|(index, _)| *index == 0)
                 .map(|(_, len)| len.clone())
                 .or_else(|| self.window_len_companion(&args[0]))
-            {
-                return self.window_subslice(
-                    mir_bb,
-                    args[0].clone(),
-                    len,
-                    &args[1],
-                    arg_is_range_full,
-                    true,
-                );
-            }
+        {
+            return self.window_subslice(
+                mir_bb,
+                args[0].clone(),
+                len,
+                &args[1],
+                arg_is_range_full,
+                true,
+            );
         }
         if let Some((0, len)) = pair_lens.first().cloned()
             && self.is_window_view_identity(reg)
@@ -4486,10 +4477,6 @@ impl<'a> Lowering<'a> {
     /// plus `allow_surrogates`. A one-word STR owner is split the same way
     /// other `&[u8]` callees are. Dest `&Wtf8` is `rstr.STR`; the Ok arm
     /// is that header (`charpsize2str` of the window, or the STR itself).
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Mirrors the other try_lower_* call intercepts"
-    )]
     pub(in crate::front::mir) fn try_lower_wtf8_from_bytes_checked(
         &mut self,
         mir_bb: usize,
@@ -4624,10 +4611,6 @@ impl<'a> Lowering<'a> {
     /// `String::from_utf8_lossy` → `decode_utf8_with_errors(bytes, "replace")`
     /// then Ok payload as a plain string (`unicodehelper.py str_decode_utf8`
     /// replace / U+FFFD). Dest is not a Cow ADT.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Mirrors the other try_lower_* call intercepts"
-    )]
     pub(in crate::front::mir) fn try_lower_from_utf8_lossy(
         &mut self,
         mir_bb: usize,

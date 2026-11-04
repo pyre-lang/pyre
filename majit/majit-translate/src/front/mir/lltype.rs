@@ -494,9 +494,7 @@ pub(in crate::front::mir) fn trait_impl_match_for_receiver(
         if found.is_some() {
             return None;
         }
-        let Some(impl_generics) = reconstructed_impl_generics(&subst, &const_subst, row) else {
-            return None;
-        };
+        let impl_generics = reconstructed_impl_generics(&subst, &const_subst, row)?;
         found = Some((impl_id, fn_id, impl_generics));
     }
     found
@@ -829,9 +827,7 @@ pub(in crate::front::mir) fn tyref_nested_ref_to_scalar_value_type(
     let mut refs = 0u8;
     loop {
         let obj = node.as_object()?;
-        let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array) else {
-            return None;
-        };
+        let arr = obj.get("Ref").and_then(serde_json::Value::as_array)?;
         node = strip_ty_indirections(arr.get(1)?, llbc)?;
         refs = refs.saturating_add(1);
         if refs > 24 {
@@ -3088,10 +3084,10 @@ pub(in crate::front::mir) fn const_eq_u8_in_unstructured(
             else {
                 continue;
             };
-            if binop_label(&op).ok()?.as_str() != "eq" {
+            if binop_label(op).ok()?.as_str() != "eq" {
                 continue;
             }
-            let Some(byte) = operand_const_u8(llbc, &lhs).or_else(|| operand_const_u8(llbc, &rhs))
+            let Some(byte) = operand_const_u8(llbc, lhs).or_else(|| operand_const_u8(llbc, rhs))
             else {
                 continue;
             };
@@ -3729,17 +3725,13 @@ pub(in crate::front::mir) fn option_nonzero_word_kind_inner(
     {
         return None;
     }
-    let Some(mut option) = tyref_node(ty, llbc) else {
-        return None;
-    };
+    let mut option = tyref_node(ty, llbc)?;
     // One shared borrow models the pointee (`&Option<NonZero<_>>` in
     // `map_or`). A raw pointer is the address, and a second borrow is not
     // that receiver.
     let mut peeled_ref = false;
     for _ in 0..24 {
-        let Some(obj) = option.as_object() else {
-            return None;
-        };
+        let obj = option.as_object()?;
         if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
             option = llbc.dedup_body(id)?;
             continue;
@@ -5341,10 +5333,10 @@ pub(in crate::front::mir) fn type_decl_by_owner_root<'l>(
 ) -> Option<&'l TypeDecl> {
     let index = struct_decls_by_owner(llbc);
     let start = index.exact.partition_point(|(k, _)| k.as_str() < owner);
-    if let Some((key, pos)) = index.exact.get(start) {
-        if key == owner {
-            return llbc.type_by_id(*pos as u64);
-        }
+    if let Some((key, pos)) = index.exact.get(start)
+        && key == owner
+    {
+        return llbc.type_by_id(*pos as u64);
     }
     let owner_leaf = owner.rsplit("::").next().unwrap_or(owner);
     let start = index.leaf.partition_point(|(k, _)| k.as_str() < owner_leaf);
@@ -6320,9 +6312,7 @@ pub(in crate::front::mir) fn transparent_deref_target_class(
         // arguments, via the nominal leaf) does not apply. The nominal
         // root keeps a handle `Target` from re-entering this function
         // through [`adt_node_class_root_with`].
-        let Some(root) = nominal_adt_class_root(target_ty, llbc, tombstoned) else {
-            return None;
-        };
+        let root = nominal_adt_class_root(target_ty, llbc, tombstoned)?;
         match &class {
             None => class = Some(root),
             Some(previous) if previous != &root => return None,
@@ -6608,7 +6598,7 @@ pub(crate) fn type_decl_ref_generics<'a>(
     llbc: &'a Llbc,
 ) -> Option<&'a serde_json::Value> {
     let own = tref.get("generics");
-    let own_has_args = own.is_some_and(|generics| generic_args_are_nonempty(generics));
+    let own_has_args = own.is_some_and(generic_args_are_nonempty);
     if own_has_args {
         return own;
     }
@@ -7496,7 +7486,7 @@ pub(in crate::front::mir) fn tyref_is_option_of_string_value(ty: &TyRef, llbc: &
 /// Class root of a pointer-niche `Option<&RawStruct>` whose pointee is a
 /// storage-raw struct (`payload_storage_raw_pointee_is_struct` /
 /// `raw_struct_ptr_lltype`: `declared_raw_adt_node` + `TypeDeclKind::Struct`
-/// + a known layout). `Input.class_root` of that Option seeds `SomePtr`
+/// plus a known layout). `Input.class_root` of that Option seeds `SomePtr`
 /// (`raw_struct_ptr_annotation`). A generic TypeDecl without a layout,
 /// an Enum pointee, a flavor-raw class, a GC struct, or a guard is `None`.
 pub(in crate::front::mir) fn niche_option_storage_raw_struct_root(

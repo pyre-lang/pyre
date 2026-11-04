@@ -1804,7 +1804,7 @@ impl LLFrame {
         let Some(opdesc) = ll_operations().get(opname) else {
             return Ok(());
         };
-        if opdesc.canraise.iter().any(|&name| name == "Exception") {
+        if opdesc.canraise.contains(&"Exception") {
             return Ok(());
         }
         let exc = find_exception(etype)?;
@@ -1819,10 +1819,10 @@ impl LLFrame {
                 Some(Hlvalue::Constant(c)) => host_class_object(&c.value),
                 _ => None,
             };
-            if let Some(canraise_cls) = canraise_cls {
-                if self.fn_exception_match(&exc, canraise_cls) {
-                    return Ok(());
-                }
+            if let Some(canraise_cls) = canraise_cls
+                && self.fn_exception_match(&exc, canraise_cls)
+            {
+                return Ok(());
             }
         }
         Err(TaskError {

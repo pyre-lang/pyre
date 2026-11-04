@@ -2657,10 +2657,10 @@ fn export_single_operand(
     // Packed `Operand` constants intern by value (`OpRef::ConstInt`,
     // `const_operands`); `history.py ConstInt` does not, so a constant is a
     // fresh `self.info` key per `create_state` call.
-    if !box_.is_constant() {
-        if let Some(cached) = cache.finished.get(&box_) {
-            return Rc::clone(cached);
-        }
+    if !box_.is_constant()
+        && let Some(cached) = cache.finished.get(&box_)
+    {
+        return Rc::clone(cached);
     }
     // Cycle: this opref is currently being exported on the parent stack.
     // Return a fresh Unknown leaf so the back-edge is visibly non-virtual

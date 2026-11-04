@@ -113,10 +113,10 @@ fn dispatch_bare(program: &Bytecode, threshold: u32, ticks: i64, sel: i64) -> i6
         pc += 1;
         match opcode {
             OP_WORK => {
-                state.acc = state.acc + WORK;
+                state.acc += WORK;
             }
             OP_TICK => {
-                state.ticks = state.ticks - 1i64;
+                state.ticks -= 1i64;
                 if state.ticks != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;
@@ -165,10 +165,10 @@ fn dispatch_setup_before(program: &Bytecode, threshold: u32, ticks: i64, sel: i6
         pc += 1;
         match opcode {
             OP_WORK => {
-                state.acc = state.acc + WORK;
+                state.acc += WORK;
             }
             OP_TICK => {
-                state.ticks = state.ticks - 1i64;
+                state.ticks -= 1i64;
                 if state.ticks != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;
@@ -218,10 +218,10 @@ fn dispatch_setup_in_loop(program: &Bytecode, threshold: u32, ticks: i64, sel: i
         pc += 1;
         match opcode {
             OP_WORK => {
-                state.acc = state.acc + WORK;
+                state.acc += WORK;
             }
             OP_TICK => {
-                state.ticks = state.ticks - 1i64;
+                state.ticks -= 1i64;
                 if state.ticks != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;
@@ -263,10 +263,10 @@ fn dispatch_setup_after(program: &Bytecode, threshold: u32, ticks: i64, sel: i64
         pc += 1;
         match opcode {
             OP_WORK => {
-                state.acc = state.acc + WORK;
+                state.acc += WORK;
             }
             OP_TICK => {
-                state.ticks = state.ticks - 1i64;
+                state.ticks -= 1i64;
                 if state.ticks != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;
@@ -306,7 +306,7 @@ fn check(name: &'static str, cold: i64, warm: i64, rec: &Recorder) {
     );
     let body = rec.compiled_loop();
     assert!(
-        body.iter().any(|op| *op == OpCode::IntAdd),
+        body.contains(&OpCode::IntAdd),
         "{name}: the compiled loop carries no arithmetic, so it runs none of \
          the interpreter: {body:#?}",
     );

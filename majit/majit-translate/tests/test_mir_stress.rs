@@ -437,19 +437,18 @@ fn arm_classifier(llbc: &Llbc) -> String {
             }
             let mut bound: Option<u64> = None;
             for st in &blk.statements {
-                if let Ok(StmtKind::Assign(place, _)) = st.stmt_kind() {
-                    if let PlaceKind::Local(i) = &place.kind {
-                        bound = Some(*i);
-                        break;
-                    }
+                if let Ok(StmtKind::Assign(place, _)) = st.stmt_kind()
+                    && let PlaceKind::Local(i) = &place.kind
+                {
+                    bound = Some(*i);
+                    break;
                 }
             }
-            if bound.is_none() {
-                if let Ok(TermKind::Call { call, .. }) = blk.term(llbc) {
-                    if let PlaceKind::Local(i) = &call.dest.kind {
-                        bound = Some(*i);
-                    }
-                }
+            if bound.is_none()
+                && let Ok(TermKind::Call { call, .. }) = blk.term(llbc)
+                && let PlaceKind::Local(i) = &call.dest.kind
+            {
+                bound = Some(*i);
             }
             let Some(n) = bound else { continue };
             for r in 0..blocks.len() {

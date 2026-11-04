@@ -128,7 +128,7 @@ fn the_runner_mirror_matches_mc_diag_labels() {
         runner.len(),
     );
 
-    let divergent = divergences(&majit, &runner);
+    let divergent = divergences(majit, &runner);
     assert!(
         divergent.is_empty(),
         "the pyre-wasm-runner mc_diag mirror no longer matches \
@@ -189,7 +189,7 @@ fn a_perturbed_mirror_is_detected() {
         "a rename must not change the count — otherwise this control proves \
          the length check, not the comparison",
     );
-    let caught = divergences(&majit, &perturbed);
+    let caught = divergences(majit, &perturbed);
     assert_eq!(
         caught.len(),
         1,
@@ -230,7 +230,7 @@ fn a_perturbed_mirror_is_detected() {
         "removing one label did not shorten the extracted mirror by one",
     );
     assert!(
-        divergences(&majit, &shortened).is_empty(),
+        divergences(majit, &shortened).is_empty(),
         "a trailing deletion is invisible to the element-wise comparison by \
          construction — if this fires, `divergences` is no longer bounded by \
          the shorter side and shape 2 is being caught for the wrong reason",

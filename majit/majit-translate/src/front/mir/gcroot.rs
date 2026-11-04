@@ -3233,7 +3233,7 @@ pub(in crate::front::mir) fn classify_root_slot_getter_body(
                     if dest <= 2 || defs.insert(dest, value.clone()).is_some() {
                         return None;
                     }
-                    if !root_slot_rvalue_is_traceable(&value) {
+                    if !root_slot_rvalue_is_traceable(value) {
                         return None;
                     }
                 }
@@ -3671,9 +3671,7 @@ pub(in crate::front::mir) fn peel_captured_index(
     index: &RootGetterIndex<'_>,
     capture: &Operand,
 ) -> Option<(usize, usize, Vec<usize>)> {
-    let Some(mut local) = operand_local(Some(capture)) else {
-        return None;
-    };
+    let mut local = operand_local(Some(capture))?;
     let mut carriers = Vec::new();
     for _ in 0..4 {
         if let Some(scope) = root_index_scope(index, local) {
@@ -5760,15 +5758,12 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
                                             entry.extend(values.iter().map(|v| (bb_idx, *v)));
                                             true
                                         }
-                                        _ => match slice_runs.get(&bb_idx) {
+                                        _ => matches!(
+                                            slice_runs.get(&bb_idx),
                                             Some((run_scope, _, _))
                                                 if run_scope == scope
-                                                    && bases.get(&dest) == Some(scope) =>
-                                            {
-                                                true
-                                            }
-                                            _ => false,
-                                        },
+                                                    && bases.get(&dest) == Some(scope)
+                                        ),
                                     }
                                 }
                                 ("get", Some(_)) if call.args.len() == 2 => {
@@ -7295,7 +7290,7 @@ pub(in crate::front::mir) fn elaborate_explicit_root_closes(
                 match bb.term_ref(llbc) {
                     Ok(TermKind::Drop { place, fn_ptr, .. })
                         if matches!(place.kind, PlaceKind::Local(l) if l as usize == guard || temps.contains(l as usize))
-                            && name_of(&fn_ptr)
+                            && name_of(fn_ptr)
                                 .as_deref()
                                 .is_some_and(gc_root_scope_drop_glue_path) =>
                     {

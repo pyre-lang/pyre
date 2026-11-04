@@ -1616,10 +1616,7 @@ fn real_main() {
             .collect();
         assert_eq!(call_descrs.len(), serialized_effect_info_ids.len());
         let mut frozen_effect_infos = std::collections::BTreeMap::new();
-        for (calldescr, effect_info_id) in call_descrs
-            .into_iter()
-            .zip(serialized_effect_info_ids.into_iter())
-        {
+        for (calldescr, effect_info_id) in call_descrs.into_iter().zip(serialized_effect_info_ids) {
             calldescr.translated_effect_info_id = Some(effect_info_id);
             frozen_effect_infos
                 .entry(effect_info_id)
@@ -1909,19 +1906,18 @@ fn real_main() {
                             canonical_layouts.push(parent.clone());
                             canonical_layouts.len() - 1
                         });
-                    if !canonical_layouts[index].same_descr_layout(parent) {
-                        if !conflicting_layouts
+                    if !canonical_layouts[index].same_descr_layout(parent)
+                        && !conflicting_layouts
                             .iter()
                             .any(|(type_id, _)| *type_id == parent.type_id)
-                        {
-                            conflicting_layouts.push((
-                                parent.type_id,
-                                format!(
-                                    "type_id={:#x}\n  first={:?}\n  later={:?}",
-                                    parent.type_id, canonical_layouts[index], parent,
-                                ),
-                            ));
-                        }
+                    {
+                        conflicting_layouts.push((
+                            parent.type_id,
+                            format!(
+                                "type_id={:#x}\n  first={:?}\n  later={:?}",
+                                parent.type_id, canonical_layouts[index], parent,
+                            ),
+                        ));
                     }
                     Some(u32::try_from(index).expect("too many canonical descriptor layouts"))
                 }
@@ -2473,10 +2469,10 @@ fn llbc_layout_sidecars() -> Vec<String> {
 /// Deliberately absent from `codegen_cache_key`: keying on where the cache
 /// lives would give each worktree its own key again and defeat the point.
 fn codegen_cache_shared_base(repo_root: &str) -> Option<std::path::PathBuf> {
-    if let Some(dir) = std::env::var_os(CODEGEN_CACHE_DIR_ENV) {
-        if !dir.is_empty() {
-            return Some(std::path::PathBuf::from(dir));
-        }
+    if let Some(dir) = std::env::var_os(CODEGEN_CACHE_DIR_ENV)
+        && !dir.is_empty()
+    {
+        return Some(std::path::PathBuf::from(dir));
     }
     if std::env::var_os("CI").is_some_and(|v| !v.is_empty()) {
         return None;

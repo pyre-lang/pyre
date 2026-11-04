@@ -122,8 +122,7 @@ pub struct PyreFieldDescr {
 }
 
 /// Structural key for `ARRAY_DESCR_REGISTRY`. Combination of all fields
-/// that PyPy treats as part of `ArrayDescr` identity (`descr.py
-/// + lendescr`). Two array descrs sharing this tuple share the same
+/// that PyPy treats as part of `ArrayDescr` identity (`descr.py + lendescr`). Two array descrs sharing this tuple share the same
 /// `descr_id`.
 ///
 /// `array_type_id` carries the codewriter lltype-identity proxy
@@ -16835,7 +16834,7 @@ fn field_descr_from_unlisted_interior_spec(
         field.is_immutable,
         field.field_flag,
         field.name.clone(),
-        field.field_key().to_string(),
+        field.field_key(),
     )
     .with_quasi_immutable(field.is_quasi_immutable)
     .with_index_in_parent(field.index_in_parent);

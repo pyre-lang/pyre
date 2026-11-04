@@ -96,11 +96,11 @@ fn mixed_cells_sum(
         can_enter_jit!(driver, 0usize, &mut state, program, || {});
         jit_merge_point!(driver, program, pc; state);
         let i = state.i as usize;
-        state.acc_i = state.acc_i + state.ints[i];
-        state.acc_f = state.acc_f + state.floats[i];
+        state.acc_i += state.ints[i];
+        state.acc_f += state.floats[i];
         let next = state.i + 1i64;
         state.i = if next < state.len { next } else { 0i64 };
-        state.n = state.n - 1i64;
+        state.n -= 1i64;
     }
     LAST_ACC_I.store(state.acc_i, Ordering::SeqCst);
     LAST_ACC_F_BITS.store(state.acc_f.to_bits(), Ordering::SeqCst);

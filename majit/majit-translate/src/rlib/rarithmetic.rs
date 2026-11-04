@@ -448,10 +448,9 @@ fn try_compute_restype(self_type: KnownType, other_type: KnownType) -> Option<Kn
     if let (Some((s1, b1)), Some((s2, b2))) = (
         integer_signed_and_bits(self_type),
         integer_signed_and_bits(other_type),
-    ) {
-        if s1 == s2 {
-            return build_int(None, s1, b1.max(b2), false).ok();
-        }
+    ) && s1 == s2
+    {
+        return build_int(None, s1, b1.max(b2), false).ok();
     }
     None
 }
@@ -492,13 +491,12 @@ pub fn compute_restype(self_type: KnownType, other_type: KnownType) -> KnownType
     if let (Some((s1, b1)), Some((s2, b2))) = (
         integer_signed_and_bits(self_type),
         integer_signed_and_bits(other_type),
-    ) {
-        if s1 == s2 {
-            panic!(
-                "{}",
-                build_int(None, s1, b1.max(b2), false).expect_err("merge failed")
-            );
-        }
+    ) && s1 == s2
+    {
+        panic!(
+            "{}",
+            build_int(None, s1, b1.max(b2), false).expect_err("merge failed")
+        );
     }
     panic!(
         "compute_restype: unsupported merge of {:?} and {:?}",
@@ -572,10 +570,10 @@ fn mask_u128(bits: u16) -> u128 {
 pub fn _widen(self_type: KnownType, other_type: KnownType, value: RIntValue) -> Option<ConstValue> {
     let key = (self_type, other_type);
     let typemap = typemap_for(self_type);
-    if let Some(typemap) = typemap {
-        if let Some(&restype) = typemap.lock().get(&key) {
-            return construct_int_type(restype, value);
-        }
+    if let Some(typemap) = typemap
+        && let Some(&restype) = typemap.lock().get(&key)
+    {
+        return construct_int_type(restype, value);
     }
     let restype = try_compute_restype(self_type, other_type)?;
     if let Some(typemap) = typemap {

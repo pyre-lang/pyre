@@ -46,8 +46,8 @@ fn mixed_over_reserve_count(program: &Bytecode, threshold: u32, n: i64) -> i64 {
     while state.iregs[0] < state.iregs[1] {
         can_enter_jit!(driver, 0usize, &mut state, program, || {});
         jit_merge_point!(driver, program, pc; state);
-        state.acc = state.acc + state.cells[0];
-        state.iregs[0] = state.iregs[0] + 1i64;
+        state.acc += state.cells[0];
+        state.iregs[0] += 1i64;
     }
     state.acc
 }

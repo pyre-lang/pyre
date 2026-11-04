@@ -4966,8 +4966,7 @@ mod tests {
         );
     }
 
-    /// Phase B4 + S smoke test: `_encode_descr` returns `global_index
-    /// + 1` for descrs inside the captured global range and appends the
+    /// Phase B4 + S smoke test: `_encode_descr` returns `global_index + 1` for descrs inside the captured global range and appends the
     /// rest to `_descrs` (opencoder.py `_encode_descr`).
     #[test]
     fn test_encode_descr_reads_metainterp_sd() {

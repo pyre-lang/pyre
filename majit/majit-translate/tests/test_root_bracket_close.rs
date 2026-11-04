@@ -176,7 +176,7 @@ fn bracket_closes_when_the_drop_is_not_adjacent_to_the_binding() {
                 continue;
             }
             bodies += 1;
-            let Ok(graph) = lower_fun_decl_with_root_stack(&context, fd, &root_stack_state) else {
+            let Ok(graph) = lower_fun_decl_with_root_stack(context, fd, &root_stack_state) else {
                 continue;
             };
             assert!(
@@ -243,7 +243,7 @@ fn only_a_moved_out_or_erased_guard_keeps_its_bracket_open() {
                 continue;
             }
             dropping += 1;
-            let Ok(graph) = lower_fun_decl_with_root_stack(&context, fd, &root_stack_state) else {
+            let Ok(graph) = lower_fun_decl_with_root_stack(context, fd, &root_stack_state) else {
                 continue;
             };
             if calls_to(&graph, "root_scope_close") > 0 {

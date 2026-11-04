@@ -65,10 +65,10 @@ fn dispatch_kind_resume(program: &Bytecode, threshold: u32, n: i64) -> bool {
         pc += 1;
         match opcode {
             OP_ADD => {
-                state.acc = state.acc + state.cnt;
+                state.acc += state.cnt;
             }
             OP_DEC => {
-                state.cnt = state.cnt - 1;
+                state.cnt -= 1;
             }
             OP_BACK => {
                 let target = program[pc] as usize;
@@ -213,10 +213,10 @@ fn dispatch_interleaved(program: &Bytecode, threshold: u32, n: i64) -> bool {
         pc += 1;
         match opcode {
             OP_ADD => {
-                state.acc = state.acc + state.cnt;
+                state.acc += state.cnt;
             }
             OP_DEC => {
-                state.cnt = state.cnt - 1;
+                state.cnt -= 1;
             }
             OP_BACK => {
                 let target = program[pc] as usize;
@@ -339,10 +339,10 @@ fn dispatch_abort_after_set(program: &Bytecode, threshold: u32, n: i64) -> bool 
         pc += 1;
         match opcode {
             OP_ADD => {
-                state.acc = state.acc + state.cnt;
+                state.acc += state.cnt;
             }
             OP_DEC => {
-                state.cnt = state.cnt - 1;
+                state.cnt -= 1;
             }
             OP_BACK => {
                 let target = program[pc] as usize;
@@ -600,10 +600,10 @@ fn dispatch_pc_only_virt(program: &Bytecode, threshold: u32, n: i64) -> i64 {
         pc += 1;
         match opcode {
             OP_ADD => {
-                state.regs[0] = state.regs[0] + state.regs[1];
+                state.regs[0] += state.regs[1];
             }
             OP_DEC => {
-                state.regs[1] = state.regs[1] - 1;
+                state.regs[1] -= 1;
             }
             OP_BACK => {
                 let target = program[pc] as usize;
@@ -752,7 +752,7 @@ fn dispatch_abort_after_residual(
         match opcode {
             OP_ADD => {
                 let value = state.counter;
-                state.sp = state.sp + 1;
+                state.sp += 1;
                 if state.sp > ABORT_AFTER_RESIDUAL_CAP {
                     abort_after_residual_push(state.chain, state.top);
                     abort_after_residual_abort(state.chain);
@@ -760,7 +760,7 @@ fn dispatch_abort_after_residual(
                 state.top = value;
             }
             OP_DEC => {
-                state.counter = state.counter - 1;
+                state.counter -= 1;
                 if state.counter != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;

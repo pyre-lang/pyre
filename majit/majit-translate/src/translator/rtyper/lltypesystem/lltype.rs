@@ -6062,16 +6062,15 @@ pub fn _cast_whatever_from(
             };
             return Ok(ConstValue::LLAddress(super::llmemory::cast_ptr_to_adr(ptr)));
         }
-    } else if *tgt == LowLevelType::Signed {
-        if let LowLevelType::Ptr(orig_ptr) = orig
-            && orig_ptr.TO._gckind() == GcKind::Raw
-        {
-            let ConstValue::LLPtr(ptr) = value else {
-                return Err(dont_know_how_to_cast(orig, tgt));
-            };
-            let adr = super::llmemory::cast_ptr_to_adr(ptr);
-            return super::llmemory::cast_adr_to_int_value(&adr, Some("symbolic"));
-        }
+    } else if *tgt == LowLevelType::Signed
+        && let LowLevelType::Ptr(orig_ptr) = orig
+        && orig_ptr.TO._gckind() == GcKind::Raw
+    {
+        let ConstValue::LLPtr(ptr) = value else {
+            return Err(dont_know_how_to_cast(orig, tgt));
+        };
+        let adr = super::llmemory::cast_ptr_to_adr(ptr);
+        return super::llmemory::cast_adr_to_int_value(&adr, Some("symbolic"));
     }
     Err(dont_know_how_to_cast(orig, tgt))
 }

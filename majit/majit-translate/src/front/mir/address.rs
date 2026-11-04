@@ -1004,7 +1004,7 @@ impl<'a> Lowering<'a> {
                     continue;
                 }
                 saw = true;
-                if self.rvalue_hides_spill_alias(&rvalue, &ty, groups, depth + 1) {
+                if self.rvalue_hides_spill_alias(rvalue, &ty, groups, depth + 1) {
                     return true;
                 }
             }
@@ -1062,11 +1062,11 @@ impl<'a> Lowering<'a> {
                 if !matches!(dest.kind, PlaceKind::Projection(..)) {
                     continue;
                 }
-                if place_root_local(&dest) != Some(local) {
+                if place_root_local(dest) != Some(local) {
                     continue;
                 }
                 let field_ty = clone_tyref(&dest.ty);
-                if self.rvalue_hides_spill_alias(&rvalue, &field_ty, groups, depth) {
+                if self.rvalue_hides_spill_alias(rvalue, &field_ty, groups, depth) {
                     return true;
                 }
             }
@@ -1235,7 +1235,7 @@ impl<'a> Lowering<'a> {
                 saw = true;
                 found = merge_address_source(
                     found,
-                    self.rvalue_address_source(&rvalue, depth + 1, Some(&dest.ty)),
+                    self.rvalue_address_source(rvalue, depth + 1, Some(&dest.ty)),
                 );
                 if matches!(found, Some(SpillAddressSource::Unknown)) {
                     return SpillAddressSource::Unknown;
@@ -1303,17 +1303,17 @@ impl<'a> Lowering<'a> {
                     }
                     found = merge_address_source(
                         found,
-                        self.rvalue_field_source(&rvalue, path, depth + 1, Some(&dest.ty)),
+                        self.rvalue_field_source(rvalue, path, depth + 1, Some(&dest.ty)),
                     );
                     if matches!(found, Some(SpillAddressSource::Unknown)) {
                         return SpillAddressSource::Unknown;
                     }
                     continue;
                 }
-                if place_root_local(&dest) != Some(root) {
+                if place_root_local(dest) != Some(root) {
                     continue;
                 }
-                let Some((stored_root, stored_path)) = constant_field_path(&dest, self.llbc) else {
+                let Some((stored_root, stored_path)) = constant_field_path(dest, self.llbc) else {
                     return SpillAddressSource::Unknown;
                 };
                 if stored_root as usize != root {
@@ -1321,10 +1321,10 @@ impl<'a> Lowering<'a> {
                 }
                 let stored_path = stored_path.as_slice();
                 let next = if stored_path == path {
-                    self.rvalue_address_source(&rvalue, depth + 1, Some(&dest.ty))
+                    self.rvalue_address_source(rvalue, depth + 1, Some(&dest.ty))
                 } else if path.starts_with(stored_path) {
                     self.rvalue_field_source(
-                        &rvalue,
+                        rvalue,
                         &path[stored_path.len()..],
                         depth + 1,
                         Some(&dest.ty),
@@ -1487,7 +1487,7 @@ impl<'a> Lowering<'a> {
                 if index as usize != local {
                     continue;
                 }
-                let place = self.rvalue_pointer_place(&rvalue, depth, Some(&dest.ty))?;
+                let place = self.rvalue_pointer_place(rvalue, depth, Some(&dest.ty))?;
                 if found.is_some() {
                     return None;
                 }
@@ -1649,7 +1649,7 @@ impl<'a> Lowering<'a> {
                 if index as usize != local {
                     continue;
                 }
-                let Some(place) = borrowed_place_referent(&rvalue) else {
+                let Some(place) = borrowed_place_referent(rvalue) else {
                     continue;
                 };
                 if found.is_some() {
@@ -2263,13 +2263,13 @@ pub(in crate::front::mir) fn unstructured_address_escape(
             for stmt in &block.statements {
                 match stmt.stmt_kind_ref() {
                     Ok(StmtKind::Assign(place, rvalue)) => {
-                        let value = rvalue_address(&rvalue, &depths, llbc);
+                        let value = rvalue_address(rvalue, &depths, llbc);
                         record_stored_address(
                             llbc,
                             &mut depths,
-                            &place,
+                            place,
                             value,
-                            Some(&rvalue),
+                            Some(rvalue),
                             &mut projections,
                             &mut escapes,
                         );
@@ -2297,7 +2297,7 @@ pub(in crate::front::mir) fn unstructured_address_escape(
                     target,
                     on_unwind,
                 }) => {
-                    let escape = call_address_escape(llbc, &call, &depths, stack);
+                    let escape = call_address_escape(llbc, call, &depths, stack);
                     if escape.escapes {
                         escapes = true;
                     }
@@ -2367,14 +2367,14 @@ pub(in crate::front::mir) fn unstructured_address_escape(
                     target,
                     on_unwind,
                 }) => {
-                    let value = dropped_address(&place, &depths, llbc);
+                    let value = dropped_address(place, &depths, llbc);
                     if value.overflows {
                         escapes = true;
                     }
                     if value.bits != 0 || value.condition > 0 {
                         let escape = drop_address_escape(
                             llbc,
-                            &fn_ptr,
+                            fn_ptr,
                             value.bits,
                             value.condition,
                             value.invariant,
@@ -2402,7 +2402,7 @@ pub(in crate::front::mir) fn unstructured_address_escape(
                     );
                 }
                 Ok(TermKind::Switch { discr, targets }) => {
-                    let value = operand_address(&discr, &depths, llbc);
+                    let value = operand_address(discr, &depths, llbc);
                     if control_depends_on_address(&value) {
                         escapes = true;
                     }

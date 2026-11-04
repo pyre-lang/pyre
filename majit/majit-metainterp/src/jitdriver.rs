@@ -3394,8 +3394,7 @@ impl<S: JitState> JitDriver<S> {
     /// source-pc handoff resumes at a pc dispatch advanced before those
     /// opcodes' arms, so answering `None` there runs them a second time —
     /// the very double-application this conversion exists to prevent. Every
-    /// post-chain path therefore returns `Some`, using the `single_pass_finish`
-    /// + `usize::MAX` "no forward pc" outcome when it has no merge point to
+    /// post-chain path therefore returns `Some`, using the `single_pass_finish` + `usize::MAX` "no forward pc" outcome when it has no merge point to
     ///   resume at. Upstream has no such split:
     /// `blackhole.convert_and_run_from_pyjitpl` never returns to its caller.
     ///
@@ -4131,14 +4130,14 @@ impl<S: JitState> JitDriver<S> {
                 }
             );
         }
-        if matches!(outcome, crate::CompileOutcome::Compiled { .. }) {
-            if let Some(k) = self.meta.last_compiled_key() {
-                // Stash the just-compiled loop's key so the merge-point hook
-                // can arm the CRN/lazy back-edge label entry with the
-                // walk-final state instead of replaying the walked peeled
-                // preamble (cross-loop-cut: this is cut_inner_green_key).
-                self.meta.single_pass_compiled_key = Some(k);
-            }
+        if matches!(outcome, crate::CompileOutcome::Compiled { .. })
+            && let Some(k) = self.meta.last_compiled_key()
+        {
+            // Stash the just-compiled loop's key so the merge-point hook
+            // can arm the CRN/lazy back-edge label entry with the
+            // walk-final state instead of replaying the walked peeled
+            // preamble (cross-loop-cut: this is cut_inner_green_key).
+            self.meta.single_pass_compiled_key = Some(k);
         }
         outcome
     }
@@ -7106,10 +7105,10 @@ impl<S: JitState> JitDriver<S> {
             // The cached descriptor's `Arc` stays on the driver. Cloning it
             // on every entry bumped the count; `warmstate.py execute_assembler`
             // closes over the driver data instead of re-resolving it.
-            let descriptor_ptr = self.driver_descriptor_ptr(state, &compiled_meta);
+            let descriptor_ptr = self.driver_descriptor_ptr(state, compiled_meta);
             let descriptor = unsafe { descriptor_ptr.map(|ptr| &*ptr) };
             let vable = descriptor.and_then(JitDriverStaticData::virtualizable);
-            if !filled_without_meta && !state.is_compatible(&compiled_meta) {
+            if !filled_without_meta && !state.is_compatible(compiled_meta) {
                 self.entry_scratch_out(scratch);
                 self.invalidate_loop(green_key);
                 return None;
@@ -7133,8 +7132,8 @@ impl<S: JitState> JitDriver<S> {
                     } else {
                         Some(state.build_meta(target_pc, env))
                     };
-                    let repeat_descriptor = self.driver_descriptor_for(state, &compiled_meta);
-                    let compatible = filled_without_meta || state.is_compatible(&compiled_meta);
+                    let repeat_descriptor = self.driver_descriptor_for(state, compiled_meta);
+                    let compatible = filled_without_meta || state.is_compatible(compiled_meta);
                     // Without this the four answers are dead and the loop
                     // prices nothing.
                     std::hint::black_box((token, repeat_meta, repeat_descriptor, compatible));
@@ -7158,7 +7157,7 @@ impl<S: JitState> JitDriver<S> {
                 .tracing
                 .as_ref()
                 .map(|ctx| ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()));
-            if !self.sync_before(state, &compiled_meta, vable) {
+            if !self.sync_before(state, compiled_meta, vable) {
                 self.entry_scratch_out(scratch);
                 return None;
             }
@@ -7175,9 +7174,9 @@ impl<S: JitState> JitDriver<S> {
                 scratch.vable_lengths.clear();
                 count_back_edge_stage_passes(BackEdgeStage::MarshalIn, stage_repeats.marshal_in);
                 for _ in 0..stage_repeats.marshal_in {
-                    let synced = self.sync_before(state, &compiled_meta, vable);
+                    let synced = self.sync_before(state, compiled_meta, vable);
                     state.extract_live_values_into(
-                        &compiled_meta,
+                        compiled_meta,
                         &mut scratch.live_values,
                         &mut scratch.raw,
                         &mut scratch.types,
@@ -7190,7 +7189,7 @@ impl<S: JitState> JitDriver<S> {
                     let extended = self.extend_compiled_live_values_into(
                         &procedure_token,
                         state,
-                        &compiled_meta,
+                        compiled_meta,
                         vable,
                         &mut scratch.live_values,
                         &mut scratch.vable_boxes,
@@ -7208,7 +7207,7 @@ impl<S: JitState> JitDriver<S> {
                     scratch.vable_lengths.clear();
                 }
                 state.extract_live_values_into(
-                    &compiled_meta,
+                    compiled_meta,
                     &mut scratch.live_values,
                     &mut scratch.raw,
                     &mut scratch.types,
@@ -7228,7 +7227,7 @@ impl<S: JitState> JitDriver<S> {
                 if !self.extend_compiled_live_values_into(
                     &procedure_token,
                     state,
-                    &compiled_meta,
+                    compiled_meta,
                     vable,
                     &mut scratch.live_values,
                     &mut scratch.vable_boxes,
@@ -7243,7 +7242,7 @@ impl<S: JitState> JitDriver<S> {
 
             if crate::callee_rca_enabled() {
                 let layout = state.state_field_layout();
-                let labels = state.debug_state_live_labels(&compiled_meta);
+                let labels = state.debug_state_live_labels(compiled_meta);
                 let compiled_inputs = self
                     .meta
                     .warm_state_ref_for_driver(self.index().unwrap_or(0))
@@ -7257,7 +7256,7 @@ impl<S: JitState> JitDriver<S> {
                     live_values.len(),
                     layout,
                 );
-                if let Some(dump) = state.debug_state_fields(&compiled_meta) {
+                if let Some(dump) = state.debug_state_fields(compiled_meta) {
                     eprintln!("[callee-rca][entry-state]\n{dump}");
                 }
                 eprintln!(
@@ -7275,7 +7274,7 @@ impl<S: JitState> JitDriver<S> {
             // the optimizer, so asking twice is two loads and two calls.
             let portal_rca = portal_rca_enabled();
             if portal_rca {
-                let labels = state.debug_state_live_labels(&compiled_meta);
+                let labels = state.debug_state_live_labels(compiled_meta);
                 eprintln!(
                     "[portal-rca][compiled-entry] green_key={green_key} target_pc={target_pc} \
                      dispatch_key={selected_dispatch_key} live_values={}",
@@ -7313,7 +7312,7 @@ impl<S: JitState> JitDriver<S> {
                     self.meta.back_edge_finish_word = Some(value);
                     self.restore_trace_vable_ptr(saved_vable_ptr);
                     if vable.is_some() {
-                        self.sync_after(state, &compiled_meta, vable, saved_vable_ptr);
+                        self.sync_after(state, compiled_meta, vable, saved_vable_ptr);
                     }
                     self.meta.single_pass_finish = true;
                     // `warmstate.py execute_assembler` `DoneWithThisFrameDescr*`
@@ -7329,7 +7328,7 @@ impl<S: JitState> JitDriver<S> {
                         state,
                         env,
                         frame,
-                        &compiled_meta,
+                        compiled_meta,
                         vable,
                         selected_dispatch_key,
                         portal_rca,
@@ -7516,8 +7515,8 @@ impl<S: JitState> JitDriver<S> {
             && !no_bridge_enabled()
             && bridge_fuel_take();
 
-        if should_bridge {
-            if let Some(resume) = self.trace_and_compile_from_bridge(
+        if should_bridge
+            && let Some(resume) = self.trace_and_compile_from_bridge(
                 fd,
                 None,
                 Some(&deadframe),
@@ -7525,9 +7524,9 @@ impl<S: JitState> JitDriver<S> {
                 env,
                 target_pc,
                 green_key,
-            ) {
-                return Some(resume);
-            }
+            )
+        {
+            return Some(resume);
         }
         self.resume_in_blackhole(
             fd,
@@ -7596,9 +7595,9 @@ impl<S: JitState> JitDriver<S> {
             count_back_edge_stage_passes(BackEdgeStage::MarshalOut, stage_repeats.marshal_out);
             for _ in 0..stage_repeats.marshal_out {
                 if !result.is_finish && !result.typed_values.is_empty() {
-                    state.restore_values(&compiled_meta, &result.typed_values);
+                    state.restore_values(compiled_meta, &result.typed_values);
                 }
-                self.sync_after(state, &compiled_meta, vable, saved_vable_ptr);
+                self.sync_after(state, compiled_meta, vable, saved_vable_ptr);
                 std::hint::black_box(&mut *state);
             }
         }
@@ -7654,7 +7653,7 @@ impl<S: JitState> JitDriver<S> {
             // in `result` have no reader past this point.
             self.meta.back_edge_finish_word = None;
             self.meta.back_edge_finish = Some(std::mem::take(&mut result.typed_values));
-            let run_meta = &compiled_meta;
+            let run_meta = compiled_meta;
             // The FINISH arguments are NOT the loop-carried state, so they
             // are not written back into it. `warmstate.py:405-419
             // execute_assembler` takes the `DoneWithThisFrameDescr*` fast
@@ -7827,8 +7826,8 @@ impl<S: JitState> JitDriver<S> {
         // Decode a dense list only when this failure will start a
         // bridge (`compile.py ResumeGuardDescr.handle_fail` when
         // `must_compile` fires — about once per 200 failures).
-        if should_bridge {
-            if let Some(resume) = self.trace_and_compile_from_bridge(
+        if should_bridge
+            && let Some(resume) = self.trace_and_compile_from_bridge(
                 fd,
                 Some(&descr_arc),
                 result.deadframe.as_ref(),
@@ -7836,9 +7835,9 @@ impl<S: JitState> JitDriver<S> {
                 env,
                 target_pc,
                 green_key,
-            ) {
-                return Some(resume);
-            }
+            )
+        {
+            return Some(resume);
         }
 
         self.resume_in_blackhole(
@@ -9591,7 +9590,7 @@ impl<S: JitState> JitDriver<S> {
         // `warmstate.py execute_assembler` keeps no stored meta.
         let live_meta = state.build_meta(target_pc, env);
         let meta: &S::Meta = &live_meta;
-        let descriptor = self.driver_descriptor_for(state, &meta);
+        let descriptor = self.driver_descriptor_for(state, meta);
         // Resolved here with the descriptor and carried to both ends of
         // the run; see `sync_before` for why it is not asked for twice.
         let vable = descriptor
@@ -9602,8 +9601,8 @@ impl<S: JitState> JitDriver<S> {
             .tracing
             .as_ref()
             .map(|ctx| ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()));
-        if (!filled_without_meta && !state.is_compatible(&meta))
-            || !self.sync_before(state, &meta, vable)
+        if (!filled_without_meta && !state.is_compatible(meta))
+            || !self.sync_before(state, meta, vable)
         {
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
@@ -9611,7 +9610,7 @@ impl<S: JitState> JitDriver<S> {
             };
         }
         if !filled_without_meta {
-            live_values = state.extract_live_values(&meta);
+            live_values = state.extract_live_values(meta);
         }
         if crate::debug::have_debug_prints() {
             let vals: Vec<String> = live_values
@@ -9636,7 +9635,7 @@ impl<S: JitState> JitDriver<S> {
             };
         }
         let Some(live_values) =
-            self.extend_compiled_live_values(green_key, state, &meta, vable, live_values)
+            self.extend_compiled_live_values(green_key, state, meta, vable, live_values)
         else {
             self.restore_trace_vable_ptr(saved_vable_ptr);
             return DetailedDriverRunOutcome::Abort {
@@ -9694,8 +9693,8 @@ impl<S: JitState> JitDriver<S> {
         } else {
             std::mem::take(&mut result.typed_values)
         };
-        state.restore_values(&meta, &typed_values);
-        self.sync_after(state, &meta, vable, saved_vable_ptr);
+        state.restore_values(meta, &typed_values);
+        self.sync_after(state, meta, vable, saved_vable_ptr);
         DetailedDriverRunOutcome::Jump {
             via_blackhole: false,
             continue_running_normally_values: None,
@@ -9765,7 +9764,7 @@ impl<S: JitState> JitDriver<S> {
         // The cached descriptor's `Arc` stays on the driver, as on the
         // back-edge entry: cloning it here bumped and dropped the count on
         // every call.
-        let descriptor_ptr = self.driver_descriptor_ptr(state, &meta);
+        let descriptor_ptr = self.driver_descriptor_ptr(state, meta);
         let descriptor = unsafe { descriptor_ptr.map(|ptr| &*ptr) };
         // Resolved here with the descriptor and carried to both ends of
         // the run; see `sync_before` for why it is not asked for twice.
@@ -9773,7 +9772,7 @@ impl<S: JitState> JitDriver<S> {
         // warmstate.py maybe_compile_and_run enters execute_token when the
         // procedure token exists. `is_compatible` runs only for a frontend
         // whose fill declined, so `is_compatible` can still run.
-        if !filled_without_meta && !state.is_compatible(&meta) {
+        if !filled_without_meta && !state.is_compatible(meta) {
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit][run-compiled-skip] key={} reason=incompatible-state target_pc={}",
@@ -9790,7 +9789,7 @@ impl<S: JitState> JitDriver<S> {
             .tracing
             .as_ref()
             .map(|ctx| ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()));
-        if !self.sync_before(state, &meta, vable) {
+        if !self.sync_before(state, meta, vable) {
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit][run-compiled-abort] key={} reason=sync-before target_pc={}",
@@ -9803,7 +9802,7 @@ impl<S: JitState> JitDriver<S> {
             };
         }
         if !filled_without_meta {
-            live_values = state.extract_live_values(&meta);
+            live_values = state.extract_live_values(meta);
         }
         if crate::debug::have_debug_prints() {
             let vals: Vec<String> = live_values
@@ -9841,7 +9840,7 @@ impl<S: JitState> JitDriver<S> {
         if !self.extend_compiled_live_values_into(
             procedure_token,
             state,
-            &meta,
+            meta,
             vable,
             &mut live_values,
             &mut boxes,
@@ -11965,12 +11964,11 @@ impl<S: JitState> JitDriver<S> {
                 // until `setup_bridge_sym`.
                 if let Some(info) = &vable_info
                     && info.has_vable_token()
+                    && let Some(ptr) = consume_vable_identity_addr(&boxes)
                 {
-                    if let Some(ptr) = consume_vable_identity_addr(&boxes) {
-                        unsafe {
-                            if info.is_token_nonnull_gcref(ptr as *const u8) {
-                                info.reset_token_gcref(ptr as *mut u8);
-                            }
+                    unsafe {
+                        if info.is_token_nonnull_gcref(ptr as *const u8) {
+                            info.reset_token_gcref(ptr as *mut u8);
                         }
                     }
                 }
@@ -13719,7 +13717,7 @@ mod tests {
             "drive must reach the StartTracing arm so that neither refusal fires"
         );
         assert!(
-            crate::mc_diag(61) >= before + 1,
+            crate::mc_diag(61) > before,
             "mst_entered did not move on the back edge that started tracing"
         );
     }
@@ -15799,7 +15797,7 @@ mod tests {
                 .green_key_values()
                 .expect("non-zero code_ptr seeds a typed green key");
             assert!(
-                typed.types.iter().any(|t| *t == GreenType::Ref),
+                typed.types.contains(&GreenType::Ref),
                 "the typed start key carries a Ref green"
             );
             let i0 = OpRef::input_arg_int(0);

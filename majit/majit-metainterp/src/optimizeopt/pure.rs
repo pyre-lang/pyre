@@ -1957,7 +1957,7 @@ mod tests {
 
     #[test]
     fn pure_history_keeps_the_configured_number_of_distinct_emitted_ops() {
-        let limit = crate::jit::PARAMETERS.pureop_historylength as u32;
+        let limit = crate::jit::PARAMETERS.pureop_historylength;
         let mut specs: Vec<_> = (0..limit)
             .map(|i| op_spec(OpCode::IntNeg, &[Arg::In(i)]))
             .collect();

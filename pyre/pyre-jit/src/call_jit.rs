@@ -235,7 +235,7 @@ mod tests {
     fn blackhole_leave_rejects_a_red_outside_the_open_frame_scope() {
         std::thread::spawn(|| {
             let mut ec = pyre_interpreter::PyExecutionContext::default();
-            pyre_interpreter::call::set_last_exec_ctx(&mut ec);
+            pyre_interpreter::call::set_last_exec_ctx(&ec);
             let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
             // A malformed recovered red must never be dereferenced merely
             // because it is nonzero. There is no matching execution scope.
@@ -258,7 +258,7 @@ mod tests {
     fn blackhole_leave_marks_an_on_chain_parent_without_rewriting_top() {
         std::thread::spawn(|| {
             let mut ec = pyre_interpreter::PyExecutionContext::default();
-            pyre_interpreter::call::set_last_exec_ctx(&mut ec);
+            pyre_interpreter::call::set_last_exec_ctx(&ec);
             let mut parent = stack_pyframe();
             let mut child = stack_pyframe();
             child.f_backref = &mut parent;
@@ -289,7 +289,7 @@ mod tests {
             }
             let top = unsafe { base.add(frames.len() - 1) };
             ec.topframeref = top;
-            pyre_interpreter::call::set_last_exec_ctx(&mut ec);
+            pyre_interpreter::call::set_last_exec_ctx(&ec);
             let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
             bh.virtualizable_ptr = base as i64;
             let _ = super::leave_resumed_blackhole_frame(&bh, false, pyre_object::w_none(), true);
@@ -311,7 +311,7 @@ mod tests {
     fn blackhole_leave_closes_the_open_scope() {
         std::thread::spawn(|| {
             let mut ec = pyre_interpreter::PyExecutionContext::default();
-            pyre_interpreter::call::set_last_exec_ctx(&mut ec);
+            pyre_interpreter::call::set_last_exec_ctx(&ec);
             let mut parent = stack_pyframe();
             let mut child = stack_pyframe();
             child.f_backref = &mut parent;
@@ -338,7 +338,7 @@ mod tests {
         // must not emit `leaveframe` or close `topframeref` itself.
         std::thread::spawn(|| {
             let mut ec = pyre_interpreter::PyExecutionContext::default();
-            pyre_interpreter::call::set_last_exec_ctx(&mut ec);
+            pyre_interpreter::call::set_last_exec_ctx(&ec);
             let mut child = stack_pyframe();
             ec.topframeref = &mut child;
             let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
@@ -401,7 +401,7 @@ mod tests {
         std::thread::spawn(|| {
             RETURN_TRACE_EVENTS.with(|c| c.borrow_mut().clear());
             let mut ec = pyre_interpreter::PyExecutionContext::default();
-            pyre_interpreter::call::set_last_exec_ctx(&mut ec);
+            pyre_interpreter::call::set_last_exec_ctx(&ec);
             // `return_trace` no-ops when `gettrace()` is null; a dummy
             // global plus `setllprofile`'s trampoline lets `_trace` record
             // the `('return', value)` `return_trace` hands it.
@@ -450,7 +450,7 @@ mod tests {
     fn abort_blackhole_per_code_finish_level_exception_sets_got_exception() {
         std::thread::spawn(|| {
             let mut ec = pyre_interpreter::PyExecutionContext::default();
-            pyre_interpreter::call::set_last_exec_ctx(&mut ec);
+            pyre_interpreter::call::set_last_exec_ctx(&ec);
             let mut caller = stack_pyframe();
             let mut callee = stack_pyframe();
             callee.f_backref = std::ptr::from_mut(&mut caller);

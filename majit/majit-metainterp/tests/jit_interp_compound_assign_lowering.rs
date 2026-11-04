@@ -67,7 +67,7 @@ fn dispatch_compound_assign(program: &Bytecode, threshold: u32) -> i64 {
             // index is a `let`-bound local, no compound operator.
             OP_RMW_LETIDX => {
                 let i = program[pc + 1] as usize;
-                state.regs[i] = state.regs[i] + 1;
+                state.regs[i] += 1;
                 pc += 2;
             }
             // Ingredient 2 alone: computed index in lvalue position, plain

@@ -1840,7 +1840,7 @@ pub(crate) fn consume_virtualref_boxes(
 ) -> Vec<(OpRef, usize)> {
     let vref_values = &resume_data.virtualref_values;
     assert!(
-        vref_values.len() % 2 == 0,
+        vref_values.len().is_multiple_of(2),
         "virtualref_values must contain an even number of entries (got {})",
         vref_values.len(),
     );

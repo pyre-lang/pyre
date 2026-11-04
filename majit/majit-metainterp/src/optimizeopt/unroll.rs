@@ -10673,7 +10673,7 @@ mod tests {
         let vs = unroll.jump_to_existing_trace_with_vs(
             &[arg],
             None,
-            &mut target_tokens,
+            &target_tokens,
             &mut optimizer,
             &mut ctx,
             false,
@@ -10715,7 +10715,7 @@ mod tests {
         let vs = OptUnroll::default().jump_to_existing_trace_with_vs(
             &[arg],
             None,
-            &mut target_tokens,
+            &target_tokens,
             &mut optimizer,
             &mut ctx,
             false,
@@ -11265,7 +11265,7 @@ mod tests {
         let vs = unroll.jump_to_existing_trace_with_vs(
             &[arg],
             None,
-            &mut target_tokens,
+            &target_tokens,
             &mut optimizer,
             &mut ctx,
             false,

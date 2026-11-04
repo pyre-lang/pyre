@@ -589,12 +589,12 @@ mod virt_array_with_float_scalar {
             &all_liveness,
         );
         assert!(
-            indices.int.iter().any(|&r| r == 1),
+            indices.int.contains(&1),
             "guard resume live set includes the [int] items-pointer (int_regs[1]); live_i={:?}",
             indices.int
         );
         assert!(
-            indices.int.iter().any(|&r| r == 2),
+            indices.int.contains(&2),
             "guard resume live set includes the [int] length (int_regs[2]); live_i={:?}",
             indices.int
         );

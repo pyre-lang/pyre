@@ -1231,7 +1231,7 @@ mod tests {
         let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
         let llbc = crate::test_support::load_ullbc(path);
         let graph = crate::test_support::lower_function(
-            &llbc,
+            llbc,
             "pyre_object::unicodeobject::utf8_payload_bytes",
         )
         .expect("lower utf8_payload_bytes");

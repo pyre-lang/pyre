@@ -121,7 +121,7 @@ pub fn mainloop(program: &Bytecode, iterations: i64, threshold: u32, chain: usiz
                 // reaches the chain is missing from the sum rather than hidden
                 // by a repeat.
                 let value = state.counter;
-                state.sp = state.sp + 1;
+                state.sp += 1;
                 if state.sp > CAP {
                     // The displaced word. This call and the store below are
                     // the same opcode's work as the test above them, so a
@@ -131,7 +131,7 @@ pub fn mainloop(program: &Bytecode, iterations: i64, threshold: u32, chain: usiz
                 state.top = value;
             }
             OP_BACK => {
-                state.counter = state.counter - 1;
+                state.counter -= 1;
                 if state.counter != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;

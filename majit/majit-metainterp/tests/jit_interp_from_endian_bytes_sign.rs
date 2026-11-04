@@ -78,12 +78,12 @@ fn dispatch_endian(program: &Bytecode, threshold: u32) -> i64 {
         let opcode = program[pc];
         match opcode {
             OP_DEC => {
-                state.regs[0] = state.regs[0] - 1;
-                pc = pc + 1;
+                state.regs[0] -= 1;
+                pc += 1;
             }
             OP_DECODE_I16 => {
                 state.regs[1] = i16::from_le_bytes([program[pc + 1], program[pc + 2]]) as i64;
-                pc = pc + 3;
+                pc += 3;
             }
             OP_DECODE_I32 => {
                 state.regs[2] = i32::from_be_bytes([
@@ -92,11 +92,11 @@ fn dispatch_endian(program: &Bytecode, threshold: u32) -> i64 {
                     program[pc + 3],
                     program[pc + 4],
                 ]) as i64;
-                pc = pc + 5;
+                pc += 5;
             }
             OP_DECODE_U16 => {
                 state.regs[3] = u16::from_le_bytes([program[pc + 1], program[pc + 2]]) as i64;
-                pc = pc + 3;
+                pc += 3;
             }
             OP_BACK => {
                 if state.regs[0] != 0 {
@@ -104,7 +104,7 @@ fn dispatch_endian(program: &Bytecode, threshold: u32) -> i64 {
                     pc = LOOP_HEADER;
                     continue;
                 } else {
-                    pc = pc + 1;
+                    pc += 1;
                 }
             }
             _ => break,
@@ -260,8 +260,8 @@ mod uint_as_float {
             let opcode = program[pc];
             match opcode {
                 OP_DEC => {
-                    state.regs[0] = state.regs[0] - 1;
-                    pc = pc + 1;
+                    state.regs[0] -= 1;
+                    pc += 1;
                 }
                 OP_DECODE_U64_AS_F64 => {
                     state.regs[1] = (u64::from_le_bytes([
@@ -275,7 +275,7 @@ mod uint_as_float {
                         program[pc + 8],
                     ]) as f64
                         / 2.0) as i64;
-                    pc = pc + 9;
+                    pc += 9;
                 }
                 OP_BACK => {
                     if state.regs[0] != 0 {
@@ -283,7 +283,7 @@ mod uint_as_float {
                         pc = LOOP_HEADER;
                         continue;
                     } else {
-                        pc = pc + 1;
+                        pc += 1;
                     }
                 }
                 _ => break,
@@ -437,12 +437,12 @@ mod namespaced_decoder {
             let opcode = program[pc];
             match opcode {
                 OP_DEC => {
-                    state.regs[0] = state.regs[0] - 1;
-                    pc = pc + 1;
+                    state.regs[0] -= 1;
+                    pc += 1;
                 }
                 OP_DECODE_WIRE_U16 => {
                     state.regs[1] = wire::u16::from_le_bytes([program[pc + 1], program[pc + 2]]);
-                    pc = pc + 3;
+                    pc += 3;
                 }
                 OP_BACK => {
                     if state.regs[0] != 0 {
@@ -450,7 +450,7 @@ mod namespaced_decoder {
                         pc = LOOP_HEADER;
                         continue;
                     } else {
-                        pc = pc + 1;
+                        pc += 1;
                     }
                 }
                 _ => break,

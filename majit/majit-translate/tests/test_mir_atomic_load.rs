@@ -541,13 +541,12 @@ fn quasi_atomic_u64_field_fixture(
         Receiver::CopiedThroughOwnerCopy
             | Receiver::CopiedThroughOwnerCopyInOneBranch
             | Receiver::CopiedThroughAnotherOwnerCopyInOneBranch
-    ) {
-        if matches!(receiver, Receiver::CopiedThroughOwnerCopy) {
-            statements.push(
-                json!({"span": span, "kind": {"Assign": [place(owner2, &owner_ref),
+    ) && matches!(receiver, Receiver::CopiedThroughOwnerCopy)
+    {
+        statements.push(
+            json!({"span": span, "kind": {"Assign": [place(owner2, &owner_ref),
                 {"Use": [{"Copy": place(1, &owner_ref)}, "Yes"]}]}}),
-            );
-        }
+        );
     }
     if matches!(receiver, Receiver::CopiedFromCopiesOfAReassignedOwner) {
         let o = extra_local + 3;

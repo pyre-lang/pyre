@@ -708,10 +708,9 @@ impl<'a> Lowering<'a> {
                     && first_arg_ty
                         .as_ref()
                         .is_some_and(|ty| tyref_is_u8_window(ty, self.llbc))
+                    && let (Some(data), Some(len)) = (args.first(), window_recv_len.as_ref())
                 {
-                    if let (Some(data), Some(len)) = (args.first(), window_recv_len.as_ref()) {
-                        window_parts = Some((data.clone(), len.clone()));
-                    }
+                    window_parts = Some((data.clone(), len.clone()));
                 }
                 if let Some((data, len)) = window_parts {
                     let dest = self.emit_charpsize2str_list(mir_bb, data, len);
@@ -7610,14 +7609,13 @@ impl<'a> Lowering<'a> {
         if result_expect_callee
             && let OpKind::Call { args, .. } = &op_kind
             && args.len() == 2
-        {
-            if let Some(site) = self.recognize_carrier_combinator_site(
+            && let Some(site) = self.recognize_carrier_combinator_site(
                 first_arg_ty.as_ref(),
                 &result_var,
                 crate::front::result_exc::CarrierCatchKind::RaiseImplicit,
-            ) {
-                self.carrier_combinator_sites.push(site);
-            }
+            )
+        {
+            self.carrier_combinator_sites.push(site);
         }
         // `Option::ok_or_else(opt, closure)?` is one combined value-or-raise
         // boundary in the translated graph.  Record it separately from an
@@ -8276,10 +8274,9 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 1
             && name == "branch"
+            && let Some(site) = self.recognize_result_try_site(first_arg_ty.as_ref(), &result_var)
         {
-            if let Some(site) = self.recognize_result_try_site(first_arg_ty.as_ref(), &result_var) {
-                self.result_try_sites.push(site);
-            }
+            self.result_try_sites.push(site);
         }
         // Capture `<[T]>::first(slice)` sites for the length-checked
         // `Option<&T>` diamond `front::slice_first` synthesizes.  `first` is a
@@ -8446,14 +8443,13 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 1
             && name == "unwrap"
-        {
-            if let Some(site) = self.recognize_carrier_combinator_site(
+            && let Some(site) = self.recognize_carrier_combinator_site(
                 first_arg_ty.as_ref(),
                 &result_var,
                 crate::front::result_exc::CarrierCatchKind::RaiseImplicit,
-            ) {
-                self.carrier_combinator_sites.push(site);
-            }
+            )
+        {
+            self.carrier_combinator_sites.push(site);
         }
         // Carrier `Result::expect(res, msg)` (`interp_deque.py`
         // `W_Deque.trimleft` / `popleft`; the `msg` operand is dropped).
@@ -8466,14 +8462,13 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 2
             && name == "expect"
-        {
-            if let Some(site) = self.recognize_carrier_combinator_site(
+            && let Some(site) = self.recognize_carrier_combinator_site(
                 first_arg_ty.as_ref(),
                 &result_var,
                 crate::front::result_exc::CarrierCatchKind::RaiseImplicit,
-            ) {
-                self.carrier_combinator_sites.push(site);
-            }
+            )
+        {
+            self.carrier_combinator_sites.push(site);
         }
         // Carrier map_err: dest is Result of the exception carrier. The
         // post-pass runs after result_exc hung LastException so the Err
@@ -9082,10 +9077,10 @@ impl<'a> Lowering<'a> {
         }
         let path = fd.item_meta.name_path();
         let leaf = path.rsplit("::").next().unwrap_or("fn");
-        if self.spec_body {
-            if let Some(segments) = self.enqueue_spec(fd, &generics) {
-                return Some((segments, None));
-            }
+        if self.spec_body
+            && let Some(segments) = self.enqueue_spec(fd, &generics)
+        {
+            return Some((segments, None));
         }
         Some((spec_segments(self.llbc, fd, leaf), None))
     }

@@ -1542,12 +1542,12 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
         pcdep_entries,
         const_ref_slots,
     ) {
-        Ok(overrides) => return Some(overrides),
+        Ok(overrides) => Some(overrides),
         Err(AssembleFail::NoShape) => {
             if fbw_debug_abort_enabled() {
                 crate::jitcode_dispatch::census_record("CallStack::NoOperandShape");
             }
-            return None;
+            None
         }
         Err(AssembleFail::Proof(gap)) => {
             if fbw_debug_abort_enabled() {

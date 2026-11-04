@@ -1324,7 +1324,7 @@ fn register_ref_enum_instantiation_rows(
         // sentinel dropped a tagged primitive instantiation
         // (`Option<char>`) whose template later gained a payload alias.
         let disc_rows = bases.iter().find_map(|base| {
-            struct_fields.fields.get(*base).and_then(|rows| {
+            struct_fields.fields.get(base).and_then(|rows| {
                 rows.iter()
                     .find(|row| row.name == "__discriminant")
                     .cloned()

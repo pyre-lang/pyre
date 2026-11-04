@@ -1307,8 +1307,7 @@ fn describe_operand_for_assert(b: &Operand) -> String {
 /// every one whose result folded to a `Const` — so its length is unrelated and
 /// `short_boxes[i]` pairs with nothing.
 pub struct PreviewShortState {
-    /// unroll.py:480 `short_inputargs = sb.create_short_inputargs(label_args
-    /// + virtuals)` — the ShortBoxes-stored renamed inputarg positions
+    /// unroll.py:480 `short_inputargs = sb.create_short_inputargs(label_args + virtuals)` — the ShortBoxes-stored renamed inputarg positions
     /// themselves (measured identical to the export-site `label_args +
     /// virtuals` recompute across the corpus, 2026-06-11).
     pub short_inputargs: Vec<OpRef>,
@@ -4221,7 +4220,7 @@ impl OptContext {
             // Some ProducedShortOps (PreambleOpKind::Heap with non-getfield /
             // non-getarrayitem opcodes, or other non-emitting entries) have
             // no Phase-2 result. They are no-ops for the imported builder.
-            if result_map.get(source).is_none() {
+            if !result_map.contains_key(source) {
                 continue;
             }
             match produced_op.kind {
@@ -5594,8 +5593,7 @@ impl OptContext {
     /// [`Operand`]-yielding total mirror of [`get_box_replacement`](Self::get_box_replacement):
     /// resolve a position's `_forwarded` terminal directly as an `Operand`
     /// (canonical `Op` / `InputArg` host, or inline-`Const`) without minting a
-    /// wrapper. Walks the chain via [`resolve_to_operand`](Self::resolve_to_operand)
-    /// + [`Operand::get_box_replacement`].
+    /// wrapper. Walks the chain via [`resolve_to_operand`](Self::resolve_to_operand) + [`Operand::get_box_replacement`].
     ///
     /// Total, like the operand sibling [`Operand::get_box_replacement`]
     /// (returns the position-only operand on a miss) and
@@ -8921,8 +8919,7 @@ impl OptContext {
     ///         return InputArgInt(self.cpu.bh_getinteriorfield_gc_i(struct, i, descr))
     /// ```
     ///
-    /// Reads at `struct_ptr + array.base_size() + i * array.item_size()
-    /// + field.offset()` per `InteriorFieldDescr.array_descr()` +
+    /// Reads at `struct_ptr + array.base_size() + i * array.item_size() + field.offset()` per `InteriorFieldDescr.array_descr()` +
     /// `field_descr()`. Matches the backend Cpu::bh_getinteriorfield_gc_*
     ///   shape (struct + element_index + interior-field).
     ///
@@ -9378,9 +9375,7 @@ impl OptContext {
         descr: DescrRef,
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
         // info.py:729: ref = self._const.getref_base()
-        let Some(gcref) = self.getptrinfo_handle(op).and_then(|h| h.constant_ref()) else {
-            return None;
-        };
+        let gcref = self.getptrinfo_handle(op).and_then(|h| h.constant_ref())?;
         // info.py:730-731: if not ref: raise InvalidLoop. Deferred signal +
         // `None` return; the driver aborts at the next barrier.
         if gcref.is_null() {

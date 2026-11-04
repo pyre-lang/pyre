@@ -71,7 +71,7 @@ fn mainloop(program: &Bytecode, limit: i64, threshold: u32) -> i64 {
             OP_ADD => {
                 state.top -= 2;
                 let rhs = state.regs[(state.top + 1) as usize];
-                state.regs[state.top as usize] = state.regs[state.top as usize] + rhs;
+                state.regs[state.top as usize] += rhs;
                 state.top += 1;
             }
             OP_JUMP_BACK => {

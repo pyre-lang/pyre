@@ -66,13 +66,6 @@ pub use tool::algo::regalloc;
     )
 )]
 mod codegen;
-#[cfg_attr(
-    test,
-    expect(
-        clippy::type_complexity,
-        reason = "the graph-body census retains Charon's literal nested block/body map shape so extraction and source-translation parity remain directly auditable"
-    )
-)]
 pub mod codeobject_layout;
 pub mod fat_ptr_layout;
 pub mod front;
@@ -86,13 +79,6 @@ pub mod hints;
 pub mod inline;
 pub mod layout;
 mod local_crates;
-#[cfg_attr(
-    test,
-    expect(
-        clippy::type_complexity,
-        reason = "the model test spells the exact nested RPython graph shape under test; a one-use alias would conceal rather than simplify that contract"
-    )
-)]
 pub mod memory;
 pub mod model;
 pub mod model_ssa;
@@ -1445,10 +1431,6 @@ pub fn analyze_helper_pipeline_with_modules(
     )
 }
 
-#[expect(
-    clippy::arc_with_non_send_sync,
-    reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
-)]
 #[expect(
     clippy::too_many_arguments,
     reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -3131,7 +3113,7 @@ fn register_configured_jitdrivers(
             // inherit reads converged `access_directly_call_results`
             // (`annrpython.py recursivecall`), not the pre-fixpoint set.
             drop(portal_graph);
-            call_control.annotate_access_directly(&[spec.portal.clone()]);
+            call_control.annotate_access_directly(std::slice::from_ref(&spec.portal));
             let original = call_control
                 .function_graphs()
                 .get(&spec.portal)
@@ -5134,7 +5116,7 @@ mod harvested_funcobj_hints_tests {
 
         crate::local_crates::with_local_crate_root("pyre_module", || {
             let graph = crate::test_support::lower_function(
-                &llbc,
+                llbc,
                 "pyre_module::module::_cffi_backend::lib_obj::get_attr_elidable",
             )
             .expect("lower get_attr_elidable wrapper");
@@ -5216,7 +5198,7 @@ mod harvested_funcobj_hints_tests {
                 "module::_cffi_backend::lib_obj::_orig_get_attr_elidable_unlikely_name",
             ];
             let orig_lowered = orig_names.iter().find_map(|name| {
-                crate::test_support::lower_function(&llbc, name)
+                crate::test_support::lower_function(llbc, name)
                     .ok()
                     .map(|g| (*name, g))
             });

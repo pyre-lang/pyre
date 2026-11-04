@@ -49,10 +49,6 @@ impl ShadowStackRootWalker {
 /// Graph-lifecycle owner corresponding to
 /// `ShadowStackFrameworkGCTransformer` plus
 /// `BaseGCTransformer.inline_helpers_and_postprocess`.
-#[expect(
-    clippy::upper_case_acronyms,
-    reason = "strict port of the upstream ShadowStackFrameworkGCTransformer symbol"
-)]
 pub struct ShadowStackFrameworkGCTransformer<'t> {
     framework: BaseFrameworkGCTransformer<'t>,
     root_walker: ShadowStackRootWalker,

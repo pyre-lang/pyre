@@ -150,7 +150,7 @@ pub fn mainloop(program: &Bytecode, iterations: i64, threshold: u32, chain: usiz
             OP_PUSH => {
                 let value = program[pc] as i64;
                 pc += 1;
-                state.sp = state.sp + 1;
+                state.sp += 1;
                 // `sp` is the height after the push, so the new word takes the
                 // slot of height `sp - 1`.
                 let free_slot = state.sel * CAP + ((state.sp - 1) & CAP_MASK);
@@ -163,8 +163,8 @@ pub fn mainloop(program: &Bytecode, iterations: i64, threshold: u32, chain: usiz
             }
             OP_DRAIN => {
                 let top_slot = state.sel * CAP + ((state.sp - 1) & CAP_MASK);
-                state.acc = state.acc + state.vals[top_slot];
-                state.sp = state.sp - 1;
+                state.acc += state.vals[top_slot];
+                state.sp -= 1;
                 // The slot just vacated is the one height `sp - CAP` wants
                 // back; `sp & CAP_MASK` names it because the ring wraps.
                 let refill_slot = state.sel * CAP + (state.sp & CAP_MASK);
@@ -178,7 +178,7 @@ pub fn mainloop(program: &Bytecode, iterations: i64, threshold: u32, chain: usiz
                 state.sp = state.depths[state.sel] as usize;
             }
             OP_BACK => {
-                state.counter = state.counter - 1;
+                state.counter -= 1;
                 if state.counter != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;

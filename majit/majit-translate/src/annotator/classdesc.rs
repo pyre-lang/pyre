@@ -3880,7 +3880,7 @@ mod tests {
             Some(SomeValue::Integer(SomeInteger::new(false, false))),
         )
         .expect("generalize_attr");
-        assert!(cd.borrow().attr_sources.get("indexes").is_none());
+        assert!(!cd.borrow().attr_sources.contains_key("indexes"));
         drop(scope);
         let restored = cd.borrow();
         let sources = restored

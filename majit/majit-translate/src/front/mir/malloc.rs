@@ -607,10 +607,6 @@ impl MallocLifetimes {
 }
 
 /// `malloc.py` `BaseMallocRemover.compute_lifetimes`.
-#[expect(
-    clippy::mutable_key_type,
-    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded"
-)]
 pub(in crate::front::mir) fn compute_lifetimes(graph: &FunctionGraph) -> MallocLifetimes {
     let id_to_idx: std::collections::HashMap<BlockId, usize> = graph
         .blocks

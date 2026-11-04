@@ -3551,15 +3551,15 @@ fn handle_jitexception<P: BlackholeInterpPool>(
         // portal: their chain link is dropped here and never resumes, so
         // this is where each one leaves. Without the callback a traceback
         // that retains such a frame refuses `frame.clear()`.
-        if let Some(on_leave_level) = on_leave_level {
-            if let Some(e) = on_leave_level(bh.virtualizable_ptr, LevelExit::Exception) {
-                // pyframe.py execute_frame: return_trace/leave replace the
-                // pending outcome. blackhole.py _handle_jitexception then
-                // propagates ExitFrameWithExceptionRef.
-                drop(exc_roots);
-                exc = JitException::ExitFrameWithExceptionRef(GcRef(e as usize));
-                exc_roots = root_jitexception_payload(&mut exc);
-            }
+        if let Some(on_leave_level) = on_leave_level
+            && let Some(e) = on_leave_level(bh.virtualizable_ptr, LevelExit::Exception)
+        {
+            // pyframe.py execute_frame: return_trace/leave replace the
+            // pending outcome. blackhole.py _handle_jitexception then
+            // propagates ExitFrameWithExceptionRef.
+            drop(exc_roots);
+            exc = JitException::ExitFrameWithExceptionRef(GcRef(e as usize));
+            exc_roots = root_jitexception_payload(&mut exc);
         }
         builder.release_interp(bh);
         match next {

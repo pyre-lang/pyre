@@ -48,15 +48,15 @@ fn dispatch_accum(program: &Bytecode, threshold: u32) -> i64 {
         let opcode = program[pc];
         match opcode {
             OP_DEC => {
-                state.regs[0] = state.regs[0] - 1;
-                pc = pc + 1;
+                state.regs[0] -= 1;
+                pc += 1;
             }
             OP_BACK => {
                 if state.regs[0] != 0 {
                     pc = 0;
                     continue;
                 } else {
-                    pc = pc + 1;
+                    pc += 1;
                 }
             }
             OP_REALLOC_THEN_BREAK => {
@@ -70,7 +70,7 @@ fn dispatch_accum(program: &Bytecode, threshold: u32) -> i64 {
                 }
                 // Blocker 3 — `pc` is green; a mid-arm write cannot be
                 // carried back out of this lowering path.
-                pc = pc + 1;
+                pc += 1;
             }
             _ => break,
         }

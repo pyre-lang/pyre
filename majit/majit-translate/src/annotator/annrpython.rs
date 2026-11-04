@@ -4511,10 +4511,10 @@ mod tests {
         )
         .expect("hoist");
         assert!(attr_list_same(&parent, "indexes", &fresh));
-        assert!(child.borrow().attrs.get("indexes").is_none());
+        assert!(!child.borrow().attrs.contains_key("indexes"));
         drop(scope);
         assert!(
-            parent.borrow().attrs.get("indexes").is_none(),
+            !parent.borrow().attrs.contains_key("indexes"),
             "parent slot was absent before the failed hoist"
         );
         assert!(

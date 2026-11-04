@@ -62,11 +62,10 @@ fn is_identity_wrapper_target(
             if !is_std_type_path(receiver_root.as_deref()) && !is_std_type_path(receiver_path) {
                 return false;
             }
-            match (name.as_str(), path_leaf(receiver_root.as_deref())) {
-                ("get", Some("Cell")) => true,
-                ("deref" | "deref_mut", Some("Ref") | Some("MutexGuard")) => true,
-                _ => false,
-            }
+            matches!(
+                (name.as_str(), path_leaf(receiver_root.as_deref())),
+                ("get", Some("Cell")) | ("deref" | "deref_mut", Some("Ref") | Some("MutexGuard"))
+            )
         }
         CallTarget::FunctionPath { segments, .. } => {
             let leaf = function_leaf(segments);

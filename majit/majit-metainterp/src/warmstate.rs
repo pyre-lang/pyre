@@ -4585,7 +4585,7 @@ mod tests {
         let live_66 = crate::mc_diag(66);
         assert!(!ws.should_trace_function_entry_for_key(&key_a));
         assert!(
-            crate::mc_diag(65) >= live_65 + 1,
+            crate::mc_diag(65) > live_65,
             "a decline on the tracing term bumps 65"
         );
         assert_eq!(
@@ -4611,7 +4611,7 @@ mod tests {
         let stale_66 = crate::mc_diag(66);
         assert!(!ws.should_trace_function_entry_for_key(&key_a));
         assert!(
-            crate::mc_diag(66) >= stale_66 + 1,
+            crate::mc_diag(66) > stale_66,
             "a stale JC_TRACING at this gate is what slot 66 reports"
         );
     }

@@ -1308,8 +1308,10 @@ mod set_effect_bitstrings_tests {
 
     #[test]
     fn release_gil_call_cache_keeps_fresh_effect_info_identity() {
-        let mut effect_info = EffectInfo::default();
-        effect_info.call_release_gil_target = (0xfeed, 0);
+        let effect_info = EffectInfo {
+            call_release_gil_target: (0xfeed, 0),
+            ..Default::default()
+        };
         let first = make_call_descr_with_effect(
             &[Type::Int, Type::Ref, Type::Int],
             Type::Void,

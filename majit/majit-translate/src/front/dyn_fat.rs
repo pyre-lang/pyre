@@ -639,10 +639,10 @@ fn emit_fat_len(graph: &mut FunctionGraph, env: &mut MetaEnv, fat: &FatField) ->
     // passthrough of the set pointer). A dominating definition is not a
     // definition (`ensure_meta` already threads the metadata word the
     // same way).
-    if !graph.variable_defined_in_block(fat.block, &base) {
-        if let Some(local) = graph.ensure_variable_at_block_local(fat.block, &fat.base) {
-            base = local;
-        }
+    if !graph.variable_defined_in_block(fat.block, &base)
+        && let Some(local) = graph.ensure_variable_at_block_local(fat.block, &fat.base)
+    {
+        base = local;
     }
     let meta = graph.alloc_value_var_with_type(ConcreteType::Signed);
     // `FatMeta` is the vtable word as Int (`GetfieldGcI`). Slice `FatLen`

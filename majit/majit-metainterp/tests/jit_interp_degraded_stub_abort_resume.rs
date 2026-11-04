@@ -69,7 +69,7 @@ fn dispatch_stub_resume(program: &Bytecode, threshold: u32, n: i64) -> i64 {
         pc += 1;
         match opcode {
             OP_DEC => {
-                state.regs[0] = state.regs[0] - 1;
+                state.regs[0] -= 1;
             }
             OP_BUMP => {
                 let k = program[pc] as i64;

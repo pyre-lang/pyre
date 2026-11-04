@@ -2806,9 +2806,9 @@ fn loop_callee_portal_guard_not_forced_snapshot_abort_leaves_callee_ec() {
     let r0 = tc.const_ref(1);
     let i0 = tc.const_int(0);
     let f0 = tc.const_float(0);
-    let regs_r = vec![r0, r0, r0, r0];
-    let regs_i = vec![i0, i0, i0, i0];
-    let regs_f = vec![f0, f0, f0, f0];
+    let regs_r = [r0, r0, r0, r0];
+    let regs_i = [i0, i0, i0, i0];
+    let regs_f = [f0, f0, f0, f0];
     let mut concrete_i = Vec::new();
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData::default()),
@@ -2964,7 +2964,7 @@ fn loop_callee_portal_call_assembler_guard_not_forced_snapshot_carries_send_ex_t
         0,
     );
     let r0 = tc.const_ref(1);
-    let regs_r = vec![r0];
+    let regs_r = [r0];
     let regs_i = Vec::new();
     let regs_f = Vec::new();
     let mut concrete_i = Vec::new();
@@ -3146,7 +3146,7 @@ fn loop_callee_portal_non_none_init_raises_without_aborting() {
     );
 
     let session = std::cell::RefCell::new(WalkSession::default());
-    let regs_r = vec![instance];
+    let regs_r = [instance];
     let regs_i = Vec::new();
     let regs_f = Vec::new();
     let mut concrete_i = Vec::new();
@@ -3344,7 +3344,7 @@ fn loop_callee_portal_none_init_records_the_none_check() {
     );
 
     let session = std::cell::RefCell::new(WalkSession::default());
-    let regs_r = vec![instance];
+    let regs_r = [instance];
     let regs_i = Vec::new();
     let regs_f = Vec::new();
     let mut concrete_i = Vec::new();
@@ -3537,7 +3537,7 @@ fn constructor_call_assembler_guard_snapshot_keeps_the_immediate_caller() {
 
     let session = std::cell::RefCell::new(WalkSession::default());
     let caller = constructor_assembler_caller_frame(caller_jitcode);
-    let regs_r = vec![instance];
+    let regs_r = [instance];
     let regs_i = Vec::new();
     let regs_f = Vec::new();
     let mut concrete_i = Vec::new();
@@ -4503,8 +4503,8 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
 fn getfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
     let descr_pool: Vec<DescrRef> = Vec::new();
     let mut tc = fresh_trace_ctx();
-    let regs_r = vec![OpRef::NONE];
-    let regs_i = vec![OpRef::NONE];
+    let regs_r = [OpRef::NONE];
+    let regs_i = [OpRef::NONE];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -4566,8 +4566,8 @@ fn getfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
 fn setfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
     let descr_pool: Vec<DescrRef> = Vec::new();
     let mut tc = fresh_trace_ctx();
-    let regs_r = vec![OpRef::NONE];
-    let regs_i = vec![OpRef::NONE];
+    let regs_r = [OpRef::NONE];
+    let regs_i = [OpRef::NONE];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -4647,8 +4647,8 @@ fn array_vable_handlers_with_none_obj_surface_vable_box_not_seeded() {
     ] {
         let descr_pool: Vec<DescrRef> = Vec::new();
         let mut tc = fresh_trace_ctx();
-        let regs_r = vec![OpRef::NONE];
-        let regs_i = vec![OpRef::NONE];
+        let regs_r = [OpRef::NONE];
+        let regs_i = [OpRef::NONE];
         let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -4750,8 +4750,8 @@ fn array_vable_handlers_with_unpinned_index_surface_index_not_concrete() {
         let mut tc = fresh_trace_ctx();
         // Ref reg 0 is seeded, so the `VableBoxNotSeeded` guard above lets this
         // through; int reg 1 holds an `OpRef` the walker never gave a concrete.
-        let regs_r = vec![OpRef::input_arg_ref(0)];
-        let regs_i = vec![OpRef::NONE, OpRef::NONE];
+        let regs_r = [OpRef::input_arg_ref(0)];
+        let regs_i = [OpRef::NONE, OpRef::NONE];
         let session = std::cell::RefCell::new(WalkSession::default());
         let mut wc = WalkContext {
             frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -4887,8 +4887,8 @@ fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
             [0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x01, 0x00]
         };
         let stored_value = tc.const_int(7);
-        let regs_r = vec![vable];
-        let regs_i = vec![zero, index, stored_value];
+        let regs_r = [vable];
+        let regs_i = [zero, index, stored_value];
         let descr_pool: Vec<DescrRef> = Vec::new();
         let guards_before = tc.num_guards();
         let session = std::cell::RefCell::new(WalkSession::default());
@@ -5053,8 +5053,8 @@ fn setarrayitem_vable_r_unreconstructable(own_frame: bool) {
         pc: 0,
         next_pc: code.len(),
     };
-    let regs_r = vec![vable, OpRef::NONE, value];
-    let regs_i = vec![zero, index];
+    let regs_r = [vable, OpRef::NONE, value];
+    let regs_i = [zero, index];
     let shadow = own_frame.then_some(CalleeLocalsShadow {
         fold_frame_reg: u16::MAX,
         concrete_frame: frame_ptr,
@@ -5194,8 +5194,8 @@ fn setarrayitem_vable_r_nonstandard_records_unreconstructable_store() {
         pc: 0,
         next_pc: code.len(),
     };
-    let regs_r = vec![vable, OpRef::NONE, value];
-    let regs_i = vec![zero, index];
+    let regs_r = [vable, OpRef::NONE, value];
+    let regs_i = [zero, index];
     let flat = info.num_static_extra_boxes;
     let box_before = tc.virtualizable_box_at(flat);
     let ops_before = tc.num_ops();
@@ -5491,8 +5491,8 @@ fn seed_inline_param_shadows_declines_some_opref_with_void() {
             value: boxed
         })
     );
-    assert!(shadow.opref.get(&0).is_none());
-    assert!(shadow.concrete.get(&0).is_none());
+    assert!(!shadow.opref.contains_key(&0));
+    assert!(!shadow.concrete.contains_key(&0));
 }
 
 #[test]
@@ -5514,8 +5514,8 @@ fn seed_inline_param_shadows_declines_some_opref_with_no_concrete() {
             value: boxed
         })
     );
-    assert!(shadow.opref.get(&0).is_none());
-    assert!(shadow.concrete.get(&0).is_none());
+    assert!(!shadow.opref.contains_key(&0));
+    assert!(!shadow.concrete.contains_key(&0));
 }
 
 #[test]
@@ -5546,8 +5546,8 @@ fn seed_inline_param_shadows_none_void_stays_absent() {
         seed_inline_param_shadows(&mut shadow, 4, &[OpRef::NONE], &[Value::Void], 0),
         Ok(())
     );
-    assert!(shadow.opref.get(&0).is_none());
-    assert!(shadow.concrete.get(&0).is_none());
+    assert!(!shadow.opref.contains_key(&0));
+    assert!(!shadow.concrete.contains_key(&0));
 }
 
 #[test]
@@ -5574,8 +5574,8 @@ fn seed_inline_param_shadows_seeds_reconstructable_args() {
             .map(|entry| (entry.frame_reg, entry.value)),
         Some((4, copied))
     );
-    assert!(shadow.opref.get(&1).is_none());
-    assert!(shadow.concrete.get(&1).is_none());
+    assert!(!shadow.opref.contains_key(&1));
+    assert!(!shadow.concrete.contains_key(&1));
     assert_eq!(shadow.opref.get(&2).copied(), Some(boxed_int));
     assert_eq!(
         shadow.concrete.get(&2).map(|entry| entry.value),
@@ -5652,8 +5652,8 @@ fn read_retired_callee_local(
     };
     shadow.set_opref(0, stale);
     shadow.set_concrete(0, 0, stale_value);
-    let regs_r = vec![vable, OpRef::NONE, OpRef::NONE];
-    let regs_i = vec![index, index];
+    let regs_r = [vable, OpRef::NONE, OpRef::NONE];
+    let regs_i = [index, index];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -5999,7 +5999,7 @@ fn drive_int_add_jump_if_ovf(
     let rhs = OpRef::input_arg_int(1);
     tc.set_opref_concrete(lhs, Value::Int(lhs_value));
     tc.set_opref_concrete(rhs, Value::Int(rhs_value));
-    let regs_i = vec![lhs, rhs, OpRef::NONE];
+    let regs_i = [lhs, rhs, OpRef::NONE];
     let mut concrete_i = vec![
         ConcreteValue::Int(lhs_value),
         ConcreteValue::Int(rhs_value),
@@ -6204,8 +6204,8 @@ fn drive_alloc_with_descr(
     let descr_pool = vec![crate::descr::w_int_size_descr()];
     let mut tc = TraceCtx::for_test_types(&[]);
     tc.set_cpu(cpu);
-    let regs_r = vec![OpRef::NONE];
-    let concrete_r = vec![ConcreteValue::Null];
+    let regs_r = [OpRef::NONE];
+    let concrete_r = [ConcreteValue::Null];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -7720,7 +7720,7 @@ fn switch_id_jumps_to_target_or_falls_through() {
     for (name, key, jump_to) in cases {
         let mut tc = fresh_trace_ctx();
         let value = tc.const_int(key);
-        let regs_i = vec![value];
+        let regs_i = [value];
         let descr_pool = switch_descr_pool(&[(5, 17), (9, 23)]);
         let _descr = done_descr_ref_for_tests();
         let session = std::cell::RefCell::new(WalkSession::default());
@@ -7785,7 +7785,7 @@ fn switch_id_requires_concrete_int_value() {
         0x00, // d descr index 0
     ];
     let mut tc = fresh_trace_ctx();
-    let regs_i = vec![OpRef::input_arg_int(0)];
+    let regs_i = [OpRef::input_arg_int(0)];
     let descr_pool = switch_descr_pool(&[(5, 17)]);
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -7859,7 +7859,7 @@ fn goto_if_not_truthy_records_guard_true_and_falls_through() {
     ];
     let mut tc = fresh_trace_ctx();
     let value = tc.const_int(1);
-    let regs_i = vec![value];
+    let regs_i = [value];
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -7924,7 +7924,7 @@ fn goto_if_not_falsy_records_guard_false_and_jumps() {
     ];
     let mut tc = fresh_trace_ctx();
     let value = tc.const_int(0);
-    let regs_i = vec![value];
+    let regs_i = [value];
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -7988,7 +7988,7 @@ fn goto_if_not_requires_concrete_int_value() {
         0x00, // L target = 0x0040
     ];
     let mut tc = fresh_trace_ctx();
-    let regs_i = vec![OpRef::input_arg_int(0)];
+    let regs_i = [OpRef::input_arg_int(0)];
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -10673,8 +10673,7 @@ fn append_journal_rollback_rewinds_object_length() {
 
 /// Tests use the production `PyreJitCodeDescr` adapter
 /// directly — the type lives at
-/// `pyre-jit-trace/src/descr.rs::PyreJitCodeDescr`
-/// + `descr::make_jitcode_descr(idx)` so the walker's
+/// `pyre-jit-trace/src/descr.rs::PyreJitCodeDescr` + `descr::make_jitcode_descr(idx)` so the walker's
 /// `as_jitcode_descr()` cast exercises production code, not a
 /// test-local duplicate.
 use crate::descr::make_jitcode_descr;
@@ -10897,7 +10896,7 @@ fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
     let root_code = [inline, 0, 0, 1, 0, 0, ret, 0];
     let mut trace_ctx = fresh_trace_ctx();
     let expected = OpRef::input_arg_typed(0, Type::Ref);
-    let regs_r = vec![expected];
+    let regs_r = [expected];
     trace_ctx.heap_cache_mut().class_now_known(expected);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut walk_ctx = WalkContext {
@@ -12959,7 +12958,7 @@ fn top_level_raise_settles_the_vable_token() {
     // when an earlier field store is remapped onto the first listed row
     // at that offset. The token protocol is the SETFIELD whose value is
     // FORCE_TOKEN; `cpu.fielddescrof(VTYPE, 'vable_token')` names it.
-    let ops: Vec<_> = tc.ops().iter().cloned().collect();
+    let ops: Vec<_> = tc.ops().to_vec();
     let token_store = ops
         .iter()
         .rev()
@@ -13027,7 +13026,7 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
     // class-pinned cache.
     let exc_box = OpRef::input_arg_ref(0);
     let regs: Vec<OpRef> = vec![OpRef::NONE, OpRef::NONE, exc_box, OpRef::NONE];
-    let concrete = vec![
+    let concrete = [
         ConcreteValue::Null,
         ConcreteValue::Null,
         ConcreteValue::Ref(exc_ptr),
@@ -17018,7 +17017,7 @@ fn run_symbolic_box_str_dispatch(
         "unicodeobject",
         "box_str_constant",
     ]);
-    let regs_i = vec![tc.const_int(symbolic)];
+    let regs_i = [tc.const_int(symbolic)];
     let (arg, expected_ptr) = match arg_kind {
         SymbolicBoxStrArg::InternedStr => {
             let obj = pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(
@@ -17040,7 +17039,7 @@ fn run_symbolic_box_str_dispatch(
         }
         SymbolicBoxStrArg::NonConstant => (OpRef::input_arg_ref(0), None),
     };
-    let regs_r = vec![arg, OpRef::NONE];
+    let regs_r = [arg, OpRef::NONE];
     let descr_pool = vec![make_call_descr(
         31,
         vec![Type::Ref],
@@ -18106,7 +18105,7 @@ fn release_gil_forcing_stores_precede_call() {
     let ei = call_descr.get_extra_info();
     let funcbox = tc.const_int(forces_folded_vref_for_release_gil as *const () as i64);
     let allboxes = [funcbox, tc.const_int(40), tc.const_int(2)];
-    let regs_i = vec![OpRef::NONE];
+    let regs_i = [OpRef::NONE];
     let regs_r: Vec<OpRef> = Vec::new();
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -22691,7 +22690,7 @@ fn install_carrier_latch_helper(
     startpoints: &[usize],
 ) -> (std::sync::Arc<majit_metainterp::jitcode::JitCode>, usize) {
     let code = residual_call_with_funcbox(0);
-    let mut points: Vec<usize> = startpoints.iter().copied().collect();
+    let mut points: Vec<usize> = startpoints.to_vec();
     points.push(0);
     points.push(code.len());
     if let Some(op) = crate::jitcode_runtime::decode_op_at(&code, 0) {
@@ -26035,8 +26034,8 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
     let red0 = tc.const_ref(0x2_0000); // rr[0]
     let red1 = tc.const_ref(0x3_0000); // rr[1]
     let is_being_profiled = tc.const_int(0); // gi[1]
-    let regs_i = vec![next_instr, is_being_profiled];
-    let regs_r = vec![pycode, red0, red1];
+    let regs_i = [next_instr, is_being_profiled];
+    let regs_r = [pycode, red0, red1];
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -26330,8 +26329,8 @@ fn jit_merge_point_consumes_prepared_bridge_exception_resume() {
     let red0 = tc.const_ref(0x2_0000);
     let red1 = tc.const_ref(0x3_0000);
     let is_being_profiled = tc.const_int(0); // gi[1]
-    let regs_i = vec![next_instr, is_being_profiled];
-    let regs_r = vec![pycode, red0, red1];
+    let regs_i = [next_instr, is_being_profiled];
+    let regs_r = [pycode, red0, red1];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -26459,8 +26458,8 @@ fn jit_merge_point_inlined_first_visit_continues_before_loop_header() {
     let red0 = tc.const_ref(0x2_0000);
     let red1 = tc.const_ref(0x3_0000);
     let is_being_profiled = tc.const_int(0);
-    let regs_i = vec![next_instr, is_being_profiled];
-    let regs_r = vec![pycode, red0, red1];
+    let regs_i = [next_instr, is_being_profiled];
+    let regs_r = [pycode, red0, red1];
     let session = std::cell::RefCell::new(WalkSession::default());
     session.borrow_mut().framestack.push(InlineFrame {
         is_portal: false,
@@ -26563,8 +26562,8 @@ fn jit_merge_point_nested_helper_stamped_surfaces_call_assembler() {
     let red0 = tc.const_ref(0x2_0000);
     let red1 = tc.const_ref(0x3_0000);
     let is_being_profiled = tc.const_int(0);
-    let regs_i = vec![next_instr, is_being_profiled];
-    let regs_r = vec![pycode, red0, red1];
+    let regs_i = [next_instr, is_being_profiled];
+    let regs_r = [pycode, red0, red1];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut mode = test_fbw_mode();
     mode.transparent_helper_subwalk = true;
@@ -26928,7 +26927,7 @@ fn loop_header_stamps_seen_flag() {
     let code = [lh_byte, 0x00]; // i: register slot 0 holds the jdindex
     let mut tc = fresh_trace_ctx();
     let jdindex = tc.const_int(0);
-    let regs_i = vec![jdindex];
+    let regs_i = [jdindex];
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -27267,8 +27266,8 @@ fn jit_merge_point_unresolved_green_key_fails_loud() {
     ];
     let mut tc = fresh_trace_ctx();
     // i0 is a non-constant input arg → no concrete next_instr.
-    let regs_i = vec![OpRef::input_arg_int(0)];
-    let regs_r = vec![tc.const_ref(0x1_0000)];
+    let regs_i = [OpRef::input_arg_int(0)];
+    let regs_r = [tc.const_ref(0x1_0000)];
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -27793,7 +27792,7 @@ fn int_scratch_move_carries_the_concrete_shadow_to_the_destination() {
     let dst_before = OpRef::input_arg_int(1);
     tc.set_opref_concrete(src, Value::Int(7));
     tc.set_opref_concrete(dst_before, Value::Int(99));
-    let regs_i = vec![src, dst_before];
+    let regs_i = [src, dst_before];
     let mut concrete_i = vec![ConcreteValue::Int(7), ConcreteValue::Int(99)];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -29255,7 +29254,7 @@ fn push_exc_info_prev_save_completes_without_an_anchored_nullity_guard() {
     let mut mode = test_fbw_mode();
     mode.snapshot_sym = &snapshot_sym;
 
-    let regs_r = vec![dst_box];
+    let regs_r = [dst_box];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -29351,7 +29350,7 @@ fn push_exc_info_prev_save_without_anchor_does_not_bake_w_prev() {
     let mut mode = test_fbw_mode();
     mode.snapshot_sym = &snapshot_sym;
 
-    let regs_r = vec![dst_box];
+    let regs_r = [dst_box];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {

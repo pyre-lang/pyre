@@ -104,7 +104,7 @@ fn dispatch_pop(program: &Bytecode, threshold: u32) -> i64 {
             }
             OP_BIND_POP => {
                 let popped = pop_stack(state.sel);
-                state.total = state.total + popped;
+                state.total += popped;
             }
             OP_ENCLOSED_BREAK => {
                 if state.total == 0 {

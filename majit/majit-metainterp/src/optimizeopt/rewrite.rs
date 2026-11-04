@@ -2439,7 +2439,7 @@ mod tests {
     fn producer_operand(ops: &[majit_ir::OpRc], opref: OpRef) -> Operand {
         ops.iter()
             .find(|op| op.pos().get() == opref)
-            .map(|op| Operand::from_bound_op(op))
+            .map(Operand::from_bound_op)
             .unwrap_or_else(|| panic!("no producer at {opref:?}"))
     }
 

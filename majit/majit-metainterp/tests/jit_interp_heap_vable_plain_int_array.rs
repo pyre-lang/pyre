@@ -90,7 +90,7 @@ fn heap_vable_cells_sum(program: &Bytecode, threshold: u32, frame: usize, n: i64
                 state.frame.acc = state.frame.acc + state.cells[i];
             }
             OP_STEP => {
-                state.i = state.i + 1i64;
+                state.i += 1i64;
             }
             OP_JUMP_BACK => {
                 let target = program[pc] as usize;

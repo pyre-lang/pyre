@@ -64,8 +64,8 @@ fn mainloop(program: &Bytecode, limit: i64, threshold: u32) -> i64 {
         pc += 1;
 
         match opcode {
-            OP_ACC => state.fregs[0] = state.fregs[0] + 1.25,
-            OP_INC => state.regs[0] = state.regs[0] + 1,
+            OP_ACC => state.fregs[0] += 1.25,
+            OP_INC => state.regs[0] += 1,
             OP_JUMP_BACK => {
                 let target = program[pc] as usize;
                 pc += 1;

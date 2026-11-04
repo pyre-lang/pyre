@@ -121,11 +121,11 @@ fn split_str_sum(program: &Bytecode, threshold: u32, s: usize, ticks: i64) -> i6
         let opcode = program[pc];
         match opcode {
             OP_ADD => {
-                state.acc = state.acc + ll_strgetitem(state.s, 0);
+                state.acc += ll_strgetitem(state.s, 0);
                 pc += 1;
             }
             OP_LOOP => {
-                state.ticks = state.ticks - 1i64;
+                state.ticks -= 1i64;
                 if state.ticks != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;

@@ -1339,8 +1339,8 @@ mod tests {
             let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
                 continue;
             };
-            match &call.func {
-                CallFunc::Regular(reg) => match &reg.kind {
+            if let CallFunc::Regular(reg) = &call.func {
+                match &reg.kind {
                     CallKind::Fun(FunId::Regular { id }) => {
                         entry.insert(cg.callee_node(llbc, &[], *id, &reg.generics));
                     }
@@ -1352,8 +1352,7 @@ mod tests {
                         }
                     }
                     _ => {}
-                },
-                _ => {}
+                }
             }
         }
         entry
@@ -1391,14 +1390,14 @@ mod tests {
 
         let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
         let llbc = crate::test_support::load_ullbc(path);
-        let cg = build(&llbc);
+        let cg = build(llbc);
         for fd in llbc.iter_fun_decls() {
             let Some(body) = fd.unstructured() else {
                 continue;
             };
             let stripped = strip_cleanup_blocks(body);
             let got = cg.callees.get(&fd.def_id).cloned().unwrap_or_default();
-            let want = all_block_callees(&llbc, &stripped, &cg);
+            let want = all_block_callees(llbc, &stripped, &cg);
             assert_eq!(
                 got,
                 want,

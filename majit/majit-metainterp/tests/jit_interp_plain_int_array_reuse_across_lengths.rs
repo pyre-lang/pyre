@@ -82,12 +82,12 @@ fn two_length_sum(
     while state.pos < state.n {
         can_enter_jit!(driver, 0usize, &mut state, program, || {});
         jit_merge_point!(driver, program, pc; state);
-        state.acc = state.acc + state.cells[state.i as usize];
-        state.i = state.i + 1i64;
+        state.acc += state.cells[state.i as usize];
+        state.i += 1i64;
         if state.i >= state.len {
             state.i = 0i64;
         }
-        state.pos = state.pos + 1i64;
+        state.pos += 1i64;
     }
     let first = state.acc;
     COMPILES_AFTER_FIRST.store(COMPILES.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -102,12 +102,12 @@ fn two_length_sum(
     while state.pos < state.n {
         can_enter_jit!(driver, 0usize, &mut state, program, || {});
         jit_merge_point!(driver, program, pc; state);
-        state.acc = state.acc + state.cells[state.i as usize];
-        state.i = state.i + 1i64;
+        state.acc += state.cells[state.i as usize];
+        state.i += 1i64;
         if state.i >= state.len {
             state.i = 0i64;
         }
-        state.pos = state.pos + 1i64;
+        state.pos += 1i64;
     }
     (first, state.acc)
 }

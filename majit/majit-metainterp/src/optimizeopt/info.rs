@@ -2716,8 +2716,8 @@ mod tests {
 
     /// A container field that is a virtual slice (non-constant start, length
     /// > 2) of another virtual string. `copy_str_content` emits
-    /// COPYSTRCONTENT through `Optimizer.emit_extra`, so the source is
-    /// forced before the copy is appended.
+    /// >    COPYSTRCONTENT through `Optimizer.emit_extra`, so the source is
+    /// >    forced before the copy is appended.
     #[test]
     fn force_slice_field_source_newstr_precedes_copystrcontent() {
         let (mut opt, mut ctx) = two_passon();

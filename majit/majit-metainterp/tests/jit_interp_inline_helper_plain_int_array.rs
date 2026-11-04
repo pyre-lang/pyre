@@ -104,7 +104,7 @@ fn interpreter_cells_read_matches_the_seeded_value() {
 /// I-list, so the identity slots at i1/i2 are preceded by i0.
 #[test]
 fn blackhole_inline_call_passes_cells_ptr_as_int_args() {
-    let cells = vec![11i64, 22, 33];
+    let cells = [11i64, 22, 33];
     let expected = cells[0];
 
     let mut helper = JitCodeBuilder::new();

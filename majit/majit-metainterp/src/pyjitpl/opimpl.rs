@@ -7193,7 +7193,7 @@ where
                 .descr_at(calldescr_idx as usize)
                 .and_then(crate::jitcode::RuntimeBhDescr::as_optimizer_descr)
                 .cloned()
-                .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(&calldescr));
+                .unwrap_or_else(|| crate::call_descr::call_descr_from_bh(calldescr));
             let func = frame
                 .int_regs
                 .get(funcptr_reg as usize)

@@ -123,23 +123,23 @@ macro_rules! stack_machine {
                     match opcode {
                         OP_PUSH1 => {
                             state.stack[state.sp] = 1;
-                            state.sp = state.sp + 1;
+                            state.sp += 1;
                         }
                         OP_PUSH2 => {
                             state.stack[state.sp] = 2;
-                            state.sp = state.sp + 1;
+                            state.sp += 1;
                         }
                         OP_ADD => {
                             let top = state.stack[state.sp - 1];
-                            state.sp = state.sp - 1;
-                            state.stack[state.sp - 1] = state.stack[state.sp - 1] + top;
+                            state.sp -= 1;
+                            state.stack[state.sp - 1] += top;
                         }
                         OP_DRAIN => {
-                            state.sp = state.sp - 1;
-                            state.acc = state.acc + state.stack[state.sp];
+                            state.sp -= 1;
+                            state.acc += state.stack[state.sp];
                         }
                         OP_BACK => {
-                            state.counter = state.counter - 1;
+                            state.counter -= 1;
                             if state.counter != 0 {
                                 can_enter_jit!(driver, 0usize, &mut state, program, || {});
                                 pc = 0;

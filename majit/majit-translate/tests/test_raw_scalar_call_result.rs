@@ -109,10 +109,7 @@ fn root_op<'a>(
                 }
             }
         }
-        match next {
-            Some(src) => current = src,
-            None => return None,
-        }
+        current = next?;
     }
     None
 }
@@ -141,7 +138,7 @@ fn ops(graph: &FunctionGraph) -> impl Iterator<Item = &SpaceOperation> {
     graph.blocks.iter().flat_map(|block| &block.operations)
 }
 
-fn call_result<'a>(kind: &'a OpKind) -> Option<(&'a ValueType, Option<&'a str>)> {
+fn call_result(kind: &OpKind) -> Option<(&ValueType, Option<&str>)> {
     match kind {
         OpKind::Call {
             result_ty, target, ..
@@ -206,15 +203,12 @@ fn assert_returned_call(graph: &FunctionGraph, leaf: &str) {
 fn call_returned_raw_scalar_pointer_is_int() {
     let llbc = load_llbc(INTERPRETER_LLBC);
     common::with_shared_lowering(llbc, |context| {
-        let inner = lower_fun_decl(&context, find_method(&llbc, "ticker_addr", "ActionFlag"))
+        let inner = lower_fun_decl(context, find_method(llbc, "ticker_addr", "ActionFlag"))
             .expect("lower ActionFlag::ticker_addr");
         assert_returned_call(&inner, "as_ptr");
 
-        let producer = lower_fun_decl(
-            &context,
-            find_method(&llbc, "ticker_addr", "SpaceActionFlag"),
-        )
-        .expect("lower SpaceActionFlag::ticker_addr");
+        let producer = lower_fun_decl(context, find_method(llbc, "ticker_addr", "SpaceActionFlag"))
+            .expect("lower SpaceActionFlag::ticker_addr");
         assert_returned_call(&producer, "ticker_addr");
     });
 }
@@ -233,14 +227,14 @@ fn mapdict_fns<'a>(llbc: &'a Llbc, leaf: &str) -> Vec<&'a FunDecl> {
 fn mapdict_get_reads_slots_map_pointer_as_int() {
     let llbc = load_llbc(INTERPRETER_LLBC);
     common::with_shared_lowering(llbc, |context| {
-        let gets = mapdict_fns(&llbc, "_get_mapdict_map");
+        let gets = mapdict_fns(llbc, "_get_mapdict_map");
         assert!(
             !gets.is_empty(),
             "mapdict _get_mapdict_map is in interpreter LLBC"
         );
         let mut saw_pos0 = false;
         for fd in gets {
-            let graph = lower_fun_decl(&context, fd)
+            let graph = lower_fun_decl(context, fd)
                 .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
             let pos0: Vec<_> = ops(&graph)
                 .filter_map(|op| match &op.kind {
@@ -263,9 +257,9 @@ fn mapdict_get_reads_slots_map_pointer_as_int() {
             "MapdictCarrier::_get_mapdict_map FieldReads slots().0"
         );
 
-        let slots = mapdict_fns(&llbc, "slots");
+        let slots = mapdict_fns(llbc, "slots");
         assert_eq!(slots.len(), 1, "one MapdictCarrier::slots");
-        let slots = lower_fun_decl(&context, slots[0]).expect("lower MapdictCarrier::slots");
+        let slots = lower_fun_decl(context, slots[0]).expect("lower MapdictCarrier::slots");
         let writes: Vec<_> = ops(&slots)
             .filter_map(|op| match &op.kind {
                 OpKind::FieldWrite { field, ty, .. } if field.name == "__pos_0" => Some(ty),
@@ -287,7 +281,7 @@ fn typed_array_base_call_stays_ref() {
             "pyre_object::int_array::<Impl>::index",
             "pyre_object::float_array::<Impl>::index",
         ] {
-            let graph = lower_fun_decl(&context, find_exact(&llbc, path)).unwrap_or_else(|err| {
+            let graph = lower_fun_decl(context, find_exact(llbc, path)).unwrap_or_else(|err| {
                 panic!("lower {path}: {err}");
             });
             let bases = call_results_named(&graph, "base");
@@ -308,7 +302,7 @@ fn typed_array_base_call_stays_ref() {
 fn integer_cast_to_raw_scalar_stays_int() {
     let llbc = load_llbc(MODULE_LLBC);
     common::with_shared_lowering(llbc, |context| {
-        let graph = lower_fun_decl(&context, find_method(&llbc, "as_ptr", "HashStateStorage"))
+        let graph = lower_fun_decl(context, find_method(llbc, "as_ptr", "HashStateStorage"))
             .expect("lower HashStateStorage::as_ptr");
         let leaves: Vec<_> = ops(&graph)
             .filter_map(|op| call_result(&op.kind).and_then(|(_, leaf)| leaf))
@@ -340,11 +334,8 @@ fn integer_cast_to_raw_scalar_stays_int() {
             ),
         }
 
-        let widened = lower_fun_decl(
-            &context,
-            find_method(&llbc, "as_mut_ptr", "HashStateStorage"),
-        )
-        .expect("lower HashStateStorage::as_mut_ptr");
+        let widened = lower_fun_decl(context, find_method(llbc, "as_mut_ptr", "HashStateStorage"))
+            .expect("lower HashStateStorage::as_mut_ptr");
         assert_returned_call(&widened, "as_ptr");
     });
 }
@@ -438,10 +429,10 @@ fn map_terminator_w_cls_overlay_cast_is_dest_typed_someptr() {
         let mut saw_overlay_hints = false;
         let mut saw_pure_w_cls = false;
         for leaf in ["map_terminator_w_cls", "instance_getclass"] {
-            let fns = mapdict_fns(&llbc, leaf);
+            let fns = mapdict_fns(llbc, leaf);
             assert!(!fns.is_empty(), "{leaf} is in pyre-object LLBC");
             for fd in fns {
-                let graph = lower_fun_decl(&context, fd)
+                let graph = lower_fun_decl(context, fd)
                     .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
                 for op in ops(&graph) {
                     if let OpKind::Call {
@@ -644,10 +635,10 @@ fn assert_mapnode_casts_are_word_operands(graph: &FunctionGraph) {
 fn instance_getclass_word_to_mapnode_is_int_cast_instance() {
     let llbc = load_llbc(OBJECT_LLBC);
     common::with_shared_lowering(llbc, |context| {
-        let fns = mapdict_fns(&llbc, "instance_getclass");
+        let fns = mapdict_fns(llbc, "instance_getclass");
         assert!(!fns.is_empty(), "instance_getclass is in pyre-object LLBC");
         for fd in fns {
-            let graph = lower_fun_decl(&context, fd)
+            let graph = lower_fun_decl(context, fd)
                 .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
             assert_mapnode_casts_are_word_operands(&graph);
         }
@@ -655,10 +646,10 @@ fn instance_getclass_word_to_mapnode_is_int_cast_instance() {
 
     let interp = load_llbc(INTERPRETER_LLBC);
     common::with_shared_lowering(interp, |interp_ctx| {
-        let terms = mapdict_fns(&interp, "_get_mapdict_map");
+        let terms = mapdict_fns(interp, "_get_mapdict_map");
         let mut checked_interp_graph = false;
         for fd in terms {
-            let graph = lower_fun_decl(&interp_ctx, fd)
+            let graph = lower_fun_decl(interp_ctx, fd)
                 .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
             let has_word_mapnode = ops(&graph).any(|op| {
                 majit_translate::model::cast_instance_root(&op.kind).is_some_and(is_mapnode_leaf)
@@ -903,7 +894,7 @@ fn sink_call(graph: &FunctionGraph) -> &OpKind {
     found.unwrap_or_else(|| panic!("missing sink_pair\n{}", op_lines(graph)))
 }
 
-fn call_arg<'a>(kind: &'a OpKind, index: usize) -> &'a majit_translate::flowspace::model::Variable {
+fn call_arg(kind: &OpKind, index: usize) -> &majit_translate::flowspace::model::Variable {
     let OpKind::Call { args, .. } = kind else {
         panic!("not a call");
     };
@@ -912,10 +903,7 @@ fn call_arg<'a>(kind: &'a OpKind, index: usize) -> &'a majit_translate::flowspac
         .unwrap_or_else(|| panic!("call arg {index} is not a variable: {kind:?}"))
 }
 
-fn raw_ops<'a>(
-    graph: &'a FunctionGraph,
-    pred: impl Fn(&OpKind) -> bool,
-) -> Vec<&'a SpaceOperation> {
+fn raw_ops(graph: &FunctionGraph, pred: impl Fn(&OpKind) -> bool) -> Vec<&SpaceOperation> {
     ops(graph).filter(|op| pred(&op.kind)).collect()
 }
 
@@ -3378,7 +3366,7 @@ fn lower_returned_address_sink(
         result_ty,
         sink_body
             .cloned()
-            .unwrap_or_else(|| idle_body(result_ty, &[ptr.clone()])),
+            .unwrap_or_else(|| idle_body(result_ty, std::slice::from_ref(&ptr))),
     );
     let mut fun_decls = vec![caller, sink];
     fun_decls.extend(extra_funs.iter().cloned());

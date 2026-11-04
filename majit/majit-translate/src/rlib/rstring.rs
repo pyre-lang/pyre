@@ -2526,7 +2526,7 @@ fn build_two_way_periodic(
         v("memory", LowLevelType::Signed),
         v("skip_horspool", LowLevelType::Bool),
     ]);
-    goto(&p_init, pcarry(&pin), loop_cond.clone());
+    goto(p_init, pcarry(&pin), loop_cond.clone());
     let lc = block_vars(&loop_cond);
     let still = emit_bin(
         &loop_cond,
@@ -6592,7 +6592,7 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                 block,
                 OpKind::LoweredBlackholeOp {
                     opname: name.to_string(),
-                    args: op.args.iter().map(|a| search_linkarg(a)).collect(),
+                    args: op.args.iter().map(search_linkarg).collect(),
                 },
                 result,
             );
@@ -6614,7 +6614,7 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                     block,
                     OpKind::LoweredBlackholeOp {
                         opname: other.to_string(),
-                        args: op.args.iter().map(|a| search_linkarg(a)).collect(),
+                        args: op.args.iter().map(search_linkarg).collect(),
                     },
                     result,
                 );
@@ -6773,15 +6773,12 @@ mod tests {
             .expect("_twoway_preprocess mints _ll_list_resize_ge");
         let effect = effect_graph_from_search_helper(&ge.borrow());
         for (_, op) in effect.iter_block_ops() {
-            match &op.kind {
-                OpKind::UnaryOp { op, .. } => {
-                    assert_ne!(op, "same_as", "no same_as stand-in: {op:?}");
-                    assert_ne!(
-                        op, "jit_conditional_call",
-                        "jit_conditional_call is the oopspec Call, not a unary"
-                    );
-                }
-                _ => {}
+            if let OpKind::UnaryOp { op, .. } = &op.kind {
+                assert_ne!(op, "same_as", "no same_as stand-in: {op:?}");
+                assert_ne!(
+                    op, "jit_conditional_call",
+                    "jit_conditional_call is the oopspec Call, not a unary"
+                );
             }
         }
         assert!(
@@ -6855,7 +6852,7 @@ mod tests {
         });
         assert_eq!(
             got,
-            Some(args.iter().map(|a| search_linkarg(a)).collect()),
+            Some(args.iter().map(search_linkarg).collect()),
             "keepalive Void Variable: {:?}",
             effect
                 .iter_block_ops()
@@ -6892,7 +6889,7 @@ mod tests {
         });
         assert_eq!(
             got,
-            Some(args.iter().map(|a| search_linkarg(a)).collect()),
+            Some(args.iter().map(search_linkarg).collect()),
             "keepalive Void Constant: {:?}",
             effect
                 .iter_block_ops()

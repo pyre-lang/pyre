@@ -60,11 +60,11 @@ fn split_ref_green(program: &Bytecode, extra: usize, threshold: u32, ticks: i64)
         let opcode = program[pc];
         match opcode {
             OP_ADD => {
-                state.acc = state.acc + ADD_BY;
+                state.acc += ADD_BY;
                 pc += 1;
             }
             OP_LOOP => {
-                state.ticks = state.ticks - 1i64;
+                state.ticks -= 1i64;
                 if state.ticks != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;
@@ -108,11 +108,11 @@ fn virt_ref_green(program: &Bytecode, extra: usize, threshold: u32, ticks: i64) 
         let opcode = program[pc];
         match opcode {
             OP_ADD => {
-                state.acc = state.acc + ADD_BY;
+                state.acc += ADD_BY;
                 pc += 1;
             }
             OP_LOOP => {
-                state.ticks = state.ticks - 1i64;
+                state.ticks -= 1i64;
                 if state.ticks != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;
