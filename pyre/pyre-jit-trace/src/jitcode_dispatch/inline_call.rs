@@ -2300,6 +2300,14 @@ fn blackhole_interprets_inline_callee(fnaddr: i64) -> bool {
 /// a blocker even when the concrete word is unknown.
 fn funcbox_call_blocker(fnaddr: Option<i64>, may_symbolic: bool) -> Option<i64> {
     match fnaddr {
+        Some(addr)
+            if crate::jitcode_runtime::indirectcalltarget_index_for_address(addr as usize)
+                .is_some() =>
+        {
+            // `bytecode_for_address` hits: the blackhole calls the real
+            // fnaddr (`bhimpl_residual_call_*` / `bhimpl_inline_call_*`).
+            None
+        }
         Some(addr) if !majit_jitcode::codewriter::call::is_callable_fnaddr(addr) => Some(addr),
         Some(_) => None,
         None if may_symbolic => Some(0),

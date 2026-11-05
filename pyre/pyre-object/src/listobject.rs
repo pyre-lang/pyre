@@ -350,6 +350,11 @@ const _: () = {
     );
 };
 
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_LIST_USER_MAPDICT_ACCESS for W_ListObjectUser;
+}
+
 /// GC type id assigned to `W_ListObject` at `JitDriver` init time.
 /// Held as a constant here (rather than runtime-queried) so
 /// pyre-object's host-side allocator can reach it without a

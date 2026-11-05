@@ -162,6 +162,11 @@ const _: () = {
     );
 };
 
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_MODULE_USER_MAPDICT_ACCESS for ModuleUser;
+}
+
 /// User-subclass module layout. Appended after the closed ids, ahead of
 /// the target-gated tail (`build_gc`).
 pub const W_MODULE_USER_GC_TYPE_ID: u32 = 204;

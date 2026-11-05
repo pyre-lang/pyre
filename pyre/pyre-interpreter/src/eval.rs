@@ -3164,7 +3164,8 @@ impl NamespaceOpcodeHandler for PyFrame {
         // Three allocations sit between the opcode's `pop_value` and the store:
         // `get_or_create_w_locals` when the frame has no mapping yet, and
         // `named_key_hash` / `w_code_getname_w_or_new` when the `co_names_w`
-        // slot is not realized.  The popped value's only name is this word.
+        // slot is not realized.  The popped value's only name is this word,
+        // and `w_code` is live across `store_name_into_dict`.
         let roots = pyre_object::gc_roots::push_roots();
         let _ = roots.pin_root(value);
         let w_locals = self.get_or_create_w_locals();

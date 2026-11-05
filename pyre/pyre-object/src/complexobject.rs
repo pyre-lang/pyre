@@ -31,6 +31,11 @@ const _: () = {
     );
 };
 
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_COMPLEX_USER_MAPDICT_ACCESS for W_ComplexObjectUser;
+}
+
 /// Field offset of `real` within `W_ComplexObject`.
 pub const COMPLEX_REAL_OFFSET: usize = std::mem::offset_of!(W_ComplexObject, real);
 

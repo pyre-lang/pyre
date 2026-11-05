@@ -269,6 +269,11 @@ const _: () = {
     );
 };
 
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_UNICODE_USER_MAPDICT_ACCESS for W_UnicodeObjectUser;
+}
+
 /// Field offset of `value` within `W_UnicodeObject`, for JIT field access.
 pub const UNICODE_VALUE_OFFSET: usize = std::mem::offset_of!(W_UnicodeObject, value);
 /// Field offset of `byte_len` (UTF-8 byte count) for STR STRLEN parity.

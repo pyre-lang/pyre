@@ -43,6 +43,11 @@ const _: () = {
     );
 };
 
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_LONG_USER_MAPDICT_ACCESS for W_LongObjectUser;
+}
+
 /// User-subclass big-int layout. Appended after the closed ids, ahead of
 /// the target-gated tail (`build_gc`).
 pub const W_LONG_USER_GC_TYPE_ID: u32 = 200;

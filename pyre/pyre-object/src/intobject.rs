@@ -35,6 +35,11 @@ const _: () = {
     );
 };
 
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_INT_USER_MAPDICT_ACCESS for W_IntObjectUser;
+}
+
 /// Field offset of `intval` within `W_IntObject`, for JIT field access.
 pub const INT_INTVAL_OFFSET: usize = std::mem::offset_of!(W_IntObject, intval);
 

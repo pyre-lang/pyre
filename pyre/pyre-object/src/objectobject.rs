@@ -63,6 +63,15 @@ const _: () = {
     );
 };
 
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    /// [`W_ObjectObjectUser`] is layout-identical, so both typeptrs share this
+    /// table (`MapdictStorageMixin._get_mapdict_map` / `BaseUserClassMapdict.getclass`).
+    /// `copy_getclass` is the `import_from_mixin` copy; other carriers share
+    /// [`crate::mapdict::base_user_class_mapdict_getclass`] (`_share_methods`).
+    pub static W_OBJECT_OBJECT_MAPDICT_ACCESS for W_ObjectObject, copy_getclass;
+}
+
 /// Fixed payload size of the `[ob_header | map | storage]` instance
 /// payload (`framework.py:811`).
 pub const W_OBJECT_OBJECT_SIZE: usize = std::mem::size_of::<W_ObjectObject>();

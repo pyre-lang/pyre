@@ -4310,103 +4310,10 @@ impl MapdictObject for pyre_object::W_ObjectObject {
     }
 }
 
-/// Interpreter-named `_getusercls` carriers, then the object-crate match
-/// / typeptr slot (`import_from_mixin` per-class `self.map`).
-macro_rules! mapdict_interp_carrier {
-    ($obj:expr, $p:ident => $body:expr, else => $fallback:expr) => {{
-        let obj = $obj;
-        unsafe {
-        if pyre_object::py_type_check(obj, &crate::module::_collections::DEQUE_USER_TYPE) {
-            let $p = obj as *mut crate::module::_collections::W_DequeUser;
-            $body
-        } else if pyre_object::py_type_check(obj, &crate::module::_io::BYTESIO_USER_TYPE) {
-            let $p = obj as *mut crate::module::_io::W_BytesIOUser;
-            $body
-        } else if pyre_object::py_type_check(obj, &crate::module::_io::STRINGIO_USER_TYPE) {
-            let $p = obj as *mut crate::module::_io::W_StringIOUser;
-            $body
-        } else if pyre_object::py_type_check(obj, &crate::module::_io::BUFFEREDREADER_USER_TYPE) {
-            let $p = obj as *mut crate::module::_io::W_BufferedReaderUser;
-            $body
-        } else if pyre_object::py_type_check(obj, &crate::module::_io::BUFFEREDWRITER_USER_TYPE) {
-            let $p = obj as *mut crate::module::_io::W_BufferedWriterUser;
-            $body
-        } else if pyre_object::py_type_check(obj, &crate::module::_io::BUFFEREDRWPAIR_USER_TYPE) {
-            let $p = obj as *mut crate::module::_io::W_BufferedRWPairUser;
-            $body
-        } else if pyre_object::py_type_check(obj, &crate::module::_io::BUFFEREDRANDOM_USER_TYPE) {
-            let $p = obj as *mut crate::module::_io::W_BufferedRandomUser;
-            $body
-        } else if pyre_object::py_type_check(obj, &crate::module::_io::TEXTIOWRAPPER_USER_TYPE) {
-            let $p = obj as *mut crate::module::_io::W_TextIOWrapperUser;
-            $body
-        } else if pyre_object::py_type_check(obj, &crate::module::_io::FILEIO_USER_TYPE) {
-            let $p = obj as *mut crate::module::_io::W_FileIOUser;
-            $body
-        } else if pyre_object::py_type_check(obj, &crate::module::thread::LOCAL_USER_TYPE) {
-            let $p = obj as *mut crate::module::thread::W_LocalUser;
-            $body
-        } else if pyre_object::py_type_check(obj, &crate::module::r#struct::STRUCT_USER_TYPE) {
-            let $p = obj as *mut crate::module::r#struct::W_StructUser;
-            $body
-        } else if pyre_object::py_type_check(
-            obj,
-            &crate::module::__pypy__::interp_buffer::bufferable_impl::BUFFERABLE_USER_TYPE,
-        ) {
-            let $p = obj
-                as *mut crate::module::__pypy__::interp_buffer::bufferable_impl::W_BufferableUser;
-            $body
-        } else {
-            $fallback
-        }
-        }
-    }};
-}
-
-#[inline]
-unsafe fn mapdict_interp_load_map(obj: PyObjectRef) -> MapRef {
-    mapdict_interp_carrier!(
-        obj,
-        p => (*p).map,
-        else => pyre_object::mapdict::mapdict_typed_load_map(obj)
-    )
-}
-
-#[inline]
-unsafe fn mapdict_interp_store_map(obj: PyObjectRef, map: MapRef) {
-    mapdict_interp_carrier!(
-        obj,
-        p => (*p).map = map,
-        else => pyre_object::mapdict::mapdict_typed_store_map(obj, map)
-    )
-}
-
-#[inline]
-unsafe fn mapdict_interp_load_storage(
-    obj: PyObjectRef,
-) -> *mut pyre_object::object_array::ItemsBlock {
-    mapdict_interp_carrier!(
-        obj,
-        p => (*p).storage,
-        else => pyre_object::mapdict::mapdict_typed_load_storage(obj)
-    )
-}
-
-#[inline]
-unsafe fn mapdict_interp_store_storage(
-    obj: PyObjectRef,
-    storage: *mut pyre_object::object_array::ItemsBlock,
-) {
-    mapdict_interp_carrier!(
-        obj,
-        p => (*p).storage = storage,
-        else => pyre_object::mapdict::mapdict_typed_store_storage(obj, storage)
-    )
-}
-
 /// A live view of an object's `MapdictStorageMixin` slots. `map` is the
 /// carrier's own typed field (`mapdict.py` `import_from_mixin`,
-/// `typedef.py` `_getusercls`).
+/// `typedef.py` `_getusercls`), reached through the type's
+/// `mapdict_access` slot (`rclass` `getclsfield`).
 #[derive(Clone, Copy)]
 struct MapdictCarrier {
     obj: PyObjectRef,
@@ -4419,18 +4326,19 @@ unsafe fn mapdict_carrier(obj: PyObjectRef) -> MapdictCarrier {
 
 impl MapdictCarrier {
     unsafe fn storage(&self) -> *mut pyre_object::object_array::ItemsBlock {
-        unsafe { mapdict_interp_load_storage(self.obj) }
+        unsafe { pyre_object::mapdict::mapdict_typed_load_storage(self.obj) }
     }
 
     unsafe fn set_storage(&mut self, storage: *mut pyre_object::object_array::ItemsBlock) {
-        unsafe { mapdict_interp_store_storage(self.obj, storage) };
+        unsafe { pyre_object::mapdict::mapdict_typed_store_storage(self.obj, storage) };
     }
 }
 
 impl MapdictObject for MapdictCarrier {
     fn _get_mapdict_map(&self) -> MapRef {
-        // mapdict.py `_get_mapdict_map`: `return jit.promote(self.map)`.
-        majit_ir::jit::promote(unsafe { mapdict_interp_load_map(self.obj) })
+        // MapdictStorageMixin._get_mapdict_map lives on the type slot
+        // (`return jit.promote(self.map)`); the slot body already promotes.
+        unsafe { pyre_object::mapdict::mapdict_typed_load_map(self.obj) }
     }
 
     fn _set_mapdict_map(&mut self, map: MapRef) {
@@ -4440,7 +4348,7 @@ impl MapdictObject for MapdictCarrier {
         let owner = pyre_object::gc_roots::shadow_stack_get(base);
         let map = pyre_object::gc_roots::shadow_stack_get(base + 1) as MapRef;
         unsafe {
-            mapdict_interp_store_map(owner, map);
+            pyre_object::mapdict::mapdict_typed_store_map(owner, map);
         }
         self.obj = owner;
     }

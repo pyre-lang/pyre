@@ -60,13 +60,19 @@ const _: () = {
     );
 };
 
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_ARRAY_USER_MAPDICT_ACCESS for W_ArrayUser;
+}
+
 /// User-subclass `array.array` typeptr (`typedef.py` `_getusercls`).
 /// Instances share `W_Array`'s payload and add mapdict `map` / `storage`.
-pub static ARRAY_USER_TYPE: PyType = new_user_pytype_with_lifeline(
+pub static ARRAY_USER_TYPE: PyType = new_user_pytype_with_lifeline_access(
     "array.array",
     &ARRAY_TYPE,
     std::mem::offset_of!(W_ArrayUser, map),
     std::mem::offset_of!(W_Array, w_weakreflifeline),
+    &W_ARRAY_USER_MAPDICT_ACCESS,
 );
 
 /// User-subclass array layout (`typedef.py` `_getusercls`). Unconditional,

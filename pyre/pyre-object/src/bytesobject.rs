@@ -13,10 +13,11 @@ use crate::pyobject::*;
 pub static BYTES_TYPE: PyType =
     crate::pyobject::new_pytype_with_user_subclass("bytes", &BYTES_USER_TYPE);
 /// `W_BytesObjectUser` (`typedef.py _getusercls(W_BytesObject)`).
-pub static BYTES_USER_TYPE: PyType = crate::pyobject::new_user_pytype(
+pub static BYTES_USER_TYPE: PyType = crate::pyobject::new_user_pytype_with_access(
     "bytes",
     &BYTES_TYPE,
     std::mem::offset_of!(W_BytesObjectUser, map),
+    &W_BYTES_USER_MAPDICT_ACCESS,
 );
 
 /// GC-managed byte buffer behind a `bytearray` body.
@@ -265,6 +266,11 @@ const _: () = {
                 + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
+
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_BYTES_USER_MAPDICT_ACCESS for W_BytesObjectUser;
+}
 
 /// `W_BytesObject.data` — the pointer to the block holding the bytes.
 pub const BYTES_DATA_OFFSET: usize = std::mem::offset_of!(W_BytesObject, data);

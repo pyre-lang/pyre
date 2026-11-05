@@ -8606,6 +8606,22 @@ impl<'a> Lowering<'a> {
         Some((trait_root, method_name))
     }
 
+    /// Decode a Dynamic call through a struct FnPtr field into the
+    /// `(struct_path, field)` pair carried as `family_key`.
+    ///
+    /// `ClassRepr.getclsfield` then `FunctionReprBase.call` is an
+    /// `indirect_call` with `c_graphs` the closed set of FunDefs assigned
+    /// to that field (`descs = list(s_pbc.descriptions)`). A field whose
+    /// harvested family is empty is a runtime-installed pointer and stays
+    /// on the residual path.
+    pub(in crate::front::mir) fn fnptr_struct_field_target(
+        &self,
+        dyn_operand: &Operand,
+    ) -> Option<(String, String)> {
+        let place = operand_place(dyn_operand)?;
+        super::fnptr_struct_field_target(self.llbc, self.body, place)
+    }
+
     /// The unwrapped ADT body `Value` a [`TyRef`] resolves to, following
     /// `Deduplicated` / `Value` wrapper layers.  The returned
     /// object carries the `{"Adt": {"id": …, "generics": …}}` shape both
