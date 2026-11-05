@@ -984,6 +984,15 @@ pub struct WalkSession {
     /// the return and the compile `FINISH` does not leave the outcome's
     /// address stale.
     pub finish_payload: Option<(OpRef, majit_ir::Type)>,
+    /// Per-guard snapshot capture buffers. Taken out for the capture so
+    /// encode may collect without a session borrow, then returned empty
+    /// with capacity kept (`opencoder.py create_top_snapshot` allocates
+    /// only the snapshot arrays).
+    pub(crate) snapshot_active: Vec<OpRef>,
+    pub(crate) snapshot_vable: Vec<majit_metainterp::recorder::SnapshotTagged>,
+    pub(crate) snapshot_vref: Vec<majit_metainterp::recorder::SnapshotTagged>,
+    pub(crate) snapshot_stack_sync: Vec<(usize, OpRef)>,
+    pub(crate) snapshot_saved_shadow: Vec<(usize, Option<OpRef>)>,
 }
 
 impl Default for WalkSession {
@@ -1014,6 +1023,11 @@ impl Default for WalkSession {
             binop_rewind_depth: 0,
             binop_rewind_fresh_from: None,
             finish_payload: None,
+            snapshot_active: Vec::new(),
+            snapshot_vable: Vec::new(),
+            snapshot_vref: Vec::new(),
+            snapshot_stack_sync: Vec::new(),
+            snapshot_saved_shadow: Vec::new(),
         }
     }
 }
@@ -5397,12 +5411,6 @@ pub fn step<Sym: WalkSym>(
     ) {
         return Err(error);
     }
-    // The walker mixes translated vable operations (which update the shadow)
-    // with concrete interpreter steps (which update the heap PyFrame).  Pull
-    // those concrete writes into `virtualizable_boxes` before any handler can
-    // read or synchronize it, matching the invariant documented by
-    // `TraceCtx::refresh_virtualizable_shadow_from_heap`.
-    ctx.trace_ctx.refresh_virtualizable_shadow_from_heap();
     if ctx.is_top_level {
         ctx.session.borrow_mut().recording_opcode_position = op.pc;
     }
@@ -6852,7 +6860,7 @@ fn put_back_virtualizable_mapped_colors<Sym: WalkSym>(
         .pcdep_for_jitcode_pc(merge_pc)
         .filter(|entries| !entries.is_empty())
         .or_else(|| jc.payload.pcdep_for_jitcode_pc(next_pc))
-        .unwrap_or_default();
+        .unwrap_or(&[]);
     if pcdep.is_empty() {
         return;
     }
@@ -6864,7 +6872,7 @@ fn put_back_virtualizable_mapped_colors<Sym: WalkSym>(
         .unwrap_or(0) as usize;
     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
     const KIND_REF: u8 = 1;
-    for &(bank, color, slot) in &pcdep {
+    for &(bank, color, slot) in pcdep {
         if bank != KIND_REF {
             continue;
         }
@@ -7785,6 +7793,64 @@ fn walker_inline_frame_get_w_globals<Sym: WalkSym>(
     )?))
 }
 
+/// Record `pyopcode.py LOAD_NAME`'s `getorcreatedebug().w_locals is not
+/// get_w_globals()` test the way `load_name_value` decides it.
+///
+/// Payload present and `w_locals is w_globals`: records `GuardNonnull` on
+/// `debugdata`, the `getfield_gc_r` of `w_locals` / `w_globals`,
+/// `instance_ptr_eq`, `guard_true`. Anything else declines before emitting.
+pub(crate) fn record_load_name_locals_is_globals<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> Result<bool, DispatchError> {
+    let Some((debugdata_op, majit_ir::Value::Ref(recorded))) = ctx
+        .trace_ctx
+        .virtualizable_entry_at(crate::virtualizable_spec::DEBUGDATA_VABLE_FIELD_INDEX)
+    else {
+        return Ok(false);
+    };
+    if recorded == majit_ir::GcRef::NO_CONCRETE {
+        return Ok(false);
+    }
+    if recorded.as_usize() == 0 {
+        // No payload means `getorcreatedebug` would allocate one, a shape
+        // this fold does not record.
+        return Ok(false);
+    }
+    // Read the override through the SHADOW's payload, which is what the
+    // emitted `getfield_gc_r` reads, and decline before emitting anything if
+    // a distinct locals mapping is live.
+    let shadow = recorded.as_usize() as *const pyre_interpreter::pyframe::FrameDebugData;
+    let w_locals = unsafe { (*shadow).w_locals };
+    let w_globals = unsafe { (*shadow).w_globals };
+    if w_locals.is_null() || !std::ptr::eq(w_locals, w_globals) {
+        return Ok(false);
+    }
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[debugdata_op])?;
+    let locals_op = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        debugdata_op,
+        crate::descr::frame_debug_data_w_locals_descr(),
+    );
+    let globals_op = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        debugdata_op,
+        crate::descr::frame_debug_data_w_globals_descr(),
+    );
+    // `binop_ref_to_int_record`: identical boxes and all-Const pairs fold
+    // to the constant 1 without recording.
+    if locals_op == globals_op || (locals_op.is_constant() && globals_op.is_constant()) {
+        return Ok(true);
+    }
+    let eq = ctx
+        .trace_ctx
+        .record_op(OpCode::InstancePtrEq, &[locals_op, globals_op]);
+    ctx.trace_ctx
+        .set_opref_concrete(eq, majit_ir::Value::Int(1));
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[eq])?;
+    Ok(true)
+}
+
 fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -8242,6 +8308,37 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     regs_r: &(impl RegisterValues + ?Sized),
     regs_f: &(impl RegisterValues + ?Sized),
     outer_jitcode_index: u32,
+    carried_jitcode_pc: i32,
+    entry_jitcode_pc: i32,
+    entry_twin: OuterActiveBoxesEntryTwin,
+    entry_caller: &'static str,
+    vstack: Option<&[OpRef]>,
+) -> Vec<OpRef> {
+    let mut active = Vec::new();
+    collect_outer_active_boxes_into(
+        sym,
+        trace_ctx,
+        regs_i,
+        regs_r,
+        regs_f,
+        outer_jitcode_index,
+        carried_jitcode_pc,
+        entry_jitcode_pc,
+        entry_twin,
+        entry_caller,
+        vstack,
+        &mut active,
+    );
+    active
+}
+
+fn collect_outer_active_boxes_into<Sym: WalkSym>(
+    sym: &Sym,
+    trace_ctx: &mut TraceCtx,
+    regs_i: &(impl RegisterValues + ?Sized),
+    regs_r: &(impl RegisterValues + ?Sized),
+    regs_f: &(impl RegisterValues + ?Sized),
+    outer_jitcode_index: u32,
     // Resume-carried coordinate: liveness banks, color→slot map, and stack
     // depth all key here (`pyjitpl.py get_list_of_active_boxes` at the
     // resume `-live-`; `resume.py ResumeDataLoopMemo.number`). `entry_jitcode_pc`
@@ -8251,17 +8348,35 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     entry_twin: OuterActiveBoxesEntryTwin,
     entry_caller: &'static str,
     vstack: Option<&[OpRef]>,
-) -> Vec<OpRef> {
+    active: &mut Vec<OpRef>,
+) {
     // `#124` Approach B: resolve the base live-box set through the carried
     // JitCode coordinate so the encoder's color set matches the decoder's
     // (`setup_bridge_sym` / `rebuild_inline_callee`), which read the same
     // carried word.  With the flag off `carried_jitcode_pc` is ignored and
     // this is the plain py_pc→jitcode-translation query.
-    let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
-        outer_jitcode_index as i32,
-        carried_jitcode_pc,
-    );
-    let mut active = Vec::with_capacity(banks.int.len() + banks.ref_.len() + banks.float.len());
+    //
+    // Iterate `LivenessIterator` (`liveness.py`) over the `-live-` record
+    // (`get_list_of_active_boxes`) instead of materializing three index Vecs.
+    active.clear();
+    let op_live = crate::state::op_live();
+    let all_liveness = crate::state::liveness_info_snapshot();
+    let live_header =
+        crate::state::jitcode_payload_at(outer_jitcode_index as i32).and_then(|payload| {
+            let jit_pc = payload.resolve_resume_pc_with_jitcode_pc(carried_jitcode_pc, op_live)?;
+            let off = payload.jitcode.get_live_vars_info(jit_pc, op_live);
+            if off + 2 >= all_liveness.len() {
+                return None;
+            }
+            Some((
+                all_liveness[off] as u32,
+                all_liveness[off + 1] as u32,
+                all_liveness[off + 2] as u32,
+                off + 3,
+            ))
+        });
+    let (length_i, length_r, length_f, mut live_cursor) = live_header.unwrap_or((0, 0, 0, 0));
+    active.reserve((length_i + length_r + length_f) as usize);
     // RPython `pyjitpl.py _get_list_of_active_boxes` reads
     // `self.registers_X[index]` directly per liveness index.  Pyre
     // diverges on the Ref bank for portal-owner frames: the
@@ -8333,39 +8448,32 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     // so for them `pcdep_opt` is `None`, `semantic_ref_slot_for_reg_color`
     // returns `None`, and every live color falls to the `regs_r[color]`
     // walk-bank read.
-    let entry_pcdep_entries: Vec<(u8, u16, u16)> = if sym.jitcode().is_null() {
-        Vec::new()
+    let jc = if sym.jitcode().is_null() {
+        None
     } else {
-        unsafe {
-            let jc = &*sym.jitcode();
-            match (entry_twin, entry_jitcode_pc >= 0) {
-                (OuterActiveBoxesEntryTwin::Plain, true) => jc
-                    .payload
-                    .pcdep_for_jitcode_pc(entry_jitcode_pc as usize)
-                    .unwrap_or_default(),
-                (OuterActiveBoxesEntryTwin::Trivia, true) => jc
-                    .payload
-                    .pcdep_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_default(),
-                // Defensive default for a genuinely absent entry coordinate
-                // (marker miss); 0-fire across the corpus.
-                _ => Vec::new(),
-            }
-        }
+        Some(unsafe { &*sym.jitcode() })
     };
-    let (carried_pcdep_entries, carried_stack_only) = if sym.jitcode().is_null() {
-        (Vec::new(), 0usize)
-    } else {
-        unsafe {
-            let jc = &*sym.jitcode();
+    let entry_pcdep_entries: &[(u8, u16, u16)] = match (jc, entry_twin, entry_jitcode_pc >= 0) {
+        (Some(jc), OuterActiveBoxesEntryTwin::Plain, true) => jc
+            .payload
+            .pcdep_for_jitcode_pc(entry_jitcode_pc as usize)
+            .unwrap_or(&[]),
+        (Some(jc), OuterActiveBoxesEntryTwin::Trivia, true) => jc
+            .payload
+            .pcdep_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
+            .unwrap_or(&[]),
+        // Defensive default for a genuinely absent entry coordinate
+        // (marker miss); 0-fire across the corpus.
+        _ => &[],
+    };
+    let (carried_pcdep_entries, carried_stack_only) = match jc {
+        None => (&[] as &[(u8, u16, u16)], 0usize),
+        Some(jc) => {
             let cjc = carried_jitcode_pc;
             let entries = if cjc >= 0 {
-                jc.payload
-                    .pcdep_for_jitcode_pc(cjc as usize)
-                    .unwrap_or_default()
+                jc.payload.pcdep_for_jitcode_pc(cjc as usize).unwrap_or(&[])
             } else {
-                Vec::new()
+                &[] as &[(u8, u16, u16)]
             };
             let depth = if jc.payload.code_ptr.is_null() {
                 0usize
@@ -8394,9 +8502,9 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
         valid_stack_only
     };
     let pcdep_entries_ref: &[(u8, u16, u16)] = if use_carried_map {
-        &carried_pcdep_entries
+        carried_pcdep_entries
     } else {
-        &entry_pcdep_entries
+        entry_pcdep_entries
     };
     let pcdep_opt: Option<&[(u8, u16, u16)]> =
         (!pcdep_entries_ref.is_empty()).then_some(pcdep_entries_ref);
@@ -8408,9 +8516,6 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     // site instead of bleeding NONE values into `encode_snapshot_boxes`
     // where `get_opref_type(NONE)` panics with no breadcrumb pointing at
     // the source.
-    let live_i = banks.int.clone();
-    let live_r = banks.ref_.clone();
-    let live_f = banks.float.clone();
     let (ni, nr, nf) = (regs_i.len(), regs_r.len(), regs_f.len());
     let vable_len = trace_ctx.virtualizable_boxes_len().unwrap_or(0);
     // Int / Float bank candidates: pyre's vable static fields decode as
@@ -8435,18 +8540,25 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
               nlocals={nlocals}, owns_vable={owns_vable}, \
               vable_len={vable_len}, \
               num_regs_i={ni}, num_regs_r={nr}, num_regs_f={nf}, \
-              live_banks_i={live_i:?}, live_banks_r={live_r:?}, live_banks_f={live_f:?}\
-              {int_hint})",
+              live_len_i={length_i}, live_len_r={length_r}, live_len_f={length_f}\
+              {int_hint})"
         )
     };
-    for &idx in &banks.int {
-        let v = regs_i
-            .get_box(idx as usize)
-            .unwrap_or_else(|| panic!("{}", dump_ctx("int", idx)));
-        if v == OpRef::NONE {
-            panic!("{}", dump_ctx("int", idx));
+    use majit_jitcode::liveness::LivenessIterator;
+    if length_i != 0 {
+        // SAFETY: `all_liveness` bank at `live_cursor` is a complete
+        // `encode_liveness` record (`liveness.py` `LivenessIterator.__init__`).
+        let mut it = unsafe { LivenessIterator::new(live_cursor, length_i, &all_liveness) };
+        while let Some(idx) = it.next() {
+            let v = regs_i
+                .get_box(idx as usize)
+                .unwrap_or_else(|| panic!("{}", dump_ctx("int", idx)));
+            if v == OpRef::NONE {
+                panic!("{}", dump_ctx("int", idx));
+            }
+            active.push(v);
         }
-        active.push(v);
+        live_cursor = it.offset();
     }
     // Mirror-sourced operand-stack slots: the walk-level box mirror
     // (`ctx.vstack_boxes`, indexed by absolute operand-stack depth) is the
@@ -8457,285 +8569,295 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     // vstack overlay (`generate_guard(resumepc=orgpc)`); the register file
     // and virtualizable shadow below are the sources there.
     let vstack_mirror = vstack.filter(|boxes| !boxes.is_empty());
-    for &idx in &banks.ref_ {
-        let color = idx as usize;
-        // Semantic slot this color owns at the carried coordinate's `-live-`.
-        // Where it equals the sourced slot, `regs_r[color]` is
-        // `registers_r[index]` (`pyjitpl.py get_list_of_active_boxes`).
-        let carried_owned_slot = crate::state::semantic_ref_slot_for_reg_color(
-            nlocals,
-            carried_stack_only,
-            &carried_pcdep_entries,
-            color,
-        );
-        if let Some(mirror) = vstack_mirror {
-            // Resume operand-stack slot for this live Ref color; the mirror
-            // box for that slot is the live value (bottom-anchored: resume
-            // slot `s` == `vstack_boxes[s]`).
-            if let Some(sem) = crate::state::semantic_ref_slot_for_reg_color(
+    if length_r != 0 {
+        // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
+        let mut it = unsafe { LivenessIterator::new(live_cursor, length_r, &all_liveness) };
+        while let Some(idx) = it.next() {
+            let color = idx as usize;
+            // Semantic slot this color owns at the carried coordinate's `-live-`.
+            // Where it equals the sourced slot, `regs_r[color]` is
+            // `registers_r[index]` (`pyjitpl.py get_list_of_active_boxes`).
+            let carried_owned_slot = crate::state::semantic_ref_slot_for_reg_color(
+                nlocals,
+                carried_stack_only,
+                carried_pcdep_entries,
+                color,
+            );
+            if let Some(mirror) = vstack_mirror {
+                // Resume operand-stack slot for this live Ref color; the mirror
+                // box for that slot is the live value (bottom-anchored: resume
+                // slot `s` == `vstack_boxes[s]`).
+                if let Some(sem) = crate::state::semantic_ref_slot_for_reg_color(
+                    nlocals,
+                    valid_stack_only,
+                    pcdep_opt.unwrap_or(&[]),
+                    color,
+                ) {
+                    if sem >= nlocals {
+                        let m = mirror.get(sem - nlocals).copied().unwrap_or(OpRef::NONE);
+                        // The walk-level mirror is a sparse, per-opcode value
+                        // source.  A present CONST_NULL is therefore an actual
+                        // PUSH_NULL/self_or_null operand, not the dense vable
+                        // shadow's "slot was never written" encoding.  Only
+                        // OpRef::NONE is a hole.  A CALL-site helper snapshot
+                        // uses the same mirror for the live receiver; overlaying
+                        // a typed ConstPtr(NULL) through a reused color would
+                        // plant NULL on a live Ref, so skip that overlay.
+                        if m != OpRef::NONE && !opref_is_null_const_ptr(m) {
+                            active.push(m);
+                            continue;
+                        }
+                        if m == OpRef::NONE && carried_owned_slot != Some(sem) {
+                            let shadow_sources_slot = trace_ctx
+                                .virtualizable_box_at(
+                                    crate::virtualizable_gen::NUM_VABLE_SCALARS + sem,
+                                )
+                                .is_some_and(|b| {
+                                    b != OpRef::NONE
+                                        && !opref_is_null_const_ptr(b)
+                                        && b.ty() == Some(majit_ir::Type::Ref)
+                                });
+                            if !shadow_sources_slot {
+                                // The operand-stack mirror has no box, but the
+                                // register for this live color still holds one
+                                // (the value `LOAD_FAST` left there, for
+                                // instance). `_get_list_of_active_boxes` reads
+                                // `registers_r[index]` for every live color with
+                                // no further test, so encode that register.
+                                //
+                                // A bridge inputarg left in the color after the
+                                // virtualizable slot moved on is not that value.
+                                // The merge point publishes the shadow box
+                                // (`reached_loop_header` `live_arg_boxes +=
+                                // virtualizable_boxes`). Naming the stale
+                                // inputarg makes the loop cut decline a box the
+                                // entry contract does not carry. Fall through
+                                // and let the shadow arm below choose.
+                                let reg = regs_r.get_box(color).unwrap_or(OpRef::NONE);
+                                if reg != OpRef::NONE && !reg.is_input_arg() {
+                                    active.push(reg);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let fallback = || {
+                regs_r
+                    .get_box(color)
+                    .unwrap_or_else(|| panic!("{}", dump_ctx("ref", idx)))
+            };
+            let semantic_idx = crate::state::semantic_ref_slot_for_reg_color(
                 nlocals,
                 valid_stack_only,
                 pcdep_opt.unwrap_or(&[]),
                 color,
-            ) {
-                if sem >= nlocals {
-                    let m = mirror.get(sem - nlocals).copied().unwrap_or(OpRef::NONE);
-                    // The walk-level mirror is a sparse, per-opcode value
-                    // source.  A present CONST_NULL is therefore an actual
-                    // PUSH_NULL/self_or_null operand, not the dense vable
-                    // shadow's "slot was never written" encoding.  Only
-                    // OpRef::NONE is a hole.  A CALL-site helper snapshot
-                    // uses the same mirror for the live receiver; overlaying
-                    // a typed ConstPtr(NULL) through a reused color would
-                    // plant NULL on a live Ref, so skip that overlay.
-                    if m != OpRef::NONE && !opref_is_null_const_ptr(m) {
-                        active.push(m);
-                        continue;
-                    }
-                    if m == OpRef::NONE && carried_owned_slot != Some(sem) {
-                        let shadow_sources_slot = trace_ctx
-                            .virtualizable_box_at(crate::virtualizable_gen::NUM_VABLE_SCALARS + sem)
-                            .is_some_and(|b| {
-                                b != OpRef::NONE
-                                    && !opref_is_null_const_ptr(b)
-                                    && b.ty() == Some(majit_ir::Type::Ref)
-                            });
-                        if !shadow_sources_slot {
-                            // The operand-stack mirror has no box, but the
-                            // register for this live color still holds one
-                            // (the value `LOAD_FAST` left there, for
-                            // instance). `_get_list_of_active_boxes` reads
-                            // `registers_r[index]` for every live color with
-                            // no further test, so encode that register.
+            );
+            // Portal-red routing applies only to the force-alived SCRATCH case
+            // (`filter_liveness_in_place` keeps `portal_frame_reg`/`portal_ec_reg`
+            // in every `-live-` R-bank even where the color names no frame slot).
+            // If the walk's live register bank already carries a real box, snapshot
+            // that box first: it is the direct `get_list_of_active_boxes`
+            // (`pyjitpl.py`) source for this live color, and bridge resume uses
+            // the same color-indexed bank to recover the EC red (`state.rs`).
+            // Fall back to the named red field only when the bank is empty.  If both
+            // are empty, the force-alived red is dead at this capture point, so encode
+            // `CONST_NULL` (history.py), matching the union-liveness arm below.
+            //
+            // The jitcode register allocator ALSO assigns these colors to real frame
+            // slots at other PCs (e.g. a call-result register live across a later
+            // call), where `pcdep_color_slots` maps the color to a semantic slot.
+            // Routing such a colliding color to `sym.frame`/`sym.execution_context`
+            // encodes the wrong box; a color that names a live semantic slot therefore
+            // takes the normal slot-value paths below.
+            let is_portal_red_scratch = semantic_idx.is_none()
+                && ((color as u16 == portal_frame_reg && portal_frame_reg != u16::MAX)
+                    || (color as u16 == portal_ec_reg && portal_ec_reg != u16::MAX));
+            let value = if is_portal_red_scratch {
+                let live_reg = regs_r
+                    .get_box(color)
+                    .filter(|&v| v != OpRef::NONE && !opref_is_null_const_ptr(v));
+                let red_field = if color as u16 == portal_frame_reg {
+                    sym.frame()
+                } else {
+                    sym.execution_context()
+                };
+                live_reg
+                    .or_else(|| {
+                        (red_field != OpRef::NONE && !opref_is_null_const_ptr(red_field))
+                            .then_some(red_field)
+                    })
+                    .unwrap_or_else(|| OpRef::const_ptr(majit_ir::GcRef(0)))
+            } else if owns_vable {
+                match semantic_idx {
+                    Some(s_idx) if s_idx < nlocals + valid_stack_only => {
+                        let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+                        let vbox = trace_ctx.virtualizable_box_at(nvs + s_idx);
+                        let walk_box = regs_r.get_box(color);
+                        if s_idx >= nlocals {
+                            // Operand-stack slot. `pyjitpl.py get_list_of_active_boxes`
+                            // reads `self.registers_r[index]`, but pyre's stack
+                            // `write_ref_reg` mirror was retired: the walk
+                            // register may hold a stale value from a prior SSA def
+                            // that shared the color. Prefer the live register
+                            // when the carried coordinate's color→slot map proves
+                            // this color owns the same stack slot — there the
+                            // register read is `registers_r[index]`; where
+                            // ownership is unprovable the virtualizable shadow
+                            // remains authoritative.
                             //
-                            // A bridge inputarg left in the color after the
-                            // virtualizable slot moved on is not that value.
-                            // The merge point publishes the shadow box
-                            // (`reached_loop_header` `live_arg_boxes +=
-                            // virtualizable_boxes`). Naming the stale
-                            // inputarg makes the loop cut decline a box the
-                            // entry contract does not carry. Fall through
-                            // and let the shadow arm below choose.
-                            let reg = regs_r.get_box(color).unwrap_or(OpRef::NONE);
-                            if reg != OpRef::NONE && !reg.is_input_arg() {
-                                active.push(reg);
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let fallback = || {
-            regs_r
-                .get_box(color)
-                .unwrap_or_else(|| panic!("{}", dump_ctx("ref", idx)))
-        };
-        let semantic_idx = crate::state::semantic_ref_slot_for_reg_color(
-            nlocals,
-            valid_stack_only,
-            pcdep_opt.unwrap_or(&[]),
-            color,
-        );
-        // Portal-red routing applies only to the force-alived SCRATCH case
-        // (`filter_liveness_in_place` keeps `portal_frame_reg`/`portal_ec_reg`
-        // in every `-live-` R-bank even where the color names no frame slot).
-        // If the walk's live register bank already carries a real box, snapshot
-        // that box first: it is the direct `get_list_of_active_boxes`
-        // (`pyjitpl.py`) source for this live color, and bridge resume uses
-        // the same color-indexed bank to recover the EC red (`state.rs`).
-        // Fall back to the named red field only when the bank is empty.  If both
-        // are empty, the force-alived red is dead at this capture point, so encode
-        // `CONST_NULL` (history.py), matching the union-liveness arm below.
-        //
-        // The jitcode register allocator ALSO assigns these colors to real frame
-        // slots at other PCs (e.g. a call-result register live across a later
-        // call), where `pcdep_color_slots` maps the color to a semantic slot.
-        // Routing such a colliding color to `sym.frame`/`sym.execution_context`
-        // encodes the wrong box; a color that names a live semantic slot therefore
-        // takes the normal slot-value paths below.
-        let is_portal_red_scratch = semantic_idx.is_none()
-            && ((color as u16 == portal_frame_reg && portal_frame_reg != u16::MAX)
-                || (color as u16 == portal_ec_reg && portal_ec_reg != u16::MAX));
-        let value = if is_portal_red_scratch {
-            let live_reg = regs_r
-                .get_box(color)
-                .filter(|&v| v != OpRef::NONE && !opref_is_null_const_ptr(v));
-            let red_field = if color as u16 == portal_frame_reg {
-                sym.frame()
-            } else {
-                sym.execution_context()
-            };
-            live_reg
-                .or_else(|| {
-                    (red_field != OpRef::NONE && !opref_is_null_const_ptr(red_field))
-                        .then_some(red_field)
-                })
-                .unwrap_or_else(|| OpRef::const_ptr(majit_ir::GcRef(0)))
-        } else if owns_vable {
-            match semantic_idx {
-                Some(s_idx) if s_idx < nlocals + valid_stack_only => {
-                    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-                    let vbox = trace_ctx.virtualizable_box_at(nvs + s_idx);
-                    let walk_box = regs_r.get_box(color);
-                    if s_idx >= nlocals {
-                        // Operand-stack slot. `pyjitpl.py get_list_of_active_boxes`
-                        // reads `self.registers_r[index]`, but pyre's stack
-                        // `write_ref_reg` mirror was retired: the walk
-                        // register may hold a stale value from a prior SSA def
-                        // that shared the color. Prefer the live register
-                        // when the carried coordinate's color→slot map proves
-                        // this color owns the same stack slot — there the
-                        // register read is `registers_r[index]`; where
-                        // ownership is unprovable the virtualizable shadow
-                        // remains authoritative.
-                        //
-                        // "Authoritative" deliberately does NOT extend to a NULL
-                        // shadow slot.  Upstream reads the operand stack out of
-                        // one list — `create_top_snapshot(frame, vable_boxes,
-                        // ...)` (`opencoder.py`) and `live_arg_boxes +=
-                        // self.virtualizable_boxes` (`pyjitpl.py`) are the
-                        // same object — so it is tempting to let the shadow
-                        // answer here too and keep a post-header snapshot inside
-                        // the merge point's published set.  Measured: it is
-                        // wrong.  Letting the NULL answer makes
-                        // `synth/nested_break_not_hot` raise `TypeError:
-                        // comparison on null operand` in `plain_break`, because
-                        // the traced arm has already popped a slot the guard's
-                        // resume target still reads.  The shadow under-reports
-                        // that slot; the walk register carries its live box.
-                        let shadow_is_real = vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
-                        let walk_real =
-                            walk_box.filter(|&v| v != OpRef::NONE && !opref_is_null_const_ptr(v));
-                        let shadow_real =
-                            vbox.filter(|&b| b != OpRef::NONE && !opref_is_null_const_ptr(b));
-                        let carried_pc_proves_slot = carried_owned_slot == Some(s_idx);
-                        // A bridge inputarg left in the color is not the
-                        // stack temp. The merge point's loop inputargs are
-                        // the shadow boxes; naming the inputarg makes the
-                        // loop cut decline it. A NULL shadow still loses to
-                        // the register (`nested_break_not_hot`).
-                        if let (Some(w), Some(s)) = (walk_real, shadow_real) {
-                            if w != s && w.is_input_arg() {
-                                s
+                            // "Authoritative" deliberately does NOT extend to a NULL
+                            // shadow slot.  Upstream reads the operand stack out of
+                            // one list — `create_top_snapshot(frame, vable_boxes,
+                            // ...)` (`opencoder.py`) and `live_arg_boxes +=
+                            // self.virtualizable_boxes` (`pyjitpl.py`) are the
+                            // same object — so it is tempting to let the shadow
+                            // answer here too and keep a post-header snapshot inside
+                            // the merge point's published set.  Measured: it is
+                            // wrong.  Letting the NULL answer makes
+                            // `synth/nested_break_not_hot` raise `TypeError:
+                            // comparison on null operand` in `plain_break`, because
+                            // the traced arm has already popped a slot the guard's
+                            // resume target still reads.  The shadow under-reports
+                            // that slot; the walk register carries its live box.
+                            let shadow_is_real = vbox.is_some_and(|b| !opref_is_null_const_ptr(b));
+                            let walk_real = walk_box
+                                .filter(|&v| v != OpRef::NONE && !opref_is_null_const_ptr(v));
+                            let shadow_real =
+                                vbox.filter(|&b| b != OpRef::NONE && !opref_is_null_const_ptr(b));
+                            let carried_pc_proves_slot = carried_owned_slot == Some(s_idx);
+                            // A bridge inputarg left in the color is not the
+                            // stack temp. The merge point's loop inputargs are
+                            // the shadow boxes; naming the inputarg makes the
+                            // loop cut decline it. A NULL shadow still loses to
+                            // the register (`nested_break_not_hot`).
+                            if let (Some(w), Some(s)) = (walk_real, shadow_real) {
+                                if w != s && w.is_input_arg() {
+                                    s
+                                } else if carried_pc_proves_slot {
+                                    w
+                                } else {
+                                    s
+                                }
                             } else if carried_pc_proves_slot {
-                                w
+                                walk_real.or(vbox).unwrap_or_else(fallback)
+                            } else if shadow_is_real {
+                                vbox.unwrap_or_else(fallback)
                             } else {
-                                s
+                                walk_real.unwrap_or_else(|| vbox.unwrap_or_else(fallback))
                             }
-                        } else if carried_pc_proves_slot {
-                            walk_real.or(vbox).unwrap_or_else(fallback)
-                        } else if shadow_is_real {
-                            vbox.unwrap_or_else(fallback)
                         } else {
-                            walk_real.unwrap_or_else(|| vbox.unwrap_or_else(fallback))
-                        }
-                    } else {
-                        // `pyjitpl.py get_list_of_active_boxes` reads
-                        // `self.registers_r[index]`, and a local's register is
-                        // written in lock-step with the virtualizable array, so
-                        // the live register is the box — the shadow is only the
-                        // fallback for colors the retired mirror left empty.
-                        //
-                        // The color→slot map that named this a local is a
-                        // per-program-point label, not a binding: the regalloc
-                        // freely reuses a local's color for an unrelated SSA
-                        // temp (a residual-call result, a raise operand), and
-                        // the map still reports the slot.  Preferring the
-                        // shadow there substituted the local's value for the
-                        // temp — a `raise` whose operand color doubled as
-                        // `self` then resumed publishing `self` as the
-                        // exception.
-                        //
-                        // A bridge inputarg left in the register after the
-                        // virtualizable slot moved on is not that temp. The
-                        // merge point publishes the shadow box
-                        // (`reached_loop_header` `live_arg_boxes +=
-                        // virtualizable_boxes`), and `CutTrace` treats that
-                        // box as a loop inputarg. Naming the stale inputarg
-                        // instead makes the loop cut decline a box the entry
-                        // contract does not carry.
-                        let walk_real =
-                            walk_box.filter(|&b| b != OpRef::NONE && !opref_is_null_const_ptr(b));
-                        let shadow_real =
-                            vbox.filter(|&b| b != OpRef::NONE && !opref_is_null_const_ptr(b));
-                        match (walk_real, shadow_real) {
-                            (Some(w), Some(s)) if w != s && w.is_input_arg() => s,
-                            _ => walk_real.or(vbox).unwrap_or_else(fallback),
+                            // `pyjitpl.py get_list_of_active_boxes` reads
+                            // `self.registers_r[index]`, and a local's register is
+                            // written in lock-step with the virtualizable array, so
+                            // the live register is the box — the shadow is only the
+                            // fallback for colors the retired mirror left empty.
+                            //
+                            // The color→slot map that named this a local is a
+                            // per-program-point label, not a binding: the regalloc
+                            // freely reuses a local's color for an unrelated SSA
+                            // temp (a residual-call result, a raise operand), and
+                            // the map still reports the slot.  Preferring the
+                            // shadow there substituted the local's value for the
+                            // temp — a `raise` whose operand color doubled as
+                            // `self` then resumed publishing `self` as the
+                            // exception.
+                            //
+                            // A bridge inputarg left in the register after the
+                            // virtualizable slot moved on is not that temp. The
+                            // merge point publishes the shadow box
+                            // (`reached_loop_header` `live_arg_boxes +=
+                            // virtualizable_boxes`), and `CutTrace` treats that
+                            // box as a loop inputarg. Naming the stale inputarg
+                            // instead makes the loop cut decline a box the entry
+                            // contract does not carry.
+                            let walk_real = walk_box
+                                .filter(|&b| b != OpRef::NONE && !opref_is_null_const_ptr(b));
+                            let shadow_real =
+                                vbox.filter(|&b| b != OpRef::NONE && !opref_is_null_const_ptr(b));
+                            match (walk_real, shadow_real) {
+                                (Some(w), Some(s)) if w != s && w.is_input_arg() => s,
+                                _ => walk_real.or(vbox).unwrap_or_else(fallback),
+                            }
                         }
                     }
+                    // `semantic_idx` is `None`: this Ref color names no live
+                    // frame slot at the resume PC.  Under the canonical splice a
+                    // single `-live-` marker is SHARED across a range of Python
+                    // PCs at different stack depths, and its liveness banks carry
+                    // the UNION of those PCs' live colors.  Resuming at a
+                    // shallower PC therefore sees colors that are dead here:
+                    //   - a mapped frame stack slot BEYOND this resume's live
+                    //     window (`semantic_ref_slot_for_reg_color` is `None`
+                    //     because the slot sits past `valid_stack_only`), or
+                    //   - under free (non-identity) coloring, a NON-frame SSA
+                    //     temp (in neither the local nor the stack color map)
+                    //     that is live only at another PC the marker spans.
+                    // Both are dead at this PC: the trace produced no box for a
+                    // dead value, so `registers_r[color]` is NONE.  Both decode
+                    // paths already tolerate this — the blackhole rebuild
+                    // (`state.rs` ref-bank loop) and the bridge decoder drop a
+                    // Ref color whose semantic slot is `None`.  Keep encode
+                    // symmetric: substitute `CONST_NULL` (history.py) so the
+                    // positional snapshot/liveness count stays aligned rather
+                    // than failing loud on the unsourceable dead slot.
+                    // A live color the trace holds a box for is encoded as that
+                    // box whether it was produced in this trace or is a bridge
+                    // inputarg: `_get_list_of_active_boxes` (`pyjitpl.py`) reads
+                    // `registers_r[index]` with no further test. A value computed
+                    // but not yet pushed — a `FOR_ITER` next() result between the
+                    // residual call and the stack push — is live here and its
+                    // inputarg is the only source. Only a NONE register (a color
+                    // dead at this pc under a shared marker) becomes `CONST_NULL`.
+                    // Under the walker (gate-off) each PC owns a depth-narrowed
+                    // marker, so this arm never fires.
+                    None => match regs_r.get_box(color) {
+                        Some(v) if v != OpRef::NONE => v,
+                        _ => OpRef::const_ptr(majit_ir::GcRef(0)),
+                    },
+                    _ => fallback(),
                 }
-                // `semantic_idx` is `None`: this Ref color names no live
-                // frame slot at the resume PC.  Under the canonical splice a
-                // single `-live-` marker is SHARED across a range of Python
-                // PCs at different stack depths, and its liveness banks carry
-                // the UNION of those PCs' live colors.  Resuming at a
-                // shallower PC therefore sees colors that are dead here:
-                //   - a mapped frame stack slot BEYOND this resume's live
-                //     window (`semantic_ref_slot_for_reg_color` is `None`
-                //     because the slot sits past `valid_stack_only`), or
-                //   - under free (non-identity) coloring, a NON-frame SSA
-                //     temp (in neither the local nor the stack color map)
-                //     that is live only at another PC the marker spans.
-                // Both are dead at this PC: the trace produced no box for a
-                // dead value, so `registers_r[color]` is NONE.  Both decode
-                // paths already tolerate this — the blackhole rebuild
-                // (`state.rs` ref-bank loop) and the bridge decoder drop a
-                // Ref color whose semantic slot is `None`.  Keep encode
-                // symmetric: substitute `CONST_NULL` (history.py) so the
-                // positional snapshot/liveness count stays aligned rather
-                // than failing loud on the unsourceable dead slot.
-                // A live color the trace holds a box for is encoded as that
-                // box whether it was produced in this trace or is a bridge
-                // inputarg: `_get_list_of_active_boxes` (`pyjitpl.py`) reads
-                // `registers_r[index]` with no further test. A value computed
-                // but not yet pushed — a `FOR_ITER` next() result between the
-                // residual call and the stack push — is live here and its
-                // inputarg is the only source. Only a NONE register (a color
-                // dead at this pc under a shared marker) becomes `CONST_NULL`.
-                // Under the walker (gate-off) each PC owns a depth-narrowed
-                // marker, so this arm never fires.
-                None => match regs_r.get_box(color) {
-                    Some(v) if v != OpRef::NONE => v,
-                    _ => OpRef::const_ptr(majit_ir::GcRef(0)),
-                },
-                _ => fallback(),
+            } else {
+                fallback()
+            };
+            if value == OpRef::NONE {
+                panic!("{}", dump_ctx("ref", idx));
             }
-        } else {
-            fallback()
-        };
-        if value == OpRef::NONE {
-            panic!("{}", dump_ctx("ref", idx));
-        }
-        // `PYRE_SNAPSHOT_DIAG=1`: report every live Ref color whose snapshot
-        // box did NOT come from the walk register bank.  `pyjitpl.py get_list_of_active_boxes
-        // get_list_of_active_boxes` reads `registers_r[index]` unconditionally,
-        // so each of these is a place where pyre's virtualizable-shadow
-        // preference decided otherwise — the resume value and the register the
-        // resumed bytecode reads then disagree.
-        if snapshot_diag_enabled() {
-            let walk = regs_r.get_box(color).unwrap_or(OpRef::NONE);
-            if walk != OpRef::NONE && walk != value {
-                eprintln!(
-                    "[snap] jc={outer_jitcode_index} carried={carried_jitcode_pc} \
+            // `PYRE_SNAPSHOT_DIAG=1`: report every live Ref color whose snapshot
+            // box did NOT come from the walk register bank.  `pyjitpl.py get_list_of_active_boxes
+            // get_list_of_active_boxes` reads `registers_r[index]` unconditionally,
+            // so each of these is a place where pyre's virtualizable-shadow
+            // preference decided otherwise — the resume value and the register the
+            // resumed bytecode reads then disagree.
+            if snapshot_diag_enabled() {
+                let walk = regs_r.get_box(color).unwrap_or(OpRef::NONE);
+                if walk != OpRef::NONE && walk != value {
+                    eprintln!(
+                        "[snap] jc={outer_jitcode_index} carried={carried_jitcode_pc} \
                      entry={entry_jitcode_pc} color={color} semantic_idx={semantic_idx:?} \
                      nlocals={nlocals} \
                      stack_only={valid_stack_only} walk={walk:?} chose={value:?}"
-                );
+                    );
+                }
             }
+            active.push(value);
         }
-        active.push(value);
+        live_cursor = it.offset();
     }
-    for &idx in &banks.float {
-        let v = regs_f
-            .get_box(idx as usize)
-            .unwrap_or_else(|| panic!("{}", dump_ctx("float", idx)));
-        if v == OpRef::NONE {
-            panic!("{}", dump_ctx("float", idx));
+    if length_f != 0 {
+        // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
+        let mut it = unsafe { LivenessIterator::new(live_cursor, length_f, &all_liveness) };
+        while let Some(idx) = it.next() {
+            let v = regs_f
+                .get_box(idx as usize)
+                .unwrap_or_else(|| panic!("{}", dump_ctx("float", idx)));
+            if v == OpRef::NONE {
+                panic!("{}", dump_ctx("float", idx));
+            }
+            active.push(v);
         }
-        active.push(v);
     }
-    active
 }
 
 /// Sync the symbolic vable `last_instr` at an intermediate `jit_merge_point`
@@ -9370,6 +9492,27 @@ unsafe fn walk_session_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit
         let mut root = majit_ir::GcRef(session.recording_frame_ptr);
         visitor(&mut root);
         session.recording_frame_ptr = root.0;
+    }
+    for value in &mut session.snapshot_active {
+        value.walk_const_ptr_refs_mut(visitor);
+    }
+    for tagged in &mut session.snapshot_vable {
+        if let majit_metainterp::recorder::SnapshotTagged::Box(op, _) = tagged {
+            op.walk_const_ptr_refs_mut(visitor);
+        }
+    }
+    for tagged in &mut session.snapshot_vref {
+        if let majit_metainterp::recorder::SnapshotTagged::Box(op, _) = tagged {
+            op.walk_const_ptr_refs_mut(visitor);
+        }
+    }
+    for (_, value) in &mut session.snapshot_stack_sync {
+        value.walk_const_ptr_refs_mut(visitor);
+    }
+    for (_, old) in &mut session.snapshot_saved_shadow {
+        if let Some(value) = old {
+            value.walk_const_ptr_refs_mut(visitor);
+        }
     }
     let mut walk_parent = |parent: &mut InlineParentFrame| {
         // history.py ConstPtr.value remains reachable through each
@@ -14063,6 +14206,15 @@ fn emit_namespace_cell_fold<Sym: WalkSym>(
             return Ok(false);
         }
     }
+    // `pyjitpl.py _interpret` runs `blackhole_if_trace_too_long` after every
+    // `run_one_step`. Upstream reaches `unwrap_cell` only through the
+    // LOAD_NAME / LOAD_GLOBAL steps recorded above, each its own step, so a
+    // trace already past `trace_limit` aborts on the opcode's own frame
+    // before `unwrap_cell` is entered. Leave the read to the residual; the
+    // post-step check aborts the trace here.
+    if ctx.trace_ctx.is_too_long() {
+        return Ok(false);
+    }
     let Some((result_opref, _)) = emit_namespace_cell_value(ctx, op_pc, stored)? else {
         return Ok(false);
     };
@@ -14660,8 +14812,9 @@ fn fused_goto_if_not_int<Sym: WalkSym>(
 /// `self.gettrace() is not None or self.profilefunc is not None`.
 ///
 /// Every door this walker has into a Python callee — the inline, the direct
-/// `CALL_ASSEMBLER` into the callee's own compiled trace — enters the callee
-/// past `pyframe.py execute_frame`, and `execute_frame` is what runs
+/// `CALL_ASSEMBLER` into the callee's own compiled trace, and
+/// `walk_generator_resume` — enters the callee past `pyframe.py
+/// execute_frame`, and `execute_frame` is what runs
 /// `ec.call_trace` / `ec.return_trace` around the eval loop.  So while this
 /// holds, none of those doors can report what the callee owes and the call has
 /// to stay a residual, which reaches `execute_frame` and runs both.  Upstream
@@ -15085,9 +15238,9 @@ pub(crate) fn inlined_loop_header_call_assembler(
 /// `gettrace = jit.promote(self.w_tracefunc)`.
 ///
 /// Recorded where this walker synthesizes a callee's `execute_frame` (the
-/// inline path and `CALL_ASSEMBLER`). The portal merge point records none
-/// (`pyjitpl.py opimpl_jit_merge_point`; `pyopcode.py dispatch_bytecode` →
-/// `bytecode_only_trace`).
+/// inline path, `CALL_ASSEMBLER` and `walk_generator_resume`). The portal
+/// merge point records none (`pyjitpl.py opimpl_jit_merge_point`;
+/// `pyopcode.py dispatch_bytecode` → `bytecode_only_trace`).
 ///
 /// Measured over a 100 000-iteration tail with `sys.settrace` armed from
 /// inside the loop: 1 043 `call` events for a callee the walker inlines,

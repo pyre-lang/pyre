@@ -305,7 +305,7 @@ fn abort_trace_live_clears_live_history_before_blackhole_drive() {
         key.get_uhash(),
         (0, 0),
         Some((&key.values, &key.types)),
-        Some(sd),
+        Some(std::sync::Arc::new(sd)),
         &[],
     );
     assert!(matches!(
@@ -28584,8 +28584,8 @@ fn mirroring_a_static_vable_field_flushes_it_to_the_live_frame() {
 /// A helper resume-image publishes `valuestackdepth` through
 /// `mirror_vable_static_to_boxes` (box + `synchronize_virtualizable_at`).
 /// Restore must pair that write: a boxes-only restore leaves the heap at
-/// the helper's on-entry depth, and `refresh_vable_slot` then replaces the
-/// restored `ConstInt`.
+/// the helper's on-entry depth, a heap reload (`load_fields_from_virtualizable`) then replaces the restored
+/// `ConstInt`.
 #[test]
 fn restored_valuestackdepth_survives_heap_refresh() {
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
@@ -28651,12 +28651,12 @@ fn restored_valuestackdepth_survives_heap_refresh() {
         Value::Int(SAVED_DEPTH + 1),
     );
     crate::trace_opcode::restore_vable_resume_scalars(&mut tc, saved);
-    tc.refresh_virtualizable_shadow_from_heap();
+    tc.load_fields_from_virtualizable(&info, frame_ptr);
 
     assert_eq!(
         tc.virtualizable_entry_at(vsd_idx).map(|entry| entry.1),
         Some(Value::Int(SAVED_DEPTH)),
-        "restored valuestackdepth must survive refresh_virtualizable_shadow_from_heap",
+        "restored valuestackdepth must reach the heap (load_fields_from_virtualizable)",
     );
 }
 

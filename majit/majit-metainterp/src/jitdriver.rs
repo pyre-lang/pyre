@@ -4,15 +4,10 @@ use crate::jitexc::{ContinueRunningNormallyArgs, PortalResume};
 
 /// Terminal state from a single-frame tracing-abort blackhole run.
 ///
-/// The terminal interpreter is kept logically alive by moving out its three
-/// register banks, matching the back-edge resume path below: a
-/// ContinueRunningNormally handoff needs the full color-indexed bank, not only
-/// the declared red subset carried by the exception.
+/// The register banks stay on the interpreter, which goes back to the pool
+/// with them (`blackhole.py` `release_interp`).
 pub struct SingleFrameBlackholeResult {
     pub outcome: crate::jitexc::JitException,
-    pub registers_i: Vec<i64>,
-    pub registers_r: Vec<i64>,
-    pub registers_f: Vec<i64>,
     pub position: usize,
     pub last_opcode_position: usize,
     /// The drive's virtualizable, forwarded across every collection the run
@@ -345,9 +340,6 @@ pub fn drive_single_frame_blackhole(
 
     let result = SingleFrameBlackholeResult {
         outcome,
-        registers_i: std::mem::take(&mut bh.registers_i),
-        registers_r: std::mem::take(&mut bh.registers_r),
-        registers_f: std::mem::take(&mut bh.registers_f),
         position: bh.position,
         last_opcode_position: bh.last_opcode_position,
         virtualizable_ptr,
@@ -412,6 +404,9 @@ pub struct PendingAbortBlackhole {
     /// be raised*, so the conversion hands it to the chain instead of merely
     /// copying it into the first frame's `exception_last_value`.
     pub raising_exception: bool,
+    /// Register words of a walker-published framestack; `None` when the frames
+    /// carry Const boxes.
+    pub abort_banks: Option<Vec<crate::blackhole::BlackholeAbortBanks>>,
 }
 
 /// Run a tracing MIFrame chain through the structured multi-frame blackhole
@@ -3115,6 +3110,15 @@ impl<S: JitState> JitDriver<S> {
             .clear_tracing_flag(green_key);
     }
 
+    /// `warmstate.py bound_reached` `cell.flags |= JC_TRACING`.
+    /// Kept set through `convert_and_run_from_pyjitpl`; [`Self::abort_entry_tracing`]
+    /// is the `finally` that clears it.
+    pub fn mark_entry_tracing(&mut self, green_key: u64) {
+        self.meta
+            .warm_state_for_driver(self.index().unwrap_or(0))
+            .set_tracing_flag(green_key);
+    }
+
     /// Attach a GC allocator to the active backend.
     pub fn set_gc_allocator(&mut self, gc: Box<dyn GcAllocator>) {
         self.meta.backend_mut().set_gc_allocator(gc);
@@ -3315,27 +3319,6 @@ impl<S: JitState> JitDriver<S> {
             .is_some_and(|cell| cell.is_tracing())
     }
 
-    /// True when this green key has already hit `MAX_TRACE_ABORT_COUNT` and
-    /// a later back-edge must not enter `bound_reached`.
-    ///
-    /// `warmstate.py maybe_compile_and_run` answers this from the cell it
-    /// already holds; pyre's u64 door has to look the cell up. A dead
-    /// procedure token still belongs to `cleanup_chain`, so it is not
-    /// treated as a ban. `disable_noninlinable_function` retries a
-    /// never-seen-token cell only while `abort_count` is below the ceiling;
-    /// `abort_tracing` stamps `JC_DONT_TRACE_HERE` at the ceiling as a ban.
-    #[inline]
-    pub fn cell_is_abort_ceiling_banned(&self, green_key: u64) -> bool {
-        self.meta
-            .warm_state_ref_for_driver(self.index().unwrap_or(0))
-            .and_then(|warm| warm.get_cell(green_key))
-            .is_some_and(|cell| {
-                let dead_token =
-                    cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none();
-                !dead_token && cell.abort_count.get() >= crate::warmstate::MAX_TRACE_ABORT_COUNT
-            })
-    }
-
     /// Single-pass tracing: take the `(walk_final_pc, walk_final_reds, green banks)`
     /// snapshot captured at a terminal trace transition. CloseLoop and Finish
     /// publish it before draining the ctx; a fresh TraceAction::Abort publishes
@@ -3452,6 +3435,12 @@ impl<S: JitState> JitDriver<S> {
         if let Some(pending) = self.meta.pending_abort_blackhole.take() {
             crate::pyjitpl::recycle_framestack(pending.framestack);
         }
+        // `handle_guard_failure`'s `finally` for the dropped stash.
+        self.meta.finish_cancel_tracing();
+    }
+
+    pub fn take_pending_abort_blackhole(&mut self) -> Option<PendingAbortBlackhole> {
+        self.meta.pending_abort_blackhole.take()
     }
 
     pub fn run_pending_abort_blackhole(
@@ -3473,6 +3462,31 @@ impl<S: JitState> JitDriver<S> {
     ) -> Option<PortalResume> {
         self.meta.interpret_bail_residual = None;
         let pending = self.meta.pending_abort_blackhole.take()?;
+        let resume = self.drive_pending_abort_blackhole(
+            pending,
+            state,
+            env,
+            jitdrivers_sd,
+            per_frame,
+            on_enter_level,
+            on_leave_level,
+        );
+        // `compile_and_run_once`'s `finally` after
+        // `run_blackhole_interp_to_cancel_tracing`.
+        self.meta.finish_cancel_tracing();
+        resume
+    }
+
+    fn drive_pending_abort_blackhole(
+        &mut self,
+        pending: PendingAbortBlackhole,
+        state: &mut S,
+        env: &S::Env,
+        jitdrivers_sd: Option<std::sync::Arc<[crate::blackhole::BhJitDriverSd]>>,
+        per_frame: Option<&[(i64, usize)]>,
+        on_enter_level: Option<&dyn Fn(i64)>,
+        on_leave_level: Option<&dyn Fn(i64, crate::blackhole::LevelExit) -> Option<i64>>,
+    ) -> Option<PortalResume> {
         let PendingAbortBlackhole {
             framestack,
             scalar_values,
@@ -3481,6 +3495,7 @@ impl<S: JitState> JitDriver<S> {
             virtualizable_ptr,
             last_exc_value,
             raising_exception,
+            mut abort_banks,
         } = pending;
         // pyjitpl.py popframe appends to free_frames_list; the standalone
         // walk's pool is that list. Recycle on every exit.
@@ -3586,7 +3601,7 @@ impl<S: JitState> JitDriver<S> {
             on_enter_level,
             on_leave_level,
             jitdrivers_sd,
-            None,
+            abort_banks.as_mut().map(|banks| banks.as_mut_slice()),
         );
         let MultiFrameBlackholeResult { outcome, terminal } = outcome;
         if crate::majit_log_enabled() {
@@ -4144,6 +4159,168 @@ impl<S: JitState> JitDriver<S> {
             return None;
         }
         Some(original_green_key)
+    }
+
+    /// `pyjitpl.py run_blackhole_interp_to_cancel_tracing` → `blackhole.py
+    /// convert_and_run_from_pyjitpl`: stage the aborted framestack, its walk
+    /// image and the state-field seed in `pending_abort_blackhole` for the
+    /// `jit_merge_point` hook. Every `SwitchToBlackhole` reason takes this,
+    /// `ABORT_SEGMENTED_TRACE` included.
+    fn stage_switch_to_blackhole(&mut self, abort_raising_exception: bool) {
+        let mut aborted_walk = None;
+        let mut aborted = self.meta.tracing.as_mut().and_then(|ctx| {
+            ctx.aborted_framestack.take().map(|stack| {
+                aborted_walk = ctx.aborted_walk.take();
+                stack
+            })
+        });
+        if let Some(ctx) = self.meta.tracing.as_ref() {
+            if aborted_walk.is_none()
+                && let Some(ref mut fs) = aborted
+            {
+                for frame in fs.frames.iter_mut() {
+                    frame.freeze_values_into_const_boxes(ctx);
+                }
+            }
+            if self.meta.interpret_framestack_for_abort {
+                for frame in self.meta.framestack.frames.iter_mut() {
+                    frame.freeze_values_into_const_boxes(ctx);
+                }
+            }
+        }
+        let virt_and_ptr = self.meta.trace_ctx().map(|ctx| {
+            (
+                ctx.collect_virtualizable_element_values(),
+                ctx.virtualizable_heap_ptr().map_or(0, |p| p as i64),
+            )
+        });
+        let staged = aborted
+            .or_else(|| {
+                (self.meta.interpret_framestack_for_abort && !self.meta.framestack.is_empty()).then(
+                    || {
+                        std::mem::replace(
+                            &mut self.meta.framestack,
+                            crate::pyjitpl::MIFrameStack::empty(),
+                        )
+                    },
+                )
+            })
+            .filter(|framestack| !framestack.is_empty())
+            .map(|framestack| {
+                let (virt_array_values, virtualizable_ptr) = virt_and_ptr.unwrap_or((None, 0));
+                (framestack, virt_array_values, virtualizable_ptr)
+            });
+        if let Some((framestack, virt_array_values, virtualizable_ptr)) = staged {
+            let (scalar_values, ref_scalar_values) = match self.meta.trace_ctx() {
+                Some(ctx) => (
+                    ctx.close_scalar_values.take().unwrap_or_default(),
+                    ctx.close_ref_scalar_values.take().unwrap_or_default(),
+                ),
+                None => (Vec::new(), Vec::new()),
+            };
+            let (scalar_values, ref_scalar_values) =
+                if scalar_values.is_empty() && ref_scalar_values.is_empty() {
+                    if let Some(sym) = self.sym.as_ref() {
+                        (
+                            S::collect_scalar_state_field_values(sym),
+                            S::collect_ref_scalar_state_field_values(sym),
+                        )
+                    } else {
+                        (Vec::new(), Vec::new())
+                    }
+                } else {
+                    (scalar_values, ref_scalar_values)
+                };
+            let (last_exc_value, raising_exception, abort_banks) = match aborted_walk {
+                Some(image) => (
+                    image.last_exc_value,
+                    image.raising_exception,
+                    Some(image.banks),
+                ),
+                None => (self.meta.last_exc_value, abort_raising_exception, None),
+            };
+            self.meta.pending_abort_blackhole = Some(PendingAbortBlackhole {
+                framestack,
+                scalar_values,
+                ref_scalar_values,
+                virt_array_values,
+                virtualizable_ptr,
+                last_exc_value,
+                raising_exception,
+                abort_banks,
+            });
+        }
+    }
+
+    /// pyjitpl.py run_blackhole_interp_to_cancel_tracing
+    /// run_blackhole_interp_to_cancel_tracing: a fresh trace has
+    /// executed its portal body forward with real residual heap
+    /// effects.  Before dropping that live frame, publish its
+    /// current source pc and scalar state for the single-pass
+    /// jit_merge_point hook.  The hook restores those scalars,
+    /// runs `recover_after_compiled_run`, and continues the native
+    /// interpreter from this pc rather than replaying the committed
+    /// trace prefix.
+    ///
+    /// Bridge/compiled guard-failure recovery owns a separate
+    /// blackhole resume path below `back_edge_internal`; do not
+    /// feed that path through this fresh-trace handoff.
+    ///
+    /// Unless the bridge was entered at the guard's own position
+    /// — then there was no separate resume: the walk is the only
+    /// thing that ran, and it ran the failing opcode's tail. Its
+    /// frames are the sole record of where that left the
+    /// interpreter, so this bridge needs the handoff for the
+    /// same reason a fresh trace does.
+    ///
+    /// `handle_guard_failure` catches `SwitchToBlackhole` with
+    /// `run_blackhole_interp_to_cancel_tracing` →
+    /// `MetaInterp.aborted_tracing` →
+    /// `convert_and_run_from_pyjitpl` on the live framestack.
+    /// A deterministic bridge abort (`BC_ABORT`, a refused
+    /// walk-local residual) is still that abort: converting
+    /// from the abort point finishes the half-opcode. Returning
+    /// `None` from `bridge_from_guard_resume_position` would
+    /// take `ResumeGuardDescr.handle_fail`'s else-arm
+    /// (`resume_in_blackhole` from the guard deadframe) and
+    /// replay residuals the walk already executed
+    /// (`note_residual_committed` / `ITER_NEXT`).
+    fn stage_cancel_tracing_handoff(&mut self, abort_raising_exception: bool) {
+        // This gate asks whether the session still has a bridge
+        // artifact to resume into, which is the PHASE, not the
+        // resumekey class. A declined attempt has none, so it takes
+        // the fresh-trace handoff exactly as it did when the decline
+        // arms cleared `bridge_info`.
+        if !(self.meta.bridge_info().is_none()
+            || self.bridge_attempt_declined
+            || self.bridge_entered_at_guard_resume)
+        {
+            return;
+        }
+        let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
+        if let Some(pc) = pc {
+            self.publish_single_pass_outcome(pc);
+            if let Some(scalars) = self
+                .meta
+                .trace_ctx()
+                .and_then(|ctx| ctx.close_scalar_values.take())
+            {
+                self.meta.single_pass_scalar_values = Some(scalars);
+            } else if let Some(sym) = self.sym.as_ref() {
+                let scalars = S::collect_scalar_state_field_values(sym);
+                if !scalars.is_empty() {
+                    self.meta.single_pass_scalar_values = Some(scalars);
+                }
+            }
+            let virt_elems = self
+                .meta
+                .trace_ctx()
+                .and_then(|ctx| ctx.collect_virtualizable_element_values());
+            if let Some(elems) = virt_elems {
+                self.meta.single_pass_virt_array_values = Some(elems);
+            }
+        }
+        self.stage_switch_to_blackhole(abort_raising_exception);
     }
 
     /// pyjitpl.py `_create_segmented_trace_and_blackhole` loop arm:
@@ -5346,6 +5523,15 @@ impl<S: JitState> JitDriver<S> {
                             self.meta.single_pass_virt_array_values = Some(elems);
                         }
                     }
+                    // `_create_segmented_trace_and_blackhole` `raise
+                    // SwitchToBlackhole(Counters.ABORT_SEGMENTED_TRACE)` reaches
+                    // the same `run_blackhole_interp_to_cancel_tracing` handler.
+                    if self.meta.bridge_info().is_none()
+                        || self.bridge_attempt_declined
+                        || self.bridge_entered_at_guard_resume
+                    {
+                        self.stage_switch_to_blackhole(false);
+                    }
                     let abort_reason = match bridge_exception_box {
                         // pyjitpl.py:1665-1668, the else-arm: a guard-origin
                         // bridge has no merge point to make a loop out of, so
@@ -5397,7 +5583,9 @@ impl<S: JitState> JitDriver<S> {
                     // `take_trace_meta` / `compile_finish_from_active_session`
                     // above drained the M-ownership side;
                     // `leave_profiler_tracing` fires the matching
-                    // `pyjitpl.py:2934 finally: profiler.end_tracing()`.
+                    // `finally: profiler.end_tracing()` unless a
+                    // cancel-tracing blackhole is staged, which
+                    // `finish_cancel_tracing` closes after the drive.
                     // `clear_trace_session` is then a no-op for both effects
                     // (session already drained, profiler already left) and
                     // only cleans `bridge_info`.
@@ -5417,8 +5605,9 @@ impl<S: JitState> JitDriver<S> {
                     // This is a pre-trace coverage refusal, not
                     // `SwitchToBlackhole`.  Upstream's
                     // `maybe_compile_and_run` only clears `JC_TRACING` in its
-                    // `finally` arm; charging `abort_trace_live` here made five
-                    // unrelated declines trip pyre's local abort ceiling.
+                    // `finally` arm; charging `abort_trace_live` here would
+                    // run `aborted_tracing` on a graph that never entered
+                    // `_interpret`.
                     self.meta.decline_trace_live();
                     self.sym = None;
                     self.bridge_attempt_declined = false;
@@ -5486,207 +5675,11 @@ impl<S: JitState> JitDriver<S> {
                             }
                         },
                     };
-                    // pyjitpl.py run_blackhole_interp_to_cancel_tracing
-                    // run_blackhole_interp_to_cancel_tracing: a fresh trace has
-                    // executed its portal body forward with real residual heap
-                    // effects.  Before dropping that live frame, publish its
-                    // current source pc and scalar state for the single-pass
-                    // jit_merge_point hook.  The hook restores those scalars,
-                    // runs `recover_after_compiled_run`, and continues the native
-                    // interpreter from this pc rather than replaying the committed
-                    // trace prefix.
-                    //
-                    // Bridge/compiled guard-failure recovery owns a separate
-                    // blackhole resume path below `back_edge_internal`; do not
-                    // feed that path through this fresh-trace handoff.
-                    //
-                    // Unless the bridge was entered at the guard's own position
-                    // — then there was no separate resume: the walk is the only
-                    // thing that ran, and it ran the failing opcode's tail. Its
-                    // frames are the sole record of where that left the
-                    // interpreter, so this bridge needs the handoff for the
-                    // same reason a fresh trace does.
-                    //
-                    // `handle_guard_failure` catches `SwitchToBlackhole` with
-                    // `run_blackhole_interp_to_cancel_tracing` →
-                    // `MetaInterp.aborted_tracing` →
-                    // `convert_and_run_from_pyjitpl` on the live framestack.
-                    // A deterministic bridge abort (`BC_ABORT`, a refused
-                    // walk-local residual) is still that abort: converting
-                    // from the abort point finishes the half-opcode. Returning
-                    // `None` from `bridge_from_guard_resume_position` would
-                    // take `ResumeGuardDescr.handle_fail`'s else-arm
-                    // (`resume_in_blackhole` from the guard deadframe) and
-                    // replay residuals the walk already executed
-                    // (`note_residual_committed` / `ITER_NEXT`).
                     if matches!(
                         action,
                         TraceAction::Abort | TraceAction::SwitchToBlackhole(_)
-                    ) && (self.meta.bridge_info().is_none()
-                        || self.bridge_attempt_declined
-                        || self.bridge_entered_at_guard_resume)
-                    {
-                        // This gate asks whether the session still has a bridge
-                        // artifact to resume into, which is the PHASE, not the
-                        // resumekey class. A declined attempt has none, so it takes
-                        // the fresh-trace handoff exactly as it did when the decline
-                        // arms cleared `bridge_info`.
-                        let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
-                        if let Some(pc) = pc {
-                            self.publish_single_pass_outcome(pc);
-                            if let Some(scalars) = self
-                                .meta
-                                .trace_ctx()
-                                .and_then(|ctx| ctx.close_scalar_values.take())
-                            {
-                                self.meta.single_pass_scalar_values = Some(scalars);
-                            } else if let Some(sym) = self.sym.as_ref() {
-                                let scalars = S::collect_scalar_state_field_values(sym);
-                                if !scalars.is_empty() {
-                                    self.meta.single_pass_scalar_values = Some(scalars);
-                                }
-                            }
-                            let virt_elems = self
-                                .meta
-                                .trace_ctx()
-                                .and_then(|ctx| ctx.collect_virtualizable_element_values());
-                            if let Some(elems) = virt_elems {
-                                self.meta.single_pass_virt_array_values = Some(elems);
-                            }
-                        }
-                        // `pyjitpl.py:2954 convert_and_run_from_pyjitpl(self,
-                        // stb.raising_exception)`: the source pc above is only a
-                        // sound resume position when the walk happened to stop at a
-                        // source-opcode boundary.  Stage the framestack and the
-                        // sym's state-field image so the `jit_merge_point!` hook can
-                        // finish the half-executed opcodes in the blackhole and take
-                        // the resume position from the merge point they reach.
-                        let (mut aborted, aborted_last_exc, aborted_raising) =
-                            match self.meta.tracing.as_mut() {
-                                Some(ctx) => (
-                                    ctx.aborted_framestack.take(),
-                                    std::mem::take(&mut ctx.aborted_last_exc_value),
-                                    std::mem::take(&mut ctx.aborted_raising_exception),
-                                ),
-                                None => (None, 0, false),
-                            };
-                        // `_copy_data_from_miframe` reads `getint()` off the
-                        // register box. Rewrite non-const boxes to inline
-                        // Consts while the recorder still holds `_res*`.
-                        if let Some(ctx) = self.meta.tracing.as_ref() {
-                            if let Some(ref mut fs) = aborted {
-                                for frame in fs.frames.iter_mut() {
-                                    frame.freeze_values_into_const_boxes(ctx);
-                                }
-                            }
-                            // `_interpret` owns live frames on
-                            // `MetaInterp.framestack`. FBW's leftover stack
-                            // here is the GUARD rebuild from
-                            // `handle_guard_failure`, not a convert image.
-                            if self.meta.interpret_framestack_for_abort {
-                                for frame in self.meta.framestack.frames.iter_mut() {
-                                    frame.freeze_values_into_const_boxes(ctx);
-                                }
-                            }
-                        }
-                        let virt_and_ptr = self.meta.trace_ctx().map(|ctx| {
-                            (
-                                ctx.collect_virtualizable_element_values(),
-                                ctx.virtualizable_heap_ptr().map_or(0, |p| p as i64),
-                            )
-                        });
-                        // Presence is the latched framestack, not a non-zero
-                        // last_exc. `blackhole.py convert_and_run_from_pyjitpl`
-                        // converts one coherent state (`framestack`,
-                        // `last_exc_value`, `SwitchToBlackhole.raising_exception`);
-                        // 0 / false on a published image are values, not absent.
-                        let latched_abort = aborted.is_some();
-                        // Standalone `JitCodeMachine` walks publish into
-                        // `aborted_framestack`. `MetaInterp::interpret`
-                        // (`pyjitpl.py` `_interpret`) keeps live frames on
-                        // `MetaInterp.framestack`, gated by
-                        // `interpret_framestack_for_abort`;
-                        // `stage_interpret_abort_blackhole` covers that
-                        // walk's `abort_trace` sites. FBW live frames are
-                        // only the published latch
-                        // (`publish_latched_abort_framestack`). After
-                        // `discard_staged_abort` the leftover
-                        // `MetaInterp.framestack` is the GUARD rebuild from
-                        // `handle_guard_failure`, not the walk.
-                        // `pyjitpl.py handle_guard_failure` converts only
-                        // live `metainterp.framestack` on
-                        // `SwitchToBlackhole`
-                        // (`run_blackhole_interp_to_cancel_tracing` →
-                        // `blackhole.py convert_and_run_from_pyjitpl`);
-                        // otherwise the guard resumes from the deadframe
-                        // (`resume_in_blackhole` /
-                        // `resume.py blackhole_from_resumedata`).
-                        let staged = aborted
-                            .or_else(|| {
-                                (self.meta.interpret_framestack_for_abort
-                                    && !self.meta.framestack.is_empty())
-                                .then(|| {
-                                    std::mem::replace(
-                                        &mut self.meta.framestack,
-                                        crate::pyjitpl::MIFrameStack::empty(),
-                                    )
-                                })
-                            })
-                            .filter(|framestack| !framestack.is_empty())
-                            .map(|framestack| {
-                                let (virt_array_values, virtualizable_ptr) =
-                                    virt_and_ptr.unwrap_or((None, 0));
-                                (framestack, virt_array_values, virtualizable_ptr)
-                            });
-                        // `blackhole.py convert_and_run_from_pyjitpl` only
-                        // needs the metainterp framestack. The sym image is
-                        // extra state-field seed for generated machines;
-                        // the Python portal has none, so missing `self.sym`
-                        // must not drop the conversion.
-                        if let Some((framestack, virt_array_values, virtualizable_ptr)) = staged {
-                            let (scalar_values, ref_scalar_values) = match self.meta.trace_ctx() {
-                                Some(ctx) => (
-                                    ctx.close_scalar_values.take().unwrap_or_default(),
-                                    ctx.close_ref_scalar_values.take().unwrap_or_default(),
-                                ),
-                                None => (Vec::new(), Vec::new()),
-                            };
-                            let (scalar_values, ref_scalar_values) =
-                                if scalar_values.is_empty() && ref_scalar_values.is_empty() {
-                                    if let Some(sym) = self.sym.as_ref() {
-                                        (
-                                            S::collect_scalar_state_field_values(sym),
-                                            S::collect_ref_scalar_state_field_values(sym),
-                                        )
-                                    } else {
-                                        (Vec::new(), Vec::new())
-                                    }
-                                } else {
-                                    (scalar_values, ref_scalar_values)
-                                };
-                            // A published latch is one convert image: both
-                            // last_exc and raising come from it. Without a
-                            // latch, `convert_and_run_from_pyjitpl` reads
-                            // `metainterp.last_exc_value` and the
-                            // `SwitchToBlackhole` being handled
-                            // (`history.py` `raising_exception`). Snapshot
-                            // here because `abort_trace_live` below tears
-                            // down the tracing state they live on.
-                            let (last_exc_value, raising_exception) = if latched_abort {
-                                (aborted_last_exc, aborted_raising)
-                            } else {
-                                (self.meta.last_exc_value, abort_raising_exception)
-                            };
-                            self.meta.pending_abort_blackhole = Some(PendingAbortBlackhole {
-                                framestack,
-                                scalar_values,
-                                ref_scalar_values,
-                                virt_array_values,
-                                virtualizable_ptr,
-                                last_exc_value,
-                                raising_exception,
-                            });
-                        }
+                    ) {
+                        self.stage_cancel_tracing_handoff(abort_raising_exception);
                     }
                     self.meta.abort_trace_live(false);
                     // `MetaInterp._interpret` counts every
@@ -5726,6 +5719,11 @@ impl<S: JitState> JitDriver<S> {
                     if self.bridge_attempt_declined {
                         crate::mc_diag_bump(52); // abort_after_declined
                     }
+                    // The same `run_blackhole_interp_to_cancel_tracing` handoff as Abort, so a
+                    // published walk image is staged before `abort_trace_live` recycles it.
+                    // (`abort_trace`'s `stage_interpret_abort_blackhole` already returns when
+                    // `pending_abort_blackhole` is set.)
+                    self.stage_cancel_tracing_handoff(false);
                     self.meta.abort_trace(false);
                     self.sym = None;
                     // The session ends here, so the latch must not outlive it.
@@ -8677,7 +8675,7 @@ impl<S: JitState> JitDriver<S> {
             green_key,
             (state.code_ptr(), target_pc),
             greenargs,
-            descriptor.map(|d| (*d).clone()),
+            descriptor,
             &live_values,
         ) {
             if spdiag_enabled() {
@@ -8716,6 +8714,9 @@ impl<S: JitState> JitDriver<S> {
             self.preserve_nested_overflow(green_key);
             return;
         }
+        // Same close `force_start_tracing` makes before tracing (`gctypelayout.py encode_type_shapes_now`),
+        // so a back-edge trace start also reads the frozen table.
+        majit_gc::ensure_type_registry_closed();
         let meta = state.build_meta(target_pc, env);
         let descriptor = self.driver_descriptor_for(state, &meta);
         // Resolved here with the descriptor and carried to both ends of
@@ -8745,7 +8746,7 @@ impl<S: JitState> JitDriver<S> {
             green_key,
             (state.code_ptr(), target_pc),
             None,
-            descriptor.map(|d| (*d).clone()),
+            descriptor,
             &live_values,
         ) {
             if spdiag_enabled() {
@@ -8773,7 +8774,7 @@ impl<S: JitState> JitDriver<S> {
     ) -> bool {
         // Occupied-bucket path: keep the typed comparekey walk so a
         // sibling cell at the same hash cannot answer
-        // (`chained_ceiling_latch_does_not_refuse_the_typed_sibling`).
+        // (`disable_noninlinable_on_a_typed_key_flags_its_one_cell`).
         // The empty-chain door never reaches here; it ticked already.
         let confirm_reds = self.confirm_enter_jit_reds(state, env, target_pc);
         match self.meta.on_back_edge_typed_decision_on_driver(
@@ -8889,23 +8890,7 @@ impl<S: JitState> JitDriver<S> {
         // ticks. `warmstate.py maybe_compile_and_run` only calls
         // `bound_reached` when `tick` returns True, so a NotHot back edge
         // never arrives here. Slots 62/63 are refusals of this door and
-        // stay zero until 61 has moved. The abort ceiling is NOT consulted
-        // separately here. It is a refusal the decision below already owns:
-        // `maybe_compile_decision_with_key` takes it in the position
-        // `warmstate.py maybe_compile_and_run` gives `confirm_enter_jit`,
-        // above the counter tick and above the `decay_all_counters` inside
-        // `bound_reached`, so a latched cell reaches neither — which is the
-        // whole reason the ceiling decides early. Asking first resolved the
-        // same cell through the same typed chain walk a second time, for an
-        // answer `is_ceiling_latched_agrees_with_the_decision_it_mirrors`
-        // pins equal to the one the decision reaches; `maybe_compile_and_run`
-        // binds its cell once ("to avoid computing the hash several times")
-        // and answers every question about it off that binding. Slot 81
-        // counts the same population either way, because only one of the two
-        // refusals can fire for a given edge: every state in which the
-        // mirror answered `false` returns above the decision's ceiling arm
-        // or fails its condition. A latched cell on the empty-chain door
-        // bumps 81 there and never enters this function.
+        // stay zero until 61 has moved.
 
         // The liveness decoder's thread-local payload is only a publication
         // mechanism; ownership stays with this driver. Another live portal may
@@ -11093,22 +11078,6 @@ impl<S: JitState> JitDriver<S> {
         self.get_loop_token(green_key)
     }
 
-    /// Get the pre-allocated token number for the trace being recorded.
-    ///
-    /// Returns `Some(number)` if `green_key` matches the current trace's
-    /// target, enabling self-recursive call_assembler emission.
-    pub fn get_pending_token_number(&self, green_key: u64) -> Option<i64> {
-        self.meta.get_pending_token_number(green_key)
-    }
-
-    /// Get the pre-allocated token object for the trace being recorded.
-    pub fn get_pending_token_arc(
-        &self,
-        green_key: u64,
-    ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
-        self.meta.get_pending_token_arc(green_key).cloned()
-    }
-
     /// Resolve a portal CALL_ASSEMBLER target through an installed loop token
     /// or an RPython tmp callback (`warmstate.py get_assembler_token`,
     /// `compile.py:1101-1150`). The pending token remains only a
@@ -11708,7 +11677,7 @@ impl<S: JitState> JitDriver<S> {
         if ctx.driver_descriptor().is_none()
             && let Some(descriptor) = bridge_driver_descriptor
         {
-            ctx.set_driver_descriptor((*descriptor).clone());
+            ctx.set_driver_descriptor(descriptor);
         }
         // pyjitpl.py `if not self.partial_trace:` — bridge
         // entry sets the explicit flag so close-loop consumers
@@ -12763,9 +12732,18 @@ mod tests {
         assert!(driver.is_tracing());
         driver.merge_point(|meta, _sym| {
             let ctx = meta.tracing.as_mut().expect("tracing session");
-            ctx.aborted_framestack = Some(dummy_abort_framestack());
-            ctx.aborted_last_exc_value = 0;
-            ctx.aborted_raising_exception = false;
+            let stack = dummy_abort_framestack();
+            let banks = stack
+                .frames
+                .iter()
+                .map(crate::BlackholeAbortBanks::sized_for)
+                .collect();
+            ctx.aborted_walk = Some(crate::AbortedWalkImage {
+                last_exc_value: 0,
+                raising_exception: false,
+                banks,
+            });
+            ctx.aborted_framestack = Some(stack);
             meta.last_exc_value = 0xFEED;
             TraceAction::SwitchToBlackhole(crate::SwitchToBlackhole {
                 reason: crate::counters::ABORT_ESCAPE,
@@ -12777,6 +12755,7 @@ mod tests {
             .expect("Abort arm staged a convert image");
         assert_eq!(pending.last_exc_value, 0);
         assert!(!pending.raising_exception);
+        assert!(pending.abort_banks.is_some());
     }
 
     /// Without a latched framestack, convert reads `metainterp.last_exc_value`
@@ -13768,41 +13747,7 @@ mod tests {
     }
 
     #[test]
-    fn ceiling_latched_back_edge_skips_frontend_state() {
-        use crate::warmstate::MAX_TRACE_ABORT_COUNT;
-
-        let mut driver = JitDriver::<CountingDoorState>::new(2);
-        driver.meta.finish_setup_descrs_for_jitdrivers();
-        let key = gk(4343);
-        assert!(matches!(
-            driver.meta.on_back_edge(&key, &[]),
-            BackEdgeAction::Interpret
-        ));
-        assert!(matches!(
-            driver.meta.on_back_edge(&key, &[]),
-            BackEdgeAction::StartedTracing
-        ));
-        driver.meta.abort_trace(false);
-        let cell_key = key;
-        for _ in 1..MAX_TRACE_ABORT_COUNT {
-            driver
-                .meta
-                .warm_state_for_driver(0)
-                .abort_tracing(cell_key.get_uhash(), false);
-        }
-        // `abort_tracing` stamps `DONT_TRACE_HERE` at the ceiling as a ban.
-        assert!(driver.cell_is_abort_ceiling_banned(cell_key.get_uhash()));
-
-        let mut state = CountingDoorState::default();
-        assert!(back_edge_keyed(&mut driver, &cell_key, 7, &mut state, &(), || {}).is_none());
-        assert_eq!(state.build_meta_calls.get(), 0);
-        assert_eq!(state.extract_live_values_calls.get(), 0);
-    }
-
-    #[test]
-    fn chained_ceiling_latch_does_not_refuse_the_typed_sibling() {
-        use crate::warmstate::MAX_TRACE_ABORT_COUNT;
-
+    fn disable_noninlinable_on_a_typed_key_flags_its_one_cell() {
         let mut driver = JitDriver::<CountingDoorState>::new(1);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let target_pc = 7usize;
@@ -13813,17 +13758,10 @@ mod tests {
         );
         let green_key = key.get_uhash();
 
-        // The key's own cell reaches its ceiling.
         driver
             .meta
             .warm_state_for_driver(0)
             .disable_noninlinable_function_for_key(&key);
-        for _ in 0..MAX_TRACE_ABORT_COUNT {
-            driver
-                .meta
-                .warm_state_for_driver(0)
-                .abort_tracing(green_key, false);
-        }
         assert_eq!(
             driver.meta.warm_state_for_driver(0).get_stats().num_cells,
             1,
@@ -13850,6 +13788,10 @@ mod tests {
             driver
                 .back_edge_or_run_compiled_keyed(green_key, target_pc, &mut state, &(), || {},)
                 .is_none()
+        );
+        assert!(
+            driver.is_tracing(),
+            "first post-flag back-edge at threshold=1 is StartTracing",
         );
     }
 
@@ -15054,7 +14996,7 @@ mod tests {
             hash,
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(descriptor),
+            Some(std::sync::Arc::new(descriptor)),
             &[],
         );
         assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -15687,13 +15629,6 @@ mod tests {
             driver.cell_is_tracing(key.get_uhash()),
             "force_start_tracing marks JC_TRACING"
         );
-        let abort_count_before = driver
-            .meta
-            .warm_state_for_driver(0)
-            .cell_by_key(key.get_uhash())
-            .expect("force_start_tracing installs a cell")
-            .abort_count
-            .get();
         {
             let ctx = driver.meta.trace_ctx().expect("tracing");
             let i0 = OpRef::input_arg_int(0);
@@ -15727,11 +15662,6 @@ mod tests {
                 .warm_state_for_driver(0)
                 .cell_by_key(key.get_uhash())
                 .expect("the cancelled cell remains");
-            assert_eq!(
-                cell.abort_count.get(),
-                abort_count_before,
-                "bound_reached finally does not bump abort_count"
-            );
             assert!(
                 !cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE),
                 "bound_reached finally does not set JC_DONT_TRACE_HERE"
@@ -16821,7 +16751,7 @@ mod tests {
                 green_key.get_uhash(),
                 (0, 0),
                 Some((&key.values, &key.types)),
-                Some(descriptor),
+                Some(Arc::new(descriptor)),
                 &[Value::Int(0)]
             ),
             BackEdgeAction::StartedTracing
@@ -16938,7 +16868,7 @@ mod tests {
                 green_key.get_uhash(),
                 (0, 0),
                 Some((&key.values, &key.types)),
-                Some(descriptor),
+                Some(Arc::new(descriptor)),
                 &[Value::Int(0)]
             ),
             BackEdgeAction::StartedTracing
@@ -17037,7 +16967,7 @@ mod tests {
                 green_key.get_uhash(),
                 (0, 0),
                 Some((&key.values, &key.types)),
-                Some(descriptor),
+                Some(Arc::new(descriptor)),
                 &[Value::Int(0)]
             ),
             BackEdgeAction::StartedTracing
@@ -17131,7 +17061,7 @@ mod tests {
                 key.get_uhash(),
                 (0, 0),
                 Some((&key.values, &key.types)),
-                Some(descriptor),
+                Some(Arc::new(descriptor)),
                 &[Value::Int(0)]
             ),
             BackEdgeAction::StartedTracing

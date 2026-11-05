@@ -59,10 +59,6 @@ pub struct BaseJitCell {
     /// The `JC_*` flags this cell carries. `warmstate.py` `BaseJitCell.flags`
     /// is the only per-cell state.
     pub flags: Cell<JcFlags>,
-    /// Aborts of this cell since it was installed. At `MAX_TRACE_ABORT_COUNT`
-    /// the back-edge and function-entry doors return not-hot, and the cell is
-    /// marked `JC_DONT_TRACE_HERE`.
-    pub abort_count: Cell<u32>,
     /// Hot counter value for this cell (local to this green key).
     pub counter: Cell<u32>,
     /// Generation at which tracing was last started.
@@ -170,7 +166,6 @@ impl BaseJitCell {
         BaseJitCell {
             jitdriver_sd,
             flags: Cell::new(JcFlags::empty()),
-            abort_count: Cell::new(0),
             counter: Cell::new(0),
             tracing_generation: Cell::new(0),
             loop_token: RefCell::new(None),
@@ -243,10 +238,6 @@ impl BaseJitCell {
 
     pub fn is_tracing(&self) -> bool {
         self.flags.get().contains(JcFlags::JC_TRACING)
-    }
-
-    fn abort_ceiling_latched(&self) -> bool {
-        self.abort_count.get() >= MAX_TRACE_ABORT_COUNT
     }
 
     pub(crate) fn derived_state(&self) -> BaseJitCellState {
@@ -474,85 +465,6 @@ fn default_enable_opts() -> Vec<String> {
         "unroll".to_string(),
     ]
 }
-
-/// Pyre-local abort ceiling with no upstream analogue: after repeated aborts,
-/// mark the green key `DONT_TRACE_HERE`.  Pyre walker aborts are structural
-/// and recur identically on retrace; without a ceiling the same body would
-/// retrace forever, each attempt executing its residual calls concretely.
-///
-/// The ban is permanent, and permanent in a way upstream cannot express: the
-/// flag it sets is the one `should_remove_jitcell` keeps forever on a cell that
-/// never saw a procedure token, and `abort_count` is never reset.  It is
-/// load-bearing rather than defensive — 17 of 24 sampled fixtures reach it, and
-/// removing it buys no compiled loop on any of them while multiplying
-/// `loops_aborted` by 4-6x (see [`WarmEnterState::maybe_compile_decision`] for
-/// why the upstream cell lifecycle that would retire these cells first cannot
-/// be ported as written).  `mc_diag` slots 80/81 measure it.
-///
-/// THE FLAG IT SETS IS ALSO THE INLINE GATE, AND THAT IS DELIBERATE.
-/// `JC_DONT_TRACE_HERE` is what [`WarmEnterState::can_inline_callable`] reads
-/// (`warmstate.py`), so a location the ceiling retires also stops being inlined
-/// into other traces.  Upstream writes that flag from two places only —
-/// `disable_noninlinable_function` (`warmstate.py`, reached from the
-/// `ABORT_TOO_LONG` arm of `blackhole_if_trace_too_long`, `pyjitpl.py`) and
-/// `dont_trace_here` (`warmstate.py`, `max_unroll_recursion`) — and there it
-/// does not even mean "never trace here": `maybe_compile_and_run`
-/// (`warmstate.py`) traces a flagged, tokenless cell immediately, and
-/// `prepare_trace_segmenting` (`pyjitpl.py`) sets it with the comment
-/// "bizarrely enough, this means *do trace here* ??!".  So the coupling is a
-/// pyre-local extension, not a port, and it reads like an accident.
-///
-/// It is not.  The ceiling's premise is that a pyre walker abort is STRUCTURAL
-/// and recurs identically, and that premise applies to the callee position too:
-/// inlining a body whose own walk gave up five times walks the caller into the
-/// same give-up.  Splitting the two — latching the ceiling on `abort_count`
-/// alone and leaving `JC_DONT_TRACE_HERE` to its two upstream writers — was
-/// built and measured over the whole synth corpus on 2026-08-24.  It improved
-/// NOTHING (every other row byte-identical on dynasm, cranelift and wasm) and
-/// cost `synth/generator_tree_recursion`: `bridges_compiled` 26 -> 60,
-/// `guard_failures` 2999 -> 25297, `loops_aborted` 0 -> 3, and the pypy ratio
-/// from under its 7.6x gate to 26.0x (dynasm) / 28.6x (cranelift).  A guard
-/// census of that run puts 24_819 of the 25_297 failures on ONE green key
-/// across nine fail indices, so the sixty bridges built there do not converge —
-/// the ban is holding a bridge non-convergence shut.  Reopening it means fixing
-/// that first; the two numbers above are the acceptance test.
-///
-/// A SECOND, INDEPENDENT ROUTE reached the same wall, which is what pins the
-/// diagnosis.  `abort_trace_live` (`pyjitpl.rs`) charges `abort_tracing` to the
-/// trace's green key, and a bridge session's green key is the source loop's,
-/// so guard-side walks that gave up were driving already-compiled loops into
-/// this ceiling — `synth/generator_frame_handout_image` reaches it with 14
-/// such charges and `loops_aborted=0`, i.e. no primary trace aborted there at
-/// all.  Not charging them is the upstream answer: `aborted_tracing` reads
-/// `greenkey = None # we're in the bridge` and touches no JitCell, and a
-/// bridge never passes through `bound_reached`, which is the only place
-/// upstream touches a cell for a trace.  Doing it removed one of
-/// `generator_tree_recursion`'s two bans and reproduced the paragraph above to
-/// the digit — `bridges_compiled` 26 -> 60, `guard_failures` 2999 -> 25297,
-/// `loops_aborted` 0 -> 3, ratio 41.7x/32.4x — with every other row of the
-/// corpus unchanged on all three backends.
-///
-/// What is known about that unbanned loop, from `MAJIT_GUARDLOG=1` over the bad
-/// regime.  Bridges are NOT decorative there: `MAJIT_NO_BRIDGE=1` on the same
-/// binary reads 239874 guard failures against 25297 with bridges on, so the
-/// tally counts failures a bridge serves as well as deopts, and the 25297 is
-/// 8.4x the banned regime's 2999 at the SAME `loops_compiled=3`.  Every
-/// guard is identified by its descr object
-/// (`compute_unique_id(faildescr)` / `descr_identity`) and is offered a
-/// bridge exactly once in the whole run — 103 offers, 60 bridges — and
-/// `must_compile` answers no to all 21802 later failures at those descrs,
-/// one of which accounts for 7777 by itself.  Whether those 43 offers that
-/// produced no bridge should have been retried the way `must_compile` retries
-/// upstream (`jitcounter.tick` resets the counter when a bridge does not
-/// compile, `compile.py done_compiling`) is the open question.
-///
-/// Public because an embedder that demotes a key of its own on repeated
-/// aborts has to agree with this ceiling, and the consumers that do
-/// restated the literal instead.  Sharing it makes the NUMBERS agree, not
-/// the COUNTS: this one is per green key and latches with `>=`, so a host
-/// counter keyed on anything coarser reaches 5 for reasons this one did
-/// not.
-pub const MAX_TRACE_ABORT_COUNT: u32 = 5;
 
 /// rlib/jit.py `PARAMETERS['disable_unrolling']`, stored by
 /// `set_param_disable_unrolling` and read by nothing.
@@ -913,24 +825,18 @@ impl WarmEnterState {
     /// time (`tick = True` when `JC_TRACING_OCCURRED` is unset), then by
     /// `jitcounter.tick` on subsequent entries.
     ///
-    /// `abort_tracing` also stamps `JC_DONT_TRACE_HERE` at
-    /// `MAX_TRACE_ABORT_COUNT`. That stamp is a ban, not
-    /// `disable_noninlinable_function`'s "trace this separately": with
-    /// `threshold=1`, `compute_threshold` is `> 1` so `tick` fires on every
-    /// entry and the occupied door would retrace forever. The ceiling stays
-    /// in front of this retry.
+    /// Setting `JC_DONT_TRACE_HERE` on a never-traced cell means trace this
+    /// function separately (`maybe_compile_and_run`, `dont_trace_here`); the
+    /// retry is immediate when `JC_TRACING_OCCURRED` is unset, otherwise
+    /// through `jitcounter.tick`.
     fn should_start_dont_trace_here_trace(
         &mut self,
         cell_key: u64,
         flags: JcFlags,
         has_seen_a_procedure_token: bool,
-        abort_count: u32,
         increment: f64,
     ) -> bool {
         if !flags.contains(JcFlags::JC_DONT_TRACE_HERE) || has_seen_a_procedure_token {
-            return false;
-        }
-        if abort_count >= MAX_TRACE_ABORT_COUNT {
             return false;
         }
         if flags.contains(JcFlags::JC_TRACING_OCCURRED) {
@@ -1009,22 +915,17 @@ impl WarmEnterState {
 
         if cell.get_procedure_token().is_none() {
             let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
-            let abort_count = cell.abort_count.get();
             if flags.contains(JcFlags::JC_DONT_TRACE_HERE) && !has_seen_a_procedure_token {
                 if self.should_start_dont_trace_here_trace(
                     hash,
                     flags,
                     has_seen_a_procedure_token,
-                    abort_count,
                     increment,
                 ) {
                     if function_entry && flags.contains(JcFlags::JC_TRACING_OCCURRED) {
                         crate::mc_diag_bump(25);
                     }
                     return HotResult::StartTracing;
-                }
-                if abort_count >= MAX_TRACE_ABORT_COUNT {
-                    crate::mc_diag_bump(81);
                 }
                 return HotResult::NotHot;
             }
@@ -1459,16 +1360,6 @@ impl WarmEnterState {
             {
                 return HotResult::NotHot;
             }
-            // The abort ceiling bans a cell that has already failed
-            // `MAX_TRACE_ABORT_COUNT` traces, including one that carries
-            // `JC_DONT_TRACE_HERE` from that stamp. A dead token still
-            // belongs to `cleanup_chain` on the occupied door.
-            let dead_token =
-                cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none();
-            if cell.abort_count.get() >= MAX_TRACE_ABORT_COUNT && !dead_token {
-                crate::mc_diag_bump(81);
-                return HotResult::NotHot;
-            }
         }
 
         self.start_tracing_cell(cell_key, None, green_types, reds)
@@ -1496,12 +1387,6 @@ impl WarmEnterState {
             {
                 return HotResult::NotHot;
             }
-            let dead_token =
-                cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none();
-            if cell.abort_count.get() >= MAX_TRACE_ABORT_COUNT && !dead_token {
-                crate::mc_diag_bump(81);
-                return HotResult::NotHot;
-            }
         }
 
         self.start_tracing_cell_for_key(key, reds)
@@ -1522,7 +1407,7 @@ impl WarmEnterState {
     /// This is the local counterpart of `warmstate.py`
     /// `maybe_compile_and_run`'s unconditional `finally` clear when the
     /// pre-trace policy refuses a graph: there is no `SwitchToBlackhole`, so
-    /// `aborted_tracing` and the pyre-local abort ceiling do not participate.
+    /// `aborted_tracing` does not run.
     pub fn decline_tracing(&mut self, cell_key: u64) {
         if let Some(cell) = self.cell_by_key_mut(cell_key) {
             cell.flags.set(cell.flags.get() & (!JcFlags::JC_TRACING));
@@ -1531,21 +1416,12 @@ impl WarmEnterState {
 
     /// Mark that tracing was aborted for a green key.
     ///
-    /// Non-permanent aborts clear `JC_TRACING` and allow a future retry until
-    /// pyre's abort ceiling marks the location `DONT_TRACE_HERE`.
+    /// `warmstate.py` `bound_reached` `finally` clears `JC_TRACING`. When
+    /// `disable_noninlinable_function` is set, this also calls
+    /// `WarmEnterState.disable_noninlinable_function`.
     pub fn abort_tracing(&mut self, cell_key: u64, disable_noninlinable_function: bool) {
         if let Some(cell) = self.cell_by_key_mut(cell_key) {
             cell.flags.set(cell.flags.get() & (!JcFlags::JC_TRACING));
-            cell.abort_count.set(cell.abort_count.get() + 1);
-            let already_banned = cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE);
-            let ceiling_reached = cell.abort_ceiling_latched();
-            if disable_noninlinable_function || already_banned || ceiling_reached {
-                cell.flags
-                    .set(cell.flags.get() | (JcFlags::JC_DONT_TRACE_HERE));
-            }
-            if ceiling_reached && !already_banned && !disable_noninlinable_function {
-                crate::mc_diag_bump(80);
-            }
         }
 
         if disable_noninlinable_function {
@@ -1610,6 +1486,16 @@ impl WarmEnterState {
     pub fn clear_tracing_flag(&mut self, cell_key: u64) {
         if let Some(cell) = self.cell_by_key_mut(cell_key) {
             cell.flags.set(cell.flags.get() & !JcFlags::JC_TRACING);
+        }
+    }
+
+    /// `warmstate.py bound_reached` `cell.flags |= JC_TRACING`.
+    /// Re-marks the starting cell after `abort_tracing` cleared it, so
+    /// `convert_and_run_from_pyjitpl` still sees the flag through the
+    /// blackhole cash; `clear_tracing_flag` is the `finally` that drops it.
+    pub fn set_tracing_flag(&mut self, cell_key: u64) {
+        if let Some(cell) = self.cell_by_key_mut(cell_key) {
+            cell.flags.set(cell.flags.get() | JcFlags::JC_TRACING);
         }
     }
 
@@ -4606,43 +4492,6 @@ mod tests {
         assert!(!cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE));
     }
 
-    /// `disable_noninlinable_function` retries a never-seen-token cell
-    /// (`warmstate.py maybe_compile_and_run`). `abort_tracing` stamps the
-    /// same `JC_DONT_TRACE_HERE` flag at `MAX_TRACE_ABORT_COUNT` as a ban:
-    /// a latched cell must not take that retry, or `threshold=1` retraces
-    /// on every entry.
-    ///
-    /// Was: five start-via-door / abort cycles left the tokenless cell in the
-    /// chain so `abort_count` could climb. `maybe_compile_and_run` now
-    /// `cleanup_chain`s a tokenless abort, so the latch is stamped here
-    /// without a decision-door visit between aborts.
-    #[test]
-    fn a_ceiling_latched_cell_without_a_token_is_banned() {
-        for use_typed_key in [false, true] {
-            let mut ws = WarmEnterState::new(2);
-            let green = GreenKey::new(vec![0xCE, 0x11]);
-            let key = green.get_uhash();
-            ws.ensure_cell_for_key(&green);
-            for _ in 0..MAX_TRACE_ABORT_COUNT {
-                ws.abort_tracing(key, false);
-            }
-            let mut ask = |ws: &mut WarmEnterState| {
-                if use_typed_key {
-                    ws.maybe_compile_with_key(&green)
-                } else {
-                    ws.maybe_compile(key)
-                }
-            };
-
-            for _ in 0..64 {
-                assert!(
-                    matches!(ask(&mut ws), HotResult::NotHot),
-                    "a ceiling-latched cell retried after abort_tracing stamped DONT_TRACE_HERE (typed={use_typed_key})",
-                );
-            }
-        }
-    }
-
     /// `warmstate.py maybe_compile_and_run`: `JC_DONT_TRACE_HERE` with no
     /// token and no `JC_TRACING_OCCURRED` traces immediately (`tick = True`).
     /// Threshold 100 would stay cold if the door only counted.
@@ -4657,53 +4506,16 @@ mod tests {
         ));
     }
 
-    /// The abort ceiling and the inline gate share `JC_DONT_TRACE_HERE`, so a
-    /// location the ceiling retires also stops being inlined into other
-    /// traces.  That coupling has no upstream analogue — upstream writes the
-    /// flag from `disable_noninlinable_function` and `dont_trace_here` only —
-    /// and it was measured on 2026-08-24: splitting the two improved no row of
-    /// the synth corpus and cost `synth/generator_tree_recursion`
-    /// `bridges_compiled` 26 -> 60 and `guard_failures` 2999 -> 25297.  This
-    /// test is the pin; see `MAX_TRACE_ABORT_COUNT` for the full record.
-    #[test]
-    fn the_abort_ceiling_also_closes_the_inline_gate() {
-        let mut ws = WarmEnterState::new(2);
-        let key = 0xCE111;
-
-        assert!(ws.can_inline_callable(key), "a fresh key is inlinable");
-
-        // Was: five start-via-door / abort cycles. A tokenless abort is now
-        // `cleanup_chain` (`maybe_compile_and_run`), so stamp the ceiling on
-        // one cell without a decision-door visit between aborts.
-        ws.ensure_cell_for_key(&gk_with_uhash(key, 1));
-        for _ in 0..MAX_TRACE_ABORT_COUNT {
-            // `false`: no `disable_noninlinable_function`, so the ceiling is
-            // the only thing that can stamp the flag.
-            ws.abort_tracing(key, false);
-        }
-
-        let cell = ws.get_cell(key).unwrap();
-        assert!(
-            cell.abort_ceiling_latched(),
-            "the ceiling did not latch after {MAX_TRACE_ABORT_COUNT} aborts",
-        );
-        assert!(
-            !ws.can_inline_callable(key),
-            "a ceiling-latched location is still inlinable as a callee",
-        );
-    }
-
     /// A frontend coverage decline happens before upstream enters
     /// `MetaInterp._interpret`, so it cannot raise `SwitchToBlackhole` or
-    /// contribute to `aborted_tracing`.  Repeating the local fallback past the
-    /// pyre-only ceiling must therefore leave the cell traceable.
+    /// contribute to `aborted_tracing`.
     #[test]
-    fn a_pretrace_decline_does_not_charge_the_abort_ceiling() {
+    fn a_pretrace_decline_leaves_no_dont_trace_here() {
         let mut ws = WarmEnterState::new(2);
         let key = GreenKey::new(vec![0xDEC11E]);
         let hash = key.get_uhash();
 
-        for _ in 0..=MAX_TRACE_ABORT_COUNT {
+        for _ in 0..6 {
             ws.mark_as_being_traced_for_key(&key);
             ws.decline_tracing(hash);
         }
@@ -4711,7 +4523,6 @@ mod tests {
         let cell = ws
             .get_cell_for_key(&key)
             .expect("decline keeps the warm-state cell");
-        assert_eq!(cell.abort_count.get(), 0);
         assert_eq!(cell.derived_state(), BaseJitCellState::NotHot);
         assert!(!cell.flags.get().contains(JcFlags::JC_TRACING));
         assert!(!cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE));
@@ -5166,15 +4977,11 @@ mod tests {
         assert!(ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
     }
 
-    /// A cell that has latched the pyre-local abort ceiling AND holds a
-    /// procedure token that was since invalidated must still be removed from
-    /// the chain: `warmstate.py maybe_compile_and_run` re-counts such a location
-    /// from cold,
-    /// and both back-edge doors already exempt a dead token from the ceiling.
-    /// Refusing at the ceiling first leaves the stale entry in place for every
-    /// later call, so its bucket's counter never re-arms.
+    /// `warmstate.py maybe_compile_and_run`: a dead procedure token
+    /// (`get_procedure_token() is None` after `has_seen_a_procedure_token`)
+    /// is `cleanup_chain`.
     #[test]
-    fn test_function_entry_ceiling_still_cleans_up_a_dead_token() {
+    fn function_entry_cleans_up_a_dead_token() {
         let mut ws = WarmEnterState::new(2);
         ws.set_function_threshold(2);
         let key = 0xD010;
@@ -5188,14 +4995,6 @@ mod tests {
         attach_alive(&mut ws, key, token);
         ws.register_quasiimmut_dependency(qmut, ws.cell_key_for(&gk(key as i64)).expect("cell"));
 
-        for _ in 0..MAX_TRACE_ABORT_COUNT {
-            ws.abort_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"), false);
-        }
-        assert!(
-            ws.get_cell(ws.cell_key_for(&gk(key as i64)).expect("cell"))
-                .is_some()
-        );
-
         assert_eq!(ws.invalidate_quasiimmut(qmut), 1);
         assert_eq!(
             ws.get_cell_state(ws.cell_key_for(&gk(key as i64)).expect("cell")),
@@ -5206,7 +5005,7 @@ mod tests {
         assert!(
             ws.get_cell(ws.cell_key_for(&gk(key as i64)).expect("cell"))
                 .is_none(),
-            "a dead token at the abort ceiling must reach cleanup_chain"
+            "a dead token must reach cleanup_chain"
         );
         assert!(!ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
         assert!(ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
@@ -7920,14 +7719,10 @@ mod tests {
         );
     }
 
-    /// `abort_tracing` latches `DONT_TRACE_HERE` at `MAX_TRACE_ABORT_COUNT`
-    /// without touching `loop_token`, so a cell can be both latched and
-    /// holding a token that is invalidated afterwards. The abort ceiling must
-    /// not answer for that cell before `cleanup_chain` has had it: a dead
-    /// entry left in the bucket never re-arms its counter, which is the
-    /// starvation the ceiling was moved here to remove, in another form.
+    /// Attach a never-owned token (dead weakref, `has_seen_a_procedure_token`
+    /// true). `maybe_compile_and_run` then `cleanup_chain`s it.
     #[test]
-    fn a_latched_cell_whose_token_died_is_still_removed_from_the_chain() {
+    fn a_cell_whose_token_died_is_removed_from_the_chain() {
         let mut ws = WarmEnterState::new(2);
         // Seen once, held no longer. `set_procedure_token` stores only a
         // weak handle (`_makeref`) and takes no ownership, and this fixture
@@ -7940,19 +7735,12 @@ mod tests {
             &gk(42),
             JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED),
         );
-        for _ in 0..MAX_TRACE_ABORT_COUNT {
-            ws.abort_tracing(ws.cell_key_for(&gk(42)).expect("cell"), false);
-        }
         let cell = ws
             .get_cell(ws.cell_key_for(&gk(42)).expect("cell"))
             .expect("fixture: the cell is still there");
         assert!(
             cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none(),
             "fixture: the token must be dead, not merely absent",
-        );
-        assert!(
-            cell.abort_count.get() >= MAX_TRACE_ABORT_COUNT,
-            "fixture: the ceiling must be latched",
         );
 
         assert!(matches!(
@@ -7962,26 +7750,21 @@ mod tests {
         assert!(
             ws.get_cell(ws.cell_key_for(&gk(42)).expect("cell"))
                 .is_none(),
-            "the dead cell must be gone: the ceiling returned before \
-             cleanup_chain and left it in the bucket",
+            "the dead cell must be gone: cleanup_chain dropped it",
         );
     }
 
-    /// Typed-key half of
-    /// `a_latched_cell_whose_token_died_is_still_removed_from_the_chain`.
+    /// Typed-key half of `a_cell_whose_token_died_is_removed_from_the_chain`.
     /// `maybe_compile_with_key` is a parallel implementation, so an ordering
     /// fixed in one says nothing about the other.
     #[test]
-    fn a_latched_typed_cell_whose_token_died_is_still_removed_from_the_chain() {
+    fn a_typed_cell_whose_token_died_is_removed_from_the_chain() {
         let mut ws = WarmEnterState::new(2);
         let key = GreenKey::new(vec![7, 11]);
         ws.attach_procedure_to_interp_for_key(
             &key,
             JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED),
         );
-        for _ in 0..MAX_TRACE_ABORT_COUNT {
-            ws.abort_tracing(key.get_uhash(), false);
-        }
         let cell = ws
             .get_cell_for_key(&key)
             .expect("fixture: the cell is still there");
@@ -7989,16 +7772,11 @@ mod tests {
             cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none(),
             "fixture: the token must be dead, not merely absent",
         );
-        assert!(
-            cell.abort_count.get() >= MAX_TRACE_ABORT_COUNT,
-            "fixture: the ceiling must be latched",
-        );
 
         assert!(matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot));
         assert!(
             ws.get_cell_for_key(&key).is_none(),
-            "the dead cell must be gone: the ceiling returned before \
-             cleanup_chain and left it in the bucket",
+            "the dead cell must be gone: cleanup_chain dropped it",
         );
     }
 
@@ -8052,37 +7830,6 @@ mod tests {
         assert!(
             ws.lookup_chain_with_key(&dnt).is_some(),
             "a never-traced JC_DONT_TRACE_HERE cell is not cleanup_chain",
-        );
-    }
-
-    #[test]
-    fn is_ceiling_latched_agrees_with_the_decision_it_mirrors() {
-        let mut ws = WarmEnterState::new(2);
-        let cell_key = 42u64;
-        ws.ensure_cell_for_key(&gk(cell_key as i64));
-        let cell_key = ws.cell_key_for(&gk(cell_key as i64)).expect("cell");
-        assert!(
-            ws.get_cell(cell_key).unwrap().abort_count.get() < MAX_TRACE_ABORT_COUNT,
-            "a fresh cell is not latched",
-        );
-
-        for _ in 0..MAX_TRACE_ABORT_COUNT {
-            ws.abort_tracing(cell_key, false);
-        }
-        // `abort_tracing` stamps `DONT_TRACE_HERE` at the ceiling as a ban.
-        assert!(
-            ws.get_cell(cell_key).unwrap().abort_count.get() >= MAX_TRACE_ABORT_COUNT,
-            "a ceiling-latched never-seen-token cell is banned",
-        );
-
-        assert!(matches!(
-            ws.maybe_compile_decision(cell_key, &gk(42).types),
-            HotResult::NotHot
-        ));
-        assert_eq!(
-            ws.get_cell(cell_key).unwrap().abort_count.get(),
-            MAX_TRACE_ABORT_COUNT,
-            "the refusal did not consume the latch",
         );
     }
 

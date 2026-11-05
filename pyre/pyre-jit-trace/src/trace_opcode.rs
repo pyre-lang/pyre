@@ -361,6 +361,25 @@ pub(crate) fn save_vable_resume_scalars(ctx: &TraceCtx) -> SavedVableResumeScala
     }
 }
 
+/// True when the STANDARD static is already the interned `ConstInt(want)`.
+/// Overlaying `const_int(want)` would write that same box, so skip is
+/// byte-identical (`opencoder.py` `_encode` TAGINT / small-int).
+pub(crate) fn vable_static_box_is_const_int(
+    ctx: &TraceCtx,
+    static_field_name: &str,
+    want: i64,
+) -> bool {
+    let Some(idx) = ctx
+        .virtualizable_info()
+        .and_then(|info| info.static_field_index_by_name(static_field_name))
+    else {
+        return false;
+    };
+    ctx.virtualizable_box_at(idx)
+        .and_then(|op| op.inline_const_to_value())
+        == Some(Value::Int(want))
+}
+
 pub(crate) fn restore_vable_resume_scalars(ctx: &mut TraceCtx, saved: SavedVableResumeScalars) {
     if let Some((opref, concrete)) = saved.last_instr {
         mirror_vable_static_to_boxes(ctx, "last_instr", opref, concrete);
@@ -976,26 +995,30 @@ impl MIFrame {
                 }
             }
         };
+        let payload_for_pcdep = if jitcode_ptr_pre.is_null() {
+            None
+        } else {
+            Some(std::sync::Arc::clone(&unsafe { &*jitcode_ptr_pre }.payload))
+        };
         let (nlocals, valid_stack_only, jitcode_ptr, pcdep_entries, has_color_map) = {
             let s = self.sym();
-            let (metadata_stack_depth, pcdep_entries, has_color_map) = if s.jitcode.is_null() {
-                (None, Vec::new(), false)
-            } else {
-                unsafe {
-                    let jc = &*s.jitcode;
-                    let has_color_map = jc.payload.metadata.has_color_map;
-                    match resume_jit_pc {
-                        Some(jit_pc) => (
-                            jc.payload
-                                .depth_for_jitcode_pc_pred(jit_pc)
-                                .map(|d| d as usize),
-                            jc.payload.pcdep_for_jitcode_pc(jit_pc).unwrap_or_default(),
-                            has_color_map,
-                        ),
-                        None => (None, Vec::new(), has_color_map),
+            let (metadata_stack_depth, pcdep_entries, has_color_map) =
+                match payload_for_pcdep.as_deref() {
+                    None => (None, &[] as &[(u8, u16, u16)], false),
+                    Some(payload) => {
+                        let has_color_map = payload.metadata.has_color_map;
+                        match resume_jit_pc {
+                            Some(jit_pc) => (
+                                payload
+                                    .depth_for_jitcode_pc_pred(jit_pc)
+                                    .map(|d| d as usize),
+                                payload.pcdep_for_jitcode_pc(jit_pc).unwrap_or(&[]),
+                                has_color_map,
+                            ),
+                            None => (None, &[] as &[(u8, u16, u16)], has_color_map),
+                        }
                     }
-                }
-            };
+                };
             let valid_stack_only = if self.pre_opcode_registers_r.is_some() {
                 metadata_stack_depth.unwrap_or_else(|| s.valuestackdepth.saturating_sub(s.nlocals))
             } else {
@@ -1010,7 +1033,7 @@ impl MIFrame {
             )
         };
         let pcdep_opt: Option<&[(u8, u16, u16)]> =
-            (!pcdep_entries.is_empty()).then(|| pcdep_entries.as_slice());
+            (!pcdep_entries.is_empty()).then_some(pcdep_entries);
         // SSA-authoritative live_r: Ref bank entries go
         // through the read_live / lazy-fill / materialize pipeline to
         // populate registers_r[color].  Int/Float banks already live in

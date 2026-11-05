@@ -133,6 +133,10 @@ unsafe extern "C" fn pyre_clear_vable_token(obj_ptr: i64) {
 /// required by `OptContext::ensure_ptr_info_arg0` (`optimizer.py`)
 /// to dispatch GETFIELD/SETFIELD to `InstancePtrInfo` / `StructPtrInfo`.
 pub fn build_pyframe_virtualizable_info() -> std::sync::Arc<VirtualizableInfo> {
+    pyframe_virtualizable_info().clone()
+}
+
+pub fn pyframe_virtualizable_info() -> &'static std::sync::Arc<VirtualizableInfo> {
     // warmspot.py `jd.virtualizable_info = vinfos[VTYPEPTR]`: one
     // VirtualizableInfo per virtualizable type. Field descrs stamp a
     // Weak back to that object, and `_nonstandard_virtualizable` asks
@@ -170,12 +174,11 @@ pub fn build_pyframe_virtualizable_info() -> std::sync::Arc<VirtualizableInfo> {
         info.finish();
         info
     })
-    .clone()
 }
 
 /// `virtualizable.py static_field_descrs[idx]` on the one PyFrame vinfo.
 pub fn pyframe_static_field_descr(idx: u16) -> majit_ir::DescrRef {
-    let info = build_pyframe_virtualizable_info();
+    let info = pyframe_virtualizable_info();
     let i = idx as usize;
     assert!(
         i < info.static_field_descrs().len(),

@@ -21,8 +21,9 @@
 # to the centisecond (0.36s against pypy's 0.22s, best of three, both files).
 # What is left is pyre's
 # generic `while` scaffolding (a loop-invariant class re-check on the bound, an
-# unused ForceToken, the `ec.w_tracefunc` null check and the eval-breaker
-# poll), and a ceiling of 2 here would gate on that instead of on super.  The
+# unused ForceToken, the `ec.w_tracefunc` read recorded where the loop calls a
+# Python callee, and the eval-breaker poll), and a ceiling of 2 here would
+# gate on that instead of on super.  The
 # `for`-form super fixtures beside this one do carry 2.
 #
 # Sized so pypy's own execution clears the measurement floor: below it the

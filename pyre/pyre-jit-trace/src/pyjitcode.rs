@@ -436,6 +436,8 @@ pub(crate) struct LoopScanIndex {
     pub(crate) abort_permanents: Vec<usize>,
     /// `(pc, target)` of every `goto*` op whose last operand is a label.
     pub(crate) label_gotos: Vec<(usize, usize)>,
+    /// Last `residual_call*`, for queries against any loop-header merge.
+    pub(crate) last_residual_call: Option<usize>,
 }
 
 impl LoopScanIndex {
@@ -444,12 +446,15 @@ impl LoopScanIndex {
             merge_points: Vec::new(),
             abort_permanents: Vec::new(),
             label_gotos: Vec::new(),
+            last_residual_call: None,
         };
         for op in crate::jitcode_runtime::decoded_ops(code) {
             if op.opname == "jit_merge_point" {
                 index.merge_points.push(op.pc);
             } else if op.opname == "abort_permanent" {
                 index.abort_permanents.push(op.pc);
+            } else if op.opname.starts_with("residual_call") {
+                index.last_residual_call = Some(op.pc);
             } else if op.opname.starts_with("goto") && op.argcodes.ends_with('L') {
                 let target = majit_jitcode::jitcode::read_label_at(
                     code,
@@ -510,6 +515,27 @@ pub struct PyJitCodePayload {
     /// Lazily-built per-pc answers of [`Self::blackhole_resume_facts`],
     /// dropped with the body by `replace_with`.
     pub(crate) blackhole_resume_scans: std::cell::OnceCell<Box<[BlackholeResumePcScan]>>,
+    /// Lazily-built per-`start_pc` answers of `trace.rs
+    /// loop_body_abort_permanent_pc`, dropped with the body by `replace_with`.
+    pub(crate) loop_body_abort_permanent:
+        std::cell::OnceCell<Box<[std::cell::OnceCell<Option<usize>>]>>,
+    /// Lazily-built per-`start_pc` answers of `trace.rs
+    /// collect_loop_body_referenced_roots`, dropped with the body by `replace_with`.
+    pub(crate) loop_body_referenced_roots: std::cell::OnceCell<
+        Box<[std::cell::OnceCell<Option<(Vec<usize>, std::collections::HashSet<usize>)>>]>,
+    >,
+    /// `history.py` `ConstPtrJitCode.opencoder_index` for each
+    /// `jitcode.constants_r` entry: the `const_ptr_table` index the last
+    /// `copy_constants` minted for it, `0` when none. A cached index is used
+    /// only while it still resolves to the constant's current address, so
+    /// a slot the table freed and reused is never handed out. Built on first
+    /// use and dropped with the body by `replace_with`.
+    pub(crate) const_r_box_indexes: std::cell::OnceCell<Box<[std::sync::atomic::AtomicU32]>>,
+    /// Sorted unique `co_names` indexes named by `DELETE_NAME` /
+    /// `DELETE_GLOBAL` in this body. Built on first `LOAD_NAME` /
+    /// `LOAD_GLOBAL` cell-fold probe and dropped with the body by
+    /// `replace_with`. An empty slice means the code never deletes a name.
+    pub(crate) deleted_name_indexes: std::cell::OnceCell<Box<[u32]>>,
 }
 
 impl PyJitCodePayload {
@@ -559,6 +585,25 @@ impl PyJitCodePayload {
                 compute_blackhole_resume_facts(jitcode.as_ref(), pc, in_flight_callee_may_raise)
             }
         }
+    }
+
+    /// [`Self::const_r_box_indexes`], sized to `constants_r` on first use.
+    pub(crate) fn const_r_box_indexes(&self) -> &[std::sync::atomic::AtomicU32] {
+        self.const_r_box_indexes.get_or_init(|| {
+            (0..self.jitcode.constants_r.len())
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect()
+        })
+    }
+
+    /// Codewrite-time trace-entry offset for a portal green py_pc
+    /// (`next_instr` in `interp_jit.py PyPyJitDriver.greens`).
+    pub fn merge_entry_for(&self, py_pc: usize) -> Option<usize> {
+        let table = &self.metadata.merge_entry_by_green;
+        table
+            .binary_search_by_key(&(py_pc as u32), |&(py, _)| py)
+            .ok()
+            .map(|i| table[i].1 as usize)
     }
 }
 
@@ -735,6 +780,10 @@ impl PyJitCode {
             loop_scan: std::cell::OnceCell::new(),
             helper_resume_blockers: std::cell::OnceCell::new(),
             blackhole_resume_scans: std::cell::OnceCell::new(),
+            loop_body_abort_permanent: std::cell::OnceCell::new(),
+            loop_body_referenced_roots: std::cell::OnceCell::new(),
+            const_r_box_indexes: std::cell::OnceCell::new(),
+            deleted_name_indexes: std::cell::OnceCell::new(),
         })
     }
 
@@ -775,6 +824,10 @@ impl PyJitCode {
             loop_scan,
             helper_resume_blockers,
             blackhole_resume_scans,
+            loop_body_abort_permanent,
+            loop_body_referenced_roots,
+            const_r_box_indexes,
+            deleted_name_indexes,
         } = next.payload.into_inner();
         let next_jitcode = std::sync::Arc::try_unwrap(next_jitcode)
             .expect("freshly assembled PyJitCode must uniquely own its runtime JitCode");
@@ -797,6 +850,10 @@ impl PyJitCode {
             current.loop_scan = loop_scan;
             current.helper_resume_blockers = helper_resume_blockers;
             current.blackhole_resume_scans = blackhole_resume_scans;
+            current.loop_body_abort_permanent = loop_body_abort_permanent;
+            current.loop_body_referenced_roots = loop_body_referenced_roots;
+            current.const_r_box_indexes = const_r_box_indexes;
+            current.deleted_name_indexes = deleted_name_indexes;
             let current_jitcode = std::sync::Arc::as_ptr(&current.jitcode) as *mut RuntimeJitCode;
             *current_jitcode = next_jitcode;
             current.metadata = metadata;
@@ -823,16 +880,6 @@ impl PyJitCode {
     /// doc.
     pub fn is_populated(&self) -> bool {
         self.metadata.is_drained
-    }
-
-    /// Codewrite-time trace-entry offset for a portal green py_pc
-    /// (`next_instr` in `interp_jit.py PyPyJitDriver.greens`).
-    pub fn merge_entry_for(&self, py_pc: usize) -> Option<usize> {
-        let table = &self.metadata.merge_entry_by_green;
-        table
-            .binary_search_by_key(&(py_pc as u32), |&(py, _)| py)
-            .ok()
-            .map(|i| table[i].1 as usize)
     }
 
     /// JitCode `-live-` offset a walk of this body enters at to resume at
@@ -903,7 +950,6 @@ impl PyJitCode {
         self.merge_entry_for(py_pc)
             .or_else(|| self.first_op_offset(py_pc))
     }
-
     /// Predecessor index into a jitcode-pc twin — the entry
     /// with the largest offset at-or-before `jit_pc`, reproducing
     /// `containing_py_pc_for_jitcode_pc`'s marker-then-first_jit resolution baked into
@@ -922,13 +968,13 @@ impl PyJitCode {
     /// `pcdep_color_slots[containing_py_pc_for_jitcode_pc(jit_pc)]` by construction for
     /// a carried resume coordinate; `None` when the twin is empty (skeleton /
     /// fixture). Scaffolding for the decode-side pc_map re-inversion retirement.
-    pub fn pcdep_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u8, u16, u16)>> {
+    pub fn pcdep_for_jitcode_pc(&self, jit_pc: usize) -> Option<&[(u8, u16, u16)]> {
         let table = &self.metadata.pcdep_by_jit_pc;
         if table.is_empty() {
             return None;
         }
         let search = table.binary_search_by_key(&jit_pc, |&(off, _)| off);
-        Self::predecessor_index(search).map(|i| table[i].1.clone())
+        Self::predecessor_index(search).map(|i| table[i].1.as_slice())
     }
 
     /// Value-stack depth keyed by a JitCode byte offset via the
@@ -984,13 +1030,13 @@ impl PyJitCode {
     /// a carried resume coordinate; `None` when the twin is empty (skeleton /
     /// fixture). Consumed on the decode-identity path of
     /// `const_ref_slots_at_pc_at`.
-    pub fn const_ref_slots_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u16, i64)>> {
+    pub fn const_ref_slots_for_jitcode_pc(&self, jit_pc: usize) -> Option<&[(u16, i64)]> {
         let table = &self.metadata.const_ref_slots_by_jit_pc;
         if table.is_empty() {
             return None;
         }
         let search = table.binary_search_by_key(&jit_pc, |&(off, _)| off);
-        Self::predecessor_index(search).map(|i| table[i].1.clone())
+        Self::predecessor_index(search).map(|i| table[i].1.as_slice())
     }
 
     /// Trivia-aware STATIC-liveness depth keyed by a JitCode

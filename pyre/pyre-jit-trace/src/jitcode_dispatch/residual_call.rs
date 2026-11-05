@@ -850,24 +850,22 @@ fn take_latched_abort_framestack() -> Option<LatchedAbortImage> {
 /// FBW latches that image into TLS; the Abort arm stages
 /// `TraceCtx.aborted_framestack` first, then the GUARD-rebuilt
 /// `MetaInterp.framestack`. Publish the latch so convert starts at the
-/// walk's current pc. Bank words become Const boxes on the MIFrame
-/// (`write_into_miframe_const_boxes`, reverse of `abort_handoff_from_minted`);
-/// last_exc / raising_exception travel next to the stack. `0` / `false` are
-/// published values (`convert_and_run_from_pyjitpl` converts one image);
-/// the Abort arm takes both from this latch when `aborted_framestack` is Some.
+/// walk's current pc. The raw register words, last exception, and raising flag
+/// travel together in `AbortedWalkImage`; no Const boxes are minted merely to
+/// hand the same words back to the blackhole.
 pub(crate) fn publish_latched_abort_framestack(ctx: &mut majit_metainterp::TraceCtx) -> bool {
     if ctx.aborted_framestack.is_some() {
         return true;
     }
-    let Some(mut image) = take_latched_abort_framestack() else {
+    let Some(image) = take_latched_abort_framestack() else {
         return false;
     };
-    for (frame, banks) in image.framestack.frames.iter_mut().zip(image.banks.iter()) {
-        banks.write_into_miframe_const_boxes(frame);
-    }
+    ctx.aborted_walk = Some(majit_metainterp::AbortedWalkImage {
+        banks: image.banks,
+        last_exc_value: image.last_exc_value,
+        raising_exception: image.raising_exception,
+    });
     ctx.aborted_framestack = Some(image.framestack);
-    ctx.aborted_last_exc_value = image.last_exc_value;
-    ctx.aborted_raising_exception = image.raising_exception;
     true
 }
 
@@ -7095,6 +7093,13 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                 ctx.fbw_mode
                     .inline_caller_py_pc
                     .unwrap_or(ctx.vstack_cur_pypc)
+            } else if !ctx.fbw_mode.inline_subwalk {
+                // The dispatch's trace callback runs before the opcode's
+                // stack mirror advances. Publish its own JitCode coordinate,
+                // as LiveLastInstrGuard does for the heap half below.
+                // Otherwise a force in the callback writes the previous
+                // opcode back over the executing last_instr.
+                live_py_pc_from_snapshot(ctx, op_pc).unwrap_or(ctx.vstack_cur_pypc)
             } else {
                 ctx.vstack_cur_pypc
             };
@@ -8670,10 +8675,7 @@ pub(super) fn inline_callee_py_pc<Sym: WalkSym>(
 ) -> Option<u32> {
     let consts = ctx.inline_callee_consts?;
     let pjc = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?;
-    Some(crate::py_coord::containing_py_pc_for_jitcode_pc(
-        &pjc.metadata,
-        jit_pc,
-    ))
+    Some(executing_py_pc(&pjc, jit_pc))
 }
 
 fn live_py_pc_from_snapshot<Sym: WalkSym>(
@@ -8689,21 +8691,39 @@ fn live_py_pc_from_snapshot<Sym: WalkSym>(
         return None;
     }
     let jc = unsafe { &*sym.jitcode() };
+    Some(executing_py_pc(&jc.payload, jit_pc))
+}
+
+fn executing_py_pc(payload: &crate::pyjitcode::PyJitCodePayload, jit_pc: usize) -> u32 {
     // `pyopcode.py dispatch_bytecode` sets `self.last_instr` to the opcode
     // whose jitted arm runs `ec.bytecode_only_trace(self)`.  That arm can be
     // laid out past the last opcode start, where the floor mapping names a
     // later instruction; the exact table names the owning opcode
     // (`vstack_step_py_pc` prefers it for the same reason).
-    if let Some(exact) = crate::pyjitcode::exact_py_pc_for_jitcode_pc(
-        &jc.payload.metadata.py_exact_by_jit_pc,
-        jit_pc,
-    ) {
-        return Some(exact);
-    }
-    Some(crate::py_coord::containing_py_pc_for_jitcode_pc(
-        &jc.payload.metadata,
-        jit_pc,
-    ))
+    let py_pc =
+        crate::pyjitcode::exact_py_pc_for_jitcode_pc(&payload.metadata.py_exact_by_jit_pc, jit_pc)
+            .unwrap_or_else(|| {
+                crate::py_coord::containing_py_pc_for_jitcode_pc(&payload.metadata, jit_pc)
+            });
+    // A source region can start at trivia or an EXTENDED_ARG prefix. Match
+    // dispatch_bytecode's last_instr store, which names the real opcode;
+    // this is an executing coordinate, not a guard-resume coordinate.
+    let Some(code) = (unsafe { payload.code_ptr.as_ref() }) else {
+        return py_pc;
+    };
+    super::skip_python_trivia_forward(code, py_pc as usize) as u32
+}
+
+#[test]
+fn executing_coordinate_preserves_a_reopened_opcode_region() {
+    let mut code = crate::PyJitCode::skeleton(std::ptr::null());
+    code.metadata.py_floor_by_jit_pc = vec![(0, 1), (4, 9)];
+    code.metadata.py_exact_by_jit_pc = vec![(0, 1), (4, 9), (8, 1)];
+    // Flattening drains the trace-callback arm out of source order. The
+    // first-offset floor belongs to opcode 9 here; the callback still
+    // executes opcode 1, which reopened its own emission region.
+    assert_eq!(executing_py_pc(&code, 10), 1);
+    assert_eq!(executing_py_pc(&code, 5), 9);
 }
 
 /// Convenience wrapper for [`walker_vable_and_vrefs_before_residual_call`].
@@ -14738,10 +14758,10 @@ mod tests {
         assert_eq!(resume, 460);
     }
 
-    /// A banks-only latch publishes Const boxes onto the TraceCtx MIFrame
-    /// and carries last_exc / raising_exception with the stack.
+    /// A banks-only latch publishes one raw `AbortedWalkImage` and leaves the
+    /// tracing MIFrame unminted.
     #[test]
-    fn publish_latched_abort_writes_bank_words_into_miframe_const_boxes() {
+    fn publish_latched_abort_keeps_raw_bank_words() {
         pyre_interpreter::module::thread::ensure_runtime_thread();
         reset_single_frame_blackhole();
         let mut builder = majit_metainterp::JitCodeBuilder::new();
@@ -14770,7 +14790,7 @@ mod tests {
             last_exc_value: last_exc,
             raising_exception: true,
             mirror_stack: None,
-            origin: "test-publish-const-boxes",
+            origin: "test-publish-raw-banks",
         });
 
         let mut ctx = TraceCtx::for_test(0);
@@ -14780,21 +14800,17 @@ mod tests {
             .as_ref()
             .expect("published framestack")
             .frames[0];
-        let int_box = frame.int_regs[0].expect("int bank word becomes a ConstInt");
-        assert!(int_box.is_constant());
-        assert_eq!(frame.int_value_for_blackhole(0), Some(int_word));
-        let ref_box = frame.ref_regs[0].expect("ref bank word becomes a ConstPtr");
-        assert!(ref_box.is_constant());
-        assert_eq!(frame.ref_value_for_blackhole(0), Some(ref_word));
-        let float_box = frame.float_regs[0].expect("float bank word becomes a ConstFloat");
-        assert!(float_box.is_constant());
-        assert_eq!(frame.float_value_for_blackhole(0), Some(float_word));
-        assert!(
-            frame.int_regs.len() >= 2 && frame.int_regs[1].is_none(),
-            "a register stays None where the bank has no word"
-        );
-        assert_eq!(ctx.aborted_last_exc_value, last_exc);
-        assert!(ctx.aborted_raising_exception);
+        assert!(frame.int_regs[0].is_none());
+        assert!(frame.ref_regs[0].is_none());
+        assert!(frame.float_regs[0].is_none());
+        let image = ctx.aborted_walk.as_ref().expect("published raw walk image");
+        assert_eq!(image.banks.len(), 1);
+        assert_eq!(image.banks[0].registers_i[0], Some(int_word));
+        assert_eq!(image.banks[0].registers_r[0], Some(ref_word));
+        assert_eq!(image.banks[0].registers_f[0], Some(float_word));
+        assert!(image.banks[0].registers_i[1].is_none());
+        assert_eq!(image.last_exc_value, last_exc);
+        assert!(image.raising_exception);
         reset_single_frame_blackhole();
     }
 }

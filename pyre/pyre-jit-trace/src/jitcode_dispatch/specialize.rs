@@ -1967,9 +1967,8 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
 /// `force_frame` INSIDE an opaque residual; that clears
 /// `TOKEN_TRACING_RESCALL` and `tracing_after_residual_call` reads it back as
 /// `VableEscapedDuringResidualCall`.  The frame `gettopframe` answers with is
-/// the one being traced, so that residual always escapes, the walk always
-/// aborts, and after `MAX_TRACE_ABORT_COUNT` of them the merge point is
-/// stamped `JC_DONT_TRACE_HERE` for the rest of the process.
+/// the one being traced, so that residual always escaped, so the merge point
+/// never compiled.
 ///
 /// [`crate::helpers::jit_bare_super_from_frame`] is the same `descriptor.py
 /// _super_from_frame` half `bh_load_super_attr_fn` calls, and it takes the
@@ -11778,8 +11777,8 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
     Ok(Some(DispatchOutcome::Continue))
 }
 
-/// Cut the trace from INSIDE the `locals()` expansion once the recorded
-/// length crosses `trace_limit`.
+/// Check between the source steps recorded by a folded interpreter body,
+/// as `pyjitpl.py MetaInterp._interpret` does after `run_one_step`.
 ///
 /// `pyjitpl.py` `MetaInterp._interpret` asks `blackhole_if_trace_too_long()`
 /// after every jitcode step, so the `@jit.unroll_safe` `fast2locals` it looks
@@ -11800,28 +11799,23 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
 /// built before emitting is a pure function of the fastlocals, so the residual
 /// redoes it with the same outcome.
 ///
+/// `pyopcode.py LOAD_NAME` can cross the limit at its locals/globals
+/// comparison, before `LOAD_GLOBAL_cached`. That prefix only reads the
+/// namespaces, so resuming at the opcode also repeats no effect there.
+///
 /// `trace_too_long_abort_safe`'s bar is kept: with effects already executed and
 /// no blackhole image to hand them to,
 /// `run_blackhole_interp_to_cancel_tracing` has nowhere to resume, so the walk
 /// goes on recording exactly as it does there.
-/// Name the gate a `locals()` / `vars()` / `dir()` expansion declined at, so a
-/// census over a corpus attributes every refusal to one gate rather than
-/// re-deriving it by reading.  `arm` distinguishes the standard-virtualizable
-/// expansion from the inlined-callee one, which decline for different reasons.
-fn locals_expansion_declined(arm: &str, why: &str) {
-    if fbw_debug_abort_enabled() {
-        eprintln!("[decline-why] LOCALS-{arm} {why}");
-    }
-}
-
-fn locals_expansion_cut_if_too_long<Sym: WalkSym>(
+fn blackhole_if_trace_too_long<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     pc: usize,
+    origin: &'static str,
 ) -> Result<(), DispatchError> {
     if !ctx.trace_ctx.is_too_long() {
         return Ok(());
     }
-    let latched = residual_call::latch_abort_blackhole(ctx, pc, "locals-expansion");
+    let latched = residual_call::latch_abort_blackhole(ctx, pc, origin);
     if !latched && super::fbw_state::fbw_executed_effect_count() != 0 {
         super::bump_keep_recording_too_long_once(ctx.session);
         return Ok(());
@@ -11833,6 +11827,22 @@ fn locals_expansion_cut_if_too_long<Sym: WalkSym>(
     );
     ctx.session.borrow_mut().trace_too_long = true;
     Err(DispatchError::TraceTooLong { pc, ops })
+}
+
+/// Check between the slots of `pyframe.py fast2locals`'s unrolled expansion.
+fn locals_expansion_cut_if_too_long<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    pc: usize,
+) -> Result<(), DispatchError> {
+    blackhole_if_trace_too_long(ctx, pc, "locals-expansion")
+}
+
+/// Name the gate a `locals()` / `vars()` / `dir()` expansion declined at.
+/// `arm` distinguishes standard-virtualizable and inlined-callee expansions.
+fn locals_expansion_declined(arm: &str, why: &str) {
+    if fbw_debug_abort_enabled() {
+        eprintln!("[decline-why] LOCALS-{arm} {why}");
+    }
 }
 
 /// Which builtin [`try_walker_specialize_builtin_locals`] is standing in for.
@@ -12768,8 +12778,8 @@ fn try_walker_specialize_builtin_locals_in_callee<Sym: WalkSym>(
     // `tracing_after_residual_call` reads as `VableEscapedDuringResidualCall`.
     // Falling through therefore does not cost one residual call; it costs the
     // enclosing loop, because the escape is a property of the callee BODY and
-    // every retry rebuilds the same framestack and escapes again until
-    // `MAX_TRACE_ABORT_COUNT` retires the caller.
+    // every retry rebuilds the same framestack and escapes again; refuse the
+    // callee here so the caller records `bh_call_fn` instead.
     //
     // Refuse the callee HERE instead, before the residual runs.  The caller
     // then records the plain `bh_call_fn` it would have recorded had this body
@@ -16553,7 +16563,7 @@ fn orthodox_helper_nested_entry<Sym: WalkSym>(
 /// `resume_marker_for_jitcode_pc` answers the preamble; this returns the
 /// op2 `-live-` when `marker` is that preamble, and `marker` unchanged
 /// otherwise.
-fn loop_header_guard_resume_marker(payload: &crate::PyJitCode, marker: usize) -> usize {
+pub(crate) fn loop_header_guard_resume_marker(payload: &crate::PyJitCode, marker: usize) -> usize {
     let jitcode = payload.jitcode.as_ref();
     let code = jitcode.code.as_slice();
     let op_live = crate::state::op_live();
@@ -20661,7 +20671,7 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(false);
     };
-    if code_deletes_name_from_ptr(w_code_ptr, &name) {
+    if code_deletes_name_cached(w_code_ptr, ctx.outer_jitcode_index, &name) {
         return Ok(false);
     }
     if emit_module_dict_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, &name)? {
@@ -21229,20 +21239,73 @@ fn code_delete_name_indices(
     })
 }
 
+fn build_deleted_name_indexes(code: &pyre_interpreter::CodeObject) -> Box<[u32]> {
+    let mut idxs: Vec<u32> = code_delete_name_indices(code).map(|i| i as u32).collect();
+    idxs.sort_unstable();
+    idxs.dedup();
+    idxs.into_boxed_slice()
+}
+
+fn deleted_name_indexes_of<'a>(
+    pjc: &'a crate::pyjitcode::PyJitCodePayload,
+    code: &pyre_interpreter::CodeObject,
+) -> &'a [u32] {
+    pjc.deleted_name_indexes
+        .get_or_init(|| build_deleted_name_indexes(code))
+}
+
+/// Payload for `w_code_ptr`'s CodeObject. Prefer the walk's live jitcode
+/// (dense index) when it is that same body; otherwise the code the fold
+/// already holds.
+fn pyjitcode_for_deleted_names(
+    w_code_ptr: usize,
+    outer_jitcode_index: u32,
+) -> Option<std::sync::Arc<crate::PyJitCode>> {
+    // Prefer the walk's live jitcode when it is this body. Index 0 is left
+    // to `pyjitcode_for_code`: fixtures default `outer_jitcode_index` to 0
+    // and a vacant build-time slot would otherwise compile on this probe.
+    if outer_jitcode_index != 0
+        && let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(outer_jitcode_index as i32)
+        && let Some(code) = code_from_w_code_ptr(w_code_ptr)
+        && std::ptr::eq(pjc.code_ptr, code)
+    {
+        return Some(pjc);
+    }
+    crate::state::pyjitcode_for_code(w_code_ptr as *const ())
+}
+
+fn indexes_delete_name(indexes: &[u32], code: &pyre_interpreter::CodeObject, name: &str) -> bool {
+    if indexes.is_empty() {
+        return false;
+    }
+    indexes.iter().any(|&idx| {
+        pyre_interpreter::pyframe::load_name_from_code(code, idx as usize) == Some(name)
+    })
+}
+
 /// `except as` compiles to `STORE_NAME` + `DELETE_NAME` of that name
 /// (`pyopcode.py DELETE_NAME`).  Baking its cell would read the detached
 /// object after the delete and the next store allocated a replacement.
 fn code_deletes_name(code: &pyre_interpreter::CodeObject, name: &str) -> bool {
-    code_delete_name_indices(code)
-        .any(|idx| pyre_interpreter::pyframe::load_name_from_code(code, idx) == Some(name))
+    indexes_delete_name(&build_deleted_name_indexes(code), code, name)
 }
 
-fn code_deletes_name_from_ptr(w_code_ptr: usize, name: &str) -> bool {
-    code_from_w_code_ptr(w_code_ptr).is_some_and(|code| code_deletes_name(code, name))
+fn code_deletes_name_cached(w_code_ptr: usize, outer_jitcode_index: u32, name: &str) -> bool {
+    let Some(code) = code_from_w_code_ptr(w_code_ptr) else {
+        return false;
+    };
+    if let Some(pjc) = pyjitcode_for_deleted_names(w_code_ptr, outer_jitcode_index) {
+        return indexes_delete_name(deleted_name_indexes_of(&pjc, code), code, name);
+    }
+    code_deletes_name(code, name)
 }
 
-fn frame_code_deletes_name(frame: &pyre_interpreter::pyframe::PyFrame, name: &str) -> bool {
-    code_deletes_name_from_ptr(frame.pycode as usize, name)
+fn frame_code_deletes_name(
+    frame: &pyre_interpreter::pyframe::PyFrame,
+    outer_jitcode_index: u32,
+    name: &str,
+) -> bool {
+    code_deletes_name_cached(frame.pycode as usize, outer_jitcode_index, name)
 }
 
 /// LoadName cell fold — module-scope LOAD_NAME mirror of
@@ -21251,6 +21314,7 @@ fn frame_code_deletes_name(frame: &pyre_interpreter::pyframe::PyFrame, name: &st
 /// (`createframe` sets `debugdata.w_locals = w_globals_storage`,
 /// pyframe.rs), so `load_name_value`'s probe + LOAD_GLOBAL fallthrough
 /// both resolve in `w_globals` — the same dict the global cell fold reads.
+/// The module-scope test is recorded as `pyopcode.py LOAD_NAME` records it.
 /// A non-module frame (class body / `exec(code, g, l)` with separate locals)
 /// has a non-null `w_locals`, so the gate routes it to the live
 /// residual `bh_load_name_fn`.
@@ -21278,14 +21342,15 @@ pub(crate) fn try_walker_load_name_cell_fold<Sym: WalkSym>(
         return Ok(false);
     }
     // Only module scope (w_locals IS w_globals) is foldable. Module frames bind
-    // `w_locals = w_globals` (pyframe.py); a `w_locals`
-    // that is a DIFFERENT object means the LOAD_NAME probe targets a separate
-    // locals namespace the module-dict cell fold (keyed on `w_globals`) would
-    // skip. (Class bodies / `exec(code, g, l)` set a separate one; they also do
+    // `w_locals = w_globals` (`pyframe.py initialize_frame_scopes`); a null
+    // `w_locals` is a frame with no debugdata, and a `w_locals` that is a
+    // DIFFERENT object means the LOAD_NAME probe targets a separate locals
+    // namespace the module-dict cell fold (keyed on `w_globals`) would skip.
+    // (Class bodies / `exec(code, g, l)` set a separate one; they also do
     // not portal-trace, so the only LOAD_NAME the walker reaches in practice is
     // module-scope.)
     let w_locals = frame.get_w_locals();
-    if !w_locals.is_null() && !std::ptr::eq(w_locals, w_globals) {
+    if w_locals.is_null() || !std::ptr::eq(w_locals, w_globals) {
         return Ok(false);
     }
     let Some(name) = (unsafe {
@@ -21293,9 +21358,16 @@ pub(crate) fn try_walker_load_name_cell_fold<Sym: WalkSym>(
     }) else {
         return Ok(false);
     };
-    if frame_code_deletes_name(frame, name) {
+    if frame_code_deletes_name(frame, ctx.outer_jitcode_index, name) {
         return Ok(false);
     }
+    if ctx.inline_callee_consts.is_none() && !record_load_name_locals_is_globals(ctx, op_pc)? {
+        return Ok(false);
+    }
+    // `pyjitpl.py MetaInterp._interpret` checks after the comparison in
+    // `pyopcode.py LOAD_NAME`, before entering `LOAD_GLOBAL_cached`. Do not
+    // append globals/version guards or execute the load after that cut.
+    blackhole_if_trace_too_long(ctx, op_pc, "load-name-locals-test")?;
     if emit_module_dict_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, name)? {
         return Ok(true);
     }
@@ -21343,7 +21415,7 @@ pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
     }) else {
         return Ok(false);
     };
-    if frame_code_deletes_name(frame, name) {
+    if frame_code_deletes_name(frame, ctx.outer_jitcode_index, name) {
         return Ok(false);
     }
     let Some(slot) = crate::state::module_dict_cell_slot_direct(w_globals, name) else {

@@ -78,6 +78,13 @@ pub struct FunDecl {
 }
 
 impl FunDecl {
+    /// A foreign ABI declaration, rather than an opaque Rust body.
+    pub fn is_extern(&self) -> bool {
+        self.body
+            .as_ref()
+            .is_some_and(|body| raw_object_first_key_is(body.get(), "Extern"))
+    }
+
     /// The `GlobalDecl` id when the function is a compiler-synthesised
     /// static / const initialiser body (e.g. the body that constructs
     /// `static NONE_SINGLETON`'s value), read from

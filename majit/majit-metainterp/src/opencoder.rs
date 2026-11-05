@@ -2434,18 +2434,9 @@ impl Trace {
     /// method matches the RPython call shape for callers that hold a
     /// `Box` (e.g. `MIFrame::get_list_of_active_boxes`).
     ///
-    /// `history.py` `ConstPtr.value` stays a GCREF local across
-    /// `_encode` and the `_snapshot_array_data` append. The append can
-    /// minor-collect (`CharList::realloc_items`).
+    /// `_encode_ptr` pins the referent when `self._refs` may grow; the
+    /// tagged word `append_snapshot_array_data_int` writes holds no address.
     pub(crate) fn _add_box_to_storage_box(&mut self, b: Box) {
-        let pin = match b {
-            Box::ConstPtr(addr) => pin_gc_addr(addr as usize),
-            _ => None,
-        };
-        let b = match &pin {
-            Some(p) => Box::ConstPtr(p.get().0 as u64),
-            None => b,
-        };
         let tagged = self._encode(b);
         self.append_snapshot_array_data_int(tagged);
     }

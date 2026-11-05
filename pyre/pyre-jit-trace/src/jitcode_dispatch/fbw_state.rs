@@ -17,41 +17,21 @@
 
 use super::*;
 
-/// Maximum inline depth the multiframe guard-snapshot path
-/// (`walker_capture_multi_frame_inline_snapshot`) unrolls a straight-line
-/// value-returning callee CHAIN before folding to the `CALL_ASSEMBLER` tail.
-/// Default 7: a deep value-returning chain (`b→c→…→h`) stays in compiled code
-/// and each extra inlined level removes a residual call — measured ~2.0–2.3×
-/// on `bench/synth/inline_chain_depth_typeflip.py` with no regression
-/// elsewhere.  The number predates that file: it was taken on the separate
-/// per-depth fixtures later consolidated into it, so re-measure before
-/// leaning on it.
-///
-/// A callee that raises inline is capped separately — at THREE distinct
-/// multiframe levels, keyed off `callee_body_contains_raise` — because its
-/// unwind crosses suspended intermediate frames through the cross-frame
-/// bridge (gh#343 / gh#467).  Recursive / duplicate raising used to sit at
-/// 2 while the carrier treated a middle `SubRaise` as a drain abort; the
-/// drain now continues `finishframe_exception` there, so that bound matches
-/// value-returning recursion (`max_unroll_recursion` only).
-///
-/// A self-recursive callee is bounded instead by
-/// [`fbw_inline_recursion_count`] against `max_unroll_recursion`, mirroring
-/// `opimpl_recursive_call` (`pyjitpl.py`) folding the recursive call
-/// straight to `CALL_ASSEMBLER` past the bound rather than continuing to unroll
-/// the call tree.
-/// (The depth-≥2 blackhole-resume crash that previously blocked this path was a
-/// GC-rooting gap in the nested `run()` chain, fixed by rooting the whole
-/// pending `nextblackholeinterp` chain across `run()`; the bound is now a
-/// performance, not a soundness, question.)
+/// No generic total-depth bound by default: `perform_call` (`pyjitpl.py`)
+/// pushes an `MIFrame` per call. Recursion is bounded by
+/// `max_unroll_recursion` (`fbw_inline_recursion_count`) and the total by
+/// the trace limit (`blackhole_if_trace_too_long`).
+/// `PYRE_FBW_MULTIFRAME_DEPTH=N` lowers it to exercise shallow resume
+/// paths in tests. The raising-chain bound of 3 stays in
+/// `fbw_effective_multiframe_depth`.
 pub(crate) fn fbw_max_multiframe_depth() -> usize {
     static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *DEPTH.get_or_init(|| {
         std::env::var("PYRE_FBW_MULTIFRAME_DEPTH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(7)
-            .clamp(1, 7)
+            .unwrap_or(usize::MAX)
+            .max(1)
     })
 }
 
@@ -137,10 +117,10 @@ pub(crate) fn framestack_has_duplicate_w_code(frames: &[InlineFrame]) -> bool {
 ///
 /// PyPy `_opimpl_recursive_call` has no second, total-framestack depth gate:
 /// once a recursive portal is admitted, `memory_manager.max_unroll_recursion`
-/// is the sole value-returning recursion bound.  FBW's generic multiframe cap
-/// is a local cost valve for non-recursive call chains and must not silently
-/// turn an upstream value of 7 into an effective 6 when an ambient inline
-/// frame is present.
+/// is the sole value-returning recursion bound.  FBW's generic multiframe
+/// bound is unbounded unless lowered by `PYRE_FBW_MULTIFRAME_DEPTH`, and
+/// must not silently turn an upstream value of 7 into an effective 6 when
+/// an ambient inline frame is present.
 ///
 /// Raising chains keep a shallower local bound on a *distinct* call chain
 /// because the carrier unwind crosses suspended frames.  `perform_call`

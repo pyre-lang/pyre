@@ -30,9 +30,10 @@
 # large it is.
 #
 # `settrace` is checked alongside `setprofile` because they fail differently:
-# `w_tracefunc` is guarded at the merge point, so arming a tracer exits compiled
-# code, while `is_being_profiled` is a portal green, so arming a profiler mints
-# a different cell that KEEPS the JIT and leaves the call a residual. Only the
+# `w_tracefunc` is guarded where the loop calls a Python callee, so arming a
+# tracer exits compiled code, while `is_being_profiled` is a portal green, so
+# arming a profiler mints a different cell that KEEPS the JIT and leaves the
+# call a residual. Only the
 # second reaches the portal entries this fixture is about, so a fixture that
 # armed only a tracer would pass without testing anything.
 import sys

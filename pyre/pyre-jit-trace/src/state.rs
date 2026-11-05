@@ -1563,8 +1563,7 @@ pub(crate) fn sub_jitcode_entry_param_colors(code: *const ()) -> Option<Vec<(u8,
         return None;
     }
     let pjc = pyjitcode_for_code(code)?;
-    let legacy = pjc.pcdep_for_jitcode_pc(0);
-    legacy
+    pjc.pcdep_for_jitcode_pc(0).map(<[_]>::to_vec)
 }
 
 pub(crate) type SubDescrPool = (
@@ -1576,10 +1575,8 @@ pub(crate) type SubDescrPool = (
 /// Build (memoized on the payload itself) the per-fn descr pool a callee body
 /// needs when inlined by full-body-walk call inlining: its OWN adapted
 /// `descr_refs` + raw `RuntimeBhDescr` slice (for `RawDescrPool::PerFn`) +
-/// `sub_jitcode_lookup`.  Mirror of the top-level diagnostic walk's per-fn
-/// descr-pool construction (`dispatch_perfn_frame` in `trace.rs`): a callee
-/// body's `d`/`j` descr operands index its OWN `exec.descrs`, not the
-/// caller's pool.
+/// `sub_jitcode_lookup`. A callee body's `d`/`j` descr operands index its
+/// OWN `exec.descrs`, not the caller's pool.
 ///
 /// The pool lives on `PyJitCodePayload.sub_descr_pool`, not in a side table
 /// keyed by object identity: RPython has no such table — the active MIFrame's
@@ -1604,6 +1601,8 @@ pub(crate) fn sub_jitcode_descr_pool_for_code(code: *const ()) -> Option<SubDesc
     Some(sub_descr_pool_for_payload(&pjc))
 }
 
+/// Single per-fn descr-pool construction, used by the top-level walk
+/// (`dispatch_perfn_frame`) and by full-body-walk call inlining.
 pub(crate) fn sub_descr_pool_for_payload(pjc: &crate::PyJitCode) -> SubDescrPool {
     use majit_metainterp::jitcode::RuntimeBhDescr;
     *pjc.sub_descr_pool.get_or_init(|| {
@@ -2339,7 +2338,10 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
             // `jitcode_pc` via the predecessor-keyed twins.  Once liveness is
             // decodable, the two sidecars are independently optional: a miss
             // in one must not discard the other.
-            let pcdep = payload.pcdep_for_jitcode_pc(jp).unwrap_or_default();
+            let pcdep = payload
+                .pcdep_for_jitcode_pc(jp)
+                .map(<[_]>::to_vec)
+                .unwrap_or_default();
             let depth = payload
                 .depth_for_jitcode_pc_pred(jp)
                 .map(usize::from)
@@ -6964,19 +6966,19 @@ impl ConstantRegisters for crate::jitcode_dispatch::RegisterList {
     }
 }
 
-fn copy_constants<F>(
+fn copy_constants<T, F>(
     registers: &mut impl ConstantRegisters,
-    constants: &[i64],
+    constants: impl ExactSizeIterator<Item = T>,
     targetindex: usize,
     mut mint: F,
 ) where
-    F: FnMut(i64) -> OpRef,
+    F: FnMut(T) -> OpRef,
 {
     let num_regs_and_consts = targetindex + constants.len();
     if registers.len() < num_regs_and_consts {
         registers.resize(num_regs_and_consts, OpRef::NONE);
     }
-    for (i, &val) in constants.iter().enumerate() {
+    for (i, val) in constants.enumerate() {
         registers.set(targetindex + i, mint(val));
     }
 }
@@ -7120,7 +7122,9 @@ impl PyreSym {
     /// per `resume.py`), not in the constant pool. Re-entering
     /// this helper therefore overwrites the trailing slots with freshly
     /// minted OpRefs across all three banks, matching `copy_constants`
-    /// overwrite semantics line-by-line.
+    /// overwrite semantics line-by-line. Ref constants go through
+    /// `TraceCtx::const_ref_cached`, which reuses the index cached on the payload
+    /// (`ConstPtrJitCode.opencoder_index`).
     ///
     /// `registers_r` carries the unified locals + stack-tail abstract
     /// register file. The SSA-authoritative live_r work extends the resize to
@@ -7144,25 +7148,11 @@ impl PyreSym {
     /// no-op.
     pub(crate) fn setup_kind_register_banks(&mut self, ctx: &mut TraceCtx) {
         debug_assert!(!self.jitcode.is_null());
-        let (num_regs_i, num_regs_r, num_regs_f, constants_i, constants_r, constants_f) = {
-            let jc = unsafe { &*self.jitcode };
-            let runtime_jc = &jc.payload.jitcode;
-            (
-                runtime_jc.num_regs_i() as usize,
-                runtime_jc.num_regs_r() as usize,
-                runtime_jc.num_regs_f() as usize,
-                runtime_jc.constants_i.clone(),
-                // Snapshot the pool's current values: `copy_constants`
-                // seeds a register file and never writes back, so it wants
-                // plain words, not the live interior-mutable slots.
-                runtime_jc
-                    .constants_r
-                    .iter()
-                    .map(|slot| slot.get())
-                    .collect::<Vec<i64>>(),
-                runtime_jc.constants_f.clone(),
-            )
-        };
+        let jc: &_ = unsafe { &*self.jitcode };
+        let runtime_jc = &jc.payload.jitcode;
+        let num_regs_i = runtime_jc.num_regs_i() as usize;
+        let num_regs_r = runtime_jc.num_regs_r() as usize;
+        let num_regs_f = runtime_jc.num_regs_f() as usize;
         // pyjitpl.py `MIFrame.copy_constants` line-by-line:
         //   num_regs_and_consts = targetindex + len(constants)
         //   if registers is None or len(registers) < num_regs_and_consts:
@@ -7172,15 +7162,26 @@ impl PyreSym {
         //       targetindex += 1
         // The "translation-time-only debug wipe" arm
         // (`elif not we_are_translated()`) has no pyre analogue.
-        copy_constants(&mut self.registers_i, &constants_i, num_regs_i, |v| {
-            ctx.const_int(v)
-        });
-        copy_constants(&mut self.registers_r, &constants_r, num_regs_r, |v| {
-            ctx.const_ref(v)
-        });
-        copy_constants(&mut self.registers_f, &constants_f, num_regs_f, |v| {
-            ctx.const_float(v)
-        });
+        copy_constants(
+            &mut self.registers_i,
+            runtime_jc.constants_i.iter().copied(),
+            num_regs_i,
+            |v| ctx.const_int(v),
+        );
+        // Each slot is read right before its `ConstPtr` is minted (`MIFrame.copy_constants`).
+        let box_indexes = jc.payload.const_r_box_indexes();
+        copy_constants(
+            &mut self.registers_r,
+            runtime_jc.constants_r.iter().zip(box_indexes.iter()),
+            num_regs_r,
+            |(slot, cache)| ctx.const_ref_cached(slot.get(), cache),
+        );
+        copy_constants(
+            &mut self.registers_f,
+            runtime_jc.constants_f.iter().copied(),
+            num_regs_f,
+            |v| ctx.const_float(v),
+        );
     }
 
     /// True when this frame is allowed to mirror writes into the
@@ -13707,7 +13708,7 @@ mod tests {
                 portal_hash,
                 (0xC0DE, 7),
                 Some(portal.clone()),
-                Some(second),
+                Some(std::sync::Arc::new(second)),
                 &[],
             );
             assert!(matches!(action, BackEdgeAction::StartedTracing));

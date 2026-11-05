@@ -15,7 +15,9 @@
 //! This module provides the Rust equivalent of RPython's `virtualizable.py`.
 
 use indexmap::IndexMap;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
+
+use majit_jitcode::jitcode::BhDescr;
 
 use majit_ir::{
     DescrRef, Type, Value,
@@ -188,6 +190,15 @@ pub struct VirtualizableInfo {
     /// virtualizable.py:73-74: self.array_field_descrs = [cpu.fielddescrof(VTYPE, name) ...]
     /// Same listed-row identity as `_static_field_descrs`.
     _array_field_descrs: Vec<DescrRef>,
+    /// Blackhole-side counterparts of `_static_field_descrs` /
+    /// `_array_field_descrs` (`virtualizable.py` `static_field_descrs`,
+    /// `array_field_descrs`): one `BhDescr::Field` per static field and one per
+    /// array-pointer field, built once on the first blackhole vable op from the
+    /// completed field tables.
+    bh_field_descrs: OnceLock<(
+        Box<[majit_jitcode::jitcode::BhDescr]>,
+        Box<[majit_jitcode::jitcode::BhDescr]>,
+    )>,
     /// virtualizable.py:81-82: self.static_field_by_descrs = {descr: i ...}
     /// Map from descriptor identity (Arc pointer address) to field index.
     pub static_field_by_descrs: indexmap::IndexMap<usize, usize>,
@@ -257,6 +268,7 @@ impl Clone for VirtualizableInfo {
             vable_token_descr: self.vable_token_descr.clone(),
             _static_field_descrs: self._static_field_descrs.clone(),
             _array_field_descrs: self._array_field_descrs.clone(),
+            bh_field_descrs: OnceLock::new(),
             static_field_by_descrs: self.static_field_by_descrs.clone(),
             array_field_by_descrs: self.array_field_by_descrs.clone(),
             clear_vable_ptr: self.clear_vable_ptr,
@@ -402,6 +414,7 @@ impl VirtualizableInfo {
             vable_token_descr: None,
             _static_field_descrs: Vec::new(),
             _array_field_descrs: Vec::new(),
+            bh_field_descrs: OnceLock::new(),
             static_field_by_descrs: indexmap::IndexMap::new(),
             array_field_by_descrs: indexmap::IndexMap::new(),
             clear_vable_ptr: None,
@@ -410,6 +423,107 @@ impl VirtualizableInfo {
             identity_live_index: None,
             outer_executor_owns_state: false,
         }
+    }
+
+    fn build_bh_field_descrs(
+        static_fields: &[VableFieldInfo],
+        array_fields: &[VableArrayInfo],
+    ) -> (Box<[BhDescr]>, Box<[BhDescr]>) {
+        let static_descrs: Box<[BhDescr]> = static_fields
+            .iter()
+            .map(|field| {
+                if field.field_type == majit_ir::value::Type::Float {
+                    debug_assert_eq!(
+                        field.field_size, 8,
+                        "get_type_flag: lltype.Float is 8 bytes; SingleFloat is FLAG_UNSIGNED"
+                    );
+                }
+                let field_flag = match field.field_type {
+                    majit_ir::value::Type::Ref => majit_ir::descr::ArrayFlag::Pointer,
+                    majit_ir::value::Type::Float => majit_ir::descr::ArrayFlag::Float,
+                    majit_ir::value::Type::Int if field.field_signed => {
+                        majit_ir::descr::ArrayFlag::Signed
+                    }
+                    majit_ir::value::Type::Int => majit_ir::descr::ArrayFlag::Unsigned,
+                    majit_ir::value::Type::Void => majit_ir::descr::ArrayFlag::Void,
+                };
+                BhDescr::Field {
+                    offset: field.offset,
+                    field_size: field.field_size,
+                    field_type: field.field_type,
+                    field_flag,
+                    is_field_signed: field.field_signed,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    // No parent list, so there is no slot to claim — `None` rather than a
+                    // `0` that reads as a claim on the first field of a list that does
+                    // not exist here.
+                    index_in_parent: None,
+                    parent: None,
+                    name: String::new(),
+                    owner: String::new(),
+                    load_is_acquire: false,
+                    store_is_release: false,
+                }
+            })
+            .collect();
+        let array_descrs: Box<[BhDescr]> = (0..array_fields.len())
+            .map(|j| {
+                BhDescr::Field {
+                    offset: array_fields[j].field_offset,
+                    // The array field is a pointer, so its width is the target word
+                    // like the scalars above.  Latent rather than live: the `_gc_r`
+                    // accessors this descr reaches take `as_offset()` and store at
+                    // pointer width without consulting the size.
+                    field_size: std::mem::size_of::<usize>(),
+                    field_type: majit_ir::value::Type::Ref,
+                    field_flag: majit_ir::descr::ArrayFlag::Pointer,
+                    is_field_signed: false,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    // No parent list, so there is no slot to claim — `None` rather than a
+                    // `0` that reads as a claim on the first field of a list that does
+                    // not exist here.
+                    index_in_parent: None,
+                    parent: None,
+                    name: String::new(),
+                    owner: String::new(),
+                    load_is_acquire: false,
+                    store_is_release: false,
+                }
+            })
+            .collect();
+        (static_descrs, array_descrs)
+    }
+
+    pub(crate) fn bh_static_field_descr(&self, index: usize) -> &BhDescr {
+        let static_fields = &self.static_fields;
+        let array_fields = &self.array_fields;
+        let (static_descrs, _) = self
+            .bh_field_descrs
+            .get_or_init(|| Self::build_bh_field_descrs(static_fields, array_fields));
+        static_descrs.get(index).unwrap_or_else(|| {
+            panic!(
+                "read_descr_vable_field: VableField index {} out of bounds for {} static fields",
+                index,
+                self.static_fields.len()
+            )
+        })
+    }
+
+    pub(crate) fn bh_array_field_descr(&self, index: usize) -> &BhDescr {
+        let static_fields = &self.static_fields;
+        let array_fields = &self.array_fields;
+        let (_, array_descrs) = self
+            .bh_field_descrs
+            .get_or_init(|| Self::build_bh_field_descrs(static_fields, array_fields));
+        array_descrs.get(index).unwrap_or_else(|| {
+            panic!(
+                "vable_array_field_descr: VableArray index {} out of bounds for {} array fields",
+                index,
+                self.array_fields.len()
+            )
+        })
     }
 
     /// Attach a `SizeDescr` backreference for every field descriptor
@@ -1470,10 +1584,15 @@ impl VirtualizableInfo {
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn read_boxes(&self, obj_ptr: *const u8, array_lengths: &[usize]) -> Vec<i64> {
         unsafe {
-            let mut boxes = self.read_static_boxes(obj_ptr);
+            let array_total: usize = (0..self.array_fields.len())
+                .map(|index| array_lengths.get(index).copied().unwrap_or(0))
+                .sum();
+            let mut boxes = Vec::with_capacity(self.static_fields.len() + array_total);
+            for index in 0..self.static_fields.len() {
+                boxes.push(self.read_field(obj_ptr, index));
+            }
             for (index, _) in self.array_fields.iter().enumerate() {
                 let length = array_lengths.get(index).copied().unwrap_or(0);
-                boxes.reserve(length);
                 for item_index in 0..length {
                     boxes.push(self.read_array_item(obj_ptr, index, item_index));
                 }

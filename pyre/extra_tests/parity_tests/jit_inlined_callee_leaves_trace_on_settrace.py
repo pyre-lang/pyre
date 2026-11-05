@@ -121,4 +121,52 @@ def jit_compiled_frame_leaves_on_f_trace_assignment():
         N // 4,
     )
 jit_compiled_frame_leaves_on_f_trace_assignment()
+
+
+def inlined_generator_resume_leaves_trace_on_settrace():
+    """A compiled generator resume has to leave when `sys.settrace` is installed.
+
+    The generator has one `yield` so the walker inlines it via
+    `walk_generator_resume`. The consuming loop is warmed with no hook, then a
+    tracer is installed that claims no frame.
+    """
+
+    import sys
+
+    WARM = 4000
+    N = 2000
+
+    seen = []
+
+    def tracer(frame, event, arg):
+        if frame.f_code.co_name == "gen":
+            seen.append(event)
+        return None
+
+    def gen(n):
+        i = 0
+        while i < n:
+            yield i
+            i += 1
+
+    def hot(n):
+        total = 0
+        for x in gen(n):
+            total += x
+        return total
+
+    hot(WARM)
+    sys.settrace(tracer)
+    try:
+        hot(N)
+    finally:
+        sys.settrace(None)
+
+    calls = seen.count("call")
+    print("gen call events:", calls)
+    # `for` resumes once more to receive StopIteration.
+    assert calls == N + 1, "gen reported %d call events, expected %d" % (calls, N + 1)
+
+
+inlined_generator_resume_leaves_trace_on_settrace()
 print("OK")

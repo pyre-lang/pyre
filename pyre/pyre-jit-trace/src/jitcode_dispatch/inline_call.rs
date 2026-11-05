@@ -1323,8 +1323,7 @@ mod seeded_frame_op_tests {
 /// callee at THREE distinct multiframe levels, not at the top level — see
 /// `fbw_effective_multiframe_depth`.  A recursive / duplicate raising chain is
 /// bounded by `max_unroll_recursion` alone.
-/// Straight value-returning chains never raise, so they still inline to the
-/// full `fbw_max_multiframe_depth`.
+/// Straight value-returning chains never raise, so they are not depth-capped.
 pub(crate) fn callee_body_contains_raise(body_code: &[u8], descr_refs: &[DescrRef]) -> bool {
     decoded_ops_on_fresh_frame(body_code, descr_refs)
         .is_some_and(|ops| ops.iter().any(|d| d.opname == "raise"))
@@ -10005,9 +10004,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let python_inline_depth = ctx.session.borrow().python_inline_depth();
 
     // A strict straight-line callee is seeded with its own frame red so guards
-    // carry a real two-frame snapshot.  A callee beyond the currently-supported
-    // resume depth remains a residual call: there is no single-frame inline
-    // fallback.  PyPy's `MetaInterp.perform_call` always pushes a distinct
+    // carry a real two-frame snapshot.  A callee past a lowered
+    // `PYRE_FBW_MULTIFRAME_DEPTH` remains a residual call: there is no
+    // single-frame inline fallback.  PyPy's `MetaInterp.perform_call` always pushes a distinct
     // `MIFrame`, and `resume.rebuild_from_resumedata` rebuilds one frame per
     // encoded section; collapsing an unseeded callee onto its caller loses the
     // callee's pycode/globals/locals identity.
@@ -12354,7 +12353,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     for rel in 0..depth {
                         let semantic_slot = nlocals + rel;
                         let register_value =
-                            crate::state::semantic_slot_color_for_ref_slot(&entries, semantic_slot)
+                            crate::state::semantic_slot_color_for_ref_slot(entries, semantic_slot)
                                 .and_then(|color| {
                                     sub_wc
                                         .frame_state
@@ -19105,6 +19104,14 @@ fn walk_generator_resume<Sym: WalkSym>(
     if pyre_interpreter::baseobjspace::should_not_inline(code) {
         return descend_generatorentry(ctx, op, funcptr, iter_op, iter_obj, call_descr, dst);
     }
+    // `pyframe.py execute_frame` brackets `resume_execute_frame` with
+    // `ec.call_trace` / `ec.return_trace`; the walker has no route to the
+    // app-level hook, so while one is installed the resume stays a residual
+    // and reaches `execute_frame`. Same test as the inline door.
+    if super::ec_hook_installed() {
+        gen_resume_decline("ec_hook_installed");
+        return Ok(None);
+    }
     if !code.cellvars.is_empty() || !code.freevars.is_empty() {
         gen_resume_decline("cells_or_freevars");
         return Ok(None);
@@ -19309,6 +19316,11 @@ fn walk_generator_resume<Sym: WalkSym>(
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
 
+    // `pyframe.py execute_frame` runs `ec.call_trace(self)` before
+    // `resume_execute_frame`; tracing through the resumed body records its
+    // `gettrace()` / `profilefunc` reads here, as on the inline door.
+    super::walker_call_trace_hook_reads(ctx, op.pc)?;
+
     // `resume_execute_frame`: push the sent `None` and start at
     // `next_instr()`.  Arm the durable undo first so a declined walk
     // puts the frame back whole.
@@ -19340,8 +19352,21 @@ fn walk_generator_resume<Sym: WalkSym>(
     // `pushvalue_none` does not record; pass the root so the frame is
     // re-read around the GetfieldGcR that follows.
     publish_generator_slot_null(ctx, frame_root, frame_box, resumed_depth);
-    // `publish_generator_slot_null` records GetfieldGcR / SetarrayitemGc
-    // and can minor-collect. Re-read before naming the resume frame.
+    // The `pushvalue_none` above is `resume_execute_frame`'s push; record
+    // its depth store, the inverse of the yield's recorded pop, so the
+    // compiled resume leaves the depth the body's merge promote reads.
+    // `publish_generator_slot_null` can minor-collect, so re-read the frame.
+    let gen_frame = live_generator_frame(frame_root);
+    publish_generator_suspension(
+        ctx,
+        gen_frame as usize,
+        frame_box,
+        "valuestackdepth",
+        unsafe { (*gen_frame).valuestackdepth } as i64,
+    );
+    // `publish_generator_slot_null` / `publish_generator_suspension` record
+    // GetfieldGcR / SetarrayitemGc / SetfieldGc and can minor-collect.
+    // Re-read before naming the resume frame.
     let resume = GeneratorResumeSubwalk {
         frame: live_generator_frame(frame_root) as usize,
         frame_root,

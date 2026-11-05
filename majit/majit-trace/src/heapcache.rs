@@ -12,6 +12,8 @@ use indexmap::IndexSet;
 
 use majit_ir::{EffectInfo, ExtraEffect, GcRef, OpCode, OpRef, Type, Value};
 
+type FxIndexSet<K> = IndexSet<K, rustc_hash::FxBuildHasher>;
+
 /// The `field_index` that stands for a descr no numberer ever reached.
 ///
 /// `heapcache.py get_field_updater(box, descr)` keys the per-box field
@@ -185,8 +187,8 @@ fn constant_from_op(opref: OpRef, boxes: &dyn HeapcBoxes) -> OpRef {
 pub struct CacheEntry {
     cache_anything: vecset::VecMap<OpRef, OpRef>,
     cache_seen_allocation: vecset::VecMap<OpRef, OpRef>,
-    quasiimmut_seen: Option<IndexSet<OpRef>>,
-    quasiimmut_seen_refs: Option<IndexSet<usize>>,
+    quasiimmut_seen: Option<FxIndexSet<OpRef>>,
+    quasiimmut_seen_refs: Option<FxIndexSet<usize>>,
     last_const_box: Option<OpRef>,
 }
 
@@ -1928,12 +1930,12 @@ impl HeapCache {
         if obj.is_constant() {
             cache
                 .quasiimmut_seen_refs
-                .get_or_insert_with(IndexSet::new)
+                .get_or_insert_with(FxIndexSet::default)
                 .insert(Self::quasiimmut_seen_ref_key(obj));
         } else {
             cache
                 .quasiimmut_seen
-                .get_or_insert_with(IndexSet::new)
+                .get_or_insert_with(FxIndexSet::default)
                 .insert(obj);
         }
     }

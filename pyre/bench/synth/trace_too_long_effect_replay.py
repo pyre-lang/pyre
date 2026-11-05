@@ -41,15 +41,16 @@ while i < N:
     free_total = free_total + x
     i = i + 1
 
-# The 100/101 post-step cutoff differs between native and wasm: wasm
-# takes two extra aborts and one bridge. 96..99 exercises the same abort
-# path on all three backends; use 98 within that shared interval.
+# Whether one abort's cutoff lands inside a descended helper's frame (a
+# multi-frame blackhole adoption) moves by one step between targets: at 98
+# native adopts it single-frame and wasm multi-frame. 95..97 take the same
+# adoptions on all three backends; use 96 within that shared interval.
 # Phase B — the same shape with the limit raised past the body's own length,
 # so the check lands mid-body, and with one effect per rollback class: a list
 # slot store is journaled, a dict store and a list append historically were
 # not. Each counter must read exactly N; a replayed iteration shows up as
 # N + 1.
-set_trace_limit(98)
+set_trace_limit(96)
 
 box = [0]
 d = {"k": 0}

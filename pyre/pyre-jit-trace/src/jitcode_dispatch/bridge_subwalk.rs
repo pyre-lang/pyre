@@ -255,9 +255,41 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // that asks what a `ConstRef(0)` operand is: a plain call's `null_or_self`
     // arrives spelled that way (`codewriter.rs`'s non-portal PY_NULL self
     // slot).
+    // `setup_kind_register_banks` already ran `copy_constants` for this pool on
+    // the sym's Ref bank; reuse those ConstPtr boxes instead of minting the pool
+    // a second time.
+    let sym_minted_r: Option<Vec<OpRef>> = {
+        let sym_jc = sym.jitcode();
+        if sym_jc.is_null() {
+            None
+        } else {
+            let sym_pool = &unsafe { &*sym_jc }.payload.jitcode.constants_r;
+            let regs = sym.registers_r();
+            let end = top_num_regs_r + top_constants_r.len();
+            (std::ptr::eq(sym_pool.as_ptr(), top_constants_r.as_ptr())
+                && sym_pool.len() == top_constants_r.len()
+                && regs.len() >= end)
+                .then(|| {
+                    (top_num_regs_r..end)
+                        .map(|k| regs.get(k).unwrap_or(OpRef::NONE))
+                        .collect()
+                })
+        }
+    };
     for (i, v) in top_constants_r.iter().enumerate() {
         let v = v.get();
-        top_regs_r.set(top_num_regs_r + i, trace_ctx.const_ref(v));
+        let minted = sym_minted_r
+            .as_ref()
+            .map(|m| m[i])
+            .filter(|op| op.is_constant());
+        let opref = match minted {
+            Some(op) => {
+                debug_assert_eq!(op, trace_ctx.const_ref(v));
+                op
+            }
+            None => trace_ctx.const_ref(v),
+        };
+        top_regs_r.set(top_num_regs_r + i, opref);
         top_concrete_r[top_num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);
     }
     for (i, &v) in top_constants_f.iter().enumerate() {

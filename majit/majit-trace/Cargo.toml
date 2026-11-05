@@ -10,6 +10,7 @@ description = "Trace management and warm-up state for majit JIT compiler"
 parking_lot = { workspace = true }
 bitflags = { workspace = true }
 indexmap = { workspace = true }
+rustc-hash = { workspace = true }
 majit-ir = { workspace = true }
 majit-backend = { workspace = true }
 majit-gc = { workspace = true }

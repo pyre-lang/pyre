@@ -272,6 +272,7 @@ pub use resume_box_reader::{
     rebuilt_value_to_opref, reconnect_virtualrefs, replay_pending_fields,
     seed_bridge_virtualizable_boxes,
 };
+pub use trace_ctx::AbortedWalkImage;
 pub use trace_ctx::BridgeInlineCarrier;
 pub use trace_ctx::ClearReplaceFrames;
 pub use trace_ctx::GreenBox;
@@ -1988,20 +1989,8 @@ pub const MC_DIAG_LABELS: &[&str] = &[
     // conversion answered. The fallback re-executes the opcodes between the
     // loop header and the guard, so a non-zero here is a defect, not a cost.
     "guard_resume_bridge_no_handoff",
-    // `MAX_TRACE_ABORT_COUNT` is a pyre-local ceiling with no upstream
-    // analogue: upstream sets `JC_DONT_TRACE_HERE` only from
-    // `blackhole_if_trace_too_long` / `prepare_trace_segmenting`, never from a
-    // count of aborts. `abort_count` is never reset and the banned cell is
-    // exempt from `should_remove_jitcell` until it has seen a procedure token,
-    // so the ban outlives the condition that caused it. The flag it stamps is
-    // also the one `can_inline_callable` reads, so a banned location stops
-    // being inlined as a CALLEE too; `MAX_TRACE_ABORT_COUNT` carries the
-    // measurement behind keeping the two together. 80 counts the ban event
-    // (once per cell, where the ceiling is what sets the flag); 81 counts
-    // every later trace request the ceiling refuses, which is what the ban
-    // costs. A zero in 80 says the ceiling is inert on this workload; a
-    // nonzero 81 with a small 80 says one banned key is being asked for
-    // repeatedly.
+    // 80 / 81 are historical: the per-cell abort ceiling is gone. The
+    // names stay so later `mc_diag_bump(N)` indices do not shift.
     "abort_ceiling_banned",
     "abort_ceiling_refused",
     // A walk inside a BRIDGE session ended in `TraceAction::AbortPermanent`.

@@ -19,8 +19,8 @@
 //! PYRE_FBW_MULTIFRAME_DEPTH=1  ->  acc: got 262173, want 578965
 //! ```
 //!
-//! `PYRE_FBW_MULTIFRAME_DEPTH` is a supported knob (`fbw_state.rs`, clamped
-//! 1..7). PyPy `_opimpl_recursive_call` bounds recursion only with
+//! `PYRE_FBW_MULTIFRAME_DEPTH` is a supported knob (`fbw_state.rs`; at least
+//! 1, unbounded by default). PyPy `_opimpl_recursive_call` bounds recursion only with
 //! `max_unroll_recursion`, so recursive carriers now bypass pyre's additional
 //! generic cap. This fixture pins both that bypass and the original safety
 //! property: no abort may roll back over effects the drain already executed.

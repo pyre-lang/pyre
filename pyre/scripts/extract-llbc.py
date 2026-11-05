@@ -58,6 +58,10 @@ CHARON_BODY_SHAPE_ARGS = ["--reconstruct-panic-calls", "--inline-anon-consts"]
 # reached foreign body; keep the narrow list.
 CHARON_CORE_INCLUDE = [
     "--include",
+    "core::str::_::floor_char_boundary",
+    "--include",
+    "core::num::_::is_utf8_char_boundary",
+    "--include",
     "core::num::_::div_ceil",
     "--include",
     "core::num::_::saturating_add",

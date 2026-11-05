@@ -3904,7 +3904,12 @@ impl GcCache {
     /// populates `_cache_array[key]`.  Mirrors `descr.py get_array_descr
     /// get_array_descr` cache-miss `cache[ARRAY_OR_STRUCT] = arraydescr`.
     pub fn register_keyed_array(&mut self, key: LLType, descr: DescrRef) {
-        self._cache_array.entry(key).or_insert(descr);
+        match self._cache_array.entry(key) {
+            indexmap::map::Entry::Vacant(v) => {
+                v.insert(descr);
+            }
+            indexmap::map::Entry::Occupied(_) => {}
+        }
     }
 
     /// Last-writer publication for a runtime singleton that must own

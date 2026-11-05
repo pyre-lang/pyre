@@ -22,6 +22,7 @@
 //! `id_or_identityhash`), not the address. The key is recorded at
 //! intern time and is not recomputed during a collection.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 use parking_lot::{Mutex, ReentrantMutex};
@@ -46,10 +47,12 @@ struct Table {
     /// `id_or_identityhash` is not recomputed on a stale address.
     hashes: Vec<u64>,
     /// `(identity hash, index)`, sorted by hash then index.
-    by_hash: Vec<(u64, u32)>,
+    /// An ordered set so insert/remove stay logarithmic; `opencoder.py`
+    /// `_refs_dict` is a dict.
+    by_hash: BTreeSet<(u64, u32)>,
     /// `(current address, index)`, sorted by address then index.
     /// `history.py` `ConstPtr.value` after a move is this word.
-    by_addr: Vec<(u64, u32)>,
+    by_addr: BTreeSet<(u64, u32)>,
     /// `begin_wave` generation that last traced this slot. Wave 0 does
     /// not dedup: a unit test that never opens a wave still forwards.
     marks: Vec<u32>,
@@ -115,8 +118,8 @@ impl Table {
         Self {
             slots: vec![GcRef::NULL],
             hashes: vec![0],
-            by_hash: Vec::new(),
-            by_addr: Vec::new(),
+            by_hash: BTreeSet::new(),
+            by_addr: BTreeSet::new(),
             marks: vec![0],
             live: vec![0],
             free: Vec::new(),
@@ -129,8 +132,8 @@ impl Table {
 static TABLE: Mutex<Table> = Mutex::new(Table {
     slots: Vec::new(),
     hashes: Vec::new(),
-    by_hash: Vec::new(),
-    by_addr: Vec::new(),
+    by_hash: BTreeSet::new(),
+    by_addr: BTreeSet::new(),
     marks: Vec::new(),
     live: Vec::new(),
     free: Vec::new(),
@@ -261,8 +264,9 @@ fn publish_slot(index: usize, addr: GcRef) {
             }
         }
     }
-    unsafe {
-        (*chunk).slots[index % SLOT_CHUNK].store(addr.0, Ordering::Release);
+    let slot = unsafe { &(*chunk).slots[index % SLOT_CHUNK] };
+    if slot.load(Ordering::Relaxed) != addr.0 {
+        slot.store(addr.0, Ordering::Release);
     }
     if ci == 0 {
         FIRST_CHUNK.store(chunk, Ordering::Release);
@@ -494,17 +498,21 @@ pub fn set_slot(index: u32, addr: GcRef) {
     if index == 0 {
         return;
     }
+    if resolve(index) == addr {
+        return;
+    }
     let mut guard = table();
     let i = index as usize;
     let Some(slot) = guard.slots.get_mut(i) else {
         return;
     };
     let old = slot.0 as u64;
-    *slot = addr;
-    if old != addr.0 as u64 {
-        remove_pair(&mut guard.by_addr, old, index);
-        insert_pair(&mut guard.by_addr, addr.0 as u64, index);
+    if old == addr.0 as u64 {
+        return;
     }
+    *slot = addr;
+    remove_pair(&mut guard.by_addr, old, index);
+    insert_pair(&mut guard.by_addr, addr.0 as u64, index);
     publish_slot(i, addr);
 }
 
@@ -779,22 +787,12 @@ fn free_slot(guard: &mut Table, idx: usize) {
     guard.free.push(idx as u32);
 }
 
-fn insert_pair(pairs: &mut Vec<(u64, u32)>, key: u64, idx: u32) {
-    let pos = pairs.partition_point(|&(k, i)| (k, i) < (key, idx));
-    pairs.insert(pos, (key, idx));
+fn insert_pair(pairs: &mut BTreeSet<(u64, u32)>, key: u64, idx: u32) {
+    pairs.insert((key, idx));
 }
 
-fn remove_pair(pairs: &mut Vec<(u64, u32)>, key: u64, idx: u32) {
-    let start = pairs.partition_point(|&(k, _)| k < key);
-    for i in start..pairs.len() {
-        if pairs[i].0 != key {
-            break;
-        }
-        if pairs[i].1 == idx {
-            pairs.remove(i);
-            return;
-        }
-    }
+fn remove_pair(pairs: &mut BTreeSet<(u64, u32)>, key: u64, idx: u32) {
+    pairs.remove(&(key, idx));
 }
 
 fn stamp_reuse(guard: &mut Table, idx: u32, addr: GcRef, hash: u64) {
@@ -832,24 +830,17 @@ fn retarget_hash(guard: &mut Table, idx: u32, new_hash: u64) {
 
 fn find_by_addr(table: &Table, addr: usize) -> Option<u32> {
     let key = addr as u64;
-    let start = table.by_addr.partition_point(|&(a, _)| a < key);
-    for &(a, idx) in &table.by_addr[start..] {
-        if a != key {
-            break;
-        }
-        return Some(idx);
-    }
-    None
+    table
+        .by_addr
+        .range((key, 0)..=(key, u32::MAX))
+        .next()
+        .map(|&(_, idx)| idx)
 }
 
 fn find(table: &Table, hash: u64, addr: usize) -> Option<u32> {
-    let start = table.by_hash.partition_point(|&(h, _)| h < hash);
     let mut identity_hit = None;
     let mut identity_hits = 0u32;
-    for &(h, idx) in &table.by_hash[start..] {
-        if h != hash {
-            break;
-        }
+    for &(_, idx) in table.by_hash.range((hash, 0)..=(hash, u32::MAX)) {
         if table.slots.get(idx as usize).map(|s| s.0) == Some(addr) {
             return Some(idx);
         }

@@ -2763,7 +2763,6 @@ impl TraceCtx {
             active_boxes,
             jitcode_index,
             pc,
-            pc,
             &vable_boxes,
             &vref_boxes,
         );
@@ -2789,10 +2788,37 @@ impl TraceCtx {
         active_boxes: &[OpRef],
         jitcode_index: u32,
         pc: u32,
-        _py_pc: u32,
         vable_boxes: &[crate::recorder::SnapshotTagged],
         vref_boxes: &[crate::recorder::SnapshotTagged],
     ) {
+        if self.recorder.has_byte_buffer() {
+            // `opencoder.py Trace.create_top_snapshot`: encode the live
+            // active boxes straight into `_snapshot_array_data`.
+            for (slot, opref) in active_boxes.iter().enumerate() {
+                debug_assert!(
+                    self.get_opref_type(*opref).is_some(),
+                    "capture_snapshot_for_last_guard: active OpRef missing Box.type \
+                     (slot={slot}, opref={opref:?}, raw={raw}, ty()={ty:?}, \
+                      is_constant={is_const}, num_inputargs={ninputs}, num_ops={nops})",
+                    raw = opref.raw(),
+                    ty = opref.ty(),
+                    is_const = opref.is_constant(),
+                    ninputs = self.recorder.num_inputargs(),
+                    nops = self.recorder.ops().len(),
+                );
+            }
+            let snapshot_id = self.recorder.encode_top_snapshot_from_oprefs(
+                active_boxes,
+                jitcode_index,
+                pc,
+                vable_boxes,
+                vref_boxes,
+            );
+            // The byte stream is the record; drop any decoded copy (`capture_resumedata`).
+            self.snapshots.clear();
+            self.set_last_guard_resume_position(snapshot_id);
+            return;
+        }
         // The pc word is a raw JitCode offset.
         let boxes = self.encode_snapshot_boxes(active_boxes);
         let snapshot_id = self.capture_resumedata(crate::recorder::Snapshot {
@@ -5071,7 +5097,7 @@ impl TraceCtx {
             arg_types,
             result_type,
             self.driver_descriptor
-                .as_ref()
+                .as_deref()
                 .and_then(JitDriverStaticData::virtualizable_arg_index),
         );
         let opcode = OpCode::call_assembler_for_type(result_type);
@@ -5266,7 +5292,7 @@ impl TraceCtx {
             arg_types,
             Type::Ref,
             self.driver_descriptor
-                .as_ref()
+                .as_deref()
                 .and_then(JitDriverStaticData::virtualizable_arg_index),
         );
         self.record_op_with_descr(OpCode::CallAssemblerR, args, descr)
@@ -5691,10 +5717,12 @@ mod history_record_tests {
     fn call_assembler_red_only_ref_emits_red_args_descr() {
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
         let frame = OpRef::input_arg_ref(0);
-        ctx.set_driver_descriptor(JitDriverStaticData::with_virtualizable(
-            Vec::new(),
-            vec![("frame", Type::Ref)],
-            Some("frame"),
+        ctx.set_driver_descriptor(std::sync::Arc::new(
+            JitDriverStaticData::with_virtualizable(
+                Vec::new(),
+                vec![("frame", Type::Ref)],
+                Some("frame"),
+            ),
         ));
 
         let _ = ctx.call_assembler_red_only_ref(999, &[frame], &[Type::Ref]);
@@ -5754,5 +5782,30 @@ mod history_record_tests {
             ctx.lookup_opref_concrete(later),
             Some(Value::Int(executed + 1))
         );
+    }
+
+    #[test]
+    fn snapshot_captured_after_a_decode_is_visible() {
+        let mut ctx = TraceCtx::for_test(1);
+        let sd = ctx.metainterp_sd.clone();
+        ctx.recorder.attach_byte_buffer(sd);
+        assert!(ctx.recorder.has_byte_buffer());
+        let box0 = OpRef::input_arg_int(0);
+
+        ctx.record_guard(OpCode::GuardTrue, &[box0], 0);
+        ctx.capture_snapshot_for_last_guard_with_vable_vref(&[box0], 0, 0, &[], &[]);
+        let id_a = ctx
+            .recorder
+            .guard_op_resume_position_from_end(0)
+            .expect("first guard resume position");
+        assert!(ctx.get_snapshot(id_a).is_some());
+
+        ctx.record_guard(OpCode::GuardTrue, &[box0], 0);
+        ctx.capture_snapshot_for_last_guard_with_vable_vref(&[box0], 0, 0, &[], &[]);
+        let id_b = ctx
+            .recorder
+            .guard_op_resume_position_from_end(0)
+            .expect("second guard resume position");
+        assert!(ctx.get_snapshot(id_b).is_some());
     }
 }

@@ -4714,7 +4714,7 @@ fn trace_and_compile_from_bridge_body(
     refresh_host_vable_frame(&mut jit_state, bridge_frame_root);
     let catch_level = if pending_exc && last_bridge_is_exception_guard {
         if is_multiframe_resume {
-            // `resume_pc` (and thus `frame.last_instr`, set above) addresses the
+            // `resume_pc` addresses the
             // INNERMOST inlined frame while `code` is the live OUTER frame, so
             // the single-frame lookup below would consult the wrong code object.
             // Ask each resumed frame about its OWN pc instead.
@@ -4723,12 +4723,7 @@ fn trace_and_compile_from_bridge_body(
             // inside an inlined callee is a real bridge, not a decline.
             resumed_catch_level(&resume_coords)
         } else {
-            let last_instr = bridge_frame_root.frame().last_instr;
-            let off = if last_instr < 0 {
-                0u32
-            } else {
-                (last_instr as u32) * 2
-            };
+            let off = exc_table_offset(resume_pc);
             pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, off)
                 .map(|_| 0usize)
         }

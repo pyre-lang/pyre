@@ -10003,3 +10003,58 @@ fn collect_by_value_struct_leaves_walks_the_whole_finite_nesting() {
     let expected = format!("{}x", "inner.".repeat(20));
     assert_eq!(dotted, expected);
 }
+
+#[test]
+fn foreign_byte_pointer_stub_keeps_the_c_address_bank() {
+    let mut funs = Vec::new();
+    for (id, signed, external) in [(0, false, true), (1, true, true), (2, false, false)] {
+        let byte = if signed {
+            serde_json::json!({"Scalar": {"Integer": {"Signed": "I8"}}})
+        } else {
+            serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}})
+        };
+        funs.push(serde_json::json!({
+            "def_id": id,
+            "item_meta": {
+                "name": [{"Ident": ["fixture", 0]}, {"Ident": [format!("f{id}"), 0]}],
+                "span": {"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}},
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false},
+                "is_local": true
+            },
+            "signature": {"is_unsafe": true, "inputs": [], "output": {"RawPtr": [byte, "Mut"]}},
+            "body": if external { serde_json::json!({"Extern": {}}) } else { serde_json::json!("Opaque") }
+        }));
+    }
+    let llbc = Llbc::from_slice(
+        serde_json::json!({
+            "charon_version": "0.1.201", "has_errors": false,
+            "translated": {"crate_name": "fixture", "type_decls": [], "fun_decls": funs,
+                "global_decls": [], "trait_decls": [], "trait_impls": []}
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+    let specs = super::collect_unsafe_fn_stubs_from_llbc(
+        &llbc,
+        &std::collections::HashSet::new(),
+        crate::ErrorCarrierSpec::default(),
+        &std::collections::HashSet::new(),
+    );
+    let token = |leaf: &str| {
+        specs
+            .iter()
+            .find(|(path, _, _)| path.last().is_some_and(|p| p == leaf))
+            .unwrap()
+            .2
+            .as_deref()
+    };
+    assert_eq!(token("f0"), Some("i64"));
+    assert_eq!(token("f1"), Some("i64"));
+    assert_eq!(
+        token("f2"),
+        Some("ref"),
+        "Rust's erased managed-byte pointer is unchanged"
+    );
+}

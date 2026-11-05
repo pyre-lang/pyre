@@ -278,6 +278,16 @@ pub struct MergePoint {
     pub vable_ptr: usize,
 }
 
+/// `metainterp.last_exc_value`, `SwitchToBlackhole.raising_exception` and the
+/// register words (`_copy_data_from_miframe`) of the frames the portal walker
+/// published in `aborted_framestack` (`run_blackhole_interp_to_cancel_tracing`);
+/// `None` when the publisher left them to the MetaInterp.
+pub struct AbortedWalkImage {
+    pub last_exc_value: i64,
+    pub raising_exception: bool,
+    pub banks: Vec<crate::BlackholeAbortBanks>,
+}
+
 /// Tracing context: wraps the recorder Trace with a convenience API.
 ///
 /// The interpreter uses this during trace recording to:
@@ -319,7 +329,7 @@ pub struct TraceCtx {
     /// Structured green key values (if provided by the interpreter).
     green_key_values: Option<GreenKey>,
     /// Declarative driver layout metadata, if provided by the interpreter.
-    pub(crate) driver_descriptor: Option<JitDriverStaticData>,
+    pub(crate) driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
     /// Standard virtualizable boxes -- OpRefs for each static field + array element.
     /// When set, vable_getfield/setfield access these instead of emitting heap ops.
     /// Layout: [field_0, ..., field_N, arr_0[0], ..., arr_0[M], ..., vable_ref]
@@ -361,7 +371,7 @@ pub struct TraceCtx {
     ///
     /// `walk_virtualizable_value_refs` updates the raw cell only when the
     /// extra-root walk runs. CALL_ASSEMBLER bridge tracing can collect
-    /// without that walk (`refresh_virtualizable_from_heap` then reads a
+    /// without that walk (`load_fields_from_virtualizable` then reads a
     /// reused corpse as `locals_cells_stack_w`). The owner root is the
     /// same slot `snapshot_for_tracing`'s `FrameBox` already holds for the
     /// snapshot itself.
@@ -667,15 +677,12 @@ pub struct TraceCtx {
     /// jitdriver's Abort arm to convert.  `None` on every non-aborting walk and
     /// once the arm has taken it.
     pub aborted_framestack: Option<crate::pyjitpl::MIFrameStack>,
-    /// `pyjitpl.py` `metainterp.last_exc_value` of an FBW latch published
-    /// onto [`Self::aborted_framestack`]. Set and cleared with that stack.
-    /// A GCREF; the TraceCtx walker forwards it. `0` is a published null,
-    /// not "absent": `convert_and_run_from_pyjitpl` (`blackhole.py`)
-    /// converts this with the stack as one image.
-    pub aborted_last_exc_value: i64,
-    /// `SwitchToBlackhole.raising_exception` (`history.py`) of the same
-    /// latch. `false` is a published value, not "absent".
-    pub aborted_raising_exception: bool,
+    /// `metainterp.last_exc_value`, `SwitchToBlackhole.raising_exception` and
+    /// the register words (`_copy_data_from_miframe`) of the frames a portal
+    /// walker published in `aborted_framestack`
+    /// (`run_blackhole_interp_to_cancel_tracing`); `None` when a non-walker
+    /// publisher left register values on the MIFrames for the generic converter.
+    pub aborted_walk: Option<AbortedWalkImage>,
     /// Single-pass tracing: the walk-final concrete RED values captured from
     /// the closing merge point's red operands (their live register boxes),
     /// in operand order (slot 3 ints, slot 4 refs, slot 5 floats). The
@@ -1229,6 +1236,12 @@ impl TraceCtx {
             // SAFETY: identical owner contract to `field_sanity_load`.
             unsafe { &*cpu }
         })
+    }
+
+    /// The raw CPU pointer [`Self::blackhole_cpu`] derefs, for a caller that
+    /// must outlive this `TraceCtx` (the process backend does).
+    pub fn blackhole_cpu_ptr(&self) -> Option<*const dyn majit_backend::Backend> {
+        self.cpu
     }
 
     /// `executor.execute` for `GETFIELD_GC_{I,R,F}`.
@@ -2484,8 +2497,7 @@ impl TraceCtx {
             symbolic_residual_abort: false,
             deterministic_bridge_abort: false,
             aborted_framestack: None,
-            aborted_last_exc_value: 0,
-            aborted_raising_exception: false,
+            aborted_walk: None,
             walk_final_reds: Vec::new(),
             close_jump_boxes: None,
             close_scalar_values: None,
@@ -2588,8 +2600,7 @@ impl TraceCtx {
             symbolic_residual_abort: false,
             deterministic_bridge_abort: false,
             aborted_framestack: None,
-            aborted_last_exc_value: 0,
-            aborted_raising_exception: false,
+            aborted_walk: None,
             walk_final_reds: Vec::new(),
             close_jump_boxes: None,
             close_scalar_values: None,
@@ -3177,6 +3188,36 @@ impl TraceCtx {
         opref
     }
 
+    /// [`Self::const_ref`] for a jitcode constant whose box index is cached
+    /// in `cache` (`history.py` `ConstPtrJitCode.opencoder_index`). A cached
+    /// index that still resolves to the constant's current address is the
+    /// box `intern` would return, so it is reused without the intern
+    /// lookup. The recorder still holds it, like any other minted box.
+    ///
+    /// `constants_r` is a GC field, already forwarded; when `resolve`
+    /// matches `value` the intern slot names that same object and
+    /// `gc_current_object_address` is a no-op. A slot the table freed
+    /// and reused fails the compare and falls through.
+    pub fn const_ref_cached(&mut self, value: i64, cache: &std::sync::atomic::AtomicU32) -> OpRef {
+        let cached = cache.load(std::sync::atomic::Ordering::Relaxed);
+        if cached != 0 && majit_ir::const_ptr_table::resolve(cached).0 == value as usize {
+            let opref = OpRef::ConstPtr(cached);
+            self.recorder.hold_live_const_ptr(opref);
+            return opref;
+        }
+        let addr = majit_gc::gc_current_object_address(value as usize);
+        if cached != 0 && majit_ir::const_ptr_table::resolve(cached).0 == addr {
+            let opref = OpRef::ConstPtr(cached);
+            self.recorder.hold_live_const_ptr(opref);
+            return opref;
+        }
+        let opref = self.const_ref(addr as i64);
+        if let Some(index) = opref.const_ptr_index() {
+            cache.store(index, std::sync::atomic::Ordering::Relaxed);
+        }
+        opref
+    }
+
     /// history.py CONST_NULL = ConstPtr(ConstPtr.value).
     /// Ref-typed null pointer constant.
     pub fn const_null(&mut self) -> OpRef {
@@ -3601,7 +3642,7 @@ impl TraceCtx {
         {
             return jd.green_args_spec();
         }
-        if let Some(descriptor) = self.driver_descriptor.as_ref() {
+        if let Some(descriptor) = self.driver_descriptor.as_deref() {
             return descriptor.green_args_spec();
         }
         self.green_key_values
@@ -3759,11 +3800,11 @@ impl TraceCtx {
 
     /// The declarative JitDriver descriptor, if provided.
     pub fn driver_descriptor(&self) -> Option<&JitDriverStaticData> {
-        self.driver_descriptor.as_ref()
+        self.driver_descriptor.as_deref()
     }
 
     /// Attach declarative JitDriver metadata to the active trace.
-    pub fn set_driver_descriptor(&mut self, descriptor: JitDriverStaticData) {
+    pub fn set_driver_descriptor(&mut self, descriptor: std::sync::Arc<JitDriverStaticData>) {
         self.driver_descriptor = Some(descriptor);
     }
 
@@ -4108,7 +4149,7 @@ impl TraceCtx {
     /// Callers set this at trace/bridge-entry so writes to
     /// `virtualizable_boxes` can propagate to the live PyFrame without
     /// routing back through MetaInterp (`virtualizable.py write_boxes` target).
-    /// The object `refresh_virtualizable_shadow_from_heap` and
+    /// The object `load_fields_from_virtualizable` and
     /// `synchronize_virtualizable` read and write.  Diagnostic only: a caller
     /// that needs to know whether the frame it just mutated is the one the
     /// shadow tracks has no other way to ask.
@@ -4157,131 +4198,6 @@ impl TraceCtx {
             }
         } else {
             self.virtualizable_heap_root = None;
-        }
-    }
-
-    /// Inverse of `synchronize_virtualizable`: pull current heap virtualizable
-    /// field values onto the JIT-tracked boxes.
-    ///
-    /// pyre-only sync hook.  RPython's metainterp IS the execution loop —
-    /// every opcode flows through `_opimpl_*` which mutates
-    /// `metainterp.virtualizable_boxes` in lockstep with the implicit heap
-    /// write, so the boxes never drift.  Pyre's tracer dispatches some
-    /// opcodes through the walker (which mirrors via
-    /// `vable_setfield → synchronize_virtualizable`) and others through
-    /// `execute_opcode_step` (which mutates the heap PyFrame directly
-    /// via `PyFrame::push` / `PyFrame::pop` etc., bypassing the boxes).
-    /// Between any pair of those dispatch paths the boxes can lag heap.
-    ///
-    /// Calling this at each walker step entry — *before* the walker
-    /// arm body reads any vable box or `synchronize_virtualizable` writes
-    /// a stale box back to heap — restores the invariant that
-    /// each box's concrete equals the heap at every opcode boundary.  When
-    /// dispatch unification retires `execute_opcode_step`, this hook becomes
-    /// a no-op (every mutation already lands on the box) and can be deleted.
-    ///
-    /// A box that already carries `_res*` keeps it: that payload is the
-    /// trace's observed value (`*FrontendOp(pos, value)` / `InputArg*`).
-    /// Overwriting it with the live heap makes the next recorded use of the
-    /// box (unbox for `i = i + 1`) see a store the walker is about to record,
-    /// and apply it a second time. Unstamped boxes stay unstamped;
-    /// [`Self::virtualizable_entry_at`] reads the live virtualizable for those
-    /// slots. A residual that forced the frame is reloaded with
-    /// `load_fields_from_virtualizable`.
-    pub fn refresh_virtualizable_shadow_from_heap(&mut self) {
-        self.refresh_virtualizable_from_heap();
-    }
-
-    fn refresh_virtualizable_from_heap(&mut self) {
-        let Some(heap_ptr) = self.virtualizable_heap_ptr() else {
-            return;
-        };
-        let Some(info) = self.virtualizable_info.clone() else {
-            return;
-        };
-        let Some(boxes) = self.virtualizable_boxes.clone() else {
-            return;
-        };
-        let Some(lengths) = self.virtualizable_array_lengths.clone() else {
-            return;
-        };
-        let static_count = info.num_static_extra_boxes;
-        // Last slot is the standard-vable identity (`virtualizable_boxes[-1]`).
-        // `synchronize_virtualizable` already stops at `static_count + sum(lengths)`;
-        // mirror that here so a short/misaligned list (only the identity slot
-        // present, or fewer data slots than expected) can never overwrite it.
-        let shadow_data_len = boxes.len().saturating_sub(1);
-        let mut replacements = Vec::new();
-        for (i, field) in info
-            .static_fields
-            .iter()
-            .take(static_count.min(shadow_data_len))
-            .enumerate()
-        {
-            let ty = field.field_type;
-            let bits = unsafe { info.read_field(heap_ptr, i) };
-            let concrete = crate::pyjitpl::heap_value_for_pub(ty, bits);
-            if let Some(new_box) = self.refresh_vable_slot(boxes[i], ty, bits, concrete) {
-                replacements.push((i, new_box));
-            }
-        }
-        let mut cursor = static_count;
-        for (a_idx, &length) in lengths.iter().enumerate() {
-            if a_idx >= info.array_fields.len() {
-                break;
-            }
-            let ty = info.array_fields[a_idx].item_type;
-            for item_idx in 0..length {
-                if cursor >= shadow_data_len {
-                    break;
-                }
-                let bits = unsafe { info.read_array_item(heap_ptr, a_idx, item_idx) };
-                let concrete = crate::pyjitpl::heap_value_for_pub(ty, bits);
-                if let Some(new_box) = self.refresh_vable_slot(boxes[cursor], ty, bits, concrete) {
-                    replacements.push((cursor, new_box));
-                }
-                cursor += 1;
-            }
-        }
-        if !replacements.is_empty()
-            && let Some(boxes) = self.virtualizable_boxes.as_mut()
-        {
-            for (index, new_box) in replacements {
-                if let Some(slot) = boxes.get_mut(index) {
-                    *slot = new_box;
-                }
-            }
-        }
-    }
-
-    /// Rebuild a slot from a heap read without stamping an existing box with
-    /// a value that is not its own result (`history.py _make_op(pos, value)`).
-    /// A `Const*` that disagrees is wrapped as a fresh `Const*`
-    /// (`cpu.tsosvgcref_to_box` / `wrap(..., in_const_box)`). A non-const box
-    /// stays as it is: unstamped slots are answered by
-    /// [`Self::virtualizable_entry_at`]'s heap fallback.
-    fn refresh_vable_slot(
-        &mut self,
-        opref: OpRef,
-        ty: Type,
-        bits: i64,
-        concrete: Value,
-    ) -> Option<OpRef> {
-        if opref.is_constant() {
-            if opref.inline_const_to_value() == Some(concrete) {
-                return None;
-            }
-            return Some(self.wrap_heap_const(ty, bits, opref));
-        }
-        None
-    }
-
-    fn wrap_heap_const(&mut self, ty: Type, bits: i64, fallback: OpRef) -> OpRef {
-        match ty {
-            Type::Int => self.const_int(bits),
-            Type::Ref => self.const_ref(bits),
-            Type::Float => self.const_float(bits),
-            Type::Void => fallback,
         }
     }
 
@@ -9236,10 +9152,10 @@ mod tests {
             key.clone(),
             std::sync::Arc::new(sd),
         );
-        ctx.set_driver_descriptor(JitDriverStaticData::new(
+        ctx.set_driver_descriptor(std::sync::Arc::new(JitDriverStaticData::new(
             vec![("a", Type::Int), ("b", Type::Ref)],
             vec![],
-        ));
+        )));
         assert_eq!(
             ctx.merge_point_green_spec(0),
             vec![GreenType::Int],

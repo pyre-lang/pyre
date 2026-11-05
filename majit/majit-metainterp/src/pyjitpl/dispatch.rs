@@ -6287,28 +6287,38 @@ pub fn implement_guard_value_on_frames(
 /// `resume.py`) reads the identity first.  Each entry must carry
 /// `OpRef::ty()`; misshapen entries panic rather than silently shrink the
 /// snapshot relative to upstream.
+pub fn fill_vable_snapshot_boxes(
+    virtualizable_boxes: &[OpRef],
+    out: &mut Vec<crate::recorder::SnapshotTagged>,
+) {
+    out.clear();
+    if virtualizable_boxes.is_empty() {
+        return;
+    }
+    out.reserve(virtualizable_boxes.len());
+    let last = virtualizable_boxes.last().copied().unwrap();
+    // `pyjitpl.py MetaInterp.initialize_virtualizable`: the virtualizable identity is the live red input
+    // box at `virtualizable_boxes[-1]`.  It must remain a TAGBOX failarg,
+    // never a trace-time Ref constant: resume.py reads the
+    // current failing jitframe slot, whose GC map keeps a moving-GC pointer
+    // updated in place.
+    let last_ty = last
+        .ty()
+        .expect("build_vable_snapshot_boxes: virtualizable identity must be typed");
+    out.push(crate::recorder::SnapshotTagged::Box(last, last_ty));
+    for opref in &virtualizable_boxes[..virtualizable_boxes.len() - 1] {
+        let ty = opref
+            .ty()
+            .expect("build_vable_snapshot_boxes: virtualizable_boxes entry must be typed");
+        out.push(crate::recorder::SnapshotTagged::Box(*opref, ty));
+    }
+}
+
 pub fn build_vable_snapshot_boxes(
     virtualizable_boxes: &[OpRef],
 ) -> Vec<crate::recorder::SnapshotTagged> {
-    let mut vable_boxes_snap: Vec<crate::recorder::SnapshotTagged> = Vec::new();
-    if !virtualizable_boxes.is_empty() {
-        let last = virtualizable_boxes.last().copied().unwrap();
-        // `pyjitpl.py:3319`: the virtualizable identity is the live red input
-        // box at `virtualizable_boxes[-1]`.  It must remain a TAGBOX failarg,
-        // never a trace-time Ref constant: resume.py reads the
-        // current failing jitframe slot, whose GC map keeps a moving-GC pointer
-        // updated in place.
-        let last_ty = last
-            .ty()
-            .expect("build_vable_snapshot_boxes: virtualizable identity must be typed");
-        vable_boxes_snap.push(crate::recorder::SnapshotTagged::Box(last, last_ty));
-        for opref in &virtualizable_boxes[..virtualizable_boxes.len() - 1] {
-            let ty = opref
-                .ty()
-                .expect("build_vable_snapshot_boxes: virtualizable_boxes entry must be typed");
-            vable_boxes_snap.push(crate::recorder::SnapshotTagged::Box(*opref, ty));
-        }
-    }
+    let mut vable_boxes_snap = Vec::new();
+    fill_vable_snapshot_boxes(virtualizable_boxes, &mut vable_boxes_snap);
     vable_boxes_snap
 }
 
@@ -6317,18 +6327,26 @@ pub fn build_vable_snapshot_boxes(
 /// the snapshot keeps the opref order verbatim — the resume reader walks the
 /// pairs in `consume_virtualref_info` (`resume.py`).  As with vable, every
 /// entry must carry `OpRef::ty()`.
+pub fn fill_vref_snapshot_boxes(
+    virtualref_boxes: &[(OpRef, usize)],
+    out: &mut Vec<crate::recorder::SnapshotTagged>,
+) {
+    out.clear();
+    out.reserve(virtualref_boxes.len());
+    for (opref, _ptr) in virtualref_boxes {
+        let ty = opref
+            .ty()
+            .expect("build_vref_snapshot_boxes: virtualref_boxes entry must be typed");
+        out.push(crate::recorder::SnapshotTagged::Box(*opref, ty));
+    }
+}
+
 pub fn build_vref_snapshot_boxes(
     virtualref_boxes: &[(OpRef, usize)],
 ) -> Vec<crate::recorder::SnapshotTagged> {
-    virtualref_boxes
-        .iter()
-        .map(|(opref, _ptr)| {
-            let ty = opref
-                .ty()
-                .expect("build_vref_snapshot_boxes: virtualref_boxes entry must be typed");
-            crate::recorder::SnapshotTagged::Box(*opref, ty)
-        })
-        .collect()
+    let mut out = Vec::new();
+    fill_vref_snapshot_boxes(virtualref_boxes, &mut out);
+    out
 }
 
 include!("opimpl.rs");
