@@ -422,10 +422,7 @@ unsafe fn kwonly_defaults_for_inline(
     if strategy.is_null() {
         return None;
     }
-    let raw = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     if raw.is_null() {
         return None;
     }
@@ -3833,8 +3830,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         }
     }
     // Branch A frame shape only: `ncells == 0`, non-global-storing callee.
-    let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) }
-        as *const pyre_interpreter::CodeObject;
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     if raw.is_null() {
         return Ok(None);
     }
@@ -5200,10 +5196,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
 /// keyword-only parameter owns one it never reaches — and none of the three is
 /// counted by `co_argcount`, so an arity check alone lets them through.
 fn fbw_callee_scope_is_positional_only(w_code: *const ()) -> bool {
-    let raw = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     if raw.is_null() {
         return false;
     }
@@ -5216,10 +5209,7 @@ fn fbw_callee_scope_is_positional_only(w_code: *const ()) -> bool {
 /// Whether the only local of `w_code` outside `registers_r[0..co_argcount]`
 /// is the `**kwargs` mapping.
 fn fbw_callee_scope_is_varkw_only(w_code: *const ()) -> bool {
-    let raw = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     if raw.is_null() {
         return false;
     }
@@ -5232,10 +5222,7 @@ fn fbw_callee_scope_is_varkw_only(w_code: *const ()) -> bool {
 /// The scope slot `_match_signature` writes the vararg tuple into
 /// (`_match_signature`): `co_argcount + co_kwonlyargcount`.
 fn fbw_callee_vararg_slot(w_code: *const ()) -> Option<usize> {
-    let raw = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     if raw.is_null() {
         return None;
     }
@@ -5250,10 +5237,7 @@ fn fbw_callee_vararg_slot(w_code: *const ()) -> Option<usize> {
 /// The scope slot `_match_signature` writes the `**kwargs` mapping into
 /// (`_match_signature`): `co_argcount + co_kwonlyargcount + has_vararg`.
 fn fbw_callee_varkw_slot(w_code: *const ()) -> Option<usize> {
-    let raw = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     if raw.is_null() {
         return None;
     }
@@ -5272,10 +5256,7 @@ fn fbw_callee_varkw_slot(w_code: *const ()) -> Option<usize> {
 /// How many keyword-only locals the seeding has to fill, or `None` when the
 /// callee's code object is not readable.
 fn fbw_callee_kwonly_count(w_code: *const ()) -> Option<usize> {
-    let raw = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     if raw.is_null() {
         return None;
     }
@@ -5338,10 +5319,7 @@ unsafe fn fbw_reorder_call_kw_args(
     } else if nparams == 0 || nargs + receiver_count > nparams {
         return None;
     }
-    let raw = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     if raw.is_null() {
         return None;
     }
@@ -5945,10 +5923,7 @@ unsafe fn fbw_bind_star_kwargs(
     if !fbw_callee_scope_is_positional_only(w_code) {
         return None;
     }
-    let raw = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     if raw.is_null() {
         return None;
     }
@@ -6217,8 +6192,7 @@ fn sub_jitcode_body_facts_for_code(code: *const ()) -> Option<crate::pyjitcode::
             ),
             owns_loop_header: callee_body_owns_loop_header(body.code, descr_refs),
             has_exception_table: unsafe {
-                let raw = pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef)
-                    as *const pyre_interpreter::CodeObject;
+                let raw = pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef);
                 !raw.is_null() && !(&(*raw).exceptiontable).is_empty()
             },
         }
@@ -6377,8 +6351,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         // Name the callee: a pc alone does not say which function a decline
         // cost, and one trace reaches several.
         let name = unsafe {
-            let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                as *const pyre_interpreter::CodeObject;
+            let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef);
             if raw.is_null() {
                 String::new()
             } else {
@@ -9716,10 +9689,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     if callee_args.len() != seeded_locals {
         return resolved_inline_decline(op.pc, line!());
     }
-    let raw_callee_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
+    let raw_callee_code =
+        unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     if raw_callee_code.is_null() {
         return resolved_inline_decline(op.pc, line!());
     }
@@ -12236,7 +12207,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     let raw = unsafe {
                         pyre_interpreter::w_code_get_ptr(pyre_object::gc_roots::shadow_stack_get(
                             inline_code_slot,
-                        )) as *const pyre_interpreter::CodeObject
+                        ))
                     };
                     if raw.is_null() {
                         return Err("null callee code ptr");
@@ -17520,8 +17491,7 @@ fn yield_marker_py_pc<Sym: WalkSym>(
     if w_code == 0 {
         return None;
     }
-    let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) }
-        as *const pyre_interpreter::CodeObject;
+    let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     Some((py_pc, code_ptr))
 }
 
@@ -17778,8 +17748,7 @@ fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResu
     // sent value.  This fast path only admits a parked `YIELD_VALUE`
     // (`last_instr >= 0`), where that is `last_instr + 1`.
     census.resume_py_pc = unsafe { (*shape.frame).next_instr() };
-    let raw = unsafe { pyre_interpreter::w_code_get_ptr(shape.w_pycode) }
-        as *const pyre_interpreter::CodeObject;
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(shape.w_pycode) };
     if raw.is_null() {
         decline!(V::NoJitcode)
     }
@@ -18999,8 +18968,7 @@ fn walk_generator_resume<Sym: WalkSym>(
         gen_resume_decline("not_resumable");
         return Ok(None);
     };
-    let raw = unsafe { pyre_interpreter::w_code_get_ptr(shape.w_pycode) }
-        as *const pyre_interpreter::CodeObject;
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(shape.w_pycode) };
     if raw.is_null() {
         gen_resume_decline("no_code");
         return Ok(None);

@@ -18446,10 +18446,8 @@ mod tests {
     /// `w_code_get_ptr`), not an arbitrary copy of the same source —
     /// `CallControl.jitcodes` is keyed by raw pointer identity.
     fn register_test_portal(_unused: &pyre_interpreter::CodeObject, w_code: *const ()) {
-        let raw_code = unsafe {
-            pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                as *const pyre_interpreter::CodeObject
-        };
+        let raw_code =
+            unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
         let canonical_code = unsafe { &*raw_code };
         crate::jit::codewriter::register_portal_jitdriver(canonical_code);
     }

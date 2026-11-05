@@ -1711,7 +1711,7 @@ pub unsafe fn get_pycode(obj: PyObjectRef) -> *const () {
             !crate::is_builtin_code(code as PyObjectRef),
             "get_pycode called on a builtin function"
         );
-        crate::w_code_get_ptr(code as PyObjectRef)
+        crate::w_code_get_ptr(code as PyObjectRef) as *const ()
     }
 }
 
@@ -2308,7 +2308,7 @@ fn code_getdocstring(obj: PyObjectRef) -> PyObjectRef {
         return unsafe { crate::gateway::builtin_code_get_docstring(code) };
     }
     if unsafe { crate::pycode::is_code(code) } {
-        let raw = unsafe { crate::pycode::w_code_get_ptr(code) } as *const crate::CodeObject;
+        let raw = unsafe { crate::pycode::w_code_get_ptr(code) };
         if !raw.is_null() {
             let code_ref = unsafe { &*raw };
             if code_ref.flags.contains(crate::CodeFlags::HAS_DOCSTRING)
@@ -2969,7 +2969,7 @@ pub unsafe fn fset_func_code(obj: PyObjectRef, w_code: PyObjectRef) -> Result<()
         } else {
             pyre_object::w_tuple_len(closure)
         };
-        let raw_code = crate::pycode::w_code_get_ptr(w_code) as *const crate::CodeObject;
+        let raw_code = crate::pycode::w_code_get_ptr(w_code);
         let freevars_len = if raw_code.is_null() {
             0
         } else {
@@ -3312,7 +3312,7 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // so the words below are the slots, not the pre-pin copies.
     let w_code = pyre_object::gc_roots::shadow_stack_get(base);
     let w_name = pyre_object::gc_roots::shadow_stack_get(base + 2);
-    let code_ptr = unsafe { crate::w_code_get_ptr(w_code) } as *const crate::CodeObject;
+    let code_ptr = unsafe { crate::w_code_get_ptr(w_code) };
     let name = if w_name.is_null() || unsafe { pyre_object::is_none(w_name) } {
         unsafe { (*code_ptr).obj_name.to_string() }
     } else if unsafe { pyre_object::is_str(w_name) } {
@@ -3326,7 +3326,7 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // reads (`ShadowStackFrameworkGCTransformer.pop_roots`).
     let w_code = pyre_object::gc_roots::shadow_stack_get(base);
     let w_argdefs = pyre_object::gc_roots::shadow_stack_get(base + 3);
-    let code_ptr = unsafe { crate::w_code_get_ptr(w_code) } as *const crate::CodeObject;
+    let code_ptr = unsafe { crate::w_code_get_ptr(w_code) };
     // [3.14-spec] PyPy `Function.descr_function__new__` calls
     // `space.fixedview(argdefs)` before it inspects `closure`, but that accepts
     // lists and then reports PyPy's `TypeError("invalid closure")` for

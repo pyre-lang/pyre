@@ -1397,10 +1397,7 @@ fn publish_carrier_header_vsd<Sym: WalkSym>(
     let Some(depth_vsd) = crate::state::depth_based_vsd_for_wcode(w_code, target_pc) else {
         return;
     };
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
+    let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     if raw_code.is_null() {
         return;
     }

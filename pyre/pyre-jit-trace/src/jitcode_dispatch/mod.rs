@@ -10360,10 +10360,7 @@ fn frame_raw_code(frame: usize) -> Option<*const pyre_interpreter::CodeObject> {
     if w_code.is_null() {
         return None;
     }
-    Some(unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    })
+    Some(unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) })
 }
 
 fn exact_floor_segment_anchor(
@@ -11809,8 +11806,7 @@ pub(crate) unsafe fn resolve_inlinable_callee(
         {
             return None;
         }
-        let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject;
+        let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef);
         if raw.is_null() {
             return None;
         }
@@ -14089,8 +14085,7 @@ fn mark_trace_reads_module_global_from_code(
         return false;
     }
     let Some(name) = (unsafe {
-        let raw = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject;
+        let raw = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
         if raw.is_null() {
             None
         } else {
