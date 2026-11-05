@@ -996,7 +996,9 @@ impl PyJitCode {
                 if is_live {
                     Vec::new()
                 } else {
-                    self.pcdep_for_jitcode_pc(jit_pc).unwrap_or_default()
+                    self.pcdep_for_jitcode_pc(jit_pc)
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_default()
                 }
             }
         }
