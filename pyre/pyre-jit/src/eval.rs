@@ -13514,7 +13514,8 @@ fn compile_and_run_once(
     }
 
     // pyjitpl.py `initialize_state_from_start`: `newframe(mainjitcode)`
-    // then, on the interpret arm, `setup_call(original_boxes)`.
+    // then `setup_call(original_boxes)`. The interpret arm starts at pc 0
+    // from that `setup_call`, as `_compile_and_run_once` does.
     // Virtualizable boxes were already seeded by `setup_tracing`.
     // The `trace_bytecode` arm keeps the previous seed: one root frame
     // and no `setup_call` (`rebuild_portal_framestack_from_resume`).
