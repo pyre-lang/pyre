@@ -884,6 +884,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // never leaks into a later op or merge-point sync.
             scratch.stack_sync.clear();
             let mut async_force_result_slot = None;
+            let mut live_stack_depth = None;
+            let mut async_force_result_color = None;
             if sym.owns_virtualizable_shadow() {
                 let depth = unsafe {
                     let jc = &walked_owned;
@@ -900,6 +902,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         }
                     }
                 };
+                live_stack_depth = Some(depth);
                 let nlocals = sym.nlocals();
                 // `pyjitpl.py capture_resumedata` stores `virtualizable_boxes`
                 // as they stand and `do_residual_call` puts the result in a
@@ -912,16 +915,16 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // operand stack the interpreter still holds) are published
                 // from the vstack mirror because pyre's operand stack lives
                 // there, not in vable stores.
-                let residual_result_argcode =
+                let residual_op =
                     if after_residual_call && last_guard == Some(OpCode::GuardNotForced) {
                         crate::jitcode_runtime::decode_op_at(
                             walked_owned.payload.jitcode.code.as_slice(),
                             op_pc,
                         )
-                        .map(|op| op.result_argcode())
                     } else {
                         None
                     };
+                let residual_result_argcode = residual_op.as_ref().map(|op| op.result_argcode());
                 async_force_result_slot = self::async_force_result_slot(
                     last_guard,
                     after_residual_call,
@@ -929,6 +932,17 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     nlocals,
                     depth,
                 );
+                if async_force_result_slot.is_some() {
+                    async_force_result_color = residual_op.as_ref().and_then(|op| {
+                        walked_owned
+                            .payload
+                            .jitcode
+                            .code
+                            .as_slice()
+                            .get(op.next_pc.checked_sub(1)?)
+                            .copied()
+                    });
+                }
                 // depth 0 has no operand-stack vable slots to overlay.
                 // An invalid mirror yields OpRef::NONE for every slot;
                 // vstack_box_for_snapshot drops them, so the overlay is empty.
@@ -1139,7 +1153,14 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     jitcode_index as i32,
                     guard_jitcode_pc,
                 );
-                let semantic_limit = sym.nlocals() + maps.stack_depth_at_pc;
+                // Slots at or above the live depth were popped and hold NULL
+                // in the shadow (`pyframe.py` `popvalue_maybe_none` /
+                // `dropvalues`); the snapshot encodes that depth, so the
+                // projection never writes there.
+                let semantic_limit = sym.nlocals()
+                    + live_stack_depth.map_or(maps.stack_depth_at_pc, |depth| {
+                        depth.min(maps.stack_depth_at_pc)
+                    });
                 let nlocals = sym.nlocals();
                 // The residual call's result lands on the operand stack, so
                 // only stack slots need reconciling here.  A local's slot is
@@ -1150,10 +1171,16 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // local's slot can publish an unrelated value.
                 let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
                 for &(bank, color, slot) in &maps.pcdep_entries {
+                    // The call's result register is not defined while async
+                    // force (`compile.py` `ResumeGuardForcedDescr.handle_async_forcing`)
+                    // writes this vable image back, which is why
+                    // `pyjitpl.py` `MIFrame.get_list_of_active_boxes` clears
+                    // it via `_result_argcode`.
                     if bank != 1
                         || (slot as usize) < nlocals
                         || slot as usize >= semantic_limit
                         || Some(slot as usize) == async_force_result_slot
+                        || Some(color as u8) == async_force_result_color
                         || !banks.ref_.contains(&(color as u32))
                     {
                         continue;
