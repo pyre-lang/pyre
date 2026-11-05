@@ -5632,12 +5632,10 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
 
     // `PyFrame::clear_references` is the loop in `PyFrame.descr_clear`.
-    // `look_inside_graph` leaves that loop residual, and
-    // `generator_frame_is_finished` calls it while a bridge can still be
-    // recording the generator's return. PyPy's `getfunctionptr` publishes a
-    // real address for the same residual; both CallPath spellings are
-    // required, as for `PyFrame::pop` above. It is not an operand-stack
-    // accessor: the walk may execute it against the live frame.
+    // `look_inside_graph` leaves that loop residual. PyPy's `getfunctionptr`
+    // publishes a real address for the same residual; both CallPath
+    // spellings are required, as for `PyFrame::pop` above. It is not an
+    // operand-stack accessor: the walk may execute it against the live frame.
     pa1!(
         &mut entries,
         "pyre_interpreter::pyframe::PyFrame::clear_references",

@@ -4146,10 +4146,11 @@ impl Bookkeeper {
 
     /// Intern an RPython exception class under the literal name.
     ///
-    /// `intern_class_by_qualname_with_bases` runs `canonical_struct_name`.
-    /// A bare leaf in `STRUCT_ORIGIN_REGISTRY` becomes `module::Leaf`,
-    /// which would merge `argument.py` `class ArgErr(Exception)` with
-    /// the value ADT. The key here is the name as given (`ArgErr`,
+    /// `intern_class_key` resolves against this bookkeeper's registry
+    /// and already-interned classes, and a TypeDecl is interned under
+    /// its qualified path (`argument::ArgErr`), so the literal Python
+    /// `__name__` key keeps the exception class apart from the value
+    /// ADT. The key here is the name as given (`ArgErr`,
     /// `ArgErrMissing`). First mint wins: a key that is already present
     /// is returned unchanged.
     fn intern_exception_class(&self, name: &str, bases: Vec<HostObject>) -> HostObject {

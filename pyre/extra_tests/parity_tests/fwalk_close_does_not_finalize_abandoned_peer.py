@@ -1,9 +1,9 @@
 # CPython-suite gap: test_os.FwalkTests.test_fd_finalization only fails
 # after test_walk_symlink abandons a live fwalk; the suite does not pin
 # that close() of one fwalk must not run a peer's finally.
-# parity-tests reason: prompt-finalization on gen.close() must not treat
-# an exhausted scandir's leftover finalizer registration as a reason to
-# collect the whole heap and close another generator's dirfds.
+# parity-tests reason: close() of one fwalk must not collect the heap and
+# close another generator's dirfds.  An exhausted scandir's leftover
+# finalizer registration is a no-op (`may_ignore_finalizer` / `_close`).
 import os
 import shutil
 import tempfile

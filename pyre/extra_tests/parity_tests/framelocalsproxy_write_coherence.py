@@ -282,7 +282,7 @@ def check_unstarted_asyncgen_celltype_f_locals():
 
 
 def check_exhausted_generator_retained_frame_locals():
-    # Ordinary exhaustion (`frame_is_finished` with prompt_finalization false)
+    # Ordinary exhaustion (`GeneratorOrCoroutine.frame_is_finished`)
     # leaves a retained frame's locals in place. Capture `g.gi_frame` and a
     # frame taken inside via `sys._getframe()` before `next` / `for` finish
     # the generator, then print sorted `f.f_locals` items.
@@ -346,7 +346,7 @@ def check_exhausted_generator_retained_frame_locals():
 
 
 def check_finished_generator_retained_frame_f_generator():
-    # Ordinary completion (`frame_is_finished` with prompt_finalization false)
+    # Ordinary completion (`GeneratorOrCoroutine.frame_is_finished`)
     # and close() both drop `frame.f_generator_wref`. Capture `g.gi_frame`
     # before start, then print `f.f_generator is g` (True while live) and
     # `f.f_generator` after finish / close (None), with `g` still alive so a

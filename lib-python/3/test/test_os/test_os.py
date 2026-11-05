@@ -2095,6 +2095,10 @@ class FwalkTests(WalkTests):
             next(it)
             self.assertGreater(getfd(), old_fd)
             it.close()
+            # PyPy: with a wrapping generator (BytesFwalkTests) close() only
+            # releases the inner fwalk() generator; its finally closes the
+            # fds when a collection finalizes it.
+            support.gc_collect()
             self.assertEqual(getfd(), old_fd)
 
     # fwalk() keeps file descriptors open

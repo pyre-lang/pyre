@@ -835,9 +835,6 @@ pub struct ExecutionContext {
     pub repr_active: RefCell<Vec<PyObjectRef>>,
     /// Placeholders currently being resolved (`_PyThreadStateImpl.lazy_imports`).
     pub lazy_imports_resolving: RefCell<Vec<PyObjectRef>>,
-    /// Frame-close census for `__del__` before the next opcode. Owned by
-    /// the execution context that is finishing the generator, not TLS.
-    pub pending_close_finalizer: Cell<bool>,
     /// Number of user Python frames currently executing bytecode on this
     /// context.  Bumped once at every `eval_loop` / `eval_loop_jit` entry and
     /// dropped when that activation returns, so the module-level frame, an
@@ -1026,7 +1023,6 @@ impl ExecutionContext {
             py_repr: pyre_object::PY_NULL,
             repr_active: RefCell::new(Vec::new()),
             lazy_imports_resolving: RefCell::new(Vec::new()),
-            pending_close_finalizer: Cell::new(false),
             py_recursion_depth: 0,
             accounted_activation: 0,
             root_stack_slot: Cell::new(0),
@@ -1082,7 +1078,6 @@ impl ExecutionContext {
         ec.py_repr = pyre_object::PY_NULL;
         ec.repr_active = RefCell::new(Vec::new());
         ec.lazy_imports_resolving = RefCell::new(Vec::new());
-        ec.pending_close_finalizer = Cell::new(false);
         ec
     }
 

@@ -5650,10 +5650,10 @@ impl PyFrame {
                         "cannot clear a suspended frame",
                     ));
                 }
-                // `_PyGen_Finalize` can execute Python and collect.  Keep both
-                // owner and frame as explicit roots, then reload both before
-                // severing the association; neither raw pointer may survive
-                // the call unchanged across a nursery move.
+                // `_PyGen_Finalize` can execute Python.  Keep both owner and
+                // frame as explicit roots, then reload both before severing
+                // the association; neither raw pointer may survive the call
+                // unchanged across a nursery move.
                 let frame_anchor = crate::eval::FrameAnchor::new(self);
                 let roots = pyre_object::gc_roots::push_roots();
                 let gen_slot = roots.base();
@@ -5665,13 +5665,9 @@ impl PyFrame {
                     crate::baseobjspace::generator_frame_is_finished(
                         roots.get(gen_slot),
                         &mut *frame_anchor.live(),
-                        true,
                     )
                 };
                 self.clear_references();
-                crate::baseobjspace::generator_close_finalizer_boundary(
-                    crate::baseobjspace::take_pending_close_finalizer(),
-                );
                 return Ok(());
             }
             // pyframe.py:815-820: a dead `f_generator_wref` simply skips the
@@ -5688,141 +5684,6 @@ impl PyFrame {
 
         self.clear_references();
         Ok(())
-    }
-
-    /// Whether the graph this frame currently holds contains an app-level
-    /// finalizer.  Taken before `generator_frame_is_finished` cuts the
-    /// generator's frame slot, while the locals are still in place.  A false
-    /// answer proves that a prompt-finalization collection cannot run Python
-    /// code.
-    #[majit_macros::dont_look_inside]
-    pub(crate) fn cleared_references_have_pending_finalizer(&self, gen_obj: PyObjectRef) -> bool {
-        if !majit_gc::gc_has_pending_finalizers() {
-            return false;
-        }
-
-        let mut released = Vec::with_capacity(locals_w!(self).len() + 4);
-        for index in 0..locals_w!(self).len() {
-            let value = locals_w!(self)[index];
-            if !value.is_null() {
-                released.push(majit_ir::GcRef(value as usize));
-            }
-        }
-        if !self.w_yielding_from.is_null() {
-            released.push(majit_ir::GcRef(self.w_yielding_from as usize));
-        }
-        if let Some(debug) = self.getdebug_data() {
-            released.extend(
-                [debug.w_locals, debug.w_extra_locals, debug.w_f_trace]
-                    .into_iter()
-                    .filter(|value| !value.is_null())
-                    .map(|value| majit_ir::GcRef(value as usize)),
-            );
-        }
-        // Objects reachable from outside the released graph: every other frame
-        // on the execution-context chain (plus pycode, get_w_globals(),
-        // w_builtin); an already-forced JitVirtualRef's frame (MiniMark traces
-        // `forced`; we do not force); the generator being closed and the
-        // code / globals it holds (`GeneratorOrCoroutine.pycode`); every
-        // module registered in the Python-visible `sys.modules` dict and
-        // that module's namespace, added for a second walk when the first
-        // answers true.  Chain frames stay because the EC holds
-        // them.  A forced vref's frame stays because the vref holds it.
-        // The closee stays because `close()` keeps it on the stack through
-        // the prompt collection; `frame_is_finished` drops only `gen.frame`.
-        // A `sys.modules` module stays because `sys` holds the dict.  The
-        // walk does not enter them.
-        let mut live = Vec::new();
-        if !gen_obj.is_null() {
-            // The generator being closed is an argument of the running `close()`
-            // and stays on the stack through the prompt collection that follows,
-            // so it and the code object it holds (`GeneratorOrCoroutine.pycode`)
-            // with that code's globals survive the release.  The frame does not:
-            // `frame_is_finished` drops `gen.frame`.
-            live.push(majit_ir::GcRef(gen_obj as usize));
-            let w_code = unsafe { pyre_object::generator::w_generator_get_pycode(gen_obj) };
-            if !w_code.is_null() {
-                live.push(majit_ir::GcRef(w_code as usize));
-                let w_globals = unsafe { (*(w_code as *const crate::pycode::PyCode)).w_globals };
-                if !w_globals.is_null() {
-                    live.push(majit_ir::GcRef(w_globals as usize));
-                }
-            }
-        }
-        let ec = crate::call::getexecutioncontext();
-        if !ec.is_null() {
-            let mut link = unsafe { (*ec).topframeref };
-            let mut hops = 0;
-            while !link.is_null() {
-                hops += 1;
-                if hops > 10_000 {
-                    break;
-                }
-                live.push(majit_ir::GcRef(link as usize));
-                if unsafe {
-                    majit_metainterp::virtualref::ptr_is_virtual_ref(
-                        link as majit_gc::header::GCREF,
-                    )
-                } {
-                    let forced = unsafe {
-                        majit_metainterp::virtualref::vref_forced(link as majit_gc::header::GCREF)
-                    };
-                    if forced.is_null() {
-                        break;
-                    }
-                    link = forced as *mut PyFrame;
-                    continue;
-                }
-                let frame = unsafe { &*link };
-                if !std::ptr::eq(frame, self) {
-                    live.extend(
-                        [
-                            frame.pycode as PyObjectRef,
-                            frame.get_w_globals(),
-                            frame.w_builtin,
-                        ]
-                        .into_iter()
-                        .filter(|value| !value.is_null())
-                        .map(|value| majit_ir::GcRef(value as usize)),
-                    );
-                } else {
-                    live.pop();
-                }
-                link = frame.f_backref;
-            }
-        }
-        if !majit_gc::subgraph_has_pending_finalizer(&released, &live) {
-            return false;
-        }
-        // Live objects only shrink the walk, so a false answer above is final; the namespaces
-        // in `sys.modules` are added only to re-check a true one.
-        // Every module `sys.modules` holds, and its namespace, outlives the release: the `sys`
-        // module keeps the dict, and the prompt collection runs before any Python code could
-        // remove an entry.  A function of another module reached from a released local
-        // therefore does not take the walk into that module's globals.
-        let w_modules = crate::importing::sys_modules_dict();
-        if !w_modules.is_null()
-            && unsafe {
-                pyre_object::is_dict(w_modules)
-                    && pyre_object::is_exact_type(w_modules, &pyre_object::DICT_TYPE)
-            }
-        {
-            let mut from = 0usize;
-            while let Some((slot, _key, v)) =
-                unsafe { pyre_object::w_dict_next_item(w_modules, from) }
-            {
-                from = slot.wrapping_add(1);
-                if v.is_null() || unsafe { !pyre_object::is_module(v) } {
-                    continue;
-                }
-                live.push(majit_ir::GcRef(v as usize));
-                let w_dict = unsafe { pyre_object::w_module_get_w_dict(v) };
-                if !w_dict.is_null() {
-                    live.push(majit_ir::GcRef(w_dict as usize));
-                }
-            }
-        }
-        majit_gc::subgraph_has_pending_finalizer(&released, &live)
     }
 
     /// Clear the frame-owned reference region after its owner has already

@@ -1,27 +1,21 @@
-# pyre-check: pypy-diverges: unretained close() runs `__del__` before it
-# returns; pypy3's tracing GC reaches that local later. A retained
-# `gi_frame` keeps the locals on both sides.
-# CPython-suite gap: test_yield_from exercises close() on a generator that
-# yields from its finally, but only with locals that hold no finalizer, so the
-# prompt-finalization collection this path can take is never entered there.
-# parity-tests reason: pyre runs a whole-heap collection at close()'s
-# finalization boundary, and that collection may only run once the propagation
-# root is consumed; an arm that leaves an exception in flight must skip it.
-#
-# close_keeps_retained_frame_locals:
-# test_close_clears_frame never retains `gi_frame` across `close()`.  A
-# retained frame keeps its locals (`arg`, `x`); an unretained frame's
-# objects run `__del__` before `close()` returns.  `frame.clear()` is the
-# path that drops the slots.
+# CPython-suite gap: test_close_clears_frame asserts `__del__` before close()
+# returns (refcount); test_close_releases_frame_locals uses gc_collect after
+# close.  Neither grades a retained gi_frame's locals, nor the raising close()
+# messages across a yield-from chain.
+# parity-tests reason: close() drops the generator's frame so a later
+# collection finalizes unretained locals; a retained gi_frame keeps them;
+# RuntimeError "generator ignored GeneratorExit" and ValueError "boom" stay
+# the close() messages.
 
-"""close() propagates its error across the finalization boundary.
+"""close() releases the frame's locals so a collection can finalize them.
 
-The generator's frame holds an object with `__del__`, so releasing the frame
-releases a graph that can run application code.  Two of close()'s outcomes
-raise rather than return: the generator that yields again after GeneratorExit
-becomes RuntimeError, and one that raises from its finally propagates that
-exception.  Both must survive the boundary with their message intact.
+An unretained local with `__del__` runs after close() and three gc.collect()
+calls (`support.gc_collect`).  A retained `gi_frame` keeps those locals.
+Raising close() arms keep their message: RuntimeError "generator ignored
+GeneratorExit", ValueError "boom".
 """
+
+import gc
 
 
 class Finalized:
@@ -123,6 +117,9 @@ def check_close_keeps_retained_frame_locals():
     g = gen_with_arg(D("suspended_unretained"))
     next(g)
     g.close()
+    gc.collect()
+    gc.collect()
+    gc.collect()
     deleted = "suspended_unretained" in finalized
     print(f"suspended_unretained deleted={deleted}")
     assert deleted is True
@@ -141,6 +138,9 @@ def check_close_keeps_retained_frame_locals():
 
     g = gen_with_arg(D("unstarted_unretained"))
     g.close()
+    gc.collect()
+    gc.collect()
+    gc.collect()
     deleted = "unstarted_unretained" in finalized
     print(f"unstarted_unretained deleted={deleted}")
     assert deleted is True
@@ -148,37 +148,3 @@ def check_close_keeps_retained_frame_locals():
 
 check_close_keeps_retained_frame_locals()
 print("OK")
-
-
-import types
-
-# A released local that holds a function of a module registered in sys.modules
-# does not release that module's namespace.  close() must not collect, so an
-# unrelated unreachable cycle with a finalizer is still unfinalized right after it.
-import gc
-import sys
-cycle_log = []
-class CycleOnDel:
-    def __del__(self):
-        cycle_log.append("cycle")
-class HeldOnDel:
-    def __del__(self):
-        cycle_log.append("held")
-other = types.ModuleType("generator_close_other_module")
-other.held = HeldOnDel()
-exec("def helper():\n    return held\n", other.__dict__)
-sys.modules["generator_close_other_module"] = other
-def holds_other_module_function():
-    fn = other.helper
-    assert fn() is other.held
-    yield 1
-cyc = CycleOnDel()
-cyc.self = cyc
-del cyc
-gen = holds_other_module_function()
-assert next(gen) == 1
-gen.close()
-assert cycle_log == [], cycle_log
-gc.collect()
-assert cycle_log == ["cycle"], cycle_log
-del sys.modules["generator_close_other_module"]

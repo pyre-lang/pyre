@@ -4272,10 +4272,12 @@ fn register_opaque_external_argtype(
 /// whose result lltype does not depend on the keyed argument.
 ///
 /// Builds the stub with [`build_stub_pygraph_for_lltype`] and installs
-/// it as the source template so `specialize_argtype` → `cachedgraph(key,
-/// None, None)` copies that template per knowntype (`description.py`
-/// `cachedgraph`). [`register_opaque_external_argtype`] leaves the
-/// source template empty because the result is the keyed argument's type
+/// it as the source template (`FunctionDesc.buildgraph` /
+/// `translator.buildflowgraph`) so `specialize_argtype` →
+/// `cachedgraph(knowntype key)` copies that template per argument
+/// knowntype (`description.py` `cachedgraph`). None is not written into
+/// `_cache`. [`register_opaque_external_argtype`] leaves the template
+/// empty because the result is the keyed argument's type
 /// (`specialize_argtype_stub_result`).
 fn register_opaque_external_argtype_with_result(
     registry: &CallRegistry,
@@ -16141,6 +16143,10 @@ mod tests {
             assert!(
                 fd.built_source_template().is_some(),
                 "{segments:?}: source template installed"
+            );
+            assert!(
+                fd.cache.borrow().is_empty(),
+                "{segments:?}: None enters _cache only when cachedgraph requests it"
             );
             let annspecialcase = fd
                 .base

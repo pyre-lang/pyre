@@ -539,9 +539,6 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
     majit_gc::set_active_collect_step(Some(dynasm_collect_step));
     majit_gc::set_active_get_objects(Some(dynasm_get_objects));
     majit_gc::set_active_get_referents(Some(dynasm_get_referents));
-    majit_gc::set_active_subgraph_has_pending_finalizer(Some(
-        dynasm_subgraph_has_pending_finalizer,
-    ));
     majit_gc::set_active_is_tracked(Some(dynasm_is_tracked));
     majit_gc::set_active_gcflag_hooks(
         Some(dynasm_get_gcflag_extra),
@@ -1118,16 +1115,6 @@ fn dynasm_get_referents(obj: majit_ir::GcRef, visitor: majit_gc::GetObjectsVisit
     // See `MajitGc::get_referents`: the fallback enters the collector, so the
     // argument is published and reloaded rather than passed as the raw local.
     majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.get_referents(obj, &mut visit));
-}
-
-fn dynasm_subgraph_has_pending_finalizer(
-    roots: &[majit_ir::GcRef],
-    live: &[majit_ir::GcRef],
-) -> bool {
-    if let Some(found) = gc_box::with_mut(|g| g.subgraph_has_pending_finalizer(roots, live)) {
-        return found;
-    }
-    majit_gc::gc_sync::gc_op(|g| g.subgraph_has_pending_finalizer(roots, live))
 }
 
 fn dynasm_is_tracked(obj: majit_ir::GcRef) -> bool {

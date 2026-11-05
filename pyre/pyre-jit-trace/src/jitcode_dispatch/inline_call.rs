@@ -18318,8 +18318,7 @@ fn descend_generatorentry<Sym: WalkSym>(
 ///               residual_call_r_r  bh_send_ex_tail(result, generator) -> answer
 ///               -live-                        [r0 live]
 ///               ref_return         answer
-///               load_const_i       prompt = 0
-///               inline_call_ir_v   generator_frame_is_finished(prompt, gen, frame)
+///               inline_call_r_v    generator_frame_is_finished(gen, frame)
 ///   after_teardown:
 ///               -live-                        []
 ///               load_const_r       result = NULL
@@ -18335,7 +18334,6 @@ fn descend_generatorentry<Sym: WalkSym>(
 const SEND_EX_RESULT_REG: u16 = 0;
 const SEND_EX_GENERATOR_REG: u16 = 1;
 const SEND_EX_FRAME_REG: u16 = 2;
-const SEND_EX_PROMPT_REG: u16 = 0;
 const SEND_EX_PLACEHOLDER_CALLEE: u16 = 0;
 const GENERATOR_FRAME_IS_FINISHED_PATH: &str =
     "pyre_interpreter::baseobjspace::generator_frame_is_finished";
@@ -18385,11 +18383,7 @@ pub extern "C" fn bh_send_ex_tail(
             as *mut pyre_interpreter::PyFrame;
         if frame.is_null() || (*frame).frame_finished_execution() {
             if !frame.is_null() {
-                pyre_interpreter::baseobjspace::generator_frame_is_finished(
-                    generator,
-                    &mut *frame,
-                    false,
-                );
+                pyre_interpreter::baseobjspace::generator_frame_is_finished(generator, &mut *frame);
             } else {
                 pyre_object::generator::w_generator_set_exhausted(generator);
             }
@@ -18479,17 +18473,15 @@ fn append_send_ex_finished_section(builder: &mut JitCodeBuilder) -> Option<usize
     // half-written second section on the first-section builder.
     let after_teardown_liveness = crate::state::intern_liveness(&[], &[], &[])?;
     let helper_idx = builder.add_sub_jitcode_arc(helper);
-    builder.load_const_i_value(SEND_EX_PROMPT_REG, 0);
-    builder.inline_call_ir_v(
+    builder.inline_call_r_v(
         helper_idx,
-        &[(SEND_EX_PROMPT_REG, 0)],
         &[(SEND_EX_GENERATOR_REG, 0), (SEND_EX_FRAME_REG, 1)],
         None,
     );
     let after_teardown = builder.current_pos();
     // Following ops: `load_const_r` writes r0, `ref_return` reads r0.
     // `_compute_liveness_must_continue` therefore has an empty live set at
-    // this `-live-` (`load_const_r` kills r0; nothing later reads r1/r2/i0).
+    // this `-live-` (`load_const_r` kills r0; nothing later reads r1/r2).
     let after_teardown_live = builder.live_placeholder();
     builder.patch_live_offset(after_teardown_live, after_teardown_liveness);
     builder.load_const_r_value(SEND_EX_RESULT_REG, 0);
@@ -18591,14 +18583,14 @@ mod send_ex_continuation_tests {
             "the anchor must be addressable as a resume coordinate",
         );
         let expected = if send_ex_after_teardown_pc().is_some() {
-            10
+            9
         } else {
             5
         };
         assert_eq!(
             startpoints.len(),
             expected,
-            "startpoints must cover the first section (5) and, when the finished helper is installed, the teardown section (5 more), got {startpoints:?}",
+            "startpoints must cover the first section (5) and, when the finished helper is installed, the teardown section (4 more), got {startpoints:?}",
         );
     }
 
@@ -18966,18 +18958,15 @@ fn walk_send_ex_finished_tail<Sym: WalkSym>(
     if frame.is_null() {
         return Err(DispatchError::callee_inline_unsupported(op.pc));
     }
-    // `setup_call` splits by kind. `(gen_obj: r, frame: r, prompt: i)` is
-    // `arg_classes` "rri": ints `[prompt]`, refs `[gen_obj, frame]`.
+    // `setup_call` splits by kind. `(gen_obj: r, frame: r)` is
+    // `arg_classes` "rr": refs `[gen_obj, frame]`.
     let arg_classes = jitcode.calldescr().arg_classes.as_str();
-    let n_int = arg_classes.chars().filter(|&c| c == 'i').count();
-    let n_ref = arg_classes.chars().filter(|&c| c == 'r').count();
-    if n_int != 1 || n_ref != 2 {
+    if arg_classes != "rr" {
         return Err(DispatchError::callee_inline_unsupported(op.pc));
     }
     let Some(after_teardown_parent) = send_ex_finished_after_teardown_parent_frame(iter_op) else {
         return Err(DispatchError::callee_inline_unsupported(op.pc));
     };
-    let prompt_box = ctx.trace_ctx.const_int(0);
     let gen_concrete = ConcreteValue::Ref(gen_obj);
     let frame = ConcreteValue::Ref(frame as pyre_object::PyObjectRef);
     match super::specialize::run_codewriter_helper_inline_call_under_parent(
@@ -18985,8 +18974,8 @@ fn walk_send_ex_finished_tail<Sym: WalkSym>(
         op.pc,
         &body,
         after_teardown_parent,
-        &[prompt_box],
-        &[ConcreteValue::Int(0)],
+        &[],
+        &[],
         &[iter_op, frame_box],
         &[gen_concrete, frame],
         &[],

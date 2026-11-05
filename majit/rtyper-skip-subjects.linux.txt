@@ -268,7 +268,6 @@ two-phase-annotate-skipped	pyre_interpreter::baseobjspace::super_getattribute
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::super_getattribute_code_name
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::super_getattribute_str
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::super_getattribute_wtf8
-two-phase-annotate-skipped	pyre_interpreter::baseobjspace::take_pending_close_finalizer
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::take_pending_hash_error_for
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::take_pending_mapping_key_error
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::takewhile_next_w

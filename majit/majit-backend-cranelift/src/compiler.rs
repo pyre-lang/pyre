@@ -406,9 +406,6 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_collect_step(Some(collect_step_via_active_runtime));
     majit_gc::set_active_get_objects(Some(get_objects_via_active_runtime));
     majit_gc::set_active_get_referents(Some(get_referents_via_active_runtime));
-    majit_gc::set_active_subgraph_has_pending_finalizer(Some(
-        subgraph_has_pending_finalizer_via_active_runtime,
-    ));
     majit_gc::set_active_is_tracked(Some(is_tracked_via_active_runtime));
     majit_gc::set_active_gcflag_hooks(
         Some(get_gcflag_extra_via_active_runtime),
@@ -1607,17 +1604,6 @@ fn get_referents_via_active_runtime(obj: GcRef, visitor: majit_gc::GetObjectsVis
     } else if majit_gc::gc_sync::is_initialized() {
         majit_gc::gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_referents(obj, &mut visit));
     }
-}
-
-fn subgraph_has_pending_finalizer_via_active_runtime(roots: &[GcRef], live: &[GcRef]) -> bool {
-    if gc_box::present() {
-        return with_cranelift_gc(|gc| gc.subgraph_has_pending_finalizer(roots, live))
-            .unwrap_or(false);
-    }
-    if majit_gc::gc_sync::is_initialized() {
-        return majit_gc::gc_sync::gc_op(|gc| gc.subgraph_has_pending_finalizer(roots, live));
-    }
-    false
 }
 
 fn is_tracked_via_active_runtime(obj: GcRef) -> bool {
