@@ -2405,6 +2405,29 @@ pub(crate) fn non_arm_skip_category(msg: &str) -> Option<&'static str> {
     if msg.contains("two-phase: subject annotate-skipped in prepass") {
         return Some("two-phase-annotate-skipped");
     }
+    // Direct `Ok(Skip)` reasons from `dual_gate_outcome_from_cache` /
+    // `dual_gate_check_with_registry`. They never carry the
+    // `registry build panicked: ` prefix, so `unported_category` does
+    // not see them; without a row here they land as
+    // `direct-skip (never reaches unported_category)`.
+    if msg.contains("two-phase divergence:") {
+        return Some("two-phase-divergence");
+    }
+    if msg.contains("two-phase compared set empty") {
+        return Some("two-phase-compared-set-empty");
+    }
+    if msg.contains("two-phase: cached const lltype does not project") {
+        return Some("two-phase-cached-const-lltype-does-not-project");
+    }
+    if msg.contains("two-phase: cached lltype does not project") {
+        return Some("two-phase-cached-lltype-does-not-project");
+    }
+    if msg.contains("dual-gate divergence:") {
+        return Some("dual-gate-divergence");
+    }
+    if msg.contains("dual-gate compared set empty") {
+        return Some("dual-gate-compared-set-empty");
+    }
     None
 }
 
@@ -9268,6 +9291,38 @@ mod tests {
         assert_eq!(
             non_arm_skip_category(&reason),
             Some("two-phase-never-a-subject")
+        );
+    }
+
+    #[test]
+    fn two_phase_and_dual_gate_skip_reasons_have_census_classes() {
+        assert_eq!(
+            non_arm_skip_category("two-phase divergence: Void vs Int"),
+            Some("two-phase-divergence")
+        );
+        assert_eq!(
+            non_arm_skip_category("two-phase compared set empty"),
+            Some("two-phase-compared-set-empty")
+        );
+        assert_eq!(
+            non_arm_skip_category("two-phase: cached lltype does not project"),
+            Some("two-phase-cached-lltype-does-not-project")
+        );
+        assert_eq!(
+            non_arm_skip_category("two-phase: cached const lltype does not project"),
+            Some("two-phase-cached-const-lltype-does-not-project")
+        );
+        assert_eq!(
+            non_arm_skip_category("dual-gate divergence: Void vs Int"),
+            Some("dual-gate-divergence")
+        );
+        assert_eq!(
+            non_arm_skip_category("dual-gate compared set empty"),
+            Some("dual-gate-compared-set-empty")
+        );
+        assert_eq!(
+            non_arm_skip_category("two-phase: subject annotate-skipped in prepass: x"),
+            Some("two-phase-annotate-skipped")
         );
     }
 
