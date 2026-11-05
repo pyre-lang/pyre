@@ -4715,26 +4715,26 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             // An integer names its second exactly, so it is read as one
             // rather than through a float that would round the seconds it is
             // too wide to hold.
-            if unsafe { pyre_object::is_int_or_long(v) } {
+            if unsafe { pyre_object::is_int_or_long(v) }
+                || unsafe { crate::baseobjspace::lookup(v, "__index__") }.is_some()
+            {
                 let sec = crate::builtins::space_index_w(v).map_err(|_| time_t_overflow())?;
                 return Ok(UTime { sec, nsec: 0 });
             }
-            // Everything else has to name a float. What cannot is not a time
-            // at all, and is refused by type: `utime(p, ('a', 'b'))` names the
-            // type it was given rather than reporting a failed float parse.
-            let f = pyre_object::with_roots!(v => crate::builtins::builtin_float(&[v])).map_err(
-                |err| {
+            // [3.15-spec] `pytime_object_to_denominator`: `PyIndex_Check`
+            // then `PyFloat_AsDouble` (`float_w`), not the `float()`
+            // constructor. A str is `must be real number, not str`; a
+            // `__float__` object is accepted. PyPy `convert_seconds` uses
+            // `space.int_w` unless the value is a float. Measured on
+            // python3.15t.
+            let secs =
+                pyre_object::with_roots!(v => crate::baseobjspace::float_w(v)).map_err(|err| {
                     if err.kind == crate::PyErrorKind::OverflowError {
                         time_t_overflow()
                     } else {
-                        crate::PyError::type_error(format!(
-                            "argument must be int or float, not {}",
-                            crate::type_methods::arg_type_name(v)
-                        ))
+                        err
                     }
-                },
-            )?;
-            let secs = unsafe { pyre_object::w_float_get_value(f) };
+                })?;
             // A NaN has no floor to take, and it is the one non-finite value
             // answered by value rather than by range.
             if secs.is_nan() {
