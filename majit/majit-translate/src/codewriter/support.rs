@@ -52,11 +52,18 @@
 //! mirror of upstream's `_obj.<callable>.oopspec` access: same
 //! information, different host vehicle.
 
+#[cfg(test)]
+use std::collections::{HashMap, HashSet};
+
 use crate::codewriter::call::CallControl;
 use crate::codewriter::jtransform::{JitMarkerKey, jit_marker_key_from_target};
 use crate::codewriter::strfind::specialized_helper_leaf;
 use crate::codewriter::type_state::ConcreteType;
 use crate::flowspace::model::Variable;
+#[cfg(test)]
+use crate::inline::{op_variable_refs, remap_op_kind};
+#[cfg(test)]
+use crate::model::CallTarget;
 use crate::model::{BlockId, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 use crate::parse::CallPath;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
@@ -264,6 +271,366 @@ pub(crate) fn rewrite_jit_merge_point(
         },
     });
     graph.set_return(block, result);
+}
+
+/// Origportal-for-EvalFn: rewrite the registered-override graph so a
+/// no-resume call of `(frame, None)` is a `direct_call` of
+/// `portal_runner_ptr` with greens/reds read off dest's frame formal.
+///
+/// Same shape as `rewrite_jit_merge_point`, applied to the EvalFn graph
+/// callers invoke. Identified by `discover_eval_override_graphs` (the
+/// registrar's `FnDef` argument), not a function path. The process-eval
+/// driver is the spec with a portal runner, a `"frame"` virtualizable,
+/// and a `"frame"` red.
+///
+/// The portal's rewritten origportal keeps the loop-header prefix that
+/// produces the marker args (GC reload, ticker). Copying that body onto
+/// EvalFn makes `bytecode_for_address(eval_with_jit)` a looped helper
+/// walk. This pass keeps dest's formals and clones only the producers of
+/// the portal_runner arguments, with the red frame substituted by dest's
+/// frame formal.
+///
+/// Production skips this rewrite: a slim stub hits `assembler.rs`
+/// `fielddescrof` (`Cow<str>::Owned.__pos_0` on a discriminant-only layout)
+/// once the inliner walks cloned producers. The unit test still calls it.
+#[cfg(test)]
+pub(crate) fn rewrite_eval_override_graphs(
+    call_control: &mut CallControl,
+    specs: &[crate::pipeline::JitDriverSpec],
+) {
+    let overrides = call_control.eval_override_graphs().to_vec();
+    if overrides.is_empty() {
+        return;
+    }
+    let Some(spec) = specs.iter().find(|spec| {
+        spec.split_portal
+            && spec.portal_runner.is_some()
+            && spec.virtualizables.iter().any(|name| name == "frame")
+            && spec.reds.iter().any(|name| name == "frame")
+    }) else {
+        return;
+    };
+    let Some(runner) = spec.portal_runner.as_ref() else {
+        return;
+    };
+    let Some(original) = call_control.function_graphs().get(&spec.portal) else {
+        return;
+    };
+    let calls_runner = original.blocks.iter().any(|block| {
+        block
+            .operations
+            .iter()
+            .any(|op| call_target_is_portal_runner(&op.kind, runner))
+    });
+    if !calls_runner {
+        return;
+    }
+    let origportal = crate::model::copygraph(&original);
+    drop(original);
+    let mut rewritten = Vec::new();
+    for path in &overrides {
+        if path == &spec.portal {
+            continue;
+        }
+        let Some(dest) = call_control.function_graphs_mut().get_mut(path) else {
+            continue;
+        };
+        rewrite_eval_override_graph(dest, &origportal, runner, spec.greens.len());
+        rewritten.push(path.clone());
+    }
+    for path in rewritten {
+        call_control.register_helper_graph(path);
+    }
+}
+
+#[cfg(test)]
+fn call_target_is_portal_runner(kind: &OpKind, runner: &CallPath) -> bool {
+    match kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => {
+            segments == &runner.segments
+                || (runner.segments.len() >= 2 && segments.ends_with(runner.segments.as_slice()))
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+fn find_portal_runner_call(
+    graph: &FunctionGraph,
+    runner: &CallPath,
+) -> Option<(CallTarget, Vec<LinkArg>, ValueType)> {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if call_target_is_portal_runner(&op.kind, runner)
+                && let OpKind::Call {
+                    target,
+                    args,
+                    result_ty,
+                } = &op.kind
+            {
+                return Some((target.clone(), args.clone(), result_ty.clone()));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+fn defining_op<'a>(graph: &'a FunctionGraph, var: &Variable) -> Option<&'a SpaceOperation> {
+    graph.blocks.iter().find_map(|block| {
+        block
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(var))
+    })
+}
+
+#[cfg(test)]
+fn unique_phi_source(graph: &FunctionGraph, var: &Variable) -> Option<Variable> {
+    let mut sources: Vec<Variable> = Vec::new();
+    for block in &graph.blocks {
+        let Some(index) = block.inputargs.iter().position(|input| input == var) else {
+            continue;
+        };
+        for pred in &graph.blocks {
+            for exit in &pred.exits {
+                if exit.target != block.id {
+                    continue;
+                }
+                if let Some(LinkArg::Value(src)) = exit.args.get(index)
+                    && src != var
+                    && !sources.iter().any(|seen| seen == src)
+                {
+                    sources.push(src.clone());
+                }
+            }
+        }
+    }
+    (sources.len() == 1).then(|| sources.pop().unwrap())
+}
+
+#[cfg(test)]
+fn kind_is_linear_producer(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::ConstInt(_)
+            | OpKind::ConstUInt(_)
+            | OpKind::ConstBool(_)
+            | OpKind::ConstFloat(_)
+            | OpKind::ConstRef(_)
+            | OpKind::ConstRefNull
+            | OpKind::ConstNone
+            | OpKind::ConstRefAddr(_)
+            | OpKind::ConstFnAddr { .. }
+            | OpKind::ConstStr(_)
+            | OpKind::ConstInternedStr(_)
+            | OpKind::FieldRead { .. }
+            | OpKind::Call { .. }
+            | OpKind::UnaryOp { .. }
+            | OpKind::BinOp { .. }
+    )
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable Variable identity; concretetype/name cells do not participate"
+)]
+fn materialize_portal_arg(
+    dest: &mut FunctionGraph,
+    orig: &FunctionGraph,
+    var: &Variable,
+    map: &mut HashMap<Variable, Variable>,
+    frame_vars: &HashSet<Variable>,
+    dest_frame: &Variable,
+    dest_block: BlockId,
+    depth: usize,
+) -> Option<Variable> {
+    if let Some(mapped) = map.get(var) {
+        return Some(mapped.clone());
+    }
+    if frame_vars.contains(var) {
+        map.insert(var.clone(), dest_frame.clone());
+        return Some(dest_frame.clone());
+    }
+    if depth > 32 {
+        return None;
+    }
+    if let Some(op) = defining_op(orig, var) {
+        if matches!(op.kind, OpKind::Input { .. }) {
+            map.insert(var.clone(), dest_frame.clone());
+            return Some(dest_frame.clone());
+        }
+        if !kind_is_linear_producer(&op.kind) {
+            return None;
+        }
+        if let OpKind::FieldRead { base, .. } = &op.kind {
+            // Greens/reds are fields of dest's frame. Nested enum
+            // payloads (`Cow::Owned.__pos_0`) are not portal args;
+            // cloning them panics `fielddescrof` (layout is discriminant-only).
+            let mapped_base = materialize_portal_arg(
+                dest,
+                orig,
+                base,
+                map,
+                frame_vars,
+                dest_frame,
+                dest_block,
+                depth + 1,
+            )?;
+            if &mapped_base != dest_frame {
+                return None;
+            }
+        } else {
+            for operand in op_variable_refs(&op.kind) {
+                materialize_portal_arg(
+                    dest,
+                    orig,
+                    &operand,
+                    map,
+                    frame_vars,
+                    dest_frame,
+                    dest_block,
+                    depth + 1,
+                )?;
+            }
+        }
+        let remap =
+            |operand: &Variable| map.get(operand).cloned().unwrap_or_else(|| operand.clone());
+        let kind = remap_op_kind(&op.kind, &remap);
+        let result = dest.alloc_value_var_with_type(FunctionGraph::concretetype_of(var));
+        result.set_concretetype(var.concretetype());
+        dest.push_op_with_result_var(dest_block, kind, result.clone());
+        map.insert(var.clone(), result.clone());
+        return Some(result);
+    }
+    if let Some(src) = unique_phi_source(orig, var) {
+        let mapped = materialize_portal_arg(
+            dest,
+            orig,
+            &src,
+            map,
+            frame_vars,
+            dest_frame,
+            dest_block,
+            depth + 1,
+        )?;
+        map.insert(var.clone(), mapped.clone());
+        return Some(mapped);
+    }
+    None
+}
+
+/// Keep `dest`'s identity and startblock formals. Emit greens/reds from
+/// dest's frame, then `direct_call` of `portal_runner` (`rewrite_jit_merge_point`
+/// applied to the EvalFn graph).
+#[cfg(test)]
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable Variable identity; concretetype/name cells do not participate"
+)]
+pub(crate) fn rewrite_eval_override_graph(
+    dest: &mut FunctionGraph,
+    origportal: &FunctionGraph,
+    runner: &CallPath,
+    numgreens: usize,
+) {
+    let Some((target, runner_args, result_ty)) = find_portal_runner_call(origportal, runner) else {
+        return;
+    };
+    let dest_inputs = dest.block(dest.startblock).inputargs.clone();
+    let dest_input_ops: Vec<SpaceOperation> = dest
+        .block(dest.startblock)
+        .operations
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::Input { .. }))
+        .cloned()
+        .collect();
+    let Some(dest_frame) = dest_inputs.first().cloned() else {
+        return;
+    };
+
+    let mut frame_vars: HashSet<Variable> = HashSet::new();
+    if let Some(orig_frame) = origportal.block(origportal.startblock).inputargs.first() {
+        frame_vars.insert(orig_frame.clone());
+    }
+    let runner_vars = crate::model::call_arg_vars(&runner_args);
+    if let Some(frame_red) = runner_vars.get(numgreens) {
+        frame_vars.insert(frame_red.clone());
+    }
+
+    let mut stub = FunctionGraph::new(dest.name.clone());
+    stub.source_identity = dest.source_identity.clone();
+    stub.fun_decl_id = dest.fun_decl_id;
+    stub.owner_root = dest.owner_root.clone();
+    stub.notes = dest.notes.clone();
+    stub.return_type = dest.return_type.clone();
+    stub.return_class_root = dest.return_class_root.clone();
+    stub.return_can_be_none = dest.return_can_be_none;
+    stub.return_is_str = dest.return_is_str;
+    stub.return_container_root = dest.return_container_root.clone();
+    stub.residual_return_type = dest.residual_return_type.clone();
+    stub.hints = dest.hints.clone();
+    stub.specialization = dest.specialization;
+    // Keep `FunctionGraph::new`'s `access_directly = false` and empty
+    // `access_directly_inputs`. Copying dest's flags would hint
+    // dest_frame and mint an AccessDirect cachedgraph of
+    // portal_runner_ptr, which is outside `jit_graphs`.
+    stub.return_flags = dest.return_flags;
+    stub.func = dest.func.clone();
+    stub.block_mut(stub.startblock).inputargs = dest_inputs;
+    stub.block_mut(stub.startblock).operations = dest_input_ops;
+
+    let dest_block = stub.startblock;
+    let mut map: HashMap<Variable, Variable> = HashMap::new();
+    for frame_var in &frame_vars {
+        map.insert(frame_var.clone(), dest_frame.clone());
+    }
+
+    let mut call_args: Vec<Variable> = Vec::with_capacity(runner_vars.len());
+    for arg in &runner_vars {
+        let Some(mapped) = materialize_portal_arg(
+            &mut stub,
+            origportal,
+            arg,
+            &mut map,
+            &frame_vars,
+            &dest_frame,
+            dest_block,
+            0,
+        ) else {
+            return;
+        };
+        call_args.push(mapped);
+    }
+
+    let result = if matches!(result_ty, ValueType::Void) {
+        None
+    } else {
+        let ty = match result_ty {
+            ValueType::Int | ValueType::Unsigned | ValueType::Bool => ConcreteType::Signed,
+            ValueType::Float => ConcreteType::Float,
+            _ => ConcreteType::GcRef,
+        };
+        Some(stub.alloc_value_var_with_type(ty))
+    };
+    stub.block_mut(dest_block).operations.push(SpaceOperation {
+        result: result.clone(),
+        kind: OpKind::Call {
+            target,
+            args: crate::model::call_args(call_args),
+            result_ty,
+        },
+    });
+    stub.set_return(dest_block, result);
+    stub.project_policy_hints();
+    if !stub.func.unroll_safe {
+        stub.push_hint("unroll_safe");
+    }
+    *dest = stub;
 }
 
 /// The split portal's start block is a fresh parameter list (the

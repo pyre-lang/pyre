@@ -31659,7 +31659,8 @@ fn rutf8_codepoint_at_pos_lowers_byte_reads_to_ord() {
 
 /// `PyError(ptr)` is the payload pointer. Construction peels to that
 /// word; `retag_error_carrier` recasts once to the handle class
-/// (`error::PyError`). No FieldWrite / synthetic ctor.
+/// (`error::PyError`). No FieldWrite / synthetic ctor / malloc of
+/// `__pos_0`.
 #[test]
 fn pyerror_ptr_ctor_emits_one_cast_instance() {
     let py_ptr = interior_raw_mut(interior_adt(0));
@@ -31749,6 +31750,30 @@ fn pyerror_ptr_ctor_emits_one_cast_instance() {
         .iter()
         .filter_map(|op| crate::model::cast_instance_root(&op.kind))
         .collect();
+    let allocates_shell =
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| match &op.kind {
+                crate::model::OpKind::New { owner }
+                | crate::model::OpKind::NewWithVtable { owner, .. } => {
+                    owner.contains("PyError") && !owner.contains("PyErrorObject")
+                }
+                crate::model::OpKind::Call {
+                    target:
+                        crate::model::CallTarget::SyntheticTransparentCtor {
+                            name, is_struct, ..
+                        },
+                    ..
+                } => *is_struct && name.contains("PyError") && !name.contains("PyErrorObject"),
+                _ => false,
+            });
+    assert!(
+        !allocates_shell,
+        "PyError(ptr) is the operand word, not a malloc of __pos_0; graph={}",
+        graph.dump()
+    );
     assert_eq!(
         roots,
         ["error::PyError"],

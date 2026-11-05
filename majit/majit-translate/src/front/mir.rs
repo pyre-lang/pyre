@@ -8984,7 +8984,7 @@ pub(crate) use self::consteval::{
 };
 pub use self::desugar::callee::discover_fnptr_field_families;
 pub(crate) use self::desugar::callee::{
-    discover_eval_hook_graphs, discover_profilefunc_graphs, discover_profilefunc_spellings,
+    discover_eval_hook_graphs, discover_eval_override_graphs, discover_profilefunc_graphs, discover_profilefunc_spellings,
     fnptr_field_family_member_fn_ids, fnptr_field_under_use, fnptr_struct_field_target,
     release_declared_vable_array_address, vtable_slot_under_fn_ptr_cast,
 };

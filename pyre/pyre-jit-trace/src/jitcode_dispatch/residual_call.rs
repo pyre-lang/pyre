@@ -624,7 +624,9 @@ impl MirrorStackImage {
 /// One FBW abort frame: jitcode/pc on the MIFrame, typed `setarg_*` words
 /// on the banks. `_copy_data_from_miframe` (`blackhole.py`) reads
 /// `box.getint()` / `getref_base()` / `getfloatstorage()`; these banks
-/// are those raw words. The MIFrame register slots stay `None`.
+/// are those raw words when a colour has a concrete. A virtual/symbolic
+/// box stays in the MIFrame register and is materialized when the
+/// blackhole/resume image is built.
 pub(crate) struct AbortHandoffFrame {
     pub(crate) miframe: majit_metainterp::MIFrame,
     pub(crate) banks: majit_metainterp::BlackholeAbortBanks,
@@ -819,7 +821,7 @@ pub(crate) fn publish_latched_abort_framestack(ctx: &mut majit_metainterp::Trace
     if ctx.aborted_framestack.is_some() {
         return true;
     }
-    let Some(image) = take_latched_abort_framestack() else {
+    let Some(mut image) = take_latched_abort_framestack() else {
         return false;
     };
     ctx.aborted_walk = Some(majit_metainterp::AbortedWalkImage {
@@ -827,6 +829,14 @@ pub(crate) fn publish_latched_abort_framestack(ctx: &mut majit_metainterp::Trace
         last_exc_value: image.last_exc_value,
         raising_exception: image.raising_exception,
     });
+    for frame in image.framestack.frames.iter_mut() {
+        // A live colour with no bank word is the virtual box
+        // `fill_abort_miframe_register_banks` kept. Stamp `box_bits` onto
+        // Const boxes so `_copy_data_from_miframe` / `getref_base` read the
+        // word after the recorder is dropped, the same freeze
+        // `abort_trace` applies to a guard's resume image.
+        frame.freeze_values_into_const_boxes(ctx);
+    }
     ctx.aborted_framestack = Some(image.framestack);
     true
 }
@@ -1372,10 +1382,11 @@ fn build_paused_portal_miframe<Sym: WalkSym>(
         crate::state::pyjitcode_for_jitcode_index(index)
             .and_then(|pjc| parent_call_result_color(&pjc, pc))
     });
-    let miframe = mint_abort_handoff_miframe(jitcode, resume_pc);
+    let mut miframe = mint_abort_handoff_miframe(jitcode, resume_pc);
     let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
     fill_abort_miframe_register_banks(
         ctx.trace_ctx,
+        &mut miframe,
         &mut banks,
         &paused.registers_i,
         &paused.registers_r,
@@ -1438,10 +1449,11 @@ pub(crate) fn build_helper_parent_miframe(
     if !instruction_starts_at(&jitcode, resume_pc) {
         return None;
     }
-    let miframe = mint_abort_handoff_miframe(jitcode, resume_pc);
+    let mut miframe = mint_abort_handoff_miframe(jitcode, resume_pc);
     let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
     fill_abort_miframe_register_banks(
         trace_ctx,
+        &mut miframe,
         &mut banks,
         registers_i,
         registers_r,
@@ -2432,9 +2444,9 @@ pub(crate) fn build_trace_too_long_single_frame_miframe<Sym: WalkSym>(
         }
         return None;
     }
-    let miframe = mint_abort_handoff_miframe(jitcode, resume_pc);
+    let mut miframe = mint_abort_handoff_miframe(jitcode, resume_pc);
     let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
-    fill_trace_too_long_register_banks(ctx, &mut banks)
+    fill_trace_too_long_register_banks(ctx, &mut miframe, &mut banks)
         .then_some(AbortHandoffFrame { miframe, banks })
 }
 
@@ -2478,13 +2490,16 @@ fn instruction_starts_at(jitcode: &majit_metainterp::jitcode::JitCode, pc: usize
 /// colour with no box is not copied: that is how a dead colour kept an
 /// already-materialized `W_ListObject` in the slot `newlist_from_array`
 /// reads as an array length. A colour that has a box but no concrete
-/// refuses the frame.
+/// keeps that box on the MIFrame; the blackhole/resume image materializes
+/// it the same way a guard's resume data carries virtuals.
 fn fill_trace_too_long_register_banks<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
+    miframe: &mut majit_metainterp::MIFrame,
     banks: &mut majit_metainterp::BlackholeAbortBanks,
 ) -> bool {
     fill_abort_miframe_register_banks(
         ctx.trace_ctx,
+        miframe,
         banks,
         ctx.registers_i,
         ctx.registers_r,
@@ -2501,8 +2516,14 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
 /// (`_copy_data_from_miframe` walks `range(num_regs_i/r/f())`).
 /// `skip_result` is the dest of a CALL this paused parent sits on:
 /// `_setup_return_value_*` writes that color when the callee finishes.
+/// A colour with a box but no concrete stays that box on the MIFrame;
+/// `freeze_values_into_const_boxes` / `copy_data_from_abort_banks`
+/// materialize `getint` / `getref_base` / `getfloatstorage` when the
+/// blackhole/resume image is built (`capture_resumedata` carries
+/// virtuals the same way).
 fn fill_abort_miframe_register_banks(
     trace_ctx: &TraceCtx,
+    miframe: &mut majit_metainterp::MIFrame,
     banks: &mut majit_metainterp::BlackholeAbortBanks,
     registers_i: &RegisterBank,
     registers_r: &RegisterBank,
@@ -2518,6 +2539,13 @@ fn fill_abort_miframe_register_banks(
         ($($a:tt)*) => {
             if fbw_debug_abort_enabled() {
                 eprintln!("[s2-fill-decline] {}", format!($($a)*));
+            }
+        };
+    }
+    macro_rules! s2keep {
+        ($($a:tt)*) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[s2-fill-virtual] {}", format!($($a)*));
             }
         };
     }
@@ -2544,11 +2572,18 @@ fn fill_abort_miframe_register_banks(
             banks.registers_i[color] = Some(value);
             continue;
         }
-        let Some(majit_ir::Value::Int(value)) = trace_ctx.concrete_of_opref(opref) else {
-            s2dbg!("int color={color} opref={opref:?} has no concrete");
+        if let Some(majit_ir::Value::Int(value)) = trace_ctx.concrete_of_opref(opref) {
+            banks.registers_i[color] = Some(value);
+            continue;
+        }
+        s2keep!(
+            "int color={color} opref={opref:?} opcode={:?}",
+            trace_ctx.opcode_of(opref)
+        );
+        if !keep_virtual_abort_box(&mut miframe.int_regs, color, opref) {
+            s2dbg!("int color={color} opref={opref:?} virtual slot missing");
             return false;
-        };
-        banks.registers_i[color] = Some(value);
+        }
     }
 
     for color in 0..banks.registers_r.len() {
@@ -2589,8 +2624,14 @@ fn fill_abort_miframe_register_banks(
             let live = pin.as_ref().map_or(value as usize, |p| p.get().0);
             banks.registers_r[color] = Some(live as i64);
         } else {
-            s2dbg!("ref color={color} opref={opref:?} has no concrete");
-            return false;
+            s2keep!(
+                "ref color={color} opref={opref:?} opcode={:?}",
+                trace_ctx.opcode_of(opref)
+            );
+            if !keep_virtual_abort_box(&mut miframe.ref_regs, color, opref) {
+                s2dbg!("ref color={color} opref={opref:?} virtual slot missing");
+                return false;
+            }
         }
     }
 
@@ -2607,12 +2648,31 @@ fn fill_abort_miframe_register_banks(
         if opref == OpRef::NONE {
             continue;
         }
-        let Some(majit_ir::Value::Float(value)) = trace_ctx.concrete_of_opref(opref) else {
-            s2dbg!("float color={color} opref={opref:?} has no concrete");
+        if let Some(majit_ir::Value::Float(value)) = trace_ctx.concrete_of_opref(opref) {
+            banks.registers_f[color] = Some(value.to_bits() as i64);
+            continue;
+        }
+        s2keep!(
+            "float color={color} opref={opref:?} opcode={:?}",
+            trace_ctx.opcode_of(opref)
+        );
+        if !keep_virtual_abort_box(&mut miframe.float_regs, color, opref) {
+            s2dbg!("float color={color} opref={opref:?} virtual slot missing");
             return false;
-        };
-        banks.registers_f[color] = Some(value.to_bits() as i64);
+        }
     }
+    true
+}
+
+/// Park a virtual/symbolic box on the abort MIFrame.
+///
+/// `_copy_data_from_miframe` copies every non-None box; `getint` /
+/// `getref_base` / `getfloatstorage` on an unstamped FrontendOp is 0.
+fn keep_virtual_abort_box(regs: &mut [Option<OpRef>], color: usize, opref: OpRef) -> bool {
+    let Some(slot) = regs.get_mut(color) else {
+        return false;
+    };
+    *slot = Some(opref);
     true
 }
 
@@ -3262,92 +3322,23 @@ fn build_parent_miframe_from_live_banks<Sym: WalkSym>(
     let result = parent
         .call_jitcode_pc
         .and_then(|pc| parent_call_result_color(pjc, pc));
-    let miframe = mint_abort_handoff_miframe(pjc.jitcode.clone(), resume_pc);
+    let mut miframe = mint_abort_handoff_miframe(pjc.jitcode.clone(), resume_pc);
     let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
-    for color in 0..banks.registers_i.len() {
-        if result == Some(('i', color)) {
-            continue;
+    if !fill_abort_miframe_register_banks(
+        ctx.trace_ctx,
+        &mut miframe,
+        &mut banks,
+        registers_i,
+        registers_r,
+        registers_f,
+        &[],
+        frame_state,
+        result,
+    ) {
+        if fbw_debug_abort_enabled() {
+            eprintln!("[s2-build-decline] origin={origin} frame {index}: live banks fill declined");
         }
-        let Some(opref) = registers_i.get(color) else {
-            continue;
-        };
-        if opref == OpRef::NONE {
-            continue;
-        }
-        let Some(majit_ir::Value::Int(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
-            if fbw_debug_abort_enabled() {
-                eprintln!(
-                    "[s2-build-decline] origin={origin} frame {index}: live int color \
-                     {color} opref={opref:?} has no concrete"
-                );
-            }
-            return None;
-        };
-        banks.registers_i[color] = Some(value);
-    }
-    for color in 0..banks.registers_r.len() {
-        if result == Some(('r', color)) {
-            continue;
-        }
-        let Some(opref) = registers_r.get(color) else {
-            continue;
-        };
-        if opref.is_none() {
-            continue;
-        }
-        let from_shadow = {
-            let borrowed = frame_state.borrow();
-            borrowed
-                .concrete_registers_r
-                .get(color)
-                .copied()
-                .and_then(|value| match value {
-                    ConcreteValue::Ref(value) => Some(value as i64),
-                    _ => None,
-                })
-        };
-        let forwarded = match ctx
-            .trace_ctx
-            .lookup_opref_concrete(opref)
-            .or_else(|| ctx.trace_ctx.recover_ref_value(opref, 8))
-        {
-            Some(majit_ir::Value::Ref(gc)) => Some(gc.0 as i64),
-            _ => None,
-        };
-        if let Some(value) = forwarded.or(from_shadow) {
-            let pin = owner_root_if_gc(value as usize);
-            let live = pin.as_ref().map_or(value as usize, |p| p.get().0);
-            banks.registers_r[color] = Some(live as i64);
-        } else {
-            if fbw_debug_abort_enabled() {
-                eprintln!(
-                    "[s2-build-decline] origin={origin} frame {index}: live ref color \
-                     {color} opref={opref:?} has no concrete"
-                );
-            }
-            return None;
-        }
-    }
-    for color in 0..banks.registers_f.len() {
-        if result == Some(('f', color)) {
-            continue;
-        }
-        let Some(opref) = registers_f.get(color) else {
-            continue;
-        };
-        if opref == OpRef::NONE {
-            continue;
-        }
-        let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
-            if fbw_debug_abort_enabled() {
-                eprintln!(
-                    "[s2-build-decline] origin={origin} frame {index}: live float color \
-                     {color} opref={opref:?} has no concrete"
-                );
-            }
-            return None;
-        };
-        banks.registers_f[color] = Some(value.to_bits() as i64);
+        return None;
     }
     Some(AbortHandoffFrame { miframe, banks })
 }
@@ -4930,8 +4921,7 @@ pub(crate) fn mayforce_null_ref_arg_is_checked_sentinel(
 ///
 /// A plain `dont_look_inside*` body has no `RuntimeHelperKind`, so the table
 /// above cannot name it and the funcptr is the only coordinate the call
-/// carries; resolve it against the published registry the way
-/// `records_inside_transparent_helper` does.
+/// carries; resolve it against the published registry.
 fn null_ref_sentinel_of_registered_leaf(target: i64, arg_index: usize, nargs: usize) -> bool {
     if target <= 0 {
         return false;
@@ -5116,43 +5106,6 @@ fn residual_callable_has_closure_or_cells<Sym: WalkSym>(
         let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef);
         !raw.is_null() && pyre_interpreter::ncells(&*raw) != 0
     }
-}
-
-/// `dont_look_inside_cannot_raise` helpers whose descr stays
-/// `EF_RANDOM_EFFECTS`. Recording the call inside a transparent helper
-/// is sound: they do not call Python, so `GUARD_NOT_FORCED` does not fail.
-/// `module_spec_get_initializing` answers `-1` instead of running `__eq__`,
-/// `__get__`, or `__bool__`. `bootstrap_handle_fromlist` and
-/// `default_importlib_import_word` are the same kind of lookup: a miss is
-/// null, and neither calls `_handle_fromlist`.
-fn records_inside_transparent_helper(addr: i64) -> bool {
-    if addr <= 0 {
-        return false;
-    }
-    pyre_interpreter::jit_trace_fnaddrs()
-        .iter()
-        .any(|(path, registered)| *registered == addr && transparent_helper_recordable_leaf(path))
-}
-
-fn transparent_helper_recordable_leaf(path: &str) -> bool {
-    path.rsplit("::").next().is_some_and(|leaf| {
-        let leaf = leaf.strip_prefix("__majit_call_target_").unwrap_or(leaf);
-        matches!(
-            leaf,
-            "tuple_from_exact_list"
-                | "dict_get_plain"
-                | "exc_init_one_positional"
-                | "value_error_one_arg"
-                | "extend_from_frame_locals_proxy"
-                | "proxy_list_new"
-                | "proxy_list_append"
-                | "append_extra_locals"
-                | "append_extra_locals_items"
-                | "module_spec_get_initializing"
-                | "bootstrap_handle_fromlist"
-                | "default_importlib_import_word"
-        )
-    })
 }
 
 /// `jit_portal_call_3` is `space.call_method` (`baseobjspace.py`) as five
@@ -5511,6 +5464,39 @@ pub(crate) fn portal_entry_for_funcptr(addr: i64) -> bool {
     addr != 0 && addr == pyre_interpreter::call::current_eval_fn_addr() as i64
 }
 
+/// Process-evaluator identity of a residual funcbox (`current_eval_fn_addr`).
+///
+/// Regular-indirect `int_guard_value` may skip when the CallPure result of
+/// `current_eval_fn_addr` is a known Int that is not yet a Const
+/// (`guard_value_record` reads `concrete_registers_i`, which can be Null
+/// while `box_value` already holds the address). Identify by the live
+/// bits (`Int` or `Ref`) so the walker never `execute_varargs`s EvalFn.
+fn process_evaluator_addr_of<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    funcbox: OpRef,
+) -> Option<i64> {
+    let bits = ctx.trace_ctx.box_bits(funcbox)?;
+    portal_entry_for_funcptr(bits).then_some(bits)
+}
+
+/// Regular-indirect promote: `GUARD_VALUE` then `replace_box` to ConstInt.
+fn promote_process_evaluator_funcbox<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    funcbox: OpRef,
+    addr: i64,
+    op_pc: usize,
+) -> Result<OpRef, DispatchError> {
+    if funcbox.is_constant() {
+        return Ok(funcbox);
+    }
+    let expected = ctx.trace_ctx.const_int(addr);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[funcbox, expected]);
+    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    super::vable_ops::walker_replace_box(ctx, funcbox, expected);
+    Ok(expected)
+}
+
 /// `executor.execute_varargs` for one residual, then the caller's
 /// `record_after_execute` hook.
 ///
@@ -5538,9 +5524,9 @@ pub(crate) enum AssemblerContinuationEscape {
 /// `OrthodoxSubWalkTraceUnsupported` before executing the call.
 pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
-    call_opcode: OpCode,
+    _call_opcode: OpCode,
     allboxes: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
+    _call_descr: &dyn majit_ir::descr::CallDescr,
 ) -> Option<(&'static str, i64, i64)> {
     // Orthodox sub-jitcode walk safety (#171 wall-5d): a residual call whose
     // funcbox is NULL or a `symbolic_fnaddr` placeholder — a 64-bit `DefaultHasher`
@@ -5566,15 +5552,12 @@ pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
     // with such a parameter, so the descent declines before running one and
     // the interpreter makes the call with the argument whole.
     //
-    // A may-force residual inside a transparent helper is declined for the
-    // resume it would need.  Its GUARD_NOT_FORCED and GUARD_NO_EXCEPTION fail
-    // after the Python code it called back into has run: a callback that
-    // raises forces the caller's frame vref on `leave`, and so does one that
-    // escapes its frame.  `capture_resumedata` resumes such a guard inside the
-    // helper's own frame, past the call.  A transparent helper has no frame of
-    // its own, so its guards resume at the Python CALL that entered it, and
-    // the CALL runs the callback a second time -- or, with the exception still
-    // pending at that coordinate, lets it past the CALL's handler.
+    // A may-force residual inside a transparent helper records like any
+    // other residual (`do_residual_call`: `CALL_MAY_FORCE_*`, then
+    // `GUARD_NOT_FORCED` / the exception guard). `capture_resumedata`
+    // snapshots every `MIFrame`, and a helper walk is its own frame
+    // (`helper_subwalk_level` / `compute_inline_caller_frame`), so those
+    // guards resume inside the helper plus its callers.
     if ctx.fbw_mode.inline_subwalk
         && allboxes.first().is_some_and(|b| b.is_constant())
         && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
@@ -5587,34 +5570,119 @@ pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
             // A real funcptr reached here, so there is no hash to carry, and
             // zero is what this variant spells for that.
             Some(("abi-unsound-arg", addr, 0))
-        } else if ctx.fbw_mode.transparent_helper_subwalk
-            && call_opcode.is_call_may_force()
-            && !records_inside_transparent_helper(addr)
-            && !pyre_interpreter::is_rewindable_root_bracket_residual(addr as usize)
-            && !call_descr.get_extra_info().is_call_release_gil()
-            // `pyjitpl.py direct_libffi_call` executes `jit_ffi_call_impl_*`
-            // and records `call_release_gil`. The helper is
-            // `dont_look_inside` and does not re-enter Python; the forces
-            // guard belongs to the recorded release-gil op.
-            && call_descr.get_extra_info().oopspecindex != majit_ir::OopSpecIndex::LibffiCall
-        {
-            // These helpers are `dont_look_inside_cannot_raise`. Their
-            // call descr is still `EF_RANDOM_EFFECTS` because the graph
-            // is top, so the opcode is may-force. They do not call back
-            // into Python, so the guard the comment above is about does
-            // not fail and the call can be recorded.
-            // `do_residual_call` runs `executor.execute_varargs` on
-            // `call_external_function` (`ccall_*`), then
-            // `direct_call_release_gil` records `CALL_RELEASE_GIL_*`
-            // (`history.record_nospec`). The wrapper releases the GIL around
-            // the C call, so it does not re-enter Python and
-            // `GUARD_NOT_FORCED` cannot fail for a callback.
-            Some(("may-force-in-transparent-helper", addr, 0))
         } else {
             None
         }
     } else {
         None
+    }
+}
+
+/// Rebuild portal greens/reds from the helper-ABI EvalFn residual and
+/// enter `_opimpl_recursive_call` / `do_recursive_call`.
+///
+/// `get_eval_fn()(frame, None)` is not the portal runner. `execute_varargs`
+/// of that pointer under `residual_call_r_r` returns the frame. Force the
+/// virtualizable, take `allboxes[1]` as the live `PyFrame`, and record
+/// `CALL_ASSEMBLER` / inline of `jd.portal_runner_adr` with portal ABI.
+fn try_eval_fn_residual_as_recursive_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    allboxes: &[OpRef],
+    op_pc: usize,
+    blackhole_result: Option<(usize, char, usize)>,
+) -> Result<Option<ResidualExecOutcome>, DispatchError> {
+    let Some((frame_box, frame)) = super::inline_call::existing_eval_frame_arg(ctx, allboxes)
+    else {
+        return Ok(None);
+    };
+    let w_code = unsafe { (*frame).pycode };
+    if w_code.is_null() {
+        return Ok(None);
+    }
+    let is_being_profiled = unsafe { (*frame).get_is_being_profiled() };
+    let next_instr = unsafe { (*frame).next_instr() };
+    let next_instr_box = ctx.trace_ctx.const_int(next_instr as i64);
+    let profiled_box = ctx.trace_ctx.const_int(i64::from(is_being_profiled));
+    let pycode_box = OpRef::const_ptr(majit_ir::GcRef(w_code as usize));
+    ctx.trace_ctx.set_opref_concrete(
+        frame_box,
+        majit_ir::Value::Ref(majit_ir::GcRef(frame as usize)),
+    );
+    let mut callee_ec = {
+        let sym_ptr = ctx.fbw_mode.snapshot_sym;
+        if sym_ptr.is_null() {
+            OpRef::NONE
+        } else {
+            unsafe { (*sym_ptr).execution_context() }
+        }
+    };
+    if callee_ec.is_none() {
+        callee_ec = crate::helpers::emit_current_execution_context(
+            ctx.trace_ctx,
+            "ExecutionContext::EvalFnResidual",
+        );
+    }
+    if !matches!(
+        ctx.trace_ctx.concrete_of_opref(callee_ec),
+        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE
+    ) {
+        super::stamp_live_execution_context(ctx.trace_ctx, callee_ec);
+    }
+    let greens_i = [next_instr_box, profiled_box];
+    let greens_r = [pycode_box];
+    let greens_f: [OpRef; 0] = [];
+    let reds_i: [OpRef; 0] = [];
+    let reds_r = [frame_box, callee_ec];
+    let reds_f: [OpRef; 0] = [];
+    let next_pc = blackhole_result.map(|(n, _, _)| n).unwrap_or(op_pc);
+    let dst_bank = blackhole_result.map(|(_, b, _)| b).unwrap_or('r');
+    let dst = blackhole_result.map(|(_, _, d)| d).unwrap_or(0);
+    let op = crate::jitcode_runtime::DecodedOp {
+        key: "recursive_call_r",
+        opname: "recursive_call_r",
+        argcodes: "",
+        pc: op_pc,
+        next_pc,
+    };
+    let (outcome, _) = super::recursive_call_from_green_red_boxes(
+        ctx,
+        &op,
+        crate::state::PyreJitState::PYPYJIT_JD_INDEX,
+        dst_bank,
+        dst,
+        &greens_i,
+        &greens_r,
+        &greens_f,
+        &reds_i,
+        &reds_r,
+        &reds_f,
+    )?;
+    match outcome {
+        DispatchOutcome::Continue | DispatchOutcome::SubReturn { .. } => {
+            let word = if let Some((_, bank, color)) = blackhole_result {
+                let opref = match bank {
+                    'r' => ctx.registers_r.get(color),
+                    'i' => ctx.registers_i.get(color),
+                    'f' => ctx.registers_f.get(color),
+                    _ => None,
+                };
+                opref
+                    .map(|box_ref| super::inline_call::residual_result_word(ctx, box_ref))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            Ok(Some(ResidualExecOutcome::PortalPerformCall {
+                result: Ok(word),
+            }))
+        }
+        DispatchOutcome::SubRaise { exc, exc_concrete } => {
+            ctx.set_last_exc_value(exc, exc_concrete);
+            Ok(Some(ResidualExecOutcome::PortalPerformCall {
+                result: Err(super::inline_call::concrete_value_word(exc_concrete)),
+            }))
+        }
+        _ => Err(DispatchError::callee_inline_unsupported(op_pc)),
     }
 }
 
@@ -5672,22 +5740,46 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // (`declined_symbolic`): that leaves subsequent steps without the
     // concrete result `execute_varargs` would have produced.
 
-    if ctx.fbw_mode.inline_subwalk
-        && ctx.fbw_mode.transparent_helper_subwalk
-        && allboxes.first().is_some_and(|b| b.is_constant())
-        && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
+    if let Some(addr) = allboxes
+        .first()
+        .copied()
+        .and_then(|funcbox| process_evaluator_addr_of(ctx, funcbox))
     {
-        if portal_entry_for_funcptr(addr) {
-            match super::inline_call::perform_portal_call_from_helper(
-                ctx,
-                allboxes,
-                op_pc,
-                blackhole_result,
-            ) {
-                Ok(Some(outcome)) => return Ok(outcome),
-                Ok(None) => {}
-                Err(error) => return Err(error),
+        let mut boxed = allboxes.to_vec();
+        boxed[0] = promote_process_evaluator_funcbox(ctx, boxed[0], addr, op_pc)?;
+        let allboxes = boxed.as_slice();
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[eval-fn-residual] pc={op_pc} addr={addr:#x} const={} nboxes={}",
+                allboxes[0].is_constant(),
+                allboxes.len(),
+            );
+        }
+        maybe_walker_vable_and_vrefs_before_residual_call(ctx, op_pc);
+        match super::inline_call::perform_portal_call_from_helper(
+            ctx,
+            allboxes,
+            op_pc,
+            blackhole_result,
+        ) {
+            Ok(Some(outcome)) => return Ok(outcome),
+            Ok(None) => {}
+            Err(error) => return Err(error),
+        }
+        match try_eval_fn_residual_as_recursive_call(ctx, allboxes, op_pc, blackhole_result) {
+            Ok(Some(outcome)) => return Ok(outcome),
+            Ok(None) => {
+                if fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[eval-fn-residual] pc={op_pc} no live PyFrame after vable_and_vrefs nboxes={}",
+                        allboxes.len()
+                    );
+                }
+                // Never `execute_varargs` EvalFn. Missing helper-ABI frame is
+                // a resume-image gap, not a reason to residualize the pointer.
+                return Err(DispatchError::callee_inline_unsupported(op_pc));
             }
+            Err(error) => return Err(error),
         }
     }
     let unsupported_funcbox =
@@ -5803,6 +5895,16 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // whose 48-bit VA maps code at 0xaaab…/0xffff…).
     if func_ptr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(func_ptr) {
         return Ok(decline_symbolic_or_pure(cannot_raise_pure, call_opcode));
+    }
+    // `get_eval_fn()(frame, None)` is not the portal-runner ABI. The
+    // intercept above rebuilds greens/reds and enters `do_recursive_call`.
+    // Reaching here with that pointer would `execute_varargs` EvalFn and
+    // return the frame as the result word.
+    if portal_entry_for_funcptr(func_ptr) {
+        if fbw_debug_abort_enabled() {
+            eprintln!("[eval-fn-residual] pc={op_pc} execute_varargs of EvalFn skipped");
+        }
+        return Err(DispatchError::callee_inline_unsupported(op_pc));
     }
     // Same unsound-argument set the inline-subwalk gate consults above.
     // Top-level FBW (bridge retrace after a compiled-loop guard) used to
@@ -14109,7 +14211,7 @@ mod tests {
             "the fixture needs a live colour and a dead colour"
         );
 
-        let miframe = majit_metainterp::MIFrame::new(jitcode, 0);
+        let mut miframe = majit_metainterp::MIFrame::new(jitcode, 0);
         let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
         let live_box = OpRef::input_arg_ref(0);
         let live_ptr = pyre_object::w_none() as usize;
@@ -14128,6 +14230,7 @@ mod tests {
         assert!(
             fill_abort_miframe_register_banks(
                 &tc,
+                &mut miframe,
                 &mut banks,
                 &regs_i,
                 &regs_r,
@@ -14143,6 +14246,54 @@ mod tests {
         assert!(
             banks.registers_r[1].is_none(),
             "a non-live Ref colour with a stale concrete must stay unset"
+        );
+        assert!(
+            miframe.ref_regs[0].is_none(),
+            "a concrete colour lives on the bank, not as a virtual MIFrame box"
+        );
+    }
+
+    /// A live colour whose box has no concrete stays that box on the
+    /// MIFrame. `_copy_data_from_miframe` copies every non-None box;
+    /// declining the whole frame is not a missing-concrete path.
+    #[test]
+    fn fill_abort_miframe_keeps_a_virtual_ref_box() {
+        pyre_interpreter::module::thread::ensure_runtime_thread();
+        let mut builder = majit_metainterp::JitCodeBuilder::new();
+        builder.load_const_r_value(0, 0);
+        let jitcode = std::sync::Arc::new(builder.finish());
+        assert!(jitcode.num_regs_r() >= 1, "the fixture needs a live colour");
+
+        let mut miframe = majit_metainterp::MIFrame::new(jitcode, 0);
+        let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
+        let live_box = OpRef::input_arg_ref(0);
+        let regs_r = RegisterBank::new([live_box]);
+        let regs_i = RegisterBank::default();
+        let regs_f = RegisterBank::default();
+        let tc = TraceCtx::for_test_types(&[Type::Ref]);
+        let frame_state = WalkFrameState::new(WalkFrameStateData::default());
+        assert!(
+            fill_abort_miframe_register_banks(
+                &tc,
+                &mut miframe,
+                &mut banks,
+                &regs_i,
+                &regs_r,
+                &regs_f,
+                &[],
+                &frame_state,
+                None,
+            ),
+            "a virtual live colour must still yield an image"
+        );
+        assert!(
+            banks.registers_r[0].is_none(),
+            "a virtual colour has no concrete bank word"
+        );
+        assert_eq!(
+            miframe.ref_regs[0],
+            Some(live_box),
+            "the virtual box stays on the MIFrame"
         );
     }
 

@@ -4464,6 +4464,10 @@ pub struct CallControl {
     /// and `helper_seed_graphs`. The two-phase prepass drives these as
     /// entry graphs with declared seeds (`annrpython.py` `build_types`).
     bfs_entry_roots: Vec<CallPath>,
+    /// `register_eval_override`'s `FnDef` argument graphs. After
+    /// `rewrite_jit_merge_point`, those graphs become origportal-for-EvalFn
+    /// stubs (`direct_call` of `portal_runner_ptr`).
+    eval_override_graphs: Vec<CallPath>,
 
     /// RPython: `JitDriverStaticData` — metadata for each jitdriver.
     /// `jitdrivers_sd[i]` holds the green/red arg layout for driver i.
@@ -5418,6 +5422,7 @@ impl CallControl {
             bfs_look_inside_function: Box::new(|_| true),
             helper_seed_graphs: Vec::new(),
             bfs_entry_roots: Vec::new(),
+            eval_override_graphs: Vec::new(),
             jitdrivers_sd: Vec::new(),
             jitcodes: indexmap::IndexMap::new(),
             function_fnaddrs: HashMap::new(),
@@ -7612,6 +7617,17 @@ impl CallControl {
         self.helper_seed_graphs.push(path);
     }
 
+    /// The EvalFn-family override graphs `discover_eval_override_graphs`
+    /// harvested. Empty when this translation has no `register_eval_override`.
+    pub fn set_eval_override_graphs(&mut self, paths: Vec<CallPath>) {
+        self.eval_override_graphs = paths;
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn eval_override_graphs(&self) -> &[CallPath] {
+        &self.eval_override_graphs
+    }
+
     pub fn register_function_fnaddr(&mut self, path: CallPath, fnaddr: i64) {
         let abi = self
             .function_fnaddrs
@@ -8080,7 +8096,30 @@ impl CallControl {
     /// keeping the assignment separate mirrors that construction order and
     /// prevents graph identity from standing in for runner identity.
     pub fn set_jitdriver_portal_runner(&mut self, index: usize, runner: Option<CallPath>) {
-        self.jitdrivers_sd[index].portal_runner = runner;
+        self.jitdrivers_sd[index].portal_runner = runner.clone();
+        if let Some(runner) = runner {
+            self.stamp_portal_runner_dont_look_inside(&runner);
+        }
+    }
+
+    /// `warmspot.py helper_func` annotates `ll_portal_runner` from the FUNC
+    /// lltype (`annhelper.getgraph(func, args_s, s_result)`), so
+    /// `default_specialize` never sees the caller's `access_directly` frame.
+    /// Pyre harvests the runner as an ordinary graph; `_jit_look_inside_ =
+    /// False` is the analogue so `default_specialize` strips the flag instead
+    /// of minting an AccessDirect cachedgraph outside `jit_graphs`
+    /// (`check_access_directly_sanity`).
+    fn stamp_portal_runner_dont_look_inside(&mut self, runner: &CallPath) {
+        let mut paths = vec![runner.clone()];
+        let resolved = self.resolved_callable_path(runner);
+        if resolved != *runner {
+            paths.push(resolved);
+        }
+        for path in paths {
+            if let Some(func) = self.function_graphs.func_mut(&path) {
+                func.jit_look_inside = Some(false);
+            }
+        }
     }
 
     /// warmspot.py `jd.virtualizable_info = vinfos[VTYPEPTR]`.
@@ -8329,13 +8368,43 @@ impl CallControl {
 
     /// call.py `jitdriver_sd_from_portal_runner_ptr(funcptr)`.
     ///
+    /// `funcptr is jd.portal_runner_ptr` is function-object identity.
+    /// Harvest may spell the same funcobj with a defining-crate prefix,
+    /// and an AccessDirect cachedgraph (if one were minted) is still
+    /// that funcptr. All of those must classify `'recursive'` so
+    /// origportal emits `recursive_call_*`. `ensure_access_directly_copy`
+    /// does not mint that cachedgraph: portal_runner_ptr is residual
+    /// (`guess_call_kind` Recursive) and the copy would sit outside
+    /// `jit_graphs` (`check_access_directly_sanity`).
     pub fn jitdriver_sd_from_portal_runner_ptr(
         &self,
         path: &CallPath,
     ) -> Option<&JitDriverStaticData> {
-        self.jitdrivers_sd
-            .iter()
-            .find(|sd| sd.portal_runner.as_ref() == Some(path))
+        self.jitdrivers_sd.iter().find(|sd| {
+            sd.portal_runner
+                .as_ref()
+                .is_some_and(|runner| self.portal_runner_ptr_is(path, runner))
+        })
+    }
+
+    /// `funcptr is jd.portal_runner_ptr` for one driver's runner spelling.
+    fn portal_runner_ptr_is(&self, path: &CallPath, runner: &CallPath) -> bool {
+        let origin = access_directly_origin_path(path).unwrap_or_else(|| path.clone());
+        if path == runner || &origin == runner || &access_directly_path(runner) == path {
+            return true;
+        }
+        let runner_resolved = self.resolved_callable_path(runner);
+        if origin == runner_resolved || path == &runner_resolved {
+            return true;
+        }
+        if self.resolved_callable_path(&origin) == runner_resolved {
+            return true;
+        }
+        // `JitDriverSpec.portal_runner` is crate-stripped (`call_jit::…`);
+        // a retargeted site may keep the harvested `pyre_jit::call_jit::…`.
+        runner.segments.len() >= 2
+            && (origin.segments.ends_with(runner.segments.as_slice())
+                || path.segments.ends_with(runner.segments.as_slice()))
     }
 
     /// `call.py jitdriver_sd_from_portal_runner_ptr(funcptr) is not None`.
@@ -8798,6 +8867,16 @@ impl CallControl {
     /// backs a residual call in upstream only if the graph is not looked
     /// inside.
     fn ensure_access_directly_copy(&mut self, origin: &CallPath) -> Option<CallPath> {
+        // Origportal / EvalFn stubs `direct_call` portal_runner_ptr with
+        // the live frame. That frame is often `access_directly` (portal
+        // reds; callers of EvalFn). An AccessDirect cachedgraph of the
+        // runner would be `called` and outside `jit_graphs` — the
+        // `check_access_directly_sanity` panic. Recursive/close_stack
+        // callees are not looked inside (`guess_call_kind`); keep the
+        // call on the regular residual, same as `jit_look_inside=false`.
+        if self.is_portal_recursive_call(origin) {
+            return None;
+        }
         let aliases = self.function_graphs.alias_paths(origin);
         // `cachedgraph` stores the `(AccessDirect, None)` graph on the
         // same FunctionDesc as the regular graph. Trait-impl methods
@@ -25854,13 +25933,44 @@ mod tests {
             Vec::new(),
             original.clone(),
         );
+        cc.register_function_graph(runner.clone(), FunctionGraph::new("ll_portal_runner_shim"));
         cc.set_jitdriver_portal_runner(0, Some(runner.clone()));
+        assert_eq!(
+            cc.function_graphs()
+                .get(&runner)
+                .expect("runner graph remains registered")
+                .func
+                .jit_look_inside,
+            Some(false),
+            "portal_runner_ptr is residual support code (`helper_func` / `_jit_look_inside_ = False`)"
+        );
 
         assert_eq!(
             cc.guess_call_kind(&direct_call_op(CallTarget::function_path(
                 runner.segments.clone()
             ))),
             CallKind::Recursive
+        );
+        let ad_runner = access_directly_path(&runner);
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(CallTarget::from_call_path(&ad_runner))),
+            CallKind::Recursive,
+            "AccessDirect cachedgraph of portal_runner_ptr is still that funcptr"
+        );
+        let harvested = CallPath::from_segments(["pyre_jit", "call_jit", "ll_portal_runner_shim"]);
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(CallTarget::function_path(
+                harvested.segments.clone()
+            ))),
+            CallKind::Recursive,
+            "harvested crate-prefix spelling is still portal_runner_ptr"
+        );
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(CallTarget::from_call_path(
+                &access_directly_path(&harvested)
+            ))),
+            CallKind::Recursive,
+            "harvested crate-prefix AccessDirect spelling is still portal_runner_ptr"
         );
         for non_runner in [portal, original] {
             assert_ne!(

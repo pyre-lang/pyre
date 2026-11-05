@@ -202,6 +202,7 @@ fn build_semantic_program_via_active_frontend(
 ) -> (
     front::SemanticProgram,
     std::collections::HashSet<majit_ir::descr::StructId>,
+    Vec<String>,
 ) {
     #[cfg(feature = "mir-frontend")]
     {
@@ -246,6 +247,7 @@ fn build_semantic_program_via_active_frontend(
             let mut unsafe_fn_stubs = Vec::new();
             let mut foreign_opaque_method_externals = Vec::new();
             let mut eval_hook_graphs = Vec::new();
+            let mut eval_override_graphs = Vec::new();
             let mut profilefunc_graphs = Vec::new();
             let mut profilefunc_spellings = Vec::new();
             let mut fnptr_field_families = Vec::new();
@@ -371,6 +373,11 @@ fn build_semantic_program_via_active_frontend(
                 for path in front::mir::discover_eval_hook_graphs(&llbc) {
                     if !eval_hook_graphs.contains(&path) {
                         eval_hook_graphs.push(path);
+                    }
+                }
+                for path in front::mir::discover_eval_override_graphs(&llbc) {
+                    if !eval_override_graphs.contains(&path) {
+                        eval_override_graphs.push(path);
                     }
                 }
                 for path in front::mir::discover_profilefunc_graphs(&llbc) {
@@ -511,7 +518,7 @@ fn build_semantic_program_via_active_frontend(
             program.unsafe_fn_stubs = unsafe_fn_stubs;
             program.foreign_opaque_method_externals = foreign_opaque_method_externals;
             program.fnptr_field_families = fnptr_field_families;
-            return (program, gc_struct_ids);
+            return (program, gc_struct_ids, eval_override_graphs);
         }
     }
     let _ = (
@@ -1602,16 +1609,17 @@ fn analyze_pipeline_from_module_paths(
         .filter(|spec| spec.split_portal && spec.portal_runner.is_some())
         .map(|spec| spec.portal.canonical_key())
         .collect();
-    let (mut program, declared_gc) = build_semantic_program_via_active_frontend(
-        module_paths,
-        static_addrs,
-        &config.pipeline.transform.jitdriver_receiver_roots,
-        &rewritten_origportals,
-        explicit_llbc_paths,
-        &funcobj_declarations,
-        &lowering_skips,
-        &mut prof,
-    );
+    let (mut program, declared_gc, eval_override_graphs) =
+        build_semantic_program_via_active_frontend(
+            module_paths,
+            static_addrs,
+            &config.pipeline.transform.jitdriver_receiver_roots,
+            &rewritten_origportals,
+            explicit_llbc_paths,
+            &funcobj_declarations,
+            &lowering_skips,
+            &mut prof,
+        );
     // Publish the `(bare struct leaf → defining crate-relative module
     // path)` map into the process-global `STRUCT_ORIGIN_REGISTRY` so the
     // later `codewriter` `canonical_struct_name` `path_hash` sites
@@ -1950,6 +1958,12 @@ fn analyze_pipeline_from_module_paths(
     // ── Build CallControl (RPython call.py) ──
     // Populate with all discovered function graphs and trait impl methods.
     let mut call_control = call::CallControl::with_struct_layouts(program.struct_layouts.clone());
+    call_control.set_eval_override_graphs(
+        eval_override_graphs
+            .into_iter()
+            .map(|path| crate::parse::CallPath::from_segments(path.split("::")))
+            .collect(),
+    );
     call_control.use_funcobj_declarations(funcobj_declarations);
     // RPython: known struct types for get_type_flag(ARRAY.OF) → FLAG_STRUCT.
     call_control.set_known_struct_names(program.known_struct_names.clone());
@@ -3500,6 +3514,12 @@ fn register_configured_jitdrivers(
             );
         }
     }
+    // 4.3 origportal-for-EvalFn is skipped in production: a slim
+    // `direct_call(portal_runner_ptr)` stub of `eval_with_jit` hits
+    // `assembler.rs` `fielddescrof` (`Cow<str>::Owned.__pos_0` on a
+    // discriminant-only layout) once the inliner walks the cloned
+    // producers. Keep + 4.2 A/B still record may-force inside helpers
+    // and route an EvalFn residual through `do_recursive_call`.
     // `interp_jit.py class __extend__(PyFrame)` replaces the interpreter
     // function with the portal. `warmspot.py rewrite_jit_merge_point`
     // leaves the origportal as `return portal_runner(*args)`, and every
@@ -4837,6 +4857,159 @@ mod portal_driver_tests {
                     .expect("wrapper keeps its graph"),
             ),
             "without extends the wrapper keeps its own graph"
+        );
+    }
+
+    /// Origportal-for-EvalFn: a one-input portal stub transplants onto the
+    /// two-input override graph, which then `direct_call`s `portal_runner`.
+    #[test]
+    fn rewrite_eval_override_graph_calls_portal_runner() {
+        use crate::codewriter::type_state::ConcreteType;
+
+        let mut call_control = call::CallControl::new();
+        let portal = CallPath::from_segments(["fixture", "eval_loop_jit"]);
+        let eval_fn = CallPath::from_segments(["fixture", "eval_with_jit"]);
+        let mut graph = FunctionGraph::new("pyre_jit::eval::eval_loop_jit");
+        let frame = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.blocks[graph.startblock.0].inputargs = vec![frame.clone()];
+        graph.push_op_with_result_var(
+            graph.startblock,
+            OpKind::Input {
+                name: "frame".into(),
+                ty: ValueType::Ref(None),
+                class_root: Some("PyFrame".into()),
+            },
+            frame.clone(),
+        );
+        let next_instr = graph
+            .push_op_var(graph.startblock, OpKind::ConstInt(0), true)
+            .unwrap();
+        let is_being_profiled = graph
+            .push_op_var(graph.startblock, OpKind::ConstInt(0), true)
+            .unwrap();
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into())),
+                    args: crate::model::call_args(vec![
+                        frame.clone(),
+                        next_instr,
+                        is_being_profiled,
+                        frame.clone(),
+                        frame.clone(),
+                        frame.clone(),
+                    ]),
+                    result_ty: ValueType::Void,
+                },
+            });
+        graph.set_return(graph.startblock, None);
+        call_control.register_function_graph(portal.clone(), graph);
+
+        let mut override_graph = FunctionGraph::new("pyre_jit::eval::eval_with_jit");
+        let eval_frame = override_graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let resume = override_graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        override_graph.blocks[override_graph.startblock.0].inputargs =
+            vec![eval_frame.clone(), resume.clone()];
+        override_graph.push_op_with_result_var(
+            override_graph.startblock,
+            OpKind::Input {
+                name: "frame".into(),
+                ty: ValueType::Ref(None),
+                class_root: Some("PyFrame".into()),
+            },
+            eval_frame,
+        );
+        override_graph.push_op_with_result_var(
+            override_graph.startblock,
+            OpKind::Input {
+                name: "resume".into(),
+                ty: ValueType::Ref(None),
+                class_root: None,
+            },
+            resume,
+        );
+        override_graph.set_return(override_graph.startblock, None);
+        call_control.register_function_graph(eval_fn.clone(), override_graph);
+        call_control.set_eval_override_graphs(vec![eval_fn.clone()]);
+
+        let config = pipeline::PipelineConfig {
+            transform: GraphTransformConfig::default(),
+            jit_drivers: vec![pipeline::JitDriverSpec {
+                portal: portal.clone(),
+                portal_runner: Some(CallPath::from_segments(["fixture", "portal_runner"])),
+                greens: vec![
+                    "next_instr".into(),
+                    "is_being_profiled".into(),
+                    "pycode".into(),
+                ],
+                reds: vec!["frame".into(), "ec".into()],
+                green_kinds: Vec::new(),
+                red_kinds: Vec::new(),
+                autoreds: false,
+                virtualizables: vec!["frame".into()],
+                red_types: vec!["PyFrame".into(), "ExecutionContext".into()],
+                split_portal: true,
+                extends: None,
+            }],
+            register_trait_families: Vec::new(),
+            helper_graphs: Vec::new(),
+            builtin_graphs: Vec::new(),
+        };
+        register_configured_jitdrivers(
+            &mut call_control,
+            &config.jit_drivers,
+            &config.transform.jitdriver_receiver_roots,
+        );
+        crate::codewriter::support::rewrite_eval_override_graphs(
+            &mut call_control,
+            &config.jit_drivers,
+        );
+        let eval_graph = call_control
+            .function_graphs()
+            .get(&eval_fn)
+            .expect("override graph remains registered");
+        assert_eq!(eval_graph.name, "pyre_jit::eval::eval_with_jit");
+        assert_eq!(
+            eval_graph.block(eval_graph.startblock).inputargs.len(),
+            2,
+            "EvalFn formals stay (frame, resume)"
+        );
+        let calls_runner = eval_graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.as_slice() == ["fixture", "portal_runner"],
+                _ => false,
+            })
+        });
+        assert!(
+            calls_runner,
+            "rewritten override graph must direct_call portal_runner"
+        );
+        assert!(eval_graph.func.unroll_safe);
+        assert!(
+            !eval_graph.access_directly,
+            "EvalFn stub is not an AccessDirect copy; portal_runner_ptr stays residual"
+        );
+        assert!(eval_graph.access_directly_inputs.is_none());
+        assert_eq!(
+            eval_graph.block(eval_graph.startblock).exits.len(),
+            1,
+            "EvalFn stub returns from the startblock"
+        );
+        assert_eq!(
+            eval_graph.block(eval_graph.startblock).exits[0].target,
+            eval_graph.returnblock
+        );
+        assert!(
+            eval_graph
+                .blocks
+                .iter()
+                .all(|block| block.id == eval_graph.startblock || block.operations.is_empty()),
+            "EvalFn stub is a single block of field reads plus portal_runner"
         );
     }
 

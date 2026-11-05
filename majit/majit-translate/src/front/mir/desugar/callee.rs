@@ -26,15 +26,11 @@ pub(in crate::front::mir) enum FnPtrFamily {
     Unknown,
 }
 
-/// Crate-stripped paths of the prebuilt eval hook in this artefact.
-///
 /// `register_eval_override`'s `FnDef` argument, then every other `FnDef`
-/// assigned to that parameter's type (the plain evaluator). Callers in
-/// another crate see the registrar as an external `FunDecl`; the
-/// translator unions the lists before lowering.
-pub(crate) fn discover_eval_hook_graphs(llbc: &Llbc) -> Vec<String> {
+/// assigned to that parameter's type (the plain evaluator).
+fn discover_eval_hook_families(llbc: &Llbc) -> (Vec<String>, Vec<String>) {
     let Some(eval_ty) = eval_fn_type_id(llbc) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let registrar_ids = registrar_fun_ids(llbc);
     let mut overrides = Vec::new();
@@ -81,6 +77,23 @@ pub(crate) fn discover_eval_hook_graphs(llbc: &Llbc) -> Vec<String> {
             }
         }
     }
+    (overrides, plain)
+}
+
+/// The registered-override graph of the EvalFn family (`register_eval_override`'s
+/// `FnDef` argument). The plain evaluator is not in this list.
+pub(crate) fn discover_eval_override_graphs(llbc: &Llbc) -> Vec<String> {
+    discover_eval_hook_families(llbc).0
+}
+
+/// Crate-stripped paths of the prebuilt eval hook in this artefact.
+///
+/// `register_eval_override`'s `FnDef` argument, then every other `FnDef`
+/// assigned to that parameter's type (the plain evaluator). Callers in
+/// another crate see the registrar as an external `FunDecl`; the
+/// translator unions the lists before lowering.
+pub(crate) fn discover_eval_hook_graphs(llbc: &Llbc) -> Vec<String> {
+    let (mut overrides, plain) = discover_eval_hook_families(llbc);
     for path in plain {
         if !overrides.contains(&path) {
             overrides.push(path);

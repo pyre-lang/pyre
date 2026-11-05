@@ -11087,7 +11087,8 @@ fn walker_call_trace_hook_reads_guards_null_hooks() {
             leftover,
             vec![majit_ir::OpCode::IntIsZero, majit_ir::OpCode::GuardTrue],
             "second walk re-records the generated profilefunc is-not-None \
-             INT_IS_ZERO / GuardTrue: leftover={leftover:?} first={first_ops:?}"
+             INT_IS_ZERO / GuardTrue: leftover={leftover:?} first={first_ops:?} \
+             generated={generated:?}"
         );
         assert_unarmed_call_trace_recorded(
             wc, session, &r_before, &i_before, &f_before, &generated,
@@ -25972,12 +25973,13 @@ fn helper_abort_resume_pc_prefers_published_live_after() {
     fbw_store_journal_reset();
 }
 
-/// `residual_call_refused_up_front` declines may-force residuals inside a
-/// transparent helper before `execute_varargs`. EF_CAN_RAISE CallR still
-/// executes (`do_residual_call`); refusing it residualizes list-iterator
+/// `residual_call_refused_up_front` still executes EF_CAN_RAISE CallR
+/// (`do_residual_call`); refusing it residualizes list-iterator
 /// `descr_next` and drops `for_iter_list_fold` `hot_setstate_sentinel`.
-/// A trampoline that calls back into Python is `jit_may_force` so this
-/// refuse catches it (`dict_eq_hook` `hash_w_hooked` / `eq_w_hooked`).
+/// A may-force residual inside a transparent helper also executes:
+/// `do_residual_call` records `CALL_MAY_FORCE_*` then `GUARD_NOT_FORCED`.
+/// `capture_resumedata` snapshots every `MIFrame`, and a helper walk is
+/// its own frame (`helper_subwalk_level` / `compute_inline_caller_frame`).
 fn residual_call_refused_up_front_probe(
     opcode: majit_ir::OpCode,
     extra: majit_ir::ExtraEffect,
@@ -26060,9 +26062,9 @@ fn residual_call_refused_up_front_declines_may_force_not_can_raise_in_transparen
         true,
         true,
     );
-    assert!(
-        matches!(may_force, Some(("may-force-in-transparent-helper", _, 0))),
-        "CallMayForce inside a transparent helper stays declined: {may_force:?}"
+    assert_eq!(
+        may_force, None,
+        "CallMayForce inside a transparent helper records via do_residual_call: {may_force:?}"
     );
 }
 
