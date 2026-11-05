@@ -115,6 +115,10 @@ pub(crate) struct SliceFirstSite {
     /// base is a `StringRepr`, not a GC array, so the successful arm must
     /// emit `__string_byte_getitem` rather than `ArrayRead`.
     pub string_byte_view: bool,
+    /// Instance STRUCT of the built `Some`, when the dest TyRef is concrete.
+    pub some_vsid: Option<majit_ir::descr::StructId>,
+    /// Instance STRUCT of the built `None`.
+    pub none_vsid: Option<majit_ir::descr::StructId>,
 }
 
 #[derive(Clone, Debug)]
@@ -384,6 +388,7 @@ fn rewire_one_slice_first_site(
             &site.option_owner,
             1,
             Some((&site.some_owner, elem, site.payload_ty.clone())),
+            site.some_vsid,
         );
         emit_narrow(graph, then_bb, some_var, &narrow_root)
     };
@@ -402,7 +407,8 @@ fn rewire_one_slice_first_site(
         let null = graph.push_niche_null(else_bb, site.niche_null_cast.as_ref());
         emit_narrow(graph, else_bb, null, &site.payload_narrow_root)
     } else {
-        let none_var = emit_option_variant(graph, else_bb, &site.option_owner, 0, None);
+        let none_var =
+            emit_option_variant(graph, else_bb, &site.option_owner, 0, None, site.none_vsid);
         emit_narrow(graph, else_bb, none_var, &narrow_root)
     };
     let else_link_args = reproduce_exit_args(
@@ -521,6 +527,8 @@ mod tests {
             array_type_id: None,
             object_array_type_id: None,
             string_byte_view: false,
+            some_vsid: None,
+            none_vsid: None,
         }
     }
 

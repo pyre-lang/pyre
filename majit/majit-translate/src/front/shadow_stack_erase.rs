@@ -34,7 +34,12 @@
 //! and it does not leave extra slots. A LeavesAbove or ParamSlots
 //! callee is the same split for neutrality, but erasure still refuses
 //! — after the rewrite nothing rewinds a leftover
-//! (`_fix_graph_after_inlining`). A call whose resolved path is the
+//! (`_fix_graph_after_inlining`). A callee that *returns* the leftover
+//! inside an owned guard (`body_returns_owned_scope`; the dest is the
+//! nested `RootScope`, as `RootedItems::new` packages one) is the
+//! nested-Open shape: the leftover is that dest, the caller drops it,
+//! and ParamSlots methods of the dest read the nested bracket the
+//! callee kept rather than this body's slot locals. A call whose resolved path is the
 //! same declaration `alias_extended_functions_to_origportal` shares with the
 //! rewritten origportal takes that portal's effect: the portal body is
 //! RootScope-balanced. Anything the interpretation cannot model refuses
@@ -50,7 +55,7 @@ use std::time::Instant;
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{
     CallFunc, FunDecl, Operand, Place, PlaceKind, ProjectionElem, RegularCall, Rvalue, SpanRef,
-    StmtKind, TermKind, TyRef, Unstructured, UnwindKind, operand_json_place,
+    StmtKind, SwitchTargets, TermKind, TyRef, Unstructured, UnwindKind, operand_json_place,
 };
 use serde_json::{Value, json};
 
@@ -71,13 +76,18 @@ enum Leaf {
     /// `shadow_stack_copy_range` / `_into_vec`: a Get of argument 0 for
     /// the walk, Unmodeled for erase.
     CopyRange,
-    /// `RootedItems::new`: a second Open for the walk, Unmodeled for erase.
+    /// `RootedItems::new` / `Default`: a second Open, scalar-replaced.
     ItemsOpen,
     /// `RootedItems::push`.
     ItemsPush,
-    /// `RootedItems::{len, is_empty, assert_owns_the_top}`.
+    /// `RootedItems::assert_owns_the_top`: a void debug check.
     ItemsNop,
-    /// `RootedItems::{get, take}`: own-slot reads for the walk.
+    /// `RootedItems::len`: the modeled container length (`rlist.py` `ll_length`).
+    ItemsLen,
+    /// `RootedItems::is_empty`: `len == 0` (`RootedItems::is_empty`).
+    ItemsIsEmpty,
+    /// `RootedItems::get`: own-slot read, offset from the set's open depth.
+    /// `take` is the same for the walk; erase refuses it (no Vec constructor).
     ItemsGet,
     /// `RootedItems` drop / `drop_in_place`.
     ItemsClose,
@@ -127,6 +137,8 @@ fn classify_call(
         Some(Operand::Copy(p) | Operand::Move(p)) => Some(&p.ty),
         _ => None,
     };
+    let dest_items = is_rooted_items_ty(&call.dest.ty, llbc);
+    let recv_items = receiver_ty.is_some_and(|ty| is_rooted_items_ty(ty, llbc));
     // `DictOperationGuard` lives in `dictmultiobject`, not `gc_roots`.
     // Charon names the constructor `dictmultiobject::<Impl>::new`, so the
     // type is read off the destination (and the receiver for `root`).
@@ -148,13 +160,15 @@ fn classify_call(
     if !segments.contains(&super::ROOT_SCOPE_MODULE) {
         return None;
     }
-    let is_method =
-        segments.contains(&super::ROOT_SCOPE_TYPE) || segments.iter().any(|s| s.starts_with('<'));
+    let is_method = segments.contains(&super::ROOT_SCOPE_TYPE)
+        || segments.iter().any(|s| s.starts_with('<'))
+        || dest_items
+        || recv_items;
     if is_method {
         if names_type(&call.dest.ty, super::ROOT_SCOPE_TYPE) && leaf == "new" {
             return Some((Leaf::Open, false));
         }
-        if names_type(&call.dest.ty, "RootedItems") && leaf == "new" {
+        if dest_items && matches!(leaf, "new" | "default") {
             return Some((Leaf::ItemsOpen, false));
         }
         if names_type(&call.dest.ty, "RootedOnceRef")
@@ -163,10 +177,12 @@ fn classify_call(
             // Process-global MiniMark slot, not the thread shadow stack.
             return None;
         }
-        if receiver_ty.is_some_and(|ty| names_type(ty, "RootedItems")) {
+        if recv_items {
             let kind = match leaf {
                 "push" => Leaf::ItemsPush,
-                "len" | "is_empty" | "assert_owns_the_top" => Leaf::ItemsNop,
+                "len" => Leaf::ItemsLen,
+                "is_empty" => Leaf::ItemsIsEmpty,
+                "assert_owns_the_top" => Leaf::ItemsNop,
                 "get" | "take" => Leaf::ItemsGet,
                 "drop" | "drop_in_place" => Leaf::ItemsClose,
                 _ => Leaf::Unmodeled,
@@ -362,6 +378,47 @@ fn is_frame_anchor_ty(ty: &TyRef, llbc: &Llbc) -> bool {
         .is_some_and(|t| t.item_meta.name_path().rsplit("::").next() == Some("FrameAnchor"))
 }
 
+/// Unique `RootedItems` ADT: class-root / type-decl identity. FunDecl
+/// path segments are not consulted.
+fn is_rooted_items_ty(ty: &TyRef, llbc: &Llbc) -> bool {
+    if super::tyref_class_root(ty, llbc).is_some_and(|root| super::gc_rooted_items_type_path(&root))
+    {
+        return true;
+    }
+    super::output_adt_def_id_free(ty, llbc)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|t| super::gc_rooted_items_type_path(&t.item_meta.name_path()))
+}
+
+fn slice_of_special(special: Special) -> Option<usize> {
+    match special {
+        Special::SliceBase { slice_local }
+        | Special::SliceIndex { slice_local, .. }
+        | Special::SliceIndexPair { slice_local, .. } => Some(slice_local),
+        _ => None,
+    }
+}
+
+fn is_slice_special(special: Special) -> bool {
+    slice_of_special(special).is_some()
+}
+
+/// Whether `base + x` of a published slice can use the add as a runtime
+/// element index (`Get` of leftover-slice `k == 0`). A `const` operand, a
+/// `PlaceKind::Global` (`FrameBox::new` `inputs + FRAME_BOX_DEBUG_INPUT`),
+/// or a local this body assigned. A parameter / return place stays
+/// `index-not-static`.
+fn slice_addend_is_computed(op: &Operand, stmt_assigned: &HashMap<usize, usize>) -> bool {
+    match op {
+        Operand::Const(_) => true,
+        Operand::Copy(place) | Operand::Move(place) => match place.kind {
+            PlaceKind::Local(l) => stmt_assigned.get(&(l as usize)).copied().unwrap_or(0) >= 1,
+            PlaceKind::Global { .. } => true,
+            _ => false,
+        },
+    }
+}
+
 /// What a special local stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Special {
@@ -497,6 +554,65 @@ fn merge_special(previous: Special, new: Special) -> Result<Special, Refusal> {
     }
 }
 
+/// Pins published through one guard. `RootedItems::len` / `is_empty` read
+/// this the way `rlist.py` `ll_length` reads `l.length`: only an exact count
+/// is a value; a joined lower bound is not statically represented.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuardPins {
+    Exact(usize),
+    Min(usize),
+}
+
+impl GuardPins {
+    fn exact(self) -> Option<usize> {
+        match self {
+            GuardPins::Exact(n) => Some(n),
+            GuardPins::Min(_) => None,
+        }
+    }
+
+    fn count(self) -> usize {
+        match self {
+            GuardPins::Exact(n) | GuardPins::Min(n) => n,
+        }
+    }
+
+    fn plus_one(self) -> Self {
+        match self {
+            GuardPins::Exact(n) => GuardPins::Exact(n + 1),
+            GuardPins::Min(n) => GuardPins::Min(n + 1),
+        }
+    }
+
+    fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (GuardPins::Exact(a), GuardPins::Exact(b)) if a == b => GuardPins::Exact(a),
+            (a, b) => GuardPins::Min(a.count().min(b.count())),
+        }
+    }
+}
+
+/// Same-key pin maps at a join keep the per-guard minimum.
+/// Agreeing `Exact` counts stay exact; disagreeing counts become `Min`.
+/// Different keys still refuse (`pin-count-disagrees-at-merge`).
+fn join_pin_counts_min(
+    a: &HashMap<usize, GuardPins>,
+    b: &HashMap<usize, GuardPins>,
+) -> Option<HashMap<usize, GuardPins>> {
+    if a == b {
+        return Some(a.clone());
+    }
+    if a.len() != b.len() {
+        return None;
+    }
+    let mut out = HashMap::with_capacity(a.len());
+    for (k, va) in a {
+        let vb = b.get(k)?;
+        out.insert(*k, va.join(*vb));
+    }
+    Some(out)
+}
+
 /// A call or assert this pass rewrites to a `Goto`, with the statements that
 /// replace it.
 struct TermRewrite {
@@ -516,6 +632,8 @@ struct Plan {
     /// Per-slot type. FrameAnchor pins `*mut PyFrame`; RootScope pins
     /// `PyObjectRef`. A mixed body needs both.
     slot_tys: HashMap<usize, Value>,
+    /// Pins published through each `RootedItems` / `RootScope` / `FrameAnchor` guard.
+    pin_count: HashMap<usize, GuardPins>,
     /// Blocks no path from the entry reaches once the rewritten calls lose
     /// their unwind edges.
     unreachable: Vec<usize>,
@@ -635,7 +753,41 @@ fn local_def_counts(body: &Unstructured, llbc: &Llbc, forward_blocks: &[bool]) -
     counts
 }
 
+/// `funccallunrolling` is `range(4)` plus the zero arm — five predecessors.
+const MAX_SCRUTINEE_ARMS: usize = 8;
+
+fn switch_arm_value(v: &Value) -> Option<u64> {
+    if let Some(b) = v.get("Bool").and_then(Value::as_bool) {
+        return Some(u64::from(b));
+    }
+    let inner = v.get("Scalar").unwrap_or(v);
+    let inner = inner.get("Integer").unwrap_or(inner);
+    let lit = inner.get("Unsigned").or_else(|| inner.get("Signed"))?;
+    let s = lit.as_array()?.get(1)?.as_str()?;
+    s.parse().ok()
+}
+
+fn switch_int_arm_target(
+    arms: &[(majit_charon_reader::ullbc::JsonVal, u64)],
+    value: u64,
+) -> Option<u64> {
+    arms.iter()
+        .find_map(|(scalar, t)| (switch_arm_value(scalar) == Some(value)).then_some(*t))
+}
+
+fn switch_int_covers(
+    arm_exit: &HashMap<(usize, u64), (usize, usize, usize)>,
+    root: usize,
+    arms: &[(majit_charon_reader::ullbc::JsonVal, u64)],
+) -> bool {
+    !arms.is_empty()
+        && arms.iter().all(|(scalar, _)| {
+            switch_arm_value(scalar).is_some_and(|val| arm_exit.contains_key(&(root, val)))
+        })
+}
+
 /// An unsigned scalar constant operand.
+
 fn const_usize(op: &Operand, llbc: &Llbc) -> Option<usize> {
     let Operand::Const(v) = op else {
         return None;
@@ -1240,17 +1392,61 @@ struct EraseWalk<'a> {
     queue: &'a mut VecDeque<usize>,
     visited: &'a mut [bool],
     specials: &'a mut HashMap<usize, Special>,
+    pin_count: HashMap<usize, GuardPins>,
+    pin_count_in: &'a mut Vec<Option<HashMap<usize, GuardPins>>>,
+    frozen_pin_count: &'a [Option<HashMap<usize, GuardPins>>],
     plan: Option<&'a mut Plan>,
     const_locals: &'a mut HashMap<usize, usize>,
     array_lens: &'a mut HashMap<usize, usize>,
     getter_cache: &'a mut HashMap<u64, Option<SlotGetter>>,
     getter_bbs: &'a mut bit_set::BitSet,
     capture_temps: &'a mut bit_set::BitSet,
+    /// Use-copy chain for the current walk (`let n = nargs`).
+    copy_of: HashMap<usize, usize>,
+    /// Scrutinee locals assigned after a split was recorded.
+    /// Probe fills this; Emit reads it and does not re-derive (the map is
+    /// already populated, so a prefix `let nargs = args.len()` would look
+    /// like a kill).
+    scrutinee_killed: &'a mut HashSet<usize>,
+    /// `depth` at entry to the block being walked. Extra-pin Gets sit in
+    /// `[lo, pin-join hi)`; suffix pins after that join sit at `k >= hi`.
+    incoming_hi: usize,
+    /// Scrutinee local and arm value for the unique switch-arm path
+    /// that reached this block (`funccall_flat_from_args` `match nargs`).
+    split_key: Option<(usize, u64)>,
+    split_key_in: &'a mut Vec<Option<Option<(usize, u64)>>>,
+    /// Per-arm (`depth`, `lo`, `open`) at the first disagreeing join of
+    /// those arms. A later switch on the same local restores, plus the
+    /// shared-suffix delta (`current_depth - max snapshot`).
+    arm_exit: &'a mut HashMap<(usize, u64), (usize, usize, usize)>,
 }
 
 impl<'a> EraseWalk<'a> {
     fn emit(&self) -> bool {
         self.mode == WalkMode::Emit
+    }
+
+    fn copy_root(&self, local: usize) -> usize {
+        let mut cur = local;
+        for _ in 0..8 {
+            match self.copy_of.get(&cur) {
+                Some(&src) if src != cur => cur = src,
+                _ => break,
+            }
+        }
+        cur
+    }
+
+    fn note_local_assign(&mut self, dest: usize) {
+        self.copy_of.remove(&dest);
+        if self.emit() {
+            return;
+        }
+        if self.split_key.is_some_and(|(l, _)| l == dest)
+            || self.arm_exit.keys().any(|(l, _)| *l == dest)
+        {
+            self.scrutinee_killed.insert(dest);
+        }
     }
 
     fn slot_local(&self, k: usize) -> usize {
@@ -1306,10 +1502,30 @@ impl<'a> EraseWalk<'a> {
                     "get-above-depth"
                 });
             }
-        } else if k >= lo {
+        } else if k >= lo && k < self.join_band_hi(lo) {
             return Err("absolute-get-above-join-floor");
+        } else if k >= depth {
+            return Err(if set {
+                "set-above-depth"
+            } else {
+                "get-above-depth"
+            });
         }
         Ok(())
+    }
+
+    fn join_band_hi(&self, lo: usize) -> usize {
+        let snap_hi = self
+            .arm_exit
+            .values()
+            .map(|(d, _, _)| *d)
+            .max()
+            .unwrap_or(0);
+        if snap_hi > lo {
+            snap_hi
+        } else {
+            self.incoming_hi
+        }
     }
 
     fn reach(
@@ -1332,15 +1548,15 @@ impl<'a> EraseWalk<'a> {
                 // `depth-disagrees-at-merge` in release.
                 let frozen_hi = self.frozen_depth[target];
                 let frozen_lo = self.frozen_lo[target];
-                debug_assert!(
-                    frozen_hi.is_some_and(|h| depth <= h),
-                    "emit incoming depth exceeds phase-1 lattice"
-                );
-                debug_assert!(
-                    frozen_lo.is_some_and(|l| lo >= l),
-                    "emit incoming lo is below phase-1 lattice"
-                );
                 if !frozen_hi.is_some_and(|h| depth <= h) || !frozen_lo.is_some_and(|l| lo >= l) {
+                    debug_assert!(
+                        frozen_hi.is_some_and(|h| depth <= h),
+                        "emit incoming depth exceeds phase-1 lattice"
+                    );
+                    debug_assert!(
+                        frozen_lo.is_some_and(|l| lo >= l),
+                        "emit incoming lo is below phase-1 lattice"
+                    );
                     return Err("depth-disagrees-at-merge");
                 }
                 if !self.visited[target] {
@@ -1356,12 +1572,35 @@ impl<'a> EraseWalk<'a> {
                 // Join the Drop/Close entry too: skipping it leaves the
                 // first-visit lattice, and Emit then walks the rewind at
                 // that depth with the final Guard specials.
+                if let Some(key) = self.split_key {
+                    if let Some(prev_d) = self.depth_in[target] {
+                        if self.arm_exit.len() < MAX_SCRUTINEE_ARMS
+                            || self.arm_exit.contains_key(&key)
+                        {
+                            self.arm_exit.entry(key).or_insert((depth, lo, open));
+                        }
+                        if let Some(Some(prev_key)) = self.split_key_in[target] {
+                            if prev_key != key
+                                && (self.arm_exit.len() < MAX_SCRUTINEE_ARMS
+                                    || self.arm_exit.contains_key(&prev_key))
+                            {
+                                self.arm_exit.entry(prev_key).or_insert((
+                                    prev_d,
+                                    self.lo_in[target].unwrap_or(prev_d),
+                                    self.open_in[target].unwrap_or(0),
+                                ));
+                            }
+                        }
+                    }
+                }
                 match (self.depth_in[target], self.lo_in[target]) {
-                    (Some(d), Some(l)) if d == depth && l == lo => Ok(()),
+                    (Some(d), Some(l)) if d == depth && l == lo => self.join_pins_at(target),
                     (None, _) => {
                         self.depth_in[target] = Some(depth);
                         self.lo_in[target] = Some(lo);
                         self.open_in[target] = Some(open);
+                        self.pin_count_in[target] = Some(self.pin_count.clone());
+                        self.split_key_in[target] = Some(self.split_key);
                         self.queue.push_back(target);
                         Ok(())
                     }
@@ -1410,12 +1649,114 @@ impl<'a> EraseWalk<'a> {
                             self.visited[target] = false;
                             self.queue.push_back(target);
                         }
-                        Ok(())
+                        self.join_pins_at(target)
                     }
                     _ => Ok(()),
                 }
             }
         }
+    }
+
+    fn reach_switch(
+        &mut self,
+        from: usize,
+        discr: &Operand,
+        targets: &SwitchTargets,
+        depth: usize,
+        lo: usize,
+        open: usize,
+    ) -> Result<(), Refusal> {
+        match targets {
+            SwitchTargets::If(a, b) => {
+                self.reach(from, *a, depth, lo, open)?;
+                self.reach(from, *b, depth, lo, open)
+            }
+            SwitchTargets::SwitchInt(_, arms, default) => {
+                self.reach_switch_int(from, discr, arms, *default, depth, lo, open)
+            }
+        }
+    }
+
+    /// Second `match nargs` (`funccall_flat_from_args`): restore each arm's
+    /// depth from the first switch's join snapshot, plus shared-suffix
+    /// pins. A unique-arm path uses the live `split_key` as a known exit.
+    /// `If` stays on the current lattice so extra-pin Gets remain on the
+    /// writing arm and unsplittable join-band Gets still refuse.
+    fn reach_switch_int(
+        &mut self,
+        from: usize,
+        discr: &Operand,
+        arms: &[(majit_charon_reader::ullbc::JsonVal, u64)],
+        default: u64,
+        depth: usize,
+        lo: usize,
+        open: usize,
+    ) -> Result<(), Refusal> {
+        let root = operand_local(discr).map(|l| self.copy_root(l));
+        let killed = root.is_some_and(|r| self.scrutinee_killed.contains(&r));
+        let covers = !killed && root.is_some_and(|r| switch_int_covers(self.arm_exit, r, arms));
+        if covers && lo != depth {
+            let root = root.expect("covers implies a discr local");
+            let mut restored = Vec::new();
+            for (scalar, t) in arms {
+                let val = switch_arm_value(scalar).expect("covers parsed every arm");
+                let snap = self
+                    .arm_exit
+                    .get(&(root, val))
+                    .copied()
+                    .expect("covers has every snapshot");
+                restored.push((*t, snap));
+            }
+            let join_hi = restored
+                .iter()
+                .map(|(_, (arm_d, _, _))| *arm_d)
+                .max()
+                .unwrap_or(depth);
+            let delta = depth.saturating_sub(join_hi);
+            for (t, (arm_d, arm_lo, _)) in restored {
+                let rd = arm_d.saturating_add(delta);
+                let rlo = if arm_lo == arm_d {
+                    rd
+                } else {
+                    arm_lo.saturating_add(delta).min(rd)
+                };
+                self.reach(from, t, rd, rlo, open)?;
+            }
+            self.reach(from, default, depth, lo, open)?;
+            return Ok(());
+        }
+        if !killed && let Some(root) = root {
+            if let Some((local, val)) = self.split_key
+                && local == root
+            {
+                if covers {
+                    // Unique-arm walk of a later switch: wait for the
+                    // join-band re-walk so Get arms first-visit at the
+                    // restored depth, not this arm's transient depth.
+                    self.reach(from, default, depth, lo, open)?;
+                    return Ok(());
+                }
+                if let Some(t) = switch_int_arm_target(arms, val) {
+                    self.reach(from, t, depth, lo, open)?;
+                    self.reach(from, default, depth, lo, open)?;
+                    return Ok(());
+                }
+            }
+            let saved = self.split_key;
+            for (scalar, t) in arms {
+                if saved.is_none() {
+                    self.split_key = switch_arm_value(scalar).map(|val| (root, val));
+                }
+                self.reach(from, *t, depth, lo, open)?;
+            }
+            self.split_key = saved;
+            self.reach(from, default, depth, lo, open)?;
+            return Ok(());
+        }
+        for (_, t) in arms {
+            self.reach(from, *t, depth, lo, open)?;
+        }
+        self.reach(from, default, depth, lo, open)
     }
 
     fn guard_open(&self, g: usize) -> Result<(usize, usize), Refusal> {
@@ -1488,6 +1829,72 @@ impl<'a> EraseWalk<'a> {
             .as_ref()
             .and_then(|p| p.slot_tys.get(&k).cloned().or_else(|| p.slot_ty.clone()))
     }
+
+    fn note_guard_pins(&mut self, guard: usize, pins: GuardPins) {
+        self.pin_count.insert(guard, pins);
+        if let Some(plan) = self.plan.as_mut() {
+            plan.pin_count.insert(guard, pins);
+        }
+    }
+
+    fn bump_guard_pins(&mut self, guard: usize) {
+        let e = self.pin_count.entry(guard).or_insert(GuardPins::Exact(0));
+        *e = e.plus_one();
+        let pins = *e;
+        if let Some(plan) = self.plan.as_mut() {
+            plan.pin_count.insert(guard, pins);
+        }
+    }
+
+    /// Drop pin-count keys for a guard closed at `closed` and every set
+    /// opened inside it. Nested exclusive RootScopes (`zip_two_tuple_next`)
+    /// close before they merge with a sibling that never opened them;
+    /// leftover keys would refuse that join (`pin-count-disagrees-at-merge`).
+    fn forget_closed_guards(&mut self, closed: usize) {
+        self.pin_count
+            .retain(|other, _| match self.specials.get(other) {
+                Some(Special::Guard { depth, .. }) => *depth < closed,
+                _ => false,
+            });
+        if let Some(plan) = self.plan.as_mut() {
+            plan.pin_count
+                .retain(|other, _| match self.specials.get(other) {
+                    Some(Special::Guard { depth, .. }) => *depth < closed,
+                    _ => false,
+                });
+        }
+    }
+
+    fn join_pins_at(&mut self, target: usize) -> Result<(), Refusal> {
+        if self.emit() {
+            return Ok(());
+        }
+        // Drop/Close postdominates exclusive-arm Opens (`do_call` n==1 vs
+        // n>1): pin maps disagree on keys until the rewind forgets them.
+        // Main's lattice joins only depth/lo here; pin counts are walked
+        // after the rewind.
+        if block_rewinds_scope(self.body, self.llbc, self.classified, self.specials, target) {
+            return Ok(());
+        }
+        match self.pin_count_in[target].as_ref() {
+            None => {
+                self.pin_count_in[target] = Some(self.pin_count.clone());
+                Ok(())
+            }
+            Some(prev) if prev == &self.pin_count => Ok(()),
+            Some(prev) => {
+                let Some(joined) = join_pin_counts_min(prev, &self.pin_count) else {
+                    return Err("pin-count-disagrees-at-merge");
+                };
+                if self.pin_count_in[target].as_ref() != Some(&joined) {
+                    self.pin_count_in[target] = Some(joined);
+                    self.visited[target] = false;
+                    self.queue.push_back(target);
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// A pin raises `hi`. It raises `lo` only while the stack is aligned
@@ -1534,6 +1941,16 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                 cx.open_in[bb].expect("queued blocks have an open count"),
             ),
         };
+        cx.pin_count = match cx.mode {
+            WalkMode::Emit => cx.frozen_pin_count[bb].clone().unwrap_or_default(),
+            WalkMode::Probe => cx.pin_count_in[bb].clone().unwrap_or_default(),
+        };
+        cx.split_key = match cx.mode {
+            WalkMode::Emit => None,
+            WalkMode::Probe if depth != lo => None,
+            WalkMode::Probe => cx.split_key_in.get(bb).copied().flatten().flatten(),
+        };
+        cx.incoming_hi = depth;
         let block = &body.body[bb];
         // Statements: the index, pair and alias definitions.
         for (si, stmt) in block.statements.iter().enumerate() {
@@ -1543,6 +1960,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
             let Some(dest) = place_local(place) else {
                 continue;
             };
+            cx.note_local_assign(dest);
             match rvalue {
                 Rvalue::Aggregate(kind, operands) if kind.get("Array").is_some() => {
                     if cx.single_def(dest) {
@@ -1596,6 +2014,9 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                 Rvalue::Use(op, _) => match op {
                     Operand::Copy(src) | Operand::Move(src) => {
                         if let Some(l) = place_local(src) {
+                            if l != dest {
+                                cx.copy_of.insert(dest, l);
+                            }
                             if cx.single_def(dest) {
                                 if let Some(n) = cx.const_locals.get(&l).copied() {
                                     cx.const_locals.insert(dest, n);
@@ -1658,8 +2079,13 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                         let spec_of = |o: &Operand| {
                             operand_local(o).and_then(|l| cx.specials.get(&l).copied())
                         };
+                        let const_addend = |other: &Operand| {
+                            const_usize(other, llbc).or_else(|| {
+                                operand_local(other).and_then(|l| cx.const_locals.get(&l).copied())
+                            })
+                        };
                         let slice_add = |spec: Option<Special>, other: &Operand, checked: bool| {
-                            let c = const_usize(other, llbc)?;
+                            let c = const_addend(other)?;
                             match spec {
                                 Some(Special::SliceBase { slice_local }) => Some(if checked {
                                     Special::SliceIndexPair { slice_local, k: c }
@@ -1683,6 +2109,32 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                             IndexArith::Sub { .. } => None,
                         } {
                             Some(special)
+                        } else if matches!(arith, IndexArith::Add { .. })
+                            && let Some(slice_local) = spec_of(lhs)
+                                .and_then(slice_of_special)
+                                .or_else(|| spec_of(rhs).and_then(slice_of_special))
+                        {
+                            // Non-const `base + i` of a leftover slice
+                            // (`do_call` n>1, `try_new` live-tail) when `i`
+                            // is a local this body assigned. An unassigned
+                            // addend (return place, parameter) stays
+                            // `index-not-static`. A `const` item rustc
+                            // spells as `Copy(Global)` is the same shape
+                            // (`FrameBox::new` `inputs + FRAME_BOX_DEBUG_INPUT`).
+                            let other = if spec_of(lhs).and_then(slice_of_special).is_some() {
+                                rhs
+                            } else {
+                                lhs
+                            };
+                            if slice_addend_is_computed(other, cx.stmt_assigned) {
+                                Some(if matches!(arith, IndexArith::Add { checked: true }) {
+                                    Special::SliceIndexPair { slice_local, k: 0 }
+                                } else {
+                                    Special::SliceIndex { slice_local, k: 0 }
+                                })
+                            } else {
+                                None
+                            }
                         } else {
                             let index_of = |o: &Operand| match spec_of(o) {
                                 Some(
@@ -1696,13 +2148,13 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                             // names a just-pinned slot as `shadow_stack_len() - 1`.
                             let offset = match (arith, index_of(lhs), index_of(rhs)) {
                                 (IndexArith::Add { checked }, Some((k, relative)), None) => {
-                                    const_usize(rhs, llbc).map(|c| (k + c, checked, relative))
+                                    const_addend(rhs).map(|c| (k + c, checked, relative))
                                 }
                                 (IndexArith::Add { checked }, None, Some((k, relative))) => {
-                                    const_usize(lhs, llbc).map(|c| (k + c, checked, relative))
+                                    const_addend(lhs).map(|c| (k + c, checked, relative))
                                 }
                                 (IndexArith::Sub { checked }, Some((k, relative)), None) => {
-                                    const_usize(rhs, llbc).and_then(|c| {
+                                    const_addend(rhs).and_then(|c| {
                                         k.checked_sub(c).map(|n| (n, checked, relative))
                                     })
                                 }
@@ -1740,17 +2192,36 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
             };
             if let Some(special) = special {
                 cx.bind(dest, special)?;
-                cx.record_removed(bb, si);
+                // Slice bases stay assigned (`dest = 0`) and their `base + k`
+                // arithmetic is kept, so dummy-`k == 0` Get can use that
+                // dest as the runtime element index. Guard / Alias / Index
+                // defs are stripped.
+                if !is_slice_special(special) {
+                    cx.record_removed(bb, si);
+                }
             }
         }
         let term_json = block.terminator.kind_value();
         match block.term_ref(llbc) {
             Ok(TermKind::Call { call, target, .. }) => {
+                if let Some(dest) = place_local(&call.dest) {
+                    cx.note_local_assign(dest);
+                }
                 let Some(&(leaf, method)) = classified.get(&bb) else {
                     if let Some((d, skew)) = mem_drop_guard(call, llbc, &cx.specials) {
                         if d > depth {
-                            return Err("close-above-depth");
+                            // Drop flag: this path did not open the guard
+                            // (`funccall_flat_from_args` nargs arm copies a
+                            // Conditional Drop of a nested `_scope` opened on
+                            // a deeper arm). Erase the Call; do not rewind.
+                            // Forget the key so a later join does not see a
+                            // nested pin-count the short arm never held.
+                            cx.forget_closed_guards(d);
+                            cx.record_term(bb, *target, Vec::new());
+                            cx.reach(bb, *target, depth, lo, open)?;
+                            continue;
                         }
+                        cx.forget_closed_guards(d);
                         depth = d;
                         lo = d - skew;
                         open = open.saturating_sub(1);
@@ -1843,7 +2314,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                 };
                 let mut stmts = Vec::new();
                 match leaf {
-                    Leaf::Open => {
+                    Leaf::Open | Leaf::ItemsOpen => {
                         let dest = dest.ok_or("guard-dest-projected")?;
                         cx.bind(
                             dest,
@@ -1853,6 +2324,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                             },
                         )?;
                         open += 1;
+                        cx.note_guard_pins(dest, GuardPins::Exact(0));
                     }
                     Leaf::GuardNew => {
                         let dest = dest.ok_or("guard-dest-projected")?;
@@ -1896,6 +2368,8 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                         };
                         pin_depth(&mut depth, &mut lo, 1 + extra);
                         cx.bump_slot_count(depth);
+                        open += 1;
+                        cx.note_guard_pins(dest, GuardPins::Exact(1 + extra));
                     }
                     Leaf::AnchorOpen => {
                         let dest = dest.ok_or("guard-dest-projected")?;
@@ -1926,7 +2400,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                         open += 1;
                         cx.bump_slot_count(depth);
                     }
-                    Leaf::Close => {
+                    Leaf::Close | Leaf::ItemsClose => {
                         let (d, skew) = if let Some(g) = guard {
                             cx.guard_open(g)?
                         } else {
@@ -1939,6 +2413,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                         if d > depth {
                             return Err("close-above-depth");
                         }
+                        cx.forget_closed_guards(d);
                         depth = d;
                         lo = d - skew;
                         open = open.saturating_sub(1);
@@ -1962,7 +2437,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                             },
                         )?;
                     }
-                    Leaf::Pin => {
+                    Leaf::Pin | Leaf::ItemsPush => {
                         let value = &args_json[arg0];
                         let ty = value
                             .as_object()
@@ -1976,15 +2451,22 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                             let copied = copy_operand_json(value);
                             stmts.push(assign_json(
                                 local_place_json(cx.slot_local(depth), &ty),
-                                json!({ "Use": [copied, "Yes"] }),
+                                json!({ "Use": [copied.clone(), "Yes"] }),
                             ));
-                            stmts.push(assign_json(
-                                dest_json.clone(),
-                                json!({ "Use": [copied, "Yes"] }),
-                            ));
+                            // `pin_root` answers the value; `RootedItems::push`
+                            // answers `()`. Copy dest only when it is the value.
+                            if dest_json.get("ty") == Some(&ty) {
+                                stmts.push(assign_json(
+                                    dest_json.clone(),
+                                    json!({ "Use": [copied, "Yes"] }),
+                                ));
+                            }
                         }
                         pin_depth(&mut depth, &mut lo, 1);
                         cx.bump_slot_count(depth);
+                        if let Some(g) = guard {
+                            cx.bump_guard_pins(g);
+                        }
                     }
                     Leaf::Publish => {
                         let slice = call.args.get(arg0).and_then(operand_local);
@@ -2043,11 +2525,55 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                             if let Some(dest) = dest {
                                 cx.bind(dest, Special::SliceBase { slice_local })?;
                             }
+                            if cx.emit() {
+                                stmts.push(assign_json(
+                                    dest_json.clone(),
+                                    json!({ "Use": [{ "Const": [{ "Integer": { "Unsigned": ["Usize", "0"] } }, dest_json["ty"].clone()] }, "Yes"] }),
+                                ));
+                            }
+                        } else if let Some(slice_local) =
+                            leftover_published_slice(body, block, slice, llbc)
+                        {
+                            // Body-built slice (`try_new` `Vec`, `FrameBox::new`
+                            // published array phi): `get(base + k)` is
+                            // `getarrayitem` of that list. Dest Const 0 so a
+                            // later `base + i` names element `i`.
+                            if let Some(dest) = dest {
+                                cx.bind(dest, Special::SliceBase { slice_local })?;
+                            }
+                            if cx.emit() {
+                                stmts.push(assign_json(
+                                    dest_json.clone(),
+                                    json!({ "Use": [{ "Const": [{ "Integer": { "Unsigned": ["Usize", "0"] } }, dest_json["ty"].clone()] }, "Yes"] }),
+                                ));
+                            }
                         } else {
                             return Err("publish-array-unresolved");
                         }
                     }
-                    Leaf::Normalize => {}
+                    Leaf::ItemsLen | Leaf::ItemsIsEmpty => {
+                        let g = guard.ok_or("items-count-without-guard")?;
+                        let n = cx
+                            .pin_count
+                            .get(&g)
+                            .copied()
+                            .and_then(GuardPins::exact)
+                            .ok_or("items-count-not-static")?;
+                        dest.ok_or("index-dest-projected")?;
+                        if cx.emit() {
+                            let ty = dest_json["ty"].clone();
+                            let lit = if matches!(leaf, Leaf::ItemsLen) {
+                                json!({ "Integer": { "Unsigned": ["Usize", n.to_string()] } })
+                            } else {
+                                json!({ "Bool": n == 0 })
+                            };
+                            stmts.push(assign_json(
+                                dest_json.clone(),
+                                json!({ "Use": [{ "Const": [lit, ty] }, "Yes"] }),
+                            ));
+                        }
+                    }
+                    Leaf::Normalize | Leaf::ItemsNop => {}
                     Leaf::NormalizeMoved => {
                         if cx.emit() {
                             let ty = dest_json["ty"].clone();
@@ -2092,10 +2618,21 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                                     return Err("get-above-depth");
                                 }
                                 if cx.emit() {
-                                    stmts.push(assign_json(
-                                        dest_json.clone(),
-                                        slice_elem_use(body, slice_local, dest_json, k)?,
-                                    ));
+                                    // Dummy k from leftover-slice `base + i`,
+                                    // or compile-time `base + 0`. Publish dest
+                                    // is 0, so this operand is the element
+                                    // index.
+                                    let rvalue = if k == 0 {
+                                        slice_index_use(
+                                            body,
+                                            slice_local,
+                                            dest_json,
+                                            copy_operand_json(&args_json[arg0]),
+                                        )?
+                                    } else {
+                                        slice_elem_use(body, slice_local, dest_json, k)?
+                                    };
+                                    stmts.push(assign_json(dest_json.clone(), rvalue));
                                 }
                             }
                             _ if const_k.is_some() => {
@@ -2124,6 +2661,35 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                             })
                             .ok_or("index-not-static")?;
                         let slot = d.checked_add(k).ok_or("get-above-depth")?;
+                        cx.check_slot_read(slot, false, depth, lo, false)?;
+                        if cx.emit() {
+                            let ty = cx.slot_ty_at(slot).ok_or("get-before-any-pin")?;
+                            stmts.push(assign_json(
+                                dest_json.clone(),
+                                json!({ "Use": [{ "Read": local_place_json(cx.slot_local(slot), &ty) }, "Yes"] }),
+                            ));
+                        }
+                    }
+                    Leaf::ItemsGet => {
+                        // `take` has no index; the rewrite has no Vec constructor.
+                        let Some(index_op) = call.args.get(arg0) else {
+                            return Err("unmodeled-stack-op");
+                        };
+                        // `RootedItems::get(i)`: `i` is an offset from the
+                        // set's open depth (`gc_roots.rs` `RootedItems::get`).
+                        let rel = const_usize(index_op, llbc)
+                            .or_else(|| {
+                                operand_local(index_op)
+                                    .and_then(|l| cx.const_locals.get(&l).copied())
+                            })
+                            .ok_or("index-not-static")?;
+                        let g = guard.ok_or("get-without-guard")?;
+                        let (d, _) = cx.guard_open(g)?;
+                        let pins = cx.pin_count.get(&g).map(|p| p.count()).unwrap_or(0);
+                        if rel >= pins {
+                            return Err("get-out-of-set");
+                        }
+                        let slot = d.checked_add(rel).ok_or("get-above-depth")?;
                         cx.check_slot_read(slot, false, depth, lo, false)?;
                         if cx.emit() {
                             let ty = cx.slot_ty_at(slot).ok_or("get-before-any-pin")?;
@@ -2175,13 +2741,7 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                             ));
                         }
                     }
-                    Leaf::Unmodeled
-                    | Leaf::CopyRange
-                    | Leaf::ItemsOpen
-                    | Leaf::ItemsPush
-                    | Leaf::ItemsNop
-                    | Leaf::ItemsGet
-                    | Leaf::ItemsClose => unreachable!("refused above"),
+                    Leaf::Unmodeled | Leaf::CopyRange => unreachable!("refused above"),
                 }
                 cx.record_term(bb, *target, stmts);
                 cx.reach(bb, *target, depth, lo, open)?;
@@ -2194,13 +2754,23 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                     // A drop flag the artefact does not carry can leave the
                     // guard unopened on this path; the depth says so.
                     if d > depth {
-                        return Err("close-above-depth");
+                        // Drop flag: this path did not open the guard
+                        // (`funccall_flat_from_args` nargs arm copies a
+                        // Conditional Drop of a nested `_scope` opened on
+                        // a deeper arm). Erase the Drop; do not rewind.
+                        // Forget the key so a later join does not see a
+                        // nested pin-count the short arm never held.
+                        cx.forget_closed_guards(d);
+                        cx.record_term(bb, *target, Vec::new());
+                        cx.reach(bb, *target, depth, lo, open)?;
+                    } else {
+                        cx.forget_closed_guards(d);
+                        depth = d;
+                        lo = d - skew;
+                        open = open.saturating_sub(1);
+                        cx.record_term(bb, *target, Vec::new());
+                        cx.reach(bb, *target, depth, lo, open)?;
                     }
-                    depth = d;
-                    lo = d - skew;
-                    open = open.saturating_sub(1);
-                    cx.record_term(bb, *target, Vec::new());
-                    cx.reach(bb, *target, depth, lo, open)?;
                 } else if dropped.is_some_and(|l| {
                     is_root_scope_local(body, llbc, l) || is_frame_anchor_local(body, llbc, l)
                 }) {
@@ -2216,18 +2786,9 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                 cx.reach(bb, *target, depth, lo, open)?;
             }
             Ok(TermKind::Goto { target }) => cx.reach(bb, *target, depth, lo, open)?,
-            Ok(TermKind::Switch { targets, .. }) => match targets {
-                majit_charon_reader::ullbc::SwitchTargets::If(a, b) => {
-                    cx.reach(bb, *a, depth, lo, open)?;
-                    cx.reach(bb, *b, depth, lo, open)?;
-                }
-                majit_charon_reader::ullbc::SwitchTargets::SwitchInt(_, arms, default) => {
-                    for (_, t) in arms {
-                        cx.reach(bb, *t, depth, lo, open)?;
-                    }
-                    cx.reach(bb, *default, depth, lo, open)?;
-                }
-            },
+            Ok(TermKind::Switch { discr, targets }) => {
+                cx.reach_switch(bb, discr, targets, depth, lo, open)?;
+            }
             Ok(TermKind::Return) => {
                 if depth != 0 {
                     // 10.04 `Drop` of the guard lives in an `is_cleanup`
@@ -2285,6 +2846,11 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     // after the rewrite nothing rewinds a leftover
     // (`_fix_graph_after_inlining`). A callee that only reads below entry
     // is checked against the entry depth in the walk below.
+    //
+    // A returned owned guard is that leftover packaged in the dest the
+    // caller drops, so it is not this body's slots. ParamSlots methods
+    // of that dest read the nested bracket.
+    let owned_scope_locals = owned_scope_receiver_locals(body, llbc, &forward_blocks);
     for (bb, block) in body.body.iter().enumerate() {
         if !forward_blocks[bb] {
             continue;
@@ -2293,7 +2859,9 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             && classify_call(call, llbc).is_none()
         {
             let effect = resolved_callee_effect(call, llbc, &|id| callee_effect_of(llbc, id));
-            if effect.refuses_erase() {
+            if effect.refuses_erase()
+                && !callee_leftover_is_owned_scope(call, llbc, &owned_scope_locals)
+            {
                 if crate::decline::enabled() {
                     eprintln!(
                         "[erase] refuses_erase {} as {}",
@@ -2350,12 +2918,17 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     depth_in[0] = Some(0);
     lo_in[0] = Some(0);
     open_in[0] = Some(0);
+    let mut pin_count_in: Vec<Option<HashMap<usize, GuardPins>>> = vec![None; n_blocks];
+    pin_count_in[0] = Some(HashMap::new());
 
     let mut probe_specials = HashMap::new();
     let mut queue: VecDeque<usize> = VecDeque::from([0]);
     let mut visited = vec![false; n_blocks];
     let mut dummy_getter_bbs = bit_set::BitSet::new();
     let mut dummy_capture = bit_set::BitSet::new();
+    let mut split_key_in: Vec<Option<Option<(usize, u64)>>> = vec![None; n_blocks];
+    let mut arm_exit: HashMap<(usize, u64), (usize, usize, usize)> = HashMap::new();
+    let mut scrutinee_killed: HashSet<usize> = HashSet::new();
     {
         let mut cx = EraseWalk {
             mode: WalkMode::Probe,
@@ -2377,18 +2950,28 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             queue: &mut queue,
             visited: &mut visited,
             specials: &mut probe_specials,
+            pin_count: HashMap::new(),
+            pin_count_in: &mut pin_count_in,
+            frozen_pin_count: &[],
             plan: None,
             const_locals: &mut const_locals,
             array_lens: &mut array_lens,
             getter_cache: &mut getter_cache,
             getter_bbs: &mut dummy_getter_bbs,
             capture_temps: &mut dummy_capture,
+            copy_of: HashMap::new(),
+            scrutinee_killed: &mut scrutinee_killed,
+            incoming_hi: 0,
+            split_key: None,
+            split_key_in: &mut split_key_in,
+            arm_exit: &mut arm_exit,
         };
         run_erase_walk(&mut cx)?;
     }
 
     let frozen_depth = depth_in.clone();
     let frozen_lo = lo_in.clone();
+    let frozen_pin_count = pin_count_in.clone();
     visited.fill(false);
     queue.clear();
     queue.push_back(0);
@@ -2400,6 +2983,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         slot_count: 0,
         slot_ty: None,
         slot_tys: HashMap::new(),
+        pin_count: HashMap::new(),
         unreachable: Vec::new(),
     };
     let mut emit_specials = HashMap::new();
@@ -2426,12 +3010,21 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             queue: &mut queue,
             visited: &mut visited,
             specials: &mut emit_specials,
+            pin_count: HashMap::new(),
+            pin_count_in: &mut pin_count_in,
+            frozen_pin_count: &frozen_pin_count,
             plan: Some(&mut plan),
             const_locals: &mut const_locals,
             array_lens: &mut array_lens,
             getter_cache: &mut getter_cache,
             getter_bbs: &mut getter_bbs,
             capture_temps: &mut capture_temps,
+            copy_of: HashMap::new(),
+            scrutinee_killed: &mut scrutinee_killed,
+            incoming_hi: 0,
+            split_key: None,
+            split_key_in: &mut split_key_in,
+            arm_exit: &mut arm_exit,
         };
         run_erase_walk(&mut cx)?;
     }
@@ -2483,8 +3076,13 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     // Every surviving mention of a guard, borrow or index has to be one of the
     // shapes rewritten above; anything else would read a local no block binds.
     let mut watched = bit_set::BitSet::new();
-    for local in plan.specials.keys() {
-        watched.insert(*local);
+    for (local, special) in &plan.specials {
+        // Slice bases stay assigned (`dest = 0`) and their `base + k`
+        // arithmetic is kept, so a surviving mention is a use of a
+        // bound local. Guard / Alias / Index defs are stripped.
+        if !is_slice_special(*special) {
+            watched.insert(*local);
+        }
     }
     for (bb, block) in body.body.iter().enumerate() {
         if !forward_blocks[bb] {
@@ -2545,16 +3143,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
 }
 
 fn leaf_unmodeled_for_erase(leaf: Leaf) -> bool {
-    matches!(
-        leaf,
-        Leaf::Unmodeled
-            | Leaf::CopyRange
-            | Leaf::ItemsOpen
-            | Leaf::ItemsPush
-            | Leaf::ItemsNop
-            | Leaf::ItemsGet
-            | Leaf::ItemsClose
-    )
+    matches!(leaf, Leaf::Unmodeled | Leaf::CopyRange)
 }
 
 fn is_rooted_items_local(body: &Unstructured, llbc: &Llbc, local: usize) -> bool {
@@ -2576,7 +3165,10 @@ pub(super) fn is_root_scope_local(body: &Unstructured, llbc: &Llbc, local: usize
     };
     super::output_adt_def_id_free(&decl.ty, llbc)
         .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|t| super::gc_root_scope_type_path(t.item_meta.name_path_str()))
+        .is_some_and(|t| {
+            let path = t.item_meta.name_path_str();
+            super::gc_root_scope_type_path(path) || super::gc_rooted_items_type_path(path)
+        })
 }
 
 /// Drop of the guard / `root_scope_close` rewinds to the open depth, so
@@ -2590,7 +3182,10 @@ fn block_rewinds_scope(
     specials: &HashMap<usize, Special>,
     bb: usize,
 ) -> bool {
-    if matches!(classified.get(&bb), Some((Leaf::Close, _))) {
+    if matches!(
+        classified.get(&bb),
+        Some((Leaf::Close | Leaf::ItemsClose, _))
+    ) {
         return true;
     }
     match body.body.get(bb).and_then(|b| b.term_ref(llbc).ok()) {
@@ -2740,6 +3335,23 @@ fn slice_elem_use(
     dest_place: &Value,
     k: usize,
 ) -> Result<Value, Refusal> {
+    let offset = json!({
+        "Const": [
+            { "Integer": { "Unsigned": ["Usize", k.to_string()] } },
+            { "Deduplicated": 0 }
+        ]
+    });
+    slice_index_use(body, slice_local, dest_place, offset)
+}
+
+/// `(*slice)[index]` as a `Use` rvalue. Leftover-slice `get(base + i)`
+/// passes the get's index operand; a compile-time `k` is a usize Const.
+fn slice_index_use(
+    body: &Unstructured,
+    slice_local: usize,
+    dest_place: &Value,
+    index_op: Value,
+) -> Result<Value, Refusal> {
     let slice_ty = body
         .locals
         .locals
@@ -2747,17 +3359,11 @@ fn slice_elem_use(
         .map(|loc| ty_ref_json(&loc.ty))
         .ok_or("slice-untyped")?;
     let elem_ty = dest_place.get("ty").cloned().ok_or("get-dest-untyped")?;
-    let local_place = json!({ "kind": { "Local": slice_local }, "ty": slice_ty });
+    let local_place = json!({ "kind": { "Local": slice_local }, "ty": slice_ty.clone() });
     let deref = json!({ "kind": { "Projection": [local_place, "Deref"] }, "ty": slice_ty });
-    let offset = json!({
-        "Const": [
-            { "Integer": { "Unsigned": ["Usize", k.to_string()] } },
-            { "Deduplicated": 0 }
-        ]
-    });
     let index_place = json!({
         "kind": {
-            "Projection": [deref, { "Index": { "offset": offset, "from_end": false } }]
+            "Projection": [deref, { "Index": { "offset": index_op, "from_end": false } }]
         },
         "ty": elem_ty
     });
@@ -2871,6 +3477,57 @@ fn resolve_published_array(
     None
 }
 
+/// Same-block walk as [`resolve_published_array`], then the leftover local
+/// when the published value is a body-built slice (`try_new` `Vec`, a
+/// phi of `FrameBox::new`'s published array) rather than an incoming
+/// parameter or a `[x, y]` aggregate.
+fn leftover_published_slice(
+    body: &Unstructured,
+    block: &majit_charon_reader::ullbc::BasicBlock,
+    slice: Option<usize>,
+    llbc: &Llbc,
+) -> Option<usize> {
+    let mut want = slice?;
+    for stmt in block.statements.iter().rev() {
+        let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+            continue;
+        };
+        if place_local(place) != Some(want) {
+            continue;
+        }
+        match rvalue {
+            Rvalue::UnaryOp(_, op) | Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => {
+                want = operand_local(op)?;
+            }
+            Rvalue::Ref { place: src, .. } | Rvalue::RawPtr { place: src, .. } => {
+                want = place_local(src).or_else(|| deref_of_local(src))?;
+            }
+            Rvalue::Aggregate(kind, _) if kind.get("Array").is_some() => {
+                return None;
+            }
+            _ => return None,
+        }
+    }
+    if is_root_scope_local(body, llbc, want) || is_frame_anchor_local(body, llbc, want) {
+        return None;
+    }
+    Some(want)
+}
+
+/// Dummy rvalue that initialises a slot local: a copy of an argument of
+/// the same type. Extra-pin slots used after a disagreeing join
+/// (`funccall_flat_from_args` `match nargs`) are live through the shared
+/// suffix, so the short arm needs a definition even though it never
+/// pinned that index. The arm that did pin overwrites the seed.
+fn slot_seed_rvalue(u: &Value, ty: &Value) -> Option<Value> {
+    let locals = u["locals"]["locals"].as_array()?;
+    let arg_count = u["locals"]["arg_count"].as_u64()? as usize;
+    (1..=arg_count).find_map(|i| {
+        (locals.get(i)?.get("ty") == Some(ty))
+            .then(|| json!({ "Use": [{ "Read": local_place_json(i, ty) }, "Yes"] }))
+    })
+}
+
 /// Rewrite `fd`'s body with its root brackets scalar-replaced.
 ///
 /// `Ok(None)`: the body has no bracket.  `Err`: it has one this pass refuses;
@@ -2903,17 +3560,26 @@ pub(super) fn erase_shadow_stack(
     };
     let mut u = unstructured_json_from_body(body);
     let span = u["span"].clone();
-    // The slot locals.
-    if plan.slot_count > 0 {
+    // Slot locals. Seed them in bb0 so a merge whose predecessors pinned
+    // different counts still has every extra slot assigned on the short
+    // arms: those locals are live through the shared suffix. A later
+    // switch that restores reads the arm's own pin, which overwrote the
+    // seed.
+    let slot_seed = if plan.slot_count > 0 {
+        let tys: Result<Vec<Value>, Refusal> = (0..plan.slot_count)
+            .map(|k| {
+                plan.slot_tys
+                    .get(&k)
+                    .cloned()
+                    .or_else(|| plan.slot_ty.clone())
+                    .ok_or("slot-untyped")
+            })
+            .collect();
+        let tys = tys?;
+        let seeds: Vec<Option<Value>> = tys.iter().map(|ty| slot_seed_rvalue(&u, ty)).collect();
         let locals = u["locals"]["locals"].as_array_mut().ok_or("body-json")?;
         let base = locals.len();
-        for k in 0..plan.slot_count {
-            let ty = plan
-                .slot_tys
-                .get(&k)
-                .cloned()
-                .or_else(|| plan.slot_ty.clone())
-                .ok_or("slot-untyped")?;
+        for (k, ty) in tys.iter().enumerate() {
             locals.push(json!({
                 "index": base + k,
                 "name": null,
@@ -2921,7 +3587,10 @@ pub(super) fn erase_shadow_stack(
                 "ty": ty,
             }));
         }
-    }
+        Some((base, tys, seeds))
+    } else {
+        None
+    };
     let blocks = u["body"].as_array_mut().ok_or("body-json")?;
     for (bb, block) in blocks.iter_mut().enumerate() {
         // An unreachable block may still name a guard or an index whose
@@ -2934,7 +3603,11 @@ pub(super) fn erase_shadow_stack(
         let removed = plan.removed.get(&bb);
         let term = plan.terms.get(&bb);
         let has_inserts = plan.inserted_after.keys().any(|(b, _)| *b == bb);
-        if removed.is_none() && term.is_none() && !has_inserts {
+        let seed_here = bb == 0
+            && slot_seed
+                .as_ref()
+                .is_some_and(|(_, _, seeds)| seeds.iter().any(Option::is_some));
+        if removed.is_none() && term.is_none() && !has_inserts && !seed_here {
             continue;
         }
         let stmt_span = block["terminator"]["span"].clone();
@@ -2946,7 +3619,17 @@ pub(super) fn erase_shadow_stack(
             })
         };
         let old = block["statements"].as_array().cloned().unwrap_or_default();
-        let mut new = Vec::with_capacity(old.len());
+        let mut new = Vec::with_capacity(old.len() + plan.slot_count);
+        if seed_here && let Some((base, tys, seeds)) = &slot_seed {
+            for (k, (ty, rv)) in tys.iter().zip(seeds.iter()).enumerate() {
+                if let Some(rv) = rv {
+                    new.push(make_stmt(assign_json(
+                        local_place_json(*base + k, ty),
+                        rv.clone(),
+                    )));
+                }
+            }
+        }
         for (si, stmt) in old.into_iter().enumerate() {
             if !removed.is_some_and(|r| r.contains(&si)) {
                 new.push(stmt);
@@ -2980,11 +3663,7 @@ fn span_ref_json(span: &SpanRef) -> Value {
 }
 
 fn ty_ref_json(ty: &TyRef) -> Value {
-    match ty {
-        TyRef::Dedup { id } => json!({ "Deduplicated": id }),
-        TyRef::Inline { value: (id, v) } => json!({ "Value": [*id, v] }),
-        TyRef::Other(v) => v.clone(),
-    }
+    super::tyref_as_json(ty)
 }
 
 /// JSON for `body` as the rewrite sees it: same blocks, same statement
@@ -3465,6 +4144,101 @@ fn resolved_callee_effect(
     effect(&super::scope_owner_identity(llbc, fd))
 }
 
+fn call_fun_decl_id(call: &majit_charon_reader::ullbc::CallPayload) -> Option<u64> {
+    let majit_charon_reader::ullbc::CallFunc::Regular(reg) = &call.func else {
+        return None;
+    };
+    super::regular_call_fun_decl_id(&reg.kind)
+}
+
+fn call_returns_owned_scope(call: &majit_charon_reader::ullbc::CallPayload, llbc: &Llbc) -> bool {
+    call_fun_decl_id(call).is_some_and(|id| super::fn_returns_owned_scope(llbc, id))
+}
+
+/// Locals that hold a nested owned guard this body received, plus the
+/// borrows and copies the artefact passes as the method receiver.
+fn owned_scope_receiver_locals(
+    body: &Unstructured,
+    llbc: &Llbc,
+    forward_blocks: &[bool],
+) -> HashSet<usize> {
+    let mut owned = HashSet::new();
+    for (bb, block) in body.body.iter().enumerate() {
+        if !forward_blocks[bb] {
+            continue;
+        }
+        if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
+            && classify_call(call, llbc).is_none()
+            && resolved_callee_effect(call, llbc, &|id| callee_effect_of(llbc, id)).refuses_erase()
+            && call_returns_owned_scope(call, llbc)
+            && let Some(dest) = place_local(&call.dest)
+        {
+            owned.insert(dest);
+        }
+    }
+    if owned.is_empty() {
+        return owned;
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (bb, block) in body.body.iter().enumerate() {
+            if !forward_blocks[bb] {
+                continue;
+            }
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                let Some(dest) = place_local(place) else {
+                    continue;
+                };
+                if owned.contains(&dest) {
+                    continue;
+                }
+                let src = match rvalue {
+                    Rvalue::Ref { place: src, .. } | Rvalue::RawPtr { place: src, .. } => {
+                        place_local(src).or_else(|| deref_of_local(src))
+                    }
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) => {
+                        place_local(src).or_else(|| deref_of_local(src))
+                    }
+                    _ => None,
+                };
+                if src.is_some_and(|l| owned.contains(&l)) {
+                    owned.insert(dest);
+                    changed = true;
+                }
+            }
+        }
+    }
+    owned
+}
+
+/// The leftover this call publishes is a nested owned guard the caller
+/// holds, or a ParamSlots read of that guard, not this body's slot locals.
+fn callee_leftover_is_owned_scope(
+    call: &majit_charon_reader::ullbc::CallPayload,
+    llbc: &Llbc,
+    owned: &HashSet<usize>,
+) -> bool {
+    let effect = resolved_callee_effect(call, llbc, &|id| callee_effect_of(llbc, id));
+    if effect.observes {
+        return false;
+    }
+    if call_returns_owned_scope(call, llbc) {
+        return true;
+    }
+    !effect.param_slots.is_empty()
+        && !effect.leaves_above
+        && !effect.returns_index
+        && call
+            .args
+            .first()
+            .and_then(operand_local)
+            .is_some_and(|l| owned.contains(&l))
+}
+
 /// Result of the per-path shadow-stack walk.
 struct StackWalk {
     /// `None` when every reachable return / unwind restores the entry
@@ -3926,7 +4700,11 @@ fn stack_walk(
                                     None => depth = depth.after_unknown_push(),
                                 }
                             }
-                            Leaf::Normalize | Leaf::NormalizeMoved | Leaf::ItemsNop => {}
+                            Leaf::Normalize
+                            | Leaf::NormalizeMoved
+                            | Leaf::ItemsNop
+                            | Leaf::ItemsLen
+                            | Leaf::ItemsIsEmpty => {}
                             Leaf::Get | Leaf::Set | Leaf::CopyRange => {
                                 if !call
                                     .args
@@ -4518,7 +5296,9 @@ pub fn ensure_stack_sensitive_fns(llbc: &Llbc) {
 mod tests {
     use super::*;
     use majit_charon_reader::Llbc;
+    use majit_charon_reader::ullbc::StmtKind;
     use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn origportal_alias_is_a_registered_rewritten_portal() {
@@ -5082,6 +5862,38 @@ mod tests {
 
     fn usize_lit(k: u64) -> Value {
         json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]})
+    }
+
+    fn switch_int(discr: u64, arms: &[(u64, u64)], default: u64) -> Value {
+        json!({"Switch": {
+            "discr": {"Read": place(discr)},
+            "targets": {"SwitchInt": [
+                null,
+                arms.iter().map(|(v, t)| json!([
+                    {"Scalar": {"Unsigned": ["Usize", v.to_string()]}},
+                    t
+                ])).collect::<Vec<_>>(),
+                default
+            ]}
+        }})
+    }
+
+    fn json_has_local(v: &Value, local: usize) -> bool {
+        match v {
+            Value::Object(m) => {
+                m.get("Local").and_then(Value::as_u64) == Some(local as u64)
+                    || m.values().any(|c| json_has_local(c, local))
+            }
+            Value::Array(a) => a.iter().any(|c| json_has_local(c, local)),
+            _ => false,
+        }
+    }
+
+    fn rewrite_copies_slot(plan: &Plan, bb: usize, slot_k: usize, n_locals: usize) -> bool {
+        let local = n_locals + slot_k;
+        plan.terms
+            .get(&bb)
+            .is_some_and(|t| t.stmts.iter().any(|stmt| json_has_local(stmt, local)))
     }
 
     /// A cleanup block that reassigns a local is not a second definition.
@@ -6744,6 +7556,68 @@ mod tests {
         }
     }
 
+    /// `do_call` n>1 / `finish_for_call` `get(args_base + i)`: `i` is a
+    /// local this body assigned, not a parameter. Dummy `k == 0` names the
+    /// get operand as the element index.
+    #[test]
+    fn analyze_erases_incoming_slice_get_with_assigned_runtime_index() {
+        let llbc = incoming_slice_llbc();
+        let body = body_of_args(
+            1,
+            7,
+            vec![
+                bb(call_fun(1, vec![], 2, 1)),
+                bb(call_fun(5, vec![copy_local(1)], 3, 2)),
+                bb_stmts(
+                    vec![
+                        assign_local(4, json!({"Len": place(1)})),
+                        assign_local(
+                            5,
+                            json!({"BinaryOp": ["Add", copy_local(3), copy_local(4)]}),
+                        ),
+                    ],
+                    call_fun(2, vec![copy_local(5)], 6, 3),
+                ),
+                bb(drop_local(2, 4)),
+                bb(json!("Return")),
+            ],
+        );
+        let plan = match analyze(&body, &llbc) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => {
+                panic!("expected accepted erase of assigned runtime slice index, got {reason}")
+            }
+        };
+        assert!(
+            plan.removed.get(&2).is_none_or(|r| !r.contains(&1)),
+            "dummy-k base+i stays assigned so Get can use that dest as the index"
+        );
+    }
+
+    /// `try_new` `pin_roots(&live)` / `FrameBox::new` publish of a phi
+    /// slice: leftover local after the same-block walk, not an incoming
+    /// parameter and not an array aggregate.
+    #[test]
+    fn analyze_erases_leftover_local_slice_publish() {
+        let llbc = incoming_slice_llbc();
+        let body = body_of(
+            5,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(5, vec![copy_local(2)], 3, 2)),
+                bb(call_fun(2, vec![copy_local(3)], 4, 3)),
+                bb(drop_local(1, 4)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected leftover-slice publish to erase, got {reason}"),
+        }
+    }
+
     #[test]
     fn analyze_refuses_incoming_slice_get_after_close() {
         let llbc = incoming_slice_llbc();
@@ -7020,6 +7894,111 @@ mod tests {
         );
     }
 
+    /// Two SwitchInt on the same unmodified local: pin count per arm of
+    /// the first matches get count per arm of the second
+    /// (`funccall_flat_from_args` `match nargs`).
+    #[test]
+    fn analyze_erases_repeated_switch_on_same_scrutinee() {
+        let llbc = stack_ops_llbc();
+        let abort = json!({"Abort": "UndefinedBehavior"});
+        let body = body_of_args(
+            1,
+            12,
+            vec![
+                bb(call_fun(1, vec![], 2, 1)),
+                bb(switch_int(1, &[(0, 2), (1, 3)], 11)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 4, 5)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 5, 4)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 6, 5)),
+                bb(json!({"Goto": {"target": 6}})),
+                bb(switch_int(1, &[(0, 7), (1, 8)], 11)),
+                bb(call_fun(2, vec![usize_lit(0)], 8, 10)),
+                bb(call_fun(2, vec![usize_lit(0)], 9, 9)),
+                bb(call_fun(2, vec![usize_lit(1)], 10, 10)),
+                bb(drop_local(2, 12)),
+                bb(abort),
+                bb(json!("Return")),
+            ],
+        );
+        let n_locals = body.locals.locals.len();
+        let plan = match analyze(&body, &llbc) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => panic!("expected erasure of correlated pin/get switches"),
+            Err(reason) => panic!("expected erasure of correlated pin/get switches, got {reason}"),
+        };
+        assert!(
+            rewrite_copies_slot(&plan, 7, 0, n_locals),
+            "arm 0 get must copy the slot that arm pinned"
+        );
+        assert!(
+            rewrite_copies_slot(&plan, 8, 0, n_locals),
+            "arm 1 first get must copy slot 0"
+        );
+        assert!(
+            rewrite_copies_slot(&plan, 9, 1, n_locals),
+            "arm 1 second get must copy the second pin of that arm"
+        );
+        let fd: FunDecl =
+            serde_json::from_value(opaque_fun(9, &["other", "subject"], json!("Opaque")))
+                .expect("subject FunDecl");
+        let erased = match erase_shadow_stack(&fd, &body, &llbc) {
+            Ok(Some(erased)) => erased,
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        };
+        let seeded: Vec<usize> = erased.body[0]
+            .statements
+            .iter()
+            .filter_map(|stmt| match stmt.stmt_kind_ref() {
+                Ok(StmtKind::Assign(place, _)) => place_local(place),
+                _ => None,
+            })
+            .filter(|local| *local >= n_locals)
+            .collect();
+        assert!(
+            (0..plan.slot_count).all(|k| seeded.contains(&(n_locals + k))),
+            "every extra-pin slot must be seeded in bb0, got {seeded:?} for {} slots",
+            plan.slot_count
+        );
+    }
+
+    /// Same shape, but the scrutinee is assigned between the switches,
+    /// so the suffix Get of the extra pin is again in the join band.
+    #[test]
+    fn analyze_refuses_repeated_switch_after_scrutinee_reassign() {
+        let llbc = stack_ops_llbc();
+        let abort = json!({"Abort": "UndefinedBehavior"});
+        let body = body_of_args(
+            1,
+            12,
+            vec![
+                bb(call_fun(1, vec![], 2, 1)),
+                bb(switch_int(1, &[(0, 2), (1, 3)], 12)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 4, 5)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 5, 4)),
+                bb(call_fun(4, vec![json!({"Read": place(0)})], 6, 5)),
+                bb(json!({"Goto": {"target": 6}})),
+                bb_stmts(
+                    vec![assign_local(1, json!({"Use": [usize_lit(99), "Yes"]}))],
+                    json!({"Goto": {"target": 7}}),
+                ),
+                bb(switch_int(1, &[(0, 8), (1, 9)], 12)),
+                bb(call_fun(2, vec![usize_lit(0)], 8, 11)),
+                bb(call_fun(2, vec![usize_lit(0)], 9, 10)),
+                bb(call_fun(2, vec![usize_lit(1)], 10, 11)),
+                bb(drop_local(2, 13)),
+                bb(abort),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Err("absolute-get-above-join-floor") => {}
+            Ok(Some(_)) => panic!("expected absolute-get-above-join-floor, got accepted"),
+            Ok(None) => panic!("expected absolute-get-above-join-floor, got no bracket"),
+            Err(reason) => panic!("expected absolute-get-above-join-floor, got {reason}"),
+        }
+    }
+
     /// `ll_set_nonnull`: one arm binds the shared index local as a
     /// `pin_roots` dest (`relative: false`), the other as a `Len`
     /// (`relative: true`) then `pin_root`. Same `k` is a compatible
@@ -7157,6 +8136,1270 @@ mod tests {
             {
                 panic!("push_roots survived erase of w_module_dict_setitem_str_internal");
             }
+        }
+    }
+
+    fn type_struct(def_id: u64, name: &[&str]) -> Value {
+        json!({
+            "def_id": def_id,
+            "item_meta": {
+                "name": name.iter().map(|s| json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            },
+            "kind": {"Struct": []}
+        })
+    }
+
+    fn rooted_items_adt() -> Value {
+        json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    }
+
+    fn rooted_items_ref() -> Value {
+        json!({"Ref": ["Erased", rooted_items_adt(), "Mut"]})
+    }
+
+    fn value_ty() -> Value {
+        json!({"Scalar": {"Integer": {"Unsigned": "U64"}}})
+    }
+
+    fn unit_ty() -> Value {
+        json!({"Tuple": []})
+    }
+
+    fn usize_ty() -> Value {
+        json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}})
+    }
+
+    fn bool_ty() -> Value {
+        json!({"Scalar": "Bool"})
+    }
+
+    fn usize_const(k: u64) -> Value {
+        json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, usize_ty()]})
+    }
+
+    fn place_ty(i: u64, ty: &Value) -> Value {
+        json!({"kind": {"Local": i}, "ty": ty})
+    }
+
+    fn local_ty(i: u64, ty: Value) -> Value {
+        json!({"index": i, "name": null, "span": span(), "ty": ty})
+    }
+
+    fn call_term(fun: u64, args: Vec<Value>, dest: Value, target: u64, on_unwind: u64) -> Value {
+        json!({"Call": {
+            "call": {
+                "func": {"Regular": {"kind": {"Fun": fun}, "generics": {}}},
+                "args": args}, "dest": dest,
+            "target": target,
+            "on_unwind": on_unwind
+        }})
+    }
+
+    fn drop_term(local: u64, ty: &Value, target: u64, on_unwind: u64) -> Value {
+        json!({"Drop": {
+            "place": place_ty(local, ty),
+            "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
+            "target": target,
+            "on_unwind": on_unwind
+        }})
+    }
+
+    fn rooted_items_llbc(unstructured: Value) -> Llbc {
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "type_decls": [
+                    type_struct(0, &["pyre_object", "gc_roots", "RootedItems"])
+                ],
+                "fun_decls": [
+                    null,
+                    opaque_fun(1, &["pyre_object", "gc_roots", "RootedItems", "new"], json!("Opaque")),
+                    opaque_fun(2, &["pyre_object", "gc_roots", "RootedItems", "push"], json!("Opaque")),
+                    opaque_fun(3, &["pyre_object", "gc_roots", "RootedItems", "get"], json!("Opaque")),
+                    opaque_fun(4, &["pyre_object", "gc_roots", "RootedItems", "take"], json!("Opaque")),
+                    opaque_fun(
+                        5,
+                        &["pyre_object", "eval", "subject"],
+                        json!({ "Unstructured": unstructured })
+                    ),
+                    opaque_fun(6, &["pyre_object", "gc_roots", "RootedItems", "len"], json!("Opaque")),
+                    opaque_fun(7, &["pyre_object", "gc_roots", "RootedItems", "is_empty"], json!("Opaque"))
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        llbc
+    }
+
+    fn assign_copies_local(body: &Unstructured, dest: u64, src: u64) -> bool {
+        body.body.iter().any(|bb| {
+            bb.statements.iter().any(|st| {
+                let assign = &st.kind_value()["Assign"];
+                assign[0]["kind"].get("Local") == Some(&json!(dest))
+                    && assign[1]["Use"][0]
+                        .get("Read")
+                        .and_then(|p| p["kind"].get("Local"))
+                        == Some(&json!(src))
+            })
+        })
+    }
+
+    fn assign_uses_const_lit(body: &Unstructured, dest: u64, lit: &Value) -> bool {
+        body.body.iter().any(|bb| {
+            bb.statements.iter().any(|st| {
+                let assign = &st.kind_value()["Assign"];
+                assign[0]["kind"].get("Local") == Some(&json!(dest))
+                    && assign[1]["Use"][0].get("Const").and_then(|c| c.get(0)) == Some(lit)
+            })
+        })
+    }
+
+    fn rooted_items_call_paths(body: &Unstructured, llbc: &Llbc) -> Vec<String> {
+        body.body
+            .iter()
+            .filter_map(|bb| match bb.term_ref(llbc) {
+                Ok(TermKind::Call { call, .. }) => {
+                    super::callee_path(call, llbc).filter(|path| path.contains("RootedItems"))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `RootedItems::new` → `push(a)` → `push(b)` → `get(0)` / `get(_t)`
+    /// (`_t = const 1`) → `drop`. The rewrite removes every `RootedItems::*`
+    /// call and both gets read the pinned values.
+    #[test]
+    fn rooted_items_bracket_erases() {
+        let items = rooted_items_adt();
+        let items_ref = rooted_items_ref();
+        let value = value_ty();
+        let unit = unit_ty();
+        let usize = usize_ty();
+        let copy = |i: u64, ty: &Value| json!({"Read": place_ty(i, ty)});
+        let mv = |i: u64, ty: &Value| json!({"Move": place_ty(i, ty)});
+        let borrow = stmt(json!({
+            "Assign": [
+                place_ty(2, &items_ref),
+                {"Ref": {"place": place_ty(1, &items), "kind": "Mut", "ptr_metadata": null}}
+            ]
+        }));
+        let t_const = stmt(json!({
+            "Assign": [place_ty(7, &usize), {"Use": [usize_const(1), "Yes"]}]
+        }));
+        // bb0 new → bb1 push(a) → bb2 push(b) → bb3 get(0)
+        // → bb4 _t = 1; get(_t) → bb5 drop → bb6 return; bb7 unwind.
+        let unstructured = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 0,
+                "locals": [
+                    local_ty(0, unit.clone()),
+                    local_ty(1, items.clone()),
+                    local_ty(2, items_ref.clone()),
+                    local_ty(3, value.clone()),
+                    local_ty(4, value.clone()),
+                    local_ty(5, value.clone()),
+                    local_ty(6, value.clone()),
+                    local_ty(7, usize.clone()),
+                    local_ty(8, unit.clone())
+                ]
+            },
+            "body": [
+                bb_stmts(vec![], call_term(1, vec![], place_ty(1, &items), 1, 7)),
+                bb_stmts(
+                    vec![borrow],
+                    call_term(
+                        2,
+                        vec![copy(2, &items_ref), mv(3, &value)],
+                        place_ty(8, &unit),
+                        2,
+                        7
+                    )
+                ),
+                bb_stmts(
+                    vec![],
+                    call_term(
+                        2,
+                        vec![copy(2, &items_ref), mv(4, &value)],
+                        place_ty(8, &unit),
+                        3,
+                        7
+                    )
+                ),
+                bb_stmts(
+                    vec![],
+                    call_term(
+                        3,
+                        vec![copy(2, &items_ref), usize_const(0)],
+                        place_ty(5, &value),
+                        4,
+                        7
+                    )
+                ),
+                bb_stmts(
+                    vec![t_const],
+                    call_term(
+                        3,
+                        vec![copy(2, &items_ref), copy(7, &usize)],
+                        place_ty(6, &value),
+                        5,
+                        7
+                    )
+                ),
+                bb_stmts(vec![], drop_term(1, &items, 6, 7)),
+                bb_stmts(vec![], json!("Return")),
+                bb_stmts(vec![], json!("UnwindResume"))
+            ]
+        });
+        let llbc = rooted_items_llbc(unstructured);
+        let fd = llbc.fn_by_id(5).expect("subject");
+        let body = fd.unstructured().expect("stripped body");
+        let erased = match erase_shadow_stack(fd, &body, &llbc) {
+            Ok(Some(erased)) => erased,
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        };
+        assert!(
+            rooted_items_call_paths(&erased, &llbc).is_empty(),
+            "erased body still calls RootedItems::*: {:?}",
+            rooted_items_call_paths(&erased, &llbc)
+        );
+        // 9 original locals; slot 0 is local 9 (from `a`), slot 1 is local 10.
+        assert!(
+            assign_copies_local(&erased, 9, 3),
+            "push(a) should write slot 0 from a"
+        );
+        assert!(
+            assign_copies_local(&erased, 10, 4),
+            "push(b) should write slot 1 from b"
+        );
+        assert!(
+            assign_copies_local(&erased, 5, 9),
+            "get(0) should read the value pinned at slot 0"
+        );
+        assert!(
+            assign_copies_local(&erased, 6, 10),
+            "get(_t) with _t = const 1 should read the value pinned at slot 1"
+        );
+    }
+
+    /// `RootedItems::new` → `push(a)` → `len` → `get(0)` → `drop`.
+    /// `len` is `rlist.py` `ll_length`: dest is the pin count, not a deleted call.
+    #[test]
+    fn rooted_items_len_assigns_pin_count() {
+        let items = rooted_items_adt();
+        let items_ref = rooted_items_ref();
+        let value = value_ty();
+        let unit = unit_ty();
+        let usize = usize_ty();
+        let copy = |i: u64, ty: &Value| json!({"Read": place_ty(i, ty)});
+        let mv = |i: u64, ty: &Value| json!({"Move": place_ty(i, ty)});
+        let borrow = stmt(json!({
+            "Assign": [
+                place_ty(2, &items_ref),
+                {"Ref": {"place": place_ty(1, &items), "kind": "Mut", "ptr_metadata": null}}
+            ]
+        }));
+        let unstructured = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 0,
+                "locals": [
+                    local_ty(0, unit.clone()),
+                    local_ty(1, items.clone()),
+                    local_ty(2, items_ref.clone()),
+                    local_ty(3, value.clone()),
+                    local_ty(4, usize.clone()),
+                    local_ty(5, value.clone()),
+                    local_ty(6, unit.clone())
+                ]
+            },
+            "body": [
+                bb_stmts(vec![], call_term(1, vec![], place_ty(1, &items), 1, 6)),
+                bb_stmts(
+                    vec![borrow],
+                    call_term(
+                        2,
+                        vec![copy(2, &items_ref), mv(3, &value)],
+                        place_ty(6, &unit),
+                        2,
+                        6
+                    )
+                ),
+                bb_stmts(
+                    vec![],
+                    call_term(6, vec![copy(2, &items_ref)], place_ty(4, &usize), 3, 6)
+                ),
+                bb_stmts(
+                    vec![],
+                    call_term(
+                        3,
+                        vec![copy(2, &items_ref), usize_const(0)],
+                        place_ty(5, &value),
+                        4,
+                        6
+                    )
+                ),
+                bb_stmts(vec![], drop_term(1, &items, 5, 6)),
+                bb_stmts(vec![], json!("Return")),
+                bb_stmts(vec![], json!("UnwindResume"))
+            ]
+        });
+        let llbc = rooted_items_llbc(unstructured);
+        let fd = llbc.fn_by_id(5).expect("subject");
+        let body = fd.unstructured().expect("stripped body");
+        let erased = match erase_shadow_stack(fd, &body, &llbc) {
+            Ok(Some(erased)) => erased,
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        };
+        assert!(
+            rooted_items_call_paths(&erased, &llbc).is_empty(),
+            "erased body still calls RootedItems::*: {:?}",
+            rooted_items_call_paths(&erased, &llbc)
+        );
+        assert!(
+            assign_uses_const_lit(
+                &erased,
+                4,
+                &json!({ "Integer": { "Unsigned": ["Usize", "1"] } })
+            ),
+            "len dest should be the pin count 1"
+        );
+        assert!(
+            assign_copies_local(&erased, 7, 3),
+            "push(a) should write slot 0 from a"
+        );
+        assert!(
+            assign_copies_local(&erased, 5, 7),
+            "get(0) should read the value pinned at slot 0"
+        );
+    }
+
+    /// `RootedItems::new` → `is_empty` → branch → `drop`.
+    /// Empty set: dest is `true` (`count == 0`), and the If still branches on it.
+    #[test]
+    fn rooted_items_is_empty_assigns_zero_count() {
+        let items = rooted_items_adt();
+        let items_ref = rooted_items_ref();
+        let unit = unit_ty();
+        let flag_ty = bool_ty();
+        let copy = |i: u64, ty: &Value| json!({"Read": place_ty(i, ty)});
+        let borrow = stmt(json!({
+            "Assign": [
+                place_ty(2, &items_ref),
+                {"Ref": {"place": place_ty(1, &items), "kind": "Mut", "ptr_metadata": null}}
+            ]
+        }));
+        let unstructured = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 0,
+                "locals": [
+                    local_ty(0, unit.clone()),
+                    local_ty(1, items.clone()),
+                    local_ty(2, items_ref.clone()),
+                    local_ty(3, flag_ty.clone())
+                ]
+            },
+            "body": [
+                bb_stmts(vec![], call_term(1, vec![], place_ty(1, &items), 1, 7)),
+                bb_stmts(
+                    vec![borrow],
+                    call_term(7, vec![copy(2, &items_ref)], place_ty(3, &flag_ty), 2, 7)
+                ),
+                bb_stmts(
+                    vec![],
+                    json!({"Switch": {
+                        "discr": {"Read": place_ty(3, &flag_ty)},
+                        "targets": {"If": [3, 4]}
+                    }})
+                ),
+                bb_stmts(vec![], json!({"Goto": {"target": 5}})),
+                bb_stmts(vec![], json!({"Goto": {"target": 5}})),
+                bb_stmts(vec![], drop_term(1, &items, 6, 7)),
+                bb_stmts(vec![], json!("Return")),
+                bb_stmts(vec![], json!("UnwindResume"))
+            ]
+        });
+        let llbc = rooted_items_llbc(unstructured);
+        let fd = llbc.fn_by_id(5).expect("subject");
+        let body = fd.unstructured().expect("stripped body");
+        let erased = match erase_shadow_stack(fd, &body, &llbc) {
+            Ok(Some(erased)) => erased,
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        };
+        assert!(
+            rooted_items_call_paths(&erased, &llbc).is_empty(),
+            "erased body still calls RootedItems::*: {:?}",
+            rooted_items_call_paths(&erased, &llbc)
+        );
+        assert!(
+            assign_uses_const_lit(&erased, 3, &json!({ "Bool": true })),
+            "is_empty dest should be true when the pin count is 0"
+        );
+        let switches_on_flag = erased.body.iter().any(|bb| {
+            let kind = bb.terminator.kind_value();
+            kind.get("Switch")
+                .and_then(|s| s.get("discr"))
+                .and_then(|d| d.get("Read"))
+                .and_then(|p| p["kind"].get("Local"))
+                == Some(&json!(3))
+        });
+        assert!(
+            switches_on_flag,
+            "zero-count is_empty should still feed the If"
+        );
+    }
+
+    /// `_t = 0; _t = 1; get(_t)` is not a single-definition constant:
+    /// keep the bracket rather than rewrite `get(1)`.
+    #[test]
+    fn rooted_items_get_follows_reassigned_const() {
+        let items = rooted_items_adt();
+        let items_ref = rooted_items_ref();
+        let value = value_ty();
+        let unit = unit_ty();
+        let usize = usize_ty();
+        let copy = |i: u64, ty: &Value| json!({"Read": place_ty(i, ty)});
+        let mv = |i: u64, ty: &Value| json!({"Move": place_ty(i, ty)});
+        let borrow = stmt(json!({
+            "Assign": [
+                place_ty(2, &items_ref),
+                {"Ref": {"place": place_ty(1, &items), "kind": "Mut", "ptr_metadata": null}}
+            ]
+        }));
+        let t_zero = stmt(json!({
+            "Assign": [place_ty(7, &usize), {"Use": [usize_const(0), "Yes"]}]
+        }));
+        let t_one = stmt(json!({
+            "Assign": [place_ty(7, &usize), {"Use": [usize_const(1), "Yes"]}]
+        }));
+        let unstructured = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 0,
+                "locals": [
+                    local_ty(0, unit.clone()),
+                    local_ty(1, items.clone()),
+                    local_ty(2, items_ref.clone()),
+                    local_ty(3, value.clone()),
+                    local_ty(4, value.clone()),
+                    local_ty(5, value.clone()),
+                    local_ty(6, unit.clone()),
+                    local_ty(7, usize.clone())
+                ]
+            },
+            "body": [
+                bb_stmts(vec![], call_term(1, vec![], place_ty(1, &items), 1, 6)),
+                bb_stmts(
+                    vec![borrow],
+                    call_term(
+                        2,
+                        vec![copy(2, &items_ref), mv(3, &value)],
+                        place_ty(6, &unit),
+                        2,
+                        6
+                    )
+                ),
+                bb_stmts(
+                    vec![],
+                    call_term(
+                        2,
+                        vec![copy(2, &items_ref), mv(4, &value)],
+                        place_ty(6, &unit),
+                        3,
+                        6
+                    )
+                ),
+                bb_stmts(
+                    vec![t_zero, t_one],
+                    call_term(
+                        3,
+                        vec![copy(2, &items_ref), copy(7, &usize)],
+                        place_ty(5, &value),
+                        4,
+                        6
+                    )
+                ),
+                bb_stmts(vec![], drop_term(1, &items, 5, 6)),
+                bb_stmts(vec![], json!("Return")),
+                bb_stmts(vec![], json!("UnwindResume"))
+            ]
+        });
+        let llbc = rooted_items_llbc(unstructured);
+        let fd = llbc.fn_by_id(5).expect("subject");
+        let body = fd.unstructured().expect("stripped body");
+        match erase_shadow_stack(fd, &body, &llbc) {
+            Err("index-not-static") => {}
+            Ok(Some(_)) => panic!("reassigned const index should refuse the rewrite, not erase"),
+            Ok(None) => {
+                panic!("reassigned const index should refuse the rewrite, not skip as no bracket")
+            }
+            Err(reason) => panic!("expected index-not-static, got {reason}"),
+        }
+    }
+
+    /// `_t = const 0` then `_t = copy(dynamic)` then `get(_t)` is not a
+    /// static index: keep the bracket rather than rewrite `get(0)`.
+    #[test]
+    fn rooted_items_get_after_dynamic_index_keeps_the_bracket() {
+        let items = rooted_items_adt();
+        let items_ref = rooted_items_ref();
+        let value = value_ty();
+        let unit = unit_ty();
+        let usize = usize_ty();
+        let copy = |i: u64, ty: &Value| json!({"Read": place_ty(i, ty)});
+        let mv = |i: u64, ty: &Value| json!({"Move": place_ty(i, ty)});
+        let borrow = stmt(json!({
+            "Assign": [
+                place_ty(2, &items_ref),
+                {"Ref": {"place": place_ty(1, &items), "kind": "Mut", "ptr_metadata": null}}
+            ]
+        }));
+        let t_const = stmt(json!({
+            "Assign": [place_ty(7, &usize), {"Use": [usize_const(0), "Yes"]}]
+        }));
+        let t_dyn = stmt(json!({
+            "Assign": [place_ty(7, &usize), {"Use": [copy(8, &usize), "Yes"]}]
+        }));
+        let unstructured = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 0,
+                "locals": [
+                    local_ty(0, unit.clone()),
+                    local_ty(1, items.clone()),
+                    local_ty(2, items_ref.clone()),
+                    local_ty(3, value.clone()),
+                    local_ty(4, value.clone()),
+                    local_ty(5, value.clone()),
+                    local_ty(6, unit.clone()),
+                    local_ty(7, usize.clone()),
+                    local_ty(8, usize.clone())
+                ]
+            },
+            "body": [
+                bb_stmts(vec![], call_term(1, vec![], place_ty(1, &items), 1, 6)),
+                bb_stmts(
+                    vec![borrow],
+                    call_term(
+                        2,
+                        vec![copy(2, &items_ref), mv(3, &value)],
+                        place_ty(6, &unit),
+                        2,
+                        6
+                    )
+                ),
+                bb_stmts(
+                    vec![],
+                    call_term(
+                        2,
+                        vec![copy(2, &items_ref), mv(4, &value)],
+                        place_ty(6, &unit),
+                        3,
+                        6
+                    )
+                ),
+                bb_stmts(
+                    vec![t_const, t_dyn],
+                    call_term(
+                        3,
+                        vec![copy(2, &items_ref), copy(7, &usize)],
+                        place_ty(5, &value),
+                        4,
+                        6
+                    )
+                ),
+                bb_stmts(vec![], drop_term(1, &items, 5, 6)),
+                bb_stmts(vec![], json!("Return")),
+                bb_stmts(vec![], json!("UnwindResume"))
+            ]
+        });
+        let llbc = rooted_items_llbc(unstructured);
+        let fd = llbc.fn_by_id(5).expect("subject");
+        let body = fd.unstructured().expect("stripped body");
+        match erase_shadow_stack(fd, &body, &llbc) {
+            Err("index-not-static") => {}
+            Ok(Some(_)) => panic!("dynamic index should refuse the rewrite, not erase"),
+            Ok(None) => panic!("dynamic index should refuse the rewrite, not skip as no bracket"),
+            Err(reason) => panic!("expected index-not-static, got {reason}"),
+        }
+    }
+
+    /// `RootedItems::take` is Unmodeled: new → push → take → drop keeps the
+    /// bracket.
+    #[test]
+    fn rooted_items_take_keeps_the_bracket() {
+        let items = rooted_items_adt();
+        let items_ref = rooted_items_ref();
+        let value = value_ty();
+        let unit = unit_ty();
+        let copy = |i: u64, ty: &Value| json!({"Read": place_ty(i, ty)});
+        let mv = |i: u64, ty: &Value| json!({"Move": place_ty(i, ty)});
+        let borrow = stmt(json!({
+            "Assign": [
+                place_ty(2, &items_ref),
+                {"Ref": {"place": place_ty(1, &items), "kind": "Mut", "ptr_metadata": null}}
+            ]
+        }));
+        let unstructured = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 0,
+                "locals": [
+                    local_ty(0, unit.clone()),
+                    local_ty(1, items.clone()),
+                    local_ty(2, items_ref.clone()),
+                    local_ty(3, value.clone()),
+                    local_ty(4, unit.clone()),
+                    local_ty(5, unit.clone())
+                ]
+            },
+            "body": [
+                bb_stmts(vec![], call_term(1, vec![], place_ty(1, &items), 1, 5)),
+                bb_stmts(
+                    vec![borrow],
+                    call_term(
+                        2,
+                        vec![copy(2, &items_ref), mv(3, &value)],
+                        place_ty(4, &unit),
+                        2,
+                        5
+                    )
+                ),
+                bb_stmts(
+                    vec![],
+                    call_term(
+                        4,
+                        vec![copy(2, &items_ref)],
+                        place_ty(5, &unit),
+                        3,
+                        5
+                    )
+                ),
+                bb_stmts(vec![], drop_term(1, &items, 4, 5)),
+                bb_stmts(vec![], json!("Return")),
+                bb_stmts(vec![], json!("UnwindResume"))
+            ]
+        });
+        let llbc = rooted_items_llbc(unstructured);
+        let fd = llbc.fn_by_id(5).expect("subject");
+        let body = fd.unstructured().expect("stripped body");
+        match erase_shadow_stack(fd, &body, &llbc) {
+            Err("unmodeled-stack-op") => {}
+            Ok(Some(_)) => panic!("take should refuse the rewrite, not erase the bracket"),
+            Ok(None) => panic!("take should refuse the rewrite, not skip it as no bracket"),
+            Err(reason) => panic!("expected unmodeled-stack-op, got {reason}"),
+        }
+        let kept = erase_or_keep(fd, body, &llbc);
+        let paths = rooted_items_call_paths(&kept, &llbc);
+        assert!(
+            paths.iter().any(|p| p.ends_with("::take")),
+            "unerased body should still call RootedItems::take, got {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with("::new")),
+            "unerased body should still call RootedItems::new, got {paths:?}"
+        );
+    }
+
+    fn frame_anchor_ref() -> Value {
+        json!({"Ref": ["Erased", frame_anchor_adt(), "Shared"]})
+    }
+
+    fn frame_anchor_call_paths(body: &Unstructured, llbc: &Llbc) -> Vec<String> {
+        body.body
+            .iter()
+            .filter_map(|bb| match bb.term_ref(llbc) {
+                Ok(TermKind::Call { call, .. }) => super::callee_path(call, llbc)
+                    .filter(|path| path.contains("FrameAnchor") || path.contains("frame_anchor_")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn frame_anchor_method_llbc(unstructured: Value) -> Llbc {
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "type_decls": [
+                    type_struct(0, &["pyre_interpreter", "eval", "FrameAnchor"])
+                ],
+                "fun_decls": [
+                    null,
+                    opaque_fun(
+                        1,
+                        &["pyre_interpreter", "eval", "FrameAnchor", "from_raw"],
+                        json!("Opaque")
+                    ),
+                    opaque_fun(
+                        2,
+                        &["pyre_interpreter", "eval", "FrameAnchor", "live"],
+                        json!("Opaque")
+                    ),
+                    opaque_fun(
+                        3,
+                        &["pyre_interpreter", "eval", "subject"],
+                        json!({ "Unstructured": unstructured })
+                    )
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        llbc
+    }
+
+    fn frame_anchor_free_llbc(unstructured: Value) -> Llbc {
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "type_decls": [
+                    type_struct(0, &["pyre_interpreter", "eval", "FrameAnchor"])
+                ],
+                "fun_decls": [
+                    null,
+                    opaque_fun(
+                        1,
+                        &["pyre_interpreter", "eval", "frame_anchor_push"],
+                        json!("Opaque")
+                    ),
+                    opaque_fun(
+                        2,
+                        &["pyre_interpreter", "eval", "frame_anchor_live"],
+                        json!("Opaque")
+                    ),
+                    opaque_fun(
+                        3,
+                        &["pyre_interpreter", "eval", "frame_anchor_release"],
+                        json!("Opaque")
+                    ),
+                    opaque_fun(
+                        4,
+                        &["pyre_interpreter", "eval", "subject"],
+                        json!({ "Unstructured": unstructured })
+                    )
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        llbc
+    }
+
+    /// `FrameAnchor::from_raw` → `live` → `drop`. The rewrite pins the frame
+    /// into a slot local, reads that local, and drops the Call/Drop pair.
+    #[test]
+    fn frame_anchor_from_raw_live_drop_erases() {
+        let anchor = frame_anchor_adt();
+        let anchor_ref = frame_anchor_ref();
+        let value = value_ty();
+        let unit = unit_ty();
+        let copy = |i: u64, ty: &Value| json!({"Read": place_ty(i, ty)});
+        let mv = |i: u64, ty: &Value| json!({"Move": place_ty(i, ty)});
+        let borrow = stmt(json!({
+            "Assign": [
+                place_ty(3, &anchor_ref),
+                {"Ref": {"place": place_ty(2, &anchor), "kind": "Shared", "ptr_metadata": null}}
+            ]
+        }));
+        let unstructured = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 0,
+                "locals": [
+                    local_ty(0, unit.clone()),
+                    local_ty(1, value.clone()),
+                    local_ty(2, anchor.clone()),
+                    local_ty(3, anchor_ref.clone()),
+                    local_ty(4, value.clone())
+                ]
+            },
+            "body": [
+                bb_stmts(
+                    vec![],
+                    call_term(1, vec![mv(1, &value)], place_ty(2, &anchor), 1, 4)
+                ),
+                bb_stmts(
+                    vec![borrow],
+                    call_term(
+                        2,
+                        vec![copy(3, &anchor_ref)],
+                        place_ty(4, &value),
+                        2,
+                        4
+                    )
+                ),
+                bb_stmts(vec![], drop_term(2, &anchor, 3, 4)),
+                bb_stmts(vec![], json!("Return")),
+                bb_stmts(vec![], json!("UnwindResume"))
+            ]
+        });
+        let llbc = frame_anchor_method_llbc(unstructured);
+        let fd = llbc.fn_by_id(3).expect("subject");
+        let body = fd.unstructured().expect("stripped body");
+        let erased = match erase_shadow_stack(fd, &body, &llbc) {
+            Ok(Some(erased)) => erased,
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        };
+        assert!(
+            frame_anchor_call_paths(&erased, &llbc).is_empty(),
+            "erased body still calls FrameAnchor ops: {:?}",
+            frame_anchor_call_paths(&erased, &llbc)
+        );
+        assert!(
+            !erased.body.iter().any(|bb| {
+                matches!(bb.term_ref(&llbc), Ok(TermKind::Drop { place, .. }) if {
+                    place_ty_local_is(place, 2)
+                })
+            }),
+            "erased body still Drops the FrameAnchor"
+        );
+        // 5 original locals; slot 0 is local 5, written from the frame (local 1).
+        assert!(
+            assign_copies_local(&erased, 5, 1),
+            "from_raw should write slot 0 from the frame"
+        );
+        assert!(
+            assign_copies_local(&erased, 4, 5),
+            "live should read the value pinned at slot 0"
+        );
+    }
+
+    fn place_ty_local_is(place: &Place, local: u64) -> bool {
+        matches!(place.kind, PlaceKind::Local(l) if l == local)
+    }
+
+    /// `frame_anchor_push` → `frame_anchor_live` → `frame_anchor_release`.
+    #[test]
+    fn frame_anchor_push_live_release_erases() {
+        let value = value_ty();
+        let unit = unit_ty();
+        let usize = usize_ty();
+        let copy = |i: u64, ty: &Value| json!({"Read": place_ty(i, ty)});
+        let mv = |i: u64, ty: &Value| json!({"Move": place_ty(i, ty)});
+        let unstructured = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 0,
+                "locals": [
+                    local_ty(0, unit.clone()),
+                    local_ty(1, value.clone()),
+                    local_ty(2, usize.clone()),
+                    local_ty(3, value.clone())
+                ]
+            },
+            "body": [
+                bb_stmts(
+                    vec![],
+                    call_term(1, vec![mv(1, &value)], place_ty(2, &usize), 1, 4)
+                ),
+                bb_stmts(
+                    vec![],
+                    call_term(
+                        2,
+                        vec![copy(2, &usize)],
+                        place_ty(3, &value),
+                        2,
+                        4
+                    )
+                ),
+                bb_stmts(
+                    vec![],
+                    call_term(
+                        3,
+                        vec![copy(2, &usize)],
+                        place_ty(0, &unit),
+                        3,
+                        4
+                    )
+                ),
+                bb_stmts(vec![], json!("Return")),
+                bb_stmts(vec![], json!("UnwindResume"))
+            ]
+        });
+        let llbc = frame_anchor_free_llbc(unstructured);
+        let fd = llbc.fn_by_id(4).expect("subject");
+        let body = fd.unstructured().expect("stripped body");
+        let erased = match erase_shadow_stack(fd, &body, &llbc) {
+            Ok(Some(erased)) => erased,
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        };
+        assert!(
+            frame_anchor_call_paths(&erased, &llbc).is_empty(),
+            "erased body still calls frame_anchor_*: {:?}",
+            frame_anchor_call_paths(&erased, &llbc)
+        );
+        assert!(
+            assign_copies_local(&erased, 4, 1),
+            "push should write slot 0 from the frame"
+        );
+        assert!(
+            assign_copies_local(&erased, 3, 4),
+            "live should read the value pinned at slot 0"
+        );
+    }
+
+    /// `from_raw` wrapping a `RootedItems` bracket: both families share the
+    /// abstract depth, LIFO close erases.
+    #[test]
+    fn frame_anchor_nested_with_rooted_items_erases() {
+        let anchor = frame_anchor_adt();
+        let items = json!({
+            "Adt": {
+                "id": 1,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let items_ref = json!({"Ref": ["Erased", items.clone(), "Mut"]});
+        let value = value_ty();
+        let unit = unit_ty();
+        let copy = |i: u64, ty: &Value| json!({"Read": place_ty(i, ty)});
+        let mv = |i: u64, ty: &Value| json!({"Move": place_ty(i, ty)});
+        let borrow_items = stmt(json!({
+            "Assign": [
+                place_ty(4, &items_ref),
+                {"Ref": {"place": place_ty(3, &items), "kind": "Mut", "ptr_metadata": null}}
+            ]
+        }));
+        let unstructured = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 0,
+                "locals": [
+                    local_ty(0, unit.clone()),
+                    local_ty(1, value.clone()),
+                    local_ty(2, anchor.clone()),
+                    local_ty(3, items.clone()),
+                    local_ty(4, items_ref.clone()),
+                    local_ty(5, value.clone()),
+                    local_ty(6, value.clone()),
+                    local_ty(7, unit.clone())
+                ]
+            },
+            "body": [
+                bb_stmts(
+                    vec![],
+                    call_term(1, vec![mv(1, &value)], place_ty(2, &anchor), 1, 7)
+                ),
+                bb_stmts(vec![], call_term(3, vec![], place_ty(3, &items), 2, 7)),
+                bb_stmts(
+                    vec![borrow_items],
+                    call_term(
+                        4,
+                        vec![copy(4, &items_ref), mv(5, &value)],
+                        place_ty(7, &unit),
+                        3,
+                        7
+                    )
+                ),
+                bb_stmts(
+                    vec![],
+                    call_term(
+                        5,
+                        vec![copy(4, &items_ref), usize_const(0)],
+                        place_ty(6, &value),
+                        4,
+                        7
+                    )
+                ),
+                bb_stmts(vec![], drop_term(3, &items, 5, 7)),
+                bb_stmts(vec![], drop_term(2, &anchor, 6, 7)),
+                bb_stmts(vec![], json!("Return")),
+                bb_stmts(vec![], json!("UnwindResume"))
+            ]
+        });
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "type_decls": [
+                    type_struct(0, &["pyre_interpreter", "eval", "FrameAnchor"]),
+                    type_struct(1, &["pyre_object", "gc_roots", "RootedItems"])
+                ],
+                "fun_decls": [
+                    null,
+                    opaque_fun(
+                        1,
+                        &["pyre_interpreter", "eval", "FrameAnchor", "from_raw"],
+                        json!("Opaque")
+                    ),
+                    opaque_fun(
+                        2,
+                        &["pyre_interpreter", "eval", "subject"],
+                        json!({ "Unstructured": unstructured })
+                    ),
+                    opaque_fun(3, &["pyre_object", "gc_roots", "RootedItems", "new"], json!("Opaque")),
+                    opaque_fun(4, &["pyre_object", "gc_roots", "RootedItems", "push"], json!("Opaque")),
+                    opaque_fun(5, &["pyre_object", "gc_roots", "RootedItems", "get"], json!("Opaque"))
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        let fd = llbc.fn_by_id(2).expect("subject");
+        let body = fd.unstructured().expect("stripped body");
+        let erased = match erase_shadow_stack(fd, &body, &llbc) {
+            Ok(Some(erased)) => erased,
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        };
+        assert!(
+            frame_anchor_call_paths(&erased, &llbc).is_empty()
+                && rooted_items_call_paths(&erased, &llbc).is_empty(),
+            "erased body still names a bracket call"
+        );
+        assert!(
+            assign_copies_local(&erased, 8, 1),
+            "from_raw should write slot 0 from the frame"
+        );
+        assert!(
+            assign_copies_local(&erased, 9, 5),
+            "RootedItems::push should write slot 1 from the item"
+        );
+        assert!(
+            assign_copies_local(&erased, 6, 9),
+            "RootedItems::get(0) should read slot 1"
+        );
+    }
+
+    /// `from_raw` → `drop` → `live` is a get above the remaining depth.
+    #[test]
+    fn frame_anchor_live_after_drop_refuses() {
+        let anchor = frame_anchor_adt();
+        let anchor_ref = frame_anchor_ref();
+        let value = value_ty();
+        let unit = unit_ty();
+        let copy = |i: u64, ty: &Value| json!({"Read": place_ty(i, ty)});
+        let mv = |i: u64, ty: &Value| json!({"Move": place_ty(i, ty)});
+        let borrow = stmt(json!({
+            "Assign": [
+                place_ty(3, &anchor_ref),
+                {"Ref": {"place": place_ty(2, &anchor), "kind": "Shared", "ptr_metadata": null}}
+            ]
+        }));
+        let unstructured = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 0,
+                "locals": [
+                    local_ty(0, unit.clone()),
+                    local_ty(1, value.clone()),
+                    local_ty(2, anchor.clone()),
+                    local_ty(3, anchor_ref.clone()),
+                    local_ty(4, value.clone())
+                ]
+            },
+            "body": [
+                bb_stmts(
+                    vec![],
+                    call_term(1, vec![mv(1, &value)], place_ty(2, &anchor), 1, 4)
+                ),
+                bb_stmts(vec![], drop_term(2, &anchor, 2, 4)),
+                bb_stmts(
+                    vec![borrow],
+                    call_term(
+                        2,
+                        vec![copy(3, &anchor_ref)],
+                        place_ty(4, &value),
+                        3,
+                        4
+                    )
+                ),
+                bb_stmts(vec![], json!("Return")),
+                bb_stmts(vec![], json!("UnwindResume"))
+            ]
+        });
+        let llbc = frame_anchor_method_llbc(unstructured);
+        let fd = llbc.fn_by_id(3).expect("subject");
+        let body = fd.unstructured().expect("stripped body");
+        match erase_shadow_stack(fd, &body, &llbc) {
+            Err("get-above-depth") | Err("get-out-of-set") | Err("receiver-not-a-guard-borrow") => {
+            }
+            Ok(Some(_)) => panic!("live after drop should refuse, not erase"),
+            Ok(None) => panic!("live after drop should refuse, not skip as no bracket"),
+            Err(reason) => panic!("expected a get/close refusal, got {reason}"),
+        }
+    }
+
+    /// The `from_raw` body itself is a leaf: skip, keep as written.
+    #[test]
+    fn erase_skips_frame_anchor_leaf_body() {
+        let value = value_ty();
+        let usize = usize_ty();
+        let mv = |i: u64, ty: &Value| json!({"Move": place_ty(i, ty)});
+        let unstructured = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 1,
+                "locals": [
+                    local_ty(0, usize.clone()),
+                    local_ty(1, value.clone())
+                ]
+            },
+            "body": [
+                bb_stmts(
+                    vec![],
+                    call_term(2, vec![mv(1, &value)], place_ty(0, &usize), 1, 2)
+                ),
+                bb_stmts(vec![], json!("Return")),
+                bb_stmts(vec![], json!("UnwindResume"))
+            ]
+        });
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "type_decls": [
+                    type_struct(0, &["pyre_interpreter", "eval", "FrameAnchor"])
+                ],
+                "fun_decls": [
+                    null,
+                    opaque_fun(
+                        1,
+                        &["pyre_interpreter", "eval", "FrameAnchor", "from_raw"],
+                        json!({ "Unstructured": unstructured })
+                    ),
+                    opaque_fun(
+                        2,
+                        &["pyre_interpreter", "eval", "frame_anchor_push"],
+                        json!("Opaque")
+                    )
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        let fd = llbc.fn_by_id(1).expect("from_raw");
+        let body = fd.unstructured().expect("stripped body");
+        match erase_shadow_stack(fd, &body, &llbc) {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("leaf body should be skipped, not rewritten"),
+            Err(reason) => panic!("leaf body should be skipped, got {reason}"),
+        }
+    }
+
+    /// A callee that opens a nested `RootScope` and returns it in the dest,
+    /// then ParamSlots methods of that dest. The leftover is the dest the
+    /// caller drops, not this body's slots.
+    fn owned_scope_llbc() -> Llbc {
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    null,
+                    opaque_fun(1, &["pyre_object", "gc_roots", "push_roots"], json!("Opaque")),
+                    opaque_fun(2, &["pyre_object", "gc_roots", "shadow_stack_get"], json!("Opaque")),
+                    opaque_fun(3, &["pyre_object", "gc_roots", "shadow_stack_len"], json!("Opaque")),
+                    opaque_fun(4, &["pyre_object", "gc_roots", "pin_root"], json!("Opaque")),
+                    opaque_fun(5, &["other", "owned_scope_ctor"], json!("Opaque")),
+                    opaque_fun(6, &["other", "owned_scope_get"], json!("Opaque"))
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.fn_by_id(5)
+            .expect("owned_scope_ctor")
+            .returns_owned_scope
+            .store(true, Ordering::Relaxed);
+        let id = |suffix: &str| stack_fn_identity(&llbc, suffix);
+        llbc.register_stack_sensitive_fns([id("owned_scope_ctor"), id("owned_scope_get")]);
+        llbc.register_stack_returns_index_fns([id("owned_scope_ctor")]);
+        llbc.register_stack_param_slots_fns([(id("owned_scope_get"), vec![0])]);
+        llbc.mark_stack_sensitive_fns_complete();
+        llbc
+    }
+
+    fn returned_owned_scope_body() -> Unstructured {
+        let copy = |i| json!({"Read": place(i)});
+        body_of(
+            5,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![copy(0)], 2, 2)),
+                bb(call_fun(5, vec![], 3, 3)),
+                bb_stmts(
+                    vec![assign_local(
+                        4,
+                        json!({"Ref": {
+                            "place": place(3),
+                            "kind": "Shared",
+                            "ptr_metadata": null
+                        }}),
+                    )],
+                    call_fun(6, vec![copy(4)], 2, 4),
+                ),
+                bb(drop_local(3, 5)),
+                bb(drop_local(1, 6)),
+                bb(json!("Return")),
+            ],
+        )
+    }
+
+    #[test]
+    fn analyze_accepts_returned_owned_scope_inside_open() {
+        let llbc = owned_scope_llbc();
+        match analyze(&returned_owned_scope_body(), &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!(
+                "expected erasure of Open/Pin/owned-scope dest/ParamSlots/Close, got {reason}"
+            ),
+        }
+    }
+
+    #[test]
+    fn analyze_refuses_returns_index_that_is_not_an_owned_scope() {
+        let llbc = owned_scope_llbc();
+        llbc.fn_by_id(5)
+            .expect("owned_scope_ctor")
+            .returns_owned_scope
+            .store(false, Ordering::Relaxed);
+        match analyze(&returned_owned_scope_body(), &llbc) {
+            Err("calls-stack-sensitive-fn") => {}
+            Ok(Some(_)) => panic!("expected calls-stack-sensitive-fn, got accepted"),
+            Ok(None) => panic!("expected calls-stack-sensitive-fn, got no bracket"),
+            Err(reason) => panic!("expected calls-stack-sensitive-fn, got {reason}"),
         }
     }
 }

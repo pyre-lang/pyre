@@ -196,6 +196,46 @@ fn closure_call_fn_id(td: &TypeDecl, llbc: &Llbc) -> Option<u64> {
         .map(|fd| fd.def_id)
 }
 
+/// Generated `bitflags!` `bits()` accessor: inherent or `Flags` trait
+/// method of `src_ty`, matched by FunDecl identity.
+fn fun_decl_is_generated_bitflags_bits_accessor(fd: &FunDecl, llbc: &Llbc, src_ty: &TyRef) -> bool {
+    let Some(src_path) = adt_path_of_tyref(src_ty, llbc) else {
+        return false;
+    };
+    if let Some((owner, leaf)) = impl_method_owner_for_fundecl(llbc, fd) {
+        if leaf != "bits" {
+            return false;
+        }
+        // A local trait method named `bits` on the same type is not the
+        // generated accessor. Non-local `bitflags::Flags` leaves
+        // `trait_impl_trait_path_for_fundecl` empty.
+        if trait_impl_trait_path_for_fundecl(llbc, fd).is_some() {
+            return false;
+        }
+        return bitflags_bits_owner_matches_src(&owner, &src_path);
+    }
+    generated_ident_type_bits_path(fd, &src_path)
+}
+
+fn bitflags_bits_owner_matches_src(owner: &str, src_path: &str) -> bool {
+    if owner == src_path {
+        return true;
+    }
+    let owner_stripped = strip_crate_prefix(owner);
+    let src_stripped = strip_crate_prefix(src_path);
+    owner == src_stripped.as_str()
+        || owner_stripped.as_str() == src_path
+        || owner_stripped == src_stripped
+}
+
+fn generated_ident_type_bits_path(fd: &FunDecl, src_path: &str) -> bool {
+    let path = fd.item_meta.name_path();
+    let Some(without_bits) = path.strip_suffix("::bits") else {
+        return false;
+    };
+    bitflags_bits_owner_matches_src(without_bits, src_path)
+}
+
 impl<'a> Lowering<'a> {
     /// `w_obj._utf8` — narrow the `PyObjectRef` receiver to
     /// `W_UnicodeObject` and read its `value` field, the rstr `STR`
@@ -1225,7 +1265,8 @@ impl<'a> Lowering<'a> {
         let Some(kind) = self.option_none_aggregate_kind(dest_ty) else {
             return Ok(None);
         };
-        let (op, var) = self.build_rvalue(mir_bb, Rvalue::Aggregate(kind, Vec::new()), dest_ty)?;
+        let (op, var) =
+            self.build_rvalue(mir_bb, Rvalue::Aggregate(kind.into(), Vec::new()), dest_ty)?;
         if let Some(op) = op {
             let bb_id = self.emit_bb(mir_bb);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -1827,10 +1868,31 @@ impl<'a> Lowering<'a> {
                 for (vidx, variant) in variants.iter().enumerate() {
                     let discr_value = variant.discriminant_i64()?;
                     let variant_owner = format!("{leaf}::{}", variant.name);
-                    let variant_id = majit_ir::descr::StructId::from_canonical(&format!(
-                        "{canon}::{}",
-                        variant.name
-                    ));
+                    let inst_adt = tyref_adt_map(ty, self.llbc);
+                    let variant_id = concrete_adt_struct_id(
+                        majit_ir::descr::StructId::from_canonical(&format!(
+                            "{canon}::{}",
+                            variant.name
+                        )),
+                        inst_adt,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                    );
+                    let inst_args = inst_adt
+                        .map(|adt| render_adt_type_args(adt, self.llbc, 0, self.tombstoned_leaves))
+                        .unwrap_or_default();
+                    ensure_enum_variant_instance_layout(
+                        self.llbc,
+                        td,
+                        vidx,
+                        &inst_args,
+                        inst_adt,
+                        variant_id,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                        &self.struct_layouts,
+                    );
                     let mut candidates: Vec<MoveSpan> = Vec::new();
                     for (i, field) in variant.fields.iter().enumerate() {
                         let offset = layout.field_offset(vidx, i)?;
@@ -5006,6 +5068,9 @@ impl<'a> Lowering<'a> {
                 None => return Ok(false),
             }
         };
+        let none_vsid = self.stamp_variant_vsid(dest_ty, "None");
+        let some_vsid = self.stamp_variant_vsid(dest_ty, "Some");
+        let result_ok_vsid = self.stamp_variant_vsid(&output_ty, "Ok");
         let bb_id = self.emit_bb(mir_bb);
         let allow = self
             .graph
@@ -5022,7 +5087,13 @@ impl<'a> Lowering<'a> {
             vec![data.clone(), len.clone(), allow],
             ValueType::Ref(Some(result_owner.clone())),
         );
-        let disc = emit_enum_disc_read(&mut self.graph, bb_id, result_var, &result_owner);
+        let disc = emit_enum_disc_read(
+            &mut self.graph,
+            bb_id,
+            result_var,
+            &result_owner,
+            result_ok_vsid,
+        );
         let option_owner = tagged_owners.as_ref().map(|(o, _, _)| o.clone());
         let some_owner = tagged_owners.as_ref().map(|(_, s, _)| s.clone());
         let payload_ty = tagged_owners
@@ -5055,6 +5126,7 @@ impl<'a> Lowering<'a> {
                         option_owner.as_ref().expect("tagged Option owner"),
                         0,
                         None,
+                        none_vsid,
                     )
                 }
             },
@@ -5079,6 +5151,7 @@ impl<'a> Lowering<'a> {
                             header,
                             payload_ty.clone(),
                         )),
+                        some_vsid,
                     )
                 }
             },
@@ -5426,7 +5499,14 @@ impl<'a> Lowering<'a> {
             vec![data, len, replace],
             ValueType::Ref(Some(result_owner.clone())),
         );
-        let disc = emit_enum_disc_read(&mut self.graph, bb_id, result_var.clone(), &result_owner);
+        let result_ok_vsid = self.stamp_variant_vsid(&output_ty, "Ok");
+        let disc = emit_enum_disc_read(
+            &mut self.graph,
+            bb_id,
+            result_var.clone(),
+            &result_owner,
+            result_ok_vsid,
+        );
         // Result Ok=0 is the false arm of `bool(disc)`. Err is unreachable:
         // `unicodehelper.py str_decode_utf8` replace never returns Err, so
         // the true arm is `RaiseImplicit(AssertionError)` (`rtyper/debug.py
@@ -5447,6 +5527,7 @@ impl<'a> Lowering<'a> {
                     ok_bb,
                     mapped[0].clone(),
                     &ok_owner,
+                    result_ok_vsid,
                     ValueType::Str,
                     false,
                 );
@@ -5899,9 +5980,12 @@ impl<'a> Lowering<'a> {
                 let field = Place {
                     kind: PlaceKind::Projection(
                         Box::new(place.clone()),
-                        ProjectionElem::Tagged(serde_json::json!({
-                            "Field": [serde_json::Value::Null, i]
-                        })),
+                        ProjectionElem::Tagged(
+                            serde_json::json!({
+                                "Field": [serde_json::Value::Null, i]
+                            })
+                            .into(),
+                        ),
                     ),
                     ty,
                 };
@@ -6409,6 +6493,8 @@ impl<'a> Lowering<'a> {
         else {
             return Ok(false);
         };
+        let some_vsid = self.stamp_variant_vsid(dest_ty, "Some");
+        let none_vsid = self.stamp_variant_vsid(dest_ty, "None");
         let bb_id = self.emit_bb(mir_bb);
         // Needle is a 1-char STR. `emit_str_const` is the `__str_const`
         // define the adapter pre-folds to `Constant('text')`; a raw
@@ -6464,6 +6550,7 @@ impl<'a> Lowering<'a> {
                     &option_owner_some,
                     1,
                     Some((some_owner.as_str(), mapped[0].clone(), payload_ty.clone())),
+                    some_vsid,
                 )
             },
             move |this, none_bb, _| {
@@ -6473,6 +6560,7 @@ impl<'a> Lowering<'a> {
                     &option_owner,
                     0,
                     None,
+                    none_vsid,
                 )
             },
         )?;
@@ -7317,6 +7405,72 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Length of a slice that is not a fat `Box<[T]>` field. A string-byte
+    /// view is `__strlen`; a list view is `__len`; a declared virtualizable
+    /// array is `arraylen_vable` (the field read must be unmarked); every
+    /// other slice is `ArrayLen`.
+    pub(in crate::front::mir) fn emit_slice_len(
+        &mut self,
+        bb_id: BlockId,
+        base: &Variable,
+        is_string_byte_view: bool,
+        is_list_view: bool,
+        array_type_id: Option<String>,
+    ) -> Variable {
+        self.release_declared_vable_array_address(base);
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        let kind = if is_string_byte_view {
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__strlen".to_string()],
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![base.clone()]),
+                result_ty: ValueType::Int,
+            }
+        } else if is_list_view {
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__len".to_string()],
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![base.clone()]),
+                result_ty: ValueType::Int,
+            }
+        } else {
+            // `<[PyObject]>::len` sees the list (`AbstractListRepr.rtype_len`),
+            // so an object-pointer slice base narrows to the list root.
+            let base = if array_type_id.is_some() {
+                self.narrow_value_to_instance_root(
+                    bb_id,
+                    crate::model::LinkArg::Value(base.clone()),
+                    "[PyObject]",
+                )
+                .as_variable()
+                .expect("an object-pointer slice base stays a Variable")
+                .clone()
+            } else {
+                base.clone()
+            };
+            OpKind::ArrayLen {
+                base,
+                array_type_id,
+                array: None,
+                nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
+            }
+        };
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind,
+        });
+        res
+    }
+
     /// ARRAY identity of a `<[T]>::len` / `is_empty` receiver whose `T` is
     /// an object pointer. Every other slice keeps the identity-less length
     /// read. The identity string itself comes from [`slice_array_type_id`].
@@ -8142,6 +8296,70 @@ impl<'a> Lowering<'a> {
             path.ends_with("::translated_alias")
                 && receiver_ty.is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
         })
+    }
+
+    /// `bitflags` `bits()` on a linked transparent scalar is the inner word.
+    ///
+    /// Bound to the generated accessor FunDecl (`Flags::bits` /
+    /// `InternalBitFlags::bits` / the inherent `bits` of the flags type),
+    /// not to every function whose leaf is `bits`. `PyCode.co_flags` is an
+    /// int field (`sourcetools.py has_varargs_flags`). The wrapper is the
+    /// row `external_transparent_scalar_kinds` publishes; `get_type_flag`
+    /// and the assembler already type that field as the unsigned word, and
+    /// a `CodeFlags` borrow is the word (`place_borrow_takes_address`).
+    /// `bits()` is the unwrap `const_eval_opaque_bitflag_call` already
+    /// folds on constants. A residual call would pass the word as a borrow
+    /// (`refuse_borrowed_transparent_scalar_residual`) or abort the helper
+    /// walk on a compiler-core symbolic fnaddr.
+    pub(in crate::front::mir) fn is_transparent_scalar_word_identity(
+        &self,
+        reg: &RegularCall,
+        src_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let src_ty = src_ty.or_else(|| fd.signature.inputs.first());
+        let Some(src_ty) = src_ty else {
+            return false;
+        };
+        if !fun_decl_is_generated_bitflags_bits_accessor(fd, self.llbc, src_ty) {
+            return false;
+        }
+        let Some(inner) = self.tyref_linked_transparent_scalar_inner(src_ty) else {
+            return false;
+        };
+        if self
+            .tyref_linked_transparent_scalar_inner(dest_ty)
+            .is_some()
+        {
+            return false;
+        }
+        let dest_vt = tyref_to_value_type_with(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        );
+        matches!(
+            (inner, dest_vt),
+            (ValueType::Unsigned, ValueType::Unsigned)
+                | (ValueType::Unsigned, ValueType::Int)
+                | (ValueType::Int, ValueType::Int)
+                | (ValueType::Int, ValueType::Unsigned)
+                | (ValueType::Bool, ValueType::Bool)
+                | (ValueType::Float, ValueType::Float)
+        )
+    }
+
+    fn tyref_linked_transparent_scalar_inner(&self, ty: &TyRef) -> Option<ValueType> {
+        let path = adt_path_of_tyref(ty, self.llbc)?;
+        crate::front::mir::transparent_scalar_inner_value_for_path(&path, self.llbc)
     }
 
     /// A callsite of the reflexive `impl<T> From<T> for T`

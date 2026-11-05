@@ -715,6 +715,24 @@ impl<'a> Lowering<'a> {
         header: Variable,
         target: usize,
     ) -> Result<(), LowerError> {
+        let list = self.emit_object_vec_gcarray_value(mir_bb, dest_local, header)?;
+        self.local_var[dest_local] = Some(LocalValue::One(list));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph
+            .set_goto(self.emit_bb(mir_bb), target_bb, link_args);
+        Ok(())
+    }
+
+    /// The shared whole-list object GcArray this tree already uses for
+    /// `&vec` / `&vec[..]` / `as_slice` (`gcarray_from_pyobject_vec`,
+    /// narrowed through the destination `[Class]` ListDef).
+    fn emit_object_vec_gcarray_value(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        header: Variable,
+    ) -> Result<Variable, LowerError> {
         let view = self.emit_path_call(
             mir_bb,
             "pyre_object::gc_roots::gcarray_from_pyobject_vec",
@@ -744,15 +762,10 @@ impl<'a> Lowering<'a> {
             ))
         })?;
         let list = self.narrow_value_to_instance_root(bb_id, LinkArg::Value(view), &list_root);
-        self.local_var[dest_local] = Some(LocalValue::One(
-            list.as_variable()
-                .expect("cast_instance of a Variable stays a Variable")
-                .clone(),
-        ));
-        let target_bb = self.block_id[target];
-        let link_args = self.edge_args(mir_bb, target)?;
-        self.graph.set_goto(bb_id, target_bb, link_args);
-        Ok(())
+        Ok(list
+            .as_variable()
+            .expect("cast_instance of a Variable stays a Variable")
+            .clone())
     }
 
     /// `&vec`, `&mut vec`, `&vec[..]`, `&mut vec[..]` of a `Vec<PyObjectRef>`
@@ -810,6 +823,108 @@ impl<'a> Lowering<'a> {
         self.graph
             .set_goto(self.block_id[mir_bb], target_bb, link_args);
         Ok(())
+    }
+
+    /// Shared `&vec[start:]` / `&vec[..end]` / `&vec[start..end]` of an
+    /// object-pointer `Vec`. The dest is the one-word object GcArray this
+    /// tree already uses for a whole-list view (`scope_w` / `args_w`);
+    /// `rlist.py` `rtype_getslice` then copies via `ll_listslice_startonly`
+    /// / `ll_listslice_rangeto` / `ll_listslice_startstop`, which
+    /// jtransform mints once the base is that GcArray.
+    ///
+    /// `&mut` dests stay the aliasing `{ptr, len}` view
+    /// (`objectptr_pair_view_locals` / `pair_subslice`). A non-object Vec
+    /// keeps that pair path too.
+    pub(in crate::front::mir) fn try_lower_object_vec_shared_subslice(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+        reg: &RegularCall,
+    ) -> Result<bool, LowerError> {
+        if call.args.len() != 2 {
+            return Ok(false);
+        }
+        let path = regular_call_name_path(reg, self.llbc).unwrap_or_default();
+        let leaf = path.rsplit("::").next().unwrap_or("");
+        if leaf != "index" {
+            return Ok(false);
+        }
+        if !(path.starts_with("alloc::vec::")
+            || vec_index_regular_unchecked_leaf(reg, self.llbc) == Some("index"))
+        {
+            return Ok(false);
+        }
+        let Some(first_ty) = call.args.first().and_then(operand_tyref) else {
+            return Ok(false);
+        };
+        if !tyref_is_object_pointer_rust_vec(first_ty, self.llbc) {
+            return Ok(false);
+        }
+        let dest_ty = &call.dest.ty;
+        if ref_kind_is_mut(dest_ty, self.llbc) {
+            return Ok(false);
+        }
+        if object_pointer_slice_list_root(dest_ty, self.llbc).is_none() {
+            return Ok(false);
+        }
+        let range = self.resolve_operand(mir_bb, call.args[1].clone())?;
+        let (marker_leaf, extra) = if let Some(site) = self
+            .slice_index_rangefrom_sites
+            .iter()
+            .find(|site| site.range_result == range)
+        {
+            ("__getslice_rangefrom", vec![site.start.clone()])
+        } else if let Some(site) = self
+            .slice_index_rangeto_sites
+            .iter()
+            .find(|site| site.range_result == range)
+        {
+            ("__getslice_rangeto", vec![site.end.clone()])
+        } else if let Some(site) = self
+            .slice_index_range_sites
+            .iter()
+            .find(|site| site.range_result == range)
+        {
+            (
+                "__getslice_range",
+                vec![site.start.clone(), site.end.clone()],
+            )
+        } else {
+            return Ok(false);
+        };
+        let header = self.resolve_operand(mir_bb, call.args[0].clone())?;
+        let list = self.emit_object_vec_gcarray_value(mir_bb, dest_local, header)?;
+        let mut args = vec![list.clone()];
+        args.extend(extra);
+        let suffix = crate::codewriter::getslice::listslice_marker_suffix(
+            &ValueType::Ref(None),
+            Some(OBJECT_REF_GCARRAY_TYPE_ID),
+        )
+        .expect("OBJECT_REF_GCARRAY_TYPE_ID sanitizes for listslice_marker_suffix");
+        let segments = vec![marker_leaf.to_string(), suffix];
+        let bb_id = self.emit_bb(mir_bb);
+        let dest = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(dest.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments,
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(args),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        self.local_var[dest_local] = Some(LocalValue::One(dest));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
     }
 
     /// Emit a call of the helper at `path` and return its result.
@@ -1632,7 +1747,7 @@ impl<'a> Lowering<'a> {
             unreachable!("raw array storage local");
         };
         let item_ty = tyref_raw_array_parts(&self.body.locals.locals[storage].ty, self.llbc)
-            .map(|(item, _)| self.value_type_of(&TyRef::Other(item.clone())))
+            .map(|(item, _)| self.value_type_of(&TyRef::Other(item.clone().into())))
             .expect("raw array local has an array type");
         let ptr = self.local_var[storage]
             .as_ref()
@@ -2823,7 +2938,7 @@ impl<'a> Lowering<'a> {
                 }
                 _ => {
                     let fd = self.pair_callee_decl(mir_bb, reg, &name, &pair_lens, true)?;
-                    if self.dont_look_inside.contains(fd.item_meta.name_path_str()) {
+                    if fun_decl_is_dont_look_inside(self.llbc, fd, self.dont_look_inside) {
                         return Err(LowerError::Unsupported(format!(
                             "bb{mir_bb}: residual {name} returns a pair slice"
                         )));
@@ -4348,7 +4463,7 @@ pub(in crate::front::mir) fn tyref_pair_field_kind(
         .or_else(|| {
             let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
             let referent = node.get("Ref")?.as_array()?.get(1)?;
-            tyref_pair_slice_item_kind(&TyRef::Other(referent.clone()), llbc)
+            tyref_pair_slice_item_kind(&TyRef::Other(referent.clone().into()), llbc)
         })
         .filter(|kind| PAIR_SLICE_ITEM_KINDS.contains(kind))
         // A struct field of `&mut [PyObjectRef]` stays the one-word object
@@ -4510,6 +4625,26 @@ pub(in crate::front::mir) fn tyref_object_pointer_slice_mutability<'l>(
     (json_ty_is_objectptr(item, llbc)
         || object_pointer_item_spelling(&charon_type_value_to_ast_string(item, llbc, 0)))
     .then_some(kind)
+}
+
+/// The element node of `[T]` behind `&` / `&mut` / `*const` / `*mut` / `Box`.
+/// `str` and `dyn Trait` have no `Slice` node, so they answer `None`.
+pub(in crate::front::mir) fn tyref_slice_elem<'l>(
+    ty: &'l TyRef,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let pointee = if let Some(pointee) = type_node_box_pointee(node, llbc) {
+        pointee
+    } else {
+        match (node.get("Ref"), node.get("RawPtr")) {
+            (Some(reference), _) => reference.as_array()?.get(1)?,
+            (None, Some(raw)) => raw.as_array()?.first()?,
+            (None, None) => return None,
+        }
+    };
+    let pointee = strip_ty_indirections(pointee, llbc)?;
+    pointee.get("Slice")?.as_array()?.first()
 }
 
 /// The item kind of a `&[T]` / `&mut [T]` / `*const [T]` / `*mut [T]` whose
@@ -4678,7 +4813,7 @@ pub(in crate::front::mir) fn iter_mut_item_is_object_pointer(ty: &TyRef, llbc: &
 pub(in crate::front::mir) fn ref_pointee_ty(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     let pointee = node.get("Ref")?.as_array()?.get(1)?;
-    Some(TyRef::Other(pointee.clone()))
+    Some(TyRef::Other(pointee.clone().into()))
 }
 
 pub(in crate::front::mir) fn tyref_ref_pointee_value_type(
@@ -4691,7 +4826,7 @@ pub(in crate::front::mir) fn tyref_ref_pointee_value_type(
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     let pointee = node.get("Ref")?.as_array()?.get(1)?;
     Some(tyref_to_value_type_with(
-        &TyRef::Other(pointee.clone()),
+        &TyRef::Other(pointee.clone().into()),
         llbc,
         tombstoned,
         gc_struct_ids,

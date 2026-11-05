@@ -345,6 +345,10 @@ pub struct TraceCtx {
     virtualizable_live_null_slots: Option<Vec<bool>>,
     /// VirtualizableInfo for the standard virtualizable (if any).
     virtualizable_info: Option<std::sync::Arc<VirtualizableInfo>>,
+    /// SizeDescr parents of synthetic EmbeddedArray `buf` GETFIELD descrs.
+    /// `FieldDescr.parent_descr` is a Weak (`descr.py`); the parent has to
+    /// outlive the op that holds the field.
+    embedded_array_parent_descrs: Vec<DescrRef>,
     /// Lengths of each virtualizable array field, needed for flat index computation.
     virtualizable_array_lengths: Option<Vec<usize>>,
     /// Live virtualizable heap pointer (pyjitpl.py:3446 write_boxes target).
@@ -939,11 +943,10 @@ pub struct TraceCtx {
 /// then `prepare_resume_from_failure`). The concrete `PyFrame` stays
 /// deferred to the drain so it is not held unrooted across a collection.
 ///
-/// The bank vectors are indexed by pyre's semantic register index: pyre
-/// traces Python bytecode, so these are `locals_cells_stack_w` positions,
-/// NOT RPython regalloc colors, and align with LOAD_FAST's `nlocals +
-/// stack_idx`. `concrete_r` is parallel to `registers_r` and seeds the
-/// assembled frame's `locals_cells_stack_w`.
+/// `registers_i` / `registers_f` are post-regalloc color. `registers_r` is
+/// slot-indexed (`locals_cells_stack_w`) and seeds the assembled frame;
+/// `registers_r_color` is color-indexed (`MIFrame.registers_r` /
+/// `resume.py` `_callback_r`). `concrete_r` is parallel to `registers_r`.
 #[derive(Clone)]
 pub struct ReconstructRecipe {
     /// Raw `CodeObject*` identity of the callee (NOT the PyCode wrapper).
@@ -961,6 +964,7 @@ pub struct ReconstructRecipe {
     pub nlocals: usize,
     pub valuestackdepth: usize,
     pub registers_i: Vec<OpRef>,
+    /// Slot-indexed (`locals_cells_stack_w`).
     pub registers_r: Vec<OpRef>,
     pub registers_f: Vec<OpRef>,
     pub concrete_r: Vec<majit_ir::Value>,
@@ -2464,6 +2468,7 @@ impl TraceCtx {
             virtualizable_boxes: None,
             virtualizable_live_null_slots: None,
             virtualizable_info: None,
+            embedded_array_parent_descrs: Vec::new(),
             virtualizable_array_lengths: None,
             virtualizable_heap_ptr: None,
             virtualizable_heap_root: None,
@@ -2566,6 +2571,7 @@ impl TraceCtx {
             virtualizable_boxes: None,
             virtualizable_live_null_slots: None,
             virtualizable_info: None,
+            embedded_array_parent_descrs: Vec::new(),
             virtualizable_array_lengths: None,
             virtualizable_heap_ptr: None,
             virtualizable_heap_root: None,
@@ -6965,6 +6971,8 @@ impl TraceCtx {
             // slot was stamped at the calling record-site with
             // `concrete` via `set_opref_concrete`, so cache-hit sanity
             // readers retrieve it through `box_value(cached)`.
+            // The store ran before `execute_and_record` (`field_store` /
+            // `do_setfield_gc`), so a second write here would duplicate it.
             self.heapcache_setfield_cached(vable_opref, field_index, value);
             return None;
         }
@@ -7416,7 +7424,7 @@ impl TraceCtx {
         field.set_parent_descr(&parent);
         // `get_parent_descr` upgrades a `Weak`. The field descr stored on the
         // op is the only other owner, so the parent has to stay alive itself.
-        Self::keep_embedded_parent(parent);
+        self.keep_embedded_parent(parent);
         let concrete = self.concrete_of_opref(container);
         let field_descr: majit_ir::DescrRef = field.clone();
         let op = self.record_op_with_descr(OpCode::GetfieldGcR, &[container], field_descr.clone());
@@ -7434,12 +7442,54 @@ impl TraceCtx {
         self.vable_embedded_items_base(container, array_index)
     }
 
-    fn keep_embedded_parent(parent: majit_ir::DescrRef) {
-        use std::sync::Mutex;
-        static KEPT: Mutex<Vec<majit_ir::DescrRef>> = Mutex::new(Vec::new());
-        KEPT.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(parent);
+    fn keep_embedded_parent(&mut self, parent: majit_ir::DescrRef) {
+        self.embedded_array_parent_descrs.push(parent);
+    }
+
+    /// Write one item of a nonstandard virtualizable through the live
+    /// object (`blackhole.py` `bhimpl_setarrayitem_vable_*`).
+    ///
+    /// The jitcode array-pointer descr may not share identity with the
+    /// interned `vinfo.array_field_descrs` entry; offset match is the
+    /// same field (`virtualizable.py` `array_field_by_descrs`).
+    fn write_nonstandard_vable_array_item(
+        &self,
+        vable_ptr: i64,
+        fdescr: &DescrRef,
+        index: i64,
+        value: Value,
+    ) -> bool {
+        let Some(info) = self.virtualizable_info.as_ref() else {
+            return false;
+        };
+        let ai = info
+            .array_field_by_descr(fdescr)
+            .or_else(|| info.array_field_index_by_offset(fdescr.as_field_descr()?.offset()));
+        let Some(ai) = ai else {
+            return false;
+        };
+        let Some(array) = info.array_fields.get(ai) else {
+            return false;
+        };
+        // `executor.py do_setarrayitem_gc` writes through the cpu;
+        // unit traces leave `cpu` unwired (`translate_support_code`)
+        // and stamp small ConstPtrs that are not objects.
+        if self.cpu.is_none() {
+            return false;
+        }
+        if (vable_ptr as usize) % std::mem::align_of::<*const u8>() != 0 {
+            return false;
+        }
+        let bits = match value {
+            Value::Ref(r) if r != GcRef::NO_CONCRETE && r.0 != 0 => {
+                majit_gc::gc_current_object_address(r.0) as i64
+            }
+            other => value_to_raw_bits(other),
+        };
+        unsafe {
+            crate::virtualizable::vable_write_array_item(vable_ptr as *mut u8, array, index, bits);
+        }
+        true
     }
 
     fn stamp_vable_array_base(&mut self, op: OpRef, vable: Option<Value>, fdescr: &DescrRef) {
@@ -7905,11 +7955,33 @@ impl TraceCtx {
         record_only: bool,
     ) -> VableArrayStore {
         if nonstandard {
-            // `execute_setarrayitem_gc` records `SETARRAYITEM_GC` and updates
-            // the heapcache. It does not write the concrete array.
+            // `_opimpl_setarrayitem_gc_any` → `execute_and_record(SETARRAYITEM_GC)`
+            // (`pyjitpl.py`). `executor.py do_setarrayitem_gc` →
+            // `cpu.bh_setarrayitem_gc_*` writes the concrete array while
+            // recording. The standard arm below writes through
+            // `write_virtualizable_heap_value_at`; `record_only` is
+            // `optimize_VIRTUAL_REF_FINISH` after that write already ran.
             let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
             let array_opref = self.vable_embedded_items_base_descr(array_opref, &fdescr);
-            self.execute_setarrayitem_gc(array_opref, index, value, adescr);
+            self.execute_setarrayitem_gc(array_opref, index, value, adescr.clone());
+            if !record_only {
+                // `executor.py do_setarrayitem_gc` writes the live array.
+                // Prefer the vable's concrete frame → its locals pointer
+                // (`bhimpl_setarrayitem_vable_*`): an EmbeddedArray items
+                // GETFIELD may not yet carry a concrete, and `array_store`
+                // on the container would index the header.
+                let written = self.live_ptr_of(vable_opref).is_some_and(|vable_ptr| {
+                    self.write_nonstandard_vable_array_item(
+                        vable_ptr,
+                        &fdescr,
+                        index_runtime_value,
+                        concrete,
+                    )
+                });
+                if !written && let Some(ptr) = self.live_ptr_of(array_opref) {
+                    self.array_store(ptr, index_runtime_value, &adescr, concrete);
+                }
+            }
             return VableArrayStore::Stored(None);
         }
         // index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
@@ -10704,6 +10776,48 @@ mod tests {
             ops.iter().all(|op| op.opcode != OpCode::GetarrayitemGcR),
             "heapcache hit must not record GETARRAYITEM_GC_R: {ops:?}"
         );
+    }
+
+    /// `executor.py do_setarrayitem_gc` writes the live array on the
+    /// nonstandard arm (`bhimpl_setarrayitem_vable_*`).
+    #[test]
+    fn nonstandard_setarrayitem_writes_live_array() {
+        let heap = TwoArrayVable::new(false);
+        assert_eq!(heap.slots(), [1, 2, 10, 20, 30]);
+        let cpu = SanityTestCpu {
+            int_value: 0,
+            ref_value: majit_ir::GcRef(0),
+            float_value: 0.0,
+        };
+        let (mut ctx, vable) = ctx_with_shadow(
+            &heap,
+            &[
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(10),
+                Value::Int(20),
+                Value::Int(30),
+            ],
+        );
+        ctx.set_cpu(Some(&cpu));
+        ctx.set_opref_concrete(vable, Value::Ref(GcRef(heap.ptr() as usize)));
+        let a_descr = heap.info.array_pointer_field_descr(0);
+        let a_item = heap.info.array_item_descr(0);
+        let index = ctx.const_int(1);
+        let new_val = ctx.const_int(888);
+        ctx.vable_setarrayitem_checked(
+            true,
+            0,
+            vable,
+            index,
+            1,
+            a_descr,
+            a_item,
+            new_val,
+            Value::Int(888),
+            false,
+        );
+        assert_eq!(heap.slots(), [1, 2, 10, 888, 30]);
     }
 
     #[test]

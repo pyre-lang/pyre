@@ -9905,6 +9905,9 @@ impl<M: Clone> MetaInterp<M> {
         };
         let _ops_live = self.publish_live_ops(&optimized_ops);
         self.last_quasi_immutable_deps = quasi_immutable_deps;
+        // `compile.py` `compile_loop` holds the optimized op list on the
+        // compiling frame until `send_loop_to_backend`. Numbered-guard
+        // descrs live on these ops, not on the source `TreeLoop`.
 
         // compile.py:302-308: vectorization post-pass. Condition is
         // `((warmstate.vec and jitdriver_sd.vec) or warmstate.vec_all) and
@@ -12628,7 +12631,7 @@ impl<M: Clone> MetaInterp<M> {
                     trace.inputargs.len(),
                 )
             });
-        let optimized_ops = match optimize_result {
+        let mut optimized_ops = match optimize_result {
             Ok(ops) => ops,
             // A guard proven to always fail (deferred `InvalidLoop` signal):
             // abort the trace and fall back to the blackhole interpreter.
@@ -12680,10 +12683,12 @@ impl<M: Clone> MetaInterp<M> {
             }
         };
         let opt_time = Instant::now().saturating_duration_since(optimize_start);
+        // `compile.py` `compile_trace` holds the optimized op list on the
+        // compiling frame until `send_loop_to_backend`.
+        let _live_finish = self.publish_live_ops(&optimized_ops);
         // RPython optimizer.py (flush=True): Finish/Jump is sent
         // through passes inside propagate_all_forward and ends up in
         // new_operations naturally — no restoration needed.
-        let optimized_ops = optimized_ops;
         let num_ops_after = optimized_ops.len();
         let opcodes_after: Vec<OpCode> = optimized_ops.iter().map(|op| op.opcode).collect();
         // optimizer.py:557 self.resumedata_memo.update_counters(profiler)
@@ -12696,7 +12701,6 @@ impl<M: Clone> MetaInterp<M> {
         // unrolled-loop path, `compile_loop_body`), not on the FINISH
         // terminator: this trace ends in FINISH, not a back-edge JUMP, so it
         // is not a vectorizable loop.
-        let optimized_ops = optimized_ops;
 
         if crate::majit_log_enabled() {
             eprintln!(
@@ -12732,7 +12736,9 @@ impl<M: Clone> MetaInterp<M> {
         // rd_consts/rd_virtuals). RPython has no compile-time abort
         // heuristic — runtime guard-fail recovery handles unrecoverable
         // cases via `cpu.invalidate_loop` / `release_all_loops`.
-        let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        drop(_live_finish);
+        optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        let _live_finish = self.publish_live_ops(&optimized_ops);
 
         if crate::majit_log_enabled() {
             eprintln!("--- finish trace (after unbox) ---");
@@ -13095,7 +13101,7 @@ impl<M: Clone> MetaInterp<M> {
                     num_trace_inputargs,
                 )
             });
-        let optimized_ops = match optimize_result {
+        let mut optimized_ops = match optimize_result {
             Ok(ops) => ops,
             // A guard proven to always fail (deferred `InvalidLoop` signal):
             // abandon the loop.
@@ -13136,7 +13142,10 @@ impl<M: Clone> MetaInterp<M> {
             &constants,
         );
 
-        let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        // `compile.py` `compile_simple_loop` holds the optimized op list on
+        // the compiling frame until `send_loop_to_backend`.
+        optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        let mut _live_simple = self.publish_live_ops(&optimized_ops);
 
         // This path mints one TargetToken with no virtual state and no
         // preamble in front of it, so its LABEL is the only entry the key
@@ -13197,7 +13206,9 @@ impl<M: Clone> MetaInterp<M> {
         // `compile.py jitcell_token.target_tokens = [target_token]` —
         // mirror onto JCT for `has_compiled_targets` (`pyjitpl.py`).
         token.record_target_token(target_token.as_jump_target_descr());
+        drop(_live_simple);
         let mut compiled_ops = optimized_ops.clone();
+        _live_simple = self.publish_live_ops(&compiled_ops);
         if let Some(jump_op) = compiled_ops.last().filter(|op| op.opcode == OpCode::Jump) {
             jump_op.setdescr(target_token.as_jump_target_descr());
         }
@@ -31966,6 +31977,55 @@ mod tests {
                 .getref_base(),
             live,
             "walk_rd_consts_refs must write the rd_consts Const::Ref field"
+        );
+    }
+
+    /// A guard op published through `CompileLiveOpRoots` traces its
+    /// fail-descr `rd_consts` pool even with no live resume memo.
+    /// `compile.py` `ResumeGuardDescr._attrs_` / `resoperation.py`
+    /// `GuardResOp` `getdescr`.
+    #[test]
+    fn compile_snapshot_walk_forwards_guard_descr_rd_consts() {
+        let dead = GcRef(0x96E4_B100);
+        let live = GcRef(0x96E4_C100);
+        let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
+        descr
+            .as_fail_descr()
+            .expect("resume guard")
+            .set_rd_consts(Some(vec![majit_ir::Const::from_gcref(dead)]));
+        let op = {
+            let op = majit_ir::Op::new(
+                majit_ir::OpCode::GuardTrue,
+                &[majit_ir::operand::Operand::const_(majit_ir::Const::Int(1))],
+            );
+            op.setdescr(descr.clone());
+            majit_ir::OpRc::new(op)
+        };
+        let ops = vec![op];
+        let mut meta = MetaInterp::<()>::new(0);
+        assert!(
+            meta.compile_resume_memos.is_empty(),
+            "fixture starts with no live resume memo"
+        );
+        let _published = meta.compile_live_op_roots.publish_vec(&ops);
+        meta.walk_compile_snapshot_refs(|slot| {
+            if slot.0 == dead.0 {
+                slot.0 = live.0;
+            }
+        });
+        assert_eq!(
+            descr
+                .as_fail_descr()
+                .expect("resume guard")
+                .rd_consts_arc()
+                .expect("pool")[0]
+                .getref_base(),
+            live,
+            "walk_compile_snapshot_refs must forward the guard descr rd_consts Ref"
+        );
+        assert!(
+            meta.compile_resume_memos.is_empty(),
+            "walk must not require a live resume memo"
         );
     }
 

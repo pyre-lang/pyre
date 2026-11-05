@@ -605,7 +605,7 @@ pub(crate) fn identity_unstructured(ty: &TyRef) -> Option<Unstructured> {
     let ty_json = match ty {
         TyRef::Dedup { id } => serde_json::json!({"Deduplicated": id}),
         TyRef::Inline { value: (id, body) } => serde_json::json!({"Value": [id, body]}),
-        TyRef::Other(v) => v.clone(),
+        TyRef::Other(v) => serde_json::Value::clone(v),
     };
     let span = serde_json::json!({
         "data": {
@@ -935,12 +935,12 @@ pub(crate) fn subst_tyref(
     let mut value = match ty {
         TyRef::Dedup { id } => serde_json::json!({ "Deduplicated": id }),
         TyRef::Inline { value: (id, body) } => {
-            serde_json::json!({ "Value": [id, body] })
+            serde_json::json!({ "Value": [id, &**body] })
         }
-        TyRef::Other(body) => body.clone(),
+        TyRef::Other(body) => (*body.0).clone(),
     };
     substitute_type_vars(&mut value, llbc, types, const_generics);
-    serde_json::from_value(value.clone()).unwrap_or(TyRef::Other(value))
+    serde_json::from_value(value.clone()).unwrap_or(TyRef::Other(value.into()))
 }
 
 fn subst_vars(
@@ -2649,7 +2649,7 @@ mod tests {
     /// and a Return (`FunctionDesc.getuniquegraph` of the reflexive From).
     #[test]
     fn identity_unstructured_is_copy_and_return() {
-        let ty = TyRef::Other(json!({"Scalar": {"Integer": {"Signed": "I64"}}}));
+        let ty = TyRef::Other(json!({"Scalar": {"Integer": {"Signed": "I64"}}}).into());
         let u = identity_unstructured(&ty).expect("identity body");
         assert_eq!(u.locals.arg_count, 1);
         assert_eq!(u.locals.locals.len(), 2);

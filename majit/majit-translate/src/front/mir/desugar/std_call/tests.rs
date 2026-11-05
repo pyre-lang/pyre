@@ -1,6 +1,6 @@
 use majit_charon_reader::{
     Llbc,
-    ullbc::{RegularCall, TyRef, Unstructured},
+    ullbc::{CallKind, FunId, RegularCall, TyRef, Unstructured},
 };
 
 use super::{
@@ -128,12 +128,18 @@ fn deref_impl_fixture(owner_path: &[&str]) -> (Llbc, RegularCall) {
 /// alias it with `alloc::vec::Vec`; the declaration path does not.
 #[test]
 fn user_vec_deref_is_not_container_identity() {
-    let slice_ty = TyRef::Other(serde_json::json!({
-        "Ref": [null, {"Slice": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, null]}, "Shared"]
-    }));
-    let i64_ty = TyRef::Other(serde_json::json!({
-        "Ref": [null, {"Scalar": {"Integer": {"Signed": "I64"}}}, "Shared"]
-    }));
+    let slice_ty = TyRef::Other(
+        serde_json::json!({
+            "Ref": [null, {"Slice": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, null]}, "Shared"]
+        })
+        .into(),
+    );
+    let i64_ty = TyRef::Other(
+        serde_json::json!({
+            "Ref": [null, {"Scalar": {"Integer": {"Signed": "I64"}}}, "Shared"]
+        })
+        .into(),
+    );
 
     let (llbc, call) = deref_impl_fixture(&["foo", "Vec"]);
     with_fixture_lowering(&llbc, |lo| {
@@ -225,5 +231,102 @@ fn user_vec_deref_is_not_container_identity() {
             !lo.is_container_identity_deref_for(&call, None, Some(&slice_ty)),
             "foo::alloc::boxed::Box with a slice dest is not alloc::boxed::Box"
         );
+    });
+}
+
+fn bits_fixture() -> (Llbc, TyRef, TyRef) {
+    use crate::front::mir::tests::{window_empty_generics, window_meta, window_span};
+    let span = window_span();
+    let ident = |s: &str| serde_json::json!({"Ident": [s, 0]});
+    let codeflags_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    });
+    let u32_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U32"}}});
+    let flags_ref = serde_json::json!({"Ref": [null, codeflags_adt.clone(), "Shared"]});
+    let inherent_impl = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": {"Value": [0, codeflags_adt.clone()]},
+        "kind": "InherentImplBlock"
+    }}});
+    let bits_fd = |def_id: u64, name: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": {
+                "name": name,
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [flags_ref.clone()],
+                "output": u32_ty.clone()
+            },
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 1, "locals": []},
+                "body": []
+            }}
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [{
+                "def_id": 0,
+                "item_meta": window_meta(
+                    &["rustpython_compiler_core", "bytecode", "CodeFlags"],
+                    true
+                ),
+                "kind": {"Struct": []}
+            }],
+            "fun_decls": [
+                null,
+                bits_fd(1, vec![
+                    ident("rustpython_compiler_core"),
+                    ident("bytecode"),
+                    inherent_impl,
+                    ident("bits"),
+                ]),
+                bits_fd(2, vec![ident("application"), ident("bits")]),
+            ],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": [],
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let src = TyRef::Other(flags_ref.into());
+    let dest = TyRef::Other(u32_ty.into());
+    (llbc, src, dest)
+}
+
+fn bits_call(id: u64) -> RegularCall {
+    serde_json::from_value(serde_json::json!({"kind": {"Fun": id}, "generics": null}))
+        .expect("fixture call parses")
+}
+
+/// A free `application::bits(CodeFlags) -> u32` is not the generated
+/// `bitflags!` accessor, even though its leaf is `bits`.
+#[test]
+fn transparent_scalar_word_identity_is_the_generated_bitflags_bits_accessor() {
+    let (llbc, src, dest) = bits_fixture();
+    with_fixture_lowering(&llbc, |lowering| {
+        let inherent = bits_call(1);
+        let free = bits_call(2);
+        assert!(
+            lowering.is_transparent_scalar_word_identity(&inherent, Some(&src), &dest),
+            "CodeFlags::bits is the generated accessor"
+        );
+        assert!(
+            !lowering.is_transparent_scalar_word_identity(&free, Some(&src), &dest),
+            "application::bits is an ordinary function"
+        );
+        assert!(matches!(
+            inherent.kind,
+            CallKind::Fun(FunId::Regular { id: 1 })
+        ));
     });
 }

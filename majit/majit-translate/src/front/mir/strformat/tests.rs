@@ -1144,11 +1144,13 @@ fn i64_to_i32_try_from_real_sites_lower_to_checked_result() {
 }
 
 /// `w_range_iter` keeps the word iterator only when
-/// `start + length * step` still fits i64 (`i64::try_from(i128)`).
-/// That shell is the same checked Result `c_int_w` writes, with
-/// `longlongmask` on the Ok payload (`rbuiltin.py`).
+/// `start + length * step` still fits i64. The gate is
+/// `length.checked_mul(step)` then `start.checked_add(product)`
+/// (`functional.rs` `w_range_iter`; [3.14-spec] `rangeobject.c`
+/// `range_iter`). Signed `checked_*` lifts to `mul_ovf` / `add_ovf`
+/// (`checked_arith.rs`, `operation.py` `ovfcheck`).
 #[test]
-fn w_range_iter_i128_try_from_lowers_to_checked_result() {
+fn w_range_iter_overflow_gate_lifts_to_ovf_ops() {
     use crate::model::{CallTarget, OpKind};
 
     let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::OBJECT_ULLBC);
@@ -1164,25 +1166,27 @@ fn w_range_iter_i128_try_from_lowers_to_checked_result() {
             }),
             "w_range_iter: i128 try_from must not remain an opaque core call"
         );
-    for expected in ["lt", "gt", "or"] {
+    for residual in ["checked_mul", "checked_add"] {
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some(residual))
+            }),
+            "w_range_iter: {residual} must lift off the residual call"
+        );
+    }
+    for expected in ["mul_ovf", "add_ovf"] {
         assert!(
             graph
                 .blocks
                 .iter()
                 .flat_map(|b| &b.operations)
                 .any(|op| { matches!(&op.kind, OpKind::BinOp { op, .. } if op == expected) }),
-            "w_range_iter: missing checked-narrowing {expected} op"
+            "w_range_iter: missing overflow-gate {expected} op"
         );
     }
-    assert!(
-        graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-            matches!(&op.kind, OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } if segments.last().map(String::as_str) == Some("longlongmask"))
-        }),
-        "w_range_iter: Ok payload must go through longlongmask"
-    );
 }
 
 #[test]

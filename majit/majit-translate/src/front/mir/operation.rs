@@ -247,7 +247,7 @@ impl<'a> Lowering<'a> {
                     ),
                     ty: pointee,
                 }),
-                ProjectionElem::Tagged(serde_json::json!({"Field": [null, field_idx]})),
+                ProjectionElem::Tagged(serde_json::json!({"Field": [null, field_idx]}).into()),
             ),
             ty: field_ty,
         };
@@ -2955,6 +2955,7 @@ impl<'a> Lowering<'a> {
                     if let Some(raw) = self.emit_dest_overlay_cast(
                         overlay_bb,
                         src_kind.as_ref(),
+                        operand_tyref(&operand),
                         arg.clone(),
                         dest_ty,
                     ) {
@@ -3120,6 +3121,18 @@ impl<'a> Lowering<'a> {
                             res,
                         ));
                     }
+                    // GC ref → Signed (`p as i64`): `rbuiltin.py gen_cast`
+                    // Ptr→Primitive is `cast_ptr_to_int` (`rtype_cast_ptr_to_int`
+                    // resulttype=Signed). `Str` / `StringBuilder` share the
+                    // `'ref'` bank with `Ref` (`UnicodeValueStorage`, rstr `STR`).
+                    if gc_ptr_to_signed(src_kind.as_ref(), &dst_kind) {
+                        let bb_id = self.emit_bb(mir_bb);
+                        let orig = arg.clone();
+                        let signed = push_cast_ptr_to_int(&mut self.graph, bb_id, arg);
+                        self.cast_ptr_to_int_src.insert(signed.clone(), orig);
+                        return Ok((None, signed));
+                    }
+
                     // `p as usize as *mut T` is `lltype.cast_opaque_ptr`
                     // (`lltype.py` `ann_cast_opaque_ptr`). Recover the
                     // original GC pointer so OptEarlyForce does not
@@ -3493,6 +3506,7 @@ impl<'a> Lowering<'a> {
                 );
                 let src_int = operand_tyref(&operand).and_then(|src| self.literal_int_width(src));
                 let dst_int = self.literal_int_width(&ty);
+                let src_ty = operand_tyref(&operand).cloned();
                 let src_is_pointer_from_ty = operand_tyref(&operand).map(|src_ty| {
                     tyref_node(src_ty, self.llbc)
                         .is_some_and(|node| one_level_pointer_pointee(node, self.llbc).is_some())
@@ -3542,9 +3556,13 @@ impl<'a> Lowering<'a> {
                 // an int source must not alias (`SomeInteger`) or take
                 // the 1-arg GCREF form (`SomeInstance`).
                 let overlay_bb = self.emit_bb(mir_bb);
-                if let Some(raw) =
-                    self.emit_dest_overlay_cast(overlay_bb, src_kind.as_ref(), v.clone(), &ty)
-                {
+                if let Some(raw) = self.emit_dest_overlay_cast(
+                    overlay_bb,
+                    src_kind.as_ref(),
+                    src_ty.as_ref(),
+                    v.clone(),
+                    &ty,
+                ) {
                     return Ok((None, raw));
                 }
                 if tyref_is_raw_u8_ptr(&ty, self.llbc)
@@ -3613,6 +3631,23 @@ impl<'a> Lowering<'a> {
                         emit_cast_int_to_strptr(&mut self.graph, bb_id, v, dest_root.as_deref());
                     return Ok((None, raw));
                 }
+                // GC ref → Signed (`p as i64`) before the bank-crossing
+                // `cast_call_segments` arm: `rbuiltin.py gen_cast` Ptr→Signed
+                // is `cast_ptr_to_int`. `Str` / `StringBuilder` are the same
+                // `'ref'` bank. Record `cast_ptr_to_int_src` so a later
+                // `p as i64 as *mut T` folds (`rewrite_op_cast_opaque_ptr`).
+                if gc_ptr_to_signed(src_kind.as_ref(), &dst_kind)
+                    && self.dest_is_plain_signed_int(&ty)
+                {
+                    let bb_id = self.emit_bb(mir_bb);
+                    let orig = v.clone();
+                    let signed = push_cast_ptr_to_int(&mut self.graph, bb_id, v);
+                    self.cast_ptr_to_int_src.insert(signed.clone(), orig);
+                    return Ok((None, signed));
+                }
+                // `*mut Raw as *mut u8` / a GC pointer, and the reverse, cross
+                // the int and ref banks. Aliasing would reuse one variable in
+                // both argument lists.
                 let crosses_raw_ref = (src_raw_addr && matches!(dst_kind, ValueType::Ref(_)))
                     || (matches!(src_kind, Some(ValueType::Ref(_))) && dest_raw_addr);
                 if crosses_raw_ref
@@ -5077,15 +5112,14 @@ impl<'a> Lowering<'a> {
         (!owner.is_empty()).then_some(owner)
     }
 
-    /// Dest PTRTYPE for a raw overlay struct (`*const raw_overlay::PrefixView`).
-    /// `ann_cast_int_to_ptr` returns
-    /// `SomePtr(PTRTYPE)`; `SomePtr.getattr` resolves on the example fields.
-    /// Decide by GC-ness, not class root: a raw (non-GC) `lltype.Struct` is
-    /// never an instance (`lltype.py` `ann_cast_int_to_ptr`). A declared-GC
-    /// ADT stays on [`Self::instance_narrow_for_type`].
+    /// Dest PTRTYPE for an overlay struct (`as *const Overlay`). The
+    /// overlay body's `_gckind` is the source pointer's (`lltype.py`
+    /// `castable`). A dest whose pointee is not overlay-eligible
+    /// (`declared_raw_adt_node`) stays on [`Self::instance_narrow_for_type`].
     pub(in crate::front::mir) fn dest_overlay_ptr_lltype(
         &self,
         dest_ty: &TyRef,
+        gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind,
     ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
         // `ann_cast_int_to_ptr` of `Ptr(STR)` is the string itself
         // (`node_is_string_value`). Overlay would recast that header as a
@@ -5108,7 +5142,7 @@ impl<'a> Lowering<'a> {
         let TypeDeclKind::Struct(_) = &decl.kind else {
             return None;
         };
-        self.raw_struct_ptr_lltype(decl)
+        self.raw_struct_ptr_lltype(decl, gckind)
     }
 
     /// `Ptr(Struct)` of a storage-raw overlay (`lltype.py`
@@ -5117,10 +5151,11 @@ impl<'a> Lowering<'a> {
     pub(in crate::front::mir) fn raw_struct_ptr_lltype(
         &self,
         decl: &TypeDecl,
+        gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind,
     ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
         use crate::flowspace::model::ConstValue;
         use crate::translator::rtyper::lltypesystem::lltype::{
-            GcKind, LowLevelType, Ptr, Struct, frozendict,
+            LowLevelType, Ptr, Struct, frozendict,
         };
         let TypeDeclKind::Struct(fields) = &decl.kind else {
             return None;
@@ -5135,7 +5170,7 @@ impl<'a> Lowering<'a> {
             let fty = overlay_field_lltype(&field.ty, self.llbc, self.gc_struct_ids);
             ll_fields.push((fname, fty));
         }
-        let mut body = Struct::registry_fields(&name, ll_fields, GcKind::Raw);
+        let mut body = Struct::registry_fields(&name, ll_fields, gckind);
         // `_immutable_fields_` from the table harvested once for this
         // artefact (`harvest_immutable_fields_from_llbcs`), the same
         // source GC struct schemas use (`program.immutable_fields`).
@@ -5192,7 +5227,10 @@ impl<'a> Lowering<'a> {
                 )?;
                 crate::annotator::bookkeeper::raw_enum_base_ptr_lltype(self.struct_fields?, &name)
             }
-            TypeDeclKind::Struct(_) => self.raw_struct_ptr_lltype(decl),
+            TypeDeclKind::Struct(_) => self.raw_struct_ptr_lltype(
+                decl,
+                crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            ),
             _ => None,
         }
     }
@@ -5290,27 +5328,45 @@ impl<'a> Lowering<'a> {
         None
     }
 
-    /// 2-arg `cast_int_to_ptr(PTRTYPE, addr)` when dest is a raw overlay.
-    /// A Ref source goes through `cast_ptr_to_int` first (`rffi.cast`).
+    /// Overlay dest `as *const T`. A Ref source is `lltype.cast_pointer`
+    /// (`jtransform.py` `rewrite_op_cast_pointer` → `same_as`); the overlay
+    /// `Ptr`'s `_gckind` is the source pointee's (`lltype.py` `castable`).
+    /// A flavor-raw `Ref` (`flavor_raw_pointer_class_root`) stays Raw.
+    /// Any other source is 2-arg `cast_int_to_ptr` of a raw overlay
+    /// (`ann_cast_int_to_ptr`).
     pub(in crate::front::mir) fn emit_dest_overlay_cast(
         &mut self,
         bb_id: BlockId,
         src_kind: Option<&ValueType>,
+        src_ty: Option<&TyRef>,
         arg: Variable,
         dest_ty: &TyRef,
     ) -> Option<Variable> {
-        let ptr_ty = self.dest_overlay_ptr_lltype(dest_ty)?;
-        let addr = if matches!(src_kind, Some(ValueType::Ref(_))) {
-            push_cast_ptr_to_int(&mut self.graph, bb_id, arg)
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+        if matches!(src_kind, Some(ValueType::Ref(_))) {
+            let gckind = overlay_source_gckind(
+                src_kind,
+                src_ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                &self.raw_alloc_flavor_structs,
+            );
+            let ptr_ty = self.dest_overlay_ptr_lltype(dest_ty, gckind)?;
+            Some(emit_dest_typed_cast_pointer(
+                &mut self.graph,
+                bb_id,
+                arg,
+                ptr_ty,
+            ))
         } else {
-            arg
-        };
-        Some(emit_dest_typed_cast_int_to_ptr(
-            &mut self.graph,
-            bb_id,
-            addr,
-            ptr_ty,
-        ))
+            let ptr_ty = self.dest_overlay_ptr_lltype(dest_ty, GcKind::Raw)?;
+            Some(emit_dest_typed_cast_int_to_ptr(
+                &mut self.graph,
+                bb_id,
+                arg,
+                ptr_ty,
+            ))
+        }
     }
 
     /// GC object start as `*u8` is `rffi.cast` onto CCHARP (`rffi.py`
@@ -5409,6 +5465,10 @@ impl<'a> Lowering<'a> {
     ///   Both annotate `lltype_to_annotation(GCREF)` (`SomePtr`).
     ///   GCREF→GCREF stays an alias. A genuine integer keeps
     ///   `cast_int_to_ptr`.
+    /// * **recast GCREF** — a value-model word occupying a GC pointer
+    ///   slot (`as PyObjectRef` / `pin_root`). RPython recasts a typed
+    ///   GC pointer into that slot with `cast_opaque_ptr` (`rgcref.py`
+    ///   `pairtype(Repr, GCRefRepr).convert_from_to`).
     ///
     /// A `Ref` source is required for the narrow / address arms: an
     /// `addr_usize as *const Struct` reinterpret is `cast_int_to_ptr`
@@ -5418,7 +5478,10 @@ impl<'a> Lowering<'a> {
     /// different pointer mutability (`*mut UnicodeValueStorage` →
     /// `*const UnicodeValueStorage`). Two-phase may seed that Input as
     /// `SomeInstance(PyObject)`; the dest of this cast is still
-    /// `Ptr(STR)` / `SomeString`.
+    /// `Ptr(STR)` / `SomeString`. A `Str` source is the same physical
+    /// pointer ([`Self::cast_src_is_pointer`]): dest-Str recasts it onto
+    /// rstr `STR`; a GC pointer dest recasts it to GCREF. Aliasing would
+    /// keep `SomeString` on a slot that later phis with `null` PyObjectRef.
     pub(in crate::front::mir) fn dest_ty_is_rstr_str(&self, dest_ty: &TyRef) -> bool {
         self.dest_rstr_str_layout_root(dest_ty).is_some()
             || tyref_is_string_value(dest_ty, self.llbc)
@@ -5440,8 +5503,11 @@ impl<'a> Lowering<'a> {
     /// Pointer-ness of a dest-STR restore source (`rbuiltin.py` `gen_cast`:
     /// Ptr→Ptr is `cast_pointer`; Primitive→Ptr is `cast_int_to_ptr`).
     /// When the source Rust type is available, [`one_level_pointer_pointee`]
-    /// (`*mut`/`*const`, `&`/`&mut`, thin `Box`, `NonNull`). Otherwise
-    /// `Ref(_)` or a stamped CCHARP / GCREF concretetype (`<*mut T>::cast`).
+    /// (`*mut`/`*const`, `&`/`&mut`, thin `Box`, `NonNull`) or a
+    /// string-family value (`tyref_is_string_value`: rstr `STR` is
+    /// `Ptr(STR)`). Otherwise `Ref(_)` / `Str` or a stamped CCHARP /
+    /// GCREF concretetype (`<*mut T>::cast`). A `Str` source is that
+    /// same pointer: dest-Str and the GCREF recast both take it.
     pub(in crate::front::mir) fn cast_src_is_pointer(
         &self,
         src_ty: Option<&TyRef>,
@@ -5450,9 +5516,10 @@ impl<'a> Lowering<'a> {
     ) -> bool {
         if let Some(ty) = src_ty {
             return tyref_node(ty, self.llbc)
-                .is_some_and(|node| one_level_pointer_pointee(node, self.llbc).is_some());
+                .is_some_and(|node| one_level_pointer_pointee(node, self.llbc).is_some())
+                || tyref_is_string_value(ty, self.llbc);
         }
-        matches!(src_kind, Some(ValueType::Ref(_)))
+        matches!(src_kind, Some(ValueType::Ref(_) | ValueType::Str))
             || arg.concretetype().as_ref().is_some_and(|ct| {
                 lltype_is_ccharp(ct)
                     || ct == &*crate::translator::rtyper::lltypesystem::lltype::GCREF
@@ -5497,6 +5564,21 @@ impl<'a> Lowering<'a> {
                 crate::model::cast_instance_call_result(root, arg.clone(), ValueType::Str),
                 res,
             ));
+        }
+        // `pairtype(Repr, GCRefRepr).convert_from_to` (`rgcref.py`): the
+        // dest is an instance pointer consumed as a GCREF slot (`pin_root`
+        // / `gc_root_pin_path`). The annotator already accepts the source
+        // value on a GCREF root (`cast_instance_intrinsic` `root == "GCREF"`).
+        // After dest-Str so a dest rstr `STR` with dest_kind `Ref(Utf8Str)`
+        // is not stolen into GCREF. A `Str` source is a pointer under
+        // [`Self::cast_src_is_pointer`]; dest-Str already took those dests.
+        if matches!(src_kind, Some(ValueType::Str)) && matches!(dest_kind, ValueType::Ref(_)) {
+            let res = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            let kind =
+                crate::model::cast_instance_call_result("GCREF", arg.clone(), ValueType::Ref(None));
+            return Some((kind, res));
         }
         // dest-GCREF (`*mut GCREFOpaque` / `llmemory.GCREF`). Split on
         // the source pointee's gckind (`ptr_pointee_is_gc`):
@@ -6443,6 +6525,21 @@ impl<'a> Lowering<'a> {
             return false;
         };
         if fields.is_empty() || field_decl.is_repr_transparent() {
+            return false;
+        }
+        // A linked transparent scalar (`CodeFlags`) is the inner word.
+        // `published_struct_copy` leaves `repr.transparent` false, so the
+        // flag above does not catch it; the same table as
+        // `tyref_transparent_inner_value_type` does.
+        if tyref_transparent_inner_value_type(
+            field_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )
+        .is_some()
+        {
             return false;
         }
         let field_path = field_decl.item_meta.name_path_str();
@@ -8263,12 +8360,37 @@ impl<'a> Lowering<'a> {
                         // itself (`ClassRepr.getclsfield`).
                         return Ok(base);
                     }
+                    let slice_elem = tyref_slice_elem(&inner.ty, self.llbc);
+                    let is_string_byte_view = self
+                        .string_byte_view_locals
+                        .iter()
+                        .any(|&local| place_references_local(&inner, local));
+                    let is_list_view = self
+                        .list_view_locals
+                        .iter()
+                        .any(|&local| place_references_local(&inner, local));
+                    let array_type_id = slice_elem.and_then(|elem| {
+                        json_ty_is_objectptr(elem, self.llbc).then(|| {
+                            slice_array_type_id("*mut PyObject")
+                                .expect("object-pointer slice names the object gcarray")
+                        })
+                    });
+                    let is_slice = slice_elem.is_some();
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.emit_bb(mir_bb);
                     if let Some(meta) =
                         self.fat_component(bb_id, &base, crate::model::VecFieldPart::FatLen)
                     {
                         return Ok(meta);
+                    }
+                    if is_slice {
+                        return Ok(self.emit_slice_len(
+                            bb_id,
+                            &base,
+                            is_string_byte_view,
+                            is_list_view,
+                            array_type_id,
+                        ));
                     }
                     return Ok(base);
                 }
@@ -9216,11 +9338,16 @@ impl<'a> Lowering<'a> {
                 // can drop the ZST (`rordereddict.py` has no hasher field).
                 let dest_adt = dest_ty.and_then(|ty| tyref_adt_map(ty, self.llbc));
                 let spelling_adt = match head_adt {
-                    Some(h) if !render_adt_type_args(h, self.llbc, 0).is_empty() => Some(h),
+                    Some(h)
+                        if !render_adt_type_args(h, self.llbc, 0, self.tombstoned_leaves)
+                            .is_empty() =>
+                    {
+                        Some(h)
+                    }
                     _ => dest_adt.or(head_adt),
                 };
                 let inst_args = spelling_adt
-                    .map(|h| render_adt_type_args(h, self.llbc, 0))
+                    .map(|h| render_adt_type_args(h, self.llbc, 0, self.tombstoned_leaves))
                     .unwrap_or_default();
                 // Instantiated field TyRef (`substitute_spill_typevars`):
                 // `_names_without_voids` sees `BuildHasherDefault<H>`
@@ -9272,14 +9399,22 @@ impl<'a> Lowering<'a> {
                 // TypeDeclRef when the head has no type arguments.
                 let inst_adt = intern_adt;
                 let type_leaf = inst_adt
-                    .and_then(|h| struct_instantiation_suffix(&name_path, h, self.llbc))
+                    .and_then(|h| {
+                        struct_instantiation_suffix(
+                            &name_path,
+                            h,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                        )
+                    })
                     .map(|suffix| majit_ir::descr::with_instantiation_suffix(&type_leaf, &suffix))
                     .unwrap_or(type_leaf);
+
                 Some((
                     owner_path,
                     type_leaf,
                     field_rows,
-                    concrete_adt_struct_id(template, inst_adt, self.llbc),
+                    concrete_adt_struct_id(template, inst_adt, self.llbc, self.tombstoned_leaves),
                     true,
                     None,
                 ))
@@ -9323,7 +9458,7 @@ impl<'a> Lowering<'a> {
                 // intern as the pointer word rather than the template
                 // `??TypeVar`.
                 let inst_args = inst_adt
-                    .map(|h| render_adt_type_args(h, self.llbc, 0))
+                    .map(|h| render_adt_type_args(h, self.llbc, 0, self.tombstoned_leaves))
                     .unwrap_or_default();
                 // Instantiated field type (`collect_by_value_struct_leaves`
                 // `substitute_spill_typevars`): `_names_without_voids` sees
@@ -9364,11 +9499,25 @@ impl<'a> Lowering<'a> {
                     decl_path_for_tombstone(&name_path, self.tombstoned_leaves),
                     v.name
                 ));
+                let vsid =
+                    concrete_adt_struct_id(template, inst_adt, self.llbc, self.tombstoned_leaves);
+                ensure_enum_variant_instance_layout(
+                    self.llbc,
+                    td,
+                    idx as usize,
+                    &inst_args,
+                    inst_adt,
+                    vsid,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                    &self.struct_layouts,
+                );
                 Some((
                     variant_owner,
                     v.name.clone(),
                     field_rows,
-                    concrete_adt_struct_id(template, inst_adt, self.llbc),
+                    vsid,
                     false,
                     Some(idx as i64),
                 ))
@@ -9443,7 +9592,13 @@ impl<'a> Lowering<'a> {
         &'s self,
         base_ty: &'s TyRef,
     ) -> Option<&'s serde_json::Map<String, serde_json::Value>> {
-        strip_ty_wrappers(tyref_node(base_ty, self.llbc)?, self.llbc)?
+        // Type aliases are transparent: `IdentityDictStorage` is
+        // `RDict<IdentityKey, PyObjectRef, RandomState>`, and the field
+        // descr is keyed by that instantiated STRUCT
+        // (`descr.py` `get_field_descr`). Peel after stripping `&` so a
+        // borrowed alias still projects the aliased ADT's generics.
+        let node = strip_ty_wrappers(tyref_node(base_ty, self.llbc)?, self.llbc)?;
+        type_node_peel_aliases(node, self.llbc)?
             .as_object()?
             .get("Adt")?
             .as_object()
@@ -9593,7 +9748,11 @@ impl<'a> Lowering<'a> {
         let (variant_idx, field_idx) = indexed_field_parts(payload)?;
         let host_index = host_field_index(variant_idx, field_idx);
         let head = self.field_base_adt(base_ty)?;
-        let head_adt = Some(head);
+        // Same dest/head choice as `resolve_aggregate_adt`: the place type
+        // still carries use-site generics when alias peel / a bare TypeDeclRef
+        // dropped them (`ItemMeta::instantiation`, `getinstancerepr`).
+        let dest_adt = tyref_adt_map(base_ty, self.llbc);
+        let inst_adt = concrete_instantiation_adt(Some(head), dest_adt, self.llbc);
         let type_id = type_decl_ref_adt_id(head)?;
         let td = self.llbc.type_by_id(type_id)?;
         // The full `name_path()` is in hand here, so mint the owning
@@ -9625,9 +9784,16 @@ impl<'a> Lowering<'a> {
         let owner_root = if majit_charon_reader::ullbc::is_closure_leaf(&owner_leaf) {
             strip_crate_prefix(&name_path)
         } else {
-            match adt_head_instantiation_suffix(head, self.llbc, self.tombstoned_leaves) {
+            match inst_adt.and_then(|adt| {
+                adt_head_instantiation_suffix(adt, self.llbc, self.tombstoned_leaves)
+            }) {
                 Some(suffix) => majit_ir::descr::with_instantiation_suffix(&owner_base, &suffix),
-                None => match struct_instantiation_suffix(&name_path, head, self.llbc) {
+                None => match struct_instantiation_suffix(
+                    &name_path,
+                    inst_adt.unwrap_or(head),
+                    self.llbc,
+                    self.tombstoned_leaves,
+                ) {
                     Some(suffix) => {
                         majit_ir::descr::with_instantiation_suffix(&owner_base, &suffix)
                     }
@@ -9638,9 +9804,9 @@ impl<'a> Lowering<'a> {
         if variant_idx.is_none()
             && let Some(fields) = type_decl_struct_fields(td, self.llbc)
         {
-            // `type Alias = Struct<…>` is an Alias whose fields live on
-            // the generic struct. Keep the alias as owner so
-            // `exact_layouts` uses the monomorph's rustc offsets.
+            // `type Alias = Struct<…>` is transparent: `field_base_adt`
+            // already peeled to the aliased ADT, so `owner_id` is the
+            // instance STRUCT (`descr.py` `get_field_descr`).
             let f = fields.get(field_idx)?;
             let name = f
                 .name
@@ -9651,7 +9817,12 @@ impl<'a> Lowering<'a> {
                 &name_path,
                 self.tombstoned_leaves,
             ));
-            let owner_id = Some(concrete_adt_struct_id(template, head_adt, self.llbc));
+            let owner_id = Some(concrete_adt_struct_id(
+                template,
+                inst_adt,
+                self.llbc,
+                self.tombstoned_leaves,
+            ));
             return Some((owner_root, name, ty, owner_id, host_index));
         }
         match (&td.kind, variant_idx) {
@@ -9678,8 +9849,24 @@ impl<'a> Lowering<'a> {
                     decl_path_for_tombstone(&name_path, self.tombstoned_leaves),
                     variant.name
                 ));
-                let owner_id = Some(concrete_adt_struct_id(template, head_adt, self.llbc));
-                Some((variant_owner, name, ty, owner_id, host_index))
+                let owner_id =
+                    concrete_adt_struct_id(template, inst_adt, self.llbc, self.tombstoned_leaves);
+                let inst_args = inst_adt
+                    .map(|adt| render_adt_type_args(adt, self.llbc, 0, self.tombstoned_leaves))
+                    .unwrap_or_default();
+                ensure_enum_variant_instance_layout(
+                    self.llbc,
+                    td,
+                    vidx as usize,
+                    &inst_args,
+                    inst_adt,
+                    owner_id,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                    &self.struct_layouts,
+                );
+                Some((variant_owner, name, ty, Some(owner_id), host_index))
             }
             _ => None,
         }
@@ -10022,7 +10209,12 @@ impl<'a> Lowering<'a> {
             Some(suffix) => Some(majit_ir::descr::with_instantiation_suffix(
                 &name_path, &suffix,
             )),
-            None => match struct_instantiation_suffix(&name_path, adt, self.llbc) {
+            None => match struct_instantiation_suffix(
+                &name_path,
+                adt,
+                self.llbc,
+                self.tombstoned_leaves,
+            ) {
                 Some(suffix) => Some(majit_ir::descr::with_instantiation_suffix(
                     &name_path, &suffix,
                 )),
@@ -10034,20 +10226,26 @@ impl<'a> Lowering<'a> {
     /// Concrete physical-layout identity of an ADT type. Unlike
     /// [`Self::tyref_adt_class_root`], this always preserves generic arguments:
     /// annotator class splitting is selective, while Rust monomorphization is
-    /// not.
+    /// not. A `type T = Struct<…>` alias peels to that instance STRUCT.
     pub(in crate::front::mir) fn tyref_adt_layout_id(
         &self,
         ty: &TyRef,
     ) -> Option<majit_ir::descr::StructId> {
         let value = self.tyref_adt_body(ty)?;
-        let def_id = inline_adt_def_id(value)?;
+        let peeled = type_node_peel_aliases(value, self.llbc)?;
+        let def_id = inline_adt_def_id(peeled)?;
         let name_path = self.llbc.type_by_id(def_id)?.item_meta.name_path_str();
         let template = majit_ir::descr::StructId::from_canonical(&decl_path_for_tombstone(
             &name_path,
             self.tombstoned_leaves,
         ));
-        let adt = value.as_object()?.get("Adt")?.as_object();
-        Some(concrete_adt_struct_id(template, adt, self.llbc))
+        let adt = peeled.as_object()?.get("Adt")?.as_object();
+        Some(concrete_adt_struct_id(
+            template,
+            adt,
+            self.llbc,
+            self.tombstoned_leaves,
+        ))
     }
 
     /// `true` when `ty` resolves to a FIELDLESS enum whose discriminant
@@ -10109,8 +10307,8 @@ impl<'a> Lowering<'a> {
         'a: 't,
     {
         match ty {
-            TyRef::Inline { value: (_, v) } => Some(v),
-            TyRef::Other(v) => Some(v),
+            TyRef::Inline { value: (_, v) } => Some(v.as_ref()),
+            TyRef::Other(v) => Some(v.as_ref()),
             TyRef::Dedup { id } => self.llbc.dedup_body(*id),
         }
     }
@@ -10385,6 +10583,23 @@ impl<'a> Lowering<'a> {
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let dest_ty = self.mir_local_ty(dest_local);
+        let variant_ids = dest_ty
+            .as_ref()
+            .map(|ty| {
+                if crate::front::result_exc::tyref_is_option(ty, self.llbc) {
+                    [
+                        self.stamp_variant_vsid(ty, "None"),
+                        self.stamp_variant_vsid(ty, "Some"),
+                    ]
+                } else {
+                    [
+                        self.stamp_variant_vsid(ty, "Ok"),
+                        self.stamp_variant_vsid(ty, "Err"),
+                    ]
+                }
+            })
+            .unwrap_or([None, None]);
         self.tagged_pair_aggregate_sites
             .push(TaggedPairAggregateSite {
                 block: bb_id,
@@ -10395,6 +10610,7 @@ impl<'a> Lowering<'a> {
                 disc: disc.clone(),
                 payload: payload.clone(),
                 payload_ty: payload_ty.clone(),
+                variant_ids,
             });
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(res.clone()),
@@ -10414,9 +10630,20 @@ impl<'a> Lowering<'a> {
         // `Wtf8::as_str` validity decomposition.  `__discriminant` keys the
         // root (tag offset 0); `__pos_0` keys the success variant so its exact
         // offset and type match the read.
-        for (name, value, field_owner, ty) in [
-            ("__discriminant", disc, owner, ValueType::Int),
-            ("__pos_0", payload, payload_owner, payload_ty),
+        let success_vsid = if payload_owner.ends_with("::Some") {
+            variant_ids[1]
+        } else {
+            variant_ids[0]
+        };
+        for (name, value, field_owner, ty, owner_id) in [
+            (
+                "__discriminant",
+                disc,
+                owner,
+                ValueType::Int,
+                variant_ids[0].or(variant_ids[1]),
+            ),
+            ("__pos_0", payload, payload_owner, payload_ty, success_vsid),
         ] {
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
@@ -10425,7 +10652,8 @@ impl<'a> Lowering<'a> {
                     field: crate::model::FieldDescriptor {
                         name: name.to_string(),
                         owner_root: Some(field_owner.to_string()),
-                        owner_id: None,
+                        owner_id: owner_id
+                            .or_else(|| struct_id_from_enum_owner_spelling(field_owner)),
                         base_is_deref: None,
                         taken_by_address: false,
                         inline_vec: false,
@@ -10835,6 +11063,25 @@ pub(crate) fn value_type_bank(ty: &ValueType) -> u8 {
         // lower to integer arithmetic over the float's bit pattern.
         ValueType::SingleFloat => 8,
     }
+}
+
+/// GC pointer kinds that occupy the `'ref'` bank (`flatten.py getkind` of
+/// a `Ptr` whose `TO` is a GC struct). `Ref` is an `rclass` instance;
+/// `Str` is rstr `STR` (`UnicodeValueStorage` / `Utf8Str` / `Wtf8`);
+/// `StringBuilder` is `rstring.StringBuilder`. `lltype_is_gc` is true
+/// for all three, so `rewrite_op_cast_ptr_to_adr` raises.
+pub(crate) fn value_type_is_gc_ptr(ty: &ValueType) -> bool {
+    matches!(
+        ty,
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder
+    )
+}
+
+/// `p as i64` of a GC pointer (`rbuiltin.py gen_cast` Ptr→Signed):
+/// operand bank `'ref'`, result `Signed`. Keyed on [`ValueType`], never
+/// a callee or variable name.
+pub(in crate::front::mir) fn gc_ptr_to_signed(src: Option<&ValueType>, dst: &ValueType) -> bool {
+    src.is_some_and(value_type_is_gc_ptr) && matches!(dst, ValueType::Int)
 }
 
 /// Whether `transmute::<A, B>` is an ordinary copy in the lowered graph.
@@ -11313,6 +11560,39 @@ pub(in crate::front::mir) fn emit_cast_int_to_strptr(
         kind: crate::model::cast_instance_call_result(root, raw, ValueType::Str),
     });
     restored
+}
+
+/// `lltype.cast_pointer(PTRTYPE, ptr)` (`lltype.py` `cast_pointer` /
+/// `rbuiltin.py` `rtype_cast_pointer`). Same 2-arg shape as
+/// [`emit_dest_typed_cast_int_to_ptr`]: constant PTRTYPE then the Ref
+/// operand. `PTRTYPE.TO._gckind` is the source pointee's (`castable`).
+fn emit_dest_typed_cast_pointer(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    arg: Variable,
+    ptr_ty: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Variable {
+    use crate::flowspace::model::ConstValue;
+    let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+    result.set_concretetype(Some(ptr_ty.clone()));
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(result.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::function_path([
+                "rpython",
+                "rtyper",
+                "lltypesystem",
+                "lltype",
+                "cast_pointer",
+            ]),
+            args: vec![
+                crate::model::LinkArg::from(ConstValue::LowLevelType(Box::new(ptr_ty))),
+                crate::model::LinkArg::from(arg),
+            ],
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    result
 }
 
 /// `lltype.cast_int_to_ptr(PTRTYPE, int)` (`lltype.py` `ann_cast_int_to_ptr`).

@@ -8,8 +8,12 @@
 
 mod common;
 
-use common::{OBJECT_LLBC, load_llbc, lower_named_with_static_addrs};
+use common::{
+    OBJECT_LLBC, build_semantic_program_from_llbcs_with_static_addrs_and_function_names, load_llbc,
+    lower_named_with_static_addrs,
+};
 use majit_translate::HostStaticAddrs;
+use majit_translate::call::CallControl;
 use majit_translate::codewriter::jtransform::{GraphTransformConfig, Transformer};
 use majit_translate::model::{CallTarget, FunctionGraph, OpKind};
 
@@ -169,12 +173,39 @@ fn has_ptr_write(graph: &FunctionGraph) -> bool {
     })
 }
 
-fn transform_named(leaf: &str) -> (FunctionGraph, FunctionGraph) {
-    let llbc = load_llbc(OBJECT_LLBC);
-    let pytypes = [
+fn object_alloc_pytypes() -> [(&'static str, i64); 2] {
+    [
         ("pyobject::INSTANCE_TYPE", 0x1000_0000i64),
         ("pyobject::INSTANCE_USER_TYPE", 0x1000_1000i64),
-    ];
+    ]
+}
+
+/// `jtransform.py is_typeptr_getset` walks the STRUCT first-field chain
+/// (`heaptracker.is_typeptr_field`). Production threads harvested
+/// `struct_fields` through `CallControl`; the Transformer here does the
+/// same so a `New PyObject` typeptr store drops.
+fn object_alloc_callcontrol() -> CallControl {
+    let llbc = load_llbc(OBJECT_LLBC);
+    let pytypes = object_alloc_pytypes();
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        HostStaticAddrs {
+            pytypes: &pytypes,
+            ..Default::default()
+        },
+        &[],
+        &["alloc_exact_object_instance", "alloc_user_object_instance"],
+    )
+    .unwrap_or_else(|e| panic!("object alloc program: {e:?}"));
+    let mut cc = CallControl::new();
+    cc.set_struct_fields(program.struct_fields.clone());
+    cc.set_known_struct_names(program.known_struct_names.clone());
+    cc
+}
+
+fn transform_named(leaf: &str) -> (FunctionGraph, FunctionGraph) {
+    let llbc = load_llbc(OBJECT_LLBC);
+    let pytypes = object_alloc_pytypes();
     let graph = lower_named_with_static_addrs(
         llbc,
         leaf,
@@ -184,7 +215,10 @@ fn transform_named(leaf: &str) -> (FunctionGraph, FunctionGraph) {
         },
     )
     .unwrap_or_else(|e| panic!("lower {leaf}: {e:?}"));
-    let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+    let mut cc = object_alloc_callcontrol();
+    let transformed = Transformer::new(&GraphTransformConfig::default())
+        .with_callcontrol(&mut cc)
+        .transform(&graph);
     (graph, transformed.graph)
 }
 

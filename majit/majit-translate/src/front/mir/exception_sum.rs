@@ -1811,15 +1811,18 @@ fn fn_ptr_result(
     llbc: &Llbc,
     output: Value,
 ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
-    let ty = TyRef::Other(json!({
-        "FnPtr": {
-            "skip_binder": {
-                "inputs": [],
-                "output": output,
-                "is_unsafe": false
+    let ty = TyRef::Other(
+        json!({
+            "FnPtr": {
+                "skip_binder": {
+                    "inputs": [],
+                    "output": output,
+                    "is_unsafe": false
+                }
             }
-        }
-    }));
+        })
+        .into(),
+    );
     super::lltype::func_type_from_fn_ptr_ty(&ty, llbc, carrier_spec())
         .expect("fn pointer")
         .result

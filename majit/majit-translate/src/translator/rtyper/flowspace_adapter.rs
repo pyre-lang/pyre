@@ -3966,7 +3966,9 @@ pub fn translate_op(
             }
             if field.vec_part == Some(crate::model::VecFieldPart::FatLen) {
                 // A GC owner's slice FatLen is `len(getattr(owner, field))`
-                // (`ListRepr.rtype_len`).
+                // (`ListRepr.rtype_len`). Dyn FatLen already returned above
+                // as `getitem` of `two_word_fat_struct` (`rtuple.py`
+                // `rtype_getitem`).
                 let list = Hlvalue::Variable(Variable::new());
                 return Ok(vec![
                     FlowspaceOp::new(

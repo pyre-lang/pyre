@@ -73,8 +73,9 @@ const CONST_PREFIX_HINTS: &[(&str, &[&str])] = &[
     ("_gctransformer_hint_close_stack_", &["close_stack"]),
 ];
 
-/// Build a `{crate_stripped_fn_path → sorted-deduped hints}` map from
-/// the marker consts present in `llbcs`.
+/// Build a `{fn_path → sorted-deduped hints}` map from the marker consts
+/// present in `llbcs`. Impl methods are keyed `{owner}::{leaf}` because
+/// Charon's `name_path` renders every inherent impl as `<Impl>`.
 pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String, Vec<String>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
     for llbc in llbcs {
@@ -83,6 +84,9 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
             .iter_local_fns()
             .map(|fd| strip_crate_prefix(fd.item_meta.name_path_str()))
             .collect();
+        let marker_keys = |gd: &GlobalDecl, prefix: &str| {
+            harvest_marker_fn_keys(llbc, gd, prefix, &function_paths)
+        };
         for gd in llbc.iter_global_decls() {
             let path = gd.item_meta.name_path_str();
             // Charon emits a crate-less duplicate Ident for some
@@ -126,11 +130,9 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
                 } else {
                     "dont_look_inside"
                 };
-                push_hint(
-                    &mut out,
-                    marker_path_to_fn_path(&path, "_jit_look_inside_", &function_paths),
-                    hint,
-                );
+                for key in marker_keys(gd, "_jit_look_inside_") {
+                    push_hint(&mut out, key, hint);
+                }
                 continue;
             }
             // `#[jit_may_force]` body-local `const _MAJIT_MAY_FORCE` (no
@@ -170,11 +172,10 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
                 // declaration order).  A spec that referenced its parameters
                 // out of order or by expression would need the argnames map to
                 // resolve names→positions; emit it here when such a spec lands.
-                push_hint(
-                    &mut out,
-                    marker_path_to_fn_path(&path, "oopspec_", &function_paths),
-                    &format!("oopspec:{spec}"),
-                );
+                let spec_hint = format!("oopspec:{spec}");
+                for key in marker_keys(gd, "oopspec_") {
+                    push_hint(&mut out, key, &spec_hint);
+                }
                 continue;
             }
             // `#[jit_llop("opname")]` emits `_jit_llop_<NAME>: &'static str =
@@ -188,11 +189,10 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
                          initializer; this signals a marker encoding/decoder drift"
                     )
                 });
-                push_hint(
-                    &mut out,
-                    marker_path_to_fn_path(&path, "_jit_llop_", &function_paths),
-                    &format!("llop:{opname}"),
-                );
+                let llop_hint = format!("llop:{opname}");
+                for key in marker_keys(gd, "_jit_llop_") {
+                    push_hint(&mut out, key, &llop_hint);
+                }
                 continue;
             }
             // `#[call_aroundstate_target(funcptr = .., save_err = N)]` emits
@@ -211,14 +211,11 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
                          encoding change"
                         )
                     });
-                let fn_path =
-                    marker_path_to_fn_path(&path, "_call_aroundstate_target_", &function_paths);
-                push_hint(&mut out, fn_path.clone(), "aroundstate");
-                push_hint(
-                    &mut out,
-                    fn_path,
-                    &format!("aroundstate_target:{save_err}:{identity}"),
-                );
+                let around_hint = format!("aroundstate_target:{save_err}:{identity}");
+                for fn_path in marker_keys(gd, "_call_aroundstate_target_") {
+                    push_hint(&mut out, fn_path.clone(), "aroundstate");
+                    push_hint(&mut out, fn_path, &around_hint);
+                }
                 continue;
             }
             // rffi.py llexternal stores `random_effects_on_gcobjs` on the
@@ -279,11 +276,9 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
                          string initializer; this signals a marker encoding/decoder drift"
                     )
                 });
-                push_hint(
-                    &mut out,
-                    marker_path_to_fn_path(&path, "_annspecialcase_argtype_", &function_paths),
-                    &hint,
-                );
+                for key in marker_keys(gd, "_annspecialcase_argtype_") {
+                    push_hint(&mut out, key, &hint);
+                }
                 continue;
             }
             for (prefix, hints) in CONST_PREFIX_HINTS {
@@ -295,9 +290,10 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
                     // wrapper `f` carries no marker.  The body is harvested
                     // like any other elidable function, so its call sites
                     // stay residual `CALL_PURE`s.
-                    let key = marker_path_to_fn_path(&path, prefix, &function_paths);
-                    for hint in *hints {
-                        push_hint(&mut out, key.clone(), hint);
+                    for key in marker_keys(gd, prefix) {
+                        for hint in *hints {
+                            push_hint(&mut out, key.clone(), hint);
+                        }
                     }
                     break;
                 }
@@ -321,7 +317,9 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
                 && fd.signature.inputs.is_empty()
                 && crate::front::mir::output_type_is_objectptr(&fd.signature.output, llbc)
             {
-                push_hint(&mut out, path, "dont_look_inside");
+                for key in fun_decl_hint_keys(llbc, fd) {
+                    push_hint(&mut out, key, "dont_look_inside");
+                }
             }
         }
     }
@@ -1410,6 +1408,60 @@ fn should_skip_generated_elidable_helper(fn_name: &str) -> bool {
     fn_name.starts_with("_orig_") && fn_name.ends_with("_unlikely_name")
 }
 
+/// The `llop:<opname>` harvested for this callee (`ExtRegistryEntry._about_`).
+///
+/// Keys follow `fun_decl_hint_keys` and `CallControl.func_effects_with_crate_alias`:
+/// the joined path, then the crate-stripped spelling `harvest_hints_from_llbcs`
+/// stores. A specialized leaf uses `unspecialized_leaf` so a spec copy
+/// inherits the declaration's token.
+pub fn harvested_callee_llop<'a>(
+    target: &crate::model::CallTarget,
+    func_hints: &'a HashMap<String, Vec<String>>,
+) -> Option<&'a str> {
+    let crate::model::CallTarget::FunctionPath { segments, .. } = target else {
+        return None;
+    };
+    if segments.is_empty() {
+        return None;
+    }
+    let opname_of = |key: &str| -> Option<&'a str> {
+        func_hints.get(key).and_then(|hints| {
+            hints
+                .iter()
+                .find_map(|hint| hint.strip_prefix("llop:").filter(|op| !op.is_empty()))
+        })
+    };
+    let joined = segments.join("::");
+    if let Some(opname) = opname_of(&joined) {
+        return Some(opname);
+    }
+    let stripped = strip_crate_prefix(&joined);
+    if stripped != joined {
+        if let Some(opname) = opname_of(&stripped) {
+            return Some(opname);
+        }
+    }
+    let leaf = segments.last().map(String::as_str).unwrap_or("");
+    let unspecialized = crate::front::clause_spec::unspecialized_leaf(leaf);
+    if unspecialized == leaf {
+        return None;
+    }
+    let mut unspecialized_segs = segments.to_vec();
+    if let Some(last) = unspecialized_segs.last_mut() {
+        *last = unspecialized.to_string();
+    }
+    let joined = unspecialized_segs.join("::");
+    if let Some(opname) = opname_of(&joined) {
+        return Some(opname);
+    }
+    let stripped = strip_crate_prefix(&joined);
+    if stripped != joined {
+        opname_of(&stripped)
+    } else {
+        None
+    }
+}
+
 /// Union harvested JIT-hint tokens onto `graph.hints` and project the
 /// policy tokens onto `graph.func`.
 ///
@@ -1442,6 +1494,61 @@ pub fn merge_hints_into_graph(graph: &mut crate::model::FunctionGraph, hints: &[
 
 fn push_hint(out: &mut HashMap<String, Vec<String>>, key: String, hint: &str) {
     out.entry(key).or_default().push(hint.to_string());
+}
+
+/// Keys `look_inside_graph` / `SemanticFunctionHeader` use for one FunDecl.
+///
+/// `ItemMeta::name_path` renders every inherent impl as `<Impl>` and drops
+/// the owner type, so `pyframe::<Impl>::new` is one spelling for
+/// `FrameBox::new`, `FrameLocalsRoot::new`, and every other `new` in that
+/// module. RPython stores `_jit_look_inside_` on the function object
+/// (`rlib/jit.py`); the owner-qualified key is that identity.
+pub(crate) fn fun_decl_hint_keys(llbc: &Llbc, fd: &FunDecl) -> Vec<String> {
+    if let Some((owner, leaf)) = crate::front::mir::impl_method_owner_for_fundecl(llbc, fd) {
+        vec![format!("{owner}::{leaf}")]
+    } else {
+        vec![strip_crate_prefix(&fd.item_meta.name_path())]
+    }
+}
+
+/// Whether `fd` carries a harvested hint in `set`.
+///
+/// Membership is the owner-qualified key and, when that `name_path` is
+/// unique in its LLBC, the `name_path` itself.
+pub(crate) fn fun_decl_has_harvested_hint(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    set: &HashSet<String>,
+) -> bool {
+    if set.is_empty() {
+        return false;
+    }
+    if let Some((owner, leaf)) = crate::front::mir::impl_method_owner_for_fundecl(llbc, fd) {
+        if set.contains(&format!("{owner}::{leaf}")) {
+            return true;
+        }
+    }
+    set.contains(&strip_crate_prefix(&fd.item_meta.name_path()))
+}
+
+fn harvest_marker_fn_keys(
+    llbc: &Llbc,
+    gd: &GlobalDecl,
+    prefix: &str,
+    function_paths: &HashSet<String>,
+) -> Vec<String> {
+    if let Some(owner) = crate::front::mir::impl_owner_from_item_meta(llbc, &gd.item_meta) {
+        let path = gd.item_meta.name_path();
+        let const_leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+        if let Some(fn_leaf) = const_leaf.strip_prefix(prefix) {
+            return vec![format!("{owner}::{fn_leaf}")];
+        }
+    }
+    vec![marker_path_to_fn_path(
+        &gd.item_meta.name_path(),
+        prefix,
+        function_paths,
+    )]
 }
 
 fn marker_path_to_fn_path(
@@ -1520,7 +1627,7 @@ fn bool_assigned_to_return(llbc: &Llbc, init_id: u64) -> Option<bool> {
         }
         for stmt in &block.statements {
             let Ok(StmtKind::Assign(place, Rvalue::Use(Operand::Const(value), _))) =
-                stmt.stmt_kind()
+                stmt.stmt_kind_ref()
             else {
                 continue;
             };
@@ -1561,7 +1668,7 @@ fn global_marker_str_uncached(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
         }
         for stmt in &block.statements {
             let StmtKind::Assign(place, Rvalue::Use(Operand::Const(value), _)) =
-                stmt.stmt_kind().ok()?
+                stmt.stmt_kind_ref().ok()?
             else {
                 continue;
             };
@@ -1601,7 +1708,7 @@ fn visit_marker_init_rvalues(llbc: &Llbc, gd: &GlobalDecl, mut visit: impl FnMut
             continue;
         }
         for stmt in &block.statements {
-            let Ok(StmtKind::Assign(_, rvalue)) = stmt.stmt_kind() else {
+            let Ok(StmtKind::Assign(_, rvalue)) = stmt.stmt_kind_ref() else {
                 continue;
             };
             visit(&rvalue);
@@ -1885,6 +1992,38 @@ mod tests {
     }
 
     #[test]
+    fn colliding_impl_new_marker_stays_on_the_decorated_owner() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/llbc/pyre-interpreter.ullbc"
+        );
+        if !std::path::Path::new(path).is_file() {
+            return;
+        }
+        let llbc = majit_charon_reader::Llbc::load(path).expect("load pyre-interpreter.ullbc");
+        let harvested = super::harvest_hints_from_llbcs(std::slice::from_ref(&llbc));
+        let locals_root = harvested.get("pyframe::FrameLocalsRoot::new");
+        assert!(
+            locals_root.is_some_and(|hints| hints.iter().any(|h| h == "dont_look_inside")),
+            "FrameLocalsRoot::new is #[dont_look_inside]: {locals_root:?}"
+        );
+        let frame_box = harvested.get("pyframe::FrameBox::new");
+        assert!(
+            frame_box
+                .map(|hints| !hints.iter().any(|h| h == "dont_look_inside"))
+                .unwrap_or(true),
+            "FrameBox::new must not inherit dont_look_inside: {frame_box:?}"
+        );
+        let colliding = harvested.get("pyframe::<Impl>::new");
+        assert!(
+            colliding
+                .map(|hints| !hints.iter().any(|h| h == "dont_look_inside"))
+                .unwrap_or(true),
+            "non-injective <Impl>::new must not carry dont_look_inside: {colliding:?}"
+        );
+    }
+
+    #[test]
     fn module_less_elidable_marker_is_not_harvested_as_bare_leaf() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -2033,14 +2172,20 @@ mod tests {
         )
         .unwrap();
         let ty = serde_json::json!({"Deduplicated": 1});
-        let funcptr = super::Operand::Const(serde_json::json!([
-            {"FnDef": {"kind": {"Fun": 7}}},
-            ty
-        ]));
-        let save_err = super::Operand::Const(serde_json::json!([
-            {"Integer": {"Signed": ["I64", "5"]}},
-            ty
-        ]));
+        let funcptr = super::Operand::Const(
+            serde_json::json!([
+                {"FnDef": {"kind": {"Fun": 7}}},
+                ty
+            ])
+            .into(),
+        );
+        let save_err = super::Operand::Const(
+            serde_json::json!([
+                {"Integer": {"Signed": ["I64", "5"]}},
+                ty
+            ])
+            .into(),
+        );
         let (mut fn_id, mut save) = (None, None);
         super::collect_aroundstate_operand(&llbc, &funcptr, &mut fn_id, &mut save);
         super::collect_aroundstate_operand(&llbc, &save_err, &mut fn_id, &mut save);
@@ -2544,6 +2689,7 @@ mod tests {
             &raw,
             None,
             None,
+            Default::default(),
         );
         let program = state.finish(Vec::new());
         assert_eq!(program.exception_class_hints.len(), 1);
