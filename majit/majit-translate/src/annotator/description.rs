@@ -1103,8 +1103,8 @@ pub struct FunctionDesc {
     pub specializer: Option<Specializer>,
     /// RPython `self._cache` (description.py:203) — keyed by the
     /// specialization result. Holds only graphs a specializer requested
-    /// through [`Self::cachedgraph`]. The lifted LLBC body / signature
-    /// stub is the code object in [`Self::source_graph`], not a cache
+    /// through [`Self::cachedgraph`]. The lifted LLBC body / bodyless
+    /// external is the code object in [`Self::source_graph`], not a cache
     /// entry (`FunctionDesc.getgraphs` / `translator.buildflowgraph`).
     ///
     /// Upstream keys entries with arbitrary Python values
@@ -1124,9 +1124,11 @@ pub struct FunctionDesc {
     /// synthetic-function failure.
     pub(crate) lift_error: RefCell<Option<String>>,
     /// Code-object analogue of `translator.buildflowgraph`: a pending
-    /// `FnOnce` lift, or the memoized [`PyGraph`] that lift produced
-    /// (`FunctionDesc.buildgraph`). [`Self::source_template`] runs the
-    /// pending lift once; it never writes `_cache`.
+    /// `FnOnce` lift, the memoized [`PyGraph`] that lift produced
+    /// (`FunctionDesc.buildgraph`), or a bodyless external
+    /// (`register_external` / `SomeExternalFunction.call`) carrying its
+    /// declared `s_result`. [`Self::source_template`] runs the pending
+    /// lift once; it never writes `_cache`.
     pub(crate) source_graph: RefCell<Option<SourceGraph>>,
     /// Upstream `self.pyobj._signature_` (description.py:294, :315).
     /// Carried on FunctionDesc rather than HostObject because
@@ -1205,8 +1207,8 @@ impl FunctionDesc {
 
     /// `dont_look_inside` (`_jit_look_inside_ = False`) or elidable
     /// (`_elidable_function_`) on this desc's funcobj. Same predicate
-    /// `install_source_graph` uses when it installs the unique
-    /// signature stub as the source template.
+    /// `install_source_graph` uses when it installs a bodyless
+    /// external as the source template.
     pub(crate) fn residualizes_as_signature_stub(&self) -> bool {
         self.base
             .pyobj
@@ -1220,26 +1222,22 @@ impl FunctionDesc {
             })
     }
 
-    /// Declared result of a residual signature stub
-    /// (`FunctionDesc.pycall` `_signature_` / `register_external`
-    /// `s_result`). `Some(s)` only when this desc residualizes as a
-    /// signature stub and `annsignature` finishes to a result
-    /// annotation. `cachedgraph` mints a fresh stub from this value.
+    /// Declared result of a bodyless external (`register_external` /
+    /// `SomeExternalFunction.call`). `Some(s)` iff the source-graph
+    /// slot is [`SourceGraph::External`]. `cachedgraph` mints a fresh
+    /// stub from this value.
     pub(crate) fn residual_signature_result(&self) -> Option<SomeValue> {
-        if !self.residualizes_as_signature_stub() {
-            return None;
+        match &*self.source_graph.borrow() {
+            Some(SourceGraph::External { s_result, .. }) => Some(s_result.clone()),
+            _ => None,
         }
-        let annsig = self.annsignature.as_ref()?;
-        super::signature::finish_type(&annsig.result, &self.base.bookkeeper, &self.name)
-            .ok()
-            .flatten()
     }
 
     /// RPython `FunctionDesc.getgraphs()` (description.py).
     ///
     /// Upstream reads `_cache` alone: it holds exactly the graphs a
     /// specializer requested (`FunctionDesc.cachedgraph`). The lifted
-    /// body / signature stub is the code object in
+    /// body / bodyless external is the code object in
     /// [`Self::source_template`], not a cache entry.
     pub fn getgraphs(&self) -> Vec<Rc<PyGraph>> {
         self.cache.borrow().values().cloned().collect()
@@ -1258,28 +1256,47 @@ impl FunctionDesc {
         *self.source_graph.borrow_mut() = Some(SourceGraph::Built(pygraph));
     }
 
+    /// Install a bodyless external (`register_external` /
+    /// `SomeExternalFunction.call`) as the code-object slot. `s_result`
+    /// is the declared result, the same shell the stub's return variable
+    /// carries. Publishes `_signature_` through
+    /// `publish_residual_result_signature`; does not overwrite an
+    /// existing one. Does not write `_cache`.
+    pub(crate) fn install_external_stub(&mut self, stub: Rc<PyGraph>, s_result: SomeValue) {
+        *self.source_graph.borrow_mut() = Some(SourceGraph::External {
+            stub,
+            s_result: s_result.clone(),
+        });
+        crate::translator::rtyper::call_registry::publish_residual_result_signature(self, s_result);
+    }
+
     /// Peek at a built source template without running a pending lift.
     /// Used by identity lookups (`find_entry_with_cached_graph`) that
-    /// must not force `translator.buildflowgraph`.
+    /// must not force `translator.buildflowgraph`. A [`SourceGraph::External`]
+    /// stub is a built template.
     pub(crate) fn built_source_template(&self) -> Option<Rc<PyGraph>> {
         match &*self.source_graph.borrow() {
             Some(SourceGraph::Built(pygraph)) => Some(pygraph.clone()),
+            Some(SourceGraph::External { stub, .. }) => Some(stub.clone()),
             _ => None,
         }
     }
 
-    /// The lifted LLBC body or signature stub that plays the role of the
-    /// code object `translator.buildflowgraph` reads
+    /// The lifted LLBC body or bodyless external stub that plays the
+    /// role of the code object `translator.buildflowgraph` reads
     /// (`FunctionDesc.buildgraph`). Runs a pending lift once and
     /// memoizes the product in [`Self::source_graph`]; a lift failure
-    /// records `lift_error`. Never writes `_cache`.
+    /// records `lift_error`. Never writes `_cache`. A
+    /// [`SourceGraph::External`] stub is a built template.
     pub(crate) fn source_template(&self) -> Option<Rc<PyGraph>> {
+        match &*self.source_graph.borrow() {
+            Some(SourceGraph::Built(pygraph)) => return Some(pygraph.clone()),
+            Some(SourceGraph::External { stub, .. }) => return Some(stub.clone()),
+            Some(SourceGraph::Pending(_)) => {}
+            None => return None,
+        }
         let taken = self.source_graph.borrow_mut().take();
         match taken {
-            Some(SourceGraph::Built(pygraph)) => {
-                *self.source_graph.borrow_mut() = Some(SourceGraph::Built(pygraph.clone()));
-                Some(pygraph)
-            }
             Some(SourceGraph::Pending(build)) => match build() {
                 Ok(pygraph) => {
                     *self.source_graph.borrow_mut() = Some(SourceGraph::Built(pygraph.clone()));
@@ -1299,13 +1316,21 @@ impl FunctionDesc {
                     None
                 }
             },
-            None => None,
+            other => {
+                let result = match &other {
+                    Some(SourceGraph::Built(pygraph)) => Some(pygraph.clone()),
+                    Some(SourceGraph::External { stub, .. }) => Some(stub.clone()),
+                    _ => None,
+                };
+                *self.source_graph.borrow_mut() = other;
+                result
+            }
         }
     }
 
     /// Drop a pending lift whose graph nothing asked for. A built
-    /// template stays: it is the code object
-    /// (`translator.buildflowgraph`).
+    /// template or bodyless external stays: it is the code object
+    /// (`translator.buildflowgraph` / `register_external`).
     pub(crate) fn release_source_graph(&self) {
         let mut slot = self.source_graph.borrow_mut();
         if matches!(&*slot, Some(SourceGraph::Pending(_))) {
@@ -1512,16 +1537,18 @@ impl FunctionDesc {
             self.remember_in_translator_graphs(existing);
             return Ok(existing.clone());
         }
-        // The lifted LLBC body / signature stub is the code object
-        // (`FunctionDesc.buildgraph` / `translator.buildflowgraph`).
-        // Upstream `cachedgraph` re-runs `buildgraph` per key. There is
-        // no Python code object to re-flow, so a miss with `builder is
-        // None` copies that template (`copygraph` / mint from
-        // `FunctionDesc.pycall` `_signature_` / `register_external`
-        // `s_result`). `GraphCacheKey::None` is the first
-        // `buildflowgraph`: insert the template `Rc` itself so a
-        // signature stub keeps its result annotation. Any other key
-        // copies. None enters `_cache` only when None is requested.
+        // The lifted LLBC body / bodyless external stub is the code
+        // object (`FunctionDesc.buildgraph` / `translator.buildflowgraph`
+        // / `register_external`). Upstream `cachedgraph` re-runs
+        // `buildgraph` per key. There is no Python code object to
+        // re-flow, so a miss with `builder is None` copies that
+        // template (`copygraph`, or mint from
+        // `SomeExternalFunction.call` `s_result` when the slot is
+        // [`SourceGraph::External`]). `GraphCacheKey::None` is the
+        // first `buildflowgraph`: insert the template `Rc` itself so
+        // an external stub keeps its result annotation. Any other key
+        // copies or mints. None enters `_cache` only when None is
+        // requested.
         if builder.is_none()
             && let Some(template) = self.source_template()
         {
@@ -1574,11 +1601,17 @@ impl FunctionDesc {
 }
 
 /// Code-object analogue of `translator.buildflowgraph`
-/// ([`FunctionDesc::source_graph`]): a pending lift, or the memoized
-/// [`PyGraph`] that lift produced (`FunctionDesc.buildgraph`).
+/// ([`FunctionDesc::source_graph`]): a pending lift, the memoized
+/// [`PyGraph`] that lift produced (`FunctionDesc.buildgraph`), or a
+/// bodyless external (`register_external` /
+/// `SomeExternalFunction.call`) carrying its declared `s_result`.
 pub(crate) enum SourceGraph {
     Pending(Box<dyn FnOnce() -> Result<Rc<PyGraph>, String>>),
     Built(Rc<PyGraph>),
+    External {
+        stub: Rc<PyGraph>,
+        s_result: SomeValue,
+    },
 }
 
 impl SourceGraph {
@@ -1592,25 +1625,22 @@ impl std::fmt::Debug for SourceGraph {
         match self {
             Self::Pending(_) => f.write_str("SourceGraph::Pending(..)"),
             Self::Built(_) => f.write_str("SourceGraph::Built(..)"),
+            Self::External { .. } => f.write_str("SourceGraph::External { .. }"),
         }
     }
 }
 
 /// `dont_look_inside` (`_jit_look_inside_ = False`) or elidable
 /// (`_elidable_function_`). `install_source_graph` residualizes the
-/// unique graph into a signature stub on this predicate;
-/// `cachedgraph` mints a fresh stub per key from
-/// [`FunctionDesc::residual_signature_result`] (`FunctionDesc.pycall`
-/// `_signature_` / `register_external` `s_result`) instead of
-/// `copygraph`.
+/// unique graph into a bodyless external on this predicate.
 pub(crate) fn residualizes_as_signature_stub(dont_look_inside: bool, elidable: bool) -> bool {
     dont_look_inside || elidable
 }
 
-/// Per-key residual signature stub: mint from the desc's declared
-/// `_signature_` result (`FunctionDesc.pycall` `_signature_` /
-/// `register_external` `s_result`) instead of `copygraph`. Look-inside
-/// bodies still `copygraph`.
+/// Per-key residual of a bodyless external: mint from the desc's
+/// declared `s_result` (`register_external` /
+/// `SomeExternalFunction.call`) instead of `copygraph`. A lifted
+/// body still `copygraph`.
 pub(crate) fn copy_or_mint_unique_graph(
     template: &PyGraph,
     alt_name: &str,
@@ -3607,17 +3637,13 @@ mod tests {
             None,
             None,
         );
-        fd.annsignature = Some(Rc::new(AnnSignature {
-            params: vec![ParamType::Marker(TypeMarker::AnyType)],
-            result: ParamType::Annotation(Box::new(SomeValue::Integer(SomeInteger::default()))),
-        }));
         let startblock = Block::shared(vec![Hlvalue::Variable(Variable::named("x"))]);
         let func = GraphFunc::new("stub", Constant::new(ConstValue::Dict(Default::default())));
         let mut graph_inner = FunctionGraph::new("stub", startblock.clone());
         graph_inner.func = Some(func.clone());
         let return_var = Variable::named("__unsafe_stub_result");
-        *return_var.annotation.borrow_mut() =
-            Some(Rc::new(SomeValue::Integer(SomeInteger::default())));
+        let s_result = SomeValue::Integer(SomeInteger::default());
+        *return_var.annotation.borrow_mut() = Some(Rc::new(s_result.clone()));
         let link = Rc::new(RefCell::new(Link::new(
             vec![Hlvalue::Variable(return_var)],
             Some(graph_inner.returnblock.clone()),
@@ -3631,7 +3657,7 @@ mod tests {
             defaults: RefCell::new(Some(Vec::new())),
             access_directly: std::cell::Cell::new(false),
         });
-        fd.install_source_template(stub.clone());
+        fd.install_external_stub(stub.clone(), s_result);
 
         let none = fd
             .cachedgraph(GraphCacheKey::None, None, None)
@@ -3676,10 +3702,10 @@ mod tests {
     }
 
     /// `specialize_argtype` `cachedgraph` mints a fresh residual stub
-    /// from the desc's `_signature_` result (`FunctionDesc.pycall`
-    /// `_signature_` / `register_external` `s_result`). `copygraph`
-    /// copyvar would drop that annotation; the signature stub has no
-    /// body to re-flow, so the declared result stays.
+    /// from the desc's External `s_result` (`register_external` /
+    /// `SomeExternalFunction.call`). `copygraph` copyvar would drop
+    /// that annotation; a bodyless external has no body to re-flow, so
+    /// the declared result stays.
     #[test]
     fn cachedgraph_keeps_signature_stub_return_annotation_per_key() {
         use crate::flowspace::model::{
@@ -3699,10 +3725,6 @@ mod tests {
             None,
             None,
         );
-        fd.annsignature = Some(Rc::new(AnnSignature {
-            params: vec![ParamType::Marker(TypeMarker::AnyType)],
-            result: ParamType::Annotation(Box::new(SomeValue::Integer(SomeInteger::default()))),
-        }));
         let startblock = Block::shared(vec![Hlvalue::Variable(Variable::named("value"))]);
         let func = GraphFunc::new(
             "alloc_box",
@@ -3711,8 +3733,8 @@ mod tests {
         let mut graph_inner = FunctionGraph::new("alloc_box", startblock.clone());
         graph_inner.func = Some(func.clone());
         let return_var = Variable::named("__unsafe_stub_result");
-        *return_var.annotation.borrow_mut() =
-            Some(std::rc::Rc::new(SomeValue::Integer(SomeInteger::default())));
+        let s_result = SomeValue::Integer(SomeInteger::default());
+        *return_var.annotation.borrow_mut() = Some(std::rc::Rc::new(s_result.clone()));
         let link = std::rc::Rc::new(std::cell::RefCell::new(Link::new(
             vec![Hlvalue::Variable(return_var)],
             Some(graph_inner.returnblock.clone()),
@@ -3726,7 +3748,7 @@ mod tests {
             defaults: std::cell::RefCell::new(Some(Vec::new())),
             access_directly: std::cell::Cell::new(false),
         });
-        fd.install_source_template(stub.clone());
+        fd.install_external_stub(stub.clone(), s_result);
         {
             let g = stub.graph.borrow();
             if let Hlvalue::Variable(v) = &g.startblock.borrow().inputargs[0] {
@@ -3753,7 +3775,7 @@ mod tests {
         };
         assert!(
             matches!(link_ann.as_deref(), Some(SomeValue::Integer(_))),
-            "per-key stub keeps the published `_signature_` result, got {link_ann:?}"
+            "per-key stub keeps the External `s_result`, got {link_ann:?}"
         );
         let input_ann = {
             let g = cloned.graph.borrow();
@@ -3901,9 +3923,78 @@ mod tests {
         );
     }
 
-    /// The per-key stub's return annotation is the published
-    /// `_signature_` result, even when a startblock exit carries a
-    /// different annotation.
+    /// A lifted body with ops, `_signature_` set, and
+    /// `_jit_look_inside_ = False` still `copygraph`s: bodyless-ness is
+    /// the External slot (`register_external` /
+    /// `SomeExternalFunction.call`), not the JIT hint or `_signature_`.
+    #[test]
+    fn cachedgraph_lifted_body_with_signature_and_hint_keeps_operations() {
+        use crate::flowspace::model::{
+            Block, BlockRefExt, FunctionGraph, GraphFunc, Hlvalue, Link, SpaceOperation, Variable,
+        };
+
+        let mut host_func =
+            GraphFunc::new("body", Constant::new(ConstValue::Dict(Default::default())));
+        host_func._jit_look_inside_ = Some(false);
+        let mut fd = FunctionDesc::new(
+            bk(),
+            Some(HostObject::new_user_function(host_func)),
+            "body",
+            int_sig(&["x"]),
+            None,
+            None,
+        );
+        fd.annsignature = Some(Rc::new(AnnSignature {
+            params: vec![ParamType::Marker(TypeMarker::AnyType)],
+            result: ParamType::Annotation(Box::new(SomeValue::Integer(SomeInteger::default()))),
+        }));
+        let x = Variable::named("x");
+        let startblock = Block::shared(vec![Hlvalue::Variable(x.clone())]);
+        let func = GraphFunc::new("body", Constant::new(ConstValue::Dict(Default::default())));
+        let mut graph_inner = FunctionGraph::new("body", startblock.clone());
+        graph_inner.func = Some(func.clone());
+        let tmp = Variable::named("t");
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "int_add",
+            vec![Hlvalue::Variable(x.clone()), Hlvalue::Variable(x.clone())],
+            Hlvalue::Variable(tmp),
+        ));
+        let return_var = Variable::named("r");
+        *return_var.annotation.borrow_mut() =
+            Some(Rc::new(SomeValue::Integer(SomeInteger::default())));
+        let link = Rc::new(RefCell::new(Link::new(
+            vec![Hlvalue::Variable(return_var)],
+            Some(graph_inner.returnblock.clone()),
+            None,
+        )));
+        startblock.closeblock(vec![link]);
+        let body = Rc::new(PyGraph {
+            graph: Rc::new(RefCell::new(graph_inner)),
+            func,
+            signature: RefCell::new(int_sig(&["x"])),
+            defaults: RefCell::new(Some(Vec::new())),
+            access_directly: std::cell::Cell::new(false),
+        });
+        fd.install_source_template(body);
+        assert!(fd.residual_signature_result().is_none());
+
+        let copied = fd
+            .cachedgraph(
+                GraphCacheKey::Tuple(vec![GraphCacheKey::String("i32".into())]),
+                None,
+                None,
+            )
+            .expect("clone of lifted body");
+        let ops = copied.graph.borrow().startblock.borrow().operations.len();
+        assert!(
+            ops >= 1,
+            "later key must keep the lifted body's operations, got {ops}"
+        );
+    }
+
+    /// The per-key stub's return annotation is the External slot's
+    /// `s_result` (`register_external` / `SomeExternalFunction.call`),
+    /// even when a startblock exit carries a different annotation.
     #[test]
     fn cachedgraph_signature_stub_result_comes_from_annsignature() {
         use crate::flowspace::model::{
@@ -3921,10 +4012,6 @@ mod tests {
             None,
             None,
         );
-        fd.annsignature = Some(Rc::new(AnnSignature {
-            params: vec![ParamType::Marker(TypeMarker::AnyType)],
-            result: ParamType::Annotation(Box::new(SomeValue::Integer(SomeInteger::default()))),
-        }));
         let startblock = Block::shared(vec![Hlvalue::Variable(Variable::named("x"))]);
         let func = GraphFunc::new("stub", Constant::new(ConstValue::Dict(Default::default())));
         let mut graph_inner = FunctionGraph::new("stub", startblock.clone());
@@ -3946,7 +4033,7 @@ mod tests {
             defaults: RefCell::new(Some(Vec::new())),
             access_directly: std::cell::Cell::new(false),
         });
-        fd.install_source_template(stub);
+        fd.install_external_stub(stub, SomeValue::Integer(SomeInteger::default()));
 
         let minted = fd
             .cachedgraph(
@@ -3966,7 +4053,7 @@ mod tests {
         };
         assert!(
             matches!(link_ann.as_deref(), Some(SomeValue::Integer(_))),
-            "per-key stub result is the published SomeInteger, got {link_ann:?}"
+            "per-key stub result is the External SomeInteger, got {link_ann:?}"
         );
     }
 
@@ -3989,18 +4076,14 @@ mod tests {
             None,
             None,
         );
-        fd.annsignature = Some(Rc::new(AnnSignature {
-            params: vec![ParamType::Marker(TypeMarker::AnyType)],
-            result: ParamType::Annotation(Box::new(SomeValue::Integer(SomeInteger::default()))),
-        }));
         let startblock = Block::shared(vec![Hlvalue::Variable(Variable::named("x"))]);
         let func = GraphFunc::new("stub", Constant::new(ConstValue::Dict(Default::default())));
         let template_func_id = func.id;
         let mut graph_inner = FunctionGraph::new("stub", startblock.clone());
         graph_inner.func = Some(func.clone());
         let return_var = Variable::named("__unsafe_stub_result");
-        *return_var.annotation.borrow_mut() =
-            Some(Rc::new(SomeValue::Integer(SomeInteger::default())));
+        let s_result = SomeValue::Integer(SomeInteger::default());
+        *return_var.annotation.borrow_mut() = Some(Rc::new(s_result.clone()));
         let link = Rc::new(RefCell::new(Link::new(
             vec![Hlvalue::Variable(return_var)],
             Some(graph_inner.returnblock.clone()),
@@ -4014,7 +4097,7 @@ mod tests {
             defaults: RefCell::new(Some(vec![Constant::new(ConstValue::Int(7))])),
             access_directly: std::cell::Cell::new(true),
         });
-        fd.install_source_template(stub);
+        fd.install_external_stub(stub, s_result);
 
         let minted = fd
             .cachedgraph(
@@ -4306,8 +4389,10 @@ mod tests {
             ),
             "Bookkeeper.newfuncdesc must install specialize:argtype"
         );
-        fd.borrow()
-            .install_source_template(dont_look_inside_stub("alloc", signature));
+        fd.borrow_mut().install_external_stub(
+            dont_look_inside_stub("alloc", signature),
+            SomeValue::Impossible,
+        );
 
         let inst = SomeValue::Instance(SomeInstance::new(
             Some(ClassDef::new_standalone("rordereddict::RDict", None)),

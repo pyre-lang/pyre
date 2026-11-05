@@ -2409,10 +2409,11 @@ fn install_source_graph(
     if entry.function_desc.borrow().is_memo() {
         return;
     }
-    let residualize = crate::annotator::description::residualizes_as_signature_stub(
-        graph.func.jit_look_inside == Some(false),
-        graph.func.elidable,
-    ) || annotator_residual_raw_method(key);
+    let residualize = entry
+        .function_desc
+        .borrow()
+        .residualizes_as_signature_stub()
+        || annotator_residual_raw_method(key);
     if residualize {
         // The materialisers' raw `*mut PyObject` return is only their
         // residual-call ABI.  Their FunctionDesc carries the orthodox
@@ -2459,8 +2460,7 @@ fn install_source_graph(
                 signature.clone(),
                 result_shell.clone(),
             );
-            entry.install_source_template(stub);
-            entry.publish_residual_result_signature(result_shell);
+            entry.install_external_stub(stub, result_shell);
             return;
         }
     }
@@ -3171,9 +3171,8 @@ pub(crate) fn build_stub_pygraph_for_somevalue(
 
 /// Annotator-only stub whose return Variable carries `return_someval`,
 /// keeping `template.func`, `template.defaults` and
-/// `template.access_directly`. Per-key mint of a residual signature
-/// stub (`FunctionDesc.pycall` `_signature_` / `register_external`
-/// `s_result`).
+/// `template.access_directly`. Per-key mint of a bodyless external
+/// (`register_external` / `SomeExternalFunction.call` `s_result`).
 pub(crate) fn build_stub_pygraph_for_somevalue_from_template(
     name: String,
     signature: Signature,
@@ -3710,7 +3709,7 @@ fn declared_funcptr_type_from_legacy(
 /// `(segments, signature, FUNC.RESULT token)` specs into `registry`.
 /// Each entry is wrapped through [`residual_return_shell`] +
 /// [`build_stub_pygraph_with_result_shell`]
-/// + [`CallRegistry::register_callee`], so subsequent
+/// + [`FunctionEntry::install_external_stub`], so subsequent
 ///   `flowspace_adapter::translate_op` lookups via
 ///   `call_registry.lookup_with_leaf_match` find a registered entry and
 ///   the dual gate no longer Skips with "not registered in
@@ -3724,21 +3723,22 @@ fn declared_funcptr_type_from_legacy(
 /// upstream "not registered" Skip path then absorbs that specific fn
 /// while the rest of the batch lands.
 ///
-/// Mirrors `populate_call_registry_from_call_graphs`'s "register and
-/// install source template" contract but feeds from declarations rather
-/// than from the `function_graphs` `GraphStore`.  The two key
+/// Mirrors `populate_call_registry_from_call_graphs`'s register
+/// contract but installs a bodyless external (`register_external` /
+/// `SomeExternalFunction.call`) from declarations rather than a lifted
+/// body from the `function_graphs` `GraphStore`.  The two key
 /// differently, so both can hold the same fn; `CallControl::unsafe_fn_stubs`
 /// carries the measured split.
 ///
 /// **Annotator-only carrier — never reaches the codewriter.**
 /// The stub graph carries a single return link holding a pre-annotated
 /// Variable, suitable for `RPythonAnnotator` return-type inference via
-/// `FunctionDesc.cachedgraph` (see `install_source_template`).  It
+/// `FunctionDesc.cachedgraph` (see `install_external_stub`).  It
 /// cannot become a compile candidate because it never lands in the
 /// container the codewriter reads: `build_stub_pygraph_with_result_shell`
 /// builds a `flowspace::model::FunctionGraph`, which
-/// `FunctionEntry::install_source_template` parks in the entry's
-/// source-template slot, while `CallControl::find_all_graphs` and
+/// `FunctionEntry::install_external_stub` parks in the entry's
+/// External slot, while `CallControl::find_all_graphs` and
 /// `CallControl::target_to_path_and_graph` resolve candidates out of
 /// `function_graphs` and hand `CodeWriter::transform_graph_to_jitcode` a
 /// `crate::model::FunctionGraph`.  Nothing on this path can put a stub
@@ -3829,8 +3829,7 @@ pub(crate) fn register_unsafe_fn_stubs(
         // (`dont_look_inside` sets `_jit_look_inside_ = False`).
         graph_func._jit_look_inside_ = Some(false);
         let entry = registry.get_or_register_with_func(key, signature.clone(), graph_func);
-        entry.install_source_template(stub_pygraph);
-        entry.publish_residual_result_signature(result_shell);
+        entry.install_external_stub(stub_pygraph, result_shell);
     }
 }
 
@@ -4224,18 +4223,21 @@ fn register_opaque_external(
         None,
         None,
     );
-    let Some(stub_pygraph) = build_stub_pygraph_for_lltype(
-        segments.last().copied().unwrap_or_default().to_string(),
-        signature.clone(),
-        return_lltype,
-    ) else {
+    let Some(s_result) = default_someshell_for_lltype(&return_lltype) else {
         return;
     };
+    let stub_pygraph = build_stub_pygraph_with_result_shell(
+        segments.last().copied().unwrap_or_default().to_string(),
+        signature.clone(),
+        s_result.clone(),
+    );
     let key = FunctionPathKey::from_segments(segments.iter().map(|s| s.to_string()));
     if alias_existing_lookup(registry, &key) {
         return;
     }
-    registry.register_callee(key, signature, stub_pygraph);
+    registry
+        .get_or_register(key, signature)
+        .install_external_stub(stub_pygraph, s_result);
 }
 
 /// Register a bodyless foreign external with `specialize:argtype(i)`.
@@ -4244,7 +4246,7 @@ fn register_opaque_external(
 /// (`policy.py` `get_specializer`). The source template stays empty:
 /// installing a unique shell would give every instantiation the same
 /// graph (`call_registry.rs` `register_callee` /
-/// `install_source_template`).
+/// `install_external_stub`).
 fn register_opaque_external_argtype(
     registry: &CallRegistry,
     segments: &[&str],
@@ -4271,11 +4273,13 @@ fn register_opaque_external_argtype(
 /// Register a bodyless foreign external with `specialize:argtype(i)`
 /// whose result lltype does not depend on the keyed argument.
 ///
-/// Builds the stub with [`build_stub_pygraph_for_lltype`] and installs it
-/// as the funcdesc's source template, which `specialize_argtype` →
-/// `cachedgraph(key, None, None)` copies per knowntype (`description.py`
-/// `cachedgraph`). [`register_opaque_external_argtype`] installs no
-/// template because the result is the keyed argument's type
+/// Builds the stub with [`build_stub_pygraph_with_result_shell`] and
+/// installs it as a bodyless external (`register_external` /
+/// `SomeExternalFunction.call`) so `specialize_argtype` →
+/// `cachedgraph(key, None, None)` mints that declared result per
+/// knowntype (`description.py` `cachedgraph`).
+/// [`register_opaque_external_argtype`] leaves the slot empty because
+/// the result is the keyed argument's type
 /// (`specialize_argtype_stub_result`).
 fn register_opaque_external_argtype_with_result(
     registry: &CallRegistry,
@@ -4289,13 +4293,14 @@ fn register_opaque_external_argtype_with_result(
         None,
         None,
     );
-    let Some(mut stub_pygraph) = build_stub_pygraph_for_lltype(
-        segments.last().copied().unwrap_or_default().to_string(),
-        signature.clone(),
-        return_lltype,
-    ) else {
+    let Some(s_result) = default_someshell_for_lltype(&return_lltype) else {
         return;
     };
+    let mut stub_pygraph = build_stub_pygraph_with_result_shell(
+        segments.last().copied().unwrap_or_default().to_string(),
+        signature.clone(),
+        s_result.clone(),
+    );
     let key = FunctionPathKey::from_segments(segments.iter().map(|s| s.to_string()));
     if alias_existing_lookup(registry, &key) {
         return;
@@ -4317,7 +4322,7 @@ fn register_opaque_external_argtype_with_result(
     graph_func.annspecialcase = Some(tag);
     registry
         .get_or_register_with_func(key, signature, graph_func)
-        .install_source_template(stub_pygraph);
+        .install_external_stub(stub_pygraph, s_result);
 }
 
 /// Declare the opaque MIR deref-write marker to the annotator.
@@ -4506,9 +4511,11 @@ pub(crate) fn register_foreign_opaque_method_externals(
         let stub_pygraph = build_stub_pygraph_with_result_shell(
             segments.last().cloned().unwrap_or_default(),
             signature.clone(),
-            return_someval,
+            return_someval.clone(),
         );
-        registry.register_callee(key, signature.clone(), stub_pygraph);
+        registry
+            .get_or_register(key, signature.clone())
+            .install_external_stub(stub_pygraph, return_someval);
     }
 }
 
@@ -15915,6 +15922,59 @@ mod tests {
         assert!(
             matches!(link_ann.as_deref(), Some(SomeValue::Bool(_))),
             "later key keeps the published result, got {link_ann:?}"
+        );
+    }
+
+    /// Codex #240 second review §1: an AccessDirect key of a desc
+    /// installed by `register_opaque_external` keeps the declared
+    /// result (`register_external` / `SomeExternalFunction.call`).
+    #[test]
+    fn register_opaque_external_access_direct_keeps_result_annotation() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::description::GraphCacheKey;
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+
+        let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        register_opaque_external(
+            &registry,
+            &["pyobject", "is_none"],
+            &["obj"],
+            LowLevelType::Bool,
+        );
+        let entry = registry
+            .lookup(&FunctionPathKey::from_segments([
+                "pyobject".to_string(),
+                "is_none".to_string(),
+            ]))
+            .expect("opaque external registered");
+        assert!(
+            entry
+                .function_desc
+                .borrow()
+                .residual_signature_result()
+                .is_some(),
+            "bodyless external occupies the External slot"
+        );
+        let cloned = entry
+            .function_desc
+            .borrow()
+            .cachedgraph(GraphCacheKey::access_direct_none(), None, None)
+            .expect("AccessDirect key of an opaque external");
+        let link_ann = {
+            let g = cloned.graph.borrow();
+            let start = g.startblock.borrow();
+            let link = start.exits[0].borrow();
+            match &link.args[0] {
+                Some(crate::flowspace::model::Hlvalue::Variable(v)) => {
+                    v.annotation.borrow().clone()
+                }
+                _ => None,
+            }
+        };
+        assert!(
+            matches!(link_ann.as_deref(), Some(SomeValue::Bool(_))),
+            "AccessDirect key keeps the declared result, got {link_ann:?}"
         );
     }
 

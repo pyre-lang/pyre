@@ -423,11 +423,16 @@ pub fn specialize_argtype(
     maybe_star_args(funcdesc, GraphCacheKey::Tuple(key_parts), args_s)
 }
 
-/// Bodyless foreign stub: no source template (pending lift or built
-/// graph) and no `HostCode`. `FunctionDesc.cachedgraph` with
-/// `builder is None` copies `source_template()` (`translator.buildflowgraph`
-/// analogue); a bodyless `specialize:argtype` external must take the
-/// builder stub path. An empty `_cache` is not the test — the second
+/// Bodyless `specialize:argtype` external: no source-graph slot
+/// (Pending lift, Built body, or External stub) and no `HostCode`.
+/// `FunctionDesc.cachedgraph` with `builder is None` copies
+/// `source_template()` (`translator.buildflowgraph` analogue). A
+/// `specialize:argtype` external whose result is the keyed argument
+/// (`register_opaque_external_argtype`) has no template and takes the
+/// builder stub path. An External slot is a declared-result stub
+/// (`register_external` / `SomeExternalFunction.call`), so
+/// `specialize_argtype` mints from that `s_result`. An empty `_cache`
+/// is not the test — the second
 /// knowntype must still take this path after the first graph is cached.
 pub(crate) fn is_bodyless_argtype_stub(funcdesc: &FunctionDesc) -> bool {
     if funcdesc.source_graph.borrow().is_some() {
@@ -669,13 +674,23 @@ fn py_number(value: &ConstValue) -> Option<PyNumber> {
                 Some(PyNumber::UInt(*v))
             }
         }
-        ConstValue::RInt(c, v, _) => match crate::rlib::rarithmetic::rint_value(*c, *v) {
+        ConstValue::RInt(c, v, _) => match crate::rlib::rarithmetic::rint_value(*c, v) {
             crate::rlib::rarithmetic::RIntValue::Signed(x) => Some(PyNumber::Int(x)),
             crate::rlib::rarithmetic::RIntValue::Unsigned(x) => {
                 if x <= i128::MAX as u128 {
                     Some(PyNumber::Int(x as i128))
                 } else {
                     Some(PyNumber::UInt(x))
+                }
+            }
+            crate::rlib::rarithmetic::RIntValue::SignedBig(x) => {
+                i128::try_from(&x).ok().map(PyNumber::Int)
+            }
+            crate::rlib::rarithmetic::RIntValue::UnsignedBig(x) => {
+                if let Ok(n) = i128::try_from(&x) {
+                    Some(PyNumber::Int(n))
+                } else {
+                    u128::try_from(&x).ok().map(PyNumber::UInt)
                 }
             }
         },

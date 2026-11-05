@@ -355,13 +355,6 @@ impl FunctionEntry {
         );
     }
 
-    /// Publish a residual stub's declared result as this entry's
-    /// `_signature_` (`FunctionDesc.pycall` `_signature_` /
-    /// `register_external` `s_result`).
-    pub(crate) fn publish_residual_result_signature(&self, s_result: SomeValue) {
-        publish_residual_result_signature(&mut self.function_desc.borrow_mut(), s_result);
-    }
-
     /// Install `pygraph` as this entry's source template (the code
     /// object `FunctionDesc.buildgraph` / `translator.buildflowgraph`
     /// reads). Does not write `_cache`; None enters `_cache` only when
@@ -373,6 +366,18 @@ impl FunctionEntry {
     /// `cutover::lift_callee_to_pygraph`.
     pub fn install_source_template(&self, pygraph: Rc<PyGraph>) {
         self.function_desc.borrow().install_source_template(pygraph);
+    }
+
+    /// Install a bodyless external (`register_external` /
+    /// `SomeExternalFunction.call`) as this entry's source template.
+    pub(crate) fn install_external_stub(
+        &self,
+        stub: Rc<PyGraph>,
+        s_result: crate::annotator::model::SomeValue,
+    ) {
+        self.function_desc
+            .borrow_mut()
+            .install_external_stub(stub, s_result);
     }
 
     /// Record a per-entry lift failure so consumers surfacing through
@@ -1101,18 +1106,18 @@ impl CallRegistry {
             .with_new_name(key.name());
         let entry = self.get_or_register_with_func(key.clone(), signature.clone(), graph_func);
         if let Some(pygraph) = pygraph {
-            // `copyvar` drops annotation. A residual template stub has
-            // no body to re-flow, so mint a fresh stub from the
-            // template desc's `_signature_` result
-            // (`FunctionDesc.pycall` `_signature_` /
-            // `register_external` `s_result`) into the inst desc's
-            // source-template slot.
-            entry.install_source_template(copy_or_mint_unique_graph(
-                &pygraph,
-                key.name(),
-                signature,
-                residual_result,
-            ));
+            // `copyvar` drops annotation. A bodyless external has no
+            // body to re-flow (`register_external` /
+            // `SomeExternalFunction.call`), so mint a fresh stub from
+            // the template desc's `s_result` into the inst desc's
+            // External slot.
+            let minted =
+                copy_or_mint_unique_graph(&pygraph, key.name(), signature, residual_result.clone());
+            if let Some(s_result) = residual_result {
+                entry.install_external_stub(minted, s_result);
+            } else {
+                entry.install_source_template(minted);
+            }
         }
         *entry.declared_funcptr_type.borrow_mut() = declared;
         entry.function_desc.borrow_mut().annsignature = annsignature;
@@ -1974,10 +1979,13 @@ mod tests {
                 sig.clone(),
                 func,
             );
-            template.install_source_template(stub_pygraph_with_formals(
-                "pyre_object::gc_storage::gc_alloc_young_storage_box",
-                sig.clone(),
-            ));
+            template.install_external_stub(
+                stub_pygraph_with_formals(
+                    "pyre_object::gc_storage::gc_alloc_young_storage_box",
+                    sig.clone(),
+                ),
+                SomeValue::Impossible,
+            );
 
             let inst_entry = registry
                 .lookup(&FunctionPathKey::from_segments([
@@ -2106,10 +2114,13 @@ mod tests {
                 sig.clone(),
                 func,
             );
-            template.install_source_template(stub_pygraph_with_formals(
-                "pyre_object::gc_storage::gc_alloc_young_storage_box",
-                sig.clone(),
-            ));
+            template.install_external_stub(
+                stub_pygraph_with_formals(
+                    "pyre_object::gc_storage::gc_alloc_young_storage_box",
+                    sig.clone(),
+                ),
+                SomeValue::Impossible,
+            );
 
             let inst_key = FunctionPathKey::from_segments([
                 "gc_storage",
