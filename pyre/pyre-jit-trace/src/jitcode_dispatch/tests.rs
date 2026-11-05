@@ -3107,10 +3107,9 @@ impl majit_backend::Backend for CallTraceFieldLoadCpu {
 }
 
 /// Unarmed `executioncontext.py call_trace` at an inlined callee entry
-/// (`pyframe.py execute_frame` after `enter`): walk the generated jitcode
-/// to `Ok`, record `GUARD_VALUE` of NULL `w_tracefunc` (`gettrace` /
-/// `jit.promote`) plus the `profilefunc is not None` null check, and emit
-/// no residual call.
+/// (`pyframe.py execute_frame` after `enter`): record `GUARD_VALUE` of
+/// NULL `w_tracefunc` (`gettrace` / `jit.promote`) plus the
+/// `profilefunc is not None` null check, and emit no residual call.
 #[test]
 fn unarmed_inlined_callee_entry_walks_call_trace() {
     use crate::state::PyreSym;
@@ -3138,7 +3137,7 @@ fn unarmed_inlined_callee_entry_walks_call_trace() {
     );
     unsafe {
         assert!(
-            (*ec).w_tracefunc.is_null(),
+            (*ec).w_tracefunc().is_null(),
             "fixture EC must be unarmed (w_tracefunc)"
         );
         assert!(
@@ -9768,7 +9767,7 @@ fn walker_call_trace_hook_reads_guards_null_hooks() {
         {
             saw_tracefunc_getfield = true;
         }
-        if saw_tracefunc_getfield && op.opcode == majit_ir::OpCode::GuardIsnull {
+        if saw_tracefunc_getfield && op.opcode == majit_ir::OpCode::GuardValue {
             saw_tracefunc_isnull = true;
         }
         if op.opcode == majit_ir::OpCode::GetfieldGcI
@@ -9784,7 +9783,7 @@ fn walker_call_trace_hook_reads_guards_null_hooks() {
     }
     assert!(
         saw_tracefunc_getfield && saw_tracefunc_isnull,
-        "gettrace() promote(None) is GetfieldGcR + GuardIsnull"
+        "gettrace() promote(None) is GetfieldGcR + GuardValue"
     );
     assert!(
         saw_profilefunc_getfield && saw_profilefunc_false,

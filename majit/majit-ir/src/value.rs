@@ -1840,13 +1840,12 @@ pub fn pypyjit_greenkey_uhash(pc: usize, is_being_profiled: bool, code_ptr: u64)
 /// `threshold`. A profiled frame still reaches a trace: the eligibility
 /// gate reads the per-frame `f_trace`, not `is_being_profiled`.
 ///
-/// Tracing has no green of its own. An inlined callee walks generated
-/// `executioncontext.py call_trace` at entry
-/// (`walker_inline_execute_frame_call_trace`), so `gettrace`'s
-/// `jit.promote(self.w_tracefunc)` is in the compiled loop and a tracer
-/// armed later fails that guard. `return_trace` stays on residual
-/// `execute_frame`; the inline door declines while a hook is installed.
-/// Mid-loop tracing of the portal frame itself is the `debugdata` guard
+/// Tracing has no green of its own. An inlined callee records
+/// `gettrace`'s `jit.promote(self.w_tracefunc)` at entry
+/// (`walker_inline_execute_frame_call_trace`), so a tracer armed later
+/// fails that guard. `return_trace` stays on residual `execute_frame`;
+/// the inline door declines while a hook is installed. Mid-loop tracing
+/// of the portal frame itself is the `debugdata` guard
 /// `pyopcode.py dispatch_bytecode`'s `jit.we_are_jitted()` arm records.
 pub fn pypyjit_greenkey(pc: usize, is_being_profiled: bool, code_ptr: u64) -> GreenKey {
     GreenKey::with_types(

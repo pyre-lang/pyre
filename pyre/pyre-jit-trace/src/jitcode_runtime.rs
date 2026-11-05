@@ -897,8 +897,9 @@ fn compute_unique_regular_leaf_jitcode_index(leaf: &str) -> Option<usize> {
     first
 }
 
-/// Regular `executioncontext.py call_trace`, walked at an inlined callee
-/// entry (`pyframe.py execute_frame` after `enter`).
+/// Regular `executioncontext.py call_trace` (`pyframe.py execute_frame`
+/// after `enter`). The inline walker records `gettrace`'s promote on the
+/// callee EC in the parent walk; this index is the graph-key identity.
 pub fn call_trace_jitcode_index() -> Option<usize> {
     *CALL_TRACE_JITCODE_INDEX.get_or_init(|| {
         compute_unique_regular_leaf_jitcode_index("call_trace")

@@ -6805,58 +6805,22 @@ fn walker_ec_enter(
 
 /// `pyframe.py execute_frame`: after `enter`, `executioncontext.call_trace(self)`.
 ///
-/// The inline door still declines when `ec_hook_installed()`. An unarmed
-/// trace that inlined a callee still has to see a hook armed later: walking
-/// the generated `call_trace` jitcode records `gettrace()`'s
-/// `jit.promote(self.w_tracefunc)`.
-///
-/// Compact tests that omit the helper (null `snapshot_sym`, missing jitcode)
-/// skip silently; production tables must contain the Regular `call_trace`
-/// graph (`call_trace_jitcode_index`). A walk `Err` propagates; the
-/// `null_fn` residual that used to force a cut is a constant 0
-/// (`jtransform.py` `lltype.nullptr(FUNC)`).
+/// Records `gettrace()`'s `jit.promote(self.w_tracefunc)` and the
+/// `profilefunc is not None` test on `callee_ec` in this walk, the same
+/// reads `call_trace` leaves in `execute_frame`. Compact tests that omit
+/// `snapshot_sym` skip. A walk `Err` still `leave()`s.
 pub(crate) fn walker_inline_execute_frame_call_trace<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     callee_ec: OpRef,
-    callee_frame: OpRef,
+    _callee_frame: OpRef,
     concrete_ec: *mut pyre_interpreter::PyExecutionContext,
-    concrete_frame: *mut pyre_interpreter::PyFrame,
+    _concrete_frame: *mut pyre_interpreter::PyFrame,
 ) -> Result<(), DispatchError> {
-    if ctx.fbw_mode.snapshot_sym.is_null() {
+    if ctx.fbw_mode.snapshot_sym.is_null() || concrete_ec.is_null() {
         return Ok(());
     }
-    let Some(jitcode_index) = crate::jitcode_runtime::call_trace_jitcode_index() else {
-        return Ok(());
-    };
-    let Some(sub_body) = crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode_index) else {
-        return Ok(());
-    };
-    if crate::state::ensure_build_time_jitcode_at(jitcode_index).is_none() {
-        return Ok(());
-    }
-    let r_args = [callee_ec, callee_frame];
-    if r_args.len() > sub_body.num_regs_r {
-        return Ok(());
-    }
-    let r_concretes = [
-        ConcreteValue::Ref(concrete_ec as pyre_object::PyObjectRef),
-        ConcreteValue::Ref(concrete_frame as pyre_object::PyObjectRef),
-    ];
-    let saved_th_index = ctx.fbw_mode.transparent_helper_jitcode_index;
-    ctx.fbw_mode.transparent_helper_jitcode_index = Some(jitcode_index);
-    let walk = super::specialize::run_codewriter_helper_inline_call(
-        ctx,
-        op_pc,
-        &sub_body,
-        &[],
-        &[],
-        &r_args,
-        &r_concretes,
-        &[],
-    );
-    ctx.fbw_mode.transparent_helper_jitcode_index = saved_th_index;
-    walk.map(|_| ())
+    super::walker_record_unarmed_call_trace(ctx, op_pc, callee_ec)
 }
 
 /// The box this walk holds for the frame at `frame_ptr`: the virtual of a
@@ -6903,7 +6867,7 @@ fn caller_frame_box_for(ctx: &TraceCtx, frame_ptr: usize) -> Option<OpRef> {
 /// from `pyframe.py execute_frame` rather than from `enter` / `leave`.
 /// Whatever inlines the callee inlines those `ec.gettrace()` reads with it, so
 /// upstream's trace carries a guard on them and a tracer installed later cannot
-/// be missed.  This walker inlines `call_trace` at the callee entry
+/// be missed.  This walker records `gettrace`'s promote at the callee entry
 /// (`walker_inline_execute_frame_call_trace`); `return_trace` stays with
 /// `execute_frame` on residual paths.
 ///
@@ -6913,10 +6877,10 @@ fn caller_frame_box_for(ctx: &TraceCtx, frame_ptr: usize) -> Option<OpRef> {
 /// once `ec.w_tracefunc` or `ec.profilefunc` is set, so the callee becomes a
 /// residual call and reaches the interpreter's own `execute_frame`, which runs
 /// `call_trace` / `return_trace` / `leave`.  A hook installed AFTER the trace
-/// was recorded fails `gettrace()`'s `jit.promote` inside the inlined
-/// `call_trace` walk; `CALL_ASSEMBLER` and `walk_generator_resume` pin the
-/// same reads through `walker_call_trace_hook_reads`. A profiler uses the
-/// `is_being_profiled` green / back-edge read.
+/// was recorded fails `gettrace()`'s `jit.promote` at that inlined entry;
+/// `CALL_ASSEMBLER` and `walk_generator_resume` pin the same reads through
+/// `walker_call_trace_hook_reads`. A profiler uses the `is_being_profiled`
+/// green / back-edge read.
 ///
 /// `eval_with_jit_inner` (`pyre-jit/src/eval.rs`) routing every frame for
 /// which `frame_tracing_active` holds to `execute_frame_plain` is a
@@ -9874,14 +9838,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `ec.call_trace(self)` and `ec.return_trace(self, w_exitvalue)`, and
     // `executioncontext.py leave` adds `_trace(frame, 'leaveframe', ...)` when
     // a profiler is installed.  `walker_ec_enter` / `walker_ec_leave` port the
-    // frame-chain half; `walker_inline_execute_frame_call_trace` walks the
-    // generated `call_trace` jitcode at the callee entry.  The walker has no
-    // route to record `_trace` — it calls back into app-level Python with the
-    // callee frame as an argument.  So while a hook is installed there is no
-    // shape of this inline that can report what the callee owes, and the
-    // answer is the one `codewriter/policy.py look_inside_graph` gives for a
-    // graph it will not look inside: decline, and let the residual call reach
-    // the interpreter's own `execute_frame`, which runs both.
+    // frame-chain half; `walker_inline_execute_frame_call_trace` records
+    // `gettrace`'s promote at the callee entry.  The walker has no route to
+    // record `_trace` — it calls back into app-level Python with the callee
+    // frame as an argument.  So while a hook is installed there is no shape
+    // of this inline that can report what the callee owes, and the answer is
+    // the one `codewriter/policy.py look_inside_graph` gives for a graph it
+    // will not look inside: decline, and let the residual call reach the
+    // interpreter's own `execute_frame`, which runs both.
     //
     if super::ec_hook_installed() {
         return resolved_inline_decline(op.pc, line!());
@@ -11715,8 +11679,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 concrete_ec,
             );
             // `pyframe.py execute_frame`: `executioncontext.call_trace(self)`
-            // after `enter`. Unarmed recording inlines this generated
-            // jitcode so a later-armed hook fails `gettrace()`'s promote.
+            // after `enter`. Unarmed recording puts `gettrace()`'s promote
+            // on `callee_ec` so a later-armed hook fails that guard.
             if let Err(err) = walker_inline_execute_frame_call_trace(
                 ctx,
                 op.pc,

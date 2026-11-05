@@ -14802,8 +14802,8 @@ fn fused_goto_if_not_int<Sym: WalkSym>(
 /// Read live off the running context rather than from a recorded box.  The
 /// answer only decides whether to record a door at all, and every caller bails
 /// before recording any IR; the other half — a hook installed after the trace
-/// was recorded — is `gettrace()`'s `jit.promote` inside the inlined
-/// `call_trace` walk (`walker_inline_execute_frame_call_trace`), the
+/// was recorded — is `gettrace()`'s `jit.promote` recorded at an inlined
+/// callee entry (`walker_inline_execute_frame_call_trace`), the
 /// [`walker_call_trace_hook_reads`] pins on `CALL_ASSEMBLER` and generator
 /// resume, and the `is_being_profiled` green / back-edge read for a profiler.
 pub(crate) fn ec_hook_installed() -> bool {
@@ -15216,30 +15216,14 @@ pub(crate) fn inlined_loop_header_call_assembler(
 /// `if self.gettrace() is not None or self.profilefunc is not None`, with
 /// `gettrace = jit.promote(self.w_tracefunc)`.
 ///
-/// Recorded where this walker synthesizes a callee's `execute_frame` (the
-/// inline path, `CALL_ASSEMBLER` and `walk_generator_resume`). The portal
-/// merge point records none (`pyjitpl.py opimpl_jit_merge_point`;
-/// `pyopcode.py dispatch_bytecode` → `bytecode_only_trace`).
-///
-/// Measured over a 100 000-iteration tail with `sys.settrace` armed from
-/// inside the loop: 1 043 `call` events for a callee the walker inlines,
-/// against 100 000 on cpython 3.14.6, on pypy3 7.3.22 and for a callee
-/// left residual.
-pub(super) fn walker_call_trace_hook_reads<Sym: WalkSym>(
+/// Recorded on `ec_box` in the current walk. `call_trace` is a small method
+/// the translator inlines into `execute_frame`, so these reads stay on this
+/// walk's MIFrame.
+pub(super) fn walker_record_unarmed_call_trace<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
+    ec_box: OpRef,
 ) -> Result<(), DispatchError> {
-    let ec = pyre_interpreter::call::getexecutioncontext();
-    if ec.is_null() {
-        return Ok(());
-    }
-    debug_assert!(
-        unsafe { (*ec).w_tracefunc().is_null() && (*ec).profilefunc.is_none() },
-        "walker_call_trace_hook_reads: every caller declines on ec_hook_installed() first",
-    );
-    let Some(ec_box) = walker_ensure_execution_context(ctx) else {
-        return Ok(());
-    };
     stamp_live_execution_context(ctx.trace_ctx, ec_box);
 
     // `executioncontext.py gettrace`: `return jit.promote(self.w_tracefunc)`
@@ -15265,7 +15249,9 @@ pub(super) fn walker_call_trace_hook_reads<Sym: WalkSym>(
             .heapcache_getfield_now_known(ec_box, descr_index, read);
         ctx.trace_ctx
             .set_opref_concrete(read, Value::Ref(majit_ir::GcRef(0)));
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardIsnull, &[read])?;
+        let expected = ctx.trace_ctx.const_ref(0);
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[read, expected])?;
+        ctx.trace_ctx.heap_cache_mut().replace_box(read, expected);
         ctx.trace_ctx.heap_cache_mut().nullity_now_known(read);
     }
 
@@ -15307,6 +15293,26 @@ pub(super) fn walker_call_trace_hook_reads<Sym: WalkSym>(
         }
     }
     Ok(())
+}
+
+/// `CALL_ASSEMBLER` and generator-resume door: the running ExecutionContext
+/// box, then [`walker_record_unarmed_call_trace`].
+pub(super) fn walker_call_trace_hook_reads<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> Result<(), DispatchError> {
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    if ec.is_null() {
+        return Ok(());
+    }
+    debug_assert!(
+        unsafe { (*ec).w_tracefunc().is_null() && (*ec).profilefunc.is_none() },
+        "walker_call_trace_hook_reads: every caller declines on ec_hook_installed() first",
+    );
+    let Some(ec_box) = walker_ensure_execution_context(ctx) else {
+        return Ok(());
+    };
+    walker_record_unarmed_call_trace(ctx, op_pc, ec_box)
 }
 
 /// RPython `pyjitpl.py MIFrame._establish_nullity(box, orgpc)` — the shared
