@@ -7,7 +7,7 @@
 //! wakeup fd.  The actual app-level handler and the ticker update happen
 //! later, from a safe interpreter checkpoint.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicPtr, Ordering};
 
 #[cfg(all(windows, not(feature = "host_env")))]
 use libc::SIG_ERR;
@@ -50,6 +50,30 @@ pub const NSIG: i32 = 64;
 /// width wherever `_NSIG` is 65.
 const N_LONGBITS: i32 = i64::BITS as i32;
 const N_LONGSIG: usize = ((NSIG - 1) / N_LONGBITS + 1) as usize;
+
+/// `rsignal.py STRUCT_ONEFIELD` (`pypysig_long_struct_inner`): the one-field view of
+/// `signals.c pypysig_counter`. `c_value` is the action ticker.
+#[repr(C)]
+pub struct PypysigLongStructInner {
+    pub c_value: AtomicIsize,
+}
+
+/// `signals.c pypysig_counter`.
+static PYPYSIG_COUNTER: PypysigLongStructInner = PypysigLongStructInner {
+    c_value: AtomicIsize::new(0),
+};
+
+/// `rsignal.py pypysig_getaddr_occurred` (`_nowrapper=True, elidable_function=True`).
+#[majit_macros::elidable]
+pub fn pypysig_getaddr_occurred() -> *mut PypysigLongStructInner {
+    &PYPYSIG_COUNTER as *const PypysigLongStructInner as *mut PypysigLongStructInner
+}
+
+/// One-word residual-call ABI for [`pypysig_getaddr_occurred`].
+pub extern "C" fn pypysig_getaddr_occurred_jit_abi() -> i64 {
+    majit_ir::icf_identity!("signalstate::pypysig_getaddr_occurred_jit_abi");
+    pypysig_getaddr_occurred() as i64
+}
 
 /// Identity of the signal-driving `ActionFlag` ticker cell (`signals.c:45-49
 /// pypysig_counter`).  The pointer is compared by the interpreter but never
@@ -309,11 +333,11 @@ pub fn pypysig_reinstall(_signum: i32) {}
 /// (registered ticker, pending-signal set, `EB_ASYNC` / `EB_STW`). Libtest
 /// runs `#[test]`s in one process; a nursery collection's `set_stw` overlapping
 /// `action_dispatcher`'s still-check leaves the registered ticker at `-1`.
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_support {
     static SIGNAL_EVAL_BREAKER_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-    pub(crate) fn signal_eval_breaker_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+    pub fn signal_eval_breaker_test_guard() -> parking_lot::MutexGuard<'static, ()> {
         SIGNAL_EVAL_BREAKER_TEST_LOCK.lock()
     }
 }
@@ -333,6 +357,8 @@ mod tests {
             pypysig_default(libc::SIGINT);
             while signal_poll() >= 0 {}
             majit_ir::eval_breaker_word::clear_async();
+            let p = pypysig_getaddr_occurred();
+            unsafe { (*p).c_value.store(0, Ordering::Relaxed) };
         }
     }
 
@@ -355,9 +381,8 @@ mod tests {
     /// Those tests take [`test_support::signal_eval_breaker_test_guard`] with
     /// this one: if `EB_STW` is set when `action_dispatcher`'s still-check
     /// runs, it `reset_ticker(-1)` and the post-dispatch `get_ticker() >= 0`
-    /// assertion fails. Tests that merely build an `ActionFlag` are safe
-    /// alongside it: the async-bit mirror is gated on the registered ticker,
-    /// so an unregistered flag's `reset_ticker` never reaches the shared word.
+    /// assertion fails. Every `ActionFlag` shares `pypysig_counter`, so a
+    /// test that mutates the ticker must hold this guard for its whole body.
     #[test]
     fn signal_during_warmup_sets_async_bit() {
         let _lock = test_support::signal_eval_breaker_test_guard();

@@ -856,12 +856,12 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
         // signal seen on a worker rearms the main ticker promptly.
         majit_gc::rgil::invoke_after_thread_switch(CheckSignalAction::after_thread_switch);
 
-        // Hand the ticker cell address to the OS handler
-        // (`pypysig_getaddr_occurred`).  The handler itself only arms the
-        // eval-breaker's async bit, which is a lock-free atomic RMW and so
-        // async-signal-safe; `ExecutionContext::bytecode_trace` is what turns
-        // that request into a negative ticker, under the GIL.  Writing this
-        // cell from the handler would not be signal-safe.
+        // Hand the ticker cell address (`pypysig_counter.c_value`) to the
+        // OS handler (`pypysig_getaddr_occurred`).  The handler itself only
+        // arms the eval-breaker's async bit, which is a lock-free atomic RMW
+        // and so async-signal-safe; `ExecutionContext::bytecode_trace` is
+        // what turns that request into a negative ticker, under the GIL.
+        // Writing this cell from the handler would not be signal-safe.
         let ticker_addr = ec.actionflag.ticker_addr();
         signalstate::register_ticker(ticker_addr);
 

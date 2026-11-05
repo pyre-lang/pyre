@@ -3087,24 +3087,19 @@ pub(crate) fn service_eval_breaker(
 ///
 /// PyPy starts with a plain `ActionFlag` (its ticker is a Python field)
 /// and, when the `signal` module loads, rebinds `space.actionflag` to a
-/// `SignalActionFlag` whose ticker is the C `pypysig_counter` cell.  pyre
-/// merges the two. `_ticker` is an `AtomicIsize` (`pypysig_counter`): the
-/// OS handler and `fire_action_ticker` store `-1` into it, and the
-/// interpreter reads it from `decrement_ticker`.
+/// `SignalActionFlag` whose ticker is the C `pypysig_counter` cell. This
+/// type is `SignalActionFlag`: the ticker is `signals.c pypysig_counter`,
+/// reached through `pypysig_getaddr_occurred`. The OS handler and
+/// `fire_action_ticker` store `-1` into `c_value`, and the interpreter
+/// reads it from `decrement_ticker`.
 pub struct ActionFlag {
     base: AbstractActionFlag,
-    /// `executioncontext.py ActionFlag._ticker`, stored atomically so an OS
-    /// signal handler and a collector can store `-1` (`pypysig_counter`).
-    _ticker: std::sync::atomic::AtomicIsize,
 }
 
 impl Clone for ActionFlag {
     fn clone(&self) -> Self {
         Self {
             base: self.base.clone(),
-            _ticker: std::sync::atomic::AtomicIsize::new(
-                self._ticker.load(std::sync::atomic::Ordering::Relaxed),
-            ),
         }
     }
 }
@@ -3119,7 +3114,6 @@ impl ActionFlag {
     pub fn new() -> Self {
         Self {
             base: AbstractActionFlag::new(),
-            _ticker: std::sync::atomic::AtomicIsize::new(0),
         }
     }
 
@@ -3127,11 +3121,13 @@ impl ActionFlag {
         let _ = (ec, frame);
     }
 
-    /// Address used to identify this as the signal-driving ticker.  The OS
-    /// handler never dereferences it; it is stable for the process lifetime
-    /// because the owning process `ActionFlag` allocation never moves.
+    /// Address of `signals.c pypysig_counter.c_value`, the cell
+    /// `pypysig_getaddr_occurred` returns. Used to identify the
+    /// signal-driving ticker; the cell is process-global and stable
+    /// for the process lifetime.
     pub fn ticker_addr(&mut self) -> *mut isize {
-        self._ticker.as_ptr()
+        let p = crate::module::signal::signalstate::pypysig_getaddr_occurred();
+        unsafe { (*p).c_value.as_ptr() }
     }
 
     /// Transfer an asynchronous eval-breaker request into the registered
@@ -3139,7 +3135,8 @@ impl ActionFlag {
     /// GIL-side copy for a bit armed without that store.
     pub(crate) fn sync_async_ticker(&mut self) {
         if self.is_registered_ticker() {
-            self._ticker.store(-1, std::sync::atomic::Ordering::Relaxed);
+            let p = crate::module::signal::signalstate::pypysig_getaddr_occurred();
+            unsafe { (*p).c_value.store(-1, std::sync::atomic::Ordering::Relaxed) };
         }
     }
 
@@ -3155,17 +3152,19 @@ impl ActionFlag {
             return;
         }
         self.base.has_bytecode_counter = true;
-        if self._ticker.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        let p = crate::module::signal::signalstate::pypysig_getaddr_occurred();
+        let value = unsafe { (*p).c_value.load(std::sync::atomic::Ordering::Relaxed) };
+        if value == 0 {
             let interval = self.base.checkinterval_scaled as isize;
             self.reset_ticker(interval);
         }
     }
 
-    /// True when `self._ticker` is the signal-registered ticker cell — the
-    /// single cell compiled-loop back-edges poll. Only that ticker drives the
-    /// shared async bit; per-EC flags that are not the registered breaker
-    /// source must not touch the shared word, or one context's dispatch clear
-    /// would drop another context's pending async.
+    /// True when `pypysig_counter.c_value` is the signal-registered ticker
+    /// cell — the single cell compiled-loop back-edges poll. Only that ticker
+    /// drives the shared async bit; per-EC flags that are not the registered
+    /// breaker source must not touch the shared word, or one context's
+    /// dispatch clear would drop another context's pending async.
     ///
     /// The cell identity is compared as `usize` rather than via
     /// `ptr::eq`: this runs inside the traced eval loop (`decrement_ticker`),
@@ -3173,7 +3172,8 @@ impl ActionFlag {
     /// `int_eq/ir>i` kind shape that has no blackhole handler; casting both
     /// addresses to `usize` keeps the comparison an int/int equality.
     fn is_registered_ticker(&self) -> bool {
-        let here = self._ticker.as_ptr() as usize;
+        let p = crate::module::signal::signalstate::pypysig_getaddr_occurred();
+        let here = unsafe { (*p).c_value.as_ptr() } as usize;
         let registered = crate::module::signal::signalstate::registered_ticker_ptr() as usize;
         here == registered
     }
@@ -3189,18 +3189,23 @@ impl ActionFlagOps for ActionFlag {
         &mut self.base
     }
 
-    /// interp_signal.py `SignalActionFlag.get_ticker` — `p.c_value`.
+    /// interp_signal.py `SignalActionFlag.get_ticker` —
+    /// `pypysig_getaddr_occurred` then `p.c_value`.
     /// The safe-checkpoint synchronization above is the Rust equivalent of
     /// the signal handler making this cell negative.
     fn get_ticker(&self) -> isize {
-        self._ticker.load(std::sync::atomic::Ordering::Relaxed)
+        let p = crate::module::signal::signalstate::pypysig_getaddr_occurred();
+        unsafe { (*p).c_value.load(std::sync::atomic::Ordering::Relaxed) }
     }
 
     /// interp_signal.py `SignalActionFlag.reset_ticker` —
-    /// `p.c_value = value`.
+    /// `pypysig_getaddr_occurred` then `p.c_value = value`.
     fn reset_ticker(&mut self, value: isize) {
-        self._ticker
-            .store(value, std::sync::atomic::Ordering::Relaxed);
+        let p = crate::module::signal::signalstate::pypysig_getaddr_occurred();
+        unsafe {
+            (*p).c_value
+                .store(value, std::sync::atomic::Ordering::Relaxed)
+        };
         if self.is_registered_ticker() {
             if value < 0 {
                 arm_async_eval_breaker();
@@ -3251,14 +3256,17 @@ impl ActionFlagOps for ActionFlag {
         // a lost `-1` delays delivery by at most one ticker period, or until
         // `CheckSignalAction::after_thread_switch` re-arms from the pending
         // signal bits when a blocked thread resumes.
-        let value = self._ticker.load(std::sync::atomic::Ordering::Relaxed);
+        let p = crate::module::signal::signalstate::pypysig_getaddr_occurred();
+        let value = unsafe { (*p).c_value.load(std::sync::atomic::Ordering::Relaxed) };
         if self.base.has_bytecode_counter {
             if by == 0 {
                 return value;
             }
             let next = value.wrapping_sub(by);
-            self._ticker
-                .store(next, std::sync::atomic::Ordering::Relaxed);
+            unsafe {
+                (*p).c_value
+                    .store(next, std::sync::atomic::Ordering::Relaxed)
+            };
             if next < 0 && self.is_registered_ticker() {
                 arm_async_eval_breaker();
             }
@@ -3302,8 +3310,10 @@ impl SpaceActionFlag {
     pub fn new() -> Self {
         let ptr = *SPACE_ACTIONFLAG.get_or_init(|| {
             let ptr = Box::into_raw(Box::new(ActionFlag::new()));
-            // The leaked process flag is the ticker cell armers store into.
-            majit_ir::eval_breaker_word::publish_action_ticker(unsafe { &raw mut (*ptr)._ticker });
+            // Armers store into `signals.c pypysig_counter`.
+            majit_ir::eval_breaker_word::publish_action_ticker(unsafe {
+                &raw mut (*crate::module::signal::signalstate::pypysig_getaddr_occurred()).c_value
+            });
             ptr as usize
         }) as *mut ActionFlag;
         Self { ptr }
