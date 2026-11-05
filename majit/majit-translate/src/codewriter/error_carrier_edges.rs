@@ -30,6 +30,8 @@
 //! `from_exc_object` declared), apart from turning its exitcase into the
 //! catch-all.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::flowspace::model::Variable;
 use crate::model::{
     BlockId, CallTarget, ConcreteType, ExitCase, FunctionGraph, Link, LinkArg, OpKind, ValueType,
@@ -167,12 +169,99 @@ fn lower_carrier_raises(
         ) {
             continue;
         }
+        // `exceptiontransform.py comes_from_last_exception`: the raised
+        // evalue is the caught `last_exc_value` (through `cast_pointer`).
+        // That is a reraise of the runtime exception the residual ABI
+        // already stored in `BH_LAST_EXC_VALUE`. `to_exc_object` would
+        // treat that object as a carrier. `raise_link_through_closes`
+        // is this shape: cleanup, then `type(caught)` + exceptblock.
+        if comes_from_last_exception(graph, block_id) {
+            continue;
+        }
         // The raise below takes the type of the converted value instead.
         if !variable_used_outside(graph, bi, idx, &etype) {
             graph.blocks[bi].operations.remove(idx);
         }
         let exc = push_call(graph, block_id, to_exc_object, evalue);
         crate::front::exc_from_raise::set_raise_from_instance(graph, block_id, exc);
+    }
+}
+
+/// `exceptiontransform.py ExceptionTransformer.comes_from_last_exception`.
+///
+/// Walks `evalue` (`link.args[1]`) back through `cast_pointer` / `same_as`
+/// and incoming links. True when it is some link's `last_exc_value`.
+fn comes_from_last_exception(graph: &FunctionGraph, raise_block: BlockId) -> bool {
+    let raise_link = &graph.block(raise_block).exits[0];
+    let Some(start) = raise_link
+        .args
+        .get(1)
+        .and_then(LinkArg::as_variable)
+        .cloned()
+    else {
+        return false;
+    };
+    let mut entrymap: HashMap<BlockId, Vec<(BlockId, usize)>> = HashMap::new();
+    for src in graph.iterblocks_order() {
+        for (idx, exit) in graph.block(src).exits.iter().enumerate() {
+            entrymap.entry(exit.target).or_default().push((src, idx));
+        }
+    }
+    let mut seen: HashSet<(BlockId, usize, Variable)> = HashSet::new();
+    let mut pending = vec![(raise_block, 0, start)];
+    while let Some((src, idx, mut v)) = pending.pop() {
+        if !seen.insert((src, idx, v.clone())) {
+            continue;
+        }
+        let link = &graph.block(src).exits[idx];
+        if link.last_exc_value.as_ref().and_then(LinkArg::as_variable) == Some(&v) {
+            return true;
+        }
+        let block = src;
+        for op in graph.block(block).operations.iter().rev() {
+            if op.result.as_ref() != Some(&v) {
+                continue;
+            }
+            if let Some(operand) = cast_pointer_operand(&op.kind) {
+                v = operand.clone();
+                continue;
+            }
+            break;
+        }
+        let Some(incoming) = entrymap.get(&block) else {
+            continue;
+        };
+        let inputs = &graph.block(block).inputargs;
+        for &(pred, pred_idx) in incoming {
+            let pred_link = &graph.block(pred).exits[pred_idx];
+            for (arg, input) in pred_link.args.iter().zip(inputs.iter()) {
+                if input != &v {
+                    continue;
+                }
+                if let Some(arg_var) = arg.as_variable() {
+                    pending.push((pred, pred_idx, arg_var.clone()));
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Operand of an identity cast (`cast_pointer` / `same_as` /
+/// `__cast_instance_intrinsic`). RPython peels `cast_pointer` only;
+/// pyre's jtransform folds that family to `same_as`.
+fn cast_pointer_operand(kind: &OpKind) -> Option<&Variable> {
+    match kind {
+        OpKind::UnaryOp { op, operand, .. } if op == "same_as" || op == "cast_pointer" => {
+            Some(operand)
+        }
+        OpKind::Call { args, .. }
+            if crate::model::cast_pointer_root(kind).is_some()
+                || crate::model::cast_instance_root(kind).is_some() =>
+        {
+            args.first().and_then(LinkArg::as_variable)
+        }
+        _ => None,
     }
 }
 
@@ -288,6 +377,77 @@ mod tests {
         };
         assert_eq!(*raised, exc);
         assert_eq!(block.exits[0].target, graph.exceptblock);
+    }
+
+    /// `raise_link_through_closes`: cleanup, then raise the caught
+    /// `last_exc_value`. `comes_from_last_exception` is true, so the
+    /// runtime exception is not passed through `to_exc_object`.
+    #[test]
+    fn a_reraise_after_cleanup_does_not_convert_last_exc_value() {
+        let mut graph = FunctionGraph::new("reraise_after_cleanup");
+        let entry = graph.startblock;
+        let r = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["may_raise"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (normal, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(normal, Some(graph.blocks[normal.0].inputargs[0].clone()));
+        let (cleanup, cleanup_in) = graph.create_block_with_arg_vars(3);
+        graph.push_op_var(
+            cleanup,
+            OpKind::Call {
+                target: CallTarget::function_path(["pop_roots"]),
+                args: crate::model::call_args(vec![cleanup_in[0].clone()]),
+                result_ty: ValueType::Void,
+            },
+            true,
+        );
+        crate::front::exc_from_raise::set_raise_from_instance(
+            &mut graph,
+            cleanup,
+            cleanup_in[2].clone(),
+        );
+        let close_arg = graph.alloc_value_var();
+        let etype = graph.alloc_value_var();
+        let evalue = graph.alloc_value_var();
+        let mut exc = Link::new_mixed(
+            vec![
+                LinkArg::Value(close_arg),
+                LinkArg::Value(etype.clone()),
+                LinkArg::Value(evalue.clone()),
+            ],
+            cleanup,
+            Some(crate::model::exception_exitcase()),
+        );
+        exc.last_exception = Some(LinkArg::Value(etype));
+        exc.last_exc_value = Some(LinkArg::Value(evalue));
+        graph.set_control_flow_metadata(
+            entry,
+            Some(ExitSwitch::LastException),
+            vec![Link::new_mixed(vec![LinkArg::Value(r)], normal, None), exc],
+        );
+        lower_error_carrier_edges(&mut graph, &carrier(), &|_| false);
+
+        let names: Vec<_> = graph.blocks[cleanup.0]
+            .operations
+            .iter()
+            .filter_map(|op| call_segments(op).map(|s| s.join("::")))
+            .collect();
+        assert!(
+            names.iter().any(|n| n.ends_with("pop_roots")),
+            "cleanup stays on the raise edge: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("pyerror_to_exc_object")),
+            "reraise of last_exc_value must not convert: {names:?}"
+        );
     }
 
     /// `except OperationError as e` lands on `e = from_exc_object(caught)`
