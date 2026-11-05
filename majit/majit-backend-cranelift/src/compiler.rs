@@ -19657,7 +19657,7 @@ impl CraneliftBackend {
             // code, and each contiguous run is its own region.
             if let Some(code) = ctx.compiled_code() {
                 for region in code.buffer.get_srclocs_sorted() {
-                    let op_idx = region.loc.bits() as usize;
+                    let op_idx = region.loc.as_abs().bits() as usize;
                     let Some(op) = ops.get(op_idx) else { continue };
                     eprintln!(
                         "[clif] @{:#06x} op[{}] {:?}",

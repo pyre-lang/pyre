@@ -19,11 +19,11 @@ wasmtime = { workspace = true }
 # Disassemble a trace module to WAT when it fails to compile, gated by
 # PYRE_WASM_DUMP_BAD_TRACE — used to debug JIT codegen bugs. Pinned to the
 # version wasmtime already resolves in the lockfile.
-wasmprinter = "0.248"
+wasmprinter = "0.261"
 # Resolve a function-table slot to its symbol for the PYRE_WASM_CALL_HIST
 # probe, by reading the module's element and name sections. Pinned to the
 # version wasmtime already resolves in the lockfile, as wasmprinter is.
-wasmparser = "0.248"
+wasmparser = "0.261"
 # Render a resolved slot symbol the way the codebase cites one
 # (`pyre_jit::call_jit::bh_call_fn`) rather than as its v0 mangling. Already in
 # the lockfile as a wasmtime backtrace dependency.
