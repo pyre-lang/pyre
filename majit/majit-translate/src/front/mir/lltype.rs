@@ -2253,6 +2253,16 @@ pub(in crate::front::mir) fn field_ty_is_raw_word(
     if node.get("Scalar").is_some() {
         return true;
     }
+    // `Atomic<T>` is Opaque in Charon; its stored word is `T`
+    // (`tyref_atomic_arg`). `history.getkind` of a `Signed` word is int.
+    if let Some(arg) = tyref_atomic_arg(ty, llbc) {
+        if arg.get("Scalar").is_some() {
+            return true;
+        }
+        if let Some(pointee) = one_level_pointer_pointee(arg, llbc) {
+            return pointee_is_raw_word(pointee, llbc, gc_struct_ids);
+        }
+    }
     if let Some(pointee) = one_level_pointer_pointee(node, llbc) {
         return pointee_is_raw_word(pointee, llbc, gc_struct_ids);
     }
