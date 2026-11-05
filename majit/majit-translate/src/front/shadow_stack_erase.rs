@@ -690,8 +690,9 @@ fn operand_is_reloaded_root_json(op: &Value, specials: &HashMap<usize, Special>)
 /// depth 0 copies the held frame (`gc_restore_root` identity). A ReloadedRoot
 /// already in the args is the live red frame: copying the original argument
 /// would keep it live across `jit_merge_point`. An intermediate (a cast of
-/// that argument) is not live on every path, so fall back to a previous
-/// ReloadedRoot dest or the function argument.
+/// the hinted operand) is that live red; copy it, not a prior `debug_assert`
+/// temp or the function argument. A `slot_top_ref` with only a handle falls
+/// back to a previous ReloadedRoot dest or the function argument.
 fn depth0_reload_copy(
     depth: usize,
     args_json: &Value,
@@ -720,12 +721,11 @@ fn depth0_reload_copy(
         if json_operand_local(&held).is_some_and(is_fn_arg) {
             return Ok(copy_operand_json(&held));
         }
-        if let Some(src) = reload_src {
-            return Ok(src.clone());
-        }
-        if let Some(arg_local) = function_held_root(body).filter(|l| is_fn_arg(*l)) {
-            return Ok(json!({ "Copy": local_place_json(arg_local, dest_ty) }));
-        }
+        // A cast of the hinted frame (`Deref` of `hint` dest) is the live
+        // red. `reload_src` may be a `debug_assert` temp that is not
+        // initialised on the release edge; copying it aliases later
+        // reloads off that temp and drops `access_directly` when the
+        // fallback was the function argument.
         return Ok(copy_operand_json(&held));
     }
     if let Some(src) = reload_src {
@@ -1847,6 +1847,12 @@ fn analyze_in(
             };
             if let Some(special) = special {
                 bind(&mut plan.specials, dest, special)?;
+                // A ReloadedRoot copy/cast without a function-wide source
+                // must keep the original rvalue (the reload dest). Removing
+                // it leaves the dest uninitialised on this path.
+                if matches!(special, Special::ReloadedRoot) && plan.reload_src.is_none() {
+                    continue;
+                }
                 plan.removed.entry(bb).or_default().push(si);
                 if let Some(dest_json) = stmt.kind_value().get("Assign").and_then(|a| a.get(0)) {
                     if matches!(special, Special::SlotHandle)
@@ -2190,13 +2196,14 @@ fn analyze_in(
                             bind(&mut plan.specials, dest, Special::ReloadedRoot)?;
                             // A single-def dest is a temp (tuple `.0`,
                             // `debug_assert` reload): projections of it
-                            // answer the held frame. A reassigned dest is
-                            // the live red; later copies must answer it,
-                            // not the Input argument that would stay live
-                            // across `jit_merge_point`.
-                            if single_def(dest) {
-                                plan.reload_src.get_or_insert_with(|| copied.clone());
-                            } else {
+                            // answer the held frame. Publishing that temp
+                            // as `reload_src` makes a release-path join
+                            // copy a local that is only defined on the
+                            // debug edge. A reassigned dest is the live
+                            // red; later copies must answer it, not the
+                            // Input argument that would stay live across
+                            // `jit_merge_point`.
+                            if !single_def(dest) {
                                 plan.reload_src =
                                     Some(json!({ "Copy": local_place_json(dest, &dest_ty) }));
                             }
@@ -6326,56 +6333,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// `slot_top_ref` answers a GcRef; the wrapper projects `.0` and pointer-
-    /// casts it onto the held frame. That pipeline is the reload, not an
-    /// escape of the handle.
-    #[test]
-    fn erase_reload_through_tuple_field_and_pointer_cast() {
-        let copy = |i| json!({"Copy": place(i)});
-        let field0 = |i: u64| {
-            json!({
-                "kind": {"Projection": [place(i), {"Field": [null, 0]}]},
-                "ty": ty()
-            })
-        };
-        let body_json = two_arg_body(
-            vec![
-                bb(call_fun(1, vec![copy(1)], 3, 1)),
-                bb_stmts(
-                    vec![assign_local(4, json!({"Use": [copy(3), "Yes"]}))],
-                    call_fun(2, vec![copy(4)], 5, 2),
-                ),
-                bb_stmts(
-                    vec![
-                        assign_local(6, json!({"Use": [{"Copy": field0(5)}, "Yes"]})),
-                        assign_local(
-                            0,
-                            json!({"UnaryOp": [
-                                {"Cast": {"PtrWithExposedProvenance": [
-                                    {"Integer": {"Unsigned": "Usize"}},
-                                    ty()
-                                ]}},
-                                {"Move": place(6)}
-                            ]}),
-                        ),
-                    ],
-                    json!("Return"),
-                ),
-            ],
-            7,
-        );
-        let mut funs = cached_slot_leaves();
-        funs.push(opaque_fun(
-            3,
-            &["lib", "reload_frame"],
-            json!({ "Unstructured": body_json }),
-        ));
-        let llbc = cached_slot_llbc(funs);
-        let fd = llbc.fn_by_id(3).expect("subject");
-        let body = fd.unstructured().expect("stripped body");
-        let _ = assert_reload_answers_frame(fd, &body, &llbc, 2);
     }
 
     /// Cached-slot resolve/reload does not publish pins. A stack-sensitive

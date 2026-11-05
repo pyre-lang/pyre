@@ -2680,26 +2680,12 @@ fn inline_struct_field_offset(
     Some(row.offset)
 }
 
-/// Byte offset of a `taken_by_address` field on a raw owner, any flag.
-///
-/// `rewrite_op_getsubstruct` is `int_add(ptr, offsetof)` for `_gckind ==
-/// 'raw'`. `inline_aggregate_offset` / `inline_struct_field_offset` only
-/// name `FLAG_STRUCT` rows; a one-word pointer slot (`UnsafeCell.value`)
-/// is still that interior address, not `getfield_raw_r` of the word.
-fn raw_taken_field_offset(
-    field: &FieldDescriptor,
-    cc: Option<&crate::call::CallControl>,
-) -> Option<usize> {
-    if !field.taken_by_address || field.vec_part.is_some() {
-        return None;
-    }
-    let owner = field.owner_root.as_deref()?;
-    let layout = cc.and_then(|cc| cc.struct_layout_for(owner))?;
-    layout
-        .fields
-        .iter()
-        .find(|row| row.name == field.name)
-        .map(|row| row.offset)
+/// `cpu.fielddescrof(STRUCT, quasiimmut.get_mutate_field_name(name))`.
+/// Same STRUCT object as `field` (`descr.py get_field_descr`).
+fn mutate_field_descr(field: &FieldDescriptor) -> FieldDescriptor {
+    FieldDescriptor::new(format!("mutate_{}", field.name), field.owner_root.clone())
+        .with_owner_id(field.owner_id)
+        .with_owner_declared_gc(field.owner_declared_gc)
 }
 
 /// Inputargs that receive `root` on every incoming edge. A join fed by only
@@ -3913,8 +3899,7 @@ impl<'a> Transformer<'a> {
         // applied after rewrite. Resolve the same handle `hook_access_field`
         // keys flags on.
         let renamed_base = resolve_alias(renamed_base, &self.aliases);
-        let mutate_field =
-            FieldDescriptor::new(format!("mutate_{}", field.name), field.owner_root.clone());
+        let mutate_field = mutate_field_descr(field);
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
             detail: format!(
@@ -8994,18 +8979,6 @@ impl<'a> Transformer<'a> {
             };
             return self.rewrite_raw_substruct_address(op, base, offset, graph);
         }
-        // A one-word pointer / scalar slot taken by address is the same
-        // `getsubstruct` (`int_add`) as a `FLAG_STRUCT` row. Leaving it as
-        // `getfield` is `getfield_raw_r` of the word, which
-        // `rewrite_op_getfield` refuses.
-        if let Some(offset) = raw_taken_field_offset(field, self.callcontrol.as_deref())
-            && !crate::codewriter::type_state::field_owner_is_gc(field, self.callcontrol.as_deref())
-        {
-            let OpKind::FieldRead { base, .. } = &op.kind else {
-                unreachable!("rewrite_op_getfield called on non-FieldRead op")
-            };
-            return self.rewrite_raw_substruct_address(op, base, offset, graph);
-        }
         // A place read of the same aggregate (`(*raw).inline.field`) does
         // not set `taken_by_address`. On a raw container that read is still
         // `rewrite_op_getsubstruct`: the result is the interior address.
@@ -9288,10 +9261,9 @@ impl<'a> Transformer<'a> {
                 // lltype `inst_` prefix before prepending `mutate_`.  Rust
                 // structs carry no such prefix, so we prepend `mutate_`
                 // directly.
-                let mutate_field = FieldDescriptor::new(
-                    format!("mutate_{}", field.name),
-                    field.owner_root.clone(),
-                );
+                // `cpu.fielddescrof(STRUCT, mutate_name)` uses the same
+                // STRUCT object as `field` (`descr.py get_field_descr`).
+                let mutate_field = mutate_field_descr(field);
                 self.notes.push(GraphTransformNote {
                     function: graph_name.to_string(),
                     detail: format!(
@@ -11400,6 +11372,25 @@ impl<'a> Transformer<'a> {
                     // typed the unit `()` shell (see `effective_call_result_ty`).
                     let effective_result_ty =
                         self.effective_call_result_ty(target, op.result.as_ref(), result_ty);
+                    // `call.py getcalldescr` uses FUNC.RESULT. When the
+                    // declared graph result is Int, stamp that bank before
+                    // reading the result cell: a residual by-value raw ADT
+                    // keeps the frontend's aggregate Ref token on the dest
+                    // (`Ptr(GcStruct object)`), and `resolve_call_result`
+                    // would otherwise prefer that cell over the reconciled
+                    // Int. A dest that already carries a raw-pointer
+                    // concretetype (CCHARP / Signed) is already that bank.
+                    if self
+                        .callcontrol
+                        .as_deref()
+                        .is_some_and(|cc| cc.declared_raw_result_for_target(target))
+                    {
+                        self.stamp_value_kind_from_value_type(
+                            graph,
+                            op.result.clone(),
+                            &effective_result_ty,
+                        );
+                    }
                     let result_ir_type = self
                         .resolve_call_result(op.result.as_ref(), &effective_result_ty)
                         .ir_type;

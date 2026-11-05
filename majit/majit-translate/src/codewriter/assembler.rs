@@ -5715,19 +5715,7 @@ pub(crate) fn bh_size_spec_from_callcontrol(
     let (is_gc_managed, headerless) = cc
         .struct_storage_for(owner)
         .or_else(|| cc.struct_storage_for(template_owner))
-        .unwrap_or_else(|| {
-            match cc
-                .declared_gckind_for(owner)
-                .or_else(|| cc.declared_gckind_for(template_owner))
-            {
-                Some(crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc) => (true, false),
-                Some(crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw)
-                | Some(crate::translator::rtyper::lltypesystem::lltype::GcKind::Prebuilt) => {
-                    (false, false)
-                }
-                None => (true, false),
-            }
-        });
+        .unwrap_or((true, false));
     Some(crate::jitcode::BhSizeSpec {
         size,
         is_gc_managed,

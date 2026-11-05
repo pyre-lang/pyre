@@ -11375,6 +11375,27 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
             .map(|arg| tyref_to_ast_string(&arg, llbc))
             .unwrap_or_else(|| "*mut PyObject".to_string());
     }
+    // `Cell` / `UnsafeCell` is one stored word (`heaptracker.all_fielddescrs`
+    // does not recurse). `tyref_to_value_type_with` peels the constructor
+    // before the by-value raw-struct gate; without the same peel here the
+    // transparent-scalar arm below sees the inner `UnsafeCell<bool>` as
+    // Int and emits that ADT spelling, and `is_known_by_value_struct` then
+    // flattens it as FLAG_STRUCT. Spell the payload so `get_type_flag`
+    // publishes `bool` / the inner pointer, matching the group row.
+    //
+    // `tyref_interior_mut_inner_ty` also matches `core::sync::atomic`
+    // wrappers. Those already have dedicated arms above, and peeling
+    // `AtomicPtr<QuasiImmut>` to `*mut QuasiImmut` makes a flavor-raw
+    // pointee Int against the group's Ref mutate row.
+    if adt_path_of_tyref(ty, llbc).is_some_and(|path| {
+        path.ends_with("::UnsafeCell")
+            || path == "core::cell::Cell"
+            || path == "std::cell::Cell"
+            || path.ends_with("::cell::Cell")
+    }) && let Some(inner) = tyref_interior_mut_inner_ty(ty, llbc)
+    {
+        return tyref_to_field_layout_string(&inner, llbc, gc_struct_ids, raw_alloc_flavor_structs);
+    }
     // A `Vec` of one-word items is the header address (`RustVecRepr`,
     // kind `int`): one pointer-sized word, not the 24-byte inline Vec.
     // Spelling the Vec ADT here registers a `FLAG_STRUCT` row whose
