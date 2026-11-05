@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 
 use crate::annotator::bookkeeper::Bookkeeper;
 use crate::annotator::description::{DescKey, alloc_desc_key};
-use crate::annotator::specialize::memotable_for_args;
+use crate::annotator::specialize::{MemoKey, memotable_for_args};
 use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{_ptr, LowLevelType, MallocFlavor, malloc};
@@ -130,7 +130,11 @@ pub fn _ll_prebuilt_empty_array(
                 .unwrap_or_else(|| "_ll_prebuilt_empty_array memo failed".into()),
         )
     })?;
-    match memotable.borrow().table.get(&args) {
+    match memotable
+        .borrow()
+        .table
+        .get(&args.iter().cloned().map(MemoKey).collect::<Vec<_>>())
+    {
         Some(ConstValue::LLPtr(ptr)) => Ok((**ptr).clone()),
         other => Err(TyperError::message(format!(
             "_ll_prebuilt_empty_array: MemoTable missing malloc(LISTITEM, 0), got {other:?}"
