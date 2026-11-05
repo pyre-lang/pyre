@@ -556,6 +556,7 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
     ));
     majit_gc::set_active_total_memory_pressure(Some(dynasm_total_memory_pressure));
     majit_gc::set_active_collect_oldgen(Some(dynasm_collect_oldgen_nonmoving));
+    majit_gc::set_active_collect_nursery(Some(dynasm_collect_nursery));
     majit_gc::set_active_heap_stats(Some(dynasm_heap_stats));
     majit_gc::set_active_gc_memory_stats(Some(dynasm_gc_memory_stats));
     majit_gc::set_active_major_threshold_reached(Some(dynasm_major_threshold_reached));
@@ -1214,15 +1215,26 @@ fn dynasm_total_memory_pressure() -> isize {
     majit_gc::gc_sync::gc_op(|g| g.total_memory_pressure())
 }
 
-/// Non-moving old-gen-only major. Reclaims stable-allocated interp int/float
-/// without moving the nursery, so the interpreter safepoint can fire it under
-/// an active JIT (nursery non-empty) — unlike [`dynasm_collect_generation`], whose
-/// embedded minor would relocate a Rust-stack nursery PyObjectRef.
+/// Non-moving old-gen-only major. Nursery addresses stay put. Used by the
+/// explicit old-gen request and by `nonmoving_major_*` tests. Automatic
+/// dispatch-loop collection is [`dynasm_collect_nursery`]. The depth ≤ 2
+/// gate exists because opcode-handler Rust locals are not rooted; assembler
+/// frames are rooted by gcmap.
 fn dynasm_collect_oldgen_nonmoving() {
     if gc_box::with_mut(|g| g.collect_oldgen_nonmoving()).is_some() {
         return;
     }
     majit_gc::gc_sync::gc_op(|g| g.collect_oldgen_nonmoving());
+}
+
+/// Moving minor plus one bounded major step.
+/// `incminimark.py` `minor_collection_with_major_progress` with
+/// `force_enabled=False`.
+fn dynasm_collect_nursery() {
+    if gc_box::with_mut(|g| g.collect_nursery()).is_some() {
+        return;
+    }
+    majit_gc::gc_sync::gc_op(|g| g.collect_nursery());
 }
 
 fn dynasm_register_finalizer(fq_index: usize, obj: GcRef) {

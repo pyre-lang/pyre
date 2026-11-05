@@ -177,13 +177,32 @@ fn pyre_object_gc_collect_step_trampoline() -> (u8, u8) {
     (transition.old_state, transition.new_state)
 }
 
-/// Non-moving old-gen-only major trampoline for the interpreter GC safepoint.
-/// Bridges pyre-object's `try_gc_collect_oldgen` to
-/// `majit_gc::collect_oldgen_nonmoving`. Unlike the full-collect trampoline it
-/// runs no minor, so it reclaims stable-allocated interp int/float without
-/// moving the nursery — safe to fire under an active JIT.
+/// Non-moving old-gen-only major trampoline. Bridges pyre-object's
+/// `try_gc_collect_oldgen` to `majit_gc::collect_oldgen_nonmoving`. Nursery
+/// addresses stay put. Used by the explicit old-gen request. Automatic
+/// dispatch-loop collection is [`pyre_object_gc_collect_nursery_trampoline`].
+/// The depth ≤ 2 gate admits the module frame (depth 1) and one nested
+/// activation (depth 2); a callback entered from a depth-1 opcode handler
+/// runs at depth 2 with that handler suspended. Operands stay on the frame
+/// value stack or are pinned (`with_roots!`), the interpreter frame is a
+/// `FrameBox` (young-nonmoving), and the result push goes through
+/// `FrameAnchor`; a handler that writes the frame after a collecting call
+/// through the pre-call `&mut` relies on the frame not moving. Upstream
+/// roots every live variable around a collecting call and reloads it
+/// (`framework.py` `BaseFrameworkGCTransformer.gct_direct_call`,
+/// `shadowstack.py` `ShadowStackFrameworkGCTransformer.push_roots` /
+/// `pop_roots`). Assembler frames are rooted by gcmap.
 fn pyre_object_gc_collect_oldgen_trampoline() {
     majit_gc::collect_oldgen_nonmoving();
+}
+
+/// Moving minor plus one bounded major step for the interpreter GC safepoint.
+/// Bridges pyre-object's `try_gc_minor_with_major_progress` to
+/// `majit_gc::collect_nursery_with_major_progress`.
+/// `incminimark.py` `minor_collection_with_major_progress` with
+/// `force_enabled=False`.
+fn pyre_object_gc_collect_nursery_trampoline() {
+    majit_gc::collect_nursery_with_major_progress();
 }
 
 /// Trampoline for the interpreter safepoint's next-major-threshold question
@@ -5811,6 +5830,9 @@ fn install_pyre_object_hooks() {
     pyre_object::register_gc_collect_hook(pyre_object_gc_collect_trampoline);
     pyre_object::gc_hook::register_gc_collect_step_hook(pyre_object_gc_collect_step_trampoline);
     pyre_object::gc_hook::register_gc_collect_oldgen_hook(pyre_object_gc_collect_oldgen_trampoline);
+    pyre_object::gc_hook::register_gc_minor_with_major_progress_hook(
+        pyre_object_gc_collect_nursery_trampoline,
+    );
     pyre_object::gc_hook::register_gc_major_threshold_reached_hook(
         pyre_object_gc_major_threshold_reached_trampoline,
     );
@@ -11430,12 +11452,17 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
     // moving frame since the seam; keying the same activation again by its
     // new address would spend a second recursion unit.
     // Count this eval-loop activation for the GC safepoint's
-    // at_outermost_activation gate (gh#393). The gate allows collection
-    // at depth ≤ 2 (module + one called function) where the CALL opcode
-    // has completed and no Rust-stack ref is live, but blocks at depth
-    // ≥ 3 (a callback re-entry from FOR_ITER→__getitem__, exception
-    // handler, etc., where the outer opcode handler holds a PyObjectRef
-    // on the Rust stack that walk_pyframe_roots cannot reach).
+    // `at_outermost_activation` gate. The gate admits the module frame
+    // (depth 1) and one nested activation (depth 2); a callback entered
+    // from a depth-1 opcode handler runs at depth 2 with that handler
+    // suspended. Operands stay on the frame value stack or are pinned
+    // (`with_roots!`), the interpreter frame is a `FrameBox`
+    // (young-nonmoving), and the result push goes through `FrameAnchor`;
+    // a handler that writes the frame after a collecting call through the
+    // pre-call `&mut` relies on the frame not moving. Upstream roots every
+    // live variable around a collecting call and reloads it (`framework.py`
+    // `BaseFrameworkGCTransformer.gct_direct_call`, `shadowstack.py`
+    // `ShadowStackFrameworkGCTransformer.push_roots` / `pop_roots`).
     let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
     if _eval_activation.armed() {
         // Share the interpreter-path GC configuration through the dispatch

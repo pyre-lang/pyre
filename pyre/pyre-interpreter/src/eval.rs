@@ -2772,24 +2772,28 @@ pub(crate) fn eval_frame_plain_with_resume(
     }
 }
 
-/// Resume interpretation after compiled code guard failure.
-pub fn eval_loop_for_force(frame: &mut PyFrame) -> PyResult {
-    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
-    eval_loop(frame, ec, /* relink */ false)
-}
-
+/// The frame passed here is a `FrameBox` frame that a minor collection does
+/// not move. A JIT nursery frame is resumed through `eval_loop_jit`, which
+/// reloads it from the top shadow-stack root after a collecting call
+/// (`shadowstack.py` `ShadowStackFrameworkGCTransformer.pop_roots`).
 fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bool) -> PyResult {
     // Bump the monotonic frame eval-loop entry odometer: a user Python frame
     // is about to run bytecode.  The FBW FOR_ITER Option-C guard snapshots
     // this around a residual call to detect a body effect that ran through
     // user code (a side-effecting getter / dunder / module top level).
     crate::call::bump_frame_entry_count();
-    // Count this interpreter activation so the JIT eval loop's GC safepoint
-    // stops firing once the nesting is deep enough to hide a root
-    // (PYRE_GC_INTERP root-completeness): module level and one called
-    // function's loop still collect, and an `eval_loop_jit` re-entered from
-    // inside an opcode handler observes depth >= 3 and skips collection.
-    // No-op when the flag is off.
+    // Count this interpreter activation for the dispatch-loop GC safepoint.
+    // `at_outermost_activation` admits the module frame (depth 1) and one
+    // nested activation (depth 2); a callback entered from a depth-1 opcode
+    // handler runs at depth 2 with that handler suspended. Operands stay on
+    // the frame value stack or are pinned (`with_roots!`), the interpreter
+    // frame is a `FrameBox` (young-nonmoving), and the result push goes
+    // through `FrameAnchor`; a handler that writes the frame after a
+    // collecting call through the pre-call `&mut` relies on the frame not
+    // moving. Upstream roots every live variable around a collecting call
+    // and reloads it (`framework.py` `BaseFrameworkGCTransformer.gct_direct_call`,
+    // `shadowstack.py` `ShadowStackFrameworkGCTransformer.push_roots` /
+    // `pop_roots`). No-op when the flag is off.
     let _eval_activation = pyre_object::gc_interp::EvalActivationGuard::enter();
     if _eval_activation.armed() {
         // Publish the process-stable configuration in the breaker word once
@@ -7848,5 +7852,115 @@ result = (
                 "intern_exact_str key {s} must survive weakref_create then minor"
             );
         }
+    }
+
+    static STEP0_PYFRAME_WALK: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn step0_pyframe_minor_walk(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        if !STEP0_PYFRAME_WALK.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        unsafe {
+            walk_pyframe_roots_area(capture_pyframe_root_area(), visitor);
+        }
+    }
+
+    /// A nursery object referenced only from a `PyFrame` local survives the
+    /// moving minor the dispatch-loop safepoint will run
+    /// (`do_collect_nursery` / `minor_collection_with_major_progress` with
+    /// `force_enabled=False`). An unreferenced nursery neighbour is not kept.
+    /// Depth ≤ 2 is [`at_outermost_activation`]: the module frame and one
+    /// nested activation; a callback from a depth-1 opcode handler runs at
+    /// depth 2 with that handler suspended. Assembler frames are rooted by
+    /// gcmap.
+    #[test]
+    fn safepoint_depth_le_2_minor_forwards_frame_locals() {
+        use majit_gc::GcAllocator;
+        use majit_gc::collector::{GcConfig, MiniMarkGC};
+        use majit_gc::trace::TypeInfo;
+        use std::sync::atomic::Ordering;
+
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let _signal_lock =
+            crate::module::signal::signalstate::test_support::signal_eval_breaker_test_guard();
+        crate::module::thread::ensure_runtime_thread();
+        crate::test_hooks::install_hash_hook();
+
+        majit_gc::shadow_stack::register_extra_root_walker(
+            step0_pyframe_minor_walk,
+            "safepoint_depth_le_2_pyframe",
+        );
+
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 2048,
+            ..GcConfig::default()
+        });
+        struct Step0Restore;
+        impl Drop for Step0Restore {
+            fn drop(&mut self) {
+                STEP0_PYFRAME_WALK.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _restore = Step0Restore;
+
+        const MAGIC: u64 = 0xA11C_E711;
+        const PAYLOAD: usize = 24;
+        let tid = gc.register_type(TypeInfo::simple(PAYLOAD));
+        let live = gc.alloc_nursery_typed(tid, PAYLOAD);
+        let dead = gc.alloc_nursery_typed(tid, PAYLOAD);
+        assert!(!live.is_null() && !dead.is_null());
+        assert!(gc.is_in_nursery(live.0) && gc.is_in_nursery(dead.0));
+        unsafe {
+            std::ptr::write_bytes(live.0 as *mut u8, 0, PAYLOAD);
+            std::ptr::write_bytes(dead.0 as *mut u8, 0, PAYLOAD);
+            *((live.0 as *mut u8).add(16) as *mut u64) = MAGIC;
+            *((dead.0 as *mut u8).add(16) as *mut u64) = 0xDEAD_BEEF;
+        }
+        let live_before = live.0;
+        let dead_before = dead.0;
+
+        let code = compile_exec("x = 1").expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        unsafe {
+            let frame_ptr = frame.as_mut_ptr();
+            let arr = (*frame_ptr).locals_cells_stack_w;
+            assert!(!arr.is_null(), "frame must own a locals array");
+            assert!(
+                (*arr).len() >= 1,
+                "frame locals array must have a slot for the live object"
+            );
+            (*arr).as_mut_slice()[0] = live_before as PyObjectRef;
+            (*frame_ptr).valuestackdepth = (*frame_ptr).valuestackdepth.max(1);
+        }
+
+        let _current = install_current_frame_tls_only(&mut frame);
+        STEP0_PYFRAME_WALK.store(true, Ordering::Release);
+        gc.do_collect_nursery();
+
+        let forwarded = unsafe {
+            let arr = (*frame.as_mut_ptr()).locals_cells_stack_w;
+            (*arr).as_slice()[0] as usize
+        };
+        assert_ne!(
+            forwarded, live_before,
+            "PyFrame local must be rewritten to the forwarded survivor"
+        );
+        assert!(
+            gc.is_managed_heap_object(forwarded),
+            "forwarded local must remain a managed heap object"
+        );
+        assert!(
+            !gc.is_in_nursery(forwarded),
+            "the survivor of a minor leaves the nursery"
+        );
+        let magic = unsafe { *((forwarded as *const u8).add(16) as *const u64) };
+        assert_eq!(magic, MAGIC, "forwarded payload must keep its contents");
+        assert!(
+            gc.is_in_nursery(dead_before),
+            "an unreferenced nursery object must not be promoted"
+        );
+        assert_ne!(forwarded, dead_before);
     }
 }

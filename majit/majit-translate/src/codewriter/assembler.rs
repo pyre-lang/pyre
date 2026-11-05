@@ -15041,10 +15041,30 @@ mod tests {
     #[test]
     fn minted_exception_class_keeps_literal_key_beside_struct_origin() {
         let (ann, _rtyper) = fresh_exception_typer();
+        let mut reg = crate::front::StructFieldRegistry::default();
+        reg.fields.insert(
+            "argument::ArgErr".to_string(),
+            Vec::<(String, String)>::new(),
+        );
+        let id = majit_ir::descr::StructId::from_canonical("argument::ArgErr");
+        let identity = crate::front::semantic::ClassIdentity {
+            id,
+            spelling: "argument::ArgErr".to_string(),
+        };
+        reg.class_identity
+            .insert("argument::ArgErr".to_string(), Some(identity.clone()));
+        reg.class_identity
+            .insert("ArgErr".to_string(), Some(identity));
+        ann.bookkeeper.set_struct_fields(std::rc::Rc::new(reg));
         let _guard = crate::test_support::register_struct_origins_serialized(
             std::collections::HashMap::from([("ArgErr".to_string(), "argument".to_string())]),
         );
-        let struct_host = ann.bookkeeper.intern_class_by_qualname("argument::ArgErr");
+        // `CallRegistry::ensure_session` pre-mints every `struct_fields`
+        // key; interning the qualified declaration first lets the leaf
+        // alias `ArgErr` reach that host through the registry identity
+        // (`Bookkeeper.getdesc`).
+        let _ = ann.bookkeeper.intern_class_by_qualname("argument::ArgErr");
+        let struct_host = ann.bookkeeper.intern_class_by_qualname("ArgErr");
         assert_eq!(struct_host.qualname(), "argument::ArgErr");
         ann.bookkeeper.mint_exception_class_hierarchies(&[
             crate::front::llbc_hints::ExceptionClassHint {

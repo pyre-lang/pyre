@@ -519,10 +519,10 @@ pub fn try_gc_collect_step() -> (u8, u8) {
 }
 
 /// Signature of the host-side non-moving old-gen-only major callback.
-/// Reclaims stable-allocated interp int/float without moving the nursery, so
-/// the interpreter safepoint can drive it under an active JIT (non-empty
-/// nursery) — unlike [`try_gc_collect`], whose embedded minor would relocate a
-/// Rust-stack nursery `PyObjectRef` that has no shadowstack root.
+/// Nursery addresses stay put. Used by the explicit old-gen request; automatic
+/// dispatch-loop collection is [`try_gc_minor_with_major_progress`]. The
+/// depth ≤ 2 gate exists because opcode-handler Rust locals are not rooted;
+/// assembler frames are rooted by gcmap.
 pub type GcCollectOldgenHookFn = fn();
 
 majit_gc::global_hook!(static GC_COLLECT_OLDGEN_HOOK: GcCollectOldgenHookFn);
@@ -547,6 +547,38 @@ pub fn clear_gc_collect_oldgen_hook() {
 #[majit_macros::dont_look_inside]
 pub fn try_gc_collect_oldgen() {
     if let Some(f) = GC_COLLECT_OLDGEN_HOOK.get() {
+        f();
+    }
+}
+
+/// Signature of the host-side moving-minor-plus-one-major-step callback.
+/// `incminimark.py` `minor_collection_with_major_progress` with
+/// `force_enabled=False`.
+pub type GcMinorWithMajorProgressHookFn = fn();
+
+majit_gc::global_hook!(static GC_MINOR_WITH_MAJOR_PROGRESS_HOOK: GcMinorWithMajorProgressHookFn);
+
+/// Install the minor-plus-major-progress callback.
+pub fn register_gc_minor_with_major_progress_hook(hook: GcMinorWithMajorProgressHookFn) {
+    GC_MINOR_WITH_MAJOR_PROGRESS_HOOK.set(Some(hook));
+}
+
+/// Remove the minor-plus-major-progress callback.
+pub fn clear_gc_minor_with_major_progress_hook() {
+    GC_MINOR_WITH_MAJOR_PROGRESS_HOOK.set(None);
+}
+
+/// Trigger `incminimark.py` `minor_collection_with_major_progress` with
+/// `force_enabled=False` via the installed hook. No-op when no hook is
+/// installed.
+///
+/// Reads the runtime-mutable `GC_MINOR_WITH_MAJOR_PROGRESS_HOOK` fn-pointer
+/// cell, not a build-time constant, so the JIT residualizes the call instead
+/// of tracing into it (`@dont_look_inside`, the [`try_gc_collect_oldgen`]
+/// twin). A `()` return has no discriminant to erase and it cannot raise.
+#[majit_macros::dont_look_inside]
+pub fn try_gc_minor_with_major_progress() {
+    if let Some(f) = GC_MINOR_WITH_MAJOR_PROGRESS_HOOK.get() {
         f();
     }
 }

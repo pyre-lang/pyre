@@ -652,12 +652,25 @@ fn apply_star_args_builder(pygraph: &PyGraph, nb_extra_args: usize) -> Result<()
 #[derive(Clone, Debug)]
 pub struct MemoKey(pub ConstValue);
 
-/// A numeric memo argument value as the exact number Python compares: `UInt` only above `i128::MAX`, `Float` only for non-integral or out-of-range floats.
+/// A numeric memo argument value as the exact number Python compares: `UInt` only above `i128::MAX`, `Big` only for integers outside both fixed-width ranges, `Float` only for non-integral or non-finite floats.
 #[derive(PartialEq, Eq, Hash)]
 enum PyNumber {
     Int(i128),
     UInt(u128),
+    Big(malachite_bigint::BigInt),
     Float(u64),
+}
+
+/// Narrowest Python int: `Int` if it fits `i128`, else `UInt` if it fits
+/// `u128`, else `Big`. Python int `==` is exact and unbounded.
+fn py_int(v: malachite_bigint::BigInt) -> PyNumber {
+    if let Ok(n) = i128::try_from(&v) {
+        PyNumber::Int(n)
+    } else if let Ok(n) = u128::try_from(&v) {
+        PyNumber::UInt(n)
+    } else {
+        PyNumber::Big(v)
+    }
 }
 
 /// The exact number a numeric `ConstValue` equals under Python `==`, `None` for non-numbers.
@@ -683,16 +696,8 @@ fn py_number(value: &ConstValue) -> Option<PyNumber> {
                     Some(PyNumber::UInt(x))
                 }
             }
-            crate::rlib::rarithmetic::RIntValue::SignedBig(x) => {
-                i128::try_from(&x).ok().map(PyNumber::Int)
-            }
-            crate::rlib::rarithmetic::RIntValue::UnsignedBig(x) => {
-                if let Ok(n) = i128::try_from(&x) {
-                    Some(PyNumber::Int(n))
-                } else {
-                    u128::try_from(&x).ok().map(PyNumber::UInt)
-                }
-            }
+            crate::rlib::rarithmetic::RIntValue::SignedBig(x)
+            | crate::rlib::rarithmetic::RIntValue::UnsignedBig(x) => Some(py_int(x)),
         },
         ConstValue::Float(bits) => {
             let f = f64::from_bits(*bits);
@@ -705,10 +710,18 @@ fn py_number(value: &ConstValue) -> Option<PyNumber> {
                 Some(PyNumber::Int(f as i128))
             } else if f.fract() == 0.0 && f >= TWO_127 && f < TWO_128 {
                 Some(PyNumber::UInt(f as u128))
+            } else if f.is_finite() && f.fract() == 0.0 {
+                // Outside i128::MIN..=u128::MAX: Python int `==` is unbounded.
+                use num_traits::FromPrimitive;
+                Some(py_int(
+                    malachite_bigint::BigInt::from_f64(f)
+                        .expect("finite integral f64 converts exactly to BigInt"),
+                ))
             } else {
                 Some(PyNumber::Float(*bits))
             }
         }
+        ConstValue::Long(i) => Some(py_int(i.clone())),
         _ => None,
     }
 }
@@ -2159,6 +2172,47 @@ mod tests {
         assert_eq!(
             MemoKey(ConstValue::Float(1.0f64.to_bits())),
             MemoKey(ConstValue::Bool(true))
+        );
+    }
+
+    #[test]
+    fn memokey_python_int_equality_is_exact_and_unbounded() {
+        use crate::annotator::model::KnownType;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn hash_key(k: &MemoKey) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            k.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let two_200: malachite_bigint::BigInt = malachite_bigint::BigInt::from(1) << 200;
+        let long = MemoKey(ConstValue::Long(two_200.clone()));
+        let float = MemoKey(ConstValue::Float(2f64.powi(200).to_bits()));
+        assert_eq!(long, float);
+        assert_eq!(hash_key(&long), hash_key(&float));
+
+        let u256 =
+            match crate::rlib::rarithmetic::build_int(Some("r_uint256_memokey"), false, 256, true)
+                .unwrap_or_else(|e| panic!("{e}"))
+            {
+                KnownType::RInt(c) => c,
+                other => panic!("expected RInt, got {other:?}"),
+            };
+        let rint = crate::rlib::rarithmetic::rint_new(u256, two_200.clone())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let rint_key = MemoKey(rint);
+        assert_eq!(long, rint_key);
+        assert_eq!(hash_key(&long), hash_key(&rint_key));
+
+        assert_eq!(
+            MemoKey(ConstValue::Long(malachite_bigint::BigInt::from(5))),
+            MemoKey(ConstValue::Int(5))
+        );
+        assert_ne!(
+            MemoKey(ConstValue::Long(two_200.clone())),
+            MemoKey(ConstValue::Long(two_200 + 1))
         );
     }
 }

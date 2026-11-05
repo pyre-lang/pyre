@@ -40,41 +40,43 @@
 
 use indexmap::IndexMap;
 use parking_lot::Mutex;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
 
 use crate::translator::rtyper::rrange::{
     rtype_builtin_enumerate, rtype_builtin_range, rtype_builtin_xrange,
 };
 
-/// Process-global counter for the legacy InstanceRepr→PtrRepr swap
-/// inside [`rtype_cast_ptr_to_int`].  Each fire is one
-/// `cast_ptr_to_int` call whose operand reached the typer without a
-/// producer-set `SomeValue::Ptr` annotation — i.e. the struct's
-/// `Ptr(GcStruct(...))` is not in the walker lltype catalog yet
-/// (typed-ref-someptr-followup progression).
-///
-/// Progression gate (swap deletion): this counter must read 0
-/// across a representative production run.  Read it via
-/// [`swap_fallback_hits`]; reset between runs via
-/// [`reset_swap_fallback_hits`].
-pub(crate) static SWAP_FALLBACK_HITS: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// A diagnostic progression counter for the swap fallback, which has no
+    /// upstream counterpart (`rbuiltin.py` `rtype_cast_ptr_to_int` has no
+    /// fallback); it never affects identity, semantics, lifetime or GC
+    /// reachability, so it is per translating thread.
+    ///
+    /// Each fire is one `cast_ptr_to_int` call whose operand reached the
+    /// typer without a producer-set `SomeValue::Ptr` annotation — i.e. the
+    /// struct's `Ptr(GcStruct(...))` is not in the walker lltype catalog yet
+    /// (typed-ref-someptr-followup progression).  Progression gate (swap
+    /// deletion): this counter must read 0 across a representative production
+    /// run.  Read it via [`swap_fallback_hits`]; reset between runs via
+    /// [`reset_swap_fallback_hits`].
+    pub(crate) static SWAP_FALLBACK_HITS: Cell<u64> = const { Cell::new(0) };
+}
 
 /// Read the current value of the `cast_ptr_to_int` swap fallback hit
 /// counter.  Used by readiness checks + by unit tests.
 pub fn swap_fallback_hits() -> u64 {
-    SWAP_FALLBACK_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    SWAP_FALLBACK_HITS.with(Cell::get)
 }
 
 /// Reset the swap fallback hit counter to zero.  Test fixtures call
 /// this before exercising a `cast_ptr_to_int` lowering so the
-/// post-call observation is independent of any earlier-in-process
-/// fires (the registry is process-global so cross-test bleed is
-/// otherwise unavoidable).
+/// post-call observation is independent of any earlier fires on the
+/// same translating thread.
 pub fn reset_swap_fallback_hits() {
-    SWAP_FALLBACK_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+    SWAP_FALLBACK_HITS.with(|c| c.set(0));
 }
 
 use crate::annotator::model::{SomeBuiltin, SomeBuiltinMethod, SomeValue};
@@ -4846,7 +4848,7 @@ pub fn rtype_cast_ptr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
         );
     }
     if needs_swap {
-        SWAP_FALLBACK_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SWAP_FALLBACK_HITS.with(|c| c.set(c.get() + 1));
         let v = hop.args_v.borrow()[0].clone();
         let concrete = match &v {
             Hlvalue::Variable(var) => var.concretetype(),
@@ -7165,12 +7167,12 @@ mod tests {
     #[test]
     fn swap_fallback_hits_round_trip() {
         // The `cast_ptr_to_int` retirement-readiness counter is
-        // process-global; reset before observing so cross-test bleed
-        // is excluded.  Subsequent increments through the public
-        // `SWAP_FALLBACK_HITS` atomic surface in the reader.
+        // per translating thread; reset before observing so earlier
+        // fires on this thread are excluded.  Subsequent increments
+        // through the `SWAP_FALLBACK_HITS` Cell surface in the reader.
         reset_swap_fallback_hits();
         assert_eq!(swap_fallback_hits(), 0);
-        SWAP_FALLBACK_HITS.fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+        SWAP_FALLBACK_HITS.with(|c| c.set(c.get() + 3));
         assert_eq!(swap_fallback_hits(), 3);
         reset_swap_fallback_hits();
         assert_eq!(swap_fallback_hits(), 0);

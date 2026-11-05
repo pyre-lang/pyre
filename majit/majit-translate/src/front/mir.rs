@@ -424,6 +424,22 @@ pub(crate) fn absorb_semantic_program(
                     })
                     .or_insert(id);
             }
+            for (key, identity) in prog.struct_fields.class_identity {
+                acc.struct_fields
+                    .class_identity
+                    .entry(key)
+                    .and_modify(|slot| {
+                        let same = match (slot.as_ref(), identity.as_ref()) {
+                            (Some(a), Some(b)) => a.id == b.id,
+                            (None, None) => true,
+                            _ => false,
+                        };
+                        if !same {
+                            *slot = None;
+                        }
+                    })
+                    .or_insert(identity);
+            }
             acc.raw_alloc_flavor_structs
                 .extend(prog.raw_alloc_flavor_structs);
             for hint in prog.exception_class_hints {
@@ -1301,17 +1317,21 @@ fn register_ref_enum_instantiation_rows(
             // the discriminant-map guard) — a withdrawn leaf fails closed
             // rather than projecting whichever colliding decl was inserted
             // first.
-            let sid = majit_ir::descr::StructId::from_canonical_spelling(&format!(
-                "{canon_base}{}::{}",
-                inst.suffix, v.name
-            ));
+            let identity = format!("{canon_base}{}::{}", inst.suffix, v.name);
+            let sid = majit_ir::descr::StructId::from_canonical_spelling(&identity);
             for base in &bases {
                 let key = format!("{base}{}::{}", inst.suffix, v.name);
                 struct_fields
                     .fields
                     .entry(key.clone())
                     .or_insert_with(|| rows.clone());
-                record_struct_id(struct_ids, key, sid);
+                // Layout id stays the crate-stripped spelling
+                // (`StructId::from_canonical_spelling`). Class identity
+                // is not published here: `Bookkeeper.getdesc` of a
+                // constructed generic is the template class object plus
+                // its args (`intern_class_key_from_registry` reattaches
+                // them).
+                record_layout_struct_id(struct_ids, key, sid);
             }
         }
         // Suffixed enum BASE (`{base}{suffix}`): copy the unsuffixed
@@ -3763,7 +3783,7 @@ fn type_spelling_is_fixed_object_array(spelling: &str) -> bool {
 /// to `None` (ambiguous) if the same name already mapped to a different
 /// identity — i.e. two distinct type definitions share that spelling
 /// (only possible for a bare leaf across modules).
-fn record_struct_id(
+fn record_layout_struct_id(
     table: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
     name: String,
     id: majit_ir::descr::StructId,
@@ -3776,6 +3796,40 @@ fn record_struct_id(
             }
         })
         .or_insert(Some(id));
+}
+
+fn record_struct_id(
+    table: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    class_identity: &mut std::collections::HashMap<
+        String,
+        Option<crate::front::semantic::ClassIdentity>,
+    >,
+    name: String,
+    id: majit_ir::descr::StructId,
+    identity_spelling: &str,
+) {
+    record_layout_struct_id(table, name.clone(), id);
+    // One producer: the same harvest spelling `class_identity_spelling` /
+    // `enum_ctor_class_identity` uses as the declaration's `struct_fields`
+    // key. Two ids for one spelling collapse to `None`, matching
+    // `Bookkeeper.getdesc` (two class objects never merge).
+    class_identity
+        .entry(name)
+        .and_modify(|slot| {
+            let same = match slot {
+                Some(ci) => ci.id == id,
+                None => false,
+            };
+            if !same {
+                *slot = None;
+            }
+        })
+        .or_insert_with(|| {
+            Some(crate::front::semantic::ClassIdentity {
+                id,
+                spelling: identity_spelling.to_string(),
+            })
+        });
 }
 
 /// Publish a `type T = Struct<…>` alias as its own layout identity.
@@ -3832,8 +3886,20 @@ fn register_type_alias_struct(
         .fields
         .insert(canonical_name.clone(), rows.clone());
     let sid = majit_ir::descr::StructId::from_canonical(&canonical_name);
-    record_struct_id(struct_ids, name.clone(), sid);
-    record_struct_id(struct_ids, canonical_name.clone(), sid);
+    record_struct_id(
+        struct_ids,
+        &mut struct_fields.class_identity,
+        name.clone(),
+        sid,
+        &canonical_name,
+    );
+    record_struct_id(
+        struct_ids,
+        &mut struct_fields.class_identity,
+        canonical_name.clone(),
+        sid,
+        &canonical_name,
+    );
     // A later Struct/Enum with the same leaf keeps that leaf. Poisoning the
     // resolver slot would drop both layouts; skip the alias leaf instead.
     let leaf_free = match struct_ids.get(&leaf) {
@@ -3842,7 +3908,13 @@ fn register_type_alias_struct(
     };
     if leaf_free {
         struct_fields.fields.insert(leaf.clone(), rows);
-        record_struct_id(struct_ids, leaf.clone(), sid);
+        record_struct_id(
+            struct_ids,
+            &mut struct_fields.class_identity,
+            leaf.clone(),
+            sid,
+            &canonical_name,
+        );
     }
     let mut field_offsets = std::collections::HashMap::new();
     for (i, f) in fields.iter().enumerate() {
@@ -4211,9 +4283,27 @@ fn derive_program_metadata(
                 // publishes.  Every name spelling (full-crate, stripped,
                 // bare leaf) resolves to it through the resolver table.
                 let sid = majit_ir::descr::StructId::from_canonical(&canonical_name);
-                record_struct_id(&mut struct_ids, name.clone(), sid);
-                record_struct_id(&mut struct_ids, canonical_name.clone(), sid);
-                record_struct_id(&mut struct_ids, leaf.clone(), sid);
+                record_struct_id(
+                    &mut struct_ids,
+                    &mut struct_fields.class_identity,
+                    name.clone(),
+                    sid,
+                    &canonical_name,
+                );
+                record_struct_id(
+                    &mut struct_ids,
+                    &mut struct_fields.class_identity,
+                    canonical_name.clone(),
+                    sid,
+                    &canonical_name,
+                );
+                record_struct_id(
+                    &mut struct_ids,
+                    &mut struct_fields.class_identity,
+                    leaf.clone(),
+                    sid,
+                    &canonical_name,
+                );
                 // Exact field byte offsets from Charon's resolved layout
                 // (the true Rust layout, not the heuristic).  Field index
                 // `i` matches the declaration order Charon offsets by.
@@ -4439,18 +4529,42 @@ fn derive_program_metadata(
                     && enum_layout
                         .as_ref()
                         .is_some_and(|layout| layout.has_branch_discriminant());
-                if !fieldless && !tag_recorded_but_unspellable && !marked {
-                    let discr_ty = discr_ty.unwrap_or("i64").to_string();
-                    let rows: Vec<(String, String)> =
-                        vec![("__discriminant".to_string(), discr_ty)];
-                    struct_fields.fields.insert(name.clone(), rows.clone());
-                    struct_fields.fields.insert(leaf.clone(), rows.clone());
-                    struct_fields.fields.insert(canon_base.clone(), rows);
-                    // Object identity for the enum base (the discriminant
-                    // carrier), minted from the crate-stripped `module::Enum`.
-                    record_struct_id(&mut struct_ids, name.clone(), base_sid);
-                    record_struct_id(&mut struct_ids, leaf.clone(), base_sid);
-                    record_struct_id(&mut struct_ids, canon_base.clone(), base_sid);
+                if !fieldless && !tag_recorded_but_unspellable {
+                    if !marked {
+                        let discr_ty = discr_ty.unwrap_or("i64").to_string();
+                        let rows: Vec<(String, String)> =
+                            vec![("__discriminant".to_string(), discr_ty)];
+                        struct_fields.fields.insert(name.clone(), rows.clone());
+                        struct_fields.fields.insert(leaf.clone(), rows.clone());
+                        struct_fields.fields.insert(canon_base.clone(), rows);
+                    }
+                    // Object identity for the enum base, minted from the
+                    // crate-stripped `module::Enum`. A marked exception
+                    // class skips the `__discriminant` field rows (the
+                    // base class gets none) and still records intern
+                    // identity so `intern_class_key` resolves the leaf
+                    // alias (`Bookkeeper.getdesc`).
+                    record_struct_id(
+                        &mut struct_ids,
+                        &mut struct_fields.class_identity,
+                        name.clone(),
+                        base_sid,
+                        &canon_base,
+                    );
+                    record_struct_id(
+                        &mut struct_ids,
+                        &mut struct_fields.class_identity,
+                        leaf.clone(),
+                        base_sid,
+                        &canon_base,
+                    );
+                    record_struct_id(
+                        &mut struct_ids,
+                        &mut struct_fields.class_identity,
+                        canon_base.clone(),
+                        base_sid,
+                        &canon_base,
+                    );
                 }
                 // Per-variant field rows + exact offsets under
                 // `{enum}::{variant}` keys — the RPython sum-type subclass
@@ -4735,9 +4849,27 @@ fn derive_program_metadata(
                         // Object identity for the variant subclass, minted from
                         // the crate-stripped `module::Enum::Variant`.
                         let vsid = majit_ir::descr::StructId::from_canonical(&variant_canon);
-                        record_struct_id(&mut struct_ids, variant_qual.clone(), vsid);
-                        record_struct_id(&mut struct_ids, variant_leaf.clone(), vsid);
-                        record_struct_id(&mut struct_ids, variant_canon.clone(), vsid);
+                        record_struct_id(
+                            &mut struct_ids,
+                            &mut struct_fields.class_identity,
+                            variant_qual.clone(),
+                            vsid,
+                            &variant_canon,
+                        );
+                        record_struct_id(
+                            &mut struct_ids,
+                            &mut struct_fields.class_identity,
+                            variant_leaf.clone(),
+                            vsid,
+                            &variant_canon,
+                        );
+                        record_struct_id(
+                            &mut struct_ids,
+                            &mut struct_fields.class_identity,
+                            variant_canon.clone(),
+                            vsid,
+                            &variant_canon,
+                        );
                         if explicit_sum_shell {
                             let exact = crate::front::semantic::ExactLayout {
                                 size: Some(sum_shell_size(&voffsets)),
@@ -4838,7 +4970,13 @@ fn derive_program_metadata(
         known_struct_names.insert("Constants".to_string());
         let sid = majit_ir::descr::StructId::from_canonical("bytecode::Constants");
         for key in [compiler_constants_path, "bytecode::Constants", "Constants"] {
-            record_struct_id(&mut struct_ids, key.to_string(), sid);
+            record_struct_id(
+                &mut struct_ids,
+                &mut struct_fields.class_identity,
+                key.to_string(),
+                sid,
+                "bytecode::Constants",
+            );
         }
         struct_origins
             .entry("Constants".to_string())
@@ -4874,7 +5012,13 @@ fn derive_program_metadata(
         }
         let sid = majit_ir::descr::StructId::from_canonical(&num_complex_canon);
         for key in [num_complex_path, "Complex"] {
-            record_struct_id(&mut struct_ids, key.to_string(), sid);
+            record_struct_id(
+                &mut struct_ids,
+                &mut struct_fields.class_identity,
+                key.to_string(),
+                sid,
+                &num_complex_canon,
+            );
         }
         struct_origins.insert("Complex".to_string(), "num_complex".to_string());
         struct_field_attrs.insert(
@@ -4906,7 +5050,13 @@ fn derive_program_metadata(
         }
         let sid = majit_ir::descr::StructId::from_canonical(alloc_vec_path);
         for key in [alloc_vec_path, "Vec"] {
-            record_struct_id(&mut struct_ids, key.to_string(), sid);
+            record_struct_id(
+                &mut struct_ids,
+                &mut struct_fields.class_identity,
+                key.to_string(),
+                sid,
+                alloc_vec_path,
+            );
         }
         let word = crate::layout::target_word_size() as u64;
         let mut field_offsets = std::collections::HashMap::new();
@@ -4941,7 +5091,13 @@ fn derive_program_metadata(
         }
         let sid = majit_ir::descr::StructId::from_canonical("alloc::layout::Layout");
         for key in [layout_path, "alloc::layout::Layout", "Layout"] {
-            record_struct_id(&mut struct_ids, key.to_string(), sid);
+            record_struct_id(
+                &mut struct_ids,
+                &mut struct_fields.class_identity,
+                key.to_string(),
+                sid,
+                "alloc::layout::Layout",
+            );
         }
         let word = crate::layout::target_word_size() as u64;
         let mut field_offsets = std::collections::HashMap::new();
@@ -5350,9 +5506,24 @@ fn promote_cross_crate_stripped_keys(
         known_struct_names.remove(&stripped);
         struct_ids.insert(name.clone(), Some(new_sid));
         struct_ids.remove(&stripped);
+        struct_fields.class_identity.insert(
+            name.clone(),
+            Some(crate::front::semantic::ClassIdentity {
+                id: new_sid,
+                spelling: name.clone(),
+            }),
+        );
+        struct_fields.class_identity.remove(&stripped);
         let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
         if struct_ids.get(&leaf) == Some(&Some(old_sid)) {
             struct_ids.insert(leaf.clone(), Some(new_sid));
+            struct_fields.class_identity.insert(
+                leaf.clone(),
+                Some(crate::front::semantic::ClassIdentity {
+                    id: new_sid,
+                    spelling: name.clone(),
+                }),
+            );
         }
         let TypeDeclKind::Enum(variants) = &td.kind else {
             continue;
@@ -5371,11 +5542,26 @@ fn promote_cross_crate_stripped_keys(
             if let Some(rows) = struct_fields.remove_field(&old_key) {
                 struct_fields.fields.insert(new_key.clone(), rows);
             }
-            struct_ids.insert(new_key, Some(new_vsid));
+            struct_ids.insert(new_key.clone(), Some(new_vsid));
             struct_ids.remove(&old_key);
+            struct_fields.class_identity.insert(
+                new_key.clone(),
+                Some(crate::front::semantic::ClassIdentity {
+                    id: new_vsid,
+                    spelling: new_key.clone(),
+                }),
+            );
+            struct_fields.class_identity.remove(&old_key);
             let variant_leaf = format!("{leaf}::{}", v.name);
             if struct_ids.get(&variant_leaf) == Some(&Some(old_vsid)) {
-                struct_ids.insert(variant_leaf, Some(new_vsid));
+                struct_ids.insert(variant_leaf.clone(), Some(new_vsid));
+                struct_fields.class_identity.insert(
+                    variant_leaf,
+                    Some(crate::front::semantic::ClassIdentity {
+                        id: new_vsid,
+                        spelling: new_key,
+                    }),
+                );
             }
         }
     }

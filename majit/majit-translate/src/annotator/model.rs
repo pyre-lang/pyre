@@ -326,6 +326,9 @@ fn unresolved_option_none_name(name: &str) -> bool {
 }
 
 fn same_struct_identity(a: &str, b: &str) -> bool {
+    // Dots-to-`::` only. Aliases of one declaration intern under one
+    // `ClassDef.name` (`Bookkeeper.getdesc` / `intern_class_key`), so this
+    // fallback is for dotted leftovers that never interned.
     crate::annotator::bookkeeper::normalize_class_qualname(a)
         == crate::annotator::bookkeeper::normalize_class_qualname(b)
 }

@@ -8262,9 +8262,10 @@ mod tests {
             .classdef
             .as_ref()
             .expect("PyObject class_root must populate classdef");
-        // Dual-publish leaf `PyObject` is a lookup spelling of one class
-        // (`intern_key_from_registry` unique-first). The instance-not-string
-        // contract is the assertion below; the intern key is the origin.
+        // Dual-publish leaf `PyObject` is a lookup spelling of one class: it
+        // interns as its declaration `pyobject::PyObject` (`Bookkeeper.getdesc`
+        // keys on the class object). The instance-not-string contract is the
+        // assertion below.
         assert_eq!(classdef.borrow().name, "pyobject::PyObject");
 
         let projected_root_instance = bk.project_struct_field_type("PyObjectRef");

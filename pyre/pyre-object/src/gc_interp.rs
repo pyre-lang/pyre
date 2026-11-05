@@ -7,32 +7,27 @@
 //! instead makes those boxes collector-owned. JIT-compiled boxing already uses
 //! the managed nursery.
 //!
-//! The faithful fix is RPython's model: allocate young objects in the moving
-//! nursery and let the allocator trigger a minor collection when it fills. pyre
-//! cannot do that yet — the interpreter has no shadowstack pass, so a moving
-//! collection would relocate any live `PyObjectRef` held only on the Rust stack
-//! of a bytecode handler and leave it dangling (documented at
-//! `pyre/pyre-jit/src/eval.rs` `pyre_object_gc_collect_trampoline`).
+//! Interpreter ints and floats allocate young through
+//! [`crate::gc_hook::try_gc_alloc_nursery_raw`] (`w_int_gc_alloc`): a no-collect
+//! nursery bump that spills to old-gen when the nursery is full and arms
+//! `EB_GC`. The allocator itself does not collect; the dispatch-loop safepoint
+//! does.
 //!
-//! This module is the safe stepping stone: route the interpreter's int/float
-//! allocations through the *non-moving* old-gen (`try_gc_alloc_stable`, the same
-//! path set/type/instance boxes already use), so they become GC-tracked without
-//! the move hazard, and trigger a full mark-sweep at a bytecode-dispatch
-//! safepoint (loop top, where the only live refs are in the frame and reachable
-//! through the registered `pyframe` root walker). When to collect is not
-//! decided here: the safepoint asks the collector's own `threshold_reached`
-//! (incminimark.py), which weighs everything the collector is
-//! responsible for against the threshold `set_major_threshold_from`
-//! (incminimark.py) derived from the last major's survivors. Upstream
-//! asks that question in the allocator; pyre asks it here because here is where
-//! it can act on the answer.
+//! Automatic collection at that safepoint is `incminimark.py`
+//! `minor_collection_with_major_progress` with `force_enabled=False`
+//! (`do_collect_nursery`): a moving minor, then one bounded
+//! `major_collection_step`. The depth ≤ 2 gate ([`at_outermost_activation`])
+//! admits the module frame and one nested activation; a callback from a
+//! depth-1 opcode handler runs at depth 2 with that handler suspended.
+//! Assembler frames are rooted by gcmap. When to collect is not decided here:
+//! the safepoint asks the collector's own `threshold_reached` (incminimark.py),
+//! which weighs everything the collector is responsible for against the
+//! threshold `set_major_threshold_from` (incminimark.py) derived from the last
+//! major's survivors. Upstream asks that question in the allocator; pyre asks
+//! it here because here is where it can act on the answer.
 //!
-//! Enabled by default on every target. RPython never has a mode in which
-//! ordinary interpreter boxes sit outside the collector, and the full native
-//! synthetic corpus exercises this born-old stepping stone without a semantic
-//! or root-liveness failure. `PYRE_GC_INTERP=0` remains the explicit rollback
-//! switch while the translated shadow-stack pass replaces the stepping stone
-//! with ordinary moving-nursery allocation.
+//! Enabled by default on every target. `PYRE_GC_INTERP=0` remains the explicit
+//! rollback switch.
 
 use std::cell::Cell;
 use std::ffi::OsStr;
@@ -53,8 +48,7 @@ static EXPLICIT_OLDGEN_REQUEST: AtomicBool = AtomicBool::new(false);
 thread_local! {
     /// Number of interpreter eval-loop activations currently on this
     /// thread's call stack (both the plain `eval_loop` and the JIT
-    /// `eval_loop_jit`). The dispatch-loop safepoint consults it so
-    /// a collection only fires at the OUTERMOST activation — see
+    /// `eval_loop_jit`). The dispatch-loop safepoint consults it through
     /// [`at_outermost_activation`].
     static EVAL_NESTING: Cell<u32> = const { Cell::new(0) };
 }
@@ -117,17 +111,20 @@ impl Drop for EvalActivationGuard {
 
 /// Whether the safepoint may fire at this eval-loop nesting depth.
 ///
-/// Depth 1 = module-level loop, depth 2 = one called function's loop.
-/// Both are safe: a Python CALL opcode completes before re-entering the
-/// eval loop, so no opcode handler holds a Rust-stack `PyObjectRef` across
-/// the boundary; the pyframe root walker sees the full `CURRENT_FRAME` /
-/// `f_backref` chain.
+/// The gate admits the module frame (depth 1) and one nested activation
+/// (depth 2). A callback entered from a depth-1 opcode handler (FOR_ITER
+/// `__next__`, BINARY_OP `__add__`, a builtin calling back) runs at depth 2
+/// with that handler suspended.
 ///
-/// Depth ≥ 3 = a callback re-entry from inside an opcode handler (e.g.
-/// FOR_ITER → `__getitem__`, exception handler, `_sre.sub` callable,
-/// `sorted` key). The outer handler holds live `PyObjectRef`s on the
-/// Rust stack that the walker cannot reach — a collection would free
-/// still-reachable old-gen objects. Block the safepoint there.
+/// Handler references stay valid across a moving minor today because operands
+/// remain on the frame value stack or are pinned (`with_roots!`), the
+/// interpreter frame is a `FrameBox` (young-nonmoving), and the result push
+/// goes through `FrameAnchor`. A handler that writes the frame after a
+/// collecting call through the pre-call `&mut` relies on the frame not moving.
+/// Upstream roots every live variable around a collecting call and reloads it
+/// (`framework.py` `BaseFrameworkGCTransformer.gct_direct_call`,
+/// `shadowstack.py` `ShadowStackFrameworkGCTransformer.push_roots` /
+/// `pop_roots`).
 ///
 /// Reads the runtime-mutable `EVAL_NESTING` thread-local, not a build-time
 /// constant, so the JIT residualizes the call instead of tracing into it
@@ -252,9 +249,10 @@ fn enabled_from_env(value: Option<&OsStr>) -> bool {
 /// `gc.disable()` is among the questions. This is the automatic path, the one
 /// `incminimark.py` returns from while the flag is clear; only an
 /// explicit `gc.collect()` carries `force_enabled` past it. The collection this
-/// safepoint runs is `do_collect_oldgen_nonmoving`, which drives a full cycle
-/// whatever the flag says, so the flag has to be read here or a
-/// `gc.disable()` region would still be collected.
+/// safepoint runs is `do_collect_nursery` (`minor_collection_with_major_progress`
+/// with `force_enabled=False`): the minor still evacuates while disabled, so
+/// the flag has to be read here or a `gc.disable()` region would still be
+/// collected.
 ///
 /// Plain rather than `@dont_look_inside`: both callers are already outside
 /// traced code — [`safepoint`] is itself a residual, and the allocator reaches
@@ -268,8 +266,8 @@ pub fn would_collect() -> bool {
 }
 
 /// Dispatch-loop safepoint: when the collector says it has reached the
-/// threshold it set for its next major, run a non-moving old-gen-only major.
-/// A no-op when the flag is off or no collection hook is installed.
+/// threshold it set for its next major, run a moving minor plus one bounded
+/// major step. A no-op when the flag is off or no collection hook is installed.
 ///
 /// The decision is entirely the collector's. `threshold_reached`
 /// (incminimark.py) compares `get_total_memory_used()` — every byte
@@ -277,9 +275,8 @@ pub fn would_collect() -> bool {
 /// — against the threshold `set_major_threshold_from` (incminimark.py)
 /// derived from the last major's survivors under `major_collection_threshold`,
 /// `growth_rate_max`, `max_delta`, `min_heap_size` and `max_heap_size`. Running
-/// the collection re-derives it, because `do_collect_oldgen_nonmoving` drives
-/// `major_collection_step` to the end of the cycle and `finish_incremental_cycle`
-/// sets the next threshold there.
+/// the collection may re-derive it, because a major step that finishes a cycle
+/// calls `finish_incremental_cycle` and sets the next threshold there.
 ///
 /// The safepoint deliberately keeps no counter of its own. Upstream asks this
 /// question in the allocator, where every allocation passes; a second tally
@@ -287,7 +284,7 @@ pub fn would_collect() -> bool {
 /// that remembered to report, and would answer for a heap that is not the one
 /// being collected.
 ///
-/// Born-old allocations ask it in the allocator too, as `external_malloc`
+/// Nursery-spill allocations ask it in the allocator too, as `external_malloc`
 /// (incminimark.py) does, and hand the answer here through the
 /// eval-breaker word (`majit_gc::collector::take_deferred_major_request`).
 /// That path is what reaches compiled code: a trace runs its loop without
@@ -298,24 +295,22 @@ pub fn would_collect() -> bool {
 /// above. The allocator arms it only when [`would_collect`] holds, so the
 /// request cannot outlive the conditions that let this safepoint answer it.
 ///
-/// The collection is `try_gc_collect_oldgen` — it seeds roots, marks, and
-/// sweeps ONLY the old generation, never touching the nursery (not moved, not
-/// freed). So unlike `do_collect_full` (whose leading moving minor would
-/// relocate a Rust-stack nursery `PyObjectRef` with no shadowstack root) it is
-/// safe with a live nursery, and the `nursery_used == 0` gate is dropped — the
-/// reclamation can now fire under an active JIT, exactly when the interp-path
-/// old-gen leak accumulates. Reachability stays exact: the marker walks through
-/// nursery objects (`old -> nursery -> old` edges are followed) so no live old
-/// object is freed. A suspended compiled trace is no obstacle either: a trace
-/// suspends by making a residual call into the interpreter, and a call site is
-/// where the backend emits a gcmap, so `enumerate_root_walker_values` reaches
-/// the suspended frame's live refs by expanding each jitframe on the JF shadow
-/// stack through `trace_libc_jitframe`. That is the same basis on which
-/// upstream collects with compiled frames on the stack. The safepoint fires
-/// at the first two eval activations and no deeper
-/// ([`at_outermost_activation`]), so a Python callback re-entered from inside
-/// an opcode handler — whose Rust-stack roots the pyframe walker cannot see —
-/// never triggers it.
+/// The automatic collection is `try_gc_minor_with_major_progress` —
+/// `incminimark.py` `minor_collection_with_major_progress` with
+/// `force_enabled=False`. Assembler frames are rooted by gcmap, so a moving
+/// minor with jitframes on the stack is already the `CALL_MALLOC_NURSERY`
+/// overflow path. [`at_outermost_activation`] admits the module frame
+/// (depth 1) and one nested activation (depth 2); a callback entered from a
+/// depth-1 opcode handler runs at depth 2 with that handler suspended.
+/// Operands stay on the frame value stack or are pinned (`with_roots!`), the
+/// interpreter frame is a `FrameBox` (young-nonmoving), and the result push
+/// goes through `FrameAnchor`; a handler that writes the frame after a
+/// collecting call through the pre-call `&mut` relies on the frame not moving.
+/// Upstream roots every live variable around a collecting call and reloads it
+/// (`framework.py` `BaseFrameworkGCTransformer.gct_direct_call`,
+/// `shadowstack.py` `ShadowStackFrameworkGCTransformer.push_roots` /
+/// `pop_roots`). An explicit [`request_oldgen_collection`] still runs the
+/// non-moving old-gen major.
 ///
 /// Dispatches to the installed threshold and collection hooks, neither a
 /// build-time constant, so the JIT residualizes the call instead of tracing
@@ -352,7 +347,7 @@ pub fn safepoint() {
     // allocator armed it.
     if requested {
         if would_collect() {
-            crate::gc_hook::try_gc_collect_oldgen();
+            crate::gc_hook::try_gc_minor_with_major_progress();
         }
         return;
     }
@@ -419,7 +414,7 @@ fn collect_if_threshold_reached() {
         && at_outermost_activation()
         && crate::gc_hook::try_gc_major_threshold_reached()
     {
-        crate::gc_hook::try_gc_collect_oldgen();
+        crate::gc_hook::try_gc_minor_with_major_progress();
     }
 }
 
@@ -450,8 +445,69 @@ pub fn collect_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::collect_if_threshold_reached;
     use super::enabled_from_env;
+    use majit_gc::GcAllocator;
+    use majit_gc::collector::{GcConfig, MiniMarkGC};
+    use majit_gc::trace::TypeInfo;
+    use std::cell::RefCell;
     use std::ffi::OsStr;
+
+    thread_local! {
+        static SAFEPOINT_TEST_GC: RefCell<Option<MiniMarkGC>> = const { RefCell::new(None) };
+    }
+
+    fn safepoint_test_collect_oldgen() {
+        SAFEPOINT_TEST_GC.with(|cell| {
+            if let Some(gc) = cell.borrow_mut().as_mut() {
+                gc.do_collect_oldgen_nonmoving();
+            }
+        });
+    }
+
+    fn safepoint_test_collect_nursery() {
+        SAFEPOINT_TEST_GC.with(|cell| {
+            if let Some(gc) = cell.borrow_mut().as_mut() {
+                gc.do_collect_nursery();
+            }
+        });
+    }
+
+    fn safepoint_test_threshold_true() -> bool {
+        true
+    }
+
+    struct SafepointHookGuard;
+
+    impl Drop for SafepointHookGuard {
+        fn drop(&mut self) {
+            crate::gc_hook::clear_gc_collect_oldgen_hook();
+            crate::gc_hook::clear_gc_minor_with_major_progress_hook();
+            crate::gc_hook::clear_gc_major_threshold_reached_hook();
+            SAFEPOINT_TEST_GC.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+
+    fn install_safepoint_test_hooks(gc: MiniMarkGC) -> SafepointHookGuard {
+        SAFEPOINT_TEST_GC.with(|cell| *cell.borrow_mut() = Some(gc));
+        crate::gc_hook::register_gc_collect_oldgen_hook(safepoint_test_collect_oldgen);
+        crate::gc_hook::register_gc_minor_with_major_progress_hook(safepoint_test_collect_nursery);
+        crate::gc_hook::register_gc_major_threshold_reached_hook(safepoint_test_threshold_true);
+        SafepointHookGuard
+    }
+
+    fn with_safepoint_test_gc<R>(f: impl FnOnce(&mut MiniMarkGC) -> R) -> R {
+        SAFEPOINT_TEST_GC.with(|cell| f(cell.borrow_mut().as_mut().expect("safepoint test GC")))
+    }
+
+    fn fill_nursery_with_unrooted(gc: &mut MiniMarkGC, tid: u32, payload: usize) {
+        loop {
+            let obj = gc.try_alloc_with_type_no_collect(tid, payload);
+            if obj.is_null() || !gc.is_in_nursery(obj.0) {
+                break;
+            }
+        }
+    }
 
     #[test]
     fn interpreter_gc_is_default_on_with_explicit_off_switch() {
@@ -462,5 +518,74 @@ mod tests {
         // it must not select the leaking rollback path, nor — through the
         // `collect_enabled` sharing this predicate — silence the safepoint.
         assert!(enabled_from_env(Some(OsStr::new(""))));
+    }
+
+    /// Unreferenced nursery objects are reclaimed when the dispatch-loop
+    /// safepoint collects. Invokes [`collect_if_threshold_reached`], not
+    /// `do_collect_oldgen_nonmoving`.
+    #[test]
+    fn safepoint_collect_empties_nursery_of_dead_objects() {
+        let _hook_lock = crate::gc_hook::hook_test_guard();
+        const PAYLOAD: usize = 16;
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 2048,
+            ..GcConfig::default()
+        });
+        let tid = gc.register_type(TypeInfo::simple(PAYLOAD));
+        fill_nursery_with_unrooted(&mut gc, tid, PAYLOAD);
+        let used_before = gc.heap_byte_stats().1;
+        assert!(
+            used_before > 0,
+            "nursery must hold unrooted objects before the safepoint"
+        );
+
+        let _hooks = install_safepoint_test_hooks(gc);
+        collect_if_threshold_reached();
+
+        with_safepoint_test_gc(|gc| {
+            let used_after = gc.heap_byte_stats().1;
+            assert!(
+                used_after < used_before,
+                "safepoint collection must empty the nursery of dead objects, used {used_before} -> {used_after}"
+            );
+            let next = gc.try_alloc_with_type_no_collect(tid, PAYLOAD);
+            assert!(!next.is_null(), "a following bump must succeed");
+            assert!(
+                gc.is_in_nursery(next.0),
+                "a following bump must land in the nursery"
+            );
+        });
+    }
+
+    /// The safepoint collection is a minor plus at most one major step, not a
+    /// full `gc_step_until_scanning` pair. Starts in SCANNING below the
+    /// collector's own threshold so major progress is skipped; a non-moving
+    /// full cycle would still increment `major_collections`.
+    #[test]
+    fn safepoint_collect_is_minor_plus_one_major_step_not_full_cycle() {
+        let _hook_lock = crate::gc_hook::hook_test_guard();
+        let gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 2048,
+            ..GcConfig::default()
+        });
+        let minor_before = gc.minor_collections;
+        let major_before = gc.major_collections;
+
+        let _hooks = install_safepoint_test_hooks(gc);
+        collect_if_threshold_reached();
+
+        with_safepoint_test_gc(|gc| {
+            assert_eq!(
+                gc.minor_collections,
+                minor_before + 1,
+                "safepoint collection must run a moving minor"
+            );
+            assert_eq!(
+                gc.major_collections, major_before,
+                "safepoint collection must not finish a full major cycle"
+            );
+        });
     }
 }

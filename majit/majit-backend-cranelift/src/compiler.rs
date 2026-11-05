@@ -426,6 +426,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     ));
     majit_gc::set_active_total_memory_pressure(Some(total_memory_pressure_via_active_runtime));
     majit_gc::set_active_collect_oldgen(Some(collect_oldgen_nonmoving_via_active_runtime));
+    majit_gc::set_active_collect_nursery(Some(collect_nursery_via_active_runtime));
     majit_gc::set_active_heap_stats(Some(heap_stats_via_active_runtime));
     majit_gc::set_active_gc_memory_stats(Some(gc_memory_stats_via_active_runtime));
     majit_gc::set_active_major_threshold_reached(Some(major_threshold_reached_via_active_runtime));
@@ -1714,12 +1715,20 @@ fn total_memory_pressure_via_active_runtime() -> isize {
     with_cranelift_gc(|gc| gc.total_memory_pressure()).unwrap_or(0)
 }
 
-/// Non-moving old-gen-only major trampoline — sweeps dead old-gen objects
-/// without moving the nursery, so the interpreter safepoint can drive it under
-/// an active JIT (non-empty nursery). Unlike [`collect_generation_via_active_runtime`]
-/// it runs no minor, so a Rust-stack nursery PyObjectRef cannot dangle.
+/// Non-moving old-gen-only major trampoline. Nursery addresses stay put.
+/// Used by the explicit old-gen request and by `nonmoving_major_*` tests.
+/// Automatic dispatch-loop collection is [`collect_nursery_via_active_runtime`].
+/// The depth ≤ 2 gate exists because opcode-handler Rust locals are not
+/// rooted; assembler frames are rooted by gcmap.
 fn collect_oldgen_nonmoving_via_active_runtime() {
     with_cranelift_gc(|gc| gc.collect_oldgen_nonmoving());
+}
+
+/// Moving minor plus one bounded major step.
+/// `incminimark.py` `minor_collection_with_major_progress` with
+/// `force_enabled=False`.
+fn collect_nursery_via_active_runtime() {
+    with_cranelift_gc(|gc| gc.collect_nursery());
 }
 
 fn register_finalizer_via_active_runtime(fq_index: usize, obj: GcRef) {

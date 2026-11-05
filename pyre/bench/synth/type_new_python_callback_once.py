@@ -1,3 +1,4 @@
+# pyre-check: requires-modules=gc
 # pyre-check: max-pypy-ratio=10
 # macOS reads 3.1x on dynasm and 4.8x on cranelift.
 # Regression oracle: `type(name, bases, ns)` re-enters Python from inside
@@ -25,6 +26,7 @@
 # The four counters must equal what an interpreter counts, and the
 # checksums over the caught values, the forced locals and the traceback shape
 # match.
+import gc
 import sys
 
 N = 3600
@@ -180,6 +182,11 @@ def report(label, fn):
 
 
 def main():
+    # Promote Meta/Base/Named/Root and their maps out of the nursery before
+    # the loops compile. must_compile keys a failing ref GUARD_VALUE by
+    # address; a moving minor mid-warm-up restarts those counters and can
+    # compile one extra bridge (class_reassign_hot / mapdict_polymorphic_map_attr).
+    gc.collect()
     report('callee', through_callee)
     report('same', same_frame)
     # A second pass enters the loops and bridges the first one compiled.

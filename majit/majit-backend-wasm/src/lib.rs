@@ -1458,6 +1458,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_collect_generation(Some(wasm_collect_generation));
     majit_gc::set_active_collect_step(Some(wasm_collect_step));
     majit_gc::set_active_collect_oldgen(Some(wasm_collect_oldgen_nonmoving));
+    majit_gc::set_active_collect_nursery(Some(wasm_collect_nursery));
     majit_gc::set_active_heap_stats(Some(active_gc_heap_stats));
     majit_gc::set_active_gc_memory_stats(Some(active_gc_memory_stats));
     majit_gc::set_active_major_threshold_reached(Some(active_gc_major_threshold_reached));
@@ -1745,14 +1746,22 @@ fn wasm_collect_step() -> majit_gc::GcStepTransition {
     })
 }
 
-/// `majit_gc::CollectOldgenFn` installed by `set_gc_allocator`. Drives the
-/// interpreter-safepoint non-moving old-gen major (`gc_interp::safepoint`,
-/// default-on on wasm) through the active GC. Needs mutable access, so it
-/// routes via `with_wasm_active_gc_mut` (test box → box; production → the
-/// `gc_sync` singleton). Mirrors dynasm's `dynasm_collect_oldgen_nonmoving`
-/// and cranelift's `collect_oldgen_nonmoving_via_active_runtime`.
+/// `majit_gc::CollectOldgenFn` installed by `set_gc_allocator`. Non-moving
+/// old-gen major; nursery addresses stay put. Used by the explicit old-gen
+/// request and by `nonmoving_major_*` tests. Automatic dispatch-loop
+/// collection is [`wasm_collect_nursery`]. The depth ≤ 2 gate exists because
+/// opcode-handler Rust locals are not rooted; assembler frames are rooted
+/// by gcmap. Routes via `with_wasm_active_gc_mut` (test box → box;
+/// production → the `gc_sync` singleton).
 fn wasm_collect_oldgen_nonmoving() {
     with_wasm_active_gc_mut(|gc| gc.collect_oldgen_nonmoving());
+}
+
+/// Moving minor plus one bounded major step.
+/// `incminimark.py` `minor_collection_with_major_progress` with
+/// `force_enabled=False`.
+fn wasm_collect_nursery() {
+    with_wasm_active_gc_mut(|gc| gc.collect_nursery());
 }
 
 fn wasm_get_objects(generation: i8, visitor: majit_gc::GetObjectsVisitorFn) {
