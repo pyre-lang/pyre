@@ -8,6 +8,8 @@ use majit_gc::{
 };
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
+// The active finalizer-queue getter is process-global; tests that install it or resolve through it hold this lock.
+static GLOBAL_FQ_HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static FQ: u8 = 0;
 static POPPED: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_TABLE: AtomicPtr<majit_gc::FinalizerQueueTable> =
@@ -80,6 +82,7 @@ fn two_collectors_number_finalizer_queue_indexes_independently() {
 /// re-entering the collector.
 #[test]
 fn trigger_looks_up_index_and_pops_without_collector_reentry() {
+    let _guard = GLOBAL_FQ_HOOK.lock().unwrap_or_else(|e| e.into_inner());
     POPPED.store(0, Ordering::Relaxed);
     let mut gc = MiniMarkGC::new();
     ACTIVE_TABLE.store(
@@ -106,6 +109,7 @@ fn trigger_looks_up_index_and_pops_without_collector_reentry() {
 /// descr still numbers a tag when no framework collector is installed.
 #[test]
 fn host_heap_numbers_finalizer_queue_indexes_without_a_collector() {
+    let _guard = GLOBAL_FQ_HOOK.lock().unwrap_or_else(|e| e.into_inner());
     fn dummy() {}
     static HOST_FQ: u8 = 0;
     std::thread::spawn(|| {
