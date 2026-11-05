@@ -197,6 +197,13 @@ pub fn ensure_lazy_pending_submodules() -> PyObjectRef {
     d
 }
 
+/// Reset to the default value. Used by unit tests that need a clean
+/// recursion-limit state between runs.
+#[cfg(test)]
+pub fn reset_recursion_limit_for_tests() {
+    RECURSION_LIMIT.store(DEFAULT_RECURSION_LIMIT as usize, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -208,11 +215,4 @@ mod tests {
         super::set_int_max_str_digits(super::DEFAULT_MAX_STR_DIGITS).unwrap();
         assert!(super::set_int_max_str_digits(1).is_err());
     }
-}
-
-/// Reset to the default value. Used by unit tests that need a clean
-/// recursion-limit state between runs.
-#[cfg(test)]
-pub fn reset_recursion_limit_for_tests() {
-    RECURSION_LIMIT.store(DEFAULT_RECURSION_LIMIT as usize, Ordering::Relaxed);
 }

@@ -1863,7 +1863,7 @@ fn dict_update_from_pairs(w_dict: PyObjectRef, items: PyObjectRef) -> Result<PyO
     let n = unsafe {
         pyre_object::listobject::w_list_len(pyre_object::gc_roots::shadow_stack_get(base + 1))
     };
-    if n % 2 != 0 {
+    if !n.is_multiple_of(2) {
         return Err(unpickling_error("odd number of items for DICT"));
     }
     let mut i = 0;

@@ -3281,10 +3281,12 @@ pub(crate) fn is_some_constant_type(s: &SomeValue) -> bool {
 /// `(SomeType, SomeConstantType)` / `(SomeConstantType, SomeType)` twins.
 fn union_some_type_pair(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
     let mut result = SomeType::new();
-    if s1.is_immutable_constant() && s2.is_immutable_constant() && s1.const_() == s2.const_() {
-        if let Some(c) = s1.const_() {
-            result.base.const_box = Some(Constant::new(c.clone()));
-        }
+    if s1.is_immutable_constant()
+        && s2.is_immutable_constant()
+        && s1.const_() == s2.const_()
+        && let Some(c) = s1.const_()
+    {
+        result.base.const_box = Some(Constant::new(c.clone()));
     }
     Ok(SomeValue::Type(result))
 }
@@ -5393,8 +5395,8 @@ mod tests {
             panic!("expected SomeTypeOf");
         };
         assert_eq!(joined.is_type_of.len(), 2);
-        assert!(joined.is_type_of.iter().any(|v| *v == v1));
-        assert!(joined.is_type_of.iter().any(|v| *v == v2));
+        assert!(joined.is_type_of.contains(&v1));
+        assert!(joined.is_type_of.contains(&v2));
 
         let again = SomeValue::TypeOf(SomeTypeOf::new(vec![Rc::clone(&v1)]));
         let SomeValue::TypeOf(same) = union(&a, &again).expect("same var once") else {

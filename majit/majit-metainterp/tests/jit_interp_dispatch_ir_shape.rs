@@ -2092,8 +2092,7 @@ mod oparg_with_body_local_state_le_green {
 /// The shape test pins the canonical `call_pure_int_canonical_via_target`
 /// emission (`BC_RESIDUAL_CALL_IR_I` because receiver=Ref + pc=Int) to
 /// land BEFORE `BC_JIT_MERGE_POINT(_C)` and threads its result reg
-/// forward through `BC_INT_LE` and finally A.3.5's `BC_INT_GUARD_VALUE`
-/// + greens_i payload byte, so future refactors of
+/// forward through `BC_INT_LE` and finally A.3.5's `BC_INT_GUARD_VALUE` + greens_i payload byte, so future refactors of
 ///   `lower_method_call_value` (A.3.6.2) cannot silently regress the chain.
 ///
 /// RPython parity: `jtransform.py handle_residual_call`
@@ -2997,7 +2996,7 @@ mod degraded_arm_is_named_at_install {
             .descrs
             .iter()
             .filter_map(|descr| descr.as_jitcode())
-            .filter(|sub| sub.code.iter().any(|&b| b == BC_ABORT))
+            .filter(|sub| sub.code.contains(&BC_ABORT))
             .count();
         let arms = recorded_arms();
         assert_eq!(

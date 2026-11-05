@@ -3245,7 +3245,7 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
             ),
             make_op(
                 OpCode::IntAdd,
-                &[OpRef::int_op(base + 2), OpRef::const_int(0x5a5a_007)],
+                &[OpRef::int_op(base + 2), OpRef::const_int(0x05a5_a007)],
                 OpRef::int_op(base + 4),
             ),
             Op::new(
@@ -4657,7 +4657,7 @@ fn parameter_entry_does_not_arm_guard_param_dispatch() {
     assert_eq!(guards.len(), 2, "GuardTrue and Finish");
     let types = return_call_indirect_type_indices(&bytes);
     assert!(
-        types.iter().any(|&t| t == 0),
+        types.contains(&0),
         "frame-entry epilogue uses type 0, got {types:?}"
     );
     assert!(
@@ -11385,7 +11385,7 @@ fn inline_newarray_clear_fills_when_an_item_is_unwritten() {
     );
     let fills = memory_fill_lengths(&bytes);
     assert!(
-        fills.iter().any(|&n| n == 8),
+        fills.contains(&8),
         "emit_pending_zeros trims the written prefix; leftover is one item (8 bytes), got {fills:?}"
     );
 }

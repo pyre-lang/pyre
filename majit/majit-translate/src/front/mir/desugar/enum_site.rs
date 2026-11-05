@@ -578,7 +578,7 @@ impl<'a> Lowering<'a> {
 
     /// Resolve a recognized `<[T]>::get(slice, i)` call into a
     /// [`crate::front::slice_get::SliceGetSite`] — the same `Option` enum root
-    /// + `Some` variant owners [`Self::recognize_slice_first_site`] resolves,
+    /// plus `Some` variant owners [`Self::recognize_slice_first_site`] resolves,
     /// plus the `SliceIndex` instantiation gate `first` has no need of.
     ///
     /// The call site has already proved the `SliceIndex` instantiation is

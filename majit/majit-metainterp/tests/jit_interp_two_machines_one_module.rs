@@ -14,6 +14,7 @@
 //! array (`codegen_state.rs` `let supports_fresh_alloc`). So:
 //!   * `CounterState` is scalars-only  -> supports_fresh_alloc = FALSE (3 idents)
 //!   * `StackState`   has one virt array -> supports_fresh_alloc = TRUE (5 idents)
+//!
 //! Adding a machine here without checking which side of that predicate it falls
 //! on re-opens the hole this fixture exists to close.
 //!
@@ -80,8 +81,8 @@ pub fn mainloop_counter(program: &Bytecode, inputarg: i64, threshold: u32) -> i6
 
         match opcode {
             C_ADD => {
-                state.acc = state.acc + state.n;
-                state.n = state.n - 1;
+                state.acc += state.n;
+                state.n -= 1;
             }
             C_BR_COND => {
                 let offset = program[pc] as i8 as i64;
@@ -157,10 +158,10 @@ pub fn mainloop_stack(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 
                 let value = program[pc] as i8 as i64;
                 pc += 1;
                 state.stack[state.stackpos as usize] = value;
-                state.stackpos = state.stackpos + 1;
+                state.stackpos += 1;
             }
             POP => {
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             SWAP => {
                 let a = state.stack[(state.stackpos - 1) as usize];
@@ -173,25 +174,25 @@ pub fn mainloop_stack(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 
                 pc += 1;
                 let v = state.stack[(state.stackpos as usize) - i - 1];
                 state.stack[state.stackpos as usize] = v;
-                state.stackpos = state.stackpos + 1;
+                state.stackpos += 1;
             }
             ADD => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = b + a;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             SUB => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = b - a;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             BR_COND => {
                 let offset = program[pc] as i8 as i64;
                 let target = ((pc as i64) + offset + 1) as usize;
                 pc += 1;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
                 let jump = state.stack[state.stackpos as usize] != 0;
                 if jump {
                     if target <= pc {
@@ -204,13 +205,13 @@ pub fn mainloop_stack(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 
             RETURN => break,
             PUSHARG => {
                 state.stack[state.stackpos as usize] = inputarg;
-                state.stackpos = state.stackpos + 1;
+                state.stackpos += 1;
             }
             _ => {}
         }
     }
 
-    state.stackpos = state.stackpos - 1;
+    state.stackpos -= 1;
     state.stack[state.stackpos as usize]
 }
 

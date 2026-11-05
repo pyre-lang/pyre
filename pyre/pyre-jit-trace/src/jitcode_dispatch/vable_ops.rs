@@ -1964,8 +1964,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
-/// `arraylen_vable/rdd>i` handler. Operand layout `rdd>i`: 1B r-reg(vable)
-/// + 2B fdescr(VableArray) + 2B adescr(Array) + 1B i-dst.
+/// `arraylen_vable/rdd>i` handler. Operand layout `rdd>i`: 1B r-reg(vable) + 2B fdescr(VableArray) + 2B adescr(Array) + 1B i-dst.
 ///
 /// RPython parity: `pyjitpl.py opimpl_arraylen_vable`.
 /// Delegates to `TraceCtx::vable_arraylen_vable` (`trace_ctx.rs`)

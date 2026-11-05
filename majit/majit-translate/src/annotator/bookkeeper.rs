@@ -4033,12 +4033,12 @@ impl Bookkeeper {
                 let is_entry = template_leaf == "Entry"
                     && (stripped.ends_with("rordereddict_entries::Entry")
                         || stripped.as_ref() == "Entry");
-                if stripped.as_ref() != lookup.as_str() && is_entry {
-                    if reg.fields.contains_key(stripped.as_ref())
-                        && !seen.contains(stripped.as_ref())
-                    {
-                        return Some(stripped.into_owned());
-                    }
+                if stripped.as_ref() != lookup.as_str()
+                    && is_entry
+                    && reg.fields.contains_key(stripped.as_ref())
+                    && !seen.contains(stripped.as_ref())
+                {
+                    return Some(stripped.into_owned());
                 }
                 // The registry publishes a full declaration path and a bare
                 // convenience alias.  `harden_duplicate_leaf_metadata`
@@ -5533,10 +5533,6 @@ impl Bookkeeper {
             false,
             false,
         );
-        #[expect(
-            clippy::if_same_then_else,
-            reason = "model.py SomeDict = SomeOrderedDict; both arms construct the rebound type"
-        )]
         let mut result = if is_ordered {
             SomeOrderedDict::new(dictdef.clone())
         } else {

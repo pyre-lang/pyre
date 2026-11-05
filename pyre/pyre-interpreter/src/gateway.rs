@@ -499,7 +499,6 @@ pub struct ApplevelCache {
     pub base: GatewayCache,
 }
 
-#[allow(non_camel_case_types)]
 pub use pyre_object::gateway::interp2app;
 
 #[allow(non_camel_case_types)]
@@ -1892,9 +1891,7 @@ fn starargs_constructor_type_name(
     {
         return None;
     }
-    let Some(arg0) = sig.argnames.first().map(|name| name.as_ref()) else {
-        return None;
-    };
+    let arg0 = sig.argnames.first().map(|name| name.as_ref())?;
     if arg0 != "self" && arg0 != "cls" {
         return None;
     }

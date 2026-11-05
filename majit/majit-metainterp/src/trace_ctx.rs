@@ -96,8 +96,7 @@ fn bh_field_flag(f: &dyn majit_ir::descr::FieldDescr) -> majit_ir::ArrayFlag {
 /// analogue of [`descr_to_bh_field_descr`].
 ///
 /// `bh_getarrayitem_gc_*` consumes the descr through
-/// `unpack_arraydescr_size` (`base_size`, `itemsize`, `is_item_signed`)
-/// + the `array_base_size()` accessor for Ref/Float reads; the
+/// `unpack_arraydescr_size` (`base_size`, `itemsize`, `is_item_signed`) + the `array_base_size()` accessor for Ref/Float reads; the
 ///   remaining `BhDescr::Array` fields are placeholder defaults the load
 ///   path never reads.  Returns `None` for non-array descrs.
 fn descr_to_bh_array_descr(descr: &DescrRef) -> Option<majit_jitcode::jitcode::BhDescr> {
@@ -6100,8 +6099,7 @@ impl TraceCtx {
     /// `compile.py patch_new_loop_to_load_virtualizable_fields`
     /// mirrored at the call site instead of the callee preamble.
     ///
-    /// Emits `GETFIELD_GC` for every static field and `GETFIELD_GC_R`
-    /// + `GETARRAYITEM_GC` for every array item of the virtualizable
+    /// Emits `GETFIELD_GC` for every static field and `GETFIELD_GC_R` + `GETARRAYITEM_GC` for every array item of the virtualizable
     ///   referenced by `vable`. Returns the freshly recorded OpRefs in
     ///   `[scalar_0, ..., scalar_{N-1}, array_0_item_0, ...,
     /// array_K_item_M]` order — the callee inputarg order minus the
@@ -7700,10 +7698,6 @@ impl TraceCtx {
     /// the virtualizable array, making `OutOfVable` an invariant violation on
     /// that path. Graceful handling belongs to dispatcher/walker callers that
     /// have a trace to abort.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
-    )]
     /// The array half of `virtualizable.py write_boxes`, emitted into the trace
     /// for one array field of the STANDARD virtualizable.
     ///

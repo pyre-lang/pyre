@@ -640,7 +640,7 @@ pub fn do_stringformat(hop: &HighLevelOp) -> RTypeResult {
                     }
                 }
                 FmtChunk::Literal(text) => {
-                    let p = const_str_cache_llstr(&text).map_err(TyperError::message)?;
+                    let p = const_str_cache_llstr(text).map_err(TyperError::message)?;
                     Hlvalue::Constant(Constant::with_concretetype(
                         ConstValue::LLPtr(Box::new(p)),
                         STRPTR.clone(),

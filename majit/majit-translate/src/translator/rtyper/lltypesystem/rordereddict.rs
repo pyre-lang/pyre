@@ -2047,7 +2047,6 @@ impl OrderedDictRepr {
             let clear_indexes_const = clear_indexes_const.clone();
             let store_clean_fns = store_clean_fns.clone();
             let keyhash_fn = hash_fn_const.clone();
-            let hash_takes_dict = hash_takes_dict;
             rtyper.lowlevel_helper_function_with_builder(
                 "ll_dict_reindex",
                 vec![dict_ptr.clone(), LowLevelType::Signed],
@@ -2072,7 +2071,6 @@ impl OrderedDictRepr {
             let entries_ptr = entries_ptr.clone();
             let reindex_const = reindex_const.clone();
             let keyhash_fn = hash_fn_const.clone();
-            let hash_takes_dict = hash_takes_dict;
             rtyper.lowlevel_helper_function_with_builder(
                 "ll_dict_rehash_after_translation",
                 vec![dict_ptr.clone()],
@@ -9674,10 +9672,6 @@ pub(crate) fn build_ll_dict_del_helper_graph(
 /// if index < 0: raise KeyError
 /// _ll_dict_del(d, hash, index)
 /// ```
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Parameter order mirrors ll_dict_delitem; hash_takes_dict selects ll_keyhash_custom(d, key)"
-)]
 pub(crate) fn build_ll_dict_delitem_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
@@ -14159,7 +14153,7 @@ mod tests {
                     };
                     if let Hlvalue::Variable(v) = hl {
                         assert!(
-                            defined.iter().any(|d| *d == v),
+                            defined.contains(&v),
                             "link[{link_i}].args[{arg_i}] variable {} is not defined in the source block",
                             v.name()
                         );
@@ -18484,7 +18478,7 @@ mod tests {
     fn ll_dict_setitem_grows_and_every_key_is_found() {
         let repr = signed_signed_ordered_dict_repr();
         let mut d = ll_newdict_size(&repr.DICT, 4).expect("ll_newdict_size");
-        let n = (DICT_INITSIZE * 2) as i64;
+        let n = DICT_INITSIZE * 2;
         for i in 0..n {
             ll_dict_setitem(
                 &mut d,

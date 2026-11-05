@@ -1142,6 +1142,7 @@ pub(crate) fn host() -> Arc<Platform> {
 }
 
 /// `is_host_build`: `host == platform` via `Platform.__eq__`.
+#[cfg_attr(not(test), expect(dead_code))] // rpython/translator/platform/__init__.py is_host_build
 pub(crate) fn is_host_build() -> bool {
     *host() == *platform()
 }
@@ -1163,6 +1164,7 @@ pub(crate) fn pick_platform(new_platform: &str, cc: Option<String>) -> Result<Pl
 
 /// `set_platform(new_platform, cc)`: rebind `platform`, and `host` when
 /// `new_platform == "host"`.
+#[cfg_attr(not(test), expect(dead_code))] // rpython/translator/platform/__init__.py set_platform
 pub(crate) fn set_platform(new_platform: &str, cc: Option<String>) -> Result<(), String> {
     ensure_initialised();
     let plat = pick_platform(new_platform, cc.clone())?;
@@ -1627,6 +1629,7 @@ fn host_class_name() -> &'static str {
 
 /// `BasePosix.relevant_environ` / `MsvcPlatform.relevant_environ`.
 /// `MingwPlatform` inherits `BasePosix.relevant_environ`.
+#[cfg(test)]
 pub(crate) fn host_relevant_environ() -> &'static [&'static str] {
     match host_family() {
         HostFamily::Msvc => windows::RELEVANT_ENVIRON,
@@ -1746,10 +1749,10 @@ pub fn execute(
         command.envs(env);
         // Windows programs often require SystemRoot.
         #[cfg(windows)]
-        if !env.contains_key("SystemRoot") {
-            if let Ok(system_root) = std::env::var("SystemRoot") {
-                command.env("SystemRoot", system_root);
-            }
+        if !env.contains_key("SystemRoot")
+            && let Ok(system_root) = std::env::var("SystemRoot")
+        {
+            command.env("SystemRoot", system_root);
         }
     }
 

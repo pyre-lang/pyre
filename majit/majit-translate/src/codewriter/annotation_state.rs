@@ -21,7 +21,6 @@ use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
 /// Classdef-less `Ref` shells are not counted in a thread-local.
 /// A `SomeInstance` carries its `classdef` only when the caller has a
 /// `Bookkeeper` (`Bookkeeper::getuniqueclassdef`). This projector does not.
-
 fn record_ref_payload(payload: Option<&str>) {
     let _ = payload;
 }

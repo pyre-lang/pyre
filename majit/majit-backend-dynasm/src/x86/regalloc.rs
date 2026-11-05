@@ -604,12 +604,10 @@ impl<'a> RegAlloc<'a> {
                     let f = crate::regloc::FrameLoc::new(pos, ebp_offset, is_float);
                     self.fm.add_frame_pos_hint(arg, f, &mut self.longevity);
                 }
-                TargetArgLoc::Reg { regnum, is_xmm } => {
-                    if !hinted.contains(arg) {
-                        hinted.push(arg.clone());
-                        let r = crate::regloc::RegLoc::new(regnum, is_xmm);
-                        self.longevity.fixed_register(position, r, Some(arg));
-                    }
+                TargetArgLoc::Reg { regnum, is_xmm } if !hinted.contains(arg) => {
+                    hinted.push(arg.clone());
+                    let r = crate::regloc::RegLoc::new(regnum, is_xmm);
+                    self.longevity.fixed_register(position, r, Some(arg));
                 }
                 _ => {}
             }
@@ -1813,7 +1811,6 @@ impl<'a> RegAlloc<'a> {
 
         let result_tp = op.opcode.result_type();
         let result_loc = if result_tp != Type::Void {
-            let dst = dst;
             let r = if result_tp == Type::Float {
                 self.xrm.after_call(dst, &mut self.longevity)
             } else {
@@ -1872,7 +1869,6 @@ impl<'a> RegAlloc<'a> {
 
         let result_tp = op.opcode.result_type();
         let result_loc = if result_tp != Type::Void {
-            let dst = dst;
             let r = if result_tp == Type::Float {
                 self.xrm.after_call(dst, &mut self.longevity)
             } else {
@@ -1919,7 +1915,6 @@ impl<'a> RegAlloc<'a> {
 
         let result_tp = op.opcode.result_type();
         let result_loc = if result_tp != Type::Void {
-            let dst = dst;
             let r = if result_tp == Type::Float {
                 self.xrm.after_call(dst, &mut self.longevity)
             } else {
@@ -2166,11 +2161,9 @@ impl<'a> RegAlloc<'a> {
                         self.fm
                             .add_frame_pos_hint(iarg, frame_loc, &mut self.longevity);
                     }
-                    Loc::Reg(r) => {
-                        if !hinted.contains(iarg) {
-                            hinted.push(iarg.clone());
-                            self.longevity.fixed_register(position, r, Some(iarg));
-                        }
+                    Loc::Reg(r) if !hinted.contains(iarg) => {
+                        hinted.push(iarg.clone());
+                        self.longevity.fixed_register(position, r, Some(iarg));
                     }
                     _ => {}
                 }

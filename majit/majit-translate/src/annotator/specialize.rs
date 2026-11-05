@@ -265,21 +265,21 @@ pub fn default_specialize(
         let Some(s_obj) = slot else {
             continue;
         };
-        if let SomeValue::Instance(inst) = s_obj {
-            if inst.flags.contains_key("access_directly") {
-                if jit_look_inside {
-                    access_directly = true;
-                    key = GraphCacheKey::Tuple(vec![GraphCacheKey::AccessDirect, key.clone()]);
-                    break;
-                } else {
-                    let mut new_flags = inst.flags.clone();
-                    new_flags.remove("access_directly");
-                    *slot = Some(SomeValue::Instance(SomeInstance::new(
-                        inst.classdef.clone(),
-                        inst.can_be_none,
-                        new_flags,
-                    )));
-                }
+        if let SomeValue::Instance(inst) = s_obj
+            && inst.flags.contains_key("access_directly")
+        {
+            if jit_look_inside {
+                access_directly = true;
+                key = GraphCacheKey::Tuple(vec![GraphCacheKey::AccessDirect, key.clone()]);
+                break;
+            } else {
+                let mut new_flags = inst.flags.clone();
+                new_flags.remove("access_directly");
+                *slot = Some(SomeValue::Instance(SomeInstance::new(
+                    inst.classdef.clone(),
+                    inst.can_be_none,
+                    new_flags,
+                )));
             }
         }
     }

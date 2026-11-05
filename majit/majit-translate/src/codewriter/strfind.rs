@@ -1435,9 +1435,7 @@ mod tests {
             .transform(&lower_graph(&find_char_flow));
         let (find_effects, find_addrs) = residual_effect_and_fnaddrs(&find_char_xf.graph);
         assert!(
-            find_effects
-                .iter()
-                .any(|effect| *effect == ExtraEffect::ElidableCannotRaise),
+            find_effects.contains(&ExtraEffect::ElidableCannotRaise),
             "ll_find_char residual is ElidableCannotRaise: {find_effects:?}"
         );
         assert!(
@@ -1548,9 +1546,7 @@ mod tests {
         );
         let (find_effects, _) = residual_effect_and_fnaddrs(&find_xf.graph);
         assert!(
-            find_effects
-                .iter()
-                .any(|effect| *effect == ExtraEffect::ElidableCannotRaise),
+            find_effects.contains(&ExtraEffect::ElidableCannotRaise),
             "ll_find_char residual is ElidableCannotRaise: {find_effects:?}"
         );
 
@@ -1741,9 +1737,7 @@ mod tests {
         );
         let (find_effects, find_addrs) = residual_effect_and_fnaddrs(&find_xf.graph);
         assert!(
-            find_effects
-                .iter()
-                .any(|effect| *effect == ExtraEffect::ElidableCannotRaise),
+            find_effects.contains(&ExtraEffect::ElidableCannotRaise),
             "ll_find_char residual is ElidableCannotRaise: {find_effects:?}"
         );
         assert!(
@@ -1863,12 +1857,12 @@ mod tests {
                 if matches!(op.kind, OpKind::NewArray { .. }) {
                     return true;
                 }
-                if let OpKind::Call { target, .. } = &op.kind {
-                    if let Some(segs) = target.path_segments() {
-                        let nested = CallPath::from_segments(segs);
-                        if walk(cc, &nested, seen) {
-                            return true;
-                        }
+                if let OpKind::Call { target, .. } = &op.kind
+                    && let Some(segs) = target.path_segments()
+                {
+                    let nested = CallPath::from_segments(segs);
+                    if walk(cc, &nested, seen) {
+                        return true;
                     }
                 }
             }
@@ -1934,9 +1928,7 @@ mod tests {
         );
         let (find_effects, find_addrs) = residual_effect_and_fnaddrs(&find_xf.graph);
         assert!(
-            find_effects
-                .iter()
-                .any(|effect| *effect == ExtraEffect::ElidableCannotRaise),
+            find_effects.contains(&ExtraEffect::ElidableCannotRaise),
             "UNICODE ll_find_char residual is ElidableCannotRaise: {find_effects:?}"
         );
         assert!(

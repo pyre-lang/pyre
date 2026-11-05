@@ -5210,7 +5210,7 @@ mod tests {
 
         let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
         let llbc = crate::test_support::load_ullbc(path);
-        let cg = super::super::framework::build(&llbc);
+        let cg = super::super::framework::build(llbc);
         let push: HashSet<u64> = cg
             .names
             .iter()
@@ -5222,8 +5222,8 @@ mod tests {
                 continue;
             };
             let stripped = strip_cleanup_blocks(fd.unstructured().expect("Unstructured body"));
-            let retained = helper_body_fact(&llbc, &body, &push, &cg.names);
-            let stripped_fact = helper_body_fact(&llbc, &stripped, &push, &cg.names);
+            let retained = helper_body_fact(llbc, &body, &push, &cg.names);
+            let stripped_fact = helper_body_fact(llbc, &stripped, &push, &cg.names);
             match (retained, stripped_fact) {
                 (None, None) => {}
                 (Some(a), Some(b)) => {

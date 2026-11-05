@@ -93,16 +93,17 @@ fn getfield_gc_i(
     descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
     use majit_ir::Value;
-    if obj.is_constant() && descr.is_always_pure() {
-        if let Some(Value::Ref(struct_ref)) = ctx.box_value(obj) {
-            let struct_ptr = struct_ref.0 as i64;
-            if struct_ptr != 0 && struct_ptr != usize::MAX as i64 {
-                if let Some(Value::Int(n)) =
-                    ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int)
-                {
-                    return ctx.const_int(n);
-                }
-            }
+    if obj.is_constant()
+        && descr.is_always_pure()
+        && let Some(Value::Ref(struct_ref)) = ctx.box_value(obj)
+    {
+        let struct_ptr = struct_ref.0 as i64;
+        if struct_ptr != 0
+            && struct_ptr != usize::MAX as i64
+            && let Some(Value::Int(n)) =
+                ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int)
+        {
+            return ctx.const_int(n);
         }
     }
     getfield_gc_i_pureornot(ctx, obj, descr)
@@ -327,16 +328,17 @@ fn getfield_gc_f(
     descr: majit_ir::DescrRef,
 ) -> majit_ir::OpRef {
     use majit_ir::Value;
-    if obj.is_constant() && descr.is_always_pure() {
-        if let Some(Value::Ref(struct_ref)) = ctx.box_value(obj) {
-            let struct_ptr = struct_ref.0 as i64;
-            if struct_ptr != 0 && struct_ptr != usize::MAX as i64 {
-                if let Some(Value::Float(f)) =
-                    ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Float)
-                {
-                    return ctx.const_float(f.to_bits() as i64);
-                }
-            }
+    if obj.is_constant()
+        && descr.is_always_pure()
+        && let Some(Value::Ref(struct_ref)) = ctx.box_value(obj)
+    {
+        let struct_ptr = struct_ref.0 as i64;
+        if struct_ptr != 0
+            && struct_ptr != usize::MAX as i64
+            && let Some(Value::Float(f)) =
+                ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Float)
+        {
+            return ctx.const_float(f.to_bits() as i64);
         }
     }
     getfield_gc_f_pureornot(ctx, obj, descr)

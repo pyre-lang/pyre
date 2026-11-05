@@ -1193,7 +1193,7 @@ pub(crate) fn remap_op_kind(
         },
         OpKind::LoweredBlackholeOp { opname, args } => OpKind::LoweredBlackholeOp {
             opname: opname.clone(),
-            args: args.iter().map(|a| a.map_value(&remap_var)).collect(),
+            args: args.iter().map(|a| a.map_value(remap_var)).collect(),
         },
         OpKind::LoadStatic {
             segments,

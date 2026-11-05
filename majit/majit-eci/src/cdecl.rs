@@ -93,12 +93,11 @@ pub fn functype_result(
         Type::Path(type_path) if type_path.qself.is_none() => {
             match resolve(&type_path.path, &target_module) {
                 Some(Resolved::LocalStruct(_)) => return Err(container_msg.into()),
-                Some(Resolved::Extern(p)) => {
+                Some(Resolved::Extern(p))
                     if p.last()
-                        .is_some_and(|last| STRUCT_TAGS.contains(&last.as_str()))
-                    {
-                        return Err(container_msg.into());
-                    }
+                        .is_some_and(|last| STRUCT_TAGS.contains(&last.as_str())) =>
+                {
+                    return Err(container_msg.into());
                 }
                 _ => {}
             }

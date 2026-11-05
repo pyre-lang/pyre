@@ -101,7 +101,7 @@ fn dispatch_pool(program: &Bytecode, threshold: u32, pools: usize, ticks: i64) -
                 state.total = state.total + state.selected.value;
             }
             OP_TICK => {
-                state.ticks = state.ticks - 1i64;
+                state.ticks -= 1i64;
                 if state.ticks != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;

@@ -1470,10 +1470,6 @@ impl FunctionRepr {
     /// RPython `FunctionRepr(rtyper, s_pbc)` — inherits `__init__` from
     /// `FunctionReprBase` and sets `lowleveltype = Void` as a
     /// class-level attribute (rpbc.py).
-    #[expect(
-        clippy::arc_with_non_send_sync,
-        reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
-    )]
     pub fn new(rtyper: &Rc<RPythonTyper>, s_pbc: SomePBC) -> Result<Arc<Self>, TyperError> {
         let base = FunctionReprBase::new(rtyper, s_pbc)?;
         Ok(Arc::new_cyclic(|weak| FunctionRepr {
@@ -2146,10 +2142,6 @@ pub struct FunctionsPBCRepr {
 
 impl FunctionsPBCRepr {
     /// RPython `FunctionsPBCRepr(rtyper, s_pbc)` (rpbc.py).
-    #[expect(
-        clippy::arc_with_non_send_sync,
-        reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
-    )]
     pub fn new(rtyper: &Rc<RPythonTyper>, s_pbc: SomePBC) -> Result<Arc<Self>, TyperError> {
         let base = FunctionReprBase::new(rtyper, s_pbc)?;
         let callfamily = base.callfamily.clone().ok_or_else(|| {
@@ -2762,10 +2754,6 @@ pub struct SmallFunctionSetPBCRepr {
 impl SmallFunctionSetPBCRepr {
     /// RPython `SmallFunctionSetPBCRepr.__init__(self, rtyper, s_pbc)`
     /// (rpbc.py).
-    #[expect(
-        clippy::arc_with_non_send_sync,
-        reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
-    )]
     pub fn new(rtyper: &Rc<RPythonTyper>, s_pbc: SomePBC) -> Result<Arc<Self>, TyperError> {
         // upstream rpbc.py — `FunctionReprBase.__init__(...)`.
         let base = FunctionReprBase::new(rtyper, s_pbc.clone())?;
@@ -7650,10 +7638,6 @@ impl MethodsPBCRepr {
     ///     # now hop2 looks like simple_call(function, self, args...)
     ///     return hop2.dispatch()
     /// ```
-    #[expect(
-        clippy::arc_with_non_send_sync,
-        reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
-    )]
     pub fn redispatch_call(
         &self,
         hop: &crate::translator::rtyper::rtyper::HighLevelOp,

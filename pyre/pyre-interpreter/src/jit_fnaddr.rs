@@ -8288,9 +8288,7 @@ mod tests {
     }
 
     fn pyre_interpreter_crate_root_glob_reexport(module: &str) -> bool {
-        crate_root_glob_reexport_modules()
-            .iter()
-            .any(|&name| name == module)
+        crate_root_glob_reexport_modules().contains(&module)
     }
 
     /// Whether two registered paths are two spellings of one item, which is

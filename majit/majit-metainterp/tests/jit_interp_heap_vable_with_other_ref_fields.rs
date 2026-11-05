@@ -96,7 +96,7 @@ fn extra_after_vable(
         match opcode {
             OP_ACC => {
                 state.frame.acc = state.frame.acc + state.extra.mark;
-                state.i = state.i + 1i64;
+                state.i += 1i64;
             }
             OP_JUMP_BACK => {
                 let target = program[pc] as usize;
@@ -164,7 +164,7 @@ fn extra_before_vable(
         match opcode {
             OP_ACC => {
                 state.frame.acc = state.frame.acc + 1i64;
-                state.i = state.i + 1i64;
+                state.i += 1i64;
             }
             OP_JUMP_BACK => {
                 let target = program[pc] as usize;

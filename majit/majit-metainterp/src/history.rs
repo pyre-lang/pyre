@@ -806,17 +806,16 @@ impl TreeLoop {
             }
         }
 
-        if let Some(last) = operations.last() {
-            if last.opcode == OpCode::Jump {
-                if let Some(descr) = last.getdescr() {
-                    assert!(
-                        descr.as_loop_target_descr().is_some(),
-                        "op {} {:?}: JUMP descr is not a loop target",
-                        operations.len() - 1,
-                        last.opcode
-                    );
-                }
-            }
+        if let Some(last) = operations.last()
+            && last.opcode == OpCode::Jump
+            && let Some(descr) = last.getdescr()
+        {
+            assert!(
+                descr.as_loop_target_descr().is_some(),
+                "op {} {:?}: JUMP descr is not a loop target",
+                operations.len() - 1,
+                last.opcode
+            );
         }
     }
 
@@ -3008,8 +3007,7 @@ impl TraceCtx {
     /// Mutate `op.fail_args` on a recorded op identified by `opref`.
     ///
     /// Port of `resoperation.Op.setfailargs`. Production guard recording uses
-    /// the snapshot path (`record_guard` + `capture_resumedata`
-    /// + `set_last_guard_resume_position`); the optimizer's
+    /// the snapshot path (`record_guard` + `capture_resumedata` + `set_last_guard_resume_position`); the optimizer's
     /// `OptContext::store_final_boxes_in_guard`, which derives `op.fail_args`
     /// from the snapshot through `Op::store_final_boxes`. This setter serves
     /// tests and other synthetic guards built outside that flow, matching
@@ -4209,10 +4207,6 @@ impl TraceCtx {
     /// address, potentially distinct from the wrapper at `argboxes[0]`
     /// per `call.py:252-258`).  That shape is implemented by
     /// [`Self::record_release_gil_typed_with_effect`].
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
-    )]
     fn call_family_typed(
         &mut self,
         opcode: OpCode,

@@ -155,7 +155,6 @@ mod tests {
 /// `ADVANCE` writes `cur` and `acc` and then guards `left > 0`. The guard's
 /// snapshot is taken from the arm frame's identity registers. After the guard
 /// fails, resume reads those fields; the pair must match a run with no JIT.
-
 #[repr(C)]
 struct Link {
     tag: i64,

@@ -624,7 +624,7 @@ fn front_graph_carries_no_synthesized_exception_edges() {
             let Some(body): Option<Unstructured> = fd.unstructured() else {
                 continue;
             };
-            let graph = lower_fun_decl(&context, fd)
+            let graph = lower_fun_decl(context, fd)
                 .unwrap_or_else(|e| panic!("{} failed to lower: {e}", fd.item_meta.name_path()));
 
             // Invariant A.  The iterator `next`-diamond rewrite
@@ -1023,7 +1023,7 @@ fn bool_then_keeps_regular_call_to_core_body() {
             if !is_then && !is_then_some {
                 continue;
             }
-            let graph = lower_fun_decl(&ctx, fd).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+            let graph = lower_fun_decl(ctx, fd).unwrap_or_else(|e| panic!("lower {path}: {e}"));
             let (call_once, bool_branches, some_ctor, none_ctor) = diamond_counts(&graph);
             assert!(
                 bool_branches >= 1,
@@ -1335,7 +1335,7 @@ fn boxing_cluster_fuses_from_the_host_supplied_class_address() {
 
     let fd = llbc.local_fn("w_new_int").expect("w_new_int in corpus");
     common::with_lowering(llbc, |context| {
-        let graph = lower_fun_decl_with_static_addrs(&context, fd, static_addrs).expect("lowering");
+        let graph = lower_fun_decl_with_static_addrs(context, fd, static_addrs).expect("lowering");
 
         let mut fused = Vec::new();
         let mut payload_stores = 0usize;
@@ -1385,7 +1385,7 @@ fn boxing_cluster_fuses_from_the_host_supplied_class_address() {
             .local_fn("w_number_add")
             .expect("w_number_add in corpus");
         let add_graph =
-            lower_fun_decl_with_static_addrs(&context, add, static_addrs).expect("lowering");
+            lower_fun_decl_with_static_addrs(context, add, static_addrs).expect("lowering");
         let mut narrow_roots = std::collections::BTreeMap::new();
         let mut class_addr_narrowed = 0usize;
         for b in &add_graph.blocks {
@@ -1464,7 +1464,7 @@ fn boxing_cluster_fuses_where_the_header_declares_no_class_word() {
         .local_fn("w_new_type_only_int")
         .expect("w_new_type_only_int in corpus");
     common::with_lowering(llbc, |context| {
-        let graph = lower_fun_decl_with_static_addrs(&context, fd, static_addrs).expect("lowering");
+        let graph = lower_fun_decl_with_static_addrs(context, fd, static_addrs).expect("lowering");
 
         let mut fused = Vec::new();
         let mut payload_stores = 0usize;
@@ -2032,8 +2032,8 @@ fn a_char_literal_default_joins_an_option_char_payload_in_the_int_bank() {
         blob.contains("char") || blob.contains("Char")
     }) {
         common::with_lowering(llbc, |context| {
-            let body = lower_fun_decl(&context, fd)
-                .unwrap_or_else(|e| panic!("lower core unwrap_or: {e}"));
+            let body =
+                lower_fun_decl(context, fd).unwrap_or_else(|e| panic!("lower core unwrap_or: {e}"));
             let producer = |var: &Variable| -> Option<&OpKind> {
                 body.blocks
                     .iter()
@@ -2387,10 +2387,8 @@ fn mem_replace_field_and_slice_element_read_then_store() {
                         write_at = Some(step);
                         write_value = Some(value.clone());
                     }
-                    OpKind::Call { target, .. } => {
-                        if format!("{target:?}").contains("replace") {
-                            replace_calls += 1;
-                        }
+                    OpKind::Call { target, .. } if format!("{target:?}").contains("replace") => {
+                        replace_calls += 1;
                     }
                     _ => {}
                 }
@@ -2499,11 +2497,9 @@ fn assert_exchange_pair_item(name: &str) {
     let returned = graph.blocks.iter().flat_map(|b| &b.exits).any(|link| {
         link.target == graph.returnblock
             && link.args.iter().any(|arg| {
-                arg.as_variable()
-                    .and_then(|v| producer(v))
-                    .is_some_and(|(l, a)| {
-                        l == "intmask" && a[0].as_variable() == Some(&read_result)
-                    })
+                arg.as_variable().and_then(producer).is_some_and(|(l, a)| {
+                    l == "intmask" && a[0].as_variable() == Some(&read_result)
+                })
             })
     });
     assert!(returned, "{name} does not return the old item");
@@ -2559,13 +2555,12 @@ fn mem_replace_of_a_multi_word_value_is_field_wise() {
                     OpKind::FieldWrite { field, .. } if !want_read => {
                         names.push(field.name.clone())
                     }
-                    OpKind::Call { target, .. } => {
+                    OpKind::Call { target, .. }
                         if format!("{target:?}").contains("replace")
                             || format!("{target:?}").contains("swap")
-                            || format!("{target:?}").contains("take")
-                        {
-                            replace_calls += 1;
-                        }
+                            || format!("{target:?}").contains("take") =>
+                    {
+                        replace_calls += 1;
                     }
                     _ => {}
                 }
@@ -2705,10 +2700,8 @@ fn mem_replace_through_box_deref_names_enum_fields() {
             for op in &block.operations {
                 match &op.kind {
                     OpKind::FieldWrite { field, .. } => writes.push(field.name.clone()),
-                    OpKind::Call { target, .. } => {
-                        if format!("{target:?}").contains("replace") {
-                            replace_calls += 1;
-                        }
+                    OpKind::Call { target, .. } if format!("{target:?}").contains("replace") => {
+                        replace_calls += 1;
                     }
                     _ => {}
                 }
@@ -3220,7 +3213,7 @@ fn a_closure_indexes_its_captured_slice_through_the_pair() {
         })
         .expect("closure body");
     common::with_lowering(llbc, |context| {
-        let graph = majit_translate::front::mir::lower_fun_decl(&context, fd).expect("lowering");
+        let graph = majit_translate::front::mir::lower_fun_decl(context, fd).expect("lowering");
         let ops: Vec<_> = graph.blocks.iter().flat_map(|b| &b.operations).collect();
         assert!(
             ops.iter().any(|op| matches!(
@@ -3492,7 +3485,7 @@ fn frame_box_new_ptr_write_lowers_to_field_stores() {
         })
         .expect("FrameBox::new");
     common::with_shared_lowering(llbc, |context| {
-        let graph = lower_fun_decl(&context, fd).expect("lower FrameBox::new");
+        let graph = lower_fun_decl(context, fd).expect("lower FrameBox::new");
         assert!(
             !graph
                 .blocks
@@ -3596,7 +3589,7 @@ fn frame_box_owner_root_word_roundtrips() {
             }
         }
 
-        fn op_result<'a>(graph: &'a FunctionGraph, id: u64) -> Option<&'a SpaceOperation> {
+        fn op_result(graph: &FunctionGraph, id: u64) -> Option<&SpaceOperation> {
             graph.blocks.iter().find_map(|block| {
                 block
                     .operations
@@ -3686,7 +3679,7 @@ fn frame_box_owner_root_word_roundtrips() {
             out
         }
 
-        fn defining_op<'a>(graph: &'a FunctionGraph, start: u64) -> &'a SpaceOperation {
+        fn defining_op(graph: &FunctionGraph, start: u64) -> &SpaceOperation {
             let mut id = start;
             let mut seen = Vec::new();
             loop {
@@ -3730,7 +3723,7 @@ fn frame_box_owner_root_word_roundtrips() {
                 })
         }
 
-        let frame_ptr = lower_pyframe(&llbc, &context, "fn frame_ptr(&self)");
+        let frame_ptr = lower_pyframe(llbc, context, "fn frame_ptr(&self)");
         let live = reachable_blocks(&frame_ptr);
         let mut arms = Vec::new();
         for block in &frame_ptr.blocks {
@@ -3772,7 +3765,7 @@ fn frame_box_owner_root_word_roundtrips() {
             "frame_ptr still casts the guard word through the integer bank"
         );
 
-        let deref_mut = lower_pyframe(&llbc, &context, "fn deref_mut(&mut self)");
+        let deref_mut = lower_pyframe(llbc, context, "fn deref_mut(&mut self)");
         let live = reachable_blocks(&deref_mut);
         let mut deref_returns = Vec::new();
         for block in &deref_mut.blocks {
@@ -3818,7 +3811,7 @@ fn frame_box_owner_root_word_roundtrips() {
             "deref_mut casts the frame pointer through the integer bank"
         );
 
-        let new_graph = lower_pyframe(&llbc, &context, "pub fn new(mut frame: PyFrame)");
+        let new_graph = lower_pyframe(llbc, context, "pub fn new(mut frame: PyFrame)");
         let mut owner_value = None;
         let mut ptr_value = None;
         for block in &new_graph.blocks {
@@ -4017,7 +4010,7 @@ fn frame_box_owner_root_guard_lowers_without_guard_calls() {
                             .is_some_and(|text| text.starts_with(source))
                 })
                 .unwrap_or_else(|| panic!("missing {source}"));
-            let graph = lower_fun_decl(&context, fd)
+            let graph = lower_fun_decl(context, fd)
                 .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
             let calls: Vec<String> = graph
                 .blocks

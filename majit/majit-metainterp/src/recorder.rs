@@ -1061,10 +1061,10 @@ impl Trace {
     fn hold_const_indexes(&mut self, refs: &[OpRef]) -> usize {
         let base = self.live_const_indexes.len();
         for r in refs {
-            if let Some(index) = r.const_ptr_index() {
-                if index != 0 {
-                    self.live_const_indexes.push(index);
-                }
+            if let Some(index) = r.const_ptr_index()
+                && index != 0
+            {
+                self.live_const_indexes.push(index);
             }
         }
         base
@@ -1690,8 +1690,9 @@ impl Trace {
                 .filter(|s| s.opcode.is_guard())
                 .nth(from_end)
                 .and_then(|s| s.descr_pos);
-            if let Some(pos) = descr_pos {
-                let trb = self.trb.as_mut().expect("byte buffer");
+            if let Some(pos) = descr_pos
+                && let Some(trb) = self.trb.as_mut()
+            {
                 let old_len = crate::opencoder::decode_varint_signed(&trb.ops_bytes()[pos..]).1;
                 trb.patch_descr_slot_at(pos, snapshot_id as i64);
                 let new_len = crate::opencoder::decode_varint_signed(&trb.ops_bytes()[pos..]).1;
@@ -2449,7 +2450,7 @@ impl Trace {
             // `VirtualState::retain_const_ptr_indexes` dedups. `box_for_operand`
             // hits the same ConstPtr on every use; a push-only list would
             // grow with the trace length and extra-area-walk that many times.
-            if list.last().copied() == Some(index) || list.iter().any(|&i| i == index) {
+            if list.last().copied() == Some(index) || list.contains(&index) {
                 return;
             }
             list.push(index);

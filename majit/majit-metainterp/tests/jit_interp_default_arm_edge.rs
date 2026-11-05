@@ -115,10 +115,10 @@ fn dispatch_skip(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
         pc += 1;
         match opcode {
             OP_WORK => {
-                state.acc = state.acc + WORK;
+                state.acc += WORK;
             }
             OP_TICK => {
-                state.ticks = state.ticks - 1i64;
+                state.ticks -= 1i64;
                 if state.ticks != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;
@@ -160,10 +160,10 @@ fn dispatch_work(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
         pc += 1;
         match opcode {
             OP_WORK => {
-                state.acc = state.acc + WORK;
+                state.acc += WORK;
             }
             OP_TICK => {
-                state.ticks = state.ticks - 1i64;
+                state.ticks -= 1i64;
                 if state.ticks != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;
@@ -171,7 +171,7 @@ fn dispatch_work(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
                 }
             }
             _ => {
-                state.acc = state.acc + DEFAULT_WORK;
+                state.acc += DEFAULT_WORK;
             }
         }
     }
@@ -210,10 +210,10 @@ fn dispatch_exit(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
         pc += 1;
         match opcode {
             OP_WORK => {
-                state.acc = state.acc + WORK;
+                state.acc += WORK;
             }
             OP_TICK => {
-                state.ticks = state.ticks - 1i64;
+                state.ticks -= 1i64;
                 if state.ticks != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;
@@ -259,10 +259,10 @@ fn dispatch_switch(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
         pc += 1;
         match opcode {
             OP_WORK => {
-                state.acc = state.acc + WORK;
+                state.acc += WORK;
             }
             OP_TICK => {
-                state.ticks = state.ticks - 1i64;
+                state.ticks -= 1i64;
                 if state.ticks != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;
@@ -270,7 +270,7 @@ fn dispatch_switch(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
                 }
             }
             _ => {
-                state.acc = state.acc + DEFAULT_WORK;
+                state.acc += DEFAULT_WORK;
             }
         }
     }

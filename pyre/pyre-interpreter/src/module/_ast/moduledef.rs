@@ -517,9 +517,7 @@ fn call_method_with_raw_kwargs(
         return None;
     }
     if receiver.is_none() {
-        let Some(first) = positional.first() else {
-            return None;
-        };
+        let first = positional.first()?;
         if !is_ast_instance(*first) {
             return None;
         }

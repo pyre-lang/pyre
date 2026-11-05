@@ -2527,8 +2527,8 @@ fn root_bracket_erasure_keeps_an_unnameable_read_back() {
         &fixture_llbc(),
         &body,
         &super::MovedOutLocals::with_set(&body, bit_set::BitSet::new()),
-        &name_of,
-        &touches,
+        name_of,
+        touches,
     );
     assert!(
         !plan.scopes.contains(3),
@@ -2847,8 +2847,8 @@ fn root_bracket_erasure_answers_a_closure_get_of_a_captured_slot() {
             &llbc,
             body,
             &super::MovedOutLocals::with_set(body, bit_set::BitSet::new()),
-            &name_of,
-            &touches,
+            name_of,
+            touches,
         )
     };
     let pin_slice = |elems: Vec<serde_json::Value>| {
@@ -2924,7 +2924,7 @@ fn root_bracket_erasure_answers_a_closure_get_of_a_captured_slot() {
         );
     }
     assert!(
-        plan.capture_temps.get(&5).is_none(),
+        !plan.capture_temps.contains_key(&5),
         "the captured base is the index, not a temp"
     );
     assert_eq!(plan.free_sites.get(&1), Some(&3));
@@ -3018,7 +3018,7 @@ fn root_bracket_erasure_answers_a_closure_get_of_a_captured_slot() {
     assert_eq!(plan.get_sites, vec![(3usize, 1usize)]);
     assert_eq!(plan.slot_temps.get(&4), Some(&3), "the len result");
     assert!(
-        plan.slot_temps.get(&5).is_none(),
+        !plan.slot_temps.contains_key(&5),
         "pin_root's result is not a depth"
     );
     for temp in [10usize, 11, 12, 13] {
@@ -3028,7 +3028,7 @@ fn root_bracket_erasure_answers_a_closure_get_of_a_captured_slot() {
             "len capture temp _{temp}"
         );
     }
-    assert!(plan.capture_temps.get(&4).is_none(), "the len is the index");
+    assert!(!plan.capture_temps.contains_key(&4), "the len is the index");
     assert_eq!(plan.free_sites.get(&1), Some(&3), "the len call");
     assert_eq!(plan.free_sites.get(&2), Some(&3), "the pin call");
 }
@@ -4570,9 +4570,8 @@ fn specialized_direct_call_does_not_fan_out_trait_impls() {
         "generics": null
     }))
     .expect("unresolved trait call parses");
-    assert_eq!(
+    assert!(
         analyzer.regular_call_touches_root_stack(&unresolved),
-        true,
         "an unresolved clause is top_result"
     );
     let map_quiet: RegularCall = serde_json::from_value(serde_json::json!({
@@ -4580,9 +4579,8 @@ fn specialized_direct_call_does_not_fan_out_trait_impls() {
         "generics": map_call_generics(0, i64_ty.clone())
     }))
     .expect("quiet map call parses");
-    assert_eq!(
-        analyzer.regular_call_touches_root_stack(&map_quiet),
-        false,
+    assert!(
+        !analyzer.regular_call_touches_root_stack(&map_quiet),
         "specialized map reaches only the quiet impl"
     );
     let map_pin: RegularCall = serde_json::from_value(serde_json::json!({
@@ -4590,25 +4588,21 @@ fn specialized_direct_call_does_not_fan_out_trait_impls() {
         "generics": map_call_generics(1, u64_ty.clone())
     }))
     .expect("pin map call parses");
-    assert_eq!(
+    assert!(
         analyzer.regular_call_touches_root_stack(&map_pin),
-        true,
         "specialized map reaches only the pin impl"
     );
     let touching = super::harvest_root_stack_touching_paths(&llbc);
-    assert_eq!(
-        touching.iter().any(|p| p == "core::option::Option::map"),
-        false,
+    assert!(
+        !touching.iter().any(|p| p == "core::option::Option::map"),
         "harvest skips the generic template; touching={touching:?}"
     );
-    assert_eq!(
+    assert!(
         touching.iter().any(|p| p == "fixture::pin_once"),
-        true,
         "harvest includes the pin impl; touching={touching:?}"
     );
-    assert_eq!(
-        touching.iter().any(|p| p == "fixture::quiet_once"),
-        false,
+    assert!(
+        !touching.iter().any(|p| p == "fixture::quiet_once"),
         "harvest excludes the quiet impl; touching={touching:?}"
     );
     let caller_quiet: RegularCall = serde_json::from_value(serde_json::json!({
@@ -4616,9 +4610,8 @@ fn specialized_direct_call_does_not_fan_out_trait_impls() {
         "generics": null
     }))
     .expect("quiet caller parses");
-    assert_eq!(
-        analyzer.regular_call_touches_root_stack(&caller_quiet),
-        false,
+    assert!(
+        !analyzer.regular_call_touches_root_stack(&caller_quiet),
         "the quiet map caller does not inherit the pin impl"
     );
 }
@@ -4711,9 +4704,8 @@ fn generic_opaque_callee_is_analyzed_as_external() {
         "generics": size_of_generics
     }))
     .expect("size_of call parses");
-    assert_eq!(
-        analyzer.regular_call_touches_root_stack(&size_of_call),
-        false,
+    assert!(
+        !analyzer.regular_call_touches_root_stack(&size_of_call),
         "a foreign generic Opaque in the API crate is analyze_external_call"
     );
     let caller_call: RegularCall = serde_json::from_value(serde_json::json!({
@@ -4721,22 +4713,19 @@ fn generic_opaque_callee_is_analyzed_as_external() {
         "generics": null
     }))
     .expect("caller parses");
-    assert_eq!(
-        analyzer.regular_call_touches_root_stack(&caller_call),
-        false,
+    assert!(
+        !analyzer.regular_call_touches_root_stack(&caller_call),
         "a caller of that Opaque does not inherit top_result"
     );
     let touching = super::harvest_root_stack_touching_paths(&llbc);
-    assert_eq!(
-        touching.iter().any(|p| p == "fixture::alloc_sized"),
-        false,
+    assert!(
+        !touching.iter().any(|p| p == "fixture::alloc_sized"),
         "harvest excludes the Opaque caller; touching={touching:?}"
     );
-    assert_eq!(
+    assert!(
         touching
             .iter()
             .any(|p| p == "pyre_object::gc_roots::pin_root"),
-        true,
         "the root-stack API itself stays a touching body; touching={touching:?}"
     );
 }
@@ -4906,9 +4895,8 @@ fn builtin_or_auto_trait_ref_is_not_unknown() {
         "generics": map_call_generics
     }))
     .expect("map call parses");
-    assert_eq!(
-        analyzer.regular_call_touches_root_stack(&map_call),
-        false,
+    assert!(
+        !analyzer.regular_call_touches_root_stack(&map_call),
         "specialized map drop of BuiltinOrAuto is not top_result"
     );
     let caller: RegularCall = serde_json::from_value(serde_json::json!({
@@ -4916,9 +4904,8 @@ fn builtin_or_auto_trait_ref_is_not_unknown() {
         "generics": null
     }))
     .expect("caller parses");
-    assert_eq!(
-        analyzer.regular_call_touches_root_stack(&caller),
-        false,
+    assert!(
+        !analyzer.regular_call_touches_root_stack(&caller),
         "the map caller does not inherit an unknown drop"
     );
 }

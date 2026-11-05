@@ -322,9 +322,8 @@ impl MdAccumulator {
         }
         self.buffer.extend_from_slice(&bit_len.to_le_bytes());
         let buffer = std::mem::take(&mut self.buffer);
-        for chunk in buffer.chunks_exact(64) {
-            let chunk: [u8; 64] = chunk.try_into().unwrap();
-            self.compress(&chunk);
+        for chunk in buffer.as_chunks::<64>().0 {
+            self.compress(chunk);
         }
         let mut out = [0u8; 16];
         for (i, w) in self.state.iter().enumerate() {

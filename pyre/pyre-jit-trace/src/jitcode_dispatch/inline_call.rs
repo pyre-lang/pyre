@@ -692,7 +692,7 @@ fn is_live_marker(opname: &str) -> bool {
     opname == "live" || opname.starts_with("live/")
 }
 
-fn previous_non_live_op<'a>(ops: &'a [DecodedOp], idx: usize) -> Option<&'a DecodedOp> {
+fn previous_non_live_op(ops: &[DecodedOp], idx: usize) -> Option<&DecodedOp> {
     let mut i = idx;
     while i > 0 {
         i -= 1;
@@ -18351,6 +18351,7 @@ fn send_ex_continuation_level() -> Option<(i32, usize)> {
     send_ex_continuation_full().map(|(index, resume_pc, _)| (index, resume_pc))
 }
 
+#[cfg(test)]
 fn send_ex_after_teardown_pc() -> Option<usize> {
     send_ex_continuation_full().and_then(|(_, _, after)| (after != 0).then_some(after))
 }
@@ -19972,7 +19973,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
             }));
         }
     }
-    return try_walker_inline_user_binop_reflected(
+    try_walker_inline_user_binop_reflected(
         ctx,
         op,
         code,
@@ -19991,7 +19992,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         w_typ_r.as_ptr(),
         // Settled last arm: not speculative.
         false,
-    );
+    )
 }
 
 /// Reflected arm of [`try_walker_inline_user_binop`]: look `__r*__` up on the
@@ -23898,7 +23899,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         // never called `enter_helper_level`, so pending stays empty
         // (`nested_loop`, `spectral_norm`).
         let exchange = unsafe { &mut *(driver_pointer as *mut SubWalkExchange<'a, Sym>) };
-        snapshot_residual_heap_before_suspend::<Sym>(&*ctx.trace_ctx.heap_cache());
+        snapshot_residual_heap_before_suspend::<Sym>(&ctx.trace_ctx.heap_cache());
         assert!(exchange.pending.replace(frame).is_none());
         return Err(DispatchError::SubWalkSuspended { pc });
     }

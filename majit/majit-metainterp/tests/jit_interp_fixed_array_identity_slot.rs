@@ -79,8 +79,8 @@ mod fixed_array_before_virt_array {
                 // Read-only: a MUTATED plain `[int]` is refused outright (it is
                 // not restored on deopt), so the fixed array is loop-carried but
                 // never written.
-                OP_ACC => state.iregs[2] = state.iregs[2] + state.cells[0],
-                OP_INC => state.iregs[0] = state.iregs[0] + 1,
+                OP_ACC => state.iregs[2] += state.cells[0],
+                OP_INC => state.iregs[0] += 1,
                 OP_JUMP_BACK => {
                     let target = program[pc] as usize;
                     pc += 1;

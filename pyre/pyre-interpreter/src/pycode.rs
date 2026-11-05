@@ -2958,9 +2958,7 @@ pub unsafe fn positions_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
         };
         let mut bounds = PyCodeAddressRange::resume(linetable, cursor);
         if it.offset as i32 >= bounds.ar_end {
-            let Some((line, end_line, column, end_column)) = bounds.advance_with_locations() else {
-                return None;
-            };
+            let (line, end_line, column, end_column) = bounds.advance_with_locations()?;
             it.ar_line = line as i64;
             it.end_line = end_line as i64;
             it.column = column as i64;

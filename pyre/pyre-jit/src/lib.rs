@@ -242,11 +242,11 @@ mod tests {
         }
         #[cfg(feature = "dynasm")]
         {
-            return majit_backend_dynasm::jit_exc_value_peek();
+            majit_backend_dynasm::jit_exc_value_peek()
         }
         #[cfg(all(feature = "cranelift", not(feature = "dynasm")))]
         {
-            return majit_backend_cranelift::jit_exc_value_peek();
+            majit_backend_cranelift::jit_exc_value_peek()
         }
     }
 

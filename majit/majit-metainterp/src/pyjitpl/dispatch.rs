@@ -3273,10 +3273,11 @@ where
     ///    so nothing is recorded, and `opimpl_goto_if_not` then sees a `Const`
     ///    condbox so `generate_guard` records no guard either (pyjitpl.py,
     ///    2583).
-    ///    Only a non-constant, non-same-box operand pair materialises the compare
-    /// + guard. The branch is followed identically in all cases (`taken`
-    ///   already reflects the concrete condition): `taken` = condition true =
-    ///   fall through; `!taken` jumps to `target`.
+    ///
+    /// Only a non-constant, non-same-box operand pair materialises the
+    /// compare + guard. The branch is followed identically in all cases
+    /// (`taken` already reflects the concrete condition): `taken` = condition
+    /// true = fall through; `!taken` jumps to `target`.
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
@@ -3695,9 +3696,9 @@ where
             // greenkey)` uses that one `greenkey` for unique_id and
             // `portal_trace_positions`.
             let mut types = Vec::with_capacity(greens_i.len() + greens_r.len() + greens_f.len());
-            types.extend(std::iter::repeat(GreenType::Int).take(greens_i.len()));
-            types.extend(std::iter::repeat(GreenType::Ref).take(greens_r.len()));
-            types.extend(std::iter::repeat(GreenType::Float).take(greens_f.len()));
+            types.extend(std::iter::repeat_n(GreenType::Int, greens_i.len()));
+            types.extend(std::iter::repeat_n(GreenType::Ref, greens_r.len()));
+            types.extend(std::iter::repeat_n(GreenType::Float, greens_f.len()));
             let typed = GreenKey::with_types(green_values.clone(), types);
             let greenkey: crate::pyjitpl::PortalGreenKey = (typed.get_uhash(), typed);
             let mut portal_frame =
@@ -4589,10 +4590,6 @@ where
         }
     }
 
-    #[expect(
-        clippy::type_complexity,
-        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
-    )]
     fn read_canonical_call_args(
         &mut self,
         ctx: &TraceCtx,
@@ -8983,7 +8980,7 @@ mod tests {
         let action = trace_jitcode_with_args(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0, &[]);
         assert!(matches!(action, TraceAction::Continue));
         assert!(
-            !cpu.loads.borrow().iter().any(|&p| p == 0),
+            !cpu.loads.borrow().contains(&0),
             "heapcache-hit getfield must not field_sanity_load a null struct, got {:?}",
             cpu.loads.borrow()
         );

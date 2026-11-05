@@ -4273,11 +4273,7 @@ impl<'a> Lowering<'a> {
             {
                 Some(var) => var,
                 None => {
-                    if self
-                        .owner_shadow
-                        .iter()
-                        .any(|slot| *slot == Some(local_idx))
-                    {
+                    if self.owner_shadow.contains(&Some(local_idx)) {
                         args.push(self.emit_gc_null(from_bb));
                         continue;
                     }

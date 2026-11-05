@@ -272,11 +272,7 @@ fn run_arm(arm: Arm, vable: VableBox) -> (usize, bool, bool) {
 
 /// ## The negative control, and how it was taken
 ///
-/// This assertion is a `!promoted_index`, which cannot arm itself. The `guards
-/// > 0` line below is what says the arm ran at all; that it fires on the
-/// pre-fix SHAPE was checked by hand rather than by a knob, because a
-/// production flag whose only caller is a test is a second code path to keep
-/// correct forever.
+/// This assertion is a `!promoted_index`, which cannot arm itself. The `guards > 0` line below is what says the arm ran at all; that it fires on the pre-fix SHAPE was checked by hand rather than by a knob, because a production flag whose only caller is a test is a second code path to keep correct forever.
 ///
 /// The inversion applied to each of the six arms in
 /// `pyjitpl/dispatch.rs` was to move the promote back above the branch, i.e.

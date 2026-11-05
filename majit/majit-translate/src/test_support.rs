@@ -177,9 +177,9 @@ pub(crate) fn with_shared_lowering<R>(
 
 /// Shared artefacts use the cached context under the read lock; fixtures
 /// build a fresh [`LowerContext`].
-pub(crate) fn with_lowering<'a, R>(llbc: &'a Llbc, f: impl FnOnce(&LowerContext<'_>) -> R) -> R {
+pub(crate) fn with_lowering<R>(llbc: &Llbc, f: impl FnOnce(&LowerContext<'_>) -> R) -> R {
     if let Some(shared) = as_production_llbc(llbc) {
-        with_shared_lowering(shared, |ctx| f(ctx))
+        with_shared_lowering(shared, f)
     } else {
         let ctx = LowerContext::new(llbc);
         f(&ctx)
@@ -221,15 +221,15 @@ pub(crate) fn with_shared_link_write<'a, R>(
     }
 }
 
-pub(crate) fn lower_function<'a>(
-    llbc: &'a Llbc,
+pub(crate) fn lower_function(
+    llbc: &Llbc,
     function_name: &str,
 ) -> Result<FunctionGraph, LowerError> {
     lower_function_with_static_addrs(llbc, function_name, crate::HostStaticAddrs::default())
 }
 
-pub(crate) fn lower_function_with_static_addrs<'a>(
-    llbc: &'a Llbc,
+pub(crate) fn lower_function_with_static_addrs(
+    llbc: &Llbc,
     function_name: &str,
     static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<FunctionGraph, LowerError> {

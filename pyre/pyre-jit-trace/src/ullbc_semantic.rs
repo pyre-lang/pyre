@@ -69,7 +69,7 @@ pub fn feed_semantic_ullbc(data: &[u8], emit: &mut dyn FnMut(&[u8])) {
     }
 }
 
-fn strip_prefix_at<'a>(data: &'a [u8], index: usize, prefix: &[u8]) -> Option<usize> {
+fn strip_prefix_at(data: &[u8], index: usize, prefix: &[u8]) -> Option<usize> {
     let rest = data.get(index..)?;
     rest.starts_with(prefix).then_some(index + prefix.len())
 }

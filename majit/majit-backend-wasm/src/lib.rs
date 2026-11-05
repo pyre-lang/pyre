@@ -1278,10 +1278,7 @@ pub(crate) mod gc_box {
     /// and are reused while still referenced.
     pub(super) fn store(gc: Box<dyn majit_gc::GcAllocator>) -> (u64, bool) {
         let table = gc.finalizer_queue_table();
-        let ptr = table
-            .as_ref()
-            .map(|a| Arc::as_ptr(a))
-            .unwrap_or(std::ptr::null());
+        let ptr = table.as_ref().map(Arc::as_ptr).unwrap_or(std::ptr::null());
         let generation = NEXT_GC_BOX_GEN.fetch_add(1, Ordering::Relaxed);
         let installed = WASM_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();

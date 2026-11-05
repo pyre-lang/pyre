@@ -383,7 +383,7 @@ fn all_fielddescrs_into(
         } else if !only_gc || flag == majit_ir::descr::ArrayFlag::Pointer {
             let owner = Some(struct_name.to_string());
             let idx = gccache.descr_indices.field_index(&owner, name);
-            if let Some(descr) = gccache.fielddescrof(idx, struct_name, None, &name) {
+            if let Some(descr) = gccache.fielddescrof(idx, struct_name, None, name) {
                 res.push(descr);
             }
         }

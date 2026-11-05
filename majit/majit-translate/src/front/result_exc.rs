@@ -4779,9 +4779,7 @@ fn branch_shell_banks(
                     if !receiver_root.as_deref().unwrap_or("").ends_with("Result") {
                         return None;
                     }
-                    let Some(payloads) = branch_payloads.as_ref() else {
-                        return None;
-                    };
+                    let payloads = branch_payloads.as_ref()?;
                     let (Some(err), Some(brk)) = (payloads.err.clone(), payloads.break_ty.clone())
                     else {
                         return None;
@@ -8025,10 +8023,6 @@ fn rewire_question_site(
 }
 
 #[expect(
-    clippy::mutable_key_type,
-    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-)]
-#[expect(
     clippy::too_many_arguments,
     reason = "the merged-continue rewrite reads the whole scoped-call result list beside the per-site arguments"
 )]
@@ -8320,19 +8314,17 @@ fn rewire_one_call_site(
     let c = question.disc_block;
     let cf_c = question.cf_at_disc.clone();
     let disc_var = question.disc_var.clone();
-    if c != b {
-        if assert_single_pred(graph, c, &name).is_err() {
-            if !allow_fallback {
-                return Err(format!(
-                    "{name}: ControlFlow discriminant block {c} is shared by multiple predecessors"
-                ));
-            }
-            if let Some(sum) = call_sum(&calls, r) {
-                return Err(sum_used_as_value(sum));
-            }
-            catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
-            return Ok(SiteOutcome::Rewrapped);
+    if c != b && assert_single_pred(graph, c, &name).is_err() {
+        if !allow_fallback {
+            return Err(format!(
+                "{name}: ControlFlow discriminant block {c} is shared by multiple predecessors"
+            ));
         }
+        if let Some(sum) = call_sum(&calls, r) {
+            return Err(sum_used_as_value(sum));
+        }
+        catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
+        return Ok(SiteOutcome::Rewrapped);
     }
     let chain = diamond_forward_chain(a, &question.path);
     let mut plumbing = vec![b];
@@ -9656,10 +9648,10 @@ fn exception_continuation_is_pure_construction(graph: &FunctionGraph, start: Blo
             if !pure {
                 return false;
             }
-            if let Some(result) = op.result.clone() {
-                if env_op_result_is_fresh(&op.kind, &fresh) {
-                    fresh.push(result);
-                }
+            if let Some(result) = op.result.clone()
+                && env_op_result_is_fresh(&op.kind, &fresh)
+            {
+                fresh.push(result);
             }
         }
         if raises {
@@ -10081,10 +10073,6 @@ fn arm_shell_vars_from_args(
 ///
 /// Fail-safe: any other use of the shell returns `Err` with the graph
 /// unchanged. Every check runs before the first edit.
-#[expect(
-    clippy::mutable_key_type,
-    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-)]
 fn collapse_rebuilt_shell_match(
     graph: &mut FunctionGraph,
     normal: usize,
@@ -13859,13 +13847,10 @@ fn merged_forward_target(graph: &FunctionGraph, block: usize, var: &Variable) ->
                 return None;
             }
         }
-        let Some(pos) = link
+        let pos = link
             .args
             .iter()
-            .position(|arg| matches!(arg, LinkArg::Value(value) if *value == tracked))
-        else {
-            return None;
-        };
+            .position(|arg| matches!(arg, LinkArg::Value(value) if *value == tracked))?;
         let target = link.target;
         if predecessor_exits(graph, target.0).len() > 1 {
             return Some(target);
@@ -16512,7 +16497,7 @@ mod static_result_shell_tests {
         );
         let returned = return_link_values(&graph);
         assert!(!returned.iter().any(|var| *var == ctor || *var == forwarded));
-        assert!(returned.iter().any(|var| *var == payload));
+        assert!(returned.contains(&payload));
         assert!(field_read_owners(&graph, "__discriminant").contains(&"Result".to_string()));
         assert!(field_read_owners(&graph, "__pos_0").contains(&"Result::Ok".to_string()));
         assert!(field_read_owners(&graph, "__pos_0").contains(&"Result::Err".to_string()));
@@ -16534,11 +16519,7 @@ mod static_result_shell_tests {
             1
         );
         assert_ne!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
-        assert!(
-            !return_link_values(&graph)
-                .iter()
-                .any(|var| *var == forwarded)
-        );
+        assert!(!return_link_values(&graph).contains(&forwarded));
     }
 
     #[test]
@@ -16550,11 +16531,7 @@ mod static_result_shell_tests {
                 .expect("ctor and shell lower"),
             2
         );
-        assert!(
-            !return_link_values(&graph)
-                .iter()
-                .any(|var| *var == forwarded)
-        );
+        assert!(!return_link_values(&graph).contains(&forwarded));
     }
 
     #[test]
@@ -16564,11 +16541,7 @@ mod static_result_shell_tests {
             .expect_err("an Ok payload read is already T");
         assert!(err.contains("no rewritable returns"));
         assert_eq!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
-        assert!(
-            return_link_values(&graph)
-                .iter()
-                .any(|var| *var == forwarded)
-        );
+        assert!(return_link_values(&graph).contains(&forwarded));
     }
 
     #[test]
@@ -16579,11 +16552,7 @@ mod static_result_shell_tests {
             .expect_err("Utf8Error is not the carrier");
         assert!(err.contains("no rewritable returns"));
         assert_eq!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
-        assert!(
-            return_link_values(&graph)
-                .iter()
-                .any(|var| *var == forwarded)
-        );
+        assert!(return_link_values(&graph).contains(&forwarded));
     }
 
     #[test]
@@ -16655,11 +16624,7 @@ mod static_result_shell_tests {
                 .expect("the ctor lowers and the payload stays"),
             1
         );
-        assert!(
-            return_link_values(&graph)
-                .iter()
-                .any(|var| *var == forwarded)
-        );
+        assert!(return_link_values(&graph).contains(&forwarded));
         assert!(!field_read_owners(&graph, "__discriminant").contains(&"Result".to_string()));
     }
 
@@ -16672,11 +16637,7 @@ mod static_result_shell_tests {
                 .expect("forward lowers"),
             1
         );
-        assert!(
-            !return_link_values(&graph)
-                .iter()
-                .any(|var| *var == forwarded)
-        );
+        assert!(!return_link_values(&graph).contains(&forwarded));
         assert!(field_read_owners(&graph, "__discriminant").contains(&"Result".to_string()));
         assert!(graph.blocks.iter().any(|block| {
             block
@@ -21815,8 +21776,7 @@ mod break_arm_copy_tests {
 
     #[test]
     fn one_field_read_still_reraises() {
-        break_arm(|graph, arm, payload| field_read(graph, arm, payload))
-            .expect("one field read of the payload still reraises");
+        break_arm(field_read).expect("one field read of the payload still reraises");
     }
 
     #[test]

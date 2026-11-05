@@ -1370,11 +1370,11 @@ mod tests {
             .map(|(k, _)| k.as_str())
             .collect();
         assert!(
-            harvested.get("invert").is_none(),
+            !harvested.contains_key("invert"),
             "module-less Charon duplicate must not harvest as bare invert: invert_keys={invert_keys:?}"
         );
         assert!(
-            harvested.get("neg").is_none(),
+            !harvested.contains_key("neg"),
             "module-less Charon duplicate must not harvest as bare neg"
         );
         assert!(

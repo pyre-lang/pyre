@@ -20347,7 +20347,7 @@ impl RootCensus {
         if !self.on {
             return;
         }
-        self.rows.sort_by(|a, b| b.1.cmp(&a.1));
+        self.rows.sort_by_key(|a| std::cmp::Reverse(a.1));
         let total: usize = self.rows.iter().map(|(_, seen, _)| seen).sum();
         let mut line = format!("[jit-gc-diag] major={major} roots={total} prebuilt={prebuilt}");
         for (label, seen, null) in &self.rows {

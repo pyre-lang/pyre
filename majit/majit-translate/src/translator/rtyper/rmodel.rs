@@ -244,10 +244,6 @@ pub(crate) fn lowlevel_type_const(lltype: LowLevelType) -> Hlvalue {
 /// the `cflags` argument shape used by `malloc` / `malloc_varsize`
 /// SpaceOperations. Mirrors upstream `inputconst(Void, {'flavor':
 /// 'gc'})` (rmodel.py, rstr.py:1130).  allow-line-citation
-#[expect(
-    clippy::mutable_key_type,
-    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-)]
 pub(crate) fn gc_flavor_const() -> Result<Hlvalue, TyperError> {
     let flags = IndexMap::from([(ConstValue::byte_str("flavor"), ConstValue::byte_str("gc"))]);
     HighLevelOp::inputconst(

@@ -2792,7 +2792,7 @@ impl<Sym: WalkSym> WalkContext<'_, '_, Sym> {
             .borrow()
             .callee_shadow
             .as_ref()
-            .and_then(&hit)
+            .and_then(hit)
         {
             return Some(found);
         }
@@ -2804,7 +2804,7 @@ impl<Sym: WalkSym> WalkContext<'_, '_, Sym> {
                     .borrow()
                     .callee_shadow
                     .as_ref()
-                    .and_then(&hit)
+                    .and_then(hit)
             {
                 return Some(found);
             }
@@ -2812,7 +2812,7 @@ impl<Sym: WalkSym> WalkContext<'_, '_, Sym> {
                 let Some(state) = parent.frame_state.as_ref() else {
                     continue;
                 };
-                if let Some(found) = state.borrow().callee_shadow.as_ref().and_then(&hit) {
+                if let Some(found) = state.borrow().callee_shadow.as_ref().and_then(hit) {
                     return Some(found);
                 }
             }
@@ -2823,7 +2823,7 @@ impl<Sym: WalkSym> WalkContext<'_, '_, Sym> {
                 .borrow()
                 .callee_shadow
                 .as_ref()
-                .and_then(&hit)
+                .and_then(hit)
             {
                 return Some(found);
             }
@@ -5592,8 +5592,7 @@ fn walk_err_coordinate_belongs_to_this_frame<Sym: WalkSym>(
 /// `catch_exception/L` handler match and reaches the outermost
 /// `walk()` invocation, RPython `pyjitpl.py
 /// finishframe_exception` records `compile_exit_frame_with_exception(
-/// last_exc_box)` — i.e. `FINISH(exc, exit_frame_with_exception_descr_ref)`
-/// + raise `ExitFrameWithExceptionRef`. The walker mirrors this on
+/// last_exc_box)` — i.e. `FINISH(exc, exit_frame_with_exception_descr_ref)` + raise `ExitFrameWithExceptionRef`. The walker mirrors this on
 /// exit: if the loop terminates with `SubRaise` AND `ctx.is_top_level
 /// == true`, record the FINISH and convert the outcome to `Terminate`
 /// before returning. Sub-walk frames keep returning `SubRaise` to
@@ -14134,8 +14133,7 @@ fn mark_trace_reads_module_global_from_frame_name(
 }
 
 /// Shared module-dict cell fast path for the LOAD_GLOBAL / LOAD_NAME folds:
-/// const-fold a module-global name read to a `QuasiimmutField` version guard
-/// + elidable `jit_namespace_cell_lookup`, reading an `ObjectMutableCell`'s
+/// const-fold a module-global name read to a `QuasiimmutField` version guard + elidable `jit_namespace_cell_lookup`, reading an `ObjectMutableCell`'s
 /// `w_value` live.  Returns `false` (fall through to the residual) for a
 /// missing / `IntMutableCell` slot.
 fn emit_module_dict_cell_fold<Sym: WalkSym>(
@@ -14172,8 +14170,7 @@ fn emit_module_dict_cell_fold<Sym: WalkSym>(
     Ok(false)
 }
 
-/// Emit the `QUASIIMMUT_FIELD(ns, slot)` + elidable `jit_namespace_cell_lookup`
-/// + (for a mutable cell) live field read that the LOAD_GLOBAL cell fold lowers
+/// Emit the `QUASIIMMUT_FIELD(ns, slot)` + elidable `jit_namespace_cell_lookup` + (for a mutable cell) live field read that the LOAD_GLOBAL cell fold lowers
 /// to, seeding the dst's concrete with the unwrapped value.  `stored` is the
 /// raw value-or-cell at `slot` of `ns` (a module dict in strategy mode); the
 /// caller has already proven it foldable and non-null.  An

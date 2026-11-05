@@ -66,10 +66,10 @@ fn dispatch_halt_post_loop(program: &Bytecode, threshold: u32, n: i64) -> i64 {
         pc += 1;
         match opcode {
             OP_ADD => {
-                state.acc = state.acc + state.cnt;
+                state.acc += state.cnt;
             }
             OP_DEC => {
-                state.cnt = state.cnt - 1;
+                state.cnt -= 1;
             }
             OP_BACK => {
                 let target = program[pc] as usize;
@@ -91,7 +91,7 @@ fn dispatch_halt_post_loop(program: &Bytecode, threshold: u32, n: i64) -> i64 {
     if state.cnt < 0 {
         0
     } else {
-        state.acc = state.acc + EPILOGUE_BONUS;
+        state.acc += EPILOGUE_BONUS;
         state.acc
     }
 }

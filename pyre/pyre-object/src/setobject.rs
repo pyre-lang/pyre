@@ -1520,7 +1520,7 @@ where
     };
     let grew = {
         let dst = crate::gc_roots::shadow_stack_get(dst_slot);
-        let storage = unsafe { &mut *strategy.storage_ptr(&mut *(dst as *mut W_SetObject)) };
+        let storage = unsafe { &mut *strategy.storage_ptr(&*(dst as *mut W_SetObject)) };
         let mut grew = false;
         for key in keys {
             if storage.insert(key, ()).is_none() {
@@ -1591,7 +1591,7 @@ where
     };
     let removed = {
         let dst = crate::gc_roots::shadow_stack_get(dst_slot);
-        let storage = unsafe { &mut *strategy.storage_ptr(&mut *(dst as *mut W_SetObject)) };
+        let storage = unsafe { &mut *strategy.storage_ptr(&*(dst as *mut W_SetObject)) };
         let mut removed = false;
         for key in &keys {
             if storage.remove(key).is_some() {

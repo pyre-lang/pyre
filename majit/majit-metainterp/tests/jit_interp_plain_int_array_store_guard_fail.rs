@@ -86,11 +86,11 @@ fn hot_then_rare(
         can_enter_jit!(driver, 0usize, &mut state, program, || {});
         jit_merge_point!(driver, program, pc; state);
         if state.pos >= state.switch_at {
-            state.cells[0] = state.cells[0] + RARE_ADD;
+            state.cells[0] += RARE_ADD;
         } else {
-            state.cells[0] = state.cells[0] + state.cells[1];
+            state.cells[0] += state.cells[1];
         }
-        state.pos = state.pos + 1i64;
+        state.pos += 1i64;
     }
     cells_fingerprint(&state.cells)
 }

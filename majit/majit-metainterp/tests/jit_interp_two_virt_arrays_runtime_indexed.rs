@@ -104,12 +104,12 @@ pub fn mainloop(program: &Bytecode, iterations: i64, threshold: u32) -> i64 {
                 pc += 1;
                 let slot = state.sel * CAP + (state.sp & CAP_MASK);
                 state.vals[slot] = value;
-                state.sp = state.sp + 1;
+                state.sp += 1;
             }
             OP_DRAIN => {
-                state.sp = state.sp - 1;
+                state.sp -= 1;
                 let slot = state.sel * CAP + (state.sp & CAP_MASK);
-                state.acc = state.acc + state.vals[slot];
+                state.acc += state.vals[slot];
             }
             OP_SWITCH => {
                 // Park the outgoing pool's height and take the incoming one's
@@ -119,7 +119,7 @@ pub fn mainloop(program: &Bytecode, iterations: i64, threshold: u32) -> i64 {
                 state.sp = state.depths[state.sel] as usize;
             }
             OP_BACK => {
-                state.counter = state.counter - 1;
+                state.counter -= 1;
                 if state.counter != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;

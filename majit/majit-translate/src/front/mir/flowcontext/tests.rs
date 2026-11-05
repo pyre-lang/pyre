@@ -178,19 +178,19 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
     });
     let body = crate::front::clause_spec::substituted_unstructured(
         fd,
-        &llbc,
+        llbc,
         &[],
         &[i64_ty, gcref_ty],
         &[],
     )
     .expect("substituted entries_item_ptr body");
-    crate::test_support::with_lowering(&llbc, |context| {
+    crate::test_support::with_lowering(llbc, |context| {
         let struct_fields = super::struct_field_registry_from_rows(&context.struct_fields);
-        let accum = super::AccumulatorFacts::build(&llbc, &body);
+        let accum = super::AccumulatorFacts::build(llbc, &body);
         let jitdriver_receiver_roots =
             crate::codewriter::jtransform::default_jitdriver_receiver_roots();
         let graph = super::lower_unstructured_with_static_addrs_and_attrs(
-            &llbc,
+            llbc,
             fd,
             &body,
             crate::HostStaticAddrs::default(),
@@ -204,7 +204,7 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
             &context.raw_alloc_flavor_structs,
             accum.has_builder,
             &accum,
-            &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+            &super::RootStackAnalyzer::new(llbc, &super::RootStackState::new(llbc)),
             None,
             true,
             None,
@@ -874,16 +874,18 @@ fn graph_has_ctor_or_new(graph: &FunctionGraph) -> bool {
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
-        .any(|op| match &op.kind {
-            OpKind::New { .. } => true,
-            OpKind::Call {
-                target:
-                    CallTarget::SyntheticTransparentCtor {
-                        is_struct: true, ..
-                    },
-                ..
-            } => true,
-            _ => false,
+        .any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::New { .. }
+                    | OpKind::Call {
+                        target: CallTarget::SyntheticTransparentCtor {
+                            is_struct: true,
+                            ..
+                        },
+                        ..
+                    }
+            )
         })
 }
 
@@ -2082,8 +2084,8 @@ fn random_genrand32_fixed_array_keeps_concrete_identity() {
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path().ends_with("::genrand32"))
         .expect("_random::Random::genrand32 in interpreter LLBC");
-    crate::test_support::with_lowering(&llbc, |context| {
-        let graph = super::lower_fun_decl(&context, fd).expect("lower Random::genrand32");
+    crate::test_support::with_lowering(llbc, |context| {
+        let graph = super::lower_fun_decl(context, fd).expect("lower Random::genrand32");
 
         let mut reads = 0usize;
         let mut writes = 0usize;
@@ -2137,9 +2139,9 @@ fn rbigint_gc_root_unsafecell_calls_are_word_identity() {
             .iter_local_fns()
             .find(|fd| fd.item_meta.name_path() == name)
             .unwrap_or_else(|| panic!("{name} in majit-rlib LLBC"));
-        crate::test_support::with_lowering(&llbc, |context| {
+        crate::test_support::with_lowering(llbc, |context| {
             let graph =
-                super::lower_fun_decl(&context, fd).unwrap_or_else(|e| panic!("lower {name}: {e}"));
+                super::lower_fun_decl(context, fd).unwrap_or_else(|e| panic!("lower {name}: {e}"));
             for op in graph.blocks.iter().flat_map(|block| &block.operations) {
                 let OpKind::Call { target, .. } = &op.kind else {
                     continue;
@@ -2462,8 +2464,8 @@ fn live_rbigint_clone_result_is_rbigint_instance() {
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path() == "majit_rlib::rbigint::gc::live_rbigint")
         .expect("live_rbigint in majit-rlib LLBC");
-    crate::test_support::with_lowering(&llbc, |context| {
-        let graph = super::lower_fun_decl(&context, fd).expect("lower live_rbigint");
+    crate::test_support::with_lowering(llbc, |context| {
+        let graph = super::lower_fun_decl(context, fd).expect("lower live_rbigint");
         let rooted = graph
             .blocks
             .iter()
@@ -2497,8 +2499,8 @@ fn a_kept_handle_roots_the_producer_value_with_the_real_new() {
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path() == "majit_rlib::rbigint::_int_bitwise_and")
         .expect("_int_bitwise_and in majit-rlib LLBC");
-    crate::test_support::with_lowering(&llbc, |context| {
-        let graph = super::lower_fun_decl(&context, fd).expect("lower _int_bitwise_and");
+    crate::test_support::with_lowering(llbc, |context| {
+        let graph = super::lower_fun_decl(context, fd).expect("lower _int_bitwise_and");
         let leaf_of = |op: &crate::model::SpaceOperation| match &op.kind {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
@@ -2539,7 +2541,7 @@ fn a_kept_handle_roots_the_producer_value_with_the_real_new() {
                     == "majit_rlib::rbigint::_int_bitwise_and::<Impl>::call_once"
             })
             .expect("_int_bitwise_and closure in majit-rlib LLBC");
-        super::lower_fun_decl(&context, closure).expect("lower the _int_bitwise_and closure");
+        super::lower_fun_decl(context, closure).expect("lower the _int_bitwise_and closure");
     });
 }
 
@@ -2557,8 +2559,8 @@ fn live_rbigint_returns_the_rooted_value() {
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path() == "majit_rlib::rbigint::gc::live_rbigint")
         .expect("live_rbigint in majit-rlib LLBC");
-    crate::test_support::with_lowering(&llbc, |context| {
-        let graph = super::lower_fun_decl(&context, fd).expect("lower live_rbigint");
+    crate::test_support::with_lowering(llbc, |context| {
+        let graph = super::lower_fun_decl(context, fd).expect("lower live_rbigint");
         for op in graph.blocks.iter().flat_map(|block| &block.operations) {
             let OpKind::Call { target, .. } = &op.kind else {
                 continue;
@@ -2593,10 +2595,10 @@ fn items_block_set_ref_call_is_one_array_write() {
     let mut writes = Vec::new();
     let mut object_items_casts = Vec::new();
     for op in graph.blocks.iter().flat_map(|block| &block.operations) {
-        if crate::model::cast_instance_root(&op.kind) == Some("[pyobject::PyObject]") {
-            if let Some(result) = op.result.as_ref() {
-                object_items_casts.push(result.clone());
-            }
+        if crate::model::cast_instance_root(&op.kind) == Some("[pyobject::PyObject]")
+            && let Some(result) = op.result.as_ref()
+        {
+            object_items_casts.push(result.clone());
         }
         if let OpKind::ArrayWrite {
             base,
@@ -2641,8 +2643,8 @@ fn gcref_address_cast_store_keeps_gcref_pointer() {
             fd.item_meta.name_path() == "majit_rlib::rbigint::<Impl>::with_size_reloading_digits"
         })
         .expect("with_size_reloading_digits");
-    crate::test_support::with_lowering(&llbc, |context| {
-        let graph = super::lower_fun_decl(&context, fd).expect("lower with_size_reloading_digits");
+    crate::test_support::with_lowering(llbc, |context| {
+        let graph = super::lower_fun_decl(context, fd).expect("lower with_size_reloading_digits");
         let mut gcref_casts = 0;
         let mut pointer_stores = 0;
         for op in graph.blocks.iter().flat_map(|block| &block.operations) {
@@ -2732,8 +2734,8 @@ fn assert_extracted_core_body_lowers(llbc: &Llbc, suffix: &str) {
             if !name_path.ends_with(suffix) {
                 continue;
             }
-            let graph = super::lower_fun_decl(&ctx, fd)
-                .unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
+            let graph =
+                super::lower_fun_decl(ctx, fd).unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
             let leftover_divergent = graph
                 .blocks
                 .iter()
@@ -2789,7 +2791,7 @@ fn call_leaf_is_diverging_panic(op: &crate::model::SpaceOperation) -> bool {
         || leaf == Some("unwrap_failed")
         || leaf == Some("panic")
         || leaf == Some("panic_fmt")
-        || segs.iter().any(|s| *s == "panicking")
+        || segs.contains(&"panicking")
 }
 
 fn graph_has_live_assertion_branch(graph: &crate::model::FunctionGraph) -> bool {
@@ -2817,8 +2819,8 @@ fn random_rnd_keeps_regular_call_to_core_body() {
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path() == "pyre_module::module::_random::<Impl>::rnd")
         .expect("W_Random::rnd");
-    crate::test_support::with_lowering(&llbc, |context| {
-        let graph = super::lower_fun_decl(&context, fd).expect("lower rnd");
+    crate::test_support::with_lowering(llbc, |context| {
+        let graph = super::lower_fun_decl(context, fd).expect("lower rnd");
         assert_eq!(
             core_option_impl_expect_call_count(&graph),
             1,
@@ -2851,8 +2853,8 @@ fn random_wrapper_narrows_nullable_self_to_w_random() {
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path().ends_with("::__majit_wrap_random"))
         .expect("_random::__majit_wrap_random");
-    crate::test_support::with_lowering(&llbc, |context| {
-        let graph = super::lower_fun_decl(&context, fd).expect("lower wrapper");
+    crate::test_support::with_lowering(llbc, |context| {
+        let graph = super::lower_fun_decl(context, fd).expect("lower wrapper");
         let receiver = graph
             .blocks
             .iter()
@@ -5259,8 +5261,8 @@ fn dict_strategy_ref_imp_layout_is_dyn_fat() {
         return;
     };
     let (_, _, fields, _, _, attrs, _, _) = super::derive_program_metadata(
-        &llbc,
-        &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        llbc,
+        &super::harvest_declared_gc_facts(llbc).gc_struct_ids(),
         super::no_immutable_fields(),
         &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc)),
         &[],
@@ -5311,7 +5313,7 @@ fn range_contains_real_body_carries_le_lt() {
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    crate::test_support::with_lowering(&llbc, |ctx| {
+    crate::test_support::with_lowering(llbc, |ctx| {
         let mut bounds_contains = None;
         let mut range_contains = None;
         for fd in llbc.iter_fun_decls() {
@@ -5331,7 +5333,7 @@ fn range_contains_real_body_carries_le_lt() {
             }
         }
         let bounds_fd = bounds_contains.expect("RangeBounds::contains FunDecl with a body");
-        let bounds_graph = super::lower_fun_decl(&ctx, bounds_fd)
+        let bounds_graph = super::lower_fun_decl(ctx, bounds_fd)
             .unwrap_or_else(|e| panic!("lower RangeBounds::contains: {e:?}"));
 
         let mut leaves: Vec<String> = Vec::new();
@@ -5370,7 +5372,7 @@ fn range_contains_real_body_carries_le_lt() {
         assert!(has("lt"), "missing lt: leaves={leaves:?} binops={binops:?}");
 
         if let Some(range_fd) = range_contains {
-            let range_graph = super::lower_fun_decl(&ctx, range_fd)
+            let range_graph = super::lower_fun_decl(ctx, range_fd)
                 .unwrap_or_else(|e| panic!("lower Range::contains: {e:?}"));
             let mut range_leaves: Vec<String> = Vec::new();
             let mut range_between = 0usize;
@@ -6141,9 +6143,9 @@ fn w_module_dict_setitem_str_internal_calls_inherent_setitem_str() {
                 .ends_with("::w_module_dict_setitem_str_internal")
         })
         .expect("w_module_dict_setitem_str_internal in pyre-object LLBC");
-    crate::test_support::with_lowering(&llbc, |context| {
+    crate::test_support::with_lowering(llbc, |context| {
         let graph =
-            super::lower_fun_decl(&context, fd).expect("lower w_module_dict_setitem_str_internal");
+            super::lower_fun_decl(context, fd).expect("lower w_module_dict_setitem_str_internal");
         let mut bindings = Vec::new();
         for op in graph_ops(&graph) {
             let OpKind::Call { target, .. } = &op.kind else {
@@ -6194,7 +6196,7 @@ fn w_module_dict_setitem_str_internal_calls_inherent_setitem_str() {
             );
             assert_eq!(
                 bound,
-                super::registered_path_for_fun_decl(&llbc, callee).segments
+                super::registered_path_for_fun_decl(llbc, callee).segments
             );
             assert!(
                 !bound.iter().any(|s| s.starts_with("<impl ")),
@@ -7516,8 +7518,8 @@ fn pointer_to_usize_cast_keeps_rpython_signed_then_unsigned_sequence() {
 fn look_inside_iff_vec_trampoline_records_rust_vec_root() {
     let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    crate::test_support::with_lowering(&llbc, |context| {
-        let opaque = super::dont_look_inside_set_of(&llbc);
+    crate::test_support::with_lowering(llbc, |context| {
+        let opaque = super::dont_look_inside_set_of(llbc);
         for (name, root) in [
             (
                 "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_r_trampoline",
@@ -7542,7 +7544,7 @@ fn look_inside_iff_vec_trampoline_records_rust_vec_root() {
                 "{policy} is the dont_look_inside trampoline"
             );
             let graph =
-                super::lower_fun_decl(&context, fd).unwrap_or_else(|e| panic!("lower {name}: {e}"));
+                super::lower_fun_decl(context, fd).unwrap_or_else(|e| panic!("lower {name}: {e}"));
             assert_eq!(graph.return_container_root.as_deref(), Some(root), "{name}");
         }
     });
@@ -8269,7 +8271,7 @@ fn result_as_ref_keeps_regular_call_to_core_body() {
     let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
     };
-    let caller = crate::test_support::lower_function(&llbc, "unicode_translate_error_str")
+    let caller = crate::test_support::lower_function(llbc, "unicode_translate_error_str")
         .expect("lower unicode_translate_error_str");
     let as_ref_calls = caller
         .blocks
@@ -8295,7 +8297,7 @@ fn result_as_ref_keeps_regular_call_to_core_body() {
         "caller keeps one regular call to the core as_ref body, got {as_ref_calls}"
     );
 
-    crate::test_support::with_lowering(&llbc, |ctx| {
+    crate::test_support::with_lowering(llbc, |ctx| {
         let mut lowered_core_bodies = 0usize;
         for fd in llbc.iter_fun_decls() {
             if !fd.has_unstructured_body() {
@@ -8305,8 +8307,8 @@ fn result_as_ref_keeps_regular_call_to_core_body() {
             if !name_path.ends_with("::result::<Impl>::as_ref") {
                 continue;
             }
-            let graph = super::lower_fun_decl(&ctx, fd)
-                .unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
+            let graph =
+                super::lower_fun_decl(ctx, fd).unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
             let has_disc = graph.blocks.iter().any(|block| {
                 matches!(block.exitswitch, Some(ExitSwitch::Value(_)))
                     || block.operations.iter().any(|op| {
@@ -8337,7 +8339,7 @@ fn combine_starstarargs_keeps_regular_call_to_core_expect() {
     let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
     };
-    let caller = crate::test_support::lower_function(&llbc, "combine_starstarargs_wrapped")
+    let caller = crate::test_support::lower_function(llbc, "combine_starstarargs_wrapped")
         .expect("lower combine_starstarargs_wrapped");
     assert_eq!(
         core_option_impl_expect_call_count(&caller),
@@ -8346,7 +8348,7 @@ fn combine_starstarargs_keeps_regular_call_to_core_expect() {
         core_option_impl_expect_call_count(&caller)
     );
 
-    crate::test_support::with_lowering(&llbc, |ctx| {
+    crate::test_support::with_lowering(llbc, |ctx| {
         let mut lowered_core_bodies = 0usize;
         for fd in llbc.iter_fun_decls() {
             if !fd.has_unstructured_body() {
@@ -8356,8 +8358,8 @@ fn combine_starstarargs_keeps_regular_call_to_core_expect() {
             if !name_path.ends_with("::option::<Impl>::expect") {
                 continue;
             }
-            let graph = super::lower_fun_decl(&ctx, fd)
-                .unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
+            let graph =
+                super::lower_fun_decl(ctx, fd).unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
             let leftover_divergent = graph
                 .blocks
                 .iter()
@@ -8403,7 +8405,7 @@ fn complex_add_keeps_regular_call_to_core_unwrap() {
         return;
     };
     let caller =
-        crate::test_support::lower_function(&llbc, "complex_add").expect("lower complex_add");
+        crate::test_support::lower_function(llbc, "complex_add").expect("lower complex_add");
     assert_eq!(
         core_impl_call_count(&caller, "unwrap", "option"),
         2,
@@ -8423,7 +8425,7 @@ fn complex_add_keeps_regular_call_to_core_unwrap() {
         !graph_has_live_assertion_branch(&caller),
         "complex_add must not keep a live AssertionError raise after simplify"
     );
-    assert_extracted_core_body_lowers(&llbc, "::option::<Impl>::unwrap");
+    assert_extracted_core_body_lowers(llbc, "::option::<Impl>::unwrap");
 }
 
 /// `unicode_translate_error_str` has two plain Result expects:
@@ -8437,7 +8439,7 @@ fn unicode_translate_error_str_keeps_regular_call_to_core_result_expect() {
     let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
     };
-    let caller = crate::test_support::lower_function(&llbc, "unicode_translate_error_str")
+    let caller = crate::test_support::lower_function(llbc, "unicode_translate_error_str")
         .expect("lower unicode_translate_error_str");
     assert_eq!(
         core_impl_call_count(&caller, "expect", "result"),
@@ -8458,7 +8460,7 @@ fn unicode_translate_error_str_keeps_regular_call_to_core_result_expect() {
         !graph_has_live_assertion_branch(&caller),
         "unicode_translate_error_str must not keep a live AssertionError raise after simplify"
     );
-    assert_extracted_core_body_lowers(&llbc, "::result::<Impl>::expect");
+    assert_extracted_core_body_lowers(llbc, "::result::<Impl>::expect");
 }
 
 /// `range_list_length` is `usize::try_from(...).unwrap()`. The caller
@@ -8470,7 +8472,7 @@ fn range_list_length_keeps_regular_call_to_core_result_unwrap() {
     let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
     };
-    let caller = crate::test_support::lower_function(&llbc, "range_list_length")
+    let caller = crate::test_support::lower_function(llbc, "range_list_length")
         .expect("lower range_list_length");
     assert_eq!(
         core_impl_call_count(&caller, "unwrap", "result"),
@@ -8491,7 +8493,7 @@ fn range_list_length_keeps_regular_call_to_core_result_unwrap() {
         !graph_has_live_assertion_branch(&caller),
         "range_list_length must not keep a live AssertionError raise after simplify"
     );
-    assert_extracted_core_body_lowers(&llbc, "::result::<Impl>::unwrap");
+    assert_extracted_core_body_lowers(llbc, "::result::<Impl>::unwrap");
 }
 
 /// A plain Result dest stays a regular call of the extracted core body
@@ -8505,7 +8507,7 @@ fn result_map_err_keeps_regular_call_to_core_body() {
     let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
     };
-    let caller = crate::test_support::lower_function(&llbc, "read_code_units")
+    let caller = crate::test_support::lower_function(llbc, "read_code_units")
         .expect("lower read_code_units");
     let map_err_calls = caller
         .blocks
@@ -8531,7 +8533,7 @@ fn result_map_err_keeps_regular_call_to_core_body() {
         "caller keeps one regular call to the core map_err body, got {map_err_calls}"
     );
 
-    crate::test_support::with_lowering(&llbc, |ctx| {
+    crate::test_support::with_lowering(llbc, |ctx| {
         let mut lowered_core_bodies = 0usize;
         for fd in llbc.iter_fun_decls() {
             if !fd.has_unstructured_body() {
@@ -8541,8 +8543,8 @@ fn result_map_err_keeps_regular_call_to_core_body() {
             if !name_path.ends_with("::result::<Impl>::map_err") {
                 continue;
             }
-            let graph = super::lower_fun_decl(&ctx, fd)
-                .unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
+            let graph =
+                super::lower_fun_decl(ctx, fd).unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
             let has_disc = graph.blocks.iter().any(|block| {
                 matches!(block.exitswitch, Some(ExitSwitch::Value(_)))
                     || block.operations.iter().any(|op| {
@@ -8594,7 +8596,7 @@ fn result_map_err_unit_ok_caller_keeps_regular_call_to_core_body() {
     let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
     };
-    let caller = crate::test_support::lower_function(&llbc, "dict_store_checked")
+    let caller = crate::test_support::lower_function(llbc, "dict_store_checked")
         .expect("lower dict_store_checked");
     let map_err_calls = caller
         .blocks
@@ -9085,8 +9087,8 @@ fn root_bracket_erasure_names_the_pin_a_shadow_stack_len_reads() {
             &llbc,
             body,
             &super::MovedOutLocals::with_set(body, bit_set::BitSet::new()),
-            &name_of,
-            &touches,
+            name_of,
+            touches,
         )
     };
     let push = || (vec![], call(1, vec![], 3, 0));
@@ -9109,10 +9111,10 @@ fn root_bracket_erasure_names_the_pin_a_shadow_stack_len_reads() {
     assert_eq!(plan.get_answer(3), Some(1usize));
     assert_eq!(plan.slot_temps.get(&4), Some(&3), "the len result");
     assert!(
-        plan.slot_temps.get(&5).is_none(),
+        !plan.slot_temps.contains_key(&5),
         "pin_root's result is the value, not a depth"
     );
-    assert!(plan.base_results.get(&4).is_none());
+    assert!(!plan.base_results.contains_key(&4));
     for bb in [1usize, 2, 3] {
         assert_eq!(plan.free_sites.get(&bb), Some(&3), "free call in bb{bb}");
     }
@@ -9147,8 +9149,8 @@ fn root_bracket_erasure_names_the_pin_a_shadow_stack_len_reads() {
     assert_eq!(plan.pins.get(&3), Some(&vec![1, 2]));
     assert_eq!(plan.get_sites, vec![(4usize, 2usize)]);
     assert_eq!(plan.slot_temps.get(&4), Some(&3));
-    assert!(plan.slot_temps.get(&8).is_none());
-    assert!(plan.slot_temps.get(&9).is_none());
+    assert!(!plan.slot_temps.contains_key(&8));
+    assert!(!plan.slot_temps.contains_key(&9));
 
     // `len + 1` names the pin after the one the len names. A copy of
     // that sum is the argument temporary MIR builds for the get.
@@ -9398,8 +9400,8 @@ fn root_bracket_erasure_erases_free_pins_indexed_by_len_after_open() {
         &fixture_llbc(),
         &body,
         &super::MovedOutLocals::with_set(&body, bit_set::BitSet::new()),
-        &name_of,
-        &touches,
+        name_of,
+        touches,
     );
     assert!(
         plan.scopes.contains(3),
@@ -9433,7 +9435,7 @@ fn saturating_sub_wrapper_diamond_real() {
     use crate::model::OpKind;
     let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    crate::test_support::with_lowering(&llbc, |context| {
+    crate::test_support::with_lowering(llbc, |context| {
         let mut saw = 0usize;
         for fd in llbc.iter_fun_decls() {
             if fd.item_meta.name_path() != "core::num::<Impl>::saturating_sub" {
@@ -9442,7 +9444,7 @@ fn saturating_sub_wrapper_diamond_real() {
             if !fd.has_unstructured_body() {
                 continue;
             }
-            let graph = super::lower_fun_decl(&context, fd)
+            let graph = super::lower_fun_decl(context, fd)
                 .expect("lower core::num::<Impl>::saturating_sub");
             let start = &graph.blocks[graph.startblock.0];
             assert!(
@@ -9489,7 +9491,7 @@ fn opcode_impl_receiver_keeps_pyframe_input_root() {
     );
     let llbc = crate::test_support::load_ullbc(path);
     let graph =
-        crate::test_support::lower_function(&llbc, "pyre_interpreter::eval::<Impl>::pop_value")
+        crate::test_support::lower_function(llbc, "pyre_interpreter::eval::<Impl>::pop_value")
             .expect("lower eval::<Impl>::pop_value");
     let receiver = graph
         .block(graph.startblock)
@@ -9593,10 +9595,10 @@ fn opcode_step_executor_to_bool_direct_path_is_pyframe_override() {
     let mut to_bool_default = false;
     for fd in llbc.iter_local_fns() {
         let name_path = fd.item_meta.name_path();
-        let trait_path = super::trait_impl_trait_path_for_fundecl(&llbc, fd);
+        let trait_path = super::trait_impl_trait_path_for_fundecl(llbc, fd);
         let trait_leaf = trait_path.as_deref().and_then(|p| p.rsplit("::").next());
         if trait_leaf == Some("OpcodeStepExecutor")
-            && let Some((owner, method)) = super::impl_method_owner_for_fundecl(&llbc, fd)
+            && let Some((owner, method)) = super::impl_method_owner_for_fundecl(llbc, fd)
         {
             owners.insert(owner);
             if method == "to_bool" {
@@ -9970,7 +9972,7 @@ fn option_of_one_word_item_vec_keeps_the_enum_tag() {
     use crate::model::OpKind;
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
-    crate::test_support::with_lowering(&llbc, |context| {
+    crate::test_support::with_lowering(llbc, |context| {
         let fd = llbc
             .iter_local_fns()
             .find(|fd| {
@@ -9978,7 +9980,7 @@ fn option_of_one_word_item_vec_keeps_the_enum_tag() {
                     && fd.signature.inputs.len() == 7
             })
             .expect("Arguments::new");
-        let graph = super::lower_fun_decl(&context, fd).expect("lower Arguments::new");
+        let graph = super::lower_fun_decl(context, fd).expect("lower Arguments::new");
         let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
         assert!(
             !ops().any(|op| matches!(&op.kind,
@@ -10012,8 +10014,8 @@ fn struct_ptr_write_copies_inlined_struct_field_leaves() {
                 .is_some_and(|text| text.starts_with("pub fn new(mut frame: PyFrame)"))
         })
         .expect("FrameBox::new");
-    crate::test_support::with_lowering(&llbc, |context| {
-        let graph = super::lower_fun_decl(&context, fd).expect("lower FrameBox::new");
+    crate::test_support::with_lowering(llbc, |context| {
+        let graph = super::lower_fun_decl(context, fd).expect("lower FrameBox::new");
         assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
                 matches!(
@@ -10075,8 +10077,8 @@ fn snapshot_frame_ctor_stores_inlined_header_as_leaves() {
                 })
             })
             .expect("build_snapshot_frame");
-    crate::test_support::with_lowering(&llbc, |context| {
-        let graph = super::lower_fun_decl(&context, fd).expect("lower build_snapshot_frame");
+    crate::test_support::with_lowering(llbc, |context| {
+        let graph = super::lower_fun_decl(context, fd).expect("lower build_snapshot_frame");
         assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
                 matches!(
@@ -10119,7 +10121,7 @@ fn slice_get_rangefrom_preserves_constant_bound_rtype() {
     use crate::translator::rtyper::cutover::{DualGateOutcome, dual_gate_check_with_registry};
     let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::MODULE_ULLBC);
     let graph = crate::test_support::lower_function(
-        &llbc,
+        llbc,
         "pyre_module::module::unicodedata::interp_ucd::ucd_method_args",
     )
     .expect("lower actual RangeFrom get caller");
@@ -10485,8 +10487,8 @@ fn pyerror_exc_object_registry_retains_instance_ref() {
     );
     let llbc = crate::test_support::load_ullbc(path);
     let (_, _, fields, _, _, _, _, _) = super::derive_program_metadata(
-        &llbc,
-        &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        llbc,
+        &super::harvest_declared_gc_facts(llbc).gc_struct_ids(),
         super::no_immutable_fields(),
         &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc)),
         &[],

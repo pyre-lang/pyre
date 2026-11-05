@@ -66,8 +66,8 @@ fn matchless_count(program: &Bytecode, threshold: u32, n: i64) -> i64 {
     while state.pos < state.n {
         can_enter_jit!(driver, 0usize, &mut state, program, || {});
         jit_merge_point!(driver, program, pc; state);
-        state.acc = state.acc + 1i64;
-        state.pos = state.pos + 1i64;
+        state.acc += 1i64;
+        state.pos += 1i64;
     }
     state.acc
 }
@@ -90,7 +90,7 @@ fn a_matchless_portal_compiles_the_while_body() {
     );
     let body = REC.body.lock().clone();
     assert!(
-        body.iter().any(|op| *op == OpCode::IntAdd),
+        body.contains(&OpCode::IntAdd),
         "the compiled loop carries no increment, so it runs none of the \
          while body: {body:#?}",
     );
@@ -130,10 +130,10 @@ fn matchless_with_local_match(program: &Bytecode, threshold: u32, n: i64) -> i64
         can_enter_jit!(driver, 0usize, &mut state, program, || {});
         jit_merge_point!(driver, program, pc; state);
         match state.acc {
-            0 => state.acc = state.acc + 2i64,
-            _ => state.acc = state.acc + 1i64,
+            0 => state.acc += 2i64,
+            _ => state.acc += 1i64,
         }
-        state.pos = state.pos + 1i64;
+        state.pos += 1i64;
     }
     state.acc
 }
@@ -155,7 +155,7 @@ fn a_matchless_portal_with_a_local_match_still_runs_the_body() {
     );
     let body = REC.body.lock().clone();
     assert!(
-        body.iter().any(|op| *op == OpCode::IntAdd),
+        body.contains(&OpCode::IntAdd),
         "the compiled loop carries no increment: {body:#?}",
     );
 }
@@ -194,11 +194,11 @@ fn matchless_with_continue(program: &Bytecode, threshold: u32, n: i64) -> i64 {
         can_enter_jit!(driver, 0usize, &mut state, program, || {});
         jit_merge_point!(driver, program, pc; state);
         if state.pos % 2i64 == 0i64 {
-            state.pos = state.pos + 1i64;
+            state.pos += 1i64;
             continue;
         }
-        state.acc = state.acc + 1i64;
-        state.pos = state.pos + 1i64;
+        state.acc += 1i64;
+        state.pos += 1i64;
     }
     state.acc
 }

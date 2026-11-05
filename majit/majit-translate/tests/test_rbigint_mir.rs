@@ -482,7 +482,7 @@ fn rbigint_impl_methods_preserve_upstream_elidable_markers() {
     let Some(llbcs) = rbigint_llbcs() else {
         return;
     };
-    let hints = harvest_hints_from_llbcs(&llbcs);
+    let hints = harvest_hints_from_llbcs(llbcs);
     // Exhaustive mapping of every `@jit.elidable` method in the pinned
     // rpython/rlib/rbigint.py.  This is a performance contract, not just
     // metadata: missing one changes whether callers residualize a pure bigint
@@ -714,7 +714,7 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
         return;
     };
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
-        &llbcs,
+        llbcs,
         HostStaticAddrs::default(),
         &["rbigint", "longobject"],
     )
@@ -2010,7 +2010,7 @@ fn rbigint_add_residual_calls_the_rbigint_add_body_once() {
         return;
     };
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
-        &llbcs,
+        llbcs,
         HostStaticAddrs::default(),
         &["longobject"],
         &["jit_bigint_add", "w_long_from_i64", "box_bigint_constant"],

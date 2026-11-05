@@ -124,10 +124,10 @@ macro_rules! machine {
                         // node: the store the walk exists to reach.
                         let m = c.marked;
                         c.marked = m + 1i64;
-                        state.acc = state.acc + m;
+                        state.acc += m;
                     }
                     OP_TICK => {
-                        state.ticks = state.ticks - 1i64;
+                        state.ticks -= 1i64;
                         if state.ticks != 0 {
                             can_enter_jit!(driver, 0usize, &mut state, program, || {});
                             pc = 0;

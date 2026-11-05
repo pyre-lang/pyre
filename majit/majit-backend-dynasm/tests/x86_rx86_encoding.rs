@@ -383,14 +383,14 @@ fn rx86_encoding() {
     enc!(mc => rx86::or8_mi(&mut mc, (13, 0), 0x11), or BYTE [r13], 0x11);
     enc!(mc => rx86::or8_mi(&mut mc, (15, 8), 0x11), or BYTE [r15 + 8], 0x11);
     // lea_ra
-    enc!(mc => rx86::lea_ra(&mut mc, 0, (0 as i16, 1, 0, 0)), lea rax, [rax + rcx * 1]);
-    enc!(mc => rx86::lea_ra(&mut mc, 0, (0 as i16, 1, 0, 8)), lea rax, [rax + rcx * 1 + 8]);
-    enc!(mc => rx86::lea_ra(&mut mc, 0, (0 as i16, 1, 3, 0)), lea rax, [rax + rcx * 8]);
-    enc!(mc => rx86::lea_ra(&mut mc, 0, (0 as i16, 1, 3, 8)), lea rax, [rax + rcx * 8 + 8]);
-    enc!(mc => rx86::lea_ra(&mut mc, 0, (0 as i16, 9, 0, 0)), lea rax, [rax + r9 * 1]);
-    enc!(mc => rx86::lea_ra(&mut mc, 0, (0 as i16, 9, 0, 8)), lea rax, [rax + r9 * 1 + 8]);
-    enc!(mc => rx86::lea_ra(&mut mc, 0, (0 as i16, 9, 3, 0)), lea rax, [rax + r9 * 8]);
-    enc!(mc => rx86::lea_ra(&mut mc, 0, (0 as i16, 9, 3, 8)), lea rax, [rax + r9 * 8 + 8]);
+    enc!(mc => rx86::lea_ra(&mut mc, 0, (0_i16, 1, 0, 0)), lea rax, [rax + rcx * 1]);
+    enc!(mc => rx86::lea_ra(&mut mc, 0, (0_i16, 1, 0, 8)), lea rax, [rax + rcx * 1 + 8]);
+    enc!(mc => rx86::lea_ra(&mut mc, 0, (0_i16, 1, 3, 0)), lea rax, [rax + rcx * 8]);
+    enc!(mc => rx86::lea_ra(&mut mc, 0, (0_i16, 1, 3, 8)), lea rax, [rax + rcx * 8 + 8]);
+    enc!(mc => rx86::lea_ra(&mut mc, 0, (0_i16, 9, 0, 0)), lea rax, [rax + r9 * 1]);
+    enc!(mc => rx86::lea_ra(&mut mc, 0, (0_i16, 9, 0, 8)), lea rax, [rax + r9 * 1 + 8]);
+    enc!(mc => rx86::lea_ra(&mut mc, 0, (0_i16, 9, 3, 0)), lea rax, [rax + r9 * 8]);
+    enc!(mc => rx86::lea_ra(&mut mc, 0, (0_i16, 9, 3, 8)), lea rax, [rax + r9 * 8 + 8]);
     enc!(mc => rx86::lea_ra(&mut mc, 0, (13 as i16, 1, 0, 0)), lea rax, [r13 + rcx * 1]);
     enc!(mc => rx86::lea_ra(&mut mc, 0, (13 as i16, 1, 0, 8)), lea rax, [r13 + rcx * 1 + 8]);
     enc!(mc => rx86::lea_ra(&mut mc, 0, (13 as i16, 1, 3, 0)), lea rax, [r13 + rcx * 8]);
@@ -400,14 +400,14 @@ fn rx86_encoding() {
     enc!(mc => rx86::lea_ra(&mut mc, 0, (13 as i16, 9, 3, 0)), lea rax, [r13 + r9 * 8]);
     enc!(mc => rx86::lea_ra(&mut mc, 15, (13 as i16, 9, 3, 8)), lea r15, [r13 + r9 * 8 + 8]);
     // mov_ra
-    enc!(mc => rx86::mov_ra(&mut mc, 0, (0 as i16, 1, 0, 0)), mov rax, [rax + rcx * 1]);
-    enc!(mc => rx86::mov_ra(&mut mc, 0, (0 as i16, 1, 0, 8)), mov rax, [rax + rcx * 1 + 8]);
-    enc!(mc => rx86::mov_ra(&mut mc, 0, (0 as i16, 1, 3, 0)), mov rax, [rax + rcx * 8]);
-    enc!(mc => rx86::mov_ra(&mut mc, 0, (0 as i16, 1, 3, 8)), mov rax, [rax + rcx * 8 + 8]);
-    enc!(mc => rx86::mov_ra(&mut mc, 0, (0 as i16, 9, 0, 0)), mov rax, [rax + r9 * 1]);
-    enc!(mc => rx86::mov_ra(&mut mc, 0, (0 as i16, 9, 0, 8)), mov rax, [rax + r9 * 1 + 8]);
-    enc!(mc => rx86::mov_ra(&mut mc, 0, (0 as i16, 9, 3, 0)), mov rax, [rax + r9 * 8]);
-    enc!(mc => rx86::mov_ra(&mut mc, 0, (0 as i16, 9, 3, 8)), mov rax, [rax + r9 * 8 + 8]);
+    enc!(mc => rx86::mov_ra(&mut mc, 0, (0_i16, 1, 0, 0)), mov rax, [rax + rcx * 1]);
+    enc!(mc => rx86::mov_ra(&mut mc, 0, (0_i16, 1, 0, 8)), mov rax, [rax + rcx * 1 + 8]);
+    enc!(mc => rx86::mov_ra(&mut mc, 0, (0_i16, 1, 3, 0)), mov rax, [rax + rcx * 8]);
+    enc!(mc => rx86::mov_ra(&mut mc, 0, (0_i16, 1, 3, 8)), mov rax, [rax + rcx * 8 + 8]);
+    enc!(mc => rx86::mov_ra(&mut mc, 0, (0_i16, 9, 0, 0)), mov rax, [rax + r9 * 1]);
+    enc!(mc => rx86::mov_ra(&mut mc, 0, (0_i16, 9, 0, 8)), mov rax, [rax + r9 * 1 + 8]);
+    enc!(mc => rx86::mov_ra(&mut mc, 0, (0_i16, 9, 3, 0)), mov rax, [rax + r9 * 8]);
+    enc!(mc => rx86::mov_ra(&mut mc, 0, (0_i16, 9, 3, 8)), mov rax, [rax + r9 * 8 + 8]);
     enc!(mc => rx86::mov_ra(&mut mc, 0, (13 as i16, 1, 0, 0)), mov rax, [r13 + rcx * 1]);
     enc!(mc => rx86::mov_ra(&mut mc, 0, (13 as i16, 1, 0, 8)), mov rax, [r13 + rcx * 1 + 8]);
     enc!(mc => rx86::mov_ra(&mut mc, 0, (13 as i16, 1, 3, 0)), mov rax, [r13 + rcx * 8]);
@@ -417,14 +417,14 @@ fn rx86_encoding() {
     enc!(mc => rx86::mov_ra(&mut mc, 0, (13 as i16, 9, 3, 0)), mov rax, [r13 + r9 * 8]);
     enc!(mc => rx86::mov_ra(&mut mc, 15, (13 as i16, 9, 3, 8)), mov r15, [r13 + r9 * 8 + 8]);
     // mov_ar
-    enc!(mc => rx86::mov_ar(&mut mc, (0 as i16, 1, 0, 0), 0), mov [rax + rcx * 1], rax);
-    enc!(mc => rx86::mov_ar(&mut mc, (0 as i16, 1, 0, 8), 0), mov [rax + rcx * 1 + 8], rax);
-    enc!(mc => rx86::mov_ar(&mut mc, (0 as i16, 1, 3, 0), 0), mov [rax + rcx * 8], rax);
-    enc!(mc => rx86::mov_ar(&mut mc, (0 as i16, 1, 3, 8), 0), mov [rax + rcx * 8 + 8], rax);
-    enc!(mc => rx86::mov_ar(&mut mc, (0 as i16, 9, 0, 0), 0), mov [rax + r9 * 1], rax);
-    enc!(mc => rx86::mov_ar(&mut mc, (0 as i16, 9, 0, 8), 0), mov [rax + r9 * 1 + 8], rax);
-    enc!(mc => rx86::mov_ar(&mut mc, (0 as i16, 9, 3, 0), 0), mov [rax + r9 * 8], rax);
-    enc!(mc => rx86::mov_ar(&mut mc, (0 as i16, 9, 3, 8), 0), mov [rax + r9 * 8 + 8], rax);
+    enc!(mc => rx86::mov_ar(&mut mc, (0_i16, 1, 0, 0), 0), mov [rax + rcx * 1], rax);
+    enc!(mc => rx86::mov_ar(&mut mc, (0_i16, 1, 0, 8), 0), mov [rax + rcx * 1 + 8], rax);
+    enc!(mc => rx86::mov_ar(&mut mc, (0_i16, 1, 3, 0), 0), mov [rax + rcx * 8], rax);
+    enc!(mc => rx86::mov_ar(&mut mc, (0_i16, 1, 3, 8), 0), mov [rax + rcx * 8 + 8], rax);
+    enc!(mc => rx86::mov_ar(&mut mc, (0_i16, 9, 0, 0), 0), mov [rax + r9 * 1], rax);
+    enc!(mc => rx86::mov_ar(&mut mc, (0_i16, 9, 0, 8), 0), mov [rax + r9 * 1 + 8], rax);
+    enc!(mc => rx86::mov_ar(&mut mc, (0_i16, 9, 3, 0), 0), mov [rax + r9 * 8], rax);
+    enc!(mc => rx86::mov_ar(&mut mc, (0_i16, 9, 3, 8), 0), mov [rax + r9 * 8 + 8], rax);
     enc!(mc => rx86::mov_ar(&mut mc, (13 as i16, 1, 0, 0), 0), mov [r13 + rcx * 1], rax);
     enc!(mc => rx86::mov_ar(&mut mc, (13 as i16, 1, 0, 8), 0), mov [r13 + rcx * 1 + 8], rax);
     enc!(mc => rx86::mov_ar(&mut mc, (13 as i16, 1, 3, 0), 0), mov [r13 + rcx * 8], rax);
@@ -434,14 +434,14 @@ fn rx86_encoding() {
     enc!(mc => rx86::mov_ar(&mut mc, (13 as i16, 9, 3, 0), 0), mov [r13 + r9 * 8], rax);
     enc!(mc => rx86::mov_ar(&mut mc, (13 as i16, 9, 3, 8), 15), mov [r13 + r9 * 8 + 8], r15);
     // mov32_ra
-    enc!(mc => rx86::mov32_ra(&mut mc, 0, (0 as i16, 1, 0, 0)), mov eax, [rax + rcx * 1]);
-    enc!(mc => rx86::mov32_ra(&mut mc, 0, (0 as i16, 1, 0, 8)), mov eax, [rax + rcx * 1 + 8]);
-    enc!(mc => rx86::mov32_ra(&mut mc, 0, (0 as i16, 1, 3, 0)), mov eax, [rax + rcx * 8]);
-    enc!(mc => rx86::mov32_ra(&mut mc, 0, (0 as i16, 1, 3, 8)), mov eax, [rax + rcx * 8 + 8]);
-    enc!(mc => rx86::mov32_ra(&mut mc, 0, (0 as i16, 9, 0, 0)), mov eax, [rax + r9 * 1]);
-    enc!(mc => rx86::mov32_ra(&mut mc, 0, (0 as i16, 9, 0, 8)), mov eax, [rax + r9 * 1 + 8]);
-    enc!(mc => rx86::mov32_ra(&mut mc, 0, (0 as i16, 9, 3, 0)), mov eax, [rax + r9 * 8]);
-    enc!(mc => rx86::mov32_ra(&mut mc, 0, (0 as i16, 9, 3, 8)), mov eax, [rax + r9 * 8 + 8]);
+    enc!(mc => rx86::mov32_ra(&mut mc, 0, (0_i16, 1, 0, 0)), mov eax, [rax + rcx * 1]);
+    enc!(mc => rx86::mov32_ra(&mut mc, 0, (0_i16, 1, 0, 8)), mov eax, [rax + rcx * 1 + 8]);
+    enc!(mc => rx86::mov32_ra(&mut mc, 0, (0_i16, 1, 3, 0)), mov eax, [rax + rcx * 8]);
+    enc!(mc => rx86::mov32_ra(&mut mc, 0, (0_i16, 1, 3, 8)), mov eax, [rax + rcx * 8 + 8]);
+    enc!(mc => rx86::mov32_ra(&mut mc, 0, (0_i16, 9, 0, 0)), mov eax, [rax + r9 * 1]);
+    enc!(mc => rx86::mov32_ra(&mut mc, 0, (0_i16, 9, 0, 8)), mov eax, [rax + r9 * 1 + 8]);
+    enc!(mc => rx86::mov32_ra(&mut mc, 0, (0_i16, 9, 3, 0)), mov eax, [rax + r9 * 8]);
+    enc!(mc => rx86::mov32_ra(&mut mc, 0, (0_i16, 9, 3, 8)), mov eax, [rax + r9 * 8 + 8]);
     enc!(mc => rx86::mov32_ra(&mut mc, 0, (13 as i16, 1, 0, 0)), mov eax, [r13 + rcx * 1]);
     enc!(mc => rx86::mov32_ra(&mut mc, 0, (13 as i16, 1, 0, 8)), mov eax, [r13 + rcx * 1 + 8]);
     enc!(mc => rx86::mov32_ra(&mut mc, 0, (13 as i16, 1, 3, 0)), mov eax, [r13 + rcx * 8]);
@@ -451,14 +451,14 @@ fn rx86_encoding() {
     enc!(mc => rx86::mov32_ra(&mut mc, 0, (13 as i16, 9, 3, 0)), mov eax, [r13 + r9 * 8]);
     enc!(mc => rx86::mov32_ra(&mut mc, 15, (13 as i16, 9, 3, 8)), mov r15d, [r13 + r9 * 8 + 8]);
     // mov32_ar
-    enc!(mc => rx86::mov32_ar(&mut mc, (0 as i16, 1, 0, 0), 0), mov [rax + rcx * 1], eax);
-    enc!(mc => rx86::mov32_ar(&mut mc, (0 as i16, 1, 0, 8), 0), mov [rax + rcx * 1 + 8], eax);
-    enc!(mc => rx86::mov32_ar(&mut mc, (0 as i16, 1, 3, 0), 0), mov [rax + rcx * 8], eax);
-    enc!(mc => rx86::mov32_ar(&mut mc, (0 as i16, 1, 3, 8), 0), mov [rax + rcx * 8 + 8], eax);
-    enc!(mc => rx86::mov32_ar(&mut mc, (0 as i16, 9, 0, 0), 0), mov [rax + r9 * 1], eax);
-    enc!(mc => rx86::mov32_ar(&mut mc, (0 as i16, 9, 0, 8), 0), mov [rax + r9 * 1 + 8], eax);
-    enc!(mc => rx86::mov32_ar(&mut mc, (0 as i16, 9, 3, 0), 0), mov [rax + r9 * 8], eax);
-    enc!(mc => rx86::mov32_ar(&mut mc, (0 as i16, 9, 3, 8), 0), mov [rax + r9 * 8 + 8], eax);
+    enc!(mc => rx86::mov32_ar(&mut mc, (0_i16, 1, 0, 0), 0), mov [rax + rcx * 1], eax);
+    enc!(mc => rx86::mov32_ar(&mut mc, (0_i16, 1, 0, 8), 0), mov [rax + rcx * 1 + 8], eax);
+    enc!(mc => rx86::mov32_ar(&mut mc, (0_i16, 1, 3, 0), 0), mov [rax + rcx * 8], eax);
+    enc!(mc => rx86::mov32_ar(&mut mc, (0_i16, 1, 3, 8), 0), mov [rax + rcx * 8 + 8], eax);
+    enc!(mc => rx86::mov32_ar(&mut mc, (0_i16, 9, 0, 0), 0), mov [rax + r9 * 1], eax);
+    enc!(mc => rx86::mov32_ar(&mut mc, (0_i16, 9, 0, 8), 0), mov [rax + r9 * 1 + 8], eax);
+    enc!(mc => rx86::mov32_ar(&mut mc, (0_i16, 9, 3, 0), 0), mov [rax + r9 * 8], eax);
+    enc!(mc => rx86::mov32_ar(&mut mc, (0_i16, 9, 3, 8), 0), mov [rax + r9 * 8 + 8], eax);
     enc!(mc => rx86::mov32_ar(&mut mc, (13 as i16, 1, 0, 0), 0), mov [r13 + rcx * 1], eax);
     enc!(mc => rx86::mov32_ar(&mut mc, (13 as i16, 1, 0, 8), 0), mov [r13 + rcx * 1 + 8], eax);
     enc!(mc => rx86::mov32_ar(&mut mc, (13 as i16, 1, 3, 0), 0), mov [r13 + rcx * 8], eax);
@@ -468,14 +468,14 @@ fn rx86_encoding() {
     enc!(mc => rx86::mov32_ar(&mut mc, (13 as i16, 9, 3, 0), 0), mov [r13 + r9 * 8], eax);
     enc!(mc => rx86::mov32_ar(&mut mc, (13 as i16, 9, 3, 8), 15), mov [r13 + r9 * 8 + 8], r15d);
     // mov16_ar
-    enc!(mc => rx86::mov16_ar(&mut mc, (0 as i16, 1, 0, 0), 0), mov [rax + rcx * 1], ax);
-    enc!(mc => rx86::mov16_ar(&mut mc, (0 as i16, 1, 0, 8), 0), mov [rax + rcx * 1 + 8], ax);
-    enc!(mc => rx86::mov16_ar(&mut mc, (0 as i16, 1, 3, 0), 0), mov [rax + rcx * 8], ax);
-    enc!(mc => rx86::mov16_ar(&mut mc, (0 as i16, 1, 3, 8), 0), mov [rax + rcx * 8 + 8], ax);
-    enc!(mc => rx86::mov16_ar(&mut mc, (0 as i16, 9, 0, 0), 0), mov [rax + r9 * 1], ax);
-    enc!(mc => rx86::mov16_ar(&mut mc, (0 as i16, 9, 0, 8), 0), mov [rax + r9 * 1 + 8], ax);
-    enc!(mc => rx86::mov16_ar(&mut mc, (0 as i16, 9, 3, 0), 0), mov [rax + r9 * 8], ax);
-    enc!(mc => rx86::mov16_ar(&mut mc, (0 as i16, 9, 3, 8), 0), mov [rax + r9 * 8 + 8], ax);
+    enc!(mc => rx86::mov16_ar(&mut mc, (0_i16, 1, 0, 0), 0), mov [rax + rcx * 1], ax);
+    enc!(mc => rx86::mov16_ar(&mut mc, (0_i16, 1, 0, 8), 0), mov [rax + rcx * 1 + 8], ax);
+    enc!(mc => rx86::mov16_ar(&mut mc, (0_i16, 1, 3, 0), 0), mov [rax + rcx * 8], ax);
+    enc!(mc => rx86::mov16_ar(&mut mc, (0_i16, 1, 3, 8), 0), mov [rax + rcx * 8 + 8], ax);
+    enc!(mc => rx86::mov16_ar(&mut mc, (0_i16, 9, 0, 0), 0), mov [rax + r9 * 1], ax);
+    enc!(mc => rx86::mov16_ar(&mut mc, (0_i16, 9, 0, 8), 0), mov [rax + r9 * 1 + 8], ax);
+    enc!(mc => rx86::mov16_ar(&mut mc, (0_i16, 9, 3, 0), 0), mov [rax + r9 * 8], ax);
+    enc!(mc => rx86::mov16_ar(&mut mc, (0_i16, 9, 3, 8), 0), mov [rax + r9 * 8 + 8], ax);
     enc!(mc => rx86::mov16_ar(&mut mc, (13 as i16, 1, 0, 0), 0), mov [r13 + rcx * 1], ax);
     enc!(mc => rx86::mov16_ar(&mut mc, (13 as i16, 1, 0, 8), 0), mov [r13 + rcx * 1 + 8], ax);
     enc!(mc => rx86::mov16_ar(&mut mc, (13 as i16, 1, 3, 0), 0), mov [r13 + rcx * 8], ax);
@@ -485,17 +485,17 @@ fn rx86_encoding() {
     enc!(mc => rx86::mov16_ar(&mut mc, (13 as i16, 9, 3, 0), 0), mov [r13 + r9 * 8], ax);
     enc!(mc => rx86::mov16_ar(&mut mc, (13 as i16, 9, 3, 8), 15), mov [r13 + r9 * 8 + 8], r15w);
     // mov8_ar
-    enc!(mc => rx86::mov8_ar(&mut mc, (0 as i16, 1, 0, 0), 6), mov BYTE [rax + rcx * 1], sil);
+    enc!(mc => rx86::mov8_ar(&mut mc, (0_i16, 1, 0, 0), 6), mov BYTE [rax + rcx * 1], sil);
     // `rex_fw` (`encode_rex`) always emits a REX byte, even `0x40`.
-    enc_bytes!(mc => rx86::mov8_ar(&mut mc, (0 as i16, 1, 0, 8), 0), [0x40, 0x88, 0x44, 0x08, 0x08]);
+    enc_bytes!(mc => rx86::mov8_ar(&mut mc, (0_i16, 1, 0, 8), 0), [0x40, 0x88, 0x44, 0x08, 0x08]);
     // `rex_fw` (`encode_rex`) always emits a REX byte, even `0x40`.
-    enc_bytes!(mc => rx86::mov8_ar(&mut mc, (0 as i16, 1, 3, 0), 0), [0x40, 0x88, 0x04, 0xC8]);
+    enc_bytes!(mc => rx86::mov8_ar(&mut mc, (0_i16, 1, 3, 0), 0), [0x40, 0x88, 0x04, 0xC8]);
     // `rex_fw` (`encode_rex`) always emits a REX byte, even `0x40`.
-    enc_bytes!(mc => rx86::mov8_ar(&mut mc, (0 as i16, 1, 3, 8), 0), [0x40, 0x88, 0x44, 0xC8, 0x08]);
-    enc!(mc => rx86::mov8_ar(&mut mc, (0 as i16, 9, 0, 0), 0), mov BYTE [rax + r9 * 1], al);
-    enc!(mc => rx86::mov8_ar(&mut mc, (0 as i16, 9, 0, 8), 0), mov BYTE [rax + r9 * 1 + 8], al);
-    enc!(mc => rx86::mov8_ar(&mut mc, (0 as i16, 9, 3, 0), 0), mov BYTE [rax + r9 * 8], al);
-    enc!(mc => rx86::mov8_ar(&mut mc, (0 as i16, 9, 3, 8), 0), mov BYTE [rax + r9 * 8 + 8], al);
+    enc_bytes!(mc => rx86::mov8_ar(&mut mc, (0_i16, 1, 3, 8), 0), [0x40, 0x88, 0x44, 0xC8, 0x08]);
+    enc!(mc => rx86::mov8_ar(&mut mc, (0_i16, 9, 0, 0), 0), mov BYTE [rax + r9 * 1], al);
+    enc!(mc => rx86::mov8_ar(&mut mc, (0_i16, 9, 0, 8), 0), mov BYTE [rax + r9 * 1 + 8], al);
+    enc!(mc => rx86::mov8_ar(&mut mc, (0_i16, 9, 3, 0), 0), mov BYTE [rax + r9 * 8], al);
+    enc!(mc => rx86::mov8_ar(&mut mc, (0_i16, 9, 3, 8), 0), mov BYTE [rax + r9 * 8 + 8], al);
     enc!(mc => rx86::mov8_ar(&mut mc, (13 as i16, 1, 0, 0), 0), mov BYTE [r13 + rcx * 1], al);
     enc!(mc => rx86::mov8_ar(&mut mc, (13 as i16, 1, 0, 8), 0), mov BYTE [r13 + rcx * 1 + 8], al);
     enc!(mc => rx86::mov8_ar(&mut mc, (13 as i16, 1, 3, 0), 0), mov BYTE [r13 + rcx * 8], al);
@@ -505,14 +505,14 @@ fn rx86_encoding() {
     enc!(mc => rx86::mov8_ar(&mut mc, (13 as i16, 9, 3, 0), 0), mov BYTE [r13 + r9 * 8], al);
     enc!(mc => rx86::mov8_ar(&mut mc, (13 as i16, 9, 3, 8), 8), mov BYTE [r13 + r9 * 8 + 8], r8b);
     // movzx8_ra
-    enc!(mc => rx86::movzx8_ra(&mut mc, 0, (0 as i16, 1, 0, 0)), movzx rax, BYTE [rax + rcx * 1]);
-    enc!(mc => rx86::movzx8_ra(&mut mc, 0, (0 as i16, 1, 0, 8)), movzx rax, BYTE [rax + rcx * 1 + 8]);
-    enc!(mc => rx86::movzx8_ra(&mut mc, 0, (0 as i16, 1, 3, 0)), movzx rax, BYTE [rax + rcx * 8]);
-    enc!(mc => rx86::movzx8_ra(&mut mc, 0, (0 as i16, 1, 3, 8)), movzx rax, BYTE [rax + rcx * 8 + 8]);
-    enc!(mc => rx86::movzx8_ra(&mut mc, 0, (0 as i16, 9, 0, 0)), movzx rax, BYTE [rax + r9 * 1]);
-    enc!(mc => rx86::movzx8_ra(&mut mc, 0, (0 as i16, 9, 0, 8)), movzx rax, BYTE [rax + r9 * 1 + 8]);
-    enc!(mc => rx86::movzx8_ra(&mut mc, 0, (0 as i16, 9, 3, 0)), movzx rax, BYTE [rax + r9 * 8]);
-    enc!(mc => rx86::movzx8_ra(&mut mc, 0, (0 as i16, 9, 3, 8)), movzx rax, BYTE [rax + r9 * 8 + 8]);
+    enc!(mc => rx86::movzx8_ra(&mut mc, 0, (0_i16, 1, 0, 0)), movzx rax, BYTE [rax + rcx * 1]);
+    enc!(mc => rx86::movzx8_ra(&mut mc, 0, (0_i16, 1, 0, 8)), movzx rax, BYTE [rax + rcx * 1 + 8]);
+    enc!(mc => rx86::movzx8_ra(&mut mc, 0, (0_i16, 1, 3, 0)), movzx rax, BYTE [rax + rcx * 8]);
+    enc!(mc => rx86::movzx8_ra(&mut mc, 0, (0_i16, 1, 3, 8)), movzx rax, BYTE [rax + rcx * 8 + 8]);
+    enc!(mc => rx86::movzx8_ra(&mut mc, 0, (0_i16, 9, 0, 0)), movzx rax, BYTE [rax + r9 * 1]);
+    enc!(mc => rx86::movzx8_ra(&mut mc, 0, (0_i16, 9, 0, 8)), movzx rax, BYTE [rax + r9 * 1 + 8]);
+    enc!(mc => rx86::movzx8_ra(&mut mc, 0, (0_i16, 9, 3, 0)), movzx rax, BYTE [rax + r9 * 8]);
+    enc!(mc => rx86::movzx8_ra(&mut mc, 0, (0_i16, 9, 3, 8)), movzx rax, BYTE [rax + r9 * 8 + 8]);
     enc!(mc => rx86::movzx8_ra(&mut mc, 0, (13 as i16, 1, 0, 0)), movzx rax, BYTE [r13 + rcx * 1]);
     enc!(mc => rx86::movzx8_ra(&mut mc, 0, (13 as i16, 1, 0, 8)), movzx rax, BYTE [r13 + rcx * 1 + 8]);
     enc!(mc => rx86::movzx8_ra(&mut mc, 0, (13 as i16, 1, 3, 0)), movzx rax, BYTE [r13 + rcx * 8]);
@@ -522,14 +522,14 @@ fn rx86_encoding() {
     enc!(mc => rx86::movzx8_ra(&mut mc, 0, (13 as i16, 9, 3, 0)), movzx rax, BYTE [r13 + r9 * 8]);
     enc!(mc => rx86::movzx8_ra(&mut mc, 15, (13 as i16, 9, 3, 8)), movzx r15, BYTE [r13 + r9 * 8 + 8]);
     // movzx16_ra
-    enc!(mc => rx86::movzx16_ra(&mut mc, 0, (0 as i16, 1, 0, 0)), movzx rax, WORD [rax + rcx * 1]);
-    enc!(mc => rx86::movzx16_ra(&mut mc, 0, (0 as i16, 1, 0, 8)), movzx rax, WORD [rax + rcx * 1 + 8]);
-    enc!(mc => rx86::movzx16_ra(&mut mc, 0, (0 as i16, 1, 3, 0)), movzx rax, WORD [rax + rcx * 8]);
-    enc!(mc => rx86::movzx16_ra(&mut mc, 0, (0 as i16, 1, 3, 8)), movzx rax, WORD [rax + rcx * 8 + 8]);
-    enc!(mc => rx86::movzx16_ra(&mut mc, 0, (0 as i16, 9, 0, 0)), movzx rax, WORD [rax + r9 * 1]);
-    enc!(mc => rx86::movzx16_ra(&mut mc, 0, (0 as i16, 9, 0, 8)), movzx rax, WORD [rax + r9 * 1 + 8]);
-    enc!(mc => rx86::movzx16_ra(&mut mc, 0, (0 as i16, 9, 3, 0)), movzx rax, WORD [rax + r9 * 8]);
-    enc!(mc => rx86::movzx16_ra(&mut mc, 0, (0 as i16, 9, 3, 8)), movzx rax, WORD [rax + r9 * 8 + 8]);
+    enc!(mc => rx86::movzx16_ra(&mut mc, 0, (0_i16, 1, 0, 0)), movzx rax, WORD [rax + rcx * 1]);
+    enc!(mc => rx86::movzx16_ra(&mut mc, 0, (0_i16, 1, 0, 8)), movzx rax, WORD [rax + rcx * 1 + 8]);
+    enc!(mc => rx86::movzx16_ra(&mut mc, 0, (0_i16, 1, 3, 0)), movzx rax, WORD [rax + rcx * 8]);
+    enc!(mc => rx86::movzx16_ra(&mut mc, 0, (0_i16, 1, 3, 8)), movzx rax, WORD [rax + rcx * 8 + 8]);
+    enc!(mc => rx86::movzx16_ra(&mut mc, 0, (0_i16, 9, 0, 0)), movzx rax, WORD [rax + r9 * 1]);
+    enc!(mc => rx86::movzx16_ra(&mut mc, 0, (0_i16, 9, 0, 8)), movzx rax, WORD [rax + r9 * 1 + 8]);
+    enc!(mc => rx86::movzx16_ra(&mut mc, 0, (0_i16, 9, 3, 0)), movzx rax, WORD [rax + r9 * 8]);
+    enc!(mc => rx86::movzx16_ra(&mut mc, 0, (0_i16, 9, 3, 8)), movzx rax, WORD [rax + r9 * 8 + 8]);
     enc!(mc => rx86::movzx16_ra(&mut mc, 0, (13 as i16, 1, 0, 0)), movzx rax, WORD [r13 + rcx * 1]);
     enc!(mc => rx86::movzx16_ra(&mut mc, 0, (13 as i16, 1, 0, 8)), movzx rax, WORD [r13 + rcx * 1 + 8]);
     enc!(mc => rx86::movzx16_ra(&mut mc, 0, (13 as i16, 1, 3, 0)), movzx rax, WORD [r13 + rcx * 8]);
@@ -539,14 +539,14 @@ fn rx86_encoding() {
     enc!(mc => rx86::movzx16_ra(&mut mc, 0, (13 as i16, 9, 3, 0)), movzx rax, WORD [r13 + r9 * 8]);
     enc!(mc => rx86::movzx16_ra(&mut mc, 15, (13 as i16, 9, 3, 8)), movzx r15, WORD [r13 + r9 * 8 + 8]);
     // movsx8_ra
-    enc!(mc => rx86::movsx8_ra(&mut mc, 0, (0 as i16, 1, 0, 0)), movsx rax, BYTE [rax + rcx * 1]);
-    enc!(mc => rx86::movsx8_ra(&mut mc, 0, (0 as i16, 1, 0, 8)), movsx rax, BYTE [rax + rcx * 1 + 8]);
-    enc!(mc => rx86::movsx8_ra(&mut mc, 0, (0 as i16, 1, 3, 0)), movsx rax, BYTE [rax + rcx * 8]);
-    enc!(mc => rx86::movsx8_ra(&mut mc, 0, (0 as i16, 1, 3, 8)), movsx rax, BYTE [rax + rcx * 8 + 8]);
-    enc!(mc => rx86::movsx8_ra(&mut mc, 0, (0 as i16, 9, 0, 0)), movsx rax, BYTE [rax + r9 * 1]);
-    enc!(mc => rx86::movsx8_ra(&mut mc, 0, (0 as i16, 9, 0, 8)), movsx rax, BYTE [rax + r9 * 1 + 8]);
-    enc!(mc => rx86::movsx8_ra(&mut mc, 0, (0 as i16, 9, 3, 0)), movsx rax, BYTE [rax + r9 * 8]);
-    enc!(mc => rx86::movsx8_ra(&mut mc, 0, (0 as i16, 9, 3, 8)), movsx rax, BYTE [rax + r9 * 8 + 8]);
+    enc!(mc => rx86::movsx8_ra(&mut mc, 0, (0_i16, 1, 0, 0)), movsx rax, BYTE [rax + rcx * 1]);
+    enc!(mc => rx86::movsx8_ra(&mut mc, 0, (0_i16, 1, 0, 8)), movsx rax, BYTE [rax + rcx * 1 + 8]);
+    enc!(mc => rx86::movsx8_ra(&mut mc, 0, (0_i16, 1, 3, 0)), movsx rax, BYTE [rax + rcx * 8]);
+    enc!(mc => rx86::movsx8_ra(&mut mc, 0, (0_i16, 1, 3, 8)), movsx rax, BYTE [rax + rcx * 8 + 8]);
+    enc!(mc => rx86::movsx8_ra(&mut mc, 0, (0_i16, 9, 0, 0)), movsx rax, BYTE [rax + r9 * 1]);
+    enc!(mc => rx86::movsx8_ra(&mut mc, 0, (0_i16, 9, 0, 8)), movsx rax, BYTE [rax + r9 * 1 + 8]);
+    enc!(mc => rx86::movsx8_ra(&mut mc, 0, (0_i16, 9, 3, 0)), movsx rax, BYTE [rax + r9 * 8]);
+    enc!(mc => rx86::movsx8_ra(&mut mc, 0, (0_i16, 9, 3, 8)), movsx rax, BYTE [rax + r9 * 8 + 8]);
     enc!(mc => rx86::movsx8_ra(&mut mc, 0, (13 as i16, 1, 0, 0)), movsx rax, BYTE [r13 + rcx * 1]);
     enc!(mc => rx86::movsx8_ra(&mut mc, 0, (13 as i16, 1, 0, 8)), movsx rax, BYTE [r13 + rcx * 1 + 8]);
     enc!(mc => rx86::movsx8_ra(&mut mc, 0, (13 as i16, 1, 3, 0)), movsx rax, BYTE [r13 + rcx * 8]);
@@ -556,14 +556,14 @@ fn rx86_encoding() {
     enc!(mc => rx86::movsx8_ra(&mut mc, 0, (13 as i16, 9, 3, 0)), movsx rax, BYTE [r13 + r9 * 8]);
     enc!(mc => rx86::movsx8_ra(&mut mc, 15, (13 as i16, 9, 3, 8)), movsx r15, BYTE [r13 + r9 * 8 + 8]);
     // movsx16_ra
-    enc!(mc => rx86::movsx16_ra(&mut mc, 0, (0 as i16, 1, 0, 0)), movsx rax, WORD [rax + rcx * 1]);
-    enc!(mc => rx86::movsx16_ra(&mut mc, 0, (0 as i16, 1, 0, 8)), movsx rax, WORD [rax + rcx * 1 + 8]);
-    enc!(mc => rx86::movsx16_ra(&mut mc, 0, (0 as i16, 1, 3, 0)), movsx rax, WORD [rax + rcx * 8]);
-    enc!(mc => rx86::movsx16_ra(&mut mc, 0, (0 as i16, 1, 3, 8)), movsx rax, WORD [rax + rcx * 8 + 8]);
-    enc!(mc => rx86::movsx16_ra(&mut mc, 0, (0 as i16, 9, 0, 0)), movsx rax, WORD [rax + r9 * 1]);
-    enc!(mc => rx86::movsx16_ra(&mut mc, 0, (0 as i16, 9, 0, 8)), movsx rax, WORD [rax + r9 * 1 + 8]);
-    enc!(mc => rx86::movsx16_ra(&mut mc, 0, (0 as i16, 9, 3, 0)), movsx rax, WORD [rax + r9 * 8]);
-    enc!(mc => rx86::movsx16_ra(&mut mc, 0, (0 as i16, 9, 3, 8)), movsx rax, WORD [rax + r9 * 8 + 8]);
+    enc!(mc => rx86::movsx16_ra(&mut mc, 0, (0_i16, 1, 0, 0)), movsx rax, WORD [rax + rcx * 1]);
+    enc!(mc => rx86::movsx16_ra(&mut mc, 0, (0_i16, 1, 0, 8)), movsx rax, WORD [rax + rcx * 1 + 8]);
+    enc!(mc => rx86::movsx16_ra(&mut mc, 0, (0_i16, 1, 3, 0)), movsx rax, WORD [rax + rcx * 8]);
+    enc!(mc => rx86::movsx16_ra(&mut mc, 0, (0_i16, 1, 3, 8)), movsx rax, WORD [rax + rcx * 8 + 8]);
+    enc!(mc => rx86::movsx16_ra(&mut mc, 0, (0_i16, 9, 0, 0)), movsx rax, WORD [rax + r9 * 1]);
+    enc!(mc => rx86::movsx16_ra(&mut mc, 0, (0_i16, 9, 0, 8)), movsx rax, WORD [rax + r9 * 1 + 8]);
+    enc!(mc => rx86::movsx16_ra(&mut mc, 0, (0_i16, 9, 3, 0)), movsx rax, WORD [rax + r9 * 8]);
+    enc!(mc => rx86::movsx16_ra(&mut mc, 0, (0_i16, 9, 3, 8)), movsx rax, WORD [rax + r9 * 8 + 8]);
     enc!(mc => rx86::movsx16_ra(&mut mc, 0, (13 as i16, 1, 0, 0)), movsx rax, WORD [r13 + rcx * 1]);
     enc!(mc => rx86::movsx16_ra(&mut mc, 0, (13 as i16, 1, 0, 8)), movsx rax, WORD [r13 + rcx * 1 + 8]);
     enc!(mc => rx86::movsx16_ra(&mut mc, 0, (13 as i16, 1, 3, 0)), movsx rax, WORD [r13 + rcx * 8]);
@@ -573,14 +573,14 @@ fn rx86_encoding() {
     enc!(mc => rx86::movsx16_ra(&mut mc, 0, (13 as i16, 9, 3, 0)), movsx rax, WORD [r13 + r9 * 8]);
     enc!(mc => rx86::movsx16_ra(&mut mc, 15, (13 as i16, 9, 3, 8)), movsx r15, WORD [r13 + r9 * 8 + 8]);
     // movsx32_ra
-    enc!(mc => rx86::movsx32_ra(&mut mc, 0, (0 as i16, 1, 0, 0)), movsxd rax, DWORD [rax + rcx * 1]);
-    enc!(mc => rx86::movsx32_ra(&mut mc, 0, (0 as i16, 1, 0, 8)), movsxd rax, DWORD [rax + rcx * 1 + 8]);
-    enc!(mc => rx86::movsx32_ra(&mut mc, 0, (0 as i16, 1, 3, 0)), movsxd rax, DWORD [rax + rcx * 8]);
-    enc!(mc => rx86::movsx32_ra(&mut mc, 0, (0 as i16, 1, 3, 8)), movsxd rax, DWORD [rax + rcx * 8 + 8]);
-    enc!(mc => rx86::movsx32_ra(&mut mc, 0, (0 as i16, 9, 0, 0)), movsxd rax, DWORD [rax + r9 * 1]);
-    enc!(mc => rx86::movsx32_ra(&mut mc, 0, (0 as i16, 9, 0, 8)), movsxd rax, DWORD [rax + r9 * 1 + 8]);
-    enc!(mc => rx86::movsx32_ra(&mut mc, 0, (0 as i16, 9, 3, 0)), movsxd rax, DWORD [rax + r9 * 8]);
-    enc!(mc => rx86::movsx32_ra(&mut mc, 0, (0 as i16, 9, 3, 8)), movsxd rax, DWORD [rax + r9 * 8 + 8]);
+    enc!(mc => rx86::movsx32_ra(&mut mc, 0, (0_i16, 1, 0, 0)), movsxd rax, DWORD [rax + rcx * 1]);
+    enc!(mc => rx86::movsx32_ra(&mut mc, 0, (0_i16, 1, 0, 8)), movsxd rax, DWORD [rax + rcx * 1 + 8]);
+    enc!(mc => rx86::movsx32_ra(&mut mc, 0, (0_i16, 1, 3, 0)), movsxd rax, DWORD [rax + rcx * 8]);
+    enc!(mc => rx86::movsx32_ra(&mut mc, 0, (0_i16, 1, 3, 8)), movsxd rax, DWORD [rax + rcx * 8 + 8]);
+    enc!(mc => rx86::movsx32_ra(&mut mc, 0, (0_i16, 9, 0, 0)), movsxd rax, DWORD [rax + r9 * 1]);
+    enc!(mc => rx86::movsx32_ra(&mut mc, 0, (0_i16, 9, 0, 8)), movsxd rax, DWORD [rax + r9 * 1 + 8]);
+    enc!(mc => rx86::movsx32_ra(&mut mc, 0, (0_i16, 9, 3, 0)), movsxd rax, DWORD [rax + r9 * 8]);
+    enc!(mc => rx86::movsx32_ra(&mut mc, 0, (0_i16, 9, 3, 8)), movsxd rax, DWORD [rax + r9 * 8 + 8]);
     enc!(mc => rx86::movsx32_ra(&mut mc, 0, (13 as i16, 1, 0, 0)), movsxd rax, DWORD [r13 + rcx * 1]);
     enc!(mc => rx86::movsx32_ra(&mut mc, 0, (13 as i16, 1, 0, 8)), movsxd rax, DWORD [r13 + rcx * 1 + 8]);
     enc!(mc => rx86::movsx32_ra(&mut mc, 0, (13 as i16, 1, 3, 0)), movsxd rax, DWORD [r13 + rcx * 8]);
@@ -590,14 +590,14 @@ fn rx86_encoding() {
     enc!(mc => rx86::movsx32_ra(&mut mc, 0, (13 as i16, 9, 3, 0)), movsxd rax, DWORD [r13 + r9 * 8]);
     enc!(mc => rx86::movsx32_ra(&mut mc, 15, (13 as i16, 9, 3, 8)), movsxd r15, DWORD [r13 + r9 * 8 + 8]);
     // movsd_xa
-    enc!(mc => rx86::movsd_xa(&mut mc, 0, (0 as i16, 1, 0, 0)), movsd xmm0, [rax + rcx * 1]);
-    enc!(mc => rx86::movsd_xa(&mut mc, 0, (0 as i16, 1, 0, 8)), movsd xmm0, [rax + rcx * 1 + 8]);
-    enc!(mc => rx86::movsd_xa(&mut mc, 0, (0 as i16, 1, 3, 0)), movsd xmm0, [rax + rcx * 8]);
-    enc!(mc => rx86::movsd_xa(&mut mc, 0, (0 as i16, 1, 3, 8)), movsd xmm0, [rax + rcx * 8 + 8]);
-    enc!(mc => rx86::movsd_xa(&mut mc, 0, (0 as i16, 9, 0, 0)), movsd xmm0, [rax + r9 * 1]);
-    enc!(mc => rx86::movsd_xa(&mut mc, 0, (0 as i16, 9, 0, 8)), movsd xmm0, [rax + r9 * 1 + 8]);
-    enc!(mc => rx86::movsd_xa(&mut mc, 0, (0 as i16, 9, 3, 0)), movsd xmm0, [rax + r9 * 8]);
-    enc!(mc => rx86::movsd_xa(&mut mc, 0, (0 as i16, 9, 3, 8)), movsd xmm0, [rax + r9 * 8 + 8]);
+    enc!(mc => rx86::movsd_xa(&mut mc, 0, (0_i16, 1, 0, 0)), movsd xmm0, [rax + rcx * 1]);
+    enc!(mc => rx86::movsd_xa(&mut mc, 0, (0_i16, 1, 0, 8)), movsd xmm0, [rax + rcx * 1 + 8]);
+    enc!(mc => rx86::movsd_xa(&mut mc, 0, (0_i16, 1, 3, 0)), movsd xmm0, [rax + rcx * 8]);
+    enc!(mc => rx86::movsd_xa(&mut mc, 0, (0_i16, 1, 3, 8)), movsd xmm0, [rax + rcx * 8 + 8]);
+    enc!(mc => rx86::movsd_xa(&mut mc, 0, (0_i16, 9, 0, 0)), movsd xmm0, [rax + r9 * 1]);
+    enc!(mc => rx86::movsd_xa(&mut mc, 0, (0_i16, 9, 0, 8)), movsd xmm0, [rax + r9 * 1 + 8]);
+    enc!(mc => rx86::movsd_xa(&mut mc, 0, (0_i16, 9, 3, 0)), movsd xmm0, [rax + r9 * 8]);
+    enc!(mc => rx86::movsd_xa(&mut mc, 0, (0_i16, 9, 3, 8)), movsd xmm0, [rax + r9 * 8 + 8]);
     enc!(mc => rx86::movsd_xa(&mut mc, 0, (13 as i16, 1, 0, 0)), movsd xmm0, [r13 + rcx * 1]);
     enc!(mc => rx86::movsd_xa(&mut mc, 0, (13 as i16, 1, 0, 8)), movsd xmm0, [r13 + rcx * 1 + 8]);
     enc!(mc => rx86::movsd_xa(&mut mc, 0, (13 as i16, 1, 3, 0)), movsd xmm0, [r13 + rcx * 8]);
@@ -607,14 +607,14 @@ fn rx86_encoding() {
     enc!(mc => rx86::movsd_xa(&mut mc, 0, (13 as i16, 9, 3, 0)), movsd xmm0, [r13 + r9 * 8]);
     enc!(mc => rx86::movsd_xa(&mut mc, 15, (13 as i16, 9, 3, 8)), movsd xmm15, [r13 + r9 * 8 + 8]);
     // movsd_ax
-    enc!(mc => rx86::movsd_ax(&mut mc, (0 as i16, 1, 0, 0), 0), movsd [rax + rcx * 1], xmm0);
-    enc!(mc => rx86::movsd_ax(&mut mc, (0 as i16, 1, 0, 8), 0), movsd [rax + rcx * 1 + 8], xmm0);
-    enc!(mc => rx86::movsd_ax(&mut mc, (0 as i16, 1, 3, 0), 0), movsd [rax + rcx * 8], xmm0);
-    enc!(mc => rx86::movsd_ax(&mut mc, (0 as i16, 1, 3, 8), 0), movsd [rax + rcx * 8 + 8], xmm0);
-    enc!(mc => rx86::movsd_ax(&mut mc, (0 as i16, 9, 0, 0), 0), movsd [rax + r9 * 1], xmm0);
-    enc!(mc => rx86::movsd_ax(&mut mc, (0 as i16, 9, 0, 8), 0), movsd [rax + r9 * 1 + 8], xmm0);
-    enc!(mc => rx86::movsd_ax(&mut mc, (0 as i16, 9, 3, 0), 0), movsd [rax + r9 * 8], xmm0);
-    enc!(mc => rx86::movsd_ax(&mut mc, (0 as i16, 9, 3, 8), 0), movsd [rax + r9 * 8 + 8], xmm0);
+    enc!(mc => rx86::movsd_ax(&mut mc, (0_i16, 1, 0, 0), 0), movsd [rax + rcx * 1], xmm0);
+    enc!(mc => rx86::movsd_ax(&mut mc, (0_i16, 1, 0, 8), 0), movsd [rax + rcx * 1 + 8], xmm0);
+    enc!(mc => rx86::movsd_ax(&mut mc, (0_i16, 1, 3, 0), 0), movsd [rax + rcx * 8], xmm0);
+    enc!(mc => rx86::movsd_ax(&mut mc, (0_i16, 1, 3, 8), 0), movsd [rax + rcx * 8 + 8], xmm0);
+    enc!(mc => rx86::movsd_ax(&mut mc, (0_i16, 9, 0, 0), 0), movsd [rax + r9 * 1], xmm0);
+    enc!(mc => rx86::movsd_ax(&mut mc, (0_i16, 9, 0, 8), 0), movsd [rax + r9 * 1 + 8], xmm0);
+    enc!(mc => rx86::movsd_ax(&mut mc, (0_i16, 9, 3, 0), 0), movsd [rax + r9 * 8], xmm0);
+    enc!(mc => rx86::movsd_ax(&mut mc, (0_i16, 9, 3, 8), 0), movsd [rax + r9 * 8 + 8], xmm0);
     enc!(mc => rx86::movsd_ax(&mut mc, (13 as i16, 1, 0, 0), 0), movsd [r13 + rcx * 1], xmm0);
     enc!(mc => rx86::movsd_ax(&mut mc, (13 as i16, 1, 0, 8), 0), movsd [r13 + rcx * 1 + 8], xmm0);
     enc!(mc => rx86::movsd_ax(&mut mc, (13 as i16, 1, 3, 0), 0), movsd [r13 + rcx * 8], xmm0);
@@ -624,14 +624,14 @@ fn rx86_encoding() {
     enc!(mc => rx86::movsd_ax(&mut mc, (13 as i16, 9, 3, 0), 0), movsd [r13 + r9 * 8], xmm0);
     enc!(mc => rx86::movsd_ax(&mut mc, (13 as i16, 9, 3, 8), 15), movsd [r13 + r9 * 8 + 8], xmm15);
     // movss_xa
-    enc!(mc => rx86::movss_xa(&mut mc, 0, (0 as i16, 1, 0, 0)), movss xmm0, [rax + rcx * 1]);
-    enc!(mc => rx86::movss_xa(&mut mc, 0, (0 as i16, 1, 0, 8)), movss xmm0, [rax + rcx * 1 + 8]);
-    enc!(mc => rx86::movss_xa(&mut mc, 0, (0 as i16, 1, 3, 0)), movss xmm0, [rax + rcx * 8]);
-    enc!(mc => rx86::movss_xa(&mut mc, 0, (0 as i16, 1, 3, 8)), movss xmm0, [rax + rcx * 8 + 8]);
-    enc!(mc => rx86::movss_xa(&mut mc, 0, (0 as i16, 9, 0, 0)), movss xmm0, [rax + r9 * 1]);
-    enc!(mc => rx86::movss_xa(&mut mc, 0, (0 as i16, 9, 0, 8)), movss xmm0, [rax + r9 * 1 + 8]);
-    enc!(mc => rx86::movss_xa(&mut mc, 0, (0 as i16, 9, 3, 0)), movss xmm0, [rax + r9 * 8]);
-    enc!(mc => rx86::movss_xa(&mut mc, 0, (0 as i16, 9, 3, 8)), movss xmm0, [rax + r9 * 8 + 8]);
+    enc!(mc => rx86::movss_xa(&mut mc, 0, (0_i16, 1, 0, 0)), movss xmm0, [rax + rcx * 1]);
+    enc!(mc => rx86::movss_xa(&mut mc, 0, (0_i16, 1, 0, 8)), movss xmm0, [rax + rcx * 1 + 8]);
+    enc!(mc => rx86::movss_xa(&mut mc, 0, (0_i16, 1, 3, 0)), movss xmm0, [rax + rcx * 8]);
+    enc!(mc => rx86::movss_xa(&mut mc, 0, (0_i16, 1, 3, 8)), movss xmm0, [rax + rcx * 8 + 8]);
+    enc!(mc => rx86::movss_xa(&mut mc, 0, (0_i16, 9, 0, 0)), movss xmm0, [rax + r9 * 1]);
+    enc!(mc => rx86::movss_xa(&mut mc, 0, (0_i16, 9, 0, 8)), movss xmm0, [rax + r9 * 1 + 8]);
+    enc!(mc => rx86::movss_xa(&mut mc, 0, (0_i16, 9, 3, 0)), movss xmm0, [rax + r9 * 8]);
+    enc!(mc => rx86::movss_xa(&mut mc, 0, (0_i16, 9, 3, 8)), movss xmm0, [rax + r9 * 8 + 8]);
     enc!(mc => rx86::movss_xa(&mut mc, 0, (13 as i16, 1, 0, 0)), movss xmm0, [r13 + rcx * 1]);
     enc!(mc => rx86::movss_xa(&mut mc, 0, (13 as i16, 1, 0, 8)), movss xmm0, [r13 + rcx * 1 + 8]);
     enc!(mc => rx86::movss_xa(&mut mc, 0, (13 as i16, 1, 3, 0)), movss xmm0, [r13 + rcx * 8]);
@@ -641,14 +641,14 @@ fn rx86_encoding() {
     enc!(mc => rx86::movss_xa(&mut mc, 0, (13 as i16, 9, 3, 0)), movss xmm0, [r13 + r9 * 8]);
     enc!(mc => rx86::movss_xa(&mut mc, 15, (13 as i16, 9, 3, 8)), movss xmm15, [r13 + r9 * 8 + 8]);
     // movss_ax
-    enc!(mc => rx86::movss_ax(&mut mc, (0 as i16, 1, 0, 0), 0), movss [rax + rcx * 1], xmm0);
-    enc!(mc => rx86::movss_ax(&mut mc, (0 as i16, 1, 0, 8), 0), movss [rax + rcx * 1 + 8], xmm0);
-    enc!(mc => rx86::movss_ax(&mut mc, (0 as i16, 1, 3, 0), 0), movss [rax + rcx * 8], xmm0);
-    enc!(mc => rx86::movss_ax(&mut mc, (0 as i16, 1, 3, 8), 0), movss [rax + rcx * 8 + 8], xmm0);
-    enc!(mc => rx86::movss_ax(&mut mc, (0 as i16, 9, 0, 0), 0), movss [rax + r9 * 1], xmm0);
-    enc!(mc => rx86::movss_ax(&mut mc, (0 as i16, 9, 0, 8), 0), movss [rax + r9 * 1 + 8], xmm0);
-    enc!(mc => rx86::movss_ax(&mut mc, (0 as i16, 9, 3, 0), 0), movss [rax + r9 * 8], xmm0);
-    enc!(mc => rx86::movss_ax(&mut mc, (0 as i16, 9, 3, 8), 0), movss [rax + r9 * 8 + 8], xmm0);
+    enc!(mc => rx86::movss_ax(&mut mc, (0_i16, 1, 0, 0), 0), movss [rax + rcx * 1], xmm0);
+    enc!(mc => rx86::movss_ax(&mut mc, (0_i16, 1, 0, 8), 0), movss [rax + rcx * 1 + 8], xmm0);
+    enc!(mc => rx86::movss_ax(&mut mc, (0_i16, 1, 3, 0), 0), movss [rax + rcx * 8], xmm0);
+    enc!(mc => rx86::movss_ax(&mut mc, (0_i16, 1, 3, 8), 0), movss [rax + rcx * 8 + 8], xmm0);
+    enc!(mc => rx86::movss_ax(&mut mc, (0_i16, 9, 0, 0), 0), movss [rax + r9 * 1], xmm0);
+    enc!(mc => rx86::movss_ax(&mut mc, (0_i16, 9, 0, 8), 0), movss [rax + r9 * 1 + 8], xmm0);
+    enc!(mc => rx86::movss_ax(&mut mc, (0_i16, 9, 3, 0), 0), movss [rax + r9 * 8], xmm0);
+    enc!(mc => rx86::movss_ax(&mut mc, (0_i16, 9, 3, 8), 0), movss [rax + r9 * 8 + 8], xmm0);
     enc!(mc => rx86::movss_ax(&mut mc, (13 as i16, 1, 0, 0), 0), movss [r13 + rcx * 1], xmm0);
     enc!(mc => rx86::movss_ax(&mut mc, (13 as i16, 1, 0, 8), 0), movss [r13 + rcx * 1 + 8], xmm0);
     enc!(mc => rx86::movss_ax(&mut mc, (13 as i16, 1, 3, 0), 0), movss [r13 + rcx * 8], xmm0);
@@ -658,14 +658,14 @@ fn rx86_encoding() {
     enc!(mc => rx86::movss_ax(&mut mc, (13 as i16, 9, 3, 0), 0), movss [r13 + r9 * 8], xmm0);
     enc!(mc => rx86::movss_ax(&mut mc, (13 as i16, 9, 3, 8), 15), movss [r13 + r9 * 8 + 8], xmm15);
     // mov_ai
-    enc!(mc => rx86::mov_ai(&mut mc, (0 as i16, 1, 0, 0), -2), mov QWORD [rax + rcx * 1], -2);
-    enc!(mc => rx86::mov_ai(&mut mc, (0 as i16, 1, 0, 8), -2), mov QWORD [rax + rcx * 1 + 8], -2);
-    enc!(mc => rx86::mov_ai(&mut mc, (0 as i16, 1, 3, 0), -2), mov QWORD [rax + rcx * 8], -2);
-    enc!(mc => rx86::mov_ai(&mut mc, (0 as i16, 1, 3, 8), -2), mov QWORD [rax + rcx * 8 + 8], -2);
-    enc!(mc => rx86::mov_ai(&mut mc, (0 as i16, 9, 0, 0), -2), mov QWORD [rax + r9 * 1], -2);
-    enc!(mc => rx86::mov_ai(&mut mc, (0 as i16, 9, 0, 8), -2), mov QWORD [rax + r9 * 1 + 8], -2);
-    enc!(mc => rx86::mov_ai(&mut mc, (0 as i16, 9, 3, 0), -2), mov QWORD [rax + r9 * 8], -2);
-    enc!(mc => rx86::mov_ai(&mut mc, (0 as i16, 9, 3, 8), -2), mov QWORD [rax + r9 * 8 + 8], -2);
+    enc!(mc => rx86::mov_ai(&mut mc, (0_i16, 1, 0, 0), -2), mov QWORD [rax + rcx * 1], -2);
+    enc!(mc => rx86::mov_ai(&mut mc, (0_i16, 1, 0, 8), -2), mov QWORD [rax + rcx * 1 + 8], -2);
+    enc!(mc => rx86::mov_ai(&mut mc, (0_i16, 1, 3, 0), -2), mov QWORD [rax + rcx * 8], -2);
+    enc!(mc => rx86::mov_ai(&mut mc, (0_i16, 1, 3, 8), -2), mov QWORD [rax + rcx * 8 + 8], -2);
+    enc!(mc => rx86::mov_ai(&mut mc, (0_i16, 9, 0, 0), -2), mov QWORD [rax + r9 * 1], -2);
+    enc!(mc => rx86::mov_ai(&mut mc, (0_i16, 9, 0, 8), -2), mov QWORD [rax + r9 * 1 + 8], -2);
+    enc!(mc => rx86::mov_ai(&mut mc, (0_i16, 9, 3, 0), -2), mov QWORD [rax + r9 * 8], -2);
+    enc!(mc => rx86::mov_ai(&mut mc, (0_i16, 9, 3, 8), -2), mov QWORD [rax + r9 * 8 + 8], -2);
     enc!(mc => rx86::mov_ai(&mut mc, (13 as i16, 1, 0, 0), -2), mov QWORD [r13 + rcx * 1], -2);
     enc!(mc => rx86::mov_ai(&mut mc, (13 as i16, 1, 0, 8), -2), mov QWORD [r13 + rcx * 1 + 8], -2);
     enc!(mc => rx86::mov_ai(&mut mc, (13 as i16, 1, 3, 0), -2), mov QWORD [r13 + rcx * 8], -2);
@@ -675,14 +675,14 @@ fn rx86_encoding() {
     enc!(mc => rx86::mov_ai(&mut mc, (13 as i16, 9, 3, 0), -2), mov QWORD [r13 + r9 * 8], -2);
     enc!(mc => rx86::mov_ai(&mut mc, (13 as i16, 9, 3, 8), -2), mov QWORD [r13 + r9 * 8 + 8], -2);
     // mov32_ai
-    enc!(mc => rx86::mov32_ai(&mut mc, (0 as i16, 1, 0, 0), 0x123456), mov DWORD [rax + rcx * 1], 0x123456);
-    enc!(mc => rx86::mov32_ai(&mut mc, (0 as i16, 1, 0, 8), 0x123456), mov DWORD [rax + rcx * 1 + 8], 0x123456);
-    enc!(mc => rx86::mov32_ai(&mut mc, (0 as i16, 1, 3, 0), 0x123456), mov DWORD [rax + rcx * 8], 0x123456);
-    enc!(mc => rx86::mov32_ai(&mut mc, (0 as i16, 1, 3, 8), 0x123456), mov DWORD [rax + rcx * 8 + 8], 0x123456);
-    enc!(mc => rx86::mov32_ai(&mut mc, (0 as i16, 9, 0, 0), 0x123456), mov DWORD [rax + r9 * 1], 0x123456);
-    enc!(mc => rx86::mov32_ai(&mut mc, (0 as i16, 9, 0, 8), 0x123456), mov DWORD [rax + r9 * 1 + 8], 0x123456);
-    enc!(mc => rx86::mov32_ai(&mut mc, (0 as i16, 9, 3, 0), 0x123456), mov DWORD [rax + r9 * 8], 0x123456);
-    enc!(mc => rx86::mov32_ai(&mut mc, (0 as i16, 9, 3, 8), 0x123456), mov DWORD [rax + r9 * 8 + 8], 0x123456);
+    enc!(mc => rx86::mov32_ai(&mut mc, (0_i16, 1, 0, 0), 0x123456), mov DWORD [rax + rcx * 1], 0x123456);
+    enc!(mc => rx86::mov32_ai(&mut mc, (0_i16, 1, 0, 8), 0x123456), mov DWORD [rax + rcx * 1 + 8], 0x123456);
+    enc!(mc => rx86::mov32_ai(&mut mc, (0_i16, 1, 3, 0), 0x123456), mov DWORD [rax + rcx * 8], 0x123456);
+    enc!(mc => rx86::mov32_ai(&mut mc, (0_i16, 1, 3, 8), 0x123456), mov DWORD [rax + rcx * 8 + 8], 0x123456);
+    enc!(mc => rx86::mov32_ai(&mut mc, (0_i16, 9, 0, 0), 0x123456), mov DWORD [rax + r9 * 1], 0x123456);
+    enc!(mc => rx86::mov32_ai(&mut mc, (0_i16, 9, 0, 8), 0x123456), mov DWORD [rax + r9 * 1 + 8], 0x123456);
+    enc!(mc => rx86::mov32_ai(&mut mc, (0_i16, 9, 3, 0), 0x123456), mov DWORD [rax + r9 * 8], 0x123456);
+    enc!(mc => rx86::mov32_ai(&mut mc, (0_i16, 9, 3, 8), 0x123456), mov DWORD [rax + r9 * 8 + 8], 0x123456);
     enc!(mc => rx86::mov32_ai(&mut mc, (13 as i16, 1, 0, 0), 0x123456), mov DWORD [r13 + rcx * 1], 0x123456);
     enc!(mc => rx86::mov32_ai(&mut mc, (13 as i16, 1, 0, 8), 0x123456), mov DWORD [r13 + rcx * 1 + 8], 0x123456);
     enc!(mc => rx86::mov32_ai(&mut mc, (13 as i16, 1, 3, 0), 0x123456), mov DWORD [r13 + rcx * 8], 0x123456);
@@ -692,14 +692,14 @@ fn rx86_encoding() {
     enc!(mc => rx86::mov32_ai(&mut mc, (13 as i16, 9, 3, 0), 0x123456), mov DWORD [r13 + r9 * 8], 0x123456);
     enc!(mc => rx86::mov32_ai(&mut mc, (13 as i16, 9, 3, 8), 0x123456), mov DWORD [r13 + r9 * 8 + 8], 0x123456);
     // mov16_ai
-    enc!(mc => rx86::mov16_ai(&mut mc, (0 as i16, 1, 0, 0), 0x1234), mov WORD [rax + rcx * 1], 0x1234);
-    enc!(mc => rx86::mov16_ai(&mut mc, (0 as i16, 1, 0, 8), 0x1234), mov WORD [rax + rcx * 1 + 8], 0x1234);
-    enc!(mc => rx86::mov16_ai(&mut mc, (0 as i16, 1, 3, 0), 0x1234), mov WORD [rax + rcx * 8], 0x1234);
-    enc!(mc => rx86::mov16_ai(&mut mc, (0 as i16, 1, 3, 8), 0x1234), mov WORD [rax + rcx * 8 + 8], 0x1234);
-    enc!(mc => rx86::mov16_ai(&mut mc, (0 as i16, 9, 0, 0), 0x1234), mov WORD [rax + r9 * 1], 0x1234);
-    enc!(mc => rx86::mov16_ai(&mut mc, (0 as i16, 9, 0, 8), 0x1234), mov WORD [rax + r9 * 1 + 8], 0x1234);
-    enc!(mc => rx86::mov16_ai(&mut mc, (0 as i16, 9, 3, 0), 0x1234), mov WORD [rax + r9 * 8], 0x1234);
-    enc!(mc => rx86::mov16_ai(&mut mc, (0 as i16, 9, 3, 8), 0x1234), mov WORD [rax + r9 * 8 + 8], 0x1234);
+    enc!(mc => rx86::mov16_ai(&mut mc, (0_i16, 1, 0, 0), 0x1234), mov WORD [rax + rcx * 1], 0x1234);
+    enc!(mc => rx86::mov16_ai(&mut mc, (0_i16, 1, 0, 8), 0x1234), mov WORD [rax + rcx * 1 + 8], 0x1234);
+    enc!(mc => rx86::mov16_ai(&mut mc, (0_i16, 1, 3, 0), 0x1234), mov WORD [rax + rcx * 8], 0x1234);
+    enc!(mc => rx86::mov16_ai(&mut mc, (0_i16, 1, 3, 8), 0x1234), mov WORD [rax + rcx * 8 + 8], 0x1234);
+    enc!(mc => rx86::mov16_ai(&mut mc, (0_i16, 9, 0, 0), 0x1234), mov WORD [rax + r9 * 1], 0x1234);
+    enc!(mc => rx86::mov16_ai(&mut mc, (0_i16, 9, 0, 8), 0x1234), mov WORD [rax + r9 * 1 + 8], 0x1234);
+    enc!(mc => rx86::mov16_ai(&mut mc, (0_i16, 9, 3, 0), 0x1234), mov WORD [rax + r9 * 8], 0x1234);
+    enc!(mc => rx86::mov16_ai(&mut mc, (0_i16, 9, 3, 8), 0x1234), mov WORD [rax + r9 * 8 + 8], 0x1234);
     enc!(mc => rx86::mov16_ai(&mut mc, (13 as i16, 1, 0, 0), 0x1234), mov WORD [r13 + rcx * 1], 0x1234);
     enc!(mc => rx86::mov16_ai(&mut mc, (13 as i16, 1, 0, 8), 0x1234), mov WORD [r13 + rcx * 1 + 8], 0x1234);
     enc!(mc => rx86::mov16_ai(&mut mc, (13 as i16, 1, 3, 0), 0x1234), mov WORD [r13 + rcx * 8], 0x1234);
@@ -710,17 +710,17 @@ fn rx86_encoding() {
     enc!(mc => rx86::mov16_ai(&mut mc, (13 as i16, 9, 3, 8), 0x1234), mov WORD [r13 + r9 * 8 + 8], 0x1234);
     // mov8_ai
     // `rex_fw` (`encode_rex`) always emits a REX byte, even `0x40`.
-    enc_bytes!(mc => rx86::mov8_ai(&mut mc, (0 as i16, 1, 0, 0), -5), [0x40, 0xC6, 0x04, 0x08, 0xFB]);
+    enc_bytes!(mc => rx86::mov8_ai(&mut mc, (0_i16, 1, 0, 0), -5), [0x40, 0xC6, 0x04, 0x08, 0xFB]);
     // `rex_fw` (`encode_rex`) always emits a REX byte, even `0x40`.
-    enc_bytes!(mc => rx86::mov8_ai(&mut mc, (0 as i16, 1, 0, 8), -5), [0x40, 0xC6, 0x44, 0x08, 0x08, 0xFB]);
+    enc_bytes!(mc => rx86::mov8_ai(&mut mc, (0_i16, 1, 0, 8), -5), [0x40, 0xC6, 0x44, 0x08, 0x08, 0xFB]);
     // `rex_fw` (`encode_rex`) always emits a REX byte, even `0x40`.
-    enc_bytes!(mc => rx86::mov8_ai(&mut mc, (0 as i16, 1, 3, 0), -5), [0x40, 0xC6, 0x04, 0xC8, 0xFB]);
+    enc_bytes!(mc => rx86::mov8_ai(&mut mc, (0_i16, 1, 3, 0), -5), [0x40, 0xC6, 0x04, 0xC8, 0xFB]);
     // `rex_fw` (`encode_rex`) always emits a REX byte, even `0x40`.
-    enc_bytes!(mc => rx86::mov8_ai(&mut mc, (0 as i16, 1, 3, 8), -5), [0x40, 0xC6, 0x44, 0xC8, 0x08, 0xFB]);
-    enc!(mc => rx86::mov8_ai(&mut mc, (0 as i16, 9, 0, 0), -5), mov BYTE [rax + r9 * 1], -5);
-    enc!(mc => rx86::mov8_ai(&mut mc, (0 as i16, 9, 0, 8), -5), mov BYTE [rax + r9 * 1 + 8], -5);
-    enc!(mc => rx86::mov8_ai(&mut mc, (0 as i16, 9, 3, 0), -5), mov BYTE [rax + r9 * 8], -5);
-    enc!(mc => rx86::mov8_ai(&mut mc, (0 as i16, 9, 3, 8), -5), mov BYTE [rax + r9 * 8 + 8], -5);
+    enc_bytes!(mc => rx86::mov8_ai(&mut mc, (0_i16, 1, 3, 8), -5), [0x40, 0xC6, 0x44, 0xC8, 0x08, 0xFB]);
+    enc!(mc => rx86::mov8_ai(&mut mc, (0_i16, 9, 0, 0), -5), mov BYTE [rax + r9 * 1], -5);
+    enc!(mc => rx86::mov8_ai(&mut mc, (0_i16, 9, 0, 8), -5), mov BYTE [rax + r9 * 1 + 8], -5);
+    enc!(mc => rx86::mov8_ai(&mut mc, (0_i16, 9, 3, 0), -5), mov BYTE [rax + r9 * 8], -5);
+    enc!(mc => rx86::mov8_ai(&mut mc, (0_i16, 9, 3, 8), -5), mov BYTE [rax + r9 * 8 + 8], -5);
     enc!(mc => rx86::mov8_ai(&mut mc, (13 as i16, 1, 0, 0), -5), mov BYTE [r13 + rcx * 1], -5);
     enc!(mc => rx86::mov8_ai(&mut mc, (13 as i16, 1, 0, 8), -5), mov BYTE [r13 + rcx * 1 + 8], -5);
     enc!(mc => rx86::mov8_ai(&mut mc, (13 as i16, 1, 3, 0), -5), mov BYTE [r13 + rcx * 8], -5);

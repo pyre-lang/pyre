@@ -197,11 +197,7 @@ fn populate_platform_inttypes() -> Result<(), RffiCacheError> {
     }
     let sizes = sizeof_c_types(&missing_c, false)?;
     let mut platform = PLATFORM.lock();
-    for ((name, signed), size) in missing_name
-        .iter()
-        .zip(missing_signed)
-        .zip(sizes.into_iter())
-    {
+    for ((name, signed), size) in missing_name.iter().zip(missing_signed).zip(sizes) {
         if platform.get(name).is_none() {
             platform.make_type(name, signed, size)?;
         }
@@ -313,16 +309,16 @@ fn nt_fallback_type_aliases(
     int_tp: LowLevelType,
 ) -> IndexMap<String, LowLevelType> {
     let mut aliases = IndexMap::new();
-    if !types.iter().any(|name| *name == "pid_t") {
+    if !types.contains(&"pid_t") {
         aliases.insert("PID_T".into(), SIGNED);
     }
-    if !types.iter().any(|name| *name == "ssize_t") {
+    if !types.contains(&"ssize_t") {
         aliases.insert("SSIZE_T".into(), SIGNED);
     }
-    if !types.iter().any(|name| *name == "ptrdiff_t") {
+    if !types.contains(&"ptrdiff_t") {
         aliases.insert("PTRDIFF_T".into(), SIGNED);
     }
-    if !types.iter().any(|name| *name == "mode_t") {
+    if !types.contains(&"mode_t") {
         aliases.insert("MODE_T".into(), int_tp);
     }
     aliases
@@ -1411,10 +1407,6 @@ fn ccharp_array_lltype() -> Result<LowLevelType, TyperError> {
 }
 
 fn raw_flavor_no_track_const() -> Result<Hlvalue, TyperError> {
-    #[expect(
-        clippy::mutable_key_type,
-        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-    )]
     let flags = IndexMap::from([
         (ConstValue::byte_str("flavor"), ConstValue::byte_str("raw")),
         (
@@ -2389,16 +2381,16 @@ pub(crate) mod tests {
             LowLevelType::Signed => {}
             other => panic!("VOID* is a Number, got {other:?}"),
         }
-        assert!(NUMBER_TYPES.iter().any(|tp| *tp == void_star));
-        assert!(!NUMBER_TYPES.iter().any(|tp| *tp == *VOIDP));
+        assert!(NUMBER_TYPES.contains(&void_star));
+        assert!(!NUMBER_TYPES.contains(&*VOIDP));
     }
 
     #[test]
     fn types_includes_int128_iff_sizeof_succeeds() {
         let _guard = rffi_test_guard();
         let sizeof_ok = sizeof_c_type("__int128_t", true).is_ok();
-        assert_eq!(TYPES.iter().any(|name| *name == "__int128_t"), sizeof_ok);
-        assert_eq!(TYPES.iter().any(|name| *name == "__uint128_t"), sizeof_ok);
+        assert_eq!(TYPES.contains(&"__int128_t"), sizeof_ok);
+        assert_eq!(TYPES.contains(&"__uint128_t"), sizeof_ok);
         if sizeof_ok {
             let signed128 = platform_lltype("__INT128_T");
             assert_eq!(signed128, LowLevelType::SignedLongLongLong);

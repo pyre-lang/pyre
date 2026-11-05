@@ -1222,10 +1222,10 @@ mod tests {
             .iter()
             .flat_map(|b| &b.operations)
             .find_map(|op| {
-                if op.result.as_ref() == Some(&bound_var) {
-                    if let OpKind::ConstInt(n) = op.kind {
-                        return Some(n);
-                    }
+                if op.result.as_ref() == Some(&bound_var)
+                    && let OpKind::ConstInt(n) = op.kind
+                {
+                    return Some(n);
                 }
                 None
             })

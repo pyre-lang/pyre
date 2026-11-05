@@ -3922,12 +3922,8 @@ pub(in crate::front::mir) fn fat_field_producer(
                 return None;
             }
             for src in sources {
-                let Some(src) = src else {
-                    return None;
-                };
-                let Some(prod) = direct_fat_field_read(graph, fat_box_vars, &src) else {
-                    return None;
-                };
+                let src = src?;
+                let prod = direct_fat_field_read(graph, fat_box_vars, &src)?;
                 if let Some((base, field, _)) = &agreed {
                     if base != &prod.0
                         || field.name != prod.1.name
@@ -5115,13 +5111,13 @@ pub(in crate::front::mir) fn body_owner_view_locals(
         {
             let dest = dest as usize;
             if is_body_local(dest) && tyref_is_u8_window(&call.dest.ty, llbc) {
-                if call_dest_is_w1_str_source(&call, llbc)
-                    || call_dest_is_built_str_view(&call, accum)
-                    || call_dest_is_format_str_view(&call, llbc, accum)
+                if call_dest_is_w1_str_source(call, llbc)
+                    || call_dest_is_built_str_view(call, accum)
+                    || call_dest_is_format_str_view(call, llbc, accum)
                 {
                     str_view[dest] = true;
                     w1_call_def[dest] = true;
-                } else if call_dest_is_w2_list_source(&call, llbc) {
+                } else if call_dest_is_w2_list_source(call, llbc) {
                     list_view[dest] = true;
                     list_call_def[dest] = true;
                     if call
@@ -5976,7 +5972,7 @@ pub(in crate::front::mir) fn raw_array_slice_is_push_roots_only(
                 if slices.contains(dest as usize) {
                     continue;
                 }
-                if operand_mentions_any_local(&op, &slices) {
+                if operand_mentions_any_local(op, &slices) {
                     slices.insert(dest as usize);
                     changed = true;
                 }

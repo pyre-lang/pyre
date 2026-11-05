@@ -115,7 +115,7 @@ pub fn mainloop(program: &Bytecode, iterations: i64, threshold: u32, chain: usiz
                 // reaches the chain is missing from the sum rather than hidden
                 // by a repeat.
                 let value = state.counter;
-                state.sp = state.sp + 1;
+                state.sp += 1;
                 let free_slot = (state.sp - 1) & CAP_MASK;
                 if state.sp > CAP {
                     // The ring is full: the word in this slot is the oldest
@@ -127,7 +127,7 @@ pub fn mainloop(program: &Bytecode, iterations: i64, threshold: u32, chain: usiz
                 state.vals[free_slot] = value;
             }
             OP_BACK => {
-                state.counter = state.counter - 1;
+                state.counter -= 1;
                 if state.counter != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;

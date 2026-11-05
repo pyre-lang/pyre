@@ -1456,9 +1456,7 @@ fn return_producer<'a>(
         }
         // A frame-exit cleanup block rebinds the returned word onto its
         // inputarg. One predecessor passing one value is that word.
-        let Some(src) = single_inputarg_source(graph, &current) else {
-            return None;
-        };
+        let src = single_inputarg_source(graph, &current)?;
         current = src;
     }
 }

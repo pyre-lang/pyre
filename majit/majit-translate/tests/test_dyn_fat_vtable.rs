@@ -364,9 +364,9 @@ fn first_input_kind(graph: &FunctionGraph) -> Option<(char, ValueType)> {
     None
 }
 
-fn first_indirect_call<'a>(
-    graph: &'a FunctionGraph,
-) -> Option<(BlockId, &'a [Variable], Option<&'a (String, String)>)> {
+fn first_indirect_call(
+    graph: &FunctionGraph,
+) -> Option<(BlockId, &[Variable], Option<&(String, String)>)> {
     for block in &graph.blocks {
         for op in &block.operations {
             if let OpKind::IndirectCall {

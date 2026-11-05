@@ -52,8 +52,8 @@ fn suffix_loop_int_return(program: &Bytecode, threshold: u32, n: i64) -> i64 {
     while state.pos < state.n {
         can_enter_jit!(driver, 0usize, &mut state, program, || {});
         jit_merge_point!(driver, program, pc; state);
-        state.acc = state.acc + 1i64;
-        state.pos = state.pos + 1i64;
+        state.acc += 1i64;
+        state.pos += 1i64;
     }
     // Unlowerable: `lower_for_loop` only unrolls a literal range.
     for _ in [0i64].iter() {

@@ -2727,22 +2727,17 @@ fn phi_aliases(
                     continue;
                 };
                 let explained = incoming[*block].iter().all(|link| {
-                    match link
-                        .args
-                        .get(*slot)
-                        .and_then(crate::model::LinkArg::as_variable)
-                    {
+                    matches!(
+                        link.args
+                            .get(*slot)
+                            .and_then(crate::model::LinkArg::as_variable),
                         Some(var)
                             if aliases.contains(var)
                                 || pending
                                     .iter()
                                     .zip(live.iter())
-                                    .any(|(phi, kept)| *kept && phi == var) =>
-                        {
-                            true
-                        }
-                        _ => false,
-                    }
+                                    .any(|(phi, kept)| *kept && phi == var)
+                    )
                 });
                 if !explained {
                     live[index] = false;
@@ -4097,15 +4092,15 @@ impl<'a> Transformer<'a> {
             crate::front::llbc_hints::alloc_flavor_raw_contains(&cc.raw_alloc_flavor_structs, owner)
         });
         if let Some(var) = result {
-            if let Some(ct) = var.concretetype() {
-                if matches!(
+            if let Some(ct) = var.concretetype()
+                && matches!(
                     &ct,
                     crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(_)
-                ) {
-                    return crate::model::try_getkind(&ct, true, true, true)
-                        == Ok(crate::codewriter::type_state::ConcreteType::Signed)
-                        || harvest;
-                }
+                )
+            {
+                return crate::model::try_getkind(&ct, true, true, true)
+                    == Ok(crate::codewriter::type_state::ConcreteType::Signed)
+                    || harvest;
             }
             // `set_concretetype_of_inline` may store the canonical Signed
             // representative of a raw Ptr. A New result already in the int
@@ -7361,14 +7356,14 @@ impl<'a> Transformer<'a> {
         supplied: crate::model::ArrayGcKind,
     ) -> crate::model::ArrayGcKind {
         use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
-        if let Some(LowLevelType::Ptr(ptr)) = base.concretetype() {
-            if matches!(&ptr.TO, PtrTarget::Array(_) | PtrTarget::FixedSizeArray(_)) {
-                return match ptr._gckind() {
-                    GcKind::Gc => crate::model::ArrayGcKind::Gc,
-                    GcKind::Raw => crate::model::ArrayGcKind::Raw,
-                    _ => supplied,
-                };
-            }
+        if let Some(LowLevelType::Ptr(ptr)) = base.concretetype()
+            && matches!(&ptr.TO, PtrTarget::Array(_) | PtrTarget::FixedSizeArray(_))
+        {
+            return match ptr._gckind() {
+                GcKind::Gc => crate::model::ArrayGcKind::Gc,
+                GcKind::Raw => crate::model::ArrayGcKind::Raw,
+                _ => supplied,
+            };
         }
         match FunctionGraph::concretetype_of(base) {
             crate::codewriter::type_state::ConcreteType::Signed => crate::model::ArrayGcKind::Raw,
@@ -11584,10 +11579,6 @@ impl<'a> Transformer<'a> {
 
     /// Port of `Transformer._handle_str2unicode_call` in `jtransform.py`.
     /// `ll_str2unicode` is elidable but may raise `UnicodeDecodeError`.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
-    )]
     fn _handle_str2unicode_call(
         &mut self,
         op: &SpaceOperation,
@@ -11613,10 +11604,6 @@ impl<'a> Transformer<'a> {
     /// Port of `Transformer._handle_math_sqrt_call` in `jtransform.py`.
     /// The domain check belongs to the caller; `sqrt_nonneg` itself is an
     /// elidable operation that cannot raise.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
-    )]
     fn _handle_math_sqrt_call(
         &mut self,
         op: &SpaceOperation,
@@ -18194,10 +18181,9 @@ impl crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout
     fn field_offset(&self, struct_name: &str, fldname: &str) -> Option<i64> {
         if let Some(name) = &self.struct_name
             && name == struct_name
+            && let Some((_, off)) = self.field_offsets.iter().find(|(f, _)| f == fldname)
         {
-            if let Some((_, off)) = self.field_offsets.iter().find(|(f, _)| f == fldname) {
-                return Some(*off);
-            }
+            return Some(*off);
         }
         self.inner.field_offset(struct_name, fldname)
     }
@@ -31147,7 +31133,7 @@ mod tests {
                     result_ty: result_ty.clone(),
                 },
             };
-            match transformer.rewrite_op_direct_call(
+            if let RewriteResult::Identity(_) = transformer.rewrite_op_direct_call(
                 &op,
                 &target,
                 std::slice::from_ref(&arg),
@@ -31155,8 +31141,7 @@ mod tests {
                 "not_ptr_from_ref",
                 &mut graph,
             ) {
-                RewriteResult::Identity(_) => panic!("must not alias slice/NonNull from_ref"),
-                _ => {}
+                panic!("must not alias slice/NonNull from_ref")
             }
         }
     }
@@ -33492,7 +33477,7 @@ mod tests {
             graph.set_return(entry, Some(array));
             graph
         }
-        fn call_named<'a>(ops: &'a [SpaceOperation], name: &str) -> bool {
+        fn call_named(ops: &[SpaceOperation], name: &str) -> bool {
             ops.iter().any(|op| {
                 matches!(
                     &op.kind,

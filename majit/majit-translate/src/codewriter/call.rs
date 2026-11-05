@@ -3238,10 +3238,10 @@ impl StoreCore {
             .path_to_key
             .borrow_mut()
             .insert(path.clone(), key.clone());
-        if let Some(old) = previous {
-            if old != key {
-                self.remove_spelling(&old, &path);
-            }
+        if let Some(old) = previous
+            && old != key
+        {
+            self.remove_spelling(&old, &path);
         }
         self.add_spelling(&key, path);
     }
@@ -6887,6 +6887,7 @@ impl CallControl {
     ///
     /// RPython: `CodeWriter.setup_jitdriver(jitdriver_sd)` (codewriter.py)
     /// + `jitdriver.virtualizables` (rlib/jit.py).
+    ///
     /// Each jitdriver gets a sequential index.
     ///
     /// `red_types` mirrors `_JIT_ENTER_FUNCTYPE.ARGS` for the red slot
@@ -12134,12 +12135,12 @@ impl CallControl {
                     // panics `compare_slot_rest` (call result `Ref`, stamp
                     // missing). The stamp, when present, is checked.
                     // `Result<T, E>` is the success type `T` (`FUNC.RESULT`).
-                    if let Some(expected_result) = self.declared_graph_result_type(&graph) {
-                        if result_type != expected_result {
-                            panic!(
-                                "operation calling {target}: calling a function with signature {expected_result:?}, but the actual return type is {result_type:?}",
-                            );
-                        }
+                    if let Some(expected_result) = self.declared_graph_result_type(&graph)
+                        && result_type != expected_result
+                    {
+                        panic!(
+                            "operation calling {target}: calling a function with signature {expected_result:?}, but the actual return type is {result_type:?}",
+                        );
                     }
                 }
             }
@@ -12168,15 +12169,15 @@ impl CallControl {
                     // hook (`register_eval_override`, `plain_eval_fn_addr`)
                     // returns `PyResult`, which stays unstamped, and mapping
                     // that absence to `Void` disagrees with the call's `Ref`.
-                    if let Some(expected_result) = self.declared_graph_result_type(&witness_graph) {
-                        if result_type != expected_result {
-                            panic!(
-                                "indirect_call in family including {witness_path:?}: \
+                    if let Some(expected_result) = self.declared_graph_result_type(&witness_graph)
+                        && result_type != expected_result
+                    {
+                        panic!(
+                            "indirect_call in family including {witness_path:?}: \
                                  calling a function with return type \
                                  {expected_result:?}, but the actual return type \
                                  is {result_type:?}",
-                            );
-                        }
+                        );
                     }
                 }
             }
@@ -14407,6 +14408,7 @@ fn trace_field_ei_descr_mint(
 /// - Ptr(gc) → FLAG_POINTER; Ptr(non-gc) → FLAG_UNSIGNED
 /// - Struct → FLAG_STRUCT; Float → FLAG_FLOAT
 /// - Bool/unsigned → FLAG_UNSIGNED; signed int → FLAG_SIGNED
+///
 /// Per-field `(flag, field_type, size)` classification from a type string.
 ///
 /// A field whose type is itself a known struct is an embedded struct
@@ -16104,7 +16106,7 @@ fn effect_transduce_op(
                 block,
                 OpKind::LoweredBlackholeOp {
                     opname: name.to_string(),
-                    args: op.args.iter().map(|a| effect_linkarg(a)).collect(),
+                    args: op.args.iter().map(effect_linkarg).collect(),
                 },
                 result,
             );
@@ -16296,7 +16298,7 @@ fn effect_transduce_op(
                 block,
                 OpKind::LoweredBlackholeOp {
                     opname: "raw_memcopy".to_string(),
-                    args: op.args.iter().map(|a| effect_linkarg(a)).collect(),
+                    args: op.args.iter().map(effect_linkarg).collect(),
                 },
                 result,
             );
@@ -28565,7 +28567,7 @@ mod tests {
             });
         assert_eq!(
             got,
-            Some(args.iter().map(|a| effect_linkarg(a)).collect()),
+            Some(args.iter().map(effect_linkarg).collect()),
             "raw_memcopy: {:?}",
             converted
                 .iter_block_ops()

@@ -1098,7 +1098,6 @@ impl HeapCache {
     /// (`heapcache.py` `new_ref_dict` keys the live GCREF; the collector
     /// forwards that dict). The index is the box; resolve() after a
     /// minor would miss a set still holding the old address.
-
     pub fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn forward(slot: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)) {
             slot.trace_const_ptr(visitor);

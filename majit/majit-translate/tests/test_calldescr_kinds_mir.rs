@@ -84,10 +84,7 @@ fn root_op<'a>(
                 }
             }
         }
-        match next {
-            Some(src) => current = src,
-            None => return None,
-        }
+        current = next?;
     }
     None
 }
@@ -107,7 +104,7 @@ fn ops(graph: &FunctionGraph) -> impl Iterator<Item = &SpaceOperation> {
 #[test]
 fn sizehint_deref_loads_an_int_word() {
     let llbc = load_object();
-    let graph = lower_function(&llbc, "listobject::sizehint_state_value")
+    let graph = lower_function(llbc, "listobject::sizehint_state_value")
         .expect("lower sizehint_state_value");
     let ret = graph
         .blocks
@@ -135,7 +132,7 @@ fn sizehint_deref_loads_an_int_word() {
         }
     }
 
-    let store = lower_function(&llbc, "listobject::set_sizehint_state_value")
+    let store = lower_function(llbc, "listobject::set_sizehint_state_value")
         .expect("lower set_sizehint_state_value");
     assert!(
         ops(&store).any(|op| matches!(
@@ -158,7 +155,7 @@ fn sizehint_deref_loads_an_int_word() {
 fn unresolved_gc_type_size_stays_a_ref_sentinel() {
     let llbc = load_object();
     let graph =
-        lower_function(&llbc, "lltype::malloc_typed_stable").expect("lower malloc_typed_stable");
+        lower_function(llbc, "lltype::malloc_typed_stable").expect("lower malloc_typed_stable");
     let call = ops(&graph)
         .find_map(|op| match &op.kind {
             OpKind::Call { target, args, .. }
@@ -186,11 +183,8 @@ fn unresolved_gc_type_size_stays_a_ref_sentinel() {
 #[test]
 fn scalar_pointer_params_match_int_callers() {
     let llbc = load_object();
-    let callback = lower_function(
-        &llbc,
-        "dictmultiobject::w_dict_object_setitem_callback_free",
-    )
-    .expect("lower setitem callback");
+    let callback = lower_function(llbc, "dictmultiobject::w_dict_object_setitem_callback_free")
+        .expect("lower setitem callback");
     let tys = input_types(&callback);
     assert_eq!(tys.len(), 6, "callback params: {tys:?}");
     assert!(
@@ -213,7 +207,7 @@ fn scalar_pointer_params_match_int_callers() {
     );
 
     let barrier =
-        lower_function(&llbc, "gc_hook::try_gc_write_barrier").expect("lower try_gc_write_barrier");
+        lower_function(llbc, "gc_hook::try_gc_write_barrier").expect("lower try_gc_write_barrier");
     let barrier_tys = input_types(&barrier);
     assert!(
         matches!(barrier_tys.first(), Some(ValueType::Ref(_))),
@@ -221,7 +215,7 @@ fn scalar_pointer_params_match_int_callers() {
     );
 
     let caller = lower_function(
-        &llbc,
+        llbc,
         "dictmultiobject::w_dict_store_object_strategy_checked_inner",
     )
     .expect("lower callback caller");
@@ -320,7 +314,7 @@ fn residual_named(graph: &FunctionGraph, owner: &str, leaf: &str) -> bool {
 #[test]
 fn grow_int_items_block_call_once_has_no_layout_new_residual() {
     let llbc = load_object();
-    let graph = lower_function(&llbc, "object_array::grow_int_items_block")
+    let graph = lower_function(llbc, "object_array::grow_int_items_block")
         .expect("lower grow_int_items_block");
     assert!(
         !residual_named(&graph, "Layout", "new"),
@@ -336,7 +330,7 @@ fn grow_int_items_block_call_once_has_no_layout_new_residual() {
 fn ll_list_int_length_reads_int_array_len_field() {
     let llbc = load_object();
     let graph =
-        lower_function(&llbc, "listobject::ll_list_int_length").expect("lower ll_list_int_length");
+        lower_function(llbc, "listobject::ll_list_int_length").expect("lower ll_list_int_length");
     assert!(
         ops(&graph).any(|op| matches!(
             &op.kind,
@@ -372,7 +366,7 @@ fn ll_list_int_length_reads_int_array_len_field() {
 fn orig_extend_from_tuple_has_no_undefined_link_args() {
     let llbc = load_llbc(INTERPRETER_LLBC);
     let graph =
-        lower_function(&llbc, "_orig_extend_from_tuple").expect("lower _orig_extend_from_tuple");
+        lower_function(llbc, "_orig_extend_from_tuple").expect("lower _orig_extend_from_tuple");
     let mut holes = Vec::new();
     for block in &graph.blocks {
         if block.dead {

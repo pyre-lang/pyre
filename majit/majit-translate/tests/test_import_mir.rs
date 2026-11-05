@@ -1225,7 +1225,7 @@ fn lower_native_raw_malloc(llbc: &'static Llbc) -> FunctionGraph {
         "raw_malloc graph is the rffi buffer helper"
     );
     assert!(
-        call_leaves(&graph).iter().any(|leaf| *leaf == "malloc"),
+        call_leaves(&graph).contains(&"malloc"),
         "native raw_malloc calls libc::malloc; leaves={:?}",
         call_leaves(&graph)
     );

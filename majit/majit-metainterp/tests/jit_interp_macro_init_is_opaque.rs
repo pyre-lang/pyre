@@ -83,13 +83,13 @@ fn dispatch_pre(program: &Bytecode, threshold: u32, ticks: i64, sel: i64) -> i64
         pc += 1;
         match opcode {
             OP_USES => {
-                state.acc = state.acc + bump;
+                state.acc += bump;
             }
             OP_PLAIN => {
-                state.acc = state.acc + PLAIN_WORK;
+                state.acc += PLAIN_WORK;
             }
             OP_TICK => {
-                state.ticks = state.ticks - 1i64;
+                state.ticks -= 1i64;
                 if state.ticks != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;
@@ -128,13 +128,13 @@ fn dispatch_arm(program: &Bytecode, threshold: u32, ticks: i64, sel: i64) -> i64
         match opcode {
             OP_USES => {
                 let n = pick!(sel);
-                state.acc = state.acc + n;
+                state.acc += n;
             }
             OP_PLAIN => {
-                state.acc = state.acc + PLAIN_WORK;
+                state.acc += PLAIN_WORK;
             }
             OP_TICK => {
-                state.ticks = state.ticks - 1i64;
+                state.ticks -= 1i64;
                 if state.ticks != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;

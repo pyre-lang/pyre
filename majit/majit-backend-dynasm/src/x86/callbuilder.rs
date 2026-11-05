@@ -660,23 +660,23 @@ impl<'m, 'a> CallBuilder64<'m, 'a> {
         match src {
             // XXX too much special logic
             Loc::Frame(_) | Loc::Ebp(_) => {
-                self.asm.mc.MOV32(X86_64_SCRATCH_REG, &src);
-                self.asm.mc.MOV32(&dst, X86_64_SCRATCH_REG);
+                self.asm.mc.MOV32(X86_64_SCRATCH_REG, src);
+                self.asm.mc.MOV32(dst, X86_64_SCRATCH_REG);
             }
             Loc::Reg(r) if r.is_xmm => panic!("singlefloat stack argument location {src:?}"),
-            _ => self.asm.mc.MOV32(&dst, &src),
+            _ => self.asm.mc.MOV32(dst, src),
         }
     }
 
     /// `prepare_arguments`'s `MOVD32(dst, src)` of a singlefloat into its
     /// argument xmm register.
     fn movd32_to_xmm(&mut self, dst: RegLoc, src: Loc) {
-        self.asm.mc.MOVD32(dst, &src);
+        self.asm.mc.MOVD32(dst, src);
     }
 
     /// `CallBuilder64.emit_raw_call`: `CALL(self.fnloc)`.
     fn emit_raw_call(&mut self) {
         let fnloc = self.fnloc.expect("emit_raw_call before prepare_arguments");
-        self.asm.mc.CALL(&fnloc);
+        self.asm.mc.CALL(fnloc);
     }
 }

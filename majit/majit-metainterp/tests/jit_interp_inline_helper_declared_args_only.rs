@@ -65,7 +65,7 @@ fn cells_helper_sum(program: &Bytecode, threshold: u32, cells: Vec<i64>, ticks: 
                 pc += 1;
             }
             OP_LOOP => {
-                state.ticks = state.ticks - 1i64;
+                state.ticks -= 1i64;
                 if state.ticks != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;

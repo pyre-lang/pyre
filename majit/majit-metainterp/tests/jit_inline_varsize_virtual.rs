@@ -130,7 +130,7 @@ fn dispatch_fill(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
                 state.acc = fill_slot();
             }
             OP_TICK => {
-                state.ticks = state.ticks - 1i64;
+                state.ticks -= 1i64;
                 if state.ticks != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;

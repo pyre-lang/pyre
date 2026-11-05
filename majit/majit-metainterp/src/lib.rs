@@ -2272,9 +2272,7 @@ pub fn criticalcode_stop() {
 /// exceptions). Rust's equivalent is `Drop`: this guard calls
 /// `criticalcode_stop()` in its destructor so ordinary returns,
 /// `?`-propagated errors, and `panic!` unwind all re-enable the
-/// `report_error` flag. Matches rpython/jit/metainterp/resume.py:1315
-/// + rpython/jit/metainterp/pyjitpl.py:3281 +
-/// rpython/jit/metainterp/compile.py:976 `try/finally` semantics.
+/// `report_error` flag. Matches rpython/jit/metainterp/resume.py:1315 + rpython/jit/metainterp/pyjitpl.py:3281 + rpython/jit/metainterp/compile.py:976 `try/finally` semantics.
 pub struct CriticalCodeGuard {
     _private: (),
 }

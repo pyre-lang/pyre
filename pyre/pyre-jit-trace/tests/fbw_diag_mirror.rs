@@ -200,7 +200,7 @@ fn the_runner_mirror_matches_fbw_diag_labels() {
         runner.len(),
     );
 
-    let divergent = divergences(&authority, &runner);
+    let divergent = divergences(authority, &runner);
     assert!(
         divergent.is_empty(),
         "the pyre-wasm-runner fbw mirror no longer matches \
@@ -334,7 +334,7 @@ fn the_mirror_check_catches_injected_drift() {
     assert_ne!(renamed, runner_src, "control: rename injection was a no-op");
     let drifted = array_after(&renamed, "let fbw_labels", "runner");
     assert!(
-        !divergences(&authority, &drifted).is_empty(),
+        !divergences(authority, &drifted).is_empty(),
         "a renamed slot went undetected — `divergences` or the runner anchor is \
          broken, and this file is guarding nothing",
     );
@@ -352,7 +352,7 @@ fn the_mirror_check_catches_injected_drift() {
          assertion in the mirror test is untested",
     );
     assert!(
-        divergences(&authority, &short).is_empty(),
+        divergences(authority, &short).is_empty(),
         "control assumption broken: dropping the LAST slot should leave every \
          remaining slot correctly named, so only the length check can catch it",
     );

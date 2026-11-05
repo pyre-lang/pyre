@@ -1040,11 +1040,11 @@ impl RPythonTyper {
                     (0, &exceptiondata.r_exception_type),
                     (1, &exceptiondata.r_exception_value),
                 ] {
-                    if let Some(Hlvalue::Constant(c)) = args.get(i).and_then(|a| a.as_ref()) {
-                        if matches!(c.value, ConstValue::HostObject(_)) {
-                            let typed = inputconst(repr.as_ref(), &c.value)?;
-                            link.borrow_mut().args[i] = Some(Hlvalue::Constant(typed));
-                        }
+                    if let Some(Hlvalue::Constant(c)) = args.get(i).and_then(|a| a.as_ref())
+                        && matches!(c.value, ConstValue::HostObject(_))
+                    {
+                        let typed = inputconst(repr.as_ref(), &c.value)?;
+                        link.borrow_mut().args[i] = Some(Hlvalue::Constant(typed));
                     }
                 }
             }

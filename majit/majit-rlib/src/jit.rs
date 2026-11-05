@@ -321,7 +321,7 @@ mod tests {
         }
         let mut slot = 0i32;
         let hit = conditional_call_elidable1(std::ptr::null_mut(), compute, &mut slot);
-        assert!(std::ptr::eq(hit, &mut slot));
+        assert!(std::ptr::eq(hit, &slot));
         assert_eq!(slot, 1);
         let again = conditional_call_elidable1(hit, compute, &mut slot);
         assert!(std::ptr::eq(again, hit));
@@ -347,7 +347,7 @@ mod tests {
         }
         let mut slot = 0i32;
         let hit = conditional_call_elidable2(std::ptr::null_mut(), compute, &mut slot, 2);
-        assert!(std::ptr::eq(hit, &mut slot));
+        assert!(std::ptr::eq(hit, &slot));
         assert_eq!(slot, 2);
         let again = conditional_call_elidable2(hit, compute, &mut slot, 2);
         assert!(std::ptr::eq(again, hit));

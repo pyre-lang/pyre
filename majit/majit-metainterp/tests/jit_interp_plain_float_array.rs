@@ -72,10 +72,10 @@ fn cells_sum(program: &Bytecode, threshold: u32, cells: Vec<f64>, n: i64) -> i64
         can_enter_jit!(driver, 0usize, &mut state, program, || {});
         jit_merge_point!(driver, program, pc; state);
         let i = state.i as usize;
-        state.acc = state.acc + state.cells[i];
+        state.acc += state.cells[i];
         let next = state.i + 1i64;
         state.i = if next < state.len { next } else { 0i64 };
-        state.n = state.n - 1i64;
+        state.n -= 1i64;
     }
     state.acc.to_bits() as i64
 }

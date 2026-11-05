@@ -1379,9 +1379,7 @@ impl OptRewrite {
             }
         }
 
-        let Some(reflex) = op.opcode.bool_reflex() else {
-            return None;
-        };
+        let reflex = op.opcode.bool_reflex()?;
         let top = Op::new(reflex, &[arg1.clone(), arg0.clone()]);
         if let Some(old) = self.get_pure_result(top.opcode, [top.arg(0), top.arg(1)], ctx) {
             let b_old = Operand::from_bound_op(op_rc);
@@ -2441,7 +2439,7 @@ mod tests {
     fn producer_operand(ops: &[majit_ir::OpRc], opref: OpRef) -> Operand {
         ops.iter()
             .find(|op| op.pos().get() == opref)
-            .map(|op| Operand::from_bound_op(op))
+            .map(Operand::from_bound_op)
             .unwrap_or_else(|| panic!("no producer at {opref:?}"))
     }
 

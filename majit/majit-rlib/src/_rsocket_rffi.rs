@@ -8,7 +8,7 @@
 //! `select`, `getsockname`, `getsockopt`, the byte-order conversions,
 //! `inet_addr`, `inet_ntoa`, `inet_pton`, `inet_ntop`, and `_WSAGetLastError`.
 
-#![allow(non_snake_case, non_camel_case_types)]
+#![allow(non_camel_case_types)]
 
 #[cfg(unix)]
 mod posix {

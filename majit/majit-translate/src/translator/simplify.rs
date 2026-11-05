@@ -2232,10 +2232,6 @@ impl<'a> ListComprehensionDetector<'a> {
         result
     }
 
-    #[expect(
-        clippy::mutable_key_type,
-        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-    )]
     fn run(&mut self, vlist: Hlvalue, vmeth: Hlvalue, appendblock: BlockRef) -> Result<(), ()> {
         let append_ops = appendblock.borrow().operations.clone();
         for hlop in &append_ops {

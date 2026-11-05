@@ -2730,8 +2730,8 @@ mod bridge_seed_tests {
         let mut shadow = CalleeLocalsShadow::default();
         let copied = Value::Ref(majit_ir::GcRef(pyre_object::w_none() as usize));
         seed_bridge_shadow_concrete(&mut shadow, 4, 0, OpRef::NONE, copied, 0).unwrap();
-        assert!(shadow.concrete.get(&0).is_none());
-        assert!(shadow.opref.get(&0).is_none());
+        assert!(!shadow.concrete.contains_key(&0));
+        assert!(!shadow.opref.contains_key(&0));
 
         seed_bridge_shadow_concrete(&mut shadow, 4, 1, OpRef::NONE, Value::Int(7), 0).unwrap();
         assert_eq!(
@@ -2765,7 +2765,7 @@ mod bridge_seed_tests {
             0,
         )
         .unwrap();
-        assert!(shadow.concrete.get(&3).is_some());
+        assert!(shadow.concrete.contains_key(&3));
         assert_eq!(shadow.opref.get(&3).copied(), Some(constant));
     }
 
@@ -2780,8 +2780,8 @@ mod bridge_seed_tests {
                 value: boxed
             })
         );
-        assert!(shadow.opref.get(&0).is_none());
-        assert!(shadow.concrete.get(&0).is_none());
+        assert!(!shadow.opref.contains_key(&0));
+        assert!(!shadow.concrete.contains_key(&0));
     }
 
     #[test]
@@ -2802,8 +2802,8 @@ mod bridge_seed_tests {
                 value: boxed
             })
         );
-        assert!(shadow.opref.get(&0).is_none());
-        assert!(shadow.concrete.get(&0).is_none());
+        assert!(!shadow.opref.contains_key(&0));
+        assert!(!shadow.concrete.contains_key(&0));
     }
 
     #[test]
@@ -2813,8 +2813,8 @@ mod bridge_seed_tests {
             seed_bridge_shadow_concrete(&mut shadow, 4, 0, OpRef::NONE, Value::Void, 0),
             Ok(())
         );
-        assert!(shadow.opref.get(&0).is_none());
-        assert!(shadow.concrete.get(&0).is_none());
+        assert!(!shadow.opref.contains_key(&0));
+        assert!(!shadow.concrete.contains_key(&0));
     }
 
     /// A reconstructed recipe whose box is `NO_CONCRETE` is declined at
@@ -2857,7 +2857,7 @@ mod bridge_seed_tests {
                 value: opref
             })
         );
-        assert!(shadow.opref.get(&0).is_none());
-        assert!(shadow.concrete.get(&0).is_none());
+        assert!(!shadow.opref.contains_key(&0));
+        assert!(!shadow.concrete.contains_key(&0));
     }
 }

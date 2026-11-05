@@ -784,10 +784,6 @@ impl VectorLoop {
         if let Some(jcell) = jitcell_token {
             // vector.py:64-72
             if reset_label_token {
-                #[expect(
-                    clippy::arc_with_non_send_sync,
-                    reason = "Arc preserves shared JitCode/descriptor identity across compiled artifacts; the non-Send translator payload is confined to the single-threaded build phase and is never transferred between threads"
-                )]
                 let token = std::sync::Arc::new(crate::history::TargetToken::new_loop(0));
                 let descr = token.as_jump_target_descr();
                 jcell.target_tokens.lock().push(descr.clone());
@@ -800,10 +796,6 @@ impl VectorLoop {
             // vector.py:73-77: prefix_label gets its own TargetToken, and
             // the jump is rebound to point at it.
             if let Some(ref prefix_label) = self.prefix_label {
-                #[expect(
-                    clippy::arc_with_non_send_sync,
-                    reason = "Arc preserves shared JitCode/descriptor identity across compiled artifacts; the non-Send translator payload is confined to the single-threaded build phase and is never transferred between threads"
-                )]
                 let pre_token = std::sync::Arc::new(crate::history::TargetToken::new_loop(0));
                 let pre_descr = pre_token.as_jump_target_descr();
                 jcell.target_tokens.lock().push(pre_descr.clone());

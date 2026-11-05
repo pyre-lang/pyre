@@ -1646,9 +1646,8 @@ fn is_type_shaped(sv: &SomeValue) -> bool {
 /// / `pairtype(SomeConstantType, SomeType)` are owned by `annotator::union`.
 /// Call that first when it already has the arm (PBC ∪ PBC).
 fn union_type_shaped(existing: &SomeValue, incoming: &SomeValue) -> Result<SomeValue, TyperError> {
-    match crate::annotator::model::union(existing, incoming) {
-        Ok(u) => return Ok(u),
-        Err(_) => {}
+    if let Ok(u) = crate::annotator::model::union(existing, incoming) {
+        return Ok(u);
     }
     if let (SomeValue::TypeOf(a), SomeValue::TypeOf(b)) = (existing, incoming) {
         let mut vars = a.is_type_of.clone();
@@ -4036,9 +4035,8 @@ mod tests {
 
         let bound = scratch.alloc_value_var();
         assert!(merge_flat(&bound, ValueType::Int, None).unwrap());
-        assert_eq!(
-            merge_flat(&bound, ValueType::Unknown, None).unwrap(),
-            false,
+        assert!(
+            !merge_flat(&bound, ValueType::Unknown, None).unwrap(),
             "incoming Unknown (unbound source) into a bound slot is a no-op"
         );
         assert_eq!(read_binding(&bound), ValueType::Int);
@@ -4076,9 +4074,8 @@ mod tests {
         let mut scratch = FunctionGraph::new("scratch_unsigned_str");
         let unsigned_slot = scratch.alloc_value_var();
         assert!(merge_flat(&unsigned_slot, ValueType::Unsigned, None).unwrap());
-        assert_eq!(
-            merge_flat(&unsigned_slot, ValueType::Unsigned, None).unwrap(),
-            false,
+        assert!(
+            !merge_flat(&unsigned_slot, ValueType::Unsigned, None).unwrap(),
             "Unsigned ∪ Unsigned is identity"
         );
         assert_eq!(read_binding(&unsigned_slot), ValueType::Unsigned);
@@ -4086,9 +4083,8 @@ mod tests {
         // `binaryop.py` `pairtype(SomeString, SomeString).union` succeeds.
         let str_slot = scratch.alloc_value_var();
         assert!(merge_flat(&str_slot, ValueType::Str, None).unwrap());
-        assert_eq!(
-            merge_flat(&str_slot, ValueType::Str, None).unwrap(),
-            false,
+        assert!(
+            !merge_flat(&str_slot, ValueType::Str, None).unwrap(),
             "Str ∪ Str is identity"
         );
         assert_eq!(read_binding(&str_slot), ValueType::Str);
@@ -4497,9 +4493,8 @@ mod tests {
         let mut scratch = FunctionGraph::new("scratch_str_family_ref");
         let slot = scratch.alloc_value_var();
         assert!(merge_flat(&slot, ValueType::Str, None).unwrap());
-        assert_eq!(
-            merge_flat(&slot, ValueType::Ref(Some("string::String".into())), None).unwrap(),
-            false,
+        assert!(
+            !merge_flat(&slot, ValueType::Ref(Some("string::String".into())), None).unwrap(),
             "str-family Ref ∪ Str is identity"
         );
         assert_eq!(read_binding(&slot), ValueType::Str);

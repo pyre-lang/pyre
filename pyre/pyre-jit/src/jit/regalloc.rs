@@ -676,7 +676,6 @@ pub fn perform_register_allocation_all_kinds_with_pairs(
 
 /// Mirrors `rpython/jit/codewriter/flatten.py enforce_input_args`
 ///
-
 /// Walks the startblock's inputargs in source order; for each inputarg
 /// of kind `K` whose current color in `regallocs[K]` does not equal
 /// the next "real" color for that kind (`0, 1, 2, ...` per appearance),
@@ -960,7 +959,7 @@ mod tests {
         let pin_pairs = vec![(VariableId(99), v0.id)];
         let result = perform_register_allocation_with_pairs(&graph, Kind::Ref, &pin_pairs);
         assert!(
-            result.coloring.get(&v0.id).is_some(),
+            result.coloring.contains_key(&v0.id),
             "inputarg v0 must retain a color even when pinned scratch ID 99 is absent from the graph"
         );
     }

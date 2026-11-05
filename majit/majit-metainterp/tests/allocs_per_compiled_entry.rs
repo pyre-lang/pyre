@@ -373,8 +373,8 @@ pub fn mainloop(
 
         match opcode {
             C_ADD => {
-                state.acc = state.acc + state.n;
-                state.n = state.n - 1;
+                state.acc += state.n;
+                state.n -= 1;
             }
             C_BR_COND => {
                 let offset = program[pc] as i8 as i64;

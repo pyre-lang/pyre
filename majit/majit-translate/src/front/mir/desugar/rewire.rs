@@ -363,7 +363,6 @@ pub(in crate::front::mir) struct AggregateField {
 
 /// Emit `ctor`'s constructor and field writes into `block` over the operand
 /// values `args`, returning the constructed value.
-
 pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
     graph: &mut FunctionGraph,
     block: BlockId,

@@ -55,7 +55,7 @@ fn pure_lookup_keeps_forwarding_and_commutative_matching() {
         &[Operand::const_from_value(Value::Int(9))],
     ));
     let x = ctx.get_box_replacement_operand_opt(x_pos).unwrap();
-    let alias_pos = ctx.emit(Op::new(OpCode::SameAsI, &[x.clone()]));
+    let alias_pos = ctx.emit(Op::new(OpCode::SameAsI, std::slice::from_ref(&x)));
     let alias = ctx.get_box_replacement_operand_opt(alias_pos).unwrap();
     ctx.make_equal_to(&alias, &x);
     let result = emit_result_box(&mut ctx);

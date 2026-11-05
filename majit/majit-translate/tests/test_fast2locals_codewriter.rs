@@ -51,7 +51,7 @@ fn lower_named(llbc: &Llbc, context: &LowerContext<'_>, leaf: &str) -> FunctionG
 fn lower_fast2locals() -> Option<FunctionGraph> {
     let llbc = interpreter_llbc()?;
     common::with_shared_lowering(llbc, |context| {
-        Some(lower_named(llbc, &context, "fast2locals"))
+        Some(lower_named(llbc, context, "fast2locals"))
     })
 }
 
@@ -82,7 +82,7 @@ fn the_access_directly_marker_folds_out_of_the_type_lookup() {
         return;
     };
     common::with_shared_lowering(llbc, |context| {
-        let graph = lower_named(llbc, &context, "typedef::type");
+        let graph = lower_named(llbc, context, "typedef::type");
         assert!(
             call_leafs(&graph)
                 .iter()
@@ -104,10 +104,10 @@ fn f_locals_gateway_force_is_deleted_and_the_method_has_none() {
     common::with_shared_lowering(llbc, |context| {
         let gateway = lower_named(
             llbc,
-            &context,
+            context,
             "__majit_wrap_descr_typecheck_fget_getdictscope",
         );
-        let method = lower_named(llbc, &context, "fget_getdictscope");
+        let method = lower_named(llbc, context, "fget_getdictscope");
         assert!(
             call_leafs(&gateway)
                 .iter()
@@ -166,7 +166,7 @@ fn every_redirected_frame_getter_carries_a_deletable_force() {
             "__majit_wrap_descr_typecheck_fget_f_trace_opcodes",
             "__majit_wrap_descr_typecheck_fset_f_trace_opcodes",
         ] {
-            let gateway = lower_named(llbc, &context, leaf);
+            let gateway = lower_named(llbc, context, leaf);
             let before = call_leafs(&gateway);
             assert!(
                 before
@@ -212,7 +212,7 @@ fn the_gateways_outside_the_redirected_set_carry_no_force() {
             "__majit_wrap_descr_typecheck_fget_f_builtins",
             "__majit_wrap_descr_typecheck_get_generator",
         ] {
-            let gateway = lower_named(llbc, &context, leaf);
+            let gateway = lower_named(llbc, context, leaf);
             let before = call_leafs(&gateway);
             assert!(
                 before

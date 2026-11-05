@@ -493,7 +493,7 @@ fn function_new_impl_reload_emits_cast_instance_str() {
         return;
     };
     let graph =
-        crate::test_support::lower_function(&llbc, "pyre_interpreter::function::function_new_impl")
+        crate::test_support::lower_function(llbc, "pyre_interpreter::function::function_new_impl")
             .expect("lower function_new_impl");
     let casts: Vec<_> = graph
         .blocks
@@ -2238,8 +2238,8 @@ fn unicode_storage_matches_real_object_llbc() {
     );
     let llbc = crate::test_support::load_ullbc(path);
     let (_, _, fields, _, _, attrs, _, _) = super::derive_program_metadata(
-        &llbc,
-        &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        llbc,
+        &super::harvest_declared_gc_facts(llbc).gc_struct_ids(),
         super::no_immutable_fields(),
         &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc)),
         &[],
@@ -2261,7 +2261,7 @@ fn unicode_storage_matches_real_object_llbc() {
         "W_UnicodeObject.value must project as PyPy's string-valued _utf8 field"
     );
 
-    let graph = crate::test_support::lower_function(&llbc, "w_str_from_wtf8_managed")
+    let graph = crate::test_support::lower_function(llbc, "w_str_from_wtf8_managed")
         .expect("lower managed string constructor");
     assert!(
         !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
@@ -2338,8 +2338,8 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
     let (_, _, fields, _, _, attrs, _, _) = super::derive_program_metadata(
-        &llbc,
-        &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        llbc,
+        &super::harvest_declared_gc_facts(llbc).gc_struct_ids(),
         super::no_immutable_fields(),
         &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc)),
         &[],
@@ -2406,7 +2406,7 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
             ("im".to_string(), ValueType::Float),
         ])
     );
-    let constant_at = crate::test_support::lower_function(&llbc, "constant_at")
+    let constant_at = crate::test_support::lower_function(llbc, "constant_at")
         .expect("lower ConstantOpcodeHandler::constant_at");
     let constant_ops: Vec<_> = constant_at
         .blocks
@@ -2485,7 +2485,7 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
         }
     }
 
-    let getdocstring = crate::test_support::lower_function(&llbc, "code_getdocstring")
+    let getdocstring = crate::test_support::lower_function(llbc, "code_getdocstring")
         .expect("lower code_getdocstring");
     let doc_ops: Vec<_> = getdocstring
         .blocks
@@ -2525,11 +2525,11 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
         !deref_ids.is_empty(),
         "code_getdocstring must call translated Constants::deref"
     );
-    crate::test_support::with_lowering(&llbc, |context| {
+    crate::test_support::with_lowering(llbc, |context| {
         let mut deref_field_reads = 0usize;
         for id in deref_ids {
             let fd = llbc.fn_by_id(id).expect("Constants::deref FunDecl");
-            let deref_graph = super::lower_fun_decl(&context, fd)
+            let deref_graph = super::lower_fun_decl(context, fd)
                 .unwrap_or_else(|e| panic!("lower Constants::deref: {e:?}"));
             deref_field_reads += deref_graph
                 .blocks
@@ -2551,7 +2551,7 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
         );
     });
 
-    let load_const = crate::test_support::lower_function(&llbc, "load_const_value")
+    let load_const = crate::test_support::lower_function(llbc, "load_const_value")
         .expect("lower rbigint-consuming load_const_value");
     let load_ops: Vec<_> = load_const
         .blocks
@@ -2582,7 +2582,7 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
     // survive, and the existing GC reference must flow to
     // `w_long_from_raw`.
     let mut boxed_handlers = 0usize;
-    crate::test_support::with_lowering(&llbc, |context| {
+    crate::test_support::with_lowering(llbc, |context| {
         for fd in llbc.iter_local_fns().filter(|fd| {
             fd.item_meta.name_path().ends_with("::bigint_constant") && fd.unstructured().is_some()
         }) {
@@ -7284,7 +7284,7 @@ fn option_map_or_keeps_regular_call_to_core_body() {
     let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
     };
-    let caller = crate::test_support::lower_function(&llbc, "get_or_create_extra_locals")
+    let caller = crate::test_support::lower_function(llbc, "get_or_create_extra_locals")
         .expect("lower get_or_create_extra_locals");
     let map_or_calls = caller
         .blocks
@@ -7310,7 +7310,7 @@ fn option_map_or_keeps_regular_call_to_core_body() {
         "caller keeps one regular call to the core map_or body, got {map_or_calls}"
     );
 
-    crate::test_support::with_lowering(&llbc, |ctx| {
+    crate::test_support::with_lowering(llbc, |ctx| {
         let mut lowered_core_bodies = 0usize;
         for fd in llbc.iter_fun_decls() {
             if !fd.has_unstructured_body() {
@@ -7320,8 +7320,8 @@ fn option_map_or_keeps_regular_call_to_core_body() {
             if !name_path.ends_with("::option::<Impl>::map_or") {
                 continue;
             }
-            let graph = super::lower_fun_decl(&ctx, fd)
-                .unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
+            let graph =
+                super::lower_fun_decl(ctx, fd).unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
             let has_disc = graph.blocks.iter().any(|block| {
                 matches!(block.exitswitch, Some(ExitSwitch::Value(_)))
                     || block.operations.iter().any(|op| {
@@ -7379,7 +7379,7 @@ fn option_map_family_keeps_regular_call_to_core_body() {
     let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
     };
-    crate::test_support::with_lowering(&llbc, |ctx| {
+    crate::test_support::with_lowering(llbc, |ctx| {
         let leaves = [
             "map",
             "and_then",
@@ -7398,7 +7398,7 @@ fn option_map_family_keeps_regular_call_to_core_body() {
                 if !name_path.ends_with(&suffix) {
                     continue;
                 }
-                let graph = super::lower_fun_decl(&ctx, fd)
+                let graph = super::lower_fun_decl(ctx, fd)
                     .unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
                 let has_disc = graph.blocks.iter().any(|block| {
                     matches!(block.exitswitch, Some(ExitSwitch::Value(_)))
@@ -7445,7 +7445,7 @@ fn option_map_family_keeps_regular_call_to_core_body() {
         }
     });
 
-    let caller = crate::test_support::lower_function(&llbc, "install_applevel_builtins")
+    let caller = crate::test_support::lower_function(llbc, "install_applevel_builtins")
         .expect("lower install_applevel_builtins");
     let is_some_and_calls = caller
         .blocks
@@ -7526,19 +7526,19 @@ fn option_of_type_parameter_param_seeds_enum_template() {
     let tvar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
     let node = option_adt_node(0, tvar);
     assert_eq!(
-        super::adt_node_class_root_identity(&node, &llbc, &tomb),
+        super::adt_node_class_root_identity(&node, &llbc, tomb),
         None,
         "value paint of Option<v0> stays classdef-less"
     );
     let ty = TyRef::Other(node.clone());
     assert_eq!(
-        super::tyref_ref_param_class_root(&ty, &llbc, &tomb, None),
+        super::tyref_ref_param_class_root(&ty, &llbc, tomb, None),
         Some("option::Option".into()),
         "Option<v0> param seeds the harvested Option template"
     );
     let borrowed = TyRef::Other(option_shared_ref(node));
     assert_eq!(
-        super::tyref_ref_param_class_root(&borrowed, &llbc, &tomb, None),
+        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
         Some("option::Option".into()),
         "&Option<v0> param seeds the harvested Option template"
     );
@@ -7554,19 +7554,19 @@ fn option_of_unit_param_seeds_enum_template() {
     let unit = serde_json::json!({"Tuple": []});
     let node = option_adt_node(0, unit);
     assert_eq!(
-        super::adt_node_class_root_identity(&node, &llbc, &tomb),
+        super::adt_node_class_root_identity(&node, &llbc, tomb),
         None,
         "value paint of Option<()> stays classdef-less"
     );
     let ty = TyRef::Other(node.clone());
     assert_eq!(
-        super::tyref_ref_param_class_root(&ty, &llbc, &tomb, None),
+        super::tyref_ref_param_class_root(&ty, &llbc, tomb, None),
         Some("option::Option".into()),
         "Option<()> param seeds the harvested Option template"
     );
     let borrowed = TyRef::Other(option_shared_ref(node));
     assert_eq!(
-        super::tyref_ref_param_class_root(&borrowed, &llbc, &tomb, None),
+        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
         Some("option::Option".into()),
         "&Option<()> param seeds the harvested Option template"
     );
@@ -7623,12 +7623,12 @@ fn unsuffixed_local_payload_enum_param_is_not_a_template_seed() {
     });
     let ty = TyRef::Other(node.clone());
     assert_eq!(
-        super::tyref_split_core_enum_param_root(&ty, &llbc, &tomb),
+        super::tyref_split_core_enum_param_root(&ty, &llbc, tomb),
         None,
         "Buffer-shaped enum has no type args; do not seed the Option<()> path"
     );
     assert_eq!(
-        super::adt_node_class_root_identity(&node, &llbc, &tomb).as_deref(),
+        super::adt_node_class_root_identity(&node, &llbc, tomb).as_deref(),
         Some("RawEnum"),
         "value/param paint still names the harvested identity"
     );
@@ -7645,7 +7645,7 @@ fn option_of_word_struct_interns_tagged_class() {
     );
     let tomb = super::no_tombstoned_leaves();
     let node = option_adt_node(0, adt_node(1));
-    let root = super::adt_node_class_root_with(&node, &llbc, &tomb);
+    let root = super::adt_node_class_root_with(&node, &llbc, tomb);
     assert_eq!(root.as_deref(), Some("option::Option<WordHasher>"));
     let ty = TyRef::Other(node);
     assert_eq!(
@@ -7653,7 +7653,7 @@ fn option_of_word_struct_interns_tagged_class() {
         crate::model::ValueType::Ref(Some("option::Option<WordHasher>".into()))
     );
     assert_eq!(
-        super::tyref_ref_param_class_root(&ty, &llbc, &tomb, None),
+        super::tyref_ref_param_class_root(&ty, &llbc, tomb, None),
         Some("option::Option<WordHasher>".into())
     );
     let borrowed = TyRef::Other(option_shared_ref(option_adt_node(0, adt_node(1))));
@@ -7662,7 +7662,7 @@ fn option_of_word_struct_interns_tagged_class() {
         crate::model::ValueType::Ref(Some("option::Option<WordHasher>".into()))
     );
     assert_eq!(
-        super::tyref_ref_param_class_root(&borrowed, &llbc, &tomb, None),
+        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
         Some("option::Option<WordHasher>".into())
     );
 }
@@ -7685,12 +7685,12 @@ fn option_of_shared_ref_to_generic_struct_is_niche() {
         "Option<&WordHasher> is the nullable pointer niche"
     );
     assert_eq!(
-        super::adt_node_class_root_with(&node, &llbc, &tomb),
+        super::adt_node_class_root_with(&node, &llbc, tomb),
         None,
         "niche Option<&Struct> must not intern a tagged class"
     );
     assert_eq!(
-        super::tyref_ref_param_class_root(&ty, &llbc, &tomb, None),
+        super::tyref_ref_param_class_root(&ty, &llbc, tomb, None),
         None
     );
 }
@@ -7724,7 +7724,7 @@ fn option_of_thin_arc_or_rc_is_niche() {
         "Option of a thin Rc is the nullable pointer niche"
     );
     assert_eq!(
-        super::adt_node_class_root_with(&option_arc, &llbc, &tomb),
+        super::adt_node_class_root_with(&option_arc, &llbc, tomb),
         None,
         "niche Option of Arc must not intern a tagged class"
     );
@@ -7784,7 +7784,7 @@ fn option_with_extra_fn_ptr_arg_still_interns() {
     );
     let tomb = super::no_tombstoned_leaves();
     let node = option_adt_node_from_types(0, vec![adt_node(1), unit_fn_ptr()]);
-    let root = super::adt_node_class_root_with(&node, &llbc, &tomb);
+    let root = super::adt_node_class_root_with(&node, &llbc, tomb);
     assert!(
         root.as_deref()
             .is_some_and(|r| r.starts_with("option::Option<") && r.contains("WordHasher")),
@@ -7792,7 +7792,7 @@ fn option_with_extra_fn_ptr_arg_still_interns() {
     );
     let ty = TyRef::Other(node);
     assert_eq!(
-        super::tyref_ref_param_class_root(&ty, &llbc, &tomb, None),
+        super::tyref_ref_param_class_root(&ty, &llbc, tomb, None),
         root.clone()
     );
     let borrowed = TyRef::Other(option_shared_ref(option_adt_node_from_types(
@@ -7800,7 +7800,7 @@ fn option_with_extra_fn_ptr_arg_still_interns() {
         vec![adt_node(1), unit_fn_ptr()],
     )));
     assert_eq!(
-        super::tyref_ref_param_class_root(&borrowed, &llbc, &tomb, None),
+        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
         root
     );
 }
@@ -7854,7 +7854,7 @@ fn option_of_nested_hasher_map_interns_tagged_class() {
     let hasher = generic_adt_node(2, vec![adt_node(1)]);
     let map = generic_adt_node(3, vec![adt_node(1), adt_node(1), hasher]);
     let node = option_adt_node(0, map);
-    let root = super::adt_node_class_root_with(&node, &llbc, &tomb);
+    let root = super::adt_node_class_root_with(&node, &llbc, tomb);
     assert!(
         root.as_deref()
             .is_some_and(|r| r.starts_with("option::Option<") && r.contains("HashMap")),
@@ -7862,7 +7862,7 @@ fn option_of_nested_hasher_map_interns_tagged_class() {
     );
     let borrowed = TyRef::Other(option_shared_ref(node));
     assert_eq!(
-        super::tyref_ref_param_class_root(&borrowed, &llbc, &tomb, None),
+        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
         root
     );
 }
@@ -7893,7 +7893,7 @@ fn option_instantiated_type_decl_interns_tagged_class() {
             "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
         }
     });
-    let root = super::adt_node_class_root_with(&node, &llbc, &tomb);
+    let root = super::adt_node_class_root_with(&node, &llbc, tomb);
     assert_eq!(
         root.as_deref(),
         Some("option::Option<WordHasher>"),
@@ -7901,7 +7901,7 @@ fn option_instantiated_type_decl_interns_tagged_class() {
     );
     let borrowed = TyRef::Other(option_shared_ref(node));
     assert_eq!(
-        super::tyref_ref_param_class_root(&borrowed, &llbc, &tomb, None),
+        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
         Some("option::Option<WordHasher>".into())
     );
 }
@@ -7932,7 +7932,7 @@ fn option_instantiated_dedup_skip_binder_interns_tagged_class() {
             "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
         }
     });
-    let root = super::adt_node_class_root_with(&node, &llbc, &tomb);
+    let root = super::adt_node_class_root_with(&node, &llbc, tomb);
     assert_eq!(
         root.as_deref(),
         Some("option::Option<WordHasher>"),
@@ -7940,7 +7940,7 @@ fn option_instantiated_dedup_skip_binder_interns_tagged_class() {
     );
     let borrowed = TyRef::Other(option_shared_ref(node));
     assert_eq!(
-        super::tyref_ref_param_class_root(&borrowed, &llbc, &tomb, None),
+        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
         Some("option::Option<WordHasher>".into())
     );
 }
@@ -7965,7 +7965,7 @@ fn option_of_dict_with_hasher_and_raw_ptr_interns_tagged_class() {
     let raw = serde_json::json!({"RawPtr": [adt_node(4), "Mut"]});
     let dict = generic_adt_node(3, vec![adt_node(1), raw, hasher]);
     let node = option_adt_node(0, dict);
-    let root = super::adt_node_class_root_with(&node, &llbc, &tomb);
+    let root = super::adt_node_class_root_with(&node, &llbc, tomb);
     assert!(
         root.as_deref()
             .is_some_and(|r| r.starts_with("option::Option<") && r.contains("RDict")),
@@ -7973,7 +7973,7 @@ fn option_of_dict_with_hasher_and_raw_ptr_interns_tagged_class() {
     );
     let borrowed = TyRef::Other(option_shared_ref(node));
     assert_eq!(
-        super::tyref_ref_param_class_root(&borrowed, &llbc, &tomb, None),
+        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
         root
     );
 }
@@ -8124,19 +8124,19 @@ fn two_same_leaf_structs_paint_distinct_class_roots() {
     let a = TyRef::Other(adt_node(0));
     let b = TyRef::Other(adt_node(1));
     assert_eq!(
-        super::adt_node_class_root_with(&adt_node(0), &llbc, &tomb).as_deref(),
+        super::adt_node_class_root_with(&adt_node(0), &llbc, tomb).as_deref(),
         Some("a::Dup")
     );
     assert_eq!(
-        super::adt_node_class_root_with(&adt_node(1), &llbc, &tomb).as_deref(),
+        super::adt_node_class_root_with(&adt_node(1), &llbc, tomb).as_deref(),
         Some("b::Dup")
     );
     assert_eq!(
-        super::tyref_ref_param_class_root(&a, &llbc, &tomb, None).as_deref(),
+        super::tyref_ref_param_class_root(&a, &llbc, tomb, None).as_deref(),
         Some("a::Dup")
     );
     assert_eq!(
-        super::tyref_ref_param_class_root(&b, &llbc, &tomb, None).as_deref(),
+        super::tyref_ref_param_class_root(&b, &llbc, tomb, None).as_deref(),
         Some("b::Dup")
     );
 }
@@ -8210,8 +8210,8 @@ fn type_parameter_fields_force_no_attribute_real() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = crate::test_support::load_ullbc(path);
     let (_, _, _, _, _, attrs, _, _) = super::derive_program_metadata(
-        &llbc,
-        &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        llbc,
+        &super::harvest_declared_gc_facts(llbc).gc_struct_ids(),
         super::no_immutable_fields(),
         &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc)),
         &[],
@@ -8378,8 +8378,8 @@ fn option_of_string_is_ref_paint_and_niche() {
         "Option<String> attr paint is the payload String's Ref"
     );
     let tomb = super::no_tombstoned_leaves();
-    let option_param = super::tyref_ref_param_class_root(&option_string, &llbc, &tomb, None);
-    let string_param = super::tyref_ref_param_class_root(&string, &llbc, &tomb, None);
+    let option_param = super::tyref_ref_param_class_root(&option_string, &llbc, tomb, None);
+    let string_param = super::tyref_ref_param_class_root(&string, &llbc, tomb, None);
     assert_eq!(
         option_param, string_param,
         "Option<String> param class root is the payload String's class root"
@@ -8389,8 +8389,8 @@ fn option_of_string_is_ref_paint_and_niche() {
         "String class root must be named, got {option_param:?}"
     );
     assert_eq!(
-        super::tyref_input_class_root(&option_string, &llbc, &tomb),
-        super::tyref_input_class_root(&string, &llbc, &tomb),
+        super::tyref_input_class_root(&option_string, &llbc, tomb),
+        super::tyref_input_class_root(&string, &llbc, tomb),
         "Option<String> input class root is the payload String's class root"
     );
     with_fixture_lowering(&llbc, |lowering| {
@@ -8415,7 +8415,7 @@ fn option_of_string_is_ref_paint_and_niche() {
             "Option<&String> value paint is the payload String's Ref"
         );
         assert_eq!(
-            super::tyref_ref_param_class_root(&option_ref_string, &llbc, &tomb, None),
+            super::tyref_ref_param_class_root(&option_ref_string, &llbc, tomb, None),
             string_param,
             "Option<&String> param class root is the payload String's class root"
         );
@@ -8431,7 +8431,7 @@ fn option_of_string_is_ref_paint_and_niche() {
             "&Option<String> attr paint is the payload String's Ref"
         );
         assert_eq!(
-            super::tyref_ref_param_class_root(&borrowed, &llbc, &tomb, None),
+            super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
             string_param,
             "&Option<String> param class root is the payload String's class root"
         );
@@ -8524,7 +8524,7 @@ fn option_of_object_pointer_slice_is_nullable_list() {
     );
     let tomb = super::no_tombstoned_leaves();
     assert_eq!(
-        super::tyref_ref_param_class_root(&option_ty, &llbc, &tomb, None),
+        super::tyref_ref_param_class_root(&option_ty, &llbc, tomb, None),
         list_root,
         "Option<&[*mut PyObject]> param seeds SomeList of PyObject"
     );
@@ -8623,7 +8623,7 @@ fn option_of_vec_of_vec_u8_is_nullable_list() {
     );
     let tomb = super::no_tombstoned_leaves();
     assert_eq!(
-        super::tyref_ref_param_class_root(&option_ty, &llbc, &tomb, None),
+        super::tyref_ref_param_class_root(&option_ty, &llbc, tomb, None),
         list_root,
         "Option<Vec<Vec<u8>>> param seeds SomeList"
     );
@@ -8634,7 +8634,7 @@ fn option_of_vec_of_vec_u8_is_nullable_list() {
         "&Option<Vec<Vec<u8>>> value paint is the nullable list"
     );
     assert_eq!(
-        super::tyref_ref_param_class_root(&borrowed, &llbc, &tomb, None),
+        super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
         list_root,
         "&Option<Vec<Vec<u8>>> param seeds SomeList"
     );
@@ -9499,9 +9499,9 @@ fn elidable_declaration_keeps_a_functiondesc_without_a_lowered_body() {
         "/../../target/llbc/pyre-object.ullbc"
     );
     let llbc = crate::test_support::load_ullbc(path);
-    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let gc_struct_ids = super::harvest_declared_gc_facts(llbc).gc_struct_ids();
     let specs = super::collect_policy_opaque_fn_stubs_from_llbc(
-        &llbc,
+        llbc,
         &gc_struct_ids,
         crate::ErrorCarrierSpec::default(),
         &std::collections::HashSet::<String>::new(),
@@ -9536,9 +9536,9 @@ fn getset_direct_residual_keeps_a_functiondesc_without_a_jitcode_body() {
         "/../../target/llbc/pyre-interpreter.ullbc"
     );
     let llbc = crate::test_support::load_ullbc(path);
-    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let gc_struct_ids = super::harvest_declared_gc_facts(llbc).gc_struct_ids();
     let specs = super::collect_policy_opaque_fn_stubs_from_llbc(
-        &llbc,
+        llbc,
         &gc_struct_ids,
         crate::ErrorCarrierSpec::default(),
         &std::collections::HashSet::<String>::new(),
@@ -9575,9 +9575,9 @@ fn dont_look_inside_option_objectptr_residual_is_nullable_gcref() {
         "/../../target/llbc/pyre-interpreter.ullbc"
     );
     let llbc = crate::test_support::load_ullbc(path);
-    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let gc_struct_ids = super::harvest_declared_gc_facts(llbc).gc_struct_ids();
     let specs = super::collect_policy_opaque_fn_stubs_from_llbc(
-        &llbc,
+        llbc,
         &gc_struct_ids,
         crate::ErrorCarrierSpec::default(),
         &std::collections::HashSet::<String>::new(),

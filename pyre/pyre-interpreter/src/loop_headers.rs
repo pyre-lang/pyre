@@ -361,7 +361,7 @@ mod tests {
             }
         }
         assert!(
-            continue_targets.iter().any(|&t| t == header),
+            continue_targets.contains(&header),
             "continue must land on the while header"
         );
         for &target in &continue_targets {

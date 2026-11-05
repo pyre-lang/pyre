@@ -408,7 +408,7 @@ fn main() {
             "the benchmark input is supposed NOT to match"
         );
 
-        let interp_row = bench(NAMES[0], roots[0], &s, None, |r, s| interp::matches(r, s));
+        let interp_row = bench(NAMES[0], roots[0], &s, None, interp::matches);
         let masking_row = bench(
             NAMES[1],
             roots[1],

@@ -172,10 +172,10 @@ fn reachable(root: &Arc<majit_metainterp::JitCode>) -> Vec<Arc<majit_metainterp:
         let current = Arc::clone(&found[cursor]);
         cursor += 1;
         for descr in &current.exec.descrs {
-            if let Some(sub) = descr.as_jitcode() {
-                if !found.iter().any(|j| Arc::ptr_eq(j, sub)) {
-                    found.push(Arc::clone(sub));
-                }
+            if let Some(sub) = descr.as_jitcode()
+                && !found.iter().any(|j| Arc::ptr_eq(j, sub))
+            {
+                found.push(Arc::clone(sub));
             }
         }
     }

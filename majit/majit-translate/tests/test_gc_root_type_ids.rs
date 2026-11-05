@@ -20,7 +20,7 @@ fn a_gc_pointer_slice_is_found_in_the_object_crate() {
     let gc_tys = liveness::gc_ptr_type_ids(llbc);
     assert!(!gc_tys.is_empty(), "no PyObjectRef type id");
     assert!(
-        !liveness::gc_slice_type_ids(&llbc, &gc_tys).is_empty(),
+        !liveness::gc_slice_type_ids(llbc, &gc_tys).is_empty(),
         "no &[PyObjectRef] type id"
     );
 }

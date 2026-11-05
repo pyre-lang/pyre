@@ -2288,8 +2288,7 @@ fn emit_graph_op_void(
 /// Walker-rewrite entrypoint: a single place that
 /// packages the fresh-Variable → `record_graph_op` → return-Variable
 /// pattern so the walker's per-opcode handlers can record
-/// value-producing graph operations without inlining `graph.fresh_variable`
-/// + `record_graph_op` at every call site.  Once every value-producing op
+/// value-producing graph operations without inlining `graph.fresh_variable` + `record_graph_op` at every call site.  Once every value-producing op
 /// records through this path the production pipeline can source `SSARepr`
 /// from `flatten_graph(graph, ...)` per `codewriter.py:44-67`.
 fn emit_graph_op_with_result(
@@ -13106,7 +13105,7 @@ impl CodeWriter {
                                     Kind::Ref,
                                     py_pc as i64,
                                 );
-                                for pair in items.chunks_exact(2) {
+                                for pair in items.as_chunks::<2>().0 {
                                     emit_graph_op_void(
                                         &current_block.block(),
                                         "dict_display_setitem",
@@ -21319,7 +21318,7 @@ def f(g):
             "armed arm must keep the inline_call of bytecode_only_trace, got {opnames:?}"
         );
         assert!(
-            opnames.iter().any(|&name| name == "catch_exception"),
+            opnames.contains(&"catch_exception"),
             "handler catch_exception must survive the armed canraise arm, got {opnames:?}"
         );
         assert!(

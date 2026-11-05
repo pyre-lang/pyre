@@ -178,10 +178,7 @@ mod gc_box {
     /// Store `gc` as this thread's box, publishing the raw mirror with it.
     pub(super) fn store(gc: Box<dyn majit_gc::GcAllocator>) {
         let table = gc.finalizer_queue_table();
-        let ptr = table
-            .as_ref()
-            .map(|a| Arc::as_ptr(a))
-            .unwrap_or(std::ptr::null());
+        let ptr = table.as_ref().map(Arc::as_ptr).unwrap_or(std::ptr::null());
         DYNASM_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();
             *guard = Some(gc);

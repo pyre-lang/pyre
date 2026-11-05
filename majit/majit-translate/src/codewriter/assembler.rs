@@ -2376,7 +2376,7 @@ impl AssemblerEncode for Assembler {
                 let (vtable_word, type_static_name) = if *vtable == 0 {
                     (0, String::new())
                 } else {
-                    match self.type_static_size_words(*vtable as i64) {
+                    match self.type_static_size_words(*vtable) {
                         Some((word, name)) => (word, name),
                         None => (*vtable as u64, String::new()),
                     }
@@ -5058,10 +5058,6 @@ struct AssemblyState {
     resulttypes: indexmap::IndexMap<usize, char>,
     /// Result Variable → defining SpaceOperation summary, for mutate-field
     /// panics that name the `v_inst` producer. Diagnostic only.
-    #[expect(
-        clippy::mutable_key_type,
-        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-    )]
     var_producers: HashMap<crate::flowspace::model::Variable, String>,
 }
 
@@ -11254,7 +11250,7 @@ mod tests {
             "flattened parent descrs must hold mutate_value.ptr / .lock, got {parent_keys:?}"
         );
         assert!(
-            !parent_keys.iter().any(|key| *key == "mutate_value"),
+            !parent_keys.contains(&"mutate_value"),
             "flattened parent descrs must not hold a mutate_value row, got {parent_keys:?}"
         );
 

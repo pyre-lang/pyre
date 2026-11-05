@@ -6595,10 +6595,7 @@ pub fn driver_pair() -> &'static mut JitDriverPair {
 pub fn existing_driver_pair() -> Option<&'static mut JitDriverPair> {
     JIT_DRIVER.with(|cell| unsafe {
         let slot = &mut *cell.get();
-        match slot {
-            Some(pair) => Some(&mut *(pair as *mut JitDriverPair)),
-            None => None,
-        }
+        slot.as_mut().map(|pair| &mut *(pair as *mut JitDriverPair))
     })
 }
 

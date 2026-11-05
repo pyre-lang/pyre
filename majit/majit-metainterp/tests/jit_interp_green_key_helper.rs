@@ -70,8 +70,8 @@ fn dispatch_green_key(program: &Bytecode, threshold: u32) -> i64 {
         let opcode = program[pc];
         match opcode {
             OP_DEC => {
-                state.regs[0] = state.regs[0] - 1;
-                pc = pc + 1;
+                state.regs[0] -= 1;
+                pc += 1;
             }
             OP_BACK => {
                 if state.regs[0] != 0 {
@@ -79,7 +79,7 @@ fn dispatch_green_key(program: &Bytecode, threshold: u32) -> i64 {
                     pc = LOOP_HEADER;
                     continue;
                 } else {
-                    pc = pc + 1;
+                    pc += 1;
                 }
             }
             _ => break,

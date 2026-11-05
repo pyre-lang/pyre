@@ -3033,8 +3033,7 @@ pub fn install_global_build_descr_pool() {
 /// runs `setup_insns(asm.insns)` + `setup_descrs(asm.descrs)` and
 /// `setup_insns` (blackhole.py) resolves each opname via
 /// `_get_method` eagerly, raising `AttributeError` if any `bhimpl_*`
-/// is missing. The Rust port mirrors the `setup_insns` + `setup_descrs`
-/// + `wire_bhimpl_handlers` sequence, but surfaces the unwired list as
+/// is missing. The Rust port mirrors the `setup_insns` + `setup_descrs` + `wire_bhimpl_handlers` sequence, but surfaces the unwired list as
 /// a return value instead of panicking.
 ///
 /// TODO(diagnostic). RPython has no equivalent

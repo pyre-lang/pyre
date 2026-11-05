@@ -78,9 +78,9 @@ fn neighbor_add(program: &Bytecode, threshold: u32, cells: Vec<i64>, n: i64) -> 
         let i = state.i as usize;
         let next = state.i + 1i64;
         let next = if next < state.len { next } else { 0i64 };
-        state.cells[i] = state.cells[i] + state.cells[next as usize];
+        state.cells[i] += state.cells[next as usize];
         state.i = next;
-        state.n = state.n - 1i64;
+        state.n -= 1i64;
     }
     cells_fingerprint(&state.cells)
 }

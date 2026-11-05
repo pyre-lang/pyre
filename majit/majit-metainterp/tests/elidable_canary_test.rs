@@ -3,8 +3,7 @@
 //! is patched to `CallPureI` (or fully cut to `Const` when every
 //! argument is a constant).
 //!
-//! `pyjitpl.py MIFrame.execute_varargs(opnum, argboxes, descr, exc=False, pure=True)`
-//! + `pyjitpl.py record_result_of_call_pure` — the live wire
+//! `pyjitpl.py MIFrame.execute_varargs(opnum, argboxes, descr, exc=False, pure=True)` + `pyjitpl.py record_result_of_call_pure` — the live wire
 //!   must not break when observed from outside the metainterp crate.
 //!
 //! Infrastructure unit tests already exist at:

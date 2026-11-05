@@ -406,7 +406,7 @@ fn peel_identity_var(graph: &FunctionGraph, var: &Variable) -> Variable {
         };
         // SSA copy chains are acyclic; `seen` only stops a cyclic graph
         // from hanging the walk.
-        if seen.iter().any(|v| *v == next) {
+        if seen.contains(&next) {
             break;
         }
         seen.push(next.clone());

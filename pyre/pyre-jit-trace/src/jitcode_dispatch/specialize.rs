@@ -5290,8 +5290,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
 }
 
 /// #171: FBW virtualization of a non-escaping BUILD_LIST.
-/// `lower_tuple_build_hlop_to_insn` lowers BUILD_LIST to `new_array_clear`
-/// + per-index `setarrayitem_gc` + a `newlist_from_array` residual
+/// `lower_tuple_build_hlop_to_insn` lowers BUILD_LIST to `new_array_clear` + per-index `setarrayitem_gc` + a `newlist_from_array` residual
 /// (oopspec [`majit_ir::RuntimeHelperKind::NewlistFromArray`]) whose single
 /// r-arg is the already-built backing array.  Decompose that residual into
 /// the virtualizable `opimpl_newlist` shape (`pyjitpl.py`) —
@@ -5690,8 +5689,7 @@ const SPECIALISED_TUPLE2_DESCENT: HelperDescent = HelperDescent {
 };
 
 /// #195 / #73: FBW virtualization of an arity-2 BUILD_TUPLE.
-/// `lower_tuple_build_hlop_to_insn` lowers BUILD_TUPLE to `new_array_clear`
-/// + per-index `setarrayitem_gc` + a `newtuple_from_array` residual
+/// `lower_tuple_build_hlop_to_insn` lowers BUILD_TUPLE to `new_array_clear` + per-index `setarrayitem_gc` + a `newtuple_from_array` residual
 /// (oopspec [`majit_ir::RuntimeHelperKind::NewtupleFromArray`]).  Descend
 /// [`SPECIALISED_TUPLE2_DESCENT`] (`specialisedtupleobject.py
 /// makespecialisedtuple2`) with the two element boxes; the walk records
@@ -6312,8 +6310,7 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
 /// helper residual_call (oopspec `BinaryOp`, op_tag `Subscr`).  Ports
 /// the former subscription/list-strategy path for the object-, int-,
 /// float- and ascii-storage list strategies with a
-/// non-negative concrete index: `guard_class LIST` + `guard_value(strategy)`
-/// + unbox index + `IntLt` bounds guard, then the strategy-specific element
+/// non-negative concrete index: `guard_class LIST` + `guard_value(strategy)` + unbox index + `IntLt` bounds guard, then the strategy-specific element
 /// load — `getarrayitem_gc_r` against the `Ptr(GcArray(OBJECTPTR))` items
 /// block for object storage (the element is a boxed Ref read directly), or a
 /// raw-array getitem + `wrapint` / `wrapfloat` rebox for int/float storage,
@@ -16974,8 +16971,7 @@ pub(crate) fn pinned_obj(
 /// (`try_walker_orthodox_list_append_opcode`) forms.  Stamps the receiver
 /// concrete, pins the value's class (Integer/Float storage), publishes the
 /// single append-site resume coordinate, descends the real `w_list_append`
-/// body as a sub-jitcode walk recording its native array store, then journals
-/// + applies the concrete append.  `self_ref` is the receiver list OpRef the
+/// body as a sub-jitcode walk recording its native array store, then journals + applies the concrete append.  `self_ref` is the receiver list OpRef the
 /// caller supplies (the bound method's `w_self` field, or the opcode's list
 /// operand); `sym` / `sub_body` are the pre-resolved resume source + callee
 /// body.  The caller writes any residual result (the method form's `None`; the

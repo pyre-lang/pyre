@@ -46,8 +46,8 @@ fn count_portal(program: &Bytecode, threshold: u32, n: i64) -> i64 {
     while state.pos < state.n {
         can_enter_jit!(driver, 0usize, &mut state, program, || {});
         jit_merge_point!(driver, program, pc; state);
-        state.acc = state.acc + 1i64;
-        state.pos = state.pos + 1i64;
+        state.acc += 1i64;
+        state.pos += 1i64;
     }
     state.acc
 }

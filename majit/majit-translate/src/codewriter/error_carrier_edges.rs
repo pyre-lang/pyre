@@ -487,7 +487,7 @@ mod tests {
             "PyError::value_error must not survive: {names:?}"
         );
         assert!(
-            !names.iter().any(|n| *n == "__cast_instance_intrinsic"),
+            !names.contains(&"__cast_instance_intrinsic"),
             "the transparent cast must drop with the constructor: {names:?}"
         );
     }

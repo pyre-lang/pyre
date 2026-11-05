@@ -170,7 +170,7 @@ mod tests {
     ) -> (DynasmBackend, JitCellToken) {
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut token = JitCellToken::new(trace_id as i64);
+        let token = JitCellToken::new(trace_id as i64);
 
         let word = OpRc::new(Op::with_descr(
             OpCode::RawLoadI,
@@ -195,7 +195,7 @@ mod tests {
         let rebind_ops_2 = [word, armed, OpRc::new(guard), OpRc::new(finish)];
         rebind_trace_arg_boxes(&[], &rebind_ops_2);
         backend
-            .compile_loop(&[], &rebind_ops_2, &mut token)
+            .compile_loop(&[], &rebind_ops_2, &token)
             .expect("compile eval-breaker poll IR");
         (backend, token)
     }
@@ -1514,7 +1514,7 @@ pub(crate) enum MallocSlowpathKind {
 /// Emits `_push_all_regs_to_frame([ecx, edx])` → CALL helper →
 /// reload_frame → inline WB → OOM check → `MOV ecx, eax` →
 /// `_pop_all_regs_from_frame` → RET.
-
+///
 /// `slowpath_fn` is the absolute address of the GC helper called by
 /// `MOV rax, imm64; CALL rax`.  `Fixed` passes the size in ARG0
 /// (RCX on Win64, RDI on SysV).  `Var` passes
@@ -1854,7 +1854,7 @@ fn encode_wb_array_card_mark(mc: &mut Assembler, loc_base: u8, loc_index: &Loc, 
             if idx.value != scratch {
                 dynasm!(mc
                     ; .arch x64
-                    ; mov Rq(scratch), Rq(idx.value as u8)
+                    ; mov Rq(scratch), Rq(idx.value)
                 );
             }
             rx86::shr_ri(mc, scratch, page_shift as i32);
@@ -1878,7 +1878,7 @@ fn encode_wb_array_card_mark(mc: &mut Assembler, loc_base: u8, loc_index: &Loc, 
         }
         Loc::Immed(idx) | Loc::ImmedFloat(idx) => {
             let byte_index = idx.value >> page_shift;
-            let byte_ofs = !((byte_index >> 3) as i64) - majit_gc::header::GcHeader::SIZE as i64;
+            let byte_ofs = !(byte_index >> 3) - majit_gc::header::GcHeader::SIZE as i64;
             let byte_val = 1_i64 << (byte_index & 7);
             rx86::or8_mi(mc, (loc_base, byte_ofs as i32), i32::from(byte_val as i8));
         }
@@ -3619,7 +3619,7 @@ impl<'a> Assembler386<'a> {
         op_index: usize,
         arglocs: &[Loc],
         result_loc: Option<&Loc>,
-        fail_index: u32,
+        _fail_index: u32,
         ops: &[OpRc],
     ) {
         match op.opcode {
@@ -3877,10 +3877,10 @@ impl<'a> Assembler386<'a> {
                     };
                     let src = *src_loc;
                     match op.opcode {
-                        OpCode::FloatAdd => self.mc.ADDSD(dst, &src),
-                        OpCode::FloatSub => self.mc.SUBSD(dst, &src),
-                        OpCode::FloatMul => self.mc.MULSD(dst, &src),
-                        OpCode::FloatTrueDiv => self.mc.DIVSD(dst, &src),
+                        OpCode::FloatAdd => self.mc.ADDSD(dst, src),
+                        OpCode::FloatSub => self.mc.SUBSD(dst, src),
+                        OpCode::FloatMul => self.mc.MULSD(dst, src),
+                        OpCode::FloatTrueDiv => self.mc.DIVSD(dst, src),
                         _ => {}
                     }
                 }
@@ -3939,7 +3939,7 @@ impl<'a> Assembler386<'a> {
                              _consider_float_cmp), got {lhs:?}"
                         );
                     };
-                    self.mc.UCOMISD(dst, &rhs);
+                    self.mc.UCOMISD(dst, rhs);
                     if need_p {
                         self.emit_if_parity_clear_zero_and_carry();
                     }
@@ -4806,7 +4806,7 @@ impl<'a> Assembler386<'a> {
                                 arglocs[0]
                             );
                         };
-                        self.mc.UCOMISD(x, &arglocs[1]);
+                        self.mc.UCOMISD(x, arglocs[1]);
                     } else {
                         self.emit_cmp_loc_loc(&arglocs[0], &arglocs[1]);
                     }
@@ -5832,7 +5832,7 @@ impl<'a> Assembler386<'a> {
         let withfloats = guard_token
             .fail_descr
             .as_fail_descr()
-            .is_some_and(|fd| fd.fail_arg_types().iter().any(|tp| *tp == Type::Float));
+            .is_some_and(|fd| fd.fail_arg_types().contains(&Type::Float));
         usize::from(guard_token.must_save_exception) + 2 * usize::from(withfloats)
     }
 
@@ -7720,7 +7720,7 @@ impl<'a> Assembler386<'a> {
             }
             Loc::Immed(idx) | Loc::ImmedFloat(idx) => {
                 let byte_index = idx.value >> page_shift;
-                let byte_ofs = !((byte_index >> 3) as i64) - header;
+                let byte_ofs = !(byte_index >> 3) - header;
                 let byte_val = 1_i64 << (byte_index & 7);
                 self.mc.OR8(
                     heap(base.wrapping_add(byte_ofs)),
@@ -7732,7 +7732,7 @@ impl<'a> Assembler386<'a> {
     }
 
     fn mov_gpr_from_loc(&mut self, dst: u8, loc: Loc) {
-        self.mc.MOV(Operand::R(dst), &loc);
+        self.mc.MOV(Operand::R(dst), loc);
     }
 
     /// `_imul_const_scaled`. Returns the residual scale (0..3) the outer
@@ -7984,7 +7984,7 @@ impl<'a> Assembler386<'a> {
             shift
         };
         let mut constsize = base_size + majit_gc::header::GcHeader::SIZE as i64;
-        let force_realignment = (itemsize as usize) % WORD != 0;
+        let force_realignment = !(itemsize as usize).is_multiple_of(WORD);
         if force_realignment {
             constsize += WORD as i64 - 1;
         }
@@ -8090,7 +8090,7 @@ impl<'a> Assembler386<'a> {
         self.push_all_regs_to_jitframe(&[], true);
         match arglocs.first() {
             Some(Loc::Reg(len_r)) => {
-                self.emit_abi_int_arg_from_reg(0, len_r.value as u8);
+                self.emit_abi_int_arg_from_reg(0, len_r.value);
             }
             Some(Loc::Immed(len_i) | Loc::ImmedFloat(len_i)) => {
                 self.emit_abi_int_arg_from_imm(0, len_i.value);

@@ -1243,44 +1243,6 @@ pyre_interpreter::py_module! {
     },
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stream_type_owner_flags_and_module_match_cpython_314() {
-        pyre_interpreter::typedef::init_typeobjects();
-        const IMMUTABLETYPE: i64 =
-            pyre_object::typeobject::TpFlags::PY_TPFLAGS_IMMUTABLETYPE.as_int();
-        const HEAPTYPE: i64 = pyre_object::typeobject::TpFlags::PY_TPFLAGS_HEAPTYPE.as_int();
-        const MASK: i64 = IMMUTABLETYPE | HEAPTYPE;
-        for (name, ty, expected) in [
-            ("Compress", compress_type(), HEAPTYPE),
-            ("Decompress", decompress_type(), HEAPTYPE),
-            (
-                "_ZlibDecompressor",
-                zdecompress_type(),
-                HEAPTYPE | IMMUTABLETYPE,
-            ),
-        ] {
-            assert_eq!(
-                unsafe { pyre_object::w_type_get_flags(ty) } & MASK,
-                expected
-            );
-            assert_eq!(
-                unsafe {
-                    pyre_object::w_str_get_wtf8(
-                        pyre_interpreter::baseobjspace::getattr_str(ty, "__module__").unwrap(),
-                    )
-                },
-                "zlib",
-                "{name}.__module__"
-            );
-            assert!(!unsafe { pyre_object::w_type_is_heaptype(ty) });
-        }
-    }
-}
-
 /// The GC types this module owns, in `build_gc` registration order.
 pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
     use pyre_interpreter::importing::{ModuleGcLayout, ModuleGcType};
@@ -1318,4 +1280,42 @@ pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType
         layout: pyre_class,
         destructor: Some(gc_destructor!(w_zdecompress_dealloc)),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_type_owner_flags_and_module_match_cpython_314() {
+        pyre_interpreter::typedef::init_typeobjects();
+        const IMMUTABLETYPE: i64 =
+            pyre_object::typeobject::TpFlags::PY_TPFLAGS_IMMUTABLETYPE.as_int();
+        const HEAPTYPE: i64 = pyre_object::typeobject::TpFlags::PY_TPFLAGS_HEAPTYPE.as_int();
+        const MASK: i64 = IMMUTABLETYPE | HEAPTYPE;
+        for (name, ty, expected) in [
+            ("Compress", compress_type(), HEAPTYPE),
+            ("Decompress", decompress_type(), HEAPTYPE),
+            (
+                "_ZlibDecompressor",
+                zdecompress_type(),
+                HEAPTYPE | IMMUTABLETYPE,
+            ),
+        ] {
+            assert_eq!(
+                unsafe { pyre_object::w_type_get_flags(ty) } & MASK,
+                expected
+            );
+            assert_eq!(
+                unsafe {
+                    pyre_object::w_str_get_wtf8(
+                        pyre_interpreter::baseobjspace::getattr_str(ty, "__module__").unwrap(),
+                    )
+                },
+                "zlib",
+                "{name}.__module__"
+            );
+            assert!(!unsafe { pyre_object::w_type_is_heaptype(ty) });
+        }
+    }
 }

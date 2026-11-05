@@ -14855,7 +14855,7 @@ mod tests {
         let start_ops: Vec<&str> = start.operations.iter().map(|o| o.opname.as_str()).collect();
         assert_eq!(*start_ops.last().expect("startblock ops"), "int_add_ovf");
         assert!(
-            !start_ops.iter().any(|op| *op == "int_lt"),
+            !start_ops.contains(&"int_lt"),
             "startblock ovfcheck is int_add_ovf, got {start_ops:?}"
         );
         assert_eq!(

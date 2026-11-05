@@ -140,7 +140,7 @@ impl RecentPureOps {
     ///
     /// Matching uses producer identity after forwarding, or constant value
     /// equality (`history.py Const.same_box`).
-
+    ///
     /// pure.py `lookup` + `force_preamble_op`: a PreambleOp slot is
     /// replaced in place with the forced body op.
     fn lookup_forcing(
@@ -1957,7 +1957,7 @@ mod tests {
 
     #[test]
     fn pure_history_keeps_the_configured_number_of_distinct_emitted_ops() {
-        let limit = crate::jit::PARAMETERS.pureop_historylength as u32;
+        let limit = crate::jit::PARAMETERS.pureop_historylength;
         let mut specs: Vec<_> = (0..limit)
             .map(|i| op_spec(OpCode::IntNeg, &[Arg::In(i)]))
             .collect();

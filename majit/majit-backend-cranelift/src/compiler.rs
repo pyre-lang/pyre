@@ -1289,10 +1289,7 @@ mod gc_box {
     /// Install or drop this thread's box, keeping the raw mirror in step.
     pub(super) fn store(gc: Option<Box<dyn GcAllocator>>) {
         let table = gc.as_ref().and_then(|g| g.finalizer_queue_table());
-        let ptr = table
-            .as_ref()
-            .map(|a| Arc::as_ptr(a))
-            .unwrap_or(std::ptr::null());
+        let ptr = table.as_ref().map(Arc::as_ptr).unwrap_or(std::ptr::null());
         CRANELIFT_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();
             // Drop the previous allocator first so reentrant
@@ -2656,7 +2653,7 @@ fn ref_finish_word(
     descr: &dyn FailDescr,
 ) -> usize {
     let locs = descr.rd_locs();
-    let slot = if let Some(&pos) = locs.get(0) {
+    let slot = if let Some(&pos) = locs.first() {
         if pos == 0xFFFF {
             return 0;
         }
@@ -12836,7 +12833,7 @@ impl CraneliftBackend {
         if majit_log_enabled() {
             let longevity_dump: Vec<(i32, i32)> = inputargs
                 .iter()
-                .map(|ia| Operand::from_bound_inputarg(ia))
+                .map(Operand::from_bound_inputarg)
                 .chain(ops.iter().map(Operand::from_bound_op))
                 .filter_map(|box_| {
                     majit_backend::regalloc::get_lifetime::<(), ()>(&box_)
@@ -24022,17 +24019,17 @@ mod tests {
         let mut fail_first = false;
         for line in clif.lines() {
             let t = line.trim();
-            if slt.is_none() {
-                if let Some((lhs, rhs)) = t.split_once(" = icmp")
-                    && lhs.starts_with('v')
-                    && rhs.contains("slt")
+            if let Some(slt_name) = slt {
+                if let Some((_lhs, rhs)) = t.split_once(" = uextend.i64 ")
+                    && rhs.trim() == slt_name
                 {
-                    slt = Some(lhs);
+                    slt_uextend = true;
                 }
-            } else if let Some((_lhs, rhs)) = t.split_once(" = uextend.i64 ")
-                && rhs.trim() == slt.unwrap()
+            } else if let Some((lhs, rhs)) = t.split_once(" = icmp")
+                && lhs.starts_with('v')
+                && rhs.contains("slt")
             {
-                slt_uextend = true;
+                slt = Some(lhs);
             }
             if let Some((lhs, rhs)) = t.split_once(" = icmp")
                 && lhs.starts_with('v')
@@ -31692,8 +31689,8 @@ mod tests {
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let mut data = vec![0x11u8; 16];
-        data.extend(std::iter::repeat(0x22u8).take(24));
-        data.extend(std::iter::repeat(0x33u8).take(8));
+        data.extend(std::iter::repeat_n(0x22u8, 24));
+        data.extend(std::iter::repeat_n(0x33u8, 8));
         let ptr = data.as_mut_ptr() as usize;
         backend.execute_token(&token, &[Value::Ref(GcRef(ptr))]);
         assert_eq!(&data[..16], &[0x11u8; 16]);
@@ -34672,7 +34669,7 @@ mod tests {
 
         let root = gc.alloc_with_type(0, 16);
         unsafe {
-            *(root.0 as *mut u64) = 0xF012_CED;
+            *(root.0 as *mut u64) = 0x0F01_2CED;
         }
         let mut backend = backend_with_gc(gc);
 

@@ -29,7 +29,7 @@ fn unicode_translate_error_borrow_chain_is_value_lowered() {
         .expect("unicode_translate_error_str exists in interpreter LLBC");
     common::with_shared_lowering(llbc, |context| {
         let graph =
-            lower_fun_decl_with_static_addrs(&context, declaration, HostStaticAddrs::default())
+            lower_fun_decl_with_static_addrs(context, declaration, HostStaticAddrs::default())
                 .expect("lower unicode_translate_error_str, not reject the graph");
         let mut as_ref_calls = 0;
         let mut result_expect_calls = 0;

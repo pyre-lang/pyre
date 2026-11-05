@@ -2015,7 +2015,7 @@ impl UnrollOptimizer {
                     .jump_to_existing_trace(
                         &body_jump_args,
                         Some(&current_label_args),
-                        &mut self.target_tokens,
+                        &self.target_tokens,
                         &mut opt_p2,
                         &mut jump_ctx,
                         false,
@@ -2051,7 +2051,7 @@ impl UnrollOptimizer {
                     .jump_to_existing_trace(
                         &body_jump_args,
                         Some(&current_label_args),
-                        &mut self.target_tokens,
+                        &self.target_tokens,
                         &mut opt_p2,
                         &mut jump_ctx,
                         true,
@@ -10673,7 +10673,7 @@ mod tests {
         let vs = unroll.jump_to_existing_trace_with_vs(
             &[arg],
             None,
-            &mut target_tokens,
+            &target_tokens,
             &mut optimizer,
             &mut ctx,
             false,
@@ -10715,7 +10715,7 @@ mod tests {
         let vs = OptUnroll::default().jump_to_existing_trace_with_vs(
             &[arg],
             None,
-            &mut target_tokens,
+            &target_tokens,
             &mut optimizer,
             &mut ctx,
             false,
@@ -11265,7 +11265,7 @@ mod tests {
         let vs = unroll.jump_to_existing_trace_with_vs(
             &[arg],
             None,
-            &mut target_tokens,
+            &target_tokens,
             &mut optimizer,
             &mut ctx,
             false,

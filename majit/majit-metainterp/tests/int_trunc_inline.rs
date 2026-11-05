@@ -69,8 +69,8 @@ fn mod_pow2(program: &Bytecode, threshold: u32, n: i64) -> i64 {
     while state.pos < state.n {
         can_enter_jit!(driver, 0usize, &mut state, program, || {});
         jit_merge_point!(driver, program, pc; state);
-        state.sum = state.sum + (state.pos % 2);
-        state.pos = state.pos + 1i64;
+        state.sum += state.pos % 2;
+        state.pos += 1i64;
     }
     state.sum
 }
@@ -107,8 +107,8 @@ fn div_pow2(program: &Bytecode, threshold: u32, n: i64) -> i64 {
     while state.pos < state.n {
         can_enter_jit!(driver, 0usize, &mut state, program, || {});
         jit_merge_point!(driver, program, pc; state);
-        state.sum = state.sum + (state.pos / 4);
-        state.pos = state.pos + 1i64;
+        state.sum += state.pos / 4;
+        state.pos += 1i64;
     }
     state.sum
 }
@@ -154,9 +154,9 @@ fn mod_var(program: &Bytecode, threshold: u32, n: i64, a: i64, b: i64) -> i64 {
         jit_merge_point!(driver, program, pc; state);
         // `b` advances, so the divisor is not a constant and
         // `_optimize_CALL_INT_PY_MOD` leaves the oopspec call in place.
-        state.sum = state.sum + (state.a % state.b);
-        state.b = state.b + 1i64;
-        state.pos = state.pos + 1i64;
+        state.sum += state.a % state.b;
+        state.b += 1i64;
+        state.pos += 1i64;
     }
     state.sum
 }
@@ -200,9 +200,9 @@ fn div_var(program: &Bytecode, threshold: u32, n: i64, a: i64, b: i64) -> i64 {
     while state.pos < state.n {
         can_enter_jit!(driver, 0usize, &mut state, program, || {});
         jit_merge_point!(driver, program, pc; state);
-        state.sum = state.sum + (state.a / state.b);
-        state.b = state.b + 1i64;
-        state.pos = state.pos + 1i64;
+        state.sum += state.a / state.b;
+        state.b += 1i64;
+        state.pos += 1i64;
     }
     state.sum
 }
@@ -236,8 +236,8 @@ fn mod_zero(program: &Bytecode, threshold: u32, n: i64, a: i64, b: i64) -> i64 {
     while state.pos < state.n {
         can_enter_jit!(driver, 0usize, &mut state, program, || {});
         jit_merge_point!(driver, program, pc; state);
-        state.a = state.a % state.b;
-        state.pos = state.pos + 1i64;
+        state.a %= state.b;
+        state.pos += 1i64;
     }
     state.a
 }
@@ -280,12 +280,11 @@ fn nonnegative_power_of_two_mod_and_div_leave_no_call() {
     let mod_body = MOD_POW.body.lock().clone();
     let div_body = DIV_POW.body.lock().clone();
     assert!(
-        mod_body.iter().any(|op| *op == OpCode::IntAnd) && mod_body.iter().all(|op| !is_call(op)),
+        mod_body.contains(&OpCode::IntAnd) && mod_body.iter().all(|op| !is_call(op)),
         "a % 2 on a nonnegative int must fold to int_and with no call: {mod_body:?}"
     );
     assert!(
-        div_body.iter().any(|op| *op == OpCode::IntRshift)
-            && div_body.iter().all(|op| !is_call(op)),
+        div_body.contains(&OpCode::IntRshift) && div_body.iter().all(|op| !is_call(op)),
         "a / 4 on a nonnegative int must fold to int_rshift with no call: {div_body:?}"
     );
 }

@@ -581,7 +581,7 @@ fn classify_capture_plus_const(
                     if dest <= 2 || defs.insert(dest, value.clone()).is_some() {
                         return None;
                     }
-                    if !super::root_slot_rvalue_is_traceable(&value) {
+                    if !super::root_slot_rvalue_is_traceable(value) {
                         return None;
                     }
                 }
@@ -603,7 +603,7 @@ fn classify_capture_plus_const(
                 let CallFunc::Regular(reg) = &call.func else {
                     return None;
                 };
-                let path = name_of(&reg)?;
+                let path = name_of(reg)?;
                 let leaf = path.rsplit("::").next().unwrap_or("");
                 if leaf != "shadow_stack_get"
                     || !path
@@ -1886,10 +1886,10 @@ fn resolve_published_array_in_body(
         };
         match rvalue {
             Rvalue::UnaryOp(_, op) | Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => {
-                local = operand_local(&op)?;
+                local = operand_local(op)?;
             }
             Rvalue::Ref { place: src, .. } | Rvalue::RawPtr { place: src, .. } => {
-                local = place_local(&src).or_else(|| deref_of_local(&src))?;
+                local = place_local(src).or_else(|| deref_of_local(src))?;
             }
             Rvalue::Aggregate(kind, _) if kind.get("Array").is_some() => {
                 let operands = stmt.kind_value()["Assign"][1]["Aggregate"][1]

@@ -100,7 +100,7 @@ fn dispatch(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
                 state.acc = state.regs[0].to_bits() as i64;
             }
             OP_TICK => {
-                state.ticks = state.ticks - 1;
+                state.ticks -= 1;
                 if state.ticks != 0 {
                     can_enter_jit!(driver, 0usize, &mut state, program, || {});
                     pc = 0;
@@ -134,7 +134,7 @@ fn two_spellings_of_a_virtual_float_fold_to_the_stored_value() {
     );
     let body = COMPILED.lock().unwrap().clone();
     assert!(
-        !body.iter().any(|op| *op == OpCode::GetfieldGcF),
+        !body.contains(&OpCode::GetfieldGcF),
         "GetfieldGcF survived, so the two spellings did not share a slot: {body:?}"
     );
 }

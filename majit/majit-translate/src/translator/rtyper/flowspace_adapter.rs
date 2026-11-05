@@ -1834,10 +1834,6 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
     }
 }
 
-#[expect(
-    clippy::mutable_key_type,
-    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-)]
 /// Census-only accumulation of a graph's *whole* unresolvable-callee set.
 ///
 /// The adapter is first-fail: [`function_graph_to_flowspace`] returns on the
@@ -9005,7 +9001,7 @@ mod tests {
         let llbc = crate::test_support::load_ullbc(path);
         let mut all_sites = Vec::new();
         for name in ["w_str_cut", "str_byte_window"] {
-            let graph = crate::test_support::lower_function(&llbc, name)
+            let graph = crate::test_support::lower_function(llbc, name)
                 .unwrap_or_else(|err| panic!("lower {name}: {err}"));
             let sites = collect_strlen_sites(&graph);
             assert!(
@@ -10457,7 +10453,7 @@ mod tests {
     fn parse_builtin_signature_has_no_residual_vec_from_elem_after_adaptation() {
         let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = crate::test_support::load_ullbc(path);
-        let legacy = crate::test_support::lower_function(&llbc, "parse_builtin_signature")
+        let legacy = crate::test_support::lower_function(llbc, "parse_builtin_signature")
             .expect("lower parse_builtin_signature");
         let raw_from_elem = legacy
             .blocks
@@ -13505,7 +13501,7 @@ mod tests {
         let vars = mint_vars(&mut graph, 7);
         let owner = "Tuple<i64,i64>".to_string();
         let pos = |index: usize| {
-            crate::model::FieldDescriptor::new(&format!("__pos_{index}"), Some(owner.clone()))
+            crate::model::FieldDescriptor::new(format!("__pos_{index}"), Some(owner.clone()))
         };
         let startblock = Block {
             id: graph.startblock,

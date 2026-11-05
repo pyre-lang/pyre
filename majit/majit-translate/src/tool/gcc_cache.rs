@@ -3,7 +3,7 @@
 //! `cache_file_path` md5s source contents + `eci` + `platform.key()` under
 //! `CACHE_DIR/<cachename>` (`translationoption.cache_dir`).
 //! `build_executable_cache` hits return the stored stdout; misses compile
-//! + execute, echo stderr, cache only when stderr is empty, and return
+//! plus execute, echo stderr, cache only when stderr is empty, and return
 //! stdout. `try_compile_cache` caches `"True"` or the compiler error
 //! text and does not execute. `try_atomic_write` is the pid-suffixed
 //! temp file + rename.

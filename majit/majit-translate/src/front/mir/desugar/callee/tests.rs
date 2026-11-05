@@ -55,7 +55,7 @@ fn builtin_wrapper_declaration_has_builtin_code_fn_type() {
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path().ends_with("::__majit_wrap_random"))
         .expect("_random::__majit_wrap_random");
-    assert!(super::fun_decl_is_builtin_code_fn(wrapper, &llbc));
+    assert!(super::fun_decl_is_builtin_code_fn(wrapper, llbc));
     let non_member = llbc
         .iter_local_fns()
         .find(|fd| {
@@ -64,7 +64,7 @@ fn builtin_wrapper_declaration_has_builtin_code_fn_type() {
                 .ends_with("::function::funccall_valuestack")
         })
         .expect("function::funccall_valuestack");
-    assert!(!super::fun_decl_is_builtin_code_fn(non_member, &llbc));
+    assert!(!super::fun_decl_is_builtin_code_fn(non_member, llbc));
 }
 
 /// rustc's promoted-const wrapper copies one `Place::Global` and

@@ -1226,8 +1226,7 @@ impl Insn {
 
 /// Production port of `rpython/jit/codewriter/flatten.py:60-350`
 /// `GraphFlattener`. Owns the whole `FunctionGraph -> SSARepr` lowering:
-/// `flatten_graph` builds one per graph and drives `enforce_input_args`
-/// + `generate_ssa_form`, emitting the production `ssarepr.insns` the
+/// `flatten_graph` builds one per graph and drives `enforce_input_args` + `generate_ssa_form`, emitting the production `ssarepr.insns` the
 /// codewriter adopts (`codewriter.rs`'s `transform_graph_to_jitcode` builds
 /// it and splices it in as `ssarepr.insns`). The earlier
 /// direct-SSA-emission dual-write is retired.
@@ -4785,8 +4784,10 @@ where
     // GC heap.  Use EF_CAN_RAISE with concrete-empty effect sets.  The generic
     // Plain flavor means “no graph was analyzed” and becomes RANDOM_EFFECTS /
     // CALL_MAY_FORCE, contradicting PyPy's zero-forcing IMPORT_NAME trace.
-    let mut effect_info = majit_ir::EffectInfo::default();
-    effect_info.runtime_helper = majit_ir::RuntimeHelperKind::LoadImport;
+    let effect_info = majit_ir::EffectInfo {
+        runtime_helper: majit_ir::RuntimeHelperKind::LoadImport,
+        ..Default::default()
+    };
     Some(build_residual_call_r_r_insn_with_effect_info(
         ctx.load_import_fn_idx,
         vec![frame_operand],
@@ -8209,8 +8210,7 @@ pub fn build_load_const_fn_residual_call_ir_r_insn_with_const_pycode(
 /// `arg_kinds = [Ref, Int]`, flavor = `Plain`.  Distinct from
 /// `build_residual_call_ir_r_insn_from_operands` which serves the
 /// `(Ref, Ref, Int) → Ref` MayForce arity used by BINARY_OP /
-/// COMPARE_OP.  Both produce opname `residual_call_ir_r` (kinds `ir`
-/// + reskind `r`) but the bucketed argument layout and Descr
+/// COMPARE_OP.  Both produce opname `residual_call_ir_r` (kinds `ir` + reskind `r`) but the bucketed argument layout and Descr
 /// `arg_kinds` differ.
 ///
 /// Inline arg order produced here:
@@ -8451,7 +8451,7 @@ mod tests {
                 false,
                 ArrayFlag::Unsigned,
                 "PyFrame.PyFrame.flags".to_string(),
-                "PyFrame.flags".to_string(),
+                "PyFrame.flags",
             )
             .with_index_in_parent(10),
         );
@@ -9637,7 +9637,7 @@ mod tests {
         let call_pos = ssarepr
             .insns
             .iter()
-            .position(|insn| is_lowered_binary_op(insn))
+            .position(is_lowered_binary_op)
             .unwrap_or_else(|| {
                 panic!(
                     "expected BINARY_OP inline_call or residual_call: {:?}",
@@ -9787,12 +9787,12 @@ mod tests {
         let binary_pos = ssarepr
             .insns
             .iter()
-            .position(|insn| is_lowered_binary_op(insn))
+            .position(is_lowered_binary_op)
             .expect("BINARY_OP lowered call must exist");
         let compare_pos = ssarepr
             .insns
             .iter()
-            .position(|insn| is_lowered_compare_op(insn))
+            .position(is_lowered_compare_op)
             .expect("COMPARE_OP lowered call must exist");
         assert!(
             binary_pos < compare_pos,
@@ -10017,7 +10017,7 @@ mod tests {
         let mut regallocs = perform_register_allocation_all_kinds(&graph);
         let ssarepr = super::flatten_graph(&graph, &mut regallocs, false, Some(&cpu));
 
-        let has_binary_op_lowered = ssarepr.insns.iter().any(|insn| is_lowered_binary_op(insn));
+        let has_binary_op_lowered = ssarepr.insns.iter().any(is_lowered_binary_op);
         let has_raw_add = ssarepr
             .insns
             .iter()

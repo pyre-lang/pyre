@@ -174,10 +174,6 @@ pub fn func_with_new_name(
 /// Mirrors CPython's `types.FunctionType(..., globals, name, ...)`
 /// post-construction `f.__module__ = globals.get('__name__')` rule
 /// (`Objects/funcobject.c:func_new_impl`).
-#[expect(
-    clippy::mutable_key_type,
-    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-)]
 fn module_from_globals(globals: &Constant) -> Option<String> {
     let dict = match &globals.value {
         crate::flowspace::model::ConstValue::Dict(d) => d,

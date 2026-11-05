@@ -78,7 +78,7 @@ fn neighbor_add_compound(program: &Bytecode, threshold: u32, cells: Vec<i64>, n:
         let next = if next < state.len { next } else { 0i64 };
         state.cells[i] += state.cells[next as usize];
         state.i = next;
-        state.n = state.n - 1i64;
+        state.n -= 1i64;
     }
     cells_fingerprint(&state.cells)
 }
@@ -221,7 +221,7 @@ mod float_vals {
             let next = if next < state.len { next } else { 0i64 };
             state.vals[i] += state.vals[next as usize];
             state.i = next;
-            state.n = state.n - 1i64;
+            state.n -= 1i64;
         }
         vals_fingerprint(&state.vals)
     }

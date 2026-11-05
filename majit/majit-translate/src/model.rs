@@ -3839,10 +3839,6 @@ pub fn clear_unreachable_blocks(graph: &mut FunctionGraph) {
 /// `Link.arg`, a terminal-block inputarg — pins the result and the
 /// chain is kept.  Runs to a fixpoint so a store of one dead aggregate
 /// into another exposes the inner one once the outer store is gone.
-#[expect(
-    clippy::mutable_key_type,
-    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-)]
 fn function_path_ends_with(segments: &[String], tail: &[&str]) -> bool {
     segments.len() >= tail.len()
         && segments[segments.len() - tail.len()..]
@@ -4286,10 +4282,6 @@ fn intersect_idoms(mut finger1: u32, mut finger2: u32, idom: &[u32], rpo_of: &[u
 
 /// Op-result and phi-input index for [`lower_struct_ptr_writes`]'s
 /// producer walk. One scan replaces the per-step rescan of every block.
-#[expect(
-    clippy::mutable_key_type,
-    reason = "Variable equality and hashing use immutable identity IDs while annotations are excluded"
-)]
 struct ProducerIndex<'g> {
     graph: &'g FunctionGraph,
     defined: rustc_hash::FxHashSet<crate::flowspace::model::Variable>,
@@ -5373,7 +5365,7 @@ pub(crate) fn fuse_boxing_alloc_with(
                 if (block, op) == goal {
                     return true;
                 }
-                if barriers.iter().any(|&b| b == (block, op)) {
+                if barriers.contains(&(block, op)) {
                     killed = true;
                     break;
                 }
@@ -5506,7 +5498,7 @@ pub(crate) fn fuse_boxing_alloc_with(
                         return StoreAtEach::Conflict;
                     }
                     for loc in store.locations.iter().copied() {
-                        if !concat.iter().any(|&seen| seen == loc) {
+                        if !concat.contains(&loc) {
                             concat.push(loc);
                         }
                     }
@@ -6270,11 +6262,8 @@ pub(crate) fn fuse_boxing_alloc_with(
                 None => None,
                 Some(_) => unreachable!("layout contradiction handled above"),
             };
-            let Some(declares_class_word) =
-                header_declares_field(graph, root, "w_class", struct_field_attrs)
-            else {
-                return None;
-            };
+            let declares_class_word =
+                header_declares_field(graph, root, "w_class", struct_field_attrs)?;
             if any_store(graph, root, "w_class") && !declares_class_word {
                 crate::decline::record(
                     VTABLE_GATE,
@@ -6439,10 +6428,11 @@ pub(crate) fn fuse_boxing_alloc_with(
             }
         }
         let drop_payload = |payload: &mut Payload| {
-            if let Some((b, i)) = &mut payload.read_at {
-                if *b == block && *i > at {
-                    *i -= 1;
-                }
+            if let Some((b, i)) = &mut payload.read_at
+                && *b == block
+                && *i > at
+            {
+                *i -= 1;
             }
         };
         if let Some(payload) = &mut site.w_class {
@@ -6708,7 +6698,7 @@ pub(crate) fn fuse_boxing_alloc_with(
                         let mut seen_write_keys: Vec<(Option<String>, String)> = Vec::new();
                         for leaf in &expansion.leaves {
                             let write_field = container_leaf_descriptor(
-                                &store.field,
+                                store.field,
                                 expansion.at_offset_zero,
                                 leaf,
                             );
@@ -6725,7 +6715,7 @@ pub(crate) fn fuse_boxing_alloc_with(
                         for leaf in expansion.leaves {
                             let inner_name = leaf.field.name.clone();
                             let write_field = container_leaf_descriptor(
-                                &store.field,
+                                store.field,
                                 expansion.at_offset_zero,
                                 &leaf,
                             );

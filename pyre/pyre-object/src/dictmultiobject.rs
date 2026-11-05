@@ -224,11 +224,10 @@ impl std::hash::Hasher for StrKeyHasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
         self.mix(bytes.len() as u64);
-        let mut chunks = bytes.chunks_exact(8);
-        for chunk in &mut chunks {
-            self.mix(u64::from_le_bytes(chunk.try_into().unwrap()));
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for chunk in chunks {
+            self.mix(u64::from_le_bytes(*chunk));
         }
-        let rest = chunks.remainder();
         if !rest.is_empty() {
             // The zero-padded little-endian tail word, folded byte by byte: a
             // `copy_from_slice` of a variable length is an out-of-line

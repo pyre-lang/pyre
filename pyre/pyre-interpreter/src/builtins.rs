@@ -5373,7 +5373,7 @@ pub(crate) fn bound_starargs(args: &[PyObjectRef], index: usize) -> Vec<PyObject
 
 fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // Bound scope: sep, end, file, flush, *args. app_io.py print_.
-    let sep_val = args.get(0).copied().filter(|value| !value.is_null());
+    let sep_val = args.first().copied().filter(|value| !value.is_null());
     let end_val = args.get(1).copied().filter(|value| !value.is_null());
     let file_val = args.get(2).copied().filter(|value| !value.is_null());
     let flush_val = args.get(3).copied().filter(|value| !value.is_null());
@@ -17105,9 +17105,7 @@ fn escape_decode_error(
             cursor += 1;
             continue;
         }
-        let Some(&kind) = contents.get(cursor + 1) else {
-            return None;
-        };
+        let &kind = contents.get(cursor + 1)?;
         // `\N{...}` names a character; a bytes literal has no such escape.  The
         // brace here belongs to the escape, which is why the field skip above
         // runs only where no backslash precedes it.

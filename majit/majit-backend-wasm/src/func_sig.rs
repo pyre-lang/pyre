@@ -72,7 +72,7 @@ pub struct WasmSig {
 
 impl WasmSig {
     pub fn has_f32(&self) -> bool {
-        self.result == Some(FuncSigVal::F32) || self.params.iter().any(|p| *p == FuncSigVal::F32)
+        self.result == Some(FuncSigVal::F32) || self.params.contains(&FuncSigVal::F32)
     }
 }
 

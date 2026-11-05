@@ -168,7 +168,7 @@ fn print_summary(audit: &Audit) {
         audit.collision_occurrences,
     );
     let mut rows: Vec<&Collision> = audit.collisions.values().collect();
-    rows.sort_by(|l, r| r.occurrences.cmp(&l.occurrences));
+    rows.sort_by_key(|l| std::cmp::Reverse(l.occurrences));
     for row in rows {
         eprintln!(
             "[opref-audit]   x{} {}: key={} (scope={:#x}) first {:?}, now {:?}",
