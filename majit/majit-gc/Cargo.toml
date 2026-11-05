@@ -46,6 +46,7 @@ libc = { workspace = true }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }
 parking_lot = { workspace = true }
+paste = { workspace = true }
 
 # `#[dont_look_inside]` emits a wasm32 constructor that registers the residual
 # trampoline (`emit_helper_fnaddr_ctor`).

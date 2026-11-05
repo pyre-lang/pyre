@@ -5601,6 +5601,52 @@ pub(in crate::front::mir) fn adt_path_of_tyref(ty: &TyRef, llbc: &Llbc) -> Optio
     Some(llbc.type_by_id(id)?.item_meta.name_path())
 }
 
+/// `majit_gc::hook_cell::FnPtrCell<F>` — a `global_hook!` cell. Keyed on
+/// the ADT path, never on the static's name.
+pub(in crate::front::mir) fn tyref_is_fnptrcell(ty: &TyRef, llbc: &Llbc) -> bool {
+    adt_path_of_tyref(ty, llbc)
+        .is_some_and(|p| path_ends_with_segments(&p, "majit_gc::hook_cell::FnPtrCell"))
+}
+
+/// `std::sync::OnceLock<F>` (or `core::sync::once_lock::OnceLock<F>`)
+/// whose `F` is a bare function pointer. Keyed on the ADT path and
+/// generic 0, never on the static's name.
+pub(in crate::front::mir) fn tyref_is_oncelock_fn(ty: &TyRef, llbc: &Llbc) -> bool {
+    adt_path_of_tyref(ty, llbc)
+        .is_some_and(|p| path_ends_with_segments(&p, "sync::once_lock::OnceLock"))
+        && tyref_adt_generics_type_arg(ty, 0, llbc)
+            .is_some_and(|payload| tyref_is_bare_fn_ptr(&payload, llbc))
+}
+
+fn tyref_is_bare_fn_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc).is_some_and(|node| type_node_is_fn_ptr(node, llbc))
+}
+
+/// ADT `TypeDecl` of `ty`, after stripping `Ref` / hash-cons wrappers.
+pub(in crate::front::mir) fn tyref_type_decl<'a>(
+    ty: &'a TyRef,
+    llbc: &'a Llbc,
+) -> Option<&'a TypeDecl> {
+    let node = tyref_node(ty, llbc)?;
+    let node = strip_ty_wrappers(node, llbc)?;
+    llbc.type_by_id(adt_node_def_id(node)?)
+}
+
+/// Byte offset of the `OnceLock<fn>` payload word — the LLBC `value`
+/// field. `OnceLock` is `repr(Rust)` with a platform-dependent layout,
+/// so only Charon's computed layout may be used: the `value` field
+/// offset from `field_offsets` (`type_decl_struct_field_offset`). `None`
+/// when that offset is missing or unchosen; the caller must not fold
+/// `OnceLock::get`.
+pub(in crate::front::mir) fn oncelock_fn_payload_offset(ty: &TyRef, llbc: &Llbc) -> Option<i64> {
+    let td = tyref_type_decl(ty, llbc)?;
+    let fields = type_decl_struct_fields(td, llbc)?;
+    let idx = fields
+        .iter()
+        .position(|f| f.name.as_deref() == Some("value"))?;
+    type_decl_struct_field_offset(td, llbc, idx).and_then(|off| i64::try_from(off).ok())
+}
+
 /// Whether `td` declares a field named `name` — a struct field, or any
 /// enum variant's field (Model A flattens variant fields into the same
 /// class attr namespace).
@@ -7211,8 +7257,9 @@ pub(in crate::front::mir) fn stamp_raw_u8_ccharp(var: &Variable, ty: &TyRef, llb
 
 /// Stamp a function-pointer dest `Ptr(FuncType)` (`lltype.FuncType` /
 /// `getfunctionptr`). The walker rebuilds `SomePtr` from this
-/// `concretetype` (`var_concretetype_is_ccharp` parallel). Mint through
-/// `func_type_from_fn_spelling` with the exception-carrier test so
+/// `concretetype` (`var_concretetype_is_ccharp` parallel). Prefer the
+/// Charon `FnPtr` skip_binder lowered through `tyref_to_value_type` /
+/// `valuetype_to_lltype`; fall back to the rendered spelling so
 /// `Result<(), E>` is `Void` and equals `fn_null_constant` of the same
 /// spelling (`ann_nullptr`).
 pub(in crate::front::mir) fn stamp_fn_ptr(
@@ -7221,6 +7268,10 @@ pub(in crate::front::mir) fn stamp_fn_ptr(
     llbc: &Llbc,
     error_carrier: crate::ErrorCarrierSpec<'_>,
 ) {
+    if let Some(ft) = func_type_from_fn_ptr_ty(ty, llbc, error_carrier) {
+        stamp_func_type(var, ft);
+        return;
+    }
     let Some(spelling) = tyref_fn_ptr_spelling(ty, llbc) else {
         return;
     };
@@ -7238,16 +7289,124 @@ pub(crate) fn stamp_fn_ptr_spelling(
         exception_carrier_keys_from_spec, exception_carrier_type_spelling_keys,
         func_type_from_fn_spelling,
     };
-    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget};
     let (carrier, handle) = exception_carrier_keys_from_spec(error_carrier);
     let is_carrier =
         |e: &str| exception_carrier_type_spelling_keys(e, carrier.as_deref(), handle.as_deref());
     let Some(ft) = func_type_from_fn_spelling(spelling, &is_carrier) else {
         return;
     };
+    stamp_func_type(var, ft);
+}
+
+fn stamp_func_type(var: &Variable, ft: crate::translator::rtyper::lltypesystem::lltype::FuncType) {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget};
     var.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
         TO: PtrTarget::Func(ft),
     }))));
+}
+
+/// `FuncType` of a Charon `FnPtr`, including `type T = fn(...)` aliases
+/// and `Option<fn>`. Args and result come from the skip_binder types
+/// lowered by `tyref_to_value_type` / `valuetype_to_lltype`. `GCREF`
+/// stays `GCREF`; a GC instance pointer is `rclass.OBJECTPTR`.
+pub(in crate::front::mir) fn func_type_from_fn_ptr_ty(
+    ty: &TyRef,
+    llbc: &Llbc,
+    error_carrier: crate::ErrorCarrierSpec<'_>,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::FuncType> {
+    use crate::translator::rtyper::lltypesystem::lltype::{FuncType, LowLevelType};
+    let owned = crate::front::result_exc::tyref_option_payload(ty, llbc);
+    let ty = owned.as_ref().unwrap_or(ty);
+    let node = tyref_node(ty, llbc)?;
+    let peeled = type_node_peel_aliases(node, llbc)?;
+    // Only a Charon `FnPtr` (or an alias of one) is a function pointer.
+    // A `RawPtr` / `Scalar` object has no `skip_binder`/`inputs`/`output`,
+    // and treating it as one would stamp `Ptr(FuncType { args: [], result:
+    // Void })` over a CCHARP dest (`stamp_raw_u8_ccharp`).
+    let fnptr = peeled.as_object()?.get("FnPtr")?;
+    let sig = fnptr.get("skip_binder").unwrap_or(fnptr).as_object()?;
+    let args = match sig.get("inputs").and_then(serde_json::Value::as_array) {
+        Some(items) => items
+            .iter()
+            .map(|n| fn_ptr_ty_node_to_lltype(n, llbc, error_carrier))
+            .collect(),
+        None => Vec::new(),
+    };
+    let result = match sig.get("output") {
+        Some(n) => fn_ptr_ty_node_to_lltype(n, llbc, error_carrier),
+        None => LowLevelType::Void,
+    };
+    Some(FuncType { args, result })
+}
+
+fn fn_ptr_ty_node_to_lltype(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+    error_carrier: crate::ErrorCarrierSpec<'_>,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    let ty = serde_json::from_value::<TyRef>(node.clone())
+        .unwrap_or_else(|_| TyRef::Other(node.clone()));
+    fn_ptr_tyref_to_lltype(&ty, llbc, error_carrier)
+}
+
+fn fn_ptr_tyref_to_lltype(
+    ty: &TyRef,
+    llbc: &Llbc,
+    error_carrier: crate::ErrorCarrierSpec<'_>,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::translator::rtyper::cutover::valuetype_to_lltype;
+    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+    if crate::front::result_exc::tyref_is_result_of_carrier(ty, llbc, error_carrier)
+        && let Some(ok) = crate::front::result_exc::tyref_result_ok(ty, llbc)
+    {
+        return fn_ptr_tyref_to_lltype(&ok, llbc, error_carrier);
+    }
+    if is_unit_type(ty, llbc) {
+        return LowLevelType::Void;
+    }
+    if tyref_is_gcref_spelling(ty, llbc) {
+        return GCREF.clone();
+    }
+    // Bare `GCREFOpaque` is `GCREF`'s TO (`llmemory.py` `GCREF =
+    // Ptr(GCREFOpaque)`). `tyref_is_gcref_spelling` needs the pointer
+    // form; a skip_binder result spelled as the opaque ADT is still
+    // `GCREF`, not a class instance (`SomePtr.call` result).
+    if let Some(node) = tyref_node(ty, llbc).and_then(|n| type_node_peel_aliases(n, llbc))
+        && one_level_pointer_pointee(node, llbc).is_none()
+        && let Some(td) = adt_node_def_id(node).and_then(|id| llbc.type_by_id(id))
+        && crate::annotator::bookkeeper::is_gcref_type_spelling(&td.item_meta.name_path())
+    {
+        return GCREF.clone();
+    }
+    // A one-level pointer to a named class is `rclass.OBJECTPTR`
+    // (`SomePtr.call` takes a `SomeInstance` argument as that pointer).
+    // `tyref_to_value_type` paints an unharvested fieldless struct as
+    // Int (`ty_is_raw_address`); FUNC.ARGS still need the instance
+    // pointer so `SomePtr.call` matches.
+    if let Some(node) = tyref_node(ty, llbc).and_then(|n| type_node_peel_aliases(n, llbc))
+        && let Some(pointee) = one_level_pointer_pointee(node, llbc)
+    {
+        let pointee = type_node_peel_aliases(pointee, llbc).unwrap_or(pointee);
+        if let Some(root) = adt_node_class_root_with(pointee, llbc, no_tombstoned_leaves())
+            && !crate::annotator::bookkeeper::is_gcref_type_spelling(&root)
+        {
+            return OBJECTPTR.clone();
+        }
+        // `*mut bool` is a primitive slot address (`SomeInteger` /
+        // Signed at the call site). `valuetype_to_lltype` of `Ref` would
+        // paint it `OBJECTPTR` and `SomePtr.call` would reject the
+        // Signed argument (`lltype.py` `_func` arg equality).
+        if pointee
+            .as_object()
+            .and_then(|o| o.get("Scalar"))
+            .and_then(scalar_value_type)
+            == Some(crate::model::ValueType::Bool)
+        {
+            return LowLevelType::Signed;
+        }
+    }
+    valuetype_to_lltype(&tyref_to_value_type(ty, llbc)).unwrap_or_else(|| OBJECTPTR.clone())
 }
 
 /// Clone a Charon `Ref` / `RawPtr` node with `pointee` in the inner slot.
@@ -8801,6 +8960,13 @@ pub(in crate::front::mir) fn type_node_peel_aliases<'l>(
 ) -> Option<&'l serde_json::Value> {
     for _ in 0..24 {
         let stripped = strip_ty_indirections(node, llbc)?;
+        // `TypeDeclKind::Alias` stores `{aliased_ty: T}`; callers that
+        // pass that body in (not an `Adt` of the alias) still have to
+        // reach `T` (`type_decl_struct_owner`).
+        if let Some(inner) = stripped.get("aliased_ty") {
+            node = inner;
+            continue;
+        }
         let Some(def_id) = adt_node_def_id(stripped) else {
             return Some(stripped);
         };
@@ -8809,7 +8975,7 @@ pub(in crate::front::mir) fn type_node_peel_aliases<'l>(
         };
         match &td.kind {
             TypeDeclKind::Alias(aliased) => {
-                node = aliased;
+                node = aliased.get("aliased_ty").unwrap_or(aliased);
             }
             _ => return Some(stripped),
         }

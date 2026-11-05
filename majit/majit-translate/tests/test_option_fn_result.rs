@@ -30,8 +30,9 @@ use std::sync::Arc;
 
 fn option_fn_return_phi_graph() -> FunctionGraph {
     let mut graph = FunctionGraph::new("option_fn_return_phi").with_return_type("i64");
-    let pred_some = graph.create_block();
-    let pred_split = graph.create_block();
+    let (pred_some, some_args) = graph.create_block_with_arg_vars(1);
+    let some_phi = some_args[0].clone();
+    let (pred_split, split_args) = graph.create_block_with_arg_vars(1);
     let pred_none1 = graph.create_block();
     let pred_none2 = graph.create_block();
     let start = graph.startblock;
@@ -57,14 +58,28 @@ fn option_fn_return_phi_graph() -> FunctionGraph {
             true,
         )
         .unwrap();
-    graph.set_branch(start, cond.clone(), pred_some, vec![], pred_split, vec![]);
-    graph.set_return(pred_some, Some(some_fn));
-    // Reuse the startblock Input as the inner switch without threading it
-    // through `pred_split` inputargs so dual-gate Skip-classifies (the
-    // production `builtin_fixed_arity_fn` path is Skip). Two `null_fn`
-    // `None` arms sit after the Int `Some` in block order so the phi's
-    // last annotation is `SomePtr`.
-    graph.set_branch(pred_split, cond, pred_none1, vec![], pred_none2, vec![]);
+    graph.push_inputarg_var(start, cond.clone());
+    graph.push_inputarg_var(start, some_fn.clone());
+    graph.set_branch(
+        start,
+        cond.clone(),
+        pred_some,
+        vec![some_fn],
+        pred_split,
+        vec![cond],
+    );
+    graph.set_return(pred_some, Some(some_phi));
+    // Thread the cond so the fused dual-gate Matches. Publication
+    // copies `specialize_block`'s Constant onto the None arms
+    // (`rtype_const_result`) before jtransform.
+    graph.set_branch(
+        pred_split,
+        split_args[0].clone(),
+        pred_none1,
+        vec![],
+        pred_none2,
+        vec![],
+    );
     let none1 = graph.push_null_fn_ptr_with_spelling(pred_none1, Some("fn() -> i64"));
     graph.set_return(pred_none1, Some(none1));
     let none2 = graph.push_null_fn_ptr_with_spelling(pred_none2, Some("fn() -> i64"));

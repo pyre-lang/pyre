@@ -992,6 +992,9 @@ fn is_null_ptr_result(result_ty: &ValueType) -> bool {
 /// The null-function-pointer builtin `HostEnv::bootstrap` registers
 /// (`flowspace/model.rs`), spelled as `HostObject::qualname`.
 /// `history.getkind` of `Ptr(FuncType)` is `'int'`.
+/// Only Skip (legacy-walker) graphs reach it: a Match graph's `null_fn`
+/// hop arrives as the rtyper's Constant (`rtype_const_result`). It goes
+/// away when those graphs are Match.
 const NULL_FN_BUILTIN_QUALNAMES: &[&str] = &["core.ptr.null_fn"];
 
 /// Whether a `FunctionPath` call names `core.ptr.null_fn`.
@@ -32697,9 +32700,45 @@ mod tests {
         }
     }
 
+    /// Drive dual-gate Match and copy `specialize_block` Constant
+    /// results onto `graph` so jtransform sees a `Const*` the way
+    /// `jtransform.py` reads the rtyper's one graph.
+    fn apply_rtyper_const_results_match(graph: &mut FunctionGraph) {
+        let _lock = crate::translator::rtyper::cutover::specialize_test_lock();
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(
+            crate::translator::rtyper::call_registry::CallRegistry::new(ann.bookkeeper.clone()),
+        );
+        let graphs = crate::codewriter::call::GraphStore::default();
+        let outcome = crate::translator::rtyper::cutover::dual_gate_check_with_registry(
+            graph, &registry, &graphs,
+        )
+        .expect("dual-gate");
+        match outcome {
+            crate::translator::rtyper::cutover::DualGateOutcome::Match {
+                real_value_to_var,
+                real_constants,
+                const_results,
+            } => {
+                crate::codewriter::type_state::apply_from_flowspace_variables(&real_value_to_var);
+                crate::codewriter::type_state::apply_from_flowspace_constants(&real_constants);
+                crate::translator::rtyper::cutover::apply_rtyper_const_results(
+                    graph,
+                    &const_results,
+                );
+            }
+            crate::translator::rtyper::cutover::DualGateOutcome::Skip(reason) => {
+                panic!(
+                    "graph must Match so rtyper Constant reaches jtransform, got Skip: {reason}"
+                );
+            }
+        }
+    }
+
     /// `lltype.nullptr(FUNC)` is a Constant (`rtype_const_result`).
-    /// The surviving graph still carries `direct_call(core.ptr.null_fn)`;
-    /// fold it to Signed 0 (`history.getkind` of `Ptr(FuncType)` is `'int'`).
+    /// `specialize_block` rewrites the hop; publication copies that
+    /// Constant onto the FunctionGraph as Signed 0 (`history.getkind`
+    /// of `Ptr(FuncType)` is `'int'`).
     #[test]
     fn ptr_null_fn_builtin_rewrites_to_int_constant_zero() {
         use crate::flowspace::model::ConstValue;
@@ -32724,6 +32763,7 @@ mod tests {
                 .unwrap();
             FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
             graph.set_return(entry, Some(result_var.clone()));
+            apply_rtyper_const_results_match(&mut graph);
 
             let result = transform_graph(&graph, &config);
             let folded = result
@@ -32761,17 +32801,19 @@ mod tests {
             let config = GraphTransformConfig::default();
             let mut graph = FunctionGraph::new("is_some__spec_fn");
             let entry = graph.startblock;
+            let class_root = spelling.clone().or_else(|| Some("fn".into()));
             let opt = graph
                 .push_op_var(
                     entry,
                     OpKind::Input {
                         name: "opt".into(),
                         ty: ValueType::Int,
-                        class_root: None,
+                        class_root,
                     },
                     true,
                 )
                 .unwrap();
+            graph.push_inputarg_var(entry, opt.clone());
             let result_var = graph.alloc_value_var();
             graph.push_niche_is_some(
                 entry,
@@ -32790,6 +32832,7 @@ mod tests {
                     }
                 }
             }
+            apply_rtyper_const_results_match(&mut graph);
 
             let result = transform_graph(&graph, &config);
             let kinds: Vec<&OpKind> = result

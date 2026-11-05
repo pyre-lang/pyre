@@ -2827,7 +2827,7 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bo
             return Ok(w_none());
         }
 
-        let pc = next_instr;
+        let mut pc = next_instr;
         frame.last_instr = pc as isize;
         // pypy/interpreter/pyopcode.py dispatch_bytecode, non-jitted arm:
         //   self.last_instr = intmask(next_instr)
@@ -2861,9 +2861,13 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bo
                     }
                     return Err(err);
                 }
+                // `pyopcode.py dispatch_bytecode`: `next_instr = r_uint(self.last_instr)`
+                // then dispatch that opcode in this iteration. A line callback
+                // that jumped via `f_lineno` must not re-enter `bytecode_trace`
+                // for the landing instruction.
                 if frame.last_instr as usize != pc {
                     next_instr = frame.last_instr as usize;
-                    continue;
+                    pc = next_instr;
                 }
             } else {
                 let ticker = crate::executioncontext::space_decrement_ticker(
@@ -2879,7 +2883,7 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bo
                     }
                     if frame.last_instr as usize != pc {
                         next_instr = frame.last_instr as usize;
-                        continue;
+                        pc = next_instr;
                     }
                 }
             }

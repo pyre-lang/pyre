@@ -24,8 +24,8 @@ use crate::front::mir::tests::{
     mut_u8_ty_json, named_adt, option_adt_node, option_adt_node_from_types, option_enum,
     option_int_arg, option_shared_ref, range_contains_fixture, result_adt_node, result_enum,
     span_json, struct_decl, trait_clone_call_fixture, trait_clone_kind_payload, transparent_layout,
-    type_decl_meta, type_decl_struct, tyref_to_attr_value_type, unit_fn_ptr, usize_ty,
-    vec_decl_json, vec_of, vec_type_decls, vec_usize_ty_json, window_const_slice_ptr,
+    type_decl_alias, type_decl_meta, type_decl_struct, tyref_to_attr_value_type, unit_fn_ptr,
+    usize_ty, vec_decl_json, vec_of, vec_type_decls, vec_usize_ty_json, window_const_slice_ptr,
     window_empty_generics, window_llbc, window_local, window_meta, window_mut_slice, window_place,
     window_shared_slice, window_slice, window_span, window_usize,
 };
@@ -988,6 +988,134 @@ fn stamp_fn_ptr_spelling_equals_fn_null_constant_for_carrier_results() {
             "{spelling}: stamp_fn_ptr equals fn_null_constant of the same spec"
         );
     }
+}
+
+#[test]
+fn type_alias_of_fn_ptr_peels_to_functype() {
+    use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+
+    let fnptr = serde_json::json!({
+        "FnPtr": {
+            "skip_binder": {
+                "inputs": [{
+                    "RawPtr": [{"Adt": {"id": 1, "generics": empty_generics()}}, "Mut"]
+                }],
+                "output": {
+                    "RawPtr": [{"Adt": {"id": 1, "generics": empty_generics()}}, "Mut"]
+                },
+                "is_unsafe": false
+            }
+        }
+    });
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_alias(
+                0,
+                &["fixture", "HookFn"],
+                serde_json::json!({"aliased_ty": fnptr}),
+            ),
+            type_decl_struct(1, &["fixture", "PyObject"], vec![]),
+        ],
+        vec![],
+    );
+    let ty = TyRef::Other(serde_json::json!({
+        "Adt": {"id": 0, "generics": empty_generics()}
+    }));
+    assert!(
+        super::type_node_is_fn_ptr(
+            super::tyref_node(&ty, &llbc).expect("alias Adt node"),
+            &llbc
+        ),
+        "TypeDeclKind::Alias {{aliased_ty: FnPtr}} is a function pointer"
+    );
+    let ft = super::func_type_from_fn_ptr_ty(&ty, &llbc, crate::ErrorCarrierSpec::default())
+        .expect("alias FnPtr lowers to FuncType");
+    assert_eq!(ft.args, vec![OBJECTPTR.clone()]);
+    assert_eq!(ft.result, *OBJECTPTR);
+
+    let var = crate::flowspace::model::Variable::named("hook");
+    super::stamp_fn_ptr(&var, &ty, &llbc, crate::ErrorCarrierSpec::default());
+    let ct = var.concretetype().expect("dest stamped");
+    let crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(ptr_ty) = ct else {
+        panic!("stamp must be Ptr, got {ct:?}");
+    };
+    assert!(
+        matches!(ptr_ty.TO, PtrTarget::Func(_)),
+        "stamp is Ptr(FuncType)"
+    );
+}
+
+#[test]
+fn fn_ptr_ty_keeps_gcref_result() {
+    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+
+    let gcrefopaque_adt = serde_json::json!({
+        "Adt": {"id": 0, "generics": empty_generics()}
+    });
+    let gcref_adt = serde_json::json!({
+        "Adt": {"id": 3, "generics": empty_generics()}
+    });
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(0, &["majit_gc", "header", "GCREFOpaque"], vec![]),
+            type_decl_struct(1, &["fixture", "PyObject"], vec![]),
+            type_decl_struct(2, &["alloc", "vec", "Vec"], vec![]),
+            type_decl_alias(
+                3,
+                &["majit_gc", "header", "GCREF"],
+                serde_json::json!({"RawPtr": [gcrefopaque_adt.clone(), "Mut"]}),
+            ),
+        ],
+        vec![],
+    );
+    let ty = TyRef::Other(serde_json::json!({
+        "FnPtr": {
+            "skip_binder": {
+                "inputs": [
+                    {"Scalar": {"Integer": {"Unsigned": "U32"}}},
+                    {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                    {"RawPtr": [gcref_adt.clone(), "Mut"]},
+                    {"RawPtr": [{"Scalar": "Bool"}, "Mut"]}
+                ],
+                "output": gcref_adt,
+                "is_unsafe": true
+            }
+        }
+    }));
+    let ft = super::func_type_from_fn_ptr_ty(&ty, &llbc, crate::ErrorCarrierSpec::default())
+        .expect("hook FnPtr lowers");
+    assert_eq!(ft.args.len(), 4);
+    assert_eq!(ft.args[0], LowLevelType::Unsigned);
+    assert_eq!(ft.args[1], LowLevelType::Unsigned);
+    assert_eq!(
+        ft.args[3],
+        LowLevelType::Signed,
+        "*mut bool FUNC arg is the slot address, not OBJECTPTR"
+    );
+    assert_eq!(
+        ft.result, *GCREF,
+        "GCREF FUNC.RESULT stays GCREF, not OBJECTPTR"
+    );
+
+    let opaque_out = TyRef::Other(serde_json::json!({
+        "FnPtr": {
+            "skip_binder": {
+                "inputs": [],
+                "output": gcrefopaque_adt,
+                "is_unsafe": false
+            }
+        }
+    }));
+    let ft_opaque =
+        super::func_type_from_fn_ptr_ty(&opaque_out, &llbc, crate::ErrorCarrierSpec::default())
+            .expect("GCREFOpaque result FnPtr lowers");
+    assert_eq!(
+        ft_opaque.result, *GCREF,
+        "bare GCREFOpaque FUNC.RESULT is GCREF"
+    );
 }
 
 #[test]

@@ -5007,6 +5007,63 @@ mod tests {
     }
 
     #[test]
+    fn someptr_call_instance_arg_matches_objectptr_and_returns_instance() {
+        use crate::translator::rtyper::lltypesystem::lltype::{FuncType, Ptr, PtrTarget};
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+
+        let s_inst = SomeValue::Instance(SomeInstance::new(
+            None,
+            true,
+            std::collections::BTreeMap::new(),
+        ));
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![OBJECTPTR.clone()],
+                result: OBJECTPTR.clone(),
+            }),
+        });
+        let args =
+            super::super::argument::ArgumentsForTranslation::new(vec![Some(s_inst)], None, None);
+        let result = s_ptr
+            .call(&args)
+            .expect("SomeInstance argument equals FUNC.ARGS OBJECTPTR");
+        assert!(
+            matches!(result, SomeValue::Instance(_)),
+            "ll_to_annotation of OBJECTPTR FUNC.RESULT is the instance, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn someptr_call_instance_arg_against_signed_raises() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let s_inst = SomeValue::Instance(SomeInstance::new(
+            None,
+            true,
+            std::collections::BTreeMap::new(),
+        ));
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![LowLevelType::Signed],
+                result: LowLevelType::Void,
+            }),
+        });
+        let args =
+            super::super::argument::ArgumentsForTranslation::new(vec![Some(s_inst)], None, None);
+        let err = s_ptr
+            .call(&args)
+            .expect_err("instance against a non-instance-pointer FUNC.ARGS must raise");
+        assert!(
+            err.msg
+                .unwrap_or_default()
+                .contains("argument to ll function pointer call"),
+            "upstream prefix on annotation_to_lltype ValueError"
+        );
+    }
+
+    #[test]
     fn someptr_call_rejects_keyword_arguments() {
         use crate::translator::rtyper::lltypesystem::lltype::{
             FuncType, LowLevelType, Ptr, PtrTarget,

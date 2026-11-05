@@ -5387,7 +5387,7 @@ impl CallControl {
                         concrete_type, // descr.py:366-370 Float-only marker
                     );
                 let ad_arc: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> =
-                    majit_ir::descr::descr_arc_as_array_descr(cached)
+                    majit_ir::descr::descr_arc_as_array_descr(cached.clone())
                         .expect("gc_cache._cache_array slot held a non-ArrayDescr Arc");
                 // descr.py get_array_descr: cache[ARRAY_OR_STRUCT] is keyed on the
                 // ARRAY lltype identity, and `nolength` is a property of
@@ -5404,16 +5404,17 @@ impl CallControl {
                      base_size={base_size}, cached len_offset={cached_len_offset:?} \
                      base_size={cached_base_size}",
                 );
-                // descr.py:372-375 — struct arrays get interior field
-                // descriptors.  `set_all_interiorfielddescrs` is
-                // `OnceLock` (first-call wins) so re-populating on
-                // cache hit is safe.
+                // descr.py get_array_descr assigns interiors then
+                // gccache.init_array_descr. Attach after the Arc wrap
+                // stamps through that same init (`OnceLock` first-wins).
                 if is_struct && let Some(struct_name) = elem_ref {
                     let array_key = majit_ir::descr::LLType::Array(path_hash_u64);
                     let (descrs, _) =
                         all_interiorfielddescrs(self, struct_name, array_key, ad_arc.clone());
                     if !descrs.is_empty() {
-                        ad_arc.set_all_interiorfielddescrs(descrs);
+                        majit_ir::descr::gc_cache()
+                            .lock()
+                            .attach_array_interiorfielddescrs(&cached, descrs);
                     }
                 }
                 let key = majit_ir::effectinfo::DescrSetMember::Array {

@@ -57,7 +57,7 @@ use crate::flowspace::model::{
     GraphKey, GraphRef, HOST_ENV, Hlvalue, HostObject, Link, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
-use crate::model::FunctionGraph as LegacyGraph;
+use crate::model::{FunctionGraph as LegacyGraph, OpKind};
 use crate::translator::backendopt::inline::collect_called_graphs;
 use crate::translator::rtyper::call_registry::{
     CallRegistry, FunctionEntry, FunctionPathKey, GraphStoreTdcCut, SubjectTdcPlan,
@@ -255,6 +255,11 @@ pub(crate) enum DualGateOutcome {
         /// Constant representatives, including eliminated phi carriers.
         /// Publish only after the legacy comparison, alongside Variable types.
         real_constants: HashMap<Variable, LowLevelType>,
+        /// Hops `specialize_block` rewrote to a Constant (`rtyper.py`
+        /// `translate_hl_to_ll` `same_as(Constant, op.result)` for
+        /// `rtype_const_result`). Keyed by the FunctionGraph result
+        /// Variable so publication can replace the surviving op.
+        const_results: HashMap<Variable, Constant>,
     },
     /// Real path failed on a known-unported feature — the gate
     /// cannot validate this graph yet but the failure is *not* a
@@ -322,8 +327,10 @@ pub(crate) fn dual_gate_check_with_registry(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         drive_subject(legacy_graph, call_registry, true)
     }));
-    let (graph, real_value_to_var, real_constants) = match result {
-        Ok(Ok((graph, value_to_var, _, constants, _, _))) => (graph, value_to_var, constants),
+    let (graph, real_value_to_var, candidates, real_constants, block_map) = match result {
+        Ok(Ok((graph, value_to_var, candidates, constants, _, block_map))) => {
+            (graph, value_to_var, candidates, constants, block_map)
+        }
         Ok(Err(e)) => {
             unpoison_failed_subject_callees(call_registry, &session_at_entry, lift_sources, true);
             let msg = format!("{e}");
@@ -415,10 +422,29 @@ pub(crate) fn dual_gate_check_with_registry(
     // (`jtransform.py add_in_correct_list`, `call.py getcalldescr`
     // NON_VOID_ARGS). A followed Variable typed Void still diverges
     // above and skips.
+    let const_results = collect_specialize_const_results(
+        &graph,
+        legacy_graph,
+        &real_value_to_var,
+        Some(&candidates),
+        Some(&block_map),
+    );
     Ok(DualGateOutcome::Match {
         real_value_to_var,
         real_constants,
+        const_results,
     })
+}
+
+/// Process-local guard serialising specialize-driving tests.
+/// The rtyper's lattice has process-global singletons that mutate
+/// during `setup()`; cargo's parallel test runner can interleave
+/// two specialize-driving tests so one observes the other's
+/// `setupstate::InProgress`.
+#[cfg(test)]
+pub(crate) fn specialize_test_lock() -> parking_lot::MutexGuard<'static, ()> {
+    static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    LOCK.lock()
 }
 
 /// Repair shared callee state poisoned by a failed subject scope.
@@ -660,6 +686,209 @@ fn project_value_to_var(
         }
     }
     real_state
+}
+
+/// Hops whose rtyper result is a Constant (`rtyper.py specialize_block`
+/// `block.operations[:] = newops`, `translate_hl_to_ll` emitting
+/// `same_as(Constant, op.result)` for `rtype_const_result`).
+///
+/// The adapter's `value_to_var` / candidates name the FunctionGraph
+/// result's flowspace twin; after specialize that twin is defined by
+/// `same_as` of the Constant. Lift-time const-defines never become
+/// hops, so they do not appear here.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn collect_same_as_const_results(block: &BlockRef, twin_const: &mut HashMap<Variable, Constant>) {
+    for op in &block.borrow().operations {
+        if op.opname != "same_as" {
+            continue;
+        }
+        let Some(Hlvalue::Constant(c)) = op.args.first() else {
+            continue;
+        };
+        let Hlvalue::Variable(typed) = &op.result else {
+            continue;
+        };
+        twin_const.insert(typed.clone(), c.clone());
+    }
+}
+
+fn collect_specialize_const_results(
+    flow: &GraphRef,
+    legacy: &LegacyGraph,
+    value_to_var: &LegacyToTyped,
+    candidates: Option<&LegacyToTypedCandidates>,
+    block_map: Option<&HashMap<crate::model::BlockId, BlockRef>>,
+) -> HashMap<Variable, Constant> {
+    let mut twin_const: HashMap<Variable, Constant> = HashMap::new();
+    for block in flow.borrow().iterblocks() {
+        collect_same_as_const_results(&block, &mut twin_const);
+    }
+    if let Some(block_map) = block_map {
+        for block in block_map.values() {
+            collect_same_as_const_results(block, &mut twin_const);
+        }
+    }
+    if twin_const.is_empty() {
+        return HashMap::new();
+    }
+    let mut out: HashMap<Variable, Constant> = HashMap::new();
+    let mut consider = |legacy_var: &Variable| {
+        if let Some(typed) = value_to_var.get(legacy_var)
+            && let Some(c) = twin_const.get(typed)
+        {
+            out.insert(legacy_var.clone(), c.clone());
+        }
+        if let Some(candidates) = candidates
+            && let Some(vars) = candidates.get(legacy_var)
+        {
+            for typed in vars {
+                if let Some(c) = twin_const.get(typed) {
+                    out.entry(legacy_var.clone()).or_insert_with(|| c.clone());
+                }
+            }
+        }
+    };
+    for (legacy_var, _) in value_to_var {
+        consider(legacy_var);
+    }
+    if let Some(candidates) = candidates {
+        for legacy_var in candidates.keys() {
+            consider(legacy_var);
+        }
+    }
+    for block in &legacy.blocks {
+        for op in &block.operations {
+            if let Some(result) = op.result.as_ref() {
+                consider(result);
+            }
+        }
+    }
+    out
+}
+
+fn is_const_define_op(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::ConstInt(_)
+            | OpKind::ConstFnAddr { .. }
+            | OpKind::ConstUInt(_)
+            | OpKind::ConstInt128(_)
+            | OpKind::ConstUInt128(_)
+            | OpKind::ConstBool(_)
+            | OpKind::ConstFloat(_)
+            | OpKind::ConstSingleFloat(_)
+            | OpKind::ConstStr(_)
+            | OpKind::ConstInternedStr(_)
+            | OpKind::ConstRef(_)
+            | OpKind::ConstRefNull
+            | OpKind::ConstNone
+            | OpKind::ConstRefAddr(_)
+            | OpKind::ConstSymbolic { .. }
+    )
+}
+
+fn kind_of_rtyper_constant(c: &Constant) -> Option<crate::model::ConcreteType> {
+    c.concretetype
+        .as_ref()
+        .and_then(|ll| crate::model::try_getkind(ll, true, true, true).ok())
+}
+
+/// `_ptr._obj0 is None` (`_getobj(check=False)`). `nonzero()` is
+/// `_getobj(check=True)` and panics on freed storage (`_check`) or a
+/// dead Weak upgrade; a rtyper Constant is Null or Strong.
+fn llptr_is_null(p: &crate::translator::rtyper::lltypesystem::lltype::_ptr) -> bool {
+    matches!(p._obj0_value(), Ok(None))
+}
+
+/// FunctionGraph `Const*` for a rtyper Constant. `history.getkind` of
+/// `Ptr(FuncType)` is `'int'`, so a null function pointer is
+/// `ConstInt(0)` rather than `ConstRefNull`.
+fn opkind_from_rtyper_constant(c: &Constant) -> Option<OpKind> {
+    use crate::translator::rtyper::lltypesystem::lltype::_address;
+    let kind = kind_of_rtyper_constant(c);
+    match &c.value {
+        ConstValue::Int(n) => Some(OpKind::ConstInt(*n)),
+        ConstValue::UInt(n) => Some(OpKind::ConstUInt(*n)),
+        ConstValue::Int128(n) => Some(OpKind::ConstInt128(*n)),
+        ConstValue::UInt128(n) => Some(OpKind::ConstUInt128(*n)),
+        ConstValue::Bool(b) => Some(OpKind::ConstBool(*b)),
+        ConstValue::Float(bits) | ConstValue::LongFloat(bits) => Some(OpKind::ConstFloat(*bits)),
+        ConstValue::SingleFloat(bits) => Some(OpKind::ConstSingleFloat(*bits)),
+        ConstValue::UniChar(cp) => Some(OpKind::ConstInt(*cp as i64)),
+        ConstValue::AddressAsInt(addr) => match addr {
+            _address::Null => Some(OpKind::ConstInt(0)),
+            _address::IntCast(n) => Some(OpKind::ConstInt(*n)),
+            _address::Fake(_) => None,
+        },
+        ConstValue::None => match kind {
+            Some(crate::model::ConcreteType::Signed) => Some(OpKind::ConstInt(0)),
+            Some(crate::model::ConcreteType::GcRef) => Some(OpKind::ConstRefNull),
+            _ => Some(OpKind::ConstNone),
+        },
+        ConstValue::ByteStr(s) => Some(OpKind::ConstStr(s.clone())),
+        ConstValue::UniStr(s) => Some(OpKind::ConstInternedStr(s.as_bytes().to_vec())),
+        ConstValue::HostObject(obj) => Some(OpKind::ConstRef(obj.clone())),
+        ConstValue::LLPtr(p) if llptr_is_null(p) => match kind {
+            Some(crate::model::ConcreteType::Signed) => Some(OpKind::ConstInt(0)),
+            _ => Some(OpKind::ConstRefNull),
+        },
+        ConstValue::LLAddress(addr) if !addr.nonzero() => match kind {
+            Some(crate::model::ConcreteType::Signed) => Some(OpKind::ConstInt(0)),
+            _ => Some(OpKind::ConstRefAddr(0)),
+        },
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn op_is_null_fn_call(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call { target, .. }
+            if matches!(
+                target.path_segments().as_deref(),
+                Some(["core", "ptr", "null_fn"])
+            )
+    )
+}
+
+/// Replace FunctionGraph ops whose flowspace twin `specialize_block`
+/// rewrote to a Constant, so jtransform sees a `Const*` the way
+/// `jtransform.py` sees the rtyper's `Constant`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+pub(crate) fn apply_rtyper_const_results(
+    graph: &mut LegacyGraph,
+    const_results: &HashMap<Variable, Constant>,
+) {
+    if const_results.is_empty() {
+        return;
+    }
+    for block in &mut graph.blocks {
+        for op in &mut block.operations {
+            let Some(result) = op.result.as_ref() else {
+                continue;
+            };
+            let Some(c) = const_results.get(result) else {
+                continue;
+            };
+            if is_const_define_op(&op.kind) {
+                continue;
+            }
+            let Some(new_kind) = opkind_from_rtyper_constant(c) else {
+                continue;
+            };
+            if let Some(ct) = c.concretetype.clone() {
+                result.set_concretetype(Some(ct));
+            }
+            op.kind = new_kind;
+        }
+    }
 }
 
 /// Select the typed block-local representative of each legacy MIR Variable.
@@ -4981,6 +5210,7 @@ fn drive_lifted_subject(
             &mut constant_concretetypes,
             Some(&rtyper),
         );
+        map_block_inputargs_from_flowspace(legacy, &block_map, &mut value_to_var);
     }
     Ok((
         graph,
@@ -7145,6 +7375,54 @@ fn reconcile_projection_aliases(
     }
 }
 
+/// Point the FunctionGraph returnblock / exceptblock inputargs at the
+/// live flowspace twins `block_map` holds after simplify and rtype.
+///
+/// `rtyper.py specialize_block` calls `setconcretetype(graph.getreturnvar())`
+/// on the one graph; `FunctionGraph.getreturnvar` is `returnblock.inputargs[0]`.
+/// Pass 1 of `function_graph_to_flowspace_inner` skips those finals and
+/// then seeds `value_to_var` with `or_insert_with` while
+/// `FunctionGraph.with_return_var` installs a fresh `getreturnvar()`.
+/// `remove_identical_vars_SSA` pops returnblock (and start/except) from the
+/// entrymap, so [`reconcile_elided_phi_inputargs`] does not alias those
+/// columns. A multi-predecessor return phi also fails that helper's one
+/// shared representative rule.
+///
+/// Two-phase Phase B types the live `getreturnvar()` in place. Zip the
+/// live `block_map` columns of those finals last so publication copies
+/// that twin, not a lift-time seed.
+///
+/// Intermediate blocks stay on the Pass 1 seed: `remove_identical_vars_SSA`
+/// deletes identical phi columns, so a position zip would pair the wrong
+/// twin. Extra flowspace columns (`SSA_to_SSI` appends) have no
+/// FunctionGraph twin by construction; extra FunctionGraph columns keep
+/// the previous seed. A Constant flowspace inputarg is not a Variable twin.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn map_block_inputargs_from_flowspace(
+    legacy: &LegacyGraph,
+    block_map: &HashMap<crate::model::BlockId, BlockRef>,
+    value_to_var: &mut LegacyToTyped,
+) {
+    for block in &legacy.blocks {
+        if block.id != legacy.returnblock && block.id != legacy.exceptblock {
+            continue;
+        }
+        let Some(flow_block) = block_map.get(&block.id) else {
+            continue;
+        };
+        let flow_inputs = flow_block.borrow().inputargs.clone();
+        for (legacy_arg, flow_arg) in block.inputargs.iter().zip(flow_inputs.iter()) {
+            let Hlvalue::Variable(typed) = flow_arg else {
+                continue;
+            };
+            value_to_var.insert(legacy_arg.clone(), typed.clone());
+        }
+    }
+}
+
 /// Whether the origin FunctionDesc's `(AccessDirect, None)` cachedgraph
 /// is the subject's annotated `PyGraph` (`description.py
 /// FunctionDesc.cachedgraph` / `specialize.py default_specialize`).
@@ -7226,6 +7504,7 @@ pub(crate) fn dual_gate_outcome_from_cache(
                         subj.value_to_var_candidates.clone(),
                         subj.constant_concretetypes.clone(),
                         subj.constant_hlvalues.clone(),
+                        subj.block_map.clone(),
                     ))
                 }
             }
@@ -7243,11 +7522,17 @@ pub(crate) fn dual_gate_outcome_from_cache(
             }
         }
     };
-    let (graph, mut value_to_var, value_to_var_candidates, mut constants, mut constant_values) =
-        match cached {
-            Ok(cached) => cached,
-            Err(reason) => return Ok(DualGateOutcome::Skip(reason)),
-        };
+    let (
+        graph,
+        mut value_to_var,
+        value_to_var_candidates,
+        mut constants,
+        mut constant_values,
+        block_map,
+    ) = match cached {
+        Ok(cached) => cached,
+        Err(reason) => return Ok(DualGateOutcome::Skip(reason)),
+    };
     select_rtyped_representatives(&mut value_to_var, &value_to_var_candidates)
         .map_err(|e| e.to_string())?;
     let rtyper = call_registry.session_if_started().map(|(_, rt)| rt);
@@ -7258,6 +7543,7 @@ pub(crate) fn dual_gate_outcome_from_cache(
         &mut constants,
         rtyper.as_ref(),
     );
+    map_block_inputargs_from_flowspace(legacy, &block_map, &mut value_to_var);
 
     // Validate the cached lltypes project to concrete kinds (the Step-4 check
     // deferred from `drive_subject`, which did not rtype in Phase A).
@@ -7320,9 +7606,17 @@ pub(crate) fn dual_gate_outcome_from_cache(
             "two-phase compared set empty".to_string(),
         ));
     }
+    let const_results = collect_specialize_const_results(
+        &graph,
+        legacy,
+        &value_to_var,
+        Some(&value_to_var_candidates),
+        Some(&block_map),
+    );
     Ok(DualGateOutcome::Match {
         real_value_to_var: value_to_var,
         real_constants: constants,
+        const_results,
     })
 }
 
@@ -8655,6 +8949,378 @@ mod tests {
             .and_then(|s| s.pygraph.clone())
             .expect("subject PyGraph");
         assert!(!Rc::ptr_eq(&manufactured, &subject_pygraph));
+    }
+
+    /// SSA `Option<fn>` return phi: one Some arm and three `null_fn` None
+    /// arms, cond threaded through every split. Same predecessor shape as
+    /// production `builtin_fixed_arity_fn` (one Some + three `null_fn`).
+    fn option_fn_return_phi_match_graph() -> LegacyGraph {
+        let mut graph = LegacyGraph::new("option_fn_return_phi_match").with_return_type("i64");
+        let start = graph.startblock;
+        let (pred_some, some_args) = graph.create_block_with_arg_vars(1);
+        let some_phi = some_args[0].clone();
+        let (rest1, rest1_args) = graph.create_block_with_arg_vars(1);
+        let cond1 = rest1_args[0].clone();
+        let pred_none1 = graph.create_block();
+        let (rest2, rest2_args) = graph.create_block_with_arg_vars(1);
+        let cond2 = rest2_args[0].clone();
+        let pred_none2 = graph.create_block();
+        let pred_none3 = graph.create_block();
+
+        let cond = graph
+            .push_op_var(
+                start,
+                crate::model::OpKind::Input {
+                    name: "c".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let some_fn = graph
+            .push_op_var(
+                start,
+                crate::model::OpKind::Input {
+                    name: "f".into(),
+                    ty: ValueType::Int,
+                    class_root: Some("fn() -> i64".into()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(start, cond.clone());
+        graph.push_inputarg_var(start, some_fn.clone());
+        graph.set_branch(
+            start,
+            cond.clone(),
+            pred_some,
+            vec![some_fn],
+            rest1,
+            vec![cond],
+        );
+        graph.set_return(pred_some, Some(some_phi));
+        graph.set_branch(rest1, cond1.clone(), pred_none1, vec![], rest2, vec![cond1]);
+        let none1 = graph.push_null_fn_ptr_with_spelling(pred_none1, Some("fn() -> i64"));
+        graph.set_return(pred_none1, Some(none1));
+        graph.set_branch(rest2, cond2, pred_none2, vec![], pred_none3, vec![]);
+        let none2 = graph.push_null_fn_ptr_with_spelling(pred_none2, Some("fn() -> i64"));
+        graph.set_return(pred_none2, Some(none2));
+        let none3 = graph.push_null_fn_ptr_with_spelling(pred_none3, Some("fn() -> i64"));
+        graph.set_return(pred_none3, Some(none3));
+        graph
+    }
+
+    /// Two-phase Match: the returnblock inputarg is the live
+    /// `getreturnvar()` twin (`rtyper.py specialize_block`
+    /// `setconcretetype`), so `func_result_kind` is `'i'` without the
+    /// Func→Int comparison residue.
+    #[test]
+    fn two_phase_match_option_fn_return_phi_maps_returnblock_inputarg() {
+        let _lock = anchor_lock();
+        let graph = option_fn_return_phi_match_graph();
+        let path = crate::parse::CallPath {
+            segments: vec!["option_fn_return_phi_match".into()],
+            specialization: crate::parse::GraphSpecialization::Regular,
+        };
+        let return_var = graph.block(graph.returnblock).inputargs[0].clone();
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.insert(path.clone(), graph.clone());
+        run_two_phase_prepass(&registry, &HashSet::from([path.clone()]), &graphs);
+        let outcome = dual_gate_outcome_from_cache(&graph, &registry, &graphs, &path)
+            .expect("publish reads the cache");
+        let DualGateOutcome::Match {
+            real_value_to_var, ..
+        } = outcome
+        else {
+            panic!("two-phase Option<fn> return phi must Match, got {outcome:?}");
+        };
+        assert!(
+            real_value_to_var.contains_key(&return_var),
+            "returnblock inputarg must be in real_value_to_var"
+        );
+        let live = {
+            let tp = registry.two_phase();
+            let subj = tp.subjects.get(&path).expect("prepass subject");
+            match subj.graph.borrow().getreturnvar() {
+                Hlvalue::Variable(v) => v,
+                other => panic!("getreturnvar must be a Variable, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            real_value_to_var.get(&return_var),
+            Some(&live),
+            "returnblock inputarg maps to PyGraph getreturnvar()"
+        );
+        assert_eq!(
+            kind_of_in(&real_value_to_var, &return_var),
+            ConcreteType::Signed,
+        );
+        crate::codewriter::type_state::apply_from_flowspace_variables(&real_value_to_var);
+        assert_eq!(
+            LegacyGraph::concretetype_of(&return_var),
+            ConcreteType::Signed,
+        );
+
+        let mut callcontrol = crate::codewriter::call::CallControl::new();
+        callcontrol.register_function_graph(path.clone(), graph.clone());
+        callcontrol.find_all_graphs_for_tests();
+        let mut codewriter = crate::codewriter::codewriter::CodeWriter::new();
+        codewriter.run_two_phase_prepass(&callcontrol);
+        let jitcode =
+            std::sync::Arc::new(crate::jitcode::JitCode::new("option_fn_return_phi_match"));
+        codewriter.transform_graph_to_jitcode(
+            &graph,
+            &path,
+            &mut callcontrol,
+            &crate::codewriter::jtransform::GraphTransformConfig::default(),
+            &jitcode,
+            false,
+            0,
+        );
+        assert_eq!(jitcode.calldescr().result_type, 'i');
+    }
+
+    /// One Some arm and one `null_fn` None arm, cond threaded.
+    /// Fused dual-gate Match: both arms stay live, so publication does
+    /// not depend on GraphStore TDC.
+    fn option_fn_one_none_arm_graph() -> LegacyGraph {
+        let mut graph = LegacyGraph::new("option_fn_one_none_arm").with_return_type("i64");
+        let start = graph.startblock;
+        let (pred_some, some_args) = graph.create_block_with_arg_vars(1);
+        let some_phi = some_args[0].clone();
+        let pred_none = graph.create_block();
+        let cond = graph
+            .push_op_var(
+                start,
+                crate::model::OpKind::Input {
+                    name: "c".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let some_fn = graph
+            .push_op_var(
+                start,
+                crate::model::OpKind::Input {
+                    name: "f".into(),
+                    ty: ValueType::Int,
+                    class_root: Some("fn() -> i64".into()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(start, cond.clone());
+        graph.push_inputarg_var(start, some_fn.clone());
+        graph.set_branch(start, cond, pred_some, vec![some_fn], pred_none, vec![]);
+        graph.set_return(pred_some, Some(some_phi));
+        let none = graph.push_null_fn_ptr_with_spelling(pred_none, Some("fn() -> i64"));
+        graph.set_return(pred_none, Some(none));
+        graph
+    }
+
+    /// Match-path: a graph whose None arm is `null_fn` publishes
+    /// `ConstInt(0)` on the FunctionGraph before jtransform
+    /// (`rtyper.py specialize_block` `same_as(Constant, op.result)`).
+    #[test]
+    fn match_null_fn_none_arm_publishes_const_int_before_jtransform() {
+        let _lock = anchor_lock();
+        let mut graph = option_fn_one_none_arm_graph();
+        let null_fn_results: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| op_is_null_fn_call(&op.kind))
+            .filter_map(|op| op.result.clone())
+            .collect();
+        assert_eq!(
+            null_fn_results.len(),
+            1,
+            "fixture must start with one null_fn Call"
+        );
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let graphs = crate::codewriter::call::GraphStore::default();
+        let outcome = dual_gate_check_with_registry(&graph, &registry, &graphs).expect("dual-gate");
+        let DualGateOutcome::Match { const_results, .. } = outcome else {
+            panic!("Option<fn> None-arm graph must Match, got {outcome:?}");
+        };
+        apply_rtyper_const_results(&mut graph, &const_results);
+        assert!(
+            !graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| op_is_null_fn_call(&op.kind)),
+            "FunctionGraph must not carry null_fn after publication"
+        );
+        for result in &null_fn_results {
+            let folded = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .find(|op| op.result.as_ref() == Some(result))
+                .expect("null_fn result must survive as a constant definition");
+            assert!(
+                matches!(folded.kind, OpKind::ConstInt(0)),
+                "None arm stayed {:?} before jtransform",
+                folded.kind
+            );
+        }
+    }
+
+    /// A `FnPtrCell<fn(..)>` static is a prebuilt `ConstRefAddr`; `get`
+    /// is a signed-word `raw_load` of `Ptr(FuncType)` (`history.getkind`
+    /// `'int'`); calling the loaded pointer is `SomePtr.call`.
+    #[test]
+    fn fnptrcell_get_and_call_dual_gate_match_load_is_func_ptr_kind_i() {
+        let _lock = anchor_lock();
+        let mut graph = LegacyGraph::new("fnptrcell_get_and_call");
+        let entry = graph.startblock;
+        let cell = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x1111), true)
+            .unwrap();
+        cell.set_concretetype(Some(LowLevelType::Address));
+        let offset = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+        let load = graph
+            .push_op_var(
+                entry,
+                OpKind::RawLoad {
+                    base: cell,
+                    offset,
+                    item_ty: ValueType::Int,
+                    itemsize: crate::layout::target_word_size(),
+                    is_item_signed: true,
+                },
+                true,
+            )
+            .unwrap();
+        let ft =
+            crate::annotator::bookkeeper::func_type_from_fn_spelling("fn() -> i64", &|_| false)
+                .expect("fn() -> i64 spelling");
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
+        load.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Func(ft),
+        }))));
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::IndirectCall {
+                    funcptr: load.clone(),
+                    args: vec![],
+                    graphs: None,
+                    family_key: None,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(result.clone()));
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let graphs = crate::codewriter::call::GraphStore::default();
+        let outcome = dual_gate_check_with_registry(&graph, &registry, &graphs).expect("dual-gate");
+        let DualGateOutcome::Match {
+            real_value_to_var, ..
+        } = outcome
+        else {
+            panic!("FnPtrCell get+call graph must Match, got {outcome:?}");
+        };
+        assert_eq!(kind_of_in(&real_value_to_var, &load), ConcreteType::Signed);
+        let typed = real_value_to_var.get(&load).expect("load in value_to_var");
+        match typed.concretetype() {
+            Some(LowLevelType::Ptr(p)) if matches!(p.TO, PtrTarget::Func(_)) => {}
+            other => panic!("load must be Ptr(FuncType), got {other:?}"),
+        }
+        match typed.annotation.borrow().as_ref().map(|rc| rc.as_ref()) {
+            Some(crate::annotator::model::SomeValue::Ptr(_)) => {}
+            other => panic!("load annotation must be SomePtr, got {other:?}"),
+        }
+        assert_eq!(
+            kind_of_in(&real_value_to_var, &result),
+            ConcreteType::Signed
+        );
+    }
+
+    /// A `OnceLock<fn() -> i64>` static is a prebuilt `ConstRefAddr`;
+    /// `get` is a signed-word `raw_load` of `Ptr(FuncType)` at the
+    /// payload offset (`history.getkind` `'int'`); calling the loaded
+    /// pointer is `SomePtr.call`.
+    #[test]
+    fn oncelock_fn_get_and_call_dual_gate_match_load_is_func_ptr_kind_i() {
+        let _lock = anchor_lock();
+        let mut graph = LegacyGraph::new("oncelock_fn_get_and_call");
+        let entry = graph.startblock;
+        let cell = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x1111), true)
+            .unwrap();
+        cell.set_concretetype(Some(LowLevelType::Address));
+        let offset = graph.push_op_var(entry, OpKind::ConstInt(8), true).unwrap();
+        let load = graph
+            .push_op_var(
+                entry,
+                OpKind::RawLoad {
+                    base: cell,
+                    offset,
+                    item_ty: ValueType::Int,
+                    itemsize: crate::layout::target_word_size(),
+                    is_item_signed: true,
+                },
+                true,
+            )
+            .unwrap();
+        let ft =
+            crate::annotator::bookkeeper::func_type_from_fn_spelling("fn() -> i64", &|_| false)
+                .expect("fn() -> i64 spelling");
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
+        load.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Func(ft),
+        }))));
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::IndirectCall {
+                    funcptr: load.clone(),
+                    args: vec![],
+                    graphs: None,
+                    family_key: None,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(result.clone()));
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let graphs = crate::codewriter::call::GraphStore::default();
+        let outcome = dual_gate_check_with_registry(&graph, &registry, &graphs).expect("dual-gate");
+        let DualGateOutcome::Match {
+            real_value_to_var, ..
+        } = outcome
+        else {
+            panic!("OnceLock<fn> get+call graph must Match, got {outcome:?}");
+        };
+        assert_eq!(kind_of_in(&real_value_to_var, &load), ConcreteType::Signed);
+        let typed = real_value_to_var.get(&load).expect("load in value_to_var");
+        match typed.concretetype() {
+            Some(LowLevelType::Ptr(p)) if matches!(p.TO, PtrTarget::Func(_)) => {}
+            other => panic!("load must be Ptr(FuncType), got {other:?}"),
+        }
+        match typed.annotation.borrow().as_ref().map(|rc| rc.as_ref()) {
+            Some(crate::annotator::model::SomeValue::Ptr(_)) => {}
+            other => panic!("load annotation must be SomePtr, got {other:?}"),
+        }
+        assert_eq!(
+            kind_of_in(&real_value_to_var, &result),
+            ConcreteType::Signed
+        );
     }
 
     /// `warmspot.py check_access_directly_sanity`: a graph
@@ -11281,6 +11947,84 @@ mod tests {
     }
 
     #[test]
+    fn map_block_inputargs_from_flowspace_maps_returnblock_to_live_twin() {
+        let graph = LegacyGraph::new("ret_phi");
+        let ret = graph.block(graph.returnblock).inputargs[0].clone();
+        let stale = Variable::named("stale");
+        stale.set_concretetype(Some(LowLevelType::Void));
+        let live = Variable::named("live_return");
+        live.set_concretetype(Some(LowLevelType::Signed));
+        let mut value_to_var = HashMap::from([(ret.clone(), stale)]);
+        let flow_return =
+            crate::flowspace::model::Block::shared(vec![Hlvalue::Variable(live.clone())]);
+        let mut block_map = HashMap::new();
+        block_map.insert(graph.returnblock, flow_return);
+        map_block_inputargs_from_flowspace(&graph, &block_map, &mut value_to_var);
+        assert_eq!(value_to_var.get(&ret), Some(&live));
+    }
+
+    #[test]
+    fn map_block_inputargs_from_flowspace_leaves_extra_flowspace_ssi_copies() {
+        let graph = LegacyGraph::new("ret_ssi");
+        let ret = graph.block(graph.returnblock).inputargs[0].clone();
+        let live = Variable::named("live_return");
+        let ssi_copy = Variable::named("ssi_copy");
+        let mut value_to_var = HashMap::from([(ret.clone(), Variable::named("seed"))]);
+        let flow_return = crate::flowspace::model::Block::shared(vec![
+            Hlvalue::Variable(live.clone()),
+            Hlvalue::Variable(ssi_copy),
+        ]);
+        let mut block_map = HashMap::new();
+        block_map.insert(graph.returnblock, flow_return);
+        map_block_inputargs_from_flowspace(&graph, &block_map, &mut value_to_var);
+        assert_eq!(value_to_var.get(&ret), Some(&live));
+        assert_eq!(
+            value_to_var.len(),
+            1,
+            "SSA_to_SSI extra column has no FunctionGraph twin"
+        );
+    }
+
+    #[test]
+    fn map_block_inputargs_from_flowspace_keeps_extra_legacy_column_seed() {
+        let graph = LegacyGraph::new("except_extra_legacy");
+        let etype = graph.block(graph.exceptblock).inputargs[0].clone();
+        let evalue = graph.block(graph.exceptblock).inputargs[1].clone();
+        let seed_evalue = Variable::named("seed_evalue");
+        let live = Variable::named("live_etype");
+        let mut value_to_var = HashMap::from([
+            (etype.clone(), Variable::named("seed_etype")),
+            (evalue.clone(), seed_evalue.clone()),
+        ]);
+        let flow_except =
+            crate::flowspace::model::Block::shared(vec![Hlvalue::Variable(live.clone())]);
+        let mut block_map = HashMap::new();
+        block_map.insert(graph.exceptblock, flow_except);
+        map_block_inputargs_from_flowspace(&graph, &block_map, &mut value_to_var);
+        assert_eq!(value_to_var.get(&etype), Some(&live));
+        assert_eq!(value_to_var.get(&evalue), Some(&seed_evalue));
+    }
+
+    #[test]
+    fn map_block_inputargs_from_flowspace_leaves_intermediate_phi_seed() {
+        let mut graph = LegacyGraph::new("join_phi");
+        let (join, inputs) = graph.create_block_with_arg_vars(1);
+        let phi = inputs[0].clone();
+        let seed = Variable::named("seed");
+        let live = Variable::named("live_phi");
+        let mut value_to_var = HashMap::from([(phi.clone(), seed.clone())]);
+        let flow_join = crate::flowspace::model::Block::shared(vec![Hlvalue::Variable(live)]);
+        let mut block_map = HashMap::new();
+        block_map.insert(join, flow_join);
+        map_block_inputargs_from_flowspace(&graph, &block_map, &mut value_to_var);
+        assert_eq!(
+            value_to_var.get(&phi),
+            Some(&seed),
+            "remove_identical_vars_SSA may drop columns; do not zip intermediate phis"
+        );
+    }
+
+    #[test]
     fn constant_phi_aliases_require_equal_values_and_publish_after_acceptance() {
         for (right, expected_alias) in [(1, true), (2, false)] {
             let mut graph = LegacyGraph::new("constant_phi");
@@ -11929,6 +12673,7 @@ mod tests {
         let DualGateOutcome::Match {
             real_value_to_var,
             real_constants,
+            ..
         } = outcome
         else {
             panic!("frozen-PBC phi must Match, got {outcome:?}");
@@ -13553,8 +14298,7 @@ mod tests {
     /// `setupstate::InProgress` and panics with "recursive invocation
     /// of Repr setup()".  Holding this `Mutex` serialises the runs.
     fn anchor_lock() -> parking_lot::MutexGuard<'static, ()> {
-        static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-        LOCK.lock()
+        super::specialize_test_lock()
     }
 
     #[test]

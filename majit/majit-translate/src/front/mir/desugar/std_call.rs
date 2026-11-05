@@ -2361,6 +2361,45 @@ impl<'a> Lowering<'a> {
         Some(variants.get(variant_idx)?.name.clone())
     }
 
+    /// `FnPtrCell::get` (`hook_cell::FnPtrCell::get`). Keyed on the
+    /// receiver ADT path and the method leaf, never on the static's name.
+    pub(in crate::front::mir) fn is_fnptrcell_get(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        if fd.item_meta.name_path().rsplit("::").next() != Some("get") {
+            return false;
+        }
+        fd.signature
+            .inputs
+            .first()
+            .is_some_and(|t| tyref_is_fnptrcell(t, self.llbc))
+    }
+
+    /// `OnceLock::get` on a `OnceLock<fn>` receiver. Leaf `get` only
+    /// (`get_or_init` stays [`Self::is_prebuilt_once_lock_get_or_init`]).
+    /// The receiver type is the call-site operand, so a generic FunDecl
+    /// whose signature still has a TypeVar still matches.
+    pub(in crate::front::mir) fn is_oncelock_fn_get(
+        &self,
+        reg: &RegularCall,
+        recv_ty: Option<&TyRef>,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        if fd.item_meta.name_path().rsplit("::").next() != Some("get") {
+            return false;
+        }
+        recv_ty.is_some_and(|t| tyref_is_oncelock_fn(t, self.llbc))
+    }
+
     /// `core::sync::atomic::Atomic*::from_ptr(p)` is a layout-transparent
     /// pointer view.  Match the exact core associated function and require an
     /// atomic output wrapper so unrelated `from_ptr` constructors (notably

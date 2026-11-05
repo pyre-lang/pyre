@@ -354,6 +354,49 @@ pub fn for_each_prebuilt_class_static(mut visit: impl FnMut(&PrebuiltStaticAddr)
     }
 }
 
+/// Link-time registry of every `global_hook!` `FnPtrCell` static.
+///
+/// `distributed_slice` rejects wasm32, which carries the same set in
+/// [`WASM_FNPTRCELL_STATICS`]; read both through [`for_each_fnptrcell_static`].
+#[cfg(not(target_arch = "wasm32"))]
+#[::linkme::distributed_slice]
+pub static FNPTRCELL_STATICS: [PrebuiltStaticAddr] = [..];
+
+/// The same registry on wasm32, populated at constructor time.
+#[cfg(target_arch = "wasm32")]
+pub static WASM_FNPTRCELL_STATICS: std::sync::Mutex<Vec<PrebuiltStaticAddr>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Append one `FnPtrCell` static to [`WASM_FNPTRCELL_STATICS`].
+///
+/// Called only from the constructor `global_hook!` emits. An entry appended
+/// after the address table has been read is not published.
+#[cfg(target_arch = "wasm32")]
+pub fn register_fnptrcell_static(path: &'static str, addr: *const ()) {
+    WASM_FNPTRCELL_STATICS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(PrebuiltStaticAddr::new(path, addr));
+}
+
+/// Visit every registered `FnPtrCell` static, whichever population the target
+/// carries.
+pub fn for_each_fnptrcell_static(mut visit: impl FnMut(&PrebuiltStaticAddr)) {
+    #[cfg(not(target_arch = "wasm32"))]
+    for desc in FNPTRCELL_STATICS {
+        visit(desc);
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let guard = WASM_FNPTRCELL_STATICS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for desc in guard.iter() {
+            visit(desc);
+        }
+    }
+}
+
 #[cfg(test)]
 mod object_gcarray_slice_tests {
     use super::object_gcarray_slice;

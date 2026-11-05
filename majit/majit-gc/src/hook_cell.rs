@@ -121,6 +121,86 @@ macro_rules! global_hook {
         $(#[$attr])*
         $vis static $name: $crate::hook_cell::FnPtrCell<$fnty> =
             $crate::hook_cell::FnPtrCell::new();
+        $crate::paste::paste! {
+            #[cfg(not(target_arch = "wasm32"))]
+            #[::majit_ir::linkme::distributed_slice(::majit_ir::helper_fnaddr::FNPTRCELL_STATICS)]
+            #[linkme(crate = ::majit_ir::linkme)]
+            #[allow(non_upper_case_globals)]
+            static [<__FNPTRCELL_STATIC_ $name>]: ::majit_ir::helper_fnaddr::PrebuiltStaticAddr =
+                ::majit_ir::helper_fnaddr::PrebuiltStaticAddr::new(
+                    ::core::concat!(::core::module_path!(), "::", stringify!($name)),
+                    &$name as *const _ as *const (),
+                );
+            #[cfg(target_arch = "wasm32")]
+            #[::ctor::ctor(unsafe)]
+            #[allow(non_snake_case)]
+            fn [<__fnptrcell_register_ $name>]() {
+                ::majit_ir::helper_fnaddr::register_fnptrcell_static(
+                    ::core::concat!(::core::module_path!(), "::", stringify!($name)),
+                    &$name as *const _ as *const (),
+                );
+            }
+        }
+    };
+}
+
+/// Declare a process-global `OnceLock<fn(..)>` and publish its address
+/// through the same [`FNPTRCELL_STATICS`](majit_ir::helper_fnaddr::FNPTRCELL_STATICS)
+/// registry [`global_hook!`] uses.
+///
+/// `F` must be a bare `fn(..)` pointer: pointer-sized, and
+/// `Option<F>` must share that word (`NicheIntNull::FnPtr`). The
+/// translator keys the Global lane on the `OnceLock<F>` type, not on
+/// the static's name (`bookkeeper.immutablevalue`).
+///
+/// ```ignore
+/// majit_gc::oncelock_fn_static!(static HOOK: OnceLock<fn()>);
+/// ```
+#[macro_export]
+macro_rules! oncelock_fn_static {
+    ($(#[$attr:meta])* $vis:vis static $name:ident : OnceLock<$fnty:ty>) => {
+        $crate::oncelock_fn_static! { @emit $(#[$attr])* $vis static $name: $fnty }
+    };
+    ($(#[$attr:meta])* $vis:vis static $name:ident : std::sync::OnceLock<$fnty:ty>) => {
+        $crate::oncelock_fn_static! { @emit $(#[$attr])* $vis static $name: $fnty }
+    };
+    ($(#[$attr:meta])* $vis:vis static $name:ident : ::std::sync::OnceLock<$fnty:ty>) => {
+        $crate::oncelock_fn_static! { @emit $(#[$attr])* $vis static $name: $fnty }
+    };
+    (@emit $(#[$attr:meta])* $vis:vis static $name:ident : $fnty:ty) => {
+        $(#[$attr])*
+        $vis static $name: ::std::sync::OnceLock<$fnty> = ::std::sync::OnceLock::new();
+        const _: () = {
+            assert!(
+                ::core::mem::size_of::<$fnty>() == ::core::mem::size_of::<*mut ()>(),
+                "OnceLock<F>: F must be a pointer-sized bare fn pointer"
+            );
+            assert!(
+                ::core::mem::size_of::<::core::option::Option<$fnty>>()
+                    == ::core::mem::size_of::<$fnty>(),
+                "OnceLock<F>: Option<F> must be the fn-pointer niche word"
+            );
+        };
+        $crate::paste::paste! {
+            #[cfg(not(target_arch = "wasm32"))]
+            #[::majit_ir::linkme::distributed_slice(::majit_ir::helper_fnaddr::FNPTRCELL_STATICS)]
+            #[linkme(crate = ::majit_ir::linkme)]
+            #[allow(non_upper_case_globals)]
+            static [<__FNPTRCELL_STATIC_ $name>]: ::majit_ir::helper_fnaddr::PrebuiltStaticAddr =
+                ::majit_ir::helper_fnaddr::PrebuiltStaticAddr::new(
+                    ::core::concat!(::core::module_path!(), "::", stringify!($name)),
+                    &$name as *const _ as *const (),
+                );
+            #[cfg(target_arch = "wasm32")]
+            #[::ctor::ctor(unsafe)]
+            #[allow(non_snake_case)]
+            fn [<__fnptrcell_register_ $name>]() {
+                ::majit_ir::helper_fnaddr::register_fnptrcell_static(
+                    ::core::concat!(::core::module_path!(), "::", stringify!($name)),
+                    &$name as *const _ as *const (),
+                );
+            }
+        }
     };
 }
 

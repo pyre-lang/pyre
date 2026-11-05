@@ -7323,6 +7323,32 @@ impl<'a> Lowering<'a> {
                     });
                     return Ok(res);
                 }
+                // A `FnPtrCell<F>` static (`global_hook!`) or a
+                // `OnceLock<F>` static whose `F` is a bare fn pointer
+                // (`oncelock_fn_static!`) is a prebuilt constant
+                // (`bookkeeper.immutablevalue` of a module-level object).
+                // The cell is not a class instance: wrapping it in
+                // `__cast_instance_intrinsic` would mint
+                // `SomeInstance(...)` and drop the subsequent `get`
+                // load of `Option<Ptr(FuncType)>`. Emit the bare
+                // `ConstRefAddr`, keyed on the GlobalDecl's type.
+                if (tyref_is_fnptrcell(&place_ty, self.llbc)
+                    || tyref_is_oncelock_fn(&place_ty, self.llbc))
+                    && let Some(op @ OpKind::ConstRefAddr(_)) = self.static_addr_op(&segments)
+                {
+                    let bb_id = self.emit_bb(mir_bb);
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+                    res.set_concretetype(Some(
+                        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Address,
+                    ));
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: op,
+                    });
+                    return Ok(res);
+                }
                 // Bookkeeper.immutablevalue annotates a prebuilt instance
                 // with its class regardless of whether that class has fields.
                 // Preserve that owner on both unit strategy implementations
@@ -8535,9 +8561,11 @@ impl<'a> Lowering<'a> {
     /// Field-bearing instances need the same owner as zero-field ones.
     ///
     /// Opaque declarations do not prove the pointed-to layout. In particular,
-    /// the OnceLock globals used to initialize Python singletons are opaque in
-    /// LLBC, and their registered refs identify the initialized Python objects,
-    /// not the OnceLock containers. Keep those on their existing raw-ref path.
+    /// the OnceLock globals used to initialize Python singletons — Opaque
+    /// or Struct — have refs that identify the initialized Python objects,
+    /// not the OnceLock containers (`bookkeeper.immutablevalue`). Keep
+    /// those on their existing raw-ref path so `get_or_init` still aliases
+    /// to the registered object.
     ///
     /// The name is crate-stripped ([`strip_crate_prefix`]) so it matches
     /// the canonical `module::Leaf` spelling every other classdef path keys
@@ -8556,8 +8584,12 @@ impl<'a> Lowering<'a> {
         if td.published_struct_copy {
             return None;
         }
+        let path = td.item_meta.name_path();
+        if path_ends_with_segments(&path, "sync::once_lock::OnceLock") {
+            return None;
+        }
         match &td.kind {
-            TypeDeclKind::Struct(_) => Some(strip_crate_prefix(&td.item_meta.name_path())),
+            TypeDeclKind::Struct(_) => Some(strip_crate_prefix(&path)),
             _ => None,
         }
     }

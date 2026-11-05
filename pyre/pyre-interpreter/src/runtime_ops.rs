@@ -213,7 +213,7 @@ type JitFunctionCaller = extern "C" fn(
     nargs: i64,
 ) -> i64;
 
-static JIT_FUNCTION_CALLER: OnceLock<JitFunctionCaller> = OnceLock::new();
+majit_gc::oncelock_fn_static!(static JIT_FUNCTION_CALLER: OnceLock<JitFunctionCaller>);
 
 pub fn register_jit_function_caller(caller: JitFunctionCaller) {
     let _ = JIT_FUNCTION_CALLER.set(caller);
@@ -221,7 +221,7 @@ pub fn register_jit_function_caller(caller: JitFunctionCaller) {
 
 type JitExcRaiser = extern "C" fn(value: i64);
 
-static JIT_EXC_RAISER: OnceLock<JitExcRaiser> = OnceLock::new();
+majit_gc::oncelock_fn_static!(static JIT_EXC_RAISER: OnceLock<JitExcRaiser>);
 
 pub fn register_jit_exc_raiser(raiser: JitExcRaiser) {
     let _ = JIT_EXC_RAISER.set(raiser);
@@ -239,7 +239,7 @@ extern "C" fn object_residual_raise(value: i64) {
 
 type JitExcClearer = extern "C" fn();
 
-static JIT_EXC_CLEARER: OnceLock<JitExcClearer> = OnceLock::new();
+majit_gc::oncelock_fn_static!(static JIT_EXC_CLEARER: OnceLock<JitExcClearer>);
 
 pub fn register_jit_exc_clearer(clearer: JitExcClearer) {
     let _ = JIT_EXC_CLEARER.set(clearer);

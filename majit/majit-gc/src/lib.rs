@@ -4,6 +4,10 @@ pub use header::{
     GC_FLAG_SHIFT, GC_HEADER_WORD_SIZE, GC_IMMORTAL_LEAF_HEADER, GC_TYPE_ID_BITS,
     GCFLAG_NO_HEAP_PTRS, GCFLAG_TRACK_YOUNG_PTRS, GCREF, GCREFOpaque, GcType,
 };
+// `global_hook!` expansions name `$crate::paste` so consumers do not need a
+// direct `paste` dependency.
+#[doc(hidden)]
+pub use paste;
 
 /// `history.py` `ConstPtr` is rooted by the holder that stores the box
 /// (`trace_index`), not by every slot `intern` has ever recorded.

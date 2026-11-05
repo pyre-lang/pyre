@@ -102,6 +102,16 @@ CHARON_CORE_INCLUDE = [
     "core::cell::Cell",
     "--include",
     "core::cell::UnsafeCell",
+    # `OnceLock<fn>` payload is the `value` field after `Once`; the type
+    # stays `kind: Opaque` / empty layout unless included, so
+    # `OnceLock::get` cannot derive that offset. Include the type, not
+    # `::_` (the latter extracts the whole module). Associated methods
+    # such as `get_or_init` may still appear; the existing prebuilt
+    # fold stays in force.
+    "--include",
+    "std::sync::once_lock::OnceLock",
+    "--include",
+    "core::sync::once_lock::OnceLock",
     "--include",
     "core::cmp::impls::_::le",
     "--include",

@@ -2612,8 +2612,9 @@ static MEMORY_ERROR_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock:
 /// dependency). `register_jit_exc_raiser` installs this hook so rstr helpers
 /// raise through that existing pair instead of a parallel channel.
 type ResidualExcPublisher = extern "C" fn(i64);
-static RESIDUAL_EXC_PUBLISHER: std::sync::OnceLock<ResidualExcPublisher> =
-    std::sync::OnceLock::new();
+majit_gc::oncelock_fn_static!(
+    static RESIDUAL_EXC_PUBLISHER: std::sync::OnceLock<ResidualExcPublisher>
+);
 
 pub fn register_residual_exc_publisher(f: ResidualExcPublisher) {
     let _ = RESIDUAL_EXC_PUBLISHER.set(f);

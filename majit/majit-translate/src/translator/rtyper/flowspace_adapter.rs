@@ -539,6 +539,15 @@ fn const_ref_addr_define_hlvalue(addr: i64, result: &Variable) -> Hlvalue {
             ConstValue::None,
             LowLevelType::Void,
         ))
+    } else if matches!(result.concretetype(), Some(LowLevelType::Address)) {
+        // A `FnPtrCell` / `OnceLock<fn>` static is a raw host address
+        // (`llmemory.Address`), not a GCREF singleton. `raw_load`
+        // keeps an int-kinded addr (`inputarg_llop_intkind_or_signed`).
+        use crate::translator::rtyper::lltypesystem::lltype::_address;
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::LLAddress(_address::IntCast(addr)),
+            LowLevelType::Address,
+        ))
     } else {
         Hlvalue::Constant(const_ref_gcref_constant(Some(addr)))
     }
@@ -731,6 +740,25 @@ fn raw_item_lltype(
             )));
         }
     })
+}
+
+/// `raw_load` TYPE. A dest stamped `Ptr(FuncType)` (`FnPtrCell::get` /
+/// `OnceLock<fn>::get`) keeps that lltype so
+/// `_LLOpEntry.compute_result_annotation` binds `SomePtr` while the
+/// machine descr stays a signed word (`history.getkind` `'int'`).
+fn raw_load_item_lltype(
+    item_ty: &crate::model::ValueType,
+    itemsize: usize,
+    is_item_signed: bool,
+    result: Option<&Variable>,
+) -> Result<LowLevelType, TyperError> {
+    use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+    if let Some(existing) = result.and_then(|var| var.concretetype())
+        && matches!(&existing, LowLevelType::Ptr(p) if matches!(p.TO, PtrTarget::Func(_)))
+    {
+        return Ok(existing);
+    }
+    raw_item_lltype(item_ty, itemsize, is_item_signed)
 }
 
 /// `_LLOpEntry.compute_result_annotation` writes
@@ -4577,7 +4605,8 @@ pub fn translate_op(
             itemsize,
             is_item_signed,
         } => {
-            let item_ll = raw_item_lltype(item_ty, *itemsize, *is_item_signed)?;
+            let item_ll =
+                raw_load_item_lltype(item_ty, *itemsize, *is_item_signed, op.result.as_ref())?;
             let type_hl =
                 Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(Box::new(item_ll))));
             let base_hl = lookup_operand(value_map, base, op, "base")?;
