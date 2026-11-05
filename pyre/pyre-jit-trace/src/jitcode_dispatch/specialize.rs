@@ -16689,6 +16689,21 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
 
     let walk_start = ctx.trace_ctx.get_trace_position();
     let saved_fbw_mode = ctx.fbw_mode.clone();
+    // Pause this Python MIFrame (portal or inlined callee) with the banks
+    // `convert_and_run_from_pyjitpl` / `_copy_data_from_miframe` copy.
+    // `record_paused_portal_abort_point` may already have left abort-point
+    // scalars on a placeholder live; bind keeps those and fills the banks.
+    // A nested helper walk already occupies a helper MIFrame — rebinding
+    // would overwrite that frame with the inner helper's register file.
+    if !saved_fbw_mode.transparent_helper_subwalk {
+        super::vable_ops::bind_paused_caller_regs(
+            ctx.session,
+            ctx.registers_r,
+            ctx.registers_i,
+            ctx.registers_f,
+            &ctx.frame_state,
+        );
+    }
     ctx.fbw_mode.inline_subwalk = true;
     ctx.fbw_mode.subwalk_floor = Some(walk_start);
     ctx.fbw_mode.helper_return = nested_entry.ret;
