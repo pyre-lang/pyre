@@ -18772,6 +18772,45 @@ mod tests {
         }
     }
 
+    /// A per-knowntype copy keeps the row's fixed result. `copygraph` drops
+    /// the stub's return annotation, which made every `Cell<i32>::set`
+    /// caller (`c_ffi_call`'s alt-errno save) `s_ImpossibleValue` and
+    /// lowered the code after it to a raise.
+    #[test]
+    fn fixed_result_argtype_rows_keep_their_result_per_key() {
+        use crate::annotator::description::GraphCacheKey;
+        use crate::flowspace::model::Hlvalue;
+
+        let (_ann, registry) = pointer_atomic_argtype_registry();
+        for (segments, _, _, return_lltype) in FIXED_RESULT_ARGTYPE_EXTERNALS {
+            let entry = registry
+                .lookup(&FunctionPathKey::from_segments(segments.iter().copied()))
+                .unwrap_or_else(|| panic!("{segments:?} must register"));
+            let fd = entry.function_desc.borrow();
+            let copy = fd
+                .cachedgraph(
+                    GraphCacheKey::Tuple(vec![GraphCacheKey::String("Signed".into())]),
+                    None,
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("{segments:?}: cachedgraph: {e:?}"));
+            let link_ann = {
+                let g = copy.graph.borrow();
+                let start = g.startblock.borrow();
+                let link = start.exits[0].borrow();
+                match &link.args[0] {
+                    Some(Hlvalue::Variable(v)) => v.annotation.borrow().clone(),
+                    _ => None,
+                }
+            };
+            assert_eq!(
+                link_ann.as_deref(),
+                default_someshell_for_lltype(return_lltype).as_ref(),
+                "{segments:?}: the per-key copy returns the row's result"
+            );
+        }
+    }
+
     #[test]
     fn fixed_result_argtype_rows_install_source_template() {
         use crate::annotator::policy::Specializer;
