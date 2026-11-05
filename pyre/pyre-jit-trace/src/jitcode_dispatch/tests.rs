@@ -11715,7 +11715,8 @@ fn walker_call_trace_hook_reads_guards_null_hooks() {
             leftover,
             vec![majit_ir::OpCode::IntIsZero, majit_ir::OpCode::GuardTrue],
             "second walk re-records the generated profilefunc is-not-None \
-             INT_IS_ZERO / GuardTrue: leftover={leftover:?} first={first_ops:?}"
+             INT_IS_ZERO / GuardTrue: leftover={leftover:?} first={first_ops:?} \
+             generated={generated:?}"
         );
         assert_unarmed_call_trace_recorded(
             wc, session, &r_before, &i_before, &f_before, &generated,
