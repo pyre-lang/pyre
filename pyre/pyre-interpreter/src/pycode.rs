@@ -945,7 +945,7 @@ pub unsafe fn w_code_qualname_obj(w_code: PyObjectRef) -> PyObjectRef {
         if !cached.is_null() {
             return cached;
         }
-        let code_ptr = w_code_get_ptr(w_code) as *const crate::CodeObject;
+        let code_ptr = w_code_get_ptr(w_code);
         if code_ptr.is_null() {
             return pyre_object::PY_NULL;
         }
@@ -982,7 +982,7 @@ pub unsafe fn w_code_name_obj(w_code: PyObjectRef) -> PyObjectRef {
         if !cached.is_null() {
             return cached;
         }
-        let code_ptr = w_code_get_ptr(w_code) as *const crate::CodeObject;
+        let code_ptr = w_code_get_ptr(w_code);
         if code_ptr.is_null() {
             return pyre_object::PY_NULL;
         }
@@ -2275,7 +2275,7 @@ unsafe fn require_code(
             "descriptor '{descriptor}' requires a 'code' object"
         )));
     }
-    let ptr = unsafe { w_code_get_ptr(obj) } as *const crate::CodeObject;
+    let ptr = unsafe { w_code_get_ptr(obj) };
     if ptr.is_null() || !(ptr as usize).is_multiple_of(std::mem::align_of::<crate::CodeObject>()) {
         return Err(crate::PyError::type_error("code object has no code body"));
     }
@@ -2855,7 +2855,7 @@ unsafe fn iter_linetable<'a>(w_code: PyObjectRef) -> Option<&'a [u8]> {
     if w_code.is_null() {
         return None;
     }
-    let code = unsafe { w_code_get_ptr(w_code) } as *const crate::CodeObject;
+    let code = unsafe { w_code_get_ptr(w_code) };
     if code.is_null() {
         return None;
     }
@@ -3061,7 +3061,7 @@ pub unsafe fn branches_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
         if it.w_code.is_null() {
             return None;
         }
-        let code = w_code_get_ptr(it.w_code) as *const crate::CodeObject;
+        let code = w_code_get_ptr(it.w_code);
         if code.is_null() {
             return None;
         }
@@ -3197,7 +3197,7 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         unsafe { pyre_object::w_dict_getitem_str(kwds, name) }
     };
 
-    let code_ptr = unsafe { w_code_get_ptr(w_self()) } as *const crate::CodeObject;
+    let code_ptr = unsafe { w_code_get_ptr(w_self()) };
     if code_ptr.is_null() {
         return Err(crate::PyError::type_error(
             "cannot replace fields of a code object with no code body",
@@ -3733,7 +3733,7 @@ pub(crate) unsafe fn obj_to_constant_data(
             });
         }
         if is_code(obj) {
-            let ptr = w_code_get_ptr(obj) as *const crate::CodeObject;
+            let ptr = w_code_get_ptr(obj);
             if !ptr.is_null() {
                 return Ok(ConstantData::Code {
                     code: Box::new((*ptr).clone()),
@@ -4523,7 +4523,7 @@ pub unsafe fn w_code_addr2line(w_code: PyObjectRef, addrq: i64) -> i32 {
 #[majit_macros::dont_look_inside]
 unsafe fn _offset2lineno(w_code: PyObjectRef, addrq: i64) -> i32 {
     unsafe {
-        let code = &*(w_code_get_ptr(w_code) as *const crate::CodeObject);
+        let code = &*(w_code_get_ptr(w_code));
         let firstlineno = w_code_firstlineno_raw(w_code);
         // An offset outside `i32` cannot be spelled in the packed pair.
         let Ok(key) = i32::try_from(addrq) else {
@@ -5922,7 +5922,7 @@ mod tests {
         let instruction_storage = code.instructions.as_ptr();
 
         let w_code = box_code_object(code);
-        let stored = unsafe { &*(w_code_get_ptr(w_code) as *const crate::CodeObject) };
+        let stored = unsafe { &*(w_code_get_ptr(w_code)) };
 
         assert_eq!(stored.source_path.as_ptr(), source_storage);
         assert_eq!(stored.instructions.as_ptr(), instruction_storage);

@@ -5664,7 +5664,7 @@ fn carrier_stack_box_for_ref_arg<Sym: WalkSym>(
     let color = ctx.registers_r.iter().position(|value| value == arg)?;
     let raw_code = unsafe {
         pyre_interpreter::w_code_get_ptr(ctx.inline_w_code() as pyre_object::PyObjectRef)
-    } as *const pyre_interpreter::CodeObject;
+    };
     if raw_code.is_null() {
         return None;
     }
@@ -5788,8 +5788,7 @@ fn residual_callable_has_closure_or_cells<Sym: WalkSym>(
         if has_closure {
             return true;
         }
-        let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject;
+        let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef);
         !raw.is_null() && pyre_interpreter::ncells(&*raw) != 0
     }
 }

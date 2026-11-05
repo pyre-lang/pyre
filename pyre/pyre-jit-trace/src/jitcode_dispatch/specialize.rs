@@ -6200,8 +6200,7 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
     let code_roots = pyre_object::gc_roots::push_roots();
     let code_slot = code_roots.base();
     let w_code = code_roots.pin_root(w_code);
-    let code_ptr =
-        unsafe { pyre_interpreter::w_code_get_ptr(w_code) } as *const pyre_interpreter::CodeObject;
+    let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
     if code_ptr.is_null() {
         return Ok(None);
     }

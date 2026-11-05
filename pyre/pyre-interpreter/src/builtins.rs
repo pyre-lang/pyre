@@ -20800,7 +20800,7 @@ pub fn exec_or_eval(
     let raw_code = unsafe {
         crate::w_code_get_ptr(
             pyre_object::gc_roots::shadow_stack_get(code_slot) as pyre_object::PyObjectRef
-        ) as *const crate::CodeObject
+        )
     };
     let globals_arg = reload_ns(1);
     let locals_arg = reload_ns(2);

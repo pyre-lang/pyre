@@ -4191,22 +4191,29 @@ impl<S: JitState> JitDriver<S> {
                 ctx.virtualizable_heap_ptr().map_or(0, |p| p as i64),
             )
         });
-        let staged = aborted
-            .or_else(|| {
-                (self.meta.interpret_framestack_for_abort && !self.meta.framestack.is_empty()).then(
-                    || {
+        // A failed instruction has no executable blackhole continuation
+        // (`run_blackhole_interp_to_cancel_tracing` /
+        // `publish_walk_abort_handoff`).
+        let staged =
+            aborted
+                .or_else(|| {
+                    (self.meta.interpret_framestack_for_abort
+                        && !self.meta.framestack.is_empty()
+                        && !self.meta.tracing.as_ref().is_some_and(|ctx| {
+                            ctx.abort_after_panic || ctx.symbolic_residual_abort
+                        }))
+                    .then(|| {
                         std::mem::replace(
                             &mut self.meta.framestack,
                             crate::pyjitpl::MIFrameStack::empty(),
                         )
-                    },
-                )
-            })
-            .filter(|framestack| !framestack.is_empty())
-            .map(|framestack| {
-                let (virt_array_values, virtualizable_ptr) = virt_and_ptr.unwrap_or((None, 0));
-                (framestack, virt_array_values, virtualizable_ptr)
-            });
+                    })
+                })
+                .filter(|framestack| !framestack.is_empty())
+                .map(|framestack| {
+                    let (virt_array_values, virtualizable_ptr) = virt_and_ptr.unwrap_or((None, 0));
+                    (framestack, virt_array_values, virtualizable_ptr)
+                });
         if let Some((framestack, virt_array_values, virtualizable_ptr)) = staged {
             let (scalar_values, ref_scalar_values) = match self.meta.trace_ctx() {
                 Some(ctx) => (
@@ -12818,6 +12825,34 @@ mod tests {
         assert!(
             driver.pending_abort_blackhole_mut().is_none(),
             "FBW abort without a published latch must not convert MetaInterp.framestack"
+        );
+    }
+
+    /// A caught panic abort has no executable blackhole continuation
+    /// (`run_blackhole_interp_to_cancel_tracing` / `publish_walk_abort_handoff`).
+    #[test]
+    fn pending_abort_blackhole_skips_when_abort_after_panic() {
+        let mut driver = JitDriver::<CountingDoorState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let mut state = CountingDoorState::default();
+        let key = gk(2166);
+        driver.force_start_tracing(
+            key.get_uhash(),
+            Some((&key.values, &key.types)),
+            0,
+            &mut state,
+            &(),
+        );
+        assert!(driver.is_tracing());
+        driver.merge_point(|meta, _sym| {
+            meta.interpret_framestack_for_abort = true;
+            meta.framestack = dummy_abort_framestack();
+            meta.tracing.as_mut().unwrap().abort_after_panic = true;
+            TraceAction::Abort
+        });
+        assert!(
+            driver.pending_abort_blackhole_mut().is_none(),
+            "panic abort must not stage interpret framestack as a blackhole"
         );
     }
 

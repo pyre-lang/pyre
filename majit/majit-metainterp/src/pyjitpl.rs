@@ -12029,6 +12029,15 @@ impl<M: Clone> MetaInterp<M> {
         {
             return;
         }
+        // A failed instruction has no executable blackhole continuation
+        // (`run_blackhole_interp_to_cancel_tracing` / `publish_walk_abort_handoff`).
+        if self
+            .tracing
+            .as_ref()
+            .is_some_and(|ctx| ctx.abort_after_panic || ctx.symbolic_residual_abort)
+        {
+            return;
+        }
         let (virt_array_values, virtualizable_ptr, raising_exception) = self
             .tracing
             .as_ref()

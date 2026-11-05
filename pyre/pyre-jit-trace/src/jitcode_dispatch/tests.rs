@@ -2453,9 +2453,7 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
     // path, not merely its parent-count predicate.
     let code = compile_exec("None").expect("test code should compile");
     let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
-    let raw_code = unsafe {
-        w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const pyre_interpreter::CodeObject
-    };
+    let raw_code = unsafe { w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     let mut builder = majit_metainterp::JitCodeBuilder::default();
     let live_patch = builder.live_placeholder();
     builder.patch_live_offset(live_patch, 0);
@@ -29395,8 +29393,7 @@ fn loop_header_stamp_is_consumed_by_jit_merge_point() {
     ];
     let code_obj = pyre_interpreter::compile_exec("None").expect("test code should compile");
     let w_code = pyre_interpreter::w_code_new(Box::into_raw(Box::new(code_obj)) as *const ());
-    let raw_code =
-        unsafe { pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject };
+    let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
     pyre_interpreter::register_live_code_wrapper(raw_code as *const (), w_code);
     assert!(
         !pyre_interpreter::live_code_wrapper(raw_code as *const ()).is_null(),
