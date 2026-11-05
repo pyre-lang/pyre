@@ -1144,6 +1144,10 @@ pub struct FunctionDesc {
     /// [`Self::annsignature`]. `Some(sig)` means an `@enforceargs(...)`
     /// decoration was applied and `normalize_args` should invoke it.
     pub annenforceargs: Option<Rc<super::signature::Sig>>,
+    /// Regular two-phase FRESH adapters (`drive_subject`) that share
+    /// this funcobj. Upstream `cachedgraph` is one graph; pyre Regular
+    /// annotates a second lift that is not a cache entry.
+    extra_annotation_graphs: RefCell<Vec<crate::flowspace::model::GraphRef>>,
 }
 
 /// Upstream `_signature_` tuple (params_s, result_s) attached to
@@ -1202,6 +1206,7 @@ impl FunctionDesc {
             source_graph: RefCell::new(None),
             annsignature: None,
             annenforceargs: None,
+            extra_annotation_graphs: RefCell::new(Vec::new()),
         }
     }
 
@@ -1241,6 +1246,67 @@ impl FunctionDesc {
     /// [`Self::source_template`], not a cache entry.
     pub fn getgraphs(&self) -> Vec<Rc<PyGraph>> {
         self.cache.borrow().values().cloned().collect()
+    }
+
+    /// Graphs `recursivecall` may have registered `notify` on, plus the
+    /// two-phase subject's source template. Upstream
+    /// `FunctionDesc.cachedgraph` is one graph per key; pyre Regular
+    /// subjects annotate a FRESH adapter while pycall uses
+    /// `cachedgraph(None)` (the template). Return-block generalization
+    /// of either must reflow the other (`annrpython.py recursivecall`
+    /// `notify[graph.returnblock]`).
+    pub(crate) fn annotation_graphs(&self) -> Vec<Rc<PyGraph>> {
+        let mut graphs = self.getgraphs();
+        if let Some(template) = self.built_source_template()
+            && !graphs.iter().any(|g| Rc::ptr_eq(g, &template))
+        {
+            graphs.push(template);
+        }
+        graphs
+    }
+
+    /// Flowspace graphs whose returnblocks share this FunctionDesc
+    /// (`description.py FunctionDesc.getgraphs` plus the Regular
+    /// subject's FRESH adapter remembered from the flowspace lift).
+    pub(crate) fn annotation_graph_refs(&self) -> Vec<crate::flowspace::model::GraphRef> {
+        let mut graphs = Vec::new();
+        let mut push = |g: crate::flowspace::model::GraphRef| {
+            if !graphs.iter().any(|e| Rc::ptr_eq(e, &g)) {
+                graphs.push(g);
+            }
+        };
+        for pygraph in self.annotation_graphs() {
+            push(pygraph.graph.clone());
+        }
+        for extra in self.extra_annotation_graphs.borrow().iter() {
+            push(extra.clone());
+        }
+        graphs
+    }
+
+    /// Record a Regular two-phase FRESH adapter so its inferred return
+    /// generalizes `cachedgraph` graphs of the same funcobj
+    /// (`annrpython.py recursivecall` / `FunctionDesc.getgraphs`).
+    pub(crate) fn remember_annotation_graph(&self, graph: crate::flowspace::model::GraphRef) {
+        let mut extra = self.extra_annotation_graphs.borrow_mut();
+        if extra.iter().any(|g| Rc::ptr_eq(g, &graph)) {
+            return;
+        }
+        extra.push(graph);
+    }
+
+    /// First `cachedgraph(None)` asker (`description.py FunctionDesc.cachedgraph`).
+    /// A Regular two-phase FRESH adapter that lifts before any pycall is
+    /// that graph (`translator.buildflowgraph`); later `pycall` must HIT
+    /// it rather than lift a second template.
+    pub(crate) fn seed_cachedgraph_none_if_vacant(&self, pygraph: Rc<PyGraph>) {
+        let mut cache = self.cache.borrow_mut();
+        if cache.contains_key(&GraphCacheKey::None) {
+            return;
+        }
+        cache.insert(GraphCacheKey::None, pygraph.clone());
+        drop(cache);
+        self.remember_in_translator_graphs(&pygraph);
     }
 
     /// Install a pending lift of the lowered body

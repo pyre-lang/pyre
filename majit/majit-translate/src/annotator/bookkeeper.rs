@@ -530,17 +530,39 @@ impl std::fmt::Debug for Bookkeeper {
 #[derive(Default)]
 pub(crate) struct DescMap {
     inner: IndexMap<ConstValue, DescEntry>,
+    /// `bookkeeper.py getdesc` keys on `id(pyobj)`. `GraphFunc.id` is
+    /// `Hashable(function)` so a HostObject wrapping the same function
+    /// object (or a `FunctionGraph.func` clone) still resolves the
+    /// FunctionDesc (`description.py FunctionDesc.cachedgraph`).
+    by_func_id: IndexMap<u64, DescEntry>,
 }
 
 impl DescMap {
     pub(crate) fn new() -> Self {
         Self {
             inner: IndexMap::new(),
+            by_func_id: IndexMap::new(),
         }
     }
 
     pub(crate) fn insert(&mut self, pyobj: HostObject, entry: DescEntry) -> Option<DescEntry> {
+        if let Some(gf) = pyobj.user_function() {
+            self.by_func_id.insert(gf.id, entry.clone());
+        }
         self.insert_const(ConstValue::HostObject(pyobj), entry)
+    }
+
+    pub(crate) fn function_desc_for_func_id(
+        &self,
+        func_id: u64,
+    ) -> Option<Rc<RefCell<FunctionDesc>>> {
+        self.by_func_id
+            .get(&func_id)
+            .and_then(DescEntry::as_function)
+    }
+
+    pub(crate) fn desc_entry_for_func_id(&self, func_id: u64) -> Option<DescEntry> {
+        self.by_func_id.get(&func_id).cloned()
     }
 
     pub(crate) fn get(&self, pyobj: &HostObject) -> Option<&DescEntry> {
@@ -2602,6 +2624,18 @@ impl Bookkeeper {
     ) -> Result<DescEntry, AnnotatorError> {
         if let Some(existing) = self.descs.borrow().get(pyobj) {
             return Ok(existing.clone());
+        }
+        // `bookkeeper.py getdesc` keys on `id(pyobj)`. `GraphFunc.id` is
+        // `Hashable(function)` so a second HostObject wrapping the same
+        // function object reuses the FunctionDesc (`description.py
+        // FunctionDesc.cachedgraph`). Drop the `descs` borrow before
+        // insert: `RefCell` cannot nest `borrow` and `borrow_mut`.
+        let by_func_id = pyobj
+            .user_function()
+            .and_then(|gf| self.descs.borrow().desc_entry_for_func_id(gf.id));
+        if let Some(entry) = by_func_id {
+            self.descs.borrow_mut().insert(pyobj.clone(), entry.clone());
+            return Ok(entry);
         }
         let entry = if pyobj.is_user_function() {
             // upstream `newfuncdesc` already returns a MemoDesc or
@@ -13746,6 +13780,21 @@ mod tests {
         let b = bk.getdesc(&host).unwrap();
         assert_eq!(a, b);
         // Same underlying FunctionDesc Rc — pointer-identity.
+        let a_fd = a.as_function().unwrap();
+        let b_fd = b.as_function().unwrap();
+        assert!(Rc::ptr_eq(&a_fd, &b_fd));
+    }
+
+    #[test]
+    fn getdesc_reuses_function_desc_for_same_graphfunc_id() {
+        // `bookkeeper.py getdesc` keys on `id(pyobj)`. Two HostObjects
+        // wrapping a GraphFunc of the same `id` are one function object.
+        let bk = bk();
+        let gf = GraphFunc::new("g", Constant::new(ConstValue::Dict(Default::default())));
+        let host_a = HostObject::new_user_function(gf.clone());
+        let host_b = HostObject::new_user_function(gf);
+        let a = bk.getdesc(&host_a).unwrap();
+        let b = bk.getdesc(&host_b).unwrap();
         let a_fd = a.as_function().unwrap();
         let b_fd = b.as_function().unwrap();
         assert!(Rc::ptr_eq(&a_fd, &b_fd));

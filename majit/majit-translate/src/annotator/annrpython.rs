@@ -183,6 +183,17 @@ pub struct RPythonAnnotator {
     pub failed_blocks: RefCell<IndexMap<BlockKey, BlockRef>>,
     /// RPython `self.errors = []` (annrpython.py).
     pub errors: RefCell<Vec<String>>,
+    /// `(graph, block)` pairs whose `processblock` is on the stack.
+    /// Direct/indirect recursion must not `reflowpendingblock` a live
+    /// startblock (`annrpython.py recursivecall` leaves a truthy
+    /// `annotated[block]` alone and waits for `flowin` notify).
+    processing_blocks: RefCell<Vec<(GraphKey, BlockKey)>>,
+    /// Blocks already given one leftover-Some `reflowpendingblock`
+    /// (`annrpython.py`) in the current `complete_pending_blocks`.
+    /// Caps A↔B canraise leftover pairs; a second HIT waits for
+    /// `flowin` notify (`annrpython.py` Phase 4) or the drain-end
+    /// sweep of still-open leftovers.
+    leftover_retried: RefCell<IndexSet<BlockKey>>,
 }
 
 /// RPython `class BlockedInference(Exception)` (annrpython.py).
@@ -335,6 +346,26 @@ impl From<crate::annotator::model::AnnotatorException> for FlowinError {
 /// it in `Some`.
 fn gather_error(ann: &RPythonAnnotator, graph: &GraphRef, block: &BlockRef, i: usize) -> String {
     crate::tool::error::gather_error(ann, graph, block, Some(i))
+}
+
+/// Pushes `(graph, block)` onto [`RPythonAnnotator::processing_blocks`]
+/// for the duration of `processblock`, so leftover-Some retry in
+/// `addpendingblock` can skip `reflowpendingblock` of a live startblock.
+struct ProcessingBlockGuard<'a> {
+    ann: &'a RPythonAnnotator,
+}
+
+impl<'a> ProcessingBlockGuard<'a> {
+    fn push(ann: &'a RPythonAnnotator, gkey: GraphKey, bkey: BlockKey) -> Self {
+        ann.processing_blocks.borrow_mut().push((gkey, bkey));
+        Self { ann }
+    }
+}
+
+impl Drop for ProcessingBlockGuard<'_> {
+    fn drop(&mut self) {
+        self.ann.processing_blocks.borrow_mut().pop();
+    }
 }
 
 /// RAII guard returned by [`RPythonAnnotator::using_policy`] — mirrors
@@ -764,6 +795,8 @@ impl RPythonAnnotator {
                 keepgoing,
                 failed_blocks: RefCell::new(IndexMap::new()),
                 errors: RefCell::new(Vec::new()),
+                processing_blocks: RefCell::new(Vec::new()),
+                leftover_retried: RefCell::new(IndexSet::new()),
             }
         });
         if !translator_was_provided {
@@ -1244,7 +1277,67 @@ impl RPythonAnnotator {
         // upstream: `v = graph.getreturnvar(); return self.binding(v)` or
         // s_ImpossibleValue on KeyError.
         let v = graph.borrow().getreturnvar();
-        self.annotation(&v).unwrap_or_else(s_impossible_value)
+        if let Some(s) = self.annotation(&v) {
+            return s;
+        }
+        // Two-phase Regular subjects annotate a FRESH adapter
+        // (`drive_subject`) while this `cachedgraph(None)` is the
+        // source template (`description.py FunctionDesc.cachedgraph`).
+        // Upstream has one graph, so a sibling that already reached
+        // returnblock is this graph's return (`annrpython.py
+        // recursivecall` `binding(getreturnvar)`).
+        if let Some(s) = self.sibling_return_annotation(graph) {
+            let returnblock = graph.borrow().returnblock.clone();
+            self.addpendingblock(graph, &returnblock, &[Some(s.clone())]);
+            return s;
+        }
+        s_impossible_value()
+    }
+
+    fn function_desc_for_graph(
+        &self,
+        graph: &GraphRef,
+    ) -> Option<Rc<RefCell<super::description::FunctionDesc>>> {
+        let func_id = graph.borrow().func.as_ref()?.id;
+        self.bookkeeper
+            .descs
+            .borrow()
+            .function_desc_for_func_id(func_id)
+    }
+
+    fn sibling_graphs(&self, graph: &GraphRef) -> Vec<GraphRef> {
+        let Some(desc) = self.function_desc_for_graph(graph) else {
+            return Vec::new();
+        };
+        desc.borrow().annotation_graph_refs()
+    }
+
+    fn sibling_return_annotation(&self, graph: &GraphRef) -> Option<SomeValue> {
+        for sibling in self.sibling_graphs(graph) {
+            if Rc::ptr_eq(&sibling, graph) {
+                continue;
+            }
+            let v = sibling.borrow().getreturnvar();
+            if let Some(s) = self.annotation(&v) {
+                return Some(s);
+            }
+        }
+        None
+    }
+
+    /// Bind a generalized return onto every `FunctionDesc.cachedgraph` /
+    /// source-template of the same function object
+    /// (`bookkeeper.py getdesc` / `description.py FunctionDesc.getgraphs`).
+    /// `recursivecall` notify is keyed by that graph's returnblock
+    /// (`annrpython.py`).
+    fn generalize_function_desc_return(&self, graph: &GraphRef, result: &SomeValue) {
+        for sibling in self.sibling_graphs(graph) {
+            if Rc::ptr_eq(&sibling, graph) {
+                continue;
+            }
+            let returnblock = sibling.borrow().returnblock.clone();
+            self.addpendingblock(&sibling, &returnblock, &[Some(result.clone())]);
+        }
     }
 
     /// RPython `gettype(self, variable)` (annrpython.py).
@@ -1961,6 +2054,189 @@ impl RPythonAnnotator {
         let needs_flow = matches!(self.annotated.borrow().get(&bkey), Some(None));
         if needs_flow {
             self.schedulependingblock(graph, block);
+        } else if matches!(self.annotated.borrow().get(&bkey), Some(Some(_))) {
+            self.retry_leftover_some_block(graph, block, gkey, bkey);
+        }
+    }
+
+    fn block_has_followed_exit(&self, block: &BlockRef) -> bool {
+        let exits = block.borrow().exits.clone();
+        let followed = self.links_followed.borrow();
+        exits
+            .iter()
+            .any(|link| followed.contains_key(&LinkKey::of(link)))
+    }
+
+    fn block_has_unfollowed_success_exit(&self, block: &BlockRef) -> bool {
+        let exits = block.borrow().exits.clone();
+        let followed = self.links_followed.borrow();
+        exits.iter().any(|link| {
+            link.borrow().exitcase.is_none() && !followed.contains_key(&LinkKey::of(link))
+        })
+    }
+
+    /// `flowin` BlockedOnRaisingOp (`annrpython.py` BlockedInference
+    /// when `e.op is block.raising_op`) leaves `annotated[block] =
+    /// graph` and follows only exception exits. Success stays
+    /// unfollowed until `notify[callee.returnblock]` re-flows this
+    /// block. A leftover HIT of the *callee* in that state must
+    /// `reflowpendingblock` (`annrpython.py`) so its returnblock can
+    /// generalize (`jit_ffi_call_impl_any` last-op `c_ffi_call`;
+    /// `jit_ffi_call` kind-arm last-op `do_ffi_call_sint`).
+    fn leftover_blocked_on_raising_op(&self, block: &BlockRef) -> bool {
+        block.borrow().canraise() && self.block_has_unfollowed_success_exit(block)
+    }
+
+    fn leftover_open_block(&self, block: &BlockRef) -> bool {
+        if !matches!(
+            self.annotated.borrow().get(&BlockKey::of(block)),
+            Some(Some(_))
+        ) {
+            return false;
+        }
+        !self.block_has_followed_exit(block) || self.leftover_blocked_on_raising_op(block)
+    }
+
+    /// One leftover-Some `reflowpendingblock` (`annrpython.py`) per
+    /// block per `complete_pending_blocks`. Live `processblock`
+    /// frames are skipped (`annrpython.py recursivecall` waits for
+    /// notify rather than re-entering the same start).
+    fn reflow_leftover_open_once(&self, graph: &GraphRef, block: &BlockRef) -> bool {
+        if !self.leftover_open_block(block) {
+            return false;
+        }
+        let bkey = BlockKey::of(block);
+        let on_stack = self
+            .processing_blocks
+            .borrow()
+            .iter()
+            .any(|(_, k)| k == &bkey);
+        if on_stack {
+            return false;
+        }
+        if !self.leftover_retried.borrow_mut().insert(bkey) {
+            return false;
+        }
+        self.reflowpendingblock(graph, block);
+        true
+    }
+
+    /// Two-phase compensation: `flowin` HarmlesslySwallowed
+    /// (`annrpython.py` BlockedInference on `simple_call` /
+    /// `call_args` / `next`) leaves `annotated[block] = graph` with
+    /// no exit in `links_followed`. BlockedOnRaisingOp leaves the
+    /// same truthy annotated with only exception exits followed.
+    /// Upstream `addpendingblock` then skips (`if not
+    /// self.annotated[block]: schedule`) and `recursivecall` stays
+    /// Impossible. A later `cachedgraph` HIT of that leftover must
+    /// `reflowpendingblock` (`annrpython.py`) so the callee can reach
+    /// returnblock and `notify` the caller.
+    ///
+    /// Loop headers that already followed a back-edge and are not
+    /// canraise are not retried (that reflow never drains). When
+    /// `recursivecall` hits a start that *did* follow exits but whose
+    /// returnblock was never entered, walk those exits and retry
+    /// leftover successors that are still open (`jit_ffi_call`
+    /// getkind then kind-arm; `jit_ffi_call_impl_any` loop then
+    /// `c_ffi_call`).
+    fn retry_leftover_some_block(
+        &self,
+        graph: &GraphRef,
+        block: &BlockRef,
+        gkey: GraphKey,
+        bkey: BlockKey,
+    ) {
+        let (startblock, returnblock, exceptblock) = {
+            let g = graph.borrow();
+            (
+                g.startblock.clone(),
+                g.returnblock.clone(),
+                g.exceptblock.clone(),
+            )
+        };
+        if Rc::ptr_eq(block, &returnblock) || Rc::ptr_eq(block, &exceptblock) {
+            return;
+        }
+        // Only a successfully processed returnblock (`annotated =
+        // graph`) means the callee already generalized. `None` is the
+        // `False` sentinel (`bindinputargs` / BlockedInference) and
+        // must not suppress leftover retry.
+        if matches!(
+            self.annotated.borrow().get(&BlockKey::of(&returnblock)),
+            Some(Some(_))
+        ) {
+            return;
+        }
+        let processing = self.processing_blocks.borrow();
+        let on_stack = processing.iter().any(|(_, k)| k == &bkey);
+        let graph_on_stack = processing.iter().any(|(g, _)| g == &gkey);
+        drop(processing);
+        if on_stack {
+            return;
+        }
+        if self.reflow_leftover_open_once(graph, block) {
+            return;
+        }
+        if self.leftover_open_block(block) {
+            return;
+        }
+        if Rc::ptr_eq(block, &startblock) && !graph_on_stack {
+            self.resume_unfollowed_leftover_successors(graph, block);
+        }
+    }
+
+    fn resume_unfollowed_leftover_successors(&self, graph: &GraphRef, start: &BlockRef) {
+        let (returnblock, exceptblock) = {
+            let g = graph.borrow();
+            (g.returnblock.clone(), g.exceptblock.clone())
+        };
+        let mut seen: IndexSet<BlockKey> = IndexSet::new();
+        let mut stack = vec![Rc::clone(start)];
+        while let Some(block) = stack.pop() {
+            if Rc::ptr_eq(&block, &returnblock) || Rc::ptr_eq(&block, &exceptblock) {
+                continue;
+            }
+            let bkey = BlockKey::of(&block);
+            if !seen.insert(bkey.clone()) {
+                continue;
+            }
+            if self.leftover_open_block(&block) {
+                self.reflow_leftover_open_once(graph, &block);
+                continue;
+            }
+            let exits = block.borrow().exits.clone();
+            let mut followed_targets = Vec::new();
+            let mut unfollowed_leftover = Vec::new();
+            {
+                let followed = self.links_followed.borrow();
+                let annotated = self.annotated.borrow();
+                for link in &exits {
+                    let target = link.borrow().target.clone();
+                    if followed.contains_key(&LinkKey::of(link)) {
+                        if let Some(t) = target {
+                            followed_targets.push(t);
+                        }
+                    } else if let Some(t) = target {
+                        if Rc::ptr_eq(&t, &returnblock) || Rc::ptr_eq(&t, &exceptblock) {
+                            continue;
+                        }
+                        if matches!(annotated.get(&BlockKey::of(&t)), Some(Some(_))) {
+                            unfollowed_leftover.push(t);
+                        }
+                    }
+                }
+            }
+            if followed_targets.is_empty() {
+                // Reached via a followed predecessor, but this block
+                // itself never followed an exit (`flowin`
+                // HarmlesslySwallowed).
+                self.reflow_leftover_open_once(graph, &block);
+                continue;
+            }
+            stack.extend(followed_targets);
+            for t in unfollowed_leftover {
+                self.reflow_leftover_open_once(graph, &t);
+            }
         }
     }
 
@@ -1989,17 +2265,30 @@ impl RPythonAnnotator {
     /// `addpendingblock → schedulependingblock`, the outer loop keeps
     /// scanning until every dict is empty.
     pub fn complete_pending_blocks(&self) -> Result<(), crate::annotator::model::AnnotatorError> {
+        self.leftover_retried.borrow_mut().clear();
         loop {
             // Find the first non-empty generation dict.
             let mut generation: usize = 0;
-            {
+            let all_empty = {
                 let pending = self.genpendingblocks.borrow();
                 while generation < pending.len() && pending[generation].is_empty() {
                     generation += 1;
                 }
-                if generation == pending.len() {
-                    return Ok(()); // all empty ⇒ done
+                generation == pending.len()
+            };
+            if all_empty {
+                // Pending drained. Leftover Some that
+                // `addpendingblock` skipped (`annrpython.py`
+                // `if not self.annotated[block]`) still has
+                // unfollowed success (`flowin` BlockedOnRaisingOp
+                // / HarmlesslySwallowed). One `reflowpendingblock`
+                // per such block so `notify[returnblock]` can
+                // fire (`annrpython.py` Phase 4). Already-retried
+                // leftovers stay for `cutoff_alwaysraising_block`.
+                if self.schedule_leftover_open_blocks() {
+                    continue;
                 }
+                return Ok(()); // all empty ⇒ done
             }
 
             // Upstream: `gen += 1; if len(self.genpendingblocks) == gen:
@@ -2026,6 +2315,41 @@ impl RPythonAnnotator {
                 self.processblock(&graph, &block)?;
             }
         }
+    }
+
+    /// After `genpendingblocks` drains, leftover-Some open blocks
+    /// (`flowin` HarmlesslySwallowed / BlockedOnRaisingOp) have no
+    /// further `addpendingblock` HIT. Schedule one
+    /// `reflowpendingblock` (`annrpython.py`) each so a callee that
+    /// generalized later in the same drain can still `notify` its
+    /// callers. `reflow_leftover_open_once` caps the set.
+    fn schedule_leftover_open_blocks(&self) -> bool {
+        let candidates: Vec<(GraphRef, BlockRef)> = {
+            let annotated = self.annotated.borrow();
+            let all_blocks = self.all_blocks.borrow();
+            annotated
+                .iter()
+                .filter_map(|(bkey, gopt)| {
+                    let graph = gopt.as_ref()?.clone();
+                    let block = all_blocks.get(bkey)?.clone();
+                    Some((graph, block))
+                })
+                .collect()
+        };
+        let mut any = false;
+        for (graph, block) in candidates {
+            let (returnblock, exceptblock) = {
+                let g = graph.borrow();
+                (g.returnblock.clone(), g.exceptblock.clone())
+            };
+            if Rc::ptr_eq(&block, &returnblock) || Rc::ptr_eq(&block, &exceptblock) {
+                continue;
+            }
+            if self.reflow_leftover_open_once(&graph, &block) {
+                any = true;
+            }
+        }
+        any
     }
 
     /// RPython `reflowpendingblock(self, graph, block)`
@@ -3291,6 +3615,19 @@ impl RPythonAnnotator {
             self.reflowfromposition(&position);
         }
 
+        // Two-phase Regular subjects annotate a FRESH adapter while
+        // `FunctionDesc.cachedgraph(None)` is the source template.
+        // Upstream `recursivecall` notify is keyed by that one
+        // returnblock (`annrpython.py` Phase 4). Bind the inferred
+        // return onto every graph of the same FunctionDesc
+        // (`description.py FunctionDesc.getgraphs` / `cachedgraph`).
+        if Rc::ptr_eq(block, &graph.borrow().returnblock) {
+            let returnvar = graph.borrow().getreturnvar();
+            if let Some(s) = self.annotation(&returnvar) {
+                self.generalize_function_desc_return(graph, &s);
+            }
+        }
+
         Ok(())
     }
 
@@ -3338,6 +3675,8 @@ impl RPythonAnnotator {
         }
         // upstream: `if block in self.blocked_blocks: del ...`.
         self.blocked_blocks.borrow_mut().shift_remove(&bkey);
+
+        let _processing = ProcessingBlockGuard::push(self, GraphKey::of(graph), bkey.clone());
 
         // upstream annrpython.py:397-406:
         //     try:
@@ -4810,6 +5149,156 @@ mod tests {
                 &returnblock
             ),
             "arm1 must still exit to returnblock"
+        );
+    }
+
+    /// Look-inside unit callee with no `_signature_`. First `pycall`
+    /// yields `s_ImpossibleValue` (`annrpython.py recursivecall`); the
+    /// caller's `c_last_exception` success arm must still be followed
+    /// once the callee returnblock generalizes to `s_None`
+    /// (`flowin` notify → `reflowfromposition`) so
+    /// `transform.py cutoff_alwaysraising_block` does not fire.
+    fn unit_look_inside_callee(
+        name: &str,
+    ) -> (
+        crate::flowspace::model::GraphRef,
+        Rc<crate::flowspace::pygraph::PyGraph>,
+        crate::flowspace::model::GraphFunc,
+    ) {
+        use super::super::super::flowspace::argument::Signature;
+        use super::super::super::flowspace::model::{
+            BlockRefExt, ConstValue, Constant, GraphFunc, Link,
+        };
+        use super::super::super::flowspace::pygraph::PyGraph;
+        use std::cell::Cell;
+        let startblock = Block::shared(vec![]);
+        let mut inner = FunctionGraph::new(name, startblock.clone());
+        let func = GraphFunc::new(name, Constant::new(ConstValue::Dict(Default::default())));
+        inner.func = Some(func.clone());
+        let none = Hlvalue::Constant(Constant::new(ConstValue::None));
+        let to_return = Link::new(vec![none], Some(inner.returnblock.clone()), None).into_ref();
+        startblock.closeblock(vec![to_return]);
+        let graph = Rc::new(RefCell::new(inner));
+        let pygraph = Rc::new(PyGraph {
+            graph: Rc::clone(&graph),
+            func: func.clone(),
+            signature: RefCell::new(Signature::new(vec![], None, None)),
+            defaults: RefCell::new(Some(Vec::new())),
+            access_directly: Cell::new(false),
+        });
+        (graph, pygraph, func)
+    }
+
+    fn canraise_void_caller(
+        name: &str,
+        callee_host: crate::flowspace::model::HostObject,
+    ) -> (
+        crate::flowspace::model::GraphRef,
+        crate::flowspace::model::LinkRef,
+        crate::flowspace::model::BlockRef,
+    ) {
+        use super::super::super::flowspace::model::{
+            BlockRefExt, ConstValue, Constant, HOST_ENV, Link, SpaceOperation, c_last_exception,
+        };
+        let startblock = Block::shared(vec![]);
+        let caller = Rc::new(RefCell::new(FunctionGraph::new(name, startblock.clone())));
+        let result = Variable::named("call_result");
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "simple_call",
+            vec![Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                callee_host,
+            )))],
+            Hlvalue::Variable(result),
+        ));
+        let none = Hlvalue::Constant(Constant::new(ConstValue::None));
+        let success =
+            Link::new(vec![none], Some(caller.borrow().returnblock.clone()), None).into_ref();
+        let exceptblock = caller.borrow().exceptblock.clone();
+        let exc_cls = HOST_ENV
+            .lookup_exception_class("Exception")
+            .expect("HOST_ENV Exception");
+        let etype = Variable::named("last_exception");
+        let evalue = Variable::named("last_exc_value");
+        let mut raise = Link::new(
+            vec![
+                Hlvalue::Variable(etype.clone()),
+                Hlvalue::Variable(evalue.clone()),
+            ],
+            Some(exceptblock),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                exc_cls,
+            )))),
+        );
+        raise.extravars(
+            Some(Hlvalue::Variable(etype)),
+            Some(Hlvalue::Variable(evalue)),
+        );
+        startblock.borrow_mut().exitswitch = Some(Hlvalue::Constant(c_last_exception()));
+        startblock.closeblock(vec![success.clone(), raise.into_ref()]);
+        (caller, success, startblock)
+    }
+
+    fn install_unit_callee_desc(
+        ann: &RPythonAnnotator,
+        name: &str,
+        host: crate::flowspace::model::HostObject,
+        pygraph: Rc<crate::flowspace::pygraph::PyGraph>,
+    ) -> Rc<RefCell<super::super::description::FunctionDesc>> {
+        use super::super::super::flowspace::argument::Signature;
+        use super::super::description::{DescEntry, FunctionDesc};
+        let fd = Rc::new(RefCell::new(FunctionDesc::new(
+            Rc::clone(&ann.bookkeeper),
+            Some(host.clone()),
+            name,
+            Signature::new(vec![], None, None),
+            None,
+            None,
+        )));
+        fd.borrow().install_source_template(pygraph);
+        ann.bookkeeper
+            .descs
+            .borrow_mut()
+            .insert(host, DescEntry::function(Rc::clone(&fd)));
+        fd
+    }
+
+    #[test]
+    fn canraise_void_call_to_look_inside_unit_callee_success_arm_survives_tdc() {
+        use super::super::super::flowspace::model::LinkKey;
+        use super::super::model::s_none;
+        let translator = super::super::super::translator::translator::TranslationContext::new();
+        let ann = RPythonAnnotator::new(Some(translator), None, None, false);
+        let (callee_graph, callee_py, func) = unit_look_inside_callee("do_ffi_call_sint");
+        let host = crate::flowspace::model::HostObject::new_user_function(func);
+        install_unit_callee_desc(&ann, "do_ffi_call_sint", host.clone(), callee_py);
+        let (caller, success, startblock) = canraise_void_caller("jit_ffi_call", host);
+
+        let returnvar = callee_graph.borrow().getreturnvar();
+        assert!(
+            ann.annotation(&returnvar).is_none(),
+            "ordinary look-inside has no _signature_; first visit is Impossible"
+        );
+
+        ann.addpendinggraph(&caller, &[]);
+        ann.complete_pending_blocks()
+            .expect("complete_pending_blocks");
+        crate::translator::transform::transform_dead_code(&ann, std::slice::from_ref(&startblock));
+
+        assert!(
+            matches!(ann.annotation(&returnvar), Some(s) if s == s_none()),
+            "callee returnblock must generalize to s_None, got {:?}",
+            ann.annotation(&returnvar)
+        );
+        assert!(
+            ann.links_followed
+                .borrow()
+                .contains_key(&LinkKey::of(&success)),
+            "success arm of the canraise Void call must be followed"
+        );
+        let exits = startblock.borrow().exits.clone();
+        assert!(
+            exits.iter().any(|link| link.borrow().exitcase.is_none()),
+            "cutoff_alwaysraising_block must not kill the success arm, exits={exits:?}"
         );
     }
 
