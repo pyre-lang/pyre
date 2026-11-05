@@ -5554,6 +5554,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::executioncontext::space_decrement_ticker",
         crate::executioncontext::space_decrement_ticker_jit_abi,
     );
+    cp0!(
+        &mut entries,
+        "pyre_interpreter::module::signal::signalstate::pypysig_getaddr_occurred",
+        crate::module::signal::signalstate::pypysig_getaddr_occurred_jit_abi,
+    );
     // The `anchor` handler graph residualizes `FrameAnchor::new` itself
     // (its aggregate return keeps it out of inlining), and `push_anchored`
     // reads back through `FrameAnchor::live`; bind both under the exact

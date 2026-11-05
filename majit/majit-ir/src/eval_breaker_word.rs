@@ -11,7 +11,7 @@
 //!                       constant.
 //!   bit1 EB_ASYNC — an async ticker request; OR'd in by the OS signal handler
 //!                   and action dispatcher, then copied into
-//!                   `ActionFlag._ticker` at a safe interpreter checkpoint.
+//!                   `pypysig_counter` at a safe interpreter checkpoint.
 //!   bit2 EB_STW   — mirrors `GC_SYNC.stw_requested`; OR'd in by the collector
 //!                   while it drains mutators to safepoints.
 //!   bit3 EB_FINALIZING — mirrors interpreter finalization; once armed,
@@ -91,25 +91,24 @@ const _: () = {
 /// The shared eval-breaker word (see module docs).
 static EVAL_BREAKER_WORD: AtomicUsize = AtomicUsize::new(0);
 
-/// Address of `ActionFlag`'s ticker (`executioncontext.py ActionFlag._ticker`,
-/// `signals.c pypysig_counter`). Null until the process flag publishes it.
-/// Armers store `-1` through this pointer so the next `decrement_ticker`
-/// takes the `action_dispatcher` path. A fire that arrives first sticks in
-/// `TICKER_FORCED` and is folded in at publish.
+/// Address of the action ticker (`signals.c pypysig_counter`). Null until
+/// the process flag publishes it. Armers store `-1` through this pointer so
+/// the next `decrement_ticker` takes the `action_dispatcher` path. A fire
+/// that arrives first sticks in `TICKER_FORCED` and is folded in at publish.
 static ACTION_TICKER: AtomicPtr<AtomicIsize> = AtomicPtr::new(std::ptr::null_mut());
 static TICKER_FORCED: AtomicIsize = AtomicIsize::new(0);
 
-/// Address of the process-owned `ActionFlag._ticker`, or 0 before the
-/// process action flag has been constructed.  Compiled back-edges embed this
+/// Address of the action ticker (`signals.c pypysig_counter`), or 0 before
+/// the process action flag has published it.  Compiled back-edges embed this
 /// stable address and perform PyPy's raw ticker load/store sequence.
 pub fn action_ticker_addr() -> usize {
     ACTION_TICKER.load(Ordering::Acquire) as usize
 }
 
-/// Width used by `raw_load_i` / `raw_store_i` for `ActionFlag._ticker`.
+/// Width used by `raw_load_i` / `raw_store_i` for the action ticker.
 pub const ACTION_TICKER_WORD_SIZE: usize = size_of::<AtomicIsize>();
 
-/// Publish the process `ActionFlag` ticker. The cell is an `AtomicIsize`;
+/// Publish the `pypysig_counter` ticker cell. The cell is an `AtomicIsize`;
 /// signal handlers and collectors store `-1` into it.
 pub fn publish_action_ticker(ptr: *mut AtomicIsize) {
     if ptr.is_null() {

@@ -13,6 +13,8 @@ fn fired_ticker_is_serviced_once_before_the_opcode() {
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(|| {
+            let _lock =
+                pyre_interpreter::module::signal::signalstate::test_support::signal_eval_breaker_test_guard();
             pyre_module::register();
             init_jit_hooks();
             let ec = alloc_execution_context();
@@ -27,6 +29,7 @@ fn fired_ticker_is_serviced_once_before_the_opcode() {
                 ticker >= 0,
                 "action_dispatcher resets a fired ticker, left {ticker}"
             );
+            unsafe { (*ec_ptr).actionflag.reset_ticker(0) };
         })
         .unwrap()
         .join()
@@ -62,6 +65,8 @@ fn simple_counted_loop_runs_through_the_portal() {
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(|| {
+            let _lock =
+                pyre_interpreter::module::signal::signalstate::test_support::signal_eval_breaker_test_guard();
             pyre_module::register();
             init_jit_hooks();
             let ec = alloc_execution_context();
@@ -75,6 +80,7 @@ fn simple_counted_loop_runs_through_the_portal() {
             .unwrap();
             let mut frame = PyFrame::new_with_context(code, ec.clone()).unwrap();
             eval_with_jit(&mut frame, None).unwrap();
+            unsafe { (*ec_ptr).actionflag.reset_ticker(0) };
         })
         .unwrap()
         .join()
@@ -86,6 +92,8 @@ fn for_range_loop_runs_through_the_portal() {
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(|| {
+            let _lock =
+                pyre_interpreter::module::signal::signalstate::test_support::signal_eval_breaker_test_guard();
             pyre_module::register();
             init_jit_hooks();
             let ec = alloc_execution_context();
@@ -99,6 +107,7 @@ fn for_range_loop_runs_through_the_portal() {
             .unwrap();
             let mut frame = PyFrame::new_with_context(code, ec.clone()).unwrap();
             eval_with_jit(&mut frame, None).unwrap();
+            unsafe { (*ec_ptr).actionflag.reset_ticker(0) };
         })
         .unwrap()
         .join()
@@ -110,6 +119,8 @@ fn list_subscript_loop_runs_through_the_portal() {
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(|| {
+            let _lock =
+                pyre_interpreter::module::signal::signalstate::test_support::signal_eval_breaker_test_guard();
             pyre_module::register();
             init_jit_hooks();
             let ec = alloc_execution_context();
@@ -127,6 +138,7 @@ fn list_subscript_loop_runs_through_the_portal() {
             .unwrap();
             let mut frame = PyFrame::new_with_context(code, ec.clone()).unwrap();
             eval_with_jit(&mut frame, None).unwrap();
+            unsafe { (*ec_ptr).actionflag.reset_ticker(0) };
         })
         .unwrap()
         .join()
