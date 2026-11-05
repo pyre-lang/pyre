@@ -3861,10 +3861,9 @@ fn residual_stub_result_shell(
 /// `Integer ∪ RustVec` at a `look_inside_iff` wrapper return
 /// (`ll_vec_alloc_and_set_nonnull_r`).
 /// `None` when the token is not `ref` (and not that `Vec` header) or the
-/// graph declares neither. A leftover `"gcref"` token on a registered GC
-/// pointer (`PyObjectRef`) still intern's `SomeInstance` of
-/// `return_class_root` (`signature.py` `annotationoftype`); a real
-/// `llmemory.GCREF` return has no class root and stays `SomePtr`.
+/// graph declares neither. A `"gcref"` token is `llmemory.GCREF`
+/// `SomePtr` (`llannotation.py` `lltype_to_annotation`), including a
+/// leftover token that still carries a registered `return_class_root`.
 fn declared_return_annotation(
     registry: &CallRegistry,
     graph: &LegacyGraph,
@@ -3886,16 +3885,15 @@ fn declared_return_annotation(
         .as_deref()
         .or(graph.residual_return_type.as_deref());
     let class_root = graph.return_class_root.as_deref();
-    let registered_gc_ptr_return =
-        class_root.is_some_and(|root| !crate::annotator::bookkeeper::is_gcref_type_spelling(root));
     // `lltype.GCREF` (`llannotation.py` `lltype_to_annotation`). A `"ref"`
     // token plus the GCREFOpaque class root interned a ClassDef, and
     // `pairtype(SomePtr, SomeObject).union` refused the look-inside CAST
     // SomePtr at MethodDesc pbc_call (`get_empty_storage`). A leftover
-    // `"gcref"` token on a registered GC pointer still intern's
-    // `SomeInstance` of `return_class_root`.
-    if class_root.is_some_and(crate::annotator::bookkeeper::is_gcref_type_spelling)
-        || (token == Some(GCREF_RETURN_TYPE) && !registered_gc_ptr_return)
+    // `"gcref"` token is still `llmemory.GCREF`, even when
+    // `return_class_root` names a registered instance: mixing that
+    // `SomePtr` with `SomeInstance` is `Int ∪ Ref` at mergeinputargs.
+    if token == Some(GCREF_RETURN_TYPE)
+        || class_root.is_some_and(crate::annotator::bookkeeper::is_gcref_type_spelling)
     {
         return Some(
             crate::translator::rtyper::llannotation::lltype_to_annotation(
@@ -3913,7 +3911,7 @@ fn declared_return_annotation(
             s
         });
     }
-    if token != Some("ref") && !(token == Some(GCREF_RETURN_TYPE) && registered_gc_ptr_return) {
+    if token != Some("ref") {
         return None;
     }
     if let Some(spelling) = graph.return_container_root.as_deref() {
@@ -3923,9 +3921,6 @@ fn declared_return_annotation(
         }
     }
     let root = graph.return_class_root.as_deref()?;
-    if crate::annotator::bookkeeper::is_gcref_type_spelling(root) {
-        return None;
-    }
     let bk = registry.bookkeeper();
     // `llmemory.py` `GCREF`; `lltype.GcOpaqueType` has no ClassDef.
     if crate::annotator::bookkeeper::is_gcref_type_spelling(root) {
@@ -18336,24 +18331,24 @@ mod tests {
 
         graph.return_type = Some(GCREF_RETURN_TYPE.into());
         let leftover = declared_return_annotation(&registry, &graph)
-            .expect("a leftover gcref token on a PyObjectRef residual intern's SomeInstance");
-        let SomeValue::Instance(inst) = leftover else {
-            panic!("leftover gcref + class root is SomeInstance, got {leftover:?}");
-        };
-        assert!(inst.can_be_none);
-        assert!(inst.classdef.is_some());
+            .expect("a leftover gcref token is llmemory.GCREF");
+        assert!(
+            matches!(leftover, SomeValue::Ptr(_)),
+            "leftover gcref stays SomePtr, got {leftover:?}"
+        );
 
         graph.return_class_root = None;
-        assert_eq!(
-            declared_return_annotation(&registry, &graph),
-            None,
-            "a real GCREF residual has no class root"
-        );
-        let gcref = residual_return_annotation(Some(GCREF_RETURN_TYPE), None)
-            .expect("gcref token shells as SomePtr");
+        let gcref = declared_return_annotation(&registry, &graph)
+            .expect("a real GCREF residual is SomePtr");
         assert!(
             matches!(gcref, SomeValue::Ptr(_)),
             "llmemory.GCREF stays SomePtr, got {gcref:?}"
+        );
+        let residual = residual_return_annotation(Some(GCREF_RETURN_TYPE), None)
+            .expect("gcref token shells as SomePtr");
+        assert!(
+            matches!(residual, SomeValue::Ptr(_)),
+            "llmemory.GCREF stays SomePtr, got {residual:?}"
         );
     }
 

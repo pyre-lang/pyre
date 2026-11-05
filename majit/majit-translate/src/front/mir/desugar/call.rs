@@ -5410,6 +5410,7 @@ impl<'a> Lowering<'a> {
                     }) = self.taken_by_address_field_read_of(bb_id, &args[0])
                     {
                         field.taken_by_address = false;
+                        Self::peel_cell_inner_value_field(&mut field);
                         let res = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -5435,14 +5436,15 @@ impl<'a> Lowering<'a> {
                 // and `Cell<PyObjectRef>::set` merge Bool ∪ Instance at
                 // `mergeinputargs`. Rewrite the field-place form (the
                 // same `taken_by_address` FieldRead `get` consumes) to
-                // a write of that field; `ExecutionContext::get_builtin`
-                // stores `builtin_dict_cache` this way.
+                // a write of that field; `ExecutionContext::clone_for_thread`
+                // stores `root_stack_slot` this way.
                 if args.len() == 2 && self.is_cell_set(&reg) {
                     if let Some(OpKind::FieldRead {
                         base, mut field, ..
                     }) = self.taken_by_address_field_read_of(bb_id, &args[0])
                     {
                         field.taken_by_address = false;
+                        Self::peel_cell_inner_value_field(&mut field);
                         let value_ty = second_arg_ty
                             .as_ref()
                             .map(|ty| {
@@ -9223,6 +9225,15 @@ impl<'a> Lowering<'a> {
         }
         impl_method_owner_for_fundecl(self.llbc, fd)
             .is_some_and(|(owner, leaf)| leaf == leaf_name && owner_is_cell(&owner) && std_cell)
+    }
+
+    /// `UnsafeCell<T>`'s payload is `value`. Address-of a `Cell` field
+    /// place composes `{field}.value`; RPython's setfield is the Cell
+    /// field itself (`nestedscope.py CellFamily.ever_mutated`).
+    fn peel_cell_inner_value_field(field: &mut crate::model::FieldDescriptor) {
+        while let Some(stripped) = field.name.strip_suffix(".value") {
+            field.name = stripped.to_string();
+        }
     }
 
     /// Address-of a named field that a subsequent `Cell::{get,set}` consumes.

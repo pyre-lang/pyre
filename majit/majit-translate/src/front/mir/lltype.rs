@@ -5511,6 +5511,20 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     if td.item_meta.name_path() == "alloc::boxed::Box" {
         return None;
     }
+    // `Cell<T>` / `UnsafeCell<T>` are the slot, not a nested RPython
+    // struct (`nestedscope.py CellFamily.ever_mutated`). Expanding the
+    // payload as `{field}.value` misses fielddescrof.
+    if tyref_is_unsafecell(ty, llbc) || tyref_is_std_cell(ty, llbc) {
+        return None;
+    }
+    let path = td.item_meta.name_path();
+    if path == "cell::Cell"
+        || path == "cell::UnsafeCell"
+        || path.ends_with("::UnsafeCell")
+        || path.ends_with("::cell::Cell")
+    {
+        return None;
+    }
     if !matches!(td.kind, TypeDeclKind::Struct(_)) {
         return None;
     }
@@ -6847,6 +6861,17 @@ pub(in crate::front::mir) fn transparent_scalar_value_type(
 pub(in crate::front::mir) fn tyref_is_unsafecell(ty: &TyRef, llbc: &Llbc) -> bool {
     adt_path_of_tyref(ty, llbc)
         .is_some_and(|p| p == "core::cell::UnsafeCell" || p.ends_with("::UnsafeCell"))
+}
+
+/// `core::cell::Cell<T>` (not `nestedscope::Cell`).
+pub(in crate::front::mir) fn tyref_is_std_cell(ty: &TyRef, llbc: &Llbc) -> bool {
+    adt_path_of_tyref(ty, llbc).is_some_and(|p| {
+        p == "core::cell::Cell"
+            || p == "std::cell::Cell"
+            || p == "crate::cell::Cell"
+            || p == "cell::Cell"
+            || p.ends_with("::cell::Cell")
+    })
 }
 
 /// `Arg<T>` from `rustpython_compiler_core::bytecode::instruction` —

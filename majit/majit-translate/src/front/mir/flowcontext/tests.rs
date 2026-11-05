@@ -6377,11 +6377,11 @@ fn w_module_dict_get_strategy_names_return_class_root() {
     }
 }
 
-/// `ExecutionContext::get_builtin` stores `builtin_dict_cache` with
+/// `ExecutionContext::clone_for_thread` stores `root_stack_slot` with
 /// `Cell::set`. That write is the field's `setfield`, not a residual
 /// `set` graph shared with `Cell<bool>::set`.
 #[test]
-fn executioncontext_get_builtin_cell_set_is_field_write() {
+fn executioncontext_clone_for_thread_cell_set_is_field_write() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     if !std::path::Path::new(path).is_file() {
         eprintln!("skipping: {path} is missing; run `python3 scripts/extract-llbc.py`");
@@ -6390,27 +6390,123 @@ fn executioncontext_get_builtin_cell_set_is_field_write() {
     let llbc = Llbc::load(path).expect("load interpreter LLBC");
     let graph = crate::front::mir::lower_function(
         &llbc,
-        "pyre_interpreter::executioncontext::<Impl>::get_builtin",
+        "pyre_interpreter::executioncontext::<Impl>::clone_for_thread",
     )
-    .expect("lower ExecutionContext::get_builtin");
-    let writes_cache = graph.blocks.iter().any(|block| {
+    .expect("lower ExecutionContext::clone_for_thread");
+    let writes_slot = graph.blocks.iter().any(|block| {
         block.operations.iter().any(|op| {
             matches!(
                 &op.kind,
-                OpKind::FieldWrite { field, .. } if field.name == "builtin_dict_cache"
+                OpKind::FieldWrite { field, .. } if field.name == "root_stack_slot"
             )
         })
     });
     assert!(
-        writes_cache,
-        "get_builtin must setfield builtin_dict_cache, ops={:?}",
+        writes_slot,
+        "clone_for_thread must setfield root_stack_slot, ops={:?}",
         graph_ops(&graph)
     );
     assert!(
         !calls_leaf(&graph, "set"),
-        "get_builtin must not residualize Cell::set, ops={:?}",
+        "clone_for_thread must not residualize Cell::set, ops={:?}",
         graph_call_leaves(&graph)
     );
+}
+
+/// `CellFamily::set_ever_mutated` writes `ever_mutated`, not the
+/// `UnsafeCell` payload name `ever_mutated.value` (`fielddescrof`).
+#[test]
+fn cellfamily_set_ever_mutated_writes_the_cell_field() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let llbc = Llbc::load(path).expect("load object LLBC");
+    let graph = crate::front::mir::lower_function(
+        &llbc,
+        "pyre_object::nestedscope::<Impl>::set_ever_mutated",
+    )
+    .expect("lower CellFamily::set_ever_mutated");
+    let writes = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. } if field.name == "ever_mutated"
+            )
+        })
+    });
+    assert!(
+        writes,
+        "set_ever_mutated must setfield ever_mutated, ops={:?}",
+        graph_ops(&graph)
+    );
+    let writes_inner = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. } if field.name.ends_with(".value")
+            )
+        })
+    });
+    assert!(
+        !writes_inner,
+        "Cell::set must not setfield *.value, ops={:?}",
+        graph_ops(&graph)
+    );
+}
+
+/// `descroperation::add` of two `PyObjectRef` is Python add, not
+/// `<*mut T>::add`. A residual leaf-`add` ptradd rewrite turns that
+/// arm into `cast_ptr_to_int` / `direct_ptradd` and `returnvar` unions
+/// Int with Result.
+#[test]
+fn binary_value_from_tag_inner_add_is_not_direct_ptradd() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let llbc = Llbc::load(path).expect("load interpreter LLBC");
+    let graph = crate::front::mir::lower_function(
+        &llbc,
+        "pyre_interpreter::opcode_ops::binary_value_from_tag_inner",
+    )
+    .expect("lower binary_value_from_tag_inner");
+    let calls_descrop = |leaf: &str| {
+        graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => {
+                    segments.last().map(String::as_str) == Some(leaf)
+                        && segments.iter().any(|s| s == "descroperation")
+                }
+                _ => false,
+            })
+        })
+    };
+    assert!(
+        calls_descrop("add") && calls_descrop("sub"),
+        "add/sub arms must stay descroperation, ops={:?}",
+        graph_call_leaves(&graph)
+    );
+    let has_direct_ptradd = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("direct_ptradd"),
+            _ => false,
+        })
+    });
+    assert!(
+        !has_direct_ptradd,
+        "Python add must not lower as direct_ptradd, ops={:?}",
+        graph_call_leaves(&graph)
+    );
+    crate::translator::rtyper::legacy_annotator::annotate(&graph);
 }
 
 /// `LiveIter::entry_at` is `entries_item_ptr(*self.entries).add(i)` then

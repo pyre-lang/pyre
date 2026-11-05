@@ -1782,6 +1782,13 @@ impl<'a> Lowering<'a> {
         );
         let bb_id = self.emit_bb(mir_bb);
         for leaf in leaves {
+            let cell_slot = leaf.field.name == "value"
+                && leaf.field.owner_root.as_deref().is_some_and(|owner| {
+                    owner == "cell::UnsafeCell"
+                        || owner.ends_with("::UnsafeCell")
+                        || owner == "cell::Cell"
+                        || owner.ends_with("::cell::Cell")
+                });
             let read = self.graph.alloc_value_var();
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(read.clone()),
@@ -1796,7 +1803,11 @@ impl<'a> Lowering<'a> {
                 result: None,
                 kind: OpKind::FieldWrite {
                     base: dest.clone(),
-                    field: container_leaf_descriptor(container_field, at_offset_zero, &leaf),
+                    field: if cell_slot {
+                        container_field.clone()
+                    } else {
+                        container_leaf_descriptor(container_field, at_offset_zero, &leaf)
+                    },
                     value: LinkArg::Value(read),
                     ty: leaf.ty,
                 },
@@ -6266,43 +6277,26 @@ impl<'a> Lowering<'a> {
     }
 
     /// `<*mut T>::add` / `::sub`, including a Charon-instantiated
-    /// `{impl#N}` spelling, a residual leaf `add` on a raw pointer, and
-    /// `CallKind::Trait` `Add::add` / `Sub::sub` of a raw pointer.
-    fn ptr_add_or_sub_call(&self, reg: &RegularCall, first_arg_ty: Option<&TyRef>) -> bool {
-        let raw_ptr =
-            first_arg_ty.is_some_and(|ty| tyref_peel_one_raw_ptr_node(ty, self.llbc).is_some());
+    /// `{impl#N}` spelling (`is_core_ptr_add_path`). A residual leaf
+    /// `add` on a raw pointer is not enough: `descroperation::add` of
+    /// two `PyObjectRef` (`*mut PyObject`) is Python add, and rewriting
+    /// it as `direct_ptradd` merges Int ∪ Ref at `returnvar`.
+    fn ptr_add_or_sub_call(&self, reg: &RegularCall, _first_arg_ty: Option<&TyRef>) -> bool {
         match &reg.kind {
-            CallKind::Fun(FunId::Regular { id }) => {
-                let Some(fd) = self.llbc.fn_by_id(*id) else {
-                    return false;
-                };
+            CallKind::Fun(FunId::Regular { id }) => self.llbc.fn_by_id(*id).is_some_and(|fd| {
                 let path = fd.item_meta.name_path();
-                if is_core_ptr_add_path(path.as_str()) || is_core_ptr_sub_path(path.as_str()) {
-                    return true;
-                }
-                raw_ptr
-                    && path
-                        .rsplit("::")
-                        .next()
-                        .is_some_and(|leaf| leaf == "add" || leaf == "sub")
-            }
-            CallKind::Trait(v) => {
-                raw_ptr
-                    && trait_payload_path_and_method(v, self.llbc)
-                        .is_some_and(|(_, method)| method == "add" || method == "sub")
-            }
+                is_core_ptr_add_path(path.as_str()) || is_core_ptr_sub_path(path.as_str())
+            }),
             _ => false,
         }
     }
 
     pub(in crate::front::mir) fn ptr_offset_is_sub(&self, reg: &RegularCall) -> bool {
         match &reg.kind {
-            CallKind::Fun(FunId::Regular { id }) => self.llbc.fn_by_id(*id).is_some_and(|fd| {
-                let path = fd.item_meta.name_path();
-                is_core_ptr_sub_path(path.as_str()) || path.rsplit("::").next() == Some("sub")
-            }),
-            CallKind::Trait(v) => trait_payload_path_and_method(v, self.llbc)
-                .is_some_and(|(_, method)| method == "sub"),
+            CallKind::Fun(FunId::Regular { id }) => self
+                .llbc
+                .fn_by_id(*id)
+                .is_some_and(|fd| is_core_ptr_sub_path(fd.item_meta.name_path().as_str())),
             _ => false,
         }
     }
