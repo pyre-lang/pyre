@@ -1930,7 +1930,6 @@ fn carrier_py_frame_depth(carrier: &majit_metainterp::BridgeInlineCarrier) -> us
         .count()
 }
 
-
 /// Walk a helper-innermost carrier recipe from the failed guard.
 ///
 /// `setup_reconstructed_callee_frame` needs a Python `code_ptr`; a

@@ -25,12 +25,12 @@ use crate::front::mir::tests::{
     mut_ref_value_field, mut_u8_ty_json, named_adt, option_adt_node, option_adt_node_from_types,
     option_enum, option_int_arg, option_shared_ref, range_contains_fixture, result_adt_node,
     result_enum, span_json, struct_decl, trait_clone_call_fixture, trait_clone_kind_payload,
-    transparent_layout, type_decl_alias, type_decl_meta, type_decl_struct, tyref_to_attr_value_type,
-    unit_fn_ptr, usize_ty, vec_decl_json, vec_of, vec_type_decls, vec_usize_ty_json,
-    window_const_slice_ptr, window_const_u8_ptr, window_empty_generics, window_graph_ops,
-    window_llbc, window_llbc_with_globals, window_local, window_meta, window_mut_slice,
-    window_opaque_fun, window_place, window_shared_slice, window_slice, window_span,
-    window_unwind_and_return_blocks, window_usize,
+    transparent_layout, type_decl_alias, type_decl_meta, type_decl_struct,
+    tyref_to_attr_value_type, unit_fn_ptr, usize_ty, vec_decl_json, vec_of, vec_type_decls,
+    vec_usize_ty_json, window_const_slice_ptr, window_const_u8_ptr, window_empty_generics,
+    window_graph_ops, window_llbc, window_llbc_with_globals, window_local, window_meta,
+    window_mut_slice, window_opaque_fun, window_place, window_shared_slice, window_slice,
+    window_span, window_unwind_and_return_blocks, window_usize,
 };
 
 #[test]
