@@ -1159,6 +1159,16 @@ pub(crate) fn cached_type_error() -> Option<PyObjectRef> {
     if cls.is_null() { None } else { Some(cls) }
 }
 
+/// `OperationError.match(space, space.w_TypeError)` — subclasses included.
+/// Bootstrap falls back to the kind tag before `w_TypeError` is installed.
+pub(crate) fn type_error_matched(err: &mut crate::PyError) -> bool {
+    if let Some(w_type_error) = cached_type_error() {
+        err.match_(pyre_object::PY_NULL, w_type_error)
+    } else {
+        err.kind == crate::PyErrorKind::TypeError
+    }
+}
+
 /// `space.w_AttributeError`, set the same way as [`cached_base_exception`].
 pub(crate) fn cached_attribute_error() -> Option<PyObjectRef> {
     let cls = object_space().w_attribute_error();
@@ -3925,24 +3935,31 @@ pub(crate) fn sequence_count(w_container: PyObjectRef, mut w_item: PyObjectRef) 
 /// `w_item` (`w is w_item or w == w_item`), scanning `w_container` through the
 /// iterator protocol.
 pub(crate) fn sequence_contains(
-    mut w_container: PyObjectRef,
-    mut w_item: PyObjectRef,
+    w_container: PyObjectRef,
+    w_item: PyObjectRef,
 ) -> Result<bool, PyError> {
-    let w_iter = match pyre_object::with_roots!(w_container, w_item => iter(w_container)) {
-        Ok(w_iter) => w_iter,
-        // CPython 3.14 `PySequence_Contains` replaces an iterator-acquisition
-        // TypeError (including one raised by user `__iter__`) with its
-        // membership-specific diagnostic.  Other exceptions propagate.
-        Err(err) if err.kind == PyErrorKind::TypeError => {
-            return Err(not_container_or_iterable_error(w_container));
-        }
-        Err(err) => return Err(err),
-    };
-    // `next`/`eq_w` re-enter Python and may collect; a raw local is not a root,
-    // so the iterator and needle live on the shadow stack.
+    // `next`/`eq_w` re-enter Python and may collect; pin the container for
+    // the GetIter TypeError rewrite and the needle for the scan.
     let _roots = pyre_object::gc_roots::push_roots();
-    let pair = pyre_object::gc_roots::pin_roots(&[w_iter, w_item]);
-    let iter_slot = pair;
+    let pair = pyre_object::gc_roots::pin_roots(&[w_container, w_item]);
+    let w_iter = match iter(pyre_object::gc_roots::shadow_stack_get(pair)) {
+        Ok(w_iter) => w_iter,
+        // [3.15-spec] `_PySequence_IterSearch` rewrites GetIter TypeError
+        // (`PyErr_ExceptionMatches(PyExc_TypeError)`, subclasses included)
+        // to the membership diagnostic. PyPy `sequence_contains` lets
+        // `space.iter` propagate. `contains_jitdriver` is the scan loop
+        // after a successful GetIter.
+        Err(mut err) => {
+            if type_error_matched(&mut err) {
+                return Err(not_container_or_iterable_error(
+                    pyre_object::gc_roots::shadow_stack_get(pair),
+                ));
+            }
+            return Err(err);
+        }
+    };
+    let iter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_iter);
     let item_slot = pair + 1;
     loop {
         match next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
@@ -5918,6 +5935,12 @@ fn copied_byte_vec(data: &[u8]) -> Vec<u8> {
 /// raw bytes: a buffer (bytes/bytearray/array/memoryview) yields its bytes,
 /// otherwise an iterable of ints is range-checked element-wise.  A `str` or
 /// non-iterable source is rejected.
+///
+/// [3.15-spec] `bytearray_setslice` does not consult `__bytes__`.
+/// `HasBytes()` raises `TypeError: cannot convert 'HasBytes' object to
+/// bytearray`; an `int` or `str` raises `can assign only bytes, buffers, or
+/// iterables of ints in range(0, 256)`. PyPy `makebytesdata_w` uses
+/// `__bytes__`. Measured on python3.15t.
 unsafe fn bytearray_assign_source(value: PyObjectRef) -> Result<Vec<u8>, PyError> {
     let mut value = value;
     if let Some(src) = crate::typedef::buffer_as_bytes_like(value)? {
@@ -17750,29 +17773,25 @@ pub(crate) fn drain_collect_items(items: PyObjectRef) -> Vec<PyObjectRef> {
         .collect()
 }
 
-/// `ObjSpace.length_hint`: `e.match(space, space.w_TypeError)`.
-/// AttributeError stays the kind tag so a user subclass is not absorbed.
+/// [3.15-spec] `PyObject_LengthHint` clears only TypeError
+/// (`_PyErr_ExceptionMatches(PyExc_TypeError)` on `PyObject_Length` and on
+/// the `__length_hint__` call). PyPy `ObjSpace.length_hint` also matches
+/// AttributeError. A user `AttributeError` from `__len__` or
+/// `__length_hint__` propagates; a missing `__length_hint__` still returns
+/// `default`.
 fn length_hint_absorbed(err: &mut crate::PyError) -> bool {
-    if let Some(w_type_error) = cached_type_error() {
-        if err.match_(pyre_object::PY_NULL, w_type_error) {
-            return true;
-        }
-    } else if err.kind == crate::PyErrorKind::TypeError {
-        return true;
-    }
-    err.kind == crate::PyErrorKind::AttributeError
+    type_error_matched(err)
 }
 
 /// pypy/interpreter/baseobjspace.py `length_hint`.
 ///
 /// Returns the length of an object, consulting its `__length_hint__`
-/// method if necessary.  Errors mirror the upstream contract:
+/// method if necessary.  Errors mirror the 3.15 contract:
 /// `len_w`'s TypeError (subclasses included via `OperationError.match`)
-/// and an exact AttributeError kind are absorbed; an `__length_hint__`
-/// that raises those same errors returns `default`; a NotImplemented
-/// return also yields `default`; a negative return raises ValueError
-/// "__length_hint__() should return >= 0"; any other exception
-/// propagates.
+/// is absorbed; an `__length_hint__` that raises TypeError returns
+/// `default`; a NotImplemented return also yields `default`; a negative
+/// return raises ValueError "__length_hint__() should return >= 0"; any
+/// other exception, including AttributeError, propagates.
 pub fn length_hint(mut w_obj: PyObjectRef, default: i64) -> Result<i64, crate::PyError> {
     // baseobjspace.py `length_hint`: `w_obj` is a livevar across `len_w`,
     // `lookup('__length_hint__')`, and `get_and_call_function`. RPython
@@ -17818,6 +17837,7 @@ pub fn length_hint(mut w_obj: PyObjectRef, default: i64) -> Result<i64, crate::P
         Some(descr) => {
             let descr_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(descr);
+            w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let w_type = crate::typedef::r#type(w_obj).map_or(std::ptr::null_mut(), |p| p.as_ptr());
             unsafe {
                 get_and_call_function(
@@ -18065,14 +18085,13 @@ pub fn float_w(mut obj: PyObjectRef) -> Result<f64, PyError> {
         if pyre_object::is_float(obj) {
             return Ok(pyre_object::w_float_get_value(obj));
         }
-        // The integer fast paths read the payload, which is the answer only
-        // when the operand's Python class is the builtin itself: a strict
-        // subclass may override `__float__`, and the layout predicates read
-        // `ob_type`, which the subclass shares.  A subclass falls through to
-        // the lookup below, where an inherited `int.__float__` reproduces the
-        // same payload.  The `float` arm above is deliberately not gated: the
-        // conversion short-circuits on the float layout and never consults an
-        // override.
+        // [3.15-spec] `W_IntObject.float_w` returns `float(self.intval)` for
+        // an int subclass and ignores an override. `PyNumber_Float` looks
+        // up `__float__`. Measured: `complex(I(10))`, `struct.pack("d", I(10))`,
+        // `array("d", [I(10)])` on python3.15t follow the override; pypy3
+        // uses the payload. `float_w` has no `@jit.*` / `_immutable_*` on
+        // the method. The `float` arm above stays ungated: the conversion
+        // short-circuits on the float layout.
         if pyre_object::is_exact_builtin_instance(obj) {
             // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
             if pyre_object::pyobject::is_bool(obj) {

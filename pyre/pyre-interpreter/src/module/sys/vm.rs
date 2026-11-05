@@ -3176,10 +3176,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // print-non-integral-and-exit-1) is the launcher's job
     // (`app_main.py handle_sys_exit`).
     //
-    // [3.14-spec] `app.py exit(exitcode=None)` also accepts the argument by
+    // [3.15-spec] `app.py exit(exitcode=None)` also accepts the argument by
     // keyword; `sysmodule.c` declares `sys.exit` with `status: object = None`
-    // followed by `/`, so `sys.exit(exitcode=1)` is a TypeError. Evidence is
-    // the clinic input in `Python/sysmodule.c` at v3.14.6.
+    // followed by `/`, so `sys.exit(code=0)` is TypeError
+    // "sys.exit() takes no keyword arguments". Evidence: clinic input in
+    // `sysmodule.c` at v3.15.0, measured on python3.15t.
     module_ns_store(
         roots.get(ns_slot),
         "exit",
