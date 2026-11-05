@@ -988,7 +988,15 @@ fn integer_bits_for_ptr_cast(value: &ConstValue) -> Result<i64, CastWhateverErro
         ConstValue::Bool(true) => Ok(1),
         ConstValue::Int128(n) => Ok(*n as i64),
         ConstValue::UInt128(n) => Ok(*n as i64),
-        ConstValue::RInt(c, v, _) => Ok(rarithmetic::rint_value(*c, *v).as_i64()),
+        ConstValue::Long(_) => Err(CastWhateverError::TypeError(format!(
+            "casting {value:?} to pointer"
+        ))),
+        ConstValue::RInt(c, v, _) => match v {
+            rarithmetic::RIntPayload::Small(_) => Ok(rarithmetic::rint_value(*c, v).as_i64()),
+            rarithmetic::RIntPayload::Big(_) => Err(CastWhateverError::TypeError(format!(
+                "casting {value:?} to pointer"
+            ))),
+        },
         ConstValue::LLPtr(p) if !p.nonzero() => Ok(0),
         _ => Err(CastWhateverError::TypeError(format!(
             "casting {value:?} to pointer"

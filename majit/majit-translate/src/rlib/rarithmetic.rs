@@ -7,6 +7,8 @@
 //! ports come online.
 
 use indexmap::IndexMap;
+use malachite_bigint::BigInt;
+use num_traits::ToPrimitive;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fmt;
@@ -15,6 +17,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::annotator::model::{KnownType, RIntClass};
 use crate::flowspace::model::{ConstValue, HostObject};
+
+/// `MASK = (2 ** bits) - 1` (`build_int`).
+pub fn mask_bigint(bits: u16) -> BigInt {
+    if bits == 0 {
+        BigInt::from(0)
+    } else {
+        (BigInt::from(1) << bits) - 1
+    }
+}
 
 /// RPython `LONG_BIT` (`rarithmetic.py`): the width of `lltype.Signed` in bits.
 pub fn long_bit() -> u16 {
@@ -102,16 +113,9 @@ fn intern_name(name: &str) -> &'static str {
 }
 
 /// `MASK = (2 ** bits) - 1` as a host integer constant (`build_int`).
-/// Same width rule as `RIntClass::mask`; the carrier follows the value.
+/// Narrowest carrier: Int, UInt, Int128, UInt128, Long.
 fn mask_const(bits: u16) -> ConstValue {
-    let mask = mask_u128(bits);
-    if let Ok(n) = i64::try_from(mask) {
-        ConstValue::Int(n)
-    } else if let Ok(n) = u64::try_from(mask) {
-        ConstValue::UInt(n)
-    } else {
-        ConstValue::UInt128(mask)
-    }
+    ConstValue::host_int_from_bigint(mask_bigint(bits))
 }
 
 /// `type(name, (base_int_type,), {'MASK', 'BITS', 'SIGN'})` in `build_int`.
@@ -223,16 +227,9 @@ fn no_predefined_int(sign: bool, bits: u16) -> String {
 }
 
 /// `type(name, ...)` in `build_int`, after `_inttypes` lookup and the
-/// `name is None` TypeError. The 128-bit carrier limit is ours; it
-/// sits here so a missing predefined type still reports
-/// `TypeError: No predefined [u]intN`.
+/// `name is None` TypeError.
 fn create_int_type_checked(name: Option<&str>, sign: bool, bits: u16) -> Result<KnownType, String> {
     let name = name.ok_or_else(|| no_predefined_int(sign, bits))?;
-    if bits > 128 {
-        return Err(format!(
-            "build_int: {bits}-bit integers exceed the 128-bit value carrier"
-        ));
-    }
     Ok(create_int_type(name, sign, bits))
 }
 
@@ -284,18 +281,54 @@ pub fn signed_int_overflow_message(value: impl fmt::Display, bits: u16) -> Strin
     format!("{value} does not fit in signed {bits}-bit integer")
 }
 
+/// Stored value of a `build_int` instance. Classes up to 128 bits keep
+/// the bit pattern in an `i128` (unsigned 128-bit values wrap, read back
+/// through `rint_value`); wider classes store the Python long.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum RIntPayload {
+    Small(i128),
+    Big(BigInt),
+}
+
+impl RIntPayload {
+    /// i128 bit pattern when `class.bits <= 128`.
+    pub fn small_or_unreachable(&self) -> i128 {
+        match self {
+            Self::Small(n) => *n,
+            Self::Big(_) => {
+                unreachable!("wider than 128 bits never reaches the rtyper")
+            }
+        }
+    }
+}
+
+pub(crate) fn rint_payload_from_normalized(class: RIntClass, value: BigInt) -> RIntPayload {
+    if class.bits <= 128 {
+        let n = if let Ok(i) = i128::try_from(&value) {
+            i
+        } else if let Ok(u) = u128::try_from(&value) {
+            u as i128
+        } else {
+            unreachable!("normalized value of bits<=128 fits i128/u128")
+        };
+        RIntPayload::Small(n)
+    } else {
+        RIntPayload::Big(value)
+    }
+}
+
 /// Normalize `val` the way `signed_int.__new__` / `unsigned_int.__new__`
 /// do, without wrapping a Python instance.
-pub fn rint_normalize(class: RIntClass, value: i128) -> Result<i128, String> {
+pub fn rint_normalize(class: RIntClass, value: BigInt) -> Result<BigInt, String> {
     if class.sign {
-        let max = (class.mask() >> 1) as i128;
-        let min = -max - 1;
+        let max: BigInt = class.mask() >> 1;
+        let min: BigInt = -max.clone() - 1;
         if value > max || value < min {
-            return Err(signed_int_overflow_message(value, class.bits));
+            return Err(signed_int_overflow_message(&value, class.bits));
         }
         Ok(value)
     } else {
-        Ok((value as u128 & class.mask()) as i128)
+        Ok(value & class.mask())
     }
 }
 
@@ -306,8 +339,11 @@ pub fn rint_normalize(class: RIntClass, value: i128) -> Result<i128, String> {
 /// OverflowError payload; callers that stringify the exception add
 /// the `OverflowError: ` prefix themselves. Each `Ok` is a fresh
 /// `ConstValue::RInt` instance.
-pub fn rint_new(class: RIntClass, value: i128) -> Result<ConstValue, String> {
-    Ok(ConstValue::rint(class, rint_normalize(class, value)?))
+pub fn rint_new(class: RIntClass, value: impl Into<BigInt>) -> Result<ConstValue, String> {
+    Ok(ConstValue::rint(
+        class,
+        rint_normalize(class, value.into())?,
+    ))
 }
 
 /// Stored Number i128 interpreted by `class.sign`.
@@ -315,92 +351,145 @@ pub fn rint_new(class: RIntClass, value: i128) -> Result<ConstValue, String> {
 /// Unsigned classes store the bit pattern (`unsigned_int.__new__` masks
 /// into a non-negative integer; `u128::MAX` is `-1i128`). Every numeric
 /// reader goes through [`rint_value`] rather than treating the i128 as signed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Wider classes (`bits > 128`) use the `*Big` variants.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RIntValue {
     Signed(i128),
     Unsigned(u128),
+    SignedBig(BigInt),
+    UnsignedBig(BigInt),
 }
 
 impl RIntValue {
-    pub fn as_u128(self) -> u128 {
+    pub fn as_u128(&self) -> u128 {
         match self {
-            Self::Signed(n) => n as u128,
-            Self::Unsigned(n) => n,
+            Self::Signed(n) => *n as u128,
+            Self::Unsigned(n) => *n,
+            Self::SignedBig(n) | Self::UnsignedBig(n) => bigint_low_u128(n),
         }
     }
 
-    pub fn as_f64(self) -> f64 {
+    pub fn as_f64(&self) -> f64 {
         match self {
-            Self::Signed(n) => n as f64,
-            Self::Unsigned(n) => n as f64,
+            Self::Signed(n) => *n as f64,
+            Self::Unsigned(n) => *n as f64,
+            Self::SignedBig(n) | Self::UnsignedBig(n) => bigint_as_f64(n),
         }
     }
 
-    pub fn as_i64(self) -> i64 {
+    pub fn as_i64(&self) -> i64 {
         match self {
-            Self::Signed(n) => n as i64,
-            Self::Unsigned(n) => n as i64,
+            Self::Signed(n) => *n as i64,
+            Self::Unsigned(n) => *n as i64,
+            Self::SignedBig(_) | Self::UnsignedBig(_) => self.as_u128() as i64,
         }
     }
 
-    pub fn as_i128(self) -> Option<i128> {
+    pub fn as_i128(&self) -> Option<i128> {
         match self {
-            Self::Signed(n) => Some(n),
-            Self::Unsigned(n) => i128::try_from(n).ok(),
+            Self::Signed(n) => Some(*n),
+            Self::Unsigned(n) => i128::try_from(*n).ok(),
+            Self::SignedBig(n) | Self::UnsignedBig(n) => i128::try_from(n).ok(),
         }
     }
 
-    pub fn is_zero(self) -> bool {
+    pub fn is_zero(&self) -> bool {
         match self {
-            Self::Signed(n) => n == 0,
-            Self::Unsigned(n) => n == 0,
+            Self::Signed(n) => *n == 0,
+            Self::Unsigned(n) => *n == 0,
+            Self::SignedBig(n) | Self::UnsignedBig(n) => *n == BigInt::from(0),
         }
     }
 
-    pub fn is_negative(self) -> bool {
-        matches!(self, Self::Signed(n) if n < 0)
+    pub fn is_negative(&self) -> bool {
+        match self {
+            Self::Signed(n) => *n < 0,
+            Self::Unsigned(_) | Self::UnsignedBig(_) => false,
+            Self::SignedBig(n) => *n < BigInt::from(0),
+        }
+    }
+
+    pub fn to_bigint(&self) -> BigInt {
+        match self {
+            Self::Signed(n) => BigInt::from(*n),
+            Self::Unsigned(n) => BigInt::from(*n),
+            Self::SignedBig(n) | Self::UnsignedBig(n) => n.clone(),
+        }
     }
 
     /// Numeric ordering of `base_int` / `int` / `long` values.
-    pub fn cmp_numeric(self, other: Self) -> std::cmp::Ordering {
+    pub fn cmp_numeric(&self, other: &Self) -> std::cmp::Ordering {
         match (self, other) {
-            (Self::Signed(a), Self::Signed(b)) => a.cmp(&b),
-            (Self::Unsigned(a), Self::Unsigned(b)) => a.cmp(&b),
+            (Self::Signed(a), Self::Signed(b)) => a.cmp(b),
+            (Self::Unsigned(a), Self::Unsigned(b)) => a.cmp(b),
             (Self::Signed(a), Self::Unsigned(b)) => {
-                if a < 0 {
+                if *a < 0 {
                     std::cmp::Ordering::Less
                 } else {
-                    (a as u128).cmp(&b)
+                    (*a as u128).cmp(b)
                 }
             }
             (Self::Unsigned(a), Self::Signed(b)) => {
-                if b < 0 {
+                if *b < 0 {
                     std::cmp::Ordering::Greater
                 } else {
-                    a.cmp(&(b as u128))
+                    a.cmp(&(*b as u128))
                 }
             }
+            (a, b) => a.to_bigint().cmp(&b.to_bigint()),
         }
     }
 }
 
 impl fmt::Display for RIntValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
+        match self {
             Self::Signed(n) => write!(f, "{n}"),
             Self::Unsigned(n) => write!(f, "{n}"),
+            Self::SignedBig(n) | Self::UnsignedBig(n) => write!(f, "{n}"),
         }
     }
 }
 
-/// Interpret a stored Number i128 by `class.sign`.
+/// Low 128 bits of the two's-complement value (`n & MASK` for 128-bit MASK).
+fn bigint_low_u128(n: &BigInt) -> u128 {
+    u128::try_from(&(n & mask_bigint(128)))
+        .unwrap_or_else(|_| unreachable!("mask_bigint(128) is in 0..=u128::MAX"))
+}
+
+/// `ToPrimitive::to_f64` (Nearest); None beyond f64 range stays ±inf for `as_f64`.
+fn bigint_as_f64(n: &BigInt) -> f64 {
+    match n.to_f64() {
+        Some(f) => f,
+        None => {
+            if n < &BigInt::from(0) {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            }
+        }
+    }
+}
+
+/// Interpret a stored payload by `class.sign`.
 ///
-/// Unsigned stores the bit pattern (`u128::MAX` is `-1i128`).
-pub fn rint_value(class: RIntClass, v: i128) -> RIntValue {
-    if class.sign {
-        RIntValue::Signed(v)
-    } else {
-        RIntValue::Unsigned(v as u128)
+/// Unsigned `Small` stores the bit pattern (`u128::MAX` is `-1i128`).
+pub fn rint_value(class: RIntClass, payload: &RIntPayload) -> RIntValue {
+    match payload {
+        RIntPayload::Small(v) => {
+            if class.sign {
+                RIntValue::Signed(*v)
+            } else {
+                RIntValue::Unsigned(*v as u128)
+            }
+        }
+        RIntPayload::Big(v) => {
+            if class.sign {
+                RIntValue::SignedBig(v.clone())
+            } else {
+                RIntValue::UnsignedBig(v.clone())
+            }
+        }
     }
 }
 
@@ -508,44 +597,32 @@ pub fn compute_restype(self_type: KnownType, other_type: KnownType) -> KnownType
 pub fn construct_int_type(restype: KnownType, value: RIntValue) -> Option<ConstValue> {
     match restype {
         KnownType::Float => Some(ConstValue::float(value.as_f64())),
-        KnownType::Int => i64::try_from(value.as_i128()?).ok().map(ConstValue::Int),
+        KnownType::Int => i64::try_from(&value.to_bigint()).ok().map(ConstValue::Int),
         KnownType::Bool => Some(ConstValue::Bool(!value.is_zero())),
-        KnownType::RInt(c) => {
-            let n = if c.sign {
-                value.as_i128()?
-            } else {
-                value.as_u128() as i128
-            };
-            rint_new(c, n).ok()
-        }
+        KnownType::RInt(c) => rint_new(c, value.to_bigint()).ok(),
         KnownType::Rint | KnownType::LongLong => {
-            let n = value.as_i128()?;
+            let v = value.to_bigint();
             let bits = integer_signed_and_bits(restype)?.1;
-            let max = (mask_u128(bits) >> 1) as i128;
-            let min = -max - 1;
-            if n > max || n < min {
+            let max: BigInt = mask_bigint(bits) >> 1;
+            let min: BigInt = -max.clone() - 1;
+            if v > max || v < min {
                 return None;
             }
-            i64::try_from(n).ok().map(ConstValue::Int)
+            i64::try_from(&v).ok().map(ConstValue::Int)
         }
         KnownType::Ruint | KnownType::ULongLong => {
             let bits = integer_signed_and_bits(restype)?.1;
-            let masked = value.as_u128() & mask_u128(bits);
-            u64::try_from(masked).ok().map(ConstValue::UInt)
+            let masked = value.to_bigint() & mask_bigint(bits);
+            u64::try_from(&masked).ok().map(ConstValue::UInt)
         }
-        KnownType::LongLongLong => value.as_i128().map(ConstValue::Int128),
-        KnownType::ULongLongLong => Some(ConstValue::UInt128(value.as_u128())),
+        KnownType::LongLongLong => i128::try_from(&value.to_bigint())
+            .ok()
+            .map(ConstValue::Int128),
+        KnownType::ULongLongLong => {
+            let masked = value.to_bigint() & mask_bigint(128);
+            u128::try_from(&masked).ok().map(ConstValue::UInt128)
+        }
         _ => None,
-    }
-}
-
-fn mask_u128(bits: u16) -> u128 {
-    if bits == 0 {
-        0
-    } else if bits >= 128 {
-        u128::MAX
-    } else {
-        (1u128 << bits) - 1
     }
 }
 
@@ -779,17 +856,32 @@ mod tests {
         assert_eq!(rint_new(uchar, 256), Ok(ConstValue::rint(uchar, 0)));
         let err = rint_new(schar, 128).expect_err("signed overflow");
         assert_eq!(err, "128 does not fit in signed 8-bit integer");
-        assert_eq!(rint_value(uchar, 255), RIntValue::Unsigned(255));
-        assert_eq!(rint_value(schar, -1), RIntValue::Signed(-1));
+        assert_eq!(
+            rint_value(uchar, &RIntPayload::Small(255)),
+            RIntValue::Unsigned(255)
+        );
+        assert_eq!(
+            rint_value(schar, &RIntPayload::Small(-1)),
+            RIntValue::Signed(-1)
+        );
         let u128_forced = match build_int(Some("r_u128_forced"), false, 128, true)
             .unwrap_or_else(|e| panic!("{e}"))
         {
             KnownType::RInt(c) => c,
             other => panic!("expected RInt, got {other:?}"),
         };
-        assert_eq!(rint_value(u128_forced, -1), RIntValue::Unsigned(u128::MAX));
-        assert_eq!(rint_value(u128_forced, -1).as_u128(), u128::MAX);
-        assert_eq!(rint_value(u128_forced, -1).as_f64(), u128::MAX as f64);
+        assert_eq!(
+            rint_value(u128_forced, &RIntPayload::Small(-1)),
+            RIntValue::Unsigned(u128::MAX)
+        );
+        assert_eq!(
+            rint_value(u128_forced, &RIntPayload::Small(-1)).as_u128(),
+            u128::MAX
+        );
+        assert_eq!(
+            rint_value(u128_forced, &RIntPayload::Small(-1)).as_f64(),
+            u128::MAX as f64
+        );
     }
 
     #[test]
@@ -918,19 +1010,116 @@ mod tests {
     }
 
     #[test]
-    fn build_int_rejects_width_above_128() {
+    fn build_int_wider_than_128_bits() {
         let err = build_int(None, false, 256, false).expect_err("no predefined uint256");
         assert_eq!(err, "TypeError: No predefined uint256");
-        let err = build_int(Some("r_too_wide"), true, 129, false).expect_err("129 bits");
+
+        let a = build_int(Some("r_int256"), true, 256, false).unwrap();
+        let b = build_int(Some("r_int256"), true, 256, false).unwrap();
+        let KnownType::RInt(c_signed) = a else {
+            panic!("expected KnownType::RInt, got {a:?}");
+        };
+        let KnownType::RInt(c_signed_again) = b else {
+            panic!("expected KnownType::RInt, got {b:?}");
+        };
+        assert_eq!(c_signed.bits, 256);
+        assert!(c_signed.sign);
+        assert_eq!(c_signed.id, c_signed_again.id);
+
+        let u = build_int(Some("r_uint256"), false, 256, true).unwrap();
+        let KnownType::RInt(c_unsigned) = u else {
+            panic!("expected KnownType::RInt, got {u:?}");
+        };
+        assert!(!c_unsigned.sign);
+        assert_eq!(c_unsigned.bits, 256);
+        let mask256: BigInt = (BigInt::from(1) << 256) - 1;
         assert_eq!(
-            err,
-            "build_int: 129-bit integers exceed the 128-bit value carrier"
+            rint_class_object(c_unsigned).class_get("MASK"),
+            Some(ConstValue::Long(mask256.clone()))
         );
-        let err = build_int(Some("r_too_wide"), false, 256, true).expect_err("256 bits forced");
         assert_eq!(
-            err,
-            "build_int: 256-bit integers exceed the 128-bit value carrier"
+            rint_class_object(c_unsigned).class_get("BITS"),
+            Some(ConstValue::Int(256))
         );
+        assert_eq!(c_unsigned.mask(), mask256);
+        let c129 = match build_int(Some("r_u129_forced"), false, 129, true)
+            .unwrap_or_else(|e| panic!("{e}"))
+        {
+            KnownType::RInt(c) => c,
+            other => panic!("expected RInt, got {other:?}"),
+        };
+        assert_eq!(c129.mask(), (BigInt::from(1) << 129) - 1);
+    }
+
+    #[test]
+    fn rint_new_unsigned_256_wraps_and_signed_256_overflows() {
+        let u256 = match build_int(Some("r_uint256_new"), false, 256, true)
+            .unwrap_or_else(|e| panic!("{e}"))
+        {
+            KnownType::RInt(c) => c,
+            other => panic!("expected RInt, got {other:?}"),
+        };
+        let mask = mask_bigint(256);
+        assert_eq!(rint_new(u256, -1), Ok(ConstValue::rint(u256, mask.clone())));
+        assert_eq!(
+            rint_new(u256, mask.clone() + 1),
+            Ok(ConstValue::rint(u256, BigInt::from(0)))
+        );
+        assert_eq!(
+            rint_new(u256, 1),
+            Ok(ConstValue::rint(u256, BigInt::from(1)))
+        );
+
+        let s256 = match build_int(Some("r_int256_new"), true, 256, true)
+            .unwrap_or_else(|e| panic!("{e}"))
+        {
+            KnownType::RInt(c) => c,
+            other => panic!("expected RInt, got {other:?}"),
+        };
+        let two_255: BigInt = BigInt::from(1) << 255;
+        let err = rint_new(s256, two_255.clone()).expect_err("signed overflow");
+        assert_eq!(err, signed_int_overflow_message(&two_255, 256));
+        let too_low: BigInt = -two_255.clone() - 1;
+        let err = rint_new(s256, too_low.clone()).expect_err("signed underflow");
+        assert_eq!(err, signed_int_overflow_message(&too_low, 256));
+        assert!(rint_new(s256, two_255.clone() - 1).is_ok());
+        assert!(rint_new(s256, -two_255.clone()).is_ok());
+
+        let a = rint_new(u256, 1).expect("r_uint256(1)");
+        let b = rint_new(u256, 1).expect("r_uint256(1)");
+        assert_eq!(a, b);
+        assert!(!a.object_is(&b));
+    }
+
+    #[test]
+    fn mask_bigint_and_python_and_on_negative() {
+        assert_eq!(mask_bigint(8), BigInt::from(255));
+        assert_eq!(mask_bigint(0), BigInt::from(0));
+        assert_eq!(mask_bigint(256), (BigInt::from(1) << 256) - 1);
+        assert_eq!(BigInt::from(-1) & mask_bigint(8), BigInt::from(255));
+        assert_eq!(BigInt::from(-1) & mask_bigint(256), mask_bigint(256));
+        let max8: BigInt = mask_bigint(8) >> 1;
+        let min8 = -max8.clone() - 1;
+        assert_eq!(min8, BigInt::from(-128));
+        assert_eq!(max8, BigInt::from(127));
+    }
+
+    #[test]
+    fn rint_value_big_as_u128_as_i64_low_bits() {
+        let v = RIntValue::SignedBig((BigInt::from(1) << 200) + 5);
+        assert_eq!(v.as_u128(), 5);
+        assert_eq!(v.as_i64(), 5);
+        let neg1 = RIntValue::SignedBig(BigInt::from(-1));
+        assert_eq!(neg1.as_u128(), u128::MAX);
+        assert_eq!(neg1.as_i64(), -1);
+    }
+
+    #[test]
+    fn rint_value_big_as_f64_nearest_even() {
+        let v = RIntValue::SignedBig((BigInt::from(1) << 200) + 1);
+        assert_eq!(v.as_f64(), 2f64.powi(200));
+        let halfway = RIntValue::SignedBig((BigInt::from(1) << 53) + 1);
+        assert_eq!(halfway.as_f64(), 9007199254740992.0);
     }
 
     #[test]

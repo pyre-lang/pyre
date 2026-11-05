@@ -875,7 +875,7 @@ pub fn op_ullong_ge(args: &[ConstValue]) -> Option<ConstValue> {
 /// `opimpl.py` `get_primitive_op_src` `op_function` formats it with `%r`.
 fn constvalue_python_type_name(v: &ConstValue) -> &'static str {
     match v {
-        ConstValue::Int(_) | ConstValue::UInt(_) => "int",
+        ConstValue::Int(_) | ConstValue::UInt(_) | ConstValue::Long(_) => "int",
         ConstValue::Bool(_) => "bool",
         ConstValue::Int128(_) => "r_longlonglong",
         ConstValue::UInt128(_) => "r_ulonglonglong",

@@ -1656,7 +1656,7 @@ pub(crate) fn constvalue_kind(cv: &ConstValue) -> char {
         | ConstValue::InheritanceId { .. }
         | ConstValue::LLAddress(_)
         | ConstValue::AddressAsInt(_) => 'i',
-        ConstValue::Int128(_) | ConstValue::UInt128(_) => {
+        ConstValue::Int128(_) | ConstValue::UInt128(_) | ConstValue::Long(_) => {
             panic!("getkind: 128-bit integer constant is too large (history.py:62)")
         }
         // `history.py getkind`: SingleFloat is stored in an int when

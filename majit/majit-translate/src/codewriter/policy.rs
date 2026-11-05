@@ -462,7 +462,7 @@ fn link_arg_refused(
         LinkArg::Const(constant) => {
             if matches!(
                 constant.value,
-                ConstValue::Int128(_) | ConstValue::UInt128(_)
+                ConstValue::Int128(_) | ConstValue::UInt128(_) | ConstValue::Long(_)
             ) {
                 return true;
             }

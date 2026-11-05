@@ -40,6 +40,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use malachite_bigint::BigInt;
+
 use super::flowcontext::FlowingError;
 use super::model::{ConstValue, Constant, Hlvalue, SpaceOperation, Variable};
 
@@ -1632,7 +1634,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
 pub(crate) fn cmp_fold(a: &ConstValue, b: &ConstValue) -> Option<std::cmp::Ordering> {
     use ConstValue as C;
     if let (Some(x), Some(y)) = (integer_numeric(a), integer_numeric(b)) {
-        return Some(x.cmp_numeric(y));
+        return Some(x.cmp_numeric(&y));
     }
     match (a, b) {
         (C::Float(x), C::Float(y)) => f64::from_bits(*x).partial_cmp(&f64::from_bits(*y)),
@@ -1778,7 +1780,7 @@ fn numeric_i128(v: &ConstValue) -> Option<i128> {
 }
 
 /// Integer-valued constants: `Int`, `UInt`, `Int128`, `UInt128`, `Bool`,
-/// `RInt`. `rint_value` interprets the stored i128 by `class.sign`.
+/// `RInt`. `rint_value` interprets the stored payload by `class.sign`.
 fn integer_numeric(v: &ConstValue) -> Option<crate::rlib::rarithmetic::RIntValue> {
     use crate::rlib::rarithmetic::{RIntValue, rint_value};
     match v {
@@ -1787,7 +1789,7 @@ fn integer_numeric(v: &ConstValue) -> Option<crate::rlib::rarithmetic::RIntValue
         ConstValue::UInt(n) => Some(RIntValue::Unsigned(*n as u128)),
         ConstValue::UInt128(n) => Some(RIntValue::Unsigned(*n)),
         ConstValue::Bool(b) => Some(RIntValue::Signed(i128::from(*b))),
-        ConstValue::RInt(c, n, _) => Some(rint_value(*c, *n)),
+        ConstValue::RInt(c, n, _) => Some(rint_value(*c, n)),
         _ => None,
     }
 }
@@ -1812,7 +1814,10 @@ fn cmp_rint_float(n: crate::rlib::rarithmetic::RIntValue, f: f64) -> Option<std:
             Ok(v) => cmp_int_float_exact(v, f),
             Err(_) => cmp_i128_float_exact(i, f),
         },
-        None => cmp_u128_float_exact(n.as_u128(), f),
+        None => match n {
+            crate::rlib::rarithmetic::RIntValue::Unsigned(u) => cmp_u128_float_exact(u, f),
+            _ => None,
+        },
     }
 }
 
@@ -1853,13 +1858,13 @@ fn fold_rint_op(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
     use crate::rlib::rarithmetic::{_widen, construct_int_type};
     match (kind, args) {
         (OpKind::Neg, [a]) => {
-            construct_int_type(const_integer_type(a)?, rint_neg(integer_numeric(a)?)?)
+            construct_int_type(const_integer_type(a)?, rint_neg(integer_numeric(a)?))
         }
         (OpKind::Abs, [a]) => {
-            construct_int_type(const_integer_type(a)?, rint_abs(integer_numeric(a)?)?)
+            construct_int_type(const_integer_type(a)?, rint_abs(integer_numeric(a)?))
         }
         (OpKind::Invert, [a]) => {
-            construct_int_type(const_integer_type(a)?, rint_invert(integer_numeric(a)?)?)
+            construct_int_type(const_integer_type(a)?, rint_invert(integer_numeric(a)?))
         }
         (
             OpKind::Add
@@ -1879,9 +1884,9 @@ fn fold_rint_op(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
             let va = integer_numeric(a)?;
             let vb = integer_numeric(b)?;
             let result = match kind {
-                OpKind::Add => rint_add(va, vb)?,
-                OpKind::Sub => rint_add(va, rint_neg(vb)?)?,
-                OpKind::Mul => rint_mul(va, vb)?,
+                OpKind::Add => rint_add(va, vb),
+                OpKind::Sub => rint_sub(va, vb),
+                OpKind::Mul => rint_mul(va, vb),
                 OpKind::And => rint_bitop(va, vb, |x, y| x & y),
                 OpKind::Or => rint_bitop(va, vb, |x, y| x | y),
                 OpKind::Xor => rint_bitop(va, vb, |x, y| x ^ y),
@@ -1937,173 +1942,134 @@ fn const_as_float(v: &ConstValue) -> Option<f64> {
 
 fn fold_rint_shift(kind: OpKind, a: &ConstValue, b: &ConstValue) -> Option<ConstValue> {
     use crate::rlib::rarithmetic::{RIntValue, construct_int_type, integer_signed_and_bits};
+    // `HLOperation::constfold` never calls `pyfunc` with a `ConstValue::RInt`
+    // argument: a `build_int` instance is not `Constant.foldable()` (class
+    // module `rpython.rlib.rarithmetic`). `signed_int.__new__` OverflowError
+    // is not observable through constfold; `None` here is "no value".
     let va = integer_numeric(a)?;
-    let y = integer_numeric(b)?.as_i128()?;
-    if y < 0 {
+    let y = integer_numeric(b)?.to_bigint();
+    if y < BigInt::from(0) {
         return None;
     }
     let kt = const_integer_type(a)?;
     if va.is_zero() {
         return construct_int_type(kt, va);
     }
-    if y > i64::MAX as i128 {
-        return None;
-    }
-    if let Some((sign, bits)) = integer_signed_and_bits(kt)
-        && !sign
-    {
-        let x = va.as_u128();
-        let shifted = if kind == OpKind::LShift {
-            if y >= bits as i128 {
-                0
-            } else {
-                x.wrapping_shl(y as u32)
+    let (sign, bits) = integer_signed_and_bits(kt)?;
+    let x = va.to_bigint();
+    let result = if kind == OpKind::LShift {
+        if sign {
+            // `y >= bits + 1` ⇒ `x << y` overflows `signed_int.__new__`.
+            if y >= BigInt::from(u32::from(bits) + 1) {
+                return None;
             }
-        } else if y >= 128 {
-            0
+        } else if y >= BigInt::from(bits) {
+            // `unsigned_int.__new__` masks; `y >= bits` ⇒ `(x << y) & MASK == 0`.
+            return construct_int_type(kt, RIntValue::SignedBig(BigInt::from(0)));
+        }
+        let shift = u32::try_from(&y).unwrap_or_else(|_| unreachable!("y < bits+1 fits u32"));
+        x << shift
+    } else if y >= BigInt::from(u32::from(bits) + 1) {
+        // `y >= bits + 1` ⇒ `x >> y` is 0 or -1 by sign (`__new__` of that).
+        if x < BigInt::from(0) {
+            BigInt::from(-1)
         } else {
-            x >> (y as u32)
-        };
-        return construct_int_type(kt, RIntValue::Unsigned(shifted));
-    }
-    let x = va.as_i128()?;
-    let shifted = if kind == OpKind::LShift {
-        if y >= 127 {
-            return None;
+            BigInt::from(0)
         }
-        x.checked_shl(y as u32)?
-    } else if y >= 127 {
-        if x < 0 { -1 } else { 0 }
     } else {
-        x >> (y as u32)
+        let shift = u32::try_from(&y).unwrap_or_else(|_| unreachable!("y < bits+1 fits u32"));
+        x >> shift
     };
-    construct_int_type(kt, RIntValue::Signed(shifted))
+    construct_int_type(kt, RIntValue::SignedBig(result))
 }
 
-fn rint_neg(v: crate::rlib::rarithmetic::RIntValue) -> Option<crate::rlib::rarithmetic::RIntValue> {
-    use crate::rlib::rarithmetic::RIntValue::*;
-    match v {
-        Signed(n) => n.checked_neg().map(Signed),
-        Unsigned(0) => Some(Unsigned(0)),
-        Unsigned(n) => {
-            if n == 1u128 << 127 {
-                Some(Signed(i128::MIN))
-            } else {
-                i128::try_from(n).ok()?.checked_neg().map(Signed)
-            }
-        }
-    }
+fn rint_long(n: BigInt) -> crate::rlib::rarithmetic::RIntValue {
+    crate::rlib::rarithmetic::RIntValue::SignedBig(n)
 }
 
-fn rint_abs(v: crate::rlib::rarithmetic::RIntValue) -> Option<crate::rlib::rarithmetic::RIntValue> {
+fn rint_neg(v: crate::rlib::rarithmetic::RIntValue) -> crate::rlib::rarithmetic::RIntValue {
+    rint_long(-v.to_bigint())
+}
+
+fn rint_abs(v: crate::rlib::rarithmetic::RIntValue) -> crate::rlib::rarithmetic::RIntValue {
     if v.is_negative() {
         rint_neg(v)
     } else {
-        Some(v)
+        rint_long(v.to_bigint())
     }
 }
 
-fn rint_invert(
-    v: crate::rlib::rarithmetic::RIntValue,
-) -> Option<crate::rlib::rarithmetic::RIntValue> {
-    use crate::rlib::rarithmetic::RIntValue::*;
-    match v {
-        Signed(n) => Some(Signed(!n)),
-        Unsigned(n) => i128::try_from(n)
-            .ok()?
-            .checked_neg()?
-            .checked_sub(1)
-            .map(Signed),
-    }
+fn rint_invert(v: crate::rlib::rarithmetic::RIntValue) -> crate::rlib::rarithmetic::RIntValue {
+    rint_long(!v.to_bigint())
 }
 
 fn rint_add(
     a: crate::rlib::rarithmetic::RIntValue,
     b: crate::rlib::rarithmetic::RIntValue,
-) -> Option<crate::rlib::rarithmetic::RIntValue> {
-    use crate::rlib::rarithmetic::RIntValue::*;
-    match (a, b) {
-        (Signed(x), Signed(y)) => x.checked_add(y).map(Signed),
-        (Unsigned(x), Unsigned(y)) => x.checked_add(y).map(Unsigned),
-        (Signed(x), Unsigned(y)) | (Unsigned(y), Signed(x)) => {
-            if x >= 0 {
-                (x as u128).checked_add(y).map(Unsigned)
-            } else {
-                let mag = x.unsigned_abs();
-                if y >= mag {
-                    Some(Unsigned(y - mag))
-                } else {
-                    i128::try_from(mag - y).ok().map(|d| Signed(-d))
-                }
-            }
-        }
-    }
+) -> crate::rlib::rarithmetic::RIntValue {
+    rint_long(a.to_bigint() + b.to_bigint())
+}
+
+fn rint_sub(
+    a: crate::rlib::rarithmetic::RIntValue,
+    b: crate::rlib::rarithmetic::RIntValue,
+) -> crate::rlib::rarithmetic::RIntValue {
+    rint_long(a.to_bigint() - b.to_bigint())
 }
 
 fn rint_mul(
     a: crate::rlib::rarithmetic::RIntValue,
     b: crate::rlib::rarithmetic::RIntValue,
-) -> Option<crate::rlib::rarithmetic::RIntValue> {
-    use crate::rlib::rarithmetic::RIntValue::*;
-    match (a, b) {
-        (Signed(x), Signed(y)) => x.checked_mul(y).map(Signed),
-        (Unsigned(x), Unsigned(y)) => x.checked_mul(y).map(Unsigned),
-        (Signed(x), Unsigned(y)) | (Unsigned(y), Signed(x)) => {
-            if x >= 0 {
-                (x as u128).checked_mul(y).map(Unsigned)
-            } else {
-                let mag = x.unsigned_abs().checked_mul(y)?;
-                i128::try_from(mag).ok()?.checked_neg().map(Signed)
-            }
-        }
-    }
+) -> crate::rlib::rarithmetic::RIntValue {
+    rint_long(a.to_bigint() * b.to_bigint())
 }
 
 fn rint_bitop(
     a: crate::rlib::rarithmetic::RIntValue,
     b: crate::rlib::rarithmetic::RIntValue,
-    op: impl Fn(u128, u128) -> u128,
+    op: impl Fn(&BigInt, &BigInt) -> BigInt,
 ) -> crate::rlib::rarithmetic::RIntValue {
-    use crate::rlib::rarithmetic::RIntValue::*;
-    let r = op(a.as_u128(), b.as_u128());
-    if !a.is_negative() && !b.is_negative() {
-        Unsigned(r)
-    } else {
-        Signed(r as i128)
-    }
+    rint_long(op(&a.to_bigint(), &b.to_bigint()))
 }
 
 fn rint_floordiv(
     a: crate::rlib::rarithmetic::RIntValue,
     b: crate::rlib::rarithmetic::RIntValue,
 ) -> Option<crate::rlib::rarithmetic::RIntValue> {
-    use crate::rlib::rarithmetic::RIntValue::*;
-    match (a, b) {
-        (Unsigned(x), Unsigned(y)) => {
-            if y == 0 {
-                None
-            } else {
-                Some(Unsigned(x / y))
-            }
-        }
-        _ => python_floor_div_i128(a.as_i128()?, b.as_i128()?).map(Signed),
-    }
+    python_floor_div_bigint(&a.to_bigint(), &b.to_bigint()).map(rint_long)
 }
 
 fn rint_mod(
     a: crate::rlib::rarithmetic::RIntValue,
     b: crate::rlib::rarithmetic::RIntValue,
 ) -> Option<crate::rlib::rarithmetic::RIntValue> {
-    use crate::rlib::rarithmetic::RIntValue::*;
-    match (a, b) {
-        (Unsigned(x), Unsigned(y)) => {
-            if y == 0 {
-                None
-            } else {
-                Some(Unsigned(x % y))
-            }
-        }
-        _ => python_mod_i128(a.as_i128()?, b.as_i128()?).map(Signed),
+    python_mod_bigint(&a.to_bigint(), &b.to_bigint()).map(rint_long)
+}
+
+/// Python `//` over `BigInt`. malachite `Div` truncates toward 0.
+fn python_floor_div_bigint(x: &BigInt, y: &BigInt) -> Option<BigInt> {
+    if y == &BigInt::from(0) {
+        return None;
+    }
+    let q = x / y;
+    let r = x % y;
+    if r != BigInt::from(0) && (x < &BigInt::from(0)) != (y < &BigInt::from(0)) {
+        Some(q - 1)
+    } else {
+        Some(q)
+    }
+}
+
+/// Python `%` over `BigInt` (sign of the divisor). malachite `Rem` uses the dividend.
+fn python_mod_bigint(x: &BigInt, y: &BigInt) -> Option<BigInt> {
+    if y == &BigInt::from(0) {
+        return None;
+    }
+    let r = x % y;
+    if r != BigInt::from(0) && (r < BigInt::from(0)) != (y < &BigInt::from(0)) {
+        Some(r + y)
+    } else {
+        Some(r)
     }
 }
 
@@ -2357,7 +2323,7 @@ fn float_py_floor_div(x: f64, y: f64) -> f64 {
 pub(crate) fn python_eq_const(a: &ConstValue, b: &ConstValue) -> bool {
     use ConstValue as C;
     if let (Some(x), Some(y)) = (integer_numeric(a), integer_numeric(b)) {
-        return x.cmp_numeric(y).is_eq();
+        return x.cmp_numeric(&y).is_eq();
     }
     match (a, b) {
         (C::Float(x), C::Float(y)) => f64::from_bits(*x) == f64::from_bits(*y),
@@ -2622,7 +2588,9 @@ fn shift_type_error(lhs: &ConstValue, rhs: &ConstValue) -> bool {
 fn cross_type_ordering(a: &ConstValue, b: &ConstValue) -> bool {
     use ConstValue as C;
     let kind = |v: &ConstValue| match v {
-        C::Int(_) | C::UInt(_) | C::Int128(_) | C::UInt128(_) | C::RInt(_, _, _) => Some(0),
+        C::Int(_) | C::UInt(_) | C::Int128(_) | C::UInt128(_) | C::Long(_) | C::RInt(_, _, _) => {
+            Some(0)
+        }
         C::Bool(_) => Some(0), // Python: bool is int — same kind
         C::Float(_) => Some(1),
         C::UniStr(_) => Some(2),
@@ -4960,6 +4928,181 @@ mod tests {
         assert_eq!(
             pyfunc(OpKind::Lt, &[&one, &two]),
             Some(ConstValue::Bool(true)),
+        );
+    }
+
+    fn forced_rint(name: &str, sign: bool, bits: u16) -> crate::annotator::model::RIntClass {
+        match crate::rlib::rarithmetic::build_int(Some(name), sign, bits, true)
+            .unwrap_or_else(|e| panic!("{e}"))
+        {
+            crate::annotator::model::KnownType::RInt(c) => c,
+            other => panic!("expected KnownType::RInt for {name}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn constfold_rint_shift_full_integer_then_construct() {
+        let s8 = forced_rint("r_s8_fold_shift", true, 8);
+        let u8 = forced_rint("r_u8_fold_shift", false, 8);
+        let s256 = forced_rint("r_s256_fold_shift", true, 256);
+        let u256 = forced_rint("r_u256_fold_shift", false, 256);
+        let rint = |c, n: i128| ConstValue::rint(c, n);
+        assert_eq!(
+            pyfunc(OpKind::LShift, &[&rint(s8, 64), &ConstValue::Int(126)]),
+            None,
+        );
+        assert_eq!(
+            pyfunc(OpKind::LShift, &[&rint(s8, 64), &ConstValue::Int(1)]),
+            None,
+        );
+        assert_eq!(
+            pyfunc(OpKind::LShift, &[&rint(s8, 1), &ConstValue::Int(2)]),
+            Some(rint(s8, 4)),
+        );
+        assert_eq!(
+            pyfunc(OpKind::LShift, &[&rint(s8, -1), &ConstValue::Int(7)]),
+            Some(rint(s8, -128)),
+        );
+        assert_eq!(
+            pyfunc(OpKind::LShift, &[&rint(u8, 64), &ConstValue::Int(126)]),
+            Some(rint(u8, 0)),
+        );
+        assert_eq!(
+            pyfunc(OpKind::LShift, &[&rint(u8, 3), &ConstValue::Int(2)]),
+            Some(rint(u8, 12)),
+        );
+        assert_eq!(
+            pyfunc(OpKind::LShift, &[&rint(u8, 255), &ConstValue::Int(1)]),
+            Some(rint(u8, 254)),
+        );
+        assert_eq!(
+            pyfunc(OpKind::RShift, &[&rint(s8, -1), &ConstValue::Int(7)]),
+            Some(rint(s8, -1)),
+        );
+        assert_eq!(
+            pyfunc(OpKind::RShift, &[&rint(s8, -128), &ConstValue::Int(200)]),
+            Some(rint(s8, -1)),
+        );
+        assert_eq!(
+            pyfunc(OpKind::RShift, &[&rint(u8, 255), &ConstValue::Int(8)]),
+            Some(rint(u8, 0)),
+        );
+        assert_eq!(
+            pyfunc(OpKind::LShift, &[&rint(s8, 0), &ConstValue::Int(1 << 60)],),
+            Some(rint(s8, 0)),
+        );
+        let one256 = ConstValue::rint(u256, 1);
+        assert_eq!(
+            pyfunc(OpKind::LShift, &[&one256, &ConstValue::Int(200)]),
+            Some(ConstValue::rint(u256, BigInt::from(1) << 200u32)),
+        );
+        assert_eq!(
+            pyfunc(OpKind::LShift, &[&one256, &ConstValue::Int(256)]),
+            Some(ConstValue::rint(u256, 0)),
+        );
+        let s_one256 = ConstValue::rint(s256, 1);
+        assert_eq!(
+            pyfunc(OpKind::LShift, &[&s_one256, &ConstValue::Int(254)]),
+            Some(ConstValue::rint(s256, BigInt::from(1) << 254u32)),
+        );
+        assert_eq!(
+            pyfunc(OpKind::LShift, &[&s_one256, &ConstValue::Int(255)]),
+            None,
+        );
+    }
+
+    #[test]
+    fn constfold_rint_arith_full_integer_then_construct() {
+        let s8 = forced_rint("r_s8_fold_arith", true, 8);
+        let u8 = forced_rint("r_u8_fold_arith", false, 8);
+        let s256 = forced_rint("r_s256_fold_arith", true, 256);
+        let u256 = forced_rint("r_u256_fold_arith", false, 256);
+        let s128 = forced_rint("r_s128_fold_arith", true, 128);
+        let u128c = forced_rint("r_u128_fold_arith", false, 128);
+        assert_eq!(
+            pyfunc(
+                OpKind::Add,
+                &[&ConstValue::rint(u8, 200), &ConstValue::rint(u8, 100)],
+            ),
+            Some(ConstValue::rint(u8, 44)),
+        );
+        assert_eq!(
+            pyfunc(
+                OpKind::Add,
+                &[&ConstValue::rint(s8, 64), &ConstValue::rint(s8, 64)],
+            ),
+            None,
+        );
+        assert_eq!(
+            pyfunc(
+                OpKind::FloorDiv,
+                &[&ConstValue::rint(s8, -7), &ConstValue::rint(s8, 2)],
+            ),
+            Some(ConstValue::rint(s8, -4)),
+        );
+        assert_eq!(
+            pyfunc(
+                OpKind::Mod,
+                &[&ConstValue::rint(s8, -7), &ConstValue::rint(s8, 2)],
+            ),
+            Some(ConstValue::rint(s8, 1)),
+        );
+        assert_eq!(
+            pyfunc(
+                OpKind::Mod,
+                &[&ConstValue::rint(s8, 7), &ConstValue::rint(s8, -2)],
+            ),
+            Some(ConstValue::rint(s8, -1)),
+        );
+        let mask256 = crate::rlib::rarithmetic::mask_bigint(256);
+        assert_eq!(
+            pyfunc(
+                OpKind::Add,
+                &[
+                    &ConstValue::rint(u256, mask256.clone()),
+                    &ConstValue::rint(u256, 1),
+                ],
+            ),
+            Some(ConstValue::rint(u256, 0)),
+        );
+        let s256_max = (BigInt::from(1) << 255u32) - 1;
+        assert_eq!(
+            pyfunc(
+                OpKind::Add,
+                &[
+                    &ConstValue::rint(s256, s256_max),
+                    &ConstValue::rint(s256, 1),
+                ],
+            ),
+            None,
+        );
+        assert_eq!(
+            pyfunc(OpKind::Invert, &[&ConstValue::rint(s256, 0)]),
+            Some(ConstValue::rint(s256, -1)),
+        );
+        assert_eq!(
+            pyfunc(OpKind::Invert, &[&ConstValue::rint(u256, 0)]),
+            Some(ConstValue::rint(u256, mask256)),
+        );
+        assert_eq!(
+            pyfunc(
+                OpKind::Mul,
+                &[
+                    &ConstValue::rint(s128, i128::MAX),
+                    &ConstValue::rint(s128, 2),
+                ],
+            ),
+            None,
+        );
+        assert_eq!(
+            pyfunc(
+                OpKind::Add,
+                &[
+                    &ConstValue::rint(u128c, u128::MAX),
+                    &ConstValue::rint(u128c, 1),
+                ],
+            ),
+            Some(ConstValue::rint(u128c, 0)),
         );
     }
 
