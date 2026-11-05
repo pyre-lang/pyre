@@ -34,8 +34,7 @@ pub(super) fn arm_platform(cc: Option<String>) -> Platform {
 
 /// Testable `ARM` constructor: `SB2` / `SB2OPT` / env `CC` are parameters
 /// instead of process environment. Does not touch `SB2_MODULE`.
-#[cfg(test)]
-pub(super) fn arm_platform_from(
+pub fn arm_platform_from(
     sb2_root: Option<OsString>,
     sb2opt: Option<String>,
     cc: Option<String>,
@@ -166,7 +165,7 @@ pub(super) fn library_dirs_for_libffi(
 
 impl Platform {
     /// `ARM._invent_new_name`. `copied_cache` is declared but never read upstream.
-    pub(crate) fn _invent_new_name(&self, basepath: &Path, base: &str) -> PathBuf {
+    pub fn _invent_new_name(&self, basepath: &Path, base: &str) -> PathBuf {
         let mut pth = invent_join(basepath, base);
         let mut num = 0;
         // `LocalPath.check()` with no keywords is `os.path.exists`.
@@ -181,7 +180,6 @@ impl Platform {
 
 /// `py.path.local.join`: strip leading `/` from each argument and
 /// `normpath` the result.
-#[cfg_attr(not(test), expect(dead_code))] // rpython/translator/platform/arm.py ARM._invent_new_name
 fn invent_join(basepath: &Path, name: &str) -> PathBuf {
     super::lexical_normpath(&basepath.join(name.trim_start_matches('/')))
 }
@@ -315,7 +313,7 @@ mod tests {
     #[test]
     fn arm_invent_new_name_joins_leading_slash_onto_basepath() {
         let plat = sample_arm();
-        let basepath = crate::tool::udir::udir().join(format!(
+        let basepath = crate::udir::udir().join(format!(
             "arm-invent-slash-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -331,7 +329,7 @@ mod tests {
     #[test]
     fn arm_invent_new_name_skips_existing_paths() {
         let plat = sample_arm();
-        let basepath = crate::tool::udir::udir().join(format!(
+        let basepath = crate::udir::udir().join(format!(
             "arm-invent-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

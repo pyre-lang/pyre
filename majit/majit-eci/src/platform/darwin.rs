@@ -149,17 +149,16 @@ pub(super) fn _library_dirs_for_libffi(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translator::tool::cbuild::ExternalCompilationInfo;
+    use crate::ExternalCompilationInfo;
     use std::path::PathBuf;
 
     #[test]
     fn darwin_link_args_include_frameworks_and_include_dirs() {
         let plat = darwin_platform("aarch64-apple-darwin".to_string());
-        let inc = PathBuf::from("/tmp/darwin-inc");
         let eci = ExternalCompilationInfo {
-            include_dirs: vec![inc.clone()],
+            include_dirs: vec!["/tmp/darwin-inc".to_string()],
             frameworks: vec!["Cocoa".to_string()],
-            link_files: vec![PathBuf::from("/foo/bar.a")],
+            link_files: vec!["/foo/bar.a".to_string()],
             ..ExternalCompilationInfo::default()
         };
         let args = plat._link_args_from_eci(&eci, true);

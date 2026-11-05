@@ -11,3 +11,10 @@ syn = { workspace = true, features = ["full", "parsing", "printing"] }
 proc-macro2 = { workspace = true }
 quote = { workspace = true }
 cc = "1.2"
+majit-config = { workspace = true }
+parking_lot = { workspace = true }
+md-5 = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -2453,7 +2453,7 @@ crate::rffi::llexternal!(
 
 // `rposix.eci_inheritable` is `eci.merge(...)`: POSIX_ECI includes plus
 // the inheritable `separate_module_sources`. `%(HAVE_DUP3)d` is the
-// `rffi_platform` probe; `majit-rlib/build.rs` probes `dup3` (`rffi_platform.Has`)
+// `rffi_platform` probe; `majit-rlib/build.rs` asks `rffi_platform.Has('dup3')` (`majit_eci::rffi_platform`)
 // and defines `HAVE_DUP3` to 0 or 1.
 // The `ioctl_works` / `dup3_works` caches are relaxed atomics, as
 // `set_inheritable` (`Python/fileutils.c`) and `os_dup2_impl` keep them for

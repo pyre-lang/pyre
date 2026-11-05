@@ -57,7 +57,7 @@ pub(super) fn openbsd_libs(libraries: &[String]) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translator::tool::cbuild::ExternalCompilationInfo;
+    use crate::ExternalCompilationInfo;
 
     #[test]
     fn openbsd_cflags_include_bsd_source() {

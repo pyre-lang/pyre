@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use crate::annotator::policy::AnnotatorPolicy;
 use crate::annotator::signature::AnnotationSpec;
-use crate::config::config::{ConfigError, ConfigValue, OptionValue};
+use crate::config::config::{ConfigValue, OptionValue};
 use crate::flowspace::model::HostObject;
 use crate::rlib::entrypoint::export_symbol;
 use crate::translator::driver::{ProceedGoals, TranslationDriver};
@@ -30,12 +30,6 @@ fn default_overrides() -> HashMap<String, OptionValue> {
 fn task_error(message: impl Into<String>) -> TaskError {
     TaskError {
         message: message.into(),
-    }
-}
-
-impl From<ConfigError> for TaskError {
-    fn from(value: ConfigError) -> Self {
-        task_error(value.to_string())
     }
 }
 

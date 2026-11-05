@@ -1874,7 +1874,7 @@ impl TranslationDriver {
     /// Upstream `task_llinterpret_lltype(self)` at `:544-555`.
     pub fn task_llinterpret_lltype(&self) -> Result<TaskOutput, TaskError> {
         // Upstream `:545`: `from rpython.rtyper.llinterp import LLInterpreter`.
-        use crate::translator::rtyper::llinterp::LLInterpreter;
+        use crate::translator::rtyper::llinterp::{FrameError, LLInterpreter};
         // Upstream `:547`: `translator = self.translator`.
         let translator = self.translator.borrow().clone().ok_or_else(|| TaskError {
             message: "task_llinterpret_lltype: translator slot is unset".to_string(),
@@ -1914,7 +1914,9 @@ impl TranslationDriver {
             .cloned()
             .map(|_| ())
             .unwrap_or(());
-        let v = interp.eval_graph(placeholder_graph, Vec::new(), false)?;
+        let v = interp
+            .eval_graph(placeholder_graph, Vec::new(), false)
+            .map_err(FrameError::into_task_error)?;
         // Upstream `:555`: `log.llinterpret("result -> %s" % v)`.
         self.info(&format!("llinterpret result -> {:?}", v.type_id()));
         Ok(None)

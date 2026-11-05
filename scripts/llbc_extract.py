@@ -757,6 +757,23 @@ def normalized_local_name(value: str) -> PurePosixPath:
     return PurePosixPath(posixpath.normpath(PureWindowsPath(value).as_posix()))
 
 
+def is_cargo_out_dir_name(normal: PurePosixPath) -> bool:
+    """Whether a file-table name sits under cargo's generated `OUT_DIR`.
+
+    An `OUT_DIR` file is generated from inputs the enumeration already carries,
+    as `_reject_unresolvable_include` says of `concat!(env!("OUT_DIR"), ...)`.
+    Hashing it makes `source=` depend on where the charon target dir lives: a
+    repo-relative `.pyre-build/charon-target/.../out/...` on CI, an absolute
+    path that `is_repo_relative_name` drops locally. No tracked file matches
+    this shape (`git ls-files | rg '(^|/)build/.+/out/'` is empty).
+    """
+    parts = normal.parts
+    for i, part in enumerate(parts):
+        if part == "out" and i >= 2 and "build" in parts[: i - 1]:
+            return True
+    return False
+
+
 def artefact_local_readfiles(path: Path) -> dict[str, set[Path]]:
     """Repo-relative `Local` files in an artefact, grouped by crate name."""
     by_crate: dict[str, set[Path]] = {}
@@ -774,6 +791,8 @@ def artefact_local_readfiles(path: Path) -> dict[str, set[Path]]:
             raise SystemExit(
                 f"extract-llbc.py: {path} has a Local filename outside the repository: {value}"
             )
+        if is_cargo_out_dir_name(normal):
+            continue
         crate_name = entry.get("crate_name")
         if not isinstance(crate_name, str) or not crate_name:
             raise SystemExit(
@@ -3750,6 +3769,32 @@ def self_test_ullbc_files_table() -> None:
             "crate_name": "crate",
             "contents": "",
         },
+        # Cargo `OUT_DIR` under both layouts Charon records: the in-repo
+        # charon-target on CI, and the ordinary `<target>/<profile>/build/`
+        # path. Both are generated, so they stay out of the read set.
+        {
+            "id": 6,
+            "name": {
+                "Local": (
+                    ".pyre-build/charon-target/h/x86_64-unknown-linux-gnu/"
+                    "debug/build/majit-rlib/706af7b6fedd021a/out/clibffi_cconfig.rs"
+                )
+            },
+            "crate_name": "majit-rlib",
+            "contents": "",
+        },
+        {
+            "id": 7,
+            "name": {"Local": "target/debug/build/foo-0123/out/gen.rs"},
+            "crate_name": "foo",
+            "contents": "",
+        },
+        {
+            "id": 8,
+            "name": {"Local": "majit/majit-rlib/src/clibffi.rs"},
+            "crate_name": "majit-rlib",
+            "contents": "",
+        },
     ]
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "probe.ullbc"
@@ -3758,7 +3803,10 @@ def self_test_ullbc_files_table() -> None:
         )
         parsed = ullbc_files_table(path, chunk_size=7)
         local = artefact_local_readfiles(path)
-    expected = {"crate": {Path("crate/src/lib.rs"), Path("shared/app.py")}}
+    expected = {
+        "crate": {Path("crate/src/lib.rs"), Path("shared/app.py")},
+        "majit-rlib": {Path("majit/majit-rlib/src/clibffi.rs")},
+    }
     if parsed != table or local != expected:
         raise SystemExit(
             f"self-test FAILED: files-table parser returned parsed={parsed!r}, local={local!r}"

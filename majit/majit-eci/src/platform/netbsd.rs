@@ -85,7 +85,7 @@ fn _library_dirs_for_libffi_from(localbase: OsString) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translator::tool::cbuild::ExternalCompilationInfo;
+    use crate::ExternalCompilationInfo;
     use std::path::PathBuf;
 
     #[test]

@@ -15,7 +15,7 @@ pub mod driver;
 pub mod gensupp;
 pub mod goal;
 pub mod interactive;
-pub mod platform;
+pub use majit_eci::platform;
 pub mod revdb;
 pub mod rtyper;
 pub mod sandbox;

@@ -1,11 +1,18 @@
 //! `rpython/translator/tool/cbuild.py`: `ExternalCompilationInfo` and the C
 //! build step ll2ctypes runs for it (`compile_shared_lib`).
 
+use std::fmt;
 use std::path::Path;
 
+pub mod ansi_print;
 pub mod build;
 pub mod cdecl;
+pub mod gcc_cache;
 pub mod parse;
+pub mod platform;
+pub mod rffi_platform;
+pub mod taskengine;
+pub mod udir;
 
 /// `rffi.py generate_macro_wrapper`. `args` and `result` are `gettype`
 /// templates. `LowLevelDatabase.gettype` FuncType skips `Void` (the resolved
@@ -38,7 +45,7 @@ pub fn generate_macro_wrapper(name: &str, macro_: &str, args: &[String], result:
 }
 
 /// `cbuild.py` `ExternalCompilationInfo`. Fields follow `_ATTRIBUTES`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ExternalCompilationInfo {
     pub pre_include_bits: Vec<String>,
     pub includes: Vec<String>,
@@ -54,6 +61,8 @@ pub struct ExternalCompilationInfo {
     pub link_files: Vec<String>,
     pub testonly_libraries: Vec<String>,
     pub use_cpp_linker: bool,
+    /// `_EXTRA_ATTRIBUTES` `platform`.
+    pub platform: Option<String>,
 }
 
 /// `ExternalCompilationInfo._ATTRIBUTES`.
@@ -150,9 +159,50 @@ impl ExternalCompilationInfo {
         }
     }
 
+    /// `ExternalCompilationInfo._value`: `_ATTRIBUTES + _EXTRA_ATTRIBUTES`
+    /// in declaration order.
+    pub fn _value(
+        &self,
+    ) -> (
+        &[String],
+        &[String],
+        &[String],
+        &[String],
+        &[String],
+        &[String],
+        &[String],
+        &[String],
+        &[String],
+        &[String],
+        &[String],
+        &[String],
+        &[String],
+        bool,
+        Option<&str>,
+    ) {
+        (
+            &self.pre_include_bits,
+            &self.includes,
+            &self.include_dirs,
+            &self.post_include_bits,
+            &self.libraries,
+            &self.library_dirs,
+            &self.separate_module_sources,
+            &self.separate_module_files,
+            &self.compile_extra,
+            &self.link_extra,
+            &self.frameworks,
+            &self.link_files,
+            &self.testonly_libraries,
+            self.use_cpp_linker,
+            self.platform.as_deref(),
+        )
+    }
+
     /// `ExternalCompilationInfo.merge`. Duplicate `others` are dropped first;
     /// `_DUPLICATES_OK` fields concatenate; every other field keeps first
     /// occurrence order without duplicates; `use_cpp_linker` is the `or`.
+    /// Mixed `platform` panics (`ExternalCompilationInfo.merge`).
     pub fn merge(&self, others: &[&ExternalCompilationInfo]) -> ExternalCompilationInfo {
         let mut uniq: Vec<&ExternalCompilationInfo> = Vec::new();
         for &other in others {
@@ -184,6 +234,15 @@ impl ExternalCompilationInfo {
                 *out.field_mut(name) = attr;
             }
         }
+        for other in &uniq {
+            if other.platform != self.platform {
+                panic!(
+                    "Mixing ECI for different platforms {:?} and {:?}",
+                    other.platform, self.platform
+                );
+            }
+        }
+        out.platform = self.platform.clone();
         out
     }
 
@@ -307,6 +366,30 @@ impl ExternalCompilationInfo {
     }
 }
 
+/// `ExternalCompilationInfo.__repr__`.
+impl fmt::Display for ExternalCompilationInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let attrs = [
+            format!("pre_include_bits={:?}", self.pre_include_bits),
+            format!("includes={:?}", self.includes),
+            format!("include_dirs={:?}", self.include_dirs),
+            format!("post_include_bits={:?}", self.post_include_bits),
+            format!("libraries={:?}", self.libraries),
+            format!("library_dirs={:?}", self.library_dirs),
+            format!("separate_module_sources={:?}", self.separate_module_sources),
+            format!("separate_module_files={:?}", self.separate_module_files),
+            format!("compile_extra={:?}", self.compile_extra),
+            format!("link_extra={:?}", self.link_extra),
+            format!("frameworks={:?}", self.frameworks),
+            format!("link_files={:?}", self.link_files),
+            format!("testonly_libraries={:?}", self.testonly_libraries),
+            format!("use_cpp_linker={:?}", self.use_cpp_linker),
+            format!("platform={:?}", self.platform),
+        ];
+        write!(f, "<ExternalCompilationInfo ({})>", attrs.join(", "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,20 +398,24 @@ mod tests {
     fn merge_header_and_sources() {
         let a = ExternalCompilationInfo {
             includes: vec!["stdio.h".into(), "stdlib.h".into()],
+            include_dirs: vec!["inc".into(), "inc".into()],
             libraries: vec!["foo".into()],
             compile_extra: vec!["-O2".into()],
             link_extra: vec!["-lm".into()],
             pre_include_bits: vec!["#define FOO 1".into()],
             post_include_bits: vec!["typedef int X;".into()],
             use_cpp_linker: false,
+            platform: Some("host".into()),
             ..ExternalCompilationInfo::default()
         };
         let b = ExternalCompilationInfo {
             includes: vec!["stdlib.h".into(), "math.h".into()],
+            include_dirs: vec!["inc".into(), "other".into()],
             libraries: vec!["foo".into(), "bar".into()],
-            compile_extra: vec!["-g".into()],
-            link_extra: vec!["-ldl".into()],
+            compile_extra: vec!["-O2".into(), "-g".into()],
+            link_extra: vec!["-lm".into(), "-ldl".into()],
             use_cpp_linker: true,
+            platform: Some("host".into()),
             ..ExternalCompilationInfo::default()
         };
         let merged = a.merge(&[&b, &b]);
@@ -340,16 +427,21 @@ mod tests {
                 "math.h".to_string()
             ]
         );
+        assert_eq!(
+            merged.include_dirs,
+            vec!["inc".to_string(), "other".to_string()]
+        );
         assert_eq!(merged.libraries, vec!["foo".to_string(), "bar".to_string()]);
         assert_eq!(
             merged.compile_extra,
-            vec!["-O2".to_string(), "-g".to_string()]
+            vec!["-O2".to_string(), "-O2".to_string(), "-g".to_string()]
         );
         assert_eq!(
             merged.link_extra,
-            vec!["-lm".to_string(), "-ldl".to_string()]
+            vec!["-lm".to_string(), "-lm".to_string(), "-ldl".to_string()]
         );
         assert!(merged.use_cpp_linker);
+        assert_eq!(merged.platform.as_deref(), Some("host"));
 
         let mut header = String::new();
         a.write_c_header(&mut header);
@@ -791,5 +883,38 @@ mod tests {
             ExternalCompilationInfo::from_linker_flags(r"-I\x"),
             Err(r"compiler flag found in linker options: '-I\\x'".to_string())
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "Mixing ECI for different platforms")]
+    fn merge_rejects_mixed_platforms() {
+        let left = ExternalCompilationInfo {
+            platform: Some("host".to_string()),
+            ..ExternalCompilationInfo::default()
+        };
+        let right = ExternalCompilationInfo {
+            platform: Some("other".to_string()),
+            ..ExternalCompilationInfo::default()
+        };
+        let _ = left.merge(&[&right]);
+    }
+
+    #[test]
+    fn repr_and_value_cover_every_attribute() {
+        let eci = ExternalCompilationInfo {
+            includes: vec!["stdio.h".to_string()],
+            use_cpp_linker: true,
+            platform: Some("host".to_string()),
+            ..ExternalCompilationInfo::default()
+        };
+        let rendered = eci.to_string();
+        assert!(rendered.starts_with("<ExternalCompilationInfo ("));
+        assert!(rendered.contains("includes="));
+        assert!(rendered.contains("use_cpp_linker=true"));
+        assert!(rendered.contains("platform=Some(\"host\")"));
+        let value = eci._value();
+        assert_eq!(value.1, &["stdio.h".to_string()][..]);
+        assert!(value.13);
+        assert_eq!(value.14, Some("host"));
     }
 }

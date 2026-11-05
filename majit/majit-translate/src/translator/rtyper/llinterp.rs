@@ -100,14 +100,8 @@ impl From<TaskError> for FrameError {
     }
 }
 
-impl From<FrameError> for TaskError {
-    fn from(err: FrameError) -> Self {
-        err.into_task_error()
-    }
-}
-
 impl FrameError {
-    fn into_task_error(self) -> TaskError {
+    pub(crate) fn into_task_error(self) -> TaskError {
         match self {
             FrameError::LLException { etype, .. } => TaskError {
                 message: format!(

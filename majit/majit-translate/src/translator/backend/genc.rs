@@ -175,7 +175,7 @@ impl CBuilder {
     /// under `majit/majit-translate`: this module cites
     /// `rpython/translator/c/...` only as upstream source material.
     pub fn get_eci(&self) -> ExternalCompilationInfo {
-        let mut include_dirs: Vec<PathBuf> = Vec::new();
+        let mut include_dirs: Vec<String> = Vec::new();
         match std::env::var("PYPY_SRCROOT") {
             Ok(pypy_srcroot) => {
                 // Upstream `:81`: `pypy_include_dir =
@@ -183,7 +183,7 @@ impl CBuilder {
                 // `${PYPY_SRCROOT}/rpython/translator/c`.
                 let pypy_include_dir = PathBuf::from(pypy_srcroot).join("rpython/translator/c");
                 // Upstream `:82`: `include_dirs = [pypy_include_dir]`.
-                include_dirs.push(pypy_include_dir.clone());
+                include_dirs.push(pypy_include_dir.to_string_lossy().into_owned());
                 // Upstream `:83-84`: revdb include dir is
                 // `pypy_include_dir.join('..', 'revdb')`.
                 if matches!(
@@ -193,7 +193,7 @@ impl CBuilder {
                     ))
                 ) && let Some(parent) = pypy_include_dir.parent()
                 {
-                    include_dirs.push(parent.join("revdb"));
+                    include_dirs.push(parent.join("revdb").to_string_lossy().into_owned());
                 }
             }
             Err(_) => {
@@ -202,9 +202,8 @@ impl CBuilder {
                 // sentinel path so a later compile-step / merge-eci
                 // failure points at the missing vendored tree rather
                 // than silently producing wrong machine code.
-                include_dirs.push(PathBuf::from(
-                    "<unported: rpython/translator/c headers; set PYPY_SRCROOT>",
-                ));
+                include_dirs
+                    .push("<unported: rpython/translator/c headers; set PYPY_SRCROOT>".to_string());
             }
         }
         ExternalCompilationInfo {
@@ -424,17 +423,8 @@ impl CBuilder {
             // overwrite with a typed ECI that ignored what was there.
             return;
         };
-        match current.merge(&[other.as_ref()]) {
-            Ok(merged) => {
-                *slot = Some(Rc::new(merged) as Rc<dyn Any>);
-            }
-            Err(_) => {
-                // Mixed-platform error — propagating it from a side-
-                // effecting merge_eci is not yet wired through callers.
-                // Leave the slot at its prior value and let downstream
-                // ECI consumers surface the platform mismatch.
-            }
-        }
+        let merged = current.merge(&[other.as_ref()]);
+        *slot = Some(Rc::new(merged) as Rc<dyn Any>);
     }
 
     /// Port of upstream `CBuilder.get_gcpolicyclass(self)` at
@@ -787,7 +777,7 @@ mod tests {
 
         assert_eq!(eci.include_dirs.len(), 1);
         assert!(
-            eci.include_dirs[0].ends_with("rpython/translator/c"),
+            std::path::Path::new(&eci.include_dirs[0]).ends_with("rpython/translator/c"),
             "expected {:?} to end with rpython/translator/c",
             eci.include_dirs[0]
         );
@@ -812,9 +802,7 @@ mod tests {
             eci.include_dirs
         );
         assert!(
-            eci.include_dirs[0]
-                .to_string_lossy()
-                .contains("PYPY_SRCROOT"),
+            eci.include_dirs[0].contains("PYPY_SRCROOT"),
             "sentinel path must reference PYPY_SRCROOT: {:?}",
             eci.include_dirs
         );

@@ -24,10 +24,11 @@
 //! * `box_str_const_fold` removes redundant boxing calls whose string view is
 //!   proven to come from that prebuilt-string constant.
 //!
-//! `lltypesystem::ll2ctypes`, `lltypesystem::llarena`, and
-//! `tool::rffi_platform` are intentionally absent; their module roots
-//! document why those C/backend-GC probing or simulation layers are
-//! permanently unused in pyre.
+//! `lltypesystem::ll2ctypes` and `lltypesystem::llarena` are
+//! intentionally absent; their module roots document why those
+//! C/backend-GC probing or simulation layers are permanently unused
+//! in pyre. `tool::rffi_platform` is `majit_eci::rffi_platform`, which
+//! build scripts call.
 
 pub mod annlowlevel;
 pub(crate) mod box_str_const_fold;

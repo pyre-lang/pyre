@@ -37,7 +37,7 @@ pub(super) fn freebsd_platform(host_triple: String, is_64: bool) -> Platform {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translator::tool::cbuild::ExternalCompilationInfo;
+    use crate::ExternalCompilationInfo;
     use std::path::PathBuf;
 
     #[test]

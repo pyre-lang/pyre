@@ -39,22 +39,7 @@ use std::rc::Rc;
 /// `Box<dyn Any>` carries that shape across the generic engine API.
 pub type TaskOutput = Option<Box<dyn Any>>;
 
-/// Error surface of a task callable. Upstream raises Python
-/// exceptions and `_execute` re-raises after the `_error(goal)` hook
-/// fires. The Rust port replaces the raise-and-catch with `Result` +
-/// an error struct carrying the upstream-observable message text.
-#[derive(Debug, Clone)]
-pub struct TaskError {
-    pub message: String,
-}
-
-impl std::fmt::Display for TaskError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl std::error::Error for TaskError {}
+pub use majit_eci::taskengine::TaskError;
 
 /// Port of a task callable + its registered metadata.
 ///

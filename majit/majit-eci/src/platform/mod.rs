@@ -17,9 +17,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use crate::tool::ansi_print::AnsiLogger;
-use crate::translator::tool::cbuild::ExternalCompilationInfo;
-use crate::translator::tool::taskengine::TaskError;
+use crate::ExternalCompilationInfo;
+use crate::ansi_print::AnsiLogger;
+use crate::taskengine::TaskError;
 use parking_lot::{ReentrantMutex, RwLock};
 
 mod arm;
@@ -31,6 +31,8 @@ mod netbsd;
 mod openbsd;
 mod posix;
 mod windows;
+
+pub use arm::arm_platform_from;
 
 use posix::py_bytes_repr;
 
@@ -439,7 +441,7 @@ impl Platform {
     ) -> Vec<PathBuf> {
         let mut seen = Vec::new();
         let mut result = Vec::new();
-        let extras = eci.separate_module_files.iter().map(PathBuf::as_path);
+        let extras = eci.separate_module_files.iter().map(|p| Path::new(p));
         for cfile in c_files.iter().map(AsRef::as_ref).chain(extras) {
             let cfile = abs_path(cfile);
             if !seen.contains(&cfile) {
@@ -514,7 +516,7 @@ impl Platform {
     /// `Platform._make_o_file`.
     fn _make_o_file(&self, cfile: &Path, ext: &str) -> PathBuf {
         let ofile = cfile.with_extension(ext);
-        let udir = crate::tool::udir::udir();
+        let udir = crate::udir::udir();
         if ofile.starts_with(udir) {
             return ofile;
         }
@@ -693,7 +695,9 @@ impl Platform {
         eci: &ExternalCompilationInfo,
         standalone: bool,
     ) -> Vec<OsString> {
-        let include_dirs = self.preprocess_include_dirs(&eci.include_dirs);
+        let include_dirs: Vec<PathBuf> =
+            eci.include_dirs.iter().map(|s| PathBuf::from(s)).collect();
+        let include_dirs = self.preprocess_include_dirs(&include_dirs);
         let args = self._includedirs(&include_dirs);
         let extra = if standalone {
             self.standalone_only.clone()
@@ -726,17 +730,22 @@ impl Platform {
         standalone: bool,
     ) -> Vec<OsString> {
         let _standalone = if self.is_msvc() { true } else { standalone };
-        let library_dirs = self.preprocess_library_dirs(&eci.library_dirs);
+        let library_dirs: Vec<PathBuf> =
+            eci.library_dirs.iter().map(|s| PathBuf::from(s)).collect();
+        let library_dirs = self.preprocess_library_dirs(&library_dirs);
         let mut args = self._libdirs(&library_dirs);
         args.extend(self.link_flags.iter().cloned());
         args.extend(self._exportsymbols_link_flags());
-        args.extend(self._linkfiles(&eci.link_files));
+        let link_files: Vec<PathBuf> = eci.link_files.iter().map(|s| PathBuf::from(s)).collect();
+        args.extend(self._linkfiles(&link_files));
         args.extend(eci.link_extra.iter().map(OsString::from));
         args.extend(self._libs(&eci.libraries));
         args.extend(self.extra_libs.iter().cloned());
         if self.family() == HostFamily::Darwin {
             args.extend(darwin::frameworks(&eci.frameworks));
-            args.extend(self._includedirs(&eci.include_dirs));
+            let include_dirs: Vec<PathBuf> =
+                eci.include_dirs.iter().map(|s| PathBuf::from(s)).collect();
+            args.extend(self._includedirs(&include_dirs));
         }
         let _ = _standalone;
         args
@@ -778,9 +787,9 @@ impl Platform {
                 .parent()
                 .filter(|path| !path.as_os_str().is_empty())
                 .map(Path::to_path_buf)
-                .unwrap_or_else(|| crate::tool::udir::udir().join("module_cache"))
+                .unwrap_or_else(|| crate::udir::udir().join("module_cache"))
         } else {
-            crate::tool::udir::udir().join("module_cache")
+            crate::udir::udir().join("module_cache")
         };
         let mut exe_name = dirname.join(&outputfilename);
         if standalone {
@@ -1125,7 +1134,7 @@ fn ensure_initialised() {
 
 /// Module-global `platform = host = host_factory()`. Construction records
 /// the `CC` command and does not discover a compiler.
-pub(crate) fn platform() -> Arc<Platform> {
+pub fn platform() -> Arc<Platform> {
     ensure_initialised();
     Arc::clone(
         PLATFORM
@@ -1136,20 +1145,19 @@ pub(crate) fn platform() -> Arc<Platform> {
 }
 
 /// Module-global `host` (`translator.platform.host`).
-pub(crate) fn host() -> Arc<Platform> {
+pub fn host() -> Arc<Platform> {
     ensure_initialised();
     Arc::clone(HOST.read().as_ref().expect("ensure_initialised fills HOST"))
 }
 
 /// `is_host_build`: `host == platform` via `Platform.__eq__`.
-#[cfg_attr(not(test), expect(dead_code))] // rpython/translator/platform/__init__.py is_host_build
-pub(crate) fn is_host_build() -> bool {
+pub fn is_host_build() -> bool {
     *host() == *platform()
 }
 
 /// `pick_platform(new_platform, cc)`. `"host"` is `host_factory(cc)`; `"arm"`
 /// is `ARM(cc)`; anything else is `ValueError("platform = %s")`.
-pub(crate) fn pick_platform(new_platform: &str, cc: Option<String>) -> Result<Platform, String> {
+pub fn pick_platform(new_platform: &str, cc: Option<String>) -> Result<Platform, String> {
     if new_platform == "host" {
         Ok(match cc.as_deref() {
             None | Some("") => host_platform(),
@@ -1164,8 +1172,7 @@ pub(crate) fn pick_platform(new_platform: &str, cc: Option<String>) -> Result<Pl
 
 /// `set_platform(new_platform, cc)`: rebind `platform`, and `host` when
 /// `new_platform == "host"`.
-#[cfg_attr(not(test), expect(dead_code))] // rpython/translator/platform/__init__.py set_platform
-pub(crate) fn set_platform(new_platform: &str, cc: Option<String>) -> Result<(), String> {
+pub fn set_platform(new_platform: &str, cc: Option<String>) -> Result<(), String> {
     ensure_initialised();
     let plat = pick_platform(new_platform, cc.clone())?;
     let using_cc = plat
@@ -1526,8 +1533,8 @@ pub(super) fn resolve_compiler_on_path(
     }
 }
 
-pub(crate) fn host_triple() -> String {
-    std::env::var("HOST").unwrap_or_else(|_| env!("MAJIT_TRANSLATE_HOST").to_string())
+pub fn host_triple() -> String {
+    std::env::var("HOST").unwrap_or_else(|_| env!("MAJIT_ECI_HOST").to_string())
 }
 
 /// `_get_compiler_type` (`windows.py`): empty/missing `cc` → `MsvcPlatform`;
@@ -1629,8 +1636,7 @@ fn host_class_name() -> &'static str {
 
 /// `BasePosix.relevant_environ` / `MsvcPlatform.relevant_environ`.
 /// `MingwPlatform` inherits `BasePosix.relevant_environ`.
-#[cfg(test)]
-pub(crate) fn host_relevant_environ() -> &'static [&'static str] {
+pub fn host_relevant_environ() -> &'static [&'static str] {
     match host_family() {
         HostFamily::Msvc => windows::RELEVANT_ENVIRON,
         _ => posix::RELEVANT_ENVIRON,
@@ -1657,7 +1663,7 @@ fn relevant_environ_values(names: &[&'static str]) -> Vec<(&'static str, Option<
 }
 
 /// String form of `Platform.key` with an injectable compiler identity.
-pub(crate) fn format_platform_key(
+pub fn format_platform_key(
     class_name: &str,
     cc_path: &Path,
     cc_args: &[OsString],
@@ -1760,12 +1766,7 @@ pub fn execute(
     if cfg!(unix)
         && let Some(info) = compilation_info
     {
-        let joined = info
-            .library_dirs
-            .iter()
-            .map(|path| path.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(":");
+        let joined = info.library_dirs.join(":");
         if cfg!(target_os = "macos") {
             command.env("DYLD_LIBRARY_PATH", joined);
         } else {
@@ -2071,7 +2072,7 @@ mod tests {
 
     #[test]
     fn compiler_exists_reads_snapshot_path() {
-        let dir = crate::tool::udir::udir().join(unique("cc-snap"));
+        let dir = crate::udir::udir().join(unique("cc-snap"));
         fs::create_dir_all(&dir).unwrap();
         let stem = unique("probe-cc");
         let exe_name = if cfg!(windows) {
@@ -2097,7 +2098,7 @@ mod tests {
 
     #[test]
     fn resolve_compiler_on_path_does_not_search_path_for_dir_component() {
-        let dir = crate::tool::udir::udir().join(unique("cc-dir-comp"));
+        let dir = crate::udir::udir().join(unique("cc-dir-comp"));
         fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("cc-name");
         fs::write(&exe, b"").unwrap();
@@ -2113,7 +2114,7 @@ mod tests {
 
     #[test]
     fn shell_command_search_keeps_exact_name() {
-        let dir = crate::tool::udir::udir().join(unique("shell-exact"));
+        let dir = crate::udir::udir().join(unique("shell-exact"));
         fs::create_dir_all(&dir).unwrap();
         let cl = dir.join("cl.exe");
         fs::write(&cl, b"").unwrap();
@@ -2126,7 +2127,7 @@ mod tests {
 
     #[test]
     fn shell_command_search_appends_pathext_in_order() {
-        let dir = crate::tool::udir::udir().join(unique("shell-pathext"));
+        let dir = crate::udir::udir().join(unique("shell-pathext"));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("tool.BAT"), b"").unwrap();
         fs::write(dir.join("tool.EXE"), b"").unwrap();
@@ -2136,7 +2137,7 @@ mod tests {
             Some(dir.join("tool.EXE"))
         );
 
-        let dir2 = crate::tool::udir::udir().join(unique("shell-pathext-bare"));
+        let dir2 = crate::udir::udir().join(unique("shell-pathext-bare"));
         fs::create_dir_all(&dir2).unwrap();
         fs::write(dir2.join("tool"), b"").unwrap();
         assert_eq!(
@@ -2147,7 +2148,7 @@ mod tests {
 
     #[test]
     fn shell_command_search_bare_name_on_path() {
-        let dir = crate::tool::udir::udir().join(unique("shell-path"));
+        let dir = crate::udir::udir().join(unique("shell-path"));
         fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("cc-bare.exe");
         fs::write(&exe, b"").unwrap();
@@ -2170,7 +2171,7 @@ mod tests {
 
     #[test]
     fn shell_command_search_dir_component_does_not_search_path() {
-        let dir = crate::tool::udir::udir().join(unique("shell-dir-comp"));
+        let dir = crate::udir::udir().join(unique("shell-dir-comp"));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("cc-x.exe"), b"").unwrap();
         assert_eq!(
@@ -2197,7 +2198,7 @@ mod tests {
 
     #[test]
     fn shell_command_search_quoted_path_entry() {
-        let dir = crate::tool::udir::udir().join(unique("shell-quoted"));
+        let dir = crate::udir::udir().join(unique("shell-quoted"));
         fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("cc-q.exe");
         fs::write(&exe, b"").unwrap();
@@ -2211,7 +2212,7 @@ mod tests {
     }
 
     fn write_udir(rel: &str, contents: &str) -> PathBuf {
-        let path = crate::tool::udir::udir().join(rel);
+        let path = crate::udir::udir().join(rel);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -2265,9 +2266,9 @@ mod tests {
     #[test]
     fn compile_args_from_eci_emits_include_dirs() {
         let plat = silent_host();
-        let inc = crate::tool::udir::udir().join(unique("inc"));
+        let inc = crate::udir::udir().join(unique("inc"));
         let eci = ExternalCompilationInfo {
-            include_dirs: vec![inc.clone()],
+            include_dirs: vec![inc.to_string_lossy().into_owned()],
             ..ExternalCompilationInfo::default()
         };
         let args = plat._compile_args_from_eci(&eci, true);
@@ -2282,7 +2283,7 @@ mod tests {
     fn compile_uses_eci_include_dirs() {
         let plat = silent_host();
         let prefix = unique("eci");
-        let inc = crate::tool::udir::udir().join(format!("{prefix}-inc"));
+        let inc = crate::udir::udir().join(format!("{prefix}-inc"));
         fs::create_dir_all(&inc).unwrap();
         fs::write(inc.join("needed.h"), "#define SOMEHASHDEFINE 42\n").unwrap();
         let cfile = write_udir(
@@ -2297,7 +2298,7 @@ mod tests {
             "#,
         );
         let eci = ExternalCompilationInfo {
-            include_dirs: vec![inc],
+            include_dirs: vec![inc.to_string_lossy().into_owned()],
             ..ExternalCompilationInfo::default()
         };
         let exe = plat
@@ -2381,7 +2382,7 @@ mod tests {
     fn link_args_include_eci_link_files() {
         let plat = silent_host();
         let eci = ExternalCompilationInfo {
-            link_files: vec![PathBuf::from("/foo/bar.a")],
+            link_files: vec!["/foo/bar.a".to_string()],
             link_extra: vec!["-Wl,-dead_strip".to_string()],
             ..ExternalCompilationInfo::default()
         };
@@ -2770,7 +2771,7 @@ mod tests {
     #[test]
     fn mingw_handle_error_appends_stdout_after_stderr() {
         let plat = windows::mingw_platform(host_triple());
-        let dir = crate::tool::udir::udir().join(unique("mingw-err"));
+        let dir = crate::udir::udir().join(unique("mingw-err"));
         fs::create_dir_all(&dir).unwrap();
         let outname = dir.join("out.o");
         let err = plat
@@ -2786,7 +2787,7 @@ mod tests {
     #[should_panic(expected = ".errors")]
     fn handle_error_write_failure_names_errors_file() {
         let plat = windows::mingw_platform(host_triple());
-        let outname = crate::tool::udir::udir()
+        let outname = crate::udir::udir()
             .join(unique("missing-dir"))
             .join("nested")
             .join("out.o");

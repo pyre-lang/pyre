@@ -9,7 +9,7 @@
 use std::mem::size_of;
 use std::sync::OnceLock;
 
-use crate::rffi::{self, DOUBLE, INT, RFFI_ALT_ERRNO, RFFI_ERR_ALL, SIZE_T, UINT, VOIDP};
+use crate::rffi::{DOUBLE, INT, RFFI_ALT_ERRNO, RFFI_ERR_ALL, SIZE_T, UINT, VOIDP};
 
 pub use libffi_sys::{ffi_abi, ffi_arg, ffi_cif, ffi_closure, ffi_type};
 
@@ -53,9 +53,10 @@ pub const FFI_SYSV: FFI_ABI = libffi_sys::ffi_abi_FFI_SYSV;
 #[cfg(target_arch = "arm")]
 pub const FFI_VFP: FFI_ABI = libffi_sys::ffi_abi_FFI_VFP;
 
-// `clibffi.py configure_simple_type`: copy size/alignment/type off the
-// libffi-sys static into an immortal record of our own. Callers compare
-// these pointers by identity (`jit_libffi.py types.getkind`).
+// Immortal `ffi_type` records (`configure_simple_type`). On non-MSVC
+// targets the records come from `cConfig`; on MSVC they are copied off
+// libffi-sys's statics. Callers compare these pointers by identity
+// (`jit_libffi.py types.getkind`).
 struct SimpleTypeStorage {
     ffi_type_double: ffi_type,
     ffi_type_uchar: ffi_type,
@@ -85,16 +86,29 @@ unsafe impl Send for SimpleTypeStorage {}
 
 static SIMPLE_TYPES: OnceLock<SimpleTypeStorage> = OnceLock::new();
 
-fn copy_simple(src: *const ffi_type) -> ffi_type {
-    let src = unsafe { &*src };
+#[cfg(not(target_env = "msvc"))]
+#[allow(non_upper_case_globals)]
+mod cconfig {
+    include!(concat!(env!("OUT_DIR"), "/clibffi_cconfig.rs"));
+}
+
+/// `clibffi.py configure_simple_type`.
+const fn configure_simple_type(size: usize, alignment: u16, type_: u16) -> ffi_type {
     ffi_type {
-        size: src.size,
-        alignment: src.alignment,
-        type_: src.type_,
+        size,
+        alignment,
+        type_,
         elements: std::ptr::null_mut(),
     }
 }
 
+#[cfg(target_env = "msvc")]
+fn copy_simple(src: *const ffi_type) -> ffi_type {
+    let src = unsafe { &*src };
+    configure_simple_type(src.size, src.alignment, src.type_)
+}
+
+#[cfg(target_env = "msvc")]
 fn sized_unsigned(
     u8t: ffi_type,
     u16t: ffi_type,
@@ -111,6 +125,7 @@ fn sized_unsigned(
     }
 }
 
+#[cfg(target_env = "msvc")]
 fn sized_signed(
     s8t: ffi_type,
     s16t: ffi_type,
@@ -127,6 +142,108 @@ fn sized_signed(
     }
 }
 
+#[cfg(not(target_env = "msvc"))]
+fn init_simple_types() -> SimpleTypeStorage {
+    SimpleTypeStorage {
+        ffi_type_double: configure_simple_type(
+            cconfig::ffi_type_double_size,
+            cconfig::ffi_type_double_alignment,
+            cconfig::ffi_type_double_type,
+        ),
+        ffi_type_uchar: configure_simple_type(
+            cconfig::ffi_type_uchar_size,
+            cconfig::ffi_type_uchar_alignment,
+            cconfig::ffi_type_uchar_type,
+        ),
+        ffi_type_schar: configure_simple_type(
+            cconfig::ffi_type_schar_size,
+            cconfig::ffi_type_schar_alignment,
+            cconfig::ffi_type_schar_type,
+        ),
+        ffi_type_sshort: configure_simple_type(
+            cconfig::ffi_type_sshort_size,
+            cconfig::ffi_type_sshort_alignment,
+            cconfig::ffi_type_sshort_type,
+        ),
+        ffi_type_ushort: configure_simple_type(
+            cconfig::ffi_type_ushort_size,
+            cconfig::ffi_type_ushort_alignment,
+            cconfig::ffi_type_ushort_type,
+        ),
+        ffi_type_uint: configure_simple_type(
+            cconfig::ffi_type_uint_size,
+            cconfig::ffi_type_uint_alignment,
+            cconfig::ffi_type_uint_type,
+        ),
+        ffi_type_sint: configure_simple_type(
+            cconfig::ffi_type_sint_size,
+            cconfig::ffi_type_sint_alignment,
+            cconfig::ffi_type_sint_type,
+        ),
+        ffi_type_float: configure_simple_type(
+            cconfig::ffi_type_float_size,
+            cconfig::ffi_type_float_alignment,
+            cconfig::ffi_type_float_type,
+        ),
+        ffi_type_longdouble: configure_simple_type(
+            cconfig::ffi_type_longdouble_size,
+            cconfig::ffi_type_longdouble_alignment,
+            cconfig::ffi_type_longdouble_type,
+        ),
+        ffi_type_pointer: configure_simple_type(
+            cconfig::ffi_type_pointer_size,
+            cconfig::ffi_type_pointer_alignment,
+            cconfig::ffi_type_pointer_type,
+        ),
+        ffi_type_void: configure_simple_type(
+            cconfig::ffi_type_void_size,
+            cconfig::ffi_type_void_alignment,
+            cconfig::ffi_type_void_type,
+        ),
+        ffi_type_sint8: configure_simple_type(
+            cconfig::ffi_type_sint8_size,
+            cconfig::ffi_type_sint8_alignment,
+            cconfig::ffi_type_sint8_type,
+        ),
+        ffi_type_uint8: configure_simple_type(
+            cconfig::ffi_type_uint8_size,
+            cconfig::ffi_type_uint8_alignment,
+            cconfig::ffi_type_uint8_type,
+        ),
+        ffi_type_sint16: configure_simple_type(
+            cconfig::ffi_type_sint16_size,
+            cconfig::ffi_type_sint16_alignment,
+            cconfig::ffi_type_sint16_type,
+        ),
+        ffi_type_uint16: configure_simple_type(
+            cconfig::ffi_type_uint16_size,
+            cconfig::ffi_type_uint16_alignment,
+            cconfig::ffi_type_uint16_type,
+        ),
+        ffi_type_sint32: configure_simple_type(
+            cconfig::ffi_type_sint32_size,
+            cconfig::ffi_type_sint32_alignment,
+            cconfig::ffi_type_sint32_type,
+        ),
+        ffi_type_uint32: configure_simple_type(
+            cconfig::ffi_type_uint32_size,
+            cconfig::ffi_type_uint32_alignment,
+            cconfig::ffi_type_uint32_type,
+        ),
+        ffi_type_sint64: configure_simple_type(
+            cconfig::ffi_type_sint64_size,
+            cconfig::ffi_type_sint64_alignment,
+            cconfig::ffi_type_sint64_type,
+        ),
+        ffi_type_uint64: configure_simple_type(
+            cconfig::ffi_type_uint64_size,
+            cconfig::ffi_type_uint64_alignment,
+            cconfig::ffi_type_uint64_type,
+        ),
+    }
+}
+
+#[cfg(target_env = "msvc")]
 fn init_simple_types() -> SimpleTypeStorage {
     // libffi-sys's `ffi_type_*` statics hold the C library's size/alignment/type.
     let uint8 = copy_simple(&raw const libffi_sys::ffi_type_uint8);
@@ -138,16 +255,18 @@ fn init_simple_types() -> SimpleTypeStorage {
     let uint64 = copy_simple(&raw const libffi_sys::ffi_type_uint64);
     let sint64 = copy_simple(&raw const libffi_sys::ffi_type_sint64);
     let double = copy_simple(&raw const libffi_sys::ffi_type_double);
-    // Where `long double` is `double`, `ffi.h` defines `ffi_type_longdouble`
-    // as a macro for `ffi_type_double` and libffi exports no such symbol
-    // (build.rs sets `clibffi_longdouble` otherwise).
-    #[cfg(clibffi_longdouble)]
-    let longdouble = copy_simple(&raw const libffi_sys::ffi_type_longdouble);
-    #[cfg(not(clibffi_longdouble))]
+    // MSVC's `long double` is `double`, and the bundled libffi's `fficonfig.h`
+    // leaves `HAVE_LONG_DOUBLE` 0.
     let longdouble = double;
     SimpleTypeStorage {
         ffi_type_double: double,
-        ffi_type_uchar: sized_unsigned(uint8, uint16, uint32, uint64, size_of::<rffi::UCHAR>()),
+        ffi_type_uchar: sized_unsigned(
+            uint8,
+            uint16,
+            uint32,
+            uint64,
+            size_of::<crate::rffi::UCHAR>(),
+        ),
         ffi_type_schar: sized_signed(
             sint8,
             sint16,
@@ -155,10 +274,22 @@ fn init_simple_types() -> SimpleTypeStorage {
             sint64,
             size_of::<std::ffi::c_schar>(),
         ),
-        ffi_type_sshort: sized_signed(sint8, sint16, sint32, sint64, size_of::<rffi::SHORT>()),
-        ffi_type_ushort: sized_unsigned(uint8, uint16, uint32, uint64, size_of::<rffi::USHORT>()),
-        ffi_type_uint: sized_unsigned(uint8, uint16, uint32, uint64, size_of::<rffi::UINT>()),
-        ffi_type_sint: sized_signed(sint8, sint16, sint32, sint64, size_of::<rffi::INT>()),
+        ffi_type_sshort: sized_signed(
+            sint8,
+            sint16,
+            sint32,
+            sint64,
+            size_of::<crate::rffi::SHORT>(),
+        ),
+        ffi_type_ushort: sized_unsigned(
+            uint8,
+            uint16,
+            uint32,
+            uint64,
+            size_of::<crate::rffi::USHORT>(),
+        ),
+        ffi_type_uint: sized_unsigned(uint8, uint16, uint32, uint64, size_of::<UINT>()),
+        ffi_type_sint: sized_signed(sint8, sint16, sint32, sint64, size_of::<INT>()),
         ffi_type_float: copy_simple(&raw const libffi_sys::ffi_type_float),
         ffi_type_longdouble: longdouble,
         ffi_type_pointer: copy_simple(&raw const libffi_sys::ffi_type_pointer),

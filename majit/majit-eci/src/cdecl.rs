@@ -44,6 +44,8 @@ pub enum Resolved {
     Alias(syn::Type, Vec<String>),
     Extern(Vec<String>),
     LocalStruct(String),
+    /// A platform typedef whose class `rffi_platform` measured.
+    Int(crate::rffi_platform::IntType),
 }
 
 /// Peel `Type::Paren`/`Type::Group` and follow `Resolved::Alias` to the type
@@ -191,6 +193,7 @@ pub fn gettype(
                 Some(Resolved::Alias(target, alias_module)) => {
                     gettype(&target, &alias_module, resolve)
                 }
+                Some(Resolved::Int(t)) => Ok(int_template(t.signed, t.bits).to_string()),
                 Some(Resolved::Extern(p)) => match p.last() {
                     Some(last) => {
                         let spelled = if p.len() == 3 && p[0] == "majit_rlib" && p[1] == "rffi" {
@@ -260,7 +263,7 @@ fn fixed_array_length(arr: &syn::TypeArray, ty: &Type) -> Result<usize, String> 
     }
 }
 
-fn option_of_bare_fn(path: &syn::Path) -> Option<&Type> {
+pub(crate) fn option_of_bare_fn(path: &syn::Path) -> Option<&Type> {
     let last = path.segments.last()?;
     if last.ident != "Option" {
         return None;

@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn pkg_config_check_result_dir_accepts_existing_default() {
-        let default = vec![crate::tool::udir::udir().as_os_str().to_os_string()];
+        let default = vec![crate::udir::udir().as_os_str().to_os_string()];
         let result = _pkg_config(
             "majit-translate-no-such-libffi-pkg",
             "--cflags-only-I",
@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn pkg_config_check_result_dir_rejects_missing_default() {
         let default = vec![
-            crate::tool::udir::udir()
+            crate::udir::udir()
                 .join("majit-translate-no-such-libffi-dir")
                 .into_os_string(),
         ];

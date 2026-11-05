@@ -84,7 +84,7 @@ pub(crate) fn s390x_update_cflags(mut cflags: Vec<OsString>) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translator::tool::cbuild::ExternalCompilationInfo;
+    use crate::ExternalCompilationInfo;
 
     #[test]
     fn s390x_update_cflags_defaults_to_zec12_and_appends_m64() {

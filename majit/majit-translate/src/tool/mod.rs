@@ -17,10 +17,8 @@
 //! | `udir`                | `udir.py`                     |
 
 pub mod algo;
-pub mod ansi_print;
+pub use majit_eci::{ansi_print, gcc_cache, udir};
 pub mod error;
 pub mod flattenrec;
-pub mod gcc_cache;
 pub mod pairtype;
 pub mod sourcetools;
-pub mod udir;

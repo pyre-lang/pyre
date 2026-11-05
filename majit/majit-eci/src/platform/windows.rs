@@ -334,8 +334,8 @@ pub(super) fn patch_os_env(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translator::platform::is_asm_source;
-    use crate::translator::tool::cbuild::ExternalCompilationInfo;
+    use crate::ExternalCompilationInfo;
+    use crate::platform::is_asm_source;
     use std::path::Path;
 
     fn msvc_x64() -> Platform {
@@ -356,11 +356,10 @@ mod tests {
             "link.exe",
             "MsvcPlatform.link is link.exe"
         );
-        let libdir = PathBuf::from(r"C:\libs");
         let eci = ExternalCompilationInfo {
-            library_dirs: vec![libdir.clone()],
+            library_dirs: vec![r"C:\libs".to_string()],
             libraries: vec!["foo".to_string()],
-            link_files: vec![PathBuf::from(r"C:\prebuilt.obj")],
+            link_files: vec![r"C:\prebuilt.obj".to_string()],
             ..ExternalCompilationInfo::default()
         };
         let link_args = plat._link_args_from_eci(&eci, true);

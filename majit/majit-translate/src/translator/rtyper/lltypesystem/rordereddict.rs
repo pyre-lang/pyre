@@ -25,7 +25,7 @@ use crate::rlib::jit::{LookInsidePred, mint_look_inside_iff};
 #[cfg(test)]
 use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
-use crate::translator::rtyper::llinterp::eval_funcptr;
+use crate::translator::rtyper::llinterp::{FrameError, eval_funcptr};
 use crate::translator::rtyper::lltypesystem::lltype::{
     _ptr, Array, GCREF, LowLevelType, LowLevelValue, MallocFlavor, Ptr, PtrTarget, Struct,
     cast_opaque_ptr, cast_primitive, malloc,
@@ -40,7 +40,6 @@ use crate::translator::rtyper::rtyper::{
     ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype,
     exception_args, helper_pygraph_from_graph, variable_with_lltype, void_field_const,
 };
-use crate::translator::tool::taskengine::TaskError;
 
 fn ptr_to_gc_array(of: LowLevelType) -> LowLevelType {
     LowLevelType::Ptr(Box::new(Ptr {
@@ -11749,7 +11748,7 @@ fn host_hlinvoke(
         },
     };
     eval_funcptr(&p, args)
-        .map_err(TaskError::from)
+        .map_err(FrameError::into_task_error)
         .map_err(|e| TyperError::message(e.message))
 }
 
@@ -11769,7 +11768,7 @@ fn ll_keyhash(d: &_ptr, key: &LowLevelValue) -> Result<i64, TyperError> {
                 ))
             })?;
             eval_funcptr(&fp, std::slice::from_ref(key))
-                .map_err(TaskError::from)
+                .map_err(FrameError::into_task_error)
                 .map_err(|e| TyperError::message(e.message))?
         }
         None => {
@@ -11817,7 +11816,7 @@ fn ll_keyeq(d: &_ptr, a: &LowLevelValue, b: &LowLevelValue) -> Result<Option<boo
                 TyperError::message(format!("d.keyeq: stored adtmeth is not a funcptr: {adt:?}"))
             })?;
             eval_funcptr(&fp, &[a.clone(), b.clone()])
-                .map_err(TaskError::from)
+                .map_err(FrameError::into_task_error)
                 .map_err(|e| TyperError::message(e.message))?
         }
     };

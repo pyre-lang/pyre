@@ -9,14 +9,13 @@
 //! temp file + rename.
 
 use md5::{Digest, Md5};
-use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-use crate::config::translationoption::cache_dir;
-use crate::translator::platform::{CompilationError, platform};
-use crate::translator::tool::cbuild::ExternalCompilationInfo;
+use crate::ExternalCompilationInfo;
+use crate::platform::{CompilationError, platform};
+use majit_config::translationoption::cache_dir;
 
 /// `cache_file_path(c_files, eci, cachename)`.
 pub fn cache_file_path(
@@ -32,7 +31,7 @@ pub fn cache_file_path(
 /// The rustc sizeof probe (`rfficache.sizeof_c_types_via_rustc`) is a
 /// cross-target adaptation: the target has no C toolchain, so the cache
 /// key uses a rustc identity instead of the host `Platform.key`.
-pub(crate) fn cache_file_path_with_key(
+pub fn cache_file_path_with_key(
     c_files: &[impl AsRef<Path>],
     eci: &ExternalCompilationInfo,
     cachename: &str,
@@ -221,16 +220,16 @@ fn hash_eci(hasher: &mut Md5, eci: &ExternalCompilationInfo) {
     } = eci;
     hash_named_strs(hasher, "pre_include_bits", pre_include_bits);
     hash_named_strs(hasher, "includes", includes);
-    hash_named_paths(hasher, "include_dirs", include_dirs);
+    hash_named_strs(hasher, "include_dirs", include_dirs);
     hash_named_strs(hasher, "post_include_bits", post_include_bits);
     hash_named_strs(hasher, "libraries", libraries);
-    hash_named_paths(hasher, "library_dirs", library_dirs);
+    hash_named_strs(hasher, "library_dirs", library_dirs);
     hash_named_strs(hasher, "separate_module_sources", separate_module_sources);
-    hash_named_paths(hasher, "separate_module_files", separate_module_files);
+    hash_named_strs(hasher, "separate_module_files", separate_module_files);
     hash_named_strs(hasher, "compile_extra", compile_extra);
     hash_named_strs(hasher, "link_extra", link_extra);
     hash_named_strs(hasher, "frameworks", frameworks);
-    hash_named_paths(hasher, "link_files", link_files);
+    hash_named_strs(hasher, "link_files", link_files);
     hash_named_strs(hasher, "testonly_libraries", testonly_libraries);
     hash_bytes(hasher, b"use_cpp_linker");
     hasher.update([u8::from(*use_cpp_linker)]);
@@ -241,14 +240,6 @@ fn hash_eci(hasher: &mut Md5, eci: &ExternalCompilationInfo) {
             hash_bytes(hasher, value.as_bytes());
         }
         None => hasher.update([0]),
-    }
-}
-
-fn hash_named_paths(hasher: &mut Md5, name: &str, values: &[PathBuf]) {
-    hash_bytes(hasher, name.as_bytes());
-    hasher.update((values.len() as u64).to_le_bytes());
-    for value in values {
-        hash_os(hasher, value.as_os_str());
     }
 }
 
@@ -263,10 +254,6 @@ fn hash_named_strs(hasher: &mut Md5, name: &str, values: &[String]) {
 fn hash_bytes(hasher: &mut Md5, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
-}
-
-fn hash_os(hasher: &mut Md5, value: &OsStr) {
-    hash_bytes(hasher, value.as_encoded_bytes());
 }
 
 #[cfg(test)]
@@ -288,7 +275,7 @@ mod tests {
 
     fn write_temp_c(contents: &str) -> PathBuf {
         // `Platform._make_o_file` requires sources under the repo or `udir`.
-        let dir = crate::tool::udir::udir().join("gcc_cache_tests");
+        let dir = crate::udir::udir().join("gcc_cache_tests");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!(
             "src-{}-{}.c",
@@ -399,7 +386,6 @@ mod tests {
         let files = std::slice::from_ref(&src);
         let base = ExternalCompilationInfo::default();
         let base_path = cache_file_path_with_key(files, &base, "test", "key").expect("base");
-        let sentinel_path = PathBuf::from("/eci-sentinel");
         let sentinel = "eci-sentinel".to_string();
         let variants = [
             ExternalCompilationInfo {
@@ -411,7 +397,7 @@ mod tests {
                 ..ExternalCompilationInfo::default()
             },
             ExternalCompilationInfo {
-                include_dirs: vec![sentinel_path.clone()],
+                include_dirs: vec![sentinel.clone()],
                 ..ExternalCompilationInfo::default()
             },
             ExternalCompilationInfo {
@@ -423,7 +409,7 @@ mod tests {
                 ..ExternalCompilationInfo::default()
             },
             ExternalCompilationInfo {
-                library_dirs: vec![sentinel_path.clone()],
+                library_dirs: vec![sentinel.clone()],
                 ..ExternalCompilationInfo::default()
             },
             ExternalCompilationInfo {
@@ -431,7 +417,7 @@ mod tests {
                 ..ExternalCompilationInfo::default()
             },
             ExternalCompilationInfo {
-                separate_module_files: vec![sentinel_path.clone()],
+                separate_module_files: vec![sentinel.clone()],
                 ..ExternalCompilationInfo::default()
             },
             ExternalCompilationInfo {
@@ -447,7 +433,7 @@ mod tests {
                 ..ExternalCompilationInfo::default()
             },
             ExternalCompilationInfo {
-                link_files: vec![sentinel_path],
+                link_files: vec![sentinel.clone()],
                 ..ExternalCompilationInfo::default()
             },
             ExternalCompilationInfo {
