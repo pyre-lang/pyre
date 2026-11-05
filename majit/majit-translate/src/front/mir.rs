@@ -4521,15 +4521,21 @@ fn derive_program_metadata(
                     && enum_layout
                         .as_ref()
                         .is_some_and(|layout| layout.has_branch_discriminant());
-                if !fieldless && !tag_recorded_but_unspellable && !marked {
-                    let discr_ty = discr_ty.unwrap_or("i64").to_string();
-                    let rows: Vec<(String, String)> =
-                        vec![("__discriminant".to_string(), discr_ty)];
-                    struct_fields.fields.insert(name.clone(), rows.clone());
-                    struct_fields.fields.insert(leaf.clone(), rows.clone());
-                    struct_fields.fields.insert(canon_base.clone(), rows);
-                    // Object identity for the enum base (the discriminant
-                    // carrier), minted from the crate-stripped `module::Enum`.
+                if !fieldless && !tag_recorded_but_unspellable {
+                    if !marked {
+                        let discr_ty = discr_ty.unwrap_or("i64").to_string();
+                        let rows: Vec<(String, String)> =
+                            vec![("__discriminant".to_string(), discr_ty)];
+                        struct_fields.fields.insert(name.clone(), rows.clone());
+                        struct_fields.fields.insert(leaf.clone(), rows.clone());
+                        struct_fields.fields.insert(canon_base.clone(), rows);
+                    }
+                    // Object identity for the enum base, minted from the
+                    // crate-stripped `module::Enum`. A marked exception
+                    // class skips the `__discriminant` field rows (the
+                    // base class gets none) and still records intern
+                    // identity so `intern_class_key` resolves the leaf
+                    // alias (`Bookkeeper.getdesc`).
                     record_struct_id(
                         &mut struct_ids,
                         &mut struct_fields.class_identity,
