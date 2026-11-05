@@ -6987,6 +6987,51 @@ fn run_annotator_simplify_isolated(
     }
 }
 
+/// Dual-gate `flowin` treats a blocked `simple_call` / `call_args` /
+/// `next` as `HarmlesslySwallowed`: the block is marked annotated
+/// (`processblock` Ok) and `follow_link` never runs. Upstream
+/// `complete()` would raise on a still-blocked call; dual-gate does
+/// not, so a later `transform_dead_code` cutoff would rewrite the
+/// GraphStore success exit into `exceptblock`.
+///
+/// Skip that cutoff only when the GraphStore origin is a unit success
+/// (`returnblock`, every link arg a Const). That is the kind-arm of a
+/// void Call whose MIR already returned: keeping the Const-None exit
+/// preserves the front graph. A value-returning swallowed call still
+/// cuts — its GraphStore args are Variables, and leaving them uncut
+/// would publish an unbound success. A dead switch has annotated
+/// `same_as` ops and still cuts.
+fn flowspace_block_swallowed_call_family(block: &crate::flowspace::model::Block) -> bool {
+    if block.canraise() {
+        return false;
+    }
+    block.operations.iter().any(|op| {
+        matches!(op.opname.as_str(), "simple_call" | "call_args" | "next")
+            && matches!(
+                &op.result,
+                crate::flowspace::model::Hlvalue::Variable(v) if v.annotation.borrow().is_none()
+            )
+    })
+}
+
+fn graphstore_origin_is_const_return(
+    graph: &LegacyGraph,
+    link: &crate::flowspace::model::LinkRef,
+) -> bool {
+    let Some(origin) = link.borrow().origin else {
+        return false;
+    };
+    if origin.0.0 >= graph.blocks.len() || origin.1 >= graph.blocks[origin.0.0].exits.len() {
+        return false;
+    }
+    let exit = &graph.blocks[origin.0.0].exits[origin.1];
+    exit.target == graph.returnblock
+        && exit
+            .args
+            .iter()
+            .all(|a| matches!(a, crate::model::LinkArg::Const(_)))
+}
+
 /// Decide the GraphStore cut from `annotator.links_followed` on the
 /// still-unsimplified flowspace graph (`transform.py` `transform_dead_code`).
 /// Every unfollowed exit of every annotated block is recorded; a
@@ -7038,7 +7083,11 @@ fn record_tdc_cut_for_flow_graph(
                     None => none_origin += 1,
                 }
                 remaining.retain(|l| !Rc::ptr_eq(l, link));
-                if transform_dead_code_would_cutoff(canraise, &remaining) {
+                if transform_dead_code_would_cutoff(canraise, &remaining)
+                    && (canraise
+                        || !flowspace_block_swallowed_call_family(&fb)
+                        || !graphstore_origin_is_const_return(graph, link))
+                {
                     cutoff = true;
                 }
             } else if let Some(o) = origin {
@@ -12323,6 +12372,66 @@ mod tests {
         assert!(gs.block(start).exitswitch.is_none());
         assert!(gs.block(body_id).dead);
         assert!(gs.block(body_id).exits.is_empty());
+    }
+
+    /// A non-raising GraphStore Call whose flowspace `simple_call` was
+    /// HarmlesslySwallowed leaves remaining empty without `follow_link`.
+    /// Dual-gate marks that block annotated, so a cutoff would rewrite
+    /// the still-live success exit into exceptblock. Keep the return.
+    #[test]
+    fn tdc_graphstore_cut_keeps_success_of_swallowed_simple_call() {
+        let mut gs = LegacyGraph::new("swallowed_call");
+        let start = gs.startblock;
+        let ret = gs.returnblock;
+        let src = gs.alloc_value_var();
+        let r0 = gs.alloc_value_var();
+        gs.block_mut(start).inputargs = vec![src.clone()];
+        gs.block_mut(start).operations = vec![hint_op(&src, &r0)];
+        gs.closeblock(
+            start,
+            vec![crate::model::Link::new_mixed(
+                vec![LinkArg::from(crate::flowspace::model::ConstValue::None)],
+                ret,
+                None,
+            )],
+        );
+
+        let fs_src = Variable::new();
+        let fs_result = Variable::new();
+        let fs_start =
+            crate::flowspace::model::Block::shared(vec![Hlvalue::Variable(fs_src.clone())]);
+        {
+            let mut b = fs_start.borrow_mut();
+            b.operations
+                .push(crate::flowspace::model::SpaceOperation::new(
+                    "simple_call",
+                    vec![Hlvalue::Variable(fs_src.clone())],
+                    Hlvalue::Variable(fs_result),
+                ));
+        }
+        let flow = crate::flowspace::model::FunctionGraph::new("swallowed_call", fs_start.clone())
+            .into_ref();
+        let fs_ret = flow.borrow().returnblock.clone();
+        let success = crate::flowspace::model::Link::new(
+            vec![Hlvalue::Constant(crate::flowspace::model::Constant::new(
+                crate::flowspace::model::ConstValue::None,
+            ))],
+            Some(fs_ret),
+            None,
+        )
+        .into_ref();
+        stamp_origin(&success, start, 0);
+        fs_start.closeblock(vec![success]);
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        seed_annotated(&ann, &flow, std::slice::from_ref(&fs_start));
+
+        let (unmapped, removed) = run_recorded_tdc_cut(&ann, &mut gs, &flow, &HashMap::new());
+        assert_eq!(unmapped, 0);
+        assert_eq!(removed, 0);
+        assert_eq!(gs.block(start).exits.len(), 1);
+        assert_eq!(gs.block(start).exits[0].target, ret);
+        assert!(!gs.block(start).canraise());
     }
 
     /// Host: `tdc_graphstore_cut_truncates_alwaysraising_op_and_recloses_errlink`.

@@ -5282,6 +5282,30 @@ fn dispatch_recursive_call<Sym: WalkSym>(
     } else {
         code[op.next_pc - 1] as usize
     };
+    recursive_call_from_green_red_boxes(
+        ctx, op, jd_index, dst_bank, dst, &greens_i, &greens_r, &greens_f, &reds_i, &reds_r,
+        &reds_f,
+    )
+}
+
+/// `_opimpl_recursive_call` / `do_recursive_call` after greens and reds
+/// are already boxes. The EvalFn residual rebuilds those boxes from the
+/// live helper-ABI frame and enters here so it never `execute_varargs`s
+/// the process evaluator.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn recursive_call_from_green_red_boxes<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    jd_index: usize,
+    dst_bank: char,
+    dst: usize,
+    greens_i: &[OpRef],
+    greens_r: &[OpRef],
+    greens_f: &[OpRef],
+    reds_i: &[OpRef],
+    reds_r: &[OpRef],
+    reds_f: &[OpRef],
+) -> Result<(DispatchOutcome, usize), DispatchError> {
     let (adr, descr) = {
         let (driver, _) = crate::driver::driver_pair();
         let Some(jd) = driver.meta_interp().staticdata.jitdrivers_sd.get(jd_index) else {

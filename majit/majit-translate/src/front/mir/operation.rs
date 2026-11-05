@@ -7869,6 +7869,18 @@ impl<'a> Lowering<'a> {
                 });
             }
         }
+        // The error carrier is one pointer word (`retag_error_carrier`).
+        // `tyref_transparent_inner_value_type` returns None so the handle
+        // keeps the wrapper class (`PyError.0` stays a field of that
+        // class); construction is still the operand, not a named-struct
+        // malloc of `__pos_0`. A residual that takes the object pointer
+        // then receives that word.
+        if n_operands == 1 && self.ty_is_error_carrier(dest_ty) {
+            return Ok(AggregateShape::Operand {
+                index: 0,
+                transparent: true,
+            });
+        }
         // Resolve the user-defined owner + field names and types from the
         // Adt kind's `type_id` when possible.  Charon encodes
         // `AggregateKind::Adt(type_id, variant_idx, ..)` as

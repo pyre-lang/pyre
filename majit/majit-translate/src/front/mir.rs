@@ -7340,7 +7340,7 @@ pub(crate) use self::consteval::{
     type_flag_for_external_transparent_scalar,
 };
 pub(crate) use self::desugar::callee::{
-    discover_eval_hook_graphs, release_declared_vable_array_address,
+    discover_eval_hook_graphs, discover_eval_override_graphs, release_declared_vable_array_address,
 };
 pub(crate) use self::desugar::rewire::{
     AggregateCtor, AggregateShape, emit_aggregate_value, is_core_clone_impls_clone_path,

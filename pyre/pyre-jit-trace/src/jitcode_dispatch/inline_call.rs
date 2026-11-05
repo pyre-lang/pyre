@@ -5164,7 +5164,10 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     }))
 }
 
-fn residual_result_word<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, opref: OpRef) -> i64 {
+pub(crate) fn residual_result_word<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    opref: OpRef,
+) -> i64 {
     match ctx
         .trace_ctx
         .concrete_of_opref(opref)
@@ -5177,7 +5180,7 @@ fn residual_result_word<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, opref: OpR
     }
 }
 
-fn concrete_value_word(concrete: ConcreteValue) -> i64 {
+pub(crate) fn concrete_value_word(concrete: ConcreteValue) -> i64 {
     match concrete {
         ConcreteValue::Ref(ptr) => ptr as i64,
         ConcreteValue::Int(n) => n,
@@ -5221,11 +5224,12 @@ fn opref_live_value<Sym: WalkSym>(
     ctx.trace_ctx
         .concrete_of_opref(arg)
         .or_else(|| ctx.trace_ctx.box_value(arg))
+        .or_else(|| ctx.trace_ctx.recover_ref_value(arg, 4))
 }
 
 /// The helper residual's red is `allboxes[1]`, the look-inside `deref_mut`
 /// result (`pyjitpl.py` `build_allboxes` = `[funcbox, ...permuted args]`).
-fn existing_eval_frame_arg<Sym: WalkSym>(
+pub(crate) fn existing_eval_frame_arg<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     allboxes: &[OpRef],
 ) -> Option<(OpRef, *mut pyre_interpreter::PyFrame)> {
