@@ -364,7 +364,8 @@ pub(crate) struct InlineBodyFacts {
 #[derive(Clone, Copy)]
 pub(crate) struct BlackholeResumeFacts {
     /// [`crate::jitcode_runtime::blackhole_resume_reachable_starts`] returned
-    /// `None` (`switch` or an undecodable instruction).
+    /// `None` (an undecodable instruction, including a `switch` whose descr
+    /// is not a `SwitchDictDescr`).
     pub(crate) switch_or_undecodable: bool,
     /// Some reachable op's `bhimpl_*` may raise, or the scan failed.
     pub(crate) may_raise: bool,
@@ -397,6 +398,7 @@ pub(crate) fn compute_blackhole_resume_facts(
         jitcode.code.as_slice(),
         pc,
         in_flight_callee_may_raise,
+        Some(jitcode),
     ) {
         None => BlackholeResumeFacts {
             switch_or_undecodable: true,
