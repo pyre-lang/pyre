@@ -15073,7 +15073,7 @@ mod tests {
         let exc_host = base.borrow().classdesc.borrow().pyobj.clone();
         assert_eq!(exc_host.qualname(), "ArgErr");
         assert_ne!(exc_host, struct_host);
-        let roots = ann.bookkeeper.struct_root_classes.borrow();
+        let roots = ann.bookkeeper.struct_root_classes();
         assert_ne!(
             roots.get("ArgErr").expect("literal key"),
             roots.get("argument::ArgErr").expect("struct key")

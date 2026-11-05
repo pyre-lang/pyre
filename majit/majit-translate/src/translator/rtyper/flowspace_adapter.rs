@@ -5204,8 +5204,7 @@ fn legacy_const_define_hlvalue(
             let name = obj.qualname();
             let host = registry
                 .bookkeeper()
-                .struct_root_classes
-                .borrow()
+                .struct_root_classes()
                 .get(name)
                 .cloned()
                 .unwrap_or_else(|| panic!("class ConstRef `{name}` is not an interned class"));

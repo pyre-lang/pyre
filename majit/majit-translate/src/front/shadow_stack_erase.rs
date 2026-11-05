@@ -3156,7 +3156,7 @@ fn discover_stack_effects(
     let mut observes_ids: Vec<usize> = Vec::new();
     let mut other_ids: Vec<usize> = Vec::new();
     for (i, fd) in fds.iter().enumerate() {
-        let Some(body) = fd.unstructured() else {
+        let Some(body) = fd.unstructured_shared() else {
             continue;
         };
         let forward_blocks = super::forward_reachable_mask(llbc, &body);
@@ -3224,7 +3224,7 @@ fn discover_stack_effects(
             }) {
             prev.clone()
         } else {
-            let Some(body) = fds[i].unstructured() else {
+            let Some(body) = fds[i].unstructured_shared() else {
                 continue;
             };
             let queried = std::cell::RefCell::new(Vec::new());
@@ -3330,7 +3330,7 @@ pub fn discover_depth_neutral_fns(llbc: &Llbc) -> Vec<String> {
             {
                 continue;
             }
-            let Some(body) = fd.unstructured() else {
+            let Some(body) = fd.unstructured_shared() else {
                 last_check[i] = Some((proven.len(), Vec::new()));
                 continue;
             };

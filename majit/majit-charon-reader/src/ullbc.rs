@@ -69,6 +69,9 @@ pub struct FunDecl {
     /// query.
     #[serde(skip)]
     splices_promoted: OnceLock<bool>,
+    /// [`FunDecl::unstructured_shared`], parsed on first query.
+    #[serde(skip)]
+    unstructured_cache: OnceLock<Option<Arc<Unstructured>>>,
     /// Set on a body-less foreign declaration whose signature, span, and
     /// impl owner match one constructor a defining crate analysed as
     /// returning an owned root-bracket guard. Read only when
@@ -137,6 +140,24 @@ impl FunDecl {
             splice_promoted_reads(&mut u, table, false);
         }
         Some(u)
+    }
+
+    /// [`FunDecl::unstructured`], parsed once and shared by every later caller.
+    /// For readers that do not modify the body.
+    pub fn unstructured_shared(&self) -> Option<Arc<Unstructured>> {
+        self.unstructured_cache
+            .get_or_init(|| self.unstructured().map(Arc::new))
+            .clone()
+    }
+
+    /// An owned [`FunDecl::unstructured`] body for a caller that modifies it: a copy of the
+    /// [`FunDecl::unstructured_shared`] body when that is already parsed, else a fresh parse
+    /// that leaves the shared cache unset.
+    pub fn unstructured_owned(&self) -> Option<Unstructured> {
+        match self.unstructured_cache.get() {
+            Some(shared) => shared.as_deref().cloned(),
+            None => self.unstructured(),
+        }
     }
 
     /// Rewrite each shared borrow of a string-literal global in `body` to an inline `const`,
@@ -1434,14 +1455,14 @@ impl TyRef {
 
 // Bodies
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Unstructured {
     pub locals: Locals,
     pub body: Vec<BasicBlock>,
     pub span: SpanRef,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Locals {
     pub arg_count: u64,
     pub locals: Vec<Local>,
@@ -1497,6 +1518,20 @@ pub struct BasicBlock {
     /// the raw JSON again.
     #[serde(skip)]
     term_cache: OnceLock<Box<Result<TermKind, String>>>,
+}
+
+impl Clone for BasicBlock {
+    /// Copies the statements, terminator and unwind kind; the terminator projection cache
+    /// starts empty, as after a parse.
+    fn clone(&self) -> Self {
+        BasicBlock {
+            statements: self.statements.clone(),
+            terminator: self.terminator.clone(),
+            kind: self.kind,
+            is_cleanup: self.is_cleanup,
+            term_cache: OnceLock::new(),
+        }
+    }
 }
 
 impl From<BasicBlockDe> for BasicBlock {
@@ -2501,6 +2536,17 @@ pub struct Terminator {
     value_cache: OnceLock<Box<Value>>,
 }
 
+impl Clone for Terminator {
+    /// Copies the raw kind and span; the decoded-kind cache starts empty, as after a parse.
+    fn clone(&self) -> Self {
+        Terminator {
+            kind: self.kind.clone(),
+            span: self.span.clone(),
+            value_cache: OnceLock::new(),
+        }
+    }
+}
+
 impl Terminator {
     /// The terminator kind as an untyped JSON tree, parsed on first query.
     pub fn kind_value(&self) -> &Value {
@@ -2526,6 +2572,18 @@ pub struct Statement {
     /// [`Statement::kind_value`], parsed on first query.
     #[serde(skip)]
     value_cache: OnceLock<Box<Value>>,
+}
+
+impl Clone for Statement {
+    /// Copies the raw kind and span; the decoded-kind caches start empty, as after a parse.
+    fn clone(&self) -> Self {
+        Statement {
+            kind: self.kind.clone(),
+            span: self.span.clone(),
+            stmt_cache: OnceLock::new(),
+            value_cache: OnceLock::new(),
+        }
+    }
 }
 
 impl Statement {

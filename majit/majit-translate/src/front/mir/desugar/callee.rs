@@ -40,7 +40,7 @@ pub(crate) fn discover_eval_hook_graphs(llbc: &Llbc) -> Vec<String> {
     let mut overrides = Vec::new();
     let mut plain = Vec::new();
     for fd in llbc.iter_local_fns() {
-        let Some(body) = fd.unstructured() else {
+        let Some(body) = fd.unstructured_shared() else {
             continue;
         };
         let mut bound = vec![None; body.locals.locals.len()];

@@ -845,12 +845,7 @@ impl CallRegistry {
         for family in families {
             for impl_root in &family.impl_roots {
                 let key = majit_ir::descr::canonical_struct_name(impl_root);
-                let host = self
-                    .bookkeeper
-                    .struct_root_classes
-                    .borrow()
-                    .get(&key)
-                    .cloned();
+                let host = self.bookkeeper.struct_root_classes().get(&key).cloned();
                 let Some(host) = host else { continue };
                 let Ok(cd) = self.bookkeeper.getuniqueclassdef(&host) else {
                     continue;

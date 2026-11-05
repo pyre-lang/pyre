@@ -436,7 +436,11 @@ pub struct Bookkeeper {
     /// `annotationoftype(t) -> getuniqueclassdef(t)` (signature.py)
     /// where `t` is the already-resolved class object.  Used by
     /// [`Self::getuniqueclassdef_for_struct_root`].
-    pub struct_root_classes: RefCell<HashMap<String, HostObject>>,
+    struct_root_classes: RefCell<HashMap<String, HostObject>>,
+    /// Keys of [`Self::struct_root_classes`] grouped by their last `::`
+    /// segment. Filled by [`Self::insert_struct_root_class`], the only
+    /// writer of `struct_root_classes`, which is never shrunk.
+    struct_root_class_leaves: RefCell<rustc_hash::FxHashMap<String, Vec<String>>>,
     /// Class key (`canonical_struct_name`) of the interpreter's error
     /// carrier object, the `Deref::Target` of the `E` of `Result<T, E>`.
     /// The object is what the program raises, so it is minted as an
@@ -1395,6 +1399,7 @@ impl Bookkeeper {
             enum_variant_by_discriminant: RefCell::new(None),
             enum_variant_stripped_keys: RefCell::new(Vec::new()),
             struct_root_classes: RefCell::new(HashMap::new()),
+            struct_root_class_leaves: RefCell::new(rustc_hash::FxHashMap::default()),
             exception_carrier: RefCell::new(None),
             exception_carrier_handle: RefCell::new(None),
             trait_unique_impls: RefCell::new(HashMap::new()),
@@ -3332,9 +3337,7 @@ impl Bookkeeper {
             Vec::new(),
             base_members,
         );
-        self.struct_root_classes
-            .borrow_mut()
-            .insert(base_key, base_host.clone());
+        self.insert_struct_root_class(base_key, base_host.clone());
         // Index the base by the raw `base_root` spelling too, so the
         // receiver seed (`derive_subject_inputcells`) can match a
         // `dyn Trait` receiver's `class_root` (the trait's `name_path()`)
@@ -3352,9 +3355,7 @@ impl Bookkeeper {
                 vec![base_host.clone()],
                 members,
             );
-            self.struct_root_classes
-                .borrow_mut()
-                .insert(impl_key, impl_host.clone());
+            self.insert_struct_root_class(impl_key, impl_host.clone());
             self.getuniqueclassdef(&impl_host)?;
         }
         Ok(base_cd)
@@ -4095,9 +4096,7 @@ impl Bookkeeper {
             crate::virtualizable_decl::stamp_host_virtualizable(&host, &key);
             self.stamp_raw_alloc_flavor(&host, &key);
             self.stamp_immutable_fields(&host, &key);
-            self.struct_root_classes
-                .borrow_mut()
-                .insert(key, host.clone());
+            self.insert_struct_root_class(key, host.clone());
             base_host = Some(host);
         }
         base_host.expect("chain holds at least `name` itself")
@@ -4138,9 +4137,7 @@ impl Bookkeeper {
         crate::virtualizable_decl::stamp_host_virtualizable(&host, &key);
         self.stamp_raw_alloc_flavor(&host, &key);
         self.stamp_immutable_fields(&host, &key);
-        self.struct_root_classes
-            .borrow_mut()
-            .insert(key, host.clone());
+        self.insert_struct_root_class(key, host.clone());
         host
     }
 
@@ -4160,9 +4157,7 @@ impl Bookkeeper {
         let host = HostObject::new_class(name.to_string(), bases);
         crate::virtualizable_decl::stamp_host_virtualizable(&host, name);
         self.stamp_raw_alloc_flavor(&host, name);
-        self.struct_root_classes
-            .borrow_mut()
-            .insert(name.to_string(), host.clone());
+        self.insert_struct_root_class(name.to_string(), host.clone());
         host
     }
 
@@ -6152,6 +6147,28 @@ pub(crate) fn normalize_class_qualname(name: &str) -> String {
 }
 
 impl Bookkeeper {
+    /// Read view of the struct-root class cache. Writers go through
+    /// [`Self::insert_struct_root_class`], which keeps
+    /// `struct_root_class_leaves` in sync.
+    pub fn struct_root_classes(&self) -> std::cell::Ref<'_, HashMap<String, HostObject>> {
+        self.struct_root_classes.borrow()
+    }
+
+    /// Insert into [`Self::struct_root_classes`], indexing a new key by its
+    /// last `::` segment.
+    fn insert_struct_root_class(&self, key: String, host: HostObject) {
+        let mut classes = self.struct_root_classes.borrow_mut();
+        if !classes.contains_key(&key) {
+            let leaf = key.rsplit("::").next().unwrap_or(key.as_str()).to_string();
+            self.struct_root_class_leaves
+                .borrow_mut()
+                .entry(leaf)
+                .or_default()
+                .push(key.clone());
+        }
+        classes.insert(key, host);
+    }
+
     /// Intern cache key for a host class spelling.
     ///
     /// RPython `Bookkeeper.getdesc` keys `descs` on `Constant(pyobj)` —
@@ -6168,6 +6185,11 @@ impl Bookkeeper {
         }
         {
             let classes = self.struct_root_classes.borrow();
+            let leaves = self.struct_root_class_leaves.borrow();
+            let bucket = |owner: &str| {
+                let leaf = owner.rsplit("::").next().unwrap_or(owner);
+                leaves.get(leaf).into_iter().flatten()
+            };
             if classes.contains_key(&lookup) {
                 return lookup;
             }
@@ -6175,7 +6197,7 @@ impl Bookkeeper {
             // (`PyObject` after `pyobject::PyObject`). Never collapse a
             // registry-exact qualified key onto a shorter interned alias
             // (`module::struct::Code::Int` must not become `Code::Int`).
-            if let Some(key) = unique_suffix_key_owned(&lookup, classes.keys()) {
+            if let Some(key) = unique_suffix_key_owned(&lookup, bucket(&lookup)) {
                 return reattach_instantiation_suffix(&key, &lookup);
             }
             let stripped = majit_ir::descr::strip_generic_args(&lookup);
@@ -6183,7 +6205,9 @@ impl Bookkeeper {
                 if classes.contains_key(stripped.as_ref()) {
                     return reattach_instantiation_suffix(stripped.as_ref(), &lookup);
                 }
-                if let Some(key) = unique_suffix_key_owned(stripped.as_ref(), classes.keys()) {
+                if let Some(key) =
+                    unique_suffix_key_owned(stripped.as_ref(), bucket(stripped.as_ref()))
+                {
                     return reattach_instantiation_suffix(&key, &lookup);
                 }
             }
@@ -6227,28 +6251,25 @@ fn unique_registered_intern_key<'a>(
     reg: &'a crate::front::StructFieldRegistry,
     owner: &str,
 ) -> Option<&'a str> {
-    let key = unique_suffix_key_owned(owner, reg.fields.keys())?;
+    let leaf = owner.rsplit("::").next().unwrap_or(owner);
+    let key =
+        reg.with_keys_by_last_segment(leaf, |keys| unique_suffix_key_owned(owner, keys.iter()))?;
     accept_intern_suffix_match(owner, &key)
         .then(|| reg.fields.get_key_value(&key).map(|(k, _)| k.as_str()))
         .flatten()
 }
 
+/// The unique key other than `owner` that has `owner` as a `::` path
+/// suffix. Callers pass the keys sharing `owner`'s last `::` segment;
+/// a path-suffix match always has that segment.
 fn unique_suffix_key_owned(
     owner: &str,
     keys: impl Iterator<Item = impl AsRef<str>>,
 ) -> Option<String> {
-    let leaf = owner.rsplit("::").next().unwrap_or(owner);
     let mut found: Option<String> = None;
     for key in keys {
         let key = key.as_ref();
-        if key == owner {
-            continue;
-        }
-        let key_leaf = key.rsplit("::").next().unwrap_or(key);
-        if key_leaf != leaf {
-            continue;
-        }
-        if !accept_intern_suffix_match(owner, key) {
+        if key == owner || !accept_intern_suffix_match(owner, key) {
             continue;
         }
         if found.is_some() {

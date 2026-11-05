@@ -889,6 +889,18 @@ impl StructFieldRegistry {
             .map(|(key, _)| key.as_str())
     }
 
+    /// Run `f` over the registered keys whose last `::` segment is `leaf`.
+    pub(crate) fn with_keys_by_last_segment<R>(
+        &self,
+        leaf: &str,
+        f: impl FnOnce(&[String]) -> R,
+    ) -> R {
+        self.ensure_field_path_index();
+        let index = self.field_path_index.borrow();
+        let index = index.as_ref().expect("path index built");
+        f(index.by_last.get(leaf).map_or(&[][..], Vec::as_slice))
+    }
+
     fn ensure_field_path_index(&self) {
         let len = self.fields.len();
         let key_fp = self.fields.key_fp();
