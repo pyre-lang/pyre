@@ -173,8 +173,15 @@ pub struct CallControl {
     ///
     /// pyre now mirrors RPython's bare-graph queue directly. The
     /// pyre-only `w_code` adapter state lives on the cached `PyJitCode`
-    /// shell instead of in the queue tuple so
-    /// `enum_pending_graphs()` can match `call.py` again.
+    /// shell (`payload.w_code`, stamped at enqueue) instead of in the
+    /// queue tuple so `enum_pending_graphs()` can match `call.py` again.
+    ///
+    /// The queue itself is not a GC root. The wrapper lives on the
+    /// skeleton `payload.w_code` at enqueue. That slot is forwarded by
+    /// `walk_jitcode_code_roots_in` through `CallControl.jitcodes` (the
+    /// owner while the drain compiles) and again through `sd.jitcodes`
+    /// after install. `install_jitcodes` rejects skeletons, so a queued
+    /// payload is not in `sd.jitcodes` until the drain finishes.
     pub unfinished_graphs: Vec<*const CodeObject>,
 
     /// call.py `self.callinfocollection = CallInfoCollection()`.
@@ -267,7 +274,7 @@ impl CallControl {
             // the graph onto `unfinished_graphs`. Drop the returned
             // clone immediately so the cached slot is uniquely owned for
             // the call.py stamp below.
-            drop(self.get_jitcode(code));
+            drop(self.get_jitcode(code, std::ptr::null()));
             // call.py `jd.mainjitcode.jitdriver_sd = jd` — stamp the
             // skeleton's `jitdriver_sd` while the outer `Arc<PyJitCode>`
             // and inner `Arc<JitCode>` still have refcount 1 (only the
@@ -445,7 +452,17 @@ impl CallControl {
     /// re-runs `transform_graph_to_jitcode` and replaces the slot with
     /// the populated entry (codewriter.py
     /// `transform_graph_to_jitcode(graph, jitcode, ...)`).
-    pub fn get_jitcode(&mut self, code: &CodeObject) -> std::sync::Arc<PyJitCode> {
+    ///
+    /// `w_code` is the owner `PyCode` wrapper. RPython's graph *is* that
+    /// object; pyre threads it as a value from the caller that already
+    /// holds it and stamps `payload.w_code` on the skeleton at enqueue.
+    /// Null is only for a graph with no Python code object, or a test
+    /// that never installs into `sd.jitcodes`.
+    pub fn get_jitcode(
+        &mut self,
+        code: &CodeObject,
+        w_code: *const (),
+    ) -> std::sync::Arc<PyJitCode> {
         // RPython's `get_jitcode(graph)` receives the exact graph object
         // the dict is keyed by. Match that by requiring callers to pass
         // the canonical raw graph here; portal setup canonicalizes
@@ -471,11 +488,13 @@ impl CallControl {
             // `CodeWriter::make_jitcodes`'s drain loop at
             // codewriter.py `transform_graph_to_jitcode(graph,
             // jitcode, verbose, len(all_jitcodes))`.
-            self.reset_jitcode_skeleton(key, code_ptr);
+            self.reset_jitcode_skeleton(key, code_ptr, w_code);
             // call.py `self.unfinished_graphs.append(graph)`.
             self.unfinished_graphs.push(code_ptr);
         }
-        std::sync::Arc::clone(self.jitcodes.get(&key).unwrap())
+        let pyjit = std::sync::Arc::clone(self.jitcodes.get(&key).unwrap());
+        pyjit.stamp_w_code(w_code);
+        pyjit
     }
 
     /// Insert an empty skeleton for a freshly-registered graph — the state
@@ -488,7 +507,12 @@ impl CallControl {
     /// the drain, but this entry point only runs when the key is absent
     /// (`get_jitcode`'s `call.py` guard), so there is no populated
     /// holder to clobber.
-    fn reset_jitcode_skeleton(&mut self, key: usize, code_ptr: *const CodeObject) {
+    fn reset_jitcode_skeleton(
+        &mut self,
+        key: usize,
+        code_ptr: *const CodeObject,
+        w_code: *const (),
+    ) {
         // Only the absent-key path (`get_jitcode`'s `needs_rebuild`) installs a
         // skeleton. Enforce it so a stray call cannot roll a populated jitcode
         // back to a skeleton and break the runtime-reader publication invariant
@@ -497,8 +521,10 @@ impl CallControl {
             !self.jitcodes.contains_key(&key),
             "reset_jitcode_skeleton must only create fresh skeleton entries"
         );
-        self.jitcodes
-            .insert(key, std::sync::Arc::new(PyJitCode::skeleton(code_ptr)));
+        self.jitcodes.insert(
+            key,
+            std::sync::Arc::new(PyJitCode::skeleton_with_w_code(code_ptr, w_code)),
+        );
     }
 
     /// Publish the populated jitcode into `self.jitcodes[graph]`.
@@ -543,6 +569,16 @@ impl CallControl {
 
     pub(crate) fn jitcode_key(code: *const CodeObject) -> usize {
         code as usize
+    }
+
+    /// Forward `payload.w_code` of every cached jitcode, including a
+    /// skeleton queued by `get_jitcode` and not yet installed into
+    /// `sd.jitcodes`. `walk_jitcode_code_roots_in` reaches this through
+    /// `CallJitCallbacks.walk_writer_jitcode_code_roots`.
+    pub fn walk_jitcode_code_roots(&self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        for payload in self.jitcodes.values() {
+            pyre_jit_trace::state::walk_payload_w_code(payload, visitor);
+        }
     }
 }
 

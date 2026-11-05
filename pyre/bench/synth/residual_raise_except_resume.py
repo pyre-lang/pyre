@@ -1,5 +1,7 @@
-# pyre-check: max-pypy-ratio=4
-# The measured reading stays under 4, so the ceiling is 4.
+# pyre-check: max-pypy-ratio=3
+# Inlining the except-as-return callee (`warmstate.py can_inline_callable`,
+# `pyjitpl.py perform_call`) brings the measured ratio to about 1x
+# (dynasm 0.9-1.3x, wasm 2.0x), so the ceiling is 3 (floor 0.75x).
 # pyre-check: skip-cpython
 # cpython 1.67s vs pyre 0.13s (13x), and it is not gated on — only pypy is.
 # A hot loop FOLLOWED by a try/except whose body raises through a

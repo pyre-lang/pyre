@@ -1474,7 +1474,7 @@ impl MIFrame {
         // `pycode.py class PyCode(W_Root)`: intern hashes the referent
         // (`history.py` `ConstPtr` / `id_or_identityhash` / `_allocate_shadow`).
         // Take the code from the jitcode-retained wrapper, which the GC walks
-        // (`walk_live_code_wrapper`), not from a `PyFrame.pycode` word read
+        // (`walk_payload_w_code`), not from a `PyFrame.pycode` word read
         // through the raw `concrete_frame_addr`, which a collection does not
         // update. Pin wrapper and globals together (`gctransform/shadowstack.py`
         // `push_roots` / `framework.py` `gct_direct_call`) before the first
@@ -1482,8 +1482,7 @@ impl MIFrame {
         // frame-less MIFrame did before. `last_instr` / `valuestackdepth` stay
         // sourced from `concrete_frame_addr` below.
         let wrapper = if !self.sym().jitcode.is_null() {
-            let raw = unsafe { (*self.sym().jitcode).raw_code() as *const () };
-            pyre_interpreter::live_code_wrapper(raw)
+            unsafe { (*self.sym().jitcode).payload.w_code.get() as pyre_object::PyObjectRef }
         } else {
             pyre_object::PY_NULL
         };
