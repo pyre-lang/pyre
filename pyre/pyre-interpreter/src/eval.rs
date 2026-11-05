@@ -2775,7 +2775,7 @@ macro_rules! reload_resume_args {
             if let Some(slot) = pins.operr_slot
                 && let Some(err) = $resume.operr.as_mut()
             {
-                err.reload(&pins.roots, slot);
+                err.reload_slot(slot);
             }
         }
     }};

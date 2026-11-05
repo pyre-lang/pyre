@@ -969,12 +969,30 @@ impl PyError {
         slot
     }
 
+    /// Slot-only pin for residual portal graphs. The caller holds the
+    /// `RootScope` for liveness; this residual does not borrow the
+    /// save-point word.
+    pub fn pin_slot(&mut self) -> usize {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        self.0 = pyre_object::gc_roots::pin_root(self.0);
+        slot
+    }
+
     /// Write the forwarded handle out of `slot`.
     ///
     /// `shadowstack.py gc_restore_root` / `expand_pop_roots`: the local read
     /// after the call is the slot, not the word from before the call.
     pub fn reload(&mut self, roots: &pyre_object::gc_roots::RootScope, slot: usize) {
         self.0 = roots.get(slot);
+    }
+
+    /// Slot-only restore for residual portal graphs.
+    ///
+    /// `&RootScope` is the save-point word (`history.py` `getkind` of a raw
+    /// `Ptr`); a residual must not take that word as an address. The caller
+    /// holds the `RootScope` for liveness.
+    pub fn reload_slot(&mut self, slot: usize) {
+        self.0 = pyre_object::gc_roots::shadow_stack_get(slot);
     }
 
     /// `error.py OperationError.w_type`, resolving from [`kind`] when the

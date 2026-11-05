@@ -8239,14 +8239,10 @@ fn drive_portal_metatrace(
         "iirrr",
         "portal metatracing requires the split eval portal"
     );
-    let mut header_pc = None;
-    for op in pyre_jit_trace::jitcode_runtime::decoded_ops(&canonical.code) {
-        if op.opname == "jit_merge_point" {
-            header_pc = Some(op.pc);
-            break;
-        }
-    }
-    let header_pc = header_pc.expect("jd0 portal must contain its merge point");
+    let header_pc = pyre_jit_trace::jitcode_runtime::decoded_ops(&canonical.code)
+        .find(|op| op.opname == "jit_merge_point")
+        .expect("jd0 portal must contain its merge point")
+        .pc;
     eprintln!(
         "[jd0-mt] portal jitcode name={} code_len={} entry=start pc=0 header_pc={}",
         canonical.name,
@@ -8305,13 +8301,11 @@ fn drive_portal_metatrace(
         loop_header_pc,
     );
     let depth = meta.framestack.len();
-    let (stop_jitcode, stop_cursor) = if let Some(top) = meta.framestack.frames.last() {
-        (top.jitcode.name(), top.code_cursor)
-    } else {
-        ("<empty>", 0)
-    };
+    let top = meta.framestack.frames.last();
     eprintln!(
-        "[jd0-mt] walk action={action:?} depth={depth} stop_jitcode={stop_jitcode} stop_cursor={stop_cursor}"
+        "[jd0-mt] walk action={action:?} depth={depth} stop_jitcode={} stop_cursor={}",
+        top.map_or("<empty>", |f| f.jitcode.name()),
+        top.map_or(0, |f| f.code_cursor)
     );
     let outcome = match action {
         TraceAction::Finish {
@@ -10534,24 +10528,17 @@ enum PortalLeaveOwner {
 /// `register_external` way so the portal graphs do not getattr `value`
 /// off the interned `PyErrorObject`.
 #[majit_macros::dont_look_inside]
-fn pin_pending_pyerror(
-    result: &mut PyResult,
-    roots: &pyre_object::gc_roots::RootScope,
-) -> Option<usize> {
+fn pin_pending_pyerror(result: &mut PyResult) -> Option<usize> {
     match result {
-        Err(err) => Some(err.pin(roots)),
+        Err(err) => Some(err.pin_slot()),
         Ok(_) => None,
     }
 }
 
 #[majit_macros::dont_look_inside]
-fn reload_pending_pyerror(
-    result: &mut PyResult,
-    roots: &pyre_object::gc_roots::RootScope,
-    slot: usize,
-) {
+fn reload_pending_pyerror(result: &mut PyResult, slot: usize) {
     if let Err(err) = result {
-        err.reload(roots, slot);
+        err.reload_slot(slot);
     }
 }
 
@@ -10588,7 +10575,7 @@ fn portal_return_trace_then_leave(
             // the outer `finally`; `shadowstack.py` `push_roots` roots it
             // across `ExecutionContext.leave`.
             let mut pending = Err(err);
-            let slot = pin_pending_pyerror(&mut pending, &roots);
+            let slot = pin_pending_pyerror(&mut pending);
             let leave_result = unsafe {
                 (*ec).leave(
                     frame_root.frame() as *mut PyFrame,
@@ -10597,7 +10584,7 @@ fn portal_return_trace_then_leave(
                 )
             };
             if let Some(base) = slot {
-                reload_pending_pyerror(&mut pending, &roots, base);
+                reload_pending_pyerror(&mut pending, base);
             }
             match leave_result {
                 Err(leave_err) => Err(leave_err),
@@ -10749,13 +10736,13 @@ fn portal_activation_return_trace(
         let exit_slot = roots.base();
         let exit = roots.pin_root(*w_exitvalue);
         let err_slot = match &mut result {
-            Err(err) => Some(err.pin(&roots)),
+            Err(err) => Some(err.pin_slot()),
             Ok(_) => None,
         };
         let trace = unsafe { (*ec).return_trace(frame_root.frame() as *mut PyFrame, exit) };
         *w_exitvalue = roots.get(exit_slot);
         if let (Err(err), Some(base)) = (&mut result, err_slot) {
-            err.reload(&roots, base);
+            err.reload_slot(base);
         }
         trace
     };
@@ -10792,7 +10779,7 @@ fn portal_activation_leave(
             *value = exit;
         }
         let err_slot = match &mut outer_result {
-            Err(err) => Some(err.pin(&roots)),
+            Err(err) => Some(err.pin_slot()),
             Ok(_) => None,
         };
         let left = match leave_owner {
@@ -10808,7 +10795,7 @@ fn portal_activation_leave(
             },
         };
         if let (Err(err), Some(base)) = (&mut outer_result, err_slot) {
-            err.reload(&roots, base);
+            err.reload_slot(base);
         }
         left
     };
@@ -11452,14 +11439,14 @@ pub(crate) fn continue_entered_frame(frame: &mut PyFrame) -> PyResult {
     if let Ok(value) = &mut body_result {
         *value = w_exitvalue;
     }
-    let err_slot = pin_pending_pyerror(&mut body_result, &roots);
+    let err_slot = pin_pending_pyerror(&mut body_result);
     let hook = portal_return_trace_then_leave(&mut frame_root, ec, w_exitvalue, got_exception);
     w_exitvalue = roots.get(exit_slot);
     if let Ok(value) = &mut body_result {
         *value = w_exitvalue;
     }
     if let Some(base) = err_slot {
-        reload_pending_pyerror(&mut body_result, &roots, base);
+        reload_pending_pyerror(&mut body_result, base);
     }
     match hook {
         Err(err) => Err(err),
