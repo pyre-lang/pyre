@@ -1909,7 +1909,7 @@ pub fn normalize_raise_cause(mut cause: PyObjectRef) -> Result<RaiseCause, PyErr
     // A constructor that answers something other than an exception instance
     // is wrong whatever it answered: `None` is not the `from None` spelling,
     // which never reaches this branch because `None` is not a class.
-    let invalid = pyre_object::with_roots!(result => {
+    let invalid = pyre_object::with_roots!(result, cause => {
         (!unsafe { pyre_object::is_exception(result) })
             .then(|| crate::error::exception_from_call_type_error(cause, result))
     });
@@ -3197,17 +3197,18 @@ impl NamespaceOpcodeHandler for PyFrame {
         // `named_key_hash` / `w_code_getname_w_or_new` when the `co_names_w`
         // slot is not realized.  The popped value's only name is this word.
         let roots = pyre_object::gc_roots::push_roots();
-        let value_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(value);
-        let locals_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(self.get_or_create_w_locals());
+        let w_locals = self.get_or_create_w_locals();
         let w_code = self.getcode_w();
-        let hash = crate::baseobjspace::named_key_hash(name, w_code, nameindex);
-        if store_name_into_dict(roots.get(locals_slot), name, hash, roots.get(value_slot)) {
+        let value = roots.get(roots.base());
+        let base = roots.pin_roots(&[value, w_locals, w_code]);
+        let hash = crate::baseobjspace::named_key_hash(name, roots.get(base + 2), nameindex);
+        if store_name_into_dict(roots.get(base + 1), name, hash, roots.get(base)) {
             return Ok(());
         }
+        let w_code = roots.get(base + 2);
         let key = unsafe { crate::pycode::w_code_getname_w_or_new(w_code, nameindex, name) };
-        crate::baseobjspace::setitem(roots.get(locals_slot), key, roots.get(value_slot))?;
+        crate::baseobjspace::setitem(roots.get(base + 1), key, roots.get(base))?;
         Ok(())
     }
 
@@ -3226,18 +3227,17 @@ impl NamespaceOpcodeHandler for PyFrame {
         // `named_key_hash` / `w_code_getname_w_or_new` realize the name when
         // the `co_names_w` slot is not, and the mapping's own `__setitem__`
         // runs Python: the popped value's only name is this word.
-        let roots = pyre_object::gc_roots::push_roots();
-        let value_slot = roots.base();
-        let _ = roots.pin_root(value);
-        let globals_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(self.get_w_globals());
+        let w_globals = self.get_w_globals();
         let w_code = self.getcode_w();
-        let hash = crate::baseobjspace::named_key_hash(name, w_code, nameindex);
-        if !roots.get(globals_slot).is_null()
-            && !store_name_into_dict(roots.get(globals_slot), name, hash, roots.get(value_slot))
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.pin_roots(&[value, w_globals, w_code]);
+        let hash = crate::baseobjspace::named_key_hash(name, roots.get(base + 2), nameindex);
+        if !roots.get(base + 1).is_null()
+            && !store_name_into_dict(roots.get(base + 1), name, hash, roots.get(base))
         {
+            let w_code = roots.get(base + 2);
             let key = unsafe { crate::pycode::w_code_getname_w_or_new(w_code, nameindex, name) };
-            crate::baseobjspace::setitem(roots.get(globals_slot), key, roots.get(value_slot))?;
+            crate::baseobjspace::setitem(roots.get(base + 1), key, roots.get(base))?;
         }
         Ok(())
     }

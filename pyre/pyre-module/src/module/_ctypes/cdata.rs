@@ -1201,7 +1201,8 @@ fn ctype_leaf(mut cls: PyObjectRef) -> PyObjectRef {
         {
             break;
         }
-        let Some(proto) = pyre_object::with_roots!(cls => super::stginfo::stginfo_proto(info))
+        let Some(proto) =
+            pyre_object::with_roots!(cls, info => super::stginfo::stginfo_proto(info))
         else {
             break;
         };
