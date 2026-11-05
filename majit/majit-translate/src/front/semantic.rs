@@ -1366,6 +1366,12 @@ pub struct SemanticProgram {
     /// the body again. `populate_call_registry_from_call_graphs` reads it.
     pub atomic_load_decls:
         Vec<crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl>,
+    /// FunDecls stored in a struct FnPtr field by a static initializer.
+    /// Each row is `(struct_path, field, callpath)` where `struct_path` is
+    /// the crate-stripped defining type path. `FunctionReprBase.call`
+    /// `c_graphs` for an indirect call through that slot. Empty until the
+    /// first-pass harvest fills it.
+    pub fnptr_field_families: Vec<(String, String, String)>,
 }
 
 /// Graph lookup table built from a `SemanticProgram` so registration and

@@ -43,7 +43,8 @@ pub(crate) fn discover_eval_hook_graphs(llbc: &Llbc) -> Vec<String> {
         let Some(body) = fd.unstructured_shared() else {
             continue;
         };
-        let mut bound = vec![None; body.locals.locals.len()];
+        let assigns = collect_local_assigns(llbc, &body);
+        let bounds = collect_local_fn_bounds(llbc, &assigns);
         let forward_blocks = forward_reachable_mask(llbc, &body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
@@ -56,11 +57,6 @@ pub(crate) fn discover_eval_hook_graphs(llbc: &Llbc) -> Vec<String> {
                 let Some(fun) = rvalue_fundef(llbc, rvalue) else {
                     continue;
                 };
-                if let PlaceKind::Local(index) = place.kind
-                    && (index as usize) < bound.len()
-                {
-                    bound[index as usize] = Some(fun);
-                }
                 if tyref_dedup_id(&place.ty) == Some(eval_ty) {
                     push_registered_fun_path(llbc, fun, &mut plain);
                 }
@@ -80,7 +76,7 @@ pub(crate) fn discover_eval_hook_graphs(llbc: &Llbc) -> Vec<String> {
             let Some(arg) = call.args.first() else {
                 continue;
             };
-            if let Some(fun) = operand_bound_fundef(llbc, arg, &bound) {
+            for fun in operand_bound_fundefs(llbc, arg, &bounds) {
                 push_registered_fun_path(llbc, fun, &mut overrides);
             }
         }
@@ -521,6 +517,499 @@ fn push_unique_spelling(out: &mut Vec<String>, spelling: String) {
     }
 }
 
+/// FunDecls stored in a struct's FnPtr fields across every FunDecl body.
+///
+/// Each row is `(struct_path, field, callpath)` where `struct_path` is the
+/// crate-stripped defining type path (`fnptr_field_family_struct_key`) and
+/// `callpath` is the FunDecl actually assigned to that field
+/// (`FunctionReprBase.call` `descs = list(s_pbc.descriptions)` then
+/// `row_of_graphs`). The family is the union of every store: a static
+/// Aggregate, a runtime constructor, a field assignment through a place,
+/// and a `from_access`-style copy of the same `(struct, field)`. A store
+/// that is not a recoverable FunDecl (a parameter, a call result, a field
+/// of another type) marks the slot unknown; that field publishes no row
+/// (`FnPtrFamily::Unknown` / `graphs_from` None).
+pub fn discover_fnptr_field_families(llbc: &Llbc) -> Vec<(String, String, String)> {
+    llbc_derived(llbc)
+        .fnptr_field_families
+        .get_or_init(|| discover_fnptr_field_families_uncached(llbc))
+        .clone()
+}
+
+/// Crate-stripped full defining type path used as the family key together
+/// with the field name. Shared by harvest, `fnptr_struct_field_target`,
+/// and `register_trait_family_path`.
+pub(in crate::front::mir) fn fnptr_field_family_struct_key(td: &TypeDecl) -> String {
+    strip_crate_prefix(&td.item_meta.name_path())
+}
+
+fn discover_fnptr_field_families_uncached(llbc: &Llbc) -> Vec<(String, String, String)> {
+    let structs = fnptr_struct_tables(llbc);
+    if structs.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut unknown: Vec<(String, String)> = Vec::new();
+    for fd in llbc.iter_fun_decls() {
+        if !fd.has_unstructured_body() {
+            continue;
+        }
+        let Some(body) = fd.unstructured() else {
+            continue;
+        };
+        enroll_fnptr_field_stores(llbc, &body, &structs, &mut out, &mut unknown);
+    }
+    out.retain(|(path, field, _)| {
+        !unknown
+            .iter()
+            .any(|(unknown_path, unknown_field)| unknown_path == path && unknown_field == field)
+    });
+    out
+}
+
+fn fnptr_struct_tables(
+    llbc: &Llbc,
+) -> std::collections::HashMap<u64, (String, Vec<Option<String>>)> {
+    let mut tables = std::collections::HashMap::new();
+    for td in llbc.iter_type_decls() {
+        let TypeDeclKind::Struct(fields) = &td.kind else {
+            continue;
+        };
+        let field_slots: Vec<Option<String>> = fields
+            .iter()
+            .map(|field| {
+                let name = field.name.as_deref()?;
+                tyref_is_fnptr(&field.ty, llbc).then(|| name.to_string())
+            })
+            .collect();
+        if field_slots.iter().all(Option::is_none) {
+            continue;
+        }
+        tables.insert(td.def_id, (fnptr_field_family_struct_key(td), field_slots));
+    }
+    tables
+}
+
+fn enroll_fnptr_field_stores(
+    llbc: &Llbc,
+    body: &Unstructured,
+    structs: &std::collections::HashMap<u64, (String, Vec<Option<String>>)>,
+    out: &mut Vec<(String, String, String)>,
+    unknown: &mut Vec<(String, String)>,
+) {
+    let assigns = collect_local_assigns(llbc, body);
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            if let Rvalue::Aggregate(kind, operands) = rvalue
+                && let Some(struct_id) = aggregate_struct_decl_id(llbc, kind)
+                && let Some((struct_path, field_slots)) = structs.get(&struct_id)
+            {
+                for (slot, operand) in field_slots.iter().zip(operands.iter()) {
+                    let Some(field) = slot.as_deref() else {
+                        continue;
+                    };
+                    record_fnptr_store(
+                        llbc,
+                        struct_path,
+                        field,
+                        store_source_of_operand(
+                            llbc,
+                            operand,
+                            struct_id,
+                            field,
+                            &assigns,
+                            &mut Vec::new(),
+                        ),
+                        out,
+                        unknown,
+                    );
+                }
+            }
+            if let Some((struct_id, struct_path, field)) = fnptr_field_slot(llbc, place)
+                && let Some((_, field_slots)) = structs.get(&struct_id)
+                && field_slots
+                    .iter()
+                    .any(|slot| slot.as_deref() == Some(field.as_str()))
+            {
+                record_fnptr_store(
+                    llbc,
+                    &struct_path,
+                    &field,
+                    store_source_of_rvalue(
+                        llbc,
+                        rvalue,
+                        struct_id,
+                        &field,
+                        &assigns,
+                        &mut Vec::new(),
+                    ),
+                    out,
+                    unknown,
+                );
+            }
+        }
+    }
+}
+
+fn record_fnptr_store(
+    llbc: &Llbc,
+    struct_path: &str,
+    field: &str,
+    source: StoreSource,
+    out: &mut Vec<(String, String, String)>,
+    unknown: &mut Vec<(String, String)>,
+) {
+    match source {
+        StoreSource::ClosedCopy => {}
+        StoreSource::Unknown => {
+            let key = (struct_path.to_string(), field.to_string());
+            if !unknown.contains(&key) {
+                unknown.push(key);
+            }
+        }
+        StoreSource::Funs(funs) => {
+            for fun in funs {
+                let Some(stored) = llbc.fn_by_id(fun) else {
+                    continue;
+                };
+                let callpath = registered_path_for_fun_decl(llbc, stored).canonical_key();
+                if callpath.is_empty() {
+                    continue;
+                }
+                let row = (struct_path.to_string(), field.to_string(), callpath);
+                if !out.contains(&row) {
+                    out.push(row);
+                }
+            }
+        }
+    }
+}
+
+/// What a store into a FnPtr field contributes to the call family.
+///
+/// `ClosedCopy` is a read of the same `(struct, field)` (`from_access`-style
+/// `x.f` stored into `y.f` of the same type): it adds no new target.
+/// `Unknown` is any other non-FunDecl (a parameter, a call, a different
+/// field). `FunctionReprBase.call` unions `s_pbc.descriptions`; an unknown
+/// store means the annotated set is not closed.
+enum StoreSource {
+    Funs(std::collections::BTreeSet<u64>),
+    ClosedCopy,
+    Unknown,
+}
+
+fn merge_store_source(left: StoreSource, right: StoreSource) -> StoreSource {
+    match (left, right) {
+        (StoreSource::Unknown, _) | (_, StoreSource::Unknown) => StoreSource::Unknown,
+        (StoreSource::ClosedCopy, other) | (other, StoreSource::ClosedCopy) => other,
+        (StoreSource::Funs(mut left), StoreSource::Funs(right)) => {
+            left.extend(right);
+            StoreSource::Funs(left)
+        }
+    }
+}
+
+fn store_source_of_rvalue(
+    llbc: &Llbc,
+    rvalue: &Rvalue,
+    dest_struct: u64,
+    dest_field: &str,
+    assigns: &LocalAssigns<'_>,
+    visiting: &mut Vec<usize>,
+) -> StoreSource {
+    let Some(operand) = rvalue_use_operand(rvalue) else {
+        return StoreSource::Unknown;
+    };
+    store_source_of_operand(llbc, operand, dest_struct, dest_field, assigns, visiting)
+}
+
+fn store_source_of_operand(
+    llbc: &Llbc,
+    operand: &Operand,
+    dest_struct: u64,
+    dest_field: &str,
+    assigns: &LocalAssigns<'_>,
+    visiting: &mut Vec<usize>,
+) -> StoreSource {
+    if let Some(fun) = operand_fundef(llbc, operand) {
+        return StoreSource::Funs(std::collections::BTreeSet::from([fun]));
+    }
+    let Some(place) = operand_place(operand) else {
+        return StoreSource::Unknown;
+    };
+    if let Some((struct_id, _, field)) = fnptr_field_slot(llbc, place) {
+        if struct_id == dest_struct && field == dest_field {
+            return StoreSource::ClosedCopy;
+        }
+        return StoreSource::Unknown;
+    }
+    let PlaceKind::Local(index) = place.kind else {
+        return StoreSource::Unknown;
+    };
+    store_source_of_local(
+        llbc,
+        index as usize,
+        dest_struct,
+        dest_field,
+        assigns,
+        visiting,
+    )
+}
+
+fn store_source_of_local(
+    llbc: &Llbc,
+    index: usize,
+    dest_struct: u64,
+    dest_field: &str,
+    assigns: &LocalAssigns<'_>,
+    visiting: &mut Vec<usize>,
+) -> StoreSource {
+    if visiting.contains(&index) {
+        return StoreSource::ClosedCopy;
+    }
+    if assigns.opaque.get(index).copied().unwrap_or(true) {
+        return StoreSource::Unknown;
+    }
+    let Some(rvalues) = assigns.rvalues.get(index) else {
+        return StoreSource::Unknown;
+    };
+    if rvalues.is_empty() {
+        return StoreSource::Unknown;
+    }
+    visiting.push(index);
+    let mut acc: Option<StoreSource> = None;
+    for rvalue in rvalues {
+        let next = store_source_of_rvalue(llbc, rvalue, dest_struct, dest_field, assigns, visiting);
+        acc = Some(match acc {
+            None => next,
+            Some(prev) => merge_store_source(prev, next),
+        });
+        if matches!(acc, Some(StoreSource::Unknown)) {
+            visiting.pop();
+            return StoreSource::Unknown;
+        }
+    }
+    visiting.pop();
+    acc.unwrap_or(StoreSource::Unknown)
+}
+
+fn aggregate_struct_decl_id(llbc: &Llbc, kind: &serde_json::Value) -> Option<u64> {
+    let adt = kind.as_object()?.get("Adt")?.as_array()?;
+    let head = adt.first()?;
+    let type_id = match head.as_u64() {
+        Some(id) => id,
+        None => type_decl_ref_adt_id(head.as_object()?)?,
+    };
+    let td = llbc.type_by_id(type_id)?;
+    match &td.kind {
+        TypeDeclKind::Struct(_) => Some(td.def_id),
+        TypeDeclKind::Alias(inner) => {
+            let inner_td = peel_ty_node_to_adt(llbc, inner)?;
+            matches!(inner_td.kind, TypeDeclKind::Struct(_)).then_some(inner_td.def_id)
+        }
+        _ => None,
+    }
+}
+
+fn peel_ty_node_to_adt<'a>(llbc: &'a Llbc, ty: &'a serde_json::Value) -> Option<&'a TypeDecl> {
+    let mut node = strip_ty_wrappers(ty, llbc).unwrap_or(ty);
+    for _ in 0..8 {
+        let obj = node.as_object()?;
+        if let Some(id) = adt_node_def_id(node).or_else(|| {
+            obj.get("Adt")
+                .and_then(serde_json::Value::as_object)
+                .and_then(type_decl_ref_adt_id)
+        }) {
+            return llbc.type_by_id(id);
+        }
+        let inner = obj
+            .get("RawPtr")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|arr| arr.first())
+            .or_else(|| {
+                obj.get("Ref")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|arr| arr.get(1))
+            })?;
+        node = strip_ty_wrappers(inner, llbc).unwrap_or(inner);
+    }
+    None
+}
+
+pub(in crate::front::mir) fn tyref_is_fnptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(mut node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    for _ in 0..8 {
+        let Some(stripped) = strip_ty_wrappers(node, llbc) else {
+            return false;
+        };
+        if stripped.get("FnPtr").is_some() {
+            return true;
+        }
+        if let Some(arr) = stripped.get("RawPtr").and_then(serde_json::Value::as_array)
+            && let Some(inner) = arr.first()
+        {
+            node = inner;
+            continue;
+        }
+        let Some(id) = adt_node_def_id(stripped) else {
+            return false;
+        };
+        let Some(td) = llbc.type_by_id(id) else {
+            return false;
+        };
+        match &td.kind {
+            TypeDeclKind::Alias(inner) => node = inner,
+            _ => return false,
+        }
+    }
+    false
+}
+
+pub(in crate::front::mir) fn fnptr_field_family_contains(
+    llbc: &Llbc,
+    struct_path: &str,
+    field: &str,
+) -> bool {
+    discover_fnptr_field_families(llbc)
+        .iter()
+        .any(|(path, name, _)| path == struct_path && name == field)
+}
+
+/// `(struct_path, field)` a harvested FnPtr Field place names.
+///
+/// `place` is the Dynamic operand or the Field slot after
+/// [`vtable_slot_under_fn_ptr_cast`] / [`fnptr_field_under_use`]. Shared by
+/// lowering and the GC call graph.
+pub(crate) fn fnptr_struct_field_target(
+    llbc: &Llbc,
+    body: &Unstructured,
+    place: &Place,
+) -> Option<(String, String)> {
+    let operand = Operand::Copy(place.clone());
+    let slot = vtable_slot_under_fn_ptr_cast(llbc, body, &operand)
+        .or_else(|| fnptr_field_under_use(llbc, body, &operand))
+        .unwrap_or(operand);
+    let place = operand_place(&slot)?;
+    let (_, struct_path, field_name) = fnptr_field_slot(llbc, place)?;
+    if !fnptr_field_family_contains(llbc, &struct_path, &field_name) {
+        return None;
+    }
+    Some((struct_path, field_name))
+}
+
+/// `(struct_id, struct_path, field)` a FnPtr Field place names, whether or
+/// not a family has been published for that slot.
+fn fnptr_field_slot(llbc: &Llbc, place: &Place) -> Option<(u64, String, String)> {
+    let PlaceKind::Projection(base, elem) = &place.kind else {
+        return None;
+    };
+    let field_payload = elem.field_payload()?;
+    let struct_ty = peel_place_struct_ty(llbc, &base.ty).unwrap_or_else(|| base.ty.clone());
+    let type_id = type_decl_ref_adt_id(fnptr_field_base_adt(llbc, &struct_ty)?)?;
+    let td = llbc.type_by_id(type_id)?;
+    if !matches!(td.kind, TypeDeclKind::Struct(_)) {
+        return None;
+    }
+    let (variant_idx, field_idx) = indexed_field_parts(field_payload)?;
+    if variant_idx.is_some() {
+        return None;
+    }
+    let fields = type_decl_struct_fields(td, llbc)?;
+    let f = fields.get(field_idx)?;
+    let field_name = f
+        .name
+        .clone()
+        .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(field_idx));
+    let field_ty = tyref_subst_bound_typevar(&f.ty, &struct_ty, llbc);
+    if !tyref_is_fnptr(&field_ty, llbc) {
+        return None;
+    }
+    Some((td.def_id, fnptr_field_family_struct_key(td), field_name))
+}
+
+fn fnptr_field_base_adt<'a>(
+    llbc: &'a Llbc,
+    base_ty: &'a TyRef,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    strip_ty_wrappers(tyref_node(base_ty, llbc)?, llbc)?
+        .as_object()?
+        .get("Adt")?
+        .as_object()
+}
+
+/// FunDecl ids stored in `(struct_path, field)`, each with a body.
+/// `None` when the family is empty or any member is missing or bodyless.
+pub(crate) fn fnptr_field_family_member_fn_ids(
+    llbc: &Llbc,
+    struct_path: &str,
+    field: &str,
+) -> Option<Vec<u64>> {
+    let rows = discover_fnptr_field_families(llbc);
+    let wanted: Vec<&String> = rows
+        .iter()
+        .filter(|(path, name, _)| path == struct_path && name == field)
+        .map(|(_, _, callpath)| callpath)
+        .collect();
+    if wanted.is_empty() {
+        return None;
+    }
+    let mut ids = vec![None; wanted.len()];
+    let mut remaining = wanted.len();
+    for fd in llbc.iter_fun_decls() {
+        let key = registered_path_for_fun_decl(llbc, fd).canonical_key();
+        for (i, path) in wanted.iter().enumerate() {
+            if ids[i].is_none() && key == **path {
+                fd.unstructured()?;
+                ids[i] = Some(fd.def_id);
+                remaining -= 1;
+            }
+        }
+        if remaining == 0 {
+            break;
+        }
+    }
+    if remaining != 0 {
+        return None;
+    }
+    Some(
+        ids.into_iter()
+            .map(|id| id.expect("every family member resolved"))
+            .collect(),
+    )
+}
+
+/// The struct ADT under Ref / RawPtr wrappers, so a Field off `*access`
+/// still names the slot table (`MapdictMixinAccess.getclass`).
+pub(in crate::front::mir) fn peel_place_struct_ty(llbc: &Llbc, ty: &TyRef) -> Option<TyRef> {
+    let mut node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
+    for _ in 0..8 {
+        let obj = node.as_object()?;
+        if obj.get("Adt").is_some() {
+            return Some(TyRef::Other(node.clone()));
+        }
+        let inner = obj
+            .get("RawPtr")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|arr| arr.first())
+            .or_else(|| {
+                obj.get("Ref")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|arr| arr.get(1))
+            })?;
+        node = strip_ty_wrappers(inner, llbc)?;
+    }
+    None
+}
+
 /// `register_eval_override`'s parameter type: the `EvalFn` pointer.
 ///
 /// Resolved once per artefact, from every `FunDecl` including an external
@@ -574,6 +1063,141 @@ pub(in crate::front::mir) fn operand_fundef(llbc: &Llbc, operand: &Operand) -> O
     const_fn_def_regular_id(llbc, value)
 }
 
+fn rvalue_use_operand(rvalue: &Rvalue) -> Option<&Operand> {
+    match rvalue {
+        Rvalue::Use(operand, _) | Rvalue::UnaryOp(_, operand) | Rvalue::Cast(_, operand, _) => {
+            Some(operand)
+        }
+        _ => None,
+    }
+}
+
+/// Assignment sites of each local in forward-reachable blocks.
+///
+/// `rvalues` is every `Assign` of that local. `opaque` is set when a Call
+/// (or another non-rvalue definition) writes the local, so a later use is
+/// not a closed FunDecl set.
+struct LocalAssigns<'a> {
+    rvalues: Vec<Vec<&'a Rvalue>>,
+    opaque: Vec<bool>,
+}
+
+fn collect_local_assigns<'a>(llbc: &Llbc, body: &'a Unstructured) -> LocalAssigns<'a> {
+    let n = body.locals.locals.len();
+    let mut rvalues = vec![Vec::new(); n];
+    let mut opaque = vec![false; n];
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            if let PlaceKind::Local(index) = place.kind
+                && (index as usize) < n
+            {
+                rvalues[index as usize].push(rvalue);
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
+            && let PlaceKind::Local(index) = call.dest.kind
+            && (index as usize) < n
+        {
+            opaque[index as usize] = true;
+        }
+    }
+    LocalAssigns { rvalues, opaque }
+}
+
+/// Per-local union of FunDecl ids assigned in the body.
+///
+/// Every assignment site that resolves to a FnDef contributes
+/// (`FunctionReprBase.call` unions `s_pbc.descriptions`). Physical-order
+/// last-write-wins is not used: a diamond that binds `f` on one predecessor
+/// and `g` on another yields `{f, g}`.
+struct LocalFnBounds {
+    funs: Vec<std::collections::BTreeSet<u64>>,
+}
+
+fn collect_local_fn_bounds(llbc: &Llbc, assigns: &LocalAssigns<'_>) -> LocalFnBounds {
+    let n = assigns.rvalues.len();
+    let mut memo: Vec<Option<std::collections::BTreeSet<u64>>> = vec![None; n];
+    for i in 0..n {
+        local_fn_bound(llbc, i, assigns, &mut memo, &mut Vec::new());
+    }
+    LocalFnBounds {
+        funs: memo
+            .into_iter()
+            .map(|slot| slot.unwrap_or_default())
+            .collect(),
+    }
+}
+
+fn local_fn_bound(
+    llbc: &Llbc,
+    index: usize,
+    assigns: &LocalAssigns<'_>,
+    memo: &mut [Option<std::collections::BTreeSet<u64>>],
+    visiting: &mut Vec<usize>,
+) -> std::collections::BTreeSet<u64> {
+    if let Some(funs) = memo.get(index).and_then(|slot| slot.as_ref()) {
+        return funs.clone();
+    }
+    if visiting.contains(&index) {
+        return std::collections::BTreeSet::new();
+    }
+    let rvalues = assigns.rvalues.get(index).map(Vec::as_slice).unwrap_or(&[]);
+    visiting.push(index);
+    let mut funs = std::collections::BTreeSet::new();
+    for rvalue in rvalues {
+        if let Some(more) = fn_bound_of_rvalue(llbc, rvalue, assigns, memo, visiting) {
+            funs.extend(more);
+        }
+    }
+    visiting.pop();
+    if let Some(slot) = memo.get_mut(index) {
+        *slot = Some(funs.clone());
+    }
+    funs
+}
+
+fn fn_bound_of_rvalue(
+    llbc: &Llbc,
+    rvalue: &Rvalue,
+    assigns: &LocalAssigns<'_>,
+    memo: &mut [Option<std::collections::BTreeSet<u64>>],
+    visiting: &mut Vec<usize>,
+) -> Option<std::collections::BTreeSet<u64>> {
+    fn_bound_of_operand(llbc, rvalue_use_operand(rvalue)?, assigns, memo, visiting)
+}
+
+fn fn_bound_of_operand(
+    llbc: &Llbc,
+    operand: &Operand,
+    assigns: &LocalAssigns<'_>,
+    memo: &mut [Option<std::collections::BTreeSet<u64>>],
+    visiting: &mut Vec<usize>,
+) -> Option<std::collections::BTreeSet<u64>> {
+    if let Some(fun) = operand_fundef(llbc, operand) {
+        return Some(std::collections::BTreeSet::from([fun]));
+    }
+    let (Operand::Copy(place) | Operand::Move(place)) = operand else {
+        return None;
+    };
+    let PlaceKind::Local(index) = place.kind else {
+        return None;
+    };
+    Some(local_fn_bound(
+        llbc,
+        index as usize,
+        assigns,
+        memo,
+        visiting,
+    ))
+}
+
 pub(in crate::front::mir) fn operand_bound_fundef(
     llbc: &Llbc,
     operand: &Operand,
@@ -589,6 +1213,23 @@ pub(in crate::front::mir) fn operand_bound_fundef(
         return None;
     };
     bound.get(index as usize).copied().flatten()
+}
+
+fn operand_bound_fundefs(
+    llbc: &Llbc,
+    operand: &Operand,
+    bounds: &LocalFnBounds,
+) -> std::collections::BTreeSet<u64> {
+    if let Some(fun) = operand_fundef(llbc, operand) {
+        return std::collections::BTreeSet::from([fun]);
+    }
+    let (Operand::Copy(place) | Operand::Move(place)) = operand else {
+        return std::collections::BTreeSet::new();
+    };
+    let PlaceKind::Local(index) = place.kind else {
+        return std::collections::BTreeSet::new();
+    };
+    bounds.funs.get(index as usize).cloned().unwrap_or_default()
 }
 
 /// `_trace`'s `self.profilefunc(...)`: the prebuilt family published on `llbc`.
@@ -3029,7 +3670,7 @@ pub(in crate::front::mir) fn defining_call(
 /// The vtable slot a monomorphized `dyn` call reads: `operand` is a
 /// temporary whose single producer is a raw-pointer cast of that slot
 /// (`_t = copy (*ptr_metadata(recv)).method_<name> as fn(..)`).
-pub(in crate::front::mir) fn vtable_slot_under_fn_ptr_cast(
+pub(crate) fn vtable_slot_under_fn_ptr_cast(
     llbc: &Llbc,
     body: &Unstructured,
     operand: &Operand,
@@ -3041,6 +3682,27 @@ pub(in crate::front::mir) fn vtable_slot_under_fn_ptr_cast(
         return None;
     };
     op.get("Cast")?.get("RawPtr")?;
+    let PlaceKind::Projection(_, ProjectionElem::Tagged(elem)) = &operand_place(slot)?.kind else {
+        return None;
+    };
+    elem.get("Field")?;
+    Some(slot.clone())
+}
+
+/// The Field operand a Dynamic call copies out of a struct slot into a
+/// temporary (`_t = copy (*access).field; call _t`). A Cast of that
+/// Field is [`vtable_slot_under_fn_ptr_cast`].
+pub(crate) fn fnptr_field_under_use(
+    llbc: &Llbc,
+    body: &Unstructured,
+    operand: &Operand,
+) -> Option<Operand> {
+    let PlaceKind::Local(local) = operand_place(operand)?.kind else {
+        return None;
+    };
+    let Rvalue::Use(slot, _) = defining_assign(llbc, body, local as usize)? else {
+        return None;
+    };
     let PlaceKind::Projection(_, ProjectionElem::Tagged(elem)) = &operand_place(slot)?.kind else {
         return None;
     };

@@ -27,6 +27,7 @@ indexmap = { workspace = true }
 rustpython-wtf8 = { workspace = true }
 linkme = { workspace = true }
 bitflags = { workspace = true }
+paste = { workspace = true }
 
 # `type_object()` accessors publish their residual-call address through a
 # `linkme` link section off wasm32.  wasm32 rejects that section — a custom

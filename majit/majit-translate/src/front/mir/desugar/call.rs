@@ -6916,6 +6916,7 @@ impl<'a> Lowering<'a> {
                 // type into a temporary and calls the temporary.  The slot
                 // read is that cast's operand.
                 let vtable_slot = vtable_slot_under_fn_ptr_cast(self.llbc, self.body, &dyn_operand)
+                    .or_else(|| fnptr_field_under_use(self.llbc, self.body, &dyn_operand))
                     .unwrap_or_else(|| dyn_operand.clone());
                 let indirect = self.dyn_indirect_target(&vtable_slot);
                 let passes_pairs = !pair_lens.is_empty();
@@ -6986,6 +6987,23 @@ impl<'a> Lowering<'a> {
                         args,
                         graphs: Some(graphs),
                         family_key: None,
+                        result_ty,
+                    }
+                } else if let Some((struct_path, field_name)) =
+                    self.fnptr_struct_field_target(&vtable_slot)
+                {
+                    // `FunctionReprBase.call`: `descs = list(s_pbc.descriptions)`
+                    // then `row_of_graphs = callfamily.calltables[shape][index]`;
+                    // `vfn = hop.inputarg(self, arg=0)` is the already-loaded
+                    // callable. `vtable_slot` (the Field place) names that
+                    // family only; the callee is `dyn_operand`, the loaded
+                    // pointer, matching the `fn_ptr_family` arm.
+                    let funcptr = self.resolve_operand(mir_bb, dyn_operand)?;
+                    OpKind::IndirectCall {
+                        funcptr,
+                        args,
+                        graphs: None,
+                        family_key: Some((struct_path, field_name)),
                         result_ty,
                     }
                 } else if let Some(family) = fn_ptr_family {

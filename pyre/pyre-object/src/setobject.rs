@@ -26,8 +26,12 @@ pub static SET_TYPE: PyType = crate::pyobject::new_pytype_with_user_subclass_and
     std::mem::offset_of!(W_SetObject, lifeline),
 );
 /// `W_SetObjectUser` (`typedef.py` `_getusercls(W_SetObject)`).
-pub static SET_USER_TYPE: PyType =
-    crate::pyobject::new_user_pytype("set", &SET_TYPE, std::mem::offset_of!(W_SetObjectUser, map));
+pub static SET_USER_TYPE: PyType = crate::pyobject::new_user_pytype_with_access(
+    "set",
+    &SET_TYPE,
+    std::mem::offset_of!(W_SetObjectUser, map),
+    &W_SET_USER_MAPDICT_ACCESS,
+);
 pub static FROZENSET_TYPE: PyType = crate::pyobject::new_pytype_with_user_subclass_and_weakref(
     "frozenset",
     &FROZENSET_USER_TYPE,
@@ -35,10 +39,11 @@ pub static FROZENSET_TYPE: PyType = crate::pyobject::new_pytype_with_user_subcla
 );
 /// `W_SetObjectUser` for `frozenset` (`typedef.py` `_getusercls`). The two
 /// user typeptrs share one payload layout and one GC tid.
-pub static FROZENSET_USER_TYPE: PyType = crate::pyobject::new_user_pytype(
+pub static FROZENSET_USER_TYPE: PyType = crate::pyobject::new_user_pytype_with_access(
     "frozenset",
     &FROZENSET_TYPE,
     std::mem::offset_of!(W_SetObjectUser, map),
+    &W_SET_USER_MAPDICT_ACCESS,
 );
 
 /// setobject.py `W_SetIterObject`.  Unlike the old sequence-iterator
@@ -637,6 +642,12 @@ const _: () = {
                 + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
+
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    /// `set` and `frozenset` user typeptrs share this layout.
+    pub static W_SET_USER_MAPDICT_ACCESS for W_SetObjectUser;
+}
 
 /// GC type id assigned to `W_SetObject` at JitDriver init time.
 pub const W_SET_GC_TYPE_ID: u32 = 30;

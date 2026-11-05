@@ -72,7 +72,10 @@ use majit_translate::{
     codewriter::jtransform::{GraphTransformConfig, Transformer},
     flowspace::model::ConstValue,
     front::llbc_hints::harvest_immutable_fields_from_llbcs,
-    front::mir::{LowerError, lower_fun_decl, lower_function, lower_function_with_static_addrs},
+    front::mir::{
+        LowerError, discover_fnptr_field_families, lower_fun_decl, lower_function,
+        lower_function_with_static_addrs,
+    },
     model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType},
     translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget},
 };
@@ -228,40 +231,81 @@ fn mapdict_fns<'a>(llbc: &'a Llbc, leaf: &str) -> Vec<&'a FunDecl> {
         .collect()
 }
 
+fn mapdict_access_fns<'a>(llbc: &'a Llbc, field: &str) -> Vec<&'a FunDecl> {
+    let suffix = format!("::{field}");
+    llbc.iter_local_fns()
+        .filter(|fd| {
+            let path = fd.item_meta.name_path_str();
+            path.ends_with(&suffix) && path.contains("MAPDICT_ACCESS")
+        })
+        .collect()
+}
+
+fn graph_reads_map_gcref(graph: &FunctionGraph) -> bool {
+    ops(graph).any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldRead {
+                field,
+                ty: ValueType::Ref(_),
+                ..
+            } if field.name == "map"
+        )
+    })
+}
+
+fn graph_has_fnptr_slot_dispatch(graph: &FunctionGraph, field: &str) -> bool {
+    ops(graph).any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::IndirectCall {
+                family_key: Some((_, name)),
+                ..
+            } if name == field
+        )
+    })
+}
+
 #[test]
 fn mapdict_get_reads_map_field_as_ref() {
-    let llbc = load_llbc(INTERPRETER_LLBC);
-    common::with_shared_lowering(llbc, |context| {
-        let gets = mapdict_fns(llbc, "_get_mapdict_map");
+    let object = load_llbc(OBJECT_LLBC);
+    common::with_shared_lowering(object, |context| {
+        let loads = mapdict_fns(object, "mapdict_typed_load_map");
         assert!(
-            !gets.is_empty(),
-            "mapdict _get_mapdict_map is in interpreter LLBC"
+            !loads.is_empty(),
+            "mapdict_typed_load_map is in pyre-object LLBC"
         );
-        let mut saw_map = false;
-        for fd in gets {
+        for fd in loads {
             let graph = lower_fun_decl(context, fd)
                 .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path_str()));
-            let maps: Vec<_> = ops(&graph)
-                .filter_map(|op| match &op.kind {
-                    OpKind::FieldRead { field, ty, .. } if field.name == "map" => Some(ty),
-                    _ => None,
-                })
-                .collect();
-            if maps.is_empty() {
-                continue;
-            }
-            saw_map = true;
             assert!(
-                maps.iter().all(|ty| matches!(ty, ValueType::Ref(_))),
-                "{} FieldRead of map is GCREF (`history.getkind` of Ptr(TO) follows TO._gckind), got {maps:?}",
+                graph_has_fnptr_slot_dispatch(&graph, "get_map"),
+                "{} dispatches through the get_map slot",
+                graph.name
+            );
+            assert!(
+                !graph_has_word_to_map_class_cast(&graph),
+                "{} must not cast a word to AbstractAttribute",
                 graph.name
             );
         }
-        assert!(
-            saw_map,
-            "MapdictObject::_get_mapdict_map FieldReads the map GCREF"
-        );
     });
+
+    let mut saw_map = false;
+    for llbc_path in [OBJECT_LLBC, INTERPRETER_LLBC] {
+        let llbc = load_llbc(llbc_path);
+        common::with_shared_lowering(llbc, |ctx| {
+            let gets = mapdict_access_fns(&llbc, "get_map");
+            for fd in gets {
+                let graph = lower_fun_decl(&ctx, fd)
+                    .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path_str()));
+                if graph_reads_map_gcref(&graph) {
+                    saw_map = true;
+                }
+            }
+        });
+    }
+    assert!(saw_map, "per-carrier get_map FieldReads the map GCREF");
 }
 
 #[test]
@@ -387,12 +431,12 @@ fn call_returned_byte_pointer_stays_ref() {
 }
 
 /// Front-end: `map_terminator` loads `AbstractAttribute.terminator`
-/// and `map_terminator_w_cls` / `instance_getclass` load
-/// `Terminator.w_cls` as GCREF field reads (`getfield_gc_r`). The
-/// parent is first-field-inlined (`GcStruct._first_struct`); a
-/// downcast (`cast_pointer`) keeps the object start.
-/// `jtransform.py rewrite_op_getfield` marks `w_cls` pure from
-/// `_immutable_fields_`.
+/// and `map_terminator_w_cls` loads `Terminator.w_cls` as GCREF field
+/// reads (`getfield_gc_r`). Per-carrier `getclass` calls that helper
+/// (`BaseUserClassMapdict.getclass`). The parent is first-field-inlined
+/// (`GcStruct._first_struct`); a downcast (`cast_pointer`) keeps the
+/// object start. `jtransform.py rewrite_op_getfield` marks `w_cls` pure
+/// from `_immutable_fields_`.
 #[test]
 fn map_terminator_w_cls_is_gc_field_read_from_object_start() {
     let llbc = load_llbc(OBJECT_LLBC);
@@ -544,10 +588,9 @@ fn graph_has_word_to_map_class_cast(graph: &FunctionGraph) -> bool {
     })
 }
 
-/// `instance_getclass` loads the mixin `map` as a typed GCREF
-/// (`getfield_gc_r`). A word → `AbstractAttribute` `__cast_instance_intrinsic`
-/// is `gc_load_indexed` of a GCREF, which `rewrite_op_gc_load_indexed`
-/// refuses.
+/// `instance_getclass` dispatches through the type's `getclass` slot
+/// (`ClassRepr.getclsfield` then `FunctionReprBase.call`). Per-carrier
+/// `getclass` FieldReads the mixin `map` as a GCREF (`getfield_gc_r`).
 #[test]
 fn instance_getclass_loads_typed_mapref_field() {
     let llbc = load_llbc(OBJECT_LLBC);
@@ -557,15 +600,9 @@ fn instance_getclass_loads_typed_mapref_field() {
         for fd in fns {
             let graph = lower_fun_decl(context, fd)
                 .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path_str()));
-            let maps: Vec<_> = ops(&graph)
-                .filter_map(|op| match &op.kind {
-                    OpKind::FieldRead { field, ty, .. } if field.name == "map" => Some(ty),
-                    _ => None,
-                })
-                .collect();
             assert!(
-                !maps.is_empty() && maps.iter().all(|ty| matches!(ty, ValueType::Ref(_))),
-                "{} loads map as GCREF FieldRead, got {maps:?}",
+                graph_has_fnptr_slot_dispatch(&graph, "getclass"),
+                "{} dispatches through the getclass slot",
                 graph.name
             );
             assert!(
@@ -575,6 +612,26 @@ fn instance_getclass_loads_typed_mapref_field() {
             );
         }
     });
+
+    let mut saw_map = false;
+    for llbc_path in [OBJECT_LLBC, INTERPRETER_LLBC] {
+        let artefact = load_llbc(llbc_path);
+        common::with_shared_lowering(artefact, |ctx| {
+            for fd in mapdict_access_fns(&artefact, "getclass") {
+                let graph = lower_fun_decl(&ctx, fd)
+                    .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path_str()));
+                if graph_reads_map_gcref(&graph) {
+                    saw_map = true;
+                }
+                assert!(
+                    !graph_has_word_to_map_class_cast(&graph),
+                    "{} must not cast a word to AbstractAttribute",
+                    graph.name
+                );
+            }
+        });
+    }
+    assert!(saw_map, "per-carrier getclass FieldReads the map GCREF");
 
     let interp = load_llbc(INTERPRETER_LLBC);
     common::with_shared_lowering(interp, |interp_ctx| {
@@ -590,6 +647,44 @@ fn instance_getclass_loads_typed_mapref_field() {
             );
         }
     });
+}
+
+/// Nested `getclass` FunDecls stored in `mapdict_mixin_access!` consts
+/// are family members (`FunctionReprBase.call` `c_graphs` /
+/// `descs = list(s_pbc.descriptions)`). `_share_methods` stores one shared
+/// FunDecl plus the `W_ObjectObject` `import_from_mixin` copy.
+#[test]
+fn mapdict_getclass_fnptr_family_includes_object_carrier() {
+    let llbc = load_llbc(OBJECT_LLBC);
+    let rows = discover_fnptr_field_families(&llbc);
+    let getclass: Vec<&str> = rows
+        .iter()
+        .filter(|(path, field, _)| path == "mapdict::MapdictMixinAccess" && field == "getclass")
+        .map(|(_, _, path)| path.as_str())
+        .collect();
+    assert_eq!(
+        getclass.len(),
+        2,
+        "getclass family is shared + object copy: {getclass:?}"
+    );
+    assert!(
+        getclass
+            .iter()
+            .any(|path| *path == "mapdict::base_user_class_mapdict_getclass"),
+        "shared getclass member path: {getclass:?}"
+    );
+    assert!(
+        getclass
+            .iter()
+            .any(|path| *path == "objectobject::W_OBJECT_OBJECT_MAPDICT_ACCESS::getclass"),
+        "object getclass member path: {getclass:?}"
+    );
+    let get_map: Vec<&str> = rows
+        .iter()
+        .filter(|(path, field, _)| path == "mapdict::MapdictMixinAccess" && field == "get_map")
+        .map(|(_, _, path)| path.as_str())
+        .collect();
+    assert!(!get_map.is_empty(), "get_map family members after harvest");
 }
 
 fn i64_ty() -> Value {

@@ -468,6 +468,11 @@ const _: () = {
     );
 };
 
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_BASE_EXCEPTION_USER_MAPDICT_ACCESS for W_BaseExceptionUser;
+}
+
 /// `typedef.py` `_getusercls` of an extra-field realbase (`W_OSError`,
 /// `W_ImportError`, `W_StopIteration`, ...). Same mapdict tail as
 /// [`W_BaseExceptionUser`], prefixed by [`W_ExceptionExtended`].
@@ -486,19 +491,26 @@ const _: () = {
     );
 };
 
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_EXCEPTION_EXTENDED_USER_MAPDICT_ACCESS for W_ExceptionExtendedUser;
+}
+
 /// Slim `_getusercls` typeptr (`typedef.py` `_getusercls(W_BaseException)`).
-pub static BASE_EXCEPTION_USER_TYPE: PyType = new_user_pytype(
+pub static BASE_EXCEPTION_USER_TYPE: PyType = new_user_pytype_with_access(
     "BaseException",
     &EXCEPTION_TYPE,
     std::mem::offset_of!(W_BaseExceptionUser, map),
+    &W_BASE_EXCEPTION_USER_MAPDICT_ACCESS,
 );
 
 /// Extra-field `_getusercls` typeptr. One vtable covers every extended
 /// realbase's user layout; `w_class` names the Python class.
-pub static EXCEPTION_EXTENDED_USER_TYPE: PyType = new_user_pytype(
+pub static EXCEPTION_EXTENDED_USER_TYPE: PyType = new_user_pytype_with_access(
     "BaseException",
     &EXCEPTION_TYPE,
     std::mem::offset_of!(W_ExceptionExtendedUser, map),
+    &W_EXCEPTION_EXTENDED_USER_MAPDICT_ACCESS,
 );
 
 pub const EXC_KIND_OFFSET: usize = std::mem::offset_of!(W_BaseException, kind);

@@ -744,6 +744,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             unsafe_fn_stubs: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),
             atomic_load_decls: Vec::new(),
+            fnptr_field_families: Vec::new(),
         }),
     )
 }
@@ -3397,6 +3398,7 @@ impl CrateLoweringState {
             unsafe_fn_stubs: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),
             atomic_load_decls,
+            fnptr_field_families: Vec::new(),
         }
     }
 }
@@ -7817,9 +7819,11 @@ pub(crate) use self::consteval::{
     harvest_named_const_folds, push_named_const_folds, register_ambiguous_impl_foldable_const_lits,
     register_foldable_const_lits,
 };
+pub use self::desugar::callee::discover_fnptr_field_families;
 pub(crate) use self::desugar::callee::{
     discover_eval_hook_graphs, discover_profilefunc_graphs, discover_profilefunc_spellings,
-    release_declared_vable_array_address,
+    fnptr_field_family_member_fn_ids, fnptr_field_under_use, fnptr_struct_field_target,
+    release_declared_vable_array_address, vtable_slot_under_fn_ptr_cast,
 };
 pub(crate) use self::desugar::rewire::{
     AggregateCtor, AggregateShape, emit_aggregate_value, is_core_clone_impls_clone_path,

@@ -8,10 +8,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub static BYTEARRAY_TYPE: PyType =
     crate::pyobject::new_pytype_with_user_subclass("bytearray", &BYTEARRAY_USER_TYPE);
 /// `W_BytearrayObjectUser` (`typedef.py _getusercls(W_BytearrayObject)`).
-pub static BYTEARRAY_USER_TYPE: PyType = crate::pyobject::new_user_pytype(
+pub static BYTEARRAY_USER_TYPE: PyType = crate::pyobject::new_user_pytype_with_access(
     "bytearray",
     &BYTEARRAY_TYPE,
     std::mem::offset_of!(W_BytearrayObjectUser, map),
+    &W_BYTEARRAY_USER_MAPDICT_ACCESS,
 );
 
 /// Python bytearray object.
@@ -77,6 +78,11 @@ const _: () = {
                 + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
+
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_BYTEARRAY_USER_MAPDICT_ACCESS for W_BytearrayObjectUser;
+}
 
 /// GC type id assigned to `W_BytearrayObject` at JitDriver init time.
 pub const W_BYTEARRAY_GC_TYPE_ID: u32 = 28;

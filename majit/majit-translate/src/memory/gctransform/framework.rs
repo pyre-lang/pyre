@@ -1659,9 +1659,10 @@ mod tests {
             .expect("cleanup-call fixture parses")
     }
 
-    /// Regular and trait-default callees of every Call terminator in `body`.
-    /// Regular Fun ids go through the same helper `build` uses, so a
-    /// specialized instantiation is the node the oracle names.
+    /// Regular, trait-default, and harvested FnPtr-field Dynamic callees
+    /// of every Call terminator in `body`. Regular Fun ids go through the
+    /// same helper `build` uses, so a specialized instantiation is the
+    /// node the oracle names.
     fn all_block_callees(
         llbc: &majit_charon_reader::Llbc,
         body: &majit_charon_reader::ullbc::Unstructured,
@@ -1673,8 +1674,8 @@ mod tests {
             let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
                 continue;
             };
-            if let CallFunc::Regular(reg) = &call.func {
-                match &reg.kind {
+            match &call.func {
+                CallFunc::Regular(reg) => match &reg.kind {
                     CallKind::Fun(FunId::Regular { id }) => {
                         entry.insert(cg.callee_node(llbc, &[], *id, &reg.generics));
                     }
@@ -1686,7 +1687,23 @@ mod tests {
                         }
                     }
                     _ => {}
+                },
+                CallFunc::Dynamic(op, _) => {
+                    if let Some(members) =
+                        super::super::instantiate::fnptr_field_analyze_indirect_call(llbc, body, op)
+                    {
+                        let empty_generics = serde_json::json!({
+                            "regions": [],
+                            "types": [],
+                            "const_generics": [],
+                            "trait_refs": [],
+                        });
+                        for member_id in members {
+                            entry.insert(cg.callee_node(llbc, &[], member_id, &empty_generics));
+                        }
+                    }
                 }
+                _ => {}
             }
         }
         entry

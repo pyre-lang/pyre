@@ -84,8 +84,8 @@ pub struct PyType {
     pub user_base: *const PyType,
     /// Per-class `MapdictStorageMixin` field accessors
     /// (`typedef.py` `_getusercls` `import_from_mixin`). Null when the
-    /// class has no mixin, or when a looked-inside match already names
-    /// the carrier.
+    /// class has no mixin. Immutable after type creation
+    /// (`_immutable_fields_`); a constant type folds the slot load.
     pub mapdict_access: Option<&'static crate::mapdict::MapdictMixinAccess>,
 }
 
@@ -627,46 +627,52 @@ const _: () = {
 
 pub static INT_TYPE: PyType = new_pytype_with_user_subclass("int", &INT_USER_TYPE);
 /// `W_IntObjectUser` (`typedef.py _getusercls(W_IntObject)`).
-pub static INT_USER_TYPE: PyType = new_user_pytype(
+pub static INT_USER_TYPE: PyType = new_user_pytype_with_access(
     "int",
     &INT_TYPE,
     std::mem::offset_of!(crate::intobject::W_IntObjectUser, map),
+    &crate::intobject::W_INT_USER_MAPDICT_ACCESS,
 );
 pub static BOOL_TYPE: PyType = new_pytype("bool");
 pub static FLOAT_TYPE: PyType = new_pytype_with_user_subclass("float", &FLOAT_USER_TYPE);
 /// `W_FloatObjectUser` (`typedef.py _getusercls(W_FloatObject)`).
-pub static FLOAT_USER_TYPE: PyType = new_user_pytype(
+pub static FLOAT_USER_TYPE: PyType = new_user_pytype_with_access(
     "float",
     &FLOAT_TYPE,
     std::mem::offset_of!(crate::floatobject::W_FloatObjectUser, map),
+    &crate::floatobject::W_FLOAT_USER_MAPDICT_ACCESS,
 );
 pub static COMPLEX_TYPE: PyType = new_pytype_with_user_subclass("complex", &COMPLEX_USER_TYPE);
 /// `W_ComplexObjectUser` (`typedef.py _getusercls(W_ComplexObject)`).
-pub static COMPLEX_USER_TYPE: PyType = new_user_pytype(
+pub static COMPLEX_USER_TYPE: PyType = new_user_pytype_with_access(
     "complex",
     &COMPLEX_TYPE,
     std::mem::offset_of!(crate::complexobject::W_ComplexObjectUser, map),
+    &crate::complexobject::W_COMPLEX_USER_MAPDICT_ACCESS,
 );
 pub static STR_TYPE: PyType = new_pytype_with_user_subclass("str", &STR_USER_TYPE);
 /// `W_UnicodeObjectUser` (`typedef.py _getusercls(W_UnicodeObject)`).
-pub static STR_USER_TYPE: PyType = new_user_pytype(
+pub static STR_USER_TYPE: PyType = new_user_pytype_with_access(
     "str",
     &STR_TYPE,
     std::mem::offset_of!(crate::unicodeobject::W_UnicodeObjectUser, map),
+    &crate::unicodeobject::W_UNICODE_USER_MAPDICT_ACCESS,
 );
 pub static LIST_TYPE: PyType = new_pytype_with_user_subclass("list", &LIST_USER_TYPE);
 /// `W_ListObjectUser` (`typedef.py _getusercls(W_ListObject)`).
-pub static LIST_USER_TYPE: PyType = new_user_pytype(
+pub static LIST_USER_TYPE: PyType = new_user_pytype_with_access(
     "list",
     &LIST_TYPE,
     std::mem::offset_of!(crate::listobject::W_ListObjectUser, map),
+    &crate::listobject::W_LIST_USER_MAPDICT_ACCESS,
 );
 pub static TUPLE_TYPE: PyType = new_pytype_with_user_subclass("tuple", &TUPLE_USER_TYPE);
 /// `W_TupleObjectUser` (`typedef.py _getusercls(W_TupleObject)`).
-pub static TUPLE_USER_TYPE: PyType = new_user_pytype(
+pub static TUPLE_USER_TYPE: PyType = new_user_pytype_with_access(
     "tuple",
     &TUPLE_TYPE,
     std::mem::offset_of!(crate::tupleobject::W_TupleObjectUser, map),
+    &crate::tupleobject::W_TUPLE_USER_MAPDICT_ACCESS,
 );
 pub static DICT_TYPE: PyType = new_pytype("dict");
 /// Layout tag for the builtin `frozendict` type. Instances reuse the
@@ -675,10 +681,11 @@ pub static DICT_TYPE: PyType = new_pytype("dict");
 pub static FROZENDICT_TYPE: PyType = new_pytype("frozendict");
 pub static LONG_TYPE: PyType = new_pytype_with_user_subclass("int", &LONG_USER_TYPE);
 /// `W_LongObjectUser` (`typedef.py` `_getusercls(W_LongObject)`).
-pub static LONG_USER_TYPE: PyType = new_user_pytype(
+pub static LONG_USER_TYPE: PyType = new_user_pytype_with_access(
     "int",
     &LONG_TYPE,
     std::mem::offset_of!(crate::longobject::W_LongObjectUser, map),
+    &crate::longobject::W_LONG_USER_MAPDICT_ACCESS,
 );
 pub static NONE_TYPE: PyType = new_pytype("NoneType");
 pub static NOTIMPLEMENTED_TYPE: PyType = new_pytype("NotImplementedType");
@@ -690,11 +697,12 @@ pub static MODULE_TYPE: PyType = new_pytype_with_user_subclass_and_weakref(
 );
 /// `ModuleUser` (`typedef.py` `_getusercls(Module)`). The lifeline lives on
 /// the `Module` prefix, so a subclass instance addresses the same word.
-pub static MODULE_USER_TYPE: PyType = new_user_pytype_with_lifeline(
+pub static MODULE_USER_TYPE: PyType = new_user_pytype_with_lifeline_access(
     "module",
     &MODULE_TYPE,
     std::mem::offset_of!(crate::module::ModuleUser, map),
     std::mem::offset_of!(crate::module::Module, lifeline),
+    &crate::module::W_MODULE_USER_MAPDICT_ACCESS,
 );
 pub static MAPPING_PROXY_TYPE: PyType = new_pytype("mappingproxy");
 pub static TYPE_TYPE: PyType = new_pytype_with_weakref(
@@ -710,9 +718,10 @@ pub static W_ROOT_TYPE: PyType = new_pytype("W_Root");
 /// `_getusercls` class below; both keep the `map` word
 /// (`MapdictStorageMixin`).
 pub static INSTANCE_TYPE: PyType = {
-    let mut tp = new_pytype_with_mapdict_mixin(
+    let mut tp = new_pytype_with_mapdict_mixin_access(
         "object",
         std::mem::offset_of!(crate::objectobject::W_ObjectObject, map),
+        &crate::objectobject::W_OBJECT_OBJECT_MAPDICT_ACCESS,
     );
     tp.user_subclass = &INSTANCE_USER_TYPE;
     tp
@@ -721,10 +730,11 @@ pub static INSTANCE_TYPE: PyType = {
 /// `_getusercls(W_ObjectObject)`). Same `{header, map, storage}` payload
 /// as `W_ObjectObject`; a carrier whose app-level class is not exactly
 /// `object` stamps this vtable.
-pub static INSTANCE_USER_TYPE: PyType = new_user_pytype(
+pub static INSTANCE_USER_TYPE: PyType = new_user_pytype_with_access(
     "object",
     &INSTANCE_TYPE,
     std::mem::offset_of!(crate::objectobject::W_ObjectObject, map),
+    &crate::objectobject::W_OBJECT_OBJECT_MAPDICT_ACCESS,
 );
 
 /// Field offset of `ob_type` within PyObject, for JIT field access.

@@ -1868,8 +1868,9 @@ fn expand_pyre_class(
     // `<W_X as GcType>::type_id()` (which itself becomes `cell.get()`).
     let mixin_access_items = if has_mapdict_mixin {
         quote! {
-            #st_vis static #mapdict_access_static: ::pyre_object::mapdict::MapdictMixinAccess =
-                ::pyre_object::mapdict_mixin_access!(#st_name);
+            ::pyre_object::mapdict_mixin_access! {
+                #st_vis static #mapdict_access_static for #st_name;
+            }
         }
     } else {
         quote! {}
@@ -2093,8 +2094,9 @@ fn expand_pyre_class(
                     );
                 };
 
-                #st_vis static #user_mapdict_access_static: ::pyre_object::mapdict::MapdictMixinAccess =
-                    ::pyre_object::mapdict_mixin_access!(#user_struct_name);
+                ::pyre_object::mapdict_mixin_access! {
+                    #st_vis static #user_mapdict_access_static for #user_struct_name;
+                }
 
                 #st_vis static #user_pytype_static: ::pyre_object::PyType =
                     #user_pytype_init;

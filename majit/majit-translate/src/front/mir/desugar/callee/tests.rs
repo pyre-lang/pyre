@@ -1,4 +1,6 @@
-use super::{FnPtrFamily, fn_ptr_family_for, profilefunc_graphs_for_call};
+use super::{
+    FnPtrFamily, discover_fnptr_field_families, fn_ptr_family_for, profilefunc_graphs_for_call,
+};
 
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::Operand;
@@ -47,6 +49,702 @@ fn fn_ptr_family_names_the_wrapper_set_only_for_a_safe_pointer() {
                  fnptr_indirect={fnptr_indirect}"
         );
     }
+}
+
+fn fnptr_ty() -> serde_json::Value {
+    unit_fn_ptr()
+}
+
+fn adt_ty(id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "Adt": {
+            "id": id,
+            "generics": empty_generics()
+        }
+    })
+}
+
+fn fn_def_const(fun_id: u64) -> serde_json::Value {
+    serde_json::json!({"Const": [{
+        "FnDef": {
+            "kind": {"Fun": fun_id},
+            "generics": empty_generics()
+        }
+    }, fnptr_ty()]})
+}
+
+fn fn_def_to_fn_ptr(operand: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"UnaryOp": [{"Cast": "FnDefToFnPtr"}, operand]})
+}
+
+fn local_ty(index: u64, ty: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "index": index,
+        "name": null,
+        "span": span_json(),
+        "ty": ty
+    })
+}
+
+fn typed_local(index: u64, ty: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"kind": {"Local": index}, "ty": ty})
+}
+
+fn move_local(index: u64, ty: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"Move": typed_local(index, ty)})
+}
+
+fn copy_local(index: u64, ty: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"Read": typed_local(index, ty)})
+}
+
+fn assign_local(
+    index: u64,
+    ty: &serde_json::Value,
+    rvalue: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "span": span_json(),
+        "kind": {"Assign": [typed_local(index, ty), rvalue]}
+    })
+}
+
+fn unit_fun(def_id: u64, path: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(path, "", true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": unit_ty()},
+        "src": "Normal",
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [local_ty(0, &unit_ty())]},
+            "body": [{
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }}
+    })
+}
+
+fn table_type(def_id: u64, path: &[&str], fields: &[&str]) -> serde_json::Value {
+    let field_decls: Vec<serde_json::Value> = fields
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "name": name,
+                "ty": fnptr_ty(),
+                "attr_info": null
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(path, "", true),
+        "kind": {"Struct": field_decls}
+    })
+}
+
+fn table_static(def_id: u64, path: &[&str], type_id: u64, init_fun: u64) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(path, "", true),
+        "global_kind": "Static",
+        "ty": adt_ty(type_id),
+        "value": {"Value": [0, [{"Call": [{"kind": {"Fun": init_fun}, "generics": empty_generics()}, []]}, adt_ty(type_id)]]}
+    })
+}
+
+fn table_initializer(
+    def_id: u64,
+    path: &[&str],
+    global_id: u64,
+    type_id: u64,
+    field_rvalues: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    table_aggregate_fun(
+        def_id,
+        path,
+        serde_json::json!({"GlobalInitializer": {"id": global_id}}),
+        type_id,
+        field_rvalues,
+    )
+}
+
+fn table_runtime_constructor(
+    def_id: u64,
+    path: &[&str],
+    type_id: u64,
+    field_rvalues: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    table_aggregate_fun(
+        def_id,
+        path,
+        serde_json::json!("Normal"),
+        type_id,
+        field_rvalues,
+    )
+}
+
+fn table_aggregate_fun(
+    def_id: u64,
+    path: &[&str],
+    src: serde_json::Value,
+    type_id: u64,
+    field_rvalues: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let struct_ty = adt_ty(type_id);
+    let n_fields = field_rvalues.len() as u64;
+    let mut locals = vec![local_ty(0, &struct_ty)];
+    for i in 1..=n_fields {
+        locals.push(local_ty(i, &fnptr_ty()));
+    }
+    let mut statements = Vec::new();
+    for (i, rvalue) in field_rvalues.into_iter().enumerate() {
+        statements.push(assign_local(i as u64 + 1, &fnptr_ty(), rvalue));
+    }
+    let operands: Vec<serde_json::Value> =
+        (1..=n_fields).map(|i| move_local(i, &fnptr_ty())).collect();
+    statements.push(assign_local(
+        0,
+        &struct_ty,
+        serde_json::json!({"Aggregate": [{"Adt": [type_id, null]}, operands]}),
+    ));
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(path, "", true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": struct_ty},
+        "src": src,
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": locals},
+            "body": [{
+                "statements": statements,
+                "kind": "Regular",
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }}
+    })
+}
+
+/// Charon indexes `*_decls` by `def_id` (`fn_by_id` / `type_by_id` /
+/// `global_by_id` are O(1) array lookups). Pad unused slots with `null`.
+fn pad_by_def_id(decls: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let max_id = decls
+        .iter()
+        .filter_map(|decl| decl.get("def_id")?.as_u64())
+        .max()
+        .unwrap_or(0);
+    let mut out = vec![serde_json::Value::Null; max_id as usize + 1];
+    for decl in decls {
+        let id = decl
+            .get("def_id")
+            .and_then(serde_json::Value::as_u64)
+            .expect("decl def_id") as usize;
+        out[id] = decl;
+    }
+    out
+}
+
+fn fnptr_family_llbc(
+    types: Vec<serde_json::Value>,
+    funs: Vec<serde_json::Value>,
+    globals: Vec<serde_json::Value>,
+) -> Llbc {
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "c",
+            "type_decls": pad_by_def_id(types),
+            "fun_decls": pad_by_def_id(funs),
+            "global_decls": pad_by_def_id(globals),
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("fnptr family fixture parses")
+}
+
+fn family_members<'a>(
+    rows: &'a [(String, String, String)],
+    struct_path: &str,
+    field: &str,
+) -> Vec<&'a str> {
+    rows.iter()
+        .filter(|(path, name, _)| path == struct_path && name == field)
+        .map(|(_, _, callpath)| callpath.as_str())
+        .collect()
+}
+
+/// Families follow the FunDecl stored in the field (`row_of_graphs`), not
+/// a FunDecl whose last path segment equals the field name.
+#[test]
+fn fnptr_field_family_follows_stored_functions_not_field_names() {
+    let llbc = fnptr_family_llbc(
+        vec![table_type(0, &["c", "mod", "Table"], &["left", "right"])],
+        vec![
+            unit_fun(1, &["c", "mod", "TABLE", "foo"]),
+            unit_fun(2, &["c", "mod", "bar"]),
+            unit_fun(3, &["c", "mod", "TABLE", "left"]),
+            table_initializer(
+                20,
+                &["c", "mod", "TABLE"],
+                10,
+                0,
+                vec![
+                    fn_def_to_fn_ptr(fn_def_const(1)),
+                    fn_def_to_fn_ptr(fn_def_const(2)),
+                ],
+            ),
+        ],
+        vec![table_static(10, &["c", "mod", "TABLE"], 0, 20)],
+    );
+    let rows = discover_fnptr_field_families(&llbc);
+    assert_eq!(
+        family_members(&rows, "mod::Table", "left"),
+        ["mod::TABLE::foo"],
+        "left stores nested foo, not a FunDecl named left: {rows:?}"
+    );
+    assert_eq!(
+        family_members(&rows, "mod::Table", "right"),
+        ["mod::bar"],
+        "right stores top-level bar: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|(_, _, path)| path == "mod::TABLE::left"),
+        "a FunDecl named left that is not stored is not a family member: {rows:?}"
+    );
+}
+
+/// Swapping the initializer operands swaps the families. The left slot
+/// peels `Use` of an `FnDef` then `FnDefToFnPtr` of that copy.
+#[test]
+fn fnptr_field_family_follows_swapped_initializer() {
+    let llbc = swapped_use_peel_llbc();
+    let rows = discover_fnptr_field_families(&llbc);
+    assert_eq!(
+        family_members(&rows, "mod::Table", "left"),
+        ["mod::bar"],
+        "swapped left stores bar: {rows:?}"
+    );
+    assert_eq!(
+        family_members(&rows, "mod::Table", "right"),
+        ["mod::foo"],
+        "swapped right stores foo: {rows:?}"
+    );
+}
+
+fn swapped_use_peel_llbc() -> Llbc {
+    let struct_ty = adt_ty(0);
+    let fn_ty = fnptr_ty();
+    let statements = vec![
+        assign_local(
+            3,
+            &fn_ty,
+            serde_json::json!({"Use": [fn_def_const(2), "No"]}),
+        ),
+        assign_local(1, &fn_ty, fn_def_to_fn_ptr(copy_local(3, &fn_ty))),
+        assign_local(2, &fn_ty, fn_def_to_fn_ptr(fn_def_const(1))),
+        assign_local(
+            0,
+            &struct_ty,
+            serde_json::json!({"Aggregate": [{"Adt": [0, null]}, [
+                move_local(1, &fn_ty),
+                move_local(2, &fn_ty)
+            ]]}),
+        ),
+    ];
+    let init = serde_json::json!({
+        "def_id": 20,
+        "item_meta": item_meta_json(&["c", "mod", "TABLE"], "", true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": struct_ty},
+        "src": {"GlobalInitializer": {"id": 10}},
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                local_ty(0, &struct_ty),
+                local_ty(1, &fn_ty),
+                local_ty(2, &fn_ty),
+                local_ty(3, &fn_ty)
+            ]},
+            "body": [{
+                "statements": statements,
+                "kind": "Regular",
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }}
+    });
+    fnptr_family_llbc(
+        vec![table_type(0, &["c", "mod", "Table"], &["left", "right"])],
+        vec![
+            unit_fun(1, &["c", "mod", "foo"]),
+            unit_fun(2, &["c", "mod", "bar"]),
+            init,
+        ],
+        vec![table_static(10, &["c", "mod", "TABLE"], 0, 20)],
+    )
+}
+
+/// Two types that share a leaf name keep distinct family keys.
+#[test]
+fn fnptr_field_family_keys_use_full_defining_type_path() {
+    let llbc = fnptr_family_llbc(
+        vec![
+            table_type(0, &["c", "a", "Table"], &["slot"]),
+            table_type(1, &["c", "b", "Table"], &["slot"]),
+        ],
+        vec![
+            unit_fun(1, &["c", "a", "foo"]),
+            unit_fun(2, &["c", "b", "bar"]),
+            table_initializer(
+                20,
+                &["c", "a", "A"],
+                10,
+                0,
+                vec![fn_def_to_fn_ptr(fn_def_const(1))],
+            ),
+            table_initializer(
+                21,
+                &["c", "b", "B"],
+                11,
+                1,
+                vec![fn_def_to_fn_ptr(fn_def_const(2))],
+            ),
+        ],
+        vec![
+            table_static(10, &["c", "a", "A"], 0, 20),
+            table_static(11, &["c", "b", "B"], 1, 21),
+        ],
+    );
+    let rows = discover_fnptr_field_families(&llbc);
+    assert_eq!(
+        family_members(&rows, "a::Table", "slot"),
+        ["a::foo"],
+        "a::Table.slot family: {rows:?}"
+    );
+    assert_eq!(
+        family_members(&rows, "b::Table", "slot"),
+        ["b::bar"],
+        "b::Table.slot family: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|(path, _, _)| path == "Table"),
+        "family key keeps the defining type path, not the leaf: {rows:?}"
+    );
+    assert!(
+        super::fnptr_field_family_contains(&llbc, "a::Table", "slot"),
+        "lookup uses the full key"
+    );
+    assert!(
+        !super::fnptr_field_family_contains(&llbc, "Table", "slot"),
+        "the leaf alone is not a family key"
+    );
+}
+
+/// A static that stores `f` plus a runtime constructor that stores `g`
+/// closes the family over both (`s_pbc.descriptions` is the union).
+#[test]
+fn fnptr_field_family_unions_static_and_runtime_stores() {
+    let llbc = fnptr_family_llbc(
+        vec![table_type(0, &["c", "mod", "Table"], &["slot"])],
+        vec![
+            unit_fun(1, &["c", "mod", "f"]),
+            unit_fun(2, &["c", "mod", "g"]),
+            table_initializer(
+                20,
+                &["c", "mod", "TABLE"],
+                10,
+                0,
+                vec![fn_def_to_fn_ptr(fn_def_const(1))],
+            ),
+            table_runtime_constructor(
+                21,
+                &["c", "mod", "make"],
+                0,
+                vec![fn_def_to_fn_ptr(fn_def_const(2))],
+            ),
+        ],
+        vec![table_static(10, &["c", "mod", "TABLE"], 0, 20)],
+    );
+    let rows = discover_fnptr_field_families(&llbc);
+    assert_eq!(
+        family_members(&rows, "mod::Table", "slot"),
+        ["mod::f", "mod::g"],
+        "static f and runtime g: {rows:?}"
+    );
+}
+
+/// A runtime store of a parameter is not a recoverable FunDecl, so the
+/// family is unpublished even when a static also stores `f`.
+#[test]
+fn fnptr_field_family_unpublished_when_a_store_is_not_a_fndef() {
+    let table = adt_ty(0);
+    let table_ptr = serde_json::json!({"RawPtr": [table.clone(), "Mut"]});
+    let fn_ty = fnptr_ty();
+    let field_place = serde_json::json!({
+        "kind": {"Projection": [
+            {"kind": {"Projection": [
+                {"kind": {"Local": 1}, "ty": table_ptr.clone()},
+                "Deref"
+            ]}, "ty": table.clone()},
+            {"Field": [null, 0]}
+        ]},
+        "ty": fn_ty.clone()
+    });
+    let poison = serde_json::json!({
+        "def_id": 21,
+        "item_meta": item_meta_json(&["c", "mod", "install"], "", true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [table_ptr.clone(), fn_ty.clone()],
+            "output": unit_ty()
+        },
+        "src": "Normal",
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 2, "locals": [
+                local_ty(0, &unit_ty()),
+                local_ty(1, &table_ptr),
+                local_ty(2, &fn_ty)
+            ]},
+            "body": [{
+                "statements": [serde_json::json!({
+                    "span": span_json(),
+                    "kind": {"Assign": [field_place, serde_json::json!({"Use": [move_local(2, &fn_ty), "No"]})]}
+                })],
+                "kind": "Regular",
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }}
+    });
+    let llbc = fnptr_family_llbc(
+        vec![table_type(0, &["c", "mod", "Table"], &["slot"])],
+        vec![
+            unit_fun(1, &["c", "mod", "f"]),
+            table_initializer(
+                20,
+                &["c", "mod", "TABLE"],
+                10,
+                0,
+                vec![fn_def_to_fn_ptr(fn_def_const(1))],
+            ),
+            poison,
+        ],
+        vec![table_static(10, &["c", "mod", "TABLE"], 0, 20)],
+    );
+    let rows = discover_fnptr_field_families(&llbc);
+    assert!(
+        family_members(&rows, "mod::Table", "slot").is_empty(),
+        "a parameter store unpublishes the family: {rows:?}"
+    );
+    assert!(
+        !super::fnptr_field_family_contains(&llbc, "mod::Table", "slot"),
+        "fnptr_struct_field_target must not name an unknown family"
+    );
+}
+
+/// A diamond that assigns `f` / `g` to one local then Aggregates that
+/// local publishes the union. Last-write-wins in physical block order
+/// would keep only `g`.
+#[test]
+fn fnptr_field_family_unions_diamond_local_assigns() {
+    let struct_ty = adt_ty(0);
+    let fn_ty = fnptr_ty();
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let diamond = serde_json::json!({
+        "def_id": 20,
+        "item_meta": item_meta_json(&["c", "mod", "make"], "", true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [bool_ty.clone()],
+            "output": struct_ty.clone()
+        },
+        "src": "Normal",
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 1, "locals": [
+                local_ty(0, &struct_ty),
+                local_ty(1, &bool_ty),
+                local_ty(2, &fn_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": {"Switch": {
+                        "discr": {"Read": typed_local(1, &bool_ty)},
+                        "targets": {"If": [1, 2]}
+                    }}}
+                },
+                {
+                    "statements": [assign_local(2, &fn_ty, fn_def_to_fn_ptr(fn_def_const(1)))],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": {"Goto": {"target": 3}}}
+                },
+                {
+                    "statements": [assign_local(2, &fn_ty, fn_def_to_fn_ptr(fn_def_const(2)))],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": {"Goto": {"target": 3}}}
+                },
+                {
+                    "statements": [assign_local(
+                        0,
+                        &struct_ty,
+                        serde_json::json!({"Aggregate": [{"Adt": [0, null]}, [
+                            move_local(2, &fn_ty)
+                        ]]})
+                    )],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let llbc = fnptr_family_llbc(
+        vec![table_type(0, &["c", "mod", "Table"], &["slot"])],
+        vec![
+            unit_fun(1, &["c", "mod", "f"]),
+            unit_fun(2, &["c", "mod", "g"]),
+            diamond,
+        ],
+        vec![],
+    );
+    let rows = discover_fnptr_field_families(&llbc);
+    assert_eq!(
+        family_members(&rows, "mod::Table", "slot"),
+        ["mod::f", "mod::g"],
+        "diamond union of f and g: {rows:?}"
+    );
+}
+
+fn dynamic_call_fun(
+    def_id: u64,
+    path: &[&str],
+    statements: Vec<serde_json::Value>,
+    dyn_operand: serde_json::Value,
+    locals: Vec<serde_json::Value>,
+    arg_count: u64,
+    inputs: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(path, "", true),
+        "signature": {"is_unsafe": false, "inputs": inputs, "output": unit_ty()},
+        "src": "Normal",
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": arg_count, "locals": locals},
+            "body": [
+                {
+                    "statements": statements,
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Dynamic": [dyn_operand, {"regions": []}]},
+                            "args": []
+                        },
+                        "dest": typed_local(0, &unit_ty()),
+                        "target": 1,
+                        "on_unwind": 1
+                    }}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }
+            ]
+        }}
+    })
+}
+
+/// A Dynamic call through a harvested FnPtr field is `analyze_indirect_call`
+/// over the family members, not `graphs is None`.
+#[test]
+fn fnptr_field_dynamic_call_follows_family_members() {
+    let table = adt_ty(0);
+    let table_ptr = serde_json::json!({"RawPtr": [table.clone(), "Const"]});
+    let fn_ty = fnptr_ty();
+    let field_place = serde_json::json!({
+        "kind": {"Projection": [
+            {"kind": {"Projection": [
+                {"kind": {"Local": 1}, "ty": table_ptr.clone()},
+                "Deref"
+            ]}, "ty": table},
+            {"Field": [null, 0]}
+        ]},
+        "ty": fn_ty.clone()
+    });
+    let harvested = dynamic_call_fun(
+        30,
+        &["c", "mod", "harvested_caller"],
+        vec![assign_local(
+            2,
+            &fn_ty,
+            serde_json::json!({"Use": [{"Read": field_place}, "No"]}),
+        )],
+        copy_local(2, &fn_ty),
+        vec![
+            local_ty(0, &unit_ty()),
+            local_ty(1, &table_ptr),
+            local_ty(2, &fn_ty),
+        ],
+        1,
+        vec![table_ptr],
+    );
+    let residual = dynamic_call_fun(
+        31,
+        &["c", "mod", "residual_caller"],
+        vec![],
+        copy_local(1, &fn_ty),
+        vec![local_ty(0, &unit_ty()), local_ty(1, &fn_ty)],
+        1,
+        vec![fn_ty],
+    );
+    let llbc = fnptr_family_llbc(
+        vec![table_type(0, &["c", "mod", "Table"], &["left", "right"])],
+        vec![
+            unit_fun(1, &["c", "mod", "foo"]),
+            unit_fun(2, &["c", "mod", "bar"]),
+            table_initializer(
+                20,
+                &["c", "mod", "TABLE"],
+                10,
+                0,
+                vec![
+                    fn_def_to_fn_ptr(fn_def_const(1)),
+                    fn_def_to_fn_ptr(fn_def_const(2)),
+                ],
+            ),
+            harvested,
+            residual,
+        ],
+        vec![table_static(10, &["c", "mod", "TABLE"], 0, 20)],
+    );
+    let cg = crate::memory::gctransform::framework::build(&llbc);
+    let harvested_callees = cg.callees.get(&30).expect("harvested caller");
+    assert!(
+        harvested_callees.contains(&1),
+        "left stores foo: {harvested_callees:?}"
+    );
+    assert!(
+        !harvested_callees.contains(&2),
+        "right is a different slot: {harvested_callees:?}"
+    );
+    assert!(
+        !cg.indirect.contains(&30),
+        "harvested Dynamic is analyze_indirect_call, not top_result"
+    );
+    assert!(
+        cg.indirect.contains(&31),
+        "a Dynamic call through a non-harvested pointer stays unresolved"
+    );
+    let residual_callees = cg.callees.get(&31).cloned().unwrap_or_default();
+    assert!(
+        residual_callees.is_empty(),
+        "non-harvested Dynamic has no family edges: {residual_callees:?}"
+    );
 }
 
 #[test]

@@ -686,268 +686,351 @@ const _: () = {
 
 /// Per-class copies of `MapdictStorageMixin._get_mapdict_map` /
 /// `_set_mapdict_map` / `_mapdict_read_storage` field accessors
-/// (`typedef.py` `_getusercls` `import_from_mixin`). Stored on the typeptr
-/// so a crate that cannot name the carrier still dispatches to that
-/// class's typed `self.map` / `self.storage` (`W_Root.getclass` overridden
-/// on the generated class).
+/// (`typedef.py` `_getusercls` `import_from_mixin`). `getclass` is
+/// [`base_user_class_mapdict_getclass`] (`_share_methods`) except the
+/// `W_ObjectObject` carrier, which keeps an `import_from_mixin` copy.
+/// Stored on the typeptr so a call through an unknown class is a vtable
+/// slot (`rclass` `getclsfield` then `FunctionReprBase.call`). Written
+/// once at type creation (`_immutable_fields_`).
+#[repr(C)]
 #[derive(Clone, Copy)]
+#[majit_macros::jit_immutable_fields(
+    "get_map",
+    "set_map",
+    "get_storage",
+    "set_storage",
+    "getclass"
+)]
 pub struct MapdictMixinAccess {
-    pub get_map: unsafe fn(crate::PyObjectRef) -> MapRef,
-    pub set_map: unsafe fn(crate::PyObjectRef, MapRef),
-    pub get_storage: unsafe fn(crate::PyObjectRef) -> *mut crate::object_array::ItemsBlock,
-    pub set_storage: unsafe fn(crate::PyObjectRef, *mut crate::object_array::ItemsBlock),
+    pub get_map: fn(crate::PyObjectRef) -> MapRef,
+    pub set_map: fn(crate::PyObjectRef, MapRef),
+    pub get_storage: fn(crate::PyObjectRef) -> *mut crate::object_array::ItemsBlock,
+    pub set_storage: fn(crate::PyObjectRef, *mut crate::object_array::ItemsBlock),
+    pub getclass: fn(crate::PyObjectRef) -> crate::PyObjectRef,
 }
 
-/// Typed `self.map` / `self.storage` accessors for one carrier layout.
+/// One `mapdict_mixin_access!` static's FnPtr slots, with the FunDecl
+/// `name_path` of each nested function. `CallControl.get_jitcode` stamps
+/// `JitCode.fnaddr` from `getfunctionptr`; `bytecode_for_address` looks
+/// that word up. The pointer is the slot field itself, captured in this
+/// crate so a later `fn as usize` in another crate cannot mint a second
+/// wasm32 table index.
+#[derive(Clone, Copy)]
+pub struct MapdictAccessFnCarrier {
+    pub get_map_path: &'static str,
+    pub get_map: fn(crate::PyObjectRef) -> MapRef,
+    pub set_map_path: &'static str,
+    pub set_map: fn(crate::PyObjectRef, MapRef),
+    pub get_storage_path: &'static str,
+    pub get_storage: fn(crate::PyObjectRef) -> *mut crate::object_array::ItemsBlock,
+    pub set_storage_path: &'static str,
+    pub set_storage: fn(crate::PyObjectRef, *mut crate::object_array::ItemsBlock),
+    /// FunDecl path of this table's nested `getclass`. Empty when the
+    /// table stores [`base_user_class_mapdict_getclass`]; that path is
+    /// published once by [`for_each_mapdict_access_fnaddr`].
+    pub getclass_path: &'static str,
+    pub getclass: fn(crate::PyObjectRef) -> crate::PyObjectRef,
+}
+
+impl MapdictAccessFnCarrier {
+    pub const fn from_access(
+        get_map_path: &'static str,
+        set_map_path: &'static str,
+        get_storage_path: &'static str,
+        set_storage_path: &'static str,
+        getclass_path: &'static str,
+        access: MapdictMixinAccess,
+    ) -> Self {
+        Self {
+            get_map_path,
+            get_map: access.get_map,
+            set_map_path,
+            set_map: access.set_map,
+            get_storage_path,
+            get_storage: access.get_storage,
+            set_storage_path,
+            set_storage: access.set_storage,
+            getclass_path,
+            getclass: access.getclass,
+        }
+    }
+
+    pub fn for_each_slot(self, mut visit: impl FnMut(&'static str, usize)) {
+        visit(self.get_map_path, self.get_map as usize);
+        visit(self.set_map_path, self.set_map as usize);
+        visit(self.get_storage_path, self.get_storage as usize);
+        visit(self.set_storage_path, self.set_storage as usize);
+        if !self.getclass_path.is_empty() {
+            visit(self.getclass_path, self.getclass as usize);
+        }
+    }
+}
+
+// Safety: every field is a `'static` path or a process-global function
+// pointer word; sharing across threads is sound.
+unsafe impl Sync for MapdictAccessFnCarrier {}
+
+/// Link-time registry of every `mapdict_mixin_access!` slot table.
+/// `distributed_slice` rejects wasm32; that target fills
+/// [`WASM_MAPDICT_ACCESS_FNADDRS`] from a constructor instead. Read both
+/// through [`for_each_mapdict_access_fnaddr`].
+#[cfg(not(target_arch = "wasm32"))]
+#[::linkme::distributed_slice]
+pub static PYRE_MAPDICT_ACCESS_FNADDRS: [MapdictAccessFnCarrier] = [..];
+
+#[cfg(target_arch = "wasm32")]
+pub static WASM_MAPDICT_ACCESS_FNADDRS: std::sync::Mutex<Vec<MapdictAccessFnCarrier>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(target_arch = "wasm32")]
+pub fn register_mapdict_access_fncarrier(carrier: MapdictAccessFnCarrier) {
+    WASM_MAPDICT_ACCESS_FNADDRS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(carrier);
+}
+
+/// Visit the shared [`base_user_class_mapdict_getclass`] once, then every
+/// nested slot function of every `mapdict_mixin_access!` static.
+pub fn for_each_mapdict_access_fnaddr(mut visit: impl FnMut(&'static str, usize)) {
+    visit(
+        concat!(module_path!(), "::base_user_class_mapdict_getclass"),
+        base_user_class_mapdict_getclass as *const () as usize,
+    );
+    #[cfg(not(target_arch = "wasm32"))]
+    for carrier in PYRE_MAPDICT_ACCESS_FNADDRS {
+        carrier.for_each_slot(&mut visit);
+    }
+    #[cfg(target_arch = "wasm32")]
+    for carrier in WASM_MAPDICT_ACCESS_FNADDRS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+    {
+        carrier.for_each_slot(&mut visit);
+    }
+}
+
+#[doc(hidden)]
+pub use paste as __paste;
+
+/// `mapdict.py` `BaseUserClassMapdict.getclass` after `_share_methods`
+/// (`typedef.py` `_getusercls`): one FunDecl for every non-object carrier.
+/// `_get_mapdict_map` is an *indirect* call through the type's
+/// `mapdict_access.get_map` slot (`rclass` `getclsfield` then
+/// `FunctionReprBase.call`). `W_ObjectObject` keeps an `import_from_mixin`
+/// copy (`mapdict_mixin_access!` `copy_getclass`).
+pub fn base_user_class_mapdict_getclass(obj: PyObjectRef) -> PyObjectRef {
+    match unsafe { (*(*obj).ob_type).mapdict_access } {
+        Some(access) => {
+            let map = (access.get_map)(obj);
+            if map.is_null() {
+                return unsafe { (*obj).w_class };
+            }
+            let w_cls = unsafe { map_terminator_w_cls(map) };
+            if w_cls.is_null() {
+                unsafe { (*obj).w_class }
+            } else {
+                w_cls
+            }
+        }
+        None => unsafe { (*obj).w_class },
+    }
+}
+
+/// Typed `self.map` / `self.storage` accessors and `getclass` for one
+/// carrier layout. Bodies are safe `fn` items so they compile to JitCode
+/// (`MapdictStorageMixin._get_mapdict_map` / `BaseUserClassMapdict.getclass`).
+///
+/// Default arm: nested `get_map` / `set_map` / `get_storage` / `set_storage`
+/// (`import_from_mixin` copies) and the shared
+/// [`base_user_class_mapdict_getclass`] (`_share_methods`).
+/// `copy_getclass`: the same four accessors plus a nested `getclass`
+/// (`import_from_mixin` copy). Used only for `W_ObjectObject`.
+///
+/// Also emits one [`MapdictAccessFnCarrier`] so `build_jit_trace_fnaddrs`
+/// can publish each slot as `getfunctionptr` without a hand list of
+/// carriers. Paths are `{module}::{STATIC}::{field}`, matching the
+/// translator family member from `discover_fnptr_field_families`. The
+/// shared getclass is published once under its FunDecl path.
 #[macro_export]
 macro_rules! mapdict_mixin_access {
-    ($ty:ty) => {
-        $crate::mapdict::MapdictMixinAccess {
-            get_map: {
-                unsafe fn get_map(obj: $crate::PyObjectRef) -> $crate::mapdict::MapRef {
-                    unsafe { (*(obj as *const $ty)).map }
-                }
-                get_map
-            },
-            set_map: {
-                unsafe fn set_map(obj: $crate::PyObjectRef, map: $crate::mapdict::MapRef) {
-                    unsafe {
-                        (*(obj as *mut $ty)).map = map;
+    (
+        $(#[$attr:meta])*
+        $vis:vis static $access:ident for $ty:ty $(;)?
+    ) => {
+        $crate::mapdict_mixin_access! {
+            @table
+            $(#[$attr])*
+            $vis static $access for $ty;
+            extra = {};
+            getclass = $crate::mapdict::base_user_class_mapdict_getclass,
+            getclass_path = ""
+        }
+    };
+    (
+        $(#[$attr:meta])*
+        $vis:vis static $access:ident for $ty:ty, copy_getclass $(;)?
+    ) => {
+        $crate::mapdict_mixin_access! {
+            @table
+            $(#[$attr])*
+            $vis static $access for $ty;
+            extra = {
+                fn getclass(obj: $crate::PyObjectRef) -> $crate::PyObjectRef {
+                    majit_ir::icf_identity!(::core::concat!(::core::module_path!(), "::", stringify!($access), "::getclass"));
+                    // BaseUserClassMapdict.getclass:
+                    // `return self._get_mapdict_map().terminator.w_cls`.
+                    let map = majit_ir::jit::promote(unsafe { (*(obj as *const $ty)).map });
+                    if map.is_null() {
+                        return unsafe { (*obj).w_class };
+                    }
+                    let w_cls = unsafe { $crate::mapdict::map_terminator_w_cls(map) };
+                    if w_cls.is_null() {
+                        unsafe { (*obj).w_class }
+                    } else {
+                        w_cls
                     }
                 }
-                set_map
-            },
-            get_storage: {
-                unsafe fn get_storage(
-                    obj: $crate::PyObjectRef,
-                ) -> *mut $crate::object_array::ItemsBlock {
-                    unsafe { (*(obj as *const $ty)).storage }
+            };
+            getclass = getclass,
+            getclass_path = ::core::concat!(
+                ::core::module_path!(),
+                "::",
+                stringify!($access),
+                "::getclass"
+            )
+        }
+    };
+    (
+        @table
+        $(#[$attr:meta])*
+        $vis:vis static $access:ident for $ty:ty;
+        extra = { $($extra:tt)* };
+        getclass = $getclass:expr,
+        getclass_path = $getclass_path:expr
+    ) => {
+        $(#[$attr])*
+        $vis static $access: $crate::mapdict::MapdictMixinAccess = {
+            $crate::mapdict_mixin_access!(@accessors $access, $ty, get_map, set_map, get_storage, set_storage);
+            $($extra)*
+            $crate::mapdict::MapdictMixinAccess {
+                get_map,
+                set_map,
+                get_storage,
+                set_storage,
+                getclass: $getclass,
+            }
+        };
+        $crate::mapdict_mixin_access!(@fnaddrs $access, $getclass_path);
+    };
+    (@accessors $access:ident, $ty:ty, $get_map:ident, $set_map:ident, $get_storage:ident, $set_storage:ident) => {
+            // Each carrier's slot bodies are byte-identical when the field offsets
+            // agree; the token keeps every published fnaddr distinct so
+            // bytecode_for_address resolves one jitcode per carrier
+            // (`pyjitpl.py` `MetaInterpStaticData.bytecode_for_address`).
+            fn $get_map(obj: $crate::PyObjectRef) -> $crate::mapdict::MapRef {
+                majit_ir::icf_identity!(::core::concat!(::core::module_path!(), "::", stringify!($access), "::get_map"));
+                // MapdictStorageMixin._get_mapdict_map: `return jit.promote(self.map)`.
+                majit_ir::jit::promote(unsafe { (*(obj as *const $ty)).map })
+            }
+            fn $set_map(obj: $crate::PyObjectRef, map: $crate::mapdict::MapRef) {
+                majit_ir::icf_identity!(::core::concat!(::core::module_path!(), "::", stringify!($access), "::set_map"));
+                unsafe {
+                    (*(obj as *mut $ty)).map = map;
                 }
-                get_storage
-            },
-            set_storage: {
-                unsafe fn set_storage(
-                    obj: $crate::PyObjectRef,
-                    storage: *mut $crate::object_array::ItemsBlock,
-                ) {
-                    unsafe {
-                        (*(obj as *mut $ty)).storage = storage;
-                    }
+            }
+            fn $get_storage(obj: $crate::PyObjectRef) -> *mut $crate::object_array::ItemsBlock {
+                majit_ir::icf_identity!(::core::concat!(::core::module_path!(), "::", stringify!($access), "::get_storage"));
+                unsafe { (*(obj as *const $ty)).storage }
+            }
+            fn $set_storage(
+                obj: $crate::PyObjectRef,
+                storage: *mut $crate::object_array::ItemsBlock,
+            ) {
+                majit_ir::icf_identity!(::core::concat!(::core::module_path!(), "::", stringify!($access), "::set_storage"));
+                unsafe {
+                    (*(obj as *mut $ty)).storage = storage;
                 }
-                set_storage
-            },
+            }
+    };
+    (@fnaddrs $access:ident, $getclass_path:expr) => {
+        $crate::mapdict::__paste::paste! {
+            #[cfg(not(target_arch = "wasm32"))]
+            #[::linkme::distributed_slice($crate::mapdict::PYRE_MAPDICT_ACCESS_FNADDRS)]
+            #[allow(non_upper_case_globals)]
+            static [<$access _FNADDRS>]: $crate::mapdict::MapdictAccessFnCarrier =
+                $crate::mapdict::MapdictAccessFnCarrier::from_access(
+                    ::core::concat!(
+                        ::core::module_path!(),
+                        "::",
+                        stringify!($access),
+                        "::get_map"
+                    ),
+                    ::core::concat!(
+                        ::core::module_path!(),
+                        "::",
+                        stringify!($access),
+                        "::set_map"
+                    ),
+                    ::core::concat!(
+                        ::core::module_path!(),
+                        "::",
+                        stringify!($access),
+                        "::get_storage"
+                    ),
+                    ::core::concat!(
+                        ::core::module_path!(),
+                        "::",
+                        stringify!($access),
+                        "::set_storage"
+                    ),
+                    $getclass_path,
+                    $access,
+                );
+
+            #[cfg(target_arch = "wasm32")]
+            #[::ctor::ctor(unsafe)]
+            #[allow(non_snake_case)]
+            fn [<__register_ $access _fnaddrs>]() {
+                $crate::mapdict::register_mapdict_access_fncarrier(
+                    $crate::mapdict::MapdictAccessFnCarrier::from_access(
+                        ::core::concat!(
+                            ::core::module_path!(),
+                            "::",
+                            stringify!($access),
+                            "::get_map"
+                        ),
+                        ::core::concat!(
+                            ::core::module_path!(),
+                            "::",
+                            stringify!($access),
+                            "::set_map"
+                        ),
+                        ::core::concat!(
+                            ::core::module_path!(),
+                            "::",
+                            stringify!($access),
+                            "::get_storage"
+                        ),
+                        ::core::concat!(
+                            ::core::module_path!(),
+                            "::",
+                            stringify!($access),
+                            "::set_storage"
+                        ),
+                        $getclass_path,
+                        $access,
+                    ),
+                );
+            }
         }
     };
 }
 
-/// Select the carrier's own `map` / `storage` fields.
-///
-/// `typedef.py` `_getusercls` `import_from_mixin(MapdictStorageMixin)` copies
-/// those fields onto each generated class; this match is how pyre names
-/// the same per-class layout from a `PyObjectRef` (`mapdict_map_descr`).
-macro_rules! mapdict_typed_carrier {
-    ($obj:expr, $p:ident => $body:expr, else => $fallback:expr) => {{
-        let obj = $obj;
-        unsafe {
-            if crate::py_type_check(obj, &crate::INSTANCE_USER_TYPE)
-                || crate::py_type_check(obj, &crate::INSTANCE_TYPE)
-            {
-                let $p = obj as *mut crate::objectobject::W_ObjectObject;
-                $body
-            } else if crate::py_type_check(obj, &crate::INT_USER_TYPE) {
-                let $p = obj as *mut crate::W_IntObjectUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::FLOAT_USER_TYPE) {
-                let $p = obj as *mut crate::W_FloatObjectUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::BYTES_USER_TYPE) {
-                let $p = obj as *mut crate::W_BytesObjectUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::BYTEARRAY_USER_TYPE) {
-                let $p = obj as *mut crate::W_BytearrayObjectUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::LIST_USER_TYPE) {
-                let $p = obj as *mut crate::W_ListObjectUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::SET_USER_TYPE)
-                || crate::py_type_check(obj, &crate::FROZENSET_USER_TYPE)
-            {
-                let $p = obj as *mut crate::W_SetObjectUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::interp_array::ARRAY_USER_TYPE) {
-                let $p = obj as *mut crate::interp_array::W_ArrayUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::weakref::WEAKREF_LAYOUT_USER_TYPE) {
-                let $p = obj as *mut crate::weakref::W_WeakrefUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::COMPLEX_USER_TYPE) {
-                let $p = obj as *mut crate::W_ComplexObjectUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::STR_USER_TYPE) {
-                let $p = obj as *mut crate::W_UnicodeObjectUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::TUPLE_USER_TYPE) {
-                let $p = obj as *mut crate::W_TupleObjectUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::ENUMERATE_USER_TYPE) {
-                let $p = obj as *mut crate::W_EnumerateUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::MAP_USER_TYPE) {
-                let $p = obj as *mut crate::W_MapUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::FILTER_USER_TYPE) {
-                let $p = obj as *mut crate::W_FilterUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::ZIP_USER_TYPE) {
-                let $p = obj as *mut crate::W_ZipUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::REVERSED_USER_TYPE) {
-                let $p = obj as *mut crate::W_ReversedIteratorUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::SUPER_USER_TYPE) {
-                let $p = obj as *mut crate::W_SuperUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::PROPERTY_USER_TYPE) {
-                let $p = obj as *mut crate::W_PropertyUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::COUNT_USER_TYPE) {
-                let $p = obj as *mut crate::W_CountUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::REPEAT_USER_TYPE) {
-                let $p = obj as *mut crate::W_RepeatUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::TAKEWHILE_USER_TYPE) {
-                let $p = obj as *mut crate::W_TakeWhileUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::DROPWHILE_USER_TYPE) {
-                let $p = obj as *mut crate::W_DropWhileUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::FILTERFALSE_USER_TYPE) {
-                let $p = obj as *mut crate::W_FilterFalseUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::ISLICE_USER_TYPE) {
-                let $p = obj as *mut crate::W_ISliceUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::BATCHED_USER_TYPE) {
-                let $p = obj as *mut crate::W_BatchedUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::PRODUCT_USER_TYPE) {
-                let $p = obj as *mut crate::W_ProductUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::COMBINATIONS_USER_TYPE) {
-                let $p = obj as *mut crate::W_CombinationsUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::COMBINATIONS_WITH_REPLACEMENT_USER_TYPE) {
-                let $p = obj as *mut crate::W_CombinationsWithReplacementUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::PERMUTATIONS_USER_TYPE) {
-                let $p = obj as *mut crate::W_PermutationsUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::GROUPBY_USER_TYPE) {
-                let $p = obj as *mut crate::W_GroupByUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::COMPRESS_USER_TYPE) {
-                let $p = obj as *mut crate::W_CompressUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::STARMAP_USER_TYPE) {
-                let $p = obj as *mut crate::W_StarMapUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::ACCUMULATE_USER_TYPE) {
-                let $p = obj as *mut crate::W_AccumulateUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::ZIP_LONGEST_USER_TYPE) {
-                let $p = obj as *mut crate::W_ZipLongestUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::PAIRWISE_USER_TYPE) {
-                let $p = obj as *mut crate::W_PairwiseUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::CYCLE_USER_TYPE) {
-                let $p = obj as *mut crate::W_CycleUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::CHAIN_USER_TYPE) {
-                let $p = obj as *mut crate::W_ChainUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::GENERIC_ALIAS_USER_TYPE) {
-                let $p = obj as *mut crate::GenericAliasUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::LONG_USER_TYPE) {
-                let $p = obj as *mut crate::W_LongObjectUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::STATICMETHOD_USER_TYPE) {
-                let $p = obj as *mut crate::StaticMethodUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::CLASSMETHOD_USER_TYPE) {
-                let $p = obj as *mut crate::ClassMethodUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::MODULE_USER_TYPE) {
-                let $p = obj as *mut crate::ModuleUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::BASE_EXCEPTION_USER_TYPE) {
-                let $p = obj as *mut crate::W_BaseExceptionUser;
-                $body
-            } else if crate::py_type_check(obj, &crate::EXCEPTION_EXTENDED_USER_TYPE) {
-                let $p = obj as *mut crate::W_ExceptionExtendedUser;
-                $body
-            } else {
-                $fallback
-            }
-        }
-    }};
-}
-
-#[inline]
-unsafe fn mapdict_access_load_map(obj: crate::PyObjectRef) -> MapRef {
-    let tp = unsafe { (*obj).ob_type };
-    if tp.is_null() {
-        return std::ptr::null();
-    }
-    match unsafe { (*tp).mapdict_access } {
-        Some(access) => unsafe { (access.get_map)(obj) },
-        None => std::ptr::null(),
-    }
-}
-
-#[inline]
-unsafe fn mapdict_access_store_map(obj: crate::PyObjectRef, map: MapRef) {
-    let tp = unsafe { (*obj).ob_type };
-    if tp.is_null() {
-        return;
-    }
-    if let Some(access) = unsafe { (*tp).mapdict_access } {
-        unsafe { (access.set_map)(obj, map) };
-    }
-}
-
-#[inline]
-unsafe fn mapdict_access_load_storage(
-    obj: crate::PyObjectRef,
-) -> *mut crate::object_array::ItemsBlock {
-    let tp = unsafe { (*obj).ob_type };
-    if tp.is_null() {
-        return std::ptr::null_mut();
-    }
-    match unsafe { (*tp).mapdict_access } {
-        Some(access) => unsafe { (access.get_storage)(obj) },
-        None => std::ptr::null_mut(),
-    }
-}
-
-#[inline]
-unsafe fn mapdict_access_store_storage(
-    obj: crate::PyObjectRef,
-    storage: *mut crate::object_array::ItemsBlock,
-) {
-    let tp = unsafe { (*obj).ob_type };
-    if tp.is_null() {
-        return;
-    }
-    if let Some(access) = unsafe { (*tp).mapdict_access } {
-        unsafe { (access.set_storage)(obj, storage) };
-    }
-}
-
-/// Load `self.map` from the carrier's own typed field
-/// (`MapdictStorageMixin._get_mapdict_map`).
+/// Load `self.map` through the type's `mapdict_access` slot
+/// (`MapdictStorageMixin._get_mapdict_map`). The slot is a vtable field
+/// (`rclass` `getclsfield` then `FunctionReprBase.call`).
 ///
 /// # Safety
 /// `obj` must be a live mapdict carrier, or null.
@@ -956,14 +1039,17 @@ pub unsafe fn mapdict_typed_load_map(obj: crate::PyObjectRef) -> MapRef {
     if obj.is_null() {
         return std::ptr::null();
     }
-    mapdict_typed_carrier!(
-        obj,
-        p => (*p).map,
-        else => mapdict_access_load_map(obj)
-    )
+    let tp = unsafe { (*obj).ob_type };
+    if tp.is_null() {
+        return std::ptr::null();
+    }
+    match unsafe { (*tp).mapdict_access } {
+        Some(access) => (access.get_map)(obj),
+        None => std::ptr::null(),
+    }
 }
 
-/// Store `self.map` on the carrier's own typed field
+/// Store `self.map` through the type's `mapdict_access` slot
 /// (`MapdictStorageMixin._set_mapdict_map`).
 ///
 /// # Safety
@@ -974,14 +1060,16 @@ pub unsafe fn mapdict_typed_store_map(obj: crate::PyObjectRef, map: MapRef) {
     if obj.is_null() {
         return;
     }
-    mapdict_typed_carrier!(
-        obj,
-        p => (*p).map = map,
-        else => mapdict_access_store_map(obj, map)
-    )
+    let tp = unsafe { (*obj).ob_type };
+    if tp.is_null() {
+        return;
+    }
+    if let Some(access) = unsafe { (*tp).mapdict_access } {
+        (access.set_map)(obj, map);
+    }
 }
 
-/// Load `self.storage` from the carrier's own typed field
+/// Load `self.storage` through the type's `mapdict_access` slot
 /// (`MapdictStorageMixin._mapdict_read_storage`).
 ///
 /// # Safety
@@ -993,14 +1081,17 @@ pub unsafe fn mapdict_typed_load_storage(
     if obj.is_null() {
         return std::ptr::null_mut();
     }
-    mapdict_typed_carrier!(
-        obj,
-        p => (*p).storage,
-        else => mapdict_access_load_storage(obj)
-    )
+    let tp = unsafe { (*obj).ob_type };
+    if tp.is_null() {
+        return std::ptr::null_mut();
+    }
+    match unsafe { (*tp).mapdict_access } {
+        Some(access) => (access.get_storage)(obj),
+        None => std::ptr::null_mut(),
+    }
 }
 
-/// Store `self.storage` on the carrier's own typed field
+/// Store `self.storage` through the type's `mapdict_access` slot
 /// (`MapdictStorageMixin._mapdict_write_storage`).
 ///
 /// # Safety
@@ -1014,11 +1105,13 @@ pub unsafe fn mapdict_typed_store_storage(
     if obj.is_null() {
         return;
     }
-    mapdict_typed_carrier!(
-        obj,
-        p => (*p).storage = storage,
-        else => mapdict_access_store_storage(obj, storage)
-    )
+    let tp = unsafe { (*obj).ob_type };
+    if tp.is_null() {
+        return;
+    }
+    if let Some(access) = unsafe { (*tp).mapdict_access } {
+        (access.set_storage)(obj, storage);
+    }
 }
 
 const _: () = {
@@ -1075,9 +1168,13 @@ pub unsafe fn map_terminator_w_cls(map: MapRef) -> PyObjectRef {
 /// Only a `_getusercls` layout (`typedef.py`) is that mixin: `user_base`
 /// names the builtin the generated class extends. Exact `object()` is
 /// `INSTANCE_TYPE` (`user_base` null) and uses `W_Root.getclass` /
-/// `gettypefor(typeptr)` — the header word. A `_getusercls` carrier with
-/// a non-null map reads the terminator; a still-null map falls back to
-/// the header until `user_setup` copies `w_subtype.terminator`.
+/// `gettypefor(typeptr)` — the header word. A `_getusercls` carrier
+/// dispatches through the type's `getclass` slot (`rclass` `getclsfield`
+/// then `FunctionReprBase.call`). Non-object carriers share
+/// [`base_user_class_mapdict_getclass`] (`_share_methods`); `W_ObjectObject`
+/// keeps an `import_from_mixin` copy. `get_map` promotes `self.map`
+/// (`MapdictStorageMixin._get_mapdict_map`) and the body reads
+/// `terminator.w_cls`.
 ///
 /// # Safety
 /// `obj` must be a live object reference. Tagged immediates are not
@@ -1100,32 +1197,14 @@ pub unsafe fn instance_getclass(obj: PyObjectRef) -> PyObjectRef {
     if tp.is_null() || unsafe { (*tp).user_base.is_null() } {
         return unsafe { (*obj).w_class };
     }
-    // `_get_mapdict_map` is `self.map` (`mapdict.py`). Generated
-    // `_getusercls` payloads put the mixin after the builtin prefix
-    // as ordinary fields of that class (`import_from_mixin`). Load
-    // `map` off the carrier (`getfield_gc_r`).
     let off = unsafe { (*tp).mapdict_offset };
     if off == 0 {
         return unsafe { (*obj).w_class };
     }
-    let map_word = mapdict_typed_carrier!(
-        obj,
-        p => (*p).map,
-        else => mapdict_access_load_map(obj)
-    );
-    if map_word.is_null() {
-        return unsafe { (*obj).w_class };
+    match unsafe { (*tp).mapdict_access } {
+        Some(access) => (access.getclass)(obj),
+        None => unsafe { (*obj).w_class },
     }
-    // MapdictStorageMixin._get_mapdict_map: `return jit.promote(self.map)`.
-    // getclass is that word then `terminator.w_cls`; without the promote the
-    // class stays a red load and every `type()` / `is_exact_type` inlines a
-    // fat residual.
-    let map = majit_ir::jit::promote(map_word);
-    let w_cls = unsafe { map_terminator_w_cls(map) };
-    if !w_cls.is_null() {
-        return w_cls;
-    }
-    unsafe { (*obj).w_class }
 }
 
 /// `mapdict.py` `AbstractAttribute.cache_attrs` table type.
@@ -1384,5 +1463,47 @@ mod first_field_inheritance_tests {
             .wrapping_add(core::mem::offset_of!(CachedAttributeHolder, mutate_typ));
         let direct_typ = &holder.mutate_typ as *const _ as *const u8;
         assert_eq!(via_typ, direct_typ);
+    }
+
+    #[test]
+    fn mapdict_access_fnaddr_path_matches_translator_member() {
+        let qualified = "pyre_object::objectobject::W_OBJECT_OBJECT_MAPDICT_ACCESS::getclass";
+        let mut found = None;
+        super::for_each_mapdict_access_fnaddr(|path, addr| {
+            if path == qualified {
+                found = Some(addr);
+            }
+        });
+        let addr = found.expect(qualified);
+        assert_eq!(
+            addr,
+            crate::objectobject::W_OBJECT_OBJECT_MAPDICT_ACCESS.getclass as usize
+        );
+    }
+
+    #[test]
+    fn test_correct_method_sharing() {
+        // `typedef.py` `_getusercls` / `test_mapdict.py` `test_correct_method_sharing`.
+        let shared = super::base_user_class_mapdict_getclass as *const () as usize;
+        let bytes = crate::bytesobject::W_BYTES_USER_MAPDICT_ACCESS.getclass as usize;
+        let unicode = crate::unicodeobject::W_UNICODE_USER_MAPDICT_ACCESS.getclass as usize;
+        assert_eq!(bytes, shared);
+        assert_eq!(unicode, shared);
+        let object = crate::objectobject::W_OBJECT_OBJECT_MAPDICT_ACCESS.getclass as usize;
+        assert_ne!(object, shared);
+
+        let shared_path = "pyre_object::mapdict::base_user_class_mapdict_getclass";
+        let mut shared_visits = 0;
+        super::for_each_mapdict_access_fnaddr(|path, addr| {
+            if path == shared_path {
+                shared_visits += 1;
+                assert_eq!(addr, shared);
+            }
+            assert!(
+                !path.contains("W_BYTES_USER_MAPDICT_ACCESS::getclass"),
+                "default arm must not publish a per-carrier getclass path: {path}"
+            );
+        });
+        assert_eq!(shared_visits, 1);
     }
 }

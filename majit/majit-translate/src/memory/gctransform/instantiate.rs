@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, TermKind, Unstructured};
+use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, Operand, TermKind, Unstructured};
 use majit_charon_reader::{FunDecl, Llbc};
 use serde_json::Value;
 
@@ -223,6 +223,24 @@ fn impl_method_from_row(llbc: &Llbc, impl_id: u64, method_idx: u64) -> Option<u6
                 None
             }
         })
+}
+
+/// FunDecl ids `graphanalyze.py` `analyze_indirect_call` walks for a
+/// Dynamic call through a harvested FnPtr field. `None` is `graphs is None`.
+pub(crate) fn fnptr_field_analyze_indirect_call(
+    llbc: &Llbc,
+    body: &Unstructured,
+    op: &Operand,
+) -> Option<Vec<u64>> {
+    let slot = crate::front::mir::vtable_slot_under_fn_ptr_cast(llbc, body, op)
+        .or_else(|| crate::front::mir::fnptr_field_under_use(llbc, body, op))
+        .unwrap_or_else(|| op.clone());
+    let place = match &slot {
+        Operand::Copy(p) | Operand::Move(p) => p,
+        Operand::Const(_) => return None,
+    };
+    let (struct_key, field_name) = crate::front::mir::fnptr_struct_field_target(llbc, body, place)?;
+    crate::front::mir::fnptr_field_family_member_fn_ids(llbc, &struct_key, &field_name)
 }
 
 /// Build the resolved ULLBC call graph, specializing Regular calls whose
@@ -453,23 +471,42 @@ impl<'a> Builder<'a> {
                     }
                 },
                 CallFunc::Dynamic(op, _) => {
-                    // Same closed-family recovery as `CallKind::Ptr`.
-                    unresolved = true;
-                    if note_opaque {
-                        let ty = match op {
-                            majit_charon_reader::ullbc::Operand::Copy(p)
-                            | majit_charon_reader::ullbc::Operand::Move(p) => match &p.ty {
-                                majit_charon_reader::ullbc::TyRef::Inline { value: (_, v) } => {
-                                    Some(v)
-                                }
-                                majit_charon_reader::ullbc::TyRef::Dedup { id } => {
-                                    self.llbc.dedup_body(*id)
-                                }
-                                majit_charon_reader::ullbc::TyRef::Other(v) => Some(v),
-                            },
-                            majit_charon_reader::ullbc::Operand::Const(v) => Some(v),
-                        };
-                        self.note_opaque(ty, "Dynamic");
+                    // graphanalyze.py analyze_indirect_call: a harvested FnPtr
+                    // field family is the c_graphs. Otherwise the same
+                    // closed-family recovery as `CallKind::Ptr`.
+                    if let Some(members) = fnptr_field_analyze_indirect_call(self.llbc, body, op) {
+                        let empty_generics = serde_json::json!({
+                            "regions": [],
+                            "types": [],
+                            "const_generics": [],
+                            "trait_refs": [],
+                        });
+                        for member_id in members {
+                            let node = self.callee_node_for_call(
+                                bindings,
+                                member_id,
+                                &empty_generics,
+                                depth,
+                            );
+                            self.graph.callees.entry(id).or_default().insert(node);
+                        }
+                    } else {
+                        unresolved = true;
+                        if note_opaque {
+                            let ty = match op {
+                                Operand::Copy(p) | Operand::Move(p) => match &p.ty {
+                                    majit_charon_reader::ullbc::TyRef::Inline { value: (_, v) } => {
+                                        Some(v)
+                                    }
+                                    majit_charon_reader::ullbc::TyRef::Dedup { id } => {
+                                        self.llbc.dedup_body(*id)
+                                    }
+                                    majit_charon_reader::ullbc::TyRef::Other(v) => Some(v),
+                                },
+                                Operand::Const(v) => Some(v),
+                            };
+                            self.note_opaque(ty, "Dynamic");
+                        }
                     }
                 }
                 CallFunc::Unknown => {

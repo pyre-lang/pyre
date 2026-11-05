@@ -3531,6 +3531,8 @@ pub(in crate::front::mir) struct LlbcDerived {
     /// equality (`rclass.py` `getvtable` / `OBJECT.typeptr`).
     pub(in crate::front::mir) registered_dyn_impl_vtables:
         std::sync::OnceLock<Vec<(String, String)>>,
+    pub(in crate::front::mir) fnptr_field_families:
+        std::sync::OnceLock<Vec<(String, String, String)>>,
 }
 
 pub(in crate::front::mir) fn llbc_derived(llbc: &Llbc) -> &LlbcDerived {
