@@ -18,9 +18,8 @@
 #
 # ## What it was
 #
-# `PYRE_FBW_MULTIFRAME_DEPTH=1` answered correctly while `=2` and the default
-# `7` did not, which put the defect in the depth->=2 multi-frame path rather
-# than in any writer of `last_instr`.  The issue title proposes the opposite --
+# The defect sits in the multi-frame blackhole-adopt path rather than in any
+# writer of `last_instr`.  The issue title proposes the opposite --
 # that a resume restores `last_instr` without its partner `valuestackdepth` --
 # and that was implemented and measured: pairing the inline-callee coordinate
 # publish with the forward analysis's depth at `callee_py_pc + 1` changed
@@ -56,8 +55,7 @@
 #
 # It fails on the buggy binary.  Two saved pre-fix `pyre-dynasm` binaries both
 # die here with the `TypeError` above, while the fixed tree prints the same
-# `592304421450` CPython does, on both backends, with
-# `PYRE_FBW_MULTIFRAME_DEPTH` 1, 2 and 7 all agreeing.
+# `592304421450` CPython does, on both backends.
 EXPECTED = 592304421450
 
 

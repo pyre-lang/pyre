@@ -1873,23 +1873,6 @@ fn discard_bridge_carrier_walk<Sym: WalkSym>(
     ctx.restore_virtualref_boxes(pre_virtualref_boxes[..restore_depth].to_vec());
 }
 
-/// How many of a carrier's recipes are real Python frames.
-///
-/// The multi-frame depth cap bounds reconstructed `PyFrame`s, so a level that
-/// reconstructs none — `descr_call`'s tail, `len`'s operator tail — must not
-/// consume one of its slots.
-fn carrier_py_frame_depth(carrier: &majit_metainterp::BridgeInlineCarrier) -> usize {
-    carrier
-        .recipes
-        .iter()
-        .filter(|recipe| {
-            !recipe.ctor_tail
-                && !recipe.len_tail
-                && !crate::state::jitcode_is_transparent_helper(recipe.jitcode_index)
-        })
-        .count()
-}
-
 /// Walk a helper-innermost carrier recipe from the failed guard.
 ///
 /// `setup_reconstructed_callee_frame` needs a Python `code_ptr`; a
@@ -1902,7 +1885,6 @@ fn drive_helper_innermost_subwalk<Sym: WalkSym>(
     sym: &Sym,
     root_pc: usize,
     carrier: &majit_metainterp::BridgeInlineCarrier,
-    recursive_carrier: bool,
 ) -> Option<(
     Option<
         Result<
@@ -1921,11 +1903,7 @@ fn drive_helper_innermost_subwalk<Sym: WalkSym>(
         helper_pjc.jitcode.index() as i32,
         recipe.jitcode_pc,
     )?;
-    let paused = if carrier.recipes.len() >= 2
-        && (recursive_carrier
-            || carrier_py_frame_depth(carrier)
-                <= crate::jitcode_dispatch::fbw_max_multiframe_depth())
-    {
+    let paused = if carrier.recipes.len() >= 2 {
         &carrier.recipes[..carrier.recipes.len() - 1]
     } else {
         &[]
@@ -1972,30 +1950,6 @@ fn drive_helper_innermost_subwalk<Sym: WalkSym>(
         handler_entry,
     );
     Some((walk, entry, helper_pjc))
-}
-
-/// Whether the root plus reconstructed carrier contain the same Python portal
-/// more than once.
-///
-/// PyPy `_opimpl_recursive_call` gives recursive portals only the
-/// `max_unroll_recursion` bound, and `resume.rebuild_from_resumedata` rebuilds
-/// every encoded frame regardless of depth. Pyre's separate multiframe cap is
-/// a safety valve for ordinary call chains, so it must not become a second
-/// recursion bound merely because a bridge reconstructed the recursive frames
-/// with `MIFrame.greenkey == None`.
-fn carrier_contains_recursive_portal(
-    root_w_code: *const (),
-    carrier: &majit_metainterp::BridgeInlineCarrier,
-) -> bool {
-    let mut seen = vec![root_w_code as usize];
-    for recipe in carrier.recipes.iter() {
-        let w_code = crate::state::recover_inline_callee_code(recipe.code_ptr) as usize;
-        if w_code != 0 && seen.contains(&w_code) {
-            return true;
-        }
-        seen.push(w_code);
-    }
-    false
 }
 
 fn drive_bridge_carrier_walk<Sym: WalkSym>(
@@ -2059,7 +2013,6 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         );
         slot
     });
-    let recursive_carrier = carrier_contains_recursive_portal(w_code, carrier);
     if crate::jitcode_dispatch::p2_diag_enabled() {
         let pcs: Vec<usize> = carrier
             .recipes
@@ -2074,23 +2027,6 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             carrier.recipes.len()
         );
     }
-    // Deeper than the middle-frame drive can compile.  Decided here, before
-    // anything in the callee runs: past this point the sub-walk
-    // concrete-executes the reconstructed frames, and the abort tail's rollback
-    // covers the journals alone -- a residual call's heap writes move the
-    // odometer and push no journal entry, so they stand while the blackhole
-    // replays the region that made them.  `carrier_py_frame_depth` reads only
-    // the carrier, so nothing the sub-walk produces is needed to answer it.
-    //
-    // Transient, unlike `NoRecipes` below: the depth is this carrier's, and the
-    // same guard can fail again carrying a shallower one.
-    if !recursive_carrier
-        && carrier_py_frame_depth(carrier) > crate::jitcode_dispatch::fbw_max_multiframe_depth()
-    {
-        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes, true);
-        crate::jitcode_dispatch::census_record("P2Drain::OverMultiframeDepth");
-        return p2_drain_abort();
-    }
     let Some(recipe) = carrier.recipes.last() else {
         crate::jitcode_dispatch::census_record("P2Drain::NoRecipes");
         discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes, true);
@@ -2101,14 +2037,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         || recipe.len_tail
         || crate::state::jitcode_is_transparent_helper(recipe.jitcode_index)
     {
-        match drive_helper_innermost_subwalk(
-            ctx,
-            &session,
-            sym,
-            root_pc,
-            carrier,
-            recursive_carrier,
-        ) {
+        match drive_helper_innermost_subwalk(ctx, &session, sym, root_pc, carrier) {
             Some(parts) => parts,
             None => {
                 discard_bridge_carrier_walk(
@@ -2273,11 +2202,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             // paused so its in-callee guard snapshots encode the full
             // [root, ..middles.., deepest] chain (else the blackhole rebuilds a
             // framestack missing the middles on such a guard's deopt).
-            if carrier.recipes.len() >= 2
-                && (recursive_carrier
-                    || carrier_py_frame_depth(carrier)
-                        <= crate::jitcode_dispatch::fbw_max_multiframe_depth())
-            {
+            if carrier.recipes.len() >= 2 {
                 &carrier.recipes[..carrier.recipes.len() - 1]
             } else {
                 &[]
@@ -2402,29 +2327,23 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     };
     if let Some((exc, exc_concrete)) = subwalk_raise {
         let n = carrier.recipes.len();
-        let depth_ok = n >= 1
-            && (recursive_carrier
-                || carrier_py_frame_depth(carrier)
-                    <= crate::jitcode_dispatch::fbw_max_multiframe_depth());
-        if depth_ok {
-            if let Some(action) = drive_carrier_finishframe_exception(
-                meta,
-                flush_committed,
-                &session,
-                sym,
-                w_code,
-                root_pc,
-                cf_addr,
-                root_ec,
-                root_ec_box,
-                root_frame_box,
-                carrier,
-                &carrier.recipes[..n.saturating_sub(1)],
-                exc,
-                exc_concrete,
-            ) {
-                return action;
-            }
+        if let Some(action) = drive_carrier_finishframe_exception(
+            meta,
+            flush_committed,
+            &session,
+            sym,
+            w_code,
+            root_pc,
+            cf_addr,
+            root_ec,
+            root_ec_box,
+            root_frame_box,
+            carrier,
+            &carrier.recipes[..n.saturating_sub(1)],
+            exc,
+            exc_concrete,
+        ) {
+            return action;
         }
     }
 
@@ -3985,9 +3904,19 @@ fn cash_multi_frame_blackhole(
             })
             .collect::<Vec<_>>(),
     );
+    // This closure does not run `return_trace` / `ExecutionContext.leave`.
+    // Adopted Python levels finish through `bhimpl_jit_merge_point`'s
+    // recursive arm; `ll_portal_runner_shim`'s bracket already ran
+    // `pyframe.py execute_frame`'s inner and outer `finally` hooks
+    // (`portal_activation_bracketed`, `PortalLeaveOwner::CompiledTrace`).
+    // The bracket skips the chain half of `leave`, which this supplies.
+    // Convert's `bh_portal_runner_c` levels instead take
+    // `finish_per_code_blackhole_level` (`call_jit.rs`).
     let finish_level = |frame_ptr: i64, _exit: majit_metainterp::blackhole::LevelExit| {
         crate::state::finish_blackhole_level_frame(frame_ptr);
         if frame_ptr != 0 {
+            // `executioncontext.py leave`: `self.topframeref = frame.f_backref`
+            // before the caller's residuals run.
             unsafe {
                 (*ec).topframeref = (*(frame_ptr as *mut pyre_interpreter::PyFrame)).f_backref;
             }

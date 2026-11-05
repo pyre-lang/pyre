@@ -234,9 +234,8 @@ driver is no longer suppressed: `maybe_compile_and_run` reads
 | PYRE_WASM_COMPILE_CENSUS | reports every cranelift compile of a trace module separately (`main.rs jit_compile_trace`) — the bytes handed over, the wall time it took, and whether the request was a first compile or the re-emission of an owner that took a merge.  The stats line carries only the run's totals, which cannot separate a re-emission's cost from a first compile's nor say whether the per-module cost is linear in the bytes | trace compilation stops being on the critical path, or the two questions are answered and the answers stop moving |
 | PYRE_JD1 | arms the jd1 (`unpackiterable_driver`) compiled-loop experiment — `eval.rs jd1_experiment_enabled` is `PYRE_JD1 == "1"`, so nothing else turns it on.  `PYRE_NO_JD1`, `PYRE_JD1=0` and the master JIT off-switches (`PYRE_NO_JIT`, `PYRE_JIT=0`) each force it back off | the jd1 experiment concludes |
 
-### §6b — VALUE knobs (16): config, not gates
+### §6b — VALUE knobs (15): config, not gates
 
-`PYRE_FBW_MULTIFRAME_DEPTH`,
 `PYRE_FBW_NO_SPECIALIZE`, `PYRE_JD1_THRESHOLD`,
 `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT_PROBE`,
 `PYRE_PORTAL_METATRACE_SKIP`,

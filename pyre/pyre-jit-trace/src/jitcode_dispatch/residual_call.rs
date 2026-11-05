@@ -8791,9 +8791,8 @@ pub(super) fn maybe_publish_inline_callee_last_instr_concrete<Sym: WalkSym>(
     // Pairing it here with the forward analysis's depth at `callee_py_pc + 1`
     // was measured and does not fix
     // `bench/synth/_pending/loop_callee_for_header_resume.py`; it does not fix
-    // gh#1444 either, whose wrong answer is a depth->=2 multi-frame blackhole
-    // adopt (`PYRE_FBW_MULTIFRAME_DEPTH=1` answers correctly).  So the split is
-    // a recorded gap rather than either one's cause.
+    // gh#1444 either, whose wrong answer is a multi-frame blackhole adopt.
+    // So the split is a recorded gap rather than either one's cause.
     if let Some(ConcreteValue::Ref(frame_ptr)) = ctx
         .frame_state
         .borrow()

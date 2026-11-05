@@ -129,6 +129,175 @@ def run(loop, unsetter, tail):
     return calls
 
 
+# Inlined callee with the hook armed inside so the CALL compiles before
+# `ec_hook_installed`. settrace misses the first return (`f_trace` unset
+# on that frame); setprofile reports every return. A doubled leave lists
+# the first profile return twice.
+ADOPT_N = 200
+MIDBODY_N = 8
+adopt_trace_returns = []
+adopt_profile_returns = []
+midbody_trace_returns = []
+midbody_profile_returns = []
+
+
+def _return_hook(name, dest, ret_self):
+    def hook(frame, event, arg):
+        if event == 'return' and frame.f_code.co_name == name:
+            dest.append(arg)
+        if ret_self:
+            return hook
+    return hook
+
+
+adopt_tracer = _return_hook('adopt_leaf', adopt_trace_returns, True)
+adopt_profiler = _return_hook('adopt_leaf', adopt_profile_returns, False)
+midbody_tracer = _return_hook('midbody_leaf', midbody_trace_returns, True)
+midbody_profiler = _return_hook('midbody_leaf', midbody_profile_returns, False)
+
+
+def adopt_leaf(x):
+    sys.settrace(adopt_tracer)
+    sys.setprofile(adopt_profiler)
+    a = x + 1
+    b = a + 2
+    c = b + 3
+    d = c + 4
+    e = d + 5
+    f = e + 6
+    g = f + 7
+    h = g + 8
+    i = h + 9
+    j = i + 10
+    return x + 1 + (j - j)
+
+
+def adopt_loop(n):
+    s = 0
+    i = 0
+    while i < n:
+        s += adopt_leaf(i)
+        i += 1
+    return s
+
+
+def midbody_leaf(x):
+    # Long body so TraceTooLong latches past the callee's entry merge point.
+    # Later calls take the short path once the hook is live.
+    if sys.gettrace() is not None:
+        return x + 1
+    s = x
+    s = s + 1
+    s = s + 2
+    s = s + 3
+    s = s + 4
+    s = s + 5
+    s = s + 6
+    s = s + 7
+    s = s + 8
+    s = s + 9
+    s = s + 10
+    s = s + 11
+    s = s + 12
+    s = s + 13
+    s = s + 14
+    s = s + 15
+    s = s + 16
+    s = s + 17
+    s = s + 18
+    s = s + 19
+    s = s + 20
+    s = s + 21
+    s = s + 22
+    s = s + 23
+    s = s + 24
+    s = s + 25
+    s = s + 26
+    s = s + 27
+    s = s + 28
+    s = s + 29
+    s = s + 30
+    i = 0
+    t = 0
+    while i < 24:
+        t = t + i
+        t = t + 1
+        t = t + 2
+        i = i + 1
+    sys.settrace(midbody_tracer)
+    sys.setprofile(midbody_profiler)
+    return x + 1 + (s - s) + (t - t)
+
+
+def midbody_loop(n):
+    acc = 0
+    i = 0
+    while i < n:
+        acc += midbody_leaf(i)
+        i += 1
+    return acc
+
+
+def _run_traced(loop, n, trace_limit):
+    import atexit
+
+    atexit._ncallbacks()
+    try:
+        import pypyjit
+    except ImportError:
+        pypyjit = None
+    if pypyjit is not None:
+        pypyjit.set_param(
+            'trace_limit=%d,threshold=1,function_threshold=1' % trace_limit
+        )
+    try:
+        return loop(n)
+    finally:
+        sys.settrace(None)
+        sys.setprofile(None)
+        if pypyjit is not None:
+            pypyjit.set_param('default')
+
+
+def _check_exact_returns(label, total, n, traces, profiles):
+    expected_trace = list(range(2, n + 1))
+    expected_profile = list(range(1, n + 1))
+    failures = []
+    if total != n * (n + 1) // 2:
+        failures.append(
+            '%s loop returned %r, expected %r' % (label, total, n * (n + 1) // 2)
+        )
+    if traces != expected_trace:
+        failures.append(
+            '%s settrace return events were %r, expected %r'
+            % (label, traces, expected_trace)
+        )
+    if profiles != expected_profile:
+        failures.append(
+            '%s setprofile return events were %r, expected %r'
+            % (label, profiles, expected_profile)
+        )
+    return failures
+
+
+def check_adopted_return_trace():
+    del adopt_trace_returns[:]
+    del adopt_profile_returns[:]
+    total = _run_traced(adopt_loop, ADOPT_N, 70)
+    return _check_exact_returns(
+        'adopt', total, ADOPT_N, adopt_trace_returns, adopt_profile_returns
+    )
+
+
+def check_midbody_adopted_return_trace():
+    del midbody_trace_returns[:]
+    del midbody_profile_returns[:]
+    total = _run_traced(midbody_loop, MIDBODY_N, 180)
+    return _check_exact_returns(
+        'midbody', total, MIDBODY_N, midbody_trace_returns, midbody_profile_returns
+    )
+
+
 def main():
     columns = [('settrace/direct', settrace_direct, sys.settrace),
                ('settrace/nested', settrace_nested, sys.settrace)]
@@ -148,6 +317,8 @@ def main():
                 '%s: the count does not track the tail, so the loop is blind '
                 'from the arming onward' % (name,)
             )
+    failures.extend(check_adopted_return_trace())
+    failures.extend(check_midbody_adopted_return_trace())
     if failures:
         for line in failures:
             print('FAIL', line)
