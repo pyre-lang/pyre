@@ -279,6 +279,14 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // `fbw_rolled_back_with_effects == 0` gate.  The public decoder has no
     // jitcode in the generated metadata; both scalar projections do, so the
     // evidence covers the reached pair as well as the unreachable graph.
+    //
+    // `decode_instruction_forward_dispatch` is the projection the portal's
+    // dispatch reads, with the same at-most-three EXTENDED_ARG loop.
+    // Evidence for adding it: the local dynasm `pyre/check.py` corpus (630
+    // fixtures, macOS arm64) kept every committed per-fixture jitstats
+    // baseline, including `fbw_rolled_back_with_effects == 0`; its one red,
+    // a `trace_too_long_effect_replay` wall-clock ratio, fails the same way
+    // on main's CI.
     (
         "decode_instruction_forward",
         "pyopcode.py dispatch_bytecode EXTENDED_ARG loop",
@@ -290,6 +298,10 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     (
         "decode_instruction_forward_packed",
         "pyopcode.py dispatch_bytecode EXTENDED_ARG loop (opcode/oparg projection)",
+    ),
+    (
+        "decode_instruction_forward_dispatch",
+        "pyopcode.py dispatch_bytecode EXTENDED_ARG loop (dispatch projection)",
     ),
     // `ctypefunc.py W_CTypeFunc._call` carries `@jit.unroll_safe`, and the two
     // halves it is split into here both take it: the body that converts the
