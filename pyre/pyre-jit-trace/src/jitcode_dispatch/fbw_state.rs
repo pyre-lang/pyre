@@ -2506,10 +2506,12 @@ pub fn fbw_foriter_any_body_effect_signal() -> bool {
 ///   a future caller takes before the rollback.
 /// Any signal set → refuse delivery (drop the stash → the legacy bypass keeps
 /// the prior drop-on-abort behaviour for that shape, never a double).
-/// `fbw_has_unjournaled_effect()` is the converse: the residual was recorded
-/// but NOT executed, and only the legacy replay applies it. It prevents an
-/// end-state commit, but it must not suppress delivery of the consumed item
-/// or that replay starts at the next iteration and drops this one.
+/// `fbw_has_unjournaled_effect()` is the converse for abort-path delivery: a
+/// declined residual is recorded symbolically. CloseLoop no longer treats
+/// that flag as a flush veto (`pyjitpl.py` `reached_loop_header` publishes
+/// the current boxes); this take still must not suppress delivery of the
+/// consumed item or a remaining abort-path replay starts at the next
+/// iteration and drops this one.
 /// `for_mutate` aborts BEFORE the append's effect, so both signal classes are
 /// clear at the abort point — the clean continuation case.
 /// Which stash entry a take removes, given the indices of the portal frame's
@@ -3293,10 +3295,11 @@ mod foriter_delivery_tests {
 /// place, sampled before a descent that may later decline to a residual.
 #[derive(Clone, Copy)]
 pub(crate) struct FbwEffectJournalMark {
-    stores: usize,
+    pub(crate) stores: usize,
     list_effects: usize,
     promotes: usize,
     cells: usize,
+    pub(crate) executed: usize,
 }
 
 pub(crate) fn fbw_effect_journal_mark() -> FbwEffectJournalMark {
@@ -3305,6 +3308,7 @@ pub(crate) fn fbw_effect_journal_mark() -> FbwEffectJournalMark {
         list_effects: FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len()),
         promotes: fbw_append_promote_journal_len(),
         cells: FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len()),
+        executed: fbw_executed_effect_count(),
     }
 }
 

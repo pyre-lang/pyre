@@ -2087,9 +2087,9 @@ pub(crate) unsafe fn normalize_slice(
 /// `@classmethod` / custom-descriptor dunders receive the arguments PyPy
 /// gives them.
 ///
-/// Residual (`look_inside_graph` sees the `args_w` loop). The word-ABI
-/// trampoline is `getfunctionptr` (`get_jitcode_calldescr`).
-#[majit_macros::getfunctionptr]
+/// Look-inside: `descroperation.py get_and_call_function` has no JIT hint;
+/// RPython specializes `*args_w` per arity, so `look_inside_graph` accepts it.
+#[majit_macros::unroll_safe]
 pub unsafe fn get_and_call_function(
     w_descr: PyObjectRef,
     w_obj: PyObjectRef,
@@ -3767,12 +3767,12 @@ unsafe fn range_compute_slice(obj: PyObjectRef, slice: PyObjectRef) -> PyResult 
     let w_substop = pyre_object::range_bigint_to_obj(substop.translated_alias());
     let _ = pyre_object::gc_roots::pin_root(w_substop);
     let substop_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    Ok(pyre_object::w_range_new(
+    crate::builtins::w_range_new(
         pyre_object::gc_roots::shadow_stack_get(substart_slot),
         pyre_object::gc_roots::shadow_stack_get(substop_slot),
         pyre_object::gc_roots::shadow_stack_get(substep_slot),
         false,
-    ))
+    )
 }
 
 /// `space.type(w_item) is space.w_int or space.w_bool` used by
@@ -4520,12 +4520,12 @@ pub(crate) fn range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
         let w_step = w_int_new(step);
         let _ = pyre_object::gc_roots::pin_root(w_step);
         let step_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let w_range = pyre_object::w_range_new(
+        let w_range = crate::builtins::w_range_new(
             pyre_object::gc_roots::shadow_stack_get(current_slot),
             pyre_object::gc_roots::shadow_stack_get(stop_slot),
             pyre_object::gc_roots::shadow_stack_get(step_slot),
             false,
-        );
+        )?;
         let w_range = pyre_object::gc_roots::pin_root(w_range);
         let state = w_tuple_new(vec![w_range]);
         let state_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -4583,12 +4583,12 @@ pub(crate) fn long_range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
         let w_step = pyre_object::range_bigint_to_obj(step_b.translated_alias());
         let _ = pyre_object::gc_roots::pin_root(w_step);
         let step_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let w_range = pyre_object::w_range_new(
+        let w_range = crate::builtins::w_range_new(
             pyre_object::gc_roots::shadow_stack_get(current_slot),
             pyre_object::gc_roots::shadow_stack_get(stop_slot),
             pyre_object::gc_roots::shadow_stack_get(step_slot),
             false,
-        );
+        )?;
         let w_range = pyre_object::gc_roots::pin_root(w_range);
         let state = w_tuple_new(vec![w_range]);
         let state_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -4635,6 +4635,10 @@ pub(crate) fn range_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
                 }
             })?;
             let (current, remaining, step) = pyre_object::w_range_iter_fields(w_iter);
+            // `rangeiter_setstate` clamps against `len >= 0`. A negative
+            // remaining (raw-stop empty promoted iterator) would panic
+            // `i64::clamp` because min > max.
+            let remaining = remaining.max(0);
             let skipped = state.clamp(0, remaining);
             let next = (current as i128 + skipped as i128 * step as i128) as i64;
             pyre_object::w_range_iter_set_cursor(w_iter, next, remaining - skipped);
@@ -5040,7 +5044,8 @@ fn filter_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, PyEr
 }
 
 pub(crate) fn filter_iter_method(args: &[PyObjectRef]) -> PyResult {
-    filter_receiver(args, "__iter__")
+    let self_ = filter_receiver(args, "__iter__")?;
+    Ok(unsafe { pyre_object::functional::w_filter_iter(self_) })
 }
 
 pub(crate) fn filter_next_method(args: &[PyObjectRef]) -> PyResult {
@@ -5278,7 +5283,8 @@ fn map_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, PyError
 }
 
 pub(crate) fn map_iter_method(args: &[PyObjectRef]) -> PyResult {
-    map_receiver(args, "__iter__")
+    let self_ = map_receiver(args, "__iter__")?;
+    Ok(unsafe { pyre_object::functional::w_map_iter(self_) })
 }
 
 pub(crate) fn map_next_method(args: &[PyObjectRef]) -> PyResult {
@@ -5367,9 +5373,12 @@ fn zip_receiver(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, PyError
 }
 
 pub(crate) fn zip_iter_method(args: &[PyObjectRef]) -> PyResult {
-    zip_receiver(args, "__iter__")
+    let self_ = zip_receiver(args, "__iter__")?;
+    Ok(unsafe { pyre_object::functional::w_zip_iter(self_) })
 }
 
+/// `functional.py W_Zip.next_w`. FOR_ITER calls [`zip_two_tuple_next`] as
+/// a residual; the body is not descended.
 pub(crate) fn zip_next_method(args: &[PyObjectRef]) -> PyResult {
     zip_next_w(zip_receiver(args, "__next__")?)
 }
@@ -19385,13 +19394,17 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // Already an iterator
         if is_range_iter(obj)
             || pyre_object::is_long_range_iter(obj)
-            || is_seq_iter(obj)
-            || pyre_object::is_list_iter(obj)
-            || pyre_object::is_list_reverse_iter(obj)
-            || pyre_object::is_tuple_iter(obj)
             || pyre_object::generator::is_generator(obj)
         {
             return Ok(obj);
+        }
+        // `iterobject.py W_AbstractSeqIterObject.descr_iter` — `return self`.
+        if is_seq_iter(obj) || pyre_object::is_list_iter(obj) || pyre_object::is_tuple_iter(obj) {
+            return Ok(pyre_object::w_seqiter_iter(obj));
+        }
+        // `iterobject.py W_ReverseSeqIterObject.descr_iter` — `return self`.
+        if pyre_object::is_list_reverse_iter(obj) {
+            return Ok(pyre_object::w_reverseseqiter_iter(obj));
         }
         // W_ISlice.iter_w returns self, but a heap subtype can replace
         // `__iter__`; dispatch that override before taking the native fast
@@ -19503,12 +19516,15 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // `pypy/module/__builtin__/functional.py W_Filter.iter_w` —
         // `return self`.
         if pyre_object::functional::is_filter(obj) {
-            return Ok(obj);
+            return Ok(pyre_object::functional::w_filter_iter(obj));
         }
-        // `functional.py W_Map.iter_w` / `:1019-1020 W_Zip.iter_w` —
-        // `return self`.
-        if pyre_object::functional::is_map(obj) || pyre_object::functional::is_zip(obj) {
-            return Ok(obj);
+        // `functional.py W_Map.iter_w` — `return self`.
+        if pyre_object::functional::is_map(obj) {
+            return Ok(pyre_object::functional::w_map_iter(obj));
+        }
+        // `functional.py W_Zip.iter_w` — `return self`.
+        if pyre_object::functional::is_zip(obj) {
+            return Ok(pyre_object::functional::w_zip_iter(obj));
         }
         // `pypy/module/_sre/interp_sre.py W_SRE_Scanner.iter_w` —
         // `return self` (the finditer/scanner iterator).
@@ -19858,11 +19874,12 @@ unsafe fn tuple_exact_cursor_exhausted(it: PyObjectRef) -> bool {
     (index as u64) >= (pyre_object::w_tuple_len(seq) as u64)
 }
 
-/// `functional.py` `W_Zip.next_w` for two `W_FastTupleIterObject` cursors
-/// over `W_TupleObject`. The traced product is `w_specialised_tuple_oo_new`,
-/// the constructor `next`'s arity-two zip arm allocates (`makespecialisedtuple2`
-/// would box plain ints as `Cls_ii` and change the unpack). A shape this
-/// arm does not own goes to `zip_two_tuple_next_other`.
+/// `functional.py` `W_Zip.next_w` recordable leaf: length==2 over two
+/// `W_FastTupleIterObject` cursors on `W_TupleObject` is two
+/// `tuple_iter_descr_next` calls plus `w_specialised_tuple_oo_new`
+/// (`space.newtuple2`). Every other shape goes to
+/// `zip_two_tuple_next_other`. FOR_ITER calls this body as a residual;
+/// `zip_next_w` uses it through `zip_two_tuple_fast_pyresult`.
 unsafe fn zip_two_tuple_next(zip_obj: PyObjectRef) -> PyObjectRef {
     // Same pin as `zip_two_tuple_next_other`: the first item stays live
     // across the second `next`, and `w_specialised_tuple_oo_new` allocates.
@@ -23532,7 +23549,7 @@ fn generator_send_ex(
         // merge point allocates, so the reds are the arguments themselves.
         let pycode = w_generator_get_pycode(gen_obj);
         if !pycode.is_null() {
-            let raw = crate::pycode::w_code_get_ptr(pycode) as *const crate::CodeObject;
+            let raw = crate::pycode::w_code_get_ptr(pycode);
             if !raw.is_null() && majit_metainterp::jit::we_are_jitted() && should_not_inline(&*raw)
             {
                 return generatorentry_portal(pycode, gen_obj, w_arg);
@@ -24447,6 +24464,26 @@ pub(crate) fn iter_self_method(args: &[PyObjectRef]) -> PyResult {
         args[0]
     };
     Ok(obj)
+}
+
+/// `iterobject.py W_AbstractSeqIterObject.descr_iter` gateway.
+pub(crate) fn seqiter_iter_method(args: &[PyObjectRef]) -> PyResult {
+    let obj = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
+    Ok(unsafe { pyre_object::w_seqiter_iter(obj) })
+}
+
+/// `iterobject.py W_ReverseSeqIterObject.descr_iter` gateway.
+pub(crate) fn reverseseqiter_iter_method(args: &[PyObjectRef]) -> PyResult {
+    let obj = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
+    Ok(unsafe { pyre_object::w_reverseseqiter_iter(obj) })
 }
 
 /// PyPy: GeneratorIterator.descr_send(w_arg)

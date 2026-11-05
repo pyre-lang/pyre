@@ -1711,7 +1711,7 @@ pub unsafe fn get_pycode(obj: PyObjectRef) -> *const () {
             !crate::is_builtin_code(code as PyObjectRef),
             "get_pycode called on a builtin function"
         );
-        crate::w_code_get_ptr(code as PyObjectRef)
+        crate::w_code_get_ptr(code as PyObjectRef) as *const ()
     }
 }
 
@@ -2308,7 +2308,7 @@ fn code_getdocstring(obj: PyObjectRef) -> PyObjectRef {
         return unsafe { crate::gateway::builtin_code_get_docstring(code) };
     }
     if unsafe { crate::pycode::is_code(code) } {
-        let raw = unsafe { crate::pycode::w_code_get_ptr(code) } as *const crate::CodeObject;
+        let raw = unsafe { crate::pycode::w_code_get_ptr(code) };
         if !raw.is_null() {
             let code_ref = unsafe { &*raw };
             if code_ref.flags.contains(crate::CodeFlags::HAS_DOCSTRING)
@@ -2969,7 +2969,7 @@ pub unsafe fn fset_func_code(obj: PyObjectRef, w_code: PyObjectRef) -> Result<()
         } else {
             pyre_object::w_tuple_len(closure)
         };
-        let raw_code = crate::pycode::w_code_get_ptr(w_code) as *const crate::CodeObject;
+        let raw_code = crate::pycode::w_code_get_ptr(w_code);
         let freevars_len = if raw_code.is_null() {
             0
         } else {
@@ -3312,7 +3312,7 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // so the words below are the slots, not the pre-pin copies.
     let w_code = pyre_object::gc_roots::shadow_stack_get(base);
     let w_name = pyre_object::gc_roots::shadow_stack_get(base + 2);
-    let code_ptr = unsafe { crate::w_code_get_ptr(w_code) } as *const crate::CodeObject;
+    let code_ptr = unsafe { crate::w_code_get_ptr(w_code) };
     let name = if w_name.is_null() || unsafe { pyre_object::is_none(w_name) } {
         unsafe { (*code_ptr).obj_name.to_string() }
     } else if unsafe { pyre_object::is_str(w_name) } {
@@ -3326,7 +3326,7 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // reads (`ShadowStackFrameworkGCTransformer.pop_roots`).
     let w_code = pyre_object::gc_roots::shadow_stack_get(base);
     let w_argdefs = pyre_object::gc_roots::shadow_stack_get(base + 3);
-    let code_ptr = unsafe { crate::w_code_get_ptr(w_code) } as *const crate::CodeObject;
+    let code_ptr = unsafe { crate::w_code_get_ptr(w_code) };
     // [3.14-spec] PyPy `Function.descr_function__new__` calls
     // `space.fixedview(argdefs)` before it inspects `closure`, but that accepts
     // lists and then reports PyPy's `TypeError("invalid closure")` for
@@ -4164,6 +4164,8 @@ pub fn function_call_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
 /// whether or not a trace is recording: the CALL walker intercepts the
 /// `CallFn` residual, and after `abort: force quasi-immut` the regular
 /// interpreter still wants the gateway rather than `space.call_function`.
+/// `function.py Function.funccall`: `*args_w` has a length fixed per call site.
+#[majit_macros::unroll_safe]
 pub fn funccall_result(
     func: PyObjectRef,
     args: &[PyObjectRef],
@@ -4248,12 +4250,11 @@ pub fn funccall_result(
 ///
 /// `funccallunrolling = unrolling_iterable(range(4))` expands the copy in
 /// flowspace, so the graph has no loop and `Function.funccall` carries no
-/// `@jit.unroll_safe`. The `match nargs` below is that expansion. PyPy has
-/// no extra GC API on that path; pyre is 3.14t, so the converted
-/// `PyObjectRef`s stay pinned across `createframe` /
-/// `try_new_for_call_with_closure_and_globals_obj` with one-shot
-/// `pin_roots` (`gc_push_roots` publishes the whole live set), matching
-/// `_flat_pycall_defaults`.
+/// `@jit.unroll_safe`. The `match nargs` below is that expansion. Each
+/// store is `setarrayitem` (`FixedObjectArray::set_ref`: write barrier,
+/// then the ref). Pyre is 3.14t, so the converted `PyObjectRef`s stay
+/// pinned across `createframe` with one-shot `pin_roots` (`gc_push_roots`
+/// publishes the whole live set), matching `_flat_pycall_defaults`.
 fn funccall_flat_from_args(
     func: PyObjectRef,
     code: PyObjectRef,
@@ -4286,9 +4287,8 @@ fn funccall_flat_from_args(
     let mut func = _roots.get(root_base);
 
     let mut new_frame = crate::pyframe::FrameBox::new(pyre_object::with_roots!(func => {
-        crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        crate::pyframe::PyFrame::try_createframe(
             _roots.get(root_base + 1) as *const (),
-            &[],
             _roots.get(env_base),
             crate::call::getexecutioncontext(),
             _roots.get(env_base + 1),
@@ -4297,6 +4297,7 @@ fn funccall_flat_from_args(
     })?);
 
     // funccallunrolling: `for i in unrolling_iterable(range(4)): if i < nargs`
+    // `locals_cells_stack_w[i] = args_w[i]` — barrier then store.
     match nargs {
         0 => {}
         1 => new_frame.set_locals_w(0, _roots.get(root_base + 2)),
@@ -4317,8 +4318,6 @@ fn funccall_flat_from_args(
         }
         _ => unreachable!(),
     }
-    crate::pyframe::remember_frame_locals(&new_frame);
-    new_frame.fix_array_ptrs();
     // function.py `Function.funccall` — `new_frame.run(self.name, self.qualname)`
     // → `initialize_as_generator(name, qualname)` / `GeneratorIterator`.
     // Same arm as `_flat_pycall`: transfer the owned `FrameBox`, do not
@@ -4659,15 +4658,14 @@ fn _flat_pycall(
     let w_globals = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
 
-    // function.py:208-209 — createframe(code, w_func_globals, self)
+    // function.py `_flat_pycall` — createframe(code, w_func_globals, self)
     // FrameBox: the callee runs through the JIT, so it must be a
     // header-bearing heap frame (write barrier reads a valid header at
     // frame - GC_HEADER_SIZE) rather than a bare interpreter-stack frame.
     let mut new_frame = crate::pyframe::FrameBox::new(
         match pyre_object::with_roots!(func =>
-            crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
+            crate::pyframe::PyFrame::try_createframe(
                 code as *const (),
-                &[], // locals filled below directly from stack
                 w_globals,
                 crate::call::getexecutioncontext(),
                 closure,
@@ -4686,20 +4684,13 @@ fn _flat_pycall(
     // the GC transform; read the forwarded caller for peekvalue / dropvalues
     // so those writes land on the live valuestackdepth.
     let frame = unsafe { &mut *caller.live() };
-    // function.py:210-211 — copy from stack into locals directly
+    // function.py `_flat_pycall` — `locals_cells_stack_w[i] = peekvalue(...)`
     // peekvalue(nargs-1-i) gives bottom-to-top order (matching local slot order)
     for i in 0..nargs {
         new_frame.set_locals_w(i, frame.peekvalue(nargs - 1 - i));
     }
-    // `PyFrame.__init__` allocates `locals_cells_stack_w` as a fresh
-    // `[None] * size` nursery array.  Arguments just written into it are
-    // also young.  `remember_frame_locals_array` still runs: a full nursery
-    // can spill the array to old-gen, and until the callee sits on
-    // `f_backref` nothing else exposes these slots.
-    crate::pyframe::remember_frame_locals(&new_frame);
     let frame = unsafe { &mut *caller.live() };
     frame.dropvalues(dropvalues);
-    new_frame.fix_array_ptrs();
 
     // function.py `_flat_pycall` — return new_frame.run(self.name, self.qualname)
     // Generator/coroutine: wrap the frame in a generator object and hand it
@@ -4759,9 +4750,8 @@ fn _flat_pycall_defaults(
 
     // FrameBox: header-bearing heap frame for the JIT write barrier.
     let mut new_frame = crate::pyframe::FrameBox::new(
-        match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        match crate::pyframe::PyFrame::try_createframe(
             code as *const (),
-            &[], // locals filled below
             w_globals,
             crate::call::getexecutioncontext(),
             closure,
@@ -4779,12 +4769,12 @@ fn _flat_pycall_defaults(
     // transform reloads `frame` after `space.createframe` in
     // `function.py _flat_pycall_defaults`.
     let frame = unsafe { &mut *caller.live() };
-    // function.py:221-222 — copy positional args from stack
+    // function.py `_flat_pycall_defaults` — `locals_cells_stack_w[i] = peekvalue(...)`
     for i in 0..nargs {
         new_frame.set_locals_w(i, frame.peekvalue(nargs - 1 - i));
     }
 
-    // function.py:224-229 — fill remaining from defs_w
+    // function.py `_flat_pycall_defaults` — remaining slots from `self.defs_w`
     let defs = pyre_object::gc_roots::shadow_stack_get(defs_idx);
     if !defs.is_null() {
         let ndefs = unsafe { pyre_object::w_tuple_len(defs) };
@@ -4798,12 +4788,8 @@ fn _flat_pycall_defaults(
         }
     }
 
-    // Same barrier as `_flat_pycall`: a full nursery can spill the callee's
-    // locals array to old-gen, and the arguments and defaults in it are young.
-    crate::pyframe::remember_frame_locals(&new_frame);
     let frame = unsafe { &mut *caller.live() };
     frame.dropvalues(dropvalues);
-    new_frame.fix_array_ptrs();
 
     // function.py `_flat_pycall_defaults` — return new_frame.run.
     // Same callee root as `_flat_pycall`: `FrameBox`'s `OwnerRootGuard`.

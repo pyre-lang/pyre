@@ -4535,7 +4535,7 @@ pub fn load_super_attr_value(
     name_idx: usize,
     is_two_arg: bool,
 ) -> Result<PyObjectRef, PyError> {
-    let code = unsafe { &*(crate::w_code_get_ptr(w_code) as *const crate::CodeObject) };
+    let code = unsafe { &*(crate::w_code_get_ptr(w_code)) };
     let Some(name) = code.names.get(name_idx) else {
         return Err(PyError::runtime_error(format!(
             "LOAD_SUPER_ATTR name index {name_idx} out of range"
@@ -4564,6 +4564,10 @@ pub fn load_super_attr_value(
 }
 
 impl OpcodeStepExecutor for PyFrame {
+    fn pycode(&self) -> pyre_object::PyObjectRef {
+        self.pycode as pyre_object::PyObjectRef
+    }
+
     /// The generic default walks `small_int_constant` → `int_constant`
     /// → `w_int_new` and writes a translator-local `&INT_TYPE`.
     fn load_small_int(&mut self, value: i64) -> Result<(), PyError> {
