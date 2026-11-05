@@ -1591,6 +1591,16 @@ impl FunctionDesc {
     }
 
     fn remember_in_translator_graphs(&self, graph: &Rc<PyGraph>) {
+        // `extfunc.py` `ExtFuncEntry` has no flow graph.
+        // `FunctionDesc.pycall` `_signature_` short-circuits a residual
+        // stub; appending it would `checkgraph` a link arg that is not
+        // an SSA def (`__unsafe_stub_result`). The same stub shape is
+        // used for a bodyless `register_external` without `_signature_`.
+        if self.residual_signature_result().is_some()
+            || residual_stub_link_arg(&graph.graph.borrow())
+        {
+            return;
+        }
         if let Some(annotator) = self.base.bookkeeper.try_annotator() {
             let mut graphs = annotator.translator.graphs.borrow_mut();
             if !graphs.iter().any(|g| Rc::ptr_eq(g, &graph.graph)) {
@@ -1598,6 +1608,24 @@ impl FunctionDesc {
             }
         }
     }
+}
+
+/// True when `graph` is an annotator-only residual stub: empty
+/// startblock whose return link names `__unsafe_stub_result`
+/// (`build_stub_pygraph_with_result_shell`). That Variable is not an
+/// SSA def, so `checkgraph` of `translator.graphs` panics.
+fn residual_stub_link_arg(graph: &crate::flowspace::model::FunctionGraph) -> bool {
+    use crate::flowspace::model::Hlvalue;
+    let start = graph.startblock.borrow();
+    start.operations.is_empty()
+        && start.exits.iter().any(|link| {
+            link.borrow().args.iter().any(|arg| {
+                matches!(
+                    arg,
+                    Some(Hlvalue::Variable(v)) if v.name_prefix() == "__unsafe_stub_result"
+                )
+            })
+        })
 }
 
 /// Code-object analogue of `translator.buildflowgraph`
@@ -2206,6 +2234,35 @@ impl FunctionDesc {
             })?;
         // upstream: `inputcells = self.parse_arguments(new_args, graph)`.
         let inputcells = self.parse_arguments(&new_args, Some(graph.as_ref()))?;
+
+        // `extfunc.py` `ExtFuncEntry.compute_result_annotation`: a
+        // bodyless residual's declared FUNC.RESULT is the annotation,
+        // with no walk of a stub graph (`annrpython.py` `recursivecall`
+        // is the look-inside body). Bind startblock inputargs so
+        // `callparse.py` `getrinputs` sees them, without
+        // `addpendingblock` (that would queue flowin / Phase B rtype
+        // of the stub).
+        if let Some(s_result) = self.residual_signature_result() {
+            {
+                let graph_ref = graph.graph.borrow();
+                let start = graph_ref.startblock.borrow();
+                for (arg, cell) in start.inputargs.iter().zip(inputcells.iter()) {
+                    if let crate::flowspace::model::Hlvalue::Variable(v) = arg
+                        && let Some(s) = cell
+                    {
+                        *v.annotation.borrow_mut() = Some(Rc::new(s.clone()));
+                    }
+                }
+                if let crate::flowspace::model::Hlvalue::Variable(v) = graph_ref.getreturnvar()
+                    && v.annotation.borrow().is_none()
+                {
+                    *v.annotation.borrow_mut() = Some(Rc::new(s_result.clone()));
+                }
+            }
+            return super::model::unionof([&s_result, s_previous_result]).map_err(|e| {
+                AnnotatorError::new(format!("{}.pycall unionof: {}", self.name, e))
+            });
+        }
 
         // upstream: `annotator = self.bookkeeper.annotator`.
         let annotator = self.base.bookkeeper.annotator();

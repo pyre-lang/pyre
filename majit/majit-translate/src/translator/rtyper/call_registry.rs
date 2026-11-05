@@ -1041,6 +1041,9 @@ impl CallRegistry {
         if let Some(entry) = self.lookup_existing(key) {
             return Some(entry);
         }
+        if let Some(entry) = self.alias_residual_spec_spelling(key) {
+            return Some(entry);
+        }
         if let Some(stripped) = crate::local_crates::strip_alias_crate_prefix(key.segments()) {
             let stripped_key = key.with_segments(stripped);
             if let Some(entry) = self.describe_or_materialize_residual_inst(&stripped_key) {
@@ -1048,6 +1051,37 @@ impl CallRegistry {
             }
         }
         self.describe_or_materialize_residual_inst(key)
+    }
+
+    /// `leaf__spec_<hash>` is `instance_leaf` of the same FunDecl
+    /// (`bookkeeper.py Bookkeeper.getdesc`). Point it at the residual
+    /// stub of `leaf` when that stub is bodyless
+    /// (`_jit_look_inside_ = False`). Look-inside instantiations keep
+    /// their own GraphStore bodies (`FunctionDesc.cachedgraph`).
+    fn alias_residual_spec_spelling(&self, key: &FunctionPathKey) -> Option<Rc<FunctionEntry>> {
+        let leaf = key.name();
+        let stem = crate::front::clause_spec::unspecialized_leaf(leaf);
+        if stem == leaf || stem.is_empty() {
+            return None;
+        }
+        let mut segs = key.segments().to_vec();
+        *segs.last_mut()? = stem.to_string();
+        let stem_key = key.with_segments(segs);
+        let entry = self.lookup_existing(&stem_key)?;
+        if !entry
+            .host_object
+            .user_function()
+            .is_some_and(|func| func._jit_look_inside_ == Some(false))
+        {
+            return None;
+        }
+        if let Some(canonical) = self.canonical_key_of(&entry)
+            && canonical != *key
+            && self.lookup_registered(key).is_none()
+        {
+            self.alias(key.clone(), &canonical);
+        }
+        Some(entry)
     }
 
     /// A declared `leaf__inst_*` funcobj (`FunctionDesc.cachedgraph`)
@@ -1760,6 +1794,32 @@ mod tests {
         );
         assert_eq!(residual_inst_template_leaf("ll_dict_grow_trampoline"), None);
         assert_eq!(residual_inst_template_leaf("__inst_i64"), None);
+    }
+
+    #[test]
+    fn lookup_aliases_spec_suffix_onto_a_residual_stub() {
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = CallRegistry::new(bk);
+        let mut func = GraphFunc::new(
+            "bodyless_ext".to_string(),
+            Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
+        );
+        func._jit_look_inside_ = Some(false);
+        let residual = registry.get_or_register_with_func(
+            FunctionPathKey::from_segments(["extmod", "bodyless_ext"]),
+            signature(&["x"]),
+            func,
+        );
+        let spec = registry
+            .lookup(&FunctionPathKey::from_segments([
+                "extmod",
+                "bodyless_ext__spec_deadbeefdeadbeef",
+            ]))
+            .expect("spec spelling of a residual stub");
+        assert!(
+            Rc::ptr_eq(&residual, &spec),
+            "leaf__spec_ is the same FunctionDesc as the bodyless stub"
+        );
     }
 
     #[test]

@@ -3148,6 +3148,17 @@ impl StoreCore {
         entries
     }
 
+    /// `(path, GraphKey)` for every registered spelling. Does not clone a
+    /// declaration header (`iter_declared` / `slot_declaration`).
+    pub(crate) fn iter_path_keys(&self) -> Vec<(CallPath, GraphKey)> {
+        self.register_declared();
+        self.path_to_key
+            .borrow()
+            .iter()
+            .map(|(path, key)| (path.clone(), key.clone()))
+            .collect()
+    }
+
     /// Remove one built graph so a caller can mutate it while still
     /// borrowing the rest of the store. Alias paths keep their `GraphKey`.
     fn take_graph(&mut self, key: &GraphKey) -> Option<(FunctionGraph, Vec<CallPath>, bool)> {
