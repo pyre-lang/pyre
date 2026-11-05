@@ -1713,22 +1713,14 @@ mod tm_zone_name_tests {
     use std::ffi::CString;
 
     #[test]
-    fn tm_zone_name_copies_non_utf8_bytes() {
+    fn tm_zone_name_copies_bytes_and_pads_empty() {
         let raw = CString::new(vec![b'E', 0xFF, b'T']).unwrap();
         assert_eq!(tm_zone_name(raw.as_ptr()), vec![b'E', 0xFF, b'T']);
-    }
-
-    #[test]
-    fn tm_zone_name_empty_is_three_spaces() {
         assert_eq!(tm_zone_name(std::ptr::null()), b"   ");
         let empty = CString::new("").unwrap();
         assert_eq!(tm_zone_name(empty.as_ptr()), b"   ");
-    }
-
-    #[test]
-    fn tm_zone_name_ascii_abbreviation() {
-        let raw = CString::new("EST").unwrap();
-        assert_eq!(tm_zone_name(raw.as_ptr()), b"EST");
+        let ascii = CString::new("EST").unwrap();
+        assert_eq!(tm_zone_name(ascii.as_ptr()), b"EST");
     }
 }
 

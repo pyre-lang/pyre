@@ -90,16 +90,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tag_round_trips_signed_payload() {
+    fn tag_round_trips_payload_and_rejects_out_of_range() {
         for v in [-1_000_000i64, -42, -1, 0, 1, 21, 1_000_000] {
             let p = tag_int(v);
             assert!(is_tagged_int(p));
             assert_eq!(untag_int(p), v);
         }
-    }
-
-    #[test]
-    fn tag_round_trips_range_boundaries() {
         // Derive the boundary from pointer width so the round-trip is
         // correct on any target (full i64>>1 on 64-bit, 31-bit on wasm32).
         let lo = (isize::MIN >> 1) as i64;
@@ -107,14 +103,6 @@ mod tests {
         assert!(fits_tagged(lo) && fits_tagged(hi));
         assert_eq!(untag_int(tag_int(lo)), lo);
         assert_eq!(untag_int(tag_int(hi)), hi);
-    }
-
-    #[test]
-    fn fits_tagged_rejects_top_bit_values() {
-        let lo = (isize::MIN >> 1) as i64;
-        let hi = (isize::MAX >> 1) as i64;
-        assert!(fits_tagged(hi));
-        assert!(fits_tagged(lo));
         // hi = i64::MAX>>1 < i64::MAX and lo = i64::MIN>>1 > i64::MIN on
         // both 32- and 64-bit, so the `+1`/`-1` cannot overflow.
         assert!(!fits_tagged(hi + 1));

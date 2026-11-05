@@ -7681,7 +7681,9 @@ mod tests {
     }
 
     #[test]
-    fn ascii_strategy_oopspec_tags_present() {
+    fn strategy_oopspec_tags_present() {
+        // The `#[oopspec(...)]` attribute emits the spec string for the
+        // codewriter's `_handle_list_call` to decode (rlib/jit.py parity).
         assert_eq!(oopspec_ll_list_ascii_length, "list.ascii_len(l)");
         assert_eq!(
             oopspec_ll_list_ascii_getitem_fast,
@@ -7693,10 +7695,6 @@ mod tests {
             oopspec_ll_list_ascii_setitem_fast,
             "list.ascii_setitem(l, index, item)"
         );
-    }
-
-    #[test]
-    fn bytes_strategy_oopspec_tags_present() {
         assert_eq!(oopspec_ll_list_bytes_length, "list.bytes_len(l)");
         assert_eq!(
             oopspec_ll_list_bytes_getitem_fast,
@@ -7706,12 +7704,6 @@ mod tests {
             oopspec_ll_list_bytes_setitem_fast,
             "list.bytes_setitem(l, index, item)"
         );
-    }
-
-    #[test]
-    fn integer_strategy_oopspec_tags_present() {
-        // The `#[oopspec(...)]` attribute emits the spec string for the
-        // codewriter's `_handle_list_call` to decode (rlib/jit.py parity).
         assert_eq!(oopspec_ll_list_int_length, "list.int_len(l)");
         assert_eq!(
             oopspec_ll_list_int_getitem_fast,
@@ -7723,10 +7715,6 @@ mod tests {
         );
         assert_eq!(oopspec_ll_list_int_capacity, "list.int_capacity(l)");
         assert_eq!(oopspec_ll_list_int_set_len, "list.int_set_len(l, n)");
-    }
-
-    #[test]
-    fn object_strategy_oopspec_tags_present() {
         assert_eq!(oopspec_ll_list_obj_length, "list.obj_len(l)");
         assert_eq!(oopspec_ll_list_obj_capacity, "list.obj_capacity(l)");
         assert_eq!(oopspec_ll_list_obj_set_len, "list.obj_set_len(l, n)");
@@ -7737,12 +7725,21 @@ mod tests {
     }
 
     #[test]
-    fn test_list_out_of_bounds() {
+    fn test_list_out_of_bounds_and_pop_none() {
         let list = w_list_new(vec![w_int_new(1)]);
         unsafe {
             assert!(w_list_getitem(list, 5).is_none());
             assert!(w_list_getitem(list, -5).is_none());
             assert!(!w_list_setitem(list, 5, w_int_new(0)));
+        }
+        let pop = w_list_new(vec![w_int_new(10), w_int_new(20), w_int_new(30)]);
+        unsafe {
+            let popped = w_list_pop(pop, -1).unwrap();
+            assert_eq!(crate::intobject::w_int_get_value(popped), 30);
+            assert_eq!(w_list_len(pop), 2);
+            assert!(w_list_pop(pop, 5).is_none());
+            assert!(w_list_pop(pop, -5).is_none());
+            assert_eq!(w_list_len(pop), 2);
         }
     }
 
@@ -7767,28 +7764,6 @@ mod tests {
                 crate::intobject::w_int_get_value(w_list_getitem(list, 2).unwrap()),
                 7
             );
-        }
-    }
-
-    #[test]
-    fn test_w_list_pop_normalizes_negative_index() {
-        let list = w_list_new(vec![w_int_new(10), w_int_new(20), w_int_new(30)]);
-        unsafe {
-            let popped = w_list_pop(list, -1).unwrap();
-            assert_eq!(crate::intobject::w_int_get_value(popped), 30);
-            assert_eq!(w_list_len(list), 2);
-        }
-    }
-
-    #[test]
-    fn test_w_list_pop_out_of_range_returns_none() {
-        // An out-of-range index leaves the list untouched and returns
-        // `None` (the caller raises IndexError).
-        let list = w_list_new(vec![w_int_new(10)]);
-        unsafe {
-            assert!(w_list_pop(list, 5).is_none());
-            assert!(w_list_pop(list, -5).is_none());
-            assert_eq!(w_list_len(list), 1);
         }
     }
 
@@ -7827,29 +7802,26 @@ mod tests {
     }
 
     #[test]
-    fn test_list_setitem_mixed_value_switches_to_int_or_float_strategy() {
-        let list = w_list_new(vec![w_int_new(1), w_int_new(2)]);
-        let float = crate::floatobject::w_float_new(3.5);
+    fn test_list_mixed_value_switches_to_int_or_float_strategy() {
+        let setitem = w_list_new(vec![w_int_new(1), w_int_new(2)]);
+        let append = w_list_new(vec![w_int_new(1), w_int_new(2)]);
+        let float_set = crate::floatobject::w_float_new(3.5);
+        let float_app = crate::floatobject::w_float_new(3.5);
         unsafe {
-            assert!(w_list_uses_int_storage(list));
-            assert!(w_list_setitem(list, 0, float));
-            assert!(w_list_uses_int_or_float_storage(list));
-            let value = w_list_getitem(list, 0).unwrap();
-            assert!(crate::pyobject::is_float(value));
-        }
-    }
+            assert!(w_list_uses_int_storage(setitem));
+            assert!(w_list_setitem(setitem, 0, float_set));
+            assert!(w_list_uses_int_or_float_storage(setitem));
+            assert!(crate::pyobject::is_float(
+                w_list_getitem(setitem, 0).unwrap()
+            ));
 
-    #[test]
-    fn test_list_append_mixed_value_switches_to_int_or_float_strategy() {
-        let list = w_list_new(vec![w_int_new(1), w_int_new(2)]);
-        let float = crate::floatobject::w_float_new(3.5);
-        unsafe {
-            assert!(w_list_uses_int_storage(list));
-            w_list_append(list, float);
-            assert!(w_list_uses_int_or_float_storage(list));
-            assert_eq!(w_list_len(list), 3);
-            let value = w_list_getitem(list, 2).unwrap();
-            assert!(crate::pyobject::is_float(value));
+            assert!(w_list_uses_int_storage(append));
+            w_list_append(append, float_app);
+            assert!(w_list_uses_int_or_float_storage(append));
+            assert_eq!(w_list_len(append), 3);
+            assert!(crate::pyobject::is_float(
+                w_list_getitem(append, 2).unwrap()
+            ));
         }
     }
 
@@ -7965,33 +7937,26 @@ mod tests {
     }
 
     #[test]
-    fn test_list_setitem_mixed_on_float_strategy_switches_to_int_or_float_strategy() {
-        let list = w_list_new(vec![
+    fn test_list_mixed_on_float_strategy_switches_to_int_or_float() {
+        let setitem = w_list_new(vec![
+            crate::floatobject::w_float_new(1.0),
+            crate::floatobject::w_float_new(2.0),
+        ]);
+        let append = w_list_new(vec![
             crate::floatobject::w_float_new(1.0),
             crate::floatobject::w_float_new(2.0),
         ]);
         unsafe {
-            assert!(w_list_uses_float_storage(list));
-            assert!(w_list_setitem(list, 0, w_int_new(7)));
-            assert!(w_list_uses_int_or_float_storage(list));
-            let value = w_list_getitem(list, 0).unwrap();
-            assert!(crate::pyobject::is_int(value));
-        }
-    }
+            assert!(w_list_uses_float_storage(setitem));
+            assert!(w_list_setitem(setitem, 0, w_int_new(7)));
+            assert!(w_list_uses_int_or_float_storage(setitem));
+            assert!(crate::pyobject::is_int(w_list_getitem(setitem, 0).unwrap()));
 
-    #[test]
-    fn test_list_append_mixed_on_float_strategy_switches_to_int_or_float_strategy() {
-        let list = w_list_new(vec![
-            crate::floatobject::w_float_new(1.0),
-            crate::floatobject::w_float_new(2.0),
-        ]);
-        unsafe {
-            assert!(w_list_uses_float_storage(list));
-            w_list_append(list, w_int_new(7));
-            assert!(w_list_uses_int_or_float_storage(list));
-            assert_eq!(w_list_len(list), 3);
-            let value = w_list_getitem(list, 2).unwrap();
-            assert!(crate::pyobject::is_int(value));
+            assert!(w_list_uses_float_storage(append));
+            w_list_append(append, w_int_new(7));
+            assert!(w_list_uses_int_or_float_storage(append));
+            assert_eq!(w_list_len(append), 3);
+            assert!(crate::pyobject::is_int(w_list_getitem(append, 2).unwrap()));
         }
     }
 
@@ -8261,30 +8226,24 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_first_int_append_switches_to_int_strategy() {
+    fn test_empty_first_append_picks_typed_strategy() {
         // listobject.py EmptyListStrategy.append picks the typed strategy
         // matching the first item.
-        let list = w_list_new(Vec::new());
+        let ints = w_list_new(Vec::new());
+        let floats = w_list_new(Vec::new());
         unsafe {
-            assert!(w_list_uses_empty_storage(list));
-            w_list_append(list, w_int_new(7));
-            assert!(w_list_uses_int_storage(list));
-            assert_eq!(w_list_len(list), 1);
+            assert!(w_list_uses_empty_storage(ints));
+            w_list_append(ints, w_int_new(7));
+            assert!(w_list_uses_int_storage(ints));
+            assert_eq!(w_list_len(ints), 1);
             assert_eq!(
-                crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()),
+                crate::intobject::w_int_get_value(w_list_getitem(ints, 0).unwrap()),
                 7
             );
-        }
-    }
-
-    #[test]
-    fn test_empty_first_float_append_switches_to_float_strategy() {
-        let list = w_list_new(Vec::new());
-        unsafe {
-            assert!(w_list_uses_empty_storage(list));
-            w_list_append(list, crate::floatobject::w_float_new(2.5));
-            assert!(w_list_uses_float_storage(list));
-            assert_eq!(w_list_len(list), 1);
+            assert!(w_list_uses_empty_storage(floats));
+            w_list_append(floats, crate::floatobject::w_float_new(2.5));
+            assert!(w_list_uses_float_storage(floats));
+            assert_eq!(w_list_len(floats), 1);
         }
     }
 

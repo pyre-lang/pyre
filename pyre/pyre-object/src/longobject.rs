@@ -735,66 +735,32 @@ mod tests {
 
     #[test]
     fn test_long_create_and_read() {
-        let obj = w_long_new(BigInt::from(42));
-        unsafe {
-            assert!(is_long(obj));
-            assert!(!is_int(obj));
-            assert_eq!(*w_long_get_value(obj), BigInt::from(42));
-        }
-    }
-
-    #[test]
-    fn test_long_from_i64() {
-        let obj = w_long_from_i64(i64::MAX);
-        unsafe {
-            assert!(is_long(obj));
-            assert_eq!(*w_long_get_value(obj), BigInt::from(i64::MAX));
-        }
-    }
-
-    #[test]
-    fn test_long_large_value() {
-        let big = BigInt::from(i64::MAX) + BigInt::from(1);
-        let obj = w_long_new(big.clone());
-        unsafe {
-            assert!(is_long(obj));
-            assert_eq!(*w_long_get_value(obj), big);
-        }
-    }
-
-    #[test]
-    fn test_long_field_offset() {
         assert_eq!(LONG_VALUE_OFFSET, 16);
-    }
-
-    #[test]
-    fn test_jit_w_long_fits_int_in_range() {
-        let obj = w_long_from_i64(123);
-        assert_eq!(jit_w_long_fits_int(obj), 1);
-        let obj = w_long_from_i64(i64::MAX);
-        assert_eq!(jit_w_long_fits_int(obj), 1);
-        let obj = w_long_from_i64(i64::MIN);
-        assert_eq!(jit_w_long_fits_int(obj), 1);
-    }
-
-    #[test]
-    fn test_jit_w_long_fits_int_out_of_range() {
+        let small = w_long_new(BigInt::from(42));
+        let from_i64 = w_long_from_i64(i64::MAX);
         let big = BigInt::from(i64::MAX) + BigInt::from(1);
-        let obj = w_long_new(big);
-        assert_eq!(jit_w_long_fits_int(obj), 0);
-        let big = BigInt::from(i64::MIN) - BigInt::from(1);
-        let obj = w_long_new(big);
-        assert_eq!(jit_w_long_fits_int(obj), 0);
+        let large = w_long_new(big.clone());
+        unsafe {
+            assert!(is_long(small) && !is_int(small));
+            assert_eq!(*w_long_get_value(small), BigInt::from(42));
+            assert!(is_long(from_i64));
+            assert_eq!(*w_long_get_value(from_i64), BigInt::from(i64::MAX));
+            assert!(is_long(large));
+            assert_eq!(*w_long_get_value(large), big);
+        }
     }
 
     #[test]
-    fn test_jit_w_long_toint_extracts_i64() {
-        let obj = w_long_from_i64(42);
-        assert_eq!(jit_w_long_toint(obj), 42);
-        let obj = w_long_from_i64(i64::MAX);
-        assert_eq!(jit_w_long_toint(obj), i64::MAX);
-        let obj = w_long_from_i64(i64::MIN);
-        assert_eq!(jit_w_long_toint(obj), i64::MIN);
+    fn test_jit_w_long_fits_int_and_toint() {
+        for v in [123, i64::MAX, i64::MIN] {
+            let obj = w_long_from_i64(v);
+            assert_eq!(jit_w_long_fits_int(obj), 1);
+            assert_eq!(jit_w_long_toint(obj), v);
+        }
+        let above = w_long_new(BigInt::from(i64::MAX) + BigInt::from(1));
+        let below = w_long_new(BigInt::from(i64::MIN) - BigInt::from(1));
+        assert_eq!(jit_w_long_fits_int(above), 0);
+        assert_eq!(jit_w_long_fits_int(below), 0);
     }
 
     #[test]

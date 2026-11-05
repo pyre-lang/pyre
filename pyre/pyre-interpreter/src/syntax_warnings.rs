@@ -1171,19 +1171,11 @@ mod tests {
     }
 
     #[test]
-    fn only_the_first_invalid_escape_is_reported() {
+    fn scan_reports_the_first_invalid_escape() {
         // The offset names the backslash, which is what a `SyntaxError.offset`
         // of 1 for a literal starting a line requires.
         assert_eq!(scan(r"'\d and \q'", false), character('d', 1));
-    }
-
-    #[test]
-    fn recognized_escapes_are_not_reported() {
         assert_eq!(scan(r"'\n\t\\\x41\u0041\N{BULLET}\101'", false), None);
-    }
-
-    #[test]
-    fn bytes_reject_the_character_escapes() {
         assert_eq!(scan(r"b'\u0041'", true), character('u', 2));
         assert_eq!(scan(r"b'\u0041'", false), None);
     }

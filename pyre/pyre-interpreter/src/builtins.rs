@@ -28637,7 +28637,7 @@ mod tests {
     }
 
     #[test]
-    fn in_memory_file_write_overwrites_at_the_seek_position() {
+    fn in_memory_file_write_at_seek_and_empty_past_end() {
         let mut data = b"PK\0\0payload".to_vec();
         let end = file_write_at(&mut data, 2, b"\x03\x04").unwrap();
         assert_eq!(end, 4);
@@ -28646,14 +28646,11 @@ mod tests {
         let end = file_write_at(&mut data, 12, b"x").unwrap();
         assert_eq!(end, 13);
         assert_eq!(&data[11..], b"\0x");
-    }
 
-    #[test]
-    fn in_memory_file_empty_write_past_the_end_keeps_the_size() {
-        let mut data = b"abc".to_vec();
-        let end = file_write_at(&mut data, 4096, b"").unwrap();
+        let mut empty_past = b"abc".to_vec();
+        let end = file_write_at(&mut empty_past, 4096, b"").unwrap();
         assert_eq!(end, 4096);
-        assert_eq!(&data, b"abc");
+        assert_eq!(&empty_past, b"abc");
     }
 
     #[test]
@@ -28669,10 +28666,6 @@ mod tests {
         assert_eq!(syntax_error_character_offset("α = 0xI", 1, 7), 6);
         assert_eq!(syntax_error_character_offset("first\nα = 0xI", 2, 7), 6);
         assert_eq!(syntax_error_character_offset("α", 1, 0), 0);
-    }
-
-    #[test]
-    fn source_byte_location_accepts_an_offset_inside_utf8() {
         assert_eq!(source_byte_location("αx", 1), (1, 1));
         assert_eq!(source_byte_location("first\nαx", 7), (2, 1));
     }
@@ -28904,32 +28897,25 @@ mod tests {
     }
 
     #[test]
-    fn long_abs_reuses_nonnegative_rbigint_payload() {
-        let value = BigInt::one().lshift(80).unwrap();
-        let input = w_long_new(value);
-        let result = builtin_abs(&[input]).unwrap();
-
-        assert_ne!(result, input, "int.__abs__ returns a fresh long wrapper");
+    fn long_abs_payload_identity() {
+        let pos = w_long_new(BigInt::one().lshift(80).unwrap());
+        let pos_abs = builtin_abs(&[pos]).unwrap();
+        assert_ne!(pos_abs, pos, "int.__abs__ returns a fresh long wrapper");
         unsafe {
             assert!(
-                std::ptr::eq(w_long_get_value(result), w_long_get_value(input)),
+                std::ptr::eq(w_long_get_value(pos_abs), w_long_get_value(pos)),
                 "nonnegative rbigint.abs returns its original payload"
             );
         }
-    }
 
-    #[test]
-    fn long_abs_negates_negative_rbigint_payload() {
-        let value = BigInt::one().lshift(80).unwrap().neg();
-        let input = w_long_new(value);
-        let result = builtin_abs(&[input]).unwrap();
-
+        let neg = w_long_new(BigInt::one().lshift(80).unwrap().neg());
+        let neg_abs = builtin_abs(&[neg]).unwrap();
         unsafe {
             assert!(!std::ptr::eq(
-                w_long_get_value(result),
-                w_long_get_value(input)
+                w_long_get_value(neg_abs),
+                w_long_get_value(neg)
             ));
-            assert_eq!(w_long_get_value(result).get_sign(), 1);
+            assert_eq!(w_long_get_value(neg_abs).get_sign(), 1);
         }
     }
 
@@ -29128,15 +29114,6 @@ mod tests {
     }
 
     #[test]
-    fn test_hash_rejects_tuple_containing_unhashable_key() {
-        crate::typedef::init_typeobjects();
-        let value = w_tuple_new(vec![w_list_new(vec![])]);
-        let err = builtin_hash(&[value]).expect_err("tuple hash should reject list element");
-
-        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
-    }
-
-    #[test]
     fn int_string_digit_limit_precedes_digit_buffer_allocation() {
         crate::typedef::init_typeobjects();
         let text = "7".repeat(crate::module::sys::state::DEFAULT_MAX_STR_DIGITS as usize + 1);
@@ -29171,6 +29148,12 @@ mod tests {
         for text in ["- 1", "+ 1", " + 1 "] {
             let source = w_str_new(text);
             let err = parse_int_from_str(source, text, 10).unwrap_err();
+            assert_eq!(err.kind, crate::PyErrorKind::ValueError);
+        }
+        for text in ["1234L", "12x", "0x12g"] {
+            let source = w_str_new(text);
+            let base = if text.starts_with("0x") { 0 } else { 10 };
+            let err = parse_int_from_str(source, text, base).unwrap_err();
             assert_eq!(err.kind, crate::PyErrorKind::ValueError);
         }
     }
@@ -29230,16 +29213,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn int_string_rejects_trailing_nondigit() {
-        crate::typedef::init_typeobjects();
-        for text in ["1234L", "12x", "0x12g"] {
-            let source = w_str_new(text);
-            let base = if text.starts_with("0x") { 0 } else { 10 };
-            let err = parse_int_from_str(source, text, base).unwrap_err();
-            assert_eq!(err.kind, crate::PyErrorKind::ValueError);
-        }
-    }
     /// PyPy `interp_io._open` constructs `W_FileIO`, and
     /// `W_FileIO.descr_init` calls `_open_fd` before returning.  A writable
     /// pathname must therefore be created/truncated while the stream is still

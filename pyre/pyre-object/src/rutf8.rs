@@ -493,10 +493,28 @@ mod tests {
     use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
     #[test]
-    fn check_utf8_counts_code_points() {
+    fn check_utf8_counts_admits_surrogates_and_reports_position() {
         assert_eq!(check_utf8(b"", true), Ok(0));
         assert_eq!(check_utf8(b"abc", true), Ok(3));
         assert_eq!(check_utf8("é中\u{10000}".as_bytes(), false), Ok(3));
+        let lone = b"\xed\xa0\x80";
+        assert_eq!(check_utf8(lone, true), Ok(1));
+        assert_eq!(check_utf8(lone, false), Err(CheckError { pos: 0 }));
+        // A pair stays two code points, which is what `surrogatepass` decodes
+        // `'\\ud800\\udc00'.encode('utf-8', 'surrogatepass')` back to.
+        assert_eq!(check_utf8(b"\xed\xa0\x80\xed\xb0\x80", true), Ok(2));
+        assert_eq!(check_utf8(b"ab\x80", true), Err(CheckError { pos: 2 }));
+        assert_eq!(check_utf8(b"ab\xc2", true), Err(CheckError { pos: 2 }));
+        assert_eq!(
+            check_utf8(b"ab\xe0\x80\x80", true),
+            Err(CheckError { pos: 2 })
+        );
+        assert_eq!(
+            check_utf8(b"ab\xf4\x90\x80\x80", true),
+            Err(CheckError { pos: 2 })
+        );
+        assert_eq!(check_utf8(b"ab\xf5", true), Err(CheckError { pos: 2 }));
+        assert_eq!(check_utf8(b"ab\xc1\x81", true), Err(CheckError { pos: 2 }));
     }
 
     #[test]
@@ -577,32 +595,6 @@ mod tests {
         // past it rather than report its own position.
         probe(b"\xed\xa0\x80\xed\xc0\x80");
         probe(b"a\xed\xa0\x80\xed\xb0\x80z");
-    }
-
-    #[test]
-    fn check_utf8_admits_surrogates_only_when_asked() {
-        let lone = b"\xed\xa0\x80";
-        assert_eq!(check_utf8(lone, true), Ok(1));
-        assert_eq!(check_utf8(lone, false), Err(CheckError { pos: 0 }));
-        // A pair stays two code points, which is what `surrogatepass` decodes
-        // `'\\ud800\\udc00'.encode('utf-8', 'surrogatepass')` back to.
-        assert_eq!(check_utf8(b"\xed\xa0\x80\xed\xb0\x80", true), Ok(2));
-    }
-
-    #[test]
-    fn check_utf8_reports_the_offending_sequences_position() {
-        assert_eq!(check_utf8(b"ab\x80", true), Err(CheckError { pos: 2 }));
-        assert_eq!(check_utf8(b"ab\xc2", true), Err(CheckError { pos: 2 }));
-        assert_eq!(
-            check_utf8(b"ab\xe0\x80\x80", true),
-            Err(CheckError { pos: 2 })
-        );
-        assert_eq!(
-            check_utf8(b"ab\xf4\x90\x80\x80", true),
-            Err(CheckError { pos: 2 })
-        );
-        assert_eq!(check_utf8(b"ab\xf5", true), Err(CheckError { pos: 2 }));
-        assert_eq!(check_utf8(b"ab\xc1\x81", true), Err(CheckError { pos: 2 }));
     }
 
     #[test]

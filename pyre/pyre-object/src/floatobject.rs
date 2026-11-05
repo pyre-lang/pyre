@@ -228,7 +228,11 @@ mod tests {
     // `malloc_typed` through the managed allocator.
 
     #[test]
-    fn test_w_float_gc_alloc_word_boxes_a_float() {
+    fn float_layout_and_boxing() {
+        assert_eq!(FLOAT_FLOATVAL_OFFSET, 16); // after PyObject { ob_type(8) + w_class(8) }
+        unsafe {
+            assert_eq!(w_float_get_value(box_float_constant(6.25)), 6.25);
+        }
         let obj = w_float_gc_alloc_word(3.25) as PyObjectRef;
         if obj.is_null() {
             return;
@@ -237,18 +241,5 @@ mod tests {
             assert!(is_float(obj));
             assert_eq!(w_float_get_value(obj), 3.25);
         }
-    }
-
-    #[test]
-    fn test_box_float_constant_reads_back() {
-        let obj = box_float_constant(6.25);
-        unsafe {
-            assert_eq!(w_float_get_value(obj), 6.25);
-        }
-    }
-
-    #[test]
-    fn test_float_field_offset() {
-        assert_eq!(FLOAT_FLOATVAL_OFFSET, 16); // after PyObject { ob_type(8) + w_class(8) }
     }
 }

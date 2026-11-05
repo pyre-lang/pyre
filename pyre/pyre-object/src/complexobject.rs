@@ -162,6 +162,8 @@ mod tests {
     /// `W_ComplexObjectUser` carrying `COMPLEX_USER_TYPE`.
     #[test]
     fn complex_subclass_instance_carries_user_typeptr() {
+        assert_eq!(COMPLEX_REAL_OFFSET, 16);
+        assert_eq!(COMPLEX_IMAG_OFFSET, 24);
         let obj = w_complex_subclass_new(1.0, -2.0);
         unsafe {
             assert!(std::ptr::eq(
@@ -171,12 +173,5 @@ mod tests {
             assert!(crate::pyobject::is_complex(obj));
             assert!(!crate::pyobject::is_exact_type(obj, &COMPLEX_TYPE));
         }
-    }
-
-    #[test]
-    fn test_complex_field_offsets() {
-        // after PyObject { ob_type(8) + w_class(8) }
-        assert_eq!(COMPLEX_REAL_OFFSET, 16);
-        assert_eq!(COMPLEX_IMAG_OFFSET, 24);
     }
 }

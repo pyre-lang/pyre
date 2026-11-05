@@ -6011,6 +6011,7 @@ impl MiniMarkGC {
             } else {
                 unsafe { (*header_of(holder_addr)).tid_and_flags }
             };
+            let backtrace = std::backtrace::Backtrace::force_capture();
             panic!(
                 "GC BUG: invalid type_id={} at obj_addr={:#x} \
                  (minor={}, header_addr={:#x}, nursery_start={:#x}, site={}, \
@@ -6024,7 +6025,7 @@ impl MiniMarkGC {
                  holder_tid_and_flags={:#x}, holder_in_remembered={}, \
                  store_sites={:#x}, \
                  enclosing={}, extra_area={}, gc_state={:?}, minors={}, majors={}, \
-                 root_slot={})",
+                 root_slot={})\n{backtrace}",
                 type_id,
                 obj_addr,
                 self.minor_collections,

@@ -593,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn named_escape_rewrite_substitutes_tangut_and_aliases() {
+    fn named_escape_rewrite_substitutes_and_ignores_escaped_backslash() {
         let rewritten =
             rewrite_resolved_named_escapes(r#"x = "\N{TANGUT IDEOGRAPH-17000}""#).unwrap();
         assert!(rewritten.contains(r"\U00017000"), "{rewritten}");
@@ -602,10 +602,6 @@ mod tests {
         assert!(rewritten.contains(r"\U000001A2"), "{rewritten}");
         assert!(rewrite_resolved_named_escapes(r#"x = r"\N{TANGUT IDEOGRAPH-17000}""#).is_none());
         assert!(rewrite_resolved_named_escapes(r#"x = "\N{SNOWMAN}""#).is_some());
-    }
-
-    #[test]
-    fn escaped_backslash_does_not_start_a_named_escape() {
         assert!(rewrite_resolved_named_escapes(r#"x = "\\N{SNOWMAN}""#).is_none());
         let rewritten =
             rewrite_resolved_named_escapes(r#"x = "\N{TANGUT IDEOGRAPH-17000}\\N{SNOWMAN}""#)

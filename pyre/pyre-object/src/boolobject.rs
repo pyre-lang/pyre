@@ -136,42 +136,27 @@ pub unsafe fn bool_descr_xor(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_bool_true() {
-        let obj = w_bool_from(true);
-        unsafe {
-            assert!(is_bool(obj));
-            // bool is a subclass of int, so is_int(bool) is true.
-            assert!(is_int(obj));
-            assert!(w_bool_get_value(obj));
-        }
-    }
-
-    #[test]
-    fn test_bool_false() {
-        let obj = w_bool_from(false);
-        unsafe {
-            assert!(!w_bool_get_value(obj));
-        }
-    }
-
     /// `w_bool_from` returns one of the two prebuilt singletons —
     /// every call with the same value yields the same address.
-    /// pypy/objspace/std/objspace.py:61 installs `space.w_True` /
-    /// `space.w_False` with the same identity invariant.
+    /// `objspace.py` installs `space.w_True` / `space.w_False` with the
+    /// same identity invariant.
     #[test]
-    fn test_bool_singleton_identity() {
-        let a = w_bool_from(true);
-        let b = w_bool_from(true);
-        let c = w_bool_from(false);
-        let d = w_bool_from(false);
-        assert!(std::ptr::eq(a, b), "w_bool_from(true) is not a singleton");
-        assert!(std::ptr::eq(c, d), "w_bool_from(false) is not a singleton");
-        assert!(!std::ptr::eq(a, c));
+    fn bool_from_returns_typed_singletons() {
+        let t = w_bool_from(true);
+        let t2 = w_bool_from(true);
+        let f = w_bool_from(false);
+        let f2 = w_bool_from(false);
         unsafe {
-            let hdr = majit_gc::header::header_of(a as usize);
+            assert!(is_bool(t));
+            assert!(is_int(t));
+            assert!(w_bool_get_value(t));
+            assert!(!w_bool_get_value(f));
+            let hdr = majit_gc::header::header_of(t as usize);
             assert_eq!((*hdr).type_id(), 5);
             assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS));
         }
+        assert!(std::ptr::eq(t, t2), "w_bool_from(true) is not a singleton");
+        assert!(std::ptr::eq(f, f2), "w_bool_from(false) is not a singleton");
+        assert!(!std::ptr::eq(t, f));
     }
 }

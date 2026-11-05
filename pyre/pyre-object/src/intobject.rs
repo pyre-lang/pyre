@@ -638,6 +638,7 @@ mod tests {
 
     #[test]
     fn test_int_create_and_read() {
+        assert_eq!(INT_INTVAL_OFFSET, 16);
         let cases = [("positive", 42_i64), ("negative", -7)];
         for (name, value) in cases {
             let obj = w_int_new(value);
@@ -647,11 +648,6 @@ mod tests {
                 assert_eq!(w_int_get_value(obj), value, "case {name}");
             }
         }
-    }
-
-    #[test]
-    fn test_int_field_offset() {
-        assert_eq!(INT_INTVAL_OFFSET, 16);
     }
 
     #[test]

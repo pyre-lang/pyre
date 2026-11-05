@@ -2204,6 +2204,10 @@ mod tests {
 
     #[test]
     fn test_str_create_and_read() {
+        assert_eq!(UNICODE_VALUE_OFFSET, 16);
+        assert_eq!(UNICODE_BYTE_LEN_OFFSET, 24);
+        assert_eq!(UNICODE_LEN_OFFSET, 32);
+        assert_eq!(UNICODE_INDEX_STORAGE_OFFSET, 40);
         let cases = [("hello", "hello"), ("empty", "")];
         for (name, value) in cases {
             let obj = w_str_new(value);
@@ -2212,6 +2216,17 @@ mod tests {
                 assert!(!is_int(obj), "case {name}");
                 assert_eq!(w_str_get_wtf8(obj), value, "case {name}");
             }
+        }
+        let hello = w_str_new("hello");
+        unsafe {
+            assert_eq!(w_str_len(hello), 5);
+            assert_eq!(w_str_get_wtf8(hello).len(), 5);
+        }
+        let cafe = w_str_new("café");
+        unsafe {
+            let str_obj = cafe as *const W_UnicodeObject;
+            assert_eq!((*str_obj).byte_len, 5); // UTF-8: c(1) a(1) f(1) é(2)
+            assert_eq!((*str_obj).len, 4); // 4 codepoints
         }
     }
 
@@ -2269,33 +2284,6 @@ mod tests {
             intern_str_value("__pyre_intern_once_keeps_table__"),
             interned
         ));
-    }
-
-    #[test]
-    fn test_str_field_offset() {
-        assert_eq!(UNICODE_VALUE_OFFSET, 16);
-        assert_eq!(UNICODE_BYTE_LEN_OFFSET, 24);
-        assert_eq!(UNICODE_LEN_OFFSET, 32);
-        assert_eq!(UNICODE_INDEX_STORAGE_OFFSET, 40);
-    }
-
-    #[test]
-    fn test_str_cached_len_matches_value() {
-        let obj = w_str_new("hello");
-        unsafe {
-            assert_eq!(w_str_len(obj), 5);
-            assert_eq!(w_str_get_wtf8(obj).len(), 5);
-        }
-    }
-
-    #[test]
-    fn test_str_byte_len_vs_char_len() {
-        let obj = w_str_new("café");
-        unsafe {
-            let str_obj = obj as *const W_UnicodeObject;
-            assert_eq!((*str_obj).byte_len, 5); // UTF-8: c(1) a(1) f(1) é(2)
-            assert_eq!((*str_obj).len, 4); // 4 codepoints
-        }
     }
 
     #[test]

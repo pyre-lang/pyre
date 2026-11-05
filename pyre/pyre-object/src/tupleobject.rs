@@ -964,35 +964,21 @@ mod tests {
     }
 
     #[test]
-    fn test_tuple_negative_index() {
-        let items = vec![w_int_new(10), w_int_new(20)];
-        let tup = w_tuple_new(items);
+    fn test_tuple_getitem_specialised_oob_and_jit() {
+        let tup = w_tuple_new(vec![w_int_new(10), w_int_new(20)]);
         unsafe {
-            // Arity-2 int-int specialisation is active.
             assert!(is_specialised_tuple_ii(tup));
             assert!(is_tuple(tup));
-            let item = w_tuple_getitem(tup, -1).unwrap();
-            assert_eq!(crate::intobject::w_int_get_value(item), 20);
-        }
-    }
-
-    #[test]
-    fn test_tuple_out_of_bounds() {
-        let tup = w_tuple_new(vec![w_int_new(1)]);
-        unsafe {
-            assert!(w_tuple_getitem(tup, 5).is_none());
-            assert!(w_tuple_getitem(tup, -5).is_none());
-        }
-    }
-
-    #[test]
-    fn test_jit_tuple_getitem_shares_tuple_semantics() {
-        let tup = w_tuple_new(vec![w_int_new(3), w_int_new(5)]);
-        unsafe {
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_tuple_getitem(tup, -1).unwrap()),
+                20
+            );
             assert_eq!(
                 crate::intobject::w_int_get_value(jit_tuple_getitem(tup, 1)),
-                5
+                20
             );
+            assert!(w_tuple_getitem(tup, 5).is_none());
+            assert!(w_tuple_getitem(tup, -5).is_none());
         }
     }
 
@@ -1060,28 +1046,21 @@ mod tests {
     }
 
     #[test]
-    fn unroll_condition_empty_is_true() {
+    fn unroll_condition_empty_and_specialised() {
         // `rlib/jit.py loop_unrolling_heuristic`: size == 0 is always true.
-        let empty = w_tuple_new(vec![]);
-        assert!(unroll_condition(empty));
-        let one = w_tuple_new(vec![crate::intobject::w_int_new(1)]);
         // Residual `isconstant` is false, so a non-empty tuple does not unroll.
-        assert!(!unroll_condition(one));
-    }
-
-    #[test]
-    fn unroll_condition_specialised_passes_self() {
-        // `Cls_ii._unroll_condition` passes `self`. Residual `isconstant`
-        // is false, so the constant `typelen` still does not unroll here.
-        let tup = w_specialised_tuple_ii_new(1, 2);
-        assert!(!unroll_condition(tup));
-        let ff = w_specialised_tuple_ff_new(1.0, 2.0);
-        assert!(!unroll_condition(ff));
-        let oo = w_specialised_tuple_oo_new(
+        // `Cls_ii._unroll_condition` passes `self`; the constant `typelen`
+        // still does not unroll here.
+        assert!(unroll_condition(w_tuple_new(vec![])));
+        assert!(!unroll_condition(w_tuple_new(vec![
+            crate::intobject::w_int_new(1)
+        ])));
+        assert!(!unroll_condition(w_specialised_tuple_ii_new(1, 2)));
+        assert!(!unroll_condition(w_specialised_tuple_ff_new(1.0, 2.0)));
+        assert!(!unroll_condition(w_specialised_tuple_oo_new(
             crate::intobject::w_int_new(1),
             crate::intobject::w_int_new(2),
-        );
-        assert!(!unroll_condition(oo));
+        )));
     }
 
     #[test]
@@ -1145,24 +1124,16 @@ mod tests {
     }
 
     #[test]
-    fn test_arity2_mixed_falls_through_to_specialised_oo() {
-        let tup = w_tuple_new(vec![w_int_new(7), crate::floatobject::w_float_new(2.0)]);
-        unsafe {
-            assert!(is_specialised_tuple_oo(tup));
-            assert!(is_tuple(tup));
-            assert_eq!(w_tuple_len(tup), 2);
-        }
-    }
-
-    #[test]
-    fn test_arity_other_uses_array_backing() {
+    fn test_arity2_mixed_and_other_arities() {
+        let mixed = w_tuple_new(vec![w_int_new(7), crate::floatobject::w_float_new(2.0)]);
         let tup0 = w_tuple_new(vec![]);
         let tup1 = w_tuple_new(vec![w_int_new(1)]);
         let tup3 = w_tuple_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
         unsafe {
-            assert!(is_tuple(tup0));
-            assert!(is_tuple(tup1));
-            assert!(is_tuple(tup3));
+            assert!(is_specialised_tuple_oo(mixed));
+            assert!(is_tuple(mixed));
+            assert_eq!(w_tuple_len(mixed), 2);
+            assert!(is_tuple(tup0) && is_tuple(tup1) && is_tuple(tup3));
             assert!(!is_specialised_tuple_ii(tup0));
             assert!(!is_specialised_tuple_ii(tup1));
             assert!(!is_specialised_tuple_ii(tup3));
@@ -1208,27 +1179,21 @@ mod tests {
     /// rejects the int-int specialisation (per `is_plain_int1`'s
     /// `_fits_int()` check) and must fall through to `Cls_oo`.
     #[test]
-    fn test_arity2_overflow_long_falls_through_to_oo() {
+    fn test_arity2_overflow_long_and_bool_fall_through_to_oo() {
+        use crate::boolobject::w_bool_from;
         use crate::longobject::w_long_new;
         use majit_rlib::rbigint::RBigInt as BigInt;
+        // A `W_LongObject` that does not fit a machine int rejects
+        // `is_plain_int1`. `bool` is a subclass of `int` but
+        // `type(w) is W_IntObject` still rejects it.
         let huge = BigInt::from(i64::MAX) * BigInt::from(2);
-        let tup = w_tuple_new(vec![w_long_new(huge), w_int_new(0)]);
+        let overflow = w_tuple_new(vec![w_long_new(huge), w_int_new(0)]);
+        let bools = w_tuple_new(vec![w_bool_from(true), w_bool_from(false)]);
         unsafe {
-            assert!(is_specialised_tuple_oo(tup));
-            assert!(!is_specialised_tuple_ii(tup));
-        }
-    }
-
-    /// `bool` is a subclass of `int` but `is_plain_int1` rejects it
-    /// (`type(w) is W_IntObject`). A `(True, False)` pair therefore
-    /// falls through to `Cls_oo`, not `Cls_ii`.
-    #[test]
-    fn test_arity2_bool_pair_falls_through_to_oo() {
-        use crate::boolobject::w_bool_from;
-        let tup = w_tuple_new(vec![w_bool_from(true), w_bool_from(false)]);
-        unsafe {
-            assert!(is_specialised_tuple_oo(tup));
-            assert!(!is_specialised_tuple_ii(tup));
+            assert!(is_specialised_tuple_oo(overflow));
+            assert!(!is_specialised_tuple_ii(overflow));
+            assert!(is_specialised_tuple_oo(bools));
+            assert!(!is_specialised_tuple_ii(bools));
         }
     }
 }

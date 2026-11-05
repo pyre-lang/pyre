@@ -2121,174 +2121,126 @@ pub(crate) fn format_too_many_method(
 mod tests {
     use super::*;
 
-    /// pypy/interpreter/argument.py — `w_function is None` arm.
+    /// `argument.py raise_type_error`: `w_function is None` vs the
+    /// function-prefixed arm (scalar fallback through `object_functionstr`).
     #[test]
-    fn raise_type_error_no_function() {
+    fn raise_type_error_with_and_without_function() {
         let err = raise_type_error!(pyre_object::PY_NULL, "boom", &[]);
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
         assert_eq!(err.message_text(), "boom");
-    }
 
-    /// pypy/interpreter/argument.py:16-17 — function-prefixed arm.
-    /// With an int as `w_function` the prefix falls back to `str(int) ()`
-    /// per `object_functionstr`'s scalar fallback path.  The fallback
-    /// invokes `space.str(w_int)` which dispatches to `int.__str__`
-    /// via type-MRO `lookup`; that lookup needs `init_typeobjects()`
-    /// to have populated the W_TypeObject MRO.
-    #[test]
-    fn raise_type_error_with_function() {
         crate::typedef::init_typeobjects();
         let func = pyre_object::w_int_new(7);
         let err = raise_type_error!(func, "needs an iterable", &[]);
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
-        // object_functionstr scalar fallback returns the str() of the
-        // value, here "7"; raise_type_error joins it with the message.
         assert_eq!(err.message_text(), "7 needs an iterable");
     }
 
-    /// pypy/interpreter/argument.py getmsg single-missing positional case.
+    /// `argument.py ArgErr.getmsg` branches: missing, multiple, unknown,
+    /// pos-only-as-kw, too-many, and the method self-hint.
     #[test]
-    fn arg_err_missing_one_positional() {
-        let err = ArgErr::Missing {
-            missing: vec!["x".to_string()],
-            positional: true,
-        };
-        assert_eq!(err.getmsg(), "missing 1 required positional argument: 'x'",);
-    }
-
-    /// pypy/interpreter/argument.py:540-541 — 2-missing uses ` and `.
-    #[test]
-    fn arg_err_missing_two_keyword_only() {
-        let err = ArgErr::Missing {
-            missing: vec!["a".to_string(), "b".to_string()],
-            positional: false,
-        };
+    fn arg_err_getmsg_branches() {
         assert_eq!(
-            err.getmsg(),
+            ArgErr::Missing {
+                missing: vec!["x".to_string()],
+                positional: true,
+            }
+            .getmsg(),
+            "missing 1 required positional argument: 'x'",
+        );
+        assert_eq!(
+            ArgErr::Missing {
+                missing: vec!["a".to_string(), "b".to_string()],
+                positional: false,
+            }
+            .getmsg(),
             "missing 2 required keyword-only arguments: 'a' and 'b'",
         );
-    }
-
-    /// pypy/interpreter/argument.py — 3-or-more uses `, and `.
-    #[test]
-    fn arg_err_missing_three_with_oxford_comma() {
-        let err = ArgErr::Missing {
-            missing: vec!["a".to_string(), "b".to_string(), "c".to_string()],
-            positional: true,
-        };
         assert_eq!(
-            err.getmsg(),
+            ArgErr::Missing {
+                missing: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                positional: true,
+            }
+            .getmsg(),
             "missing 3 required positional arguments: 'a', 'b', and 'c'",
         );
-    }
-
-    /// pypy/interpreter/argument.py `ArgErrMultipleValues`.
-    #[test]
-    fn arg_err_multiple_values() {
-        let err = ArgErr::MultipleValues {
-            argname: "kwarg".to_string(),
-        };
-        assert_eq!(err.getmsg(), "got multiple values for argument 'kwarg'");
-    }
-
-    /// pypy/interpreter/argument.py `ArgErrUnknownKwds`
-    /// — single-name vs multi-count branches.
-    #[test]
-    fn arg_err_unknown_kwds_branches() {
-        let one = ArgErr::UnknownKwds {
-            num_kwds: 1,
-            kwd_name: Wtf8Buf::from("wibble"),
-        };
-        assert_eq!(one.getmsg(), "got an unexpected keyword argument 'wibble'");
-        let many = ArgErr::UnknownKwds {
-            num_kwds: 3,
-            kwd_name: Wtf8Buf::new(),
-        };
-        assert_eq!(many.getmsg(), "got 3 unexpected keyword arguments");
-    }
-
-    /// pypy/interpreter/argument.py `ArgErrPosonlyAsKwds.getmsg` —
-    /// always the plural wording, regardless of `posonly_kwds` length.
-    /// CPython's `positional_only_passed_as_keyword` (Python/ceval.c) has
-    /// no singular form either.
-    #[test]
-    fn arg_err_posonly_as_kwds_always_plural() {
-        let one = ArgErr::PosonlyAsKwds {
-            posonly_kwds: vec!["a".to_string()],
-        };
         assert_eq!(
-            one.getmsg(),
+            ArgErr::MultipleValues {
+                argname: "kwarg".to_string(),
+            }
+            .getmsg(),
+            "got multiple values for argument 'kwarg'"
+        );
+        assert_eq!(
+            ArgErr::UnknownKwds {
+                num_kwds: 1,
+                kwd_name: Wtf8Buf::from("wibble"),
+            }
+            .getmsg(),
+            "got an unexpected keyword argument 'wibble'"
+        );
+        assert_eq!(
+            ArgErr::UnknownKwds {
+                num_kwds: 3,
+                kwd_name: Wtf8Buf::new(),
+            }
+            .getmsg(),
+            "got 3 unexpected keyword arguments"
+        );
+        // Always the plural wording, regardless of `posonly_kwds` length.
+        assert_eq!(
+            ArgErr::PosonlyAsKwds {
+                posonly_kwds: vec!["a".to_string()],
+            }
+            .getmsg(),
             "got some positional-only arguments passed as keyword arguments: 'a'",
         );
-        let many = ArgErr::PosonlyAsKwds {
-            posonly_kwds: vec!["x".to_string(), "y".to_string()],
-        };
         assert_eq!(
-            many.getmsg(),
+            ArgErr::PosonlyAsKwds {
+                posonly_kwds: vec!["x".to_string(), "y".to_string()],
+            }
+            .getmsg(),
             "got some positional-only arguments passed as keyword arguments: 'x, y'",
         );
-    }
 
-    /// pypy/interpreter/argument.py `ArgErrTooMany.getmsg` —
-    /// no defaults, single-arg singular path.
-    #[test]
-    fn arg_err_too_many_no_defaults_singular() {
-        let sig = crate::gateway::Signature::new(vec!["x"], None, None, 0, 0);
-        let err = ArgErr::TooMany {
-            signature: sig,
+        let too_many = ArgErr::TooMany {
+            signature: crate::gateway::Signature::new(vec!["x"], None, None, 0, 0),
             num_defaults: 0,
             given: 2,
             kwonly_given: 0,
         };
-        assert_eq!(err.getmsg(), "takes 1 positional argument but 2 were given");
-    }
-
-    /// pypy/interpreter/argument.py:565-567 — defaults branch produces
-    /// "from X to Y positional arguments".
-    #[test]
-    fn arg_err_too_many_with_defaults() {
-        let sig = crate::gateway::Signature::new(vec!["a", "b", "c"], None, None, 0, 0);
-        let err = ArgErr::TooMany {
-            signature: sig,
+        assert_eq!(
+            too_many.getmsg(),
+            "takes 1 positional argument but 2 were given"
+        );
+        let with_defaults = ArgErr::TooMany {
+            signature: crate::gateway::Signature::new(vec!["a", "b", "c"], None, None, 0, 0),
             num_defaults: 1,
             given: 4,
             kwonly_given: 0,
         };
         assert_eq!(
-            err.getmsg(),
+            with_defaults.getmsg(),
             "takes from 2 to 3 positional arguments but 4 were given",
         );
-    }
 
-    /// pypy/interpreter/argument.py `ArgErrTooManyMethod`
-    /// appends self-hint when shape matches and argnames[0] != "self".
-    #[test]
-    fn arg_err_too_many_method_self_hint_appended() {
-        let sig = crate::gateway::Signature::new(vec!["x"], None, None, 0, 0);
-        let err = ArgErr::TooManyMethod {
-            signature: sig,
+        let hinted = ArgErr::TooManyMethod {
+            signature: crate::gateway::Signature::new(vec!["x"], None, None, 0, 0),
             num_defaults: 0,
             given: 2,
             kwonly_given: 0,
-        };
-        let msg = err.getmsg();
-        assert!(msg.starts_with("takes 1 positional argument but 2 were given"));
-        assert!(msg.contains("Did you forget 'self'"));
-    }
-
-    /// pypy/interpreter/argument.py:592-593 — when argnames[0] == "self"
-    /// the hint is suppressed.
-    #[test]
-    fn arg_err_too_many_method_self_hint_suppressed() {
-        let sig = crate::gateway::Signature::new(vec!["self", "x"], None, None, 0, 0);
-        let err = ArgErr::TooManyMethod {
-            signature: sig,
+        }
+        .getmsg();
+        assert!(hinted.starts_with("takes 1 positional argument but 2 were given"));
+        assert!(hinted.contains("Did you forget 'self'"));
+        let suppressed = ArgErr::TooManyMethod {
+            signature: crate::gateway::Signature::new(vec!["self", "x"], None, None, 0, 0),
             num_defaults: 0,
             given: 3,
             kwonly_given: 0,
-        };
-        let msg = err.getmsg();
-        assert!(!msg.contains("Did you forget"));
+        }
+        .getmsg();
+        assert!(!suppressed.contains("Did you forget"));
     }
 
     /// pypy/interpreter/argument.py `contains_w_names` —
@@ -2319,28 +2271,27 @@ mod tests {
         assert!(err.message_text().contains("got multiple values"));
     }
 
-    /// pypy/interpreter/argument.py `_check_not_duplicate_kwargs` —
-    /// raises TypeError on overlap.
+    /// `_check_not_duplicate_kwargs`: overlap raises TypeError; disjoint passes.
     #[test]
-    fn check_not_duplicate_kwargs_raises_on_overlap() {
-        let existing = vec![pyre_object::w_str_new("a")];
-        let new = vec![pyre_object::w_str_new("a")];
+    fn check_not_duplicate_kwargs_overlap_and_disjoint() {
         let values: Vec<PyObjectRef> = vec![pyre_object::w_int_new(1)];
-        let err = check_not_duplicate_kwargs(&existing, &new, &values, pyre_object::PY_NULL)
-            .expect_err("should raise TypeError on duplicate");
+        let err = check_not_duplicate_kwargs(
+            &[pyre_object::w_str_new("a")],
+            &[pyre_object::w_str_new("a")],
+            &values,
+            pyre_object::PY_NULL,
+        )
+        .expect_err("should raise TypeError on duplicate");
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
         assert!(err.message_text().contains("got multiple values"));
         assert!(err.message_text().contains("'a'"));
-    }
-
-    /// `check_not_duplicate_kwargs` accepts disjoint name sets.
-    #[test]
-    fn check_not_duplicate_kwargs_disjoint_ok() {
-        let existing = vec![pyre_object::w_str_new("a")];
-        let new = vec![pyre_object::w_str_new("b")];
-        let values: Vec<PyObjectRef> = vec![pyre_object::w_int_new(1)];
-        check_not_duplicate_kwargs(&existing, &new, &values, pyre_object::PY_NULL)
-            .expect("disjoint names should pass");
+        check_not_duplicate_kwargs(
+            &[pyre_object::w_str_new("a")],
+            &[pyre_object::w_str_new("b")],
+            &values,
+            pyre_object::PY_NULL,
+        )
+        .expect("disjoint names should pass");
     }
 
     /// pypy/interpreter/argument.py `_combine_starargs_wrapped`:
@@ -2813,22 +2764,18 @@ mod tests {
     }
 
     /// argument.py `__init__`: `_jit_few_keywords` is true when
-    /// `keyword_names_w is None`.
+    /// `keyword_names_w is None`. When the list is present it is
+    /// `jit.isconstant(len(keyword_names_w))`; residual `isconstant` is
+    /// false, so a present names list is not "few" until a trace sees a
+    /// constant length.
     #[test]
-    fn jit_few_keywords_true_without_names() {
+    fn jit_few_keywords_follows_keyword_names_presence() {
         let pos = [pyre_object::w_int_new(1)];
         let arguments = Arguments::positional_only(&pos);
         assert!(arguments.jit_few_keywords);
         let replaced = arguments.replace_arguments(vec![pyre_object::w_int_new(2)]);
         assert!(replaced.jit_few_keywords);
-    }
 
-    /// argument.py `__init__`: `_jit_few_keywords` is
-    /// `jit.isconstant(len(keyword_names_w))` when the list is present.
-    /// Residual `isconstant` is false, so a present names list is not
-    /// "few" until a trace sees a constant length.
-    #[test]
-    fn jit_few_keywords_false_for_present_names_at_interp() {
         let pos: [PyObjectRef; 0] = [];
         let names = [pyre_object::w_str_new("k")];
         let values = [pyre_object::w_int_new(1)];
