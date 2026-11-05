@@ -552,17 +552,13 @@ pub fn resolve(index: u32) -> GcRef {
 /// `intern` records one slot per referent. A root walk that has already
 /// read `ConstPtr.value` uses this to name that slot without recomputing
 /// `gc_id_or_identityhash` (a stale nursery address must not be hashed).
+/// Looks the address up in `by_addr`, the current-address index.
 pub fn index_of_current(addr: GcRef) -> Option<u32> {
     if addr.is_null() {
         return None;
     }
     let guard = table();
-    guard
-        .slots
-        .iter()
-        .position(|slot| slot.0 == addr.0)
-        .map(|idx| idx as u32)
-        .filter(|idx| *idx != 0)
+    find_by_addr(&guard, addr.0).filter(|idx| *idx != 0)
 }
 
 /// Forward every non-null slot. Nested walk (a visitor that collects)
@@ -891,6 +887,23 @@ mod tests {
         assert_eq!(resolve(i), a);
         let b = GcRef(0x2222_0000);
         assert_ne!(intern(b), i);
+    }
+
+    #[test]
+    fn index_of_current_finds_interned_addresses_and_follows_a_move() {
+        let _serial = TEST_SERIAL.lock();
+        let a = GcRef(0x6E6E_0000);
+        let b = GcRef(0x6E6E_1000);
+        let ia = intern(a);
+        let ib = intern(b);
+        assert_eq!(index_of_current(a), Some(ia));
+        assert_eq!(index_of_current(b), Some(ib));
+        assert_eq!(index_of_current(GcRef(0x6E6E_2000)), None);
+        assert_eq!(index_of_current(GcRef::NULL), None);
+        let moved = GcRef(0x6E6E_0080);
+        set_slot(ia, moved);
+        assert_eq!(index_of_current(moved), Some(ia));
+        assert_eq!(index_of_current(a), None);
     }
 
     #[test]
