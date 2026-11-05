@@ -1,4 +1,8 @@
 use super::simplify_lowered_graph_expanding;
+use crate::front::mir::operation::gc_ptr_to_signed;
+use crate::front::mir::tests::{field_keys, size_parent};
+use crate::front::mir::tuple_field_value_type;
+use crate::front::mir::value_type_is_gc_ptr;
 
 use super::harden_duplicate_leaf_metadata;
 
@@ -81,6 +85,7 @@ fn simplify_lowered_graph(
         sweep_dead_vars,
         guard_words,
         &|_, _| None,
+        &std::collections::HashMap::new(),
     )
     .expect("inline-struct expansion is off");
 }
@@ -197,6 +202,7 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
             &jitdriver_receiver_roots,
             &context.struct_field_attrs,
             &struct_fields,
+            Default::default(),
             &context.dont_look_inside,
             &context.tombstoned_leaves,
             &context.gc_struct_ids,
@@ -208,6 +214,8 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
             None,
             true,
             None,
+            None,
+            &context.func_hints,
         )
         .unwrap_or_else(|err| panic!("lower substituted {name_path}: {err:?}"));
 
@@ -565,6 +573,7 @@ fn result_branch_match_uses_int_payloads_from_the_type_decls() {
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
             &std::collections::HashSet::<String>::new(),
         ),
+        ..Default::default()
     };
     assert_eq!(payloads.ok, Some(ValueType::Int));
     assert_eq!(payloads.err, Some(ValueType::Unsigned));
@@ -575,6 +584,559 @@ fn result_branch_match_uses_int_payloads_from_the_type_decls() {
     let (reads, writes) = payload_field_tys(&graph);
     assert_eq!(reads, vec![ValueType::Int, ValueType::Unsigned]);
     assert_eq!(writes, vec![ValueType::Int, ValueType::Unsigned]);
+}
+
+#[test]
+fn charon_never_value_wrapper_renders_as_never_type() {
+    let llbc = result_flow_llbc();
+    let never = serde_json::json!({"Value": [7, "Never"]});
+    assert_eq!(
+        super::charon_type_value_to_ast_string(&never, &llbc, 0),
+        "Never"
+    );
+}
+
+#[test]
+fn result_branch_break_pos0_uses_ensured_variant_struct_id() {
+    use crate::codewriter::call::StructLayoutTable;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let llbc = result_flow_llbc();
+    let result_ty = branch_adt_ty(0, &[i64_ty.clone(), u8_ty.clone()]);
+    let flow_ty = branch_adt_ty(1, &[u8_ty, i64_ty]);
+    let tombstoned = std::collections::HashSet::new();
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw = std::collections::HashSet::<String>::new();
+    let layouts: StructLayoutTable = Rc::new(RefCell::new(HashMap::new()));
+    let continue_vsid = super::stamp_enum_variant_instance_layout(
+        &llbc,
+        &flow_ty,
+        "Continue",
+        &tombstoned,
+        &gc,
+        &raw,
+        &layouts,
+    )
+    .expect("Continue instance");
+    let break_vsid = super::stamp_enum_variant_instance_layout(
+        &llbc,
+        &flow_ty,
+        "Break",
+        &tombstoned,
+        &gc,
+        &raw,
+        &layouts,
+    )
+    .expect("Break instance");
+    let ok_vsid = super::stamp_enum_variant_instance_layout(
+        &llbc,
+        &result_ty,
+        "Ok",
+        &tombstoned,
+        &gc,
+        &raw,
+        &layouts,
+    )
+    .expect("Ok instance");
+    let err_vsid = super::stamp_enum_variant_instance_layout(
+        &llbc,
+        &result_ty,
+        "Err",
+        &tombstoned,
+        &gc,
+        &raw,
+        &layouts,
+    )
+    .expect("Err instance");
+    let row = |vsid: majit_ir::descr::StructId| {
+        let table = layouts.borrow();
+        let layout = table.get(&vsid).expect("ensured layout");
+        layout
+            .fields
+            .iter()
+            .map(|field| (field.name.clone(), field.offset))
+            .collect::<Vec<_>>()
+    };
+    let continue_row = row(continue_vsid);
+    let break_row = row(break_vsid);
+    assert_eq!(continue_row[0], ("__discriminant".to_string(), 0));
+    assert!(
+        continue_row
+            .iter()
+            .any(|(name, off)| name == "__pos_0" && *off > 0),
+        "Continue layout {continue_row:?}"
+    );
+    assert_eq!(break_row[0], ("__discriminant".to_string(), 0));
+    assert!(
+        break_row
+            .iter()
+            .any(|(name, off)| name == "__pos_0" && *off > 0),
+        "Break layout {break_row:?}"
+    );
+    let payloads = crate::model::ResultBranchPayloads {
+        ok: super::adt_variant_payload_type(&result_ty, "Ok", &llbc, &tombstoned, &gc, &raw),
+        err: super::adt_variant_payload_type(&result_ty, "Err", &llbc, &tombstoned, &gc, &raw),
+        continue_ty: super::adt_variant_payload_type(
+            &flow_ty,
+            "Continue",
+            &llbc,
+            &tombstoned,
+            &gc,
+            &raw,
+        ),
+        break_ty: super::adt_variant_payload_type(&flow_ty, "Break", &llbc, &tombstoned, &gc, &raw),
+        continue_vsid: Some(continue_vsid),
+        break_vsid: Some(break_vsid),
+        ok_vsid: Some(ok_vsid),
+        err_vsid: Some(err_vsid),
+    };
+    let mut graph = branch_graph(payloads);
+    super::lower_result_branch_to_control_flow(&mut graph);
+    let mut break_pos0 = None;
+    let mut continue_pos0 = None;
+    for op in graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+    {
+        if let OpKind::FieldWrite { field, .. } = &op.kind
+            && field.name == "__pos_0"
+        {
+            let owner = field.owner_root.as_deref().unwrap_or("");
+            if owner.ends_with("::Break") {
+                break_pos0 = field.owner_id;
+            } else if owner.ends_with("::Continue") {
+                continue_pos0 = field.owner_id;
+            }
+        }
+    }
+    assert_eq!(break_pos0, Some(break_vsid));
+    assert_eq!(continue_pos0, Some(continue_vsid));
+}
+
+fn vec_payload_flow_llbc() -> Llbc {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|seg| serde_json::json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        })
+    };
+    let enum_decl = |def_id: u64, path: &[&str], variants: &[(&str, u64, u64)]| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": meta(path),
+            "kind": {"Enum": variants.iter().map(|(name, disc, tvar)| serde_json::json!({
+                "name": name,
+                "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, tvar]}}}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", disc.to_string()]}}
+            })).collect::<Vec<_>>()},
+            "layout": []
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                enum_decl(0, &["core", "result", "Result"], &[("Ok", 0, 0), ("Err", 1, 1)]),
+                enum_decl(1, &["core", "ops", "control_flow", "ControlFlow"], &[("Continue", 0, 1), ("Break", 1, 0)]),
+                {
+                    "def_id": 2,
+                    "item_meta": meta(&["alloc", "vec", "Vec"]),
+                    "kind": "Opaque",
+                    "layout": []
+                },
+            ],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("vec payload llbc")
+}
+
+fn vec_u8_adt() -> serde_json::Value {
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    serde_json::json!({
+        "Adt": {
+            "id": 2,
+            "generics": {"regions": [], "types": [u8_ty], "const_generics": [], "trait_refs": []}
+        }
+    })
+}
+
+#[test]
+fn enum_variant_vec_u8_payload_gets_two_field_layout_and_owner_id() {
+    use crate::codewriter::call::StructLayoutTable;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    assert!(
+        super::enum_variant_row_occupies_storage("Vec<u8>"),
+        "Vec<u8> occupying predicate"
+    );
+    let word = crate::layout::target_word_size() as u64;
+    let rows = [
+        ("__discriminant".to_string(), "i64".to_string()),
+        ("__pos_0".to_string(), "Vec<u8>".to_string()),
+    ];
+    let mut exact = HashMap::new();
+    exact.insert("__discriminant".to_string(), 0);
+    exact.insert("__pos_0".to_string(), 8);
+    let heuristic = crate::layout::struct_layout_from_rows_and_exact(
+        &rows,
+        &exact,
+        Some(8 + 3 * word),
+        &std::collections::HashSet::new(),
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+        &std::collections::HashSet::new(),
+    );
+    assert!(
+        heuristic
+            .fields
+            .iter()
+            .any(|field| field.name == "__pos_0" && field.offset > 0),
+        "from_type_strings/apply_exact drops Vec: {:?}",
+        heuristic
+            .fields
+            .iter()
+            .map(|field| (field.name.clone(), field.offset, field.size))
+            .collect::<Vec<_>>()
+    );
+
+    let i32_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I32"}}});
+    let never = serde_json::json!({"Value": [7, "Never"]});
+    let llbc = vec_payload_flow_llbc();
+    let result_ty = branch_adt_ty(0, &[vec_u8_adt(), i32_ty.clone()]);
+    let residual = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [never, i32_ty],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let flow_ty = branch_adt_ty(1, &[residual, vec_u8_adt()]);
+    let tombstoned = std::collections::HashSet::new();
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw = std::collections::HashSet::<String>::new();
+    let layouts: StructLayoutTable = Rc::new(RefCell::new(HashMap::new()));
+    let ok_vsid = super::stamp_enum_variant_instance_layout(
+        &llbc,
+        &result_ty,
+        "Ok",
+        &tombstoned,
+        &gc,
+        &raw,
+        &layouts,
+    )
+    .expect("Ok instance");
+    let continue_vsid = super::stamp_enum_variant_instance_layout(
+        &llbc,
+        &flow_ty,
+        "Continue",
+        &tombstoned,
+        &gc,
+        &raw,
+        &layouts,
+    )
+    .expect("Continue instance");
+    let row = |vsid: majit_ir::descr::StructId| {
+        let table = layouts.borrow();
+        let layout = table.get(&vsid).expect("ensured layout");
+        layout
+            .fields
+            .iter()
+            .map(|field| (field.name.clone(), field.offset))
+            .collect::<Vec<_>>()
+    };
+    let ok_row = row(ok_vsid);
+    assert_eq!(ok_row[0], ("__discriminant".to_string(), 0));
+    assert!(
+        ok_row
+            .iter()
+            .any(|(name, off)| name == "__pos_0" && *off > 0),
+        "Result<Vec<u8>, i32>::Ok layout {ok_row:?}"
+    );
+    let continue_row = row(continue_vsid);
+    assert_eq!(continue_row[0], ("__discriminant".to_string(), 0));
+    assert!(
+        continue_row
+            .iter()
+            .any(|(name, off)| name == "__pos_0" && *off > 0),
+        "ControlFlow Continue Vec<u8> layout {continue_row:?}"
+    );
+
+    let payloads = crate::model::ResultBranchPayloads {
+        ok: super::adt_variant_payload_type(&result_ty, "Ok", &llbc, &tombstoned, &gc, &raw),
+        err: super::adt_variant_payload_type(&result_ty, "Err", &llbc, &tombstoned, &gc, &raw),
+        continue_ty: super::adt_variant_payload_type(
+            &flow_ty,
+            "Continue",
+            &llbc,
+            &tombstoned,
+            &gc,
+            &raw,
+        ),
+        break_ty: super::adt_variant_payload_type(&flow_ty, "Break", &llbc, &tombstoned, &gc, &raw),
+        continue_vsid: Some(continue_vsid),
+        break_vsid: None,
+        ok_vsid: Some(ok_vsid),
+        err_vsid: None,
+    };
+    let mut graph = branch_graph(payloads);
+    super::lower_result_branch_to_control_flow(&mut graph);
+    let mut continue_pos0 = None;
+    let mut ok_pos0 = None;
+    for op in graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+    {
+        if let OpKind::FieldWrite { field, .. } | OpKind::FieldRead { field, .. } = &op.kind
+            && field.name == "__pos_0"
+        {
+            let owner = field.owner_root.as_deref().unwrap_or("");
+            if owner.ends_with("::Continue") {
+                continue_pos0 = field.owner_id;
+            } else if owner.ends_with("::Ok") {
+                ok_pos0 = field.owner_id;
+            }
+        }
+    }
+    assert_eq!(continue_pos0, Some(continue_vsid));
+    assert_eq!(ok_pos0, Some(ok_vsid));
+
+    let cc = crate::codewriter::call::CallControl::with_struct_layouts(layouts.clone());
+    let ok_parent = size_parent(
+        &cc,
+        "__pos_0",
+        "core::result::Result<Vec<u8>,i32>::Ok",
+        ok_vsid,
+    );
+    let continue_parent = size_parent(
+        &cc,
+        "__pos_0",
+        "core::ops::control_flow::ControlFlow<Result<!,i32>,Vec<u8>>::Continue",
+        continue_vsid,
+    );
+    let ok_keys = field_keys(&ok_parent);
+    assert_eq!(ok_keys.first().map(String::as_str), Some("__discriminant"));
+    assert!(
+        ok_parent
+            .all_fielddescrs
+            .iter()
+            .any(|field| field.field_key() == "__pos_0" && field.offset > 0),
+        "Result<Vec<u8>,i32>::Ok SizeSpec {ok_keys:?}"
+    );
+    assert!(
+        ok_parent
+            .all_fielddescrs
+            .iter()
+            .all(|field| field.offset + field.field_size <= ok_parent.size),
+        "Result Ok SizeSpec size {} does not cover {:?}",
+        ok_parent.size,
+        ok_parent
+            .all_fielddescrs
+            .iter()
+            .map(|field| (field.field_key(), field.offset, field.field_size))
+            .collect::<Vec<_>>()
+    );
+    let continue_keys = field_keys(&continue_parent);
+    assert_eq!(
+        continue_keys.first().map(String::as_str),
+        Some("__discriminant")
+    );
+    assert!(
+        continue_parent
+            .all_fielddescrs
+            .iter()
+            .any(|field| field.field_key() == "__pos_0" && field.offset > 0),
+        "ControlFlow Continue Vec<u8> SizeSpec {continue_keys:?}"
+    );
+    assert!(
+        continue_parent
+            .all_fielddescrs
+            .iter()
+            .all(|field| field.offset + field.field_size <= continue_parent.size),
+        "Continue SizeSpec size {} does not cover {:?}",
+        continue_parent.size,
+        continue_parent
+            .all_fielddescrs
+            .iter()
+            .map(|field| (field.field_key(), field.offset, field.field_size))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn ensure_enum_variant_instance_layout_skips_unsplit_payload() {
+    use crate::codewriter::call::StructLayoutTable;
+    use majit_charon_reader::ullbc::TypeDeclKind;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    let llbc = llbc_with_types("fixture", vec![option_enum(0)], vec![]);
+    let td = llbc.type_by_id(0).expect("Option");
+    let TypeDeclKind::Enum(variants) = &td.kind else {
+        panic!("Option is an enum");
+    };
+    let none_idx = variants
+        .iter()
+        .position(|variant| variant.name == "None")
+        .expect("None");
+    let some_idx = variants
+        .iter()
+        .position(|variant| variant.name == "Some")
+        .expect("Some");
+    let tombstoned = std::collections::HashSet::new();
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw = std::collections::HashSet::<String>::new();
+    let layouts: StructLayoutTable = Rc::new(RefCell::new(HashMap::new()));
+    let some_tmpl = majit_ir::descr::StructId::from_canonical("core::option::Option::Some");
+    let none_tmpl = majit_ir::descr::StructId::from_canonical("core::option::Option::None");
+    // Unbound TraitType projection (`resolve_trait_assoc_type` has no impl).
+    let unresolved_node = option_adt_node(
+        0,
+        serde_json::json!({
+            "TraitType": [
+                { "trait_decl_ref": { "skip_binder": { "id": 1 } } },
+                0,
+                { "regions": [], "types": [], "const_generics": [], "trait_refs": [] }
+            ]
+        }),
+    );
+    // Concrete Void payload: `()` is a known type (`get_size_descr` cache[STRUCT]).
+    let unit_node = option_adt_node(0, serde_json::json!({"Tuple": []}));
+    let i64_node = option_adt_node(0, option_int_arg(true));
+    let unresolved_adt = unresolved_node
+        .get("Adt")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .expect("unresolved Adt");
+    let unit_adt = unit_node
+        .get("Adt")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .expect("unit Adt");
+    let i64_adt = i64_node
+        .get("Adt")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .expect("i64 Adt");
+    let unresolved_args = super::render_adt_type_args(&unresolved_adt, &llbc, 0, &tombstoned);
+    let unit_args = super::render_adt_type_args(&unit_adt, &llbc, 0, &tombstoned);
+    let i64_args = super::render_adt_type_args(&i64_adt, &llbc, 0, &tombstoned);
+    let unresolved_some =
+        super::concrete_adt_struct_id(some_tmpl, Some(&unresolved_adt), &llbc, &tombstoned);
+    let unresolved_none =
+        super::concrete_adt_struct_id(none_tmpl, Some(&unresolved_adt), &llbc, &tombstoned);
+    let unit_some = super::concrete_adt_struct_id(some_tmpl, Some(&unit_adt), &llbc, &tombstoned);
+    let concrete_some =
+        super::concrete_adt_struct_id(some_tmpl, Some(&i64_adt), &llbc, &tombstoned);
+    super::ensure_enum_variant_instance_layout(
+        &llbc,
+        td,
+        some_idx,
+        &unresolved_args,
+        Some(&unresolved_adt),
+        unresolved_some,
+        &tombstoned,
+        &gc,
+        &raw,
+        &layouts,
+    );
+    super::ensure_enum_variant_instance_layout(
+        &llbc,
+        td,
+        none_idx,
+        &unresolved_args,
+        Some(&unresolved_adt),
+        unresolved_none,
+        &tombstoned,
+        &gc,
+        &raw,
+        &layouts,
+    );
+    super::ensure_enum_variant_instance_layout(
+        &llbc,
+        td,
+        some_idx,
+        &unit_args,
+        Some(&unit_adt),
+        unit_some,
+        &tombstoned,
+        &gc,
+        &raw,
+        &layouts,
+    );
+    super::ensure_enum_variant_instance_layout(
+        &llbc,
+        td,
+        some_idx,
+        &i64_args,
+        Some(&i64_adt),
+        concrete_some,
+        &tombstoned,
+        &gc,
+        &raw,
+        &layouts,
+    );
+    assert!(
+        !layouts.borrow().contains_key(&unresolved_some),
+        "unbound TraitType instantiation is not a known class"
+    );
+    assert!(
+        !layouts.borrow().contains_key(&unresolved_none),
+        "non-concrete instantiation skips every variant"
+    );
+    let unit_row = {
+        let table = layouts.borrow();
+        let layout = table
+            .get(&unit_some)
+            .expect("concrete () instantiation still registers tag-only");
+        layout
+            .fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(unit_row, vec!["__discriminant".to_string()]);
+    let some_row = {
+        let table = layouts.borrow();
+        let layout = table
+            .get(&concrete_some)
+            .expect("concrete payload instantiation still registers");
+        layout
+            .fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(some_row.first().map(String::as_str), Some("__discriminant"));
+    assert!(
+        some_row.iter().any(|name| name == "__pos_0"),
+        "concrete Some layout {some_row:?}"
+    );
 }
 
 #[test]
@@ -627,6 +1189,7 @@ fn result_branch_break_of_infallible_result_builds_err() {
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
             &std::collections::HashSet::<String>::new(),
         ),
+        ..Default::default()
     };
     assert_eq!(payloads.ok, Some(ValueType::Int));
     assert_eq!(payloads.err, Some(ValueType::Int));
@@ -704,6 +1267,7 @@ fn result_branch_match_emits_nothing_for_void_payloads() {
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
             &std::collections::HashSet::<String>::new(),
         ),
+        ..Default::default()
     };
     assert_eq!(payloads.ok, None);
     assert_eq!(payloads.err, None);
@@ -1905,6 +2469,11 @@ fn declined_disc_combinator_leaves_disconnected_blocks_that_cleanup_removes() {
         result_scalar_niche: false,
         niche_null_cast: None,
         int_null: None,
+        recv_tag0_vsid: None,
+        recv_tag1_vsid: None,
+        result_tag0_vsid: None,
+        result_tag1_vsid: None,
+        result_none_vsid: None,
     };
     let live_before: std::collections::HashSet<_> =
         graph.blocks.iter().map(|block| block.id).collect();
@@ -3236,7 +3805,7 @@ fn a_deref_last_projection_reads_a_value_rather_than_naming_an_address() {
     use majit_charon_reader::ullbc::{Place, PlaceKind, ProjectionElem};
 
     fn ty() -> TyRef {
-        TyRef::Other(serde_json::Value::Null)
+        TyRef::Other(serde_json::Value::Null.into())
     }
     fn place(kind: PlaceKind) -> Place {
         Place { kind, ty: ty() }
@@ -3244,7 +3813,7 @@ fn a_deref_last_projection_reads_a_value_rather_than_naming_an_address() {
     fn field(inner: Place, name: &str) -> Place {
         place(PlaceKind::Projection(
             Box::new(inner),
-            ProjectionElem::Tagged(serde_json::json!({ "Field": name })),
+            ProjectionElem::Tagged(serde_json::json!({ "Field": name }).into()),
         ))
     }
     fn deref(inner: Place) -> Place {
@@ -6207,6 +6776,122 @@ fn w_module_dict_setitem_str_internal_calls_inherent_setitem_str() {
 }
 
 #[test]
+fn spec_segments_adt_owned_trait_impl_keeps_identity_not_owner_leaf() {
+    // rustc method-call: inherent `OwnerFlags::bits` owns owner-leaf;
+    // `impl Flags for OwnerFlags` is the identity path even though
+    // `Self` is an ADT (`CallControl.graphs_from`).
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+    }});
+    let ident = |s: &str| serde_json::json!({"Ident": [s, 0]});
+    let meta = |name: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "name": name,
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        })
+    };
+    let owner_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": {"types": [], "const_generics": []}}
+    });
+    let owner_value = serde_json::json!({"Value": [0, owner_adt.clone()]});
+    let inherent_impl = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": owner_value.clone(),
+        "kind": "InherentImplBlock"
+    }}});
+    // `Ty` so `impl_method_owner_for_fundecl` resolves the ADT; `Trait`
+    // so `trait_impl_id_for_fundecl` still sees the impl id.
+    let trait_impl_seg = serde_json::json!({"Impl": {
+        "Ty": {"skip_binder": owner_value.clone(), "kind": "TraitImpl"},
+        "Trait": 0
+    }});
+    let bits_fd = |def_id: u64, impl_seg: serde_json::Value| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": meta(vec![
+                ident("gateway"),
+                impl_seg,
+                ident("bits"),
+            ]),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [{"Ref": [null, owner_adt.clone(), "Shared"]}],
+                "output": {"Scalar": {"Integer": {"Unsigned": "U32"}}}
+            },
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 1, "locals": []},
+                "body": []
+            }}
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [{
+                "def_id": 0,
+                "item_meta": meta(vec![ident("gateway"), ident("OwnerFlags")]),
+                "kind": {"Struct": []}
+            }],
+            "fun_decls": [null, bits_fd(1, inherent_impl), bits_fd(2, trait_impl_seg)],
+            "global_decls": [],
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": meta(vec![ident("bitflags"), ident("Flags")]),
+                "methods": [{"skip_binder": {"name": "bits"}}]
+            }],
+            "trait_impls": [{
+                "impl_trait": {
+                    "id": 0,
+                    "generics": {"types": [owner_adt.clone()], "const_generics": []}
+                },
+                "methods": []
+            }]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let inherent = llbc.fn_by_id(1).expect("inherent bits");
+    let trait_impl = llbc.fn_by_id(2).expect("trait-impl bits");
+    assert!(super::trait_impl_id_for_fundecl(inherent).is_none());
+    assert_eq!(super::trait_impl_id_for_fundecl(trait_impl), Some(0));
+    let inherent_owner =
+        super::impl_method_owner_for_fundecl(&llbc, inherent).expect("inherent has an ADT owner");
+    let trait_owner = super::impl_method_owner_for_fundecl(&llbc, trait_impl)
+        .expect("trait impl has an ADT owner");
+    assert_eq!(inherent_owner.0, trait_owner.0);
+    let owner_leaf = crate::parse::CallPath::for_impl_method(&inherent_owner.0, "bits").segments;
+    let inherent_path = super::spec_segments(&llbc, inherent, "bits");
+    let trait_path = super::spec_segments(&llbc, trait_impl, "bits");
+    let identity = crate::front::clause_spec::render_trait_impl(&llbc, 0).expect("Flags identity");
+    assert_eq!(inherent_path, owner_leaf);
+    assert_eq!(
+        trait_path,
+        super::trait_impl_identity_path(&trait_owner.0, &identity, "bits")
+    );
+    assert_ne!(inherent_path, trait_path);
+    assert_eq!(
+        super::registered_path_for_fun_decl(&llbc, inherent).segments,
+        inherent_path
+    );
+    assert_eq!(
+        super::registered_path_for_fun_decl(&llbc, trait_impl).segments,
+        trait_path
+    );
+    assert_eq!(
+        super::fundecl_fn_item_segments(&llbc, inherent),
+        inherent_path
+    );
+    assert_eq!(
+        super::fundecl_fn_item_segments(&llbc, trait_impl),
+        trait_path
+    );
+}
+
+#[test]
 fn direct_ptradd_pointer_reuses_array_only_when_element_matches() {
     use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr, PtrTarget};
     let byte = LowLevelType::Char;
@@ -7138,7 +7823,7 @@ fn resolve_adt_field_keys_a_closure_capture_by_its_full_path() {
         false,
     )
     .unwrap();
-    let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}));
+    let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}).into());
     let payload = serde_json::json!([null, 0]);
     let (owner_root, field_name, _, _, _) = lowering
         .resolve_adt_field(&base, &payload)
@@ -7222,9 +7907,14 @@ fn dest_overlay_rejects_raw_struct_with_mutable_gc_pointer_field() {
         false,
     )
     .unwrap();
-    let dest = TyRef::Other(serde_json::json!({"RawPtr": [adt_node(1), "Const"]}));
+    let dest = TyRef::Other(serde_json::json!({"RawPtr": [adt_node(1), "Const"]}).into());
     assert!(
-        lowering.dest_overlay_ptr_lltype(&dest).is_none(),
+        lowering
+            .dest_overlay_ptr_lltype(
+                &dest,
+                crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            )
+            .is_none(),
         "a mutable GC pointer field must not become SomePtr overlay"
     );
 }
@@ -7292,9 +7982,14 @@ fn dest_overlay_rejects_lowlevel_string_header() {
         false,
     )
     .unwrap();
-    let dest = TyRef::Other(serde_json::json!({"RawPtr": [adt_node(0), "Const"]}));
+    let dest = TyRef::Other(serde_json::json!({"RawPtr": [adt_node(0), "Const"]}).into());
     assert!(
-        lowering.dest_overlay_ptr_lltype(&dest).is_none(),
+        lowering
+            .dest_overlay_ptr_lltype(
+                &dest,
+                crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            )
+            .is_none(),
         "LowlevelStringHeader is Ptr(STR), not a raw overlay SomePtr"
     );
 }
@@ -7548,6 +8243,66 @@ fn push_cast_ptr_to_int_emits_the_lltype_helper() {
             .result
             .as_ref(),
         Some(&signed)
+    );
+}
+
+/// `*mut UnicodeValueStorage as i64` (`w_str_from_storage`) is Str→Int,
+/// not Ref→Int. `rbuiltin.py gen_cast` Ptr→Signed is `cast_ptr_to_int`
+/// for the whole `'ref'` bank (`Ref` / `Str` / `StringBuilder`).
+#[test]
+fn gc_ptr_to_signed_covers_str_and_stringbuilder() {
+    assert_eq!(
+        tuple_field_value_type("UnicodeValueStorage"),
+        ValueType::Str
+    );
+    assert_eq!(tuple_field_value_type("Utf8Str"), ValueType::Str);
+    for src in [
+        ValueType::Ref(None),
+        ValueType::Ref(Some("PyObject".into())),
+        ValueType::Str,
+        ValueType::StringBuilder,
+    ] {
+        assert!(value_type_is_gc_ptr(&src), "{src:?}");
+        assert!(
+            gc_ptr_to_signed(Some(&src), &ValueType::Int),
+            "{src:?} → Int"
+        );
+        assert!(
+            !gc_ptr_to_signed(Some(&src), &ValueType::Unsigned),
+            "{src:?} → Unsigned is ptr→Unsigned, not ptr2int"
+        );
+    }
+    for src in [
+        ValueType::Int,
+        ValueType::Unsigned,
+        ValueType::Float,
+        ValueType::Bool,
+    ] {
+        assert!(!value_type_is_gc_ptr(&src), "{src:?}");
+        assert!(!gc_ptr_to_signed(Some(&src), &ValueType::Int), "{src:?}");
+    }
+    assert!(!gc_ptr_to_signed(None, &ValueType::Int));
+    let mut graph = FunctionGraph::new("str_as_i64");
+    let entry = graph.startblock;
+    let ptr = graph
+        .push_op_var(entry, OpKind::ConstRefAddr(0x2000), true)
+        .expect("string pointer");
+    assert!(gc_ptr_to_signed(Some(&ValueType::Str), &ValueType::Int));
+    let signed = push_cast_ptr_to_int(&mut graph, entry, ptr.clone());
+    match &graph.block(entry).operations.last().unwrap().kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            result_ty: ValueType::Int,
+        } if segments.last().map(String::as_str) == Some("cast_ptr_to_int") => {
+            assert_eq!(args, &vec![ptr]);
+            assert_eq!(segments[segments.len() - 2], "lltype");
+        }
+        other => panic!("Str→Int must emit lltype.cast_ptr_to_int, got {other:?}"),
+    }
+    assert_eq!(
+        FunctionGraph::concretetype_of(&signed),
+        crate::model::ConcreteType::Signed
     );
 }
 
@@ -7837,9 +8592,12 @@ fn resolve_aggregate_adt_uses_dest_ty_generics_when_head_is_bare_id() {
     .unwrap();
     let kind = serde_json::json!({"Adt": [0, 1]});
     let dest = |signed: bool| {
-        TyRef::Other(serde_json::json!({
-            "Value": [7, option_adt_node(0, option_int_arg(signed))]
-        }))
+        TyRef::Other(
+            serde_json::json!({
+                "Value": [7, option_adt_node(0, option_int_arg(signed))]
+            })
+            .into(),
+        )
     };
     let owner_tail = |signed: bool| {
         let (path, leaf, _, _, _, _) = lowering
@@ -7905,22 +8663,25 @@ fn resolve_aggregate_adt_control_flow_continue_matches_field_intern_identity() {
     )
     .unwrap();
     let kind = serde_json::json!({"Adt": [0, 0]});
-    let dest = TyRef::Other(serde_json::json!({
-        "Value": [7, {
-            "Adt": {
-                "id": 0,
-                "generics": {
-                    "regions": [],
-                    "types": [
-                        option_adt_node(1, serde_json::json!({"Value": [0, "Never"]})),
-                        serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}})
-                    ],
-                    "const_generics": [],
-                    "trait_refs": []
+    let dest = TyRef::Other(
+        serde_json::json!({
+            "Value": [7, {
+                "Adt": {
+                    "id": 0,
+                    "generics": {
+                        "regions": [],
+                        "types": [
+                            option_adt_node(1, serde_json::json!({"Value": [0, "Never"]})),
+                            serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}})
+                        ],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
                 }
-            }
-        }]
-    }));
+            }]
+        })
+        .into(),
+    );
     let (path, ctor, _, _, _, _) = lowering
         .resolve_aggregate_adt(&kind, Some(&dest))
         .expect("Continue constructor");
@@ -7983,9 +8744,12 @@ fn resolve_aggregate_adt_option_unit_some_payload_is_void() {
     )
     .unwrap();
     let kind = serde_json::json!({"Adt": [0, 1]});
-    let dest = TyRef::Other(serde_json::json!({
-        "Value": [7, option_adt_node(0, option_unit_arg())]
-    }));
+    let dest = TyRef::Other(
+        serde_json::json!({
+            "Value": [7, option_adt_node(0, option_unit_arg())]
+        })
+        .into(),
+    );
     let (_path, leaf, fields, _, _, _) = lowering
         .resolve_aggregate_adt(&kind, Some(&dest))
         .expect("Some constructor");
@@ -8065,9 +8829,12 @@ fn aggregate_shape_result_ok_stamps_payload_void_for_unit_and_zst() {
     .unwrap();
     let kind = serde_json::json!({"Adt": [0, 0]});
     let dest = |ok: serde_json::Value| {
-        TyRef::Other(serde_json::json!({
-            "Value": [7, result_adt_node(0, ok, option_int_arg(true))]
-        }))
+        TyRef::Other(
+            serde_json::json!({
+                "Value": [7, result_adt_node(0, ok, option_int_arg(true))]
+            })
+            .into(),
+        )
     };
     let zst_arg = serde_json::json!({"Adt": {
         "id": 1,
@@ -8150,10 +8917,9 @@ fn classify_option_ptr_none(option_decl: serde_json::Value) -> (bool, bool, supe
         false,
     )
     .unwrap();
-    let dest = TyRef::Other(option_adt_node(
-        0,
-        serde_json::json!({"RawPtr": [adt_node(1), "Mut"]}),
-    ));
+    let dest = TyRef::Other(
+        option_adt_node(0, serde_json::json!({"RawPtr": [adt_node(1), "Mut"]})).into(),
+    );
     let kind = serde_json::json!({"Adt": [0, 0]});
     let void = super::tyref_is_void_zst(&dest, &llbc);
     let niche = lowering.tyref_is_niche_option_ptr(&dest);
@@ -8220,7 +8986,7 @@ fn unit_aggregate_is_still_void_const_none() {
         false,
     )
     .unwrap();
-    let dest = TyRef::Other(option_unit_arg());
+    let dest = TyRef::Other(option_unit_arg().into());
     assert!(
         super::tyref_is_void_zst(&dest, &llbc),
         "() is tyref_is_void_zst"
@@ -8295,9 +9061,12 @@ fn resolve_aggregate_adt_range_inclusive_uses_dest_ty_when_head_is_bare_id() {
     .unwrap();
     let kind = serde_json::json!({"Adt": [0]});
     let dest = |ty: serde_json::Value| {
-        TyRef::Other(serde_json::json!({
-            "Value": [7, option_adt_node(0, ty)]
-        }))
+        TyRef::Other(
+            serde_json::json!({
+                "Value": [7, option_adt_node(0, ty)]
+            })
+            .into(),
+        )
     };
     let leaf_of = |ty: serde_json::Value| {
         let (_, leaf, _, _, _, _) = lowering
@@ -8791,7 +9560,7 @@ fn crate_root_tombstoned_leaf_paints_the_full_declaration_path() {
         false,
     )
     .unwrap();
-    let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}));
+    let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}).into());
     let payload = serde_json::json!([null, 0]);
     let (owner_root, field_name, _, _, _) = lowering
         .resolve_adt_field(&base, &payload)
@@ -8839,7 +9608,7 @@ fn tombstoned_module_leaf_field_owner_matches_the_class_root() {
         false,
     )
     .unwrap();
-    let base = TyRef::Other(serde_json::json!({"Adt": {"id": 1, "builtin": null}}));
+    let base = TyRef::Other(serde_json::json!({"Adt": {"id": 1, "builtin": null}}).into());
     let payload = serde_json::json!([null, 0]);
     let (owner_root, _, _, _, _) = lowering
         .resolve_adt_field(&base, &payload)
@@ -8918,7 +9687,7 @@ fn cross_crate_same_module_leaf_keeps_distinct_rows() {
         false,
     )
     .unwrap();
-    let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}));
+    let base = TyRef::Other(serde_json::json!({"Adt": {"id": 0, "builtin": null}}).into());
     let payload = serde_json::json!([null, 0]);
     let (owner_a, field_a, _, id_a, _) = lowering_a
         .resolve_adt_field(&base, &payload)
@@ -9794,14 +10563,16 @@ fn option_niche_null_cast_shared_u8_slice_is_window() {
     .unwrap();
     let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
     let slice = serde_json::json!({"Slice": [u8_ty, null]});
-    let option_shared = TyRef::Other(option_adt_node(
-        0,
-        serde_json::json!({"Ref": ["Erased", slice.clone(), "Shared"]}),
-    ));
-    let option_mut = TyRef::Other(option_adt_node(
-        0,
-        serde_json::json!({"Ref": ["Erased", slice, "Mut"]}),
-    ));
+    let option_shared = TyRef::Other(
+        option_adt_node(
+            0,
+            serde_json::json!({"Ref": ["Erased", slice.clone(), "Shared"]}),
+        )
+        .into(),
+    );
+    let option_mut = TyRef::Other(
+        option_adt_node(0, serde_json::json!({"Ref": ["Erased", slice, "Mut"]})).into(),
+    );
     assert!(
         matches!(
             lowering.option_niche_null_cast(&option_shared),
@@ -9978,7 +10749,7 @@ fn mut_ref_cell_signature_skips_a_residual_callee() {
             "type_decls": [],
             "fun_decls": [
                 decl(0, "traced", body.clone()),
-                decl(1, "opaque", serde_json::Value::Null),
+                decl(1, "opaque", serde_json::Value::Null.into()),
                 decl(2, "marked", body)
             ],
             "global_decls": [],
@@ -9990,14 +10761,17 @@ fn mut_ref_cell_signature_skips_a_residual_callee() {
     let mut dont_look_inside = std::collections::HashSet::new();
     dont_look_inside.insert("marked".to_string());
     assert!(!super::fun_decl_is_residual(
+        &llbc,
         llbc.fn_by_id(0).unwrap(),
         &dont_look_inside
     ));
     assert!(super::fun_decl_is_residual(
+        &llbc,
         llbc.fn_by_id(1).unwrap(),
         &dont_look_inside
     ));
     assert!(super::fun_decl_is_residual(
+        &llbc,
         llbc.fn_by_id(2).unwrap(),
         &dont_look_inside
     ));
@@ -11071,6 +11845,7 @@ fn concrete_i64_entry_rows_publish_one_qualified_spelling() {
         &std::collections::HashSet::new(),
         None,
         None,
+        Default::default(),
     );
     let program = state.finish(Vec::new());
     let qualified = "pyre_object::rordereddict_entries::Entry<i64,*mut PyObject>";

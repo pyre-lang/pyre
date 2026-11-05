@@ -3355,6 +3355,18 @@ impl Op {
     /// RPython's GC traces `ResOperation.args` / `fail_args` object fields
     /// directly. Pyre stores a `const_ptr_table` index on `OpRef::ConstPtr`,
     /// so long-lived op graphs must `trace_index` those holders.
+    ///
+    /// `compile.py` `ResumeGuardDescr._attrs_` traces `rd_consts` as an
+    /// ordinary MiniMark field of the descr. `resoperation.py` `GuardResOp`
+    /// stores that descr in `AbstractResOp._descr` (`getdescr`). When this
+    /// op is reachable, visit every `Const::Ref` in the fail-descr pool in
+    /// place. The compiled-graph `take_minor_scan_pending` /
+    /// `mark_visited_generation` filters do not apply: those remember
+    /// old-to-young edges on a published graph, while this path is "the op
+    /// is reachable, so its descr fields are traced". A second visit in one
+    /// collection is a no-op: `copy_nursery_object` returns the forwarding
+    /// address of an already-copied object, and `drag_out_root` greys a
+    /// marked object once.
     pub fn walk_const_ptr_refs_mut(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
         for arg in self.args_slice().iter() {
             arg.walk_const_ptr_refs(visitor);
@@ -3362,6 +3374,18 @@ impl Op {
         if let Some(fail_args) = self.guard_fail_args() {
             for arg in fail_args.iter() {
                 arg.walk_const_ptr_refs(visitor);
+            }
+        }
+        if let Some(descr) = self.getdescr()
+            && let Some(pool) = descr.as_fail_descr().and_then(|fd| fd.rd_consts_pool())
+        {
+            // SAFETY: exclusive GC root walker; same escape hatch
+            // `walk_rd_consts_refs` `visit_pool` uses.
+            let consts = unsafe { pool.as_mut_vec_for_gc() };
+            for c in consts.iter_mut() {
+                if let crate::value::Const::Ref(gcref) = c {
+                    visitor(gcref);
+                }
             }
         }
     }
@@ -7889,5 +7913,51 @@ mod tests {
         let e = thin_stamped_at(word).expect("reader path");
         assert_eq!(e.vtable, 3);
         assert_eq!(e.stamp, 0xABCDEF01);
+    }
+
+    #[test]
+    fn walk_const_ptr_refs_mut_visits_fail_descr_rd_consts_pool() {
+        use crate::descr::{Descr, FailDescr};
+        use crate::value::{Const, SharedConstPool};
+
+        #[derive(Debug)]
+        struct PoolFailDescr {
+            pool: std::sync::Arc<SharedConstPool>,
+            arg_types: Vec<Type>,
+        }
+        impl Descr for PoolFailDescr {
+            fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+                Some(self)
+            }
+            fn as_fail_descr_arc(
+                self: std::sync::Arc<Self>,
+            ) -> Option<std::sync::Arc<dyn FailDescr>> {
+                Some(self)
+            }
+        }
+        impl FailDescr for PoolFailDescr {
+            fn fail_arg_types(&self) -> &[Type] {
+                &self.arg_types
+            }
+            fn rd_consts_pool(&self) -> Option<&SharedConstPool> {
+                Some(self.pool.as_ref())
+            }
+        }
+
+        let dead = GcRef(0xA100_0001);
+        let live = GcRef(0xA100_0002);
+        let pool = SharedConstPool::new(vec![Const::from_gcref(dead)]);
+        let descr: DescrRef = std::sync::Arc::new(PoolFailDescr {
+            pool: std::sync::Arc::clone(&pool),
+            arg_types: Vec::new(),
+        });
+        let op = Op::new(OpCode::GuardTrue, &[Operand::const_(Const::Int(1))]);
+        op.setdescr(descr);
+        op.walk_const_ptr_refs_mut(&mut |slot: &mut GcRef| {
+            if slot.0 == dead.0 {
+                *slot = live;
+            }
+        });
+        assert_eq!(pool.as_slice()[0].getref_base(), live);
     }
 }

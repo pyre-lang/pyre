@@ -15,6 +15,17 @@ use crate::model::{
     ValueType,
 };
 
+/// STRUCT identity `resolve_adt_field` would mint from a module-qualified
+/// owner spelling (`StructId::from_canonical_spelling`). A leaf hashes a
+/// different template than the crate-stripped declaration path.
+pub(crate) fn struct_id_from_enum_owner_spelling(owner: &str) -> Option<majit_ir::descr::StructId> {
+    let template = majit_ir::descr::strip_generic_args(owner);
+    if !template.contains("::") {
+        return None;
+    }
+    Some(majit_ir::descr::StructId::from_canonical_spelling(owner))
+}
+
 /// The arm inputarg `v` binds to, by position in the arm's source list.
 pub(crate) fn map_source(
     sources: &[Variable],
@@ -69,13 +80,22 @@ pub(crate) fn emit_option_variant(
     option_owner: &str,
     disc: i64,
     payload: Option<(&str, Variable, ValueType)>,
+    variant_id: Option<majit_ir::descr::StructId>,
 ) -> Variable {
     let variant = match disc {
         0 => "None",
         1 => "Some",
         other => panic!("emit_option_variant: Option discriminant must be 0 or 1, got {other}"),
     };
-    emit_sum_variant(graph, block, option_owner, variant, disc, payload)
+    emit_sum_variant(
+        graph,
+        block,
+        option_owner,
+        variant,
+        disc,
+        payload,
+        variant_id,
+    )
 }
 
 /// Build one statically selected two-variant enum shell.  This is the common
@@ -88,6 +108,7 @@ pub(crate) fn emit_sum_variant(
     variant: &str,
     disc: i64,
     payload: Option<(&str, Variable, ValueType)>,
+    variant_id: Option<majit_ir::descr::StructId>,
 ) -> Variable {
     let res = graph.alloc_value_var();
     push_option_variant_ctor(graph, block, res.clone(), enum_owner, variant);
@@ -99,7 +120,9 @@ pub(crate) fn emit_sum_variant(
         result: Some(disc_var.clone()),
         kind: OpKind::ConstInt(disc),
     });
-    write_option_fields(graph, block, &res, enum_owner, disc_var, payload);
+    write_option_fields(
+        graph, block, &res, enum_owner, disc_var, payload, variant_id,
+    );
     res
 }
 
@@ -143,6 +166,7 @@ pub(crate) fn emit_option_variant_dynamic(
     option_owner: &str,
     disc: Variable,
     payload: Option<(&str, Variable, ValueType)>,
+    variant_ids: [Option<majit_ir::descr::StructId>; 2],
 ) {
     emit_sum_variant_dynamic(
         graph,
@@ -152,6 +176,7 @@ pub(crate) fn emit_option_variant_dynamic(
         disc,
         ["None", "Some"],
         payload,
+        variant_ids,
     );
 }
 
@@ -166,6 +191,7 @@ pub(crate) fn emit_sum_variant_dynamic(
     disc: Variable,
     variants: [&str; 2],
     payload: Option<(&str, Variable, ValueType)>,
+    variant_ids: [Option<majit_ir::descr::StructId>; 2],
 ) {
     validate_dynamic_option_exit(graph, block).expect("validated before residual removal");
     let saved_exit = graph.block(block).exits[0].clone();
@@ -205,7 +231,15 @@ pub(crate) fn emit_sum_variant_dynamic(
                 ty,
             )
         });
-        let value = emit_sum_variant(graph, arm, enum_owner, variant, tag as i64, arm_payload);
+        let value = emit_sum_variant(
+            graph,
+            arm,
+            enum_owner,
+            variant,
+            tag as i64,
+            arm_payload,
+            variant_ids[tag],
+        );
         // Recast each arm onto the dest type's enum ClassDef (`bookkeeper.py`
         // `getuniqueclassdef(cls)`). Discriminant narrowing then intern's
         // the declared variant (`classdesc.py` `getuniqueclassdef`) and
@@ -266,6 +300,7 @@ fn write_option_fields(
     option_owner: &str,
     disc_var: Variable,
     payload: Option<(&str, Variable, ValueType)>,
+    variant_id: Option<majit_ir::descr::StructId>,
 ) {
     graph.block_mut(block).operations.push(SpaceOperation {
         result: None,
@@ -274,7 +309,7 @@ fn write_option_fields(
             field: FieldDescriptor {
                 name: "__discriminant".to_string(),
                 owner_root: Some(option_owner.to_string()),
-                owner_id: None,
+                owner_id: variant_id.or_else(|| struct_id_from_enum_owner_spelling(option_owner)),
                 base_is_deref: None,
                 taken_by_address: false,
                 inline_vec: false,
@@ -297,7 +332,7 @@ fn write_option_fields(
                 field: FieldDescriptor {
                     name: "__pos_0".to_string(),
                     owner_root: Some(some_owner.to_string()),
-                    owner_id: None,
+                    owner_id: variant_id.or_else(|| struct_id_from_enum_owner_spelling(some_owner)),
                     base_is_deref: None,
                     taken_by_address: false,
                     inline_vec: false,
@@ -411,6 +446,7 @@ mod tests {
             owner,
             1,
             Some((&format!("{owner}::Some"), payload, ValueType::Ref(None))),
+            None,
         );
 
         match &graph.block(block).operations[0] {
@@ -460,6 +496,7 @@ mod tests {
             disc,
             ["Ok", "Err"],
             Some(("result::Result<i64,()>::Ok", payload, ValueType::Int)),
+            [None, None],
         );
         for exit in &graph.block(block).exits {
             let arm = graph.block(exit.target);
@@ -553,6 +590,7 @@ mod tests {
                 root,
                 disc,
                 Some((&format!("{root}::Some"), payload, payload_ty.clone())),
+                [None, None],
             );
             let lifted = function_graph_to_flowspace(&graph, &registry).expect("lift diamond");
             crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
@@ -622,6 +660,7 @@ mod tests {
             owner,
             disc,
             Some((&format!("{owner}::Some"), payload, ValueType::Unsigned)),
+            [None, None],
         );
 
         assert_eq!(

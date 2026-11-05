@@ -377,7 +377,7 @@ impl<'a> Builder<'a> {
             if forward[bb_idx] && call_graph_flow_is_incomplete(self.llbc, bb) {
                 incomplete = true;
             }
-            let Ok(TermKind::Call { call, .. }) = bb.term(self.llbc) else {
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref(self.llbc) else {
                 continue;
             };
             match &call.func {
@@ -454,14 +454,14 @@ impl<'a> Builder<'a> {
                             majit_charon_reader::ullbc::Operand::Copy(p)
                             | majit_charon_reader::ullbc::Operand::Move(p) => match &p.ty {
                                 majit_charon_reader::ullbc::TyRef::Inline { value: (_, v) } => {
-                                    Some(v)
+                                    Some(v.as_ref())
                                 }
                                 majit_charon_reader::ullbc::TyRef::Dedup { id } => {
                                     self.llbc.dedup_body(*id)
                                 }
-                                majit_charon_reader::ullbc::TyRef::Other(v) => Some(v),
+                                majit_charon_reader::ullbc::TyRef::Other(v) => Some(v.as_ref()),
                             },
-                            majit_charon_reader::ullbc::Operand::Const(v) => Some(v),
+                            majit_charon_reader::ullbc::Operand::Const(v) => Some(v.as_ref()),
                         };
                         self.note_opaque(ty, "Dynamic");
                     }
@@ -523,7 +523,7 @@ fn has_resolvable_trait_call(llbc: &Llbc, body: &Unstructured, bindings: &[Value
         if !call_graph_walks_block(bb, forward[bb_idx]) {
             continue;
         }
-        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
         let CallFunc::Regular(reg) = &call.func else {
@@ -534,7 +534,7 @@ fn has_resolvable_trait_call(llbc: &Llbc, body: &Unstructured, bindings: &[Value
         };
         if !payload_is_clause_or_parent(llbc, v) {
             continue;
-        }
+        };
         if matches!(
             resolve_trait_call(llbc, v, bindings),
             TraitCallRes::Method { .. }
@@ -551,7 +551,7 @@ fn body_has_clause_trait_call(llbc: &Llbc, body: &Unstructured) -> bool {
         if !call_graph_walks_block(bb, forward[bb_idx]) {
             continue;
         }
-        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
         let CallFunc::Regular(reg) = &call.func else {

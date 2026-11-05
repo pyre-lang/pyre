@@ -16,10 +16,72 @@
 //!   reader fails-loud at the lowering site instead of silently
 //!   discarding work.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
 use std::sync::{Arc, OnceLock};
+
+/// Shared JSON subtree. `TermKind` / `StmtKind` / `TyRef` clone this
+/// without copying the `serde_json::Map` (`BTreeMap<String, Value>`).
+#[derive(Debug, Clone)]
+pub struct JsonVal(pub Arc<Value>);
+
+impl<'de> Deserialize<'de> for JsonVal {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(JsonVal(Arc::new(Value::deserialize(deserializer)?)))
+    }
+}
+
+impl Serialize for JsonVal {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl std::ops::Deref for JsonVal {
+    type Target = Value;
+    fn deref(&self) -> &Value {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for JsonVal {
+    fn deref_mut(&mut self) -> &mut Value {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+impl From<Value> for JsonVal {
+    fn from(value: Value) -> Self {
+        JsonVal(Arc::new(value))
+    }
+}
+
+impl std::fmt::Display for JsonVal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl PartialEq for JsonVal {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for JsonVal {}
+
+impl PartialEq<Value> for JsonVal {
+    fn eq(&self, other: &Value) -> bool {
+        &*self.0 == other
+    }
+}
+
+impl AsRef<Value> for JsonVal {
+    fn as_ref(&self) -> &Value {
+        &self.0
+    }
+}
 
 // FunDecl + meta
 
@@ -83,6 +145,9 @@ pub struct FunDecl {
     /// [`FunDecl::unstructured`] is `None`.
     #[serde(skip)]
     pub returns_owned_scope: std::sync::atomic::AtomicBool,
+    /// Shared `Instantiated` skip_binder, built once from [`ItemMeta::instantiation`].
+    #[serde(skip)]
+    instantiation: OnceLock<Option<Arc<Value>>>,
 }
 
 fn fun_generics<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
@@ -272,6 +337,14 @@ impl FunDecl {
     /// struct) name.
     pub fn is_adt_constructor(&self) -> bool {
         self.src.as_ref().and_then(Value::as_str) == Some("AdtConstructor")
+    }
+
+    /// The callee's `Instantiated` skip_binder, shared across every call
+    /// that copies those arguments into `RegularCall.generics`.
+    pub fn instantiation_arc(&self) -> Option<Arc<Value>> {
+        self.instantiation
+            .get_or_init(|| self.item_meta.instantiation().map(|v| Arc::new(v.clone())))
+            .clone()
     }
 
     /// Return the `Unstructured` (basic-block CFG) body if present.
@@ -698,6 +771,21 @@ impl TypeDecl {
         Some(layout)
     }
 
+    /// Whether Charon recorded a layout row whose key equals `target`.
+    ///
+    /// An empty `target` is the sole-extraction case (`TARGET` unset) and
+    /// matches. A non-empty `target` matches only an explicit key: the
+    /// sole-entry fallback in [`Self::layout_for_target`] still feeds the
+    /// codewriter for types with no field rows (`alloc::layout::Layout`),
+    /// but `llmemory.offsetof` of an instantiated STRUCT must not be a
+    /// foreign triple's offsets (`lltype.Signed` is WORD).
+    pub fn has_layout_entry_for(&self, target: &str) -> bool {
+        let Some(raw) = self.layout.as_ref() else {
+            return target.is_empty();
+        };
+        layout_json_has_target(raw.get(), target)
+    }
+
     /// Byte size and alignment, even when a field offset is still a
     /// deduplicated expression. `size_of` / `align_of` only need these two
     /// words; [`Self::layout_for_target`] refuses the whole layout when an
@@ -754,6 +842,18 @@ fn select_target_layout<'a>(entries: &'a [TargetLayout], target: &str) -> Option
         .find(|e| e.key == target)
         .or_else(|| (entries.len() == 1).then(|| &entries[0]))
         .map(|e| &e.value)
+}
+
+/// Whether `raw` layout JSON names `target`. Empty `target` is the
+/// sole-extraction case and matches.
+fn layout_json_has_target(raw: &str, target: &str) -> bool {
+    if target.is_empty() {
+        return true;
+    }
+    let Ok(entries) = serde_json::from_str::<Vec<TargetLayout>>(raw) else {
+        return false;
+    };
+    entries.iter().any(|entry| entry.key == target)
 }
 
 /// A layout integer written inline: a bare `u64`, `{"chosen": <u64>}`, or a
@@ -1594,10 +1694,10 @@ pub enum TyRef {
     /// Inline value with hash-cons id.
     Inline {
         #[serde(rename = "Value")]
-        value: (u64, Value),
+        value: (u64, JsonVal),
     },
     /// Anything else (e.g. literal-int short forms).
-    Other(Value),
+    Other(JsonVal),
 }
 
 impl TyRef {
@@ -2465,7 +2565,7 @@ fn materialize(init: &PromotedInit, use_ty: Value, ctx: &mut SpliceCtx<'_>) -> u
     }
     let t = ctx.locals.locals.len() as u64;
     remap[0] = Some(t);
-    let ty = serde_json::from_value(use_ty.clone()).unwrap_or(TyRef::Other(use_ty.clone()));
+    let ty = serde_json::from_value(use_ty.clone()).unwrap_or(TyRef::Other(use_ty.clone().into()));
     ctx.locals.locals.push(Local {
         index: t,
         name: None,
@@ -2804,7 +2904,7 @@ pub enum StmtKind {
     /// `place := rvalue`
     Assign(Place, Rvalue),
     /// Borrow-checker fact. No runtime effect.
-    Borrowck(Value),
+    Borrowck(JsonVal),
     /// `Assert { cond, expected, check_kind }` — inline assertion;
     /// failure terminator is the *terminator-level* `Assert` instead.
     Assert(AssertStmt),
@@ -2819,7 +2919,7 @@ pub enum StmtKind {
 pub struct AssertStmt {
     pub cond: Operand,
     pub expected: bool,
-    pub check_kind: Value,
+    pub check_kind: JsonVal,
 }
 
 // Places, operands, rvalues
@@ -2837,7 +2937,7 @@ pub enum PlaceKind {
     /// Reference to a static / const global item.
     /// `Global { generics, id }` — `id` indexes `global_decls`.
     Global {
-        generics: Value,
+        generics: JsonVal,
         id: u64,
     },
     #[serde(other)]
@@ -2849,7 +2949,7 @@ pub enum PlaceKind {
 pub enum ProjectionElem {
     /// `"Deref"` and similar atom variants.
     Atom(String),
-    Tagged(Value),
+    Tagged(JsonVal),
 }
 
 impl ProjectionElem {
@@ -2893,41 +2993,41 @@ impl Place {
 #[derive(Debug, Clone, Deserialize)]
 pub enum Rvalue {
     /// Second value is `WithRetag` (`"Yes"` / `"No"`).
-    Use(Operand, Value),
+    Use(Operand, JsonVal),
     /// `BinaryOp(op, lhs, rhs)`. `op` is a tagged variant — primitive
     /// ops are atom strings (`"Add"`, `"Eq"`, …), wrap/overflow forms
     /// are objects (`{"Shr": "Wrap"}`, `{"Add": "Wrap"}`).
-    BinaryOp(Value, Operand, Operand),
-    UnaryOp(Value, Operand),
+    BinaryOp(JsonVal, Operand, Operand),
+    UnaryOp(JsonVal, Operand),
     /// `Ref { place, kind, ptr_metadata }` — borrow / raw-ptr creation.
     Ref {
         place: Place,
         /// `"Shared" | "Mut" | "TwoPhaseMut" | …`
-        kind: Value,
-        ptr_metadata: Value,
+        kind: JsonVal,
+        ptr_metadata: JsonVal,
     },
     /// `Aggregate(kind, operands)` — tuple / struct / enum-variant /
     /// array construction.
-    Aggregate(Value, Vec<Operand>),
+    Aggregate(JsonVal, Vec<Operand>),
     Discriminant(Place),
     /// `Cast(kind, operand, target_ty)`.
-    Cast(Value, Operand, TyRef),
+    Cast(JsonVal, Operand, TyRef),
     /// `Len(place)` for slice / array length.
     Len(Place),
     /// `Repeat(operand, elem_ty, count, trait_info)` for `[v; N]` literals.
     /// The last value is the `Copy`/`Clone` witness Charon now records.
-    Repeat(Operand, TyRef, Value, Value),
+    Repeat(Operand, TyRef, JsonVal, JsonVal),
     /// `ShallowInitBox(operand, target_ty)` — emitted by `Box::new_in`
     /// and friends to allocate the box and initialise its contents.
     ShallowInitBox(Operand, TyRef),
     /// `RawPtr { place, kind }` — raw-pointer construction (sibling of `Ref`).
     RawPtr {
         place: Place,
-        kind: Value,
-        ptr_metadata: Value,
+        kind: JsonVal,
+        ptr_metadata: JsonVal,
     },
     /// `NullaryOp(op, type)` — `SizeOf(T)`, `AlignOf(T)`, etc.
-    NullaryOp(Value, TyRef),
+    NullaryOp(JsonVal, TyRef),
     #[serde(other)]
     Unknown,
 }
@@ -2936,7 +3036,7 @@ pub enum Rvalue {
 pub enum Operand {
     Copy(Place),
     Move(Place),
-    Const(Value),
+    Const(JsonVal),
 }
 
 /// Regular `Fun` id carried by an `Operand::Const` whose kind is `FnDef`
@@ -2956,10 +3056,10 @@ pub fn const_fn_def_regular_id(llbc: &crate::Llbc, value: &Value) -> Option<u64>
 pub enum TermKind {
     Return,
     UnwindResume,
-    Abort(Value),
+    Abort(JsonVal),
     /// Charon `TerminatorKind::Panic`.
     Panic {
-        name: Value,
+        name: JsonVal,
         on_unwind: u64,
     },
     Goto {
@@ -3056,7 +3156,7 @@ fn decode_switch(sw: &Value, llbc: &crate::Llbc) -> Result<TermKind, String> {
         .ok_or("switch missing arms")?;
     let fallback = data.get("fallback").and_then(Value::as_u64);
     let bb_of = |id: u64| bbs.get(id as usize).and_then(Value::as_u64);
-    let mut decoded: Vec<(Value, u64, Option<bool>)> = Vec::new();
+    let mut decoded: Vec<(JsonVal, u64, Option<bool>)> = Vec::new();
     for arm in arms {
         let pair = arm.as_array().ok_or("switch arm is not a pair")?;
         let target = pair
@@ -3084,7 +3184,7 @@ fn decode_switch(sw: &Value, llbc: &crate::Llbc) -> Result<TermKind, String> {
             }
         };
         let flag = lit.get("Bool").and_then(Value::as_bool);
-        decoded.push((lit, target, flag));
+        decoded.push((JsonVal::from(lit), target, flag));
     }
     let default = fallback.and_then(bb_of).ok_or("switch missing fallback")?;
     if decoded.is_empty() {
@@ -3109,7 +3209,7 @@ fn decode_switch(sw: &Value, llbc: &crate::Llbc) -> Result<TermKind, String> {
             .into_iter()
             .map(|(scalar, target, _)| (scalar, target))
             .collect();
-        SwitchTargets::SwitchInt(Value::Null, arms, default)
+        SwitchTargets::SwitchInt(Value::Null.into(), arms, default)
     };
     Ok(TermKind::Switch { discr, targets })
 }
@@ -3119,7 +3219,7 @@ pub enum SwitchTargets {
     /// Boolean switch: `[then_bb, else_bb]`.
     If(u64, u64),
     /// `SwitchInt(int_ty, [(scalar, bb)], default_bb)`.
-    SwitchInt(Value, Vec<(Value, u64)>, u64),
+    SwitchInt(JsonVal, Vec<(JsonVal, u64)>, u64),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3151,7 +3251,7 @@ pub enum CallFunc {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegularCall {
     pub kind: CallKind,
-    pub generics: Value,
+    pub generics: JsonVal,
 }
 
 impl RegularCall {
@@ -3166,13 +3266,10 @@ impl RegularCall {
         let CallKind::Fun(FunId::Regular { id }) = &self.kind else {
             return;
         };
-        let Some(args) = llbc
-            .fn_by_id(*id)
-            .and_then(|fd| fd.item_meta.instantiation())
-        else {
+        let Some(fd) = llbc.fn_by_id(*id) else {
             return;
         };
-        let Some(generics) = self.generics.as_object_mut() else {
+        let Some(generics) = self.generics.as_object() else {
             return;
         };
         const KEYS: [&str; 3] = ["types", "const_generics", "trait_refs"];
@@ -3185,11 +3282,19 @@ impl RegularCall {
         if !unparameterized {
             return;
         }
+        let Some(args) = fd.instantiation_arc() else {
+            return;
+        };
+        let mut merged = (*self.generics.0).clone();
+        let Some(obj) = merged.as_object_mut() else {
+            return;
+        };
         for key in KEYS {
             if let Some(v) = args.get(key) {
-                generics.insert(key.to_string(), v.clone());
+                obj.insert(key.to_string(), v.clone());
             }
         }
+        self.generics = JsonVal::from(merged);
     }
 }
 
@@ -3199,9 +3304,9 @@ pub enum CallKind {
     /// `Fun { Trait(...) }`.
     Fun(FunId),
     /// Static trait method call (post-resolution).
-    Trait(Value),
+    Trait(JsonVal),
     /// `Ptr` (function-pointer call).
-    Ptr(Value),
+    Ptr(JsonVal),
     #[serde(other)]
     Unknown,
 }
@@ -3690,6 +3795,17 @@ mod tests {
 
         // empty list → None
         assert!(select_target_layout(&[], "aarch64-apple-darwin").is_none());
+    }
+
+    /// A host-only layout row is not a wasm32 offsetof. Instantiated
+    /// STRUCTs (`RDict<…>` via an alias) must not publish that row as
+    /// `num_live_items` (`rordereddict.rtype_len` / `llmemory.offsetof`).
+    #[test]
+    fn has_layout_entry_for_requires_the_named_triple() {
+        let host = r#"[{"key":"aarch64-apple-darwin","value":{"variant_layouts":[{"field_offsets":[16]}]}}]"#;
+        assert!(layout_json_has_target(host, ""));
+        assert!(layout_json_has_target(host, "aarch64-apple-darwin"));
+        assert!(!layout_json_has_target(host, "wasm32-unknown-unknown"));
     }
 
     /// A union body keeps its field list. `#[serde(other)]` turns any tag this

@@ -114,6 +114,13 @@ impl<'a> Lowering<'a> {
         if owner_root_guard::tyref_is_erased_drop(&place.ty, self.llbc) {
             return Ok(true);
         }
+        // Recorded only when the constructor is Add and Drop is exactly
+        // Remove (`ll_call_destructor`). An unknown destructor stays.
+        if let PlaceKind::Local(local) = place.kind
+            && self.erased_gc_root_locals.contains(&(local as usize))
+        {
+            return Ok(true);
+        }
         if tyref_is_owned_vec(&place.ty, self.llbc) {
             if let PlaceKind::Local(local) = place.kind {
                 match vec_init_at_drop(self.body, self.llbc, mir_bb, local as usize) {
@@ -614,6 +621,70 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
+    fn local_is_only_dropped(&mut self, dest_local: usize) -> bool {
+        if self.gc_root_only_dropped.is_none() {
+            self.gc_root_only_dropped = Some(gc_root_registration::locals_only_dropped(
+                self.body, self.llbc,
+            ));
+        }
+        self.gc_root_only_dropped
+            .as_ref()
+            .and_then(|v| v.get(dest_local))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// A `gc_hook` add-root call whose dest is only dropped, whose slot
+    /// is a local aggregate, and whose Drop is exactly Remove: emit no
+    /// op, `Goto` the return target (`shadow_stack_erase` erased-Call
+    /// shape). The dest is remembered so its `Drop` is nothing.
+    /// `ll_call_destructor` (`gctransform/support.py`) always invokes
+    /// the registered destructor; `None`, `Add`, mixed effects, fields
+    /// that need drop, and absent bodies refuse erasure.
+    pub(in crate::front::mir) fn lower_erased_gc_root_registration_call(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let Some(fun_id) = gc_root_registration::call_fun_id(call) else {
+            return Ok(false);
+        };
+        if !self.local_is_only_dropped(dest_local) {
+            return Ok(false);
+        }
+        let Some(first) = call.args.first() else {
+            return Ok(false);
+        };
+        if !gc_root_registration::slot_is_local_aggregate(self.body, self.llbc, mir_bb, first) {
+            return Ok(false);
+        }
+        let stack_cache;
+        let cache = if let Some(cache) = self.gc_root_effects {
+            cache
+        } else {
+            stack_cache = std::sync::Mutex::new(std::collections::HashMap::new());
+            &stack_cache
+        };
+        if gc_root_registration::root_registration_effect(fun_id, self.llbc, cache)
+            != Some(gc_root_registration::RootRegistration::Add)
+        {
+            return Ok(false);
+        }
+        if gc_root_registration::drop_glue_effect(&call.dest.ty, self.llbc, cache)
+            != Some(gc_root_registration::RootRegistration::Remove)
+        {
+            return Ok(false);
+        }
+        self.erased_gc_root_locals.insert(dest_local);
+        let bb_id = self.emit_bb(mir_bb);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
     /// A residual callee runs the real Rust layout. A pointer to the guard,
     /// or to an aggregate that contains one, would show it the erased word.
     pub(in crate::front::mir) fn refuse_residual_owner_root_guard(
@@ -689,7 +760,8 @@ impl<'a> Lowering<'a> {
                     "types": [],
                     "const_generics": [],
                     "trait_refs": []
-                }),
+                })
+                .into(),
             }),
             args: vec![Operand::Move(Place {
                 kind: PlaceKind::Local(dest_local as u64),
@@ -718,7 +790,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return Ok(());
         };
-        if !fun_decl_is_residual(fd, self.dont_look_inside) {
+        if !fun_decl_is_residual(self.llbc, fd, self.dont_look_inside) {
             return Ok(());
         }
         for (index, declared) in fd.signature.inputs.iter().enumerate() {
@@ -743,12 +815,18 @@ impl<'a> Lowering<'a> {
     }
 }
 
-/// True for the root-stack publication helper.  Both the free function and
-/// `RootScope` method spell the last two semantic components `gc_roots` and
-/// `pin_root`, with an optional `<Impl>` segment between them.
+/// True for the root-stack publication helper.  The free function and
+/// `RootScope` method spell `gc_roots` plus `pin_root` / `pin_roots`, with
+/// an optional `<Impl>` segment between them.
+///
+/// `pin_roots` takes the slice as its last argument; that word is the same
+/// GCREF slot `gct_gc_identityhash` (`framework.py`) recasts before the
+/// call, so StringRepr and InstanceRepr callers do not meet in one
+/// FunctionDesc cell (`mergeinputargs` `Instance(PyObject) ∪ Ptr(GCREF)`).
 pub(in crate::front::mir) fn gc_root_pin_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
-    segments.last() == Some(&"pin_root") && segments.contains(&"gc_roots")
+    let last = segments.last().copied();
+    (last == Some("pin_root") || last == Some("pin_roots")) && segments.contains(&"gc_roots")
 }
 
 /// `gc_hook::gc_identity_hash` (`framework.py` `gct_gc_identityhash`).
@@ -764,6 +842,10 @@ pub(in crate::front::mir) fn gc_identity_hash_path(name: &str) -> bool {
 /// from the dropped value's own resolved path, so nothing below names one.
 pub(in crate::front::mir) const ROOT_SCOPE_MODULE: &str = "gc_roots";
 pub(in crate::front::mir) const ROOT_SCOPE_TYPE: &str = "RootScope";
+/// The set constructor that opens a `RootScope` and returns it inside the
+/// value (`gc_roots.rs` `RootedItems::new`).  An importing artefact sees
+/// that constructor as opaque; the type name is what names the bracket.
+pub(in crate::front::mir) const ROOTED_ITEMS_TYPE: &str = "RootedItems";
 /// The shadow-stack rewind the guard's destructor performs, spelled as a call
 /// that takes the guard by reference.
 pub(crate) const ROOT_SCOPE_CLOSE: &str = "root_scope_close";
@@ -772,6 +854,13 @@ pub(crate) const ROOT_SCOPE_CLOSE: &str = "root_scope_close";
 pub(in crate::front::mir) fn gc_root_scope_type_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
     segments.last() == Some(&ROOT_SCOPE_TYPE) && segments.contains(&ROOT_SCOPE_MODULE)
+}
+
+/// True for the set that holds a `RootScope` and answers as that bracket's
+/// guard (`RootedItems`).
+pub(in crate::front::mir) fn gc_rooted_items_type_path(name: &str) -> bool {
+    let segments: Vec<&str> = name.split("::").collect();
+    segments.last() == Some(&ROOTED_ITEMS_TYPE) && segments.iter().any(|s| *s == ROOT_SCOPE_MODULE)
 }
 
 /// Match Charon's `gc_roots::RootScope::<Impl>::drop_in_place` path.
@@ -2123,9 +2212,11 @@ pub(in crate::front::mir) fn owned_root_scopes(
 }
 
 /// Whether `body` opens a bracket and hands its guard back inside the value
-/// it returns: the guard, through any plain moves, enters an aggregate that
-/// becomes `_0`, directly or through one moved local.  Such a constructor's pins belong to
-/// the bracket its caller now holds.
+/// it returns: the guard, through any plain moves, is `_0` itself or enters
+/// an aggregate that becomes `_0`, directly or through one moved local.
+/// `RootedItems::new` is the aggregate case; `Default::default` forwards
+/// that constructor's result.  Such a constructor's pins belong to the
+/// bracket its caller now holds.
 ///
 /// Only a call whose result can reach `_0` is asked, so each call the recursive
 /// query follows contributes its callee's answer to this body's answer — the
@@ -2183,6 +2274,12 @@ pub(in crate::front::mir) fn body_returns_owned_scope(
                 }
             }
         }
+    }
+    // The guard may be `_0` itself or move into it without an aggregate
+    // (`Default::default` forwarding `RootedItems::new`'s result).
+    reaching.insert(0);
+    for h in moved_into_result.iter() {
+        reaching.insert(h);
     }
     // Follow plain moves backward (`_21 = move _3`): a local that reaches `_0`
     // through a move also reaches it from the move's source.
@@ -3906,7 +4003,7 @@ pub(in crate::front::mir) fn record_root_slot_getter_reads(
         if !index.forward_blocks[bb_idx] {
             continue;
         }
-        let Ok(term) = bb.term(llbc) else {
+        let Ok(term) = bb.term_ref(llbc) else {
             continue;
         };
         let TermKind::Call { call, .. } = term else {
@@ -3915,7 +4012,7 @@ pub(in crate::front::mir) fn record_root_slot_getter_reads(
         if let PlaceKind::Local(dest) = call.dest.kind {
             call_dests.insert(dest as usize);
         }
-        calls.push((bb_idx, call));
+        calls.push((bb_idx, call.clone()));
     }
     let index = RootGetterIndex {
         call_dests: &call_dests,
@@ -4158,7 +4255,7 @@ pub fn apply_published_structs(llbc: &mut Llbc, rows: &[PublishedStructBody]) {
                 remap_portable_type_ids(&mut ty, llbc, &exact, &stripped_unique);
                 majit_charon_reader::ullbc::FieldDecl {
                     name: field.name.clone(),
-                    ty: TyRef::Other(ty),
+                    ty: TyRef::Other(ty.into()),
                     attr_info: None,
                 }
             })
@@ -5545,7 +5642,21 @@ pub(in crate::front::mir) fn analyze_root_brackets_with(
                 }
                 // `_t = copy _slot`, the argument temporary (2.5) recorded,
                 // and a field of a tuple aggregate that names the same slot.
-                Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) if matches!(place.kind, PlaceKind::Local(d) if copies.get(&(d as usize)).copied() == use_operand_slot_src(body, &assigned, operand, &forward_blocks)) =>
+                // Both sides are Some: a field of the guard itself
+                // (`_t = Copy(guard.base)`) is not a recorded slot copy.
+                Ok(StmtKind::Assign(place, Rvalue::Use(operand, _)))
+                    if matches!(
+                        place.kind,
+                        PlaceKind::Local(d)
+                            if copies.get(&(d as usize)).copied().is_some_and(|src| {
+                                use_operand_slot_src(
+                                    body,
+                                    &assigned,
+                                    operand,
+                                    &forward_blocks,
+                                ) == Some(src)
+                            })
+                    ) =>
                 {
                     continue;
                 }
@@ -7236,16 +7347,28 @@ pub(in crate::front::mir) fn elaborate_explicit_root_closes(
         };
         let mine: Vec<&Close> = closes.iter().filter(|c| c.guard == guard).collect();
         let close_bbs: bit_set::BitSet = mine.iter().map(|c| c.bb).collect();
-        // Every move of the guard and of its temporaries is a link of one of
-        // these chains.
+        // Every move of the guard is a link of one of these chains.
+        // `local_move_counts` does not count a recognised `core::mem::drop`
+        // as a move-out, so the drop operand's remaining count is 0. An
+        // intermediate temp still has count 1 (moved into the next). A temp
+        // moved anywhere else, or a guard moved anywhere else, is refused.
         if move_counts.get(&guard).copied().unwrap_or(0) != mine.len() {
             continue;
         }
         let temps: bit_set::BitSet = mine.iter().flat_map(|c| c.temps.iter().copied()).collect();
+        let drop_operands: bit_set::BitSet = mine
+            .iter()
+            .filter_map(|c| c.temps.first().copied())
+            .collect();
         if temps.contains(guard)
-            || temps
-                .iter()
-                .any(|t| move_counts.get(&t).copied().unwrap_or(0) != 1)
+            || temps.iter().any(|t| {
+                let count = move_counts.get(&t).copied().unwrap_or(0);
+                if drop_operands.contains(t) {
+                    count != 0
+                } else {
+                    count != 1
+                }
+            })
         {
             continue;
         }

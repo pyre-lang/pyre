@@ -2547,7 +2547,7 @@ const SKIP_STD_ALLOC_RAW: &str = "skip-std-alloc-raw";
 
 /// `std::alloc::alloc` / `alloc_zeroed` and the `alloc::alloc` re-export.
 /// The `alloc_zeroed` leaf is unique; the `alloc` leaf is not.
-fn is_std_alloc_raw(canonical_strip: &[String]) -> bool {
+pub(crate) fn is_std_alloc_raw(canonical_strip: &[String]) -> bool {
     match canonical_strip {
         [crate_or_std, module, leaf]
             if (crate_or_std == "std" || crate_or_std == "alloc")

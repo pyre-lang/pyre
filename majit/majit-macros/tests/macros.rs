@@ -1254,7 +1254,7 @@ mod helper_fnaddr_registry {
     }
 
     /// The object-slice shape (`&[PyObjectRef]`) is covered on the pyre side
-    /// by `jit_trace_fnaddrs_publishes_getfunctionptr_call_residuals`
+    /// by `jit_trace_fnaddrs_looks_inside_call_helpers`
     /// (pyre-interpreter `jit_fnaddr.rs`).
     #[test]
     fn getfunctionptr_registers_a_word_result_trampoline() {

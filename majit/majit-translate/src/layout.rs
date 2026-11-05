@@ -286,24 +286,172 @@ impl LayoutProvider for HeuristicLayoutProvider {
         exact_offsets: &HashMap<String, u64>,
         exact_size: Option<u64>,
     ) -> Option<StructLayout> {
-        let mut layout = self.get_struct_layout(struct_name)?;
         let rows = self.fields_by_struct.get(struct_name)?;
         let imm_ranks = self
             .immutable_fields_by_struct
             .get(struct_name)
             .cloned()
             .unwrap_or_default();
-        layout.apply_exact_layout(
+        Some(struct_layout_from_rows_and_exact(
             rows,
             exact_offsets,
             exact_size,
             &self.known_struct_names,
             &self.known_struct_sizes,
+            &self.known_struct_aligns,
             &imm_ranks,
             &self.raw_alloc_flavor_structs,
-        );
-        Some(layout)
+        ))
     }
+}
+
+/// `from_type_strings` then `apply_exact_layout`: the conversion
+/// [`program_struct_layouts`] uses through [`HeuristicLayoutProvider::get_struct_layout_exact`].
+pub(crate) fn struct_layout_from_rows_and_exact(
+    rows: &[(String, String)],
+    exact_offsets: &HashMap<String, u64>,
+    exact_size: Option<u64>,
+    known_struct_names: &HashSet<String>,
+    known_struct_sizes: &HashMap<String, usize>,
+    known_struct_aligns: &HashMap<String, usize>,
+    immutable_field_ranks: &HashMap<String, ImmutableRank>,
+    raw_alloc_flavor_structs: &HashSet<String>,
+) -> StructLayout {
+    let mut layout = StructLayout::from_type_strings(
+        rows,
+        known_struct_names,
+        known_struct_sizes,
+        known_struct_aligns,
+        immutable_field_ranks,
+        raw_alloc_flavor_structs,
+    );
+    layout.apply_exact_layout(
+        rows,
+        exact_offsets,
+        exact_size,
+        known_struct_names,
+        known_struct_sizes,
+        immutable_field_ranks,
+        raw_alloc_flavor_structs,
+    );
+    layout
+}
+
+/// One STRUCT's layout ready to install on `CallControl`.
+///
+/// Exact Charon layouts are emitted first, keyed by STRUCT identity
+/// (`descr.py` `get_field_descr(STRUCT, fieldname)`). The field rows come
+/// from a registry spelling that resolves to that same identity. Heuristic
+/// layouts fill remaining names.
+pub(crate) struct ProgramStructLayout {
+    pub spelling: String,
+    pub sid: majit_ir::descr::StructId,
+    pub exact: Option<crate::front::semantic::ExactLayout>,
+    pub layout: StructLayout,
+}
+
+fn field_rows_cover_exact(
+    rows: &[crate::front::semantic::FieldRow],
+    exact: &crate::front::semantic::ExactLayout,
+) -> bool {
+    exact
+        .field_offsets
+        .keys()
+        .all(|name| rows.iter().any(|row| row.name == *name))
+}
+
+/// Registry spelling whose STRUCT identity is `sid` and whose rows name
+/// every field in `exact`. `get_field_descr(STRUCT, fieldname)` reads
+/// FIELD off STRUCT; a covering name of a different identity is not
+/// that STRUCT.
+fn spelling_covering_exact<'a>(
+    sid: majit_ir::descr::StructId,
+    exact: &crate::front::semantic::ExactLayout,
+    struct_fields: &'a crate::front::semantic::StructFieldRegistry,
+) -> Option<&'a str> {
+    for (name, rows) in struct_fields.fields.iter() {
+        // A Void-only instance has empty offsets and empty rows; that
+        // spelling still names the STRUCT (`get_size_descr` cache[STRUCT]).
+        if !exact.field_offsets.is_empty() {
+            if rows.is_empty() || !field_rows_cover_exact(rows, exact) {
+                continue;
+            }
+        } else if !rows.is_empty() && !field_rows_cover_exact(rows, exact) {
+            continue;
+        }
+        if majit_ir::descr::struct_id_for_name(name) == Some(sid) {
+            return Some(name.as_str());
+        }
+    }
+    None
+}
+
+/// Exact layouts by STRUCT identity, then heuristic layouts for names
+/// that still have no identity-keyed row.
+///
+/// An instantiated STRUCT does not inherit the template's offsets, but a
+/// missing Charon row must still get a layout: otherwise
+/// `compute_struct_size` / `fielddescrof_concrete` fall through to the
+/// C-order accumulator on every use.
+pub(crate) fn program_struct_layouts(
+    struct_fields: &crate::front::semantic::StructFieldRegistry,
+    exact_layouts: &HashMap<majit_ir::descr::StructId, crate::front::semantic::ExactLayout>,
+    provider: &dyn LayoutProvider,
+) -> Vec<ProgramStructLayout> {
+    let mut installed = HashSet::new();
+    let mut out = Vec::new();
+    for (sid, exact) in exact_layouts {
+        // A Void-only variant keeps `size` and no occupying fields
+        // (`heaptracker.all_fielddescrs` skips `lltype.Void`). Install
+        // that STRUCT so `bh_size_spec_for` does not walk the template
+        // under this instance id.
+        if exact.field_offsets.is_empty() && exact.size.is_none() {
+            continue;
+        }
+        let Some(spelling) = spelling_covering_exact(*sid, exact, struct_fields) else {
+            continue;
+        };
+        let Some(layout) =
+            provider.get_struct_layout_exact(spelling, &exact.field_offsets, exact.size)
+        else {
+            continue;
+        };
+        installed.insert(*sid);
+        out.push(ProgramStructLayout {
+            spelling: spelling.to_string(),
+            sid: *sid,
+            exact: Some(exact.clone()),
+            layout,
+        });
+    }
+    for (struct_name, rows) in struct_fields.fields.iter() {
+        let Some(sid) = majit_ir::descr::struct_id_for_name(struct_name) else {
+            continue;
+        };
+        if !installed.insert(sid) {
+            continue;
+        }
+        let exact = exact_layouts.get(&sid);
+        if exact.is_some_and(|layout| !layout.field_offsets.is_empty()) && rows.is_empty() {
+            continue;
+        }
+        let layout = match exact {
+            Some(exact) if !exact.field_offsets.is_empty() => {
+                provider.get_struct_layout_exact(struct_name, &exact.field_offsets, exact.size)
+            }
+            _ => provider.get_struct_layout(struct_name),
+        };
+        let Some(layout) = layout else {
+            continue;
+        };
+        out.push(ProgramStructLayout {
+            spelling: struct_name.clone(),
+            sid,
+            exact: exact.cloned(),
+            layout,
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -492,5 +640,56 @@ mod tests {
         assert_eq!(signed_size_for("x86", 4), 4);
         assert_eq!(signed_size_for("x86_64", 8), 8);
         assert_eq!(signed_size_for("aarch64", 8), 8);
+    }
+
+    /// `get_field_descr(STRUCT, fieldname)` reads FIELD off STRUCT. An
+    /// exact layout whose identity has no registry spelling must not
+    /// borrow another STRUCT's rows because the field names match.
+    #[test]
+    fn exact_layout_does_not_borrow_another_structs_rows() {
+        use crate::front::semantic::{ExactLayout, FieldRow, StructFieldRegistry};
+        use crate::test_support::register_struct_ids_serialized;
+
+        let owner = "OtherStruct";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let orphan = majit_ir::descr::StructId::from_canonical("OrphanStruct");
+        assert_ne!(owner_id, orphan);
+
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![FieldRow::named("a", "i64"), FieldRow::named("b", "i64")],
+        );
+        let _registry =
+            register_struct_ids_serialized(HashMap::from([(owner.to_string(), Some(owner_id))]));
+
+        let mut field_offsets = HashMap::new();
+        field_offsets.insert("a".to_string(), 0u64);
+        field_offsets.insert("b".to_string(), 8u64);
+        let mut exact_layouts = HashMap::new();
+        exact_layouts.insert(
+            orphan,
+            ExactLayout {
+                size: Some(16),
+                align: Some(8),
+                field_offsets,
+                host: None,
+            },
+        );
+        let pair_fields: HashMap<String, Vec<(String, String)>> = fields.fields.clone().into();
+        let provider = HeuristicLayoutProvider::from_struct_fields(
+            &pair_fields,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+        let installed: Vec<_> = program_struct_layouts(&fields, &exact_layouts, &provider)
+            .into_iter()
+            .map(|entry| entry.sid)
+            .collect();
+        assert!(
+            !installed.contains(&orphan),
+            "orphan exact layout must not borrow OtherStruct rows"
+        );
     }
 }

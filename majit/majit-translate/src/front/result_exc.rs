@@ -584,14 +584,18 @@ pub(crate) fn tyref_is_result(ty: &TyRef, llbc: &Llbc) -> bool {
 /// both writers agree on one ClassDef and the `__pos_0` payload no longer
 /// unions across instantiations.  Both the `Ok` and `Err` shells of one
 /// callee share this suffix so the two variants share one base ClassDef.
-pub(crate) fn tyref_result_instantiation_suffix(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+pub(crate) fn tyref_result_instantiation_suffix(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
     let body = match ty {
         TyRef::Inline { value: (_, v) } => v,
         TyRef::Other(v) => v,
         TyRef::Dedup { id } => llbc.dedup_body(*id)?,
     };
     let adt = body.get("Adt")?.as_object()?;
-    crate::front::mir::adt_head_instantiation_suffix(adt, llbc)
+    crate::front::mir::adt_head_instantiation_suffix(adt, llbc, tombstoned)
 }
 
 /// True when `ty` is `Result<(), PyError>` — the Ok payload is the unit
@@ -871,12 +875,17 @@ fn raise_merged_err_ctor(
 ///
 /// `sum` is set when the call's destination is an exception sum. A carrier
 /// `Result` keeps `sum` empty and follows the existing rewrap path.
+/// `ok_vsid` / `err_vsid` are the instance STRUCTs
+/// `ensure_enum_variant_instance_layout` registered; `None` keeps the
+/// spelling fallback on a template body or a unit-test record.
 #[derive(Clone)]
 pub(crate) struct ResultExcCall {
     pub result: Variable,
     pub suffix: Option<String>,
     pub payload_ty: ValueType,
     pub sum: Option<ExceptionSum>,
+    pub ok_vsid: Option<majit_ir::descr::StructId>,
+    pub err_vsid: Option<majit_ir::descr::StructId>,
 }
 
 impl ResultExcCall {
@@ -886,6 +895,8 @@ impl ResultExcCall {
             suffix,
             payload_ty,
             sum: None,
+            ok_vsid: None,
+            err_vsid: None,
         }
     }
 }
@@ -923,6 +934,12 @@ impl ResultExcCalls for Vec<(Variable, Option<String>, ValueType)> {
 impl ResultExcCalls for [ResultExcCall] {
     fn calls(&self) -> Vec<ResultExcCall> {
         self.to_vec()
+    }
+}
+
+impl<const N: usize> ResultExcCalls for [ResultExcCall; N] {
+    fn calls(&self) -> Vec<ResultExcCall> {
+        self.as_slice().calls()
     }
 }
 
@@ -3893,6 +3910,11 @@ pub(crate) struct OptionOkOrElseTrySite {
     pub niche: bool,
     /// `Option<NonZero*>`: the word itself, `None` is integer 0.
     pub scalar_niche: bool,
+    /// Instance STRUCT of the receiver `Some`, when the TyRef is concrete.
+    pub some_vsid: Option<majit_ir::descr::StructId>,
+    /// Instance STRUCTs of the dest `Result` the combinator builds.
+    pub ok_vsid: Option<majit_ir::descr::StructId>,
+    pub err_vsid: Option<majit_ir::descr::StructId>,
 }
 
 /// Catch-link action for a carrier Result combinator fused onto
@@ -4499,9 +4521,8 @@ fn peel_declared_wrappers(ty: &str, wrappers: &[&str]) -> String {
 /// `Result<Infallible, E>` is the `Try::branch` residual, not `E`.
 ///
 /// Charon spells that uninhabited ok as `Never`
-/// (`{"Value":[id,"Never"]}`). `charon_type_value_to_ast_string` renders a
-/// non-object payload as `??scalar`, so the owner suffix is
-/// `Result<??scalar,E>`.
+/// (`{"Value":[id,"Never"]}`). The type printer renders that unit kind as
+/// `!`. Older graphs still carry `??scalar` / `Never`.
 fn peel_infallible_result(ty: &str) -> String {
     let Some(rest) = ty.strip_prefix("Result<") else {
         return ty.to_string();
@@ -5270,6 +5291,8 @@ pub(crate) fn rewire_result_exc_call_sites(
             r,
             suffix.unwrap_or(""),
             payload_ty,
+            call.ok_vsid,
+            call.err_vsid,
             enclosing_scoped,
             true,
             &calls,
@@ -5375,7 +5398,9 @@ fn rewire_one_option_ok_or_else_try_site(
     site: &OptionOkOrElseTrySite,
     enclosing_scoped: bool,
 ) -> Result<(), String> {
-    use crate::front::option_variant::{close_goto_mixed, map_source, reproduce_exit_args};
+    use crate::front::option_variant::{
+        close_goto_mixed, map_source, reproduce_exit_args, struct_id_from_enum_owner_spelling,
+    };
 
     let name = graph.name.clone();
     let a = graph
@@ -5428,12 +5453,21 @@ fn rewire_one_option_ok_or_else_try_site(
 
     // One recorded result: a merged `ok_or_else` continue has to fail in
     // planning, before this splice mutates, and the matcher reads the list.
-    let recorded = [(site.result_var.clone(), None, site.payload_ty.clone())];
+    let recorded = [ResultExcCall {
+        result: site.result_var.clone(),
+        suffix: None,
+        payload_ty: site.payload_ty.clone(),
+        sum: None,
+        ok_vsid: site.ok_vsid,
+        err_vsid: site.err_vsid,
+    }];
     let result_shape = rewire_one_call_site(
         graph,
         &site.result_var,
         "",
         &site.payload_ty,
+        site.ok_vsid,
+        site.err_vsid,
         enclosing_scoped,
         false,
         &recorded,
@@ -5520,7 +5554,9 @@ fn rewire_one_option_ok_or_else_try_site(
                     field: crate::model::FieldDescriptor {
                         name: "__pos_0".to_string(),
                         owner_root: Some(site.some_owner.clone()),
-                        owner_id: None,
+                        owner_id: site
+                            .some_vsid
+                            .or_else(|| struct_id_from_enum_owner_spelling(&site.some_owner)),
                         base_is_deref: None,
                         taken_by_address: false,
                         inline_vec: false,
@@ -5595,7 +5631,9 @@ fn rewire_one_option_ok_or_else_try_site(
                     field: crate::model::FieldDescriptor {
                         name: "__discriminant".to_string(),
                         owner_root: Some(site.option_owner.clone()),
-                        owner_id: None,
+                        owner_id: site
+                            .some_vsid
+                            .or_else(|| struct_id_from_enum_owner_spelling(&site.option_owner)),
                         base_is_deref: None,
                         taken_by_address: false,
                         inline_vec: false,
@@ -5643,12 +5681,9 @@ pub(crate) fn rewire_carrier_combinator_sites(
 pub(crate) fn rewire_overflow_combinator_sites(
     graph: &mut FunctionGraph,
     sites: &[CarrierCombinatorSite],
-    toint_results: &[(Variable, Option<String>, ValueType)],
+    toint_results: &[ResultExcCall],
 ) -> usize {
-    let toint_vars: Vec<Variable> = toint_results
-        .iter()
-        .map(|(var, _, _)| var.clone())
-        .collect();
+    let toint_vars: Vec<Variable> = toint_results.iter().map(|rec| rec.result.clone()).collect();
     let mut rewritten = 0usize;
     for site in sites {
         match plan_carrier_combinator_site(graph, site) {
@@ -7797,6 +7832,8 @@ fn rewire_question_site(
     r: &Variable,
     suffix: &str,
     payload_ty: &ValueType,
+    ok_vsid: Option<majit_ir::descr::StructId>,
+    err_vsid: Option<majit_ir::descr::StructId>,
     allow_fallback: bool,
     results: &[ResultExcCall],
     site: QuestionSite,
@@ -7809,7 +7846,7 @@ fn rewire_question_site(
         if let Some(sum) = call_sum(results, r) {
             return Err(sum_used_as_value(sum));
         }
-        catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
+        catch_and_rewrap(graph, a, r, suffix, payload_ty, ok_vsid, err_vsid)?;
         Ok(SiteOutcome::Rewrapped)
     };
     if assert_single_pred(graph, site.branch_block, &name).is_err() {
@@ -8031,6 +8068,8 @@ fn rewire_one_call_site(
     r: &Variable,
     suffix: &str,
     payload_ty: &ValueType,
+    ok_vsid: Option<majit_ir::descr::StructId>,
+    err_vsid: Option<majit_ir::descr::StructId>,
     enclosing_scoped: bool,
     allow_fallback: bool,
     results: &impl ResultExcCalls,
@@ -8154,7 +8193,7 @@ fn rewire_one_call_site(
         if let Some(sum) = call_sum(&calls, r) {
             return Err(sum_used_as_value(sum));
         }
-        catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
+        catch_and_rewrap(graph, a, r, suffix, payload_ty, ok_vsid, err_vsid)?;
         return Ok(SiteOutcome::Rewrapped);
     }
     let (r_forwarded, _recast_a) = peel_recast_chain_from(graph, a, r);
@@ -8182,6 +8221,8 @@ fn rewire_one_call_site(
                 r,
                 suffix,
                 payload_ty,
+                ok_vsid,
+                err_vsid,
                 allow_fallback,
                 &calls,
                 site,
@@ -8219,7 +8260,7 @@ fn rewire_one_call_site(
                 );
             }
         }
-        catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
+        catch_and_rewrap(graph, a, r, suffix, payload_ty, ok_vsid, err_vsid)?;
         return Ok(SiteOutcome::Rewrapped);
     };
     // The rewrite bypasses B and C on this call edge, so that chain has to
@@ -8275,7 +8316,7 @@ fn rewire_one_call_site(
         if let Some(sum) = call_sum(&calls, r) {
             return Err(sum_used_as_value(sum));
         }
-        catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
+        catch_and_rewrap(graph, a, r, suffix, payload_ty, ok_vsid, err_vsid)?;
         return Ok(SiteOutcome::Rewrapped);
     }
     // `branch` and the discriminant switch share this block. The split
@@ -8288,6 +8329,8 @@ fn rewire_one_call_site(
             r,
             suffix,
             payload_ty,
+            ok_vsid,
+            err_vsid,
             allow_fallback,
             &calls,
             QuestionSite {
@@ -8323,7 +8366,7 @@ fn rewire_one_call_site(
         if let Some(sum) = call_sum(&calls, r) {
             return Err(sum_used_as_value(sum));
         }
-        catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
+        catch_and_rewrap(graph, a, r, suffix, payload_ty, ok_vsid, err_vsid)?;
         return Ok(SiteOutcome::Rewrapped);
     }
     let chain = diamond_forward_chain(a, &question.path);
@@ -8717,6 +8760,8 @@ pub(crate) fn catch_overflow_and_rewrap(
     r: &Variable,
     suffix: &str,
     payload_ty: &ValueType,
+    ok_vsid: Option<majit_ir::descr::StructId>,
+    err_vsid: Option<majit_ir::descr::StructId>,
 ) -> Result<(), String> {
     catch_and_rewrap_with(
         graph,
@@ -8724,6 +8769,8 @@ pub(crate) fn catch_overflow_and_rewrap(
         r,
         suffix,
         payload_ty,
+        ok_vsid,
+        err_vsid,
         CatchRewrapKind::OverflowError,
     )
 }
@@ -8734,6 +8781,8 @@ fn catch_and_rewrap(
     r: &Variable,
     suffix: &str,
     payload_ty: &ValueType,
+    ok_vsid: Option<majit_ir::descr::StructId>,
+    err_vsid: Option<majit_ir::descr::StructId>,
 ) -> Result<(), String> {
     catch_and_rewrap_with(
         graph,
@@ -8741,6 +8790,8 @@ fn catch_and_rewrap(
         r,
         suffix,
         payload_ty,
+        ok_vsid,
+        err_vsid,
         CatchRewrapKind::ErrorCarrier,
     )
 }
@@ -8769,12 +8820,18 @@ fn emit_rbigint_overflow_const(
         .expect("RBigIntError::Overflow ctor must produce a value")
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "kind plus the per-instantiation Ok/Err STRUCT ids the shells stamp"
+)]
 fn catch_and_rewrap_with(
     graph: &mut FunctionGraph,
     a: usize,
     r: &Variable,
     suffix: &str,
     payload_ty: &ValueType,
+    ok_vsid: Option<majit_ir::descr::StructId>,
+    err_vsid: Option<majit_ir::descr::StructId>,
     kind: CatchRewrapKind,
 ) -> Result<(), String> {
     use crate::model::BlockId;
@@ -8840,6 +8897,7 @@ fn catch_and_rewrap_with(
             payload.clone(),
             payload_ty.clone(),
             suffix,
+            ok_vsid,
         );
         (Some(shell), Some(payload))
     } else {
@@ -8909,6 +8967,7 @@ fn catch_and_rewrap_with(
                         v_err.clone(),
                         ValueType::Ref(None),
                         suffix,
+                        err_vsid,
                     );
                     (Some(shell), Some(v_err))
                 }
@@ -8924,6 +8983,7 @@ fn catch_and_rewrap_with(
                         v_err.clone(),
                         ValueType::Ref(Some("majit_rlib::rbigint::RBigIntError".to_string())),
                         suffix,
+                        err_vsid,
                     );
                     (Some(shell), Some(v_err))
                 }
@@ -9038,11 +9098,12 @@ fn catch_and_rewrap_with(
 /// Sites already fused (`LastException` from unwrap_or or map_err) are skipped.
 pub(crate) fn rewire_toint_call_sites(
     graph: &mut FunctionGraph,
-    results: &[(Variable, Option<String>, ValueType)],
+    results: &[ResultExcCall],
 ) -> Result<usize, String> {
     let results = bind_toint_results(graph, results);
     let mut rewritten = 0usize;
-    for (r, suffix, payload_ty) in &results {
+    for rec in &results {
+        let r = &rec.result;
         let Some(a) = producer_block_index(graph, r) else {
             // Fusion / unwrap_or reminted the call onto a fresh payload
             // Variable; the recorded dest is gone. A leftover use without a
@@ -9059,7 +9120,15 @@ pub(crate) fn rewire_toint_call_sites(
         if matches!(graph.blocks[a].exitswitch, Some(ExitSwitch::LastException)) {
             continue;
         }
-        catch_overflow_and_rewrap(graph, a, r, suffix.as_deref().unwrap_or(""), payload_ty)?;
+        catch_overflow_and_rewrap(
+            graph,
+            a,
+            r,
+            rec.suffix.as_deref().unwrap_or(""),
+            &rec.payload_ty,
+            rec.ok_vsid,
+            rec.err_vsid,
+        )?;
         rewritten += 1;
     }
     split_trailing_ops_off_canraise_blocks(graph);
@@ -9069,10 +9138,7 @@ pub(crate) fn rewire_toint_call_sites(
 /// Rebind recorded toint dests onto surviving `jit_bigint_toint` results
 /// when extra-simplify renamed every recorded Variable
 /// (`result_map_err` `rewire_result_map_err_sites` stale binders).
-fn bind_toint_results(
-    graph: &FunctionGraph,
-    results: &[(Variable, Option<String>, ValueType)],
-) -> Vec<(Variable, Option<String>, ValueType)> {
+fn bind_toint_results(graph: &FunctionGraph, results: &[ResultExcCall]) -> Vec<ResultExcCall> {
     let live: Vec<Variable> = graph
         .blocks
         .iter()
@@ -9082,12 +9148,19 @@ fn bind_toint_results(
         .collect();
     let stale = results
         .iter()
-        .all(|(var, _, _)| producer_block_index(graph, var).is_none());
+        .all(|rec| producer_block_index(graph, &rec.result).is_none());
     if stale && results.len() == live.len() {
         results
             .iter()
             .zip(live)
-            .map(|((_, suffix, ty), var)| (var, suffix.clone(), ty.clone()))
+            .map(|(rec, var)| ResultExcCall {
+                result: var,
+                suffix: rec.suffix.clone(),
+                payload_ty: rec.payload_ty.clone(),
+                sum: rec.sum.clone(),
+                ok_vsid: rec.ok_vsid,
+                err_vsid: rec.err_vsid,
+            })
             .collect()
     } else {
         results.to_vec()
@@ -9119,16 +9192,12 @@ fn origin_is_toint(graph: &FunctionGraph, origin: &CarrierOrigin, toint_vars: &[
 /// Returns the fused `map_err` dest vars so later carrier rewrites skip them.
 pub(crate) fn fuse_toint_map_err_sites(
     graph: &mut FunctionGraph,
-    toint_results: &[(Variable, Option<String>, ValueType)],
+    toint_results: &[ResultExcCall],
     map_err_sites: &[crate::front::result_map_err::ResultMapErrSite],
 ) -> Result<Vec<Variable>, String> {
-    let toint_vars: Vec<Variable> = toint_results
-        .iter()
-        .map(|(var, _, _)| var.clone())
-        .collect();
     let mut fused = Vec::new();
     for site in map_err_sites {
-        if fuse_one_toint_map_err(graph, site, &toint_vars) {
+        if fuse_one_toint_map_err(graph, site, toint_results) {
             fused.push(site.result_var.clone());
         }
     }
@@ -9769,8 +9838,9 @@ fn emit_toint_overflow_mapper(
 fn fuse_one_toint_map_err(
     graph: &mut FunctionGraph,
     site: &crate::front::result_map_err::ResultMapErrSite,
-    toint_vars: &[Variable],
+    toint_results: &[ResultExcCall],
 ) -> bool {
+    let toint_vars: Vec<Variable> = toint_results.iter().map(|rec| rec.result.clone()).collect();
     let name = graph.name.clone();
     let Some(u) = producer_block_index(graph, &site.result_var) else {
         return false;
@@ -9798,7 +9868,7 @@ fn fuse_one_toint_map_err(
         Ok(origin) => origin,
         Err(_) => return false,
     };
-    if !origin_is_toint(graph, &origin, toint_vars) {
+    if !origin_is_toint(graph, &origin, &toint_vars) {
         return false;
     }
     if matches!(
@@ -9848,12 +9918,24 @@ fn fuse_one_toint_map_err(
     // leave hop exits naming a register the hop does not define.
     replace_var_everywhere(graph, &map_err_result, &recv_var);
 
-    let recorded = [(origin.r.clone(), None, ValueType::Int)];
+    let toint_rec = toint_results.iter().find(|rec| rec.result == origin.r);
+    let ok_vsid = toint_rec.and_then(|rec| rec.ok_vsid);
+    let err_vsid = toint_rec.and_then(|rec| rec.err_vsid);
+    let recorded = [ResultExcCall {
+        result: origin.r.clone(),
+        suffix: toint_rec.and_then(|rec| rec.suffix.clone()),
+        payload_ty: ValueType::Int,
+        sum: toint_rec.and_then(|rec| rec.sum.clone()),
+        ok_vsid,
+        err_vsid,
+    }];
     let outcome = match rewire_one_call_site(
         graph,
         &origin.r,
         "",
         &ValueType::Int,
+        ok_vsid,
+        err_vsid,
         false,
         false,
         &recorded,
@@ -12123,6 +12205,7 @@ pub(crate) fn build_shell(
     payload: Variable,
     payload_ty: ValueType,
     suffix: &str,
+    variant_id: Option<majit_ir::descr::StructId>,
 ) -> Variable {
     use crate::model::FieldDescriptor;
     let owner = format!("core::result::Result{suffix}::{variant}");
@@ -12135,8 +12218,10 @@ pub(crate) fn build_shell(
                 base: shell.clone(),
                 field: FieldDescriptor {
                     name: "__pos_0".to_string(),
-                    owner_root: Some(owner),
-                    owner_id: None,
+                    owner_root: Some(owner.clone()),
+                    owner_id: variant_id.or_else(|| {
+                        crate::front::option_variant::struct_id_from_enum_owner_spelling(&owner)
+                    }),
                     base_is_deref: None,
                     taken_by_address: false,
                     inline_vec: false,
@@ -16009,7 +16094,9 @@ mod static_result_shell_tests {
                     field: crate::model::FieldDescriptor {
                         name: name.into(),
                         owner_root: Some(owner.into()),
-                        owner_id: None,
+                        owner_id: crate::front::option_variant::struct_id_from_enum_owner_spelling(
+                            owner,
+                        ),
                         base_is_deref: None,
                         taken_by_address: false,
                         inline_vec: false,
@@ -16687,8 +16774,10 @@ mod static_result_shell_tests {
                     base: shell.clone(),
                     field: crate::model::FieldDescriptor {
                         name: name.into(),
-                        owner_root: Some(field_owner),
-                        owner_id: None,
+                        owner_root: Some(field_owner.clone()),
+                        owner_id: crate::front::option_variant::struct_id_from_enum_owner_spelling(
+                            &field_owner,
+                        ),
                         base_is_deref: None,
                         taken_by_address: false,
                         inline_vec: false,
@@ -16764,7 +16853,9 @@ mod static_result_shell_tests {
                 field: crate::model::FieldDescriptor {
                     name: "__pos_0".into(),
                     owner_root: Some("core::result::Result<i64,PyError>::Ok".into()),
-                    owner_id: None,
+                    owner_id: crate::front::option_variant::struct_id_from_enum_owner_spelling(
+                        "core::result::Result<i64,PyError>::Ok",
+                    ),
                     base_is_deref: None,
                     taken_by_address: false,
                     inline_vec: false,
@@ -16937,7 +17028,7 @@ mod rewire_dead_arm_tests {
         let ghost = Variable::new();
         let outcome = rewire_result_exc_call_sites(
             &mut graph,
-            &[(ghost, None, ValueType::Ref(None))],
+            &[ResultExcCall::new(ghost, None, ValueType::Ref(None))],
             true,
             crate::ErrorCarrierSpec::default(),
         )
@@ -16957,7 +17048,7 @@ mod rewire_dead_arm_tests {
             .push(ghost.clone());
         let err = match rewire_result_exc_call_sites(
             &mut graph,
-            &[(ghost, None, ValueType::Ref(None))],
+            &[ResultExcCall::new(ghost, None, ValueType::Ref(None))],
             true,
             crate::ErrorCarrierSpec::default(),
         ) {
@@ -16987,7 +17078,11 @@ mod rewire_dead_arm_tests {
         graph.set_goto(a, tail, vec![]);
         let outcome = rewire_result_exc_call_sites(
             &mut graph,
-            &[(r.clone(), Some("<(),PyError>".to_string()), ValueType::Void)],
+            &[ResultExcCall::new(
+                r.clone(),
+                Some("<(),PyError>".to_string()),
+                ValueType::Void,
+            )],
             true,
             crate::ErrorCarrierSpec::default(),
         )
@@ -17131,7 +17226,7 @@ mod indirect_call_try_tests {
 
         let outcome = rewire_result_exc_call_sites(
             &mut graph,
-            &[(shell.clone(), None, ValueType::Int)],
+            &[ResultExcCall::new(shell.clone(), None, ValueType::Int)],
             true,
             crate::ErrorCarrierSpec::default(),
         )
@@ -17195,9 +17290,11 @@ mod tail_forward_close_tests {
             &r,
             "",
             &ValueType::Int,
+            None,
+            None,
             true,
             true,
-            &[(r.clone(), None, ValueType::Int)],
+            &[ResultExcCall::new(r.clone(), None, ValueType::Int)],
             crate::ErrorCarrierSpec::default(),
         )
         .expect("tail forward");
@@ -17245,9 +17342,11 @@ mod tail_forward_close_tests {
             &r,
             "",
             &ValueType::Int,
+            None,
+            None,
             true,
             true,
-            &[(r.clone(), None, ValueType::Int)],
+            &[ResultExcCall::new(r.clone(), None, ValueType::Int)],
             crate::ErrorCarrierSpec::default(),
         )
         .expect("tail forward");
@@ -17298,9 +17397,11 @@ mod tail_forward_close_tests {
             &r,
             "",
             &ValueType::Int,
+            None,
+            None,
             true,
             true,
-            &[(r.clone(), None, ValueType::Int)],
+            &[ResultExcCall::new(r.clone(), None, ValueType::Int)],
             crate::ErrorCarrierSpec::default(),
         )
         .expect("recast tail-forward rewires");
@@ -17944,7 +18045,16 @@ mod rebuilt_shell_collapse_tests {
         let (tail, _) = graph.create_block_with_arg_vars(1);
         graph.set_return(tail, None);
         graph.set_goto(a, tail, vec![r.clone()]);
-        catch_and_rewrap(&mut graph, a.0, &r, "<i64,PyError>", &ValueType::Int).expect("rewrap");
+        catch_and_rewrap(
+            &mut graph,
+            a.0,
+            &r,
+            "<i64,PyError>",
+            &ValueType::Int,
+            None,
+            None,
+        )
+        .expect("rewrap");
         assert!(
             matches!(
                 graph.blocks[a.0].exitswitch,
@@ -17979,7 +18089,16 @@ mod rebuilt_shell_collapse_tests {
         let (tail, _) = graph.create_block_with_arg_vars(1);
         graph.set_return(tail, None);
         graph.set_goto(a, tail, vec![r.clone()]);
-        catch_and_rewrap(&mut graph, a.0, &r, "<(),PyError>", &ValueType::Void).expect("rewrap");
+        catch_and_rewrap(
+            &mut graph,
+            a.0,
+            &r,
+            "<(),PyError>",
+            &ValueType::Void,
+            None,
+            None,
+        )
+        .expect("rewrap");
         let rebuilds = graph
             .blocks
             .iter()
@@ -18049,7 +18168,16 @@ mod rebuilt_shell_collapse_tests {
             ),
         ];
         graph.set_goto(a, tail, vec![r.clone()]);
-        catch_and_rewrap(&mut graph, a.0, &r, "<(),PyError>", &ValueType::Void).expect("rewrap");
+        catch_and_rewrap(
+            &mut graph,
+            a.0,
+            &r,
+            "<(),PyError>",
+            &ValueType::Void,
+            None,
+            None,
+        )
+        .expect("rewrap");
         let caught = graph.blocks[a.0]
             .exits
             .iter()
@@ -18162,7 +18290,16 @@ mod rebuilt_shell_collapse_tests {
             ),
         ];
         graph.set_goto(a, m, vec![r.clone()]);
-        catch_and_rewrap(&mut graph, a.0, &r, "<(),PyError>", &ValueType::Void).expect("rewrap");
+        catch_and_rewrap(
+            &mut graph,
+            a.0,
+            &r,
+            "<(),PyError>",
+            &ValueType::Void,
+            None,
+            None,
+        )
+        .expect("rewrap");
         let normal = &graph.blocks[a.0].exits[0];
         assert!(normal.exitcase.is_none(), "exit 0 is the normal edge");
         assert!(
@@ -18273,7 +18410,16 @@ mod rebuilt_shell_collapse_tests {
         let (tail, _) = graph.create_block_with_arg_vars(2);
         graph.set_return(tail, None);
         graph.set_goto(a, tail, vec![r.clone(), reloaded.clone()]);
-        catch_and_rewrap(&mut graph, a.0, &r, "<i64,PyError>", &ValueType::Int).expect("rewrap");
+        catch_and_rewrap(
+            &mut graph,
+            a.0,
+            &r,
+            "<i64,PyError>",
+            &ValueType::Int,
+            None,
+            None,
+        )
+        .expect("rewrap");
         let call_block = &graph.blocks[a.0];
         assert!(matches!(
             call_block.exitswitch,
@@ -18619,9 +18765,15 @@ mod drain_fuse_guarded_err_tests {
             &r,
             "<(),PyError>",
             &payload_ty,
+            None,
+            None,
             true,
             true,
-            &[(r.clone(), Some("<(),PyError>".into()), payload_ty.clone())],
+            &[ResultExcCall::new(
+                r.clone(),
+                Some("<(),PyError>".into()),
+                payload_ty.clone(),
+            )],
             spec(),
         )
         .expect("guarded Err rewraps");
@@ -18700,9 +18852,11 @@ mod drain_fuse_guarded_err_tests {
             &r,
             "<*mut PyObject,PyError>",
             &payload_ty,
+            None,
+            None,
             true,
             true,
-            &[(
+            &[ResultExcCall::new(
                 r.clone(),
                 Some("<*mut PyObject,PyError>".into()),
                 payload_ty.clone(),
@@ -18982,6 +19136,9 @@ mod option_ok_or_else_try_tests {
             error_ty: ValueType::Ref(None),
             niche: false,
             scalar_niche: false,
+            some_vsid: None,
+            ok_vsid: None,
+            err_vsid: None,
         };
         (graph, site)
     }
@@ -21076,7 +21233,7 @@ mod from_residual_conversion_tests {
     fn rewire(graph: &mut FunctionGraph, residual: Variable) -> Result<RewireOutcome, String> {
         rewire_result_exc_call_sites(
             graph,
-            &[(residual, None, ValueType::Ref(None))],
+            &[ResultExcCall::new(residual, None, ValueType::Ref(None))],
             false,
             spec(),
         )
@@ -21173,7 +21330,7 @@ mod from_residual_conversion_tests {
 
         let outcome = rewire_result_exc_call_sites(
             &mut graph,
-            &[(residual, None, ValueType::Int)],
+            &[ResultExcCall::new(residual, None, ValueType::Int)],
             true,
             spec(),
         )
@@ -21426,6 +21583,7 @@ mod from_residual_conversion_tests {
                             err: Some(err_ty),
                             continue_ty: Some(ValueType::Int),
                             break_ty: Some(break_ty),
+                            ..Default::default()
                         }),
                     args: crate::model::call_args(vec![operand]),
                     result_ty: ValueType::Ref(None),
@@ -21832,7 +21990,7 @@ mod merged_continue_tests {
     /// The start switch keeps every arm reachable. Each `?` is
     /// `call → Result::branch → ControlFlow discriminant`, and both
     /// break arms share one `from_residual` tail.
-    fn merged_question_mark() -> (FunctionGraph, Vec<(Variable, Option<String>, ValueType)>) {
+    fn merged_question_mark() -> (FunctionGraph, Vec<ResultExcCall>) {
         let mut graph = FunctionGraph::new("merged_question_mark");
         let (cont, cont_args) = graph.create_block_with_arg_vars(2);
         let payload = graph
@@ -21927,7 +22085,10 @@ mod merged_continue_tests {
         ];
         (
             graph,
-            vec![(r1, None, ValueType::Int), (r2, None, ValueType::Int)],
+            vec![
+                ResultExcCall::new(r1, None, ValueType::Int),
+                ResultExcCall::new(r2, None, ValueType::Int),
+            ],
         )
     }
 
@@ -22237,8 +22398,7 @@ mod merged_continue_tests {
     /// closes the root bracket and returns. Projecting `Err.__pos_0` into
     /// that phi puts a GC ref next to the call's `i64` payload, so the
     /// CFG return kind is `r` against `FUNC.RESULT=i`.
-    fn merged_call_and_literal_err() -> (FunctionGraph, Vec<(Variable, Option<String>, ValueType)>)
-    {
+    fn merged_call_and_literal_err() -> (FunctionGraph, Vec<ResultExcCall>) {
         let mut graph = FunctionGraph::new("merged_call_and_err");
         let (merge, merge_args) = graph.create_block_with_arg_vars(2);
         graph.push_op_var(
@@ -22317,7 +22477,10 @@ mod merged_continue_tests {
                 Some(ExitCase::Const(ConstValue::Int(1))),
             ),
         ];
-        (graph, vec![(result, None, ValueType::Int)])
+        (
+            graph,
+            vec![ResultExcCall::new(result, None, ValueType::Int)],
+        )
     }
 
     fn result_err_pos0_reaches_return(graph: &FunctionGraph) -> bool {
@@ -22599,7 +22762,7 @@ mod merged_continue_tests {
 
         let outcome = rewire_result_exc_call_sites(
             &mut graph,
-            &[(result, None, ValueType::Int)],
+            &[ResultExcCall::new(result, None, ValueType::Int)],
             true,
             crate::ErrorCarrierSpec::default(),
         )
@@ -22858,7 +23021,7 @@ mod merged_continue_tests {
 
         let outcome = rewire_result_exc_call_sites(
             &mut graph,
-            &[(result, None, ValueType::Void)],
+            &[ResultExcCall::new(result, None, ValueType::Void)],
             true,
             crate::ErrorCarrierSpec::default(),
         )
@@ -23062,7 +23225,7 @@ mod merged_continue_tests {
         );
         rewire_result_exc_call_sites(
             &mut graph,
-            &[(r, None, ValueType::Int)],
+            &[ResultExcCall::new(r, None, ValueType::Int)],
             true,
             crate::ErrorCarrierSpec::default(),
         )
@@ -23080,7 +23243,7 @@ mod merged_continue_tests {
         );
         rewire_result_exc_call_sites(
             &mut graph,
-            &[(r, None, ValueType::Int)],
+            &[ResultExcCall::new(r, None, ValueType::Int)],
             true,
             crate::ErrorCarrierSpec::default(),
         )
@@ -23097,7 +23260,7 @@ mod merged_continue_tests {
         graph.push_op_var(BlockId(b), keepalive_until_here(local), false);
         let err = match rewire_result_exc_call_sites(
             &mut graph,
-            &[(r, None, ValueType::Int)],
+            &[ResultExcCall::new(r, None, ValueType::Int)],
             true,
             crate::ErrorCarrierSpec::default(),
         ) {
@@ -23607,7 +23770,7 @@ mod toint_overflow_tests {
             ),
         ];
         graph.set_goto(a, m, vec![r.clone()]);
-        rewire_toint_call_sites(&mut graph, &[(r, None, ValueType::Int)])
+        rewire_toint_call_sites(&mut graph, &[ResultExcCall::new(r, None, ValueType::Int)])
             .expect("toint match rewires");
         let a = graph.startblock.0;
         let exc = overflow_exit(&graph, a);
@@ -23664,7 +23827,11 @@ mod toint_overflow_tests {
             catch: CarrierCatchKind::JoinDefault,
         };
         assert_eq!(
-            rewire_overflow_combinator_sites(&mut graph, &[site], &[(r, None, ValueType::Int)],),
+            rewire_overflow_combinator_sites(
+                &mut graph,
+                &[site],
+                &[ResultExcCall::new(r, None, ValueType::Int)],
+            ),
             1
         );
         assert!(
@@ -23712,6 +23879,9 @@ mod toint_overflow_tests {
             args_tuple_suffix: "<RBigIntError>".into(),
             fn_item_segments: None,
             closure_env_is_trivially_dropless: true,
+            receiver_ok_vsid: None,
+            receiver_err_vsid: None,
+            result_err_vsid: None,
         }
     }
 
@@ -24036,7 +24206,7 @@ mod toint_overflow_tests {
             let prefix_before = ops_before_toint(&graph);
             let fused = fuse_toint_map_err_sites(
                 &mut graph,
-                &[(r, None, ValueType::Int)],
+                &[ResultExcCall::new(r, None, ValueType::Int)],
                 &[map_err_site(mapped)],
             )
             .expect("toint map_err fuses");
@@ -24079,7 +24249,7 @@ mod toint_overflow_tests {
         let prefix_before = ops_before_toint(&graph);
         let fused = fuse_toint_map_err_sites(
             &mut graph,
-            &[(r, None, ValueType::Int)],
+            &[ResultExcCall::new(r, None, ValueType::Int)],
             &[map_err_site(mapped)],
         )
         .expect("toint map_err fuses");
@@ -24200,7 +24370,7 @@ mod toint_overflow_tests {
         let prefix_before = ops_before_toint(&graph);
         let fused = fuse_toint_map_err_sites(
             &mut graph,
-            &[(r, None, ValueType::Int)],
+            &[ResultExcCall::new(r, None, ValueType::Int)],
             &[map_err_site(mapped)],
         )
         .expect("toint map_err fuses");
@@ -24330,7 +24500,7 @@ mod toint_overflow_tests {
             let before = graph.clone();
             let fused = fuse_toint_map_err_sites(
                 &mut graph,
-                &[(r, None, ValueType::Int)],
+                &[ResultExcCall::new(r, None, ValueType::Int)],
                 &[map_err_site(mapped)],
             )
             .expect("declined fusion is not a translation error");
@@ -24439,7 +24609,7 @@ mod toint_overflow_tests {
         let before = graph.clone();
         let fused = fuse_toint_map_err_sites(
             &mut graph,
-            &[(r, None, ValueType::Int)],
+            &[ResultExcCall::new(r, None, ValueType::Int)],
             &[map_err_site(mapped)],
         )
         .expect("declined fusion is not a translation error");

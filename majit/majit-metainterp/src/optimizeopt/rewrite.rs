@@ -8,7 +8,7 @@ use majit_ir::operand::Operand;
 use majit_ir::{Const, Op, OpCode, OpRc, OpRef, Value};
 use std::cell::{Cell, RefCell};
 
-use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
+use crate::optimizeopt::info::{PreambleOp, PtrInfo, PtrInfoExt};
 use crate::optimizeopt::optimizer::{Optimizer, send_extra_operation_from};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult, intdiv};
 
@@ -714,8 +714,9 @@ impl OptRewrite {
         // the typeptr at offset 0 via cls_of_box and compares against
         // expectedclassbox. Mismatch → proven-fail guard → InvalidLoop.
         let obj_info_for_class = ctx.getptrinfo(&op.arg(0).get_box_replacement(false));
-        if let Some(known_class) =
-            obj_info_for_class.and_then(|i| i.get_known_class(ctx.cpu.as_ref()))
+        if let Some(known_class) = obj_info_for_class
+            .as_ref()
+            .and_then(|i| i.get_known_class(ctx.cpu.as_ref()))
             && op.num_args() >= 2
         {
             // RPython GuardClass / GuardNonnullClass class operands are
@@ -733,6 +734,26 @@ impl OptRewrite {
                 // proven-fail guard — abort the trace.
                 return raise_invalid_loop("GUARD_CLASS proven to always fail", op, ctx);
             }
+        }
+        // A plain `new` is a vstruct (`virtualize.py optimize_NEW` /
+        // `make_vstruct`). `rewrite_op_malloc` emits `new` when the
+        // first-field chain is the object-header type itself
+        // (`heaptracker.py has_gcstruct_a_vtable`: `rclass.OBJECT` has
+        // no vtable), and `rewrite_op_setfield` drops the typeptr store
+        // (`is_typeptr_getset`). The recorded GUARD_CLASS therefore
+        // carries expected class 0 — the NEW's typeptr is never written.
+        // `info.py StructPtrInfo` has no `_known_class`, so the match
+        // above cannot see it; the descr's vtable word of 0 is that
+        // fact. Leaving the guard `force_box`es a unique nursery object
+        // every iteration (`info.py AbstractVirtualPtrInfo.force_box`).
+        // `NewWithVtable` with vtable 0 is a different shape
+        // (`rewrite_op_malloc` fill-from-published-group) and stays on
+        // `PtrInfo::Virtual`, whose `get_known_class` filters 0.
+        if op.num_args() >= 2
+            && matches!(obj_info_for_class.as_ref(), Some(PtrInfo::VirtualStruct(_)))
+            && ctx.get_constant_int_box(&op.arg(1)) == Some(0)
+        {
+            return OptimizationResult::Remove;
         }
         // rewrite.py:408-427: guard strengthening.
         // If there was a previous GUARD_NONNULL on the same value,

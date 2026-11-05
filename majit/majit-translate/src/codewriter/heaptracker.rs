@@ -54,12 +54,14 @@ pub fn has_gcstruct_a_vtable(gcstruct: &Struct) -> bool {
 /// the class word of the object header.  Upstream keys on `typeptr` and
 /// the struct's `typeptr` hint; pyre's header is `PyObject { ob_type,
 /// w_class }`, and only `ob_type` is the class the tracer guards on.
+///
+/// A flattened containment path (`frame.ob_header.ob_type` on
+/// `GcFramePrefix`) is the same word: `all_fielddescrs` skips it via
+/// [`is_header_word`], so `fielddescrof` getattr would miss. The rewrite
+/// has to fire on that spelling too (`handle_getfield_typeptr` /
+/// `rewrite_op_setfield` drop).
 pub fn is_typeptr_field(field: &crate::model::FieldDescriptor) -> bool {
-    let owner_leaf = field
-        .owner_root
-        .as_deref()
-        .map(|owner| owner.rsplit("::").next().unwrap_or(owner));
-    field.name == "ob_type" && owner_leaf == Some("PyObject")
+    is_header_word(field.owner_root.as_deref().unwrap_or(""), &field.name)
 }
 
 /// `has_gcstruct_a_vtable` over ordered field entries (`STRUCT._names`).
@@ -403,6 +405,27 @@ mod tests {
         assert!(!is_header_word("PyObject", "w_class"));
         assert!(!is_header_word("W_BytesObject", "ob_header.w_class"));
         assert!(!is_header_word("Method", "ob"));
+    }
+
+    #[test]
+    fn typeptr_field_matches_nested_header_word() {
+        let leaf = crate::model::FieldDescriptor::new("ob_type", Some("PyObject".into()));
+        assert!(is_typeptr_field(&leaf));
+        let float_header =
+            crate::model::FieldDescriptor::new("ob_header.ob_type", Some("W_FloatObject".into()));
+        assert!(is_typeptr_field(&float_header));
+        let nested = crate::model::FieldDescriptor::new(
+            "frame.ob_header.ob_type",
+            Some("pyframe::GcFramePrefix".into()),
+        );
+        assert!(is_typeptr_field(&nested));
+        let w_class_leaf = crate::model::FieldDescriptor::new("w_class", Some("PyObject".into()));
+        assert!(!is_typeptr_field(&w_class_leaf));
+        let w_class = crate::model::FieldDescriptor::new(
+            "frame.ob_header.w_class",
+            Some("pyframe::GcFramePrefix".into()),
+        );
+        assert!(!is_typeptr_field(&w_class));
     }
 
     #[test]

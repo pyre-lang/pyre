@@ -352,8 +352,13 @@ pub(in crate::front::mir) fn compute_interior_field_extra_live(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Vec<Vec<usize>> {
-    let mut extra = vec![Vec::new(); body.body.len()];
+    let n_blocks = body.body.len();
+    let n_locals = body.locals.locals.len();
     let forward_blocks = forward_reachable_mask(llbc, body);
+    // dest local → (header, index) for each `ptr::add` this pass rewrites.
+    // Indexed by MIR local so the use scan is one pass over the body, not a
+    // (add × block) product (`graphanalyze.py` walks each op once).
+    let mut dest_of: Vec<Option<(usize, usize)>> = vec![None; n_locals];
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -367,13 +372,17 @@ pub(in crate::front::mir) fn compute_interior_field_extra_live(
         let PlaceKind::Local(dest) = call.dest.kind else {
             continue;
         };
+        let dest = dest as usize;
+        if dest >= n_locals {
+            continue;
+        }
         let Some(traced) = struct_field_ptr_add_trace(
             reg,
             call.args.len(),
             operand_local(call.args.first()),
             call.args.first().and_then(operand_tyref),
             operand_local(call.args.get(1)),
-            dest as usize,
+            dest,
             body,
             llbc,
             tombstoned,
@@ -384,14 +393,25 @@ pub(in crate::front::mir) fn compute_interior_field_extra_live(
             TracedPtrAddHeader::EntriesItem { local } => local,
             TracedPtrAddHeader::EntryPtr { recv_local, .. } => recv_local,
         };
-        for (use_idx, use_bb) in body.body.iter().enumerate() {
-            if !forward_blocks[use_idx] {
+        dest_of[dest] = Some((header_local, traced.index_local));
+    }
+    if dest_of.iter().all(Option::is_none) {
+        return vec![Vec::new(); n_blocks];
+    }
+    let mut extra = vec![Vec::new(); n_blocks];
+    let mut seen = bit_set::BitSet::new();
+    for (use_idx, use_bb) in body.body.iter().enumerate() {
+        if !forward_blocks[use_idx] {
+            continue;
+        }
+        seen.make_empty();
+        struct_field_value_dests_in_block(llbc, use_bb, &mut seen);
+        for dest in seen.iter() {
+            let Some((header, index)) = dest_of.get(dest).copied().flatten() else {
                 continue;
-            }
-            if block_has_struct_field_value_use(llbc, use_bb, dest as usize) {
-                extra[use_idx].push(header_local);
-                extra[use_idx].push(traced.index_local);
-            }
+            };
+            extra[use_idx].push(header);
+            extra[use_idx].push(index);
         }
     }
     extra
@@ -423,25 +443,14 @@ pub(in crate::front::mir) fn compute_mir_liveness(
     body: &Unstructured,
     extra_live: &[Vec<usize>],
     glue_call_drops: &bit_set::BitSet,
-) -> Vec<bit_set::BitSet> {
-    use bit_set::BitSet;
-
+) -> Vec<LocalSet> {
     let n_blocks = body.body.len();
     let n_locals = body.locals.locals.len();
     // Same closure as whole-body scans: a panic-abort default still
     // contributes uses, and an `on_unwind` cleanup block does not.
     let forward = forward_reachable_mask(llbc, body);
-    let mut uses = Vec::with_capacity(n_blocks);
-    let mut defs = Vec::with_capacity(n_blocks);
-    for bb_idx in 0..n_blocks {
-        if forward[bb_idx] {
-            uses.push(BitSet::with_capacity(n_locals));
-            defs.push(BitSet::with_capacity(n_locals));
-        } else {
-            uses.push(BitSet::new());
-            defs.push(BitSet::new());
-        }
-    }
+    let mut uses = empty_block_local_sets(n_blocks);
+    let mut defs = empty_block_local_sets(n_blocks);
     let mut succs = vec![Vec::<usize>::new(); n_blocks];
     let mut preds = vec![Vec::<usize>::new(); n_blocks];
 
@@ -535,27 +544,24 @@ pub(in crate::front::mir) fn compute_mir_liveness(
         }
     }
 
-    let mut live_in = Vec::with_capacity(n_blocks);
-    for bb_idx in 0..n_blocks {
-        if forward[bb_idx] {
-            live_in.push(BitSet::with_capacity(n_locals));
-        } else {
-            live_in.push(BitSet::new());
-        }
-    }
+    let mut live_in = empty_block_local_sets(n_blocks);
     let mut worklist: std::collections::VecDeque<usize> =
         (0..n_blocks).rev().filter(|&bb| forward[bb]).collect();
     let mut in_worklist = forward.clone();
+    // One scratch row: `liveness.py` `compute_liveness` reuses the
+    // bitvector it unions into. Cloning a fresh `BitSet` per worklist
+    // pop is `O(blocks × locals × iterations)` retained churn.
+    let mut new_in = LocalSet::new();
     while let Some(bb_idx) = worklist.pop_front() {
         in_worklist[bb_idx] = false;
-        let mut new_in = BitSet::with_capacity(n_locals);
+        new_in.clear();
         for &succ in &succs[bb_idx] {
             new_in.union_with(&live_in[succ]);
         }
         new_in.difference_with(&defs[bb_idx]);
         new_in.union_with(&uses[bb_idx]);
         if new_in != live_in[bb_idx] {
-            live_in[bb_idx] = new_in;
+            live_in[bb_idx].clone_from(&new_in);
             for &pred in &preds[bb_idx] {
                 if !in_worklist[pred] {
                     worklist.push_back(pred);
@@ -582,12 +588,7 @@ pub(in crate::front::mir) fn push_successor(
     }
 }
 
-pub(in crate::front::mir) fn mark_call_uses(
-    call: &CallPayload,
-    uses: &mut bit_set::BitSet,
-    defs: &bit_set::BitSet,
-    n_locals: usize,
-) {
+fn mark_call_uses(call: &CallPayload, uses: &mut LocalSet, defs: &LocalSet, n_locals: usize) {
     if let CallFunc::Dynamic(op, _) = &call.func {
         mark_operand_use(op, uses, defs, n_locals);
     }
@@ -596,12 +597,7 @@ pub(in crate::front::mir) fn mark_call_uses(
     }
 }
 
-pub(in crate::front::mir) fn mark_rvalue_uses(
-    rvalue: &Rvalue,
-    uses: &mut bit_set::BitSet,
-    defs: &bit_set::BitSet,
-    n_locals: usize,
-) {
+fn mark_rvalue_uses(rvalue: &Rvalue, uses: &mut LocalSet, defs: &LocalSet, n_locals: usize) {
     match rvalue {
         Rvalue::Use(op, _)
         | Rvalue::UnaryOp(_, op)
@@ -625,24 +621,14 @@ pub(in crate::front::mir) fn mark_rvalue_uses(
     }
 }
 
-pub(in crate::front::mir) fn mark_operand_use(
-    op: &Operand,
-    uses: &mut bit_set::BitSet,
-    defs: &bit_set::BitSet,
-    n_locals: usize,
-) {
+fn mark_operand_use(op: &Operand, uses: &mut LocalSet, defs: &LocalSet, n_locals: usize) {
     match op {
         Operand::Copy(place) | Operand::Move(place) => mark_place_use(place, uses, defs, n_locals),
         Operand::Const(_) => {}
     }
 }
 
-pub(in crate::front::mir) fn mark_place_use(
-    place: &Place,
-    uses: &mut bit_set::BitSet,
-    defs: &bit_set::BitSet,
-    n_locals: usize,
-) {
+fn mark_place_use(place: &Place, uses: &mut LocalSet, defs: &LocalSet, n_locals: usize) {
     match &place.kind {
         PlaceKind::Local(i) => mark_local_use(*i as usize, uses, defs, n_locals),
         PlaceKind::Projection(inner, elem) => {
@@ -653,12 +639,7 @@ pub(in crate::front::mir) fn mark_place_use(
     }
 }
 
-pub(in crate::front::mir) fn mark_place_write(
-    place: &Place,
-    uses: &mut bit_set::BitSet,
-    defs: &mut bit_set::BitSet,
-    n_locals: usize,
-) {
+fn mark_place_write(place: &Place, uses: &mut LocalSet, defs: &mut LocalSet, n_locals: usize) {
     match &place.kind {
         PlaceKind::Local(i) => mark_local_def(*i as usize, defs, n_locals),
         PlaceKind::Projection(inner, elem) => {
@@ -684,8 +665,8 @@ pub(in crate::front::mir) fn mark_place_write(
 /// marks every register argument alive.
 pub(in crate::front::mir) fn mark_projection_index_offset_use(
     elem: &ProjectionElem,
-    uses: &mut bit_set::BitSet,
-    defs: &bit_set::BitSet,
+    uses: &mut LocalSet,
+    defs: &LocalSet,
     n_locals: usize,
 ) {
     let ProjectionElem::Tagged(v) = elem else {
@@ -714,8 +695,8 @@ pub(in crate::front::mir) fn mark_projection_index_offset_use(
 
 pub(in crate::front::mir) fn mark_local_use(
     local_idx: usize,
-    uses: &mut bit_set::BitSet,
-    defs: &bit_set::BitSet,
+    uses: &mut LocalSet,
+    defs: &LocalSet,
     n_locals: usize,
 ) {
     if local_idx >= n_locals || defs.contains(local_idx) {
@@ -726,7 +707,7 @@ pub(in crate::front::mir) fn mark_local_use(
 
 pub(in crate::front::mir) fn mark_local_def(
     local_idx: usize,
-    defs: &mut bit_set::BitSet,
+    defs: &mut LocalSet,
     n_locals: usize,
 ) {
     if local_idx < n_locals {

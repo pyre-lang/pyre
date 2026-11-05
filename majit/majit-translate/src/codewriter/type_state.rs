@@ -451,6 +451,27 @@ fn signed_ids_that_must_stay_int(
             {
                 stay.insert(result.id());
             }
+            // A call result's kind is the callee's return kind
+            // (`rpbc.py` FunctionsPBCRepr.call `hop.r_result`;
+            // `jtransform.py` rewrite_call `getkind(op.result.concretetype)`;
+            // `inline_call_*_<kind>` / `<kind>_return` agreement). A GC
+            // field access on it goes through
+            // `redirect_signed_base_through_cast`, as for any stay-int base.
+            if matches!(
+                &op.kind,
+                OpKind::Call { .. }
+                    | OpKind::IndirectCall { .. }
+                    | OpKind::CallResidual { .. }
+                    | OpKind::CallMayForce { .. }
+                    | OpKind::CallElidable { .. }
+                    | OpKind::InlineCall { .. }
+                    | OpKind::ConditionalCall { .. }
+                    | OpKind::ConditionalCallValue { .. }
+                    | OpKind::RecordKnownResult { .. }
+                    | OpKind::RecursiveCall { .. }
+            ) {
+                stay.insert(result.id());
+            }
         }
     }
     let mut ties: Vec<(Variable, Variable)> = Vec::new();
@@ -1162,7 +1183,7 @@ pub(crate) fn field_owner_is_gc(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FieldDescriptor, OpKind, SpaceOperation, ValueType};
+    use crate::model::{CallTarget, FieldDescriptor, LinkArg, OpKind, SpaceOperation, ValueType};
 
     fn push_input(
         graph: &mut FunctionGraph,
@@ -1398,6 +1419,80 @@ mod tests {
             OpKind::UnaryOp { op, operand, .. }
                 if op == "cast_int_to_ptr" && operand.id() == sum.id()
         )));
+    }
+
+    #[test]
+    fn promote_gc_field_bases_casts_a_signed_direct_call_result_used_only_as_a_field_base() {
+        let mut graph = FunctionGraph::new("signed_call_field_base");
+        let arg = push_input(&mut graph, "obj", ValueType::Ref(None));
+        FunctionGraph::set_concretetype_of_inline(&arg, ConcreteType::GcRef);
+        let call_result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["callee"]),
+                    args: vec![LinkArg::Value(arg)],
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&call_result, ConcreteType::Signed);
+        let read = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: call_result.clone(),
+                    field: FieldDescriptor::new("x", Some("Point".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(read));
+
+        promote_gc_field_bases(&mut graph, None);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&call_result),
+            ConcreteType::Signed,
+            "a call result's kind is the callee's return kind"
+        );
+        let ops = &graph.block(graph.startblock).operations;
+        let cast_at = ops
+            .iter()
+            .position(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, operand, .. }
+                        if op == "cast_int_to_ptr" && operand.id() == call_result.id()
+                )
+            })
+            .expect("cast_int_to_ptr of the signed call result");
+        let field_at = ops
+            .iter()
+            .position(|op| matches!(&op.kind, OpKind::FieldRead { .. }))
+            .expect("field read");
+        assert!(cast_at < field_at, "the cast dominates the field read");
+        let OpKind::FieldRead {
+            base: field_base, ..
+        } = &ops[field_at].kind
+        else {
+            unreachable!("field read");
+        };
+        assert_ne!(field_base.id(), call_result.id());
+        assert_eq!(
+            FunctionGraph::concretetype_of(field_base),
+            ConcreteType::GcRef
+        );
+        assert!(ops.iter().any(|op| {
+            matches!(&op.kind, OpKind::Call { .. })
+                && op
+                    .result
+                    .as_ref()
+                    .is_some_and(|r| r.id() == call_result.id())
+        }));
     }
 
     #[test]

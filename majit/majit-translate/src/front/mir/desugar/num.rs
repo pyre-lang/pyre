@@ -853,7 +853,7 @@ impl<'a> Lowering<'a> {
         let owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let arg = arg.clone();
         let bb_id = self.emit_bb(mir_bb);
@@ -1060,10 +1060,20 @@ impl<'a> Lowering<'a> {
             },
         });
         self.local_var[dest_local] = Some(LocalValue::One(result.clone()));
-        let suffix =
-            crate::front::result_exc::tyref_result_instantiation_suffix(dest_ty, self.llbc);
+        let suffix = crate::front::result_exc::tyref_result_instantiation_suffix(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+        );
         self.toint_call_results
-            .push((result, suffix, ValueType::Int));
+            .push(crate::front::result_exc::ResultExcCall {
+                result,
+                suffix,
+                payload_ty: ValueType::Int,
+                sum: None,
+                ok_vsid: self.stamp_variant_vsid(dest_ty, "Ok"),
+                err_vsid: self.stamp_variant_vsid(dest_ty, "Err"),
+            });
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -1126,7 +1136,7 @@ impl<'a> Lowering<'a> {
         let owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let bb_id = self.emit_bb(mir_bb);
         let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
@@ -1359,7 +1369,7 @@ impl<'a> Lowering<'a> {
         let owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let tuple_owner = format!("Tuple{suffix}");
         let bb_id = self.emit_bb(mir_bb);
@@ -1501,7 +1511,7 @@ impl<'a> Lowering<'a> {
         let owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let arg = arg.clone();
         if src_is_signed_word {
@@ -1679,7 +1689,7 @@ impl<'a> Lowering<'a> {
         let owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(result_ty, self.llbc)
+            tyref_enum_instantiation_suffix(result_ty, self.llbc, self.tombstoned_leaves)
         );
         let bb_id = self.emit_bb(mir_bb);
         let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
@@ -1881,7 +1891,7 @@ impl<'a> Lowering<'a> {
         let owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(result_ty, self.llbc)
+            tyref_enum_instantiation_suffix(result_ty, self.llbc, self.tombstoned_leaves)
         );
         let bb_id = self.emit_bb(mir_bb);
         let disc = self

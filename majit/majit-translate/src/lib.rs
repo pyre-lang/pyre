@@ -423,6 +423,7 @@ fn build_semantic_program_via_active_frontend(
                 unsafe_fn_stubs: Vec::new(),
                 foreign_opaque_method_externals: Vec::new(),
                 atomic_load_decls: Vec::new(),
+                struct_layouts: Default::default(),
             });
             front::mir::harden_duplicate_leaf_metadata(
                 &mut program.struct_fields,
@@ -1106,11 +1107,30 @@ fn expand_immutable_fields_to_all_spellings(
     let mut declared_names: Vec<&String> = declared.keys().collect();
     declared_names.sort();
     for name in declared_names {
+        let entries = &declared[name];
         if let Some(sid) = majit_ir::descr::struct_template_id_for_name(name) {
-            by_struct_id.entry(sid).or_insert(&declared[name]);
+            by_struct_id.entry(sid).or_insert(entries);
+        }
+        // A marker const next to a foreign struct is keyed by the const's
+        // bare leaf (`_immutable_fields_CodeObject` → `CodeObject`). The
+        // field-read `owner_root` is the defining path
+        // (`bytecode::CodeObject`). `rclass.py _parse_field_list` reads
+        // `_immutable_fields_` off the class object; `canonical_struct_name`
+        // is that class's intern key once `STRUCT_ORIGIN_REGISTRY` is live.
+        let canon = majit_ir::descr::canonical_struct_name(name);
+        if canon != *name
+            && let Some(sid) = majit_ir::descr::struct_template_id_for_name(&canon)
+        {
+            by_struct_id.entry(sid).or_insert(entries);
         }
     }
     let mut out = declared.clone();
+    for name in declared.keys() {
+        let canon = majit_ir::descr::canonical_struct_name(name);
+        if canon != *name {
+            out.entry(canon).or_insert_with(|| declared[name].clone());
+        }
+    }
     for name in struct_fields.fields.keys() {
         if out.contains_key(name) {
             continue;
@@ -1629,6 +1649,7 @@ fn analyze_pipeline_from_module_paths(
         Option<String>,
         Vec<String>,
         crate::model::LazyGraph,
+        Option<u64>,
     )> = Vec::new();
     let mut canonical_function_graphs: std::collections::HashMap<
         crate::parse::CallPath,
@@ -1712,18 +1733,18 @@ fn analyze_pipeline_from_module_paths(
     for func in &program.functions {
         match (&func.self_ty_root, &func.trait_root) {
             // Concrete trait-impl method: `impl Trait for Type { fn m }`.
-            // Registration-wise it behaves exactly like an inherent
-            // method (`[Owner, method]` graph + hints below); routing it
-            // through `register_trait_method` instead would also seed
-            // `method_to_impl_types`, flipping `resolve_method`'s
-            // name-based lookup for every same-named method.  The trait
-            // identity feeds two complementary direct-path consumers:
-            // the `concrete_trait_methods` loop below binds the unique
-            // impl when the trait method has NO default body, and the
-            // `trait_method_overrides` lookup inside the default-body
-            // registration prefers the unique override over the default
-            // (`classdesc.py` — a concrete override shadows the
-            // trait default in the MRO walk).
+            // rustc's method-call rule (Reference, "Method-call
+            // expressions") picks an inherent method before any trait
+            // method of the same name, so this row is NOT registered at
+            // owner-leaf when the owner has an inherent of this leaf
+            // (`register_trait_impl_method` / vacant-only alias). The
+            // trait identity feeds two complementary direct-path
+            // consumers: the `concrete_trait_methods` loop below binds
+            // the unique impl when the trait method has NO default body,
+            // and the `trait_method_overrides` lookup inside the
+            // default-body registration prefers the unique override over
+            // the default (`classdesc.py` — a concrete override shadows
+            // the trait default in the MRO walk).
             (Some(owner), Some(trait_leaf)) => {
                 concrete_trait_methods.push((
                     trait_leaf.clone(),
@@ -1735,6 +1756,7 @@ fn analyze_pipeline_from_module_paths(
                     func.return_type.clone(),
                     func.hints.clone(),
                     func.lazy_graph().clone(),
+                    func.trait_impl_id,
                 ));
                 index_concrete_trait_method(
                     func,
@@ -1842,7 +1864,7 @@ fn analyze_pipeline_from_module_paths(
 
     // ── Build CallControl (RPython call.py) ──
     // Populate with all discovered function graphs and trait impl methods.
-    let mut call_control = call::CallControl::new();
+    let mut call_control = call::CallControl::with_struct_layouts(program.struct_layouts.clone());
     call_control.use_funcobj_declarations(funcobj_declarations);
     // RPython: known struct types for get_type_flag(ARRAY.OF) → FLAG_STRUCT.
     call_control.set_known_struct_names(program.known_struct_names.clone());
@@ -2030,89 +2052,49 @@ fn analyze_pipeline_from_module_paths(
     // classification, immutability rank, and size stay as the provider
     // computed them; only the byte offsets and the struct size are corrected.
     prof.mark("  call_control setup");
-    for struct_name in program.struct_fields.fields.keys() {
-        // Resolve the (possibly multi-spelled) field-registry key to its
-        // identity token; an unresolved / ambiguous bare leaf has no
-        // identity to key a layout on, so skip it.
-        let Some(sid) = majit_ir::descr::struct_id_for_name(struct_name) else {
-            continue;
-        };
-        // `exact_layouts` originates on Charon's defining TypeDecl. Concrete
-        // generic identities are derived later from use-site type arguments,
-        // so inherit the declaration's exact offsets when it has no concrete
-        // entry (notably the explicit translated `Result` shell).
-        // `Option<fn(..)>::Some` is a pointer niche (`null_fn`): the
-        // payload sits at byte 0. The Option template is the explicit
-        // `[tag@0 | payload@8]` shell, so inheriting it would place
-        // `__pos_0` at 8.
-        let skip_template_exact =
-            program
-                .struct_fields
-                .fields
-                .get(struct_name)
-                .is_some_and(|rows| {
-                    !rows.iter().any(|row| row.name == "__discriminant")
-                        && rows.iter().any(|row| {
-                            row.name == "__pos_0" && majit_ir::descr::is_fn_ptr_spelling(&row.ty)
-                        })
-                });
-        let exact = program.exact_layouts.get(&sid).or_else(|| {
-            if skip_template_exact {
-                None
+    // `descr.py` `get_field_descr(STRUCT, fieldname)` keys on the lltype
+    // STRUCT object. Exact Charon layouts are installed by that identity
+    // first, including monomorphizations whose name spelling the merge
+    // withdrew. Remaining names (templates, instantiations without a
+    // Charon row) keep a heuristic layout so size/offset queries do not
+    // fall through to the C-order accumulator.
+    for entry in crate::layout::program_struct_layouts(
+        &program.struct_fields,
+        &program.exact_layouts,
+        provider,
+    ) {
+        let crate::layout::ProgramStructLayout {
+            spelling: struct_name,
+            sid,
+            exact,
+            mut layout,
+        } = entry;
+        if let Some(align) = exact.as_ref().and_then(|item| {
+            item.align
+                .or_else(|| item.host.as_ref().map(|host| host.align))
+        }) {
+            layout.align = align as usize;
+        }
+        if let Some(host) = exact.as_ref().and_then(|item| item.host.clone()) {
+            layout.host = Some(host);
+        }
+        layout.gckind =
+            if crate::front::mir::struct_id_is_declared_gc(&declared_gc, sid, &struct_name) {
+                crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
             } else {
-                majit_ir::descr::struct_template_id_for_name(struct_name)
-                    .and_then(|template| program.exact_layouts.get(&template))
-            }
-        });
-        // An opaque/shadow declaration can share the runtime identity of its
-        // defining type (e.g. pyre-interpreter's zero-field GetSetProperty
-        // marker versus pyre-object's real definition).  If Charon's exact
-        // definition carries fields but this spelling has no rows, it is an
-        // alias consumer, not a layout producer; letting it write would erase
-        // the real field layout according to HashMap iteration order.
-        let incomplete_shadow = exact.is_some_and(|layout| !layout.field_offsets.is_empty())
-            && program
-                .struct_fields
-                .fields
-                .get(struct_name)
-                .is_some_and(Vec::is_empty);
-        if incomplete_shadow {
-            continue;
-        }
-        let layout = match exact {
-            Some(exact) => {
-                provider.get_struct_layout_exact(struct_name, &exact.field_offsets, exact.size)
-            }
-            None => provider.get_struct_layout(struct_name),
-        };
-        if let Some(mut layout) = layout {
-            if let Some(align) = exact.and_then(|item| {
-                item.align
-                    .or_else(|| item.host.as_ref().map(|host| host.align))
+                crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
+            };
+        if census_struct_layouts {
+            let variants = struct_layout_variants.entry(sid).or_default();
+            if let Some((_, spellings)) = variants.iter_mut().find(|(observed, _)| {
+                observed.size == layout.size && observed.fields == layout.fields
             }) {
-                layout.align = align as usize;
+                spellings.push(struct_name.clone());
+            } else {
+                variants.push((layout.clone(), vec![struct_name.clone()]));
             }
-            if let Some(host) = exact.and_then(|item| item.host.clone()) {
-                layout.host = Some(host);
-            }
-            layout.gckind =
-                if crate::front::mir::struct_id_is_declared_gc(&declared_gc, sid, struct_name) {
-                    crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
-                } else {
-                    crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
-                };
-            if census_struct_layouts {
-                let variants = struct_layout_variants.entry(sid).or_default();
-                if let Some((_, spellings)) = variants.iter_mut().find(|(observed, _)| {
-                    observed.size == layout.size && observed.fields == layout.fields
-                }) {
-                    spellings.push(struct_name.clone());
-                } else {
-                    variants.push((layout.clone(), vec![struct_name.clone()]));
-                }
-            }
-            call_control.set_struct_layout(sid, layout);
         }
+        call_control.set_struct_layout(sid, layout);
     }
     if census_struct_layouts {
         let struct_id_count = struct_layout_variants.len();
@@ -2192,13 +2174,9 @@ fn analyze_pipeline_from_module_paths(
             &func.return_type,
             &func.return_class_root,
             func.return_can_be_none,
-            &[],
+            &func.hints,
         );
-        if func.hints.is_empty() {
-            call_control.register_function_graph(path, graph);
-        } else {
-            call_control.register_function_graph_with_hints(path, graph, func.hints.clone());
-        }
+        call_control.register_function_graph(path, graph);
     }
     prof.mark("  register concrete trait-impl identities");
     // `rpbc.py FunctionReprBase.call`: the `c_graphs` constant is the full
@@ -2437,7 +2415,7 @@ fn analyze_pipeline_from_module_paths(
     }
     let mut concrete_impl_counts: std::collections::HashMap<(String, String), usize> =
         std::collections::HashMap::new();
-    for (trait_leaf, _, method_name, _, _, _, _) in &concrete_trait_methods {
+    for (trait_leaf, _, method_name, _, _, _, _, _) in &concrete_trait_methods {
         *concrete_impl_counts
             .entry((trait_leaf.clone(), method_name.clone()))
             .or_insert(0) += 1;
@@ -2449,7 +2427,7 @@ fn analyze_pipeline_from_module_paths(
     // this is annotation-only metadata — it pulls no graph bodies into
     // callers.
     let mut trait_impl_owners: TraitImplOwners = std::collections::HashMap::new();
-    for (_, trait_qualified, _, owner, _, _, _) in &concrete_trait_methods {
+    for (_, trait_qualified, _, owner, _, _, _, _) in &concrete_trait_methods {
         // Keyed by the trait's qualified `name_path()` — two distinct
         // traits sharing a leaf name must not pool their impl owners
         // (`tyref_generic_trait_bound_root` resolves bound-trait
@@ -2538,7 +2516,9 @@ fn analyze_pipeline_from_module_paths(
     call_control.set_trait_family_registrations(trait_family_registrations);
     let trait_unique_impls = unique_trait_impl_roots(&program, trait_impl_owners);
     call_control.set_trait_unique_impls(trait_unique_impls);
-    for (trait_leaf, _, method_name, _owner, return_type, hints, graph) in &concrete_trait_methods {
+    for (trait_leaf, _, method_name, _owner, return_type, hints, graph, _) in
+        &concrete_trait_methods
+    {
         let key = (trait_leaf.clone(), method_name.clone());
         if concrete_impl_counts.get(&key) != Some(&1) || default_trait_methods.contains(&key) {
             continue;
@@ -2578,6 +2558,10 @@ fn analyze_pipeline_from_module_paths(
     // RPython: direct_call → funcobj.graph — inherent methods are resolved
     // by direct graph linkage, not name-based trait method lookup.
     // Register only in function_graphs under qualified path (Type::method).
+    // rustc method-call rule: this owner-leaf bind replaces a trait-impl
+    // that occupied the slot first (`register_trait_impl_method` is
+    // vacant-only). `method_info.graph` is this inherent's body even when
+    // `lookup_impl_method` is ambiguous against a same-leaf trait-impl.
     for method_info in &canonical_inherent_methods {
         let impl_type = method_info
             .self_ty_root
@@ -2586,8 +2570,8 @@ fn analyze_pipeline_from_module_paths(
         let path = crate::parse::CallPath::for_impl_method(impl_type, method_info.name.as_str());
         // Read the MIR-built graph; `method_info.graph` is the
         // residual fallback for the handful of MIR-uncovered entries,
-        // effectively unreached because every inherent method
-        // registered above carries a graph.
+        // and for a same-leaf trait-impl that makes the lookup
+        // ambiguous.
         let graph: &model::LazyGraph = mir_graph_lookup
             .lookup_impl_method(impl_type, &method_info.name)
             .unwrap_or(&method_info.graph);

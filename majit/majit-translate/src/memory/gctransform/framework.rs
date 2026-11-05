@@ -757,7 +757,7 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
                 continue;
             }
             for st in &bb.statements {
-                if let Ok(StmtKind::Assign(p, rv)) = st.stmt_kind()
+                if let Ok(StmtKind::Assign(p, rv)) = st.stmt_kind_ref()
                     && let Some(l) = root(&p)
                 {
                     if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rv
@@ -765,10 +765,10 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
                     {
                         projected.insert(l, elem.label());
                     }
-                    defs.insert(l, rv);
+                    defs.insert(l, rv.clone());
                 }
             }
-            if let Ok(TermKind::Call { call, .. }) = bb.term(llbc)
+            if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
                 && let Some(l) = root(&call.dest)
                 && let CallFunc::Regular(reg) = &call.func
                 && let CallKind::Fun(FunId::Regular { id }) = &reg.kind
@@ -784,7 +784,7 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
             if !call_graph_walks_block(bb, forward[bb_idx]) {
                 continue;
             }
-            let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
                 continue;
             };
             let CallFunc::Dynamic(op, _) = &call.func else {

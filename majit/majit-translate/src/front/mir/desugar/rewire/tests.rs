@@ -653,6 +653,7 @@ fn raising_combinator(
             n_inputs[0].clone(),
             ValueType::Int,
             "",
+            None,
         );
         graph.set_goto(n, a, vec![ok, n_inputs[1].clone()]);
         let error = graph
@@ -673,6 +674,7 @@ fn raising_combinator(
             error,
             ValueType::Ref(None),
             "",
+            None,
         );
         graph.set_goto(e, a, vec![err, e_inputs[0].clone()]);
         (n, e, e_inputs[2].clone())

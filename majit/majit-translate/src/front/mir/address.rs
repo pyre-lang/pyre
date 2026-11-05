@@ -211,7 +211,7 @@ impl<'a> Lowering<'a> {
                 // A residual callee is entered through its Rust ABI, which
                 // takes the address of the word. The cell exists only inside
                 // a traced body.
-                if fun_decl_is_residual(fd, self.dont_look_inside) {
+                if fun_decl_is_residual(self.llbc, fd, self.dont_look_inside) {
                     return None;
                 }
                 let mut cells = Vec::new();
@@ -552,8 +552,8 @@ impl<'a> Lowering<'a> {
             let Some(arg_node) = tyref_peel_one_ref_node(passed, self.llbc) else {
                 continue;
             };
-            let param_pointee = TyRef::Other(param_node.clone());
-            let arg_pointee = TyRef::Other(arg_node.clone());
+            let param_pointee = TyRef::Other(param_node.clone().into());
+            let arg_pointee = TyRef::Other(arg_node.clone().into());
             let Some((item_ty, itemsize, is_item_signed)) = self.raw_word_descr(&param_pointee)
             else {
                 continue;
@@ -1847,7 +1847,7 @@ pub(in crate::front::mir) fn substitute_spill_typevars(
 ) -> Option<TyRef> {
     let node = tyref_node(ty, llbc)?;
     let value = substitute_spill_value(node, owner, llbc, &mut Vec::new(), 0)?;
-    Some(TyRef::Other(value))
+    Some(TyRef::Other(value.into()))
 }
 
 /// `arg` was copied out of an aggregate's generic arguments, so it is
