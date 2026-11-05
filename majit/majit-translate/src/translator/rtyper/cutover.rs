@@ -4588,16 +4588,21 @@ fn register_opaque_external_argtype_with_result(
         let mut graph = stub_pygraph.graph.borrow_mut();
         if let Some(func) = graph.func.as_mut() {
             func.annspecialcase = Some(tag.clone());
+            func._jit_look_inside_ = Some(false);
         }
     }
     if let Some(stub) = Rc::get_mut(&mut stub_pygraph) {
         stub.func.annspecialcase = Some(tag.clone());
+        stub.func._jit_look_inside_ = Some(false);
     }
     let mut graph_func = GraphFunc::new(
         segments.last().copied().unwrap_or_default().to_string(),
         Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
     );
     graph_func.annspecialcase = Some(tag);
+    // `register_external` residual: the JIT has no body to look inside
+    // (`dont_look_inside` sets `_jit_look_inside_ = False`).
+    graph_func._jit_look_inside_ = Some(false);
     registry
         .get_or_register_with_func(key, signature, graph_func)
         .install_external_stub(stub_pygraph, s_result);
@@ -17112,6 +17117,14 @@ mod tests {
                 .and_then(|func| func.annspecialcase.clone());
             let expected = format!("specialize:argtype({argtype_index})");
             assert_eq!(annspecialcase.as_deref(), Some(expected.as_str()));
+            // `register_external` residual: the JIT has no body to look
+            // inside (`dont_look_inside` sets `_jit_look_inside_ = False`).
+            assert_eq!(
+                entry.host_object.user_function().unwrap()._jit_look_inside_,
+                Some(false),
+                "{segments:?}"
+            );
+            assert!(fd.residualizes_as_signature_stub(), "{segments:?}");
         }
     }
 
