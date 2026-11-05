@@ -412,30 +412,6 @@ pub(in crate::front::mir) fn compute_multi_assigned_locals(
         .collect()
 }
 
-/// Parameter locals (`1..=arg_count`) the body assigns again — statement
-/// assigns plus call destinations.  The incoming binding is the
-/// parameter's first definition, so one such assignment gives it two
-/// definitions.  [`Lowering::multi_assigned_locals`] counts only the
-/// assignments the body makes; this list carries the parameter case for
-/// the users that need every definition counted.
-pub(in crate::front::mir) fn compute_reassigned_param_locals(
-    llbc: &Llbc,
-    body: &Unstructured,
-) -> Vec<usize> {
-    let arg_count = body.locals.arg_count as usize;
-    let mut out = Vec::new();
-    for_each_assigned_place(llbc, body, |place| {
-        if let PlaceKind::Local(i) = place.kind {
-            let i = i as usize;
-            if (1..=arg_count).contains(&i) && !out.contains(&i) {
-                out.push(i);
-            }
-        }
-    });
-    out.sort_unstable();
-    out
-}
-
 /// Locals whose value the body can change through a mutable borrow of the
 /// local itself (`&mut l`, `&raw mut l`, or of a field or element of `l`
 /// reached without a deref). No `Assign` names the local for such a write,

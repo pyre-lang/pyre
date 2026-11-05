@@ -1,5 +1,6 @@
 //! Hand lowering of individual call sites (`lower_call` … `impl_method_owner`).
 
+use super::std_call::{AtomicClass, interior_deref_root_local, rewrite_interior_index_slots};
 use super::*;
 
 impl<'a> Lowering<'a> {
@@ -38,6 +39,7 @@ impl<'a> Lowering<'a> {
                 )));
             }
         };
+        self.clear_atomic_slots(dest_local);
         // A declared-Never callee (`assert_failed`, `panic_fmt`, a
         // `-> !` helper) is a Rust abort. Upstream that is `ll_assert`
         // / `fatalerror`: the same implicit AssertionError raise
@@ -3536,6 +3538,9 @@ impl<'a> Lowering<'a> {
                 // unicode `hash`, `rstr.py` `UNICODE`), so alias the view to the
                 // field pointer exactly like the raw-pointer casts above.
                 if args.len() == 1 && self.is_atomic_from_ptr_identity(&reg) {
+                    if let Some(src) = arg_locals.first().copied().flatten() {
+                        self.copy_atomic_slots(src, dest_local);
+                    }
                     self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -3584,48 +3589,65 @@ impl<'a> Lowering<'a> {
                 // whole-program builder's pre-existing residual fallback is
                 // separate #346 work, not an implementation of atomic loads.
                 if args.len() == 2 && self.is_atomic_load(&reg) {
-                    let receiver_locals = self.atomic_receiver_through_copies(mir_bb, &arg_locals);
                     let ordering = arg_locals
                         .get(1)
                         .copied()
                         .flatten()
-                        .and_then(|local| self.atomic_ordering_locals.get(&local))
-                        .map(String::as_str);
-                    if ordering == Some("Relaxed") {
-                        // A borrow recorded on `atomic_ref_place` already
-                        // aliases the scalar field (`STR.hash` is Signed).
-                        // `from_ptr` identity leaves the field *address*;
-                        // loading that word is `raw_load`, not aliasing the
-                        // pointer (Unsigned) onto the Signed memo.
-                        // A recorded borrow whose place reads a local written
-                        // between the borrow and the call stays unsupported:
-                        // the re-read would name another object.
-                        // A receiver whose definitions reaching the call all
-                        // copy, possibly through further copies, recorded
-                        // borrows of one place resolves as that borrow. A
-                        // receiver that a definition reaching the call may
-                        // otherwise copy one into holds the field value, not
-                        // its address, and is unsupported.
-                        if (self.atomic_receiver_has_recorded_borrow(&receiver_locals)
-                            && !self.atomic_referent_is_stable(mir_bb, &arg_locals))
-                            || self.atomic_receiver_may_copy_a_recorded_borrow(
-                                mir_bb,
-                                &receiver_locals,
-                            )
+                        .and_then(|local| self.atomic_ordering_locals.get(&local).cloned());
+                    let recv = arg_locals.first().copied().flatten();
+                    let foldable = recv.and_then(|local| self.atomic_foldable_interior(local));
+                    let is_acquire = ordering.as_deref() == Some("Acquire");
+                    // Fold on the parent and indexes captured at the borrow
+                    // (`rptr.py InteriorPtrRepr`). A pinned template
+                    // needs no parent. An Acquire load of a
+                    // quasi-immutable field is that field's read: the
+                    // descr's Acquire bit orders the executable read.
+                    if let Some((template, parent)) = foldable
+                        && (ordering.as_deref() == Some("Relaxed")
+                            || (is_acquire
+                                && self.atomic_template_final_field_is_quasi_immutable(&template)))
+                    {
+                        let value = self.fold_atomic_field_on_captured_parent(
+                            template,
+                            parent,
+                            recv,
+                            |lowering, place| lowering.resolve_place(mir_bb, place),
+                        )?;
+                        self.local_var[dest_local] = Some(LocalValue::One(value));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
+                    let class = recv.and_then(|local| self.atomic_class.get(local));
+                    let sources = recv
+                        .map(|local| self.atomic_receiver_sources(mir_bb, local))
+                        .unwrap_or_default();
+                    if ordering.as_deref() == Some("Relaxed") {
+                        if matches!(class, Some(AtomicClass::Interior(_)))
+                            || sources.borrow
+                            || (sources.call_value && sources.address)
                         {
                             return Err(LowerError::Unsupported(
                                 "atomic load ordering Relaxed requires address-preserving ordered lowering"
                                     .to_string(),
                             ));
                         }
-                        if self.bind_dest_to_recorded_atomic_load(
-                            mir_bb,
-                            dest_local,
-                            target,
-                            &receiver_locals,
-                        )? {
+                        if sources.call_value {
+                            // A reborrow of a lowered callee returning `&Atomic*` aliases the
+                            // field value that callee designates; the load is that value.
+                            self.alias_dest_to_arg0_inherit(
+                                dest_local,
+                                args[0].clone(),
+                                &arg_locals,
+                            );
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
                             return Ok(());
                         }
+                        // `from_ptr` identity of a non-borrow leaves the
+                        // field *address*; loading that word is `raw_load`.
                         if let Some((item_ty, itemsize, is_item_signed)) =
                             self.raw_word_descr(&call.dest.ty)
                         {
@@ -3661,30 +3683,7 @@ impl<'a> Lowering<'a> {
                         self.graph.set_goto(bb_id, target_bb, link_args);
                         return Ok(());
                     }
-                    // Quasi-immutable field. The field is read at the load
-                    // site through the recorded borrow (`atomic_ref_place`),
-                    // so `record_quasiimmut_field` still guards it and the
-                    // getfield executes as the Acquire load. A receiver with
-                    // no recorded borrow (an `Atomic*::from_ptr` view)
-                    // cannot be re-read there, so it stays unsupported
-                    // rather than reusing an earlier read. A borrow whose
-                    // place reads a local written between the borrow and the
-                    // call, or goes through a pointer read from a field,
-                    // also stays unsupported.
-                    let is_acquire = ordering == Some("Acquire");
-                    let ordering_label = ordering.unwrap_or("unknown").to_string();
-                    if is_acquire
-                        && self.atomic_receiver_is_quasi_immutable_field(&args[0])
-                        && self.atomic_referent_is_stable(mir_bb, &arg_locals)
-                        && self.bind_dest_to_recorded_atomic_load(
-                            mir_bb,
-                            dest_local,
-                            target,
-                            &receiver_locals,
-                        )?
-                    {
-                        return Ok(());
-                    }
+                    let ordering_label = ordering.as_deref().unwrap_or("unknown");
                     return Err(LowerError::Unsupported(format!(
                         "atomic load ordering {ordering_label} requires address-preserving ordered lowering"
                     )));
@@ -3692,8 +3691,9 @@ impl<'a> Lowering<'a> {
                 // `<Atomic*>::store(&self, value, ordering)` — the write twin
                 // of the load fold above.  A read needs no place, so the load
                 // gets away with aliasing the receiver Variable; a write does,
-                // so recover the borrowed slot from the `&self` operand
-                // ([`Lowering::atomic_ref_place`]) and emit the same
+                // so recover the borrowed place from the reaching definitions
+                // of `&self` and the parent from
+                // [`Lowering::atomic_shadow`], and emit the same
                 // `FieldWrite` a plain `slot = value` assignment would.
                 //
                 // PRECONDITION, and it is a real one: a `FieldWrite` lowers to
@@ -3715,12 +3715,14 @@ impl<'a> Lowering<'a> {
                 // target means teaching the BACKEND, or declining there.
                 // The load fold rests on the same precondition.
                 //
-                // A Relaxed store folds for any field whose place is recorded.
-                // A Release store folds only for a quasi-immutable field: the
-                // descr carries `store_is_release`, so the setfield is the
-                // Release store (the store twin of the Acquire `?` load fold).
-                // A Release store of any other field, SeqCst, and AcqRel stay
-                // the residual call.  A recorded borrow that is not stable is
+                // A Relaxed store folds for any field whose reaching
+                // definitions share a supported template. A Release store
+                // folds only for a quasi-immutable field: the descr carries
+                // `store_is_release`, so the setfield is the Release store
+                // (the store twin of the Acquire `?` load fold). A Release
+                // store of any other field, SeqCst, and AcqRel stay the
+                // residual call. A reaching borrow whose parent was not
+                // captured, or whose reaching templates disagree, is
                 // Unsupported rather than a fold.  `w_type_set_version_tag`
                 // publishes `version_tag` with Release against
                 // `w_type_get_version_tag`'s Acquire reader; folding that `?`
@@ -3731,69 +3733,62 @@ impl<'a> Lowering<'a> {
                         .get(2)
                         .copied()
                         .flatten()
-                        .and_then(|l| self.atomic_ordering_locals.get(&l))
-                        .map(String::as_str);
-                    let fold = ordering == Some("Relaxed")
-                        || (ordering == Some("Release")
-                            && self.atomic_receiver_is_quasi_immutable_field(&args[0]));
-                    if fold {
-                        // A receiver this body did not bind as a borrow of a
-                        // field — or one borrowing a whole local rather than a
-                        // field of one — leaves no place to write to.  Fall
-                        // through to the ordinary call path, which is what an
-                        // unrecognised `store` already lowers to, rather than
-                        // inventing a target or failing a graph that compiles
-                        // today.  A recorded borrow whose place reads a local
-                        // written between the borrow and the call is
-                        // unsupported: writing the place now would name
-                        // another object.  The place is copied, not taken:
-                        // one borrow stored through twice folds both times.
-                        // A receiver whose definitions reaching the call all
-                        // copy, possibly through further copies, recorded
-                        // borrows of one place resolves as that borrow. A
-                        // receiver that a definition reaching the call may
-                        // otherwise copy one into holds the field value, not
-                        // its address, and is unsupported.
-                        let receiver_locals =
-                            self.atomic_receiver_through_copies(mir_bb, &arg_locals);
-                        if (self.atomic_receiver_has_recorded_borrow(&receiver_locals)
-                            && !self.atomic_referent_is_stable(mir_bb, &arg_locals))
-                            || self.atomic_receiver_may_copy_a_recorded_borrow(
-                                mir_bb,
-                                &receiver_locals,
-                            )
-                        {
-                            return Err(LowerError::Unsupported(format!(
-                                "atomic store ordering {} requires address-preserving ordered lowering",
-                                ordering.unwrap_or("unknown")
-                            )));
-                        }
-                        let referent = receiver_locals
-                            .first()
-                            .copied()
-                            .flatten()
-                            .and_then(|l| self.atomic_ref_place.get(&l))
-                            .map(clone_place);
-                        if let Some(referent) = referent {
-                            let field_ty = clone_tyref(&referent.ty);
-                            if let PlaceKind::Projection(inner, elem) = referent.kind {
-                                let value = args[1].clone();
-                                self.emit_projection_write(
+                        .and_then(|l| self.atomic_ordering_locals.get(&l).cloned());
+                    let recv = arg_locals.first().copied().flatten();
+                    let foldable = recv.and_then(|local| self.atomic_foldable_interior(local));
+                    let template = recv.and_then(|local| {
+                        self.atomic_template
+                            .get(local)
+                            .and_then(|place| place.as_ref())
+                    });
+                    let want_fold = ordering.as_deref() == Some("Relaxed")
+                        || (ordering.as_deref() == Some("Release")
+                            && template.is_some_and(|place| {
+                                self.atomic_template_final_field_is_quasi_immutable(place)
+                            }));
+                    let sources = recv
+                        .map(|local| self.atomic_receiver_sources(mir_bb, local))
+                        .unwrap_or_default();
+                    // Fold on the parent and indexes captured at the borrow
+                    // (`rptr.py InteriorPtrRepr`). A pinned template
+                    // needs no parent. A reaching borrow whose parent
+                    // was not captured is Unsupported rather than a fold.
+                    // Otherwise fall through to the ordinary call path.
+                    // A `call_value` receiver is the field value, not an
+                    // address: do not fold or raw-store it.
+                    if want_fold && let Some((template, parent)) = foldable {
+                        let value = args[1].clone();
+                        let ordering_label = ordering.as_deref().unwrap_or("unknown").to_string();
+                        self.fold_atomic_field_on_captured_parent(
+                            template,
+                            parent,
+                            recv,
+                            |lowering, place| {
+                                let field_ty = clone_tyref(&place.ty);
+                                let PlaceKind::Projection(inner, elem) = place.kind else {
+                                    return Err(LowerError::Unsupported(format!(
+                                        "atomic store ordering {ordering_label} requires address-preserving ordered lowering"
+                                    )));
+                                };
+                                lowering.emit_projection_write(
                                     mir_bb,
                                     *inner,
                                     elem,
                                     value.into(),
                                     &field_ty,
-                                )?;
-                                // The store's result is an actual unit constant.
-                                self.local_var[dest_local] =
-                                    Some(LocalValue::One(self.emit_unit(bb_id)));
-                                let target_bb = self.block_id[target];
-                                let link_args = self.edge_args(mir_bb, target)?;
-                                self.graph.set_goto(bb_id, target_bb, link_args);
-                                return Ok(());
-                            }
-                        }
+                                )
+                            },
+                        )?;
+                        self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    } else if sources.call_value || (want_fold && sources.borrow) {
+                        return Err(LowerError::Unsupported(format!(
+                            "atomic store ordering {} requires address-preserving ordered lowering",
+                            ordering.as_deref().unwrap_or("unknown")
+                        )));
                     }
                 }
                 // `(block as *mut u8).add(ITEMS_BLOCK_ITEMS_OFFSET)` inside
@@ -8854,32 +8849,47 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
-    /// Bind `dest_local` to a fresh read of the atomic slot recorded on
-    /// the `&self` local, then close the block. The read happens at this
-    /// call site (`resolve_place`), not at the borrow that built `&self`.
-    fn bind_dest_to_recorded_atomic_load(
+    /// Lower a field op of `template`. A `Deref` root swaps `local_var[L]`
+    /// to the parent captured at the borrow; a pinned root needs no
+    /// parent (`rptr.py InteriorPtrRepr`). Each `DynIndex` operand is
+    /// rewritten to `Copy` of the index slot captured at that position
+    /// (`rptr.py rtype_getitem`). Restores the swapped root, including
+    /// on error.
+    fn fold_atomic_field_on_captured_parent<T>(
         &mut self,
-        mir_bb: usize,
-        dest_local: usize,
-        target: usize,
-        arg_locals: &[Option<usize>],
-    ) -> Result<bool, LowerError> {
-        let Some(referent) = arg_locals
-            .first()
-            .copied()
-            .flatten()
-            .and_then(|local| self.atomic_ref_place.get(&local))
-            .map(clone_place)
-        else {
-            return Ok(false);
+        template: Place,
+        parent: Option<Variable>,
+        recv: Option<usize>,
+        f: impl FnOnce(&mut Self, Place) -> Result<T, LowerError>,
+    ) -> Result<T, LowerError> {
+        let slots = recv
+            .and_then(|local| self.atomic_shadow.get(local))
+            .map(|shadow| shadow.indexes.clone())
+            .unwrap_or_default();
+        let concrete = rewrite_interior_index_slots(template, &slots);
+        let swap = if let Some(root) = interior_deref_root_local(&concrete) {
+            let Some(parent) = parent else {
+                return Err(LowerError::Unsupported(
+                    "atomic field place parent was not captured; requires address-preserving ordered lowering"
+                        .to_string(),
+                ));
+            };
+            if root >= self.local_var.len() {
+                return Err(LowerError::Unsupported(
+                    "atomic field place local is out of range".to_string(),
+                ));
+            }
+            let prev = self.local_var[root].clone();
+            self.local_var[root] = Some(LocalValue::One(parent));
+            Some((root, prev))
+        } else {
+            None
         };
-        let value = self.resolve_place(mir_bb, referent)?;
-        self.local_var[dest_local] = Some(LocalValue::One(value));
-        let bb_id = self.emit_bb(mir_bb);
-        let target_bb = self.block_id[target];
-        let link_args = self.edge_args(mir_bb, target)?;
-        self.graph.set_goto(bb_id, target_bb, link_args);
-        Ok(true)
+        let result = f(self, concrete);
+        if let Some((root, prev)) = swap {
+            self.local_var[root] = prev;
+        }
+        result
     }
 
     /// `Cell<T>` is `#[repr(transparent)]` over `T`, so `get` of a field place

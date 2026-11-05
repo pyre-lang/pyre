@@ -14,3 +14,7 @@ pub(in crate::front::mir) mod std_call;
 
 pub(in crate::front::mir) use self::callee::*;
 pub(in crate::front::mir) use self::rewire::*;
+pub(in crate::front::mir) use self::std_call::{
+    atomic_pure_reborrow_source, is_atomic_from_ptr_identity, is_atomic_load, is_atomic_store,
+    whole_local_copy_source,
+};

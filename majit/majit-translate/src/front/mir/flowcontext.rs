@@ -1,6 +1,21 @@
 //! `FlowContext` / `build_flow` (`rpython/flowspace/flowcontext.py`).
 
+use super::desugar::std_call::{
+    AtomicClass, ParsedBorrow, Shape, ShapeElem, ShapeRoot, append_projections,
+    atomic_classes_equal, dyn_index_locals_inner_first, join_atomic_class, parse_borrow_place,
+    split_deref_local_projections,
+};
 use super::*;
+
+/// Per-local captured parent and dynamic-index slots for an atomic
+/// receiver (`rptr.py InteriorPtrRepr`; `rptr.py rtype_getitem` keeps
+/// `ptr` and `index`). Index slots are one per `DynIndex` position, in
+/// path order. Indexed by MIR local.
+#[derive(Clone, Debug, Default)]
+pub(in crate::front::mir) struct AtomicShadow {
+    pub parent: Option<usize>,
+    pub indexes: Vec<usize>,
+}
 
 /// `objectmodel.keepalive_until_here`.
 pub(crate) const KEEPALIVE_UNTIL_HERE_PATH: &str =
@@ -162,6 +177,24 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// Extra slot carrying a window's GC owner (`rffi.get_raw_address_of_string`
     /// / list header) across block inputargs. Not a startblock ABI param.
     pub(in crate::front::mir) owner_shadow: Vec<Option<usize>>,
+    /// Per-local captured parent and dynamic-index slots for an atomic
+    /// receiver's copy chain (`rptr.py InteriorPtrRepr`: the parent
+    /// pointer is the value, the field names are static; `rptr.py
+    /// rtype_getitem` also stores the evaluated index). Threaded through
+    /// block inputargs and link args like [`Self::owner_shadow`]; not a
+    /// startblock ABI param.
+    pub(in crate::front::mir) atomic_shadow: Vec<AtomicShadow>,
+    /// Static class of each MIR local the atomic arms care about
+    /// (`rptr.py InteriorPtrRepr`). Indexed by MIR local.
+    pub(in crate::front::mir) atomic_class: Vec<AtomicClass>,
+    /// Representative interior template of each `Interior` local, cloned
+    /// from a contributing borrow (`rptr.py rtype_getattr` appends).
+    pub(in crate::front::mir) atomic_template: Vec<Option<Place>>,
+    /// Variables that [`Self::emit_atomic_parent_unbound`] produced: the
+    /// gc null or int zero pushed for an unbound atomic slot on an edge.
+    /// [`Self::atomic_captured_slot`] rejects only these, or a
+    /// `FrameState.copy` of one, so a captured index of 0 is kept.
+    pub(in crate::front::mir) atomic_unbound_defaults: Vec<Variable>,
     /// The local slot holding the trailing length-slot parameter of a body
     /// that returns a pair slice.
     pub(in crate::front::mir) ret_len_slot_local: Option<usize>,
@@ -311,23 +344,16 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// MIR local.
     pub(in crate::front::mir) interior_field_alias:
         std::collections::HashMap<usize, InteriorFieldAlias>,
-    /// MIR locals bound by `_i = &place` where `place` is a
-    /// `core::sync::atomic` slot, mapped to the place they borrowed.
-    ///
-    /// `<Atomic*>::store(&self, v, ord)` and `core::mem::{replace,swap,take}`
-    /// are calls, so the write target survives only as an operand.  The load
-    /// fold gets away with aliasing the receiver Variable because a read
-    /// needs no place, but a write does.  Every single-assignment borrow is
-    /// recorded; the atomic store still fires only for an atomic method.
+    /// MIR locals bound by `_i = &place` / `&raw place`, mapped to the place
+    /// they borrowed, for the place-addressed consumers of a borrow (`*p = v`,
+    /// `core::mem::{replace,swap,take}`, raw / scalar alias paths). The atomic
+    /// `load` / `store` arms do not read it: they take the borrowed place from
+    /// the reaching definitions and the parent from
+    /// [`Self::atomic_shadow`].
     ///
     /// Only locals outside [`Lowering::multi_assigned_locals`] enter, the
-    /// same restriction [`Lowering::const_discriminant_locals`] carries and
-    /// for the same reason: MIR locals are not SSA and this map is not a
-    /// flow-state, so a local borrowed from `&a` in one block and `&b` in
-    /// another would hand the store whichever block happened to be lowered
-    /// last rather than the definition that reaches it — a write to the
-    /// wrong field.  A local assigned once in the whole body carries the
-    /// reaching place at every use of it; a rebound one stays a call.
+    /// same restriction [`Lowering::const_discriminant_locals`] carries:
+    /// this map is not a flow-state.
     pub(in crate::front::mir) atomic_ref_place: std::collections::HashMap<usize, Place>,
     /// Parameter locals declared `&mut T` where `T` is a GC reference.
     /// The local holds the one-field cell, not the reference word.
@@ -352,7 +378,8 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// whose descr carries `store_is_release` so the setfield is the Release
     /// store (the store twin of the Acquire `?` load fold).  A Release store
     /// of any other field, SeqCst, and AcqRel stay the residual call.  A
-    /// recorded borrow that is not stable is Unsupported rather than a fold.
+    /// reaching borrow whose parent was not captured, or whose reaching
+    /// templates disagree, is Unsupported rather than a fold.
     /// Which makes reading the WRONG variant a dropped barrier, so this map
     /// carries the single-assignment restriction for the same reason
     /// [`Lowering::atomic_ref_place`] does.
@@ -385,10 +412,6 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// (statement assigns + call destinations).  Guard set for
     /// [`Lowering::const_discriminant_locals`].
     pub(in crate::front::mir) multi_assigned_locals: std::collections::HashSet<usize>,
-    /// Parameter locals the body assigns again. See [`compute_reassigned_param_locals`].
-    pub(in crate::front::mir) reassigned_param_locals: Vec<usize>,
-    /// Locals mutably borrowed in this body. See [`compute_mutably_borrowed_locals`].
-    pub(in crate::front::mir) mutably_borrowed_locals: Vec<usize>,
     /// String variables whose Rust source obtained a `&[u8]` through
     /// `str`/`Wtf8::as_bytes`. RPython stores UTF-8/WTF-8 in a byte string,
     /// where `ord(s[i])` is the scalar byte read; the consumer gate below
@@ -963,6 +986,346 @@ fn copy_agreed_concretetypes(prev: &FrameState, ex: &FrameState, merged: &FrameS
     }
 }
 
+/// Static interior-pointer classification and slot numbering
+/// (`rptr.py InteriorPtrRepr`). Seeded from arg 0 of every atomic
+/// `load` / `store` in a forward-reached block, then closed backward over
+/// copy / move / pure reborrow / `from_ptr` / field-borrow bases. Classes
+/// join to a fixpoint before slots are numbered from `start_slot`.
+fn classify_atomic_locals(
+    body: &Unstructured,
+    llbc: &Llbc,
+    forward_reached: &[bool],
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    gc_mut_ref_params: &std::collections::HashSet<usize>,
+    start_slot: usize,
+) -> (Vec<AtomicClass>, Vec<Option<Place>>, Vec<AtomicShadow>) {
+    let n = body.locals.locals.len();
+    let arg_count = body.locals.arg_count as usize;
+    let mutably_borrowed = compute_mutably_borrowed_locals(llbc, body);
+    let mut considered = vec![false; n];
+    let mut work = Vec::new();
+    for (bb_idx, block) in body.body.iter().enumerate() {
+        if !forward_reached.get(bb_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc) else {
+            continue;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        if !is_atomic_load(llbc, reg) && !is_atomic_store(llbc, reg) {
+            continue;
+        }
+        if let Some(arg0) = operand_local(call.args.first())
+            && arg0 < n
+            && !considered[arg0]
+        {
+            considered[arg0] = true;
+            work.push(arg0);
+        }
+    }
+    while let Some(dest) = work.pop() {
+        for (bb_idx, block) in body.body.iter().enumerate() {
+            if !forward_reached.get(bb_idx).copied().unwrap_or(false) {
+                continue;
+            }
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                let PlaceKind::Local(index) = place.kind else {
+                    continue;
+                };
+                if index as usize != dest {
+                    continue;
+                }
+                if let Some(src) =
+                    whole_local_copy_source(rvalue).or_else(|| atomic_pure_reborrow_source(rvalue))
+                    && src < n
+                    && !considered[src]
+                {
+                    considered[src] = true;
+                    work.push(src);
+                }
+                if let Some(referent) = borrowed_place_referent(rvalue)
+                    && let Some((src, trailing)) = split_deref_local_projections(&referent)
+                    && !trailing.is_empty()
+                    && src < n
+                    && !considered[src]
+                {
+                    considered[src] = true;
+                    work.push(src);
+                }
+            }
+            let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc) else {
+                continue;
+            };
+            if !matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == dest) {
+                continue;
+            }
+            let CallFunc::Regular(reg) = &call.func else {
+                continue;
+            };
+            if !is_atomic_from_ptr_identity(llbc, gc_struct_ids, raw_alloc_flavor_structs, reg) {
+                continue;
+            }
+            if let Some(src) = operand_local(call.args.first())
+                && src < n
+                && !considered[src]
+            {
+                considered[src] = true;
+                work.push(src);
+            }
+        }
+    }
+    let mut classes = vec![AtomicClass::Unknown; n];
+    let mut templates = vec![None; n];
+    for i in 0..n {
+        if considered[i] && (mutably_borrowed.contains(&i) || gc_mut_ref_params.contains(&i)) {
+            classes[i] = AtomicClass::Invalid;
+        }
+    }
+    loop {
+        let mut progressed = false;
+        for dest in 0..n {
+            if !considered[dest] || matches!(classes[dest], AtomicClass::Invalid) {
+                continue;
+            }
+            let (joined, tmpl) = atomic_class_contributions(
+                body,
+                llbc,
+                forward_reached,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+                gc_mut_ref_params,
+                dest,
+                arg_count,
+                &classes,
+                &templates,
+            );
+            if !atomic_classes_equal(&classes[dest], &joined) {
+                classes[dest] = joined;
+                templates[dest] = tmpl;
+                progressed = true;
+            } else if templates[dest].is_none()
+                && tmpl.is_some()
+                && matches!(classes[dest], AtomicClass::Interior(_))
+            {
+                templates[dest] = tmpl;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    for i in 0..n {
+        if considered[i] && matches!(classes[i], AtomicClass::Unknown) {
+            classes[i] = AtomicClass::Plain;
+        }
+    }
+    let mut next = start_slot;
+    let mut shadows = vec![AtomicShadow::default(); n];
+    for i in 0..n {
+        let AtomicClass::Interior(shape) = &classes[i] else {
+            continue;
+        };
+        if matches!(shape.root, ShapeRoot::Deref { .. }) {
+            shadows[i].parent = Some(next);
+            next += 1;
+        }
+        for elem in &shape.path {
+            if matches!(elem, ShapeElem::DynIndex) {
+                shadows[i].indexes.push(next);
+                next += 1;
+            }
+        }
+    }
+    (classes, templates, shadows)
+}
+
+fn atomic_class_contributions(
+    body: &Unstructured,
+    llbc: &Llbc,
+    forward_reached: &[bool],
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    gc_mut_ref_params: &std::collections::HashSet<usize>,
+    dest: usize,
+    arg_count: usize,
+    classes: &[AtomicClass],
+    templates: &[Option<Place>],
+) -> (AtomicClass, Option<Place>) {
+    let n = body.locals.locals.len();
+    let mut joined = AtomicClass::Unknown;
+    let mut tmpl = None;
+    if dest >= 1 && dest <= arg_count {
+        (joined, tmpl) = join_atomic_class(joined, tmpl, AtomicClass::Plain, None);
+    }
+    for (bb_idx, block) in body.body.iter().enumerate() {
+        if !forward_reached.get(bb_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let PlaceKind::Local(index) = place.kind else {
+                continue;
+            };
+            if index as usize != dest {
+                continue;
+            }
+            let (contrib, contrib_tmpl) =
+                atomic_assign_contribution(body, gc_mut_ref_params, rvalue, classes, templates);
+            (joined, tmpl) = join_atomic_class(joined, tmpl, contrib, contrib_tmpl);
+        }
+        let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc) else {
+            continue;
+        };
+        if !matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == dest) {
+            continue;
+        }
+        let CallFunc::Regular(reg) = &call.func else {
+            (joined, tmpl) = join_atomic_class(joined, tmpl, AtomicClass::Plain, None);
+            continue;
+        };
+        if is_atomic_from_ptr_identity(llbc, gc_struct_ids, raw_alloc_flavor_structs, reg) {
+            if let Some(src) = operand_local(call.args.first()).filter(|src| *src < n) {
+                let (contrib, contrib_tmpl) = copy_atomic_class(classes, templates, src);
+                (joined, tmpl) = join_atomic_class(joined, tmpl, contrib, contrib_tmpl);
+            } else {
+                (joined, tmpl) = join_atomic_class(joined, tmpl, AtomicClass::Plain, None);
+            }
+        } else {
+            (joined, tmpl) = join_atomic_class(joined, tmpl, AtomicClass::Plain, None);
+        }
+    }
+    (joined, tmpl)
+}
+
+fn copy_atomic_class(
+    classes: &[AtomicClass],
+    templates: &[Option<Place>],
+    src: usize,
+) -> (AtomicClass, Option<Place>) {
+    match classes.get(src) {
+        Some(AtomicClass::Interior(shape)) => (
+            AtomicClass::Interior(shape.clone()),
+            templates
+                .get(src)
+                .and_then(|place| place.as_ref())
+                .map(clone_place),
+        ),
+        Some(other) => (other.clone(), None),
+        None => (AtomicClass::Unknown, None),
+    }
+}
+
+fn atomic_assign_contribution(
+    body: &Unstructured,
+    gc_mut_ref_params: &std::collections::HashSet<usize>,
+    rvalue: &Rvalue,
+    classes: &[AtomicClass],
+    templates: &[Option<Place>],
+) -> (AtomicClass, Option<Place>) {
+    if let Some(src) =
+        whole_local_copy_source(rvalue).or_else(|| atomic_pure_reborrow_source(rvalue))
+    {
+        return copy_atomic_class(classes, templates, src);
+    }
+    let Some(place) = borrowed_place_referent(rvalue) else {
+        return (AtomicClass::Plain, None);
+    };
+    match parse_borrow_place(&place, gc_mut_ref_params) {
+        ParsedBorrow::PureReborrow { src } => copy_atomic_class(classes, templates, src),
+        ParsedBorrow::DerefLocal {
+            src,
+            path,
+            trailing,
+        } => match classes.get(src) {
+            Some(AtomicClass::Interior(shape)) => {
+                let mut composed = shape.clone();
+                composed.path.extend(path);
+                let template = templates
+                    .get(src)
+                    .and_then(|place| place.as_ref())
+                    .map(|base| append_projections(base, &trailing));
+                (AtomicClass::Interior(composed), template)
+            }
+            Some(AtomicClass::Plain) => {
+                let Some(local) = body.locals.locals.get(src) else {
+                    return (AtomicClass::Invalid, None);
+                };
+                (
+                    AtomicClass::Interior(Shape {
+                        root: ShapeRoot::Deref {
+                            ty: clone_tyref(&local.ty),
+                        },
+                        path,
+                    }),
+                    Some(clone_place(&place)),
+                )
+            }
+            Some(AtomicClass::Invalid) => (AtomicClass::Invalid, None),
+            Some(AtomicClass::Unknown) | None => (AtomicClass::Unknown, None),
+        },
+        ParsedBorrow::PinnedStatic { id, path } => (
+            AtomicClass::Interior(Shape {
+                root: ShapeRoot::PinnedStatic { id },
+                path,
+            }),
+            Some(clone_place(&place)),
+        ),
+        ParsedBorrow::PinnedLocal { local, path } => (
+            AtomicClass::Interior(Shape {
+                root: ShapeRoot::PinnedLocal { local },
+                path,
+            }),
+            Some(clone_place(&place)),
+        ),
+        ParsedBorrow::Invalid => (AtomicClass::Invalid, None),
+    }
+}
+
+fn atomic_shadow_slot_ty<'b>(
+    classes: &'b [AtomicClass],
+    shadows: &[AtomicShadow],
+    slot: usize,
+) -> Option<&'b TyRef> {
+    for (i, shadow) in shadows.iter().enumerate() {
+        if shadow.parent == Some(slot) {
+            if let Some(AtomicClass::Interior(Shape {
+                root: ShapeRoot::Deref { ty },
+                ..
+            })) = classes.get(i)
+            {
+                return Some(ty);
+            }
+        }
+    }
+    None
+}
+
+fn atomic_shadow_slot_count(shadows: &[AtomicShadow]) -> usize {
+    shadows
+        .iter()
+        .map(|shadow| usize::from(shadow.parent.is_some()) + shadow.indexes.len())
+        .sum()
+}
+
+fn atomic_shadow_is_parent_slot(shadows: &[AtomicShadow], slot: usize) -> bool {
+    shadows.iter().any(|shadow| shadow.parent == Some(slot))
+}
+
+fn atomic_shadow_is_index_slot(shadows: &[AtomicShadow], slot: usize) -> bool {
+    shadows
+        .iter()
+        .any(|shadow| shadow.indexes.iter().any(|index_slot| *index_slot == slot))
+}
+
 impl<'a> Lowering<'a> {
     pub(in crate::front::mir) fn new(
         llbc: &'a Llbc,
@@ -998,10 +1361,22 @@ impl<'a> Lowering<'a> {
         let item_addr = item_addr_locals(body, llbc, &slice_next_iter);
         let owner_start = n_locals + len_shadow.iter().flatten().count();
         let owner_shadow = pair_owner_shadows_of(&len_shadow, owner_start);
-        let n_slots = owner_start + owner_shadow.iter().flatten().count();
+        let owner_end = owner_start + owner_shadow.iter().flatten().count();
         // `pair_owner_shadows_of` numbers the owner shadows consecutively
-        // from `owner_start`.
-        let owner_slots = owner_start..n_slots;
+        // from `owner_start`. Atomic parent and index shadows follow, before
+        // the trailing return-length slot.
+        let owner_slots = owner_start..owner_end;
+        let forward_reached = forward_reachable_mask(llbc, body);
+        let (atomic_class, atomic_template, atomic_shadow) = classify_atomic_locals(
+            body,
+            llbc,
+            &forward_reached,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+            &gc_mut_ref_params,
+            owner_end,
+        );
+        let n_slots = owner_end + atomic_shadow_slot_count(&atomic_shadow);
         // A body returning a pair slice or a window takes the address of
         // the caller's length slot as a trailing parameter. A STR-view
         // local 0 has no length shadow and still needs the slot.
@@ -1282,7 +1657,6 @@ impl<'a> Lowering<'a> {
         // blocks get no `BlockId`, no per-block row, and no dead stub. A
         // niche-shaped `SwitchInt` keeps that default
         // (`lower_niche_option_switch`).
-        let forward_reached = forward_reachable_mask(llbc, body);
         let lowered = lowered_reachable_mask(llbc, body);
         let block_id = MirBlockMap::from_lowered(&mut graph, &lowered);
         let mut extra_live = compute_index_write_extra_live(body, llbc, gc_struct_ids);
@@ -1403,6 +1777,22 @@ impl<'a> Lowering<'a> {
                 .collect();
             live.extend(owners);
         }
+        for (mir_bb, live) in block_live_in.iter_mut().enumerate() {
+            if mir_bb == 0 {
+                continue;
+            }
+            let extras: Vec<usize> = live
+                .iter()
+                .filter_map(|local| atomic_shadow.get(local))
+                .flat_map(|shadow| {
+                    shadow
+                        .parent
+                        .into_iter()
+                        .chain(shadow.indexes.iter().copied())
+                })
+                .collect();
+            live.extend(extras);
+        }
         // Panic-abort blocks stay in the fixpoint above so their uses still
         // flow into the switch that targets them. Only the lowered closure
         // keeps a row.
@@ -1479,6 +1869,11 @@ impl<'a> Lowering<'a> {
                 if let Some(local) = body.locals.locals.get(local_idx) {
                     stamp_rust_vec_header(&var, &local.ty, llbc);
                     stamp_raw_u8_ccharp(&var, &local.ty, llbc);
+                } else if let Some(slot_ty) =
+                    atomic_shadow_slot_ty(&atomic_class, &atomic_shadow, local_idx)
+                {
+                    stamp_rust_vec_header(&var, slot_ty, llbc);
+                    stamp_raw_u8_ccharp(&var, slot_ty, llbc);
                 }
                 if owner_slots.contains(&local_idx) {
                     crate::model::FunctionGraph::set_concretetype_of_inline(
@@ -1506,6 +1901,10 @@ impl<'a> Lowering<'a> {
             local_var,
             len_shadow,
             owner_shadow,
+            atomic_shadow,
+            atomic_class,
+            atomic_template,
+            atomic_unbound_defaults: Vec::new(),
             ret_len_slot_local,
             raw_array,
             item_addr,
@@ -1564,8 +1963,6 @@ impl<'a> Lowering<'a> {
             const_discriminant_locals: std::collections::HashMap::new(),
             const_struct_fields: vec![None; n_locals],
             multi_assigned_locals: compute_multi_assigned_locals(llbc, body),
-            reassigned_param_locals: compute_reassigned_param_locals(llbc, body),
-            mutably_borrowed_locals: compute_mutably_borrowed_locals(llbc, body),
             string_byte_view_locals: str_view_locals
                 .iter()
                 .enumerate()
@@ -2736,6 +3133,7 @@ impl<'a> Lowering<'a> {
         let dest_ty = clone_tyref(&dest.ty);
         match dest.kind {
             PlaceKind::Local(i) => {
+                self.bind_atomic_shadow(i as usize, &rvalue);
                 // `_i = &atomic_slot` — remember the referent so a later
                 // `<Atomic*>::store` through this local can write to the
                 // place rather than to the value it resolved to.  Read
@@ -3883,6 +4281,12 @@ impl<'a> Lowering<'a> {
                         args.push(self.emit_gc_null(from_bb));
                         continue;
                     }
+                    if atomic_shadow_is_parent_slot(&self.atomic_shadow, local_idx)
+                        || atomic_shadow_is_index_slot(&self.atomic_shadow, local_idx)
+                    {
+                        args.push(self.emit_atomic_parent_unbound(from_bb, local_idx));
+                        continue;
+                    }
                     let owner_is_str = self.len_shadow.iter().enumerate().any(|(owner, slot)| {
                         *slot == Some(local_idx)
                             && (self.local_holds_str_view(owner)
@@ -3971,6 +4375,47 @@ impl<'a> Lowering<'a> {
         null
     }
 
+    /// Integer zero for an unbound atomic parent whose root is not a GC
+    /// reference. Same `ConstInt(0)` the Relaxed `raw_load` fallback emits
+    /// as its offset.
+    pub(in crate::front::mir) fn emit_int_zero(&mut self, mir_bb: usize) -> Variable {
+        let bb_id = self.emit_bb(mir_bb);
+        let zero = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(zero.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        zero
+    }
+
+    fn emit_atomic_parent_unbound(&mut self, from_bb: usize, slot: usize) -> Variable {
+        let result = if self.atomic_parent_slot_root_is_gc_ref(slot) {
+            self.emit_gc_null(from_bb)
+        } else {
+            self.emit_int_zero(from_bb)
+        };
+        self.atomic_unbound_defaults.push(result.clone());
+        result
+    }
+
+    /// `registered_gc_ptr_class_root_with`: a `RawPtr` / `Ref` whose pointee
+    /// is a registered GC struct. A raw address stays off this arm.
+    fn atomic_parent_slot_root_is_gc_ref(&self, slot: usize) -> bool {
+        let Some(ty) = atomic_shadow_slot_ty(&self.atomic_class, &self.atomic_shadow, slot) else {
+            return false;
+        };
+        registered_gc_ptr_class_root_with(
+            ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )
+        .is_some()
+    }
+
     /// `objectmodel.keepalive_until_here` as the host call the annotator
     /// accepts (`robjmodel_keepalive_until_here`). `normalize_unary_op_name`
     /// rejects a unary op named `keepalive`.
@@ -3981,6 +4426,121 @@ impl<'a> Lowering<'a> {
             vec![owner],
             ValueType::Void,
         );
+    }
+
+    /// Clear every atomic shadow slot of `dest`.
+    pub(in crate::front::mir) fn clear_atomic_slots(&mut self, dest: usize) {
+        let Some(shadow) = self.atomic_shadow.get(dest).cloned() else {
+            return;
+        };
+        if let Some(slot) = shadow.parent {
+            self.local_var[slot] = None;
+        }
+        for slot in shadow.indexes {
+            self.local_var[slot] = None;
+        }
+    }
+
+    /// Copy every atomic shadow slot of `src` onto `dest`, in path order
+    /// (`rptr.py InteriorPtrRepr`; `rptr.py rtype_getattr` copies `ptr`
+    /// and the existing indexes).
+    pub(in crate::front::mir) fn copy_atomic_slots(&mut self, src: usize, dest: usize) {
+        let Some(src_shadow) = self.atomic_shadow.get(src).cloned() else {
+            return;
+        };
+        let Some(dest_shadow) = self.atomic_shadow.get(dest).cloned() else {
+            return;
+        };
+        if let Some(dest_parent) = dest_shadow.parent {
+            self.local_var[dest_parent] = src_shadow
+                .parent
+                .and_then(|slot| self.local_var.get(slot).cloned().flatten());
+        }
+        for (dest_slot, src_slot) in dest_shadow.indexes.iter().zip(src_shadow.indexes.iter()) {
+            self.local_var[*dest_slot] = self.local_var.get(*src_slot).cloned().flatten();
+        }
+    }
+
+    /// Bind atomic shadow slots of `dest` from the rvalue that defines it,
+    /// before `build_rvalue` consumes that rvalue.
+    fn bind_atomic_shadow(&mut self, dest: usize, rvalue: &Rvalue) {
+        let Some(shadow) = self.atomic_shadow.get(dest) else {
+            return;
+        };
+        if shadow.parent.is_none() && shadow.indexes.is_empty() {
+            return;
+        }
+        if let Some(src) =
+            whole_local_copy_source(rvalue).or_else(|| atomic_pure_reborrow_source(rvalue))
+        {
+            self.copy_atomic_slots(src, dest);
+            return;
+        }
+        if let Some(place) = borrowed_place_referent(rvalue) {
+            self.bind_atomic_shadow_terminal(dest, &place);
+            return;
+        }
+        self.clear_atomic_slots(dest);
+    }
+
+    fn bind_atomic_shadow_terminal(&mut self, dest: usize, place: &Place) {
+        let Some(dest_shadow) = self.atomic_shadow.get(dest).cloned() else {
+            return;
+        };
+        if dest_shadow.parent.is_none() && dest_shadow.indexes.is_empty() {
+            return;
+        }
+        let new_indexes = dyn_index_locals_inner_first(place);
+        if let Some((s, trailing)) = split_deref_local_projections(place)
+            && !trailing.is_empty()
+        {
+            match self.atomic_class.get(s) {
+                Some(AtomicClass::Interior(_)) => {
+                    if let Some(parent_slot) = dest_shadow.parent {
+                        self.local_var[parent_slot] = self
+                            .atomic_shadow
+                            .get(s)
+                            .and_then(|shadow| shadow.parent)
+                            .and_then(|slot| self.local_var.get(slot).cloned().flatten());
+                    }
+                    let mut values = Vec::new();
+                    if let Some(src_shadow) = self.atomic_shadow.get(s) {
+                        for &src_slot in &src_shadow.indexes {
+                            values.push(self.local_var.get(src_slot).cloned().flatten());
+                        }
+                    }
+                    for op in new_indexes {
+                        values.push(self.local_var.get(op).cloned().flatten());
+                    }
+                    for (slot, value) in dest_shadow.indexes.iter().zip(values) {
+                        self.local_var[*slot] = value;
+                    }
+                    return;
+                }
+                Some(AtomicClass::Plain) | Some(AtomicClass::Unknown) => {
+                    if let Some(parent_slot) = dest_shadow.parent {
+                        self.local_var[parent_slot] =
+                            match self.local_var.get(s).and_then(|value| value.as_ref()) {
+                                Some(LocalValue::One(parent)) => {
+                                    Some(LocalValue::One(parent.clone()))
+                                }
+                                _ => None,
+                            };
+                    }
+                    for (slot, op) in dest_shadow.indexes.iter().zip(new_indexes) {
+                        self.local_var[*slot] = self.local_var.get(op).cloned().flatten();
+                    }
+                    return;
+                }
+                _ => {
+                    self.clear_atomic_slots(dest);
+                    return;
+                }
+            }
+        }
+        for (slot, op) in dest_shadow.indexes.iter().zip(new_indexes) {
+            self.local_var[*slot] = self.local_var.get(op).cloned().flatten();
+        }
     }
 
     /// True when `owner` is `emit_gc_null`'s `ConstRefNull`, or a
@@ -3996,6 +4556,29 @@ impl<'a> Lowering<'a> {
                 })
             });
             if produced {
+                return true;
+            }
+            if !seen.insert(id) || seen.len() > 64 {
+                return false;
+            }
+            match self.input_copied_from.get(&id).copied() {
+                Some(next) => id = next,
+                None => return false,
+            }
+        }
+    }
+
+    /// True when `var` is a Variable [`Self::emit_atomic_parent_unbound`]
+    /// produced, or a `FrameState.copy` of one (`input_copied_from`).
+    pub(in crate::front::mir) fn is_atomic_unbound_default(&self, var: &Variable) -> bool {
+        let mut id = var.id();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            if self
+                .atomic_unbound_defaults
+                .iter()
+                .any(|default| default.id() == id)
+            {
                 return true;
             }
             if !seen.insert(id) || seen.len() > 64 {
