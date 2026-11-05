@@ -715,6 +715,8 @@ pub(crate) fn build_frame_realloc_slowpath(
 
     // f) `_load_shadowstack_top` into x19 (free after restore); store x0,
     // still the new frame because restore did not clobber it.
+    // assembler.py `build_frame_realloc_slowpath`: `if gcrootmap and gcrootmap.is_shadow_stack`.
+    // Constant-true: dynasm always uses the shadow-stack root map (`gen_shadowstack_header`, `gen_footer_shadowstack`, `reload_frame_if_necessary` are unconditional).
     let rst_addr = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
     crate::aarch64::codebuilder::emit_mov_imm64_to(&mut mc, 19, rst_addr);
     dynasm!(mc ; .arch aarch64

@@ -4632,42 +4632,78 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     // `jtransform.py _handle_stroruni_call` registers these beside
     // `stroruni.equal` through `_register_extra_helper` →
-    // `support.builtin_func_for_spec`, which names each
-    // `_ll_<nargs>_str_eq_*` (`support.py setup_extra_builtin`).
+    // `support.builtin_func_for_spec`. The host publishes
+    // `specialized_helper_leaf` labels so STR and UNICODE share the
+    // same `str.eq_*` oopspec names with distinct bodies.
     cp4!(
         &mut entries,
-        "_ll_4_str_eq_slice_checknull",
+        "_ll_4_str_eq_slice_checknull__rpy_stringPtr_Signed_Signed_rpy_stringPtr",
         pyre_object::lowlevel_string::jit_ll_str_eq_slice_checknull,
     );
     cp4!(
         &mut entries,
-        "_ll_4_str_eq_slice_nonnull",
+        "_ll_4_str_eq_slice_checknull__rpy_unicodePtr_Signed_Signed_rpy_unicodePtr",
+        pyre_object::lowlevel_string::jit_ll_unicode_eq_slice_checknull,
+    );
+    cp4!(
+        &mut entries,
+        "_ll_4_str_eq_slice_nonnull__rpy_stringPtr_Signed_Signed_rpy_stringPtr",
         pyre_object::lowlevel_string::jit_ll_str_eq_slice_nonnull,
     );
     cp4!(
         &mut entries,
-        "_ll_4_str_eq_slice_char",
+        "_ll_4_str_eq_slice_nonnull__rpy_unicodePtr_Signed_Signed_rpy_unicodePtr",
+        pyre_object::lowlevel_string::jit_ll_unicode_eq_slice_nonnull,
+    );
+    cp4!(
+        &mut entries,
+        "_ll_4_str_eq_slice_char__rpy_stringPtr_Signed_Signed_Char",
         pyre_object::lowlevel_string::jit_ll_str_eq_slice_char,
+    );
+    cp4!(
+        &mut entries,
+        "_ll_4_str_eq_slice_char__rpy_unicodePtr_Signed_Signed_UniChar",
+        pyre_object::lowlevel_string::jit_ll_unicode_eq_slice_char,
     );
     cp2!(
         &mut entries,
-        "_ll_2_str_eq_nonnull",
+        "_ll_2_str_eq_nonnull__rpy_stringPtr_rpy_stringPtr",
         pyre_object::lowlevel_string::jit_ll_str_eq_nonnull,
     );
     cp2!(
         &mut entries,
-        "_ll_2_str_eq_nonnull_char",
+        "_ll_2_str_eq_nonnull__rpy_unicodePtr_rpy_unicodePtr",
+        pyre_object::lowlevel_string::jit_ll_unicode_eq_nonnull,
+    );
+    cp2!(
+        &mut entries,
+        "_ll_2_str_eq_nonnull_char__rpy_stringPtr_Char",
         pyre_object::lowlevel_string::jit_ll_str_eq_nonnull_char,
     );
     cp2!(
         &mut entries,
-        "_ll_2_str_eq_checknull_char",
+        "_ll_2_str_eq_nonnull_char__rpy_unicodePtr_UniChar",
+        pyre_object::lowlevel_string::jit_ll_unicode_eq_nonnull_char,
+    );
+    cp2!(
+        &mut entries,
+        "_ll_2_str_eq_checknull_char__rpy_stringPtr_Char",
         pyre_object::lowlevel_string::jit_ll_str_eq_checknull_char,
     );
     cp2!(
         &mut entries,
-        "_ll_2_str_eq_lengthok",
+        "_ll_2_str_eq_checknull_char__rpy_unicodePtr_UniChar",
+        pyre_object::lowlevel_string::jit_ll_unicode_eq_checknull_char,
+    );
+    cp2!(
+        &mut entries,
+        "_ll_2_str_eq_lengthok__rpy_stringPtr_rpy_stringPtr",
         pyre_object::lowlevel_string::jit_ll_str_eq_lengthok,
+    );
+    cp2!(
+        &mut entries,
+        "_ll_2_str_eq_lengthok__rpy_unicodePtr_rpy_unicodePtr",
+        pyre_object::lowlevel_string::jit_ll_unicode_eq_lengthok,
     );
     cpa2!(
         &mut entries,
@@ -9245,41 +9281,69 @@ mod tests {
         assert!(!is_list_write_barrier(0));
     }
 
-    /// `jtransform.py _handle_stroruni_call` resolves the seven
-    /// `stroruni.equal` extra helpers by their `setup_extra_builtin` names;
-    /// each must name the `lowlevel_string` body over the rstr `STR` payload.
+    /// `jtransform.py _handle_stroruni_call` resolves the fourteen
+    /// `stroruni.equal` extra helpers by their `specialized_helper_leaf`
+    /// labels; each STR/UNICODE pair names a distinct body.
     #[test]
     fn jit_trace_fnaddrs_publishes_the_str_eq_extra_helpers() {
         use pyre_object::lowlevel_string as ll;
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let expected: [(&str, usize); 7] = [
+        let expected: [(&str, usize); 14] = [
             (
-                "_ll_4_str_eq_slice_checknull",
+                "_ll_4_str_eq_slice_checknull__rpy_stringPtr_Signed_Signed_rpy_stringPtr",
                 ll::jit_ll_str_eq_slice_checknull as *const () as usize,
             ),
             (
-                "_ll_4_str_eq_slice_nonnull",
+                "_ll_4_str_eq_slice_checknull__rpy_unicodePtr_Signed_Signed_rpy_unicodePtr",
+                ll::jit_ll_unicode_eq_slice_checknull as *const () as usize,
+            ),
+            (
+                "_ll_4_str_eq_slice_nonnull__rpy_stringPtr_Signed_Signed_rpy_stringPtr",
                 ll::jit_ll_str_eq_slice_nonnull as *const () as usize,
             ),
             (
-                "_ll_4_str_eq_slice_char",
+                "_ll_4_str_eq_slice_nonnull__rpy_unicodePtr_Signed_Signed_rpy_unicodePtr",
+                ll::jit_ll_unicode_eq_slice_nonnull as *const () as usize,
+            ),
+            (
+                "_ll_4_str_eq_slice_char__rpy_stringPtr_Signed_Signed_Char",
                 ll::jit_ll_str_eq_slice_char as *const () as usize,
             ),
             (
-                "_ll_2_str_eq_nonnull",
+                "_ll_4_str_eq_slice_char__rpy_unicodePtr_Signed_Signed_UniChar",
+                ll::jit_ll_unicode_eq_slice_char as *const () as usize,
+            ),
+            (
+                "_ll_2_str_eq_nonnull__rpy_stringPtr_rpy_stringPtr",
                 ll::jit_ll_str_eq_nonnull as *const () as usize,
             ),
             (
-                "_ll_2_str_eq_nonnull_char",
+                "_ll_2_str_eq_nonnull__rpy_unicodePtr_rpy_unicodePtr",
+                ll::jit_ll_unicode_eq_nonnull as *const () as usize,
+            ),
+            (
+                "_ll_2_str_eq_nonnull_char__rpy_stringPtr_Char",
                 ll::jit_ll_str_eq_nonnull_char as *const () as usize,
             ),
             (
-                "_ll_2_str_eq_checknull_char",
+                "_ll_2_str_eq_nonnull_char__rpy_unicodePtr_UniChar",
+                ll::jit_ll_unicode_eq_nonnull_char as *const () as usize,
+            ),
+            (
+                "_ll_2_str_eq_checknull_char__rpy_stringPtr_Char",
                 ll::jit_ll_str_eq_checknull_char as *const () as usize,
             ),
             (
-                "_ll_2_str_eq_lengthok",
+                "_ll_2_str_eq_checknull_char__rpy_unicodePtr_UniChar",
+                ll::jit_ll_unicode_eq_checknull_char as *const () as usize,
+            ),
+            (
+                "_ll_2_str_eq_lengthok__rpy_stringPtr_rpy_stringPtr",
                 ll::jit_ll_str_eq_lengthok as *const () as usize,
+            ),
+            (
+                "_ll_2_str_eq_lengthok__rpy_unicodePtr_rpy_unicodePtr",
+                ll::jit_ll_unicode_eq_lengthok as *const () as usize,
             ),
         ];
         for (name, addr) in expected {
@@ -9287,6 +9351,13 @@ mod tests {
                 bindings.get(name).copied(),
                 Some(addr as i64),
                 "{name} must publish its lowlevel_string body"
+            );
+        }
+        for pair in expected.chunks_exact(2) {
+            assert_ne!(
+                pair[0].1, pair[1].1,
+                "{} and {} must have distinct addresses",
+                pair[0].0, pair[1].0
             );
         }
     }

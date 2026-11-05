@@ -8795,6 +8795,7 @@ impl CallControl {
                     *ll_res,
                     None,
                     None,
+                    None,
                 );
                 let impl_path = CallPath::from_segments([spec.impl_name.as_str()]);
                 if self.function_graphs.contains_key(&impl_path)

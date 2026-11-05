@@ -115,20 +115,35 @@ fn checked_arithmetic_does_not_reuse_unchecked_arithmetic() {
         let x = ctx.get_box_replacement_operand_opt(x_pos).unwrap();
         let result = emit_result_box(&mut ctx);
         pure.pure_from_args2(plain, &x, &const_int(5), &result, &mut ctx);
-        let checked = OpRc::new(Op::new(
+        let ovf = OpRc::new(Op::new(
             checked,
             &[x, Operand::const_from_value(Value::Int(5))],
         ));
-        checked.pos().set(OpRef::int_op(3));
+        ovf.pos().set(OpRef::int_op(3));
         assert!(matches!(
-            pure.propagate_forward(&checked, &checked, &mut None, &mut ctx),
+            pure.propagate_forward(&ovf, &ovf, &mut None, &mut ctx),
             OptimizationResult::Remove
         ));
         let guard = OpRc::new(Op::new(OpCode::GuardNoOverflow, &[]));
         guard.pos().set(OpRef::op_typed(4, Type::Void));
+        guard.set_rd_resume_position(0);
+        ctx.snapshot_boxes = vec![Some(majit_metainterp::optimizeopt::SnapshotBoxList::new())];
+        // `DefaultOptimizationResult`: the postponed ovf is the result op
+        // and the guard is `emit_extra`'d from `_callback`, so OptPure
+        // itself does not pass the current op on.
         assert!(matches!(
             pure.propagate_forward(&guard, &guard, &mut None, &mut ctx),
-            OptimizationResult::PassOn
+            OptimizationResult::Remove
         ));
+        assert!(
+            ctx.new_operations.iter().any(|op| op.opcode == checked),
+            "checked arithmetic must not CSE against the unchecked cache entry"
+        );
+        assert!(
+            ctx.new_operations
+                .iter()
+                .any(|op| op.opcode == OpCode::GuardNoOverflow),
+            "callback emit_extra(nextop) re-sends the overflow guard"
+        );
     }
 }

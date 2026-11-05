@@ -1108,17 +1108,7 @@ impl VirtualState {
                         // remaining after it (OptHeap). Not
                         // `Optimizer.force_box`, whose default
                         // `optforce=self` is `_emit_operation`.
-                        let saved_pass_idx = ctx.current_pass_idx;
-                        let saved_direct = ctx.force_direct;
-                        ctx.current_pass_idx = ctx.optearlyforce_idx;
-                        ctx.force_direct = false;
-                        let mut info = ctx.take_ptr_info(&resolved).unwrap();
-                        let forced = crate::optimizeopt::info::force_box_impl(
-                            &mut info, &resolved, ctx, optimizer,
-                        );
-                        ctx.current_pass_idx = saved_pass_idx;
-                        ctx.force_direct = saved_direct;
-                        forced
+                        optimizer.force_box_with_optearlyforce(&resolved, ctx)
                     }
                     _ => resolved.clone(),
                 };

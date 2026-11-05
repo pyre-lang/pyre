@@ -2334,6 +2334,25 @@ impl Optimizer {
         resolved_box
     }
 
+    /// `info.force_box(op, optimizer.optearlyforce)`. `emit_extra` walks the
+    /// passes after OptEarlyForce. Contrast with `Optimizer::force_box`'s
+    /// `optforce=self`.
+    pub fn force_box_with_optearlyforce(
+        &mut self,
+        resolved: &majit_ir::operand::Operand,
+        ctx: &mut OptContext,
+    ) -> majit_ir::operand::Operand {
+        let saved_pass_idx = ctx.current_pass_idx;
+        let saved_direct = ctx.force_direct;
+        ctx.current_pass_idx = ctx.optearlyforce_idx;
+        ctx.force_direct = false;
+        let mut info = ctx.take_ptr_info(resolved).unwrap();
+        let forced = super::info::force_box_impl(&mut info, resolved, ctx, self);
+        ctx.current_pass_idx = saved_pass_idx;
+        ctx.force_direct = saved_direct;
+        forced
+    }
+
     /// `optimizer.py` `force_box_for_end_of_preamble(box)`.
     ///
     /// ```python
@@ -2478,14 +2497,7 @@ impl Optimizer {
             // `optforce` is OptEarlyForce, so `emit_extra` walks remaining
             // after that pass (OptHeap). Not `Optimizer.force_box`, whose
             // default `optforce=self` is `_emit_operation`.
-            let saved = ctx.current_pass_idx;
-            let saved_direct = ctx.force_direct;
-            ctx.current_pass_idx = ctx.optearlyforce_idx;
-            ctx.force_direct = false;
-            let mut info = ctx.take_ptr_info(&resolved).unwrap();
-            let forced = super::info::force_box_impl(&mut info, &resolved, ctx, self);
-            ctx.current_pass_idx = saved;
-            ctx.force_direct = saved_direct;
+            let forced = self.force_box_with_optearlyforce(&resolved, ctx);
             return ctx.resolve_operand_operand(&forced);
         }
 

@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::cell::Cell;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 /// The type of a value in the JIT IR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -224,10 +224,24 @@ impl Eq for Const {}
 pub struct SharedConstPool {
     values: std::cell::UnsafeCell<Vec<Const>>,
     visited_generation: std::sync::atomic::AtomicU64,
-    /// `incminimark.py` `GCFLAG_TRACK_YOUNG_PTRS` analogue.
-    /// 0: the flag is set (the pool is on no collector's list).
-    /// Nonzero: the MiniMark id whose `pending_const_pools` holds it.
-    remembered_by: std::sync::atomic::AtomicUsize,
+    /// Packed `incminimark.py` `GCFLAG_TRACK_YOUNG_PTRS` analogue:
+    /// high 32 bits are `owner` (0 = none, a MiniMark id, or
+    /// [`SharedConstPool::REMEMBERED_MULTI`]), low 32 bits are `count`
+    /// (how many MiniMark lists currently hold this pool).
+    remembered_by: AtomicU64,
+}
+
+/// Outcome of [`SharedConstPool::try_mark_remembered`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TryMarkRemembered {
+    /// `count` was 0; CAS to `(id, 1)` succeeded; append to this collector's list.
+    NewlyMarked,
+    /// `owner` already equals `id`; already on this collector's list.
+    AlreadyMarked,
+    /// `count > 0` and `owner` is another id or [`SharedConstPool::REMEMBERED_MULTI`].
+    /// No state change yet: scan this collector's list and, if the pool is
+    /// absent and the caller pushes, call [`SharedConstPool::note_shared_push`].
+    Shared,
 }
 
 unsafe impl Send for SharedConstPool {}
@@ -239,7 +253,7 @@ impl SharedConstPool {
         let arc = std::sync::Arc::new(Self {
             values: std::cell::UnsafeCell::new(values),
             visited_generation: std::sync::atomic::AtomicU64::new(0),
-            remembered_by: std::sync::atomic::AtomicUsize::new(0),
+            remembered_by: AtomicU64::new(0),
         });
         if has_ref {
             // A freshly built list holding refs is traced by the next minor,
@@ -249,33 +263,116 @@ impl SharedConstPool {
         arc
     }
 
+    /// Marker value: the pool may be on several MiniMarks' lists.
+    ///
+    /// The single-collector path is the `incminimark.py` `write_barrier`
+    /// `GCFLAG_TRACK_YOUNG_PTRS` test. `MULTI` exists because one pool can
+    /// sit on several MiniMarks' lists
+    /// (`pending_const_pools_stay_on_the_remembering_minimark`).
+    pub const REMEMBERED_MULTI: u32 = u32::MAX;
+
+    fn pack_remembered(owner: u32, count: u32) -> u64 {
+        ((owner as u64) << 32) | (count as u64)
+    }
+
+    fn unpack_remembered(packed: u64) -> (u32, u32) {
+        ((packed >> 32) as u32, packed as u32)
+    }
+
+    /// Packed `(owner, count)` of the remembered marker.
+    pub fn remembered_state(&self) -> (u32, u32) {
+        Self::unpack_remembered(self.remembered_by.load(Ordering::Acquire))
+    }
+
     /// Try to take `GCFLAG_TRACK_YOUNG_PTRS` for `id`.
     ///
-    /// Returns true when the pool was not already marked with `id`, so the
-    /// caller should append it to that MiniMark's `pending_const_pools`.
-    pub fn try_mark_remembered(&self, id: usize) -> bool {
+    /// `NewlyMarked`: `count == 0`; CAS to `(id, 1)` succeeded; the caller pushes.
+    /// `AlreadyMarked`: `owner == id`; the caller returns.
+    /// `Shared`: already on another list; no state change. The caller scans
+    /// its own list and, after a push, calls [`Self::note_shared_push`].
+    pub fn try_mark_remembered(&self, id: usize) -> TryMarkRemembered {
+        debug_assert!(id > 0 && id < u32::MAX as usize);
+        let id = id as u32;
         loop {
             let cur = self.remembered_by.load(Ordering::Acquire);
-            if cur == id {
-                return false;
+            let (owner, count) = Self::unpack_remembered(cur);
+            if owner == id {
+                return TryMarkRemembered::AlreadyMarked;
             }
+            if count == 0 {
+                if self
+                    .remembered_by
+                    .compare_exchange_weak(
+                        cur,
+                        Self::pack_remembered(id, 1),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return TryMarkRemembered::NewlyMarked;
+                }
+                continue;
+            }
+            return TryMarkRemembered::Shared;
+        }
+    }
+
+    /// After a [`TryMarkRemembered::Shared`] result, the MiniMark scanned its
+    /// list, did not find the pool, and pushed. CAS `(owner, count)` →
+    /// (`MULTI`, `count + 1`).
+    pub fn note_shared_push(&self) {
+        loop {
+            let cur = self.remembered_by.load(Ordering::Acquire);
+            let (_owner, count) = Self::unpack_remembered(cur);
+            let next = Self::pack_remembered(
+                Self::REMEMBERED_MULTI,
+                count
+                    .checked_add(1)
+                    .expect("SharedConstPool remembered count overflow"),
+            );
             if self
                 .remembered_by
-                .compare_exchange_weak(cur, id, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return true;
+                return;
             }
         }
     }
 
     /// `incminimark.py` `collect_oldrefs_to_nursery` setting
-    /// `GCFLAG_TRACK_YOUNG_PTRS` back. A pool another MiniMark re-marked
-    /// keeps that mark (`compare_exchange` fails).
+    /// `GCFLAG_TRACK_YOUNG_PTRS` back. CAS `count → count − 1`; when the
+    /// result is 0, `owner` becomes 0 (the single-owner case is `owner == id`
+    /// and count becoming 0). `owner` stays `MULTI` while `count > 0`.
     pub fn clear_remembered(&self, id: usize) {
-        let _ = self
-            .remembered_by
-            .compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire);
+        debug_assert!(id > 0 && id < u32::MAX as usize);
+        let id = id as u32;
+        loop {
+            let cur = self.remembered_by.load(Ordering::Acquire);
+            let (owner, count) = Self::unpack_remembered(cur);
+            if count == 0 {
+                return;
+            }
+            debug_assert!(
+                owner == id || owner == Self::REMEMBERED_MULTI,
+                "clear_remembered of a pool this MiniMark does not own"
+            );
+            let new_count = count - 1;
+            let new_owner = if new_count == 0 { 0 } else { owner };
+            if self
+                .remembered_by
+                .compare_exchange_weak(
+                    cur,
+                    Self::pack_remembered(new_owner, new_count),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return;
+            }
+        }
     }
 
     pub fn mark_visited_generation(&self, generation: u64) -> bool {

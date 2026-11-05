@@ -11812,51 +11812,103 @@ impl<'a> Transformer<'a> {
     ///                                 EffectInfo.EF_ELIDABLE_CANNOT_RAISE)
     /// ```
     fn register_stroruni_equal_extra_helpers(&mut self, kind: &StrOrUniKind) {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, UNICODEPTR};
         use majit_ir::value::Type::{Int, Ref};
-        // SoU and CHR are Ref and Int on the pyre side.
-        let rows: [(OopSpecIndex, &str, &[majit_ir::value::Type]); 7] = [
+        let (sou, chr) = match kind {
+            StrOrUniKind::Str => (STRPTR.clone(), LowLevelType::Char),
+            StrOrUniKind::Unicode => (UNICODEPTR.clone(), LowLevelType::UniChar),
+            StrOrUniKind::ByteArray | StrOrUniKind::Other => return,
+        };
+        let slice_sou = [
+            sou.clone(),
+            LowLevelType::Signed,
+            LowLevelType::Signed,
+            sou.clone(),
+        ];
+        let slice_chr = [
+            sou.clone(),
+            LowLevelType::Signed,
+            LowLevelType::Signed,
+            chr.clone(),
+        ];
+        let pair_sou = [sou.clone(), sou.clone()];
+        let pair_chr = [sou, chr];
+        // SoU and CHR are Ref and Int on the erased ABI; the lltype
+        // slices keep Ptr(STR)/Char vs Ptr(UNICODE)/UniChar.
+        let rows: [(
+            OopSpecIndex,
+            &str,
+            &[majit_ir::value::Type],
+            &[LowLevelType],
+        ); 7] = [
             (
                 OopSpecIndex::StreqSliceChecknull,
                 "str.eq_slice_checknull",
                 &[Ref, Int, Int, Ref],
+                &slice_sou,
             ),
             (
                 OopSpecIndex::StreqSliceNonnull,
                 "str.eq_slice_nonnull",
                 &[Ref, Int, Int, Ref],
+                &slice_sou,
             ),
             (
                 OopSpecIndex::StreqSliceChar,
                 "str.eq_slice_char",
                 &[Ref, Int, Int, Int],
+                &slice_chr,
             ),
-            (OopSpecIndex::StreqNonnull, "str.eq_nonnull", &[Ref, Ref]),
+            (
+                OopSpecIndex::StreqNonnull,
+                "str.eq_nonnull",
+                &[Ref, Ref],
+                &pair_sou,
+            ),
             (
                 OopSpecIndex::StreqNonnullChar,
                 "str.eq_nonnull_char",
                 &[Ref, Int],
+                &pair_chr,
             ),
             (
                 OopSpecIndex::StreqChecknullChar,
                 "str.eq_checknull_char",
                 &[Ref, Int],
+                &pair_chr,
             ),
-            (OopSpecIndex::StreqLengthok, "str.eq_lengthok", &[Ref, Ref]),
+            (
+                OopSpecIndex::StreqLengthok,
+                "str.eq_lengthok",
+                &[Ref, Ref],
+                &pair_sou,
+            ),
         ];
-        // `builtin_func_for_spec` specializes each helper on its `ll_args`,
-        // so the UNICODE rows name UNICODE-typed bodies. The host binds the
-        // `_ll_*_str_eq_*` names to bodies over STR `chars` only, which leaves
-        // every `OS_UNIEQ_*` helper unbound.
-        if matches!(kind, StrOrUniKind::Unicode) {
-            return;
-        }
-        for (otherindex, othername, argtypes) in rows {
+        for (otherindex, othername, argtypes, ll_arg_types) in rows {
+            // `jtransform.py _handle_stroruni_call`:
+            // `otherindex += EffectInfo._OS_offset_uni` when SoU is UNICODE.
+            let otherindex = if matches!(kind, StrOrUniKind::Unicode) {
+                match otherindex {
+                    OopSpecIndex::StreqSliceChecknull => OopSpecIndex::UnieqSliceChecknull,
+                    OopSpecIndex::StreqSliceNonnull => OopSpecIndex::UnieqSliceNonnull,
+                    OopSpecIndex::StreqSliceChar => OopSpecIndex::UnieqSliceChar,
+                    OopSpecIndex::StreqNonnull => OopSpecIndex::UnieqNonnull,
+                    OopSpecIndex::StreqNonnullChar => OopSpecIndex::UnieqNonnullChar,
+                    OopSpecIndex::StreqChecknullChar => OopSpecIndex::UnieqChecknullChar,
+                    OopSpecIndex::StreqLengthok => OopSpecIndex::UnieqLengthok,
+                    other => other,
+                }
+            } else {
+                otherindex
+            };
             self._register_extra_helper(
                 otherindex,
                 othername,
                 argtypes,
                 Int,
                 ExtraEffect::ElidableCannotRaise,
+                ll_arg_types,
             );
         }
     }
@@ -11888,6 +11940,7 @@ impl<'a> Transformer<'a> {
         argtypes: &[majit_ir::value::Type],
         resulttype: majit_ir::value::Type,
         effectinfo: ExtraEffect,
+        ll_arg_types: &[crate::translator::rtyper::lltypesystem::lltype::LowLevelType],
     ) {
         let Some(cc) = self.callcontrol.as_deref_mut() else {
             return;
@@ -11896,15 +11949,14 @@ impl<'a> Transformer<'a> {
             return;
         }
         // A codewriter run without the host's helper table (the build-time
-        // LLBC pipeline) has no `_ll_*` binding to hand
+        // LLBC pipeline) has no specialized `_ll_*` binding to hand
         // `setup_extra_builtin`; skip the row the way `find_all_graphs`'s
         // `inline_calls_to` seed loop does. The runtime seeds the same rows
         // from the bound helpers.
-        let canonical = crate::parse::CallPath::from_segments([format!(
-            "_ll_{}_{}",
-            argtypes.len(),
-            oopspec_name.replace('.', "_"),
-        )]);
+        let bare = format!("_ll_{}_{}", argtypes.len(), oopspec_name.replace('.', "_"),);
+        let canonical_name =
+            crate::codewriter::strfind::specialized_helper_leaf(&bare, ll_arg_types);
+        let canonical = crate::parse::CallPath::from_segments([canonical_name.as_str()]);
         if cc.lookup_function_fnaddr(&canonical).is_none() {
             return;
         }
@@ -11915,6 +11967,7 @@ impl<'a> Transformer<'a> {
             resulttype,
             None,
             None,
+            Some(ll_arg_types),
         );
         // `pseudo_call_cannot_raise` is a direct call to `c_func` for
         // `getcalldescr`; only its arity and target are read.
@@ -36905,43 +36958,99 @@ mod tests {
         stroruni_equal_lowering_case(false);
     }
 
-    /// The host's `_ll_*_str_eq_*` bodies read STR `chars`; a UNICODE
-    /// operand gets no `OS_UNIEQ_*` row even when those names are bound.
+    /// `jtransform.py _handle_stroruni_call` registers `OS_UNIEQ_*` with
+    /// UNICODE-typed specialized labels beside the STR `OS_STREQ_*` rows.
     #[test]
-    fn stroruni_equal_on_unicode_registers_no_unieq_helper() {
+    fn stroruni_equal_on_unicode_registers_unieq_helpers() {
         use crate::call::CallControl;
         use crate::parse::CallPath;
 
+        let pairs = [
+            (
+                OopSpecIndex::StreqSliceChecknull,
+                OopSpecIndex::UnieqSliceChecknull,
+                "_ll_4_str_eq_slice_checknull__rpy_stringPtr_Signed_Signed_rpy_stringPtr",
+                "_ll_4_str_eq_slice_checknull__rpy_unicodePtr_Signed_Signed_rpy_unicodePtr",
+            ),
+            (
+                OopSpecIndex::StreqSliceNonnull,
+                OopSpecIndex::UnieqSliceNonnull,
+                "_ll_4_str_eq_slice_nonnull__rpy_stringPtr_Signed_Signed_rpy_stringPtr",
+                "_ll_4_str_eq_slice_nonnull__rpy_unicodePtr_Signed_Signed_rpy_unicodePtr",
+            ),
+            (
+                OopSpecIndex::StreqSliceChar,
+                OopSpecIndex::UnieqSliceChar,
+                "_ll_4_str_eq_slice_char__rpy_stringPtr_Signed_Signed_Char",
+                "_ll_4_str_eq_slice_char__rpy_unicodePtr_Signed_Signed_UniChar",
+            ),
+            (
+                OopSpecIndex::StreqNonnull,
+                OopSpecIndex::UnieqNonnull,
+                "_ll_2_str_eq_nonnull__rpy_stringPtr_rpy_stringPtr",
+                "_ll_2_str_eq_nonnull__rpy_unicodePtr_rpy_unicodePtr",
+            ),
+            (
+                OopSpecIndex::StreqNonnullChar,
+                OopSpecIndex::UnieqNonnullChar,
+                "_ll_2_str_eq_nonnull_char__rpy_stringPtr_Char",
+                "_ll_2_str_eq_nonnull_char__rpy_unicodePtr_UniChar",
+            ),
+            (
+                OopSpecIndex::StreqChecknullChar,
+                OopSpecIndex::UnieqChecknullChar,
+                "_ll_2_str_eq_checknull_char__rpy_stringPtr_Char",
+                "_ll_2_str_eq_checknull_char__rpy_unicodePtr_UniChar",
+            ),
+            (
+                OopSpecIndex::StreqLengthok,
+                OopSpecIndex::UnieqLengthok,
+                "_ll_2_str_eq_lengthok__rpy_stringPtr_rpy_stringPtr",
+                "_ll_2_str_eq_lengthok__rpy_unicodePtr_rpy_unicodePtr",
+            ),
+        ];
         let mut cc = CallControl::new();
-        for (i, name) in [
-            "_ll_4_str_eq_slice_checknull",
-            "_ll_4_str_eq_slice_nonnull",
-            "_ll_4_str_eq_slice_char",
-            "_ll_2_str_eq_nonnull",
-            "_ll_2_str_eq_nonnull_char",
-            "_ll_2_str_eq_checknull_char",
-            "_ll_2_str_eq_lengthok",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            cc.register_function_fnaddr(CallPath::from_segments([name]), 0x1000 + i as i64);
+        for (i, (_, _, str_name, uni_name)) in pairs.iter().enumerate() {
+            cc.register_function_fnaddr(CallPath::from_segments([*str_name]), 0x1000 + i as i64);
+            cc.register_function_fnaddr(CallPath::from_segments([*uni_name]), 0x2000 + i as i64);
         }
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        transformer.register_stroruni_equal_extra_helpers(&StrOrUniKind::Str);
         transformer.register_stroruni_equal_extra_helpers(&StrOrUniKind::Unicode);
         drop(transformer);
-        for oopspec in [
-            OopSpecIndex::UnieqSliceChecknull,
-            OopSpecIndex::UnieqSliceNonnull,
-            OopSpecIndex::UnieqSliceChar,
-            OopSpecIndex::UnieqNonnull,
-            OopSpecIndex::UnieqNonnullChar,
-            OopSpecIndex::UnieqChecknullChar,
-            OopSpecIndex::UnieqLengthok,
-            OopSpecIndex::StreqNonnull,
-        ] {
-            assert!(!cc.callinfocollection.has_oopspec(oopspec), "{oopspec:?}");
+        for (i, (streq, unieq, str_name, uni_name)) in pairs.iter().enumerate() {
+            assert!(cc.callinfocollection.has_oopspec(*streq), "{str_name}");
+            assert!(cc.callinfocollection.has_oopspec(*unieq), "{uni_name}");
+            let (str_descr, str_func) = cc.callinfocollection.callinfo_for_oopspec(*streq);
+            let (uni_descr, uni_func) = cc.callinfocollection.callinfo_for_oopspec(*unieq);
+            assert_ne!(str_func, 0, "{str_name}");
+            assert_ne!(uni_func, 0, "{uni_name}");
+            assert_eq!(str_func, 0x1000 + i as u64, "{str_name}");
+            assert_eq!(uni_func, 0x2000 + i as u64, "{uni_name}");
+            assert_ne!(str_func, uni_func, "{str_name} vs {uni_name}");
+            let str_descr = str_descr.unwrap_or_else(|| panic!("{str_name} has no calldescr"));
+            let uni_descr = uni_descr.unwrap_or_else(|| panic!("{uni_name} has no calldescr"));
+            let str_effect = str_descr
+                .as_call_descr()
+                .map(|cd| cd.get_extra_info().clone())
+                .unwrap_or_else(|| panic!("{str_name} calldescr is not a call descr"));
+            let uni_effect = uni_descr
+                .as_call_descr()
+                .map(|cd| cd.get_extra_info().clone())
+                .unwrap_or_else(|| panic!("{uni_name} calldescr is not a call descr"));
+            assert_eq!(
+                str_effect.extraeffect,
+                ExtraEffect::ElidableCannotRaise,
+                "{str_name}"
+            );
+            assert_eq!(
+                uni_effect.extraeffect,
+                ExtraEffect::ElidableCannotRaise,
+                "{uni_name}"
+            );
+            assert_eq!(str_effect.oopspecindex, *streq, "{str_name}");
+            assert_eq!(uni_effect.oopspecindex, *unieq, "{uni_name}");
         }
     }
 
@@ -36953,20 +37062,32 @@ mod tests {
         let extras = [
             (
                 OopSpecIndex::StreqSliceChecknull,
-                "_ll_4_str_eq_slice_checknull",
+                "_ll_4_str_eq_slice_checknull__rpy_stringPtr_Signed_Signed_rpy_stringPtr",
             ),
             (
                 OopSpecIndex::StreqSliceNonnull,
-                "_ll_4_str_eq_slice_nonnull",
+                "_ll_4_str_eq_slice_nonnull__rpy_stringPtr_Signed_Signed_rpy_stringPtr",
             ),
-            (OopSpecIndex::StreqSliceChar, "_ll_4_str_eq_slice_char"),
-            (OopSpecIndex::StreqNonnull, "_ll_2_str_eq_nonnull"),
-            (OopSpecIndex::StreqNonnullChar, "_ll_2_str_eq_nonnull_char"),
+            (
+                OopSpecIndex::StreqSliceChar,
+                "_ll_4_str_eq_slice_char__rpy_stringPtr_Signed_Signed_Char",
+            ),
+            (
+                OopSpecIndex::StreqNonnull,
+                "_ll_2_str_eq_nonnull__rpy_stringPtr_rpy_stringPtr",
+            ),
+            (
+                OopSpecIndex::StreqNonnullChar,
+                "_ll_2_str_eq_nonnull_char__rpy_stringPtr_Char",
+            ),
             (
                 OopSpecIndex::StreqChecknullChar,
-                "_ll_2_str_eq_checknull_char",
+                "_ll_2_str_eq_checknull_char__rpy_stringPtr_Char",
             ),
-            (OopSpecIndex::StreqLengthok, "_ll_2_str_eq_lengthok"),
+            (
+                OopSpecIndex::StreqLengthok,
+                "_ll_2_str_eq_lengthok__rpy_stringPtr_rpy_stringPtr",
+            ),
         ];
         let mut cc = CallControl::new();
         if bind_helpers {

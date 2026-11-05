@@ -54,10 +54,12 @@
 
 use crate::codewriter::call::CallControl;
 use crate::codewriter::jtransform::{JitMarkerKey, jit_marker_key_from_target};
+use crate::codewriter::strfind::specialized_helper_leaf;
 use crate::codewriter::type_state::ConcreteType;
 use crate::flowspace::model::Variable;
 use crate::model::{BlockId, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 use crate::parse::CallPath;
+use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 
 use majit_ir::value::Type;
 
@@ -794,7 +796,7 @@ pub enum NeedResultType {
     Exact,
 }
 
-/// `support.py:770` cache key tuple
+/// `support.py builtin_func_for_spec` cache key tuple
 /// (`(oopspec_name, tuple(ll_args), ll_res, extrakey)`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BuiltinFuncSpecCacheKey {
@@ -802,6 +804,12 @@ pub struct BuiltinFuncSpecCacheKey {
     pub ll_args: Vec<Type>,
     pub ll_res: Type,
     pub extrakey: Option<String>,
+    /// Real `ll_args` cells (`support.py builtin_func_for_spec` keys on
+    /// `tuple(ll_args)`). Empty when the caller has no richer lltype tuple.
+    /// Distinguishes `Ptr(STR)` from `Ptr(UNICODE)` where the erased ABI
+    /// `Type`s coincide, and function-pointer / same-named struct cells
+    /// that share a `lltype_nameof` label.
+    pub ll_arg_lltypes: Vec<LowLevelType>,
 }
 
 /// `support.py builtin_func_for_spec` return value.
@@ -880,12 +888,20 @@ pub fn setup_extra_builtin(
     nb_args: usize,
     extra: Option<&[String]>,
     extrakey: Option<&str>,
+    ll_arg_types: Option<&[LowLevelType]>,
 ) -> (String, i64, NeedResultType) {
     // `support.py:684`: name = '_ll_%d_%s' % (nb_args, oopspec_name.replace('.', '_'))
     let mut name = format!("_ll_{}_{}", nb_args, oopspec_name.replace('.', "_"));
     // `support.py`: if extra is not None: name = 'build' + name
     if extra.is_some() {
         name = format!("build{}", name);
+    }
+    // `annlowlevel.py LowLevelAnnotatorPolicy.default_specialize` labels
+    // the mix-level graph `name__<argtypes>`. When the caller supplies
+    // the real lltype tuple, resolve that specialized leaf so STR and
+    // UNICODE do not share a host fnaddr.
+    if let Some(types) = ll_arg_types {
+        name = specialized_helper_leaf(&name, types);
     }
     // `support.py:687-690`:
     //   try:
@@ -1019,6 +1035,7 @@ pub fn builtin_func_for_spec(
     ll_res: Type,
     extra: Option<&[String]>,
     extrakey: Option<&str>,
+    ll_arg_types: Option<&[LowLevelType]>,
 ) -> BuiltinFuncSpec {
     // `support.py`: assert (extra is None) == (extrakey is None).
     // The workspace defines no `[profile.release]`, so `debug_assertions`
@@ -1032,12 +1049,17 @@ pub fn builtin_func_for_spec(
         "support.py:769 — extra and extrakey must be supplied together",
     );
 
-    // `support.py:770`: key = (oopspec_name, tuple(ll_args), ll_res, extrakey)
+    // `support.py builtin_func_for_spec`: key = (oopspec_name, tuple(ll_args), ll_res, extrakey).
+    let ll_arg_lltypes = match ll_arg_types {
+        Some(types) => types.to_vec(),
+        None => Vec::new(),
+    };
     let key = BuiltinFuncSpecCacheKey {
         oopspec_name: oopspec_name.to_string(),
         ll_args: ll_args.to_vec(),
         ll_res,
         extrakey: extrakey.map(String::from),
+        ll_arg_lltypes,
     };
 
     // `support.py:771-774`: try: return rtyper._builtin_func_for_spec_cache[key]
@@ -1079,8 +1101,14 @@ pub fn builtin_func_for_spec(
     // fnaddr — upstream's wrapper is invoked with `extra` itself, and
     // pyre's analog uses the host-supplied `extrakey` as the
     // matching cache discriminator.
-    let (impl_name, fnaddr, need_result_type) =
-        setup_extra_builtin(call_control, oopspec_name, ll_args.len(), extra, extrakey);
+    let (impl_name, fnaddr, need_result_type) = setup_extra_builtin(
+        call_control,
+        oopspec_name,
+        ll_args.len(),
+        extra,
+        extrakey,
+        ll_arg_types,
+    );
 
     // `support.py:782-794`: if getattr(impl, 'need_result_type', False):
     //                           if hasattr(rtyper, 'annotator'):
@@ -1208,11 +1236,12 @@ mod tests {
         cc.register_function_fnaddr(CallPath::from_segments(["_ll_2_int_mod"]), 1);
         cc.register_function_fnaddr(CallPath::from_segments(["_ll_1_int_abs"]), 2);
         cc.register_function_fnaddr(CallPath::from_segments(["_ll_1_ll_math_ll_math_sqrt"]), 3);
-        let (name, _, _) = setup_extra_builtin(Some(&cc), "int_mod", 2, None, None);
+        let (name, _, _) = setup_extra_builtin(Some(&cc), "int_mod", 2, None, None, None);
         assert_eq!(name, "_ll_2_int_mod");
-        let (name, _, _) = setup_extra_builtin(Some(&cc), "int_abs", 1, None, None);
+        let (name, _, _) = setup_extra_builtin(Some(&cc), "int_abs", 1, None, None, None);
         assert_eq!(name, "_ll_1_int_abs");
-        let (name, _, _) = setup_extra_builtin(Some(&cc), "ll_math.ll_math_sqrt", 1, None, None);
+        let (name, _, _) =
+            setup_extra_builtin(Some(&cc), "ll_math.ll_math_sqrt", 1, None, None, None);
         // `.` → `_` per `support.py .replace('.', '_')`
         assert_eq!(name, "_ll_1_ll_math_ll_math_sqrt");
     }
@@ -1224,7 +1253,7 @@ mod tests {
         cc.register_function_fnaddr(CallPath::from_segments(["build_ll_0_dict_make"]), 1);
         let extra: Vec<String> = vec!["foo".to_string()];
         let (name, _, _) =
-            setup_extra_builtin(Some(&cc), "dict_make", 0, Some(&extra), Some("foo"));
+            setup_extra_builtin(Some(&cc), "dict_make", 0, Some(&extra), Some("foo"), None);
         assert_eq!(name, "build_ll_0_dict_make");
     }
 
@@ -1234,7 +1263,7 @@ mod tests {
         // Host registers under the canonical `_ll_<n>_<name>` form per
         // `support.py:684` template.
         cc.register_function_fnaddr(CallPath::from_segments(["_ll_2_int_mod"]), 0xdead_beef);
-        let (_, fnaddr, _) = setup_extra_builtin(Some(&cc), "int_mod", 2, None, None);
+        let (_, fnaddr, _) = setup_extra_builtin(Some(&cc), "int_mod", 2, None, None, None);
         assert_eq!(fnaddr, 0xdead_beef);
     }
 
@@ -1246,7 +1275,7 @@ mod tests {
         // raises `AttributeError`.  Pyre mirrors the raise via panic so
         // missing wiring surfaces loudly at setup time.
         let cc = CallControl::new();
-        let _ = setup_extra_builtin(Some(&cc), "int_mod", 2, None, None);
+        let _ = setup_extra_builtin(Some(&cc), "int_mod", 2, None, None, None);
     }
 
     #[test]
@@ -1257,7 +1286,7 @@ mod tests {
         let mut cc = CallControl::new();
         cc.register_function_fnaddr(CallPath::from_segments(["_ll_1_dict_keys"]), 0x44);
         cc.register_need_result_type("_ll_1_dict_keys", NeedResultType::Approx);
-        let (_, _, ty) = setup_extra_builtin(Some(&cc), "dict_keys", 1, None, None);
+        let (_, _, ty) = setup_extra_builtin(Some(&cc), "dict_keys", 1, None, None, None);
         assert_eq!(ty, NeedResultType::Approx);
     }
 
@@ -1276,8 +1305,14 @@ mod tests {
         cc.register_function_fnaddr(CallPath::from_segments(["build_ll_2_dict_iter"]), FALLBACK);
         cc.register_builtin_factory("build_ll_2_dict_iter", "Ptr(STR)", SPECIAL);
         let extra: Vec<String> = vec!["Ptr(STR)".to_string()];
-        let (_, fnaddr, _) =
-            setup_extra_builtin(Some(&cc), "dict_iter", 2, Some(&extra), Some("Ptr(STR)"));
+        let (_, fnaddr, _) = setup_extra_builtin(
+            Some(&cc),
+            "dict_iter",
+            2,
+            Some(&extra),
+            Some("Ptr(STR)"),
+            None,
+        );
         assert_eq!(fnaddr, SPECIAL);
     }
 
@@ -1292,8 +1327,14 @@ mod tests {
         let mut cc = CallControl::new();
         cc.register_function_fnaddr(CallPath::from_segments(["build_ll_2_dict_iter"]), FALLBACK);
         let extra: Vec<String> = vec!["Ptr(STR)".to_string()];
-        let (_, fnaddr, _) =
-            setup_extra_builtin(Some(&cc), "dict_iter", 2, Some(&extra), Some("Ptr(STR)"));
+        let (_, fnaddr, _) = setup_extra_builtin(
+            Some(&cc),
+            "dict_iter",
+            2,
+            Some(&extra),
+            Some("Ptr(STR)"),
+            None,
+        );
         assert_eq!(fnaddr, FALLBACK);
     }
 
@@ -1302,7 +1343,15 @@ mod tests {
         // `support.py:776-777`: if '.' not in oopspec_name: LIST_OR_DICT = ll_res
         let mut cc = CallControl::new();
         cc.register_function_fnaddr(CallPath::from_segments(["_ll_1_int_abs"]), 0x11);
-        let spec = builtin_func_for_spec(Some(&cc), "int_abs", &[Type::Int], Type::Int, None, None);
+        let spec = builtin_func_for_spec(
+            Some(&cc),
+            "int_abs",
+            &[Type::Int],
+            Type::Int,
+            None,
+            None,
+            None,
+        );
         assert_eq!(spec.oopspec_name, "int_abs");
         assert_eq!(spec.impl_name, "_ll_1_int_abs");
         assert_eq!(spec.ll_args, &[Type::Int]);
@@ -1327,6 +1376,7 @@ mod tests {
             Type::Float,
             None,
             None,
+            None,
         );
         assert_eq!(spec.list_or_dict, Type::Float);
         assert_eq!(spec.impl_name, "_ll_1_ll_math_ll_math_sqrt");
@@ -1341,6 +1391,7 @@ mod tests {
             "int_mod",
             &[Type::Int, Type::Int],
             Type::Int,
+            None,
             None,
             None,
         );
@@ -1362,6 +1413,7 @@ mod tests {
             Type::Int,
             None,
             None,
+            None,
         );
         assert_eq!(first.fnaddr, 0x1111);
         // Mutate the underlying registry; cache should shield the
@@ -1372,6 +1424,7 @@ mod tests {
             "int_mod",
             &[Type::Int, Type::Int],
             Type::Int,
+            None,
             None,
             None,
         );
@@ -1394,6 +1447,7 @@ mod tests {
             Type::Int,
             Some(&extra_a),
             Some("a"),
+            None,
         );
         let spec_b = builtin_func_for_spec(
             Some(&cc),
@@ -1402,6 +1456,7 @@ mod tests {
             Type::Int,
             Some(&extra_b),
             Some("b"),
+            None,
         );
         // Both produce the `build_ll_2_int_mod` canonical name (extra
         // is_some → 'build' prefix) and the same fnaddr, but the cache
@@ -1426,7 +1481,64 @@ mod tests {
             Type::Int,
             Some(&extra),
             None,
+            None,
         );
+    }
+
+    #[test]
+    fn builtin_func_for_spec_cache_keyed_on_str_vs_unicode_ll_args() {
+        // `support.py builtin_func_for_spec` keys on `tuple(ll_args)`.
+        // The graph label (`specialized_helper_leaf`) stays separate from
+        // that key. STR vs UNICODE must not share a cache entry or impl_name.
+        use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, UNICODEPTR};
+
+        let str_args = [STRPTR.clone(), STRPTR.clone()];
+        let uni_args = [UNICODEPTR.clone(), UNICODEPTR.clone()];
+        let str_label = specialized_helper_leaf("_ll_2_str_eq_nonnull", &str_args);
+        let uni_label = specialized_helper_leaf("_ll_2_str_eq_nonnull", &uni_args);
+        assert_ne!(
+            BuiltinFuncSpecCacheKey {
+                oopspec_name: "str.eq_nonnull".to_string(),
+                ll_args: vec![Type::Ref, Type::Ref],
+                ll_res: Type::Int,
+                extrakey: None,
+                ll_arg_lltypes: str_args.to_vec(),
+            },
+            BuiltinFuncSpecCacheKey {
+                oopspec_name: "str.eq_nonnull".to_string(),
+                ll_args: vec![Type::Ref, Type::Ref],
+                ll_res: Type::Int,
+                extrakey: None,
+                ll_arg_lltypes: uni_args.to_vec(),
+            }
+        );
+        let mut cc = CallControl::new();
+        cc.register_function_fnaddr(CallPath::from_segments([str_label.as_str()]), 0x1000);
+        cc.register_function_fnaddr(CallPath::from_segments([uni_label.as_str()]), 0x2000);
+        let spec_str = builtin_func_for_spec(
+            Some(&cc),
+            "str.eq_nonnull",
+            &[Type::Ref, Type::Ref],
+            Type::Int,
+            None,
+            None,
+            Some(&str_args),
+        );
+        let spec_uni = builtin_func_for_spec(
+            Some(&cc),
+            "str.eq_nonnull",
+            &[Type::Ref, Type::Ref],
+            Type::Int,
+            None,
+            None,
+            Some(&uni_args),
+        );
+        assert_ne!(spec_str.impl_name, spec_uni.impl_name);
+        assert_ne!(spec_str.fnaddr, spec_uni.fnaddr);
+        assert_eq!(spec_str.impl_name, str_label);
+        assert_eq!(spec_uni.impl_name, uni_label);
+        assert_eq!(spec_str.fnaddr, 0x1000);
+        assert_eq!(spec_uni.fnaddr, 0x2000);
     }
 
     // ───────── `decode_builtin_call` tests ─────────

@@ -190,6 +190,40 @@ pub(crate) fn copy_str_content_with(
     next_offset
 }
 
+/// vstring.py `VStringPlainInfo.initialize_forced_string` — the STRSETITEM
+/// loop. The only copy of that loop; a virtual Plain's `string_copy_parts`
+/// and Plain `initialize_forced_string` both call this.
+fn vstring_plain_initialize_forced_string(
+    opt: &mut Option<&mut Optimizer>,
+    chars: &[Option<Operand>],
+    targetbox: &Operand,
+    offsetbox: &Operand,
+    mode: u8,
+    ctx: &mut OptContext,
+) -> Operand {
+    let mut offset = offsetbox.clone();
+    let one = Operand::const_(Const::Int(1));
+    let set_opcode = if mode != 0 {
+        OpCode::Unicodesetitem
+    } else {
+        OpCode::Strsetitem
+    };
+    for ch in chars {
+        if let Some(ch_ref) = ch {
+            let arg_char = ctx.resolve_operand_operand(ch_ref);
+            let arg_target = ctx.resolve_operand_operand(targetbox);
+            let arg_offset = ctx.resolve_operand_operand(&offset);
+            let setitem_op = Op::new(
+                set_opcode,
+                &[arg_target.clone(), arg_offset.clone(), arg_char.clone()],
+            );
+            ctx.emit_for_force_with(opt, setitem_op);
+        }
+        offset = _int_add_with(opt, &offset, &one, ctx);
+    }
+    offset
+}
+
 /// `vstring.py` `string_copy_parts` / `initialize_forced_string`. `opt` is the
 /// owning optimizer on the `force_box` path so STRSETITEM, STRLEN and the
 /// nested `force_box` use `emit_extra` immediately.
@@ -204,8 +238,9 @@ pub(crate) fn string_copy_parts_with(
     // Extract variant data without keeping PtrInfo borrow alive.
     // RPython dispatches via subclass; we dispatch via enum variant.
     enum Action {
-        /// vstring.py VStringPlainInfo.initialize_forced_string
-        Plain(Vec<Option<Operand>>),
+        /// vstring.py VStringPlainInfo.string_copy_parts virtual branch →
+        /// initialize_forced_string
+        PlainVirtual(Vec<Option<Operand>>),
         /// vstring.py VStringSliceInfo.string_copy_parts
         Slice {
             s: Operand,
@@ -224,7 +259,9 @@ pub(crate) fn string_copy_parts_with(
             // vstring.py dispatches `string_copy_parts` by class, then
             // `VStringPlainInfo` alone checks `is_virtual()`.
             PtrInfo::Str(sinfo) => match &sinfo.variant {
-                VStringVariant::Plain(p) if sinfo.is_virtual() => Action::Plain(p._chars.to_vec()),
+                VStringVariant::Plain(p) if sinfo.is_virtual() => {
+                    Action::PlainVirtual(p._chars.to_vec())
+                }
                 VStringVariant::Plain(_) => Action::NonVirtual,
                 VStringVariant::Slice(s) => Action::Slice {
                     s: s.s.clone(),
@@ -242,31 +279,11 @@ pub(crate) fn string_copy_parts_with(
         None => Action::NonVirtual,
     };
 
-    let set_opcode = if mode != 0 {
-        OpCode::Unicodesetitem
-    } else {
-        OpCode::Strsetitem
-    };
-
     match action {
-        Action::Plain(chars) => {
-            // vstring.py VStringPlainInfo.initialize_forced_string
-            let mut offset = offsetbox.clone();
-            let one = Operand::const_(Const::Int(1));
-            for ch in &chars {
-                if let Some(ch_ref) = ch {
-                    let arg_char = ctx.resolve_operand_operand(ch_ref);
-                    let arg_target = ctx.resolve_operand_operand(targetbox);
-                    let arg_offset = ctx.resolve_operand_operand(&offset);
-                    let setitem_op = Op::new(
-                        set_opcode,
-                        &[arg_target.clone(), arg_offset.clone(), arg_char.clone()],
-                    );
-                    ctx.emit_for_force_with(opt, setitem_op);
-                }
-                offset = _int_add_with(opt, &offset, &one, ctx);
-            }
-            offset
+        Action::PlainVirtual(chars) => {
+            // vstring.py VStringPlainInfo.string_copy_parts:
+            // `return self.initialize_forced_string(...)`
+            vstring_plain_initialize_forced_string(opt, &chars, targetbox, offsetbox, mode, ctx)
         }
         Action::Slice { s, start, lgtop } => {
             // vstring.py VStringSliceInfo.string_copy_parts
@@ -299,7 +316,8 @@ pub(crate) fn string_copy_parts_with(
 /// `VStringPlainInfo.initialize_forced_string`. Called from `force_box`
 /// after `_is_virtual = False`, so Plain still walks `_chars` (the
 /// override does not check `is_virtual()`). STRSETITEM goes through
-/// `optstring.emit_extra` (`emit_for_force_with`).
+/// `optstring.emit_extra` (`emit_for_force_with`). Slice and Concat
+/// inherit the base: `return self.string_copy_parts(...)`.
 pub(crate) fn initialize_forced_string_with(
     opt: &mut Option<&mut Optimizer>,
     info: &StrPtrInfo,
@@ -310,37 +328,10 @@ pub(crate) fn initialize_forced_string_with(
 ) -> Operand {
     match &info.variant {
         VStringVariant::Plain(p) => {
-            let mut offset = offsetbox.clone();
-            let one = Operand::const_(Const::Int(1));
-            let set_opcode = if mode != 0 {
-                OpCode::Unicodesetitem
-            } else {
-                OpCode::Strsetitem
-            };
-            for ch in &p._chars {
-                if let Some(ch_ref) = ch {
-                    let arg_char = ctx.resolve_operand_operand(ch_ref);
-                    let arg_target = ctx.resolve_operand_operand(targetbox);
-                    let arg_offset = ctx.resolve_operand_operand(&offset);
-                    let setitem_op = Op::new(
-                        set_opcode,
-                        &[arg_target.clone(), arg_offset.clone(), arg_char.clone()],
-                    );
-                    ctx.emit_for_force_with(opt, setitem_op);
-                }
-                offset = _int_add_with(opt, &offset, &one, ctx);
-            }
-            offset
+            vstring_plain_initialize_forced_string(opt, &p._chars, targetbox, offsetbox, mode, ctx)
         }
-        VStringVariant::Slice(s) => copy_str_content_with(
-            opt, ctx, &s.s, targetbox, &s.start, offsetbox, &s.lgtop, mode, true,
-        )
-        .expect("need_next_offset=true always returns the offset"),
-        VStringVariant::Concat(c) => {
-            let offset = string_copy_parts_with(opt, &c.vleft, targetbox, offsetbox, mode, ctx);
-            string_copy_parts_with(opt, &c.vright, targetbox, &offset, mode, ctx)
-        }
-        VStringVariant::Ptr => {
+        _ => {
+            // StrPtrInfo.initialize_forced_string = return self.string_copy_parts(...)
             string_copy_parts_with(opt, targetbox, targetbox, offsetbox, mode, ctx)
         }
     }
@@ -440,6 +431,17 @@ impl OptString {
     fn get_slice_info(&self, op: &Operand, ctx: &OptContext) -> Option<VStringSliceInfo> {
         match ctx.peek_ptr_info(op) {
             Some(PtrInfo::Str(sinfo)) => match sinfo.variant {
+                VStringVariant::Slice(info) => Some(info),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// vstring.py `isinstance(sinfo, VStringSliceInfo) and sinfo.is_virtual()`
+    fn get_virtual_slice_info(&self, op: &Operand, ctx: &OptContext) -> Option<VStringSliceInfo> {
+        match ctx.peek_ptr_info(op) {
+            Some(PtrInfo::Str(sinfo)) if sinfo.is_virtual() => match sinfo.variant {
                 VStringVariant::Slice(info) => Some(info),
                 _ => None,
             },
@@ -604,18 +606,17 @@ impl OptString {
         // not constant, and `start + 0` collapses back to `start`.
         let resolved_s = ctx.resolve_operand_operand(s);
         let index_const_box = Operand::const_(Const::Int(index));
-        let (strbox, index_box) = if let Some(slice) = self.get_slice_info(&resolved_s, ctx) {
+        // vstring.py: `isinstance(sinfo, VStringSliceInfo) and sinfo.is_virtual()`
+        let (strbox, index_box) = if let Some(slice) = self.get_virtual_slice_info(&resolved_s, ctx)
+        {
             let index_box = _int_add_with(opt, &slice.start, &index_const_box, ctx);
             (ctx.resolve_operand_operand(&slice.s), index_box)
         } else {
             (resolved_s, index_const_box)
         };
-        // vstring.py:505-512: a virtual concat with a constant index recurses
-        // into the child holding that position, so the residual STRGETITEM
-        // reads that child (forcing only it) rather than the whole concat. The
-        // top `strgetitem` already folded the statically-known case; this only
-        // fires when the child's char is a variable but the left length is a
-        // known constant.
+        // vstring.py: `isinstance(sinfo, VStringConcatInfo) and vindex.is_constant()`
+        // — no `is_virtual()` on the concat. Recurse into the child holding
+        // that position so the residual STRGETITEM reads that child.
         if let Some(idx) = ctx
             .resolve_operand_operand_opt(&index_box)
             .and_then(|b| ctx.get_constant_int_box(&b))
@@ -690,7 +691,9 @@ impl OptString {
         // vstring.py:487: make_nonnull_str(s, mode)
         let resolved_s = ctx.resolve_operand_operand(s);
         ctx.make_nonnull_str(&resolved_s, mode);
-        let (strbox, index_box) = if let Some(slice) = self.get_slice_info(&resolved_s, ctx) {
+        // vstring.py: `isinstance(sinfo, VStringSliceInfo) and sinfo.is_virtual()`
+        let (strbox, index_box) = if let Some(slice) = self.get_virtual_slice_info(&resolved_s, ctx)
+        {
             let new_index = _int_add_with(opt, &slice.start, index, ctx);
             (ctx.resolve_operand_operand(&slice.s), new_index)
         } else {
@@ -880,8 +883,9 @@ impl OptString {
         ctx: &mut OptContext,
     ) -> Option<(Operand, Operand)> {
         let resolved_s = ctx.resolve_operand_operand(s);
-        // vstring.py:490-493: slice → rebase to source, then continue dispatch.
-        if let Some(slice) = self.get_slice_info(&resolved_s, ctx) {
+        // vstring.py: `isinstance(sinfo, VStringSliceInfo) and sinfo.is_virtual()`
+        // — slice → rebase to source, then continue dispatch.
+        if let Some(slice) = self.get_virtual_slice_info(&resolved_s, ctx) {
             let new_index = _int_add_with(opt, &slice.start, index, ctx);
             let source = ctx.resolve_operand_operand(&slice.s);
             return Some(
@@ -889,9 +893,9 @@ impl OptString {
                     .unwrap_or((source, new_index)),
             );
         }
-        // vstring.py:505-512: virtual concat + constant index → recurse into
-        // the child holding the position (vleft if index < len1, else vright at
-        // index - len1).
+        // vstring.py: `isinstance(sinfo, VStringConcatInfo) and vindex.is_constant()`
+        // — no `is_virtual()` on the concat. Recurse into the child holding
+        // the position (vleft if index < len1, else vright at index - len1).
         if let Some(idx) = ctx
             .resolve_operand_operand_opt(index)
             .and_then(|b| ctx.get_constant_int_box(&b))
@@ -1265,7 +1269,7 @@ impl OptString {
             let mut start = ctx.resolve_operand_operand(&op.arg(2));
             let stop = ctx.resolve_operand_operand(&op.arg(3));
             let lgtop = self.int_sub(opt, &stop, &start, ctx);
-            // vstring.py:682-685: double slicing s[i:j][k:l]
+            // vstring.py: `isinstance(vstr, VStringSliceInfo)` — no `is_virtual()`.
             if let Some(info) = self.get_slice_info(&s, ctx) {
                 let source = info.s;
                 let source_start = info.start;
@@ -1374,7 +1378,7 @@ impl OptString {
                 OopSpecIndex::StreqNonnull
             };
             if let Some(result) =
-                self.generate_modified_call(oopspec, &[arg1.clone(), arg2.clone()], op, ctx)
+                self.generate_modified_call(oopspec, &[arg1.clone(), arg2.clone()], op, mode, ctx)
             {
                 return result;
             }
@@ -1442,7 +1446,8 @@ impl OptString {
                     // first_optimization. Restart, not a final Emit.
                     return Some(OptimizationResult::Restart(eq_op));
                 }
-                // vstring.py:769-774: arg1 is a virtual slice, arg2 is length 1
+                // vstring.py handle_str_equal_level1:
+                // `isinstance(i1, VStringSliceInfo)` — no `is_virtual()`.
                 if let Some(info) = self.get_slice_info(arg1, ctx) {
                     let source = info.s.clone();
                     let start = info.start.clone();
@@ -1452,6 +1457,7 @@ impl OptString {
                         OopSpecIndex::StreqSliceChar,
                         &[source, start, length, vchar],
                         op,
+                        mode,
                         ctx,
                     );
                 }
@@ -1509,11 +1515,12 @@ impl OptString {
                 } else {
                     OopSpecIndex::StreqChecknullChar
                 };
-                return self.generate_modified_call(oopspec, &[arg1.clone(), vchar], op, ctx);
+                return self.generate_modified_call(oopspec, &[arg1.clone(), vchar], op, mode, ctx);
             }
         }
-        // vstring.py:807-813: if arg1 is a virtual slice
-        if let Some(info) = self.get_slice_info(arg1, ctx) {
+        // vstring.py handle_str_equal_level2:
+        // `isinstance(i1, VStringSliceInfo) and i1.is_virtual()`
+        if let Some(info) = self.get_virtual_slice_info(arg1, ctx) {
             let source = info.s.clone();
             let start = info.start.clone();
             let length = info.lgtop.clone();
@@ -1526,6 +1533,7 @@ impl OptString {
                 oopspec,
                 &[source, start, length, arg2.clone()],
                 op,
+                mode,
                 ctx,
             );
         }
@@ -1550,6 +1558,27 @@ impl OptString {
         false
     }
 
+    /// vstring.py `oopspecindex += mode.OS_offset`.
+    /// `mode_string.OS_offset` is 0; `mode_unicode.OS_offset` is
+    /// `EffectInfo._OS_offset_uni`.
+    fn oopspec_plus_mode_os_offset(oopspec: OopSpecIndex, mode: u8) -> OopSpecIndex {
+        if mode == 0 {
+            return oopspec;
+        }
+        let mapped = match oopspec {
+            OopSpecIndex::StreqSliceChecknull => OopSpecIndex::UnieqSliceChecknull,
+            OopSpecIndex::StreqSliceNonnull => OopSpecIndex::UnieqSliceNonnull,
+            OopSpecIndex::StreqSliceChar => OopSpecIndex::UnieqSliceChar,
+            OopSpecIndex::StreqNonnull => OopSpecIndex::UnieqNonnull,
+            OopSpecIndex::StreqNonnullChar => OopSpecIndex::UnieqNonnullChar,
+            OopSpecIndex::StreqChecknullChar => OopSpecIndex::UnieqChecknullChar,
+            OopSpecIndex::StreqLengthok => OopSpecIndex::UnieqLengthok,
+            other => return other,
+        };
+        debug_assert_eq!(mapped as u16, oopspec as u16 + EffectInfo::_OS_OFFSET_UNI);
+        mapped
+    }
+
     /// vstring.py generate_modified_call
     ///
     /// Look up the calldescr and func_ptr for the given oopspec in the
@@ -1559,11 +1588,14 @@ impl OptString {
         oopspec: OopSpecIndex,
         args: &[Operand],
         result_op: &Op,
+        mode: u8,
         ctx: &mut OptContext,
     ) -> Option<OptimizationResult> {
+        // vstring.py: oopspecindex += mode.OS_offset
+        let oopspec = Self::oopspec_plus_mode_os_offset(oopspec, mode);
         // Clone Arc to avoid borrow conflict with ctx
         let cic = ctx.callinfocollection.clone()?;
-        // vstring.py:852: calldescr, func = cic.callinfo_for_oopspec(oopspecindex)
+        // vstring.py: calldescr, func = cic.callinfo_for_oopspec(oopspecindex)
         // — a missing oopspec yields (None, 0). PyPy then builds CALL_I with
         // descr=calldescr (possibly None). Op.descr is `Option<DescrRef>`, so
         // encode the None-descr CALL directly instead of bailing.

@@ -6224,48 +6224,93 @@ fn build_jit_driver_pair() -> JitDriverPair {
         use majit_ir::OopSpecIndex as Os;
         use majit_ir::Type::{Int, Ref};
         use pyre_object::lowlevel_string as ll;
-        let rows: [(Os, &[majit_ir::Type], u64, &str); 7] = [
+        let rows: [(Os, &[majit_ir::Type], u64, &str); 14] = [
             (
                 Os::StreqSliceChecknull,
                 &[Ref, Int, Int, Ref],
                 pyre_interpreter::residual_word_addr!(4, ll::jit_ll_str_eq_slice_checknull) as u64,
-                "_ll_4_str_eq_slice_checknull",
+                "_ll_4_str_eq_slice_checknull__rpy_stringPtr_Signed_Signed_rpy_stringPtr",
+            ),
+            (
+                Os::UnieqSliceChecknull,
+                &[Ref, Int, Int, Ref],
+                pyre_interpreter::residual_word_addr!(4, ll::jit_ll_unicode_eq_slice_checknull)
+                    as u64,
+                "_ll_4_str_eq_slice_checknull__rpy_unicodePtr_Signed_Signed_rpy_unicodePtr",
             ),
             (
                 Os::StreqSliceNonnull,
                 &[Ref, Int, Int, Ref],
                 pyre_interpreter::residual_word_addr!(4, ll::jit_ll_str_eq_slice_nonnull) as u64,
-                "_ll_4_str_eq_slice_nonnull",
+                "_ll_4_str_eq_slice_nonnull__rpy_stringPtr_Signed_Signed_rpy_stringPtr",
+            ),
+            (
+                Os::UnieqSliceNonnull,
+                &[Ref, Int, Int, Ref],
+                pyre_interpreter::residual_word_addr!(4, ll::jit_ll_unicode_eq_slice_nonnull)
+                    as u64,
+                "_ll_4_str_eq_slice_nonnull__rpy_unicodePtr_Signed_Signed_rpy_unicodePtr",
             ),
             (
                 Os::StreqSliceChar,
                 &[Ref, Int, Int, Int],
                 pyre_interpreter::residual_word_addr!(4, ll::jit_ll_str_eq_slice_char) as u64,
-                "_ll_4_str_eq_slice_char",
+                "_ll_4_str_eq_slice_char__rpy_stringPtr_Signed_Signed_Char",
+            ),
+            (
+                Os::UnieqSliceChar,
+                &[Ref, Int, Int, Int],
+                pyre_interpreter::residual_word_addr!(4, ll::jit_ll_unicode_eq_slice_char) as u64,
+                "_ll_4_str_eq_slice_char__rpy_unicodePtr_Signed_Signed_UniChar",
             ),
             (
                 Os::StreqNonnull,
                 &[Ref, Ref],
                 pyre_interpreter::residual_word_addr!(2, ll::jit_ll_str_eq_nonnull) as u64,
-                "_ll_2_str_eq_nonnull",
+                "_ll_2_str_eq_nonnull__rpy_stringPtr_rpy_stringPtr",
+            ),
+            (
+                Os::UnieqNonnull,
+                &[Ref, Ref],
+                pyre_interpreter::residual_word_addr!(2, ll::jit_ll_unicode_eq_nonnull) as u64,
+                "_ll_2_str_eq_nonnull__rpy_unicodePtr_rpy_unicodePtr",
             ),
             (
                 Os::StreqNonnullChar,
                 &[Ref, Int],
                 pyre_interpreter::residual_word_addr!(2, ll::jit_ll_str_eq_nonnull_char) as u64,
-                "_ll_2_str_eq_nonnull_char",
+                "_ll_2_str_eq_nonnull_char__rpy_stringPtr_Char",
+            ),
+            (
+                Os::UnieqNonnullChar,
+                &[Ref, Int],
+                pyre_interpreter::residual_word_addr!(2, ll::jit_ll_unicode_eq_nonnull_char) as u64,
+                "_ll_2_str_eq_nonnull_char__rpy_unicodePtr_UniChar",
             ),
             (
                 Os::StreqChecknullChar,
                 &[Ref, Int],
                 pyre_interpreter::residual_word_addr!(2, ll::jit_ll_str_eq_checknull_char) as u64,
-                "_ll_2_str_eq_checknull_char",
+                "_ll_2_str_eq_checknull_char__rpy_stringPtr_Char",
+            ),
+            (
+                Os::UnieqChecknullChar,
+                &[Ref, Int],
+                pyre_interpreter::residual_word_addr!(2, ll::jit_ll_unicode_eq_checknull_char)
+                    as u64,
+                "_ll_2_str_eq_checknull_char__rpy_unicodePtr_UniChar",
             ),
             (
                 Os::StreqLengthok,
                 &[Ref, Ref],
                 pyre_interpreter::residual_word_addr!(2, ll::jit_ll_str_eq_lengthok) as u64,
-                "_ll_2_str_eq_lengthok",
+                "_ll_2_str_eq_lengthok__rpy_stringPtr_rpy_stringPtr",
+            ),
+            (
+                Os::UnieqLengthok,
+                &[Ref, Ref],
+                pyre_interpreter::residual_word_addr!(2, ll::jit_ll_unicode_eq_lengthok) as u64,
+                "_ll_2_str_eq_lengthok__rpy_unicodePtr_rpy_unicodePtr",
             ),
         ];
         for (oopspec, argtypes, func, name) in rows {

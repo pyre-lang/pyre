@@ -409,9 +409,7 @@ fn str_chars<'a>(s: *const crate::unicodeobject::UnicodeValueStorage) -> &'a [u8
     unsafe { std::slice::from_raw_parts((s as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET), len) }
 }
 
-/// `support.py _ll_4_str_eq_slice_checknull` — `str1[start : start + length]
-/// == str2`.  The `OS_STREQ_SLICE_CHECKNULL` helper `jtransform.py
-/// _handle_stroruni_call` registers beside `stroruni.equal`.
+/// `support.py LLtypeHelpers._ll_4_str_eq_slice_checknull`
 #[majit_macros::elidable]
 pub extern "C" fn jit_ll_str_eq_slice_checknull(
     s1: *const crate::unicodeobject::UnicodeValueStorage,
@@ -422,11 +420,22 @@ pub extern "C" fn jit_ll_str_eq_slice_checknull(
     if s2.is_null() {
         return 0;
     }
-    jit_ll_str_eq_slice_nonnull(s1, start, length, s2)
+    let chars2 = str_chars(s2);
+    if chars2.len() as i64 != length {
+        return 0;
+    }
+    let mut j: i64 = 0;
+    let chars1 = str_chars(s1);
+    while j < length {
+        if chars1[(start + j) as usize] != chars2[j as usize] {
+            return 0;
+        }
+        j += 1;
+    }
+    1
 }
 
-/// `support.py _ll_4_str_eq_slice_nonnull` — `str1[start : start + length]
-/// == str2`, assuming `str2 != NULL`.
+/// `support.py LLtypeHelpers._ll_4_str_eq_slice_nonnull`
 #[majit_macros::elidable]
 pub extern "C" fn jit_ll_str_eq_slice_nonnull(
     s1: *const crate::unicodeobject::UnicodeValueStorage,
@@ -438,12 +447,18 @@ pub extern "C" fn jit_ll_str_eq_slice_nonnull(
     if chars2.len() as i64 != length {
         return 0;
     }
-    let start = start as usize;
-    (str_chars(s1)[start..start + chars2.len()] == *chars2) as i64
+    let mut j: i64 = 0;
+    let chars1 = str_chars(s1);
+    while j < length {
+        if chars1[(start + j) as usize] != chars2[j as usize] {
+            return 0;
+        }
+        j += 1;
+    }
+    1
 }
 
-/// `support.py _ll_4_str_eq_slice_char` — `str1[start : start + length] ==
-/// c2`.
+/// `support.py LLtypeHelpers._ll_4_str_eq_slice_char`
 #[majit_macros::elidable]
 pub extern "C" fn jit_ll_str_eq_slice_char(
     s1: *const crate::unicodeobject::UnicodeValueStorage,
@@ -454,28 +469,52 @@ pub extern "C" fn jit_ll_str_eq_slice_char(
     if length != 1 {
         return 0;
     }
-    (str_chars(s1)[start as usize] as i64 == c2) as i64
+    if str_chars(s1)[start as usize] as i64 != c2 {
+        return 0;
+    }
+    1
 }
 
-/// `support.py _ll_2_str_eq_nonnull` — `str1 == str2`, both non-null.
+/// `support.py LLtypeHelpers._ll_2_str_eq_nonnull`
 #[majit_macros::elidable]
 pub extern "C" fn jit_ll_str_eq_nonnull(
     s1: *const crate::unicodeobject::UnicodeValueStorage,
     s2: *const crate::unicodeobject::UnicodeValueStorage,
 ) -> i64 {
-    (str_chars(s1) == str_chars(s2)) as i64
+    let chars1 = str_chars(s1);
+    let chars2 = str_chars(s2);
+    let len1 = chars1.len() as i64;
+    let len2 = chars2.len() as i64;
+    if len1 != len2 {
+        return 0;
+    }
+    let mut j: i64 = 0;
+    while j < len1 {
+        if chars1[j as usize] != chars2[j as usize] {
+            return 0;
+        }
+        j += 1;
+    }
+    1
 }
 
-/// `support.py _ll_2_str_eq_nonnull_char` — `str1 == c2`, `str1` non-null.
+/// `support.py LLtypeHelpers._ll_2_str_eq_nonnull_char`
 #[majit_macros::elidable]
 pub extern "C" fn jit_ll_str_eq_nonnull_char(
     s1: *const crate::unicodeobject::UnicodeValueStorage,
     c2: i64,
 ) -> i64 {
-    matches!(str_chars(s1), [c] if *c as i64 == c2) as i64
+    let chars = str_chars(s1);
+    if chars.len() as i64 != 1 {
+        return 0;
+    }
+    if chars[0] as i64 != c2 {
+        return 0;
+    }
+    1
 }
 
-/// `support.py _ll_2_str_eq_checknull_char` — `str1 == c2`.
+/// `support.py LLtypeHelpers._ll_2_str_eq_checknull_char`
 #[majit_macros::elidable]
 pub extern "C" fn jit_ll_str_eq_checknull_char(
     s1: *const crate::unicodeobject::UnicodeValueStorage,
@@ -484,18 +523,172 @@ pub extern "C" fn jit_ll_str_eq_checknull_char(
     if s1.is_null() {
         return 0;
     }
-    jit_ll_str_eq_nonnull_char(s1, c2)
+    let chars = str_chars(s1);
+    if chars.len() as i64 != 1 {
+        return 0;
+    }
+    if chars[0] as i64 != c2 {
+        return 0;
+    }
+    1
 }
 
-/// `support.py _ll_2_str_eq_lengthok` — `str1 == str2` for two non-null
-/// strings already known to have the same length.
+/// `support.py LLtypeHelpers._ll_2_str_eq_lengthok`
 #[majit_macros::elidable]
 pub extern "C" fn jit_ll_str_eq_lengthok(
     s1: *const crate::unicodeobject::UnicodeValueStorage,
     s2: *const crate::unicodeobject::UnicodeValueStorage,
 ) -> i64 {
+    let mut j: i64 = 0;
     let chars1 = str_chars(s1);
-    (*chars1 == str_chars(s2)[..chars1.len()]) as i64
+    let chars2 = str_chars(s2);
+    let len1 = chars1.len() as i64;
+    while j < len1 {
+        if chars1[j as usize] != chars2[j as usize] {
+            return 0;
+        }
+        j += 1;
+    }
+    1
+}
+
+type U = majit_rlib::lltypesystem::rstr::UNICODE;
+
+/// The `chars` array of a live rstr `UNICODE` payload.
+fn unicode_chars<'a>(s: *const U) -> &'a [u32] {
+    let len = unsafe { (*s).length };
+    unsafe { std::slice::from_raw_parts((*s).chars.as_ptr(), len) }
+}
+
+/// `support.py LLtypeHelpers._ll_4_str_eq_slice_checknull`
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_unicode_eq_slice_checknull(
+    s1: *const U,
+    start: i64,
+    length: i64,
+    s2: *const U,
+) -> i64 {
+    if s2.is_null() {
+        return 0;
+    }
+    let chars2 = unicode_chars(s2);
+    if chars2.len() as i64 != length {
+        return 0;
+    }
+    let mut j: i64 = 0;
+    let chars1 = unicode_chars(s1);
+    while j < length {
+        if chars1[(start + j) as usize] != chars2[j as usize] {
+            return 0;
+        }
+        j += 1;
+    }
+    1
+}
+
+/// `support.py LLtypeHelpers._ll_4_str_eq_slice_nonnull`
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_unicode_eq_slice_nonnull(
+    s1: *const U,
+    start: i64,
+    length: i64,
+    s2: *const U,
+) -> i64 {
+    let chars2 = unicode_chars(s2);
+    if chars2.len() as i64 != length {
+        return 0;
+    }
+    let mut j: i64 = 0;
+    let chars1 = unicode_chars(s1);
+    while j < length {
+        if chars1[(start + j) as usize] != chars2[j as usize] {
+            return 0;
+        }
+        j += 1;
+    }
+    1
+}
+
+/// `support.py LLtypeHelpers._ll_4_str_eq_slice_char`
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_unicode_eq_slice_char(
+    s1: *const U,
+    start: i64,
+    length: i64,
+    c2: i64,
+) -> i64 {
+    if length != 1 {
+        return 0;
+    }
+    if unicode_chars(s1)[start as usize] as i64 != c2 {
+        return 0;
+    }
+    1
+}
+
+/// `support.py LLtypeHelpers._ll_2_str_eq_nonnull`
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_unicode_eq_nonnull(s1: *const U, s2: *const U) -> i64 {
+    let chars1 = unicode_chars(s1);
+    let chars2 = unicode_chars(s2);
+    let len1 = chars1.len() as i64;
+    let len2 = chars2.len() as i64;
+    if len1 != len2 {
+        return 0;
+    }
+    let mut j: i64 = 0;
+    while j < len1 {
+        if chars1[j as usize] != chars2[j as usize] {
+            return 0;
+        }
+        j += 1;
+    }
+    1
+}
+
+/// `support.py LLtypeHelpers._ll_2_str_eq_nonnull_char`
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_unicode_eq_nonnull_char(s1: *const U, c2: i64) -> i64 {
+    let chars = unicode_chars(s1);
+    if chars.len() as i64 != 1 {
+        return 0;
+    }
+    if chars[0] as i64 != c2 {
+        return 0;
+    }
+    1
+}
+
+/// `support.py LLtypeHelpers._ll_2_str_eq_checknull_char`
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_unicode_eq_checknull_char(s1: *const U, c2: i64) -> i64 {
+    if s1.is_null() {
+        return 0;
+    }
+    let chars = unicode_chars(s1);
+    if chars.len() as i64 != 1 {
+        return 0;
+    }
+    if chars[0] as i64 != c2 {
+        return 0;
+    }
+    1
+}
+
+/// `support.py LLtypeHelpers._ll_2_str_eq_lengthok`
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_unicode_eq_lengthok(s1: *const U, s2: *const U) -> i64 {
+    let mut j: i64 = 0;
+    let chars1 = unicode_chars(s1);
+    let chars2 = unicode_chars(s2);
+    let len1 = chars1.len() as i64;
+    while j < len1 {
+        if chars1[j as usize] != chars2[j as usize] {
+            return 0;
+        }
+        j += 1;
+    }
+    1
 }
 
 /// `rstr.py LLHelpers.ll_strcmp` — order two rstr `STR` payloads.
@@ -1178,6 +1371,52 @@ mod tests {
         for s in [whole, mid, mid_again, other, three] {
             bh_free_lowlevel_string(s, LOWLEVEL_STR_BASE_SIZE, 1);
         }
+    }
+
+    #[test]
+    fn jit_ll_unicode_eq_helpers_match_support_py() {
+        type U = majit_rlib::lltypesystem::rstr::UNICODE;
+        let alloc_unicode = |chars: &[u32]| -> (Vec<u64>, *const U) {
+            let nbytes = std::mem::size_of::<U>()
+                .saturating_add(chars.len().saturating_mul(std::mem::size_of::<u32>()));
+            let nwords = (nbytes + std::mem::size_of::<u64>() - 1) / std::mem::size_of::<u64>();
+            let mut buf = vec![0u64; nwords.max(1)];
+            let p = buf.as_mut_ptr() as *mut U;
+            unsafe {
+                (*p).hash = 0;
+                (*p).length = chars.len();
+                if !chars.is_empty() {
+                    std::ptr::copy_nonoverlapping(
+                        chars.as_ptr(),
+                        (*p).chars.as_mut_ptr(),
+                        chars.len(),
+                    );
+                }
+            }
+            (buf, p as *const U)
+        };
+
+        let null = std::ptr::null::<U>();
+        let (_whole_buf, whole) = alloc_unicode(&[0x41, 0x0100, 0x1F600, 0x42, 0x43]);
+        let (_mid_buf, mid) = alloc_unicode(&[0x0100, 0x1F600, 0x42]);
+        let (_mid_again_buf, mid_again) = alloc_unicode(&[0x0100, 0x1F600, 0x42]);
+        let (_other_buf, other) = alloc_unicode(&[0x0100, 0x1F600, 0x43]);
+        let (_grin_buf, grin) = alloc_unicode(&[0x1F600]);
+        assert_eq!(jit_ll_unicode_eq_slice_nonnull(whole, 1, 3, mid), 1);
+        assert_eq!(jit_ll_unicode_eq_slice_nonnull(whole, 1, 3, other), 0);
+        assert_eq!(jit_ll_unicode_eq_slice_nonnull(whole, 1, 2, mid), 0);
+        assert_eq!(jit_ll_unicode_eq_slice_checknull(whole, 1, 3, null), 0);
+        assert_eq!(jit_ll_unicode_eq_slice_checknull(whole, 1, 3, mid), 1);
+        assert_eq!(jit_ll_unicode_eq_slice_char(whole, 2, 1, 0x1F600), 1);
+        assert_eq!(jit_ll_unicode_eq_slice_char(whole, 2, 2, 0x1F600), 0);
+        assert_eq!(jit_ll_unicode_eq_nonnull(mid, mid_again), 1);
+        assert_eq!(jit_ll_unicode_eq_nonnull(mid, whole), 0);
+        assert_eq!(jit_ll_unicode_eq_nonnull_char(grin, 0x1F600), 1);
+        assert_eq!(jit_ll_unicode_eq_nonnull_char(mid, 0x0100), 0);
+        assert_eq!(jit_ll_unicode_eq_checknull_char(null, 0x1F600), 0);
+        assert_eq!(jit_ll_unicode_eq_checknull_char(grin, 0x1F600), 1);
+        assert_eq!(jit_ll_unicode_eq_lengthok(mid, mid_again), 1);
+        assert_eq!(jit_ll_unicode_eq_lengthok(mid, other), 0);
     }
 
     #[test]

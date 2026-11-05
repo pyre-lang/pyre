@@ -1403,9 +1403,8 @@ pub trait GcAllocator: Send {
     fn remember_gc_table(&mut self, _table: &std::sync::Arc<crate::GcTable>) {}
 
     /// `incminimark.py` `write_barrier` for `ResumeGuardDescr.rd_consts`.
-    /// The pool enters this collector's `pending_const_pools` unless
-    /// `GCFLAG_TRACK_YOUNG_PTRS` is already clear for this MiniMark
-    /// (`SharedConstPool::try_mark_remembered`).
+    /// The pool enters this collector's `pending_const_pools` unless it is
+    /// already on this MiniMark's list (`SharedConstPool::try_mark_remembered`).
     fn remember_const_pool(&mut self, _pool: &std::sync::Arc<majit_ir::SharedConstPool>) {}
 
     /// Whether the GC supports optimized conditional write barriers.
