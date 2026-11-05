@@ -318,7 +318,16 @@ pub fn clear_gc_alloc_young_nonmoving_hook() {
 /// payload first takes [`try_gc_alloc_young_nonmoving_no_collect_raw`].
 ///
 /// With no young hook installed this answers exactly as the stable twin.
+///
+/// Declared llop is `malloc` (`lloperation.py malloc`, flavor `'gc'`).
+/// `jtransform.py rewrite_op_malloc` turns that into `new_with_vtable`;
+/// it refuses a leftover `nonmovable` flag, so the fused op is a nursery
+/// `NewWithVtable`. `framework.py gct_fv_gc_malloc` is the GC-transformer
+/// lowering of the same llop. The native body is the nonmovable young
+/// allocator (`external_malloc(..., alloc_young=True)`); the JIT does not
+/// see that adaptation. The translator keys on the marker, not the path.
 #[majit_macros::dont_look_inside]
+#[majit_macros::jit_llop("malloc")]
 pub fn try_gc_alloc_young_nonmoving_raw(type_id: u32, payload_size: usize) -> GCREF {
     #[cfg(any(test, feature = "test-hooks"))]
     if !hook_test_effects_visible() {
@@ -355,7 +364,14 @@ pub fn clear_gc_alloc_young_nonmoving_no_collect_hook() {
 /// serves, as it does for the stable twin.
 ///
 /// With no such hook installed this answers exactly as the stable twin.
+///
+/// Same declared llop as [`try_gc_alloc_young_nonmoving_raw`]:
+/// `lloperation.py malloc` / `jtransform.py rewrite_op_malloc` /
+/// `framework.py gct_fv_gc_malloc`. The two helpers differ only in
+/// whether they collect; the native body of both is the nonmovable young
+/// allocator.
 #[majit_macros::dont_look_inside]
+#[majit_macros::jit_llop("malloc")]
 pub fn try_gc_alloc_young_nonmoving_no_collect_raw(type_id: u32, payload_size: usize) -> GCREF {
     #[cfg(any(test, feature = "test-hooks"))]
     if !hook_test_effects_visible() {

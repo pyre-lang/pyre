@@ -868,6 +868,13 @@ pub struct WalkSession {
     /// driver is active so `walk_session_roots` forwards its parent
     /// concretes until `push_frame` publishes it (`MetaInterp.newframe`).
     pub(crate) pending_helper_level: Option<HelperLevel>,
+    /// Portal CALL image captured when a Converted helper is entered from
+    /// the portal (`publish_helper_outer_call_image`). Converted helpers
+    /// do not push a `HelperLevel`, so a later helper→portal `perform_call`
+    /// numbers this as section 0 (`capture_resumedata` /
+    /// `ResumeDataLoopMemo.number`). A numbered `CallResult` helper leaves
+    /// this empty: its paused caller is the section itself.
+    pub(crate) helper_outer_call_parent: Option<InlineParentFrame>,
     /// `MetaInterp.current_call_id`: the root portal owns id 0 and each
     /// subsequently entered Python portal frame consumes the next id.
     pub next_call_id: u64,
@@ -1039,6 +1046,7 @@ impl Default for WalkSession {
             helper_live: Vec::new(),
             framestack: Vec::new(),
             pending_helper_level: None,
+            helper_outer_call_parent: None,
             next_call_id: 1,
             open_inline_activations: 0,
             root_debug_merge_point_py_pc: None,
@@ -1144,6 +1152,15 @@ impl WalkSession {
 
     pub(crate) fn last_inline(&self) -> Option<&InlineFrame> {
         self.framestack.iter().rev().find(|frame| !frame.is_portal)
+    }
+
+    /// Last inlined Python callee, skipping transparent helper levels.
+    /// `last_inline` is any non-portal frame; helpers count there.
+    pub(crate) fn last_python_inline(&self) -> Option<&InlineFrame> {
+        self.framestack
+            .iter()
+            .rev()
+            .find(|frame| !frame.is_portal && !frame.is_helper_level())
     }
 
     /// [`HelperChain`] of the helper levels on top of `framestack`.
@@ -1392,9 +1409,18 @@ fn record_inline_exception_context(ctx: &mut TraceCtx, exc: OpRef, exc_concrete:
     // skipped at the `SubRaise` catch site instead, matching
     // `pyopcode.py handle_bytecode` routing that exception around
     // `record_context`.
+    //
     // The hook chains through `chain_context`, so calling it here both applies
     // the effect to this authoritative walk's concrete exception and reaches
-    // the value the compiled iterations will store.
+    // the value the compiled iterations will store. A recording-time skip
+    // when `sys_exc_info` is None would bake that into the trace; compiled
+    // iterations that later run under a live handler would leave
+    // `__context__` unset. PyPy traces `executioncontext.py sys_exc_info`
+    // as jitcode (`guard_isnull` on `sys_exc_operror` and
+    // `current_gen_or_coroutine`) and compiles a bridge when a guard fails.
+    // Those guards synthesized here resume at the inlined CALL whose
+    // valuestack was already consumed. Residual-call the hook instead
+    // (`resolve_exception_context` reads `get_sys_exception` at run time).
     majit_metainterp::resolve_exception_context_for_recording(exc_ptr as usize as i64);
     let hook = majit_metainterp::resolve_exception_context_hook_address();
     if !hook.is_null() && !exc.is_none() {
@@ -3634,8 +3660,11 @@ pub enum DispatchError {
         callee_num_regs_f: usize,
     },
     /// Internal yield from one heap-owned sub-walk frame to the explicit
-    /// sub-walk driver.  It is consumed before ordinary abort handling and can
-    /// never escape [`run_sub_jitcode_walk`].  RPython's `_interpret` gets the
+    /// sub-walk driver.  [`SubWalkDriver::drive`] consumes it by pushing the
+    /// pending callee and continuing the same `_interpret` loop.  Nested
+    /// helpers yield from [`run_sub_jitcode_walk`]; a helper residual that
+    /// `MetaInterp.perform_call`s a portal Python frame yields from
+    /// [`perform_portal_call_from_helper`].  RPython's `_interpret` gets the
     /// same transition by changing `framestack[-1]` in its single driver loop.
     SubWalkSuspended { pc: usize },
     /// `inline_call_r_r/dR>r`'s callee surfaced
@@ -5026,6 +5055,8 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
     let raised = match exec {
         ResidualExecOutcome::Executed(Ok(_)) => 0i64,
         ResidualExecOutcome::Executed(Err(exc)) => exc,
+        ResidualExecOutcome::PortalPerformCall { result: Ok(_) } => 0i64,
+        ResidualExecOutcome::PortalPerformCall { result: Err(exc) } => exc,
         ResidualExecOutcome::Declined(cause) => {
             fbw_state::fbw_mark_unjournaled_effect(cause);
             let recorded =
@@ -5321,6 +5352,7 @@ fn dispatch_recursive_call<Sym: WalkSym>(
     }
     let raised = match exec {
         ResidualExecOutcome::Executed(result) => result.is_err(),
+        ResidualExecOutcome::PortalPerformCall { result } => result.is_err(),
         ResidualExecOutcome::Declined(cause) => {
             fbw_state::fbw_mark_unjournaled_effect(cause);
             false
@@ -7170,6 +7202,29 @@ unsafe fn raw_load_float(addr: *const u8, itemsize: usize) -> f64 {
     }
 }
 
+/// `pyjitpl.py opimpl_goto_if_not` reads `box.getint()`. The FrontendOp
+/// carries that value (`history.py` `IntFrontendOp` / `Box.getint()`);
+/// pyre also keeps it in the MIFrame int-register shadow when the OpRef
+/// was allocated outside this recorder (`setup_call` / a helper splice).
+/// `execute_and_record` stamps the result from those `getint()` values.
+fn box_getint<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    opref: OpRef,
+    shadow: ConcreteValue,
+) -> Option<i64> {
+    match opref
+        .inline_const_to_value()
+        .or_else(|| ctx.trace_ctx.box_value(opref))
+    {
+        Some(Value::Int(n)) => Some(n),
+        _ => match shadow {
+            ConcreteValue::Int(n) => Some(n),
+            ConcreteValue::Bool(v) => Some(i64::from(v)),
+            ConcreteValue::Null | ConcreteValue::Ref(_) | ConcreteValue::Float(_) => None,
+        },
+    }
+}
+
 /// Int-bank twin of [`write_ref_reg`] (Int-bank concrete shadow).  Writes an Int
 /// register and its concrete shadow in lock-step.  Mirrors the
 /// Ref-bank contract: every walker handler that writes
@@ -7649,12 +7704,8 @@ fn top_level_live_code<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<*
     if sym.jitcode().is_null() {
         return None;
     }
-    let raw = unsafe { (&(*sym.jitcode()).payload).code_ptr };
-    if raw.is_null() {
-        None
-    } else {
-        Some(pyre_interpreter::live_code_wrapper(raw as *const ()) as *const ())
-    }
+    let w = unsafe { (&(*sym.jitcode()).payload).w_code.get() };
+    (w != 0).then_some(w as *const ())
 }
 
 fn guard_current_frame_globals_identity<Sym: WalkSym>(
@@ -8276,6 +8327,12 @@ pub(crate) enum ResidualDecline {
 pub(crate) enum ResidualExecOutcome {
     Executed(Result<i64, i64>),
     Declined(ResidualDecline),
+    /// `MetaInterp.perform_call` of the portal from a helper EvalFn residual.
+    /// The callee walk already recorded the body (or CALL_ASSEMBLER); do not
+    /// also record the EvalFn `CallMayForce`.
+    PortalPerformCall {
+        result: Result<i64, i64>,
+    },
 }
 
 /// `pyjitpl.py _get_list_of_active_boxes` parity for the
@@ -9501,6 +9558,9 @@ unsafe fn walk_session_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit
         for parent in level.parents.iter_mut().chain(call_entry) {
             walk_parent(parent);
         }
+    }
+    if let Some(parent) = session.helper_outer_call_parent.as_mut() {
+        walk_parent(parent);
     }
 }
 
@@ -11019,7 +11079,9 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
         .get(boundary_index + 1)
         .map(|&(off, _)| off as usize)
         .unwrap_or(code.len());
-    let w_code = pyre_interpreter::live_code_wrapper(active.0.code_ptr.cast()) as usize;
+    // `ActiveResumeFrame::current` already selected the innermost inline
+    // frame's payload; its `w_code` is the green `pycode`.
+    let w_code = active.0.w_code.get() as usize;
     if w_code == 0 {
         return Ok(None);
     }
@@ -11351,6 +11413,7 @@ fn direct_libffi_call<Sym: WalkSym>(
     }
     let resid_raised = match resid_exec {
         ResidualExecOutcome::Executed(result) => result.is_err(),
+        ResidualExecOutcome::PortalPerformCall { result } => result.is_err(),
         ResidualExecOutcome::Declined(cause) => {
             fbw_abort_nested_unjournaled_residual(ctx, pc, Some(cause))?;
             fbw_mark_unjournaled_effect(cause);
@@ -11625,6 +11688,7 @@ fn direct_call_release_gil<Sym: WalkSym>(
     // the walk-end no-replay commit must stay off for this trace.
     let resid_raised = match resid_exec {
         ResidualExecOutcome::Executed(result) => result.is_err(),
+        ResidualExecOutcome::PortalPerformCall { result } => result.is_err(),
         ResidualExecOutcome::Declined(cause) => {
             fbw_abort_nested_unjournaled_residual(ctx, pc, Some(cause))?;
             fbw_mark_unjournaled_effect(cause);
@@ -13161,7 +13225,7 @@ fn walker_load_name_from_code(w_code_ptr: usize, name_idx: usize) -> Option<Stri
         if code_ptr.is_null() {
             return None;
         }
-        let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
+        let code = &*code_ptr;
         pyre_interpreter::pyframe::load_name_from_code(code, name_idx).map(ToString::to_string)
     }
 }
@@ -14611,7 +14675,9 @@ fn fused_goto_if_not_int<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_int_reg(code, op, 0, ctx)?;
     let b = read_int_reg(code, op, 1, ctx)?;
-    let condbox = record_int_cmp(ctx, opcode, a, b);
+    let a_concrete = read_int_reg_concrete(code, op, 0, ctx);
+    let b_concrete = read_int_reg_concrete(code, op, 1, ctx);
+    let condbox = record_int_cmp(ctx, opcode, a, b, a_concrete, b_concrete);
     let switchcase = match ctx.trace_ctx.concrete_of_opref(condbox) {
         Some(Value::Int(v)) => v,
         _ => {
@@ -15344,7 +15410,8 @@ fn fused_goto_if_not_int_unary<Sym: WalkSym>(
     opcode: OpCode,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let a = read_int_reg(code, op, 0, ctx)?;
-    let condbox = record_int_unary(ctx, opcode, a);
+    let a_concrete = read_int_reg_concrete(code, op, 0, ctx);
+    let condbox = record_int_unary(ctx, opcode, a, a_concrete);
     let switchcase = match ctx.trace_ctx.concrete_of_opref(condbox) {
         Some(Value::Int(v)) => v,
         _ => {

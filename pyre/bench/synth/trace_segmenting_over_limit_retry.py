@@ -25,6 +25,16 @@
 # Which means the number tracks what one traced iteration COSTS in this tree,
 # and has to be re-fit whenever that moves — by sweeping, not by nudging.
 #
+# GET_ITER of exact `range` now records `W_Range.descr_iter` (`functional.py
+# descr_iter` / `w_range_iter`) instead of the GetIter fold. That extra raw
+# cost pushed one more retry into the 0.8x band: `prepare_trace_segmenting`
+# (`pyjitpl.py`) cuts a bridge with `GUARD_ALWAYS_FAILS` and blackholes
+# `ABORT_SEGMENTED_TRACE`. PyPy's `PYPYLOG=jit-summary` on this fixture is
+# 4 loops / 11 bridges / 13 aborts (4 too-long + 9 segmenting); pyre lands
+# 3 loops / 13 bridges / 13 aborts (3 too-long + 10 segmenting). The extra
+# abort and its compiled cut (and the matching `fbw_blackhole_adopted_
+# single_frame`) are that segmenting abort, not a new inline admit.
+#
 # CPython (the oracle) has no `pypyjit`; PyPy and pyre do. Guarding the import
 # keeps the output identical across all three while the params only bind where a
 # JIT exists. `set_param` rather than an environment variable because the wasm

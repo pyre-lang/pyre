@@ -1723,7 +1723,7 @@ fn record_carrier_crossed_frame_traceback(
     if exc_ptr.is_null() {
         return true;
     }
-    let w_code = crate::state::recover_inline_callee_code(recipe.code_ptr);
+    let w_code = crate::state::recover_inline_callee_code(recipe.jitcode_index);
     // A synthetic frame carries the sentinel or null instead of a real code
     // object; the hook dereferences it, so both checks precede `is_code`, whose
     // type check would deref the sentinel.
@@ -1975,7 +1975,8 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             crate::jitcode_dispatch::census_record("P2Drain::SetupFailed");
             return p2_drain_abort();
         };
-        let Some(callee_pjc) = crate::state::pyjitcode_for_code(recipe.code_ptr) else {
+        let Some(callee_pjc) = crate::state::pyjitcode_for_jitcode_index(recipe.jitcode_index)
+        else {
             discard_bridge_carrier_walk(
                 ctx,
                 sym,
@@ -2545,7 +2546,8 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
             }
             continue;
         }
-        let Some(middle_pjc) = crate::state::pyjitcode_for_code(middle.code_ptr) else {
+        let Some(middle_pjc) = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index)
+        else {
             crate::jitcode_dispatch::census_record("P2Drain::NoMiddlePjc");
             return None;
         };
@@ -2630,8 +2632,8 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
             }
             continue;
         }
-        let middle_pjc =
-            crate::state::pyjitcode_for_code(middle.code_ptr).expect("pre-validated above");
+        let middle_pjc = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index)
+            .expect("pre-validated above");
         if let Some(catch_target) = carrier_catch_target(
             middle_pjc.jitcode.code.as_slice(),
             middle.jitcode_pc as usize,
@@ -2786,7 +2788,7 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::MiddleSetupFailed");
         return None;
     };
-    let Some(middle_pjc) = crate::state::pyjitcode_for_code(middle.code_ptr) else {
+    let Some(middle_pjc) = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index) else {
         crate::jitcode_dispatch::census_record("P2Drain::NoMiddlePjc");
         return None;
     };
@@ -3156,7 +3158,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::MiddleSetupFailed");
         return None;
     };
-    let Some(middle_pjc) = crate::state::pyjitcode_for_code(middle.code_ptr) else {
+    let Some(middle_pjc) = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index) else {
         crate::jitcode_dispatch::census_record("P2Drain::NoMiddlePjc");
         return None;
     };
@@ -3342,8 +3344,8 @@ fn adopt_blackhole_crn(frame: usize, resume_py_pc: usize) {
 }
 
 /// Canonical `CodeObject*` for the live portal frame, matching
-/// `MetaInterpStaticData::canonical_code_key_opt`: a raw code pointer is
-/// already the key, a `W_Code` wrapper unwraps through `w_code_get_ptr`.
+/// `MetaInterpStaticData::canonical_code_key_opt`: the frame's `PyCode`
+/// wrapper unwraps through `w_code_get_ptr`.
 fn live_root_code_key(root_addr: usize) -> Option<usize> {
     if root_addr == 0 {
         return None;
@@ -3354,9 +3356,11 @@ fn live_root_code_key(root_addr: usize) -> Option<usize> {
     if pycode.is_null() {
         return None;
     }
-    if !pyre_interpreter::live_code_wrapper(pycode).is_null() {
-        return Some(pycode as usize);
-    }
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        unsafe { pyre_interpreter::pycode::is_code(pycode as pyre_object::PyObjectRef) },
+        "live_root_code_key `pycode` must be a PyCode wrapper"
+    );
     let raw = unsafe { pyre_interpreter::w_code_get_ptr(pycode as pyre_object::PyObjectRef) };
     if raw.is_null() {
         None
@@ -6119,23 +6123,21 @@ fn run_perfn_walk<Sym: WalkSym>(
             }
             *jump_args = rebuilt;
         }
-        // pyjitpl.py raise_continue_running_normally parity: a
-        // walk that ends at a merge point hands the interpreter (and the
-        // compiled loop's heap-reloading preamble) the END-of-walk frame
-        // state, so the walked iteration — whose residual calls executed
-        // concretely — is not re-run.  After `close_loop_args_at` (whose
-        // jump-arg derivation reads the pre-walk frame) is the one safe
-        // commit point.  All-or-nothing inside the helper; a `false`
+        // pyjitpl.py `reached_loop_header` closes the loop from the tracer's
+        // CURRENT boxes; `raise_continue_running_normally` unpacks those live
+        // boxes into ContinueRunningNormally.  The interpreter continues from
+        // the tracer's frame and never rolls already-executed work back to
+        // replay it.  A residual recorded symbolically (`int_pow_nomod`) has
+        // still run concretely during the walk, so the end frame is
+        // authoritative even when `fbw_has_unjournaled_effect()` is set.
+        // Always attempt `flush_walk_loop_end_state_to_frame`; the helper's
+        // all-or-nothing slot/depth refusal is the remaining gate.  A `false`
         // return keeps the legacy replay.
         //
-        // Commit preconditions:
-        //   - no unjournaled effect (a symbolically recorded residual
-        //     call only the replay applies);
-        //   - the frame flush resolves every live slot (all-or-nothing);
-        // then the committed flag routes the portal to adopt the end
-        // state instead of replaying.  The store-journal epilogue below
-        // settles the walk's eager list stores either way (commit keeps
-        // them, non-commit rolls them back for the replay).
+        // After `close_loop_args_at` (whose jump-arg derivation reads the
+        // pre-walk frame) is the one safe commit point.  The store-journal
+        // epilogue below settles the walk's eager list stores either way
+        // (commit keeps them, non-commit rolls them back for the replay).
         if let Ok((outcome, _end_pc)) = &walk_result {
             let header_pc = match outcome {
                 crate::jitcode_dispatch::DispatchOutcome::CloseLoop { .. } => close_loop_restart_pc,
@@ -6152,28 +6154,28 @@ fn run_perfn_walk<Sym: WalkSym>(
                 _ => None,
             };
             if let Some(header_pc) = header_pc {
-                if crate::jitcode_dispatch::fbw_has_unjournaled_effect() {
-                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                        eprintln!(
-                            "[fbw-end-flush] declined at header_pc={header_pc} \
-                             (unjournaled effect) — legacy replay kept"
-                        );
-                    }
-                } else if crate::state::flush_walk_loop_end_state_to_frame(
-                    ctx,
-                    cf_addr_now(),
-                    header_pc,
-                ) {
+                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    let unjournaled = crate::jitcode_dispatch::fbw_has_unjournaled_effect();
+                    let (value_unavailable, symbolic) =
+                        crate::jitcode_dispatch::fbw_unjournaled_kinds();
+                    eprintln!(
+                        "[fbw-end-flush] loop-end header_pc={header_pc} \
+                         unjournaled={unjournaled} value_unavailable={value_unavailable} \
+                         symbolic={symbolic}"
+                    );
+                }
+                if crate::state::flush_walk_loop_end_state_to_frame(ctx, cf_addr_now(), header_pc) {
                     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                         eprintln!(
                             "[fbw-end-flush] COMMIT header_pc={header_pc} bridge={} \
-                             journal_len={} outcome={outcome:?}",
+                             journal_len={} unjournaled={} outcome={outcome:?}",
                             ctx.is_bridge_trace,
                             crate::jitcode_dispatch::fbw_store_journal_len(),
+                            crate::jitcode_dispatch::fbw_has_unjournaled_effect(),
                         );
                     }
-                    // The loop header IS where this walk ended; the sticky
-                    // unjournaled check above is the whole gate.
+                    // The loop header IS where this walk ended; the flush's
+                    // all-or-nothing slot/depth refusal is the remaining gate.
                     let leg = if matches!(
                         outcome,
                         crate::jitcode_dispatch::DispatchOutcome::SegmentTrace { .. }
@@ -6204,8 +6206,10 @@ fn run_perfn_walk<Sym: WalkSym>(
         // whose prior STORE_ATTR ran once during the walk, then again on
         // replay).  Flush the abort-point frame (locals + last_instr) so the
         // portal resumes at the unsupported opcode instead of replaying.
-        // The marker-only fallback uses the same no-unjournaled-effect
-        // predicate as the CloseLoop end-flush above.  A latched inline-callee
+        // The marker-only fallback still refuses an unjournaled effect:
+        // unlike CloseLoop (`reached_loop_header` publishes the current
+        // boxes), this resume re-runs the unsupported opcode rather than
+        // adopting a completed loop-header image.  A latched inline-callee
         // forward abort has already distinguished an outside mark from a mark
         // inside its discarded attempt.
         let live_root_addr = sym.live_vable_frame_addr();
@@ -8286,6 +8290,7 @@ mod tests {
             metadata,
             std::ptr::null(),
             false,
+            std::ptr::null(),
         );
         let wrapper = Box::new(crate::state::JitCode {
             index: -1,
@@ -9017,6 +9022,7 @@ mod tests {
             metadata,
             code_ptr,
             false,
+            std::ptr::null(),
         ));
         crate::state::install_jitcode_for(code_ref, pyjit);
         assert!(

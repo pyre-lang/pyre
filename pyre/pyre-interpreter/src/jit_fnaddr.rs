@@ -7978,37 +7978,39 @@ mod tests {
         assert!(!is_abi_unsound_argument_residual(0));
     }
 
-    /// `#[getfunctionptr]` publishes the word-ABI trampoline, not the raw
-    /// `&[PyObjectRef]` / `Result` item (`get_jitcode_calldescr` /
-    /// `getfunctionptr`).
+    /// Look-inside (`descroperation.py get_and_call_function` /
+    /// `baseobjspace.py call_function`): no JIT hint, `*args_w` specialized
+    /// per arity. Same unpublished residual as `funccall_result`: a
+    /// `__majit_call_target_*` trampoline is not the published fnaddr.
     #[test]
-    fn jit_trace_fnaddrs_publishes_getfunctionptr_call_residuals() {
+    fn jit_trace_fnaddrs_looks_inside_call_helpers() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let get_and_call: extern "C" fn(i64, i64, i64, i64) -> i64 =
-            crate::baseobjspace::__majit_call_target_get_and_call_function;
-        let get_and_call = get_and_call as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_interpreter::baseobjspace::get_and_call_function"],
-            get_and_call
-        );
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+            assert!(
+                !desc.path.ends_with("::get_and_call_function"),
+                "get_and_call_function must not publish a getfunctionptr trampoline: {}",
+                desc.path
+            );
+            assert!(
+                !desc.path.ends_with("::call_function_impl_result"),
+                "call_function_impl_result must not publish a getfunctionptr trampoline: {}",
+                desc.path
+            );
+        });
         let raw_get = crate::baseobjspace::get_and_call_function as *const () as usize as i64;
-        assert_ne!(
-            get_and_call, raw_get,
-            "must not publish the raw slice/Result item"
-        );
-
-        let call_impl: extern "C" fn(i64, i64) -> i64 =
-            crate::call::__majit_call_target_call_function_impl_result;
-        let call_impl = call_impl as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_interpreter::call::call_function_impl_result"],
-            call_impl
-        );
+        if let Some(&addr) = bindings.get("pyre_interpreter::baseobjspace::get_and_call_function") {
+            assert_eq!(
+                addr, raw_get,
+                "look-inside get_and_call_function must not publish a distinct trampoline"
+            );
+        }
         let raw_call = crate::call::call_function_impl_result as *const () as usize as i64;
-        assert_ne!(
-            call_impl, raw_call,
-            "must not publish the raw slice/Result item"
-        );
+        if let Some(&addr) = bindings.get("pyre_interpreter::call::call_function_impl_result") {
+            assert_eq!(
+                addr, raw_call,
+                "look-inside call_function_impl_result must not publish a distinct trampoline"
+            );
+        }
     }
 
     /// The `ll_math.py` C llexternals are core: float `**` and `%` call

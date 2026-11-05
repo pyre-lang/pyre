@@ -1165,13 +1165,16 @@ pub(crate) fn binary_slice_values_inner(
             };
             let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
             let e = (if e < 0 { (len + e).max(0) } else { e.min(len) } as usize).max(s);
-            // `_utf8[start:end]` through `ll_stringslice_startstop`
-            // (`rstr.py`); wrap with `space.newutf8`. A whole-string slice
-            // of an exact `str` shares the operand (`unicodeobject.py`
-            // `_getitem_slice`). Take storage and index table after the last
-            // conversion — off the receiver that conversion may have moved.
+            // `_unicode_sliced` always cuts through `_index_to_byte` +
+            // `ll_stringslice_startstop`. Interpreter-only, a whole-string
+            // slice of an exact `str` returns the operand so `is_w` sees
+            // the same `_utf8` (`unicodeobject.py is_w`); `rstr.py
+            // ll_stringslice_startstop` does the same when not jitted.
+            // `we_are_jitted()` folds this off so a trace whose `stop` is
+            // never `len` does not GUARD `start != 0`.
             let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            if s == 0
+            if !majit_metainterp::jit::we_are_jitted()
+                && s == 0
                 && e == pyre_object::w_str_len(obj)
                 && pyre_object::pyobject::is_exact_type(obj, &pyre_object::pyobject::STR_TYPE)
             {

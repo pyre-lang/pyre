@@ -4704,6 +4704,10 @@ fn import_module_importhook(
 }
 
 impl OpcodeStepExecutor for PyFrame {
+    fn pycode(&self) -> pyre_object::PyObjectRef {
+        self.pycode as pyre_object::PyObjectRef
+    }
+
     fn getname_u(&self, index: usize) -> Result<&'static str, PyError> {
         let w_name = unsafe { crate::pycode::w_code_getname_w(self.getcode_w(), index) };
         crate::baseobjspace::text_w(w_name)

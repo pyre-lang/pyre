@@ -3208,6 +3208,41 @@ pub(crate) fn propagate_portal_frame_escape(frame: *mut PyFrame, got_exception: 
     }
 }
 
+/// `resume.py` `blackhole_from_resumedata` indexes `jitcodes[jitcode_pos]`.
+/// Python jitcodes with `abort()` cannot be blackhole-dispatched
+/// (`has_abort` is pyre-only). A helper body still carries `abort()` on
+/// unlowered branches; `blackhole.py` `_resume_mainloop` runs that jitcode
+/// from the guard, and `bhimpl_abort` raises only if reached.
+pub(crate) fn resolve_jitcode_for_blackhole(
+    jitcode_index: i32,
+    pc: i32,
+) -> Option<majit_metainterp::resume::ResolvedJitCode<'static>> {
+    if pc < 0 {
+        return None;
+    }
+    let op_live = pyre_jit_trace::state::blackhole_control_opcodes().0 as u8;
+    let pyjitcode = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)?;
+    // Capture-time `helper_resume_reaches_blocker` treats a reachable
+    // `abort` as a blocker, so a numbered helper section never resumes
+    // at a pc that can reach one. Refusing the whole helper section here
+    // would collapse deopt onto the caller's CALL and re-run the helper.
+    if pyjitcode.has_abort_opcode()
+        && !pyre_jit_trace::state::jitcode_is_transparent_helper(jitcode_index)
+    {
+        return None;
+    }
+    // A published resume frame carries a decodable JitCode `-live-`
+    // coordinate. An unrepresentable frame declines this blackhole path.
+    if !pyjitcode.jitcode.can_decode_live_vars(pc as usize, op_live) {
+        return None;
+    }
+    let resolved_pc = pc as usize;
+    Some(
+        majit_metainterp::resume::ResolvedJitCode::new(pyjitcode.jitcode.clone(), resolved_pc)
+            .with_virtualizable_stack_base(pyjitcode.metadata.stack_base),
+    )
+}
+
 /// resume.py blackhole_from_resumedata parity:
 /// Decode rd_numb via ResumeDataDirectReader, build blackhole chain,
 /// run _run_forever.
@@ -3276,44 +3311,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // the list `blackhole.py` `resume_in_blackhole` passes
     // (`MetaInterpStaticData.jitcodes` from `CodeWriter.make_jitcodes`).
     // `novable` only means this stream has no vable section.
-    let resolve_jitcode = |jitcode_index: i32,
-                           pc: i32|
-     -> Option<resume::ResolvedJitCode<'static>> {
-        if pc < 0 {
-            return None;
-        }
-        let op_live = pyre_jit_trace::state::blackhole_control_opcodes().0 as u8;
-        let pyjitcode = match pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index) {
-            Some(j) => j,
-            None => {
-                return None;
-            }
-        };
-        // Python jitcodes with `abort()` cannot be blackhole-dispatched
-        // (`has_abort` is pyre-only). A helper body still carries `abort()`
-        // on unlowered branches; `blackhole.py` `_resume_mainloop` runs that
-        // jitcode from the guard, and `bhimpl_abort` raises only if reached.
-        // Capture-time `helper_resume_reaches_blocker` treats a reachable
-        // `abort` as a blocker, so a numbered helper section never resumes
-        // at a pc that can reach one. Refusing the whole helper section here
-        // would collapse deopt onto the caller's CALL and re-run the helper.
-        if pyjitcode.has_abort_opcode()
-            && !pyre_jit_trace::state::jitcode_is_transparent_helper(jitcode_index)
-        {
-            return None;
-        }
-        // A published resume frame carries a decodable JitCode `-live-`
-        // coordinate. An unrepresentable frame declines this blackhole path.
-        let resolved_pc = if pyjitcode.jitcode.can_decode_live_vars(pc as usize, op_live) {
-            pc as usize
-        } else {
-            return None;
-        };
-        Some(
-            resume::ResolvedJitCode::new(pyjitcode.jitcode.clone(), resolved_pc)
-                .with_virtualizable_stack_base(pyjitcode.metadata.stack_base),
-        )
-    };
+    let resolve_jitcode = resolve_jitcode_for_blackhole;
 
     // resume.py `cpu.get_int_value(deadframe, i)`: values stay in
     // `jf_frame[]`. `jitframe_trace` walks the Ref slots. A host copy
@@ -4465,6 +4463,53 @@ fn consume_bridge_attempt_state(
 /// `prepare_resume_from_failure`'s `ExitFrameWithExceptionRef` is not
 /// that shortcut: it returns `FinishedException` on every caller, before
 /// the walk, and the caller propagates `jitexc.ExitFrameWithExceptionRef`.
+/// The exception-table byte offset a `next_instr`-style resume coordinate
+/// maps to, mirroring the live-frame form `frame.last_instr * 2` (where
+/// `last_instr` is `next_instr - 1`).
+fn exc_table_offset(py_pc: usize) -> u32 {
+    (py_pc.saturating_sub(1) as u32) * 2
+}
+
+/// Index of the resumed frame that catches, searched INNERMOST-first by
+/// asking each frame's own exception table about its own resume pc.
+/// `coords` is outermost-first, so `Some(0)` means the raise unwinds clear
+/// out of every inlined callee into the live frame; `None` means it
+/// escapes them all.
+pub(crate) fn resumed_catch_level(coords: &[(usize, usize, i32, i32)]) -> Option<usize> {
+    for (level, &(w_code, py_pc, jitcode_index, jitcode_pc)) in coords.iter().enumerate().rev() {
+        if w_code == 0 {
+            // Helper section: consult that jitcode's `catch_exception`
+            // at the section pc (`handle_exception_in_frame`). A
+            // continuation with no helper jitcode keeps walking to the
+            // Python ancestor (`finishframe_exception`).
+            if pyre_jit_trace::state::jitcode_is_transparent_helper(jitcode_index)
+                && pyre_jit_trace::jitcode_dispatch::helper_section_catch_target(
+                    jitcode_index,
+                    jitcode_pc,
+                )
+                .is_some()
+            {
+                return Some(level);
+            }
+            continue;
+        }
+        let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
+        if raw.is_null() {
+            return None;
+        }
+        let code = unsafe { &*raw };
+        if pyre_interpreter::pycode::lookup_exceptiontable(
+            &code.exceptiontable,
+            exc_table_offset(py_pc),
+        )
+        .is_some()
+        {
+            return Some(level);
+        }
+    }
+    None
+}
+
 // dont_look_inside: bridge-compile machinery the tracer must not enter.
 #[cfg_attr(target_arch = "wasm32", allow(unreachable_code))]
 #[majit_macros::dont_look_inside]
@@ -4800,54 +4845,6 @@ fn trace_and_compile_from_bridge_body(
     // handler.  An uncaught raise closes with
     // `compile_exit_frame_with_exception` (`last_exc_box` from
     // `handle_possible_exception`).
-    /// The exception-table byte offset a `next_instr`-style resume coordinate
-    /// maps to, mirroring the live-frame form `frame.last_instr * 2` (where
-    /// `last_instr` is `next_instr - 1`).
-    fn exc_table_offset(py_pc: usize) -> u32 {
-        (py_pc.saturating_sub(1) as u32) * 2
-    }
-
-    /// Index of the resumed frame that catches, searched INNERMOST-first by
-    /// asking each frame's own exception table about its own resume pc.
-    /// `coords` is outermost-first, so `Some(0)` means the raise unwinds clear
-    /// out of every inlined callee into the live frame; `None` means it
-    /// escapes them all.
-    fn resumed_catch_level(coords: &[(usize, usize, i32, i32)]) -> Option<usize> {
-        for (level, &(w_code, py_pc, jitcode_index, jitcode_pc)) in coords.iter().enumerate().rev()
-        {
-            if w_code == 0 {
-                // Helper section: consult that jitcode's `catch_exception`
-                // at the section pc (`handle_exception_in_frame`). A
-                // continuation with no helper jitcode keeps walking to the
-                // Python ancestor (`finishframe_exception`).
-                if pyre_jit_trace::state::jitcode_is_transparent_helper(jitcode_index)
-                    && pyre_jit_trace::jitcode_dispatch::helper_section_catch_target(
-                        jitcode_index,
-                        jitcode_pc,
-                    )
-                    .is_some()
-                {
-                    return Some(level);
-                }
-                continue;
-            }
-            let raw =
-                unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
-            if raw.is_null() {
-                return None;
-            }
-            let code = unsafe { &*raw };
-            if pyre_interpreter::pycode::lookup_exceptiontable(
-                &code.exceptiontable,
-                exc_table_offset(py_pc),
-            )
-            .is_some()
-            {
-                return Some(level);
-            }
-        }
-        None
-    }
 
     // `start_bridge_tracing` and `rebuild_portal_framestack_from_resumedata`
     // allocate. `set_valuestackdepth` writes through `live_frame()` (the
