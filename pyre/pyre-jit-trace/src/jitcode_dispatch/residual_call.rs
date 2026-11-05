@@ -5107,10 +5107,8 @@ pub(crate) fn residual_callee_is_walk_self_recursive<Sym: WalkSym>(
         if sym.jitcode().is_null() {
             return false;
         }
-        let caller_code =
-            pyre_interpreter::live_code_wrapper((*sym.jitcode()).raw_code() as *const ())
-                as *const ();
-        w_code as usize == caller_code as usize
+        let caller_code = (&(*sym.jitcode()).payload).w_code.get();
+        caller_code != 0 && w_code as usize == caller_code as usize
     }
 }
 
@@ -5555,6 +5553,16 @@ fn may_force_needs_helper_frame_resume<Sym: WalkSym>(
         && call_descr.get_extra_info().oopspecindex != majit_ir::OopSpecIndex::LibffiCall
 }
 
+/// `call.py guess_call_kind` `'recursive'` via
+/// `jitdriver_sd_from_portal_runner_ptr`: true iff `addr` is the process
+/// evaluator `EVAL_OVERRIDE` (`current_eval_fn_addr`), which
+/// `register_eval_override` sets to the JIT portal entry — the same role
+/// `jd.portal_runner_adr` plays for `ll_portal_runner_shim`. A forced-plain
+/// evaluator (`plain_eval_fn_addr`) is not a portal entry.
+pub(crate) fn portal_entry_for_funcptr(addr: i64) -> bool {
+    addr != 0 && addr == pyre_interpreter::call::current_eval_fn_addr() as i64
+}
+
 /// `executor.execute_varargs` for one residual, then the caller's
 /// `record_after_execute` hook.
 ///
@@ -5713,6 +5721,24 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         Some((pc, _, _)) => pc,
         None => usize::MAX,
     };
+    if ctx.fbw_mode.inline_subwalk
+        && ctx.fbw_mode.transparent_helper_subwalk
+        && allboxes.first().is_some_and(|b| b.is_constant())
+        && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
+    {
+        if portal_entry_for_funcptr(addr) {
+            match super::inline_call::perform_portal_call_from_helper(
+                ctx,
+                allboxes,
+                op_pc,
+                blackhole_result,
+            ) {
+                Ok(Some(outcome)) => return Ok(outcome),
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
     let unsupported_funcbox =
         residual_call_refused_up_front(ctx, call_opcode, allboxes, call_descr, op_pc, post_call_pc);
     if let Some((reason, addr, symbolic)) = unsupported_funcbox {
@@ -5721,7 +5747,15 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         // unnameable.
         if fbw_debug_abort_enabled() {
             let path = majit_metainterp::resolve_symbolic_fnaddr_path(addr);
-            eprintln!("[subwalk-unsupported] pc={op_pc} {reason}={addr:#x} path={path:?}");
+            let live = pyre_interpreter::jit_trace_fnaddrs()
+                .into_iter()
+                .find(|(_, registered)| *registered == addr)
+                .map(|(p, _)| p);
+            let current = pyre_interpreter::call::current_eval_fn_addr();
+            eprintln!(
+                "[subwalk-unsupported] pc={op_pc} {reason}={addr:#x} path={path:?} live={live:?} current_eval={current:#x} portal={}",
+                portal_entry_for_funcptr(addr)
+            );
         }
         return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
             pc: op_pc,
@@ -7356,6 +7390,26 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             {
                 (cb.drain_backend_jit_exc)();
             }
+            // The residual has returned; `vable_after_residual_call` never
+            // rewinds. Rewrite the force-time PRE-call flush into the
+            // fallthrough image `_copy_data_from_miframe` would copy, so
+            // `AfterApplied` (blackhole adopt declined) does not re-enter
+            // CALL. A raise keeps the force-time image — the handler, not
+            // the fallthrough, is that continuation.
+            if let Ok(value) = exec_result
+                && call_descr.result_type() == majit_ir::Type::Ref
+            {
+                let result = match (residual_result_scope.as_ref(), residual_result_index) {
+                    (Some(scope), Some(index)) => scope.get(index),
+                    _ => value as usize as pyre_object::PyObjectRef,
+                };
+                let _ = flush_escape_past_applied_call(
+                    ctx,
+                    live_frame_root.current(live_frame),
+                    op_pc,
+                    result,
+                );
+            }
             crate::state::note_vable_escape_abort();
             return Err(DispatchError::VableEscapedDuringResidualCall { pc: op_pc });
         }
@@ -8647,8 +8701,9 @@ pub(crate) fn publish_portal_executing_last_instr<Sym: WalkSym>(
     );
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
     let idx = info.static_field_index_by_name("last_instr")?;
-    // Listed `cpu.fielddescrof` row, matching the publish in
-    // `try_execute_residual_call_via_executor_inner`.
+    // Listed `cpu.fielddescrof(VTYPE, name)` row that
+    // `VirtualizableInfo.__init__` stores in `static_field_descrs`, the same
+    // descr an ordinary `setfield_gc` of this field carries.
     let descr = info.static_field_struct_descr(idx);
     ctx.trace_ctx
         .vable_setfield_descr(vable_ref, last_instr, descr);
@@ -8878,6 +8933,19 @@ fn record_operator_tail_residual_inner<Sym: WalkSym>(
         args,
         false,
     )?;
+    if recorded_residual.portal_perform_call {
+        if recorded_residual.raised {
+            let Some(exc) = ctx.last_exc_value() else {
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
+            };
+            let exc_concrete = ctx.last_exc_value_concrete();
+            return Ok(OperatorTailResidual::Raised((
+                DispatchOutcome::SubRaise { exc, exc_concrete },
+                op.next_pc,
+            )));
+        }
+        return Ok(OperatorTailResidual::Returned(recorded_residual.recorded));
+    }
     ctx.live_after_jit_pc = op.next_pc;
     if emit_guard_not_forced {
         ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
@@ -9526,7 +9594,7 @@ fn try_walker_force_quasi_immut_mapdict_write<Sym: WalkSym>(
         if code_ptr.is_null() {
             return None;
         }
-        &*(code_ptr as *const pyre_interpreter::CodeObject)
+        &*code_ptr
     };
     let name = pyre_interpreter::pyframe::load_name_from_code(code, name_idx as usize)?;
     // `descr_set__name__` stores `name?`. The residual setattr hides
@@ -10133,6 +10201,7 @@ struct RecordedResidual {
     is_list_wb: bool,
     raised: bool,
     can_raise: bool,
+    portal_perform_call: bool,
 }
 
 struct ResidualHookState {
@@ -10481,6 +10550,13 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
             Some(&mut record_call),
         ) {
             Ok(exec) => exec,
+            Err(error @ DispatchError::SubWalkSuspended { .. }) => {
+                // `MetaInterp.perform_call` from a helper residual yields a
+                // portal Python `MIFrame` onto the explicit driver. Recording
+                // a symbolic CALL here would bake a fnaddr into the cut
+                // preamble the driver rewinds.
+                return Err(error);
+            }
             Err(error) => {
                 // The hook did not run. A non-forces refusal still owes the
                 // symbolic call (`execute_varargs` records, and this gate
@@ -10508,6 +10584,15 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
             }
         }
     };
+    if let ResidualExecOutcome::PortalPerformCall { result } = resid_exec {
+        return Ok(RecordedResidual {
+            recorded: OpRef::NONE,
+            is_list_wb: false,
+            raised: result.is_err(),
+            can_raise,
+            portal_perform_call: true,
+        });
+    }
     let (recorded, is_list_wb, posted) = if hook_state.ran {
         (hook_state.recorded, hook_state.is_list_wb, true)
     } else {
@@ -10535,6 +10620,7 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
     let can_raise = can_raise && recorded.inline_const_to_value().is_none();
     let raised = match resid_exec {
         ResidualExecOutcome::Executed(result) => result.is_err(),
+        ResidualExecOutcome::PortalPerformCall { result } => result.is_err(),
         ResidualExecOutcome::Declined(cause) => {
             // The call op is recorded. A symbolic fnaddr must not stay in
             // it: the backend would emit a call to the hash. Cut back to
@@ -10595,6 +10681,7 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
         is_list_wb,
         raised,
         can_raise,
+        portal_perform_call: false,
     })
 }
 
@@ -11150,23 +11237,16 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
-    // Range GET_ITER: virtualize exact machine-word `range` into the same
-    // `W_IntRangeIterator` shape PyPy's inlined `descr_iter` would trace.
+    // GET_ITER records `W_Range.descr_iter` (`RANGE_ITER_DESCENT`) for
+    // exact `range`, `iter_w` for exact `zip` / `map` / `filter`, and
+    // `descr_iter` for exact sequence iterators. Not a spec-fold row —
+    // HelperDescent, the `newdict` twin.
     if ctx.is_authoritative_executor
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::GetIter
     {
-        if let Some(iter_op) = spec_gate(SpecFold::GetIter, || {
-            try_walker_specialize_get_iter(ctx, op.pc, &r_args, dst, dst_bank)
-        })? {
+        if let Some(iter_op) = try_walker_orthodox_get_iter(ctx, op.pc, &r_args, dst, dst_bank)? {
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, iter_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
-        }
-        // `W_Range.descr_iter`. The hand fold above needs a non-inlined
-        // concrete box and declines the virtual `range` that the same outer
-        // trace just allocated; this walks the interpreter body instead.
-        // Not a spec-fold row.
-        if let Some(outcome) = try_walker_orthodox_get_iter(ctx, op.pc, &r_args, dst, dst_bank)? {
-            return Ok((outcome, op.next_pc));
         }
         // The instance arm of `iter`: a user class's `__iter__` is Python, and
         // left residual it costs an interpreter frame and the virtualref
@@ -11205,6 +11285,12 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             try_walker_orthodox_list_iter_next(ctx, op.pc, &r_args, dst, dst_bank)?
         {
             write_no_driver_finishframe_dest(ctx, op.pc, op.next_pc, dst, dst_bank, item_op)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+        // Exact `zip` records `W_Zip.next_w` (`zip_two_tuple_next` /
+        // `zip_next_method`). Not a spec-fold row.
+        if let Some(item_op) = try_walker_orthodox_zip_next(ctx, op.pc, &r_args, dst, dst_bank)? {
+            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, item_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
         if let Some(inlined) = spec_gate(SpecFold::InstanceNext, || {
@@ -11301,6 +11387,19 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             Ok(Some(outcome)) => return Ok((outcome, op.next_pc)),
             Ok(None) => {}
             Err(error) => return Err(error),
+        }
+    }
+
+    // BUILD_MAP 0 (`{}`) is `space.newdict()` (`pyopcode.py BUILD_MAP`).
+    // Descend `newdict_empty` (`allocate_and_init_instance` empty-dict arm)
+    // so the trace records `new_with_vtable` + dstorage/dstrategy, matching
+    // PyPy.  Not a spec-fold row — HelperDescent, the `newfloat` twin.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::NewEmptyDict
+    {
+        if let Some(outcome) = try_walker_orthodox_newdict(ctx, op, dst, dst_bank)? {
+            return Ok((outcome, op.next_pc));
         }
     }
 
@@ -11426,18 +11525,16 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // An exact `range(...)` constructor call becomes a virtual W_Range whose
-    // four wrapped-int fields can fold directly into GET_ITER virtualization.
-    // Non-canonical callables and arguments fall through to the residual.
+    // An exact `range(...)` records `W_Range.descr_new` (`RANGE_NEW_*_DESCENT`)
+    // with the raw bound boxes. The leaf applies `space.index` and the
+    // zero-step `ValueError`. Not a spec-fold row — HelperDescent, the
+    // `newfloat` twin.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && try_walker_orthodox_range_new(ctx, code, op, &r_args, dst)?.is_some()
     {
-        if let Some(outcome) = spec_gate(SpecFold::BuiltinRange, || {
-            try_walker_specialize_builtin_range(ctx, code, op, &r_args, dst)
-        })? {
-            return Ok((outcome, op.next_pc));
-        }
+        return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
     // Zero-argument `locals()` / `vars()` / `dir()` on the walk's own portal
@@ -11810,6 +11907,16 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         let is_list_wb = recorded_residual.is_list_wb;
         let resid_raised = recorded_residual.raised;
         let can_raise = recorded_residual.can_raise;
+        if recorded_residual.portal_perform_call {
+            if resid_raised {
+                let Some(exc) = ctx.last_exc_value() else {
+                    return Err(DispatchError::callee_inline_unsupported(op.pc));
+                };
+                let exc_concrete = ctx.last_exc_value_concrete();
+                return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
+            }
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
         // pyjitpl.py `metainterp.generate_guard(rop.GUARD_NOT_FORCED)`
         // — unconditionally on the forces-virtual-or-virtualizable branch.
         // The walker omits the `vable_after_residual_call(funcbox)`
@@ -13219,6 +13326,16 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         let is_list_wb = recorded_residual.is_list_wb;
         let resid_raised = recorded_residual.raised;
         let can_raise = recorded_residual.can_raise;
+        if recorded_residual.portal_perform_call {
+            if resid_raised {
+                let Some(exc) = ctx.last_exc_value() else {
+                    return Err(DispatchError::callee_inline_unsupported(op.pc));
+                };
+                let exc_concrete = ctx.last_exc_value_concrete();
+                return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
+            }
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
@@ -13431,6 +13548,16 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         let is_list_wb = recorded_residual.is_list_wb;
         let resid_raised = recorded_residual.raised;
         let can_raise = recorded_residual.can_raise;
+        if recorded_residual.portal_perform_call {
+            if resid_raised {
+                let Some(exc) = ctx.last_exc_value() else {
+                    return Err(DispatchError::callee_inline_unsupported(op.pc));
+                };
+                let exc_concrete = ctx.last_exc_value_concrete();
+                return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
+            }
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
