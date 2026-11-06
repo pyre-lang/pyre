@@ -2150,27 +2150,38 @@ pub fn fsum(args: &[PyObjectRef]) -> PyResult {
 }
 
 pub fn prod(args: &[PyObjectRef]) -> PyResult {
-    // math.prod(iterable, /, *, start=1) — PyPy: interp_math.py `prod`.
+    // app_math.py `prod`: `res = start; for x in iterable: res = res * x`.
     // Bound scope: pos-only `iterable`, kw-only `start` (`PY_NULL` omitted).
     let bound = |i: usize| args.get(i).copied().filter(|value| !value.is_null());
     let iterable = bound(0)
         .ok_or_else(|| pyre_interpreter::PyError::type_error("prod() takes at least 1 argument"))?;
     let start = bound(1).unwrap_or_else(|| w_int_new(1));
     let _roots = pyre_object::gc_roots::push_roots();
-    let acc_slot = pyre_object::gc_roots::pin_roots(&[start, iterable]);
-    let items = pyre_interpreter::builtins::collect_iterable(
-        pyre_object::gc_roots::shadow_stack_get(acc_slot + 1),
-    )?;
-    // `collect_iterable` returns unrooted pointers. Publish the whole
-    // slice before any forwarding query; a per-item `pin_root` is a
-    // safepoint that can move the still-unpinned tail.
-    let items_base = pyre_object::gc_roots::pin_roots(&items);
-    // Multiplication can call `__mul__`; reload both operands after every
-    // collection and keep the running product in its rooted slot.
-    for index in 0..items.len() {
+    // Three livevars, a compile-time `pin_roots` array the erase pass
+    // scalar-replaces: the running product, the iterator, the current
+    // factor. A collected `Vec` is a native buffer, not a jitframe slot.
+    let acc_slot = pyre_object::gc_roots::pin_roots(&[start, iterable, PY_NULL]);
+    let w_iter = pyre_interpreter::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(
+        acc_slot + 1,
+    ))?;
+    pyre_object::gc_roots::shadow_stack_set(acc_slot + 1, w_iter);
+    loop {
+        let w_value = match pyre_interpreter::baseobjspace::next(
+            pyre_object::gc_roots::shadow_stack_get(acc_slot + 1),
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                let (stop, err) = err.matches_stop_iteration_keep();
+                if stop {
+                    break;
+                }
+                return Err(err);
+            }
+        };
+        pyre_object::gc_roots::shadow_stack_set(acc_slot + 2, w_value);
         let product = pyre_interpreter::baseobjspace::mul(
             pyre_object::gc_roots::shadow_stack_get(acc_slot),
-            pyre_object::gc_roots::shadow_stack_get(items_base + index),
+            pyre_object::gc_roots::shadow_stack_get(acc_slot + 2),
         )?;
         pyre_object::gc_roots::shadow_stack_set(acc_slot, product);
     }

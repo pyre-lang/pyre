@@ -214,6 +214,11 @@ impl MetaInterpStaticData {
         if let Some(jitcode) = self.frozen_indirectcall_dict.get(&fnaddress) {
             return Some(std::sync::Arc::clone(jitcode));
         }
+        // `pyjitpl.py bytecode_for_address` is `indirectcall_dict.get`
+        // (`Assembler.indirectcalltargets`). A translator symbolic hash
+        // is `getfunctionptr(graph)` only for a graph in that set; a
+        // direct residual (`getitem_slot`, `hash_w_hooked`) stays a
+        // residual (`do_residual_call`).
         let index = crate::jitcode_runtime::indirectcalltarget_index_for_address(fnaddress)?;
         let jitcode = crate::jitcode_runtime::indirectcalltarget_by_index(index)?;
         self.frozen_indirectcall_dict
@@ -1744,10 +1749,10 @@ pub fn resolve_bridge_walk_entry_at(jitcode_index: i32, carried_jitcode_pc: i32)
 ///   any non-vable extra reds (e.g. `ec`); virtualizable_boxes only
 ///   carries the vable static fields plus array items.
 /// * `array_items` — pre-resolved OpRefs for the heap-side
-///   `locals_cells_stack_w` array. Entries past `array_len` are ignored;
-///   short lists are padded with a shared const-NULL Ref so the vable
-///   mirror covers every interpreter-visible slot (virtualizable.py
-///   `assert len(boxes) == i + 1`).
+///   `locals_cells_stack_w` array. Production `init_symbolic` supplies
+///   one InputArg per `len(lst)` slot (`virtualizable.py read_boxes`).
+///   A short list is padded with const-NULL so the length still matches
+///   `array_len` (`assert len(boxes) == i + 1`).
 /// * `array_len` — the runtime PyFrame's
 ///   `locals_cells_stack_w.len()`; `init_virtualizable_boxes` stores this
 ///   as the sole entry in `virtualizable_array_lengths`.
@@ -7617,13 +7622,9 @@ impl PyreSym {
         if let Some(base) = self.vable_array_base {
             // virtualizable.py read_boxes iterates `len(lst)` — the
             // heap-side `locals_cells_stack_w` length, which is
-            // `num_locals + num_cells + max_stack` (pyframe.py:107-110).
-            // Match that shape so every interpreter-visible slot has a
-            // tracing-time mirror. The live prefix [0, nlocals+stack_only_depth)
-            // references the recorder's InputArg stream; reserved stack slots
-            // beyond the current stack pointer are NULL on the PyFrame heap
-            // (alloc_fixed_array_with_header(..., PY_NULL)) and the helper pads
-            // them with a shared const-NULL OpRef.
+            // `num_locals + num_cells + max_stack` (pyframe.py). Every
+            // slot is a box, including leftover refs above
+            // `valuestackdepth` after a POP.
             let num_vable_scalars = crate::virtualizable_gen::NUM_VABLE_SCALARS;
             let live_prefix = nlocals + stack_only_depth;
             // virtualizable.py read_boxes iterates `len(lst)` — the heap
@@ -7668,9 +7669,11 @@ impl PyreSym {
                     OpRef::input_arg_typed(pos, tp)
                 })
                 .collect();
-            // Array items inputargs at base..base + live_prefix. Items are
+            // Array items inputargs at base..base + array_len. Items are
             // W_Root (Ref) per `array_item_type = Ref` in virtualizable_gen.
-            let array_items: Vec<OpRef> = (0..live_prefix)
+            // `read_boxes` walks `len(lst)`, not the live valuestackdepth
+            // window, so the InputArg stream covers the full heap array.
+            let array_items: Vec<OpRef> = (0..array_len)
                 .map(|i| OpRef::input_arg_ref(base + i as u32))
                 .collect();
             // SYM_FRAME_IDX is the virtualizable identity (Ref).
@@ -16699,6 +16702,56 @@ mod tests {
             ctx.virtualizable_data_boxes().len(),
             crate::virtualizable_gen::NUM_VABLE_SCALARS + array_len,
         );
+    }
+
+    /// virtualizable.py `read_boxes` wraps every `len(lst)` item, including
+    /// leftover refs above `valuestackdepth`. Those slots are InputArg
+    /// boxes, not a const-NULL pad.
+    #[test]
+    fn init_symbolic_boxes_dead_stack_slots_from_the_heap_array() {
+        use pyre_interpreter::pyframe::PyFrame;
+
+        ensure_test_callbacks();
+        let code = compile_exec("len(x)").expect("test code should compile");
+        let mut frame = PyFrame::new(code.clone());
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+        install_test_jitcode(&code, frame.pycode);
+        let array_len =
+            concrete_frame_array_len(frame_ptr).expect("frame should expose locals_cells_stack_w");
+        assert!(
+            array_len >= 2,
+            "need a heap array longer than the live valuestackdepth window"
+        );
+        let tail = array_len - 1;
+        let sentinel = w_int_new(99);
+        locals_w_mut!(frame)[tail] = sentinel;
+        frame.valuestackdepth = 0;
+
+        let mut input_types = vec![
+            Type::Ref,
+            Type::Ref,
+            Type::Int,
+            Type::Ref,
+            Type::Int,
+            Type::Ref,
+        ];
+        input_types.extend(std::iter::repeat(Type::Ref).take(array_len));
+        let mut ctx = TraceCtx::for_test_types(&input_types);
+        let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
+        sym.become_active_vable_owner();
+        sym.set_live_vable_frame_addr(frame_ptr);
+        sym.init_symbolic(&mut ctx, frame_ptr);
+
+        let boxes = ctx.virtualizable_data_boxes();
+        let nstatic = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+        assert_eq!(boxes.len(), nstatic + array_len);
+        let tail_box = boxes[nstatic + tail];
+        assert!(
+            !tail_box.is_constant(),
+            "dead stack slots are read_boxes inputargs, not const NULL"
+        );
+        ctx.check_synchronized_virtualizable();
     }
 
     /// A walk that resumed from a guard leaves `PyFrame.valuestackdepth` at

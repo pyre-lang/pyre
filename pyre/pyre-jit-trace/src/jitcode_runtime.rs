@@ -3527,8 +3527,8 @@ pub fn decoded_ops(code: &[u8]) -> impl Iterator<Item = DecodedOp> + '_ {
 /// fallthrough of every instruction that does not end its block, plus every
 /// `L` label operand (`blackhole.py` `bhimpl_goto*` return the label or the
 /// next position). `catch_exception` `L` is followed like any other label.
-/// `None` when a reached instruction cannot be decoded or branches through a
-/// descr (`switch/id`), so the caller reads the whole body.
+/// `None` when a reached instruction cannot be decoded or a `switch/id`
+/// cannot resolve its descr, so the caller reads the whole body.
 pub fn reachable_starts_from(code: &[u8], pc: usize) -> Option<Vec<usize>> {
     reachable_starts_from_catch(code, pc, |_, _| true)
 }
@@ -3545,6 +3545,22 @@ pub fn reachable_starts_from_catch(
     pc: usize,
     follow_catch: impl Fn(usize, &std::collections::BTreeSet<usize>) -> bool,
 ) -> Option<Vec<usize>> {
+    reachable_starts_from_catch_switch(code, pc, follow_catch, |_| None)
+}
+
+/// [`reachable_starts_from_catch`] plus `bhimpl_switch` successors.
+///
+/// `blackhole.py bhimpl_switch` looks up `switchdict.dict[switchvalue]` and
+/// returns that label, or the position after the operands on `KeyError`.
+/// `switch_targets(descr_index)` supplies every listed arm; the KeyError
+/// fallthrough is `op.next_pc`. `None` from the callback, or an arm past
+/// `code.len()`, keeps the conservative whole-body answer.
+pub fn reachable_starts_from_catch_switch(
+    code: &[u8],
+    pc: usize,
+    follow_catch: impl Fn(usize, &std::collections::BTreeSet<usize>) -> bool,
+    switch_targets: impl Fn(usize) -> Option<Vec<usize>>,
+) -> Option<Vec<usize>> {
     let mut seen = std::collections::BTreeSet::new();
     let mut work = vec![pc];
     let mut catch_handlers = Vec::new();
@@ -3555,7 +3571,16 @@ pub fn reachable_starts_from_catch(
             }
             let op = decode_op_at(code, pc)?;
             if op.opname == "switch" {
-                return None;
+                let descr_index = decoded_op_descr_index(code, &op)? as usize;
+                let targets = switch_targets(descr_index)?;
+                for target in targets {
+                    if target >= code.len() {
+                        return None;
+                    }
+                    work.push(target);
+                }
+                work.push(op.next_pc);
+                continue;
             }
             let mut cursor = pc + 1;
             if op.opname != "live" {
@@ -3617,6 +3642,50 @@ pub fn reachable_starts_from_catch(
     Some(seen.into_iter().collect())
 }
 
+/// Arm PCs of the `switch/id` whose descr is `descr_index` on `jitcode`.
+///
+/// `bhimpl_switch` asserts a `SwitchDictDescr` then `switchdict.dict[value]`.
+/// Every listed key must resolve: dropping one would narrow the successor
+/// set. Missing descr or a non-switch entry is `None`.
+pub(crate) fn switch_arm_targets_for_jitcode(
+    jitcode: &majit_metainterp::jitcode::JitCode,
+    descr_index: usize,
+) -> Option<Vec<usize>> {
+    if let Some(descr) = jitcode.descr_at(descr_index) {
+        if let Some(targets) = switch_arm_targets_from_bh(descr.as_bh_descr()) {
+            return Some(targets);
+        }
+    }
+    // LLBC helpers resolve `d` through the build-time pool
+    // (`descr_ref_at`) when `GLOBAL_BUILD_DESCR_POOL` is not yet
+    // installed; `inline_call.rs switch_descr_targets` reads the same table.
+    switch_arm_targets_from_descr_ref(descr_index)
+}
+
+fn switch_arm_targets_from_bh(descr: Option<&BhDescr>) -> Option<Vec<usize>> {
+    match descr? {
+        BhDescr::Switch {
+            dict,
+            const_keys_in_order,
+            ..
+        } => const_keys_in_order
+            .iter()
+            .map(|&key| dict.get(&key).copied())
+            .collect(),
+        _ => None,
+    }
+}
+
+fn switch_arm_targets_from_descr_ref(descr_index: usize) -> Option<Vec<usize>> {
+    let descr = descr_ref_at(descr_index)?;
+    let switch = descr.as_switch_descr()?;
+    switch
+        .const_keys_in_order()
+        .iter()
+        .map(|&key| switch.lookup(key))
+        .collect()
+}
+
 /// Instruction starts `BlackholeInterpreter.run` can dispatch from `pc`.
 ///
 /// A `catch_exception` handler is followed when a reachable instruction in
@@ -3624,15 +3693,45 @@ pub fn reachable_starts_from_catch(
 /// a leading `live`). When `in_flight_callee_may_raise`, `_run_forever` /
 /// `_resume_mainloop` can also deliver the callee's exception to the catch
 /// sitting at this resume pc, so that landing handler is followed too.
+/// A `switch/id` without a descr resolver still returns `None`.
 pub fn blackhole_resume_reachable_starts(
     code: &[u8],
     pc: usize,
     in_flight_callee_may_raise: bool,
 ) -> Option<Vec<usize>> {
-    reachable_starts_from_catch(code, pc, |catch_pc, seen| {
-        catch_predecessor_is_reachable(code, catch_pc, seen)
-            || (in_flight_callee_may_raise && catch_at_landing_pc(code, pc, catch_pc))
-    })
+    blackhole_resume_reachable_starts_switch(code, pc, in_flight_callee_may_raise, |_| None)
+}
+
+/// [`blackhole_resume_reachable_starts`] that follows `bhimpl_switch` through
+/// `jitcode.descr_at`.
+pub fn blackhole_resume_reachable_starts_on(
+    jitcode: &majit_metainterp::jitcode::JitCode,
+    pc: usize,
+    in_flight_callee_may_raise: bool,
+) -> Option<Vec<usize>> {
+    blackhole_resume_reachable_starts_switch(
+        jitcode.code.as_slice(),
+        pc,
+        in_flight_callee_may_raise,
+        |descr_index| switch_arm_targets_for_jitcode(jitcode, descr_index),
+    )
+}
+
+fn blackhole_resume_reachable_starts_switch(
+    code: &[u8],
+    pc: usize,
+    in_flight_callee_may_raise: bool,
+    switch_targets: impl Fn(usize) -> Option<Vec<usize>>,
+) -> Option<Vec<usize>> {
+    reachable_starts_from_catch_switch(
+        code,
+        pc,
+        |catch_pc, seen| {
+            catch_predecessor_is_reachable(code, catch_pc, seen)
+                || (in_flight_callee_may_raise && catch_at_landing_pc(code, pc, catch_pc))
+        },
+        switch_targets,
+    )
 }
 
 /// `handle_exception_in_frame` skips a leading `live` and then reads
@@ -5441,6 +5540,71 @@ mod tests {
         );
     }
 
+    fn dict_strategy_method_offset(method: &str) -> usize {
+        let want = format!("method_{method}");
+        for i in 0..descr_count() {
+            let BhDescr::Field {
+                name,
+                owner,
+                offset: off,
+                ..
+            } = load_descr_uncached(i)
+            else {
+                continue;
+            };
+            if name == want
+                && owner.contains("DictStrategy")
+                && (owner == "{vtable}" || owner.ends_with("::{vtable}"))
+            {
+                return off;
+            }
+        }
+        panic!("method_{method} FieldDescr on DictStrategy {{vtable}}");
+    }
+
+    #[test]
+    fn ict_map_keys_rustc_vtable_slot_for_every_dict_strategy_getitem() {
+        let offset = dict_strategy_method_offset("getitem");
+        let mut missing = Vec::new();
+        for entry in pyre_interpreter::dyn_impl_vtables() {
+            if entry.trait_leaf != "DictStrategy" {
+                continue;
+            }
+            let slot = unsafe { *((entry.vtable as *const u8).add(offset) as *const usize) };
+            let ict = indirectcalltarget_index_for_address(slot);
+            let bc = crate::state::bytecode_for_address(slot);
+            if slot == 0 || ict.is_none() || bc.is_none() {
+                missing.push(entry.impl_key);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "DictStrategy::getitem rustc vtable slots must resolve through bytecode_for_address: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn bytecode_for_address_skips_class_dict_methods_getitem_symbolic_fnaddr() {
+        // Inherent `ClassDictMethods::getitem` has no rustc vtable slot, so
+        // `Assembler.indirectcalltargets` never names it.
+        // `pyjitpl.py bytecode_for_address` is `indirectcall_dict.get`;
+        // the Const funcbox stays a residual (`do_residual_call`).
+        let path = "objspace::std::classdict::ClassDictMethods::getitem";
+        let index = compute_pathed_jitcode_index(path)
+            .expect("ClassDictMethods::getitem must have a compiled jitcode");
+        let jitcode = get_jitcode_by_index(index).expect("index resolves");
+        let addr = crate::runtime_fnaddr_patch::runtime_fnaddr(jitcode.fnaddr) as usize;
+        assert_ne!(addr, 0);
+        assert!(
+            indirectcalltarget_index_for_address(addr).is_none(),
+            "ClassDictMethods::getitem must stay off the ICT map"
+        );
+        assert!(
+            crate::state::bytecode_for_address(addr).is_none(),
+            "bytecode_for_address must miss a non-ICT ClassDictMethods::getitem hash"
+        );
+    }
+
     #[test]
     fn portal_jitcode_resolves_to_unique_jitdriver_entry() {
         // Verify the portal accessor returns the build-time JitCode for the
@@ -5632,6 +5796,100 @@ mod tests {
         assert_eq!(
             blackhole_resume_reachable_starts(&code, 11, true),
             Some(vec![11, 14, 18, 22]),
+        );
+    }
+
+    #[test]
+    fn bytecode_for_address_skips_getitem_slot_symbolic_fnaddr() {
+        // `getitem_slot` is a direct residual (`baseobjspace.py` slot body),
+        // not an `Assembler.indirectcalltargets` graph. A translator
+        // symbolic hash must not `perform_call` it; `do_residual_call`
+        // runs the linked address (`pyjitpl.py bytecode_for_address` miss).
+        let jc = named_jitcode("getitem_slot").expect("getitem_slot jitcode");
+        let addr = crate::runtime_fnaddr_patch::runtime_fnaddr(jc.fnaddr) as usize;
+        assert_ne!(addr, 0);
+        assert!(
+            indirectcalltarget_index_for_address(addr).is_none(),
+            "getitem_slot must stay off the ICT map"
+        );
+        assert!(
+            crate::state::bytecode_for_address(addr).is_none(),
+            "bytecode_for_address must miss a non-ICT getitem_slot hash"
+        );
+    }
+
+    #[test]
+    fn reachable_starts_returns_none_on_unresolved_switch() {
+        let byte = |key: &str| {
+            *insns_opname_to_byte()
+                .get(key)
+                .unwrap_or_else(|| panic!("{key} must be in insns table"))
+        };
+        // 0: switch/id  then void_return. No descr resolver, so the
+        // code-only scan still reads the whole body.
+        let code = [byte("switch/id"), 0, 0, 0, byte("void_return/")];
+        assert_eq!(reachable_starts_from(&code, 0), None);
+        assert_eq!(blackhole_resume_reachable_starts(&code, 0, false), None);
+    }
+
+    #[test]
+    fn blackhole_resume_from_getitem_slot_lookup_follows_switch_arms() {
+        // After `w_dict_lookup_checked` the remaining body is a `switch/id`
+        // on the lookup tag (`bhimpl_switch`). The dict-hit arm returns; the
+        // miss arm raises. Neither is a later type-dispatch residual, so the
+        // remaining-body scan must not inherit the whole-body
+        // `blackhole_may_reject_unresolved_call`.
+        install_global_build_descr_pool();
+        let index = compute_named_jitcode_index("getitem_slot").expect("getitem_slot index");
+        let jc = get_runtime_jitcode_by_index(index).expect("runtime getitem_slot");
+        let mut pc = 0;
+        let mut switch_pc = None;
+        let mut descr_index = None;
+        while let Some(op) = decode_op_at(&jc.code, pc) {
+            if op.opname == "switch" {
+                switch_pc = Some(op.pc);
+                descr_index = decoded_op_descr_index(&jc.code, &op).map(usize::from);
+                break;
+            }
+            if op.next_pc <= pc {
+                break;
+            }
+            pc = op.next_pc;
+        }
+        let switch_pc = switch_pc.expect("getitem_slot has a switch/id");
+        let descr_index = descr_index.expect("switch/id d-operand");
+        let arms = switch_arm_targets_for_jitcode(&jc, descr_index)
+            .expect("getitem_slot switch descr resolves");
+        assert!(!arms.is_empty(), "switch descr must list at least one arm");
+        let resume_pc = {
+            // The live immediately in front of the switch is where FBW
+            // resumes after `w_dict_lookup_checked` returns.
+            let mut prev = 0;
+            let mut cur = 0;
+            while cur < switch_pc {
+                let op = decode_op_at(&jc.code, cur).expect("decode to switch");
+                prev = cur;
+                cur = op.next_pc;
+            }
+            prev
+        };
+        let starts = blackhole_resume_reachable_starts_on(&jc, resume_pc, false)
+            .unwrap_or_else(|| panic!("switch arms of getitem_slot@{resume_pc}"));
+        assert!(starts.contains(&resume_pc), "resume: {starts:?}");
+        assert!(starts.contains(&switch_pc), "switch: {starts:?}");
+        for arm in &arms {
+            assert!(
+                starts.contains(arm),
+                "arm {arm} missing from remaining starts {starts:?}"
+            );
+        }
+        assert!(
+            !starts.contains(&0),
+            "list arm must stay unreachable from the dict switch: {starts:?}"
+        );
+        assert!(
+            !jc.blackhole_may_reject_unresolved_call_at(&starts),
+            "dict-arm remaining body must not reject unresolved calls"
         );
     }
 

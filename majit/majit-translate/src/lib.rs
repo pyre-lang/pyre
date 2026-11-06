@@ -2041,20 +2041,19 @@ fn analyze_pipeline_from_module_paths(
         // generic identities are derived later from use-site type arguments,
         // so inherit the declaration's exact offsets when it has no concrete
         // entry (notably the explicit translated `Result` shell).
-        // `Option<fn(..)>::Some` is a pointer niche (`null_fn`): the
-        // payload sits at byte 0. The Option template is the explicit
-        // `[tag@0 | payload@8]` shell, so inheriting it would place
-        // `__pos_0` at 8.
+        // `inherit_template_exact_layout` withholds that for the
+        // `Option<fn>` pointer niche and for `Entry<K,V>` monomorphs
+        // (`get_ll_dict` one DICTENTRYARRAY per flavour).
         let skip_template_exact =
             program
                 .struct_fields
                 .fields
                 .get(struct_name)
                 .is_some_and(|rows| {
-                    !rows.iter().any(|row| row.name == "__discriminant")
-                        && rows.iter().any(|row| {
-                            row.name == "__pos_0" && majit_ir::descr::is_fn_ptr_spelling(&row.ty)
-                        })
+                    !layout::inherit_template_exact_layout(
+                        struct_name,
+                        rows.iter().map(|row| (row.name.as_str(), row.ty.as_str())),
+                    )
                 });
         let exact = program.exact_layouts.get(&sid).or_else(|| {
             if skip_template_exact {

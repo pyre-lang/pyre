@@ -8262,18 +8262,34 @@ fn orthodox_helper_boxed<Sym: WalkSym>(
 /// leaves the trace cut back to the call site.  The descent itself must
 /// produce the concrete; missing it declines rather than allocating a
 /// second shadow.
+///
+/// `_match_signature` is `@jit.unroll_safe`. A constructor walk that
+/// crosses `trace_limit` residualizes the enclosing Python CALL
+/// (`do_residual_call`) once the journaled ops can still be cut; leaving
+/// them in the caller trace makes the CALL dest the unfinished mapping.
 pub(crate) fn try_walker_orthodox_kwargs_dict_new<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
 ) -> Result<Option<OpRef>, DispatchError> {
-    match orthodox_helper_boxed(ctx, op_pc, &[], &[], &W_DICT_NEW_KWARGS_DESCENT, false)? {
-        Some(Some(dict_op)) => {
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    match orthodox_helper_boxed(ctx, op_pc, &[], &[], &W_DICT_NEW_KWARGS_DESCENT, false) {
+        Ok(Some(Some(dict_op))) => {
             if walker_concrete_ref_object(ctx, dict_op).is_none() {
                 return Ok(None);
             }
             Ok(Some(dict_op))
         }
-        Some(None) | None => Ok(None),
+        Ok(Some(None) | None) => Ok(None),
+        Err(DispatchError::TraceTooLong { .. }) => {
+            // The helper latches ABORT_TOO_LONG at this constructor. Residualizing
+            // the enclosing Python CALL (`do_residual_call`) replaces that abort:
+            // drop the image so the CALL dest is not the unfinished mapping.
+            discard_staged_abort(ctx.session);
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -8289,6 +8305,7 @@ pub(crate) fn try_walker_orthodox_kwargs_dict_setitem<Sym: WalkSym>(
     value_op: OpRef,
     value_obj: pyre_object::PyObjectRef,
 ) -> Result<Option<()>, DispatchError> {
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     match orthodox_helper_boxed(
         ctx,
         op_pc,
@@ -8300,9 +8317,16 @@ pub(crate) fn try_walker_orthodox_kwargs_dict_setitem<Sym: WalkSym>(
         ],
         &W_DICT_STORE_DESCENT,
         true,
-    )? {
-        Some(_) => Ok(Some(())),
-        None => Ok(None),
+    ) {
+        Ok(Some(_)) => Ok(Some(())),
+        Ok(None) => Ok(None),
+        Err(DispatchError::TraceTooLong { .. }) => {
+            discard_staged_abort(ctx.session);
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 

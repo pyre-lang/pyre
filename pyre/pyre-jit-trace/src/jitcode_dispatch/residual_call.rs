@@ -1903,12 +1903,15 @@ fn blackhole_level_starts(
     frame: &majit_metainterp::MIFrame,
     in_flight_callee_may_raise: bool,
 ) -> Option<Vec<usize>> {
-    let code = &frame.jitcode.code;
     blackhole_scan_root_pcs(frame)
         .into_iter()
         .map(|start| {
             let follow_callee = in_flight_callee_may_raise && start == frame.pc;
-            crate::jitcode_runtime::blackhole_resume_reachable_starts(code, start, follow_callee)
+            crate::jitcode_runtime::blackhole_resume_reachable_starts_on(
+                frame.jitcode.as_ref(),
+                start,
+                follow_callee,
+            )
         })
         .try_fold(Vec::new(), |mut all, starts| {
             all.extend(starts?);
@@ -4564,6 +4567,19 @@ fn residual_operands_are_not_all_objects<Sym: WalkSym>(
         || BIGINT_FNADDRS.contains(&addr)
 }
 
+/// A residual the walk must not invoke: the residual ABI cannot describe its
+/// signature.
+///
+/// [`pyre_interpreter::is_abi_unsound_argument_residual`] and
+/// [`pyre_interpreter::is_abi_unsound_result_residual`] name helpers published
+/// through the unsound hatches. Runtime helpers (`CallKw`, `BinaryOp`, the
+/// portal shim, `bh_*`) stay executable; their addresses are bound by the
+/// helper registry, not the unsound lists.
+fn residual_fnaddr_is_not_executable(addr: usize) -> bool {
+    pyre_interpreter::is_abi_unsound_argument_residual(addr)
+        || pyre_interpreter::is_abi_unsound_result_residual(addr)
+}
+
 /// Write the traced frame's locals region out before a residual that reads it
 /// through a live `FrameLocalsProxy`.
 ///
@@ -5416,7 +5432,13 @@ fn null_ref_sentinel_of_registered_leaf(target: i64, arg_index: usize, nargs: us
                         // deref. Declining it marks the walk unjournaled and
                         // the end flush keeps the legacy loop-entry replay,
                         // which runs the traced iteration's add a second time.
-                        "pin_root" => arg_index == 1 && nargs == 2,
+                        // The free `pin_root(root)` is the same store with
+                        // no `self`; `_match_signature` pins `w_kw_defs`
+                        // which is `PY_NULL` when the callee has no kw-only
+                        // defaults.
+                        "pin_root" => {
+                            (arg_index == 1 && nargs == 2) || (arg_index == 0 && nargs == 1)
+                        }
                         // `rlist.py ll_alloc_and_set(length, init)` writes
                         // `init` into every slot and does not dereference it.
                         // `vec![PY_NULL; n]` lowers to this helper; a NULL
@@ -6077,9 +6099,10 @@ pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
     // second half from whichever register the caller last wrote, and reading
     // that as a length dereferences an address nothing chose --- a fault
     // inside the callee, past every check this walk makes.
-    // `is_abi_unsound_argument_residual` names exactly the helpers published
-    // with such a parameter, so the descent declines before running one and
-    // the interpreter makes the call with the argument whole.
+    // `is_abi_unsound_argument_residual` / `is_abi_unsound_result_residual`
+    // name exactly the helpers published with such a parameter or result, so
+    // the descent declines before running one and the interpreter makes the
+    // call with the value whole.
     //
     // A may-force residual inside a transparent helper is declined for the
     // resume it would need.  Its GUARD_NOT_FORCED and GUARD_NO_EXCEPTION fail
@@ -6098,10 +6121,10 @@ pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
             // `symbolic` resolves against `symbolic_fnaddr_paths` in the
             // build's jit metadata, so carry the hash for the report.
             Some(("symbolic", addr, addr))
-        } else if pyre_interpreter::is_abi_unsound_argument_residual(addr as usize) {
+        } else if residual_fnaddr_is_not_executable(addr as usize) {
             // A real funcptr reached here, so there is no hash to carry, and
             // zero is what this variant spells for that.
-            Some(("abi-unsound-arg", addr, 0))
+            Some(("abi-unsound", addr, 0))
         } else if ctx.fbw_mode.transparent_helper_subwalk
             && call_opcode.is_call_may_force()
             && !records_inside_transparent_helper(addr)
@@ -6299,14 +6322,14 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // a fat-pointer parameter then reads the next register as a length and
     // memmoves from a wild address (`exception_reused_object_tb_not_doubled`
     // cranelift SIGSEGV in `try_execute_residual_call_via_executor_inner`).
-    if pyre_interpreter::is_abi_unsound_argument_residual(func_ptr as usize) {
+    if residual_fnaddr_is_not_executable(func_ptr as usize) {
         // `declined_symbolic` skips only the tracing-time invocation and
         // leaves the residual CALL in the trace. The backend then supplies
         // one word per `arg_types()` entry to a helper that expects a
-        // multiword parameter. Abort the enclosing walk the same way the
-        // inline-subwalk gate above does.
+        // multiword parameter or result. Abort the enclosing walk the same
+        // way the inline-subwalk gate above does.
         if fbw_debug_abort_enabled() {
-            eprintln!("[subwalk-unsupported] pc={op_pc} abi-unsound-arg={func_ptr:#x}");
+            eprintln!("[subwalk-unsupported] pc={op_pc} abi-unsound={func_ptr:#x}");
         }
         // A cannot-raise pure call used to return before this gate. An `Err`
         // here would abort the walk with no recorded call; keep the decline.
@@ -10477,11 +10500,14 @@ fn try_do_residual_or_indirect_call<Sym: WalkSym>(
         // of a funcptr is `'int'`).
         return Ok(None);
     };
-    if addr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(addr) {
-        // Translator-time symbolic addresses have no runtime jitcode.
-        // Same `bytecode_for_address` miss as a null key.
+    if addr == 0 {
+        // Null funcbox. Same `bytecode_for_address` miss as a null key.
         return Ok(None);
     }
+    // `pyjitpl.py do_residual_or_indirect_call`: Const funcbox →
+    // `bytecode_for_address` (ICT only). A translator symbolic hash is
+    // that graph's `getfunctionptr` when the graph is an indirect-call
+    // target; skipping it residualizes a body PyPy would `perform_call`.
     let Some(jitcode) = crate::state::bytecode_for_address(addr as usize) else {
         return Ok(None);
     };

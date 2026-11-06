@@ -6,11 +6,12 @@ impl<'a> Lowering<'a> {
     /// Close a root bracket at the guard's `Drop`, by calling the same rewind
     /// the destructor body calls. A non-guard drop is a no-op.
     ///
-    /// The call takes the guard by reference rather than the two words the
-    /// rewind needs, so this arm reads no field of it. A crate that only
-    /// imports the guard sees an opaque stub with no fields, and a
-    /// field-keyed close would silently confine itself to the crate that
-    /// defines one.
+    /// The call takes the guard's one word (`save_point`) by value, as
+    /// `pop_roots` restores `root_stack_top` by value. Residual `push_roots`
+    /// already returns that word, so the close hands it to
+    /// `root_scope_close_word` rather than a reference to the guard. The
+    /// named helper is what a crate that only imports the opaque guard can
+    /// still spell.
     pub(in crate::front::mir) fn emit_root_scope_close(&mut self, mir_bb: usize, place: &Place) {
         let Some(class_root) = self.tyref_adt_class_root(&place.ty) else {
             return;
@@ -718,7 +719,14 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return Ok(());
         };
-        if !fun_decl_is_residual(fd, self.dont_look_inside) {
+        // A callee is residual only when it is `dont_look_inside` or no
+        // loaded crate extracted its body. An Opaque FunDecl in this
+        // artefact is still a regular call when another loaded crate
+        // carries the Unstructured graph (`instance_leaf` sibling,
+        // `GraphBodyProvider::declare_crate`).
+        if !fun_decl_is_dont_look_inside(fd, self.dont_look_inside)
+            && fun_decl_has_body_in_loaded_crate(fd, self.struct_fields)
+        {
             return Ok(());
         }
         for (index, declared) in fd.signature.inputs.iter().enumerate() {
@@ -765,8 +773,8 @@ pub(in crate::front::mir) fn gc_identity_hash_path(name: &str) -> bool {
 pub(in crate::front::mir) const ROOT_SCOPE_MODULE: &str = "gc_roots";
 pub(in crate::front::mir) const ROOT_SCOPE_TYPE: &str = "RootScope";
 /// The shadow-stack rewind the guard's destructor performs, spelled as a call
-/// that takes the guard by reference.
-pub(crate) const ROOT_SCOPE_CLOSE: &str = "root_scope_close";
+/// that takes the guard's save_point word.
+pub(crate) const ROOT_SCOPE_CLOSE: &str = "root_scope_close_word";
 
 /// True for the root-bracket guard's own type path.
 pub(in crate::front::mir) fn gc_root_scope_type_path(name: &str) -> bool {
@@ -962,7 +970,7 @@ pub(in crate::front::mir) fn drop_lowers_as_glue_call(
 /// Match the lowered RootScope close used by result/exception rewrites.
 ///
 /// #1689 hoists Charon's `drop_in_place` glue; this branch emits the named
-/// `root_scope_close` residual.  Both rewind the same stack, so a rewrite
+/// `root_scope_close_word` residual.  Both rewind the same stack, so a rewrite
 /// that walks a close has to see either spelling.
 pub(crate) fn is_root_scope_drop_glue_call(kind: &OpKind) -> bool {
     let OpKind::Call {

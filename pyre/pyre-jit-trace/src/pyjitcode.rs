@@ -393,8 +393,8 @@ pub(crate) fn compute_blackhole_resume_facts(
     pc: usize,
     in_flight_callee_may_raise: bool,
 ) -> BlackholeResumeFacts {
-    match crate::jitcode_runtime::blackhole_resume_reachable_starts(
-        jitcode.code.as_slice(),
+    match crate::jitcode_runtime::blackhole_resume_reachable_starts_on(
+        jitcode,
         pc,
         in_flight_callee_may_raise,
     ) {
@@ -975,6 +975,33 @@ impl PyJitCode {
         }
         let search = table.binary_search_by_key(&jit_pc, |&(off, _)| off);
         Self::predecessor_index(search).map(|i| table[i].1.as_slice())
+    }
+
+    /// Color→slot map for a snapshot *entry* coordinate.
+    ///
+    /// An exact `pcdep_by_jit_pc` hit is that coordinate's own row, including
+    /// an empty one. A `-live-` that is absent from the first-offset table
+    /// must not inherit the previous opcode's map (`pcdep_for_jitcode_pc`
+    /// predecessor scan): `get_live_vars_info` (`jitcode.py`) walks BACK
+    /// onto the marker itself, and `get_list_of_active_boxes` reads
+    /// `registers_r[index]` there. Interior non-live offsets still
+    /// predecessor-scan.
+    pub fn pcdep_for_snapshot_entry(&self, jit_pc: usize, op_live: u8) -> Vec<(u8, u16, u16)> {
+        let table = &self.metadata.pcdep_by_jit_pc;
+        match table.binary_search_by_key(&jit_pc, |&(off, _)| off) {
+            Ok(i) => table[i].1.clone(),
+            Err(_) => {
+                let is_live = self.jitcode.can_decode_live_vars(jit_pc, op_live)
+                    || self.jitcode.code.get(jit_pc) == Some(&op_live);
+                if is_live {
+                    Vec::new()
+                } else {
+                    self.pcdep_for_jitcode_pc(jit_pc)
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_default()
+                }
+            }
+        }
     }
 
     /// Value-stack depth keyed by a JitCode byte offset via the

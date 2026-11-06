@@ -3459,6 +3459,22 @@ impl ResumeDataLoopMemo {
     /// `cached` is the box object `TraceIterator._cache` holds for the slot
     /// when the caller has it (`SnapshotIterator._untag` hands out that
     /// object), so the replacement walk starts from the box itself.
+    ///
+    /// `resume.py _number_boxes` calls `getptrinfo` on that replacement.
+    /// When the cache handle is a split `Rc` for the same position, the
+    /// optimizer's producer is the box that carries `PtrInfo`.
+    fn numbered_is_virtual(env: &dyn BoxEnv, b: &Operand) -> bool {
+        let opref = b.to_opref();
+        if opref.is_none() || opref.inline_const_bits().is_some() {
+            return false;
+        }
+        match opref.ty().unwrap_or_else(|| env.get_type(opref)) {
+            majit_ir::Type::Ref => env.is_virtual_ref(b),
+            majit_ir::Type::Int => env.is_virtual_raw(b),
+            _ => false,
+        }
+    }
+
     fn _number_one(
         &mut self,
         snapshot_box: SnapshotBox,
@@ -3485,21 +3501,21 @@ impl ResumeDataLoopMemo {
         let held = cached.or(snapshot_box.cached.as_ref());
         let b = match held {
             Some(cached) => {
-                let b = cached.get_box_replacement(false);
-                // An unregistered position mints a fresh box on every
-                // positional lookup, so only a registered one has an answer
-                // to compare against.
-                #[cfg(debug_assertions)]
-                {
-                    let positional = env.get_box_replacement_operand(raw_opref);
-                    if positional.same_box(&env.get_box_replacement_operand(raw_opref)) {
-                        debug_assert!(
-                            b.same_box(&positional),
-                            "_number_one {raw_opref:?}: cached box resolves to {:?}, \
-                             position resolves to {:?}",
-                            b.to_opref(),
-                            positional.to_opref()
-                        );
+                let mut b = cached.get_box_replacement(false);
+                // resume.py `_number_boxes`:
+                //     box = iter.get(...)
+                //     box = box.get_box_replacement()
+                //     info = getptrinfo(box)
+                // `iter.get` is the TraceIterator._cache object the
+                // optimizer mutates. A split Rc at that position is a
+                // different object: liveboxes is keyed by `is`, and the
+                // backend longevity walk keys failargs the same way, so
+                // numbering must store the producer even when it is no
+                // longer virtual (a forced NEW still has to be the
+                // failarg the allocator defined).
+                if let Some(from_env) = env.get_box_replacement_operand_opt(b.to_opref()) {
+                    if !b.same_box(&from_env) {
+                        b = from_env;
                     }
                 }
                 b
@@ -3523,25 +3539,13 @@ impl ResumeDataLoopMemo {
             numb_state.append_short(tagged);
             return Ok(());
         }
-        // ResumeDataLoopMemo._number_boxes:
-        //
-        //     box = iter.get(...)
-        //     box = box.get_box_replacement()
-        //     ...
-        //     if box.type == 'r':
-        //
         // The type used for virtual classification is the replacement
         // box's type, not the original snapshot slot's fallback type.  A
         // snapshot slot can carry an Int fallback from tracing but forward
         // to a Ref virtual after optimization; keeping the stale fallback
         // would number that virtual as a TAGBOX and the subsequent
         // fail-arg force would materialize it.
-        let box_type = opref.ty().unwrap_or_else(|| env.get_type(opref));
-        let is_virtual = match box_type {
-            majit_ir::Type::Ref => env.is_virtual_ref(&b),
-            majit_ir::Type::Int => env.is_virtual_raw(&b),
-            _ => false,
-        };
+        let is_virtual = Self::numbered_is_virtual(env, &b);
         let tagged = if is_virtual {
             let t = tag(numb_state.num_virtuals, TAGVIRTUAL)?;
             numb_state.num_virtuals += 1;
@@ -4493,6 +4497,141 @@ mod tests {
         assert_eq!(state.num_boxes, 1);
         assert_eq!(state.liveboxes.iter().count(), 1);
         assert_eq!(env.resolutions.get(), 3);
+    }
+
+    #[test]
+    fn numbering_reads_optimizer_virtual_when_cache_rc_splits() {
+        // resume.py `_number_boxes` calls getptrinfo on the optimizer's
+        // box. unique_cache can hold a split Rc at the same position with
+        // no PtrInfo; numbering must still TAGVIRTUAL.
+        let opref = majit_ir::OpRef::ref_op(24);
+        let cache_box = crate::history::test_support::rooted_operand_from_opref(opref);
+        let opt_box = crate::history::test_support::rooted_operand_from_opref(opref);
+        assert!(
+            !cache_box.same_box(&opt_box),
+            "two rootings of one position are distinct boxes"
+        );
+        struct Env {
+            opt_box: majit_ir::operand::Operand,
+        }
+        impl super::BoxEnv for Env {
+            fn get_box_replacement(&self, opref: majit_ir::OpRef) -> majit_ir::OpRef {
+                opref
+            }
+            fn get_box_replacement_operand(
+                &self,
+                opref: majit_ir::OpRef,
+            ) -> majit_ir::operand::Operand {
+                if opref == self.opt_box.to_opref() {
+                    self.opt_box.clone()
+                } else {
+                    crate::history::test_support::rooted_operand_from_opref(opref)
+                }
+            }
+            fn is_const(&self, box_: &majit_ir::operand::Operand) -> bool {
+                box_.to_opref().is_constant()
+            }
+            fn get_const(&self, box_: &majit_ir::operand::Operand) -> (i64, majit_ir::Type) {
+                (
+                    box_.to_opref().inline_const_bits().unwrap_or(0),
+                    majit_ir::Type::Ref,
+                )
+            }
+            fn get_type(&self, opref: majit_ir::OpRef) -> majit_ir::Type {
+                opref.ty().unwrap_or(majit_ir::Type::Ref)
+            }
+            fn is_virtual_ref(&self, box_: &majit_ir::operand::Operand) -> bool {
+                box_.same_box(&self.opt_box)
+            }
+            fn is_virtual_raw(&self, _: &majit_ir::operand::Operand) -> bool {
+                false
+            }
+        }
+        let env = Env {
+            opt_box: opt_box.clone(),
+        };
+        let snapshot = super::SnapshotBox {
+            opref,
+            cached: Some(cache_box),
+            const_gcref: None,
+        };
+        let mut state = super::NumberingState::new(1);
+        super::ResumeDataLoopMemo::new()
+            ._number_one(snapshot, None, &mut state, &env)
+            .unwrap();
+        assert_eq!(state.num_virtuals, 1, "split-Rc virtual is TAGVIRTUAL");
+        assert_eq!(state.num_boxes, 0, "split-Rc virtual is not a live TAGBOX");
+    }
+
+    #[test]
+    fn numbering_uses_optimizer_producer_when_cache_rc_splits() {
+        // resume.py `_number_boxes` keys liveboxes by the optimizer box.
+        // A split cache handle at the same position must not become the
+        // TAGBOX failarg: backend longevity keys that same object.
+        let opref = majit_ir::OpRef::ref_op(24);
+        let cache_box = crate::history::test_support::rooted_operand_from_opref(opref);
+        let opt_box = crate::history::test_support::rooted_operand_from_opref(opref);
+        assert!(
+            !cache_box.same_box(&opt_box),
+            "two rootings of one position are distinct boxes"
+        );
+        struct Env {
+            opt_box: majit_ir::operand::Operand,
+        }
+        impl super::BoxEnv for Env {
+            fn get_box_replacement(&self, opref: majit_ir::OpRef) -> majit_ir::OpRef {
+                opref
+            }
+            fn get_box_replacement_operand(
+                &self,
+                opref: majit_ir::OpRef,
+            ) -> majit_ir::operand::Operand {
+                if opref == self.opt_box.to_opref() {
+                    self.opt_box.clone()
+                } else {
+                    crate::history::test_support::rooted_operand_from_opref(opref)
+                }
+            }
+            fn is_const(&self, box_: &majit_ir::operand::Operand) -> bool {
+                box_.to_opref().is_constant()
+            }
+            fn get_const(&self, box_: &majit_ir::operand::Operand) -> (i64, majit_ir::Type) {
+                (
+                    box_.to_opref().inline_const_bits().unwrap_or(0),
+                    majit_ir::Type::Ref,
+                )
+            }
+            fn get_type(&self, opref: majit_ir::OpRef) -> majit_ir::Type {
+                opref.ty().unwrap_or(majit_ir::Type::Ref)
+            }
+            fn is_virtual_ref(&self, _: &majit_ir::operand::Operand) -> bool {
+                false
+            }
+            fn is_virtual_raw(&self, _: &majit_ir::operand::Operand) -> bool {
+                false
+            }
+        }
+        let env = Env {
+            opt_box: opt_box.clone(),
+        };
+        let snapshot = super::SnapshotBox {
+            opref,
+            cached: Some(cache_box.clone()),
+            const_gcref: None,
+        };
+        let mut state = super::NumberingState::new(1);
+        super::ResumeDataLoopMemo::new()
+            ._number_one(snapshot, None, &mut state, &env)
+            .unwrap();
+        assert_eq!(state.num_boxes, 1);
+        assert_eq!(state.num_virtuals, 0);
+        let tagged = super::tag(0, super::TAGBOX).unwrap();
+        assert_eq!(state.liveboxes.get(&opt_box), Some(tagged));
+        assert_eq!(
+            state.liveboxes.get(&cache_box),
+            None,
+            "split cache handle is not the liveboxes key"
+        );
     }
 
     #[test]
@@ -7419,14 +7558,16 @@ impl<'a> ResumeDataDirectReader<'a> {
     #[inline]
     fn finish_ref_slot(&mut self, tagged: i16) -> i64 {
         // resume.py decode_ref `TAGBOX`: the payload is a deadframe index.
-        if (tagged as u16) & TAGMASK as u16 == TAGBOX as u16 {
+        let value = if (tagged as u16) & TAGMASK as u16 == TAGBOX as u16 {
             let mut idx = (tagged >> 2) as i32;
             if idx < 0 {
                 idx += self.count;
             }
-            return self.cpu_get_value(idx as usize);
-        }
-        self.decode_ref(tagged)
+            self.cpu_get_value(idx as usize)
+        } else {
+            self.decode_ref(tagged)
+        };
+        value
     }
 
     /// resume.py next_float

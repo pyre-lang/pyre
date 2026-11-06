@@ -477,6 +477,7 @@ pub fn _wrapkey(key: &str) -> PyObjectRef {
 /// (`IdentityDictStorage`, `ObjectDictStorage`); `celldict.py`
 /// `erase({})`.
 pub type ModuleDictStorage = ModuleDictEntries;
+pub const MODULE_DICT_STORAGE_SIZE: usize = std::mem::size_of::<ModuleDictStorage>();
 
 /// `ModuleDictStrategy` key: the unwrapped `str` (`Utf8Str`).
 ///
@@ -1356,13 +1357,21 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     /// trait surface stays strategy-agnostic.
     fn get_empty_storage(&self) -> crate::gc_hook::GCREF {
         // `celldict.py get_empty_storage`: `self.erase({})` is a nursery
-        // `dicttable`. A `malloc_raw` table has no MiniMark header, so
-        // `ll_dict_grow`'s `d.entries = newitems` write barrier cannot
-        // remember the young `DICTENTRYARRAY`.
-        crate::gc_storage::gc_alloc_young_storage_box(
-            ModuleDictStorage::default(),
-            module_dict_storage_gc_type_id(),
-        ) as crate::gc_hook::GCREF
+        // `dicttable`. `ll_newdict`: malloc + field stores.
+        let tid = module_dict_storage_gc_type_id();
+        let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw(
+            tid,
+            MODULE_DICT_STORAGE_SIZE,
+        );
+        let d = if raw.is_null() {
+            crate::gc_storage::malloc_raw_zeroed::<ModuleDictStorage>()
+        } else {
+            raw as *mut ModuleDictStorage
+        };
+        unsafe {
+            crate::rordereddict::rdict_ll_newdict_in_place(d);
+        }
+        d as crate::gc_hook::GCREF
     }
 
     /// `celldict.py getitem` — str fast path, else

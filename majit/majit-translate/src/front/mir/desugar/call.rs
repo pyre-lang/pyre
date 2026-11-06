@@ -4,6 +4,50 @@ use super::std_call::{AtomicClass, interior_deref_root_local, rewrite_interior_i
 use super::*;
 
 impl<'a> Lowering<'a> {
+    /// Wrap class-backed arguments of a stored fn-ptr call the way
+    /// RPython source writes `cast_instance_to_base_ptr` at the call
+    /// site (`annlowlevel.py`). `None` of an instance is still that
+    /// call; `CastObjectToPtrEntry.specialize_call` turns a `NoneRepr`
+    /// argument into `lltype.nullptr(PTR.TO)`.
+    pub(in crate::front::mir) fn wrap_stored_fn_ptr_call_args(
+        &mut self,
+        mir_bb: usize,
+        args: Vec<Variable>,
+        arg_operands: &[Operand],
+        call_arg_tys: &[Option<TyRef>],
+    ) -> Vec<Variable> {
+        let bb_id = self.emit_bb(mir_bb);
+        let mut wrapped = Vec::with_capacity(args.len());
+        for (i, arg) in args.into_iter().enumerate() {
+            let ty = call_arg_tys
+                .get(i)
+                .and_then(|t| t.as_ref())
+                .cloned()
+                .or_else(|| {
+                    arg_operands
+                        .get(i)
+                        .and_then(|op| const_operand_tyref(op, self.llbc))
+                });
+            let Some(ty) = ty else {
+                wrapped.push(arg);
+                continue;
+            };
+            if !tyref_is_class_backed_fn_ptr_arg(&ty, self.llbc, self.tombstoned_leaves) {
+                wrapped.push(arg);
+                continue;
+            }
+            wrapped.push(
+                self.graph
+                    .push_op_var(
+                        bb_id,
+                        crate::model::cast_instance_to_base_ptr_call(arg),
+                        true,
+                    )
+                    .expect("cast_instance_to_base_ptr defines a result"),
+            );
+        }
+        wrapped
+    }
     pub(in crate::front::mir) fn lower_call(
         &mut self,
         mir_bb: usize,
@@ -596,7 +640,8 @@ impl<'a> Lowering<'a> {
         let resolved_call_args = args.clone();
         let gc_mut_ref_sig = self.gc_mut_ref_signature(&call.func, &call_arg_tys);
         // Captured before `call.func` moves into the call-shape match.
-        let raw_scalar_spills = self.raw_scalar_borrow_spills(&call.func, &call_arg_tys);
+        let raw_scalar_spills =
+            self.raw_scalar_borrow_spills(&call.func, &call_arg_tys, &arg_locals);
         let first_arg_is_string_array_view = args.first().is_some_and(|arg| {
             self.string_array_view_locals.iter().any(|(local, _)| {
                 self.local_var
@@ -1710,6 +1755,19 @@ impl<'a> Lowering<'a> {
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `direct_arrayitems` of a `DICTENTRYARRAY` is an int
+                // address (`rewrite_op_getsubstruct`). Emit that before
+                // the helper can return a GCREF of the item run.
+                if self.try_lower_rordereddict_item_ptr(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    first_arg_ty.as_ref(),
+                    dest_local,
+                    target,
+                )? {
                     return Ok(());
                 }
                 // `(*p.add(i)).field` on a named struct pointee is
@@ -6598,7 +6656,16 @@ impl<'a> Lowering<'a> {
                 // non-pointer operand, such as a `dyn` fat pointer the vtable
                 // arm could not resolve, keeps the synthetic `__dyn_call`
                 // path with the receiver threaded into `args[0]`.
-                let fn_ptr_family = operand_fn_ptr_family(&dyn_operand, self.llbc);
+                let fn_ptr_family = operand_fn_ptr_family(&dyn_operand, self.llbc).or_else(|| {
+                    // Registrar type id can miss when Charon inlines the
+                    // `unsafe fn` alias (`TyRef::Other`). The invoke body
+                    // still has one stored `Ptr(FuncType)` call:
+                    // `rptr.py` `rtype_simple_call` `indirect_call` with
+                    // `graphs is None`.
+                    (path_is_dict_eq_hook_invoke(&self.graph.name)
+                        && operand_fn_ptr_signature(&dyn_operand, self.llbc).is_some())
+                    .then_some(FnPtrFamily::Unknown)
+                });
                 let eval_hook_graphs =
                     eval_hook_graphs_for_call(self.llbc, self.body, &dyn_operand);
                 // A monomorphized vtable stores every method slot as
@@ -6608,6 +6675,19 @@ impl<'a> Lowering<'a> {
                 let vtable_slot = vtable_slot_under_fn_ptr_cast(self.llbc, self.body, &dyn_operand)
                     .unwrap_or_else(|| dyn_operand.clone());
                 let indirect = self.dyn_indirect_target(&vtable_slot);
+                // A stored `Ptr(FuncType)` call site in RPython writes
+                // `cast_instance_to_base_ptr` in the source
+                // (`annlowlevel.py`), including for a null instance.
+                // Wrap here so `SomePtr.call` sees already-converted
+                // arguments.
+                if indirect.is_none() && (eval_hook_graphs.is_some() || fn_ptr_family.is_some()) {
+                    args = self.wrap_stored_fn_ptr_call_args(
+                        mir_bb,
+                        args,
+                        &arg_operands,
+                        &call_arg_tys,
+                    );
+                }
                 let passes_pairs = !pair_lens.is_empty();
                 let mut args = splice_pair_lens(args, pair_lens);
                 if let Some((trait_root, method_name)) = indirect {
@@ -9092,6 +9172,7 @@ impl<'a> Lowering<'a> {
             &signature.output,
             self.llbc,
             carrier,
+            self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
         );

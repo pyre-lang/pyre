@@ -13485,20 +13485,18 @@ fn handler_debug_fatalerror(
         .collect();
     panic!("{}", String::from_utf8_lossy(&bytes));
 }
-/// blackhole.py `bhimpl_cast_ptr_to_int(a)`. The cast is identity
-/// (the tagging arithmetic lives at the erase site, never here); the
-/// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate.
-/// `ll_assert` remains a translated runtime assertion.
+/// blackhole.py `bhimpl_cast_ptr_to_int(a)`. Identity on the bits
+/// (`assembler.py genop_cast_ptr_to_int = _genop_same_as`, walker
+/// `unop_cast_record`). Upstream's `ll_assert((i & 1) == 1)` is the
+/// Boehm/MiniMark tagged-GCREF invariant; this runtime stores aligned
+/// GCREFs, and `support.py adr2int` here is the untagged cast.
 fn bhimpl_cast_ptr_to_int(a: i64) -> i64 {
-    assert!((a & 1) == 1, "bhimpl_cast_ptr_to_int: not an odd int");
     a
 }
 
-/// blackhole.py `bhimpl_cast_int_to_ptr(i)`. Identity cast; the
-/// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate
-/// before it is reinterpreted as a `GCREF`.
+/// blackhole.py `bhimpl_cast_int_to_ptr(i)`. Identity on the bits, same
+/// representation as [`bhimpl_cast_ptr_to_int`].
 fn bhimpl_cast_int_to_ptr(i: i64) -> i64 {
-    assert!((i & 1) == 1, "bhimpl_cast_int_to_ptr: not an odd int");
     i
 }
 

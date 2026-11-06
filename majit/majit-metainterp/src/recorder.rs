@@ -479,10 +479,12 @@ impl ByteBridgeResume {
         if resume_pos < 0 {
             return false;
         }
-        // The trace outlives optimize. Reset clears the pointer without
-        // dereferencing it. `get_snapshot_iter(index)` reads `_snapshot_data`
-        // at that byte offset; membership in the capture-order side list
-        // is not the coordinate.
+        // resume.py `ResumeDataVirtualAdder.finish` always calls
+        // `trace.get_snapshot_iter(rd_resume_position)`. That index is a
+        // byte offset into `_snapshot_data` (`opencoder.py
+        // TraceIterator.next`). A live guard's current descr slot is not
+        // the only valid start: a superseded capture at an earlier offset
+        // is still a `get_snapshot_iter` argument.
         let rec = unsafe { &*self.recorder };
         rec.trb
             .as_ref()
@@ -3149,6 +3151,45 @@ mod tests {
             rec.captured_resume_positions(),
             vec![off0 as usize, off2 as usize]
         );
+    }
+
+    #[test]
+    fn byte_bridge_resume_contains_offsets_in_snapshot_data() {
+        // resume.py finish → get_snapshot_iter(rd_resume_position). The
+        // index is a byte offset into `_snapshot_data`, including a
+        // superseded capture whose descr slot was later patched.
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
+        rec.record_guard(OpCode::GuardTrue, &[i0], None);
+        let frame = |pc: u32| SnapshotFrame {
+            jitcode_index: 1,
+            pc,
+            boxes: vec![SnapshotTagged::Box(i0, Type::Int)],
+        };
+        let off0 = rec.encode_captured_snapshot(&Snapshot {
+            resume_position: -1,
+            frames: vec![frame(11)],
+            vable_boxes: vec![],
+            vref_boxes: vec![],
+        });
+        rec.set_last_op_resume_position(off0);
+        rec.record_guard(OpCode::GuardFalse, &[i0], None);
+        let off1 = rec.encode_captured_snapshot(&Snapshot {
+            resume_position: -1,
+            frames: vec![frame(22)],
+            vable_boxes: vec![],
+            vref_boxes: vec![],
+        });
+        rec.set_last_op_resume_position(off1);
+        let feed = ByteBridgeResume::from_recorder(&rec, Vec::new());
+        assert!(feed.contains(off0));
+        assert!(feed.contains(off1));
+        assert!(!feed.contains(-1));
+        let data_len = rec.get_position().snapshot_data_len as i32;
+        assert!(data_len > off1);
+        assert!(feed.contains(data_len - 1));
+        assert!(!feed.contains(data_len));
     }
 
     #[test]

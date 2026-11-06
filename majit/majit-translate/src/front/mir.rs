@@ -81,7 +81,10 @@
 //!   - `Repeat` / `Len` / `NullaryOp` — synthetic `Call(__array_repeat
 //!     / __len / __nullary_*)`. `new_array_clear` is produced later by
 //!     `do_fixed_newlist_clear`, after the rtyper, so a `[i64; N]`
-//!     repeat stays the `__array_repeat(fill, count)` call here.
+//!     repeat stays the `__array_repeat(fill, count)` call here. The
+//!     result type is the dest's `Array<T;N>` so
+//!     `fixed_repeat_identity` can redirect without a later
+//!     `ArrayRead` / `ArrayWrite` of the same SSA.
 //!
 //! ### Terminators
 //!   - `Return` → `returnblock`.
@@ -144,6 +147,17 @@ use serde_json::Value;
 /// operation until that rewrite.  Non-null keeps it distinct from the null
 /// reference representation on every backend.
 const JITDRIVER_NAMEDCONST_SENTINEL_ADDR: i64 = 8;
+
+/// Locals some forward-reached `Call` terminator writes whole, plus the
+/// unique Regular call's argument operands so [`Lowering::place_address_source`]
+/// can follow a pointer-identity cast (`is_ptr_identity_cast`).
+struct CallDestLocals {
+    dests: bit_set::BitSet,
+    /// Unique whole-local Regular call writing this dest, with its
+    /// argument operands. Empty when two calls write the same local, or
+    /// the writer is not Regular.
+    unique: Vec<Option<(RegularCall, Vec<Operand>)>>,
+}
 
 /// Top-level entry — load `function_name` out of `llbc`, lower it,
 /// return the constructed [`FunctionGraph`].
@@ -554,9 +568,14 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
     let mut seen_struct_names = std::collections::HashSet::new();
     let mut seen_trait_names = std::collections::HashSet::new();
     let dedup_key = semantic_function_dedup_key;
+    // A callee whose Unstructured body lives in another loaded artefact
+    // is a regular call (`fun_decl_has_body_in_loaded_crate`). The
+    // per-artefact state is rebuilt each time, so note every artefact's
+    // local bodies into it before that artefact lowers.
     for llbc in llbcs {
         let prog = build_semantic_program_from_llbc_with_static_addrs_filtered(
             llbc,
+            llbcs,
             static_addrs,
             jitdriver_receiver_roots,
             module_filter,
@@ -1496,18 +1515,68 @@ fn intern_opaque_payload_spelling(
     }
 }
 
-/// One concrete `rordereddict_entries::Entry` / `GcEntries` use found in a
-/// signature or a local. `found` holds the rendered type arguments.
+/// `Entry<K, V>` flavour arguments. `RDict<K, V, S>` carries a hasher;
+/// only the first two arguments are the entry key and value
+/// (`get_ll_dict` one `DICTENTRY` per flavour).
+fn concrete_entry_type_args(args: &[String]) -> Option<Vec<String>> {
+    let kv: Vec<String> = args.iter().take(2).cloned().collect();
+    (kv.len() == 2 && kv.iter().all(|arg| !arg.is_empty() && !arg.contains("??"))).then_some(kv)
+}
+
+fn rendered_generic_type_args(generics: &serde_json::Value, llbc: &Llbc) -> Vec<String> {
+    generics
+        .get("types")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|ty| charon_type_value_to_ast_string(ty, llbc, 0))
+                .filter(|s| s != "Global" && s != "RandomState")
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One concrete `rordereddict_entries::Entry` / `GcEntries` / `RDict`
+/// use found in a signature, a local, or a `type T = RDict<K, V, S>`
+/// alias. `found` holds the rendered type arguments and the TypeDecl
+/// whose fields they belong to (`None` = generic template).
 struct EntryInstantiationScan<'a> {
     llbc: &'a Llbc,
-    entry_id: u64,
-    gc_entries_id: Option<u64>,
+    entry_ids: std::collections::HashSet<u64>,
+    gc_entries_ids: std::collections::HashSet<u64>,
+    rdict_ids: std::collections::HashSet<u64>,
     seen_dedup: std::collections::HashSet<u64>,
     seen_suffix: std::collections::HashSet<String>,
-    found: Vec<Vec<String>>,
+    subst: Vec<String>,
+    found: Vec<(Vec<String>, Option<u64>)>,
 }
 
 impl EntryInstantiationScan<'_> {
+    fn push_args(&mut self, args: Vec<String>, fields_from: Option<u64>) {
+        if args.is_empty() || args.iter().any(|arg| arg.is_empty() || arg.contains("??")) {
+            return;
+        }
+        let suffix = args.join(",");
+        if self.seen_suffix.insert(suffix) {
+            self.found.push((args, fields_from));
+        }
+    }
+
+    fn push_kv_from(&mut self, rendered: &[String], fields_from: Option<u64>) {
+        let kv = concrete_entry_type_args(rendered).or_else(|| {
+            if rendered.iter().any(|arg| arg.contains("??")) {
+                concrete_entry_type_args(&self.subst)
+            } else {
+                None
+            }
+        });
+        if let Some(args) = kv {
+            let fields_from =
+                fields_from.filter(|_| rendered.iter().all(|arg| !arg.contains("??")));
+            self.push_args(args, fields_from);
+        }
+    }
+
     fn consider(&mut self, root: Option<&serde_json::Value>) {
         let Some(root) = root else {
             return;
@@ -1529,26 +1598,42 @@ impl EntryInstantiationScan<'_> {
                 }
                 continue;
             }
-            if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
+            if let Some(arr) = obj
+                .get("Value")
+                .or_else(|| obj.get("HashConsedValue"))
+                .and_then(serde_json::Value::as_array)
                 && arr.len() == 2
             {
                 stack.push((&arr[1], depth + 1));
                 continue;
             }
+            if let Some(inst) = obj.get("Instantiated") {
+                if let Some(skip) = inst.get("skip_binder") {
+                    stack.push((skip, depth + 1));
+                }
+                continue;
+            }
+            if obj.get("types").is_some() && obj.get("const_generics").is_some() {
+                if let Some(types) = obj.get("types").and_then(serde_json::Value::as_array) {
+                    for ty in types {
+                        stack.push((ty, depth + 1));
+                    }
+                }
+                continue;
+            }
             if let Some(adt) = obj.get("Adt").and_then(serde_json::Value::as_object) {
-                if let Some(id) = type_decl_ref_adt_id(adt)
-                    && (id == self.entry_id || self.gc_entries_id == Some(id))
-                {
-                    let args = render_adt_type_args(adt, self.llbc, depth);
-                    if !args.is_empty()
-                        && args
-                            .iter()
-                            .all(|arg| !arg.is_empty() && !arg.contains("??"))
+                if let Some(id) = type_decl_ref_adt_id(adt) {
+                    if self.entry_ids.contains(&id) || self.gc_entries_ids.contains(&id) {
+                        let rendered = render_adt_type_args(adt, self.llbc, depth);
+                        let fields_from = self.entry_ids.contains(&id).then_some(id);
+                        self.push_kv_from(&rendered, fields_from);
+                    } else if self.rdict_ids.contains(&id) {
+                        let rendered = render_adt_type_args(adt, self.llbc, depth);
+                        self.push_kv_from(&rendered, None);
+                    } else if let Some(td) = self.llbc.type_by_id(id)
+                        && let TypeDeclKind::Alias(body) = &td.kind
                     {
-                        let suffix = args.join(",");
-                        if self.seen_suffix.insert(suffix) {
-                            self.found.push(args);
-                        }
+                        stack.push((body.get("aliased_ty").unwrap_or(body), depth + 1));
                     }
                 }
                 if let Some(types) = type_decl_ref_generics(adt, self.llbc)
@@ -1588,46 +1673,113 @@ impl EntryInstantiationScan<'_> {
     }
 }
 
-/// Publish concrete `Entry<i64, *mut PyObject>` field rows.
+/// Type arguments Charon recorded on a monomorphized TypeDecl
+/// (`item_meta.instantiation`). Empty when the decl is the generic template.
+fn type_decl_rendered_type_args(td: &TypeDecl, llbc: &Llbc) -> Vec<String> {
+    let mut adt = serde_json::Map::new();
+    adt.insert("id".to_string(), serde_json::json!(td.def_id));
+    render_adt_type_args(&adt, llbc, 0)
+}
+
+/// Publish concrete `Entry<K, V>` field rows.
 ///
 /// Charon leaves `rordereddict_entries::Entry` generic, so
 /// `derive_program_metadata` records `key` as a type variable.
-/// `_handle_dict_lookup_call` extra descrs need that concrete `i64` key
-/// (`arraydescrof(DICTENTRYARRAY)`). A fully concrete use of `Entry`, or
-/// the same arguments on `GcEntries`, supplies the rows. Only the
-/// qualified spelling is inserted. `#[repr(C)]` places `key`, `f_valid`,
-/// `value`, and `f_hash` in declaration order.
-fn register_ordereddict_i64_entry_rows(
+/// `get_ll_dict` builds one `DICTENTRYARRAY` per dict flavour; each
+/// monomorph (`i64`, `ObjectKey`, …) is its own ARRAY.OF. A fully
+/// concrete use of `Entry` or `GcEntries`, a `RDict<K, V, S>` head, or
+/// a `type T = RDict<K, V, S>` alias (`ObjectDictStorage`) supplies the
+/// rows. `#[repr(C)]` places `key`, `f_valid`, `value`, and `f_hash`
+/// in declaration order.
+fn register_ordereddict_entry_rows(
     llbc: &Llbc,
     known_struct_names: &mut std::collections::HashSet<String>,
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) {
-    let mut entry: Option<(u64, String)> = None;
-    let mut gc_entries_id = None;
-    for td in llbc.iter_type_decls() {
-        let path = td.item_meta.name_path();
-        if entry.is_none()
-            && path.ends_with("rordereddict_entries::Entry")
-            && matches!(td.kind, TypeDeclKind::Struct(_))
-        {
-            entry = Some((td.def_id, path));
-        } else if gc_entries_id.is_none() && path.ends_with("rordereddict_entries::GcEntries") {
-            gc_entries_id = Some(td.def_id);
-        }
-    }
-    let Some((entry_id, entry_path)) = entry else {
-        return;
-    };
+    let mut template: Option<(u64, String)> = None;
+    let mut entry_ids = std::collections::HashSet::new();
+    let mut gc_entries_ids = std::collections::HashSet::new();
+    let mut rdict_ids = std::collections::HashSet::new();
     let mut scan = EntryInstantiationScan {
         llbc,
-        entry_id,
-        gc_entries_id,
+        entry_ids: std::collections::HashSet::new(),
+        gc_entries_ids: std::collections::HashSet::new(),
+        rdict_ids: std::collections::HashSet::new(),
         seen_dedup: std::collections::HashSet::new(),
         seen_suffix: std::collections::HashSet::new(),
+        subst: Vec::new(),
         found: Vec::new(),
     };
+    for td in llbc.iter_type_decls() {
+        let path = td.item_meta.name_path();
+        if path.ends_with("rordereddict_entries::Entry")
+            && matches!(td.kind, TypeDeclKind::Struct(_))
+        {
+            entry_ids.insert(td.def_id);
+            let args = type_decl_rendered_type_args(td, llbc);
+            if args.is_empty() {
+                if template.is_none() {
+                    template = Some((td.def_id, path));
+                }
+            } else {
+                scan.push_kv_from(&args, Some(td.def_id));
+            }
+        } else if path.ends_with("rordereddict_entries::GcEntries") {
+            gc_entries_ids.insert(td.def_id);
+            let args = type_decl_rendered_type_args(td, llbc);
+            if !args.is_empty() {
+                scan.push_kv_from(&args, None);
+            }
+        } else if path.ends_with("rordereddict::RDict") {
+            rdict_ids.insert(td.def_id);
+        }
+    }
+    let Some((template_id, entry_path)) = template.or_else(|| {
+        entry_ids.iter().next().and_then(|id| {
+            llbc.type_by_id(*id)
+                .map(|td| (*id, td.item_meta.name_path()))
+        })
+    }) else {
+        return;
+    };
+    scan.entry_ids = entry_ids;
+    scan.gc_entries_ids = gc_entries_ids;
+    scan.rdict_ids = rdict_ids;
+    for td in llbc.iter_type_decls() {
+        match &td.kind {
+            TypeDeclKind::Alias(body) => {
+                scan.consider(Some(body.get("aliased_ty").unwrap_or(body)));
+            }
+            TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => {
+                for field in fields {
+                    scan.consider(tyref_node(&field.ty, llbc));
+                }
+            }
+            TypeDeclKind::Enum(variants) => {
+                for variant in variants {
+                    for field in &variant.fields {
+                        scan.consider(tyref_node(&field.ty, llbc));
+                    }
+                }
+            }
+            TypeDeclKind::Opaque | TypeDeclKind::Unknown => {}
+        }
+    }
     for fd in llbc.iter_local_fns() {
+        scan.subst.clear();
+        if let Some(inst) = fd.item_meta.instantiation() {
+            if let Some(generics) = instantiation_generic_args(inst, llbc) {
+                let args = rendered_generic_type_args(generics, llbc);
+                if args
+                    .iter()
+                    .all(|arg| !arg.is_empty() && !arg.contains("??"))
+                {
+                    scan.subst = args;
+                }
+            }
+            scan.consider(Some(inst));
+        }
         for ty in fd
             .signature
             .inputs
@@ -1641,16 +1793,17 @@ fn register_ordereddict_i64_entry_rows(
                 scan.consider(tyref_node(&local.ty, llbc));
             }
         }
+        scan.subst.clear();
     }
-    let Some(td) = llbc.type_by_id(entry_id) else {
-        return;
-    };
-    let TypeDeclKind::Struct(fields) = &td.kind else {
-        return;
-    };
-    for args in scan.found {
+    for (args, fields_from) in scan.found {
+        let fields_id = fields_from.unwrap_or(template_id);
+        let Some(td) = llbc.type_by_id(fields_id) else {
+            continue;
+        };
+        let TypeDeclKind::Struct(fields) = &td.kind else {
+            continue;
+        };
         let mut rows = Vec::with_capacity(fields.len());
-        let mut key_is_i64 = false;
         let mut valid = false;
         let mut value = false;
         let mut hash = false;
@@ -1669,7 +1822,6 @@ fn register_ordereddict_i64_entry_rows(
                 break;
             }
             match fname.as_str() {
-                "key" => key_is_i64 = concrete_ty == "i64",
                 "f_valid" => valid = true,
                 "value" => value = true,
                 "f_hash" => hash = true,
@@ -1677,12 +1829,19 @@ fn register_ordereddict_i64_entry_rows(
             }
             rows.push(field_row_from_decl(index, field, concrete_ty, llbc));
         }
-        if !concrete || !key_is_i64 || !valid || !value || !hash {
+        if !concrete || !valid || !value || !hash {
             continue;
         }
-        let name = format!("{entry_path}<{}>", args.join(","));
-        struct_fields.fields.entry(name.clone()).or_insert(rows);
+        let suffix = format!("<{}>", args.join(","));
+        let name = format!("{entry_path}{suffix}");
+        let identity = format!("{}{suffix}", strip_crate_prefix(&entry_path));
+        struct_fields
+            .fields
+            .entry(name.clone())
+            .or_insert_with(|| rows.clone());
+        struct_fields.fields.entry(identity.clone()).or_insert(rows);
         known_struct_names.insert(name);
+        known_struct_names.insert(identity);
     }
 }
 
@@ -1705,6 +1864,7 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
         crate::codewriter::jtransform::default_jitdriver_receiver_roots();
     build_semantic_program_from_llbc_with_static_addrs_filtered(
         llbc,
+        &[],
         static_addrs,
         &jitdriver_receiver_roots,
         None,
@@ -1907,10 +2067,11 @@ impl CrateLoweringState {
             gc_struct_ids,
             &exception_class_hints,
         );
-        // Concrete `Entry<i64, *mut PyObject>` rows. The generic decl's
-        // `key` is a type variable; extra descrs for `OS_DICT_LOOKUP`
-        // need the monomorph `get_ll_dict` would have built.
-        register_ordereddict_i64_entry_rows(
+        // Concrete `Entry<K, V>` rows. The generic decl's `key` is a
+        // type variable; each monomorph is the ARRAY.OF `get_ll_dict`
+        // would have built (`OS_DICT_LOOKUP` extra descrs, interior
+        // field descrs).
+        register_ordereddict_entry_rows(
             llbc,
             &mut known_struct_names,
             &mut struct_fields,
@@ -2004,6 +2165,15 @@ impl CrateLoweringState {
             spec: std::cell::RefCell::new(crate::front::clause_spec::SpecQueue::new()),
             skipped,
             atomic_load_decls: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Record body-carrying FunDecls from another loaded crate so an
+    /// Opaque import is a regular call
+    /// (`StructFieldRegistry::foreign_callables`).
+    pub(crate) fn note_loaded_crate_bodies(&mut self, llbc: &Llbc) {
+        for fd in llbc.iter_local_fns() {
+            note_body_crate_root_into(fd, &mut self.struct_fields);
         }
     }
 
@@ -2281,6 +2451,7 @@ impl<'l> CrateLowering<'l> {
             self.static_addrs.error_carrier,
             &self.state.gc_struct_ids,
             &self.state.raw_alloc_flavor_structs,
+            &self.state.tombstoned_leaves,
             &fn_path,
         )
     }
@@ -2503,6 +2674,7 @@ impl<'l> CrateLowering<'l> {
             self.static_addrs.error_carrier,
             &self.state.gc_struct_ids,
             &self.state.raw_alloc_flavor_structs,
+            &self.state.tombstoned_leaves,
             &policy_fn_path,
         );
         let segments = spec_segments(llbc, fd, &header.name);
@@ -2747,6 +2919,7 @@ impl CrateLoweringState {
 
 fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     llbc: &Llbc,
+    loaded_llbcs: &[&Llbc],
     static_addrs: crate::HostStaticAddrs<'_>,
     jitdriver_receiver_roots: &[String],
     module_filter: Option<&std::collections::HashSet<String>>,
@@ -2755,7 +2928,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     let skips = LoweringSkips::default();
     let gc_struct_ids = harvest_declared_gc_facts(llbc).gc_struct_ids();
-    let state = CrateLoweringState::new(
+    let mut state = CrateLoweringState::new(
         llbc,
         cross_tombstoned_leaves,
         std::collections::HashMap::new(),
@@ -2765,6 +2938,9 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         module_filter,
         function_filter,
     );
+    for loaded in loaded_llbcs {
+        state.note_loaded_crate_bodies(loaded);
+    }
     let functions = CrateLowering::new(llbc, static_addrs, jitdriver_receiver_roots, &state)
         .lower_all(module_filter, function_filter);
     let program = state.finish(functions);
@@ -2909,6 +3085,34 @@ fn note_body_crate_root_into(
     fields.note_foreign_body_callable(root, &stripped);
 }
 
+/// True when this FunDecl has an Unstructured body here, or another
+/// loaded crate recorded one on [`StructFieldRegistry::foreign_callables`].
+/// Every local crate is extracted into the merged program
+/// ([`build_semantic_program_from_llbcs`]), so a local Opaque FunDecl
+/// is an import of a graph that exists (`is_crate_alias_root`). A
+/// harvested foreign callable is the same (`foreign_callables`).
+fn fun_decl_has_body_in_loaded_crate(
+    fd: &FunDecl,
+    fields: Option<&crate::front::semantic::StructFieldRegistry>,
+) -> bool {
+    if fd.has_unstructured_body() {
+        return true;
+    }
+    let Some(NameSeg::Ident { ident: (root, _) }) = fd.item_meta.name.first() else {
+        return false;
+    };
+    if crate::local_crates::is_crate_alias_root(root) {
+        return true;
+    }
+    let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+    fields.is_some_and(|fields| {
+        fields
+            .foreign_callables
+            .iter()
+            .any(|(crate_root, path)| crate_root == root && path == &stripped)
+    })
+}
+
 fn decl_fn_path(module_path: &str, name: &str) -> String {
     if module_path.is_empty() {
         name.to_string()
@@ -2960,6 +3164,7 @@ impl SemanticFunctionHeader {
         error_carrier: crate::ErrorCarrierSpec<'_>,
         gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
         raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+        tombstoned_leaves: &std::collections::HashSet<String>,
         policy_fn_path: &str,
     ) -> Self {
         let self_ty_root = impl_method_owner_for_fundecl(llbc, fd).map(|(owner, _)| owner);
@@ -3063,6 +3268,7 @@ impl SemanticFunctionHeader {
             &signature.output,
             llbc,
             error_carrier,
+            tombstoned_leaves,
             gc_struct_ids,
             raw_alloc_flavor_structs,
         );
@@ -5919,6 +6125,10 @@ pub struct LowerContext<'a> {
     /// through `OnceLock`, so the stored tables stay `Sync`; lowering
     /// rebuilds a registry from these rows for `field_name_at`.
     struct_fields: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// Body-carrying FunDecls harvested onto
+    /// [`StructFieldRegistry::foreign_callables`]. Stored as a `Vec` so
+    /// this context stays `Sync` for `OnceLock`.
+    foreign_callables: Vec<(String, String)>,
     dont_look_inside: std::collections::HashSet<String>,
     /// Leaves [`harden_duplicate_leaf_metadata`] emptied for this LLBC.
     /// Single-function entry points paint with this set, the same one the
@@ -5960,7 +6170,7 @@ impl<'a> LowerContext<'a> {
             ));
         // Flavor is a program-wide class property; a dependency's raw classes count here too.
         raw_alloc_flavor_structs.extend(dependency_raw_alloc_flavor_structs.iter().cloned());
-        let (_, _, struct_fields, _, _, struct_field_attrs, _, _) = derive_program_metadata(
+        let (_, _, mut struct_fields, _, _, struct_field_attrs, _, _) = derive_program_metadata(
             llbc,
             &gc_struct_ids,
             &immutable_fields,
@@ -5969,9 +6179,16 @@ impl<'a> LowerContext<'a> {
                 std::slice::from_ref(llbc),
             ),
         );
+        // Same harvest `CrateLoweringState::new` runs, so a stand-alone
+        // lowering sees this artefact's bodies before
+        // `refuse_borrowed_transparent_scalar_residual`.
+        for fd in llbc.iter_local_fns() {
+            note_body_crate_root_into(fd, &mut struct_fields);
+        }
         Self {
             llbc,
             struct_field_attrs,
+            foreign_callables: struct_fields.foreign_callables,
             struct_fields: struct_fields.fields.into(),
             dont_look_inside: dont_look_inside_set_of(llbc),
             tombstoned_leaves: tombstoned_leaves_of(llbc),
@@ -5986,7 +6203,21 @@ impl<'a> LowerContext<'a> {
     /// `CallControl` so `fielddescrof` can `getattr` the names the
     /// lowering emitted (`descr.py get_field_descr`).
     pub fn struct_field_registry(&self) -> crate::front::semantic::StructFieldRegistry {
-        struct_field_registry_from_rows(&self.struct_fields)
+        struct_field_registry_from_rows(&self.struct_fields, &self.foreign_callables)
+    }
+
+    /// Record body-carrying FunDecls from another loaded crate so an
+    /// Opaque import is a regular call
+    /// (`StructFieldRegistry::foreign_callables`).
+    pub fn note_loaded_crate_bodies(&mut self, llbc: &Llbc) {
+        let mut fields = crate::front::semantic::StructFieldRegistry {
+            foreign_callables: std::mem::take(&mut self.foreign_callables),
+            ..Default::default()
+        };
+        for fd in llbc.iter_local_fns() {
+            note_body_crate_root_into(fd, &mut fields);
+        }
+        self.foreign_callables = fields.foreign_callables;
     }
 }
 
@@ -5995,9 +6226,11 @@ impl<'a> LowerContext<'a> {
 /// harvest; `__pos_N` remains the missing-row fallback.
 fn struct_field_registry_from_rows(
     rows: &std::collections::HashMap<String, Vec<(String, String)>>,
+    foreign_callables: &[(String, String)],
 ) -> crate::front::semantic::StructFieldRegistry {
     crate::front::semantic::StructFieldRegistry {
         fields: crate::front::semantic::FieldRows::from(rows.clone()),
+        foreign_callables: foreign_callables.to_vec(),
         ..Default::default()
     }
 }
@@ -6036,7 +6269,8 @@ fn lower_fun_decl_with_static_addrs_and_root_stack(
     root_stack_state: &RootStackState,
 ) -> Result<FunctionGraph, LowerError> {
     let llbc = context.llbc;
-    let struct_fields = struct_field_registry_from_rows(&context.struct_fields);
+    let struct_fields =
+        struct_field_registry_from_rows(&context.struct_fields, &context.foreign_callables);
     crate::local_crates::with_local_crate_root(llbc.crate_name(), || {
         let jitdriver_receiver_roots =
             crate::codewriter::jtransform::default_jitdriver_receiver_roots();
@@ -6266,6 +6500,7 @@ fn splice_recorded_fat_dyn_returns(
 #[path = "shadow_stack_erase.rs"]
 mod shadow_stack_erase;
 pub use shadow_stack_erase::census as shadow_stack_erase_census;
+pub use shadow_stack_erase::erase_named as shadow_stack_erase_named;
 pub use shadow_stack_erase::{
     discover_depth_neutral_fns, discover_stack_fn_effects, discover_stack_leaves_above_fns,
     discover_stack_param_slots_fns, discover_stack_returns_index_fns, discover_stack_sensitive_fns,
@@ -6574,6 +6809,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             output,
             llbc,
             static_addrs.error_carrier,
+            tombstoned_leaves,
             gc_struct_ids,
             raw_alloc_flavor_structs,
         );
@@ -6826,25 +7062,36 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         };
         if !lo.result_exc_call_results.is_empty() {
             let carrier = static_addrs.error_carrier;
-            let foreign_sites = crate::front::result_exc::foreign_from_residual_sites_in(
-                &lo.graph,
-                carrier,
-                exception_sum.as_ref(),
-            );
-            let mut conversions = Vec::with_capacity(foreign_sites.len());
-            for site in &foreign_sites {
-                conversions.push(
-                    from_impl_conversion(lo.llbc, carrier.carrier_path, &site.error_ty).map_err(
-                        |err| LowerError::Unsupported(format!("{}: {err}", lo.graph.name)),
-                    )?,
+            // `FromResidual::from_residual` of a foreign error becomes
+            // `Err(From::from(e))` raised as the carrier only when this
+            // graph *is* `Result<T, PyError>` (`result_exc_callee`).
+            // `argument.py _match_signature` raises `ArgErr` or
+            // `OperationError`; pyre returns `MatchOutcome` (not `Result`)
+            // and `parse_into_scope` catches `ArgErr`. A `from_residual` of
+            // `MatchSignatureError` is that function's own error arm, not a
+            // conversion into `PyError`.
+            if result_exc_callee {
+                let foreign_sites = crate::front::result_exc::foreign_from_residual_sites_in(
+                    &lo.graph,
+                    carrier,
+                    exception_sum.as_ref(),
                 );
+                let mut conversions = Vec::with_capacity(foreign_sites.len());
+                for site in &foreign_sites {
+                    conversions.push(
+                        from_impl_conversion(lo.llbc, carrier.carrier_path, &site.error_ty)
+                            .map_err(|err| {
+                                LowerError::Unsupported(format!("{}: {err}", lo.graph.name))
+                            })?,
+                    );
+                }
+                crate::front::result_exc::apply_foreign_from_residuals(
+                    &mut lo.graph,
+                    &foreign_sites,
+                    &conversions,
+                )
+                .map_err(LowerError::Unsupported)?;
             }
-            crate::front::result_exc::apply_foreign_from_residuals(
-                &mut lo.graph,
-                &foreign_sites,
-                &conversions,
-            )
-            .map_err(LowerError::Unsupported)?;
             // Fusion removed the map_err call; its dest may still be in
             // `result_exc_call_results`. Skip it so the missing producer
             // is not a graph-wide decline.
