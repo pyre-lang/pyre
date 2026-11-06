@@ -1770,6 +1770,16 @@ fn real_main() {
             }
         }
         let frozen_lookups: Vec<_> = leftover_set.into_iter().collect();
+        for member in &frozen_lookups {
+            if let majit_ir::effectinfo::DescrSetMember::Array { array_id: 0 } = member {
+                panic!(
+                    "EffectInfo leftover Array(0): a dest ARRAY was recorded \
+                     without array_identity_hash; prepass add_descr skips \
+                     type_id == 0, so the member would freeze as \
+                     AbsentContainer"
+                );
+            }
+        }
         let mint_count = frozen_mints.len();
         for (i, member) in frozen_lookups.iter().enumerate() {
             member_index.insert(

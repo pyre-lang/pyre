@@ -16890,7 +16890,8 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     // residualize the helper instead of recording the body.
     let walk_result = match walk_result {
         Err(DispatchError::AbortMarkerReached { pc })
-        | Err(DispatchError::GuardResumeCoordinateUnavailable { pc }) => {
+        | Err(DispatchError::GuardResumeCoordinateUnavailable { pc })
+        | Err(DispatchError::RegisterReadUnbound { pc, .. }) => {
             Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 })
         }
         other => other,

@@ -11532,9 +11532,9 @@ fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
 
 #[test]
 fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
-    // Acceptance: caller's `inline_call_r_i/dR>i`
-    // recurses into a synthetic callee whose body is `int_return
-    // r0` on the int bank. The callee's int_return surfaces as
+    // Acceptance: caller's `inline_call_r_i/dR>i` recurses into a
+    // synthetic callee that seeds i0 with `int_copy/c>i` then
+    // `int_return/i`. The callee's int_return surfaces as
     // `SubReturn { result: Some(callee.registers_i[0]) }`; the
     // caller's helper writes that OpRef into the caller's
     // `registers_i[dst]` (NOT registers_r — the kind discriminator
@@ -11542,69 +11542,19 @@ fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
     // exec-generated `_opimpl_inline_call_r_i` template paired with
     // `_opimpl_any_return` for `int_return`.
     //
-    // Callee shape constraint: the `_r` arglist promises only Ref
-    // args, but the body needs an int register populated to source
-    // the int_return. The codewriter populates that via a separate
-    // op inside the callee body (e.g. `int_copy/i>i`). For the
-    // walker test, we synthesize an `int_copy` that materializes
-    // the int constant from a tracer-side const_int OpRef stored in
-    // a high i-register, then int_returns it.
-    //
-    // Simpler: callee whose body is just `int_return i0`; we
-    // pre-populate the callee's registers_i[0] indirectly through a
-    // setter — but the walker doesn't expose that directly. So
-    // instead, we use a callee whose body emits an int constant op
-    // and returns it. The simplest working shape is `int_neg i0
-    // ->i0; int_return i0` — but registers_i[0] starts as
-    // OpRef::NONE which `int_neg` would record meaninglessly.
-    //
-    // Pragmatic alternative: the walker's test-side `setup` for
-    // sub_body lets us choose `num_regs_i = 1`. We initialize
-    // callee.registers_i[0] to a known OpRef AT SUB-WALK TIME by
-    // having the caller arglist carry the int OpRef indirectly —
-    // but the `dR` arglist only has Ref. So we *can't* pass the
-    // int OpRef through the call.
-    //
-    // RPython solution: callee bodies *always* compute their int
-    // results from concrete operations (int_const, int_add, etc.).
-    // For walker testing, the smallest standalone body is
-    // `int_const_42 i0 = 42; int_return i0` — but pyre doesn't have
-    // an `int_const/c>i` opname today (constants live in the
-    // jitcode's constants_i table). Without re-engineering the
-    // sub_body fixture, the cleanest test is to drive the callee
-    // body through `int_copy` from a callee int register that the
-    // setup_call path populated (which doesn't exist for `_r_i`
-    // variant — only Ref args flow in).
-    //
-    // Here we lean on the simpler invariant: the
-    // SubReturn{Some(value)} from the *helper itself* writes into
-    // the caller's `registers_i[dst]`. To exercise that branch
-    // without standing up a full int-producing callee, we test the
-    // helper's dst-bank dispatch logic via a callee body that
-    // returns an OpRef::NONE placeholder through `int_return r0`
-    // — wait, that's wrong: `int_return/i` reads from `registers_i`
-    // not `registers_r`.
-    //
-    // Cleanest path: callee body = `[int_return_byte, 0x00]` where
-    // callee's `registers_i[0]` is OpRef::NONE; the SubReturn
-    // value will be NONE. The test asserts that the caller's
-    // `registers_i[dst]` was written to NONE (proving the dst-bank
-    // routing is correct — wrong-bank routing would write to
-    // `registers_r[dst]` instead and leave `registers_i[dst]`
-    // unchanged at its initial OpRef::NONE).
-    //
-    // The OpRef::NONE-vs-OpRef::NONE comparison is admittedly
-    // weak; instead we initialize the caller's `registers_i[dst]`
-    // to a distinct OpRef before the call so the assertion can
-    // distinguish "no write" from "write of NONE".
+    // The `_r` arglist carries only Ref args, so the callee body
+    // materialises the int with `int_copy/c>i` rather than an
+    // inbound i-register. An unwritten i0 is `OpRef::NONE` and
+    // `read_int_reg` declines that as `RegisterReadUnbound`.
     let int_ret_byte = *insns_opname_to_byte()
         .get("int_return/i")
         .expect("`int_return/i` must be in insns table");
     let inline_ri_byte = *insns_opname_to_byte()
         .get("inline_call_r_i/dR>i")
         .expect("`inline_call_r_i/dR>i` must be in insns table");
-    // Callee body: `int_return i0` (registers_i[0] starts at NONE).
-    let callee_code: &'static [u8] = Box::leak(Box::new([int_ret_byte, 0]));
+    let mut callee_body = int_copy_const(42, 0);
+    callee_body.extend_from_slice(&[int_ret_byte, 0]);
+    let callee_code: &'static [u8] = Box::leak(callee_body.into_boxed_slice());
     let sub_body = SubJitCodeBody {
         code: callee_code,
         num_regs_r: 1, // callee accepts a Ref arg, then ignores it
@@ -11684,12 +11634,9 @@ fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
     let returned_int = wc.registers_i.get(3);
     let regs_r = wc.registers_r.to_vec();
     drop(wc);
-    // Callee's int_return[i0] surfaced SubReturn{Some(NONE)}; the
-    // helper wrote that into caller's registers_i[3]. Sentinel is
-    // gone, replaced by OpRef::NONE.
     assert_eq!(
         returned_int,
-        Some(OpRef::NONE),
+        Some(OpRef::ConstInt(42)),
         "inline_call_r_i must write SubReturn value into caller registers_i[dst]",
     );
     // Wrong-bank check: registers_r[3] must remain its original

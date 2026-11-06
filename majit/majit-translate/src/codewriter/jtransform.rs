@@ -12884,12 +12884,25 @@ impl<'a> Transformer<'a> {
                     NewlistClearShape::Fixed {
                         item_ty,
                         array_type_id,
-                    } => Some(vec![cc.arraydescrof_for_type(
-                        &item_ty,
-                        &array_type_id,
-                        value_type_to_ir_type(&item_ty),
-                        Some(0),
-                    )]),
+                    } => {
+                        // A `&[PyObjectRef]` dest without a sibling array op
+                        // still names `OBJECT_REF_GCARRAY_TYPE_ID`
+                        // (`array_identity_of_base`); keep that ARRAY even
+                        // if a producer left `array_type_id` unset, so
+                        // `arraydescrof_concrete` does not mint `cache_key` 0.
+                        let array_type_id = match (&item_ty, array_type_id) {
+                            (ValueType::Ref(_), None) => {
+                                Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string())
+                            }
+                            (_, id) => id,
+                        };
+                        Some(vec![cc.arraydescrof_for_type(
+                            &item_ty,
+                            &array_type_id,
+                            value_type_to_ir_type(&item_ty),
+                            Some(0),
+                        )])
+                    }
                     NewlistClearShape::Fallback => {
                         // A kind-collapsed GC object pointer used as a
                         // list item array is `GcArray(OBJECTPTR)`, the
