@@ -9152,7 +9152,16 @@ impl<'a> Transformer<'a> {
         // The frontend FieldRead carries `ty: Int` (`W_BytesIO.pos`) while
         // the dest cell stays Unknown; stamp it the way the vtable-slot
         // arm already stamps Int, so `getkind` is `'i'` not `'r'`.
-        self.stamp_value_kind_from_value_type(graph, op.result.clone(), ty);
+        // A dest the rtyper already typed (a raw `*const CodeObject` is
+        // Signed at `history.getkind`) keeps that cell: `ty: Ref(Some)` of
+        // a flavor-raw pointee would otherwise restamp `OBJECTPTR` and
+        // lower `bool` to `ptr_nonzero`.
+        if op.result.as_ref().is_some_and(|result| {
+            FunctionGraph::concretetype_of(result)
+                == crate::codewriter::type_state::ConcreteType::Unknown
+        }) {
+            self.stamp_value_kind_from_value_type(graph, op.result.clone(), ty);
+        }
         // A rustc vtable slot is a function address. MIR may type the
         // `method_*` FieldRead as Ref (a fn-pointer); leaving that
         // assembles `getfield_gc_r` and `optimize_getfield` then
