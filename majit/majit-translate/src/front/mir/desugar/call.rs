@@ -3925,6 +3925,31 @@ impl<'a> Lowering<'a> {
                             || (is_acquire
                                 && self.atomic_template_final_field_is_quasi_immutable(&template)))
                     {
+                        // A pinned static Atomic* is the object's address
+                        // (`rptr.py InteriorPtrRepr` parentptrtype). The
+                        // load is the inner scalar at that address
+                        // (`rtype_getattr` getinteriorfield of a
+                        // non-container FIELD_TYPE), not the static object
+                        // (`bookkeeper.py immutablevalue`).
+                        if parent.is_none()
+                            && matches!(template.kind, PlaceKind::Global { .. })
+                            && let Some((item_ty, itemsize, is_item_signed)) =
+                                self.atomic_load_word_descr(&call.dest.ty, first_arg_ty.as_ref())
+                        {
+                            let base = self.resolve_place(mir_bb, template.clone())?;
+                            let loaded = self.emit_raw_word_load(
+                                bb_id,
+                                base,
+                                item_ty,
+                                itemsize,
+                                is_item_signed,
+                            );
+                            self.local_var[dest_local] = Some(LocalValue::One(loaded));
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
+                            return Ok(());
+                        }
                         let value = self.fold_atomic_field_on_captured_parent(
                             template,
                             parent,
@@ -3967,49 +3992,15 @@ impl<'a> Lowering<'a> {
                         // `from_ptr` identity of a non-borrow leaves the
                         // field *address*; loading that word is `raw_load`.
                         if let Some((item_ty, itemsize, is_item_signed)) =
-                            self.raw_word_descr(&call.dest.ty).or_else(|| {
-                                first_arg_ty.as_ref().and_then(|ty| {
-                                    let peeled = self
-                                        .tyref_peel_ref_to_pointee(ty)
-                                        .unwrap_or_else(|| ty.clone());
-                                    let item_ty = tyref_atomic_inner_value_type(
-                                        &peeled,
-                                        self.llbc,
-                                        self.gc_struct_ids,
-                                        &self.raw_alloc_flavor_structs,
-                                    )?;
-                                    let is_item_signed = matches!(item_ty, ValueType::Int);
-                                    let itemsize = match &item_ty {
-                                        ValueType::Bool => 1,
-                                        ValueType::Int
-                                        | ValueType::Unsigned
-                                        | ValueType::Ref(_) => crate::layout::target_word_size(),
-                                        _ => return None,
-                                    };
-                                    Some((item_ty, itemsize, is_item_signed))
-                                })
-                            })
+                            self.atomic_load_word_descr(&call.dest.ty, first_arg_ty.as_ref())
                         {
-                            let offset = self
-                                .graph
-                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                                result: Some(offset.clone()),
-                                kind: OpKind::ConstInt(0),
-                            });
-                            let res = self
-                                .graph
-                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                                result: Some(res.clone()),
-                                kind: OpKind::RawLoad {
-                                    base: args[0].clone(),
-                                    offset,
-                                    item_ty,
-                                    itemsize,
-                                    is_item_signed,
-                                },
-                            });
+                            let res = self.emit_raw_word_load(
+                                bb_id,
+                                args[0].clone(),
+                                item_ty,
+                                itemsize,
+                                is_item_signed,
+                            );
                             self.local_var[dest_local] = Some(LocalValue::One(res));
                             let target_bb = self.block_id[target];
                             let link_args = self.edge_args(mir_bb, target)?;

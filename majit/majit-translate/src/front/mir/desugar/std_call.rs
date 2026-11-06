@@ -2084,6 +2084,75 @@ impl<'a> Lowering<'a> {
         json_ty_raw_store_descr(tyref_node(ty, self.llbc)?, self.llbc)
     }
 
+    /// Word descr of an `Atomic*::load` result: the destination scalar, or
+    /// the atomic wrapper's inner value when dest is not a copy scalar.
+    pub(in crate::front::mir) fn atomic_load_word_descr(
+        &self,
+        dest_ty: &TyRef,
+        recv_ty: Option<&TyRef>,
+    ) -> Option<(ValueType, usize, bool)> {
+        self.raw_word_descr(dest_ty).or_else(|| {
+            recv_ty.and_then(|ty| {
+                let peeled = self
+                    .tyref_peel_ref_to_pointee(ty)
+                    .unwrap_or_else(|| ty.clone());
+                let item_ty = tyref_atomic_inner_value_type(
+                    &peeled,
+                    self.llbc,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                )?;
+                let is_item_signed = matches!(item_ty, ValueType::Int);
+                let itemsize = match &item_ty {
+                    ValueType::Bool => 1,
+                    ValueType::Int | ValueType::Unsigned | ValueType::Ref(_) => {
+                        crate::layout::target_word_size()
+                    }
+                    _ => return None,
+                };
+                Some((item_ty, itemsize, is_item_signed))
+            })
+        })
+    }
+
+    /// `raw_load` of one word at `base+0`. Bool / int results bank as Signed
+    /// (`history.py` `getkind`).
+    pub(in crate::front::mir) fn emit_raw_word_load(
+        &mut self,
+        bb_id: crate::model::BlockId,
+        base: Variable,
+        item_ty: ValueType,
+        itemsize: usize,
+        is_item_signed: bool,
+    ) -> Variable {
+        let offset = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(offset.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        let result_ct = match item_ty {
+            ValueType::Int | ValueType::Unsigned | ValueType::Bool => {
+                crate::model::ConcreteType::Signed
+            }
+            ValueType::Float | ValueType::SingleFloat => crate::model::ConcreteType::Float,
+            _ => crate::model::ConcreteType::Unknown,
+        };
+        let loaded = self.graph.alloc_value_var_with_type(result_ct);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(loaded.clone()),
+            kind: OpKind::RawLoad {
+                base,
+                offset,
+                item_ty,
+                itemsize,
+                is_item_signed,
+            },
+        });
+        loaded
+    }
+
     pub(in crate::front::mir) fn read_mem_slot(
         &mut self,
         mir_bb: usize,
