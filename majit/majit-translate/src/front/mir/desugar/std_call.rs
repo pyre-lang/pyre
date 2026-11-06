@@ -6277,16 +6277,37 @@ impl<'a> Lowering<'a> {
     }
 
     /// `<*mut T>::add` / `::sub`, including a Charon-instantiated
-    /// `{impl#N}` spelling (`is_core_ptr_add_path`). A residual leaf
-    /// `add` on a raw pointer is not enough: `descroperation::add` of
-    /// two `PyObjectRef` (`*mut PyObject`) is Python add, and rewriting
-    /// it as `direct_ptradd` merges Int ∪ Ref at `returnvar`.
-    fn ptr_add_or_sub_call(&self, reg: &RegularCall, _first_arg_ty: Option<&TyRef>) -> bool {
+    /// `{impl#N}` spelling, a residual leaf `add` on a raw pointer, and
+    /// `CallKind::Trait` `Add::add` / `Sub::sub` of a raw pointer.
+    /// `descroperation::add` of two `PyObjectRef` (`*mut PyObject`) is
+    /// Python add: rewriting it as `direct_ptradd` merges Int ∪ Ref at
+    /// `returnvar`.
+    fn ptr_add_or_sub_call(&self, reg: &RegularCall, first_arg_ty: Option<&TyRef>) -> bool {
+        let raw_ptr =
+            first_arg_ty.is_some_and(|ty| tyref_peel_one_raw_ptr_node(ty, self.llbc).is_some());
         match &reg.kind {
-            CallKind::Fun(FunId::Regular { id }) => self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            CallKind::Fun(FunId::Regular { id }) => {
+                let Some(fd) = self.llbc.fn_by_id(*id) else {
+                    return false;
+                };
                 let path = fd.item_meta.name_path();
-                is_core_ptr_add_path(path.as_str()) || is_core_ptr_sub_path(path.as_str())
-            }),
+                if is_core_ptr_add_path(path.as_str()) || is_core_ptr_sub_path(path.as_str()) {
+                    return true;
+                }
+                if path.split("::").any(|s| s == "descroperation") {
+                    return false;
+                }
+                raw_ptr
+                    && path
+                        .rsplit("::")
+                        .next()
+                        .is_some_and(|leaf| leaf == "add" || leaf == "sub")
+            }
+            CallKind::Trait(v) => {
+                raw_ptr
+                    && trait_payload_path_and_method(v, self.llbc)
+                        .is_some_and(|(_, method)| method == "add" || method == "sub")
+            }
             _ => false,
         }
     }

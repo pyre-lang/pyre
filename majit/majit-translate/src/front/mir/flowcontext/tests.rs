@@ -6510,11 +6510,11 @@ fn binary_value_from_tag_inner_add_is_not_direct_ptradd() {
 }
 
 /// `LiveIter::entry_at` is `entries_item_ptr(*self.entries).add(i)` then
-/// `e.f_valid`. The add is `lltype.direct_ptradd`, not residual host `add`.
-/// Generic `Entry<K,V>` has no resolved Charon size; the item is that
-/// struct so `rewrite_op_direct_ptradd` can scale from `sizeof(TO.OF)`.
+/// `e.f_valid`. The `.add` is consumed by one deref, so it lowers as
+/// getarrayitem (`ll_getitem_fast` / `ll_getitem_nonneg`), not residual
+/// host `add`.
 #[test]
-fn liveiter_entry_at_lowers_ptr_add_as_direct_ptradd() {
+fn liveiter_entry_at_lowers_ptr_add_as_getarrayitem() {
     let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
     if !std::path::Path::new(path).is_file() {
         eprintln!("skipping: {path} is missing; run `python3 scripts/extract-llbc.py`");
@@ -6537,9 +6537,18 @@ fn liveiter_entry_at_lowers_ptr_add_as_direct_ptradd() {
         let path = fd.item_meta.name_path();
         let graph =
             super::lower_fun_decl(&context, fd).unwrap_or_else(|err| panic!("lower {path}: {err}"));
+        let has_entry_array_read = graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| match &op.kind {
+                OpKind::ArrayRead {
+                    array_type_id: Some(id),
+                    ..
+                } => id.contains("Entry"),
+                _ => false,
+            })
+        });
         assert!(
-            calls_leaf(&graph, "direct_ptradd"),
-            "LiveIter::entry_at {path} must emit direct_ptradd, ops={:?}",
+            has_entry_array_read,
+            "LiveIter::entry_at {path} must emit getarrayitem of Entry, ops={:?}",
             graph_call_leaves(&graph)
         );
         assert!(

@@ -26253,10 +26253,12 @@ fn rutf8_codepoint_at_pos_lowers_byte_reads_to_ord() {
     );
 }
 
-/// `PyError(ptr)` is one pointer operand. The ctor store narrows it
-/// once, to the carrier's inner class (`PyErrorObject`), in
-/// `ctor_ccharp_field_store` (`rtyper.py` `LowLevelOpList.convertvar`
-/// converts once).
+/// `PyError(ptr)` is one pointer word. Value typing keeps the handle
+/// class (`tyref_transparent_inner_value_type` is None for a transparent
+/// GC handle), so construction recasts through `retag_error_carrier`
+/// onto that class. Field stores of `.0` still convertvar to the inner
+/// object (`recast_error_carrier_field_store` / `rclass.py`
+/// `InstanceRepr.rtype_setattr`).
 #[test]
 fn pyerror_ptr_ctor_emits_one_cast_instance() {
     let py_ptr = interior_raw_mut(interior_adt(0));
@@ -26345,8 +26347,8 @@ fn pyerror_ptr_ctor_emits_one_cast_instance() {
         .collect();
     assert_eq!(
         roots,
-        ["PyErrorObject"],
-        "PyError(ptr) emits one __cast_instance_intrinsic to the inner class; graph={}",
+        ["error::PyError"],
+        "PyError(ptr) emits one __cast_instance_intrinsic to the handle class; graph={}",
         graph.dump()
     );
 }
