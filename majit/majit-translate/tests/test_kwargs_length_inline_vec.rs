@@ -275,9 +275,9 @@ fn gc_alloc_young_storage_box_gets_one_residual_per_storage_shape() {
 }
 
 /// `specialize.py` `specialize_argtype`: each `__inst_` copy of
-/// `gc_alloc_young_storage_box` (`dont_look_inside`, `*mut T`) carries
-/// the residual token of the substituted output. The generic template
-/// stays `None`.
+/// `gc_alloc_young_storage_box` (`dont_look_inside`, `llmemory.GCREF`)
+/// is a distinct residual. The return stays `SomePtr`; the generic
+/// template stays `None`.
 #[test]
 fn gc_alloc_young_storage_box_inst_gets_substituted_return_token() {
     let Some(llbc) = object_llbc() else {
@@ -319,16 +319,16 @@ fn gc_alloc_young_storage_box_inst_gets_substituted_return_token() {
     ));
     assert_eq!(
         inst_rdict.return_type.as_deref(),
-        Some("ref"),
-        "substituted *mut RDict is ref; names={names:?}"
+        Some("gcref"),
+        "substituted GCREF residual; names={names:?}"
     );
     let root = inst_rdict
         .return_class_root
         .as_deref()
         .or(inst_rdict.graph().return_class_root.as_deref());
     assert!(
-        root.is_some_and(|root| root.contains("RDict")),
-        "RDict class root, got {root:?}; names={names:?}"
+        root.is_none(),
+        "llmemory.GCREF has no class root, got {root:?}; names={names:?}"
     );
 }
 

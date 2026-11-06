@@ -9334,7 +9334,9 @@ impl<'a> Lowering<'a> {
     /// `annlowlevel.specialize` still names the call `leaf__inst_*`,
     /// and `materialize_residual_inst` keeps the template stub. A
     /// GraphStore header stamped `ref` with a Void call result fails
-    /// `getcalldescr` (`FUNC.RESULT != RESULT`).
+    /// `getcalldescr` (`FUNC.RESULT != RESULT`). `llmemory.GCREF` is a
+    /// distinct residual (`SomePtr`); `specialize_argtype` still mints
+    /// one copy per `T`.
     fn enqueue_residual_inst(&self, fd: &FunDecl, generics: &serde_json::Value, leaf: String) {
         let Some(spec) = self.spec else {
             return;
@@ -9376,7 +9378,9 @@ impl<'a> Lowering<'a> {
         );
         if class_root.is_none()
             && container_root.is_none()
-            && !token.as_deref().is_some_and(|t| t.starts_with("raw:"))
+            && !token.as_deref().is_some_and(|t| {
+                t.starts_with("raw:") || t == crate::translator::rtyper::cutover::GCREF_RETURN_TYPE
+            })
         {
             return;
         }
