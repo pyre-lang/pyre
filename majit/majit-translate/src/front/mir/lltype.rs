@@ -4983,6 +4983,21 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     {
         return Some(root);
     }
+    // A transparent scalar result is the inner word (`u64` token).
+    // Overlaying the wrapper class_root made residual `FrameAnchor::new`
+    // a `ref` instance / SomePtr that `live` could not merge with its
+    // Unsigned Input.
+    if tyref_transparent_inner_value_type(
+        ty,
+        llbc,
+        no_tombstoned_leaves(),
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    )
+    .is_some()
+    {
+        return None;
+    }
     if let Some(root) = registered_gc_ptr_class_root_with(
         ty,
         llbc,
@@ -8218,7 +8233,13 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
     // false`. RPython stores those flags as `r_uint`
     // (`IntegerRepr.rtype_or_`); reading a copied field would retype
     // the word, so the kind stays the scalar table for every spelling.
-    if let Some(kind) = llbc.transparent_scalar_kind(&decl.item_meta.name_path()) {
+    let path = decl.item_meta.name_path();
+    let stripped = strip_crate_prefix(&path);
+    if let Some(kind) = llbc.transparent_scalar_kind(&path).or_else(|| {
+        (stripped != path && stripped.contains("::"))
+            .then(|| llbc.transparent_scalar_kind(&stripped))
+            .flatten()
+    }) {
         return Some(transparent_scalar_value_type(kind));
     }
     match &decl.kind {
@@ -9390,12 +9411,11 @@ pub(in crate::front::mir) fn stamp_raw_c_void_ptr(var: &Variable, ty: &TyRef, ll
 }
 
 /// Stamp a function-pointer dest `Ptr(FuncType)` (`lltype.FuncType` /
-/// `getfunctionptr`). The walker rebuilds `SomePtr` from this
-/// `concretetype` (`var_concretetype_is_ccharp` parallel). Prefer the
-/// Charon `FnPtr` skip_binder lowered through `tyref_to_value_type` /
-/// `valuetype_to_lltype`; fall back to the rendered spelling so
-/// `Result<(), E>` is `Void` and equals `fn_null_constant` of the same
-/// spelling (`ann_nullptr`).
+/// `getfunctionptr` / `FunctionsPBCRepr.lowleveltype` for one row).
+/// Prefer the Charon `FnPtr` skip_binder lowered through
+/// `tyref_to_value_type` / `valuetype_to_lltype`; fall back to the
+/// rendered spelling so `Result<(), E>` is `Void`. The annotation of a
+/// spelled `null_fn` is `s_None`; this stamp is the lltype only.
 pub(in crate::front::mir) fn stamp_fn_ptr(
     var: &Variable,
     ty: &TyRef,
@@ -9539,12 +9559,12 @@ fn fn_ptr_tyref_to_lltype(
     }
     // Bare `GCREFOpaque` is `GCREF`'s TO (`llmemory.py` `GCREF =
     // Ptr(GCREFOpaque)`). `tyref_is_gcref_spelling` needs the pointer
-    // form; a skip_binder result spelled as the opaque ADT is still
-    // `GCREF`, not a class instance (`SomePtr.call` result).
+    // form; a skip_binder result spelled as the opaque ADT or as
+    // `majit_ir::GcRef` is still `GCREF`, not a class instance
+    // (`SomePtr.call` result).
     if let Some(node) = tyref_node(ty, llbc).and_then(|n| type_node_peel_aliases(n, llbc))
         && one_level_pointer_pointee(node, llbc).is_none()
-        && let Some(td) = adt_node_def_id(node).and_then(|id| llbc.type_by_id(id))
-        && crate::annotator::bookkeeper::is_gcref_type_spelling(&td.item_meta.name_path())
+        && fn_ptr_pointee_is_gcref(node, llbc)
     {
         return GCREF.clone();
     }
@@ -9557,6 +9577,15 @@ fn fn_ptr_tyref_to_lltype(
         && let Some(pointee) = one_level_pointer_pointee(node, llbc)
     {
         let pointee = type_node_peel_aliases(pointee, llbc).unwrap_or(pointee);
+        // `*mut GCREF` is a root slot (`tyref_is_gcref_spelling` of the
+        // pointer is false: two levels onto GCREFOpaque). The call site
+        // annotates that slot as GCREF (`is_gcref_type_spelling` peels
+        // prefixes). `valuetype_to_lltype(Ref)` would paint OBJECTPTR
+        // and `SomePtr.call` would reject the GCREF argument.
+        // `*mut GcRef` is the same word (`majit_ir::GcRef`).
+        if fn_ptr_pointee_is_gcref(pointee, llbc) {
+            return GCREF.clone();
+        }
         if let Some(root) = adt_node_class_root_with(pointee, llbc, no_tombstoned_leaves()) {
             if !crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
                 return OBJECTPTR.clone();
@@ -9576,6 +9605,22 @@ fn fn_ptr_tyref_to_lltype(
         }
     }
     valuetype_to_lltype(&tyref_to_value_type(ty, llbc)).unwrap_or_else(|| OBJECTPTR.clone())
+}
+
+/// Pointee of a one-level pointer that is the GCREF word: `*mut GCREFOpaque`,
+/// the `GCREF` alias (`Ptr(GCREFOpaque)`), or `majit_ir::GcRef`.
+fn fn_ptr_pointee_is_gcref(pointee: &serde_json::Value, llbc: &Llbc) -> bool {
+    if tyref_is_gcref_spelling(&TyRef::Other(pointee.clone()), llbc) {
+        return true;
+    }
+    let Some(td) = adt_node_def_id(pointee).and_then(|id| llbc.type_by_id(id)) else {
+        return false;
+    };
+    let path = td.item_meta.name_path();
+    if crate::annotator::bookkeeper::is_gcref_type_spelling(&path) {
+        return true;
+    }
+    majit_ir::descr::class_root_leaf(&path) == "GcRef"
 }
 
 /// Clone a Charon `Ref` / `RawPtr` node with `pointee` in the inner slot.
@@ -11422,6 +11467,74 @@ pub(in crate::front::mir) fn json_ty_scalar_element_spelling(
         "F64" => Some("f64".to_string()),
         _ => None,
     }
+}
+
+fn adt_leaf_is_interior_mutable(path: &str) -> bool {
+    let leaf = path.rsplit("::").next().unwrap_or(path);
+    leaf == "UnsafeCell" || leaf == "Cell" || leaf.starts_with("Atomic")
+}
+
+/// A Copy leaf of a packed C-repr struct: a scalar, a fieldless enum,
+/// a ZST, or a nested struct of those. `UnsafeCell` / `Cell` / `Atomic*`
+/// stay out — `<[AtomicU64]>::get` must not rewrite; the consumer
+/// mutates the live slot.
+fn packed_copy_leaf_ty(ty: &TyRef, llbc: &Llbc, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    if tyref_is_zero_sized(ty, llbc) {
+        return true;
+    }
+    if tyref_node(ty, llbc).is_some_and(|node| json_ty_is_copy_scalar(node, llbc)) {
+        return true;
+    }
+    if tyref_is_fieldless_enum_free(ty, llbc) {
+        return true;
+    }
+    if adt_path_of_tyref(ty, llbc).is_some_and(|p| adt_leaf_is_interior_mutable(&p)) {
+        return false;
+    }
+    let Some(td) = tyref_adt_def_id_of(ty, llbc).and_then(|id| llbc.type_by_id(id)) else {
+        return false;
+    };
+    packed_copy_struct_fields_are_leaves(td, llbc, depth)
+}
+
+fn packed_copy_struct_fields_are_leaves(td: &TypeDecl, llbc: &Llbc, depth: usize) -> bool {
+    if adt_leaf_is_interior_mutable(&td.item_meta.name_path()) {
+        return false;
+    }
+    let Some(fields) = type_decl_struct_fields(td, llbc) else {
+        return false;
+    };
+    !fields.is_empty()
+        && fields
+            .iter()
+            .all(|f| packed_copy_leaf_ty(&f.ty, llbc, depth + 1))
+}
+
+/// Byte size of a packed Copy C-repr struct whose fields are scalars,
+/// fieldless enums, or nested structs of those.
+///
+/// `<[T]>::get` of such a `T` returns `Option<&T>`: the Some payload is
+/// the element ADDRESS (itemsize this size), None is null. An
+/// `ArrayRead` of `T` would copy the struct into the value bank and mix
+/// it with the pointer-niche null. `None` for interior-mutable wrappers,
+/// enums, GC-sized aggregates, and any other layout.
+pub(in crate::front::mir) fn json_ty_packed_copy_struct_byte_size(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<usize> {
+    let node = strip_ty_indirections(node, llbc)?;
+    let td = llbc.type_by_id(adt_node_def_id(node)?)?;
+    if adt_leaf_is_interior_mutable(&td.item_meta.name_path()) {
+        return None;
+    }
+    if !packed_copy_struct_fields_are_leaves(td, llbc, 0) {
+        return None;
+    }
+    let size = json_ty_byte_size(node, llbc)? as usize;
+    matches!(size, 1 | 2 | 4 | 8).then_some(size)
 }
 
 /// `true` when an array element of this type is a pointer that occupies one
@@ -13324,9 +13437,9 @@ pub(crate) fn charon_type_value_to_ast_string(
     }
     let Some(obj) = v.as_object() else {
         // Charon hash-cons `{"Value":[id,"Never"]}`: the payload is a
-        // type-name string (`Never` / `Infallible`), not a nested
-        // object. `??scalar` is not an instantiation
-        // (`type_arg_is_concrete`); `Never` is (`is_uninhabited_ok`).
+        // type-name string (`Never` / `Infallible`). A Try residual
+        // dest_ty spells that same uninhabited ok as a non-object
+        // payload; `??scalar` is that atom (`is_uninhabited_ok`).
         if let Some(s) = v.as_str() {
             return s.to_string();
         }
@@ -14928,7 +15041,8 @@ pub(in crate::front::mir) fn adt_type_args_are_concrete(
 
 /// Prefer a destination TypeDeclRef whose arguments are fully
 /// substituted (`Result<(), E>` is concrete even though `()` does not
-/// split), then a concrete head, then the head. A still-open `TypeVar`
+/// split; residual `Result<??scalar, E>` is that uninhabited ok),
+/// then a concrete head, then the head. A still-open `TypeVar`
 /// is not concrete (`RangeInclusive::new` Aggregate generics).
 /// `Bookkeeper.getuniqueclassdef`.
 pub(in crate::front::mir) fn concrete_instantiation_adt<'a>(

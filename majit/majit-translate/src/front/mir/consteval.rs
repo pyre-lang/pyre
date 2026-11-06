@@ -976,13 +976,37 @@ pub(crate) fn discover_transparent_scalar_kinds(
             ValueType::Float => majit_charon_reader::TransparentScalarKind::Float,
             _ => continue,
         };
-        discovered.push((decl.item_meta.name_path(), kind));
+        discovered.extend(
+            transparent_scalar_name_keys(&decl.item_meta.name_path())
+                .into_iter()
+                .map(|key| (key, kind)),
+        );
     }
     // The defining crate is outside the extraction set, so the `u32` field
     // is known from `bitflags!` — the same knowledge [`code_flags_const`]'s
     // bit table already encodes. Keyed by the same crate, module, and type.
-    discovered.extend(external_transparent_scalar_kinds());
+    for (path, kind) in external_transparent_scalar_kinds() {
+        discovered.extend(
+            transparent_scalar_name_keys(&path)
+                .into_iter()
+                .map(|key| (key, kind)),
+        );
+    }
     discovered
+}
+
+/// Full path and, when it still names a module, the crate-stripped path.
+/// Interned class_roots use the stripped spelling (`eval::FrameAnchor`);
+/// `Llbc::transparent_scalar_kind` is an exact key match. A two-segment
+/// path strips to the leaf (`bitflags::InternalBitFlags`); those leaves
+/// collide across crates, so they stay off the register.
+fn transparent_scalar_name_keys(path: &str) -> Vec<String> {
+    let stripped = strip_crate_prefix(path);
+    if stripped != path && stripped.contains("::") {
+        vec![path.to_string(), stripped]
+    } else {
+        vec![path.to_string()]
+    }
 }
 
 /// Transparent scalars whose defining crate is not in the extraction set.
@@ -1320,6 +1344,34 @@ pub(in crate::front::mir) fn code_flags_const(segments: &[String]) -> Option<OpK
         _ => return None,
     };
     Some(OpKind::ConstUInt(u64::from(bits)))
+}
+
+/// `pub const CO_FAST_CELL: u8 = CoFastFlags::from_element(CoFastFlag::Cell).bits()`
+/// lives in `rustpython_compiler_core`, outside the extraction set. Charon
+/// records the initializer as Opaque, so the global read is a 0-arg
+/// FunctionPath that later fails `not registered in CallRegistry`.
+/// `from_element` shifts 1 by the flag discriminant (`CoFastFlag::Cell = 6`
+/// → `0x40`). Emit the same `ConstUInt` an in-LLBC harvest would.
+pub(in crate::front::mir) fn co_fast_flags_const(segments: &[String]) -> Option<OpKind> {
+    match segments {
+        [first, second, leaf]
+            if first.as_str() == "rustpython_compiler_core" && second.as_str() == "bytecode" =>
+        {
+            let bits: u8 = match leaf.as_str() {
+                "CO_FAST_ARG_POS" => 0x02,
+                "CO_FAST_ARG_KW" => 0x04,
+                "CO_FAST_ARG_VAR" => 0x08,
+                "CO_FAST_ARG" => 0x0E,
+                "CO_FAST_HIDDEN" => 0x10,
+                "CO_FAST_LOCAL" => 0x20,
+                "CO_FAST_CELL" => 0x40,
+                "CO_FAST_FREE" => 0x80,
+                _ => return None,
+            };
+            Some(OpKind::ConstUInt(u64::from(bits)))
+        }
+        _ => None,
+    }
 }
 
 pub(in crate::front::mir) fn place_kind_label(k: &PlaceKind) -> &'static str {

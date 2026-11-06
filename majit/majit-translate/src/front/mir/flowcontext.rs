@@ -354,13 +354,13 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// `local_var` by local and only falls back to the recorded
     /// Variable for a base/index without a backing local (a constant).
     pub(in crate::front::mir) index_elem_alias: std::collections::HashMap<usize, IndexElemAlias>,
-    /// MIR locals bound by `ptr::add` whose result is used only as
-    /// `(*dest).field` on a struct pointee. The use emits
-    /// `InteriorFieldRead` / `InteriorFieldWrite` off the recovered GcArray
-    /// header (`getinteriorfield`), not off the item pointer. Same
-    /// block-split re-resolve as [`Lowering::index_elem_alias`]: the header
-    /// and index are kept as the resolving-block Variable plus the source
-    /// MIR local.
+    /// MIR locals bound by `ptr::add` or `Vec::index_mut` whose result is
+    /// used only as `(*dest).field` / `(*dest).field[i]` on a struct
+    /// pointee. The use emits `InteriorFieldRead` / `InteriorFieldWrite`
+    /// off the recovered GcArray / list header (`getinteriorfield`), not
+    /// off the item pointer. Same block-split re-resolve as
+    /// [`Lowering::index_elem_alias`]: the header and index are kept as
+    /// the resolving-block Variable plus the source MIR local.
     pub(in crate::front::mir) interior_field_alias:
         std::collections::HashMap<usize, InteriorFieldAlias>,
     /// Option dest of a fused Copy-struct `<[T]>::get`, bound to `i < len`.
@@ -712,6 +712,11 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// Arrays that received a [`Self::pointer_word_vars`] store. A later
     /// `getitem` is that same word, not the wrapper's inner integer.
     pub(in crate::front::mir) pointer_word_arrays: std::collections::HashSet<Variable>,
+    /// Destinations of a rewritten `RefCell::borrow` / `borrow_mut` /
+    /// `get_mut` (`FieldRead value`). A following `Ref::deref` of that
+    /// dest is `same_as`: the register already holds the payload, not a
+    /// `Ref` guard.
+    pub(in crate::front::mir) refcell_payload_vars: Vec<Variable>,
 }
 
 /// `PyGraph.__init__` (`flowspace/pygraph.py`): the startblock of a
@@ -914,9 +919,9 @@ pub(in crate::front::mir) fn pygraph_initial_block(
                 // A function pointer is `Int`-colored (`history.getkind` of
                 // `Ptr(FuncType)`); carry the `fn(inputs) -> output` /
                 // `Option<fn(inputs) -> output>` spelling so
-                // `derive_subject_inputcells` seeds `SomePtr(FuncType)`
-                // (`fn_ptr_somevalue_for_spelling`) instead of
-                // `valuetype_to_someshell`'s `SomeInteger`.
+                // `derive_subject_inputcells` seeds `Impossible`
+                // (`fn_ptr_somevalue_for_spelling` is the recogniser)
+                // instead of `valuetype_to_someshell`'s `SomeInteger`.
                 // A `Vec` of one-word items is `Int`-colored (its header
                 // address); carry its spelling so
                 // `derive_subject_inputcells` seeds the `SomeRustVec`.
@@ -1665,9 +1670,9 @@ impl<'a> Lowering<'a> {
                     // A function pointer is `Int`-colored (`history.getkind` of
                     // `Ptr(FuncType)`); carry the `fn(inputs) -> output` /
                     // `Option<fn(inputs) -> output>` spelling so
-                    // `derive_subject_inputcells` seeds `SomePtr(FuncType)`
-                    // (`fn_ptr_somevalue_for_spelling`) instead of
-                    // `valuetype_to_someshell`'s `SomeInteger`.
+                    // `derive_subject_inputcells` seeds `Impossible`
+                    // (`fn_ptr_somevalue_for_spelling` is the recogniser)
+                    // instead of `valuetype_to_someshell`'s `SomeInteger`.
                     // A `Vec` of one-word items is `Int`-colored (its header
                     // address); carry its spelling so
                     // `derive_subject_inputcells` seeds the `SomeRustVec`.
@@ -1818,7 +1823,8 @@ impl<'a> Lowering<'a> {
         n_slots += function_scope_plan.len();
         local_var.resize(n_slots, None);
         let mut extra_live = compute_index_write_extra_live(body, llbc, gc_struct_ids);
-        let interior_live = compute_interior_field_extra_live(body, llbc, tombstoned_leaves);
+        let interior_live =
+            compute_interior_field_extra_live(body, llbc, gc_struct_ids, tombstoned_leaves);
         if extra_live.len() < interior_live.len() {
             extra_live.resize(interior_live.len(), Vec::new());
         }
@@ -2218,6 +2224,7 @@ impl<'a> Lowering<'a> {
             raw_address_uint_src: std::collections::HashMap::new(),
             pointer_word_vars: std::collections::HashSet::new(),
             guard_word_vars: std::collections::HashSet::new(),
+            refcell_payload_vars: Vec::new(),
             pointer_word_arrays: std::collections::HashSet::new(),
             root_scope_moved_locals,
             root_bracket,

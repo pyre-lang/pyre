@@ -862,6 +862,8 @@ impl<'a> Lowering<'a> {
             niche,
             niche_null_cast: self.option_niche_null_cast(dest_ty),
             payload_narrow_root,
+            payload_is_element_addr: false,
+            element_byte_size: 0,
         })
     }
 

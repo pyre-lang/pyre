@@ -5,11 +5,11 @@ use super::{
     is_oparg_newtype_spelling, is_os_path_family_root, is_raw_ptr_to_str_family_spelling,
     is_rstr_str_layout_declaration, is_rustc_pointer_niche_spelling, is_str_family_class_root,
     json_ty_is_by_value_copy_aggregate, json_ty_is_thin_pointer_element,
-    json_ty_scalar_element_spelling, no_immutable_fields, no_tombstoned_leaves,
-    payload_tuple_suffix, raw_field_address_value_type, raw_ptr_pointee_is_non_adt_spelling,
-    shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
-    tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root, tyref_is_closure_env,
-    tyref_is_cow_str, tyref_is_gcref_spelling, tyref_is_niche_option,
+    json_ty_packed_copy_struct_byte_size, json_ty_scalar_element_spelling, no_immutable_fields,
+    no_tombstoned_leaves, payload_tuple_suffix, raw_field_address_value_type,
+    raw_ptr_pointee_is_non_adt_spelling, shaped_array_parts, type_decl_is_closure_env,
+    tyref_array_suffix, tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root,
+    tyref_is_closure_env, tyref_is_cow_str, tyref_is_gcref_spelling, tyref_is_niche_option,
     tyref_is_option_of_string_value, tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr,
     tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_is_string_family, tyref_is_void_zst,
     tyref_niche_option_gc_payload_spelling, tyref_positional_aggregate_root,
@@ -1637,7 +1637,7 @@ fn fn_ptr_value_type_is_int_and_input_class_root_is_fn() {
 
 #[test]
 fn stamp_fn_ptr_spelling_equals_fn_null_constant() {
-    use crate::annotator::bookkeeper::Bookkeeper;
+    use crate::annotator::bookkeeper::{Bookkeeper, fn_ptr_somevalue_for_spelling_in};
     use crate::annotator::builtin::fn_null_constant;
     use crate::annotator::model::SomeValue;
     use crate::flowspace::model::{ConstValue, Constant, Variable};
@@ -1649,12 +1649,17 @@ fn stamp_fn_ptr_spelling_equals_fn_null_constant() {
     let var = Variable::named("fnptr");
     super::stamp_fn_ptr_spelling(&var, spelling, crate::ErrorCarrierSpec::default());
     let bk = Rc::new(Bookkeeper::new());
+    let s_ll = fn_ptr_somevalue_for_spelling_in(spelling, Some(bk.as_ref())).expect("fn spelling");
+    let SomeValue::Ptr(p_ll) = &s_ll else {
+        panic!("fn_ptr_somevalue_for_spelling_in is the lltype helper, got {s_ll:?}");
+    };
     let mut s_ty = crate::annotator::model::s_str0();
     s_ty.set_const_box(Constant::new(ConstValue::byte_str(spelling)));
     let s_null = fn_null_constant(&bk, &[Some(s_ty)], &HashMap::new()).expect("typed null_fn");
-    let SomeValue::Ptr(p_null) = &s_null else {
-        panic!("fn_null_constant must be SomePtr, got {s_null:?}");
-    };
+    assert!(
+        matches!(s_null, SomeValue::None_(_)),
+        "spelled null_fn annotates as s_None, got {s_null:?}"
+    );
     let ct = var.concretetype().expect("dest stamped");
     let LowLevelType::Ptr(ptr_ty) = ct else {
         panic!("stamp must be Ptr, got {ct:?}");
@@ -1664,8 +1669,14 @@ fn stamp_fn_ptr_spelling_equals_fn_null_constant() {
         "stamp is Ptr(FuncType)"
     );
     assert_eq!(
-        *ptr_ty, p_null.ll_ptrtype,
-        "stamp_fn_ptr equals fn_null_constant of the same spelling (`ann_nullptr`)"
+        *ptr_ty, p_ll.ll_ptrtype,
+        "stamp_fn_ptr equals func_type_from_fn_spelling of the same spelling"
+    );
+
+    let s_untyped = fn_null_constant(&bk, &[], &HashMap::new()).expect("untyped null_fn");
+    assert!(
+        matches!(s_untyped, SomeValue::Ptr(_)),
+        "untyped ptr::null_fn stays SomePtr, got {s_untyped:?}"
     );
 }
 
@@ -1695,8 +1706,15 @@ fn stamp_fn_ptr_spelling_carrier_result_is_void() {
     let mut s_ty = crate::annotator::model::s_str0();
     s_ty.set_const_box(Constant::new(ConstValue::byte_str(spelling)));
     let s_null = fn_null_constant(&bk, &[Some(s_ty)], &HashMap::new()).expect("typed null_fn");
-    let SomeValue::Ptr(p_null) = &s_null else {
-        panic!("fn_null_constant must be SomePtr, got {s_null:?}");
+    assert!(
+        matches!(s_null, SomeValue::None_(_)),
+        "spelled null_fn annotates as s_None, got {s_null:?}"
+    );
+    let s_ll =
+        crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling_in(spelling, Some(bk.as_ref()))
+            .expect("fn spelling");
+    let SomeValue::Ptr(p_ll) = &s_ll else {
+        panic!("lltype helper is SomePtr, got {s_ll:?}");
     };
     let ct = var.concretetype().expect("dest stamped");
     let LowLevelType::Ptr(ptr_ty) = ct else {
@@ -1711,8 +1729,8 @@ fn stamp_fn_ptr_spelling_carrier_result_is_void() {
         "carrier Result<(), E> is Void (`fn_ptr_result_lltype`)"
     );
     assert_eq!(
-        *ptr_ty, p_null.ll_ptrtype,
-        "stamp_fn_ptr with the carrier equals fn_null_constant"
+        *ptr_ty, p_ll.ll_ptrtype,
+        "stamp_fn_ptr with the carrier equals func_type_from_fn_spelling"
     );
 }
 
@@ -1748,8 +1766,17 @@ fn stamp_fn_ptr_spelling_equals_fn_null_constant_for_carrier_results() {
         s_ty.set_const_box(Constant::new(ConstValue::byte_str(spelling)));
         let s_null = fn_null_constant(&bk, &[Some(s_ty)], &HashMap::new())
             .unwrap_or_else(|e| panic!("{spelling}: typed null_fn: {e}"));
-        let SomeValue::Ptr(p_null) = &s_null else {
-            panic!("{spelling}: fn_null_constant must be SomePtr, got {s_null:?}");
+        assert!(
+            matches!(s_null, SomeValue::None_(_)),
+            "{spelling}: spelled null_fn is s_None, got {s_null:?}"
+        );
+        let s_ll = crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling_in(
+            spelling,
+            Some(bk.as_ref()),
+        )
+        .unwrap_or_else(|| panic!("{spelling}: fn spelling"));
+        let SomeValue::Ptr(p_ll) = &s_ll else {
+            panic!("{spelling}: lltype helper is SomePtr, got {s_ll:?}");
         };
         let ct = var
             .concretetype()
@@ -1762,8 +1789,8 @@ fn stamp_fn_ptr_spelling_equals_fn_null_constant_for_carrier_results() {
             "{spelling}: stamp is Ptr(FuncType)"
         );
         assert_eq!(
-            *ptr_ty, p_null.ll_ptrtype,
-            "{spelling}: stamp_fn_ptr equals fn_null_constant of the same spec"
+            *ptr_ty, p_ll.ll_ptrtype,
+            "{spelling}: stamp_fn_ptr equals func_type_from_fn_spelling of the same spec"
         );
     }
 }
@@ -2095,6 +2122,10 @@ fn fn_ptr_ty_keeps_gcref_result() {
     assert_eq!(ft.args[0], LowLevelType::Unsigned);
     assert_eq!(ft.args[1], LowLevelType::Unsigned);
     assert_eq!(
+        ft.args[2], *GCREF,
+        "*mut GCREF FUNC arg is the GCREF root slot, not OBJECTPTR"
+    );
+    assert_eq!(
         ft.args[3],
         LowLevelType::Signed,
         "*mut bool FUNC arg is the slot address, not OBJECTPTR"
@@ -2119,6 +2150,58 @@ fn fn_ptr_ty_keeps_gcref_result() {
     assert_eq!(
         ft_opaque.result, *GCREF,
         "bare GCREFOpaque FUNC.RESULT is GCREF"
+    );
+
+    // `AllocNurseryCollectingTypedRootedFn`: `*mut GcRef` / `GcRef`
+    // (`majit_ir::GcRef`) is the same GCREF word.
+    let gcref_word = serde_json::json!({
+        "Adt": {"id": 4, "generics": empty_generics()}
+    });
+    let llbc_gcref = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(0, &["majit_gc", "header", "GCREFOpaque"], vec![]),
+            type_decl_struct(1, &["fixture", "PyObject"], vec![]),
+            type_decl_struct(2, &["alloc", "vec", "Vec"], vec![]),
+            type_decl_alias(
+                3,
+                &["majit_gc", "header", "GCREF"],
+                serde_json::json!({"RawPtr": [gcrefopaque_adt.clone(), "Mut"]}),
+            ),
+            type_decl_struct(4, &["majit_ir", "GcRef"], vec![]),
+        ],
+        vec![],
+    );
+    let ty_gcref = TyRef::Other(serde_json::json!({
+        "FnPtr": {
+            "skip_binder": {
+                "inputs": [
+                    {"Scalar": {"Integer": {"Unsigned": "U32"}}},
+                    {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                    {"RawPtr": [gcref_word.clone(), "Mut"]},
+                    {"RawPtr": [{"Scalar": "Bool"}, "Mut"]}
+                ],
+                "output": gcref_word,
+                "is_unsafe": true
+            }
+        }
+    }));
+    let ft_gcref =
+        super::func_type_from_fn_ptr_ty(&ty_gcref, &llbc_gcref, crate::ErrorCarrierSpec::default())
+            .expect("GcRef hook FnPtr lowers");
+    assert_eq!(ft_gcref.args.len(), 4);
+    assert_eq!(
+        ft_gcref.args[2], *GCREF,
+        "*mut GcRef FUNC arg is the GCREF root slot, not OBJECTPTR"
+    );
+    assert_eq!(
+        ft_gcref.args[3],
+        LowLevelType::Signed,
+        "*mut bool FUNC arg is the slot address, not OBJECTPTR"
+    );
+    assert_eq!(
+        ft_gcref.result, *GCREF,
+        "GcRef FUNC.RESULT is GCREF (`llmemory.py` GCREF)"
     );
 }
 
@@ -2786,6 +2869,7 @@ fn type_arg_splits_per_instantiation_defers_singlefloat_unit_and_empty() {
     assert!(type_arg_is_concrete("Result<(), PyError>"));
     assert!(type_arg_is_concrete("??scalar"));
     assert!(!type_arg_is_concrete("Result<??scalar, PyError>"));
+    assert!(type_arg_is_concrete("Never"));
     assert!(!type_arg_is_concrete("TypeVar#0"));
     assert!(!type_arg_is_concrete("Result<TypeVar, E>"));
     assert!(!type_arg_is_concrete("??TypeVar#0"));
@@ -2797,6 +2881,8 @@ fn type_arg_splits_per_instantiation_defers_singlefloat_unit_and_empty() {
         Some("<??scalar,PyError>"),
         "whole-arg ??scalar is Charon Never and still suffixes Result"
     );
+    assert!(!type_arg_is_concrete("Option<??scalar>"));
+    assert!(!type_arg_is_concrete("??TraitType"));
 }
 
 #[test]
@@ -3120,16 +3206,25 @@ fn enum_suffix_keeps_unit_ok_when_err_splits() {
         Some("<WordHasher,fn() -> ()>")
     );
     // Charon hash-cons `{"Value":[id,"Never"]}` is a type-name string.
-    // `??scalar` is not an instantiation; `Never` is.
+    // Residual dest_ty of Try::branch spells that uninhabited ok as a
+    // non-object payload (`??scalar`); dest_adt still intern's.
     let llbc = empty_llbc();
     assert_eq!(
         charon_type_value_to_ast_string(&serde_json::json!({"Value": [0, "Never"]}), &llbc, 0),
         "Never"
     );
     assert_eq!(
+        charon_type_value_to_ast_string(&serde_json::json!({"Value": [0, null]}), &llbc, 0),
+        "??scalar"
+    );
+    assert_eq!(
         enum_instantiation_suffix_from_args(&["Never".into(), "BytecodeCorruption".into()])
             .as_deref(),
         Some("<Never,BytecodeCorruption>")
+    );
+    assert_eq!(
+        enum_instantiation_suffix_from_args(&["??scalar".into(), "PyError".into()]).as_deref(),
+        Some("<??scalar,PyError>")
     );
     assert_eq!(
         enum_instantiation_suffix_from_args(&["Option<Never>".into(), "i64".into()]).as_deref(),
@@ -4712,8 +4807,13 @@ fn a_scalar_element_names_its_width_and_a_thin_pointer_needs_no_name() {
         )
     );
     // A named ADT is the element itself, not a pointer to one, so its size
-    // is whatever the struct is — `String` is three words.
+    // is whatever the struct is — `String` is three words. Packed Copy
+    // detection needs the TypeDecl field list; a missing decl declines.
     assert_eq!(spelling(named_adt.clone()), None);
+    assert_eq!(
+        json_ty_packed_copy_struct_byte_size(&named_adt, &llbc),
+        None
+    );
 
     let thin = |ty: serde_json::Value| json_ty_is_thin_pointer_element(&ty, &llbc);
     assert!(thin(

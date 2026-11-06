@@ -480,6 +480,18 @@ fn constant_result_values_agree(rv: &ConstValue, s_const: &ConstValue) -> bool {
     }
 }
 
+/// `stamp_fn_ptr` is `FunctionsPBCRepr.lowleveltype` for one row.
+/// A spelled `null_fn` annotates `s_None` (`NoneRepr` Void); replacing
+/// the stamp dual-gates `legacy=Signed, real=Void` while
+/// `history.getkind` of the pointer is `'int'`.
+fn keep_fn_ptr_stamp_when_void(var: &Variable, ll: &LowLevelType) -> bool {
+    matches!(ll, LowLevelType::Void)
+        && var
+            .concretetype()
+            .as_ref()
+            .is_some_and(crate::model::FunctionGraph::lltype_is_fn_ptr)
+}
+
 /// RPython `RPythonTyper.annotate_helper(..., argtypes)` accepts a
 /// mixed list: each item is either already an `annmodel.SomeObject` or
 /// a low-level type that must pass through `lltype_to_annotation`.
@@ -1189,7 +1201,15 @@ impl RPythonTyper {
     /// same Variable identity.
     pub fn setconcretetype(&self, var: &Variable) -> Result<(), TyperError> {
         let repr = self.bindingrepr(&Hlvalue::Variable(var.clone()))?;
-        var.set_concretetype(Some(repr.lowleveltype().clone()));
+        let ll = repr.lowleveltype().clone();
+        // `stamp_fn_ptr` is `FunctionsPBCRepr.lowleveltype` for one
+        // row. A spelled `null_fn` annotates `s_None` (`NoneRepr` Void);
+        // replacing the stamp dual-gates `legacy=Signed, real=Void`
+        // while `history.getkind` of the pointer is `'int'`.
+        if keep_fn_ptr_stamp_when_void(var, &ll) {
+            return Ok(());
+        }
+        var.set_concretetype(Some(ll));
         Ok(())
     }
 
@@ -1391,7 +1411,13 @@ impl RPythonTyper {
         // `same_as` so downstream ops see the typed value.
         let op_result: Hlvalue = match &hop.spaceop.result {
             Hlvalue::Variable(v) => {
-                v.set_concretetype(Some(expected.clone()));
+                // `op.result.concretetype = hop.r_result.lowleveltype`
+                // (rtyper.py). A spelled `null_fn` annotates `s_None`
+                // (`NoneRepr` Void); keep `stamp_fn_ptr` so dual-gate
+                // `history.getkind` stays `'int'`.
+                if !keep_fn_ptr_stamp_when_void(v, &expected) {
+                    v.set_concretetype(Some(expected.clone()));
+                }
                 Hlvalue::Variable(v.clone())
             }
             Hlvalue::Constant(c) => Hlvalue::Constant(Constant {
@@ -1476,7 +1502,9 @@ impl RPythonTyper {
         // the None-resultvar path without threading it further.
         let _typed_op_result: Hlvalue = match &hop.spaceop.result {
             Hlvalue::Variable(v) => {
-                v.set_concretetype(Some(LowLevelType::Void));
+                if !keep_fn_ptr_stamp_when_void(v, &LowLevelType::Void) {
+                    v.set_concretetype(Some(LowLevelType::Void));
+                }
                 Hlvalue::Variable(v.clone())
             }
             Hlvalue::Constant(c) => Hlvalue::Constant(Constant {
@@ -2166,10 +2194,13 @@ impl RPythonTyper {
             let r = self.bindingrepr(a)?;
             match a {
                 Hlvalue::Variable(v) => {
-                    // `Variable.concretetype` is `Rc<RefCell<...>>`; the
-                    // write propagates through every clone of the same
-                    // Variable identity.
-                    v.set_concretetype(Some(r.lowleveltype().clone()));
+                    // `a.concretetype = r.lowleveltype` (rtyper.py
+                    // setup_block_entry). Isolated `s_None` is
+                    // `NoneRepr` Void; keep `stamp_fn_ptr` so
+                    // `history.getkind` stays `'int'`.
+                    if !keep_fn_ptr_stamp_when_void(v, r.lowleveltype()) {
+                        v.set_concretetype(Some(r.lowleveltype().clone()));
+                    }
                 }
                 Hlvalue::Constant(_) => {
                     return Err(TyperError::message(
@@ -8225,6 +8256,29 @@ mod tests {
         rtyper.setconcretetype(&var).unwrap();
         // impossible_repr lowleveltype is Void.
         assert_eq!(var.concretetype(), Some(LowLevelType::Void));
+    }
+
+    #[test]
+    fn setup_block_entry_keeps_fn_ptr_stamp_when_none_repr_is_void() {
+        use crate::annotator::bookkeeper::func_type_from_fn_spelling;
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let v = Variable::new();
+        v.annotation
+            .replace(Some(Rc::new(crate::annotator::model::s_none())));
+        let ft =
+            func_type_from_fn_spelling("fn() -> i64", &|_| false, &|_| false).expect("fn spelling");
+        v.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Func(ft),
+        }))));
+        let block = Block::shared(vec![Hlvalue::Variable(v.clone())]);
+        rtyper.setup_block_entry(&block).unwrap();
+        let ct = v.concretetype().expect("stamp kept");
+        assert!(
+            matches!(&ct, LowLevelType::Ptr(p) if matches!(p.TO, PtrTarget::Func(_))),
+            "setup_block_entry must keep stamp_fn_ptr when bindingrepr is NoneRepr Void, got {ct:?}"
+        );
     }
 
     #[test]

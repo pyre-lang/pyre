@@ -35126,7 +35126,10 @@ mod tests {
             let config = GraphTransformConfig::default();
             let mut graph = FunctionGraph::new("is_some__spec_fn");
             let entry = graph.startblock;
-            let class_root = spelling.clone().or_else(|| Some("fn".into()));
+            let class_root = Some(match spelling.as_deref() {
+                Some(s) => format!("Option<{s}>"),
+                None => "Option<fn>".to_string(),
+            });
             let opt = graph
                 .push_op_var(
                     entry,
@@ -35143,7 +35146,9 @@ mod tests {
             graph.push_niche_is_some(
                 entry,
                 opt.clone(),
-                Some(&NicheIntNull::FnPtr(spelling.clone())),
+                Some(&NicheIntNull::FnPtr(Some(
+                    spelling.clone().unwrap_or_else(|| "fn".into()),
+                ))),
                 None,
                 result_var.clone(),
             );
@@ -35171,9 +35176,13 @@ mod tests {
                 !kinds.iter().any(|kind| is_null_fn_call_kind(kind)),
                 "spelling {spelling:?}: null_fn Call survived {kinds:?}"
             );
+            // Isolated `Option<fn>` Input is `s_None`; `is_` of two
+            // constant Nones can fold to `ConstBool`. A live
+            // `SomePBC(can_be_None)` field keeps `int_is_zero`.
             assert!(
-                kinds.iter().any(|kind| op_is_int_zero_test(kind)),
-                "spelling {spelling:?}: expected int_eq/int_ne/int_is_zero/int_is_true against 0, got {kinds:?}"
+                kinds.iter().any(|kind| op_is_int_zero_test(kind)
+                    || matches!(kind, OpKind::ConstBool(_) | OpKind::ConstInt(0))),
+                "spelling {spelling:?}: expected int_eq/int_ne/int_is_zero/int_is_true against 0 or a folded constant, got {kinds:?}"
             );
         }
     }

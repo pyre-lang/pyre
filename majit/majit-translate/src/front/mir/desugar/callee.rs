@@ -4338,15 +4338,41 @@ pub(in crate::front::mir) fn struct_field_deref_local(
     }
 }
 
-/// Whether `place` is exactly `(*Local(dest)).field`.
+/// The MIR local of `(*Local).field`, or `None` when `place` is not that shape.
+pub(in crate::front::mir) fn struct_field_place_local(place: &Place) -> Option<usize> {
+    let PlaceKind::Projection(inner, elem) = &place.kind else {
+        return None;
+    };
+    struct_field_deref_local(inner, elem)
+}
+
+pub(in crate::front::mir) fn projection_elem_is_index(elem: &ProjectionElem) -> bool {
+    matches!(
+        elem,
+        ProjectionElem::Tagged(payload)
+            if payload
+                .as_object()
+                .is_some_and(|map| map.contains_key("Index"))
+    )
+}
+
+/// Whether `place` is `(*Local(dest)).field` or `(*Local(dest)).field[i]`.
+///
+/// `create_utf8_index_storage` writes `storage[current].baseindex` as the
+/// first shape and `storage[current].ofs[i]` as the second
+/// (`rutf8.py` `create_utf8_index_storage`). A further field, a bare
+/// deref, or `(*dest)[i]` stays residual.
 pub(in crate::front::mir) fn place_is_immediate_struct_field_of(
     place: &Place,
     dest: usize,
 ) -> bool {
+    if struct_field_place_local(place) == Some(dest) {
+        return true;
+    }
     let PlaceKind::Projection(inner, elem) = &place.kind else {
         return false;
     };
-    struct_field_deref_local(inner, elem) == Some(dest)
+    projection_elem_is_index(elem) && struct_field_place_local(inner) == Some(dest)
 }
 
 /// How a place / operand references the struct-field `add` destination.
@@ -4354,8 +4380,8 @@ pub(in crate::front::mir) enum StructFieldUse {
     None,
     /// `(*dest).field` as a value, including a cast or aggregate operand.
     Field,
-    /// The pointer escapes: a copy, a bare deref, a reborrow, or a
-    /// deeper projection. `&(*dest).field` is this case too.
+    /// The pointer escapes: a copy, a bare deref, a whole-struct
+    /// reborrow, or a deeper projection.
     Other,
 }
 
@@ -4400,9 +4426,42 @@ pub(in crate::front::mir) fn classify_struct_field_write(
     }
 }
 
+/// `&(*dest).field` / `&raw (*dest).field` of a copy scalar, thin
+/// pointer, GCREF word, transparent wrapper of those, or a TypeVar
+/// (generic `Entry<K, V>` payloads). `Rvalue::Ref` aliases the
+/// referent, so that borrow is `entries[i].key` (`ll_getitem_fast`).
+/// A nested aggregate's address, a whole-struct `&*p`, and an
+/// unresolved fixture type stay other.
+pub(in crate::front::mir) fn tyref_is_identity_field_word(ty: &TyRef, llbc: &Llbc) -> bool {
+    fn leaf(ty: &TyRef, llbc: &Llbc) -> bool {
+        tyref_is_copy_scalar_or_thin_ptr(ty, llbc)
+            || tyref_is_gcref_spelling(ty, llbc)
+            || tyref_node(ty, llbc)
+                .and_then(|n| strip_ty_indirections(n, llbc))
+                .is_some_and(|n| n.get("TypeVar").is_some())
+    }
+    if leaf(ty, llbc) {
+        return true;
+    }
+    let Some((idx, _)) = tyref_transparent_nonzst_field(ty, llbc) else {
+        return false;
+    };
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    let Some(decl) = adt_node_def_id(node).and_then(|id| llbc.type_by_id(id)) else {
+        return false;
+    };
+    let Some(fields) = type_decl_struct_fields(decl, llbc) else {
+        return false;
+    };
+    fields.get(idx).is_some_and(|field| leaf(&field.ty, llbc))
+}
+
 pub(in crate::front::mir) fn scan_rvalue_struct_field(
     rvalue: &Rvalue,
     dest: usize,
+    llbc: &Llbc,
     fields: &mut usize,
     other: &mut usize,
 ) {
@@ -4418,12 +4477,18 @@ pub(in crate::front::mir) fn scan_rvalue_struct_field(
             bump_struct_field_use(operand_struct_field_use(lhs, dest), fields, other);
             bump_struct_field_use(operand_struct_field_use(rhs, dest), fields, other);
         }
-        // Address-of, length, and discriminant are not value field uses,
-        // even when the place is exactly `(*dest).field`.
-        Rvalue::Ref { place, .. }
-        | Rvalue::RawPtr { place, .. }
-        | Rvalue::Len(place)
-        | Rvalue::Discriminant(place) => {
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+            if struct_field_place_local(place) == Some(dest)
+                && tyref_is_identity_field_word(&place.ty, llbc)
+            {
+                *fields += 1;
+            } else if place_references_local(place, dest) {
+                *other += 1;
+            }
+        }
+        // Length and discriminant are not value field uses, even when
+        // the place is exactly `(*dest).field`.
+        Rvalue::Len(place) | Rvalue::Discriminant(place) => {
             if place_references_local(place, dest) {
                 *other += 1;
             }
@@ -4461,7 +4526,13 @@ pub(in crate::front::mir) fn struct_field_census(
         for stmt in &bb.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
-                    scan_rvalue_struct_field(rvalue, dest, &mut census.fields, &mut census.other);
+                    scan_rvalue_struct_field(
+                        rvalue,
+                        dest,
+                        llbc,
+                        &mut census.fields,
+                        &mut census.other,
+                    );
                     classify_struct_field_write(
                         place,
                         dest,
@@ -4518,11 +4589,12 @@ pub(in crate::front::mir) fn struct_field_census(
     census
 }
 
-/// `ptr::add`'s destination is used only as one or more `(*dest).field`
-/// value reads or writes. A bare deref, a copy of the pointer, a reborrow,
-/// or a second definition keeps the add residual. `StorageLive` /
-/// `StorageDead` / `PlaceMention` are ignored, same as
-/// [`add_dest_used_only_as_single_deref`].
+/// `ptr::add` / `Vec::index_mut`'s destination is used only as one or more
+/// `(*dest).field` or `(*dest).field[i]` value reads or writes, including
+/// an identity-word `&(*dest).field`. A bare deref, a copy of the
+/// pointer, a whole-struct reborrow, or a second definition keeps the
+/// call residual. `StorageLive` / `StorageDead` / `PlaceMention` are
+/// ignored, same as [`add_dest_used_only_as_single_deref`].
 pub(in crate::front::mir) fn add_dest_used_only_as_struct_field(
     llbc: &Llbc,
     body: &Unstructured,
@@ -4599,7 +4671,7 @@ fn fused_get_local_ok(
         for stmt in &bb.statements {
             match stmt.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => {
-                    if !fused_get_assign_ok(place, rvalue, dest, role, payloads, fields) {
+                    if !fused_get_assign_ok(place, rvalue, dest, llbc, role, payloads, fields) {
                         return false;
                     }
                 }
@@ -4658,6 +4730,7 @@ fn fused_get_assign_ok(
     place: &Place,
     rvalue: &Rvalue,
     dest: usize,
+    llbc: &Llbc,
     role: u8,
     payloads: &mut Vec<usize>,
     fields: &mut usize,
@@ -4706,7 +4779,7 @@ fn fused_get_assign_ok(
         return false;
     }
     let mut other = 0;
-    scan_rvalue_struct_field(rvalue, dest, &mut 0, &mut other);
+    scan_rvalue_struct_field(rvalue, dest, llbc, &mut 0, &mut other);
     other == 0
 }
 
@@ -4757,11 +4830,10 @@ pub(in crate::front::mir) fn struct_field_index_named(
         .position(|field| field.name.as_deref() == Some(name))
 }
 
-/// `GcArray<Point>` / `GcArray<Entry>` for a `*mut`/`*const` named,
-/// non-transparent struct pointee.
-///
-/// A scalar, a pointer, or a `repr(transparent)` pointee is `None`, so list
-/// `ArrayRead` intercepts and `direct_ptradd` keep those `.add` calls.
+/// `GcArray<Point>` / `GcArray<Entry>` for a named, non-transparent struct
+/// pointee node. A scalar, a pointer, or a `repr(transparent)` pointee is
+/// `None`, so list `ArrayRead` intercepts and `direct_ptradd` keep those
+/// `.add` calls.
 ///
 /// `get_array_descr` keys one ARRAY lltype, and `nolength` is a property of
 /// that lltype. `interiorfielddescrof_keyed` mints the length-prefixed
@@ -4769,12 +4841,11 @@ pub(in crate::front::mir) fn struct_field_index_named(
 /// spelling is an item run (`nolength_from_array_type_id`), so it cannot
 /// share an atid with that mint. `GcArray<T>` stays length-prefixed and
 /// `extract_element_type_from_str` still peels it to `T`.
-pub(in crate::front::mir) fn struct_pointee_array_type_id(
-    base_ty: &TyRef,
+pub(in crate::front::mir) fn gc_array_id_for_named_struct_node(
+    pointee: &serde_json::Value,
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    let pointee = tyref_peel_one_raw_ptr_node(base_ty, llbc)?;
     let decl = llbc.type_by_id(adt_node_def_id(pointee)?)?;
     if decl.published_struct_copy || !matches!(decl.kind, TypeDeclKind::Struct(_)) {
         return None;
@@ -4785,6 +4856,54 @@ pub(in crate::front::mir) fn struct_pointee_array_type_id(
     let root = adt_node_class_root_with(pointee, llbc, tombstoned)?;
     let leaf = majit_ir::descr::strip_instantiation_suffix(&root);
     Some(format!("GcArray<{leaf}>"))
+}
+
+/// `GcArray<Point>` / `GcArray<Entry>` for a `*mut`/`*const` named,
+/// non-transparent struct pointee.
+pub(in crate::front::mir) fn struct_pointee_array_type_id(
+    base_ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    gc_array_id_for_named_struct_node(
+        tyref_peel_one_raw_ptr_node(base_ty, llbc)?,
+        llbc,
+        tombstoned,
+    )
+}
+
+/// `GcArray<Utf8LocElem>` for `Vec::index_mut`'s `&mut T` destination.
+///
+/// `create_utf8_index_storage` indexes a `Vec<Utf8LocElem>`
+/// (`rutf8.py` `UTF8_INDEX_STORAGE`); the dest is a mut-ref, not a raw
+/// pointer.
+pub(in crate::front::mir) fn struct_ref_pointee_array_type_id(
+    dest_ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    gc_array_id_for_named_struct_node(tyref_peel_one_ref_node(dest_ty, llbc)?, llbc, tombstoned)
+}
+
+/// The Vec local a unique `&mut storage` / `*mut storage` temp names.
+///
+/// `storage[current] = …` lowers to `_p = index_mut(&mut storage, current)`.
+/// The interior header is `storage`, not the mut-ref temporary.
+pub(in crate::front::mir) fn peel_unique_mut_ref_local(
+    llbc: &Llbc,
+    body: &Unstructured,
+    local: usize,
+) -> usize {
+    let Some(src) = peel_copies(llbc, body, local) else {
+        return local;
+    };
+    match defining_assign(llbc, body, src) {
+        Some(Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. }) => match place.kind {
+            PlaceKind::Local(header) => header as usize,
+            _ => src,
+        },
+        _ => src,
+    }
 }
 
 pub(in crate::front::mir) enum HeaderProd {
@@ -4856,6 +4975,7 @@ pub(in crate::front::mir) fn stmt_assigns_local(
 }
 
 pub(in crate::front::mir) fn stmt_has_struct_field_value_use(
+    llbc: &Llbc,
     stmt: &majit_charon_reader::ullbc::Statement,
     dest: usize,
 ) -> bool {
@@ -4863,7 +4983,7 @@ pub(in crate::front::mir) fn stmt_has_struct_field_value_use(
     let mut other = 0usize;
     match stmt.stmt_kind_ref() {
         Ok(StmtKind::Assign(place, rvalue)) => {
-            scan_rvalue_struct_field(rvalue, dest, &mut fields, &mut other);
+            scan_rvalue_struct_field(rvalue, dest, llbc, &mut fields, &mut other);
             if place_is_immediate_struct_field_of(place, dest) {
                 fields += 1;
             }
@@ -4948,7 +5068,7 @@ pub(in crate::front::mir) fn captured_local_reaches_field_uses(
         let mut stale = state[bb].unwrap_or(false);
         let block = &body.body[bb];
         for stmt in &block.statements {
-            if stale && stmt_has_struct_field_value_use(stmt, dest) {
+            if stale && stmt_has_struct_field_value_use(llbc, stmt, dest) {
                 return false;
             }
             if stmt_assigns_local(stmt, local) {
@@ -5222,6 +5342,61 @@ pub(in crate::front::mir) fn struct_field_ptr_add_trace(
     })
 }
 
+pub(in crate::front::mir) struct StructFieldVecIndex {
+    pub(in crate::front::mir) header_local: usize,
+    pub(in crate::front::mir) index_local: usize,
+    pub(in crate::front::mir) array_type_id: String,
+}
+
+/// Shared gate for the extra-live pass and the `Vec::index_mut` intercept.
+///
+/// Requires `Vec::index_mut` of a named non-transparent struct, a MIR-local
+/// index, and a destination used only as `(*dest).field` or
+/// `(*dest).field[i]`. The array identity is taken from the `&mut T`
+/// destination. A reassignment of the index or the Vec header that
+/// reaches a field use is a miss (`captured_local_reaches_field_uses`).
+#[allow(clippy::too_many_arguments)]
+pub(in crate::front::mir) fn struct_field_vec_index_trace(
+    reg: &RegularCall,
+    args_len: usize,
+    base_local: Option<usize>,
+    index_ty: Option<&TyRef>,
+    index_local: Option<usize>,
+    dest_local: usize,
+    dest_ty: Option<&TyRef>,
+    body: &Unstructured,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<StructFieldVecIndex> {
+    if args_len != 2
+        || !is_vec_index_mut_call(reg, index_ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+    {
+        return None;
+    }
+    let base_local = base_local?;
+    let index_local = index_local?;
+    let array_type_id = struct_ref_pointee_array_type_id(dest_ty?, llbc, tombstoned)?;
+    if !add_dest_used_only_as_struct_field(llbc, body, dest_local) {
+        return None;
+    }
+    let header_local = peel_unique_mut_ref_local(llbc, body, base_local);
+    if !captured_local_reaches_field_uses(llbc, body, dest_local, index_local) {
+        return None;
+    }
+    if header_local != index_local
+        && !captured_local_reaches_field_uses(llbc, body, dest_local, header_local)
+    {
+        return None;
+    }
+    Some(StructFieldVecIndex {
+        header_local,
+        index_local,
+        array_type_id,
+    })
+}
+
 pub(in crate::front::mir) fn block_has_struct_field_value_use(
     llbc: &Llbc,
     bb: &BasicBlock,
@@ -5232,7 +5407,7 @@ pub(in crate::front::mir) fn block_has_struct_field_value_use(
     for stmt in &bb.statements {
         match stmt.stmt_kind_ref() {
             Ok(StmtKind::Assign(place, rvalue)) => {
-                scan_rvalue_struct_field(rvalue, dest, &mut fields, &mut other);
+                scan_rvalue_struct_field(rvalue, dest, llbc, &mut fields, &mut other);
                 if place_is_immediate_struct_field_of(place, dest) {
                     fields += 1;
                 }
