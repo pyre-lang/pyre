@@ -2012,6 +2012,7 @@ name = "majit-charon-reader"
 version = "0.0.2"
 dependencies = [
  "memchr",
+ "memmap2",
  "parking_lot",
  "serde",
  "serde_json",

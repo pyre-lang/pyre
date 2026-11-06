@@ -228,7 +228,8 @@ def run_layout_sidecar(engine) -> int:
         }
         encoded = json.dumps(type_decls, ensure_ascii=False).encode("utf-8")
         wide = len(encoded) > engine.LAYOUT_DECODE_WINDOW
-        ok = slim == expected and wide
+        leftover = list(dest.parent.glob(f".{dest.name}.tmp-*"))
+        ok = slim == expected and wide and leftover == []
         print(f"{'ok  ' if ok else 'FAIL'} layout sidecar keeps type_decls and drops bodies")
         return 0 if ok else 1
     finally:

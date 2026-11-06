@@ -49,8 +49,10 @@ pub struct FunDecl {
     /// exploded `Value` tree) so the whole-corpus retained footprint
     /// stays near the on-disk size; project to `Unstructured` on demand
     /// via [`FunDecl::unstructured`]. A schema change in the unused
-    /// variants still does not break load.
-    pub body: Option<Box<RawValue>>,
+    /// variants still does not break load. When loaded through
+    /// [`crate::Llbc::load`] the text is a range into the artefact's
+    /// file mapping.
+    pub body: Option<crate::RawBody>,
     /// [`FunDecl::has_unstructured_body`], decided on first query.
     #[serde(skip)]
     has_unstructured_body: OnceLock<bool>,
