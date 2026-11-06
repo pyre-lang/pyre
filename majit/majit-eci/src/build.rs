@@ -664,7 +664,7 @@ fn measure_macro_wrapper_inttypes(
             .map(|name| {
                 (
                     name.clone(),
-                    crate::rffi_platform::CConfigEntry::SimpleType(name.clone()),
+                    crate::rffi_platform::CConfigEntry::simple_type(name.clone()),
                 )
             })
             .collect();
@@ -717,6 +717,18 @@ fn inttypes_from_configure_results(
                 }
                 None => {
                     panic!("rffi_platform.configure for the macro-wrapper types {names:?}: Int")
+                }
+            },
+            other => match eci_name {
+                Some(eci_name) => {
+                    panic!(
+                        "rffi_platform.configure for the macro-wrapper types {names:?}: {other:?} (ECI `{eci_name}`)"
+                    )
+                }
+                None => {
+                    panic!(
+                        "rffi_platform.configure for the macro-wrapper types {names:?}: {other:?}"
+                    )
                 }
             },
         };
