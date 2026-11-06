@@ -39,6 +39,20 @@ fn replace_live_regs(live: &LiveFrameRegs, oldbox: OpRef, newbox: OpRef) {
     live.replace_active_box(oldbox, newbox);
 }
 
+/// Innermost Python or portal `MIFrame` on `framestack`.
+///
+/// `pyjitpl.py` `framestack[-1]` is the currently executing frame. A leftover
+/// helper `InlineFrame` (`w_code == 0`, not the portal) can sit on
+/// `framestack.last()` after `helper_live` has already popped
+/// (`residual_call.rs` `build_multi_frame_miframe`). Bind and stamp write
+/// the executing Python body, the same frame
+/// `extend_transparent_helper_chain` reads.
+pub(super) fn innermost_python_framestack_index(framestack: &[InlineFrame]) -> Option<usize> {
+    framestack
+        .iter()
+        .rposition(|frame| frame.is_portal || frame.w_code != 0)
+}
+
 /// Bind this walk's live banks onto the current MIFrame.
 ///
 /// `pyjitpl.py` `walk_active_trace_refs` walks every `framestack`
@@ -58,11 +72,9 @@ pub(super) fn bind_paused_caller_regs(
     if session.framestack.is_empty() {
         session.framestack.push(InlineFrame::portal());
     }
-    let frame = session
-        .framestack
-        .last_mut()
-        .expect("portal occupies framestack[0]");
-    frame.live = Some(live);
+    let idx = innermost_python_framestack_index(&session.framestack)
+        .unwrap_or(session.framestack.len() - 1);
+    session.framestack[idx].live = Some(live);
 }
 
 pub(super) fn push_helper_live(
@@ -98,22 +110,37 @@ impl Drop for HelperLiveGuard<'_> {
 /// Stamp the CALL that paused this frame. `MIFrame.run_one_step` has already
 /// advanced past that op, so `build_parent_miframe_from_live_banks` resumes
 /// at `next_pc` (`_setup_return_value_*` / `get_list_of_active_boxes(in_a_call=True)`).
+///
+/// The caller is the currently executing `MIFrame` (`pyjitpl.py`
+/// `framestack[-1]`). A helper body owns `helper_live.last()`; an inlined
+/// Python body owns the innermost Python/portal on `framestack`, even when
+/// an outer helper is still on `helper_live` (`helper H → Python P → helper
+/// H2`) or a leftover helper `InlineFrame` sits on `framestack.last()`
+/// after `helper_live` has popped. Stamping that leftover, or the outer
+/// helper, would leave P's `call_jitcode_pc` on the first helper CALL, so
+/// `replace_or_push_paused_live` would drop later stores (list.append)
+/// from the resume chain.
 pub(super) fn mark_paused_caller_call(
     session: &std::cell::RefCell<WalkSession>,
     jitcode_index: u32,
     call_jitcode_pc: usize,
+    caller_is_helper: bool,
 ) {
     let mut session = session.borrow_mut();
-    if let Some(live) = session.helper_live.last_mut() {
-        live.call_jitcode_pc = Some(call_jitcode_pc);
-        if live.jitcode_index.is_none() {
-            live.jitcode_index = Some(jitcode_index as usize);
+    let python_idx = innermost_python_framestack_index(&session.framestack);
+    if caller_is_helper {
+        if let Some(live) = session.helper_live.last_mut() {
+            live.call_jitcode_pc = Some(call_jitcode_pc);
+            if live.jitcode_index.is_none() {
+                live.jitcode_index = Some(jitcode_index as usize);
+            }
+            return;
         }
-        return;
     }
+    let idx = python_idx.unwrap_or_else(|| session.framestack.len().saturating_sub(1));
     if let Some(live) = session
         .framestack
-        .last_mut()
+        .get_mut(idx)
         .and_then(|frame| frame.live.as_mut())
     {
         live.call_jitcode_pc = Some(call_jitcode_pc);
@@ -595,6 +622,82 @@ mod frame_replacement_tests {
             replace_box_in_paused_frames(&mut session.borrow_mut(), new, old);
             assert_eq!(bank.to_vec(), [old, old]);
         }
+    }
+
+    fn leftover_helper_frame() -> InlineFrame {
+        InlineFrame {
+            is_portal: false,
+            w_code: 0,
+            is_being_profiled: false,
+            recursion_greenkey: false,
+            call_id: 0,
+            debug_merge_point_py_pc: None,
+            parents: Vec::new(),
+            entry_executed_effects: 0,
+            entry_heap_writing_effects: 0,
+            entry_journal_mark: fbw_effect_journal_mark(),
+            helper_resume: HelperResume::Section,
+            helper_call_entry: HelperCallEntry::Unavailable,
+            helper_entry_array_len: None,
+            entry_trace_index: 0,
+            live: None,
+        }
+    }
+
+    fn inlined_python_frame(w_code: usize) -> InlineFrame {
+        InlineFrame {
+            is_portal: false,
+            w_code,
+            is_being_profiled: false,
+            recursion_greenkey: true,
+            call_id: 1,
+            debug_merge_point_py_pc: None,
+            parents: Vec::new(),
+            entry_executed_effects: 0,
+            entry_heap_writing_effects: 0,
+            entry_journal_mark: fbw_effect_journal_mark(),
+            helper_resume: HelperResume::Section,
+            helper_call_entry: HelperCallEntry::Unavailable,
+            helper_entry_array_len: None,
+            entry_trace_index: 0,
+            live: None,
+        }
+    }
+
+    #[test]
+    fn bind_and_stamp_write_innermost_python_when_leftover_helper_is_last() {
+        let session = std::cell::RefCell::new(WalkSession::default());
+        {
+            let mut session = session.borrow_mut();
+            session.framestack.push(InlineFrame::portal());
+            session.framestack.push(inlined_python_frame(0x1000));
+            session.framestack.push(leftover_helper_frame());
+        }
+        let regs = RegisterBank::new([OpRef::input_arg_ref(0)]);
+        let state = WalkFrameState::new(WalkFrameStateData::default());
+        bind_paused_caller_regs(
+            &session,
+            &regs,
+            &RegisterBank::default(),
+            &RegisterBank::default(),
+            &state,
+        );
+        {
+            let session = session.borrow();
+            assert!(session.framestack[0].live.is_none());
+            assert!(session.framestack[1].live.is_some());
+            assert!(session.framestack[2].live.is_none());
+            assert!(session.framestack[2].is_helper_level());
+        }
+        mark_paused_caller_call(&session, 7, 42, false);
+        let session = session.borrow();
+        let live = session.framestack[1]
+            .live
+            .as_ref()
+            .expect("python live after stamp");
+        assert_eq!(live.call_jitcode_pc, Some(42));
+        assert_eq!(live.jitcode_index, Some(7));
+        assert!(session.framestack[2].live.is_none());
     }
 }
 
@@ -1645,7 +1748,7 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     if vable.is_none() {
         return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
     }
-    let index = read_int_reg(code, op, 1, ctx)?;
+    let index = read_int_reg_raw(code, op, 1, ctx)?;
     // pyjitpl.py `indexbox.getint()` — the array slot is chosen from
     // the concrete index. Fail loud if the walker can't resolve it.
     let index_value = match ctx.trace_ctx.concrete_of_opref(index) {
@@ -1917,7 +2020,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     if vable.is_none() {
         return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
     }
-    let index = read_int_reg(code, op, 1, ctx)?;
+    let index = read_int_reg_raw(code, op, 1, ctx)?;
     let index_value = match ctx.trace_ctx.concrete_of_opref(index) {
         Some(Value::Int(v)) => v,
         _ => {

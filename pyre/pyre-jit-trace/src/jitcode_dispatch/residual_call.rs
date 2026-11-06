@@ -3671,29 +3671,27 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
         drop(session);
     }
 
-    // The Python frame that entered this helper sits on
-    // `framestack.last().live`, not in `parents`. Portal is already
-    // pushed by `build_paused_portal_miframe`. Ancestor helpers are
-    // spliced after latch (`splice_active_driver_ancestors` /
-    // `blackhole.py` `convert_and_run_from_pyjitpl`).
+    // The Python frame that entered this helper sits on that frame's
+    // `live`, not in `parents`. Portal is already pushed by
+    // `build_paused_portal_miframe`. Ancestor helpers are spliced after
+    // latch (`splice_active_driver_ancestors` / `blackhole.py`
+    // `convert_and_run_from_pyjitpl`).
     //
-    // A helper `InlineFrame` (`w_code == 0`, not the portal) already listed
-    // its Python caller in `parents`. `bind_paused_caller_regs` still writes
-    // `last().live` on that helper level and `mark_paused_caller_call` can
-    // stamp the portal jitcode index onto it, which rebuilt a second `main`
-    // MIFrame whose portal red was not a `PyFrame` (`is_op_identity` SIGSEGV
-    // at `concrete_nlocals`).
+    // A leftover helper `InlineFrame` (`w_code == 0`, not the portal) can
+    // sit on `framestack.last()` after `helper_live` has popped. Skipping
+    // that last frame without looking below it dropped the Python live
+    // from the blackhole image. Read the innermost Python/portal, the same
+    // frame `bind_paused_caller_regs` / `mark_paused_caller_call` /
+    // `extend_transparent_helper_chain` write.
     if ctx.fbw_mode.transparent_helper_jitcode_index.is_some() {
         let live = {
             let session = ctx.session.borrow();
             if session.at_portal() {
                 None
             } else {
-                session.framestack.last().and_then(|last| {
-                    (last.is_portal || last.w_code != 0)
-                        .then(|| last.live.clone())
-                        .flatten()
-                })
+                let idx = super::vable_ops::innermost_python_framestack_index(&session.framestack);
+                idx.and_then(|i| session.framestack.get(i))
+                    .and_then(|frame| frame.live.clone())
             }
         };
         if let Some(live) = live {
