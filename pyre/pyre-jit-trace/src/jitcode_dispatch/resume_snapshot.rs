@@ -159,17 +159,10 @@ fn forward_snapshot_py_pc(jitcode_index: u32, pc: u32) -> Result<u32, DispatchEr
     {
         return Ok(u32::MAX);
     }
-    let mut py = match payload.resume_position_for_jitcode_pc(pc as usize) {
-        Some((_, py_pc)) => py_pc,
-        // Same empty-twin fallback as `walker_capture_snapshot_for_last_guard_impl`:
-        // a `-live-` startpoint that is not itself a forward-py key still
-        // belongs to a containing Python opcode (`containing_py_pc_for_jitcode_pc`).
-        None => crate::py_coord::containing_py_pc_for_jitcode_pc(&payload.metadata, pc as usize),
-    };
-    if !payload.code_ptr.is_null() {
-        py = skip_python_trivia_forward(unsafe { &*payload.code_ptr }, py as usize) as u32;
-    }
-    Ok(py)
+    // Same reconstruction rebuild uses (`resume_py_pc_for_jitcode_word`): a
+    // trailing `-live-` after a Python-call jitcode op is the CALL's
+    // fallthrough, not the containing CALL / cache word.
+    Ok(crate::py_coord::resume_py_pc_for_jitcode_word(jitcode_index as i32, pc as i32) as u32)
 }
 
 pub(crate) fn vstack_box_for_snapshot(value: OpRef) -> Option<OpRef> {
@@ -588,6 +581,13 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         if helper_chain == HelperChain::Unresumable {
             return Err(DispatchError::callee_inline_unsupported(op_pc));
         }
+        if guard_resume_pc_probe_enabled() {
+            eprintln!(
+                "[guard-pc] helper_chain={helper_chain:?} op_pc={op_pc} \
+                 after_residual={after_residual_call} n_parents={}",
+                parent_frames.len()
+            );
+        }
         if helper_chain == HelperChain::Numbered {
             match numbered_helper_guard_resume(
                 ctx,
@@ -605,7 +605,14 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     );
                 }
                 // Fall through to the root portal's CALL boundary below.
-                NumberedHelperGuard::CallerBoundary => {}
+                NumberedHelperGuard::CallerBoundary => {
+                    if guard_resume_pc_probe_enabled() {
+                        eprintln!(
+                            "[guard-pc] numbered_helper CallerBoundary op_pc={op_pc} \
+                             after_residual={after_residual_call}"
+                        );
+                    }
+                }
             }
         } else if capture_converted_driver_helper_guard(
             ctx,
@@ -735,7 +742,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         py = exact_after_marker
                             .and_then(|marker| jc.payload.forward_py_pc_for_jitcode_pc(marker))
                             .unwrap_or_else(|| {
-                                crate::pyjitpl::semantic_fallthrough_pc(code, py as usize) as u32
+                                crate::pyjitpl::resume_py_pc_after_python_call(code, py as usize)
+                                    as u32
                             });
                         let call_pc_has_catch = pyre_interpreter::pycode::lookup_exceptiontable(
                             &code.exceptiontable,
@@ -1365,9 +1373,12 @@ fn publish_single_frame_snapshot<Sym: WalkSym>(
         let opcode = match guard_stamp {
             GuardStampTarget::LastOp => ctx.trace_ctx.last_op_opcode(),
         };
+        let jc_name = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
+            .map(|pjc| pjc.jitcode.name().to_string())
+            .unwrap_or_default();
         eprintln!(
             "[guard-pc] {origin} {opcode:?} op_pc={op_pc} jc={jitcode_index} \
-             jit_pc={pc} py_pc={py_pc} active={}",
+             name={jc_name} jit_pc={pc} py_pc={py_pc} active={}",
             active.len(),
         );
     }
@@ -2901,40 +2912,23 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         let call_is_void =
             crate::jitcode_runtime::decode_op_at(jc.payload.jitcode.code.as_slice(), call_jit_pc)
                 .is_some_and(|op| op.result_argcode() == 'v');
-        // #73 phase-3 (twin-first): the forward `after_residual_fallthrough`
-        // twin carries the containing-then-fallthrough coordinate; the
-        // containing lookup survives for the empty-twin class and as the audit
-        // oracle.
-        let legacy_fallthrough = || unsafe {
-            let call_py =
-                crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, call_jit_pc)
-                    as usize;
-            let code = &*jc.payload.code_ptr;
-            crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32
-        };
-        let fallthrough = match jc
-            .payload
-            .after_residual_fallthrough_py_pc_for_jitcode_pc(call_jit_pc)
-        {
-            Some(ft) => {
-                if pcmap_afterresidual_audit_enabled() {
-                    assert_eq!(
-                        ft,
-                        legacy_fallthrough(),
-                        "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: inline-caller fallthrough-py twin diverged at jit_pc {call_jit_pc}"
-                    );
-                }
-                ft
-            }
-            None => {
-                crate::py_coord::note_empty_twin_fallback(
-                    "inline_caller_fallthrough",
-                    jc.index,
-                    call_jit_pc as i32,
+        let call_py =
+            crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, call_jit_pc)
+                as usize;
+        let code = &*jc.payload.code_ptr;
+        if pcmap_afterresidual_audit_enabled() {
+            let legacy = crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32;
+            if let Some(ft) = jc
+                .payload
+                .after_residual_fallthrough_py_pc_for_jitcode_pc(call_jit_pc)
+            {
+                assert_eq!(
+                    ft, legacy,
+                    "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: inline-caller fallthrough-py twin diverged at jit_pc {call_jit_pc}"
                 );
-                legacy_fallthrough()
             }
-        };
+        }
+        let fallthrough = crate::pyjitpl::resume_py_pc_after_python_call(code, call_py) as u32;
         (
             jc.index as u32,
             fallthrough,
@@ -3075,11 +3069,11 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     let call_is_void =
         crate::jitcode_runtime::decode_op_at(pjc.jitcode.code.as_slice(), call_jit_pc)
             .is_some_and(|op| op.result_argcode() == 'v');
-    let legacy_fallthrough_py_pc = || unsafe {
+    let fallthrough_py_after_call = || unsafe {
         let call_py =
             crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
         let code = &*pjc.code_ptr;
-        crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32
+        crate::pyjitpl::resume_py_pc_after_python_call(code, call_py) as u32
     };
     // The call result is the top operand-stack slot only when it remains live
     // at the return point; a call whose value is immediately discarded can
@@ -3093,7 +3087,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
             .map(|depth| depth as usize),
         None => {
             let raw = || {
-                let fallthrough_py_pc = legacy_fallthrough_py_pc();
+                let fallthrough_py_pc = fallthrough_py_after_call();
                 unsafe {
                     crate::liveness::liveness_for(pjc.code_ptr)
                         .depth_at_py_pc()
@@ -4203,7 +4197,17 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
     for frame in &parent_frames {
         let pc_word = parent_resume_pc_word(frame)
             .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })?;
-        let py_pc = forward_snapshot_py_pc(frame.jitcode_index, pc_word)?;
+        let py_pc = if crate::state::jitcode_is_transparent_helper(frame.jitcode_index as i32)
+            || crate::state::pyjitcode_for_jitcode_index(frame.jitcode_index as i32)
+                .is_some_and(|pjc| pjc.code_ptr.is_null())
+        {
+            u32::MAX
+        } else if matches!(frame.resume_coord, ParentResumeCoord::CallFallthrough(_)) {
+            resolve_parent_resume_py_pc(frame)
+                .unwrap_or(forward_snapshot_py_pc(frame.jitcode_index, pc_word)?)
+        } else {
+            forward_snapshot_py_pc(frame.jitcode_index, pc_word)?
+        };
         let boxes = boxes_matching_resume_liveness(frame, pc_word, op_pc)?;
         captured.push((frame.jitcode_index, pc_word, py_pc, boxes));
     }
@@ -4213,6 +4217,41 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
             (*jitcode_index, *pc_word, *py_pc, boxes.as_slice())
         })
         .collect();
+    if guard_resume_pc_probe_enabled() {
+        let names: Vec<String> = frames
+            .iter()
+            .map(|(jitcode_index, pc_word, py_pc, boxes)| {
+                let pjc = crate::state::pyjitcode_for_jitcode_index(*jitcode_index as i32);
+                let jc_name = pjc
+                    .as_ref()
+                    .map(|p| p.jitcode.name().to_string())
+                    .unwrap_or_default();
+                let (opname, pred) = pjc
+                    .as_ref()
+                    .map(|p| {
+                        let slice = p.jitcode.code.as_slice();
+                        let here = crate::jitcode_runtime::decode_op_at(slice, *pc_word as usize)
+                            .map(|op| op.opname.to_string())
+                            .unwrap_or_else(|| "-".into());
+                        let pred = crate::jitcode_runtime::decoded_ops(slice)
+                            .find(|op| op.next_pc == *pc_word as usize)
+                            .map(|op| op.opname.to_string())
+                            .unwrap_or_else(|| "-".into());
+                        (here, pred)
+                    })
+                    .unwrap_or_else(|| ("-".into(), "-".into()));
+                format!(
+                    "{jc_name}@{pc_word}/{opname}<{pred}/py={py_pc}/n={}",
+                    boxes.len()
+                )
+            })
+            .collect();
+        eprintln!(
+            "[guard-pc] helper-frames op_pc={op_pc} n={} [{}]",
+            frames.len(),
+            names.join(" | ")
+        );
+    }
     match guard_stamp {
         GuardStampTarget::LastOp => ctx
             .trace_ctx

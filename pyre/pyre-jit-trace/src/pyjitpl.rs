@@ -32,3 +32,28 @@ pub fn semantic_fallthrough_pc(code: &CodeObject, pc: usize) -> usize {
         }
     }
 }
+
+/// Interpreter lasti after a Python-call jitcode op.
+///
+/// `semantic_fallthrough_pc` always advances one word first. When the
+/// containing Python pc is already the next real opcode (the residual's
+/// `py_exact` run was re-keyed onto the fallthrough), that extra step
+/// skips the first instruction after the CALL. Cache words inside the
+/// CALL still need a trivia skip; a CALL opcode still needs fallthrough.
+pub fn resume_py_pc_after_python_call(code: &CodeObject, containing_py: usize) -> usize {
+    match pyre_interpreter::decode_instruction_at(code, containing_py) {
+        Some((
+            Instruction::ExtendedArg
+            | Instruction::Resume { .. }
+            | Instruction::Nop
+            | Instruction::Cache
+            | Instruction::NotTaken,
+            _,
+        )) => crate::jitcode_dispatch::skip_python_trivia_forward(code, containing_py),
+        Some((
+            Instruction::Call { .. } | Instruction::CallKw { .. } | Instruction::CallFunctionEx,
+            _,
+        )) => semantic_fallthrough_pc(code, containing_py),
+        _ => containing_py,
+    }
+}

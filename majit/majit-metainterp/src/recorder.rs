@@ -306,6 +306,16 @@ pub struct Trace {
     /// This list settles slots that outlive their box so `materialize_ops`
     /// does not intern a freed address.
     young_ref_slots: RefCell<Vec<u32>>,
+    /// InputArg `_index` values stamped with a `Value::Ref` since the last
+    /// minor collection. `set_concrete_at` on an InputArg writes `_resref`
+    /// on the box (`history.py` `InputArgRef`); that box is not a
+    /// `value_slots` entry, so it needs its own young list. An inlined
+    /// callee's `self` is this path.
+    young_inputarg_positions: RefCell<Vec<u32>>,
+    /// Recorded-op `_index` values stamped through the `Op.set_value`
+    /// fallback (no `value_slot` for that position). Settled the same
+    /// weakref way so a residual does not execute a recycled address.
+    young_fallback_positions: RefCell<Vec<u32>>,
     /// Dropped before [`Self::const_ptr_indexes`] (declaration order) so the
     /// extra area unregisters while the index list is still valid.
     const_ptr_area: RefCell<Option<majit_gc::shadow_stack::MutatorExtraAreaGuard>>,
@@ -529,6 +539,8 @@ impl Trace {
             value_slots: Box::new(Vec::new()),
             inputarg_heapc: Vec::new(),
             young_ref_slots: RefCell::new(Vec::new()),
+            young_inputarg_positions: RefCell::new(Vec::new()),
+            young_fallback_positions: RefCell::new(Vec::new()),
             const_ptr_area: RefCell::new(None),
             const_ptr_indexes: Box::new(RefCell::new(Vec::new())),
         }
@@ -1424,10 +1436,10 @@ impl Trace {
         let index = self.max_num_inputargs;
         debug_assert!(self.inputargs.last().is_none_or(|prev| prev.index < index));
         let ia = InputArg::from_type_rc(tp, index);
-        if let Some(v) = value {
-            ia.set_value(v);
-        }
         self.inputargs.push(ia);
+        if let Some(v) = value {
+            self.set_concrete_at(index, v);
+        }
         self.inputarg_heapc
             .push(majit_trace::heapcache::HeapcRecord::default());
         self.max_num_inputargs += 1;
@@ -2268,6 +2280,7 @@ impl Trace {
         };
         if let Some(ia) = self.inputarg_at(position) {
             ia.set_value(value);
+            Self::note_position_list(&self.young_inputarg_positions, position, value);
             true
         } else if position < self.max_num_inputargs {
             false
@@ -2288,6 +2301,7 @@ impl Trace {
             .find(|op| op.pos().get().raw() == position && op.result_type() != Type::Void)
         {
             op.set_value(value);
+            Self::note_position_list(&self.young_fallback_positions, position, value);
             true
         } else {
             false
@@ -2323,10 +2337,26 @@ impl Trace {
         }
     }
 
-    /// Settle one slot's `Value::Ref` against a collection: moved to where
-    /// its referent went, cleared if the referent died.
-    fn settle_concrete_ref(vs: &ValueSlot, classify: &mut dyn FnMut(usize) -> Option<usize>) {
-        let Some(Value::Ref(gcref)) = vs.concrete.get() else {
+    fn note_position_list(list: &RefCell<Vec<u32>>, position: u32, value: Value) {
+        let Value::Ref(gcref) = value else {
+            return;
+        };
+        if gcref.is_null() || gcref == GcRef::NO_CONCRETE {
+            return;
+        }
+        let mut list = list.borrow_mut();
+        if !list.contains(&position) {
+            list.push(position);
+        }
+    }
+
+    /// Settle one `_resref` cell: moved to where its referent went, cleared
+    /// if the referent died (`invalidate_young_weakrefs`).
+    fn settle_resref_cell(
+        cell: &Cell<Option<Value>>,
+        classify: &mut dyn FnMut(usize) -> Option<usize>,
+    ) {
+        let Some(Value::Ref(gcref)) = cell.get() else {
             return;
         };
         if gcref.is_null() || gcref == GcRef::NO_CONCRETE {
@@ -2334,9 +2364,15 @@ impl Trace {
         }
         match classify(gcref.0) {
             Some(addr) if addr == gcref.0 => {}
-            Some(addr) => vs.concrete.set(Some(Value::Ref(GcRef(addr)))),
-            None => vs.concrete.set(None),
+            Some(addr) => cell.set(Some(Value::Ref(GcRef(addr)))),
+            None => cell.set(None),
         }
+    }
+
+    /// Settle one slot's `Value::Ref` against a collection: moved to where
+    /// its referent went, cleared if the referent died.
+    fn settle_concrete_ref(vs: &ValueSlot, classify: &mut dyn FnMut(usize) -> Option<usize>) {
+        Self::settle_resref_cell(&vs.concrete, classify);
     }
 
     /// Settle the value-slot `Value::Ref`s stamped since the last minor
@@ -2376,6 +2412,56 @@ impl Trace {
                 self.note_concrete_ref(slot as usize, v);
             }
         }
+        let young_ia = std::mem::take(&mut *self.young_inputarg_positions.borrow_mut());
+        for position in young_ia {
+            let Some(ia) = self.inputarg_at(position) else {
+                continue;
+            };
+            Self::settle_resref_cell(&ia.value, classify);
+            if let Some(v) = ia.get_value()
+                && let Value::Ref(gcref) = v
+                && in_nursery(gcref.0)
+            {
+                Self::note_position_list(&self.young_inputarg_positions, position, v);
+            }
+        }
+        let young_fb = std::mem::take(&mut *self.young_fallback_positions.borrow_mut());
+        for position in young_fb {
+            let Some(op) = self
+                .ops
+                .iter()
+                .find(|op| op.pos().get().raw() == position && op.result_type() != Type::Void)
+            else {
+                continue;
+            };
+            match op.get_value() {
+                Some(Value::Ref(gcref)) if !gcref.is_null() && gcref != GcRef::NO_CONCRETE => {
+                    match classify(gcref.0) {
+                        Some(addr) if addr == gcref.0 => {
+                            if in_nursery(gcref.0) {
+                                Self::note_position_list(
+                                    &self.young_fallback_positions,
+                                    position,
+                                    Value::Ref(gcref),
+                                );
+                            }
+                        }
+                        Some(addr) => {
+                            op.set_value(Value::Ref(GcRef(addr)));
+                            if in_nursery(addr) {
+                                Self::note_position_list(
+                                    &self.young_fallback_positions,
+                                    position,
+                                    Value::Ref(GcRef(addr)),
+                                );
+                            }
+                        }
+                        None => op.clear_value(),
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Settle every value-slot `Value::Ref` before a major collection sweeps
@@ -2386,6 +2472,42 @@ impl Trace {
     pub(crate) fn settle_concrete_refs(&self, classify: &mut dyn FnMut(usize) -> Option<usize>) {
         for vs in self.value_slots.iter() {
             Self::settle_concrete_ref(vs, classify);
+        }
+        for ia in self.inputargs.iter() {
+            Self::settle_resref_cell(&ia.value, classify);
+        }
+        let fallback = std::mem::take(&mut *self.young_fallback_positions.borrow_mut());
+        for position in fallback {
+            let Some(op) = self
+                .ops
+                .iter()
+                .find(|op| op.pos().get().raw() == position && op.result_type() != Type::Void)
+            else {
+                continue;
+            };
+            match op.get_value() {
+                Some(Value::Ref(gcref)) if !gcref.is_null() && gcref != GcRef::NO_CONCRETE => {
+                    match classify(gcref.0) {
+                        Some(addr) if addr == gcref.0 => {
+                            Self::note_position_list(
+                                &self.young_fallback_positions,
+                                position,
+                                Value::Ref(gcref),
+                            );
+                        }
+                        Some(addr) => {
+                            op.set_value(Value::Ref(GcRef(addr)));
+                            Self::note_position_list(
+                                &self.young_fallback_positions,
+                                position,
+                                Value::Ref(GcRef(addr)),
+                            );
+                        }
+                        None => op.clear_value(),
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -3573,6 +3695,38 @@ mod tests {
         let qd = recorded.as_quasi_immut_descr().unwrap();
         assert_eq!(qd.struct_ptr(), 0x2000);
         assert_eq!(qd.constantfieldbox(), Some(Value::Ref(GcRef(0x2000))));
+    }
+
+    #[test]
+    fn settle_young_concrete_refs_clears_dead_inputarg_dest_stamp() {
+        let mut rec = Trace::new();
+        let arg = rec.record_input_arg(Type::Ref);
+        rec.set_concrete_at(arg.raw(), Value::Ref(GcRef(0x5000)));
+        rec.settle_young_concrete_refs(
+            &mut |addr| {
+                if addr == 0x5000 { None } else { Some(addr) }
+            },
+            &|_| false,
+        );
+        assert_eq!(rec.concrete_at(arg.raw()), None);
+    }
+
+    #[test]
+    fn settle_young_concrete_refs_forwards_inputarg_dest_stamp() {
+        let mut rec = Trace::new();
+        let arg = rec.record_input_arg(Type::Ref);
+        rec.set_concrete_at(arg.raw(), Value::Ref(GcRef(0x5000)));
+        rec.settle_young_concrete_refs(
+            &mut |addr| {
+                if addr == 0x5000 {
+                    Some(0x6000)
+                } else {
+                    Some(addr)
+                }
+            },
+            &|_| false,
+        );
+        assert_eq!(rec.concrete_at(arg.raw()), Some(Value::Ref(GcRef(0x6000))));
     }
 
     #[test]

@@ -16662,7 +16662,7 @@ pub(crate) fn live_box_ref<Sym: WalkSym>(
     walker_concrete_ref_object(ctx, op).unwrap_or(copied)
 }
 
-/// The address `pin` tracks now, or `copied` when nothing was pinned (a
+/// The address `pin` tracks now, or `copied` when nothing was pinned (a)
 /// prebuilt or non-GC object, which never moves).
 pub(crate) fn pinned_obj(
     pin: &Option<majit_gc::shadow_stack::OwnerRootGuard>,

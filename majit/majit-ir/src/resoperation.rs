@@ -3480,6 +3480,12 @@ impl Op {
         self.descr.set_stamp_word(pack_stamp(v));
     }
 
+    /// Drop the stamped `_res*` (`history.py` `RefFrontendOp._resref = None`
+    /// when the referent died).
+    pub fn clear_value(&self) {
+        self.descr.set_stamp_word(STAMP_UNSET);
+    }
+
     /// `AbstractResOpOrInputArg._forwarded`.
     #[inline]
     pub fn forwarded(&self) -> &ForwardedSlot {

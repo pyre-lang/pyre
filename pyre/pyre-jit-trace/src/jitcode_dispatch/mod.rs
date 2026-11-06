@@ -5609,11 +5609,23 @@ pub(crate) fn helper_abort_resume_pc(
 /// has the callee `PyFrame` and converts in place
 /// (`run_blackhole_interp_to_cancel_tracing`). `AbortPermanentMarkerReached`
 /// at the root still owns the AbortPc flush.
+///
+/// A clean decline (`do_residual_call`) never stages an image.
+///
+/// A heap-writing residual already executed
+/// (`fbw_heap_writing_effect_count`) is unrewindable:
+/// `_compile_and_run_once` except `SwitchToBlackhole` always
+/// `run_blackhole_interp_to_cancel_tracing`. Entry replay would re-apply
+/// that residual. Journaled-only walks (heap-writing == 0) keep the
+/// legacy entry replay for missing-value classes.
 pub(crate) fn abort_image_latchable_for(
     error: &DispatchError,
     frames_materialized: bool,
     crossed_inline_subwalk: bool,
 ) -> bool {
+    if error.is_clean_decline() {
+        return false;
+    }
     let carrier_owned = !frames_materialized
         && matches!(
             error,
@@ -5624,7 +5636,8 @@ pub(crate) fn abort_image_latchable_for(
         );
     (error.leaves_complete_image()
         || (frames_materialized && error.can_convert_seeded_inline())
-        || crossed_inline_subwalk)
+        || crossed_inline_subwalk
+        || fbw_heap_writing_effect_count() > 0)
         && !carrier_owned
         && !abort_blackhole_latched()
 }
@@ -5860,6 +5873,11 @@ pub fn walk<Sym: WalkSym>(
                 // reports a MISSING value cannot be converted, because the
                 // image it would hand the blackhole is the one that just
                 // failed to resolve ([`DispatchError::leaves_complete_image`]).
+                //
+                // A heap-writing residual already ran: entry replay would
+                // re-apply it, so `abort_image_latchable_for` still stages
+                // the enclosing Python CALL image
+                // (`run_blackhole_interp_to_cancel_tracing`).
                 //
                 // A seeded inline whose abort is a modeling gap rather than a
                 // missing value latches even when the root allow-list has not

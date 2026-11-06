@@ -1562,27 +1562,60 @@ fn latch_test_helper_without_snapshot<Sym: WalkSym>(
 /// is populated (`make_result_of_lastop`).
 pub(crate) fn note_residual_pc_advanced<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
+    call_pc: usize,
     next_pc: usize,
 ) {
-    ctx.frame_state.borrow_mut().residual_call_next_pc = Some(next_pc);
+    let mut state = ctx.frame_state.borrow_mut();
+    state.residual_call_next_pc = Some(next_pc);
+    state.residual_call_pc = Some(call_pc);
 }
 
 pub(crate) fn clear_residual_pc_advanced<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) {
     let mut state = ctx.frame_state.borrow_mut();
+    // `live/` (and any other op that is not a new residual) must not
+    // drop the unpopulated CALL: the missing-value abort is the next
+    // opcode that reads dest (`setarrayitem_vable`).
+    if let Some(pc) = state.residual_call_pc.take() {
+        state.unpopulated_residual_call_pc = Some(pc);
+    }
     state.residual_call_next_pc = None;
     state.residual_dest_written = false;
+}
+
+pub(crate) fn abort_latch_resume_pc_from_state(
+    state: &WalkFrameStateData,
+    opcode_position: usize,
+) -> usize {
+    if state.residual_dest_written {
+        state.residual_call_next_pc.unwrap_or(opcode_position)
+    } else if let Some(call_pc) = state.residual_call_pc {
+        call_pc
+    } else if let Some(call_pc) = state.unpopulated_residual_call_pc {
+        call_pc
+    } else {
+        opcode_position
+    }
 }
 
 pub(crate) fn abort_latch_resume_pc<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     opcode_position: usize,
 ) -> usize {
-    let state = ctx.frame_state.borrow();
-    if state.residual_dest_written {
-        state.residual_call_next_pc.unwrap_or(opcode_position)
-    } else {
-        opcode_position
+    let resume = abort_latch_resume_pc_from_state(&ctx.frame_state.borrow(), opcode_position);
+    if fbw_debug_abort_enabled() {
+        let state = ctx.frame_state.borrow();
+        eprintln!(
+            "[abort-latch-resume] dest_written={} next={:?} call={:?} unpopulated={:?} \
+             opcode={} resume={}",
+            state.residual_dest_written,
+            state.residual_call_next_pc,
+            state.residual_call_pc,
+            state.unpopulated_residual_call_pc,
+            opcode_position,
+            resume,
+        );
     }
+    resume
 }
 
 pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
@@ -9673,7 +9706,24 @@ pub(crate) fn write_residual_call_result_to_dst<Sym: WalkSym>(
     if ctx.frame_state.borrow().residual_call_next_pc.is_some() {
         ctx.frame_state.borrow_mut().residual_dest_written = true;
     }
+    // A dest without `getref_base` / `getint` is not populated
+    // (`_copy_data_from_miframe`). Keep `residual_call_pc` so the next
+    // opcode's missing-value abort re-runs the CALL instead of storing
+    // NULL.
+    if dst_bank == 'v' || dest_concrete_is_reconstructable(concrete_for_shadow) {
+        let mut state = ctx.frame_state.borrow_mut();
+        state.residual_call_pc = None;
+        state.unpopulated_residual_call_pc = None;
+    }
     Ok(())
+}
+
+fn dest_concrete_is_reconstructable(value: ConcreteValue) -> bool {
+    match value {
+        ConcreteValue::Int(_) | ConcreteValue::Float(_) | ConcreteValue::Bool(_) => true,
+        ConcreteValue::Ref(r) => !r.is_null(),
+        ConcreteValue::Null => false,
+    }
 }
 
 /// What [`record_operator_tail_residual`] recorded.
@@ -11490,7 +11540,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         code[op.pc + 1 + descr_offset + 2] as usize
     };
     // `_get_opimpl_method` has already advanced `MIFrame.pc` past dest.
-    note_residual_pc_advanced(ctx, op.next_pc);
+    note_residual_pc_advanced(ctx, op.pc, op.next_pc);
 
     let ei = call_descr.get_extra_info();
     repair_carrier_call_ref_args(ctx, op.pc, ei.runtime_helper, &mut r_args);
@@ -12837,7 +12887,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     } else {
         code[op.pc + 1 + descr_offset + 2] as usize
     };
-    note_residual_pc_advanced(ctx, op.next_pc);
+    note_residual_pc_advanced(ctx, op.pc, op.next_pc);
 
     // RootScope::get remains a residual unless the translator proves its
     // slot/value pairing. `shadowcolor.expand_one_pop_roots` reconstructs a
@@ -14242,7 +14292,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
     } else {
         code[op.pc + 1 + descr_offset + 2] as usize
     };
-    note_residual_pc_advanced(ctx, op.next_pc);
+    note_residual_pc_advanced(ctx, op.pc, op.next_pc);
 
     // Flat argboxes = i_args ++ r_args ++ f_args (`boxes3` argcode order).
     let mut argboxes: Vec<OpRef> = Vec::with_capacity(i_args.len() + r_args.len() + f_args.len());
@@ -15170,12 +15220,48 @@ mod tests {
             "decoding dest does not populate it"
         );
         state.borrow_mut().residual_dest_written = true;
-        let resume = if state.borrow().residual_dest_written {
-            state.borrow().residual_call_next_pc.unwrap_or(453)
-        } else {
-            453
-        };
-        assert_eq!(resume, 460);
+        assert_eq!(abort_latch_resume_pc_from_state(&state.borrow(), 453), 460);
+    }
+
+    /// A dest without `getref_base` is not populated. The following opcode's
+    /// missing-value abort re-runs the CALL (`_copy_data_from_miframe`).
+    #[test]
+    fn abort_latch_resume_pc_reruns_unpopulated_residual_on_next_opcode() {
+        let state = WalkFrameState::default();
+        state.borrow_mut().current_op_pc = Some(CurrentOpPc {
+            pc: 1134,
+            effects_at_step: 0,
+        });
+        state.borrow_mut().residual_call_next_pc = Some(1137);
+        state.borrow_mut().residual_call_pc = Some(1134);
+        state.borrow_mut().residual_dest_written = true;
+        assert_eq!(
+            abort_latch_resume_pc_from_state(&state.borrow(), 1134),
+            1137
+        );
+        {
+            let mut data = state.borrow_mut();
+            data.unpopulated_residual_call_pc = data.residual_call_pc.take();
+            data.residual_call_next_pc = None;
+            data.residual_dest_written = false;
+        }
+        assert_eq!(
+            abort_latch_resume_pc_from_state(&state.borrow(), 1137),
+            1134
+        );
+        {
+            let mut data = state.borrow_mut();
+            if let Some(pc) = data.residual_call_pc.take() {
+                data.unpopulated_residual_call_pc = Some(pc);
+            }
+            data.residual_call_next_pc = None;
+            data.residual_dest_written = false;
+        }
+        assert_eq!(
+            abort_latch_resume_pc_from_state(&state.borrow(), 1137),
+            1134,
+            "live/ must not drop the unpopulated CALL"
+        );
     }
 
     /// A banks-only latch publishes one raw `AbortedWalkImage` and leaves the

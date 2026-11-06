@@ -142,11 +142,47 @@ pub(crate) fn note_empty_twin_fallback(site: &'static str, jitcode_index: i32, j
     }
 }
 
+/// JitCode ops that pause a Python caller (`MIFrame.pc` immediately after
+/// the call, `pyjitpl.py` `get_list_of_active_boxes` `in_a_call` /
+/// `after_residual_call`). `cond_call` is not one: it is not a Python CALL.
+fn python_call_jit_op(opname: &str) -> bool {
+    opname.starts_with("residual_call")
+        || opname.starts_with("inline_call")
+        || opname.starts_with("call_assembler")
+        || opname.starts_with("call_may_force")
+        || opname.starts_with("recursive_call")
+}
+
+/// Python resume pc when `pc` is the byte immediately after a Python-call
+/// jitcode op (`inline_call_return_marker` / trailing `-live-`).
+///
+/// The `forward_py_pc` twin names the CALL (or a cache word inside it).
+/// Interpreter hand-off uses `next_instr`-style lasti, so the coordinate is
+/// [`crate::pyjitpl::resume_py_pc_after_python_call`] of the CALL's
+/// containing Python pc — cache words skip forward, a CALL opcode
+/// fallthroughs, and a run already re-keyed onto the next opcode stays.
+fn after_call_resume_py_pc(jitcode_index: i32, pc: usize) -> Option<u32> {
+    let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index)?;
+    if pjc.code_ptr.is_null() || crate::state::jitcode_is_transparent_helper(jitcode_index) {
+        return None;
+    }
+    let call = crate::jitcode_runtime::decoded_ops(pjc.jitcode.code.as_slice())
+        .find(|op| op.next_pc == pc && python_call_jit_op(op.opname))?;
+    let call_py = containing_py_pc_for_jitcode_pc(&pjc.metadata, call.pc) as usize;
+    let code = unsafe { &*pjc.code_ptr };
+    Some(crate::pyjitpl::resume_py_pc_after_python_call(code, call_py) as u32)
+}
+
 /// Forward Python instruction coordinate for a carried resume JitCode word.
 ///
-/// Reads the codewriter-built `forward_py_pc` twin first. Empty-twin JitCodes
-/// and negative sentinel words resolve through the trivia-normalized containing
-/// lookup.
+/// A word that is the byte after a Python-call jitcode op is the caller's
+/// `in_a_call` / `after_residual_call` resume (`MIFrame.pc`). That maps to
+/// the CALL's semantic fallthrough, not the containing CALL / cache word
+/// the `forward_py_pc` twin reports.
+///
+/// Every other word reads the codewriter-built `forward_py_pc` twin first.
+/// Empty-twin JitCodes and negative sentinel words resolve through the
+/// trivia-normalized containing lookup.
 ///
 /// A negative word (`NO_JITCODE_PC` `-1`) would cast to a huge `usize` twin
 /// key and floor-resolve to a bogus predecessor entry, so it is delegated
@@ -155,6 +191,9 @@ pub(crate) fn note_empty_twin_fallback(site: &'static str, jitcode_index: i32, j
 pub fn resume_py_pc_for_jitcode_word(jitcode_index: i32, pc_word: i32) -> i32 {
     if pc_word < 0 {
         return trivia_normalized_py_pc_for_jitcode_pc(jitcode_index, pc_word);
+    }
+    if let Some(ft) = after_call_resume_py_pc(jitcode_index, pc_word as usize) {
+        return ft as i32;
     }
     match crate::state::pyjitcode_for_jitcode_index(jitcode_index)
         .and_then(|pjc| pjc.forward_py_pc_for_jitcode_pc(pc_word as usize))

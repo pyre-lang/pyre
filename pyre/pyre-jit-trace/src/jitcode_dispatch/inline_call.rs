@@ -8891,6 +8891,99 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
     })
 }
 
+/// Live `PyObjectRef`s for a wrapper `&[PyObjectRef]`. `Null` is `PY_NULL`.
+/// A missing shadow declines the executed allocation and leaves the array
+/// virtual, which is enough for a body that only `getarrayitem`s.
+fn wrapper_args_item_pointers<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    wrapper_items: &[OpRef],
+    wrapper_item_concretes: &[ConcreteValue],
+) -> Option<Vec<pyre_object::PyObjectRef>> {
+    if wrapper_items.len() != wrapper_item_concretes.len() {
+        return None;
+    }
+    let mut items = Vec::with_capacity(wrapper_items.len());
+    for (&item, concrete) in wrapper_items.iter().zip(wrapper_item_concretes) {
+        if let Some(obj) = walker_concrete_ref_object(ctx, item) {
+            items.push(obj);
+            continue;
+        }
+        match *concrete {
+            ConcreteValue::Ref(value) if !value.is_null() => items.push(value),
+            ConcreteValue::Null => items.push(pyre_object::PY_NULL),
+            _ => return None,
+        }
+    }
+    Some(items)
+}
+
+/// Record `NewArrayClear` for a wrapper `&[PyObjectRef]` and execute the
+/// allocation. `opimpl_new_array_clear` records with `resvalue`; a residual
+/// that rebuilds the slice (`object_gcarray_slice`) reads that word.
+fn emit_wrapper_args_array<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    wrapper_items: &[OpRef],
+    wrapper_item_concretes: &[ConcreteValue],
+) -> (OpRef, ConcreteValue) {
+    let array_descr = crate::state::pyobject_gcarray_descr();
+    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
+    let item_ptrs = wrapper_args_item_pointers(ctx, wrapper_items, wrapper_item_concretes);
+    let (args_array, array_concrete) = if wrapper_items.is_empty() {
+        let args_array = ctx.trace_ctx.record_op_with_descr_value(
+            OpCode::NewArrayClear,
+            &[len],
+            array_descr.clone(),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(0))),
+        );
+        (args_array, ConcreteValue::Null)
+    } else if let Some(ptrs) = item_ptrs {
+        let block = unsafe { pyre_object::object_array::alloc_list_items_block_gc(&ptrs) };
+        if block.is_null() {
+            let args_array = ctx.trace_ctx.record_op_with_descr(
+                OpCode::NewArrayClear,
+                &[len],
+                array_descr.clone(),
+            );
+            (args_array, ConcreteValue::Null)
+        } else {
+            let _block_roots = pyre_object::gc_roots::push_roots();
+            let block_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(block as pyre_object::PyObjectRef);
+            let args_array = ctx.trace_ctx.record_op_with_descr_value(
+                OpCode::NewArrayClear,
+                &[len],
+                array_descr.clone(),
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(block as usize))),
+            );
+            let live = pyre_object::gc_roots::shadow_stack_get(block_slot);
+            ctx.trace_ctx.set_opref_concrete(
+                args_array,
+                majit_ir::Value::Ref(majit_ir::GcRef(live as usize)),
+            );
+            (args_array, ConcreteValue::Ref(live))
+        }
+    } else {
+        let args_array =
+            ctx.trace_ctx
+                .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
+        (args_array, ConcreteValue::Null)
+    };
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .new_array(args_array, len, true);
+    for (index, &item) in wrapper_items.iter().enumerate() {
+        let index = ctx.trace_ctx.const_int(index as i64);
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetarrayitemGc,
+            &[args_array, index, item],
+            array_descr.clone(),
+        );
+        ctx.trace_ctx
+            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
+    }
+    (args_array, array_concrete)
+}
+
 /// Stamp wrapper arguments, walk the generated body, restore the caller
 /// frame, and handle SubReturn / SubRaise.  Shared by CALL
 /// (`try_walker_inline_builtin_call`) and LOAD_ATTR
@@ -8945,26 +9038,8 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         }
     }
 
-    let array_descr = crate::state::pyobject_gcarray_descr();
-    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
-    let args_array =
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .new_array(args_array, len, true);
-    for (index, &item) in wrapper_items.iter().enumerate() {
-        let index = ctx.trace_ctx.const_int(index as i64);
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[args_array, index, item],
-            array_descr.clone(),
-        );
-        // The wrapper reads its `&[PyObjectRef]` argument through this same
-        // ArrayDescr, so its getarrayitem returns the live CALL operand.
-        ctx.trace_ctx
-            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
-    }
+    let (args_array, args_array_concrete) =
+        emit_wrapper_args_array(ctx, wrapper_items, wrapper_item_concretes);
 
     let saved_vable = if !nested_helper && owns_virtualizable_shadow {
         let saved = crate::trace_opcode::save_vable_resume_scalars(ctx.trace_ctx);
@@ -9068,7 +9143,7 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         &[],
         &[],
         &[args_array],
-        &[ConcreteValue::Null],
+        &[args_array_concrete],
         &[],
     );
     // The helper's level ends with its walk.  A type-call `__init__` walked
@@ -9525,24 +9600,8 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         }
     }
 
-    let array_descr = crate::state::pyobject_gcarray_descr();
-    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
-    let args_array =
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .new_array(args_array, len, true);
-    for (index, &item) in wrapper_items.iter().enumerate() {
-        let index = ctx.trace_ctx.const_int(index as i64);
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[args_array, index, item],
-            array_descr.clone(),
-        );
-        ctx.trace_ctx
-            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
-    }
+    let (args_array, args_array_concrete) =
+        emit_wrapper_args_array(ctx, &wrapper_items, &wrapper_item_concretes);
 
     let saved_vable = if !nested_helper && sym.owns_virtualizable_shadow() {
         let saved = crate::trace_opcode::save_vable_resume_scalars(ctx.trace_ctx);
@@ -9604,7 +9663,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         &[],
         &[],
         &[args_array],
-        &[ConcreteValue::Null],
+        &[args_array_concrete],
         &[],
     );
     drop(helper_frame);

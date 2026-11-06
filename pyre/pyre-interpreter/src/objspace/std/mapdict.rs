@@ -3342,19 +3342,35 @@ pub unsafe fn store_attr_add_commit(
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[w_obj, w_value]);
     let (_instance_guard, _) = instance_lock(pyre_object::gc_roots::shadow_stack_get(base));
-    let w_obj = pyre_object::gc_roots::shadow_stack_get(base);
-    let w_value = pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let mut inst = unsafe { mapdict_carrier(w_obj) };
-    debug_assert!(std::ptr::eq(inst._get_mapdict_map(), resolved.map));
+    debug_assert!({
+        let w_obj = pyre_object::gc_roots::shadow_stack_get(base);
+        std::ptr::eq(
+            unsafe { mapdict_carrier(w_obj) }._get_mapdict_map(),
+            resolved.map,
+        )
+    });
     // mapdict.py with `storage_needed() > _mapdict_storage_length()`,
     // which `store_attr_add_fast_path` proved by construction.
     match resolved.unbox_type {
-        None => inst._set_mapdict_increase_storage1(resolved.new_map, w_value),
+        None => {
+            let w_obj = pyre_object::gc_roots::shadow_stack_get(base);
+            let w_value = pyre_object::gc_roots::shadow_stack_get(base + 1);
+            let mut inst = unsafe { mapdict_carrier(w_obj) };
+            inst._set_mapdict_increase_storage1(resolved.new_map, w_value);
+        }
         // `switch_map_and_write_increase_storage1`'s `firstunwrapped` arm: a
         // fresh one-element longlong list occupies the new slot.
+        // `erase_unboxed` returns a block nothing references yet
+        // (`alloc_typed_items_block`); PyPy keeps that `unboxed` local as a
+        // livevar across `_set_mapdict_increase_storage1`. The instance is a
+        // nursery `w_instance_new`, so it is re-read after the allocating call.
         Some(typ) => {
+            let w_value = pyre_object::gc_roots::shadow_stack_get(base + 1);
             let val = unsafe { unbox_value(typ, w_value) };
             let unboxed = erase_unboxed(&[val]);
+            let unboxed = pyre_object::gc_roots::pin_root(unboxed);
+            let w_obj = pyre_object::gc_roots::shadow_stack_get(base);
+            let mut inst = unsafe { mapdict_carrier(w_obj) };
             inst._set_mapdict_increase_storage1(resolved.new_map, unboxed);
         }
     }

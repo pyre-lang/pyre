@@ -7129,13 +7129,16 @@ fn run_perfn_walk<Sym: WalkSym>(
     // the walk that stopped with every live register bound;
     // `can_convert_seeded_inline` is the seeded-inline modeling-gap family
     // the WalkAbort adopt gate already accepts; a multi-frame latch is the
-    // whole handoff.  Only an image whose banks were written for the
-    // Python frame is converted (`convert_and_run_from_pyjitpl` copies
-    // live `MIFrame` boxes).  A latch that crossed a failed helper
+    // whole handoff.  A single-frame latch after a heap-writing residual
+    // is the same handoff: `_compile_and_run_once` except `SwitchToBlackhole`
+    // always `run_blackhole_interp_to_cancel_tracing`, and entry replay
+    // would re-apply that residual.  Only an image whose banks were written
+    // for the Python frame is converted (`convert_and_run_from_pyjitpl`
+    // copies live `MIFrame` boxes).  A latch that crossed a failed helper
     // sub-walk is not such an image: `try_adopt_single_frame_blackhole`
     // already declines it (callee pc vs caller banks), and this
-    // predicate must not republish it.  An incomplete image is discarded
-    // (`discard_staged_abort`). Convert
+    // predicate must not republish it when heap-writing is zero.  An
+    // incomplete image is discarded (`discard_staged_abort`). Convert
     // (`run_python_portal_abort_blackhole` → `convert_and_run_from_pyjitpl`)
     // needs a published latch; without one the caller takes the
     // deadframe `resume_in_blackhole` (`resume.py` `blackhole_from_resumedata`).
@@ -7154,6 +7157,8 @@ fn run_perfn_walk<Sym: WalkSym>(
             error.leaves_complete_image()
                 || error.can_convert_seeded_inline()
                 || crate::jitcode_dispatch::multi_frame_blackhole_is_latched()
+                || (crate::jitcode_dispatch::abort_blackhole_latched()
+                    && crate::jitcode_dispatch::fbw_heap_writing_effect_count() > 0)
         }
         _ => crate::jitcode_dispatch::abort_blackhole_latched(),
     };
