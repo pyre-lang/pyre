@@ -2164,29 +2164,6 @@ pub unsafe fn get_and_call_function(
     crate::call::call_function_impl_result(w_impl, reloaded.as_slice())
 }
 
-/// One-word residual ABI for [`get_and_call_function`].
-///
-/// `&[PyObjectRef]` arrives as one length-prefixed `GcTypedArray` word
-/// (`publish_roots_jit_abi`). `PyResult` is sret, so HELPER_FNADDRS skips
-/// the raw item (`FatPointerArg` + `ResultReturn`) and the codewriter
-/// mints a symbolic hash. Blackhole resume of `isinstance` then declines
-/// that hash (`reject_unresolved_call`), CALL_ASSEMBLER returns 0, and
-/// GuardClass on the dest SIGSEGVs. The callee keeps its graph; this is
-/// the address `getfunctionptr` would have supplied.
-#[inline(never)]
-pub extern "C" fn get_and_call_function_jit_abi(
-    w_descr: PyObjectRef,
-    w_obj: PyObjectRef,
-    w_type: PyObjectRef,
-    array: *const pyre_object::object_array::GcTypedArray,
-) -> PyObjectRef {
-    let args = pyre_object::gc_roots::gcarray_ref_items(array);
-    match unsafe { get_and_call_function(w_descr, w_obj, w_type, &args) } {
-        Ok(result) => result,
-        Err(error) => crate::runtime_ops::jit_publish_residual_error_ref(error),
-    }
-}
-
 /// `isinstance(w_obj, Coroutine) or gen_is_coroutine(w_obj)` from PyPy
 /// `generator.py`.  Only a GeneratorIterator may use the
 /// `CO_ITERABLE_COROUTINE` marker; native coroutines have their own type.

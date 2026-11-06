@@ -3188,24 +3188,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::build_list_from_refs",
         crate::runtime_ops::build_list_from_refs_jit_abi,
     );
-    // `&[PyObjectRef]` arrives as one length-prefixed array word; `PyResult`
-    // is sret. HELPER_FNADDRS skips FatPointerArg+ResultReturn, so bind the
-    // word-ABI bridge.
-    cpa2!(
-        &mut entries,
-        "pyre_interpreter::call::call_function_impl_result",
-        "pyre_interpreter::call_function_impl_result",
-        crate::call::call_function_impl_result_jit_abi,
-    );
-    // `&[PyObjectRef]` + `PyResult` is FatPointerArg+ResultReturn; the
-    // raw item is skipped and `isinstance` residual-calls this path
-    // (`abstractinst.py` `__instancecheck__`). Bind the word-ABI bridge.
-    cpa4!(
-        &mut entries,
-        "pyre_interpreter::baseobjspace::get_and_call_function",
-        "pyre_interpreter::get_and_call_function",
-        crate::baseobjspace::get_and_call_function_jit_abi,
-    );
     pa1!(
         &mut entries,
         "pyre_object::bytesobject::jit_w_bytes_from_u8",
@@ -8218,6 +8200,10 @@ mod tests {
             bindings["pyre_interpreter::baseobjspace::get_and_call_function"],
             get_and_call
         );
+        assert_eq!(
+            bindings["pyre_interpreter::get_and_call_function"],
+            get_and_call
+        );
         let raw_get = crate::baseobjspace::get_and_call_function as *const () as usize as i64;
         assert_ne!(
             get_and_call, raw_get,
@@ -8229,6 +8215,10 @@ mod tests {
         let call_impl = call_impl as *const () as usize as i64;
         assert_eq!(
             bindings["pyre_interpreter::call::call_function_impl_result"],
+            call_impl
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::call_function_impl_result"],
             call_impl
         );
         let raw_call = crate::call::call_function_impl_result as *const () as usize as i64;
@@ -10053,7 +10043,9 @@ mod tests {
             close, raw_close,
             "must not publish the raw &RootScope item; residual push_roots returns a Box pointer"
         );
-        let call_impl = crate::call::call_function_impl_result_jit_abi as *const () as usize as i64;
+        let call_impl: extern "C" fn(i64, i64) -> i64 =
+            crate::call::__majit_call_target_call_function_impl_result;
+        let call_impl = call_impl as *const () as usize as i64;
         assert_eq!(
             bindings["pyre_interpreter::call::call_function_impl_result"],
             call_impl

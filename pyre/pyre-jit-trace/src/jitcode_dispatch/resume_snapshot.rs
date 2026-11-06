@@ -1356,66 +1356,11 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     };
     let arm_py_pc = forward_snapshot_py_pc(ctx.outer_jitcode_index, arm_pc_word)?;
-    // `generate_guard(resumepc=orgpc)`: the walker never crosses `set_orgpc`,
-    // so a helper sub-walk's vable `last_instr` / `valuestackdepth` can sit
-    // at the loop-header image. Publish the same scalars the FBW path
-    // writes (`MIFrame::publish_last_instr_to_vable`) before snapshotting.
-    // `valuestackdepth` uses the CALL jit_pc depth `run_orthodox_helper_subwalk`
-    // mirrored at enter (`nlocals + depth_trivia_for_jitcode_pc(call)`).
-    let saved_vable = if ctx.fbw_mode.transparent_helper_subwalk {
-        let saved = crate::trace_opcode::save_vable_resume_scalars(ctx.trace_ctx);
-        let last_instr_value = arm_py_pc as i64 - 1;
-        let last_instr_op = ctx.trace_ctx.const_int(last_instr_value);
-        crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
-            ctx.trace_ctx,
-            "last_instr",
-            last_instr_op,
-            Value::Int(last_instr_value),
-        );
-        let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
-        if !caller_sym_ptr.is_null() {
-            let caller_sym = unsafe { &*caller_sym_ptr };
-            if caller_sym.owns_virtualizable_shadow() && !caller_sym.jitcode().is_null() {
-                let vsd_value = unsafe {
-                    let jc = &*caller_sym.jitcode();
-                    if jc.payload.code_ptr.is_null() {
-                        caller_sym.valuestackdepth() as i64
-                    } else {
-                        let call_pc = match ctx.entry_py_pc {
-                            EntryPyPc::Jit(pc) => pc,
-                            EntryPyPc::Py(_) => arm_pc_word as usize,
-                        };
-                        let depth = if jc.payload.depth_trivia_populated() {
-                            jc.payload.depth_trivia_for_jitcode_pc(call_pc)
-                        } else {
-                            crate::liveness::liveness_for(jc.payload.code_ptr)
-                                .depth_at_py_pc()
-                                .get(arm_py_pc as usize)
-                                .copied()
-                        };
-                        match depth {
-                            Some(d) => (caller_sym.nlocals() + d as usize) as i64,
-                            None => caller_sym.valuestackdepth() as i64,
-                        }
-                    }
-                };
-                let vsd_op = ctx.trace_ctx.const_int(vsd_value);
-                crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
-                    ctx.trace_ctx,
-                    "valuestackdepth",
-                    vsd_op,
-                    Value::Int(vsd_value),
-                );
-            }
-        }
-        Some(saved)
-    } else {
-        None
-    };
+    // `capture_resumedata` snapshots `virtualizable_boxes` as
+    // `_opimpl_setfield_vable` / `write_box_at` left them; the blackhole
+    // re-executes from the guard and writes the arm's own vsd
+    // (`bhimpl_setfield_vable_i`).
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
-    if let Some(saved) = saved_vable {
-        crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved);
-    }
     let active = std::mem::take(&mut ctx.frame_state.borrow_mut().outer_active_boxes);
     publish_single_frame_snapshot(
         ctx,
