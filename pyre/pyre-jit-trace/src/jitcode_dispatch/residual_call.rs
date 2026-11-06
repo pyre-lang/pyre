@@ -73,6 +73,16 @@ static BINARY_VALUE_FROM_TAG_FNADDRS: std::sync::LazyLock<std::collections::Hash
 static COMPARE_VALUE_FROM_TAG_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
     std::sync::LazyLock::new(|| fnaddr_set(|name| name.ends_with("compare_value_from_tag")));
 
+/// `descroperation.py get_and_call_function`. The published address is the
+/// `getfunctionptr` word-ABI trampoline, not the raw slice/Result item.
+static GET_AND_CALL_FUNCTION_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| fnaddr_set(|name| name.ends_with("get_and_call_function")));
+
+/// Whether `fnaddr` is `get_and_call_function`'s residual trampoline.
+pub(crate) fn is_get_and_call_function_residual(fnaddr: i64) -> bool {
+    GET_AND_CALL_FUNCTION_FNADDRS.contains(&fnaddr)
+}
+
 /// `space.newutf8` / `w_str_from_storage_and_length`, identified by path.
 static NEWUTF8_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
     std::sync::LazyLock::new(|| fnaddr_set(|name| name.ends_with("w_str_from_storage_and_length")));
@@ -11820,6 +11830,16 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         if let Some(inlined) = try_walker_inline_int_slot(ctx, op, &r_args, dst_bank, dst)? {
             return Ok(inlined);
         }
+    }
+
+    // `space.index` (`descroperation.py _index`) residualizes
+    // `get_and_call_function` of `__index__`. Helper-innermost walks that
+    // call inside `binary_slice_values_inner`; inline the body with the
+    // same `try_walker_inline_index` `range` / `complex` already use.
+    if let Some(inlined) = try_walker_inline_get_and_call_index(
+        ctx, op, code, funcptr, &r_args, call_descr, dst, dst_bank,
+    )? {
+        return Ok(inlined);
     }
 
     // #62 slice (3c): attempt full-body-walk inline of a user-function call

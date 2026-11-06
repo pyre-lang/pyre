@@ -16610,7 +16610,7 @@ pub(crate) struct IndexInlineCandidate {
     concrete_arg: pyre_object::PyObjectRef,
     w_type: pyre_object::PyObjectRef,
     version_tag: u64,
-    method: pyre_object::PyObjectRef,
+    pub(crate) method: pyre_object::PyObjectRef,
     attr_cell: pyre_object::PyObjectRef,
     w_code: *const (),
     nparams: usize,
@@ -16650,8 +16650,15 @@ pub(crate) fn prepare_walker_inline_index<Sym: WalkSym>(
     // Every other lever that inlines app-level Python out of a specializer
     // declines once it is itself inside a callee sub-walk — `try_walker_inline_
     // type_call`, `..._property_get`, `..._property_set` and
-    // `..._subscr_getitem` all lead with this.
-    if !ctx.is_authoritative_executor || ctx.fbw_mode.inline_subwalk {
+    // `..._subscr_getitem` all lead with this. A helper-body walk is
+    // `space.index` hitting `get_and_call_function` (`descroperation.py
+    // _index`); that is the same call this prepare already inlines from
+    // `range` / `complex`.
+    if !ctx.is_authoritative_executor {
+        index_prepare_diag("not-authoritative-or-subwalk");
+        return None;
+    }
+    if ctx.fbw_mode.inline_subwalk && !ctx.fbw_mode.transparent_helper_subwalk {
         index_prepare_diag("not-authoritative-or-subwalk");
         return None;
     }
@@ -16832,6 +16839,67 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         (None, None) => Ok(None),
         _ => Err(DispatchError::callee_inline_unsupported(op.pc)),
     }
+}
+
+/// Inline `get_and_call_function` of a user `__index__` (`descroperation.py
+/// _index` / `space.index`).
+///
+/// Helper-innermost walks `binary_slice_values_inner` through
+/// `eval_slice_index` into that residual. The word-ABI trampoline is a
+/// 4-ref `CallMayForceR` (`getfunctionptr`); inlining the body records
+/// the instance read instead of leaving the call.
+pub(crate) fn try_walker_inline_get_and_call_index<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(funcptr) else {
+        return Ok(None);
+    };
+    if !super::residual_call::is_get_and_call_function_residual(addr) {
+        return Ok(None);
+    }
+    // `get_and_call_function(w_descr, w_obj, w_type, args_w)`: `args_w`
+    // interned as one GC-array word. `space.index` passes `&[]`.
+    let [method_op, obj_op, _type_op, extras_op] = r_args else {
+        return Ok(None);
+    };
+    let Some(len_op) = ctx.trace_ctx.heap_cache().arraylen(*extras_op) else {
+        return Ok(None);
+    };
+    if !matches!(
+        len_op.inline_const_to_value(),
+        Some(majit_ir::Value::Int(0))
+    ) {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, *obj_op) else {
+        return Ok(None);
+    };
+    let Some(concrete_method) = walker_concrete_ref_object(ctx, *method_op) else {
+        return Ok(None);
+    };
+    let Some(candidate) = prepare_walker_inline_index(ctx, *obj_op, concrete_obj) else {
+        return Ok(None);
+    };
+    if candidate.method != concrete_method {
+        return Ok(None);
+    }
+    let Some((result, _)) =
+        try_walker_inline_index(ctx, op, code, funcptr, r_args, call_descr, dst, candidate)?
+    else {
+        return Ok(None);
+    };
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
+    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
 /// Inline `obj[key]` into the receiver type's Python `__getitem__`.
