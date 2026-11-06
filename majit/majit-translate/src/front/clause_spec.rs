@@ -2810,6 +2810,7 @@ mod tests {
     fn spec_request(fn_id: u64, leaf: &str) -> SpecRequest {
         SpecRequest {
             fn_id,
+            fn_path: leaf.to_string(),
             leaf: leaf.to_string(),
             trait_refs: Vec::new(),
             types: Vec::new(),

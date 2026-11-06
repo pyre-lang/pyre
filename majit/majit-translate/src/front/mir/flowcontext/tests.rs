@@ -73,16 +73,10 @@ fn simplify_lowered_graph(
     graph: &mut FunctionGraph,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     sweep_dead_vars: bool,
-    guard_words: &std::collections::HashSet<Variable>,
+    _guard_words: &std::collections::HashSet<Variable>,
 ) {
-    simplify_lowered_graph_expanding(
-        graph,
-        struct_field_attrs,
-        sweep_dead_vars,
-        guard_words,
-        &|_, _| None,
-    )
-    .expect("inline-struct expansion is off");
+    simplify_lowered_graph_expanding(graph, struct_field_attrs, sweep_dead_vars, &|_, _| None)
+        .expect("inline-struct expansion is off");
 }
 
 /// A missing Charon layout on `GcEntries { length: usize, items: [T; 0] }`

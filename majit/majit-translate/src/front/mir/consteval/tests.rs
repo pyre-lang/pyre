@@ -5,9 +5,13 @@ use super::{
 
 use crate::flowspace::model::ConstValue;
 
-use crate::model::{CallTarget, OpKind};
+use crate::front::mir::tyref_to_value_type;
+use crate::model::{CallTarget, OpKind, ValueType};
 
-use majit_charon_reader::{Llbc, ullbc::NameSeg};
+use majit_charon_reader::{
+    Llbc,
+    ullbc::{NameSeg, TyRef},
+};
 
 use crate::front::mir::tests::{
     const_artifact, empty_generics, empty_llbc, fixture_llbc, init_fun, item_meta_json,

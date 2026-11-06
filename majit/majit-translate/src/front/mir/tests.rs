@@ -28636,6 +28636,7 @@ pub(in crate::front::mir) fn some_ctor_shape() -> super::AggregateShape {
             raw_u8: false,
             str_value: false,
             ty: ValueType::Int,
+            skip_signed_paint: false,
         }],
         raw: false,
     })
@@ -28686,6 +28687,7 @@ pub(in crate::front::mir) fn ok_ctor_shape() -> super::AggregateShape {
             raw_u8: false,
             str_value: false,
             ty: ValueType::Int,
+            skip_signed_paint: false,
         }],
         raw: false,
     })
