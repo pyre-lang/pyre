@@ -3014,19 +3014,9 @@ fn describe_declared_funcobj(
     key: &FunctionPathKey,
 ) -> Option<Rc<FunctionEntry>> {
     use crate::decline::gate::CALL_REGISTRY as REGISTRY_GATE;
-    let foreign_callables = registry_foreign_callables(registry);
-    // A crate-qualified lookup key still names the GraphStore funcobj
-    // (`free_function_alias_paths` / `canonical_dedup_key`). Direct
-    // `declared_funcobj(key.to_call_path())` misses that spelling and
-    // the next `get_or_register_with_func` would mint a second
-    // GraphFunc (`bookkeeper.py getdesc` `id(pyobj)`).
-    let path = graphstore_path_for_lookup_key(store, key, &foreign_callables)
-        .filter(|path| store.declared_funcobj(path).is_some())
-        .or_else(|| {
-            let path = key.to_call_path();
-            store.declared_funcobj(&path).map(|_| path)
-        })?;
+    let path = key.to_call_path();
     let graph = store.declared_funcobj(&path)?;
+    let foreign_callables = registry_foreign_callables(registry);
     if let Some(reason) = registration_decline(&path.segments)
         .or_else(|| registration_decline(&canonical_dedup_key(&path, &foreign_callables)))
         .or_else(|| registration_decline_graph_origin(graph.as_ref(), &foreign_callables))
@@ -3034,23 +3024,12 @@ fn describe_declared_funcobj(
         crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
         return None;
     }
-    // Populate skipped this declared funcobj. A prior lookup of another
-    // GraphStore alias already minted the FunctionDesc; reuse it
-    // (`bookkeeper.py getdesc` / `description.py FunctionDesc.cachedgraph`).
-    if let Some(existing) = existing_graphstore_entry(store, registry, &path) {
-        alias_key_onto_entry(registry, key, &existing);
-        return Some(existing);
-    }
     let signature = crate::codewriter::call::StoreCore::signature_from_graph(&graph);
     let entry = registry.get_or_register_with_func(
         key.clone(),
         signature.clone(),
         source_graph_func(&graph),
     );
-    alias_key_onto_entry(registry, key, &entry);
-    for alias in store.alias_paths(&path) {
-        alias_key_onto_entry(registry, &FunctionPathKey::from(&alias), &entry);
-    }
     publish_source_signature(&graph, &entry);
     seed_declared_funcptr_type(&graph, &entry);
     let body = store.body(&path).expect("a declared path names a funcobj");
@@ -9737,56 +9716,6 @@ mod tests {
                 Some(false)
             );
         });
-    }
-
-    /// Declared look-inside funcobjs skip populate. First `lookup` of
-    /// spelling A mints the FunctionDesc (`bookkeeper.py getdesc`).
-    /// First `lookup` of spelling B of the same GraphKey must reuse it
-    /// so `recursivecall` notify and the Regular FRESH adapter share
-    /// `FunctionDesc.cachedgraph` (`annrpython.py recursivecall`).
-    #[test]
-    fn describe_declared_funcobj_reuses_function_desc_across_graphstore_aliases() {
-        use crate::codewriter::call::{DeclaredFuncObj, FuncObjDeclarations, GraphTransform};
-        use crate::model::LazyGraph;
-
-        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
-        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
-        let mut graph = empty_return_graph("unit_callee");
-        graph.source_identity = Some("mod::imp::unit_callee".into());
-        let path_a =
-            crate::parse::CallPath::from_segments(["crate_root", "mod", "imp", "unit_callee"]);
-        let path_b = crate::parse::CallPath::from_segments(["mod", "imp", "unit_callee"]);
-        let decls = FuncObjDeclarations::default();
-        decls.push(DeclaredFuncObj {
-            path: path_a.clone(),
-            graph: LazyGraph::built(graph.clone()),
-            transform: GraphTransform::default(),
-        });
-        let mut graphs = crate::codewriter::call::GraphStore::default();
-        graphs.use_declarations(decls);
-        graphs.insert(path_b.clone(), std::rc::Rc::new(graph));
-        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
-        assert!(
-            registry
-                .lookup_existing(&FunctionPathKey::from(&path_a))
-                .is_none(),
-            "declared look-inside skips populate"
-        );
-        let entry_a = registry
-            .lookup(&FunctionPathKey::from(&path_a))
-            .expect("getdesc spelling A");
-        let entry_b = registry
-            .lookup(&FunctionPathKey::from(&path_b))
-            .expect("getdesc spelling B");
-        assert!(
-            Rc::ptr_eq(&entry_a, &entry_b),
-            "GraphStore aliases of one GraphKey are one FunctionDesc (`bookkeeper.py getdesc`)"
-        );
-        assert_eq!(
-            entry_a.host_object.user_function().map(|f| f.id),
-            entry_b.host_object.user_function().map(|f| f.id),
-            "one GraphFunc (`Hashable(function)`)"
-        );
     }
 
     /// Pass 1 skips a front-end declared funcobj (`describe_declared_funcobj`

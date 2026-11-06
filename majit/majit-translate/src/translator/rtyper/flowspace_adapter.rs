@@ -6191,34 +6191,6 @@ fn reachable_block_ids(legacy: &FunctionGraph) -> std::collections::HashSet<Bloc
     seen
 }
 
-/// The CallRegistry GraphFunc for this legacy graph, keyed by
-/// `FunctionGraph.source_identity` (`bookkeeper.py getdesc` identity
-/// on the callable, not `graph.name`).
-///
-/// Declared funcobjs skip populate and mint their FunctionDesc on the
-/// first `CallRegistry.lookup` (`cutover.rs describe_declared_funcobj`,
-/// `bookkeeper.py getdesc`). `lookup_existing` does not run that
-/// callback, so a Regular two-phase subject's FRESH adapter would
-/// keep `graph.func` unset and could not generalize
-/// `cachedgraph(None)`'s returnblock (`annrpython.py recursivecall`).
-fn registry_source_func(
-    legacy: &FunctionGraph,
-    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
-) -> Option<crate::flowspace::model::GraphFunc> {
-    let identity = legacy.source_identity.as_deref()?;
-    let segs: Vec<String> = identity
-        .split("::")
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    if segs.is_empty() {
-        return None;
-    }
-    let key = crate::translator::rtyper::call_registry::FunctionPathKey::from_segments(segs);
-    let entry = call_registry.lookup(&key)?;
-    entry.host_object.user_function().cloned()
-}
-
 /// `RPythonTyper.specialize`'s per-graph entry: build the flowspace view of one
 /// legacy graph.
 ///
@@ -6489,15 +6461,7 @@ fn function_graph_to_flowspace_inner(
             ))
         })?;
 
-    let mut graph = FlowspaceGraph::with_return_var(legacy.name.clone(), startblock, return_var);
-    // `FunctionGraph.func` is the Python function object
-    // (`bookkeeper.py getdesc` / `Hashable(function)`). Attach the
-    // CallRegistry GraphFunc so a two-phase Regular subject's FRESH
-    // adapter shares FunctionDesc identity with
-    // `FunctionDesc.cachedgraph(None)` (`description.py cachedgraph`).
-    if let Some(func) = registry_source_func(legacy, call_registry) {
-        graph.func = Some(func);
-    }
+    let graph = FlowspaceGraph::with_return_var(legacy.name.clone(), startblock, return_var);
     let returnblock_ref = graph.returnblock.clone();
     let exceptblock_ref = graph.exceptblock.clone();
 
@@ -6520,34 +6484,6 @@ fn function_graph_to_flowspace_inner(
     }
 
     let graph_ref = graph.into_ref();
-    // Regular two-phase FRESH is the first `cachedgraph(None)` asker
-    // (`description.py FunctionDesc.cachedgraph` /
-    // `translator.buildflowgraph`). AccessDirect subjects install
-    // `(AccessDirect, None)` in `cutover.rs seed_access_direct_lift`
-    // (`specialize.py default_specialize`); seeding `None` from that
-    // lift would make a later Regular `pycall` HIT the AccessDirect
-    // graph.
-    if matches!(
-        legacy.specialization,
-        crate::parse::GraphSpecialization::Regular
-    ) && let Some(func) = graph_ref.borrow().func.clone()
-        && let Some(fd) = call_registry
-            .bookkeeper()
-            .descs
-            .borrow()
-            .function_desc_for_func_id(func.id)
-    {
-        let desc = fd.borrow();
-        desc.remember_annotation_graph(Rc::clone(&graph_ref));
-        let pygraph = Rc::new(crate::flowspace::pygraph::PyGraph {
-            graph: Rc::clone(&graph_ref),
-            func,
-            signature: std::cell::RefCell::new(desc.signature.clone()),
-            defaults: std::cell::RefCell::new(Some(desc.defaults.clone())),
-            access_directly: std::cell::Cell::new(false),
-        });
-        desc.seed_cachedgraph_none_if_vacant(pygraph);
-    }
 
     // Map the canonical finals so any legacy Link targeting them
     // resolves to the flowspace finals constructed above.
@@ -13467,99 +13403,6 @@ mod tests {
         };
         graph.blocks = vec![startblock, returnblock];
         (graph, vars)
-    }
-
-    #[test]
-    fn function_graph_to_flowspace_attaches_func_from_getdesc_lookup() {
-        // Declared funcobjs skip populate. `lookup_existing` misses until
-        // `CallRegistry.lookup` runs `getdesc` (`bookkeeper.py getdesc` /
-        // `cutover.rs describe_declared_funcobj`). The Regular FRESH
-        // adapter must attach that GraphFunc.
-        use crate::flowspace::argument::Signature;
-        use crate::translator::rtyper::call_registry::FunctionPathKey;
-        let registry = Rc::new(CallRegistry::new(Rc::new(Bookkeeper::new())));
-        let segs = ["majit_rlib", "jit_libffi", "imp", "do_ffi_call_sint"];
-        let key = FunctionPathKey::from_segments(segs);
-        let signature = Signature::new(vec![], None, None);
-        let weak = Rc::downgrade(&registry);
-        let key_for_cb = key.clone();
-        let sig_for_cb = signature.clone();
-        registry.set_getdesc(Rc::new(move |k| {
-            if k != &key_for_cb {
-                return None;
-            }
-            let registry = weak.upgrade()?;
-            Some(registry.get_or_register(k.clone(), sig_for_cb.clone()))
-        }));
-        assert!(
-            registry.lookup_existing(&key).is_none(),
-            "declared funcobj is not in entries until getdesc"
-        );
-        let (mut legacy, _vars) = legacy_minimal_identity_return_graph();
-        legacy.source_identity = Some(segs.join("::"));
-        let output = function_graph_to_flowspace(&legacy, registry.as_ref())
-            .expect("minimal graph must assemble");
-        assert!(
-            output.graph.borrow().func.is_some(),
-            "FRESH adapter must attach the getdesc GraphFunc (`bookkeeper.py getdesc`)"
-        );
-        assert!(
-            registry.lookup_existing(&key).is_some(),
-            "adapter lookup is getdesc"
-        );
-        let entry = registry.lookup_existing(&key).unwrap();
-        let cached = entry
-            .function_desc
-            .borrow()
-            .cachedgraph(
-                crate::annotator::description::GraphCacheKey::None,
-                None,
-                None,
-            )
-            .expect("FRESH adapter is cachedgraph(None)");
-        assert!(
-            Rc::ptr_eq(&cached.graph, &output.graph),
-            "Regular FRESH is the first cachedgraph(None) (`description.py cachedgraph`)"
-        );
-    }
-
-    #[test]
-    fn function_graph_to_flowspace_access_direct_does_not_seed_cachedgraph_none() {
-        // AccessDirect subjects install `(AccessDirect, None)`
-        // (`specialize.py default_specialize`). Seeding `None` from
-        // that lift would make a later Regular `pycall` HIT the
-        // AccessDirect graph (`description.py FunctionDesc.cachedgraph`).
-        use crate::flowspace::argument::Signature;
-        use crate::translator::rtyper::call_registry::FunctionPathKey;
-        let registry = Rc::new(CallRegistry::new(Rc::new(Bookkeeper::new())));
-        let segs = ["majit_rlib", "jit_libffi", "imp", "do_ffi_call_sint"];
-        let key = FunctionPathKey::from_segments(segs);
-        let signature = Signature::new(vec![], None, None);
-        let weak = Rc::downgrade(&registry);
-        let key_for_cb = key.clone();
-        let sig_for_cb = signature.clone();
-        registry.set_getdesc(Rc::new(move |k| {
-            if k != &key_for_cb {
-                return None;
-            }
-            let registry = weak.upgrade()?;
-            Some(registry.get_or_register(k.clone(), sig_for_cb.clone()))
-        }));
-        let (mut legacy, _vars) = legacy_minimal_identity_return_graph();
-        legacy.source_identity = Some(segs.join("::"));
-        legacy.specialization = crate::parse::GraphSpecialization::AccessDirect;
-        let output = function_graph_to_flowspace(&legacy, registry.as_ref())
-            .expect("minimal graph must assemble");
-        let entry = registry.lookup_existing(&key).expect("getdesc ran");
-        let cache = entry.function_desc.borrow().cache.borrow().clone();
-        assert!(
-            !cache.contains_key(&crate::annotator::description::GraphCacheKey::None),
-            "AccessDirect lift must not occupy cachedgraph(None)"
-        );
-        assert!(
-            output.graph.borrow().func.is_some(),
-            "AccessDirect adapter still attaches the getdesc GraphFunc"
-        );
     }
 
     #[test]
