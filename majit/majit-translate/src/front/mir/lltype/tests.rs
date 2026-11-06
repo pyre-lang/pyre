@@ -1894,6 +1894,190 @@ fn one_word_storage_raw_struct_by_value_and_borrow_are_int() {
         !super::tyref_is_one_word_storage_raw_value(&borrow, &llbc, &empty_gc, &empty_flavor),
         "the borrow is a pointer, not the by-value word"
     );
+    assert!(
+        !super::tyref_is_storage_raw_spill_actual(&by_value, &llbc, &empty_gc, &empty_flavor),
+        "one-word by-value is the content word, not a spill"
+    );
+    assert!(
+        !super::tyref_is_storage_raw_spill_actual(&borrow, &llbc, &empty_gc, &empty_flavor),
+        "one-word borrow is the same content word"
+    );
+}
+
+/// `{ i32, bool }` packs to one word. Construction OR-shifts those
+/// fields into the int (`SwitchToBlackhole`).
+#[test]
+fn packed_i32_bool_storage_raw_struct_is_one_word() {
+    let word = crate::layout::target_word_size() as u64;
+    let i32_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I32"}}});
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let mut owner = struct_decl(
+        0,
+        ident_path(&["fixture", "S"]),
+        serde_json::json!([
+            {
+                "name": "reason",
+                "ty": i32_ty,
+                "attr_info": null
+            },
+            {
+                "name": "raising_exception",
+                "ty": bool_ty,
+                "attr_info": null
+            }
+        ]),
+        false,
+    );
+    owner["layout"] = serde_json::json!([{
+        "key": "host",
+        "value": {
+            "size": word,
+            "align": 4,
+            "variant_layouts": [{"field_offsets": [0, 4]}],
+            "repr": {"transparent": false}
+        }
+    }]);
+    let adt = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [], "types": [],
+                "const_generics": [], "trait_refs": []
+            },
+            "builtin": null
+        }
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [owner],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
+        std::collections::HashSet::new();
+    let empty_flavor: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let by_value = TyRef::Other(adt);
+    let tomb = super::no_tombstoned_leaves();
+    assert_eq!(
+        super::tyref_to_value_type_with(&by_value, &llbc, tomb, &empty_gc, &empty_flavor),
+        ValueType::Int,
+        "packed i32+bool storage-raw struct is one register"
+    );
+    let fields =
+        super::tyref_one_word_storage_raw_fields(&by_value, &llbc, &empty_gc, &empty_flavor)
+            .expect("one-word fields");
+    assert_eq!(
+        fields,
+        vec![
+            ("reason".to_string(), 0, 4),
+            ("raising_exception".to_string(), 4, 1)
+        ]
+    );
+}
+
+/// A by-value multi-word storage-raw struct stays the virtual aggregate
+/// (`history.getkind` of the `Ptr` is the address, not the content).
+/// Its borrow is that address (`ty_is_raw_address`).
+#[test]
+fn multi_word_storage_raw_struct_by_value_is_ref_borrow_is_int() {
+    let word = crate::layout::target_word_size() as u64;
+    let word_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let mut owner = struct_decl(
+        0,
+        ident_path(&["fixture", "S"]),
+        serde_json::json!([
+            {
+                "name": "a",
+                "ty": word_ty,
+                "attr_info": null
+            },
+            {
+                "name": "b",
+                "ty": word_ty,
+                "attr_info": null
+            }
+        ]),
+        false,
+    );
+    owner["layout"] = serde_json::json!([{
+        "key": "host",
+        "value": {
+            "size": word * 2,
+            "align": word,
+            "variant_layouts": [{"field_offsets": [0, word]}],
+            "repr": {"transparent": false}
+        }
+    }]);
+    let adt = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [], "types": [],
+                "const_generics": [], "trait_refs": []
+            },
+            "builtin": null
+        }
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [owner],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
+        std::collections::HashSet::new();
+    let empty_flavor: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let by_value = TyRef::Other(adt.clone());
+    let borrow = TyRef::Other(serde_json::json!({"Ref": ["Erased", adt, "Mut"]}));
+    let tomb = super::no_tombstoned_leaves();
+    assert_ne!(
+        super::tyref_to_value_type_with(&by_value, &llbc, tomb, &empty_gc, &empty_flavor),
+        ValueType::Int,
+        "by-value multi-word storage-raw struct is not one register"
+    );
+    assert_eq!(
+        super::tyref_to_value_type_with(&borrow, &llbc, tomb, &empty_gc, &empty_flavor),
+        ValueType::Int,
+        "a borrow of that struct is the address (`history.getkind` int)"
+    );
+    assert!(
+        !super::tyref_is_one_word_storage_raw_value(&by_value, &llbc, &empty_gc, &empty_flavor),
+        "two-word S is not one-word storage-raw"
+    );
+    assert!(
+        super::tyref_is_multi_word_storage_raw_value(&by_value, &llbc, &empty_gc, &empty_flavor),
+        "by-value S is multi-word storage-raw"
+    );
+    assert!(
+        !super::tyref_is_multi_word_storage_raw_value(&borrow, &llbc, &empty_gc, &empty_flavor),
+        "the borrow is a pointer, not the by-value aggregate"
+    );
+    assert!(
+        super::tyref_is_ref_of_multi_word_storage_raw(&borrow, &llbc, &empty_gc, &empty_flavor),
+        "the borrow is the residual-call spill shape"
+    );
+    assert!(
+        super::tyref_is_storage_raw_spill_actual(&borrow, &llbc, &empty_gc, &empty_flavor),
+        "a borrow of multi-word S is a residual-call spill actual"
+    );
+    assert!(
+        super::tyref_is_storage_raw_spill_actual(&by_value, &llbc, &empty_gc, &empty_flavor),
+        "identity-alias of that borrow is the by-value virtual"
+    );
 }
 
 #[test]

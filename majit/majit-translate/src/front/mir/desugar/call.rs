@@ -597,6 +597,7 @@ impl<'a> Lowering<'a> {
         let gc_mut_ref_sig = self.gc_mut_ref_signature(&call.func, &call_arg_tys);
         // Captured before `call.func` moves into the call-shape match.
         let raw_scalar_spills = self.raw_scalar_borrow_spills(&call.func, &call_arg_tys);
+        let storage_raw_spills = self.storage_raw_borrow_spills(&call.func, &call_arg_tys);
         let first_arg_is_string_array_view = args.first().is_some_and(|arg| {
             self.string_array_view_locals.iter().any(|(local, _)| {
                 self.local_var
@@ -8716,6 +8717,12 @@ impl<'a> Lowering<'a> {
             &resolved_call_args,
             &call.dest.ty,
         )?;
+        let storage_raw_reloads = self.install_storage_raw_address_call(
+            mir_bb,
+            &mut op_kind,
+            &storage_raw_spills,
+            &resolved_call_args,
+        )?;
         self.local_var[dest_local] = Some(match slice_next {
             Some(LocalValue::SliceIter { items, .. }) => LocalValue::SliceIter {
                 items,
@@ -8860,6 +8867,7 @@ impl<'a> Lowering<'a> {
         // Reload before `edge_args` so the successor sees the word the
         // callee wrote through the raw out-parameter.
         self.reload_raw_scalar_addresses(mir_bb, &raw_scalar_reloads)?;
+        self.reload_storage_raw_addresses(mir_bb, &storage_raw_reloads)?;
         // Narrow a call result whose declared pointee differs from the
         // target class (`recast_result_root`). Identity at jitcode
         // (`__cast_instance_intrinsic` → cast_pointer → `same_as`) when
@@ -9495,6 +9503,19 @@ impl<'a> Lowering<'a> {
         }
         let td = self.llbc.type_by_id(adt_def_id)?;
         if !matches!(td.kind, TypeDeclKind::Opaque) && !td.published_struct_copy {
+            return None;
+        }
+        // A storage-raw ADT is an address word (`history.getkind` of
+        // `Ptr(TO)` raw), not a GC instance. Cross-crate the TypeDecl
+        // is Opaque / `published_struct_copy`; painting `self` as
+        // instance leaves a Ref actual for a residual whose FUNC.ARGS
+        // is Int (`RootScope::pin_roots`).
+        let first = fd.signature.inputs.first()?;
+        let pointee = tyref_peel_one_ref_node(first, self.llbc)
+            .or_else(|| tyref_peel_one_raw_ptr_node(first, self.llbc))
+            .map(|n| TyRef::Other(n.clone()))
+            .unwrap_or_else(|| first.clone());
+        if self.pointee_is_storage_raw_spill_owner(&pointee) {
             return None;
         }
         // A fieldless enum is an int. Painting `self` as an instance

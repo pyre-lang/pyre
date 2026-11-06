@@ -2119,6 +2119,15 @@ pub(in crate::front::mir) fn declared_raw_adt_node<'a>(
     if struct_id_is_declared_gc(gc_struct_ids, sid, &name) {
         return None;
     }
+    // Closure envs that only capture Copy words are raw storage, but they
+    // are not C structs. `note_raw_word_owner` skips them so
+    // `raw_struct_ptr_annotation` does not mint SomePtr
+    // (`tyref_input_class_root`; RPython forbids closures). Paint and
+    // `&self` stay the instance, not a raw address.
+    let leaf = name.rsplit("::").next().unwrap_or(name.as_str());
+    if majit_charon_reader::ullbc::is_closure_leaf(leaf) {
+        return None;
+    }
     if tyref_is_zero_sized(&TyRef::Other(node.clone()), llbc) {
         return None;
     }
@@ -2240,6 +2249,29 @@ pub(in crate::front::mir) fn tyref_is_raw_value(
     )
 }
 
+/// Declared storage-raw ADT value: not a pointer, not flavor-raw.
+///
+/// `bookkeeper` `raw_struct_ptr_annotation` intern's a C/raw struct as
+/// `Ptr(Struct raw)`; `history.getkind` of that `Ptr` is `"int"`. A
+/// flavor-raw identity stays a front `Ref` (`rclass.py getgcflavor`).
+pub(in crate::front::mir) fn tyref_is_storage_raw_value(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> bool {
+    if !tyref_is_raw_value(ty, llbc, gc_struct_ids) {
+        return false;
+    }
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    if flavor_raw_adt_node(node, llbc, raw_alloc_flavor_structs) {
+        return false;
+    }
+    declared_raw_adt_node(node, llbc, gc_struct_ids, no_immutable_fields()).is_some()
+}
+
 /// By-value one-word storage-raw ADT: the word itself.
 ///
 /// `bookkeeper` `raw_struct_ptr_annotation` intern's that value as
@@ -2255,19 +2287,228 @@ pub(in crate::front::mir) fn tyref_is_one_word_storage_raw_value(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
-    if !tyref_is_raw_value(ty, llbc, gc_struct_ids) {
+    if !tyref_is_storage_raw_value(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
         return false;
     }
     let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
         return false;
     };
-    if flavor_raw_adt_node(node, llbc, raw_alloc_flavor_structs) {
-        return false;
-    }
-    if declared_raw_adt_node(node, llbc, gc_struct_ids, no_immutable_fields()).is_none() {
-        return false;
-    }
     json_ty_byte_size(node, llbc) == Some(crate::layout::target_word_size() as i64)
+}
+
+/// Non-void fields of a one-word storage-raw ADT: `(name, byte offset, byte size)`.
+///
+/// The by-value paint is that packed word (`history.getkind` int,
+/// `bookkeeper` `raw_struct_ptr_annotation`). Construction OR-shifts each
+/// field into the word; a later field read shifts it back out. Layout
+/// offsets come from Charon's host `variant_layouts`; a missing layout
+/// packs primitives at their natural alignment.
+pub(in crate::front::mir) fn tyref_one_word_storage_raw_fields(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> Option<Vec<(String, u64, u64)>> {
+    if !tyref_is_one_word_storage_raw_value(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
+        return None;
+    }
+    let node = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc))?;
+    let def_id = adt_node_def_id(node)?;
+    let td = llbc.type_by_id(def_id)?;
+    let fields = match &td.kind {
+        TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => fields,
+        _ => return None,
+    };
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let layout_offsets = td
+        .layout_for_target(llbc, &target)
+        .and_then(|layout| layout.variant_layouts.into_iter().next())
+        .map(|variant| variant.field_offsets);
+    let word = crate::layout::target_word_size() as u64;
+    let mut names = Vec::with_capacity(fields.len());
+    let mut sizes = Vec::with_capacity(fields.len());
+    for (i, field) in fields.iter().enumerate() {
+        let name = field
+            .name
+            .clone()
+            .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(i));
+        let size = tyref_node(&field.ty, llbc)
+            .and_then(|n| json_ty_byte_size(n, llbc))
+            .and_then(|n| u64::try_from(n).ok())
+            .unwrap_or(0);
+        names.push(name);
+        sizes.push(size);
+    }
+    let offsets = match layout_offsets {
+        Some(offsets) if offsets.len() == fields.len() => offsets,
+        _ => sequential_primitive_field_offsets(&sizes, word),
+    };
+    let mut out = Vec::new();
+    for i in 0..fields.len() {
+        if sizes[i] == 0 {
+            continue;
+        }
+        out.push((names[i].clone(), offsets[i], sizes[i]));
+    }
+    Some(out)
+}
+
+/// Byte offset and size of field `host_index` on a one-word storage-raw ADT.
+/// `host_index` is `(variant, field)` in declaration order, including
+/// zero-sized fields.
+pub(in crate::front::mir) fn tyref_one_word_storage_raw_field_bits(
+    ty: &TyRef,
+    host_index: Option<(u32, u32)>,
+    field_name: &str,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> Option<(u64, u64)> {
+    let fields =
+        tyref_one_word_storage_raw_fields(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)?;
+    if let Some((variant, field)) = host_index
+        && variant == 0
+    {
+        let idx = field as usize;
+        let node = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc))?;
+        let def_id = adt_node_def_id(node)?;
+        let td = llbc.type_by_id(def_id)?;
+        let decl_fields = match &td.kind {
+            TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => fields,
+            _ => return None,
+        };
+        if idx < decl_fields.len() {
+            let target = std::env::var("TARGET").unwrap_or_default();
+            let offset = td
+                .layout_for_target(llbc, &target)
+                .and_then(|layout| layout.variant_layouts.into_iter().next())
+                .and_then(|variant| variant.field_offsets.get(idx).copied());
+            let size = tyref_node(&decl_fields[idx].ty, llbc)
+                .and_then(|n| json_ty_byte_size(n, llbc))
+                .and_then(|n| u64::try_from(n).ok())
+                .unwrap_or(0);
+            if size > 0 {
+                let word = crate::layout::target_word_size() as u64;
+                let offset = offset.unwrap_or_else(|| {
+                    let sizes: Vec<u64> = decl_fields
+                        .iter()
+                        .map(|field| {
+                            tyref_node(&field.ty, llbc)
+                                .and_then(|n| json_ty_byte_size(n, llbc))
+                                .and_then(|n| u64::try_from(n).ok())
+                                .unwrap_or(0)
+                        })
+                        .collect();
+                    sequential_primitive_field_offsets(&sizes, word)
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(0)
+                });
+                return Some((offset, size));
+            }
+        }
+    }
+    fields
+        .iter()
+        .find(|(name, _, _)| name == field_name)
+        .map(|(_, offset, size)| (*offset, *size))
+}
+
+fn sequential_primitive_field_offsets(sizes: &[u64], word: u64) -> Vec<u64> {
+    let mut off = 0u64;
+    let mut out = Vec::with_capacity(sizes.len());
+    for &size in sizes {
+        if size == 0 {
+            out.push(off);
+            continue;
+        }
+        let align = primitive_field_align(size, word);
+        off = off.div_ceil(align) * align;
+        out.push(off);
+        off = off.saturating_add(size);
+    }
+    out
+}
+
+fn primitive_field_align(size: u64, word: u64) -> u64 {
+    let size = size.min(word).max(1);
+    if size.count_ones() == 1 {
+        size
+    } else {
+        size.next_power_of_two()
+    }
+}
+
+/// By-value multi-word storage-raw ADT: the virtual aggregate, not one
+/// register.
+///
+/// `history.getkind` of `Ptr(TO)` with `TO._gckind` raw is `"int"`: that
+/// Int is the pointer (`lltype.malloc(..., flavor='raw')`), not the
+/// content words. The by-value paint stays `Ref` so an inline field of
+/// a GC object keeps those words (`pyexpat` `items: RootedItems`).
+/// `Rvalue::Ref` of a local aliases the virtual; a residual call whose
+/// parameter is the address (`ty_is_raw_address`) spills at the call
+/// (`storage_raw_borrow_spills`). Unknown size stays the virtual.
+pub(in crate::front::mir) fn tyref_is_multi_word_storage_raw_value(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> bool {
+    if !tyref_is_storage_raw_value(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
+        return false;
+    }
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    json_ty_byte_size(node, llbc)
+        .is_some_and(|size| size > crate::layout::target_word_size() as i64)
+}
+
+/// `ty` is one `&` / `&mut` of a multi-word storage-raw ADT. A raw
+/// pointer is already the address and is not a borrow.
+pub(in crate::front::mir) fn tyref_is_ref_of_multi_word_storage_raw(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> bool {
+    if tyref_is_raw_pointer(ty, llbc) {
+        return false;
+    }
+    tyref_peel_one_ref_node(ty, llbc).is_some_and(|pointee| {
+        tyref_is_multi_word_storage_raw_value(
+            &TyRef::Other(pointee.clone()),
+            llbc,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        )
+    })
+}
+
+/// Call actual that still holds the virtual of a multi-word storage-raw
+/// ADT: a borrow, or the by-value aggregate after `Rvalue::Ref` aliases
+/// the local. A raw pointer is already the address.
+pub(in crate::front::mir) fn tyref_is_storage_raw_spill_actual(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> bool {
+    if tyref_is_raw_pointer(ty, llbc) {
+        return false;
+    }
+    if tyref_is_ref_of_multi_word_storage_raw(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
+        return true;
+    }
+    if tyref_is_multi_word_storage_raw_value(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
+        return true;
+    }
+    // Unknown layout stays the virtual (`tyref_is_one_word` is size==word).
+    tyref_is_storage_raw_value(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+        && tyref_node(ty, llbc)
+            .and_then(|n| strip_ty_indirections(n, llbc))
+            .is_some_and(|node| json_ty_byte_size(node, llbc).is_none())
 }
 
 pub(in crate::front::mir) fn field_ty_is_raw_word(

@@ -3243,6 +3243,23 @@ impl<'a> Lowering<'a> {
                                 *arg = value.clone();
                             }
                         }
+                        // By-value one-word storage-raw is the packed
+                        // content word (`history.getkind` int). The
+                        // virtual ctor is a Ref; returning it disagrees
+                        // with FUNC.RESULT (`func_result_kind`,
+                        // `interpret_abort_switch_to_blackhole`).
+                        if pair_lens.iter().all(Option::is_none)
+                            && tyref_is_one_word_storage_raw_value(
+                                dest_ty,
+                                self.llbc,
+                                self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
+                            )
+                        {
+                            let packed = self
+                                .emit_one_word_storage_raw_ctor(mir_bb, dest_ty, &ctor, &arg_vars);
+                            return Ok((None, packed));
+                        }
                         let res = emit_aggregate_ctor_with_pairs(
                             &mut self.graph,
                             bb_id,
@@ -3859,6 +3876,212 @@ impl<'a> Lowering<'a> {
                 true,
             )
             .expect("BinOp produces a value")
+    }
+
+    /// Signed `ConstInt`. `push_op_var` mints `Unknown` (`getkind` ref);
+    /// a one-word storage-raw return must already be Signed when
+    /// `func_result_kind` reads the CFG (`flatten.py` `make_return`).
+    fn emit_signed_const(&mut self, mir_bb: usize, value: i64) -> Variable {
+        let bb_id = self.emit_bb(mir_bb);
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::ConstInt(value),
+        });
+        res
+    }
+
+    fn emit_signed_binop(
+        &mut self,
+        mir_bb: usize,
+        op: &str,
+        lhs: Variable,
+        rhs: Variable,
+    ) -> Variable {
+        let bb_id = self.emit_bb(mir_bb);
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::BinOp {
+                op: op.to_string(),
+                lhs,
+                rhs,
+                result_ty: ValueType::Int,
+            },
+        });
+        res
+    }
+
+    fn ensure_signed_word(&mut self, mir_bb: usize, value: Variable) -> Variable {
+        if crate::model::FunctionGraph::concretetype_of(&value)
+            == crate::model::ConcreteType::Signed
+        {
+            return value;
+        }
+        let zero = self.emit_signed_const(mir_bb, 0);
+        self.emit_signed_binop(mir_bb, "or", value, zero)
+    }
+
+    /// Pack field pieces into the one-word storage-raw register.
+    ///
+    /// `history.getkind` of the interned `Ptr(Struct raw)` is `"int"`:
+    /// that Int is the content word (`RootScope.save_point`, packed
+    /// `SwitchToBlackhole`). Recoloring the virtual constructor to Int
+    /// would pass identity, not the word.
+    fn emit_pack_storage_raw_word(
+        &mut self,
+        mir_bb: usize,
+        pieces: &[(u64, u64, Variable)],
+    ) -> Variable {
+        let word = crate::layout::target_word_size() as u64;
+        let live: Vec<(u64, u64, Variable)> = pieces
+            .iter()
+            .filter(|(_, size, _)| *size > 0)
+            .cloned()
+            .collect();
+        if live.is_empty() {
+            return self.emit_signed_const(mir_bb, 0);
+        }
+        if live.len() == 1 && live[0].0 == 0 && live[0].1 >= word {
+            return self.ensure_signed_word(mir_bb, live[0].2.clone());
+        }
+        let mut acc: Option<Variable> = None;
+        for (offset, size, value) in live {
+            let mut bits = self.ensure_signed_word(mir_bb, value);
+            let width = (size.min(word) * 8) as u32;
+            if width > 0 && width < 64 {
+                let mask = self.emit_signed_const(mir_bb, (1i64 << width) - 1);
+                bits = self.emit_signed_binop(mir_bb, "and", bits, mask);
+            }
+            if offset > 0 {
+                let shift = self.emit_signed_const(mir_bb, (offset * 8) as i64);
+                bits = self.emit_signed_binop(mir_bb, "lshift", bits, shift);
+            }
+            acc = Some(match acc {
+                None => bits,
+                Some(prev) => self.emit_signed_binop(mir_bb, "or", prev, bits),
+            });
+        }
+        acc.unwrap_or_else(|| self.emit_signed_const(mir_bb, 0))
+    }
+
+    /// Construct a one-word storage-raw ADT as its packed content word.
+    fn emit_one_word_storage_raw_ctor(
+        &mut self,
+        mir_bb: usize,
+        dest_ty: &TyRef,
+        ctor: &AggregateCtor,
+        args: &[Variable],
+    ) -> Variable {
+        let layout = tyref_one_word_storage_raw_fields(
+            dest_ty,
+            self.llbc,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )
+        .unwrap_or_default();
+        let word = crate::layout::target_word_size() as u64;
+        let mut pieces = Vec::new();
+        let mut layout_i = 0usize;
+        for (i, field) in ctor.fields.iter().enumerate() {
+            if field.void {
+                continue;
+            }
+            let Some(arg) = args.get(i) else {
+                continue;
+            };
+            let (offset, size) = layout
+                .iter()
+                .find(|(name, _, _)| name == &field.name)
+                .map(|(_, offset, size)| (*offset, *size))
+                .or_else(|| {
+                    let row = layout.get(layout_i)?;
+                    Some((row.1, row.2))
+                })
+                .unwrap_or((0, word));
+            layout_i += 1;
+            pieces.push((offset, size, arg.clone()));
+        }
+        self.emit_pack_storage_raw_word(mir_bb, &pieces)
+    }
+
+    /// Field of a packed one-word storage-raw value: shift the word and
+    /// mask to the field width. `RootScope.save_point` is the word.
+    fn emit_one_word_storage_raw_field_extract(
+        &mut self,
+        mir_bb: usize,
+        word: Variable,
+        offset: u64,
+        size: u64,
+    ) -> Variable {
+        let word_bytes = crate::layout::target_word_size() as u64;
+        if offset == 0 && size >= word_bytes {
+            return self.ensure_signed_word(mir_bb, word);
+        }
+        let mut bits = self.ensure_signed_word(mir_bb, word);
+        if offset > 0 {
+            let shift = self.emit_signed_const(mir_bb, (offset * 8) as i64);
+            bits = self.emit_signed_binop(mir_bb, "rshift", bits, shift);
+        }
+        let width = (size.min(word_bytes) * 8) as u32;
+        if width > 0 && width < 64 {
+            let mask = self.emit_signed_const(mir_bb, (1i64 << width) - 1);
+            bits = self.emit_signed_binop(mir_bb, "and", bits, mask);
+        }
+        bits
+    }
+
+    /// A still-virtual one-word storage-raw value: FieldRead each content
+    /// field (`base_is_deref` false) and pack. Same-crate construction
+    /// already interned the word; this is a leftover virtual (phi, copy).
+    pub(in crate::front::mir) fn emit_one_word_storage_raw_from_virtual(
+        &mut self,
+        mir_bb: usize,
+        virt: &Variable,
+        dest_ty: &TyRef,
+    ) -> Variable {
+        let layout = tyref_one_word_storage_raw_fields(
+            dest_ty,
+            self.llbc,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )
+        .unwrap_or_default();
+        if layout.is_empty() {
+            return self.ensure_signed_word(mir_bb, virt.clone());
+        }
+        let owner = tyref_node(dest_ty, self.llbc)
+            .and_then(|n| strip_ty_indirections(n, self.llbc))
+            .and_then(adt_node_def_id)
+            .and_then(|id| self.llbc.type_by_id(id))
+            .map(|td| {
+                super::class_identity_spelling(&td.item_meta.name_path(), self.tombstoned_leaves)
+            })
+            .filter(|spelling| !spelling.is_empty())
+            .unwrap_or_default();
+        let bb_id = self.emit_bb(mir_bb);
+        let mut pieces = Vec::new();
+        for (name, offset, size) in layout {
+            let loaded = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(loaded.clone()),
+                kind: OpKind::FieldRead {
+                    base: virt.clone(),
+                    field: FieldDescriptor::new(name, Some(owner.clone()))
+                        .with_base_is_deref(false),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+            });
+            pieces.push((offset, size, loaded));
+        }
+        self.emit_pack_storage_raw_word(mir_bb, &pieces)
     }
 
     /// Zero-extending load of the tag word. `host_variant_index` masks to
@@ -6086,6 +6309,13 @@ impl<'a> Lowering<'a> {
                     && let Some((owner_root, field_name, field_ty, owner_id, host_index)) =
                         self.resolve_adt_field(&inner.ty, field_payload)
                 {
+                    let container_ty = clone_tyref(&inner.ty);
+                    let container_is_one_word_storage_raw = tyref_is_one_word_storage_raw_value(
+                        &container_ty,
+                        self.llbc,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    );
                     // Decl field / Charon Field `place.ty` stay the binder
                     // TypeVar (`Result<T,E>::Ok.0`). Substitute from the
                     // container's `Adt.generics.types` so a `*mut u8`
@@ -6479,9 +6709,12 @@ impl<'a> Lowering<'a> {
                     if read_rstr_attr {
                         ty = ValueType::Str;
                     }
+                    // `rewrite_op_getfield`: kind is `getkind(RESULT)`, the
+                    // dest register. Unknown banks as `'r'`, so an Int field
+                    // of a raw owner becomes `getfield_raw_r`.
                     let res = self
                         .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        .alloc_value_var_with_type(concretetype_for_field(&ty));
                     let narrow_instance_class = container_is_enum
                         && field_name == "__pos_0"
                         && self.enum_payload_is_nullable_instance_ptr(&place_ty);
@@ -6514,6 +6747,23 @@ impl<'a> Lowering<'a> {
                         );
                     if dyn_vtable {
                         field = field.with_vec_part(crate::model::VecFieldPart::FatVtable);
+                    }
+                    if container_is_one_word_storage_raw
+                        && crate::model::FunctionGraph::concretetype_of(&base)
+                            == crate::model::ConcreteType::Signed
+                    {
+                        if let Some((offset, size)) = tyref_one_word_storage_raw_field_bits(
+                            &container_ty,
+                            host_index,
+                            &field.name,
+                            self.llbc,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                        ) {
+                            return Ok(self.emit_one_word_storage_raw_field_extract(
+                                mir_bb, base, offset, size,
+                            ));
+                        }
                     }
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
@@ -7173,7 +7423,7 @@ impl<'a> Lowering<'a> {
                     let bb_id = self.emit_bb(mir_bb);
                     let res = self
                         .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        .alloc_value_var_with_type(concretetype_for_field(&ty));
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::FieldRead {
