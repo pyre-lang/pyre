@@ -135,6 +135,17 @@ pub struct WalkFrameStateData {
     /// `make_result_of_lastop` has populated dest. Together with
     /// [`Self::residual_call_next_pc`] this is the convert resume pc.
     pub residual_dest_written: bool,
+    /// Start pc of the in-flight residual CALL (`current_op_pc` at
+    /// `note_residual_pc_advanced`). Kept when dest has no reconstructable
+    /// concrete (`ConcreteValue::Null`): convert would store an unknown as
+    /// NULL and the blackhole re-runs this CALL. An executed NULL dest
+    /// (`jit_next` StopIteration) is reconstructable and clears this.
+    pub residual_call_pc: Option<usize>,
+    /// Previous residual whose dest was not reconstructable. Survives one
+    /// `clear_residual_pc_advanced` so the following opcode's missing-value
+    /// abort can resume at that CALL. An executed residual, NULL dest
+    /// included, does not land here.
+    pub unpopulated_residual_call_pc: Option<usize>,
     /// The op this frame is dispatching. `pc` is the op START
     /// (`opcode_position`). `MIFrame._get_opimpl_method` (`pyjitpl.py`)
     /// decodes the args, then sets `self.pc = position` (the op END) before
@@ -174,6 +185,8 @@ impl Default for WalkFrameStateData {
             unroll_iterations: 1,
             residual_call_next_pc: None,
             residual_dest_written: false,
+            residual_call_pc: None,
+            unpopulated_residual_call_pc: None,
             current_op_pc: None,
         }
     }

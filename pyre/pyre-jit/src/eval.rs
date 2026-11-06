@@ -14019,7 +14019,33 @@ fn compile_and_run_once(
             }
             None => {}
         }
-        return Some(LoopResult::ContinueRunningNormally);
+        // pyjitpl.py raise_if_successful → raise_continue_running_normally:
+        // compile_loop success unpacks live_arg_boxes (portal greens include
+        // next_instr at the merge point) and warmspot.py handle_jitexception
+        // re-enters portal_ptr(*args). Apply that Jump payload before the
+        // eval_loop ContinueRunningNormally arm continues; otherwise the
+        // walk's leftover last_instr replays the opcode already residualized
+        // into the trace.
+        if let Some(outcome) = outcome {
+            match handle_jit_outcome(outcome, &jit_state, frame_root.frame(), info, green_key) {
+                JitAction::Return(result) => return Some(LoopResult::Done(result)),
+                JitAction::ContinueRunningNormally => {
+                    return Some(LoopResult::ContinueRunningNormally);
+                }
+                JitAction::Continue => {}
+            }
+        }
+        // pyjitpl.py `_compile_and_run_once` raises ContinueRunningNormally
+        // only from `raise_if_successful` (a compiled token). Abort is
+        // `SwitchToBlackhole` → `run_blackhole_interp_to_cancel_tracing`,
+        // never a bare CRN. A start-of-walk abort that published no loop
+        // for this green_key must not `handle_jitexception` from leftover
+        // last_instr: function-entry -1/0 replays a CALL an outer walk
+        // already residualized.
+        if driver.has_compiled_loop(green_key) {
+            return Some(LoopResult::ContinueRunningNormally);
+        }
+        return None;
     }
 
     if let Some(outcome) = outcome {
@@ -14083,7 +14109,7 @@ fn bound_reached(
     // call blocked the tail call and allocated a second virtualizable root
     // on every too-long abort (`trace_too_long_effect_replay`).
     frame.set_last_instr_from_next_instr(loop_header_pc);
-    compile_and_run_once(
+    let compiled = compile_and_run_once(
         frame,
         green_key,
         loop_header_pc,
@@ -14091,7 +14117,19 @@ fn bound_reached(
         driver,
         info,
         env,
-    )
+    );
+    // warmspot.py handle_jitexception ContinueRunningNormally →
+    // portal_ptr(*args). The rewritten portal's first merge point is
+    // ll_portal_runner, which EnterJitAssembler now that
+    // compile_and_run_once published the token. eval_loop's
+    // untranslated jit_merge_point is a no-op, so returning CRN here
+    // would interpret the body whose residuals already ran.
+    if matches!(compiled, Some(LoopResult::ContinueRunningNormally))
+        && driver.has_runnable_compiled_loop(green_key)
+    {
+        return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
+    }
+    compiled
 }
 
 /// RPython warmstate.py maybe_compile_and_run parity.
@@ -14610,17 +14648,23 @@ fn handle_jit_outcome(
             continue_running_normally_pc,
             ..
         } => {
+            // pyjitpl.py raise_continue_running_normally unpacks live_arg_boxes
+            // into ContinueRunningNormally; warmspot.py handle_jitexception
+            // re-enters portal_ptr(*args) whose first green is next_instr at
+            // the merge point. Restore the reds, then write that green onto
+            // the live frame. Do not fall back to the walk's leftover
+            // last_instr: that replays the opcode already residualized.
             if let Some(values) = continue_running_normally_values {
-                // pyjitpl.py raise_continue_running_normally:
-                // commit the back-edge live boxes, then restart at the loop
-                // header so the next portal check can enter the compiled loop.
                 let restart_pc = continue_running_normally_pc.unwrap_or_else(|| frame.next_instr());
                 let env = PyreEnv;
                 let mut restart_state = build_jit_state(frame, _info);
                 let meta = restart_state.build_meta(restart_pc, &env);
                 restart_state.restore_values(&meta, &values);
-                frame.set_last_instr_from_next_instr(restart_pc);
                 frame.fix_array_ptrs();
+            }
+            if let Some(restart_pc) = continue_running_normally_pc {
+                frame.set_last_instr_from_next_instr(restart_pc);
+                correct_resume_vsd(frame, restart_pc);
             }
             JitAction::Continue
         }

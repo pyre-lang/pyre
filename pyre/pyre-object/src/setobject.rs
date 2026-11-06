@@ -2763,13 +2763,18 @@ unsafe fn publish_discard_if_live_box(obj: PyObjectRef, items: *mut SetItemsStor
 /// Remember `items` after a store of a GC reference into that box.
 ///
 /// The box is old (`gc_alloc_storage_box`) and `set_items_storage_custom_trace`
-/// walks its `ObjectKey.obj` slots. A minor reaches an old box only from the
+/// forwards `d.entries`. A minor reaches an old box only from the
 /// remembered set — `drag_out` does not trace an old root — including a box
 /// `clear` has already detached (`d = self.unerase(w_set.sstorage)`,
-/// `setobject.py`).
+/// `setobject.py`). An old `DICTENTRYARRAY` that holds a young `ObjectKey`
+/// is the `setinteriorfield` case `RDict.barrier_entries` records, the same
+/// store `ll_dict_setitem_lookup_done` barriers before the Entry write.
 #[inline]
 fn set_items_write_barrier(items: *mut SetItemsStorage) {
-    crate::gc_hook::try_gc_write_barrier(items as crate::gc_hook::GCREF);
+    if items.is_null() {
+        return;
+    }
+    unsafe { (*items).barrier_entries() };
 }
 
 /// Process-wide source of [`W_SetObject::set_id`].
@@ -3070,12 +3075,12 @@ unsafe fn scan_set_key_reentrant(
 /// Snapshot the set's storage box and pin it for a reentrant probe, mirroring
 /// PyPy's capture-before-probe (`d = self.unerase(w_set.sstorage)`).  The pin
 /// keeps the box alive even if a probing `__eq__` swaps the set's live storage
-/// (`w_set_clear`); the returned pointer is used for the whole operation.
+/// (`w_set_clear`); the returned pointer is the live word `pin_root` holds
+/// after a collection, and is used for the whole operation.
 #[inline]
 unsafe fn capture_set_items(obj: PyObjectRef) -> *mut SetItemsStorage {
     let items = object_set_storage_ptr(&*(obj as *const W_SetObject));
-    let _ = crate::gc_roots::pin_root(items as PyObjectRef);
-    items
+    crate::gc_roots::pin_root(items as PyObjectRef) as *mut SetItemsStorage
 }
 
 /// Store a key that carries its own digest, propagating an `eq_w` raise from
@@ -3188,12 +3193,25 @@ fn set_strategy_bool_shell(
 ///
 /// The method returns a `Result` ADT (`setobject.py SetStrategy.add`); the
 /// interned shell is that residual word, `llmemory.GCREF`.
+///
+/// `ptr::read` copies `ObjectKey.obj` off the residual argument. `add` may
+/// collect (`EmptySetStrategy.add` switches storage; `ll_dict_grow` reallocates
+/// entries), so both words are published before that call — the same livevars
+/// `EmptySetStrategy.add` / `AbstractUnwrappedSetStrategy.add` pin.
 #[majit_macros::dont_look_inside]
 pub extern "C" fn set_strategy_add_key_ptr(
     w_set: PyObjectRef,
     key: *const crate::dictmultiobject::ObjectKey,
 ) -> crate::gc_hook::GCREF {
     let key = unsafe { std::ptr::read(key) };
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::pin_roots(&[w_set, key.obj]);
+    let key_slot = obj_slot + 1;
+    let w_set = crate::gc_roots::shadow_stack_get(obj_slot);
+    let key = crate::dictmultiobject::ObjectKey {
+        hash: key.hash,
+        obj: crate::gc_roots::shadow_stack_get(key_slot),
+    };
     let result = unsafe { (*(w_set as *const W_SetObject)).strategy.add(w_set, key) };
     set_strategy_add_shell(result)
 }
@@ -3631,8 +3649,14 @@ unsafe fn w_set_insert_key_reentrant(
     key: crate::dictmultiobject::ObjectKey,
 ) -> Result<(), SetUpdateError> {
     let _roots = crate::gc_roots::push_roots();
-    let items = capture_set_items(dst);
-    w_set_insert_key_into(dst, items, key)
+    let obj_slot = crate::gc_roots::pin_roots(&[dst, key.obj]);
+    let key_slot = obj_slot + 1;
+    let items = capture_set_items(crate::gc_roots::shadow_stack_get(obj_slot));
+    let key = crate::dictmultiobject::ObjectKey {
+        hash: key.hash,
+        obj: crate::gc_roots::shadow_stack_get(key_slot),
+    };
+    w_set_insert_key_into(crate::gc_roots::shadow_stack_get(obj_slot), items, key)
 }
 
 /// Probe-and-insert half of [`w_set_insert_key_reentrant`] against a storage

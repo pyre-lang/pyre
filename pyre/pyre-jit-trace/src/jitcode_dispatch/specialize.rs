@@ -4828,6 +4828,14 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     ) else {
         return Ok(None);
     };
+    // Dest-stamps are weakrefs (`settle_young_concrete_refs`). Every arm
+    // below records guards that can minor-collect, and `copied` is a Rust
+    // local the collector does not update (`history.py` `RefFrontendOp` /
+    // `getref_base`). Pin both across the fold the way the exception-slot
+    // arm already does, so a settled-dead dest-stamp cannot fall back to a
+    // recycled occupant of the old nursery word.
+    let receiver_pin = residual_call::owner_root_if_gc(concrete_obj as usize);
+    let attr_value_pin = residual_call::owner_root_if_gc(concrete_value as usize);
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
@@ -4870,7 +4878,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         // slot the trace just wrote answers from the trace.
         // The shape guard can minor-collect. `concrete_obj` is a copy of the
         // receiver box (`RefFrontendOp` / `getref_base`).
-        let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
+        let concrete_obj = live_box_ref(ctx, obj, pinned_obj(&receiver_pin, concrete_obj));
         let block = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, unsafe {
             crate::descr::mapdict_storage_descr(concrete_obj)
         });
@@ -4895,7 +4903,8 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                 );
                 // `walker_unbox_int_exact` can minor-collect. The value box is
                 // `value` (`RefFrontendOp` / `getref_base`).
-                let concrete_value = live_box_ref(ctx, value, concrete_value);
+                let concrete_value =
+                    live_box_ref(ctx, value, pinned_obj(&attr_value_pin, concrete_value));
                 unsafe { pyre_object::w_int_get_value(concrete_value) }
             }
             pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
@@ -4911,7 +4920,8 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                 )?;
                 // The unbox and `w_class` pin can minor-collect. The value box
                 // is `value` (`RefFrontendOp` / `getref_base`).
-                let concrete_value = live_box_ref(ctx, value, concrete_value);
+                let concrete_value =
+                    live_box_ref(ctx, value, pinned_obj(&attr_value_pin, concrete_value));
                 let live_f = unsafe { pyre_object::w_float_get_value(concrete_value) };
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Float(live_f));
@@ -4929,7 +4939,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         // now (`_direct_write`'s same-type arm, mapdict.py); the ops above
         // reproduce it in compiled code. The unbox guards can minor-collect
         // after the storage descr was read.
-        let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
+        let concrete_obj = live_box_ref(ctx, obj, pinned_obj(&receiver_pin, concrete_obj));
         unsafe {
             pyre_interpreter::objspace::std::mapdict::write_unboxed_storage_raw(
                 concrete_obj,
@@ -5169,8 +5179,8 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         // the GETFIELD recording may trigger.
         let old_block = (add.storageindex > 0)
             .then(|| crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, storage_descr.clone()));
-        let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
-        let concrete_value = live_box_ref(ctx, value, concrete_value);
+        let concrete_obj = live_box_ref(ctx, obj, pinned_obj(&receiver_pin, concrete_obj));
+        let concrete_value = live_box_ref(ctx, value, pinned_obj(&attr_value_pin, concrete_value));
         let committed = unsafe {
             pyre_interpreter::objspace::std::mapdict::store_attr_add_commit(
                 concrete_obj,
@@ -5263,7 +5273,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, map)?;
     unsafe { pyre_interpreter::objspace::std::mapdict::mark_attr_ever_mutated(attr) };
     // The shape guard can minor-collect. `concrete_obj` is a copy of `obj`.
-    let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
+    let concrete_obj = live_box_ref(ctx, obj, pinned_obj(&receiver_pin, concrete_obj));
     let storageindex_const = ctx.trace_ctx.const_int(storageindex as i64);
     // mapdict.py `PlainAttribute._direct_write` →
     // `obj._mapdict_write_storage(self.storageindex, w_value)`: one
@@ -5278,8 +5288,8 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     // The walk is the authoritative execution path, so apply the write now;
     // the ops above reproduce it in compiled code. Both records can
     // minor-collect; re-read both copies from their boxes.
-    let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
-    let concrete_value = live_box_ref(ctx, value, concrete_value);
+    let concrete_obj = live_box_ref(ctx, obj, pinned_obj(&receiver_pin, concrete_obj));
+    let concrete_value = live_box_ref(ctx, value, pinned_obj(&attr_value_pin, concrete_value));
     unsafe {
         pyre_interpreter::objspace::std::mapdict::write_boxed_storage(
             concrete_obj,
@@ -16597,7 +16607,7 @@ pub(crate) fn live_box_ref<Sym: WalkSym>(
     walker_concrete_ref_object(ctx, op).unwrap_or(copied)
 }
 
-/// The address `pin` tracks now, or `copied` when nothing was pinned (a
+/// The address `pin` tracks now, or `copied` when nothing was pinned (a)
 /// prebuilt or non-GC object, which never moves).
 pub(crate) fn pinned_obj(
     pin: &Option<majit_gc::shadow_stack::OwnerRootGuard>,

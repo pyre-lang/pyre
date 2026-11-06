@@ -11956,6 +11956,107 @@ fn for_iter_residual_then_live() -> (Vec<u8>, usize, usize) {
     (code, call_pc, live_pc)
 }
 
+/// A trailing `-live-` after `residual_call` is the caller's `in_a_call` /
+/// `after_residual_call` resume word. Interpreter lasti is the CALL's
+/// first real successor: cache words skip forward, a CALL opcode
+/// fallthroughs, and a run already on that successor stays there.
+#[test]
+fn resume_py_pc_after_residual_live_uses_fallthrough_twin() {
+    use pyre_interpreter::bytecode::Instruction;
+    use pyre_interpreter::{compile_exec, w_code_new};
+
+    pyre_interpreter::module::thread::ensure_runtime_thread();
+    let (code, call_pc, live_pc) = for_iter_residual_then_live();
+    assert_eq!(
+        crate::jitcode_runtime::decoded_ops(&code)
+            .find(|op| op.next_pc == live_pc)
+            .map(|op| op.opname.starts_with("residual_call")),
+        Some(true),
+        "live_pc is the byte after residual_call"
+    );
+
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("after_call_fallthrough_py");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some([call_pc, live_pc].into_iter().collect()),
+        c_num_regs_i: 1,
+        c_num_regs_r: 1,
+        ..Default::default()
+    });
+    let py_code = compile_exec("len(())").expect("test code should compile");
+    let mut call_py = None;
+    for pc in 0..py_code.instructions.len() {
+        if matches!(
+            pyre_interpreter::decode_instruction_at(&py_code, pc),
+            Some((Instruction::Call { .. }, _))
+        ) {
+            call_py = Some(pc);
+            break;
+        }
+    }
+    let call_py = call_py.expect("len(()) compiles a CALL");
+    let want = crate::pyjitpl::semantic_fallthrough_pc(&py_code, call_py);
+    assert_ne!(
+        want, call_py,
+        "CALL at {call_py} must have a distinct fallthrough"
+    );
+    let n_py = py_code.instructions.len() as u32;
+    let raw_ptr = Box::into_raw(Box::new(py_code));
+    let w_code = w_code_new(raw_ptr as *const ()) as *const ();
+    let mut pyjit = crate::PyJitCode::skeleton(raw_ptr);
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.is_drained = true;
+    pyjit.metadata.n_py_instrs = n_py;
+    // Residual start and trailing -live- sit in the CALL's emission run
+    // (pickle's after-call -live- is a cache word, not the fallthrough).
+    pyjit.metadata.py_exact_by_jit_pc = vec![(0, call_py as u32)];
+    pyjit.metadata.forward_py_pc_marker_by_jit_pc =
+        vec![(call_pc, call_py as u32), (live_pc, call_py as u32)];
+    pyjit.metadata.forward_py_pc_pred_by_jit_pc =
+        vec![(call_pc, call_py as u32), (live_pc, call_py as u32)];
+    pyjit.stamp_w_code(w_code);
+    let installed = crate::state::install_jitcode_for(w_code, std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    let jitcode_index = unsafe { (*installed).index };
+
+    assert_eq!(
+        crate::py_coord::resume_py_pc_for_jitcode_word(jitcode_index, live_pc as i32),
+        want as i32,
+        "after-call -live- resumes at the CALL fallthrough, not the CALL"
+    );
+    assert_eq!(
+        crate::py_coord::resume_py_pc_for_jitcode_word(jitcode_index, call_pc as i32),
+        call_py as i32,
+        "the CALL's own offset still names the CALL"
+    );
+
+    // Residual whose py_exact run was re-keyed onto the fallthrough: do
+    // not apply semantic_fallthrough again (that skipped LOAD_CONST None
+    // in load_put).
+    let runtime_jc2 = majit_metainterp::jitcode::JitCode::new("after_call_already_fallthrough");
+    runtime_jc2.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: for_iter_residual_then_live().0,
+        startpoints: Some([call_pc, live_pc].into_iter().collect()),
+        c_num_regs_i: 1,
+        c_num_regs_r: 1,
+        ..Default::default()
+    });
+    let mut pyjit2 = crate::PyJitCode::skeleton(raw_ptr);
+    pyjit2.jitcode = std::sync::Arc::new(runtime_jc2);
+    pyjit2.metadata.is_drained = true;
+    pyjit2.metadata.n_py_instrs = n_py;
+    pyjit2.metadata.py_exact_by_jit_pc = vec![(0, want as u32)];
+    pyjit2.stamp_w_code(w_code);
+    let installed2 = crate::state::install_jitcode_for(w_code, std::sync::Arc::new(pyjit2))
+        as *const crate::state::JitCode;
+    let jitcode_index2 = unsafe { (*installed2).index };
+    assert_eq!(
+        crate::py_coord::resume_py_pc_for_jitcode_word(jitcode_index2, live_pc as i32),
+        want as i32,
+        "already-fallthrough py_exact must not advance again"
+    );
+}
+
 /// Root `zip_two_tuple_next` is `HelperReturn::CallResult`: the helper
 /// is a numbered section, the FOR_ITER dest is `CallResultSlot::At`,
 /// and Converted at the same call still collapses to no level.
@@ -24632,7 +24733,7 @@ fn helper_no_driver_boxed_out_checks_after_caller_dest_write() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    super::residual_call::note_residual_pc_advanced(&wc, parent_next);
+    super::residual_call::note_residual_pc_advanced(&wc, 0, parent_next);
     let descent =
         super::specialize::try_walker_orthodox_newutf8(&mut wc, 0, storage, length, boxed);
     assert_eq!(
@@ -24766,7 +24867,7 @@ fn helper_no_driver_orthodox_helper_boxed_checks_after_finishframe() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    super::residual_call::note_residual_pc_advanced(&wc, parent_next);
+    super::residual_call::note_residual_pc_advanced(&wc, 0, parent_next);
     let descent = super::specialize::try_walker_orthodox_kwargs_dict_new(&mut wc, 0);
     assert!(
         matches!(descent, Err(DispatchError::TraceTooLong { .. })),
@@ -27105,9 +27206,7 @@ fn nested_binop_rewind_refuse_stays_on_the_outermost_entry() {
         "a rewind refuse is a clean decline, not an abort"
     );
     let frames_materialized = true;
-    let abort_image_latchable = (err.leaves_complete_image()
-        || (frames_materialized && err.can_convert_seeded_inline()))
-        && !abort_blackhole_latched();
+    let abort_image_latchable = abort_image_latchable_for(&err, frames_materialized, false);
     assert!(
         !abort_image_latchable,
         "walk and drive_bridge_frame_subwalk must not latch this decline"
@@ -27226,6 +27325,44 @@ fn vstack_overlay_does_not_clobber_last_exc_with_const_null() {
         resume_snapshot::snapshot_stack_box(OpRef::NONE, false),
         None
     );
+}
+
+/// A missing-value abort after a heap-writing residual must latch:
+/// `_compile_and_run_once` except `SwitchToBlackhole` always
+/// `run_blackhole_interp_to_cancel_tracing`. Entry replay would re-apply
+/// the residual. `BinopRewindCommitRefused` stays a clean decline.
+#[test]
+fn vable_array_value_not_concrete_latches_after_heap_writing() {
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+    let err = DispatchError::VableArrayValueNotConcrete {
+        pc: 1137,
+        value: OpRef::NONE,
+    };
+    assert!(
+        !err.leaves_complete_image(),
+        "missing-value stays off the complete-image allow-list"
+    );
+    assert!(
+        !err.can_convert_seeded_inline(),
+        "missing-value stays off the seeded-inline convert list"
+    );
+    assert!(
+        !abort_image_latchable_for(&err, false, false),
+        "journaled-only walks keep entry replay for missing-value"
+    );
+    fbw_bump_heap_writing_effect("test");
+    assert!(
+        abort_image_latchable_for(&err, false, false),
+        "heap-writing residual forces the blackhole handoff"
+    );
+    let refuse = DispatchError::BinopRewindCommitRefused { pc: 12 };
+    assert!(
+        !abort_image_latchable_for(&refuse, true, false),
+        "a rewind refuse stays a clean decline with heap-writing"
+    );
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
 }
 
 #[test]
