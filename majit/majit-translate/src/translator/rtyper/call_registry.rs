@@ -448,8 +448,9 @@ pub struct TwoPhaseSubject {
     /// `function_graph_to_flowspace_inner` `block_map`: GraphStore
     /// `BlockId` → flowspace `BlockRef`. 1:1, including the canonical
     /// return/except blocks. Phase B records the `transform_dead_code`
-    /// cut from this map's origins; GraphStore is cut after simplify
-    /// for every graph that is not `rtype_skipped`.
+    /// cut from this map's origins. After simplify, a recorded plan
+    /// applies when the graph is not `rtype_skipped`, the GraphStore
+    /// key exists, the plan has work, and the key is not yet applied.
     pub block_map: HashMap<crate::model::BlockId, crate::flowspace::model::BlockRef>,
 }
 
@@ -498,7 +499,9 @@ pub struct TwoPhaseTypeCache {
     /// re-running the real path. Cleared/absent ⟹ legacy per-graph behaviour.
     pub prepass_done: bool,
     /// `transform_dead_code` plans recorded before `annotator.simplify`.
-    /// Applied after simplify to every graph that is not `rtype_skipped`.
+    /// Applied after simplify when the graph is not `rtype_skipped`,
+    /// the GraphStore key exists, the plan has work, and the key is
+    /// not yet applied.
     pub tdc_plans: HashMap<crate::model::GraphKey, SubjectTdcPlan>,
     /// GraphStore keys whose recorded TDC plan was applied after simplify.
     pub tdc_cut_applied: HashSet<crate::model::GraphKey>,

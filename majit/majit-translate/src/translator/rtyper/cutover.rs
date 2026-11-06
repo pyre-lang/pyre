@@ -6671,12 +6671,16 @@ fn run_phase_b_rtype_isolated(
     // Record the GraphStore `transform_dead_code` cut from
     // `links_followed` on the unsimplified flowspace graph first:
     // `simplify` also runs `eliminate_empty_blocks`, which rewrites
-    // live targets and must not decide the cut. Then simplify, then
-    // skip callers of incomplete callees, then cut every graph that
-    // is not `rtype_skipped`.
+    // live targets and must not decide the cut. Snapshot each call's
+    // callee set from the callgraph tag `(block, op_index)`
+    // (`annrpython.py` `recursivecall`) before simplify rewrites
+    // those indices (`transform_dead_op_vars`). Then simplify, then
+    // skip callers of incomplete callees, then cut every eligible
+    // graph that is not `rtype_skipped`.
     record_tdc_cuts_for_subjects(&annotator, call_registry, function_graphs);
+    let callsite_callees = snapshot_callsite_callees(&annotator, call_registry);
     run_annotator_simplify_isolated(&annotator, call_registry, determinism_trace);
-    mark_callers_of_incomplete_callees_rtype_skipped(&annotator, call_registry);
+    mark_callers_of_incomplete_callees_rtype_skipped(&annotator, call_registry, &callsite_callees);
     apply_tdc_cuts_to_graphstore(call_registry, function_graphs);
 
     loop {
@@ -7127,6 +7131,7 @@ fn record_tdc_cuts_for_subjects(
 fn mark_callers_of_incomplete_callees_rtype_skipped(
     annotator: &crate::annotator::annrpython::RPythonAnnotator,
     call_registry: &CallRegistry,
+    callsite_callees: &HashMap<Variable, HashSet<GraphKey>>,
 ) {
     let mut marked = 0usize;
     loop {
@@ -7148,7 +7153,8 @@ fn mark_callers_of_incomplete_callees_rtype_skipped(
         };
         let mut newly: Vec<GraphKey> = Vec::new();
         for (gk, graph) in jobs {
-            if caller_depends_on_incomplete_callee(annotator, &graph, &incomplete) {
+            if caller_depends_on_incomplete_callee(annotator, &graph, &incomplete, callsite_callees)
+            {
                 newly.push(gk);
             }
         }
@@ -7229,24 +7235,28 @@ fn add_function_desc_cache_graphs(
     }
 }
 
-/// Completeness is decided from this call site. `recursivecall`
-/// (`annrpython.py`) records the callee graph under the callgraph tag
-/// `(caller, block, op_index)`. `FunctionDesc.pycall` (`description.py`)
-/// `specialize`s one graph per call. An empty tag set is incomplete only
-/// when the callable's annotation is a `SomePBC` whose descriptions
-/// include a `FunctionDesc` (or a method desc that resolves to one). A
-/// `SomeNone`, Impossible, or PBC with no function desc is a genuine
-/// always-raise (`unaryop.py` `SomeNone.call`) and the caller stays
-/// complete.
+/// Completeness is decided from this call site. Callees come from
+/// `snapshot_callsite_callees`, keyed by the call result `Variable`:
+/// `recursivecall` (`annrpython.py`) records the callee under the
+/// callgraph tag `(caller, block, op_index)`, and simplify's
+/// `transform_dead_op_vars` shifts later indices. `FunctionDesc.pycall`
+/// (`description.py`) `specialize`s one graph per call. An empty set is
+/// incomplete only when the callable's annotation is a `SomePBC` whose
+/// descriptions include a `FunctionDesc` (or a method desc that
+/// resolves to one). A `SomeNone`, Impossible, or PBC with no function
+/// desc is a genuine always-raise (`unaryop.py` `SomeNone.call`) and
+/// the caller stays complete.
 fn caller_depends_on_incomplete_callee(
     annotator: &crate::annotator::annrpython::RPythonAnnotator,
     graph: &GraphRef,
     incomplete: &HashSet<GraphKey>,
+    callsite_callees: &HashMap<Variable, HashSet<GraphKey>>,
 ) -> bool {
+    let empty = HashSet::new();
     let blocks = graph.borrow().iterblocks();
     for block in &blocks {
         let ops = block.borrow().operations.clone();
-        for (op_index, op) in ops.iter().enumerate() {
+        for op in ops.iter() {
             if !is_highlevel_call_op(&op.opname) {
                 continue;
             }
@@ -7256,7 +7266,10 @@ fn caller_depends_on_incomplete_callee(
             ) {
                 continue;
             }
-            let callees = callee_graphs_for_call(annotator, graph, block, op_index);
+            let callees = match &op.result {
+                Hlvalue::Variable(v) => callsite_callees.get(v).unwrap_or(&empty),
+                _ => &empty,
+            };
             if callees.is_empty() {
                 if callable_annotation_expects_function_graph(annotator, op) {
                     return true;
@@ -7276,6 +7289,41 @@ fn is_highlevel_call_op(opname: &str) -> bool {
         opname,
         "simple_call" | "call_args" | "direct_call" | "indirect_call"
     )
+}
+
+/// Callee graphs keyed by the call's result `Variable`, captured from
+/// callgraph tags before `run_annotator_simplify_isolated`. Simplify
+/// runs `transform_dead_op_vars`, which shifts later `op_index`s in
+/// the same block; the tag `(caller, block, op_index)` from
+/// `recursivecall` (`annrpython.py`) then misses or hits the wrong
+/// operation. The result `Variable` is the same object after the
+/// rewrite.
+fn snapshot_callsite_callees(
+    annotator: &crate::annotator::annrpython::RPythonAnnotator,
+    call_registry: &CallRegistry,
+) -> HashMap<Variable, HashSet<GraphKey>> {
+    let graphs: Vec<GraphRef> = {
+        let tp = call_registry.two_phase();
+        tp.subjects.values().map(|s| s.graph.clone()).collect()
+    };
+    let mut out = HashMap::new();
+    for graph in graphs {
+        let blocks = graph.borrow().iterblocks();
+        for block in &blocks {
+            let ops = block.borrow().operations.clone();
+            for (op_index, op) in ops.iter().enumerate() {
+                if !is_highlevel_call_op(&op.opname) {
+                    continue;
+                }
+                let Hlvalue::Variable(result) = &op.result else {
+                    continue;
+                };
+                let callees = callee_graphs_for_call(annotator, &graph, &block, op_index);
+                out.insert(result.clone(), callees);
+            }
+        }
+    }
+    out
 }
 
 /// Callee graphs this call site recorded: the callgraph tag
@@ -11414,74 +11462,97 @@ mod tests {
         assert!(after.block(start).exitswitch.is_none());
     }
 
-    /// Caller of an annotate-skipped callee with an Impossible
-    /// `simple_call` result is `rtype_skipped` and GraphStore is not
-    /// cut. A complete always-raising callee leaves the caller rtyped
-    /// and applies the recorded cut.
-    #[test]
-    fn incomplete_callee_marks_caller_rtype_skipped() {
-        fn setup(
-            skip_callee: bool,
-        ) -> (
-            std::rc::Rc<crate::annotator::annrpython::RPythonAnnotator>,
-            CallRegistry,
-            crate::codewriter::call::GraphStore,
-            crate::parse::CallPath,
-            crate::model::GraphKey,
-            GraphKey,
-            crate::model::BlockId,
-        ) {
-            let (gs, flow, ann, start, _ret, _v) = unfollowed_exception_exit_fixture();
-            let (cuts, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs);
-            let caller_path = crate::parse::CallPath::for_impl_method("TdcCut", "caller");
-            let callee_path = crate::parse::CallPath::for_impl_method("TdcCut", "callee");
-            let mut store = crate::codewriter::call::GraphStore::default();
-            store.insert(caller_path.clone(), gs);
-            let store_key = store.key_for(&caller_path).expect("store key");
-            let registry = CallRegistry::new(ann.bookkeeper.clone());
-            let callee_entry = registry.get_or_register(
-                FunctionPathKey::from(&callee_path),
-                Signature::new(vec![], None, None),
+    fn mark_incomplete_callers_from_live_tags(
+        annotator: &crate::annotator::annrpython::RPythonAnnotator,
+        call_registry: &CallRegistry,
+    ) {
+        let callsite_callees = snapshot_callsite_callees(annotator, call_registry);
+        mark_callers_of_incomplete_callees_rtype_skipped(
+            annotator,
+            call_registry,
+            &callsite_callees,
+        );
+    }
+
+    fn incomplete_callee_fixture(
+        skip_callee: bool,
+    ) -> (
+        std::rc::Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        CallRegistry,
+        crate::codewriter::call::GraphStore,
+        crate::parse::CallPath,
+        crate::model::GraphKey,
+        GraphKey,
+        crate::model::BlockId,
+        GraphRef,
+    ) {
+        let (gs, flow, ann, start, _ret, _v) = unfollowed_exception_exit_fixture();
+        let (cuts, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs);
+        let caller_path = crate::parse::CallPath::for_impl_method("TdcCut", "caller");
+        let callee_path = crate::parse::CallPath::for_impl_method("TdcCut", "callee");
+        let mut store = crate::codewriter::call::GraphStore::default();
+        store.insert(caller_path.clone(), gs);
+        let store_key = store.key_for(&caller_path).expect("store key");
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let callee_entry = registry.get_or_register(
+            FunctionPathKey::from(&callee_path),
+            Signature::new(vec![], None, None),
+        );
+        let callee_start = crate::flowspace::model::Block::shared(vec![]);
+        let callee = crate::flowspace::model::FunctionGraph::new("callee", callee_start).into_ref();
+        let func = callee_entry
+            .host_object
+            .user_function()
+            .expect("registered callee")
+            .clone();
+        callee_entry.install_source_template(Rc::new(PyGraph {
+            graph: callee.clone(),
+            func,
+            signature: RefCell::new(Signature::new(vec![], None, None)),
+            defaults: RefCell::new(Some(Vec::new())),
+            access_directly: Cell::new(false),
+        }));
+        ann.translator.graphs.borrow_mut().push(callee.clone());
+        let caller_start = flow.borrow().startblock.clone();
+        let mut result = Variable::new();
+        ann.setbinding(&mut result, crate::annotator::model::s_impossible_value());
+        caller_start.borrow_mut().operations.insert(
+            0,
+            crate::flowspace::model::SpaceOperation::new(
+                "simple_call",
+                vec![Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                    callee_entry.host_object.clone(),
+                )))],
+                Hlvalue::Variable(result),
+            ),
+        );
+        ann.translator
+            .update_call_graph(&flow, &callee, (BlockKey::of(&caller_start), 0));
+        {
+            let mut tp = registry.two_phase();
+            tp.subjects.insert(
+                caller_path.clone(),
+                crate::translator::rtyper::call_registry::TwoPhaseSubject {
+                    graph: flow.clone(),
+                    pygraph: None,
+                    graph_key: GraphKey::of(&flow),
+                    value_to_var: HashMap::new(),
+                    value_to_var_candidates: HashMap::new(),
+                    constant_concretetypes: HashMap::new(),
+                    constant_hlvalues: HashMap::new(),
+                    block_map: HashMap::new(),
+                },
             );
-            let callee_start = crate::flowspace::model::Block::shared(vec![]);
-            let callee =
-                crate::flowspace::model::FunctionGraph::new("callee", callee_start).into_ref();
-            let func = callee_entry
-                .host_object
-                .user_function()
-                .expect("registered callee")
-                .clone();
-            callee_entry.install_source_template(Rc::new(PyGraph {
-                graph: callee.clone(),
-                func,
-                signature: RefCell::new(Signature::new(vec![], None, None)),
-                defaults: RefCell::new(Some(Vec::new())),
-                access_directly: Cell::new(false),
-            }));
-            ann.translator.graphs.borrow_mut().push(callee.clone());
-            let caller_start = flow.borrow().startblock.clone();
-            let mut result = Variable::new();
-            ann.setbinding(&mut result, crate::annotator::model::s_impossible_value());
-            caller_start.borrow_mut().operations.insert(
-                0,
-                crate::flowspace::model::SpaceOperation::new(
-                    "simple_call",
-                    vec![Hlvalue::Constant(Constant::new(ConstValue::HostObject(
-                        callee_entry.host_object.clone(),
-                    )))],
-                    Hlvalue::Variable(result),
-                ),
-            );
-            ann.translator
-                .update_call_graph(&flow, &callee, (BlockKey::of(&caller_start), 0));
-            {
-                let mut tp = registry.two_phase();
+            if skip_callee {
+                tp.annotate_skipped
+                    .insert(callee_path, "phaseA fail".to_string());
+            } else {
                 tp.subjects.insert(
-                    caller_path.clone(),
+                    callee_path,
                     crate::translator::rtyper::call_registry::TwoPhaseSubject {
-                        graph: flow.clone(),
+                        graph: callee.clone(),
                         pygraph: None,
-                        graph_key: GraphKey::of(&flow),
+                        graph_key: GraphKey::of(&callee),
                         value_to_var: HashMap::new(),
                         value_to_var_candidates: HashMap::new(),
                         constant_concretetypes: HashMap::new(),
@@ -11489,45 +11560,36 @@ mod tests {
                         block_map: HashMap::new(),
                     },
                 );
-                if skip_callee {
-                    tp.annotate_skipped
-                        .insert(callee_path, "phaseA fail".to_string());
-                } else {
-                    tp.subjects.insert(
-                        callee_path,
-                        crate::translator::rtyper::call_registry::TwoPhaseSubject {
-                            graph: callee.clone(),
-                            pygraph: None,
-                            graph_key: GraphKey::of(&callee),
-                            value_to_var: HashMap::new(),
-                            value_to_var_candidates: HashMap::new(),
-                            constant_concretetypes: HashMap::new(),
-                            constant_hlvalues: HashMap::new(),
-                            block_map: HashMap::new(),
-                        },
-                    );
-                }
-                tp.tdc_plans.insert(
-                    store_key.clone(),
-                    SubjectTdcPlan {
-                        cuts,
-                        value_to_var: HashMap::new(),
-                    },
-                );
             }
-            (
-                ann,
-                registry,
-                store,
-                caller_path,
-                store_key,
-                GraphKey::of(&flow),
-                start,
-            )
+            tp.tdc_plans.insert(
+                store_key.clone(),
+                SubjectTdcPlan {
+                    cuts,
+                    value_to_var: HashMap::new(),
+                },
+            );
         }
+        (
+            ann,
+            registry,
+            store,
+            caller_path,
+            store_key,
+            GraphKey::of(&flow),
+            start,
+            flow,
+        )
+    }
 
-        let (ann, registry, store, path, store_key, caller_key, start) = setup(true);
-        mark_callers_of_incomplete_callees_rtype_skipped(&ann, &registry);
+    /// Caller of an annotate-skipped callee with an Impossible
+    /// `simple_call` result is `rtype_skipped` and GraphStore is not
+    /// cut. A complete always-raising callee leaves the caller rtyped
+    /// and applies the recorded cut.
+    #[test]
+    fn incomplete_callee_marks_caller_rtype_skipped() {
+        let (ann, registry, store, path, store_key, caller_key, start, _flow) =
+            incomplete_callee_fixture(true);
+        mark_incomplete_callers_from_live_tags(&ann, &registry);
         apply_tdc_cuts_to_graphstore(&registry, &store);
         {
             let tp = registry.two_phase();
@@ -11537,8 +11599,58 @@ mod tests {
         let after = store.get_built(&path).expect("built graph");
         assert_eq!(after.block(start).exits.len(), 2);
 
-        let (ann, registry, store, path, store_key, caller_key, start) = setup(false);
-        mark_callers_of_incomplete_callees_rtype_skipped(&ann, &registry);
+        let (ann, registry, store, path, store_key, caller_key, start, _flow) =
+            incomplete_callee_fixture(false);
+        mark_incomplete_callers_from_live_tags(&ann, &registry);
+        apply_tdc_cuts_to_graphstore(&registry, &store);
+        {
+            let tp = registry.two_phase();
+            assert!(!tp.rtype_skipped.contains(&caller_key));
+            assert!(tp.tdc_cut_applied.contains(&store_key));
+        }
+        let after = store.get_built(&path).expect("built graph");
+        assert_eq!(after.block(start).exits.len(), 1);
+    }
+
+    fn shift_call_op_index(flow: &GraphRef) {
+        let caller_start = flow.borrow().startblock.clone();
+        caller_start.borrow_mut().operations.insert(
+            0,
+            crate::flowspace::model::SpaceOperation::new(
+                "same_as",
+                vec![Hlvalue::Constant(Constant::new(ConstValue::Int(0)))],
+                Hlvalue::Variable(Variable::new()),
+            ),
+        );
+    }
+
+    /// `transform_dead_op_vars` can insert or drop ops before a call
+    /// and shift `op_index`. A live `(block, op_index)` lookup then
+    /// sees an empty tag and treats a complete `FunctionDesc` call as
+    /// missing (`function_desc_without_graph_skips_caller`). The
+    /// pre-simplify snapshot, keyed by the call result `Variable`,
+    /// still finds the recorded callee.
+    #[test]
+    fn incomplete_callee_skip_uses_pre_simplify_callgraph_tag() {
+        let (ann, registry, store, path, store_key, caller_key, start, flow) =
+            incomplete_callee_fixture(false);
+        shift_call_op_index(&flow);
+        let post = snapshot_callsite_callees(&ann, &registry);
+        mark_callers_of_incomplete_callees_rtype_skipped(&ann, &registry, &post);
+        apply_tdc_cuts_to_graphstore(&registry, &store);
+        {
+            let tp = registry.two_phase();
+            assert!(tp.rtype_skipped.contains(&caller_key));
+            assert!(!tp.tdc_cut_applied.contains(&store_key));
+        }
+        let after = store.get_built(&path).expect("built graph");
+        assert_eq!(after.block(start).exits.len(), 2);
+
+        let (ann, registry, store, path, store_key, caller_key, start, flow) =
+            incomplete_callee_fixture(false);
+        let pre = snapshot_callsite_callees(&ann, &registry);
+        shift_call_op_index(&flow);
+        mark_callers_of_incomplete_callees_rtype_skipped(&ann, &registry, &pre);
         apply_tdc_cuts_to_graphstore(&registry, &store);
         {
             let tp = registry.two_phase();
@@ -11596,7 +11708,7 @@ mod tests {
                 },
             );
         }
-        mark_callers_of_incomplete_callees_rtype_skipped(&ann, &registry);
+        mark_incomplete_callers_from_live_tags(&ann, &registry);
         apply_tdc_cuts_to_graphstore(&registry, &store);
         let tp = registry.two_phase();
         assert!(!tp.rtype_skipped.contains(&GraphKey::of(&flow)));
@@ -11666,7 +11778,7 @@ mod tests {
                 },
             );
         }
-        mark_callers_of_incomplete_callees_rtype_skipped(&ann, &registry);
+        mark_incomplete_callers_from_live_tags(&ann, &registry);
         apply_tdc_cuts_to_graphstore(&registry, &store);
         let tp = registry.two_phase();
         assert!(tp.rtype_skipped.contains(&GraphKey::of(&flow)));
@@ -11781,7 +11893,7 @@ mod tests {
                 },
             );
         }
-        mark_callers_of_incomplete_callees_rtype_skipped(&ann, &registry);
+        mark_incomplete_callers_from_live_tags(&ann, &registry);
         apply_tdc_cuts_to_graphstore(&registry, &store);
         let tp = registry.two_phase();
         assert!(!tp.rtype_skipped.contains(&GraphKey::of(&flow)));
