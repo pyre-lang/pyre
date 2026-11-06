@@ -30055,6 +30055,9 @@ fn capture_root_parent_resume_stack_keeps_post_pop_call_slots() {
     let mut parent_pyframe = Box::new(std::mem::MaybeUninit::<pyre_interpreter::PyFrame>::zeroed());
     let parent_frame_ptr = parent_pyframe.as_mut_ptr() as *mut u8;
     unsafe {
+        // `concrete_stack_depth` identifies a live PyFrame by
+        // `ob_type == FRAME_TYPE` (`specialize.rs` / `PyFrame::new`).
+        (*parent_pyframe.as_mut_ptr()).ob_header.ob_type = &pyre_interpreter::pyframe::FRAME_TYPE;
         let vsd =
             parent_frame_ptr.add(crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET) as *mut usize;
         *vsd = nlocals + POST_POP_OPERAND_DEPTH;
