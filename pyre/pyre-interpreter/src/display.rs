@@ -356,12 +356,12 @@ pub(crate) fn bytes_repr_string(data: &[u8]) -> String {
     out
 }
 
-fn repr_active() -> Option<&'static std::cell::RefCell<Vec<PyObjectRef>>> {
+fn with_repr_ec<T>(f: impl FnOnce(&crate::PyExecutionContext) -> T) -> Option<T> {
     let ec = crate::call::ensure_executioncontext();
     if ec.is_null() {
         return None;
     }
-    Some(unsafe { &(*ec).repr_active })
+    Some(f(unsafe { &*ec }))
 }
 
 /// Record `obj` as mid-repr on this execution context, or report `false`
@@ -369,16 +369,7 @@ fn repr_active() -> Option<&'static std::cell::RefCell<Vec<PyObjectRef>>> {
 /// (`objspace.py get_objects_in_repr` / `cpyext Py_ReprEnter`).
 #[majit_macros::dont_look_inside]
 pub(crate) fn repr_enter(obj: PyObjectRef) -> bool {
-    let Some(active) = repr_active() else {
-        return false;
-    };
-    let mut active = active.borrow_mut();
-    if active.contains(&obj) {
-        false
-    } else {
-        active.push(obj);
-        true
-    }
+    with_repr_ec(|ec| ec.repr_active_enter(obj)).unwrap_or(false)
 }
 
 /// Length of the mid-repr set. The `Ref` deref stays in this residual.
@@ -386,22 +377,13 @@ pub(crate) fn repr_enter(obj: PyObjectRef) -> bool {
 /// at least one, so the caller can subtract without matching `Option`.
 #[majit_macros::dont_look_inside]
 fn repr_active_len() -> usize {
-    match repr_active() {
-        Some(active) => active.borrow().len(),
-        None => 0,
-    }
+    with_repr_ec(|ec| ec.repr_active_len()).unwrap_or(0)
 }
 
 /// Drop `obj` from the mid-repr set (`Py_ReprLeave`) — see [`repr_enter`].
 #[majit_macros::dont_look_inside]
 pub(crate) fn repr_leave(obj: PyObjectRef) {
-    let Some(active) = repr_active() else {
-        return;
-    };
-    let mut active = active.borrow_mut();
-    if let Some(pos) = active.iter().rposition(|&entry| entry == obj) {
-        active.remove(pos);
-    }
+    let _ = with_repr_ec(|ec| ec.repr_active_leave(obj));
 }
 
 /// Drop the entry `repr_enter` pushed at `index` — see [`repr_leave`].
@@ -410,13 +392,7 @@ pub(crate) fn repr_leave(obj: PyObjectRef) {
 /// the object is a Rust local the collector does not update, so matching on it
 /// would miss a forwarded entry and leave the set holding a finished repr.
 fn repr_leave_at(index: usize) {
-    let Some(active) = repr_active() else {
-        return;
-    };
-    let mut active = active.borrow_mut();
-    if index < active.len() {
-        active.remove(index);
-    }
+    let _ = with_repr_ec(|ec| ec.repr_active_leave_at(index));
 }
 
 /// RAII cycle guard.  `enter` returns `None` when `obj` is already being

@@ -2,14 +2,13 @@
 //! A Python loop-exit fixture can return ContinueRunningNormally before its
 //! RETURN_VALUE, so construct the actual one-frame resume stream here.
 
-use std::rc::Rc;
 use std::sync::Arc;
 
 use majit_ir::{Const, GcRef, Type};
 use majit_metainterp::jitcode::JitCodeBuilder;
 use majit_metainterp::resume::{NumberingState, TAGBOX, TAGCONST, tag};
 use pyre_interpreter::pyframe::PyFrame;
-use pyre_interpreter::{Mode, PyExecutionContext, compile_source_with_filename};
+use pyre_interpreter::{Mode, alloc_execution_context, compile_source_with_filename};
 use pyre_jit::call_jit::{BlackholeResult, blackhole_resume_via_rd_numb};
 
 #[test]
@@ -22,8 +21,8 @@ fn terminal_ref_return_finishes_the_frame_and_leaves_its_execution_scope() {
             pyre_module::register();
             pyre_jit::eval::init_jit_hooks();
             let vinfo = pyre_jit::eval::driver_pair().1.clone();
-            let ec = Rc::new(PyExecutionContext::default());
-            let ec_ptr = Rc::as_ptr(&ec) as *mut PyExecutionContext;
+            let ec = alloc_execution_context();
+            let ec_ptr = ec.as_mut_ptr();
             pyre_interpreter::call::set_last_exec_ctx(ec_ptr);
 
             let live = pyre_jit_trace::state::intern_liveness(&[], &[0], &[]).unwrap();
@@ -101,7 +100,7 @@ fn terminal_ref_return_finishes_the_frame_and_leaves_its_execution_scope() {
                 };
                 assert_eq!(returned, frame_ptr.cast());
                 assert!(frame.frame_finished_execution());
-                assert!(unsafe { (*ec_ptr).topframeref.is_null() });
+                assert!(unsafe { (*ec_ptr).topframeref().is_null() });
             }
         })
         .unwrap()

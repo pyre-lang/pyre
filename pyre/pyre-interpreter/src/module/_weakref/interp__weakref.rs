@@ -1329,7 +1329,7 @@ pub fn finalize_weakrefs(w_obj: PyObjectRef) {
             let ec = crate::call::getexecutioncontext();
             if !ec.is_null() {
                 crate::executioncontext::report_error(
-                    unsafe { (*ec).space },
+                    unsafe { (*ec).space() },
                     &error,
                     rustpython_wtf8::Wtf8::new("weakref callback "),
                     current_callable(),

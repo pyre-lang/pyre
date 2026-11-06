@@ -363,7 +363,7 @@ impl TopFrameRefGuard {
         let (saved_root, saved_recursion) = if ec.is_null() {
             (None, None)
         } else {
-            let saved = unsafe { (*ec).topframeref };
+            let saved = unsafe { (*ec).topframeref() };
             (
                 Some(majit_gc::shadow_stack::push(majit_ir::GcRef(
                     saved as usize,
@@ -387,7 +387,7 @@ impl Drop for TopFrameRefGuard {
         let saved = majit_gc::shadow_stack::get(saved_root);
         majit_gc::shadow_stack::pop_to(saved_root);
         unsafe {
-            (*self.ec).topframeref = saved.0 as *mut PyFrame;
+            (*self.ec).set_topframeref(saved.0 as *mut PyFrame);
             if let Some((depth, accounted)) = self.saved_recursion {
                 (*self.ec).py_recursion_depth = depth;
                 (*self.ec).accounted_activation = accounted;
@@ -1703,9 +1703,10 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
 ///     `FRAME_DEBUG_DATA_GC_TYPE_ID` offset walker owns these; a raw
 ///     `malloc_raw` payload forwards them in place.
 ///
-/// Excluded (matches the walker): `execution_context` (persistent, not
-/// GC), the module-dict / method-cache / prebuilt-family global walks (those are not frame-owned; the
-/// root walker performs them once per collection, not per frame).
+/// Excluded (matches the walker): `execution_context` (ExecutionContext is
+/// a GC object; the frame holds no EC field), the module-dict / method-cache /
+/// prebuilt-family global walks (those are not frame-owned; the root walker
+/// performs them once per collection, not per frame).
 unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let frame = unsafe { &mut *(obj_addr as *mut PyFrame) };
 
@@ -5443,6 +5444,26 @@ fn build_gc() -> Box<MiniMarkGC> {
         .without_app_level_typedef(),
     );
     pyre_object::rweakvaldict::set_weakdict_gc_type_id(weakdict_tid);
+    // ExecutionContext is a plain GC object (`GcType`), not a PyObject
+    // subclass. Custom trace visits every GC slot it owns; the destructor
+    // runs drop glue for Vec/RefCell/quasi-immut watchers. Absolute tail
+    // so no hardcoded / `#[pyre_class(type_id = N)]` id moves.
+    // `pypy/interpreter/executioncontext.py` `ExecutionContext`.
+    let execution_context_tid = gc.register_type(
+        TypeInfo::with_custom_trace(
+            std::mem::size_of::<pyre_interpreter::ExecutionContext>(),
+            pyre_interpreter::executioncontext_custom_trace,
+        )
+        .with_destructor_fn(pyre_interpreter::executioncontext_destructor),
+    );
+    pyre_interpreter::EXECUTION_CONTEXT_GC_TYPE_ID.set(execution_context_tid);
+    // If `EC_DESCR_GROUP` was forced before this store, it still carries
+    // the truncated cache-key sentinel. Stamp the published tid onto that
+    // same SizeDescr so `register_unresolved_struct_tids` mints nothing
+    // for it. Do not force the group: a later force reads this cell.
+    pyre_jit_trace::descr::restamp_execution_context_size_descr_if_unresolved(
+        execution_context_tid,
+    );
     gc.assign_inheritance_ids_now();
     pyre_interpreter::typedef::init_subclass_ranges();
     assert_subclass_ranges(
@@ -8039,7 +8060,7 @@ pub(crate) fn run_blackhole_interp_to_cancel_tracing(
     let set_topframeref = |frame_ptr: i64| {
         if frame_ptr != 0 {
             unsafe {
-                (*ec).topframeref = frame_ptr as *mut PyFrame;
+                (*ec).set_topframeref(frame_ptr as *mut PyFrame);
             }
         }
     };
@@ -8796,7 +8817,7 @@ fn finish_generatorentry_after_walk_abort(
             pyre_object::generator::w_generator_set_running(live_gen, false);
             let ec = pyre_interpreter::call::getexecutioncontext()
                 as *mut pyre_interpreter::PyExecutionContext;
-            if !ec.is_null() && (*ec).current_gen_or_coroutine == live_gen {
+            if !ec.is_null() && (*ec).current_gen_or_coroutine() == live_gen {
                 (*ec).pop_gen_or_coroutine(live_gen);
             }
         }
@@ -10767,6 +10788,10 @@ pub(crate) fn pyre_portal_runner(
         frame.set_last_instr_from_next_instr(next_instr);
     }
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+    let _root = gc_roots::push_roots();
+    if !saved_ctx.is_null() {
+        let _ = gc_roots::pin_root(saved_ctx as pyre_object::PyObjectRef);
+    }
     if !ec.is_null() {
         pyre_interpreter::call::set_last_exec_ctx(ec);
     }
@@ -11648,7 +11673,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 unsafe { (*ec_ptr).run_failed_attr_finalizers() };
                 f = reload_loop_frame!(f, root_slot);
             }
-            let needs_trace = unsafe { !(*ec_ptr).w_tracefunc.is_null() };
+            let needs_trace = unsafe { !(*ec_ptr).w_tracefunc().is_null() };
             // A fired breaker stores `-1` into the action ticker
             // (`fire_action_ticker`), so the no-tracer arm's
             // `decrement_ticker < 0` runs `action_dispatcher`.

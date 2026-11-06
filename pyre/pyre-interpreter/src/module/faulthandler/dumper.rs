@@ -169,7 +169,7 @@ pub unsafe extern "C" fn _dump_callback(fd: INT, ec: *const pyre_interpreter::Py
     let mut frame = if ec.is_null() {
         std::ptr::null_mut()
     } else {
-        unsafe { (*ec).topframeref }
+        unsafe { (*ec).topframeref() }
     };
     // `traceback.c dump_traceback`.
     if frame.is_null() {

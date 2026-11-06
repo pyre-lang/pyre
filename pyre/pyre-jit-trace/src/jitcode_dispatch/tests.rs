@@ -2759,7 +2759,7 @@ fn loop_callee_portal_guard_not_forced_snapshot_abort_leaves_callee_ec() {
     }
     let caller_top = unsafe { (*frame_ptr).f_backref };
     assert_eq!(
-        unsafe { (*ec).topframeref },
+        unsafe { (*ec).topframeref() },
         frame_ptr,
         "the assembler leg starts with the callee as topframeref"
     );
@@ -2875,7 +2875,7 @@ fn loop_callee_portal_guard_not_forced_snapshot_abort_leaves_callee_ec() {
         "after_residual_call capture has no trailing -live- on this fixture"
     );
     assert_eq!(
-        unsafe { (*ec).topframeref },
+        unsafe { (*ec).topframeref() },
         caller_top,
         "execute_frame finally restores topframeref when the snapshot aborts"
     );
@@ -9449,7 +9449,7 @@ fn walker_pin_classmethod_w_function_records_quasiimmut_from_mutate_descr() {
 fn walker_pin_ec_w_tracefunc_records_quasiimmut_from_mutate_descr() {
     // `executioncontext.py _immutable_fields_ = ['w_tracefunc?']`.
     pyre_interpreter::test_hooks::install_hash_hook();
-    let ec = Box::into_raw(Box::new(pyre_interpreter::ExecutionContext::new()));
+    let ec = pyre_interpreter::alloc_execution_context().as_mut_ptr();
     walker_pin_mapdict_records_quasiimmut_from_mutate(
         |wc| {
             let ec_box = wc.trace_ctx.const_ref(ec as i64);
@@ -9472,7 +9472,7 @@ fn walker_call_trace_hook_reads_guards_null_hooks() {
     // with `gettrace = jit.promote(self.w_tracefunc)`.
     pyre_interpreter::test_hooks::install_hash_hook();
     let _hook_guard = WalkerQmutHookGuard::install();
-    let ec = Box::into_raw(Box::new(pyre_interpreter::ExecutionContext::new()));
+    let ec = pyre_interpreter::alloc_execution_context().as_mut_ptr();
     let _tls = LastExecCtxGuard::install(ec);
     let mut tc = fresh_trace_ctx();
     let mut regs_r: [OpRef; 0] = [];
@@ -9553,7 +9553,7 @@ fn walker_call_trace_hook_reads_guards_null_hooks() {
 fn walker_pin_ec_profilefunc_records_quasiimmut_from_mutate_descr() {
     // `executioncontext.py _immutable_fields_ = ['profilefunc?']`.
     pyre_interpreter::test_hooks::install_hash_hook();
-    let ec = Box::into_raw(Box::new(pyre_interpreter::ExecutionContext::new()));
+    let ec = pyre_interpreter::alloc_execution_context().as_mut_ptr();
     walker_pin_mapdict_records_quasiimmut_from_mutate(
         |wc| {
             let ec_box = wc.trace_ctx.const_ref(ec as i64);
@@ -9573,13 +9573,18 @@ fn walker_pin_ec_profilefunc_records_quasiimmut_from_mutate_descr() {
 /// into a sibling test on the same thread.
 struct LastExecCtxGuard {
     saved: *const pyre_interpreter::PyExecutionContext,
+    _root: pyre_object::gc_roots::RootScope,
 }
 
 impl LastExecCtxGuard {
     fn install(ec: *const pyre_interpreter::PyExecutionContext) -> Self {
         let saved = pyre_interpreter::call::take_last_exec_ctx();
+        let _root = pyre_object::gc_roots::push_roots();
+        if !saved.is_null() {
+            let _ = pyre_object::gc_roots::pin_root(saved as pyre_object::PyObjectRef);
+        }
         pyre_interpreter::call::set_last_exec_ctx(ec);
-        Self { saved }
+        Self { saved, _root }
     }
 }
 

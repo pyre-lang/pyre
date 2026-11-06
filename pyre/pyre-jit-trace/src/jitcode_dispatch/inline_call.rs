@@ -6754,7 +6754,7 @@ fn walker_ec_enter(
     // `record_op` / `virtual_ref_during_tracing` allocate in the Trace pools
     // and can minor-collect. Pin the caller's pointer first so the collector
     // updates this local, then record.
-    let caller_topframeref_raw = unsafe { (*concrete_ec).topframeref };
+    let caller_topframeref_raw = unsafe { (*concrete_ec).topframeref() };
     let pinned_caller_topframeref = pin_frame_chain_ptr(caller_topframeref_raw);
     let caller_topframeref = ctx.record_op_with_descr(
         OpCode::GetfieldGcR,
@@ -6798,7 +6798,7 @@ fn walker_ec_enter(
     );
     unsafe {
         (*concrete_frame).f_backref = concrete_caller_topframeref;
-        (*concrete_ec).topframeref = concrete_vref as *mut pyre_interpreter::PyFrame;
+        (*concrete_ec).set_topframeref(concrete_vref as *mut pyre_interpreter::PyFrame);
     }
     vref
 }
@@ -6933,8 +6933,8 @@ pub(crate) fn walker_ec_leave(
         majit_ir::Value::Ref(majit_ir::GcRef(concrete_f_backref as usize)),
     );
     let escaped = unsafe {
-        let frame_vref = (*concrete_ec).topframeref;
-        (*concrete_ec).topframeref = concrete_f_backref;
+        let frame_vref = (*concrete_ec).topframeref();
+        (*concrete_ec).set_topframeref(concrete_f_backref);
         let escaped = (*concrete_frame).escaped() || got_exception;
         if escaped {
             // A frame that reached app level must keep its caller reachable
@@ -7035,9 +7035,9 @@ pub(crate) fn abandon_entered_frame(
         return;
     }
     unsafe {
-        let frame_vref = (*concrete_ec).topframeref;
+        let frame_vref = (*concrete_ec).topframeref();
         let concrete_f_backref = (*concrete_frame).f_backref;
-        (*concrete_ec).topframeref = concrete_f_backref;
+        (*concrete_ec).set_topframeref(concrete_f_backref);
         if (*concrete_frame).escaped() {
             let f_back = (*concrete_frame).get_f_back();
             if !f_back.is_null() {

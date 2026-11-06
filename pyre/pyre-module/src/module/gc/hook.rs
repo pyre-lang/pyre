@@ -477,7 +477,7 @@ pub fn hooks_object() -> PyObjectRef {
     );
     unsafe {
         initialize(
-            (*ec).space,
+            (*ec).space(),
             &mut (*ec).actionflag as &mut (dyn ActionFlagOps + 'static),
         )
     }

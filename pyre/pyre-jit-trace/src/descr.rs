@@ -843,6 +843,9 @@ pub use pyre_interpreter::pyframe::PYFRAME_GC_TYPE_ID;
 // with their Rust layouts in pyre-interpreter and are re-exported here beside
 // PYFRAME_GC_TYPE_ID for the runtime registration census.
 pub use pyre_interpreter::pyframe::FRAME_DEBUG_DATA_GC_TYPE_ID;
+// Stamped at the absolute tail of `build_gc`; the cell is not a compile-time
+// const. `pypy/interpreter/executioncontext.py` `ExecutionContext`.
+pub use pyre_interpreter::executioncontext::EXECUTION_CONTEXT_GC_TYPE_ID;
 
 fn field_descr_from_group(group: &dyn FieldDescrGroup, index: usize) -> DescrRef {
     group
@@ -9662,11 +9665,11 @@ pub fn w_exception_slot_descr(kind: ExcKind, offset: usize) -> Option<DescrRef> 
 /// `field_type = Ref` and `flag = FLAG_POINTER` (`descr.py get_type_flag`
 /// for a GC `Ptr`) so a traced GETFIELD yields a Ref box that the gcmap
 /// keeps live across a collecting call.  The parent SizeDescr is
-/// `is_gc_managed = false`, so `rewrite.rs handle_write_barrier_setfield`
-/// emits no `COND_CALL_GC_WB`: the EC is a non-GC `Rc`-owned struct whose
-/// `sys_exc_value` slot is forwarded as a GC root every collection
-/// (`eval::walk_pyframe_roots`).  A single cached Arc gives the PUSH and
-/// POP ops the same `descr_identity`, so the heap optimizer
+/// `is_gc_managed = true`, so `rewrite.rs handle_write_barrier_setfield`
+/// emits `COND_CALL_GC_WB`: the EC is a translated GC instance
+/// (`executioncontext.py ExecutionContext`) allocated old-gen, and a young
+/// store into it must join the remembered set.  A single cached Arc gives
+/// the PUSH and POP ops the same `descr_identity`, so the heap optimizer
 /// dead-store-eliminates a balanced save/restore (and the stored
 /// exception, if it never otherwise escapes, stays virtual and DCEs).
 pub fn ec_sys_exc_value_descr() -> DescrRef {
@@ -9751,29 +9754,27 @@ pub fn ec_accounted_activation_descr() -> DescrRef {
     ec_field_descr(pyre_interpreter::EC_ACCOUNTED_ACTIVATION_OFFSET)
 }
 
-/// The `ExecutionContext` field group.  `type_id 0 + vtable 0` →
+/// The `ExecutionContext` field group.  `vtable 0` →
 /// `SimpleSizeDescr::is_object() == false`, so the optimizer builds a
-/// StructPtrInfo for the (non-GC) EC pointer.  The object slots are Ref-typed
+/// StructPtrInfo for a non-rclass GC struct.  The object slots are Ref-typed
 /// and Pointer-flagged (`descr.py get_type_flag` for a GC `Ptr`) so a traced
-/// GETFIELD yields a Ref box.  `handle_write_barrier_setfield` emits no
-/// `COND_CALL_GC_WB` because the parent SizeDescr is `is_gc_managed = false`
-/// (the EC has no GC header); each slot is forwarded as a GC root every
-/// collection (`eval::walk_pyframe_roots` for the running context,
-/// `module::thread`'s per-context walk for the rest).
+/// GETFIELD yields a Ref box.  `handle_write_barrier_setfield` emits
+/// `COND_CALL_GC_WB` because the parent SizeDescr is `is_gc_managed = true`
+/// (`executioncontext.py ExecutionContext` is a translated GC instance).
 ///
-/// The two activation-accounting slots are Int-typed instead.  That walk
-/// visits the context's object slots by name and never reaches them, which is
-/// what makes an integer sound here: `accounted_activation` is a bare
-/// identity token that may name an already-freed frame, so forwarding it as a
-/// root would be wrong rather than merely unnecessary.
+/// The two activation-accounting slots are Int-typed instead.  The custom
+/// trace visits the context's object slots by name and never reaches them,
+/// which is what makes an integer sound here: `accounted_activation` is a
+/// bare identity token that may name an already-freed frame, so forwarding
+/// it as a root would be wrong rather than merely unnecessary.
 ///
-/// The group is minted with `is_gc_managed = false`: `ExecutionContext` is a
-/// plain Rust struct reached through a raw pointer (`EC_SIZE` is
-/// `size_of::<ExecutionContext>()`, the offsets are `offset_of!`), so it has no
-/// type-id word at `ref - GcHeader::SIZE`.  `StructPtrInfo.make_guards` gates
-/// `GUARD_GC_TYPE` on this flag, and the default GC-managed shape made it emit
-/// `GUARD_GC_TYPE(ec, 0)` — a guard that reads the memory preceding the EC
-/// allocation and compares it against the `type_id 0` above.
+/// The collector tid is [`pyre_interpreter::EXECUTION_CONTEXT_GC_TYPE_ID`].
+/// `GUARD_GC_TYPE` reads the header word `malloc_typed_stable` prepends. An
+/// unpublished cell stores the truncated `cache_key` sentinel
+/// (`struct_tid_is_unresolved`); 0 would fail the gc-managed non-headerless
+/// census. If this group is already forced when `build_gc` publishes the
+/// tid, that store restamps this same SizeDescr so
+/// `register_unresolved_struct_tids` mints nothing for it.
 static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
     use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
     let field = |index: u32, field_key: &str, offset: usize| SimpleFieldDescrSpec {
@@ -9908,16 +9909,21 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
     // under STRUCT key 0 — that sentinel collapses every no-name group onto
     // the first insert.
     let cache_key = majit_ir::descr::path_hash("executioncontext::ExecutionContext");
+    let published = pyre_interpreter::EXECUTION_CONTEXT_GC_TYPE_ID.get();
+    let type_id = if published == pyre_object::lltype::TypeIdCell::UNASSIGNED {
+        cache_key as u32
+    } else {
+        published
+    };
     let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
         u32::MAX,
         pyre_interpreter::EC_SIZE,
-        0,
+        type_id,
         cache_key,
         0,
-        // is_gc_managed: no GC header, so no runtime type-id to guard on.
-        false,
-        // headerless: the JIT never allocates an `ExecutionContext`, so the
-        // `NEW` rewrite shape this flag selects is not reachable.
+        // is_gc_managed: headered GC object.
+        true,
+        // headerless: `malloc_typed_stable` prepends a `GcHeader`.
         false,
         &specs,
         &[],
@@ -9928,6 +9934,41 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
     );
     group
 });
+
+/// Force + return the `ExecutionContext` size descriptor.
+///
+/// `build_gc` publishes [`pyre_interpreter::EXECUTION_CONTEXT_GC_TYPE_ID`]
+/// first and restamps this SizeDescr if it was already forced with the
+/// unpublished sentinel. A later force (this function,
+/// `force_declared_object_groups`) reads the published cell.
+pub fn execution_context_size_descr() -> DescrRef {
+    EC_DESCR_GROUP.size_descr.clone()
+}
+
+/// `EC_DESCR_GROUP` when already forced. Does not force.
+fn ec_descr_group_if_initialized() -> Option<&'static majit_ir::descr::SimpleDescrGroup> {
+    LazyLock::get(&EC_DESCR_GROUP)
+}
+
+/// Stamp `sd` with `published_tid` when it still carries the truncated
+/// cache-key sentinel (`struct_tid_is_unresolved`).
+fn restamp_size_descr_if_unresolved(sd: &majit_ir::descr::SimpleSizeDescr, published_tid: u32) {
+    if majit_ir::descr::struct_tid_is_unresolved(sd.cache_key(), sd.type_id()) {
+        sd.set_type_id(published_tid);
+    }
+}
+
+/// If `EC_DESCR_GROUP` is already initialised and still carries the
+/// truncated cache-key sentinel, stamp `published_tid` onto that same
+/// SizeDescr. Does not force the group: a later force reads the published
+/// collector cell, and `register_unresolved_struct_tids` then sees a
+/// collector tid and mints nothing for it.
+pub fn restamp_execution_context_size_descr_if_unresolved(published_tid: u32) {
+    let Some(group) = ec_descr_group_if_initialized() else {
+        return;
+    };
+    restamp_size_descr_if_unresolved(&group.size_descr, published_tid);
+}
 
 /// `gil.py` `GILThreadLocals.gil_ready` (`_immutable_fields_ = ['gil_ready?']`).
 ///
@@ -13700,6 +13741,52 @@ mod tests {
                 "case {name} resolved offsets"
             );
         }
+    }
+
+    #[test]
+    fn ec_descr_group_forced_before_tid_publication_is_restamped() {
+        // Private SizeDescr built the way `EC_DESCR_GROUP` is born while
+        // `EXECUTION_CONTEXT_GC_TYPE_ID` is unpublished: STRUCT path-hash
+        // cache key, truncated-key sentinel as `type_id`, headered GC
+        // layout, vtable 0. A private cache is the only table that sees
+        // this Arc, so the stamping helper and `register_unresolved_struct_tids`
+        // (`gc.py init_size_descr`) never touch a process-global descriptor.
+        let cache_key = majit_ir::descr::path_hash("executioncontext::ExecutionContext");
+        let mut sd = majit_ir::descr::SimpleSizeDescr::new(
+            u32::MAX,
+            pyre_interpreter::EC_SIZE,
+            cache_key as u32,
+        );
+        sd.set_cache_key(cache_key);
+        assert!(
+            cache_key > u32::MAX as u64,
+            "struct_tid_is_unresolved requires a 64-bit cache key"
+        );
+        assert!(
+            majit_ir::descr::struct_tid_is_unresolved(cache_key, sd.type_id()),
+            "unpublished construction stores the truncated cache-key sentinel"
+        );
+        assert!(sd.is_gc_managed());
+        assert!(!sd.headerless());
+        let published_tid = 0x00EC_0001;
+        super::restamp_size_descr_if_unresolved(&sd, published_tid);
+        assert_eq!(sd.type_id(), published_tid);
+        assert!(!majit_ir::descr::struct_tid_is_unresolved(
+            cache_key,
+            sd.type_id()
+        ));
+        let size: DescrRef = std::sync::Arc::new(sd);
+        let mut gc = majit_ir::descr::GcCache::new();
+        gc.register_keyed_size(majit_ir::descr::LLType::Struct(cache_key), size.clone());
+        let minted_tid = 0x00EC_FFFF;
+        let count = gc.register_unresolved_struct_tids(|_, _| minted_tid);
+        assert_eq!(count, 0);
+        assert_eq!(
+            size.as_size_descr()
+                .expect("private EC SizeDescr")
+                .type_id(),
+            published_tid
+        );
     }
 
     #[test]

@@ -634,8 +634,8 @@ mod tests {
     fn make_struct_seq_uses_applevel_structseqtype() {
         crate::test_hooks::install_hash_hook();
         crate::typedef::init_typeobjects();
-        let ec = std::rc::Rc::new(crate::PyExecutionContext::default());
-        crate::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&ec));
+        let ec = crate::alloc_execution_context();
+        crate::call::set_last_exec_ctx(ec.as_ptr());
         crate::importing::install_builtin_modules();
         let cls = super::make_struct_seq("os.stat_result", &["st_mode"]);
         let module =

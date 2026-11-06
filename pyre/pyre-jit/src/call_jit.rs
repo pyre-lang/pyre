@@ -234,15 +234,15 @@ mod tests {
     #[test]
     fn blackhole_leave_rejects_a_red_outside_the_open_frame_scope() {
         std::thread::spawn(|| {
-            let mut ec = pyre_interpreter::PyExecutionContext::default();
-            pyre_interpreter::call::set_last_exec_ctx(&ec);
+            let ec = pyre_interpreter::alloc_execution_context();
+            pyre_interpreter::call::set_last_exec_ctx(ec.as_ptr());
             let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
             // A malformed recovered red must never be dereferenced merely
             // because it is nonzero. There is no matching execution scope.
             bh.virtualizable_ptr = 2;
             let _ = super::leave_resumed_blackhole_frame(&bh, false, pyre_object::w_none(), true);
             let _ = super::leave_resumed_blackhole_frame(&bh, true, pyre_object::w_none(), true);
-            assert!(ec.topframeref.is_null());
+            assert!(ec.topframeref().is_null());
             pyre_interpreter::call::set_last_exec_ctx(std::ptr::null_mut());
         })
         .join()
@@ -257,18 +257,22 @@ mod tests {
     #[test]
     fn blackhole_leave_marks_an_on_chain_parent_without_rewriting_top() {
         std::thread::spawn(|| {
-            let mut ec = pyre_interpreter::PyExecutionContext::default();
-            pyre_interpreter::call::set_last_exec_ctx(&ec);
+            let ec = pyre_interpreter::alloc_execution_context();
+            pyre_interpreter::call::set_last_exec_ctx(ec.as_ptr());
             let mut parent = stack_pyframe();
             let mut child = stack_pyframe();
             child.f_backref = &mut parent;
-            ec.topframeref = &mut child;
+            // SAFETY: `ec` is the live `alloc_execution_context` handle for this thread.
+            unsafe { (*ec.as_mut_ptr()).set_topframeref(&mut child) };
             let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
             bh.virtualizable_ptr = std::ptr::from_mut(&mut parent) as i64;
             let _ = super::leave_resumed_blackhole_frame(&bh, false, pyre_object::w_none(), true);
             assert!(parent.frame_finished_execution());
             assert!(!child.frame_finished_execution());
-            assert!(std::ptr::eq(ec.topframeref, std::ptr::from_mut(&mut child)));
+            assert!(std::ptr::eq(
+                ec.topframeref(),
+                std::ptr::from_mut(&mut child)
+            ));
             pyre_interpreter::call::set_last_exec_ctx(std::ptr::null_mut());
         })
         .join()
@@ -278,7 +282,7 @@ mod tests {
     #[test]
     fn blackhole_leave_marks_a_parent_beyond_1024_frames() {
         std::thread::spawn(|| {
-            let mut ec = pyre_interpreter::PyExecutionContext::default();
+            let ec = pyre_interpreter::alloc_execution_context();
             // Allocate the complete chain before publishing any pointers.
             let mut frames: Vec<PyFrame> = (0..1026).map(|_| stack_pyframe()).collect();
             let base = frames.as_mut_ptr();
@@ -288,8 +292,9 @@ mod tests {
                 unsafe { (*base.add(index)).f_backref = base.add(index - 1) };
             }
             let top = unsafe { base.add(frames.len() - 1) };
-            ec.topframeref = top;
-            pyre_interpreter::call::set_last_exec_ctx(&ec);
+            // SAFETY: `ec` is the live `alloc_execution_context` handle for this thread.
+            unsafe { (*ec.as_mut_ptr()).set_topframeref(top) };
+            pyre_interpreter::call::set_last_exec_ctx(ec.as_ptr());
             let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
             bh.virtualizable_ptr = base as i64;
             let _ = super::leave_resumed_blackhole_frame(&bh, false, pyre_object::w_none(), true);
@@ -301,7 +306,7 @@ mod tests {
                     .iter()
                     .all(|frame| !frame.frame_finished_execution())
             );
-            assert!(std::ptr::eq(ec.topframeref, top));
+            assert!(std::ptr::eq(ec.topframeref(), top));
         })
         .join()
         .unwrap();
@@ -310,19 +315,20 @@ mod tests {
     #[test]
     fn blackhole_leave_closes_the_open_scope() {
         std::thread::spawn(|| {
-            let mut ec = pyre_interpreter::PyExecutionContext::default();
-            pyre_interpreter::call::set_last_exec_ctx(&ec);
+            let ec = pyre_interpreter::alloc_execution_context();
+            pyre_interpreter::call::set_last_exec_ctx(ec.as_ptr());
             let mut parent = stack_pyframe();
             let mut child = stack_pyframe();
             child.f_backref = &mut parent;
-            ec.topframeref = &mut child;
+            // SAFETY: `ec` is the live `alloc_execution_context` handle for this thread.
+            unsafe { (*ec.as_mut_ptr()).set_topframeref(&mut child) };
             let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
             bh.virtualizable_ptr = std::ptr::from_mut(&mut child) as i64;
             let _ = super::leave_resumed_blackhole_frame(&bh, false, pyre_object::w_none(), true);
             assert!(child.frame_finished_execution());
             assert!(!parent.frame_finished_execution());
             assert!(std::ptr::eq(
-                ec.topframeref,
+                ec.topframeref(),
                 std::ptr::from_mut(&mut parent)
             ));
             pyre_interpreter::call::set_last_exec_ctx(std::ptr::null_mut());
@@ -337,15 +343,19 @@ mod tests {
         // runs `execute_frame`'s `return_trace` then `leave`. This helper
         // must not emit `leaveframe` or close `topframeref` itself.
         std::thread::spawn(|| {
-            let mut ec = pyre_interpreter::PyExecutionContext::default();
-            pyre_interpreter::call::set_last_exec_ctx(&ec);
+            let ec = pyre_interpreter::alloc_execution_context();
+            pyre_interpreter::call::set_last_exec_ctx(ec.as_ptr());
             let mut child = stack_pyframe();
-            ec.topframeref = &mut child;
+            // SAFETY: `ec` is the live `alloc_execution_context` handle for this thread.
+            unsafe { (*ec.as_mut_ptr()).set_topframeref(&mut child) };
             let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
             bh.virtualizable_ptr = std::ptr::from_mut(&mut child) as i64;
             let _ = super::leave_resumed_blackhole_frame(&bh, false, pyre_object::w_none(), false);
             assert!(!child.frame_finished_execution());
-            assert!(std::ptr::eq(ec.topframeref, std::ptr::from_mut(&mut child)));
+            assert!(std::ptr::eq(
+                ec.topframeref(),
+                std::ptr::from_mut(&mut child)
+            ));
             pyre_interpreter::call::set_last_exec_ctx(std::ptr::null_mut());
         })
         .join()
@@ -359,19 +369,19 @@ mod tests {
     /// the finished frame.
     #[test]
     fn abort_blackhole_restore_does_not_replant_a_finished_callee_as_top() {
-        let mut ec = pyre_interpreter::PyExecutionContext::default();
+        let ec = pyre_interpreter::alloc_execution_context();
         let mut caller = stack_pyframe();
         let mut callee = stack_pyframe();
         callee.f_backref = std::ptr::from_mut(&mut caller);
-        ec.topframeref = std::ptr::from_mut(&mut callee);
+        unsafe { (*ec.as_mut_ptr()).set_topframeref(std::ptr::from_mut(&mut callee)) };
 
         // `finish_level(callee)`: finished bit plus `leave`'s chain walk.
         pyre_jit_trace::state::finish_blackhole_level_frame(std::ptr::from_mut(&mut callee) as i64);
-        ec.topframeref = callee.f_backref;
+        unsafe { (*ec.as_mut_ptr()).set_topframeref(callee.f_backref) };
 
-        super::reload_live_topframeref_after_blackhole_drive(std::ptr::from_mut(&mut ec));
+        super::reload_live_topframeref_after_blackhole_drive(ec.as_mut_ptr());
         assert!(
-            std::ptr::eq(ec.topframeref, std::ptr::from_mut(&mut caller)),
+            std::ptr::eq(ec.topframeref(), std::ptr::from_mut(&mut caller)),
             "leave already published the caller; the pre-drive pin must not re-plant the callee"
         );
     }
@@ -400,32 +410,35 @@ mod tests {
     fn abort_blackhole_per_code_finish_level_runs_execute_frame_leave() {
         std::thread::spawn(|| {
             RETURN_TRACE_EVENTS.with(|c| c.borrow_mut().clear());
-            let mut ec = pyre_interpreter::PyExecutionContext::default();
-            pyre_interpreter::call::set_last_exec_ctx(&ec);
+            let ec = pyre_interpreter::alloc_execution_context();
+            pyre_interpreter::call::set_last_exec_ctx(ec.as_ptr());
             // `return_trace` no-ops when `gettrace()` is null; a dummy
             // global plus `setllprofile`'s trampoline lets `_trace` record
             // the `('return', value)` `return_trace` hands it.
-            ec.w_tracefunc = pyre_object::w_bool_from(true);
-            ec.profilefunc = Some(record_return_trace);
-            ec.w_profilefuncarg = pyre_object::w_none();
+            unsafe {
+                (*ec.as_mut_ptr()).settrace(pyre_object::w_bool_from(true));
+                (*ec.as_mut_ptr())
+                    .setllprofile(Some(record_return_trace), pyre_object::w_none())
+                    .expect("setllprofile accepts a dummy trampoline");
+            }
             let mut caller = stack_pyframe();
             let mut callee = stack_pyframe();
             callee.f_backref = std::ptr::from_mut(&mut caller);
             callee.mark_as_escaped();
-            ec.topframeref = std::ptr::from_mut(&mut callee);
+            unsafe { (*ec.as_mut_ptr()).set_topframeref(std::ptr::from_mut(&mut callee)) };
             let callee_ptr = std::ptr::from_mut(&mut callee) as i64;
             let portal_frame = std::ptr::from_mut(&mut caller) as i64;
             let w_value = pyre_object::intobject::w_int_new(42);
             super::finish_blackhole_level(
                 callee_ptr,
                 portal_frame,
-                std::ptr::from_mut(&mut ec),
+                ec.as_mut_ptr(),
                 majit_metainterp::blackhole::LevelExit::Return(w_value as i64),
             );
             pyre_interpreter::call::set_last_exec_ctx(std::ptr::null_mut());
             assert!(callee.frame_finished_execution());
             assert!(
-                std::ptr::eq(ec.topframeref, std::ptr::from_mut(&mut caller)),
+                std::ptr::eq(ec.topframeref(), std::ptr::from_mut(&mut caller)),
                 "leave publishes the caller as topframeref"
             );
             assert!(
@@ -449,24 +462,24 @@ mod tests {
     #[test]
     fn abort_blackhole_per_code_finish_level_exception_sets_got_exception() {
         std::thread::spawn(|| {
-            let mut ec = pyre_interpreter::PyExecutionContext::default();
-            pyre_interpreter::call::set_last_exec_ctx(&ec);
+            let ec = pyre_interpreter::alloc_execution_context();
+            pyre_interpreter::call::set_last_exec_ctx(ec.as_ptr());
             let mut caller = stack_pyframe();
             let mut callee = stack_pyframe();
             callee.f_backref = std::ptr::from_mut(&mut caller);
-            ec.topframeref = std::ptr::from_mut(&mut callee);
+            unsafe { (*ec.as_mut_ptr()).set_topframeref(std::ptr::from_mut(&mut callee)) };
             let callee_ptr = std::ptr::from_mut(&mut callee) as i64;
             let portal_frame = std::ptr::from_mut(&mut caller) as i64;
             super::finish_blackhole_level(
                 callee_ptr,
                 portal_frame,
-                std::ptr::from_mut(&mut ec),
+                ec.as_mut_ptr(),
                 majit_metainterp::blackhole::LevelExit::Exception,
             );
             pyre_interpreter::call::set_last_exec_ctx(std::ptr::null_mut());
             assert!(callee.frame_finished_execution());
             assert!(
-                std::ptr::eq(ec.topframeref, std::ptr::from_mut(&mut caller)),
+                std::ptr::eq(ec.topframeref(), std::ptr::from_mut(&mut caller)),
                 "leave publishes the caller as topframeref"
             );
             assert!(
@@ -1512,6 +1525,10 @@ pub extern "C" fn bh_portal_runner_c(
     // the duration of the call: `eval_loop_jit` reads its execution context
     // through `space.getexecutioncontext()`.
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+    let _root = pyre_object::gc_roots::push_roots();
+    if !saved_ctx.is_null() {
+        let _ = pyre_object::gc_roots::pin_root(saved_ctx as PyObjectRef);
+    }
     if !ec.is_null() {
         pyre_interpreter::call::set_last_exec_ctx(ec);
     }
@@ -1589,9 +1606,10 @@ pub(crate) fn reload_live_topframeref_after_blackhole_drive(
         return;
     }
     unsafe {
-        let current = (*ec).topframeref as pyre_object::gc_hook::GCREF;
-        (*ec).topframeref =
-            pyre_object::gc_hook::try_gc_current_object_address(current) as *mut PyFrame;
+        let current = (*ec).topframeref() as pyre_object::gc_hook::GCREF;
+        (*ec).set_topframeref(
+            pyre_object::gc_hook::try_gc_current_object_address(current) as *mut PyFrame
+        );
     }
 }
 
@@ -1679,7 +1697,7 @@ pub(crate) fn finish_blackhole_level(
     pyre_jit_trace::state::finish_blackhole_level_frame(frame_ptr);
     if !ec.is_null() && frame_ptr != 0 {
         unsafe {
-            (*ec).topframeref = (*(frame_ptr as *mut PyFrame)).f_backref;
+            (*ec).set_topframeref((*(frame_ptr as *mut PyFrame)).f_backref);
         }
     }
     None
@@ -1725,7 +1743,7 @@ fn run_python_portal_abort_blackhole(
             return;
         }
         unsafe {
-            (*ec).topframeref = frame_ptr as *mut PyFrame;
+            (*ec).set_topframeref(frame_ptr as *mut PyFrame);
         }
     };
     // `pyframe.py execute_frame` `insert_stack_check_here` charges each
@@ -2836,7 +2854,7 @@ fn leave_resumed_blackhole_frame(
     if ec.is_null() {
         return Ok(w_exitvalue);
     }
-    let open = unsafe { pyre_interpreter::executioncontext::vref_referent((*ec).topframeref) };
+    let open = unsafe { pyre_interpreter::executioncontext::vref_referent((*ec).topframeref()) };
     let is_open = std::ptr::eq(open, recovered);
     if !is_open && !frame_is_on_unforced_ec_chain(ec, recovered) {
         return Ok(w_exitvalue);
@@ -2867,7 +2885,7 @@ fn leave_resumed_blackhole_frame(
     }
     let recovered = roots.get(frame_slot) as *mut PyFrame;
     let chain_got_exception = got_exception || return_trace_raised;
-    let open = unsafe { pyre_interpreter::executioncontext::vref_referent((*ec).topframeref) };
+    let open = unsafe { pyre_interpreter::executioncontext::vref_referent((*ec).topframeref()) };
     if std::ptr::eq(open, recovered) {
         // `leave(frame)` is given the current top. The recovered red is that
         // frame, so run the chain half in full.
@@ -2897,7 +2915,7 @@ fn frame_is_on_unforced_ec_chain(
     ec: *mut pyre_interpreter::PyExecutionContext,
     frame_ptr: *mut PyFrame,
 ) -> bool {
-    let mut cur = unsafe { pyre_interpreter::executioncontext::vref_referent((*ec).topframeref) };
+    let mut cur = unsafe { pyre_interpreter::executioncontext::vref_referent((*ec).topframeref()) };
     // ExecutionContext.enter/leave (executioncontext.py) maintain a chain
     // ending at null, not a fixed-depth window. A recovered ancestor may be
     // arbitrarily far below the open scope when the recursion limit is raised.
@@ -2959,7 +2977,7 @@ fn leave_compiled_frame_chain(frame_ptr: *mut PyFrame, got_exception: bool) {
     if ec.is_null() {
         return;
     }
-    let frame_vref = unsafe { (*ec).topframeref };
+    let frame_vref = unsafe { (*ec).topframeref() };
     if !std::ptr::eq(
         pyre_interpreter::executioncontext::vref_referent(frame_vref),
         frame_ptr,
@@ -2976,7 +2994,7 @@ fn leave_compiled_frame_chain(frame_ptr: *mut PyFrame, got_exception: bool) {
         // frame finished. Only dereference the recovered red after proving
         // that it names this execution context's still-open frame scope.
         (*frame_ptr).set_frame_finished_execution(true);
-        (*ec).topframeref = (*frame_ptr).f_backref;
+        (*ec).set_topframeref((*frame_ptr).f_backref);
         if (*frame_ptr).escaped() || got_exception {
             // `f_back = frame.f_backref()` — with the parens, so an inlined
             // caller that is still virtual is materialised here rather than
@@ -3029,7 +3047,7 @@ fn leave_frames_handed_to_portal_call(
     // The exception the guard grabbed belongs to the innermost call alone.
     let mut got_exception = got_exception;
     loop {
-        let top = unsafe { pyre_interpreter::executioncontext::vref_referent((*ec).topframeref) };
+        let top = unsafe { pyre_interpreter::executioncontext::vref_referent((*ec).topframeref()) };
         if top.is_null() || resumed(top) || !unsafe { (*top).frame_finished_execution() } {
             return;
         }
@@ -4074,6 +4092,10 @@ fn handle_blackhole_result(bh_result: BlackholeResult) -> Option<i64> {
                 frame.set_last_instr_from_next_instr(next_instr);
             }
             let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+            let _root = pyre_object::gc_roots::push_roots();
+            if !saved_ctx.is_null() {
+                let _ = pyre_object::gc_roots::pin_root(saved_ctx as PyObjectRef);
+            }
             if !ec.is_null() {
                 pyre_interpreter::call::set_last_exec_ctx(ec);
             }
@@ -6890,7 +6912,7 @@ fn bh_call_self_recursive_portal(
     // virtual), so there is nothing to compare: decline, and the generic
     // residual below runs the call.
     let parent_frame_ptr =
-        unsafe { pyre_interpreter::executioncontext::vref_referent((*ec).topframeref) };
+        unsafe { pyre_interpreter::executioncontext::vref_referent((*ec).topframeref()) };
     if parent_frame_ptr.is_null() {
         return None;
     }
@@ -7096,6 +7118,10 @@ fn bh_call_kw_impl(
     // interpreter's own CALL_KW installs.
     let profile_frame = residual_call_c_profile_frame(ec, callable);
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+    let _root = pyre_object::gc_roots::push_roots();
+    if !saved_ctx.is_null() {
+        let _ = pyre_object::gc_roots::pin_root(saved_ctx as PyObjectRef);
+    }
     pyre_interpreter::call::set_last_exec_ctx(ec);
     let result = {
         let _plain_guard = pyre_interpreter::call::force_plain_eval();
@@ -7445,6 +7471,10 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
             return result;
         }
         let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+        let _root = pyre_object::gc_roots::push_roots();
+        if !saved_ctx.is_null() {
+            let _ = pyre_object::gc_roots::pin_root(saved_ctx as PyObjectRef);
+        }
         // `set_last_exec_ctx` mirrors what the portal runner does on frame
         // re-entry so user functions invoked from the residual path observe
         // the caller's execution context.  That is `ec` itself: a frame's
@@ -7498,6 +7528,10 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     // without this pin it would use whatever frame last entered
     // `eval_frame_*`, which is not guaranteed to be the blackhole caller.
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+    let _root = pyre_object::gc_roots::push_roots();
+    if !saved_ctx.is_null() {
+        let _ = pyre_object::gc_roots::pin_root(saved_ctx as PyObjectRef);
+    }
     pyre_interpreter::call::set_last_exec_ctx(ec);
     let _plain_guard = pyre_interpreter::call::force_plain_eval();
     let callable = _roots.get(root_base);
@@ -7541,6 +7575,10 @@ pub extern "C" fn bh_call_function_ex_fn(
     // [`residual_call_c_profile_frame`].
     let profile_frame = residual_call_c_profile_frame(ec, callable);
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+    let _root = pyre_object::gc_roots::push_roots();
+    if !saved_ctx.is_null() {
+        let _ = pyre_object::gc_roots::pin_root(saved_ctx as PyObjectRef);
+    }
     pyre_interpreter::call::set_last_exec_ctx(ec);
     let result = {
         let _plain_guard = pyre_interpreter::call::force_plain_eval();
@@ -8654,6 +8692,10 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
     // thread state.
     let frame_ctx = pyre_interpreter::call::getexecutioncontext();
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+    let _root = pyre_object::gc_roots::push_roots();
+    if !saved_ctx.is_null() {
+        let _ = pyre_object::gc_roots::pin_root(saved_ctx as PyObjectRef);
+    }
     if !frame_ctx.is_null() {
         pyre_interpreter::call::set_last_exec_ctx(frame_ctx);
     }

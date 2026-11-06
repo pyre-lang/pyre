@@ -150,7 +150,7 @@ fn is_resolving(op: PyObjectRef) -> bool {
     }
     unsafe {
         (*ec)
-            .lazy_imports_resolving
+            .lazy_imports_resolving()
             .borrow()
             .iter()
             .any(|&p| std::ptr::eq(p, op))
@@ -160,7 +160,7 @@ fn is_resolving(op: PyObjectRef) -> bool {
 fn resolving_push(op: PyObjectRef) {
     let ec = crate::call::getexecutioncontext();
     if !ec.is_null() {
-        unsafe { (*ec).lazy_imports_resolving.borrow_mut().push(op) };
+        unsafe { (*ec).lazy_imports_push(op) };
     }
 }
 
@@ -169,10 +169,7 @@ fn resolving_pop(op: PyObjectRef) {
     if ec.is_null() {
         return;
     }
-    let mut stack = unsafe { (*ec).lazy_imports_resolving.borrow_mut() };
-    if let Some(i) = stack.iter().rposition(|&p| std::ptr::eq(p, op)) {
-        stack.remove(i);
-    }
+    unsafe { (*ec).lazy_imports_pop(op) };
 }
 
 fn import_cycle_error(name: PyObjectRef, root_from: PyObjectRef) -> crate::PyError {

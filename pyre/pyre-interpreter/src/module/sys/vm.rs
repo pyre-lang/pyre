@@ -1297,15 +1297,15 @@ fn sys_get_asyncgen_hooks_impl(_args: &[PyObjectRef]) -> crate::PyResult {
     } else {
         unsafe {
             (
-                if (*ec).w_asyncgen_firstiter_fn.is_null() {
+                if (*ec).w_asyncgen_firstiter_fn().is_null() {
                     w_none()
                 } else {
-                    (*ec).w_asyncgen_firstiter_fn
+                    (*ec).w_asyncgen_firstiter_fn()
                 },
-                if (*ec).w_asyncgen_finalizer_fn.is_null() {
+                if (*ec).w_asyncgen_finalizer_fn().is_null() {
                     w_none()
                 } else {
-                    (*ec).w_asyncgen_finalizer_fn
+                    (*ec).w_asyncgen_finalizer_fn()
                 },
             )
         }
@@ -1331,9 +1331,9 @@ fn sys_set_asyncgen_hooks_impl(args: &[PyObjectRef]) -> crate::PyResult {
             // the second argument is invalid.
             if let Some(value) = finalizer {
                 if is_none(value) {
-                    (*ec).w_asyncgen_finalizer_fn = PY_NULL;
+                    (*ec).set_w_asyncgen_finalizer_fn(PY_NULL);
                 } else if crate::baseobjspace::callable_w(value) {
-                    (*ec).w_asyncgen_finalizer_fn = value;
+                    (*ec).set_w_asyncgen_finalizer_fn(value);
                 } else {
                     return Err(crate::PyError::type_error(format!(
                         "callable finalizer expected, got {}",
@@ -1343,9 +1343,9 @@ fn sys_set_asyncgen_hooks_impl(args: &[PyObjectRef]) -> crate::PyResult {
             }
             if let Some(value) = firstiter {
                 if is_none(value) {
-                    (*ec).w_asyncgen_firstiter_fn = PY_NULL;
+                    (*ec).set_w_asyncgen_firstiter_fn(PY_NULL);
                 } else if crate::baseobjspace::callable_w(value) {
-                    (*ec).w_asyncgen_firstiter_fn = value;
+                    (*ec).set_w_asyncgen_firstiter_fn(value);
                 } else {
                     return Err(crate::PyError::type_error(format!(
                         "callable firstiter expected, got {}",

@@ -322,41 +322,14 @@ pub fn park_if_finalizing() {
 }
 
 pub(crate) fn walk_thread_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    // PyPy's ExecutionContexts live on the translated interpreter object graph,
-    // so every object-valued EC field is traced automatically.  Pyre keeps one
-    // Rust Box per OS thread; the process-owned OSThreadLocals registry is
-    // therefore the corresponding root owner and must forward those fields in
-    // place.  In particular, tracing/profile callbacks must never become stale
-    // raw pointers after a moving collection.
+    // PyPy's ExecutionContexts live on the translated interpreter object graph
+    // and are reached from `OSThreadLocals`. The process-owned registry is
+    // that slot: visit each registered EC pointer; the object's custom trace
+    // walks its fields.
     {
-        let contexts = EXECUTION_CONTEXTS.lock();
-        for &ec_addr in contexts.values() {
-            let ec = unsafe { &mut *(ec_addr as *mut crate::PyExecutionContext) };
-            let mut forward = |slot: &mut PyObjectRef| {
-                if !slot.is_null() {
-                    visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
-                }
-            };
-            forward(&mut ec.space);
-            forward(&mut ec.w_tracefunc);
-            forward(&mut ec.compiler);
-            forward(&mut ec.w_profilefuncarg);
-            forward(&mut ec.w_async_exception_type);
-            forward(&mut ec.sys_exc_value);
-            forward(&mut ec.current_gen_or_coroutine);
-            forward(&mut ec.w_asyncgen_firstiter_fn);
-            forward(&mut ec.w_asyncgen_finalizer_fn);
-            if !ec.topframeref.is_null() {
-                let mut frame = ec.topframeref as PyObjectRef;
-                forward(&mut frame);
-                ec.topframeref = frame as *mut crate::PyFrame;
-            }
-            // `builtins_module` / `builtin` / `thread_local_refs`.
-            // `clone_for_thread` copies the builtins reference into the child
-            // EC, so each copy is its own slot: forwarding only the parent's
-            // leaves the child pointing at the pre-move address once a thread
-            // is registered but has not yet armed its own root area.
-            ec.walk_builtin_roots(visitor);
+        let mut contexts = EXECUTION_CONTEXTS.lock();
+        for ec_slot in contexts.values_mut() {
+            visitor(unsafe { &mut *(std::ptr::from_mut(ec_slot).cast::<majit_ir::GcRef>()) });
         }
     }
     gil::walk_action_roots(visitor);
@@ -440,8 +413,8 @@ pub(crate) fn replace_execution_context(ec: *const crate::PyExecutionContext) {
 pub(crate) fn take_async_exception(ec: *mut crate::PyExecutionContext) -> PyObjectRef {
     let _contexts = EXECUTION_CONTEXTS.lock();
     unsafe {
-        let w_type = (*ec).w_async_exception_type;
-        (*ec).w_async_exception_type = PY_NULL;
+        let w_type = (*ec).w_async_exception_type();
+        (*ec).set_w_async_exception_type(PY_NULL);
         if !w_type.is_null() {
             ASYNC_EXCEPTION_COUNT.fetch_sub(1, Ordering::AcqRel);
         }
@@ -545,7 +518,8 @@ pub extern "C" fn PyThreadState_SetAsyncExc(ident: usize, w_type: PyObjectRef) -
         return 0;
     };
     unsafe {
-        let slot = &mut (*(ec as *mut crate::PyExecutionContext)).w_async_exception_type;
+        let ec = &mut *(ec as *mut crate::PyExecutionContext);
+        let slot = ec.w_async_exception_type();
         match (slot.is_null(), w_type.is_null()) {
             (true, false) => {
                 ASYNC_EXCEPTION_COUNT.fetch_add(1, Ordering::AcqRel);
@@ -555,7 +529,7 @@ pub extern "C" fn PyThreadState_SetAsyncExc(ident: usize, w_type: PyObjectRef) -
             }
             _ => {}
         }
-        *slot = w_type;
+        ec.set_w_async_exception_type(w_type);
     }
     // pypy/module/__pypy__/interp_signal.py `_raise_in_thread`:
     // `space.actionflag.rearm_ticker()` after updating the EC-owned slot.
@@ -817,7 +791,8 @@ pub(crate) fn after_fork_child() {
         }
         contexts.retain(|thread_ident, _| *thread_ident == ident);
         if let Some(&ec) = contexts.get(&ident) {
-            for &wref in unsafe { &(*(ec as *const crate::PyExecutionContext)).thread_local_refs } {
+            for &wref in unsafe { (*(ec as *const crate::PyExecutionContext)).thread_local_refs() }
+            {
                 let local = unsafe {
                     pyre_object::weakref::w_weakref_deref(
                         wref as *const pyre_object::weakref::Weakref,
@@ -1906,14 +1881,14 @@ fn register_local_in_current_ec(local: PyObjectRef) {
     let root = pyre_object::gc_roots::push_roots();
     let local = pyre_object::gc_roots::pin_root(local);
     let wref = unsafe { pyre_object::weakref::w_weakref_new(local) as PyObjectRef };
-    unsafe { (*ec).thread_local_refs.push(wref) };
+    unsafe { (*ec).push_thread_local_ref(wref) };
     drop(root);
 }
 
 /// `os_local.py:thread_is_stopping`.
 fn thread_is_stopping(ec: &mut crate::PyExecutionContext) {
     let ident = current_ident();
-    for wref in std::mem::take(&mut ec.thread_local_refs) {
+    for wref in ec.take_thread_local_refs() {
         let local = unsafe {
             pyre_object::weakref::w_weakref_deref(wref as *const pyre_object::weakref::Weakref)
         };
@@ -2271,28 +2246,30 @@ fn spawn_thread(
             let worker_base = worker_roots.pin_roots(&BOOTSTRAPPER.fields());
             bootstrap.release_bootstrapper();
 
-            let mut ec = Box::new(unsafe {
+            let ec = unsafe {
                 (*(parent_ec_addr as *const crate::PyExecutionContext)).clone_for_thread()
-            });
-            let ec_ptr = &*ec as *const crate::PyExecutionContext;
+            };
+            let ec_ptr = ec.as_ptr();
             crate::call::set_last_exec_ctx(ec_ptr);
             // Publish the fresh EC first, matching
             // OSThreadLocals.enter_thread() installing the ExecutionContext
             // before thread bootstrap invokes Python code.
-            ec.install_user_del_action();
+            // SAFETY: `ec` is the live `alloc_execution_context` handle for this thread.
+            unsafe { (*ec.as_mut_ptr()).install_user_del_action() };
             // The space-owned GIL action is already registered on the shared
             // actionflag; this is an idempotent bootstrap guard.
-            gil::initialize(&mut ec);
+            // SAFETY: `ec` is the live `alloc_execution_context` handle for this thread.
+            unsafe { gil::initialize(&mut *ec.as_mut_ptr()) };
             let ident = current_ident();
             let w_handle = pyre_object::gc_roots::shadow_stack_get(worker_base + 3);
             if !w_handle.is_null() {
                 let h = W_ThreadHandle::from_obj(w_handle).unwrap();
                 if let Err(e) = h.start(ident) {
                     bootstrap.fail(e.message_text());
-                    thread_is_stopping(&mut ec);
+                    // SAFETY: `ec` is the live `alloc_execution_context` handle for this thread.
+                    unsafe { thread_is_stopping(&mut *ec.as_mut_ptr()) };
                     crate::call::set_last_exec_ctx(std::ptr::null());
                     drop(worker_roots);
-                    drop(ec);
                     return;
                 }
             }
@@ -2352,7 +2329,8 @@ fn spawn_thread(
                     );
                 }
             }
-            thread_is_stopping(&mut ec);
+            // SAFETY: `ec` is the live `alloc_execution_context` handle for this thread.
+            unsafe { thread_is_stopping(&mut *ec.as_mut_ptr()) };
             crate::call::set_last_exec_ctx(std::ptr::null());
             let handle = if has_handle {
                 pyre_object::gc_roots::shadow_stack_get(worker_base + 3)
@@ -2360,7 +2338,6 @@ fn spawn_thread(
                 pyre_object::PY_NULL
             };
             drop(worker_roots);
-            drop(ec);
             // `_thread._count()` is the completion signal used by PyPy's
             // thread helpers for non-joinable `start_new_thread` workers.
             // Publish it only after EC unregistration and shadow-root teardown;
@@ -3125,7 +3102,7 @@ mod fallback_ec_registry_tests {
         let ident = rx.recv().unwrap();
         assert!(
             !EXECUTION_CONTEXTS.lock().contains_key(&ident),
-            "fallback EC must leave EXECUTION_CONTEXTS before its TLS Rc is dropped"
+            "fallback EC must leave EXECUTION_CONTEXTS before its TLS Ref is dropped"
         );
     }
 
@@ -3134,8 +3111,8 @@ mod fallback_ec_registry_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let fallback = crate::call::ensure_executioncontext();
-            let real = Box::leak(Box::new(crate::PyExecutionContext::default()));
-            let real_ptr = real as *const crate::PyExecutionContext;
+            let real = crate::alloc_execution_context();
+            let real_ptr = real.as_ptr();
             crate::call::set_last_exec_ctx(real_ptr);
             let ident = current_ident();
             assert_eq!(

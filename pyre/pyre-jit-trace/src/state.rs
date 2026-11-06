@@ -12478,7 +12478,7 @@ impl JitState for PyreJitState {
             .unwrap_or(resume_decoded_vable_addr(boxes));
         let live_ec = sym.concrete_execution_context as *mut pyre_interpreter::PyExecutionContext;
         if !live_ec.is_null() && restored_top != 0 {
-            let published = unsafe { (*live_ec).topframeref };
+            let published = unsafe { (*live_ec).topframeref() };
             // A scope the guard still had open must be republished whatever the
             // slot currently holds: `execute_assembler` restores `topframeref`
             // to the frame it saved before the run, so after an inlined-callee
@@ -12495,7 +12495,7 @@ impl JitState for PyreJitState {
                 };
             if published as usize != restored_top && stale_scope {
                 unsafe {
-                    (*live_ec).topframeref = restored_top as *mut pyre_interpreter::PyFrame;
+                    (*live_ec).set_topframeref(restored_top as *mut pyre_interpreter::PyFrame);
                 }
             }
         }

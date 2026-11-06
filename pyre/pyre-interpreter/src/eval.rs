@@ -98,7 +98,7 @@ impl Drop for CurrentFrameGuard {
         CURRENT_FRAME.with(|current| current.set(previous.0 as *mut PyFrame));
         if !self.ec.is_null() {
             unsafe {
-                (*self.ec).topframeref = previous_ec_top.0 as *mut PyFrame;
+                (*self.ec).set_topframeref(previous_ec_top.0 as *mut PyFrame);
             }
         }
     }
@@ -160,18 +160,26 @@ pub fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
     // `ExecutionContext.enter`/`leave` scope owns both.
     let enters_chain = !ec.is_null()
         && !std::ptr::eq(
-            crate::executioncontext::vref_referent(unsafe { (*ec).topframeref }),
+            crate::executioncontext::vref_referent(unsafe { (*ec).topframeref() }),
             frame as *mut PyFrame,
         );
+    // `set_topframeref` is judged able to collect (write-barrier hook). Root
+    // the predecessor frames and reload them after, as `gettopframe` does.
+    let prev_anchor = unsafe { FrameAnchor::from_raw(previous) };
     let previous_ec_top = if enters_chain {
         unsafe {
-            let top = (*ec).topframeref;
-            (*ec).topframeref = frame as *mut PyFrame;
-            top
+            let top = (*ec).topframeref();
+            let top_anchor = FrameAnchor::from_raw(top);
+            (*ec).set_topframeref(frame as *mut PyFrame);
+            top_anchor.live()
         }
     } else {
         std::ptr::null_mut()
     };
+    let previous = prev_anchor.live();
+    // Release before `push_current_frame_previous_root` so Drop cannot
+    // truncate past the guard's later root slot (shadow-stack LIFO).
+    drop(prev_anchor);
     if enters_chain || ec.is_null() {
         // Barrier for the same reason as `ExecutionContext::enter`: this is a
         // traced `Type::Ref` store and `frame` can be an old-generation frame
@@ -1196,59 +1204,9 @@ pub unsafe fn walk_pyframe_roots_area(
         // and are forwarded by the GC's root walker; no extra visit here.
 
         let mut frame = cf.get();
-        // Root the EC slots from the ambient TLS EC.  PyPy reaches the
-        // ExecutionContext unconditionally through `space.threadlocals`,
-        // independent of whether a frame is currently installed.
-        let ambient_ec = unsafe {
-            (&*(area.last_exec_ctx as *const Cell<*const PyExecutionContext>)).get()
-                as *mut PyExecutionContext
-        };
-        let mut visit_ec_slots = |ec: *mut PyExecutionContext| {
-            if ec.is_null() {
-                return;
-            }
-            let top_slot = unsafe { &mut (*ec).topframeref as *mut *mut PyFrame };
-            visitor(unsafe { &mut *(top_slot as *mut majit_ir::GcRef) });
-            // `ExecutionContext.topframeref` is the executing-frame root
-            // (`executioncontext.py enter`). A managed PyFrame is left to
-            // `pyframe_object_custom_trace` after the gray/remembered-set
-            // phase.
-            unsafe { (*ec).walk_builtin_roots(visitor) };
-            // `sys_exc_value` holds the active handler exception, which
-            // is nursery-allocated and may move; forward it so the EC
-            // slot is updated on a minor collection (the value-stack
-            // copy alone is not authoritative for later EC reads).
-            let exc_slot = unsafe { &mut (*ec).sys_exc_value as *mut PyObjectRef };
-            visitor(unsafe { &mut *(exc_slot as *mut majit_ir::GcRef) });
-            let async_exc_slot = unsafe { &mut (*ec).w_async_exception_type as *mut PyObjectRef };
-            visitor(unsafe { &mut *(async_exc_slot as *mut majit_ir::GcRef) });
-            // Exceptions may use the off-GC malloc_typed fallback.  In that
-            // case forwarding the carrier above is a no-op, so trace its raw
-            // GC-managed children just as `walk_in_flight_exception` does.
-            // This is the post-PUSH_EXC_INFO owner of the same exception and
-            // must preserve its traceback/frame graph identically.
-            {
-                let _exc = majit_gc::shadow_stack::extra_area_scope("pyframe.exc_fields");
-                unsafe { walk_raw_exception_roots((*ec).sys_exc_value, visitor) };
-            }
-            // `executioncontext.py:55` current_gen_or_coroutine is the head
-            // of the running-generator chain.  The generator custom trace
-            // follows each node's `previous_gen_or_coroutine` edge.
-            let current_gen_slot =
-                unsafe { &mut (*ec).current_gen_or_coroutine as *mut PyObjectRef };
-            visitor(unsafe { &mut *(current_gen_slot as *mut majit_ir::GcRef) });
-            let contextvar_slot = unsafe { &mut (*ec).contextvar_context as *mut PyObjectRef };
-            visitor(unsafe { &mut *(contextvar_slot as *mut majit_ir::GcRef) });
-            for hook in unsafe {
-                [
-                    &mut (*ec).w_asyncgen_firstiter_fn as *mut PyObjectRef,
-                    &mut (*ec).w_asyncgen_finalizer_fn as *mut PyObjectRef,
-                ]
-            } {
-                visitor(unsafe { &mut *(hook as *mut majit_ir::GcRef) });
-            }
-        };
-        visit_ec_slots(ambient_ec);
+        // ThreadLocalReference analog: visit the TLS `LAST_EXEC_CTX` cell as
+        // a GCREF. Field tracing lives on [`crate::executioncontext_custom_trace`].
+        visitor(unsafe { &mut *(area.last_exec_ctx as *mut majit_ir::GcRef) });
         while !frame.is_null() {
             // `CURRENT_FRAME` is a frame-shaped slot: it can hold a
             // `JitVirtualRef` in place of a `*mut PyFrame` (`virtualref.py
@@ -1752,7 +1710,7 @@ pub fn get_current_exception() -> PyObjectRef {
     if ec.is_null() {
         return PY_NULL;
     }
-    unsafe { (*ec).sys_exc_value }
+    unsafe { (*ec).sys_exc_value() }
 }
 
 /// `executioncontext.py sys_exc_info` — return the topmost handled
@@ -1787,7 +1745,7 @@ pub fn set_current_exception(exc: PyObjectRef) {
         return;
     }
     unsafe {
-        (*ec).sys_exc_value = exc;
+        (*ec).set_sys_exc_info(exc);
     }
 }
 
@@ -2842,7 +2800,7 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bo
             // only when a tracer is installed, and reloads `next_instr` from
             // `last_instr` only after that hook or `action_dispatcher`.
             // `get_w_f_trace` stays off the no-tracer path.
-            let needs_trace = unsafe { !(*ec).w_tracefunc.is_null() };
+            let needs_trace = unsafe { !(*ec).w_tracefunc().is_null() };
             if needs_trace {
                 let trace_result = unsafe {
                     (*ec).bytecode_trace(
@@ -6692,7 +6650,7 @@ mod tests {
         // `install_current_frame` will resolve.
         let ec = crate::call::getexecutioncontext() as *mut PyExecutionContext;
         assert!(!ec.is_null(), "the runtime must own an execution context");
-        let outer_top = unsafe { (*ec).topframeref };
+        let outer_top = unsafe { (*ec).topframeref() };
 
         unsafe { (*ec).enter(frame_ptr) };
         let linked_backref = unsafe { (*frame_ptr).f_backref };
@@ -6703,11 +6661,11 @@ mod tests {
             assert_eq!(unsafe { (*frame_ptr).f_backref }, linked_backref);
         }
         assert_eq!(
-            unsafe { (*ec).topframeref },
+            unsafe { (*ec).topframeref() },
             frame_ptr,
             "the outer enter/leave scope, not the TLS guard, owns the unlink",
         );
-        unsafe { (*ec).topframeref = outer_top };
+        unsafe { (*ec).set_topframeref(outer_top) };
     }
 
     // A frame value slot may hold a `JitVirtualRef`, whose leading magic word
