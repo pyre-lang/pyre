@@ -15829,6 +15829,47 @@ static PYERROR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
+static S_APPLICATION_EXCEPTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_interpreter::pyopcode::SApplicationException;
+    let ptr = |key, offset| (key, offset, WORD, Type::Ref, false, true, false);
+    let int = |key, offset, size, signed| (key, offset, size, Type::Int, signed, true, false);
+    build_object_descr_group_with_def_path(
+        std::mem::size_of::<SApplicationException>(),
+        <SApplicationException as pyre_object::lltype::GcType>::type_id(),
+        &pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_TYPE as *const _ as usize,
+        &[
+            ptr(
+                "operr",
+                pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_OPERR_OFFSET,
+            ),
+            ptr(
+                "throw0",
+                pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_THROW0_OFFSET,
+            ),
+            ptr(
+                "throw1",
+                pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_THROW1_OFFSET,
+            ),
+            ptr(
+                "throw2",
+                pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_THROW2_OFFSET,
+            ),
+            int(
+                "throw_argc",
+                std::mem::offset_of!(SApplicationException, throw_argc),
+                std::mem::size_of::<usize>(),
+                false,
+            ),
+            ptr(
+                "w_class",
+                std::mem::offset_of!(SApplicationException, ob_header.w_class),
+            ),
+        ],
+        "SApplicationException",
+        "pyopcode::SApplicationException",
+    )
+});
+
 static DECLARED_GROUPS: &[(&str, fn())] = &[
     ("intobject::W_IntObject", || {
         LazyLock::force(&W_INT_DESCR_GROUP);
@@ -15847,6 +15888,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("error::PyErrorObject", || {
         LazyLock::force(&PYERROR_DESCR_GROUP);
+    }),
+    ("pyopcode::SApplicationException", || {
+        LazyLock::force(&S_APPLICATION_EXCEPTION_DESCR_GROUP);
     }),
     ("complexobject::W_ComplexObjectUser", || {
         LazyLock::force(&W_COMPLEX_USER_DESCR_GROUP);

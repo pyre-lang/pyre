@@ -187,10 +187,10 @@ use crate::pyframe::PyFrame;
 /// The payload a suspended frame is resumed with.
 ///
 /// `generator.py _invoke_execute_frame` hands the frame the sent value
-/// and, on `throw()`, the operation error — `pyframe.py:285-315
-/// resume_execute_frame` then consumes them.  `throw_args` carries the original
-/// three-argument form for a non-generator delegate, the Rust representation of
-/// the `SApplicationException` payload.
+/// and, on `throw()`, the operation error — `pyframe.py
+/// resume_execute_frame` then consumes them.  `throw_args` unpacks the
+/// original three-argument form from `SApplicationException` for a
+/// non-generator delegate.
 ///
 /// Passed by `&mut` and `take()`n field by field as the resume consumes each
 /// one, so this stays a single pointer in [`EvalFn`]: spreading the three

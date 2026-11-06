@@ -48,8 +48,136 @@ pub struct SReturnValue {
     pub w_returnvalue: PyObjectRef,
 }
 
+/// `pypy/interpreter/pyopcode.py` `SApplicationException(W_Root)`.
+///
+/// `_immutable_ = True`. The thrown `OperationError` is a GC word
+/// (`error.py`); `isinstance(w_arg_or_err, SApplicationException)` is the
+/// throw arm of `generator.py` `_send_ex`.
+///
+/// [3.15-spec] `SApplicationException` has only `operr`. `throw_yield_from`
+/// keeps the original 1..=3 `throw()` arguments so a non-generator delegate
+/// sees that call shape (PEP 380); `delegate_to_nongen` rebuilds
+/// type/value/tb from `operr` when `throw_argc == 0`.
+#[repr(C)]
+#[majit_macros::jit_immutable_fields("operr", "throw0", "throw1", "throw2", "throw_argc")]
 pub struct SApplicationException {
-    pub operr: crate::error::OperationError,
+    pub ob_header: pyre_object::PyObject,
+    pub operr: PyObjectRef,
+    pub throw0: PyObjectRef,
+    pub throw1: PyObjectRef,
+    pub throw2: PyObjectRef,
+    pub throw_argc: usize,
+}
+
+/// Class word of [`SApplicationException`]. Direct `object` subclass; not
+/// an `Exception` / `OperationError`.
+pub static S_APPLICATION_EXCEPTION_TYPE: pyre_object::PyType =
+    pyre_object::pyobject::new_pytype("SApplicationException");
+
+/// Runtime GC tid. `build_gc` stamps this after [`crate::error::PyErrorObject`].
+pub static S_APPLICATION_EXCEPTION_GC_TYPE_ID_CELL: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::auto();
+
+pub const S_APPLICATION_EXCEPTION_OBJECT_SIZE: usize = std::mem::size_of::<SApplicationException>();
+pub const S_APPLICATION_EXCEPTION_OPERR_OFFSET: usize =
+    std::mem::offset_of!(SApplicationException, operr);
+pub const S_APPLICATION_EXCEPTION_THROW0_OFFSET: usize =
+    std::mem::offset_of!(SApplicationException, throw0);
+pub const S_APPLICATION_EXCEPTION_THROW1_OFFSET: usize =
+    std::mem::offset_of!(SApplicationException, throw1);
+pub const S_APPLICATION_EXCEPTION_THROW2_OFFSET: usize =
+    std::mem::offset_of!(SApplicationException, throw2);
+
+/// GC type id of [`SApplicationException`]: one past [`crate::error::pyerror_gc_type_id`].
+pub fn s_application_exception_gc_type_id() -> u32 {
+    crate::error::pyerror_gc_type_id() + 1
+}
+
+impl pyre_object::lltype::GcType for SApplicationException {
+    #[inline]
+    fn type_id() -> u32 {
+        let id = S_APPLICATION_EXCEPTION_GC_TYPE_ID_CELL.get();
+        if id == pyre_object::lltype::TypeIdCell::UNASSIGNED {
+            s_application_exception_gc_type_id()
+        } else {
+            id
+        }
+    }
+    const SIZE: usize = S_APPLICATION_EXCEPTION_OBJECT_SIZE;
+}
+
+/// `pyopcode.py SApplicationException.__init__(operr)`.
+///
+/// `#[inline(never)]` so a later look-inside of `send_error` records
+/// `new_with_vtable` + setfield rather than folding the malloc into the
+/// caller (`w_list_make_empty` vs `w_list_new`).
+#[inline(never)]
+pub fn s_application_exception_new(
+    operr: crate::error::PyError,
+    throw_args: Option<([PyObjectRef; 3], usize)>,
+) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let (t0, t1, t2, argc) = match throw_args {
+        Some(([a, b, c], n)) => (a, b, c, n),
+        None => (
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+            0,
+        ),
+    };
+    // Publish every operand before the first safepoint: a sequential
+    // `pin_root` of one word can collect while the rest still live only in
+    // Rust locals (`publish_roots`).
+    let base = pyre_object::gc_roots::pin_roots(&[operr.as_raw() as PyObjectRef, t0, t1, t2]);
+    let obj = pyre_object::lltype::malloc_typed_managed(SApplicationException {
+        ob_header: pyre_object::PyObject {
+            ob_type: &S_APPLICATION_EXCEPTION_TYPE,
+            w_class: pyre_object::pyobject::get_instantiate(&S_APPLICATION_EXCEPTION_TYPE),
+        },
+        operr: pyre_object::gc_roots::shadow_stack_get(base),
+        throw0: pyre_object::gc_roots::shadow_stack_get(base + 1),
+        throw1: pyre_object::gc_roots::shadow_stack_get(base + 2),
+        throw2: pyre_object::gc_roots::shadow_stack_get(base + 3),
+        throw_argc: argc,
+    });
+    obj as PyObjectRef
+}
+
+/// `isinstance(w_arg_or_err, SApplicationException)`.
+#[inline]
+pub fn is_s_application_exception(obj: PyObjectRef) -> bool {
+    unsafe { pyre_object::py_type_check(obj, &S_APPLICATION_EXCEPTION_TYPE) }
+}
+
+/// `SApplicationException.operr`.
+#[inline]
+pub fn s_application_exception_operr(obj: PyObjectRef) -> crate::error::PyError {
+    debug_assert!(is_s_application_exception(obj));
+    crate::error::PyError::from_raw(unsafe { (*(obj as *const SApplicationException)).operr })
+}
+
+/// Original `throw()` arguments, or `None` when `throw_argc == 0`.
+#[inline]
+pub fn s_application_exception_throw_args(obj: PyObjectRef) -> Option<([PyObjectRef; 3], usize)> {
+    debug_assert!(is_s_application_exception(obj));
+    let s = unsafe { &*(obj as *const SApplicationException) };
+    if s.throw_argc == 0 {
+        None
+    } else {
+        Some(([s.throw0, s.throw1, s.throw2], s.throw_argc))
+    }
+}
+
+/// `operr` plus the original `throw()` arguments.
+#[inline]
+pub fn s_application_exception_unpack(
+    obj: PyObjectRef,
+) -> (crate::error::PyError, Option<([PyObjectRef; 3], usize)>) {
+    (
+        s_application_exception_operr(obj),
+        s_application_exception_throw_args(obj),
+    )
 }
 
 pub struct SBreakLoop {
