@@ -3700,15 +3700,23 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     }
     // Positional args only (`r_args = [callable, null_or_self, arg0, ..]`).
     // A statement call (`plain(n+1)`) is void (`residual_call_r_v`); a
-    // value-producing call is Ref.  Declining void kept that self-rec
+    // value-producing call is Ref. Declining void kept that self-rec
     // on an inlined jump with no `execute_frame` depth charge, so a
     // JIT-hot recursion ran past `sys.getrecursionlimit()`.
-    if (dst_bank != 'r' && dst_bank != 'v') || r_args.len() < 3 {
+    // Zero positional args is `def f():`; `emit_new_pyframe_inline_with_params`
+    // stores an empty `param_boxes` into a NewArrayClear locals array.
+    if dst_bank != 'r' && dst_bank != 'v' {
+        return Ok(None);
+    }
+    if r_args.len() < 2 {
         return Ok(None);
     }
     // The handler test this fold needs is positional and lives below, once the
     // caller's jitcode is in hand: see `call_site_inside_protected_region`.
     let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    if arg_concretes.len() < 2 {
+        return Ok(None);
+    }
     let ConcreteValue::Ref(callable) = arg_concretes[0] else {
         return Ok(None);
     };
@@ -3877,11 +3885,9 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     let has_varkeywords = callee_code
         .flags
         .contains(pyre_interpreter::CodeFlags::VARKEYWORDS);
-    // `def f():` has nothing to store. A zero-arg scope that owns kwonly /
-    // `*args` / `**kwargs` still has slots `_match_signature` fills.
-    if nparams == 0 && kwonly_count == 0 && !has_varargs && !has_varkeywords {
-        return Ok(None);
-    }
+    // `_match_signature` fills kwonly / `*args` / `**kwargs` slots below.
+    // `def f():` is empty `param_boxes`; `_opimpl_recursive_call` still
+    // emits `CALL_ASSEMBLER` at the unroll bound.
     let total_slots =
         nparams + kwonly_count + usize::from(has_varargs) + usize::from(has_varkeywords);
     if total_slots > FBW_REC_CA_MAX_PARAMS {
