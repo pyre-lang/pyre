@@ -131,10 +131,11 @@ fn run(env: &[(&str, &str)], args: &[&str]) -> Output {
 /// `-c`, because a `<string>` filename sends the traceback printer through
 /// app-level `linecache` — see the module docs. `CARGO_TARGET_TMPDIR` is
 /// Cargo's own scratch directory for integration tests, and each call takes a
-/// fresh name: the arms run concurrently and several share a shape, so a
-/// shared name would let one arm read a file another is still writing.
+/// fresh name: the rust test threads still race the writes, so a shared name
+/// would let one arm read a file another is still writing.
 fn run_shape(env: &[(&str, &str)], args: &[&str], rounds: usize, words: usize) -> Output {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static CHILD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     let src = GROW
         .replace("ROUNDS", &rounds.to_string())
@@ -144,11 +145,19 @@ fn run_shape(env: &[(&str, &str)], args: &[&str], rounds: usize, words: usize) -
     path.push(format!("heap_limit_{rounds}_{words}_{serial}.py"));
     std::fs::write(&path, &src).expect("write the program under test");
 
+    // One child at a time: four debug `pyre-dynasm` processes on a 7 GiB
+    // runner make `malloc_typed` of the MemoryError singleton
+    // (`compile.py` `memory_error`) return null, and `handle_alloc_error`
+    // skips the MiniMark middle rung. `PYRE_MAX_MEMORY=0` leaves only
+    // `--heapsize` as the bound; the default 8 GiB process ceiling sits
+    // above the runner and never refuses before host malloc fails.
+    let _one_child = CHILD.lock().unwrap_or_else(|e| e.into_inner());
     let mut cmd = Command::new(PYRE);
     cmd.args(args);
     cmd.arg(&path);
     // Ahead of `env`, so an arm can still name its own.
     cmd.env("PYTHONIOENCODING", "utf-8");
+    cmd.env("PYRE_MAX_MEMORY", "0");
     for (k, v) in env {
         cmd.env(k, v);
     }
