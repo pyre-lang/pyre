@@ -1820,6 +1820,82 @@ fn flavor_raw_generic_named_arg_keeps_unsuffixed_class_root() {
     }
 }
 
+/// A by-value one-word storage-raw struct is the word itself
+/// (`bookkeeper` `raw_struct_ptr_annotation`, `history.getkind` int).
+/// Its borrow is the same word (`ty_is_raw_address`); `Rvalue::Ref`
+/// aliases the local.
+#[test]
+fn one_word_storage_raw_struct_by_value_and_borrow_are_int() {
+    let word = crate::layout::target_word_size() as u64;
+    let word_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let mut owner = struct_decl(
+        0,
+        ident_path(&["fixture", "S"]),
+        serde_json::json!([{
+            "name": "a",
+            "ty": word_ty,
+            "attr_info": null
+        }]),
+        false,
+    );
+    owner["layout"] = serde_json::json!([{
+        "key": "host",
+        "value": {
+            "size": word,
+            "align": word,
+            "variant_layouts": [{"field_offsets": [0]}],
+            "repr": {"transparent": false}
+        }
+    }]);
+    let adt = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [], "types": [],
+                "const_generics": [], "trait_refs": []
+            },
+            "builtin": null
+        }
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [owner],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
+        std::collections::HashSet::new();
+    let empty_flavor: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let by_value = TyRef::Other(adt.clone());
+    let borrow = TyRef::Other(serde_json::json!({"Ref": ["Erased", adt, "Mut"]}));
+    let tomb = super::no_tombstoned_leaves();
+    assert_eq!(
+        super::tyref_to_value_type_with(&by_value, &llbc, tomb, &empty_gc, &empty_flavor),
+        ValueType::Int,
+        "by-value one-word storage-raw struct is the address-sized word"
+    );
+    assert_eq!(
+        super::tyref_to_value_type_with(&borrow, &llbc, tomb, &empty_gc, &empty_flavor),
+        ValueType::Int,
+        "a borrow of that struct is the same word (`history.getkind` int)"
+    );
+    assert!(
+        super::tyref_is_one_word_storage_raw_value(&by_value, &llbc, &empty_gc, &empty_flavor),
+        "by-value S is one-word storage-raw"
+    );
+    assert!(
+        !super::tyref_is_one_word_storage_raw_value(&borrow, &llbc, &empty_gc, &empty_flavor),
+        "the borrow is a pointer, not the by-value word"
+    );
+}
+
 #[test]
 fn type_arg_splits_per_instantiation_defers_singlefloat_unit_and_empty() {
     use super::type_arg_splits_per_instantiation;

@@ -2240,6 +2240,36 @@ pub(in crate::front::mir) fn tyref_is_raw_value(
     )
 }
 
+/// By-value one-word storage-raw ADT: the word itself.
+///
+/// `bookkeeper` `raw_struct_ptr_annotation` intern's that value as
+/// `Ptr(Struct raw)`; `history.getkind` of that `Ptr` is `"int"`.
+/// `Rvalue::Ref` aliases the local, so the borrow (`ty_is_raw_address`)
+/// and this by-value paint must share the int bank
+/// (`root_scope_close`). A flavor-raw identity stays a front `Ref`
+/// (`rclass.py getgcflavor`). A multi-word raw struct is not one
+/// register.
+pub(in crate::front::mir) fn tyref_is_one_word_storage_raw_value(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> bool {
+    if !tyref_is_raw_value(ty, llbc, gc_struct_ids) {
+        return false;
+    }
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    if flavor_raw_adt_node(node, llbc, raw_alloc_flavor_structs) {
+        return false;
+    }
+    if declared_raw_adt_node(node, llbc, gc_struct_ids, no_immutable_fields()).is_none() {
+        return false;
+    }
+    json_ty_byte_size(node, llbc) == Some(crate::layout::target_word_size() as i64)
+}
+
 pub(in crate::front::mir) fn field_ty_is_raw_word(
     ty: &TyRef,
     llbc: &Llbc,
@@ -2370,10 +2400,12 @@ pub(in crate::front::mir) fn operand_is_declared_raw(
 ///
 /// `history.getkind` classifies `Ptr(TO)` from `TO._gckind`
 /// (`rewrite_op_getfield`). Storage-raw (`declared_raw_adt_node`) answers
-/// true for a one-word pointer. A flavor-raw pointee (`rclass.py
-/// getgcflavor`) stays a front `Ref`: `crosses_raw_ref` must not emit
-/// `cast_ptr_to_int` for it. A borrow of a storage-raw struct that is
-/// not a raw enum stays `Ref` (`RootScope::get`).
+/// true for a one-word pointer or a borrow of that ADT. A flavor-raw
+/// pointee (`rclass.py getgcflavor`) stays a front `Ref`: `crosses_raw_ref`
+/// must not emit `cast_ptr_to_int` for it. A fieldless enum is the tag
+/// integer (`type_decl_is_fieldless_enum`); `Rvalue::Ref` is the identity
+/// on that word, so the borrow is not an address (`rclass.py` has no
+/// `cast_pointer` of an int).
 pub(in crate::front::mir) fn ty_is_raw_address(
     ty: &TyRef,
     llbc: &Llbc,
@@ -2389,20 +2421,28 @@ pub(in crate::front::mir) fn ty_is_raw_address(
     }
     if let Some(pointee) = one_word_pointer_bank_pointee(node, llbc) {
         let is_borrow = node.as_object().is_some_and(|obj| obj.contains_key("Ref"));
-        // Non-borrow one-word pointer to a storage-raw ADT (`Box` /
-        // `NonNull` / `Arc` of a C struct). A `Ref` of a raw struct
-        // stays `Ref` (`RootScope::get`).
-        if !is_borrow
-            && declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields()).is_some()
-        {
-            return true;
+        // A pointer or a borrow of a storage-raw ADT is one raw address
+        // word (`history.getkind` of `Ptr(TO)` when `TO._gckind == raw`).
+        if declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields()).is_some() {
+            // A fieldless enum is the tag integer; the borrow is identity
+            // on that word, not an address. A flavor-raw identity borrow
+            // stays a front `Ref` (`rclass.py getgcflavor`); a rust-heap
+            // `String` is the string object (`tyref_is_rust_heap_string`),
+            // not a C-struct address.
+            let pointee_node = strip_ty_indirections(pointee, llbc).unwrap_or(pointee);
+            let fieldless_enum_borrow = is_borrow
+                && adt_node_def_id(pointee_node)
+                    .and_then(|id| llbc.type_by_id(id))
+                    .is_some_and(|td| type_decl_is_fieldless_enum(td, llbc));
+            let flavor_raw_borrow =
+                is_borrow && flavor_raw_adt_node(pointee_node, llbc, raw_alloc_flavor_structs);
+            let rust_heap_string_borrow =
+                is_borrow && tyref_is_rust_heap_string(&TyRef::Other(pointee.clone()), llbc);
+            if !fieldless_enum_borrow && !flavor_raw_borrow && !rust_heap_string_borrow {
+                return true;
+            }
         }
-        // `&mut Enum` / `&Enum` of raw storage is one address word. A raw
-        // struct borrow stays `Ref`. Classifying it as an address makes
-        // `RootScope::get` a `[Ref, Int]` signature called with `[Int, Int]`.
-        // A fieldless enum is the tag integer (`type_decl_is_fieldless_enum`);
-        // `Rvalue::Ref` is the identity on that word, so the borrow is not
-        // an address (`rclass.py` has no `cast_pointer` of an int).
+        // `&mut Enum` / `&Enum` of raw storage is one address word.
         if is_borrow && borrowed_pointee_is_raw_enum(pointee, llbc, gc_struct_ids) {
             return true;
         }
@@ -2757,6 +2797,12 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
         );
     }
     if ty_is_raw_address(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
+        return ValueType::Int;
+    }
+    // By-value one-word storage-raw ADT is that same word
+    // (`bookkeeper` `raw_struct_ptr_annotation`). The borrow arm
+    // above and this value must agree: `Rvalue::Ref` aliases the local.
+    if tyref_is_one_word_storage_raw_value(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
         return ValueType::Int;
     }
     // A one-word pointer to a flavor-raw ADT (`rclass.py getgcflavor`)
@@ -4634,6 +4680,9 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
         return inner;
     }
     if ty_is_raw_address(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
+        return ValueType::Int;
+    }
+    if tyref_is_one_word_storage_raw_value(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
         return ValueType::Int;
     }
     // Flavor-raw pointer field: front `Ref(Some(root))` so FORCE is a
@@ -7389,12 +7438,11 @@ pub(in crate::front::mir) fn split_struct_instantiation_suffix(
 
 /// Class root of a `RawPtr` / `Ref` (one pointer word) whose pointee is
 /// a registered GC struct. `None` when `ty_is_raw_address` (declared-Raw
-/// / primitive address), the node is a flavor-raw identity pointer
-/// (`flavor_raw_pointer_class_root`: residual `raw:<owner>`, Signed
-/// getkind, `SomePtr`), the node is not a pointer (a by-value
-/// transparent handle keeps its own class), the pointee is a Raw
-/// struct (`&mut S` stays `Ref(None)` with `class_root` on the Input),
-/// or the pointee has no class root (`GCREFOpaque`, `*mut u8`). The
+/// pointer or borrow, primitive address), the node is a flavor-raw
+/// identity pointer (`flavor_raw_pointer_class_root`: residual
+/// `raw:<owner>`, Signed getkind, `SomePtr`), the node is not a pointer
+/// (a by-value transparent handle keeps its own class), or the pointee
+/// has no class root (`GCREFOpaque`, `*mut u8`). The
 /// spelling is the same `adt_node_class_root_with` produces
 /// (`"pyobject::PyObject"`), which `Bookkeeper::project_struct_field_type` /
 /// `lltype_for_named_ref` resolve to the classdef.

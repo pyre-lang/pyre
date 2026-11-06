@@ -12081,8 +12081,8 @@ mod tests {
                 ) if name == "p" => {
                     assert_eq!(
                         ty,
-                        &ValueType::Ref(None),
-                        "a borrowed raw struct stays a reference"
+                        &ValueType::Int,
+                        "a borrow of a storage-raw struct is one address word (`history.getkind` int)"
                     );
                     assert_eq!(class_root.as_deref(), Some("S"));
                     Some(result.clone())
