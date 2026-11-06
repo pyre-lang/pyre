@@ -1653,6 +1653,7 @@ impl GcRewriterImpl {
     /// nursery zero-fills payload bytes, so callers already observe a
     /// zeroed array / hash field.  Under `malloc_zero_filled=false`
     /// this fans out per `kind`:
+    ///   * FLAG_ARRAY of structs/pointers asserts `opnum == NEW_ARRAY_CLEAR`
     ///   * FLAG_ARRAY + NEW_ARRAY_CLEAR → `handle_clear_array_contents`
     ///   * FLAG_STR / FLAG_UNICODE → zero the `hash` field at offset 0
     ///
@@ -1678,6 +1679,18 @@ impl GcRewriterImpl {
         }
         // rewrite.py FLAG_ARRAY path.
         if kind == 0 {
+            if let Some(ad) = arraydescr.as_array_descr()
+                && (ad.is_array_of_structs() || ad.is_array_of_pointers())
+            {
+                assert!(
+                    opnum == OpCode::NewArrayClear,
+                    "NEW_ARRAY of pointer/struct array must be NEW_ARRAY_CLEAR: \
+                     type_id={} item_size={} base_size={}",
+                    ad.type_id(),
+                    ad.item_size(),
+                    ad.base_size(),
+                );
+            }
             if opnum == OpCode::NewArrayClear {
                 self.handle_clear_array_contents(arraydescr, ad_itemsize, result, v_length, st);
             }

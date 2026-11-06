@@ -2519,6 +2519,43 @@ pub fn per_frame_vables_from_framestack(
         .collect()
 }
 
+/// One `(frame_ptr, stack_base)` per level from the abort image's register
+/// words (`blackhole.py _copy_data_from_miframe` reads `box.getref_base()`),
+/// as `portal_cash_stack_base_and_levels` does.
+pub fn per_frame_vables_from_abort_banks(
+    framestack: &majit_metainterp::MIFrameStack,
+    banks: &[majit_metainterp::BlackholeAbortBanks],
+) -> Vec<(i64, usize)> {
+    let mut per_frame = Vec::with_capacity(framestack.frames.len());
+    for (index, frame) in framestack.frames.iter().enumerate() {
+        let jitcode_index = i32::try_from(frame.jitcode.index()).unwrap_or_else(|_| {
+            panic!(
+                "portal abort convert: frame {index} jitcode index {} out of range",
+                frame.jitcode.index()
+            )
+        });
+        let frame_reg = portal_red_regs_at(jitcode_index).0;
+        if frame_reg == u16::MAX {
+            per_frame.push((0, 0));
+            continue;
+        }
+        let Some(frame_ptr) = banks
+            .get(index)
+            .and_then(|b| b.ref_word(frame_reg as usize))
+        else {
+            panic!("portal abort convert: frame {index} reg {frame_reg} unstamped");
+        };
+        if frame_ptr == 0 {
+            panic!("portal abort convert: frame {index} reg {frame_reg} is null");
+        }
+        let Some(stack_base) = concrete_nlocals(frame_ptr as usize) else {
+            panic!("portal abort convert: frame {index} {frame_ptr:#x} has no concrete nlocals");
+        };
+        per_frame.push((frame_ptr, stack_base));
+    }
+    per_frame
+}
+
 pub fn built_as_portal_at(jitcode_index: i32) -> bool {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {

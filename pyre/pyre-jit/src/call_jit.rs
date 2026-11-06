@@ -1695,22 +1695,28 @@ fn run_python_portal_abort_blackhole(
 ) -> Option<majit_metainterp::jitexc::PortalResume> {
     let per_frame = {
         let pending = driver.pending_abort_blackhole_mut()?;
-        // `blackhole.py _copy_data_from_miframe` copies a box only when
-        // it is not None. The walker writes the portal frame red at
-        // `setup_call` / `dispatch_via_miframe` argboxes; a `newframe`
-        // that never received that write is dropped before convert.
-        pyre_jit_trace::state::per_frame_vables_from_framestack(&pending.framestack)
+        if let Some(banks) = pending.abort_banks.as_deref() {
+            pyre_jit_trace::state::per_frame_vables_from_abort_banks(&pending.framestack, banks)
+        } else {
+            // `blackhole.py _copy_data_from_miframe` copies a box only when
+            // it is not None. The walker writes the portal frame red at
+            // `setup_call` / `dispatch_via_miframe` argboxes; a `newframe`
+            // that never received that write is dropped before convert.
+            let per_frame =
+                pyre_jit_trace::state::per_frame_vables_from_framestack(&pending.framestack);
+            if per_frame.first().map(|&(p, _)| p).unwrap_or(0) == 0 {
+                // Frozen-framestack case only. `blackhole.py
+                // _copy_data_from_miframe` copies a box only when it
+                // is not None. `handle_guard_failure` except SwitchToBlackhole:
+                // convert cannot name the virtualizable. Caller takes deadframe
+                // `ResumeBlackhole`. The framestack staged for an abort at
+                // `init_symbolic` can carry portal frames whose red was never
+                // written.
+                return None;
+            }
+            per_frame
+        }
     };
-    if per_frame.first().map(|&(p, _)| p).unwrap_or(0) == 0 {
-        // `blackhole.py _copy_data_from_miframe` copies a box only when it
-        // is not None. `handle_guard_failure` except SwitchToBlackhole:
-        // convert cannot name the virtualizable. Caller takes deadframe
-        // `ResumeBlackhole`. The framestack staged for an abort at
-        // `init_symbolic` can carry portal frames whose red was never
-        // written; main's too-long path never converts here and resumes
-        // from the deadframe.
-        return None;
-    }
     let jitdrivers_sd = python_portal_bh_jitdrivers_sd(driver);
     let ec =
         pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;

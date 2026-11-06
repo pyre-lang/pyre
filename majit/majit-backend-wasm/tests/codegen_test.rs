@@ -9479,7 +9479,7 @@ fn a_statically_short_array_takes_the_plain_barrier() {
     let descr = Arc::new(SimpleArrayDescr::new(1, 16, 8, 55, Type::Ref));
     let build = |length: i64| {
         let new = make_op(
-            OpCode::NewArray,
+            OpCode::NewArrayClear,
             &[OpRef::const_int(length)],
             OpRef::ref_op(4),
         );
