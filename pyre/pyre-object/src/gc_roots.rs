@@ -466,7 +466,12 @@ impl RootScope {
     }
 
     /// First slot owned by this root bracket.
+    ///
+    /// Residual like [`Self::pin_root`]: `push_roots` already returns the
+    /// `save_point` word, and a look-inside field read would take a Ref
+    /// receiver that word never occupied.
     #[inline]
+    #[majit_macros::dont_look_inside_cannot_raise]
     pub fn base(&self) -> usize {
         self.save_point
     }
