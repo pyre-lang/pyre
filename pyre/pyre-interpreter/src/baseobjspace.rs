@@ -23406,21 +23406,6 @@ pub unsafe fn generator_invoke_execute_frame(
     result
 }
 
-/// The `SApplicationException` arm of `generator.py` `w_arg_or_err`: the
-/// thrown `OperationError`, plus the `throw()` arguments a delegating frame
-/// re-throws and the `close()` flag. `_send_ex` receives it as one word,
-/// `0` for a plain sent value, the way upstream passes one `w_arg_or_err`.
-pub struct GeneratorThrow {
-    operr: Option<PyError>,
-    throw_args: Option<([PyObjectRef; 3], usize)>,
-    closing: bool,
-}
-
-/// Whether `throw` carries `close()`'s flag. `0` is a plain sent value.
-unsafe fn generator_throw_closing(throw: usize) -> bool {
-    throw != 0 && unsafe { (*(throw as *const GeneratorThrow)).closing }
-}
-
 /// `generator.py` `_send_ex`, the `frame is None` arm:
 ///
 /// ```python
@@ -23436,21 +23421,19 @@ unsafe fn generator_throw_closing(throw: usize) -> bool {
 /// raise operr
 /// ```
 ///
-/// The coroutine arm keeps the `closing` test `gen_send_ex` has and upstream
-/// drops: `close()` on a finished coroutine reaches here and returns quietly.
+/// `descr_close` returns when `self.frame is None`, so close never reaches
+/// this arm (`generator.py` `descr_close`; no `closing` flag).
 #[majit_macros::dont_look_inside]
-pub fn genentry_raise_finished(gen_obj: PyObjectRef, throw: usize) -> PyResult {
+pub fn genentry_raise_finished(gen_obj: PyObjectRef, w_arg_or_err: PyObjectRef) -> PyResult {
     use pyre_object::generator::*;
     unsafe {
-        if is_coroutine(gen_obj) && !generator_throw_closing(throw) {
+        if is_coroutine(gen_obj) {
             return Err(PyError::runtime_error(
                 "cannot reuse already awaited coroutine",
             ));
         }
-        if throw != 0
-            && let Some(err) = (*(throw as *mut GeneratorThrow)).operr.take()
-        {
-            return Err(err);
+        if crate::pyopcode::is_s_application_exception(w_arg_or_err) {
+            return Err(crate::pyopcode::s_application_exception_operr(w_arg_or_err));
         }
         Err(if is_async_generator(gen_obj) {
             PyError::stop_async_iteration()
@@ -23502,7 +23485,7 @@ pub fn genentry_raise_returned(gen_obj: PyObjectRef, w_result: PyObjectRef) -> P
 }
 
 /// `generator.py` `_invoke_execute_frame(w_arg_or_err)` behind the residual
-/// ABI. `w_inputvalue` is null when the frame takes no sent value.
+/// ABI. Unpack `SApplicationException` into the execute-frame payload.
 ///
 /// Upstream traces through `_invoke_execute_frame` into
 /// `frame.execute_frame`, where `interp_jit.py dispatch` meets the `pypyjit`
@@ -23513,20 +23496,17 @@ pub fn genentry_raise_returned(gen_obj: PyObjectRef, w_result: PyObjectRef) -> P
 pub fn generator_invoke_execute_frame_residual(
     gen_obj: PyObjectRef,
     frame: *mut crate::pyframe::PyFrame,
-    w_inputvalue: PyObjectRef,
-    throw: usize,
+    w_arg_or_err: PyObjectRef,
 ) -> PyResult {
-    let (operr, throw_args) = if throw == 0 {
-        (None, None)
-    } else {
-        let throw = unsafe { &mut *(throw as *mut GeneratorThrow) };
-        (throw.operr.take(), throw.throw_args.take())
-    };
-    let w_inputvalue = if w_inputvalue.is_null() {
-        None
-    } else {
-        Some(w_inputvalue)
-    };
+    let (w_inputvalue, operr, throw_args) =
+        if crate::pyopcode::is_s_application_exception(w_arg_or_err) {
+            let (operr, throw_args) = crate::pyopcode::s_application_exception_unpack(w_arg_or_err);
+            (None, Some(operr), throw_args)
+        } else if w_arg_or_err.is_null() {
+            (None, None, None)
+        } else {
+            (Some(w_arg_or_err), None, None)
+        };
     unsafe { generator_invoke_execute_frame(gen_obj, &mut *frame, w_inputvalue, operr, throw_args) }
 }
 
@@ -23539,11 +23519,10 @@ fn generator_send_ex(
     w_arg: PyObjectRef,
     operr: Option<PyError>,
     throw_args: Option<([PyObjectRef; 3], usize)>,
-    closing: bool,
 ) -> PyResult {
     use pyre_object::generator::*;
-    if operr.is_some() || throw_args.is_some() || closing {
-        return generator_throw_ex(gen_obj, w_arg, operr, throw_args, closing);
+    if let Some(operr) = operr {
+        return generator_throw_ex(gen_obj, operr, throw_args);
     }
     unsafe {
         // `generator.py send_ex`: when already in a trace and the body
@@ -23560,25 +23539,51 @@ fn generator_send_ex(
             }
         }
     }
-    generator_send_ex_body(gen_obj, w_arg, 0)
+    generator_send_ex_body(gen_obj, w_arg)
 }
 
-/// `send_ex` with an `SApplicationException`: throw and close never take
-/// the `generatorentry_driver` merge point.
+/// `send_error`: wrap `operr` in `SApplicationException` and enter `_send_ex`.
+/// Throw and close stay residual until look-inside of `_send_ex` lands.
 #[majit_macros::dont_look_inside]
 fn generator_throw_ex(
     gen_obj: PyObjectRef,
-    w_arg: PyObjectRef,
-    operr: Option<PyError>,
+    operr: PyError,
     throw_args: Option<([PyObjectRef; 3], usize)>,
-    closing: bool,
 ) -> PyResult {
-    let mut throw = GeneratorThrow {
-        operr,
-        throw_args,
-        closing,
+    let _roots = pyre_object::gc_roots::push_roots();
+    let (t0, t1, t2, argc) = match throw_args {
+        Some(([a, b, c], n)) => (a, b, c, n),
+        None => (
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+            0,
+        ),
     };
-    generator_send_ex_body(gen_obj, w_arg, &mut throw as *mut GeneratorThrow as usize)
+    let base =
+        pyre_object::gc_roots::pin_roots(&[gen_obj, operr.as_raw() as PyObjectRef, t0, t1, t2]);
+    let throw_args = if argc == 0 {
+        None
+    } else {
+        Some((
+            [
+                pyre_object::gc_roots::shadow_stack_get(base + 2),
+                pyre_object::gc_roots::shadow_stack_get(base + 3),
+                pyre_object::gc_roots::shadow_stack_get(base + 4),
+            ],
+            argc,
+        ))
+    };
+    let w_arg_or_err = crate::pyopcode::s_application_exception_new(
+        crate::error::PyError::from_raw(pyre_object::gc_roots::shadow_stack_get(base + 1)),
+        throw_args,
+    );
+    let arg_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_arg_or_err);
+    generator_send_ex_body(
+        pyre_object::gc_roots::shadow_stack_get(base),
+        pyre_object::gc_roots::shadow_stack_get(arg_slot),
+    )
 }
 
 /// Portal graph of `generatorentry_driver`.
@@ -23593,7 +23598,7 @@ pub fn generatorentry_portal(
     if let Some(result) = generatorentry_driver.jit_merge_point(pycode, gen_obj, w_arg) {
         return result;
     }
-    generator_send_ex_body(gen_obj, w_arg, 0)
+    generator_send_ex_body(gen_obj, w_arg)
 }
 
 /// C ABI of [`generatorentry_portal`]. `CALL_ASSEMBLER` and
@@ -23618,18 +23623,15 @@ pub extern "C" fn generatorentry_portal_c(
 
 /// `generator.py` `_send_ex(w_arg_or_err)`.
 ///
-/// `throw` is the `SApplicationException` arm of `w_arg_or_err`
-/// ([`GeneratorThrow`]), `0` for a plain sent value.
-pub fn generator_send_ex_body(gen_obj: PyObjectRef, w_arg: PyObjectRef, throw: usize) -> PyResult {
+/// `w_arg_or_err` is the sent value or an [`crate::pyopcode::SApplicationException`].
+pub fn generator_send_ex_body(gen_obj: PyObjectRef, w_arg_or_err: PyObjectRef) -> PyResult {
     use pyre_object::generator::*;
     // Every exit leaves the same three roots: the bracket is then static,
     // and the translator removes it the way `gctransform/framework.py
     // push_roots` is added only after the codewriter has read the graph.
     let _roots = pyre_object::gc_roots::push_roots();
-    let gen_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(gen_obj);
-    let arg_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_arg);
+    let gen_slot = pyre_object::gc_roots::pin_roots(&[gen_obj, w_arg_or_err]);
+    let arg_slot = gen_slot + 1;
     // `frame = self.frame`, read off the pinned generator: a pin above can
     // wait behind a collection that moves the frame, and the generator's
     // edge is what that collection updates.
@@ -23659,21 +23661,24 @@ pub fn generator_send_ex_body(gen_obj: PyObjectRef, w_arg: PyObjectRef, throw: u
         if w_generator_is_exhausted(pyre_object::gc_roots::shadow_stack_get(gen_slot)) {
             return genentry_raise_finished(
                 pyre_object::gc_roots::shadow_stack_get(gen_slot),
-                throw,
+                pyre_object::gc_roots::shadow_stack_get(arg_slot),
             );
         }
         if frame_ptr.is_null() {
             w_generator_set_exhausted(pyre_object::gc_roots::shadow_stack_get(gen_slot));
             return genentry_raise_finished(
                 pyre_object::gc_roots::shadow_stack_get(gen_slot),
-                throw,
+                pyre_object::gc_roots::shadow_stack_get(arg_slot),
             );
         }
         let already_started =
             w_generator_is_started(pyre_object::gc_roots::shadow_stack_get(gen_slot));
+        let is_throw = crate::pyopcode::is_s_application_exception(
+            pyre_object::gc_roots::shadow_stack_get(arg_slot),
+        );
 
         if !already_started
-            && throw == 0
+            && !is_throw
             && !pyre_object::gc_roots::shadow_stack_get(arg_slot).is_null()
             && !is_none(pyre_object::gc_roots::shadow_stack_get(arg_slot))
         {
@@ -23706,18 +23711,10 @@ pub fn generator_send_ex_body(gen_obj: PyObjectRef, w_arg: PyObjectRef, throw: u
         // generator.py `_invoke_execute_frame` delegates the complete
         // resume to `frame.execute_frame(w_arg_or_err)`.  In particular,
         // `PyFrame.resume_execute_frame` handles `w_yielding_from` only after
-        // the outer frame has entered the execution context.
-        // CPython `gen_send_ex2` always StackPushes the sent value, including
-        // the first resume (the frame rests on `POP_TOP`).  Pass the argument
-        // on send/`__next__` whether or not the generator has started so
-        // `resume_execute_frame` shares that push.  `throw` still injects
-        // through `operr` with no sent value, matching PyPy's
-        // `SApplicationException` arm.
-        let w_inputvalue = if throw == 0 {
-            pyre_object::gc_roots::shadow_stack_get(arg_slot)
-        } else {
-            pyre_object::PY_NULL
-        };
+        // the outer frame has entered the execution context.  Pass the
+        // argument on send/`__next__` whether or not the generator has
+        // started so `resume_execute_frame` shares that push.
+        // `SApplicationException` injects through `operr` with no sent value.
         let frame_live = if frame_owned {
             pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut crate::pyframe::PyFrame
         } else {
@@ -23726,8 +23723,7 @@ pub fn generator_send_ex_body(gen_obj: PyObjectRef, w_arg: PyObjectRef, throw: u
         match generator_invoke_execute_frame_residual(
             pyre_object::gc_roots::shadow_stack_get(gen_slot),
             frame_live,
-            w_inputvalue,
-            throw,
+            pyre_object::gc_roots::shadow_stack_get(arg_slot),
         ) {
             Ok(value) => {
                 let frame_now = if frame_owned {
@@ -23810,7 +23806,7 @@ pub(crate) fn resume_yield_from(
         None if unsafe { pyre_object::is_none(roots.get(arg_slot)) } => {
             let w_yf = roots.get(yf_slot);
             if unsafe { pyre_object::generator::is_generator_or_coroutine(w_yf) } {
-                generator_send_ex(w_yf, w_none(), None, None, false)
+                generator_send_ex(w_yf, w_none(), None, None)
             } else {
                 next(w_yf)
             }
@@ -23859,7 +23855,7 @@ fn throw_yield_from(
 ) -> PyResult {
     unsafe {
         if pyre_object::generator::is_generator_or_coroutine(w_yf) {
-            return generator_send_ex(w_yf, w_none(), Some(err), throw_args, false);
+            return generator_send_ex(w_yf, w_none(), Some(err), throw_args);
         }
     }
     // `getattr` and the following call run Python. The delegate, the original
@@ -24152,7 +24148,7 @@ pub unsafe fn generator_resume_fast_path(w_obj: PyObjectRef) -> Option<Generator
 
 /// PyPy: GeneratorIterator.next() — equivalent to __next__
 fn generator_next(gen_obj: PyObjectRef) -> PyResult {
-    generator_send_ex(gen_obj, w_none(), None, None, false)
+    generator_send_ex(gen_obj, w_none(), None, None)
 }
 
 /// __next__ method wrapper
@@ -24461,7 +24457,7 @@ pub(crate) fn generator_send_method(args: &[PyObjectRef]) -> PyResult {
         args[0]
     };
     let value = if args.len() > 1 { args[1] } else { w_none() };
-    generator_send_ex(gen_obj, value, None, None, false)
+    generator_send_ex(gen_obj, value, None, None)
 }
 
 /// PyPy: GeneratorIterator.descr_throw(w_type, w_val=None, w_tb=None)
@@ -24564,7 +24560,6 @@ fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> Py
                 w_none(),
                 Some(err),
                 Some(([reload(1), reload(2), reload(3)], argc)),
-                false,
             );
         }
     };
@@ -24582,7 +24577,6 @@ fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> Py
             w_none(),
             Some(e),
             Some(([reload(1), reload(2), reload(3)], argc)),
-            false,
         );
     }
     let w_value = pyre_object::gc_roots::shadow_stack_get(value_slot);
@@ -24592,7 +24586,6 @@ fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> Py
         w_none(),
         Some(err),
         Some(([reload(1), reload(2), reload(3)], argc)),
-        false,
     )
 }
 
@@ -24679,6 +24672,10 @@ fn generator_close_impl(gen_obj: PyObjectRef) -> PyResult {
             }
             return Ok(w_none());
         }
+        // `generator.py descr_close`: `if self.frame is None: return`.
+        if w_generator_get_frame(gen_obj).is_null() {
+            return Ok(w_none());
+        }
     }
     // generator.py `descr_close`: close the yield-from delegate first, then
     // send GeneratorExit (or the error that close raised) into this frame.
@@ -24692,7 +24689,7 @@ fn generator_close_impl(gen_obj: PyObjectRef) -> PyResult {
             .unwrap_or_else(|| PyError::new(PyErrorKind::GeneratorExit, String::new()))
     };
     let sent = pyre_object::with_roots!(gen_obj => {
-        generator_throw_ex(gen_obj, w_none(), Some(err), None, true)
+        generator_throw_ex(gen_obj, err, None)
     });
     let mut e = match sent {
         Ok(_) => {
@@ -24758,14 +24755,14 @@ pub(crate) fn coroutine_await_method(args: &[PyObjectRef]) -> PyResult {
 pub(crate) fn coroutine_wrapper_next_method(args: &[PyObjectRef]) -> PyResult {
     let wrapper = args.first().copied().unwrap_or(PY_NULL);
     let coroutine = unsafe { pyre_object::generator::w_coroutine_wrapper_get_coroutine(wrapper) };
-    generator_send_ex(coroutine, w_none(), None, None, false)
+    generator_send_ex(coroutine, w_none(), None, None)
 }
 
 pub(crate) fn coroutine_wrapper_send_method(args: &[PyObjectRef]) -> PyResult {
     let wrapper = args.first().copied().unwrap_or(PY_NULL);
     let coroutine = unsafe { pyre_object::generator::w_coroutine_wrapper_get_coroutine(wrapper) };
     let value = crate::type_methods::arg_or_none(args, 1);
-    generator_send_ex(coroutine, value, None, None, false)
+    generator_send_ex(coroutine, value, None, None)
 }
 
 pub(crate) fn coroutine_wrapper_throw_method(args: &[PyObjectRef]) -> PyResult {
@@ -24964,7 +24961,6 @@ fn async_gen_asend_do_send(awaitable: PyObjectRef, mut arg: PyObjectRef) -> PyRe
         arg,
         None,
         None,
-        false,
     )
     .and_then(|value| {
         async_gen_unwrap_value(
@@ -25021,7 +25017,6 @@ pub(crate) fn async_gen_asend_close_method(args: &[PyObjectRef]) -> PyResult {
         w_none(),
         Some(PyError::new(PyErrorKind::GeneratorExit, String::new())),
         None,
-        true,
     );
     unsafe {
         pyre_object::generator::w_async_generator_set_running(
@@ -25186,7 +25181,6 @@ fn async_gen_athrow_do_send(awaitable: PyObjectRef, arg: PyObjectRef) -> PyResul
                 w_none(),
                 Some(PyError::new(PyErrorKind::GeneratorExit, String::new())),
                 None,
-                true,
             )
         } else {
             // `AsyncGenerator.athrow` already warned from the caller-visible
@@ -25195,7 +25189,7 @@ fn async_gen_athrow_do_send(awaitable: PyObjectRef, arg: PyObjectRef) -> PyResul
             generator_throw_impl(&[async_gen, exc_type, exc_value, exc_tb], false)
         }
     } else {
-        generator_send_ex(async_gen, arg, None, None, false)
+        generator_send_ex(async_gen, arg, None, None)
     };
     let result = match result {
         Ok(value) => {
@@ -25264,7 +25258,6 @@ pub(crate) fn async_gen_athrow_close_method(args: &[PyObjectRef]) -> PyResult {
         w_none(),
         Some(PyError::new(PyErrorKind::GeneratorExit, String::new())),
         None,
-        true,
     );
     unsafe {
         pyre_object::generator::w_async_generator_set_running(

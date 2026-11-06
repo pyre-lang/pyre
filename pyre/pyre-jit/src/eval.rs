@@ -4976,6 +4976,29 @@ fn build_gc() -> Box<MiniMarkGC> {
         let pytype = &pyre_interpreter::error::PYERROR_TYPE as *const _ as usize;
         majit_gc::GcAllocator::register_vtable_for_type(&mut gc, pytype, pyerror_tid);
         pytype_to_tid.insert(pytype, pyerror_tid);
+        let sapp_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+            pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_OBJECT_SIZE,
+            object_tid,
+            vec![
+                std::mem::offset_of!(
+                    pyre_interpreter::pyopcode::SApplicationException,
+                    ob_header.w_class
+                ),
+                pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_OPERR_OFFSET,
+                pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_THROW0_OFFSET,
+                pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_THROW1_OFFSET,
+                pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_THROW2_OFFSET,
+            ],
+        ));
+        debug_assert_eq!(
+            sapp_tid,
+            pyre_interpreter::pyopcode::s_application_exception_gc_type_id()
+        );
+        pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_GC_TYPE_ID_CELL.set(sapp_tid);
+        let sapp_pytype =
+            &pyre_interpreter::pyopcode::S_APPLICATION_EXCEPTION_TYPE as *const _ as usize;
+        majit_gc::GcAllocator::register_vtable_for_type(&mut gc, sapp_pytype, sapp_tid);
+        pytype_to_tid.insert(sapp_pytype, sapp_tid);
     }
     // setobject.py stores the copied r_dict behind `sstorage`;
     // rordereddict.py makes that table a GcStruct("dicttable") the collector
@@ -8822,7 +8845,7 @@ fn finish_generatorentry_after_walk_abort(
             }
         }
     }
-    pyre_interpreter::generator_send_ex_body(live_gen, live_arg, 0)
+    pyre_interpreter::generator_send_ex_body(live_gen, live_arg)
 }
 
 /// Exception word from a jd2 FINISH, including `StopIteration`.

@@ -1421,6 +1421,10 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         crate::error::pyerror_gc_type_id(),
         &crate::error::PYERROR_TYPE,
     ));
+    aliases.push(pyre_object::pyobject::subclass_range_alias(
+        crate::pyopcode::s_application_exception_gc_type_id(),
+        &crate::pyopcode::S_APPLICATION_EXCEPTION_TYPE,
+    ));
     aliases
 }
 
@@ -1521,6 +1525,10 @@ pub fn active_subclass_range_hierarchy() -> Vec<(u32, Option<u32>)> {
     active.push((
         crate::error::pyerror_gc_type_id(),
         Some(crate::error::host_exception_gc_type_id()),
+    ));
+    active.push((
+        crate::pyopcode::s_application_exception_gc_type_id(),
+        Some(0),
     ));
     active
 }
