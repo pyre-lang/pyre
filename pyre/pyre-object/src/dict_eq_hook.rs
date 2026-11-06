@@ -235,7 +235,15 @@ pub extern "C" fn has_eq_w_hook() -> bool {
     reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
 )]
 pub extern "C" fn eq_w_hooked(a: PyObjectRef, b: PyObjectRef) -> bool {
-    EQ_W_HOOK.with(|cell| cell.get().map(|f| unsafe { f(a, b) }).unwrap_or(false))
+    // `ll_keyeq_custom` `hlinvoke`s `d.fnkeyeq` in that named body
+    // (`rordereddict.py`). The TLS cell stands in for the dict's
+    // `fnkeyeq` field; the invoke stays here so `indirect_call` is an
+    // operation of this graph, not of the `LocalKey::with` closure.
+    let f = EQ_W_HOOK.with(|cell| cell.get());
+    match f {
+        Some(f) => unsafe { f(a, b) },
+        None => false,
+    }
 }
 
 /// Invoke the installed `eq_w` hook.  Returns `None` when no hook is
@@ -296,7 +304,14 @@ pub extern "C" fn has_hash_w_hook() -> bool {
     reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
 )]
 pub extern "C" fn hash_w_hooked(obj: PyObjectRef) -> i64 {
-    HASH_W_HOOK.with(|cell| cell.get().map(|f| unsafe { f(obj) }).unwrap_or(0))
+    // `ll_keyhash_custom` `hlinvoke`s `d.fnkeyhash` in that named body
+    // (`rordereddict.py`). Same split as `eq_w_hooked`: load the stored
+    // pointer, then invoke it here.
+    let f = HASH_W_HOOK.with(|cell| cell.get());
+    match f {
+        Some(f) => unsafe { f(obj) },
+        None => 0,
+    }
 }
 
 /// Install the `hash_str` callback for this thread.  Companion to
@@ -331,7 +346,13 @@ pub extern "C" fn has_hash_str_hook() -> bool {
     reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
 )]
 pub extern "C" fn hash_str_hooked(ptr: *const u8, len: usize) -> i64 {
-    HASH_STR_HOOK.with(|cell| cell.get().map(|f| unsafe { f(ptr, len) }).unwrap_or(0))
+    // Same `hlinvoke` placement as `hash_w_hooked`: the stored pointer
+    // is loaded from TLS, then invoked in this graph.
+    let f = HASH_STR_HOOK.with(|cell| cell.get());
+    match f {
+        Some(f) => unsafe { f(ptr, len) },
+        None => 0,
+    }
 }
 
 /// [`hash_str_hooked`] over a byte slice.
@@ -435,5 +456,11 @@ pub extern "C" fn has_compares_by_identity_hook() -> bool {
     reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
 )]
 pub extern "C" fn compares_by_identity_hooked(w_type: PyObjectRef) -> bool {
-    COMPARES_BY_IDENTITY_HOOK.with(|cell| cell.get().map(|f| unsafe { f(w_type) }).unwrap_or(false))
+    // Same `hlinvoke` placement as `eq_w_hooked`: load the stored
+    // pointer, then invoke it here.
+    let f = COMPARES_BY_IDENTITY_HOOK.with(|cell| cell.get());
+    match f {
+        Some(f) => unsafe { f(w_type) },
+        None => false,
+    }
 }

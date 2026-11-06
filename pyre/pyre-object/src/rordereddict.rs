@@ -503,7 +503,7 @@ impl<K, V, S> RDict<K, V, S> {
     }
 
     #[inline]
-    fn entry_ptr(&self) -> *mut Entry<K, V> {
+    pub(crate) fn entry_ptr(&self) -> *mut Entry<K, V> {
         entries_item_ptr(self.entries)
     }
 
@@ -512,7 +512,7 @@ impl<K, V, S> RDict<K, V, S> {
     /// allocation. An old table that holds a young array is remembered so
     /// the next minor greys `d.entries` (`write_barrier`).
     #[inline]
-    fn barrier_entries(&self) {
+    pub(crate) fn barrier_entries(&self) {
         if !self.entries.is_null() {
             crate::gc_hook::try_gc_write_barrier(self.entries as crate::gc_hook::GCREF);
         }
@@ -983,9 +983,20 @@ impl<K, V, S> RDict<K, V, S> {
         Some((&e.key, &mut e.value))
     }
 
+    /// `ll_get_value`: `d.entries[i].value`. Same shape as [`Self::entry_valid`].
+    #[inline]
+    pub fn slot_value(&self, slot: usize) -> V
+    where
+        V: Copy,
+    {
+        unsafe { (*self.entry_ptr().add(slot)).value }
+    }
+
     /// Overwrite `entries[slot].value`. The caller already proved `slot`.
+    /// Same shape as [`Self::slot_value`]: `d.entries[i].value = value`.
     pub fn set_slot_value(&mut self, slot: usize, value: V) {
-        self.entry_at_mut(slot).value = value;
+        self.barrier_entries();
+        unsafe { (*self.entry_ptr().add(slot)).value = value }
     }
 
     pub fn iter(&self) -> LiveIter<'_, K, V> {
@@ -2727,6 +2738,7 @@ mod tests {
         }
         let slot = d.index_of(&30).unwrap();
         assert_eq!(d.get_slot(slot).map(|(k, _)| *k), Some(30));
+        assert_eq!(d.slot_value(slot), 30);
         assert_eq!(d.remove_slot(slot), Some((30, 30)));
         assert_eq!(d.remove_slot(slot), None);
         assert_eq!(d.index_of(&30), None);

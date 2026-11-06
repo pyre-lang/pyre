@@ -358,6 +358,36 @@ impl crate::rordereddict::Equivalent<ObjectKey> for StrLookupKey<'_> {
     }
 }
 
+/// Borrowed probe for a type namespace (`typeobject.py`
+/// `_getdictvalue_no_unwrapping` / `dict_w.get(attr)`).
+///
+/// `dict_w` is an interned-str map. The comparison is WTF-8 byte equality of
+/// exact-str keys; it never calls `dict_keys_equal` / `eq_w_hooked`.
+struct TypeDictLookupKey<'a> {
+    hash: i64,
+    key: &'a [u8],
+}
+
+impl std::hash::Hash for TypeDictLookupKey<'_> {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_i64(self.hash);
+    }
+}
+
+impl crate::rordereddict::Equivalent<ObjectKey> for TypeDictLookupKey<'_> {
+    #[inline]
+    fn equivalent(&self, k: &ObjectKey) -> bool {
+        if self.hash != k.hash {
+            return false;
+        }
+        unsafe {
+            crate::is_exact_type(k.obj, &crate::STR_TYPE)
+                && crate::w_str_get_wtf8(k.obj).as_bytes() == self.key
+        }
+    }
+}
+
 /// The borrow-key probe [`dict_entries_get_str`] runs once the str hash hook
 /// has produced `hash` — `celldict.py getitem_str`'s single
 /// `self.unerase(w_dict.dstorage).get(key)`.
@@ -379,6 +409,53 @@ pub unsafe fn dict_entries_probe_str(
     key: &str,
 ) -> Option<PyObjectRef> {
     entries.get(&StrLookupKey { hash, key }).copied()
+}
+
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
+/// `ll_dict_lookup` (`rordereddict.py`) for the type-namespace probe.
+fn dict_entries_probe_type_str_iff(entries: &ObjectDictStorage, _hash: i64, key: &[u8]) -> bool {
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(key)
+}
+
+#[majit_macros::look_inside_iff(dict_entries_probe_type_str_iff)]
+unsafe fn dict_entries_probe_type_str(
+    entries: &ObjectDictStorage,
+    hash: i64,
+    key: &[u8],
+) -> Option<PyObjectRef> {
+    entries.get(&TypeDictLookupKey { hash, key }).copied()
+}
+
+unsafe fn type_dict_entries_scan_exact_str(
+    entries: &ObjectDictStorage,
+    key: &[u8],
+) -> Option<PyObjectRef> {
+    for slot in 0..entries.entry_slots() {
+        let Some((stored, value)) = entries.get_slot(slot) else {
+            continue;
+        };
+        if crate::is_exact_type(stored.obj, &crate::STR_TYPE)
+            && crate::w_str_get_wtf8(stored.obj).as_bytes() == key
+        {
+            return Some(*value);
+        }
+    }
+    None
+}
+
+/// `typeobject.py _getdictvalue_no_unwrapping`: `self.dict_w.get(attr)`.
+///
+/// The hashed arm uses the str-hash trampoline (`rstr.py ll_strhash` of the
+/// interned name). The no-hook arm walks exact-str keys by WTF-8 bytes so
+/// pyre-object tests without the trampoline still answer, and neither arm
+/// reaches `eq_w_hooked`.
+unsafe fn type_dict_entries_get(entries: &ObjectDictStorage, key: &[u8]) -> Option<PyObjectRef> {
+    if crate::dict_eq_hook::has_hash_str_hook() {
+        let hash = crate::dict_eq_hook::hash_str_hooked_bytes(key);
+        dict_entries_probe_type_str(entries, hash, key)
+    } else {
+        type_dict_entries_scan_exact_str(entries, key)
+    }
 }
 
 /// The owned-key probe [`dict_entries_get_str`]'s no-hook arm runs — the same
@@ -500,7 +577,12 @@ pub unsafe fn dict_entries_insert_hashed(
 /// # Safety
 /// Same as [`dict_entries_probe_hashed`]; `index` must be a live entry index.
 pub unsafe fn dict_entries_value_at(entries: &ObjectDictStorage, index: usize) -> PyObjectRef {
-    *entries.get_slot(index).unwrap().1
+    // `ll_get_value`: `d.entries[i].value` in the same function as
+    // `ll_dict_getitem` (`rordereddict.py`). The expression lives here
+    // so getinteriorfield records this monomorphic ObjectDictStorage
+    // flavour (`get_ll_dict` one DICTENTRYARRAY), not the generic
+    // `RDict::slot_value` TypeVar ARRAY.OF.
+    unsafe { (*entries.entry_ptr().add(index)).value }
 }
 
 /// Overwrite the value at an entry index the caller already settled on —
@@ -516,7 +598,15 @@ pub unsafe fn dict_entries_value_set_at(
     index: usize,
     value: PyObjectRef,
 ) {
-    entries.set_slot_value(index, value);
+    // `_ll_dict_setitem_lookup_done` overwrite: `entry.value = value`
+    // after `entry = d.entries[i]` (`rordereddict.py`). The store lives
+    // here so setinteriorfield records this monomorphic ObjectDictStorage
+    // flavour (`get_ll_dict` one DICTENTRYARRAY), not generic
+    // `RDict::set_slot_value` TypeVar ARRAY.OF. Native needs the
+    // write barrier; `setinteriorfield_gc` records the JIT one
+    // (`framework.py` `write_barrier`).
+    entries.barrier_entries();
+    unsafe { (*entries.entry_ptr().add(index)).value = value }
 }
 
 /// The owned-key store — [`dict_entries_probe_object`]'s twin, hashing `key`
@@ -3263,9 +3353,18 @@ pub unsafe fn w_dict_lookup_object_strategy(
     w_dict_lookup_object_strategy_checked(obj, key).unwrap_or(None)
 }
 
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
+/// `ll_dict_lookup` (`rdict.py` / `rordereddict.py`).  The storage box is
+/// `d`; when it is not virtual the whole hash+probe+scan body residualizes
+/// as one call, matching identity and module-dict object-entries.
+fn w_dict_lookup_object_strategy_checked_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    let storage = unsafe { w_dict_object_storage(obj) };
+    majit_rlib::jit::isvirtual(storage) && majit_rlib::jit::isconstant(&key)
+}
+
 /// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
+/// `obj` must point to a valid `W_DictObject` on `ObjectDictStrategy`.
+#[majit_macros::look_inside_iff(w_dict_lookup_object_strategy_checked_iff)]
 pub unsafe fn w_dict_lookup_object_strategy_checked(
     obj: PyObjectRef,
     key: PyObjectRef,
@@ -3625,7 +3724,7 @@ pub unsafe fn w_dict_setdefault_checked(
                 None
             } else {
                 match index {
-                    Some(i) => Some(*entries.get_slot(i).unwrap().1),
+                    Some(i) => Some(entries.slot_value(i)),
                     None => {
                         dict_write_barrier(obj);
                         dict_entries_insert_hashed(entries, object_key.hash, object_key.obj, value);
@@ -3652,7 +3751,7 @@ pub unsafe fn w_dict_setdefault_checked(
         if index >= 0 {
             let dict = &*(obj as *const W_DictObject);
             let entries = &*(dict.dstorage as *const ObjectDictStorage);
-            return Ok(*entries.get_slot(index as usize).unwrap().1);
+            return Ok(entries.slot_value(index as usize));
         }
         crate::dict_eq_hook::begin_callback_free_probe();
         let dict = &mut *(obj as *mut W_DictObject);
@@ -4168,6 +4267,29 @@ pub unsafe fn w_dict_setitem(obj: PyObjectRef, key: i64, value: PyObjectRef) {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_getitem_str(obj: PyObjectRef, key: &str) -> Option<PyObjectRef> {
     w_dict_getitem_str_hashed(obj, key, 0)
+}
+
+/// `typeobject.py _getdictvalue_no_unwrapping`: `self.dict_w.get(attr)`.
+///
+/// Type namespaces are interned-str maps (`W_TypeObject.dict_w`). The probe
+/// reads Unicode/Object storage by exact-str WTF-8 bytes and never dispatches
+/// through `getitem` / `w_dict_lookup`, so the `@elidable`
+/// `_pure_getdictvalue_no_unwrapping` graph cannot reach `eq_w_hooked`.
+///
+/// # Safety
+/// `obj` must be the type's namespace `W_DictObject` (`W_TypeObject.dict`).
+pub unsafe fn w_type_dict_getitem_bytes(obj: PyObjectRef, key: &[u8]) -> Option<PyObjectRef> {
+    if obj.is_null() {
+        return None;
+    }
+    lock_dict_refs!(_dict_guard, obj);
+    let dict = &*(obj as *const W_DictObject);
+    match dict.dstrategy.kind {
+        StrategyKind::Unicode | StrategyKind::Object => {
+            type_dict_entries_get(w_dict_object_storage(obj), key)
+        }
+        _ => None,
+    }
 }
 
 /// [`w_dict_getitem_str`] for a caller that already holds `key`'s digest —
@@ -8755,6 +8877,21 @@ mod tests {
     fn install_test_hash_hook() {
         crate::dict_eq_hook::register_hash_w_hook(builtin_structural_hash);
         crate::dict_eq_hook::register_hash_str_hook(builtin_structural_str_hash);
+    }
+
+    /// `typeobject.py _getdictvalue_no_unwrapping` / `dict_w.get(attr)`:
+    /// empty miss, then an exact-str hit after `setitem_str`.
+    #[test]
+    fn type_dict_getitem_bytes_reads_exact_str_keys() {
+        install_test_hash_hook();
+        unsafe {
+            let dict = w_dict_new();
+            assert!(w_type_dict_getitem_bytes(dict, b"__eq__").is_none());
+            w_dict_setitem_str(dict, "__eq__", w_int_new(7));
+            let hit = w_type_dict_getitem_bytes(dict, b"__eq__").expect("stored name");
+            assert_eq!(w_int_get_value(hit), 7);
+            assert!(w_type_dict_getitem_bytes(dict, b"__ne__").is_none());
+        }
     }
 
     #[test]

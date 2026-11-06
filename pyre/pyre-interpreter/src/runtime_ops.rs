@@ -1652,8 +1652,7 @@ pub fn type_dict_lookup_no_unwrapping(cls: PyObjectRef, name: &str) -> Option<Py
     if dict.is_null() {
         return None;
     }
-    let value = unsafe { pyre_object::w_dict_getitem_str(dict as PyObjectRef, name)? };
-    if value.is_null() { None } else { Some(value) }
+    unsafe { pyre_object::w_type_dict_getitem_bytes(dict as PyObjectRef, name.as_bytes()) }
 }
 
 pub fn type_dict_lookup_wtf8_no_unwrapping(cls: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> {
@@ -1661,8 +1660,7 @@ pub fn type_dict_lookup_wtf8_no_unwrapping(cls: PyObjectRef, name: &Wtf8) -> Opt
     if dict.is_null() {
         return None;
     }
-    let value = unsafe { pyre_object::w_dict_getitem_wtf8(dict as PyObjectRef, name)? };
-    if value.is_null() { None } else { Some(value) }
+    unsafe { pyre_object::w_type_dict_getitem_bytes(dict as PyObjectRef, name.as_bytes()) }
 }
 
 /// `W_TypeObject.getdictvalue`: the namespace entry with a `MutableCell`
@@ -1684,7 +1682,9 @@ pub fn type_dict_contains(cls: PyObjectRef, name: &str) -> bool {
     if dict.is_null() {
         return false;
     }
-    unsafe { pyre_object::w_dict_getitem_str(dict as PyObjectRef, name).is_some() }
+    unsafe {
+        pyre_object::w_type_dict_getitem_bytes(dict as PyObjectRef, name.as_bytes()).is_some()
+    }
 }
 
 pub fn type_dict_store(cls: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
