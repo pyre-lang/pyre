@@ -8332,13 +8332,13 @@ fn tdc_cutoff_callees_at_tag(
 /// not, so a later `transform_dead_code` cutoff would rewrite the
 /// GraphStore success exit into `exceptblock`.
 ///
-/// Skip that cutoff only when the GraphStore origin is a unit success
-/// (`returnblock`, every link arg a Const). That is the kind-arm of a
-/// void Call whose MIR already returned: keeping the Const-None exit
-/// preserves the front graph. A value-returning swallowed call still
-/// cuts — its GraphStore args are Variables, and leaving them uncut
-/// would publish an unbound success. A dead switch has annotated
-/// `same_as` ops and still cuts.
+/// Skip that cutoff *and* the matching GraphStore drop only when the
+/// origin is a unit success (`returnblock`, every link arg a Const).
+/// That is the kind-arm of a void Call whose MIR already returned:
+/// keeping the Const-None exit preserves the front graph. A
+/// value-returning swallowed call still cuts — its GraphStore args are
+/// Variables, and leaving them uncut would publish an unbound success.
+/// A dead switch has annotated `same_as` ops and still cuts.
 fn flowspace_block_swallowed_call_family(block: &crate::flowspace::model::Block) -> bool {
     if block.canraise() {
         return false;
@@ -8411,6 +8411,19 @@ fn record_tdc_cut_for_flow_graph(
         for link in &exits {
             let origin = link.borrow().origin;
             if link_not_in_links_followed(ann, link) {
+                // Dual-gate swallowed a void Call: the success exit is
+                // live on GraphStore even though `follow_link` never ran.
+                // Skipping only `cutoff` still recorded the origin as a
+                // drop and deleted the Const-None return.
+                let skip_swallowed_const_return = !canraise
+                    && flowspace_block_swallowed_call_family(&fb)
+                    && graphstore_origin_is_const_return(graph, link);
+                if skip_swallowed_const_return {
+                    if let Some(o) = origin {
+                        followed_origins.insert(o);
+                    }
+                    continue;
+                }
                 match origin {
                     Some(o) => {
                         // `transform.py` `transform_dead_code` removes every
@@ -8422,11 +8435,7 @@ fn record_tdc_cut_for_flow_graph(
                     None => none_origin += 1,
                 }
                 remaining.retain(|l| !Rc::ptr_eq(l, link));
-                if transform_dead_code_would_cutoff(canraise, &remaining)
-                    && (canraise
-                        || !flowspace_block_swallowed_call_family(&fb)
-                        || !graphstore_origin_is_const_return(graph, link))
-                {
+                if transform_dead_code_would_cutoff(canraise, &remaining) {
                     cutoff = true;
                 }
             } else if let Some(o) = origin {

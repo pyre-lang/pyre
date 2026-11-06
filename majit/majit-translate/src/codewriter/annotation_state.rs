@@ -140,6 +140,21 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
             if let Some(shell) = str_family_ref_shell(payload.as_deref()) {
                 return Some(shell);
             }
+            // `llmemory.py` `GCREF = lltype.Ptr(lltype.GcOpaqueType('GCREF'))`.
+            // `llannotation.py` `lltype_to_annotation` of that Ptr is
+            // `SomePtr`. Same seed as `derive_subject_inputcells` for a
+            // GCREF Input class_root. A classdef-less `SomeInstance`
+            // here cannot join a later `SomePtr` (`pairtype(SomePtr,
+            // SomeObject).union`) and `bool` of that Instance folds
+            // True (`unaryop.py` `SomeInstance.bool_behavior`).
+            if payload.as_deref().is_some_and(|root| {
+                crate::annotator::bookkeeper::is_gcref_type_spelling(root)
+                    || crate::annotator::bookkeeper::is_gcref_type_spelling(
+                        majit_ir::descr::class_root_leaf(root),
+                    )
+            }) {
+                return Some(crate::annotator::bookkeeper::gcref_ptr_annotation());
+            }
             // RPython typed pointers lift to `SomePtr(ll_ptrtype)`
             // (`llannotation.py` `lltype_to_annotation`), but the
             // correct Ptr must come from the producer (annotator with
@@ -258,6 +273,11 @@ pub fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
         // `Ref` here; that kind is a separate decision.
         SomeValue::Ptr(p) => match &p.ll_ptrtype.TO {
             PtrTarget::Func(_) => ValueType::Int,
+            PtrTarget::Opaque(opaque)
+                if crate::annotator::bookkeeper::is_gcref_type_spelling(&opaque.tag) =>
+            {
+                ValueType::Ref(Some("GCREF".to_string()))
+            }
             _ => ValueType::Ref(None),
         },
         // Frozen / class PBCs stay `Ref`. A function-PBC's
@@ -368,6 +388,26 @@ mod tests {
             matches!(&unnamed, SomeValue::Instance(inst) if inst.classdef.is_none()),
             "unnamed Ref stays classdef-less, got {unnamed:?}"
         );
+    }
+
+    #[test]
+    fn gcref_ref_shells_to_someptr() {
+        // `llmemory.py` `GCREF = Ptr(GcOpaqueType('GCREF'))`;
+        // `llannotation.py` `lltype_to_annotation` of that Ptr is SomePtr.
+        // Same seed as `derive_subject_inputcells` for a GCREF Input.
+        for root in ["GCREF", "GCREFOpaque", "header::GCREFOpaque"] {
+            let shell = valuetype_to_someshell(&ValueType::Ref(Some(root.to_string())))
+                .unwrap_or_else(|| panic!("{root} Ref must project"));
+            assert!(
+                matches!(&shell, SomeValue::Ptr(_)),
+                "GCREF Ref({root}) must be SomePtr, got {shell:?}"
+            );
+            assert_eq!(
+                somevalue_to_valuetype(&shell),
+                ValueType::Ref(Some("GCREF".to_string())),
+                "GCREF SomePtr roundtrips to Ref(GCREF)"
+            );
+        }
     }
 
     #[test]

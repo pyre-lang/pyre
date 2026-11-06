@@ -9027,7 +9027,7 @@ mod tests {
             metadata,
             code_ptr,
             false,
-            std::ptr::null(),
+            code_ref,
         ));
         crate::state::install_jitcode_for(code_ref, pyjit);
         assert!(

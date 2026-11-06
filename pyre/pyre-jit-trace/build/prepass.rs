@@ -1250,6 +1250,22 @@ fn real_main() {
                     "iterobject",
                     "w_reverseseqiter_iter",
                 ]),
+                // `W_AbstractRangeIterator.descr_iter`. `space.iter` stays
+                // residual, so the descent looks the body up by this graph
+                // key (`specialize.rs RANGE_ITERATOR_ITER_DESCENT`).
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "functional",
+                    "w_range_iterator_iter",
+                ]),
+                // `GeneratorIterator.descr__iter`. `space.iter` stays
+                // residual, so the descent looks the body up by this graph
+                // key (`specialize.rs GENERATOR_ITER_DESCENT`).
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "generator",
+                    "w_generator_iter",
+                ]),
                 // Step-1 range `FOR_ITER` descends this body. `space.next`
                 // calls it, and that call stays residual, so the graph is
                 // seeded here for the path lookup.

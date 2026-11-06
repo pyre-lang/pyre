@@ -5465,10 +5465,15 @@ impl<'a> Lowering<'a> {
     ///   Both annotate `lltype_to_annotation(GCREF)` (`SomePtr`).
     ///   GCREF→GCREF stays an alias. A genuine integer keeps
     ///   `cast_int_to_ptr`.
-    /// * **recast GCREF** — a value-model word occupying a GC pointer
-    ///   slot (`as PyObjectRef` / `pin_root`). RPython recasts a typed
-    ///   GC pointer into that slot with `cast_opaque_ptr` (`rgcref.py`
-    ///   `pairtype(Repr, GCRefRepr).convert_from_to`).
+    /// * **recast GCREF** — a value-model word occupying a GCREF slot
+    ///   (`*mut GCREFOpaque` / `pin_root`'s last argument). RPython
+    ///   recasts a typed GC pointer into that slot with `cast_opaque_ptr`
+    ///   (`rgcref.py` `pairtype(Repr, GCRefRepr).convert_from_to`).
+    ///   `as PyObjectRef` of a `Str` aliases: the pin helper recasts its
+    ///   last argument when the call survives (`desugar/call.rs`
+    ///   `callee_pin_gcref_arg`). Recasting the body's SSA to GCREF
+    ///   makes `is_(p, None)` of that word fold False (`binaryop.py`
+    ///   `is__default`, `SomePtr.can_be_none` is false).
     ///
     /// A `Ref` source is required for the narrow / address arms: an
     /// `addr_usize as *const Struct` reinterpret is `cast_int_to_ptr`
@@ -5480,7 +5485,7 @@ impl<'a> Lowering<'a> {
     /// `SomeInstance(PyObject)`; the dest of this cast is still
     /// `Ptr(STR)` / `SomeString`. A `Str` source is the same physical
     /// pointer ([`Self::cast_src_is_pointer`]): dest-Str recasts it onto
-    /// rstr `STR`; a GC pointer dest recasts it to GCREF. Aliasing would
+    /// rstr `STR`; a GCREF dest recasts it to GCREF. Aliasing would
     /// keep `SomeString` on a slot that later phis with `null` PyObjectRef.
     pub(in crate::front::mir) fn dest_ty_is_rstr_str(&self, dest_ty: &TyRef) -> bool {
         self.dest_rstr_str_layout_root(dest_ty).is_some()
@@ -5566,19 +5571,22 @@ impl<'a> Lowering<'a> {
             ));
         }
         // `pairtype(Repr, GCRefRepr).convert_from_to` (`rgcref.py`): the
-        // dest is an instance pointer consumed as a GCREF slot (`pin_root`
-        // / `gc_root_pin_path`). The annotator already accepts the source
-        // value on a GCREF root (`cast_instance_intrinsic` `root == "GCREF"`).
-        // After dest-Str so a dest rstr `STR` with dest_kind `Ref(Utf8Str)`
-        // is not stolen into GCREF. A `Str` source is a pointer under
+        // dest is a GCREF slot (`pin_root` / `gc_root_pin_path`). The
+        // annotator already accepts the source value on a GCREF root
+        // (`cast_instance_intrinsic` `root == "GCREF"`). After dest-Str
+        // so a dest rstr `STR` with dest_kind `Ref(Utf8Str)` is not
+        // stolen into GCREF. A `Str` source is a pointer under
         // [`Self::cast_src_is_pointer`]; dest-Str already took those dests.
-        if matches!(src_kind, Some(ValueType::Str)) && matches!(dest_kind, ValueType::Ref(_)) {
+        // Only a GCREF dest recasts here. `as PyObjectRef` of a `Str`
+        // aliases so `is_(s, None)` keeps `SomeString.can_be_none`
+        // (`binaryop.py` `is__default`). `cast_instance_call("GCREF")`
+        // is `Ref(Some("GCREF"))`, the same dest as
+        // [`Self::recast_instance_to_gcref`].
+        if matches!(src_kind, Some(ValueType::Str)) && tyref_is_gcref_spelling(dest_ty, self.llbc) {
             let res = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            let kind =
-                crate::model::cast_instance_call_result("GCREF", arg.clone(), ValueType::Ref(None));
-            return Some((kind, res));
+            return Some((crate::model::cast_instance_call("GCREF", arg.clone()), res));
         }
         // dest-GCREF (`*mut GCREFOpaque` / `llmemory.GCREF`). Split on
         // the source pointee's gckind (`ptr_pointee_is_gc`):

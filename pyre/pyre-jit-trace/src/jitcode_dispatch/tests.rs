@@ -3584,9 +3584,12 @@ fn with_unarmed_call_trace_walk<R>(
     pyjit.metadata.forward_py_pc_marker_by_jit_pc = vec![(0, 0)];
     pyjit.metadata.forward_py_pc_pred_by_jit_pc = vec![(0, 0)];
     pyjit.metadata.resume_marker_marker_by_jit_pc = vec![(0, Some(0))];
-    let installed =
-        crate::state::install_jitcode_for(frame_ptr as *const (), std::sync::Arc::new(pyjit))
-            as *const crate::state::JitCode;
+    // `install_jitcode_for` keys on the owner PyCode (`pyframe.py`
+    // `self.pycode`).
+    let installed = crate::state::install_jitcode_for(
+        unsafe { (*frame_ptr).pycode },
+        std::sync::Arc::new(pyjit),
+    ) as *const crate::state::JitCode;
 
     let outer_index = test_outer_resume_jitcode_index();
     let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
@@ -11791,6 +11794,18 @@ fn seqiter_iter_jitcode_is_the_descr_iter_leaf() {
 fn reverseseqiter_iter_jitcode_is_the_descr_iter_leaf() {
     // `iterobject.py W_ReverseSeqIterObject.descr_iter` is `return self`.
     assert_identity_iter_w_leaf("pyre_object::iterobject::w_reverseseqiter_iter");
+}
+
+#[test]
+fn range_iterator_iter_jitcode_is_the_descr_iter_leaf() {
+    // `functional.py W_AbstractRangeIterator.descr_iter` is `return self`.
+    assert_identity_iter_w_leaf("pyre_object::functional::w_range_iterator_iter");
+}
+
+#[test]
+fn generator_iter_jitcode_is_the_descr_iter_leaf() {
+    // `generator.py GeneratorIterator.descr__iter` is `return self`.
+    assert_identity_iter_w_leaf("pyre_object::generator::w_generator_iter");
 }
 
 #[test]

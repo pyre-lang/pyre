@@ -9962,10 +9962,7 @@ fn dest_overlay_accepts_c_struct_with_nested_raw_pointers() {
     .unwrap();
     let dest = TyRef::Other(serde_json::json!({"RawPtr": [adt_node(0), "Mut"]}).into());
     let ptr_ty = lowering
-        .dest_overlay_ptr_lltype(
-            &dest,
-            crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
-        )
+        .dest_overlay_ptr_lltype(&dest, GcKind::Raw)
         .expect("ffi_cif dest is a raw overlay");
     let LowLevelType::Ptr(ptr) = ptr_ty else {
         panic!("overlay is Ptr(Struct), got {ptr_ty:?}");

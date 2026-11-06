@@ -1671,7 +1671,9 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
     match dst_bank {
         'i' => write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?,
-        'r' => write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?,
+        'r' => {
+            write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
+        }
         'f' => {
             let len = ctx.registers_f.len();
             let _ = ctx
