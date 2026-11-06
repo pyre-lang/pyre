@@ -226,6 +226,7 @@ mod frame_replacement_tests {
         session.borrow_mut().framestack.push(InlineFrame {
             is_portal: false,
             w_code: 1,
+            is_being_profiled: false,
             recursion_greenkey: true,
             call_id: 1,
             debug_merge_point_py_pc: None,
@@ -391,6 +392,7 @@ mod frame_replacement_tests {
         session.borrow_mut().framestack.push(InlineFrame {
             is_portal: false,
             w_code: 1,
+            is_being_profiled: false,
             recursion_greenkey: true,
             call_id: 1,
             debug_merge_point_py_pc: None,

@@ -17,19 +17,19 @@
 
 use super::*;
 
-/// Recursion depth of `w_code` on the walk's framestack —
-/// `opimpl_recursive_call` (`pyjitpl.py:1390-1402`) counting the portal frames
-/// already on `MetaInterp.framestack` before comparing against
-/// `max_unroll_recursion`.
+/// Recursion depth of a callee portal greenkey on the walk's framestack —
+/// `_opimpl_recursive_call` counting the portal frames already on
+/// `MetaInterp.framestack` before comparing against `max_unroll_recursion`.
 ///
-/// Upstream compares the whole greenkey element-wise (`pyjitpl.py`
-/// `gk[i].same_constant(greenboxes[i])`) over `(next_instr, is_being_profiled,
-/// bytecode)` (`interp_jit.py get_printable_location`); matching `w_code` alone is that comparison,
-/// because every entry this scan can see carries `next_instr == 0`:
+/// Upstream compares the whole greenkey element-wise
+/// (`gk[i].same_constant(greenboxes[i])`) over `(next_instr, is_being_profiled,
+/// bytecode)` (`interp_jit.py` `PyPyJitDriver.greens`). This scan matches
+/// `w_code` and `is_being_profiled`. `next_instr` is not stored because every
+/// entry this scan can see carries `next_instr == 0`:
 ///
-/// * `MIFrame.setup` (`pyjitpl.py`) assigns `greenkey` once and never
-///   updates it, so a frame's greenkey stays its ENTRY greens however far its
-///   pc has since advanced;
+/// * `MIFrame.setup` assigns `greenkey` once and never updates it, so a
+///   frame's greenkey stays its ENTRY greens however far its pc has since
+///   advanced;
 /// * every [`InlineFrame`] is pushed by `InlineFrameGuard::enter` at a callee
 ///   entry. Fresh forward calls carry that greenkey, while
 ///   `resume.rebuild_from_resumedata` calls `MetaInterp.newframe(jitcode)`
@@ -42,14 +42,19 @@ use super::*;
 pub(crate) fn fbw_inline_recursion_count<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     w_code: usize,
+    is_being_profiled: bool,
 ) -> usize {
-    inline_recursion_count(&ctx.session.borrow().framestack, w_code)
+    inline_recursion_count(&ctx.session.borrow().framestack, w_code, is_being_profiled)
 }
 
-fn inline_recursion_count(frames: &[InlineFrame], w_code: usize) -> usize {
+fn inline_recursion_count(frames: &[InlineFrame], w_code: usize, is_being_profiled: bool) -> usize {
     frames
         .iter()
-        .filter(|frame| frame.recursion_greenkey && frame.w_code == w_code)
+        .filter(|frame| {
+            frame.recursion_greenkey
+                && frame.w_code == w_code
+                && frame.is_being_profiled == is_being_profiled
+        })
         .count()
 }
 
@@ -58,9 +63,18 @@ mod recursion_depth_policy_tests {
     use super::*;
 
     fn frame(w_code: usize, recursion_greenkey: bool) -> InlineFrame {
+        frame_profiled(w_code, false, recursion_greenkey)
+    }
+
+    fn frame_profiled(
+        w_code: usize,
+        is_being_profiled: bool,
+        recursion_greenkey: bool,
+    ) -> InlineFrame {
         InlineFrame {
             is_portal: false,
             w_code,
+            is_being_profiled,
             recursion_greenkey,
             call_id: 0,
             debug_merge_point_py_pc: None,
@@ -79,7 +93,7 @@ mod recursion_depth_policy_tests {
     #[test]
     fn resumed_frames_without_greenkeys_do_not_count_as_recursive_unrolls() {
         let frames = [frame(42, true), frame(42, false), frame(7, true)];
-        assert_eq!(inline_recursion_count(&frames, 42), 1);
+        assert_eq!(inline_recursion_count(&frames, 42, false), 1);
     }
 
     #[test]
@@ -88,8 +102,8 @@ mod recursion_depth_policy_tests {
         // callable: `_opimpl_recursive_call` counts the new portal at 0,
         // so `perform_call` admits it. There is no total-framestack cap.
         let frames = [frame(7, true), frame(7, true), frame(9, false)];
-        assert_eq!(inline_recursion_count(&frames, 7), 2);
-        assert_eq!(inline_recursion_count(&frames, 9), 0);
+        assert_eq!(inline_recursion_count(&frames, 7, false), 2);
+        assert_eq!(inline_recursion_count(&frames, 9, false), 0);
     }
 
     #[test]
@@ -100,8 +114,21 @@ mod recursion_depth_policy_tests {
         // total-framestack cap that would refuse depth 8.
         let frames: Vec<_> = (1..=8).map(|i| frame(i, true)).collect();
         for i in 1..=8 {
-            assert_eq!(inline_recursion_count(&frames, i), 1);
+            assert_eq!(inline_recursion_count(&frames, i, false), 1);
         }
+    }
+
+    #[test]
+    fn profiled_and_unprofiled_same_code_are_distinct_greenkeys() {
+        // `PyPyJitDriver.greens` includes `is_being_profiled`;
+        // `_opimpl_recursive_call` `same_constant` treats the two keys as
+        // different portals, so they do not share an unroll count.
+        let frames = [
+            frame_profiled(42, false, true),
+            frame_profiled(42, true, true),
+        ];
+        assert_eq!(inline_recursion_count(&frames, 42, false), 1);
+        assert_eq!(inline_recursion_count(&frames, 42, true), 1);
     }
 }
 

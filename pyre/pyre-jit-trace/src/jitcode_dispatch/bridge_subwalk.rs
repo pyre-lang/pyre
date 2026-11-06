@@ -1997,6 +1997,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         parent_guards.push(InlineFrameGuard::enter(
             session,
             parent_w_code,
+            is_being_profiled,
             false,
             guard_parents,
             ctx.get_trace_position()._index,
@@ -2159,6 +2160,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         let _inline_frame = InlineFrameGuard::enter(
             session,
             callee_w_code,
+            is_being_profiled,
             false,
             callee_parents,
             sub_wc.trace_ctx.get_trace_position()._index,

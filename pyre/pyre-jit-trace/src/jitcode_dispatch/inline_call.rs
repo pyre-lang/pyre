@@ -9766,7 +9766,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let max_unroll_recursion = crate::driver::try_driver_pair()
         .map(|(driver, _)| driver.meta_interp().memory_manager.max_unroll_recursion() as usize)
         .unwrap_or(FBW_DEFAULT_MAX_INLINE_RECURSION);
-    let inline_recursion_count = fbw_inline_recursion_count(ctx, callee_code_key);
+    let inline_recursion_count =
+        fbw_inline_recursion_count(ctx, callee_code_key, is_being_profiled);
     if inline_recursion_count >= max_unroll_recursion {
         if let Some((driver, _)) = crate::driver::try_driver_pair() {
             driver
@@ -11718,6 +11719,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let _inline_frame = InlineFrameGuard::enter(
             ctx.session,
             pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as usize,
+            is_being_profiled,
             true,
             parents,
             callee_entry_trace_index,
@@ -19332,17 +19334,18 @@ fn walk_generator_resume<Sym: WalkSym>(
         // CALL-site stamps before `enter`, matching `try_walker_inline_user_call`.
         let portal_site = python_portal_subwalk_site(ctx, op.pc, parent_inline_subwalk);
         let callee_entry_trace_index = ctx.trace_ctx.get_trace_position()._index;
-        let _inline_frame = InlineFrameGuard::enter(
-            ctx.session,
-            pyre_object::gc_roots::shadow_stack_get(code_root) as usize,
-            true,
-            parents,
-            callee_entry_trace_index,
-        );
         // `newframe(portal_code, greenkey)` (`pyjitpl.py`): greens are
         // `[next_instr, is_being_profiled, pycode]`. A function CALL
         // enters at bytecode 0; this resume enters at `resume_py_pc`.
         let is_being_profiled = live_frame_is_being_profiled(ctx);
+        let _inline_frame = InlineFrameGuard::enter(
+            ctx.session,
+            pyre_object::gc_roots::shadow_stack_get(code_root) as usize,
+            is_being_profiled,
+            true,
+            parents,
+            callee_entry_trace_index,
+        );
         let w_code = pyre_object::gc_roots::shadow_stack_get(code_root) as *const ();
         let callee_green_key =
             crate::driver::make_green_key_typed(w_code, resume_py_pc, is_being_profiled);
