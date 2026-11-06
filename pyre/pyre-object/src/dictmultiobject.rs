@@ -1129,10 +1129,11 @@ pub trait W_DictMultiObject {
 ///   `dict_eq_hook::EQ_W_HOOK` trampoline → `baseobjspace::eq_w`.
 /// - `dstrategy`: PyPy `:315 __slots__ = ['dstrategy']`.  Reference
 ///   to the active strategy singleton; `space.fromcache(StrategyCls)`
-///   returns the same instance per space, so pyre stores a `&'static
-///   dyn DictStrategy` (fat pointer).  New dicts start in
+///   returns the same instance per space. The singleton is a prebuilt
+///   instance (dyn-call receiver); [`DictStrategyRef`] holds the trait
+///   object so this slot stays one word. New dicts start in
 ///   `OBJECT_DICT_STRATEGY`; promotion is `w_dict_set_strategy`
-///   per `:324-325 set_strategy`.
+///   per `set_strategy`.
 #[repr(C)]
 pub struct W_DictObject {
     pub ob_header: PyObject,
@@ -1152,12 +1153,8 @@ pub struct W_DictObject {
     pub dstorage: GCREF,
     /// `dstrategy` from `W_DictObject.__slots__` (`dictmultiobject.py`) —
     /// **one word**, like `W_ModuleDictObject.mstrategy` beside it and like the
-    /// single instance pointer upstream stores.  The strategy singletons are
-    /// unit structs, so a `&'static dyn DictStrategy` here would be a fat
-    /// pointer carrying the vtable in the *reference*: no field for the JIT to
-    /// read, and a data word that Rust may collapse to one address across
-    /// distinct ZST statics.  [`DictStrategyRef`] holds the trait object
-    /// instead and derefs to it, so this slot is a plain pointer that a
+    /// single instance pointer upstream stores. [`DictStrategyRef`] holds the
+    /// trait object and derefs to it, so this slot is a plain pointer that a
     /// `guard_class` can pin the way RPython pins an inlined virtual call's
     /// receiver.
     pub dstrategy: &'static DictStrategyRef,
@@ -2502,12 +2499,10 @@ pub unsafe fn w_module_dict_get_strategy(
 /// [`w_module_dict_get_strategy`] for a caller that has not yet proven the
 /// layout — null for anything that is not a `W_ModuleDictObject`.
 ///
-/// `mstrategy` sits at the same offset as `W_DictObject`'s `dstrategy`, which
-/// is a `&'static dyn DictStrategy` fat pointer, so the unchecked read on a
-/// plain dict returns one half of that pair.  Every strategy singleton is a
-/// zero-sized static, so the result is non-null and points into read-only
-/// memory: a caller testing `.is_null()` to mean "not a module dict" gets
-/// `false` and then reads — or atomically writes — past the static.
+/// `mstrategy` sits at the same offset as `W_DictObject`'s `dstrategy`. An
+/// unchecked read on a plain dict returns that dict's `DictStrategyRef`
+/// pointer, which is never null, so a caller testing `.is_null()` to mean
+/// "not a module dict" would then treat a regular dict as a module dict.
 ///
 /// # Safety
 /// `obj` must be null or a valid `PyObjectRef`.
@@ -2542,14 +2537,8 @@ pub unsafe fn w_dict_strategy_id(obj: PyObjectRef) -> usize {
         return m.mstrategy as usize;
     }
     let d = &*(obj as *const W_DictObject);
-    // The holder's own address, not `imp`'s data pointer.  Every strategy
-    // singleton is a unit struct, so the data half of the `&'static dyn
-    // DictStrategy` inside the holder is the address of a zero-sized static and
-    // Rust does not guarantee those differ between distinct strategies — two
-    // strategies could stamp the same id and a transition between them would be
-    // invisible to the iterators that compare this.  `DictStrategyRef` is not
-    // zero-sized, so one holder per singleton gives one distinct address per
-    // strategy.
+    // The holder's own address, not `imp`'s data pointer. One holder per
+    // singleton gives one distinct address per strategy.
     d.dstrategy as *const DictStrategyRef as usize
 }
 
@@ -4269,15 +4258,19 @@ pub unsafe fn w_dict_getitem_str(obj: PyObjectRef, key: &str) -> Option<PyObject
     w_dict_getitem_str_hashed(obj, key, 0)
 }
 
-/// `typeobject.py _getdictvalue_no_unwrapping`: `self.dict_w.get(attr)`.
+/// Interned-str map get: `typeobject.py _getdictvalue_no_unwrapping`
+/// `self.dict_w.get(attr)` and `lib_obj.py _get_attr_elidable`
+/// `self.dict_w[attr]`.
 ///
-/// Type namespaces are interned-str maps (`W_TypeObject.dict_w`). The probe
-/// reads Unicode/Object storage by exact-str WTF-8 bytes and never dispatches
-/// through `getitem` / `w_dict_lookup`, so the `@elidable`
-/// `_pure_getdictvalue_no_unwrapping` graph cannot reach `eq_w_hooked`.
+/// Both maps are interned-str (`W_TypeObject.dict_w`, `W_LibObject.dict_w`).
+/// The probe reads Unicode/Object storage by exact-str WTF-8 bytes and never
+/// dispatches through `getitem` / `w_dict_lookup`, so the `@elidable`
+/// `_pure_getdictvalue_no_unwrapping` / `_get_attr_elidable` graphs cannot
+/// reach `eq_w_hooked`.
 ///
 /// # Safety
-/// `obj` must be the type's namespace `W_DictObject` (`W_TypeObject.dict`).
+/// `obj` must be an interned-str `W_DictObject` (`W_TypeObject.dict` or
+/// `W_LibObject.dict_w`).
 pub unsafe fn w_type_dict_getitem_bytes(obj: PyObjectRef, key: &[u8]) -> Option<PyObjectRef> {
     if obj.is_null() {
         return None;
@@ -4621,10 +4614,7 @@ pub unsafe fn w_dict_delitem_wtf8_no_proxy(obj: PyObjectRef, key: &rustpython_wt
         return removed;
     }
     let dict = &mut *(obj as *mut W_DictObject);
-    // Detect via `strategy_kind()`; the strategy singletons are
-    // zero-sized statics whose addresses can coalesce, so `std::ptr::eq`
-    // on them is unreliable (an `Object`-strategy dict could otherwise
-    // be misread as `Empty` and skip the removal entirely).
+    // Detect via `strategy_kind()` on the holder (`DictStrategyRef.kind`).
     use crate::dictmultiobject::StrategyKind;
     match dict.dstrategy.strategy_kind() {
         StrategyKind::Empty => return false,
@@ -6857,10 +6847,8 @@ pub unsafe fn w_dict_view_get_dict(obj: PyObjectRef) -> PyObjectRef {
 /// (`getitem_str`'s default → `getitem(space.newtext(key))`) call
 /// `crate::w_str_new` directly.
 /// Identifies a concrete `DictStrategy` impl.  Used by
-/// `dictmultiobject::strategy_is` to discriminate strategies that share
-/// the same data pointer because each `*_DICT_STRATEGY` static is a
-/// unit-struct ZST (Rust collapses ZST static addresses, so
-/// pointer/`std::ptr::eq` checks cannot tell them apart reliably).
+/// `dictmultiobject::strategy_is` to discriminate strategies. Each
+/// `*_DICT_STRATEGY` static is a distinct prebuilt instance.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StrategyKind {
     Empty,
@@ -6888,9 +6876,7 @@ pub enum StrategyKind {
 pub struct DictPopError;
 
 pub trait DictStrategy {
-    /// Discriminate strategies by concrete impl — see [`StrategyKind`]
-    /// for the rationale.  Required because pointer comparison on the
-    /// `&'static dyn DictStrategy` slot is unreliable for ZST strategies.
+    /// Discriminate strategies by concrete impl — see [`StrategyKind`].
     fn strategy_kind(&self) -> StrategyKind;
 
     /// `dictmultiobject.py get_empty_storage` — return a
@@ -7306,11 +7292,9 @@ pub fn nullable_to_option(w: PyObjectRef) -> Option<PyObjectRef> {
 /// in the instance header, which is what the JIT's `guard_class` reads when it
 /// inlines `self.get_strategy().getitem(...)`.  A Rust `&dyn` inverts that —
 /// the vtable rides in the reference — so a dict holding one directly has no
-/// field to guard, and its data word is the address of a zero-sized static,
-/// which Rust is free to make identical across distinct strategies.  Boxing
-/// the trait object in this `#[repr(C)]` holder restores both properties: the
-/// dict slot is a single pointer, and each strategy's holder is a distinct,
-/// non-zero-sized address.
+/// field to guard.  Boxing the trait object in this `#[repr(C)]` holder
+/// restores both properties: the dict slot is a single pointer, and each
+/// strategy's holder is a distinct address.
 ///
 /// It derefs to `dyn DictStrategy`, so `dict.dstrategy.getitem(..)` and every
 /// other call through the slot reads exactly as before.
@@ -7337,7 +7321,7 @@ impl crate::lltype::GcType for DictStrategyRef {
     const SIZE: usize = 0;
 }
 
-/// The holders below wrap only the stateless unit-struct singletons, which are
+/// The holders below wrap the stateless fromcache singletons, which are
 /// shared process-wide exactly as `space.fromcache(StrategyCls)` shares them
 /// upstream.  `DictStrategy` itself cannot carry a `Sync` bound —
 /// `ModuleDictStrategy`'s `GlobalCache` holds `*mut PyObject` — and a module
@@ -7358,16 +7342,18 @@ impl std::ops::Deref for DictStrategyRef {
 /// `pypy/objspace/std/dictmultiobject.py+ ObjectDictStrategy`
 /// process-wide singleton.  PyPy's `space.fromcache(ObjectDictStrategy)`
 /// returns the same instance for every space, and `W_DictObject`'s
-/// `dstrategy` slot points at it; pyre's `ObjectDictStrategy` is a
-/// zero-sized type so a `&'static` reference suffices.  Use this
-/// constant whenever the line-by-line port calls
-/// `space.fromcache(ObjectDictStrategy)`.
-pub static OBJECT_DICT_STRATEGY: ObjectDictStrategy = ObjectDictStrategy;
+/// `dstrategy` slot points at it. Use this constant whenever the
+/// line-by-line port calls `space.fromcache(ObjectDictStrategy)`.
+pub static OBJECT_DICT_STRATEGY: ObjectDictStrategy = ObjectDictStrategy {
+    ob_header: PyObject::EMPTY,
+};
 
 /// `pypy/objspace/std/dictmultiobject.py EmptyDictStrategy`
 /// singleton — same `space.fromcache` semantics as
 /// `OBJECT_DICT_STRATEGY`.
-pub static EMPTY_DICT_STRATEGY: EmptyDictStrategy = EmptyDictStrategy;
+pub static EMPTY_DICT_STRATEGY: EmptyDictStrategy = EmptyDictStrategy {
+    ob_header: PyObject::EMPTY,
+};
 
 /// `pypy/objspace/std/kwargsdict.py EmptyKwargsDictStrategy`
 /// singleton.  Subclass of `EmptyDictStrategy` that promotes
@@ -7376,23 +7362,31 @@ pub static EMPTY_DICT_STRATEGY: EmptyDictStrategy = EmptyDictStrategy;
 /// `dictmultiobject.py allocate_and_init_instance` when the
 /// `kwargs=True` flag is set — pyre's `w_dict_new_kwargs()`
 /// allocator wires this singleton in for function-call kwarg dicts.
-pub static EMPTY_KWARGS_DICT_STRATEGY: EmptyKwargsDictStrategy = EmptyKwargsDictStrategy;
+pub static EMPTY_KWARGS_DICT_STRATEGY: EmptyKwargsDictStrategy = EmptyKwargsDictStrategy {
+    ob_header: PyObject::EMPTY,
+};
 
 /// `pypy/objspace/std/dictmultiobject.py BytesDictStrategy`
 /// singleton.
-pub static BYTES_DICT_STRATEGY: BytesDictStrategy = BytesDictStrategy;
+pub static BYTES_DICT_STRATEGY: BytesDictStrategy = BytesDictStrategy {
+    ob_header: PyObject::EMPTY,
+};
 
 /// `pypy/objspace/std/dictmultiobject.py UnicodeDictStrategy`
 /// singleton.
-pub static UNICODE_DICT_STRATEGY: UnicodeDictStrategy = UnicodeDictStrategy;
+pub static UNICODE_DICT_STRATEGY: UnicodeDictStrategy = UnicodeDictStrategy {
+    ob_header: PyObject::EMPTY,
+};
 
 /// `pypy/objspace/std/dictmultiobject.py IntDictStrategy`
 /// singleton.
-pub static INT_DICT_STRATEGY: IntDictStrategy = IntDictStrategy;
+pub static INT_DICT_STRATEGY: IntDictStrategy = IntDictStrategy {
+    ob_header: PyObject::EMPTY,
+};
 
 /// The [`DictStrategyRef`] holders a dict's `dstrategy` slot points at — one
-/// per singleton above.  Each is a distinct address; the singletons themselves
-/// are zero-sized and need not be.
+/// per singleton above. Each holder and each prebuilt instance is a distinct
+/// address.
 pub static OBJECT_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
     kind: StrategyKind::Object,
     imp: &OBJECT_DICT_STRATEGY,
@@ -7459,7 +7453,12 @@ pub static INT_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
 /// the `compares_by_identity` MRO walker (Slice D5) routed through
 /// `dict_eq_hook::COMPARES_BY_IDENTITY_HOOK`; everything else falls
 /// into the Object fallback.
-pub struct EmptyDictStrategy;
+/// `space.fromcache(EmptyDictStrategy)` prebuilt instance. The dyn-call
+/// receiver is this address.
+#[repr(C)]
+pub struct EmptyDictStrategy {
+    ob_header: PyObject,
+}
 
 /// `w_dict.dstorage = strategy.erase(storage)` / `w_dict.set_strategy`:
 /// one `setfield_gc` pair. The GC transform records the old-to-young
@@ -7610,7 +7609,12 @@ impl EmptyDictStrategy {
 /// `UnicodeDictStrategy`.  Non-unicode key branches and every
 /// other DictStrategy hook delegate to `EMPTY_DICT_STRATEGY`
 /// because PyPy's subclass inherits those methods unchanged.
-pub struct EmptyKwargsDictStrategy;
+/// `space.fromcache(EmptyKwargsDictStrategy)` prebuilt instance. The
+/// dyn-call receiver is this address.
+#[repr(C)]
+pub struct EmptyKwargsDictStrategy {
+    ob_header: PyObject,
+}
 
 impl EmptyKwargsDictStrategy {
     /// `kwargsdict.py switch_to_unicode_strategy` — the
@@ -7978,7 +7982,12 @@ impl DictStrategy for EmptyDictStrategy {
 /// migration; methods route through pyre's existing
 /// `Vec<(PyObjectRef, PyObjectRef)>` so the strategy can be
 /// switched on without disturbing call sites.
-pub struct ObjectDictStrategy;
+/// `space.fromcache(ObjectDictStrategy)` prebuilt instance. The dyn-call
+/// receiver is this address.
+#[repr(C)]
+pub struct ObjectDictStrategy {
+    ob_header: PyObject,
+}
 
 crate::register_dyn_impl_vtable!(
     DYN_IMPL_ObjectDictStrategy,
@@ -8164,7 +8173,12 @@ impl DictStrategy for ObjectDictStrategy {
 /// W_BytesObject keys; mixed keys force `switch_to_object_strategy`
 /// per `dictmultiobject.py`.  Native `RDict<BytesKey, PyObjectRef>`
 /// backing — `unerase` is the block, `wrap` shares it.
-pub struct BytesDictStrategy;
+/// `space.fromcache(BytesDictStrategy)` prebuilt instance. The dyn-call
+/// receiver is this address.
+#[repr(C)]
+pub struct BytesDictStrategy {
+    ob_header: PyObject,
+}
 
 crate::register_dyn_impl_vtable!(DYN_IMPL_BytesDictStrategy, BytesDictStrategy, DictStrategy);
 impl DictStrategy for BytesDictStrategy {
@@ -8397,7 +8411,12 @@ impl DictStrategy for BytesDictStrategy {
 /// W_UnicodeObject keys directly — the unified Vec layout is
 /// structurally identical, no native typed migration needed for
 /// parity.
-pub struct UnicodeDictStrategy;
+/// `space.fromcache(UnicodeDictStrategy)` prebuilt instance. The dyn-call
+/// receiver is this address.
+#[repr(C)]
+pub struct UnicodeDictStrategy {
+    ob_header: PyObject,
+}
 
 crate::register_dyn_impl_vtable!(
     DYN_IMPL_UnicodeDictStrategy,
@@ -8642,7 +8661,12 @@ impl DictStrategy for UnicodeDictStrategy {
 /// `Vec<(i64, PyObjectRef)>` backing (Slice D3) per
 /// `dictmultiobject.py`; `wrap = newint`, `unwrap =
 /// plain_int_w`.
-pub struct IntDictStrategy;
+/// `space.fromcache(IntDictStrategy)` prebuilt instance. The dyn-call
+/// receiver is this address.
+#[repr(C)]
+pub struct IntDictStrategy {
+    ob_header: PyObject,
+}
 
 impl IntDictStrategy {
     /// `dictmultiobject.py IntDictStrategy.is_correct_type`

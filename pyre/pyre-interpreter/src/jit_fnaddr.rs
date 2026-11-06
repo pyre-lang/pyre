@@ -7161,11 +7161,11 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
             dictmultiobject::INT_DICT_STRATEGY
         ),
         // A translated `W_DictObject.dstrategy` holds the address of the
-        // non-zero-sized holder, not the zero-sized strategy implementation.
-        // These are the concrete prebuilt instances corresponding to PyPy's
-        // `space.fromcache(StrategyClass)` results and are therefore GCREF
-        // constants in the translated graph, exactly like the implementation
-        // rows above but with the identity the live dict slot actually reads.
+        // `DictStrategyRef` holder. These are the concrete prebuilt instances
+        // corresponding to PyPy's `space.fromcache(StrategyClass)` results
+        // and are therefore GCREF constants in the translated graph, exactly
+        // like the implementation rows above but with the identity the live
+        // dict slot actually reads.
         ref_addr!(
             "dictmultiobject::OBJECT_DICT_STRATEGY_REF",
             dictmultiobject::OBJECT_DICT_STRATEGY_REF

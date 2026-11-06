@@ -344,8 +344,8 @@ pub trait SetStrategy {
 /// One-word strategy slot, the set-side [`crate::dictmultiobject::DictStrategyRef`].
 ///
 /// `W_BaseSetObject.strategy` is one instance pointer. A `&dyn SetStrategy`
-/// in the object would be a fat pointer, and the unit-struct singletons are
-/// zero-sized, so this `#[repr(C)]` holder is what `strategy` stores.
+/// in the object would be a fat pointer, so this `#[repr(C)]` holder is what
+/// `strategy` stores.
 #[repr(C)]
 pub struct SetStrategyRef {
     /// Compared by field, the way `DictStrategyRef.kind` is, so a guard reads
@@ -370,11 +370,18 @@ impl std::ops::Deref for SetStrategyRef {
 
 /// `setobject.py ObjectSetStrategy`. The erased box is [`SetItemsStorage`]
 /// (`newset` → `r_dict(eq_w, hash_w)`).
-pub struct ObjectSetStrategy;
+/// `space.fromcache(ObjectSetStrategy)` prebuilt instance. The dyn-call
+/// receiver is this address.
+#[repr(C)]
+pub struct ObjectSetStrategy {
+    ob_header: PyObject,
+}
 
 /// `setobject.py ObjectSetStrategy` process-wide singleton
 /// (`space.fromcache(ObjectSetStrategy)`).
-pub static OBJECT_SET_STRATEGY: ObjectSetStrategy = ObjectSetStrategy;
+pub static OBJECT_SET_STRATEGY: ObjectSetStrategy = ObjectSetStrategy {
+    ob_header: PyObject::EMPTY,
+};
 
 /// Holder `W_SetObject.strategy` points at.
 pub static OBJECT_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
@@ -384,11 +391,18 @@ pub static OBJECT_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
 };
 
 /// `setobject.py EmptySetStrategy`. `get_empty_storage` is `erase(None)`.
-pub struct EmptySetStrategy;
+/// `space.fromcache(EmptySetStrategy)` prebuilt instance. The dyn-call
+/// receiver is this address.
+#[repr(C)]
+pub struct EmptySetStrategy {
+    ob_header: PyObject,
+}
 
 /// `setobject.py EmptySetStrategy` process-wide singleton
 /// (`space.fromcache(EmptySetStrategy)`).
-pub static EMPTY_SET_STRATEGY: EmptySetStrategy = EmptySetStrategy;
+pub static EMPTY_SET_STRATEGY: EmptySetStrategy = EmptySetStrategy {
+    ob_header: PyObject::EMPTY,
+};
 
 /// Holder installed by `W_BaseSetObject.switch_to_empty_strategy`.
 pub static EMPTY_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
@@ -399,11 +413,18 @@ pub static EMPTY_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
 
 /// `setobject.py IntegerSetStrategy`. The erased box is [`IntSetStorage`]
 /// (`erase({})` of plain ints). `is_correct_type` is `is_plain_int1`.
-pub struct IntegerSetStrategy;
+/// `space.fromcache(IntegerSetStrategy)` prebuilt instance. The dyn-call
+/// receiver is this address.
+#[repr(C)]
+pub struct IntegerSetStrategy {
+    ob_header: PyObject,
+}
 
 /// `setobject.py IntegerSetStrategy` process-wide singleton
 /// (`space.fromcache(IntegerSetStrategy)`).
-pub static INTEGER_SET_STRATEGY: IntegerSetStrategy = IntegerSetStrategy;
+pub static INTEGER_SET_STRATEGY: IntegerSetStrategy = IntegerSetStrategy {
+    ob_header: PyObject::EMPTY,
+};
 
 /// Holder installed by `EmptySetStrategy.add` for a plain int.
 pub static INTEGER_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
@@ -415,11 +436,18 @@ pub static INTEGER_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
 /// `setobject.py BytesSetStrategy`. The erased box is [`BytesSetStorage`]
 /// (`erase({})` of the `bytes` block). `is_correct_type` is
 /// `type(w_key) is W_BytesObject`.
-pub struct BytesSetStrategy;
+/// `space.fromcache(BytesSetStrategy)` prebuilt instance. The dyn-call
+/// receiver is this address.
+#[repr(C)]
+pub struct BytesSetStrategy {
+    ob_header: PyObject,
+}
 
 /// `setobject.py BytesSetStrategy` process-wide singleton
 /// (`space.fromcache(BytesSetStrategy)`).
-pub static BYTES_SET_STRATEGY: BytesSetStrategy = BytesSetStrategy;
+pub static BYTES_SET_STRATEGY: BytesSetStrategy = BytesSetStrategy {
+    ob_header: PyObject::EMPTY,
+};
 
 /// Holder installed by `EmptySetStrategy.add` for an exact `bytes`.
 pub static BYTES_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
@@ -431,11 +459,18 @@ pub static BYTES_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
 /// `setobject.py AsciiSetStrategy`. The erased box is [`AsciiSetStorage`]
 /// (`erase({})` of the utf8 text). `is_correct_type` is
 /// `type(w_key) is W_UnicodeObject and w_key.is_ascii()`.
-pub struct AsciiSetStrategy;
+/// `space.fromcache(AsciiSetStrategy)` prebuilt instance. The dyn-call
+/// receiver is this address.
+#[repr(C)]
+pub struct AsciiSetStrategy {
+    ob_header: PyObject,
+}
 
 /// `setobject.py AsciiSetStrategy` process-wide singleton
 /// (`space.fromcache(AsciiSetStrategy)`).
-pub static ASCII_SET_STRATEGY: AsciiSetStrategy = AsciiSetStrategy;
+pub static ASCII_SET_STRATEGY: AsciiSetStrategy = AsciiSetStrategy {
+    ob_header: PyObject::EMPTY,
+};
 
 /// Holder installed by `EmptySetStrategy.add` for an exact ASCII `str`.
 pub static ASCII_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
@@ -447,11 +482,18 @@ pub static ASCII_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
 /// `setobject.py IdentitySetStrategy`. The erased box is [`IdentitySetStorage`]
 /// (`erase({})` of the object itself). `is_correct_type` is
 /// `W_TypeObject.compares_by_identity`.
-pub struct IdentitySetStrategy;
+/// `space.fromcache(IdentitySetStrategy)` prebuilt instance. The dyn-call
+/// receiver is this address.
+#[repr(C)]
+pub struct IdentitySetStrategy {
+    ob_header: PyObject,
+}
 
 /// `setobject.py IdentitySetStrategy` process-wide singleton
 /// (`space.fromcache(IdentitySetStrategy)`).
-pub static IDENTITY_SET_STRATEGY: IdentitySetStrategy = IdentitySetStrategy;
+pub static IDENTITY_SET_STRATEGY: IdentitySetStrategy = IdentitySetStrategy {
+    ob_header: PyObject::EMPTY,
+};
 
 /// Holder installed by `EmptySetStrategy.add` when
 /// `W_TypeObject.compares_by_identity` holds.
