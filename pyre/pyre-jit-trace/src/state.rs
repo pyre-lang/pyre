@@ -1799,6 +1799,82 @@ pub(crate) fn seed_virtualizable_boxes(
     ctx.set_virtualizable_heap_ptr(heap_ptr);
 }
 
+/// `pyjitpl.py rebuild_state_after_failure` trailing
+/// `self.synchronize_virtualizable()`: write STANDARD static fields from
+/// the seeded boxes onto the live virtualizable.
+///
+/// Array items are already stored field-aware by `store_live_frame_array_slot`
+/// (`value_to_vable_array_item_bits`). The generic `value_to_raw_bits` writer
+/// must not re-box those Ref slots
+/// (`JitState::SYNCHRONIZES_VIRTUALIZABLE_AFTER_GUARD_FAILURE`). Statics
+/// (`last_instr` / `pycode` / `valuestackdepth` / `debugdata`) need no boxing.
+pub(crate) fn write_seeded_vable_statics(ctx: &TraceCtx) {
+    let Some(n) = ctx
+        .virtualizable_info()
+        .map(|info| info.num_static_extra_boxes)
+    else {
+        return;
+    };
+    for i in 0..n {
+        ctx.synchronize_virtualizable_at(i);
+    }
+}
+
+/// Shared bridge-setup tail: seed `virtualizable_boxes` from resume
+/// consume, republish the consume identity, then write STANDARD statics
+/// onto the live frame (`pyjitpl.py` `rebuild_state_after_failure`
+/// trailing `synchronize_virtualizable`).
+fn seed_and_synchronize_bridge_vable(
+    ctx: &mut TraceCtx,
+    sym: &mut PyreSym,
+    boxes: &majit_metainterp::VrefVableBoxes,
+    scalar_oprefs: &[OpRef],
+    array_items: &[OpRef],
+    array_len: usize,
+    seed_values: &[majit_ir::Value],
+) {
+    // virtualizable.py `load_list_of_boxes` appends the vable box
+    // last; pyjitpl.py `synchronize_virtualizable` then writes
+    // through `virtualizable_boxes[-1]`. Heap pointer is the
+    // consume identity (`resume.py consume_vable_info` `next_ref()`),
+    // re-read here. After this seed, readers use
+    // `TraceCtx::standard_virtualizable_ptr()`.
+    let vable_ref_value = boxes.live_vable(
+        0,
+        boxes
+            .virtualizable_boxes
+            .first()
+            .map(|&(_, v)| v)
+            .unwrap_or(majit_ir::Value::Void),
+    );
+    seed_virtualizable_boxes(
+        ctx,
+        sym.frame,
+        vable_ref_value,
+        scalar_oprefs,
+        array_items,
+        array_len,
+        seed_values,
+        resume_decoded_vable_addr(boxes) as *const u8,
+    );
+    // Seed may allocate; re-read the consume identity onto the
+    // host root and TraceCtx heap pointer. Readers after this
+    // use `virtualizable_boxes[-1]`
+    // (`TraceCtx::standard_virtualizable_ptr`).
+    let resume_vable = resume_decoded_vable_addr(boxes);
+    if resume_vable != 0 {
+        sym.publish_live_vable_frame(resume_vable);
+        sym.concrete_vable_ptr = resume_vable as *mut u8;
+        ctx.set_virtualizable_heap_ptr(resume_vable as *const u8);
+    }
+    // `rebuild_state_after_failure` installs the boxes then
+    // `synchronize_virtualizable` writes them *to* the heap.
+    // Array items were stored field-aware above; statics
+    // (`valuestackdepth` included) were left as the compiled-loop
+    // leftover. Write them now so heap == boxes at walk start.
+    write_seeded_vable_statics(ctx);
+}
+
 /// Decode a raw `vinfo.read_boxes` entry into the typed Value a
 /// virtualizable shadow slot expects.  Local helper that mirrors
 /// `majit-metainterp::pyjitpl::heap_value_for` so both seed sites (root
@@ -12235,40 +12311,15 @@ impl JitState for PyreJitState {
                     Vec::with_capacity(vable_scalar_values.len() + bridge_array_len);
                 concrete_values.extend_from_slice(&vable_scalar_values);
                 concrete_values.extend_from_slice(&bridge_array_values);
-                // virtualizable.py `load_list_of_boxes` appends the vable box
-                // last; pyjitpl.py `synchronize_virtualizable` then writes
-                // through `virtualizable_boxes[-1]`. Heap pointer is the
-                // consume identity (`resume.py consume_vable_info` `next_ref()`),
-                // re-read here. After this seed, readers use
-                // `TraceCtx::standard_virtualizable_ptr()`.
-                let vable_ref_value = boxes.live_vable(
-                    0,
-                    boxes
-                        .virtualizable_boxes
-                        .first()
-                        .map(|&(_, v)| v)
-                        .unwrap_or(majit_ir::Value::Void),
-                );
-                crate::state::seed_virtualizable_boxes(
+                crate::state::seed_and_synchronize_bridge_vable(
                     ctx,
-                    sym.frame,
-                    vable_ref_value,
+                    sym,
+                    boxes,
                     &scalar_oprefs,
                     &bridge_array_items,
                     bridge_array_len,
                     &concrete_values,
-                    resume_decoded_vable_addr(boxes) as *const u8,
                 );
-                // Seed may allocate; re-read the consume identity onto the
-                // host root and TraceCtx heap pointer. Readers after this
-                // use `virtualizable_boxes[-1]`
-                // (`TraceCtx::standard_virtualizable_ptr`).
-                let resume_vable = resume_decoded_vable_addr(boxes);
-                if resume_vable != 0 {
-                    sym.publish_live_vable_frame(resume_vable);
-                    sym.concrete_vable_ptr = resume_vable as *mut u8;
-                    ctx.set_virtualizable_heap_ptr(resume_vable as *const u8);
-                }
                 // `resume.py` `decode_box`: a slot below the restored depth
                 // that decoded to NULL is `CONST_NULL` (GET_ITER's
                 // index-or-NULL, PUSH_NULL, an unbound local), not an
@@ -12320,6 +12371,44 @@ impl JitState for PyreJitState {
                 // is about to be overwritten with the slot-indexed semantic mirror and
                 // then rebuilt by init_symbolic, losing this color decode.
                 sym.bridge_registers_r.replace(bridge_registers_r.clone());
+            } else {
+                // Empty framestack, nonempty vable payload.
+                // `rebuild_state_after_failure` still does
+                // `self.virtualizable_boxes = virtualizable_boxes` then
+                // `self.synchronize_virtualizable()` whenever `vinfo is not
+                // None` (`pyjitpl.py`), independent of framestack. Frame-0
+                // register overlay needs `frames[0]`; seed from the consume
+                // payload already decoded above.
+                let bridge_array_len =
+                    concrete_frame_array_len(resume_decoded_vable_addr(boxes)).unwrap_or(nlocals);
+                let scalar_oprefs = [
+                    sym.vable_last_instr,
+                    sym.vable_pycode,
+                    sym.vable_valuestackdepth,
+                    sym.vable_debugdata,
+                ];
+                let live_array_values = live_frame_array_values(
+                    resume_decoded_vable_addr(boxes),
+                    bridge_array_len,
+                    &vable_array_values,
+                );
+                let mut seed_values =
+                    Vec::with_capacity(vable_scalar_values.len() + bridge_array_len);
+                seed_values.extend_from_slice(&vable_scalar_values);
+                seed_values.extend_from_slice(&live_array_values);
+                seed_values.resize(
+                    vable_scalar_values.len() + bridge_array_len,
+                    majit_ir::Value::Ref(majit_ir::GcRef::NULL),
+                );
+                crate::state::seed_and_synchronize_bridge_vable(
+                    ctx,
+                    sym,
+                    boxes,
+                    &scalar_oprefs,
+                    &vable_array_items,
+                    bridge_array_len,
+                    &seed_values,
+                );
             }
         }
         // `consume_vref_and_vable_boxes` decoded the virtualref stream;
@@ -12380,8 +12469,11 @@ impl JitState for PyreJitState {
         // (`decode_and_restore_guard_failure` in pyre-jit's `eval.rs`), which
         // applies a callee-coordinate depth to the root frame before
         // `setup_bridge_sym` reads it. The per-item write in the vvals loop
-        // above re-asserts that array image immediately after
-        // each decode; the statics retain the deliberate PR#569 override.
+        // above re-asserts that array image immediately after each decode.
+        // Statics are written after `seed_virtualizable_boxes` via
+        // `write_seeded_vable_statics` (`rebuild_state_after_failure`
+        // trailing `synchronize_virtualizable`), including the empty-
+        // framestack vable-only arm.
 
         // Multi-frame bridge. The body above reconstructed
         // the portal (`frames[0]`) into the caller-visible root `sym`. When
@@ -15669,7 +15761,8 @@ mod tests {
 
     /// `rebuild_state_after_failure` still runs `consume_virtualizable_boxes`
     /// when `framestack` stays empty. An empty frame list must not return
-    /// before that payload is applied.
+    /// before that payload is applied, and `synchronize_virtualizable` then
+    /// writes those boxes onto the live frame (`pyjitpl.py`).
     #[test]
     fn setup_bridge_sym_applies_vable_payload_when_frames_are_empty() {
         use majit_ir::resumedata::RebuiltValue;
@@ -15679,6 +15772,9 @@ mod tests {
         let raw_code = compile_exec("None").expect("test code should compile");
         let mut frame = PyFrame::new(raw_code);
         frame.fix_array_ptrs();
+        // Compiled-loop leftover on the live frame (pathlib 24-over-23 shape).
+        frame.valuestackdepth = 24;
+        frame.last_instr = 11;
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
         let code_ref = frame.pycode as *const ();
         let input_types = [
@@ -15738,6 +15834,14 @@ mod tests {
             &boxes,
         );
         assert_eq!(sym.valuestackdepth, 4);
+        assert_eq!(
+            frame.valuestackdepth, 4,
+            "empty framestack still writes resume valuestackdepth onto the live frame",
+        );
+        assert_eq!(
+            frame.last_instr, 9,
+            "empty framestack still writes resume last_instr onto the live frame",
+        );
     }
 
     /// `virtualizable.py write_boxes` writes the consume-pinned identity

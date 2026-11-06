@@ -10765,18 +10765,6 @@ pub(crate) fn pyre_portal_runner(
     }
     if let Some(next_instr) = next_instr {
         frame.set_last_instr_from_next_instr(next_instr);
-        // Same correction every other blackhole resume leg applies: the frame still
-        // carries the FAILING GUARD's recorded operand depth, and this handoff
-        // resumes at the CRN's merge-point pc instead, so that depth over-counts
-        // and the header's pushes overflow the frame at its peak stack use.
-        // Re-derive it from the pc actually resumed at.
-        //
-        // Spelled here rather than through `apply_blackhole_crn_handoff`, which
-        // pairs the same two calls: that helper takes its pc from `green_int` alone
-        // and does nothing when it is empty, while this leg reads the MERGED
-        // `all_i`.  Routing through it would change which value becomes the resume
-        // pc, which is a separate question from the depth this fixes.
-        correct_resume_vsd(frame, next_instr);
     }
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
     if !ec.is_null() {
@@ -12283,20 +12271,6 @@ enum HandleFailOutcome {
     BridgeRaised(PyError),
 }
 
-/// Drop an over-count of `frame.valuestackdepth` at resume pc `resume_pc`.
-/// A blackhole guard-failure resume writes the failing guard's own recorded
-/// operand depth into the frame; when the handoff resumes at a different pc
-/// (a merge point) that depth over-counts, so the loop header's pushes overflow
-/// the frame at its peak stack use.  Re-derive the operand depth from the
-/// actual resume pc via `depth_based_vsd_for_wcode`, then assign
-/// `valuestackdepth = corrected` and `clear_stack_above(corrected)` only when
-/// `corrected < frame.valuestackdepth`.  A raise of the live depth would expose
-/// slots nothing wrote; `pyopcode.py dropvaluesuntil` likewise only shrinks.
-/// Shared by every blackhole resume leg (the eval.rs CRN arms via
-/// [`apply_blackhole_crn_handoff`] and the CALL_ASSEMBLER arm in
-/// `handle_blackhole_result`) so the resume coordinate and its operand depth
-/// stay consistent.  A `None` depth (missing liveness) or a corrected depth
-/// that is not smaller than the live depth leaves the frame untouched.
 /// A CRN green pc is a bytecode position only when it is non-negative.
 /// `as usize` wraps a negative and the next `next_instr()` read resumes
 /// in unrelated code. `None` means leave the frame where the blackhole
@@ -12306,6 +12280,14 @@ pub(crate) fn green_pc_position(pc: i64) -> Option<usize> {
     usize::try_from(pc).ok()
 }
 
+/// Shrink `frame.valuestackdepth` to the liveness-table depth at `resume_pc`
+/// when that table is strictly smaller than the live field.
+///
+/// ContinueRunningNormally legs do not call this: `handle_jitexception`
+/// (`warmspot.py`) forwards to `portal_ptr(*args)` and leaves the vsd
+/// `bhimpl_setfield_vable_i` already wrote. Remaining callers are the
+/// non-CRN `walk_end_restart_pc` and interpret-abort sites in
+/// `compile_and_run_once`.
 #[majit_macros::dont_look_inside]
 pub(crate) fn correct_resume_vsd(frame: &mut PyFrame, resume_pc: usize) {
     if let Some(corrected) =
@@ -12318,13 +12300,13 @@ pub(crate) fn correct_resume_vsd(frame: &mut PyFrame, resume_pc: usize) {
     }
 }
 
-/// Blackhole `ContinueRunningNormally` handoff: resume `frame` at the
-/// merge-point next_instr carried in `green_int[0]` and re-derive its
-/// `valuestackdepth` from that resume pc via [`correct_resume_vsd`].
+/// Blackhole `ContinueRunningNormally` handoff: stamp `last_instr` from the
+/// merge-point next_instr in `green_int[0]` so `eval_loop_jit` resumes there.
 ///
-/// warmspot.py `handle_jitexception` parity — the CRN carries the
-/// merge-point args, so the frame restarts at the merge point, not the
-/// guard-failure pc.
+/// `handle_jitexception` (`warmspot.py`) calls `portal_ptr(*args)` and does
+/// not rewrite `valuestackdepth`; `bhimpl_setfield_vable_i` /
+/// `bhimpl_setarrayitem_vable_r` (`blackhole.py`) already wrote those fields,
+/// and `dispatch` (`interp_jit.py`) promotes the live `valuestackdepth`.
 #[majit_macros::dont_look_inside]
 fn apply_blackhole_crn_handoff(frame: &mut PyFrame, green_int: &[i64]) {
     let Some(&ni) = green_int.first() else {
@@ -12334,7 +12316,6 @@ fn apply_blackhole_crn_handoff(frame: &mut PyFrame, green_int: &[i64]) {
         return;
     };
     frame.set_last_instr_from_next_instr(ni);
-    correct_resume_vsd(frame, ni);
 }
 
 /// compile.py handle_fail.
@@ -14136,17 +14117,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             Some(deliver_exit_frame_exception(frame_root.frame(), err))
         }
         Some(LoopResult::ContinueRunningNormally) => {
-            // warmspot.py:976-978 portal re-entry.  Marker mode completed the
-            // synchronous walk; continue from the adopted/restart state.
-            // `apply_blackhole_crn_handoff` pairs last_instr with the
-            // merge-point vsd; this door has no CRN green_int, so re-derive
-            // vsd from the frame's own next_instr before `eval_loop_jit`
-            // resumes. A walk that wrote back vsd while last_instr stayed
-            // at function entry overflowed `PyFrame::push`.
-            let frame = frame_root.frame();
-            let resume_pc = frame.next_instr();
-            correct_resume_vsd(frame, resume_pc);
-            Some(handle_jitexception(frame))
+            // `handle_jitexception` (`warmspot.py`) ContinueRunningNormally
+            // re-enters `portal_ptr(*args)`. last_instr is already the merge
+            // green from `adopt_blackhole_crn` / the portal shim;
+            // valuestackdepth stays the field `bhimpl_setfield_vable_i` wrote.
+            Some(handle_jitexception(frame_root.frame()))
         }
         None => None,
     }

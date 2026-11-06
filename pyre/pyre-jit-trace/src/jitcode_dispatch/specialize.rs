@@ -1664,15 +1664,14 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
         let class_slot = layout.class_slot? as i64;
         let slot_op = |slot: i64| -> Option<OpRef> {
             let op = shadow.opref.get(&slot).copied()?;
-            // Only an entry recorded through THIS level's frame register
-            // describes this frame -- the same per-frame isolation the
-            // own-frame vable read applies.
-            // When the strict fold is off the shadow is still this level's, and
-            // `concrete.frame_reg` names the portal red rather than the fold witness.
+            // Only an entry recorded against THIS level's virtualizable
+            // describes this frame -- the same per-frame isolation
+            // `write_box_at` applies. When the strict fold is off the
+            // shadow is still this level's.
             if shadow.fold_frame_reg == u16::MAX {
                 return Some(op);
             }
-            (shadow.concrete.get(&slot)?.frame_reg == shadow.fold_frame_reg).then_some(op)
+            (shadow.concrete.get(&slot)?.frame == shadow.concrete_frame).then_some(op)
         };
         return Some((slot_op(0)?, slot_op(class_slot)?, layout.self_is_cell));
     }
@@ -13009,21 +13008,19 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
                 // "unbound" would drop a live name, so decline.
                 (None, None) if is_cell_slot(slot as usize) => decline!("cell-slot-unread"),
                 (None, None) => slot_oprefs.push(None),
-                // Only an entry recorded through THIS level's frame register
-                // describes this frame — the same per-frame isolation the
-                // `getarrayitem_vable` read fallback applies.  When the
-                // strict fold is off the shadow is still this level's, and
-                // `concrete.frame_reg` names the portal red rather than the
-                // fold witness; accept the opref and let `concrete_of_opref`
-                // resolve the value.
+                // Only an entry recorded against THIS level's virtualizable
+                // describes this frame — the same per-frame isolation
+                // `write_box_at` applies. When the strict fold is off the
+                // shadow is still this level's; accept the opref and let
+                // `concrete_of_opref` resolve the value.
                 (Some(opref), Some(concrete))
-                    if fold_frame_reg == u16::MAX || concrete.frame_reg == fold_frame_reg =>
+                    if fold_frame_reg == u16::MAX || concrete.frame == shadow.concrete_frame =>
                 {
                     slot_oprefs.push(Some(opref))
                 }
                 (Some(opref), None) if fold_frame_reg == u16::MAX => slot_oprefs.push(Some(opref)),
-                // Written with no reconstructable concrete half, or through
-                // another frame's register: decline rather than guess.
+                // Written with no reconstructable concrete half, or against
+                // another virtualizable: decline rather than guess.
                 _ => decline!("slot-not-this-frame"),
             }
         }
@@ -16536,6 +16533,17 @@ pub(crate) struct HelperEntry {
     level: Option<HelperLevel>,
 }
 
+#[cfg(test)]
+impl HelperEntry {
+    pub(crate) fn for_test(nested: bool, ret: HelperReturn) -> Self {
+        Self {
+            nested,
+            ret,
+            level: None,
+        }
+    }
+}
+
 /// The [`HelperEntry`] for a helper call at `op_pc` of the current walk.
 /// `ret` says whether the helper's return is that call's result.
 /// An `Err` is a decline: nothing has been recorded.
@@ -16615,21 +16623,23 @@ pub(super) fn collapsed_parent_resume_marker(
 /// Enter a canonical helper body as a sub-jitcode walk from a walker fold.
 ///
 /// Publishes the call-site resume coordinate the enclosing full-body walk needs
-/// to rebuild this frame, mirrors the virtualizable's `last_instr` /
-/// `valuestackdepth` when the enclosing frame owns the shadow, swaps in the
-/// callee's GLOBAL descr pool for the duration, runs the walk, then restores
-/// every field it moved.  A build-time canonical body carries no per-fn descr
-/// pool, so its `d` / `j` operands resolve through `all_descr_refs()` /
-/// `RawDescrPool::Global` -- not the parent loop's per-fn pool, which
-/// mis-resolves the first `residual_call` descr.
+/// to rebuild this frame, swaps in the callee's GLOBAL descr pool for the
+/// duration, runs the walk, then restores every field it moved.  A build-time
+/// canonical body carries no per-fn descr pool, so its `d` / `j` operands
+/// resolve through `all_descr_refs()` / `RawDescrPool::Global` -- not the
+/// parent loop's per-fn pool, which mis-resolves the first `residual_call`
+/// descr.
+///
+/// `_opimpl_setfield_vable` (`pyjitpl.py`) updates `virtualizable_boxes`
+/// immediately; an inlined/helper call does not rewrite those boxes.
+/// `blackhole.py` `convert_and_run_from_pyjitpl` / `_copy_data_from_miframe`
+/// copies the vable as the metainterp left it.
 ///
 /// Returns the walk outcome together with the trace position taken immediately
 /// before the walk, for a caller that has to reason about which ops the callee
-/// contributed.  The position is captured after the resume mirroring above, so
-/// it names the callee's first op and not the mirror's.
+/// contributed.
 ///
-/// `fallback_label` names this site in the empty-twin coordinate note;
-/// `call_site_label` names it in the active-box collection.
+/// `call_site_label` names this site in the active-box collection.
 ///
 /// `nested_entry` is [`orthodox_helper_nested_entry`]'s answer for `op_pc`:
 /// call-site box inheritance stays `Root` vs nested, and the helper level
@@ -16643,7 +16653,7 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     sym: &Sym,
     sub_body: &SubJitCodeBody,
     nested_entry: HelperEntry,
-    fallback_label: &'static str,
+    _fallback_label: &'static str,
     call_site_label: &'static str,
     int_args: &[OpRef],
     int_arg_concretes: &[ConcreteValue],
@@ -16652,78 +16662,16 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     float_args: &[OpRef],
 ) -> Result<(DispatchOutcome, majit_metainterp::recorder::TracePosition), DispatchError> {
     let nested_helper = nested_entry.nested;
-    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = if nested_helper {
-        (
-            ctx.entry_py_pc(),
-            0,
-            ctx.outer_jitcode_index,
-            ctx.outer_resume_marker_jit_pc,
-        )
+    let (outer_jitcode_index, call_site_marker) = if nested_helper {
+        (ctx.outer_jitcode_index, ctx.outer_resume_marker_jit_pc)
     } else {
         unsafe {
             let jc = &*sym.jitcode();
-            let jc_index = jc.index as u32;
-            let marker = collapsed_parent_resume_marker(&jc.payload, op_pc);
-            // Forward py twin first (#73 phase-3): equals the containing
-            // coordinate plus trivia normalization by construction; the containing
-            // lookup survives for the empty-twin class, and the trivia skip below
-            // is an identity on the twin path.
-            let mut py = jc
-                .payload
-                .forward_py_pc_for_jitcode_pc(op_pc)
-                .unwrap_or_else(|| {
-                    crate::py_coord::note_empty_twin_fallback(
-                        fallback_label,
-                        jc.index,
-                        op_pc as i32,
-                    );
-                    crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, op_pc)
-                });
-            if jc.payload.code_ptr.is_null() {
-                (py, sym.valuestackdepth() as i64, jc_index, marker)
-            } else {
-                let codeobj = &*jc.payload.code_ptr;
-                py = skip_python_trivia_forward(codeobj, py as usize) as u32;
-                // Read the depth off the jitcode-pc-keyed trivia twin, which equals
-                // `depth_at_py_pc()[skip_python_trivia_forward(containing_py_pc_for_jitcode_pc(op_pc))]`
-                // by construction; fall back to the py_pc-keyed static-liveness read
-                // where the twin is unpopulated (skeleton / fixture install).
-                let depth = if jc.payload.depth_trivia_populated() {
-                    jc.payload.depth_trivia_for_jitcode_pc(op_pc)
-                } else {
-                    crate::liveness::liveness_for(jc.payload.code_ptr)
-                        .depth_at_py_pc()
-                        .get(py as usize)
-                        .copied()
-                };
-                let vsd = match depth {
-                    Some(d) => (sym.nlocals() + d as usize) as i64,
-                    None => sym.valuestackdepth() as i64,
-                };
-                (py, vsd, jc_index, marker)
-            }
+            (
+                jc.index as u32,
+                collapsed_parent_resume_marker(&jc.payload, op_pc),
+            )
         }
-    };
-    let saved_vable = if !nested_helper && sym.owns_virtualizable_shadow() {
-        let saved = crate::trace_opcode::save_vable_resume_scalars(ctx.trace_ctx);
-        let li = call_site_py_pc as i64 - 1;
-        let li_op = ctx.trace_ctx.const_int(li);
-        crate::trace_opcode::mirror_vable_static_to_boxes(
-            ctx.trace_ctx,
-            "last_instr",
-            li_op,
-            Value::Int(li),
-        );
-        let vsd_op = ctx.trace_ctx.const_int(vsd_value);
-        crate::trace_opcode::mirror_vable_static_to_boxes(
-            ctx.trace_ctx,
-            "valuestackdepth",
-            vsd_op,
-            Value::Int(vsd_value),
-        );
-        Some(saved)
-    } else {
-        None
     };
     let active = if nested_helper {
         ctx.frame_state.borrow().outer_active_boxes.clone()
@@ -16790,9 +16738,6 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ctx.descr_refs = saved_descr_refs;
     ctx.raw_descrs = saved_raw_descrs;
     ctx.sub_jitcode_lookup = saved_lookup;
-    if let Some(saved) = saved_vable {
-        crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved);
-    }
 
     // `abort/` in a helper body is an un-lowered `OpKind` — the same class
     // as a symbolic residual (`try_execute_residual_call_via_executor_inner` →

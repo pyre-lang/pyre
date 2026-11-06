@@ -1490,12 +1490,6 @@ pub extern "C" fn bh_portal_runner_c(
     }
     if let Some(pc) = crate::eval::green_pc_position(next_instr) {
         frame.set_last_instr_from_next_instr(pc);
-        // The blackhole wrote the failing guard's recorded operand depth into the
-        // frame; resuming at the merge-point `next_instr` (a different pc) would
-        // carry that over-count and overflow the frame at its peak stack use.
-        // Re-derive the depth from the resume pc — the same correction the
-        // CALL_ASSEMBLER CRN arm applies to the same kind of green `next_instr`.
-        crate::eval::correct_resume_vsd(frame, pc);
     }
     // `blackhole.py bhimpl_jit_merge_point` inner arm (`nextblackholeinterp`
     // is not None): a portal merge reached by recursion.  Upstream calls
@@ -4072,12 +4066,6 @@ fn handle_blackhole_result(bh_result: BlackholeResult) -> Option<i64> {
             }
             if let Some(next_instr) = next_instr {
                 frame.set_last_instr_from_next_instr(next_instr);
-                // The blackhole wrote the failing guard's recorded operand depth
-                // into the frame; resuming at the merge-point `next_instr` (a
-                // different pc) would carry that over-count and overflow the frame
-                // at its peak stack use.  Re-derive the depth from the resume pc —
-                // the CALL_ASSEMBLER-path mirror of the eval.rs CRN handoff.
-                crate::eval::correct_resume_vsd(frame, next_instr);
             }
             let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
             if !ec.is_null() {
@@ -4195,11 +4183,12 @@ fn bridge_resolution_from_abort_blackhole(
             BridgeResolution::Finished(cv)
         }
         PortalResume::ContinueRunningNormally(args) => {
+            // `handle_jitexception` (`warmspot.py`) calls `portal_ptr(*args)`
+            // and leaves `valuestackdepth` as `bhimpl_setfield_vable_i` wrote it.
             if let Some(&ni) = args.green_int.first()
                 && let Some(pc) = crate::eval::green_pc_position(ni)
             {
                 frame.set_last_instr_from_next_instr(pc);
-                crate::eval::correct_resume_vsd(frame, pc);
             }
             BridgeResolution::CompiledContinue
         }

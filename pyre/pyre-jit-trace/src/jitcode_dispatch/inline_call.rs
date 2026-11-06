@@ -9181,7 +9181,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
 /// `set_opref(NONE)` / `set_concrete(Void)` leave the slot unwritten.
 pub(crate) fn seed_inline_param_shadows(
     shadow: &mut CalleeLocalsShadow,
-    frame_reg: u16,
+    frame: usize,
     args: &[OpRef],
     concretes: &[majit_ir::Value],
     pc: usize,
@@ -9196,7 +9196,7 @@ pub(crate) fn seed_inline_param_shadows(
         let concrete = concretes.get(i).copied().unwrap_or(majit_ir::Value::Void);
         let slot = i as i64;
         shadow.set_opref(slot, opref);
-        shadow.set_concrete(frame_reg, slot, concrete);
+        shadow.set_concrete(frame, slot, concrete);
     }
     Ok(())
 }
@@ -11920,7 +11920,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 let shadow = state.callee_shadow.as_mut().unwrap();
                 seed_inline_param_shadows(
                     shadow,
-                    callee_portal_frame_reg,
+                    concrete_callee_frame as usize,
                     &callee_args[..seeded_locals],
                     &concretes,
                     op.pc,
@@ -11948,7 +11948,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 let shadow = state.callee_shadow.as_mut().unwrap();
                 shadow.set_opref(slot, value);
                 shadow.set_concrete(
-                    callee_portal_frame_reg,
+                    concrete_callee_frame as usize,
                     slot,
                     majit_ir::Value::Ref(majit_ir::GcRef(cell as usize)),
                 );
@@ -12317,11 +12317,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             .or_else(|| {
                                 (metadata.built_as_portal && abort_kind == MidBodyAbortKind::Marker)
                                     .then(|| {
-                                        callee_vable_ref_at(
-                                            sub_wc.frame_state.borrow().callee_shadow.as_ref(),
-                                            metadata.portal_frame_reg,
-                                            semantic_slot,
-                                        )
+                                        let state = sub_wc.frame_state.borrow();
+                                        let shadow = state.callee_shadow.as_ref();
+                                        let frame = shadow.map(|s| s.concrete_frame).unwrap_or(0);
+                                        callee_vable_ref_at(shadow, frame, semantic_slot)
                                     })
                                     .flatten()
                             })
@@ -12345,8 +12344,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             .borrow()
                             .callee_shadow
                             .as_ref()
-                            .and_then(|shadow| shadow.concrete.get(&(slot as i64)).copied())
-                            .filter(|entry| entry.frame_reg == metadata.portal_frame_reg)
+                            .and_then(|shadow| {
+                                shadow
+                                    .concrete
+                                    .get(&(slot as i64))
+                                    .copied()
+                                    .filter(|entry| {
+                                        shadow.concrete_frame == 0
+                                            || entry.frame == shadow.concrete_frame
+                                    })
+                            })
                             .and_then(|entry| match entry.value {
                                 Value::Ref(r) => Some(ConcreteValue::Ref(
                                     r.as_usize() as pyre_object::PyObjectRef

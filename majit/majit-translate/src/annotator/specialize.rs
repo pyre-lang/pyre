@@ -2205,6 +2205,12 @@ mod tests {
         let rint_key = MemoKey(rint);
         assert_eq!(long, rint_key);
         assert_eq!(hash_key(&long), hash_key(&rint_key));
+        let rint_one =
+            crate::rlib::rarithmetic::rint_new(u256, 1).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(MemoKey(rint_one), MemoKey(ConstValue::Bool(true)));
+        let rint_umax =
+            crate::rlib::rarithmetic::rint_new(u256, u128::MAX).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(MemoKey(rint_umax), MemoKey(ConstValue::UInt128(u128::MAX)));
 
         assert_eq!(
             MemoKey(ConstValue::Long(malachite_bigint::BigInt::from(5))),

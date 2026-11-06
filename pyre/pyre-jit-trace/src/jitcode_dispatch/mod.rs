@@ -465,14 +465,17 @@ impl<'a> RawDescrPool<'a> {
     }
 }
 
-/// A callee local slot's recording-time concrete, tagged with the frame
-/// register it was written through. Own-frame reads (`getarrayitem_vable`) and
-/// the mid-body live-value recovery only honor an entry whose `frame_reg`
-/// matches the frame they resolve against, so a value stored to another frame's
-/// same-indexed slot never leaks across a frame identity.
+/// A callee local slot's recording-time concrete, tagged with the
+/// virtualizable object the store targeted.
+///
+/// `virtualizable.py write_boxes` / `write_box_at` write the boxes of that
+/// object whichever register held its address. Own-frame reads
+/// (`_opimpl_getarrayitem_vable`) and the mid-body live-value recovery honor
+/// an entry whose `frame` is that object, so a value stored to another
+/// frame's same-indexed slot never leaks across a frame identity.
 #[derive(Clone, Copy)]
 pub struct CalleeLocalConcrete {
-    pub frame_reg: u16,
+    pub frame: usize,
     pub value: majit_ir::Value,
 }
 
@@ -496,8 +499,8 @@ pub struct CalleeLocalsShadow {
     pub opref: std::collections::HashMap<i64, OpRef>,
     /// Recording-time concrete held by each local slot, including across
     /// may-force operations that clear the heapcache. Each entry records the
-    /// frame register it was written through so a slot read resolves against
-    /// its own frame only.
+    /// virtualizable object the store targeted (`write_box_at`) so a slot
+    /// read resolves against its own frame only.
     pub concrete: std::collections::HashMap<i64, CalleeLocalConcrete>,
     /// Portal frame register used to resolve own-frame vable operations.
     /// `u16::MAX` means that the strict fresh-frame fold is inactive.
@@ -566,13 +569,13 @@ impl CalleeLocalsShadow {
     }
 
     /// A `Void` value clears the slot so a later read does not resurrect a
-    /// stale concrete. `frame_reg` is the frame register the write targeted.
-    fn set_concrete(&mut self, frame_reg: u16, slot: i64, value: majit_ir::Value) {
+    /// stale concrete. `frame` is the virtualizable object the write targeted.
+    fn set_concrete(&mut self, frame: usize, slot: i64, value: majit_ir::Value) {
         if matches!(value, majit_ir::Value::Void) {
             self.concrete.remove(&slot);
         } else {
             self.concrete
-                .insert(slot, CalleeLocalConcrete { frame_reg, value });
+                .insert(slot, CalleeLocalConcrete { frame, value });
         }
     }
 }
@@ -1600,17 +1603,13 @@ fn record_inline_application_traceback<Sym: WalkSym>(
             opcode_position as i32,
         )
         .map(|py_pc| {
-            let frame_reg = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)
-                .expect("an inlined level must have JitCode metadata")
-                .metadata
-                .portal_frame_reg;
             let frame = concrete_portal_frame(ctx, consts.jitcode_index)
                 .expect("an inlined MIFrame must carry its own concrete PyFrame");
-            (frame, py_pc, frame_reg)
+            (frame, py_pc)
         });
         let old = exc_ptr;
         journaled_concrete_traceback_attach(&mut exc_ptr, |slot| {
-            if let Some((frame_ptr, _py_pc, frame_reg)) = node_frame {
+            if let Some((frame_ptr, _py_pc)) = node_frame {
                 // `dispatch_bytecode` publishes the executing instruction through
                 // the frame field before handling the exception.  Keep all three
                 // views in step here as well: emitted IR, the recording-time frame,
@@ -1630,7 +1629,6 @@ fn record_inline_application_traceback<Sym: WalkSym>(
                     ctx,
                     pyre_object::gc_roots::shadow_stack_get(frame_slot)
                         as *mut pyre_interpreter::PyFrame,
-                    frame_reg,
                 );
                 let frame_ptr = pyre_object::gc_roots::shadow_stack_get(frame_slot)
                     as *mut pyre_interpreter::PyFrame;
@@ -1644,7 +1642,7 @@ fn record_inline_application_traceback<Sym: WalkSym>(
             }
         });
         note_forwarded_exc(ctx, exc_concrete, old, exc_ptr);
-        if let Some((frame_ptr, _py_pc, _frame_reg)) = node_frame {
+        if let Some((frame_ptr, _py_pc)) = node_frame {
             stamp_traceback_node_concrete(ctx, node, exc_ptr, frame_ptr);
         }
     }
@@ -1690,8 +1688,7 @@ fn concrete_portal_frame<Sym: WalkSym>(
     (!frame.is_null()).then_some(frame as *mut pyre_interpreter::PyFrame)
 }
 
-/// Whether `shadow` can reproduce every locals slot of a frame reached through
-/// `frame_reg`.
+/// Whether `shadow` can reproduce every locals slot of `frame`.
 ///
 /// `virtualizable.py write_boxes` writes every locals-array element
 /// because `virtualizable_boxes` is total. This shadow is sparse instead, so an
@@ -1706,17 +1703,15 @@ fn concrete_portal_frame<Sym: WalkSym>(
 /// `Value::Void` and `GcRef::NO_CONCRETE` are the "no concrete half" sentinels,
 /// not a NULL local: writing one back would store `PY_NULL` or an untraceable
 /// word over the slot the walk holds in a register. Only entries recorded
-/// through `frame_reg` describe this frame.
+/// against `frame` itself describe this virtualizable (`write_box_at`).
 fn callee_locals_region_is_publishable(
     shadow: &CalleeLocalsShadow,
     nlocals: usize,
-    frame_reg: u16,
+    frame: usize,
 ) -> bool {
     callee_locals_written_slots_have_concrete(shadow, nlocals)
         && (0..nlocals as i64).all(|slot| match shadow.concrete.get(&slot) {
-            Some(concrete) => {
-                concrete.frame_reg == frame_reg && !matches!(concrete.value, Value::Void)
-            }
+            Some(concrete) => concrete.frame == frame && !matches!(concrete.value, Value::Void),
             None => true,
         })
 }
@@ -1737,33 +1732,17 @@ fn callee_locals_written_slots_have_concrete(shadow: &CalleeLocalsShadow, nlocal
     })
 }
 
-/// Result of publishing a sparse [`CalleeLocalsShadow`] onto a concrete frame.
-///
-/// `virtualizable.py write_boxes` writes every box; a hole here is a real
-/// decline because the shadow is sparse. `Unreconstructable` is 4d/4e
-/// (`callee_locals_written_slots_have_concrete`). `BrokenInvariant` is a
-/// null frame, missing `w_code`, short/null locals array, missing shadow,
-/// `frame_reg` mismatch, stale `Void`, or `store_pinned_frame_locals` failure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CalleeLocalsPublish {
-    Written,
-    Unreconstructable,
-    BrokenInvariant,
-}
-
 /// [`crate::state::flush_locals_region_to_frame`]'s twin for an inlined level.
 ///
 /// The top-level frame's slots come from the seeded `virtualizable_boxes`; a
 /// fresh inlined callee has no seeded frame and owns [`CalleeLocalsShadow`]
 /// instead, so the escape write reads the locals region out of that shadow.
-/// `frame_reg` is the level's portal frame register, and only entries written
-/// through it belong to `frame`.
+/// Only entries recorded against `frame` itself belong to it (`write_box_at`).
 fn flush_callee_locals_region_to_frame<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     frame: *mut pyre_interpreter::PyFrame,
-    frame_reg: u16,
 ) -> bool {
-    flush_callee_locals_region(&ctx.frame_state, frame, frame_reg)
+    flush_callee_locals_region(&ctx.frame_state, frame)
 }
 
 /// [`flush_callee_locals_region_to_frame`] against a shadow reached without a
@@ -1773,7 +1752,6 @@ fn flush_callee_locals_region_to_frame<Sym: WalkSym>(
 pub(crate) fn flush_callee_locals_region(
     state: &WalkFrameState,
     frame: *mut pyre_interpreter::PyFrame,
-    frame_reg: u16,
 ) -> bool {
     if frame.is_null() {
         return false;
@@ -1795,7 +1773,7 @@ pub(crate) fn flush_callee_locals_region(
     // boxing inside the callback would collect between a copied `Ref` and
     // its store.
     let mut slots = Vec::new();
-    if !state.write_callee_locals(nlocals, frame_reg, |abs, value| {
+    if !state.write_callee_locals(nlocals, frame as usize, |abs, value| {
         slots.push((abs, value));
     }) {
         return false;
@@ -1803,17 +1781,17 @@ pub(crate) fn flush_callee_locals_region(
     crate::state::store_pinned_frame_locals(frame as usize, &slots).is_some()
 }
 
-/// Sibling of [`flush_callee_locals_region`] that names why a carrier region
-/// cannot be supplied, used only by the bridge abort tail.
+/// Sibling of [`flush_callee_locals_region`] used by the bridge abort tail.
 ///
-/// 4d/4e is asked first through [`callee_locals_written_slots_have_concrete`]
-/// (the same predicate `write_callee_locals` / the residual force path uses)
-/// so an unreconstructable slot never reaches `store_pinned_frame_locals`.
+/// `virtualizable.py write_boxes` ends with `assert len(boxes) == i + 1`;
+/// a missing box is that assertion. 4d/4e is asked first through
+/// [`callee_locals_written_slots_have_concrete`] (the same predicate
+/// `write_callee_locals` / the residual force path uses) so an
+/// unreconstructable slot never reaches `store_pinned_frame_locals`.
 pub(crate) fn publish_callee_locals_region(
     state: &WalkFrameState,
     frame: *mut pyre_interpreter::PyFrame,
-    frame_reg: u16,
-) -> CalleeLocalsPublish {
+) {
     let unreconstructable = if frame.is_null() {
         false
     } else if let Some(nlocals) = crate::state::concrete_nlocals(frame as usize) {
@@ -1826,13 +1804,19 @@ pub(crate) fn publish_callee_locals_region(
         false
     };
     if unreconstructable {
-        return CalleeLocalsPublish::Unreconstructable;
+        panic!(
+            "Unreconstructable: carrier locals publish failed; \
+             virtualizable.py write_boxes requires every box"
+        );
     }
-    if flush_callee_locals_region(state, frame, frame_reg) {
-        CalleeLocalsPublish::Written
-    } else {
-        CalleeLocalsPublish::BrokenInvariant
-    }
+    assert!(
+        flush_callee_locals_region(state, frame),
+        "BrokenInvariant: carrier locals publish failed \
+         (null frame, no w_code, short/null locals array, \
+         no shadow, frame identity mismatch, stale Void, or \
+         store_pinned_frame_locals failure); \
+         virtualizable.py write_boxes requires every box"
+    );
 }
 
 /// Apply `PyFrame.frame_finished_execution = True` on the concrete frame a
@@ -10533,23 +10517,20 @@ fn portal_vable_bookkeeping_anchor(
 }
 
 /// Read one exact Ref slot from a callee sub-walk's fresh-frame virtualizable
-/// shadow. The shadow's `fold_frame_reg` witnesses the strict-fold shape; an
-/// entry whose recorded `frame_reg` matches witnesses the live multi-frame
-/// inline shape. A foreign frame, missing, non-Ref, or null value is ambiguous
-/// and declines.
+/// shadow. An entry whose recorded virtualizable object is `frame` witnesses
+/// this level (`write_box_at`). A foreign frame, missing, non-Ref, or null
+/// value is ambiguous and declines.
 fn callee_vable_ref_at(
     shadow: Option<&CalleeLocalsShadow>,
-    frame_reg: u16,
+    frame: usize,
     slot: usize,
 ) -> Option<ConcreteValue> {
-    if frame_reg == u16::MAX {
+    if frame == 0 {
         return None;
     }
     let shadow = shadow?;
     let entry = shadow.concrete.get(&(slot as i64)).copied()?;
-    let strict_fold_witness = shadow.fold_frame_reg == frame_reg;
-    let inline_scope_witness = entry.frame_reg == frame_reg;
-    if !strict_fold_witness && !inline_scope_witness {
+    if entry.frame != frame {
         return None;
     }
     match entry.value {

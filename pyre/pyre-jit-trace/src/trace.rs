@@ -3478,7 +3478,8 @@ fn frame_resume_py_pc(frame: usize) -> usize {
 /// opcode past the loop header — measured on
 /// `getframe_root_loop_force_blackhole_crn` and
 /// `getframe_root_loop_force_while_merge`, which then produce no output at all.
-/// The adopt sets the resume coordinate and its operand depth.
+/// The adopt stamps that resume coordinate. It does not recompute
+/// `valuestackdepth` or clear the stack.
 ///
 /// ⭐Infallible, and that is the whole point.  The register-image rebuild this
 /// replaces had to validate pcdep coverage, register-bank bounds and NULL Refs,
@@ -3496,17 +3497,13 @@ fn adopt_blackhole_crn(snapshot: usize, live_root: usize, resume_py_pc: usize) {
         let live = &*(live_root as *const pyre_interpreter::PyFrame);
         let snap = &mut *(snapshot as *mut pyre_interpreter::PyFrame);
         snap.restore_resume_state_from(live);
-        snap.last_instr = resume_py_pc as isize - 1;
-        // The CRN green names the merge point's `next_instr`; the operand depth
-        // is the one at that pc, as in `apply_blackhole_crn_handoff`
-        // (`warmspot.py handle_jitexception`).  The latched image may still hold
-        // the depth of the opcode that made the helper call.
-        if let Some(corrected) =
-            crate::state::depth_based_vsd_for_wcode(snap.pycode as usize, resume_py_pc)
-        {
-            snap.valuestackdepth = corrected;
-            snap.clear_stack_above(corrected);
-        }
+        snap.set_last_instr_from_next_instr(resume_py_pc);
+        // `handle_jitexception` (`warmspot.py`) ContinueRunningNormally calls
+        // `portal_ptr(*args)`. It neither recomputes `valuestackdepth` nor
+        // clears the stack: `bhimpl_setfield_vable_i` /
+        // `bhimpl_setarrayitem_vable_r` (`blackhole.py`) already wrote those
+        // vable fields, and `dispatch` (`interp_jit.py`) promotes the live
+        // `valuestackdepth`.
     }
 }
 
@@ -5640,34 +5637,6 @@ fn run_perfn_walk<Sym: WalkSym>(
             }
         }
     };
-    if let Some(entry_depth) = pjc.depth_for_jitcode_pc_pred(entry) {
-        let stack_base = crate::state::concrete_nlocals(cf_addr).unwrap_or(sym.nlocals());
-        let live_stack = sym.valuestackdepth().saturating_sub(stack_base);
-        // A mismatch is unsound only when the carried coordinate IS the
-        // resume marker.  That is the marker-inside-super-instruction shape:
-        // the live frame has advanced through the super-instruction while the
-        // predecessor depth twin still describes the marker's pre-op stack.
-        // An interior branch resume resolves *through* a marker but carries
-        // its own jitcode offset, so it may legitimately have a different
-        // live depth and must continue walking.
-        let entry_is_resume_marker = pjc.resume_marker_for_jitcode_pc(entry) == Some(entry);
-        if live_stack != entry_depth as usize && entry_is_resume_marker {
-            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                let marker_py =
-                    crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, entry);
-                eprintln!(
-                    "[fbw-abort] start_pc={start_pc} entry={entry} live_stack={live_stack} \\
-                     entry_depth={entry_depth} marker_py={marker_py}; declining marker-entry walk"
-                );
-            }
-            fbw_decline(crate::driver::make_green_key(
-                w_code,
-                start_pc,
-                is_being_profiled,
-            ));
-            return None;
-        }
-    }
     // The full-body walk drives a PORTAL trace, so the body must carry the
     // portal entry INPUT SHAPE (`FrameInputs::Portal`: `[frame, ec]` red inputs
     // + the frame-vable locals prologue). Every drained per-code jitcode is
@@ -9408,6 +9377,178 @@ mod tests {
         // The array must hold the restored operands plus the pushed exception.
         assert!(!super::exception_delivery_stack_is_sourceable(0, 0, 7, 7));
         assert!(!super::exception_delivery_stack_is_sourceable(1, 1, 8, 7));
+    }
+
+    #[test]
+    fn adopt_blackhole_crn_keeps_live_vsd_and_stack_word() {
+        // handle_jitexception (warmspot.py) ContinueRunningNormally calls
+        // portal_ptr(*args) and leaves the blackhole's valuestackdepth and
+        // stack. A liveness-table rewrite plus clear_stack_above would drop
+        // a live word whose slot sits above the table depth.
+        use pyre_interpreter::compile_exec;
+        use pyre_interpreter::pyframe::PyFrame;
+        use pyre_object::w_int_new;
+
+        pyre_interpreter::typedef::init_typeobjects();
+        let _pins = pyre_object::gc_roots::push_roots();
+        let code = compile_exec("for i in x:\n    pass\n").expect("test code should compile");
+        let mut live = PyFrame::new(code);
+        live.fix_array_ptrs();
+        let w_code = live.pycode as usize;
+        let array_len = pyre_interpreter::locals_w!(live).len();
+        let (resume_py_pc, table_vsd) = (0..array_len.saturating_mul(64).max(1))
+            .find_map(|pc| {
+                crate::state::depth_based_vsd_for_wcode(w_code, pc)
+                    .filter(|&vsd| vsd < array_len)
+                    .map(|vsd| (pc, vsd))
+            })
+            .expect("compiled body must expose a resume pc with a table depth inside the frame");
+        let live_vsd = table_vsd + 1;
+        assert!(
+            live_vsd > table_vsd,
+            "fail-before needs live vsd above the liveness-table depth"
+        );
+        let sentinel = pyre_object::gc_roots::pin_root(w_int_new(0xC0FFEE));
+        live.valuestackdepth = live_vsd;
+        pyre_interpreter::locals_w_mut!(live)[table_vsd] = sentinel;
+
+        let mut snap = live.snapshot_for_tracing();
+        snap.fix_array_ptrs();
+        snap.valuestackdepth = 0;
+        snap.last_instr = -1;
+        pyre_interpreter::locals_w_mut!(snap)[table_vsd] = pyre_object::PY_NULL;
+
+        let live_addr = (&mut *live) as *mut PyFrame as usize;
+        let snap_addr = (&mut *snap) as *mut PyFrame as usize;
+        super::adopt_blackhole_crn(snap_addr, live_addr, resume_py_pc);
+
+        assert_eq!(
+            snap.valuestackdepth, live_vsd,
+            "ContinueRunningNormally keeps the blackhole valuestackdepth"
+        );
+        assert_eq!(
+            pyre_interpreter::locals_w!(snap)[table_vsd],
+            sentinel,
+            "ContinueRunningNormally keeps the live stack word above the table depth"
+        );
+        assert_eq!(snap.last_instr, resume_py_pc as isize - 1);
+    }
+
+    #[test]
+    fn bridge_walk_at_resume_marker_with_start_vsd_below_twin_is_not_declined() {
+        // resume.py rebuild_from_resumedata / pyjitpl.py MetaInterp.handle_guard_failure
+        // continue the jitcode from the resume marker with captured START-depth
+        // boxes. A valuestackdepth below the marker twin must not decline the walk.
+        use majit_ir::OpRef;
+        use majit_metainterp::jitcode::JitCodeBuilder;
+        use pyre_interpreter::pyframe::PyFrame;
+
+        crate::state::ensure_trace_test_driver();
+        pyre_interpreter::typedef::init_typeobjects();
+        let _pins = pyre_object::gc_roots::push_roots();
+
+        let raw_code = compile_exec("pass").expect("test code should compile");
+        let mut frame = PyFrame::new(raw_code);
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+        let code_ref = frame.pycode as *const ();
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(frame.pycode as pyre_object::PyObjectRef)
+                as *const pyre_interpreter::CodeObject
+        };
+
+        const ENTRY: usize = 0;
+        const TWIN_DEPTH: u16 = 6;
+        const START_OPERAND_DEPTH: usize = 3;
+
+        // Seed live/ so a later decoder can read the placeholder; publish_state
+        // clears all_liveness, so intern_liveness runs after it.
+        {
+            let mut insns = indexmap::IndexMap::new();
+            insns.insert(
+                "live/".to_string(),
+                majit_metainterp::jitcode::insns::BC_LIVE,
+            );
+            crate::assembler::publish_state(&insns, &[], 0, 0);
+        }
+        let live_off = crate::state::intern_liveness(&[], &[0], &[])
+            .expect("bridge liveness must fit in the shared buffer");
+        let mut builder = JitCodeBuilder::new();
+        let patch = builder.live_placeholder();
+        builder.patch_live_offset(patch, live_off);
+        let runtime_jitcode = std::sync::Arc::new(builder.finish());
+
+        let mut metadata = crate::PyJitCodeMetadata::degenerate();
+        metadata.n_py_instrs = 1;
+        metadata.built_as_portal = true;
+        metadata.is_drained = true;
+        metadata.depth_pred_by_jit_pc = vec![(ENTRY, TWIN_DEPTH)];
+        metadata.resume_marker_marker_by_jit_pc = vec![(ENTRY, Some(ENTRY))];
+
+        let pyjit = std::sync::Arc::new(crate::PyJitCode::from_parts(
+            runtime_jitcode,
+            metadata,
+            code_ptr,
+            false,
+        ));
+        crate::state::install_jitcode_for(code_ref, pyjit);
+        assert!(
+            crate::state::pyjitcode_for_code(code_ref).is_some(),
+            "fixture must install a non-skeleton PyJitCode keyed by the frame's CodeObject"
+        );
+
+        pyre_interpreter::module::thread::ensure_runtime_thread();
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut meta = majit_metainterp::MetaInterp::<crate::state::PyreMeta>::new(0);
+        let mut sd = majit_metainterp::JitDriverStaticData::new(vec![], vec![]);
+        sd.portal_runner_adr = portal_runner_helper as *const () as i64;
+        sd.index = Some(0);
+        let _idx = meta.register_jitdriver_sd(sd.clone());
+        meta.finish_setup_descrs_for_jitdrivers();
+        let tracing_key = majit_ir::GreenKey::new(vec![0x1a01]);
+        let action = meta.force_start_tracing(
+            tracing_key.get_uhash(),
+            (0, 0),
+            Some((&tracing_key.values, &tracing_key.types)),
+            Some(std::sync::Arc::new(sd)),
+            &[],
+        );
+        assert!(matches!(
+            action,
+            majit_metainterp::BackEdgeAction::StartedTracing
+        ));
+        if let Some(ctx) = meta.trace_ctx() {
+            ctx.is_bridge_trace = true;
+        } else {
+            panic!("force_start_tracing must leave a live TraceCtx");
+        }
+
+        let mut sym = crate::state::PyreSym::new_uninit(OpRef::NONE);
+        let stack_base = crate::state::concrete_nlocals(frame_ptr).unwrap_or(0);
+        sym.nlocals = stack_base;
+        sym.valuestackdepth = stack_base + START_OPERAND_DEPTH;
+        sym.bridge_walk_entry_pc = Some(ENTRY);
+        // Leave bridge_walk_entry_jitcode_index unmatched so dispatch does not
+        // run; the assertion is that the marker-twin depth check must not decline.
+        let flush_committed = std::cell::Cell::new(false);
+        let key = crate::driver::make_green_key(code_ref, ENTRY, false);
+        let _ = super::run_perfn_walk(
+            &mut meta,
+            &flush_committed,
+            &mut sym,
+            code_ref,
+            ENTRY,
+            frame_ptr,
+            false,
+            false,
+            None,
+        );
+        assert!(
+            !super::fbw_declined(key),
+            "marker-entry bridge with captured START vsd below the twin must walk"
+        );
     }
 }
 

@@ -211,7 +211,7 @@ impl WalkFrameState {
     pub(crate) fn write_callee_locals(
         &self,
         nlocals: usize,
-        frame_reg: u16,
+        frame: usize,
         mut write: impl FnMut(usize, Value),
     ) -> bool {
         {
@@ -219,7 +219,7 @@ impl WalkFrameState {
             let Some(shadow) = data.callee_shadow.as_ref() else {
                 return false;
             };
-            if !super::callee_locals_region_is_publishable(shadow, nlocals, frame_reg) {
+            if !super::callee_locals_region_is_publishable(shadow, nlocals, frame) {
                 return false;
             }
         }
@@ -332,6 +332,11 @@ unsafe fn walk_frame_state_roots(data: *const (), visitor: &mut dyn FnMut(&mut G
             if let Value::Ref(root) = &mut entry.value {
                 visitor(root);
             }
+            if entry.frame != 0 {
+                let mut frame = GcRef(entry.frame);
+                visitor(&mut frame);
+                entry.frame = frame.0;
+            }
         }
         // FrameBox frames are currently nonmoving, but the owning reference
         // is still a GC edge (call_jit.rs walk_jit_callee_frame_roots_area).
@@ -387,7 +392,7 @@ mod tests {
             ..Default::default()
         };
         shadow.set_opref(0, op);
-        shadow.set_concrete(1, 0, Value::Ref(GcRef(word)));
+        shadow.set_concrete(word, 0, Value::Ref(GcRef(word)));
         WalkFrameState::new(WalkFrameStateData {
             callee_shadow: Some(shadow),
             outer_active_boxes: vec![op],
@@ -437,6 +442,7 @@ mod tests {
             shadow.concrete.get(&0).unwrap().value,
             Value::Ref(GcRef(mirror))
         );
+        assert_eq!(shadow.concrete.get(&0).unwrap().frame, mirror);
         assert_eq!(state.inline_w_globals, mirror);
         assert_eq!(state.inline_w_code, mirror);
     }
