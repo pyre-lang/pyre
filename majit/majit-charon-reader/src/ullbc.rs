@@ -28,20 +28,23 @@ pub struct FunDecl {
     pub def_id: u64,
     pub item_meta: ItemMeta,
     pub signature: Signature,
-    /// Generic-parameter context of the declaration: `types` lists the
-    /// type params (`{"index": N, "name": "H"|"Self"}`) and
-    /// `trait_clauses` their bounds
-    /// (`trait_.skip_binder.{id, generics.types[0]}` = bound trait id +
-    /// subject TypeVar).  Kept as raw `Value`; only
-    /// `front::mir::tyref_generic_trait_bound_root` projects it, to map
-    /// a `&T`-where-`T: Trait` parameter to its bound trait's name leaf.
-    #[serde(default)]
+    /// Generic-parameter context of the declaration. Each value keeps
+    /// only the paths the translator reads: `types`; `const_generics`;
+    /// `trait_clauses[].trait_.skip_binder.id`,
+    /// `trait_clauses[].trait_.skip_binder.generics.types`.
+    /// `decl_is_generic` tests nonempty `types` / `trait_clauses` /
+    /// `const_generics`; `tyref_generic_trait_bound_root` projects the
+    /// bound. A new reader of another path must add it to
+    /// `FunGenericsRow`.
+    #[serde(default, deserialize_with = "fun_generics")]
     pub generics: Option<Value>,
-    /// Where the function comes from (`ItemSource`): `"Normal"`,
-    /// `{"TraitImpl": ..}`, `{"GlobalInitializer": {"id": <GlobalDecl id>,
-    /// ..}}`, …  Kept as raw `Value`; only
-    /// [`FunDecl::is_global_initializer`] projects it.
-    #[serde(default)]
+    /// Where the function comes from (`ItemSource`). Kept as a string
+    /// (`"Normal"`, `"AdtConstructor"`, `"VTableShim"`);
+    /// `GlobalInitializer.id`; `TraitDefault` presence.
+    /// [`FunDecl::is_global_initializer`], [`FunDecl::is_adt_constructor`],
+    /// and `trait_default_call_segments` project these. A new reader of
+    /// another path must add it to `FunSrcRow`.
+    #[serde(default, deserialize_with = "fun_src")]
     pub src: Option<Value>,
     /// `body` is `null` for opaque references and one of
     /// `{"Unstructured": {...}}`, `{"Structured": {...}}`, or
@@ -80,6 +83,163 @@ pub struct FunDecl {
     /// [`FunDecl::unstructured`] is `None`.
     #[serde(skip)]
     pub returns_owned_scope: std::sync::atomic::AtomicBool,
+}
+
+fn fun_generics<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Ok(Option::<FunGenericsRow>::deserialize(d)?.map(FunGenericsRow::into_value))
+}
+
+fn fun_src<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Ok(Option::<FunSrcRow>::deserialize(d)?.and_then(FunSrcRow::into_value))
+}
+
+/// A `FunDecl.generics` object reduced to the paths the translator reads.
+#[derive(Deserialize)]
+struct FunGenericsRow {
+    #[serde(default, deserialize_with = "crate::schema::present")]
+    types: Option<Value>,
+    #[serde(default, deserialize_with = "crate::schema::present")]
+    const_generics: Option<Value>,
+    #[serde(default, deserialize_with = "crate::schema::present_nullable")]
+    trait_clauses: Option<crate::schema::Nullable<Vec<Option<TraitClause>>>>,
+}
+
+impl FunGenericsRow {
+    fn into_value(self) -> Value {
+        let mut map = serde_json::Map::new();
+        crate::schema::insert_present(&mut map, "types", self.types);
+        crate::schema::insert_present(&mut map, "const_generics", self.const_generics);
+        crate::schema::insert_present(
+            &mut map,
+            "trait_clauses",
+            self.trait_clauses.map(|n| {
+                n.into_value(|es| {
+                    crate::schema::option_array_into_value(es, TraitClause::into_value)
+                })
+            }),
+        );
+        Value::Object(map)
+    }
+}
+
+#[derive(Deserialize)]
+struct TraitClause {
+    #[serde(default, deserialize_with = "crate::schema::present_nullable")]
+    trait_: Option<crate::schema::Nullable<TraitPred>>,
+}
+
+impl TraitClause {
+    fn into_value(self) -> Value {
+        let mut map = serde_json::Map::new();
+        crate::schema::insert_present(
+            &mut map,
+            "trait_",
+            self.trait_.map(|n| n.into_value(TraitPred::into_value)),
+        );
+        Value::Object(map)
+    }
+}
+
+#[derive(Deserialize)]
+struct TraitPred {
+    #[serde(default, deserialize_with = "crate::schema::present_nullable")]
+    skip_binder: Option<crate::schema::Nullable<TraitPredBinder>>,
+}
+
+impl TraitPred {
+    fn into_value(self) -> Value {
+        let mut map = serde_json::Map::new();
+        crate::schema::insert_present(
+            &mut map,
+            "skip_binder",
+            self.skip_binder
+                .map(|n| n.into_value(TraitPredBinder::into_value)),
+        );
+        Value::Object(map)
+    }
+}
+
+#[derive(Deserialize)]
+struct TraitPredBinder {
+    #[serde(default, deserialize_with = "crate::schema::present")]
+    id: Option<Value>,
+    #[serde(default, deserialize_with = "crate::schema::present_nullable")]
+    generics: Option<crate::schema::Nullable<TraitPredGenerics>>,
+}
+
+impl TraitPredBinder {
+    fn into_value(self) -> Value {
+        let mut map = serde_json::Map::new();
+        crate::schema::insert_present(&mut map, "id", self.id);
+        crate::schema::insert_present(
+            &mut map,
+            "generics",
+            self.generics
+                .map(|n| n.into_value(TraitPredGenerics::into_value)),
+        );
+        Value::Object(map)
+    }
+}
+
+#[derive(Deserialize)]
+struct TraitPredGenerics {
+    #[serde(default, deserialize_with = "crate::schema::present")]
+    types: Option<Value>,
+}
+
+impl TraitPredGenerics {
+    fn into_value(self) -> Value {
+        let mut map = serde_json::Map::new();
+        crate::schema::insert_present(&mut map, "types", self.types);
+        Value::Object(map)
+    }
+}
+
+/// A `FunDecl.src` value reduced to the paths the translator reads.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FunSrcRow {
+    Str(String),
+    Obj(FunSrcObj),
+}
+
+#[derive(Deserialize)]
+struct FunSrcObj {
+    #[serde(default, rename = "GlobalInitializer")]
+    global_initializer: Option<GlobalInitSrc>,
+    #[serde(default, rename = "TraitDefault")]
+    trait_default: Option<serde::de::IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+struct GlobalInitSrc {
+    #[serde(default)]
+    id: Option<u64>,
+}
+
+impl FunSrcRow {
+    fn into_value(self) -> Option<Value> {
+        match self {
+            FunSrcRow::Str(s) => Some(Value::String(s)),
+            FunSrcRow::Obj(obj) => {
+                if let Some(gi) = obj.global_initializer {
+                    let mut inner = serde_json::Map::new();
+                    if let Some(id) = gi.id {
+                        inner.insert("id".into(), Value::from(id));
+                    }
+                    let mut map = serde_json::Map::new();
+                    map.insert("GlobalInitializer".into(), Value::Object(inner));
+                    Some(Value::Object(map))
+                } else if obj.trait_default.is_some() {
+                    let mut map = serde_json::Map::new();
+                    map.insert("TraitDefault".into(), Value::Object(Default::default()));
+                    Some(Value::Object(map))
+                } else {
+                    None
+                }
+            }
+        }
+    }
 }
 
 impl FunDecl {
@@ -3573,6 +3733,116 @@ mod tests {
             }}
         });
         serde_json::from_str(&json.to_string()).expect("FunDecl fixture parses")
+    }
+
+    fn parse_fun_decl(extra: Value) -> FunDecl {
+        let mut v = serde_json::json!({
+            "def_id": 0,
+            "item_meta": {
+                "name": [{"Ident": ["f", 0]}],
+                "span": span(0),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "signature": {"is_unsafe": false, "inputs": [], "output": {"Deduplicated": 0}},
+            "body": null
+        });
+        let Value::Object(dst) = &mut v else {
+            unreachable!()
+        };
+        let Value::Object(src) = extra else {
+            panic!("extra must be an object")
+        };
+        dst.extend(src);
+        serde_json::from_value(v).expect("FunDecl fixture parses")
+    }
+
+    #[test]
+    fn fun_decl_generics_keep_bound_pred_and_drop_outlives() {
+        let fd = parse_fun_decl(serde_json::json!({
+            "generics": {
+                "regions": [{"index": 0, "name": "'a"}],
+                "types": [{"index": 0, "name": "T", "variance": "Covariant"}],
+                "const_generics": [{"index": 0, "name": "N"}],
+                "trait_clauses": [{
+                    "clause_id": 0,
+                    "span": {"Deduplicated": 0},
+                    "origin": "WhereClause",
+                    "trait_": {
+                        "regions": [],
+                        "regions_outlive": [],
+                        "types_outlive": [],
+                        "skip_binder": {
+                            "id": 7,
+                            "generics": {
+                                "regions": [],
+                                "types": [{"TypeVar": {"Bound": [0, 0]}}],
+                                "const_generics": [],
+                                "trait_refs": []
+                            }
+                        }
+                    }
+                }],
+                "regions_outlive": [1],
+                "types_outlive": [1],
+                "trait_type_constraints": [1]
+            },
+            "src": "Normal"
+        }));
+        let g = fd.generics.as_ref().expect("generics");
+        assert!(g.get("regions").is_none());
+        assert!(g.get("regions_outlive").is_none());
+        assert!(g.get("types_outlive").is_none());
+        assert!(g.get("trait_type_constraints").is_none());
+        assert_eq!(g["types"][0]["name"], "T");
+        assert_eq!(g["const_generics"][0]["name"], "N");
+        let pred = &g["trait_clauses"][0]["trait_"]["skip_binder"];
+        assert_eq!(pred["id"], 7);
+        assert!(pred["generics"].get("regions").is_none());
+        assert!(pred["generics"].get("trait_refs").is_none());
+        assert_eq!(pred["generics"]["types"][0]["TypeVar"]["Bound"][0], 0);
+        assert_eq!(fd.src.as_ref().and_then(Value::as_str), Some("Normal"));
+    }
+
+    #[test]
+    fn fun_decl_src_keeps_initializer_id_and_trait_default_presence() {
+        let gi = parse_fun_decl(serde_json::json!({
+            "src": {"GlobalInitializer": {"id": 9, "generics": {"types": [1]}}}
+        }));
+        assert_eq!(gi.is_global_initializer(), Some(9));
+        assert!(
+            gi.src.as_ref().unwrap()["GlobalInitializer"]
+                .get("generics")
+                .is_none()
+        );
+
+        let td = parse_fun_decl(serde_json::json!({
+            "src": {"TraitDefault": {"trait_ref": {"id": 1}, "item_id": 2}}
+        }));
+        let marker = td.src.as_ref().unwrap().get("TraitDefault").unwrap();
+        assert!(marker.as_object().unwrap().is_empty());
+
+        let adt = parse_fun_decl(serde_json::json!({"src": "AdtConstructor"}));
+        assert!(adt.is_adt_constructor());
+
+        let shim = parse_fun_decl(serde_json::json!({"src": "VTableShim"}));
+        assert_eq!(
+            shim.src.as_ref().and_then(Value::as_str),
+            Some("VTableShim")
+        );
+
+        let impl_method = parse_fun_decl(serde_json::json!({
+            "src": {
+                "TraitImpl": {
+                    "impl_ref": {"id": 1, "generics": {"types": [0]}},
+                    "trait_ref": {"id": 2},
+                    "item_id": 3,
+                    "reuses_default": false
+                }
+            }
+        }));
+        assert!(impl_method.src.is_none());
     }
 
     fn bb(kind: Value, is_cleanup: bool, term_span: u64) -> Value {
