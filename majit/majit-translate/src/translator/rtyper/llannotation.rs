@@ -303,10 +303,6 @@ impl SomePtr {
             ));
         }
         let info = "argument to ll function pointer call";
-        let func_args = match &self.ll_ptrtype.TO {
-            lltype::PtrTarget::Func(ft) => Some(ft.args.as_slice()),
-            _ => None,
-        };
         // `lltype.py SomePtr.call`: `[annotation_to_lltype(
         // s_arg, info)._defl() for s_arg in args_s]` — touches every
         // slot once via the list comprehension; `annotation_to_lltype`
@@ -317,26 +313,11 @@ impl SomePtr {
         let llargs = (0..args_s_opt.len())
             .map(|i| {
                 let s_arg = crate::annotator::builtin::arg_at(&args_s_opt, i, "SomePtr.call");
-                // Rust fn-pointer adaptation of the implicit
-                // `annlowlevel.cast_instance_to_base_ptr` at an
-                // `llhelper` call site (`lltype.py` `SomePtr.call`).
-                // `annotation_to_lltype` has no `SomeInstance` case
-                // (`llannotation.py`); a `SomeInstance` argument whose
-                // FUNC `ARGS[i]` is a GC instance pointer
-                // (`rclass.OBJECTPTR`, or a class's instance pointer)
-                // is taken as that pointer. An instance against a
-                // non-instance-pointer `ARGS[i]` still raises.
-                if matches!(s_arg, SomeValue::Instance(_))
-                    && let Some(arg_ty) = func_args.and_then(|args| args.get(i))
-                    && func_arg_is_gc_instance_pointer(arg_ty)
-                {
-                    return Ok(arg_ty.clone()._defl());
-                }
                 annotation_to_lltype(s_arg, Some(info)).map(|t| t._defl())
             })
             .collect::<Result<Vec<_>, _>>()?;
         let v = self.ll_ptrtype._example().call(&llargs);
-        Ok(ll_fn_ptr_result_annotation(ll_to_annotation(v)))
+        Ok(ll_to_annotation(v))
     }
 
     /// RPython `SomePtr.setattr(self, s_attr, s_value)` (lltype.py).
@@ -365,46 +346,6 @@ impl SomePtr {
                 .map_err(AnnotatorError::new)?;
         }
         Ok(SomeValue::Impossible)
-    }
-}
-
-/// Implicit `annlowlevel.cast_base_ptr_to_instance` of the same Rust
-/// fn-pointer adaptation as [`SomePtr::call`]'s instance-argument
-/// conversion (`annlowlevel.cast_instance_to_base_ptr`).
-/// `ll_to_annotation(FUNC.RESULT)` for a `Ptr(FuncType)` call: a GC
-/// instance pointer is the instance annotation (`llannotation.py`
-/// `ll_to_annotation` of `Ptr(GcStruct)` of a class); `rclass.OBJECTPTR`
-/// is the root instance. `GCREF` stays `SomePtr`.
-fn ll_fn_ptr_result_annotation(s: SomeValue) -> SomeValue {
-    if let Some(inst) = gc_class_root_ptr_as_instance(&s) {
-        return inst;
-    }
-    if let SomeValue::Ptr(p) = &s {
-        let ty = lltype::LowLevelType::from(p.ll_ptrtype.clone());
-        if ty == *crate::translator::rtyper::rclass::OBJECTPTR {
-            return SomeValue::Instance(SomeInstance::new(
-                None,
-                true,
-                std::collections::BTreeMap::new(),
-            ));
-        }
-    }
-    s
-}
-
-/// FUNC.ARGS[i] is a GC instance pointer: `rclass.OBJECTPTR`, or a
-/// class's `InstanceRepr.lowleveltype` (`Ptr(object_type)`, `rclass.py`).
-fn func_arg_is_gc_instance_pointer(ty: &lltype::LowLevelType) -> bool {
-    if ty == &*crate::translator::rtyper::rclass::OBJECTPTR {
-        return true;
-    }
-    let lltype::LowLevelType::Ptr(p) = ty else {
-        return false;
-    };
-    match &p.TO {
-        lltype::PtrTarget::Struct(st) => st._gckind == lltype::GcKind::Gc,
-        lltype::PtrTarget::ForwardReference(fwd) => fwd._gckind == lltype::GcKind::Gc,
-        _ => false,
     }
 }
 

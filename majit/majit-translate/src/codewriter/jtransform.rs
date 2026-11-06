@@ -2651,6 +2651,16 @@ fn inline_aggregate_offset(
     if !wider {
         return None;
     }
+    // `symbolic.get_field_token` includes an inlined STRUCT in the parent.
+    // A row that does not fit is a pointer in that slot
+    // (`StructLayout::demote_struct_fields_that_exceed_parent`); keep
+    // `rewrite_op_getfield` from `int_add`ing into a stale FLAG_STRUCT.
+    if let Some(row) = row.as_ref()
+        && let Some(layout) = cc.and_then(|cc| cc.struct_layout_for(owner))
+        && row.offset + row.size > layout.size
+    {
+        return None;
+    }
     Some(match row {
         Some(row) => Ok(row.offset),
         None => Err(()),
@@ -13687,8 +13697,8 @@ impl<'a> Transformer<'a> {
     }
 
     /// `cpu.fielddescrof(STRUCT, 'entries')` and `cpu.arraydescrof(STRUCT.entries.TO)`.
-    /// The harvest `register_ordereddict_i64_entry_rows` publishes the one
-    /// `Entry<i64, *mut PyObject>` `get_ll_dict` would have built.
+    /// The harvest `register_ordereddict_entry_rows` publishes each
+    /// `Entry<K, V>` `get_ll_dict` would have built.
     fn dict_lookup_extra_descrs(cc: &crate::call::CallControl) -> Option<Vec<majit_ir::DescrRef>> {
         let owner = dict_lookup_rdict_owner(cc)?;
         let entry_array = dict_lookup_entry_array_id(cc)?;
@@ -18885,6 +18895,56 @@ mod tests {
             }
             other => panic!("expected Live, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn inline_aggregate_that_exceeds_parent_is_not_getsubstruct() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let owner = "core::result::Result::Ok";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let word = crate::layout::target_word_size();
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 2 * word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "__discriminant".into(),
+                        offset: 0,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Signed,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "__pos_0".into(),
+                        offset: word,
+                        size: 2 * word,
+                        flag: majit_ir::descr::ArrayFlag::Struct,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        let field = FieldDescriptor::new("__pos_0", Some(owner.into()));
+        assert_eq!(
+            inline_aggregate_offset(&field, Some(&cc)),
+            None,
+            "a FLAG_STRUCT that does not fit is a pointer load, not getsubstruct"
+        );
     }
 
     #[test]

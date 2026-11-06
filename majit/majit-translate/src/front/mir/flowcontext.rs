@@ -89,11 +89,12 @@ pub(in crate::front::mir) struct InteriorFieldAlias {
     pub(in crate::front::mir) header: InteriorHeader,
     pub(in crate::front::mir) index_local: usize,
     pub(in crate::front::mir) index_var: Variable,
-    /// `GcArray<Entry>` / `GcArray<Point>`. `extract_element_type_from_str`
-    /// takes the angle-bracket interior, so the leaf is
-    /// `strip_instantiation_suffix`'d. The `GcArray<>` wrapper is the
-    /// length-prefixed ARRAY spelling: `nolength_from_array_type_id` is
-    /// false, matching `interiorfielddescrof_keyed`.
+    /// `GcArray<Entry>` / `GcArray<Entry<K,V>>` / `GcArray<Point>`.
+    /// `extract_element_type_from_str` takes the angle-bracket interior
+    /// and keeps an `Entry<K,V>` suffix (`get_ll_dict` one ARRAY.OF per
+    /// flavour). The `GcArray<>` wrapper is the length-prefixed ARRAY
+    /// spelling: `nolength_from_array_type_id` is false, matching
+    /// `interiorfielddescrof_keyed`.
     pub(in crate::front::mir) array_type_id: String,
 }
 

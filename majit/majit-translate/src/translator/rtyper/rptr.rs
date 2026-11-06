@@ -423,11 +423,11 @@ mod tests {
     }
 
     /// `SomePtr.call` of a `Ptr(FuncType)` whose FUNC arg is
-    /// `rclass.OBJECTPTR`: a GC instance argument is taken as that
-    /// instance pointer (`annlowlevel.cast_instance_to_base_ptr`
-    /// adaptation in `SomePtr.call`) and the result is
-    /// `ll_to_annotation(FUNC.RESULT)`. Dual-gate Match; hop is
-    /// `indirect_call`; arg and result kinds are `'r'`.
+    /// `rclass.OBJECTPTR`: the call site emits
+    /// `annlowlevel.cast_instance_to_base_ptr` (`annlowlevel.py`) and
+    /// the result is `ll_to_annotation(FUNC.RESULT)` (`lltype.py`
+    /// `SomePtr.call`). Dual-gate Match; hop is `indirect_call`; arg
+    /// and result kinds are `'r'`.
     #[test]
     fn fnptr_objectptr_instance_arg_result_dual_gate_match() {
         use crate::codewriter::type_state::ConcreteType;
@@ -468,12 +468,14 @@ mod tests {
             .unwrap();
         graph.push_inputarg_var(entry, f_var.clone());
         graph.push_inputarg_var(entry, obj_var.clone());
+        let wrap_kind = crate::model::cast_instance_to_base_ptr_call(obj_var.clone());
+        let wrap_var = graph.push_op_var(entry, wrap_kind, true).unwrap();
         let r_var = graph
             .push_op_var(
                 entry,
                 OpKind::IndirectCall {
                     funcptr: f_var,
-                    args: vec![obj_var.clone()],
+                    args: vec![wrap_var.clone()],
                     graphs: None,
                     family_key: None,
                     result_ty: ValueType::Ref(Some("PyObject".to_string())),
@@ -495,6 +497,19 @@ mod tests {
         assert_eq!(kind_of(&real_value_to_var, &obj_var), ConcreteType::GcRef);
         assert_eq!(kind_of(&real_value_to_var, &r_var), ConcreteType::GcRef);
         match real_value_to_var
+            .get(&wrap_var)
+            .expect("cast_instance_to_base_ptr result in value_to_var")
+            .annotation
+            .borrow()
+            .as_ref()
+            .map(|rc| rc.as_ref())
+        {
+            Some(SomeValue::Ptr(_)) => {}
+            other => {
+                panic!("cast_instance_to_base_ptr annotates as SomePtr(OBJECTPTR), got {other:?}")
+            }
+        }
+        match real_value_to_var
             .get(&r_var)
             .expect("result in value_to_var")
             .annotation
@@ -502,8 +517,8 @@ mod tests {
             .as_ref()
             .map(|rc| rc.as_ref())
         {
-            Some(SomeValue::Instance(_)) => {}
-            other => panic!("FUNC.RESULT OBJECTPTR is the instance annotation, got {other:?}"),
+            Some(SomeValue::Ptr(_)) => {}
+            other => panic!("ll_to_annotation of OBJECTPTR FUNC.RESULT is SomePtr, got {other:?}"),
         }
 
         let (ann, _) = registry.ensure_session().expect("session after dual-gate");

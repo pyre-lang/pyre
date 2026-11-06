@@ -2520,6 +2520,13 @@ pub(in crate::front::mir) fn borrowed_pointee_is_raw_enum(
     if flavor_raw_adt_node(pointee, llbc, raw_alloc_flavor_structs) {
         return false;
     }
+    let ty = TyRef::Other(pointee.clone());
+    // A marked exception-class enum is a minted class instance
+    // (`rclass.py` `InstanceRepr`). `history.getkind` of that pointer
+    // is `ref`; the borrow is not a raw address.
+    if tyref_exception_class_leaf(&ty, llbc).is_some() {
+        return false;
+    }
     // A one-word niche (`None` = null) is identity on the payload word;
     // `&Option<P>` peels to that word. A tagged aggregate is a real
     // pointer. Recursing into payload fields (`declared_raw_adt_node`)
@@ -2527,7 +2534,6 @@ pub(in crate::front::mir) fn borrowed_pointee_is_raw_enum(
     // host-heap word (`pointee_is_raw_word`: `TO._gckind` does not
     // follow those). A GC *object* pointer that is not in
     // `_immutable_fields_` is `getfield_raw_r` and is refused below.
-    let ty = TyRef::Other(pointee.clone());
     if tyref_is_niche_option(&ty, llbc) || tyref_enum_layout_is_pointer_niche(&ty, llbc) {
         return false;
     }

@@ -250,25 +250,79 @@ pub(in crate::front::mir) fn operand_fn_ptr_family(
     operand: &Operand,
     llbc: &Llbc,
 ) -> Option<FnPtrFamily> {
-    let ty = match operand {
-        Operand::Copy(place) | Operand::Move(place) => &place.ty,
-        Operand::Const(_) => return None,
-    };
-    let signature = tyref_node(ty, llbc)
-        .and_then(|node| strip_ty_wrappers(node, llbc))
-        .and_then(|node| node.get("FnPtr"))?
-        .get("skip_binder")
-        .and_then(serde_json::Value::as_object)?;
+    let signature = operand_fn_ptr_signature(operand, llbc)?;
     // A missing or non-boolean `is_unsafe` reads as unsafe.
     let is_safe = signature
         .get("is_unsafe")
         .and_then(serde_json::Value::as_bool)
         == Some(false);
+    // `register_eq_w_hook` installs `r_dict` `fnkeyeq`. The candidate set
+    // is not in this artefact, so the call is `indirect_call` with
+    // `graphs is None` (`rptr.py` `PtrRepr.rtype_simple_call`) even when
+    // the pointer is `unsafe fn` and `MAJIT_FNPTR_INDIRECT` is off.
+    // `hash_w` / `hash_str` / `compares_by_identity` stay on `__dyn_call`
+    // so elidable type-dict reads (`_pure_getdictvalue_no_unwrapping`,
+    // `dict_w.get`) keep their extraeffect: PyPy's `dict_w` is a plain
+    // str map and never `hlinvoke`s `space.hash_w`.
+    if operand_is_dict_eq_hook_fn(operand, llbc) {
+        return Some(FnPtrFamily::Unknown);
+    }
     fn_ptr_family_for(
         is_safe,
         fn_ptr_signature_is_builtin_code_fn(signature, llbc),
         fnptr_indirect_enabled(),
     )
+}
+
+/// `FnPtr` skip_binder of a Dynamic call operand, or `None` when the
+/// operand is not a plain function pointer.
+pub(in crate::front::mir) fn operand_fn_ptr_signature<'a>(
+    operand: &'a Operand,
+    llbc: &'a Llbc,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    let ty = match operand {
+        Operand::Copy(place) | Operand::Move(place) => &place.ty,
+        Operand::Const(_) => return None,
+    };
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_wrappers(node, llbc))
+        .and_then(|node| node.get("FnPtr"))?
+        .get("skip_binder")
+        .and_then(serde_json::Value::as_object)
+}
+
+/// First-parameter type of `dict_eq_hook::register_eq_w_hook`: the TLS
+/// callback `eq_w_hooked` invokes (`ll_keyeq_custom` `d.fnkeyeq`).
+pub(in crate::front::mir) fn dict_eq_hook_registrar_param_type_ids(llbc: &Llbc) -> Vec<u64> {
+    const SUFFIXES: &[&str] = &["::register_eq_w_hook"];
+    llbc.iter_fun_decls()
+        .filter(|fd| {
+            let path = fd.item_meta.name_path();
+            SUFFIXES.iter().any(|suffix| path.ends_with(suffix))
+        })
+        .filter_map(|fd| fd.signature.inputs.first().and_then(tyref_dedup_id))
+        .collect()
+}
+
+/// Whether `operand` has the type `register_eq_w_hook` takes: a stored
+/// `Ptr(FuncType)` whose family is not in the artefact.
+pub(in crate::front::mir) fn operand_is_dict_eq_hook_fn(operand: &Operand, llbc: &Llbc) -> bool {
+    let ty = match operand {
+        Operand::Copy(place) | Operand::Move(place) => &place.ty,
+        Operand::Const(_) => return false,
+    };
+    let Some(id) = tyref_dedup_id(ty) else {
+        return false;
+    };
+    dict_eq_hook_registrar_param_type_ids(llbc).contains(&id)
+}
+
+/// Bodies that `hlinvoke` the TLS `fnkeyeq` analogue (`eq_w_hooked`,
+/// `ll_keyeq_custom`). The Dynamic call is the stored hook. A nested
+/// Charon item under that leaf (`{closure#0}`, `call_once`) still
+/// belongs to that `hlinvoke` body.
+pub(in crate::front::mir) fn path_is_dict_eq_hook_invoke(path: &str) -> bool {
+    path.split("::").any(|seg| seg == "eq_w_hooked")
 }
 
 /// The family decision itself, separated from the LLBC digging above so it
@@ -4093,6 +4147,60 @@ pub(in crate::front::mir) fn path_is_rordereddict_entry_ptr(path: &str) -> bool 
     path.split("::").any(|seg| seg == "rordereddict") && path_leaf_is(path, "entry_ptr")
 }
 
+pub(in crate::front::mir) fn path_is_rordereddict_entries_item_ptr(path: &str) -> bool {
+    path.split("::").any(|seg| seg == "rordereddict_entries")
+        && path_leaf_is(path, "entries_item_ptr")
+}
+
+/// `entry_ptr` / `entries_item_ptr` dest is only the base of a
+/// `(*p.add(i)).field` add (`ll_get_value`). The ARRAY GCREF is the
+/// interior base; `rewrite_op_getsubstruct` is not recorded.
+pub(in crate::front::mir) fn item_ptr_consumed_only_by_struct_field_add(
+    dest_local: usize,
+    body: &Unstructured,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> bool {
+    let census = struct_field_census(llbc, body, dest_local);
+    if census.defs != 1 || census.fields != 0 || census.other != 1 {
+        return false;
+    }
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+            continue;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        if !regular_call_is_ptr_add(reg, llbc) {
+            continue;
+        }
+        if operand_local(call.args.first()) != Some(dest_local) {
+            continue;
+        }
+        let PlaceKind::Local(add_dest) = call.dest.kind else {
+            return false;
+        };
+        return struct_field_ptr_add_trace(
+            reg,
+            call.args.len(),
+            Some(dest_local),
+            call.args.first().and_then(operand_tyref),
+            operand_local(call.args.get(1)),
+            add_dest as usize,
+            body,
+            llbc,
+            tombstoned,
+        )
+        .is_some();
+    }
+    false
+}
+
 pub(in crate::front::mir) fn tyref_is_raw_ptr_value(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_node(ty, llbc)
         .and_then(|node| type_node_raw_ptr_pointee(node, llbc))
@@ -4117,7 +4225,7 @@ pub(in crate::front::mir) fn struct_field_index_named(
         .position(|field| field.name.as_deref() == Some(name))
 }
 
-/// `GcArray<Point>` / `GcArray<Entry>` for a `*mut`/`*const` named,
+/// `GcArray<Point>` / `GcArray<Entry<K,V>>` for a `*mut`/`*const` named,
 /// non-transparent struct pointee.
 ///
 /// A scalar, a pointer, or a `repr(transparent)` pointee is `None`, so list
@@ -4129,6 +4237,10 @@ pub(in crate::front::mir) fn struct_field_index_named(
 /// spelling is an item run (`nolength_from_array_type_id`), so it cannot
 /// share an atid with that mint. `GcArray<T>` stays length-prefixed and
 /// `extract_element_type_from_str` still peels it to `T`.
+///
+/// `Entry<K,V>` keeps the instantiation suffix: each dict flavour is its
+/// own `DICTENTRYARRAY` (`get_ll_dict`), and stripping would union
+/// `ObjectKey` (two words) with `i64` (one word) onto one interior descr.
 pub(in crate::front::mir) fn struct_pointee_array_type_id(
     base_ty: &TyRef,
     llbc: &Llbc,
@@ -4143,8 +4255,7 @@ pub(in crate::front::mir) fn struct_pointee_array_type_id(
         return None;
     }
     let root = adt_node_class_root_with(pointee, llbc, tombstoned)?;
-    let leaf = majit_ir::descr::strip_instantiation_suffix(&root);
-    Some(format!("GcArray<{leaf}>"))
+    Some(format!("GcArray<{root}>"))
 }
 
 pub(in crate::front::mir) enum HeaderProd {

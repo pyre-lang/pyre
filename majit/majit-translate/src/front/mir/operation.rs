@@ -113,6 +113,95 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
+    /// `entries_item_ptr(array)` / `entry_ptr(&dict)` is
+    /// `lltype.direct_arrayitems`. `odictentry` is `lltype.Struct`,
+    /// not `GcStruct`: a GCREF of the item run lets
+    /// `id_or_identityhash` treat `GcEntries.length` as the object
+    /// header (`GCFLAG_HAS_SHADOW` lands on the length word).
+    ///
+    /// `d.entries[i].value` (`ll_get_value`) consumes the dest only as
+    /// `(*p.add(i)).field`. Bind the ARRAY GCREF and leave
+    /// `getinteriorfield` to the add intercept; `rewrite_op_getsubstruct`
+    /// is `int_add` only when the dest escapes as an address.
+    pub(in crate::front::mir) fn try_lower_rordereddict_item_ptr(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        first_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if args.len() != 1 {
+            return Ok(false);
+        }
+        let path = regular_call_name_path(reg, self.llbc).unwrap_or_default();
+        let header = if path_is_rordereddict_entries_item_ptr(&path) {
+            args[0].clone()
+        } else if path_is_rordereddict_entry_ptr(&path) {
+            let Some(recv_ty) = first_arg_ty else {
+                return Ok(false);
+            };
+            let Some((field, ty)) = self.entries_field_descriptor(recv_ty) else {
+                return Ok(false);
+            };
+            let bb_id = self.emit_bb(mir_bb);
+            let res = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: OpKind::FieldRead {
+                    base: args[0].clone(),
+                    field,
+                    ty,
+                    pure: false,
+                },
+            });
+            res
+        } else {
+            return Ok(false);
+        };
+        let field_add = item_ptr_consumed_only_by_struct_field_add(
+            dest_local,
+            self.body,
+            self.llbc,
+            self.tombstoned_leaves,
+        );
+        let dest = if field_add {
+            header
+        } else {
+            let bb_id = self.emit_bb(mir_bb);
+            let addr = push_cast_ptr_to_int(&mut self.graph, bb_id, header);
+            let shift = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(shift.clone()),
+                kind: OpKind::ConstInt(std::mem::size_of::<usize>() as i64),
+            });
+            let dest = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(dest.clone()),
+                kind: OpKind::BinOp {
+                    op: "add".to_string(),
+                    lhs: addr,
+                    rhs: shift,
+                    result_ty: ValueType::Int,
+                },
+            });
+            dest
+        };
+        self.local_var[dest_local] = Some(LocalValue::One(dest));
+        let bb_id = self.emit_bb(mir_bb);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
     /// `*p.add(i)` where `p` is the data pointer of a `&[u8]` byte string.
     ///
     /// `<[u8]>::as_ptr` aliases that pointer to the string and marks it.
@@ -7970,6 +8059,18 @@ impl<'a> Lowering<'a> {
                     transparent: true,
                 });
             }
+        }
+        // `PyError(ptr)` is one pointer word (`retag_error_carrier`).
+        // `tyref_transparent_inner_value_type` leaves a GC handle unpeeled
+        // so the wrapper keeps its class, and the Ctor arm would then
+        // `new` an 8-byte `__pos_0` box. Native `from_raw` is identity
+        // (`PyError(raw)`); `pyerror_to_exc_object` takes that same
+        // `PyErrorObject *` (`error.py OperationError` is the instance).
+        if n_operands == 1 && self.ty_is_error_carrier(dest_ty) {
+            return Ok(AggregateShape::Operand {
+                index: 0,
+                transparent: false,
+            });
         }
         // Resolve the user-defined owner + field names and types from the
         // Adt kind's `type_id` when possible.  Charon encodes

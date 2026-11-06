@@ -4583,6 +4583,29 @@ impl StructLayout {
         if let Some(size) = exact_size {
             self.size = size as usize;
         }
+        self.demote_struct_fields_that_exceed_parent();
+    }
+
+    /// `symbolic.get_field_token` sizes the parent including an inlined
+    /// STRUCT (`heaptracker.all_fielddescrs` recurses into
+    /// `isinstance(FIELD, lltype.Struct)`). An exact parent smaller than
+    /// that field is a word slot holding `Ptr(STRUCT)`: `rclass.py`
+    /// `InstanceRepr` `new`s the nested GcStruct and `setfield`s the
+    /// pointer. `rewrite_op_getsubstruct` would otherwise `int_add` into
+    /// the slot and read the pointer as the nested fields.
+    fn demote_struct_fields_that_exceed_parent(&mut self) {
+        let parent = self.size;
+        let word = crate::layout::target_word_size();
+        for fl in &mut self.fields {
+            if fl.flag == majit_ir::descr::ArrayFlag::Struct
+                && fl.size > 0
+                && fl.offset + fl.size > parent
+            {
+                fl.flag = majit_ir::descr::ArrayFlag::Pointer;
+                fl.size = word;
+                fl.field_type = majit_ir::value::Type::Ref;
+            }
+        }
     }
 }
 
@@ -16567,6 +16590,58 @@ mod tests {
         assert_eq!(layout.fields[1].size, 0);
     }
 
+    /// The explicit sum shell (`front/mir.rs` `explicit_sum_shell`) is one
+    /// tag word plus one-word payload slots. A by-value GcStruct in that
+    /// slot (`symbolic.get_field_token` FLAG_STRUCT of the nested size)
+    /// does not fit; the producer `new`s it and `setfield`s the pointer.
+    #[test]
+    fn apply_exact_layout_demotes_a_struct_field_that_exceeds_parent() {
+        use majit_ir::descr::ArrayFlag;
+
+        let word = crate::layout::target_word_size();
+        let mut known = std::collections::HashSet::new();
+        known.insert("ObjectKey".to_string());
+        let mut layout = StructLayout::from_type_strings(
+            &[
+                ("__discriminant".into(), "i64".into()),
+                ("__pos_0".into(), "ObjectKey".into()),
+            ],
+            &known,
+            &std::collections::HashMap::from([("ObjectKey".to_string(), 2 * word)]),
+            &std::collections::HashMap::from([("ObjectKey".to_string(), word)]),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(layout.size, 3 * word);
+        assert_eq!(layout.fields[1].flag, ArrayFlag::Struct);
+        assert_eq!(layout.fields[1].size, 2 * word);
+        layout.apply_exact_layout(
+            &[
+                ("__discriminant".into(), "i64".into()),
+                ("__pos_0".into(), "ObjectKey".into()),
+            ],
+            &std::collections::HashMap::from([
+                ("__discriminant".to_string(), 0u64),
+                ("__pos_0".to_string(), word as u64),
+            ]),
+            Some(2 * word as u64),
+            &known,
+            &std::collections::HashMap::from([("ObjectKey".to_string(), 2 * word)]),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(layout.size, 2 * word);
+        let payload = layout
+            .fields
+            .iter()
+            .find(|field| field.name == "__pos_0")
+            .expect("__pos_0 row");
+        assert_eq!(payload.offset, word);
+        assert_eq!(payload.flag, ArrayFlag::Pointer);
+        assert_eq!(payload.size, word);
+        assert_eq!(payload.field_type, majit_ir::value::Type::Ref);
+    }
+
     /// `char` is `lltype.UniChar`: unsigned, int-banked, 4 bytes.
     /// The unknown-name fallback would bank it as a word-sized Ref.
     #[test]
@@ -21573,6 +21648,75 @@ mod tests {
         if crate::layout::target_word_size() == 8 {
             assert_eq!(offset, 16);
         }
+    }
+
+    /// `get_ll_dict` `Entry<ObjectKey, OBJECTPTR>`: two-word key, then
+    /// `f_valid`, then `value` at 24. The generic TypeVar layout is 16.
+    #[test]
+    fn interiorfielddescrof_object_key_entry_value_offset() {
+        if crate::layout::target_word_size() != 8 {
+            return;
+        }
+        let object_key = "ObjectKey";
+        let elem = "rordereddict_entries::Entry<ObjectKey,*mut PyObject>";
+        let atid = format!("GcArray<{elem}>");
+        let key_sid = majit_ir::descr::StructId::from_canonical(object_key);
+        let sid = majit_ir::descr::StructId::from_canonical_spelling(elem);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (object_key.to_string(), Some(key_sid)),
+                (elem.to_string(), Some(sid)),
+            ]));
+        let mut fields_by_struct = std::collections::HashMap::new();
+        fields_by_struct.insert(
+            object_key.to_string(),
+            vec![
+                ("hash".to_string(), "i64".to_string()),
+                ("obj".to_string(), "*mut PyObject".to_string()),
+            ],
+        );
+        fields_by_struct.insert(
+            elem.to_string(),
+            vec![
+                ("key".to_string(), object_key.to_string()),
+                ("f_valid".to_string(), "bool".to_string()),
+                ("value".to_string(), "*mut PyObject".to_string()),
+                ("f_hash".to_string(), "u64".to_string()),
+            ],
+        );
+        let names = std::collections::HashSet::from([object_key.to_string(), elem.to_string()]);
+        let provider = crate::layout::HeuristicLayoutProvider::from_struct_fields(
+            &fields_by_struct,
+            &names,
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let layout = crate::layout::LayoutProvider::get_struct_layout(&provider, elem)
+            .expect("ObjectKey Entry layout");
+        assert_eq!(
+            layout
+                .fields
+                .iter()
+                .find(|field| field.name == "value")
+                .map(|field| field.offset),
+            Some(24)
+        );
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(names);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            elem.to_string(),
+            fields_by_struct.get(elem).cloned().unwrap(),
+        );
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(sid, layout);
+
+        let (descr, _) = cc
+            .interiorfielddescrof_keyed(1, &Some(atid), "value")
+            .expect("interior field descr");
+        let interior = descr.as_interior_field_descr().expect("InteriorFieldDescr");
+        assert_eq!(interior.field_descr().offset(), 24);
+        assert_eq!(interior.array_descr().item_size(), 40);
     }
 
     /// `getkind(SingleFloat) == 'int'` (history.py): `f32` banks to the

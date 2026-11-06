@@ -1757,6 +1757,19 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `direct_arrayitems` of a `DICTENTRYARRAY` is an int
+                // address (`rewrite_op_getsubstruct`). Emit that before
+                // the helper can return a GCREF of the item run.
+                if self.try_lower_rordereddict_item_ptr(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    first_arg_ty.as_ref(),
+                    dest_local,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 // `(*p.add(i)).field` on a named struct pointee is
                 // `getinteriorfield` (`rewrite_op_getinteriorfield`). The
                 // add records the GcArray header and the index; the field
@@ -6643,7 +6656,16 @@ impl<'a> Lowering<'a> {
                 // non-pointer operand, such as a `dyn` fat pointer the vtable
                 // arm could not resolve, keeps the synthetic `__dyn_call`
                 // path with the receiver threaded into `args[0]`.
-                let fn_ptr_family = operand_fn_ptr_family(&dyn_operand, self.llbc);
+                let fn_ptr_family = operand_fn_ptr_family(&dyn_operand, self.llbc).or_else(|| {
+                    // Registrar type id can miss when Charon inlines the
+                    // `unsafe fn` alias (`TyRef::Other`). The invoke body
+                    // still has one stored `Ptr(FuncType)` call:
+                    // `rptr.py` `rtype_simple_call` `indirect_call` with
+                    // `graphs is None`.
+                    (path_is_dict_eq_hook_invoke(&self.graph.name)
+                        && operand_fn_ptr_signature(&dyn_operand, self.llbc).is_some())
+                    .then_some(FnPtrFamily::Unknown)
+                });
                 let eval_hook_graphs =
                     eval_hook_graphs_for_call(self.llbc, self.body, &dyn_operand);
                 // A monomorphized vtable stores every method slot as

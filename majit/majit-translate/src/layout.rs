@@ -180,6 +180,45 @@ pub trait LayoutProvider {
     ) -> Option<StructLayout>;
 }
 
+/// Whether a spelling may inherit Charon's exact layout of its unsuffixed
+/// TypeDecl. Concrete generic identities are derived later from use-site
+/// type arguments (`lib.rs` layout loop), and the declaration's offsets
+/// are the right shell for the explicit translated `Result` (`get_ll_dict`
+/// analogue: one ARRAY.OF per flavour, not one shared STRUCT).
+pub(crate) fn inherit_template_exact_layout<'a>(
+    struct_name: &str,
+    rows: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> bool {
+    let rows: Vec<(&str, &str)> = rows.into_iter().collect();
+    // `Option<fn(..)>::Some` is a pointer niche (`null_fn`): the payload
+    // sits at byte 0. The Option template is the explicit `[tag@0 |
+    // payload@8]` shell, so inheriting it would place `__pos_0` at 8.
+    if !rows.iter().any(|(name, _)| *name == "__discriminant")
+        && rows
+            .iter()
+            .any(|(name, ty)| *name == "__pos_0" && majit_ir::descr::is_fn_ptr_spelling(ty))
+    {
+        return false;
+    }
+    // `rordereddict.py get_ll_dict` builds one `DICTENTRY` per dict
+    // flavour. Charon's generic `Entry` layout is the TypeVar key (one
+    // word). `ObjectKey` is two words; inheriting the template stamps
+    // `value` at 16 instead of 24.
+    if struct_name.contains('<') {
+        let leaf = struct_name
+            .split('<')
+            .next()
+            .and_then(|base| base.rsplit("::").next());
+        if leaf == Some("Entry")
+            && rows.iter().any(|(name, _)| *name == "f_valid")
+            && rows.iter().any(|(name, _)| *name == "f_hash")
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Default provider using type-string heuristic.
 ///
 /// Approximates `#[repr(C)]` layout by parsing field type strings and
@@ -309,6 +348,91 @@ impl LayoutProvider for HeuristicLayoutProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inherit_template_exact_layout_keeps_result_shell() {
+        assert!(inherit_template_exact_layout(
+            "result::Result<ObjectKey,DictKeyError>::Ok",
+            [("__discriminant", "i64"), ("__pos_0", "ObjectKey"),],
+        ));
+    }
+
+    #[test]
+    fn inherit_template_exact_layout_skips_option_fn_niche() {
+        assert!(!inherit_template_exact_layout(
+            "option::Option<fn()>",
+            [("__pos_0", "fn()")],
+        ));
+    }
+
+    #[test]
+    fn inherit_template_exact_layout_skips_entry_monomorph() {
+        assert!(!inherit_template_exact_layout(
+            "rordereddict_entries::Entry<ObjectKey,*mut PyObject>",
+            [
+                ("key", "ObjectKey"),
+                ("f_valid", "bool"),
+                ("value", "*mut PyObject"),
+                ("f_hash", "u64"),
+            ],
+        ));
+    }
+
+    #[test]
+    fn inherit_template_exact_layout_keeps_generic_entry() {
+        assert!(inherit_template_exact_layout(
+            "rordereddict_entries::Entry",
+            [
+                ("key", "??TypeVar#0"),
+                ("f_valid", "bool"),
+                ("value", "??TypeVar#1"),
+                ("f_hash", "u64"),
+            ],
+        ));
+    }
+
+    #[test]
+    fn object_key_entry_heuristic_value_offset_is_two_words() {
+        let word = target_word_size();
+        if word != 8 {
+            return;
+        }
+        let mut fields = HashMap::new();
+        fields.insert(
+            "ObjectKey".to_string(),
+            vec![
+                ("hash".to_string(), "i64".to_string()),
+                ("obj".to_string(), "*mut PyObject".to_string()),
+            ],
+        );
+        let entry = "rordereddict_entries::Entry<ObjectKey,*mut PyObject>";
+        fields.insert(
+            entry.to_string(),
+            vec![
+                ("key".to_string(), "ObjectKey".to_string()),
+                ("f_valid".to_string(), "bool".to_string()),
+                ("value".to_string(), "*mut PyObject".to_string()),
+                ("f_hash".to_string(), "u64".to_string()),
+            ],
+        );
+        let known = HashSet::from(["ObjectKey".to_string(), entry.to_string()]);
+        let provider = HeuristicLayoutProvider::from_struct_fields(
+            &fields,
+            &known,
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+        let layout = provider.get_struct_layout(entry).unwrap();
+        let value = layout
+            .fields
+            .iter()
+            .find(|field| field.name == "value")
+            .expect("value");
+        assert_eq!(value.offset, 24);
+        assert_eq!(layout.size, 40);
+        assert_eq!(layout.fields[0].flag, majit_ir::descr::ArrayFlag::Struct);
+        assert_eq!(layout.fields[0].size, 16);
+    }
 
     #[test]
     fn test_heuristic_provider_basic_struct() {

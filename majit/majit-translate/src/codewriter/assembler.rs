@@ -5682,6 +5682,20 @@ pub(crate) fn bh_size_spec_from_callcontrol(
         }
         all_fielddescrs.insert(0, tag);
     }
+    // Same demotion as `StructLayout::demote_struct_fields_that_exceed_parent`:
+    // an inlined STRUCT that does not fit is Ptr(STRUCT) in that slot.
+    let word = crate::layout::target_word_size();
+    for field in &mut all_fielddescrs {
+        if field.field_flag == majit_ir::descr::ArrayFlag::Struct
+            && field.field_size > 0
+            && field.offset + field.field_size > size
+        {
+            field.field_flag = majit_ir::descr::ArrayFlag::Pointer;
+            field.field_size = word;
+            field.field_type = majit_ir::value::Type::Ref;
+            field.is_field_signed = false;
+        }
+    }
     let violating_fields = all_fielddescrs
         .iter()
         .filter(|field| field.offset + field.field_size > size)

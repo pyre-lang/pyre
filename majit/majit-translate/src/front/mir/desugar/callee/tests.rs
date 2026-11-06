@@ -4,6 +4,8 @@ use majit_charon_reader::Llbc;
 
 use serde_json::json;
 
+use crate::model::{CallTarget, OpKind};
+
 use crate::front::mir::tests::{
     assign_stmt, bb, call_term, const_artifact, deref_place, fixture_llbc, fmt_arguments_adt,
     fmt_arguments_decl, fmt_format_decl, format_as_bytes_window_llbc, hint_must_use_decl,
@@ -44,6 +46,78 @@ fn fn_ptr_family_names_the_wrapper_set_only_for_a_safe_pointer() {
                  fnptr_indirect={fnptr_indirect}"
         );
     }
+}
+
+#[test]
+fn dict_eq_hook_invoke_leaves_are_the_tls_hlinvoke_bodies() {
+    assert!(super::path_is_dict_eq_hook_invoke(
+        "pyre_object::dict_eq_hook::eq_w_hooked"
+    ));
+    assert!(super::path_is_dict_eq_hook_invoke(
+        "pyre_object::dict_eq_hook::eq_w_hooked::{closure#0}::call_once"
+    ));
+    assert!(!super::path_is_dict_eq_hook_invoke("hash_w_hooked"));
+    assert!(!super::path_is_dict_eq_hook_invoke(
+        "pyre_object::dict_eq_hook::hash_str_hooked"
+    ));
+    assert!(!super::path_is_dict_eq_hook_invoke(
+        "compares_by_identity_hooked"
+    ));
+    assert!(!super::path_is_dict_eq_hook_invoke(
+        "pyre_object::dict_eq_hook::hash_str_hooked_bytes"
+    ));
+    assert!(!super::path_is_dict_eq_hook_invoke(
+        "pyre_object::dict_eq_hook::register_eq_w_hook"
+    ));
+    assert!(!super::path_is_dict_eq_hook_invoke("eq_w_hooked_inner"));
+    assert!(!super::path_is_dict_eq_hook_invoke(
+        "pyre_object::dict_eq_hook::__majit_call_target_eq_w_hooked"
+    ));
+}
+
+/// `ll_keyeq_custom` is a named body whose `hlinvoke` is `indirect_call`
+/// with `graphs is None` (`rordereddict.py`, `rptr.py`
+/// `PtrRepr.rtype_simple_call`). The TLS hook must lower the same way.
+#[test]
+fn eq_w_hooked_lowers_the_tls_hook_as_indirect_call_with_unknown_family() {
+    let Some(llbc) =
+        crate::test_support::load_ullbc_if_present(crate::runtime_names::artifacts::OBJECT_ULLBC)
+    else {
+        return;
+    };
+    let graph = crate::test_support::lower_function(llbc, "pyre_object::dict_eq_hook::eq_w_hooked")
+        .expect("lower eq_w_hooked");
+    let mut unknown_family = 0usize;
+    let mut dyn_call = 0usize;
+    let kinds: Vec<String> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .map(|op| {
+            match &op.kind {
+                OpKind::IndirectCall { graphs, .. } if graphs.is_none() => {
+                    unknown_family += 1;
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("__dyn_call") => {
+                    dyn_call += 1;
+                }
+                _ => {}
+            }
+            format!("{:?}", op.kind)
+        })
+        .collect();
+    assert_eq!(
+        dyn_call, 0,
+        "eq_w_hooked must not residualize the hook as __dyn_call: {kinds:?}"
+    );
+    assert_eq!(
+        unknown_family, 1,
+        "eq_w_hooked must hlinvoke the stored hook as indirect_call \
+         with graphs is None: {kinds:?}"
+    );
 }
 
 #[test]
