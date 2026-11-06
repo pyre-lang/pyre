@@ -7442,6 +7442,51 @@ impl<'a> Lowering<'a> {
                 {
                     return self.resolve_offset_place(mir_bb, *inner, offset);
                 }
+                if let ProjectionElem::Atom(name) = &elem
+                    && name == "Deref"
+                {
+                    let inner_is_raw_ptr = tyref_is_raw_pointer(&inner.ty, self.llbc);
+                    let inner_ty = clone_tyref(&inner.ty);
+                    let base = self.resolve_place(mir_bb, *inner)?;
+                    // `*p` of a raw pointer is the address word
+                    // (`history.py` `getkind` of `Ptr` with `_gckind ==
+                    // 'raw'` is `'int'`). Aliasing that word as the
+                    // referent lets `align_gc_link_args` restamp the
+                    // `getfield_raw` dest `GcRef` when the return is a
+                    // GC/`Ref` struct (`rewrite_op_getfield` then
+                    // refuses `getfield_raw_r`). A primitive deref is
+                    // `raw_load` above; a one-word storage-raw pointee
+                    // is the word itself.
+                    if (inner_is_raw_ptr || scalar_address)
+                        && crate::model::FunctionGraph::concretetype_of(&base)
+                            == crate::model::ConcreteType::Signed
+                    {
+                        let dest_vt = tyref_to_value_type_with(
+                            &place_ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                        );
+                        if matches!(dest_vt, ValueType::Ref(_)) {
+                            if let Some(root) =
+                                tyref_class_root_with(&place_ty, self.llbc, self.tombstoned_leaves)
+                            {
+                                return Ok(self.cast_ref_word(mir_bb, base, &root));
+                            }
+                            let bb_id = self.emit_bb(mir_bb);
+                            let ptr_ty =
+                                overlay_field_lltype(&inner_ty, self.llbc, self.gc_struct_ids);
+                            return Ok(emit_dest_typed_cast_int_to_ptr(
+                                &mut self.graph,
+                                bb_id,
+                                base,
+                                ptr_ty,
+                            ));
+                        }
+                    }
+                    return Ok(base);
+                }
                 match elem {
                     ProjectionElem::Tagged(_) | ProjectionElem::Atom(_) => {
                         self.resolve_place(mir_bb, *inner)
