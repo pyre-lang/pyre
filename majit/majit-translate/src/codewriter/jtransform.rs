@@ -1565,6 +1565,15 @@ fn lltype_is_gc(tp: &crate::translator::rtyper::lltypesystem::lltype::LowLevelTy
     }
 }
 
+/// `history.getkind` of a `Ptr` whose `TO._gckind` is not `'gc'` is
+/// `'int'` (`rclass.py getgcflavor`). The rtyper writes that `Ptr` onto
+/// the result; restamping it to `OBJECT` would make `_is_gc` true.
+fn result_lltype_is_raw_ptr(var: &crate::flowspace::model::Variable) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    var.concretetype()
+        .is_some_and(|ct| matches!(ct, LowLevelType::Ptr(_)) && !lltype_is_gc(&ct))
+}
+
 /// A flow-graph `Constant` (`jtransform.py` `isinstance(v, Constant)`).
 ///
 /// The frontend materialises source constants as SSA Variables produced by
@@ -4084,7 +4093,21 @@ impl<'a> Transformer<'a> {
     /// Int base as Int (`getfield_raw_i`); a Signed base on a GC owner is
     /// a mis-banked pointer `promote_gc_field_bases` rehomes, not a raw
     /// struct. `history.getkind` of a GC `Ptr` is `"ref"`.
-    fn gc_pointer_field_stays_ref(&self, field: &FieldDescriptor, ty: &ValueType) -> bool {
+    ///
+    /// A rtyper-written `Ptr` whose `TO._gckind` is raw is already int
+    /// (`rclass.py getgcflavor` / `history.getkind`). Isolated
+    /// `transform_graph` has `callcontrol is None` (`jtransform.py
+    /// Transformer.get_vinfo`), so [`Self::flavor_raw_ref_is_int_banked`]
+    /// cannot see the harvest; the lltype is the same fact.
+    fn gc_pointer_field_stays_ref(
+        &self,
+        field: &FieldDescriptor,
+        ty: &ValueType,
+        result: Option<&crate::flowspace::model::Variable>,
+    ) -> bool {
+        if result.is_some_and(result_lltype_is_raw_ptr) {
+            return false;
+        }
         matches!(
             ty,
             ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder
@@ -9252,7 +9275,7 @@ impl<'a> Transformer<'a> {
                 .as_ref()
                 .is_some_and(|r| self.get_value_kind_var(r) == 'r')
         {
-            if self.gc_pointer_field_stays_ref(field, ty) {
+            if self.gc_pointer_field_stays_ref(field, ty, op.result.as_ref()) {
                 self.stamp_value_kind_from_value_type(graph, op.result.clone(), ty);
             } else {
                 self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
@@ -9273,7 +9296,7 @@ impl<'a> Transformer<'a> {
             };
             // rtyper may have typed a `*mut PyObject` field as Signed.
             // `history.getkind` of that GC pointer is still `"ref"`.
-            if self.gc_pointer_field_stays_ref(field, ty)
+            if self.gc_pointer_field_stays_ref(field, ty, op.result.as_ref())
                 && matches!(typed_ty, ValueType::Int | ValueType::Unsigned)
             {
                 self.stamp_value_kind_from_value_type(graph, op.result.clone(), ty);
