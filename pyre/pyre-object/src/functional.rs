@@ -750,6 +750,20 @@ pub unsafe fn is_range_iter(obj: PyObjectRef) -> bool {
     }
 }
 
+/// `functional.py W_AbstractRangeIterator.descr_iter` — `return self`.
+/// Shared by the three machine-int layouts and `W_LongRangeIterator`.
+///
+/// `#[inline(never)]` is load-bearing: rustc otherwise folds this body into
+/// `space.iter` and the GET_ITER descent has no graph to look up
+/// (`specialize.rs RANGE_ITERATOR_ITER_DESCENT`).
+///
+/// # Safety
+/// `obj` must point to a valid range iterator of those types.
+#[inline(never)]
+pub unsafe fn w_range_iterator_iter(obj: PyObjectRef) -> PyObjectRef {
+    obj
+}
+
 /// Read the `(current, remaining, step)` triple of a range iterator.
 ///
 /// # Safety
