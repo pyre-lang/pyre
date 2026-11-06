@@ -1071,19 +1071,23 @@ impl<'a> GraphFlattener<'a> {
             {
                 continue;
             }
-            // Skip Void inputargs (no color assigned by regalloc) — the
-            // `flatten.py v.concretetype is not lltype.Void` filter.
-            let dst = match self.try_getcolor(dst_var) {
-                Some(r) => r,
-                None => continue,
-            };
+            // `flatten.py insert_renamings`: `v.concretetype is not
+            // lltype.Void`. Unknown is not Void — a missing colour is
+            // `getcolor` KeyError, not a silent drop.
+            match v {
+                LinkArg::Value(var)
+                    if FunctionGraph::concretetype_of(var) == crate::model::ConcreteType::Void =>
+                {
+                    continue;
+                }
+                LinkArg::Const(c) if constant_kind(c) == 'v' => continue,
+                _ => {}
+            }
             let src = match v {
-                LinkArg::Value(var) => match self.try_getcolor(var) {
-                    Some(r) => RegOrConst::Reg(r),
-                    None => continue,
-                },
+                LinkArg::Value(var) => RegOrConst::Reg(self.getcolor(var)),
                 LinkArg::Const(c) => RegOrConst::Const(c.clone()),
             };
+            let dst = self.getcolor(dst_var);
             // `flatten.py:314 if v == w: continue` — color-level
             // identity skip (post-regalloc Register equality).
             if let RegOrConst::Reg(src_r) = &src
@@ -1212,23 +1216,6 @@ impl<'a> GraphFlattener<'a> {
                 self.emitline(FlatOp::LastExcValue { dst });
             }
         }
-    }
-
-    /// Resolve a Variable to its dedup'd [`Register`], returning
-    /// `None` for Void slots that regalloc skipped.  Companion to
-    /// [`Self::getcolor`] which panics in that case.
-    fn try_getcolor(&mut self, var: &Variable) -> Option<Register> {
-        let (kind, color) = self.kind_color_of(var)?;
-        let key = (
-            kind,
-            u16::try_from(color).expect("register color > u16::MAX"),
-        );
-        Some(
-            *self
-                .registers
-                .entry(key)
-                .or_insert_with(|| Register::new(kind, color)),
-        )
     }
 
     /// `flatten.py def make_exception_link(self, link, handling_ovf)`.
@@ -3017,6 +3004,177 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "not assigned a color")]
+    fn insert_renamings_panics_on_uncoloured_non_void_source() {
+        // `flatten.py getcolor(v)` KeyError: Unknown is not Void.
+        let mut graph = FunctionGraph::new("uncoloured_src");
+        let src = graph.alloc_value_var();
+        let dst = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        let mut coloring = crate::regalloc::Coloring::default();
+        coloring.insert(dst.clone(), 0);
+        let mut regallocs = std::collections::HashMap::new();
+        regallocs.insert(
+            RegKind::Ref,
+            crate::regalloc::RegAllocator {
+                coloring,
+                num_regs: 1,
+            },
+        );
+        let link = Link::new_mixed(vec![LinkArg::Value(src)], BlockId(0), None);
+        let mut f = GraphFlattener::new(&graph, &regallocs, false);
+        f.insert_renamings(&link, &[dst]);
+    }
+
+    /// A variable passed on a link into a block whose only use of it is
+    /// the call argument, after a conditional that skipped `isconstant`.
+    /// Real `perform_register_allocation`, not identity coloring.
+    #[test]
+    fn flatten_copies_a_link_only_call_arg_skipped_by_the_other_use() {
+        use crate::call::CallDescriptor;
+        use crate::model::{CallFuncPtr, CallTarget, ConcreteType, SpaceOperation, ValueType};
+        use majit_ir::effectinfo::EffectInfo;
+        use majit_ir::value::Type;
+
+        let mut graph = FunctionGraph::new("link_only_call_arg");
+        let obj = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "obj".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let flag = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "flag".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(graph.startblock, obj.clone());
+        graph.push_inputarg_var(graph.startblock, flag.clone());
+        FunctionGraph::set_concretetype_of_inline(&flag, ConcreteType::Signed);
+        // Startblock `obj` stays Unknown so the only kind source for the
+        // trampoline phi is the residual ref list, matching a link-only
+        // SSI copy that `authoritative_result_types` never stamped.
+
+        let (bool_bb, bool_ins) = graph.create_block_with_arg_vars(2);
+        let obj_phi = bool_ins[0].clone();
+        let flag_phi = bool_ins[1].clone();
+        FunctionGraph::set_concretetype_of_inline(&flag_phi, ConcreteType::Signed);
+
+        let (use_bb, use_ins) = graph.create_block_with_arg_vars(1);
+        let obj_use = use_ins[0].clone();
+        let (tramp_bb, tramp_ins) = graph.create_block_with_arg_vars(1);
+        let obj_tramp = tramp_ins[0].clone();
+
+        graph.set_goto(graph.startblock, bool_bb, vec![obj.clone(), flag.clone()]);
+        graph.set_branch(
+            bool_bb,
+            flag_phi,
+            use_bb,
+            vec![obj_phi.clone()],
+            tramp_bb,
+            vec![obj_phi.clone()],
+        );
+        if let Some(crate::model::ExitSwitch::Value(cond)) = &graph.block(bool_bb).exitswitch {
+            FunctionGraph::set_concretetype_of_inline(cond, ConcreteType::Signed);
+        }
+
+        let isconst = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.block_mut(use_bb).operations.push(SpaceOperation {
+            result: Some(isconst),
+            kind: OpKind::IsConstant {
+                value: obj_use.clone(),
+                kind_char: 'r',
+            },
+        });
+        graph.set_return(use_bb, Some(obj_use.clone()));
+
+        let tramp_result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.block_mut(tramp_bb).operations.push(SpaceOperation {
+            result: Some(tramp_result.clone()),
+            kind: OpKind::CallResidual {
+                funcptr: CallFuncPtr::Target(CallTarget::function_path(["test", "trampoline"])),
+                descriptor: CallDescriptor::from_signature(
+                    &[Type::Ref],
+                    Type::Ref,
+                    EffectInfo::default(),
+                ),
+                args_i: vec![],
+                args_r: vec![obj_tramp.clone()],
+                args_f: vec![],
+                result_kind: 'r',
+                indirect_targets: None,
+            },
+        });
+        graph.set_return(tramp_bb, Some(tramp_result.clone()));
+
+        crate::codewriter::type_state::stamp_unknown_call_args(&mut graph);
+        crate::codewriter::type_state::align_gc_link_args(&mut graph);
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&obj_phi),
+            ConcreteType::GcRef
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&obj_tramp),
+            ConcreteType::GcRef
+        );
+        assert!(
+            regallocs[&RegKind::Ref]
+                .color_for_variable(&obj_phi)
+                .is_some(),
+            "link-only phi must be coloured"
+        );
+        assert!(
+            regallocs[&RegKind::Ref]
+                .color_for_variable(&obj_tramp)
+                .is_some(),
+            "call-arg dest must be coloured"
+        );
+
+        // `flatten_graph` `enforce_input_args` swapcolors the startblock
+        // prefix; read colours after that rotation so the Move assertion
+        // matches the flattened registers.
+        let flat = flatten_graph(&graph, &mut regallocs);
+        let src_color = regallocs[&RegKind::Ref]
+            .color_for_variable(&obj_phi)
+            .expect("link-only phi must stay coloured");
+        let dst_color = regallocs[&RegKind::Ref]
+            .color_for_variable(&obj_tramp)
+            .expect("call-arg dest must stay coloured");
+        if src_color != dst_color {
+            let copied = flat.insns.iter().any(|op| {
+                matches!(
+                    op,
+                    FlatOp::Move {
+                        src: RegOrConst::Reg(src),
+                        dst,
+                    } if src.kind == RegKind::Ref
+                        && src.index as usize == src_color
+                        && dst.kind == RegKind::Ref
+                        && dst.index as usize == dst_color
+                )
+            });
+            assert!(
+                copied,
+                "insert_renamings must copy the link-only phi into the call register; insns={:?}",
+                flat.insns
+            );
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────

@@ -65,6 +65,13 @@ pub(in crate::front::mir) struct AtomicReceiverSources {
     pub address: bool,
 }
 
+/// `core::mem::replace` / `swap` / `take` (and the `std::mem` re-exports).
+/// [`Lowering::try_lower_mem_exchange`] inlines these as `old = place; place = new`.
+pub(in crate::front::mir) fn is_inlined_mem_exchange_path(name: &str) -> bool {
+    (name.starts_with("core::mem::") || name.starts_with("std::mem::"))
+        && matches!(name.rsplit("::").next(), Some("replace" | "swap" | "take"))
+}
+
 impl<'a> Lowering<'a> {
     /// `w_obj._utf8` — narrow the `PyObjectRef` receiver to
     /// `W_UnicodeObject` and read its `value` field, the rstr `STR`
@@ -866,7 +873,7 @@ impl<'a> Lowering<'a> {
         let Some(name) = regular_call_name_path(reg, self.llbc) else {
             return Ok(false);
         };
-        if !(name.starts_with("core::mem::") || name.starts_with("std::mem::")) {
+        if !is_inlined_mem_exchange_path(&name) {
             return Ok(false);
         }
         let leaf = name.rsplit("::").next();
@@ -5189,10 +5196,11 @@ impl<'a> Lowering<'a> {
             || tyref_is_string_value(ty, self.llbc)
     }
 
-    /// Default of `ty`: primitive scalar zero, unit / `PhantomData`,
-    /// empty `Vec` (`vec::Vec::new` → `newlist` / `ll_newemptylist`),
-    /// empty rstr `STR` (`Wtf8` / `Wtf8Buf` / `str`), or
-    /// `TupleRepr.newtuple` of those.
+    /// Default of `ty`: primitive scalar zero, unit / std void ZST
+    /// (`PhantomData`, `BuildHasherDefault`), empty `Vec`
+    /// (`vec::Vec::new` → `newlist` / `ll_newemptylist`), empty rstr
+    /// `STR` (`Wtf8` / `Wtf8Buf` / `str`), or `TupleRepr.newtuple` of
+    /// those.
     pub(in crate::front::mir) fn emit_default_of_ty(
         &mut self,
         bb_id: BlockId,
@@ -6588,9 +6596,15 @@ impl<'a> Lowering<'a> {
         };
         match self.llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
             "pyre_object::int_array::<Impl>::as_slice"
-            | "pyre_object::int_array::<Impl>::as_mut_slice" => Some(("IntArray", "[i64]")),
+            | "pyre_object::int_array::<Impl>::as_mut_slice" => Some((
+                "IntArray",
+                super::super::numeric_array_slice_spelling("IntArray")?,
+            )),
             "pyre_object::float_array::<Impl>::as_slice"
-            | "pyre_object::float_array::<Impl>::as_mut_slice" => Some(("FloatArray", "[f64]")),
+            | "pyre_object::float_array::<Impl>::as_mut_slice" => Some((
+                "FloatArray",
+                super::super::numeric_array_slice_spelling("FloatArray")?,
+            )),
             _ => None,
         }
     }
@@ -7591,6 +7605,14 @@ impl<'a> Lowering<'a> {
         result_ty: ValueType,
     ) -> Result<(), LowerError> {
         let bb_id = self.emit_bb(mir_bb);
+        if op == "cast_int_to_ptr" && matches!(result_ty, ValueType::Str) {
+            let raw = emit_cast_int_to_strptr(&mut self.graph, bb_id, operand);
+            self.local_var[dest_local] = Some(LocalValue::One(raw));
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(());
+        }
         let concretetype = if op == "cast_int_to_ptr" {
             crate::model::ConcreteType::GcRef
         } else {

@@ -3,6 +3,9 @@
 # three independently observable containers before the limit lands; replaying
 # from the caller's CALL applies an iteration twice, while collapsing the
 # callee onto the caller loses its locals/operand stack.
+# pyre-check: jitstats-band=fbw_blackhole_adopted_single_frame=1,fbw_blackhole_adopted_multi_frame=1
+# The ABORT_TOO_LONG blackhole adoptions split single- vs multi-frame by host.
+# ubuntu/macos CI read 439/39; darwin-arm64 here reads 440/38.
 import atexit
 
 # Keep lazy shutdown imports outside this fixture's tiny trace limit. The

@@ -2046,18 +2046,19 @@ unsafe fn int_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // Rust source spelling the MIR front lowers back to `int_mul_ovf`.
     match int_pow_nomod(va, vb) {
         Ok(r) => Ok(w_int_new(r)),
-        Err(_) => Ok(w_long_new(pow_ovf2long(va, vb)?)),
+        Err(_) => pow_ovf2long(va, vb),
     }
 }
 
-/// intobject.py `_pow_ovf2long`: `W_LongObject.fromint(iv)` then
-/// `rbigint.int_pow(iw)`.  The base is built inside this opaque call, so
-/// the traced `int_pow` never passes a stack `BigInt` to the
-/// `jit_bigint_int_pow_nomod` residual, which reads a heap rbigint pointer.
+/// intobject.py `_pow_ovf2long`: `W_LongObject.fromint(iv)` then `descr_pow`,
+/// which returns the wrapped long. The recovery is one opaque residual so
+/// the traced `int_pow` except arm is a bound word-ABI `PyObjectRef` call
+/// (`getfunctionptr` of `_pow_ovf2long`) rather than a `BigInt` payload the
+/// residual ABI cannot publish.
 #[majit_macros::dont_look_inside]
-fn pow_ovf2long(iv: i64, iw: i64) -> Result<BigInt, PyError> {
+fn pow_ovf2long(iv: i64, iw: i64) -> PyResult {
     let base = BigInt::from(iv);
-    bigint_int_pow_nomod(&base, iw)
+    Ok(w_long_new(bigint_int_pow_nomod(&base, iw)?))
 }
 
 /// Negative-exponent `int ** int` float route, kept opaque so `int_pow`
@@ -4823,38 +4824,39 @@ unsafe fn shortcut_rshift(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObj
 }
 
 #[majit_macros::always_inline_try]
-unsafe fn shortcut_and(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
-    // `is_int` accepts BOOL_TYPE; W_BoolObject.descr_and returns the
-    // bool singleton, W_IntObject.descr_and always boxes an int.
+unsafe fn shortcut_and(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    // `descroperation.py shortcut_binop` returns a W_Root (the result or
+    // NotImplemented). `is_int` accepts BOOL_TYPE; W_BoolObject.descr_and
+    // returns the bool singleton, W_IntObject.descr_and always boxes an int.
     if is_bool(a) {
-        return Ok(Some(bool_descr_and(a, b)));
+        return Ok(bool_descr_and(a, b));
     }
     if is_int(a) {
-        return Ok(Some(int_bitand(a, b)?));
+        return int_bitand(a, b);
     }
-    Ok(None)
+    Ok(w_not_implemented())
 }
 
 #[majit_macros::always_inline_try]
-unsafe fn shortcut_or(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+unsafe fn shortcut_or(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if is_bool(a) {
-        return Ok(Some(bool_descr_or(a, b)));
+        return Ok(bool_descr_or(a, b));
     }
     if is_int(a) {
-        return Ok(Some(int_bitor(a, b)?));
+        return int_bitor(a, b);
     }
-    Ok(None)
+    Ok(w_not_implemented())
 }
 
 #[majit_macros::always_inline_try]
-unsafe fn shortcut_xor(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+unsafe fn shortcut_xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if is_bool(a) {
-        return Ok(Some(bool_descr_xor(a, b)));
+        return Ok(bool_descr_xor(a, b));
     }
     if is_int(a) {
-        return Ok(Some(int_bitxor(a, b)?));
+        return int_bitxor(a, b);
     }
-    Ok(None)
+    Ok(w_not_implemented())
 }
 
 pub fn add(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
@@ -6735,11 +6737,11 @@ pub(crate) fn rshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) 
 
 pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_unoverridden_rpy_type(a, b)
-            && let Some(w_res) = shortcut_and(a, b)?
-            && !is_not_implemented(w_res)
-        {
-            return Ok(w_res);
+        if same_unoverridden_rpy_type(a, b) {
+            let w_res = shortcut_and(a, b)?;
+            if !is_not_implemented(w_res) {
+                return Ok(w_res);
+            }
         }
     }
     and_impl(a, b, "&")
@@ -6810,11 +6812,11 @@ pub(crate) fn unionable(obj: PyObjectRef) -> bool {
 
 pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_unoverridden_rpy_type(a, b)
-            && let Some(w_res) = shortcut_or(a, b)?
-            && !is_not_implemented(w_res)
-        {
-            return Ok(w_res);
+        if same_unoverridden_rpy_type(a, b) {
+            let w_res = shortcut_or(a, b)?;
+            if !is_not_implemented(w_res) {
+                return Ok(w_res);
+            }
         }
     }
     or_impl(a, b, "|")
@@ -6925,11 +6927,11 @@ pub(crate) fn or_impl(a: PyObjectRef, b: PyObjectRef, symbol: &str) -> PyResult 
 
 pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_unoverridden_rpy_type(a, b)
-            && let Some(w_res) = shortcut_xor(a, b)?
-            && !is_not_implemented(w_res)
-        {
-            return Ok(w_res);
+        if same_unoverridden_rpy_type(a, b) {
+            let w_res = shortcut_xor(a, b)?;
+            if !is_not_implemented(w_res) {
+                return Ok(w_res);
+            }
         }
     }
     xor_impl(a, b, "^")

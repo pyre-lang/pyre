@@ -11,6 +11,9 @@
 //! bits, just like a translated 32-bit PyPy.  The upper four bytes are ABI
 //! padding, not an extension of either field.
 
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
 use crate::GcFlags;
 
 /// Number of bits reserved for the type ID in the lower half.
@@ -314,6 +317,188 @@ pub fn alloc_with_gc_header<T>(value: T, type_id: u32) -> *mut T {
     alloc_with_gc_header_flags(value, GcHeader::new(type_id))
 }
 
+/// Dedicated host mapping for [`alloc_with_gc_header_immortal`]. MiniMark's
+/// `get_actual_typeid` reads `HDR.tid` only inside nursery/oldgen
+/// (`incminimark.py` `get_type_id`); a `std::alloc` immortal sits outside
+/// those ranges, so the foreign classptr path would misread a non-object
+/// payload. Birth here makes membership a range test over every published
+/// segment. The typeid still lives on the header. Segments are `std::alloc`
+/// (wasm32 has no mmap). An object never leaves this arena: when the current
+/// segment is full a new one is published. There is no segment-count ceiling
+/// (`incminimark.py` `external_malloc` has none); layout / OS failure returns
+/// null so the caller can raise MemoryError.
+const IMMORTAL_ARENA_FIRST_CAP: usize = 8 * 1024 * 1024;
+const IMMORTAL_ARENA_MAX_SEG_CAP: usize = 64 * 1024 * 1024;
+
+struct ImmortalSegment {
+    /// Segment base, 0 until published with Release.
+    base: AtomicUsize,
+    cap: AtomicUsize,
+    bump: AtomicUsize,
+    next: AtomicPtr<ImmortalSegment>,
+}
+
+struct ImmortalArena {
+    head: AtomicPtr<ImmortalSegment>,
+    /// Last published segment; bump allocation loads this.
+    tail: AtomicPtr<ImmortalSegment>,
+    /// Count of published segments; sizes the next segment, not a ceiling.
+    nseg: AtomicUsize,
+    /// 0/1 grower lock so only one thread publishes the next segment.
+    growing: AtomicUsize,
+}
+
+static IMMORTAL_ARENA: OnceLock<ImmortalArena> = OnceLock::new();
+
+fn immortal_arena() -> &'static ImmortalArena {
+    IMMORTAL_ARENA.get_or_init(|| ImmortalArena {
+        head: AtomicPtr::new(std::ptr::null_mut()),
+        tail: AtomicPtr::new(std::ptr::null_mut()),
+        nseg: AtomicUsize::new(0),
+        growing: AtomicUsize::new(0),
+    })
+}
+
+fn segment_cap_for(idx: usize, min_total: usize) -> usize {
+    let shift = idx.min(3);
+    let mut cap = IMMORTAL_ARENA_FIRST_CAP.saturating_mul(1usize << shift);
+    cap = cap.min(IMMORTAL_ARENA_MAX_SEG_CAP).max(min_total);
+    let align = GcHeader::SIZE;
+    cap.checked_add(align - 1)
+        .map(|n| n & !(align - 1))
+        .unwrap_or(min_total)
+}
+
+impl ImmortalArena {
+    /// Publish one more segment sized for `min_total`. `true` means retry the
+    /// bump (this thread or another published, or another is done growing).
+    /// `false` is a hard failure: invalid layout or OS allocation returned null.
+    fn try_grow(&self, expected_tail: *mut ImmortalSegment, min_total: usize) -> bool {
+        if self
+            .growing
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            while self.growing.load(Ordering::Acquire) != 0 {
+                std::hint::spin_loop();
+            }
+            return true;
+        }
+        let cur = self.tail.load(Ordering::Acquire);
+        if cur != expected_tail {
+            self.growing.store(0, Ordering::Release);
+            return true;
+        }
+        let idx = self.nseg.load(Ordering::Relaxed);
+        let cap = segment_cap_for(idx, min_total);
+        let Some(mem_layout) = std::alloc::Layout::from_size_align(cap, GcHeader::SIZE).ok() else {
+            self.growing.store(0, Ordering::Release);
+            return false;
+        };
+        let mem = unsafe { std::alloc::alloc(mem_layout) };
+        if mem.is_null() {
+            self.growing.store(0, Ordering::Release);
+            return false;
+        }
+        let node_layout = std::alloc::Layout::new::<ImmortalSegment>();
+        let node = unsafe { std::alloc::alloc(node_layout) as *mut ImmortalSegment };
+        if node.is_null() {
+            unsafe { std::alloc::dealloc(mem, mem_layout) };
+            self.growing.store(0, Ordering::Release);
+            return false;
+        }
+        unsafe {
+            node.write(ImmortalSegment {
+                base: AtomicUsize::new(mem as usize),
+                cap: AtomicUsize::new(cap),
+                bump: AtomicUsize::new(0),
+                next: AtomicPtr::new(std::ptr::null_mut()),
+            });
+            if expected_tail.is_null() {
+                self.head.store(node, Ordering::Release);
+            } else {
+                (*expected_tail).next.store(node, Ordering::Release);
+            }
+        }
+        self.tail.store(node, Ordering::Release);
+        self.nseg.store(idx + 1, Ordering::Release);
+        self.growing.store(0, Ordering::Release);
+        true
+    }
+}
+
+fn alloc_immortal_raw(total: usize, align: usize) -> *mut u8 {
+    let arena = immortal_arena();
+    let align = align.max(1);
+    let mask = align - 1;
+    loop {
+        let tail = arena.tail.load(Ordering::Acquire);
+        if tail.is_null() {
+            if !arena.try_grow(std::ptr::null_mut(), total) {
+                return std::ptr::null_mut();
+            }
+            continue;
+        }
+        let seg = unsafe { &*tail };
+        let base = seg.base.load(Ordering::Acquire);
+        if base == 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        let cap = seg.cap.load(Ordering::Relaxed);
+        let off = seg.bump.load(Ordering::Relaxed);
+        let Some(aligned) = off.checked_add(mask).map(|n| n & !mask) else {
+            if !arena.try_grow(tail, total) {
+                return std::ptr::null_mut();
+            }
+            continue;
+        };
+        match aligned.checked_add(total) {
+            Some(next) if next <= cap => {
+                if seg
+                    .bump
+                    .compare_exchange_weak(off, next, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return (base + aligned) as *mut u8;
+                }
+            }
+            _ => {
+                if !arena.try_grow(tail, total) {
+                    return std::ptr::null_mut();
+                }
+            }
+        }
+    }
+}
+
+/// Whether `addr` is a payload from [`alloc_with_gc_header_immortal`]'s arena.
+///
+/// `get_actual_typeid` uses this to read `HDR.tid` for prebuilts that are
+/// not MiniMark nursery/oldgen objects (`w_not_implemented`, process-wide
+/// `DictStrategyRef` holders, interned exact-str wrappers). Checks every
+/// published segment.
+#[inline]
+pub fn is_immortal_header_payload(addr: usize) -> bool {
+    let Some(arena) = IMMORTAL_ARENA.get() else {
+        return false;
+    };
+    let mut p = arena.head.load(Ordering::Acquire);
+    while !p.is_null() {
+        let seg = unsafe { &*p };
+        let base = seg.base.load(Ordering::Acquire);
+        if base != 0 && addr >= base {
+            let off = addr - base;
+            let used = seg.bump.load(Ordering::Acquire);
+            if off >= GcHeader::SIZE && off <= used {
+                return true;
+            }
+        }
+        p = seg.next.load(Ordering::Acquire);
+    }
+    false
+}
+
 /// [`alloc_with_gc_header`] for a genuine immortal leaf — `init_gc_object_immortal`
 /// (`NO_HEAP_PTRS | TRACK_YOUNG_PTRS`), incminimark's prebuilt shape.
 ///
@@ -335,13 +520,30 @@ pub fn alloc_with_gc_header<T>(value: T, type_id: u32) -> *mut T {
 /// never-updated slots into freed memory. See [`alloc_with_gc_header`] for the
 /// measured failure that rule comes from.
 pub fn alloc_with_gc_header_immortal<T>(value: T, type_id: u32) -> *mut T {
-    alloc_with_gc_header_flags(
-        value,
-        GcHeader::with_flags(
-            type_id,
-            crate::GcFlags::GCFLAG_NO_HEAP_PTRS | crate::GcFlags::GCFLAG_TRACK_YOUNG_PTRS,
-        ),
-    )
+    const {
+        assert!(
+            std::mem::align_of::<T>() <= GcHeader::SIZE,
+            "alloc_with_gc_header_immortal: align_of::<T>() exceeds GcHeader::SIZE; the fixed obj - SIZE header offset would misalign the payload",
+        )
+    };
+    let header = GcHeader::with_flags(
+        type_id,
+        crate::GcFlags::GCFLAG_NO_HEAP_PTRS | crate::GcFlags::GCFLAG_TRACK_YOUNG_PTRS,
+    );
+    let Some(total) = GcHeader::SIZE.checked_add(std::mem::size_of::<T>()) else {
+        return std::ptr::null_mut();
+    };
+    let align = std::mem::align_of::<T>().max(GcHeader::SIZE);
+    let raw = alloc_immortal_raw(total, align);
+    if raw.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        (raw as *mut GcHeader).write(header);
+        let ptr = raw.add(GcHeader::SIZE) as *mut T;
+        ptr.write(value);
+        ptr
+    }
 }
 
 /// Varsize analogue of [`alloc_with_gc_header_immortal`].
@@ -351,7 +553,8 @@ pub fn alloc_with_gc_header_immortal<T>(value: T, type_id: u32) -> *mut T {
 /// `incminimark.py`). The returned pointer is the address after the header, so
 /// `{hash, len, chars}` readers stay unchanged. A payload holds no GC pointer,
 /// so it is a true leaf (`GCFLAG_NO_HEAP_PTRS | GCFLAG_TRACK_YOUNG_PTRS`).
-/// Returns null on overflow or allocation failure.
+/// Returns null on payload-size overflow, invalid layout, or OS allocation
+/// failure (`incminimark.py` `external_malloc` raises MemoryError).
 ///
 /// `malloc_varsize` + `init_gc_object_immortal`. Opaque to the tracer so the
 /// dispatcher does not look inside.
@@ -381,15 +584,61 @@ fn alloc_varsize_with_gc_header_immortal_zeroed_flag(
     let Some(layout) = varsize_immortal_layout(payload_size) else {
         return std::ptr::null_mut();
     };
+    let raw = alloc_immortal_raw(layout.size(), layout.align());
+    if raw.is_null() {
+        return std::ptr::null_mut();
+    }
     unsafe {
-        let raw = if zeroed {
+        (raw as *mut GcHeader).write(GcHeader::with_flags(
+            type_id,
+            crate::GcFlags::GCFLAG_NO_HEAP_PTRS | crate::GcFlags::GCFLAG_TRACK_YOUNG_PTRS,
+        ));
+        let payload = raw.add(GcHeader::SIZE);
+        if zeroed {
+            std::ptr::write_bytes(payload, 0, payload_size);
+        }
+        payload
+    }
+}
+
+/// Reclaimable varsize analogue of [`alloc_with_gc_header`].
+///
+/// `rstr.py` `mallocstr` is `malloc(STR, length)` — a GC `malloc_varsize`,
+/// not a prebuilt. Host fallback (no collector / unpublished tid) still
+/// stamps `init_gc_object_immortal` so a write barrier skips the leaf, but
+/// the block is a `std::alloc` payload [`dealloc_varsize_with_gc_header`]
+/// frees. Returns null on overflow, invalid layout, or OS allocation
+/// failure (`external_malloc` MemoryError).
+#[majit_macros::dont_look_inside]
+pub fn alloc_varsize_with_gc_header(payload_size: usize, type_id: u32) -> *mut u8 {
+    alloc_varsize_reclaimable_zeroed_flag(payload_size, type_id, false)
+}
+
+/// [`alloc_varsize_with_gc_header`] with the payload bytes cleared.
+#[majit_macros::dont_look_inside]
+pub fn alloc_varsize_with_gc_header_zeroed(payload_size: usize, type_id: u32) -> *mut u8 {
+    alloc_varsize_reclaimable_zeroed_flag(payload_size, type_id, true)
+}
+
+fn alloc_varsize_reclaimable_zeroed_flag(
+    payload_size: usize,
+    type_id: u32,
+    zeroed: bool,
+) -> *mut u8 {
+    let Some(layout) = varsize_immortal_layout(payload_size) else {
+        return std::ptr::null_mut();
+    };
+    let raw = unsafe {
+        if zeroed {
             std::alloc::alloc_zeroed(layout)
         } else {
             std::alloc::alloc(layout)
-        };
-        if raw.is_null() {
-            return std::ptr::null_mut();
         }
+    };
+    if raw.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
         (raw as *mut GcHeader).write(GcHeader::with_flags(
             type_id,
             crate::GcFlags::GCFLAG_NO_HEAP_PTRS | crate::GcFlags::GCFLAG_TRACK_YOUNG_PTRS,
@@ -398,7 +647,11 @@ fn alloc_varsize_with_gc_header_immortal_zeroed_flag(
     }
 }
 
-/// Free a payload returned by [`alloc_varsize_with_gc_header_immortal`].
+/// Free a payload returned by [`alloc_varsize_with_gc_header`].
+///
+/// Arena payloads from [`alloc_varsize_with_gc_header_immortal`] are
+/// prebuilts (`init_gc_object_immortal`) and are never deallocated. A
+/// reclaimable host `std::alloc` block is freed.
 ///
 /// # Safety
 /// `payload` must be a live pointer from that allocator, and `payload_size`
@@ -408,7 +661,12 @@ pub unsafe fn dealloc_varsize_with_gc_header(payload: GCREF, payload_size: usize
     if payload.is_null() {
         return;
     }
-    let layout = varsize_immortal_layout(payload_size).expect("dealloc_varsize_with_gc_header");
+    if is_immortal_header_payload(payload as usize) {
+        return;
+    }
+    let Some(layout) = varsize_immortal_layout(payload_size) else {
+        return;
+    };
     unsafe { std::alloc::dealloc((payload as *mut u8).sub(GcHeader::SIZE), layout) };
 }
 
@@ -556,6 +814,21 @@ mod tests {
             assert!(!(*hdr).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
             assert!(!(*hdr).has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS));
         }
+        assert!(!is_immortal_header_payload(p as usize));
+    }
+
+    #[test]
+    fn alloc_with_gc_header_immortal_is_an_arena_payload() {
+        let p = alloc_with_gc_header_immortal(0xABCDu64, 0x99);
+        unsafe {
+            assert_eq!(*p, 0xABCD);
+            let hdr = header_of(p as usize);
+            assert_eq!((*hdr).type_id(), 0x99);
+            assert!((*hdr).has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS));
+            assert!((*hdr).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+        }
+        assert!(is_immortal_header_payload(p as usize));
+        assert!(!is_immortal_header_payload(0));
     }
 
     #[test]
@@ -569,7 +842,126 @@ mod tests {
             assert!((*hdr).has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS));
             assert!((*hdr).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
             assert_eq!(*(p as *const u64), 0x1111_2222_3333_4444);
+            assert!(is_immortal_header_payload(p as usize));
             dealloc_varsize_with_gc_header(p.cast(), 16);
+            assert!(
+                is_immortal_header_payload(p as usize),
+                "dealloc must not drop an arena payload"
+            );
+            assert_eq!((*header_of(p as usize)).type_id(), 0x2468);
+        }
+    }
+
+    #[test]
+    fn immortal_arena_grows_across_segments_and_keeps_typeids() {
+        const N: usize = 20;
+        const PAYLOAD: usize = 512 * 1024;
+        let mut ptrs: Vec<(*mut u8, u32)> = Vec::with_capacity(N + 8);
+        for i in 0..N {
+            let tid = 0xB100 + i as u32;
+            let p = alloc_varsize_with_gc_header_immortal(PAYLOAD, tid);
+            assert!(!p.is_null(), "varsize immortal {i}");
+            unsafe {
+                *p = i as u8;
+                assert_eq!((*header_of(p as usize)).type_id(), tid);
+            }
+            assert!(
+                is_immortal_header_payload(p as usize),
+                "varsize {i} must stay in the arena"
+            );
+            ptrs.push((p, tid));
+        }
+        for i in 0..8 {
+            let tid = 0xC100 + i as u32;
+            let p = alloc_with_gc_header_immortal(0xFEEDu64, tid);
+            unsafe {
+                assert_eq!(*p, 0xFEED);
+                assert_eq!((*header_of(p as usize)).type_id(), tid);
+            }
+            assert!(
+                is_immortal_header_payload(p as usize),
+                "fixed {i} must stay in the arena"
+            );
+            ptrs.push((p as *mut u8, tid));
+        }
+        for (p, tid) in &ptrs {
+            assert!(
+                is_immortal_header_payload(*p as usize),
+                "cross-segment payload tid={tid} must remain a member"
+            );
+            unsafe {
+                assert_eq!((*header_of(*p as usize)).type_id(), *tid);
+            }
+        }
+    }
+
+    #[test]
+    fn varsize_allocation_failure_returns_null() {
+        // `GcHeader::SIZE.checked_add` overflow — `external_malloc` MemoryError.
+        assert!(alloc_varsize_with_gc_header_immortal(usize::MAX, 1).is_null());
+        assert!(alloc_varsize_with_gc_header_immortal_zeroed(usize::MAX, 1).is_null());
+        assert!(alloc_varsize_with_gc_header(usize::MAX, 1).is_null());
+        assert!(alloc_varsize_with_gc_header_zeroed(usize::MAX, 1).is_null());
+        // `Layout::from_size_align` rejects size > isize::MAX even when the
+        // usize add succeeds (`external_malloc` overflow / arena_malloc null).
+        let payload = (isize::MAX as usize).saturating_sub(GcHeader::SIZE - 1);
+        assert!(
+            GcHeader::SIZE.checked_add(payload).is_some(),
+            "this path is layout failure, not checked_add overflow"
+        );
+        assert!(alloc_varsize_with_gc_header_immortal(payload, 1).is_null());
+        assert!(alloc_varsize_with_gc_header(payload, 1).is_null());
+    }
+
+    #[test]
+    fn reclaimable_varsize_is_freed_and_is_not_an_arena_member() {
+        let p = alloc_varsize_with_gc_header(16, 0x51);
+        assert!(!p.is_null());
+        unsafe {
+            (p as *mut u64).write(0x1111_2222_3333_4444);
+            let hdr = header_of(p as usize);
+            assert_eq!((*hdr).type_id(), 0x51);
+            assert!((*hdr).has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS));
+            assert!((*hdr).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+        }
+        assert!(
+            !is_immortal_header_payload(p as usize),
+            "mallocstr-style fallback must not land in the never-freed arena"
+        );
+        unsafe {
+            dealloc_varsize_with_gc_header(p.cast(), 16);
+        }
+        let q = alloc_varsize_with_gc_header_zeroed(16, 0x52);
+        assert!(!q.is_null());
+        assert!(!is_immortal_header_payload(q as usize));
+        unsafe {
+            assert_eq!(*(q as *const u64), 0);
+            dealloc_varsize_with_gc_header(q.cast(), 16);
+        }
+    }
+
+    #[test]
+    fn immortal_arena_grows_a_jumbo_segment_without_a_count_ceiling() {
+        // Larger than IMMORTAL_ARENA_MAX_SEG_CAP so `segment_cap_for` uses
+        // `min_total`. A fixed 64-segment table is not a semantic limit;
+        // layout / OS failure is a null return.
+        let payload = IMMORTAL_ARENA_MAX_SEG_CAP + MEMORY_ALIGNMENT;
+        let p = alloc_varsize_with_gc_header_immortal(payload, 0xD1);
+        if p.is_null() {
+            // OS refused a jumbo segment — MemoryError, not a segment-count abort.
+            return;
+        }
+        unsafe {
+            *p = 0xAB;
+            assert_eq!((*header_of(p as usize)).type_id(), 0xD1);
+        }
+        assert!(is_immortal_header_payload(p as usize));
+        unsafe {
+            dealloc_varsize_with_gc_header(p.cast(), payload);
+            assert!(
+                is_immortal_header_payload(p as usize),
+                "dealloc must not drop an arena payload"
+            );
         }
     }
 

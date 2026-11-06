@@ -189,6 +189,23 @@ where
     }
 }
 
+/// `lltype.py` `ann_malloc`: `SomePtr(Ptr(s_T.const))`. `s_T.const` is
+/// the allocated container (`Array` / `Struct`); wrap it in `Ptr`. A
+/// `Ptr` already is that result lltype. Flavor `'raw'` is included —
+/// `history.py` `getkind` of a raw `Ptr` is `'int'` later, at the
+/// codewriter, not here.
+#[allow(non_snake_case)]
+pub fn ann_malloc_result_annotation(TYPE: lltype::LowLevelType) -> SomeValue {
+    match TYPE {
+        lltype::LowLevelType::Ptr(ptr_ty) => SomeValue::Ptr(SomePtr::new(*ptr_ty)),
+        other => {
+            let ptr = lltype::Ptr::from_container_type(other)
+                .unwrap_or_else(|e| panic!("ann_malloc: {e}"));
+            SomeValue::Ptr(SomePtr::new(ptr))
+        }
+    }
+}
+
 /// RPython `ll_to_annotation(v)` (llannotation.py).
 pub fn ll_to_annotation(v: lltype::LowLevelValue) -> SomeValue {
     if let lltype::LowLevelValue::InteriorPtr(ptr) = v {
@@ -1212,6 +1229,41 @@ mod tests {
             panic!("expected SomeInteriorPtr");
         };
         assert_eq!(s_ptr.ll_ptrtype, interior);
+    }
+
+    #[test]
+    fn ann_malloc_result_annotation_is_someptr_of_ptr_type() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, Ptr, PtrTarget, Struct};
+
+        let st = lltype::LowLevelType::Struct(Box::new(Struct::new(
+            "Tuple<i64>",
+            vec![("item0".into(), lltype::LowLevelType::Signed)],
+        )));
+        let SomeValue::Ptr(p) = ann_malloc_result_annotation(st.clone()) else {
+            panic!("ann_malloc of a Struct is SomePtr");
+        };
+        assert_eq!(
+            p.ll_ptrtype,
+            Ptr::from_container_type(st).expect("Struct ptr")
+        );
+        assert!(matches!(p.ll_ptrtype.TO, PtrTarget::Struct(_)));
+
+        let arr = lltype::LowLevelType::Array(Box::new(Array::new(lltype::LowLevelType::Char)));
+        let SomeValue::Ptr(p) = ann_malloc_result_annotation(arr.clone()) else {
+            panic!("ann_malloc of Array(Char) is SomePtr");
+        };
+        assert_eq!(
+            p.ll_ptrtype,
+            Ptr::from_container_type(arr).expect("Array ptr")
+        );
+        assert!(matches!(
+            p.ll_ptrtype.TO,
+            PtrTarget::Array(ref a) if matches!(a.OF, lltype::LowLevelType::Char)
+        ));
+        assert_eq!(
+            crate::model::getkind(&lltype::LowLevelType::Ptr(Box::new(p.ll_ptrtype.clone()))),
+            crate::model::ConcreteType::Signed
+        );
     }
 
     #[test]

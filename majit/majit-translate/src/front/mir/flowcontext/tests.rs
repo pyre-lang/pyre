@@ -198,6 +198,7 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
             &context.struct_field_attrs,
             &struct_fields,
             &context.dont_look_inside,
+            &std::collections::HashSet::new(),
             &context.tombstoned_leaves,
             &context.gc_struct_ids,
             &context.immutable_fields,
@@ -635,16 +636,29 @@ fn result_branch_break_of_infallible_result_builds_err() {
         payloads.break_ty, payloads.err,
         "Result<Infallible, i64> is not banked as i64"
     );
+    let Some(ValueType::Ref(Some(write_owner))) = payloads.break_ty.clone() else {
+        panic!(
+            "Break payload type must be a classed Result, got {:?}",
+            payloads.break_ty
+        );
+    };
     let mut graph = branch_graph(payloads);
     super::lower_result_branch_to_control_flow(&mut graph);
     let mut ctors = Vec::new();
+    let mut err_owners = Vec::new();
     for block in &graph.blocks {
         for op in &block.operations {
             if let OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                target:
+                    CallTarget::SyntheticTransparentCtor {
+                        name, owner_path, ..
+                    },
                 ..
             } = &op.kind
             {
+                if name == "Err" {
+                    err_owners.push(owner_path.join("::"));
+                }
                 ctors.push(name.clone());
             }
         }
@@ -661,6 +675,10 @@ fn result_branch_break_of_infallible_result_builds_err() {
             ValueType::Ref(Some(name)) if name.starts_with("result::Result<")
         )),
         "Break stores the Result value, got {writes:?}"
+    );
+    assert!(
+        err_owners.iter().any(|owner| owner == &write_owner),
+        "Err ctor owner_path must be the Break payload Result, got {err_owners:?} want {write_owner}"
     );
 }
 
@@ -2020,6 +2038,7 @@ fn ordinary_raw_adt_pointer_does_not_stamp_i64_func_result() {
             spec,
             &empty_gc,
             &std::collections::HashSet::<String>::new(),
+            &empty_names,
             &format!(
                 "fixture::{}",
                 fd.item_meta.name_path().rsplit("::").next().unwrap()
@@ -3425,8 +3444,92 @@ fn extract_fmt_chain_recovers_pieces_and_args_cross_block() {
     assert!(extract_fmt_chain(&graph, &pieces_arr).is_none());
 }
 
+/// Call-scoped residual `&T` cell the front emits around `Argument::new_*`
+/// (`address.rs` `RAW_SCALAR_SPILL_OWNER`): RawMalloc + ConstInt(0) +
+/// RawStore of `stored`. The caller emits the `new_*` call and RawFree.
+fn push_call_scoped_fmt_arg_spill(
+    graph: &mut crate::model::FunctionGraph,
+    bb: crate::model::BlockId,
+    stored: crate::flowspace::model::Variable,
+) -> crate::flowspace::model::Variable {
+    use crate::model::{OpKind, SpaceOperation, ValueType};
+    let ptr = crate::flowspace::model::Variable::new();
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: Some(ptr.clone()),
+        kind: OpKind::raw_malloc(super::super::RAW_SCALAR_SPILL_OWNER, false, None),
+    });
+    let offset = crate::flowspace::model::Variable::new();
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: Some(offset.clone()),
+        kind: OpKind::ConstInt(0),
+    });
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: None,
+        kind: OpKind::RawStore {
+            base: ptr.clone(),
+            offset,
+            value: stored,
+            item_ty: ValueType::Int,
+            itemsize: 8,
+            is_item_signed: true,
+        },
+    });
+    ptr
+}
+
+/// Function-scope Char-varsize cell (`RAW_SCALAR_CELL_OWNER`) the front
+/// emits for a residual `&T` of a parameter or field.
+fn push_function_scope_fmt_arg_spill(
+    graph: &mut crate::model::FunctionGraph,
+    bb: crate::model::BlockId,
+    stored: crate::flowspace::model::Variable,
+) -> crate::flowspace::model::Variable {
+    let ptr = super::super::emit_raw_cell_malloc(graph, bb, 8);
+    super::super::emit_raw_cell_store(
+        graph,
+        bb,
+        ptr.clone(),
+        stored,
+        crate::model::ValueType::Int,
+        8,
+        true,
+    );
+    ptr
+}
+
+fn graph_has_raw_cell_ops(graph: &crate::model::FunctionGraph) -> bool {
+    use crate::model::OpKind;
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::RawMalloc { .. }
+                    | OpKind::RawStore { .. }
+                    | OpKind::RawFree { .. }
+                    | OpKind::RawLoad { .. }
+            )
+        })
+    })
+}
+
 fn single_arg_display_fmt_fixture(
     ctx_input_root: Option<&str>,
+) -> (
+    crate::model::FunctionGraph,
+    crate::model::BlockId,
+    crate::model::BlockId,
+    crate::model::BlockId,
+    crate::flowspace::model::Variable,
+    crate::flowspace::model::Variable,
+    crate::flowspace::model::Variable,
+    crate::flowspace::model::Variable,
+) {
+    single_arg_display_fmt_fixture_spill(ctx_input_root, false)
+}
+
+fn single_arg_display_fmt_fixture_spill(
+    ctx_input_root: Option<&str>,
+    char_cell: bool,
 ) -> (
     crate::model::FunctionGraph,
     crate::model::BlockId,
@@ -3489,6 +3592,14 @@ fn single_arg_display_fmt_fixture(
             pure: false,
         },
     });
+    // Residual `&T` spill: FieldRead stored in a per-call `Tuple<i64>`
+    // cell or a function-scope Char-varsize cell; `new_display` receives
+    // the malloc pointer.
+    let spilled = if char_cell {
+        push_function_scope_fmt_arg_spill(&mut graph, b0, arg_ref)
+    } else {
+        push_call_scoped_fmt_arg_spill(&mut graph, b0, arg_ref)
+    };
     let new_display = Variable::new();
     graph.block_mut(b0).operations.push(SpaceOperation {
         result: Some(new_display.clone()),
@@ -3501,9 +3612,13 @@ fn single_arg_display_fmt_fixture(
                 fun_decl_id: None,
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
-            args: crate::model::call_args(vec![arg_ref]),
+            args: crate::model::call_args(vec![spilled.clone()]),
             result_ty: ValueType::Ref(None),
         },
+    });
+    graph.block_mut(b0).operations.push(SpaceOperation {
+        result: None,
+        kind: OpKind::RawFree { ptr: spilled },
     });
     let arg_in = Variable::new();
     graph.block_mut(bp).inputargs = vec![arg_in.clone()];
@@ -3905,6 +4020,594 @@ fn collapse_fmt_chains_expands_lower_hex_to_mod_pct_x() {
     assert!(
         getslice <= 2,
         "hex collapse must not unroll digits: {getslice} __getslice_rangeto"
+    );
+}
+
+fn single_arg_lower_hex_fmt_fixture(
+    piece_bytes: &[i64],
+    spill: bool,
+) -> crate::model::FunctionGraph {
+    use crate::flowspace::model::Variable;
+    use crate::model::{
+        CallTarget, FieldDescriptor, FunctionGraph, Link, LinkArg, OpKind, SpaceOperation,
+        ValueType,
+    };
+
+    let mut graph = FunctionGraph::new("fmt_hex_spill");
+    let b0 = graph.create_block();
+    let bp = graph.create_block();
+    let bf = graph.create_block();
+    let bret = graph.create_block();
+
+    let ctx = Variable::new();
+    graph.block_mut(b0).operations.push(SpaceOperation {
+        result: Some(ctx.clone()),
+        kind: OpKind::Input {
+            name: "n".into(),
+            ty: ValueType::Int,
+            class_root: None,
+        },
+    });
+    let tuple = Variable::new();
+    graph.block_mut(b0).operations.push(SpaceOperation {
+        result: Some(tuple.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::synthetic_transparent_ctor("Tuple<i64>"),
+            args: crate::model::call_args(vec![]),
+            result_ty: ValueType::Ref(Some("Tuple<i64>".to_string())),
+        },
+    });
+    graph.block_mut(b0).operations.push(SpaceOperation {
+        result: None,
+        kind: OpKind::FieldWrite {
+            base: tuple.clone(),
+            field: FieldDescriptor::new("__pos_0", Some("Tuple<i64>".to_string())),
+            value: LinkArg::Value(ctx.clone()),
+            ty: ValueType::Int,
+        },
+    });
+    let arg_ref = Variable::new();
+    graph.block_mut(b0).operations.push(SpaceOperation {
+        result: Some(arg_ref.clone()),
+        kind: OpKind::FieldRead {
+            base: tuple,
+            field: FieldDescriptor::new("__pos_0", Some("Tuple<i64>".to_string())),
+            ty: ValueType::Int,
+            pure: false,
+        },
+    });
+    let new_arg = if spill {
+        push_call_scoped_fmt_arg_spill(&mut graph, b0, arg_ref)
+    } else {
+        arg_ref
+    };
+    let new_lower_hex = Variable::new();
+    graph.block_mut(b0).operations.push(SpaceOperation {
+        result: Some(new_lower_hex.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: ["fmt", "rt", "Argument", "new_lower_hex"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            args: crate::model::call_args(vec![new_arg.clone()]),
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    if spill {
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::RawFree { ptr: new_arg },
+        });
+    }
+    let arg_in = Variable::new();
+    graph.block_mut(bp).inputargs = vec![arg_in.clone()];
+    graph.block_mut(b0).exits =
+        vec![Link::from_variables(&graph, vec![new_lower_hex], bp, None).with_prevblock(b0)];
+
+    let args_arr = Variable::new();
+    graph.block_mut(bp).operations.push(SpaceOperation {
+        result: Some(args_arr.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::synthetic_transparent_ctor("Array"),
+            args: crate::model::call_args(vec![]),
+            result_ty: ValueType::Ref(Some("Array".to_string())),
+        },
+    });
+    graph.block_mut(bp).operations.push(SpaceOperation {
+        result: None,
+        kind: OpKind::FieldWrite {
+            base: args_arr.clone(),
+            field: FieldDescriptor::new("__pos_0", Some("Array".to_string())),
+            value: LinkArg::Value(arg_in.clone()),
+            ty: ValueType::Ref(None),
+        },
+    });
+    let pieces_arr = Variable::new();
+    graph.block_mut(bp).operations.push(SpaceOperation {
+        result: Some(pieces_arr.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::synthetic_transparent_ctor("Array"),
+            args: crate::model::call_args(vec![]),
+            result_ty: ValueType::Ref(Some("Array".to_string())),
+        },
+    });
+    for (i, byte) in piece_bytes.iter().enumerate() {
+        let v = Variable::new();
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: Some(v.clone()),
+            kind: OpKind::ConstInt(*byte),
+        });
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: pieces_arr.clone(),
+                field: FieldDescriptor::new(format!("__pos_{i}"), Some("Array".to_string())),
+                value: LinkArg::Value(v),
+                ty: ValueType::Int,
+            },
+        });
+    }
+    let fmt_args = Variable::new();
+    graph.block_mut(bp).operations.push(SpaceOperation {
+        result: Some(fmt_args.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: ["fmt", "Arguments", "new"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            args: crate::model::call_args(vec![pieces_arr, args_arr]),
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    let fmt_args_in = Variable::new();
+    graph.block_mut(bf).inputargs = vec![fmt_args_in.clone()];
+    graph.block_mut(bp).exits =
+        vec![Link::from_variables(&graph, vec![fmt_args], bf, None).with_prevblock(bp)];
+
+    let formatted = Variable::new();
+    graph.block_mut(bf).operations.push(SpaceOperation {
+        result: Some(formatted.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: ["alloc", "fmt", "format"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            args: crate::model::call_args(vec![fmt_args_in.clone()]),
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    let ret = Variable::new();
+    graph.block_mut(bret).inputargs = vec![ret];
+    graph.block_mut(bf).exits =
+        vec![Link::from_variables(&graph, vec![formatted.clone()], bret, None).with_prevblock(bf)];
+    graph
+}
+
+fn graph_has_fmt_format(graph: &crate::model::FunctionGraph) -> bool {
+    use super::fmt_path_ends_with;
+    use crate::model::{CallTarget, OpKind};
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if fmt_path_ends_with(segments, &["fmt", "format"])
+            )
+        })
+    })
+}
+
+#[test]
+fn collapse_fmt_chains_sees_through_call_scoped_spill() {
+    use super::collapse_fmt_chains;
+    use crate::model::{CallTarget, OpKind};
+
+    // `format!("0x{:x}", n)` with the residual `&T` cell around `&tuple.0`.
+    let mut graph = single_arg_lower_hex_fmt_fixture(&[2, b'0' as i64, b'x' as i64, 0xC0, 0], true);
+    assert!(
+        graph_has_raw_cell_ops(&graph),
+        "fixture must install the call-scoped spill"
+    );
+    collapse_fmt_chains(&mut graph);
+    assert!(
+        !graph_has_fmt_format(&graph),
+        "alloc::fmt::format must be consumed through the spill"
+    );
+    assert!(
+        !graph_has_raw_cell_ops(&graph),
+        "collapsed chain must delete the now-dead RawMalloc/RawStore/RawFree"
+    );
+    let has_pct_x_mod = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            let OpKind::BinOp { op: name, lhs, .. } = &op.kind else {
+                return false;
+            };
+            if name != "mod" {
+                return false;
+            }
+            graph.blocks.iter().any(|b| {
+                b.operations.iter().any(|prod| {
+                    prod.result.as_ref().map(|r| r.id()) == Some(lhs.id())
+                        && matches!(
+                            &prod.kind,
+                            OpKind::Call {
+                                target: CallTarget::FunctionPath { segments, .. },
+                                ..
+                            } if segments.as_slice()
+                                == ["__str_const".to_string(), "%x".to_string()]
+                        )
+                })
+            })
+        })
+    });
+    assert!(
+        has_pct_x_mod,
+        "default-spec {{:x}} must become '%x' % r_uint"
+    );
+}
+
+#[test]
+fn peel_call_scoped_fmt_arg_spill_sees_function_scope_cell() {
+    use super::peel_call_scoped_fmt_arg_spill;
+    use crate::model::{
+        CallTarget, FieldDescriptor, FunctionGraph, Link, LinkArg, OpKind, SpaceOperation,
+        ValueType,
+    };
+
+    let mut graph = FunctionGraph::new("fmt_cell");
+    let b0 = graph.create_block();
+    let b1 = graph.create_block();
+    let tuple = crate::flowspace::model::Variable::new();
+    graph.block_mut(b0).operations.push(SpaceOperation {
+        result: Some(tuple.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::synthetic_transparent_ctor("Tuple"),
+            args: crate::model::call_args(vec![]),
+            result_ty: ValueType::Ref(Some("Tuple".to_string())),
+        },
+    });
+    let ctx = crate::flowspace::model::Variable::new();
+    graph.block_mut(b0).operations.push(SpaceOperation {
+        result: Some(ctx.clone()),
+        kind: OpKind::Input {
+            name: "n".to_string(),
+            ty: ValueType::Int,
+            class_root: None,
+        },
+    });
+    graph.block_mut(b0).operations.push(SpaceOperation {
+        result: None,
+        kind: OpKind::FieldWrite {
+            base: tuple.clone(),
+            field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+            value: LinkArg::Value(ctx.clone()),
+            ty: ValueType::Int,
+        },
+    });
+    let arg_ref = crate::flowspace::model::Variable::new();
+    graph.block_mut(b0).operations.push(SpaceOperation {
+        result: Some(arg_ref.clone()),
+        kind: OpKind::FieldRead {
+            base: tuple,
+            field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+            ty: ValueType::Int,
+            pure: false,
+        },
+    });
+    let spilled = push_function_scope_fmt_arg_spill(&mut graph, b0, arg_ref.clone());
+    let new_display = crate::flowspace::model::Variable::new();
+    graph.block_mut(b0).operations.push(SpaceOperation {
+        result: Some(new_display.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: ["fmt", "rt", "Argument", "new_display"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            args: crate::model::call_args(vec![spilled.clone()]),
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    let spill_in = crate::flowspace::model::Variable::new();
+    graph.block_mut(b1).inputargs = vec![spill_in.clone()];
+    graph.block_mut(b0).exits =
+        vec![Link::from_variables(&graph, vec![spilled.clone()], b1, None).with_prevblock(b0)];
+    graph.block_mut(b1).operations.push(SpaceOperation {
+        result: None,
+        kind: OpKind::RawFree {
+            ptr: spill_in.clone(),
+        },
+    });
+
+    let (field_read, extra_dead) = peel_call_scoped_fmt_arg_spill(&graph, &spilled)
+        .expect("function-scope Char-varsize cell is a recognized fmt spill");
+    assert_eq!(field_read.id(), arg_ref.id());
+    assert!(
+        extra_dead.contains(&spilled.id()),
+        "peel marks the malloc pointer dead"
+    );
+    let (from_slot, _) = peel_call_scoped_fmt_arg_spill(&graph, &spill_in)
+        .expect("extra-slot inputarg of a later block names the same cell");
+    assert_eq!(from_slot.id(), arg_ref.id());
+}
+
+#[test]
+fn peel_call_scoped_fmt_arg_spill_sees_join_phi_cell() {
+    use super::{peel_call_scoped_fmt_arg_spill, resolve_to_producer_op};
+    use crate::model::{
+        CallTarget, FieldDescriptor, FunctionGraph, Link, LinkArg, OpKind, SpaceOperation,
+        ValueType,
+    };
+
+    let mut graph = FunctionGraph::new("fmt_join_phi_cell");
+    let alloc_bb = graph.create_block();
+    let ok_bb = graph.create_block();
+    let err_bb = graph.create_block();
+    let join_bb = graph.create_block();
+    let drop_bb = graph.create_block();
+
+    let tuple = crate::flowspace::model::Variable::new();
+    graph.block_mut(alloc_bb).operations.push(SpaceOperation {
+        result: Some(tuple.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::synthetic_transparent_ctor("Tuple"),
+            args: crate::model::call_args(vec![]),
+            result_ty: ValueType::Ref(Some("Tuple".to_string())),
+        },
+    });
+    let ctx = crate::flowspace::model::Variable::new();
+    graph.block_mut(alloc_bb).operations.push(SpaceOperation {
+        result: Some(ctx.clone()),
+        kind: OpKind::Input {
+            name: "n".to_string(),
+            ty: ValueType::Int,
+            class_root: None,
+        },
+    });
+    graph.block_mut(alloc_bb).operations.push(SpaceOperation {
+        result: None,
+        kind: OpKind::FieldWrite {
+            base: tuple.clone(),
+            field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+            value: LinkArg::Value(ctx.clone()),
+            ty: ValueType::Int,
+        },
+    });
+    let arg_ref = crate::flowspace::model::Variable::new();
+    graph.block_mut(alloc_bb).operations.push(SpaceOperation {
+        result: Some(arg_ref.clone()),
+        kind: OpKind::FieldRead {
+            base: tuple,
+            field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+            ty: ValueType::Int,
+            pure: false,
+        },
+    });
+    let spilled = push_function_scope_fmt_arg_spill(&mut graph, alloc_bb, arg_ref.clone());
+
+    let ok_h = crate::flowspace::model::Variable::new();
+    graph.block_mut(ok_bb).inputargs = vec![ok_h.clone()];
+    let err_h = crate::flowspace::model::Variable::new();
+    graph.block_mut(err_bb).inputargs = vec![err_h.clone()];
+    let join_h = crate::flowspace::model::Variable::new();
+    graph.block_mut(join_bb).inputargs = vec![join_h.clone()];
+    let drop_h = crate::flowspace::model::Variable::new();
+    graph.block_mut(drop_bb).inputargs = vec![drop_h.clone()];
+
+    graph.block_mut(alloc_bb).exits = vec![
+        Link::from_variables(&graph, vec![spilled.clone()], ok_bb, None).with_prevblock(alloc_bb),
+        Link::from_variables(&graph, vec![spilled.clone()], err_bb, None).with_prevblock(alloc_bb),
+    ];
+    graph.block_mut(ok_bb).exits =
+        vec![Link::from_variables(&graph, vec![ok_h.clone()], join_bb, None).with_prevblock(ok_bb)];
+    graph.block_mut(err_bb).exits = vec![
+        Link::from_variables(&graph, vec![err_h.clone()], join_bb, None).with_prevblock(err_bb),
+    ];
+    graph.block_mut(join_bb).exits = vec![
+        Link::from_variables(&graph, vec![join_h.clone()], drop_bb, None).with_prevblock(join_bb),
+    ];
+    graph.block_mut(join_bb).operations.push(SpaceOperation {
+        result: None,
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: ["fmt", "rt", "Argument", "new_display"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            args: crate::model::call_args(vec![join_h.clone()]),
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    graph.block_mut(drop_bb).operations.push(SpaceOperation {
+        result: None,
+        kind: OpKind::RawFree { ptr: drop_h },
+    });
+
+    assert_eq!(resolve_to_producer_op(&graph, &join_h), None);
+    let (field_read, extra_dead) = peel_call_scoped_fmt_arg_spill(&graph, &join_h)
+        .expect("join-phi extra slot names the function-scope Char-varsize cell");
+    assert_eq!(field_read.id(), arg_ref.id());
+    assert!(
+        extra_dead.contains(&spilled.id()),
+        "peel marks the malloc pointer dead"
+    );
+}
+
+#[test]
+fn peel_call_scoped_fmt_arg_spill_sees_loop_carried_cell() {
+    use super::{peel_call_scoped_fmt_arg_spill, resolve_to_producer_op};
+    use crate::model::{
+        CallTarget, FieldDescriptor, FunctionGraph, Link, LinkArg, OpKind, SpaceOperation,
+        ValueType,
+    };
+
+    let mut graph = FunctionGraph::new("fmt_loop_cell");
+    let latch_bb = graph.create_block();
+    let alloc_bb = graph.create_block();
+    let header_bb = graph.create_block();
+    let drop_bb = graph.create_block();
+
+    let tuple = crate::flowspace::model::Variable::new();
+    graph.block_mut(alloc_bb).operations.push(SpaceOperation {
+        result: Some(tuple.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::synthetic_transparent_ctor("Tuple"),
+            args: crate::model::call_args(vec![]),
+            result_ty: ValueType::Ref(Some("Tuple".to_string())),
+        },
+    });
+    let ctx = crate::flowspace::model::Variable::new();
+    graph.block_mut(alloc_bb).operations.push(SpaceOperation {
+        result: Some(ctx.clone()),
+        kind: OpKind::Input {
+            name: "n".to_string(),
+            ty: ValueType::Int,
+            class_root: None,
+        },
+    });
+    graph.block_mut(alloc_bb).operations.push(SpaceOperation {
+        result: None,
+        kind: OpKind::FieldWrite {
+            base: tuple.clone(),
+            field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+            ty: ValueType::Int,
+            value: LinkArg::Value(ctx.clone()),
+        },
+    });
+    let arg_ref = crate::flowspace::model::Variable::new();
+    graph.block_mut(alloc_bb).operations.push(SpaceOperation {
+        result: Some(arg_ref.clone()),
+        kind: OpKind::FieldRead {
+            base: tuple,
+            field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+            ty: ValueType::Int,
+            pure: false,
+        },
+    });
+    let spilled = push_function_scope_fmt_arg_spill(&mut graph, alloc_bb, arg_ref.clone());
+
+    let carried = crate::flowspace::model::Variable::new();
+    graph.block_mut(header_bb).inputargs = vec![carried.clone()];
+    let latch_h = crate::flowspace::model::Variable::new();
+    graph.block_mut(latch_bb).inputargs = vec![latch_h.clone()];
+    let drop_h = crate::flowspace::model::Variable::new();
+    graph.block_mut(drop_bb).inputargs = vec![drop_h.clone()];
+
+    graph.block_mut(latch_bb).exits = vec![
+        Link::from_variables(&graph, vec![latch_h.clone()], header_bb, None)
+            .with_prevblock(latch_bb),
+    ];
+    graph.block_mut(alloc_bb).exits = vec![
+        Link::from_variables(&graph, vec![spilled.clone()], header_bb, None)
+            .with_prevblock(alloc_bb),
+    ];
+    graph.block_mut(header_bb).exits = vec![
+        Link::from_variables(&graph, vec![carried.clone()], latch_bb, None)
+            .with_prevblock(header_bb),
+        Link::from_variables(&graph, vec![carried.clone()], drop_bb, None)
+            .with_prevblock(header_bb),
+    ];
+    graph.block_mut(header_bb).operations.push(SpaceOperation {
+        result: None,
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: ["fmt", "rt", "Argument", "new_display"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            args: crate::model::call_args(vec![carried.clone()]),
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    graph.block_mut(drop_bb).operations.push(SpaceOperation {
+        result: None,
+        kind: OpKind::RawFree { ptr: drop_h },
+    });
+
+    assert_eq!(resolve_to_producer_op(&graph, &carried), None);
+    let (field_read, extra_dead) = peel_call_scoped_fmt_arg_spill(&graph, &carried)
+        .expect("loop-carried extra slot names the function-scope Char-varsize cell");
+    assert_eq!(field_read.id(), arg_ref.id());
+    assert!(
+        extra_dead.contains(&spilled.id()),
+        "peel marks the malloc pointer dead"
+    );
+}
+
+#[test]
+fn collapse_fmt_chains_sees_through_function_scope_char_cell() {
+    use super::collapse_fmt_chains;
+
+    let (mut graph, _, _, _, _, _, _, _) = single_arg_display_fmt_fixture_spill(None, true);
+    assert!(
+        graph_has_raw_cell_ops(&graph),
+        "fixture must install the function-scope cell"
+    );
+    collapse_fmt_chains(&mut graph);
+    assert!(
+        !graph_has_fmt_format(&graph),
+        "alloc::fmt::format must be consumed through the Char-varsize cell"
+    );
+    assert!(
+        !graph_has_raw_cell_ops(&graph),
+        "collapsed chain must delete the now-dead RawMalloc/RawStore/RawFree"
+    );
+}
+
+#[test]
+fn collapse_fmt_chains_keeps_spill_when_chain_does_not_collapse() {
+    use super::collapse_fmt_chains;
+    use crate::model::OpKind;
+
+    // Non-default `{:4x}`: navigate peels the spill, both collapsers decline,
+    // residual `&T` keeps the cell.
+    let mut graph = single_arg_lower_hex_fmt_fixture(&[0xC2, 4, 0, 0], true);
+    assert!(
+        graph_has_raw_cell_ops(&graph),
+        "fixture must install the call-scoped spill"
+    );
+    collapse_fmt_chains(&mut graph);
+    assert!(
+        graph_has_fmt_format(&graph),
+        "non-default placeholder must stay residual"
+    );
+    assert!(
+        graph_has_raw_cell_ops(&graph),
+        "residual Argument::new_lower_hex must keep its call-scoped cell"
+    );
+    assert!(
+        graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::RawMalloc { owner, .. } if owner == super::super::RAW_SCALAR_SPILL_OWNER
+                )
+            })
+        }),
+        "spill owner Tuple<i64> must remain"
     );
 }
 
@@ -6146,33 +6849,66 @@ fn w_module_dict_setitem_str_internal_calls_inherent_setitem_str() {
     crate::test_support::with_lowering(llbc, |context| {
         let graph =
             super::lower_fun_decl(context, fd).expect("lower w_module_dict_setitem_str_internal");
-        let mut bindings = Vec::new();
-        for op in graph_ops(&graph) {
-            let OpKind::Call { target, .. } = &op.kind else {
-                continue;
-            };
-            match target {
-                CallTarget::Method {
-                    name,
-                    resolved_path,
-                    fun_decl_id,
-                    ..
-                } if name == "setitem_str" => bindings.push((
-                    *fun_decl_id,
-                    resolved_path
-                        .as_ref()
-                        .map(|p| p.segments.clone())
-                        .unwrap_or_default(),
-                )),
-                CallTarget::FunctionPath {
-                    segments,
-                    fun_decl_id,
-                    ..
-                } if segments.last().map(String::as_str) == Some("setitem_str") => {
-                    bindings.push((*fun_decl_id, segments.clone()))
+        let collect_setitem_str = |graph: &crate::model::FunctionGraph| {
+            let mut bindings = Vec::new();
+            for op in graph_ops(graph) {
+                let OpKind::Call { target, .. } = &op.kind else {
+                    continue;
+                };
+                match target {
+                    CallTarget::Method {
+                        name,
+                        resolved_path,
+                        fun_decl_id,
+                        ..
+                    } if name == "setitem_str" => bindings.push((
+                        *fun_decl_id,
+                        resolved_path
+                            .as_ref()
+                            .map(|p| p.segments.clone())
+                            .unwrap_or_default(),
+                    )),
+                    CallTarget::FunctionPath {
+                        segments,
+                        fun_decl_id,
+                        ..
+                    } if segments.last().map(String::as_str) == Some("setitem_str") => {
+                        bindings.push((*fun_decl_id, segments.clone()))
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+            bindings
+        };
+        let mut bindings = collect_setitem_str(&graph);
+        // The module arm is a same-crate helper so the object-strategy arm
+        // stays the only collecting path. Follow that helper when rustc
+        // leaves it as a call.
+        if bindings.is_empty() {
+            let helper_id = graph_ops(&graph).iter().find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target:
+                        CallTarget::FunctionPath {
+                            segments,
+                            fun_decl_id,
+                            ..
+                        },
+                    ..
+                } if segments.last().map(String::as_str)
+                    == Some("w_module_dict_setitem_str_module_strategy") =>
+                {
+                    *fun_decl_id
+                }
+                _ => None,
+            });
+            let helper_id = helper_id
+                .expect("module-dict store must call setitem_str or the module-strategy helper");
+            let helper = llbc
+                .fn_by_id(helper_id)
+                .expect("w_module_dict_setitem_str_module_strategy FunDecl");
+            let helper_graph = super::lower_fun_decl(context, helper)
+                .expect("lower w_module_dict_setitem_str_module_strategy");
+            bindings = collect_setitem_str(&helper_graph);
         }
         assert!(
             !bindings.is_empty(),

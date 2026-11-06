@@ -1642,6 +1642,36 @@ fn catch_exception(target: usize) -> Vec<u8> {
     ]
 }
 
+/// A look_inside_iff wrapper catch is `reraise`. That is
+/// `finishframe_exception` propagating, not `descr_pow`'s except arm.
+#[test]
+fn a_reraise_catch_is_not_a_helper_handler() {
+    let mut code = live();
+    let reraise_at = code.len() + 4;
+    code.extend(catch_exception(reraise_at));
+    assert_eq!(code.len(), reraise_at);
+    code.push(
+        *insns_opname_to_byte()
+            .get("reraise/")
+            .expect("`reraise/` must be in insns table"),
+    );
+    let target = super::find_catch_for_exc_resume(&code, 0).expect("catch sits after live");
+    assert_eq!(target, reraise_at);
+    assert!(
+        super::catch_body_is_reraise(&code, target),
+        "wrapper catch is reraise"
+    );
+    let mut handled = live();
+    let handler = handled.len() + 4;
+    handled.extend(catch_exception(handler));
+    handled.extend(void_return());
+    let target = super::find_catch_for_exc_resume(&handled, 0).expect("handler catch");
+    assert!(
+        !super::catch_body_is_reraise(&handled, target),
+        "a void-return except arm is a handler"
+    );
+}
+
 /// A raise caught in this frame is not a frame exit.  `finishframe_lookahead_at`
 /// skips the `live/` and takes the `catch_exception/L` behind it, so the handler
 /// runs forward over bytes no fallthrough reaches — treating the raise as
@@ -6773,6 +6803,106 @@ fn with_hint_walk_context<R>(
     result
 }
 
+/// A portal helper's success-path guards resume at the CALL (`entry_py_pc`).
+/// `pyjitpl.py capture_resumedata` numbers only the `MIFrame`s already on
+/// `metainterp.framestack`; a residual call does not push one. Numbering a
+/// call-entry section here made FBW walk the helper during the Python loop
+/// body and drop FOR_ITER items (`reversed_disabled`).
+#[test]
+fn portal_helper_call_result_does_not_number_a_call_entry_section() {
+    use pyre_interpreter::{compile_exec, w_code_get_ptr, w_code_new};
+
+    let code = compile_exec("None").expect("test code should compile");
+    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
+    let raw_code = unsafe {
+        w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const pyre_interpreter::CodeObject
+    };
+    let mut builder = majit_metainterp::JitCodeBuilder::default();
+    let live_patch = builder.live_placeholder();
+    builder.patch_live_offset(live_patch, 0);
+    let mut insns = indexmap::IndexMap::new();
+    insns.insert(
+        "live/".to_string(),
+        majit_metainterp::jitcode::insns::BC_LIVE,
+    );
+    crate::assembler::publish_state(&insns, &[0, 0, 0], 3, 1);
+    let mut pyjit = crate::PyJitCode::skeleton(raw_code);
+    pyjit.jitcode = std::sync::Arc::new(builder.finish());
+    pyjit.metadata.is_drained = true;
+    pyjit.metadata.forward_py_pc_marker_by_jit_pc = vec![(0, 0)];
+    let installed = crate::state::install_jitcode_for(w_code, std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    assert!(!installed.is_null());
+    let jitcode_index = unsafe { (*installed).index } as u32;
+
+    let mut tc = fresh_trace_ctx();
+    let mut regs_r: [OpRef; 0] = [];
+    let mut concrete_r: [ConcreteValue; 0] = [];
+    let mut regs_i: [OpRef; 0] = [];
+    let mut concrete_i: [ConcreteValue; 0] = [];
+    let mut regs_f: [OpRef; 0] = [];
+    let descr_pool: [DescrRef; 0] = [];
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut regs_i,
+        &mut concrete_i,
+        &mut regs_f,
+        &descr_pool,
+        |wc| {
+            assert!(
+                !wc.fbw_mode.inline_subwalk,
+                "fixture premise: root portal walk"
+            );
+            // `compute_inline_caller_frame` cannot pause past the call
+            // (`w_code == 0` has no nested PyCode), but
+            // `compute_inline_helper_call_entry_frame` would return this
+            // Python parent. The removed portal numbering used that
+            // fallback to push a section.
+            wc.session.borrow_mut().framestack.push(InlineFrame {
+                is_portal: false,
+                w_code: 0,
+                is_being_profiled: false,
+                recursion_greenkey: false,
+                call_id: 0,
+                debug_merge_point_py_pc: None,
+                parents: vec![InlineParentFrame {
+                    jitcode_index,
+                    call_jitcode_pc: None,
+                    call_pc: Some(0),
+                    resume_pc: Some(0),
+                    call_stack_overrides: Vec::new(),
+                    blackhole: None,
+                    resume_coord: ParentResumeCoord::Backxlat(0),
+                    resume_marker_jit_pc: Some(0),
+                    boxes: Vec::new(),
+                    registers_r: None,
+                    registers_i: None,
+                    registers_f: None,
+                    frame_state: None,
+                    caller_py_pc: None,
+                    result_slot: CallResultSlot::Unknown,
+                }],
+                entry_executed_effects: 0,
+                entry_heap_writing_effects: 0,
+                entry_journal_mark: fbw_effect_journal_mark(),
+                helper_resume: HelperResume::Section,
+                helper_call_entry: HelperCallEntry::Unavailable,
+                helper_entry_array_len: None,
+                entry_trace_index: 0,
+                live: None,
+            });
+            let level = helper_subwalk_level(wc, 0, HelperReturn::CallResult)
+                .expect("portal helper CallResult is Ok");
+            assert!(
+                level.is_none(),
+                "capture_resumedata numbers only framestack MIFrames; a portal helper stays at the CALL"
+            );
+        },
+    );
+}
+
 #[test]
 fn assert_not_none_records_when_the_operand_has_a_concrete() {
     let byte = *insns_opname_to_byte()
@@ -7236,6 +7366,49 @@ fn goto_if_not_ptr_nonzero_guards_nonnull_and_falls_through() {
     assert!(
         tc.heap_cache().is_nullity_known(operand),
         "the nullity must be stamped into the heapcache"
+    );
+}
+
+#[test]
+fn goto_if_not_ptr_iszero_records_no_guard_when_nullity_is_already_known() {
+    // FOR_ITER's GuardNonnull stamps heapcache.nullity_now_known; a later
+    // inlined `goto_if_not_ptr_iszero` of the same box must not record
+    // another guard (`pyjitpl.py` `_establish_nullity`).
+    let nonzero = *insns_opname_to_byte()
+        .get("goto_if_not_ptr_nonzero/rL")
+        .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
+    let iszero = *insns_opname_to_byte()
+        .get("goto_if_not_ptr_iszero/rL")
+        .expect("`goto_if_not_ptr_iszero/rL` must be in insns table");
+    let mut tc = fresh_trace_ctx();
+    let operand = dummy_ptr_eq_box(&mut tc);
+    let mut regs_r = [operand];
+    let mut concrete_r = [ConcreteValue::Ref(
+        0xdead_beef_usize as *mut pyre_object::pyobject::PyObject,
+    )];
+    run_hint_step(
+        &[nonzero, 0x00, 0x09, 0x00, 0x00],
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut [],
+    )
+    .expect("first nonnull test records the guard");
+    assert!(tc.heap_cache().is_nullity_known(operand));
+    let after_first = tc.num_ops();
+    let (outcome, _) = run_hint_step(
+        &[iszero, 0x00, 0x09, 0x00, 0x00],
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut [],
+    )
+    .expect("second null test of a known box must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(
+        tc.num_ops(),
+        after_first,
+        "a known-nullity box must not record a second guard"
     );
 }
 
@@ -22667,6 +22840,100 @@ fn helper_abort_resume_pc_prefers_published_live_after() {
     fbw_store_journal_reset();
 }
 
+/// `residual_call_refused_up_front` declines may-force residuals inside a
+/// transparent helper before `execute_varargs`. EF_CAN_RAISE CallR still
+/// executes (`do_residual_call`); refusing it residualizes list-iterator
+/// `descr_next` and drops `for_iter_list_fold` `hot_setstate_sentinel`.
+/// A trampoline that calls back into Python is `jit_may_force` so this
+/// refuse catches it (`dict_eq_hook` `hash_w_hooked` / `eq_w_hooked`).
+fn residual_call_refused_up_front_probe(
+    opcode: majit_ir::OpCode,
+    extra: majit_ir::ExtraEffect,
+    inline_subwalk: bool,
+    transparent_helper_subwalk: bool,
+) -> Option<(&'static str, i64, i64)> {
+    let mut tc = fresh_trace_ctx();
+    let addr = pyre_interpreter::residual_word_addr!(2, add2_for_walker_test,) as i64;
+    let funcbox = tc.const_int(addr);
+    let allboxes = [funcbox];
+    let descr = make_call_descr(90, vec![], Type::Int, extra);
+    let call_descr = descr.as_call_descr().expect("CallDescr");
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
+    let wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            inline_subwalk,
+            transparent_helper_subwalk,
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    residual_call_refused_up_front(&wc, opcode, &allboxes, call_descr)
+}
+
+#[test]
+fn residual_call_refused_up_front_declines_may_force_not_can_raise_in_transparent_helper() {
+    let can_raise = residual_call_refused_up_front_probe(
+        majit_ir::OpCode::CallR,
+        majit_ir::ExtraEffect::CanRaise,
+        true,
+        true,
+    );
+    assert_eq!(
+        can_raise, None,
+        "CanRaise CallR still executes; Python-callback trampolines are jit_may_force"
+    );
+    let cannot_raise = residual_call_refused_up_front_probe(
+        majit_ir::OpCode::CallR,
+        majit_ir::ExtraEffect::CannotRaise,
+        true,
+        true,
+    );
+    assert_eq!(cannot_raise, None, "CannotRaise CallR still executes");
+    let may_force = residual_call_refused_up_front_probe(
+        majit_ir::OpCode::CallMayForceI,
+        majit_ir::ExtraEffect::RandomEffects,
+        true,
+        true,
+    );
+    assert!(
+        matches!(may_force, Some(("may-force-in-transparent-helper", _, 0))),
+        "CallMayForce inside a transparent helper stays declined: {may_force:?}"
+    );
+}
+
 /// CHANGE 3 (d): a failed ancestor splice is not a latch.
 /// `convert_and_run_from_pyjitpl` (`blackhole.py`) copies every
 /// framestack level; an image missing ancestor helpers resumes the
@@ -23796,6 +24063,48 @@ fn nested_binop_rewind_refuse_does_not_claim_the_abort_coordinate() {
     drop(wc);
     fbw_store_journal_reset();
     reset_single_frame_blackhole();
+}
+
+/// Capture-only overlay must not replace last_exc with a hole ConstPtr(NULL).
+///
+/// `collect_outer_active_boxes` / `reseed_vstack_from_shadow` already treat
+/// that encoding as unwritten; overlaying it onto `_opimpl_setarrayitem_vable`
+/// last_exc is what made `bhimpl_raise` see a null ref register.
+#[test]
+fn vstack_overlay_does_not_clobber_last_exc_with_const_null() {
+    let last_exc = OpRef::const_ptr(majit_ir::GcRef(0x1000));
+    let hole = OpRef::const_ptr(majit_ir::GcRef::NULL);
+    let live = OpRef::const_ptr(majit_ir::GcRef(0x2000));
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(hole, Some(last_exc), false),
+        None,
+        "Const NULL must not overwrite a live last_exc box"
+    );
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(hole, Some(last_exc), true),
+        Some(hole),
+        "CALL self_or_null still overwrites when the slot stored live NULL"
+    );
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(hole, Some(hole), false),
+        Some(hole)
+    );
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(hole, None, false),
+        Some(hole)
+    );
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(hole, Some(OpRef::NONE), false),
+        Some(hole)
+    );
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(live, Some(last_exc), false),
+        Some(live)
+    );
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(OpRef::NONE, Some(last_exc), false),
+        None
+    );
 }
 
 #[test]
@@ -31030,7 +31339,6 @@ fn exception_string_override_straight_line_accepts_load_fast_unbound_check() {
         "goto src must be the getarrayitem_vable_r dest"
     );
 }
-
 /// `fbw_strict_fold_frame_reg` still writes the live frame / callee shadow,
 /// but `_opimpl_setfield_vable` (`pyjitpl.py`) always stores
 /// `virtualizable_boxes[index] = valuebox` for the standard virtualizable.
@@ -31135,4 +31443,219 @@ fn setfield_vable_i_imm_fold_frame_updates_vsd_box() {
         "standard-vable fold arm must store the immediate in virtualizable_boxes"
     );
     assert_eq!(ops_after, ops_before, "the fold still elides SETFIELD_GC");
+}
+
+/// Portal jitcode pops before the helper CALL. Helper-entry mirroring then
+/// rewrites `valuestackdepth` to the opcode-entry image for guard snapshots.
+/// The abort-point pair recorded on the paused portal `LiveFrameRegs` is
+/// what a ForceQuasiImmutable latch must publish (`_copy_data_from_miframe`).
+#[test]
+fn paused_portal_mirror_uses_abort_point_not_entry_vstack() {
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let nlocals = 2usize;
+    let array_len = 5usize;
+    let vsd_idx = info
+        .static_field_index_by_name("valuestackdepth")
+        .expect("valuestackdepth is a static vable field");
+    let last_idx = info
+        .static_field_index_by_name("last_instr")
+        .expect("last_instr is a static vable field");
+    let nstatic = info.num_static_extra_boxes;
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let vable = tc.const_ref(1);
+    let iter = tc.const_ref(0xA11);
+    let companion = tc.const_null();
+    let leftover_tos = tc.const_ref(0xDEAD);
+    let local0 = tc.const_ref(0x10);
+    let local1 = tc.const_ref(0x20);
+    let mut boxes = vec![tc.const_null(); nstatic + array_len];
+    let mut values = vec![Value::Ref(majit_ir::GcRef::NULL); nstatic + array_len];
+    boxes[last_idx] = tc.const_int(7);
+    values[last_idx] = Value::Int(7);
+    boxes[vsd_idx] = tc.const_int(4);
+    values[vsd_idx] = Value::Int(4);
+    boxes[nstatic] = local0;
+    values[nstatic] = Value::Ref(majit_ir::GcRef(0x10));
+    boxes[nstatic + 1] = local1;
+    values[nstatic + 1] = Value::Ref(majit_ir::GcRef(0x20));
+    boxes[nstatic + 2] = iter;
+    values[nstatic + 2] = Value::Ref(majit_ir::GcRef(0xA11));
+    boxes[nstatic + 3] = companion;
+    values[nstatic + 3] = Value::Ref(majit_ir::GcRef::NULL);
+    boxes[nstatic + 4] = leftover_tos;
+    values[nstatic + 4] = Value::Ref(majit_ir::GcRef(0xDEAD));
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        vable,
+        Value::Ref(majit_ir::GcRef(1)),
+        &boxes,
+        &values,
+        &[array_len],
+    );
+
+    let mut snapshot_sym = crate::state::PyreSym::new_uninit(OpRef::NONE);
+    snapshot_sym.nlocals = nlocals;
+    let mut mode = test_fbw_mode();
+    mode.snapshot_sym = &snapshot_sym;
+    mode.inline_caller_py_pc = Some(12);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let stale_entry = vec![OpRef::NONE, leftover_tos, leftover_tos];
+    let frame_state = WalkFrameState::new(WalkFrameStateData {
+        vstack_boxes: stale_entry,
+        ..Default::default()
+    });
+    let regs_r = RegisterBank::default();
+    let regs_i = RegisterBank::default();
+    let regs_f = RegisterBank::default();
+    let mut portal = InlineFrame::portal();
+    portal.live = Some(LiveFrameRegs::new(&regs_r, &regs_i, &regs_f, &frame_state));
+    session.borrow_mut().framestack.push(portal);
+    super::vable_ops::record_paused_portal_abort_point(&session, &tc);
+    // Helper-entry mirroring: opcode-entry `valuestackdepth` (nlocals + 3).
+    let entry_vsd = tc.const_int(5);
+    tc.set_virtualizable_entry_at(vsd_idx, entry_vsd, Value::Int(5));
+    let wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &regs_r,
+        registers_i: &regs_i,
+        registers_f: &regs_f,
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let mirror = capture_paused_portal_mirror_stack(&wc, "test-vable-abort")
+        .expect("paused portal publishes the abort-point stack");
+    drop(wc);
+    std::hint::black_box(&mut snapshot_sym);
+    assert_eq!(mirror.py_pc, 12);
+    assert_eq!(mirror.valuestackdepth, Some(4));
+    assert_eq!(mirror.last_instr, Some(7));
+    assert_eq!(
+        mirror.slots.iter().map(|&p| p as usize).collect::<Vec<_>>(),
+        vec![0xA11, 0],
+        "opcode-entry vstack_boxes (TOS present) must not win over the abort-point",
+    );
+}
+
+/// Portal jitcode stores `setfield_vable_i_imm` as a PerFn `VableField`.
+/// `vable_field_descr` maps that index through the active vinfo so
+/// `_opimpl_setfield_vable` writes `virtualizable_boxes`.
+#[test]
+fn setfield_vable_int_imm_perfn_vablefield_updates_valuestackdepth_boxes() {
+    assert_perfn_vablefield_updates_valuestackdepth_boxes(false);
+    assert_perfn_vablefield_updates_valuestackdepth_boxes(true);
+}
+
+fn assert_perfn_vablefield_updates_valuestackdepth_boxes(own_frame: bool) {
+    use majit_jitcode::jitcode::BhDescr;
+    use majit_metainterp::jitcode::RuntimeBhDescr;
+
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let vsd_idx = info
+        .static_field_index_by_name("valuestackdepth")
+        .expect("valuestackdepth is a static vable field");
+    let nstatic = info.num_static_extra_boxes;
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let standard = OpRef::input_arg_ref(0);
+    let mut boxes = vec![tc.const_null(); nstatic];
+    let mut values = vec![Value::Ref(majit_ir::GcRef::NULL); nstatic];
+    boxes[vsd_idx] = tc.const_int(3);
+    values[vsd_idx] = Value::Int(3);
+    tc.init_virtualizable_boxes(
+        &info,
+        standard,
+        Value::Ref(majit_ir::GcRef(1)),
+        &boxes,
+        &values,
+        &[0],
+    );
+    let vable = standard;
+    tc.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(1)));
+
+    let byte = *insns_opname_to_byte()
+        .get("setfield_vable_i_imm/rdd")
+        .expect("`setfield_vable_i_imm/rdd` must be in insns table");
+    let code = [byte, 0x00, 0x02, 0x00, 0x00, 0x00];
+    let raw_pool = vec![RuntimeBhDescr::Descr(Box::new(BhDescr::VableField {
+        index: vsd_idx,
+    }))];
+    let descr_pool: Vec<DescrRef> = Vec::new();
+    let regs_r = vec![vable];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: own_frame.then(|| CalleeLocalsShadow {
+                fold_frame_reg: 0,
+                frame_box: vable,
+                ..Default::default()
+            }),
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::PerFn(&raw_pool),
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let op = DecodedOp {
+        key: "setfield_vable_i_imm/rdd",
+        opname: "setfield_vable_i_imm",
+        argcodes: "rdd",
+        pc: 0,
+        next_pc: 6,
+    };
+    let (outcome, next_pc) =
+        setfield_vable_int_imm(&code, &op, &mut wc).expect("setfield_vable_i_imm must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 6);
+    drop(wc);
+    assert_eq!(
+        tc.virtualizable_entry_at(vsd_idx).map(|entry| entry.1),
+        Some(Value::Int(2)),
+        "emit_vsd's setfield_vable_i_imm must store valuestackdepth into \
+         virtualizable_boxes (`_opimpl_setfield_vable`)",
+    );
 }

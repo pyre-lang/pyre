@@ -772,6 +772,15 @@ pub(crate) struct LiveFrameRegs {
     pub(crate) registers_i: RegisterBank,
     pub(crate) registers_f: RegisterBank,
     frame_state: WalkFrameState,
+    /// Portal jitcode `last_instr` / `valuestackdepth` as of the CALL that
+    /// paused this frame (`_opimpl_setfield_vable` /
+    /// `_opimpl_setarrayitem_vable` before the helper). Guard snapshots
+    /// during the helper walk use the opcode-entry image mirrored onto
+    /// `virtualizable_boxes`; a ForceQuasiImmutable abort resumes this
+    /// MIFrame at the CALL's `next_pc` (`blackhole.py
+    /// _setup_return_value_*`) and needs this abort-point pair.
+    abort_point_valuestackdepth: Option<usize>,
+    abort_point_last_instr: Option<isize>,
 }
 
 impl LiveFrameRegs {
@@ -786,7 +795,16 @@ impl LiveFrameRegs {
             registers_i: registers_i.clone(),
             registers_f: registers_f.clone(),
             frame_state: frame_state.clone(),
+            abort_point_valuestackdepth: None,
+            abort_point_last_instr: None,
         }
+    }
+
+    pub(crate) fn abort_point_scalars(&self) -> (Option<usize>, Option<isize>) {
+        (
+            self.abort_point_valuestackdepth,
+            self.abort_point_last_instr,
+        )
     }
 
     pub(crate) fn frame_state(&self) -> &WalkFrameState {
@@ -6498,12 +6516,33 @@ pub(crate) fn find_catch_for_exc_resume(code: &[u8], resume_live_pos: usize) -> 
 /// `catch_exception` target of a helper jitcode section at `jitcode_pc`.
 /// `None` when the section has no handler, so the exception continues to
 /// the caller (`handle_exception_in_frame` / `_handle_jitexception`).
+///
+/// A catch whose body is `reraise` is `finishframe_exception` propagating
+/// (`look_inside_iff` wrapper / trampoline), not a handler. Innermost-first
+/// resume would otherwise stop there and never run the caller's except arm
+/// (`descr_pow` `except OverflowError: return _pow_ovf2long`).
 pub fn helper_section_catch_target(jitcode_index: i32, jitcode_pc: i32) -> Option<usize> {
     if jitcode_pc < 0 {
         return None;
     }
     let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index)?;
-    find_catch_for_exc_resume(pjc.jitcode.code.as_slice(), jitcode_pc as usize)
+    let code = pjc.jitcode.code.as_slice();
+    let target = find_catch_for_exc_resume(code, jitcode_pc as usize)?;
+    if catch_body_is_reraise(code, target) {
+        return None;
+    }
+    Some(target)
+}
+
+/// True when `target` is a `reraise` (optional leading `-live-`).
+pub(crate) fn catch_body_is_reraise(code: &[u8], target: usize) -> bool {
+    let mut pos = target;
+    if let Some(op) = decode_op_at(code, pos)
+        && op.key == "live/"
+    {
+        pos = op.next_pc;
+    }
+    decode_op_at(code, pos).is_some_and(|op| op.key == "reraise/")
 }
 
 /// Mirror of `blackhole.rs BlackholeInterpreter::find_catch_before_resume_live`

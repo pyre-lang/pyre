@@ -87,13 +87,76 @@ pub(crate) fn is_iter_next_segments(segments: &[String]) -> bool {
 /// `next`-leaf method or FunctionPath.  Combined with an `Option` return
 /// type at the recording site, this records a `next`-diamond candidate;
 /// the rewrite itself validates the surrounding match shape.
+///
+/// A `slice::iter::{Iter,IterMut}::next` FunctionPath is recognised by
+/// [`is_slice_iter_next_segments`] (inherent *and* the `Iterator` trait-impl
+/// identity spelling). Other `next` leaves still record here; the rewrite
+/// then keeps the constructor gate (`originates_from_iter_op`).
 pub(crate) fn is_iterator_next_target(target: &CallTarget) -> bool {
     match target {
         CallTarget::Method { name, .. } => name == "next",
-        CallTarget::FunctionPath { segments, .. } => segments.last().is_some_and(|s| s == "next"),
+        CallTarget::FunctionPath { segments, .. } => {
+            is_slice_iter_next_segments(segments) || segments.last().is_some_and(|s| s == "next")
+        }
         CallTarget::Indirect { method_name, .. } => method_name == "next",
         _ => false,
     }
+}
+
+/// Trait path named by a `slice::iter::{Iter,IterMut}` `Iterator` impl
+/// identity segment (`<impl core::iter::traits::iterator::Iterator<…>>`).
+const SLICE_ITER_ITERATOR_TRAIT: &[&str] = &["core", "iter", "traits", "iterator", "Iterator"];
+
+/// Owner suffixes of the slice iterator ADTs the inherent
+/// `["slice","iter","Iter","next"]` spelling already rewrites.
+const SLICE_ITER_OWNERS: &[&[&str]] = &[&["slice", "iter", "Iter"], &["slice", "iter", "IterMut"]];
+
+/// `true` iff `segment` is the `Iterator` trait-impl identity for a slice
+/// `Iter` / `IterMut` (`mir::trait_impl_identity_path`).  Owner + trait
+/// shape + leaf, not one literal of the whole path, so `Iter<v0>` and
+/// `IterMut<v1>` share the rule.
+fn iterator_trait_impl_identity_segment(segment: &str) -> bool {
+    let Some(inner) = segment
+        .strip_prefix("<impl ")
+        .and_then(|s| s.strip_suffix('>'))
+    else {
+        return false;
+    };
+    let trait_name = inner.split_once('<').map(|(head, _)| head).unwrap_or(inner);
+    trait_name
+        .split("::")
+        .eq(SLICE_ITER_ITERATOR_TRAIT.iter().copied())
+}
+
+/// `true` iff `segments` is `slice::iter::{Iter,IterMut}::next`, including
+/// the trait-impl identity spelling
+/// `["slice","iter","Iter","<impl core::iter::traits::iterator::Iterator<core::slice::iter::Iter<v0>>>","next"]`.
+///
+/// That residual is the same method the inherent four-segment path already
+/// rewrites to `[__iter_next]` (`ListIteratorRepr.rtype_next` /
+/// `ll_listnext`).  A non-slice iterator's `Iterator::next` (different
+/// owner) stays residual; the constructor gate then refuses the rewrite.
+pub(crate) fn is_slice_iter_next_segments(segments: &[String]) -> bool {
+    let n = segments.len();
+    if n == 0 || crate::front::clause_spec::unspecialized_leaf(&segments[n - 1]) != "next" {
+        return false;
+    }
+    let owner_end = if n >= 2 && crate::front::mir::is_trait_impl_identity_segment(&segments[n - 2])
+    {
+        if !iterator_trait_impl_identity_segment(&segments[n - 2]) {
+            return false;
+        }
+        n - 2
+    } else {
+        n - 1
+    };
+    SLICE_ITER_OWNERS.iter().any(|owner| {
+        owner_end >= owner.len()
+            && segments[owner_end - owner.len()..owner_end]
+                .iter()
+                .map(String::as_str)
+                .eq(owner.iter().copied())
+    })
 }
 
 /// `true` iff `segments` is the `core::slice` `iter` constructor the
@@ -578,11 +641,15 @@ fn stopiteration_exitcase() -> ExitCase {
 }
 
 /// Split the nullable-pointer form of an Option switch into `(None, Some)`.
-/// `front::mir::lower_niche_option_switch` closes the identity-null predicate
-/// `((ptr is null) == false)` through `set_branch`, so false is None and true
-/// is Some.  This is the flow-graph shape RPython itself uses for a maybe-null
-/// pointer (`ptr_nonzero`).
-fn split_niche_bool_exits(exits: &[Link], name: &str) -> Result<(Link, Link), String> {
+/// `true_is_some` is the leftover `eq(is_none, false)` / `ne` polarity
+/// (`ptr_nonzero`: true = Some). After `set_branch` peels a switch-only
+/// `not_` (`flowcontext.py FlowContext.not_` / `guessbool`), the closed
+/// block switches on `is_none` (`ptr_iszero`: true = None).
+fn split_niche_bool_exits(
+    exits: &[Link],
+    name: &str,
+    true_is_some: bool,
+) -> Result<(Link, Link), String> {
     if exits.len() != 2 {
         return Err(format!(
             "{name}: niche Option switch has {} exits, expected 2",
@@ -593,8 +660,20 @@ fn split_niche_bool_exits(exits: &[Link], name: &str) -> Result<(Link, Link), St
     let mut some: Option<Link> = None;
     for link in exits {
         match link.exitcase {
-            Some(ExitCase::Bool(false)) => none = Some(link.clone()),
-            Some(ExitCase::Bool(true)) => some = Some(link.clone()),
+            Some(ExitCase::Bool(false)) => {
+                if true_is_some {
+                    none = Some(link.clone());
+                } else {
+                    some = Some(link.clone());
+                }
+            }
+            Some(ExitCase::Bool(true)) => {
+                if true_is_some {
+                    some = Some(link.clone());
+                } else {
+                    none = Some(link.clone());
+                }
+            }
             _ => {
                 return Err(format!(
                     "{name}: niche Option switch has non-bool exit case {:?}",
@@ -619,6 +698,52 @@ fn bool_const(value: bool) -> LinkArg {
     LinkArg::Const(Constant::new(ConstValue::Bool(value)))
 }
 
+/// `true` iff the graph still holds a residual `slice::iter::{Iter,IterMut}::next`
+/// (inherent or the `Iterator` trait-impl identity).  The extra simplify
+/// that prunes the Option switch's default→Abort arm keys off recorded
+/// `next` sites; a trait-impl dest typed as opaque `Ref` never records, so
+/// the diamond matcher would see three exits and decline.  The lowering
+/// consults this before that simplify so the rewrite still sees the
+/// 0/1 pair (`ListIteratorRepr.rtype_next` / `ll_listnext`).
+pub(crate) fn graph_has_residual_slice_iter_next(graph: &FunctionGraph) -> bool {
+    !residual_slice_iter_next_sites(graph, &[]).is_empty()
+}
+
+/// Residual `slice::iter::{Iter,IterMut}::next` calls (inherent or
+/// trait-impl identity) whose dest was not recorded as an Option diamond.
+/// The trait-impl FunDecl can type the dest as an opaque `Ref` that
+/// `tyref_is_option` misses; the call is still `ListIteratorRepr.rtype_next`
+/// once the iterator traces to a slice `iter` constructor.
+fn residual_slice_iter_next_sites(
+    graph: &FunctionGraph,
+    already: &[(Variable, ValueType)],
+) -> Vec<(Variable, ValueType)> {
+    let mut extra = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                result_ty,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if !is_slice_iter_next_segments(segments) {
+                continue;
+            }
+            let Some(result) = &op.result else {
+                continue;
+            };
+            if already.iter().any(|(v, _)| v == result) || extra.iter().any(|(v, _)| v == result) {
+                continue;
+            }
+            extra.push((result.clone(), result_ty.clone()));
+        }
+    }
+    extra
+}
+
 /// Rewrite every recorded `next()` call site into the `next` op +
 /// StopIteration handler shape.  Fail-safe: a site whose surrounding
 /// `Option` match does not fit the for-loop shape is left as the residual
@@ -628,13 +753,18 @@ pub(crate) fn rewire_next_call_sites(
     graph: &mut FunctionGraph,
     sites: &[(Variable, ValueType)],
 ) -> usize {
+    // Trait-impl `Iter::next` may miss the Option recording gate; pick up
+    // the residual by owner + Iterator-impl shape before the rewrite loop.
+    let extra = residual_slice_iter_next_sites(graph, sites);
+    let mut pending: Vec<(Variable, ValueType)> = sites.to_vec();
+    pending.extend(extra);
     // One index for every site that has not yet mutated the graph. A site
     // that reached the mutation phase changed blocks and links, whether it
     // then succeeded or declined, so the next site builds a fresh index; a
     // decline during validation leaves the graph alone and keeps this one.
     let mut edges = BackEdges::build(graph);
     let mut rewritten = 0;
-    for (opt, recorded_item_ty) in sites {
+    for (opt, recorded_item_ty) in &pending {
         let mut mutated = false;
         match rewire_one_next_site(graph, &edges, opt, recorded_item_ty, &mut mutated) {
             Ok(()) => rewritten += 1,
@@ -1186,21 +1316,24 @@ fn rewire_one_next_site(
         .map_err(|e| format!("{name}: next call block exit: {e}"))?;
     assert_single_pred(graph, c, &name)?;
 
-    // Block C has one of the two representation-faithful Option tests:
+    // Block C has one of the representation-faithful Option tests:
     //
     // * aggregate Option: `d = opt.__discriminant`; switch 0/1;
-    // * one-word niche Option: `d = bool((opt is None) == false)`;
-    //   switch false/true.  The None sentinel is `ConstNone`
-    //   (`rnone.py` `rtype_is_None`; `pairtype(NoneRepr, Repr).convert_from_to`
-    //   is `inputconst(r_to, None)`) or `null_mut` (`rtype_ptr_null` /
-    //   `convert_const(None)`).  The direct `opt != null_mut()` spelling is
-    //   also accepted for artefacts extracted before the identity-null fold.
+    // * one-word niche Option: `is_(opt, None)` then, for a value use,
+    //   `eq(is_none, false)` (`Some` = 1). A switch-only use is
+    //   `flowcontext.py FlowContext.not_` / `guessbool`: `set_branch`
+    //   peels the eq and switches on `is_none` (`ptr_iszero`, true = None).
+    //   The None sentinel is `ConstNone` (`rnone.py` `rtype_is_None`;
+    //   `pairtype(NoneRepr, Repr).convert_from_to` is `inputconst(r_to, None)`)
+    //   or `null_mut` (`rtype_ptr_null` / `convert_const(None)`).  The
+    //   direct `opt != null_mut()` spelling is also accepted for artefacts
+    //   extracted before the identity-null fold.
     //
-    // The latter is `ptr_nonzero` in an RPython graph. Rust uses it for a
-    // by-value array/Vec iterator whose T is itself a non-null pointer. The
-    // front folds the niche before this post-pass runs, so accepting both
-    // shapes here is required for one list-iterator representation rather
-    // than a separate Rust-specific iterator path.
+    // The unpeeled eq form is `ptr_nonzero` in an RPython graph. Rust uses
+    // it for a by-value array/Vec iterator whose T is itself a non-null
+    // pointer. The front folds the niche before this post-pass runs, so
+    // accepting both shapes here is required for one list-iterator
+    // representation rather than a separate Rust-specific iterator path.
     //
     // A tagged `Option<T>` Discriminant recasts the forwarded `opt` onto
     // the interned class (`cast_instance_call` of `owner_root`) so
@@ -1230,12 +1363,14 @@ fn rewire_one_next_site(
         (none_link, some_link, true, branch_value_vars)
     } else {
         // The current MIR fold preserves PyPy identity semantics for
-        // nullable strings/lists: `is_none = opt is null; d = is_none ==
-        // false`.  This is the same `ptr_nonzero` predicate as the older
-        // direct `ne(opt, null)` spelling, but unlike value inequality it
-        // remains valid for every pointer repr.  Recognise both exact pure
-        // forms; accepting an arbitrary boolean chain here could reverse the
-        // None/Some arms and would not be a faithful `ll_listnext` rewrite.
+        // nullable strings/lists: `is_none = opt is null`. A value use
+        // keeps `d = is_none == false` (`ptr_nonzero`). A switch-only use
+        // is `flowcontext.py FlowContext.not_` / `guessbool`: the closed
+        // block switches on `is_none` (`ptr_iszero`). The older direct
+        // `ne(opt, null)` spelling is the same `ptr_nonzero` predicate.
+        // Recognise those exact pure forms; accepting an arbitrary boolean
+        // chain here could reverse the None/Some arms and would not be a
+        // faithful `ll_listnext` rewrite.
         let ops = &graph.blocks[c].operations;
         let direct =
             ops.iter()
@@ -1253,6 +1388,7 @@ fn rewire_one_next_site(
                                 lhs.clone()
                             },
                             vec![result.clone()],
+                            true,
                         ))
                     }
                     _ => None,
@@ -1299,10 +1435,40 @@ fn rewire_one_next_site(
                 disc_var.clone(),
                 null_var,
                 vec![is_none, false_var, disc_var],
+                true,
             ))
         };
-        let (mut pure_indices, disc_var, null_var, mut branch_value_vars) = direct
+        let identity_is_none = || {
+            let (is_idx, is_none, null_var) =
+                ops.iter().enumerate().find_map(|(i, op)| {
+                    match (&op.kind, op.result.as_ref()) {
+                        (OpKind::BinOp { op, lhs, rhs, .. }, Some(result))
+                            if op == "is_" && (*lhs == opt_c || *rhs == opt_c) =>
+                        {
+                            Some((
+                                i,
+                                result.clone(),
+                                if *lhs == opt_c {
+                                    rhs.clone()
+                                } else {
+                                    lhs.clone()
+                                },
+                            ))
+                        }
+                        _ => None,
+                    }
+                })?;
+            Some((
+                vec![is_idx],
+                is_none.clone(),
+                null_var,
+                vec![is_none],
+                false,
+            ))
+        };
+        let (mut pure_indices, disc_var, null_var, mut branch_value_vars, true_is_some) = direct
             .or_else(identity_inversion)
+            .or_else(identity_is_none)
             .ok_or_else(|| {
                 format!(
                     "{name}: block {c} lacks both an Option __discriminant read and a nullable-pointer test"
@@ -1374,7 +1540,8 @@ fn rewire_one_next_site(
             "nullable-pointer discriminant",
             &name,
         )?;
-        let (none_link, some_link) = split_niche_bool_exits(&graph.blocks[c].exits, &name)?;
+        let (none_link, some_link) =
+            split_niche_bool_exits(&graph.blocks[c].exits, &name, true_is_some)?;
         branch_value_vars.push(bool_var.clone());
         (none_link, some_link, false, branch_value_vars)
     };
@@ -1861,46 +2028,81 @@ mod tests {
             Link::new_mixed(Vec::new(), some_target, Some(ExitCase::Bool(true))),
             Link::new_mixed(Vec::new(), none_target, Some(ExitCase::Bool(false))),
         ];
-        let (none, some) = split_niche_bool_exits(&exits, "test").expect("split niche exits");
+        let (none, some) = split_niche_bool_exits(&exits, "test", true).expect("split niche exits");
         assert_eq!(none.target, none_target);
         assert_eq!(some.target, some_target);
     }
 
-    fn slice_iter_next_target() -> CallTarget {
-        CallTarget::FunctionPath {
-            segments: ["slice", "iter", "Iter", "next"]
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect(),
-            fun_decl_id: None,
-            specialization: crate::parse::GraphSpecialization::Regular,
-        }
+    fn segs(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
     }
 
-    /// Residual `next()` plus a trailing `__cast_instance_intrinsic` recast
-    /// in the same block — the production shape of `for &x in &[PyObjectRef]`.
-    /// The rewrite must replace the residual call, not the recast; otherwise
-    /// `slice::iter::Iter::next` survives next to `[__iter_next]` and the
-    /// rtyper still Skips.
+    fn slice_iter_next_target() -> CallTarget {
+        CallTarget::function_path(["slice", "iter", "Iter", "next"])
+    }
+
+    fn slice_iter_trait_next_target(owner_leaf: &str) -> CallTarget {
+        let identity = format!(
+            "<impl core::iter::traits::iterator::Iterator<core::slice::iter::{owner_leaf}<v0>>>"
+        );
+        CallTarget::function_path([
+            "slice".to_string(),
+            "iter".to_string(),
+            owner_leaf.to_string(),
+            identity,
+            "next".to_string(),
+        ])
+    }
+
     #[test]
-    fn recast_tail_does_not_leave_the_residual_next_call() {
+    fn slice_iter_next_segments_match_inherent_and_trait_impl_owners() {
+        assert!(is_slice_iter_next_segments(&segs(&[
+            "slice", "iter", "Iter", "next"
+        ])));
+        assert!(is_slice_iter_next_segments(&segs(&[
+            "slice",
+            "iter",
+            "Iter",
+            "<impl core::iter::traits::iterator::Iterator<core::slice::iter::Iter<v0>>>",
+            "next",
+        ])));
+        assert!(is_slice_iter_next_segments(&segs(&[
+            "core",
+            "slice",
+            "iter",
+            "IterMut",
+            "<impl core::iter::traits::iterator::Iterator<core::slice::iter::IterMut<v1>>>",
+            "next",
+        ])));
+        assert!(is_slice_iter_next_segments(&segs(&[
+            "slice", "iter", "IterMut", "next"
+        ])));
+        assert!(!is_slice_iter_next_segments(&segs(&[
+            "option",
+            "iter",
+            "IntoIter",
+            "<impl core::iter::traits::iterator::Iterator<core::option::iter::IntoIter<v0>>>",
+            "next",
+        ])));
+        assert!(!is_slice_iter_next_segments(&segs(&[
+            "slice",
+            "iter",
+            "Iter",
+            "<impl core::iter::traits::double_ended::DoubleEndedIterator<core::slice::iter::Iter<v0>>>",
+            "next",
+        ])));
+    }
+
+    fn recast_tailed_slice_loop(name: &str, next_target: CallTarget) -> (FunctionGraph, Variable) {
         use crate::model::{ExitCase, ExitSwitch, FieldDescriptor, Link};
 
-        let mut g = FunctionGraph::new("test_iter_next_recast_tail");
+        let mut g = FunctionGraph::new(name);
         let n = g.startblock;
         let container = g
             .push_op_var(
                 n,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![
-                            "some".to_string(),
-                            "container".to_string(),
-                            "make".to_string(),
-                        ],
-                        fun_decl_id: None,
-                        specialization: crate::parse::GraphSpecialization::Regular,
-                    },
+                    target: CallTarget::function_path(["some", "container", "make"]),
                     args: Vec::new(),
                     result_ty: ValueType::Ref(None),
                 },
@@ -1911,11 +2113,7 @@ mod tests {
             .push_op_var(
                 n,
                 OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
-                        fun_decl_id: None,
-                        specialization: crate::parse::GraphSpecialization::Regular,
-                    },
+                    target: CallTarget::function_path(["core", "slice", "iter"]),
                     args: crate::model::call_args(vec![container]),
                     result_ty: ValueType::Ref(None),
                 },
@@ -1929,7 +2127,7 @@ mod tests {
             .push_op_var(
                 a,
                 OpKind::Call {
-                    target: slice_iter_next_target(),
+                    target: next_target,
                     args: crate::model::call_args(vec![it_a]),
                     result_ty: ValueType::Ref(None),
                 },
@@ -1993,40 +2191,211 @@ mod tests {
             )
             .with_prevblock(c),
         ];
+        (g, raw)
+    }
 
-        // Capture the raw `next()` result, the way `front::mir` records it.
-        let rewritten = rewire_next_call_sites(&mut g, &[(raw, ValueType::Ref(None))]);
-        assert_eq!(rewritten, 1, "the recast-tailed for-loop must fold");
-        let residual = g.blocks.iter().flat_map(|b| &b.operations).filter(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                    if segments == &["slice".to_string(), "iter".to_string(), "Iter".to_string(), "next".to_string()]
-            )
-        }).count();
-        assert_eq!(residual, 0, "residual slice::iter::Iter::next must be gone");
-        let native = g
-            .blocks
+    fn residual_slice_iter_next_count(g: &FunctionGraph) -> usize {
+        g.blocks
             .iter()
             .flat_map(|b| &b.operations)
             .filter(|op| {
                 matches!(
                     &op.kind,
                     OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                        if segments == &["__iter_next".to_string()]
+                        if is_slice_iter_next_segments(segments)
+                )
+            })
+            .count()
+    }
+
+    /// Residual `next()` plus a trailing `__cast_instance_intrinsic` recast
+    /// in the same block — the production shape of `for &x in &[PyObjectRef]`.
+    /// The rewrite must replace the residual call, not the recast; otherwise
+    /// `slice::iter::Iter::next` survives next to `[__iter_next]` and the
+    /// rtyper still Skips.  The trait-impl identity spelling of the same
+    /// method is the same residual (`ListIteratorRepr.rtype_next`).
+    #[test]
+    fn recast_tail_does_not_leave_the_residual_next_call() {
+        for (name, target) in [
+            ("test_iter_next_recast_tail", slice_iter_next_target()),
+            (
+                "test_iter_next_recast_tail_trait_impl",
+                slice_iter_trait_next_target("Iter"),
+            ),
+            (
+                "test_iter_next_recast_tail_itermut_trait_impl",
+                slice_iter_trait_next_target("IterMut"),
+            ),
+        ] {
+            let (mut g, raw) = recast_tailed_slice_loop(name, target);
+            let rewritten = rewire_next_call_sites(&mut g, &[(raw, ValueType::Ref(None))]);
+            assert_eq!(rewritten, 1, "{name}: the recast-tailed for-loop must fold");
+            assert_eq!(
+                residual_slice_iter_next_count(&g),
+                0,
+                "{name}: residual slice::iter::Iter::next must be gone"
+            );
+            assert_eq!(
+                native_iter_next_count(&g),
+                1,
+                "{name}: native [__iter_next] replaces the residual and its recast"
+            );
+        }
+    }
+
+    /// Trait-impl `Iter::next` can miss the Option recording gate (opaque
+    /// dest). Owner + Iterator-impl shape still finds the residual.
+    #[test]
+    fn trait_impl_slice_iter_next_rewrites_without_option_recording() {
+        let (mut g, _raw) = recast_tailed_slice_loop(
+            "test_iter_next_trait_impl_unrecorded",
+            slice_iter_trait_next_target("Iter"),
+        );
+        assert!(
+            graph_has_residual_slice_iter_next(&g),
+            "opaque-dest trait-impl Iter::next is still a residual site"
+        );
+        let rewritten = rewire_next_call_sites(&mut g, &[]);
+        assert_eq!(rewritten, 1, "unrecorded trait-impl Iter::next must fold");
+        assert_eq!(
+            residual_slice_iter_next_count(&g),
+            0,
+            "residual slice::iter::Iter::next must be gone"
+        );
+        assert_eq!(native_iter_next_count(&g), 1);
+    }
+
+    /// A non-slice iterator's `Iterator::next` trait-impl spelling is not
+    /// `ListIteratorRepr.rtype_next`. The constructor gate must leave it.
+    #[test]
+    fn non_slice_trait_impl_next_is_not_rewritten() {
+        use crate::model::{ExitCase, ExitSwitch, FieldDescriptor, Link};
+
+        let mut g = FunctionGraph::new("test_non_slice_trait_impl_next");
+        let n = g.startblock;
+        let container = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::function_path(["option", "Option", "make"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let it = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::function_path(["option", "Option", "into_iter"]),
+                    args: crate::model::call_args(vec![container]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+
+        let (a, a_args) = g.create_block_with_arg_vars(1);
+        let it_a = a_args[0].clone();
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::function_path([
+                        "option".to_string(),
+                        "iter".to_string(),
+                        "IntoIter".to_string(),
+                        "<impl core::iter::traits::iterator::Iterator<core::option::iter::IntoIter<v0>>>"
+                            .to_string(),
+                        "next".to_string(),
+                    ]),
+                    args: crate::model::call_args(vec![it_a]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+
+        let (c, c_args) = g.create_block_with_arg_vars(1);
+        let opt_c = c_args[0].clone();
+        let disc = g
+            .push_op_var(
+                c,
+                OpKind::FieldRead {
+                    base: opt_c.clone(),
+                    field: FieldDescriptor::new("__discriminant", None),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+
+        let (some_t, some_args) = g.create_block_with_arg_vars(1);
+        let some_opt = some_args[0].clone();
+        g.push_op_var(
+            some_t,
+            OpKind::FieldRead {
+                base: some_opt,
+                field: FieldDescriptor::new("__pos_0", None),
+                ty: ValueType::Ref(None),
+                pure: true,
+            },
+            true,
+        );
+        g.set_return(some_t, None);
+
+        let (none_t, _none_args) = g.create_block_with_arg_vars(0);
+        g.set_return(none_t, None);
+
+        g.set_goto(n, a, vec![it]);
+        g.set_goto(a, c, vec![opt.clone()]);
+        g.block_mut(c).exitswitch = Some(ExitSwitch::Value(disc));
+        g.block_mut(c).exits = vec![
+            Link::new_mixed(
+                Vec::new(),
+                none_t,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            )
+            .with_prevblock(c),
+            Link::new_mixed(
+                vec![LinkArg::Value(opt_c)],
+                some_t,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            )
+            .with_prevblock(c),
+        ];
+
+        assert!(
+            !graph_has_residual_slice_iter_next(&g),
+            "non-slice trait-impl next is not a slice Iter residual"
+        );
+        let rewritten = rewire_next_call_sites(&mut g, &[(opt.clone(), ValueType::Ref(None))]);
+        assert_eq!(rewritten, 0, "non-slice Iterator::next must stay residual");
+        assert_eq!(native_iter_next_count(&g), 0);
+        let residual = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target, .. } if is_iterator_next_target(target)
                 )
             })
             .count();
         assert_eq!(
-            native, 1,
-            "native [__iter_next] replaces the residual and its recast"
+            residual, 1,
+            "non-slice trait-impl next must not be rewritten"
         );
     }
 
     /// Identity-null niche whose None sentinel is `ConstNone` (`is_`),
     /// the Discriminant spelling `push_niche_is_some` emits for an
-    /// instance-Ref (`rnone.py` `rtype_is_None`).  Counterpart of
-    /// `iter_next_fold_real_identity_null_niche`: that ignored LLBC test
+    /// instance-Ref (`rnone.py` `rtype_is_None`). `set_branch` peels the
+    /// `eq(is_none, false)` (`flowcontext.py FlowContext.not_`). Counterpart
+    /// of `iter_next_fold_real_identity_null_niche`: that ignored LLBC test
     /// records the same `for &x in &[PyObjectRef]` shape; this one
     /// constructs the diamond and asserts the rewrite fires.
     fn slice_iter_next_const_none_niche_graph(recast_none: bool) -> (FunctionGraph, Variable) {

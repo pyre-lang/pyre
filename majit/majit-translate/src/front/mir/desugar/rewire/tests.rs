@@ -386,6 +386,371 @@ fn option_ok_or_else_lowers_to_discriminant_switch() {
     assert_eq!(graph.blocks[graph.startblock.0].exits.len(), 2);
 }
 
+/// Every `Link.args` Value must still be an op result or a block
+/// inputarg after a rewrite that deletes ops (`FreshMallocs`).
+fn assert_link_args_are_op_result_or_inputarg(graph: &FunctionGraph) {
+    use std::collections::HashSet;
+    let mut defined = HashSet::new();
+    for block in &graph.blocks {
+        for var in &block.inputargs {
+            defined.insert(var.clone());
+        }
+        for op in &block.operations {
+            if let Some(var) = &op.result {
+                defined.insert(var.clone());
+            }
+        }
+    }
+    for block in &graph.blocks {
+        for (ei, link) in block.exits.iter().enumerate() {
+            for (ai, arg) in link.args.iter().enumerate() {
+                let LinkArg::Value(var) = arg else {
+                    continue;
+                };
+                assert!(
+                    defined.contains(var),
+                    "block {} exit[{ei}] args[{ai}] -> {} is not an op result or inputarg ({})",
+                    block.id.0,
+                    link.target.0,
+                    var.name()
+                );
+            }
+        }
+    }
+}
+
+/// Combinator call + trailing `cast_instance`, with the original goto
+/// carrying the call's own result as well as the cast. The rewrite
+/// deletes both ops; the call result must not stay on `Link.args`.
+#[test]
+fn option_ok_or_else_trailing_cast_does_not_carry_deleted_call_result() {
+    let mut graph = FunctionGraph::new("ok_or_else_trailing_cast");
+    let a = graph.startblock;
+    let live0 = graph.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
+    let live1 = graph.push_op_var(a, OpKind::ConstInt(2), true).unwrap();
+    let recv = graph.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+    let extra = graph.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+    let call_result = graph
+        .push_op_var(
+            a,
+            OpKind::Call {
+                target: CallTarget::method("ok_or_else", Some("Option".into())),
+                args: crate::model::call_args(vec![recv.clone(), extra.clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+            true,
+        )
+        .unwrap();
+    let flow_result = graph
+        .push_op_var(
+            a,
+            crate::model::cast_instance_call("core::result::Result", call_result.clone()),
+            true,
+        )
+        .unwrap();
+    let (b, _) = graph.create_block_with_arg_vars(6);
+    graph.set_return(b, None);
+    graph.set_goto(
+        a,
+        b,
+        vec![live0, live1, recv, extra, call_result.clone(), flow_result],
+    );
+    let rewritten = super::rewire_disc_combinator_sites(
+        &mut graph,
+        &[option_ok_or_else_site(call_result)],
+        crate::ErrorCarrierSpec::default(),
+    );
+    assert_eq!(rewritten, 1);
+    assert_eq!(count_method_calls(&graph, "ok_or_else"), 0);
+    assert_link_args_are_op_result_or_inputarg(&graph);
+}
+
+/// Same trailing-cast hole in `rewire_option_filter_diamond`.
+#[test]
+fn option_filter_trailing_cast_does_not_carry_deleted_call_result() {
+    let mut graph = FunctionGraph::new("filter_trailing_cast");
+    let a = graph.startblock;
+    let live0 = graph.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
+    let recv = graph.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+    let env = graph.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+    let call_result = graph
+        .push_op_var(
+            a,
+            OpKind::Call {
+                target: CallTarget::method("filter", Some("Option".into())),
+                args: crate::model::call_args(vec![recv.clone(), env.clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+            true,
+        )
+        .unwrap();
+    let flow_result = graph
+        .push_op_var(
+            a,
+            crate::model::cast_instance_call("core::option::Option", call_result.clone()),
+            true,
+        )
+        .unwrap();
+    let (b, _) = graph.create_block_with_arg_vars(5);
+    graph.set_return(b, None);
+    graph.set_goto(
+        a,
+        b,
+        vec![live0, recv, env, call_result.clone(), flow_result],
+    );
+    let rewritten = super::rewire_disc_combinator_sites(
+        &mut graph,
+        &[option_disc_site(
+            super::DiscCombinator::OptionFilter,
+            call_result,
+        )],
+        crate::ErrorCarrierSpec::default(),
+    );
+    assert_eq!(rewritten, 1);
+    assert_eq!(count_method_calls(&graph, "filter"), 0);
+    assert_link_args_are_op_result_or_inputarg(&graph);
+}
+
+/// `remint_call_as_payload` replaces the call's result with a copy and
+/// leaves the old identity on the goto. That identity is not a removed
+/// op result; rewriting it to `flow_result` would hide a front defect.
+#[test]
+fn option_ok_or_else_does_not_carry_reminted_call_identity() {
+    let mut graph = FunctionGraph::new("ok_or_else_reminted_identity");
+    let a = graph.startblock;
+    let live0 = graph.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
+    let recv = graph.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+    let extra = graph.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+    let old_identity = graph
+        .push_op_var(
+            a,
+            OpKind::Call {
+                target: CallTarget::method("ok_or_else", Some("Option".into())),
+                args: crate::model::call_args(vec![recv.clone(), extra.clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+            true,
+        )
+        .unwrap();
+    let payload = old_identity.copy();
+    let op = graph.blocks[a.0]
+        .operations
+        .last_mut()
+        .expect("ok_or_else call");
+    op.result = Some(payload.clone());
+    let (b, _) = graph.create_block_with_arg_vars(4);
+    graph.set_return(b, None);
+    graph.set_goto(a, b, vec![live0, recv, extra, old_identity.clone()]);
+    let err = super::rewire_one_disc_combinator(
+        &mut graph,
+        &option_ok_or_else_site(payload),
+        crate::ErrorCarrierSpec::default(),
+    )
+    .expect_err("reminted-away identity is a dangling non-removed exit arg");
+    assert!(
+        err.contains("undefined"),
+        "decline must name the dangling var, got {err}"
+    );
+    assert_eq!(count_method_calls(&graph, "ok_or_else"), 1);
+    let still_old = graph.blocks[a.0].exits.iter().any(|link| {
+        link.args
+            .iter()
+            .any(|arg| matches!(arg, LinkArg::Value(v) if *v == old_identity))
+    });
+    assert!(
+        still_old,
+        "dangling remint identity must not be rewritten to flow_result"
+    );
+}
+
+/// An exit arg that is not the removed combinator call (or its trailing
+/// `cast_instance`) and has no def is a front defect: decline, do not
+/// rewrite it to `flow_result`.
+#[test]
+fn option_ok_or_else_declines_dangling_non_removed_exit_arg() {
+    let mut graph = FunctionGraph::new("ok_or_else_dangling_non_removed");
+    let a = graph.startblock;
+    let recv = graph.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+    let extra = graph.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+    let call_result = graph
+        .push_op_var(
+            a,
+            OpKind::Call {
+                target: CallTarget::method("ok_or_else", Some("Option".into())),
+                args: crate::model::call_args(vec![recv.clone(), extra.clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+            true,
+        )
+        .unwrap();
+    let dangling = graph.alloc_value_var();
+    let (b, _) = graph.create_block_with_arg_vars(2);
+    graph.set_return(b, None);
+    graph.set_goto(a, b, vec![call_result.clone(), dangling.clone()]);
+    let err = super::rewire_one_disc_combinator(
+        &mut graph,
+        &option_ok_or_else_site(call_result),
+        crate::ErrorCarrierSpec::default(),
+    )
+    .expect_err("dangling non-removed exit arg must decline");
+    assert!(
+        err.contains("undefined"),
+        "decline must name the dangling var, got {err}"
+    );
+    assert_eq!(count_method_calls(&graph, "ok_or_else"), 1);
+    let still_dangling = graph.blocks[a.0].exits.iter().any(|link| {
+        link.args
+            .iter()
+            .any(|arg| matches!(arg, LinkArg::Value(v) if *v == dangling))
+    });
+    assert!(
+        still_dangling,
+        "dangling non-removed arg must not be rewritten to flow_result"
+    );
+}
+
+/// Extra-live can name a Variable defined in another block. The rewrite
+/// must keep that def on `carried`; remapping it to `flow_result` unions
+/// the dest phi with the combinator payload.
+#[test]
+fn option_ok_or_else_keeps_def_from_other_block() {
+    let mut graph = FunctionGraph::new("ok_or_else_foreign_def");
+    let entry = graph.startblock;
+    let foreign = graph
+        .push_op_var(entry, OpKind::ConstInt(99), true)
+        .unwrap();
+    let (a, _) = graph.create_block_with_arg_vars(0);
+    graph.set_goto(entry, a, Vec::<Variable>::new());
+    let recv = graph.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+    let extra = graph.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+    let call_result = graph
+        .push_op_var(
+            a,
+            OpKind::Call {
+                target: CallTarget::method("ok_or_else", Some("Option".into())),
+                args: crate::model::call_args(vec![recv.clone(), extra.clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+            true,
+        )
+        .unwrap();
+    let (b, _) = graph.create_block_with_arg_vars(2);
+    graph.set_return(b, None);
+    graph.set_goto(a, b, vec![foreign.clone(), call_result.clone()]);
+    let rewritten = super::rewire_disc_combinator_sites(
+        &mut graph,
+        &[option_ok_or_else_site(call_result)],
+        crate::ErrorCarrierSpec::default(),
+    );
+    assert_eq!(rewritten, 1);
+    assert_eq!(count_method_calls(&graph, "ok_or_else"), 0);
+    assert_link_args_are_op_result_or_inputarg(&graph);
+    let still_carries_foreign = graph.blocks.iter().any(|block| {
+        block.exits.iter().any(|link| {
+            link.args
+                .iter()
+                .any(|arg| matches!(arg, LinkArg::Value(v) if *v == foreign))
+        })
+    });
+    assert!(
+        still_carries_foreign,
+        "def from another block must stay on Link.args"
+    );
+}
+
+/// Production `get_attr` / `simplequeue_get`: tail-return `ok_or_else` joins
+/// a merged returnblock with another Result tail. After the combinator
+/// rewrite every Link.args Value still has a def (`FreshMallocs`).
+#[test]
+fn option_ok_or_else_merged_return_has_no_undefined_link_args() {
+    let mut graph = FunctionGraph::new("ok_or_else_merged_return");
+    let entry = graph.startblock;
+    let flag = graph
+        .push_op_var(entry, OpKind::ConstBool(true), true)
+        .unwrap();
+    let (a, _) = graph.create_block_with_arg_vars(0);
+    let (b, _) = graph.create_block_with_arg_vars(0);
+    let (merge, _) = graph.create_block_with_arg_vars(1);
+    graph.set_return(merge, None);
+    graph.set_branch(
+        entry,
+        flag,
+        a,
+        Vec::<Variable>::new(),
+        b,
+        Vec::<Variable>::new(),
+    );
+    let recv = graph.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+    let env = graph.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+    let call_result = graph
+        .push_op_var(
+            a,
+            OpKind::Call {
+                target: CallTarget::method("ok_or_else", Some("Option".into())),
+                args: crate::model::call_args(vec![recv, env]),
+                result_ty: ValueType::Ref(Some("result::Result<*mut PyObject,PyError>".into())),
+            },
+            true,
+        )
+        .unwrap();
+    graph.set_goto(a, merge, vec![call_result.clone()]);
+    let sibling = graph
+        .push_op_var(
+            b,
+            OpKind::Call {
+                target: CallTarget::function_path(["sibling"]),
+                args: vec![],
+                result_ty: ValueType::Ref(Some("result::Result<*mut PyObject,PyError>".into())),
+            },
+            true,
+        )
+        .unwrap();
+    graph.set_goto(b, merge, vec![sibling]);
+    let rewritten = super::rewire_disc_combinator_sites(
+        &mut graph,
+        &[option_ok_or_else_site(call_result)],
+        crate::ErrorCarrierSpec::default(),
+    );
+    assert_eq!(rewritten, 1);
+    assert_eq!(count_method_calls(&graph, "ok_or_else"), 0);
+    assert_link_args_are_op_result_or_inputarg(&graph);
+}
+
+/// Production `_orig_parse_format` body: combinator rewrite must not
+/// leave a deleted op result on `Link.args` (`FreshMallocs`).
+#[test]
+fn orig_parse_format_link_args_are_defined() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+        return;
+    }
+    let llbc = majit_charon_reader::Llbc::load(path).expect("load pyre-interpreter.ullbc");
+    let spec = crate::ErrorCarrierSpec {
+        carrier_path: "pyre_interpreter::error::PyError",
+        carrier_class: "",
+        carrier_wrappers: &[],
+        to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+        from_exc_object: Some(("PyError", "from_exc_object")),
+    };
+    let name = if llbc.local_fn("_orig_parse_format").is_some() {
+        "_orig_parse_format"
+    } else {
+        "parse_format"
+    };
+    let graph = crate::front::mir::lower_function_with_static_addrs(
+        &llbc,
+        name,
+        crate::HostStaticAddrs {
+            error_carrier: spec,
+            ..Default::default()
+        },
+    )
+    .unwrap_or_else(|err| panic!("lower {name}: {err:?}"));
+    assert_link_args_are_op_result_or_inputarg(&graph);
+    crate::translator::rtyper::legacy_annotator::annotate(&graph);
+}
+
 fn option_ok_or_family_site(
     kind: super::DiscCombinator,
     result_var: Variable,
@@ -1067,4 +1432,45 @@ fn core_option_result_method_paths() {
         "mycrate::option::<Impl>::filter",
         "filter"
     ));
+}
+
+#[test]
+fn classed_result_enum_owner_is_core_result_path() {
+    use crate::front::result_exc::owner_is_core_result;
+    use crate::model::ValueType;
+
+    assert!(owner_is_core_result("core::result::Result"));
+    assert!(owner_is_core_result("core::result::Result<Infallible, E>"));
+    assert!(owner_is_core_result(
+        "core::result::Result<Infallible, E>::Err"
+    ));
+    assert!(owner_is_core_result("result::Result<??scalar, i64>"));
+    assert!(owner_is_core_result("std::result::Result"));
+    assert!(
+        !owner_is_core_result("mymod::Result<Infallible, E>"),
+        "a same-leaf user enum is not core::result::Result"
+    );
+    assert!(
+        !owner_is_core_result("Result<Infallible, E>"),
+        "a bare Result leaf is not the std item"
+    );
+
+    let core = ValueType::Ref(Some("core::result::Result<Infallible, E>".to_string()));
+    assert_eq!(
+        super::classed_result_enum_owner(&core),
+        Some("core::result::Result<Infallible, E>")
+    );
+    let stripped = ValueType::Ref(Some("result::Result<??scalar, i64>".to_string()));
+    assert_eq!(
+        super::classed_result_enum_owner(&stripped),
+        Some("result::Result<??scalar, i64>")
+    );
+    let user = ValueType::Ref(Some("mymod::Result<Infallible, E>".to_string()));
+    assert_eq!(
+        super::classed_result_enum_owner(&user),
+        None,
+        "user Result must not intern as the std Result wrap"
+    );
+    let leaf = ValueType::Ref(Some("Result<Infallible, E>".to_string()));
+    assert_eq!(super::classed_result_enum_owner(&leaf), None);
 }
