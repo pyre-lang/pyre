@@ -345,6 +345,14 @@ pub(super) fn isxidcontinue(args: &[PyObjectRef]) -> PyResult {
     ))
 }
 
+/// `unicodedata.block` — the block the character is assigned to
+/// (`unicodedata_block_impl`).
+pub(super) fn block(args: &[PyObjectRef]) -> PyResult {
+    Ok(w_str_new_managed(ucd_core::data::block(one_char(
+        "block", args,
+    )?)))
+}
+
 pub(super) fn grapheme_cluster_break(args: &[PyObjectRef]) -> PyResult {
     Ok(w_str_new_managed(
         ucd_core::grapheme::grapheme_cluster_break(one_char("grapheme_cluster_break", args)?),

@@ -1535,39 +1535,6 @@ fn space_index_w_returns_ok_i64() {
     );
 }
 
-/// `Lock.locked` is `*lock_state(&self.locked)`. `lock_state` is residual
-/// and `MutexGuard::deref` returns `&bool`. That address is not the bool
-/// `Rvalue::Ref` would have aliased, so the return is a `raw_load` and
-/// `history.getkind` of the loaded word is `int`, matching `FUNC.RESULT`.
-#[test]
-fn lock_locked_returns_the_bool_word() {
-    use majit_translate::model::{LinkArg, OpKind, ValueType};
-    let path = "pyre_interpreter::module::thread::lock_class::<Impl>::locked";
-    let g = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower: {e}"));
-    let mut returns = 0usize;
-    for block in &g.blocks {
-        for link in &block.exits {
-            if link.target != g.returnblock {
-                continue;
-            }
-            assert_eq!(link.args.len(), 1, "bool return has one arg");
-            let LinkArg::Value(var) = &link.args[0] else {
-                panic!("return arg is a value");
-            };
-            match return_producer(&g, var) {
-                Some(OpKind::RawLoad {
-                    item_ty: ValueType::Int,
-                    itemsize: 1,
-                    ..
-                }) => {}
-                other => panic!("locked return must raw_load the bool, got {other:?}"),
-            }
-            returns += 1;
-        }
-    }
-    assert_eq!(returns, 1, "{path}");
-}
-
 /// `getindex_w_index` is `space_index(index)?` followed by a `match` on
 /// `with_roots!(index => int_w(w_index))`. Restore hops sit between the
 /// rebuilt shells and the discriminant; collapsing them forwards `int_w`'s

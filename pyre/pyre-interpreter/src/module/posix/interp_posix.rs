@@ -14573,9 +14573,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                     // `os_access_impl` leaves the interpreter for
                     // `GetFileAttributesW`, which blocks on a network path.
+                    let wide = wide_path(&path.as_bytes)?;
                     let allowed = {
                         let _blocked = crate::module::thread::before_external_block();
-                        host_nt::access(path_from_bytes(&path.as_bytes).as_ref(), mode)
+                        host_nt::access(&wide, mode)
                     };
                     Ok(pyre_object::w_bool_from(allowed))
                 },

@@ -771,9 +771,9 @@ class TypeVarTuple(
 class TypeAliasType(_PickleUsingNameMixin, metaclass=_ImmutableTypeMeta):
     """A PEP 695 ``type X = ...`` alias."""
 
-    __slots__ = ("_name", "_type_params", "_value", "_evaluate_value", "_module")
+    __slots__ = ("_name", "_qualname", "_type_params", "_value", "_evaluate_value", "_module")
 
-    def __init__(self, name, value, *, type_params=()):
+    def __init__(self, name, value, *, type_params=(), qualname=None):
         if not isinstance(name, str):
             raise TypeError(
                 f"typealias() argument 'name' must be str, not "
@@ -782,7 +782,12 @@ class TypeAliasType(_PickleUsingNameMixin, metaclass=_ImmutableTypeMeta):
         if not isinstance(type_params, tuple):
             raise TypeError("type_params must be a tuple")
         self._check_type_params(type_params)
+        if qualname is None:
+            qualname = name
+        elif not isinstance(qualname, str):
+            raise TypeError("qualname must be a string")
         object.__setattr__(self, "_name", name)
+        object.__setattr__(self, "_qualname", qualname)
         object.__setattr__(self, "_type_params", type_params)
         object.__setattr__(self, "_value", value)
         object.__setattr__(self, "_evaluate_value", None)
@@ -818,6 +823,9 @@ class TypeAliasType(_PickleUsingNameMixin, metaclass=_ImmutableTypeMeta):
         # deliberately skips `typealias_check_type_params`: checking here
         # would force lazy defaults before the alias is even constructed.
         object.__setattr__(self, "_name", name)
+        # `_Py_make_typealias` takes the qualname from the evaluator's code object.
+        code = getattr(evaluate_value, "__code__", None)
+        object.__setattr__(self, "_qualname", code.co_qualname if code is not None else name)
         object.__setattr__(self, "_type_params", type_params)
         object.__setattr__(self, "_value", _MISSING)
         object.__setattr__(self, "_evaluate_value", evaluate_value)
@@ -833,13 +841,21 @@ class TypeAliasType(_PickleUsingNameMixin, metaclass=_ImmutableTypeMeta):
                 return module
             evaluate_value = object.__getattribute__(self, "_evaluate_value")
             return getattr(evaluate_value, "__module__", None)
+        if name == "__qualname__":
+            # `typealias_members` exposes `qualname` as a read-only member; a
+            # class-body entry would be taken as the class's own qualname.
+            return object.__getattribute__(self, "_qualname")
         return object.__getattribute__(self, name)
 
     def __setattr__(self, name, value):
-        if name == "__name__":
+        if name in ("__name__", "__qualname__"):
             raise AttributeError("readonly attribute")
+        if name == "__module__":
+            # `typealias_set_module` stores the value; the getter returns it.
+            object.__setattr__(self, "_module", value)
+            return
         if name in {
-            "__module__", "__parameters__", "__type_params__", "__value__",
+            "__parameters__", "__type_params__", "__value__",
             "evaluate_value",
         }:
             raise AttributeError(
@@ -852,6 +868,9 @@ class TypeAliasType(_PickleUsingNameMixin, metaclass=_ImmutableTypeMeta):
         )
 
     def __delattr__(self, name):
+        if name == "__module__":
+            object.__setattr__(self, "_module", _MISSING)
+            return
         # The native object uses the same read-only/no-dict paths for writes
         # and deletions.
         self.__setattr__(name, None)
@@ -914,7 +933,7 @@ class TypeAliasType(_PickleUsingNameMixin, metaclass=_ImmutableTypeMeta):
         return Union[other, self]
 
     def __repr__(self):
-        return self.__name__
+        return self.__qualname__
 
 
 class Generic:

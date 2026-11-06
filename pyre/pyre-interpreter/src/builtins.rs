@@ -16398,7 +16398,17 @@ fn assignment_target_error(
     source: &str,
     mode: crate::compile::Mode,
 ) -> Option<(String, usize, usize)> {
-    use rustpython_compiler::ast::{self, Expr, Stmt, visitor::Visitor};
+    use rustpython_compiler::ast::{self, Expr, Stmt, token::TokenKind, visitor::Visitor};
+    use rustpython_compiler::parser::ParseErrorType;
+
+    // `def f(None=1)` / `lambda True=1` are `invalid_parameters`, not assignment
+    // targets: the parser stopped on the keyword constant itself.
+    if let crate::compile::CompileError::Parse(parse_error) = error
+        && let ParseErrorType::ExpectedToken { found, .. } = &parse_error.error
+        && matches!(found, TokenKind::None | TokenKind::True | TokenKind::False)
+    {
+        return None;
+    }
 
     // Both statements this reads are spelled with one, and the recovering parse
     // below is a second parse of the whole source: skip it for the failures that
@@ -18162,6 +18172,13 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             {
                 "expected ':'".to_owned()
             }
+            // `invalid_def_raw`: `'def' NAME [type_params] &&'('`.
+            ParseErrorType::ExpectedToken {
+                expected: rustpython_compiler::ast::token::TokenKind::Lpar,
+                ..
+            } if def_header_missing_paren_at(source, parse_err.raw_location.start().to_usize()) => {
+                "expected '('".to_owned()
+            }
             ParseErrorType::ExpectedToken { .. } => "invalid syntax".to_owned(),
             ParseErrorType::OtherError(message) if message == "Expected a statement" => {
                 "invalid syntax".to_owned()
@@ -18215,17 +18232,46 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             ParseErrorType::UnparenthesizedGeneratorExpression => {
                 "Generator expression must be parenthesized".to_owned()
             }
-            // Ruff's parser capitalizes this semantic diagnostic.  The real
-            // pypy3 oracle and CPython 3.14's `invalid_starred_expression`
-            // grammar rule both expose the lower-case spelling for a starred
-            // expression rejected while parsing (for example
-            // ``((*x), y) = 1, 2``). Keep this structured parse arm distinct
-            // from codegen's ``InvalidStarExpr``: CPython's in-tree
-            // `test_unpack_ex` gives that other path the "can't use starred
-            // expression here" spelling for shapes such as ``x = *a``.
-            ParseErrorType::InvalidStarredExpressionUsage => {
-                "cannot use starred expression here".to_owned()
+            // `invalid_kwds` / `invalid_lambda_kwds`.
+            ParseErrorType::ParamAfterVarKeywordParam => {
+                "parameters cannot follow var-keyword parameter".to_owned()
             }
+            // `invalid_star_etc` / `invalid_lambda_star_etc`.
+            ParseErrorType::ExpectedKeywordParam => {
+                "named parameters must follow bare *".to_owned()
+            }
+            // `invalid_kwds`.
+            ParseErrorType::VarKeywordParameterWithDefault => {
+                "var-keyword parameter cannot have default value".to_owned()
+            }
+            // `invalid_star_etc`.
+            ParseErrorType::VarParameterWithDefault => {
+                "var-positional parameter cannot have default value".to_owned()
+            }
+            // `invalid_star_etc`.
+            ParseErrorType::OtherError(message) if message == "* argument may appear only once" => {
+                "* may appear only once".to_owned()
+            }
+            // `invalid_parameters` / `invalid_lambda_parameters`.
+            ParseErrorType::OtherError(message)
+                if message == "at least one argument must precede /" =>
+            {
+                "at least one parameter must precede /".to_owned()
+            }
+            // No `invalid_*` rule names a match body without `case`.
+            ParseErrorType::OtherError(message) if message == "expected `case` block" => {
+                "invalid syntax".to_owned()
+            }
+            // `invalid_raise_stmt` leftover / `yield from` tuple: span in
+            // `unparenthesized_raise_tuple_span`.
+            ParseErrorType::UnparenthesizedTupleExpression => "invalid syntax".to_owned(),
+            // Ruff's rejection of a starred expression as a slice bound, an
+            // annotation or a lambda body, which the 3.15 grammar reports as
+            // plain `invalid syntax`.  `((*x), y) = 1, 2`, `print((*a))` and
+            // `(*a) = 1` reach this function as OtherError("cannot use starred
+            // expression here"), not as this variant, so they keep their
+            // message.  Span rewrite is `starred_slice_bound_span`.
+            ParseErrorType::InvalidStarredExpressionUsage => "invalid syntax".to_owned(),
             // `tok_get_normal_mode` says what it found rather than what it
             // wanted: a backslash is a continuation only when the newline is
             // the next character, and anything else after it -- a space, a
@@ -18505,7 +18551,8 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     // and so does a generator expression the call left unparenthesized.  Each
     // of those has already claimed `msg` above, wherever in the statement it
     // sits: `b'\xe4' = 1` reports the byte and `f() = '\N{'` the escape in the
-    // value, not the target either way.
+    // value, not the target either way.  The grammar overrides below are
+    // alternatives too, so they are gated the same way.
     let literal_content_error = escape_error.is_some()
         || delimiter_error.is_some()
         || literal_span.is_some()
@@ -18536,7 +18583,55 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     } else {
         assignment_error.map(|(_, start, end)| (start, end))
     };
-    let keyword_generator_span = (msg == "invalid syntax")
+    let if_missing_else = (!literal_content_error)
+        .then(|| if_expression_missing_else(&e, source))
+        .flatten();
+    if let Some((replacement, _, _)) = &if_missing_else {
+        msg = replacement.clone();
+    }
+    let case_outside_match = (!literal_content_error)
+        .then(|| case_outside_match_error(&e, source))
+        .flatten();
+    if let Some((replacement, _, _)) = &case_outside_match {
+        msg = replacement.clone();
+    }
+    let invalid_assert = (!literal_content_error)
+        .then(|| invalid_assert_stmt_error(&e, source))
+        .flatten();
+    if let Some((replacement, _, _)) = &invalid_assert {
+        msg = replacement.clone();
+    }
+    let invalid_star = (!literal_content_error)
+        .then(|| invalid_star_expression_error(&e, source))
+        .flatten();
+    if let Some((replacement, _, _)) = &invalid_star {
+        msg = replacement.clone();
+    }
+    let starred_bound = (!literal_content_error)
+        .then(|| starred_slice_bound_span(&e, source))
+        .flatten();
+    if let Some((replacement, _, _)) = &starred_bound {
+        msg = replacement.clone();
+    }
+    let raise_tuple = (!literal_content_error)
+        .then(|| unparenthesized_raise_tuple_span(&e, source))
+        .flatten();
+    if let Some((replacement, _, _)) = &raise_tuple {
+        msg = replacement.clone();
+    }
+    let if_missing_else_span = if_missing_else.map(|(_, start, end)| (start, end));
+    let case_outside_match_span = case_outside_match.map(|(_, start, end)| (start, end));
+    let invalid_assert_span = invalid_assert.map(|(_, start, end)| (start, end));
+    let invalid_star_span = invalid_star.map(|(_, start, end)| (start, end));
+    let starred_bound_span = starred_bound.map(|(_, start, end)| (start, end));
+    let raise_tuple_span = raise_tuple.map(|(_, start, end)| (start, end));
+    let grammar_override_fired = if_missing_else_span.is_some()
+        || case_outside_match_span.is_some()
+        || invalid_assert_span.is_some()
+        || invalid_star_span.is_some()
+        || starred_bound_span.is_some()
+        || raise_tuple_span.is_some();
+    let keyword_generator_span = (msg == "invalid syntax" && !grammar_override_fired)
         .then(|| keyword_generator_assignment_span(source))
         .flatten()
         .filter(|(start, _)| raw_parse_start.is_none_or(|error_start| *start <= error_start));
@@ -18609,6 +18704,12 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         .or(conversion_span)
         .or(prefix_span)
         .or(keyword_generator_span)
+        .or(raise_tuple_span)
+        .or(starred_bound_span)
+        .or(invalid_star_span)
+        .or(invalid_assert_span)
+        .or(case_outside_match_span)
+        .or(if_missing_else_span)
         .or(assignment_span)
         .or(fstring_span)
         .or(scope_span)
@@ -18986,6 +19087,71 @@ fn compound_suite_header_at(source: &str, loc: usize) -> bool {
     })
 }
 
+/// `invalid_def_raw` (3.15): the prefix of the line up to `loc` is a `def`
+/// header waiting for `'('`.
+fn def_header_missing_paren_at(source: &str, loc: usize) -> bool {
+    let loc = loc.min(source.len());
+    let bytes = source.as_bytes();
+    let mut line_start = loc;
+    while line_start > 0 {
+        line_start -= 1;
+        if bytes[line_start] == b'\n' {
+            line_start += 1;
+            break;
+        }
+    }
+    let prefix = &source[line_start..loc];
+    let mut rest = prefix.trim_start_matches([' ', '\t']);
+    if let Some(after) = rest.strip_prefix("async") {
+        let trimmed = after.trim_start_matches([' ', '\t']);
+        if trimmed.len() < after.len() {
+            rest = trimmed;
+        }
+    }
+    let Some(after_def) = rest.strip_prefix("def") else {
+        return false;
+    };
+    let after_name_ws = after_def.trim_start_matches([' ', '\t']);
+    if after_name_ws.len() == after_def.len() {
+        return false;
+    }
+    let mut chars = after_name_ws.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !rustpython_unicode::identifier::is_start(first) {
+        return false;
+    }
+    let mut ident_end = first.len_utf8();
+    for character in chars {
+        if !rustpython_unicode::identifier::is_continue(character) {
+            break;
+        }
+        ident_end += character.len_utf8();
+    }
+    let after_ident = after_name_ws[ident_end..].trim_start_matches([' ', '\t']);
+    let after_type_params = if let Some(inner) = after_ident.strip_prefix('[') {
+        let inner_bytes = inner.as_bytes();
+        let mut depth = 1i32;
+        let mut index = 0usize;
+        while index < inner_bytes.len() && depth > 0 {
+            match inner_bytes[index] {
+                b'[' => depth += 1,
+                b']' => depth -= 1,
+                _ => {}
+            }
+            index += 1;
+        }
+        if depth != 0 {
+            return false;
+        }
+        inner[index..].trim_start_matches([' ', '\t'])
+    } else {
+        after_ident
+    };
+    after_type_params.is_empty()
+}
+
 /// Whether the `except *` clause on `loc`'s line names no exception type at
 /// all, which is the only shape `invalid_except_star_stmt` matches:
 /// `'except' '*' (NEWLINE | ':')`, with end-of-source standing in for the
@@ -19014,6 +19180,757 @@ fn except_star_missing_types_at(source: &str, loc: usize) -> bool {
         _ => rest,
     };
     rest.is_empty() || rest.starts_with([':', '\n', '\r'])
+}
+
+fn skip_spaces_tabs(source: &str, mut index: usize) -> usize {
+    let bytes = source.as_bytes();
+    while index < bytes.len() && matches!(bytes[index], b' ' | b'\t') {
+        index += 1;
+    }
+    index
+}
+
+fn line_start_index(source: &str, loc: usize) -> usize {
+    source.as_bytes()[..loc.min(source.len())]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |index| index + 1)
+}
+
+fn line_end_index(source: &str, loc: usize) -> usize {
+    let bytes = source.as_bytes();
+    let loc = loc.min(bytes.len());
+    bytes[loc..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(bytes.len(), |index| loc + index)
+}
+
+fn line_indent(source: &str, line_start: usize) -> usize {
+    source.as_bytes()[line_start.min(source.len())..]
+        .iter()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count()
+}
+
+fn skip_string_literal(bytes: &[u8], mut index: usize) -> usize {
+    let Some(&quote) = bytes.get(index) else {
+        return index;
+    };
+    if !matches!(quote, b'\'' | b'"') {
+        return index;
+    }
+    let triple = bytes.get(index + 1) == Some(&quote) && bytes.get(index + 2) == Some(&quote);
+    if triple {
+        index += 3;
+        while index + 2 < bytes.len() {
+            if bytes[index] == b'\\' {
+                index += 2;
+                continue;
+            }
+            if bytes[index] == quote && bytes[index + 1] == quote && bytes[index + 2] == quote {
+                return index + 3;
+            }
+            index += 1;
+        }
+        return bytes.len();
+    }
+    index += 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'\n' => return index,
+            b if b == quote => return index + 1,
+            _ => index += 1,
+        }
+    }
+    bytes.len()
+}
+
+fn recovered_module(
+    source: &str,
+) -> rustpython_compiler::parser::Parsed<rustpython_compiler::ast::ModModule> {
+    crate::compile::parser::parse_unchecked_source(
+        source,
+        rustpython_compiler::ast::PySourceType::Python,
+    )
+}
+
+fn recoverable_parse_error(
+    e: &crate::compile::CompileError,
+) -> Option<&rustpython_compiler::ParseError> {
+    use rustpython_compiler::parser::ParseErrorType;
+    match e {
+        crate::compile::CompileError::Parse(parse_err)
+            if !parse_err.is_unclosed_bracket
+                && !parse_err.is_unclosed_string
+                && !matches!(
+                    parse_err.error,
+                    ParseErrorType::Lexical(_)
+                        | ParseErrorType::FStringError(_)
+                        | ParseErrorType::TStringError(_)
+                ) =>
+        {
+            Some(parse_err)
+        }
+        _ => None,
+    }
+}
+
+/// `invalid_expression` (3.15): `a=disjunction 'if' b=disjunction !('else'|':')`.
+fn if_expression_missing_else(
+    e: &crate::compile::CompileError,
+    source: &str,
+) -> Option<(String, usize, usize)> {
+    use rustpython_compiler::ast::{
+        self, Expr,
+        token::TokenKind,
+        visitor::{Visitor, walk_expr, walk_stmt},
+    };
+    use rustpython_compiler::parser::ParseErrorType;
+
+    let parse_err = recoverable_parse_error(e)?;
+    let ParseErrorType::ExpectedToken {
+        expected: TokenKind::Else,
+        found,
+    } = &parse_err.error
+    else {
+        return None;
+    };
+    if *found == TokenKind::Colon {
+        return None;
+    }
+    let raw = parse_err.raw_location.start().to_usize();
+
+    struct Finder {
+        raw: usize,
+        best_test_end: Option<usize>,
+        body_start: usize,
+    }
+
+    impl<'a> Visitor<'a> for Finder {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if let Expr::If(if_expr) = expr
+                && let Expr::Name(name) = if_expr.orelse.as_ref()
+                && name.id.as_str().is_empty()
+            {
+                let test_end = if_expr.test.range().end().to_usize();
+                if test_end <= self.raw && self.best_test_end.is_none_or(|best| test_end > best) {
+                    self.best_test_end = Some(test_end);
+                    self.body_start = if_expr.body.range().start().to_usize();
+                }
+            }
+            walk_expr(self, expr);
+        }
+
+        fn visit_stmt(&mut self, statement: &'a ast::Stmt) {
+            walk_stmt(self, statement);
+        }
+    }
+
+    let parsed = recovered_module(source);
+    let mut finder = Finder {
+        raw,
+        best_test_end: None,
+        body_start: 0,
+    };
+    for statement in &parsed.syntax().body {
+        finder.visit_stmt(statement);
+    }
+    let test_end = finder.best_test_end?;
+    Some((
+        "expected 'else' after 'if' expression".to_owned(),
+        finder.body_start,
+        test_end,
+    ))
+}
+
+struct CaseHeader {
+    case_at: usize,
+    colon_at: usize,
+    colon_line_end: usize,
+    same_line_block: bool,
+}
+
+fn next_content_line_start(source: &str, mut index: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    while index < bytes.len() {
+        let start = index;
+        while index < bytes.len() && bytes[index] != b'\n' {
+            index += 1;
+        }
+        let line = &source[start..index];
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            return Some(start);
+        }
+        if index < bytes.len() {
+            index += 1;
+        }
+    }
+    None
+}
+
+fn find_case_header_colon(source: &str, mut index: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut depth = 0i32;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'#' => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'\'' | b'"' => index = skip_string_literal(bytes, index),
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                index += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            b'\n' if depth <= 0 => return None,
+            b':' if depth == 0 && bytes.get(index + 1) != Some(&b'=') => return Some(index),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn case_header_on_line(source: &str, line_start: usize) -> Option<CaseHeader> {
+    let bytes = source.as_bytes();
+    let mut index = line_start;
+    while index < bytes.len() && matches!(bytes[index], b' ' | b'\t') {
+        index += 1;
+    }
+    if !source
+        .get(index..)
+        .is_some_and(|rest| rest.starts_with("case"))
+    {
+        return None;
+    }
+    let case_at = index;
+    index += 4;
+    if let Some(next) = source.get(index..).and_then(|rest| rest.chars().next())
+        && rustpython_unicode::identifier::is_continue(next)
+    {
+        return None;
+    }
+    let first = skip_spaces_tabs(source, index);
+    if first >= bytes.len() {
+        return None;
+    }
+    let first_char = source[first..].chars().next()?;
+    let allowed = rustpython_unicode::identifier::is_start(first_char)
+        || first_char.is_ascii_digit()
+        || matches!(
+            bytes[first],
+            b'(' | b'[' | b'{' | b'-' | b'\'' | b'"' | b'*'
+        );
+    if !allowed {
+        return None;
+    }
+    if bytes[first] == b'*' && bytes.get(first + 1) == Some(&b'=') {
+        return None;
+    }
+    let colon_at = find_case_header_colon(source, index)?;
+    if source[index..colon_at].trim().is_empty() {
+        return None;
+    }
+    let colon_line_end = line_end_index(source, colon_at);
+    let rest = source[colon_at + 1..colon_line_end].trim();
+    let same_line_block = !rest.is_empty() && !rest.starts_with('#');
+    let has_following_block = {
+        let after = if colon_line_end < bytes.len() {
+            colon_line_end + 1
+        } else {
+            colon_line_end
+        };
+        next_content_line_start(source, after)
+            .is_some_and(|start| line_indent(source, start) > line_indent(source, line_start))
+    };
+    if !same_line_block && !has_following_block {
+        return None;
+    }
+    Some(CaseHeader {
+        case_at,
+        colon_at,
+        colon_line_end,
+        same_line_block,
+    })
+}
+
+/// `invalid_match_stmt` (3.15): `a="case" patterns guard? b=':' block`.
+fn case_outside_match_error(
+    e: &crate::compile::CompileError,
+    source: &str,
+) -> Option<(String, usize, usize)> {
+    use rustpython_compiler::ast::{
+        self, Stmt,
+        visitor::{Visitor, walk_expr, walk_stmt},
+    };
+
+    let parse_err = recoverable_parse_error(e)?;
+    let raw = parse_err.raw_location.start().to_usize();
+    let mut line_start = line_start_index(source, raw.min(source.len()));
+    let mut header = case_header_on_line(source, line_start)?;
+    let case_at = header.case_at;
+
+    struct Finder {
+        case_at: usize,
+        inside_match: bool,
+    }
+
+    impl<'a> Visitor<'a> for Finder {
+        fn visit_stmt(&mut self, statement: &'a Stmt) {
+            if let Stmt::Match(_) = statement {
+                let start = statement.range().start().to_usize();
+                let end = statement.range().end().to_usize();
+                if start <= self.case_at && self.case_at < end {
+                    self.inside_match = true;
+                }
+            }
+            walk_stmt(self, statement);
+        }
+
+        fn visit_expr(&mut self, expr: &'a ast::Expr) {
+            walk_expr(self, expr);
+        }
+    }
+
+    let parsed = recovered_module(source);
+    let mut finder = Finder {
+        case_at,
+        inside_match: false,
+    };
+    for statement in &parsed.syntax().body {
+        finder.visit_stmt(statement);
+    }
+    if finder.inside_match {
+        return None;
+    }
+
+    while !header.same_line_block {
+        let after = if header.colon_line_end < source.len() {
+            header.colon_line_end + 1
+        } else {
+            header.colon_line_end
+        };
+        let Some(block_line) = next_content_line_start(source, after) else {
+            break;
+        };
+        if case_header_on_line(source, block_line).is_none() {
+            break;
+        }
+        line_start = block_line;
+        header = case_header_on_line(source, line_start)?;
+    }
+    Some((
+        "case statement must be inside match statement".to_owned(),
+        header.case_at,
+        header.colon_at + 1,
+    ))
+}
+
+fn stmt_leading_expr(
+    statement: &rustpython_compiler::ast::Stmt,
+) -> Option<&rustpython_compiler::ast::Expr> {
+    use rustpython_compiler::ast::Stmt;
+    match statement {
+        Stmt::Expr(node) => Some(node.value.as_ref()),
+        Stmt::Assign(node) => node.targets.first(),
+        Stmt::AnnAssign(node) => Some(node.target.as_ref()),
+        Stmt::AugAssign(node) => Some(node.target.as_ref()),
+        _ => None,
+    }
+}
+
+/// `invalid_assert_stmt` (3.15).
+fn invalid_assert_stmt_error(
+    e: &crate::compile::CompileError,
+    source: &str,
+) -> Option<(String, usize, usize)> {
+    use rustpython_compiler::ast::{
+        self, Expr, Stmt,
+        visitor::{Visitor, walk_expr, walk_stmt},
+    };
+
+    let parse_err = recoverable_parse_error(e)?;
+    let raw = parse_err.raw_location.start().to_usize();
+    let bytes = source.as_bytes();
+    let (walrus, op_len) = if bytes.get(raw) == Some(&b':') && bytes.get(raw + 1) == Some(&b'=') {
+        (true, 2usize)
+    } else if bytes.get(raw) == Some(&b'=') && bytes.get(raw + 1) != Some(&b'=') {
+        (false, 1usize)
+    } else {
+        return None;
+    };
+    let parsed = recovered_module(source);
+
+    struct AssertFinder<'a> {
+        raw: usize,
+        source: &'a str,
+        found: Option<&'a Stmt>,
+    }
+
+    impl<'a> Visitor<'a> for AssertFinder<'a> {
+        fn visit_stmt(&mut self, statement: &'a Stmt) {
+            if let Stmt::Assert(assert) = statement {
+                let p = skip_spaces_tabs(self.source, assert.range().end().to_usize());
+                if p == self.raw {
+                    self.found = Some(statement);
+                }
+            }
+            walk_stmt(self, statement);
+        }
+
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            walk_expr(self, expr);
+        }
+    }
+
+    let mut finder = AssertFinder {
+        raw,
+        source,
+        found: None,
+    };
+    for statement in &parsed.syntax().body {
+        finder.visit_stmt(statement);
+    }
+    let Stmt::Assert(assert) = finder.found? else {
+        return None;
+    };
+    let a = assert.msg.as_deref().unwrap_or(assert.test.as_ref());
+    let q = skip_spaces_tabs(source, raw + op_len);
+
+    struct StmtAt<'a> {
+        q: usize,
+        found: Option<&'a Stmt>,
+    }
+
+    impl<'a> Visitor<'a> for StmtAt<'a> {
+        fn visit_stmt(&mut self, statement: &'a Stmt) {
+            if statement.range().start().to_usize() == self.q {
+                self.found = Some(statement);
+            }
+            walk_stmt(self, statement);
+        }
+
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            walk_expr(self, expr);
+        }
+    }
+
+    let mut at = StmtAt { q, found: None };
+    for statement in &parsed.syntax().body {
+        at.visit_stmt(statement);
+    }
+
+    let mut b = at.found.and_then(stmt_leading_expr);
+    if let Some(Expr::Tuple(tuple)) = b
+        && tuple.range().start().to_usize() == q
+    {
+        b = tuple.elts.first();
+    }
+    if b.is_none() {
+        struct ExprAt<'a> {
+            q: usize,
+            found: Option<&'a Expr>,
+        }
+        impl<'a> Visitor<'a> for ExprAt<'a> {
+            fn visit_expr(&mut self, expr: &'a Expr) {
+                if self.found.is_none() && expr.range().start().to_usize() == self.q {
+                    self.found = Some(expr);
+                }
+                walk_expr(self, expr);
+            }
+            fn visit_stmt(&mut self, statement: &'a ast::Stmt) {
+                walk_stmt(self, statement);
+            }
+        }
+        let mut expr_at = ExprAt { q, found: None };
+        for statement in &parsed.syntax().body {
+            expr_at.visit_stmt(statement);
+        }
+        b = expr_at.found;
+        if let Some(Expr::Tuple(tuple)) = b
+            && tuple.range().start().to_usize() == q
+        {
+            b = tuple.elts.first();
+        }
+    }
+    let b = b?;
+    let start = a.range().start().to_usize();
+    let end = b.range().end().to_usize();
+    if walrus {
+        Some((
+            "cannot use named expression without parentheses here".to_owned(),
+            start,
+            end,
+        ))
+    } else {
+        let name = assignment_expr_name(a)?;
+        Some((
+            format!("cannot assign to {name} here. Maybe you meant '==' instead of '='?"),
+            start,
+            end,
+        ))
+    }
+}
+
+fn starred_covers_raw(expr: &rustpython_compiler::ast::Expr, raw: usize) -> bool {
+    if let rustpython_compiler::ast::Expr::Starred(starred) = expr {
+        let start = starred.range().start().to_usize();
+        let end = starred.range().end().to_usize();
+        start < raw && raw <= end
+    } else {
+        false
+    }
+}
+
+fn slice_family_starred_covers(expr: &rustpython_compiler::ast::Expr, raw: usize) -> bool {
+    use rustpython_compiler::ast::Expr;
+    match expr {
+        Expr::Starred(_) => starred_covers_raw(expr, raw),
+        Expr::Tuple(tuple) => tuple
+            .elts
+            .iter()
+            .any(|element| slice_family_starred_covers(element, raw)),
+        // A star that opens a subscript element is `invalid_starred_expression`
+        // even when the element goes on as a slice (`A[*(1:2)]`); one after
+        // the first `:` sits in a slice bound, which is plain `expression`
+        // (`A[:*]` stays `invalid syntax`).
+        Expr::Slice(slice) => slice
+            .lower
+            .as_deref()
+            .is_some_and(|element| slice_family_starred_covers(element, raw)),
+        _ => false,
+    }
+}
+
+/// `invalid_starred_expression` (3.15): `'*'` through `starred_expression` in
+/// slices and call `args`.
+fn invalid_star_expression_error(
+    e: &crate::compile::CompileError,
+    source: &str,
+) -> Option<(String, usize, usize)> {
+    use rustpython_compiler::ast::{
+        self, Expr,
+        visitor::{Visitor, walk_expr, walk_stmt},
+    };
+    use rustpython_compiler::parser::ParseErrorType;
+
+    let parse_err = recoverable_parse_error(e)?;
+    let generic_invalid = match &parse_err.error {
+        ParseErrorType::ExpectedToken { .. } => true,
+        ParseErrorType::OtherError(message) if message == "invalid syntax" => true,
+        _ => false,
+    };
+    if !generic_invalid {
+        return None;
+    }
+    let raw = parse_err.raw_location.start().to_usize();
+
+    struct Finder {
+        raw: usize,
+        found: bool,
+    }
+
+    impl<'a> Visitor<'a> for Finder {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if self.found {
+                return;
+            }
+            match expr {
+                Expr::Call(call) => {
+                    if call
+                        .arguments
+                        .args
+                        .iter()
+                        .any(|arg| starred_covers_raw(arg, self.raw))
+                    {
+                        self.found = true;
+                        return;
+                    }
+                }
+                Expr::Subscript(sub) => {
+                    if slice_family_starred_covers(&sub.slice, self.raw) {
+                        self.found = true;
+                        return;
+                    }
+                }
+                _ => {}
+            }
+            walk_expr(self, expr);
+        }
+
+        fn visit_stmt(&mut self, statement: &'a ast::Stmt) {
+            if !self.found {
+                walk_stmt(self, statement);
+            }
+        }
+    }
+
+    let parsed = recovered_module(source);
+    let mut finder = Finder { raw, found: false };
+    for statement in &parsed.syntax().body {
+        finder.visit_stmt(statement);
+    }
+    finder.found.then(|| {
+        (
+            "Invalid star expression".to_owned(),
+            parse_err.raw_location.start().to_usize(),
+            parse_err.raw_location.end().to_usize(),
+        )
+    })
+}
+
+fn starred_is_slice_upper_or_step(source: &str, starred_start: usize) -> bool {
+    use rustpython_compiler::ast::{
+        self, Expr,
+        visitor::{Visitor, walk_expr, walk_stmt},
+    };
+
+    struct Finder {
+        starred_start: usize,
+        found: bool,
+    }
+
+    impl<'a> Visitor<'a> for Finder {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if self.found {
+                return;
+            }
+            if let Expr::Slice(slice) = expr {
+                let is_starred_at = |inner: Option<&Expr>| {
+                    matches!(inner, Some(Expr::Starred(starred))
+                        if starred.range().start().to_usize() == self.starred_start)
+                };
+                if is_starred_at(slice.upper.as_deref()) || is_starred_at(slice.step.as_deref()) {
+                    self.found = true;
+                    return;
+                }
+            }
+            walk_expr(self, expr);
+        }
+
+        fn visit_stmt(&mut self, statement: &'a ast::Stmt) {
+            if !self.found {
+                walk_stmt(self, statement);
+            }
+        }
+    }
+
+    let parsed = recovered_module(source);
+    let mut finder = Finder {
+        starred_start,
+        found: false,
+    };
+    for statement in &parsed.syntax().body {
+        finder.visit_stmt(statement);
+    }
+    finder.found
+}
+
+/// Starred slice-bound span for `InvalidStarredExpressionUsage` (3.15).
+fn starred_slice_bound_span(
+    e: &crate::compile::CompileError,
+    source: &str,
+) -> Option<(String, usize, usize)> {
+    use rustpython_compiler::ast::{
+        self, Expr,
+        visitor::{Visitor, walk_expr, walk_stmt},
+    };
+    use rustpython_compiler::parser::ParseErrorType;
+
+    let parse_err = recoverable_parse_error(e)?;
+    if !matches!(
+        parse_err.error,
+        ParseErrorType::InvalidStarredExpressionUsage
+    ) {
+        return None;
+    }
+    let raw = parse_err.raw_location.start().to_usize();
+
+    struct Finder {
+        raw: usize,
+        end: Option<usize>,
+    }
+
+    impl<'a> Visitor<'a> for Finder {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if self.end.is_some() {
+                return;
+            }
+            if let Expr::Starred(starred) = expr
+                && starred.range().start().to_usize() == self.raw
+            {
+                self.end = Some(starred.range().end().to_usize());
+                return;
+            }
+            walk_expr(self, expr);
+        }
+
+        fn visit_stmt(&mut self, statement: &'a ast::Stmt) {
+            if self.end.is_none() {
+                walk_stmt(self, statement);
+            }
+        }
+    }
+
+    let parsed = recovered_module(source);
+    let mut finder = Finder { raw, end: None };
+    for statement in &parsed.syntax().body {
+        finder.visit_stmt(statement);
+    }
+    let end = finder.end?;
+    let j = skip_spaces_tabs(source, end);
+    let bytes = source.as_bytes();
+    if bytes.get(j) != Some(&b':') || bytes.get(j + 1) == Some(&b'=') {
+        return None;
+    }
+    if starred_is_slice_upper_or_step(source, raw) {
+        return None;
+    }
+    Some(("invalid syntax".to_owned(), j, j + 1))
+}
+
+/// Unparenthesized tuple in `raise` / `yield from` (3.15).
+fn unparenthesized_raise_tuple_span(
+    e: &crate::compile::CompileError,
+    source: &str,
+) -> Option<(String, usize, usize)> {
+    use rustpython_compiler::parser::ParseErrorType;
+
+    let parse_err = recoverable_parse_error(e)?;
+    if !matches!(
+        parse_err.error,
+        ParseErrorType::UnparenthesizedTupleExpression
+    ) {
+        return None;
+    }
+    let start = parse_err.raw_location.start().to_usize();
+    let end = parse_err.raw_location.end().to_usize().min(source.len());
+    let bytes = source.as_bytes();
+    let mut index = start;
+    let mut depth = 0i32;
+    while index < end {
+        match bytes[index] {
+            b'\'' | b'"' => index = skip_string_literal(bytes, index),
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                index += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            b',' if depth == 0 => return Some(("invalid syntax".to_owned(), index, index + 1)),
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 /// The `SyntaxError` subclass a compile failure belongs to.  3.14 raises
@@ -19427,7 +20344,11 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     };
 
     // Any bit outside the recognised compilation-flag set is rejected.
+    // `future.py allowed_flags` also holds `nested_scopes`' `CO_NESTED`
+    // (0x0010).  It selects nothing, so only this validity check takes it.
+    const CO_NESTED: i64 = 0x0010;
     let recognized = COMPILER_FLAGS
+        | CO_NESTED
         | PYCF_ONLY_AST
         | PYCF_DONT_IMPLY_DEDENT
         | PYCF_SOURCE_IS_UTF8

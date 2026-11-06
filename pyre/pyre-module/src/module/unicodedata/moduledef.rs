@@ -27,6 +27,7 @@ pyre_interpreter::py_module! {
         "is_normalized"    / 2 = interp_ucd::is_normalized,
         "isxidstart"              / 1 = interp_ucd::isxidstart,
         "isxidcontinue"           / 1 = interp_ucd::isxidcontinue,
+        "block"                   / 1 = interp_ucd::block,
         "grapheme_cluster_break"  / 1 = interp_ucd::grapheme_cluster_break,
         "indic_conjunct_break"    / 1 = interp_ucd::indic_conjunct_break,
         "extended_pictographic"   / 1 = interp_ucd::extended_pictographic,

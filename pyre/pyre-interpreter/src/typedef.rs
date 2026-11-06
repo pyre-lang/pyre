@@ -4662,11 +4662,9 @@ fn module_annotations_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 &[format],
             )?;
             if !unsafe { pyre_object::is_dict(result) } {
-                let received = crate::typedef::r#type(result)
-                    .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) }.to_string())
-                    .unwrap_or_else(|| unsafe { (*(*result).ob_type).name }.to_string());
-                return Err(crate::PyError::type_error(format!(
-                    "__annotate__ returned non-dict of type '{received}'"
+                return Err(crate::PyError::type_error(crate::display::wtf8_format!(
+                    "__annotate__() must return a dict, not ",
+                    unsafe { crate::display::type_fully_qualified_name_of(result) },
                 )));
             }
             result

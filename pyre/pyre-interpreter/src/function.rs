@@ -2416,9 +2416,9 @@ pub unsafe fn function_get_annotations(obj: PyObjectRef) -> Result<PyObjectRef, 
                 &[pyre_object::gc_roots::shadow_stack_get(idx_slot)],
             )?;
             if !pyre_object::is_dict(dict) {
-                return Err(crate::PyError::type_error(format!(
-                    "__annotate__ returned non-dict of type '{}'",
-                    crate::baseobjspace::object_functionstr_type_name(dict),
+                return Err(crate::PyError::type_error(crate::display::wtf8_format!(
+                    "__annotate__() must return a dict, not ",
+                    unsafe { crate::display::type_fully_qualified_name_of(dict) },
                 )));
             }
             let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);

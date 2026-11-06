@@ -777,22 +777,16 @@ pub fn list_extend_value(list: PyObjectRef, mut iterable: PyObjectRef) -> Result
     }
 }
 
-/// SET_ADD — `set.add(value)` (or `list.append` for the list-shaped
-/// accumulator).  Shared by the interpreter's `set_add` and the JIT
-/// residual `bh_set_add_fn`.  `set` is peeked, mutated in place.
+/// SET_ADD — `set.add(value)`.  Shared by the interpreter's `set_add` and
+/// the JIT residual `bh_set_add_fn`.  `set` is peeked, mutated in place.
 ///
 /// pyopcode.py uses `space.call_method(w_set, 'add', ...)`; this stores
-/// directly by container type instead.  These accumulators only ever touch
-/// the container the surrounding BUILD_SET / BUILD_MAP / BUILD_LIST just
-/// pushed — a set/dict/list comprehension or display has no syntax to
-/// target a user subclass — so the container is always the exact builtin
-/// type and the method-dispatch vs direct-store distinction is not
-/// observable (SET_UPDATE / DICT_UPDATE below take the same shortcut; the
-/// *source* iterable/mapping, which can be arbitrary, still goes through
-/// the iterator / mapping protocol).
+/// directly into an exact builtin `set`.  BUILD_SET / set comprehensions
+/// push `w_set_new()`.  A rebound `__conditional_annotations__` that is
+/// not an exact `set` raises `TypeError("'%T' object is not a set")`.
 pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError> {
     unsafe {
-        if pyre_object::is_set_or_frozenset(set) {
+        if pyre_object::is_exact_type(set, &pyre_object::setobject::SET_TYPE) {
             // `IntegerSetStrategy.add` with `is_correct_type(w_key)`:
             // `d[self.unwrap(w_key)] = None`. A plain int is stored unwrapped
             // and needs no `try_hash_value` first. The helper reads the
@@ -829,8 +823,11 @@ pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError
             };
             pyre_object::w_set_add_hashed_checked(roots.get(base), roots.get(base + 1), hash)
                 .map_err(crate::baseobjspace::map_set_update_error)?;
-        } else if pyre_object::is_list(set) {
-            pyre_object::w_list_append(set, value);
+        } else {
+            return Err(PyError::type_error(format!(
+                "'{}' object is not a set",
+                crate::display::type_fully_qualified_name_of(set),
+            )));
         }
     }
     Ok(())

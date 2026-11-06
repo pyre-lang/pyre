@@ -864,9 +864,7 @@ pub(crate) fn after_fork_child() {
 }
 
 // os_lock.py `RPY_LOCK_FAILURE, RPY_LOCK_ACQUIRED, RPY_LOCK_INTR`.
-const RPY_LOCK_FAILURE: i64 = 0;
-const RPY_LOCK_ACQUIRED: i64 = 1;
-const RPY_LOCK_INTR: i64 = 2;
+use majit_rlib::rthread::{RPY_LOCK_ACQUIRED, RPY_LOCK_FAILURE, RPY_LOCK_INTR, ThreadLock};
 
 /// A `pthread_mutex_t` has no poison state — `thread_pthread.c` inspects only
 /// the status code — so a panic taken while lock bookkeeping was held must not
@@ -1018,32 +1016,13 @@ fn acquire_timed(
 
 mod lock_class {
     use super::*;
-    // `pthread_cond_wait` returning without the lock is how
-    // `RPyThreadAcquireLockTimed` detects a signal (thread_pthread.c:466-471),
-    // so the wait must be the bare one-shot call that propagates spurious
-    // wakeups.  `parking_lot`'s condition variable retries internally and
-    // would swallow exactly the wakeup that carries the interrupt.
-    use std::sync::{Condvar, Mutex};
-
-    /// Native mutex acquisition is the residual `RPyThreadAcquireLock*`
-    /// primitive (`rpython/rlib/rthread.py:60-90,160-200`).  Keep the Python
-    /// lock algorithms visible while hiding Rust's poison-Result ABI inside
-    /// the same external boundary.  A `pthread_mutex_t` has no poison state,
-    /// so recovery returns the guard exactly as the platform primitive does.
-    #[majit_macros::dont_look_inside]
-    fn lock_state(mutex: &Mutex<bool>) -> std::sync::MutexGuard<'_, bool> {
-        mutex
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 
     // CPython 3.14 Modules/_threadmodule.c builds lock_type_spec as an
     // immutable module heap type.
     #[crate::pyre_class("_thread.lock", cpython_heaptype, weakrefable)]
     #[derive(Default)]
     pub struct W_Lock {
-        locked: Mutex<bool>,
-        ready: Condvar,
+        lock: ThreadLock,
     }
 
     #[crate::pyre_methods(doc = "A lock object is a synchronization primitive.", weakrefable)]
@@ -1063,9 +1042,8 @@ mod lock_class {
             Ok(obj)
         }
 
-        /// `thread_pthread.c:427-485 RPyThreadAcquireLockTimed`, the mutex and
-        /// condition-variable build — the shape this lock has — with
-        /// `intr_flag=1`, which is what `rthread.py:195` passes.
+        /// `thread_pthread.c RPyThreadAcquireLockTimed` and
+        /// `rthread.py Lock.acquire_timed` (`intr_flag=1`).
         #[majit_macros::dont_look_inside]
         fn acquire_timed(&self, microseconds: i64) -> i64 {
             // A potentially blocking native lock wait leaves the collector's
@@ -1073,50 +1051,7 @@ mod lock_class {
             // guard ends with the primitive, so the signal handlers the caller
             // runs on `RPY_LOCK_INTR` execute back inside the census.
             let _blocked = before_external_block();
-            let mut locked = lock_state(&self.locked);
-            let mut success;
-            if !*locked {
-                success = RPY_LOCK_ACQUIRED;
-            } else if microseconds == 0 {
-                success = RPY_LOCK_FAILURE;
-            } else {
-                let deadline = (microseconds > 0)
-                    .then(|| Instant::now() + Duration::from_micros(microseconds as u64));
-                success = RPY_LOCK_FAILURE;
-                while success == RPY_LOCK_FAILURE {
-                    if let Some(deadline) = deadline {
-                        let now = Instant::now();
-                        if now >= deadline {
-                            break;
-                        }
-                        let (guard, timeout) = self
-                            .ready
-                            .wait_timeout(locked, deadline - now)
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        locked = guard;
-                        if timeout.timed_out() {
-                            break;
-                        }
-                    } else {
-                        locked = self
-                            .ready
-                            .wait(locked)
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    }
-                    if *locked {
-                        // We were woken up, but didn't get the lock.  We
-                        // probably received a signal.  Return RPY_LOCK_INTR to
-                        // allow the caller to handle it and retry.
-                        success = RPY_LOCK_INTR;
-                    } else {
-                        success = RPY_LOCK_ACQUIRED;
-                    }
-                }
-            }
-            if success == RPY_LOCK_ACQUIRED {
-                *locked = true;
-            }
-            success
+            self.lock.acquire_timed(microseconds, true)
         }
 
         /// `os_lock.py descr_lock_acquire`.
@@ -1131,17 +1066,14 @@ mod lock_class {
         }
 
         fn release(&self) -> Result<(), crate::PyError> {
-            let mut locked = lock_state(&self.locked);
-            if !*locked {
+            if self.lock.release() == -1 {
                 return Err(crate::PyError::runtime_error("release unlocked lock"));
             }
-            *locked = false;
-            self.ready.notify_one();
             Ok(())
         }
 
         fn locked(&self) -> bool {
-            *lock_state(&self.locked)
+            self.lock.is_locked()
         }
 
         fn __enter__(&self) -> Result<PyObjectRef, crate::PyError> {
@@ -1163,14 +1095,10 @@ mod lock_class {
         }
 
         fn _at_fork_reinit(&self) {
-            // The old native mutex/condvar may have been owned by a thread which
+            // The old native lock may have been owned by a thread which
             // vanished at fork.  PyPy's rthread lock reinit replaces the native
             // lock without trying to acquire or destroy the inherited one.
-            let this = self as *const Self as *mut Self;
-            unsafe {
-                std::ptr::write(&mut (*this).locked, Mutex::new(false));
-                std::ptr::write(&mut (*this).ready, Condvar::new());
-            }
+            self.lock.reinit();
         }
     }
 }
@@ -1178,25 +1106,6 @@ pub use lock_class::W_Lock;
 
 mod rlock_class {
     use super::*;
-    // Same interrupt-detection requirement as `lock_class`.
-    use std::sync::{Condvar, Mutex};
-
-    #[derive(Default)]
-    struct RLockState {
-        count: i64,
-        owner: i64,
-    }
-
-    /// RLock bookkeeping is visible to the generated JIT, but acquiring its
-    /// native mutex is the same residual `RPyThreadAcquireLock*` primitive as
-    /// the non-recursive lock.  Rust poisoning has no RPython counterpart and
-    /// stays inside this host boundary.
-    #[majit_macros::dont_look_inside]
-    fn lock_state(mutex: &Mutex<RLockState>) -> std::sync::MutexGuard<'_, RLockState> {
-        mutex
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 
     /// `rlock_new`: the exact type, or a subtype that inherits RLock's
     /// `__init__`, takes no arguments (`_PyArg_NoPositional`, then
@@ -1258,8 +1167,9 @@ mod rlock_class {
     #[crate::pyre_class("_thread.RLock", cpython_heaptype, weakrefable)]
     #[derive(Default)]
     pub struct W_RLock {
-        state: Mutex<RLockState>,
-        ready: Condvar,
+        lock: ThreadLock,
+        owner: AtomicI64,
+        count: AtomicI64,
     }
 
     #[crate::pyre_methods(weakrefable)]
@@ -1271,60 +1181,12 @@ mod rlock_class {
             rlock_new(cls, args.len() > 1, false)
         }
 
-        /// The native-lock half of `os_lock.py acquire_w`, shaped to
-        /// the `RPyThreadAcquireLockTimed` ABI (thread_pthread.c:427-485) so
-        /// `acquire_timed` can deliver signals between attempts.
-        ///
-        /// Upstream keeps `rlock_count`/`rlock_owner` outside the native lock
-        /// because the GIL serializes them; free-threaded pyre has no such
-        /// serialization, so ownership is claimed under the same mutex the
-        /// wait releases — the place `thread_pthread.c:479` sets `locked`.
+        /// `thread_pthread.c RPyThreadAcquireLockTimed` and
+        /// `rthread.py Lock.acquire_timed` (`intr_flag=1`).
         #[majit_macros::dont_look_inside]
-        fn acquire_timed(&self, microseconds: i64, ident: i64) -> i64 {
+        fn acquire_timed(&self, microseconds: i64) -> i64 {
             let _blocked = before_external_block();
-            let mut state = lock_state(&self.state);
-            let mut success;
-            if state.count == 0 {
-                success = RPY_LOCK_ACQUIRED;
-            } else if microseconds == 0 {
-                success = RPY_LOCK_FAILURE;
-            } else {
-                let deadline = (microseconds > 0)
-                    .then(|| Instant::now() + Duration::from_micros(microseconds as u64));
-                success = RPY_LOCK_FAILURE;
-                while success == RPY_LOCK_FAILURE {
-                    if let Some(deadline) = deadline {
-                        let now = Instant::now();
-                        if now >= deadline {
-                            break;
-                        }
-                        let (guard, timeout) = self
-                            .ready
-                            .wait_timeout(state, deadline - now)
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        state = guard;
-                        if timeout.timed_out() {
-                            break;
-                        }
-                    } else {
-                        state = self
-                            .ready
-                            .wait(state)
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    }
-                    if state.count != 0 {
-                        // Woken without the lock — probably a signal.
-                        success = RPY_LOCK_INTR;
-                    } else {
-                        success = RPY_LOCK_ACQUIRED;
-                    }
-                }
-            }
-            if success == RPY_LOCK_ACQUIRED {
-                state.owner = ident;
-                state.count = 1;
-            }
-            success
+            self.lock.acquire_timed(microseconds, true)
         }
 
         /// `os_lock.py acquire_w`.
@@ -1335,79 +1197,80 @@ mod rlock_class {
         ) -> Result<bool, crate::PyError> {
             let microseconds = parse_acquire_args(blocking, timeout)?;
             let tid = current_ident();
-            {
-                let mut state = lock_state(&self.state);
-                if state.count > 0 && state.owner == tid {
-                    state.count = state.count.checked_add(1).ok_or_else(|| {
-                        crate::PyError::overflow_error("internal lock count overflowed")
-                    })?;
-                    return Ok(true);
-                }
+            let count = self.count.load(Ordering::Relaxed);
+            if count > 0 && self.owner.load(Ordering::Relaxed) == tid {
+                let new_count = count.checked_add(1).ok_or_else(|| {
+                    crate::PyError::overflow_error("internal lock count overflowed")
+                })?;
+                self.count.store(new_count, Ordering::Relaxed);
+                return Ok(true);
             }
-            // os_lock.py:231-235 — `self.lock.acquire(False)` first; only a
-            // failed poll waits, and only when `blocking`.  The count check
-            // upstream pairs it with is the same predicate the poll tests,
-            // because here the count is the lock.
-            let mut r = self.acquire_timed(0, tid) == RPY_LOCK_ACQUIRED;
+            // `os_lock.py acquire_w` — `self.lock.acquire(False)` first; only a
+            // failed poll waits, and only when `blocking`.
+            let mut r = self.acquire_timed(0) == RPY_LOCK_ACQUIRED;
             if !r {
                 if blocking == 0 {
                     return Ok(false);
                 }
-                r = super::acquire_timed(microseconds, |us| self.acquire_timed(us, tid))?
+                r = super::acquire_timed(microseconds, |us| self.acquire_timed(us))?
                     == RPY_LOCK_ACQUIRED;
+            }
+            if r {
+                self.owner.store(tid, Ordering::Relaxed);
+                self.count.store(1, Ordering::Relaxed);
             }
             Ok(r)
         }
 
         fn release(&self) -> Result<(), crate::PyError> {
-            let ident = current_ident();
-            let mut state = lock_state(&self.state);
-            if state.count == 0 || state.owner != ident {
+            let tid = current_ident();
+            let count = self.count.load(Ordering::Relaxed);
+            if count == 0 || self.owner.load(Ordering::Relaxed) != tid {
                 return Err(crate::PyError::runtime_error(
                     "cannot release un-acquired lock",
                 ));
             }
-            state.count -= 1;
-            if state.count == 0 {
-                state.owner = 0;
-                self.ready.notify_one();
+            let new_count = count - 1;
+            self.count.store(new_count, Ordering::Relaxed);
+            if new_count == 0 {
+                self.owner.store(0, Ordering::Relaxed);
+                self.lock.release();
             }
             Ok(())
         }
 
         fn locked(&self) -> bool {
-            lock_state(&self.state).count != 0
+            self.lock.is_locked()
         }
 
         fn _is_owned(&self) -> bool {
-            let state = lock_state(&self.state);
-            state.count > 0 && state.owner == current_ident()
+            self.count.load(Ordering::Relaxed) > 0
+                && self.owner.load(Ordering::Relaxed) == current_ident()
         }
 
         fn _recursion_count(&self) -> i64 {
-            let state = lock_state(&self.state);
-            if state.owner == current_ident() {
-                state.count
+            if self.owner.load(Ordering::Relaxed) == current_ident() {
+                self.count.load(Ordering::Relaxed)
             } else {
                 0
             }
         }
 
         fn _release_save(&self) -> Result<PyObjectRef, crate::PyError> {
-            let mut state = lock_state(&self.state);
-            if state.count == 0 {
+            let count = self.count.load(Ordering::Relaxed);
+            if count == 0 {
                 return Err(crate::PyError::runtime_error(
                     "cannot release un-acquired lock",
                 ));
             }
+            let owner = self.owner.load(Ordering::Relaxed);
+            self.count.store(0, Ordering::Relaxed);
+            self.owner.store(0, Ordering::Relaxed);
+            self.lock.release();
             let mut fields = pyre_object::gc_roots::RootedItems::new();
-            fields.push(w_int_new(state.count));
-            fields.push(w_int_new(state.owner));
-            let saved = w_tuple_new(fields.take());
-            state.count = 0;
-            state.owner = 0;
-            self.ready.notify_one();
-            Ok(saved)
+            fields.push(w_int_new(count));
+            fields.push(w_int_new(owner));
+            Ok(w_tuple_new(fields.take()))
         }
 
         fn _acquire_restore(&self, saved: PyObjectRef) -> Result<(), crate::PyError> {
@@ -1424,11 +1287,12 @@ mod rlock_class {
             let owner = unsafe { w_int_get_value(items[1]) };
             // os_lock.py `self.lock.acquire(True)` reaches
             // `RPyThreadAcquireLockTimed` with `intr_flag=0`
-            // (rthread.py), so an interrupted wait is retried rather
+            // (`rthread.py`), so an interrupted wait is retried rather
             // than reported: restoring a saved state is not a place where a
             // signal may be delivered.
-            while self.acquire_timed(-1, owner) != RPY_LOCK_ACQUIRED {}
-            lock_state(&self.state).count = count;
+            while self.acquire_restore_wait() != RPY_LOCK_ACQUIRED {}
+            self.owner.store(owner, Ordering::Relaxed);
+            self.count.store(count, Ordering::Relaxed);
             Ok(())
         }
 
@@ -1443,26 +1307,28 @@ mod rlock_class {
         }
 
         fn __repr__(&self) -> String {
-            let state = lock_state(&self.state);
-            let locked = if state.count == 0 {
-                "unlocked"
-            } else {
-                "locked"
-            };
+            let locked = if self.locked() { "locked" } else { "unlocked" };
             format!(
                 "<{locked} _thread.RLock object owner={} count={} at {}>",
-                state.owner,
-                state.count,
+                self.owner.load(Ordering::Relaxed),
+                self.count.load(Ordering::Relaxed),
                 crate::display::repr_addr(self as *const Self as usize)
             )
         }
 
         fn _at_fork_reinit(&self) {
-            let this = self as *const Self as *mut Self;
-            unsafe {
-                std::ptr::write(&mut (*this).state, Mutex::new(RLockState::default()));
-                std::ptr::write(&mut (*this).ready, Condvar::new());
-            }
+            self.lock.reinit();
+            self.owner.store(0, Ordering::Relaxed);
+            self.count.store(0, Ordering::Relaxed);
+        }
+    }
+
+    impl W_RLock {
+        /// `rthread.py Lock.acquire(True)` / `RPyThreadAcquireLock` (`intr_flag=0`).
+        #[majit_macros::dont_look_inside]
+        fn acquire_restore_wait(&self) -> i64 {
+            let _blocked = before_external_block();
+            self.lock.acquire_timed(-1, false)
         }
     }
 }

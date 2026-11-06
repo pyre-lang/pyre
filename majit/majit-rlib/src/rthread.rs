@@ -187,6 +187,276 @@ pub fn threadlocalref_set(ofs: usize, value: i64) {
     unsafe { *threadlocalref_addr().byte_add(ofs) = value };
 }
 
+/// `os_lock.py` / `thread.h` `RPY_LOCK_FAILURE`, `RPY_LOCK_ACQUIRED`, `RPY_LOCK_INTR`.
+pub const RPY_LOCK_FAILURE: i64 = 0;
+pub const RPY_LOCK_ACQUIRED: i64 = 1;
+pub const RPY_LOCK_INTR: i64 = 2;
+
+/// `thread_pthread.c struct RPyOpaque_ThreadLock`.
+#[cfg(target_os = "linux")]
+pub struct ThreadLock {
+    sem: Box<UnsafeCell<libc::sem_t>>,
+}
+
+/// `thread_pthread.c struct RPyOpaque_ThreadLock`, mutex+cond build.
+#[cfg(not(target_os = "linux"))]
+struct CondLock {
+    locked: std::sync::Mutex<bool>,
+    lock_released: std::sync::Condvar,
+}
+
+/// `thread_pthread.c struct RPyOpaque_ThreadLock`.
+#[cfg(not(target_os = "linux"))]
+pub struct ThreadLock {
+    /// The native lock lives behind a pointer, like `rthread.py`'s
+    /// `c_thread_allocate_lock` result.
+    state: Box<std::cell::UnsafeCell<CondLock>>,
+}
+
+// The cell is written only by `reinit`, in the forked child, where no other
+// thread exists.
+unsafe impl Send for ThreadLock {}
+unsafe impl Sync for ThreadLock {}
+
+#[cfg(target_os = "linux")]
+fn rpythread_fix_status(status: i32) -> i32 {
+    if status == -1 {
+        std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(status)
+    } else {
+        status
+    }
+}
+
+/// `RPY_MICROSECONDS_TO_TIMESPEC`: `gettimeofday` plus `microseconds`,
+/// then `tv_nsec` below 1e9.
+#[cfg(target_os = "linux")]
+fn rpy_microseconds_to_timespec(microseconds: i64) -> libc::timespec {
+    let mut tv = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    unsafe {
+        libc::gettimeofday(&mut tv, std::ptr::null_mut());
+    }
+    let mut usec = tv.tv_usec as i64 + microseconds % 1_000_000;
+    let mut sec = tv.tv_sec as i64 + microseconds / 1_000_000;
+    sec += usec / 1_000_000;
+    usec %= 1_000_000;
+    libc::timespec {
+        tv_sec: sec as libc::time_t,
+        tv_nsec: (usec * 1000) as _,
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Default for ThreadLock {
+    fn default() -> Self {
+        Self::allocate()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ThreadLock {
+    /// `RPyOpaqueDealloc_ThreadLock`.
+    fn drop(&mut self) {
+        unsafe {
+            libc::sem_destroy(self.sem.get());
+        }
+    }
+}
+
+// `rthread.py` reaches every primitive below as an `llexternal`, so none is traced.
+#[cfg(target_os = "linux")]
+impl ThreadLock {
+    /// `rthread.py allocate_lock` / `RPyThreadLockInit`.
+    #[majit_macros::dont_look_inside]
+    pub fn allocate() -> Self {
+        let sem = Box::new(UnsafeCell::new(unsafe { std::mem::zeroed() }));
+        if unsafe { libc::sem_init(sem.get(), 0, 1) } != 0 {
+            panic!("sem_init failed");
+        }
+        Self { sem }
+    }
+
+    /// `RPyThreadAcquireLockTimed`.
+    #[majit_macros::dont_look_inside]
+    pub fn acquire_timed(&self, microseconds: i64, intr_flag: bool) -> i64 {
+        let thelock = self.sem.get();
+        let ts = (microseconds > 0).then(|| rpy_microseconds_to_timespec(microseconds));
+        let status = loop {
+            let raw = if microseconds > 0 {
+                unsafe { libc::sem_timedwait(thelock, ts.as_ref().unwrap()) }
+            } else if microseconds == 0 {
+                unsafe { libc::sem_trywait(thelock) }
+            } else {
+                unsafe { libc::sem_wait(thelock) }
+            };
+            let status = rpythread_fix_status(raw);
+            if intr_flag || status != libc::EINTR {
+                break status;
+            }
+        };
+        if status == 0 {
+            RPY_LOCK_ACQUIRED
+        } else if intr_flag && status == libc::EINTR {
+            RPY_LOCK_INTR
+        } else {
+            RPY_LOCK_FAILURE
+        }
+    }
+
+    /// `RPyThreadReleaseLock`.
+    #[majit_macros::dont_look_inside]
+    pub fn release(&self) -> i64 {
+        let thelock = self.sem.get();
+        let mut current_value = 0;
+        unsafe {
+            libc::sem_getvalue(thelock, &mut current_value);
+        }
+        if current_value > 0 {
+            return -1;
+        }
+        unsafe {
+            libc::sem_post(thelock);
+        }
+        0
+    }
+
+    #[majit_macros::dont_look_inside]
+    pub fn is_locked(&self) -> bool {
+        let mut current_value = 0;
+        unsafe {
+            libc::sem_getvalue(self.sem.get(), &mut current_value);
+        }
+        current_value == 0
+    }
+
+    /// Fork-child `RPyThreadLockInit` on the same storage.
+    #[majit_macros::dont_look_inside]
+    pub fn reinit(&self) {
+        let sem = self.sem.get();
+        unsafe {
+            std::ptr::write(sem, std::mem::zeroed());
+            if libc::sem_init(sem, 0, 1) != 0 {
+                panic!("sem_init failed");
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Default for ThreadLock {
+    fn default() -> Self {
+        Self::allocate()
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl ThreadLock {
+    /// `rthread.py allocate_lock` / `RPyThreadLockInit`.
+    #[majit_macros::dont_look_inside]
+    pub fn allocate() -> Self {
+        Self {
+            state: Box::new(std::cell::UnsafeCell::new(CondLock {
+                locked: std::sync::Mutex::new(false),
+                lock_released: std::sync::Condvar::new(),
+            })),
+        }
+    }
+
+    /// `RPyThreadAcquireLockTimed`.
+    #[majit_macros::dont_look_inside]
+    pub fn acquire_timed(&self, microseconds: i64, intr_flag: bool) -> i64 {
+        // The cell is written only by `reinit`, in the forked child.
+        let state = unsafe { &*self.state.get() };
+        let mut locked = state
+            .locked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut success;
+        if !*locked {
+            success = RPY_LOCK_ACQUIRED;
+        } else if microseconds == 0 {
+            success = RPY_LOCK_FAILURE;
+        } else {
+            let deadline = (microseconds > 0).then(|| {
+                std::time::Instant::now() + std::time::Duration::from_micros(microseconds as u64)
+            });
+            success = RPY_LOCK_FAILURE;
+            while success == RPY_LOCK_FAILURE {
+                if let Some(deadline) = deadline {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    let (guard, timeout) = state
+                        .lock_released
+                        .wait_timeout(locked, deadline - now)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    locked = guard;
+                    if timeout.timed_out() {
+                        break;
+                    }
+                } else {
+                    locked = state
+                        .lock_released
+                        .wait(locked)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                if intr_flag && *locked {
+                    success = RPY_LOCK_INTR;
+                    break;
+                } else if !*locked {
+                    success = RPY_LOCK_ACQUIRED;
+                } else {
+                    success = RPY_LOCK_FAILURE;
+                }
+            }
+        }
+        if success == RPY_LOCK_ACQUIRED {
+            *locked = true;
+        }
+        success
+    }
+
+    /// `RPyThreadReleaseLock`.
+    #[majit_macros::dont_look_inside]
+    pub fn release(&self) -> i64 {
+        let state = unsafe { &*self.state.get() };
+        let mut locked = state
+            .locked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = if !*locked { -1 } else { 0 };
+        *locked = false;
+        state.lock_released.notify_one();
+        result
+    }
+
+    #[majit_macros::dont_look_inside]
+    pub fn is_locked(&self) -> bool {
+        let state = unsafe { &*self.state.get() };
+        *state
+            .locked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Fork-child `RPyThreadLockInit` without dropping the inherited primitives:
+    /// the inherited mutex may be held by a thread that vanished at fork.
+    #[majit_macros::dont_look_inside]
+    pub fn reinit(&self) {
+        unsafe {
+            self.state.get().write(CondLock {
+                locked: std::sync::Mutex::new(false),
+                lock_released: std::sync::Condvar::new(),
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +491,37 @@ mod tests {
         assert_ne!(here, 0);
         assert_ne!(other, 0);
         assert_ne!(here, other);
+    }
+
+    #[cfg(unix)]
+    unsafe extern "C" fn nop_sigusr1(_: libc::c_int) {}
+
+    #[cfg(unix)]
+    #[test]
+    fn acquire_timed_reports_a_signal_as_intr() {
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = nop_sigusr1 as *const () as libc::sighandler_t;
+            sa.sa_flags = 0;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
+        }
+        let lock = ThreadLock::default();
+        assert_eq!(lock.acquire_timed(0, true), RPY_LOCK_ACQUIRED);
+        let target = unsafe { libc::pthread_self() as usize };
+        let killer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            unsafe {
+                libc::pthread_kill(target as libc::pthread_t, libc::SIGUSR1);
+            }
+        });
+        let start = std::time::Instant::now();
+        let result = lock.acquire_timed(5_000_000, true);
+        let elapsed = start.elapsed();
+        assert_eq!(result, RPY_LOCK_INTR);
+        assert!(elapsed < std::time::Duration::from_secs(3));
+        killer.join().unwrap();
+        assert_eq!(lock.release(), 0);
+        assert_eq!(lock.release(), -1);
     }
 }

@@ -1825,6 +1825,24 @@ crate::builtin_wrapper_descriptor!(
     __majit_wrap_sys_exception
 );
 
+/// `confstr(_CS_GNU_LIBPTHREAD_VERSION)`, read by `system.py get_thread_info`.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn gnu_libpthread_version() -> Option<String> {
+    let mut buf = [0u8; 128];
+    let len = unsafe {
+        libc::confstr(libc::_CS_GNU_LIBPTHREAD_VERSION, buf.as_mut_ptr().cast(), buf.len())
+    };
+    if len <= 1 || len > buf.len() {
+        return None;
+    }
+    std::str::from_utf8(&buf[..len - 1]).ok().map(str::to_owned)
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn gnu_libpthread_version() -> Option<String> {
+    None
+}
+
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -2896,12 +2914,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             crate::_structseq::make_struct_seq("sys.thread_info", &["name", "lock", "version"]);
         let mut fields = pyre_object::gc_roots::RootedItems::new();
         fields.push(w_str_new(if cfg!(windows) { "nt" } else { "pthread" }));
-        fields.push(if cfg!(windows) {
-            w_none()
-        } else {
-            w_str_new("semaphore")
-        });
-        fields.push(w_none());
+        // [3.15-spec] `PyThread_GetInfo` (Python/thread.c) reports "pymutex";
+        // `system.py get_thread_info` reports "semaphore" or "mutex+cond".
+        fields.push(w_str_new("pymutex"));
+        fields.push(gnu_libpthread_version().map_or_else(w_none, |v| w_str_new(&v)));
         let value = crate::_structseq::new_instance(ty, fields.take());
         module_ns_store(roots.get(ns_slot), "thread_info", value);
     }

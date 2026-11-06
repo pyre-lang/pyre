@@ -123,15 +123,16 @@ pub fn get_slotvalues(mut w_obj: PyObjectRef) -> PyResult {
 
 /// objectobject.py `object_getstate_default(space, w_obj, required)`.
 ///
+/// [3.15-spec] returns the instance dict itself ↔ PyPy returns a copy — c.__getstate__() is c.__dict__; evidence: typeobject.c object_getstate_default @ v3.15.0 (PyObject_GenericGetDict).
+///
 /// `required` is always 0 from both callers (`descr__getstate__` and the
 /// proto>=2 path), so the variable-sized raise is unreachable and pyre
 /// has no `variable_sized` layout notion to gate it on — the structure
 /// is ported without that dead arm.
 pub fn object_getstate_default(w_obj: PyObjectRef) -> PyResult {
-    // Allocating the copy, storing into it and `get_slotvalues` all collect,
-    // so the receiver, its `__dict__`, the items being copied and the copy
-    // itself are read back from the shadow stack rather than kept in Rust
-    // locals across those points.
+    // `get_slotvalues` collects, so the receiver and its `__dict__` are
+    // read back from the shadow stack rather than kept in Rust locals
+    // across that call.
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_obj);
@@ -142,33 +143,7 @@ pub fn object_getstate_default(w_obj: PyObjectRef) -> PyResult {
         let dict_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(d);
         if crate::baseobjspace::len_w(pyre_object::gc_roots::shadow_stack_get(dict_slot))? > 0 {
-            let copy_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
-            let items = unsafe {
-                pyre_object::w_dict_items(pyre_object::gc_roots::shadow_stack_get(dict_slot))
-            };
-            let mut live = Vec::with_capacity(items.len() * 2);
-            for (k, v) in &items {
-                live.push(*k);
-                live.push(*v);
-            }
-            let items_slot = pyre_object::gc_roots::pin_roots(&live);
-            let mut count = 0usize;
-            for index in 0..items.len() {
-                let k = pyre_object::gc_roots::shadow_stack_get(items_slot + 2 * index);
-                let v = pyre_object::gc_roots::shadow_stack_get(items_slot + 2 * index + 1);
-                unsafe {
-                    pyre_object::w_dict_store(
-                        pyre_object::gc_roots::shadow_stack_get(copy_slot),
-                        k,
-                        v,
-                    )
-                };
-                count += 1;
-            }
-            if count > 0 {
-                state_slot = Some(copy_slot);
-            }
+            state_slot = Some(dict_slot);
         }
     }
     let w_slots = get_slotvalues(current_obj())?;

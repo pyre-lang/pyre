@@ -2381,8 +2381,11 @@ fn format_render(
         // so a missing/out-of-range base raises IndexError/KeyError before a
         // malformed attribute or item chain raises ValueError.
         let full = FieldName::parse(field_name);
-        if matches!(full, Err(FormatParseError::MissingRightBracket)) {
-            return Err(format_parse_err(FormatParseError::MissingRightBracket, fmt));
+        if matches!(full, Err(FormatParseError::MissingRightSquareBracket)) {
+            return Err(format_parse_err(
+                FormatParseError::MissingRightSquareBracket,
+                fmt,
+            ));
         }
         let mut head = Wtf8Buf::new();
         for ch in field_name.code_points() {
@@ -2752,7 +2755,7 @@ fn index_positional(base: usize, len: usize, idx: usize) -> Result<PyObjectRef, 
 /// `FormatString` reports `UnmatchedBracket` for both a lone trailing `{`
 /// and an opened-but-unclosed field, so the trailing byte disambiguates the
 /// two CPython messages.
-fn format_parse_err(
+pub(crate) fn format_parse_err(
     err: rustpython_common::format::FormatParseError,
     fmt: &Wtf8,
 ) -> crate::PyError {
@@ -2768,8 +2771,11 @@ fn format_parse_err(
         E::MissingStartBracket => "Single '}' encountered in format string",
         E::UnescapedStartBracketInLiteral => "Single '{' encountered in format string",
         E::MissingRightBracket => "expected '}' before end of string",
+        E::MissingRightSquareBracket => "Missing ']' in format string",
         E::EmptyAttribute => "Empty attribute in format string",
-        E::UnknownConversion => "expected ':' after conversion specifier",
+        E::MissingConversion => "end of string while looking for conversion specifier",
+        E::MissingConversionColon => "expected ':' after conversion specifier",
+        E::UnexpectedStartBracket => "unexpected '{' in field name",
         // The template parser accepts only one bracket layer in a spec and
         // reports a second as `InvalidFormatSpecifier`; that is the markup
         // recursion limit being hit.

@@ -25774,6 +25774,7 @@ fn fixed_array_for_loop_has_no_residual_into_iter_next() {
 /// are genuine runtime boundaries.  PyPy reaches the former through
 /// `rthread.py`'s `llexternal` calls; none may expose Rust's
 /// `Result<_, PoisonError<_>>::unwrap_or_else` shell to the source graph.
+/// The `_queue` leaves live in `pyre-module`.
 #[test]
 #[ignore]
 fn native_lock_and_method_metadata_leaves_are_residual() {
@@ -25784,17 +25785,38 @@ fn native_lock_and_method_metadata_leaves_are_residual() {
     let llbc = crate::test_support::load_ullbc(path);
     let residuals = super::dont_look_inside_set_of(llbc);
     for expected in [
-        "module::_queue::queue_lock",
-        "module::_queue::simplequeue_wait_for_item",
-        "module::thread::lock_class::lock_state",
+        "module::thread::rlock_class::<Impl>::acquire_restore_wait",
         "module::thread::lock_class::<Impl>::acquire_timed",
-        "module::thread::rlock_class::lock_state",
         "module::thread::rlock_class::<Impl>::acquire_timed",
         "function::object_class_method_name",
     ] {
         assert!(
             residuals.contains(expected),
             "native/runtime leaf {expected} must remain residual; got {residuals:?}"
+        );
+    }
+
+    let module_llbc =
+        crate::test_support::load_ullbc(crate::runtime_names::artifacts::MODULE_ULLBC);
+    let module_residuals = super::dont_look_inside_set_of(&module_llbc);
+    let expected_queue = [
+        "module::_queue::queue_lock",
+        "module::_queue::simplequeue_wait_for_item",
+    ];
+    if expected_queue
+        .iter()
+        .any(|expected| !module_residuals.contains(*expected))
+    {
+        let queue_entries: Vec<_> = module_residuals
+            .iter()
+            .filter(|path| path.contains("_queue"))
+            .collect();
+        eprintln!("module _queue residual paths: {queue_entries:?}");
+    }
+    for expected in expected_queue {
+        assert!(
+            module_residuals.contains(expected),
+            "native/runtime leaf {expected} must remain residual; got {module_residuals:?}"
         );
     }
 }

@@ -1,8 +1,37 @@
 from __pypy__ import reversed_dict, move_to_end, objects_in_repr
 from _collections_abc import KeysView, ItemsView, ValuesView
-from _operator import eq as _eq
 
 _missing = object()
+
+
+def _odict_next(it):
+    # `od_state` changes on every structural mutation of the dict, and the
+    # dict iterator raises RuntimeError on the same changes.  The iterator
+    # runs no application code, so only that check reaches the handler.
+    try:
+        return next(it, it)
+    except RuntimeError:
+        raise RuntimeError("OrderedDict mutated during iteration") from None
+
+
+def _odict_keys_equal(a, b):
+    'Pairwise key comparison of two OrderedDicts, as `_odict_keys_equal`.'
+    it_a = dict.__iter__(a)
+    it_b = dict.__iter__(b)
+    key_a = _odict_next(it_a)
+    key_b = _odict_next(it_b)
+    while True:
+        if key_a is it_a or key_b is it_b:
+            # Equal only when both ran out together.
+            return key_a is it_a and key_b is it_b
+        # `PyObject_RichCompareBool` treats identical objects as equal.
+        res = key_a is key_b or bool(key_a == key_b)
+        # The next keys are read before `res` is acted on, so a mutation
+        # made by the comparison raises even when the keys differ.
+        key_a = _odict_next(it_a)
+        key_b = _odict_next(it_b)
+        if not res:
+            return False
 
 
 class OrderedDict(dict):
@@ -137,7 +166,15 @@ class OrderedDict(dict):
 
     def copy(self):
         'od.copy() -> a shallow copy of od'
-        return self.__class__(self)
+        od_copy = self.__class__()
+        exact = type(self) is OrderedDict
+        it = dict.__iter__(self)
+        key = _odict_next(it)
+        while key is not it:
+            value = dict.__getitem__(self, key) if exact else self[key]
+            od_copy[key] = value
+            key = _odict_next(it)
+        return od_copy
 
     def __eq__(self, other):
         '''od.__eq__(y) <==> od==y.  Comparison to another OD is order-sensitive
@@ -145,18 +182,19 @@ class OrderedDict(dict):
 
         '''
         if isinstance(other, OrderedDict):
-            return dict.__eq__(self, other) and all(map(_eq, self, other))
+            return dict.__eq__(self, other) and _odict_keys_equal(self, other)
         return dict.__eq__(self, other)
 
     def __or__(self, other):
-        if not isinstance(other, dict):
+        if not isinstance(other, (dict, frozendict)):
             return NotImplemented
-        copyself = self.copy()
+        # `odict_or` calls the type with the left operand, not `copy()`.
+        copyself = type(self)(self)
         copyself.update(other)
         return copyself
 
     def __ror__(self, other):
-        if not isinstance(other, dict):
+        if not isinstance(other, (dict, frozendict)):
             return NotImplemented
         copy = type(self)(other)
         copy.update(self)

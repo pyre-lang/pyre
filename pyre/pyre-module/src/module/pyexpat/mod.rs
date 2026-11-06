@@ -37,11 +37,156 @@ const HANDLER_NAMES: &[&str] = &[
     "SkippedEntityHandler",
 ];
 
+/// `INIT_DATA_BUF_SIZE` (`xmlparse.c`): `XmlConvert` writes at most this
+/// many UTF-8 bytes into `m_dataBuf` when the encoding `MUST_CONVERT`.
+const INIT_DATA_BUF_SIZE: usize = 1024;
+
+fn is_char_or_predefined_entity(ent: &str) -> bool {
+    matches!(ent, "amp" | "lt" | "gt" | "quot" | "apos") || ent.starts_with('#')
+}
+
+/// `checkCharRefNumber`.
+fn check_char_ref_number(code: u32) -> Option<char> {
+    if code > 0x10FFFF {
+        return None;
+    }
+    if (0xD800..=0xDFFF).contains(&code) {
+        return None;
+    }
+    if code == 0xFFFE || code == 0xFFFF {
+        return None;
+    }
+    if code < 0x20 && !matches!(code, 0x09 | 0x0A | 0x0D) {
+        return None;
+    }
+    char::from_u32(code)
+}
+
+/// `XmlCharRefNumber`.
+fn char_from_char_ref(ent: &str) -> Option<char> {
+    let (digits, radix) = if let Some(hex) = ent.strip_prefix("#x") {
+        (hex, 16)
+    } else if let Some(dec) = ent.strip_prefix('#') {
+        (dec, 10)
+    } else {
+        return None;
+    };
+    let code = u32::from_str_radix(digits, radix).ok()?;
+    check_char_ref_number(code)
+}
+
 #[derive(Clone, Copy)]
 struct XmlPos {
     index: usize,
     line: usize,
     col: usize,
+}
+
+/// Advance `start` by `text` with `XmlUpdatePosition` rules: CR is a line
+/// break, and LF immediately after CR is not.
+fn pos_after(start: XmlPos, text: &str) -> XmlPos {
+    let mut pos = start;
+    let mut last_cr = false;
+    for ch in text.chars() {
+        match ch {
+            '\r' => {
+                pos.index += ch.len_utf8();
+                pos.line += 1;
+                pos.col = 0;
+                last_cr = true;
+            }
+            '\n' => {
+                pos.index += ch.len_utf8();
+                if !last_cr {
+                    pos.line += 1;
+                    pos.col = 0;
+                }
+                last_cr = false;
+            }
+            _ => {
+                pos.index += ch.len_utf8();
+                pos.col += 1;
+                last_cr = false;
+            }
+        }
+    }
+    pos
+}
+
+fn decl_token_len(rest: &str) -> usize {
+    let Some(ch) = rest.chars().next() else {
+        return 0;
+    };
+    if rest.starts_with("<!") {
+        let mut j = 2;
+        for c in rest[2..].chars() {
+            if MiniXmlParser::is_name_char(c) {
+                j += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        return j;
+    }
+    if matches!(ch, ' ' | '\t' | '\r' | '\n') {
+        let mut j = 0;
+        for c in rest.chars() {
+            if matches!(c, ' ' | '\t' | '\r' | '\n') {
+                j += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        return j;
+    }
+    if ch == '"' || ch == '\'' {
+        let mut j = ch.len_utf8();
+        if let Some(rel) = rest[j..].find(ch) {
+            j += rel + ch.len_utf8();
+        } else {
+            j = rest.len();
+        }
+        return j;
+    }
+    if ch == '#' {
+        let mut j = 1;
+        for c in rest[1..].chars() {
+            if MiniXmlParser::is_name_char(c) {
+                j += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        return j;
+    }
+    if MiniXmlParser::is_name_char(ch) {
+        let mut j = ch.len_utf8();
+        for c in rest[j..].chars() {
+            if MiniXmlParser::is_name_char(c) {
+                j += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if rest[j..].starts_with(['?', '*', '+']) {
+            j += 1;
+        }
+        return j;
+    }
+    if ch == ')' {
+        let mut j = 1;
+        if rest[j..].starts_with(['?', '*', '+']) {
+            j += 1;
+        }
+        return j;
+    }
+    ch.len_utf8()
+}
+
+/// `ENTITY` `textPtr` / `open`.
+struct InternalEntity {
+    text: String,
+    open: bool,
 }
 
 struct MiniXmlParser<'a> {
@@ -56,10 +201,31 @@ struct MiniXmlParser<'a> {
     stack: Vec<String>,
     ns_stack: Vec<Vec<String>>,
     namespaces: Vec<(String, String)>,
-    internal_entities: HashMap<String, String>,
+    internal_entities: HashMap<String, InternalEntity>,
     external_entities: HashMap<String, (String, Option<String>)>,
     root_closed: bool,
     char_buffer: String,
+    deferred: bool,
+    convert_chunks: bool,
+    /// Pending tail from the last decode: `0` none, `1` `XML_TOK_PARTIAL`
+    /// (odd UTF-16 byte), `2` `XML_TOK_PARTIAL_CHAR` (incomplete sequence).
+    partial_tail_kind: i64,
+    /// `externalEntityContentProcessor`: a sub-parser whose context is not
+    /// `None`.
+    is_external_entity: bool,
+    /// `externalParEntInitProcessor`: the subparser was created with a
+    /// `None` context.
+    is_external_dtd: bool,
+    /// `m_accounting.countBytesIndirect`
+    bytes_indirect: u64,
+    /// `dtd->hasParamEntityRefs`
+    has_param_entity_refs: bool,
+    /// `dtd->standalone`, set from `standalone="yes"` in the XML declaration.
+    standalone: bool,
+    /// `(element, attribute, is_cdata, default)` for each ATTLIST attribute
+    /// (`defineAttribute`). The first declaration of an element/attribute
+    /// pair wins.
+    attlist_decls: Vec<(String, String, bool, Option<String>)>,
 }
 
 /// Pins each handler argument as it is produced. An array literal would
@@ -87,7 +253,39 @@ impl<'a> MiniXmlParser<'a> {
         pyre_object::gc_roots::shadow_stack_get(self.parser_slot)
     }
 
-    fn new(parser_slot: usize, input: &'a str, isfinal: bool, suppress_until: usize) -> Self {
+    fn new(
+        parser_slot: usize,
+        input: &'a str,
+        isfinal: bool,
+        suppress_until: usize,
+        convert_chunks: bool,
+    ) -> Self {
+        let has_param_entity_refs = pyre_interpreter::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(parser_slot),
+            "_pyre_use_foreign_dtd",
+        )
+        .map(is_true_obj)
+        .unwrap_or(false);
+        let partial_tail_kind = get_parser_int(
+            pyre_object::gc_roots::shadow_stack_get(parser_slot),
+            "_pyre_partial_tail_kind",
+            0,
+        );
+        let is_subparser = pyre_interpreter::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(parser_slot),
+            "_pyre_is_subparser",
+        )
+        .map(is_true_obj)
+        .unwrap_or(false);
+        let context_none = match pyre_interpreter::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(parser_slot),
+            "_pyre_external_context",
+        ) {
+            Ok(obj) => obj.is_null() || unsafe { is_none(obj) },
+            Err(_) => true,
+        };
+        let is_external_entity = is_subparser && !context_none;
+        let is_external_dtd = is_subparser && context_none;
         Self {
             parser_slot,
             input,
@@ -109,20 +307,43 @@ impl<'a> MiniXmlParser<'a> {
             external_entities: HashMap::new(),
             root_closed: false,
             char_buffer: String::new(),
+            deferred: false,
+            convert_chunks,
+            partial_tail_kind,
+            is_external_entity,
+            is_external_dtd,
+            bytes_indirect: 0,
+            has_param_entity_refs,
+            standalone: false,
+            attlist_decls: Vec::new(),
         }
     }
 
     fn parse(mut self) -> Result<usize, pyre_interpreter::PyError> {
-        self.skip_ws();
+        let partial_char_final = self.isfinal && self.partial_tail_kind == 2;
+        if partial_char_final {
+            let cut = match self.input.rfind('<') {
+                Some(i) if !self.input[i..].contains('>') => i,
+                _ => self.input.len(),
+            };
+            self.input = &self.input[..cut];
+            self.isfinal = false;
+        }
+        if self.is_external_dtd {
+            return self.parse_external_subset(partial_char_final);
+        }
+        if !self.is_external_entity {
+            self.skip_ws_report(true)?;
+        }
         if self.starts_with("<?xml") {
             self.parse_xml_decl()?;
         }
         loop {
-            if self.eof() {
+            if self.eof() || self.deferred {
                 break;
             }
-            if self.root_closed {
-                self.skip_ws();
+            if !self.is_external_entity && self.root_closed {
+                self.skip_ws_report(true)?;
                 if self.eof() {
                     break;
                 }
@@ -136,6 +357,10 @@ impl<'a> MiniXmlParser<'a> {
                 }
                 return self.fail("junk after document element");
             }
+            if !self.is_external_entity && self.stack.is_empty() && self.peek_is_ws() {
+                self.skip_ws_report(true)?;
+                continue;
+            }
             if self.starts_with("<!--") {
                 self.parse_comment()?;
             } else if self.starts_with("<?") {
@@ -148,15 +373,50 @@ impl<'a> MiniXmlParser<'a> {
                 self.parse_end_element()?;
             } else if self.starts_with("<") {
                 self.parse_start_element()?;
+            } else if !self.is_external_entity && self.stack.is_empty() && !self.root_closed {
+                self.fail_prolog_text()?;
             } else {
                 self.parse_chardata()?;
             }
         }
+        self.finish(partial_char_final)
+    }
+
+    /// `doProlog` returns `XML_ERROR_PARTIAL_CHAR` / `XML_ERROR_UNCLOSED_TOKEN`
+    /// at the end of a final buffer.  An external subset has no root element,
+    /// so the "no element found" / "asynchronous entity" checks do not fire.
+    fn finish(mut self, partial_char_final: bool) -> Result<usize, pyre_interpreter::PyError> {
+        if self.isfinal && self.partial_tail_kind == 1 {
+            return self.fail("unclosed token");
+        }
+        if partial_char_final {
+            self.pos = pos_after(
+                XmlPos {
+                    index: 0,
+                    line: 1,
+                    col: 0,
+                },
+                self.input,
+            );
+            self.flush_character_buffer()?;
+            return self.fail("partial character");
+        }
         if self.isfinal && self.pos.index == 0 && !self.input.is_empty() {
             return self.fail("unclosed token");
         }
-        if self.isfinal && !self.stack.is_empty() {
-            return self.fail("unclosed token");
+        if self.isfinal && !self.stack.is_empty() && !self.is_external_dtd {
+            if self.is_external_entity {
+                return self.fail("asynchronous entity");
+            }
+            return self.fail("no element found");
+        }
+        if self.isfinal
+            && self.stack.is_empty()
+            && !self.root_closed
+            && !self.is_external_entity
+            && !self.is_external_dtd
+        {
+            return self.fail("no element found");
         }
         self.flush_character_buffer()?;
         self.update_position_slots();
@@ -179,14 +439,29 @@ impl<'a> MiniXmlParser<'a> {
         self.rest().chars().next()
     }
 
+    /// `XmlUpdatePosition` (`PREFIX(updatePosition)`): `BT_CR` increments
+    /// the line; a `BT_LF` immediately after a CR is consumed with it.
     fn bump_char(&mut self) -> Option<char> {
         let ch = self.peek_char()?;
-        self.pos.index += ch.len_utf8();
-        if ch == '\n' {
-            self.pos.line += 1;
-            self.pos.col = 0;
-        } else {
-            self.pos.col += 1;
+        match ch {
+            '\r' => {
+                self.pos.index += ch.len_utf8();
+                self.pos.line += 1;
+                self.pos.col = 0;
+            }
+            '\n' => {
+                let after_cr =
+                    self.pos.index > 0 && self.input.as_bytes()[self.pos.index - 1] == b'\r';
+                self.pos.index += ch.len_utf8();
+                if !after_cr {
+                    self.pos.line += 1;
+                    self.pos.col = 0;
+                }
+            }
+            _ => {
+                self.pos.index += ch.len_utf8();
+                self.pos.col += 1;
+            }
         }
         Some(ch)
     }
@@ -210,15 +485,23 @@ impl<'a> MiniXmlParser<'a> {
     }
 
     fn skip_ws(&mut self) {
-        while matches!(self.peek_char(), Some(' ' | '\t' | '\r' | '\n')) {
+        while self.peek_is_ws() {
             self.bump_char();
         }
+    }
+
+    fn peek_is_ws(&self) -> bool {
+        matches!(self.peek_char(), Some(' ' | '\t' | '\r' | '\n'))
+    }
+
+    fn is_name_char(ch: char) -> bool {
+        ch.is_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.')
     }
 
     fn read_name(&mut self) -> Result<String, pyre_interpreter::PyError> {
         let mut name = String::new();
         while let Some(ch) = self.peek_char() {
-            if ch.is_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.') {
+            if Self::is_name_char(ch) {
                 name.push(ch);
                 self.bump_char();
             } else {
@@ -232,6 +515,41 @@ impl<'a> MiniXmlParser<'a> {
         }
     }
 
+    fn read_attlist_enum(&mut self) -> Result<Vec<String>, pyre_interpreter::PyError> {
+        self.expect("(")?;
+        let mut names = Vec::new();
+        loop {
+            self.skip_ws();
+            names.push(self.read_name()?);
+            self.skip_ws();
+            if self.consume(")") {
+                return Ok(names);
+            }
+            self.expect("|")?;
+        }
+    }
+
+    fn fail_prolog_text(&mut self) -> Result<(), pyre_interpreter::PyError> {
+        let start = self.pos;
+        let Some(ch) = self.peek_char() else {
+            return Ok(());
+        };
+        if ch.is_alphabetic() || ch == '_' || ch == ':' {
+            while let Some(next) = self.peek_char() {
+                if Self::is_name_char(next) {
+                    self.bump_char();
+                } else {
+                    break;
+                }
+            }
+            if self.peek_char() == Some('<') {
+                return self.fail("not well-formed (invalid token)");
+            }
+        }
+        self.pos = start;
+        self.fail("syntax error")
+    }
+
     fn read_quoted(&mut self) -> Result<String, pyre_interpreter::PyError> {
         let quote = match self.bump_char() {
             Some(q @ ('"' | '\'')) => q,
@@ -242,9 +560,218 @@ impl<'a> MiniXmlParser<'a> {
             if ch == quote {
                 let raw = &self.input[start..self.pos.index];
                 self.bump_char();
-                return self
-                    .expand_entities(raw, false)
-                    .map_err(|m| self.make_error(&m));
+                return self.expand_entities(raw, false, self.pos);
+            }
+            self.bump_char();
+        }
+        self.fail("unterminated quoted string")
+    }
+
+    /// `appendAttributeValue`.
+    fn append_attribute_value(
+        &mut self,
+        raw: &str,
+        is_cdata: bool,
+        out: &mut String,
+        tag_pos: XmlPos,
+        undef_pos: XmlPos,
+        value_start: Option<XmlPos>,
+    ) -> Result<(), pyre_interpreter::PyError> {
+        let mut frames: Vec<(String, usize, XmlPos, Option<XmlPos>, Option<String>)> =
+            vec![(raw.to_string(), 0, undef_pos, value_start, None)];
+        let result = (|| {
+            while !frames.is_empty() {
+                let top = frames.len() - 1;
+                let i = frames[top].1;
+                if i >= frames[top].0.len() {
+                    let name = frames.pop().unwrap().4;
+                    if let Some(ref name) = name {
+                        if let Some(ent) = self.internal_entities.get_mut(name) {
+                            ent.open = false;
+                        }
+                    }
+                    continue;
+                }
+                let ch = match frames[top].0[i..].chars().next() {
+                    Some(ch) => ch,
+                    None => break,
+                };
+                if matches!(ch, ' ' | '\t' | '\n' | '\r') {
+                    let mut i = i;
+                    i += ch.len_utf8();
+                    if ch == '\r' && i < frames[top].0.len() && frames[top].0.as_bytes()[i] == b'\n'
+                    {
+                        i += 1;
+                    }
+                    if is_cdata || !(out.is_empty() || out.ends_with(' ')) {
+                        out.push(' ');
+                    }
+                    frames[top].1 = i;
+                    continue;
+                }
+                if ch == '&' {
+                    let ref_pos_of =
+                        |frames: &[(String, usize, XmlPos, Option<XmlPos>, Option<String>)]| {
+                            match frames[top].3 {
+                                Some(start) => pos_after(start, &frames[top].0[..i]),
+                                None => frames[top].2,
+                            }
+                        };
+                    let Some(end) = frames[top].0[i + 1..].find(';') else {
+                        // `XML_ERROR_UNDEFINED_ENTITY` leaves `m_eventPtr` at the
+                        // start tag (or the `<!ATTLIST` that owns a default).
+                        return Err(self.make_error_at("undefined entity", tag_pos));
+                    };
+                    let ent = frames[top].0[i + 1..i + 1 + end].to_string();
+                    let next_i = i + 1 + end + 1;
+                    match ent.as_str() {
+                        "amp" => out.push('&'),
+                        "lt" => out.push('<'),
+                        "gt" => out.push('>'),
+                        "quot" => out.push('"'),
+                        "apos" => out.push('\''),
+                        _ if ent.starts_with('#') => {
+                            let ch = char_from_char_ref(&ent).ok_or_else(|| {
+                                self.make_error_at(
+                                    "reference to invalid character number",
+                                    ref_pos_of(&frames),
+                                )
+                            })?;
+                            if is_cdata || ch != ' ' || !(out.is_empty() || out.ends_with(' ')) {
+                                out.push(ch);
+                            }
+                        }
+                        _ if self.internal_entities.contains_key(&ent) => {
+                            if self.internal_entities[&ent].open {
+                                return Err(self.make_error_at(
+                                    "recursive entity reference",
+                                    ref_pos_of(&frames),
+                                ));
+                            }
+                            let stored = self.internal_entities[&ent].text.clone();
+                            self.account_indirect(stored.len())
+                                .map_err(|m| self.make_error_at(&m, ref_pos_of(&frames)))?;
+                            if let Some(entity) = self.internal_entities.get_mut(&ent) {
+                                entity.open = true;
+                            }
+                            frames[top].1 = next_i;
+                            frames.push((stored, 0, tag_pos, None, Some(ent)));
+                            continue;
+                        }
+                        _ if self.external_entities.contains_key(&ent) => {
+                            return Err(self.make_error_at(
+                                "reference to external entity in attribute",
+                                ref_pos_of(&frames),
+                            ));
+                        }
+                        _ => {
+                            // `appendAttributeValue` `checkEntityDecl`.
+                            if !self.has_param_entity_refs || self.standalone {
+                                return Err(self.make_error_at("undefined entity", tag_pos));
+                            }
+                        }
+                    }
+                    frames[top].1 = next_i;
+                    continue;
+                }
+                out.push(ch);
+                frames[top].1 = i + ch.len_utf8();
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            for (_, _, _, _, name) in &frames {
+                if let Some(name) = name {
+                    if let Some(ent) = self.internal_entities.get_mut(name) {
+                        ent.open = false;
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// `storeAttributeValue`.
+    fn store_attribute_value(
+        &mut self,
+        raw: &str,
+        is_cdata: bool,
+        value_start: XmlPos,
+        tag_pos: XmlPos,
+    ) -> Result<String, pyre_interpreter::PyError> {
+        let mut out = String::new();
+        self.append_attribute_value(
+            raw,
+            is_cdata,
+            &mut out,
+            tag_pos,
+            value_start,
+            Some(value_start),
+        )?;
+        if !is_cdata && out.ends_with(' ') {
+            out.pop();
+        }
+        Ok(out)
+    }
+
+    fn read_attribute_value(
+        &mut self,
+        is_cdata: bool,
+        tag_pos: XmlPos,
+    ) -> Result<String, pyre_interpreter::PyError> {
+        let quote = match self.bump_char() {
+            Some(q @ ('"' | '\'')) => q,
+            _ => return self.fail("expected quoted string"),
+        };
+        let value_start = self.pos;
+        let start = self.pos.index;
+        while let Some(ch) = self.peek_char() {
+            if ch == quote {
+                let raw = self.input[start..self.pos.index].to_string();
+                self.bump_char();
+                return self.store_attribute_value(&raw, is_cdata, value_start, tag_pos);
+            }
+            self.bump_char();
+        }
+        self.fail("unterminated quoted string")
+    }
+
+    /// `storeEntityValue`: expand character references (`XML_TOK_CHAR_REF`)
+    /// and normalise newlines (`XML_TOK_DATA_NEWLINE` / `XML_TOK_TRAILING_CR`);
+    /// copy general entity references (`XML_TOK_ENTITY_REF`) through unchanged.
+    fn read_entity_value(&mut self) -> Result<String, pyre_interpreter::PyError> {
+        let quote = match self.bump_char() {
+            Some(q @ ('"' | '\'')) => q,
+            _ => return self.fail("expected quoted string"),
+        };
+        let start = self.pos.index;
+        while let Some(ch) = self.peek_char() {
+            if ch == quote {
+                let raw = &self.input[start..self.pos.index];
+                self.bump_char();
+                let mut out = String::new();
+                let mut rest = raw;
+                while let Some(pos) = rest.find('&') {
+                    out.push_str(&rest[..pos].replace("\r\n", "\n").replace('\r', "\n"));
+                    let after = &rest[pos + 1..];
+                    let Some(end) = after.find(';') else {
+                        return self.fail("undefined entity");
+                    };
+                    let ent = &after[..end];
+                    if ent.starts_with('#') {
+                        let ch = char_from_char_ref(ent).ok_or_else(|| {
+                            self.make_error("reference to invalid character number")
+                        })?;
+                        out.push(ch);
+                    } else {
+                        out.push('&');
+                        out.push_str(ent);
+                        out.push(';');
+                    }
+                    rest = &after[end + 1..];
+                }
+                out.push_str(&rest.replace("\r\n", "\n").replace('\r', "\n"));
+                return Ok(out);
             }
             self.bump_char();
         }
@@ -281,8 +808,9 @@ impl<'a> MiniXmlParser<'a> {
                     encoding_slot = roots.pin_roots(&[w_str_new_managed(&value)]);
                 }
                 "standalone" => {
+                    self.standalone = value == "yes";
                     standalone_slot =
-                        roots.pin_roots(&[w_int_new(if value == "yes" { 1 } else { 0 })]);
+                        roots.pin_roots(&[w_int_new(if self.standalone { 1 } else { 0 })]);
                 }
                 _ => {}
             }
@@ -296,13 +824,27 @@ impl<'a> MiniXmlParser<'a> {
                 Some(pyre_interpreter::baseobjspace::str_utf8_w(encoding)?.to_string())
             }
         } {
-            validate_decl_encoding(&enc).map_err(|m| self.make_error(m))?;
+            let has_forced_encoding = match pyre_interpreter::baseobjspace::getattr_str(
+                self.parser(),
+                "_pyre_forced_encoding",
+            ) {
+                Ok(obj) if unsafe { is_str(obj) } => true,
+                _ => false,
+            };
+            if !has_forced_encoding {
+                validate_decl_encoding(&enc).map_err(|m| self.make_error(m))?;
+            }
         }
-        self.handler_args("XmlDeclHandler")
-            .arg(w_str_new_managed(&version))
-            .arg(roots.get(encoding_slot))
-            .arg(roots.get(standalone_slot))
-            .call()?;
+        if self.handler_is_set("XmlDeclHandler") {
+            self.handler_args("XmlDeclHandler")
+                .arg(w_str_new_managed(&version))
+                .arg(roots.get(encoding_slot))
+                .arg(roots.get(standalone_slot))
+                .call()?;
+        } else {
+            let text = self.input[event_pos.index..self.pos.index].to_string();
+            self.report_default(&text)?;
+        }
         let standalone = roots.get(standalone_slot);
         if unsafe { is_int(standalone) && w_int_get_value(standalone) == 0 } {
             pyre_interpreter::baseobjspace::setdictvalue_native(
@@ -320,19 +862,26 @@ impl<'a> MiniXmlParser<'a> {
         let start = self.pos.index;
         let Some(rel) = self.rest().find("-->") else {
             return if self.isfinal {
+                self.pos = event_pos;
                 self.fail("unclosed token")
             } else {
                 Ok(())
             };
         };
         let text = self.input[start..start + rel].to_string();
-        for _ in 0..rel + 3 {
+        let end = start + rel + 3;
+        while self.pos.index < end {
             self.bump_char();
         }
         self.set_event_position(event_pos);
-        self.handler_args("CommentHandler")
-            .arg(w_str_new_managed(&text))
-            .call()
+        if self.handler_is_set("CommentHandler") {
+            self.handler_args("CommentHandler")
+                .arg(w_str_new_managed(&normalize_lines(&text)))
+                .call()
+        } else {
+            let raw = self.input[event_pos.index..self.pos.index].to_string();
+            self.report_default(&raw)
+        }
     }
 
     fn parse_pi(&mut self) -> Result<(), pyre_interpreter::PyError> {
@@ -348,15 +897,21 @@ impl<'a> MiniXmlParser<'a> {
                 Ok(())
             };
         };
-        let data = self.input[start..start + rel].trim().to_string();
-        for _ in 0..rel + 2 {
+        let data = self.input[start..start + rel].to_string();
+        let end = start + rel + 2;
+        while self.pos.index < end {
             self.bump_char();
         }
         self.set_event_position(event_pos);
-        self.handler_args("ProcessingInstructionHandler")
-            .arg(w_str_new_managed(&target))
-            .arg(w_str_new_managed(&data))
-            .call()
+        if self.handler_is_set("ProcessingInstructionHandler") {
+            self.handler_args("ProcessingInstructionHandler")
+                .arg(w_str_new_managed(&target))
+                .arg(w_str_new_managed(&normalize_lines(&data)))
+                .call()
+        } else {
+            let raw = self.input[event_pos.index..self.pos.index].to_string();
+            self.report_default(&raw)
+        }
     }
 
     fn parse_cdata(&mut self) -> Result<(), pyre_interpreter::PyError> {
@@ -371,48 +926,81 @@ impl<'a> MiniXmlParser<'a> {
             };
         };
         let text = self.input[start..start + rel].to_string();
+        let close_pos = pos_after(self.pos, &text);
         self.set_event_position(event_pos);
         self.flush_character_buffer()?;
-        self.call_handler_raw("StartCdataSectionHandler", &[])?;
-        for _ in 0..rel + 3 {
+        if self.handler_is_set("StartCdataSectionHandler") {
+            self.call_handler_raw("StartCdataSectionHandler", &[])?;
+        } else {
+            self.report_default("<![CDATA[")?;
+        }
+        let end = start + rel + 3;
+        while self.pos.index < end {
             self.bump_char();
         }
-        self.emit_character_data(&text)?;
+        self.report_text(&text)?;
         self.flush_character_buffer()?;
-        self.call_handler_raw("EndCdataSectionHandler", &[])
+        if self.handler_is_set("EndCdataSectionHandler") {
+            self.call_handler_raw("EndCdataSectionHandler", &[])
+        } else {
+            self.set_event_position(close_pos);
+            self.report_default("]]>")
+        }
     }
 
     fn parse_doctype(&mut self) -> Result<(), pyre_interpreter::PyError> {
         let event_pos = self.pos;
+        let report = !self.handler_is_set("StartDoctypeDeclHandler");
+        let tok = self.pos;
         self.expect("<!DOCTYPE")?;
-        self.skip_ws();
+        self.report_consumed(tok, report)?;
+        self.skip_ws_report(report)?;
+        let name_pos = self.pos;
         let name = self.read_name()?;
+        self.report_consumed(name_pos, report)?;
         // The two identifiers are minted here and used again only at the very
         // end, past the not-standalone callback, the internal subset and the
         // start-doctype handler — all of which run Python.
         let roots = pyre_object::gc_roots::push_roots();
         let base = roots.pin_roots(&[w_none(), w_none()]);
         let mut has_internal_subset = false;
-        self.skip_ws();
+        self.skip_ws_report(report)?;
         if self.starts_with("PUBLIC") {
+            let kw = self.pos;
             self.expect("PUBLIC")?;
-            self.skip_ws();
+            self.report_consumed(kw, report)?;
+            self.skip_ws_report(report)?;
+            let q = self.pos;
             roots.set(base + 1, w_str_new_managed(&self.read_quoted()?));
-            self.skip_ws();
+            self.report_consumed(q, report)?;
+            self.skip_ws_report(report)?;
+            let q = self.pos;
             roots.set(base, w_str_new_managed(&self.read_quoted()?));
+            self.report_consumed(q, report)?;
+            self.has_param_entity_refs = true;
         } else if self.starts_with("SYSTEM") {
+            let kw = self.pos;
             self.expect("SYSTEM")?;
-            self.skip_ws();
+            self.report_consumed(kw, report)?;
+            self.skip_ws_report(report)?;
+            let q = self.pos;
             roots.set(base, w_str_new_managed(&self.read_quoted()?));
+            self.report_consumed(q, report)?;
+            self.has_param_entity_refs = true;
         }
-        self.skip_ws();
-        if pyre_interpreter::baseobjspace::getattr_str(
+        self.skip_ws_report(report)?;
+        let not_standalone_pending = pyre_interpreter::baseobjspace::getattr_str(
             self.parser(),
             "_pyre_not_standalone_pending",
         )
         .map(is_true_obj)
-        .unwrap_or(false)
-        {
+        .unwrap_or(false);
+        let has_sysid = unsafe { !is_none(roots.get(base)) };
+        let param_parsing = get_parser_int(self.parser(), "_pyre_param_entity_parsing", 0);
+        // `doProlog` `XML_ROLE_DOCTYPE_SYSTEM_ID`: not-standalone when the
+        // doctype has a system id, `!dtd->standalone`, and
+        // `m_paramEntityParsing` is `XML_PARAM_ENTITY_PARSING_NEVER`.
+        if not_standalone_pending || (has_sysid && !self.standalone && param_parsing == 0) {
             self.call_not_standalone()?;
             pyre_interpreter::baseobjspace::setdictvalue_native(
                 self.parser(),
@@ -420,8 +1008,11 @@ impl<'a> MiniXmlParser<'a> {
                 w_bool_from(false),
             );
         }
-        if self.consume("[") {
+        if self.starts_with("[") {
             has_internal_subset = true;
+            let br = self.pos;
+            self.consume("[");
+            self.report_consumed(br, report)?;
             self.set_event_position(event_pos);
             self.handler_args("StartDoctypeDeclHandler")
                 .arg(w_str_new_managed(&name))
@@ -430,6 +1021,9 @@ impl<'a> MiniXmlParser<'a> {
                 .arg(w_int_new(1))
                 .call()?;
             self.parse_internal_subset()?;
+            let br = self.pos;
+            self.expect("]")?;
+            self.report_consumed(br, report)?;
         } else {
             self.set_event_position(event_pos);
             self.handler_args("StartDoctypeDeclHandler")
@@ -439,121 +1033,250 @@ impl<'a> MiniXmlParser<'a> {
                 .arg(w_int_new(0))
                 .call()?;
         }
-        self.skip_ws();
+        self.skip_ws_report(report)?;
+        let gt = self.pos;
         self.expect(">")?;
+        // `doProlog` `XML_ROLE_DOCTYPE_CLOSE`: `handleDefault` is false when
+        // `EndDoctypeDeclHandler` is set.
+        self.report_consumed(gt, !self.handler_is_set("EndDoctypeDeclHandler"))?;
         self.maybe_external_dtd(roots.get(base + 1), roots.get(base))?;
         let _ = has_internal_subset;
         self.call_handler("EndDoctypeDeclHandler", &[])
     }
 
+    fn parse_subset_decl(&mut self) -> Result<bool, pyre_interpreter::PyError> {
+        if self.starts_with("<!ENTITY") {
+            self.parse_entity_decl()?;
+            Ok(true)
+        } else if self.starts_with("%") {
+            self.skip_parameter_entity_ref()?;
+            Ok(true)
+        } else if self.starts_with("<!ELEMENT") {
+            self.parse_element_decl()?;
+            Ok(true)
+        } else if self.starts_with("<!ATTLIST") {
+            self.parse_attlist_decl()?;
+            Ok(true)
+        } else if self.starts_with("<!NOTATION") {
+            self.parse_notation_decl()?;
+            Ok(true)
+        } else if self.starts_with("<!--") {
+            self.parse_comment()?;
+            Ok(true)
+        } else if self.starts_with("<?") {
+            self.parse_pi()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     fn parse_internal_subset(&mut self) -> Result<(), pyre_interpreter::PyError> {
         loop {
-            self.skip_ws();
-            if self.consume("]") {
+            self.skip_ws_report(true)?;
+            if self.starts_with("]") || self.eof() {
                 return Ok(());
             }
-            if self.starts_with("<!ENTITY") {
-                self.parse_entity_decl()?;
-            } else if self.starts_with("%") {
-                self.skip_parameter_entity_ref()?;
-            } else if self.starts_with("<!ELEMENT") {
-                self.parse_element_decl()?;
-            } else if self.starts_with("<!ATTLIST") {
-                self.parse_attlist_decl()?;
-            } else if self.starts_with("<!NOTATION") {
-                self.parse_notation_decl()?;
-            } else if self.starts_with("<!--") {
-                self.parse_comment()?;
-            } else if self.starts_with("<?") {
-                self.parse_pi()?;
-            } else {
+            if !self.parse_subset_decl()? {
                 self.skip_declaration()?;
             }
         }
     }
 
+    /// `externalParEntInitProcessor`: parse an external subset (DTD).
+    fn parse_external_subset(
+        mut self,
+        partial_char_final: bool,
+    ) -> Result<usize, pyre_interpreter::PyError> {
+        if self.starts_with("<?xml") {
+            self.parse_xml_decl()?;
+        }
+        loop {
+            self.skip_ws_report(true)?;
+            if self.eof() {
+                break;
+            }
+            if !self.parse_subset_decl()? {
+                return self.fail("syntax error");
+            }
+        }
+        self.finish(partial_char_final)
+    }
+
+    /// `doProlog` roles of `<!ENTITY`: each token is reported as it is
+    /// consumed, and the handler fires at the token that completes the
+    /// declaration (`XML_ROLE_ENTITY_VALUE`, `XML_ROLE_ENTITY_NOTATION_NAME`,
+    /// `XML_ROLE_ENTITY_COMPLETE`).
     fn parse_entity_decl(&mut self) -> Result<(), pyre_interpreter::PyError> {
-        let event_pos = self.pos;
+        let tok = self.pos;
         self.expect("<!ENTITY")?;
-        self.skip_ws();
-        let is_param = if self.consume("%") {
-            self.skip_ws();
+        self.report_consumed(tok, !self.handler_is_set("EntityDeclHandler"))?;
+        self.skip_ws_report(!self.handler_is_set("EntityDeclHandler"))?;
+        let is_param = if self.starts_with("%") {
+            let pct = self.pos;
+            self.consume("%");
+            self.report_consumed(pct, !self.handler_is_set("EntityDeclHandler"))?;
+            self.skip_ws_report(!self.handler_is_set("EntityDeclHandler"))?;
             1
         } else {
             0
         };
+        let name_pos = self.pos;
         let name = self.read_name()?;
-        self.skip_ws();
+        // `XML_ROLE_GENERAL_ENTITY_NAME`: a predefined name or a redeclaration
+        // leaves `m_declEntity` NULL, so nothing is stored and no declaration
+        // handler fires; the tokens go to the default handler.
+        let redeclared = is_param == 0
+            && (matches!(name.as_str(), "amp" | "lt" | "gt" | "quot" | "apos")
+                || self.internal_entities.contains_key(&name)
+                || self.external_entities.contains_key(&name));
+        let decl_handler = !redeclared && self.handler_is_set("EntityDeclHandler");
+        self.report_consumed(name_pos, !decl_handler)?;
+        self.skip_ws_report(!decl_handler)?;
         // Every identifier this declaration mints is reachable only from its
-        // local until the handler call at the end, and the reads that follow —
-        // another `read_quoted`, the position update, the handler itself — both
+        // local until the handler call, and the reads that follow — another
+        // `read_quoted`, the position update, the handler itself — both
         // allocate and run Python.
         let roots = pyre_object::gc_roots::push_roots();
         let mut base = w_none();
         let slot = roots.pin_roots(&[w_none(), w_none(), w_none(), w_none()]);
+        let mut is_external = false;
         if matches!(self.peek_char(), Some('"' | '\'')) {
-            let v = self.read_quoted()?;
-            self.internal_entities.insert(name.clone(), v.clone());
+            let q = self.pos;
+            let v = self.read_entity_value()?;
+            if is_param == 0 && !redeclared {
+                self.internal_entities.insert(
+                    name.clone(),
+                    InternalEntity {
+                        text: v.clone(),
+                        open: false,
+                    },
+                );
+            }
             roots.set(slot, w_str_new_managed(&v));
+            // `XML_ROLE_ENTITY_VALUE`: the handler fires at the literal.
+            if decl_handler {
+                self.set_event_position(q);
+                self.handler_args("EntityDeclHandler")
+                    .arg(w_str_new_managed(&name))
+                    .arg(w_int_new(is_param))
+                    .arg(roots.get(slot))
+                    .arg(base)
+                    .arg(roots.get(slot + 1))
+                    .arg(roots.get(slot + 2))
+                    .arg(roots.get(slot + 3))
+                    .call()?;
+            } else {
+                self.report_consumed(q, true)?;
+            }
         } else if self.starts_with("PUBLIC") {
+            let kw = self.pos;
             self.expect("PUBLIC")?;
-            self.skip_ws();
+            self.report_consumed(kw, !decl_handler)?;
+            self.skip_ws_report(!decl_handler)?;
+            let q = self.pos;
             roots.set(slot + 2, w_str_new_managed(&self.read_quoted()?));
-            self.skip_ws();
+            self.report_consumed(q, !decl_handler)?;
+            self.skip_ws_report(!decl_handler)?;
+            let q = self.pos;
             let system = self.read_quoted()?;
-            self.external_entities.insert(
-                name.clone(),
-                (
-                    system.clone(),
-                    Some(
-                        pyre_interpreter::baseobjspace::str_utf8_w(roots.get(slot + 2))?
-                            .to_string(),
+            self.report_consumed(q, !decl_handler)?;
+            if is_param == 0 && !redeclared {
+                self.external_entities.insert(
+                    name.clone(),
+                    (
+                        system.clone(),
+                        Some(
+                            pyre_interpreter::baseobjspace::str_utf8_w(roots.get(slot + 2))?
+                                .to_string(),
+                        ),
                     ),
-                ),
-            );
+                );
+            }
             roots.set(slot + 1, w_str_new_managed(&system));
+            is_external = true;
         } else if self.starts_with("SYSTEM") {
+            let kw = self.pos;
             self.expect("SYSTEM")?;
-            self.skip_ws();
+            self.report_consumed(kw, !decl_handler)?;
+            self.skip_ws_report(!decl_handler)?;
+            let q = self.pos;
             let system = self.read_quoted()?;
-            self.external_entities
-                .insert(name.clone(), (system.clone(), None));
+            self.report_consumed(q, !decl_handler)?;
+            if is_param == 0 && !redeclared {
+                self.external_entities
+                    .insert(name.clone(), (system.clone(), None));
+            }
             roots.set(slot + 1, w_str_new_managed(&system));
+            is_external = true;
         }
-        self.skip_ws();
+        self.skip_ws_report(!decl_handler)?;
         if self.starts_with("NDATA") {
+            let kw = self.pos;
             self.expect("NDATA")?;
-            self.skip_ws();
+            self.report_consumed(kw, !decl_handler)?;
+            self.skip_ws_report(!decl_handler)?;
+            let n = self.pos;
             roots.set(slot + 3, w_str_new_managed(&self.read_name()?));
+            // `XML_ROLE_ENTITY_NOTATION_NAME`: UnparsedEntityDeclHandler, else
+            // EntityDeclHandler (`is_param` is 0), else Default.
+            if !redeclared && self.handler_is_set("UnparsedEntityDeclHandler") {
+                self.set_event_position(n);
+                self.handler_args("UnparsedEntityDeclHandler")
+                    .arg(w_str_new_managed(&name))
+                    .arg(base)
+                    .arg(roots.get(slot + 1))
+                    .arg(roots.get(slot + 2))
+                    .arg(roots.get(slot + 3))
+                    .call()?;
+            } else if decl_handler {
+                self.set_event_position(n);
+                self.handler_args("EntityDeclHandler")
+                    .arg(w_str_new_managed(&name))
+                    .arg(w_int_new(0))
+                    .arg(roots.get(slot))
+                    .arg(base)
+                    .arg(roots.get(slot + 1))
+                    .arg(roots.get(slot + 2))
+                    .arg(roots.get(slot + 3))
+                    .call()?;
+            } else {
+                self.report_consumed(n, true)?;
+            }
         }
-        self.skip_until_gt()?;
+        self.skip_ws_report(!decl_handler)?;
+        let gt = self.pos;
+        self.expect(">")?;
+        let has_ndata = !unsafe { is_none(roots.get(slot + 3)) };
         let _ = &mut base;
-        self.set_event_position(event_pos);
-        if !unsafe { is_none(roots.get(slot + 3)) } {
-            self.handler_args("UnparsedEntityDeclHandler")
+        // `XML_ROLE_ENTITY_COMPLETE`: an external entity with no NDATA calls
+        // EntityDeclHandler at `>`; otherwise `>` is an ordinary token.
+        if is_external && !has_ndata && decl_handler {
+            self.set_event_position(gt);
+            self.handler_args("EntityDeclHandler")
                 .arg(w_str_new_managed(&name))
+                .arg(w_int_new(is_param))
+                .arg(roots.get(slot))
                 .arg(base)
                 .arg(roots.get(slot + 1))
                 .arg(roots.get(slot + 2))
                 .arg(roots.get(slot + 3))
                 .call()?;
-            return Ok(());
+        } else {
+            self.report_consumed(gt, !decl_handler)?;
         }
-        self.handler_args("EntityDeclHandler")
-            .arg(w_str_new_managed(&name))
-            .arg(w_int_new(is_param))
-            .arg(roots.get(slot))
-            .arg(base)
-            .arg(roots.get(slot + 1))
-            .arg(roots.get(slot + 2))
-            .arg(roots.get(slot + 3))
-            .call()
+        Ok(())
     }
 
     fn skip_parameter_entity_ref(&mut self) -> Result<(), pyre_interpreter::PyError> {
+        let start = self.pos;
         self.expect("%")?;
         let _name = self.read_name()?;
         self.expect(";")?;
+        self.has_param_entity_refs = true;
+        self.set_event_position(start);
+        let text = self.input[start.index..self.pos.index].to_string();
+        self.report_default(&text)?;
         self.call_not_standalone()
     }
 
@@ -568,7 +1291,7 @@ impl<'a> MiniXmlParser<'a> {
                 '(' => {
                     depth += 1;
                     if depth > 100_000 {
-                        return Err(pyre_interpreter::PyError::runtime_error(
+                        return Err(pyre_interpreter::PyError::recursion_error(
                             "maximum recursion depth exceeded",
                         ));
                     }
@@ -596,47 +1319,79 @@ impl<'a> MiniXmlParser<'a> {
         let model_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(model);
         self.set_event_position(event_pos);
-        let name = w_str_new_managed(&name);
-        self.handler_args("ElementDeclHandler")
-            .arg(name)
-            .arg(roots.get(model_slot))
-            .call()
+        if self.handler_is_set("ElementDeclHandler") {
+            let name = w_str_new_managed(&name);
+            self.handler_args("ElementDeclHandler")
+                .arg(name)
+                .arg(roots.get(model_slot))
+                .call()
+        } else {
+            self.report_decl_tokens(event_pos, self.pos.index)
+        }
     }
 
     fn parse_attlist_decl(&mut self) -> Result<(), pyre_interpreter::PyError> {
         let event_pos = self.pos;
+        let mut seg_start: XmlPos = event_pos;
         self.expect("<!ATTLIST")?;
         self.skip_ws();
         let elem = self.read_name()?;
         loop {
             self.skip_ws();
             if self.consume(">") {
+                self.report_decl_tokens_unless(seg_start, self.pos.index, "AttlistDeclHandler")?;
                 return Ok(());
             }
             let attr = self.read_name()?;
             self.skip_ws();
-            let kind = self.read_name()?;
-            self.skip_ws();
-            let required = if self.consume("#REQUIRED") {
-                1
-            } else if self.consume("#IMPLIED") {
-                0
+            let kind = if self.starts_with("(") {
+                let names = self.read_attlist_enum()?;
+                format!("({})", names.join("|"))
             } else {
-                if matches!(self.peek_char(), Some('"' | '\'')) {
-                    let _ = self.read_quoted()?;
+                let type_name = self.read_name()?;
+                if type_name == "NOTATION" {
+                    self.skip_ws();
+                    let names = self.read_attlist_enum()?;
+                    format!("NOTATION({})", names.join("|"))
                 } else {
-                    let _ = self.read_name()?;
+                    type_name
                 }
-                0
             };
-            self.set_event_position(event_pos);
-            self.handler_args("AttlistDeclHandler")
-                .arg(w_str_new_managed(&elem))
-                .arg(w_str_new_managed(&attr))
-                .arg(w_str_new_managed(&kind))
-                .arg(w_none())
-                .arg(w_int_new(required))
-                .call()?;
+            self.skip_ws();
+            let is_cdata = kind == "CDATA";
+            let (default, required) = if self.consume("#REQUIRED") {
+                (None, 1)
+            } else if self.consume("#IMPLIED") {
+                (None, 0)
+            } else if self.consume("#FIXED") {
+                self.skip_ws();
+                (Some(self.read_attribute_value(is_cdata, event_pos)?), 1)
+            } else {
+                (Some(self.read_attribute_value(is_cdata, event_pos)?), 0)
+            };
+            if !self
+                .attlist_decls
+                .iter()
+                .any(|(e, a, _, _)| e == &elem && a == &attr)
+            {
+                self.attlist_decls
+                    .push((elem.clone(), attr.clone(), is_cdata, default.clone()));
+            }
+            self.report_decl_tokens_unless(seg_start, self.pos.index, "AttlistDeclHandler")?;
+            if self.handler_is_set("AttlistDeclHandler") {
+                self.set_event_position(event_pos);
+                self.handler_args("AttlistDeclHandler")
+                    .arg(w_str_new_managed(&elem))
+                    .arg(w_str_new_managed(&attr))
+                    .arg(w_str_new_managed(&kind))
+                    .arg(match &default {
+                        Some(v) => w_str_new_managed(v),
+                        None => w_none(),
+                    })
+                    .arg(w_int_new(required))
+                    .call()?;
+            }
+            seg_start = self.pos;
         }
     }
 
@@ -666,17 +1421,25 @@ impl<'a> MiniXmlParser<'a> {
         }
         self.skip_until_gt()?;
         self.set_event_position(event_pos);
-        self.handler_args("NotationDeclHandler")
-            .arg(w_str_new_managed(&name))
-            .arg(w_none())
-            .arg(roots.get(base))
-            .arg(roots.get(base + 1))
-            .call()
+        if self.handler_is_set("NotationDeclHandler") {
+            self.handler_args("NotationDeclHandler")
+                .arg(w_str_new_managed(&name))
+                .arg(w_none())
+                .arg(roots.get(base))
+                .arg(roots.get(base + 1))
+                .call()
+        } else {
+            self.report_decl_tokens(event_pos, self.pos.index)
+        }
     }
 
     fn skip_declaration(&mut self) -> Result<(), pyre_interpreter::PyError> {
+        let start = self.pos;
         if self.starts_with("<!") {
-            self.skip_until_gt()
+            self.skip_until_gt()?;
+            self.set_event_position(start);
+            let text = self.input[start.index..self.pos.index].to_string();
+            self.report_default(&text)
         } else {
             self.fail("syntax error")
         }
@@ -710,20 +1473,31 @@ impl<'a> MiniXmlParser<'a> {
         loop {
             self.skip_ws();
             if self.consume("/>") {
-                self.apply_namespace_decls(&attrs, &mut ns_declared)?;
-                let name = self.expand_name(&raw_name, false)?;
-                let expanded_attrs = self.expand_attributes(&attrs)?;
-                // The attribute container is a `dict` or a `list`, both of which
-                // move, and the position update and the interned element name
-                // that follow allocate.  Pin it on creation and read it back out
-                // of the root slot at the call; the name is built into a local
-                // first, since the argument list evaluates left to right.
-                let roots = pyre_object::gc_roots::push_roots();
-                let attrs_slot = roots.base();
-                let _ = roots.pin_root(self.convert_attributes(&expanded_attrs));
+                let n_specified = self.apply_attlist_defaults(&raw_name, &mut attrs);
                 self.set_event_position(event_pos);
-                let w_name = self.intern_string(&name);
-                self.call_handler("StartElementHandler", &[w_name, roots.get(attrs_slot)])?;
+                self.apply_namespace_decls(&attrs, &mut ns_declared)?;
+                let name = self.expand_name(&raw_name, false, event_pos)?;
+                let (expanded_attrs, n_expanded_specified) =
+                    self.expand_attributes(&attrs, n_specified, event_pos)?;
+                let reported = if self.specified_attributes() {
+                    &expanded_attrs[..n_expanded_specified]
+                } else {
+                    &expanded_attrs[..]
+                };
+                let start_set = self.handler_is_set("StartElementHandler");
+                self.set_event_position(event_pos);
+                if start_set {
+                    // The attribute container is a `dict` or a `list`, both of which
+                    // move, and the position update and the interned element name
+                    // that follow allocate.  Pin it on creation and read it back out
+                    // of the root slot at the call; the name is built into a local
+                    // first, since the argument list evaluates left to right.
+                    let roots = pyre_object::gc_roots::push_roots();
+                    let attrs_slot = roots.base();
+                    let _ = roots.pin_root(self.convert_attributes(reported));
+                    let w_name = self.intern_string(&name);
+                    self.call_handler("StartElementHandler", &[w_name, roots.get(attrs_slot)])?;
+                }
                 // Publish the end after `/>` (`test_pyexpat.PositionTest`
                 // reads CurrentByteIndex on the empty end).  Keep the
                 // suppress bit from the opening `<`: feed/close reparses
@@ -731,35 +1505,70 @@ impl<'a> MiniXmlParser<'a> {
                 // (its index sits *at* `_pyre_emit_upto`) and pop an empty
                 // TreeBuilder stack.
                 self.publish_event_position(self.pos);
-                self.call_handler("EndElementHandler", &[self.intern_string(&name)])?;
+                // `doContent` `XML_TOK_EMPTY_ELEMENT_NO_ATTS`: read the end
+                // handler after the start callback.
+                let end_set = self.handler_is_set("EndElementHandler");
+                if end_set {
+                    self.call_handler("EndElementHandler", &[self.intern_string(&name)])?;
+                }
+                // `doContent` `noElmHandlers`: report the raw tag when no
+                // start handler was set before the call and no end handler
+                // is set after it.
+                if !start_set && !end_set {
+                    let text = self.input[event_pos.index..self.pos.index].to_string();
+                    self.set_event_position(event_pos);
+                    self.report_default(&text)?;
+                }
                 self.end_namespace_scope(ns_declared)?;
-                if self.stack.is_empty() {
+                if self.stack.is_empty() && !self.is_external_entity {
                     self.root_closed = true;
                 }
                 return Ok(());
             }
             if self.consume(">") {
+                let n_specified = self.apply_attlist_defaults(&raw_name, &mut attrs);
+                self.set_event_position(event_pos);
                 self.apply_namespace_decls(&attrs, &mut ns_declared)?;
-                let name = self.expand_name(&raw_name, false)?;
-                let expanded_attrs = self.expand_attributes(&attrs)?;
+                let name = self.expand_name(&raw_name, false, event_pos)?;
+                let (expanded_attrs, n_expanded_specified) =
+                    self.expand_attributes(&attrs, n_specified, event_pos)?;
+                let reported = if self.specified_attributes() {
+                    &expanded_attrs[..n_expanded_specified]
+                } else {
+                    &expanded_attrs[..]
+                };
                 self.stack.push(name.clone());
                 self.ns_stack.push(ns_declared);
-                let roots = pyre_object::gc_roots::push_roots();
-                let attrs_slot = roots.base();
-                let _ = roots.pin_root(self.convert_attributes(&expanded_attrs));
                 self.set_event_position(event_pos);
-                let w_name = self.intern_string(&name);
-                self.call_handler("StartElementHandler", &[w_name, roots.get(attrs_slot)])?;
+                if self.handler_is_set("StartElementHandler") {
+                    let roots = pyre_object::gc_roots::push_roots();
+                    let attrs_slot = roots.base();
+                    let _ = roots.pin_root(self.convert_attributes(reported));
+                    let w_name = self.intern_string(&name);
+                    self.call_handler("StartElementHandler", &[w_name, roots.get(attrs_slot)])?;
+                } else {
+                    let text = self.input[event_pos.index..self.pos.index].to_string();
+                    self.report_default(&text)?;
+                }
                 return Ok(());
             }
+            let attr_pos = self.pos;
             let attr_name = self.read_name()?;
             if attrs.iter().any(|(existing, _)| existing == &attr_name) {
+                self.pos = attr_pos;
                 return self.fail("duplicate attribute");
             }
             self.skip_ws();
             self.expect("=")?;
             self.skip_ws();
-            let attr_value = self.read_quoted()?;
+            // `storeAtts` looks `attId` up in `elementType->defaultAtts`.
+            let is_cdata = self
+                .attlist_decls
+                .iter()
+                .find(|(elem, attr, _, _)| elem == &raw_name && attr == &attr_name)
+                .map(|(_, _, is_cdata, _)| *is_cdata)
+                .unwrap_or(true);
+            let attr_value = self.read_attribute_value(is_cdata, event_pos)?;
             attrs.push((attr_name, attr_value));
         }
     }
@@ -767,57 +1576,279 @@ impl<'a> MiniXmlParser<'a> {
     fn parse_end_element(&mut self) -> Result<(), pyre_interpreter::PyError> {
         let event_pos = self.pos;
         self.expect("</")?;
+        let name_pos = self.pos;
         let raw_name = self.read_name()?;
         self.skip_ws();
         self.expect(">")?;
-        let name = self.expand_name(&raw_name, false)?;
+        let name = self.expand_name(&raw_name, false, self.pos)?;
         match self.stack.pop() {
             Some(open) if open == name => {
                 self.set_event_position(event_pos);
-                self.call_handler("EndElementHandler", &[self.intern_string(&name)])?;
+                if self.handler_is_set("EndElementHandler") {
+                    self.call_handler("EndElementHandler", &[self.intern_string(&name)])?;
+                } else {
+                    let text = self.input[event_pos.index..self.pos.index].to_string();
+                    self.report_default(&text)?;
+                }
                 if let Some(declared) = self.ns_stack.pop() {
                     self.end_namespace_scope(declared)?;
                 }
-                if self.stack.is_empty() {
+                if self.stack.is_empty() && !self.is_external_entity {
                     self.root_closed = true;
                 }
                 Ok(())
             }
-            _ => self.fail("mismatched tag"),
+            _ => {
+                self.pos = name_pos;
+                self.fail("mismatched tag")
+            }
         }
     }
 
+    /// `XmlContentTok` / `doContent`: character data is one token at a time.
     fn parse_chardata(&mut self) -> Result<(), pyre_interpreter::PyError> {
-        let start = self.pos.index;
-        while let Some(ch) = self.peek_char() {
+        loop {
+            if self.eof() || self.deferred {
+                return Ok(());
+            }
+            let Some(ch) = self.peek_char() else {
+                return Ok(());
+            };
             if ch == '<' {
-                break;
+                return Ok(());
             }
             if ch == '\0' {
                 return self.fail("unclosed token");
             }
-            self.bump_char();
+            if ch == '\r' || ch == '\n' {
+                let tok_start = self.pos;
+                if ch == '\r' && !self.isfinal && self.pos.index + ch.len_utf8() == self.input.len()
+                {
+                    // `XML_TOK_TRAILING_CR`
+                    self.deferred = true;
+                    return Ok(());
+                }
+                self.bump_char();
+                if ch == '\r' && self.peek_char() == Some('\n') {
+                    self.bump_char();
+                }
+                self.set_event_position(tok_start);
+                if self.handler_is_set("CharacterDataHandler") {
+                    self.report_text("\n")?;
+                } else {
+                    let raw = self.input[tok_start.index..self.pos.index].to_string();
+                    self.report_default_maybe_chunked(&raw)?;
+                }
+                continue;
+            }
+            if ch == '&' {
+                let tok_start = self.pos;
+                self.bump_char();
+                if self.peek_char() == Some('#') {
+                    self.bump_char();
+                    if self.peek_char() == Some('x') {
+                        self.bump_char();
+                        if !matches!(self.peek_char(), Some('0'..='9' | 'a'..='f' | 'A'..='F')) {
+                            if !self.eof() {
+                                return self.fail("not well-formed (invalid token)");
+                            }
+                        } else {
+                            self.bump_char();
+                            while matches!(
+                                self.peek_char(),
+                                Some('0'..='9' | 'a'..='f' | 'A'..='F')
+                            ) {
+                                self.bump_char();
+                            }
+                        }
+                    } else if !matches!(self.peek_char(), Some('0'..='9')) {
+                        if !self.eof() {
+                            return self.fail("not well-formed (invalid token)");
+                        }
+                    } else {
+                        self.bump_char();
+                        while matches!(self.peek_char(), Some('0'..='9')) {
+                            self.bump_char();
+                        }
+                    }
+                } else if match self.peek_char() {
+                    Some(ch) => Self::is_name_char(ch) && !matches!(ch, '0'..='9' | '-' | '.'),
+                    None => false,
+                } {
+                    self.bump_char();
+                    while let Some(next) = self.peek_char() {
+                        if Self::is_name_char(next) {
+                            self.bump_char();
+                        } else {
+                            break;
+                        }
+                    }
+                } else if !self.eof() {
+                    return self.fail("not well-formed (invalid token)");
+                }
+                if self.peek_char() == Some(';') {
+                    self.bump_char();
+                } else if self.eof() {
+                    self.pos = tok_start;
+                    if !self.isfinal {
+                        self.deferred = true;
+                        return Ok(());
+                    }
+                    return self.fail("unclosed token");
+                } else {
+                    return self.fail("not well-formed (invalid token)");
+                }
+                let ref_text = self.input[tok_start.index..self.pos.index].to_owned();
+                self.set_event_position(tok_start);
+                let ent = if ref_text.len() >= 2 {
+                    &ref_text[1..ref_text.len() - 1]
+                } else {
+                    ""
+                };
+                if is_char_or_predefined_entity(ent) && !self.handler_is_set("CharacterDataHandler")
+                {
+                    if ent.starts_with('#') && char_from_char_ref(ent).is_none() {
+                        return Err(
+                            self.make_error_at("reference to invalid character number", tok_start)
+                        );
+                    }
+                    self.report_default_maybe_chunked(&ref_text)?;
+                    continue;
+                }
+                let expanded = self.expand_entities(&ref_text, true, tok_start)?;
+                // `doContent` `XML_TOK_CHAR_REF` does not newline-normalise.
+                if is_char_or_predefined_entity(ent) {
+                    self.emit_reported_run(&expanded)?;
+                } else {
+                    self.report_entity_text(&expanded)?;
+                }
+                continue;
+            }
+            let tok_start = self.pos;
+            let mut split_pos = None;
+            while let Some(next) = self.peek_char() {
+                if matches!(next, '<' | '&' | '\r' | '\n' | '\0') {
+                    break;
+                }
+                if self.pos.index == self.suppress_until && self.pos.index > tok_start.index {
+                    split_pos = Some(self.pos);
+                }
+                self.bump_char();
+            }
+            self.emit_data_chars(tok_start, split_pos, self.pos.index)?;
         }
-        let raw = &self.input[start..self.pos.index];
-        if raw.is_empty() {
+    }
+
+    fn emit_data_chars(
+        &mut self,
+        start: XmlPos,
+        split: Option<XmlPos>,
+        end: usize,
+    ) -> Result<(), pyre_interpreter::PyError> {
+        if end <= self.suppress_until {
+            self.set_event_position(start);
             return Ok(());
         }
-        self.set_event_position(XmlPos {
-            index: start,
-            line: self.pos.line,
-            col: self.pos.col,
-        });
-        let text = self
-            .expand_entities(raw, true)
-            .map_err(|m| self.make_error(&m))?;
-        if self.stack.is_empty() && text.trim().is_empty() {
+        let from = split.unwrap_or(start);
+        self.set_event_position(from);
+        let text = self.input[from.index..end].to_string();
+        if !self.is_external_entity && self.stack.is_empty() && text.trim().is_empty() {
             return Ok(());
         }
+        if !self.handler_is_set("CharacterDataHandler") {
+            return self.report_default_maybe_chunked(&text);
+        }
+        self.emit_maybe_chunked(&text)
+    }
+
+    /// Internal entity replacement text is in the internal encoding, so it is
+    /// never `MUST_CONVERT`-chunked (`processEntity` uses `m_internalEncoding`).
+    fn report_entity_text(&mut self, text: &str) -> Result<(), pyre_interpreter::PyError> {
+        let convert = std::mem::replace(&mut self.convert_chunks, false);
+        let result = self.report_text(text);
+        self.convert_chunks = convert;
+        result
+    }
+
+    /// Split expansion / CDATA text the same way `doContent` splits
+    /// `XML_TOK_DATA_CHARS` and `XML_TOK_DATA_NEWLINE`.
+    fn report_text(&mut self, text: &str) -> Result<(), pyre_interpreter::PyError> {
+        let bytes = text.as_bytes();
+        let mut run_start = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\r' => {
+                    if run_start < i {
+                        self.emit_reported_run(&text[run_start..i])?;
+                    }
+                    let nl_start = i;
+                    i += 1;
+                    if i < bytes.len() && bytes[i] == b'\n' {
+                        i += 1;
+                    }
+                    self.emit_reported_newline(&text[nl_start..i])?;
+                    run_start = i;
+                }
+                b'\n' => {
+                    if run_start < i {
+                        self.emit_reported_run(&text[run_start..i])?;
+                    }
+                    let nl_start = i;
+                    i += 1;
+                    self.emit_reported_newline(&text[nl_start..i])?;
+                    run_start = i;
+                }
+                _ => i += 1,
+            }
+        }
+        if run_start < text.len() {
+            self.emit_reported_run(&text[run_start..])?;
+        }
+        Ok(())
+    }
+
+    fn emit_reported_run(&mut self, text: &str) -> Result<(), pyre_interpreter::PyError> {
+        if !self.is_external_entity && self.stack.is_empty() && text.trim().is_empty() {
+            return Ok(());
+        }
+        if !self.handler_is_set("CharacterDataHandler") {
+            return self.report_default_maybe_chunked(text);
+        }
+        self.emit_maybe_chunked(text)
+    }
+
+    /// `doCdataSection` `XML_TOK_DATA_NEWLINE`: `raw` is the newline as it
+    /// appears in the source (`"\r\n"`, `"\r"`, or `"\n"`). Without a
+    /// character-data handler it is reported unchanged; with one, `"\n"`.
+    fn emit_reported_newline(&mut self, raw: &str) -> Result<(), pyre_interpreter::PyError> {
+        if !self.is_external_entity && self.stack.is_empty() {
+            return Ok(());
+        }
+        if !self.handler_is_set("CharacterDataHandler") {
+            return self.report_default(raw);
+        }
+        self.emit_character_data("\n")
+    }
+
+    /// `MUST_CONVERT`: `XmlConvert` fills `m_dataBuf` (`INIT_DATA_BUF_SIZE`).
+    fn emit_maybe_chunked(&mut self, text: &str) -> Result<(), pyre_interpreter::PyError> {
         if text.is_empty() {
-            Ok(())
-        } else {
-            self.emit_character_data_split(&text)
+            return Ok(());
         }
+        if !self.convert_chunks {
+            return self.emit_character_data(text);
+        }
+        let mut start = 0;
+        while start < text.len() {
+            let mut end = (start + INIT_DATA_BUF_SIZE).min(text.len());
+            while end > start && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.emit_character_data(&text[start..end])?;
+            start = end;
+        }
+        Ok(())
     }
 
     fn convert_attributes(&self, attrs: &[(String, String)]) -> PyObjectRef {
@@ -885,28 +1916,6 @@ impl<'a> MiniXmlParser<'a> {
         } else {
             self.call_handler_raw("CharacterDataHandler", &[w_str_new_managed(text)])
         }
-    }
-
-    fn emit_character_data_split(&mut self, text: &str) -> Result<(), pyre_interpreter::PyError> {
-        let Some(first_non_ws) = text.find(|ch: char| !matches!(ch, ' ' | '\t' | '\r' | '\n'))
-        else {
-            return self.emit_character_data(text);
-        };
-        let (last_non_ws, last_len) = text
-            .char_indices()
-            .rev()
-            .find(|(_, ch)| !matches!(ch, ' ' | '\t' | '\r' | '\n'))
-            .map(|(idx, ch)| (idx, ch.len_utf8()))
-            .unwrap();
-        let content_end = last_non_ws + last_len;
-        if first_non_ws > 0 {
-            self.emit_character_data(&text[..first_non_ws])?;
-        }
-        self.emit_character_data(&text[first_non_ws..content_end])?;
-        if content_end < text.len() {
-            self.emit_character_data(&text[content_end..])?;
-        }
-        Ok(())
     }
 
     fn flush_character_buffer(&mut self) -> Result<(), pyre_interpreter::PyError> {
@@ -994,10 +2003,8 @@ impl<'a> MiniXmlParser<'a> {
             return Ok(());
         }
         let ret = pyre_interpreter::call::call_function_impl_result(handler, &[])?;
-        if unsafe { !(is_int(ret) || is_bool(ret)) } {
-            return Err(pyre_interpreter::PyError::type_error(
-                "NotStandaloneHandler must return an integer",
-            ));
+        if handler_int_rv(ret, "NotStandalone")? == 0 {
+            return self.fail("document is not standalone");
         }
         Ok(())
     }
@@ -1009,12 +2016,143 @@ impl<'a> MiniXmlParser<'a> {
         }
     }
 
+    fn default_handler_name(&self) -> Option<&'static str> {
+        let kind = match pyre_interpreter::baseobjspace::getattr_str(
+            self.parser(),
+            "_pyre_default_kind",
+        ) {
+            Ok(obj) if !obj.is_null() && unsafe { !is_none(obj) && is_str(obj) } => {
+                match pyre_interpreter::baseobjspace::str_utf8_w(obj) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => return None,
+                }
+            }
+            _ => return None,
+        };
+        if !self.handler_is_set(&kind) {
+            return None;
+        }
+        match kind.as_str() {
+            "DefaultHandler" => Some("DefaultHandler"),
+            "DefaultHandlerExpand" => Some("DefaultHandlerExpand"),
+            _ => None,
+        }
+    }
+
+    fn report_default(&mut self, text: &str) -> Result<(), pyre_interpreter::PyError> {
+        match self.default_handler_name() {
+            Some(name) => self.call_handler(name, &[w_str_new_managed(text)]),
+            None => Ok(()),
+        }
+    }
+
+    /// `reportDefault` converts through `m_dataBuf` (`INIT_DATA_BUF_SIZE`)
+    /// when `MUST_CONVERT`.
+    fn report_default_maybe_chunked(
+        &mut self,
+        text: &str,
+    ) -> Result<(), pyre_interpreter::PyError> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        if !self.convert_chunks {
+            return self.report_default(text);
+        }
+        let mut start = 0;
+        while start < text.len() {
+            let mut end = (start + INIT_DATA_BUF_SIZE).min(text.len());
+            while end > start && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.report_default(&text[start..end])?;
+            start = end;
+        }
+        Ok(())
+    }
+
+    /// `XML_SetDefaultHandler` clears `m_defaultExpandInternalEntities`;
+    /// `XML_SetDefaultHandlerExpand` sets it.
+    fn expands_internal_entities(&self) -> bool {
+        pyre_interpreter::baseobjspace::getattr_str(self.parser(), "_pyre_default_expand")
+            .map(is_true_obj)
+            .unwrap_or(true)
+    }
+
+    /// `doProlog` `handleDefault`: ELEMENT / ATTLIST / NOTATION tokens.
+    fn report_decl_tokens(
+        &mut self,
+        start: XmlPos,
+        end: usize,
+    ) -> Result<(), pyre_interpreter::PyError> {
+        self.report_decl_tokens_body(start, end, None)
+    }
+
+    /// Like `report_decl_tokens`, but re-checks `handler` before each token
+    /// and reports only while it is unset (`doProlog` ATTLIST roles).
+    fn report_decl_tokens_unless(
+        &mut self,
+        start: XmlPos,
+        end: usize,
+        handler: &str,
+    ) -> Result<(), pyre_interpreter::PyError> {
+        self.report_decl_tokens_body(start, end, Some(handler))
+    }
+
+    fn report_decl_tokens_body(
+        &mut self,
+        start: XmlPos,
+        end: usize,
+        handler: Option<&str>,
+    ) -> Result<(), pyre_interpreter::PyError> {
+        let text = self.input[start.index..end].to_string();
+        let mut i = 0;
+        let mut pos = start;
+        while i < text.len() {
+            let rest = &text[i..];
+            let n = decl_token_len(rest);
+            let token = rest[..n].to_string();
+            let report = match handler {
+                Some(name) => !self.handler_is_set(name),
+                None => true,
+            };
+            if report {
+                self.set_event_position(pos);
+                self.report_default(&token)?;
+            }
+            pos = pos_after(pos, &rest[..n]);
+            i += n;
+        }
+        Ok(())
+    }
+
+    fn skip_ws_report(&mut self, report: bool) -> Result<(), pyre_interpreter::PyError> {
+        let start = self.pos;
+        self.skip_ws();
+        self.report_consumed(start, report)
+    }
+
+    fn report_consumed(
+        &mut self,
+        start: XmlPos,
+        report: bool,
+    ) -> Result<(), pyre_interpreter::PyError> {
+        if report && self.pos.index > start.index {
+            self.set_event_position(start);
+            let text = self.input[start.index..self.pos.index].to_string();
+            self.report_default(&text)?;
+        }
+        Ok(())
+    }
+
     fn set_event_position(&mut self, pos: XmlPos) {
         self.suppress_current = pos.index < self.suppress_until;
         self.publish_event_position(pos);
     }
 
     fn publish_event_position(&mut self, pos: XmlPos) {
+        // `XML_GetErrorLineNumber` / `XML_GetErrorColumnNumber` /
+        // `XML_GetErrorByteIndex` are `#define`d to the `XML_GetCurrent*`
+        // functions (`expat.h`).
         pyre_interpreter::baseobjspace::setdictvalue_native(
             self.parser(),
             "CurrentLineNumber",
@@ -1028,6 +2166,21 @@ impl<'a> MiniXmlParser<'a> {
         pyre_interpreter::baseobjspace::setdictvalue_native(
             self.parser(),
             "CurrentByteIndex",
+            w_int_new(pos.index as i64),
+        );
+        pyre_interpreter::baseobjspace::setdictvalue_native(
+            self.parser(),
+            "ErrorLineNumber",
+            w_int_new(pos.line as i64),
+        );
+        pyre_interpreter::baseobjspace::setdictvalue_native(
+            self.parser(),
+            "ErrorColumnNumber",
+            w_int_new(pos.col as i64),
+        );
+        pyre_interpreter::baseobjspace::setdictvalue_native(
+            self.parser(),
+            "ErrorByteIndex",
             w_int_new(pos.index as i64),
         );
     }
@@ -1048,6 +2201,24 @@ impl<'a> MiniXmlParser<'a> {
         pyre_interpreter::baseobjspace::getattr_str(self.parser(), "namespace_prefixes")
             .map(is_true_obj)
             .unwrap_or(false)
+    }
+
+    fn specified_attributes(&self) -> bool {
+        pyre_interpreter::baseobjspace::getattr_str(self.parser(), "specified_attributes")
+            .map(is_true_obj)
+            .unwrap_or(false)
+    }
+
+    fn apply_attlist_defaults(&self, raw_name: &str, attrs: &mut Vec<(String, String)>) -> usize {
+        let n_specified = attrs.len();
+        for (elem, attr, _, default) in &self.attlist_decls {
+            if let Some(value) = default {
+                if elem == raw_name && !attrs.iter().any(|(existing, _)| existing == attr) {
+                    attrs.push((attr.clone(), value.clone()));
+                }
+            }
+        }
+        n_specified
     }
 
     fn apply_namespace_decls(
@@ -1106,13 +2277,18 @@ impl<'a> MiniXmlParser<'a> {
             .map(|(_, uri)| uri.as_str())
     }
 
-    fn expand_name(&self, name: &str, is_attr: bool) -> Result<String, pyre_interpreter::PyError> {
+    fn expand_name(
+        &self,
+        name: &str,
+        is_attr: bool,
+        at: XmlPos,
+    ) -> Result<String, pyre_interpreter::PyError> {
         let Some(sep) = self.namespace_separator() else {
             return Ok(name.to_string());
         };
         if let Some((prefix, local)) = name.split_once(':') {
             let Some(uri) = self.namespace_uri(prefix) else {
-                return self.fail("unbound prefix");
+                return Err(self.make_error_at("unbound prefix", at));
             };
             if self.namespace_prefixes() {
                 Ok(format!("{uri}{sep}{local}{sep}{prefix}"))
@@ -1130,78 +2306,189 @@ impl<'a> MiniXmlParser<'a> {
         }
     }
 
+    /// `storeAtts` / `XML_GetSpecifiedAttributeCount`: expand every attribute
+    /// before filtering to the specified prefix (`m_nSpecifiedAtts = attIndex`).
     fn expand_attributes(
         &self,
         attrs: &[(String, String)],
-    ) -> Result<Vec<(String, String)>, pyre_interpreter::PyError> {
+        n_specified: usize,
+        at: XmlPos,
+    ) -> Result<(Vec<(String, String)>, usize), pyre_interpreter::PyError> {
         let mut out = Vec::new();
-        for (name, value) in attrs {
+        let mut n_expanded_specified = 0;
+        for (i, (name, value)) in attrs.iter().enumerate() {
             if self.namespace_separator().is_some()
                 && (name == "xmlns" || name.starts_with("xmlns:"))
             {
                 continue;
             }
-            let expanded = self.expand_name(name, true)?;
+            let expanded = self.expand_name(name, true, at)?;
             if out.iter().any(|(existing, _)| existing == &expanded) {
-                return self.fail("duplicate attribute");
+                return Err(self.make_error_at("duplicate attribute", at));
             }
             out.push((expanded, value.clone()));
+            if i < n_specified {
+                n_expanded_specified += 1;
+            }
         }
+        Ok((out, n_expanded_specified))
+    }
+
+    fn expand_entities(
+        &mut self,
+        raw: &str,
+        content: bool,
+        undef_pos: XmlPos,
+    ) -> Result<String, pyre_interpreter::PyError> {
+        let err_pos = if content { undef_pos } else { self.pos };
+        let mut out = String::new();
+        // frames: (text, byte offset of the unread rest, entity name or None for `raw`)
+        let mut frames: Vec<(String, usize, Option<String>)> = vec![(raw.to_string(), 0, None)];
+        let result = (|| {
+            while !frames.is_empty() {
+                let top = frames.len() - 1;
+                let offset = frames[top].1;
+                let Some(rel) = frames[top].0[offset..].find('&') else {
+                    out.push_str(&frames[top].0[offset..]);
+                    let name = frames.pop().unwrap().2;
+                    if let Some(ref name) = name {
+                        if let Some(ent) = self.internal_entities.get_mut(name) {
+                            ent.open = false;
+                        }
+                    }
+                    if content && name.is_some() && !out.is_empty() {
+                        self.report_entity_text(&out)?;
+                        out.clear();
+                    }
+                    continue;
+                };
+                let amp_at = offset + rel;
+                out.push_str(&frames[top].0[offset..amp_at]);
+                let after_start = amp_at + 1;
+                let Some(end) = frames[top].0[after_start..].find(';') else {
+                    return Err(self.make_error("undefined entity"));
+                };
+                let ent = frames[top].0[after_start..after_start + end].to_string();
+                let next_offset = after_start + end + 1;
+                match ent.as_str() {
+                    "amp" => out.push('&'),
+                    "lt" => out.push('<'),
+                    "gt" => out.push('>'),
+                    "quot" => out.push('"'),
+                    "apos" => out.push('\''),
+                    _ if ent.starts_with('#') => {
+                        let ch = char_from_char_ref(&ent).ok_or_else(|| {
+                            self.make_error_at("reference to invalid character number", undef_pos)
+                        })?;
+                        out.push(ch);
+                    }
+                    _ if self.internal_entities.contains_key(&ent) => {
+                        // `doContent` `! parser->m_defaultExpandInternalEntities`.
+                        if content && !self.expands_internal_entities() {
+                            if !out.is_empty() {
+                                self.report_entity_text(&out)?;
+                                out.clear();
+                            }
+                            if self.handler_is_set("SkippedEntityHandler") {
+                                self.handler_args("SkippedEntityHandler")
+                                    .arg(w_str_new_managed(&ent))
+                                    .arg(w_int_new(0))
+                                    .call()?;
+                            } else {
+                                self.report_default(&format!("&{ent};"))?;
+                            }
+                        } else {
+                            if self.internal_entities[&ent].open {
+                                return Err(
+                                    self.make_error_at("recursive entity reference", err_pos)
+                                );
+                            }
+                            let text = self.internal_entities[&ent].text.clone();
+                            self.account_indirect(text.len())
+                                .map_err(|m| self.make_error_at(&m, err_pos))?;
+                            if let Some(entity) = self.internal_entities.get_mut(&ent) {
+                                entity.open = true;
+                            }
+                            frames[top].1 = next_offset;
+                            if content && !out.is_empty() {
+                                self.report_entity_text(&out)?;
+                                out.clear();
+                            }
+                            frames.push((text, 0, Some(ent)));
+                            continue;
+                        }
+                    }
+                    _ if content && self.external_entities.contains_key(&ent) => {
+                        if !out.is_empty() {
+                            self.report_entity_text(&out)?;
+                            out.clear();
+                        }
+                        if self.handler_is_set("ExternalEntityRefHandler") {
+                            let (sysid, pubid) = self.external_entities[&ent].clone();
+                            self.handle_external_entity(&ent, &sysid, pubid.as_deref(), undef_pos)?;
+                        } else {
+                            self.report_default(&format!("&{ent};"))?;
+                        }
+                    }
+                    _ if content => {
+                        // `doContent` `XML_TOK_ENTITY_REF`: undefined general entity.
+                        if !self.has_param_entity_refs || self.standalone {
+                            return Err(self.make_error_at("undefined entity", undef_pos));
+                        } else {
+                            if !out.is_empty() {
+                                self.report_entity_text(&out)?;
+                                out.clear();
+                            }
+                            if self.handler_is_set("SkippedEntityHandler") {
+                                self.handler_args("SkippedEntityHandler")
+                                    .arg(w_str_new_managed(&ent))
+                                    .arg(w_int_new(0))
+                                    .call()?;
+                            } else {
+                                self.report_default(&format!("&{ent};"))?;
+                            }
+                        }
+                    }
+                    _ => return Err(self.make_error("undefined entity")),
+                }
+                frames[top].1 = next_offset;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            for (_, _, name) in &frames {
+                if let Some(name) = name {
+                    if let Some(ent) = self.internal_entities.get_mut(name) {
+                        ent.open = false;
+                    }
+                }
+            }
+        }
+        result?;
         Ok(out)
     }
 
-    fn expand_entities(&mut self, raw: &str, content: bool) -> Result<String, String> {
-        let mut out = String::new();
-        let mut rest = raw;
-        while let Some(pos) = rest.find('&') {
-            out.push_str(&rest[..pos]);
-            let after = &rest[pos + 1..];
-            let Some(end) = after.find(';') else {
-                return Err("undefined entity".to_string());
-            };
-            let ent = &after[..end];
-            match ent {
-                "amp" => out.push('&'),
-                "lt" => out.push('<'),
-                "gt" => out.push('>'),
-                "quot" => out.push('"'),
-                "apos" => out.push('\''),
-                _ if ent.starts_with("#x") || ent.starts_with("#X") => {
-                    let code = u32::from_str_radix(&ent[2..], 16)
-                        .map_err(|_| "reference to invalid character number".to_string())?;
-                    let ch = char::from_u32(code)
-                        .ok_or_else(|| "reference to invalid character number".to_string())?;
-                    out.push(ch);
-                }
-                _ if ent.starts_with('#') => {
-                    let code = ent[1..]
-                        .parse::<u32>()
-                        .map_err(|_| "reference to invalid character number".to_string())?;
-                    let ch = char::from_u32(code)
-                        .ok_or_else(|| "reference to invalid character number".to_string())?;
-                    out.push(ch);
-                }
-                _ if self.internal_entities.contains_key(ent) => {
-                    out.push_str(&self.internal_entities[ent].clone());
-                }
-                _ if content && self.external_entities.contains_key(ent) => {
-                    let (sysid, pubid) = self.external_entities[ent].clone();
-                    self.handle_external_entity(ent, &sysid, pubid.as_deref())
-                        .map_err(|_| "error in processing external entity reference".to_string())?;
-                }
-                _ if content => {
-                    self.handler_args("SkippedEntityHandler")
-                        .arg(w_str_new_managed(ent))
-                        .arg(w_int_new(0))
-                        .call()
-                        .map_err(|_| "undefined entity".to_string())?;
-                }
-                _ => return Err("undefined entity".to_string()),
-            }
-            rest = &after[end + 1..];
+    /// `accountingDiffTolerated` + `accountingGetCurrentAmplification`.
+    /// `lenOfShortestInclude` is `sizeof("<!ENTITY a SYSTEM 'b'>") - 1` = 22.
+    fn account_indirect(&mut self, n: usize) -> Result<(), String> {
+        self.bytes_indirect += n as u64;
+        let direct = self.pos.index as u64;
+        let output = direct + self.bytes_indirect;
+        let factor = if direct > 0 {
+            output as f32 / direct as f32
+        } else {
+            (22 + self.bytes_indirect) as f32 / 22.0f32
+        };
+        // `m_accounting.activationThresholdBytes`
+        let threshold =
+            get_parser_int(self.parser(), "_pyre_billion_threshold", 8388608).max(0) as u64;
+        // `m_accounting.maximumAmplificationFactor`
+        let max_factor = get_parser_float(self.parser(), "_pyre_billion_max_factor", 100.0) as f32;
+        if output >= threshold && factor > max_factor {
+            Err("limit on input amplification factor (from DTD and entities) breached".to_string())
+        } else {
+            Ok(())
         }
-        out.push_str(rest);
-        Ok(out)
     }
 
     fn handle_external_entity(
@@ -1209,6 +2496,7 @@ impl<'a> MiniXmlParser<'a> {
         context: &str,
         sysid: &str,
         pubid: Option<&str>,
+        pos: XmlPos,
     ) -> Result<(), pyre_interpreter::PyError> {
         if self.suppress_current {
             return Ok(());
@@ -1239,8 +2527,8 @@ impl<'a> MiniXmlParser<'a> {
             handler,
             &[w_context, base, w_sysid, w_pubid],
         )?;
-        if unsafe { is_int(ret) && w_int_get_value(ret) == 0 } {
-            return self.fail("error in processing external entity reference");
+        if handler_int_rv(ret, "ExternalEntityRef")? == 0 {
+            return Err(self.make_error_at("error in processing external entity reference", pos));
         }
         Ok(())
     }
@@ -1277,7 +2565,7 @@ impl<'a> MiniXmlParser<'a> {
             roots.get(pinned),
             &[w_none(), base, roots.get(pinned + 2), roots.get(pinned + 1)],
         )?;
-        if unsafe { is_int(ret) && w_int_get_value(ret) == 0 } {
+        if handler_int_rv(ret, "ExternalEntityRef")? == 0 {
             return self.fail("error in processing external entity reference");
         }
         Ok(())
@@ -1319,33 +2607,11 @@ impl<'a> MiniXmlParser<'a> {
     }
 
     fn make_error(&self, msg: &str) -> pyre_interpreter::PyError {
-        let code = error_code_for_message(msg);
-        pyre_interpreter::baseobjspace::setdictvalue_native(
-            self.parser(),
-            "ErrorLineNumber",
-            w_int_new(self.pos.line as i64),
-        );
-        pyre_interpreter::baseobjspace::setdictvalue_native(
-            self.parser(),
-            "ErrorColumnNumber",
-            w_int_new(self.pos.col as i64),
-        );
-        pyre_interpreter::baseobjspace::setdictvalue_native(
-            self.parser(),
-            "ErrorByteIndex",
-            w_int_new(self.pos.index as i64),
-        );
-        pyre_interpreter::baseobjspace::setdictvalue_native(
-            self.parser(),
-            "ErrorCode",
-            w_int_new(code),
-        );
-        pyexpat_error(
-            format!("{msg}: line {}, column {}", self.pos.line, self.pos.col),
-            code,
-            self.pos.line as i64,
-            self.pos.col as i64,
-        )
+        self.make_error_at(msg, self.pos)
+    }
+
+    fn make_error_at(&self, msg: &str, pos: XmlPos) -> pyre_interpreter::PyError {
+        publish_error(self.parser(), msg, pos)
     }
 
     fn update_position_slots(&self) {
@@ -1364,18 +2630,39 @@ impl<'a> MiniXmlParser<'a> {
             "CurrentByteIndex",
             w_int_new(self.pos.index as i64),
         );
+        pyre_interpreter::baseobjspace::setdictvalue_native(
+            self.parser(),
+            "ErrorLineNumber",
+            w_int_new(self.pos.line as i64),
+        );
+        pyre_interpreter::baseobjspace::setdictvalue_native(
+            self.parser(),
+            "ErrorColumnNumber",
+            w_int_new(self.pos.col as i64),
+        );
+        pyre_interpreter::baseobjspace::setdictvalue_native(
+            self.parser(),
+            "ErrorByteIndex",
+            w_int_new(self.pos.index as i64),
+        );
     }
 }
 
 fn object_to_xml_string(
-    parser: PyObjectRef,
+    mut parser: PyObjectRef,
     obj: PyObjectRef,
+    isfinal: bool,
 ) -> Result<String, pyre_interpreter::PyError> {
     unsafe {
         if is_str(obj) {
-            Ok(pyre_interpreter::baseobjspace::str_utf8_w(obj)?.to_string())
+            let text = pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::str_utf8_w(obj).map(|s| s.to_string()))?;
+            decode_xml_bytes(parser, text.as_bytes(), isfinal)
         } else if pyre_object::bytesobject::is_bytes_like(obj) {
-            decode_xml_bytes(parser, pyre_object::bytesobject::bytes_like_data(obj))
+            decode_xml_bytes(
+                parser,
+                pyre_object::bytesobject::bytes_like_data(obj),
+                isfinal,
+            )
         } else {
             Err(pyre_interpreter::PyError::type_error(
                 "Parse() argument must be str or bytes",
@@ -1384,75 +2671,344 @@ fn object_to_xml_string(
     }
 }
 
+/// `asciitab.h`: the ASCII bytes whose type is `BT_OTHER` or `BT_NONXML`,
+/// the only ones `XmlInitUnknownEncoding` lets an encoding remap.
+fn ascii_byte_may_remap(b: usize) -> bool {
+    matches!(
+        b,
+        0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0x24 | 0x40 | 0x5C | 0x5E | 0x60 | 0x7B | 0x7D..=0x7F
+    )
+}
+
+/// `PyUnknownEncodingHandler` plus `XmlInitUnknownEncoding`.
+fn unknown_encoding_map(
+    mut parser: PyObjectRef,
+    name: &str,
+) -> Result<[i32; 256], pyre_interpreter::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let parser_slot = roots.pin_roots(&[parser]);
+    let decoded_slot = if let Ok(obj) = pyre_interpreter::baseobjspace::getattr_str(
+        roots.get(parser_slot),
+        "_pyre_unknown_map_text",
+    ) && unsafe { is_str(obj) }
+    {
+        roots.pin_roots(&[obj])
+    } else {
+        let payload: [u8; 256] = std::array::from_fn(|i| i as u8);
+        let bytes_slot = roots.pin_roots(&[pyre_object::bytesobject::w_bytes_from_bytes(&payload)]);
+        let name_slot = roots.pin_roots(&[w_str_new_managed(name)]);
+        let replace_slot = roots.pin_roots(&[w_str_new_managed("replace")]);
+        let decoded = pyre_interpreter::baseobjspace::call_method_result(
+            roots.get(bytes_slot),
+            "decode",
+            &[roots.get(name_slot), roots.get(replace_slot)],
+        )?;
+        roots.pin_roots(&[decoded])
+    };
+    let text = match pyre_interpreter::baseobjspace::str_utf8_w(roots.get(decoded_slot)) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            return Err(pyexpat_error(
+                "unknown encoding: line 1, column 0".to_string(),
+                error_code_for_message("unknown encoding"),
+                1,
+                0,
+            ));
+        }
+    };
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() != 256 {
+        return Err(pyre_interpreter::PyError::value_error(
+            "multi-byte encodings are not supported",
+        ));
+    }
+    let mut map = [0i32; 256];
+    for (i, ch) in chars.iter().copied().enumerate() {
+        map[i] = if ch == '\u{FFFD}' { -1 } else { ch as i32 };
+    }
+    for i in 0..256 {
+        let c = map[i];
+        if i < 0x80 && !ascii_byte_may_remap(i) && c != i as i32 {
+            return Err(pyexpat_error(
+                "unknown encoding: line 1, column 0".to_string(),
+                error_code_for_message("unknown encoding"),
+                1,
+                0,
+            ));
+        }
+        if (0..0x80).contains(&c) && !ascii_byte_may_remap(c as usize) && c != i as i32 {
+            return Err(pyexpat_error(
+                "unknown encoding: line 1, column 0".to_string(),
+                error_code_for_message("unknown encoding"),
+                1,
+                0,
+            ));
+        }
+        // `XmlInitUnknownEncoding`: mapped values must sit in the BMP.
+        if c > 0xFFFF {
+            return Err(pyexpat_error(
+                "unknown encoding: line 1, column 0".to_string(),
+                error_code_for_message("unknown encoding"),
+                1,
+                0,
+            ));
+        }
+    }
+    parser = roots.get(parser_slot);
+    let mut decoded = roots.get(decoded_slot);
+    pyre_object::with_roots!(parser, decoded => pyre_interpreter::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_unknown_map_text",
+        decoded,
+    ));
+    Ok(map)
+}
+
+fn parser_pending_raw(mut parser: PyObjectRef) -> Vec<u8> {
+    let mut obj = match pyre_object::with_roots!(parser => {
+        pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_pending_raw")
+    }) {
+        Ok(obj) => obj,
+        Err(_) => return Vec::new(),
+    };
+    if !unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
+        return Vec::new();
+    }
+    pyre_object::with_roots!(obj => unsafe { pyre_object::bytesobject::bytes_like_data(obj).to_vec() })
+}
+
+fn set_parser_pending_raw(mut parser: PyObjectRef, data: &[u8]) {
+    let mut raw = pyre_object::bytesobject::w_bytes_from_bytes(data);
+    pyre_object::with_roots!(parser, raw => pyre_interpreter::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_pending_raw",
+        raw,
+    ));
+}
+
+/// Publish the error position on the parser (`XML_GetErrorLineNumber` after
+/// a failed `XML_Parse`).  Each `w_int_new` allocates, so the parser is
+/// pinned and read back out of its root slot.
+fn publish_error(parser: PyObjectRef, msg: &str, pos: XmlPos) -> pyre_interpreter::PyError {
+    let code = error_code_for_message(msg);
+    let roots = pyre_object::gc_roots::push_roots();
+    let slot = roots.base();
+    let _ = roots.pin_root(parser);
+    pyre_interpreter::baseobjspace::setdictvalue_native(
+        roots.get(slot),
+        "ErrorLineNumber",
+        w_int_new(pos.line as i64),
+    );
+    pyre_interpreter::baseobjspace::setdictvalue_native(
+        roots.get(slot),
+        "ErrorColumnNumber",
+        w_int_new(pos.col as i64),
+    );
+    pyre_interpreter::baseobjspace::setdictvalue_native(
+        roots.get(slot),
+        "ErrorByteIndex",
+        w_int_new(pos.index as i64),
+    );
+    pyre_interpreter::baseobjspace::setdictvalue_native(
+        roots.get(slot),
+        "CurrentLineNumber",
+        w_int_new(pos.line as i64),
+    );
+    pyre_interpreter::baseobjspace::setdictvalue_native(
+        roots.get(slot),
+        "CurrentColumnNumber",
+        w_int_new(pos.col as i64),
+    );
+    pyre_interpreter::baseobjspace::setdictvalue_native(
+        roots.get(slot),
+        "CurrentByteIndex",
+        w_int_new(pos.index as i64),
+    );
+    pyre_interpreter::baseobjspace::setdictvalue_native(
+        roots.get(slot),
+        "ErrorCode",
+        w_int_new(code),
+    );
+    pyexpat_error(
+        format!("{msg}: line {}, column {}", pos.line, pos.col),
+        code,
+        pos.line as i64,
+        pos.col as i64,
+    )
+}
+
+/// `XML_ERROR_FINISHED`: a finished parser fails at its current position.
+fn parsing_finished_error(parser: PyObjectRef) -> pyre_interpreter::PyError {
+    let roots = pyre_object::gc_roots::push_roots();
+    let slot = roots.base();
+    let _ = roots.pin_root(parser);
+    let pos = XmlPos {
+        index: get_parser_int(roots.get(slot), "CurrentByteIndex", 0) as usize,
+        line: get_parser_int(roots.get(slot), "CurrentLineNumber", 1) as usize,
+        col: get_parser_int(roots.get(slot), "CurrentColumnNumber", 0) as usize,
+    };
+    publish_error(roots.get(slot), "parsing finished", pos)
+}
+
+/// Position of a decoding error: the text decoded so far, from the
+/// document start (`parser_pending` holds the whole document text so far).
+fn decode_error(parser: PyObjectRef, prev: &str, prefix: &str) -> pyre_interpreter::PyError {
+    let origin = XmlPos {
+        index: 0,
+        line: 1,
+        col: 0,
+    };
+    let pos = pos_after(pos_after(origin, prev), prefix);
+    publish_error(parser, "not well-formed (invalid token)", pos)
+}
+
 fn decode_xml_bytes(
     mut parser: PyObjectRef,
     data: &[u8],
+    isfinal: bool,
 ) -> Result<String, pyre_interpreter::PyError> {
-    let enc = pyre_object::with_roots!(parser => declared_or_forced_encoding(parser, data))?;
+    let mut buf = pyre_object::with_roots!(parser => parser_pending_raw(parser));
+    buf.extend_from_slice(data);
+    let encoding_detected = pyre_object::with_roots!(parser => {
+        pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_encoding_detected")
+            .map(is_true_obj)
+            .unwrap_or(false)
+    });
+    // `initScan` `XML_TOK_PARTIAL`: wait for a BOM, a UTF-16 null, or a
+    // complete XML declaration before choosing an encoding.
+    if !encoding_detected && !isfinal {
+        let keep_pending = if buf.len() < 2 {
+            true
+        } else if looks_like_utf16(&buf) {
+            false
+        } else if buf.len() < 3 && [0xefu8, 0xbb, 0xbf].starts_with(buf.as_slice()) {
+            true
+        } else {
+            let rest = buf.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&buf);
+            (rest.len() < b"<?xml".len() && b"<?xml".starts_with(rest))
+                || (rest.starts_with(b"<?xml") && !rest.windows(2).any(|w| w == b"?>"))
+        };
+        if keep_pending {
+            pyre_object::with_roots!(parser => set_parser_pending_raw(parser, &buf));
+            pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
+                parser,
+                "_pyre_partial_tail_kind",
+                w_int_new(if buf.is_empty() { 0 } else { 1 }),
+            ));
+            return Ok(String::new());
+        }
+    }
+    pyre_object::with_roots!(parser => set_parser_pending_raw(parser, &[]));
+    let enc = pyre_object::with_roots!(parser => declared_or_forced_encoding(parser, &buf))?;
     let normalized = normalize_encoding(&enc);
-    pyre_interpreter::baseobjspace::setdictvalue_native(
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
         "_pyre_forced_encoding",
         w_str_new_managed(&normalized),
-    );
-    match normalized.as_str() {
+    ));
+    let prev = pyre_object::with_roots!(parser => parser_pending(parser));
+    let (text, pending, kind) = match normalized.as_str() {
         "utf-8" | "us-ascii" => {
-            let data = data.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(data);
-            String::from_utf8(data.to_vec())
-        }
-        .map_err(|_| {
-            pyexpat_error(
-                "not well-formed (invalid token): line 1, column 0".to_string(),
-                error_code_for_message("not well-formed (invalid token)"),
-                1,
-                0,
-            )
-        }),
-        "iso-8859-1" => Ok(data.iter().map(|b| *b as char).collect()),
-        "utf-16" | "utf-16le" | "utf-16be" => decode_utf16_bytes(data, &normalized),
-        _ => {
-            if normalized == "undefined" {
-                Err(make_builtin_error(
-                    "UnicodeError",
-                    "unknown encoding: undefined",
-                ))
-            } else if normalized == "hex-codec" || normalized == "rot-13" || normalized == "xyz" {
-                Err(pyre_interpreter::PyError::lookup_error(format!(
-                    "unknown encoding: {enc}"
-                )))
+            let data = if !encoding_detected {
+                buf.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&buf[..])
             } else {
-                Err(pyexpat_error(
-                    "unknown encoding: line 1, column 0".to_string(),
-                    error_code_for_message("unknown encoding"),
-                    1,
-                    0,
-                ))
+                &buf[..]
+            };
+            match std::str::from_utf8(data) {
+                Ok(s) => (s.to_string(), Vec::new(), 0),
+                Err(error) if error.error_len().is_none() => {
+                    let valid = error.valid_up_to();
+                    let pending = data[valid..].to_vec();
+                    let text = match std::str::from_utf8(&data[..valid]) {
+                        Ok(s) => s.to_string(),
+                        Err(_) => String::new(),
+                    };
+                    (text, pending, 2)
+                }
+                Err(error) => {
+                    let prefix = std::str::from_utf8(&data[..error.valid_up_to()]).unwrap_or("");
+                    return Err(
+                        pyre_object::with_roots!(parser => decode_error(parser, &prev, prefix)),
+                    );
+                }
             }
         }
+        "iso-8859-1" => (buf.iter().map(|b| *b as char).collect(), Vec::new(), 0),
+        "utf-16" | "utf-16le" | "utf-16be" => {
+            match decode_utf16_bytes(&buf, &normalized, !encoding_detected) {
+                Ok(decoded) => decoded,
+                Err(prefix) => {
+                    return Err(pyre_object::with_roots!(
+                        parser => decode_error(parser, &prev, &prefix)
+                    ));
+                }
+            }
+        }
+        _ => {
+            let map = pyre_object::with_roots!(parser => unknown_encoding_map(parser, &enc))?;
+            let mut text = String::with_capacity(buf.len());
+            for &byte in &buf {
+                let c = map[byte as usize];
+                let Some(ch) = u32::try_from(c).ok().and_then(char::from_u32) else {
+                    return Err(
+                        pyre_object::with_roots!(parser => decode_error(parser, &prev, &text)),
+                    );
+                };
+                text.push(ch);
+            }
+            (text, Vec::new(), 0)
+        }
+    };
+    if buf.len() >= 2 {
+        pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
+            parser,
+            "_pyre_encoding_detected",
+            w_bool_from(true),
+        ));
     }
+    pyre_object::with_roots!(parser => set_parser_pending_raw(parser, &pending));
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_partial_tail_kind",
+        w_int_new(kind),
+    ));
+    Ok(text)
 }
 
 fn declared_or_forced_encoding(
-    parser: PyObjectRef,
+    mut parser: PyObjectRef,
     data: &[u8],
 ) -> Result<String, pyre_interpreter::PyError> {
+    let detected = pyre_object::with_roots!(parser => {
+        pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_encoding_detected")
+            .map(is_true_obj)
+            .unwrap_or(false)
+    });
+    if detected {
+        return pyre_object::with_roots!(parser => {
+            if let Ok(obj) =
+                pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_forced_encoding")
+                    && unsafe { is_str(obj) }
+            {
+                pyre_interpreter::baseobjspace::str_utf8_w(obj).map(|s| s.to_string())
+            } else {
+                Ok("utf-8".to_string())
+            }
+        });
+    }
+    // `initScan`: a BOM first, else a leading zero byte is UTF-16BE and a
+    // zero in the second byte is UTF-16LE. Runs once at the start of the entity.
     if data.starts_with(&[0xff, 0xfe]) {
         return Ok("utf-16le".to_string());
     }
     if data.starts_with(&[0xfe, 0xff]) {
         return Ok("utf-16be".to_string());
     }
-    if data.starts_with(&[b'<', 0]) {
-        return Ok("utf-16le".to_string());
-    }
-    if data.starts_with(&[0, b'<']) {
+    if data.len() >= 2 && data[0] == 0 {
         return Ok("utf-16be".to_string());
     }
-    if data.starts_with(&[b'<', 0, b'?', 0, b'x', 0]) {
+    if data.len() >= 2 && data[1] == 0 {
         return Ok("utf-16le".to_string());
-    }
-    if data.starts_with(&[0, b'<', 0, b'?', 0, b'x']) {
-        return Ok("utf-16be".to_string());
     }
     if let Ok(obj) = pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_forced_encoding")
         && unsafe { is_str(obj) }
@@ -1481,24 +3037,25 @@ fn declared_or_forced_encoding(
 fn looks_like_utf16(data: &[u8]) -> bool {
     data.starts_with(&[0xff, 0xfe])
         || data.starts_with(&[0xfe, 0xff])
-        || data.starts_with(&[b'<', 0])
-        || data.starts_with(&[0, b'<'])
-        || data.starts_with(&[b'<', 0, b'?', 0, b'x', 0])
-        || data.starts_with(&[0, b'<', 0, b'?', 0, b'x'])
+        || (data.len() >= 2 && (data[0] == 0 || data[1] == 0))
 }
 
-fn decode_utf16_bytes(data: &[u8], enc: &str) -> Result<String, pyre_interpreter::PyError> {
-    let (little, start) = if data.starts_with(&[0xff, 0xfe]) {
+fn decode_utf16_bytes(
+    data: &[u8],
+    enc: &str,
+    strip_bom: bool,
+) -> Result<(String, Vec<u8>, i64), String> {
+    let (little, start) = if strip_bom && data.starts_with(&[0xff, 0xfe]) {
         (true, 2)
-    } else if data.starts_with(&[0xfe, 0xff]) {
+    } else if strip_bom && data.starts_with(&[0xfe, 0xff]) {
         (false, 2)
     } else {
         (enc != "utf-16be", 0)
     };
-    if !(data.len() - start).is_multiple_of(2) {
-        return Err(pyre_interpreter::PyError::value_error("partial character"));
-    }
-    let words: Vec<u16> = data[start..]
+    let rest_len = data.len() - start;
+    let leftover = rest_len % 2 == 1;
+    let even_end = start + (rest_len & !1);
+    let words: Vec<u16> = data[start..even_end]
         .as_chunks::<2>()
         .0
         .iter()
@@ -1510,8 +3067,53 @@ fn decode_utf16_bytes(data: &[u8], enc: &str) -> Result<String, pyre_interpreter
             }
         })
         .collect();
-    String::from_utf16(&words)
-        .map_err(|_| pyre_interpreter::PyError::value_error("not well-formed (invalid token)"))
+    let high_surrogate_tail = words
+        .last()
+        .copied()
+        .is_some_and(|w| (0xD800..=0xDBFF).contains(&w));
+    let complete = if high_surrogate_tail {
+        &words[..words.len() - 1]
+    } else {
+        &words[..]
+    };
+    let mut text = String::new();
+    for ch in char::decode_utf16(complete.iter().copied()) {
+        match ch {
+            Ok(c) => text.push(c),
+            Err(_) => return Err(text),
+        }
+    }
+    let pending_from = if high_surrogate_tail {
+        even_end - 2
+    } else {
+        even_end
+    };
+    let pending = data[pending_from..].to_vec();
+    let kind = if high_surrogate_tail {
+        2
+    } else if leftover {
+        1
+    } else {
+        0
+    };
+    Ok((text, pending, kind))
+}
+
+/// `normalizeLines`: `"\r\n"` and a lone `"\r"` become `"\n"`.
+fn normalize_lines(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            out.push('\n');
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn normalize_encoding(enc: &str) -> String {
@@ -1544,21 +3146,6 @@ fn is_true_obj(obj: PyObjectRef) -> bool {
     }
 }
 
-fn make_builtin_error(name: &str, msg: &str) -> pyre_interpreter::PyError {
-    // `OperationError(w_type, space.newtext(msg))`.
-    let Some(cls) = pyre_interpreter::builtins::lookup_exc_class(name) else {
-        return pyre_interpreter::PyError::value_error(msg.to_string());
-    };
-    let _roots = pyre_object::gc_roots::push_roots();
-    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(cls);
-    let w_value = w_str_new_managed(msg);
-    pyre_interpreter::PyError::from_type_and_value(
-        pyre_object::gc_roots::shadow_stack_get(cls_slot),
-        w_value,
-    )
-}
-
 fn parser_pending(parser: PyObjectRef) -> String {
     match pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_pending_xml") {
         Ok(obj) if unsafe { is_str(obj) } => pyre_interpreter::baseobjspace::str_utf8_w(obj)
@@ -1580,6 +3167,13 @@ fn set_parser_pending(parser: PyObjectRef, pending: &str) {
 fn get_parser_int(parser: PyObjectRef, name: &str, default: i64) -> i64 {
     match pyre_interpreter::baseobjspace::getattr_str(parser, name) {
         Ok(obj) if unsafe { is_int(obj) } => unsafe { w_int_get_value(obj) },
+        _ => default,
+    }
+}
+
+fn get_parser_float(parser: PyObjectRef, name: &str, default: f64) -> f64 {
+    match pyre_interpreter::baseobjspace::getattr_str(parser, name) {
+        Ok(obj) if unsafe { is_float(obj) } => unsafe { w_float_get_value(obj) },
         _ => default,
     }
 }
@@ -1610,17 +3204,46 @@ fn parse_impl(
         .map(is_true_obj)
         .unwrap_or(false)
     {
-        return Err(pyexpat_error(
-            "parsing finished: line 1, column 0".to_string(),
-            error_code_for_message("parsing finished"),
-            1,
-            0,
-        ));
+        return Err(parsing_finished_error(roots.get(base + 1)));
     }
-    let mut input = parser_pending(roots.get(base + 1));
-    input.push_str(&object_to_xml_string(roots.get(base + 1), roots.get(base))?);
+    // `pyexpat_xmlparser_Parse_impl`: a `str` argument calls
+    // `XML_SetEncoding(..., "utf-8")` before the first Parse.
+    if unsafe { is_str(roots.get(base)) }
+        && !pyre_interpreter::baseobjspace::getattr_str(
+            roots.get(base + 1),
+            "_pyre_parsing_started",
+        )
+        .map(is_true_obj)
+        .unwrap_or(false)
+    {
+        pyre_interpreter::baseobjspace::setdictvalue_native(
+            roots.get(base + 1),
+            "_pyre_forced_encoding",
+            w_str_new_managed("utf-8"),
+        );
+    }
+    pyre_interpreter::baseobjspace::setdictvalue_native(
+        roots.get(base + 1),
+        "_pyre_parsing_started",
+        w_bool_from(true),
+    );
     let final_flag = is_true_obj(roots.get(base + 2));
-    maybe_reject_amplification(roots.get(base + 1), &input)?;
+    let mut input = parser_pending(roots.get(base + 1));
+    input.push_str(&object_to_xml_string(
+        roots.get(base + 1),
+        roots.get(base),
+        final_flag,
+    )?);
+    let convert_chunks = match pyre_interpreter::baseobjspace::getattr_str(
+        roots.get(base + 1),
+        "_pyre_forced_encoding",
+    ) {
+        Ok(obj) if unsafe { is_str(obj) } => {
+            let enc = pyre_interpreter::baseobjspace::str_utf8_w(obj)?;
+            enc != "utf-8" && enc != "us-ascii"
+        }
+        _ => false,
+    };
     let reparse_deferral =
         pyre_interpreter::baseobjspace::getattr_str(roots.get(base + 1), "_pyre_reparse_deferral")
             .map(is_true_obj)
@@ -1660,7 +3283,14 @@ fn parse_impl(
         call_foreign_dtd_handler(roots.get(base + 1), w_none(), w_none())?;
     }
     let suppress_until = get_emit_upto(roots.get(base + 1));
-    let parsed = MiniXmlParser::new(base + 1, &parse_input, final_flag, suppress_until).parse()?;
+    let parsed = MiniXmlParser::new(
+        base + 1,
+        &parse_input,
+        final_flag,
+        suppress_until,
+        convert_chunks,
+    )
+    .parse()?;
     if final_flag {
         pyre_interpreter::baseobjspace::setdictvalue_native(
             roots.get(base + 1),
@@ -1685,6 +3315,21 @@ fn parse_impl(
     Ok(w_int_new(1))
 }
 
+/// `INT_HANDLER` / `RC_HANDLER` `PyLong_AsLong` plus `invalid_expat_handler_rv`.
+fn handler_int_rv(mut ret: PyObjectRef, name: &str) -> Result<i64, pyre_interpreter::PyError> {
+    match pyre_object::with_roots!(ret => pyre_interpreter::baseobjspace::int_w(ret)) {
+        // Narrow to `int` (`rffi.cast(rffi.INT_real, ...)`).
+        Ok(value) => Ok(value as i32 as i64),
+        Err(mut err) => {
+            pyre_interpreter::baseobjspace::add_internal_exception_note(
+                &mut err,
+                &format!("invalid '{name}' event handler return value"),
+            )?;
+            Err(err)
+        }
+    }
+}
+
 fn call_foreign_dtd_handler(
     mut parser: PyObjectRef,
     mut pubid: PyObjectRef,
@@ -1707,33 +3352,10 @@ fn call_foreign_dtd_handler(
         roots.get(pinned),
         &[w_none(), base, roots.get(pinned + 2), roots.get(pinned + 1)],
     )?;
-    if unsafe { is_int(ret) && w_int_get_value(ret) == 0 } {
+    if handler_int_rv(ret, "ExternalEntityRef")? == 0 {
         return Err(pyexpat_error(
             "error in processing external entity reference: line 1, column 0".to_string(),
             error_code_for_message("error in processing external entity reference"),
-            1,
-            0,
-        ));
-    }
-    Ok(())
-}
-
-fn maybe_reject_amplification(
-    mut parser: PyObjectRef,
-    input: &str,
-) -> Result<(), pyre_interpreter::PyError> {
-    if !input.contains("<!ENTITY row") {
-        return Ok(());
-    }
-    let threshold = pyre_object::with_roots!(parser => get_parser_int(parser, "_pyre_billion_threshold", i64::MAX));
-    let max_one = pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_billion_max_is_one")
-        .map(is_true_obj)
-        .unwrap_or(false);
-    if threshold <= 3 || max_one {
-        return Err(pyexpat_error(
-            "limit on input amplification factor (from DTD and entities) breached: line 1, column 0"
-                .to_string(),
-            0,
             1,
             0,
         ));
@@ -1790,6 +3412,9 @@ fn copy_parser_config(mut src: PyObjectRef, mut dst: PyObjectRef) {
         "_pyre_namespace_separator",
         "_pyre_forced_encoding",
         "_pyre_base",
+        "_pyre_reparse_deferral",
+        "_pyre_default_kind",
+        "_pyre_default_expand",
     ] {
         if let Ok(value) = pyre_object::with_roots!(dst, src => pyre_interpreter::baseobjspace::getattr_str(src, name))
         {
@@ -1821,10 +3446,11 @@ mod xmlparser_class {
                 self_obj: PyObjectRef,
                 file: PyObjectRef,
             ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-                // W_XMLParserType.ParseFile looks up `read` each iteration
-                // (`space.call_method(w_file, 'read', …)`).  Each chunk's
-                // `read` and `parse_impl` run Python and can collect, so the
-                // file object is kept in a slot and reloaded.
+                // pyexpat_xmlparser_ParseFile_impl looks `read` up once
+                // (`PyObject_GetOptionalAttr(file, "read")`) and the loop
+                // calls that bound method. Each chunk's `read` and
+                // `parse_impl` run Python and can collect, so the bound
+                // method is kept in a slot and reloaded.
                 let roots = pyre_object::gc_roots::push_roots();
                 let self_slot = roots.base();
                 let _ = roots.pin_root(self_obj);
@@ -1836,11 +3462,31 @@ mod xmlparser_class {
                 let _ = roots.pin_root(w_none());
                 let eof_slot = self_slot + 4;
                 let _ = roots.pin_root(w_bool_from(false));
+                let read_slot = match pyre_interpreter::baseobjspace::getattr_str(
+                    roots.get(file_slot),
+                    "read",
+                ) {
+                    Ok(read) => {
+                        let _ = roots.pin_root(read);
+                        self_slot + 5
+                    }
+                    Err(err) if err.kind == pyre_interpreter::PyErrorKind::AttributeError => {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "argument must have 'read' attribute",
+                        ));
+                    }
+                    Err(err) => return Err(err),
+                };
+                if pyre_interpreter::baseobjspace::getattr_str(roots.get(self_slot), "_pyre_finished")
+                    .map(is_true_obj)
+                    .unwrap_or(false)
+                {
+                    return Err(parsing_finished_error(roots.get(self_slot)));
+                }
                 let mut result;
                 loop {
-                    let data = pyre_interpreter::baseobjspace::call_method_result(
-                        roots.get(file_slot),
-                        "read",
+                    let data = pyre_interpreter::call::call_function_impl_result(
+                        roots.get(read_slot),
                         &[roots.get(size_slot)],
                     )?;
                     roots.set(data_slot, data);
@@ -1859,9 +3505,13 @@ mod xmlparser_class {
                     }
                 }
             }
-            fn SetBase(self_obj: PyObjectRef, base: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+            fn SetBase(mut self_obj: PyObjectRef, mut base: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
                 if unsafe { !is_str(base) } {
                     return Err(pyre_interpreter::PyError::type_error("SetBase() argument must be str"));
+                }
+                let has_nul = pyre_object::with_roots!(self_obj, base => pyre_interpreter::baseobjspace::str_utf8_w(base).map(|s| s.contains('\0')))?;
+                if has_nul {
+                    return Err(pyre_interpreter::PyError::value_error("embedded null character"));
                 }
                 pyre_interpreter::baseobjspace::setdictvalue_native(self_obj, "_pyre_base", base);
                 Ok(w_none())
@@ -1937,7 +3587,11 @@ mod xmlparser_class {
                         0,
                     ));
                 }
-                pyre_interpreter::baseobjspace::setdictvalue_native(self_obj, "_pyre_billion_max_is_one", w_bool_from(value <= 1.0));
+                pyre_object::with_roots!(self_obj => pyre_interpreter::baseobjspace::setdictvalue_native(
+                    self_obj,
+                    "_pyre_billion_max_factor",
+                    w_float_new(value),
+                ));
                 Ok(w_none())
             }
             fn ExternalEntityParserCreate(
@@ -1991,6 +3645,25 @@ mod xmlparser_class {
                         return Err(pyre_interpreter::PyError::value_error("buffer_size must be greater than zero"));
                     }
                     pyre_interpreter::baseobjspace::setdictvalue_native(self_obj, "buffer_size", value);
+                    return Ok(w_none());
+                }
+                if name_s == "DefaultHandler" || name_s == "DefaultHandlerExpand" {
+                    let expand = name_s == "DefaultHandlerExpand";
+                    let clear = unsafe { is_none(value) };
+                    let mut kind = if clear {
+                        w_none()
+                    } else {
+                        w_str_new_managed(name_s)
+                    };
+                    pyre_object::with_roots!(self_obj, value, kind => {
+                        pyre_interpreter::baseobjspace::setdictvalue_native(self_obj, name_s, value);
+                        pyre_interpreter::baseobjspace::setdictvalue_native(self_obj, "_pyre_default_kind", kind);
+                        pyre_interpreter::baseobjspace::setdictvalue_native(
+                            self_obj,
+                            "_pyre_default_expand",
+                            w_bool_from(expand),
+                        );
+                    });
                     return Ok(w_none());
                 }
                 pyre_interpreter::baseobjspace::setdictvalue_native(self_obj, name_s, value);
@@ -2049,6 +3722,41 @@ fn init_parser_slots(mut parser: PyObjectRef) {
     ));
     pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
+        "_pyre_default_kind",
+        w_none(),
+    ));
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_default_expand",
+        w_bool_from(true),
+    ));
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_encoding_detected",
+        w_bool_from(false),
+    ));
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_unknown_map_text",
+        w_none(),
+    ));
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_pending_raw",
+        pyre_object::bytesobject::w_bytes_from_bytes(&[]),
+    ));
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_partial_tail_kind",
+        w_int_new(0),
+    ));
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_parsing_started",
+        w_bool_from(false),
+    ));
+    pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
+        parser,
         "_pyre_deferred_incomplete",
         w_bool_from(false),
     ));
@@ -2060,12 +3768,14 @@ fn init_parser_slots(mut parser: PyObjectRef) {
     pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
         "_pyre_billion_threshold",
-        w_int_new(i64::MAX),
+        // EXPAT_BILLION_LAUGHS_ATTACK_PROTECTION_ACTIVATION_THRESHOLD_DEFAULT
+        w_int_new(8388608),
     ));
     pyre_object::with_roots!(parser => pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
-        "_pyre_billion_max_is_one",
-        w_bool_from(false),
+        "_pyre_billion_max_factor",
+        // EXPAT_BILLION_LAUGHS_ATTACK_PROTECTION_MAXIMUM_AMPLIFICATION_DEFAULT
+        w_float_new(100.0),
     ));
     pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
@@ -2218,6 +3928,28 @@ const ERROR_TABLE: &[(&str, i64)] = &[
     ("parsing aborted", 35),
     ("parsing finished", 36),
     ("cannot suspend in external parameter entity", 37),
+    (
+        "reserved prefix (xml) must not be undeclared or bound to another namespace name",
+        38,
+    ),
+    (
+        "reserved prefix (xmlns) must not be declared or undeclared",
+        39,
+    ),
+    (
+        "prefix must not be bound to one of the reserved namespace names",
+        40,
+    ),
+    ("invalid argument", 41),
+    (
+        "a successful prior call to function XML_GetBuffer is required",
+        42,
+    ),
+    (
+        "limit on input amplification factor (from DTD and entities) breached",
+        43,
+    ),
+    ("parser not started", 44),
 ];
 
 /// `(constant name, value)` from Expat's content-model enums.
@@ -2275,6 +4007,13 @@ const ERROR_NAMES: &[&str] = &[
     "XML_ERROR_ABORTED",
     "XML_ERROR_FINISHED",
     "XML_ERROR_SUSPEND_PE",
+    "XML_ERROR_RESERVED_PREFIX_XML",
+    "XML_ERROR_RESERVED_PREFIX_XMLNS",
+    "XML_ERROR_RESERVED_NAMESPACE_URI",
+    "XML_ERROR_INVALID_ARGUMENT",
+    "XML_ERROR_NO_BUFFER",
+    "XML_ERROR_AMPLIFICATION_LIMIT_BREACH",
+    "XML_ERROR_NOT_STARTED",
 ];
 
 /// Build a `hasdict` namespace object used for the `model` / `errors`

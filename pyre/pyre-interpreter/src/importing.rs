@@ -1221,7 +1221,7 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
             let arg = require_string_module_str(args)?;
             let body = unsafe { pyre_object::w_str_get_wtf8(arg) }.to_wtf8_buf();
             let FieldName { field_type, parts } = FieldName::parse(&body)
-                .map_err(|_| crate::PyError::value_error("bad field name"))?;
+                .map_err(|err| crate::type_methods::format_parse_err(err, &body))?;
 
             let first = match field_type {
                 FieldType::Auto => pyre_object::w_str_new(""),

@@ -724,7 +724,7 @@ fn open_key_named(
         ],
     )?;
     let mut out: HKEY = core::ptr::null_mut();
-    let rc = unsafe { host_reg::open_key_ex(key, &wide_sub, reserved, access, &mut out) };
+    let rc = unsafe { host_reg::open_key_ex(key, Some(&wide_sub), reserved, access, &mut out) };
     if rc != 0 {
         return Err(win_err(rc));
     }
@@ -890,8 +890,9 @@ fn query_default_value(
         None
     } else {
         let mut out: HKEY = core::ptr::null_mut();
-        let rc =
-            unsafe { host_reg::open_key_ex(key, sub_key, 0, host_reg::KEY_QUERY_VALUE, &mut out) };
+        let rc = unsafe {
+            host_reg::open_key_ex(key, Some(sub_key), 0, host_reg::KEY_QUERY_VALUE, &mut out)
+        };
         if rc != 0 {
             return Err(win_err(rc));
         }
