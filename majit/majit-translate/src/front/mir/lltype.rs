@@ -1036,8 +1036,8 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
             continue;
         }
         // `"()"` is a declared unit (`residual_return_shell` → `s_None`).
-        // `None` is unknown; `residual_return_shell` keeps its pre-unit-token
-        // fall-through. A token it declines keeps the original Skip.
+        // `None` is unknown; `residual_return_shell` declines it.
+        // A token it declines keeps the original Skip.
         // `rffi.py llexternal`'s C pointer result is a raw address, even
         // when the C char type is u8. Rust's erased managed-byte-pointer
         // convention belongs to Rust bodies, not foreign declarations;

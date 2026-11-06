@@ -2666,22 +2666,22 @@ fn install_source_graph(
         // A declared Void / `()` result is `s_None` through
         // `residual_return_annotation` → `default_someshell_for_lltype`
         // (`extfunc.py` `register_external` result `None` → `s_None`).
-        // A missing token (Unknown) falls through that helper.
+        // Look-inside graphs leave `return_type` unstamped
+        // (`func_result_kind` follows the CFG) while
+        // `residual_return_type` still holds the FUNC.RESULT token;
+        // fall back to that token the same way
+        // [`declared_return_annotation`] does. A missing token
+        // (Unknown) falls through that helper.
+        let return_token = graph
+            .return_type
+            .as_deref()
+            .or(graph.residual_return_type.as_deref());
         let result_shell = if is_exception_object_materializer(&semantic_key) {
-            residual_stub_result_shell(
-                &semantic_key,
-                graph.return_type.as_deref(),
-                Some(registry.bookkeeper()),
-            )
+            residual_stub_result_shell(&semantic_key, return_token, Some(registry.bookkeeper()))
         } else {
-            raw_ptr_token_annotation(registry, graph.return_type.as_deref())
+            raw_ptr_token_annotation(registry, return_token)
                 .or_else(|| declared_return_annotation(registry, graph))
-                .or_else(|| {
-                    residual_return_annotation(
-                        graph.return_type.as_deref(),
-                        Some(registry.bookkeeper()),
-                    )
-                })
+                .or_else(|| residual_return_annotation(return_token, Some(registry.bookkeeper())))
         };
         if let Some(result_shell) = result_shell {
             let stub = build_stub_pygraph_with_result_shell(
@@ -3242,6 +3242,50 @@ fn bind_rust_vec_return_annotation(
     }
 }
 
+/// Bind `graph.getreturnvar()` to `s_None` when the lowered body
+/// returns unit (`()` / Void).
+///
+/// `llannotation.py` `lltype_to_annotation(Void)` is `s_None`.
+/// `extfunc.py` `register_external` result `None` is `s_None`.
+/// `FunctionDesc.pycall` returns `annotator.recursivecall`'s result
+/// (`annrpython.py`), so an unbound unit return is
+/// `s_ImpossibleValue` and `consider_op` raises `BlockedInference`.
+/// `flowin` swallows that for `simple_call` and never
+/// `follow_link`s the success exit, so `transform_dead_code`
+/// `cutoff_alwaysraising_block` rewrites a returning void call
+/// into `raise AssertionError`.
+///
+/// Look-inside graphs leave `return_type` unstamped
+/// (`func_result_kind` follows the CFG) while
+/// `residual_return_type` still holds the `"()"` FUNC.RESULT token.
+/// Binding from that token is the `_signature_` / residual-stub
+/// shape, not `complete()`'s Impossible seed for an always-raising
+/// graph whose returnblock was never reached.
+fn bind_unit_return_annotation(
+    legacy: &LegacyGraph,
+    graph: &crate::flowspace::model::GraphRef,
+    bookkeeper: &crate::annotator::bookkeeper::Bookkeeper,
+) {
+    let token = legacy
+        .return_type
+        .as_deref()
+        .or(legacy.residual_return_type.as_deref());
+    if token != Some("()") {
+        return;
+    }
+    let Some(s_none) = default_someshell_for_lltype(&LowLevelType::Void) else {
+        return;
+    };
+    let Hlvalue::Variable(mut ret) = graph.borrow().getreturnvar() else {
+        return;
+    };
+    if let Some(annotator) = bookkeeper.try_annotator() {
+        annotator.setbinding(&mut ret, s_none);
+    } else if ret.annotation.borrow().is_none() {
+        *ret.annotation.borrow_mut() = Some(Rc::new(s_none));
+    }
+}
+
 fn lift_callee_to_pygraph_with_func(
     callee_graph: &LegacyGraph,
     signature: Signature,
@@ -3277,6 +3321,7 @@ fn lift_callee_to_pygraph_with_func(
     // effects and raising_op. Do not suppress those reads by trait/name tests.
     crate::translator::simplify::simplify_graph(&graph.borrow(), None);
     bind_rust_vec_return_annotation(callee_graph, &graph, nested_registry.bookkeeper().as_ref());
+    bind_unit_return_annotation(callee_graph, &graph, nested_registry.bookkeeper().as_ref());
     let pygraph = Rc::new(PyGraph {
         graph,
         func,
@@ -3625,7 +3670,11 @@ fn residual_return_annotation(
             ))
         });
     }
-    return_token_to_lltype(token).and_then(|ll| default_someshell_for_lltype(&ll))
+    // `return_token_to_lltype(None)` is Void for a function-pointer RESULT;
+    // a missing FUNC.RESULT token here is unknown, not unit.
+    token
+        .and_then(|t| return_token_to_lltype(Some(t)))
+        .and_then(|ll| default_someshell_for_lltype(&ll))
 }
 
 /// Choose the annotation carried by a `dont_look_inside` stub's return link.
@@ -4971,6 +5020,7 @@ fn drive_lifted_subject(
     // not pass through `FunctionDesc.pycall`; `setconcretetype` still
     // reads this variable.
     bind_rust_vec_return_annotation(legacy, &graph, call_registry.bookkeeper().as_ref());
+    bind_unit_return_annotation(legacy, &graph, call_registry.bookkeeper().as_ref());
     // Scope an `added_blocks` tracker over this subject's drive of the
     // shared annotator so the post-drain blocked-annotation guard
     // (`raise_if_subject_blocked` below) can see exactly the blocks
@@ -16019,6 +16069,106 @@ mod tests {
         let s = default_someshell_for_lltype(&LowLevelType::Void)
             .expect("Void must project to SomeNone");
         assert!(matches!(s, SomeValue::None_(_)), "got {s:?}");
+    }
+
+    #[test]
+    fn residual_return_annotation_unit_token_yields_s_none() {
+        use crate::annotator::model::SomeValue;
+        let s =
+            residual_return_annotation(Some("()"), None).expect("() FUNC.RESULT shells as s_None");
+        assert!(matches!(s, SomeValue::None_(_)), "got {s:?}");
+        assert!(
+            residual_return_annotation(None, None).is_none(),
+            "a missing token is unknown, not unit"
+        );
+    }
+
+    fn unit_flowspace_graph(name: &str) -> crate::flowspace::model::GraphRef {
+        crate::flowspace::model::FunctionGraph::new(
+            name,
+            crate::flowspace::model::Block::shared(vec![]),
+        )
+        .into_ref()
+    }
+
+    fn return_annotation(
+        graph: &crate::flowspace::model::GraphRef,
+    ) -> Option<crate::annotator::model::SomeValue> {
+        match graph.borrow().getreturnvar() {
+            Hlvalue::Variable(v) => v.annotation.borrow().as_ref().map(|rc| (**rc).clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn bind_unit_return_annotation_binds_s_none_from_return_type() {
+        use crate::annotator::model::SomeValue;
+
+        let mut legacy = LegacyGraph::new("unit_fn");
+        legacy.return_type = Some("()".into());
+        let graph = unit_flowspace_graph("unit_fn");
+        let bk = crate::annotator::bookkeeper::Bookkeeper::new();
+        bind_unit_return_annotation(&legacy, &graph, &bk);
+        assert!(
+            matches!(return_annotation(&graph), Some(SomeValue::None_(_))),
+            "stamped () return_type binds s_None"
+        );
+    }
+
+    #[test]
+    fn bind_unit_return_annotation_binds_s_none_from_residual_token() {
+        use crate::annotator::model::SomeValue;
+
+        let mut legacy = LegacyGraph::new("look_inside_unit");
+        legacy.return_type = None;
+        legacy.residual_return_type = Some("()".into());
+        let graph = unit_flowspace_graph("look_inside_unit");
+        let bk = crate::annotator::bookkeeper::Bookkeeper::new();
+        bind_unit_return_annotation(&legacy, &graph, &bk);
+        assert!(
+            matches!(return_annotation(&graph), Some(SomeValue::None_(_))),
+            "unstamped return_type falls back to residual ()"
+        );
+    }
+
+    #[test]
+    fn bind_unit_return_annotation_skips_non_unit_and_prefers_stamped_token() {
+        let mut legacy = LegacyGraph::new("int_fn");
+        legacy.return_type = Some("i64".into());
+        legacy.residual_return_type = Some("()".into());
+        let graph = unit_flowspace_graph("int_fn");
+        let bk = crate::annotator::bookkeeper::Bookkeeper::new();
+        bind_unit_return_annotation(&legacy, &graph, &bk);
+        assert!(
+            return_annotation(&graph).is_none(),
+            "a stamped non-unit return_type is not replaced by the residual () token"
+        );
+
+        let mut unknown = LegacyGraph::new("unknown_fn");
+        unknown.return_type = None;
+        unknown.residual_return_type = None;
+        let graph = unit_flowspace_graph("unknown_fn");
+        bind_unit_return_annotation(&unknown, &graph, &bk);
+        assert!(
+            return_annotation(&graph).is_none(),
+            "a missing token is not typed as s_None"
+        );
+    }
+
+    #[test]
+    fn bind_unit_return_annotation_makes_recursivecall_return_s_none() {
+        use crate::annotator::model::SomeValue;
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let mut legacy = LegacyGraph::new("unit_callee");
+        legacy.residual_return_type = Some("()".into());
+        let graph = unit_flowspace_graph("unit_callee");
+        bind_unit_return_annotation(&legacy, &graph, ann.bookkeeper.as_ref());
+        let result = ann.recursivecall(&graph, None, &[]);
+        assert!(
+            matches!(result, SomeValue::None_(_)),
+            "recursivecall must return s_None once the unit return var is bound, got {result:?}"
+        );
     }
 
     #[test]

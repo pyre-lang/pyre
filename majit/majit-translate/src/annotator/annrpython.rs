@@ -4660,6 +4660,159 @@ mod tests {
         assert_eq!(entry.positions.len(), 1);
     }
 
+    /// A 0-arg graph that returns `None` without raising. The startblock
+    /// is empty; its only link carries `Constant(None)` into the
+    /// returnblock (`annrpython.py` `recursivecall` then binds `s_None`).
+    fn void_none_pygraph(name: &str) -> crate::flowspace::pygraph::PyGraph {
+        use super::super::super::flowspace::argument::Signature;
+        use super::super::super::flowspace::model::{
+            BlockRefExt, ConstValue, Constant, GraphFunc, Link,
+        };
+        let func = GraphFunc::new(name, Constant::new(ConstValue::Dict(Default::default())));
+        let startblock = Block::shared(vec![]);
+        let mut graph = FunctionGraph::new(name, startblock.clone());
+        graph.func = Some(func.clone());
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Constant(Constant::new(ConstValue::None))],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        crate::flowspace::pygraph::PyGraph {
+            graph: graph.into_ref(),
+            func,
+            signature: std::cell::RefCell::new(Signature::new(Vec::new(), None, None)),
+            defaults: std::cell::RefCell::new(Some(Vec::new())),
+            access_directly: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Register a void, non-raising callee on `ann.bookkeeper` so a
+    /// `simple_call` of `Constant(HostObject)` resolves through
+    /// `FunctionDesc.pycall` → `recursivecall` (`description.py`).
+    fn install_void_callee(
+        ann: &RPythonAnnotator,
+        name: &str,
+    ) -> super::super::super::flowspace::model::HostObject {
+        use super::super::super::flowspace::argument::Signature;
+        use super::super::super::flowspace::model::HostObject;
+        use super::super::description::{DescEntry, FunctionDesc};
+        let pygraph = std::rc::Rc::new(void_none_pygraph(name));
+        let host = HostObject::new_user_function(pygraph.func.clone());
+        let fd = FunctionDesc::new(
+            Rc::clone(&ann.bookkeeper),
+            Some(host.clone()),
+            name,
+            Signature::new(Vec::new(), None, None),
+            Some(Vec::new()),
+            None,
+        );
+        fd.install_source_template(Rc::clone(&pygraph));
+        ann.bookkeeper
+            .descs
+            .borrow_mut()
+            .insert(host.clone(), DescEntry::function(Rc::new(RefCell::new(fd))));
+        host
+    }
+
+    /// Two-arm caller, each arm a `canraise=false` `simple_call` of a
+    /// void callee that has not been annotated yet. After
+    /// `build_graph_types` + `complete` + `transform_dead_code`, the
+    /// caller's returnblock must stay reachable: `consider_op` blocks
+    /// on the first `s_ImpossibleValue` result (`annrpython.py`),
+    /// `flowin` swallows that for `simple_call`, and
+    /// `recursivecall`/`notify`/`reflowfromposition` must re-annotate
+    /// the call with `s_None` so `links_followed` keeps the success
+    /// exit (`transform.py` `cutoff_alwaysraising_block`).
+    #[test]
+    fn void_simple_call_keeps_caller_returnblock_after_tdc() {
+        use super::super::super::flowspace::model::{
+            BlockRefExt, ConstValue, Constant, Link, SpaceOperation,
+        };
+        use super::super::model::SomeBool;
+        use crate::translator::transform::transform_dead_code;
+
+        let translator = super::super::super::translator::translator::TranslationContext::new();
+        let ann = RPythonAnnotator::new(Some(translator), None, None, false);
+        let callee0 = install_void_callee(&ann, "void0");
+        let callee1 = install_void_callee(&ann, "void1");
+
+        let flag = Variable::named("flag");
+        let start = Block::shared(vec![Hlvalue::Variable(flag.clone())]);
+        let caller = Rc::new(RefCell::new(FunctionGraph::new(
+            "void_caller",
+            start.clone(),
+        )));
+        let returnblock = caller.borrow().returnblock.clone();
+
+        let arm0 = Block::shared(vec![]);
+        let r0 = Variable::named("r0");
+        arm0.borrow_mut().operations.push(SpaceOperation::new(
+            "simple_call",
+            vec![Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                callee0,
+            )))],
+            Hlvalue::Variable(r0.clone()),
+        ));
+        arm0.closeblock(vec![
+            Link::new(vec![Hlvalue::Variable(r0)], Some(returnblock.clone()), None).into_ref(),
+        ]);
+
+        let arm1 = Block::shared(vec![]);
+        let r1 = Variable::named("r1");
+        arm1.borrow_mut().operations.push(SpaceOperation::new(
+            "simple_call",
+            vec![Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                callee1,
+            )))],
+            Hlvalue::Variable(r1.clone()),
+        ));
+        arm1.closeblock(vec![
+            Link::new(vec![Hlvalue::Variable(r1)], Some(returnblock.clone()), None).into_ref(),
+        ]);
+
+        start.borrow_mut().exitswitch = Some(Hlvalue::Variable(flag.clone()));
+        start.closeblock(vec![
+            Link::new(
+                vec![],
+                Some(arm0.clone()),
+                Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(false)))),
+            )
+            .into_ref(),
+            Link::new(
+                vec![],
+                Some(arm1.clone()),
+                Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))),
+            )
+            .into_ref(),
+        ]);
+
+        ann.build_graph_types(&caller, &[Some(SomeValue::Bool(SomeBool::new()))], true)
+            .expect("annotate two-arm void caller");
+
+        let blocks = caller.borrow().iterblocks();
+        transform_dead_code(&ann, &blocks);
+
+        assert_eq!(arm0.borrow().exits.len(), 1, "arm0 success exit kept");
+        assert_eq!(arm1.borrow().exits.len(), 1, "arm1 success exit kept");
+        assert!(
+            Rc::ptr_eq(
+                arm0.borrow().exits[0].borrow().target.as_ref().unwrap(),
+                &returnblock
+            ),
+            "arm0 must still exit to returnblock"
+        );
+        assert!(
+            Rc::ptr_eq(
+                arm1.borrow().exits[0].borrow().target.as_ref().unwrap(),
+                &returnblock
+            ),
+            "arm1 must still exit to returnblock"
+        );
+    }
+
     #[test]
     fn complete_on_empty_schedule_is_noop() {
         // No pending blocks, no translator — complete() should fall
