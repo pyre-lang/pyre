@@ -14923,25 +14923,25 @@ mod tests {
         use crate::front::mir::DeclaredGcFacts;
         use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
 
-        let pyobject = "pyobject::PyObject";
+        let w_root = "pyobject::PyObject";
         let w_int = "intobject::W_IntObject";
         let items = "TypedItemsBlock";
-        let pyobject_id = majit_ir::descr::StructId::from_canonical(pyobject);
+        let w_root_id = majit_ir::descr::StructId::from_canonical(w_root);
         let w_int_id = majit_ir::descr::StructId::from_canonical(w_int);
         let items_id = majit_ir::descr::StructId::from_canonical(items);
         let _ids =
             crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
-                (pyobject.to_string(), Some(pyobject_id)),
+                (w_root.to_string(), Some(w_root_id)),
                 (items.to_string(), Some(items_id)),
             ]));
 
         let mut facts = DeclaredGcFacts::default();
-        facts.record_field0(w_int_id, pyobject_id);
+        facts.record_field0(w_int_id, w_root_id);
         let field0_parents = facts.field0_parent_ids();
 
         let mut reg = StructFieldRegistry::default();
         reg.fields.insert(
-            pyobject.to_string(),
+            w_root.to_string(),
             vec![
                 ("ob_type".into(), "*const PyType".into()),
                 ("w_class".into(), "*mut pyobject::PyObject".into()),
@@ -14967,7 +14967,7 @@ mod tests {
             ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
         cc.set_struct_layout(
-            pyobject_id,
+            w_root_id,
             gc_layout(vec![
                 crate::call::StructFieldLayout {
                     name: "ob_type".into(),
@@ -15011,7 +15011,7 @@ mod tests {
         let layouts = cc.struct_layouts_handle();
 
         assert!(
-            gc_struct_ptr_lltype_from_layout(&reg, &layouts, field0_parents, pyobject).is_none(),
+            gc_struct_ptr_lltype_from_layout(&reg, &layouts, field0_parents, w_root).is_none(),
             "inlined instance root uses getinstancerepr, not Ptr(GcStruct PyObject)"
         );
         let items_ptr = gc_struct_ptr_lltype_from_layout(&reg, &layouts, field0_parents, items)

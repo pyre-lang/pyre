@@ -4971,25 +4971,6 @@ pub fn call_function_impl_result(
     Err(not_callable_error(_roots.get(root_base)))
 }
 
-/// One-word residual ABI for [`call_function_impl_result`].
-///
-/// `&[PyObjectRef]` arrives as one length-prefixed `GcTypedArray` word
-/// (`publish_roots_jit_abi`). `PyResult` is sret, so HELPER_FNADDRS skips
-/// the raw item (`FatPointerArg` + `ResultReturn`) and the codewriter
-/// minted a symbolic hash. The callee keeps its graph; this is the
-/// address `getfunctionptr` would have supplied.
-#[inline(never)]
-pub extern "C" fn call_function_impl_result_jit_abi(
-    callable: PyObjectRef,
-    array: *const pyre_object::object_array::GcTypedArray,
-) -> PyObjectRef {
-    let args = pyre_object::gc_roots::gcarray_ref_items(array);
-    match call_function_impl_result(callable, &args) {
-        Ok(result) => result,
-        Err(error) => crate::runtime_ops::jit_publish_residual_error_ref(error),
-    }
-}
-
 /// CPython: typeobject.c calculate_metaclass
 pub(crate) fn calculate_metaclass(
     mut w_winner: PyObjectRef,

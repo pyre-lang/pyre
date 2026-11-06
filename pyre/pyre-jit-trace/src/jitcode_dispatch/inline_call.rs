@@ -24640,6 +24640,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
             let residual_executed = helper_subwalk_executed_residual(&error, residuals_before);
             let error = match error {
                 DispatchError::GuardResumeCoordinateUnavailable { pc }
+                | DispatchError::RegisterReadUnbound { pc, .. }
                     if helper_index.is_some() && !residual_executed =>
                 {
                     DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 }

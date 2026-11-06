@@ -16828,7 +16828,8 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     // residualize the helper instead of recording the body.
     let walk_result = match walk_result {
         Err(DispatchError::AbortMarkerReached { pc })
-        | Err(DispatchError::GuardResumeCoordinateUnavailable { pc }) => {
+        | Err(DispatchError::GuardResumeCoordinateUnavailable { pc })
+        | Err(DispatchError::RegisterReadUnbound { pc, .. }) => {
             Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 })
         }
         other => other,
@@ -17442,7 +17443,11 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(self_ref, Value::Ref(majit_ir::GcRef(inner_self as usize)));
 
-    let nested_entry = orthodox_helper_nested_entry(ctx, op.pc, HelperReturn::CallResult)
+    // `W_ListObject.descr_pop` raises on empty before `pop_end`. The inner
+    // empty arm returns None, so a numbered helper section would
+    // `_setup_return_value_r` NULL into the CALL dest. Converted leaves no
+    // helper MIFrame: `generate_guard(resumepc=orgpc)` re-runs the CALL.
+    let nested_entry = orthodox_helper_nested_entry(ctx, op.pc, HelperReturn::Converted)
         .map_err(|_| DispatchError::GuardResumeCoordinateUnavailable { pc: op.pc })?;
     let (walk_outcome, walk_start) = run_orthodox_helper_subwalk(
         ctx,

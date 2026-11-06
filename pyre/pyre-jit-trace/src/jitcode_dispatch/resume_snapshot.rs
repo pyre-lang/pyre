@@ -1451,6 +1451,10 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     };
     let arm_py_pc = forward_snapshot_py_pc(ctx.outer_jitcode_index, arm_pc_word)?;
+    // `capture_resumedata` snapshots `virtualizable_boxes` as
+    // `_opimpl_setfield_vable` / `write_box_at` left them; the blackhole
+    // re-executes from the guard and writes the arm's own vsd
+    // (`bhimpl_setfield_vable_i`).
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
     let active = std::mem::take(&mut ctx.frame_state.borrow_mut().outer_active_boxes);
     debug_assert_eq!(

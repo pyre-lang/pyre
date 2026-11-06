@@ -6623,6 +6623,32 @@ fn read_int_reg<Sym: WalkSym>(
     operand_offset: usize,
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Result<OpRef, DispatchError> {
+    let reg = code[op.pc + 1 + operand_offset] as usize;
+    let value = read_int_reg_raw(code, op, operand_offset, ctx)?;
+    // Same unbound-slot check as [`read_ref_reg`]. `OpRef::None.raw()` is
+    // `u32::MAX`; encoding that as TAGBOX overflows `append_int` and the
+    // portal aborts as `ABORT_TOO_LONG`. Decline so a helper that reads a
+    // color `setup_call` never wrote residualizes at the callable parent
+    // (`pyjitpl.py` never executes a box of `None`).
+    if value.is_none() {
+        return Err(DispatchError::RegisterReadUnbound {
+            pc: op.pc,
+            reg,
+            bank: "i",
+        });
+    }
+    Ok(value)
+}
+
+/// [`read_int_reg`] without the unbound-slot check. `*_vable_*` array
+/// index reads use this so an `OpRef::NONE` index still surfaces
+/// [`DispatchError::VableArrayIndexNotConcrete`].
+fn read_int_reg_raw<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Result<OpRef, DispatchError> {
     let byte_pc = op.pc + 1 + operand_offset;
     let reg = code[byte_pc] as usize;
     ctx.registers_i
@@ -6646,14 +6672,23 @@ fn read_float_reg<Sym: WalkSym>(
 ) -> Result<OpRef, DispatchError> {
     let byte_pc = op.pc + 1 + operand_offset;
     let reg = code[byte_pc] as usize;
-    ctx.registers_f
+    let value = ctx
+        .registers_f
         .get(reg)
         .ok_or(DispatchError::RegisterOutOfRange {
             pc: op.pc,
             reg,
             len: ctx.registers_f.len(),
             bank: "f",
-        })
+        })?;
+    if value.is_none() {
+        return Err(DispatchError::RegisterReadUnbound {
+            pc: op.pc,
+            reg,
+            bank: "f",
+        });
+    }
+    Ok(value)
 }
 
 /// Read a three-byte little-endian label operand at `pc + 1 +

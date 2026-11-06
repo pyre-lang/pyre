@@ -1588,7 +1588,7 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     if vable.is_none() {
         return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
     }
-    let index = read_int_reg(code, op, 1, ctx)?;
+    let index = read_int_reg_raw(code, op, 1, ctx)?;
     // pyjitpl.py `indexbox.getint()` — the array slot is chosen from
     // the concrete index. Fail loud if the walker can't resolve it.
     let index_value = match ctx.trace_ctx.concrete_of_opref(index) {
@@ -1860,7 +1860,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     if vable.is_none() {
         return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
     }
-    let index = read_int_reg(code, op, 1, ctx)?;
+    let index = read_int_reg_raw(code, op, 1, ctx)?;
     let index_value = match ctx.trace_ctx.concrete_of_opref(index) {
         Some(Value::Int(v)) => v,
         _ => {

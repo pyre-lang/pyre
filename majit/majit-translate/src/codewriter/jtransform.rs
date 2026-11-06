@@ -9990,7 +9990,16 @@ impl<'a> Transformer<'a> {
         // The frontend FieldRead carries `ty: Int` (`W_BytesIO.pos`) while
         // the dest cell stays Unknown; stamp it the way the vtable-slot
         // arm already stamps Int, so `getkind` is `'i'` not `'r'`.
-        self.stamp_value_kind_from_value_type(graph, op.result.clone(), ty);
+        // A dest the rtyper already typed (a raw `*const CodeObject` is
+        // Signed at `history.getkind`) keeps that cell: `ty: Ref(Some)` of
+        // a flavor-raw pointee would otherwise restamp `OBJECTPTR` and
+        // lower `bool` to `ptr_nonzero`.
+        if op.result.as_ref().is_some_and(|result| {
+            FunctionGraph::concretetype_of(result)
+                == crate::codewriter::type_state::ConcreteType::Unknown
+        }) {
+            self.stamp_value_kind_from_value_type(graph, op.result.clone(), ty);
+        }
         // A rustc vtable slot is a function address. MIR may type the
         // `method_*` FieldRead as Ref (a fn-pointer); leaving that
         // assembles `getfield_gc_r` and `optimize_getfield` then
@@ -14096,13 +14105,26 @@ impl<'a> Transformer<'a> {
                         item_ty,
                         array_type_id,
                         array,
-                    } => Some(vec![cc.arraydescrof_for_op(
-                        &item_ty,
-                        &array_type_id,
-                        &array,
-                        value_type_to_ir_type(&item_ty),
-                        Some(0),
-                    )]),
+                    } => {
+                        // A `&[PyObjectRef]` dest without a sibling array op
+                        // still names `OBJECT_REF_GCARRAY_TYPE_ID`
+                        // (`array_identity_of_base`); keep that ARRAY even
+                        // if a producer left `array_type_id` unset, so
+                        // `arraydescrof_concrete` does not mint `cache_key` 0.
+                        let array_type_id = match (&item_ty, array_type_id) {
+                            (ValueType::Ref(_), None) => {
+                                Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string())
+                            }
+                            (_, id) => id,
+                        };
+                        Some(vec![cc.arraydescrof_for_op(
+                            &item_ty,
+                            &array_type_id,
+                            &array,
+                            value_type_to_ir_type(&item_ty),
+                            Some(0),
+                        )])
+                    }
                     NewlistClearShape::Fallback | NewlistClearShape::Resized { .. } => None,
                 }
             });
