@@ -4284,22 +4284,14 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
         crate::state::bridge_semantic_maps_from_jitcode_pc(callee_jitcode_index, callee_jitcode_pc);
     if recovered_regs_r.iter().any(|value| value.is_none()) && !callee_pjc.code_ptr.is_null() {
         if let Some(shadow) = ctx.frame_state.borrow().callee_shadow.as_ref() {
-            for (color, value) in recovered_regs_r.iter_mut().enumerate() {
-                if !value.is_none() {
-                    continue;
-                }
-                let Some(slot) = crate::state::semantic_ref_slot_for_reg_color(
-                    stack_base,
-                    maps.stack_depth_at_pc,
-                    &maps.pcdep_entries,
-                    color,
-                ) else {
-                    continue;
-                };
-                if let Some(&slot_value) = shadow.opref.get(&(slot as i64)) {
-                    *value = slot_value;
-                }
-            }
+            fill_none_refs_from_callee_slots(
+                &mut recovered_regs_r,
+                stack_base,
+                maps.stack_depth_at_pc,
+                &maps.pcdep_entries,
+                &shadow.opref,
+                None,
+            );
         }
     }
     // `get_list_of_active_boxes` (`pyjitpl.py`) reads `registers_r` at the
@@ -4438,6 +4430,7 @@ pub(crate) fn fill_none_refs_from_callee_slots(
         };
         if let Some(&slot_value) = shadow_opref.get(&(slot as i64))
             && !slot_value.is_none()
+            && slot_value.ty() == Some(majit_ir::Type::Ref)
         {
             *value = slot_value;
             filled += 1;

@@ -214,21 +214,13 @@ impl MetaInterpStaticData {
         if let Some(jitcode) = self.frozen_indirectcall_dict.get(&fnaddress) {
             return Some(std::sync::Arc::clone(jitcode));
         }
-        let jitcode = if let Some(index) =
-            crate::jitcode_runtime::indirectcalltarget_index_for_address(fnaddress)
-        {
-            crate::jitcode_runtime::indirectcalltarget_by_index(index)?
-        } else if let Some(path) =
-            crate::runtime_fnaddr_patch::symbolic_fnaddr_path(fnaddress as i64)
-        {
-            // Translator residual of a compiled graph uses
-            // `symbolic_fnaddr_for_path` as the Const funcbox.
-            // `pyjitpl.py bytecode_for_address` is `getfunctionptr(graph)`;
-            // the hash is that pointer for a graph with no linker address.
-            crate::jitcode_runtime::pathed_runtime_jitcode_cached(path)?
-        } else {
-            return None;
-        };
+        // `pyjitpl.py bytecode_for_address` is `indirectcall_dict.get`
+        // (`Assembler.indirectcalltargets`). A translator symbolic hash
+        // is `getfunctionptr(graph)` only for a graph in that set; a
+        // direct residual (`getitem_slot`, `hash_w_hooked`) stays a
+        // residual (`do_residual_call`).
+        let index = crate::jitcode_runtime::indirectcalltarget_index_for_address(fnaddress)?;
+        let jitcode = crate::jitcode_runtime::indirectcalltarget_by_index(index)?;
         self.frozen_indirectcall_dict
             .insert(fnaddress, std::sync::Arc::clone(&jitcode));
         Some(jitcode)

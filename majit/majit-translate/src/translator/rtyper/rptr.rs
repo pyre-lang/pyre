@@ -404,6 +404,12 @@ mod tests {
     /// `PtrRepr.rtype_simple_call` of leftover untyped rffi is
     /// `ptrrepr_rtype_simple_call_emits_indirect_call_with_void_none_graphs`;
     /// a function-PBC site is `functions_pbc_repr_simple_call_emits_indirect_call_op`.
+    ///
+    /// `SomePtr.call` of a `Ptr(FuncType)` whose FUNC arg is
+    /// `rclass.OBJECTPTR` still emits
+    /// `annlowlevel.cast_instance_to_base_ptr` (`annlowlevel.py`); the
+    /// wrap lives on the graph even while dual-gate Skips. The wrap
+    /// annotation is `fn_ptr_indirect_call_wraps_instance_arg_with_cast_instance_to_base_ptr`.
     #[test]
     fn fnptr_objectptr_instance_arg_result_dual_gate_match() {
         use crate::translator::rtyper::cutover::{DualGateOutcome, dual_gate_check_with_registry};
@@ -443,12 +449,14 @@ mod tests {
             .unwrap();
         graph.push_inputarg_var(entry, f_var.clone());
         graph.push_inputarg_var(entry, obj_var.clone());
+        let wrap_kind = crate::model::cast_instance_to_base_ptr_call(obj_var.clone());
+        let wrap_var = graph.push_op_var(entry, wrap_kind, true).unwrap();
         let r_var = graph
             .push_op_var(
                 entry,
                 OpKind::IndirectCall {
                     funcptr: f_var,
-                    args: vec![obj_var.clone()],
+                    args: vec![wrap_var.clone()],
                     graphs: None,
                     family_key: None,
                     result_ty: ValueType::Ref(Some("PyObject".to_string())),

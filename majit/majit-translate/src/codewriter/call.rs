@@ -5201,6 +5201,29 @@ impl StructLayout {
         if let Some(size) = exact_size {
             self.size = size as usize;
         }
+        self.demote_struct_fields_that_exceed_parent();
+    }
+
+    /// `symbolic.get_field_token` sizes the parent including an inlined
+    /// STRUCT (`heaptracker.all_fielddescrs` recurses into
+    /// `isinstance(FIELD, lltype.Struct)`). An exact parent smaller than
+    /// that field is a word slot holding `Ptr(STRUCT)`: `rclass.py`
+    /// `InstanceRepr` `new`s the nested GcStruct and `setfield`s the
+    /// pointer. `rewrite_op_getsubstruct` would otherwise `int_add` into
+    /// the slot and read the pointer as the nested fields.
+    fn demote_struct_fields_that_exceed_parent(&mut self) {
+        let parent = self.size;
+        let word = crate::layout::target_word_size();
+        for fl in &mut self.fields {
+            if fl.flag == majit_ir::descr::ArrayFlag::Struct
+                && fl.size > 0
+                && fl.offset + fl.size > parent
+            {
+                fl.flag = majit_ir::descr::ArrayFlag::Pointer;
+                fl.size = word;
+                fl.field_type = majit_ir::value::Type::Ref;
+            }
+        }
     }
 }
 
@@ -19004,6 +19027,58 @@ mod tests {
         assert_eq!(layout.fields[1].name, "_not_send");
         assert_eq!(layout.fields[1].offset, 8);
         assert_eq!(layout.fields[1].size, 0);
+    }
+
+    /// The explicit sum shell (`front/mir.rs` `explicit_sum_shell`) is one
+    /// tag word plus one-word payload slots. A by-value GcStruct in that
+    /// slot (`symbolic.get_field_token` FLAG_STRUCT of the nested size)
+    /// does not fit; the producer `new`s it and `setfield`s the pointer.
+    #[test]
+    fn apply_exact_layout_demotes_a_struct_field_that_exceeds_parent() {
+        use majit_ir::descr::ArrayFlag;
+
+        let word = crate::layout::target_word_size();
+        let mut known = std::collections::HashSet::new();
+        known.insert("ObjectKey".to_string());
+        let mut layout = StructLayout::from_type_strings(
+            &[
+                ("__discriminant".into(), "i64".into()),
+                ("__pos_0".into(), "ObjectKey".into()),
+            ],
+            &known,
+            &std::collections::HashMap::from([("ObjectKey".to_string(), 2 * word)]),
+            &std::collections::HashMap::from([("ObjectKey".to_string(), word)]),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(layout.size, 3 * word);
+        assert_eq!(layout.fields[1].flag, ArrayFlag::Struct);
+        assert_eq!(layout.fields[1].size, 2 * word);
+        layout.apply_exact_layout(
+            &[
+                ("__discriminant".into(), "i64".into()),
+                ("__pos_0".into(), "ObjectKey".into()),
+            ],
+            &std::collections::HashMap::from([
+                ("__discriminant".to_string(), 0u64),
+                ("__pos_0".to_string(), word as u64),
+            ]),
+            Some(2 * word as u64),
+            &known,
+            &std::collections::HashMap::from([("ObjectKey".to_string(), 2 * word)]),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(layout.size, 2 * word);
+        let payload = layout
+            .fields
+            .iter()
+            .find(|field| field.name == "__pos_0")
+            .expect("__pos_0 row");
+        assert_eq!(payload.offset, word);
+        assert_eq!(payload.flag, ArrayFlag::Pointer);
+        assert_eq!(payload.size, word);
+        assert_eq!(payload.field_type, majit_ir::value::Type::Ref);
     }
 
     /// `char` is `lltype.UniChar`: unsigned, int-banked, 4 bytes.
