@@ -3164,9 +3164,12 @@ fn unarmed_inlined_callee_entry_walks_call_trace() {
     pyjit.metadata.forward_py_pc_marker_by_jit_pc = vec![(0, 0)];
     pyjit.metadata.forward_py_pc_pred_by_jit_pc = vec![(0, 0)];
     pyjit.metadata.resume_marker_marker_by_jit_pc = vec![(0, Some(0))];
-    let installed =
-        crate::state::install_jitcode_for(frame_ptr as *const (), std::sync::Arc::new(pyjit))
-            as *const crate::state::JitCode;
+    // `install_jitcode_for` keys on the owner PyCode (`pyframe.py`
+    // `self.pycode`).
+    let installed = crate::state::install_jitcode_for(
+        unsafe { (*frame_ptr).pycode },
+        std::sync::Arc::new(pyjit),
+    ) as *const crate::state::JitCode;
 
     let outer_index = test_outer_resume_jitcode_index();
     let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
