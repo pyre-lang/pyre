@@ -3543,42 +3543,6 @@ fn loop_carried_slot_keeps_fold_profitable<Sym: WalkSym>(
     }
 }
 
-/// Whether the call at `op_pc` in the walk's own code sits inside a protected
-/// region its `GUARD_NO_EXCEPTION` deopt would have to resume into.
-///
-/// Asked of the CALL's own coordinate, not of the whole body: the deopt
-/// resumes at this call site, so a `try` elsewhere in the function is not a
-/// handler it can reach.  `lookup_exceptiontable` answers exactly that question
-/// and returns the innermost covering entry.
-///
-/// The `depth != 0 || !lasti` test excludes the whole-body, depth-zero,
-/// `lasti` entry 3.14 wraps around every generator, which exists only to
-/// convert an escaping `StopIteration` at the generator boundary and catches
-/// nothing at a call site.  Same discrimination, same reason, as
-/// `code_yields_inside_try` (`pycode.rs`) applies to decide whether a
-/// generator really yields inside a `try`.
-fn call_site_inside_protected_region<Sym: WalkSym>(sym: &Sym, op_pc: usize) -> bool {
-    if sym.jitcode().is_null() {
-        return false;
-    }
-    let jitcode = unsafe { &*sym.jitcode() };
-    let raw = jitcode.payload.code_ptr;
-    if raw.is_null() {
-        return false;
-    }
-    let code = unsafe { &*raw };
-    // `lookup_exceptiontable` keys on the byte offset of the instruction
-    // itself, and `containing_py_pc_for_jitcode_pc` gives the CALL's own
-    // Python instruction index — so the offset is `py_pc * 2`, without the
-    // `next_instr` back-step a resume coordinate would need.
-    let call_py_pc =
-        crate::py_coord::containing_py_pc_for_jitcode_pc(&jitcode.payload.metadata, op_pc);
-    matches!(
-        pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, call_py_pc * 2),
-        Some((_target, depth, lasti)) if depth != 0 || !lasti
-    )
-}
-
 /// Whether a callee that is not the walk's own code may take `CALL_ASSEMBLER`.
 ///
 /// `_opimpl_recursive_call` (`pyjitpl.py`) falls through to
@@ -3711,8 +3675,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     if r_args.len() < 2 {
         return Ok(None);
     }
-    // The handler test this fold needs is positional and lives below, once the
-    // caller's jitcode is in hand: see `call_site_inside_protected_region`.
     let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
     if arg_concretes.len() < 2 {
         return Ok(None);
@@ -3778,21 +3740,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         return Ok(None);
     }
     let sym = unsafe { &*sym_ptr };
-    let caller_frame = sym.frame();
-    // A CALL_ASSEMBLER raising inside a `try` body must route its
-    // GUARD_NO_EXCEPTION deopt into the handler, and this fold cannot encode
-    // that resume in its snapshot.  Ask whether THIS call site is protected
-    // rather than whether the body carries a handler anywhere: the latter
-    // reads a property of the function, not of the call, and it excludes
-    // every generator outright — 3.14 wraps each generator body in a
-    // whole-body entry, so a `while` loop in a generator that calls nothing
-    // protected was declining on a handler it can never reach.
-    if call_site_inside_protected_region(sym, op.pc) {
-        if p2_diag_enabled() {
-            eprintln!("[p2-ca] decline pc={} reason=call-inside-try", op.pc);
-        }
-        return Ok(None);
-    }
     // `is_self_recursive = callee code == portal code`. During
     // recording `we_are_jitted()` is false, so `function_get_code` (the
     // `w_code` already in hand) equals `getcode` — the pointer the
@@ -4388,9 +4335,19 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             op.next_pc,
         )));
     }
-    // GUARD_NO_EXCEPTION on the non-raising recording path.
+    // `handle_possible_exception` (`pyjitpl.py`): GUARD_NO_EXCEPTION.
+    // `residual_call_catch_resume` is the same request the residual
+    // `call_fn` path makes: a CALL inside a `try` deopts at the call's
+    // own `catch_exception`, not the fallthrough opcode.
     ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    walker_capture_snapshot_for_last_guard_scoped(
+        ctx,
+        op.pc,
+        GuardCaptureScope {
+            residual_call_catch_resume: true,
+            ..GuardCaptureScope::default()
+        },
+    )?;
 
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
