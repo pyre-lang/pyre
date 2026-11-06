@@ -1834,26 +1834,19 @@ pub fn pypyjit_greenkey_uhash(pc: usize, is_being_profiled: bool, code_ptr: u64)
 /// with the unprofiled one.
 ///
 /// What that separation buys a `setprofile` armed on an ALREADY-COMPILED loop
-/// is a re-warmup, and only that: the green flips, the cell the back edge
-/// looks up holds no compiled loop, and execution is interpreted and reporting
-/// until the new cell reaches `threshold` and compiles a loop of its own.
-/// Measured, a profiler armed mid-loop over a 100 000-iteration tail reports
-/// 1041 `call` events for a callee the walker INLINES and all 99 999 for one
-/// it leaves residual — the same reading with and without the `debugdata`
-/// guard, so the ceiling is the inlined callee's unrecorded `call_trace` /
-/// `return_trace` (see `walker_ec_enter`, `jitcode_dispatch/inline_call.rs`)
-/// and not the green.  It is also not what protects a profiler installed
-/// BEFORE the frame is entered.  That used to be answered by the frame never
-/// reaching a trace at all, because the JIT-eligibility gate sent every
-/// profiled frame down `execute_frame_plain`; the gate now reads only the
-/// per-frame `f_trace`, so a profiled frame does reach a trace — measured on
-/// a call-bearing hot loop, `loops_compiled = 1`, `loops_aborted = 5`.  The green is
-/// still live at a back edge even so: `setprofile` runs `force_all_frames(True)`,
-/// which sets `is_being_profiled` on every frame ALREADY running, and one of
-/// those can be sitting in a compiled loop.  Tracing has no green of its own
-/// and so gets neither: the mid-loop case is answered instead by the
-/// `debugdata` guard `pyopcode.py dispatch_bytecode`'s `jit.we_are_jitted()`
-/// arm records.
+/// is a re-warmup: `setprofile` runs `force_all_frames(True)`, the green
+/// flips, the cell the back edge looks up holds no compiled loop, and
+/// execution is interpreted and reporting until the new cell reaches
+/// `threshold`. A profiled frame still reaches a trace: the eligibility
+/// gate reads the per-frame `f_trace`, not `is_being_profiled`.
+///
+/// Tracing has no green of its own. An inlined callee records
+/// `gettrace`'s `jit.promote(self.w_tracefunc)` at entry
+/// (`walker_inline_execute_frame_call_trace`), so a tracer armed later
+/// fails that guard. `return_trace` stays on residual `execute_frame`;
+/// the inline door declines while a hook is installed. Mid-loop tracing
+/// of the portal frame itself is the `debugdata` guard
+/// `pyopcode.py dispatch_bytecode`'s `jit.we_are_jitted()` arm records.
 pub fn pypyjit_greenkey(pc: usize, is_being_profiled: bool, code_ptr: u64) -> GreenKey {
     GreenKey::with_types(
         pypyjit_greenargs(pc, is_being_profiled, code_ptr).to_vec(),

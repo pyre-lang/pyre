@@ -3049,6 +3049,255 @@ fn loop_callee_portal_call_assembler_guard_not_forced_snapshot_carries_send_ex_t
     let _ = (recorded, frame);
 }
 
+/// Default `bh_getfield_gc_*` reads live memory (`llmodel.py
+/// read_ref_at_mem`). Compile/execute entry points are unreachable here.
+struct CallTraceFieldLoadCpu;
+impl majit_backend::Backend for CallTraceFieldLoadCpu {
+    fn compile_loop(
+        &mut self,
+        _inputargs: &[majit_ir::InputArgRc],
+        _ops: &[majit_ir::OpRc],
+        _token: &majit_backend::JitCellToken,
+    ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
+        unimplemented!("CallTraceFieldLoadCpu::compile_loop")
+    }
+    fn compile_bridge(
+        &mut self,
+        _fail_descr: &dyn majit_ir::FailDescr,
+        _inputargs: &[majit_ir::InputArgRc],
+        _ops: &[majit_ir::OpRc],
+        _original_token: &majit_backend::JitCellToken,
+    ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
+        unimplemented!("CallTraceFieldLoadCpu::compile_bridge")
+    }
+    fn execute_token(
+        &self,
+        _token: &majit_backend::JitCellToken,
+        _args: &[majit_ir::Value],
+    ) -> majit_backend::DeadFrame {
+        unimplemented!("CallTraceFieldLoadCpu::execute_token")
+    }
+    fn get_latest_descr<'a>(
+        &self,
+        _frame: &'a majit_backend::DeadFrame,
+    ) -> &'a dyn majit_ir::FailDescr {
+        unimplemented!("CallTraceFieldLoadCpu::get_latest_descr")
+    }
+    fn get_latest_descr_arc(
+        &self,
+        _frame: &majit_backend::DeadFrame,
+    ) -> std::sync::Arc<dyn majit_ir::descr::Descr> {
+        unimplemented!("CallTraceFieldLoadCpu::get_latest_descr_arc")
+    }
+    fn get_int_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> i64 {
+        unimplemented!("CallTraceFieldLoadCpu::get_int_value")
+    }
+    fn get_value_direct(&self, frame: &majit_backend::DeadFrame, slot: usize) -> i64 {
+        self.get_int_value(frame, slot)
+    }
+    fn get_float_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> f64 {
+        unimplemented!("CallTraceFieldLoadCpu::get_float_value")
+    }
+    fn get_ref_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> majit_ir::GcRef {
+        unimplemented!("CallTraceFieldLoadCpu::get_ref_value")
+    }
+    fn invalidate_loop(&self, _token: &majit_backend::JitCellToken) {
+        unimplemented!("CallTraceFieldLoadCpu::invalidate_loop")
+    }
+}
+
+/// Unarmed `executioncontext.py call_trace` at an inlined callee entry
+/// (`pyframe.py execute_frame` after `enter`): record `GUARD_VALUE` of
+/// NULL `w_tracefunc` (`gettrace` / `jit.promote`) plus the
+/// `profilefunc is not None` null check, and emit no residual call.
+#[test]
+fn unarmed_inlined_callee_entry_walks_call_trace() {
+    use crate::state::PyreSym;
+    use pyre_interpreter::compile_exec;
+
+    let _hook_guard = WalkerQmutHookGuard::install();
+    let _pair = crate::state::ensure_trace_test_driver();
+    let cpu = CallTraceFieldLoadCpu;
+    let Some(jitcode_index) = crate::jitcode_runtime::call_trace_jitcode_index() else {
+        panic!("generated `call_trace` jitcode must be in the build-time table");
+    };
+    assert!(
+        crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode_index).is_some(),
+        "call_trace body must resolve by index"
+    );
+
+    let raw_code = compile_exec("None").expect("test code should compile");
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code);
+    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame;
+    let ec =
+        pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
+    assert!(
+        !ec.is_null(),
+        "PyFrame::new installs the thread ExecutionContext"
+    );
+    unsafe {
+        assert!(
+            (*ec).w_tracefunc().is_null(),
+            "fixture EC must be unarmed (w_tracefunc)"
+        );
+        assert!(
+            (*ec).profilefunc.is_none(),
+            "fixture EC must be unarmed (profilefunc)"
+        );
+    }
+
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("unarmed_call_trace_entry");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: vec![crate::state::op_live(), 0, 0],
+        startpoints: Some([0_usize].into_iter().collect()),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.is_drained = true;
+    pyjit.metadata.n_py_instrs = 1;
+    pyjit.metadata.forward_py_pc_marker_by_jit_pc = vec![(0, 0)];
+    pyjit.metadata.forward_py_pc_pred_by_jit_pc = vec![(0, 0)];
+    pyjit.metadata.resume_marker_marker_by_jit_pc = vec![(0, Some(0))];
+    let installed =
+        crate::state::install_jitcode_for(frame_ptr as *const (), std::sync::Arc::new(pyjit))
+            as *const crate::state::JitCode;
+
+    let outer_index = test_outer_resume_jitcode_index();
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+    tc.set_cpu(Some(&cpu));
+    let callee_frame = OpRef::input_arg_ref(0);
+    let callee_ec = OpRef::input_arg_ref(1);
+    tc.set_opref_concrete(
+        callee_frame,
+        majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr as usize)),
+    );
+    tc.set_opref_concrete(
+        callee_ec,
+        majit_ir::Value::Ref(majit_ir::GcRef(ec as usize)),
+    );
+
+    let mut snapshot_sym = PyreSym::new_uninit(callee_frame);
+    snapshot_sym.jitcode = installed;
+    let mut mode = test_fbw_mode();
+    mode.snapshot_sym = &snapshot_sym;
+
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let r0 = tc.const_ref(1);
+    let i0 = tc.const_int(0);
+    let f0 = tc.const_float(0);
+    let regs_r = vec![r0, r0, r0, r0];
+    let regs_i = vec![i0, i0, i0, i0];
+    let regs_f = vec![f0, f0, f0, f0];
+    let mut concrete_i = Vec::new();
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::new(regs_f.iter().copied()),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: outer_index,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    let walk = super::inline_call::walker_inline_execute_frame_call_trace(
+        &mut wc,
+        0,
+        callee_ec,
+        callee_frame,
+        ec,
+        frame_ptr,
+    );
+    let ops: Vec<_> = wc.trace_ctx.ops().iter().map(|op| op.opcode).collect();
+    let dump = format!("{ops:?}");
+    walk.unwrap_or_else(|err| {
+        panic!("unarmed call_trace walk must Ok, got {err:?}; recorded {dump}");
+    });
+
+    let residual = ops.iter().any(|op| {
+        matches!(
+            *op,
+            majit_ir::OpCode::CallI
+                | majit_ir::OpCode::CallR
+                | majit_ir::OpCode::CallF
+                | majit_ir::OpCode::CallN
+                | majit_ir::OpCode::CallPureI
+                | majit_ir::OpCode::CallPureR
+                | majit_ir::OpCode::CallPureF
+                | majit_ir::OpCode::CallPureN
+                | majit_ir::OpCode::CallMayForceI
+                | majit_ir::OpCode::CallMayForceR
+                | majit_ir::OpCode::CallMayForceF
+                | majit_ir::OpCode::CallMayForceN
+                | majit_ir::OpCode::CallReleaseGilI
+                | majit_ir::OpCode::CallReleaseGilF
+                | majit_ir::OpCode::CallReleaseGilN
+                | majit_ir::OpCode::CallAssemblerI
+                | majit_ir::OpCode::CallAssemblerR
+                | majit_ir::OpCode::CallAssemblerF
+                | majit_ir::OpCode::CallAssemblerN
+                | majit_ir::OpCode::CondCallN
+                | majit_ir::OpCode::CondCallValueI
+                | majit_ir::OpCode::CondCallValueR
+        )
+    });
+    assert!(
+        !residual,
+        "unarmed call_trace must not residualize a helper call: {dump}"
+    );
+
+    let guard_value_consts: Vec<OpRef> = wc
+        .trace_ctx
+        .ops()
+        .iter()
+        .filter(|op| op.opcode == majit_ir::OpCode::GuardValue)
+        .filter_map(|op| {
+            let args = op.getarglist();
+            (args.len() >= 2).then_some(args[1].to_opref())
+        })
+        .collect();
+    let guard_value_null = guard_value_consts.iter().any(|&cst| {
+        wc.trace_ctx.const_type(cst) == Some(Type::Ref) && wc.trace_ctx.const_value(cst) == Some(0)
+    });
+    assert!(
+        guard_value_null,
+        "gettrace must record GUARD_VALUE of ConstPtr(NULL) w_tracefunc: {dump}"
+    );
+    assert!(
+        ops.iter().any(|op| *op == majit_ir::OpCode::GetfieldGcI),
+        "profilefunc is not None must record getfield_gc_i: {dump}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            *op,
+            majit_ir::OpCode::IntIsZero
+                | majit_ir::OpCode::IntEq
+                | majit_ir::OpCode::GuardTrue
+                | majit_ir::OpCode::GuardFalse
+        )),
+        "profilefunc is not None must record the null check: {dump}"
+    );
+    let _ = (frame, snapshot_sym);
+}
+
 /// `typeobject.py W_TypeObject.descr_call` raises `TypeError` after
 /// `get_and_call_args` when `__init__` returns non-None, and never re-enters
 /// the constructor. A loop-callee portal that residual-executed that body
@@ -8846,7 +9095,6 @@ fn walker_pin_type_version_tag_records_quasiimmut_from_mutate_descr() {
     // `quasi_immut_descr_from_mutate`.
     use crate::state::ConcreteValue;
 
-    pyre_interpreter::test_hooks::install_hash_hook();
     let _hook_guard = WalkerQmutHookGuard::install();
     let obj = pyre_object::typeobject::w_type_new(
         "WalkerPinVersion",
@@ -8908,7 +9156,6 @@ fn walker_pin_namespace_version_records_quasiimmut_from_mutate_descr() {
     // `quasi_immut_descr_from_mutate`.
     use crate::state::ConcreteValue;
 
-    pyre_interpreter::test_hooks::install_hash_hook();
     let _hook_guard = WalkerQmutHookGuard::install();
     let ns = pyre_object::w_module_dict_new();
 
@@ -8963,7 +9210,6 @@ fn walker_pin_pycode_w_globals_records_quasiimmut_from_mutate_descr() {
     // `quasi_immut_descr_from_mutate`.
     use crate::state::ConcreteValue;
 
-    pyre_interpreter::test_hooks::install_hash_hook();
     let _hook_guard = WalkerQmutHookGuard::install();
     let w_code = pyre_interpreter::w_code_new(0xDEAD_BEEF as *const ());
 
@@ -9029,7 +9275,6 @@ fn pycode_w_globals_pin_on_stamped_getfield_gcr_is_quasi_immut_descr() {
     // does not refuse the loop.
     use crate::state::ConcreteValue;
 
-    pyre_interpreter::test_hooks::install_hash_hook();
     let _hook_guard = WalkerQmutHookGuard::install();
     let w_code = pyre_interpreter::w_code_new(0xDEAD_BEEF as *const ());
 
@@ -9093,7 +9338,6 @@ fn gil_ready_quasiimmut_from_mutate_descr_on_const_int() {
     // (`trace_ctx.rs const_ref` / `hold_live_const_ptr`).
     use crate::state::ConcreteValue;
 
-    pyre_interpreter::test_hooks::install_hash_hook();
     let _hook_guard = WalkerQmutHookGuard::install();
     let mut tc = fresh_trace_ctx();
     let mut regs_r: [OpRef; 0] = [];
@@ -9149,7 +9393,6 @@ fn walker_pin_mapdict_records_quasiimmut_from_mutate(
 ) {
     use crate::state::ConcreteValue;
 
-    pyre_interpreter::test_hooks::install_hash_hook();
     let _hook_guard = WalkerQmutHookGuard::install();
     let mut tc = fresh_trace_ctx();
     let mut regs_r: [OpRef; 0] = [];
@@ -9330,7 +9573,7 @@ fn walker_pin_audit_hooks_records_quasiimmut_from_mutate_descr() {
 #[test]
 fn walker_pin_property_fget_records_quasiimmut_from_mutate_descr() {
     // `descriptor.py W_Property._immutable_fields_ = ["w_fget?", ...]`.
-    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
     let obj = pyre_object::descriptor::w_property_new(
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
@@ -9353,7 +9596,7 @@ fn walker_pin_property_fget_records_quasiimmut_from_mutate_descr() {
 
 #[test]
 fn walker_pin_property_fset_records_quasiimmut_from_mutate_descr() {
-    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
     let obj = pyre_object::descriptor::w_property_new(
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
@@ -9376,7 +9619,7 @@ fn walker_pin_property_fset_records_quasiimmut_from_mutate_descr() {
 
 #[test]
 fn walker_pin_property_fdel_records_quasiimmut_from_mutate_descr() {
-    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
     let obj = pyre_object::descriptor::w_property_new(
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
@@ -9400,7 +9643,7 @@ fn walker_pin_property_fdel_records_quasiimmut_from_mutate_descr() {
 #[test]
 fn walker_pin_staticmethod_w_function_records_quasiimmut_from_mutate_descr() {
     // `function.py StaticMethod._immutable_fields_ = ['w_function?']`.
-    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
     let obj = pyre_object::function::w_staticmethod_new(pyre_object::PY_NULL);
     walker_pin_mapdict_records_quasiimmut_from_mutate(
         |wc| {
@@ -9424,7 +9667,7 @@ fn walker_pin_staticmethod_w_function_records_quasiimmut_from_mutate_descr() {
 #[test]
 fn walker_pin_classmethod_w_function_records_quasiimmut_from_mutate_descr() {
     // `function.py ClassMethod._immutable_fields_ = ['w_function?']`.
-    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
     let obj = pyre_object::function::w_classmethod_new(pyre_object::PY_NULL);
     walker_pin_mapdict_records_quasiimmut_from_mutate(
         |wc| {
@@ -9448,7 +9691,7 @@ fn walker_pin_classmethod_w_function_records_quasiimmut_from_mutate_descr() {
 #[test]
 fn walker_pin_ec_w_tracefunc_records_quasiimmut_from_mutate_descr() {
     // `executioncontext.py _immutable_fields_ = ['w_tracefunc?']`.
-    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
     let ec = pyre_interpreter::alloc_execution_context().as_mut_ptr();
     walker_pin_mapdict_records_quasiimmut_from_mutate(
         |wc| {
@@ -9470,7 +9713,6 @@ fn walker_call_trace_hook_reads_guards_null_hooks() {
     // `executioncontext.py ExecutionContext.call_trace`:
     // `self.gettrace() is not None or self.profilefunc is not None`,
     // with `gettrace = jit.promote(self.w_tracefunc)`.
-    pyre_interpreter::test_hooks::install_hash_hook();
     let _hook_guard = WalkerQmutHookGuard::install();
     let ec = pyre_interpreter::alloc_execution_context().as_mut_ptr();
     let _tls = LastExecCtxGuard::install(ec);
@@ -9525,7 +9767,7 @@ fn walker_call_trace_hook_reads_guards_null_hooks() {
         {
             saw_tracefunc_getfield = true;
         }
-        if saw_tracefunc_getfield && op.opcode == majit_ir::OpCode::GuardIsnull {
+        if saw_tracefunc_getfield && op.opcode == majit_ir::OpCode::GuardValue {
             saw_tracefunc_isnull = true;
         }
         if op.opcode == majit_ir::OpCode::GetfieldGcI
@@ -9541,7 +9783,7 @@ fn walker_call_trace_hook_reads_guards_null_hooks() {
     }
     assert!(
         saw_tracefunc_getfield && saw_tracefunc_isnull,
-        "gettrace() promote(None) is GetfieldGcR + GuardIsnull"
+        "gettrace() promote(None) is GetfieldGcR + GuardValue"
     );
     assert!(
         saw_profilefunc_getfield && saw_profilefunc_false,
@@ -9552,7 +9794,7 @@ fn walker_call_trace_hook_reads_guards_null_hooks() {
 #[test]
 fn walker_pin_ec_profilefunc_records_quasiimmut_from_mutate_descr() {
     // `executioncontext.py _immutable_fields_ = ['profilefunc?']`.
-    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
     let ec = pyre_interpreter::alloc_execution_context().as_mut_ptr();
     walker_pin_mapdict_records_quasiimmut_from_mutate(
         |wc| {
@@ -9624,14 +9866,23 @@ fn portal_ops_have_no_ec_qmut_or_gni(ops: &[majit_ir::OpRc]) {
 /// test cannot overwrite a sibling.
 struct WalkerQmutHookGuard {
     saved: majit_metainterp::HostHooks,
-    _lock: parking_lot::MutexGuard<'static, ()>,
+    _lock: parking_lot::ReentrantMutexGuard<'static, ()>,
 }
 
-static WALKER_QMUT_HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+static WALKER_QMUT_HOOK_TEST_LOCK: parking_lot::ReentrantMutex<()> =
+    parking_lot::ReentrantMutex::new(());
 
 impl WalkerQmutHookGuard {
     fn install() -> Self {
+        // Lock before `ensure_runtime_thread`: that call holds the GIL
+        // until the test thread exits, so taking the GIL first then this
+        // mutex deadlocks a sibling that already holds the mutex and
+        // waits for the GIL (`alloc_execution_context` / `init_typeobjects`).
+        // Reentrant so a test that takes the guard before constructing
+        // (`w_property_new` / `alloc_execution_context`) can still enter
+        // `walker_pin_mapdict_records_quasiimmut_from_mutate`.
         let lock = WALKER_QMUT_HOOK_TEST_LOCK.lock();
+        pyre_interpreter::test_hooks::install_hash_hook();
         let saved = majit_metainterp::host_hooks();
         majit_metainterp::publish_host_hooks(majit_metainterp::HostHooks {
             get_current_qmut_instance: Some(walker_test_get_current_qmut_instance),
