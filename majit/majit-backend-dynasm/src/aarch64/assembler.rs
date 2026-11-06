@@ -1451,14 +1451,12 @@ impl<'a> AssemblerARM64<'a> {
         {
             let l = self.load_loc_to_reg(lhs, 17);
             let d = dst_reg;
-            // Rd/Rn take the SP-form register family for the `#imm12`
-            // encoding; `XSP(r)` encodes identically to `X(r)` for every
-            // non-SP register allocated to this instruction.
+            // codebuilder.py ADD_ri / SUB_ri: encode Rd/Rn by hand. dynasm's
+            // `add XSP(d), XSP(l), #imm` form cannot take a dynamic register
+            // (`emit_add_ri`).
             match opcode {
-                OpCode::IntSub => {
-                    dynasm!(self.mc ; .arch aarch64 ; sub XSP(d), XSP(l), im as u32)
-                }
-                _ => dynasm!(self.mc ; .arch aarch64 ; add XSP(d), XSP(l), im as u32),
+                OpCode::IntSub => self.emit_sub_ri(d, l, im as u32),
+                _ => self.emit_add_ri(d, l, im as u32),
             }
             return;
         }
@@ -1494,8 +1492,29 @@ impl<'a> AssemblerARM64<'a> {
     /// because dynasm's immediate form cannot take a dynamic register (it
     /// cannot tell whether the register is SP).
     pub(crate) fn emit_add_ri(&mut self, rd: u8, rn: u8, imm: u32) {
-        debug_assert!(imm <= MAX_CMP_IMM12, "add immediate {imm} exceeds 12 bits");
-        let word: u32 = (0b1001000100u32 << 22) | (imm << 10) | ((rn as u32) << 5) | (rd as u32);
+        self.emit_addsub_ri(rd, rn, imm, false, false);
+    }
+
+    /// `codebuilder.py SUB_ri`.
+    pub(crate) fn emit_sub_ri(&mut self, rd: u8, rn: u8, imm: u32) {
+        self.emit_addsub_ri(rd, rn, imm, true, false);
+    }
+
+    fn emit_addsub_ri(&mut self, rd: u8, rn: u8, imm: u32, sub: bool, set_flags: bool) {
+        debug_assert!(
+            imm <= MAX_CMP_IMM12,
+            "add/sub immediate {imm} exceeds 12 bits"
+        );
+        // ADD_ri: base = 0b1001000100 | (s << 7); SUB_ri: 0b1101000100 | (s << 7).
+        let mut base = if sub {
+            0b1101000100u32
+        } else {
+            0b1001000100u32
+        };
+        if set_flags {
+            base |= 1 << 7;
+        }
+        let word: u32 = (base << 22) | (imm << 10) | ((rn as u32) << 5) | (rd as u32);
         dynasm!(self.mc ; .arch aarch64 ; .u32 word);
     }
 
@@ -2578,35 +2597,43 @@ impl<'a> AssemblerARM64<'a> {
             OpCode::IntAddOvf => {
                 // RPython aarch64/opassembler.py int_add_impl parity —
                 // 3-operand `ADDS Rd, Rn, Rm` (s=1 sets flags for GUARD_NO_OVERFLOW).
-                if let (Some(Loc::Reg(dst)), Some(lhs), Some(src)) =
+                let (Some(Loc::Reg(dst)), Some(lhs), Some(src)) =
                     (result_loc, arglocs.first(), arglocs.get(1))
-                {
-                    if let Some(im) = Self::addsub_imm12(src) {
-                        let l = self.load_loc_to_reg(lhs, 17);
-                        dynasm!(self.mc ; .arch aarch64 ; adds X(dst.value), XSP(l), im as u32);
-                    } else {
-                        let (lhs_reg, src_reg) = self.load_3op_into_scratch(lhs, src);
-                        dynasm!(self.mc ; .arch aarch64
-                            ; adds X(dst.value), X(lhs_reg as u8), X(src_reg as u8));
-                    }
-                    self.guard_success_cc = Some(CC_NO);
+                else {
+                    panic!(
+                        "IntAddOvf: expected [lhs, rhs] and a register result, \
+                         got arglocs={arglocs:?} result={result_loc:?}"
+                    );
+                };
+                if let Some(im) = Self::addsub_imm12(src) {
+                    let l = self.load_loc_to_reg(lhs, 17);
+                    self.emit_addsub_ri(dst.value, l, im as u32, false, true);
+                } else {
+                    let (lhs_reg, src_reg) = self.load_3op_into_scratch(lhs, src);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; adds X(dst.value), X(lhs_reg as u8), X(src_reg as u8));
                 }
+                self.guard_success_cc = Some(CC_NO);
             }
             OpCode::IntSubOvf => {
                 // aarch64/opassembler.py int_sub_impl: `SUBS Rd, Rn, Rm`.
-                if let (Some(Loc::Reg(dst)), Some(lhs), Some(src)) =
+                let (Some(Loc::Reg(dst)), Some(lhs), Some(src)) =
                     (result_loc, arglocs.first(), arglocs.get(1))
-                {
-                    if let Some(im) = Self::addsub_imm12(src) {
-                        let l = self.load_loc_to_reg(lhs, 17);
-                        dynasm!(self.mc ; .arch aarch64 ; subs X(dst.value), XSP(l), im as u32);
-                    } else {
-                        let (lhs_reg, src_reg) = self.load_3op_into_scratch(lhs, src);
-                        dynasm!(self.mc ; .arch aarch64
-                            ; subs X(dst.value), X(lhs_reg as u8), X(src_reg as u8));
-                    }
-                    self.guard_success_cc = Some(CC_NO);
+                else {
+                    panic!(
+                        "IntSubOvf: expected [lhs, rhs] and a register result, \
+                         got arglocs={arglocs:?} result={result_loc:?}"
+                    );
+                };
+                if let Some(im) = Self::addsub_imm12(src) {
+                    let l = self.load_loc_to_reg(lhs, 17);
+                    self.emit_addsub_ri(dst.value, l, im as u32, true, true);
+                } else {
+                    let (lhs_reg, src_reg) = self.load_3op_into_scratch(lhs, src);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; subs X(dst.value), X(lhs_reg as u8), X(src_reg as u8));
                 }
+                self.guard_success_cc = Some(CC_NO);
             }
             OpCode::IntMulOvf => {
                 // `opassembler.py emit_comp_op_int_mul_ovf`: the product
@@ -2614,17 +2641,21 @@ impl<'a> AssemblerARM64<'a> {
                 // sign extension.  `CMP_rr_shifted(ip0, res, 63)` is
                 // `cmp Xn, Xm, asr #63`, which does the shift as part of the
                 // compare rather than through a scratch register.
-                if let (Some(Loc::Reg(dst)), Some(lhs), Some(src)) =
+                let (Some(Loc::Reg(dst)), Some(lhs), Some(src)) =
                     (result_loc, arglocs.first(), arglocs.get(1))
-                {
-                    let (lhs_reg, src_reg) = self.load_3op_into_scratch(lhs, src);
-                    dynasm!(self.mc ; .arch aarch64
-                        ; smulh x15, X(lhs_reg as u8), X(src_reg as u8)
-                        ; mul X(dst.value), X(lhs_reg as u8), X(src_reg as u8)
-                        ; cmp x15, X(dst.value), asr #63
+                else {
+                    panic!(
+                        "IntMulOvf: expected [lhs, rhs] and a register result, \
+                         got arglocs={arglocs:?} result={result_loc:?}"
                     );
-                    self.guard_success_cc = Some(CC_E);
-                }
+                };
+                let (lhs_reg, src_reg) = self.load_3op_into_scratch(lhs, src);
+                dynasm!(self.mc ; .arch aarch64
+                    ; smulh x15, X(lhs_reg as u8), X(src_reg as u8)
+                    ; mul X(dst.value), X(lhs_reg as u8), X(src_reg as u8)
+                    ; cmp x15, X(dst.value), asr #63
+                );
+                self.guard_success_cc = Some(CC_E);
             }
             // ── Integer binary (aarch64 3-operand form) ──
             // RPython parity: aarch64/opassembler.py `int_sub_impl` emits
@@ -2639,11 +2670,21 @@ impl<'a> AssemblerARM64<'a> {
             | OpCode::IntOr
             | OpCode::IntXor
             | OpCode::NurseryPtrIncrement => {
-                if let (Some(Loc::Reg(dst)), Some(lhs), Some(src)) =
+                // aarch64/opassembler.py `int_add_impl` / `emit_op_int_add`
+                // always unpacks `l0, l1, res = arglocs` and emits ADD.
+                // A miss here used to drop the instruction, leaving `res`
+                // with leftover bits that a later spill published as a
+                // failarg.
+                let (Some(Loc::Reg(dst)), Some(lhs), Some(src)) =
                     (result_loc, arglocs.first(), arglocs.get(1))
-                {
-                    self.emit_binop_3op(op.opcode, dst.value, lhs, src);
-                }
+                else {
+                    panic!(
+                        "{:?}: expected [lhs, rhs] and a register result, \
+                         got arglocs={arglocs:?} result={result_loc:?}",
+                        op.opcode,
+                    );
+                };
+                self.emit_binop_3op(op.opcode, dst.value, lhs, src);
             }
             // ── Unary integer ──
             OpCode::IntNeg => {

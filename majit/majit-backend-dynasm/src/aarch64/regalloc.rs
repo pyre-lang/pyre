@@ -264,26 +264,31 @@ impl<'a> RegAlloc<'a> {
     ) {
         let boxes = [lhs.clone(), rhs.clone()];
         // history.py — inline-Const variants carry the value on the OpRef.
+        // `box.type` (regalloc.py `make_sure_var_in_reg` / `force_allocate_reg(op)`):
+        // NURSERY_PTR_INCREMENT is REF, INT_ADD is INT.
+        let lhs_tp = self.tp(lhs);
+        let rhs_tp = self.tp(rhs);
+        let dst_tp = self.tp(dst);
         let imm_lhs = check_imm_box(lhs);
         let imm_rhs = check_imm_box(rhs);
         let (l0, l1) = if !imm_lhs && imm_rhs {
-            let r0 = self.make_sure_var_in_reg(lhs, Type::Int, &boxes, None, false);
-            let r1 = self.loc(rhs, Type::Int);
+            let r0 = self.make_sure_var_in_reg(lhs, lhs_tp, &boxes, None, false);
+            let r1 = self.loc(rhs, rhs_tp);
             (r0, r1)
         } else if imm_lhs && !imm_rhs {
             // PyPy regalloc.py:329-331 swaps so the immediate stays on
             // the Rn slot; aarch64 `add` is commutative.
-            let r1 = self.loc(lhs, Type::Int);
-            let r0 = self.make_sure_var_in_reg(rhs, Type::Int, &boxes, None, false);
+            let r1 = self.loc(lhs, lhs_tp);
+            let r0 = self.make_sure_var_in_reg(rhs, rhs_tp, &boxes, None, false);
             (r0, r1)
         } else {
-            let r0 = self.make_sure_var_in_reg(lhs, Type::Int, &boxes, None, false);
-            let r1 = self.make_sure_var_in_reg(rhs, Type::Int, &boxes, None, false);
+            let r0 = self.make_sure_var_in_reg(lhs, lhs_tp, &boxes, None, false);
+            let r1 = self.make_sure_var_in_reg(rhs, rhs_tp, &boxes, None, false);
             (r0, r1)
         };
-        self.possibly_free_var(lhs, Type::Int);
-        self.possibly_free_var(rhs, Type::Int);
-        let res = self.force_allocate_reg(dst, Type::Int, &[], None, false);
+        self.possibly_free_var(lhs, lhs_tp);
+        self.possibly_free_var(rhs, rhs_tp);
+        let res = self.force_allocate_reg(dst, dst_tp, &[], None, false);
         self.perform(i, [l0, l1], Some(Loc::Reg(res)), asm);
     }
 }
