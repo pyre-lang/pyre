@@ -4,8 +4,9 @@ use super::{
     is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration, is_str_family_class_root,
     json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, no_tombstoned_leaves,
     raw_field_address_value_type, shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
-    tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_gcref_spelling,
-    tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr, tyref_positional_aggregate_root,
+    tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root, tyref_is_closure_env,
+    tyref_is_gcref_spelling, tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr,
+    tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_positional_aggregate_root,
     tyref_ptr_pointee_is_vec, tyref_ref_param_class_root, tyref_shaped_tuple_root,
     tyref_to_attr_value_type_for_struct_field, tyref_to_value_type, tyref_tuple_suffix,
 };
@@ -1127,6 +1128,179 @@ fn type_alias_of_fn_ptr_peels_to_functype() {
     assert!(
         matches!(ptr_ty.TO, PtrTarget::Func(_)),
         "stamp is Ptr(FuncType)"
+    );
+}
+
+#[test]
+fn hkey_alias_of_c_void_ptr_is_voidp() {
+    let c_void_adt = serde_json::json!({
+        "Adt": {"id": 0, "generics": empty_generics()}
+    });
+    let voidp = serde_json::json!({"RawPtr": [c_void_adt, "Mut"]});
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            serde_json::json!({
+                "def_id": 0,
+                "item_meta": fixture_item_meta(ident_path(&["core", "ffi", "c_void"])),
+                "kind": "Opaque"
+            }),
+            type_decl_alias(1, &["fixture", "HKEY"], voidp.clone()),
+            type_decl_alias(
+                2,
+                &["fixture", "VOIDPP"],
+                serde_json::json!({"RawPtr": [voidp, "Mut"]}),
+            ),
+            type_decl_struct(3, &["majit_gc", "header", "GCREFOpaque"], vec![]),
+            type_decl_alias(
+                4,
+                &["majit_gc", "header", "GCREF"],
+                serde_json::json!({"RawPtr": [{
+                    "Adt": {"id": 3, "generics": empty_generics()}
+                }, "Mut"]}),
+            ),
+        ],
+        vec![],
+    );
+    let hkey = TyRef::Other(serde_json::json!({
+        "Adt": {"id": 1, "generics": empty_generics()}
+    }));
+    let voidpp = TyRef::Other(serde_json::json!({
+        "Adt": {"id": 2, "generics": empty_generics()}
+    }));
+    let gcref = TyRef::Other(serde_json::json!({
+        "Adt": {"id": 4, "generics": empty_generics()}
+    }));
+    assert!(
+        tyref_is_raw_c_void_ptr(&hkey, &llbc),
+        "type HKEY = *mut c_void is VOIDP"
+    );
+    assert!(
+        tyref_is_raw_c_void_pp(&voidpp, &llbc),
+        "type VOIDPP = *mut *mut c_void is VOIDPP"
+    );
+    assert!(
+        !tyref_is_raw_c_void_ptr(&gcref, &llbc),
+        "type GCREF = *mut GCREFOpaque is not VOIDP"
+    );
+    assert!(
+        !tyref_is_raw_c_void_pp(&gcref, &llbc),
+        "GCREF is not VOIDPP"
+    );
+}
+
+/// Charon dests intern `*mut c_void` as `Deduplicated` (`prepare_file`
+/// `null_mut` dest). The intern body is `RawPtr` of `c_void`; VOIDP
+/// recognition has to resolve that table, not `type_decls[id]`.
+#[test]
+fn interned_c_void_ptr_dest_is_voidp() {
+    let intern_ptr = 1u64;
+    let intern_void = 2u64;
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            serde_json::json!({
+                "def_id": 0,
+                "item_meta": fixture_item_meta(ident_path(&["core", "ffi", "c_void"])),
+                "kind": "Opaque"
+            }),
+            type_decl_alias(
+                1,
+                &["fixture", "InternSeed"],
+                serde_json::json!({
+                    "Value": [intern_ptr, {
+                        "RawPtr": [
+                            {"Value": [intern_void, {
+                                "Adt": {
+                                    "id": 0,
+                                    "generics": empty_generics(),
+                                    "builtin": null
+                                }
+                            }]},
+                            "Mut"
+                        ]
+                    }]
+                }),
+            ),
+        ],
+        vec![],
+    );
+    let ty = TyRef::Dedup { id: intern_ptr };
+    assert!(
+        tyref_is_raw_c_void_ptr(&ty, &llbc),
+        "Deduplicated *mut c_void intern is VOIDP"
+    );
+    assert!(
+        !tyref_is_raw_c_void_pp(&ty, &llbc),
+        "Deduplicated *mut c_void intern is not VOIDPP"
+    );
+    assert_eq!(
+        tyref_enum_payload_value_type(
+            &ty,
+            &llbc,
+            &no_tombstoned_leaves(),
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        ),
+        ValueType::Int,
+        "Result Ok *mut c_void is VOIDP int-bank, not GCREF"
+    );
+}
+
+/// `Option<*mut *mut c_void>` is tagged: the inner VOIDP word may already
+/// be null, so rustc keeps a discriminant. `Option<*mut PyObjectRef>`
+/// stays the GC pointer niche.
+#[test]
+fn option_of_voidpp_is_not_pointer_niche() {
+    let c_void_adt = serde_json::json!({
+        "Adt": {"id": 1, "generics": empty_generics()}
+    });
+    let voidp = serde_json::json!({"RawPtr": [c_void_adt, "Mut"]});
+    let voidpp = serde_json::json!({"RawPtr": [voidp.clone(), "Mut"]});
+    let gc_obj_adt = serde_json::json!({
+        "Adt": {"id": 2, "generics": empty_generics()}
+    });
+    let gc_obj_ptr = serde_json::json!({"RawPtr": [gc_obj_adt, "Mut"]});
+    let gc_obj_ptr_ptr = serde_json::json!({"RawPtr": [gc_obj_ptr, "Mut"]});
+    let hkey = serde_json::json!({
+        "Adt": {"id": 3, "generics": empty_generics()}
+    });
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            option_enum(0),
+            serde_json::json!({
+                "def_id": 1,
+                "item_meta": fixture_item_meta(ident_path(&["core", "ffi", "c_void"])),
+                "kind": "Opaque"
+            }),
+            type_decl_struct(2, &["fixture", "GcObj"], vec![]),
+            type_decl_alias(3, &["fixture", "HKEY"], voidp),
+        ],
+        vec![],
+    );
+    let option_voidpp = TyRef::Other(option_adt_node(0, voidpp));
+    let option_gc_obj_ptr_ptr = TyRef::Other(option_adt_node(0, gc_obj_ptr_ptr));
+    let option_phkey = TyRef::Other(option_adt_node(
+        0,
+        serde_json::json!({"RawPtr": [hkey, "Mut"]}),
+    ));
+    assert!(
+        !super::tyref_is_niche_option(&option_voidpp, &llbc),
+        "Option<*mut *mut c_void> keeps the tag"
+    );
+    assert!(
+        super::tyref_niche_option_payload_paint(&option_voidpp, &llbc, &no_tombstoned_leaves())
+            .is_none(),
+        "tagged VOIDPP Option is not Int-painted as a VOIDP niche"
+    );
+    assert!(
+        super::tyref_is_niche_option(&option_gc_obj_ptr_ptr, &llbc),
+        "Option<*mut *mut GcObj> stays the GC pointer niche"
+    );
+    assert!(
+        !super::tyref_is_niche_option(&option_phkey, &llbc),
+        "Option<*mut HKEY> is Option of VOIDPP via alias"
     );
 }
 

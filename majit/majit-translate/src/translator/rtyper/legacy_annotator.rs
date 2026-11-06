@@ -978,6 +978,11 @@ fn raw_ptr_annotation_incoming(result: &Variable, kind: &OpKind) -> Option<Incom
         {
             Some(ccharp_someptr_incoming())
         }
+        OpKind::Call { .. } | OpKind::FieldRead { .. } | OpKind::Input { .. }
+            if var_concretetype_is_voidp_family(result) =>
+        {
+            Some(someptr_from_voidp_concretetype(result))
+        }
         OpKind::FieldRead {
             field,
             ty: ValueType::Unsigned,
@@ -1086,6 +1091,27 @@ fn var_concretetype_is_ccharp(var: &Variable) -> bool {
         var.concretetype().as_ref(),
         Some(ct) if *ct == *CCHARP || *ct == *CONST_CCHARP
     )
+}
+
+/// `VOIDP` / `CONST_VOIDP` / `VOIDPP` (`rffi.py`) stamped on a declared
+/// `*mut c_void` / `*mut *mut c_void` (`stamp_raw_c_void_ptr`).
+fn var_concretetype_is_voidp_family(var: &Variable) -> bool {
+    use crate::translator::rtyper::lltypesystem::rffi::{CONST_VOIDP, VOIDP, VOIDPP};
+    matches!(
+        var.concretetype().as_ref(),
+        Some(ct) if *ct == *VOIDP || *ct == *CONST_VOIDP || *ct == *VOIDPP
+    )
+}
+
+/// Rebuild `SomePtr` from a stamped VOIDP / VOIDPP cell.
+fn someptr_from_voidp_concretetype(var: &Variable) -> Incoming {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    match var.concretetype() {
+        Some(LowLevelType::Ptr(ptr_ty)) if var_concretetype_is_voidp_family(var) => {
+            Incoming::Annotation(Rc::new(SomeValue::Ptr(SomePtr::new(*ptr_ty))))
+        }
+        _ => ccharp_someptr_incoming(),
+    }
 }
 
 /// Skip-walker refusal for a merged Frozen PBC the four-kind bank cannot
@@ -5355,6 +5381,60 @@ mod tests {
         graph.set_goto(pred_field, join, vec![field_var]);
         graph.set_return(join, Some(phi.clone()));
         annotate_inner(&graph, None).expect("cast_int_to_ptr ∪ *mut u8 FieldRead");
+        assert!(
+            matches!(read_binding_some(&phi).as_deref(), Some(SomeValue::Ptr(_))),
+            "phi is SomePtr, got {:?}",
+            read_binding_some(&phi)
+        );
+    }
+
+    #[test]
+    fn voidp_cast_phi_stamped_call_is_someptr() {
+        // `ann_cast_int_to_ptr(VOIDP, int)` ∪ an extern `*mut c_void`
+        // return stamped VOIDP (`stamp_raw_c_void_ptr`).
+        use crate::translator::rtyper::lltypesystem::rffi::VOIDP;
+        let mut graph = FunctionGraph::new("voidp_cast_phi_call");
+        let pred_cast = graph.create_block();
+        let pred_call = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        let cast_var = graph
+            .push_op_var(
+                pred_cast,
+                OpKind::Call {
+                    target: CallTarget::function_path([
+                        "rpython",
+                        "rtyper",
+                        "lltypesystem",
+                        "lltype",
+                        "cast_int_to_ptr",
+                    ]),
+                    args: vec![
+                        LinkArg::from(ConstValue::LowLevelType(Box::new((*VOIDP).clone()))),
+                        LinkArg::from(ConstValue::Int(0)),
+                    ],
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let call_var = graph
+            .push_op_var(
+                pred_call,
+                OpKind::Call {
+                    target: CallTarget::function_path(["fdopen"]),
+                    args: vec![],
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        call_var.set_concretetype(Some((*VOIDP).clone()));
+        branch_start_to_preds(&mut graph, pred_cast, pred_call);
+        graph.set_goto(pred_cast, join, vec![cast_var]);
+        graph.set_goto(pred_call, join, vec![call_var]);
+        graph.set_return(join, Some(phi.clone()));
+        annotate_inner(&graph, None).expect("cast_int_to_ptr(VOIDP) ∪ VOIDP Call");
         assert!(
             matches!(read_binding_some(&phi).as_deref(), Some(SomeValue::Ptr(_))),
             "phi is SomePtr, got {:?}",

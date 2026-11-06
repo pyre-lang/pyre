@@ -1942,6 +1942,360 @@ fn int_to_registered_gc_ptr_emits_cast_int_to_ptr_then_instance() {
     );
 }
 
+fn graph_has_cast_instance(graph: &crate::model::FunctionGraph) -> bool {
+    graph.blocks.iter().any(|block| {
+        block
+            .operations
+            .iter()
+            .any(|op| crate::model::cast_instance_root(&op.kind).is_some())
+    })
+}
+
+fn graph_has_intmask(graph: &crate::model::FunctionGraph) -> bool {
+    use crate::model::{CallTarget, OpKind};
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice() == ["rpython", "rlib", "rarithmetic", "intmask"]
+            )
+        })
+    })
+}
+
+fn two_arg_cast_int_to_ptr_type(
+    graph: &crate::model::FunctionGraph,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::model::{CallTarget, OpKind};
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.last().map(String::as_str) != Some("cast_int_to_ptr") || args.len() != 2 {
+            continue;
+        }
+        let crate::model::LinkArg::Const(c) = &args[0] else {
+            panic!("cast_int_to_ptr PtrT is a Constant, got {:?}", args[0]);
+        };
+        let crate::flowspace::model::ConstValue::LowLevelType(ptr_ty) = &c.value else {
+            panic!("cast_int_to_ptr PtrT is a LowLevelType, got {:?}", c.value);
+        };
+        return (**ptr_ty).clone();
+    }
+    panic!("expected 2-arg cast_int_to_ptr, graph={}", graph.dump());
+}
+
+fn int_as_ptr_cast_llbc(
+    type_decls: Vec<serde_json::Value>,
+    dest_ty: serde_json::Value,
+) -> majit_charon_reader::Llbc {
+    let span = fixture_span();
+    let src_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let unary = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["fixture", "unary_cast"])),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [src_ty.clone()],
+            "output": dest_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 1, "locals": [
+                {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                {"index": 1, "name": "addr", "span": span, "ty": src_ty.clone()}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span,
+                    "kind": {"Assign": [
+                        place(0, &dest_ty),
+                        {"UnaryOp": [
+                            {"Cast": {"PtrWithExposedProvenance": dest_ty.clone()}},
+                            {"Move": place(1, &src_ty)}
+                        ]}
+                    ]}
+                }],
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let rvalue = serde_json::json!({
+        "def_id": 1,
+        "item_meta": fixture_item_meta(ident_path(&["fixture", "rvalue_cast"])),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [src_ty.clone()],
+            "output": dest_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 1, "locals": [
+                {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                {"index": 1, "name": "addr", "span": span, "ty": src_ty.clone()}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span,
+                    "kind": {"Assign": [
+                        place(0, &dest_ty),
+                        {"Cast": [
+                            "IntToPtr",
+                            {"Move": place(1, &src_ty)},
+                            dest_ty.clone()
+                        ]}
+                    ]}
+                }],
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": type_decls,
+            "fun_decls": [unary, rvalue],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+}
+
+/// `usize as *mut c_void` is `cast_int_to_ptr(VOIDP, addr)` (`rffi.py`
+/// `VOIDP` / `lltype.py` `ann_cast_int_to_ptr`). UnaryOp and Rvalue::Cast
+/// both emit the 2-arg form so the result annotates `SomePtr(VOIDP)`.
+#[test]
+fn int_as_c_void_ptr_emits_cast_int_to_ptr_voidp() {
+    use crate::translator::rtyper::lltypesystem::rffi::VOIDP;
+    let c_void = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["core", "ffi", "c_void"])),
+        "kind": "Opaque"
+    });
+    let dest = serde_json::json!({"RawPtr": [{
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [], "types": [],
+                "const_generics": [], "trait_refs": []
+            },
+            "builtin": null
+        }
+    }, "Mut"]});
+    let llbc = int_as_ptr_cast_llbc(vec![c_void], dest);
+    for name in ["unary_cast", "rvalue_cast"] {
+        let graph = crate::test_support::lower_function(&llbc, name)
+            .unwrap_or_else(|e| panic!("lower {name}: {e}"));
+        assert_eq!(
+            two_arg_cast_int_to_ptr_type(&graph),
+            *VOIDP,
+            "{name} int→VOIDP; graph={}",
+            graph.dump()
+        );
+        assert!(
+            !graph_has_cast_instance(&graph),
+            "{name} VOIDP dest is not an instance; graph={}",
+            graph.dump()
+        );
+    }
+}
+
+/// `usize as HKEY` with `type HKEY = *mut c_void` is the same VOIDP
+/// 2-arg form (`rffi.cast(rwinreg.HKEY, int)` / `ann_cast_int_to_ptr`).
+#[test]
+fn int_as_c_void_ptr_alias_emits_cast_int_to_ptr_voidp() {
+    use crate::translator::rtyper::lltypesystem::rffi::VOIDP;
+    let c_void = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["core", "ffi", "c_void"])),
+        "kind": "Opaque"
+    });
+    let voidp = serde_json::json!({"RawPtr": [{
+        "Adt": {
+            "id": 0,
+            "generics": empty_generics(),
+            "builtin": null
+        }
+    }, "Mut"]});
+    let hkey = type_decl_alias(
+        1,
+        &["windows_sys", "Win32", "System", "Registry", "HKEY"],
+        voidp,
+    );
+    let dest = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": empty_generics(),
+            "builtin": null
+        }
+    });
+    let llbc = int_as_ptr_cast_llbc(vec![c_void, hkey], dest);
+    for name in ["unary_cast", "rvalue_cast"] {
+        let graph = crate::test_support::lower_function(&llbc, name)
+            .unwrap_or_else(|e| panic!("lower {name}: {e}"));
+        assert_eq!(
+            two_arg_cast_int_to_ptr_type(&graph),
+            *VOIDP,
+            "{name} int→HKEY alias is VOIDP; graph={}",
+            graph.dump()
+        );
+        assert!(
+            !graph_has_cast_instance(&graph),
+            "{name} HKEY dest is not an instance; graph={}",
+            graph.dump()
+        );
+    }
+}
+
+/// `usize as *mut *mut c_void` is `cast_int_to_ptr(VOIDPP, addr)`.
+#[test]
+fn int_as_c_void_pp_emits_cast_int_to_ptr_voidpp() {
+    use crate::translator::rtyper::lltypesystem::rffi::VOIDPP;
+    let c_void = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["core", "ffi", "c_void"])),
+        "kind": "Opaque"
+    });
+    let voidp = serde_json::json!({"RawPtr": [{
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [], "types": [],
+                "const_generics": [], "trait_refs": []
+            },
+            "builtin": null
+        }
+    }, "Mut"]});
+    let dest = serde_json::json!({"RawPtr": [voidp, "Mut"]});
+    let llbc = int_as_ptr_cast_llbc(vec![c_void], dest);
+    for name in ["unary_cast", "rvalue_cast"] {
+        let graph = crate::test_support::lower_function(&llbc, name)
+            .unwrap_or_else(|e| panic!("lower {name}: {e}"));
+        assert_eq!(
+            two_arg_cast_int_to_ptr_type(&graph),
+            *VOIDPP,
+            "{name} int→VOIDPP; graph={}",
+            graph.dump()
+        );
+    }
+}
+
+/// `usize as *mut ffi_cif` is 2-arg overlay `cast_int_to_ptr(Ptr(Struct), addr)`
+/// (`lltype.py` `ann_cast_int_to_ptr`). Aliasing keeps `SomeInteger`; the
+/// 1-arg form is `SomeInstance`. Nested C pointers (`arg_types: *mut *mut
+/// ffi_type`) stay raw storage (`rffi.py` `VOIDPP`).
+#[test]
+fn int_as_raw_c_struct_ptr_emits_dest_overlay_cast() {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+    let adt = |id: u64| {
+        serde_json::json!({
+            "Adt": {
+                "id": id,
+                "generics": {
+                    "regions": [], "types": [],
+                    "const_generics": [], "trait_refs": []
+                },
+                "builtin": null
+            }
+        })
+    };
+    let ffi_type = struct_decl(
+        1,
+        ident_path(&["libffi_sys", "ffi_type"]),
+        serde_json::json!([{
+            "name": "size",
+            "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+            "attr_info": null
+        }]),
+        false,
+    );
+    let cif = struct_decl(
+        0,
+        ident_path(&["libffi_sys", "ffi_cif"]),
+        serde_json::json!([
+            {
+                "name": "abi",
+                "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+                "attr_info": null
+            },
+            {
+                "name": "arg_types",
+                "ty": {"RawPtr": [{"RawPtr": [adt(1), "Mut"]}, "Mut"]},
+                "attr_info": null
+            },
+            {
+                "name": "rtype",
+                "ty": {"RawPtr": [adt(1), "Mut"]},
+                "attr_info": null
+            }
+        ]),
+        false,
+    );
+    let dest = serde_json::json!({"RawPtr": [adt(0), "Mut"]});
+    let llbc = int_as_ptr_cast_llbc(vec![cif, ffi_type], dest);
+    for name in ["unary_cast", "rvalue_cast"] {
+        let graph = crate::test_support::lower_function(&llbc, name)
+            .unwrap_or_else(|e| panic!("lower {name}: {e}"));
+        let ptr_ty = two_arg_cast_int_to_ptr_type(&graph);
+        let LowLevelType::Ptr(ptr) = ptr_ty else {
+            panic!(
+                "{name} overlay is Ptr(Struct), got {ptr_ty:?}; graph={}",
+                graph.dump()
+            );
+        };
+        let PtrTarget::Struct(st) = &ptr.TO else {
+            panic!(
+                "{name} overlay TO is Struct, got {:?}; graph={}",
+                ptr.TO,
+                graph.dump()
+            );
+        };
+        assert_eq!(st._gckind, GcKind::Raw, "{name} ffi_cif is a raw C struct");
+        assert!(
+            !graph_has_cast_instance(&graph),
+            "{name} raw C dest is SomePtr, not Instance; graph={}",
+            graph.dump()
+        );
+    }
+}
+
+/// `usize as *mut i64` stays in the int bank (`history.py` `getkind` of a
+/// raw Ptr is `'int'`). Overlay / VOIDP already returned; the unsigned
+/// source still takes `rarithmetic.intmask` so the dest is Signed.
+#[test]
+fn usize_as_raw_i64_ptr_lowers_to_intmask() {
+    let dest = serde_json::json!({"RawPtr": [
+        {"Scalar": {"Integer": {"Signed": "I64"}}},
+        "Mut"
+    ]});
+    let llbc = int_as_ptr_cast_llbc(vec![], dest);
+    let graph = crate::test_support::lower_function(&llbc, "unary_cast")
+        .unwrap_or_else(|e| panic!("lower unary_cast: {e}"));
+    assert!(
+        graph_has_intmask(&graph),
+        "unsigned→raw i64 ptr is intmask; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !graph_has_cast_instance(&graph),
+        "raw scalar dest is not an instance; graph={}",
+        graph.dump()
+    );
+}
+
 /// `*mut PyObject as *mut PyObject` is already `Ref(Some(root))` of the
 /// dest class (`rclass.py` `getinstancerepr`). The identity recast
 /// `result_narrow_root` used to emit is omitted.
@@ -17335,6 +17689,216 @@ fn null_mut_of_raw_struct_is_null_raw_without_cast() {
         }),
         "raw-pointee null_mut must not remain as a GC null; ops={ops:?}"
     );
+}
+
+fn c_void_opaque_decl(def_id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": fixture_item_meta(ident_path(&["core", "ffi", "c_void"])),
+        "kind": "Opaque"
+    })
+}
+
+fn c_void_adt(id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "Adt": {
+            "id": id,
+            "generics": empty_generics(),
+            "builtin": null
+        }
+    })
+}
+
+fn lower_null_mut_dest(
+    types: Vec<serde_json::Value>,
+    dest: serde_json::Value,
+) -> crate::model::FunctionGraph {
+    let caller = interior_caller(
+        "null_voidp",
+        0,
+        vec![],
+        dest.clone(),
+        vec![interior_local(0, None, &dest)],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(1, vec![], interior_place(0, &dest), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let null_mut = interior_opaque(1, &["std", "ptr", "null_mut"], vec![], dest);
+    let llbc = llbc_with_types("fixture", types, vec![caller, null_mut]);
+    lower_interior(&llbc, "null_voidp")
+}
+
+fn assert_null_mut_is_typed_nullptr(
+    graph: &crate::model::FunctionGraph,
+    ptr_ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    label: &str,
+) {
+    use crate::model::{CallTarget, OpKind};
+    assert_eq!(
+        two_arg_cast_int_to_ptr_type(graph),
+        *ptr_ty,
+        "{label} null_mut is 2-arg cast_int_to_ptr; graph={}",
+        graph.dump()
+    );
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .all(|op| {
+                !matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.as_slice()
+                        == ["core", "ptr", "null_mut"]
+                        || segments.as_slice() == ["std", "ptr", "null_mut"]
+                        || segments.as_slice() == ["core", "ptr", "null"]
+                        || segments.as_slice() == ["std", "ptr", "null"]
+                        || segments.as_slice() == ["core", "ptr", "null_raw"]
+                )
+            }),
+        "{label} must not remain a GC null_mut or null_raw; graph={}",
+        graph.dump()
+    );
+}
+
+/// `std::ptr::null_mut::<*mut c_void>()` is `cast_int_to_ptr(VOIDP, 0)`
+/// (`rffi.py` `VOIDP` / `ann_cast_int_to_ptr`).
+#[test]
+fn null_mut_of_c_void_ptr_emits_voidp_nullptr() {
+    use crate::translator::rtyper::lltypesystem::rffi::VOIDP;
+    let dest = serde_json::json!({"RawPtr": [c_void_adt(0), "Mut"]});
+    let graph = lower_null_mut_dest(vec![c_void_opaque_decl(0)], dest);
+    assert_null_mut_is_typed_nullptr(&graph, &VOIDP, "*mut c_void");
+}
+
+/// `null_mut()` dest `type HKEY = *mut c_void` is the same VOIDP nullptr
+/// (`as_hkey` none_ok arm / `rffi.cast(rwinreg.HKEY, int)`).
+#[test]
+fn null_mut_of_hkey_alias_emits_voidp_nullptr() {
+    use crate::translator::rtyper::lltypesystem::rffi::VOIDP;
+    let voidp = serde_json::json!({"RawPtr": [c_void_adt(0), "Mut"]});
+    let hkey = type_decl_alias(
+        1,
+        &["windows_sys", "Win32", "System", "Registry", "HKEY"],
+        voidp,
+    );
+    let dest = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": empty_generics(),
+            "builtin": null
+        }
+    });
+    let graph = lower_null_mut_dest(vec![c_void_opaque_decl(0), hkey], dest);
+    assert_null_mut_is_typed_nullptr(&graph, &VOIDP, "HKEY alias");
+}
+
+/// `prepare_file` dest of `null_mut` is interned `*mut c_void`
+/// (`Deduplicated`), not an inline `RawPtr` node.
+#[test]
+fn null_mut_of_interned_c_void_ptr_emits_voidp_nullptr() {
+    use crate::translator::rtyper::lltypesystem::rffi::VOIDP;
+    let intern_ptr = 1u64;
+    let intern_void = 2u64;
+    let dest = serde_json::json!({"Deduplicated": intern_ptr});
+    let seed = type_decl_alias(
+        1,
+        &["fixture", "InternSeed"],
+        serde_json::json!({
+            "Value": [intern_ptr, {
+                "RawPtr": [
+                    {"Value": [intern_void, {
+                        "Adt": {
+                            "id": 0,
+                            "generics": empty_generics(),
+                            "builtin": null
+                        }
+                    }]},
+                    "Mut"
+                ]
+            }]
+        }),
+    );
+    let graph = lower_null_mut_dest(vec![c_void_opaque_decl(0), seed], dest);
+    assert_null_mut_is_typed_nullptr(&graph, &VOIDP, "Deduplicated *mut c_void");
+}
+
+/// Production `prepare_file`: `Ok(null_mut())` dest is interned VOIDP.
+/// A leftover GC `null_mut` is classdef-less `SomeInstance` and cannot
+/// union with `prepare_file_argument`'s SomePtr return.
+#[test]
+fn prepare_file_null_mut_emits_voidp_nullptr() {
+    use crate::translator::rtyper::lltypesystem::rffi::VOIDP;
+    use crate::{ErrorCarrierSpec, HostStaticAddrs};
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-module.ullbc"
+    );
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let addrs = HostStaticAddrs {
+        error_carrier: ErrorCarrierSpec {
+            carrier_path: "pyre_interpreter::error::PyError",
+            carrier_class: "",
+            carrier_wrappers: &[],
+            to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+            from_exc_object: Some(("PyError", "from_exc_object")),
+        },
+        ..Default::default()
+    };
+    let name = "pyre_module::module::_cffi_backend::ctypeptr::prepare_file";
+    let graph = crate::test_support::lower_function_with_static_addrs(llbc, name, addrs)
+        .unwrap_or_else(|err| panic!("lower {name}: {err:?}"));
+    assert_null_mut_is_typed_nullptr(&graph, &VOIDP, name);
+    use crate::model::{CallTarget, OpKind};
+    let arg_call = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("prepare_file_argument")
+            )
+        })
+        .unwrap_or_else(|| panic!("{name}: missing prepare_file_argument call"));
+    let stamped = arg_call
+        .result
+        .as_ref()
+        .and_then(|v| v.concretetype())
+        .expect("prepare_file_argument result");
+    assert_eq!(
+        stamped, *VOIDP,
+        "Result Ok *mut c_void keeps VOIDP through remint"
+    );
+    crate::translator::rtyper::legacy_annotator::annotate(&graph);
+    let arg_name = "pyre_module::module::_cffi_backend::ctypeptr::prepare_file_argument";
+    let arg_graph = crate::test_support::lower_function_with_static_addrs(llbc, arg_name, addrs)
+        .unwrap_or_else(|err| panic!("lower {arg_name}: {err:?}"));
+    crate::translator::rtyper::legacy_annotator::annotate(&arg_graph);
+}
+
+/// `null_mut()` dest `*mut *mut c_void` is `cast_int_to_ptr(VOIDPP, 0)`
+/// (`rffi.py` `VOIDPP`).
+#[test]
+fn null_mut_of_c_void_pp_emits_voidpp_nullptr() {
+    use crate::translator::rtyper::lltypesystem::rffi::VOIDPP;
+    let voidp = serde_json::json!({"RawPtr": [c_void_adt(0), "Mut"]});
+    let dest = serde_json::json!({"RawPtr": [voidp, "Mut"]});
+    let graph = lower_null_mut_dest(vec![c_void_opaque_decl(0)], dest);
+    assert_null_mut_is_typed_nullptr(&graph, &VOIDPP, "*mut *mut c_void");
 }
 
 /// `std::ptr::null_mut::<Utf8Str>()` of a str-family GC pointee is

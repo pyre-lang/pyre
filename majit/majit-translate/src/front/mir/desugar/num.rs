@@ -425,6 +425,30 @@ impl<'a> Lowering<'a> {
             self.graph.set_goto(bb_id, target_bb, link_args);
             return Ok(true);
         }
+        // `null_mut()` dest `*mut c_void` / `type HKEY = *mut c_void` is
+        // `cast_int_to_ptr(VOIDP, 0)` (`rffi.py` `VOIDP` /
+        // `ann_cast_int_to_ptr` → `SomePtr(VOIDP)`). A GC `null_mut` is
+        // classdef-less `SomeInstance` (`ptr_null_constant`) and cannot
+        // union with the SomePtr int-handle arm (`as_hkey`).
+        if tyref_is_raw_c_void_ptr(&call.dest.ty, self.llbc) {
+            let bb_id = self.emit_bb(mir_bb);
+            let res = emit_voidp_nullptr(&mut self.graph, bb_id);
+            self.local_var[dest_local] = Some(LocalValue::One(res));
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(true);
+        }
+        // `null_mut()` dest `void **` (`rffi.py` `VOIDPP`).
+        if tyref_is_raw_c_void_pp(&call.dest.ty, self.llbc) {
+            let bb_id = self.emit_bb(mir_bb);
+            let res = emit_voidpp_nullptr(&mut self.graph, bb_id);
+            self.local_var[dest_local] = Some(LocalValue::One(res));
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(true);
+        }
         // A GC string pointer (`*mut Utf8Str`) is `SomeString`. `null_mut`
         // annotates as a classdef-less `SomeInstance` (`ptr_null_constant`).
         // Recast onto the str-family pointee the way `option_niche_null_cast`

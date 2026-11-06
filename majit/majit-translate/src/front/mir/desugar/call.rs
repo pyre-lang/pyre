@@ -173,6 +173,10 @@ impl<'a> Lowering<'a> {
             // `rffi.py` `CCHARP`. Int-banked so overlay Signed keeps the stamp.
             ccharp
         } else if !callee_returns_gc_block
+            && let Some(voidp) = raw_c_void_ptr_bank(&call.dest.ty, self.llbc)
+        {
+            voidp
+        } else if !callee_returns_gc_block
             && let Some(raw) = raw_scalar_address_value_type(&call.dest.ty, self.llbc)
         {
             raw
@@ -7630,11 +7634,20 @@ impl<'a> Lowering<'a> {
         }
         // A Ref-banked items-block result (`rlist.py` `ll_items`) keeps
         // the `tyref_to_value_type_with` record; CCHARP is Int-banked.
+        // Result-of-carrier dest is the Ok payload after rewire
+        // (`result_exc` `remint_call_as_payload`). Stamp that payload so
+        // overlay Signed keeps CCHARP / VOIDP (`set_concretetype_of_inline`).
         if !callee_returns_gc_block && !graph_is_items_block_base_accessor(&self.graph.name) {
-            stamp_raw_u8_ccharp(&result_var, &call.dest.ty, self.llbc);
+            let stamp_ty = crate::front::result_exc::result_exc_projected_ok(
+                &call.dest.ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            );
+            let stamp_src = stamp_ty.as_ref().unwrap_or(&call.dest.ty);
+            stamp_raw_u8_ccharp(&result_var, stamp_src, self.llbc);
             stamp_fn_ptr(
                 &result_var,
-                &call.dest.ty,
+                stamp_src,
                 self.llbc,
                 self.static_addrs.error_carrier,
             );
@@ -7786,14 +7799,16 @@ impl<'a> Lowering<'a> {
             // `Result<(), PyError>`: the transformed callee returns void
             // (`tyref_result_ok_is_unit`), so the payload is `Void`, not the
             // unit tuple's aggregate `Ref`.
+            let ok_ty = crate::front::result_exc::tyref_result_ok(&call.dest.ty, self.llbc);
             let payload_ty =
                 if crate::front::result_exc::tyref_result_ok_is_unit(&call.dest.ty, self.llbc) {
                     ValueType::Void
                 } else {
-                    crate::front::result_exc::tyref_result_ok(&call.dest.ty, self.llbc)
+                    ok_ty
+                        .as_ref()
                         .map(|ty| {
                             tyref_enum_payload_value_type(
-                                &ty,
+                                ty,
                                 self.llbc,
                                 self.tombstoned_leaves,
                                 self.gc_struct_ids,

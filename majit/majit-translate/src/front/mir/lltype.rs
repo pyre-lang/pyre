@@ -2295,6 +2295,12 @@ pub(in crate::front::mir) fn pointee_is_raw_word(
     if node.get("Scalar").is_some() {
         return true;
     }
+    // Nested C pointers (`ffi_cif.arg_types: *mut *mut ffi_type`,
+    // `rffi.py` `VOIDPP`) are one address word. Peel and ask again;
+    // do not walk the pointee struct's fields (comment above).
+    if let Some(inner) = one_level_pointer_pointee(node, llbc) {
+        return pointee_is_raw_word(inner, llbc, gc_struct_ids);
+    }
     if let Some(def_id) = adt_node_def_id(node) {
         if adt_path_is_gc_container(llbc, def_id) {
             return false;
@@ -2746,6 +2752,12 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
             raw_alloc_flavor_structs,
         );
     }
+    // `rffi.py` `VOIDP` / `VOIDPP`. `history.py` `getkind` of a raw `Ptr`
+    // is `'int'`. `*mut u8` stays `Ref` (GC byte erasure); `c_void` is
+    // never that erasure.
+    if raw_c_void_ptr_bank(ty, llbc).is_some() {
+        return ValueType::Int;
+    }
     if ty_is_raw_address(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
         return ValueType::Int;
     }
@@ -2917,6 +2929,11 @@ pub(in crate::front::mir) fn raw_field_address_value_type(
         raw_u8_ccharp_bank(place_ty, llbc).or_else(|| raw_u8_ccharp_bank(field_ty, llbc))
     {
         return Some(ccharp);
+    }
+    if let Some(voidp) =
+        raw_c_void_ptr_bank(place_ty, llbc).or_else(|| raw_c_void_ptr_bank(field_ty, llbc))
+    {
+        return Some(voidp);
     }
     // `history.py` `getkind` of a raw `Ptr` to a non-byte primitive is
     // `'int'`. Kept out of [`tyref_to_value_type_with`]: an items-base
@@ -3183,6 +3200,9 @@ pub(in crate::front::mir) fn tyref_enum_payload_value_type(
     // `rffi.py` `CCHARP`. Int-banked so overlay Signed keeps the stamp.
     if let Some(ccharp) = raw_u8_ccharp_bank(ty, llbc) {
         return ccharp;
+    }
+    if let Some(voidp) = raw_c_void_ptr_bank(ty, llbc) {
+        return voidp;
     }
     if let Some(pointee) = tyref_shared_borrow_primitive_pointee(ty, llbc) {
         return tyref_to_value_type_with(
@@ -7497,12 +7517,22 @@ pub(in crate::front::mir) fn tyref_is_raw_u8_ptr(ty: &TyRef, llbc: &Llbc) -> boo
 
 /// `*mut` / `*const` whose pointee is `c_void` (`rffi.py` `VOIDP`).
 /// Charon spells `core::ffi::c_void`; a `std::ffi` / `libc` re-export
-/// is the same VOIDP word.
+/// is the same VOIDP word. A `type T = *mut c_void` dest names the
+/// alias Adt (`TypeDeclKind::Alias`); `rffi.cast(rwinreg.HKEY, int)`
+/// is still `ann_cast_int_to_ptr` onto that VOIDP word.
 pub(in crate::front::mir) fn tyref_is_raw_c_void_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
-    let Some(pointee) = tyref_peel_one_raw_ptr_node(ty, llbc) else {
-        return false;
-    };
-    let Some(node) = type_node_peel_aliases(pointee, llbc) else {
+    tyref_peel_one_raw_ptr_through_aliases(ty, llbc)
+        .is_some_and(|pointee| type_node_is_c_void(pointee, llbc))
+}
+
+/// `void **` (`rffi.py` `VOIDPP`): one raw pointer onto [`tyref_is_raw_c_void_ptr`].
+pub(in crate::front::mir) fn tyref_is_raw_c_void_pp(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_peel_one_raw_ptr_through_aliases(ty, llbc)
+        .is_some_and(|inner| tyref_is_raw_c_void_ptr(&TyRef::Other(inner.clone()), llbc))
+}
+
+fn type_node_is_c_void(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    let Some(node) = type_node_peel_aliases(node, llbc) else {
         return false;
     };
     adt_node_def_id(node)
@@ -7537,10 +7567,31 @@ pub(in crate::front::mir) fn raw_u8_ccharp_bank(ty: &TyRef, llbc: &Llbc) -> Opti
     tyref_is_raw_u8_ptr(ty, llbc).then_some(ValueType::Unsigned)
 }
 
+/// Int-bank of `void *` / `void **` (`rffi.py` `VOIDP` / `VOIDPP`).
+pub(in crate::front::mir) fn raw_c_void_ptr_bank(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    (tyref_is_raw_c_void_ptr(ty, llbc) || tyref_is_raw_c_void_pp(ty, llbc))
+        .then_some(ValueType::Int)
+}
+
 /// Stamp a raw `*u8` cell `CCHARP`. The producing op must be Int-banked.
+/// Dest `*mut c_void` / `*mut *mut c_void` is `VOIDP` / `VOIDPP`
+/// (`rffi.py`); the walker rebuilds `SomePtr` from that stamp so an
+/// `ann_cast_int_to_ptr` arm can union with an extern return.
 pub(in crate::front::mir) fn stamp_raw_u8_ccharp(var: &Variable, ty: &TyRef, llbc: &Llbc) {
     if tyref_is_raw_u8_ptr(ty, llbc) {
         stamp_as_ccharp(var);
+        return;
+    }
+    stamp_raw_c_void_ptr(var, ty, llbc);
+}
+
+/// Stamp a raw `void *` / `void **` cell (`rffi.py` `VOIDP` / `VOIDPP`).
+pub(in crate::front::mir) fn stamp_raw_c_void_ptr(var: &Variable, ty: &TyRef, llbc: &Llbc) {
+    use crate::translator::rtyper::lltypesystem::rffi::{VOIDP, VOIDPP};
+    if tyref_is_raw_c_void_pp(ty, llbc) {
+        var.set_concretetype(Some((*VOIDPP).clone()));
+    } else if tyref_is_raw_c_void_ptr(ty, llbc) {
+        var.set_concretetype(Some((*VOIDP).clone()));
     }
 }
 
@@ -8340,11 +8391,23 @@ pub(in crate::front::mir) fn tyref_is_niche_option(ty: &TyRef, llbc: &Llbc) -> b
     //
     // `Option<*mut PyObjectRef>` expands to `Option<*mut *mut PyObject>`:
     // the pointee is itself a raw pointer, not an ADT, so the layout
-    // gate below misses. It is still one nullable word.
+    // gate below misses. It is still one nullable word when the
+    // innermost pointee is a GC object.
+    //
+    // `*mut *mut c_void` is `rffi.VOIDPP`. The inner pointer may already
+    // be null, so rustc keeps a tag (`tyref_enum_layout_is_pointer_niche`
+    // is false). `tyref_niche_option_payload_paint` and
+    // `push_niche_null_ptr` handle VOIDP only; a VOIDPP Option stays
+    // the tagged aggregate. Peel a `type HKEY = *mut c_void` dest so
+    // `Option<*mut HKEY>` is that same VOIDPP shape.
     if let Some(raw_pointee) = type_node_raw_ptr_pointee(payload, llbc)
         && let Some(stripped) = strip_ty_wrappers(raw_pointee, llbc)
-        && type_node_raw_ptr_pointee(stripped, llbc).is_some()
+        && let Some(stripped) = type_node_peel_aliases(stripped, llbc)
+        && let Some(inner) = type_node_raw_ptr_pointee(stripped, llbc)
     {
+        if type_node_is_c_void(inner, llbc) {
+            return false;
+        }
         return true;
     }
     if let Some(raw_pointee) = type_node_raw_ptr_pointee(payload, llbc)
@@ -9540,6 +9603,27 @@ pub(in crate::front::mir) fn tyref_peel_one_raw_ptr_node<'l>(
         .and_then(serde_json::Value::as_array)
         .and_then(|arr| arr.first())?;
     strip_ty_indirections(pointee, llbc)
+}
+
+/// One RawPtr layer after following `type T = U` (`TypeDeclKind::Alias`).
+///
+/// Call sites name the alias Adt, not `U`. VOIDP / VOIDPP dests spelled
+/// `type HKEY = *mut c_void` have to see the RawPtr before
+/// [`tyref_is_raw_c_void_ptr`] can stamp `rffi.py` `VOIDP`. GCREF is the
+/// same Alias shape (`type GCREF = *mut GCREFOpaque`); dest overlay and
+/// [`tyref_is_raw_pointer`] keep the strip-only peel so that word stays
+/// `llmemory.GCREF`.
+pub(in crate::front::mir) fn tyref_peel_one_raw_ptr_through_aliases<'l>(
+    ty: &'l TyRef,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    let node = type_node_peel_aliases(tyref_node(ty, llbc)?, llbc)?;
+    let pointee = node
+        .as_object()?
+        .get("RawPtr")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())?;
+    type_node_peel_aliases(pointee, llbc)
 }
 
 /// `MutRef<T>` is the cell a GC reference occupies for an `&mut` borrow.

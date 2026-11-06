@@ -7299,6 +7299,97 @@ fn dest_overlay_rejects_lowlevel_string_header() {
     );
 }
 
+/// `*mut ffi_cif` is a raw overlay even when `arg_types` is `*mut *mut
+/// ffi_type` (`rffi.py` `VOIDPP` / `clibffi.py` `FFI_CIFP`). Nested C
+/// pointers are one address word; they must not drop the dest off
+/// `ann_cast_int_to_ptr`.
+#[test]
+fn dest_overlay_accepts_c_struct_with_nested_raw_pointers() {
+    use super::Lowering;
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+    use majit_charon_reader::ullbc::Unstructured;
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let ffi_type = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(&["libffi_sys", "ffi_type"]),
+        "kind": {"Struct": [{
+            "name": "size",
+            "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+            "attr_info": null
+        }]}
+    });
+    let cif = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(&["libffi_sys", "ffi_cif"]),
+        "kind": {"Struct": [
+            {
+                "name": "abi",
+                "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+                "attr_info": null
+            },
+            {
+                "name": "arg_types",
+                "ty": {"RawPtr": [{"RawPtr": [adt_node(1), "Mut"]}, "Mut"]},
+                "attr_info": null
+            },
+            {
+                "name": "rtype",
+                "ty": {"RawPtr": [adt_node(1), "Mut"]},
+                "attr_info": null
+            }
+        ]}
+    });
+    let llbc = llbc_with_types("fixture", vec![cif, ffi_type], vec![]);
+    let body: Unstructured = serde_json::from_value(serde_json::json!({
+        "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+    }))
+    .unwrap();
+    let dont_look_inside = std::collections::HashSet::new();
+    let accum = super::AccumulatorFacts::build(&llbc, &body);
+    let tombstoned_leaves = std::collections::HashSet::new();
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let lowering = Lowering::new(
+        &llbc,
+        "fixture".into(),
+        &body,
+        crate::HostStaticAddrs::default(),
+        &[],
+        None,
+        &dont_look_inside,
+        &tombstoned_leaves,
+        &gc_struct_ids,
+        super::no_immutable_fields(),
+        &std::collections::HashSet::<String>::new(),
+        &accum,
+        &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+        false,
+        false,
+    )
+    .unwrap();
+    let dest = TyRef::Other(serde_json::json!({"RawPtr": [adt_node(0), "Mut"]}));
+    let ptr_ty = lowering
+        .dest_overlay_ptr_lltype(&dest)
+        .expect("ffi_cif dest is a raw overlay");
+    let LowLevelType::Ptr(ptr) = ptr_ty else {
+        panic!("overlay is Ptr(Struct), got {ptr_ty:?}");
+    };
+    let PtrTarget::Struct(st) = &ptr.TO else {
+        panic!("overlay TO is Struct, got {:?}", ptr.TO);
+    };
+    assert_eq!(st._gckind, GcKind::Raw);
+}
+
 #[test]
 fn push_direct_ptradd_emits_the_lltype_helper() {
     let mut graph = FunctionGraph::new("test");
