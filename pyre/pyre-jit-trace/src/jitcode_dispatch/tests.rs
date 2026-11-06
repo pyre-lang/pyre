@@ -9573,7 +9573,7 @@ fn walker_pin_audit_hooks_records_quasiimmut_from_mutate_descr() {
 #[test]
 fn walker_pin_property_fget_records_quasiimmut_from_mutate_descr() {
     // `descriptor.py W_Property._immutable_fields_ = ["w_fget?", ...]`.
-    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
     let obj = pyre_object::descriptor::w_property_new(
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
@@ -9596,7 +9596,7 @@ fn walker_pin_property_fget_records_quasiimmut_from_mutate_descr() {
 
 #[test]
 fn walker_pin_property_fset_records_quasiimmut_from_mutate_descr() {
-    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
     let obj = pyre_object::descriptor::w_property_new(
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
@@ -9619,7 +9619,7 @@ fn walker_pin_property_fset_records_quasiimmut_from_mutate_descr() {
 
 #[test]
 fn walker_pin_property_fdel_records_quasiimmut_from_mutate_descr() {
-    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
     let obj = pyre_object::descriptor::w_property_new(
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
@@ -9643,7 +9643,7 @@ fn walker_pin_property_fdel_records_quasiimmut_from_mutate_descr() {
 #[test]
 fn walker_pin_staticmethod_w_function_records_quasiimmut_from_mutate_descr() {
     // `function.py StaticMethod._immutable_fields_ = ['w_function?']`.
-    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
     let obj = pyre_object::function::w_staticmethod_new(pyre_object::PY_NULL);
     walker_pin_mapdict_records_quasiimmut_from_mutate(
         |wc| {
@@ -9667,7 +9667,7 @@ fn walker_pin_staticmethod_w_function_records_quasiimmut_from_mutate_descr() {
 #[test]
 fn walker_pin_classmethod_w_function_records_quasiimmut_from_mutate_descr() {
     // `function.py ClassMethod._immutable_fields_ = ['w_function?']`.
-    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
     let obj = pyre_object::function::w_classmethod_new(pyre_object::PY_NULL);
     walker_pin_mapdict_records_quasiimmut_from_mutate(
         |wc| {
@@ -9691,7 +9691,7 @@ fn walker_pin_classmethod_w_function_records_quasiimmut_from_mutate_descr() {
 #[test]
 fn walker_pin_ec_w_tracefunc_records_quasiimmut_from_mutate_descr() {
     // `executioncontext.py _immutable_fields_ = ['w_tracefunc?']`.
-    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
     let ec = pyre_interpreter::alloc_execution_context().as_mut_ptr();
     walker_pin_mapdict_records_quasiimmut_from_mutate(
         |wc| {
@@ -9794,7 +9794,7 @@ fn walker_call_trace_hook_reads_guards_null_hooks() {
 #[test]
 fn walker_pin_ec_profilefunc_records_quasiimmut_from_mutate_descr() {
     // `executioncontext.py _immutable_fields_ = ['profilefunc?']`.
-    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
     let ec = pyre_interpreter::alloc_execution_context().as_mut_ptr();
     walker_pin_mapdict_records_quasiimmut_from_mutate(
         |wc| {
@@ -9866,17 +9866,21 @@ fn portal_ops_have_no_ec_qmut_or_gni(ops: &[majit_ir::OpRc]) {
 /// test cannot overwrite a sibling.
 struct WalkerQmutHookGuard {
     saved: majit_metainterp::HostHooks,
-    _lock: parking_lot::MutexGuard<'static, ()>,
+    _lock: parking_lot::ReentrantMutexGuard<'static, ()>,
 }
 
-static WALKER_QMUT_HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+static WALKER_QMUT_HOOK_TEST_LOCK: parking_lot::ReentrantMutex<()> =
+    parking_lot::ReentrantMutex::new(());
 
 impl WalkerQmutHookGuard {
     fn install() -> Self {
         // Lock before `ensure_runtime_thread`: that call holds the GIL
         // until the test thread exits, so taking the GIL first then this
         // mutex deadlocks a sibling that already holds the mutex and
-        // waits for the GIL (`ExecutionContext::new` / `init_typeobjects`).
+        // waits for the GIL (`alloc_execution_context` / `init_typeobjects`).
+        // Reentrant so a test that takes the guard before constructing
+        // (`w_property_new` / `alloc_execution_context`) can still enter
+        // `walker_pin_mapdict_records_quasiimmut_from_mutate`.
         let lock = WALKER_QMUT_HOOK_TEST_LOCK.lock();
         pyre_interpreter::test_hooks::install_hash_hook();
         let saved = majit_metainterp::host_hooks();
