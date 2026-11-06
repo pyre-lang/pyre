@@ -943,14 +943,8 @@ fn dict_lookup_entry_array_id(cc: &crate::call::CallControl) -> Option<String> {
 fn dict_lookup_entry_array(
     cc: &crate::call::CallControl,
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
-    use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Struct};
     let id = dict_lookup_entry_array_id(cc)?;
-    let name =
-        crate::codewriter::call::extract_element_type_from_str(&id).unwrap_or_else(|| id.clone());
-    Some(Array::gc(LowLevelType::Struct(Box::new(Struct::new(
-        &name,
-        vec![],
-    )))))
+    cc.array_from_dump_spelling(&id)
 }
 
 /// pyre's own driver receiver types, and the

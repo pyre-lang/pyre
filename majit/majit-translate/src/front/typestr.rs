@@ -338,6 +338,10 @@ mod tests {
             "majit::object_ref_gcarray"
         );
         assert_eq!(
+            canonical_array_type_id("[str]").as_ref(),
+            "majit::object_ref_gcarray"
+        );
+        assert_eq!(
             canonical_array_type_id("majit::object_ref_gcarray").as_ref(),
             "majit::object_ref_gcarray"
         );

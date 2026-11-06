@@ -35,17 +35,16 @@ pub const LIST_OBJ_ITEMS_ARRAY: &str = OBJECT_REF_GCARRAY_TYPE_ID;
 ///
 /// `[i64]` and `GcArray<i64>` (and the `f64` pair) are the same
 /// `GcArray(Signed)` / `GcArray(Float)` that `cpu.arraydescrof` and
-/// `get_array_descr` key once. `[*mut PyObject]` is the published
-/// field layout of a fixed list of refs (`wrappeditems`); it is the
-/// same `GcArray(OBJECTPTR)` as [`OBJECT_REF_GCARRAY_TYPE_ID`]. Callers
-/// that turn a spelling into a `_cache_array` key or an effectinfo
-/// array index run the spelling through here first. Every other
-/// identity is unchanged.
+/// `get_array_descr` key once. `[*mut PyObject]` and `[str]` are the
+/// published `GcArray(OBJECTPTR)` as [`OBJECT_REF_GCARRAY_TYPE_ID`].
+/// Callers that turn a spelling into a `_cache_array` key or an
+/// effectinfo array index run the spelling through here first. Every
+/// other identity is unchanged.
 pub fn canonical_array_type_id(array_type_id: &str) -> std::borrow::Cow<'_, str> {
     match array_type_id {
         "[i64]" => std::borrow::Cow::Borrowed("GcArray<i64>"),
         "[f64]" => std::borrow::Cow::Borrowed("GcArray<f64>"),
-        "[*mut PyObject]" => std::borrow::Cow::Borrowed(OBJECT_REF_GCARRAY_TYPE_ID),
+        "[str]" | "[*mut PyObject]" => std::borrow::Cow::Borrowed(OBJECT_REF_GCARRAY_TYPE_ID),
         other => std::borrow::Cow::Borrowed(other),
     }
 }
