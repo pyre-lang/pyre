@@ -21872,6 +21872,134 @@ mod tests {
         );
     }
 
+    /// A GC-pointer word on a GC owner keeps `getkind(RESULT)`. Loading it
+    /// from a Signed `int_add` base is `getfield_gc_r` after
+    /// `promote_gc_field_bases` recasts the base (`jtransform.py
+    /// rewrite_op_getfield`: GC owner → `getfield_gc_<kind>`).
+    #[test]
+    fn gc_pointer_field_from_int_add_base_is_getfield_gc_r() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::codewriter::assembler::{Assembler, AssemblerExt};
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::model::FieldDescriptor;
+
+        let owner = "fixture::GcPointerHolder";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let word = crate::layout::target_word_size();
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 2 * word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "hash".into(),
+                        offset: 0,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Signed,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "obj".into(),
+                        offset: word,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Pointer,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_storage(&[crate::StructStorageDescriptor::headerless(owner)]);
+
+        let mut graph = FunctionGraph::new("reload_gc_ptr");
+        let shell = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, shell.clone());
+        let offset = graph
+            .push_op_var(graph.startblock, OpKind::ConstInt(word as i64), true)
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&offset, ConcreteType::Signed);
+        let addr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs: shell,
+                    rhs: offset,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&addr, ConcreteType::Signed);
+        let obj = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: addr,
+                    field: FieldDescriptor::new("obj", Some(owner.into()))
+                        .with_owner_declared_gc(Some(true)),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&obj, ConcreteType::GcRef);
+        graph.set_return(graph.startblock, Some(obj));
+
+        let out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let mut graph = out.graph;
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
+        let obj_read = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .find(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "obj"
+                )
+            })
+            .expect("obj FieldRead survives transform");
+        match &obj_read.kind {
+            OpKind::FieldRead { ty, .. } => {
+                assert!(
+                    matches!(ty, ValueType::Ref(_)),
+                    "GC owner keeps getkind(RESULT) Ref, got {ty:?}"
+                );
+            }
+            other => panic!("expected FieldRead, got {other:?}"),
+        }
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        assert!(
+            asm.insns.keys().any(|k| k.starts_with("getfield_gc_r")),
+            "GC pointer field must assemble getfield_gc_r, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.keys().any(|k| k.starts_with("getfield_gc_i")),
+            "GC pointer field must not assemble getfield_gc_i of a Ref descr, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
     /// `&mut s.tags` on a raw `#[repr(C)]` holder is `int_add` of the
     /// field offset (`rewrite_op_getsubstruct`). The address stays int.
     /// A GC holder declines instead.

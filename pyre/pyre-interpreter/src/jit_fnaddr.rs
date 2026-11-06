@@ -3427,6 +3427,17 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>, Vec<i64>) {
         "pyre_object::try_gc_alloc_nursery_raw",
         pyre_object::gc_hook::try_gc_alloc_nursery_raw,
     );
+    // Young non-moving no-collect twin of the stable arm. `pa2!` publishes
+    // only the funcptr; there is no can_collect knob. Effect info is the
+    // graph walk `try_gc_alloc_stable_raw` already gets (`dont_look_inside`
+    // body, no `mark_canmallocgc`). An unpublished `dont_look_inside` mints
+    // a symbolic `0x7ADD…` hash (RB77 F1).
+    pa2!(
+        &mut entries,
+        "pyre_object::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw",
+        "pyre_object::try_gc_alloc_young_nonmoving_no_collect_raw",
+        pyre_object::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw,
+    );
     // `w_int_gc_alloc` is the collector-heap arm of `w_int_new`, reached from
     // inside a descended body whenever a fold boxes an int. Bind the
     // macro-emitted trampoline rather than the raw fn, for the reason
@@ -5603,9 +5614,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>, Vec<i64>) {
     );
     upa3!(
         &mut entries,
-        "pyre_object::dictmultiobject::dict_entries_value_set_at",
-        "pyre_object::dict_entries_value_set_at",
-        pyre_object::dictmultiobject::dict_entries_value_set_at,
+        "pyre_object::dictmultiobject::dict_entries_setitem_lookup_done",
+        "pyre_object::dict_entries_setitem_lookup_done",
+        pyre_object::dictmultiobject::dict_entries_setitem_lookup_done,
+    );
+    // getfunctionptr of the trampoline graph; the dispatch wrapper residual-calls this.
+    cpa3!(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_setitem_lookup_done_trampoline",
+        "pyre_object::dict_entries_setitem_lookup_done_trampoline",
+        pyre_object::dictmultiobject::__majit_call_target_dict_entries_setitem_lookup_done_trampoline,
     );
     upa3!(
         &mut entries,
@@ -7819,6 +7837,26 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
         (
             "dictmultiobject::W_DICT_OBJECT_SIZE",
             pyre_object::dictmultiobject::W_DICT_OBJECT_SIZE as i64,
+        ),
+        (
+            "dictmultiobject::OBJECT_DICT_STORAGE_SIZE",
+            pyre_object::dictmultiobject::OBJECT_DICT_STORAGE_SIZE as i64,
+        ),
+        (
+            "dictmultiobject::INT_DICT_STORAGE_SIZE",
+            pyre_object::dictmultiobject::INT_DICT_STORAGE_SIZE as i64,
+        ),
+        (
+            "dictmultiobject::BYTES_DICT_STORAGE_SIZE",
+            pyre_object::dictmultiobject::BYTES_DICT_STORAGE_SIZE as i64,
+        ),
+        (
+            "identitydict::IDENTITY_DICT_STORAGE_SIZE",
+            pyre_object::identitydict::IDENTITY_DICT_STORAGE_SIZE as i64,
+        ),
+        (
+            "celldict::MODULE_DICT_STORAGE_SIZE",
+            pyre_object::celldict::MODULE_DICT_STORAGE_SIZE as i64,
         ),
         (
             "specialisedtupleobject::SPECIALISED_TUPLE_II_OBJECT_SIZE",
