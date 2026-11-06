@@ -6863,6 +6863,7 @@ fn portal_helper_call_result_does_not_number_a_call_entry_section() {
             wc.session.borrow_mut().framestack.push(InlineFrame {
                 is_portal: false,
                 w_code: 0,
+                is_being_profiled: false,
                 recursion_greenkey: false,
                 call_id: 0,
                 debug_merge_point_py_pc: None,
