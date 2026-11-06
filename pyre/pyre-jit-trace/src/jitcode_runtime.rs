@@ -872,39 +872,33 @@ pub fn bytecode_only_trace_access_directly_jitcode_index() -> Option<usize> {
 /// `CallControl.get_jitcode` keys by graph (`call.py`); 238 groups share a
 /// last-segment name, so a by-name scan cannot tell two Regular bodies
 /// apart. Restricting to `GraphSpecialization::Regular` plus last segment
-/// is the `CallControl.jitcodes` identity for a look-inside method such as
+/// is the identity for a look-inside method such as
 /// `executioncontext.py call_trace`. `None` when the pipeline has no such
-/// graph (compact tests). Panics on two Regular hits — that is a broken
-/// `IndexMap` invariant, not a lookup miss.
+/// graph (compact tests), or when two Regular graphs share that last
+/// segment: display names are not graph identity.
 fn compute_unique_regular_leaf_jitcode_index(leaf: &str) -> Option<usize> {
-    let mut hits = jitcode_index()
-        .paths
-        .iter()
-        .enumerate()
-        .filter_map(|(i, path)| {
-            let path = path.as_ref()?;
-            (path.specialization == GraphSpecialization::Regular
-                && path.last_segment() == Some(leaf))
+    unique_regular_leaf_index(jitcode_index().paths.iter().map(|p| p.as_ref()), leaf)
+}
+
+fn unique_regular_leaf_index<'a, I>(paths: I, leaf: &str) -> Option<usize>
+where
+    I: IntoIterator<Item = Option<&'a CallPath>>,
+{
+    let mut hits = paths.into_iter().enumerate().filter_map(|(i, path)| {
+        let path = path?;
+        (path.specialization == GraphSpecialization::Regular && path.last_segment() == Some(leaf))
             .then_some(i)
-        });
-    let first = hits.next();
-    if hits.next().is_some() {
-        panic!(
-            "pyre-jit-trace: build-time pipeline has more than one Regular \
-             jitcode ending in `{leaf}`; CallControl.jitcodes keys each graph once"
-        );
-    }
-    first
+    });
+    let first = hits.next()?;
+    hits.next().is_none().then_some(first)
 }
 
 /// Regular `executioncontext.py call_trace` (`pyframe.py execute_frame`
 /// after `enter`). The inline walker records `gettrace`'s promote on the
 /// callee EC in the parent walk; this index is the graph-key identity.
 pub fn call_trace_jitcode_index() -> Option<usize> {
-    *CALL_TRACE_JITCODE_INDEX.get_or_init(|| {
-        compute_unique_regular_leaf_jitcode_index("call_trace")
-            .or_else(|| compute_named_jitcode_index("call_trace"))
-    })
+    *CALL_TRACE_JITCODE_INDEX
+        .get_or_init(|| compute_unique_regular_leaf_jitcode_index("call_trace"))
 }
 
 /// The charon `w_tuple_getitem` body in `ALL_JITCODES`, resolved by the graph
@@ -5231,6 +5225,20 @@ mod tests {
         assert_eq!(
             compute_unique_regular_leaf_jitcode_index("call_trace"),
             Some(idx)
+        );
+    }
+
+    #[test]
+    fn unique_regular_leaf_index_is_none_when_two_regular_graphs_share_the_leaf() {
+        let a = CallPath::from_segments(["owner_a", "call_trace"]);
+        let b = CallPath::from_segments(["owner_b", "call_trace"]);
+        let mut access_direct = CallPath::from_segments(["owner_c", "call_trace"]);
+        access_direct.specialization = GraphSpecialization::AccessDirect;
+        let paths = [Some(&a), Some(&access_direct), Some(&b)];
+        assert_eq!(unique_regular_leaf_index(paths, "call_trace"), None);
+        assert_eq!(
+            unique_regular_leaf_index([Some(&a), Some(&access_direct)], "call_trace"),
+            Some(0)
         );
     }
 
