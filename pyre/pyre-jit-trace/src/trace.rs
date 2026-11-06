@@ -3909,8 +3909,11 @@ fn cash_multi_frame_blackhole(
     // The bracket skips the chain half of `leave`, which this supplies.
     // Convert's `bh_portal_runner_c` levels instead take
     // `finish_per_code_blackhole_level` (`call_jit.rs`).
-    let finish_level = |frame_ptr: i64, _exit: majit_metainterp::blackhole::LevelExit| {
-        crate::state::finish_blackhole_level_frame(frame_ptr);
+    let finish_level = |frame_ptr: i64, exit: majit_metainterp::blackhole::LevelExit| {
+        crate::state::finish_blackhole_level_frame(
+            frame_ptr,
+            matches!(exit, majit_metainterp::blackhole::LevelExit::Exception),
+        );
         if frame_ptr != 0 {
             // `executioncontext.py leave`: `self.topframeref = frame.f_backref`
             // before the caller's residuals run.

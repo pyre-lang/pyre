@@ -1191,22 +1191,23 @@ pub fn jitcode_is_transparent_helper(jitcode_index: i32) -> bool {
 }
 
 /// `PyFrame.frame_finished_execution = True` for a blackhole level that has
-/// left its caller.
+/// left its caller by no-handler exception propagation.
 ///
-/// `pyopcode.py RETURN_VALUE` stores the bit in the jitcode, and the blackhole
-/// replays that `setfield_gc` before `*_return`, so a normal return arrives
-/// here already finished. `pyopcode.py handle_operation_error` performs the
-/// same store on a no-handler propagation, which has no jitcode op, so this
-/// leave hook is what finishes those frames. A second store on the return
-/// path is the same bit. Without the propagation store a frame that outlives
-/// the call — reached through `sys._getframe()` or a retained traceback —
-/// reads back as still executing and refuses `frame.clear()`.
+/// A normal return already carries the bit: `pyopcode.py RETURN_VALUE` stores
+/// it in the jitcode, and the blackhole replays that `setfield_gc` before
+/// `*_return`. A level that leaves by `ref_return` without the bit is a yield
+/// (`interp_jit.py dispatch` `except Yield`) and stays unfinished so `_send_ex`
+/// yields its item. Only the no-handler propagation (`handle_operation_error`),
+/// which has no jitcode op, is finished here.
 ///
 /// A zero pointer is the inlined level whose frame was never materialized, the
 /// state upstream reaches by keeping the MIFrame virtual; there is no object to
 /// mark and no observer that could ask.
-pub fn finish_blackhole_level_frame(frame_ptr: i64) {
+pub fn finish_blackhole_level_frame(frame_ptr: i64, got_exception: bool) {
     if frame_ptr == 0 {
+        return;
+    }
+    if !got_exception {
         return;
     }
     // SAFETY: the caller resolved this from the blackhole level's own

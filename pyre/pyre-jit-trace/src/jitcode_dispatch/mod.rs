@@ -1851,6 +1851,25 @@ fn finish_current_frame_execution<Sym: WalkSym>(
     if !ctx.is_top_level {
         residual_call::record_and_publish_inline_callee_last_instr(ctx, opcode_position);
     }
+    // `pyopcode.py RETURN_VALUE` stores `frame_finished_execution` on `self`
+    // before `raise Return`. A generator-resume sub-walk is portal-shaped, so
+    // that `setfield_gc` of flags is the standard-virtualizable record-only
+    // store (`setfield_gc_via_heapcache` skips the live write when `obj` is
+    // the vable box). `_send_ex` (`generator.py`) reads the live bit after
+    // this `*_return` to tell RETURN from YIELD; without it the RETURN
+    // `w_none` is yielded as an item. `YIELD_VALUE` does not reach here.
+    // Nested helper / Python-callee walks inherit `generator_resume` through
+    // `FbwWalkMode` clone (`run_sub_jitcode_walk_from`); only this body's
+    // own pycode may write the bit (`RETURN_VALUE` on `self`).
+    if let Some(resume) = ctx.fbw_mode.generator_resume {
+        if ctx.inline_w_code() == resume.w_pycode && resume.w_pycode != 0 {
+            let frame = pyre_object::gc_roots::shadow_stack_get(resume.frame_root)
+                as *mut pyre_interpreter::PyFrame;
+            if !frame.is_null() {
+                unsafe { (*frame).set_frame_finished_execution(true) };
+            }
+        }
+    }
     let concrete_frame = if ctx.is_top_level {
         // `fbw_store_token_in_vable` captures a guard snapshot and that
         // capture returns `Err`. Setting the bit before the `?` would leave

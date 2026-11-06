@@ -376,7 +376,12 @@ mod tests {
         unsafe { (*ec.as_mut_ptr()).set_topframeref(std::ptr::from_mut(&mut callee)) };
 
         // `finish_level(callee)`: finished bit plus `leave`'s chain walk.
-        pyre_jit_trace::state::finish_blackhole_level_frame(std::ptr::from_mut(&mut callee) as i64);
+        // Exception leave is the only path this hook stamps; RETURN_VALUE
+        // already stored the bit in the jitcode.
+        pyre_jit_trace::state::finish_blackhole_level_frame(
+            std::ptr::from_mut(&mut callee) as i64,
+            true,
+        );
         unsafe { (*ec.as_mut_ptr()).set_topframeref(callee.f_backref) };
 
         super::reload_live_topframeref_after_blackhole_drive(ec.as_mut_ptr());
@@ -436,7 +441,10 @@ mod tests {
                 majit_metainterp::blackhole::LevelExit::Return(w_value as i64),
             );
             pyre_interpreter::call::set_last_exec_ctx(std::ptr::null_mut());
-            assert!(callee.frame_finished_execution());
+            // Return leave is `interp_jit.py dispatch` `except Yield` as well
+            // as RETURN_VALUE. Only RETURN_VALUE stores the finished bit in
+            // the jitcode; this hook must not stamp it on a Return word.
+            assert!(!callee.frame_finished_execution());
             assert!(
                 std::ptr::eq(ec.topframeref(), std::ptr::from_mut(&mut caller)),
                 "leave publishes the caller as topframeref"
@@ -1670,7 +1678,7 @@ pub(crate) fn finish_per_code_blackhole_level(
     w_exitvalue: PyObjectRef,
     got_exception: bool,
 ) -> Option<i64> {
-    pyre_jit_trace::state::finish_blackhole_level_frame(frame_ptr);
+    pyre_jit_trace::state::finish_blackhole_level_frame(frame_ptr, got_exception);
     if frame_ptr == 0 {
         return None;
     }
@@ -1688,13 +1696,16 @@ pub(crate) fn finish_blackhole_level(
     exit: majit_metainterp::blackhole::LevelExit,
 ) -> Option<i64> {
     if frame_ptr != 0 && frame_ptr != portal_frame {
-        let (w_exitvalue, got_exception) = match exit {
-            majit_metainterp::blackhole::LevelExit::Return(word) => (word as PyObjectRef, false),
+        let (w_exitvalue, got_exception) = match &exit {
+            majit_metainterp::blackhole::LevelExit::Return(word) => (*word as PyObjectRef, false),
             majit_metainterp::blackhole::LevelExit::Exception => (pyre_object::w_none(), true),
         };
         return finish_per_code_blackhole_level(frame_ptr, w_exitvalue, got_exception);
     }
-    pyre_jit_trace::state::finish_blackhole_level_frame(frame_ptr);
+    pyre_jit_trace::state::finish_blackhole_level_frame(
+        frame_ptr,
+        matches!(exit, majit_metainterp::blackhole::LevelExit::Exception),
+    );
     if !ec.is_null() && frame_ptr != 0 {
         unsafe {
             (*ec).set_topframeref((*(frame_ptr as *mut PyFrame)).f_backref);

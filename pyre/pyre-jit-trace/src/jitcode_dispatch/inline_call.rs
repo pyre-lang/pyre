@@ -18840,12 +18840,17 @@ fn residualize_generator_resume_foriter<Sym: WalkSym>(
     executed_effects_before: usize,
     pre_emit_pos: majit_metainterp::recorder::TracePosition,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    // The body walk recorded ops and can minor-collect. Rollback through
-    // the forwarded root, not a pointer copied before that walk.
-    fbw_durable_frame_rollback_one(live_generator_frame(frame_root) as usize);
-    if fbw_executed_effect_count() != executed_effects_before {
+    // `convert_and_run_from_pyjitpl` continues this generator frame from the
+    // abort pc (`blackhole.py`). Keep the walked stack / `last_instr` when
+    // effects already landed or a convert image is latched; restoring the
+    // parked yield first makes `_send_ex` (`generator.py`) look finished to
+    // FOR_ITER while the generator is still suspended. Residualize (no
+    // effects) still restores so `jit_next` resumes from that yield.
+    // Re-read the frame through its root: the body walk can minor-collect.
+    if abort_blackhole_latched() || fbw_executed_effect_count() != executed_effects_before {
         return Err(DispatchError::callee_inline_unsupported(op_pc));
     }
+    fbw_durable_frame_rollback_one(live_generator_frame(frame_root) as usize);
     ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
     ctx.trace_ctx.heap_cache_mut().reset();
     Ok(None)
@@ -19514,10 +19519,51 @@ fn walk_generator_resume<Sym: WalkSym>(
                     op.pc, resume_marker, yield_marker,
                 );
             }
-            fbw_durable_frame_rollback_one(live_generator_frame(frame_root) as usize);
-            if fbw_executed_effect_count() != executed_effects_before {
+            // Same split as `residualize_generator_resume_foriter` and as
+            // `TraceTooLong` above: an effectful abort is
+            // `run_blackhole_interp_to_cancel_tracing`, which drives the
+            // frame the walker left. Restoring the parked yield is only for
+            // the no-effect residual so `jit_next` can send again.
+            //
+            // A kept-stack branch abort already selected the taken link
+            // (`opimpl_goto_if_not`). Convert would resume at the guard pc
+            // and re-run the branch without the truth operand. The #32
+            // portal flush cannot write this generator frame
+            // (`abort_in_subwalk`). `jit_next` is `_send_ex`, so restore
+            // the parked yield and residualize (`do_residual_call`).
+            if matches!(
+                error,
+                DispatchError::BranchGuardUnrestorableKeptStackPermanent { .. }
+                    | DispatchError::BranchGuardKeptStackUnsupported { .. }
+            ) {
+                // Convert would resume at the guard pc and re-run the
+                // branch without the truth operand. `jit_next` is
+                // `_send_ex`: it pushes the sent value and continues
+                // after a yield, so the frame has to be back at that
+                // yield. A residual store in the post-yield body already
+                // mutated the live container; restoring `last_instr` /
+                // vsd and sending again re-runs that store.
+                if fbw_debug_abort_enabled() {
+                    let gf = live_generator_frame(frame_root);
+                    if !gf.is_null() {
+                        eprintln!(
+                            "[gen-resume] kept-stack residualize-at-yield last={} vsd={} \
+                             err={error:?}",
+                            unsafe { (*gf).last_instr },
+                            unsafe { (*gf).valuestackdepth },
+                        );
+                    }
+                }
+                discard_staged_abort(ctx.session);
+                fbw_durable_frame_rollback_one(live_generator_frame(frame_root) as usize);
+                ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+                ctx.trace_ctx.heap_cache_mut().reset();
+                return Ok(None);
+            }
+            if abort_blackhole_latched() || fbw_executed_effect_count() != executed_effects_before {
                 return Err(error);
             }
+            fbw_durable_frame_rollback_one(live_generator_frame(frame_root) as usize);
             ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
             ctx.trace_ctx.heap_cache_mut().reset();
             return Ok(None);
@@ -23827,7 +23873,14 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         frame_state,
         concrete_registers_i: callee_concrete_i,
 
-        inline_callee_consts: None,
+        // The innermost MIFrame's jitcode is the body this sub-walk executes (`pyjitpl.py` `newframe(jitcode)`).
+        inline_callee_consts: if is_python_portal {
+            sub_body.jitcode_index.map(|index| InlineCalleeConsts {
+                jitcode_index: index as i32,
+            })
+        } else {
+            None
+        },
         _inline_frame: None,
         fbw_mode,
         session: ctx.session,
