@@ -154,6 +154,14 @@ pub(crate) unsafe fn reinit_fork_tables_after_fork() {
 // `_in_next` and is refused as interp_scandir.py requires.
 static SCANDIR_IN_NEXT_SERIALIZER: Mutex<()> = Mutex::new(());
 
+/// `interp_posix.py DEFAULT_DIR_FD` — `rposix.AT_FDCWD` when the host
+/// header defines it, else `-100`. `_unwrap_dirfd` maps `None` to it, so
+/// an explicit `dir_fd=AT_FDCWD` is the same as an omitted one.
+#[cfg(unix)]
+const DEFAULT_DIR_FD: i32 = libc::AT_FDCWD;
+#[cfg(not(unix))]
+const DEFAULT_DIR_FD: i32 = -100;
+
 /// os.cpu_count() -> int | None — `interp_posix.cpu_count` answers None when
 /// `rposix._cpu_count() <= 0`.
 ///
@@ -3207,21 +3215,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     /// (`interp_posix.py`): `None` and an absent argument are the same
     /// `DEFAULT_DIR_FD`, and the value is converted before the platform is
     /// reported, so a wrongly typed one is a TypeError even on a build that
-    /// carries no `*at` call to honour it.
+    /// carries no `*at` call to honour it. `_unwrap_dirfd` is the conversion;
+    /// `_DirFD_Unavailable.unwrap` is the `have=false` arm.
     fn dir_fd_kwarg(
         value: Option<pyre_object::PyObjectRef>,
         have: bool,
-    ) -> Result<Option<i32>, crate::PyError> {
-        match value {
-            Some(v) if !unsafe { pyre_object::is_none(v) } => {
-                let fd = unwrap_fd(v, "integer or None")?;
-                if !have {
-                    return Err(dir_fd_unavailable());
-                }
-                Ok(Some(fd))
-            }
-            _ => Ok(None),
+    ) -> Result<i32, crate::PyError> {
+        let dir_fd = match value {
+            Some(v) if !unsafe { pyre_object::is_none(v) } => unwrap_fd(v, "integer or None")?,
+            _ => DEFAULT_DIR_FD,
+        };
+        if dir_fd != DEFAULT_DIR_FD && !have {
+            return Err(dir_fd_unavailable());
         }
+        Ok(dir_fd)
     }
 
     /// Keyword-only tail of a bound `Signature` scope, as filled slots
@@ -3556,14 +3563,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 // `openat` resolves the name against the descriptor;
                                 // the plain `open` is what a name without one means
                                 // (`interp_posix.py`).
-                                if let Some(dir_fd) = _dir_fd {
+                                if _dir_fd != DEFAULT_DIR_FD {
                                     let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                                         .map_err(|_| {
                                         crate::PyError::value_error("embedded null in path")
                                     })?;
                                     let fd = unsafe {
                                         majit_rlib::rposix::c_openat(
-                                            dir_fd,
+                                            _dir_fd,
                                             c_path.as_ptr(),
                                             flags,
                                             mode as _,
@@ -4064,11 +4071,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             let errno = {
                 #[cfg(not(feature = "sandbox"))]
                 {
-                    if let Some(dir_fd) = _dir_fd {
+                    if _dir_fd != DEFAULT_DIR_FD {
                         let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                             .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                         let ret =
-                            unsafe { majit_rlib::rposix::c_unlinkat(dir_fd, c_path.as_ptr(), 0) };
+                            unsafe { majit_rlib::rposix::c_unlinkat(_dir_fd, c_path.as_ptr(), 0) };
                         if ret < 0 {
                             Some(majit_rlib::rposix::get_saved_errno())
                         } else {
@@ -4186,22 +4193,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         buf.try_reserve_exact(bufsize)
                             .map_err(|_| crate::PyError::memory_error(""))?;
                         buf.resize(bufsize, 0);
-                        let res = match _dir_fd {
-                            Some(dir_fd) => unsafe {
+                        let res = if _dir_fd != DEFAULT_DIR_FD {
+                            unsafe {
                                 majit_rlib::rposix::c_readlinkat(
-                                    dir_fd,
+                                    _dir_fd,
                                     c_path.as_ptr(),
                                     buf.as_mut_ptr().cast(),
                                     bufsize,
                                 )
-                            },
-                            None => unsafe {
+                            }
+                        } else {
+                            unsafe {
                                 majit_rlib::rposix::c_readlink(
                                     c_path.as_ptr(),
                                     buf.as_mut_ptr().cast(),
                                     bufsize,
                                 )
-                            },
+                            }
                         };
                         if res < 0 {
                             return Err(fs_err_with_filename(
@@ -4281,14 +4289,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let errno = {
                         #[cfg(not(feature = "sandbox"))]
                         {
-                            if let Some(dir_fd) = _dir_fd {
+                            if _dir_fd != DEFAULT_DIR_FD {
                                 let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                                     .map_err(|_| {
                                         crate::PyError::value_error("embedded null in path")
                                     })?;
                                 let ret = unsafe {
                                     majit_rlib::rposix::c_mkdirat(
-                                        dir_fd,
+                                        _dir_fd,
                                         c_path.as_ptr(),
                                         _mode as libc::mode_t,
                                     )
@@ -4374,33 +4382,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // (`rposix.unlinkat` `removedir=True`). The no-descriptor
                     // call is `rposix.c_rmdir`, which releases the GIL and saves
                     // errno.
-                    let (ret, err) = match _dir_fd {
-                        Some(dir_fd) => {
-                            let ret = unsafe {
-                                majit_rlib::rposix::c_unlinkat(
-                                    dir_fd,
-                                    c_path.as_ptr(),
-                                    libc::AT_REMOVEDIR,
-                                )
-                            };
-                            (
-                                ret,
-                                std::io::Error::from_raw_os_error(
-                                    majit_rlib::rposix::get_saved_errno(),
-                                ),
+                    let ret = if _dir_fd != DEFAULT_DIR_FD {
+                        unsafe {
+                            majit_rlib::rposix::c_unlinkat(
+                                _dir_fd,
+                                c_path.as_ptr(),
+                                libc::AT_REMOVEDIR,
                             )
                         }
-                        None => {
-                            let ret = unsafe { majit_rlib::rposix::c_rmdir(c_path.as_ptr()) };
-                            (
-                                ret,
-                                std::io::Error::from_raw_os_error(
-                                    majit_rlib::rposix::get_saved_errno(),
-                                ),
-                            )
-                        }
+                    } else {
+                        unsafe { majit_rlib::rposix::c_rmdir(c_path.as_ptr()) }
                     };
                     if ret < 0 {
+                        let err = std::io::Error::from_raw_os_error(
+                            majit_rlib::rposix::get_saved_errno(),
+                        );
                         return Err(fs_err_with_filename(err, path.w_path()));
                     }
                 }
@@ -4451,19 +4447,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         kwargs = reload_bound_kwonly(kw_base, kw_n);
         let dst = crate::gateway::fsencode_path_named_w(roots.get(pos_base + 1), name, "dst")?;
         kwargs = reload_bound_kwonly(kw_base, kw_n);
-        let dir_fd = |name: &str| -> Result<Option<i32>, crate::PyError> {
-            match bound_kwonly_named(&kwargs, kwonly, name) {
-                // interp_posix.py `_unwrap_dirfd` — a non-`None` value
-                // goes through `unwrap_fd` with `allowed_types="integer or
-                // None"`.
-                Some(v) if !unsafe { pyre_object::is_none(v) } => {
-                    Ok(Some(unwrap_fd(v, "integer or None")?))
-                }
-                _ => Ok(None),
-            }
-        };
-        let src_fd = dir_fd("src_dir_fd")?;
-        let dst_fd = dir_fd("dst_dir_fd")?;
+        let src_fd = dir_fd_kwarg(
+            bound_kwonly_named(&kwargs, kwonly, "src_dir_fd"),
+            HAVE_RENAMEAT,
+        )?;
+        let dst_fd = dir_fd_kwarg(
+            bound_kwonly_named(&kwargs, kwonly, "dst_dir_fd"),
+            HAVE_RENAMEAT,
+        )?;
         // `rposix.c_rename` is the call with no directory descriptor.
         // `rposix.c_renameat` is the call when either side has one. On unix
         // `replace` is the same syscall. Both release the GIL and save errno.
@@ -4473,16 +4464,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 .map_err(|_| crate::PyError::value_error("embedded null in src"))?;
             let dst_c = std::ffi::CString::new(dst.as_bytes.as_slice())
                 .map_err(|_| crate::PyError::value_error("embedded null in dst"))?;
-            let ret = if src_fd.is_none() && dst_fd.is_none() {
+            let ret = if src_fd == DEFAULT_DIR_FD && dst_fd == DEFAULT_DIR_FD {
                 unsafe { majit_rlib::rposix::c_rename(src_c.as_ptr(), dst_c.as_ptr()) }
             } else {
                 unsafe {
-                    majit_rlib::rposix::c_renameat(
-                        src_fd.unwrap_or(libc::AT_FDCWD),
-                        src_c.as_ptr(),
-                        dst_fd.unwrap_or(libc::AT_FDCWD),
-                        dst_c.as_ptr(),
-                    )
+                    majit_rlib::rposix::c_renameat(src_fd, src_c.as_ptr(), dst_fd, dst_c.as_ptr())
                 }
             };
             if ret < 0 {
@@ -4497,7 +4483,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         }
         #[cfg(not(unix))]
         {
-            if src_fd.is_some() || dst_fd.is_some() {
+            if src_fd != DEFAULT_DIR_FD || dst_fd != DEFAULT_DIR_FD {
                 return Err(crate::PyError::not_implemented(
                     "dir_fd unavailable on this platform",
                 ));
@@ -4654,24 +4640,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             }
             None => true,
         };
-        let dir_fd = match bound_kwonly_named(&kwargs, kwonly, "dir_fd").and_then(present) {
+        let dir_fd = {
             // interp_posix.py types `dir_fd` as `DirFD(...)`, whose
-            // `unwrap` is `_unwrap_dirfd` (:274-278).
-            Some(v) => {
-                let roots = pyre_object::gc_roots::push_roots();
-                let base = roots.pin_roots(&[
-                    ns.unwrap_or(pyre_object::PY_NULL),
-                    times.unwrap_or(pyre_object::PY_NULL),
-                ]);
-                let r = unwrap_fd(v, "integer or None");
-                let w = roots.get(base);
-                ns = if w.is_null() { None } else { Some(w) };
-                let w = roots.get(base + 1);
-                times = if w.is_null() { None } else { Some(w) };
-                drop(roots);
-                Some(r?)
-            }
-            None => None,
+            // `unwrap` is `_unwrap_dirfd`.
+            let roots = pyre_object::gc_roots::push_roots();
+            let base = roots.pin_roots(&[
+                ns.unwrap_or(pyre_object::PY_NULL),
+                times.unwrap_or(pyre_object::PY_NULL),
+            ]);
+            let r = dir_fd_kwarg(
+                bound_kwonly_named(&kwargs, kwonly, "dir_fd"),
+                HAVE_UTIMENSAT,
+            );
+            let w = roots.get(base);
+            ns = if w.is_null() { None } else { Some(w) };
+            let w = roots.get(base + 1);
+            times = if w.is_null() { None } else { Some(w) };
+            drop(roots);
+            r?
         };
 
         let unpack_two =
@@ -4844,12 +4830,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         };
 
         if path.is_fd {
-            // interp_posix.py:1893-1900 — both modifiers reinterpret a *name*,
-            // and a descriptor is not one. 3.14, which the parity suite reads
-            // as the oracle, words the first "can't specify dir_fd without
-            // matching path" where `interp_posix.py:1895` says "can't specify
-            // both dir_fd and fd".
-            if dir_fd.is_some() {
+            // Both modifiers reinterpret a *name*, and a descriptor is not
+            // one. 3.15: "can't specify dir_fd without matching path".
+            // `interp_posix.py` `utime`: "can't specify both dir_fd and fd".
+            if dir_fd != DEFAULT_DIR_FD {
                 return Err(crate::PyError::value_error(
                     "utime: can't specify dir_fd without matching path",
                 ));
@@ -4864,7 +4848,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
 
         #[cfg(all(windows, feature = "host_env"))]
         {
-            if dir_fd.is_some() || !follow_symlinks {
+            if dir_fd != DEFAULT_DIR_FD || !follow_symlinks {
                 return Err(crate::PyError::not_implemented(
                     "utime: dir_fd and follow_symlinks=False are unavailable on this platform",
                 ));
@@ -4913,12 +4897,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             };
             let times = [timespec_of(access, now), timespec_of(modified, now)];
             let error = unsafe {
-                majit_rlib::rposix::c_utimensat(
-                    dir_fd.unwrap_or(libc::AT_FDCWD),
-                    c_path.as_ptr(),
-                    times.as_ptr(),
-                    flag,
-                )
+                majit_rlib::rposix::c_utimensat(dir_fd, c_path.as_ptr(), times.as_ptr(), flag)
             };
             if error < 0 {
                 return Err(io_err_with_filename(
@@ -5863,29 +5842,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         kwargs = reload_bound_kwonly(kw_base, kw_n);
         let path = path?;
         // `stat`/`lstat` type `dir_fd` as `DirFD(rposix.HAVE_FSTATAT)`
-        // (`interp_posix.py`), whose `unwrap` is `_unwrap_dirfd`
-        // (:274-278).
-        let dir_fd = match bound_kwonly_named(&kwargs, kwonly, "dir_fd")
-            .filter(|&v| !unsafe { pyre_object::is_none(v) })
-        {
-            Some(v) => {
-                let roots = pyre_object::gc_roots::push_roots();
-                let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
-                let fd = unwrap_fd(v, "integer or None");
-                kwargs = reload_bound_kwonly(kw_base, kw_n);
-                drop(roots);
-                let fd = fd?;
-                // `DirFD(available=False)` is `_DirFD_Unavailable`
-                // (:285-292), which turns a non-default `dir_fd` away while
-                // unwrapping — so where the platform has no `fstatat` the
-                // answer is this, not the descriptor conflict `do_stat`
-                // would reach first.
-                if !HAVE_FSTATAT {
-                    return Err(dir_fd_unavailable());
-                }
-                Some(fd)
-            }
-            None => None,
+        // (`interp_posix.py`), whose `unwrap` is `_unwrap_dirfd`.
+        let dir_fd = {
+            let roots = pyre_object::gc_roots::push_roots();
+            let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
+            let fd = dir_fd_kwarg(bound_kwonly_named(&kwargs, kwonly, "dir_fd"), HAVE_FSTATAT);
+            kwargs = reload_bound_kwonly(kw_base, kw_n);
+            drop(roots);
+            fd?
         };
         let follow_symlinks = match bound_kwonly_named(&kwargs, kwonly, "follow_symlinks") {
             Some(v) => crate::baseobjspace::is_true(v)?,
@@ -5900,10 +5864,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // exist a descriptor passed with `dir_fd` reports the platform rather
         // than the conflict.
         if path.is_fd {
-            if dir_fd.is_some() {
-                // 3.14 words this "can't specify dir_fd without matching
-                // path"; `interp_posix.py:639` says "can't specify both
-                // dir_fd and fd". The parity suite's oracle is CPython.
+            if dir_fd != DEFAULT_DIR_FD {
+                // 3.15: "can't specify dir_fd without matching path".
+                // `interp_posix.py` `do_stat`: "can't specify both dir_fd and fd".
                 return Err(crate::PyError::value_error(format!(
                     "{name}: can't specify dir_fd without matching path"
                 )));
@@ -5915,9 +5878,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             }
             return fstat_fd(path.as_fd);
         }
-        match dir_fd {
-            Some(dir_fd) => stat_at(name, &path, dir_fd, follow_symlinks),
-            None => stat_path(&path, follow_symlinks),
+        if dir_fd != DEFAULT_DIR_FD {
+            stat_at(name, &path, dir_fd, follow_symlinks)
+        } else {
+            stat_path(&path, follow_symlinks)
         }
     }
 
@@ -10855,24 +10819,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // which releases the GIL and saves errno.
                     // interp_posix.py `mkfifo`: retry on EINTR.
                     loop {
-                        let (r, errno) = match dir_fd {
-                            Some(dir_fd) => {
-                                let r = unsafe {
-                                    majit_rlib::rposix::c_mkfifoat(dir_fd, c_path.as_ptr(), mode)
-                                };
-                                (r, majit_rlib::rposix::get_saved_errno())
-                            }
-                            None => {
-                                let r =
-                                    unsafe { majit_rlib::rposix::c_mkfifo(c_path.as_ptr(), mode) };
-                                (r, majit_rlib::rposix::get_saved_errno())
-                            }
+                        let r = if dir_fd != DEFAULT_DIR_FD {
+                            unsafe { majit_rlib::rposix::c_mkfifoat(dir_fd, c_path.as_ptr(), mode) }
+                        } else {
+                            unsafe { majit_rlib::rposix::c_mkfifo(c_path.as_ptr(), mode) }
                         };
                         if r >= 0 {
                             break;
                         }
                         crate::builtins::eintr_retry_with(
-                            std::io::Error::from_raw_os_error(errno),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             |e| io_err_with_filename(e, path.w_path()),
                         )?;
                     }
@@ -10945,34 +10901,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // which releases the GIL and saves errno.
                     // interp_posix.py `mknod`: retry on EINTR.
                     loop {
-                        let (r, errno) = match dir_fd {
-                            Some(dir_fd) => {
-                                let r = unsafe {
-                                    majit_rlib::rposix::c_mknodat(
-                                        dir_fd,
-                                        c_path.as_ptr(),
-                                        mode,
-                                        device,
-                                    )
-                                };
-                                (r, majit_rlib::rposix::get_saved_errno())
+                        let r = if dir_fd != DEFAULT_DIR_FD {
+                            unsafe {
+                                majit_rlib::rposix::c_mknodat(dir_fd, c_path.as_ptr(), mode, device)
                             }
-                            None => {
-                                let r = unsafe {
-                                    majit_rlib::rposix::c_mknod(
-                                        c_path.as_ptr(),
-                                        mode,
-                                        device as libc::dev_t,
-                                    )
-                                };
-                                (r, majit_rlib::rposix::get_saved_errno())
+                        } else {
+                            unsafe {
+                                majit_rlib::rposix::c_mknod(
+                                    c_path.as_ptr(),
+                                    mode,
+                                    device as libc::dev_t,
+                                )
                             }
                         };
                         if r >= 0 {
                             break;
                         }
                         crate::builtins::eintr_retry_with(
-                            std::io::Error::from_raw_os_error(errno),
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                             |e| io_err_with_filename(e, path.w_path()),
                         )?;
                     }
@@ -11419,13 +11365,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         .map_err(|_| crate::PyError::value_error("embedded null in dst"))?;
                     // `rposix.c_symlink` is the no-descriptor call.
                     // `rposix.c_symlinkat` resolves the name against `dir_fd`.
-                    let ret = match _dir_fd {
-                        Some(dir_fd) => unsafe {
-                            majit_rlib::rposix::c_symlinkat(c_src.as_ptr(), dir_fd, c_dst.as_ptr())
-                        },
-                        None => unsafe {
-                            majit_rlib::rposix::c_symlink(c_src.as_ptr(), c_dst.as_ptr())
-                        },
+                    let ret = if _dir_fd != DEFAULT_DIR_FD {
+                        unsafe {
+                            majit_rlib::rposix::c_symlinkat(c_src.as_ptr(), _dir_fd, c_dst.as_ptr())
+                        }
+                    } else {
+                        unsafe { majit_rlib::rposix::c_symlink(c_src.as_ptr(), c_dst.as_ptr()) }
                     };
                     if ret < 0 {
                         // `os_symlink_impl` reports through `path_error2`, so the
@@ -11490,25 +11435,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // descriptor the platform can honour resolves the name against
                     // it, and one it cannot is refused rather than silently
                     // resolved against the process's own directory.
-                    let dir_fd = |kwargs: &[Option<pyre_object::PyObjectRef>],
-                                  name: &str|
-                     -> Result<i32, crate::PyError> {
-                        match bound_kwonly_named(kwargs, kwonly, name)
-                            .filter(|&w| !unsafe { pyre_object::is_none(w) })
-                        {
-                            Some(w) => unwrap_fd(w, "integer or None"),
-                            None => Ok(libc::AT_FDCWD),
-                        }
-                    };
                     let roots = pyre_object::gc_roots::push_roots();
                     let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
-                    let src_dir_fd = dir_fd(&kwargs, "src_dir_fd");
+                    let src_dir_fd = dir_fd_kwarg(
+                        bound_kwonly_named(&kwargs, kwonly, "src_dir_fd"),
+                        HAVE_LINKAT,
+                    );
                     kwargs = reload_bound_kwonly(kw_base, kw_n);
                     drop(roots);
                     let src_dir_fd = src_dir_fd?;
                     let roots = pyre_object::gc_roots::push_roots();
                     let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
-                    let dst_dir_fd = dir_fd(&kwargs, "dst_dir_fd");
+                    let dst_dir_fd = dir_fd_kwarg(
+                        bound_kwonly_named(&kwargs, kwonly, "dst_dir_fd"),
+                        HAVE_LINKAT,
+                    );
                     kwargs = reload_bound_kwonly(kw_base, kw_n);
                     drop(roots);
                     let dst_dir_fd = dst_dir_fd?;
@@ -11628,7 +11569,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             // call is `rposix.c_chmod`, which releases the GIL and saves
             // errno. `c_fchmodat` releases the GIL and saves errno.
             // The mode argument is `mode_t`.
-            let use_at = dir_fd.is_some() || !follow_symlinks;
+            let use_at = dir_fd != DEFAULT_DIR_FD || !follow_symlinks;
             loop {
                 let ret = if use_at {
                     let flag = if follow_symlinks {
@@ -11638,7 +11579,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     };
                     unsafe {
                         majit_rlib::rposix::c_fchmodat(
-                            dir_fd.unwrap_or(libc::AT_FDCWD),
+                            dir_fd,
                             c_path.as_ptr(),
                             mode as libc::mode_t,
                             flag,
@@ -11853,7 +11794,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // file, so neither modifier, which each reinterpret a name, can
                 // apply. Upstream spells the second "cannnot"; 3.14, which the
                 // parity suite reads as the oracle, spells it "cannot".
-                if dir_fd.is_some() {
+                if dir_fd != DEFAULT_DIR_FD {
                     return Err(crate::PyError::value_error(format!(
                         "{name}: can't specify both dir_fd and fd"
                     )));
@@ -11882,7 +11823,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             // set. A directory descriptor selects `rposix.fchownat`.
             // `rposix.c_chown` and `rposix.c_lchown` release the GIL and save
             // errno.
-            if dir_fd.is_none() {
+            if dir_fd == DEFAULT_DIR_FD {
                 let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                 let invoke = || {
@@ -11922,7 +11863,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
             let raw = {
                 use std::os::fd::AsRawFd;
-                fd_borrow(dir_fd.unwrap())?.as_raw_fd()
+                fd_borrow(dir_fd)?.as_raw_fd()
             };
             let flag = if follow_symlinks {
                 0
@@ -14263,7 +14204,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // name resolves against a descriptor, the final symlink must
                 // not be followed, or the effective ids are the ones to ask
                 // about. `rposix.py` is the flag mapping.
-                let allowed = if dir_fd.is_some() || !follow_symlinks || effective_ids {
+                let allowed = if dir_fd != DEFAULT_DIR_FD || !follow_symlinks || effective_ids {
                     let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                         .map_err(|_| crate::PyError::value_error("embedded null character"))?;
                     let mut flags = 0;
@@ -14274,12 +14215,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         flags |= libc::AT_EACCESS;
                     }
                     unsafe {
-                        majit_rlib::rposix::c_faccessat(
-                            dir_fd.unwrap_or(libc::AT_FDCWD),
-                            c_path.as_ptr(),
-                            mode,
-                            flags,
-                        ) == 0
+                        majit_rlib::rposix::c_faccessat(dir_fd, c_path.as_ptr(), mode, flags) == 0
                     }
                 } else {
                     // interp_posix.py `access`: `except OSError as e: raise wrap_oserror2(...)`.
@@ -14906,12 +14842,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // `_DirFD_Unavailable.unwrap` (`interp_posix.py`)
                     // converts first and reports the platform second, so a wrongly
                     // typed value is a TypeError here as well.
-                    if let Some(w) = bound_kwonly_named(&kwargs, kwonly, "dir_fd")
-                        .filter(|&w| !unsafe { pyre_object::is_none(w) })
-                    {
-                        unwrap_fd(w, "integer or None")?;
-                        return Err(dir_fd_unavailable());
-                    }
+                    dir_fd_kwarg(bound_kwonly_named(&kwargs, kwonly, "dir_fd"), false)?;
                     let path = crate::gateway::fsencode_path_or_fd_w(
                         bound[0].expect("path is required"),
                         "chmod",
@@ -15051,18 +14982,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         2,
                         &["src_dir_fd", "dst_dir_fd", "follow_symlinks"],
                     )?;
-                    // No `linkat` here, so a descriptor to resolve either name
-                    // against is refused rather than ignored — and the message
-                    // names both arguments, the way `argument_unavailable_error`
-                    // spells this one.
-                    if ["src_dir_fd", "dst_dir_fd"].iter().any(|name| {
-                        bound_kwonly_named(&kwargs, kwonly, name)
-                            .is_some_and(|w| !unsafe { pyre_object::is_none(w) })
-                    }) {
-                        return Err(crate::PyError::not_implemented(
-                            "link: src_dir_fd and dst_dir_fd unavailable on this platform",
-                        ));
-                    }
+                    // No `linkat` here, so a non-default descriptor to resolve
+                    // either name against is refused (`DirFD(HAVE_LINKAT)` /
+                    // `_DirFD_Unavailable`). The default sentinel is the
+                    // omitted-argument spelling.
+                    dir_fd_kwarg(bound_kwonly_named(&kwargs, kwonly, "src_dir_fd"), false)?;
+                    dir_fd_kwarg(bound_kwonly_named(&kwargs, kwonly, "dst_dir_fd"), false)?;
                     // `CreateHardLinkW` links the symlink `src` names rather than
                     // what it points at, so asking for the other behaviour is
                     // refused.  Leaving the argument out is not asking: the
