@@ -53,25 +53,6 @@ fn inline_recursion_count(frames: &[InlineFrame], w_code: usize) -> usize {
         .count()
 }
 
-/// Whether the callee portal is already represented by any live inline
-/// frame, independently of `MIFrame.greenkey`.
-///
-/// `_opimpl_recursive_call` counts matching greenkeys only. A frame rebuilt
-/// by `resume.rebuild_from_resumedata` has a `None` greenkey (so it
-/// contributes zero to the max-unroll count) but a call back into the same
-/// portal is still recursive: this predicate is the presence test used by
-/// the self-recursive-into-a-foreign-caller decline.
-pub(crate) fn fbw_recursive_portal_present<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    w_code: usize,
-) -> bool {
-    recursive_portal_present(&ctx.session.borrow().framestack, w_code)
-}
-
-fn recursive_portal_present(frames: &[InlineFrame], w_code: usize) -> bool {
-    frames.iter().any(|frame| frame.w_code == w_code)
-}
-
 #[cfg(test)]
 mod recursion_depth_policy_tests {
     use super::*;
@@ -99,7 +80,6 @@ mod recursion_depth_policy_tests {
     fn resumed_frames_without_greenkeys_do_not_count_as_recursive_unrolls() {
         let frames = [frame(42, true), frame(42, false), frame(7, true)];
         assert_eq!(inline_recursion_count(&frames, 42), 1);
-        assert!(recursive_portal_present(&frames, 42));
     }
 
     #[test]
@@ -3879,90 +3859,23 @@ thread_local! {
     /// trace executes that residual once on later iterations, so the generic
     /// nested-replay decline does not apply to this resolved descriptor path.
     pub(crate) static EXCEPTION_STRING_INLINE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Code keys of the callees [`fbw_decline_inline_callee`] named.  The
-    /// inline callsite declines them from then on, so the call residualizes
-    /// and the enclosing trace never re-enters the identical abort.
-    ///
-    /// This is `disable_noninlinable_function` (`warmstate.py`, which sets
-    /// `JC_DONT_TRACE_HERE` = "do not inline calls to this function"): upstream
-    /// answers an abort attributable to one inlined callee by denying THAT
-    /// callee and retracing the enclosing loop, not by penalising the loop
-    /// (`pyjitpl.py:2818-2828`).  Like the upstream flag the set has no removal
-    /// path — the hazard is a static property of the callee's `CodeObject`.
-    ///
-    /// Keying on the `CodeObject` alone is the full key for this decision, not
-    /// a truncation of one.  The flag is consumed by `can_inline_callable`
-    /// (`warmstate.py`), whose only caller is `_opimpl_recursive_call`
-    /// (`pyjitpl.py`) — it passes the CALLEE's green args, and a
-    /// callee reached through a CALL is always entered at its own entry, so the
-    /// `next_instr` component is constant and `pycode` carries the whole
-    /// decision.  The same holds here: the deny is recorded and queried for an
-    /// inline frame pushed at a CALL boundary (`inline_call.rs`), never for a
-    /// mid-body resume.
-    ///
-    /// Per-thread for the same reason as [`crate::trace::fbw_declined`]'s
-    /// `FBW_DECLINED_KEYS`: pyre's walk state is
-    /// per-thread, and an inline hazard observed while tracing is a property of
-    /// the tracing thread's framestack.  Sharing one memo while its siblings
-    /// stay per-thread would be the inconsistency.
-    ///
-    /// NOT yet ported: `warmstate.py` also treats the flag as "please
-    /// trace from here as soon as possible" — a denied cell that never had a
-    /// procedure token reaches `bound_reached` immediately, so the callee gets
-    /// its own trace instead of staying a plain residual forever.  Since
-    /// residual calls re-enter the JIT the callee does reach its own threshold,
-    /// just on the ordinary counter rather than at once.
-    ///
-    /// The stored key is `PyCode.code_ptr`, not the movable wrapper address.
-    /// Top-level `CodeObject` bodies are permanent `Box::into_raw` owners and
-    /// nested bodies borrow from that permanent graph (`pycode.rs`), so this
-    /// process-lifetime memo cannot accidentally deny a later wrapper which
-    /// reused a collected PyCode address.  The warm-state cell still receives
-    /// the wrapper green below; this raw owner key is only for this memo.
-    static FBW_HAZARDOUS_INLINE_DENY: std::cell::RefCell<std::collections::HashSet<usize>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
-pub(crate) fn fbw_hazardous_inline_denied(callee_code_key: usize) -> bool {
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(callee_code_key as pyre_object::PyObjectRef) as usize
-    };
-    raw_code != 0 && FBW_HAZARDOUS_INLINE_DENY.with(|c| c.borrow().contains(&raw_code))
-}
-
-fn fbw_deny_hazardous_inline(callee_code_key: usize) {
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(callee_code_key as pyre_object::PyObjectRef) as usize
-    };
-    if raw_code != 0 {
-        FBW_HAZARDOUS_INLINE_DENY.with(|c| {
-            c.borrow_mut().insert(raw_code);
-        });
-    }
-}
-
-/// `disable_noninlinable_function` (`warmstate.py`) plus the walker-side
-/// hazardous-inline deny: name the CALLEE, not the enclosing portal.
+/// `disable_noninlinable_function` (`warmstate.py`): name the CALLEE, not the enclosing portal.
 pub(crate) fn fbw_mark_callee_dont_trace<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     callee_code_key: usize,
 ) {
-    fbw_deny_hazardous_inline(callee_code_key);
     // Function-entry key for a callee named only by its code object:
     // there is no merge-point operand here, so read the live frame
     // (`PyFrame.get_is_being_profiled`).  Read before `try_driver_pair`
     // so the session borrow inside `live_frame_is_being_profiled` is
     // released across the driver call.
     let is_being_profiled = live_frame_is_being_profiled(ctx);
-    // `fbw_deny_hazardous_inline` writes a thread-local set that only
-    // this walker reads, so the deny stayed invisible to the warm
-    // state: `dont_trace_here` counted zero on every fixture that
-    // reaches here.  `warmstate.py`
-    // `WarmEnterState.disable_noninlinable_function` is the call that sets
-    // `JC_DONT_TRACE_HERE` on the callee's cell, and that bit is what
-    // `can_inline_callable` reads, so the deny is spelled through it
-    // rather than beside it.  Pass the typed key so the verdict lands on
-    // the same comparekey-bearing cell consulted at the next call.
+    // `WarmEnterState.disable_noninlinable_function` sets
+    // `JC_DONT_TRACE_HERE` on the callee's cell; `can_inline_callable` reads
+    // that bit.  Pass the typed key so the verdict lands on the same
+    // comparekey-bearing cell consulted at the next call.
     if let Some((driver, _)) = crate::driver::try_driver_pair() {
         let key =
             crate::driver::make_green_key_typed(callee_code_key as *const (), 0, is_being_profiled);
@@ -4421,40 +4334,6 @@ pub(crate) fn body_int_operand_constant(
         .checked_sub(num_regs_i)
         .and_then(|index| constants_i.get(index))
         .copied()
-}
-
-pub(crate) fn fbw_callee_body_has_binary_op_residual(
-    body_code: &[u8],
-    callee_descr_refs: &[DescrRef],
-) -> bool {
-    let Some(ops) = decoded_ops_on_fresh_frame(body_code, callee_descr_refs) else {
-        return false;
-    };
-    for op in &ops {
-        if op.opname.starts_with("residual_call")
-            && residual_call_descr_index_in_body(body_code, op)
-                .and_then(|index| callee_descr_refs.get(index))
-                .and_then(|descr| descr.as_call_descr())
-                .is_some_and(|descr| {
-                    descr.get_extra_info().runtime_helper == majit_ir::RuntimeHelperKind::BinaryOp
-                })
-        {
-            return true;
-        }
-        // Flatten lowered BINARY to `inline_call_ir_r` of
-        // `binary_value_from_tag` (tag + two refs).  Without this the
-        // root-bridge self-rec admission (`bridge_rec_root_selfrec`)
-        // never sees a BinaryOp and the nested recursive CALL aborts
-        // the enclosing bridge (`selfrec_bridge_nontail_promote`).
-        if op.opname.starts_with("inline_call_ir_r") {
-            let i_len = body_code.get(op.pc + 3).copied().unwrap_or(0);
-            let r_len_pc = op.pc + 3 + 1 + i_len as usize;
-            if i_len == 1 && body_code.get(r_len_pc) == Some(&2) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Refuse a commit the enclosing `BINARY_OP` / `COMPARE_OP` rewind cannot undo.

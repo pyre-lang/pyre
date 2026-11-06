@@ -47,9 +47,10 @@ class SimpleWeakSet:
 # advances.  A separate Python counter would miss that bump.
 def _abc_instancecheck(cls, instance):
     """Internal ABC helper for instance checks. Should be never used outside abc module."""
-    # `_abc__abc_instancecheck_impl` uses `PyObject_GetOptionalAttr` for
-    # `__class__` and falls back to `type(instance)` when that attribute is
-    # absent (gh-153772).
+    # `_abc_instancecheck` reads `instance.__class__` with no fallback.
+    # `_abc__abc_instancecheck_impl` uses `PyObject_GetOptionalAttr` and
+    # falls back to `type(instance)` when that attribute is absent
+    # (`test_abc.py test_instancecheck_no_class`, gh-153772).
     try:
         subclass = instance.__class__
     except AttributeError:
@@ -64,14 +65,4 @@ def _abc_instancecheck(cls, instance):
         ):
             return False
         return cls.__subclasscheck__(subclass)
-    # `app_abc.py _abc_instancecheck` writes this arm as
-    # `any(cls.__subclasscheck__(c) for c in (subclass, subtype))`.
-    # That genexp lowers to a `FOR_ITER` in this function, and
-    # `code_has_for_iter` then refuses the inline from a caller loop.
-    # The cache hit never reaches this arm. The two calls short-circuit
-    # the same way, and `any` yields a bool.
-    if cls.__subclasscheck__(subclass):
-        return True
-    if cls.__subclasscheck__(subtype):
-        return True
-    return False
+    return any(cls.__subclasscheck__(c) for c in (subclass, subtype))
