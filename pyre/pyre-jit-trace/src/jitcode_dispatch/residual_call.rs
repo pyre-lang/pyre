@@ -2102,7 +2102,12 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
         };
         let frame_ptr = frame_ptr as usize;
         let Some(stack_base) = crate::state::concrete_nlocals(frame_ptr) else {
-            latchdbg!("origin={origin} pf-nlocals");
+            latchdbg!(
+                "origin={origin} pf-nlocals index={index}/{} jitcode={} frame_reg={frame_reg} \
+                 frame_ptr={frame_ptr:#x}",
+                framestack.frames.len(),
+                frame.jitcode.name()
+            );
             return false;
         };
         let Some(stack_depth) = crate::state::concrete_stack_depth(frame_ptr) else {

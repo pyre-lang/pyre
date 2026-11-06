@@ -10370,19 +10370,7 @@ fn foriter_body_matches_frame(body: InflightForiterBody, frame: usize, body_pc: 
 }
 
 fn frame_raw_code(frame: usize) -> Option<*const pyre_interpreter::CodeObject> {
-    if frame == 0 {
-        return None;
-    }
-    let frame_ptr = frame as *const u8;
-    let w_code =
-        unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
-    if w_code.is_null() {
-        return None;
-    }
-    Some(unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    })
+    crate::state::concrete_raw_code(frame)
 }
 
 fn exact_floor_segment_anchor(

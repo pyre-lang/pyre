@@ -2124,17 +2124,27 @@ pub fn pcdep_trivia_at(jitcode_index: i32, jit_pc: i32) -> Option<Vec<(u8, u16, 
 /// over-count that materializes a stray operand slot).  Returns `None`
 /// when the code or the liveness entry for `py_pc` is missing, or when the
 /// forward analysis never reached `py_pc`.
+/// A convert-image word that is not a heap `PyObject` (null page, unaligned)
+/// cannot be a `PyFrame` or `PyCode`. `w_code_get_ptr` requires a `PyCode`.
+fn aligned_heap_ref(ptr: usize) -> Option<PyObjectRef> {
+    if ptr < 4096 || ptr % std::mem::align_of::<pyre_object::PyObject>() != 0 {
+        None
+    } else {
+        Some(ptr as PyObjectRef)
+    }
+}
+
+fn raw_code_from_w_code(w_code: usize) -> Option<*const CodeObject> {
+    let obj = aligned_heap_ref(w_code)?;
+    if !unsafe { pyre_interpreter::is_code(obj) } {
+        return None;
+    }
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(obj) as *const CodeObject };
+    (!raw.is_null()).then_some(raw)
+}
+
 pub fn depth_based_vsd_for_wcode(w_code: usize, py_pc: usize) -> Option<usize> {
-    if w_code == 0 {
-        return None;
-    }
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
-    if raw_code.is_null() {
-        return None;
-    }
+    let raw_code = raw_code_from_w_code(w_code)?;
     let code = unsafe { &*raw_code };
     let stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
     // `depth_at_py_pc` collapses the forward pass's `usize::MAX` unreachable
@@ -5284,24 +5294,29 @@ pub(crate) fn concrete_frame_array_len(frame: usize) -> Option<usize> {
 /// Returns the stack base index (nlocals + ncells) for the given frame.
 /// This is the number of non-stack slots in the unified locals_cells_stack_w
 /// array: local variables + cell/free variable slots.
+/// The `PyCode` wrapped by `frame.pycode`, when `frame` is a live `PyFrame`.
+///
+/// `multi_frame_blackhole_preflight` reads this off a convert-image red that
+/// is supposed to be that level's own frame (`interp_jit.py` `reds = ['frame',
+/// 'ec']`, `blackhole.py` `convert_and_run_from_pyjitpl`). A helper or a
+/// coalesced register can leave an `int` (or another non-frame) in
+/// `portal_frame_reg`; `w_code_get_ptr` then misaligned-dereferences the
+/// `intval` word. Decline the same way a null `pycode` already does so the
+/// latch refuses the image instead of SIGSEGV.
 fn concrete_code_object(frame: usize) -> Option<&'static pyre_interpreter::CodeObject> {
-    let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
-    let w_code =
-        unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
-    if w_code.is_null() {
+    let frame_obj = aligned_heap_ref(frame)?;
+    if !unsafe { py_type_check(frame_obj, &pyre_interpreter::pyframe::FRAME_TYPE) } {
         return None;
     }
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
+    let w_code = unsafe {
+        *((frame as *const u8).add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const usize)
     };
-    // A non-null `w_code` does not make the inner pointer non-null; every other
-    // caller of `w_code_get_ptr` in the tree checks the result before
-    // dereferencing it.
-    if raw_code.is_null() {
-        return None;
-    }
+    let raw_code = raw_code_from_w_code(w_code)?;
     Some(unsafe { &*raw_code })
+}
+
+pub(crate) fn concrete_raw_code(frame: usize) -> Option<*const CodeObject> {
+    concrete_code_object(frame).map(|code| code as *const CodeObject)
 }
 
 pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
@@ -16764,6 +16779,20 @@ mod tests {
 
         // A null frame cannot answer either.
         assert_eq!(merge_point_stack_depth_to_recover(0, deep_pc), None);
+    }
+
+    /// `multi_frame_blackhole_preflight` used to pass a convert-image red
+    /// straight to `w_code_get_ptr`. An `int` in `portal_frame_reg` (value 4
+    /// sits at the `pycode` offset of a `PyFrame` layout) misaligned-dereferenced.
+    #[test]
+    fn concrete_nlocals_declines_a_non_frame() {
+        ensure_test_callbacks();
+        assert_eq!(concrete_nlocals(0), None);
+        assert_eq!(concrete_nlocals(4), None);
+        let w_int = w_int_new(4);
+        assert_eq!(concrete_nlocals(w_int as usize), None);
+        assert_eq!(depth_based_vsd_for_wcode(w_int as usize, 0), None);
+        assert_eq!(depth_based_vsd_for_wcode(4, 0), None);
     }
 
     /// The portal `JitState` override must hand the rebuilt framestack to
