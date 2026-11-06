@@ -1,25 +1,12 @@
 //! `Option<fn>` return phi: `Some` is the fn-ptr parameter as the front
 //! end spells it (`tyref_fn_ptr_input_class_root`), `None` is a live
-//! `null_fn`.
+//! spelled `null_fn` (`s_None`).
 //!
-//! T1c-1 annotates `core::ptr::null_fn` as constant `SomePtr(Ptr(FuncType))`.
-//! `follow_link` copies that shell onto the returnblock inputarg. Upstream
-//! `history.getkind` / `codewriter/support.py` (via `getkind`) banks a
-//! `Ptr` whose `TO` is `FuncType` (`_gckind == 'raw'`) as `'int'`. A
-//! projection that maps every `SomePtr` to `Ref` commits that phi as
-//! `GcRef`, so `func_result_kind` panics `FUNC.RESULT=i but CFG return
-//! kind is r`.
-//!
-//! The graph is unfolded: return predecessors are a spelled fn-ptr
-//! `Some` input (`class_root` from `tyref_fn_ptr_input_class_root`,
-//! `"fn() -> i64"`) plus two live `null_fn` `None` arms (the extra
-//! `None` is the CI shape: after `Int ∪ Ref` clears the phi, a later
-//! `SomePtr` rewrite sticks), `return_type = Some("i64")`, driven
-//! through `CodeWriter::transform_graph_to_jitcode` once.
-//! `pairtype(SomePtr, SomeObject).union` refuses an un-spelled Int
-//! there (`SomePtr ∪ SomeInteger` at the return phi). A test that
-//! `set_return`s the `null_fn` result Variable itself stays green
-//! without the projection fix.
+//! The Input seeds `Impossible`; spelled `null_fn` is `s_None`; the phi
+//! is `s_None` (or a function-PBC once a caller unions). `stamp_fn_ptr`
+//! keeps `Ptr(FuncType)` on the dests; `history.getkind` of that pointer
+//! is `'int'`. Publication copies `specialize_block`'s Constant onto
+//! the None arms (`rtype_const_result`) before jtransform.
 
 use majit_translate::codewriter::call::CallControl;
 use majit_translate::codewriter::codewriter::CodeWriter;

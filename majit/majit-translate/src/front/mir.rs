@@ -445,6 +445,12 @@ pub(crate) fn absorb_semantic_program(
             acc.struct_fields
                 .gc_struct_ids
                 .extend(prog.struct_fields.gc_struct_ids);
+            for (key, kind) in prog.struct_fields.transparent_scalar_kinds {
+                acc.struct_fields
+                    .transparent_scalar_kinds
+                    .entry(key)
+                    .or_insert(kind);
+            }
             for root in prog.struct_fields.foreign_body_roots {
                 acc.struct_fields.note_foreign_body_crate_root(&root);
             }
@@ -4624,6 +4630,12 @@ fn note_raw_word_owner(
     if majit_charon_reader::ullbc::is_closure_leaf(&leaf) {
         return;
     }
+    // A transparent scalar is the inner word, not a C struct.
+    // `raw_struct_ptr_annotation` must not mint SomePtr for it
+    // (`derive_subject_inputcells` seeds that word).
+    if struct_fields.transparent_scalar_kind(&name).is_some() {
+        return;
+    }
     struct_fields
         .raw_word_owners
         .insert(strip_crate_prefix(&name));
@@ -5329,6 +5341,13 @@ fn derive_program_metadata(
         std::collections::HashMap::new();
     let mut struct_field_attrs: std::collections::HashMap<String, Vec<(String, ValueType)>> =
         std::collections::HashMap::new();
+
+    for (path, kind) in discover_transparent_scalar_kinds(llbc) {
+        struct_fields
+            .transparent_scalar_kinds
+            .entry(path)
+            .or_insert_with(|| transparent_scalar_value_type(kind));
+    }
 
     for td in llbc.iter_type_decls() {
         if type_decl_is_builtin_adt(td) {
@@ -6690,6 +6709,12 @@ impl DuplicateLeafFacts {
         self.struct_fields
             .gc_struct_ids
             .extend(other.struct_fields.gc_struct_ids);
+        for (key, kind) in other.struct_fields.transparent_scalar_kinds {
+            self.struct_fields
+                .transparent_scalar_kinds
+                .entry(key)
+                .or_insert(kind);
+        }
         for (enum_key, by_discr) in other.enum_variant_by_discriminant {
             self.enum_variant_by_discriminant
                 .entry(enum_key)
@@ -7667,8 +7692,6 @@ pub(crate) use self::gcroot::{
     harvest_scope_owning_identities_with, is_root_scope_drop_glue_call, is_rust_vec_free_call,
     is_shadow_stack_bracket_close, is_slice_buffer_free_call,
 };
-#[cfg(test)]
-pub(crate) use self::lltype::stamp_fn_ptr_spelling;
 pub(crate) use self::lltype::{
     RPY_LIST_OF_STR, STR_FAMILY_DECLARED_PATHS, STR_LENGTH_FIELD_CLASS_ROOTS, ThreadLocalRefLlop,
     adt_head_instantiation_suffix, cached_global_marker_str, charon_array_len_to_string,
@@ -7681,7 +7704,7 @@ pub(crate) use self::lltype::{
     is_str_family_class_root, is_str_length_field_class_root, is_str_oopspec_class_root,
     items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
     output_type_is_objectptr, push_unichr, raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt,
-    seed_program_exception_class_hints, strip_crate_prefix,
+    seed_program_exception_class_hints, stamp_fn_ptr_spelling, strip_crate_prefix,
     struct_item_flexible_gcarray_block_annotation, type_decl_ref_adt_id, type_decl_ref_builtin,
     type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
 };

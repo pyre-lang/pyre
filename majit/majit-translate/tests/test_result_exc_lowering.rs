@@ -9,11 +9,14 @@ use common::{
 use majit_charon_reader::Llbc;
 use majit_ir::descr::{ExtraEffect, OopSpecIndex};
 use majit_ir::value::Type;
+use majit_translate::annotator::bookkeeper::Bookkeeper;
 use majit_translate::codewriter::call::{AnalysisCache, CallControl};
 use majit_translate::codewriter::codewriter::CodeWriter;
 use majit_translate::codewriter::jitcode::JitCode;
 use majit_translate::model::{CallTarget, ExitCase, ExitSwitch, LinkArg, OpKind, SpaceOperation};
 use majit_translate::{CallPath, ErrorCarrierSpec, GraphTransformConfig, HostStaticAddrs};
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 /// Load `pyre-interpreter.ullbc` once and share it across every test.
 ///
@@ -115,6 +118,203 @@ fn pinned_result_reload_assembles() {
 }
 
 #[test]
+fn trace_unit_result_declares_void_return() {
+    // `call_result.is_err()` keeps a Result<(),PyError> disc-prep hop
+    // (collapse of that is_err switch would drop the later `?`).
+    // The callee rule still stamps FUNC.RESULT = void.
+    let graph = lower_function(
+        interp(),
+        "pyre_interpreter::executioncontext::<Impl>::_trace",
+    )
+    .expect("lower _trace");
+    {
+        eprintln!("TRACE nblocks={}", graph.blocks.len());
+        let mut dests: HashMap<majit_translate::flowspace::model::Variable, Vec<String>> =
+            HashMap::new();
+        let mut recast_roots: HashSet<String> = HashSet::new();
+        let mut field_owners: HashSet<String> = HashSet::new();
+        for (bi, block) in graph.blocks.iter().enumerate() {
+            if let Some(op) = block.operations.get(1) {
+                let dest = op
+                    .result
+                    .as_ref()
+                    .map(|v| v.name())
+                    .unwrap_or_else(|| "-".into());
+                let kind = match &op.kind {
+                    OpKind::FieldRead { field, .. } => {
+                        format!(
+                            "FieldRead {}::{}",
+                            field.owner_root.as_deref().unwrap_or("?"),
+                            field.name
+                        )
+                    }
+                    OpKind::Call { target, .. } => format!("Call {target}"),
+                    OpKind::Input {
+                        name,
+                        ty,
+                        class_root,
+                    } => {
+                        format!("Input {name} ty={ty:?} class={class_root:?}")
+                    }
+                    other => format!("{other:?}"),
+                };
+                let kind = if kind.len() > 180 {
+                    format!("{}…", &kind[..180])
+                } else {
+                    kind
+                };
+                eprintln!("TRACE bb{bi} op1 dest={dest} {kind}");
+            }
+            for (oi, op) in block.operations.iter().enumerate() {
+                if let Some(dest) = &op.result {
+                    dests
+                        .entry(dest.clone())
+                        .or_default()
+                        .push(format!("bb{bi} op{oi}"));
+                }
+                if let OpKind::FieldRead { field, .. } = &op.kind {
+                    if let Some(owner) = field.owner_root.as_deref() {
+                        field_owners.insert(owner.to_string());
+                    }
+                    if field.name == "__discriminant" {
+                        eprintln!(
+                            "TRACE disc bb{bi} op{oi} dest={} owner={}",
+                            op.result
+                                .as_ref()
+                                .map(|v| v.name())
+                                .unwrap_or_else(|| "-".into()),
+                            field.owner_root.as_deref().unwrap_or("?")
+                        );
+                        if oi > 0 {
+                            let prev = &block.operations[oi - 1];
+                            eprintln!(
+                                "TRACE disc-prev bb{bi} op{} dest={} {prev:?}",
+                                oi - 1,
+                                prev.result
+                                    .as_ref()
+                                    .map(|v| v.name())
+                                    .unwrap_or_else(|| "-".into())
+                            );
+                        }
+                    }
+                }
+                if let OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } = &op.kind
+                    && segments.last().map(String::as_str) == Some("__cast_instance_intrinsic")
+                {
+                    for arg in args {
+                        if let LinkArg::Const(c) = arg
+                            && let Some(s) = c.value.as_pystr()
+                        {
+                            recast_roots.insert(s.to_string());
+                        }
+                    }
+                    eprintln!(
+                        "TRACE cast bb{bi} op{oi} dest={} args={args:?}",
+                        op.result
+                            .as_ref()
+                            .map(|v| v.name())
+                            .unwrap_or_else(|| "-".into())
+                    );
+                }
+            }
+        }
+        for (dest, sites) in &dests {
+            if sites.len() > 1 {
+                eprintln!("TRACE dest-reuse {} {sites:?}", dest.name());
+            }
+        }
+        let fields = with_shared_lowering(interp(), |ctx| ctx.struct_field_registry());
+        let bk = Rc::new(Bookkeeper::new());
+        bk.set_struct_fields(Rc::new(fields));
+        bk.set_exception_carrier("error::PyErrorObject");
+        bk.alias_exception_carrier_handle("pyre_interpreter::error::PyError");
+        let mut roots: Vec<String> = recast_roots.into_iter().chain(field_owners).collect();
+        roots.sort();
+        roots.dedup();
+        for root in &roots {
+            let host = bk.intern_class_by_qualname(root);
+            let projected = bk.project_struct_field_type(root);
+            let transparent = bk.transparent_scalar_annotation(root);
+            let classdef = bk
+                .getuniqueclassdef_for_struct_root(root)
+                .ok()
+                .map(|cd| cd.borrow().name.clone());
+            let proj = format!("{projected:?}");
+            let proj = if proj.len() > 120 {
+                format!("{}…", &proj[..120])
+            } else {
+                proj
+            };
+            eprintln!(
+                "TRACE intern {root:?} host={} classdef={classdef:?} transparent={} proj={proj}",
+                host.qualname(),
+                transparent
+                    .as_ref()
+                    .map(|s| format!("{s:?}"))
+                    .unwrap_or_else(|| "-".into())
+            );
+        }
+    }
+    assert_eq!(
+        graph.return_type.as_deref(),
+        Some("()"),
+        "_trace: Result<(), PyError> callee must declare FUNC.RESULT = void"
+    );
+    let n_except = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.exits)
+        .filter(|l| l.target == graph.exceptblock)
+        .count();
+    assert!(n_except > 0, "_trace must raise through exceptblock");
+    for pred in graph.predecessors(graph.exceptblock) {
+        for link in &graph.blocks[pred.0].exits {
+            if link.target != graph.exceptblock {
+                continue;
+            }
+            let Some(LinkArg::Value(evalue)) = link.args.get(1) else {
+                continue;
+            };
+            let kind = graph.blocks.iter().find_map(|block| {
+                block
+                    .operations
+                    .iter()
+                    .find_map(|op| (op.result.as_ref() == Some(evalue)).then_some(&op.kind))
+            });
+            match kind {
+                Some(OpKind::FieldRead { field, .. }) => {
+                    let owner = field.owner_root.as_deref().unwrap_or("");
+                    assert!(
+                        !owner.ends_with("::Break"),
+                        "_trace exceptblock pred {} raises Break.__pos_0 ({owner})",
+                        pred.0
+                    );
+                }
+                Some(OpKind::Call {
+                    target:
+                        CallTarget::SyntheticTransparentCtor {
+                            name, owner_path, ..
+                        },
+                    ..
+                }) => {
+                    let owner = owner_path.join("::");
+                    assert!(
+                        !(name == "Err" && owner.contains("Result")),
+                        "_trace exceptblock pred {} raises Result ADT {owner}::{name}",
+                        pred.0
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[test]
 fn unit_result_callee_declares_void_return() {
     // A `Result<(), PyError>` scoped callee returns void after the
     // exception-link lowering, so `front::mir` stamps `return_type =
@@ -128,6 +328,7 @@ fn unit_result_callee_declares_void_return() {
         "pyre_interpreter::eval::<Impl>::send_value",
         "pyre_interpreter::pyopcode::OpcodeStepExecutor::store_fast",
         "pyre_interpreter::pyopcode::OpcodeStepExecutor::store_fast_store_fast",
+        "pyre_interpreter::executioncontext::<Impl>::_trace",
     ] {
         let g = lower_function(interp(), name).expect("lower");
         assert_eq!(

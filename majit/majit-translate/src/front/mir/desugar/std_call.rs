@@ -407,6 +407,27 @@ impl<'a> Lowering<'a> {
         json_ty_is_thin_pointer_element(element, self.llbc).then_some((item_ty, None))
     }
 
+    /// Byte size of a packed Copy C-repr struct `T` for `<[T]>::get`.
+    ///
+    /// `slice_get_element` declines a named ADT: an `ArrayRead` would
+    /// copy it. Packed Copy structs (`CodeUnit`) keep `Option<&T>` as
+    /// the element ADDRESS instead; this is that proof. Interior
+    /// mutability (`AtomicU64`) and payload enums (`Option<Entry>`)
+    /// stay residual.
+    pub(in crate::front::mir) fn slice_get_packed_element(
+        &self,
+        reg: &RegularCall,
+    ) -> Option<usize> {
+        let element_ty = reg
+            .generics
+            .get("types")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|types| types.first())
+            .and_then(|ty| serde_json::from_value::<TyRef>(ty.clone()).ok())?;
+        let element = tyref_node(&element_ty, self.llbc)?;
+        json_ty_packed_copy_struct_byte_size(element, self.llbc)
+    }
+
     pub(in crate::front::mir) fn is_slice_scalar_index_mut_call(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;

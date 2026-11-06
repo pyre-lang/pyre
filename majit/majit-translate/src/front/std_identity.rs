@@ -79,7 +79,7 @@ fn is_identity_wrapper_target(
                 (
                     "deref" | "deref_mut",
                     Some("Ref") | Some("RefMut") | Some("MutexGuard")
-                ) | ("borrow" | "borrow_mut", Some("RefCell"))
+                ) | ("borrow" | "borrow_mut" | "get_mut", Some("RefCell"))
             )
         }
         CallTarget::FunctionPath { segments, .. } => {
@@ -89,6 +89,13 @@ fn is_identity_wrapper_target(
             // before the std-path gate.
             if is_builtin_box_as_ref_or_mut_path(segments) {
                 return receiver_is_thin_box;
+            }
+            // `cell::Ref::deref` / `cell::RefCell::borrow` after `core`
+            // is peeled, same as `boxed::Box::as_mut` after `alloc`.
+            if is_peeled_ref_or_guard_deref_path(segments)
+                || is_peeled_refcell_borrow_path(segments)
+            {
+                return true;
             }
             if !is_std_fn_path(segments) {
                 return false;
@@ -111,7 +118,7 @@ fn is_identity_wrapper_target(
                 {
                     true
                 }
-                Some("borrow" | "borrow_mut")
+                Some("borrow" | "borrow_mut" | "get_mut")
                     if recv == Some("RefCell") || path_has(segments, "RefCell") =>
                 {
                     true
@@ -424,6 +431,57 @@ fn is_builtin_box_as_ref_or_mut_path(segments: &[String]) -> bool {
         parts.as_slice(),
         ["alloc", "boxed", "Box", "as_ref" | "as_mut"] | ["boxed", "Box", "as_ref" | "as_mut"]
     )
+}
+
+/// `cell::Ref::deref` / `MutexGuard::deref` after the std-crate prefix
+/// is stripped from the FunctionPath.
+fn is_peeled_ref_or_guard_deref_path(segments: &[String]) -> bool {
+    matches!(function_leaf(segments), Some("deref" | "deref_mut"))
+        && (path_has(segments, "MutexGuard")
+            || (path_has(segments, "Ref") && !path_has(segments, "RefCell")))
+}
+
+/// `cell::RefCell::borrow` after `core` is peeled. The body is
+/// Unstructured; FieldRead of `value` is the payload beside the flag.
+fn is_peeled_refcell_borrow_path(segments: &[String]) -> bool {
+    matches!(
+        function_leaf(segments),
+        Some("borrow" | "borrow_mut" | "get_mut")
+    ) && path_has(segments, "RefCell")
+}
+
+pub(crate) fn is_refcell_borrow_target(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => is_peeled_refcell_borrow_path(segments),
+        CallTarget::Method {
+            name,
+            receiver_root,
+            ..
+        } => {
+            matches!(name.as_str(), "borrow" | "borrow_mut" | "get_mut")
+                && path_leaf(receiver_root.as_deref()) == Some("RefCell")
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn is_ref_deref_target(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => {
+            matches!(function_leaf(segments), Some("deref" | "deref_mut"))
+                && path_has(segments, "Ref")
+                && !path_has(segments, "RefCell")
+        }
+        CallTarget::Method {
+            name,
+            receiver_root,
+            ..
+        } => {
+            matches!(name.as_str(), "deref" | "deref_mut")
+                && path_leaf(receiver_root.as_deref()) == Some("Ref")
+        }
+        _ => false,
+    }
 }
 
 fn is_box_as_ref_or_mut(target: &CallTarget, receiver_is_thin_box: bool) -> bool {
@@ -1119,6 +1177,91 @@ mod tests {
                 assert_eq!(base, v);
             }
             other => panic!("expected a field read of Ref.value, got {other:?}"),
+        }
+
+        let peeled = lower_std_primitive_op(
+            call(
+                path(&[
+                    "cell",
+                    "Ref",
+                    "<impl core::ops::deref::Deref<core::cell::Ref<v0>>>",
+                    "deref",
+                ]),
+                vec![v.clone()],
+                ValueType::Ref(Some("Vec".into())),
+            ),
+            Some("core::cell::Ref"),
+            None,
+            None,
+            None,
+            false,
+            true,
+            Some(&[
+                ("value".into(), ValueType::Ref(Some("Vec".into()))),
+                ("borrow".into(), ValueType::Ref(None)),
+            ]),
+            false,
+        );
+        match peeled {
+            OpKind::FieldRead { field, base, .. } => {
+                assert_eq!(field.name, "value");
+                assert_eq!(base, v);
+            }
+            other => panic!("peeled cell::Ref::deref should read value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refcell_borrow_reads_value_field_not_the_flag() {
+        let v = dummy_var();
+        let layout = [
+            ("borrow".into(), ValueType::Int),
+            ("value".into(), ValueType::Ref(Some("Vec".into()))),
+        ];
+        let borrow = lower_std_primitive_op(
+            call(
+                path(&["cell", "RefCell", "borrow"]),
+                vec![v.clone()],
+                ValueType::Ref(Some("Vec".into())),
+            ),
+            Some("core::cell::RefCell"),
+            None,
+            None,
+            None,
+            false,
+            true,
+            Some(&layout),
+            false,
+        );
+        match borrow {
+            OpKind::FieldRead { field, base, .. } => {
+                assert_eq!(field.name, "value");
+                assert_eq!(base, v);
+            }
+            other => panic!("peeled cell::RefCell::borrow should read value, got {other:?}"),
+        }
+
+        let borrow_mut = lower_std_primitive_op(
+            call(
+                path(&["core", "cell", "RefCell", "borrow_mut"]),
+                vec![v.clone()],
+                ValueType::Ref(Some("Vec".into())),
+            ),
+            Some("core::cell::RefCell"),
+            None,
+            None,
+            None,
+            false,
+            true,
+            Some(&layout),
+            false,
+        );
+        match borrow_mut {
+            OpKind::FieldRead { field, base, .. } => {
+                assert_eq!(field.name, "value");
+                assert_eq!(base, v);
+            }
+            other => panic!("RefCell::borrow_mut should read value, got {other:?}"),
         }
     }
 

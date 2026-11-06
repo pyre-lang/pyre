@@ -373,6 +373,78 @@ impl<'a> Lowering<'a> {
         None
     }
 
+    /// `Vec::index_mut` consumed only as `(*dest).field` / `(*dest).field[i]`
+    /// on a named struct element.
+    ///
+    /// Records the Vec header and the index so the field use emits
+    /// `setinteriorfield` (`rewrite_op_setinteriorfield`).
+    /// `create_utf8_index_storage` writes `storage[current].baseindex` and
+    /// `storage[current].ofs[i]` this way (`rutf8.py`). A word-stride
+    /// `ArrayRead` of that element would be false, and a residual
+    /// `index_mut` is not in CallRegistry.
+    ///
+    /// The loop increments `current` after the field writes of that
+    /// iteration; [`captured_local_reaches_field_uses`] already requires
+    /// the captured index at each field use, so a later increment does
+    /// not decline the intercept.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::front::mir) fn try_lower_struct_field_vec_index(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        arg_locals: &[Option<usize>],
+        second_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let Some(traced) = struct_field_vec_index_trace(
+            reg,
+            args.len(),
+            arg_locals.first().copied().flatten(),
+            second_arg_ty,
+            arg_locals.get(1).copied().flatten(),
+            dest_local,
+            Some(dest_ty),
+            self.body,
+            self.llbc,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+            self.tombstoned_leaves,
+        ) else {
+            return Ok(false);
+        };
+        let index_var = args.get(1).cloned().ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: struct-field Vec::index_mut lost its index operand"
+            ))
+        })?;
+        let header_var = args.first().cloned().ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: struct-field Vec::index_mut lost its Vec operand"
+            ))
+        })?;
+        self.interior_field_alias.insert(
+            dest_local,
+            InteriorFieldAlias {
+                header: InteriorHeader::Local {
+                    local: traced.header_local,
+                    var: header_var.clone(),
+                },
+                index_local: traced.index_local,
+                index_var,
+                array_type_id: traced.array_type_id,
+            },
+        );
+        self.alias_dest_to_arg0_inherit(dest_local, header_var, arg_locals);
+        let bb_id = self.emit_bb(mir_bb);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
     /// `*p.add(i)` where `p` is the data pointer of a `&[u8]` byte string.
     ///
     /// `<[u8]>::as_ptr` aliases that pointer to the string and marks it.
@@ -1858,18 +1930,18 @@ impl<'a> Lowering<'a> {
         if tyref_fieldless_enum_pointee(ty, self.llbc).is_some() {
             return None;
         }
-        // A `repr(transparent)` scalar wrapper is its inner word
-        // (`tyref_is_borrowed_transparent_scalar`). A store of that
-        // word through a borrow — rustc capturing `&FrameAnchor` into
-        // a closure env — is already the int; `cast_pointer` has no
-        // integer operand.
-        if tyref_is_borrowed_transparent_scalar(
+        // A transparent scalar is the inner word. Recasting a store onto
+        // the wrapper class minted Instance and unioned Integer ∪ Instance
+        // at `FrameAnchor::live` (`mergeinputargs`).
+        if tyref_transparent_inner_value_type(
             ty,
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
-        ) {
+        )
+        .is_some()
+        {
             return None;
         }
         let node = strip_ty_indirections(tyref_node(ty, self.llbc)?, self.llbc)?;
@@ -4692,13 +4764,18 @@ impl<'a> Lowering<'a> {
         if tyref_fieldless_enum_pointee(dest_ty, self.llbc).is_some() {
             return None;
         }
-        if tyref_is_borrowed_transparent_scalar(
+        // A transparent scalar dest is the inner word. A classdef recast
+        // here is the same Integer ∪ Instance wall as a fieldless-enum
+        // tag compare (`pair(rtype_eq) (InstanceRepr, IntegerRepr)`).
+        if tyref_transparent_inner_value_type(
             dest_ty,
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
-        ) {
+        )
+        .is_some()
+        {
             return None;
         }
         if let Some(root) = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves) {
@@ -8168,6 +8245,7 @@ impl<'a> Lowering<'a> {
                     .or_else(|| self.fold_const_fn_int_array_global(id))
                     .or_else(|| primitive_float_const(&segments))
                     .or_else(|| code_flags_const(&segments))
+                    .or_else(|| co_fast_flags_const(&segments))
                     .or_else(|| encoding_name_const(&segments))
                     .or_else(|| gc_ref_null_const(&segments))
                     .or_else(|| bitflags_trait_empty_const(&segments));

@@ -24506,6 +24506,47 @@ fn mut_ref_cell_try_dispatch_binary_special() {
     assert_eq!(cell_params, 2, "lhs and rhs are the cell parameters");
 }
 
+/// `PyError::normalize_exception` `&mut self` is a MutRef cell. The
+/// startblock Input names that cell so getattr of `.value` stays on it
+/// (`alias_exception_carrier_handle`). Ignored by default (loads the
+/// real LLBC).
+#[test]
+#[ignore]
+fn normalize_exception_self_input_is_mut_ref_cell() {
+    use crate::model::{OpKind, ValueType};
+
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let graph = crate::test_support::lower_function(
+        &llbc,
+        "pyre_interpreter::error::<Impl>::normalize_exception",
+    )
+    .expect("lower normalize_exception");
+    let start = graph.block(graph.startblock);
+    let mut self_input = None;
+    for op in &start.operations {
+        let OpKind::Input {
+            name,
+            ty,
+            class_root,
+        } = &op.kind
+        else {
+            continue;
+        };
+        if name == "self" {
+            self_input = Some((ty.clone(), class_root.clone()));
+            break;
+        }
+    }
+    let (ty, class_root) = self_input.expect("self Input");
+    let root = class_root.as_deref().unwrap_or("");
+    assert!(
+        root.starts_with("MutRef<"),
+        "self class_root {root:?} ty={ty:?} is not the cell"
+    );
+    assert!(matches!(ty, ValueType::Ref(_)), "self ty {ty:?}");
+}
+
 /// `sub_impl` passes `&mut a` / `&mut b` into
 /// `try_dispatch_binary_special`. The cell is built in the caller,
 /// passed as the argument, and read back into the local after the call.
@@ -26816,6 +26857,75 @@ fn deque_compare_scalar_slice_get_lowers_to_a_guarded_item_read() {
 /// Slice `get` is not object-pointer-specific, and a literal index has no
 /// Place type.  This production helper exercises both the generalized
 /// Option payload recognizer and its generic-type fallback for `get(1)`.
+/// `base_op` is `code.instructions.get(index)?.op`. The residual
+/// `core::slice::<Impl>::get` of `[CodeUnit]` must rewrite: otherwise
+/// skip-path lifting of `first_traceable_index` dual-gate-skips `_trace`.
+#[test]
+#[ignore]
+fn base_op_slice_get_is_rewritten() {
+    use crate::model::{CallTarget, OpKind};
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let graph = crate::test_support::lower_function(&llbc, "pyre_interpreter::pycode::base_op")
+        .expect("lower base_op");
+    let mut residual_get = 0usize;
+    let mut array_reads = 0usize;
+    let mut addr_arith = 0usize;
+    let mut ops: Vec<String> = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for (oi, op) in block.operations.iter().enumerate() {
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } => {
+                    if crate::front::slice_get::is_slice_get_segments(segments) {
+                        residual_get += 1;
+                    }
+                    ops.push(format!("b{bi}.{oi} Call {segments:?} nargs={}", args.len()));
+                }
+                OpKind::ArrayRead {
+                    array_type_id,
+                    item_ty,
+                    ..
+                } => {
+                    array_reads += 1;
+                    ops.push(format!(
+                        "b{bi}.{oi} ArrayRead id={array_type_id:?} ty={item_ty:?}"
+                    ));
+                }
+                OpKind::BinOp { op: bin, .. } => {
+                    if bin == "mul" || bin == "add" {
+                        addr_arith += 1;
+                    }
+                    ops.push(format!("b{bi}.{oi} BinOp {bin}"));
+                }
+                OpKind::FieldRead { field, ty, .. } => {
+                    ops.push(format!("b{bi}.{oi} FieldRead {} ty={ty:?}", field.name));
+                }
+                other => {
+                    let s = format!("{other:?}");
+                    if s.contains("get") || s.contains("CodeUnit") || s.contains("Instruction") {
+                        ops.push(format!("b{bi}.{oi} {s}"));
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        residual_get,
+        0,
+        "base_op slice get residual; ops:\n{}",
+        ops.join("\n")
+    );
+    assert!(
+        array_reads > 0 || addr_arith > 0,
+        "base_op in-bounds arm must read the unit or its address; ops:\n{}",
+        ops.join("\n")
+    );
+}
+
 #[test]
 #[ignore]
 fn slice_get_constant_index_lowers_to_a_guarded_item_read() {
@@ -33752,6 +33862,102 @@ fn interior_shared(inner: serde_json::Value) -> serde_json::Value {
     serde_json::json!({"Ref": [null, inner, "Shared"]})
 }
 
+fn interior_vec_decl() -> serde_json::Value {
+    serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["alloc", "vec", "Vec"], false),
+        "kind": {"Struct": []}
+    })
+}
+
+fn interior_vec_of(elem: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [elem],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    })
+}
+
+fn interior_index_mut_opaque(
+    def_id: u64,
+    vec_ty: &serde_json::Value,
+    vec_ref: &serde_json::Value,
+    usize_ty: &serde_json::Value,
+    elem_ref: &serde_json::Value,
+) -> serde_json::Value {
+    let impl_seg = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": {"Value": [1, vec_ty]},
+        "kind": "InherentImplBlock"
+    }}});
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": {
+            "name": [
+                {"Ident": ["alloc", 0]},
+                {"Ident": ["vec", 0]},
+                {"Ident": ["Vec", 0]},
+                impl_seg,
+                {"Ident": ["index_mut", 0]}
+            ],
+            "span": interior_span(),
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": false
+        },
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [vec_ref, usize_ty],
+            "output": elem_ref
+        },
+        "body": "Opaque"
+    })
+}
+
+fn interior_call_with_types(
+    fun: u64,
+    args: Vec<serde_json::Value>,
+    dest: serde_json::Value,
+    target: u64,
+    unwind: u64,
+    types: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "span": interior_span(),
+        "kind": {
+            "Call": {
+                "call": {
+                    "func": {
+                        "Regular": {
+                            "kind": {"Fun": fun},
+                            "generics": {
+                                "regions": [],
+                                "types": types,
+                                "const_generics": [],
+                                "trait_refs": []
+                            }
+                        }
+                    },
+                    "args": args
+                },
+                "dest": dest,
+                "target": target,
+                "on_unwind": unwind
+            }
+        }
+    })
+}
+
 fn interior_layout(size: u64, offsets: &[u64], transparent: bool) -> serde_json::Value {
     serde_json::json!([{
         "key": "fixture-target",
@@ -35157,6 +35363,244 @@ fn interior_field_write_of_ptr_add() {
     );
 }
 
+/// `storage[current].y = v` through `Vec::index_mut` is `setinteriorfield`
+/// (`rutf8.py` `create_utf8_index_storage`).
+#[test]
+fn interior_field_write_of_vec_index_mut() {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let adt = interior_adt(0);
+    let vec_ty = interior_vec_of(&adt);
+    let vec_ref = interior_mut_ref(vec_ty.clone());
+    let elem_ref = interior_mut_ref(adt.clone());
+    let caller = interior_caller(
+        "write_point_vec",
+        3,
+        vec![vec_ref.clone(), usize_ty.clone(), i64_ty.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("storage"), &vec_ref),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("value"), &i64_ty),
+            interior_local(4, Some("slot"), &elem_ref),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call_with_types(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &vec_ref)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(4, &elem_ref),
+                    2,
+                    1,
+                    vec![adt.clone(), usize_ty.clone()],
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![
+                    interior_assign(
+                        interior_field(4, &elem_ref, &adt, &i64_ty, 1),
+                        interior_use(interior_place(3, &i64_ty)),
+                    ),
+                    interior_assign(
+                        interior_place(0, &i64_ty),
+                        interior_use(interior_place(3, &i64_ty)),
+                    ),
+                ],
+                interior_return(),
+            ),
+        ],
+    );
+    let index_mut = interior_index_mut_opaque(1, &vec_ty, &vec_ref, &usize_ty, &elem_ref);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_point(), interior_vec_decl()],
+        vec![caller, index_mut],
+    );
+    let graph = lower_interior(&llbc, "write_point_vec");
+    let ops = graph_ops(&graph);
+    let writes: Vec<_> = ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::InteriorFieldWrite { .. }))
+        .copied()
+        .collect();
+    assert_eq!(writes.len(), 1, "ops={ops:?}");
+    let block = graph
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::InteriorFieldWrite { .. }))
+        })
+        .expect("InteriorFieldWrite block");
+    assert!(
+        block.inputargs.len() >= 3,
+        "inputargs={:?}",
+        block.inputargs
+    );
+    let OpKind::InteriorFieldWrite {
+        base,
+        index,
+        value,
+        field,
+        item_ty,
+        array_type_id,
+        array: _,
+    } = &writes[0].kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(field.name, "y");
+    assert_eq!(field.base_is_deref, Some(true));
+    assert_eq!(item_ty, &ValueType::Int);
+    assert_eq!(array_type_id.as_deref(), Some("GcArray<Point>"));
+    assert_eq!(base, &block.inputargs[0]);
+    assert_eq!(index, &block.inputargs[1]);
+    assert_eq!(value, &block.inputargs[2]);
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| leaf == "index_mut"),
+        "ops={ops:?}"
+    );
+}
+
+fn interior_u8_array16() -> serde_json::Value {
+    let u8_ty = interior_u8();
+    let len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "16"]}},
+        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+    ]);
+    serde_json::json!({"Array": [u8_ty, len, null]})
+}
+
+fn interior_loc_elem() -> serde_json::Value {
+    interior_struct(
+        0,
+        &["fixture", "Utf8LocElem"],
+        &[
+            ("baseindex", interior_i64()),
+            ("ofs", interior_u8_array16()),
+        ],
+        24,
+        &[0, 8],
+        false,
+    )
+}
+
+fn interior_field_index(
+    slot: u64,
+    slot_ty: &serde_json::Value,
+    elem_ty: &serde_json::Value,
+    field_ty: &serde_json::Value,
+    field_idx: u64,
+    index_local: u64,
+    index_ty: &serde_json::Value,
+    stored_ty: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": {
+            "Projection": [
+                interior_field(slot, slot_ty, elem_ty, field_ty, field_idx),
+                {"Index": {
+                    "offset": {"Read": interior_place(index_local, index_ty)},
+                    "from_end": false
+                }}
+            ]
+        },
+        "ty": stored_ty
+    })
+}
+
+/// `storage[current].ofs[i] = v` through `Vec::index_mut` reads the `ofs`
+/// interior field then writes the byte (`rutf8.py` `create_utf8_index_storage`).
+#[test]
+fn interior_nested_field_index_write_of_vec_index_mut() {
+    let usize_ty = interior_usize();
+    let u8_ty = interior_u8();
+    let ofs_ty = interior_u8_array16();
+    let adt = interior_adt(0);
+    let vec_ty = interior_vec_of(&adt);
+    let vec_ref = interior_mut_ref(vec_ty.clone());
+    let elem_ref = interior_mut_ref(adt.clone());
+    let caller = interior_caller(
+        "write_ofs",
+        4,
+        vec![
+            vec_ref.clone(),
+            usize_ty.clone(),
+            usize_ty.clone(),
+            u8_ty.clone(),
+        ],
+        u8_ty.clone(),
+        vec![
+            interior_local(0, None, &u8_ty),
+            interior_local(1, Some("storage"), &vec_ref),
+            interior_local(2, Some("current"), &usize_ty),
+            interior_local(3, Some("i"), &usize_ty),
+            interior_local(4, Some("value"), &u8_ty),
+            interior_local(5, Some("slot"), &elem_ref),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call_with_types(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &vec_ref)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(5, &elem_ref),
+                    2,
+                    1,
+                    vec![adt.clone(), usize_ty.clone()],
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![
+                    interior_assign(
+                        interior_field_index(5, &elem_ref, &adt, &ofs_ty, 1, 3, &usize_ty, &u8_ty),
+                        interior_use(interior_place(4, &u8_ty)),
+                    ),
+                    interior_assign(
+                        interior_place(0, &u8_ty),
+                        interior_use(interior_place(4, &u8_ty)),
+                    ),
+                ],
+                interior_return(),
+            ),
+        ],
+    );
+    let index_mut = interior_index_mut_opaque(1, &vec_ty, &vec_ref, &usize_ty, &elem_ref);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_loc_elem(), interior_vec_decl()],
+        vec![caller, index_mut],
+    );
+    let graph = lower_interior(&llbc, "write_ofs");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op.kind, OpKind::InteriorFieldRead { .. })),
+        "nested ofs[i] reads the interior ofs field; ops={ops:?}"
+    );
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op.kind, OpKind::ArrayWrite { .. })),
+        "nested ofs[i] writes the byte; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| leaf == "index_mut"),
+        "ops={ops:?}"
+    );
+}
+
 /// `*self = fresh` through `&mut Self` is the field-wise structcopy
 /// (`rffi.py` `_get_structcopy_fn`) even when a field is
 /// `Atomic<usize>` (`tyref_atomic_inner_value_type`).
@@ -36097,10 +36541,11 @@ fn interior_field_const_index_stays_direct_ptradd() {
     assert_direct_ptradd_not_residual_add(&ops);
 }
 
-/// `&(*p.add(i)).y` is an address, not a value read, so the add stays
-/// `direct_ptradd`. The census test is the guard; this locks the lowering.
+/// `&(*p.add(i)).y` of a copy-scalar field is identity
+/// (`tyref_is_identity_field_word`): `getinteriorfield` of `y`, the same
+/// as a value read (`ll_getitem_fast`).
 #[test]
-fn interior_field_address_of_stays_direct_ptradd() {
+fn interior_field_address_of_copy_scalar_is_interior_read() {
     let i64_ty = interior_i64();
     let usize_ty = interior_usize();
     let adt = interior_adt(0);
@@ -36153,8 +36598,45 @@ fn interior_field_address_of_stays_direct_ptradd() {
     let llbc = llbc_with_types("fixture", vec![interior_point()], vec![caller, add]);
     let graph = lower_interior(&llbc, "addr_point");
     let ops = graph_ops(&graph);
-    assert_no_interior(&ops);
-    assert_direct_ptradd_not_residual_add(&ops);
+    let reads: Vec<_> = ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::InteriorFieldRead { .. }))
+        .copied()
+        .collect();
+    assert_eq!(reads.len(), 1, "ops={ops:?}");
+    let block = interior_read_block(&graph);
+    assert!(
+        block.inputargs.len() >= 2,
+        "header and index stay live; inputargs={:?}",
+        block.inputargs
+    );
+    let OpKind::InteriorFieldRead {
+        base,
+        index,
+        field,
+        item_ty,
+        array_type_id,
+        array: _,
+    } = &reads[0].kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(field.name, "y");
+    assert_eq!(field.owner_root.as_deref(), Some("Point"));
+    assert_eq!(field.base_is_deref, Some(true));
+    assert_eq!(field.taken_by_address, false);
+    assert_eq!(item_ty, &ValueType::Int);
+    assert_eq!(array_type_id.as_deref(), Some("GcArray<Point>"));
+    assert_eq!(base, &block.inputargs[0]);
+    assert_eq!(index, &block.inputargs[1]);
+    assert!(
+        !ops.iter().any(|op| is_lltype_direct_ptradd(op)),
+        "ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| leaf == "add"),
+        "ops={ops:?}"
+    );
 }
 
 /// A `repr(transparent)` pointee is the inner word, not a GcArray of

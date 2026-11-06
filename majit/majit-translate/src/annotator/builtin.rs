@@ -405,6 +405,19 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // qualname covers both spellings.
     analyzer_for(&mut reg, "std.alloc.alloc", std_alloc_raw);
     analyzer_for(&mut reg, "std.alloc.alloc_zeroed", std_alloc_raw);
+    // `std::slice::from_raw_parts{,_mut}` — Charon spells
+    // `core::slice::raw::from_raw_parts{,_mut}`. `flowspace/model.rs`
+    // shares one HostObject, so this qualname covers both.
+    analyzer_for(
+        &mut reg,
+        "std.slice.from_raw_parts",
+        std_slice_from_raw_parts,
+    );
+    analyzer_for(
+        &mut reg,
+        "std.slice.from_raw_parts_mut",
+        std_slice_from_raw_parts,
+    );
     // Rust `std::ptr::null_mut::<T>()` / `null::<T>()` — the null
     // pointer constant (also the value of
     // `pyre_object::pyobject::PY_NULL`, whose HOST_ENV attr binds to
@@ -416,9 +429,10 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     analyzer_for(&mut reg, "core.ptr.null", ptr_null_constant);
     analyzer_for(&mut reg, "std.ptr.null", ptr_null_constant);
     // `Option<fn>`'s null niche. A GC pointer's null is
-    // `ptr_null_constant` (classdef-less only when unspelled); a raw
-    // function pointer's null is `SomePtr(FuncType)` (`fn_null_constant`),
-    // the same `ll_ptrtype` as the matching `fn` value so the two arms union.
+    // `ptr_null_constant` (classdef-less only when unspelled); a spelled
+    // `fn` / `Option<fn>` null is `s_None` (`fn_null_constant`) so it
+    // noneifies a function-PBC. Untyped `ptr::null_fn()` stays
+    // `SomePtr(FuncType)`.
     analyzer_for(&mut reg, "core.ptr.null_fn", fn_null_constant);
     // Raw-address niche `None` (`Option<&Raw>`, `Option<NonNull<Raw>>`).
     // A spelled class root is `lltype.nullptr(T)` (`SomePtr` of that raw
@@ -1814,6 +1828,28 @@ fn std_alloc_raw(
     Ok(raw_alloc_ptr_somevalue())
 }
 
+/// Analyzer for `std::slice::from_raw_parts{,_mut}(p, n)`.
+///
+/// The data word of the slice is `p` (`ann_direct_ptradd` returns
+/// `s_p`). A leftover residual of a pointer-slice view
+/// (`alloc_list_items_block_gc`) keeps that Call; the length rides
+/// the residual consumer (`shadow_stack_copy_range`) or a window
+/// companion, not this result.
+fn std_slice_from_raw_parts(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 2 {
+        return Err(AnnotatorError::new(
+            "std.slice.from_raw_parts expects (ptr, len)",
+        ));
+    }
+    let s_p = arg_at(args_s, 0, "std.slice.from_raw_parts").clone();
+    let _ = arg_at(args_s, 1, "std.slice.from_raw_parts");
+    Ok(s_p)
+}
+
 /// `None` of an instance class: `s_None ∪ SomeInstance(cd)` is
 /// `SomeInstance(cd, can_be_None=True)` (`model.py`), and `rclass.py`
 /// `InstanceRepr.convert_const(None)` is its `nullptr`. A front end that
@@ -1859,17 +1895,12 @@ fn ptr_null_constant(
     }
 }
 
-/// Null `Option<fn>` — `lltype.nullptr(FuncType)` as `SomePtr`, not the
-/// `SomeInstance` that `ptr_null_constant` returns for a GC pointer
-/// (classdef-less only when unspelled). `llannotation.py`
-/// `pairtype(SomePtr, SomePtr).union` requires the same `ll_ptrtype` as
-/// the function-pointer field read.
-/// An optional constant spelling is the FUNC type `lltype.nullptr` takes
-/// (`getfunctionptr`); without it the coarse empty `FuncType` is used.
-///
-/// `ann_nullptr` returns `immutablevalue(nullptr(T.const))`, so the
-/// annotation is a constant; `rbuiltin.py` `rtype_const_result` then
-/// emits that nullptr as a Constant.
+/// Null `Option<fn>` / spelled `fn`. A spelled `fn` / `Option<fn>`
+/// null is `s_None` so it unions with a function-PBC via
+/// `SomePBC.noneify` (`binaryop.py` `pairtype(SomeObject, SomeNone)`).
+/// Untyped `ptr::null_fn()` (no spelling) and a raw rffi
+/// `nullptr(FuncType)` that never meets a PBC stay `SomePtr`
+/// (`ann_nullptr` `immutablevalue(nullptr(T))`).
 pub(crate) fn fn_null_constant(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -1878,8 +1909,12 @@ pub(crate) fn fn_null_constant(
     if !kwds.is_empty() {
         return Err(AnnotatorError::new("ptr::null_fn() takes no keywords"));
     }
-    let mut s = match args_s {
-        [] => super::bookkeeper::raw_fn_ptr_somevalue(),
+    match args_s {
+        [] => {
+            let mut s = super::bookkeeper::raw_fn_ptr_somevalue();
+            stamp_fn_null_const(&mut s);
+            Ok(s)
+        }
         [Some(s_ty)] => {
             let Some(spelling) = s_ty.const_().and_then(|c| c.as_pystr()) else {
                 return Err(AnnotatorError::new(
@@ -1892,16 +1927,13 @@ pub(crate) fn fn_null_constant(
                         "ptr::null_fn() type argument is not a function pointer: {spelling}"
                     ))
                 },
-            )?
+            )?;
+            Ok(super::model::s_none())
         }
-        _ => {
-            return Err(AnnotatorError::new(
-                "ptr::null_fn() takes an optional function-pointer type argument",
-            ));
-        }
-    };
-    stamp_fn_null_const(&mut s);
-    Ok(s)
+        _ => Err(AnnotatorError::new(
+            "ptr::null_fn() takes an optional function-pointer type argument",
+        )),
+    }
 }
 
 /// `ann_nullptr`: `immutablevalue(nullptr(T))` on the `SomePtr`.
@@ -2991,8 +3023,9 @@ fn jit_conditional_call(
 /// return annmodel.unionof(s_res, args_s[0].nonnoneify())
 /// ```
 ///
-/// Pyre's fn-const is `SomePtr(FuncType)` rather than always `SomePBC`.
-/// A `Ptr(FuncType)` takes RESULT via `lltype_to_annotation`.
+/// A residual `Ptr(FuncType)` (untyped / rffi nullptr) takes RESULT
+/// via `lltype_to_annotation`. A reified `FnDef` is `SomePBC` and
+/// takes `emulate_pbc_call`.
 fn jit_conditional_call_elidable(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -4011,30 +4044,41 @@ mod tests {
         assert!(merged_i.can_be_none, "union is nullable");
     }
 
-    /// `lltype.nullptr(FUNC)` of a spelled signature is the same
-    /// `SomePtr` as a `Some` of that `fn` type (`getfunctionptr`).
+    /// Spelled `null_fn` is `s_None`; it noneifies a function-PBC
+    /// (`binaryop.py` `pairtype(SomeObject, SomeNone)`).
     #[test]
     fn typed_null_fn_unions_with_matching_fn_pointer() {
-        use crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling;
-        use crate::annotator::model::{SomeObjectTrait, SomeValue, unionof};
+        use crate::annotator::description::{DescEntry, FunctionDesc};
+        use crate::annotator::model::{SomeObjectTrait, SomePBC, SomeValue, unionof};
+        use crate::flowspace::argument::Signature;
         use crate::flowspace::model::{ConstValue, Constant};
+        use std::cell::RefCell;
+        use std::rc::Rc;
 
         let spelling = "fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>";
-        let s_fn = fn_ptr_somevalue_for_spelling(spelling).expect("fn spelling");
+        let bk = bk();
         let mut s_ty = crate::annotator::model::s_str0();
         s_ty.set_const_box(Constant::new(ConstValue::byte_str(spelling)));
-        let s_null = fn_null_constant(&bk(), &[Some(s_ty)], &std::collections::HashMap::new())
+        let s_null = fn_null_constant(&bk, &[Some(s_ty)], &std::collections::HashMap::new())
             .expect("typed null_fn");
         assert!(
-            s_null.is_constant(),
-            "typed nullptr is immutablevalue, got {s_null:?}"
+            matches!(s_null, SomeValue::None_(_)) && s_null.is_constant(),
+            "spelled null_fn is s_None, got {s_null:?}"
         );
-        let merged =
-            unionof([&s_fn, &s_null]).expect("typed None unions with Some of the same fn type");
-        assert!(
-            matches!(merged, SomeValue::Ptr(_)),
-            "typed null_fn must stay SomePtr, got {merged:?}"
-        );
+        let fd = DescEntry::function(Rc::new(RefCell::new(FunctionDesc::new(
+            bk.clone(),
+            None,
+            "f",
+            Signature::new(vec![], None, None),
+            None,
+            None,
+        ))));
+        let s_fn = SomeValue::PBC(SomePBC::new(vec![fd], false));
+        let merged = unionof([&s_fn, &s_null]).expect("s_None unions with function PBC");
+        match merged {
+            SomeValue::PBC(pbc) => assert!(pbc.can_be_none, "None ∪ PBC noneifies"),
+            other => panic!("typed null_fn ∪ PBC must be noneified PBC, got {other:?}"),
+        }
     }
 
     fn raw_mapped_obj_bk() -> (Rc<Bookkeeper>, parking_lot::MutexGuard<'static, ()>) {
@@ -5012,6 +5056,8 @@ mod tests {
         assert!(is_registered(
             "pyre_object::gc_hook::gc_alloc_failed_pending"
         ));
+        assert!(is_registered("std.slice.from_raw_parts"));
+        assert!(is_registered("std.slice.from_raw_parts_mut"));
     }
 
     #[test]
@@ -8487,6 +8533,45 @@ mod tests {
         let err = call_builtin(&bk(), "std.alloc.alloc_zeroed", &[], &no_kwds())
             .expect_err("Layout argument is required");
         assert!(err.to_string().contains("expects a Layout"), "got {err}");
+    }
+
+    #[test]
+    fn from_raw_parts_returns_the_pointer_operand() {
+        use crate::flowspace::model::HOST_ENV;
+
+        let s_p = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
+        let s_n = SomeValue::Integer(super::super::model::SomeInteger::default());
+        for name in ["std.slice.from_raw_parts", "std.slice.from_raw_parts_mut"] {
+            let out = call_builtin(
+                &bk(),
+                name,
+                &[Some(s_p.clone()), Some(s_n.clone())],
+                &no_kwds(),
+            )
+            .unwrap_or_else(|err| panic!("{name} annotates as the pointer: {err}"));
+            assert_eq!(out, s_p, "{name}");
+        }
+        let std_host = HOST_ENV
+            .import_module("std.slice")
+            .and_then(|m| m.module_get("from_raw_parts_mut"))
+            .expect("std.slice.from_raw_parts_mut");
+        let core_host = HOST_ENV
+            .import_module("core.slice.raw")
+            .and_then(|m| m.module_get("from_raw_parts_mut"))
+            .expect("core.slice.raw.from_raw_parts_mut");
+        assert_eq!(
+            std_host, core_host,
+            "core.slice.raw.from_raw_parts_mut must be the std.slice HostObject"
+        );
+        assert_eq!(std_host.qualname(), "std.slice.from_raw_parts_mut");
+        assert!(is_registered(std_host.qualname()));
+        let segs = ["core", "slice", "raw", "from_raw_parts_mut"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let via_path = crate::flowspace::model::host_env_callable(&segs)
+            .expect("Charon 4-segment path resolves in HOST_ENV");
+        assert_eq!(via_path, std_host);
     }
 
     #[test]

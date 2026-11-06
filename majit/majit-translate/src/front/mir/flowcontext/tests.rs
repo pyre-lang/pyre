@@ -7350,6 +7350,119 @@ fn reconstructed_impl_generics_binds_swapped_const_params() {
     ));
 }
 
+/// Residual `w_module_dict_get_strategy` returns `*mut ModuleDictStrategy`.
+/// Intern the Call dest so getattr `getitem_str` sees the classdef
+/// (`celldict.py` `getdictvalue_no_unwrapping`).
+#[test]
+fn w_module_dict_get_strategy_call_result_is_interned() {
+    use crate::model::{CallTarget, OpKind};
+
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let fd = llbc
+        .iter_local_fns()
+        .find(|fd| {
+            fd.item_meta
+                .name_path()
+                .ends_with("::w_module_dict_getitem_str")
+        })
+        .expect("w_module_dict_getitem_str in pyre-object LLBC");
+    crate::test_support::with_lowering(llbc, |context| {
+        let graph = super::lower_fun_decl(context, fd).expect("lower w_module_dict_getitem_str");
+        let ops = graph_ops(&graph);
+        let dest = ops.iter().find_map(|op| {
+            let OpKind::Call { target, .. } = &op.kind else {
+                return None;
+            };
+            let is_get_strategy = match target {
+                CallTarget::FunctionPath { segments, .. } => {
+                    segments.last().map(String::as_str) == Some("w_module_dict_get_strategy")
+                }
+                CallTarget::Method { name, .. } => name == "w_module_dict_get_strategy",
+                _ => false,
+            };
+            is_get_strategy.then(|| op.result.clone()).flatten()
+        });
+        let Some(dest) = dest else {
+            panic!(
+                "getitem_str must call get_strategy; ops={:?}",
+                ops.iter()
+                    .filter_map(|op| match &op.kind {
+                        OpKind::Call { target, .. } => Some(target.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            );
+        };
+        assert!(
+            ops.iter().any(|op| {
+                crate::model::cast_instance_of(&op.kind, &dest)
+                    .is_some_and(|root| root.rsplit("::").next() == Some("ModuleDictStrategy"))
+            }),
+            "residual get_strategy dest intern's ModuleDictStrategy; graph={}",
+            graph.dump()
+        );
+    });
+}
+
+/// Residual `Vec::from_raw_parts` in `rffi.mallocfn` (`rstr.mallocstr`)
+/// dest intern's as the `Vec<u8>` list so setattr `__pos_0` of
+/// `Result<Vec<u8>, MemoryError>::Ok` unions (`rlist.py`).
+#[test]
+fn mallocfn_from_raw_parts_dest_is_interned_as_list() {
+    use crate::model::{CallTarget, OpKind};
+
+    let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let fd = llbc
+        .iter_local_fns()
+        .find(|fd| fd.item_meta.name_path().ends_with("::mallocfn"))
+        .expect("mallocfn in majit-rlib LLBC");
+    crate::test_support::with_lowering(llbc, |context| {
+        let graph = super::lower_fun_decl(context, fd).expect("lower mallocfn");
+        let ops = graph_ops(&graph);
+        let dest = ops.iter().find_map(|op| {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                return None;
+            };
+            if args.len() != 3 {
+                return None;
+            }
+            let is_from_raw_parts = match target {
+                CallTarget::FunctionPath { segments, .. } => {
+                    segments.last().map(String::as_str) == Some("from_raw_parts")
+                }
+                CallTarget::Method { name, .. } => name == "from_raw_parts",
+                _ => false,
+            };
+            is_from_raw_parts.then(|| op.result.clone()).flatten()
+        });
+        let Some(dest) = dest else {
+            panic!(
+                "mallocfn must residual 3-arg from_raw_parts; ops={:?}",
+                ops.iter()
+                    .filter_map(|op| match &op.kind {
+                        OpKind::Call { target, .. } => Some(target.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            );
+        };
+        assert!(
+            ops.iter().any(|op| {
+                crate::model::cast_instance_of(&op.kind, &dest)
+                    .is_some_and(majit_ir::descr::is_list_container_spelling)
+            }),
+            "residual from_raw_parts dest intern's as list; graph={}",
+            graph.dump()
+        );
+    });
+}
+
 /// Production `w_module_dict_setitem_str_internal` names the inherent
 /// `ModuleDictStrategy::setitem_str` FunDecl, not the trait trampoline.
 #[test]
@@ -9374,6 +9487,71 @@ fn resolve_aggregate_adt_uses_dest_ty_generics_when_head_is_bare_id() {
     );
 }
 
+/// Try residual dest_ty spells uninhabited ok as a non-object payload
+/// (`charon_type_value_to_ast_string` → `??scalar`). dest_adt with that
+/// ok is still the instantiation so intern of `Result::Err` is
+/// `Result<??scalar,E>::Err` (`intern_enum_variant_host` peels to the
+/// carrier). A rejected dest_adt interned the bare template and
+/// setattr of Break.__pos_0 was `Result::Err ∪ PyError`.
+#[test]
+fn resolve_aggregate_adt_result_err_dest_ty_scalar_keeps_suffix() {
+    let llbc = llbc_with_types("fixture", vec![result_enum(0)], vec![]);
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let body: super::Unstructured = serde_json::from_value(serde_json::json!({
+        "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+    }))
+    .unwrap();
+    let dont_look_inside = std::collections::HashSet::new();
+    let accum = super::AccumulatorFacts::build(&llbc, &body);
+    let tombstoned = std::collections::HashSet::new();
+    let gc_struct_ids_llbc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let lowering = super::Lowering::new(
+        &llbc,
+        "fixture".into(),
+        &body,
+        crate::HostStaticAddrs::default(),
+        &[],
+        None,
+        &dont_look_inside,
+        &tombstoned,
+        &gc_struct_ids_llbc,
+        super::no_immutable_fields(),
+        &std::collections::HashSet::<String>::new(),
+        &accum,
+        &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+        false,
+        false,
+    )
+    .unwrap();
+    let kind = serde_json::json!({"Adt": [0, 1]});
+    let dest = TyRef::Other(serde_json::json!({
+        "Value": [7, result_adt_node(
+            0,
+            serde_json::json!(null),
+            serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}),
+        )]
+    }));
+    let (path, leaf, _, _, _, _) = lowering
+        .resolve_aggregate_adt(&kind, Some(&dest))
+        .expect("Err constructor");
+    assert_eq!(leaf, "Err");
+    assert_eq!(
+        path.last().map(String::as_str),
+        Some("result::Result<??scalar,i64>"),
+        "dest_adt with residual ??scalar must intern the instantiation"
+    );
+    let (bare_path, _, _, _, _, _) = lowering
+        .resolve_aggregate_adt(&kind, None)
+        .expect("presence check without dest_ty still resolves the ADT");
+    assert_eq!(
+        bare_path.last().map(String::as_str),
+        Some("result::Result"),
+        "without a dest_ty the presence check may keep the unsuffixed leaf"
+    );
+}
+
 /// Recast dest (`resolve_aggregate_adt`) and field intern
 /// (`class_identity_spelling` plus suffix) spell one intern key.
 #[test]
@@ -10222,8 +10400,8 @@ fn complex_add_keeps_regular_call_to_core_unwrap() {
 }
 
 /// `unicode_translate_error_str` has two plain Result expects:
-/// `start_slot.as_ref().expect(...)` and `usize::try_from(start).expect(...)`.
-/// Each stays a regular call of the extracted core body
+/// `start_slot.as_ref().expect(...)` and `try_from.expect`. They stay
+/// regular calls of the extracted core body
 /// `match self { Ok(t) => t, Err(_) => <diverging Never call> }`.
 /// Carrier Result expect stays on `result_exc` and is not this site.
 #[test]
@@ -11358,6 +11536,58 @@ fn saturating_sub_wrapper_diamond_real() {
             "object LLBC: expected at least one unstructured core::num::<Impl>::saturating_sub"
         );
     });
+}
+
+/// `FrameAnchor` is the depth `usize`. `live`'s `&self` is that word.
+///
+/// `mergeinputargs` of `live` unions Integer ∪ Ptr when a caller seeds
+/// SomePtr of the wrapper. The harvest records the type as a transparent
+/// unsigned scalar so the annotator keeps the inner word.
+#[test]
+#[ignore]
+fn frame_anchor_live_input_is_the_depth_word() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    crate::front::mir::link_transparent_scalar_types(std::slice::from_ref(&llbc));
+    assert_eq!(
+        llbc.transparent_scalar_kind("pyre_interpreter::eval::FrameAnchor"),
+        Some(majit_charon_reader::TransparentScalarKind::Unsigned),
+        "FrameAnchor is the depth usize"
+    );
+    assert_eq!(
+        llbc.transparent_scalar_kind("eval::FrameAnchor"),
+        Some(majit_charon_reader::TransparentScalarKind::Unsigned),
+        "interned class_root matches the harvested kind"
+    );
+    let graph = crate::test_support::lower_function(&llbc, "pyre_interpreter::eval::<Impl>::live")
+        .expect("lower eval::<Impl>::live");
+    let input = graph
+        .block(graph.startblock)
+        .operations
+        .iter()
+        .find_map(|op| match &op.kind {
+            OpKind::Input {
+                name,
+                ty,
+                class_root,
+            } if name == "self" => Some((ty.clone(), class_root.clone())),
+            _ => None,
+        })
+        .expect("live has a self Input");
+    assert_eq!(
+        input.0,
+        crate::model::ValueType::Unsigned,
+        "live `&self` is the depth word"
+    );
+    assert_eq!(
+        input.1.as_deref(),
+        Some("eval::FrameAnchor"),
+        "live keeps the interned class_root so the annotator can match the harvest"
+    );
+    assert!(
+        graph.return_class_root.as_deref() != Some("eval::FrameAnchor"),
+        "live returns *mut PyFrame, not the anchor wrapper"
+    );
 }
 
 /// A translated opcode helper is a PyPy frame method, not a generic

@@ -2346,6 +2346,16 @@ fn plan_sum_residual_raise(
                 "from_residual would raise {error_ty} without From::from"
             ))
         }
+        Ok(ResidualPayload::CarrierShell {
+            result_shell,
+            shell,
+        }) => Ok(ResidualRaisePlan {
+            value: result_shell.clone(),
+            delete: None,
+            shell: Some(shell),
+            read_base: result_shell,
+            class_name: None,
+        }),
         Ok(ResidualPayload::Direct(var) | ResidualPayload::Converted(var)) => {
             if let Some(loc) = peel_sum_ctor_from(graph, &var, sum) {
                 let inner = loc.inner.clone();
@@ -4980,7 +4990,8 @@ pub(crate) struct PeeledBreakShell {
 
 enum ResidualPayload {
     /// Unsuffixed owner, or a suffixed owner whose error argument is the
-    /// carrier. The field read is the value to raise.
+    /// carrier and whose stored payload is already `e`. The field read
+    /// is the value to raise.
     Direct(Variable),
     /// [`FromResidualConversion`] already replaced the argument.
     Converted(Variable),
@@ -4988,6 +4999,14 @@ enum ResidualPayload {
     Foreign {
         error_ty: String,
         shell: Option<PeeledBreakShell>,
+    },
+    /// Carrier residual whose `Break` payload is `Err(e)` —
+    /// `Result<Infallible, E>` stored when the branch banks differ.
+    /// Raise `e`, the same extra `__pos_0` read [`ResidualRaisePlan::shell`]
+    /// inserts for a foreign residual.
+    CarrierShell {
+        result_shell: Variable,
+        shell: PeeledBreakShell,
     },
 }
 
@@ -5066,14 +5085,14 @@ fn peel_declared_wrappers(ty: &str, wrappers: &[&str]) -> String {
 /// Charon spells that uninhabited ok as `Never`
 /// (`{"Value":[id,"Never"]}`). `charon_type_value_to_ast_string` renders a
 /// non-object payload as `??scalar`, so the owner suffix is
-/// `Result<??scalar,E>`.
-fn peel_infallible_result(ty: &str) -> String {
-    let Some(rest) = ty.strip_prefix("Result<") else {
+/// `Result<??scalar,E>`. A qualified head (`result::Result<Never, E>`)
+/// peels the same way; `ControlFlow::Break.__pos_0` carries that spelling.
+pub(crate) fn peel_infallible_result(ty: &str) -> String {
+    let trimmed = ty.trim();
+    let (head, inner) = split_head_args(trimmed);
+    if type_leaf(head) != "Result" || inner.is_empty() {
         return ty.to_string();
-    };
-    let Some(inner) = rest.strip_suffix('>') else {
-        return ty.to_string();
-    };
+    }
     let args = split_top_level(inner);
     if args.len() == 2 && is_uninhabited_ok(&args[0]) {
         return args[1].clone();
@@ -5226,6 +5245,14 @@ mod uninhabited_atom_tests {
             peel_infallible_result("Result<Option<Infallible>,E>"),
             "Result<Option<Infallible>,E>".to_string()
         );
+        assert_eq!(
+            peel_infallible_result("result::Result<Never,PyError>"),
+            "PyError".to_string()
+        );
+        assert_eq!(
+            peel_infallible_result("core::result::Result<Never,crate::PyError>"),
+            "crate::PyError".to_string()
+        );
     }
 
     #[test]
@@ -5257,38 +5284,16 @@ fn is_from_impl_call(kind: &OpKind) -> bool {
             .any(|seg| crate::front::mir::is_trait_impl_identity_segment(seg))
 }
 
-/// The value `Result::from_residual` is called with on a live `?` tail.
-///
-/// A diamond whose `branch()` call is still present never reaches here:
-/// [`verify_break_arm_is_reraise`] detaches that tail before this pass
-/// reraises. What remains reads `ControlFlow::Break`'s `__pos_0` or
-/// `Result::Err`'s `__pos_0`. An unsuffixed owner, and a suffixed owner
-/// whose error argument is already the carrier, is that value.
-/// `FromResidual::from_residual` for a different error type is
-/// `Err(From::from(e))`; [`foreign_from_residual_sites_in`] inserts that
-/// call, and this walk then returns its result.
-fn from_residual_carrier(
-    graph: &FunctionGraph,
-    arg: &Variable,
-    carrier_path: &str,
-    carrier_wrappers: &[&str],
-) -> Result<Variable, String> {
-    match residual_payload(graph, arg, carrier_path, carrier_wrappers)? {
-        ResidualPayload::Direct(var) | ResidualPayload::Converted(var) => Ok(var),
-        ResidualPayload::Foreign { error_ty, .. } => Err(format!(
-            "from_residual would raise {error_ty} without From::from"
-        )),
-    }
-}
-
 /// `Try::branch` puts `Result<Infallible, E>` in `Break`. The branch
 /// expansion stores `Err(e)` there when `e`'s bank differs from that
 /// residual `Result`, and stores `e` itself when the banks match.
 /// `From<E>::from` takes `e`.
 ///
-/// `Some` only for a `Break` read whose type argument actually peeled and
-/// whose `Result::branch` stamp records two different banks. Equal banks,
-/// a missing stamp, and an `Err` payload (already `e`) stay `None`.
+/// `Some` when the stored payload is `Err(e)`: the `Result::branch`
+/// stamp records two different banks, or `lower_result_branch_as_match`
+/// already built that `Err` shell (the stamp is gone). Equal banks, a
+/// missing stamp with `e` stored directly, and an `Err` payload
+/// (already `e`) stay `None`.
 fn peeled_break_shell(
     graph: &FunctionGraph,
     base: &Variable,
@@ -5307,14 +5312,190 @@ fn peeled_break_shell(
     if peel_infallible_result(break_arg) == *break_arg {
         return None;
     }
-    let (err_ty, break_ty, receiver_root) = branch_shell_banks(graph, base)?;
-    if err_ty == break_ty {
+    if let Some((err_ty, break_ty, receiver_root)) = branch_shell_banks(graph, base) {
+        if err_ty == break_ty {
+            return None;
+        }
+        let root = receiver_root.unwrap_or_else(|| "core::result::Result".to_string());
+        return Some(PeeledBreakShell {
+            err_owner: format!("{root}::Err"),
+            payload_ty: err_ty,
+        });
+    }
+    instantiated_break_err_shell(graph, base)
+}
+
+/// `__pos_0` write on `instance`, if the block still holds it.
+fn field_write_pos0(
+    graph: &FunctionGraph,
+    instance: &Variable,
+) -> Option<(Variable, ValueType, Option<String>)> {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let OpKind::FieldWrite {
+                base,
+                field,
+                value,
+                ty,
+            } = &op.kind
+                && base == instance
+                && field.name == "__pos_0"
+            {
+                let var = value.as_variable()?.clone();
+                return Some((var, ty.clone(), field.owner_root.clone()));
+            }
+        }
+    }
+    None
+}
+
+fn follow_ctor_copies(graph: &FunctionGraph, mut var: Variable) -> Variable {
+    for _ in 0..8 {
+        let Some(kind) = producing_op(graph, &var) else {
+            return var;
+        };
+        match kind {
+            OpKind::UnaryOp { op, operand, .. } if op == "same_as" => var = operand.clone(),
+            OpKind::Call { args, .. }
+                if is_recast_narrow(kind)
+                    && let Some(src) = args.first().and_then(LinkArg::as_variable) =>
+            {
+                var = src.clone();
+            }
+            _ => return var,
+        }
+    }
+    var
+}
+
+fn is_result_err_ctor(kind: &OpKind) -> bool {
+    let OpKind::Call {
+        target: CallTarget::SyntheticTransparentCtor {
+            name, owner_path, ..
+        },
+        ..
+    } = kind
+    else {
+        return false;
+    };
+    name == "Err"
+        && owner_path.last().is_some_and(|seg| {
+            majit_ir::descr::strip_instantiation_suffix(majit_ir::descr::class_root_leaf(seg))
+                == "Result"
+        })
+}
+
+/// `Break` payload is `Err(e)` built by `emit_sum_variant` after
+/// `lower_result_branch_as_match` deleted the `Result::branch` stamp
+/// [`branch_shell_banks`] reads. Continue constructors on the same phi
+/// are skipped; a Break that stores `e` itself (equal banks) stays
+/// `None`.
+fn instantiated_break_err_shell(
+    graph: &FunctionGraph,
+    root: &Variable,
+) -> Option<PeeledBreakShell> {
+    let mut seen = Vec::new();
+    let mut stack = vec![root.clone()];
+    let mut found: Option<PeeledBreakShell> = None;
+    let mut saw_direct_e = false;
+    while let Some(var) = stack.pop() {
+        if seen.iter().any(|seen_var| seen_var == &var) {
+            continue;
+        }
+        seen.push(var.clone());
+        if let Some(kind) = producing_op(graph, &var) {
+            match kind {
+                OpKind::Call { target, args, .. } => {
+                    if is_control_flow_ctor(target) {
+                        let CallTarget::SyntheticTransparentCtor { name, .. } = target else {
+                            return None;
+                        };
+                        if name == "Continue" {
+                            continue;
+                        }
+                        if let Some(shell) = err_shell_written_into_break(graph, &var) {
+                            if let Some(prev) = &found
+                                && prev != &shell
+                            {
+                                return None;
+                            }
+                            found = Some(shell);
+                        } else {
+                            saw_direct_e = true;
+                        }
+                        continue;
+                    }
+                    if is_recast_narrow(kind)
+                        && let Some(src) = args.first().and_then(LinkArg::as_variable)
+                    {
+                        stack.push(src.clone());
+                        continue;
+                    }
+                    return None;
+                }
+                OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                    stack.push(operand.clone());
+                    continue;
+                }
+                _ => return None,
+            }
+        }
+        let mut fed = false;
+        for (bi, block) in graph.blocks.iter().enumerate() {
+            let Some(pos) = block.inputargs.iter().position(|arg| arg == &var) else {
+                continue;
+            };
+            for pred in &graph.blocks {
+                for link in &pred.exits {
+                    if link.target.0 != bi {
+                        continue;
+                    }
+                    let Some(LinkArg::Value(src)) = link.args.get(pos) else {
+                        return None;
+                    };
+                    fed = true;
+                    stack.push(src.clone());
+                }
+            }
+        }
+        if !fed && found.is_none() && !saw_direct_e {
+            return None;
+        }
+    }
+    if saw_direct_e {
         return None;
     }
-    let root = receiver_root.unwrap_or_else(|| "core::result::Result".to_string());
+    found
+}
+
+fn err_shell_written_into_break(
+    graph: &FunctionGraph,
+    break_instance: &Variable,
+) -> Option<PeeledBreakShell> {
+    let (payload, _, _) = field_write_pos0(graph, break_instance)?;
+    let payload = follow_ctor_copies(graph, payload);
+    let kind = producing_op(graph, &payload)?;
+    if !is_result_err_ctor(kind) {
+        return None;
+    }
+    let (_inner, payload_ty, err_owner) = field_write_pos0(graph, &payload)?;
+    let err_owner = err_owner.unwrap_or_else(|| {
+        if let OpKind::Call {
+            target:
+                CallTarget::SyntheticTransparentCtor {
+                    owner_path, name, ..
+                },
+            ..
+        } = kind
+        {
+            format!("{}::{name}", owner_path.join("::"))
+        } else {
+            "core::result::Result::Err".to_string()
+        }
+    });
     Some(PeeledBreakShell {
-        err_owner: format!("{root}::Err"),
-        payload_ty: err_ty,
+        err_owner,
+        payload_ty,
     })
 }
 
@@ -5438,6 +5619,16 @@ fn residual_payload(
                         .as_deref()
                         .and_then(|owner| peeled_break_shell(graph, base, owner));
                     return Ok(ResidualPayload::Foreign { error_ty, shell });
+                }
+                if let Some(shell) = field
+                    .owner_root
+                    .as_deref()
+                    .and_then(|owner| peeled_break_shell(graph, base, owner))
+                {
+                    return Ok(ResidualPayload::CarrierShell {
+                        result_shell: current,
+                        shell,
+                    });
                 }
                 return Ok(ResidualPayload::Direct(current));
             }
@@ -5770,9 +5961,39 @@ fn raise_returned_from_residual(
         crate::front::exc_from_raise::set_raise_from_instance(graph, block_id, raised);
         return Ok(());
     }
-    let carrier = from_residual_carrier(graph, &residual, spec.carrier_path, spec.carrier_wrappers)
+    let payload = residual_payload(graph, &residual, spec.carrier_path, spec.carrier_wrappers)
         .map_err(|err| format!("{name}: {err}"))?;
-    graph.blocks[block].operations.remove(op_idx);
+    let carrier = match payload {
+        ResidualPayload::Direct(var) | ResidualPayload::Converted(var) => {
+            graph.blocks[block].operations.remove(op_idx);
+            var
+        }
+        ResidualPayload::CarrierShell {
+            result_shell,
+            shell,
+        } => {
+            let inner = graph.alloc_value_var();
+            graph.blocks[block].operations.insert(
+                op_idx,
+                SpaceOperation {
+                    result: Some(inner.clone()),
+                    kind: OpKind::FieldRead {
+                        base: result_shell,
+                        field: FieldDescriptor::new("__pos_0", Some(shell.err_owner)),
+                        ty: shell.payload_ty,
+                        pure: true,
+                    },
+                },
+            );
+            graph.blocks[block].operations.remove(op_idx + 1);
+            inner
+        }
+        ResidualPayload::Foreign { error_ty, .. } => {
+            return Err(format!(
+                "{name}: from_residual would raise {error_ty} without From::from"
+            ));
+        }
+    };
     let block_id = crate::model::BlockId(block);
     // `return from_residual(e)` → `raise e`. The codewriter converts
     // the raised carrier (`codewriter::error_carrier_edges`). Closes on
@@ -8146,6 +8367,13 @@ struct RebuiltShellHopPath {
     shell_at_match: Variable,
     /// Hop blocks in order, empty when [`Self::into_match`] is the start link.
     hops: Vec<usize>,
+    /// Disc / `bool(disc)` / `eq(disc, 1)` on [`Self::into_match`] when a
+    /// prep hop produced it; `None` when the match block itself reads
+    /// `__discriminant`.
+    forwarded_disc: Option<Variable>,
+    /// When [`Self::forwarded_disc`] is a bool/`eq` flag, `true` means
+    /// the flag is the Err tag (`eq(disc, 1)` / `bool(disc)`).
+    flag_true_is_err: bool,
 }
 
 /// Walk `with_roots!` restore hops from `start` to the `Result` match.
@@ -8153,6 +8381,11 @@ struct RebuiltShellHopPath {
 /// `getindex_w` is `match with_roots!(w_index => int_w(w_index))`. The
 /// call's successor is `RootScope::get`, not the discriminant switch;
 /// [`rewire_question_site`] already walks that shape for `?`.
+///
+/// A hop may read `__discriminant` (and `bool` of it) without switching
+/// when GC restores sit in the same block (`shadowstack.py` `pop_roots`
+/// mixed with the match). The successor switches on the forwarded disc
+/// or `bool(disc)`.
 fn follow_hops_to_result_match(
     graph: &FunctionGraph,
     start: &Link,
@@ -8161,6 +8394,8 @@ fn follow_hops_to_result_match(
     let mut link = start.clone();
     let mut var = shell.clone();
     let mut hops = Vec::new();
+    let mut forwarded_disc: Option<Variable> = None;
+    let mut flag_true_is_err = true;
     for _ in 0..graph.blocks.len() {
         let target = link.target.0;
         let pos = link
@@ -8173,8 +8408,17 @@ fn follow_hops_to_result_match(
             .get(pos)
             .cloned()
             .ok_or_else(|| format!("block {target} lacks inputarg {pos}"))?;
-        if let Ok((_, _, shell_in)) = match_discriminant(graph, target) {
-            if shell_in != bound {
+        let bound_disc = forwarded_disc
+            .as_ref()
+            .and_then(|disc| forward_alias(graph, disc, &link));
+        if let Ok(found) = match_discriminant_from(
+            graph,
+            target,
+            Some(&bound),
+            bound_disc.as_ref(),
+            flag_true_is_err,
+        ) {
+            if found.shell != bound {
                 return Err(format!(
                     "block {target} discriminant is not the forwarded Result shell"
                 ));
@@ -8183,15 +8427,40 @@ fn follow_hops_to_result_match(
                 into_match: link,
                 shell_at_match: var,
                 hops,
+                forwarded_disc,
+                flag_true_is_err: found.flag_true_is_err,
             });
         }
+        if let Some(prep) = result_disc_prep_hop(graph, target, &bound) {
+            hops.push(target);
+            let [exit] = graph.blocks[target].exits.as_slice() else {
+                return Err(format!("block {target} is not a single forwarding hop"));
+            };
+            // `produced` is in `target`'s namespace, which is the source
+            // of `exit` — the same invariant `var = bound` keeps for the
+            // shell. Do not `forward_alias` here; the next iteration binds
+            // it through `exit`.
+            forwarded_disc = Some(prep.forwarded);
+            flag_true_is_err = prep.flag_true_is_err;
+            link = exit.clone();
+            var = bound;
+            continue;
+        }
         if !block_forwards_result_unread(graph, target, &bound) {
-            return Err(format!("block {target} lacks a Result __discriminant read"));
+            return Err(format!(
+                "block {target} lacks a Result __discriminant read ({})",
+                summarize_block_ops(graph, target, &bound)
+            ));
         }
         hops.push(target);
         let [exit] = graph.blocks[target].exits.as_slice() else {
             return Err(format!("block {target} is not a single forwarding hop"));
         };
+        forwarded_disc = bound_disc.filter(|disc| {
+            exit.args
+                .iter()
+                .any(|arg| matches!(arg, LinkArg::Value(v) if v == disc))
+        });
         link = exit.clone();
         var = bound;
     }
@@ -9321,10 +9590,10 @@ fn err_payload_is_dead(graph: &FunctionGraph, exit: &Link, r: &Variable) -> bool
     if !variable_is_used(graph, &shell) {
         return true;
     }
-    let Ok((_, _, disc_shell)) = match_discriminant(graph, exit.target.0) else {
+    let Ok(found) = match_discriminant(graph, exit.target.0) else {
         return false;
     };
-    if disc_shell != shell {
+    if found.shell != shell {
         return false;
     }
     let Ok((_ok_link, err_link)) =
@@ -10741,7 +11010,8 @@ fn arm_shell_vars_from_args(
 /// Drop the `Ok`/`Err` shells [`catch_and_rewrap`] just built when the
 /// match they feed only reads `__pos_0` and forwards that payload.
 /// An arm that does not receive the shell is a discarded payload
-/// (`Ok(_)` / `Err(_)`); there is no `__pos_0` to collapse on that edge.
+/// (`Ok(_)` / `Err(_)` / `Ok(())`); there is no `__pos_0` to collapse on that edge,
+/// and a second predecessor of that join is allowed.
 ///
 /// `getindex_w` is `try: int_w(...) except OperationError`. The rebuilt
 /// shell plus the discriminant switch is that `try` spelled as a `Result`.
@@ -10815,7 +11085,20 @@ fn collapse_rebuilt_shell_match(
             "match block {m} is not private to the rebuilt shells"
         ));
     }
-    let (_, _, shell_in) = match_discriminant(graph, m)?;
+    let bound_shell = forward_alias(graph, &n_path.shell_at_match, &n_path.into_match)
+        .ok_or_else(|| format!("match block {m} drops the Result shell"))?;
+    let bound_disc = n_path
+        .forwarded_disc
+        .as_ref()
+        .and_then(|disc| forward_alias(graph, disc, &n_path.into_match));
+    let found = match_discriminant_from(
+        graph,
+        m,
+        Some(&bound_shell),
+        bound_disc.as_ref(),
+        n_path.flag_true_is_err,
+    )?;
+    let shell_in = found.shell.clone();
     let shell_binds = graph.blocks[m]
         .inputargs
         .iter()
@@ -10829,14 +11112,13 @@ fn collapse_rebuilt_shell_match(
             "match block {m} binds the shell in {shell_binds} inputargs"
         ));
     }
-    if graph.blocks[m].operations.len() != 1 {
-        return Err(format!("match block {m} is not a pure discriminant switch"));
-    }
-    let (ok_link, err_link) = split_diamond_exits(&graph.blocks[m].exits, "rebuilt shell match")?;
+    let plumbing = found.plumbing_indices();
+    match_block_extra_ops_ok(graph, m, &plumbing)?;
+    match_restore_ops_are_copyable(graph, m, &plumbing)?;
+    let (ok_link, err_link) =
+        split_result_match_exits(&graph.blocks[m].exits, found.flag_true_is_err)?;
     let ok_arm = ok_link.target.0;
     let err_arm = err_link.target.0;
-    assert_single_pred(graph, ok_arm, "rebuilt shell match")?;
-    assert_single_pred(graph, err_arm, "rebuilt shell match")?;
     let ok_args_renamed: Vec<LinkArg> = ok_link
         .args
         .iter()
@@ -10888,6 +11170,16 @@ fn collapse_rebuilt_shell_match(
     {
         return Err("rebuilt shell Ok and Err arms share a block".to_string());
     }
+    // `Ok(_)` / `Ok(())` drops the unused shell phi (`arm_shell_vars_from_args`).
+    // That arm is then just a join (`_trace` `FrameAnchor::live`) and may
+    // already have another predecessor. Rewrite it only when a `__pos_0`
+    // read would edit the body.
+    if !ok_walk.reads.is_empty() {
+        assert_single_pred(graph, ok_arm, "rebuilt shell match")?;
+    }
+    if !err_walk.reads.is_empty() {
+        assert_single_pred(graph, err_arm, "rebuilt shell match")?;
+    }
     let mut collapses = Vec::new();
     for (block, pos) in ok_walk.reads.iter().chain(err_walk.reads.iter()) {
         let Some(read_result) = classify_pos0_carrier(graph, *block, *pos, "rebuilt shell match")?
@@ -10927,39 +11219,29 @@ fn collapse_rebuilt_shell_match(
         .expect("merged match still reachable from the Err shell");
     let n_last = n_path.hops.last().copied().unwrap_or(normal);
     let mut e_last = e_path.hops.last().copied().unwrap_or(handler);
-    let (_, disc, shell_in) = match_discriminant(graph, m).expect("match still a discriminant");
-    let (ok_link, err_link) = split_diamond_exits(&graph.blocks[m].exits, "rebuilt shell match")
-        .expect("match still a diamond");
-    let n_arm_payload = if n_path.hops.is_empty() {
-        ok_payload.clone()
-    } else {
-        n_path.shell_at_match.clone()
-    };
-    let e_arm_payload = if e_path.hops.is_empty() {
-        err_payload.clone()
-    } else {
-        e_path.shell_at_match.clone()
-    };
-    let ok_args = project_arm_args(
-        &n_path.into_match.args,
-        &graph.blocks[m].inputargs,
-        &ok_link.args,
-        &shell_in,
-        &n_arm_payload,
-        &disc,
-        0,
+    let bound_shell = forward_alias(graph, &n_path.shell_at_match, &n_path.into_match)
+        .expect("merged match still carries the Result shell");
+    let bound_disc = n_path
+        .forwarded_disc
+        .as_ref()
+        .and_then(|disc| forward_alias(graph, disc, &n_path.into_match));
+    let found = match_discriminant_from(
+        graph,
+        m,
+        Some(&bound_shell),
+        bound_disc.as_ref(),
+        n_path.flag_true_is_err,
     )
-    .expect("merged Ok args still project onto the Ok arm");
-    let mut err_args = project_arm_args(
-        &e_path.into_match.args,
-        &graph.blocks[m].inputargs,
-        &err_link.args,
-        &shell_in,
-        &e_arm_payload,
-        &disc,
-        1,
-    )
-    .expect("merged Err args still project onto the Err arm");
+    .expect("match still a discriminant");
+    let disc = found.switch_var.clone();
+    let field_disc = found.disc.clone();
+    let shell_in = found.shell.clone();
+    let bool_switch = found.bool_switch;
+    let plumbing = found.plumbing_indices();
+    let restore_indices = restore_op_indices_besides(graph, m, &plumbing);
+    let (ok_link, err_link) =
+        split_result_match_exits(&graph.blocks[m].exits, found.flag_true_is_err)
+            .expect("match still a diamond");
     if shared_hops {
         let mut tracked = err_shell.clone();
         let mut link = e_exit.clone();
@@ -10983,18 +11265,63 @@ fn collapse_rebuilt_shell_match(
         e_path = follow_hops_to_result_match(graph, &e_exit, err_shell)
             .expect("cloned restore hops still reach the match");
         e_last = e_path.hops.last().copied().unwrap_or(handler);
-        let e_arm_payload = e_path.shell_at_match.clone();
-        err_args = project_arm_args(
-            &e_path.into_match.args,
-            &graph.blocks[m].inputargs,
-            &err_link.args,
-            &shell_in,
-            &e_arm_payload,
-            &disc,
-            1,
-        )
-        .expect("cloned hop args still project onto the Err arm");
     }
+    let n_arm_payload = if n_path.hops.is_empty() {
+        ok_payload.clone()
+    } else {
+        n_path.shell_at_match.clone()
+    };
+    let e_arm_payload = if e_path.hops.is_empty() {
+        err_payload.clone()
+    } else {
+        e_path.shell_at_match.clone()
+    };
+    let n_input_map: Vec<(Variable, Variable)> = graph.blocks[m]
+        .inputargs
+        .iter()
+        .zip(n_path.into_match.args.iter())
+        .filter_map(|(input, arg)| match arg {
+            LinkArg::Value(var) => Some((input.clone(), var.clone())),
+            _ => None,
+        })
+        .collect();
+    let e_input_map: Vec<(Variable, Variable)> = graph.blocks[m]
+        .inputargs
+        .iter()
+        .zip(e_path.into_match.args.iter())
+        .filter_map(|(input, arg)| match arg {
+            LinkArg::Value(var) => Some((input.clone(), var.clone())),
+            _ => None,
+        })
+        .collect();
+    let n_restore = apply_copy_restore_ops(graph, m, n_last, &restore_indices, &n_input_map);
+    let e_restore = apply_copy_restore_ops(graph, m, e_last, &restore_indices, &e_input_map);
+    let ok_args = project_arm_args(
+        &n_path.into_match.args,
+        &graph.blocks[m].inputargs,
+        &ok_link.args,
+        &shell_in,
+        &n_arm_payload,
+        &field_disc,
+        &disc,
+        0,
+        bool_switch,
+        &n_restore,
+    )
+    .expect("merged Ok args still project onto the Ok arm");
+    let err_args = project_arm_args(
+        &e_path.into_match.args,
+        &graph.blocks[m].inputargs,
+        &err_link.args,
+        &shell_in,
+        &e_arm_payload,
+        &field_disc,
+        &disc,
+        1,
+        bool_switch,
+        &e_restore,
+    )
+    .expect("merged Err args still project onto the Err arm");
     delete_ops(graph, normal, ok_build);
     delete_ops(graph, handler, err_build);
     if !n_path.hops.is_empty() {
@@ -11007,6 +11334,9 @@ fn collapse_rebuilt_shell_match(
     graph.blocks[n_last].exitswitch = None;
     graph.blocks[e_last].exits = vec![Link::new_mixed(err_args, err_link.target, None)];
     graph.blocks[e_last].exitswitch = None;
+    for &hop in n_path.hops.iter().chain(e_path.hops.iter()) {
+        strip_result_disc_plumbing(graph, hop);
+    }
     for plan in collapses {
         apply_pos0_collapse(graph, &plan);
     }
@@ -11117,44 +11447,460 @@ fn single_exit(graph: &FunctionGraph, block: usize) -> Result<Link, String> {
     }
 }
 
-/// The match block's one `__discriminant` read, and the inputarg it reads.
-fn match_discriminant(
+/// `__discriminant` FieldRead of a `Result` in `ops`.
+fn result_disc_field_read(ops: &[SpaceOperation]) -> Option<(usize, Variable, Variable)> {
+    ops.iter().enumerate().find_map(|(i, op)| match &op.kind {
+        OpKind::FieldRead { base, field, .. }
+            if field.name == "__discriminant"
+                && field
+                    .owner_root
+                    .as_deref()
+                    .is_some_and(owner_is_result_enum) =>
+        {
+            op.result.clone().map(|disc| (i, disc, base.clone()))
+        }
+        _ => None,
+    })
+}
+
+fn bool_of_operand(ops: &[SpaceOperation], operand: &Variable) -> Option<(usize, Variable)> {
+    ops.iter().enumerate().find_map(|(i, op)| match &op.kind {
+        OpKind::UnaryOp {
+            op: o, operand: v, ..
+        } if o == "bool" && v == operand => op.result.clone().map(|flag| (i, flag)),
+        _ => None,
+    })
+}
+
+struct DiscEqFlag {
+    const_idx: usize,
+    eq_idx: usize,
+    flag: Variable,
+    against: i64,
+}
+
+fn const_int_01(op: &SpaceOperation) -> Option<(Variable, i64)> {
+    let val = match &op.kind {
+        OpKind::ConstInt(0) => 0,
+        OpKind::ConstInt(1) => 1,
+        OpKind::ConstUInt(0) => 0,
+        OpKind::ConstUInt(1) => 1,
+        _ => return None,
+    };
+    op.result.clone().map(|var| (var, val))
+}
+
+fn binop_eq_of_disc(
+    ops: &[SpaceOperation],
+    disc: &Variable,
+    all: &[SpaceOperation],
+) -> Option<DiscEqFlag> {
+    let consts: Vec<(usize, Variable, i64)> = all
+        .iter()
+        .enumerate()
+        .filter_map(|(i, op)| const_int_01(op).map(|(var, val)| (i, var, val)))
+        .collect();
+    ops.iter().enumerate().find_map(|(i, op)| {
+        let OpKind::BinOp {
+            op: name, lhs, rhs, ..
+        } = &op.kind
+        else {
+            return None;
+        };
+        if name != "eq" && name != "int_eq" {
+            return None;
+        }
+        let flag = op.result.clone()?;
+        consts.iter().find_map(|(const_idx, k, against)| {
+            ((lhs == disc && rhs == k) || (rhs == disc && lhs == k)).then(|| DiscEqFlag {
+                const_idx: *const_idx,
+                eq_idx: i,
+                flag: flag.clone(),
+                against: *against,
+            })
+        })
+    })
+}
+
+fn eq_flag_of_disc(ops: &[SpaceOperation], disc: &Variable) -> Option<DiscEqFlag> {
+    binop_eq_of_disc(ops, disc, ops)
+}
+
+fn summarize_block_ops(graph: &FunctionGraph, block: usize, tracked: &Variable) -> String {
+    graph.blocks[block]
+        .operations
+        .iter()
+        .map(|op| match &op.kind {
+            OpKind::FieldRead { base, field, .. } => format!(
+                "FieldRead {}::{} tracked={}",
+                field.owner_root.as_deref().unwrap_or("?"),
+                field.name,
+                base == tracked
+            ),
+            OpKind::UnaryOp { op: name, .. } => format!("UnaryOp({name})"),
+            OpKind::BinOp { op: name, .. } => format!("BinOp({name})"),
+            OpKind::ConstInt(v) => format!("ConstInt({v})"),
+            OpKind::Call { target, .. } => format!("Call {target:?}"),
+            other => {
+                let text = format!("{other:?}");
+                if text.len() > 80 {
+                    format!("{}…", &text[..80])
+                } else {
+                    text
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// GC restore / recast / keepalive that may sit next to a Result
+/// discriminant read (`shadowstack.py` `pop_roots`).
+fn is_match_restore_op(kind: &OpKind) -> bool {
+    is_gc_root_reload(kind)
+        || is_recast_narrow(kind)
+        || op_is_keepalive_until_here(kind)
+        || matches!(kind, OpKind::ConstNone)
+        || is_forwarding_restore_op(kind)
+}
+
+struct DiscPrepHop {
+    forwarded: Variable,
+    flag_true_is_err: bool,
+}
+
+/// Single-exit hop that reads `tracked.__discriminant` (and maybe
+/// `bool` / `eq(disc, 1)` of it) plus restores, then forwards the
+/// shell. The successor switches on the forwarded disc or flag.
+fn result_disc_prep_hop(
     graph: &FunctionGraph,
     block: usize,
-) -> Result<(usize, Variable, Variable), String> {
-    let found = graph.blocks[block]
+    tracked: &Variable,
+) -> Option<DiscPrepHop> {
+    let body = &graph.blocks[block];
+    if body.exits.len() != 1 || body.exitswitch.is_some() {
+        return None;
+    }
+    let forwards = body.exits[0]
+        .args
+        .iter()
+        .any(|arg| matches!(arg, LinkArg::Value(v) if v == tracked));
+    if !forwards {
+        return None;
+    }
+    let mut disc = None;
+    for op in &body.operations {
+        if let OpKind::FieldRead { base, field, .. } = &op.kind
+            && field.name == "__discriminant"
+            && field
+                .owner_root
+                .as_deref()
+                .is_some_and(owner_is_result_enum)
+            && base == tracked
+        {
+            if disc.is_some() {
+                return None;
+            }
+            disc = op.result.clone();
+            continue;
+        }
+        if let Some(d) = &disc
+            && bool_of_operand(std::slice::from_ref(op), d).is_some()
+        {
+            continue;
+        }
+        if let Some(d) = &disc
+            && binop_eq_of_disc(std::slice::from_ref(op), d, &body.operations).is_some()
+        {
+            continue;
+        }
+        if is_match_restore_op(&op.kind) {
+            continue;
+        }
+        return None;
+    }
+    let disc = disc?;
+    let bool_flag = bool_of_operand(&body.operations, &disc).map(|(_, flag)| flag);
+    let eq = eq_flag_of_disc(&body.operations, &disc);
+    let in_exit = |var: &Variable| {
+        body.exits[0]
+            .args
+            .iter()
+            .any(|arg| matches!(arg, LinkArg::Value(v) if v == var))
+    };
+    if let Some(flag) = &bool_flag
+        && in_exit(flag)
+    {
+        return Some(DiscPrepHop {
+            forwarded: flag.clone(),
+            flag_true_is_err: true,
+        });
+    }
+    if let Some(eq) = &eq
+        && in_exit(&eq.flag)
+    {
+        return Some(DiscPrepHop {
+            forwarded: eq.flag.clone(),
+            flag_true_is_err: eq.against == 1,
+        });
+    }
+    Some(DiscPrepHop {
+        forwarded: disc,
+        flag_true_is_err: true,
+    })
+}
+
+struct ResultMatchDisc {
+    disc_idx: Option<usize>,
+    bool_idx: Option<usize>,
+    const_idx: Option<usize>,
+    eq_idx: Option<usize>,
+    disc: Variable,
+    switch_var: Variable,
+    shell: Variable,
+    bool_switch: bool,
+    /// `true` when the switch flag's true arm is Err (`eq(disc, 1)` /
+    /// `bool(disc)` / raw disc `1`). `eq(disc, 0)` inverts it.
+    flag_true_is_err: bool,
+}
+
+impl ResultMatchDisc {
+    fn plumbing_indices(&self) -> Vec<usize> {
+        self.disc_idx
+            .into_iter()
+            .chain(self.bool_idx)
+            .chain(self.const_idx)
+            .chain(self.eq_idx)
+            .collect()
+    }
+}
+
+/// The match block's `__discriminant` read (or a forwarded disc), and
+/// the inputarg it reads. The switch may be the disc, `bool(disc)`, or
+/// `eq(disc, 0/1)`.
+fn match_discriminant(graph: &FunctionGraph, block: usize) -> Result<ResultMatchDisc, String> {
+    match_discriminant_from(graph, block, None, None, true)
+}
+
+fn match_discriminant_from(
+    graph: &FunctionGraph,
+    block: usize,
+    expected_shell: Option<&Variable>,
+    forwarded_disc: Option<&Variable>,
+    forwarded_flag_true_is_err: bool,
+) -> Result<ResultMatchDisc, String> {
+    let ops = &graph.blocks[block].operations;
+    let found = result_disc_field_read(ops);
+    let (disc_idx, disc, shell, forwarded) = if let Some((idx, disc, base)) = found {
+        if let Some(expected) = expected_shell
+            && base != *expected
+        {
+            return Err(format!(
+                "block {block} discriminant is not the forwarded Result shell"
+            ));
+        }
+        if !graph.blocks[block].inputargs.iter().any(|arg| arg == &base) {
+            return Err(format!(
+                "block {block} discriminant base is not an inputarg"
+            ));
+        }
+        (Some(idx), disc, base, false)
+    } else if let (Some(expected), Some(fwd)) = (expected_shell, forwarded_disc) {
+        if !graph.blocks[block]
+            .inputargs
+            .iter()
+            .any(|arg| arg == expected)
+        {
+            return Err(format!("block {block} Result shell is not an inputarg"));
+        }
+        if !graph.blocks[block].inputargs.iter().any(|arg| arg == fwd) {
+            return Err(format!(
+                "block {block} forwarded discriminant is not an inputarg"
+            ));
+        }
+        (None, fwd.clone(), expected.clone(), true)
+    } else {
+        return Err(format!("block {block} lacks a Result __discriminant read"));
+    };
+    let bool_hit = bool_of_operand(ops, &disc);
+    let eq_hit = eq_flag_of_disc(ops, &disc);
+    let switch_on_bool = matches!(
+        &graph.blocks[block].exitswitch,
+        Some(ExitSwitch::Value(sw)) if bool_hit.as_ref().is_some_and(|(_, flag)| flag == sw)
+    );
+    let switch_on_eq = matches!(
+        &graph.blocks[block].exitswitch,
+        Some(ExitSwitch::Value(sw)) if eq_hit.as_ref().is_some_and(|eq| eq.flag == *sw)
+    );
+    let switch_on_disc = matches!(
+        &graph.blocks[block].exitswitch,
+        Some(ExitSwitch::Value(sw)) if *sw == disc
+    );
+    if !switch_on_bool && !switch_on_eq && !switch_on_disc {
+        return Err(format!("block {block} does not switch on the discriminant"));
+    }
+    let bool_cases = graph.blocks[block]
+        .exits
+        .iter()
+        .any(|link| matches!(link.exitcase, Some(ExitCase::Bool(_))));
+    let (switch_var, bool_switch, bool_idx, flag_true_is_err) = if switch_on_bool {
+        let (idx, flag) = bool_hit.expect("bool switch requires bool(disc)");
+        (flag, true, Some(idx), true)
+    } else if switch_on_eq {
+        let eq = eq_hit.as_ref().expect("eq switch requires eq(disc)");
+        (eq.flag.clone(), true, None, eq.against == 1)
+    } else if forwarded && bool_cases {
+        (
+            disc.clone(),
+            true,
+            bool_hit.map(|(idx, _)| idx),
+            forwarded_flag_true_is_err,
+        )
+    } else {
+        (
+            disc.clone(),
+            false,
+            bool_hit.map(|(idx, _)| idx),
+            forwarded_flag_true_is_err,
+        )
+    };
+    Ok(ResultMatchDisc {
+        disc_idx,
+        bool_idx,
+        const_idx: eq_hit.as_ref().map(|eq| eq.const_idx),
+        eq_idx: eq_hit.as_ref().map(|eq| eq.eq_idx),
+        disc,
+        switch_var,
+        shell,
+        bool_switch,
+        flag_true_is_err,
+    })
+}
+
+fn split_result_match_exits(
+    exits: &[Link],
+    flag_true_is_err: bool,
+) -> Result<(Link, Link), String> {
+    let (ok, err) = split_diamond_exits(exits, "rebuilt shell match")?;
+    if flag_true_is_err {
+        Ok((ok, err))
+    } else {
+        Ok((err, ok))
+    }
+}
+
+fn match_block_extra_ops_ok(
+    graph: &FunctionGraph,
+    block: usize,
+    plumbing: &[usize],
+) -> Result<(), String> {
+    for (i, op) in graph.blocks[block].operations.iter().enumerate() {
+        if plumbing.contains(&i) {
+            continue;
+        }
+        if is_match_restore_op(&op.kind) {
+            continue;
+        }
+        return Err(format!(
+            "match block {block} is not a pure discriminant switch"
+        ));
+    }
+    Ok(())
+}
+
+fn match_restore_ops_are_copyable(
+    graph: &FunctionGraph,
+    block: usize,
+    plumbing: &[usize],
+) -> Result<(), String> {
+    let mut defined = graph.blocks[block].inputargs.clone();
+    for (i, op) in graph.blocks[block].operations.iter().enumerate() {
+        if plumbing.contains(&i) || !is_match_restore_op(&op.kind) {
+            continue;
+        }
+        for operand in op_operand_vars(&op.kind) {
+            if !defined.iter().any(|known| known == &operand) {
+                return Err(format!("match block {block} restore operand is not local"));
+            }
+        }
+        if let Some(result) = &op.result {
+            defined.push(result.clone());
+        }
+    }
+    Ok(())
+}
+
+fn restore_op_indices_besides(
+    graph: &FunctionGraph,
+    block: usize,
+    plumbing: &[usize],
+) -> Vec<usize> {
+    graph.blocks[block]
         .operations
         .iter()
         .enumerate()
-        .find_map(|(i, op)| match &op.kind {
-            OpKind::FieldRead { base, field, .. }
-                if field.name == "__discriminant"
-                    && field
-                        .owner_root
-                        .as_deref()
-                        .is_some_and(owner_is_result_enum) =>
-            {
-                op.result.clone().map(|disc| (i, disc, base.clone()))
+        .filter(|(i, op)| !plumbing.contains(i) && is_match_restore_op(&op.kind))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn apply_copy_restore_ops(
+    graph: &mut FunctionGraph,
+    src: usize,
+    dest: usize,
+    restore_indices: &[usize],
+    input_map: &[(Variable, Variable)],
+) -> Vec<(Variable, Variable)> {
+    let mut map = input_map.to_vec();
+    let mut result_map = Vec::new();
+    for &idx in restore_indices {
+        let op = graph.blocks[src].operations[idx].clone();
+        let remap = |var: &Variable| linear_remap(&map, var);
+        let kind = crate::inline::remap_op_kind(&op.kind, &remap);
+        let result = op.result.as_ref().map(|_| graph.alloc_value_var());
+        if let (Some(old), Some(fresh)) = (&op.result, &result) {
+            map.push((old.clone(), fresh.clone()));
+            result_map.push((old.clone(), fresh.clone()));
+        }
+        graph.blocks[dest]
+            .operations
+            .push(SpaceOperation { result, kind });
+    }
+    result_map
+}
+
+fn strip_result_disc_plumbing(graph: &mut FunctionGraph, block: usize) {
+    let mut remove = Vec::new();
+    let mut disc_vars = Vec::new();
+    for (i, op) in graph.blocks[block].operations.iter().enumerate() {
+        if let OpKind::FieldRead { field, .. } = &op.kind
+            && field.name == "__discriminant"
+            && field
+                .owner_root
+                .as_deref()
+                .is_some_and(owner_is_result_enum)
+        {
+            remove.push(i);
+            if let Some(result) = &op.result {
+                disc_vars.push(result.clone());
             }
-            _ => None,
-        });
-    let Some((idx, disc, shell)) = found else {
-        return Err(format!("block {block} lacks a Result __discriminant read"));
-    };
-    match &graph.blocks[block].exitswitch {
-        Some(ExitSwitch::Value(sw)) if *sw == disc => {}
-        _ => return Err(format!("block {block} does not switch on the discriminant")),
+        }
     }
-    if !graph.blocks[block]
-        .inputargs
-        .iter()
-        .any(|arg| arg == &shell)
-    {
-        return Err(format!(
-            "block {block} discriminant base is not an inputarg"
-        ));
+    for (i, op) in graph.blocks[block].operations.iter().enumerate() {
+        if let OpKind::UnaryOp { op: o, operand, .. } = &op.kind
+            && o == "bool"
+            && disc_vars.iter().any(|disc| disc == operand)
+        {
+            remove.push(i);
+        }
     }
-    Ok((idx, disc, shell))
+    for disc in &disc_vars {
+        if let Some(eq) = eq_flag_of_disc(&graph.blocks[block].operations, disc) {
+            remove.push(eq.const_idx);
+            remove.push(eq.eq_idx);
+        }
+    }
+    delete_ops(graph, block, remove);
 }
 
 /// The arm inputarg bound from the match link's shell argument.
@@ -11180,6 +11926,54 @@ struct ShellPos0Walk {
     reads: Vec<(usize, usize)>,
     /// Every block the walk entered, including `start`.
     visited: Vec<usize>,
+}
+
+/// True when `shell` is later read as a `Result` (`__pos_0`, another
+/// field, a call, or a function-exit arg). An unused live-set copy
+/// that only hits joins returns false.
+fn shell_consumed_as_result(
+    graph: &FunctionGraph,
+    start: usize,
+    shell: &Variable,
+) -> Result<bool, String> {
+    let mut seen: Vec<(usize, u64)> = Vec::new();
+    let mut work = vec![(start, shell.clone())];
+    while let Some((block, var)) = work.pop() {
+        if seen.iter().any(|(b, id)| *b == block && *id == var.id()) {
+            continue;
+        }
+        seen.push((block, var.id()));
+        for op in &graph.blocks[block].operations {
+            if op_operand_vars(&op.kind)
+                .iter()
+                .any(|operand| operand == &var)
+            {
+                return Ok(true);
+            }
+        }
+        if let Some(ExitSwitch::Value(sw)) = &graph.blocks[block].exitswitch
+            && sw == &var
+        {
+            return Ok(true);
+        }
+        for link in &graph.blocks[block].exits {
+            let to_exit =
+                link.target.0 == graph.returnblock.0 || link.target.0 == graph.exceptblock.0;
+            for (i, arg) in link.args.iter().enumerate() {
+                if !matches!(arg, LinkArg::Value(v) if v == &var) {
+                    continue;
+                }
+                if to_exit {
+                    return Ok(true);
+                }
+                let Some(next) = graph.blocks[link.target.0].inputargs.get(i).cloned() else {
+                    continue;
+                };
+                work.push((link.target.0, next));
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Blocks reachable from `start` whose shell alias is only a `__pos_0`
@@ -11208,10 +12002,12 @@ fn shell_pos0_reads(
         if !visited.contains(&block) {
             visited.push(block);
         }
-        // `start` is the arm block, already `assert_single_pred`. Every
-        // later block this walk enters has to be single-predecessor too:
-        // a merge that only forwards the shell still joins a value this
-        // walk did not rewrite into the reader downstream.
+        // Later blocks this walk enters have to be single-predecessor
+        // when the shell is still a Result being unwrapped: a merge that
+        // only forwards the shell still joins a value this walk did not
+        // rewrite into the reader downstream. `Ok(())` keeps the unused
+        // shell in the live set (`_trace` `FrameAnchor::live`); a join
+        // of that dead phi is not an unwrap, so the walk stops.
         if block != start {
             let preds = graph
                 .blocks
@@ -11220,7 +12016,10 @@ fn shell_pos0_reads(
                 .filter(|link| link.target.0 == block)
                 .count();
             if preds != 1 {
-                return Err(format!("block {block} has {preds} predecessors"));
+                if shell_consumed_as_result(graph, block, &var)? {
+                    return Err(format!("block {block} has {preds} predecessors"));
+                }
+                continue;
             }
         }
         let mut read_result: Option<Variable> = None;
@@ -11301,7 +12100,10 @@ fn project_arm_args(
     shell_in_match: &Variable,
     payload: &Variable,
     disc: &Variable,
+    switch_var: &Variable,
     disc_case: i64,
+    bool_switch: bool,
+    extra: &[(Variable, Variable)],
 ) -> Result<Vec<LinkArg>, String> {
     arm_args
         .iter()
@@ -11310,10 +12112,23 @@ fn project_arm_args(
             LinkArg::Value(var) if var == shell_in_match => Ok(LinkArg::Value(payload.clone())),
             // The switch value is this arm's tag. The arm no longer goes
             // through the discriminant block, so pass the tag as a constant.
+            LinkArg::Value(var) if var == switch_var => {
+                let value = if bool_switch {
+                    crate::flowspace::model::ConstValue::Bool(disc_case != 0)
+                } else {
+                    crate::flowspace::model::ConstValue::Int(disc_case)
+                };
+                Ok(LinkArg::Const(crate::flowspace::model::Constant::new(
+                    value,
+                )))
+            }
             LinkArg::Value(var) if var == disc => {
                 Ok(LinkArg::Const(crate::flowspace::model::Constant::new(
                     crate::flowspace::model::ConstValue::Int(disc_case),
                 )))
+            }
+            LinkArg::Value(var) if extra.iter().any(|(from, _)| from == var) => {
+                Ok(LinkArg::Value(linear_remap(extra, var)))
             }
             LinkArg::Value(var) => {
                 let pos = match_inputs
@@ -11390,7 +12205,8 @@ fn owner_is_result_of_pyerror(owner: &str) -> bool {
 /// True iff `owner` names any `Result<T, E>` — the discriminant read of a
 /// catch-and-rewrap match, including `Result<i64, RBigIntError>`.
 fn owner_is_result_enum(owner: &str) -> bool {
-    owner.contains("Result<")
+    let stripped = majit_ir::descr::strip_generic_args(owner);
+    stripped.rsplit("::").next().unwrap_or(stripped.as_ref()) == "Result"
 }
 
 /// True iff `owner` is the short `Result::Ok` / `Result::Err` variant owner
@@ -13603,6 +14419,9 @@ fn restore_op_indices(graph: &FunctionGraph, block: usize) -> Vec<usize> {
 }
 
 fn is_forwarding_restore_op(kind: &OpKind) -> bool {
+    if is_gc_root_reload(kind) || is_recast_narrow(kind) {
+        return true;
+    }
     match kind {
         OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
@@ -13709,8 +14528,12 @@ pub(crate) fn split_diamond_exits(exits: &[Link], name: &str) -> Result<(Link, L
     let mut default: Option<Link> = None;
     for l in exits {
         match &l.exitcase {
-            Some(ExitCase::Const(ConstValue::Int(0))) => cont = Some(l.clone()),
-            Some(ExitCase::Const(ConstValue::Int(1))) => brk = Some(l.clone()),
+            Some(ExitCase::Const(ConstValue::Int(0))) | Some(ExitCase::Bool(false)) => {
+                cont = Some(l.clone())
+            }
+            Some(ExitCase::Const(ConstValue::Int(1))) | Some(ExitCase::Bool(true)) => {
+                brk = Some(l.clone())
+            }
             Some(ExitCase::Const(ConstValue::UniStr(s))) if s == "default" => {
                 default = Some(l.clone())
             }
@@ -18506,6 +19329,377 @@ mod rebuilt_shell_collapse_tests {
         );
     }
 
+    fn push_bool(graph: &mut FunctionGraph, block: BlockId, operand: &Variable) -> Variable {
+        graph
+            .push_op_var(
+                block,
+                OpKind::UnaryOp {
+                    op: "bool".into(),
+                    operand: operand.clone(),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .expect("bool")
+    }
+
+    fn push_shadow_stack_get(
+        graph: &mut FunctionGraph,
+        block: BlockId,
+        idx: &Variable,
+    ) -> Variable {
+        graph
+            .push_op_var(
+                block,
+                OpKind::Call {
+                    target: CallTarget::function_path([
+                        "pyre_object",
+                        "gc_roots",
+                        "shadow_stack_get",
+                    ]),
+                    args: crate::model::call_args(vec![idx.clone()]),
+                    result_ty: ValueType::Ref(Some("PyObject".into())),
+                },
+                true,
+            )
+            .expect("shadow_stack_get")
+    }
+
+    /// `match` lowered as `d = r.__discriminant; m = bool(d); switch m`.
+    #[test]
+    fn bool_of_discriminant_match_drops_the_rebuilt_shells() {
+        let mut fix = fixture();
+        let match_id = BlockId(fix.graph.blocks[fix.normal].exits[0].target.0);
+        let disc = fix.graph.blocks[match_id.0].operations[0]
+            .result
+            .clone()
+            .expect("disc");
+        let flag = push_bool(&mut fix.graph, match_id, &disc);
+        fix.graph.block_mut(match_id).exitswitch = Some(ExitSwitch::Value(flag));
+        {
+            let exits = &mut fix.graph.block_mut(match_id).exits;
+            exits[0].exitcase = Some(ExitCase::Bool(false));
+            exits[1].exitcase = Some(ExitCase::Bool(true));
+        }
+        collapse(&mut fix).expect("bool(disc) match collapses");
+        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
+        let exit = &fix.graph.blocks[fix.normal].exits[0];
+        assert_eq!(exit.target.0, fix.ok_arm);
+    }
+
+    /// `match` lowered as `d = r.__discriminant; f = eq(d, 1); switch f`.
+    #[test]
+    fn eq_of_discriminant_match_drops_the_rebuilt_shells() {
+        let mut fix = fixture();
+        let match_id = BlockId(fix.graph.blocks[fix.normal].exits[0].target.0);
+        let disc = fix.graph.blocks[match_id.0].operations[0]
+            .result
+            .clone()
+            .expect("disc");
+        let one = fix
+            .graph
+            .push_op_var(match_id, OpKind::ConstInt(1), true)
+            .expect("1");
+        let flag = fix
+            .graph
+            .push_op_var(
+                match_id,
+                OpKind::BinOp {
+                    op: "eq".into(),
+                    lhs: disc,
+                    rhs: one,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .expect("eq");
+        fix.graph.block_mut(match_id).exitswitch = Some(ExitSwitch::Value(flag));
+        {
+            let exits = &mut fix.graph.block_mut(match_id).exits;
+            exits[0].exitcase = Some(ExitCase::Bool(false));
+            exits[1].exitcase = Some(ExitCase::Bool(true));
+        }
+        collapse(&mut fix).expect("eq(disc, 1) match collapses");
+        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
+        let exit = &fix.graph.blocks[fix.normal].exits[0];
+        assert_eq!(exit.target.0, fix.ok_arm);
+    }
+
+    /// GC restore ops in the match block (`shadow_stack_get`) stay
+    /// beside `__discriminant` / `bool` (`shadowstack.py` `pop_roots`).
+    #[test]
+    fn gc_restore_in_the_match_block_still_drops_the_shells() {
+        let mut fix = fixture();
+        let match_id = BlockId(fix.graph.blocks[fix.normal].exits[0].target.0);
+        let idx = fix.graph.alloc_value_var();
+        fix.graph.blocks[match_id.0].inputargs.push(idx.clone());
+        fix.graph.blocks[fix.normal].exits[0]
+            .args
+            .push(LinkArg::Value(idx.clone()));
+        fix.graph.blocks[fix.handler].exits[0]
+            .args
+            .push(LinkArg::Value(idx.clone()));
+        let restored = push_shadow_stack_get(&mut fix.graph, match_id, &idx);
+        let _ = restored;
+        collapse(&mut fix).expect("GC restore in the match collapses");
+        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
+        let exit = &fix.graph.blocks[fix.normal].exits[0];
+        assert_eq!(exit.target.0, fix.ok_arm);
+        assert!(
+            fix.graph.blocks[fix.normal]
+                .operations
+                .iter()
+                .any(|op| is_gc_root_reload(&op.kind)),
+            "the restore is copied onto the normal edge"
+        );
+    }
+
+    /// Disc FieldRead in a hop, switch on the forwarded disc in the
+    /// successor — `_trace`'s block-75 shape.
+    #[test]
+    fn disc_prep_hop_then_switch_drops_the_rebuilt_shells() {
+        let mut fix = fixture();
+        let match_id = BlockId(fix.graph.blocks[fix.normal].exits[0].target.0);
+        let shell_in = fix.graph.blocks[match_id.0].inputargs[0].clone();
+        let (hop_id, hop_args) = fix.graph.create_block_with_arg_vars(1);
+        let hop_shell = hop_args[0].clone();
+        let disc = fix
+            .graph
+            .push_op_var(
+                hop_id,
+                OpKind::FieldRead {
+                    base: hop_shell.clone(),
+                    field: disc_owner(),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("hop disc");
+        let idx = fix.graph.alloc_value_var();
+        let _ = push_shadow_stack_get(&mut fix.graph, hop_id, &idx);
+        fix.graph.blocks[match_id.0].operations.clear();
+        let disc_in = fix.graph.alloc_value_var();
+        fix.graph.blocks[match_id.0].inputargs = vec![shell_in, disc_in.clone()];
+        fix.graph.block_mut(match_id).exitswitch = Some(ExitSwitch::Value(disc_in));
+        fix.graph.set_goto_mixed(
+            hop_id,
+            match_id,
+            vec![LinkArg::Value(hop_shell), LinkArg::Value(disc)],
+        );
+        fix.graph
+            .set_goto(BlockId(fix.normal), hop_id, vec![fix.ok_shell.clone()]);
+        fix.graph
+            .set_goto(BlockId(fix.handler), hop_id, vec![fix.err_shell.clone()]);
+        collapse(&mut fix).expect("disc-prep hop collapses");
+        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
+        let hop = fix.graph.blocks[fix.normal].exits[0].target.0;
+        assert_eq!(fix.graph.blocks[hop].exits[0].target.0, fix.ok_arm);
+        assert!(
+            !fix.graph.blocks[hop].operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+                )
+            }),
+            "disc FieldRead is stripped from the hop so it does not read the payload"
+        );
+    }
+
+    /// Disc FieldRead + `eq(disc, 1)` in a hop, switch on the forwarded
+    /// flag — `_trace`'s block-75 shape.
+    #[test]
+    fn disc_eq_one_prep_hop_then_switch_drops_the_rebuilt_shells() {
+        let mut fix = fixture();
+        let match_id = BlockId(fix.graph.blocks[fix.normal].exits[0].target.0);
+        let shell_in = fix.graph.blocks[match_id.0].inputargs[0].clone();
+        let (hop_id, hop_args) = fix.graph.create_block_with_arg_vars(1);
+        let hop_shell = hop_args[0].clone();
+        let disc = fix
+            .graph
+            .push_op_var(
+                hop_id,
+                OpKind::FieldRead {
+                    base: hop_shell.clone(),
+                    field: disc_owner(),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("hop disc");
+        let one = fix
+            .graph
+            .push_op_var(hop_id, OpKind::ConstInt(1), true)
+            .expect("1");
+        let flag = fix
+            .graph
+            .push_op_var(
+                hop_id,
+                OpKind::BinOp {
+                    op: "eq".into(),
+                    lhs: disc,
+                    rhs: one,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .expect("eq");
+        fix.graph.blocks[match_id.0].operations.clear();
+        let flag_in = fix.graph.alloc_value_var();
+        fix.graph.blocks[match_id.0].inputargs = vec![shell_in, flag_in.clone()];
+        fix.graph.block_mut(match_id).exitswitch = Some(ExitSwitch::Value(flag_in));
+        {
+            let exits = &mut fix.graph.block_mut(match_id).exits;
+            exits[0].exitcase = Some(ExitCase::Bool(false));
+            exits[1].exitcase = Some(ExitCase::Bool(true));
+        }
+        fix.graph.set_goto_mixed(
+            hop_id,
+            match_id,
+            vec![LinkArg::Value(hop_shell), LinkArg::Value(flag)],
+        );
+        fix.graph
+            .set_goto(BlockId(fix.normal), hop_id, vec![fix.ok_shell.clone()]);
+        fix.graph
+            .set_goto(BlockId(fix.handler), hop_id, vec![fix.err_shell.clone()]);
+        collapse(&mut fix).expect("eq(disc, 1) hop collapses");
+        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
+        let hop = fix.graph.blocks[fix.normal].exits[0].target.0;
+        assert_eq!(fix.graph.blocks[hop].exits[0].target.0, fix.ok_arm);
+        assert!(
+            !fix.graph.blocks[hop].operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+                ) || matches!(&op.kind, OpKind::BinOp { op, .. } if op == "eq")
+            }),
+            "disc FieldRead and eq are stripped from the hop"
+        );
+    }
+
+    /// `Ok(())` arm that does not receive the shell (`_trace`
+    /// `FrameAnchor::live`) is already a join. Collapse only rewrites
+    /// the match exits, so a second predecessor is allowed.
+    #[test]
+    fn shared_ok_arm_without_pos0_still_drops_the_rebuilt_shells() {
+        let mut fix = fixture();
+        let match_id = BlockId(fix.graph.blocks[fix.normal].exits[0].target.0);
+        let shell_in = fix.graph.blocks[match_id.0].inputargs[0].clone();
+        let (hop_id, hop_args) = fix.graph.create_block_with_arg_vars(1);
+        let hop_shell = hop_args[0].clone();
+        let disc = fix
+            .graph
+            .push_op_var(
+                hop_id,
+                OpKind::FieldRead {
+                    base: hop_shell.clone(),
+                    field: disc_owner(),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("hop disc");
+        let one = fix
+            .graph
+            .push_op_var(hop_id, OpKind::ConstInt(1), true)
+            .expect("1");
+        let flag = fix
+            .graph
+            .push_op_var(
+                hop_id,
+                OpKind::BinOp {
+                    op: "eq".into(),
+                    lhs: disc,
+                    rhs: one,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .expect("eq");
+        fix.graph.blocks[match_id.0].operations.clear();
+        let flag_in = fix.graph.alloc_value_var();
+        fix.graph.blocks[match_id.0].inputargs = vec![shell_in.clone(), flag_in.clone()];
+        fix.graph.block_mut(match_id).exitswitch = Some(ExitSwitch::Value(flag_in));
+        {
+            let exits = &mut fix.graph.block_mut(match_id).exits;
+            exits[0].exitcase = Some(ExitCase::Bool(false));
+            exits[0].args.clear();
+            exits[1].exitcase = Some(ExitCase::Bool(true));
+            exits[1].args = vec![LinkArg::Value(shell_in)];
+        }
+        fix.graph.blocks[fix.ok_arm].operations.clear();
+        fix.graph.blocks[fix.ok_arm].inputargs.clear();
+        let unit = fix
+            .graph
+            .push_op_var(BlockId(fix.ok_arm), OpKind::ConstInt(0), true)
+            .expect("unit");
+        fix.graph.set_return(BlockId(fix.ok_arm), Some(unit));
+        fix.graph.set_goto_mixed(
+            hop_id,
+            match_id,
+            vec![LinkArg::Value(hop_shell), LinkArg::Value(flag)],
+        );
+        fix.graph
+            .set_goto(BlockId(fix.normal), hop_id, vec![fix.ok_shell.clone()]);
+        fix.graph
+            .set_goto(BlockId(fix.handler), hop_id, vec![fix.err_shell.clone()]);
+        let (extra_id, _) = fix.graph.create_block_with_arg_vars(0);
+        fix.graph
+            .set_goto(extra_id, BlockId(fix.ok_arm), Vec::new());
+        collapse(&mut fix).expect("shared Ok arm with no pos0 still collapses");
+        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
+        let hop = fix.graph.blocks[fix.normal].exits[0].target.0;
+        assert_eq!(fix.graph.blocks[hop].exits[0].target.0, fix.ok_arm);
+        assert_eq!(
+            fix.graph.blocks[extra_id.0].exits[0].target.0, fix.ok_arm,
+            "the extra predecessor of the Ok arm stays"
+        );
+    }
+
+    /// `Ok(())` still forwards the unused shell in the live set. A later
+    /// join that does not unwrap it (`_trace` after `FrameAnchor::live`)
+    /// is not a `__pos_0` merge.
+    #[test]
+    fn unused_live_shell_join_after_ok_unit_still_drops() {
+        let mut fix = fixture();
+        let shell = fix.graph.blocks[fix.ok_arm].inputargs[0].clone();
+        let filler = fix.graph.alloc_value_var();
+        let (join_id, join_args) = fix.graph.create_block_with_arg_vars(2);
+        fix.graph.blocks[fix.ok_arm].operations.clear();
+        fix.graph.set_goto_mixed(
+            BlockId(fix.ok_arm),
+            join_id,
+            vec![LinkArg::Value(shell), LinkArg::Value(filler)],
+        );
+        fix.graph.set_return(join_id, Some(join_args[1].clone()));
+        let extra_shell = fix.graph.alloc_value_var();
+        let extra_fill = fix.graph.alloc_value_var();
+        let (extra_id, _) = fix.graph.create_block_with_arg_vars(0);
+        fix.graph.set_goto_mixed(
+            extra_id,
+            join_id,
+            vec![LinkArg::Value(extra_shell), LinkArg::Value(extra_fill)],
+        );
+        collapse(&mut fix).expect("unused live-set join still collapses");
+        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
+    }
+
+    /// A `__pos_0` read on a shared arm would rewrite a join the other
+    /// predecessor still uses. Collapse declines.
+    #[test]
+    fn shared_ok_arm_with_pos0_still_declines() {
+        let mut fix = fixture();
+        let dummy = fix.graph.alloc_value_var();
+        let (extra_id, _) = fix.graph.create_block_with_arg_vars(0);
+        fix.graph
+            .set_goto(extra_id, BlockId(fix.ok_arm), vec![dummy]);
+        let err = collapse(&mut fix).expect_err("shared Ok arm with __pos_0 declines");
+        assert!(err.contains("predecessors"), "{err}");
+        assert_eq!(shell_ctors(&fix.graph), 2, "decline leaves the shells");
+    }
+
     /// Duplicate match inputargs that every predecessor fills with the
     /// same variable (`simplify.py` `remove_identical_vars`) merge, then
     /// the single remaining shell slot collapses.
@@ -22417,6 +23611,223 @@ mod from_residual_conversion_tests {
                 .as_deref()
                 .is_some_and(|owner| owner.ends_with("::Break"))
         );
+    }
+
+    /// `lower_result_branch_as_match` stores `Err(e)` in Break when the
+    /// banks differ, then deletes the `Result::branch` stamp. The raise
+    /// peels that shell so exceptblock sees the carrier, not `Result`.
+    #[test]
+    fn carrier_break_shell_raises_the_err_payload() {
+        let mut graph = FunctionGraph::new("carrier_break_shell");
+        let start = graph.startblock;
+        let e = graph.alloc_value_var();
+        graph.blocks[start.0].inputargs = vec![e.clone()];
+        let wrapped = crate::front::option_variant::emit_sum_variant(
+            &mut graph,
+            start,
+            "core::result::Result",
+            "Err",
+            1,
+            Some(("core::result::Result::Err", e, ValueType::Ref(None))),
+        );
+        let cf_owner = "ControlFlow<Result<Never,PyError>,()>";
+        let break_owner = format!("{cf_owner}::Break");
+        let cf = crate::front::option_variant::emit_sum_variant(
+            &mut graph,
+            start,
+            cf_owner,
+            "Break",
+            1,
+            Some((break_owner.as_str(), wrapped, ValueType::Ref(None))),
+        );
+        let (arm, arm_inputs) = graph.create_block_with_arg_vars(1);
+        graph.set_goto(start, arm, vec![cf]);
+        let payload = graph
+            .push_op_var(
+                arm,
+                OpKind::FieldRead {
+                    base: arm_inputs[0].clone(),
+                    field: FieldDescriptor::new("__pos_0", Some(break_owner.clone())),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("payload");
+        let residual = graph
+            .push_op_var(
+                arm,
+                OpKind::Call {
+                    target: CallTarget::method("from_residual", Some("FromResidual".into())),
+                    args: crate::model::call_args(vec![payload.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("from_residual");
+        graph.set_return(arm, Some(residual.clone()));
+        let outcome = rewire(&mut graph, residual).expect("carrier shell raises");
+        assert_eq!(outcome.tail_forwards, 0);
+        let arg = raised_carrier(&graph);
+        let Some(OpKind::FieldRead { base, field, .. }) = producing_op(&graph, &arg) else {
+            panic!("raise peels Result::Err.__pos_0");
+        };
+        assert_eq!(field.name, "__pos_0");
+        assert!(
+            field
+                .owner_root
+                .as_deref()
+                .is_some_and(|owner| owner_is_result_variant(owner, "Err")),
+            "owner={:?}",
+            field.owner_root
+        );
+        assert_eq!(base, &payload);
+    }
+
+    /// Equal banks store `e` in Break. The raise is that payload; do not
+    /// invent an `Err.__pos_0` read on the carrier itself.
+    #[test]
+    fn carrier_break_equal_banks_raise_the_break_payload() {
+        let mut graph = FunctionGraph::new("carrier_break_equal");
+        let start = graph.startblock;
+        let e = graph.alloc_value_var();
+        graph.blocks[start.0].inputargs = vec![e.clone()];
+        let cf_owner = "ControlFlow<Result<Never,PyError>,()>";
+        let break_owner = format!("{cf_owner}::Break");
+        let cf = crate::front::option_variant::emit_sum_variant(
+            &mut graph,
+            start,
+            cf_owner,
+            "Break",
+            1,
+            Some((break_owner.as_str(), e, ValueType::Ref(None))),
+        );
+        let payload = graph
+            .push_op_var(
+                start,
+                OpKind::FieldRead {
+                    base: cf,
+                    field: FieldDescriptor::new("__pos_0", Some(break_owner)),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("payload");
+        let residual = graph
+            .push_op_var(
+                start,
+                OpKind::Call {
+                    target: CallTarget::method("from_residual", Some("FromResidual".into())),
+                    args: crate::model::call_args(vec![payload.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("from_residual");
+        graph.set_return(start, Some(residual.clone()));
+        let outcome = rewire(&mut graph, residual).expect("equal banks raise");
+        assert_eq!(outcome.tail_forwards, 0);
+        let arg = raised_carrier(&graph);
+        let Some(OpKind::FieldRead { field, .. }) = producing_op(&graph, &arg) else {
+            panic!("direct raise reads Break.__pos_0");
+        };
+        assert_eq!(field.name, "__pos_0");
+        assert!(
+            field
+                .owner_root
+                .as_deref()
+                .is_some_and(|owner| owner.ends_with("::Break")),
+            "owner={:?}",
+            field.owner_root
+        );
+        assert_eq!(arg, payload);
+    }
+
+    /// Continue and Break constructors join at the ControlFlow phi the
+    /// Break-arm `from_residual` reads. Skip Continue; peel the Break
+    /// `Err` shell.
+    #[test]
+    fn carrier_break_shell_peels_across_a_continue_phi() {
+        let mut graph = FunctionGraph::new("carrier_break_phi");
+        let start = graph.startblock;
+        let e = graph.alloc_value_var();
+        graph.blocks[start.0].inputargs = vec![e.clone()];
+        let cf_owner = "ControlFlow<Result<Never,PyError>,()>";
+        let break_owner = format!("{cf_owner}::Break");
+        let continue_owner = format!("{cf_owner}::Continue");
+        let (cont_arm, _) = graph.create_block_with_arg_vars(0);
+        let (break_arm, break_inputs) = graph.create_block_with_arg_vars(1);
+        let (join, join_inputs) = graph.create_block_with_arg_vars(1);
+        graph.set_goto(start, break_arm, vec![e.clone()]);
+        let dummy = graph.alloc_value_var();
+        graph.blocks[cont_arm.0].inputargs = vec![dummy.clone()];
+        let cont = crate::front::option_variant::emit_sum_variant(
+            &mut graph,
+            cont_arm,
+            cf_owner,
+            "Continue",
+            0,
+            Some((continue_owner.as_str(), dummy, ValueType::Int)),
+        );
+        graph.set_goto(cont_arm, join, vec![cont]);
+        let wrapped = crate::front::option_variant::emit_sum_variant(
+            &mut graph,
+            break_arm,
+            "Result",
+            "Err",
+            1,
+            Some(("Result::Err", break_inputs[0].clone(), ValueType::Ref(None))),
+        );
+        let cf = crate::front::option_variant::emit_sum_variant(
+            &mut graph,
+            break_arm,
+            cf_owner,
+            "Break",
+            1,
+            Some((break_owner.as_str(), wrapped, ValueType::Ref(None))),
+        );
+        graph.set_goto(break_arm, join, vec![cf]);
+        let payload = graph
+            .push_op_var(
+                join,
+                OpKind::FieldRead {
+                    base: join_inputs[0].clone(),
+                    field: FieldDescriptor::new("__pos_0", Some(break_owner)),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("payload");
+        let residual = graph
+            .push_op_var(
+                join,
+                OpKind::Call {
+                    target: CallTarget::method("from_residual", Some("FromResidual".into())),
+                    args: crate::model::call_args(vec![payload.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("from_residual");
+        graph.set_return(join, Some(residual.clone()));
+        let outcome = rewire(&mut graph, residual).expect("phi shell raises");
+        assert_eq!(outcome.tail_forwards, 0);
+        let arg = raised_carrier(&graph);
+        let Some(OpKind::FieldRead { base, field, .. }) = producing_op(&graph, &arg) else {
+            panic!("raise peels Result::Err.__pos_0 across the phi");
+        };
+        assert_eq!(field.name, "__pos_0");
+        assert!(
+            field
+                .owner_root
+                .as_deref()
+                .is_some_and(|owner| owner_is_result_variant(owner, "Err")),
+            "owner={:?}",
+            field.owner_root
+        );
+        assert_eq!(base, &payload);
     }
 
     #[test]

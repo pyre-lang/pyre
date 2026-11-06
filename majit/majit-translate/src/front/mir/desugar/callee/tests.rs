@@ -9,9 +9,9 @@ use crate::front::mir::tests::{
     fixture_llbc, fmt_arguments_adt, fmt_arguments_decl, fmt_format_decl,
     format_as_bytes_window_llbc, hint_must_use_decl, item_meta_json, llbc_with_trait_impls,
     llbc_with_types, local_of, move_op, opaque_decl, option_adt_node, option_enum, place_of,
-    ptr_ty, ref_rvalue, ref_string, span_json, string_adt, string_as_bytes_decl, string_decl,
-    subject_decl, type_decl_alias, type_decl_struct, unit_fn_ptr, unit_ty, window_shared_slice,
-    window_slice,
+    ptr_ty, ref_rvalue, ref_string, scalar_ty, span_json, string_adt, string_as_bytes_decl,
+    string_decl, subject_decl, type_decl_alias, type_decl_struct, unit_fn_ptr, unit_ty,
+    window_shared_slice, window_slice,
 };
 
 /// Every row of the fn-pointer family decision, including the two the
@@ -772,7 +772,44 @@ fn add_dest_struct_field_guard_classifies_uses() {
             "Ref": {"place": field_place(1, 0), "kind": "Shared", "ptr_metadata": null}
         }]
     }))]);
-    assert!(!accepts(&address), "&(*dest).field is not a value read");
+    assert!(
+        !accepts(&address),
+        "&(*dest).field of an unresolved type is not a value read"
+    );
+
+    let field_place_ty = |i: u64, idx: u64, field_ty: serde_json::Value| {
+        serde_json::json!({
+            "kind": {"Projection": [deref_place(i), {"Field": [null, idx]}]},
+            "ty": field_ty
+        })
+    };
+    let address_word = body_of(vec![stmt(serde_json::json!({
+        "Assign": [place_local(2), {
+            "Ref": {
+                "place": field_place_ty(1, 0, scalar_ty("Usize")),
+                "kind": "Shared",
+                "ptr_metadata": null
+            }
+        }]
+    }))]);
+    assert!(
+        accepts(&address_word),
+        "&(*dest).field of a copy scalar is a value read"
+    );
+
+    let address_typevar = body_of(vec![stmt(serde_json::json!({
+        "Assign": [place_local(2), {
+            "Ref": {
+                "place": field_place_ty(1, 0, serde_json::json!({"TypeVar": {"Bound": [0, 0]}})),
+                "kind": "Shared",
+                "ptr_metadata": null
+            }
+        }]
+    }))]);
+    assert!(
+        accepts(&address_typevar),
+        "&(*dest).field of a TypeVar is a value read"
+    );
 
     let deeper = body_of(vec![stmt(serde_json::json!({
         "Assign": [place_local(2), {"Use": [{"Read": {
@@ -781,6 +818,20 @@ fn add_dest_struct_field_guard_classifies_uses() {
         }}, "No"]}]
     }))]);
     assert!(!accepts(&deeper), "a further projection escapes");
+
+    let nested_index = body_of(vec![stmt(serde_json::json!({
+        "Assign": [{
+            "kind": {"Projection": [field_place(1, 1), {"Index": {
+                "offset": {"Read": place_local(2)},
+                "from_end": false
+            }}]},
+            "ty": ty()
+        }, {"Use": [{"Read": place_local(2)}, "No"]}]
+    }))]);
+    assert!(
+        accepts(&nested_index),
+        "(*dest).field[i] is a struct-field use"
+    );
 
     let dead = body_of(vec![]);
     assert!(!accepts(&dead), "no field use");

@@ -79,8 +79,9 @@ mod tests {
     };
     use crate::model::{FunctionGraph as LegacyGraph, OpKind, ValueType};
     use crate::translator::rtyper::call_registry::CallRegistry;
-    use crate::translator::rtyper::cutover::specialize_legacy_graph_with_registry_returning_value_to_var;
-    use crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace;
+    use crate::translator::rtyper::flowspace_adapter::{
+        derive_subject_inputcells, function_graph_to_flowspace,
+    };
     use crate::translator::rtyper::lltypesystem::lltype::{FuncType, LowLevelType, Ptr, PtrTarget};
     use crate::translator::rtyper::rmodel::{PtrRepr, Repr, ReprState, inputconst_from_lltype};
     use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList, RPythonTyper};
@@ -357,40 +358,19 @@ mod tests {
             .expect("adapter lowers stored fn-ptr IndirectCall to simple_call");
         assert_eq!(simple.args.len(), 2);
 
-        let (value_to_var, _) =
-            specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
-                .expect("stored fn-ptr graph must annotate and rtype");
-        let result_var = value_to_var.get(&r_var).expect("call result must project");
-        {
-            let cell = result_var.annotation.borrow();
-            match cell.as_ref().map(|rc| rc.as_ref()) {
-                Some(SomeValue::Bool(_)) => {}
-                other => panic!(
-                    "SomePtr.call returns ll_to_annotation of FuncType.RESULT, got {other:?}"
-                ),
-            }
-        }
-        assert_eq!(result_var.concretetype(), Some(LowLevelType::Bool));
-
-        let (ann, _) = registry.ensure_session().expect("session after specialize");
-        let graph_ref = ann
-            .annotated
-            .borrow()
-            .values()
-            .find_map(|g| g.clone())
-            .expect("specialized subject graph");
-        let start = graph_ref.borrow().startblock.clone();
-        let rtyped = start.borrow().operations.clone();
-        let indirect = rtyped
-            .iter()
-            .find(|op| op.opname == "indirect_call")
-            .expect("PtrRepr.rtype_simple_call emits indirect_call");
-        let last = indirect.args.last().expect("trailing graphs arg");
-        let Hlvalue::Constant(c_graphs) = last else {
-            panic!("last arg must be inputconst(Void, None)");
-        };
-        assert_eq!(c_graphs.concretetype, Some(LowLevelType::Void));
-        assert_eq!(c_graphs.value, ConstValue::None);
+        // A subject-root `fn` param is lattice bottom. No in-corpus
+        // `pycall` has unioned a family, so `consider_op` blocks the
+        // `simple_call` (`annrpython.py` Impossible arg). Family rtype
+        // is `functions_pbc_repr_simple_call_emits_indirect_call_op`.
+        let cells = derive_subject_inputcells(&graph, Some(&registry.bookkeeper()))
+            .expect("fn Input must project a cell");
+        assert_eq!(cells.len(), 2);
+        assert!(
+            matches!(cells[0], SomeValue::Impossible),
+            "stored fn-ptr Input seeds Impossible, got {:?}",
+            cells[0]
+        );
+        let _ = r_var;
     }
 
     fn object_class_registry() -> CallRegistry {
@@ -404,29 +384,14 @@ mod tests {
         CallRegistry::new(bk)
     }
 
-    fn kind_of(
-        value_to_var: &crate::translator::rtyper::flowspace_adapter::LegacyToTyped,
-        var: &crate::flowspace::model::Variable,
-    ) -> crate::codewriter::type_state::ConcreteType {
-        let typed = value_to_var
-            .get(var)
-            .unwrap_or_else(|| panic!("value missing from value_to_var"));
-        let ll = typed
-            .concretetype()
-            .unwrap_or_else(|| panic!("Variable.concretetype not populated"));
-        crate::translator::rtyper::cutover::lowleveltype_to_concrete(&ll)
-            .unwrap_or_else(|_| panic!("lltype does not project to ConcreteType"))
-    }
-
-    /// `SomePtr.call` of a `Ptr(FuncType)` whose FUNC arg is
-    /// `rclass.OBJECTPTR`: a GC instance argument is taken as that
-    /// instance pointer (`annlowlevel.cast_instance_to_base_ptr`
-    /// adaptation in `SomePtr.call`) and the result is
-    /// `ll_to_annotation(FUNC.RESULT)`. Dual-gate Match; hop is
-    /// `indirect_call`; arg and result kinds are `'r'`.
+    /// A spelled `fn` Input with no in-corpus caller stays
+    /// `Impossible` (`derive_subject_inputcells`). `simple_call` of
+    /// that bottom is deferred (`consider_op` BlockedInference).
+    /// `PtrRepr.rtype_simple_call` of leftover untyped rffi is
+    /// `ptrrepr_rtype_simple_call_emits_indirect_call_with_void_none_graphs`;
+    /// a function-PBC site is `functions_pbc_repr_simple_call_emits_indirect_call_op`.
     #[test]
     fn fnptr_objectptr_instance_arg_result_dual_gate_match() {
-        use crate::codewriter::type_state::ConcreteType;
         use crate::translator::rtyper::cutover::{DualGateOutcome, dual_gate_check_with_registry};
         use crate::translator::rtyper::rclass::OBJECTPTR;
 
@@ -482,56 +447,23 @@ mod tests {
         let registry = Rc::new(object_class_registry());
         let graphs = crate::codewriter::call::GraphStore::default();
         let outcome = dual_gate_check_with_registry(&graph, &registry, &graphs).expect("dual-gate");
-        let DualGateOutcome::Match {
-            real_value_to_var, ..
-        } = outcome
-        else {
-            panic!("OBJECTPTR instance-arg fn-ptr call must Match, got {outcome:?}");
+        let DualGateOutcome::Skip(reason) = outcome else {
+            panic!("spelled fn Input without a caller stays Impossible, got {outcome:?}");
         };
-        assert_eq!(kind_of(&real_value_to_var, &obj_var), ConcreteType::GcRef);
-        assert_eq!(kind_of(&real_value_to_var, &r_var), ConcreteType::GcRef);
-        match real_value_to_var
-            .get(&r_var)
-            .expect("result in value_to_var")
-            .annotation
-            .borrow()
-            .as_ref()
-            .map(|rc| rc.as_ref())
-        {
-            Some(SomeValue::Instance(_)) => {}
-            other => panic!("FUNC.RESULT OBJECTPTR is the instance annotation, got {other:?}"),
-        }
-
-        let (ann, _) = registry.ensure_session().expect("session after dual-gate");
-        let graph_ref = ann
-            .annotated
-            .borrow()
-            .values()
-            .find_map(|g| g.clone())
-            .expect("specialized subject graph");
-        let start = graph_ref.borrow().startblock.clone();
-        let rtyped = start.borrow().operations.clone();
-        let indirect = rtyped
-            .iter()
-            .find(|op| op.opname == "indirect_call")
-            .expect("PtrRepr.rtype_simple_call emits indirect_call");
         assert!(
-            indirect.args.len() >= 3,
-            "indirect_call is funcptr, OBJECTPTR arg, Void graphs"
+            reason.contains("Blocked")
+                || reason.contains("KeyError")
+                || reason.contains("Impossible"),
+            "deferred simple_call of Impossible funcptr, got {reason}"
         );
-        let last = indirect.args.last().expect("trailing graphs arg");
-        let Hlvalue::Constant(c_graphs) = last else {
-            panic!("last arg must be inputconst(Void, None)");
-        };
-        assert_eq!(c_graphs.concretetype, Some(LowLevelType::Void));
-        assert_eq!(c_graphs.value, ConstValue::None);
+        let _ = (obj_var, r_var);
     }
 
-    /// `SomePtr.call` of a `Ptr(FuncType)` whose FUNC result is
-    /// `Signed`: dual-gate Match and result kind `'i'`.
+    /// A spelled `fn` Input with no in-corpus caller stays
+    /// `Impossible`. Dual-gate Skip; the PBC hop is
+    /// `functions_pbc_repr_simple_call_emits_indirect_call_op`.
     #[test]
     fn fnptr_signed_result_dual_gate_match() {
-        use crate::codewriter::type_state::ConcreteType;
         use crate::translator::rtyper::cutover::{DualGateOutcome, dual_gate_check_with_registry};
 
         let _lock = anchor_lock();
@@ -579,37 +511,15 @@ mod tests {
         let registry = Rc::new(CallRegistry::new(Rc::new(Bookkeeper::new())));
         let graphs = crate::codewriter::call::GraphStore::default();
         let outcome = dual_gate_check_with_registry(&graph, &registry, &graphs).expect("dual-gate");
-        let DualGateOutcome::Match {
-            real_value_to_var, ..
-        } = outcome
-        else {
-            panic!("Signed-result fn-ptr call must Match, got {outcome:?}");
+        let DualGateOutcome::Skip(reason) = outcome else {
+            panic!("spelled fn Input without a caller stays Impossible, got {outcome:?}");
         };
-        assert_eq!(kind_of(&real_value_to_var, &r_var), ConcreteType::Signed);
-        match real_value_to_var
-            .get(&r_var)
-            .expect("result in value_to_var")
-            .annotation
-            .borrow()
-            .as_ref()
-            .map(|rc| rc.as_ref())
-        {
-            Some(SomeValue::Integer(_)) => {}
-            other => panic!("FUNC.RESULT Signed is SomeInteger, got {other:?}"),
-        }
-
-        let (ann, _) = registry.ensure_session().expect("session after dual-gate");
-        let graph_ref = ann
-            .annotated
-            .borrow()
-            .values()
-            .find_map(|g| g.clone())
-            .expect("specialized subject graph");
-        let start = graph_ref.borrow().startblock.clone();
-        let rtyped = start.borrow().operations.clone();
         assert!(
-            rtyped.iter().any(|op| op.opname == "indirect_call"),
-            "PtrRepr.rtype_simple_call emits indirect_call"
+            reason.contains("Blocked")
+                || reason.contains("KeyError")
+                || reason.contains("Impossible"),
+            "deferred simple_call of Impossible funcptr, got {reason}"
         );
+        let _ = r_var;
     }
 }

@@ -246,7 +246,95 @@ fn seed_variable(legacy_var: &Variable) -> Variable {
     if let Some(s) = legacy_var.annotation.borrow().as_ref() {
         *var.annotation.borrow_mut() = Some(s.clone());
     }
+    // `stamp_fn_ptr` lives on the legacy dest. `setconcretetype` keeps
+    // that `Ptr(FuncType)` when `bindingrepr` is `NoneRepr` Void
+    // (`s_None` of a spelled `fn`); without the copy the twin is
+    // unstamped and dual-gate reports `legacy=Signed, real=Void`.
+    crate::model::FunctionGraph::copy_fn_ptr_concretetype(legacy_var, &var);
     var
+}
+
+/// `stamp_fn_ptr` on fn-typed Inputs, spelled `null_fn` dests, then
+/// copy onto phi dests (`propagate_fn_ptr_stamps`). Twins inherit the
+/// stamp through [`seed_variable`].
+fn stamp_fn_ptr_legacy_dests(legacy: &FunctionGraph) {
+    use crate::model::ValueType;
+    for block in &legacy.blocks {
+        for op in &block.operations {
+            let Some(dest) = op.result.as_ref() else {
+                continue;
+            };
+            match &op.kind {
+                OpKind::Input {
+                    ty: ValueType::Int,
+                    class_root: Some(root),
+                    ..
+                } if crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling_in(root, None)
+                    .is_some() =>
+                {
+                    crate::front::mir::stamp_fn_ptr_spelling(
+                        dest,
+                        root,
+                        crate::ErrorCarrierSpec::default(),
+                    );
+                }
+                OpKind::Call {
+                    target,
+                    args,
+                    result_ty: ValueType::Int,
+                    ..
+                } if matches!(
+                    target.path_segments().as_deref(),
+                    Some(["core", "ptr", "null_fn"])
+                ) =>
+                {
+                    let spelling = args
+                        .first()
+                        .and_then(|a| match a {
+                            LinkArg::Const(c) => c.value.as_pystr(),
+                            _ => None,
+                        })
+                        .unwrap_or("fn");
+                    crate::front::mir::stamp_fn_ptr_spelling(
+                        dest,
+                        spelling,
+                        crate::ErrorCarrierSpec::default(),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &legacy.blocks {
+            for link in &block.exits {
+                // Ids need not be `blocks[id.0]` (`derive_subject_inputcells`).
+                let Some(target) = legacy.blocks.iter().find(|b| b.id == link.target) else {
+                    continue;
+                };
+                for (dst, src) in target.inputargs.iter().zip(link.args.iter()) {
+                    let Some(v) = src.as_variable() else {
+                        continue;
+                    };
+                    let had = dst
+                        .concretetype()
+                        .as_ref()
+                        .is_some_and(crate::model::FunctionGraph::lltype_is_fn_ptr);
+                    crate::model::FunctionGraph::copy_fn_ptr_concretetype(v, dst);
+                    if !had
+                        && dst
+                            .concretetype()
+                            .as_ref()
+                            .is_some_and(crate::model::FunctionGraph::lltype_is_fn_ptr)
+                    {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Build the `legacy Variable → typed flowspace::Variable` map for every
@@ -2385,6 +2473,69 @@ fn instantiate_op(class_host: HostObject, result: Hlvalue) -> Result<FlowspaceOp
     ))
 }
 
+/// Recast a `__discriminant` FieldRead receiver onto the FieldRead owner
+/// before `getattr`, so `getuniqueclassdef` of that tagged instantiation
+/// (`rclass.py`) supplies the tag field. Variant payload reads use
+/// [`enum_payload_getattr_ops`].
+fn enum_discriminant_getattr_ops(
+    base_hl: Hlvalue,
+    field: &crate::model::FieldDescriptor,
+    result: Hlvalue,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+) -> Result<Option<Vec<FlowspaceOp>>, TyperError> {
+    if field.name != "__discriminant" {
+        return Ok(None);
+    }
+    let Some(owner) = field.owner_root.as_deref() else {
+        return Ok(None);
+    };
+    let is_enum = {
+        let fields = call_registry.bookkeeper().struct_fields.borrow();
+        fields.as_ref().is_some_and(|reg| {
+            reg.is_enum_base(owner) || reg.enum_base_registry_key(owner).is_some()
+        })
+    };
+    if !is_enum {
+        return Ok(None);
+    }
+    call_registry
+        .bookkeeper()
+        .getuniqueclassdef_for_struct_root(owner)
+        .map_err(|err| {
+            TyperError::message(format!(
+                "enum discriminant {owner}.__discriminant: {}",
+                err.msg.unwrap_or_default()
+            ))
+        })?;
+    let callable_host = HOST_ENV
+        .lookup_builtin(crate::runtime_names::shims::CAST_INSTANCE)
+        .ok_or_else(|| {
+            TyperError::message(
+                "__cast_instance_intrinsic missing from HOST_ENV bootstrap".to_string(),
+            )
+        })?;
+    let narrowed = Hlvalue::Variable(Variable::new());
+    Ok(Some(vec![
+        FlowspaceOp::new(
+            "simple_call",
+            vec![
+                Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host))),
+                base_hl,
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str(owner))),
+            ],
+            narrowed.clone(),
+        ),
+        FlowspaceOp::new(
+            "getattr",
+            vec![
+                narrowed,
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name))),
+            ],
+            result,
+        ),
+    ]))
+}
+
 /// A per-instantiation enum payload read (`Option<T>::Some.__pos_0`).
 ///
 /// The annotated receiver is often the bare `Option::Some` template: a
@@ -3847,6 +3998,18 @@ pub fn translate_op(
                     ],
                     result,
                 )]);
+            }
+            // `__discriminant` on a tagged Option/Result intern's the
+            // FieldRead owner (`rclass.py` `getuniqueclassdef`) before
+            // getattr, so a classdef-less GCREF residual still resolves
+            // the tag (`lltype.py` `_nofield`).
+            if let Some(ops) = enum_discriminant_getattr_ops(
+                base_hl.clone(),
+                field,
+                result.clone(),
+                call_registry,
+            )? {
+                return Ok(ops);
             }
             // Registered per-instantiation `__pos_` rows
             // (`Option<T>::Some.__pos_0`) intern the variant first
@@ -5447,17 +5610,19 @@ fn legacy_const_define_hlvalue(
                     ConstValue::HostObject(entry.host_object.clone()),
                 ))));
             }
-            // A fn-const is address-taken data for a static method table
-            // (`typedef` `[(name, fn, arity)]`).  Its LL carrier is
-            // unconditionally `ConstFnAddr` (the const-define arm below),
-            // it is never JIT-called in the compiled portal, so the `FuncType`
-            // is pure typing bookkeeping with no machine-code channel.  Taking
-            // the address does NOT need the callee's body — only its declared
-            // signature.  Three populate-time realities block the precise
-            // `getfunctionptr`, and all three fall back to the callee's
-            // DECLARED LLBC signature (projected at the populate pre-pass; same
-            // fidelity class as `FOREIGN_STDLIB_EXTERNALS`) so the caller's
-            // lift succeeds instead of recording a lazy-failure that poisons
+            // A fn-const is a reified `FnDef`: the annotator constant is
+            // `CallRegistry.entry.host_object` (`SomePBC([FunctionDesc])`),
+            // the same pyobj direct calls already use. Do not mint a second
+            // `HostObject` / `ConstValue::Function`. The LL type is still
+            // `Ptr(FuncType)` (`getfunctionptr` / `declared_funcptr_type`);
+            // the legacy/codewriter dual-gate stamps Signed
+            // (`is_fn_const_define`). Taking the address does NOT need the
+            // callee's body — only its declared signature.  Three
+            // populate-time realities block the precise `getfunctionptr`,
+            // and all three fall back to the callee's DECLARED LLBC
+            // signature (projected at the populate pre-pass; same fidelity
+            // class as `FOREIGN_STDLIB_EXTERNALS`) so the caller's lift
+            // succeeds instead of recording a lazy-failure that poisons
             // every attr-lookup caller:
             //   1. no graph is rtyped yet (every arg `concretetype` is `None`);
             //   2. the callee's graph is still being built (a fn-const
@@ -5525,7 +5690,7 @@ fn legacy_const_define_hlvalue(
                 Box::new(func_ptr._TYPE.clone()),
             );
             Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
-                ConstValue::LLPtr(Box::new(func_ptr)),
+                ConstValue::HostObject(entry.host_object.clone()),
                 func_ptr_type,
             ))))
         }
@@ -5925,18 +6090,38 @@ pub(crate) fn derive_subject_inputcells(
             // A function pointer is the same Int bank (`history.getkind` of
             // `Ptr(FuncType)`) named `fn(inputs) -> output` /
             // `Option<fn(inputs) -> output>`. `valuetype_to_someshell` would
-            // seed `SomeInteger`; seed `SomePtr` so a `fn` argument unions
-            // with a reified fn item, a `fn` field read, and a typed
-            // `fn_null_constant` (`llannotation.py`
-            // `pairtype(SomePtr, SomePtr).union`). The coarse `Option<fn>`
-            // marker still unions with an untyped `fn_null_constant`.
+            // seed `SomeInteger`. A bare `fn` seeds `Impossible` so callers'
+            // `pycall` unions the family (`description.py`
+            // `FunctionDesc.pycall`). `Option<fn>` None is `s_None`
+            // (`store_profilefunc` setattr of None noneifies; consider_op
+            // blocks on an Impossible arg). Seeding `SomePtr` unions
+            // `SomePtr ∪ SomePBC` (`llannotation.py`
+            // `pairtype(SomePtr, SomeObject).union`).
+            // `fn_ptr_somevalue_for_spelling_in` is the recogniser.
             if let Some(root) = class_root.as_deref()
-                && let Some(s_fn) = crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling_in(
+                && crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling_in(
                     root,
                     bookkeeper.map(|bk| bk.as_ref()),
                 )
+                .is_some()
             {
-                cells.push(s_fn);
+                if crate::annotator::bookkeeper::spelling_is_option_fn(root) {
+                    cells.push(crate::annotator::model::s_none());
+                } else {
+                    cells.push(crate::annotator::model::SomeValue::Impossible);
+                }
+                continue;
+            }
+            // A `#[repr(transparent)]` scalar wrapper is the inner word
+            // (`discover_transparent_scalar_kinds`). Seeding SomePtr of
+            // the wrapper unioned Integer ∪ Ptr at `FrameAnchor::live`
+            // (`mergeinputargs`): live's `&self` peels to Unsigned, a
+            // caller that kept the class_root minted Ptr of the raw
+            // layout. The depth word is that unsigned integer.
+            if let (Some(bk), Some(root)) = (bookkeeper, class_root.as_deref())
+                && let Some(cell) = bk.transparent_scalar_annotation(root)
+            {
+                cells.push(cell);
                 continue;
             }
             // Rust `char` is a Unicode scalar (`SomeUnicodeCodePoint`,
@@ -6085,6 +6270,30 @@ pub(crate) fn derive_subject_inputcells(
                     continue;
                 }
                 if let (Some(root), Some(bk)) = (class_root.as_ref(), bookkeeper) {
+                    // A `MutRef<T>` cell is a synthetic one-field class.
+                    // Seed it before `exception_class_base`:
+                    // `exception_class_enum_path_matches` takes
+                    // `strip_crate_prefix("MutRef<error::PyError>")` as
+                    // `"PyError"` and would seed the payload. getattr of
+                    // `.value` then lands on the handle
+                    // (`alias_exception_carrier_handle`).
+                    if majit_ir::descr::strip_instantiation_suffix(root) == "MutRef" {
+                        let cd = bk.getuniqueclassdef_for_struct_root(root).map_err(|e| {
+                            TyperError::message(format!(
+                                "derive_subject_inputcells: startblock.inputargs[{idx}] \
+                                 ({var:?}) `Ref` receiver root {root:?} failed struct-root \
+                                 ClassDef registration: {e:?}"
+                            ))
+                        })?;
+                        cells.push(crate::annotator::model::SomeValue::Instance(
+                            crate::annotator::model::SomeInstance::new(
+                                Some(cd),
+                                false,
+                                std::collections::BTreeMap::new(),
+                            ),
+                        ));
+                        continue;
+                    }
                     // A marked enum parameter is the minted base class.
                     // `getuniqueclassdef_for_struct_root` canonicalises the
                     // leaf through `struct_origins` and would miss the
@@ -6180,8 +6389,6 @@ pub(crate) fn derive_subject_inputcells(
                     // generic struct in a harvested foreign-body crate).
                     // A broad `field_rows` knownness seeds every suffixed
                     // closure / Option and union-fails their `call_once`.
-                    // A `MutRef<T>` cell is a synthetic one-field class with no
-                    // struct-field rows, interned by qualname like its constructor.
                     // Bare red-type names (`PyFrame`) miss the registry when the
                     // leaf alias was withdrawn; `registered_struct_root_key`
                     // recovers the qualified key `getuniqueclassdef_for_struct_root`
@@ -6190,8 +6397,7 @@ pub(crate) fn derive_subject_inputcells(
                         .struct_fields
                         .borrow()
                         .as_ref()
-                        .is_some_and(|reg| split_struct_template_rows_known(reg, &root))
-                        || majit_ir::descr::strip_instantiation_suffix(&root) == "MutRef";
+                        .is_some_and(|reg| split_struct_template_rows_known(reg, &root));
                     let resolved_root = if known {
                         Some(root)
                     } else {
@@ -6884,6 +7090,11 @@ fn function_graph_to_flowspace_inner(
     let mut value_to_var_candidates: LegacyToTypedCandidates = HashMap::new();
     let mut constant_hlvalues: HashMap<Variable, Hlvalue> = HashMap::new();
     let mut constant_concretetypes: HashMap<Variable, LowLevelType> = HashMap::new();
+
+    // Skip-path Input / `null_fn` dests have no MIR `stamp_fn_ptr`.
+    // Stamp `Ptr(FuncType)` before twins are allocated so
+    // `setconcretetype` can keep it when the annotation is `s_None`.
+    stamp_fn_ptr_legacy_dests(legacy);
 
     // `remove_dead_blocks` reachable set — blocks not reachable from
     // `startblock` are dropped from every pass below alongside the
@@ -8504,7 +8715,7 @@ mod tests {
     }
 
     #[test]
-    fn derive_subject_inputcells_seeds_fn_ptr_int_input_as_someptr() {
+    fn derive_subject_inputcells_seeds_fn_ptr_int_input_as_impossible() {
         let mut graph = LegacyGraph::new("takes_fn");
         let entry = graph.startblock;
         let f_var = graph
@@ -8524,8 +8735,8 @@ mod tests {
             .expect("fn-pointer Input must project to a definite SomeValue cell");
         assert_eq!(cells.len(), 1);
         assert!(
-            matches!(cells[0], SomeValue::Ptr(_)),
-            "Int + class_root fn must seed SomePtr(FuncType), got {:?}",
+            matches!(cells[0], SomeValue::Impossible),
+            "Int + class_root fn must seed Impossible, got {:?}",
             cells[0],
         );
     }
@@ -8585,7 +8796,118 @@ mod tests {
     }
 
     #[test]
-    fn derive_subject_inputcells_seeds_option_fn_int_input_as_someptr() {
+    fn derive_subject_inputcells_seeds_transparent_scalar_ref_as_unsigned() {
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let owner = "eval::FrameAnchor";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let mut graph = LegacyGraph::new("live");
+        let entry = graph.startblock;
+        let receiver = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "self".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some(owner.to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, receiver);
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![("depth".to_string(), "usize".to_string())],
+        );
+        fields.raw_word_owners.insert(owner.to_string());
+        fields
+            .transparent_scalar_kinds
+            .insert(owner.to_string(), ValueType::Unsigned);
+        bk.set_struct_fields(Rc::new(fields));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "depth".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("transparent-scalar Ref input must seed");
+        let SomeValue::Integer(i) = &cells[0] else {
+            panic!(
+                "Ref + transparent scalar class_root must seed the inner word, got {:?}",
+                cells[0]
+            );
+        };
+        assert!(i.unsigned, "FrameAnchor.depth is usize");
+        assert!(
+            bk.raw_struct_ptr_annotation(owner).is_none(),
+            "a transparent scalar must not mint SomePtr of the wrapper"
+        );
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_transparent_scalar_int_as_unsigned() {
+        let owner = "eval::FrameAnchor";
+        let mut graph = LegacyGraph::new("from_raw_user");
+        let entry = graph.startblock;
+        let anchor = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "anchor".to_string(),
+                    ty: ValueType::Int,
+                    class_root: Some(owner.to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, anchor);
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .transparent_scalar_kinds
+            .insert(owner.to_string(), ValueType::Unsigned);
+        bk.set_struct_fields(Rc::new(fields));
+
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("transparent-scalar Int input must seed");
+        let SomeValue::Integer(i) = &cells[0] else {
+            panic!(
+                "Int + transparent scalar class_root must seed the inner word, got {:?}",
+                cells[0]
+            );
+        };
+        assert!(i.unsigned, "FrameAnchor.depth is usize");
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_option_fn_int_input_as_s_none() {
         let mut graph = LegacyGraph::new("takes_option_fn");
         let entry = graph.startblock;
         let f_var = graph
@@ -8605,8 +8927,8 @@ mod tests {
             .expect("Option<fn> Input must project to a definite SomeValue cell");
         assert_eq!(cells.len(), 1);
         assert!(
-            matches!(cells[0], SomeValue::Ptr(_)),
-            "Int + class_root Option<fn> must seed SomePtr(FuncType), got {:?}",
+            matches!(cells[0], SomeValue::None_(_)),
+            "Int + class_root Option<fn> must seed s_None, got {:?}",
             cells[0],
         );
     }
@@ -13169,6 +13491,95 @@ mod tests {
         let _keep_graph = graph;
     }
 
+    /// `exception_class_enum_path_matches` would seed `PyError` for a
+    /// `MutRef<error::PyError>` input (`strip_crate_prefix` of the cell
+    /// is `PyError`). The cell stays the constructor class.
+    #[test]
+    fn mut_ref_error_input_seeds_cell_not_exception_class() {
+        let name = "MutRef<error::PyError>";
+        let registry = empty_call_registry();
+        let bk = registry.bookkeeper().clone();
+        bk.set_struct_fields(Rc::new(crate::front::StructFieldRegistry::default()));
+        let _ = bk.intern_class_by_qualname("pyre_interpreter::error::PyError");
+        bk.mint_exception_class_hierarchies(&[crate::front::llbc_hints::ExceptionClassHint::new(
+            "PyError",
+            "",
+            vec!["X".to_string()],
+        )]);
+        assert!(bk.exception_class_base("PyError").is_some());
+
+        let mut graph = LegacyGraph::new("mut_ref_error_callee");
+        let entry = graph.startblock;
+        let cell = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "cell".to_string(),
+                    ty: ValueType::Ref(Some(name.to_string())),
+                    class_root: Some(name.to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, cell);
+
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("MutRef input must seed a classdef");
+        let SomeValue::Instance(inst) = &cells[0] else {
+            panic!("MutRef input must be SomeInstance, got {:?}", cells[0]);
+        };
+        assert_eq!(
+            inst.classdef.as_ref().expect("classdef").borrow().name,
+            name
+        );
+    }
+
+    /// Production `PyError::normalize_exception` stamps `MutRef<PyError>`.
+    /// The minted `_exception_class_` leaf is `PyError`; the cell keeps
+    /// its own ClassDef and the `value` attr (`mut_ref_shape_rows`).
+    #[test]
+    fn mut_ref_pyerror_input_seeds_cell_with_value_attr() {
+        let name = "MutRef<PyError>";
+        let registry = empty_call_registry();
+        let bk = registry.bookkeeper().clone();
+        bk.set_struct_fields(Rc::new(crate::front::StructFieldRegistry::default()));
+        let _ = bk.intern_class_by_qualname("pyre_interpreter::error::PyError");
+        bk.mint_exception_class_hierarchies(&[crate::front::llbc_hints::ExceptionClassHint::new(
+            "PyError",
+            "",
+            vec!["X".to_string()],
+        )]);
+        assert!(bk.exception_class_base("PyError").is_some());
+
+        let mut graph = LegacyGraph::new("normalize_exception");
+        let entry = graph.startblock;
+        let cell = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "self".to_string(),
+                    ty: ValueType::Ref(Some(name.to_string())),
+                    class_root: Some(name.to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, cell);
+
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("MutRef<PyError> input must seed a classdef");
+        let SomeValue::Instance(inst) = &cells[0] else {
+            panic!("MutRef input must be SomeInstance, got {:?}", cells[0]);
+        };
+        let cd = inst.classdef.as_ref().expect("classdef").clone();
+        assert_eq!(cd.borrow().name, name);
+        assert!(
+            cd.borrow().attrs.contains_key("value"),
+            "MutRef<PyError> must project value, attrs={:?}",
+            cd.borrow().attrs.keys().collect::<Vec<_>>()
+        );
+    }
+
     /// A call of each `ll_vec_*` helper lowers to the high-level `Vec`
     /// operation it implements.
     #[test]
@@ -14885,6 +15296,84 @@ mod tests {
             translated[0].opname, "same_as",
             "Result Ok payload must not alias the receiver"
         );
+    }
+
+    #[test]
+    fn translate_op_enum_discriminant_field_narrows_before_getattr() {
+        for owner in [
+            "core::option::Option<usize>",
+            "core::result::Result<(),PyError>",
+        ] {
+            let template = majit_ir::descr::strip_generic_args(owner);
+            let bk = Rc::new(Bookkeeper::new());
+            let mut fields = crate::front::StructFieldRegistry::default();
+            fields.fields.insert(
+                template.to_string(),
+                vec![("__discriminant".to_string(), "i64".to_string())],
+            );
+            bk.set_struct_fields(Rc::new(fields));
+            let registry = CallRegistry::new(bk);
+
+            let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+            let mut graph = LegacyGraph::new("translate_op_fixture");
+            let vars = mint_vars(&mut graph, 4);
+            value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+            value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+            let op = SpaceOperation {
+                result: Some(vars[2].clone()),
+                kind: OpKind::FieldRead {
+                    base: vars[1].clone(),
+                    field: crate::model::FieldDescriptor::new(
+                        "__discriminant",
+                        Some(owner.to_string()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+            };
+            let translated =
+                translate_op(&op, &value_map, &registry).expect("discriminant field must narrow");
+            assert_eq!(
+                translated
+                    .iter()
+                    .map(|op| op.opname.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["simple_call", "getattr"],
+                "{owner}"
+            );
+            let Hlvalue::Constant(ref root) = translated[0].args[2] else {
+                panic!("{owner}: cast root");
+            };
+            assert!(
+                matches!(
+                    root.value,
+                    ConstValue::ByteStr(ref bytes) if bytes == owner.as_bytes()
+                ),
+                "{owner}: recast owner"
+            );
+        }
+
+        let bare = CallRegistry::new(Rc::new(Bookkeeper::new()));
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new(
+                    "__discriminant",
+                    Some("core::result::Result<(),PyError>".into()),
+                ),
+                ty: ValueType::Int,
+                pure: true,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &bare).expect("unregistered discriminant");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "getattr");
     }
 
     #[test]
@@ -17422,7 +17911,7 @@ mod tests {
             access_directly: std::cell::Cell::new(false),
         });
         registry.register_callee(
-            key,
+            key.clone(),
             crate::flowspace::argument::Signature::new(Vec::<String>::new(), None, None),
             pygraph,
         );
@@ -17455,13 +17944,48 @@ mod tests {
         );
         match legacy_const_define_hlvalue(&op, Some(&registry)).expect("fn const define folds") {
             Some(Hlvalue::Constant(c)) => {
-                assert!(matches!(c.value, ConstValue::LLPtr(_)));
+                let entry = registry
+                    .lookup_with_leaf_match(&key)
+                    .expect("registered callee");
+                let ConstValue::HostObject(ref host) = c.value else {
+                    panic!(
+                        "fn const folds to CallRegistry host_object, got {:?}",
+                        c.value
+                    );
+                };
+                assert_eq!(
+                    host, &entry.host_object,
+                    "__fn_const HostObject is the registry pyobj"
+                );
                 assert!(matches!(
                     c.concretetype,
                     Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(_))
                 ));
+                let s = registry
+                    .bookkeeper()
+                    .immutablevalue(&c.value)
+                    .expect("host_object annotates");
+                match s {
+                    crate::annotator::model::SomeValue::PBC(pbc) => {
+                        assert_eq!(pbc.descriptions.len(), 1);
+                        assert_eq!(
+                            pbc.descriptions.values().next().unwrap().kind(),
+                            crate::annotator::model::DescKind::Function
+                        );
+                        assert_eq!(
+                            pbc.descriptions.keys().next().copied(),
+                            Some(
+                                crate::annotator::description::DescEntry::function(
+                                    entry.function_desc.clone()
+                                )
+                                .desc_key()
+                            )
+                        );
+                    }
+                    other => panic!("expected function SomePBC, got {other:?}"),
+                }
             }
-            other => panic!("expected LLPtr funcptr Constant carrier, got {other:?}"),
+            other => panic!("expected HostObject function-PBC Constant, got {other:?}"),
         }
 
         let mut legacy = LegacyGraph::new("fn_const_carrier");

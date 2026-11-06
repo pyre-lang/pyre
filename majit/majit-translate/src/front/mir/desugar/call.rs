@@ -341,9 +341,41 @@ impl<'a> Lowering<'a> {
                     root.rsplit("::")
                         .next()
                         .is_some_and(|leaf| {
-                            matches!(leaf, "ClassDictStrategy" | "SysState" | "TypedItemsBlock")
+                            matches!(
+                                leaf,
+                                "ClassDictStrategy"
+                                    | "SysState"
+                                    | "TypedItemsBlock"
+                                    | "ModuleDictStrategy"
+                            )
                         })
                         .then_some(root)
+                })
+                // Residual `Vec::from_raw_parts` (`rffi.mallocfn` /
+                // `rstr.mallocstr`) dest is `Vec<u8>`: `tyref_to_value_type`
+                // paints `Ref(None)` and `valuetype_to_someshell` seeds a
+                // classdef-less instance, so setattr `__pos_0` of
+                // `Result<Vec<u8>, MemoryError>::Ok` dies (`rlist.py`).
+                // Intern the list spelling `derive_subject_inputcells`
+                // already uses for a `Vec<T>` param
+                // (`is_list_container_spelling`). One-word-item `Vec` is
+                // Int-banked (`RustVecRepr`) and never reaches this arm.
+                // Slice `from_raw_parts` dests stay the pointer identity
+                // (`ann_direct_ptradd`).
+                .or_else(|| {
+                    [&call.dest.ty, dest_class_ty].into_iter().find_map(|ty| {
+                        let spelling = tyref_to_ast_string(ty, self.llbc);
+                        let stripped = spelling
+                            .trim()
+                            .trim_start_matches('&')
+                            .trim_start_matches("mut ")
+                            .trim_start_matches("*const ")
+                            .trim_start_matches("*mut ")
+                            .trim();
+                        (majit_ir::descr::is_list_container_spelling(&spelling)
+                            && (stripped.starts_with("Vec<") || stripped.starts_with("VecDeque<")))
+                        .then_some(spelling)
+                    })
                 }),
             _ => None,
         };
@@ -352,8 +384,27 @@ impl<'a> Lowering<'a> {
         // `result_narrow_root` for the ARRAY layout stamp
         // (`do_fixed_newlist` `op.result.concretetype.TO`) and for an
         // array-item recast whose getarrayitem dest is still GCREF.
+        //
+        // Residual `w_module_dict_get_strategy` is
+        // `*mut ModuleDictStrategy` (`dictmultiobject.py`
+        // `W_ModuleDictObject.get_strategy`). `tyref_to_value_type`
+        // paints `Ref(Some(root))`, but `valuetype_to_someshell(Ref)`
+        // still seeds a classdef-less instance, so getattr
+        // `getitem_str` / `getdictvalue_no_unwrapping` / `length`
+        // dies (`celldict.py`). Intern that Call dest. Identity CAST
+        // of `*mut PyObject` stays omitted (`rclass.py`
+        // `getinstancerepr`). A residual `Vec<T>` dest is the same
+        // classdef-less hole: intern the list spelling even when the
+        // declared pointee already names it
+        // (`__cast_instance_intrinsic` list arm).
         let recast_result_root = match (&result_ty, result_narrow_root.as_ref()) {
-            (ValueType::Ref(Some(declared)), Some(narrowed)) if declared == narrowed => None,
+            (ValueType::Ref(Some(declared)), Some(narrowed))
+                if declared == narrowed
+                    && narrowed.rsplit("::").next() != Some("ModuleDictStrategy")
+                    && !majit_ir::descr::is_list_container_spelling(narrowed) =>
+            {
+                None
+            }
             (_, other) => other.cloned(),
         };
 
@@ -470,6 +521,7 @@ impl<'a> Lowering<'a> {
         let (
             slice_get_index_is_scalar,
             slice_get_element,
+            slice_get_packed_size,
             slice_first_element,
             slice_object_array_type_id,
         ) = match &call.func {
@@ -485,6 +537,13 @@ impl<'a> Lowering<'a> {
                             array_type_id.as_ref(),
                         )
                     });
+                // Packed Copy C-repr `T` (`CodeUnit`): `get` returns
+                // `Option<&T>`, so the Some payload is the element
+                // ADDRESS. `first`/`last` still `ArrayRead` a value
+                // and stay off this proof. `get_mut` stays residual.
+                let packed = (scalar && !is_get_mut && element.is_none())
+                    .then(|| self.slice_get_packed_element(reg))
+                    .flatten();
                 // `first` / `last` share `get`'s `T` generic; the same
                 // ARRAY identity / thin-pointer proof feeds their
                 // `ArrayRead`. Skip the generic walk on every other
@@ -498,9 +557,9 @@ impl<'a> Lowering<'a> {
                 // `[u8]` slice is length-prefixed and still not the GC
                 // array object `bh_arraylen_gc` reads.
                 let object_array_type_id = self.slice_object_array_type_id(reg);
-                (scalar, element, first_element, object_array_type_id)
+                (scalar, element, packed, first_element, object_array_type_id)
             }
-            _ => (false, None, None, None),
+            _ => (false, None, None, None, None),
         };
         // A void ZST stays in `Call.args`. The callee's `Input` still
         // lists that parameter, and the annotator counts it. The
@@ -868,9 +927,23 @@ impl<'a> Lowering<'a> {
                 }
                 // Checked `Wtf8::from_bytes(&[u8])` is the window pair
                 // (`rutf8.py check_utf8` / `unicodehelper.py str_decode_utf8`).
-                if self.is_wtf8_from_bytes_checked(&reg, &call.dest.ty) {
+                // `String::from_utf8_lossy(&[u8])` is the same window
+                // (`unicodehelper.py str_decode_utf8` replace / U+FFFD).
+                if self.is_wtf8_from_bytes_checked(&reg, &call.dest.ty)
+                    || self.is_string_from_utf8_lossy(&reg, &call.dest.ty)
+                {
                     let spliced = splice_pair_lens(args.clone(), pair_lens.clone());
                     if self.try_lower_wtf8_from_bytes_checked(
+                        mir_bb,
+                        &reg,
+                        &spliced,
+                        dest_local,
+                        &call.dest.ty,
+                        target,
+                    )? {
+                        return Ok(());
+                    }
+                    if self.try_lower_from_utf8_lossy(
                         mir_bb,
                         &reg,
                         &spliced,
@@ -1887,6 +1960,23 @@ impl<'a> Lowering<'a> {
                     &args,
                     &arg_locals,
                     dest_local,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                // `storage[current].field` on a named struct element is
+                // `setinteriorfield` (`rewrite_op_setinteriorfield`).
+                // `Vec::index_mut` of `Utf8LocElem` is that shape
+                // (`rutf8.py` `create_utf8_index_storage`); a residual
+                // `index_mut` is not in CallRegistry.
+                if self.try_lower_struct_field_vec_index(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    &arg_locals,
+                    second_arg_ty.as_ref(),
+                    dest_local,
+                    &call.dest.ty,
                     target,
                 )? {
                     return Ok(());
@@ -8283,6 +8373,29 @@ impl<'a> Lowering<'a> {
             tyref_node(&peeled, self.llbc)
                 .is_some_and(|node| type_node_is_thin_box(node, self.llbc))
         });
+        let refcell_borrow = matches!(
+            &op_kind,
+            OpKind::Call { target, .. }
+                if crate::front::std_identity::is_refcell_borrow_target(target)
+        );
+        let ref_deref_payload = match &op_kind {
+            OpKind::Call {
+                target,
+                args,
+                result_ty,
+            } if crate::front::std_identity::is_ref_deref_target(target)
+                && args
+                    .first()
+                    .and_then(|a| a.as_variable())
+                    .is_some_and(|v| self.refcell_payload_vars.iter().any(|p| p == v)) =>
+            {
+                args.first()
+                    .and_then(|a| a.as_variable())
+                    .cloned()
+                    .map(|operand| (operand, result_ty.clone()))
+            }
+            _ => None,
+        };
         let op_kind = crate::front::std_identity::lower_std_primitive_op(
             op_kind,
             identity_recv.as_deref(),
@@ -8294,6 +8407,18 @@ impl<'a> Lowering<'a> {
             identity_layout.as_deref(),
             receiver_is_thin_box,
         );
+        let op_kind = if let Some((operand, result_ty)) = ref_deref_payload {
+            OpKind::UnaryOp {
+                op: "same_as".to_string(),
+                operand,
+                result_ty,
+            }
+        } else {
+            op_kind
+        };
+        if refcell_borrow && matches!(&op_kind, OpKind::FieldRead { .. }) {
+            self.refcell_payload_vars.push(result_var.clone());
+        }
         // `Option::as_deref` / `as_deref_mut` on a null-niche
         // `Option<Box<T>>` is the pointer word (`Box::as_mut` is the
         // same identity on the box itself). `None` stays null.
@@ -8634,6 +8759,8 @@ impl<'a> Lowering<'a> {
         // call.  `slice_get_element` is scalar / thin-pointer only: an
         // `AtomicU64` or `Option<Entry>` element never produces a proof, and
         // `get_mut` of a scalar is dropped because `ArrayRead` would copy it.
+        // Packed Copy C-repr `T` (`CodeUnit`) is a separate proof: the
+        // Some payload is the element ADDRESS, not a copied `T`.
         if let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             args,
@@ -8647,12 +8774,34 @@ impl<'a> Lowering<'a> {
             // `get` rewriter has neither, so its diamond would read the string
             // object as a GC array.  Leave the residual call.
             && !self.slice_receiver_is_string_byte_view(&arg_locals, first_arg_ty.as_ref())
-            && let Some((item_ty, array_type_id)) = slice_get_element.clone()
-            && let Some(mut site) =
-                self.recognize_slice_get_site(&call.dest.ty, &result_var, item_ty, array_type_id)
         {
-            site.object_array_type_id = slice_object_array_type_id.clone();
-            self.slice_get_sites.push(site);
+            let proven = if let Some((item_ty, array_type_id)) = slice_get_element.clone() {
+                Some((item_ty, array_type_id, false, 0usize))
+            } else {
+                slice_get_packed_size.and_then(|size| {
+                    crate::front::slice_get::packed_copy_array_type_id(size)
+                        .map(|array_type_id| (ValueType::Int, Some(array_type_id), true, size))
+                })
+            };
+            if let Some((item_ty, array_type_id, payload_is_element_addr, element_byte_size)) =
+                proven
+                && let Some(mut site) = self.recognize_slice_get_site(
+                    &call.dest.ty,
+                    &result_var,
+                    item_ty,
+                    array_type_id,
+                )
+            {
+                site.object_array_type_id = slice_object_array_type_id.clone();
+                if payload_is_element_addr {
+                    site.payload_is_element_addr = true;
+                    site.element_byte_size = element_byte_size;
+                    site.payload_ty = ValueType::Int;
+                    // A raw element address is not a CodeUnit instance.
+                    site.payload_narrow_root = None;
+                }
+                self.slice_get_sites.push(site);
+            }
         }
         // Capture `<[u8]>::is_ascii(slice)` sites for the
         // `rutf8.check_ascii` rewrite (`first_non_ascii_char(s) < 0`).
@@ -8820,8 +8969,8 @@ impl<'a> Lowering<'a> {
         // Discriminant-switch combinators whose opaque core body is an
         // if/else on the receiver tag (plus `call_once` of a closure
         // argument when there is one).  Option `map`/`and_then`/
-        // `unwrap_or_else`/`or_else`/`is_some_and` are extracted core
-        // bodies (`CHARON_CORE_INCLUDE`); this records the remaining
+        // `unwrap_or_else`/`or_else`/`is_some_and`/`map_or` are extracted
+        // core bodies (`CHARON_CORE_INCLUDE`); this records the remaining
         // Option/Result methods whose semantics are the same shape.
         let combinator = match &op_kind {
             OpKind::Call {
@@ -9092,7 +9241,9 @@ impl<'a> Lowering<'a> {
         // Narrow a call result whose declared pointee differs from the
         // target class (`recast_result_root`). Identity at jitcode
         // (`__cast_instance_intrinsic` → cast_pointer → `same_as`) when
-        // the roots already match, so the Call dest is the value.
+        // the roots already match, so the Call dest is the value — except
+        // residual `*mut ModuleDictStrategy` and residual `Vec<T>` list
+        // dests, which still intern.
         //
         // The narrowed Variable keeps the Call dest's `concretetype`
         // (`Variable.copy`, `flowspace/model.py`): `do_fixed_newlist`

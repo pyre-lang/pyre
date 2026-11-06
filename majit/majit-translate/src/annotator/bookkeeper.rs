@@ -752,6 +752,12 @@ pub(crate) fn raw_struct_ptr_from_layout(
     if majit_charon_reader::ullbc::is_closure_leaf(leaf) {
         return None;
     }
+    // A transparent scalar is the inner word, not a pointer to a C
+    // struct. Minting SomePtr unioned Integer ∪ Ptr at
+    // `FrameAnchor::live` (`mergeinputargs`).
+    if registry.transparent_scalar_kind(class_root).is_some() {
+        return None;
+    }
     // `GcKind::Raw` is every struct that is not on the GC field-0 chain.
     // A dict strategy or a type object is still an instance; only a
     // word-storage ADT is `SomePtr`. An empty set is a fixture that never
@@ -2102,6 +2108,32 @@ impl Bookkeeper {
         )
     }
 
+    /// `Result::Err` of `Result<Never, E>` / `Result<Infallible, E>` whose
+    /// `E` is the exception carrier is the carrier ClassDef
+    /// (`result_exc.rs` `peel_infallible_result`). A `Result<(), E>` match
+    /// keeps both variants as the Result ADT so `Ok` ∪ `Err` is
+    /// `result::Result` (`bookkeeper.py` `getuniqueclassdef(cls)`).
+    fn carrier_result_err_is_exception(&self, enum_root: &str) -> bool {
+        if self.exception_carrier.borrow().is_none() {
+            return false;
+        }
+        let lookup = normalize_class_qualname(enum_root);
+        let template = majit_ir::descr::strip_generic_args(&lookup);
+        let leaf = template.rsplit("::").next().unwrap_or(template.as_ref());
+        if leaf != "Result" {
+            return false;
+        }
+        match result_generic_args(&lookup) {
+            Some(args) if args.len() == 2 => {
+                let ok = args[0].trim();
+                self.exception_carrier_type_spelling(args[1].trim())
+                    && (crate::front::result_exc::type_spelling_is_uninhabited(ok)
+                        || ok == "??scalar")
+            }
+            _ => false,
+        }
+    }
+
     /// The `__bases__` a first mint of class `key` receives when nothing
     /// else supplies one: `Exception` for the error carrier, none otherwise.
     fn default_class_bases(&self, key: &str) -> Vec<HostObject> {
@@ -2296,6 +2328,17 @@ impl Bookkeeper {
         }
     }
 
+    /// Inner-word shell of a harvested `#[repr(transparent)]` scalar.
+    /// `None` when `class_root` is not one of those wrappers.
+    pub fn transparent_scalar_annotation(
+        &self,
+        class_root: &str,
+    ) -> Option<super::model::SomeValue> {
+        let registry = self.struct_fields.borrow();
+        let kind = registry.as_ref()?.transparent_scalar_kind(class_root)?;
+        crate::codewriter::annotation_state::valuetype_to_someshell(&kind)
+    }
+
     /// SomeInstance of a registered named struct — the shell
     /// `robjmodel_instantiate` writes for a class that is not a
     /// `raw_word_owner`. Variant payloads (`__pos_N`) of such a class
@@ -2353,7 +2396,7 @@ impl Bookkeeper {
     /// stored-pointer owners stay SomePtr so `getfield_raw` matches the
     /// named-field projection. Promote of a classed scalar is gated
     /// separately by `payload_ptr_promotes_to_instance`.
-    fn struct_ty_has_raw_pointer_field(&self, field_ty: &str) -> bool {
+    pub(crate) fn struct_ty_has_raw_pointer_field(&self, field_ty: &str) -> bool {
         let stripped = field_ty
             .trim()
             .trim_start_matches('&')
@@ -3440,12 +3483,21 @@ impl Bookkeeper {
     /// `obj_key = Constant(pyobj)`). HostObject constants reuse
     /// [`Self::getdesc`]; a `Repr` constant (`Repr._freeze_`) is the
     /// frozen-PBC fallback, cached under `ConstValue::Repr`.
+    /// `ConstValue::Function` wraps [`HostObject::new_user_function`]
+    /// the same way [`Self::immutablevalue`] does (bytecode
+    /// `MAKE_FUNCTION`). A Charon `__fn_const` must reuse
+    /// `CallRegistry.entry.host_object` instead of this arm — two
+    /// HostObjects for one GraphStore funcobj are two `FunctionDesc`s.
     pub(crate) fn getdesc_for_const(
         self: &Rc<Self>,
         x: &ConstValue,
     ) -> Result<DescEntry, AnnotatorError> {
         match x {
             ConstValue::HostObject(obj) => self.getdesc(obj),
+            ConstValue::Function(func) => {
+                let host = HostObject::new_user_function((**func).clone());
+                self.getdesc(&host)
+            }
             ConstValue::Repr(_) => {
                 if let Some(existing) = self.descs.borrow().get_const(x) {
                     return Ok(existing.clone());
@@ -4246,6 +4298,18 @@ impl Bookkeeper {
         enum_root: &str,
         variant_name: &str,
     ) -> HostObject {
+        // `Try::branch` Break of `Result<Never, E>` is the error
+        // (`result_exc.rs` `peel_infallible_result`). Interning that
+        // `Err` as `result::Result::Err` left `Exception ∪ result::Result`
+        // at `mergeinputargs`. A `Result<(), E>` match keeps the ADT so
+        // `Ok` ∪ `Err` is `result::Result` (`bookkeeper.py`
+        // `getuniqueclassdef(cls)`).
+        if variant_name == "Err"
+            && self.carrier_result_err_is_exception(enum_root)
+            && let Some(host) = self.exception_carrier_class()
+        {
+            return host;
+        }
         let canon_root = self.intern_class_key(enum_root);
         // Field reads intern the crate-stripped template
         // (`pyopcode::StepResult`). `intern_class_key` reduces a
@@ -4522,7 +4586,7 @@ impl Bookkeeper {
             //
             // A closure capture is the captured value, not a variant
             // constructor: `__cast_instance_intrinsic` / FUNC.ARGS of a
-            // raw owner write SomePtr (`load_attr` RootScope). Promoting
+            // raw owner write SomePtr (`push_roots` RootScope). Promoting
             // that slot to Instance made setattr refuse Ptr ∪ Instance.
             let owner_leaf = n.rsplit("::").next().unwrap_or(n);
             let s_value =
@@ -4580,8 +4644,12 @@ impl Bookkeeper {
                 // `Ptr`). Replace ONLY that exact FORCE shell: leaving it
                 // unions `Integer ∪ Ptr(T)` at setattr of a capture of
                 // the same field. A scalar Int field intern is Integer
-                // and stays.
-                let is_ptr_integer_force_shell = matches!(&s_value, SomeValue::Ptr(_))
+                // and stays. A bare `fn` field projects `Impossible` and
+                // `Option<fn>` projects `s_None` (`ExecutionContext.__init__`
+                // stores None), so the Int FORCE shell of a function-pointer
+                // spelling is replaced too.
+                let is_ptr_integer_force_shell = (matches!(&s_value, SomeValue::Ptr(_))
+                    || fn_ptr_somevalue_for_spelling_in(&row.ty, Some(self)).is_some())
                     && crate::codewriter::annotation_state::valuetype_to_someshell(
                         &crate::model::ValueType::Int,
                     )
@@ -4618,12 +4686,22 @@ impl Bookkeeper {
                             &crate::model::ValueType::Int,
                         )
                         .is_some_and(|shell| shell == attr.s_value);
+                // A transparent scalar is the inner word. Intern of the
+                // ADT leaf (`&FrameAnchor`) is `Instance(eval::FrameAnchor)`
+                // while `live`'s `&self` is unsigned. Replace that Instance
+                // the same way the fn-integer FORCE shell is replaced, so
+                // setattr of the depth word does not union Integer ∪ Instance.
+                let is_transparent_scalar_instance_shell =
+                    self.transparent_scalar_annotation(&row.ty).is_some()
+                        && matches!(&attr.s_value, SomeValue::Instance(_))
+                        && matches!(s_value, SomeValue::Integer(_));
                 if matches!(attr.s_value, SomeValue::Impossible)
                     || (is_untyped_force_shell && !matches!(s_value, SomeValue::Impossible))
                     || is_ptr_integer_force_shell
                     || is_profilefunc_force_shell
                     || is_window_integer_force_shell
                     || is_raw_boxed_slice_integer_force_shell
+                    || is_transparent_scalar_instance_shell
                 {
                     attr.s_value = s_value;
                 }
@@ -5559,21 +5637,31 @@ impl Bookkeeper {
         }
         // `executioncontext.py` `profilefunc`: a nullable PBC of the closed
         // function family `setllprofile` stores (`description.py`
-        // `CallFamily`). Generic `fn` / `Option<fn>` stay `SomePtr`.
+        // `CallFamily`).
         if self.is_profilefunc_type_spelling(t) {
             return self.profilefunc_pbc_or_none();
         }
-        // A function-pointer field is `Ptr(FuncType)` (`lltype.py FuncType`,
-        // `SomePtr`), not a classdef-less `SomeInstance`.  Raw `fn` has
-        // `_gckind == 'raw'`, so `getkind` is Signed — the dual-gate twin
-        // of the legacy walker's address word (`gateway::builtin_code_get`).
-        if let Some(s_fn) = fn_ptr_somevalue_for_spelling_in(t, Some(self)) {
-            // `lltype.FuncType` / `SomePtr` (`lltype.py` `SomePtr`). A raw
-            // function pointer is not a GC instance. `Option<fn(...)>`'s
-            // null (`fn_null_constant`) uses the same signature `FuncType`
-            // so the two arms union (`llannotation.py`
-            // `pairtype(SomePtr, SomePtr).union`).
-            return s_fn;
+        // A function-pointer field is lattice bottom. RPython does not
+        // seed a function-typed attr as `SomePtr`; `ExecutionContext.__init__`
+        // stores `None` and `setllprofile` stores the trampoline, then
+        // `ClassDef.generalize_attr` unions `s_None` ∪ `SomePBC`. Seeding
+        // `SomePtr(FuncType)` here unions `SomePtr ∪ SomePBC`
+        // (`llannotation.py` `pairtype(SomePtr, SomeObject).union`).
+        // `fn_ptr_somevalue_for_spelling_in` is the recogniser; the lltype
+        // is still `Ptr(FuncType)` (`stamp_fn_ptr` / `FunctionsPBCRepr`).
+        // `Option<fn>` starts as that `None` (`s_None`); a bare `fn` has
+        // no None and stays Impossible until a PBC store.
+        if fn_ptr_somevalue_for_spelling_in(t, Some(self)).is_some() {
+            if spelling_is_option_fn(t) {
+                return super::model::s_none();
+            }
+            return SomeValue::Impossible;
+        }
+        // A transparent scalar field is the inner word
+        // (`discover_transparent_scalar_kinds`). SomePtr of the wrapper
+        // unioned Integer ∪ Ptr at `FrameAnchor::live`.
+        if let Some(cell) = self.transparent_scalar_annotation(t) {
+            return cell;
         }
         // A shared `&[u8]` / `*const [u8]` is the two-word fat window
         // `{data: CCHARP, len: Signed}` (`rffi.get_nonmovingbuffer`). Peel of
@@ -5797,20 +5885,18 @@ impl Bookkeeper {
             return SomeValue::Impossible;
         }
         if let Some(inner) = strip_generic_leaf(stripped, "Option") {
-            // `executioncontext.py` `profilefunc`: `Option<ProfileFunc>` is
-            // a nullable PBC, not the generic `Option<fn>` `Ptr(FuncType)`.
+            // `executioncontext.py` `profilefunc`: `Option<ProfileFunc>` is a nullable PBC.
             if self.is_profilefunc_type_spelling(inner.trim())
                 || self.is_profilefunc_type_spelling(stripped)
             {
                 return self.profilefunc_pbc_or_none();
             }
-            // `Option<fn>` is the nullable `Ptr(FuncType)`, not
-            // `union(SomePtr, s_None)`. `s_None` is `SomeNone`
-            // (`annotator/model.py` `s_None`); `pairtype(SomeObject,
-            // SomeNone).union` noneify's (`binaryop.py`). A function
-            // pointer is an int-bank address.
-            if let Some(s_fn) = fn_ptr_somevalue_for_spelling_in(inner.trim(), Some(self)) {
-                return s_fn;
+            // `Option<fn>` None is `s_None` (`fn_null_constant` of a
+            // spelled null). setattr of a trampoline `SomePBC` unions
+            // the family. Do not seed `SomePtr`
+            // (`pairtype(SomePtr, SomeObject).union`).
+            if fn_ptr_somevalue_for_spelling_in(inner.trim(), Some(self)).is_some() {
+                return super::model::s_none();
             }
             // Charon spells `Option<&[u8]>` as `Option<[u8]>` / `Option<Slice<u8>>`.
             // The payload is a nullable window: `None` is a null data word,
@@ -5839,6 +5925,12 @@ impl Bookkeeper {
             if is_direct_pointer_word_spelling(inner) && matches!(s_inner, SomeValue::Ptr(_)) {
                 return s_inner;
             }
+            // Leading `Option<…>` is the RPython nullable-payload field
+            // spelling. Charon path-qualified `option::Option<…>` is the
+            // tagged instantiation (`getuniqueclassdef`).
+            if !spelling_starts_with_adt(stripped, "Option") {
+                return self.project_tagged_enum_instantiation(stripped);
+            }
             // The Option is the one-word nullable payload exactly when
             // `union(payload, s_None)` succeeds (`model.py`
             // `SomeObject.noneify` raising `UnionError` for annotations
@@ -5850,6 +5942,9 @@ impl Bookkeeper {
                 Err(_) => return self.project_tagged_enum_instantiation(stripped),
             }
         }
+        // `Result<Never, E>` is still the Result ADT on a field
+        // (`Try::branch` stores `Result::Err` in `ControlFlow::Break`).
+        // Peeling the field to `E` unions `Result::Err ∪ PyErrorObject`.
         if strip_generic_leaf(stripped, "Result").is_some() {
             return self.project_tagged_enum_instantiation(stripped);
         }
@@ -7333,6 +7428,46 @@ impl Bookkeeper {
         if lookup.is_empty() {
             return lookup;
         }
+        // `MutRef<T>` is a synthetic cell spelling, not a Charon struct.
+        // `unique_suffix_key_owned` takes the last `::` segment as the leaf,
+        // so `MutRef<error::PyError>` would match interned `PyError` and
+        // getattr of `.value` would land on the payload
+        // (`alias_exception_carrier_handle`).
+        if lookup.starts_with("MutRef<") && lookup.ends_with('>') {
+            return lookup;
+        }
+        // A bare leaf in `STRUCT_ORIGIN_REGISTRY` is `module::Leaf`
+        // (`canonical_struct_name`). Rewrite the leaf (and the
+        // two-segment `Result::Err` alias) first so
+        // `intern_enum_variant_host("Result", "Err")` shares the
+        // `result::Result` ClassDesc (`bookkeeper.py`
+        // `getuniqueclassdef(cls)`). A generic instantiation
+        // (`Option<Vec<T>>`) has no `::` but must keep its spelled
+        // fields key; `canonical_struct_name` would prefix the
+        // template and miss `project_struct_rows`.
+        if !lookup.contains('<') {
+            if !lookup.contains("::") {
+                let canonical = majit_ir::descr::canonical_struct_name(&lookup);
+                if canonical != lookup {
+                    return self.intern_class_key(&canonical);
+                }
+            } else if let Some((parent, variant)) = lookup.rsplit_once("::")
+                && !parent.contains("::")
+            {
+                let canon_parent = self.intern_class_key(parent);
+                if canon_parent != parent {
+                    return self.intern_class_key(&format!("{canon_parent}::{variant}"));
+                }
+            }
+        }
+        // `Try::branch` puts `Result<Never, E>` in `ControlFlow::Break`
+        // (`result_exc.rs` `peel_infallible_result` is the residual
+        // *error type*, not the Break payload). Interning that Result
+        // as `E` left `Result::Err ∪ PyErrorObject` on
+        // `setattr(Break, __pos_0, instantiate(Result::Err))`. The
+        // payload stays the Result ADT; `intern_enum_variant_host` of
+        // `Result<Never, E>::Err` still peels the *variant* to the
+        // carrier.
         let Some(reg) = self.struct_fields.borrow().clone() else {
             return lookup;
         };
@@ -7408,6 +7543,27 @@ fn intern_class_key_from_registry(
         }
     }
     lookup.to_string()
+}
+
+/// Inner type of a GC `MutRef<T>` cell, when `T` itself is a class.
+///
+/// A raw / borrowed spelling (`*mut PyObject`, `&T`) occupies the cell
+/// as a pointer payload and is not a ClassDef parent. Scalar payloads
+/// never mint a cell class.
+pub(crate) fn mut_ref_gc_payload_name(name: &str) -> Option<&str> {
+    let inner = name.strip_prefix("MutRef<")?.strip_suffix('>')?;
+    if inner.is_empty()
+        || inner.starts_with('*')
+        || inner.starts_with('&')
+        || inner.starts_with("fn(")
+    {
+        return None;
+    }
+    match inner {
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128"
+        | "usize" | "bool" | "f32" | "f64" | "char" | "str" | "()" => None,
+        _ => Some(inner),
+    }
 }
 
 fn reattach_instantiation_suffix(registered_key: &str, spelled: &str) -> String {
@@ -7705,13 +7861,12 @@ pub(crate) fn exception_carrier_type_spelling_keys(
     carrier.and_then(|k| k.rsplit("::").next()) == Some(leaf)
 }
 
-/// `SomePtr(FuncType)` when `spelling` names a function pointer or a
-/// nullable `Option<fn>`. The `Int` bank (`history.getkind` of
-/// `Ptr(FuncType)`) still shells through `valuetype_to_someshell` as
-/// `SomeInteger`; this recovers the pointer lattice those Int-typed
-/// producers lost. A full `fn(inputs) -> output` spelling yields the
-/// same `FuncType` as `getfunctionptr` / `declared_funcptr_type_from_legacy`
-/// for that signature.
+/// Recogniser / lltype helper: `SomePtr(FuncType)` when `spelling`
+/// names a function pointer or a nullable `Option<fn>`. Field and
+/// param *annotation* seeds are `Impossible`; this helper is not that
+/// seed. A full `fn(inputs) -> output` spelling yields the same
+/// `FuncType` as `getfunctionptr` / `declared_funcptr_type_from_legacy`
+/// for that signature (`stamp_fn_ptr`).
 #[cfg(test)]
 pub(crate) fn fn_ptr_somevalue_for_spelling(spelling: &str) -> Option<SomeValue> {
     fn_ptr_somevalue_for_spelling_in(spelling, getbookkeeper().as_deref())
@@ -7885,6 +8040,12 @@ fn fn_ptr_arg_lltype(
         return GCREF.clone();
     }
     let t = peel_ref_and_ptr_prefixes(spelling);
+    // `majit_ir::GcRef` is the GCREF word (`llmemory.GCREF`). `*mut GcRef`
+    // is a root slot the call site annotates as GCREF; OBJECTPTR is a
+    // class instance pointer (`*mut PyObject`).
+    if t == "GcRef" || t.ends_with("::GcRef") {
+        return GCREF.clone();
+    }
     match t {
         "i8" | "i16" | "i32" | "i64" | "isize" | "char" => LowLevelType::Signed,
         "i128" => LowLevelType::SignedLongLongLong,
@@ -7934,6 +8095,10 @@ fn fn_ptr_result_lltype(
         return GCREF.clone();
     }
     let peeled = peel_ref_and_ptr_prefixes(t);
+    // `majit_ir::GcRef` is the GCREF word (`llmemory.GCREF`).
+    if peeled == "GcRef" || peeled.ends_with("::GcRef") {
+        return GCREF.clone();
+    }
     let vt = match peeled {
         "bool" => ValueType::Bool,
         "i8" | "i16" | "i32" | "i64" | "isize" | "char" => ValueType::Int,
@@ -7959,6 +8124,12 @@ fn is_fn_type_spelling(t: &str) -> bool {
     t == "fn" || t.starts_with("fn(") || t.starts_with("fn ") || t.starts_with("unsafe fn")
 }
 
+/// `Option<fn…>` / `Option<unsafe fn…>`. None is `s_None`; a bare `fn`
+/// has no None and seeds `Impossible`.
+pub(crate) fn spelling_is_option_fn(spelling: &str) -> bool {
+    option_payload_spelling(spelling).is_some_and(is_fn_type_spelling)
+}
+
 /// Strip `Wrapper<` prefix and matching `>` suffix from a type string,
 /// returning the inner generic-args slice unchanged.  Returns `None` if
 /// the prefix is absent OR the suffix is not `>`.
@@ -7979,6 +8150,80 @@ fn strip_generic_leaf<'a>(input: &'a str, leaf: &str) -> Option<&'a str> {
     (head_leaf == leaf).then_some(&rest[..rest.len() - 1])
 }
 
+/// Payload of `Option<T>`, including `option::Option<…>` /
+/// `core::option::Option<…>`. `None` when the spelling is not that ADT
+/// or has no single type argument.
+fn option_payload_spelling(spelling: &str) -> Option<&str> {
+    let args = adt_generic_args(spelling, "Option")?;
+    (args.len() == 1).then_some(args[0].trim())
+}
+
+/// Type arguments of a `Result<T, E>` spelling, including
+/// `result::Result<…>` / `core::result::Result<…>`. `None` when the
+/// spelling is not that ADT.
+fn result_generic_args(spelling: &str) -> Option<Vec<&str>> {
+    adt_generic_args(spelling, "Result")
+}
+
+/// Type arguments of `Leaf<…>`, including `mod::Leaf<…>` /
+/// `core::mod::Leaf<…>`. `None` when the spelling is not that ADT.
+fn adt_generic_args<'a>(spelling: &'a str, leaf: &str) -> Option<Vec<&'a str>> {
+    let t = spelling.trim();
+    let mut search_from = 0usize;
+    let start = loop {
+        let rest = t.get(search_from..)?;
+        let rel = rest.find(leaf)?;
+        let start = search_from + rel;
+        let after_leaf = start + leaf.len();
+        if t.as_bytes().get(after_leaf) == Some(&b'<') && (start == 0 || t[..start].ends_with("::"))
+        {
+            break start;
+        }
+        search_from = start + 1;
+    };
+    let after = &t[start + leaf.len() + 1..];
+    let bytes = after.as_bytes();
+    let mut depth: i32 = 1;
+    let mut end = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'<' | b'(' | b'[' => depth += 1,
+            b'>' | b')' | b']' => {
+                if is_thin_arrow_gt(bytes, i) {
+                    continue;
+                }
+                depth -= 1;
+                if depth == 0 && b == b'>' {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end?;
+    if !after[end + 1..].trim().is_empty() {
+        return None;
+    }
+    Some(split_generic_args(&after[..end]))
+}
+
+/// `>` of a `->` token in a fn-pointer spelling, not a generic closer.
+fn is_thin_arrow_gt(bytes: &[u8], i: usize) -> bool {
+    bytes.get(i) == Some(&b'>') && i > 0 && bytes[i - 1] == b'-'
+}
+
+/// `Leaf<…>` with no module path. Path-qualified Charon spellings
+/// (`option::Option<…>`) are a different constructor.
+fn spelling_starts_with_adt(spelling: &str, leaf: &str) -> bool {
+    let t = spelling
+        .trim()
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .trim();
+    t.starts_with(leaf) && t.as_bytes().get(leaf.len()) == Some(&b'<')
+}
+
 /// The field-registry encoding of a Charon `RawPtr` node. A marker ADT
 /// wrapping a pointer is a different constructor and does not match.
 fn registry_ty_is_raw_ptr(ty: &str) -> bool {
@@ -7996,7 +8241,12 @@ fn split_generic_args(input: &str) -> Vec<&str> {
     for (i, &b) in bytes.iter().enumerate() {
         match b {
             b'<' | b'(' | b'[' => depth += 1,
-            b'>' | b')' | b']' => depth -= 1,
+            b'>' | b')' | b']' => {
+                if is_thin_arrow_gt(bytes, i) {
+                    continue;
+                }
+                depth -= 1;
+            }
             b',' if depth == 0 => {
                 let segment = input[start..i].trim();
                 if !segment.is_empty() {
@@ -9166,15 +9416,29 @@ mod tests {
             "dependency-opaque compiler BigInt remains one GC reference"
         );
         assert!(
-            matches!(bk.project_struct_field_type("fn"), SomeValue::Ptr(_)),
-            "a bare fn field is Ptr(FuncType), not a classdef-less instance"
+            matches!(bk.project_struct_field_type("fn"), SomeValue::Impossible),
+            "a bare fn field is lattice bottom, not SomePtr"
         );
         assert!(
             matches!(
                 bk.project_struct_field_type("fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>"),
-                SomeValue::Ptr(_)
+                SomeValue::Impossible
             ),
-            "a Rust fn-pointer spelling is Ptr(FuncType)"
+            "a Rust fn-pointer spelling seeds Impossible"
+        );
+        assert!(
+            matches!(
+                bk.project_struct_field_type("Option<fn() -> i64>"),
+                SomeValue::None_(_)
+            ),
+            "Option<fn> seeds s_None (`ExecutionContext.__init__` stores None)"
+        );
+        assert!(
+            matches!(
+                bk.project_struct_field_type("option::Option<fn() -> i64>"),
+                SomeValue::None_(_)
+            ),
+            "option::Option<fn> seeds s_None"
         );
         assert!(
             matches!(
@@ -9461,6 +9725,32 @@ mod tests {
             }),
             "*mut bool FUNC arg is Signed; RESULT GCREFOpaque is GCREF"
         );
+
+        let rooted = FuncType {
+            args: vec![
+                LowLevelType::Unsigned,
+                LowLevelType::Unsigned,
+                GCREF.clone(),
+                LowLevelType::Signed,
+            ],
+            result: GCREF.clone(),
+        };
+        for spelling in [
+            "unsafe fn(u32, usize, *mut GCREF, *mut bool) -> GCREF",
+            "unsafe fn(u32, usize, *mut GCREFOpaque, *mut bool) -> *mut GCREFOpaque",
+            "unsafe fn(u32, usize, *mut GcRef, *mut bool) -> GcRef",
+        ] {
+            let s = fn_ptr_somevalue_for_spelling(spelling)
+                .unwrap_or_else(|| panic!("{spelling}: fn-pointer spelling"));
+            let SomeValue::Ptr(p) = &s else {
+                panic!("{spelling}: must seed SomePtr, got {s:?}");
+            };
+            assert_eq!(
+                p.ll_ptrtype.TO,
+                PtrTarget::Func(rooted.clone()),
+                "{spelling}: *mut GCREF / *mut GcRef FUNC arg is GCREF"
+            );
+        }
     }
 
     #[test]
@@ -9793,6 +10083,37 @@ mod tests {
     }
 
     #[test]
+    fn option_and_result_spellings_peel_path_prefix_not_variant_suffix() {
+        assert_eq!(
+            option_payload_spelling("Option<fn() -> i64>"),
+            Some("fn() -> i64")
+        );
+        assert_eq!(
+            option_payload_spelling("option::Option<fn() -> i64>"),
+            Some("fn() -> i64")
+        );
+        assert_eq!(
+            option_payload_spelling("core::option::Option<fn(&[u8]) -> i64>"),
+            Some("fn(&[u8]) -> i64")
+        );
+        assert_eq!(
+            option_payload_spelling("core::option::Option<usize>"),
+            Some("usize")
+        );
+        assert_eq!(
+            option_payload_spelling("option::Option<Vec<u8>>::Some"),
+            None
+        );
+        assert!(result_generic_args("core::result::Result<(),PyError>").is_some());
+        assert!(result_generic_args("core::result::Result<(),PyError>::Ok").is_none());
+        assert!(spelling_is_option_fn(
+            "Option<fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>>"
+        ));
+        fn_ptr_somevalue_for_spelling("Option<fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>>")
+            .expect("Option wrapping a fn with a Result return peels to that FuncType");
+    }
+
+    #[test]
     fn tagged_option_of_scalar_projects_instantiation_classdef() {
         // `Option<usize>` is a tagged enum instance, not `uint ∪ None`.
         // The interned class is the same object `getuniqueclassdef`
@@ -9802,57 +10123,89 @@ mod tests {
         let _registry = crate::test_support::register_struct_origins_serialized(
             std::collections::HashMap::new(),
         );
-        let bk = bk();
-        let mut reg = StructFieldRegistry::default();
-        reg.fields.insert(
-            "Option".to_string(),
-            vec![("__discriminant".to_string(), "i64".to_string())],
-        );
-        for (root, payload) in [
-            ("Option<usize>", "usize"),
-            ("Option<i64>", "i64"),
-            ("Option<bool>", "bool"),
-        ] {
+        {
+            let bk = bk();
+            let mut reg = StructFieldRegistry::default();
             reg.fields.insert(
-                root.to_string(),
+                "Option".to_string(),
                 vec![("__discriminant".to_string(), "i64".to_string())],
             );
-            reg.fields.insert(
-                format!("{root}::Some"),
-                vec![("__pos_0".to_string(), payload.to_string())],
-            );
-        }
-        bk.set_struct_fields(Rc::new(reg));
+            for (root, payload) in [
+                ("Option<usize>", "usize"),
+                ("Option<i64>", "i64"),
+                ("Option<bool>", "bool"),
+            ] {
+                reg.fields.insert(
+                    root.to_string(),
+                    vec![("__discriminant".to_string(), "i64".to_string())],
+                );
+                reg.fields.insert(
+                    format!("{root}::Some"),
+                    vec![("__pos_0".to_string(), payload.to_string())],
+                );
+            }
+            bk.set_struct_fields(Rc::new(reg));
 
-        for (row, root) in [
-            ("Option<usize>", "Option<usize>"),
-            ("Option<i64>", "Option<i64>"),
-            ("Option<bool>", "Option<bool>"),
-        ] {
-            assert_eq!(
-                majit_ir::descr::canonical_struct_name(row),
-                root,
-                "intern_class_by_qualname / canonical_struct_name of {row}"
-            );
-            let projected = bk.project_struct_field_type(row);
-            let SomeValue::Instance(inst) = &projected else {
-                panic!("{row} must project to SomeInstance, got {projected:?}");
-            };
-            let classdef = inst
-                .classdef
-                .as_ref()
-                .expect("tagged Option must carry a classdef")
-                .clone();
-            let expected = bk
-                .getuniqueclassdef_for_struct_root(root)
-                .unwrap_or_else(|_| panic!("{root} classdef"));
-            assert!(
-                Rc::ptr_eq(&classdef, &expected),
-                "{row} classdef must be the {root} instantiation, got {}",
-                classdef.borrow().name
-            );
-            assert_eq!(classdef.borrow().name, root);
+            for (row, root) in [
+                ("Option<usize>", "Option<usize>"),
+                ("Option<i64>", "Option<i64>"),
+                ("Option<bool>", "Option<bool>"),
+            ] {
+                assert_eq!(
+                    majit_ir::descr::canonical_struct_name(row),
+                    root,
+                    "intern_class_by_qualname / canonical_struct_name of {row}"
+                );
+                let projected = bk.project_struct_field_type(row);
+                let SomeValue::Instance(inst) = &projected else {
+                    panic!("{row} must project to SomeInstance, got {projected:?}");
+                };
+                let classdef = inst
+                    .classdef
+                    .as_ref()
+                    .expect("tagged Option must carry a classdef")
+                    .clone();
+                let expected = bk
+                    .getuniqueclassdef_for_struct_root(root)
+                    .unwrap_or_else(|_| panic!("{root} classdef"));
+                assert!(
+                    Rc::ptr_eq(&classdef, &expected),
+                    "{row} classdef must be the {root} instantiation, got {}",
+                    classdef.borrow().name
+                );
+                assert_eq!(classdef.borrow().name, root);
+            }
         }
+
+        let bk_path = bk();
+        let mut path_reg = StructFieldRegistry::default();
+        path_reg.fields.insert(
+            "option::Option".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        path_reg.fields.insert(
+            "option::Option<usize>".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        bk_path.set_struct_fields(Rc::new(path_reg));
+        let projected = bk_path.project_struct_field_type("option::Option<usize>");
+        let SomeValue::Instance(inst) = &projected else {
+            panic!("option::Option<usize> must project to SomeInstance, got {projected:?}");
+        };
+        let classdef = inst
+            .classdef
+            .as_ref()
+            .expect("tagged option::Option<usize> must carry a classdef")
+            .clone();
+        let expected = bk_path
+            .getuniqueclassdef_for_struct_root("option::Option<usize>")
+            .expect("option::Option<usize> classdef");
+        assert!(
+            Rc::ptr_eq(&classdef, &expected),
+            "option::Option<usize> classdef must be the instantiation, got {}",
+            classdef.borrow().name
+        );
+        assert_eq!(classdef.borrow().name, "option::Option<usize>");
     }
 
     #[test]
@@ -12840,6 +13193,207 @@ mod tests {
     }
 
     #[test]
+    fn intern_enum_variant_host_bare_result_err_unions_with_instantiation_field() {
+        // Dual-publish like `front/mir.rs` TypeDeclKind::Enum: the ctor
+        // owner tail is the bare leaf (`Result`), the field spelling is
+        // the crate-stripped instantiation. intern_class_key must rewrite
+        // the leaf through the origin table before the convenience alias
+        // freezes a sibling ClassDef (`bookkeeper.py` `getuniqueclassdef`).
+        use crate::annotator::model::{SomeInstance, SomeValue};
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+        let _origins = crate::test_support::register_struct_origins_serialized(HashMap::from([(
+            "Result".to_string(),
+            "result".to_string(),
+        )]));
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        for base in ["Result", "result::Result", "core::result::Result"] {
+            reg.fields.insert(
+                base.to_string(),
+                vec![("__discriminant".to_string(), "i64".to_string())],
+            );
+        }
+        for variant in [
+            "Result::Err",
+            "result::Result::Err",
+            "core::result::Result::Err",
+        ] {
+            reg.fields.insert(
+                variant.to_string(),
+                vec![("__pos_0".to_string(), "PyError".to_string())],
+            );
+        }
+        let inst = "result::Result<Never,PyError>";
+        reg.fields.insert(
+            inst.to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            format!("{inst}::Err"),
+            vec![("__pos_0".to_string(), "PyError".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        for root in bk.struct_root_names() {
+            let _ = bk.getuniqueclassdef_for_struct_root(&root);
+        }
+
+        assert_eq!(bk.intern_class_key("Result"), "result::Result");
+        assert_eq!(bk.intern_class_key("Result::Err"), "result::Result::Err");
+
+        let err_host = bk.intern_enum_variant_host("Result", "Err");
+        assert_eq!(err_host.qualname(), "result::Result::Err");
+        let err_cd = bk
+            .getuniqueclassdef(&err_host)
+            .expect("Result::Err classdef");
+        let inst_cd = bk
+            .getuniqueclassdef_for_struct_root(inst)
+            .expect("instantiation registers");
+        assert!(
+            err_cd.borrow().issubclass(&inst_cd)
+                || inst_cd.borrow().issubclass(&err_cd)
+                || crate::annotator::classdesc::ClassDef::commonbase(&err_cd, &inst_cd).is_some(),
+            "Result::Err and {inst} must share a ClassDef/base, err={} inst={}",
+            err_cd.borrow().name,
+            inst_cd.borrow().name
+        );
+        let s_err = SomeValue::Instance(SomeInstance::new(
+            Some(err_cd),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let s_inst = SomeValue::Instance(SomeInstance::new(
+            Some(inst_cd),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        crate::annotator::model::union(&s_err, &s_inst).unwrap_or_else(|err| {
+            panic!("setattr of Result::Err onto {inst} must union, got {err}")
+        });
+    }
+
+    #[test]
+    fn intern_carrier_result_err_unions_with_exception() {
+        // `Try::branch` Break of `Result<Never, PyError>` stores
+        // `Result::Err`. The field intern stays the Result ADT so that
+        // setattr of `instantiate(Result::Err)` unions.
+        // `Result<Never, E>::Err` still interned as the carrier. A
+        // `Result<(), PyError>` match keeps the ADT
+        // (`bookkeeper.py` `getuniqueclassdef(cls)`).
+        use crate::annotator::model::{SomeInstance, SomeValue};
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+        let _origins = crate::test_support::register_struct_origins_serialized(HashMap::from([(
+            "Result".to_string(),
+            "result".to_string(),
+        )]));
+        let bk = bk();
+        bk.set_exception_carrier("error::PyErrorObject");
+        bk.alias_exception_carrier_handle("error::PyError");
+        let mut reg = StructFieldRegistry::default();
+        for base in [
+            "Result",
+            "result::Result",
+            "core::result::Result",
+            "result::Result<(),PyError>",
+            "result::Result<Never,PyError>",
+        ] {
+            reg.fields.insert(
+                base.to_string(),
+                vec![("__discriminant".to_string(), "i64".to_string())],
+            );
+        }
+        for variant in [
+            "Result::Err",
+            "result::Result::Err",
+            "core::result::Result::Err",
+        ] {
+            reg.fields.insert(
+                variant.to_string(),
+                vec![("__pos_0".to_string(), "PyError".to_string())],
+            );
+        }
+        bk.set_struct_fields(Rc::new(reg));
+        for root in bk.struct_root_names() {
+            let _ = bk.getuniqueclassdef_for_struct_root(&root);
+        }
+        let carrier = bk.exception_carrier_class().expect("carrier");
+        let bare_err = bk.intern_enum_variant_host("Result", "Err");
+        assert_ne!(
+            bare_err.qualname(),
+            carrier.qualname(),
+            "bare Result::Err stays the ADT variant"
+        );
+        assert_ne!(
+            bk.intern_class_key("result::Result<Never,PyError>"),
+            bk.intern_class_key("error::PyError"),
+            "Result<Never,PyError> intern stays the Result ADT (Break payload)"
+        );
+        assert_ne!(
+            bk.intern_class_key("result::Result<??scalar,PyError>"),
+            bk.intern_class_key("error::PyError"),
+            "Result<??scalar,PyError> intern stays the Result ADT (Break payload)"
+        );
+        let inst_err = bk.intern_enum_variant_host("result::Result<Never,PyError>", "Err");
+        assert_eq!(inst_err.qualname(), carrier.qualname());
+        let residual_err = bk.intern_enum_variant_host("result::Result<??scalar,PyError>", "Err");
+        assert_eq!(residual_err.qualname(), carrier.qualname());
+        let err_cd = bk.getuniqueclassdef(&inst_err).expect("Err classdef");
+        let exception = bk
+            .getuniqueclassdef(
+                &crate::flowspace::model::HOST_ENV
+                    .lookup_exception_class("Exception")
+                    .unwrap(),
+            )
+            .expect("Exception");
+        assert!(err_cd.borrow().issubclass(&exception));
+        let s_err = SomeValue::Instance(SomeInstance::new(
+            Some(err_cd),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let s_exc = SomeValue::Instance(SomeInstance::new(
+            Some(exception),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        crate::annotator::model::union(&s_err, &s_exc)
+            .unwrap_or_else(|err| panic!("carrier Result::Err ∪ Exception must union, got {err}"));
+        // Break.__pos_0 is the Result ADT (`Try::branch` stores
+        // `instantiate(Result::Err)`). Peeling the field to E unions
+        // `result::Result::Err ∪ error::PyError` at setattr.
+        let s_never = bk.project_struct_field_type("result::Result<Never,PyError>");
+        let s_bare_err = SomeValue::Instance(SomeInstance::new(
+            Some(
+                bk.getuniqueclassdef(&bare_err)
+                    .expect("bare Result::Err classdef"),
+            ),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        crate::annotator::model::union(&s_never, &s_bare_err).unwrap_or_else(|err| {
+            panic!("Break payload Result ADT ∪ instantiate(Result::Err) must union, got {err}")
+        });
+        let ok_host = bk.intern_enum_variant_host("result::Result<(),PyError>", "Ok");
+        let err_host = bk.intern_enum_variant_host("result::Result<(),PyError>", "Err");
+        let ok_cd = bk.getuniqueclassdef(&ok_host).expect("Ok classdef");
+        let inhabited_err_cd = bk.getuniqueclassdef(&err_host).expect("inhabited Err");
+        let s_ok = SomeValue::Instance(SomeInstance::new(
+            Some(ok_cd),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let s_inhabited_err = SomeValue::Instance(SomeInstance::new(
+            Some(inhabited_err_cd),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        crate::annotator::model::union(&s_ok, &s_inhabited_err).unwrap_or_else(|err| {
+            panic!("Result<(),PyError>::Ok ∪ Err must union as the ADT, got {err}")
+        });
+    }
+
+    #[test]
     fn unit_variant_prebuilt_continue_unions_with_stepresult_field() {
         use crate::annotator::model::{SomeInstance, SomeValue};
         use crate::flowspace::model::ConstValue;
@@ -13805,6 +14359,110 @@ mod tests {
         assert!(
             matches!(len_attr, SomeValue::Integer(ref i) if i.nonneg && !i.unsigned),
             "rlist.py ll_length is return l.length (Signed nonneg), got {len_attr:?}"
+        );
+    }
+
+    #[test]
+    fn transparent_scalar_field_projects_to_the_inner_word() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let owner = "eval::FrameAnchor";
+        let parent = "eval::Handler";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields
+            .insert(owner.to_string(), vec![("depth".into(), "usize".into())]);
+        reg.fields
+            .insert(parent.to_string(), vec![("anchor".into(), owner.into())]);
+        reg.raw_word_owners.insert(owner.to_string());
+        reg.transparent_scalar_kinds
+            .insert(owner.to_string(), crate::model::ValueType::Unsigned);
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "depth".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        assert!(
+            bk.raw_struct_ptr_annotation(owner).is_none(),
+            "a transparent scalar must not mint SomePtr of the wrapper"
+        );
+        let projected = bk.project_struct_field_type(owner);
+        let SomeValue::Integer(i) = projected else {
+            panic!("FrameAnchor field must project to the depth word, got {projected:?}");
+        };
+        assert!(i.unsigned, "FrameAnchor.depth is usize");
+        for spelling in ["&eval::FrameAnchor", "FrameAnchor", "&FrameAnchor"] {
+            let projected = bk.project_struct_field_type(spelling);
+            assert!(
+                matches!(projected, SomeValue::Integer(ref i) if i.unsigned),
+                "Charon spells a capture as the ADT leaf; {spelling} is the depth word, got {projected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn closure_capture_of_transparent_scalar_leaf_is_the_inner_word() {
+        use crate::front::StructFieldRegistry;
+
+        let owner = "eval::FrameAnchor";
+        let closure = "executioncontext::<Impl>::_trace::closure#2";
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields
+            .insert(owner.to_string(), vec![("depth".into(), "usize".into())]);
+        reg.fields.insert(
+            closure.to_string(),
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_5",
+                "&FrameAnchor",
+            )],
+        );
+        reg.transparent_scalar_kinds
+            .insert(owner.to_string(), crate::model::ValueType::Unsigned);
+        bk.set_struct_fields(Rc::new(reg));
+        crate::annotator::classdesc::register_struct_fields(
+            closure,
+            &[("__pos_5".to_string(), crate::model::ValueType::Ref(None))],
+        );
+        let cd = bk
+            .getuniqueclassdef_for_struct_root(closure)
+            .expect("closure registers");
+        let attr = cd
+            .borrow()
+            .attrs
+            .get("__pos_5")
+            .expect("__pos_5 attr projected")
+            .s_value
+            .clone();
+        assert!(
+            matches!(attr, SomeValue::Integer(ref i) if i.unsigned),
+            "closure capture of the FrameAnchor leaf is the depth word, got {attr:?}"
         );
     }
 
@@ -16732,6 +17390,194 @@ mod tests {
     }
 
     #[test]
+    fn getdesc_for_const_function_routes_to_function_desc() {
+        use crate::annotator::model::DescKind;
+        use crate::flowspace::model::{Constant, GraphFunc};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let func = GraphFunc::new("f", Constant::new(ConstValue::Dict(Default::default())));
+        let x = ConstValue::Function(Box::new(func));
+        let entry = bk
+            .getdesc_for_const(&x)
+            .expect("ConstValue::Function routes to getdesc");
+        assert_eq!(entry.kind(), DescKind::Function);
+        // Bytecode MAKE_FUNCTION mints a HostObject per code object.
+        // A Charon __fn_const must reuse CallRegistry.entry.host_object
+        // so the desc is the same one direct calls already use.
+    }
+
+    #[test]
+    fn intern_mut_ref_cell_is_not_payload_subclass() {
+        use crate::annotator::model::{SomeInstance, union};
+
+        let bk = bk();
+        let cell = bk.intern_class_by_qualname("MutRef<error::PyError>");
+        assert_eq!(cell.qualname(), "MutRef<error::PyError>");
+        assert!(
+            cell.class_bases()
+                .map(|bases| bases.is_empty())
+                .unwrap_or(true),
+            "MutRef must not subclass the payload"
+        );
+        let payload = bk.intern_class_by_qualname("pyre_interpreter::error::PyError");
+        assert_ne!(cell, payload);
+        let s_cell = SomeValue::Instance(SomeInstance::new(
+            Some(bk.getuniqueclassdef(&cell).expect("cell classdef")),
+            false,
+            Default::default(),
+        ));
+        let s_payload = SomeValue::Instance(SomeInstance::new(
+            Some(bk.getuniqueclassdef(&payload).expect("payload classdef")),
+            false,
+            Default::default(),
+        ));
+        let merged = union(&s_cell, &s_payload).expect("interned MutRef<T> ∪ T");
+        let SomeValue::Instance(inst) = merged else {
+            panic!("expected SomeInstance, got {merged:?}");
+        };
+        assert_eq!(
+            inst.classdef.as_ref().expect("classdef").borrow().name,
+            "MutRef<error::PyError>"
+        );
+    }
+
+    #[test]
+    fn fn_pbc_setattr_on_instance_unions_descs() {
+        use crate::annotator::classdesc::{ClassDef, ClassDesc};
+        use crate::annotator::model::{DescKind, SomePBC};
+        use crate::flowspace::model::HostObject;
+
+        let bk = bk();
+        let pyobj = HostObject::new_class("FnPbcHolder", vec![]);
+        let desc = Rc::new(RefCell::new(ClassDesc::new_shell(
+            &bk,
+            pyobj,
+            "FnPbcHolder".into(),
+        )));
+        let cd = ClassDef::new(&bk, &desc);
+        let f = function_desc_entry(&bk, "app_profile_call");
+        let g = function_desc_entry(&bk, "lsprof_call");
+        assert!(matches!(
+            cd.borrow().attrs.get("profilefunc").map(|a| &a.s_value),
+            None | Some(SomeValue::Impossible)
+        ));
+        ClassDef::generalize_attr(
+            &cd,
+            "profilefunc",
+            Some(SomeValue::PBC(SomePBC::new(vec![f.clone()], false))),
+        )
+        .expect("setattr SomePBC(f)");
+        ClassDef::generalize_attr(&cd, "profilefunc", Some(s_none())).expect("setattr s_None");
+        ClassDef::generalize_attr(
+            &cd,
+            "profilefunc",
+            Some(SomeValue::PBC(SomePBC::new(vec![g.clone()], false))),
+        )
+        .expect("setattr SomePBC(g)");
+        let cd_borrow = cd.borrow();
+        let slot = cd_borrow.attrs.get("profilefunc").expect("profilefunc");
+        let SomeValue::PBC(pbc) = &slot.s_value else {
+            panic!("expected SomePBC, got {:?}", slot.s_value);
+        };
+        assert!(pbc.can_be_none, "None ∪ PBC noneifies");
+        assert_eq!(pbc.descriptions.len(), 2);
+        assert!(
+            pbc.descriptions
+                .values()
+                .all(|d| d.kind() == DescKind::Function)
+        );
+        assert!(pbc.descriptions.contains_key(&f.desc_key()));
+        assert!(pbc.descriptions.contains_key(&g.desc_key()));
+    }
+
+    #[test]
+    fn fn_pbc_simple_call_is_pbc_call() {
+        use crate::annotator::argument::ArgumentsForTranslation;
+        use crate::annotator::description::GraphCacheKey;
+        use crate::annotator::model::{SomeInteger, SomePBC};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let sig = Signature::new(vec!["x".to_string()], None, None);
+        let fd_f = Rc::new(RefCell::new(FunctionDesc::new(
+            bk.clone(),
+            None,
+            "app_profile_call",
+            sig.clone(),
+            None,
+            None,
+        )));
+        let fd_g = Rc::new(RefCell::new(FunctionDesc::new(
+            bk.clone(),
+            None,
+            "lsprof_call",
+            sig,
+            None,
+            None,
+        )));
+        for (desc, name) in [
+            (&fd_f, "app_profile_call_graph"),
+            (&fd_g, "lsprof_call_graph"),
+        ] {
+            desc.borrow().cache.borrow_mut().insert(
+                GraphCacheKey::None,
+                crate::translator::rtyper::rpbc::tests::make_pygraph(name),
+            );
+        }
+        let args = ArgumentsForTranslation::new(
+            vec![Some(SomeValue::Integer(SomeInteger::default()))],
+            None,
+            None,
+        );
+        FunctionDesc::consider_call_site(
+            &[fd_f.clone(), fd_g.clone()],
+            &args,
+            &SomeValue::Impossible,
+            None,
+        )
+        .expect("consider_call_site");
+        let s_pbc = SomeValue::PBC(SomePBC::new(
+            vec![
+                DescEntry::function(fd_f.clone()),
+                DescEntry::function(fd_g.clone()),
+            ],
+            true,
+        ));
+        bk.emulate_pbc_call(
+            crate::annotator::bookkeeper::EmulatedPbcCallKey::Text("fn_pbc_simple_call".into()),
+            &s_pbc,
+            &[SomeValue::Integer(SomeInteger::default())],
+            &[],
+            None,
+        )
+        .expect("emulate_pbc_call / FunctionDesc.pycall");
+        bk.compute_at_fixpoint()
+            .expect("compute_at_fixpoint consider_call_site");
+        assert!(
+            fd_f.borrow()
+                .base
+                .getcallfamily()
+                .unwrap()
+                .borrow()
+                .total_calltable_size
+                > 0,
+            "consider_call_site grows total_calltable_size"
+        );
+    }
+
+    #[test]
+    fn someptr_functype_union_pbc_is_union_error() {
+        use crate::annotator::model::SomePBC;
+
+        let bk = bk();
+        let s_ptr = raw_fn_ptr_somevalue();
+        let s_pbc = SomeValue::PBC(SomePBC::new(vec![function_desc_entry(&bk, "f")], false));
+        union(&s_ptr, &s_pbc).expect_err("SomePtr ∪ SomePBC is UnionError");
+        s_ptr.noneify().expect_err("SomePtr.noneify is UnionError");
+    }
+
+    #[test]
     fn const_value_desc_class_of_is_host_class() {
         use crate::annotator::description::desc_host_class;
 
@@ -17997,8 +18843,8 @@ mod tests {
         use crate::front::StructFieldRegistry;
         let bk = bk();
         // `tyref_to_attr_value_type` banks `Ptr(FuncType)` as Int, so FORCE
-        // shells the field `SomeInteger`. Pass-2 must replace that with the
-        // layout spelling's `SomePtr` (`project_struct_field_type("fn")`).
+        // shells the field `SomeInteger`. Pass-2 must replace that with
+        // lattice bottom (`project_struct_field_type("fn")` is Impossible).
         crate::annotator::classdesc::register_struct_fields(
             "CallbackHolder",
             &[("slot".to_string(), crate::model::ValueType::Int)],
@@ -18015,8 +18861,40 @@ mod tests {
         let g = cd.borrow();
         let slot = g.attrs.get("slot").expect("slot attr present");
         assert!(
-            matches!(slot.s_value, SomeValue::Ptr(_)),
-            "fn field must project to SomePtr(FuncType), got {:?}",
+            matches!(slot.s_value, SomeValue::Impossible),
+            "fn field must project to Impossible, got {:?}",
+            slot.s_value
+        );
+    }
+
+    #[test]
+    fn struct_root_pass2_replaces_integer_force_shell_of_option_fn_field() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        // `tyref_to_attr_value_type` banks `Ptr(FuncType)` as Int, so FORCE
+        // shells the field `SomeInteger`. Pass-2 must replace that with
+        // `s_None` (`ExecutionContext.__init__` stores None on `Option<fn>`).
+        crate::annotator::classdesc::register_struct_fields(
+            "ProfileHolder",
+            &[("profilefunc".to_string(), crate::model::ValueType::Int)],
+        );
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "ProfileHolder".to_string(),
+            vec![("profilefunc".to_string(), "Option<fn()>".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("ProfileHolder")
+            .expect("ProfileHolder registers");
+        let g = cd.borrow();
+        let slot = g
+            .attrs
+            .get("profilefunc")
+            .expect("profilefunc attr present");
+        assert!(
+            matches!(slot.s_value, SomeValue::None_(_)),
+            "Option<fn> field must project to s_None, got {:?}",
             slot.s_value
         );
     }
@@ -18654,13 +19532,13 @@ mod tests {
         let builtin =
             bk.project_struct_field_type("fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>");
         assert!(
-            matches!(builtin, SomeValue::Ptr(_)),
-            "BuiltinCodeFn stays SomePtr, got {builtin:?}"
+            matches!(builtin, SomeValue::Impossible),
+            "a bare fn field is lattice bottom until a PBC store, got {builtin:?}"
         );
         let generic = bk.project_struct_field_type("Option<fn()>");
         assert!(
-            matches!(generic, SomeValue::Ptr(_)),
-            "generic Option<fn> stays SomePtr, got {generic:?}"
+            matches!(generic, SomeValue::None_(_)),
+            "generic Option<fn> starts as s_None, got {generic:?}"
         );
     }
 }

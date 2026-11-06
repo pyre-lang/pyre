@@ -4710,6 +4710,20 @@ fn init_someinstance_overrides(
                 if attr == "__class__" {
                     return super::classdesc::ClassDef::read_attr__class__(classdef);
                 }
+                // `MutRef<PyError>.value` is this handle. A pycall that
+                // already holds the payload (`_trace` unwrap of
+                // `Option<&mut PyError>`) reads the same word. Do not
+                // `record_getattr` here: that would hoist `value` onto
+                // the handle (`alias_exception_carrier_handle`).
+                if attr == "value" {
+                    let name = classdef.borrow().name.clone();
+                    if !name.starts_with("MutRef<")
+                        && name.rsplit("::").next() == Some("PyError")
+                        && !classdef.borrow().attrs.contains_key("value")
+                    {
+                        return s_self;
+                    }
+                }
                 // unaryop.py:840 — `getbookkeeper().record_getattr(
                 //                       self.classdef.classdesc, attr)`.
                 let classdesc = classdef.borrow().classdesc.clone();
@@ -7348,6 +7362,48 @@ mod tests {
                 SomeValue::BuiltinMethod(m) if m.analyser_name == "ptr_method_is_null"
             ),
             "a class member named is_null must win over the ptr method, got {result2:?}"
+        );
+    }
+
+    #[test]
+    fn pyerror_handle_getattr_value_is_the_handle() {
+        // `MutRef<PyError>.value` is this handle. A pycall that already
+        // holds the payload reads the same word
+        // (`alias_exception_carrier_handle`).
+        use super::super::classdesc::ClassDef;
+        use super::super::model::SomeInstance;
+        let ann = mk_ann();
+        let handle = ClassDef::new_standalone("pyre_interpreter::error::PyError", None);
+        let mut v = Variable::named("operr");
+        ann.setbinding(
+            &mut v,
+            SomeValue::Instance(SomeInstance::new(
+                Some(handle.clone()),
+                false,
+                std::collections::BTreeMap::new(),
+            )),
+        );
+        let hl = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                Hlvalue::Variable(v),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("value"))),
+            ],
+        );
+        let result = hl
+            .consider(&ann)
+            .expect("getattr value must succeed")
+            .unwrap();
+        let SomeValue::Instance(inst) = result else {
+            panic!("expected the handle, got {result:?}");
+        };
+        assert_eq!(
+            inst.classdef.as_ref().expect("classdef").borrow().name,
+            "pyre_interpreter::error::PyError"
+        );
+        assert!(
+            !handle.borrow().attrs.contains_key("value"),
+            "getattr value must not hoist the cell field onto the handle"
         );
     }
 

@@ -906,10 +906,19 @@ pub(crate) fn apply_rtyper_const_results(
             if is_const_define_op(&op.kind) {
                 continue;
             }
-            let Some(new_kind) = opkind_from_rtyper_constant(c) else {
+            let keep_fn_stamp = result
+                .concretetype()
+                .as_ref()
+                .is_some_and(crate::model::FunctionGraph::lltype_is_fn_ptr)
+                && matches!(c.value, crate::flowspace::model::ConstValue::None);
+            let Some(new_kind) = (if keep_fn_stamp {
+                Some(OpKind::ConstInt(0))
+            } else {
+                opkind_from_rtyper_constant(c)
+            }) else {
                 continue;
             };
-            if let Some(ct) = c.concretetype.clone() {
+            if !keep_fn_stamp && let Some(ct) = c.concretetype.clone() {
                 result.set_concretetype(Some(ct));
             }
             op.kind = new_kind;
@@ -2623,6 +2632,15 @@ pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'stati
     if crate::flowspace::model::is_jit_ll_arraycopy_path(canonical_strip) {
         return Some(SKIP_JIT_LL_ARRAYCOPY);
     }
+    // `core::slice::raw::from_raw_parts{,_mut}` is an opaque foreign
+    // decl. Layer-1 `call_registry.lookup` beats `host_env_callable`,
+    // so a harvested stub would be the callee. Declining the registry
+    // entry lets the callsite reach the `std.slice` host builtin
+    // (`std_slice_from_raw_parts`). The `from_raw_parts` leaf is
+    // shared with `Vec::from_raw_parts`; only the slice paths decline.
+    if is_slice_from_raw_parts(canonical_strip) {
+        return Some(SKIP_SLICE_FROM_RAW_PARTS);
+    }
 
     None
 }
@@ -2663,6 +2681,9 @@ fn is_ptr_write(canonical_strip: &[String]) -> bool {
 /// [`registration_decline`] reason for `std::alloc::alloc` / `alloc_zeroed`.
 const SKIP_STD_ALLOC_RAW: &str = "skip-std-alloc-raw";
 
+/// [`registration_decline`] reason for `slice::from_raw_parts{,_mut}`.
+const SKIP_SLICE_FROM_RAW_PARTS: &str = "skip-slice-from-raw-parts";
+
 /// `std::alloc::alloc` / `alloc_zeroed` and the `alloc::alloc` re-export.
 /// The `alloc_zeroed` leaf is unique; the `alloc` leaf is not.
 fn is_std_alloc_raw(canonical_strip: &[String]) -> bool {
@@ -2675,6 +2696,29 @@ fn is_std_alloc_raw(canonical_strip: &[String]) -> bool {
             true
         }
         [leaf] if leaf == "alloc_zeroed" => true,
+        _ => false,
+    }
+}
+
+/// `core::slice::raw::from_raw_parts{,_mut}` and the `std::slice` re-export.
+/// The bare `from_raw_parts` leaf is `Vec::from_raw_parts` as well.
+fn is_slice_from_raw_parts(canonical_strip: &[String]) -> bool {
+    match canonical_strip {
+        [core, slice, raw, leaf]
+            if core == "core"
+                && slice == "slice"
+                && raw == "raw"
+                && (leaf == "from_raw_parts" || leaf == "from_raw_parts_mut") =>
+        {
+            true
+        }
+        [std, slice, leaf]
+            if std == "std"
+                && slice == "slice"
+                && (leaf == "from_raw_parts" || leaf == "from_raw_parts_mut") =>
+        {
+            true
+        }
         _ => false,
     }
 }
@@ -4076,6 +4120,12 @@ fn declared_return_annotation(
             s
         });
     }
+    // A transparent scalar is the inner word, not Ptr of a wrapper
+    // struct. Residual `FrameAnchor::new` must meet live's Unsigned
+    // Input as Integer, not SomePtr.
+    if let Some(cell) = bk.transparent_scalar_annotation(root) {
+        return Some(cell);
+    }
     // A by-value Raw ADT is Ptr of that struct (`history.getkind`),
     // the same shell FieldRead and a `raw:<owner>` token already use.
     // SomeInstance here made mergeinputargs raise Instance(X) ∪ Ptr(X)
@@ -4192,6 +4242,9 @@ fn raw_ptr_token_annotation(
     }
     let root = raw_owner_return_root(token?)?;
     let bk = registry.bookkeeper();
+    if let Some(cell) = bk.transparent_scalar_annotation(root) {
+        return Some(cell);
+    }
     if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
         return Some(cell);
     }
@@ -9678,6 +9731,80 @@ mod tests {
         }
     }
 
+    #[test]
+    fn from_raw_parts_is_declined_and_unregistered() {
+        for segments in [
+            vec![
+                "core".to_string(),
+                "slice".into(),
+                "raw".into(),
+                "from_raw_parts_mut".into(),
+            ],
+            vec![
+                "core".into(),
+                "slice".into(),
+                "raw".into(),
+                "from_raw_parts".into(),
+            ],
+            vec!["std".into(), "slice".into(), "from_raw_parts_mut".into()],
+            vec!["std".into(), "slice".into(), "from_raw_parts".into()],
+        ] {
+            assert_eq!(
+                registration_decline(&segments),
+                Some(SKIP_SLICE_FROM_RAW_PARTS),
+                "{segments:?}"
+            );
+        }
+        assert_eq!(
+            registration_decline(&["from_raw_parts_mut".into()]),
+            None,
+            "bare leaf is Vec::from_raw_parts as well"
+        );
+        assert_eq!(
+            registration_decline(&["core".into(), "slice".into(), "from_raw_parts_mut".into()]),
+            None
+        );
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.note_foreign_body_callable("core", "slice::raw::from_raw_parts_mut");
+        fields.note_foreign_body_callable("std", "slice::from_raw_parts_mut");
+        registry.set_struct_fields(std::rc::Rc::new(fields));
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        for segments in [
+            vec!["core", "slice", "raw", "from_raw_parts_mut"],
+            vec!["std", "slice", "from_raw_parts_mut"],
+        ] {
+            let path = crate::parse::CallPath {
+                segments: segments.iter().map(|s| (*s).to_string()).collect(),
+                specialization: crate::parse::GraphSpecialization::Regular,
+            };
+            let mut graph = LegacyGraph::new("from_raw_parts_mut");
+            graph.set_return(graph.startblock.clone(), None);
+            graphs.insert(path, graph);
+        }
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        for segments in [
+            &["core", "slice", "raw", "from_raw_parts_mut"][..],
+            &["std", "slice", "from_raw_parts_mut"][..],
+        ] {
+            let key = FunctionPathKey::from_segments(segments.iter().copied());
+            assert!(
+                registry.lookup(&key).is_none(),
+                "user graph still registered for {segments:?}"
+            );
+        }
+        let host = crate::flowspace::model::host_env_callable(
+            &["core", "slice", "raw", "from_raw_parts_mut"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .expect("core.slice.raw.from_raw_parts_mut resolves in HOST_ENV");
+        assert!(crate::annotator::builtin::is_registered(host.qualname()));
+    }
+
     /// Residual `majit_rlib::jit::conditional_call*` bodies are
     /// `ConditionalCallEntry`, not graphs. Layer-1 would otherwise beat
     /// HOST_ENV and the annotator would walk `function(a)` as an ll
@@ -9919,7 +10046,11 @@ mod tests {
             crate::annotator::model::SomeValue::Impossible,
         )));
         ret.set_concretetype(Some(GCREF.clone()));
-        let startblock = crate::flowspace::model::Block::shared(vec![]);
+        // `__fn_const` is the registry HostObject (`SomePBC`). The builtin
+        // `pycall`s that desc; `bindinputargs` needs one startblock
+        // inputarg for signature `["obj"]`.
+        let obj = crate::flowspace::model::Variable::named("obj");
+        let startblock = crate::flowspace::model::Block::shared(vec![Hlvalue::Variable(obj)]);
         let func = GraphFunc::new(
             "dummy_compute",
             Constant::new(ConstValue::Dict(Default::default())),

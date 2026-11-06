@@ -14,7 +14,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::annotator::model::{KnownType, SomeFloat, SomeInstance, SomeInteger, SomeValue, s_str};
+use crate::annotator::model::{
+    DescKind, KnownType, SomeFloat, SomeInstance, SomeInteger, SomeValue, s_str,
+};
 use crate::model::ValueType;
 use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
 
@@ -258,6 +260,20 @@ pub fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
             PtrTarget::Func(_) => ValueType::Int,
             _ => ValueType::Ref(None),
         },
+        // Frozen / class PBCs stay `Ref`. A function-PBC's
+        // `FunctionsPBCRepr.lowleveltype` is `Ptr(FuncType)` even when
+        // `can_be_None` (`rtype_is_None` → `ptr_iszero`); `history.getkind`
+        // of that pointer is `'int'`. Projecting `Ref` here makes the
+        // skip-path overlay `GcRef` while `FUNC.RESULT` is `'i'`.
+        SomeValue::PBC(pbc)
+            if !pbc.descriptions.is_empty()
+                && pbc
+                    .descriptions
+                    .values()
+                    .all(|d| d.kind() == DescKind::Function) =>
+        {
+            ValueType::Int
+        }
         SomeValue::PBC(_) => ValueType::Ref(None),
         // Keep the `StringBuilder` shell distinct across the roundtrip so
         // the rtyper picks `StringBuilderRepr` rather than the generic
@@ -380,6 +396,31 @@ mod tests {
     #[test]
     fn function_pointer_someptr_projects_as_int() {
         let s = crate::annotator::bookkeeper::raw_fn_ptr_somevalue();
+        assert_eq!(somevalue_to_valuetype(&s), ValueType::Int);
+    }
+
+    #[test]
+    fn function_pbc_projects_as_int() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::description::FunctionDesc;
+        use crate::annotator::model::SomePBC;
+        use crate::flowspace::argument::Signature;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let fd = Rc::new(RefCell::new(FunctionDesc::new(
+            bk,
+            None,
+            "app_profile_call",
+            Signature::new(vec![], None, None),
+            None,
+            None,
+        )));
+        let s = SomeValue::PBC(SomePBC::new(
+            vec![crate::annotator::description::DescEntry::function(fd)],
+            true,
+        ));
         assert_eq!(somevalue_to_valuetype(&s), ValueType::Int);
     }
 
