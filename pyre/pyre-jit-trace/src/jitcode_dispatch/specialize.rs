@@ -7001,6 +7001,22 @@ const REVERSESEQITER_ITER_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "REVERSESEQITER-ITER-SUBWALK",
 };
 
+/// `functional.py W_AbstractRangeIterator.descr_iter` — `return self`.
+const RANGE_ITERATOR_ITER_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::functional::w_range_iterator_iter",
+    commit_label: "range_iterator_iter_commit",
+    call_site_label: "range_iterator_iter_call_site",
+    decline_tag: "RANGE-ITERATOR-ITER-SUBWALK",
+};
+
+/// `generator.py GeneratorIterator.descr__iter` — `return self`.
+const GENERATOR_ITER_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::generator::w_generator_iter",
+    commit_label: "generator_iter_commit",
+    call_site_label: "generator_iter_call_site",
+    decline_tag: "GENERATOR-ITER-SUBWALK",
+};
+
 /// Descend a generated cell helper (`write_cell` / `unwrap_cell`) the way
 /// [`try_walker_orthodox_descent`] enters `binary_value_from_tag`.  The
 /// IR comes from the helper's jitcode, not a hand-written getfield/setfield.
@@ -16487,6 +16503,7 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
 
     let walk_start = ctx.trace_ctx.get_trace_position();
     let saved_fbw_mode = ctx.fbw_mode.clone();
+    let saved_vstack = save_vstack_mirror(ctx);
     ctx.fbw_mode.inline_subwalk = true;
     ctx.fbw_mode.subwalk_floor = Some(walk_start);
     ctx.fbw_mode.helper_return = nested_entry.ret;
@@ -16503,6 +16520,7 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     );
     drop(helper_frame);
     ctx.fbw_mode = saved_fbw_mode;
+    restore_vstack_mirror(ctx, saved_vstack);
     ctx.entry_py_pc = saved_entry;
     ctx.outer_resume_marker_jit_pc = saved_marker;
     ctx.outer_jitcode_index = saved_oji;
@@ -19430,16 +19448,19 @@ pub(crate) fn try_walker_orthodox_store_subscr<Sym: WalkSym>(
 /// OneArg / StepOne / IntRange / LongRange via `space.int_w`. Exact
 /// `zip` / `map` / `filter` record `iter_w`. Exact sequence iterators
 /// record `W_AbstractSeqIterObject.descr_iter` (`w_seqiter_iter`) or
-/// `W_ReverseSeqIterObject.descr_iter` (`w_reverseseqiter_iter`).
-/// Admission is the instance typeptr, so a `_getusercls` subclass is
-/// excluded. Not a spec-fold row.
+/// `W_ReverseSeqIterObject.descr_iter` (`w_reverseseqiter_iter`). Exact
+/// range iterators record `W_AbstractRangeIterator.descr_iter`
+/// (`w_range_iterator_iter`). Exact generators record
+/// `GeneratorIterator.descr__iter` (`w_generator_iter`). Admission is
+/// the instance typeptr, so a `_getusercls` subclass is excluded. Not a
+/// spec-fold row.
 pub(crate) fn try_walker_orthodox_get_iter<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     r_args: &[OpRef],
     dst: usize,
     dst_bank: char,
-) -> Result<Option<OpRef>, DispatchError> {
+) -> Result<Option<DispatchOutcome>, DispatchError> {
     // `inline_subwalk` is allowed: the GET_ITER that needs this path lives
     // in the inlined caller of a list-comp
     // (`f` on `comprehension_param_range_call_flush`).
@@ -19527,6 +19548,41 @@ pub(crate) fn try_walker_orthodox_get_iter<Sym: WalkSym>(
         );
     }
 
+    // `W_AbstractRangeIterator.descr_iter` is `return self`. Admission is
+    // the instance typeptr, same as the seqiter arm. `reversed(range)`
+    // yields one of these; GET_ITER must not fall through to a residual
+    // whose LoadSpecialMethod fill can stamp a leftover list into the
+    // iterator slot.
+    if unsafe { pyre_object::is_range_iter(obj) || pyre_object::is_long_range_iter(obj) } {
+        return run_get_iter_helper_descent(
+            ctx,
+            op_pc,
+            obj_op,
+            obj,
+            dst,
+            dst_bank,
+            &RANGE_ITERATOR_ITER_DESCENT,
+            unsafe { (*obj).ob_type as i64 },
+        );
+    }
+
+    // `GeneratorIterator.descr__iter` is `return self`. Admission is
+    // the instance typeptr, same as the seqiter arm. Recursive
+    // `for y in _rlistdir(...)` GET_ITER must not fall through to a
+    // residual of `space.iter`.
+    if unsafe { pyre_object::generator::is_generator(obj) } {
+        return run_get_iter_helper_descent(
+            ctx,
+            op_pc,
+            obj_op,
+            obj,
+            dst,
+            dst_bank,
+            &GENERATOR_ITER_DESCENT,
+            unsafe { (*obj).ob_type as i64 },
+        );
+    }
+
     // `W_Range.descr_iter` itself chooses the iterator shape; the class
     // guard is the only admission (`typedef.acceptable_as_base_class = False`).
     if unsafe { !pyre_object::functional::is_w_range(obj) } {
@@ -19553,16 +19609,21 @@ fn run_get_iter_helper_descent<Sym: WalkSym>(
     dst_bank: char,
     descent: &HelperDescent,
     type_addr: i64,
-) -> Result<Option<OpRef>, DispatchError> {
-    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, descent) else {
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    // The helper return *is* the GET_ITER residual result
+    // (`_setup_return_value_r`), the FOR_ITER twin
+    // (`try_walker_orthodox_zip_next`). Converted leaves the dest
+    // unnumbered, so the remaining `setarrayitem_vable_r` of the
+    // iterator recaptures leftover TOS (`indices` after `[0]*r`,
+    // `range` from LOAD_GLOBAL). A missing result slot declines to
+    // the residual, which still writes dest before those pushes.
+    let Some(prep) =
+        prepare_orthodox_descent_with_return(ctx, op_pc, descent, HelperReturn::CallResult)
+    else {
         return Ok(None);
     };
-
-    let pre_guard = ctx.trace_ctx.get_trace_position();
     walker_guard_fold_class(ctx, op_pc, obj_op, type_addr)?;
-
-    let mut produced = None;
-    let outcome = run_prepared_orthodox_descent(
+    run_prepared_orthodox_descent(
         ctx,
         op_pc,
         prep,
@@ -19572,21 +19633,9 @@ fn run_get_iter_helper_descent<Sym: WalkSym>(
         dst,
         dst_bank,
         descent,
-        Some(&mut produced),
+        None,
         false,
-    )?;
-    if !matches!(outcome, Some(DispatchOutcome::Continue)) {
-        ctx.trace_ctx.cut_trace_with_snapshots(pre_guard);
-        ctx.trace_ctx.heap_cache_mut().reset();
-        return Ok(None);
-    }
-    let Some(new) = produced else {
-        ctx.trace_ctx.cut_trace_with_snapshots(pre_guard);
-        ctx.trace_ctx.heap_cache_mut().reset();
-        return Ok(None);
-    };
-    ctx.frame_state.borrow_mut().vstack_last_ref = new;
-    Ok(Some(new))
+    )
 }
 
 /// Descend `functional.py W_Zip.next_w` (`zip_next_method` /

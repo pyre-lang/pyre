@@ -19391,12 +19391,13 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if pyre_object::is_w_range(obj) {
             return Ok(pyre_object::w_range_iter(obj));
         }
-        // Already an iterator
-        if is_range_iter(obj)
-            || pyre_object::is_long_range_iter(obj)
-            || pyre_object::generator::is_generator(obj)
-        {
-            return Ok(obj);
+        // `functional.py W_AbstractRangeIterator.descr_iter` — `return self`.
+        if is_range_iter(obj) || pyre_object::is_long_range_iter(obj) {
+            return Ok(pyre_object::functional::w_range_iterator_iter(obj));
+        }
+        // `generator.py GeneratorIterator.descr__iter` — `return self`.
+        if pyre_object::generator::is_generator(obj) {
+            return Ok(pyre_object::generator::w_generator_iter(obj));
         }
         // `iterobject.py W_AbstractSeqIterObject.descr_iter` — `return self`.
         if is_seq_iter(obj) || pyre_object::is_list_iter(obj) || pyre_object::is_tuple_iter(obj) {

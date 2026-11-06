@@ -11671,21 +11671,69 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // `s.add(x)` on an exact `set` and zero-arg `super()` are substitutions
+    // of this CallFn residual (`try_walker_specialize_set_add_method` /
+    // `try_walker_specialize_bare_super_call`), not builtin-wrapper
+    // descents. They sit immediately before `try_walker_inline_builtin_call`
+    // the way `_code_of_sys_exc_info` does: `Method.__call__` is a
+    // look-inside-able `BuiltinCode.func`, so a later consult never sees
+    // the bound-method CALL. A decline leaves `direct_subst` empty and the
+    // descent runs. Elided integer-strategy `set.add` does not reach the
+    // generic tail.
+    //
+    // The substituted descr carries `RuntimeHelperKind::SetAddMethod` so
+    // `writes_live_heap` below still bumps the executed-effect odometer —
+    // the generic call it replaces arrived tagged `CallFn`. An untagged
+    // `MOST_GENERAL` descr with a `Ref` result matches neither, so a nested
+    // walk that aborted behind a completed insert would rewind and run it
+    // again. The set table survives that; a cpyext `tp_hash` need not.
+    //
+    // The two arms are mutually exclusive by callable (`set.add` bound
+    // method against the `super` type). `set_add` is asked first because it
+    // is the cheaper recognition. An integer-strategy hit is not this tail:
+    // the contains check does not insert and does not run `__hash__`, so it
+    // is not tagged `SetAddMethod` and must not be concrete-executed as
+    // `jit_set_add_method`. `spec_gate` still counts that `Some` as the
+    // same row.
+    let mut direct_subst = None;
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+    {
+        match spec_gate(SpecFold::SetAddMethod, || {
+            try_walker_specialize_set_add_method(ctx, code, op, &r_args, dst)
+        })? {
+            Some(SetAddMethodSpec::Elided) => {
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+            Some(SetAddMethodSpec::Subst(subst)) => direct_subst = Some(subst),
+            None => {
+                direct_subst = spec_gate(SpecFold::BareSuperCall, || {
+                    try_walker_specialize_bare_super_call(ctx, code, op, &r_args)
+                })?;
+            }
+        }
+    }
+
     // BuiltinCode.func is an indirect PBC target exactly like RPython's
     // gateway wrappers.  Enter its generated JitCode before considering the
-    // user-function-only full-body walk below.
-    if let Some(inlined) = try_walker_inline_builtin_call(
-        ctx,
-        op,
-        code,
-        funcptr,
-        1,
-        &r_args,
-        call_descr,
-        foldable_runtime_helper,
-        dst_bank,
-        dst,
-    )? {
+    // user-function-only full-body walk below. A substitution already
+    // matched above skips this descent so `Method.__call__` cannot swallow
+    // the bound-method CALL.
+    if direct_subst.is_none()
+        && let Some(inlined) = try_walker_inline_builtin_call(
+            ctx,
+            op,
+            code,
+            funcptr,
+            1,
+            &r_args,
+            call_descr,
+            foldable_runtime_helper,
+            dst_bank,
+            dst,
+        )?
+    {
         return Ok(inlined);
     }
 
@@ -12066,15 +12114,16 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
 
     // GET_ITER records `W_Range.descr_iter` (`RANGE_ITER_DESCENT`) for
-    // exact `range`, `iter_w` for exact `zip` / `map` / `filter`, and
-    // `descr_iter` for exact sequence iterators. Not a spec-fold row —
-    // HelperDescent, the `newdict` twin.
+    // exact `range`, `iter_w` for exact `zip` / `map` / `filter`,
+    // `descr_iter` for exact sequence iterators,
+    // `W_AbstractRangeIterator.descr_iter` for exact range iterators,
+    // and `GeneratorIterator.descr__iter` for exact generators.
+    // Not a spec-fold row — HelperDescent, the `newdict` twin.
     if ctx.is_authoritative_executor
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::GetIter
     {
-        if let Some(iter_op) = try_walker_orthodox_get_iter(ctx, op.pc, &r_args, dst, dst_bank)? {
-            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, iter_op)?;
-            return Ok((DispatchOutcome::Continue, op.next_pc));
+        if let Some(outcome) = try_walker_orthodox_get_iter(ctx, op.pc, &r_args, dst, dst_bank)? {
+            return Ok((outcome, op.next_pc));
         }
         // The instance arm of `iter`: a user class's `__iter__` is Python, and
         // left residual it costs an interpreter frame and the virtualref
@@ -12572,59 +12621,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // `s.add(x)` on an exact `set`: swap the generic `bh_call_fn` target for
-    // the direct `set_add` store the SET_ADD accumulator opcode records
-    // (`try_walker_specialize_set_add_method`).  This is a substitution, not a
-    // fold — the call is still a MayForce residual, still guarded and still
-    // concrete-executed by the shared tail below, so the force/exception
-    // guards, the heapcache invalidation and the `None` writeback are the ones
-    // the generic path already emits.  A decline leaves every binding
-    // untouched.
-    //
-    // The substituted descr carries `RuntimeHelperKind::SetAddMethod` for one
-    // reason: `writes_live_heap` below reads the helper tag and the result
-    // type, and the generic call it replaces arrived tagged `CallFn`.  An
-    // untagged `MOST_GENERAL` descr with a `Ref` result matches neither, so the
-    // substitution would quietly stop bumping the executed-effect odometer and
-    // stop setting `body_effect_candidate` -- and a nested walk that aborted
-    // behind a completed insert would rewind and run it again.  The set table
-    // survives that (adding the same element twice is one insert), but the
-    // element's `__hash__` need not be Python: a cpyext `tp_hash` runs native
-    // code, moves no frame-entry odometer, and can do anything.  Keeping the
-    // marker is what makes the substitution invisible to the rollback rules
-    // rather than merely survivable by them.
-    //
-    // The zero-argument `super()` re-route is the second arm of the same shape
-    // and is spelled here rather than with the folds above precisely so it can
-    // reuse this tail: its leaf can run a `__class__` property, so it needs the
-    // concrete execution, the raise transcription and the force bracket that
-    // only the generic path performs.  The two arms are mutually exclusive by
-    // callable -- `set.add` bound method against the `super` type -- so the
-    // order between them is free; `set_add` is asked first only because it is
-    // the cheaper recognition.
-    //
-    // An integer-strategy hit is not this tail.  The contains check does not
-    // insert and does not run `__hash__`, so it is not tagged `SetAddMethod`
-    // and must not be concrete-executed as `jit_set_add_method`.  `spec_gate`
-    // still counts that `Some` as the same row.
-    let direct_subst = if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-    {
-        match spec_gate(SpecFold::SetAddMethod, || {
-            try_walker_specialize_set_add_method(ctx, code, op, &r_args, dst)
-        })? {
-            Some(SetAddMethodSpec::Elided) => {
-                return Ok((DispatchOutcome::Continue, op.next_pc));
-            }
-            Some(SetAddMethodSpec::Subst(subst)) => Some(subst),
-            None => spec_gate(SpecFold::BareSuperCall, || {
-                try_walker_specialize_bare_super_call(ctx, code, op, &r_args)
-            })?,
-        }
-    } else {
-        None
-    };
+    // Reuse the `set.add` / `super()` substitution consulted before the
+    // builtin-wrapper descent. A second `spec_gate` would double the
+    // consulted count.
     let skip_indirect = direct_subst.is_some();
     let (funcptr, descr, allboxes) = match direct_subst {
         Some(subst) => (subst.funcptr, subst.descr, subst.allboxes),

@@ -10497,6 +10497,18 @@ fn reverseseqiter_iter_jitcode_is_the_descr_iter_leaf() {
 }
 
 #[test]
+fn range_iterator_iter_jitcode_is_the_descr_iter_leaf() {
+    // `functional.py W_AbstractRangeIterator.descr_iter` is `return self`.
+    assert_identity_iter_w_leaf("pyre_object::functional::w_range_iterator_iter");
+}
+
+#[test]
+fn generator_iter_jitcode_is_the_descr_iter_leaf() {
+    // `generator.py GeneratorIterator.descr__iter` is `return self`.
+    assert_identity_iter_w_leaf("pyre_object::generator::w_generator_iter");
+}
+
+#[test]
 fn range_new_stop_jitcode_is_the_descr_new_leaf() {
     // `functional.py W_Range.descr_new` nargs==1 after arity unpacking.
     // `specialize.rs RANGE_NEW_STOP_DESCENT` records this body, including

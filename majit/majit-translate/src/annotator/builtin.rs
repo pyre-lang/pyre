@@ -2123,6 +2123,10 @@ fn cast_instance_intrinsic(
         SomeValue::Instance(inst) => inst.can_be_none,
         SomeValue::String(str_) => str_.inner.can_be_none,
         SomeValue::None_(_) => true,
+        // CastBasePtrToInstanceEntry.compute_result_annotation: a
+        // GCREF / address word is a nullable pointer, so a String
+        // restore (`with_nullability`) keeps `can_be_None`.
+        SomeValue::Ptr(_) | SomeValue::Address(_) => true,
         _ => false,
     };
     let with_nullability = |mut projected: SomeValue| {
