@@ -5341,8 +5341,13 @@ pub(in crate::front::mir) fn tyref_niche_option_gc_payload_spelling(
         || tyref_is_option_of_string_value(option_ty, llbc)
         || tyref_raw_ptr_pointee_is_string_value(&payload, llbc)
         || tyref_raw_ptr_to_str_family_spelling(&payload, llbc).is_some();
-    let gc_instance = container_declared_gc(&payload, llbc, gc_struct_ids, no_immutable_fields())
-        == Some(true)
+    let gc_instance = container_declared_gc(
+        &payload,
+        llbc,
+        gc_struct_ids,
+        no_immutable_fields(),
+        raw_alloc_flavor_structs,
+    ) == Some(true)
         || registered_gc_ptr_class_root_with(
             &payload,
             llbc,

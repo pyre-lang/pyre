@@ -8,8 +8,8 @@ use super::{
     type_decl_is_closure_env, tyref_array_suffix, tyref_fn_ptr_input_class_root,
     tyref_is_closure_env, tyref_is_gcref_spelling, tyref_is_ptr_to_int_cast_origin,
     tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec,
-    tyref_ref_param_class_root, tyref_shaped_tuple_root,
-    tyref_to_attr_value_type_for_struct_field, tyref_to_value_type, tyref_tuple_suffix,
+    tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
+    tyref_to_value_type, tyref_tuple_suffix,
 };
 
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
