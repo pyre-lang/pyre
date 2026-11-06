@@ -594,7 +594,7 @@ fn byteskey_as_bytes_is_str_identity_not_window_strlen() {
 /// `aggregate_shape` already identity-returns `Some` as the payload; the
 /// `?` rewrite must classify the same specialized type.
 #[test]
-fn rdict_get_pyobject_spec_none_is_null_ref_not_option_new() {
+fn rdict_get_object_spec_none_is_null_ref_not_option_new() {
     let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         std::slice::from_ref(&llbc),

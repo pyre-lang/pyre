@@ -3671,7 +3671,6 @@ fn helper_innermost_resume_frame<Sym: WalkSym>(
     Ok(frame)
 }
 
-
 /// Live boxes for one snapshot section at the pc the snapshot will publish.
 ///
 /// `ResumeDataLoopMemo.number` writes `jitcode_index, pc, [tagged...]` and
