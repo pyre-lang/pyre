@@ -39,7 +39,7 @@ fn run_test(name: &str, source: &str, expected: &str) {
 
     // Use plain interpreter on WASI (no JS runtime for JIT execute).
     // The JIT compile path is tested separately.
-    match frame.execute_frame(None, None) {
+    match frame.execute_frame(None) {
         Ok(_) => {
             let actual = TEST_OUTPUT.with(|buf| buf.borrow().trim_end().to_string());
             if actual == expected {

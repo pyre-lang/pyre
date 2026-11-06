@@ -8827,7 +8827,25 @@ fn finish_generatorentry_after_walk_abort(
             let frame = unsafe { pyre_object::generator::w_generator_get_frame(live_gen) }
                 as *mut pyre_interpreter::pyframe::PyFrame;
             if !frame.is_null() && unsafe { (*frame).frame_finished_execution() } {
-                return pyre_interpreter::baseobjspace::genentry_raise_returned(live_gen, value);
+                // generator.py `_send_ex`: `self.frame_is_finished()` then
+                // raise. `live_gen` / `value` stay live across the call
+                // that drops `self.frame`. Own bracket so the outer pins
+                // stay static.
+                let _fin = pyre_object::gc_roots::push_roots();
+                let pin_base = pyre_object::gc_roots::pin_roots(&[live_gen, value]);
+                let live_gen = pyre_object::gc_roots::shadow_stack_get(pin_base);
+                let frame = unsafe { pyre_object::generator::w_generator_get_frame(live_gen) }
+                    as *mut pyre_interpreter::pyframe::PyFrame;
+                unsafe {
+                    pyre_interpreter::baseobjspace::generator_frame_is_finished(
+                        live_gen,
+                        &mut *frame,
+                    );
+                }
+                return pyre_interpreter::baseobjspace::genentry_raise_returned(
+                    pyre_object::gc_roots::shadow_stack_get(pin_base),
+                    pyre_object::gc_roots::shadow_stack_get(pin_base + 1),
+                );
             }
         }
         return done;
@@ -10579,10 +10597,9 @@ fn portal_activation_bracketed(
     // Same shape, and the same assign-only-what-came-back-live rule, as
     // `eval::eval_frame_plain_with_resume`.
     let mut w_exitvalue = w_none();
-    // `call_trace` runs before `resume_execute_frame`. A thrown
-    // `OperationError` (`error.py`) is a GC object on that path; the
-    // caller's `ResumeArgPins` already roots the sent value and the
-    // carrier from JIT entry through this hook and the resume.
+    // `call_trace` runs before `resume_execute_frame`. `w_arg_or_err` is
+    // a GC local on that path; the caller's `ResumeArgPins` already roots
+    // it from JIT entry through this hook and the resume.
     let mut resume = resume;
     let local_pins = if resume_pins.is_none() {
         match resume.as_mut() {
