@@ -49,13 +49,11 @@ on:
 
 # Retrigger path: this file is in the pull_request paths filter.
 concurrency:
-  # One group per PR and one per tracked branch, so only the newest run of each
-  # survives: a PR's runs supersede each other, and a merge train on `main`
-  # cancels the predecessor commit's run rather than keeping every landed commit
-  # under test.  A commit that is superseded before it finishes is therefore
-  # covered by its successor's run, not by one of its own.
+  # One group per PR and one per tracked branch. A PR's runs still supersede
+  # each other. On `main`, leave the predecessor running so a merge train
+  # does not cancel the only in-flight product gate.
   group: pyre-ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
