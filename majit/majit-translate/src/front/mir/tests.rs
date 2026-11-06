@@ -36916,23 +36916,28 @@ fn interior_field_entry_ptr_reads_entries_header() {
         .iter()
         .filter(|op| matches!(op.kind, OpKind::FieldRead { .. }))
         .collect();
-    assert_eq!(field_ops.len(), 1, "ops={ops:?}");
-    let OpKind::FieldRead {
-        base: field_base,
-        field: entries,
-        ..
-    } = &field_ops[0].kind
-    else {
-        unreachable!()
-    };
-    assert_eq!(entries.name, "entries");
-    assert_eq!(entries.base_is_deref, Some(true));
+    assert!(
+        !field_ops.is_empty(),
+        "entry_ptr must read the entries header; ops={ops:?}"
+    );
+    for op in &field_ops {
+        let OpKind::FieldRead {
+            base: field_base,
+            field: entries,
+            ..
+        } = &op.kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(entries.name, "entries");
+        assert_eq!(entries.base_is_deref, Some(true));
+        assert_eq!(field_base, &block.inputargs[0]);
+    }
     assert!(
         block.inputargs.len() >= 2,
         "inputargs={:?}",
         block.inputargs
     );
-    assert_eq!(field_base, &block.inputargs[0]);
     let OpKind::InteriorFieldRead {
         base,
         index,
@@ -36954,15 +36959,18 @@ fn interior_field_entry_ptr_reads_entries_header() {
     assert_eq!(field.name, "value");
     assert_eq!(array_type_id.as_deref(), Some("GcArray<Entry>"));
     assert_eq!(index, &block.inputargs[1]);
-    assert_eq!(base, field_ops[0].result.as_ref().unwrap());
+    assert!(
+        field_ops.iter().any(|op| op.result.as_ref() == Some(base)),
+        "interior base must be an entries FieldRead; ops={ops:?}"
+    );
     assert!(
         block.inputargs.iter().all(|arg| arg != base),
         "interior base must be the entries FieldRead, not the item pointer; inputargs={:?}",
         block.inputargs
     );
     assert!(
-        call_leafs(&ops).iter().any(|leaf| leaf == "entry_ptr"),
-        "ops={ops:?}"
+        call_leafs(&ops).iter().all(|leaf| leaf != "entry_ptr"),
+        "entry_ptr is direct_arrayitems (int address), ops={ops:?}"
     );
     assert!(
         !call_leafs(&ops).iter().any(|leaf| leaf == "add"),
@@ -36974,8 +36982,8 @@ fn interior_field_entry_ptr_reads_entries_header() {
     );
 }
 
-/// `entries_item_ptr(header).add(i)` uses `header` itself. The call
-/// stays residual; its result is not given a second length word.
+/// `entries_item_ptr(header).add(i)` uses `header` itself.
+/// `direct_arrayitems` is an int address, not a GCREF of the item run.
 #[test]
 fn interior_field_entries_item_ptr_reuses_header_arg() {
     let i64_ty = interior_i64();
@@ -37089,8 +37097,8 @@ fn interior_field_entries_item_ptr_reuses_header_arg() {
     assert!(
         call_leafs(&ops)
             .iter()
-            .any(|leaf| leaf == "entries_item_ptr"),
-        "ops={ops:?}"
+            .all(|leaf| leaf != "entries_item_ptr"),
+        "entries_item_ptr is direct_arrayitems (int address), ops={ops:?}"
     );
     assert!(
         !call_leafs(&ops).iter().any(|leaf| leaf == "add"),

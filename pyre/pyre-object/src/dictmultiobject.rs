@@ -443,6 +443,21 @@ unsafe fn type_dict_entries_scan_exact_str(
     None
 }
 
+/// Slot twin of [`type_dict_entries_scan_str`] for `setitem_str` overwrite.
+unsafe fn type_dict_entries_index_of_str(entries: &ObjectDictStorage, key: &[u8]) -> Option<usize> {
+    for slot in 0..entries.entry_slots() {
+        let Some((stored, _)) = entries.get_slot(slot) else {
+            continue;
+        };
+        if crate::unicodeobject::is_str(stored.obj)
+            && crate::w_str_get_wtf8(stored.obj).as_bytes() == key
+        {
+            return Some(slot);
+        }
+    }
+    None
+}
+
 /// `typeobject.py _getdictvalue_no_unwrapping`: `self.dict_w.get(attr)`.
 ///
 /// The hashed arm uses the str-hash trampoline (`rstr.py ll_strhash` of the
@@ -813,7 +828,15 @@ unsafe fn dict_entries_index_of_str_or_absent(entries: &ObjectDictStorage, key: 
     }
 }
 
-unsafe fn dict_entries_index_of_str(
+/// Borrow-key membership probe for `UnicodeDictStrategy.setitem_str`.
+///
+/// Probes with [`TypeDictLookupKey`]: storage holds exact-str keys
+/// (`is_correct_type` / `switch_to_object_strategy` on a non-str key) and
+/// `unicode_eq` is `W_UnicodeObject.eq_w`, never `space.eq_w`
+/// (`dictmultiobject.py UnicodeDictStrategy`), so the residual is not
+/// may-force.
+#[inline]
+unsafe fn dict_entries_index_of_unicode_str(
     entries: &ObjectDictStorage,
     key: &str,
     hash: i64,
@@ -824,24 +847,19 @@ unsafe fn dict_entries_index_of_str(
         } else {
             crate::dict_eq_hook::hash_str_hooked_bytes(key.as_bytes())
         };
-        crate::dict_eq_hook::take_eq_error();
-        dict_entries_index_of_str_hashed(entries, hash, key)
+        let idx = dict_entries_index_of_unicode_str_hashed(entries, hash, key);
+        if idx >= 0 { Some(idx as usize) } else { None }
     } else {
-        dict_entries_index_of_object(entries, crate::w_str_new(key))
+        type_dict_entries_index_of_str(entries, key.as_bytes())
     }
 }
 
-/// The borrow-key membership probe [`dict_entries_index_of_str`] runs once the
-/// str hash hook has produced `hash` — [`dict_entries_probe_str`]'s twin,
-/// returning the entry index instead of the value.
+/// Index-returning twin of [`dict_entries_probe_unicode_str`].
 ///
 /// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
-/// `ll_dict_lookup` (`rordereddict.py`), the index-returning twin of
-/// [`dict_entries_probe_str`].
-///
-/// # Safety
-/// Same as [`dict_entries_probe_str`].
-fn dict_entries_index_of_str_hashed_iff(
+/// `ll_dict_lookup` (`rordereddict.py`). Returns the slot, or `-1` on a
+/// miss (`ll_dict_lookup`), so the residual result is one word.
+fn dict_entries_index_of_unicode_str_hashed_iff(
     entries: &ObjectDictStorage,
     _hash: i64,
     key: &str,
@@ -849,17 +867,43 @@ fn dict_entries_index_of_str_hashed_iff(
     majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(key)
 }
 
-#[majit_macros::look_inside_iff(dict_entries_index_of_str_hashed_iff)]
-pub unsafe fn dict_entries_index_of_str_hashed(
+#[majit_macros::look_inside_iff(dict_entries_index_of_unicode_str_hashed_iff)]
+pub unsafe fn dict_entries_index_of_unicode_str_hashed(
     entries: &ObjectDictStorage,
     hash: i64,
     key: &str,
-) -> Option<usize> {
-    entries.index_of(&StrLookupKey { hash, key })
+) -> isize {
+    match entries.index_of(&TypeDictLookupKey {
+        hash,
+        key: key.as_bytes(),
+    }) {
+        Some(slot) => slot as isize,
+        None => -1,
+    }
 }
 
-/// The owned-key membership probe [`dict_entries_index_of_str`]'s no-hook arm
-/// runs — [`dict_entries_probe_object`]'s twin.
+#[cfg(not(target_arch = "wasm32"))]
+#[majit_ir::linkme::distributed_slice(majit_ir::helper_fnaddr::HELPER_FNADDRS)]
+#[linkme(crate = majit_ir::linkme)]
+#[allow(non_upper_case_globals)]
+static DICT_ENTRIES_INDEX_OF_UNICODE_STR_HASHED_TRAMPOLINE: majit_ir::helper_fnaddr::HelperFnAddr =
+    majit_ir::helper_fnaddr::HelperFnAddr::new(
+        "pyre_object::dictmultiobject::dict_entries_index_of_unicode_str_hashed_trampoline",
+        __majit_call_target_dict_entries_index_of_unicode_str_hashed_trampoline as *const (),
+        3,
+    );
+
+#[cfg(target_arch = "wasm32")]
+#[ctor::ctor(unsafe)]
+fn register_dict_entries_index_of_unicode_str_hashed_trampoline() {
+    majit_ir::helper_fnaddr::register(
+        "pyre_object::dictmultiobject::dict_entries_index_of_unicode_str_hashed_trampoline",
+        __majit_call_target_dict_entries_index_of_unicode_str_hashed_trampoline as *const (),
+        3,
+    );
+}
+
+/// The owned-key membership probe — [`dict_entries_probe_object`]'s twin.
 ///
 /// Same predicate as [`dict_entries_probe_object`].
 ///
@@ -4494,9 +4538,9 @@ pub unsafe fn w_dict_getitem_str_object_strategy_hashed(
 }
 
 /// `W_DictMultiObject.setitem_str` — `w_dict.get_strategy().setitem_str(w_dict, key, value)`.
-/// The module-dict arm is looked inside through [`w_dict_setitem_str_hashed`]
-/// into `ModuleDictStrategy.setitem_str`; the generic arm is the residual
-/// [`w_dict_setitem_str_hashed_generic`].
+/// The module-dict and Unicode-strategy arms are looked inside through
+/// [`w_dict_setitem_str_hashed`]; the remaining strategies residualise
+/// through [`w_dict_setitem_str_hashed_generic`].
 ///
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -4512,8 +4556,14 @@ pub unsafe fn w_dict_setitem_str(obj: PyObjectRef, key: &str, value: PyObjectRef
 /// inside and reaches `ModuleDictStrategy.setitem_str` via
 /// [`w_module_dict_setitem_str`]. `ModuleDictStrategy` has no
 /// `setitem_str_hashed` override; the trait default forwards to
-/// `setitem_str` and discards `hash`, which this arm matches. The generic
-/// arm residualises through [`w_dict_setitem_str_hashed_generic`].
+/// `setitem_str` and discards `hash`, which this arm matches.
+///
+/// The Unicode-strategy arm is looked inside the same way
+/// [`w_dict_lookup_str_keyed`] isolates `UnicodeDictStrategy`: every
+/// comparison that strategy can make is builtin (`unicode_eq` is
+/// `W_UnicodeObject.eq_w`, never `space.eq_w`). The generic arm is the
+/// remaining strategies, including `ObjectDictStrategy`, and residualises
+/// through [`w_dict_setitem_str_hashed_generic`].
 ///
 /// # Safety
 /// Same as [`w_dict_setitem_str`].
@@ -4533,7 +4583,54 @@ pub unsafe fn w_dict_setitem_str_hashed(
         w_module_dict_setitem_str_module_strategy(obj, key, value);
         return;
     }
+    // `UnicodeDictStrategy.setitem_str` (`dictmultiobject.py`): storage is
+    // `r_dict(unicode_eq, unicode_hash)`. Look inside this arm so STORE_NAME
+    // on a regular str-keyed dict does not residualise the ObjectDictStrategy
+    // join through `eq_w_hooked` (`hlinvoke` of an unknown family →
+    // random_effects, which `do_residual_call` records as CallMayForce and
+    // then refuses inside the frameless `store_name_value_w` helper).
+    if !is_module_dict(obj) && w_dict_get_strategy(obj).strategy_kind() == StrategyKind::Unicode {
+        lock_dict_refs!(_dict_guard, obj, value);
+        w_dict_setitem_str_unicode_strategy_hashed(obj, key, hash, value);
+        return;
+    }
     w_dict_setitem_str_hashed_generic(obj, key, hash, value)
+}
+
+/// `UnicodeDictStrategy.setitem_str` / `setitem_str_hashed`.
+///
+/// Overwrite reuses the stored key; a miss mints `newtext(key)`
+/// (`dictmultiobject.py setitem_str`). The probe is
+/// [`TypeDictLookupKey`], matching [`w_dict_getitem_str_unicode_strategy_hashed`].
+///
+/// # Safety
+/// `obj` must point to a live `W_DictObject` on `UNICODE_DICT_STRATEGY`.
+pub unsafe fn w_dict_setitem_str_unicode_strategy_hashed(
+    w_dict: PyObjectRef,
+    key: &str,
+    hash: i64,
+    w_value: PyObjectRef,
+) {
+    let roots = crate::gc_roots::push_roots();
+    let dict_slot = roots.publish(&[w_dict, w_value]);
+    let value_slot = dict_slot + 1;
+    let found = dict_entries_index_of_unicode_str(w_dict_object_storage(w_dict), key, hash);
+    match found {
+        Some(idx) => {
+            let w_value = roots.get(value_slot);
+            let entries = w_dict_object_storage_mut(roots.get(dict_slot));
+            dict_entries_setitem_lookup_done(entries, idx, w_value);
+        }
+        None => {
+            let stored_key = object_key_for_new_str(key, hash);
+            let w_value = roots.get(value_slot);
+            let dict = &mut *(roots.get(dict_slot) as *mut W_DictObject);
+            let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
+            dict_entries_insert_hashed(entries, stored_key.hash, stored_key.obj, w_value);
+            dict.keys_version = dict.keys_version.wrapping_add(1);
+        }
+    };
+    dict_write_barrier(roots.get(dict_slot));
 }
 
 /// Generic (non-module) arm of [`w_dict_setitem_str_hashed`].
@@ -5699,8 +5796,8 @@ pub unsafe fn w_dict_index_of_unicode_strategy(
 /// the dict guard.
 ///
 /// The type test, the borrow of the key's bytes, the digest and the
-/// `StrLookupKey` probe (a byte compare, never an app-level `__eq__`) all run
-/// without allocating, so no collection can run between the caller's
+/// [`TypeDictLookupKey`] probe (WTF-8 byte equality, never `dict_keys_equal`)
+/// all run without allocating, so no collection can run between the caller's
 /// `lock_dict_refs!` and the answer, and a second guard would republish the
 /// roots the caller is already holding.
 ///
@@ -5713,10 +5810,10 @@ unsafe fn w_dict_index_of_unicode_locked(obj: PyObjectRef, key: PyObjectRef) -> 
     }
     let key_str = crate::w_str_get_value_opt(key)?;
     let hash = w_str_memoized_hash(key, key_str)?;
-    crate::dict_eq_hook::take_eq_error();
     let dict = &*(obj as *const W_DictObject);
     let entries = &*(dict.dstorage as *const ObjectDictStorage);
-    dict_entries_index_of_str_hashed(entries, hash, key_str)
+    let idx = dict_entries_index_of_unicode_str_hashed(entries, hash, key_str);
+    if idx >= 0 { Some(idx as usize) } else { None }
 }
 
 /// `rstr.py ll_strhash` — answer from the digest memoized on the string
@@ -8687,36 +8784,9 @@ impl DictStrategy for UnicodeDictStrategy {
         hash: i64,
         w_value: PyObjectRef,
     ) {
-        // This is the one `setitem_str` that both collects and stores itself:
-        // the membership probe can run a str-subclass `__eq__` (and its no-hook
-        // arm wraps the key), and a miss mints the persistent key.  A dict
-        // header moves, and these parameters are by-value copies of the caller's
-        // words, so the root bracket the entry point holds does not update them
-        // — publish the receiver and the value here and read both slots back
-        // after the probe and after the mint.
-        let roots = crate::gc_roots::push_roots();
-        let dict_slot = roots.publish(&[w_dict, w_value]);
-        let value_slot = dict_slot + 1;
-        let found = dict_entries_index_of_str(w_dict_object_storage(w_dict), key, hash);
-        match found {
-            Some(idx) => {
-                let w_value = roots.get(value_slot);
-                let entries = w_dict_object_storage_mut(roots.get(dict_slot));
-                *entries.get_slot_mut(idx).unwrap().1 = w_value;
-            }
-            None => {
-                // Mint before reading either slot: call arguments evaluate left
-                // to right, so a slot read written inline with the mint would be
-                // taken before the collection that invalidates it.
-                let stored_key = object_key_for_new_str(key, hash);
-                let w_value = roots.get(value_slot);
-                let dict = &mut *(roots.get(dict_slot) as *mut W_DictObject);
-                let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
-                dict_entries_insert_hashed(entries, stored_key.hash, stored_key.obj, w_value);
-                dict.keys_version = dict.keys_version.wrapping_add(1);
-            }
-        };
-        dict_write_barrier(roots.get(dict_slot));
+        crate::dictmultiobject::w_dict_setitem_str_unicode_strategy_hashed(
+            w_dict, key, hash, w_value,
+        )
     }
 
     /// `dictmultiobject.py UnicodeDictStrategy.getitem_str`.

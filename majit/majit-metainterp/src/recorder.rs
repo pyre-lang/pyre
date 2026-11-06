@@ -449,6 +449,10 @@ fn snapshot_box_from_tagged<'c>(
 pub(crate) struct ByteBridgeResume {
     recorder: *const Trace,
     unique_cache: Vec<Option<Operand>>,
+    /// `_snapshot_data` offsets of live guards (`captured_resume_positions`).
+    /// `opencoder.py TraceIterator.next` stores that offset as
+    /// `rd_resume_position`; `get_snapshot_iter(index)` starts there.
+    snapshot_starts: Vec<usize>,
 }
 
 impl ByteBridgeResume {
@@ -456,6 +460,7 @@ impl ByteBridgeResume {
         Self {
             recorder: recorder as *const Trace,
             unique_cache,
+            snapshot_starts: recorder.captured_resume_positions(),
         }
     }
 
@@ -479,14 +484,14 @@ impl ByteBridgeResume {
         if resume_pos < 0 {
             return false;
         }
-        // The trace outlives optimize. Reset clears the pointer without
-        // dereferencing it. `get_snapshot_iter(index)` reads `_snapshot_data`
-        // at that byte offset; membership in the capture-order side list
-        // is not the coordinate.
-        let rec = unsafe { &*self.recorder };
-        rec.trb
-            .as_ref()
-            .is_some_and(|trb| (resume_pos as usize) < trb._snapshot_data.len())
+        // resume.py `ResumeDataVirtualAdder.finish` always calls
+        // `trace.get_snapshot_iter(rd_resume_position)`. That index is a
+        // snapshot start (`opencoder.py TraceIterator.next` assigns the
+        // descr-slot offset). An arbitrary offset inside `_snapshot_data`
+        // is not a snapshot.
+        self.snapshot_starts
+            .iter()
+            .any(|&offset| offset == resume_pos as usize)
     }
 
     pub(crate) fn number_guard(
@@ -3149,6 +3154,48 @@ mod tests {
             rec.captured_resume_positions(),
             vec![off0 as usize, off2 as usize]
         );
+    }
+
+    #[test]
+    fn byte_bridge_resume_contains_snapshot_starts_only() {
+        // resume.py finish → get_snapshot_iter(rd_resume_position). The
+        // index is a snapshot start, not any offset in `_snapshot_data`.
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
+        rec.record_guard(OpCode::GuardTrue, &[i0], None);
+        let frame = |pc: u32| SnapshotFrame {
+            jitcode_index: 1,
+            pc,
+            boxes: vec![SnapshotTagged::Box(i0, Type::Int)],
+        };
+        let off0 = rec.encode_captured_snapshot(&Snapshot {
+            resume_position: -1,
+            frames: vec![frame(11)],
+            vable_boxes: vec![],
+            vref_boxes: vec![],
+        });
+        rec.set_last_op_resume_position(off0);
+        rec.record_guard(OpCode::GuardFalse, &[i0], None);
+        let off1 = rec.encode_captured_snapshot(&Snapshot {
+            resume_position: -1,
+            frames: vec![frame(22)],
+            vable_boxes: vec![],
+            vref_boxes: vec![],
+        });
+        rec.set_last_op_resume_position(off1);
+        let feed = ByteBridgeResume::from_recorder(&rec, Vec::new());
+        assert!(feed.contains(off0));
+        assert!(feed.contains(off1));
+        assert!(!feed.contains(-1));
+        if off0 + 1 != off1 {
+            assert!(!feed.contains(off0 + 1));
+        }
+        let data_len = rec.get_position().snapshot_data_len as i32;
+        assert!(data_len > off1);
+        if data_len - 1 != off0 && data_len - 1 != off1 {
+            assert!(!feed.contains(data_len - 1));
+        }
     }
 
     #[test]

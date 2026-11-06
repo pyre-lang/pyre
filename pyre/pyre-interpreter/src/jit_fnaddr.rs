@@ -5496,6 +5496,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>, Vec<i64>) {
         "pyre_object::dict_entries_probe_str_trampoline",
         pyre_object::dictmultiobject::__majit_call_target_dict_entries_probe_str_trampoline,
     );
+    // `UnicodeDictStrategy.setitem_str` index probe: same word-ABI as
+    // `dict_entries_probe_unicode_str_trampoline` (`TypeDictLookupKey`,
+    // one-word miss as `-1`).
+    cpa3!(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_index_of_unicode_str_hashed_trampoline",
+        "pyre_object::dict_entries_index_of_unicode_str_hashed_trampoline",
+        pyre_object::dictmultiobject::__majit_call_target_dict_entries_index_of_unicode_str_hashed_trampoline,
+    );
     // `getitem_str` / hashed probe: native `&str` is two words; residual
     // `bh_call_r` passes one rstr STR. Bind the word-ABI trampoline under
     // the reloc path the codewriter records (`llmodel.py bh_call_r`).

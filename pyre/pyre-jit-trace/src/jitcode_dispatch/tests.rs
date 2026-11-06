@@ -2088,6 +2088,44 @@ fn list_type_call_resume_levels_do_not_reach_a_blocker() {
     );
 }
 
+/// A callable `jitcode.fnaddr` runs `bhimpl_inline_call_*` natively, so the
+/// callee's own residual blockers and unread regions are not sections the
+/// resume scan walks. Descent still enters that jitcode, so admission keeps
+/// those facts.
+#[test]
+fn a_callable_callees_blockers_are_not_resume_blockers() {
+    let real = 0x1234_5678i64;
+    assert!(majit_jitcode::codewriter::call::is_callable_fnaddr(real));
+    let callee = majit_jitcode::codewriter::jitcode::DescentBlockerSummary {
+        blocker_after_effect: Some(0xdead),
+        body_not_walked: true,
+        may_execute_effect: true,
+        ..Default::default()
+    };
+    let mut code = inline_call_with_descr(7);
+    code.extend(void_return());
+
+    let whole = super::inline_call::summarize_body_blockers(&code, 1, &[real], |d| {
+        (d == 7).then_some(callee)
+    });
+    assert_eq!(whole.blocker_after_effect, Some(0xdead));
+    assert!(whole.body_not_walked);
+    assert!(whole.may_execute_effect);
+
+    let resume = super::inline_call::summarize_body_blockers_resume_fnaddr(
+        0,
+        &code,
+        1,
+        &[real],
+        |d| (d == 7).then_some(callee),
+        |d| (d == 7).then_some(real),
+    );
+    assert_eq!(resume.blocker_effect_free, None);
+    assert_eq!(resume.blocker_after_effect, None);
+    assert!(!resume.body_not_walked);
+    assert!(resume.may_execute_effect);
+}
+
 /// Resume does not treat a residual whose funcbox register is a runtime-only
 /// unknown as a blocker: `ResumeDataDirectReader.consume_one_section`
 /// restores it. Whole-body admission already agreed.
@@ -31121,6 +31159,31 @@ fn none_ref_colors_reload_from_the_callee_slot_shadow() {
     );
     assert_eq!(filled, 2);
     assert_eq!(registers, vec![self_box, keep, OpRef::NONE, line_box, keep]);
+}
+
+#[test]
+fn none_ref_colors_skip_int_shadow_values() {
+    let keep = OpRef::ref_op(3);
+    let int_box = OpRef::int_op(11);
+    let ref_box = OpRef::ref_op(13);
+    let mut registers = vec![OpRef::NONE, keep, OpRef::NONE];
+    let mut shadow = std::collections::HashMap::new();
+    shadow.insert(0, int_box);
+    shadow.insert(1, ref_box);
+    // color 0 = local 0, color 2 = local 1. `MIFrame.registers_r` is refs
+    // only (`pyjitpl.py` `get_list_of_active_boxes`); an Int sitting in
+    // the slot shadow must not become a TAGBOX failarg.
+    let pcdep = vec![(1, 0, 0), (1, 2, 1)];
+    let filled = super::resume_snapshot::fill_none_refs_from_callee_slots(
+        &mut registers,
+        2,
+        0,
+        &pcdep,
+        &shadow,
+        None,
+    );
+    assert_eq!(filled, 1);
+    assert_eq!(registers, vec![OpRef::NONE, keep, ref_box]);
 }
 
 /// `insert_renamings` routes a cyclic parallel move through the Int scratch

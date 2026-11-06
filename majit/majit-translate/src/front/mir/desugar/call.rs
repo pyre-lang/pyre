@@ -1984,6 +1984,19 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `direct_arrayitems` of a `DICTENTRYARRAY` is an int
+                // address (`rewrite_op_getsubstruct`). Emit that before
+                // the helper can return a GCREF of the item run.
+                if self.try_lower_rordereddict_item_ptr(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    first_arg_ty.as_ref(),
+                    dest_local,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 // `(*p.add(i)).field` on a named struct pointee is
                 // `getinteriorfield` (`rewrite_op_getinteriorfield`). The
                 // add records the GcArray header and the index; the field

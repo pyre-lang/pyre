@@ -1998,12 +1998,15 @@ fn blackhole_level_starts(
     frame: &majit_metainterp::MIFrame,
     in_flight_callee_may_raise: bool,
 ) -> Option<Vec<usize>> {
-    let code = &frame.jitcode.code;
     blackhole_scan_root_pcs(frame)
         .into_iter()
         .map(|start| {
             let follow_callee = in_flight_callee_may_raise && start == frame.pc;
-            crate::jitcode_runtime::blackhole_resume_reachable_starts(code, start, follow_callee)
+            crate::jitcode_runtime::blackhole_resume_reachable_starts_on(
+                frame.jitcode.as_ref(),
+                start,
+                follow_callee,
+            )
         })
         .try_fold(Vec::new(), |mut all, starts| {
             all.extend(starts?);
@@ -10636,10 +10639,10 @@ fn try_do_residual_or_indirect_call<Sym: WalkSym>(
         // Null funcbox. Same `bytecode_for_address` miss as a null key.
         return Ok(None);
     }
-    // A translator symbolic hash is still `getfunctionptr(graph)` when
-    // that graph has jitcode (`bytecode_for_address`). Skipping the
-    // lookup because the word is tagged symbolic residualizes a body
-    // PyPy would `perform_call`.
+    // `pyjitpl.py do_residual_or_indirect_call`: Const funcbox →
+    // `bytecode_for_address` (ICT only). A translator symbolic hash is
+    // that graph's `getfunctionptr` when the graph is an indirect-call
+    // target; skipping it residualizes a body PyPy would `perform_call`.
     let Some(jitcode) = crate::state::bytecode_for_address(addr as usize) else {
         return Ok(None);
     };

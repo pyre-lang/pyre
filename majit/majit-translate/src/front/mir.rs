@@ -2043,18 +2043,68 @@ fn register_remaining_opaque_type_decls(
     }
 }
 
-/// One concrete `rordereddict_entries::Entry` / `GcEntries` use found in a
-/// signature or a local. `found` holds the rendered type arguments.
+/// `Entry<K, V>` flavour arguments. `RDict<K, V, S>` carries a hasher;
+/// only the first two arguments are the entry key and value
+/// (`get_ll_dict` one `DICTENTRY` per flavour).
+fn concrete_entry_type_args(args: &[String]) -> Option<Vec<String>> {
+    let kv: Vec<String> = args.iter().take(2).cloned().collect();
+    (kv.len() == 2 && kv.iter().all(|arg| !arg.is_empty() && !arg.contains("??"))).then_some(kv)
+}
+
+fn rendered_generic_type_args(generics: &serde_json::Value, llbc: &Llbc) -> Vec<String> {
+    generics
+        .get("types")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|ty| charon_type_value_to_ast_string(ty, llbc, 0))
+                .filter(|s| s != "Global" && s != "RandomState")
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One concrete `rordereddict_entries::Entry` / `GcEntries` / `RDict`
+/// use found in a signature, a local, or a `type T = RDict<K, V, S>`
+/// alias. `found` holds the rendered type arguments and the TypeDecl
+/// whose fields they belong to (`None` = generic template).
 struct EntryInstantiationScan<'a> {
     llbc: &'a Llbc,
-    entry_id: u64,
-    gc_entries_id: Option<u64>,
+    entry_ids: std::collections::HashSet<u64>,
+    gc_entries_ids: std::collections::HashSet<u64>,
+    rdict_ids: std::collections::HashSet<u64>,
     seen_dedup: std::collections::HashSet<u64>,
     seen_suffix: std::collections::HashSet<String>,
-    found: Vec<Vec<String>>,
+    subst: Vec<String>,
+    found: Vec<(Vec<String>, Option<u64>)>,
 }
 
 impl EntryInstantiationScan<'_> {
+    fn push_args(&mut self, args: Vec<String>, fields_from: Option<u64>) {
+        if args.is_empty() || args.iter().any(|arg| arg.is_empty() || arg.contains("??")) {
+            return;
+        }
+        let suffix = args.join(",");
+        if self.seen_suffix.insert(suffix) {
+            self.found.push((args, fields_from));
+        }
+    }
+
+    fn push_kv_from(&mut self, rendered: &[String], fields_from: Option<u64>) {
+        let kv = concrete_entry_type_args(rendered).or_else(|| {
+            if rendered.iter().any(|arg| arg.contains("??")) {
+                concrete_entry_type_args(&self.subst)
+            } else {
+                None
+            }
+        });
+        if let Some(args) = kv {
+            let fields_from =
+                fields_from.filter(|_| rendered.iter().all(|arg| !arg.contains("??")));
+            self.push_args(args, fields_from);
+        }
+    }
+
     fn consider(&mut self, root: Option<&serde_json::Value>) {
         let Some(root) = root else {
             return;
@@ -2076,26 +2126,42 @@ impl EntryInstantiationScan<'_> {
                 }
                 continue;
             }
-            if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
+            if let Some(arr) = obj
+                .get("Value")
+                .or_else(|| obj.get("HashConsedValue"))
+                .and_then(serde_json::Value::as_array)
                 && arr.len() == 2
             {
                 stack.push((&arr[1], depth + 1));
                 continue;
             }
+            if let Some(inst) = obj.get("Instantiated") {
+                if let Some(skip) = inst.get("skip_binder") {
+                    stack.push((skip, depth + 1));
+                }
+                continue;
+            }
+            if obj.get("types").is_some() && obj.get("const_generics").is_some() {
+                if let Some(types) = obj.get("types").and_then(serde_json::Value::as_array) {
+                    for ty in types {
+                        stack.push((ty, depth + 1));
+                    }
+                }
+                continue;
+            }
             if let Some(adt) = obj.get("Adt").and_then(serde_json::Value::as_object) {
-                if let Some(id) = type_decl_ref_adt_id(adt)
-                    && (id == self.entry_id || self.gc_entries_id == Some(id))
-                {
-                    let args = render_adt_type_args(adt, self.llbc, depth);
-                    if !args.is_empty()
-                        && args
-                            .iter()
-                            .all(|arg| !arg.is_empty() && !arg.contains("??"))
+                if let Some(id) = type_decl_ref_adt_id(adt) {
+                    if self.entry_ids.contains(&id) || self.gc_entries_ids.contains(&id) {
+                        let rendered = render_adt_type_args(adt, self.llbc, depth);
+                        let fields_from = self.entry_ids.contains(&id).then_some(id);
+                        self.push_kv_from(&rendered, fields_from);
+                    } else if self.rdict_ids.contains(&id) {
+                        let rendered = render_adt_type_args(adt, self.llbc, depth);
+                        self.push_kv_from(&rendered, None);
+                    } else if let Some(td) = self.llbc.type_by_id(id)
+                        && let TypeDeclKind::Alias(body) = &td.kind
                     {
-                        let suffix = args.join(",");
-                        if self.seen_suffix.insert(suffix) {
-                            self.found.push(args);
-                        }
+                        stack.push((body.get("aliased_ty").unwrap_or(body), depth + 1));
                     }
                 }
                 if let Some(types) = type_decl_ref_generics(adt, self.llbc)
@@ -2135,46 +2201,113 @@ impl EntryInstantiationScan<'_> {
     }
 }
 
-/// Publish concrete `Entry<i64, *mut PyObject>` field rows.
+/// Type arguments Charon recorded on a monomorphized TypeDecl
+/// (`item_meta.instantiation`). Empty when the decl is the generic template.
+fn type_decl_rendered_type_args(td: &TypeDecl, llbc: &Llbc) -> Vec<String> {
+    let mut adt = serde_json::Map::new();
+    adt.insert("id".to_string(), serde_json::json!(td.def_id));
+    render_adt_type_args(&adt, llbc, 0)
+}
+
+/// Publish concrete `Entry<K, V>` field rows.
 ///
 /// Charon leaves `rordereddict_entries::Entry` generic, so
 /// `derive_program_metadata` records `key` as a type variable.
-/// `_handle_dict_lookup_call` extra descrs need that concrete `i64` key
-/// (`arraydescrof(DICTENTRYARRAY)`). A fully concrete use of `Entry`, or
-/// the same arguments on `GcEntries`, supplies the rows. Only the
-/// qualified spelling is inserted. `#[repr(C)]` places `key`, `f_valid`,
-/// `value`, and `f_hash` in declaration order.
-fn register_ordereddict_i64_entry_rows(
+/// `get_ll_dict` builds one `DICTENTRYARRAY` per dict flavour; each
+/// monomorph (`i64`, `ObjectKey`, …) is its own ARRAY.OF. A fully
+/// concrete use of `Entry` or `GcEntries`, a `RDict<K, V, S>` head, or
+/// a `type T = RDict<K, V, S>` alias (`ObjectDictStorage`) supplies the
+/// rows. `#[repr(C)]` places `key`, `f_valid`, `value`, and `f_hash`
+/// in declaration order.
+fn register_ordereddict_entry_rows(
     llbc: &Llbc,
     known_struct_names: &mut std::collections::HashSet<String>,
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) {
-    let mut entry: Option<(u64, String)> = None;
-    let mut gc_entries_id = None;
-    for td in llbc.iter_type_decls() {
-        let path = td.item_meta.name_path();
-        if entry.is_none()
-            && path.ends_with("rordereddict_entries::Entry")
-            && matches!(td.kind, TypeDeclKind::Struct(_))
-        {
-            entry = Some((td.def_id, path));
-        } else if gc_entries_id.is_none() && path.ends_with("rordereddict_entries::GcEntries") {
-            gc_entries_id = Some(td.def_id);
-        }
-    }
-    let Some((entry_id, entry_path)) = entry else {
-        return;
-    };
+    let mut template: Option<(u64, String)> = None;
+    let mut entry_ids = std::collections::HashSet::new();
+    let mut gc_entries_ids = std::collections::HashSet::new();
+    let mut rdict_ids = std::collections::HashSet::new();
     let mut scan = EntryInstantiationScan {
         llbc,
-        entry_id,
-        gc_entries_id,
+        entry_ids: std::collections::HashSet::new(),
+        gc_entries_ids: std::collections::HashSet::new(),
+        rdict_ids: std::collections::HashSet::new(),
         seen_dedup: std::collections::HashSet::new(),
         seen_suffix: std::collections::HashSet::new(),
+        subst: Vec::new(),
         found: Vec::new(),
     };
+    for td in llbc.iter_type_decls() {
+        let path = td.item_meta.name_path();
+        if path.ends_with("rordereddict_entries::Entry")
+            && matches!(td.kind, TypeDeclKind::Struct(_))
+        {
+            entry_ids.insert(td.def_id);
+            let args = type_decl_rendered_type_args(td, llbc);
+            if args.is_empty() {
+                if template.is_none() {
+                    template = Some((td.def_id, path));
+                }
+            } else {
+                scan.push_kv_from(&args, Some(td.def_id));
+            }
+        } else if path.ends_with("rordereddict_entries::GcEntries") {
+            gc_entries_ids.insert(td.def_id);
+            let args = type_decl_rendered_type_args(td, llbc);
+            if !args.is_empty() {
+                scan.push_kv_from(&args, None);
+            }
+        } else if path.ends_with("rordereddict::RDict") {
+            rdict_ids.insert(td.def_id);
+        }
+    }
+    let Some((template_id, entry_path)) = template.or_else(|| {
+        entry_ids.iter().next().and_then(|id| {
+            llbc.type_by_id(*id)
+                .map(|td| (*id, td.item_meta.name_path()))
+        })
+    }) else {
+        return;
+    };
+    scan.entry_ids = entry_ids;
+    scan.gc_entries_ids = gc_entries_ids;
+    scan.rdict_ids = rdict_ids;
+    for td in llbc.iter_type_decls() {
+        match &td.kind {
+            TypeDeclKind::Alias(body) => {
+                scan.consider(Some(body.get("aliased_ty").unwrap_or(body)));
+            }
+            TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => {
+                for field in fields {
+                    scan.consider(tyref_node(&field.ty, llbc));
+                }
+            }
+            TypeDeclKind::Enum(variants) => {
+                for variant in variants {
+                    for field in &variant.fields {
+                        scan.consider(tyref_node(&field.ty, llbc));
+                    }
+                }
+            }
+            TypeDeclKind::Opaque | TypeDeclKind::Unknown => {}
+        }
+    }
     for fd in llbc.iter_local_fns() {
+        scan.subst.clear();
+        if let Some(inst) = fd.item_meta.instantiation() {
+            if let Some(generics) = instantiation_generic_args(inst, llbc) {
+                let args = rendered_generic_type_args(generics, llbc);
+                if args
+                    .iter()
+                    .all(|arg| !arg.is_empty() && !arg.contains("??"))
+                {
+                    scan.subst = args;
+                }
+            }
+            scan.consider(Some(inst));
+        }
         for ty in fd
             .signature
             .inputs
@@ -2188,16 +2321,17 @@ fn register_ordereddict_i64_entry_rows(
                 scan.consider(tyref_node(&local.ty, llbc));
             }
         }
+        scan.subst.clear();
     }
-    let Some(td) = llbc.type_by_id(entry_id) else {
-        return;
-    };
-    let TypeDeclKind::Struct(fields) = &td.kind else {
-        return;
-    };
-    for args in scan.found {
+    for (args, fields_from) in scan.found {
+        let fields_id = fields_from.unwrap_or(template_id);
+        let Some(td) = llbc.type_by_id(fields_id) else {
+            continue;
+        };
+        let TypeDeclKind::Struct(fields) = &td.kind else {
+            continue;
+        };
         let mut rows = Vec::with_capacity(fields.len());
-        let mut key_is_i64 = false;
         let mut valid = false;
         let mut value = false;
         let mut hash = false;
@@ -2216,7 +2350,6 @@ fn register_ordereddict_i64_entry_rows(
                 break;
             }
             match fname.as_str() {
-                "key" => key_is_i64 = concrete_ty == "i64",
                 "f_valid" => valid = true,
                 "value" => value = true,
                 "f_hash" => hash = true,
@@ -2224,12 +2357,19 @@ fn register_ordereddict_i64_entry_rows(
             }
             rows.push(field_row_from_decl(index, field, concrete_ty, llbc));
         }
-        if !concrete || !key_is_i64 || !valid || !value || !hash {
+        if !concrete || !valid || !value || !hash {
             continue;
         }
-        let name = format!("{entry_path}<{}>", args.join(","));
-        struct_fields.fields.entry(name.clone()).or_insert(rows);
+        let suffix = format!("<{}>", args.join(","));
+        let name = format!("{entry_path}{suffix}");
+        let identity = format!("{}{suffix}", strip_crate_prefix(&entry_path));
+        struct_fields
+            .fields
+            .entry(name.clone())
+            .or_insert_with(|| rows.clone());
+        struct_fields.fields.entry(identity.clone()).or_insert(rows);
         known_struct_names.insert(name);
+        known_struct_names.insert(identity);
     }
 }
 
@@ -2494,10 +2634,11 @@ impl CrateLoweringState {
             gc_struct_ids,
             program_exception_class_hints,
         );
-        // Concrete `Entry<i64, *mut PyObject>` rows. The generic decl's
-        // `key` is a type variable; extra descrs for `OS_DICT_LOOKUP`
-        // need the monomorph `get_ll_dict` would have built.
-        register_ordereddict_i64_entry_rows(
+        // Concrete `Entry<K, V>` rows. The generic decl's `key` is a
+        // type variable; each monomorph is the ARRAY.OF `get_ll_dict`
+        // would have built (`OS_DICT_LOOKUP` extra descrs, interior
+        // field descrs).
+        register_ordereddict_entry_rows(
             llbc,
             &mut known_struct_names,
             &mut struct_fields,

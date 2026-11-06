@@ -415,8 +415,8 @@ pub(crate) fn compute_blackhole_resume_facts(
     pc: usize,
     in_flight_callee_may_raise: bool,
 ) -> BlackholeResumeFacts {
-    match crate::jitcode_runtime::blackhole_resume_reachable_starts(
-        jitcode.code.as_slice(),
+    match crate::jitcode_runtime::blackhole_resume_reachable_starts_on(
+        jitcode,
         pc,
         in_flight_callee_may_raise,
     ) {

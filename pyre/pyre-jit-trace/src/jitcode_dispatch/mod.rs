@@ -2798,10 +2798,16 @@ impl<Sym: WalkSym> WalkContext<'_, '_, Sym> {
         let vref_box = (concrete != 0)
             .then(|| self.trace_ctx.virtualref_virtual_for_object_ptr(concrete))
             .flatten();
+        // Portal locals are the standard virtualizable (`pyjitpl.py`
+        // `MIFrame._nonstandard_virtualizable` vs `virtualizable_boxes[-1]`).
+        // A vref pair whose virtual is that box is the same frame (live
+        // object vs snapshot copy). `red == obj` is not: `getframe` can
+        // return an inlined callee's virtual, and that MIFrame's locals
+        // are its own shadow, not the portal vable array.
         let portal = vable_box == Some(obj)
             || vable_ptr == Some(concrete)
             || heap_ptr == Some(concrete)
-            || vref_box.is_some_and(|red| vable_box == Some(red) || red == obj);
+            || vref_box.is_some_and(|red| vable_box == Some(red));
         if portal {
             return Some(ReceiverTraceLocals::Portal);
         }
