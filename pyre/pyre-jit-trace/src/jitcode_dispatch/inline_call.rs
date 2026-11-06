@@ -26456,10 +26456,14 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
     // Stamp the paused caller at the CALL that enters this body
     // (`MIFrame.run_one_step` already advanced past it). Nested helper: the
     // outer helper is still `helper_live.last()`. First helper from a
-    // Python/portal frame: bind that frame's banks, then stamp — before
-    // `push_helper_live`, otherwise `mark_paused_caller_call` would write
-    // the child's live slot and `build_parent_miframe_from_paused_live`
-    // would see no parent jitcode (`blackhole.py _copy_data_from_miframe`).
+    // Python/portal frame: bind that frame's banks, then stamp the Python
+    // live slot — before `push_helper_live`, otherwise
+    // `mark_paused_caller_call` would write the child's live slot and
+    // `build_parent_miframe_from_paused_live` would see no parent jitcode
+    // (`blackhole.py _copy_data_from_miframe`). An inlined Python frame
+    // sitting under an outer helper is still `framestack[-1]`
+    // (`pyjitpl.py` `framestack[-1]`), so the stamp follows
+    // `transparent_helper_subwalk` rather than "any helper is live".
     // A Python-portal generator resume already entered its MIFrame
     // (`InlineFrameGuard::enter`); binding the FOR_ITER caller's banks
     // onto that child is the same mix. User-call inlining never rebinds
@@ -26483,7 +26487,12 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         .and_then(|consts| u32::try_from(consts.jitcode_index).ok())
         .unwrap_or(ctx.outer_jitcode_index);
     if !is_python_portal {
-        super::vable_ops::mark_paused_caller_call(ctx.session, caller_jitcode_index, pc);
+        super::vable_ops::mark_paused_caller_call(
+            ctx.session,
+            caller_jitcode_index,
+            pc,
+            ctx.fbw_mode.transparent_helper_subwalk,
+        );
     }
     // `bind_paused_caller_regs` / `mark_paused_caller_call` can collect after
     // the seed copies. Re-read every Ref shadow from the extra-area `_resref`
@@ -26757,6 +26766,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
             let residual_executed = helper_subwalk_executed_residual(&error, residuals_before);
             let error = match error {
                 DispatchError::GuardResumeCoordinateUnavailable { pc }
+                | DispatchError::RegisterReadUnbound { pc, .. }
                     if helper_index.is_some() && !residual_executed =>
                 {
                     DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 }

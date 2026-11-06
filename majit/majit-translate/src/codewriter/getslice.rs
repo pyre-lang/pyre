@@ -126,12 +126,17 @@ pub fn array_identity_of_base(
         Some(Some(id)) if id == crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID => {
             Some((ValueType::Ref(None), Some(id)))
         }
-        // A `&[PyObjectRef]` parameter names its own identity: the front
-        // stamps the slice's class root even where no sibling array op
-        // carries an id.  A thin-pointer element keeps the unnamed id —
-        // the identity-less descr mint already sizes it right, and it is
-        // the id the graph's own length reads use.
-        _ if object_slice_input => Some((ValueType::Ref(None), None)),
+        // A `&[PyObjectRef]` parameter is the length-prefixed
+        // `GcArray(Ptr(PyObject))` (`array_projection_metadata` remaps
+        // `[*mut PyObject]` onto `OBJECT_REF_GCARRAY_TYPE_ID`). The class
+        // root is enough to name that ARRAY when no sibling array op
+        // carries an id. An unnamed mint leaves `ArrayDescr.cache_key` at
+        // 0; `prepass add_descr` skips `type_id == 0`, so the EffectInfo
+        // member becomes leftover `AbsentContainer`.
+        _ if object_slice_input => Some((
+            ValueType::Ref(None),
+            Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+        )),
         _ => None,
     }
 }
@@ -1383,7 +1388,10 @@ mod tests {
         );
         assert_eq!(
             array_identity_of_base(&graph, &args),
-            Some((ValueType::Ref(None), None))
+            Some((
+                ValueType::Ref(None),
+                Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.into())
+            ))
         );
         let mut graph = FunctionGraph::new("g");
         let other = graph.alloc_value_var();

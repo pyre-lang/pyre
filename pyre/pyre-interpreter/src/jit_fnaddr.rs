@@ -142,27 +142,6 @@ extern "C" fn shadow_stack_slot_word() -> i64 {
     shadow_stack_slot_as_raw(majit_gc::shadow_stack::shadow_stack_slot())
 }
 
-/// Residual ABI for `gc_roots::push_roots`.
-///
-/// `RootScope` is a raw-word ADT the annotator projects as `SomePtr`
-/// (`raw_struct_ptr_annotation`). HELPER_FNADDRS skips the struct return, so
-/// the codewriter minted a symbolic hash. The residual result is a pointer to
-/// a heap guard so the published `root_scope_close(&RootScope)` and
-/// `RootScope` methods receive a live object. `RootScope::new` is private, so
-/// every residual RootScope word is this Box.
-extern "C" fn push_roots_jit_abi() -> i64 {
-    majit_ir::icf_identity!("jit_fnaddr::push_roots_jit_abi");
-    let scope = Box::new(pyre_object::gc_roots::push_roots());
-    Box::into_raw(scope) as i64
-}
-
-/// Residual ABI for `gc_roots::root_scope_close`.
-///
-/// `dont_look_inside_cannot_raise` emits the descr-word adapter that rebuilds
-/// `&RootScope` from the `push_roots` result word; `merge_macro_helper_fnaddrs`
-/// publishes that adapter into the occupied slot (`getfunctionptr`).
-use pyre_object::gc_roots::__majit_call_target_root_scope_close as root_scope_close_jit_abi;
-
 /// One-word C-ABI entry for `warn::warn_deprecation`.
 ///
 /// `space_index` records `inline_call_r_v` of that graph. The source is
@@ -3379,24 +3358,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::runtime_ops::build_list_from_refs",
         "pyre_interpreter::build_list_from_refs",
         crate::runtime_ops::build_list_from_refs_jit_abi,
-    );
-    // `&[PyObjectRef]` arrives as one length-prefixed array word; `PyResult`
-    // is sret. HELPER_FNADDRS skips FatPointerArg+ResultReturn, so bind the
-    // word-ABI bridge.
-    cpa2!(
-        &mut entries,
-        "pyre_interpreter::call::call_function_impl_result",
-        "pyre_interpreter::call_function_impl_result",
-        crate::call::call_function_impl_result_jit_abi,
-    );
-    // `&[PyObjectRef]` + `PyResult` is FatPointerArg+ResultReturn; the
-    // raw item is skipped and `isinstance` residual-calls this path
-    // (`abstractinst.py` `__instancecheck__`). Bind the word-ABI bridge.
-    cpa4!(
-        &mut entries,
-        "pyre_interpreter::baseobjspace::get_and_call_function",
-        "pyre_interpreter::get_and_call_function",
-        crate::baseobjspace::get_and_call_function_jit_abi,
     );
     pa1!(
         &mut entries,
@@ -8485,15 +8446,15 @@ mod tests {
         majit_stringbuilder_append_jit_abi, majit_stringbuilder_build_jit_abi,
         majit_stringbuilder_new_jit_abi, module_dict_getdictvalue_no_unwrapping_pure_word,
         object_dict_getitem_str_hashed_word, object_dict_getitem_str_word, occupied_published_addr,
-        pin_gcrefs_jit_abi, push_roots_jit_abi, pyframe_load_global_value_word,
-        pyframe_load_name_value_word, pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs,
-        pyre_class_typeidcell_addrs, replace_value_word_jit_abi, root_scope_close_jit_abi,
-        shadow_stack_get_word, shadow_stack_push_word, shadow_stack_try_pop_to_word,
-        switch_to_correct_strategy_word, unicode_dict_getitem_str_hashed_word,
-        unicode_dict_getitem_str_word, w_dict_getitem_str_object_strategy_hashed_word,
-        w_dict_lookup_bytes_strategy_word, w_dict_lookup_identity_strategy_word,
-        w_dict_lookup_int_strategy_word, w_list_live_len_word, w_list_pop_end_inner_word,
-        w_list_pop_end_word, w_module_dict_lookup_object_entries_word, write_bytes_word_jit_abi,
+        pin_gcrefs_jit_abi, pyframe_load_global_value_word, pyframe_load_name_value_word,
+        pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs, pyre_class_typeidcell_addrs,
+        replace_value_word_jit_abi, shadow_stack_get_word, shadow_stack_push_word,
+        shadow_stack_try_pop_to_word, switch_to_correct_strategy_word,
+        unicode_dict_getitem_str_hashed_word, unicode_dict_getitem_str_word,
+        w_dict_getitem_str_object_strategy_hashed_word, w_dict_lookup_bytes_strategy_word,
+        w_dict_lookup_identity_strategy_word, w_dict_lookup_int_strategy_word,
+        w_list_live_len_word, w_list_pop_end_inner_word, w_list_pop_end_word,
+        w_module_dict_lookup_object_entries_word, write_bytes_word_jit_abi,
     };
     use std::collections::HashMap;
 
@@ -8615,6 +8576,10 @@ mod tests {
             bindings["pyre_interpreter::baseobjspace::get_and_call_function"],
             get_and_call
         );
+        assert_eq!(
+            bindings["pyre_interpreter::get_and_call_function"],
+            get_and_call
+        );
         let raw_get = crate::baseobjspace::get_and_call_function as *const () as usize as i64;
         assert_ne!(
             get_and_call, raw_get,
@@ -8626,6 +8591,10 @@ mod tests {
         let call_impl = call_impl as *const () as usize as i64;
         assert_eq!(
             bindings["pyre_interpreter::call::call_function_impl_result"],
+            call_impl
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::call_function_impl_result"],
             call_impl
         );
         let raw_call = crate::call::call_function_impl_result as *const () as usize as i64;
@@ -10908,10 +10877,6 @@ mod tests {
     #[test]
     fn jit_trace_fnaddrs_covers_residual_call_word_bridges() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let push = push_roots_jit_abi as *const () as usize as i64;
-        assert_eq!(bindings["pyre_object::gc_roots::push_roots"], push);
-        assert_eq!(bindings["pyre_object::push_roots"], push);
-
         let concat =
             crate::objspace::descroperation::list_concat_jit_abi as *const () as usize as i64;
         assert_eq!(
@@ -10942,17 +10907,9 @@ mod tests {
         assert_eq!(bindings["__majit_stringbuilder_build"], sb_build);
         let sb_append = majit_stringbuilder_append_jit_abi as *const () as usize as i64;
         assert_eq!(bindings["__majit_stringbuilder_append"], sb_append);
-        let close = root_scope_close_jit_abi as *const () as usize as i64;
-        assert_eq!(bindings["pyre_object::gc_roots::root_scope_close"], close);
-        assert_eq!(bindings["pyre_object::root_scope_close"], close);
-        let raw_close: fn(&pyre_object::gc_roots::RootScope) =
-            pyre_object::gc_roots::root_scope_close;
-        let raw_close = raw_close as *const () as usize as i64;
-        assert_ne!(
-            close, raw_close,
-            "must not publish the raw &RootScope item; residual push_roots returns a Box pointer"
-        );
-        let call_impl = crate::call::call_function_impl_result_jit_abi as *const () as usize as i64;
+        let call_impl: extern "C" fn(i64, i64) -> i64 =
+            crate::call::__majit_call_target_call_function_impl_result;
+        let call_impl = call_impl as *const () as usize as i64;
         assert_eq!(
             bindings["pyre_interpreter::call::call_function_impl_result"],
             call_impl
