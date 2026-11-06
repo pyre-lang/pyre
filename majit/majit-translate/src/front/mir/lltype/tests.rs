@@ -1134,9 +1134,12 @@ fn type_alias_of_fn_ptr_peels_to_functype() {
         ],
         vec![],
     );
-    let ty = TyRef::Other(serde_json::json!({
-        "Adt": {"id": 0, "generics": empty_generics()}
-    }));
+    let ty = TyRef::Other(
+        serde_json::json!({
+            "Adt": {"id": 0, "generics": empty_generics()}
+        })
+        .into(),
+    );
     assert!(
         super::type_node_is_fn_ptr(
             super::tyref_node(&ty, &llbc).expect("alias Adt node"),
@@ -1358,20 +1361,23 @@ fn fn_ptr_ty_keeps_gcref_result() {
         ],
         vec![],
     );
-    let ty = TyRef::Other(serde_json::json!({
-        "FnPtr": {
-            "skip_binder": {
-                "inputs": [
-                    {"Scalar": {"Integer": {"Unsigned": "U32"}}},
-                    {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
-                    {"RawPtr": [gcref_adt.clone(), "Mut"]},
-                    {"RawPtr": [{"Scalar": "Bool"}, "Mut"]}
-                ],
-                "output": gcref_adt,
-                "is_unsafe": true
+    let ty = TyRef::Other(
+        serde_json::json!({
+            "FnPtr": {
+                "skip_binder": {
+                    "inputs": [
+                        {"Scalar": {"Integer": {"Unsigned": "U32"}}},
+                        {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                        {"RawPtr": [gcref_adt.clone(), "Mut"]},
+                        {"RawPtr": [{"Scalar": "Bool"}, "Mut"]}
+                    ],
+                    "output": gcref_adt,
+                    "is_unsafe": true
+                }
             }
-        }
-    }));
+        })
+        .into(),
+    );
     let ft = super::func_type_from_fn_ptr_ty(&ty, &llbc, crate::ErrorCarrierSpec::default())
         .expect("hook FnPtr lowers");
     assert_eq!(ft.args.len(), 4);
@@ -1387,15 +1393,18 @@ fn fn_ptr_ty_keeps_gcref_result() {
         "GCREF FUNC.RESULT stays GCREF, not OBJECTPTR"
     );
 
-    let opaque_out = TyRef::Other(serde_json::json!({
-        "FnPtr": {
-            "skip_binder": {
-                "inputs": [],
-                "output": gcrefopaque_adt,
-                "is_unsafe": false
+    let opaque_out = TyRef::Other(
+        serde_json::json!({
+            "FnPtr": {
+                "skip_binder": {
+                    "inputs": [],
+                    "output": gcrefopaque_adt,
+                    "is_unsafe": false
+                }
             }
-        }
-    }));
+        })
+        .into(),
+    );
     let ft_opaque =
         super::func_type_from_fn_ptr_ty(&opaque_out, &llbc, crate::ErrorCarrierSpec::default())
             .expect("GCREFOpaque result FnPtr lowers");
