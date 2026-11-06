@@ -11756,21 +11756,57 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // `s.add(x)` on an exact `set`: same placement as `SysExcInfo` /
+    // `BuiltinLocals`. `__majit_wrap_set_descr_add` is a `BuiltinCode.func`
+    // PBC member, so the wrapper descent below would enter its jitcode
+    // first. Helper-innermost then records the insert body and the
+    // `spec_gate(SetAddMethod)` at the generic tail never fires. Consult
+    // here so Elided returns and Subst still reuses that tail.
+    //
+    // The zero-argument `super()` re-route is the second arm of the same
+    // shape — mutually exclusive by callable — and is asked second because
+    // `set.add` recognition is cheaper.
+    let mut direct_subst = None;
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+    {
+        match spec_gate(SpecFold::SetAddMethod, || {
+            try_walker_specialize_set_add_method(ctx, code, op, &r_args, dst)
+        })? {
+            Some(SetAddMethodSpec::Elided) => {
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+            Some(SetAddMethodSpec::Subst(subst)) => {
+                direct_subst = Some(subst);
+            }
+            None => {
+                direct_subst = spec_gate(SpecFold::BareSuperCall, || {
+                    try_walker_specialize_bare_super_call(ctx, code, op, &r_args)
+                })?;
+            }
+        }
+    }
+
     // BuiltinCode.func is an indirect PBC target exactly like RPython's
     // gateway wrappers.  Enter its generated JitCode before considering the
-    // user-function-only full-body walk below.
-    if let Some(inlined) = try_walker_inline_builtin_call(
-        ctx,
-        op,
-        code,
-        funcptr,
-        1,
-        &r_args,
-        call_descr,
-        foldable_runtime_helper,
-        dst_bank,
-        dst,
-    )? {
+    // user-function-only full-body walk below. A set.add / bare-super
+    // substitution already owns this CALL: skip the wrap so the generic
+    // tail below still concrete-executes `jit_set_add_method`.
+    if direct_subst.is_none()
+        && let Some(inlined) = try_walker_inline_builtin_call(
+            ctx,
+            op,
+            code,
+            funcptr,
+            1,
+            &r_args,
+            call_descr,
+            foldable_runtime_helper,
+            dst_bank,
+            dst,
+        )?
+    {
         return Ok(inlined);
     }
 
@@ -12627,14 +12663,11 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // `s.add(x)` on an exact `set`: swap the generic `bh_call_fn` target for
-    // the direct `set_add` store the SET_ADD accumulator opcode records
-    // (`try_walker_specialize_set_add_method`).  This is a substitution, not a
-    // fold — the call is still a MayForce residual, still guarded and still
-    // concrete-executed by the shared tail below, so the force/exception
-    // guards, the heapcache invalidation and the `None` writeback are the ones
-    // the generic path already emits.  A decline leaves every binding
-    // untouched.
+    // `s.add(x)` / zero-argument `super()` were consulted before the
+    // wrapper descent. Subst still reuses this tail: the call is a MayForce
+    // residual, still guarded and still concrete-executed, so the
+    // force/exception guards, the heapcache invalidation and the `None`
+    // writeback are the ones the generic path already emits.
     //
     // The substituted descr carries `RuntimeHelperKind::SetAddMethod` for one
     // reason: `writes_live_heap` below reads the helper tag and the result
@@ -12649,37 +12682,10 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // marker is what makes the substitution invisible to the rollback rules
     // rather than merely survivable by them.
     //
-    // The zero-argument `super()` re-route is the second arm of the same shape
-    // and is spelled here rather than with the folds above precisely so it can
-    // reuse this tail: its leaf can run a `__class__` property, so it needs the
-    // concrete execution, the raise transcription and the force bracket that
-    // only the generic path performs.  The two arms are mutually exclusive by
-    // callable -- `set.add` bound method against the `super` type -- so the
-    // order between them is free; `set_add` is asked first only because it is
-    // the cheaper recognition.
-    //
     // An integer-strategy hit is not this tail.  The contains check does not
     // insert and does not run `__hash__`, so it is not tagged `SetAddMethod`
     // and must not be concrete-executed as `jit_set_add_method`.  `spec_gate`
     // still counts that `Some` as the same row.
-    let direct_subst = if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-    {
-        match spec_gate(SpecFold::SetAddMethod, || {
-            try_walker_specialize_set_add_method(ctx, code, op, &r_args, dst)
-        })? {
-            Some(SetAddMethodSpec::Elided) => {
-                return Ok((DispatchOutcome::Continue, op.next_pc));
-            }
-            Some(SetAddMethodSpec::Subst(subst)) => Some(subst),
-            None => spec_gate(SpecFold::BareSuperCall, || {
-                try_walker_specialize_bare_super_call(ctx, code, op, &r_args)
-            })?,
-        }
-    } else {
-        None
-    };
     let skip_indirect = direct_subst.is_some();
     let (funcptr, descr, allboxes) = match direct_subst {
         Some(subst) => (subst.funcptr, subst.descr, subst.allboxes),
