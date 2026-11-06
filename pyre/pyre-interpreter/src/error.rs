@@ -5461,6 +5461,14 @@ fn report_through_default_excepthook(failure: &mut PyError) {
 /// original both go through the default hook, which is `display_exception`'s
 /// `originalexcepthook`, so this answers `true` and the caller prints nothing.
 pub fn print_exception_via_excepthook(err: &mut PyError) -> bool {
+    // `gc_max_heap_already_raised`: the next breach aborts, and setting
+    // `sys.last_exc` plus calling the hook is a nested dispatch over a heap
+    // already at its limit. Decline so the caller prints through
+    // `eprint_exception`, which writes the report without running Python.
+    // Same question `display_through_traceback_module` already asks.
+    if majit_gc::gc_max_heap_already_raised() {
+        return false;
+    }
     let Some(sys) = crate::importing::get_interpreter_sys_module() else {
         return false;
     };

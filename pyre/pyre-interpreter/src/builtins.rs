@@ -5648,6 +5648,19 @@ pub(crate) fn sys_displayhook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
 /// using the shared structured renderer keeps exception chains and
 /// tracebacks visible to tests that deliberately call the original hook.
 pub(crate) fn sys_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `gc_max_heap_already_raised`: getattr of `sys.stderr` and a Python
+    // string for the report collect over a heap already at its limit, and
+    // the next breach aborts. Render into a host buffer and emit through
+    // the seam. `display_through_traceback_module` declines the stdlib
+    // renderer for the same reason.
+    if majit_gc::gc_max_heap_already_raised() {
+        let value_obj = args.get(1).copied().unwrap_or_else(w_none);
+        let traceback_obj = args.get(2).copied().unwrap_or_else(w_none);
+        let mut rendered = Vec::new();
+        let _ = crate::error::write_exception_from_parts(&mut rendered, value_obj, traceback_obj);
+        crate::error::emit_report_to_host_stderr(&rendered);
+        return Ok(w_none());
+    }
     // Route through the live `sys.stderr`, not directly through the host
     // seam: tests and applications are allowed to replace `sys.stderr` and
     // `sys.__excepthook__` must honor that replacement.
