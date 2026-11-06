@@ -4,8 +4,8 @@
 # non-tail and carries a Ref local.
 #
 # `walk` is self-recursive, takes exact-integer arguments and holds a
-# `BinaryOp` residual, so a guard-failure bridge that reaches its CALL takes the
-# root-bridge admission (`bridge_rec_root_selfrec`, inline_call.rs).
+# `BinaryOp` residual. A guard-failure bridge that reaches its CALL inlines
+# through `_opimpl_recursive_call` / `perform_call`.
 # `bridge_recursion_overflow` already covers that admission, but only in its
 # easiest form: tail recursion whose live set is two machine integers. Two
 # ingredients of the "a Ref reached an int operation" failure it is meant to

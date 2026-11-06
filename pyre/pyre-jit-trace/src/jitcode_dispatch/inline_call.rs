@@ -9787,8 +9787,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let max_unroll_recursion = crate::driver::try_driver_pair()
         .map(|(driver, _)| driver.meta_interp().memory_manager.max_unroll_recursion() as usize)
         .unwrap_or(FBW_DEFAULT_MAX_INLINE_RECURSION);
-    let inline_recursion_count = fbw_inline_recursion_count(ctx, callee_code_key);
-    let recursive_portal_present = fbw_recursive_portal_present(ctx, callee_code_key);
+    let inline_recursion_count =
+        fbw_inline_recursion_count(ctx, callee_code_key, is_being_profiled);
     if inline_recursion_count >= max_unroll_recursion {
         if let Some((driver, _)) = crate::driver::try_driver_pair() {
             driver
@@ -9859,85 +9859,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     else {
         return resolved_inline_decline(op.pc, line!());
     };
-    let args_all_builtin_integer = callee_arg_concretes.iter().all(|concrete| match concrete {
-        ConcreteValue::Int(_) | ConcreteValue::Bool(_) => true,
-        ConcreteValue::Ref(obj) if !obj.is_null() => unsafe { pyre_object::is_int_or_long(*obj) },
-        ConcreteValue::Float(_) | ConcreteValue::Ref(_) | ConcreteValue::Null => false,
-    });
-    // Keep exact-integer arithmetic callees as one residual call when tracing
-    // a guard-origin bridge.  Re-inlining their BinaryOp body would create a
-    // second virtual frame whose operand stack is not a red bridge input; an
-    // overflow path can then compile NULL vable stack slots into the bridge.
-    // The primary loop still inlines the callee, and non-integer/user-
-    // overridable calls continue through the ordinary inline/abort policy.
-    //
-    // A plain ROOT bridge walk — no carrier resume, not an inline sub-walk,
-    // an empty framestack, and
-    // a live root portal — is uniform with a primary trace, so its second
-    // virtual frame is seeded and snapshot-covered exactly as the loop's is.
-    // There the decline is lifted: the call falls through to the self-recursive
-    // unroll gate and multiframe seed as if walked from a primary trace.
-    let mut bridge_rec_root_selfrec = false;
-    if ctx.trace_ctx.is_bridge_trace
-        && args_all_builtin_integer
-        && fbw_callee_body_has_binary_op_residual(body.code, callee_descr_refs)
-    {
-        // `_opimpl_recursive_call` runs in the one `MetaInterp.interpret`
-        // loop after `perform_call` pushes each MIFrame; it has no separate
-        // "root bridge may inline, nested bridge sub-walk may not" gate.  FBW
-        // now carries the same frame chain explicitly: `InlineFrameGuard`
-        // keeps this callee and its `parent_frame` live while the nested walk
-        // runs, and multiframe guard snapshots encode that chain.  Refusing a
-        // nested root-bridge call here dropped the parent's continuation from
-        // the compiled shape and capped fib one unroll short of PyPy.
-        bridge_rec_root_selfrec = unsafe {
-            let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                as *const pyre_interpreter::CodeObject;
-            !raw.is_null() && pyre_interpreter::code_is_self_recursive(&*raw)
-        };
-    }
-    // A callee `fbw_abort_nested_unjournaled_residual` already named on its
-    // hazard arm residualizes from here on.  The hazard is a static property of
-    // the callee's `CodeObject` (self-recursive), so re-inlining
-    // it rebuilds the identical framestack and reaches the identical abort —
-    // the enclosing loop is retired for a decline that belongs to the callee.
-    // `WarmEnterState::disable_noninlinable_function_for_key` carries the
-    // general answer: its flag means "do not inline calls to this function",
-    // and the enclosing loop is left free to retrace.
-    //
-    // The root-bridge self-recursive admission still inlines: its recursive
-    // residual is not what named the callee here.  The warmstate verdict is
-    // deferred to this same point so its typed lookup cannot hide the admission.
-    if !bridge_rec_root_selfrec && fbw_hazardous_inline_denied(callee_code_key) {
-        return resolved_inline_decline(op.pc, line!());
-    }
-    // Inlining a self-recursive callee into a foreign caller (the
-    // module `for` around `walk(...)`) starts a sub-walk whose
-    // nested recursive CALL residualizes and then hits
-    // `fbw_abort_nested_unjournaled_residual`'s self-recursive
-    // hazard, aborting the enclosing loop
-    // (`selfrec_bridge_nontail_promote`).  Same-function unroll
-    // (`fib`) and the root-bridge admission keep the inline.
-    if !bridge_rec_root_selfrec && !recursive_portal_present {
-        let raw = unsafe {
-            pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                as *const pyre_interpreter::CodeObject
-        };
-        if !raw.is_null() && unsafe { pyre_interpreter::code_is_self_recursive(&*raw) } {
-            let root_code = {
-                let session = ctx.session.borrow();
-                let frame = session.recording_frame_ptr as *const pyre_interpreter::PyFrame;
-                if frame.is_null() {
-                    0
-                } else {
-                    unsafe { (*frame).pycode as usize }
-                }
-            };
-            if root_code != 0 && root_code != callee_code_key {
-                return resolved_inline_decline(op.pc, line!());
-            }
-        }
-    }
     // An unseeded inline sub-walk inside a FOR_ITER body resumes a guard at the
     // caller's CALL boundary and replays the whole callee, so a live-heap write
     // would execute twice.  A seeded callee frame answers that hazard exactly:
@@ -10031,14 +9952,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // as other CALL-entered inlines.  Its catch arm owns exception-to-exhaustion
     // conversion, so an unseeded caller-boundary resume is not part of that
     // route's deopt discipline.
-    // A zero-param `for` body's back-edge is a plain `goto`, so the
-    // forward-branch scan would walk the loop and skip the portal activation
-    // a residual call charges. That chain runs past the recursion limit.
-    // Parameter-bearing loop callees stay on the multiframe path: refusing
-    // them crashes the recursive-portal handler fixtures. `step()` has no
-    // `for`, so it stays eligible.
     let try_multiframe = multiframe_eligible
-        && !(nparams == 0 && pyre_interpreter::code_has_for_iter(callee_code))
         && callee_fast_path_inlinable_allowing_forward_branch(
             body.code,
             callee_descr_refs,
@@ -11850,6 +11764,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let _inline_frame = InlineFrameGuard::enter(
             ctx.session,
             pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as usize,
+            is_being_profiled,
             true,
             parents,
             callee_entry_trace_index,
@@ -19464,17 +19379,18 @@ fn walk_generator_resume<Sym: WalkSym>(
         // CALL-site stamps before `enter`, matching `try_walker_inline_user_call`.
         let portal_site = python_portal_subwalk_site(ctx, op.pc, parent_inline_subwalk);
         let callee_entry_trace_index = ctx.trace_ctx.get_trace_position()._index;
-        let _inline_frame = InlineFrameGuard::enter(
-            ctx.session,
-            pyre_object::gc_roots::shadow_stack_get(code_root) as usize,
-            true,
-            parents,
-            callee_entry_trace_index,
-        );
         // `newframe(portal_code, greenkey)` (`pyjitpl.py`): greens are
         // `[next_instr, is_being_profiled, pycode]`. A function CALL
         // enters at bytecode 0; this resume enters at `resume_py_pc`.
         let is_being_profiled = live_frame_is_being_profiled(ctx);
+        let _inline_frame = InlineFrameGuard::enter(
+            ctx.session,
+            pyre_object::gc_roots::shadow_stack_get(code_root) as usize,
+            is_being_profiled,
+            true,
+            parents,
+            callee_entry_trace_index,
+        );
         let w_code = pyre_object::gc_roots::shadow_stack_get(code_root) as *const ();
         let callee_green_key =
             crate::driver::make_green_key_typed(w_code, resume_py_pc, is_being_profiled);

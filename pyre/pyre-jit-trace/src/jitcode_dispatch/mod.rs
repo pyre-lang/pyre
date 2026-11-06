@@ -589,6 +589,12 @@ pub struct InlineFrame {
     /// reaches the live `max_unroll_recursion`, the call folds to a residual
     /// instead of unrolling its call tree (`pyjitpl.py`).
     pub w_code: usize,
+    /// `PyPyJitDriver.greens` `is_being_profiled` (`interp_jit.py`) captured
+    /// at this frame's portal entry. `_opimpl_recursive_call` compares it
+    /// with `same_constant` alongside `pycode`; two inlines of the same
+    /// `w_code` with different flags are distinct unroll keys because
+    /// `PyFrame.dispatch` re-reads `get_is_being_profiled` each opcode.
+    pub is_being_profiled: bool,
     /// Whether this frame was entered with the portal greenkey that
     /// `_opimpl_recursive_call` passed to `MetaInterp.perform_call`.
     ///
@@ -726,6 +732,7 @@ impl InlineFrame {
         Self {
             is_portal: true,
             w_code: 0,
+            is_being_profiled: false,
             recursion_greenkey: false,
             call_id: 0,
             debug_merge_point_py_pc: None,
@@ -9541,6 +9548,7 @@ impl<'a> InlineFrameGuard<'a> {
     fn enter(
         session: &'a std::cell::RefCell<WalkSession>,
         w_code: usize,
+        is_being_profiled: bool,
         recursion_greenkey: bool,
         parents: Vec<InlineParentFrame>,
         entry_trace_index: u32,
@@ -9548,6 +9556,7 @@ impl<'a> InlineFrameGuard<'a> {
         Self::enter_with_resume(
             session,
             w_code,
+            is_being_profiled,
             recursion_greenkey,
             parents,
             HelperResume::Section,
@@ -9563,6 +9572,7 @@ impl<'a> InlineFrameGuard<'a> {
             session,
             0,
             false,
+            false,
             level.parents,
             level.resume,
             level.call_entry,
@@ -9574,6 +9584,7 @@ impl<'a> InlineFrameGuard<'a> {
     fn enter_with_resume(
         session: &'a std::cell::RefCell<WalkSession>,
         w_code: usize,
+        is_being_profiled: bool,
         recursion_greenkey: bool,
         parents: Vec<InlineParentFrame>,
         helper_resume: HelperResume,
@@ -9592,6 +9603,7 @@ impl<'a> InlineFrameGuard<'a> {
         walk.framestack.push(InlineFrame {
             is_portal: false,
             w_code,
+            is_being_profiled,
             recursion_greenkey,
             call_id,
             debug_merge_point_py_pc: None,

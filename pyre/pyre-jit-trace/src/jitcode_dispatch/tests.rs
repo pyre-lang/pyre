@@ -50,10 +50,10 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
     let c = BASE + 0x3000;
     let t = BASE + 0x4000;
     let frames = vec![
-        InlineFrameGuard::enter(&outer, 0, false, vec![parent(a)], 0),
-        InlineFrameGuard::enter(&outer, 0, false, vec![parent(b)], 0),
+        InlineFrameGuard::enter(&outer, 0, false, false, vec![parent(a)], 0),
+        InlineFrameGuard::enter(&outer, 0, false, false, vec![parent(b)], 0),
     ];
-    let inner_frame = InlineFrameGuard::enter(&inner, 0, false, vec![parent(c)], 0);
+    let inner_frame = InlineFrameGuard::enter(&inner, 0, false, false, vec![parent(c)], 0);
     let forward = || {
         let mut seen = Vec::new();
         let mut visit = |root: &mut majit_ir::GcRef| {
@@ -157,7 +157,7 @@ fn operator_tail_caller_is_read_from_the_rooted_session_after_return() {
     let pre_call = parent(word);
     let stale = pre_call.clone();
     let interned = stale.boxes[0];
-    let frame = InlineFrameGuard::enter(&session, 0, false, vec![pre_call], 0);
+    let frame = InlineFrameGuard::enter(&session, 0, false, false, vec![pre_call], 0);
     let _wave = majit_ir::const_ptr_table::Wave::enter();
     majit_gc::shadow_stack::walk_my_extra_areas(|root| {
         if (word..word + 0x1000).contains(&root.0) {
@@ -2399,6 +2399,7 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
     session.borrow_mut().framestack.push(InlineFrame {
         is_portal: false,
         w_code: w_code as usize,
+        is_being_profiled: false,
         // What `InlineFrameGuard::new` stamps on the first Python portal frame
         // pushed onto an empty framestack: `MetaInterp.newframe` consumes
         // `call_id` 0, no `DEBUG_MERGE_POINT` has been emitted yet, and a
@@ -2620,6 +2621,7 @@ fn portal_may_force_records_the_callee_execution_context() {
     let _caller = InlineFrameGuard::enter(
         &session,
         0,
+        false,
         false,
         vec![InlineParentFrame {
             jitcode_index: jitcode_index as u32,
@@ -2943,6 +2945,7 @@ fn loop_callee_portal_call_assembler_guard_not_forced_snapshot_carries_send_ex_t
     let _caller = InlineFrameGuard::enter(
         &session,
         0,
+        false,
         false,
         vec![InlineParentFrame {
             jitcode_index: jitcode_index as u32,
@@ -18345,7 +18348,7 @@ fn release_gil_forcing_stores_precede_call() {
         result_slot: CallResultSlot::Unknown,
     };
     let session = std::cell::RefCell::new(WalkSession::default());
-    let _inline = InlineFrameGuard::enter(&session, 1, false, vec![parent], 0);
+    let _inline = InlineFrameGuard::enter(&session, 1, false, false, vec![parent], 0);
     let mut effect = majit_ir::EffectInfo::default();
     effect.extraeffect = majit_ir::ExtraEffect::CanRaise;
     effect.call_release_gil_target = (forces_folded_vref_for_release_gil as *const () as u64, 0);
@@ -22781,12 +22784,14 @@ fn helper_activation_identity_is_the_shared_frame_state_not_jitcode_index() {
             &session,
             0,
             false,
+            false,
             vec![paused_helper_parent_for_activation(1848, 18, outer.clone())],
             0,
         ),
         InlineFrameGuard::enter(
             &session,
             0,
+            false,
             false,
             vec![paused_helper_parent_for_activation(1848, 18, inner.clone())],
             0,
@@ -22817,6 +22822,7 @@ fn splice_skips_helper_activations_already_on_the_latched_framestack() {
             &session,
             0,
             false,
+            false,
             vec![paused_helper_parent_for_activation(
                 1848,
                 18,
@@ -22827,6 +22833,7 @@ fn splice_skips_helper_activations_already_on_the_latched_framestack() {
         InlineFrameGuard::enter(
             &session,
             0,
+            false,
             false,
             vec![paused_helper_parent_for_activation(
                 1779,
@@ -22876,6 +22883,7 @@ fn splice_inserts_a_missing_helper_activation_below_the_innermost() {
     let _level = InlineFrameGuard::enter(
         &session,
         0,
+        false,
         false,
         vec![paused_helper_parent_for_activation(
             1848,
@@ -26545,6 +26553,7 @@ fn jit_merge_point_inlined_first_visit_continues_before_loop_header() {
     session.borrow_mut().framestack.push(InlineFrame {
         is_portal: false,
         w_code: 0x1_0000,
+        is_being_profiled: false,
         recursion_greenkey: true,
         call_id: 1,
         debug_merge_point_py_pc: None,
@@ -29150,6 +29159,7 @@ fn residual_call_guard_snapshot_keeps_setfield_vable_vsd_and_last_instr() {
     session.borrow_mut().framestack.push(InlineFrame {
         is_portal: false,
         w_code: w_code as usize,
+        is_being_profiled: false,
         recursion_greenkey: true,
         call_id: 0,
         debug_merge_point_py_pc: None,
@@ -30105,7 +30115,7 @@ fn capture_root_parent_resume_stack_keeps_post_pop_call_slots() {
     };
 
     let session = std::cell::RefCell::new(WalkSession::default());
-    let _inline = InlineFrameGuard::enter(&session, w_code as usize, false, vec![parent], 0);
+    let _inline = InlineFrameGuard::enter(&session, w_code as usize, false, false, vec![parent], 0);
     let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
     let r0 = tc.const_ref(1);
     let i0 = tc.const_int(0);

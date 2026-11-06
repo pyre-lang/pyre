@@ -100,8 +100,6 @@ N = 20000
 
 
 def refused_inline():
-    # A `for` anywhere in the body is what `code_has_for_iter` refuses, so this
-    # callee stays residual without depending on either reverted change.
     acc = 0
     for _ in range(1):
         acc += 1
