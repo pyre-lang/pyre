@@ -93,7 +93,7 @@ pub(in crate::front::mir) fn impl_method_owner_for_fundecl(
         }
         // Non-ADT `Self` has no TypeDecl and no `CallTarget::Method`
         // owner.  `is_null` is not registered here: the front lowers
-        // `<*const T>::is_null` / `<*mut T>::is_null` to `is_`
+        // `<*const T>::is_null` / `<*mut T>::is_null` by pointee gckind
         // (`is_raw_ptr_is_null`) instead of a method key. A primitive
         // trait impl (`PartialOrd<char> for char`) is distinguished by
         // `spec_segments` via the impl's trait-ref identity, not by minting a
@@ -4349,6 +4349,11 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     if tyref_is_gcref_spelling(ty, llbc) {
         return None;
     }
+    if let Some(root) =
+        tyref_niche_option_gc_payload_spelling(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+    {
+        return Some(root);
+    }
     if let Some(root) = registered_gc_ptr_class_root_with(
         ty,
         llbc,
@@ -4394,14 +4399,16 @@ pub(in crate::front::mir) fn dont_look_inside_return_can_be_none(
 ) -> bool {
     let payload = crate::front::result_exc::result_exc_projected_ok(output, llbc, spec);
     let ty = payload.as_ref().unwrap_or(output);
-    registered_gc_ptr_class_root_with(
-        ty,
-        llbc,
-        no_tombstoned_leaves(),
-        gc_struct_ids,
-        raw_alloc_flavor_structs,
-    )
-    .is_some()
+    tyref_niche_option_gc_payload_spelling(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+        .is_some()
+        || registered_gc_ptr_class_root_with(
+            ty,
+            llbc,
+            no_tombstoned_leaves(),
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        )
+        .is_some()
 }
 
 /// Field-layout spelling of a `*mut Vec<T>` / `*mut VecDeque<T>` / `*mut [T]`
@@ -4965,6 +4972,288 @@ pub(crate) fn is_str_family_class_root(root: &str) -> bool {
         || STR_FAMILY_DECLARED_PATHS.contains(&root)
         || is_rust_heap_string_root(root)
         || root == "str"
+}
+
+/// A `*const T` / `*mut T` whose pointee is [`is_str_family_class_root`].
+/// A Rust `&T` / owned `String` spelling has no raw-pointer prefix.
+pub(crate) fn is_raw_ptr_to_str_family_spelling(ty: &str) -> bool {
+    ty.strip_prefix("*const ")
+        .or_else(|| ty.strip_prefix("*mut "))
+        .is_some_and(|pointee| is_str_family_class_root(pointee.trim()))
+}
+
+/// A `*const T` / `*mut T` whose pointee is a classed instance, or the
+/// `PyObjectRef` alias (`*mut pyobject::PyObject`). A Rust `&T` spelling
+/// has no raw-pointer prefix. Str-family raw pointers use
+/// [`is_raw_ptr_to_str_family_spelling`]; `llmemory.GCREF` and scalar /
+/// `CCHARP` pointees stay on their own seeds.
+pub(crate) fn is_raw_ptr_to_classed_instance_spelling(ty: &str) -> bool {
+    let t = ty.trim();
+    if t == "PyObjectRef" || t.ends_with("::PyObjectRef") {
+        return true;
+    }
+    let Some(pointee) = t
+        .strip_prefix("*const ")
+        .or_else(|| t.strip_prefix("*mut "))
+    else {
+        return false;
+    };
+    let pointee = pointee.trim();
+    if is_str_family_class_root(pointee)
+        || crate::annotator::bookkeeper::is_gcref_type_spelling(pointee)
+        || majit_ir::descr::is_list_container_spelling(pointee)
+        || majit_ir::descr::is_fn_ptr_spelling(t)
+        || majit_ir::descr::is_fn_ptr_spelling(pointee)
+    {
+        return false;
+    }
+    if matches!(
+        pointee,
+        "CCHARP"
+            | "u8"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "isize"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "usize"
+            | "f32"
+            | "f64"
+            | "bool"
+            | "char"
+            | "()"
+            | "c_void"
+    ) || pointee.ends_with("::CCHARP")
+        || pointee.ends_with("::c_void")
+    {
+        return false;
+    }
+    pointee.contains("::")
+        || pointee
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase())
+}
+
+/// Reconstructs [`tyref_niche_option_gc_payload_spelling`] from a
+/// class-root spelling. The stamp keeps a reference/raw-pointer wrapper
+/// on the payload (`Option<&W_X>`, `Option<*mut PyObject>`), so a tagged
+/// by-value `Option<W_X>` is not this family. See
+/// [`crate::annotator::bookkeeper::Bookkeeper::niche_option_gc_payload_annotation`].
+pub(crate) fn is_niche_option_gc_payload_spelling(ty: &str) -> bool {
+    let t = ty.trim();
+    let Some(inner) = majit_ir::descr::option_payload_spelling(t) else {
+        return false;
+    };
+    if majit_ir::descr::is_option_of_fn_ptr_spelling(t)
+        || majit_ir::descr::is_option_of_u8_window_spelling(t)
+        || majit_ir::descr::is_option_of_u8_window_spelling(majit_ir::descr::class_root_leaf(t))
+        || majit_ir::descr::is_fn_ptr_spelling(inner)
+    {
+        return false;
+    }
+    if crate::annotator::bookkeeper::is_gcref_type_spelling(inner) {
+        return false;
+    }
+    let (is_ptr, pointee) = peel_niche_option_payload_pointer(inner);
+    if matches!(
+        pointee,
+        "CCHARP"
+            | "u8"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "isize"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "usize"
+            | "f32"
+            | "f64"
+            | "bool"
+            | "char"
+            | "()"
+            | "c_void"
+    ) || pointee.ends_with("::CCHARP")
+        || pointee.ends_with("::c_void")
+        || pointee.starts_with("NonZero")
+        || pointee.contains("::NonZero")
+        || majit_ir::descr::is_list_container_spelling(inner)
+        || majit_ir::descr::is_list_container_spelling(pointee)
+        || inner == "*mut u8"
+        || inner == "*const u8"
+    {
+        return false;
+    }
+    if is_str_family_class_root(inner)
+        || is_str_family_class_root(pointee)
+        || is_raw_ptr_to_str_family_spelling(inner)
+        || inner == "PyObjectRef"
+        || inner.ends_with("::PyObjectRef")
+    {
+        return true;
+    }
+    is_ptr
+        && !pointee.is_empty()
+        && (pointee.contains("::")
+            || pointee
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase()))
+}
+
+/// Pointer wrapper around a niche Option payload, or `(false, inner)` when
+/// the payload is by-value. `NonNull` / `Box` / `Arc` / `Rc` are the same
+/// one-word null niche as `&T`.
+fn peel_niche_option_payload_pointer(inner: &str) -> (bool, &str) {
+    let inner = inner.trim();
+    if let Some(pointee) = inner
+        .strip_prefix("*mut ")
+        .or_else(|| inner.strip_prefix("*const "))
+        .or_else(|| inner.strip_prefix("&mut "))
+        .or_else(|| inner.strip_prefix('&'))
+    {
+        return (true, pointee.trim());
+    }
+    let leaf = majit_ir::descr::class_root_leaf(inner);
+    let name = leaf.split('<').next().unwrap_or(leaf);
+    if matches!(name, "NonNull" | "Box" | "Arc" | "Rc")
+        && let Some(span) = majit_ir::descr::generic_args_span(leaf)
+    {
+        return (true, span[1..span.len() - 1].trim());
+    }
+    (false, inner)
+}
+
+/// Charon spelling of a raw pointer onto a str-family pointee, or `None`.
+/// `&str` / `&Utf8Str` are `Ref` and stay out.
+pub(in crate::front::mir) fn tyref_raw_ptr_to_str_family_spelling(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<String> {
+    if !tyref_is_raw_pointer(ty, llbc) {
+        return None;
+    }
+    let spelling = tyref_to_ast_string(ty, llbc);
+    is_raw_ptr_to_str_family_spelling(&spelling).then_some(spelling)
+}
+
+/// Charon spelling of a raw pointer onto a classed instance, or `None`.
+/// `&PyObject` / owned instances stay out; `PyObjectRef` is `*mut PyObject`.
+pub(in crate::front::mir) fn tyref_raw_ptr_to_classed_instance_spelling(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<String> {
+    if !tyref_is_raw_pointer(ty, llbc) {
+        return None;
+    }
+    if tyref_is_gcref_spelling(ty, llbc) {
+        return None;
+    }
+    let spelling = tyref_to_ast_string(ty, llbc);
+    is_raw_ptr_to_classed_instance_spelling(&spelling).then_some(spelling)
+}
+
+/// Class-root stamp of a niche `Option<P>` whose payload is a GC instance
+/// or a str-family pointee. See [`is_niche_option_gc_payload_spelling`].
+pub(in crate::front::mir) fn tyref_niche_option_gc_payload_spelling(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let peeled = tyref_shared_borrow_option_pointee(ty, llbc);
+    let option_ty = peeled.as_ref().unwrap_or(ty);
+    if option_nonzero_word_kind(option_ty, llbc).is_some() {
+        return None;
+    }
+    if !tyref_is_niche_option(option_ty, llbc) {
+        return None;
+    }
+    if tyref_option_payload_is_fn_ptr(option_ty, llbc) {
+        return None;
+    }
+    if niche_option_storage_raw_struct_root(option_ty, llbc, no_tombstoned_leaves()).is_some() {
+        return None;
+    }
+    if owner_root_guard::tyref_is_option_of_guard(option_ty, llbc) {
+        return None;
+    }
+    if tyref_is_u8_window(option_ty, llbc) {
+        return None;
+    }
+    let payload = crate::front::result_exc::tyref_option_payload(option_ty, llbc)?;
+    if tyref_is_gcref_spelling(&payload, llbc) || tyref_is_raw_c_void_ptr(&payload, llbc) {
+        return None;
+    }
+    let str_family = tyref_is_string_family(&payload, llbc)
+        || tyref_is_option_of_string_value(option_ty, llbc)
+        || tyref_raw_ptr_pointee_is_string_value(&payload, llbc)
+        || tyref_raw_ptr_to_str_family_spelling(&payload, llbc).is_some();
+    let gc_instance = container_declared_gc(&payload, llbc, gc_struct_ids, no_immutable_fields())
+        == Some(true)
+        || registered_gc_ptr_class_root_with(
+            &payload,
+            llbc,
+            no_tombstoned_leaves(),
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        )
+        .is_some();
+    if !str_family && !gc_instance {
+        return None;
+    }
+    Some(format!(
+        "Option<{}>",
+        niche_option_payload_inner_spelling(&payload, llbc)
+    ))
+}
+
+/// Payload spelling inside a niche-Option stamp. A shared/mut reference
+/// keeps `&` / `&mut ` so `Option<&W_X>` does not collide with a tagged
+/// by-value `Option<W_X>`. Raw pointers already keep `*mut` / `*const`.
+fn niche_option_payload_inner_spelling(payload: &TyRef, llbc: &Llbc) -> String {
+    if let Some(node) = tyref_node(payload, llbc) {
+        if let Some(pointee) = type_node_shared_ref_pointee(node, llbc) {
+            return format!("&{}", charon_type_value_to_ast_string(pointee, llbc, 0));
+        }
+        if type_node_is_mut_ref(node, llbc)
+            && let Some(pointee) = type_node_mut_ref_pointee(node, llbc)
+        {
+            return format!("&mut {}", charon_type_value_to_ast_string(pointee, llbc, 0));
+        }
+    }
+    tyref_to_ast_string(payload, llbc)
+}
+
+fn type_node_mut_ref_pointee<'l>(
+    mut node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    for _ in 0..24 {
+        let obj = node.as_object()?;
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            node = llbc.dedup_body(id)?;
+            continue;
+        }
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            node = &arr[1];
+            continue;
+        }
+        let arr = obj.get("Ref").and_then(serde_json::Value::as_array)?;
+        let kind = arr.get(2).and_then(serde_json::Value::as_str)?;
+        if kind.to_ascii_lowercase().contains("mut") {
+            return arr.get(1);
+        }
+        return None;
+    }
+    None
 }
 
 /// lltype identity of the rstr `STR` `{hash, len}` overlay

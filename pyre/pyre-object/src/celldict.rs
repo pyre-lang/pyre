@@ -1197,11 +1197,16 @@ impl ModuleDictStrategy {
     ///     cell = self.getdictvalue_no_unwrapping(w_dict, key)
     ///     return unwrap_cell(self.space, cell)
     /// ```
+    ///
+    /// A miss is `None`; `unwrap_cell` returns it unchanged. The stored
+    /// `ObjectMutableCell` may also hold a null `w_value`, which is the
+    /// same miss after unwrap.
     pub fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {
-        let raw = self.getdictvalue_no_unwrapping(w_dict, key)?;
-        // `unwrap_cell` is null-tolerant and an `ObjectMutableCell` may hold a
-        // null `w_value`; a null unwrap means the name has no live binding, so
-        // report absence rather than `Some(null)`.
+        let cell = self.getdictvalue_no_unwrapping(w_dict, key);
+        let raw = match cell {
+            Some(v) => v,
+            None => PY_NULL,
+        };
         let v = unsafe { unwrap_cell(raw) };
         if v.is_null() { None } else { Some(v) }
     }

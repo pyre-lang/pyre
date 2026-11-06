@@ -448,8 +448,8 @@ pub struct TwoPhaseSubject {
     /// `function_graph_to_flowspace_inner` `block_map`: GraphStore
     /// `BlockId` → flowspace `BlockRef`. 1:1, including the canonical
     /// return/except blocks. Phase B records the `transform_dead_code`
-    /// cut from this map's origins; GraphStore is cut only when
-    /// `dual_gate_publish_concretetypes` accepts the real annotation.
+    /// cut from this map's origins; GraphStore is cut after simplify
+    /// for every graph that is not `rtype_skipped`.
     pub block_map: HashMap<crate::model::BlockId, crate::flowspace::model::BlockRef>,
 }
 
@@ -459,7 +459,7 @@ pub struct TwoPhaseSubject {
 #[derive(Clone)]
 pub struct GraphStoreTdcCut {
     /// GraphStore `(block, exit_index)` to drop: origins of unfollowed
-    /// flowspace links whose GraphStore source `canraise()`, minus
+    /// flowspace links (`transform.py` `transform_dead_code`), minus
     /// origins that a followed copy still carries (`Link.copy` keeps
     /// `origin`; `transform_dead_code` removes only the unfollowed
     /// link objects). Several in one block: apply highest index first.
@@ -498,14 +498,13 @@ pub struct TwoPhaseTypeCache {
     /// re-running the real path. Cleared/absent ⟹ legacy per-graph behaviour.
     pub prepass_done: bool,
     /// `transform_dead_code` plans recorded before `annotator.simplify`.
-    /// Applied to the GraphStore graph only when publish accepts.
+    /// Applied after simplify to every graph that is not `rtype_skipped`.
     pub tdc_plans: HashMap<crate::model::GraphKey, SubjectTdcPlan>,
-    /// GraphStore keys whose recorded TDC plan was applied on publish Match.
+    /// GraphStore keys whose recorded TDC plan was applied after simplify.
     pub tdc_cut_applied: HashSet<crate::model::GraphKey>,
     pub tdc_cut_links_removed: usize,
-    /// Graphs whose cutoff plan had an unmapped `value_to_var` op (or
-    /// missing `cutoff_result`). A partial cut is withheld
-    /// (`cutoff_alwaysraising_block` asserts its invariants).
+    /// Unresolved cutoff count (`unresolved=`). A plan with any
+    /// unresolved cut is not recorded in `tdc_cut_applied`.
     pub tdc_cut_unresolved: usize,
 }
 

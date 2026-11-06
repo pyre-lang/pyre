@@ -4606,37 +4606,71 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `core::ptr::{const_ptr,mut_ptr}::<Impl>::is_null(p)` is
-                // upstream's null test `p is None` (`flowspace` `is_`,
-                // `binaryop.py` `is__default`, `rnone.py` `rtype_is_None` →
-                // `ptr_iszero` on a pointer lowleveltype).  Every receiver
-                // takes that operation: a GC string is a nullable
-                // `SomeString`, and routing the call as
-                // `getattr(p, "is_null")` dies on `String` (no such
-                // attribute).  The `None` operand is `Constant(None)`.
+                // `core::ptr::{const_ptr,mut_ptr}::<Impl>::is_null(p)`
+                // spelling follows the pointee's declared gckind.
+                //
+                // Raw / `llmemory.Address`-like: `eq(bool(p), Constant(False))`
+                // (`llannotation.py` `SomePtr.bool`, `rptr.py`
+                // `PtrRepr.rtype_bool` → `ptr_nonzero`, `raddress.py`
+                // `AddressRepr.rtype_bool` → `adr_ne`). Flowspace has no
+                // `not_` op; `operator.not_` is `bool` plus inversion.
+                // Routing as `getattr(p, "is_null")` dies on `String`.
+                //
+                // GC string (`is_str_family_class_root`) or GC instance
+                // (`registered_gc_ptr_class_root_with`): `is_(p, Constant(None))`
+                // (`rnone.py` `rtype_is_None` → `ptr_iszero`). `Constant(None)`
+                // is Void (`rmodel.py` `pairtype(Repr, VoidRepr).convert_from_to`).
                 if args.len() == 1 && self.is_raw_ptr_is_null(&reg) {
-                    // `Constant(None)` is Void (`rmodel.py`
-                    // `pairtype(Repr, VoidRepr).convert_from_to`). jtransform
-                    // erases the definition and folds `is_` to `ptr_iszero`.
-                    let none = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+                    let keep_is_none = self.is_raw_ptr_is_null_keeps_is_none(first_arg_ty.as_ref());
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(none.clone()),
-                        kind: OpKind::ConstNone,
-                    });
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::BinOp {
-                            op: "is_".to_string(),
-                            lhs: args[0].clone(),
-                            rhs: none,
-                            result_ty: ValueType::Int,
-                        },
-                    });
+                    if keep_is_none {
+                        let none = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(none.clone()),
+                            kind: OpKind::ConstNone,
+                        });
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: OpKind::BinOp {
+                                op: "is_".to_string(),
+                                lhs: args[0].clone(),
+                                rhs: none,
+                                result_ty: ValueType::Int,
+                            },
+                        });
+                    } else {
+                        let truth = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        let false_var = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(truth.clone()),
+                            kind: OpKind::UnaryOp {
+                                op: "bool".to_string(),
+                                operand: args[0].clone(),
+                                result_ty: ValueType::Bool,
+                            },
+                        });
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(false_var.clone()),
+                            kind: OpKind::ConstBool(false),
+                        });
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: OpKind::BinOp {
+                                op: "eq".to_string(),
+                                lhs: truth,
+                                rhs: false_var,
+                                result_ty: ValueType::Int,
+                            },
+                        });
+                    }
                     self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -9709,8 +9743,8 @@ impl<'a> Lowering<'a> {
             // the impl owner type unresolved, so the ADT table has no entry.
             // Do not invent a `CallTarget::Method` owner from the module
             // Ident — `core::ptr::{const_ptr,mut_ptr}::<Impl>::is_null` is
-            // lowered to `is_(p, Constant(None))` before this hint is
-            // consulted (`is_raw_ptr_is_null`), and every other primitive
+            // lowered by pointee gckind (`is_raw_ptr_is_null`) before this
+            // hint is consulted, and every other primitive
             // method stays on the `FunctionPath` form.
             None => return None,
         };

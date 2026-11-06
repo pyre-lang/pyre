@@ -4500,14 +4500,63 @@ impl Bookkeeper {
 
     /// Stored raw pointers (`*mut T` / `*const T`) and the `PyObjectRef`
     /// alias (`*mut pyobject::PyObject`) can be null. RPython
-    /// `SomeInstance.__init__(classdef, can_be_None=True)` (`model.py`);
-    /// `noneify` is that constructor for an Instance. Other projections
-    /// are unchanged. `&T` never reaches this helper.
-    fn nullable_raw_ptr_annotation(s: SomeValue) -> SomeValue {
+    /// `SomeInstance.__init__(classdef, can_be_None=True)` and
+    /// `SomeString.__init__(can_be_None)` (`annotator/model.py`);
+    /// `noneify` is that constructor for Instance and String.
+    /// `binaryop.py` `is__default` const-folds `is_(p, None)` to False
+    /// unless `can_be_None`. A Rust `&T` / owned `String` never reaches
+    /// this helper.
+    pub(crate) fn nullable_raw_ptr_annotation(s: SomeValue) -> SomeValue {
         match &s {
-            SomeValue::Instance(_) => s.noneify().unwrap_or(s),
+            SomeValue::Instance(_) | SomeValue::String(_) => s.noneify().unwrap_or(s),
             _ => s,
         }
+    }
+
+    /// Annotation of a niche `Option<P>` of a GC instance or str-family
+    /// pointee. A niche `Option<P>` is one word whose None is the NULL
+    /// payload. RPython `annotator/model.py`
+    /// `SomeInstance.__init__(can_be_None)` / `SomeString.noneify`;
+    /// `binaryop.py` `is__default` const-folds `is_(opt, None)` unless
+    /// `can_be_None`. Field projection already unions the payload with
+    /// `s_None`; an unregistered payload is a classdef-less instance
+    /// (or `s_str0`) then noneified. See
+    /// [`crate::front::mir::is_niche_option_gc_payload_spelling`].
+    pub(crate) fn niche_option_gc_payload_annotation(
+        bookkeeper: Option<&Rc<Self>>,
+        root: &str,
+    ) -> SomeValue {
+        let inner = majit_ir::descr::option_payload_spelling(root).unwrap_or(root);
+        let from_option = bookkeeper.map(|bk| bk.project_struct_field_type(root));
+        let from_inner = bookkeeper.map(|bk| bk.project_struct_field_type(inner));
+        let s = match from_option {
+            Some(s @ (SomeValue::Instance(_) | SomeValue::String(_))) => s,
+            _ => match from_inner {
+                Some(s @ (SomeValue::Instance(_) | SomeValue::String(_))) => s,
+                _ => {
+                    let pointee = inner
+                        .strip_prefix("*mut ")
+                        .or_else(|| inner.strip_prefix("*const "))
+                        .or_else(|| inner.strip_prefix("&mut "))
+                        .or_else(|| inner.strip_prefix('&'))
+                        .unwrap_or(inner)
+                        .trim();
+                    if crate::front::mir::is_str_family_class_root(inner)
+                        || crate::front::mir::is_str_family_class_root(pointee)
+                        || crate::front::mir::is_raw_ptr_to_str_family_spelling(inner)
+                    {
+                        super::model::s_str0()
+                    } else {
+                        SomeValue::Instance(super::model::SomeInstance::new(
+                            None,
+                            false,
+                            std::collections::BTreeMap::new(),
+                        ))
+                    }
+                }
+            },
+        };
+        Self::nullable_raw_ptr_annotation(s)
     }
 
     /// A stored tagged `Option`/`Result` is the instantiation class
@@ -8033,6 +8082,44 @@ mod tests {
     }
 
     #[test]
+    fn project_struct_field_type_raw_ptr_to_utf8str_is_nullable_somestring() {
+        let bk = bk();
+        let SomeValue::String(raw) = bk.project_struct_field_type("*mut unicodeobject::Utf8Str")
+        else {
+            panic!("*mut unicodeobject::Utf8Str must project to SomeString");
+        };
+        assert!(
+            raw.inner.can_be_none,
+            "a raw pointer to a str-family pointee can be NULL"
+        );
+        let SomeValue::String(raw_const) =
+            bk.project_struct_field_type("*const unicodeobject::Utf8Str")
+        else {
+            panic!("*const unicodeobject::Utf8Str must project to SomeString");
+        };
+        assert!(raw_const.inner.can_be_none);
+        let SomeValue::String(owned) = bk.project_struct_field_type("unicodeobject::Utf8Str")
+        else {
+            panic!("by-value Utf8Str is SomeString");
+        };
+        assert!(!owned.inner.can_be_none);
+        let SomeValue::String(borrowed) = bk.project_struct_field_type("&unicodeobject::Utf8Str")
+        else {
+            panic!("&Utf8Str is SomeString");
+        };
+        assert!(!borrowed.inner.can_be_none);
+        let SomeValue::String(raw_string) = bk.project_struct_field_type("*mut string::String")
+        else {
+            panic!("*mut string::String must project to SomeString");
+        };
+        assert!(raw_string.inner.can_be_none);
+        let SomeValue::String(owned_string) = bk.project_struct_field_type("string::String") else {
+            panic!("owned String is SomeString");
+        };
+        assert!(!owned_string.inner.can_be_none);
+    }
+
+    #[test]
     fn project_struct_field_type_lookalike_utf8str_is_not_s_str0() {
         let bk = bk();
         assert_ne!(
@@ -8404,6 +8491,26 @@ mod tests {
             ),
             other => panic!("both projections carry the HostFrame classdef, got {other:?}"),
         }
+
+        let owned_string = bk.project_struct_field_type("string::String");
+        let SomeValue::String(owned_s) = &owned_string else {
+            panic!("string::String projects to SomeString, got {owned_string:?}");
+        };
+        assert!(!owned_s.inner.can_be_none);
+        let opt_string = bk.project_struct_field_type("Option<string::String>");
+        let SomeValue::String(opt_s) = &opt_string else {
+            panic!("Option<string::String> stays a nullable string, got {opt_string:?}");
+        };
+        assert!(
+            opt_s.inner.can_be_none,
+            "Option of a str-family payload is SomeString(can_be_None=True)"
+        );
+        let via_string_union =
+            unionof([&owned_string, &s_none()]).expect("String ∪ None_ is noneify");
+        assert_eq!(
+            opt_string, via_string_union,
+            "Option<string::String> equals unionof(String, s_none)"
+        );
 
         let unregistered = bk.project_struct_field_type("UnregisteredPayload");
         let unregistered_kind = match &unregistered {

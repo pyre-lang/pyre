@@ -6939,9 +6939,49 @@ impl<'a> Lowering<'a> {
     /// for `<*const T>::is_null` / `<*mut T>::is_null`.  The impl module
     /// leaf is `const_ptr` or `mut_ptr` and the method leaf is `is_null`;
     /// the `Impl` segment sits between them.  Mutability does not change
-    /// the null test (`p is None`).
+    /// the null test.
+    ///
+    /// Spelling is chosen from the pointee's declared gckind:
+    /// - Raw (non-GC) or `llmemory.Address`-like: `eq(bool(p), Constant(False))`
+    ///   (`llannotation.py` `SomePtr.bool`, `rptr.py` `PtrRepr.rtype_bool`
+    ///   → `ptr_nonzero`, `raddress.py` `AddressRepr.rtype_bool` → `adr_ne`).
+    ///   Flowspace has no `not_` op (`from_opname("not_")` is None);
+    ///   `operator.not_` is `bool` plus inversion.
+    /// - GC string (`is_str_family_class_root`) or GC instance
+    ///   (`registered_gc_ptr_class_root_with`): `is_(p, Constant(None))`
+    ///   (`rnone.py` `rtype_is_None` → `ptr_iszero`).
     pub(in crate::front::mir) fn is_raw_ptr_is_null(&self, reg: &RegularCall) -> bool {
         self.is_raw_ptr_method(reg, "is_null")
+    }
+
+    /// Keep `is_(p, None)` when the pointee is a GC string or a registered
+    /// GC instance. Every other pointee (declared-raw ADT, Address-like,
+    /// GCREF, scalar) uses `eq(bool(p), False)`.
+    pub(in crate::front::mir) fn is_raw_ptr_is_null_keeps_is_none(
+        &self,
+        ptr_ty: Option<&TyRef>,
+    ) -> bool {
+        let Some(ty) = ptr_ty else {
+            return false;
+        };
+        if tyref_class_root_with(ty, self.llbc, self.tombstoned_leaves)
+            .is_some_and(|root| is_str_family_class_root(&root))
+        {
+            return true;
+        }
+        if container_declared_gc(ty, self.llbc, self.gc_struct_ids, self.immutable_fields)
+            == Some(false)
+        {
+            return false;
+        }
+        registered_gc_ptr_class_root_with(
+            ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )
+        .is_some()
     }
 
     /// `<*const T>::as_ref` / `<*mut T>::as_ref` / `as_mut`.

@@ -43,6 +43,16 @@ fn instance_roots_match_equates_leaf_and_qualified_spellings() {
     ));
     assert!(!instance_roots_match("a::Foo", "b::Foo"));
     assert!(!instance_roots_match("a::Foo<i64>", "b::Foo<i64>"));
+    assert!(instance_roots_match("*mut GcStorage", "GcStorage"));
+    assert!(instance_roots_match(
+        "*mut pyobject::PyObject",
+        "pyobject::PyObject"
+    ));
+    assert!(instance_roots_match("PyObjectRef", "pyobject::PyObject"));
+    assert!(instance_roots_match(
+        "*const fixture::GcStorage",
+        "GcStorage"
+    ));
 }
 
 #[test]

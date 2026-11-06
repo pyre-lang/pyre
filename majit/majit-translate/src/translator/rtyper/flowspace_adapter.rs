@@ -5487,6 +5487,52 @@ pub(crate) fn derive_subject_inputcells(
                 cells.push(bk.project_struct_field_type(root));
                 continue;
             }
+            if class_root
+                .as_deref()
+                .is_some_and(crate::front::mir::is_raw_ptr_to_str_family_spelling)
+            {
+                cells.push(
+                    crate::annotator::bookkeeper::Bookkeeper::nullable_raw_ptr_annotation(
+                        crate::annotator::model::s_str0(),
+                    ),
+                );
+                continue;
+            }
+            // `PyObjectRef` / `*mut pyobject::PyObject` is a raw pointer
+            // (`SomeInstance.__init__(can_be_None=True)`). A peeled
+            // `pyobject::PyObject` Input is a non-null instance.
+            if class_root
+                .as_deref()
+                .is_some_and(crate::front::mir::is_raw_ptr_to_classed_instance_spelling)
+            {
+                let root = class_root.as_deref().unwrap();
+                cells.push(if let Some(bk) = bookkeeper {
+                    bk.project_struct_field_type(root)
+                } else {
+                    crate::annotator::bookkeeper::Bookkeeper::nullable_raw_ptr_annotation(
+                        crate::annotator::model::SomeValue::Instance(
+                            crate::annotator::model::SomeInstance::new(
+                                None,
+                                false,
+                                std::collections::BTreeMap::new(),
+                            ),
+                        ),
+                    )
+                });
+                continue;
+            }
+            if class_root
+                .as_deref()
+                .is_some_and(crate::front::mir::is_niche_option_gc_payload_spelling)
+            {
+                let root = class_root.as_deref().unwrap();
+                cells.push(
+                    crate::annotator::bookkeeper::Bookkeeper::niche_option_gc_payload_annotation(
+                        bookkeeper, root,
+                    ),
+                );
+                continue;
+            }
             if matches!(ty, crate::model::ValueType::Ref(_)) {
                 // Rust's `gc_roots::pin_root(PyObjectRef)` parameter is the
                 // source spelling of RPython GC-transformer's opaque root
@@ -7557,6 +7603,194 @@ mod tests {
                 "{name}: str-family Input ∪ String::new() must stay SomeString, got {joined:?}"
             );
         }
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_raw_ptr_to_str_as_nullable_somestring() {
+        for (name, ty, class_root, expect_none) in [
+            (
+                "raw_utf8str",
+                ValueType::Str,
+                Some("*mut unicodeobject::Utf8Str".to_string()),
+                true,
+            ),
+            (
+                "raw_string",
+                ValueType::Ref(Some("string::String".to_string())),
+                Some("*mut string::String".to_string()),
+                true,
+            ),
+            (
+                "owned_string",
+                ValueType::Ref(Some("string::String".to_string())),
+                Some("string::String".to_string()),
+                false,
+            ),
+            ("borrowed_str", ValueType::Str, None, false),
+        ] {
+            let mut graph = LegacyGraph::new(name);
+            let entry = graph.startblock;
+            let var = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: "s".to_string(),
+                        ty,
+                        class_root,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_inputarg_var(entry, var);
+            let cells = derive_subject_inputcells(&graph, None)
+                .expect("str-family Input must project to a definite SomeValue cell");
+            assert_eq!(cells.len(), 1);
+            let SomeValue::String(s) = &cells[0] else {
+                panic!("{name}: must seed SomeString, got {:?}", cells[0]);
+            };
+            assert_eq!(
+                s.inner.can_be_none, expect_none,
+                "{name}: can_be_None={expect_none}"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_niche_option_instance_as_nullable() {
+        let mut graph = LegacyGraph::new("takes_opt_instance");
+        let entry = graph.startblock;
+        let var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "opt".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("Option<&pyobject::PyObject>".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, var);
+        let cells = derive_subject_inputcells(&graph, None)
+            .expect("niche Option of a GC instance must project");
+        assert_eq!(cells.len(), 1);
+        let SomeValue::Instance(s) = &cells[0] else {
+            panic!("must seed SomeInstance, got {:?}", cells[0]);
+        };
+        assert!(
+            s.can_be_none,
+            "niche Option of a GC instance is SomeInstance(can_be_None=True)"
+        );
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_niche_option_string_as_nullable() {
+        for (name, ty, class_root) in [
+            (
+                "opt_heap_string",
+                ValueType::Ref(Some("string::String".to_string())),
+                Some("Option<string::String>".to_string()),
+            ),
+            (
+                "opt_rstr",
+                ValueType::Str,
+                Some("Option<unicodeobject::Utf8Str>".to_string()),
+            ),
+        ] {
+            let mut graph = LegacyGraph::new(name);
+            let entry = graph.startblock;
+            let var = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: "opt".to_string(),
+                        ty,
+                        class_root,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_inputarg_var(entry, var);
+            let cells = derive_subject_inputcells(&graph, None)
+                .expect("niche Option of a GC string must project");
+            assert_eq!(cells.len(), 1);
+            let SomeValue::String(s) = &cells[0] else {
+                panic!("{name}: must seed SomeString, got {:?}", cells[0]);
+            };
+            assert!(
+                s.inner.can_be_none,
+                "{name}: niche Option of a GC string is SomeString(can_be_None=True)"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_raw_ptr_to_instance_as_nullable() {
+        for (name, class_root, expect_none) in [
+            (
+                "raw_pyobject",
+                Some("*mut pyobject::PyObject".to_string()),
+                true,
+            ),
+            ("pyobject_ref_alias", Some("PyObjectRef".to_string()), true),
+            (
+                "owned_pyobject",
+                Some("pyobject::PyObject".to_string()),
+                false,
+            ),
+        ] {
+            let mut graph = LegacyGraph::new(name);
+            let entry = graph.startblock;
+            let var = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: "obj".to_string(),
+                        ty: ValueType::Ref(None),
+                        class_root,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_inputarg_var(entry, var);
+            let cells = derive_subject_inputcells(&graph, None)
+                .expect("instance Input must project to a definite SomeValue cell");
+            assert_eq!(cells.len(), 1);
+            let crate::annotator::model::SomeValue::Instance(s) = &cells[0] else {
+                panic!("{name}: must seed SomeInstance, got {:?}", cells[0]);
+            };
+            assert_eq!(
+                s.can_be_none, expect_none,
+                "{name}: can_be_None={expect_none}"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_subject_inputcells_keeps_non_option_instance_non_none() {
+        let mut graph = LegacyGraph::new("takes_instance");
+        let entry = graph.startblock;
+        let var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "obj".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("pyobject::PyObject".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, var);
+        let cells = derive_subject_inputcells(&graph, None)
+            .expect("non-Option instance Input must project");
+        let SomeValue::Instance(s) = &cells[0] else {
+            panic!("must seed SomeInstance, got {:?}", cells[0]);
+        };
+        assert!(
+            !s.can_be_none,
+            "a peeled pyobject::PyObject Input stays can_be_None=False"
+        );
     }
 
     #[test]
@@ -10279,6 +10513,300 @@ mod tests {
         assert!(
             saw_force,
             "rtype_jit_force_quasi_immutable must dispatch on the is-None arm"
+        );
+    }
+
+    fn raw_ptr_str_is_none_graph() -> LegacyGraph {
+        let mut graph = LegacyGraph::new("raw_ptr_str_is_none");
+        let entry = graph.startblock;
+        let p = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "p".to_string(),
+                    ty: ValueType::Str,
+                    class_root: Some("*mut unicodeobject::Utf8Str".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, p.clone());
+        let none = graph.push_op_var(entry, OpKind::ConstNone, true).unwrap();
+        let is_null = graph
+            .push_op_var(
+                entry,
+                OpKind::BinOp {
+                    op: "is_".to_string(),
+                    lhs: p.clone(),
+                    rhs: none,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        let (b_null, _) = graph.create_block_with_arg_vars(0);
+        let (b_str, str_args) = graph.create_block_with_arg_vars(1);
+        graph.set_branch(entry, is_null, b_null, vec![], b_str, vec![p]);
+        let none_ret = graph.push_op_var(b_null, OpKind::ConstNone, true).unwrap();
+        graph.set_return(b_null, Some(none_ret));
+        graph.set_return(b_str, Some(str_args[0].clone()));
+        graph
+    }
+
+    /// A raw-pointer-to-str parameter reaches `is_(p, None)` and both
+    /// exits stay live (`binaryop.py` `is__default` is non-constant when
+    /// `can_be_None`).
+    #[test]
+    fn raw_ptr_to_str_param_is_none_follows_both_exits() {
+        use crate::flowspace::model::BlockKey;
+        use crate::translator::rtyper::cutover::specialize_legacy_graph_with_registry_returning_value_to_var;
+
+        let registry = empty_call_registry();
+        let graph = raw_ptr_str_is_none_graph();
+        specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
+            .expect("nullable str pointer is_(p, None) must annotate both arms");
+        let (ann, _) = registry.ensure_session().expect("session after specialize");
+        let graph_ref = ann
+            .annotated
+            .borrow()
+            .values()
+            .find_map(|g| g.clone())
+            .expect("specialized subject graph");
+        let blocks = graph_ref.borrow().iterblocks();
+        let annotated = ann.annotated.borrow();
+        let mut switch_blocks = 0usize;
+        for block in &blocks {
+            let b = block.borrow();
+            if b.exits.len() != 2 {
+                continue;
+            }
+            switch_blocks += 1;
+            for link in &b.exits {
+                let target = link
+                    .borrow()
+                    .target
+                    .clone()
+                    .expect("switch exit has a target");
+                assert!(
+                    annotated.contains_key(&BlockKey::of(&target)),
+                    "both is_(p, None) exits must be annotated"
+                );
+            }
+        }
+        assert!(
+            switch_blocks >= 1,
+            "is_(p, None) must remain a two-exit switch"
+        );
+    }
+
+    fn raw_ptr_instance_null_test_graph(use_is_none: bool) -> LegacyGraph {
+        let mut graph = LegacyGraph::new(if use_is_none {
+            "raw_ptr_instance_is_none"
+        } else {
+            "raw_ptr_instance_bool"
+        });
+        let entry = graph.startblock;
+        let p = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "obj".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("*mut pyobject::PyObject".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, p.clone());
+        let cond = if use_is_none {
+            let none = graph.push_op_var(entry, OpKind::ConstNone, true).unwrap();
+            graph
+                .push_op_var(
+                    entry,
+                    OpKind::BinOp {
+                        op: "is_".to_string(),
+                        lhs: p.clone(),
+                        rhs: none,
+                        result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .unwrap()
+        } else {
+            graph
+                .push_op_var(
+                    entry,
+                    OpKind::UnaryOp {
+                        op: "bool".to_string(),
+                        operand: p.clone(),
+                        result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .unwrap()
+        };
+        let (b_null, _) = graph.create_block_with_arg_vars(0);
+        let (b_obj, obj_args) = graph.create_block_with_arg_vars(1);
+        graph.set_branch(entry, cond, b_null, vec![], b_obj, vec![p]);
+        let none_ret = graph.push_op_var(b_null, OpKind::ConstNone, true).unwrap();
+        graph.set_return(b_null, Some(none_ret));
+        graph.set_return(b_obj, Some(obj_args[0].clone()));
+        graph
+    }
+
+    fn assert_null_test_follows_both_exits(graph: LegacyGraph, what: &str) {
+        use crate::flowspace::model::BlockKey;
+        use crate::translator::rtyper::cutover::specialize_legacy_graph_with_registry_returning_value_to_var;
+
+        let registry = empty_call_registry();
+        specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
+            .unwrap_or_else(|e| panic!("{what} must annotate both arms: {e}"));
+        let (ann, _) = registry.ensure_session().expect("session after specialize");
+        let graph_ref = ann
+            .annotated
+            .borrow()
+            .values()
+            .find_map(|g| g.clone())
+            .expect("specialized subject graph");
+        let blocks = graph_ref.borrow().iterblocks();
+        let annotated = ann.annotated.borrow();
+        let mut switch_blocks = 0usize;
+        for block in &blocks {
+            let b = block.borrow();
+            if b.exits.len() != 2 {
+                continue;
+            }
+            switch_blocks += 1;
+            for link in &b.exits {
+                let target = link
+                    .borrow()
+                    .target
+                    .clone()
+                    .expect("switch exit has a target");
+                assert!(
+                    annotated.contains_key(&BlockKey::of(&target)),
+                    "{what}: both exits must be annotated"
+                );
+            }
+        }
+        assert!(switch_blocks >= 1, "{what}: must remain a two-exit switch");
+    }
+
+    /// `obj_or_memory_error` takes `PyObjectRef` (`*mut PyObject`).
+    /// `binaryop.py` `is__default` and `unaryop.py` `SomeInstance.bool_behavior`
+    /// stay non-constant when `can_be_None`.
+    #[test]
+    fn raw_ptr_to_instance_param_null_tests_follow_both_exits() {
+        assert_null_test_follows_both_exits(
+            raw_ptr_instance_null_test_graph(true),
+            "is_(p, None) on *mut PyObject",
+        );
+        assert_null_test_follows_both_exits(
+            raw_ptr_instance_null_test_graph(false),
+            "bool(p) on *mut PyObject",
+        );
+    }
+
+    /// A NULL return on one arm and a string on the other merge as
+    /// `SomeString(can_be_None=True)` without `UnionError`.
+    #[test]
+    fn raw_ptr_to_str_null_and_string_merge_is_nullable_somestring() {
+        use crate::translator::rtyper::cutover::specialize_legacy_graph_with_registry_returning_value_to_var;
+
+        let registry = empty_call_registry();
+        let graph = raw_ptr_str_is_none_graph();
+        specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
+            .expect("str ∪ None at the return must annotate");
+        let (ann, _) = registry.ensure_session().expect("session after specialize");
+        let graph_ref = ann
+            .annotated
+            .borrow()
+            .values()
+            .find_map(|g| g.clone())
+            .expect("specialized subject graph");
+        let ret = graph_ref.borrow().getreturnvar();
+        let s = ann
+            .annotation(&ret)
+            .expect("return variable must be annotated");
+        let SomeValue::String(st) = s else {
+            panic!("str ∪ None must be SomeString, got {s:?}");
+        };
+        assert!(
+            st.inner.can_be_none,
+            "NULL ∪ string is SomeString(can_be_None=True)"
+        );
+    }
+
+    /// Product `return std::ptr::null_mut()` of `*mut Utf8Str`: the front
+    /// recasts dest-Str `null_mut` onto the str-family pointee, and the
+    /// merge with the string arm is `SomeString(can_be_None=True)`.
+    #[test]
+    fn raw_ptr_to_str_null_mut_recast_merge_is_nullable_somestring() {
+        use crate::translator::rtyper::cutover::specialize_legacy_graph_with_registry_returning_value_to_var;
+
+        let mut graph = LegacyGraph::new("raw_ptr_str_null_mut");
+        let entry = graph.startblock;
+        let p = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "p".to_string(),
+                    ty: ValueType::Str,
+                    class_root: Some("*mut unicodeobject::Utf8Str".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, p.clone());
+        let none = graph.push_op_var(entry, OpKind::ConstNone, true).unwrap();
+        let is_null = graph
+            .push_op_var(
+                entry,
+                OpKind::BinOp {
+                    op: "is_".to_string(),
+                    lhs: p.clone(),
+                    rhs: none,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        let (b_null, _) = graph.create_block_with_arg_vars(0);
+        let (b_str, str_args) = graph.create_block_with_arg_vars(1);
+        graph.set_branch(entry, is_null, b_null, vec![], b_str, vec![p]);
+        let null = graph.push_null_mut_ptr(b_null);
+        let recast = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        graph.block_mut(b_null).operations.push(SpaceOperation {
+            result: Some(recast.clone()),
+            kind: crate::model::cast_instance_call_result(
+                "unicodeobject::Utf8Str",
+                null,
+                ValueType::Str,
+            ),
+        });
+        graph.set_return(b_null, Some(recast));
+        graph.set_return(b_str, Some(str_args[0].clone()));
+
+        let registry = empty_call_registry();
+        specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
+            .expect("dest-Str null_mut recast ∪ string must annotate");
+        let (ann, _) = registry.ensure_session().expect("session after specialize");
+        let graph_ref = ann
+            .annotated
+            .borrow()
+            .values()
+            .find_map(|g| g.clone())
+            .expect("specialized subject graph");
+        let ret = graph_ref.borrow().getreturnvar();
+        let s = ann
+            .annotation(&ret)
+            .expect("return variable must be annotated");
+        let SomeValue::String(st) = s else {
+            panic!("null_mut recast ∪ string must be SomeString, got {s:?}");
+        };
+        assert!(
+            st.inner.can_be_none,
+            "null_mut recast ∪ string is SomeString(can_be_None=True)"
         );
     }
 

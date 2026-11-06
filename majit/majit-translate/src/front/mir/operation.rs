@@ -9580,7 +9580,11 @@ pub(in crate::front::mir) fn int_cast_size_and_sign(
 /// Two class-root spellings name one class when they are equal, or when one of them is the bare leaf spelling
 /// (no `::` before any generic suffix) of the other (`PyFrame` / `pyframe::PyFrame`). Two qualified spellings with
 /// the same leaf (`a::Foo` / `b::Foo`) are distinct classes (`rclass.py` `InstanceRepr.convert_from_to`).
+/// A raw-pointer Input stamp (`*mut T` / `PyObjectRef`) is the same
+/// instance class as `T`.
 fn instance_roots_match(left: &str, right: &str) -> bool {
+    let left = peel_raw_ptr_instance_root(left);
+    let right = peel_raw_ptr_instance_root(right);
     if left == right {
         return true;
     }
@@ -9589,6 +9593,17 @@ fn instance_roots_match(left: &str, right: &str) -> bool {
         return false;
     }
     majit_ir::descr::class_root_leaf(left) == majit_ir::descr::class_root_leaf(right)
+}
+
+fn peel_raw_ptr_instance_root(root: &str) -> &str {
+    let t = root.trim();
+    if t == "PyObjectRef" || t.ends_with("::PyObjectRef") {
+        return "PyObject";
+    }
+    t.strip_prefix("*const ")
+        .or_else(|| t.strip_prefix("*mut "))
+        .map(str::trim)
+        .unwrap_or(t)
 }
 
 /// The operation `jtransform.py _int_to_int_cast` rewrites an integer

@@ -8698,14 +8698,19 @@ fn exception_args_already(w_self: PyObjectRef, positional: &[PyObjectRef]) -> bo
     }
 }
 
-/// `interp_exceptions.py W_OSError._parse_init_args` + `_init_error`.
-/// A 2..=5 positional-argument call fills the `errno` / `strerror` /
-/// `filename` / `filename2` slots; when a filename is present it is
-/// dropped from `args_w` (`self.args_w = [w_errno, w_strerror]`, line
-/// 652) for pickle / repr compatibility.  `kind` is `OSError` for the base type and
+/// `interp_exceptions.py W_OSError.descr_new` allocation half:
+/// `allocate_instance(W_OSError, w_subtype)` then `W_OSError.__init__`
+/// (zero extra slots). `args_w` is stored the way `_new` writes
+/// `exc.args_w = args_w`; `_init_error` (`os_error_fill_slots`) then
+/// restamps errno / strerror / filename and may trim `args_w`.
+///
+/// `descr_new` does not format the args. A 2..=5 positional-argument
+/// call fills the slots in `_init_error`; when a filename is present it
+/// is dropped from `args_w` (`self.args_w = [w_errno, w_strerror]`) for
+/// pickle / repr compatibility. `kind` is `OSError` for the base type and
 /// `FileNotFoundError` for that dedicated kind. `cls` selects the layout
 /// kind; `stamp` is the class `allocate_instance` compares with the realbase
-/// (`W_OSError.descr_new` may already have retargeted it through `ERRNO_MAP`).
+/// (`descr_new` may already have retargeted it through `ERRNO_MAP`).
 fn os_error_build(
     kind: pyre_object::interp_exceptions::ExcKind,
     cls: Option<PyObjectRef>,
@@ -8713,11 +8718,9 @@ fn os_error_build(
     args: &[PyObjectRef],
 ) -> PyObjectRef {
     use pyre_object::interp_exceptions;
-    // Published before the first `__repr__` runs.  `args` is the stack copy
-    // the gateway built, and a minor rewrites the shadow slots rather than
-    // that copy, so an element formatted early is a pre-move address by the
-    // time the run below is stored — every element of it, since the store
-    // reads the whole slice after the last dispatch.
+    // `allocate_instance` can collect. `args` is the stack copy the gateway
+    // built, and a minor rewrites the shadow slots rather than that copy, so
+    // every element is re-read after the allocation.
     let _roots = pyre_object::gc_roots::push_roots();
     let args_base = pyre_object::gc_roots::pin_roots(args);
     let cls_slot = cls.map(|cls| {
@@ -8737,39 +8740,12 @@ fn os_error_build(
         ),
         None => kind,
     };
-    // `py_str_wtf8` / `py_repr_wtf8` collect.  `stamp` is already in a slot;
-    // a copy held across those calls is a short bracket.
-    let stamp_now = || match stamp_slot.or(cls_slot) {
+    let stamp_now = match stamp_slot.or(cls_slot) {
         Some(slot) => pyre_object::gc_roots::shadow_stack_get(slot),
         None => pyre_object::PY_NULL,
     };
     let arg = |index: usize| pyre_object::gc_roots::shadow_stack_get(args_base + index);
-    let exc = if args.len() == 1 && unsafe { pyre_object::is_str(arg(0)) } {
-        let w = unsafe { pyre_object::w_str_get_wtf8(arg(0)) };
-        interp_exceptions::w_exception_new_wtf8_for_class(kind, w, stamp_now())
-    } else {
-        let msg: rustpython_wtf8::Wtf8Buf = if args.is_empty() {
-            rustpython_wtf8::Wtf8Buf::new()
-        } else if args.len() == 1 {
-            // exception construction is non-raising machinery, per the F7
-            // display policy; a raising __str__/__repr__ on the args degrades
-            // to the empty string rather than propagating.
-            unsafe { crate::display::py_str_wtf8(arg(0)) }.unwrap_or_default()
-        } else {
-            let mut parts = rustpython_wtf8::Wtf8Buf::from_string("(".to_string());
-            for index in 0..args.len() {
-                if index > 0 {
-                    parts.push_str(", ");
-                }
-                parts.push_wtf8(
-                    &unsafe { crate::display::py_repr_wtf8(arg(index)) }.unwrap_or_default(),
-                );
-            }
-            parts.push_str(")");
-            parts
-        };
-        interp_exceptions::w_exception_new_wtf8_for_class(kind, &msg, stamp_now())
-    };
+    let exc = interp_exceptions::w_exception_new_empty_for_class(kind, stamp_now);
     // Seed `args_w` so a deferred-init instance (`_use_init`, no `__new__`
     // slot fill) still reports the empty tuple until `__init__` runs.
     // The instance is a nursery object (`alloc_exception_nursery`), and
@@ -10249,7 +10225,7 @@ fn os_error_family_construct(
     // When `_use_init`, `__new__` allocates without parsing the args — the
     // errno/strerror/filename slots and `args_w` stay unset for `__init__` to
     // fill.  Otherwise `__new__` parses them itself.
-    // `ctor` formats the message, which runs every argument's `__repr__`, and
+    // `ctor` is `allocate_instance` plus `exc.args_w = args_w` (`descr_new`);
     // both readers below consult the arguments again afterwards.  `unpack`
     // cloned `args_w`; a minor rewrites shadow slots rather than that Vec,
     // so the operands are taken off the root stack once the Python is done.

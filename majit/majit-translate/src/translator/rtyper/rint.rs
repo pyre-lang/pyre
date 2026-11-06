@@ -2763,7 +2763,7 @@ mod tests {
                 })
             })
         }
-        fn assert_somestring(got: &SomeValue, site: &str) {
+        fn assert_somestring(got: &SomeValue, site: &str, raw_ptr: bool) {
             let SomeValue::String(s) = got else {
                 panic!("{site} is not SomeString: {got:?}");
             };
@@ -2771,11 +2771,16 @@ mod tests {
                 s.inner.base.knowntype,
                 crate::annotator::model::KnownType::Str
             );
-            assert!(!s.inner.can_be_none, "{site} STR word is not nullable");
-            assert!(
-                !s.inner.no_nul,
-                "{site} comes from ValueType::Str, not s_str0"
-            );
+            // A `*mut Utf8Str` argument is `SomeString.noneify()`
+            // (`annotator/model.py`); `&StrPtrKey` / the by-value
+            // newtype stay non-null.
+            assert_eq!(s.inner.can_be_none, raw_ptr, "{site} can_be_none={raw_ptr}");
+            if !raw_ptr {
+                assert!(
+                    !s.inner.no_nul,
+                    "{site} comes from ValueType::Str, not s_str0"
+                );
+            }
             union(got, &s_str0())
                 .unwrap_or_else(|err| panic!("{site} must union with s_str0: {err}"));
         }
@@ -2804,8 +2809,8 @@ mod tests {
         );
         assert!(matches!(input_ty(&wrap_g), ValueType::Str));
         let (wrap_in, wrap_out) = annotated_return(&wrap_g);
-        assert_somestring(&wrap_in, "wrap input");
-        assert_somestring(&wrap_out, "wrap result");
+        assert_somestring(&wrap_in, "wrap input", true);
+        assert_somestring(&wrap_out, "wrap result", true);
 
         let read_g = crate::front::mir::lower_function(&llbc, "read_str_ptr").expect("lower read");
         assert!(
@@ -2816,8 +2821,8 @@ mod tests {
             read_g.dump()
         );
         let (read_in, read_out) = annotated_return(&read_g);
-        assert_somestring(&read_in, "field receiver");
-        assert_somestring(&read_out, "field read");
+        assert_somestring(&read_in, "field receiver", false);
+        assert_somestring(&read_out, "field read", false);
 
         let recv_g = crate::front::mir::lower_function(&llbc, "recv_str_ptr").expect("lower recv");
         assert!(
@@ -2826,8 +2831,8 @@ mod tests {
             recv_g.dump()
         );
         let (recv_in, recv_out) = annotated_return(&recv_g);
-        assert_somestring(&recv_in, "method receiver");
-        assert_somestring(&recv_out, "method result");
+        assert_somestring(&recv_in, "method receiver", false);
+        assert_somestring(&recv_out, "method result", false);
 
         let obj_g = crate::front::mir::lower_function(&llbc, "wrap_obj_ptr").expect("lower obj");
         let constructs_obj_key = obj_g.blocks.iter().any(|block| {

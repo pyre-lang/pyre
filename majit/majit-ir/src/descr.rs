@@ -1050,18 +1050,23 @@ pub fn is_fn_ptr_spelling(spelling: &str) -> bool {
     t.starts_with("fn(") || t.starts_with("fn ")
 }
 
+/// Payload of `Option<P>` / `option::Option<P>` / `Option<P>::Some`.
+/// The first balanced `<…>` is the payload; a `->` inside it is not a
+/// generic closer. `None` when the leaf is not an `Option<…>` spelling.
+pub fn option_payload_spelling(spelling: &str) -> Option<&str> {
+    let leaf = class_root_leaf(spelling.trim());
+    if !leaf.starts_with("Option<") {
+        return None;
+    }
+    let span = generic_args_span(leaf)?;
+    Some(span[1..span.len() - 1].trim())
+}
+
 /// `Option<fn(...)>` / `option::Option<fn(...) -> Result<...>>` (and the
 /// `::Some` variant of that instantiation). The first balanced `<…>` is
 /// the payload; a `->` inside it is not a generic closer.
 pub fn is_option_of_fn_ptr_spelling(spelling: &str) -> bool {
-    let t = spelling.trim();
-    if !t.contains("Option<") {
-        return false;
-    }
-    let Some(span) = generic_args_span(t) else {
-        return false;
-    };
-    is_fn_ptr_spelling(&span[1..span.len() - 1])
+    option_payload_spelling(spelling).is_some_and(is_fn_ptr_spelling)
 }
 
 /// `Option<&[u8]>` / Charon `Option<[u8]>` / `Option<Slice<u8>>`: a
@@ -11378,6 +11383,21 @@ mod tests {
             "option::Option<fn(*mut PyObject) -> Result<*mut PyObject,PyError>>::Some"
         ));
         assert!(!is_option_of_fn_ptr_spelling("option::Option<i64>::Some"));
+        assert_eq!(
+            option_payload_spelling("Option<pyobject::PyObject>"),
+            Some("pyobject::PyObject")
+        );
+        assert_eq!(
+            option_payload_spelling("option::Option<string::String>"),
+            Some("string::String")
+        );
+        assert_eq!(
+            option_payload_spelling(
+                "option::Option<fn(*mut PyObject) -> Result<*mut PyObject,PyError>>::Some"
+            ),
+            Some("fn(*mut PyObject) -> Result<*mut PyObject,PyError>")
+        );
+        assert_eq!(option_payload_spelling("string::String"), None);
         assert!(is_option_of_u8_window_spelling("Option<&[u8]>"));
         assert!(is_option_of_u8_window_spelling("Option<[u8]>"));
         assert!(is_option_of_u8_window_spelling("Option<Slice<u8>>"));

@@ -5160,6 +5160,32 @@ mod tests {
     }
 
     #[test]
+    fn cast_instance_intrinsic_utf8str_root_projects_nullable_instance_to_nullable_somestring() {
+        // dest-Str `null_mut` is a classdef-less nullable `SomeInstance`
+        // (`ptr_null_constant`). Recast onto a Utf8Str root is
+        // `SomeString(can_be_None=True)` (`cast_opaque_ptr` of nullptr).
+        let bk = bk();
+        let s_null = SomeValue::Instance(SomeInstance::new(None, true, Default::default()));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("unicodeobject::Utf8Str"))
+            .expect("Utf8Str root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_null), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("nullable Instance recast onto Utf8Str");
+        let SomeValue::String(s) = out else {
+            panic!("dest-Str null_mut recast is SomeString, got {out:?}");
+        };
+        assert!(
+            s.inner.can_be_none,
+            "null_mut recast onto Utf8Str is SomeString(can_be_None=True)"
+        );
+    }
+
+    #[test]
     fn cast_instance_intrinsic_lowlevel_string_header_root_projects_somestring() {
         // Dest-Str restore of the `{hash, len}` overlay: GCREF recast
         // onto that root is `SomeString` (`op_gc_restore_root` /

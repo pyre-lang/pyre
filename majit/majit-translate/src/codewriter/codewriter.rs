@@ -435,15 +435,6 @@ impl CodeWriter {
                     "match-real-rtyper (ACCEPT, not a decline)",
                     &graph.name,
                 );
-                // The cut is a consequence of this published annotation
-                // (`transform.py` `transform_dead_code`). The comparer
-                // above ran on the uncut GraphStore; apply only now.
-                let registry = self.dual_gate_registry(callcontrol);
-                crate::translator::rtyper::cutover::apply_tdc_cut_on_publish_accept(
-                    &registry,
-                    callcontrol.function_graphs(),
-                    path,
-                );
                 // Commit each real-rtyper Variable's `concretetype`
                 // (LowLevelType) onto its placeholder on the graph's
                 // value table.  Mirrors RPython `rtyper.py setconcretetype v.concretetype = ...`

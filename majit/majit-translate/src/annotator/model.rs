@@ -5659,6 +5659,18 @@ mod tests {
     }
 
     #[test]
+    fn union_none_and_string_makes_string_nullable() {
+        let s = s_str0();
+        let none = SomeValue::None_(SomeNone::new());
+        let u = union(&none, &s).expect("SomeString ∪ None_ is noneify, not UnionError");
+        let SomeValue::String(merged) = u else {
+            panic!("expected SomeString, got {u:?}");
+        };
+        assert!(merged.inner.can_be_none);
+        assert!(merged.inner.no_nul);
+    }
+
+    #[test]
     fn union_same_classdef_instances_keeps_only_matching_flags() {
         let mut flags_a = std::collections::BTreeMap::new();
         flags_a.insert("immutable".to_string(), true);
