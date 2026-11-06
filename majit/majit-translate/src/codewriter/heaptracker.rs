@@ -217,8 +217,7 @@ pub fn all_interiorfielddescrs(
     let array_type_id = array_type_id_of_lltype(array);
     let elem_name = match &array.OF {
         LowLevelType::Struct(s) => s._name.clone(),
-        _ => extract_element_type_from_str(&array_type_id)
-            .unwrap_or_else(|| array_type_id.clone()),
+        _ => extract_element_type_from_str(&array_type_id).unwrap_or_else(|| array_type_id.clone()),
     };
     if let Some(layout) = gccache.struct_layout_for(&elem_name) {
         for field in &layout.fields {
@@ -288,12 +287,9 @@ pub fn all_interiorfielddescrs(
         let idx = gccache
             .descr_indices
             .interiorfield_index(intern_id, &row.name);
-        if let Some(descr) = gccache.interiorfielddescrof_with_array(
-            idx,
-            &spelling,
-            &Some(array.clone()),
-            &row.name,
-        ) {
+        if let Some(descr) =
+            gccache.interiorfielddescrof_with_array(idx, &spelling, &Some(array.clone()), &row.name)
+        {
             res.push(descr);
         }
     }

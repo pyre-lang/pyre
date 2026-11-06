@@ -947,7 +947,9 @@ impl<'a> Lowering<'a> {
                         value: value.clone(),
                         item_ty,
                         array_type_id: Some(array_type_id.clone()),
-                        array: crate::codewriter::call::array_lltype_for_op_spelling(&array_type_id),
+                        array: crate::codewriter::call::array_lltype_for_op_spelling(
+                            &array_type_id,
+                        ),
                         nolength: crate::front::typestr::nolength_from_array_type_id(Some(
                             array_type_id.as_str(),
                         )),
@@ -7103,7 +7105,9 @@ impl<'a> Lowering<'a> {
                             index,
                             item_ty,
                             array_type_id: Some(array_type_id.clone()),
-                            array: crate::codewriter::call::array_lltype_for_op_spelling(&array_type_id),
+                            array: crate::codewriter::call::array_lltype_for_op_spelling(
+                                &array_type_id,
+                            ),
                             nolength: crate::front::typestr::nolength_from_array_type_id(Some(
                                 array_type_id.as_str(),
                             )),
@@ -7141,7 +7145,9 @@ impl<'a> Lowering<'a> {
                             index,
                             item_ty: ValueType::Ref(None),
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
-                            array: crate::codewriter::call::array_lltype_for_op_spelling(OBJECT_REF_GCARRAY_TYPE_ID),
+                            array: crate::codewriter::call::array_lltype_for_op_spelling(
+                                OBJECT_REF_GCARRAY_TYPE_ID,
+                            ),
                             nolength: false,
                             gckind: crate::model::ArrayGcKind::Gc,
                             pure: false,

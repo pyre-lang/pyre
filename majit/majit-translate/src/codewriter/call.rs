@@ -4043,9 +4043,8 @@ pub struct CallControl {
     /// that runtime hash but mint a fresh Arc.
     array_descr_path_hash_owner: std::cell::RefCell<rustc_hash::FxHashMap<u64, u64>>,
     /// Interior-field descrs keyed by `(ARRAY id, field name)`.
-    interiorfield_descrs: std::cell::RefCell<
-        rustc_hash::FxHashMap<(u64, String), majit_ir::descr::DescrRef>,
-    >,
+    interiorfield_descrs:
+        std::cell::RefCell<rustc_hash::FxHashMap<(u64, String), majit_ir::descr::DescrRef>>,
 
     /// The effect analyzers' `_analyzed_calls` results. `call.py`
     /// builds `raise_analyzer`, `virtualizable_analyzer`,
@@ -5343,14 +5342,8 @@ impl CallControl {
         Option<majit_ir::effectinfo::DescrSetMember>,
     ) {
         let spelling = Some(array_type_id_of_lltype(array));
-        let (descr, key) = self.arraydescrof_concrete(
-            idx,
-            &spelling,
-            Some(array),
-            ir_type,
-            len_offset,
-            Some(idx),
-        );
+        let (descr, key) =
+            self.arraydescrof_concrete(idx, &spelling, Some(array), ir_type, len_offset, Some(idx));
         (descr as majit_ir::descr::DescrRef, key)
     }
 
@@ -5380,13 +5373,12 @@ impl CallControl {
         std::sync::Arc<dyn majit_ir::descr::ArrayDescr>,
         Option<majit_ir::effectinfo::DescrSetMember>,
     ) {
-        let intern_id = if array.is_some()
-            || array_type_id.as_deref().is_some_and(|s| !s.is_empty())
-        {
-            Some(self.intern_array_or_spelling(&array.cloned(), array_type_id))
-        } else {
-            None
-        };
+        let intern_id =
+            if array.is_some() || array_type_id.as_deref().is_some_and(|s| !s.is_empty()) {
+                Some(self.intern_array_or_spelling(&array.cloned(), array_type_id))
+            } else {
+                None
+            };
         if let Some(id) = intern_id
             && let Some(cached) = self.array_descrs.borrow().get(&id).cloned()
         {
@@ -5604,8 +5596,7 @@ impl CallControl {
                         ad.is_pure = is_pure;
                         ad.concrete_type = concrete_type;
                         ad.set_cache_key(path_hash_u64);
-                        std::sync::Arc::new(ad)
-                            as std::sync::Arc<dyn majit_ir::descr::ArrayDescr>
+                        std::sync::Arc::new(ad) as std::sync::Arc<dyn majit_ir::descr::ArrayDescr>
                     }
                 };
                 // descr.py get_array_descr assigns interiors then
@@ -5685,9 +5676,7 @@ impl CallControl {
             }
         };
         if let Some(id) = intern_id {
-            self.array_descrs
-                .borrow_mut()
-                .insert(id, ad_arc.clone());
+            self.array_descrs.borrow_mut().insert(id, ad_arc.clone());
         }
         // Per-trace codewriter id stamp — analyzer's
         // `descr_indices.array_index` identifies this descr in BhDescr
@@ -6514,15 +6503,13 @@ impl CallControl {
                         }),
                     },
                 );
-                let descr_from_gc = majit_ir::descr::gc_cache()
-                    .lock()
-                    .get_interiorfield_descr(
-                        array_key,
-                        field_name.to_string(),
-                        String::new(),
-                        array_descr.clone(),
-                        field_descr.clone(),
-                    );
+                let descr_from_gc = majit_ir::descr::gc_cache().lock().get_interiorfield_descr(
+                    array_key,
+                    field_name.to_string(),
+                    String::new(),
+                    array_descr.clone(),
+                    field_descr.clone(),
+                );
                 let already = self
                     .interiorfield_descrs
                     .borrow()
@@ -13084,7 +13071,13 @@ impl CallControl {
                         RwTag::InteriorField
                     };
                     ReadWriteEffects::singleton(
-                        self.rw_interiorfield_key(tag, arr, &offset.fldname, consider, field_is_void),
+                        self.rw_interiorfield_key(
+                            tag,
+                            arr,
+                            &offset.fldname,
+                            consider,
+                            field_is_void,
+                        ),
                         RwOperand::InteriorField {
                             array: Some(arr.clone()),
                             field_name: offset.fldname.clone(),
@@ -15689,9 +15682,7 @@ fn internable_array_for_spelling(
     })
 }
 
-fn unique_dump_array(
-    tail: &str,
-) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+fn unique_dump_array(tail: &str) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
     use crate::flowspace::model::ConstValue;
     use crate::translator::rtyper::lltypesystem::lltype::Array;
     use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
@@ -15758,9 +15749,8 @@ pub(crate) fn array_from_concretetype(
 pub(crate) fn array_type_id_of_lltype(
     arr: &crate::translator::rtyper::lltypesystem::lltype::Array,
 ) -> String {
-    try_array_type_id_of_lltype(arr).unwrap_or_else(|| {
-        panic!("array_type_id_of_lltype: unsupported ARRAY.OF {:?}", arr.OF)
-    })
+    try_array_type_id_of_lltype(arr)
+        .unwrap_or_else(|| panic!("array_type_id_of_lltype: unsupported ARRAY.OF {:?}", arr.OF))
 }
 
 fn try_array_type_id_of_lltype(
@@ -17054,16 +17044,10 @@ mod tests {
         use crate::translator::rtyper::lltypesystem::rffi;
         let cc = CallControl::new();
         let a_t = Array::gc(LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Struct(Struct::gc(
-                "T",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::gc("T", vec![("x".into(), LowLevelType::Signed)])),
         })));
         let a_u = Array::gc(LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Struct(Struct::gc(
-                "U",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::gc("U", vec![("x".into(), LowLevelType::Signed)])),
         })));
         assert_ne!(cc.intern_array(&a_t), cc.intern_array(&a_u));
 
@@ -17185,16 +17169,10 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&da, &da2));
 
         let t = Array::gc(LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Struct(Struct::gc(
-                "T",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::gc("T", vec![("x".into(), LowLevelType::Signed)])),
         })));
         let u = Array::gc(LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Struct(Struct::gc(
-                "U",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::gc("U", vec![("x".into(), LowLevelType::Signed)])),
         })));
         let dt = cc.arraydescrof_array(&t);
         let du = cc.arraydescrof_array(&u);
@@ -17213,20 +17191,17 @@ mod tests {
         use crate::translator::rtyper::lltypesystem::rffi;
         let cc = CallControl::new();
         let a_t = Array::gc(LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Struct(Struct::gc(
-                "T",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::gc("T", vec![("x".into(), LowLevelType::Signed)])),
         })));
         let a_u = Array::gc(LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Struct(Struct::gc(
-                "U",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::gc("U", vec![("x".into(), LowLevelType::Signed)])),
         })));
         let ia = cc.intern_array(&a_t);
         let ib = cc.intern_array(&a_u);
-        assert_ne!(cc.descr_indices.array_index(ia), cc.descr_indices.array_index(ib));
+        assert_ne!(
+            cc.descr_indices.array_index(ia),
+            cc.descr_indices.array_index(ib)
+        );
 
         fn raw_struct_ptr(name: &str) -> LowLevelType {
             LowLevelType::Ptr(Box::new(Ptr {
@@ -17239,9 +17214,18 @@ mod tests {
         let i_ba = cc.intern_array(&b_a);
         let i_bb = cc.intern_array(&b_b);
         let i_bc = cc.intern_array(&b_c);
-        assert_ne!(cc.descr_indices.array_index(i_ba), cc.descr_indices.array_index(i_bb));
-        assert_ne!(cc.descr_indices.array_index(i_ba), cc.descr_indices.array_index(i_bc));
-        assert_ne!(cc.descr_indices.array_index(i_bb), cc.descr_indices.array_index(i_bc));
+        assert_ne!(
+            cc.descr_indices.array_index(i_ba),
+            cc.descr_indices.array_index(i_bb)
+        );
+        assert_ne!(
+            cc.descr_indices.array_index(i_ba),
+            cc.descr_indices.array_index(i_bc)
+        );
+        assert_ne!(
+            cc.descr_indices.array_index(i_bb),
+            cc.descr_indices.array_index(i_bc)
+        );
 
         let c_signed = Array::gc(LowLevelType::Struct(Box::new(Struct::new(
             "x",
@@ -17274,10 +17258,9 @@ mod tests {
         let mut cc = CallControl::new();
         cc.set_known_struct_names(["x".to_string()].into_iter().collect());
         let mut registry = crate::front::StructFieldRegistry::default();
-        registry.fields.insert(
-            "x".to_string(),
-            vec![("v".to_string(), "i64".to_string())],
-        );
+        registry
+            .fields
+            .insert("x".to_string(), vec![("v".to_string(), "i64".to_string())]);
         cc.set_struct_fields(registry);
         let signed = Array::gc(LowLevelType::Struct(Box::new(Struct::new(
             "x",
@@ -22085,7 +22068,9 @@ mod tests {
         cc.set_struct_layout(sid, layout);
 
         let arr = {
-            use crate::translator::rtyper::lltypesystem::lltype::{Array, GCREF, LowLevelType, Struct};
+            use crate::translator::rtyper::lltypesystem::lltype::{
+                Array, GCREF, LowLevelType, Struct,
+            };
             Array::gc(LowLevelType::Struct(Box::new(Struct::new(
                 elem,
                 vec![
@@ -23507,9 +23492,9 @@ mod tests {
             assert_eq!(slice_ei, list_ei, "{slice_id} vs {list_id}");
             assert_eq!(slice_descr.get_ei_index(), slice_ei);
         }
-        let i64_ei = cc.descr_indices.array_index(
-            cc.intern_array_or_spelling(&None, &Some("[i64]".to_string())),
-        );
+        let i64_ei = cc
+            .descr_indices
+            .array_index(cc.intern_array_or_spelling(&None, &Some("[i64]".to_string())));
         let u32_ei = cc.descr_indices.array_index(cc.intern_array(
             &crate::translator::rtyper::lltypesystem::lltype::Array::gc(
                 crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Unsigned,
@@ -29587,9 +29572,7 @@ mod tests {
                 other => panic!("interiorfield operand, got {other:?}"),
             })
             .expect("FieldOffset interiorfield effect");
-        let extra_index = cc
-            .descr_indices
-            .array_index(cc.intern_array(&ifield_array));
+        let extra_index = cc.descr_indices.array_index(cc.intern_array(&ifield_array));
         assert_eq!(
             items_key.index, extra_index,
             "ArrayItemsOffset index vs extraef array_index"
@@ -29942,10 +29925,7 @@ mod tests {
             Array, LowLevelType, Ptr, PtrTarget, Struct,
         };
         Array::gc(LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Struct(Struct::gc(
-                name,
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::gc(name, vec![("x".into(), LowLevelType::Signed)])),
         })))
     }
 
@@ -30011,11 +29991,21 @@ mod tests {
         let mut cc = CallControl::new();
         let arr_t = collision_a_array("T");
         let arr_u = collision_a_array("U");
-        let ei_t = effectinfo_of_graph(&mut cc, "write_t", array_write_graph("write_t", arr_t.clone()));
+        let ei_t = effectinfo_of_graph(
+            &mut cc,
+            "write_t",
+            array_write_graph("write_t", arr_t.clone()),
+        );
         let ei_u = effectinfo_of_graph(&mut cc, "write_u", array_write_graph("write_u", arr_u));
         let ei_t2 = effectinfo_of_graph(&mut cc, "write_t2", array_write_graph("write_t2", arr_t));
-        let wt = ei_t._write_descrs_arrays.as_ref().expect("T writes an array");
-        let wu = ei_u._write_descrs_arrays.as_ref().expect("U writes an array");
+        let wt = ei_t
+            ._write_descrs_arrays
+            .as_ref()
+            .expect("T writes an array");
+        let wu = ei_u
+            ._write_descrs_arrays
+            .as_ref()
+            .expect("U writes an array");
         let wt2 = ei_t2
             ._write_descrs_arrays
             .as_ref()
@@ -30078,10 +30068,9 @@ mod tests {
         let mut cc = CallControl::new();
         cc.set_known_struct_names(["x".to_string()].into_iter().collect());
         let mut registry = crate::front::StructFieldRegistry::default();
-        registry.fields.insert(
-            "x".to_string(),
-            vec![("v".to_string(), "i64".to_string())],
-        );
+        registry
+            .fields
+            .insert("x".to_string(), vec![("v".to_string(), "i64".to_string())]);
         cc.set_struct_fields(registry);
         let signed = interior_struct_array(LowLevelType::Signed);
         let float = interior_struct_array(LowLevelType::Float);

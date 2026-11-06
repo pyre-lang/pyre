@@ -606,7 +606,11 @@ mod tests {
             .iter()
             .flat_map(|blk| &blk.operations)
             .filter_map(|op| match &op.kind {
-                OpKind::ArrayRead { array_type_id, array: _, .. } => Some(array_type_id.clone()),
+                OpKind::ArrayRead {
+                    array_type_id,
+                    array: _,
+                    ..
+                } => Some(array_type_id.clone()),
                 _ => None,
             })
             .collect();
@@ -722,7 +726,11 @@ mod tests {
             .iter()
             .flat_map(|blk| &blk.operations)
             .filter_map(|op| match &op.kind {
-                OpKind::ArrayRead { array_type_id, array: _, .. } => Some(array_type_id.clone()),
+                OpKind::ArrayRead {
+                    array_type_id,
+                    array: _,
+                    ..
+                } => Some(array_type_id.clone()),
                 _ => None,
             })
             .collect();

@@ -945,8 +945,8 @@ fn dict_lookup_entry_array(
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
     use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Struct};
     let id = dict_lookup_entry_array_id(cc)?;
-    let name = crate::codewriter::call::extract_element_type_from_str(&id)
-        .unwrap_or_else(|| id.clone());
+    let name =
+        crate::codewriter::call::extract_element_type_from_str(&id).unwrap_or_else(|| id.clone());
     Some(Array::gc(LowLevelType::Struct(Box::new(Struct::new(
         &name,
         vec![],
@@ -9135,7 +9135,9 @@ impl<'a> Transformer<'a> {
                 kind: OpKind::ArrayLen {
                     base: base.clone(),
                     array_type_id: Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
-                    array: crate::codewriter::call::array_lltype_for_op_spelling(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+                    array: crate::codewriter::call::array_lltype_for_op_spelling(
+                        crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID,
+                    ),
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                 },
@@ -10745,14 +10747,18 @@ impl<'a> Transformer<'a> {
                         length: length.clone(),
                         item_ty,
                         array_type_id: Some(array_type_id.clone()),
-                        array: crate::codewriter::call::array_lltype_for_op_spelling(&array_type_id),
+                        array: crate::codewriter::call::array_lltype_for_op_spelling(
+                            &array_type_id,
+                        ),
                     }
                 } else {
                     OpKind::NewArray {
                         length: length.clone(),
                         item_ty,
                         array_type_id: Some(array_type_id.clone()),
-                        array: crate::codewriter::call::array_lltype_for_op_spelling(&array_type_id),
+                        array: crate::codewriter::call::array_lltype_for_op_spelling(
+                            &array_type_id,
+                        ),
                     }
                 };
                 return RewriteResult::Replace(vec![
@@ -12579,7 +12585,9 @@ impl<'a> Transformer<'a> {
                                 index,
                                 item_ty: ValueType::Int,
                                 array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
-                                array: crate::codewriter::call::array_lltype_for_op_spelling(LIST_INT_ITEMS_ARRAY),
+                                array: crate::codewriter::call::array_lltype_for_op_spelling(
+                                    LIST_INT_ITEMS_ARRAY,
+                                ),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                                 pure: false,
@@ -12623,7 +12631,9 @@ impl<'a> Transformer<'a> {
                                 index,
                                 item_ty: ValueType::Int,
                                 array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
-                                array: crate::codewriter::call::array_lltype_for_op_spelling(LIST_INT_ITEMS_ARRAY),
+                                array: crate::codewriter::call::array_lltype_for_op_spelling(
+                                    LIST_INT_ITEMS_ARRAY,
+                                ),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                                 pure: true,
@@ -12660,7 +12670,9 @@ impl<'a> Transformer<'a> {
                                 value: crate::model::LinkArg::Value(value),
                                 item_ty: ValueType::Int,
                                 array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
-                                array: crate::codewriter::call::array_lltype_for_op_spelling(LIST_INT_ITEMS_ARRAY),
+                                array: crate::codewriter::call::array_lltype_for_op_spelling(
+                                    LIST_INT_ITEMS_ARRAY,
+                                ),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                             },
@@ -12703,7 +12715,9 @@ impl<'a> Transformer<'a> {
                             kind: OpKind::ArrayLen {
                                 base: block,
                                 array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
-                                array: crate::codewriter::call::array_lltype_for_op_spelling(LIST_INT_ITEMS_ARRAY),
+                                array: crate::codewriter::call::array_lltype_for_op_spelling(
+                                    LIST_INT_ITEMS_ARRAY,
+                                ),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                             },
@@ -12797,7 +12811,9 @@ impl<'a> Transformer<'a> {
                                 index,
                                 item_ty: ValueType::Float,
                                 array_type_id: Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
-                                array: crate::codewriter::call::array_lltype_for_op_spelling(LIST_FLOAT_ITEMS_ARRAY),
+                                array: crate::codewriter::call::array_lltype_for_op_spelling(
+                                    LIST_FLOAT_ITEMS_ARRAY,
+                                ),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                                 pure: false,
@@ -12834,7 +12850,9 @@ impl<'a> Transformer<'a> {
                                 value: crate::model::LinkArg::Value(value),
                                 item_ty: ValueType::Float,
                                 array_type_id: Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
-                                array: crate::codewriter::call::array_lltype_for_op_spelling(LIST_FLOAT_ITEMS_ARRAY),
+                                array: crate::codewriter::call::array_lltype_for_op_spelling(
+                                    LIST_FLOAT_ITEMS_ARRAY,
+                                ),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                             },
@@ -12869,7 +12887,9 @@ impl<'a> Transformer<'a> {
                             kind: OpKind::ArrayLen {
                                 base: block,
                                 array_type_id: Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
-                                array: crate::codewriter::call::array_lltype_for_op_spelling(LIST_FLOAT_ITEMS_ARRAY),
+                                array: crate::codewriter::call::array_lltype_for_op_spelling(
+                                    LIST_FLOAT_ITEMS_ARRAY,
+                                ),
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                             },
@@ -13026,19 +13046,19 @@ impl<'a> Transformer<'a> {
                             array,
                         } => {
                             let array = array.or_else(|| {
-                                array_type_id.as_deref().and_then(
-                                    crate::codewriter::call::array_lltype_for_op_spelling,
-                                )
+                                array_type_id
+                                    .as_deref()
+                                    .and_then(crate::codewriter::call::array_lltype_for_op_spelling)
                             });
                             (
-                            "newlist_clear → newlist_clear(count, arraydescr) \
+                                "newlist_clear → newlist_clear(count, arraydescr) \
                          [resized list header]",
-                            OpKind::NewListClear {
-                                length,
-                                item_ty,
-                                array_type_id,
-                                array,
-                            },
+                                OpKind::NewListClear {
+                                    length,
+                                    item_ty,
+                                    array_type_id,
+                                    array,
+                                },
                             )
                         }
                         NewlistClearShape::Fixed {
@@ -13047,19 +13067,19 @@ impl<'a> Transformer<'a> {
                             array,
                         } => {
                             let array = array.or_else(|| {
-                                array_type_id.as_deref().and_then(
-                                    crate::codewriter::call::array_lltype_for_op_spelling,
-                                )
+                                array_type_id
+                                    .as_deref()
+                                    .and_then(crate::codewriter::call::array_lltype_for_op_spelling)
                             });
                             (
-                            "newlist_clear → new_array_clear(count, arraydescr) \
+                                "newlist_clear → new_array_clear(count, arraydescr) \
                          [fixed array]",
-                            OpKind::NewArrayClear {
-                                length,
-                                item_ty,
-                                array_type_id,
-                                array,
-                            },
+                                OpKind::NewArrayClear {
+                                    length,
+                                    item_ty,
+                                    array_type_id,
+                                    array,
+                                },
                             )
                         }
                         // OBJECTPTR / None fallback: a generic `OBJECTPTR`
@@ -13120,9 +13140,9 @@ impl<'a> Transformer<'a> {
                         let (item_ty, array_type_id) =
                             arraydescr_of_fixed_array(item_ty, array_type_id);
                         let array = array.or_else(|| {
-                            array_type_id.as_deref().and_then(
-                                crate::codewriter::call::array_lltype_for_op_spelling,
-                            )
+                            array_type_id
+                                .as_deref()
+                                .and_then(crate::codewriter::call::array_lltype_for_op_spelling)
                         });
                         if matches!(item_ty, ValueType::Ref(_)) {
                             (
@@ -18090,7 +18110,8 @@ fn newlist_clear_shape(
                 array,
             };
         }
-        if let Some((item_ty, array_type_id, array)) = typed_items_array_shape(&dummy, callcontrol) {
+        if let Some((item_ty, array_type_id, array)) = typed_items_array_shape(&dummy, callcontrol)
+        {
             return NewlistClearShape::Fixed {
                 item_ty,
                 array_type_id: Some(array_type_id),
@@ -18144,7 +18165,8 @@ fn newlist_clear_shape(
                     array,
                 };
             }
-            if let Some((item_ty, array_type_id, array)) = typed_items_array_shape(&s, callcontrol) {
+            if let Some((item_ty, array_type_id, array)) = typed_items_array_shape(&s, callcontrol)
+            {
                 return NewlistClearShape::Fixed {
                     item_ty,
                     array_type_id: Some(array_type_id),
@@ -18200,9 +18222,8 @@ fn fixed_newlist_array(
         } => {
             let (item_ty, array_type_id) = arraydescr_of_fixed_array(item_ty, array_type_id);
             let array_type_id = array_type_id?;
-            let array = array.or_else(|| {
-                crate::codewriter::call::array_lltype_for_op_spelling(&array_type_id)
-            });
+            let array = array
+                .or_else(|| crate::codewriter::call::array_lltype_for_op_spelling(&array_type_id));
             let clears = matches!(item_ty, ValueType::Ref(_));
             Some((item_ty, array_type_id, clears, array))
         }

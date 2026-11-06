@@ -3138,14 +3138,7 @@ fn describe_declared_funcobj(
     let body = store
         .body(&resolved)
         .expect("a declared path names a funcobj");
-    install_source_graph(
-        registry,
-        &resolved_key,
-        &graph,
-        &entry,
-        &signature,
-        &body,
-    );
+    install_source_graph(registry, &resolved_key, &graph, &entry, &signature, &body);
     Some(entry)
 }
 
@@ -3207,11 +3200,7 @@ fn alias_same_function_spellings(
     if let Some(stripped) =
         crate::local_crates::strip_alias_crate_prefix_with(segments, foreign_callables)
     {
-        try_alias_key_onto_entry(
-            registry,
-            &FunctionPathKey::from_segments(stripped),
-            entry,
-        );
+        try_alias_key_onto_entry(registry, &FunctionPathKey::from_segments(stripped), entry);
     }
 }
 
@@ -4304,9 +4293,8 @@ pub(crate) fn register_unsafe_fn_stubs(
 ) {
     use crate::decline::gate::CALL_REGISTRY as REGISTRY_GATE;
     let foreign_callables = registry_foreign_callables(registry);
-    let spec_index = function_graphs.map(|store| {
-        build_unspecialized_spec_index(store, &foreign_callables)
-    });
+    let spec_index =
+        function_graphs.map(|store| build_unspecialized_spec_index(store, &foreign_callables));
     for (segments, signature, return_token) in specs {
         // `collect_unsafe_fn_stubs_from_llbc` feeds opaque foreign decls
         // (`core::ptr::copy_nonoverlapping`, `std::alloc::alloc_zeroed`)
@@ -4342,12 +4330,7 @@ pub(crate) fn register_unsafe_fn_stubs(
         // `ExtFuncEntry.compute_result_annotation`) before falling
         // through to `s_None`.
         let store_path = function_graphs.and_then(|store| {
-            graphstore_path_for_lookup_key(
-                store,
-                &key,
-                &foreign_callables,
-                spec_index.as_ref(),
-            )
+            graphstore_path_for_lookup_key(store, &key, &foreign_callables, spec_index.as_ref())
         });
         let store_graph = store_path.as_ref().and_then(|path| {
             function_graphs.and_then(|store| {
@@ -4387,12 +4370,7 @@ pub(crate) fn register_unsafe_fn_stubs(
             // Charon `name_path()` spelling onto that FunctionDesc, and
             // the crate-stripped / leaf spellings of the same funcobj.
             if let Some(entry) = registry.lookup_registered(&key) {
-                alias_same_function_spellings(
-                    registry,
-                    segments,
-                    &entry,
-                    &foreign_callables,
-                );
+                alias_same_function_spellings(registry, segments, &entry, &foreign_callables);
                 // A bodyless residual already registered (`alias_opaque`)
                 // without `_signature_` still takes FUNC.RESULT from the
                 // declared lltype (`extfunc.py`
@@ -4429,12 +4407,7 @@ pub(crate) fn register_unsafe_fn_stubs(
                     .and_then(|store| existing_graphstore_entry(store, registry, path))
             {
                 try_alias_key_onto_entry(registry, &key, &existing);
-                alias_same_function_spellings(
-                    registry,
-                    segments,
-                    &existing,
-                    &foreign_callables,
-                );
+                alias_same_function_spellings(registry, segments, &existing, &foreign_callables);
             }
             continue;
         }
@@ -4826,12 +4799,7 @@ pub(crate) fn is_no_effect_external(segments: &[String]) -> bool {
 /// (`icf_identity_token` then `__rffi_fp_*` in `ccall_*`).
 pub(crate) fn register_no_effect_externals(registry: &CallRegistry) {
     for (segments, argnames, return_lltype) in NO_EFFECT_EXTERNALS {
-        register_residual_signature_external(
-            registry,
-            segments,
-            argnames,
-            return_lltype.clone(),
-        );
+        register_residual_signature_external(registry, segments, argnames, return_lltype.clone());
     }
 }
 
@@ -18755,10 +18723,9 @@ mod tests {
             )];
             register_unsafe_fn_stubs(&registry, &specs, None);
             let (graph, result) = bodyless_extern_wrapper_call_graph(&[name], result_ty);
-            let (value_to_var, _) = specialize_legacy_graph_with_registry_returning_value_to_var(
-                &graph, &registry,
-            )
-            .expect("look-inside wrapper return ext(x) annotates");
+            let (value_to_var, _) =
+                specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
+                    .expect("look-inside wrapper return ext(x) annotates");
             let ann = value_to_var.get(&result).and_then(|typed| {
                 typed
                     .annotation
@@ -18853,10 +18820,9 @@ mod tests {
             };
             graph.blocks = vec![startblock, returnblock];
             setbinding(&vars[1], result_ty);
-            let (value_to_var, _) = specialize_legacy_graph_with_registry_returning_value_to_var(
-                &graph, &registry,
-            )
-            .expect("look-inside wrapper void-then-ext(x) annotates");
+            let (value_to_var, _) =
+                specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
+                    .expect("look-inside wrapper void-then-ext(x) annotates");
             let ann = value_to_var.get(&result).and_then(|typed| {
                 typed
                     .annotation

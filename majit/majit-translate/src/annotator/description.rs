@@ -2259,9 +2259,8 @@ impl FunctionDesc {
                     *v.annotation.borrow_mut() = Some(Rc::new(s_result.clone()));
                 }
             }
-            return super::model::unionof([&s_result, s_previous_result]).map_err(|e| {
-                AnnotatorError::new(format!("{}.pycall unionof: {}", self.name, e))
-            });
+            return super::model::unionof([&s_result, s_previous_result])
+                .map_err(|e| AnnotatorError::new(format!("{}.pycall unionof: {}", self.name, e)));
         }
 
         // upstream: `annotator = self.bookkeeper.annotator`.

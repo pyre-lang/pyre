@@ -8259,16 +8259,10 @@ mod tests {
             Array::gc(LowLevelType::Unsigned)
         );
         let ptr_t = LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Struct(Struct::gc(
-                "T",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::gc("T", vec![("x".into(), LowLevelType::Signed)])),
         }));
         let ptr_u = LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Struct(Struct::gc(
-                "U",
-                vec![("x".into(), LowLevelType::Signed)],
-            )),
+            TO: PtrTarget::Struct(Struct::gc("U", vec![("x".into(), LowLevelType::Signed)])),
         }));
         assert_ne!(Array::gc(ptr_t), Array::gc(ptr_u));
         let named_signed = Array::gc(LowLevelType::Struct(Box::new(Struct::new(

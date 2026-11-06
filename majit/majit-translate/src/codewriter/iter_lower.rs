@@ -917,7 +917,9 @@ mod tests {
             OpKind::ArrayLen {
                 base: l.clone(),
                 array_type_id: Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.into()),
-                array: crate::codewriter::call::array_lltype_for_op_spelling(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+                array: crate::codewriter::call::array_lltype_for_op_spelling(
+                    crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID,
+                ),
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
             },

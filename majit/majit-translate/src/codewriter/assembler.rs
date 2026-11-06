@@ -11647,11 +11647,9 @@ mod tests {
                     length: length_var.clone(),
                     item_ty: ValueType::Int,
                     array_type_id: Some("list_items".to_string()),
-                    array: Some(
-                        crate::translator::rtyper::lltypesystem::lltype::Array::gc(
-                            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
-                        ),
-                    ),
+                    array: Some(crate::translator::rtyper::lltypesystem::lltype::Array::gc(
+                        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
+                    )),
                 },
                 true,
             )
