@@ -1197,6 +1197,14 @@ pub trait BoxEnv {
     /// of one logical box are `ptr_eq`. A non-Const may resolve to a Const;
     /// callers classify the returned box before any identity-map insertion.
     fn get_box_replacement_operand(&self, opref: OpRef) -> Operand;
+    /// Optimizer producer at `opref`, or `None` when that position has no
+    /// bound box. `get_box_replacement_operand` is total and may mint a
+    /// fresh `Rc` on a miss; numbering liveboxes must not use a mint
+    /// (`resume.py` `_number_boxes` keys `liveboxes` by the optimizer
+    /// object `iter.get` already holds).
+    fn get_box_replacement_operand_opt(&self, opref: OpRef) -> Option<Operand> {
+        Some(self.get_box_replacement_operand(opref))
+    }
     /// resume.py `_number_boxes`: isinstance(box, Const) on the resolved box.
     fn is_const(&self, box_: &Operand) -> bool;
     /// Constant value + type. Only valid when is_const returns true.
