@@ -331,10 +331,11 @@ impl CodeWriter {
                 subjects.insert(path.clone());
             }
         }
-        crate::translator::rtyper::cutover::run_two_phase_prepass(
+        crate::translator::rtyper::cutover::run_two_phase_prepass_with_wrappers(
             &registry,
             &subjects,
             callcontrol.function_graphs(),
+            callcontrol.builtin_wrapper_indirect_graphs(),
         );
         // The annotator is complete and no graph is built after it. The
         // pending bodies share their graphs with `function_graphs`, which

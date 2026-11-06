@@ -1410,6 +1410,35 @@ mod tests {
         assert!(matches!(ann.binding(&ret), SomeValue::Integer(_)));
     }
 
+    #[test]
+    fn row_annotation_always_raising_member_takes_union_return() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let graph_raising = make_pygraph("always_raise", &["x"], None);
+        let graph_int = make_pygraph("returns_int", &["x"], None);
+        bind_graph_inputs(
+            &ann,
+            &graph_raising,
+            &[SomeValue::Integer(SomeInteger::default())],
+            SomeValue::Impossible,
+        );
+        bind_graph_inputs(
+            &ann,
+            &graph_int,
+            &[SomeValue::Integer(SomeInteger::default())],
+            SomeValue::Integer(SomeInteger::default()),
+        );
+
+        assert!(
+            normalize_calltable_row_annotation(&ann, &[graph_raising.clone(), graph_int.clone()])
+                .unwrap()
+        );
+
+        let ret_raising = graph_raising.graph.borrow().getreturnvar();
+        let ret_int = graph_int.graph.borrow().getreturnvar();
+        assert!(matches!(ann.binding(&ret_raising), SomeValue::Integer(_)));
+        assert!(matches!(ann.binding(&ret_int), SomeValue::Integer(_)));
+    }
+
     fn register_classdef(
         ann: &RPythonAnnotator,
         name: &str,

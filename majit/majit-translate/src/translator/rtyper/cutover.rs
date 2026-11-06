@@ -47,7 +47,7 @@
 
 use indexmap::IndexMap;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::codewriter::type_state::{ConcreteType, valuetype_to_concrete};
@@ -908,20 +908,79 @@ pub(crate) fn apply_rtyper_const_results(
 fn select_rtyped_representatives(
     value_to_var: &mut LegacyToTyped,
     candidates: &LegacyToTypedCandidates,
+    rtyper: Option<&Rc<crate::translator::rtyper::rtyper::RPythonTyper>>,
 ) -> Result<(), TyperError> {
     for (legacy, vars) in candidates {
-        if value_to_var
-            .get(legacy)
-            .is_some_and(|var| var.concretetype.borrow().is_some())
-        {
+        let primary_ct = value_to_var.get(legacy).and_then(|var| {
+            var.concretetype
+                .borrow()
+                .as_ref()
+                .and_then(|ll| lowleveltype_to_concrete(ll).ok())
+        });
+        // Call-family normalize binds a peer to `SomeInstance`. Phase B
+        // may rtype the unfollowed Ok-arm Impossible→Void and make that
+        // the primary because it has a concretetype. Prefer the family
+        // Instance peer so the dual gate does not collect
+        // `legacy=GcRef, real=Void` on a colored unfollowed phi.
+        let instance_peer = vars.iter().find(|candidate| {
+            matches!(
+                candidate.annotation.borrow().as_ref().map(|rc| rc.as_ref()),
+                Some(crate::annotator::model::SomeValue::Instance(_))
+            )
+        });
+        let primary_untyped_or_impossible = value_to_var.get(legacy).is_none_or(|var| {
+            matches!(
+                var.annotation.borrow().as_ref().map(|rc| rc.as_ref()),
+                None | Some(crate::annotator::model::SomeValue::Impossible)
+            )
+        });
+        if let Some(peer) = instance_peer {
+            // Missing/Impossible primary: `reconcile_elided_phi_inputargs`
+            // would otherwise alias the unfollowed Ok-arm Void producer
+            // onto this phi. Void primary: Phase B already stamped that
+            // producer. The compared slot is the Instance peer's
+            // `bindingrepr` (`rtyper.py` `setconcretetype`).
+            if primary_ct == Some(ConcreteType::Void)
+                || (primary_ct.is_none() && primary_untyped_or_impossible)
+            {
+                for candidate in vars {
+                    let Some(lltype) = candidate.concretetype.borrow().clone() else {
+                        continue;
+                    };
+                    let kind = lowleveltype_to_concrete(&lltype)?;
+                    if kind != ConcreteType::Void && kind != ConcreteType::GcRef {
+                        return Err(TyperError::message(format!(
+                            "block-local representatives of one legacy Variable disagree: \
+                             GcRef vs {kind:?} for {legacy:?}"
+                        )));
+                    }
+                }
+                let peer = peer.clone();
+                if !stamp_instance_concretetype(&peer, rtyper)? {
+                    continue;
+                }
+                value_to_var.insert(legacy.clone(), peer);
+                continue;
+            }
+        }
+        if primary_ct.is_some() {
             continue;
         }
+        let primary_instance = value_to_var.get(legacy).is_some_and(|var| {
+            matches!(
+                var.annotation.borrow().as_deref(),
+                Some(crate::annotator::model::SomeValue::Instance(_))
+            )
+        });
         let mut selected: Option<(Variable, ConcreteType)> = None;
         for candidate in vars {
             let Some(lltype) = candidate.concretetype.borrow().clone() else {
                 continue;
             };
             let kind = lowleveltype_to_concrete(&lltype)?;
+            if primary_instance && kind == ConcreteType::Void {
+                continue;
+            }
             if let Some((_, selected_kind)) = &selected {
                 if *selected_kind != kind {
                     return Err(TyperError::message(format!(
@@ -938,6 +997,30 @@ fn select_rtyped_representatives(
         }
     }
     Ok(())
+}
+
+/// `rtyper.py` `setconcretetype`: `v.concretetype = bindingrepr(v).lowleveltype`.
+/// `rclass.py` `InstanceRepr.__init__` uses `OBJECTPTR` when `classdef is None`.
+fn stamp_instance_concretetype(
+    peer: &Variable,
+    rtyper: Option<&Rc<crate::translator::rtyper::rtyper::RPythonTyper>>,
+) -> Result<bool, TyperError> {
+    if peer.concretetype.borrow().is_some() {
+        return Ok(true);
+    }
+    if let Some(rtyper) = rtyper {
+        rtyper.setconcretetype(peer)?;
+        return Ok(peer.concretetype.borrow().is_some());
+    }
+    let root_instance = matches!(
+        peer.annotation.borrow().as_ref().map(|rc| rc.as_ref()),
+        Some(crate::annotator::model::SomeValue::Instance(inst)) if inst.classdef.is_none()
+    );
+    if root_instance {
+        peer.set_concretetype(Some(crate::translator::rtyper::rclass::OBJECTPTR.clone()));
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Variables defined (inputarg or op result) in the reachable block
@@ -5275,7 +5358,7 @@ fn drive_lifted_subject(
     }
 
     if do_rtype {
-        select_rtyped_representatives(&mut value_to_var, &value_to_var_candidates)?;
+        select_rtyped_representatives(&mut value_to_var, &value_to_var_candidates, Some(&rtyper))?;
         reconcile_projection_aliases(
             legacy,
             &mut value_to_var,
@@ -5571,13 +5654,31 @@ fn drive_access_direct_subject(
 /// `check_access_directly_sanity` (`warmspot.py WarmRunnerDesc.__init__`)
 /// is fatal to translation. It runs after `_inner` returns so a failing
 /// graph cannot skip Phase B, and so its panic is not swallowed.
+#[cfg(test)]
 pub(crate) fn run_two_phase_prepass(
     call_registry: &CallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
     function_graphs: &crate::codewriter::call::GraphStore,
 ) {
+    run_two_phase_prepass_with_wrappers(call_registry, candidate_graphs, function_graphs, &[]);
+}
+
+/// Same as [`run_two_phase_prepass`], with the builtin-wrapper list
+/// `CallControl::builtin_wrapper_indirect_graphs` already unioned into
+/// the subject set by `CodeWriter::run_two_phase_prepass`.
+pub(crate) fn run_two_phase_prepass_with_wrappers(
+    call_registry: &CallRegistry,
+    candidate_graphs: &HashSet<crate::parse::CallPath>,
+    function_graphs: &crate::codewriter::call::GraphStore,
+    builtin_wrapper_graphs: &[crate::parse::CallPath],
+) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_two_phase_prepass_inner(call_registry, candidate_graphs, function_graphs)
+        run_two_phase_prepass_inner(
+            call_registry,
+            candidate_graphs,
+            function_graphs,
+            builtin_wrapper_graphs,
+        )
     }));
     check_access_directly_sanity(call_registry, candidate_graphs, function_graphs);
     call_registry.two_phase().prepass_done = true;
@@ -5988,10 +6089,264 @@ fn check_access_directly_sanity(
     );
 }
 
+/// Wrap an already-annotated two-phase subject graph so
+/// `FunctionDesc.cache[None]` / `DescEntry.get_graph` can return it
+/// without `pycall`.
+fn pygraph_for_cached_subject(
+    desc: &crate::annotator::description::FunctionDesc,
+    graph: crate::flowspace::model::GraphRef,
+) -> Rc<PyGraph> {
+    let func = desc
+        .base
+        .pyobj
+        .as_ref()
+        .and_then(HostObject::user_function)
+        .cloned()
+        .unwrap_or_else(|| {
+            GraphFunc::new(
+                desc.name.clone(),
+                Constant::new(ConstValue::Dict(Default::default())),
+            )
+        });
+    Rc::new(PyGraph {
+        graph,
+        func,
+        signature: RefCell::new(desc.signature.clone()),
+        defaults: RefCell::new(Some(desc.defaults.clone())),
+        access_directly: Cell::new(false),
+    })
+}
+
+/// Wrap a two-phase adapter graph as a `PyGraph` when the path has no
+/// `FunctionDesc` yet. `normalize_calltable_row_annotation` only reads
+/// `PyGraph.graph`.
+fn pygraph_from_adapter_graph(graph: crate::flowspace::model::GraphRef) -> Rc<PyGraph> {
+    let func = {
+        let g = graph.borrow();
+        g.func.clone().unwrap_or_else(|| {
+            GraphFunc::new(
+                g.name.clone(),
+                Constant::new(ConstValue::Dict(Default::default())),
+            )
+        })
+    };
+    Rc::new(PyGraph {
+        graph,
+        func,
+        signature: RefCell::new(Signature::new(vec!["args".to_string()], None, None)),
+        defaults: RefCell::new(Some(Vec::new())),
+        access_directly: Cell::new(false),
+    })
+}
+
+/// Dual-gate slot on always-raise wrappers is an unfollowed Ok-arm phi
+/// (a colored block inputarg), not `getreturnvar()`. `normalizecalls.py`
+/// `normalize_calltable_row_annotation` only unions graph args and
+/// `getreturnvar()`. Phase A leaves the Ok-arm twin unbound; Phase B
+/// stamps Impossible→Void; `flatten.py` `getcolor` still colors it.
+/// Bind only those colored unbound phi twins to the family Instance
+/// return so dual-gate compares GcRef.
+fn widen_impossible_value_to_var_twins(
+    annotator: &crate::annotator::annrpython::RPythonAnnotator,
+    call_registry: &CallRegistry,
+    builtin_wrapper_graphs: &[crate::parse::CallPath],
+    function_graphs: &crate::codewriter::call::GraphStore,
+) {
+    use crate::annotator::model::SomeValue;
+    let work: Vec<(Vec<Variable>, SomeValue)> = {
+        let tp = call_registry.two_phase();
+        builtin_wrapper_graphs
+            .iter()
+            .filter_map(|path| {
+                let subject = tp.subjects.get(path)?;
+                let ret = subject.graph.borrow().getreturnvar();
+                let s_payload = annotator.annotation(&ret)?;
+                if !matches!(s_payload, SomeValue::Instance(_)) {
+                    return None;
+                }
+                let twins = function_graphs.get(path).map_or_else(Vec::new, |legacy| {
+                    phi_unbound_twins(legacy.as_ref(), subject, annotator)
+                });
+                Some((twins, s_payload))
+            })
+            .collect()
+    };
+    for (twins, s_payload) in work {
+        for mut v in twins {
+            match annotator.annotation(&Hlvalue::Variable(v.clone())) {
+                None | Some(SomeValue::Impossible) => {
+                    annotator.setbinding(&mut v, s_payload.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Colored, unbound block inputarg twins. Dual-gate `getcolor` still
+/// emits these Ok-arm phis on always-raise wrappers.
+fn phi_unbound_twins(
+    legacy: &LegacyGraph,
+    subject: &crate::translator::rtyper::call_registry::TwoPhaseSubject,
+    annotator: &crate::annotator::annrpython::RPythonAnnotator,
+) -> Vec<Variable> {
+    use crate::annotator::model::SomeValue;
+    let colored = colored_operand_vars(legacy);
+    let mut out = Vec::new();
+    let mut push = |typed: &Variable| match annotator.annotation(&Hlvalue::Variable(typed.clone()))
+    {
+        None | Some(SomeValue::Impossible) => out.push(typed.clone()),
+        _ => {}
+    };
+    for block in &legacy.blocks {
+        for ia in &block.inputargs {
+            if !colored.contains(ia) {
+                continue;
+            }
+            if let Some(typed) = subject.value_to_var.get(ia) {
+                push(typed);
+            }
+            if let Some(typeds) = subject.value_to_var_candidates.get(ia) {
+                for typed in typeds {
+                    push(typed);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn rtype_skip_wrapper_subjects(
+    call_registry: &CallRegistry,
+    builtin_wrapper_graphs: &[crate::parse::CallPath],
+    reason: &str,
+) {
+    eprintln!("[PREPASS builtin wrapper CallFamily] {reason}");
+    let keys: Vec<GraphKey> = {
+        let tp = call_registry.two_phase();
+        builtin_wrapper_graphs
+            .iter()
+            .filter_map(|path| {
+                tp.subjects
+                    .get(path)
+                    .map(|subject| subject.graph_key.clone())
+            })
+            .collect()
+    };
+    let mut tp = call_registry.two_phase();
+    for key in keys {
+        tp.rtype_skipped.insert(key);
+    }
+}
+
+/// Record one PBC `CallFamily` row for the generated builtin wrappers.
+///
+/// Upstream `gateway.py` `BuiltinCode1.fastcall_1` calls
+/// `self.fastfunc_1(...)`; `bookkeeper.py` `consider_call_site` then
+/// `description.py` `FunctionDesc.consider_call_site` records that
+/// `SomePBC` as one row. Two-phase subjects skip `FunctionDesc.pycall`,
+/// and `builtin_code_call` is `dont_look_inside`. Install each
+/// annotated subject on `FunctionDesc.cache` (`GraphCacheKey::None`)
+/// and consider the generated `simple_call(func, slice)` shape once.
+fn consider_builtin_wrapper_call_site(
+    call_registry: &CallRegistry,
+    annotator: &crate::annotator::annrpython::RPythonAnnotator,
+    builtin_wrapper_graphs: &[crate::parse::CallPath],
+    function_graphs: &crate::codewriter::call::GraphStore,
+) -> Result<(), crate::annotator::model::AnnotatorError> {
+    use crate::annotator::argument::simple_args;
+    use crate::annotator::description::{FunctionDesc, GraphCacheKey};
+    use crate::annotator::model::SomeValue;
+    use crate::translator::rtyper::normalizecalls::normalize_calltable_row_annotation;
+
+    let annotated: Vec<(&crate::parse::CallPath, crate::flowspace::model::GraphRef)> = {
+        let tp = call_registry.two_phase();
+        builtin_wrapper_graphs
+            .iter()
+            .filter_map(|path| {
+                tp.subjects
+                    .get(path)
+                    .map(|subject| (path, subject.graph.clone()))
+            })
+            .collect()
+    };
+    let mut descs: Vec<Rc<RefCell<FunctionDesc>>> = Vec::new();
+    let mut by_nargs: BTreeMap<usize, Vec<Rc<PyGraph>>> = BTreeMap::new();
+    let mut s_arg: Option<SomeValue> = None;
+    let mut s_result: Option<SomeValue> = None;
+    for (path, graph) in &annotated {
+        let args = graph.borrow().getargs();
+        if args.len() == 1 && s_arg.is_none() {
+            s_arg = Some(
+                annotator
+                    .annotation(&args[0])
+                    .unwrap_or(SomeValue::Impossible),
+            );
+            let ret = graph.borrow().getreturnvar();
+            s_result = Some(annotator.annotation(&ret).unwrap_or(SomeValue::Impossible));
+        }
+        let pygraph = if let Some(entry) = call_registry.lookup(&FunctionPathKey::from(*path)) {
+            let desc_rc = entry.function_desc.clone();
+            let (pygraph, include_desc) = {
+                let desc = desc_rc.borrow();
+                let include_desc = args.len() == 1
+                    && desc.signature.argnames.len() == 1
+                    && !desc.signature.has_vararg()
+                    && !desc.signature.has_kwarg();
+                let mut cache = desc.cache.borrow_mut();
+                let pygraph = if let Some(existing) = cache.get(&GraphCacheKey::None)
+                    && Rc::ptr_eq(&existing.graph, graph)
+                {
+                    existing.clone()
+                } else {
+                    let pg = pygraph_for_cached_subject(&desc, (*graph).clone());
+                    cache.insert(GraphCacheKey::None, pg.clone());
+                    pg
+                };
+                (pygraph, include_desc)
+            };
+            if include_desc {
+                descs.push(desc_rc);
+            }
+            pygraph
+        } else {
+            pygraph_from_adapter_graph((*graph).clone())
+        };
+        by_nargs.entry(args.len()).or_default().push(pygraph);
+    }
+    // One calltable row per `getargs` arity (`normalizecalls.py`
+    // `nbargs` assert). Mixing arities in a single row panics; dropping
+    // non-1-arg members left always-raise wrappers un-normalized when
+    // the adapter startblock is not a single slice word.
+    for graphs in by_nargs.values() {
+        if graphs.len() > 1 {
+            normalize_calltable_row_annotation(annotator, graphs)?;
+        }
+    }
+    // Always-raising wrappers already bind `getreturnvar()` as the
+    // `PyResult` `SomeInstance` (signature / reachable except-path).
+    // Dual-gate slot is the unfollowed Ok-arm phi, still Impossible →
+    // Void. `unionof(s_ImpossibleValue, X) == X`: give that extract the
+    // family return so Phase B rtypes GcRef.
+    widen_impossible_value_to_var_twins(
+        annotator,
+        call_registry,
+        builtin_wrapper_graphs,
+        function_graphs,
+    );
+    if descs.is_empty() {
+        return Ok(());
+    }
+    let args = simple_args(vec![s_arg.unwrap_or(SomeValue::Impossible)]);
+    let s_result = s_result.unwrap_or(SomeValue::Impossible);
+    FunctionDesc::consider_call_site(&descs, &args, &s_result, None)
+}
+
 fn run_two_phase_prepass_inner(
     call_registry: &CallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
     function_graphs: &crate::codewriter::call::GraphStore,
+    builtin_wrapper_graphs: &[crate::parse::CallPath],
 ) {
     // Exists to localise prepass nondeterminism (gh#1139).
     let determinism_trace = crate::determinism_trace_enabled();
@@ -6221,6 +6576,50 @@ fn run_two_phase_prepass_inner(
     // `setconcretetype(getreturnvar())`. Run the seeding here, alongside
     // the other explicit stand-ins for the deferred complete().
     annotator.seed_all_annotated_return_vars();
+
+    // Builtin-wrapper PBC family + call-family normalization. Must run
+    // after the Impossible seed (`force_return_var_annotation`) and
+    // before Phase B: `normalizecalls.py` `normalize_calltable_row_annotation`
+    // does `annotator.setbinding(graph.getreturnvar(), generalizedresult)`
+    // with `unionof(s_ImpossibleValue, X) == X`. Two-phase
+    // `run_annotator_simplify_isolated` always passes a `block_subset`,
+    // so it never reaches `perform_normalizations`. Only
+    // `normalize_call_familes` is hoisted; `assign_inheritance_ids`
+    // already ran, and `normalize_call_familes` does not require the
+    // other `perform_normalizations` passes.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        consider_builtin_wrapper_call_site(
+            call_registry,
+            &annotator,
+            builtin_wrapper_graphs,
+            function_graphs,
+        )
+    })) {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            rtype_skip_wrapper_subjects(call_registry, builtin_wrapper_graphs, &format!("{err}"));
+        }
+        Err(payload) => {
+            let msg = crate::annotator::model::panic_payload_text(&*payload)
+                .unwrap_or_else(|| "<unrecognised panic payload>".to_string());
+            rtype_skip_wrapper_subjects(
+                call_registry,
+                builtin_wrapper_graphs,
+                &format!("panicked: {msg}"),
+            );
+        }
+    }
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Err(err) =
+            crate::translator::rtyper::normalizecalls::normalize_call_familes(&annotator)
+        {
+            eprintln!("[PREPASS normalize_call_familes] {err}");
+        }
+    })) {
+        let msg = crate::annotator::model::panic_payload_text(&*payload)
+            .unwrap_or_else(|| "<unrecognised panic payload>".to_string());
+        eprintln!("[PREPASS normalize_call_familes] panicked: {msg}");
+    }
 
     // ── Phase B — rtype-all with per-graph isolation ─────────────────
     // Writes its rtype_skipped set into the cache incrementally so partial
@@ -7833,9 +8232,9 @@ pub(crate) fn dual_gate_outcome_from_cache(
         Ok(cached) => cached,
         Err(reason) => return Ok(DualGateOutcome::Skip(reason)),
     };
-    select_rtyped_representatives(&mut value_to_var, &value_to_var_candidates)
-        .map_err(|e| e.to_string())?;
     let rtyper = call_registry.session_if_started().map(|(_, rt)| rt);
+    select_rtyped_representatives(&mut value_to_var, &value_to_var_candidates, rtyper.as_ref())
+        .map_err(|e| e.to_string())?;
     reconcile_projection_aliases(
         legacy,
         &mut value_to_var,
@@ -7844,6 +8243,11 @@ pub(crate) fn dual_gate_outcome_from_cache(
         rtyper.as_ref(),
     );
     map_block_inputargs_from_flowspace(legacy, &block_map, &mut value_to_var);
+    // Phi reconcile may alias an unfollowed Ok-arm Void producer onto a
+    // family Instance peer that had no concretetype yet. Re-run so the
+    // compared slot is the Instance `bindingrepr` representative.
+    select_rtyped_representatives(&mut value_to_var, &value_to_var_candidates, rtyper.as_ref())
+        .map_err(|e| e.to_string())?;
 
     // Validate the cached lltypes project to concrete kinds (the Step-4 check
     // deferred from `drive_subject`, which did not rtype in Phase A).
@@ -15353,11 +15757,120 @@ mod tests {
         let candidates =
             HashMap::from([(legacy.clone(), vec![removed_producer, live_phi.clone()])]);
 
-        select_rtyped_representatives(&mut preferred, &candidates)
+        select_rtyped_representatives(&mut preferred, &candidates, None)
             .expect("same legacy value's live peer must reconcile");
         assert_eq!(
             preferred[&legacy], live_phi,
             "projection must point at the positively-rtyped block-local representative"
+        );
+    }
+
+    #[test]
+    fn select_rtyped_representatives_keeps_instance_over_void_peer() {
+        use crate::annotator::model::SomeValue;
+        let legacy = Variable::named("legacy");
+        let preferred = Variable::named("preferred");
+        *preferred.annotation.borrow_mut() = Some(Rc::new(SomeValue::Instance(
+            crate::annotator::model::SomeInstance::new(
+                None,
+                false,
+                std::collections::BTreeMap::new(),
+            ),
+        )));
+        let void_peer = Variable::named("void_peer");
+        void_peer.set_concretetype(Some(LowLevelType::Void));
+        let mut preferred_map = HashMap::from([(legacy.clone(), preferred.clone())]);
+        let candidates = HashMap::from([(legacy.clone(), vec![preferred.clone(), void_peer])]);
+
+        select_rtyped_representatives(&mut preferred_map, &candidates, None)
+            .expect("instance family twin must not yield to a Void peer");
+        assert_eq!(
+            preferred_map[&legacy], preferred,
+            "call-family Instance annotation stays the representative"
+        );
+    }
+
+    #[test]
+    fn select_rtyped_representatives_prefers_instance_peer_over_void_primary() {
+        use crate::annotator::model::SomeValue;
+        let legacy = Variable::named("legacy");
+        let void_primary = Variable::named("void_primary");
+        void_primary.set_concretetype(Some(LowLevelType::Void));
+        let instance_peer = Variable::named("instance_peer");
+        *instance_peer.annotation.borrow_mut() = Some(Rc::new(SomeValue::Instance(
+            crate::annotator::model::SomeInstance::new(
+                None,
+                false,
+                std::collections::BTreeMap::new(),
+            ),
+        )));
+        let mut preferred_map = HashMap::from([(legacy.clone(), void_primary)]);
+        let candidates = HashMap::from([(legacy.clone(), vec![instance_peer.clone()])]);
+
+        select_rtyped_representatives(&mut preferred_map, &candidates, None)
+            .expect("Void primary must yield to a family Instance peer");
+        assert_eq!(
+            preferred_map[&legacy], instance_peer,
+            "call-family Instance peer becomes the representative"
+        );
+        assert!(
+            preferred_map[&legacy].concretetype.borrow().is_some(),
+            "Instance peer projects through OBJECTPTR"
+        );
+    }
+
+    #[test]
+    fn select_rtyped_representatives_fills_missing_primary_from_instance_peer() {
+        use crate::annotator::model::SomeValue;
+        let legacy = Variable::named("legacy");
+        let instance_peer = Variable::named("instance_peer");
+        *instance_peer.annotation.borrow_mut() = Some(Rc::new(SomeValue::Instance(
+            crate::annotator::model::SomeInstance::new(
+                None,
+                false,
+                std::collections::BTreeMap::new(),
+            ),
+        )));
+        let mut preferred_map: HashMap<Variable, Variable> = HashMap::new();
+        let candidates = HashMap::from([(legacy.clone(), vec![instance_peer.clone()])]);
+
+        select_rtyped_representatives(&mut preferred_map, &candidates, None)
+            .expect("missing primary must take a family Instance peer");
+        assert_eq!(
+            preferred_map[&legacy], instance_peer,
+            "call-family Instance peer becomes the representative"
+        );
+        assert!(
+            preferred_map[&legacy].concretetype.borrow().is_some(),
+            "Instance peer projects through OBJECTPTR"
+        );
+    }
+
+    #[test]
+    fn select_rtyped_representatives_rejects_instance_peer_vs_signed() {
+        use crate::annotator::model::SomeValue;
+        let legacy = Variable::named("legacy");
+        let void_primary = Variable::named("void_primary");
+        void_primary.set_concretetype(Some(LowLevelType::Void));
+        let instance_peer = Variable::named("instance_peer");
+        *instance_peer.annotation.borrow_mut() = Some(Rc::new(SomeValue::Instance(
+            crate::annotator::model::SomeInstance::new(
+                None,
+                false,
+                std::collections::BTreeMap::new(),
+            ),
+        )));
+        let signed_peer = Variable::named("signed_peer");
+        signed_peer.set_concretetype(Some(LowLevelType::Signed));
+        let mut preferred_map = HashMap::from([(legacy.clone(), void_primary)]);
+        let candidates = HashMap::from([(legacy, vec![instance_peer, signed_peer])]);
+
+        let err = select_rtyped_representatives(&mut preferred_map, &candidates, None)
+            .expect_err("GcRef family peer must not hide a Signed representative");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("GcRef vs Signed"),
+            "conflict message names both kinds: {msg}"
         );
     }
 
