@@ -2680,9 +2680,31 @@ pub(crate) fn semantic_slot_color_for_ref_slot(
 /// Resolve a resumed semantic Ref slot to its live register color.  Empty
 /// metadata is retained for skeleton/fixture compatibility; a partially
 /// populated per-PC map is authoritative, so an absent slot has no register.
-fn reconstructed_ref_slot_color(pcdep_entries: &[(u8, u16, u16)], slot: usize) -> Option<usize> {
+pub(crate) fn reconstructed_ref_slot_color(
+    pcdep_entries: &[(u8, u16, u16)],
+    slot: usize,
+) -> Option<usize> {
     semantic_slot_color_for_ref_slot(pcdep_entries, slot)
         .or_else(|| pcdep_entries.is_empty().then_some(slot))
+}
+
+/// Write each live semantic Ref slot into the post-regalloc color that owns
+/// it at this PC (`pcdep_color_slots`, the inversion `setup_bridge_sym`
+/// uses). A slot with no live color is skipped. Empty `pcdep` is identity
+/// coloring (`reconstructed_ref_slot_color`).
+pub(crate) fn seed_ref_slots_at_pcdep_colors(
+    pcdep: &[(u8, u16, u16)],
+    slots: impl IntoIterator<Item = (usize, OpRef)>,
+    mut seed: impl FnMut(usize, OpRef),
+) {
+    for (slot, value) in slots {
+        if value.is_none() {
+            continue;
+        }
+        if let Some(color) = reconstructed_ref_slot_color(pcdep, slot) {
+            seed(color, value);
+        }
+    }
 }
 
 // Sentinel null JitCode for uninitialized PyreSym.
@@ -5304,6 +5326,10 @@ fn concrete_code_object(frame: usize) -> Option<&'static pyre_interpreter::CodeO
     Some(unsafe { &*raw_code })
 }
 
+pub(crate) fn concrete_raw_code(frame: usize) -> Option<*const CodeObject> {
+    concrete_code_object(frame).map(|code| code as *const CodeObject)
+}
+
 pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
     let code = concrete_code_object(frame)?;
     let nlocals = code.varnames.len();
@@ -7526,11 +7552,14 @@ impl PyreSym {
         } else if self.symbolic_local_types.len() != nlocals {
             self.symbolic_local_types = concrete_slot_types(concrete_frame, nlocals, nlocals);
         }
-        // Seed the stack portion of `registers_r`
-        // directly. `registers_r` is the unified abstract register
-        // file — locals occupy `[..nlocals]` and stack slots occupy
-        // `[nlocals..nlocals + stack_only_depth]` (RPython
-        // `pyjitpl.py` MIFrame parity).
+        // Seed the stack portion of the semantic `locals_cells_stack_w`
+        // mirror. `registers_r` here is slot-indexed so `collect_stack` /
+        // the `#[vable]` JUMP window can read
+        // `[nlocals..nlocals + stack_only_depth]`. The convert-image
+        // color file is the walker bank seeded by `argboxes_r`
+        // (`seed_ref_slots_at_pcdep_colors`); `MIFrame.registers_r` is
+        // that color file (`pyjitpl.py`), copied by
+        // `_copy_data_from_miframe`.
         let stack_seed: Vec<OpRef> = if let Some(base) = self.vable_array_base {
             let stack_base = base + nlocals as u32;
             (0..stack_only_depth)
@@ -16766,6 +16795,38 @@ mod tests {
         assert_eq!(merge_point_stack_depth_to_recover(0, deep_pc), None);
     }
 
+    /// `_fwalk` (`os.py`): nlocals=18, slot prefix `[0, 28)`, dedicated
+    /// `portal_frame_reg` = 26 = `nlocals + 8`. A slot-identity stack seed
+    /// wrote stack[8] (an int fd) into color 26; preflight then read that
+    /// word as a `PyFrame`. The convert-image seed inverts through
+    /// `pcdep_color_slots` so slot 26 lands on its live color and the
+    /// frame red is left alone.
+    #[test]
+    fn opcode_entry_seed_does_not_overwrite_frame_color_inside_slot_prefix() {
+        let nlocals = 18;
+        let stack_slot = 8;
+        let semantic = nlocals + stack_slot;
+        let frame_color = 26;
+        let stack_color = 12;
+        let stack_value = OpRef::input_arg_ref(99);
+        let frame_value = OpRef::input_arg_ref(1);
+        // Live stack[8] at color 12; no slot owns the dedicated frame color.
+        let pcdep = [(1u8, stack_color as u16, semantic as u16)];
+        let mut bank = vec![OpRef::NONE; 28];
+        bank[frame_color] = frame_value;
+        seed_ref_slots_at_pcdep_colors(&pcdep, [(semantic, stack_value)], |color, opref| {
+            if color >= bank.len() {
+                bank.resize(color + 1, OpRef::NONE);
+            }
+            bank[color] = opref;
+        });
+        assert_eq!(bank[stack_color], stack_value);
+        assert_eq!(
+            bank[frame_color], frame_value,
+            "frame color inside the slot prefix must not take the stack seed"
+        );
+    }
+
     /// The portal `JitState` override must hand the rebuilt framestack to
     /// `trace_jitcode_at_resume_framestack` (`pyjitpl.py handle_guard_failure`
     /// → `interpret()`). The trait default returns `None` without walking.
@@ -17166,8 +17227,9 @@ pub(crate) fn assemble_bridge_inline_pending(
 ///     vable so the portal body reads its locals through `getarrayitem_vable`
 ///     (a NONE `sym.frame` would take the nonstandard-vable Void leg);
 ///   - seed the walk's initial register file: frame/ec at their portal-red
-///     colors + the live stack temps at `[nlocals..valuestackdepth)` (the same
-///     semantic-prefix convention the root bridge seeding uses, trace.rs).
+///     colors + each live local/stack slot at the color `pcdep_color_slots`
+///     names at the resume pc (`seed_ref_slots_at_pcdep_colors`, the same
+///     inversion the root opcode-entry seed in `trace.rs` uses).
 ///
 /// Returns `(pending, argboxes_r)`; `None` when the callee body/layout is
 /// unavailable. The frame's trace ops were recorded by

@@ -11027,21 +11027,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 );
             }
         }
-        let reg = match &entry_colors {
-            // Colored jitcode: seed param `i` at the register it occupies at
-            // the callee entry PC.  A param dead at entry carries no entry
-            // color — the body never reads it, so skip seeding rather than
-            // clobber a live register.
-            Some(entries) => match entries
-                .iter()
-                .find(|&&(b, _, slot)| b == 1 && slot as usize == i)
-            {
-                Some(&(_, color, _)) => color as usize,
-                None => continue,
-            },
-            // Portal / skeleton install (empty `pcdep_color_slots`): colors
-            // are slot-identity, so param `i` lives in register `i`.
-            None => i,
+        // Colored jitcode: seed param `i` at the register it occupies at
+        // the callee entry PC (`pcdep_color_slots[0]`). A param dead at
+        // entry has no color — skip rather than clobber a live register.
+        // Empty metadata is slot-identity (`reconstructed_ref_slot_color`).
+        let Some(reg) =
+            crate::state::reconstructed_ref_slot_color(entry_colors.as_deref().unwrap_or(&[]), i)
+        else {
+            continue;
         };
         if reg >= callee_regs_r.len() {
             return resolved_inline_decline(op.pc, line!());
