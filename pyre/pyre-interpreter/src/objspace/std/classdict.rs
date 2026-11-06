@@ -30,7 +30,11 @@ impl ClassDictStrategy {
 
 /// Trait-object slot used as a dict's `dstrategy`. `fromcache` still owns a
 /// per-space [`ClassDictStrategy`] so constructor identity matches upstream.
-struct ClassDictStrategySlot;
+/// The dyn-call receiver is this address.
+#[repr(C)]
+struct ClassDictStrategySlot {
+    ob_header: PyObject,
+}
 
 pyre_object::register_dyn_impl_vtable!(
     DYN_IMPL_ClassDictStrategySlot,
@@ -95,7 +99,9 @@ impl DictStrategy for ClassDictStrategySlot {
     }
 }
 
-static CLASS_DICT_SLOT: ClassDictStrategySlot = ClassDictStrategySlot;
+static CLASS_DICT_SLOT: ClassDictStrategySlot = ClassDictStrategySlot {
+    ob_header: PyObject::EMPTY,
+};
 
 pyre_object::define_prebuilt_dict_strategy_ref!(
     CLASS_DICT_STRATEGY_REF,
