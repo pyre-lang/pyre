@@ -1590,9 +1590,8 @@ extern "C" fn jit_frame_f_lineno_at(
 /// through `virtualizable_entry_at`, where the neighbouring `locals()` fold
 /// reads `debugdata`.  Neither slot has a `setfield_vable` writer
 /// (`virtualizable_spec.rs` names the ones that do), so memory holds the live
-/// value while compiled code runs, while the recording-time shadow's
-/// `debugdata` is a `clone_debugdata_ptr` copy of it.  Memory answers the same
-/// at both times; the shadow does not.
+/// value while compiled code runs. A tracing snapshot aliases the live
+/// `debugdata` payload; a generator snapshot still clones.
 ///
 /// The receiver is pinned by [`walker_prove_owned_frame_pc`].
 fn try_walker_specialize_frame_lineno<Sym: WalkSym>(
@@ -12204,12 +12203,9 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     };
     // Read the mapping through the SHADOW's payload, which is what the emitted
     // `getfield_gc_r` reads, and require it to be the one the residual would
-    // have used.  The two payloads are not the same object: a root portal seed
-    // bakes the vable identity against the live frame but expands the shadow
-    // from the `snapshot_for_tracing` copy, whose `clone_debugdata_ptr` hands
-    // out a fresh `FrameDebugData` around the same `w_locals`.  Comparing the
-    // holders would decline every portal trace; comparing the mapping is the
-    // invariant that actually has to hold.
+    // have used.  A tracing snapshot aliases the live `debugdata` object;
+    // a generator snapshot still clones around the same `w_locals`. Comparing
+    // the mapping is the invariant that has to hold.
     let shadow_debugdata =
         debugdata_ref.as_usize() as *const pyre_interpreter::pyframe::FrameDebugData;
     let w_locals = if shadow_debugdata.is_null() {

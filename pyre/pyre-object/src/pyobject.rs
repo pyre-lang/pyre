@@ -117,14 +117,21 @@ pub struct PyObject {
     pub w_class: *mut PyObject,
 }
 
+impl PyObject {
+    /// Null typeptr / `w_class`. Prebuilt `space.fromcache` strategy
+    /// singletons use this header so a dyn-call receiver is an 8-aligned
+    /// object (`offsets_for_pytype` is None for a null typeptr).
+    pub const EMPTY: Self = Self {
+        ob_type: std::ptr::null(),
+        w_class: std::ptr::null_mut(),
+    };
+}
+
 impl Default for PyObject {
     /// Null header — `Self::allocate` rewrites both fields at malloc time.
     #[inline]
     fn default() -> Self {
-        Self {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
-        }
+        Self::EMPTY
     }
 }
 

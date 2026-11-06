@@ -15,7 +15,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::dictmultiobject::DictStrategy;
-use crate::pyobject::{PY_NULL, PyObjectRef};
+use crate::pyobject::{PY_NULL, PyObject, PyObjectRef};
 
 /// `kwargsdict.py KwargsDictStrategy`.
 ///
@@ -46,7 +46,12 @@ use crate::pyobject::{PY_NULL, PyObjectRef};
 ///   are constant via `jit.look_inside_iff`.
 /// - At size ≥ 16 entries (`kwargsdict.py`) the strategy
 ///   auto-promotes to `UnicodeDictStrategy` to avoid degenerate O(n).
-pub struct KwargsDictStrategy;
+/// `space.fromcache(KwargsDictStrategy)` prebuilt instance. The dyn-call
+/// receiver is this address.
+#[repr(C)]
+pub struct KwargsDictStrategy {
+    ob_header: PyObject,
+}
 
 /// `ll_getitem_fast` on the parallel `keys_w` / `values_w` lists
 /// (`kwargsdict.py` `keys_w[i]` / `values_w[i]`).
@@ -60,7 +65,9 @@ fn kwargs_at(items: &[PyObjectRef], i: usize) -> PyObjectRef {
 
 /// `pypy/objspace/std/kwargsdict.py KwargsDictStrategy`
 /// singleton — matches PyPy's `space.fromcache(KwargsDictStrategy)`.
-pub static KWARGS_DICT_STRATEGY: KwargsDictStrategy = KwargsDictStrategy;
+pub static KWARGS_DICT_STRATEGY: KwargsDictStrategy = KwargsDictStrategy {
+    ob_header: PyObject::EMPTY,
+};
 
 crate::define_prebuilt_dict_strategy_ref!(
     KWARGS_DICT_STRATEGY_REF,

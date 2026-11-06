@@ -5952,7 +5952,12 @@ pub unsafe fn mapdict_switch_to_text_strategy(w_dict: PyObjectRef) {
 /// `__dict__` adopts. `dstorage` erases the backing `W_ObjectObject`
 /// (mapdict.py), so every routed get/set/del/iter funnels into the
 /// instance's mapdict map+storage. `_obj_getdict` installs this view.
-pub struct MapDictStrategy;
+/// `space.fromcache(MapDictStrategy)` prebuilt instance. The dyn-call
+/// receiver is this address (`MapDictStrategy.__init__`).
+#[repr(C)]
+pub struct MapDictStrategy {
+    ob_header: pyre_object::PyObject,
+}
 
 // mapdict.py:310: allow_unboxing remains true on this shared terminator. A
 // type conflict in holder_pick_attr consequently freezes unboxing for every
@@ -5979,8 +5984,10 @@ pub fn make_instance_dict() -> PyObjectRef {
 }
 
 /// `space.fromcache(MapDictStrategy)` process-wide singleton — same `&'static`
-/// ZST contract as [`pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY`].
-pub static MAP_DICT_STRATEGY: MapDictStrategy = MapDictStrategy;
+/// prebuilt instance as [`pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY`].
+pub static MAP_DICT_STRATEGY: MapDictStrategy = MapDictStrategy {
+    ob_header: pyre_object::PyObject::EMPTY,
+};
 
 pyre_object::define_prebuilt_dict_strategy_ref!(
     MAP_DICT_STRATEGY_REF,

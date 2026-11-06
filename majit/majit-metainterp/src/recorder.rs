@@ -449,10 +449,6 @@ fn snapshot_box_from_tagged<'c>(
 pub(crate) struct ByteBridgeResume {
     recorder: *const Trace,
     unique_cache: Vec<Option<Operand>>,
-    /// `_snapshot_data` offsets of live guards (`captured_resume_positions`).
-    /// `opencoder.py TraceIterator.next` stores that offset as
-    /// `rd_resume_position`; `get_snapshot_iter(index)` starts there.
-    snapshot_starts: Vec<usize>,
 }
 
 impl ByteBridgeResume {
@@ -460,7 +456,6 @@ impl ByteBridgeResume {
         Self {
             recorder: recorder as *const Trace,
             unique_cache,
-            snapshot_starts: recorder.captured_resume_positions(),
         }
     }
 
@@ -486,12 +481,14 @@ impl ByteBridgeResume {
         }
         // resume.py `ResumeDataVirtualAdder.finish` always calls
         // `trace.get_snapshot_iter(rd_resume_position)`. That index is a
-        // snapshot start (`opencoder.py TraceIterator.next` assigns the
-        // descr-slot offset). An arbitrary offset inside `_snapshot_data`
-        // is not a snapshot.
-        self.snapshot_starts
-            .iter()
-            .any(|&offset| offset == resume_pos as usize)
+        // byte offset into `_snapshot_data` (`opencoder.py
+        // TraceIterator.next`). A live guard's current descr slot is not
+        // the only valid start: a superseded capture at an earlier offset
+        // is still a `get_snapshot_iter` argument.
+        let rec = unsafe { &*self.recorder };
+        rec.trb
+            .as_ref()
+            .is_some_and(|trb| (resume_pos as usize) < trb._snapshot_data.len())
     }
 
     pub(crate) fn number_guard(
@@ -3157,9 +3154,10 @@ mod tests {
     }
 
     #[test]
-    fn byte_bridge_resume_contains_snapshot_starts_only() {
+    fn byte_bridge_resume_contains_offsets_in_snapshot_data() {
         // resume.py finish → get_snapshot_iter(rd_resume_position). The
-        // index is a snapshot start, not any offset in `_snapshot_data`.
+        // index is a byte offset into `_snapshot_data`, including a
+        // superseded capture whose descr slot was later patched.
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
@@ -3188,14 +3186,10 @@ mod tests {
         assert!(feed.contains(off0));
         assert!(feed.contains(off1));
         assert!(!feed.contains(-1));
-        if off0 + 1 != off1 {
-            assert!(!feed.contains(off0 + 1));
-        }
         let data_len = rec.get_position().snapshot_data_len as i32;
         assert!(data_len > off1);
-        if data_len - 1 != off0 && data_len - 1 != off1 {
-            assert!(!feed.contains(data_len - 1));
-        }
+        assert!(feed.contains(data_len - 1));
+        assert!(!feed.contains(data_len));
     }
 
     #[test]

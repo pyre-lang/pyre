@@ -5430,12 +5430,18 @@ pub fn is_module_dict_version_field(descr: &DescrRef) -> bool {
 ///
 /// `kind` is the stored `StrategyKind` discriminant (`strategy_is` reads it
 /// as a getfield). `imp` is `&'static dyn DictStrategy`
-/// (`two_word_fat_struct`); its data word and vtable word are `imp` /
-/// `imp.vtable` (`VecFieldPart::FatVtable`). `owner` is the GC owner of a
-/// per-dict strategy instance. `kind` / `imp` / `imp.vtable` / `owner` are
-/// `_immutable_fields_`: the holder stands for the frozen strategy
-/// instance and is replaced, never mutated, on a strategy switch
-/// (`dictmultiobject.py W_DictMultiObject.set_strategy`).
+/// (`two_word_fat_struct`); its data word is `imp`, and the metadata word
+/// is both `imp.vtable` (`VecFieldPart::FatVtable`, Ref) and `imp.len`
+/// (`VecFieldPart::FatLen`, Int) at the same offset — `dyn_fat.rs` emits
+/// the Int spelling when the word feeds `method_*`. `descr.py
+/// get_field_descr` is one FieldDescr per `(STRUCT, name)` sharing the
+/// parent SizeDescr; without `imp.len` in this group the translator mints
+/// a detached parent (`GcCache::get_size_descr` synthetic tid) and
+/// `protect_speculative_field` (`llmodel.py`) fails it. `owner` is the GC
+/// owner of a per-dict strategy instance. `kind` / `imp` / `imp.vtable` /
+/// `imp.len` / `owner` are `_immutable_fields_`: the holder stands for the
+/// frozen strategy instance and is replaced, never mutated, on a strategy
+/// switch (`dictmultiobject.py W_DictMultiObject.set_strategy`).
 static DICT_STRATEGY_REF_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
     LazyLock::new(|| {
         use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
@@ -5505,6 +5511,17 @@ static DICT_STRATEGY_REF_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup
             ),
             field(
                 u32::MAX,
+                "imp.len",
+                imp_offset + WORD,
+                WORD,
+                Type::Int,
+                true,
+                false,
+                ArrayFlag::Unsigned,
+                3,
+            ),
+            field(
+                u32::MAX,
                 "owner",
                 owner_offset,
                 WORD,
@@ -5512,7 +5529,7 @@ static DICT_STRATEGY_REF_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup
                 true,
                 false,
                 ArrayFlag::Pointer,
-                3,
+                4,
             ),
         ];
         let cache_key = majit_ir::descr::path_hash("dictmultiobject::DictStrategyRef");
@@ -14656,21 +14673,35 @@ mod tests {
         assert!(!owner.is_quasi_immutable());
         let imp = dict_strategy_ref_field_descr("imp");
         let vtable = dict_strategy_ref_field_descr("imp.vtable");
+        let fat_len = dict_strategy_ref_field_descr("imp.len");
         let imp_field = imp.as_field_descr().expect("imp field descr");
         let vtable_field = vtable.as_field_descr().expect("imp.vtable field descr");
+        let len_field = fat_len.as_field_descr().expect("imp.len field descr");
         assert!(imp.is_always_pure());
         assert!(!imp.is_quasi_immutable());
         assert!(vtable.is_always_pure());
         assert!(!vtable.is_quasi_immutable());
+        assert!(fat_len.is_always_pure());
+        assert!(!fat_len.is_quasi_immutable());
         assert_eq!(
             imp_field.offset(),
             core::mem::offset_of!(DictStrategyRef, imp),
         );
         assert_eq!(vtable_field.offset(), imp_field.offset() + WORD);
+        assert_eq!(len_field.offset(), vtable_field.offset());
         assert_eq!(imp_field.field_size(), WORD);
         assert_eq!(vtable_field.field_size(), WORD);
+        assert_eq!(len_field.field_size(), WORD);
         assert_eq!(imp_field.field_type(), Type::Ref);
         assert_eq!(vtable_field.field_type(), Type::Ref);
+        assert_eq!(len_field.field_type(), Type::Int);
+        let len_parent = len_field
+            .get_parent_descr()
+            .expect("imp.len parent SizeDescr");
+        assert!(
+            std::sync::Arc::ptr_eq(&kind_parent, &len_parent),
+            "imp.len shares the DictStrategyRef SizeDescr",
+        );
         let group_parent = DICT_STRATEGY_REF_DESCR_GROUP.size_descr.clone() as DescrRef;
         assert!(std::sync::Arc::ptr_eq(&kind_parent, &group_parent));
         for (i, descr) in DICT_STRATEGY_REF_DESCR_GROUP
@@ -14730,6 +14761,41 @@ mod tests {
             std::sync::Arc::ptr_eq(&found, &mutate),
             "mutate_descr_for_quasi_field must return the group mutate_mstrategy row",
         );
+    }
+
+    #[test]
+    fn make_descr_from_bh_bridges_dict_strategy_ref_imp_len() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_jitcode::jitcode::BhDescr;
+        use pyre_object::dictmultiobject::DictStrategyRef;
+
+        let canonical = dict_strategy_ref_field_descr("imp.len");
+        let offset = core::mem::offset_of!(DictStrategyRef, imp) + WORD;
+        for owner in [
+            "DictStrategyRef",
+            "dictmultiobject::DictStrategyRef",
+            "pyre_object::dictmultiobject::DictStrategyRef",
+        ] {
+            let descr = make_descr_from_bh(&BhDescr::Field {
+                offset,
+                field_size: WORD,
+                field_type: Type::Int,
+                field_flag: ArrayFlag::Unsigned,
+                is_field_signed: false,
+                is_immutable: true,
+                is_quasi_immutable: false,
+                index_in_parent: Some(3),
+                parent: None,
+                name: "imp.len".into(),
+                owner: owner.into(),
+                load_is_acquire: false,
+                store_is_release: false,
+            });
+            assert!(
+                std::sync::Arc::ptr_eq(&descr, &canonical),
+                "{owner}.imp.len must bridge to the canonical group entry Arc",
+            );
+        }
     }
 
     #[test]
@@ -18059,6 +18125,8 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             {
                 let lookup = if name.ends_with("imp.vtable") {
                     Some("imp.vtable")
+                } else if name.ends_with("imp.len") {
+                    Some("imp.len")
                 } else if name.as_str() == "kind" || name.ends_with(".kind") {
                     Some("kind")
                 } else if name.as_str() == "owner" || name.ends_with(".owner") {
