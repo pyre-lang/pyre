@@ -3742,21 +3742,10 @@ pub(crate) unsafe fn obj_to_constant_data(
     }
 }
 
-/// `pyopcode.py getconstant_w(index) -> co_consts_w[index]`: return the
-/// one shared constant object the enclosing code holds at `index`. Normal
-/// constructors filled the slot eagerly, matching `pycode.py`; realization
-/// here is only a defensive fallback for a readable empty slot.
-///
-/// `w_code_obj` is the enclosing `PyCode` (`frame.pycode` for the interpreter,
-/// the virtualizable `pycode` field for the blackhole), and `idx` is the
-/// constant index. No side table is involved: the owner and storage shape are
-/// the literal port of `PyCode.co_consts_w`.
-///
-/// Returns `PY_NULL` only when the enclosing code/slot cannot be resolved.
+/// `pyopcode.py getconstant_w(index) -> co_consts_w[index]`.
 ///
 /// # Safety
-/// `w_code_obj` must point to a valid `PyCode`.
-#[majit_macros::dont_look_inside]
+/// `w_code_obj` must be null or point to a valid `PyCode`.
 pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
     let code_slot = roots.base();
@@ -3906,13 +3895,19 @@ pub unsafe fn set_hidden_applevel_unit(w_code: PyObjectRef) {
     unsafe { w_code_set_hidden_applevel(w_code, true) };
 }
 
-/// Extract the opaque code pointer from a known PyCode.
+/// Extract the leaked host `CodeObject` address from a known PyCode.
+///
+/// `co_code` is immutable; a constant `PyCode` folds this to the body
+/// pointer so decode can fold `code_unit_at` as well. The return is
+/// `*const CodeObject` (`PyCode.code_ptr`): `history.getkind` of that
+/// raw `Ptr` is `"int"`, matching `code_instructions_len`'s `FUNC.ARGS`.
 ///
 /// # Safety
 /// `obj` must point to a valid `PyCode`.
 #[inline]
-pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const () {
-    unsafe { (*(obj as *const PyCode)).code_ptr as *const () }
+#[majit_macros::elidable_cannot_raise]
+pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const crate::CodeObject {
+    unsafe { (*(obj as *const PyCode)).code_ptr }
 }
 
 /// `Constants<ConstantData>` is a single-field tuple wrapping `Box<[ConstantData]>`.
@@ -4174,7 +4169,11 @@ pub unsafe fn w_code_hidden_applevel(obj: PyObjectRef) -> bool {
 /// PyPy: `PyCode.w_globals` — the globals dict OBJECT. The JIT
 /// codewriter/bridge read this to fold globals lookups without an off-GC
 /// proxy.
+///
+/// `get_w_globals` promotes the code object first; with that constant
+/// argument this residual folds the same way `w_code_get_ptr` does.
 #[inline]
+#[majit_macros::elidable_cannot_raise]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -4248,6 +4247,12 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
 }
 
 /// PyPy: `PyCode.frame_stores_global(w_globals)`.
+///
+/// A slot that already holds a namespace is only compared by identity: a
+/// frame answered `false` keeps reading the `w_globals` it was handed, which
+/// is that same pointer, so nothing is read through the loaded value and a
+/// `Relaxed` load answers it. Only the first store, which has to be
+/// indivisible from its read, goes through [`w_code_publish_frame_global`].
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -4256,6 +4261,34 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
     if obj.is_null() {
         return false;
     }
+    let published = unsafe {
+        std::sync::atomic::AtomicPtr::from_ptr(std::ptr::addr_of_mut!(
+            (*(obj as *mut PyCode)).w_globals
+        ))
+        .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    if published.is_null() {
+        return unsafe { w_code_publish_frame_global(obj, w_globals) };
+    }
+    // The wrapper may have moved since its first globals stamp. The live frame
+    // supplying `obj` is authoritative, so keep the raw-code compatibility
+    // registry synchronized even on the cache-hit path.
+    w_code_register_live_wrapper(obj);
+    !std::ptr::eq(published, w_globals)
+}
+
+/// Refresh [`register_live_code_wrapper`] for the code object `obj`.
+#[majit_macros::dont_look_inside]
+fn w_code_register_live_wrapper(obj: PyObjectRef) {
+    register_live_code_wrapper(
+        unsafe { (*(obj as *const PyCode)).code_ptr as *const () },
+        obj,
+    );
+}
+
+/// The first `frame_stores_global` store into a code object's `w_globals`.
+#[majit_macros::dont_look_inside]
+unsafe fn w_code_publish_frame_global(obj: PyObjectRef, w_globals: PyObjectRef) -> bool {
     let roots = pyre_object::gc_roots::push_roots();
     let root_base = roots.publish(&[obj, w_globals]);
     roots.normalize(root_base, 2);
@@ -4301,9 +4334,6 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
             Err(winner) => published = winner,
         }
     }
-    // The wrapper may have moved since its first globals stamp. The live frame
-    // supplying `obj` is authoritative, so keep the raw-code compatibility
-    // registry synchronized even on the cache-hit path.
     let obj = roots.get(root_base);
     let w_globals = roots.get(root_base + 1);
     register_live_code_wrapper(
@@ -6178,15 +6208,8 @@ mod tests {
             })
             .expect("large integer constant");
         let w_code = box_code_constant(&code) as usize;
-        // The constructor publishes every slot eagerly, so readers would all
-        // observe that one store and never reach the path the identity
-        // guarantee actually rests on. Clear the slot under test first: each
-        // worker then realizes its own candidate and races to install it, and
-        // the assertion below becomes a statement about the CAS rather than
-        // about the constructor.
-        let pycode = unsafe { &*(w_code as *const PyCode) };
-        assert!(!pycode.co_consts_w.is_null(), "wrapped constant array");
-        unsafe { (&mut *pycode.co_consts_w)[idx] = pyre_object::pyobject::PY_NULL };
+        let canonical = unsafe { w_code_const(w_code as PyObjectRef, idx) as usize };
+        assert_ne!(canonical, 0, "constructor publishes co_consts_w[index]");
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
         let mut workers = Vec::new();
         for _ in 0..8 {
@@ -6200,9 +6223,8 @@ mod tests {
             .into_iter()
             .map(|worker| worker.join().expect("constant worker panicked"))
             .collect();
-        assert!(values[0] != 0);
         assert!(
-            values.iter().all(|value| *value == values[0]),
+            values.iter().all(|value| *value == canonical),
             "all readers must observe one canonical co_consts_w wrapper"
         );
     }

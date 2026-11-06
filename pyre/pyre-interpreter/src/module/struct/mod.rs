@@ -13,6 +13,7 @@
 use majit_rlib::rbigint::RBigInt as BigInt;
 use num_traits::ToPrimitive;
 use pyre_object::*;
+use rustpython_wtf8::Wtf8;
 
 /// True on a big-endian build; the native (`@` / no-prefix) byte order.
 const fn native_is_bigendian() -> bool {

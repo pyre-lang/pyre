@@ -268,7 +268,7 @@ pub const QUASI_IMMUT_SLOT_COUNT: usize = (QuasiImmutSlot::WKwDefs as usize) + 1
 /// `quasiimmut.py` keys everything off the mutate-field *name*. The tag
 /// names which embedded `mutate_<name>` a setter stores under
 /// (`quasi_immut_store!`).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, majit_macros::FieldlessEnumArg)]
 pub enum QuasiImmutSlot {
     Code,
     WFuncGlobalsObj,
@@ -1674,6 +1674,8 @@ pub unsafe fn getcode(obj: PyObjectRef) -> PyObjectRef {
                 return _get_immutable_code(obj);
             }
             // function.py `Function.getcode`: `jit.promote(self.code)`.
+            // Promote the pointer, not its address bits: a GuardValue on
+            // the integer is a baked immediate the collector cannot forward.
             return majit_metainterp::jit::promote((*func).code) as PyObjectRef;
         }
         // function.py `Function.getcode`: the untraced `return self.code`.
@@ -1711,7 +1713,7 @@ pub unsafe fn get_pycode(obj: PyObjectRef) -> *const () {
             !crate::is_builtin_code(code as PyObjectRef),
             "get_pycode called on a builtin function"
         );
-        crate::w_code_get_ptr(code as PyObjectRef)
+        crate::w_code_get_ptr(code as PyObjectRef) as *const ()
     }
 }
 
@@ -2985,19 +2987,18 @@ pub unsafe fn fset_func_code(obj: PyObjectRef, w_code: PyObjectRef) -> Result<()
         // generator, coroutine, and async generator remains permitted for
         // compatibility, but warns because the callable's result protocol
         // changes underneath existing references.
-        let old_code = &*(get_pycode(obj) as *const crate::CodeObject);
-        let kind_mask = crate::CodeFlags::GENERATOR
-            | crate::CodeFlags::COROUTINE
-            | crate::CodeFlags::ASYNC_GENERATOR;
+        let kind_mask = crate::astcompiler::consts::CO_GENERATOR
+            | crate::astcompiler::consts::CO_COROUTINE
+            | crate::astcompiler::consts::CO_ASYNC_GENERATOR;
+        let old_flags = (*(getcode(obj) as *const crate::pycode::PyCode)).co_flags;
+        let new_flags = (*(w_code as *const crate::pycode::PyCode)).co_flags;
         // `warn_deprecation` runs the app-level warnings machinery and
         // `function_get_doc` realizes the docstring; both allocate, so publish
         // the two operands and read them back from their root slots rather
         // than storing through a pre-move address.
         let _roots = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::pin_roots(&[obj, w_code]);
-        if old_code.flags.intersection(kind_mask).bits()
-            != (*raw_code).flags.intersection(kind_mask).bits()
-        {
+        if old_flags & kind_mask != new_flags & kind_mask {
             crate::warn::warn_deprecation(
                 "Assigning a code object of non-matching type is deprecated (e.g., from a generator to a plain function)",
             )?;
@@ -4317,7 +4318,8 @@ fn funccall_flat_from_args(
         }
         _ => unreachable!(),
     }
-    crate::pyframe::remember_frame_locals(&new_frame);
+    // `function.py funccall` writes locals through `setarrayitem_gc`;
+    // `set_locals_w` is that store.
     new_frame.fix_array_ptrs();
     // function.py `Function.funccall` — `new_frame.run(self.name, self.qualname)`
     // → `initialize_as_generator(name, qualname)` / `GeneratorIterator`.
@@ -4359,6 +4361,7 @@ pub fn funccall(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
 /// paired `direct_fn` returns the same `(type, value, traceback)` tuple as the
 /// regular closure but skips the builtin-call setup.
 type ExcInfoDirectFn = fn(&mut crate::pyframe::PyFrame) -> PyObjectRef;
+#[majit_macros::prebuilt_static]
 static SYS_EXC_INFO_CODE: std::sync::atomic::AtomicPtr<PyObject> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 majit_gc::oncelock_fn_static!(
@@ -4379,9 +4382,12 @@ pub fn register_sys_exc_info_path(code: PyObjectRef, direct_fn: ExcInfoDirectFn)
     let _ = SYS_EXC_INFO_DIRECT_FN.set(direct_fn);
 }
 
+/// The slot is only compared by identity against a function's code and never
+/// dereferenced through, so the read is a plain `Relaxed` load of the
+/// space-wide attribute (`space._code_of_sys_exc_info`).
 #[inline]
 fn sys_exc_info_code() -> PyObjectRef {
-    SYS_EXC_INFO_CODE.load(std::sync::atomic::Ordering::Acquire)
+    SYS_EXC_INFO_CODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[inline]
@@ -4421,12 +4427,11 @@ pub fn funccall_valuestack(
     // it on the shadow stack beside the anchored frame.
     let _entry_roots = pyre_object::gc_roots::push_roots();
     let func = _entry_roots.pin_root(func);
-    // `function.py funccall_valuestack` does not register an extra root: the
-    // caller frame is already a GC object kept live by `FrameAnchor` and the
-    // execution-context chain, and `pyframe_object_custom_trace` visits
-    // `locals_cells_stack_w`. Value-stack stores can still leave a young
-    // pointer in an old array, so the write barrier runs before anything allocates.
-    crate::pyframe::remember_frame_locals(frame);
+    // `function.py funccall_valuestack` never extracts `locals_cells_stack_w`.
+    // Value-stack stores go through `set_ref` (`setarrayitem_gc`) in the same
+    // block as the virtualizable array field read (`jtransform.py
+    // _check_no_vable_array`).
+
     // A compiled callee prologue can publish an overflow before control
     // returns to this dispatcher.  The fresh stack check belongs to the
     // Python frame entry (`PyFrame.execute_frame.insert_stack_check_here`),
@@ -4506,20 +4511,41 @@ pub fn funccall_valuestack(
         unsafe { &mut *caller.live() }.dropvalues(dropvalues);
 
         let code = _roots.get(root_base);
-        let rooted_arg = |index| _roots.get(root_base + 1 + index);
         // Pyre builtins share a single fn(&[PyObjectRef]) signature, so use
         // fixed-size stack arrays instead of heap-allocating a Vec.
+        // Inline the slot reloads: a `|index| _roots.get(...)` closure
+        // captures the RootScope as `__pos_0` and the annotator unions
+        // `Ptr(RootScope)` with the index word (`history.py` `getkind`
+        // `'int'`), which skips `funccall_valuestack` and leaves
+        // `funcrun_obj`'s Vec argument typed Ref.
         let result = match nargs {
             0 => unsafe { crate::builtin_code_call(code, &[]) },
-            1 => unsafe { crate::builtin_code_call(code, &[rooted_arg(0)]) },
-            2 => unsafe { crate::builtin_code_call(code, &[rooted_arg(0), rooted_arg(1)]) },
+            1 => unsafe { crate::builtin_code_call(code, &[_roots.get(root_base + 1)]) },
+            2 => unsafe {
+                crate::builtin_code_call(
+                    code,
+                    &[_roots.get(root_base + 1), _roots.get(root_base + 2)],
+                )
+            },
             3 => unsafe {
-                crate::builtin_code_call(code, &[rooted_arg(0), rooted_arg(1), rooted_arg(2)])
+                crate::builtin_code_call(
+                    code,
+                    &[
+                        _roots.get(root_base + 1),
+                        _roots.get(root_base + 2),
+                        _roots.get(root_base + 3),
+                    ],
+                )
             },
             4 => unsafe {
                 crate::builtin_code_call(
                     code,
-                    &[rooted_arg(0), rooted_arg(1), rooted_arg(2), rooted_arg(3)],
+                    &[
+                        _roots.get(root_base + 1),
+                        _roots.get(root_base + 2),
+                        _roots.get(root_base + 3),
+                        _roots.get(root_base + 4),
+                    ],
                 )
             },
             _ => unreachable!(),
@@ -4578,29 +4604,50 @@ pub fn funccall_valuestack(
         && fast_natural_arity == crate::BuiltinCodeFlags::PASSTHROUGHARGS1.bits() as usize
         && nargs >= 1
     {
+        // `Arguments::new` can collect, so pin `[code, w_obj]` on the
+        // function-entry RootScope across `make_arguments`. Two `pin_root`
+        // calls, not `pin_roots(&[code, w_obj])`: that temporary array
+        // lowers as `newlist` and the annotator then casts the list to
+        // RootScope. Opening the dropvalues RootScope before
+        // `make_arguments` lets the annotator type `arguments_w` as GCREF
+        // (`history.py` `getkind` `'int'` for the Vec header), and
+        // `funcrun_obj` then sees `[Ref, Ref, Ref]` against `[Ref, Ref, Int]`.
+        let pair_base = pyre_object::gc_roots::shadow_stack_len();
+        let _ = _entry_roots.pin_root(code as PyObjectRef);
+        let _ = _entry_roots.pin_root(unsafe { &*caller.live() }.peekvalue(nargs - 1));
+        let mut args = unsafe { &*caller.live() }.make_arguments(nargs - 1, false, func);
+        let code = _entry_roots.get(pair_base);
+        let w_obj = _entry_roots.get(pair_base + 1);
         // Same live-variable set as the fixed-arity arm above, for the same
         // two reasons: `dropvalues()` retires the frame slots that root these
-        // values, and the native Vec is not a root walker target.
-        // `builtin_code_call` roots nothing of its own, so pin `code` first,
-        // then read the `[w_obj, ...rest]` window from the live frame and
-        // publish it in one `pin_roots`.
+        // values, and `args.arguments_w` is a native Vec no root walker updates.
+        // Pin `[code, w_obj, ...args]` before `dropvalues` (`framework.py
+        // push_roots`); `function.py funccall_valuestack` then calls
+        // `code.funcrun_obj(self, w_obj, args)`.
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = _roots.base();
-        let _ = _roots.pin_root(code as PyObjectRef);
-        let mut args = unsafe { &*caller.live() }.make_arguments(nargs, false, func);
-        let _ = _roots.pin_roots(&args.arguments_w);
+        let _ = _roots.pin_root(code);
+        let _ = _roots.pin_root(w_obj);
+        // Per-word `pin_root`: `pin_roots(&args.arguments_w)` types the
+        // field as a GCREF list, then `Arguments::new` setattr of the
+        // native Vec unions `Ptr(GCREF) ∪ RustVec` and skips this graph,
+        // leaving `funcrun_obj`'s third argument typed Ref.
+        let n_args = args.arguments_w.len();
+        for i in 0..n_args {
+            let _ = _roots.pin_root(args.arguments_w[i]);
+        }
         unsafe { &mut *caller.live() }.dropvalues(dropvalues);
+        let code_now = _roots.get(root_base);
+        let w_obj_now = _roots.get(root_base + 1);
         pyre_object::gc_roots::shadow_stack_copy_range_into_vec(
-            root_base + 1,
+            root_base + 2,
             &mut args.arguments_w,
         );
-        return match unsafe { crate::builtin_code_call(_roots.get(root_base), &args.arguments_w) } {
-            Ok(v) => v,
-            Err(e) => {
-                crate::call::set_call_error(e);
-                pyre_object::PY_NULL
-            }
-        };
+        return crate::gateway::BuiltinCodePassThroughArguments1::funcrun_obj(
+            code_now,
+            w_obj_now,
+            args.arguments_w,
+        );
     }
 
     // function.py:201-203 — fallback: build Arguments via make_arguments
@@ -4616,16 +4663,18 @@ pub fn funccall_valuestack(
     //
     // `pyframe.py peekvalues` allocates first (`[None] * n`) then copies
     // from still-live frame slots with no further allocation, so the slice
-    // is already forwarded when it returns; `pin_roots` is the next call
-    // and does not allocate.  The per-argument loop lives in `pin_roots` /
-    // `shadow_stack_copy_range_into_vec`, not here — `function.py
-    // funccall_valuestack` has no loop.
+    // is already forwarded when it returns.  Per-word `pin_root` follows
+    // so `arguments_w` stays a native Vec (`pin_roots(&arguments_w)` types
+    // the field GCREF and skips the graph).
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = _roots.base();
     let _ = _roots.pin_root(func);
     let mut args =
         unsafe { &*caller.live() }.make_arguments(nargs, methodcall, _roots.get(root_base));
-    let _ = _roots.pin_roots(&args.arguments_w);
+    let n_args = args.arguments_w.len();
+    for i in 0..n_args {
+        let _ = _roots.pin_root(args.arguments_w[i]);
+    }
     unsafe { &mut *caller.live() }.dropvalues(dropvalues);
     let func_now = _roots.get(root_base);
     pyre_object::gc_roots::shadow_stack_copy_range_into_vec(root_base + 1, &mut args.arguments_w);
@@ -4691,12 +4740,8 @@ fn _flat_pycall(
     for i in 0..nargs {
         new_frame.set_locals_w(i, frame.peekvalue(nargs - 1 - i));
     }
-    // `PyFrame.__init__` allocates `locals_cells_stack_w` as a fresh
-    // `[None] * size` nursery array.  Arguments just written into it are
-    // also young.  `remember_frame_locals_array` still runs: a full nursery
-    // can spill the array to old-gen, and until the callee sits on
-    // `f_backref` nothing else exposes these slots.
-    crate::pyframe::remember_frame_locals(&new_frame);
+    // function.py `_flat_pycall` writes `new_frame.locals_cells_stack_w[i]`
+    // through `set_locals_w` (`setarrayitem_gc`).
     let frame = unsafe { &mut *caller.live() };
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
@@ -4715,14 +4760,9 @@ fn _flat_pycall(
             }
         }
     } else {
-        let eval_fn = crate::call::get_eval_fn();
-        match eval_fn(&mut new_frame, None) {
-            Ok(v) => v,
-            Err(e) => {
-                crate::call::set_call_error(e);
-                pyre_object::PY_NULL
-            }
-        }
+        // `function.py` `_flat_pycall` returns `new_frame.run(...)`.
+        // `call::eval_current_frame_raw` is that call (`dont_look_inside`).
+        crate::call::eval_current_frame_raw(&mut new_frame)
     }
 }
 
@@ -4748,9 +4788,13 @@ fn _flat_pycall_defaults(
     // frame's trace keeps them. Normalizing a published root is a safepoint,
     // so every call input goes out in one publish and is read back from its
     // slot before use.
+    //
+    // Free-function `pin_roots`: `_roots.publish(&[func, code, defs])`
+    // lowers the temporary array as `newlist` and the annotator then casts
+    // that list to RootScope, which skips `funccall_valuestack` and leaves
+    // `funcrun_obj`'s Vec argument typed Ref.
     let _roots = pyre_object::gc_roots::push_roots();
-    let inputs_base = _roots.publish(&[func, code, defs]);
-    _roots.normalize(inputs_base, 3);
+    let inputs_base = pyre_object::gc_roots::pin_roots(&[func, code, defs]);
     let func = _roots.get(inputs_base);
     let code = _roots.get(inputs_base + 1);
     let defs_idx = inputs_base + 2;
@@ -4798,9 +4842,7 @@ fn _flat_pycall_defaults(
         }
     }
 
-    // Same barrier as `_flat_pycall`: a full nursery can spill the callee's
-    // locals array to old-gen, and the arguments and defaults in it are young.
-    crate::pyframe::remember_frame_locals(&new_frame);
+    // Same as `_flat_pycall`: `set_locals_w` is `setarrayitem_gc`.
     let frame = unsafe { &mut *caller.live() };
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
@@ -4816,14 +4858,8 @@ fn _flat_pycall_defaults(
             }
         }
     } else {
-        let eval_fn = crate::call::get_eval_fn();
-        match eval_fn(&mut new_frame, None) {
-            Ok(v) => v,
-            Err(e) => {
-                crate::call::set_call_error(e);
-                pyre_object::PY_NULL
-            }
-        }
+        // `function.py` `_flat_pycall_defaults` returns `new_frame.run(...)`.
+        crate::call::eval_current_frame_raw(&mut new_frame)
     }
 }
 

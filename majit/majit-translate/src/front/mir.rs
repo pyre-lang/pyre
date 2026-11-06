@@ -457,6 +457,7 @@ pub(crate) fn absorb_semantic_program(
                 acc.exception_class_hints.push(hint);
             }
             acc.atomic_load_decls.extend(prog.atomic_load_decls);
+            acc.residual_fn_catalog.extend(prog.residual_fn_catalog);
         }
     }
 }
@@ -586,6 +587,12 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             &mut acc.enum_variant_by_discriminant,
             Some(&acc.struct_ids),
         );
+        if acc.residual_fn_catalog.is_empty() {
+            for llbc in llbcs {
+                acc.residual_fn_catalog
+                    .extend(crate::residual_shim::catalog_from_llbc(llbc));
+            }
+        }
     }
     Ok(
         merged.unwrap_or_else(|| crate::front::semantic::SemanticProgram {
@@ -605,6 +612,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             unsafe_fn_stubs: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),
             atomic_load_decls: Vec::new(),
+            residual_fn_catalog: Vec::new(),
         }),
     )
 }
@@ -1820,6 +1828,7 @@ impl CrateLoweringState {
             crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
                 std::slice::from_ref(llbc),
             );
+        llbc.register_raw_alloc_flavor_paths(raw_alloc_flavor_structs.iter().cloned());
         // ── Pass 1: walk type_decls + trait_decls ─────────────────────
         let (
             mut known_struct_names,
@@ -2323,6 +2332,7 @@ impl<'l> CrateLowering<'l> {
                 &self.state.raw_alloc_flavor_structs,
             ),
             &self.state.raw_alloc_flavor_structs,
+            fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside),
         );
         if result_exc_ok_is_unit(
             &fd.signature.output,
@@ -2395,6 +2405,7 @@ impl<'l> CrateLowering<'l> {
             root_stack,
             Some(spec),
             false,
+            None,
             None,
         ) {
             Ok(g) => g,
@@ -2512,6 +2523,8 @@ impl<'l> CrateLowering<'l> {
                 segments,
                 body,
                 fn_id: fd.def_id,
+                types: req.types,
+                const_generics: req.const_generics,
             }),
             header,
             dont_look_inside: dont_look_inside.contains(&policy_fn_path),
@@ -2551,6 +2564,7 @@ impl<'l> CrateLowering<'l> {
                 &self.state.raw_alloc_flavor_structs,
             ),
             &self.state.raw_alloc_flavor_structs,
+            fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside),
         );
         // Local 0 is the return place. A clause-spec body is the FunDecl
         // with type arguments substituted, so that local is the instantiated
@@ -2624,6 +2638,7 @@ impl<'l> CrateLowering<'l> {
             Some(spec_queue),
             true,
             Some(spec.segments.join("::")),
+            Some((spec.types.as_slice(), spec.const_generics.as_slice())),
         ) {
             Ok(g) => g,
             Err(e) => {
@@ -2655,6 +2670,14 @@ pub(crate) struct SpecBody {
     segments: Vec<String>,
     body: majit_charon_reader::ullbc::Unstructured,
     fn_id: u64,
+    /// Call-site `generics.types` this copy was keyed on.
+    ///
+    /// `FunctionDesc.cachedgraph` is a separate graph whose annotations are
+    /// the concrete arguments (`specialize.py`). `size_align_const_from_tyexpr`
+    /// substitutes depth-0 `TypeVar`s in a leftover generic `size_of` /
+    /// `align_of` type argument with these, so `llmemory.sizeof` folds.
+    types: Vec<serde_json::Value>,
+    const_generics: Vec<serde_json::Value>,
 }
 
 impl DeclaredSpec {
@@ -2741,6 +2764,7 @@ impl CrateLoweringState {
             unsafe_fn_stubs: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),
             atomic_load_decls,
+            residual_fn_catalog: Vec::new(),
         }
     }
 }
@@ -3038,8 +3062,11 @@ impl SemanticFunctionHeader {
         // `dont_look_inside_return_token` spells a raw address word as
         // `i64` (`history.py` `getkind` of `Ptr`): a primitive scalar
         // pointer, or a declared-Raw ADT pointer
-        // (`raw_ptr_node_is_declared_raw` / `declared_raw_adt_node`).
-        // `scalar_result_token` matches that spelling. Ordinary
+        // (`raw_ptr_node_is_declared_raw` / `declared_raw_adt_node`), and
+        // a pair-slice as `u64`. `scalar_result_token` matches those
+        // spellings. A looked-inside `IntArray::as_slice` /
+        // `fsencode_bytes_w` lowers to a GcArray (`rlist.py` `ll_items`,
+        // `rstr.py` `Array(Char)`); CFG kind is `ref`. Ordinary
         // looked-inside graphs keep FUNC.RESULT unstamped so
         // `func_result_kind` follows the CFG (`flatten.py` `make_return`).
         // Residual and trait-method callees take `stamp_return_token` and
@@ -3054,6 +3081,14 @@ impl SemanticFunctionHeader {
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
             )
+            && !output_is_pair_slice(&signature.output, llbc, error_carrier)
+            && dont_look_inside_return_container_root(
+                &signature.output,
+                llbc,
+                error_carrier,
+                gc_struct_ids,
+            )
+            .is_none()
         {
             signature_token
         } else {
@@ -3557,12 +3592,11 @@ pub(crate) fn positional_field_type(ty: &str) -> String {
 
 pub(crate) fn tuple_field_value_type(type_name: &str) -> ValueType {
     let type_name = type_name.trim();
-    // A one-word-item Vec is `Ptr(Struct(raw) "RustVec")`
-    // (`rrustvec.rs rust_vec_lltype`); `getkind` of a raw pointer is
-    // `'int'`. Same recognizer as `Bookkeeper::project_rust_vec`.
-    if majit_ir::rvec::rust_vec_item_kind_for_spelling(type_name, crate::layout::target_word_size())
-        .is_some()
-    {
+    // A `Vec<T>` is `Ptr(Struct(raw) "RustVec")` (`rrustvec.rs
+    // rust_vec_lltype`); `getkind` of a raw pointer is `'int'`. Same
+    // header recognizer as `Bookkeeper::project_rust_vec`; item kind
+    // only selects `ll_vec_*`.
+    if majit_ir::rvec::vec_item_spelling(type_name).is_some() {
         return ValueType::Int;
     }
     // `history.py` `getkind` of a raw `Ptr` whose pointee is a non-byte
@@ -3708,13 +3742,36 @@ fn published_struct_field_layout(
     }
 }
 
+/// Canonical `*mut Vec<…>` spelling of a one-word-item Vec header pointer.
+///
+/// `Some` when `ty` is a `Vec` / `VecDeque` / `[T]` (`tyref_rust_vec_layout`)
+/// whose item kind is Int, Ref, or Float. `None` otherwise, including an
+/// item kind the projector does not name — callers then take
+/// [`annotation_struct_field_type`] / [`tyref_to_field_layout_string`].
+pub(in crate::front::mir) fn rust_vec_header_ptr_spelling(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<String> {
+    tyref_rust_vec_layout(ty, llbc)?;
+    match tyref_rust_vec_item_kind(ty, llbc) {
+        Some(majit_ir::rvec::VecItemKind::Int) => {
+            let item =
+                tyref_rust_vec_item_spelling(ty, llbc).unwrap_or_else(|| "usize".to_string());
+            Some(format!("*mut Vec<{item}>"))
+        }
+        Some(majit_ir::rvec::VecItemKind::Ref) => Some("*mut Vec<GCREF>".to_string()),
+        Some(majit_ir::rvec::VecItemKind::Float) => Some("*mut Vec<f64>".to_string()),
+        None => None,
+    }
+}
+
 /// Type string `Bookkeeper::project_struct_field_type` consumes for a
-/// declared field. A `Vec` of one-word items is a canonical header-pointer
-/// spelling `project_rust_vec` accepts. An integer item keeps its own
-/// spelling (`usize` / `u64` versus `isize` / `i64`) so that projector can
-/// set `SomeInteger.unsigned`. [`tyref_to_field_layout_string`] writes
-/// `isize`, which annotates as `SomeInteger` and then `len` of the field
-/// raises `'int' has no length`.
+/// declared field. A stored `*mut Vec<T>` / `&Vec<T>` of one-word items is a
+/// canonical header-pointer spelling `project_rust_vec` accepts. An integer
+/// item keeps its own spelling (`usize` / `u64` versus `isize` / `i64`) so
+/// that projector can set `SomeInteger.unsigned`. [`tyref_to_field_layout_string`]
+/// writes `isize`, which annotates as `SomeInteger` and then `len` of the
+/// field raises `'int' has no length`.
 fn annotation_struct_field_type(
     ty: &TyRef,
     llbc: &Llbc,
@@ -5155,11 +5212,12 @@ impl DeclaredGcFacts {
         self.field0.extend(other.field0);
     }
 
-    /// `StructId`s whose declared kind is `Gc`.
+    /// `StructId`s on the `GcType` field-0 chain.
     ///
     /// (a) a majit-gc `GcType` impl, (b) field 0 of a `Gc` type, (c) a
     /// type whose field 0 is `Gc`. (b) and (c) run to a fixpoint over
-    /// the field-0 edges. Every other analysed struct or enum is `Raw`.
+    /// the field-0 edges. A type absent from this set is `Raw`
+    /// ([`declared_gckind`]).
     pub(crate) fn gc_struct_ids(&self) -> std::collections::HashSet<majit_ir::descr::StructId> {
         let mut children: std::collections::HashMap<
             majit_ir::descr::StructId,
@@ -5207,6 +5265,22 @@ pub(crate) fn struct_id_is_declared_gc(
             .is_some_and(|template| gc_struct_ids.contains(&template))
 }
 
+/// Declared `Struct._gckind`: a `GcType` seed (or its field-0 parent) is
+/// `Gc`, every other identity is `Raw`. `history.py getkind` of `Ptr(TO)`
+/// reads `TO._gckind`; the rtyper stamps that from `layout.gckind`.
+pub(crate) fn declared_gckind(
+    sid: majit_ir::descr::StructId,
+    name: &str,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> crate::translator::rtyper::lltypesystem::lltype::GcKind {
+    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+    if struct_id_is_declared_gc(gc_struct_ids, sid, name) {
+        GcKind::Gc
+    } else {
+        GcKind::Raw
+    }
+}
+
 fn struct_id_for_type_decl(td: &TypeDecl) -> majit_ir::descr::StructId {
     majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&td.item_meta.name_path()))
 }
@@ -5222,12 +5296,16 @@ fn trait_path_is_majit_gc_gctype(path: &str) -> bool {
     crate_name == Some("majit_gc") && name == Some("GcType")
 }
 
-/// By-value field 0 of a struct, when that field is itself a struct.
+/// By-value field 0 of a struct, when that field is a container that is
+/// itself a struct.
 ///
 /// `lltype.py` `Struct._first_struct` returns the first field only when
 /// `isinstance(FIRSTTYPE, Struct)` and `self._gckind == FIRSTTYPE._gckind`.
 /// That is the only parent relation (`castable`, `_upcast`). An Enum is
-/// never a parent. A reference or raw pointer is not the inlined parent
+/// never a parent. A `repr(transparent)` newtype whose sole non-ZST field
+/// is a scalar is not a container (`tyref_is_container_type`): the value
+/// paint peels it to its inner word, so it is not a Struct in lltype terms.
+/// A reference or raw pointer is not the inlined parent either
 /// (`Struct.__init__` inlines a container only as the first field). `Ref`
 /// and `RawPtr` stay in place here; only an `Adt` node yields an id.
 fn struct_field0_type_id(llbc: &Llbc, td: &TypeDecl) -> Option<majit_ir::descr::StructId> {
@@ -5238,6 +5316,9 @@ fn struct_field0_type_id(llbc: &Llbc, td: &TypeDecl) -> Option<majit_ir::descr::
         return None;
     };
     let field = fields.first()?;
+    if !tyref_is_container_type(&field.ty, llbc) {
+        return None;
+    }
     let node = strip_ty_indirections(tyref_node(&field.ty, llbc)?, llbc)?;
     if node.get("Ref").is_some() || node.get("RawPtr").is_some() {
         return None;
@@ -5283,6 +5364,14 @@ pub(crate) fn harvest_declared_gc_facts(llbc: &Llbc) -> DeclaredGcFacts {
         };
         facts.seeds.push(struct_id_for_type_decl(td));
     }
+    // A closure env is a compiler-synthesized aggregate (`src: Closure`).
+    // The source cannot declare `GcType` on it. RPython has no closure;
+    // the nearest shape is `rtuple.py TupleRepr` = `Ptr(GcStruct)`.
+    for td in llbc.iter_type_decls() {
+        if type_decl_is_closure_env(td) {
+            facts.seeds.push(struct_id_for_type_decl(td));
+        }
+    }
     for td in llbc.iter_type_decls() {
         if type_decl_is_builtin_adt(td) {
             continue;
@@ -5297,12 +5386,12 @@ pub(crate) fn harvest_declared_gc_facts(llbc: &Llbc) -> DeclaredGcFacts {
 
 /// Declared `GcKind` of every struct and enum in `llbcs`, keyed by the
 /// crate-stripped type path. `Gc` follows [`DeclaredGcFacts::gc_struct_ids`]
-/// (the field-0 fixpoint); every other analysed struct or enum is `Raw`.
+/// (the field-0 fixpoint). Every other analysed struct or enum is `Raw`.
 #[cfg(test)]
+
 pub(crate) fn declared_gckind_by_name(
     llbcs: &[Llbc],
 ) -> std::collections::HashMap<String, crate::translator::rtyper::lltypesystem::lltype::GcKind> {
-    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
     let mut facts = DeclaredGcFacts::default();
     for llbc in llbcs {
         facts.absorb(harvest_declared_gc_facts(llbc));
@@ -5321,11 +5410,7 @@ pub(crate) fn declared_gckind_by_name(
                 continue;
             }
             let canon = strip_crate_prefix(&td.item_meta.name_path());
-            let kind = if struct_id_is_declared_gc(&gc, struct_id_for_type_decl(td), &canon) {
-                GcKind::Gc
-            } else {
-                GcKind::Raw
-            };
+            let kind = declared_gckind(struct_id_for_type_decl(td), &canon, &gc);
             out.insert(canon, kind);
         }
     }
@@ -5924,8 +6009,9 @@ pub struct LowerContext<'a> {
     /// Single-function entry points paint with this set, the same one the
     /// whole-program loop computes from `struct_origins`.
     tombstoned_leaves: std::collections::HashSet<String>,
-    /// Structs and enums declared Gc across this one artefact.
-    /// Absence is Raw (`DeclaredGcFacts::gc_struct_ids`).
+    /// Structs and enums on the `GcType` field-0 chain for this artefact.
+    /// A type absent from this set is still `Gc` when it is not raw
+    /// storage (`adt_def_is_raw_storage`).
     gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId>,
     /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
     /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
@@ -5947,19 +6033,26 @@ impl<'a> LowerContext<'a> {
     ) -> Self {
         shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
         // Single-function lowering does not run
-        // [`link_transparent_scalar_types`]. Publish the same external
-        // scalar the link pass adds, so a `CodeFlags` borrow is the word.
-        llbc.register_transparent_scalar_kinds(external_transparent_scalar_kinds());
+        // [`link_transparent_scalar_types`]. Discover this artefact's
+        // transparent scalars (and the external `CodeFlags` word the
+        // link pass also adds) so a defining-crate `RootScope` peels.
+        llbc.register_transparent_scalar_kinds(discover_transparent_scalar_kinds(llbc));
         let gc_struct_ids = harvest_declared_gc_facts(llbc).gc_struct_ids();
         let immutable_fields = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
             std::slice::from_ref(llbc),
         );
+        llbc.register_raw_struct_paths(discover_raw_struct_paths(
+            llbc,
+            &gc_struct_ids,
+            &immutable_fields,
+        ));
         let mut raw_alloc_flavor_structs =
             crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
                 llbc,
             ));
         // Flavor is a program-wide class property; a dependency's raw classes count here too.
         raw_alloc_flavor_structs.extend(dependency_raw_alloc_flavor_structs.iter().cloned());
+        llbc.register_raw_alloc_flavor_paths(raw_alloc_flavor_structs.iter().cloned());
         let (_, _, struct_fields, _, _, struct_field_attrs, _, _) = derive_program_metadata(
             llbc,
             &gc_struct_ids,
@@ -6159,6 +6252,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         None,
         false,
         None,
+        None,
     )
 }
 
@@ -6304,13 +6398,16 @@ use self::simplify::*;
 use self::strformat::*;
 use self::views::*;
 
+pub use self::consteval::link_transparent_scalar_types;
 pub(crate) use self::consteval::{
-    attach_foldable_const_lits, discover_foldable_const_lits, discover_transparent_scalar_kinds,
+    attach_foldable_const_lits, discover_foldable_const_lits, discover_raw_struct_paths,
+    discover_transparent_scalar_kinds, harvest_immutable_fields_from_immutable_statics,
     harvest_named_const_folds, push_named_const_folds, register_ambiguous_impl_foldable_const_lits,
     register_foldable_const_lits,
 };
 pub(crate) use self::desugar::callee::{
-    discover_eval_hook_graphs, release_declared_vable_array_address,
+    discover_eval_hook_graphs, inherent_callable_rust_path, registered_path_for_fun_decl,
+    release_declared_vable_array_address,
 };
 pub(crate) use self::desugar::rewire::{
     AggregateCtor, AggregateShape, emit_aggregate_value, is_core_clone_impls_clone_path,
@@ -6318,9 +6415,10 @@ pub(crate) use self::desugar::rewire::{
 };
 pub use self::gcroot::{
     PublishedStructBody, PublishedStructField, RootStackState, apply_published_structs,
-    erased_root_bracket_guards, fn_returns_owned_scope, harvest_published_structs,
-    harvest_root_stack_touching_paths, harvest_scope_owning_identities, mark_foreign_scope_owners,
-    scope_owner_identity,
+    erased_root_bracket_guards, fn_returns_owned_scope, function_touches_root_stack,
+    harvest_published_structs, harvest_root_stack_touching_paths, harvest_scope_owning_identities,
+    mark_foreign_scope_owners, pin_roots_published_locals, scope_owner_identity,
+    shadow_stack_erase_status,
 };
 pub(crate) use self::gcroot::{
     ROOT_SCOPE_CLOSE, RootStackAnalyzer, harvest_root_stack_touching_paths_with,
@@ -6330,16 +6428,17 @@ pub(crate) use self::gcroot::{
 #[cfg(test)]
 pub(crate) use self::lltype::stamp_fn_ptr_spelling;
 pub(crate) use self::lltype::{
-    ThreadLocalRefLlop, adt_head_instantiation_suffix, charon_array_len_to_string,
+    NullableStrEnum, ThreadLocalRefLlop, adt_head_instantiation_suffix, charon_array_len_to_string,
     charon_literal_to_ast_string, charon_type_value_to_ast_string,
     collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
-    fixed_array_index_identity, fnptr_indirect_enabled, host_rthread_threadlocalref_llop,
-    is_flattened_storage_leaf, is_rstr_str_layout_declaration, is_str_family_class_root,
-    is_str_length_field_class_root, is_str_oopspec_class_root,
-    items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
-    output_type_is_objectptr, push_unichr, same_nominal_adt, strip_crate_prefix,
+    fixed_array_index_identity, fixed_array_lowers_to_gcarray, fixed_list_reader,
+    fnptr_indirect_enabled, host_rthread_threadlocalref_llop, is_flattened_storage_leaf,
+    is_rstr_str_layout_declaration, is_str_family_class_root, is_str_length_field_class_root,
+    is_str_oopspec_class_root, items_block_accessor_returns_its_block, llbc_exception_class_hints,
+    nonzero_option_zero, output_type_is_objectptr, push_unichr, resolve_trait_assoc_type,
+    same_nominal_adt, strip_crate_prefix, type_decl_adt_tyref, type_decl_nullable_str_enum,
     type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn,
-    unichr_call,
+    tyref_nullable_str_enum, tyref_to_value_type, unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;
@@ -6521,6 +6620,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     spec: Option<&std::cell::RefCell<crate::front::clause_spec::SpecQueue>>,
     spec_body: bool,
     graph_name: Option<String>,
+    spec_instantiation: Option<(&[serde_json::Value], &[serde_json::Value])>,
 ) -> Result<FunctionGraph, LowerError> {
     // A clause specialization's readable name (`RDict::new__spec_…`) is
     // known to the caller. The body is still the template `FunDecl`, so
@@ -6720,12 +6820,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             // matcher sees the switch, leaving the plain 0/1 pair.
             // Untouched graphs skip this and keep their single
             // end-of-lowering simplify, byte-identical.
-            let guard_words = lo.guard_word_vars.clone();
             simplify_lowered_graph_expanding(
                 &mut lo.graph,
                 struct_field_attrs,
                 false,
-                &guard_words,
                 &expand_inline_struct,
             )?;
         }
@@ -7242,12 +7340,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
-        let guard_words = lo.guard_word_vars.clone();
         simplify_lowered_graph_expanding(
             &mut lo.graph,
             struct_field_attrs,
             true,
-            &guard_words,
             &expand_inline_struct,
         )?;
         // `removeassert.py` melt of abort-bound `format!` / `assert_eq!`
@@ -7313,12 +7409,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // so untouched graphs keep their single end-of-lowering simplify.
         if abort_messages_melted > 0 || collapse_panic_message_chains(&mut lo.graph) > 0 {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
-            let guard_words = lo.guard_word_vars.clone();
             simplify_lowered_graph_expanding(
                 &mut lo.graph,
                 struct_field_attrs,
                 true,
-                &guard_words,
                 &expand_inline_struct,
             )?;
         }
@@ -7386,6 +7480,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 lo.set_spec_body();
             }
         }
+        if let Some((types, consts)) = spec_instantiation {
+            lo.set_spec_instantiation(types, consts);
+        }
         // Back-edge targets (loop headers); empty for an acyclic body, in
         // which case `lower_framestate` reduces exactly to the two-pass
         // RPO walk.  Treat the threaded lowering and its shared
@@ -7445,6 +7542,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             lo.set_spec_body();
         }
     }
+    if let Some((types, consts)) = spec_instantiation {
+        lo.set_spec_instantiation(types, consts);
+    }
     match lo.lower(BlockOrder::Linear) {
         Ok(()) => {
             finish(&mut lo)?;
@@ -7489,6 +7589,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 if spec_body {
                     lo.set_spec_body();
                 }
+            }
+            if let Some((types, consts)) = spec_instantiation {
+                lo.set_spec_instantiation(types, consts);
             }
             lo.lower(BlockOrder::ReversePostorder)?;
             finish(&mut lo)?;
@@ -7993,11 +8096,10 @@ pub(crate) fn emit_rust_vec_drop_if_allocated(
     graph.block_mut(bb_id).operations.push(SpaceOperation {
         result: None,
         kind: OpKind::Call {
-            target: CallTarget::FunctionPath {
-                segments: rust_vec_helper_segments(majit_ir::rvec::VecOp::Free, kind),
-                fun_decl_id: None,
-                specialization: crate::parse::GraphSpecialization::Regular,
-            },
+            target: CallTarget::function_path(rust_vec_helper_segments(
+                majit_ir::rvec::VecOp::Free,
+                kind,
+            )),
             args: crate::model::call_args(vec![header.clone()]),
             result_ty: ValueType::Void,
         },

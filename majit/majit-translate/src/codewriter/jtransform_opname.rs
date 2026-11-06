@@ -1376,6 +1376,7 @@ fn emit_getarrayitem(
                 nolength: array_nolength(&array),
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: array._immutable_field(),
+                taken_by_address: false,
             },
             result,
         );
@@ -1404,6 +1405,7 @@ fn emit_getarrayitem(
                 nolength: array_nolength(&array),
                 gckind: crate::model::ArrayGcKind::Raw,
                 pure: false,
+                taken_by_address: false,
             },
             result,
         );

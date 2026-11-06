@@ -92,6 +92,8 @@ mod parse;
     )
 )]
 pub mod pipeline;
+/// genc `FunctionCodeGenerator` analogue for policy-declined residual callees.
+pub mod residual_shim;
 mod runtime_names;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -232,6 +234,7 @@ fn build_semantic_program_via_active_frontend(
             // the `GraphBodyProvider`, which keeps it and the state its
             // decls were lowered with.
             let mut discovered = Vec::new();
+            let mut raw_structs = Vec::new();
             let mut foldable_cross = Vec::new();
             let mut foldable_impl_by_ord = Vec::new();
             let mut duplicate_leaf_facts = front::mir::DuplicateLeafFacts::default();
@@ -240,6 +243,7 @@ fn build_semantic_program_via_active_frontend(
                 std::collections::HashMap::new();
             let mut immutable_fields = std::collections::HashMap::new();
             let mut unsafe_fn_stubs = Vec::new();
+            let mut residual_fn_catalog = Vec::new();
             let mut foreign_opaque_method_externals = Vec::new();
             let mut eval_hook_graphs = Vec::new();
             let mut declared_gc = front::mir::DeclaredGcFacts::default();
@@ -328,6 +332,11 @@ fn build_semantic_program_via_active_frontend(
                 ) {
                     immutable_fields.entry(k).or_insert(v);
                 }
+                // Explicit `#[jit_immutable_fields]` already won via
+                // `or_insert` above (`rclass.py _parse_field_list`).
+                for (k, v) in front::mir::harvest_immutable_fields_from_immutable_statics(&llbc) {
+                    immutable_fields.entry(k).or_insert(v);
+                }
                 for path in front::mir::discover_eval_hook_graphs(&llbc) {
                     if !eval_hook_graphs.contains(&path) {
                         eval_hook_graphs.push(path);
@@ -354,17 +363,30 @@ fn build_semantic_program_via_active_frontend(
             let gc_struct_ids = declared_gc.gc_struct_ids();
             published_structs.sort_by(|a, b| a.path.cmp(&b.path));
             published_structs.dedup_by(|a, b| a.path == b.path);
+            for p in &paths {
+                let llbc = majit_charon_reader::Llbc::load(p)
+                    .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
+                raw_structs.extend(front::mir::discover_raw_struct_paths(
+                    &llbc,
+                    &gc_struct_ids,
+                    &immutable_fields,
+                ));
+            }
+            raw_structs.sort();
+            raw_structs.dedup();
             for (ord, p) in paths.iter().enumerate() {
                 let mut llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
                 llbc.set_exception_carrier(static_addrs.error_carrier.carrier_path);
                 front::mir::mark_foreign_scope_owners(&llbc, &scope_owning_identities);
+                llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
+                llbc.register_raw_struct_paths(raw_structs.iter().cloned());
+                llbc.register_raw_alloc_flavor_paths(raw_alloc_flavor_structs.iter().cloned());
                 front::mir::apply_published_structs(&mut llbc, &published_structs);
                 if !eval_hook_graphs.is_empty() {
                     llbc.set_eval_hook_graphs(eval_hook_graphs.clone());
                 }
                 llbc.set_root_stack_effects(root_stack_crates.clone(), root_stack_touching.clone());
-                llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
                 llbc.register_stack_sensitive_fns(stack_sensitive.iter().cloned());
                 llbc.register_stack_depth_neutral_fns(stack_depth_neutral.iter().cloned());
                 llbc.register_stack_leaves_above_fns(stack_leaves_above.iter().cloned());
@@ -389,6 +411,7 @@ fn build_semantic_program_via_active_frontend(
                 ));
                 foreign_opaque_method_externals
                     .extend(front::mir::collect_foreign_opaque_method_externals(&llbc));
+                residual_fn_catalog.extend(crate::residual_shim::catalog_from_llbc(&llbc));
                 let prog = graph_bodies.lower_prelinked_crate(
                     llbc,
                     module_paths,
@@ -423,6 +446,7 @@ fn build_semantic_program_via_active_frontend(
                 unsafe_fn_stubs: Vec::new(),
                 foreign_opaque_method_externals: Vec::new(),
                 atomic_load_decls: Vec::new(),
+                residual_fn_catalog: Vec::new(),
             });
             front::mir::harden_duplicate_leaf_metadata(
                 &mut program.struct_fields,
@@ -432,8 +456,10 @@ fn build_semantic_program_via_active_frontend(
             );
             program.harvested_hints = hints;
             program.immutable_fields = immutable_fields;
+            program.raw_alloc_flavor_structs = raw_alloc_flavor_structs;
             program.unsafe_fn_stubs = unsafe_fn_stubs;
             program.foreign_opaque_method_externals = foreign_opaque_method_externals;
+            program.residual_fn_catalog = residual_fn_catalog;
             return (program, gc_struct_ids);
         }
     }
@@ -2095,12 +2121,7 @@ fn analyze_pipeline_from_module_paths(
             if let Some(host) = exact.and_then(|item| item.host.clone()) {
                 layout.host = Some(host);
             }
-            layout.gckind =
-                if crate::front::mir::struct_id_is_declared_gc(&declared_gc, sid, struct_name) {
-                    crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
-                } else {
-                    crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
-                };
+            layout.gckind = crate::front::mir::declared_gckind(sid, struct_name, &declared_gc);
             if census_struct_layouts {
                 let variants = struct_layout_variants.entry(sid).or_default();
                 if let Some((_, spellings)) = variants.iter_mut().find(|(observed, _)| {
@@ -2114,6 +2135,7 @@ fn analyze_pipeline_from_module_paths(
             call_control.set_struct_layout(sid, layout);
         }
     }
+    call_control.set_declared_gc_struct_ids(declared_gc);
     if census_struct_layouts {
         let struct_id_count = struct_layout_variants.len();
         let aliased_struct_ids = struct_layout_variants
@@ -2964,6 +2986,7 @@ fn analyze_pipeline_from_module_paths(
         all_liveness: Vec::new(),
         callinfo_rows: Vec::new(),
         ei_descr_mints: Vec::new(),
+        residual_shim_targets: Vec::new(),
         total_blocks: 0,
         total_ops: 0,
         total_vable_rewrites: 0,
@@ -3053,6 +3076,8 @@ fn analyze_pipeline_from_module_paths(
     // The equivalent of what `descr.py setup_descrs` would have picked up
     // for free had the analyzer and the runtime shared one gccache.
     pipeline.ei_descr_mints = majit_ir::descr::ei_descr_mints_snapshot();
+    pipeline.residual_shim_targets =
+        call_control.residual_shim_targets(&program.residual_fn_catalog);
 
     pipeline
 }
@@ -3991,6 +4016,7 @@ mod portal_driver_tests {
         pipeline::JitDriverSpec {
             portal,
             portal_runner: None,
+            portal_enter: None,
             greens: Vec::new(),
             reds: Vec::new(),
             green_kinds: Vec::new(),
@@ -4274,6 +4300,7 @@ mod portal_driver_tests {
             jit_drivers: vec![pipeline::JitDriverSpec {
                 portal: portal.clone(),
                 portal_runner: Some(CallPath::from_segments(["fixture", "portal_runner"])),
+                portal_enter: None,
                 greens: vec![
                     "next_instr".into(),
                     "is_being_profiled".into(),
@@ -4457,6 +4484,7 @@ mod portal_driver_tests {
             jit_drivers: vec![pipeline::JitDriverSpec {
                 portal: portal.clone(),
                 portal_runner: Some(CallPath::from_segments(["fixture", "portal_runner"])),
+                portal_enter: None,
                 greens: vec![
                     "next_instr".into(),
                     "is_being_profiled".into(),
@@ -4598,6 +4626,7 @@ mod portal_driver_tests {
             jit_drivers: vec![pipeline::JitDriverSpec {
                 portal: portal.clone(),
                 portal_runner: Some(CallPath::from_segments(["fixture", "portal_runner"])),
+                portal_enter: None,
                 greens: vec![
                     "next_instr".into(),
                     "is_being_profiled".into(),
@@ -4751,6 +4780,7 @@ mod portal_driver_tests {
             jit_drivers: vec![pipeline::JitDriverSpec {
                 portal: portal.clone(),
                 portal_runner: Some(CallPath::from_segments(["fixture", "portal_runner"])),
+                portal_enter: None,
                 greens: vec![
                     "next_instr".into(),
                     "is_being_profiled".into(),
@@ -5033,6 +5063,7 @@ mod harvested_funcobj_hints_tests {
                 None,
                 &mut cache,
                 None,
+                None,
             );
             assert_eq!(
                 descriptor.extra_info.extraeffect,
@@ -5063,6 +5094,7 @@ mod harvested_funcobj_hints_tests {
                 OopSpecIndex::None,
                 None,
                 &mut cache,
+                None,
                 None,
             );
             assert_eq!(
@@ -5180,6 +5212,7 @@ mod harvested_funcobj_hints_tests {
                     None,
                     &mut cache,
                     None,
+                    None,
                 );
                 assert_eq!(
                     descriptor.extra_info.extraeffect,
@@ -5228,6 +5261,7 @@ mod harvested_funcobj_hints_tests {
                             OopSpecIndex::None,
                             None,
                             &mut cache,
+                            None,
                             None,
                         );
                         assert_eq!(
@@ -5321,6 +5355,7 @@ mod harvested_funcobj_hints_tests {
                 None,
                 &mut cache,
                 None,
+                None,
             );
             assert_eq!(
                 descriptor.extra_info.extraeffect,
@@ -5347,6 +5382,7 @@ mod harvested_funcobj_hints_tests {
                 OopSpecIndex::None,
                 None,
                 &mut cache,
+                None,
                 None,
             );
             assert_ne!(
@@ -5377,6 +5413,7 @@ mod harvested_funcobj_hints_tests {
             OopSpecIndex::None,
             None,
             &mut AnalysisCache::default(),
+            None,
             None,
         );
         assert_eq!(

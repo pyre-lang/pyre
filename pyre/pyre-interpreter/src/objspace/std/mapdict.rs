@@ -2194,8 +2194,9 @@ pub unsafe fn type_getattribute_hook_fast_path(
     if version_tag == 0 {
         return None;
     }
-    // `lookup_in_type_where` reaches `box_str_constant`. Both pins stay
-    // live across that lookup and the cell read.
+    // `lookup_in_type_where` used to box internally; the caller now boxes
+    // the name. Both pins stay live across that allocation, the lookup,
+    // and the cell read.
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.pin_roots(&[metatype, w_getattribute]);
     if unsafe { crate::baseobjspace::lookup_in_type_where(roots.get(base), "__getattr__") }

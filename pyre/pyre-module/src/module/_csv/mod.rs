@@ -298,9 +298,9 @@ fn build_dialect_config(
         }
     }
 
-    let delimiter = get_codepoint(w_delimiter, Some(',' as u32), "delimiter", false)?;
+    let delimiter = pyre_object::with_roots!(w_doublequote, w_escapechar, w_lineterminator, w_quotechar, w_quoting, w_skipinitialspace, w_strict => get_codepoint(w_delimiter, Some(',' as u32), "delimiter", false))?;
     let doublequote = pyre_object::with_roots!(w_escapechar, w_lineterminator, w_quotechar, w_quoting, w_skipinitialspace, w_strict => get_bool(w_doublequote, true))?;
-    let escapechar = get_codepoint(w_escapechar, None, "escapechar", true)?;
+    let escapechar = pyre_object::with_roots!(w_lineterminator, w_quotechar, w_quoting, w_skipinitialspace, w_strict => get_codepoint(w_escapechar, None, "escapechar", true))?;
     let lineterminator = pyre_object::with_roots!(w_quotechar, w_quoting, w_skipinitialspace, w_strict => get_str(w_lineterminator, "\r\n", "lineterminator"))?;
     let mut quoting = get_int(w_quoting, QUOTE_MINIMAL, "quoting")?;
     if !valid_quoting(quoting) {
@@ -311,7 +311,7 @@ fn build_dialect_config(
     {
         quoting = QUOTE_NONE;
     }
-    let quotechar = get_codepoint(w_quotechar, Some('"' as u32), "quotechar", true)?;
+    let quotechar = pyre_object::with_roots!(w_skipinitialspace, w_strict => get_codepoint(w_quotechar, Some('"' as u32), "quotechar", true))?;
     let skipinitialspace =
         pyre_object::with_roots!(w_strict => get_bool(w_skipinitialspace, false))?;
     let strict = get_bool(w_strict, false)?;

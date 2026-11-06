@@ -2142,15 +2142,8 @@ impl AssemblerEncode for Assembler {
                 // `getfield_raw_r` with the `_pure` suffix stripped.
                 if !is_gc && result_kind == 'r' && !*pure {
                     panic!(
-                        "getfield_raw_r (without _pure) not supported — graph {:?}, \
-                         owner {:?}, field {}, ty {:?}, taken_by_address {}, \
-                         owner_declared_gc {:?}",
-                        self.current_graph_name,
-                        field.owner_root,
-                        field.name,
-                        ty,
-                        field.taken_by_address,
-                        field.owner_declared_gc,
+                        "getfield_raw_r (without _pure) not supported — graph {:?}",
+                        self.current_graph_name
                     );
                 }
                 let mut opname = if is_gc {
@@ -2656,8 +2649,10 @@ impl AssemblerEncode for Assembler {
                 if !is_gc && value_kind == 'r' {
                     panic!(
                         "setfield_raw_r not supported (jtransform.py rewrite_op_setfield) \
-                         — graph {:?}",
+                         — graph {:?} field {}.{}",
                         self.current_graph_name,
+                        field.owner_root.as_deref().unwrap_or("?"),
+                        field.name,
                     );
                 }
                 let descr_idx = self.emit_ready_descr(fielddescrof(field, ty, callcontrol, is_gc));
@@ -2781,6 +2776,7 @@ impl AssemblerEncode for Assembler {
                 nolength,
                 gckind,
                 pure,
+                taken_by_address: _,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
                 let is_gc = gckind.is_gc();
@@ -5707,6 +5703,15 @@ pub(crate) fn bh_size_spec_from_callcontrol(
             );
         }
     }
+    // `descr.py get_size_descr` keys on the lltype STRUCT's `_gckind`.
+    // 1. `struct_storage` is the embedding override (`rclass.CLASSTYPE` /
+    //    `pyobject::PyType`: static raw, no GcHeader).
+    // 2. An LLBC TypeDecl answers from `layout.gckind` (`GcType` impl or
+    //    field 0 of one; else Raw). `lib.rs` stamps that on the layout.
+    // 3. A synthetic rtyper identity with no TypeDecl (`TupleRepr`
+    //    `Ptr(GcStruct)`, `MutRef<T>`, shaped `Array<T;N>`) carries the
+    //    same fact from `CallControl::layout_of`, which mints the layout.
+    // 4. No layout: the previous SizeDescr default.
     let (is_gc_managed, headerless) = cc
         .struct_storage_for(owner)
         .or_else(|| cc.struct_storage_for(template_owner))
@@ -6588,6 +6593,32 @@ fn interiorfield_bh_descr(
     crate::jitcode::BhDescr::from_interior_field_descr(ifd)
 }
 
+/// `cpu.arraydescrof(GcArray(ITEM))` when the op carried no ARRAY
+/// spelling. A headerless C array (`len_offset is None`) is a different
+/// lltype and stays unnamed. `ArrayLen` emit passes `ty = Ref(None)`
+/// when it has no item kind, so Ref is left unnamed here.
+fn named_length_prefixed_gcarray_id(
+    ty: &crate::model::ValueType,
+    array_type_id: &Option<String>,
+    len_offset: Option<usize>,
+) -> Option<String> {
+    if array_type_id.is_some() {
+        return array_type_id.clone();
+    }
+    if len_offset != Some(0) {
+        return None;
+    }
+    match ty {
+        crate::model::ValueType::Int | crate::model::ValueType::Unsigned => {
+            Some(majit_jitcode::codewriter::jtransform::LIST_INT_ITEMS_ARRAY.to_string())
+        }
+        crate::model::ValueType::Float => {
+            Some(majit_jitcode::codewriter::jtransform::LIST_FLOAT_ITEMS_ARRAY.to_string())
+        }
+        _ => None,
+    }
+}
+
 /// jtransform.py:773,802 cpu.arraydescrof(ARRAY) equivalent.
 ///
 /// Determines the full ArrayDescr shape from the array element type.
@@ -6606,6 +6637,8 @@ fn arraydescrof(
     len_offset: Option<usize>,
     callcontrol: Option<&CallControl>,
 ) -> crate::jitcode::BhDescr {
+    let named = named_length_prefixed_gcarray_id(ty, array_type_id, len_offset);
+    let array_type_id = &named;
     let ir_type = value_type_to_ir_type_for_descr(ty);
     if let Some(cc) = callcontrol {
         // Route through `arraydescrof_for_type` so the bytecode emit
@@ -7197,8 +7230,8 @@ mod tests {
     use crate::flowspace::model::{ConstValue, HostObject};
     use crate::regalloc;
 
-    /// `descr.py get_type_flag` of the canonical RustVec header-pointer
-    /// spellings is FLAG_UNSIGNED / Int / word, matching `get_type_flag`.
+    /// `descr.py get_type_flag` of a `Vec<T>` header pointer is FLAG_UNSIGNED
+    /// / Int / word (`rrustvec.rs rust_vec_lltype`).
     #[test]
     fn rust_vec_header_pointer_type_flag_is_int_banked() {
         use majit_ir::descr::ArrayFlag;
@@ -7206,7 +7239,12 @@ mod tests {
 
         let word = crate::layout::target_word_size();
         let expected = (ArrayFlag::Unsigned, Type::Int, word);
-        for spelling in ["*mut Vec<usize>", "*mut Vec<*mut u8>", "*mut Vec<f64>"] {
+        for spelling in [
+            "*mut Vec<usize>",
+            "*mut Vec<*mut u8>",
+            "*mut Vec<f64>",
+            "*mut Vec<Utf8LocElem>",
+        ] {
             assert_eq!(
                 type_flag_from_str(spelling, &std::collections::HashSet::new()),
                 expected,
@@ -7836,6 +7874,40 @@ mod tests {
             } => assert!(load_is_acquire),
             other => panic!("arraydescrof must mint a BhDescr::Array, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_nameless_length_prefixed_int_array_names_gcarray_i64() {
+        use crate::call::CallControl;
+
+        let cc = CallControl::new();
+        let descr = arraydescrof(&crate::model::ValueType::Int, &None, Some(0), Some(&cc));
+        let crate::jitcode::BhDescr::Array {
+            array_type_id,
+            len_offset,
+            item_type,
+            ..
+        } = descr
+        else {
+            panic!("arraydescrof must mint a BhDescr::Array");
+        };
+        assert_eq!(len_offset, Some(0));
+        assert_eq!(item_type, majit_ir::value::Type::Int);
+        assert_eq!(
+            array_type_id.as_deref(),
+            Some(majit_jitcode::codewriter::jtransform::LIST_INT_ITEMS_ARRAY)
+        );
+        let headerless = arraydescrof(&crate::model::ValueType::Int, &None, None, Some(&cc));
+        let crate::jitcode::BhDescr::Array {
+            array_type_id: headerless_id,
+            len_offset: headerless_len,
+            ..
+        } = headerless
+        else {
+            panic!("headerless arraydescrof must mint a BhDescr::Array");
+        };
+        assert_eq!(headerless_len, None);
+        assert!(headerless_id.is_none());
     }
 
     #[test]
@@ -9473,6 +9545,7 @@ mod tests {
             "ref_isconstant/r",
             "float_isconstant/f",
             "ref_isvirtual/r",
+            "int_isvirtual/i",
         ] {
             assert!(
                 crate::insns::insn_byte_opt(key).is_none(),
@@ -12079,10 +12152,10 @@ mod tests {
                         class_root,
                     },
                 ) if name == "p" => {
-                    assert_eq!(
-                        ty,
-                        &ValueType::Ref(None),
-                        "a borrowed raw struct stays a reference"
+                    assert!(
+                        matches!(ty, ValueType::Ref(_)),
+                        "annotator keeps SomePtr for a borrow of a raw struct; \
+                         getkind int is the JIT kind (get_type_flag). ty={ty:?}"
                     );
                     assert_eq!(class_root.as_deref(), Some("S"));
                     Some(result.clone())
@@ -13600,6 +13673,7 @@ mod tests {
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
+                    taken_by_address: false,
                 },
                 true,
             )
@@ -13841,6 +13915,7 @@ mod tests {
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
+                    taken_by_address: false,
                 },
                 true,
             )
@@ -13958,6 +14033,7 @@ mod tests {
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure,
+                    taken_by_address: false,
                 },
                 true,
             )

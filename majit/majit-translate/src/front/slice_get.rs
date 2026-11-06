@@ -256,6 +256,8 @@ pub(crate) struct SliceGetSite {
     pub niche: bool,
     /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
     pub niche_null_cast: Option<(String, ValueType)>,
+    /// Int-bank null of a Vec-header / raw-address niche (`option_niche_int_null`).
+    pub int_null: Option<crate::model::NicheIntNull>,
     /// Concrete payload class for a niche reference.  In particular,
     /// `<[*mut PyObject]>::get` returns `Option<&PyObjectRef>`: the successful
     /// list item and the null arm must both retain the `PyObject` ClassDef.
@@ -431,6 +433,7 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
             ),
             gckind: crate::front::typestr::gckind_from_array_type_id(site.array_type_id.as_deref()),
             pure: false,
+            taken_by_address: false,
         },
     });
     let then_result = if site.niche {
@@ -457,7 +460,11 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
 
     // `else_bb`: opt = None.
     let else_result = if site.niche {
-        let null = graph.push_niche_null(else_bb, site.niche_null_cast.as_ref());
+        let null = if let Some(int_null) = site.int_null.as_ref() {
+            int_null.push(graph, else_bb)
+        } else {
+            graph.push_niche_null(else_bb, site.niche_null_cast.as_ref())
+        };
         emit_narrow(graph, else_bb, null, &site.payload_narrow_root)
     } else {
         let none_var = emit_option_variant(graph, else_bb, &site.option_owner, 0, None);
@@ -528,6 +535,7 @@ mod tests {
             object_array_type_id: None,
             niche: false,
             niche_null_cast: None,
+            int_null: None,
             payload_narrow_root: None,
         }
     }
@@ -555,6 +563,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "slice".into(), "<Impl>".into(), leaf.into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(args),
@@ -1013,11 +1022,13 @@ mod tests {
         let impl_path = CallTarget::FunctionPath {
             segments: segs(&["core", "result", "<Impl>", "ok"]),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         };
         let owner_path = CallTarget::FunctionPath {
             segments: segs(&["core", "result", "Result", "ok"]),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         };
         let option_ok = CallTarget::Method {
@@ -1030,6 +1041,7 @@ mod tests {
         let unrelated = CallTarget::FunctionPath {
             segments: segs(&["core", "option", "<Impl>", "ok"]),
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
             specialization: crate::parse::GraphSpecialization::Regular,
         };
         assert!(is_result_ok_call_target(&method));

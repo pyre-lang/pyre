@@ -62,51 +62,34 @@ pub fn depth0_sep(spelling: &str, sep: char) -> Option<usize> {
 
 pub use majit_jitcode::codewriter::jtransform::canonical_array_type_id;
 
-/// Headerless ARRAY identity for a fat `Box<[T]>` / `&[T]` of a scalar
-/// `T`. `[u8]` / `[i64]` / `[f64]` are length-prefixed GcArray spellings
+/// Headerless ARRAY identity for a fat `Box<[T]>` / `&[T]`.
+///
+/// `[u8]` / `[i64]` / `[f64]` are length-prefixed GcArray spellings
 /// shared with bytes blocks and list items; the fat box's data word has
 /// no header, so the index uses the `Vec<T>` identity (`nolength`, item
-/// width from `get_type_flag`). `[str]` and `String` are not scalars —
-/// `String` is three words — and stay unnamed here.
-pub fn fat_box_scalar_array_id(spelling: &str) -> Option<&'static str> {
+/// width from `get_type_flag`). Every item type `T` uses that identity:
+/// the element buffer is raw.
+pub fn fat_box_array_id(spelling: &str) -> Option<String> {
     let spelling = spelling.trim();
     // `Box<[u8]>` does not end at the slice bracket. Take the body of the
     // first `[` … matching `]`. A nested `[[u8]]` body still contains `[`.
     let inner = if spelling.contains('[') {
         let body = bracket_group_body(spelling)?;
         let inner = body.trim();
-        if inner.is_empty()
-            || inner.contains(';')
-            || inner.contains('<')
-            || inner.contains('[')
-            || inner.contains('*')
-            || inner.contains('&')
-            || inner.contains(' ')
-        {
+        if inner.is_empty() || inner.contains(';') || inner.contains('[') {
             return None;
         }
         inner
     } else {
+        // Element spelling fallback (`u8`, `String`). A `Vec<T>` identity
+        // is already the remapped form.
+        let leaf = spelling.rsplit("::").next().unwrap_or(spelling);
+        if spelling.is_empty() || leaf.starts_with("Vec<") {
+            return None;
+        }
         spelling
     };
-    match inner {
-        "u8" => Some("Vec<u8>"),
-        "i8" => Some("Vec<i8>"),
-        "u16" => Some("Vec<u16>"),
-        "i16" => Some("Vec<i16>"),
-        "u32" => Some("Vec<u32>"),
-        "i32" => Some("Vec<i32>"),
-        "u64" => Some("Vec<u64>"),
-        "i64" => Some("Vec<i64>"),
-        "u128" => Some("Vec<u128>"),
-        "i128" => Some("Vec<i128>"),
-        "usize" => Some("Vec<usize>"),
-        "isize" => Some("Vec<isize>"),
-        "f32" => Some("Vec<f32>"),
-        "f64" => Some("Vec<f64>"),
-        "bool" => Some("Vec<bool>"),
-        _ => None,
-    }
+    Some(format!("Vec<{inner}>"))
 }
 
 /// Body of the first bracket group. `Box<[u8]>` → `u8`, `[[u8]]` → `[u8]`.
@@ -229,27 +212,37 @@ pub fn gckind_from_array_type_id(array_type_id: Option<&str>) -> crate::model::A
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_array_type_id, depth0_sep, fat_box_scalar_array_id, gckind_from_array_type_id,
+        canonical_array_type_id, depth0_sep, fat_box_array_id, gckind_from_array_type_id,
         nolength_from_array_type_id,
     };
     use crate::model::ArrayGcKind;
 
     #[test]
-    fn fat_box_scalar_slice_uses_the_headerless_vec_identity() {
-        assert_eq!(fat_box_scalar_array_id("[u8]"), Some("Vec<u8>"));
-        assert_eq!(fat_box_scalar_array_id("Box<[u8]>"), Some("Vec<u8>"));
+    fn fat_box_slice_uses_the_headerless_vec_identity() {
+        assert_eq!(fat_box_array_id("[u8]").as_deref(), Some("Vec<u8>"));
+        assert_eq!(fat_box_array_id("Box<[u8]>").as_deref(), Some("Vec<u8>"));
         assert_eq!(
-            fat_box_scalar_array_id("alloc::boxed::Box<[u8]>"),
+            fat_box_array_id("alloc::boxed::Box<[u8]>").as_deref(),
             Some("Vec<u8>")
         );
-        assert_eq!(fat_box_scalar_array_id("&[i64]"), Some("Vec<i64>"));
-        assert_eq!(fat_box_scalar_array_id("u8"), Some("Vec<u8>"));
-        assert_eq!(fat_box_scalar_array_id("[str]"), None);
-        assert_eq!(fat_box_scalar_array_id("Vec<String>"), None);
-        assert_eq!(fat_box_scalar_array_id("[u8; 4]"), None);
-        assert_eq!(fat_box_scalar_array_id("Box<[u8; 4]>"), None);
-        assert_eq!(fat_box_scalar_array_id("[[u8]]"), None);
+        assert_eq!(fat_box_array_id("&[i64]").as_deref(), Some("Vec<i64>"));
+        assert_eq!(fat_box_array_id("u8").as_deref(), Some("Vec<u8>"));
+        assert_eq!(
+            fat_box_array_id("Box<[String]>").as_deref(),
+            Some("Vec<String>")
+        );
+        assert_eq!(fat_box_array_id("[str]").as_deref(), Some("Vec<str>"));
+        assert_eq!(fat_box_array_id("String").as_deref(), Some("Vec<String>"));
+        assert_eq!(
+            fat_box_array_id("[ConstantData]").as_deref(),
+            Some("Vec<ConstantData>")
+        );
+        assert_eq!(fat_box_array_id("Vec<String>"), None);
+        assert_eq!(fat_box_array_id("[u8; 4]"), None);
+        assert_eq!(fat_box_array_id("Box<[u8; 4]>"), None);
+        assert_eq!(fat_box_array_id("[[u8]]"), None);
         assert!(nolength_from_array_type_id(Some("Vec<u8>")));
+        assert!(nolength_from_array_type_id(Some("Vec<String>")));
         assert!(!nolength_from_array_type_id(Some("[u8]")));
         assert_eq!(gckind_from_array_type_id(Some("Vec<u8>")), ArrayGcKind::Gc);
         assert_eq!(gckind_from_array_type_id(Some("[u8]")), ArrayGcKind::Gc);

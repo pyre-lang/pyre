@@ -8546,7 +8546,7 @@ pub(crate) fn try_walker_inline_float_slot<Sym: WalkSym>(
     if float_type.is_null() {
         return Ok(None);
     }
-    if unsafe { pyre_interpreter::lookup_in_type(float_type, &name) } != Some(callable) {
+    if unsafe { pyre_interpreter::lookup_in_type(float_type, name.as_str()) } != Some(callable) {
         return Ok(None);
     }
     let decline = |why: &str| {

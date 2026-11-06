@@ -1183,7 +1183,29 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
     ) {
         return;
     }
-    if exc_value == 0 || w_code_value == 0 {
+    if exc_value == 0 {
+        return;
+    }
+    // A recording MIFrame may pass a null / sentinel `w_code` (the portal
+    // virtualizable is the caller's frame). Resolve this jitcode's own
+    // pycode; a helper with no Python code contributes no node.
+    //
+    // Keep the caller-supplied `w_globals`. `PyCode.w_globals` is only the
+    // first namespace (`pycode.py frame_stores_global`); another function
+    // using the same code can have different frame-owned globals
+    // (`pyframe.py get_w_globals`).
+    let w_code_value = if w_code_value == 0 || w_code_value as usize == usize::MAX {
+        match pyre_jit_trace::state::code_for_jitcode_index(jitcode_index) {
+            Some(w_code) if !w_code.is_null() && w_code as usize != usize::MAX => w_code as i64,
+            _ => return,
+        }
+    } else {
+        w_code_value
+    };
+    if w_globals_value == 0 || w_globals_value as usize == usize::MAX {
+        return;
+    }
+    if w_code_value == 0 {
         return;
     }
     let Some(last_instruction) = pyre_jit_trace::py_coord::containing_py_pc_for_jitcode_pc_public(
@@ -1960,6 +1982,10 @@ pub struct ResumedFrame {
     /// Structure: [live_registers...] — no scalar inputarg header.
     /// RPython parity: vable values come from snapshot, not fail_args.
     pub values: Vec<majit_ir::Value>,
+    /// Whether this section's jitcode maps to a Python `CodeObject`
+    /// (`raw_code_for_jitcode_index`). Helper jitcodes have none; an
+    /// inlined Python callee does, including when its mapped `py_pc` is 0.
+    pub has_python_twin: bool,
 }
 
 /// resume.py decode_ref / getvirtual_ptr parity.
@@ -2262,6 +2288,13 @@ fn materialize_str_call_for_cranelift(
 
 /// Interpreter hooks for `MetaInterpStaticData.host`. One constructor
 /// replaces the former `register_*` / `set_*` scatter.
+fn make_portal_quasi_immut_descr(
+    struct_ptr: i64,
+    field: &majit_ir::DescrRef,
+) -> Option<majit_ir::DescrRef> {
+    pyre_jit_trace::state::quasi_immut_descr_for_struct(struct_ptr, field, None)
+}
+
 pub fn publish_pyre_host_hooks() {
     fn criticalcode_start_adapter() {
         pyre_interpreter::stack_check::pyre_stack_criticalcode_start();
@@ -2291,6 +2324,7 @@ pub fn publish_pyre_host_hooks() {
             pyre_jit_trace::runtime_fnaddr_patch::symbolic_fnaddr_path,
         ),
         assertion_error_typeptr: Some(assertion_error_typeptr_adapter),
+        make_quasi_immut_descr: Some(make_portal_quasi_immut_descr),
     });
 }
 
@@ -4567,6 +4601,67 @@ fn trace_and_compile_from_bridge_body(
 
     if bridge_bail_stage() == 3 {
         return BridgeResolution::ResumeBlackhole;
+    }
+    // pyjitpl.py handle_guard_failure: rebuild_from_resumedata + interpret()
+    // from the guard PC. The FBW walk below is the fallback when the resume
+    // cannot be seeded. A Finish from this walk is the compiled
+    // "return from main" shape — do not attach it.
+    {
+        let (driver, _) = crate::eval::driver_pair();
+        // A result left by an earlier walk is not this walk's.
+        let _ = driver.take_done_with_this_frame_ref();
+        if let Some(resume) = driver.bridge_from_guard_resume_position(
+            descr_arc,
+            &mut jit_state,
+            &env,
+            raw_values,
+            resume_pc,
+            false,
+        ) {
+            let pc = resume.resume_pc().unwrap_or(usize::MAX);
+            // `assembler.py patch_jump_for_descr` marks the guard once a
+            // bridge is attached (`Backend::bridge_attached`).
+            let compiled = {
+                use majit_backend::Backend;
+                descr_arc
+                    .as_fail_descr()
+                    .is_some_and(|fd| driver.meta_interp().backend().bridge_attached(fd))
+            };
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bridge-trace] interpret-from-resume key={} descr=0x{:x} \
+                     resume_pc={} walk_pc={} compiled={}",
+                    green_key, descr_id, resume_pc, pc, compiled
+                );
+            }
+            // `pyjitpl.py handle_guard_failure` never goes back to the
+            // guard's resume state once `interpret()` has run: a failed
+            // `compile_trace` keeps tracing, and the give-up is a
+            // `SwitchToBlackhole` from the current framestack. The walk above
+            // already executed the region from the guard to `pc` and handed
+            // its end state to `jit_state`, so resuming the guard state in the
+            // blackhole would run that region a second time. Continue from
+            // the walk's position whether or not a bridge was attached.
+            //
+            // `usize::MAX` is the walk that returned from the frame:
+            // `MetaInterp.finishframe` raised `DoneWithThisFrameRef(result)`
+            // after `compile_done_with_this_frame`, and `ll_portal_runner`
+            // (warmspot.py) returns `result` for the portal.
+            // `BridgeResolution::Finished` is that return here.
+            let done_with_this_frame = driver.take_done_with_this_frame_ref();
+            if pc == usize::MAX
+                && allow_finish_direct_return
+                && let Some(result) = done_with_this_frame
+            {
+                return BridgeResolution::Finished(pyre_jit_trace::state::ConcreteValue::Ref(
+                    result.as_usize() as pyre_object::PyObjectRef,
+                ));
+            }
+            if compiled || pc != usize::MAX {
+                return BridgeResolution::CompiledContinue;
+            }
+            return BridgeResolution::ResumeBlackhole;
+        }
     }
     // compile.py:714: start_retrace_from_guard + set bridge_info.
     // `build_meta` reads nlocals / valuestackdepth / slot types off this
@@ -8742,7 +8837,7 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.publish(&[
                 exc,
-                cause.as_ref().map_or(std::ptr::null_mut(), |c| c.w_cause),
+                cause.map_or(std::ptr::null_mut(), |c| c.as_pyobject_ref()),
             ]);
             roots.normalize(base, 2);
             let result = {
@@ -8750,8 +8845,15 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
                 pyre_interpreter::call::call_function_impl_result(exc, &[])
             };
             exc = roots.get(base);
-            if let Some(c) = cause.as_mut() {
-                c.w_cause = roots.get(base + 1);
+            if cause.is_some() {
+                let forwarded = roots.get(base + 1);
+                cause = if forwarded.is_null() {
+                    None
+                } else {
+                    Some(pyre_interpreter::eval::RaiseCauseRef::from_pyobject_ref(
+                        forwarded,
+                    ))
+                };
             }
             match result {
                 Ok(obj) if pyre_object::is_exception(obj) => obj,

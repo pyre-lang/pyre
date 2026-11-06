@@ -266,6 +266,11 @@ const MAJIT_ONLY: &[&str] = &[
     "arraybase_vable/rdd>i",
     "goto_if_exception_mismatch/iL",
     "newlist_clear/idddd>r",
+    // `pyjitpl.py opimpl_recursive_call_{i,r,f,v}` / `blackhole.py bhimpl_recursive_call_*`.
+    "recursive_call_f/iIRFIRF>f",
+    "recursive_call_i/iIRFIRF>i",
+    "recursive_call_r/iIRFIRF>r",
+    "recursive_call_v/iIRFIRF",
     "rvmprof_code/ii",
     // `opimpl_unreachable` aborts the walk instead of panicking.
     "unreachable/",
@@ -281,6 +286,8 @@ const PYRE_ONLY: &[&str] = &[
     // when majit's tracer gained the pure array-read arms.
     // `getarrayitem_gc_f/rid>f` and `getarrayitem_gc_f_pure/rid>f` left this
     // list when majit's tracer gained the float getarrayitem arms.
+    // `record_quasiimmut_field/rdd` left this list when majit's tracer gained
+    // `pyjitpl.py opimpl_record_quasiimmut_field`.
     // Constant-length form. The register-length `new_array_clear/id>r`
     // is decoded by both tracers.
     "new_array_clear/cd>r",

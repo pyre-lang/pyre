@@ -182,7 +182,7 @@ mod imp {
         if pyre_object::with_roots!(at => funcptr::argtype_is_pointer_kind(at)) {
             return Ok(callproc::ffi_pointer_type());
         }
-        if let Some(tc) = cdata::type_code_of(at)
+        if let Some(tc) = pyre_object::with_roots!(at => cdata::type_code_of(at))
             && let Some(ty) = callproc::ffi_type_from_code(&tc)
         {
             return Ok(ty);
@@ -340,7 +340,7 @@ mod imp {
     }
 
     fn decode_arg(
-        at: PyObjectRef,
+        mut at: PyObjectRef,
         p: *const c_void,
     ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let at_slot = pyre_object::gc_roots::pin_roots(&[at]);

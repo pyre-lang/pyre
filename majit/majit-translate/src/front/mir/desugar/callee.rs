@@ -1386,7 +1386,7 @@ pub(in crate::front::mir) fn is_string_identity_call(llbc: &Llbc, call: &CallPay
         Some("as_bytes") => true,
         Some("bytes") if np.contains("str") => true,
         Some(leaf @ ("as_ref" | "as_str" | "as_str_unchecked" | "borrow")) => {
-            tyref_strips_to_str(&call.dest.ty, llbc)
+            (tyref_strips_to_str(&call.dest.ty, llbc) && !tyref_is_rust_heap_string(first_ty, llbc))
                 || is_as_ref_byte_view(Some(leaf), &call.dest.ty, llbc)
         }
         Some("deref" | "deref_mut") => tyref_is_string_family(&call.dest.ty, llbc),
@@ -2255,6 +2255,34 @@ pub(in crate::front::mir) fn is_vec_rangefull_index_regular(
     reg: &RegularCall,
     llbc: &Llbc,
 ) -> bool {
+    is_vec_range_index_regular(reg, llbc, "RangeFull")
+}
+
+/// `Vec<T>::index(_mut)(RangeFrom)` — `&vec[k..]`.
+pub(in crate::front::mir) fn is_vec_rangefrom_index_regular(
+    reg: &RegularCall,
+    llbc: &Llbc,
+) -> bool {
+    is_vec_range_index_regular(reg, llbc, "RangeFrom")
+}
+
+/// `__getslice_rangefrom` plus the object-array suffix jtransform reads.
+pub(in crate::front::mir) fn object_vec_rangefrom_marker_segments() -> Vec<String> {
+    let mut segments = vec!["__getslice_rangefrom".to_string()];
+    if let Some(suffix) = crate::codewriter::getslice::listslice_marker_suffix(
+        &ValueType::Ref(None),
+        Some(OBJECT_REF_GCARRAY_TYPE_ID),
+    ) {
+        segments.push(suffix);
+    }
+    segments
+}
+
+pub(in crate::front::mir) fn is_vec_range_index_regular(
+    reg: &RegularCall,
+    llbc: &Llbc,
+    range_leaf: &str,
+) -> bool {
     if vec_index_regular_unchecked_leaf(reg, llbc).is_none() {
         return false;
     }
@@ -2263,7 +2291,11 @@ pub(in crate::front::mir) fn is_vec_rangefull_index_regular(
         .and_then(serde_json::Value::as_array)
         .and_then(|tys| tys.get(1))
         .and_then(|t| serde_json::from_value::<TyRef>(t.clone()).ok())
-        .is_some_and(|t| tyref_to_ast_string(&t, llbc) == "RangeFull")
+        .is_some_and(|t| {
+            let spelling = tyref_to_ast_string(&t, llbc);
+            let leaf = spelling.rsplit("::").next().unwrap_or(spelling.as_str());
+            leaf == range_leaf || leaf.starts_with(&format!("{range_leaf}<"))
+        })
 }
 
 /// Shared vs mutable whole-list view of a `Vec<PyObjectRef>`.
@@ -2779,7 +2811,6 @@ pub(in crate::front::mir) fn regular_call_is_panicking_abort(
     let mut segs = path.split("::");
     matches!(segs.next(), Some("core") | Some("std")) && segs.next() == Some("panicking")
 }
-
 /// Charon `PathElem::Builtin(PromotedConst, N)` on a FunDecl.
 pub(in crate::front::mir) fn fundecl_is_promoted_const(fd: &FunDecl) -> bool {
     fd.item_meta.name.last().is_some_and(|seg| match seg {
@@ -3285,13 +3316,43 @@ pub(in crate::front::mir) fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str
     segments
 }
 
+/// Inherent-impl UFCS `Owner::method` using the owner TypeDecl's full
+/// `name_path`. Trait-impl methods use `<Self as Trait>::method` instead.
+/// `None` when the FunDecl is not an inherent impl or the owner ADT is
+/// unresolved — the catalog then keeps `name_path`, which still contains
+/// the `Impl` path element and is not a Rust path.
+pub(crate) fn inherent_callable_rust_path(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
+    if fd.item_meta.trait_impl_id().is_some() {
+        return None;
+    }
+    let segs = &fd.item_meta.name;
+    let last_idx = segs
+        .iter()
+        .rposition(|s| matches!(s, NameSeg::Ident { .. }))?;
+    let leaf = match &segs[last_idx] {
+        NameSeg::Ident { ident: (s, _) } => s.clone(),
+        _ => return None,
+    };
+    if last_idx == 0 {
+        return None;
+    }
+    let impl_payload = match &segs[last_idx - 1] {
+        NameSeg::Other(v) => v.as_object()?.get("Impl")?,
+        _ => return None,
+    };
+    let adt_def_id = resolve_impl_owner_adt_def_id_free(llbc, impl_payload)?;
+    let td = llbc.type_by_id(adt_def_id)?;
+    let owner = td.item_meta.name_path();
+    if owner.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}::{leaf}"))
+}
+
 /// The `CallPath` `lib.rs` registers for this FunDecl: the same
 /// segments [`spec_segments`] emits, so a Fun call and a Trait call
 /// that resolve to this declaration share one registry key.
-pub(in crate::front::mir) fn registered_path_for_fun_decl(
-    llbc: &Llbc,
-    fd: &FunDecl,
-) -> crate::parse::CallPath {
+pub(crate) fn registered_path_for_fun_decl(llbc: &Llbc, fd: &FunDecl) -> crate::parse::CallPath {
     let leaf = match instance_leaf(llbc, fd) {
         Some(leaf) => leaf,
         None => fd

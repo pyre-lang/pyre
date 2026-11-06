@@ -146,8 +146,40 @@ impl<'a> Lowering<'a> {
                 v = arr.first()?;
                 continue;
             }
-            return serde_json::from_value(v.clone()).ok();
+            return Some(crate::front::result_exc::tyref_from_json(v.clone()));
         }
+    }
+
+    /// FunDecl output still names a binder: a `TypeVar` anywhere in the
+    /// type (`spill_argument_carries_typevar`), a root `TraitType`, a
+    /// `*mut T` / `&T` whose pointee is one, or an `Option` whose payload
+    /// peels to one. `FUNC.RESULT` then comes from the destination place
+    /// (`rtyper.py` `setconcretetype`).
+    /// `Index::index` declares `&I::Output`; the dest place of
+    /// `s[..k]` is `&str` (`unaryop.py` `SomeString.getslice`).
+    /// `Vec::<T, A>::clone` declares `Vec<T, A>`; the dest place of
+    /// `strides.clone()` is `Vec<i64>` (`rrustvec.rs` `RustVecRepr`).
+    pub(in crate::front::mir) fn tyref_output_is_unsubstituted(&self, ty: &TyRef) -> bool {
+        if let Some(node) = tyref_node(ty, self.llbc)
+            && spill_argument_carries_typevar(node, self.llbc, &mut Vec::new(), 0)
+        {
+            return true;
+        }
+        let binder =
+            |ty: &TyRef| tyref_is_type_var(ty, self.llbc) || tyref_is_trait_type(ty, self.llbc);
+        if binder(ty) {
+            return true;
+        }
+        if self
+            .tyref_peel_ref_to_pointee(ty)
+            .is_some_and(|p| binder(&p))
+        {
+            return true;
+        }
+        crate::front::result_exc::tyref_option_payload(ty, self.llbc).is_some_and(|p| {
+            let p = self.tyref_peel_ref_to_pointee(&p).unwrap_or(p);
+            binder(&p)
+        })
     }
 
     /// The `Option`'s payload type `T` (its first `generics.types` entry)
@@ -209,6 +241,13 @@ impl<'a> Lowering<'a> {
             .get(0)?,
             self.llbc,
         )?;
+        // A one-word Vec header is the Int address (`RustVecRepr`),
+        // including `Option<&Vec<T>>`. The Option<&T> peel below would
+        // otherwise name the Vec ADT as a GC instance class. `Vec<u8>`
+        // is the list model and keeps the later payload walk.
+        if tyref_rust_vec_item_kind(&TyRef::Other(payload.clone()), self.llbc).is_some() {
+            return None;
+        }
         if let Some(root) =
             raw_ptr_pointee_class_root_with(payload, self.llbc, self.tombstoned_leaves)
         {
@@ -360,6 +399,11 @@ impl<'a> Lowering<'a> {
         let payload = type_decl_ref_generics(adt, self.llbc)?
             .get("types")?
             .get(0)?;
+        // One-word Vec header Int niche: `None` is `option_niche_int_null`,
+        // not a GC `Vec<…>` instance. `Vec<u8>` is the list model.
+        if tyref_rust_vec_item_kind(&TyRef::Other(payload.clone()), self.llbc).is_some() {
+            return None;
+        }
         let stripped = strip_ty_wrappers(payload, self.llbc)?;
         let rendered = charon_type_value_to_ast_string(stripped, self.llbc, 0);
         let payload_ty = tyref_enum_payload_value_type(
@@ -533,6 +577,7 @@ impl<'a> Lowering<'a> {
             payload_ty,
             niche,
             niche_null_cast: self.option_niche_null_cast(dest_ty),
+            int_null: self.option_niche_int_null(dest_ty),
             payload_narrow_root,
             array_type_id: None,
             object_array_type_id: None,
@@ -623,6 +668,7 @@ impl<'a> Lowering<'a> {
             object_array_type_id: None,
             niche,
             niche_null_cast: self.option_niche_null_cast(dest_ty),
+            int_null: self.option_niche_int_null(dest_ty),
             payload_narrow_root,
         })
     }
@@ -1790,21 +1836,13 @@ impl<'a> Lowering<'a> {
     /// an Address. [`tyref_to_value_type_with`] already puts `Option<fn>`,
     /// a raw-address niche ([`ty_is_raw_address`], e.g. `Option<&RawEnum>`),
     /// and a pointer-niche `Option<&RawStruct>` ([`tyref_niche_option_payload_paint`])
-    /// in `Int`; a GC pointer / `SomeString` niche stays `Ref`.
+    /// in `Int`; a GC pointer / `SomeString` niche stays `Ref`. The remaining
+    /// word is int-banked by the pointee declaration
+    /// ([`Self::option_payload_is_int_banked`]). A tagged `Option<usize>`
+    /// is not a pointer niche, so [`Self::tyref_is_niche_option_ptr`] keeps
+    /// it a discriminant test.
     pub(in crate::front::mir) fn option_niche_is_int_bank(&self, option_ty: &TyRef) -> bool {
-        if !self.tyref_is_niche_option_ptr(option_ty) {
-            return false;
-        }
-        matches!(
-            tyref_to_value_type_with(
-                option_ty,
-                self.llbc,
-                self.tombstoned_leaves,
-                self.gc_struct_ids,
-                &self.raw_alloc_flavor_structs,
-            ),
-            ValueType::Int | ValueType::Unsigned
-        )
+        self.tyref_is_niche_option_ptr(option_ty) && self.option_payload_is_int_banked(option_ty)
     }
 
     /// Int-bank null of a niche `Option`: `null_fn` with the `fn(..)`
@@ -1850,14 +1888,37 @@ impl<'a> Lowering<'a> {
         None
     }
 
+    /// Payload (or the Option word itself) lives in the int bank: a raw
+    /// `Ptr` / borrow of a raw struct / `Vec` header (`history.py` `getkind`
+    /// `'int'`). The niche `None` is Address `NULL`, not `null_mut()`.
+    /// Intern-as-classdef does not veto: `&OwnedFd` is Address even when
+    /// `OwnedFd` was interned (`rrustvec.rs` `rust_vec_lltype` pointee
+    /// declaration).
+    pub(in crate::front::mir) fn option_payload_is_int_banked(&self, option_ty: &TyRef) -> bool {
+        let ty = self
+            .tyref_peel_ref_to_pointee(option_ty)
+            .unwrap_or_else(|| clone_tyref(option_ty));
+        let payload = crate::front::result_exc::tyref_option_payload(&ty, self.llbc).unwrap_or(ty);
+        matches!(
+            tyref_to_value_type_with(
+                &payload,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            ),
+            ValueType::Int | ValueType::Unsigned
+        )
+    }
+
     /// `true` when `ty` is represented as a one-word nullable `Option` in
     /// the translated RPython model:
     /// `Option<NonNull<T>>`, `Option<Box<T>>`, `Option<fn(..)>`, `Option<&mut T>`,
     /// `Option<&T>` with a thin (Sized) ADT pointee, or a raw pointer to a
     /// thin nominal ADT. It also includes the exact Rust container spellings
     /// that translate to one RPython GC pointer: `Option<Vec<T>>` of a
-    /// multi-word item becomes a nullable `SomeList`, a shared
-    /// `Option<&[PyObjectRef]>` is the same nullable GcArray list
+    /// multi-word item is the Vec header's Int word (`RustVecRepr`), a
+    /// shared `Option<&[PyObjectRef]>` is the nullable GcArray list
     /// (`rlist.py` `FixedSizeListRepr` / `ll_fixed_items`), and
     /// `Option<&str>` / `Option<String>` (and the other string-family
     /// payloads [`node_is_string_value`] already projects) become a
@@ -1930,7 +1991,10 @@ impl<'a> Lowering<'a> {
     /// iter_next the null-test shape (its matcher must accept the
     /// `niche_disc_vars` bool switch) BEFORE relying on the fold there.
     pub(in crate::front::mir) fn tyref_is_niche_option_ptr(&self, ty: &TyRef) -> bool {
-        tyref_is_niche_option(ty, self.llbc)
+        // A two-variant enum of one fieldless arm plus one string-family
+        // payload is the same nullable STR word as `Option<Wtf8Buf>`,
+        // without sharing `Some.__pos_0` across Option instantiations.
+        tyref_is_nullable_str_enum(ty, self.llbc) || tyref_is_niche_option(ty, self.llbc)
     }
 
     /// `true` when `option_ty` is a niche nullable `Option<P>` and `P`
@@ -2156,6 +2220,21 @@ impl<'a> Lowering<'a> {
                 .is_some_and(|payload| tyref_is_raw_c_void_ptr(&payload, self.llbc))
         {
             return emit_voidp_nullptr(&mut self.graph, bb_id);
+        }
+        // `Option<GCREF>` / `GCREF` is `llmemory.GCREF` (`llmemory.py`
+        // `GCREF`). None is `cast_int_to_ptr(GCREF, 0)` (`rgc.py`
+        // `NULL_GCREF` = `lltype.nullptr(llmemory.GCREF.TO)` /
+        // `ann_cast_int_to_ptr` → `SomePtr(GCREF)`). The Some arm is
+        // 1-arg `cast_int_to_ptr` (`SomePtr(GCREF)`).
+        if tyref_is_gcref_spelling(option_ty, self.llbc)
+            || crate::front::result_exc::tyref_option_payload(option_ty, self.llbc)
+                .is_some_and(|payload| tyref_is_gcref_spelling(&payload, self.llbc))
+        {
+            return emit_typed_nullptr(
+                &mut self.graph,
+                bb_id,
+                (*crate::translator::rtyper::lltypesystem::lltype::GCREF).clone(),
+            );
         }
         // Int-banked niche (`Option<fn>` / raw Address): `rnone.py`
         // `rtype_is_None` compares against a null of the operand's own

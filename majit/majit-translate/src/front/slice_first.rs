@@ -99,6 +99,8 @@ pub(crate) struct SliceFirstSite {
     pub niche: bool,
     /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
     pub niche_null_cast: Option<(String, ValueType)>,
+    /// Int-bank null of a Vec-header / raw-address niche (`option_niche_int_null`).
+    pub int_null: Option<crate::model::NicheIntNull>,
     /// Concrete payload class retained on both the successful pointer and
     /// the null arm of a niche result.
     pub payload_narrow_root: Option<String>,
@@ -226,6 +228,16 @@ fn rewire_one_slice_first_site(
             "{name}: RangeFrom value has a non-get consumer — declining"
         ));
     }
+    // `rlist.py ll_listslice_*` takes a GC list (`Ref`). An Int-banked
+    // receiver is a Vec header or a scalar fat pointer; minting the helper
+    // would `arraylen_gc` the header. Keep the ordinary residual `get`.
+    if matches!(&site.access, SliceAccess::RangeFrom { .. })
+        && crate::front::slice_index::receiver_is_int_banked(graph, &slice)
+    {
+        return Err(format!(
+            "{name}: slice receiver is int-banked — declining getslice rewrite"
+        ));
+    }
 
     // A's single exit → B (the continuation consuming the Option).  Must be a
     // plain goto — `lower_call` closes with exactly this shape.
@@ -323,6 +335,7 @@ fn rewire_one_slice_first_site(
                     target: CallTarget::FunctionPath {
                         segments: vec!["__string_byte_getitem".to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![slice_in_then, item_index]),
@@ -343,6 +356,7 @@ fn rewire_one_slice_first_site(
                         site.array_type_id.as_deref(),
                     ),
                     pure: false,
+                    taken_by_address: false,
                 }
             };
             graph.block_mut(then_bb).operations.push(SpaceOperation {
@@ -359,12 +373,33 @@ fn rewire_one_slice_first_site(
             // `Option<&[u8]>` is a window borrow, not `ll_join_chars`.
             // A `string_byte_view` receiver is already W1 STR; identity
             // getslice. Owner → window never copies.
+            // Stamp the array identity as a second path segment when the
+            // sibling-array scan cannot recover it (`getslice_marker_segments`).
+            // An unsuffixed marker that never meets the rtyper stays a
+            // residual whose host never binds `__getslice_rangefrom`.
+            let (item_ty, array_id) = if let Some(id) = site.array_type_id.as_deref() {
+                let (item_ty, array_id) =
+                    crate::front::slice_index::identity_from_array_type_id(id)
+                        .unwrap_or_else(|| (site.payload_ty.clone(), Some(id.to_string())));
+                (item_ty, array_id)
+            } else if let Some(id) = site.object_array_type_id.as_deref() {
+                (ValueType::Ref(None), Some(id.to_string()))
+            } else {
+                (site.payload_ty.clone(), None)
+            };
+            let segments = crate::front::slice_index::getslice_marker_segments_with_fallback(
+                graph,
+                &slice_in_then,
+                "__getslice_rangefrom",
+                Some((item_ty, array_id)),
+            );
             graph.block_mut(then_bb).operations.push(SpaceOperation {
                 result: Some(subslice.clone()),
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
-                        segments: vec!["__getslice_rangefrom".to_string()],
+                        segments,
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![slice_in_then, start_in_then]),
@@ -398,7 +433,11 @@ fn rewire_one_slice_first_site(
 
     // `else_bb`: opt = None.
     let else_result = if site.niche {
-        let null = graph.push_niche_null(else_bb, site.niche_null_cast.as_ref());
+        let null = if let Some(int_null) = site.int_null.as_ref() {
+            int_null.push(graph, else_bb)
+        } else {
+            graph.push_niche_null(else_bb, site.niche_null_cast.as_ref())
+        };
         emit_narrow(graph, else_bb, null, &site.payload_narrow_root)
     } else {
         let none_var = emit_option_variant(graph, else_bb, &site.option_owner, 0, None);
@@ -450,6 +489,7 @@ fn rewire_one_slice_first_site(
                         "r_uint".to_string(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![len]),
@@ -516,6 +556,7 @@ mod tests {
             payload_ty: ValueType::Ref(None),
             niche: false,
             niche_null_cast: None,
+            int_null: None,
             payload_narrow_root: None,
             array_type_id: None,
             object_array_type_id: None,
@@ -545,6 +586,7 @@ mod tests {
                             "first".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![slice.clone()]),
@@ -635,6 +677,7 @@ mod tests {
                             "last".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![slice]),
@@ -697,6 +740,7 @@ mod tests {
                             "last".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![slice]),
@@ -768,6 +812,7 @@ mod tests {
                             "last".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![slice]),
@@ -825,6 +870,7 @@ mod tests {
                             "last".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![slice]),
@@ -880,6 +926,7 @@ mod tests {
                             "last".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![slice]),
@@ -959,6 +1006,7 @@ mod tests {
                             "first".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![slice.clone()]),
@@ -1028,6 +1076,7 @@ mod tests {
                             "first".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![slice]),
@@ -1053,11 +1102,33 @@ mod tests {
         );
     }
 
+    /// A GC-list / STR receiver the RangeFrom getslice rewrite can mint
+    /// against. `ConstInt` dummies sit in the integer bank and are declined
+    /// (`receiver_is_int_banked`).
+    fn dummy_gc_receiver(
+        g: &mut FunctionGraph,
+        block: crate::model::BlockId,
+        class_root: &str,
+    ) -> Variable {
+        let slice = g.alloc_value_var();
+        g.push_inputarg_var(block, slice.clone());
+        g.push_op_with_result_var(
+            block,
+            OpKind::Input {
+                name: "slice".into(),
+                ty: ValueType::Ref(None),
+                class_root: Some(class_root.into()),
+            },
+            slice.clone(),
+        );
+        slice
+    }
+
     #[test]
     fn rangefrom_niche_list_getslice_copies_into_str() {
         let mut g = FunctionGraph::new("test_slice_rangefrom_join_chars");
         let a = g.startblock;
-        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let slice = dummy_gc_receiver(&mut g, a, "[u8]");
         let range = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
         let start = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
         let opt = g
@@ -1072,6 +1143,7 @@ mod tests {
                             "get".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![slice, range.clone()]),
@@ -1089,19 +1161,28 @@ mod tests {
         site.payload_ty = ValueType::Int;
         site.string_byte_view = false;
         assert_eq!(rewire_slice_first_call_sites(&mut g, &[site]), 1);
-        assert!(
-            g.blocks.iter().any(|block| {
-                block.operations.iter().any(|op| {
-                    matches!(
-                        &op.kind,
-                        OpKind::Call {
-                            target: CallTarget::FunctionPath { segments, .. },
-                            ..
-                        } if segments == &["__getslice_rangefrom"]
-                    )
-                })
-            }),
-            "successful arm still emits getslice"
+        let getslice_segments = g
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.first().map(String::as_str) == Some("__getslice_rangefrom") => {
+                    Some(segments.clone())
+                }
+                _ => None,
+            })
+            .expect("successful arm still emits getslice");
+        assert_eq!(
+            getslice_segments.first().map(String::as_str),
+            Some("__getslice_rangefrom")
+        );
+        assert_eq!(
+            getslice_segments.get(1).map(String::as_str),
+            Some("int"),
+            "suffix is the u8-list item kind"
         );
     }
 
@@ -1109,7 +1190,7 @@ mod tests {
     fn rangefrom_string_byte_view_skips_join_chars() {
         let mut g = FunctionGraph::new("test_slice_rangefrom_str_identity");
         let a = g.startblock;
-        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let slice = dummy_gc_receiver(&mut g, a, "&[u8]");
         let range = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
         let start = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
         let opt = g
@@ -1124,6 +1205,7 @@ mod tests {
                             "get".into(),
                         ],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![slice, range.clone()]),
@@ -1155,6 +1237,102 @@ mod tests {
                 })
             }),
             "a STR receiver's getslice is already STR"
+        );
+    }
+
+    /// `get(start..)` on an Int-banked receiver keeps the ordinary residual.
+    /// Minting `__getslice_rangefrom` would `arraylen_gc` a Vec header.
+    #[test]
+    fn rangefrom_get_on_int_banked_receiver_keeps_ordinary_residual() {
+        let mut g = FunctionGraph::new("test_slice_first_rangefrom_int");
+        let a = g.startblock;
+        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let k = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
+        let range = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec!["core".into(), "ops".into(), "range".into()],
+                        "RangeFrom",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::ops::range::RangeFrom".into())),
+                },
+                true,
+            )
+            .unwrap();
+        g.block_mut(a).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: range.clone(),
+                field: crate::model::FieldDescriptor {
+                    name: "start".into(),
+                    owner_root: Some("core::ops::range::RangeFrom".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value: crate::model::LinkArg::Value(k.clone()),
+                ty: ValueType::Ref(None),
+            },
+        });
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "core".into(),
+                            "slice".into(),
+                            "<Impl>".into(),
+                            "get".into(),
+                        ],
+                        fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![slice, range.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![opt.clone()]);
+        let mut site = slice_first_site(opt.clone());
+        site.access = SliceAccess::RangeFrom { range, start: k };
+        assert_eq!(
+            rewire_slice_first_call_sites(&mut g, &[site]),
+            0,
+            "an int-banked RangeFrom get keeps the ordinary residual"
+        );
+        assert!(
+            g.blocks[a.0].operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.last().map(String::as_str) == Some("get")
+            )),
+            "residual get call survives"
+        );
+        assert!(
+            !g.blocks
+                .iter()
+                .flat_map(|blk| &blk.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.first().map(String::as_str) == Some("__getslice_rangefrom")
+                )),
+            "no getslice marker is planted on an int-banked receiver"
         );
     }
 }

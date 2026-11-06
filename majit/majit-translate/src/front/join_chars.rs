@@ -279,6 +279,7 @@ pub(crate) fn build_ll_join_chars_graph() -> FunctionGraph {
             nolength: crate::front::typestr::nolength_from_array_type_id(Some("[u8]")),
             gckind: crate::front::typestr::gckind_from_array_type_id(Some("[u8]")),
             pure: false,
+            taken_by_address: false,
         },
     });
     let ch = graph.alloc_value_var();

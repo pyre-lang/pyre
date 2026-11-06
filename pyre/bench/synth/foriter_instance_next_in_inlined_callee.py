@@ -1,4 +1,3 @@
-# pyre-check: spec-folds=instance_next
 # pyre-check: trace-shape=run:absent=CallMayForceR
 # The `for` loop lives in `step`, which the walker inlines into `run`'s trace,
 # so the `ForIterNext` residual it carries is dispatched from an inline

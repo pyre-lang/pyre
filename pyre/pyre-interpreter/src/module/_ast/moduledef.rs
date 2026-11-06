@@ -4,6 +4,7 @@
 //! Verbatim move of the inline block previously in importing.rs.
 
 use pyre_object::PyObjectRef;
+use rustpython_wtf8::Wtf8;
 
 const LOCATION_ATTRIBUTES: &[&str] = &["lineno", "col_offset", "end_lineno", "end_col_offset"];
 
@@ -454,9 +455,18 @@ fn call_type_with_raw_kwargs(
     if !is_ast_method_descriptor(init_descr, ast_init) {
         return None;
     }
-    let new_descr = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") }?;
-    let object_new =
-        unsafe { crate::baseobjspace::lookup_in_type(crate::typedef::w_object(), "__new__") }?;
+    let new_descr = unsafe {
+        crate::baseobjspace::lookup_in_type(
+            w_type,
+            "__new__",
+        )
+    }?;
+    let object_new = unsafe {
+        crate::baseobjspace::lookup_in_type(
+            crate::typedef::w_object(),
+            "__new__",
+        )
+    }?;
     if new_descr != object_new {
         return None;
     }

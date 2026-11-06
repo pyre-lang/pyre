@@ -272,7 +272,7 @@ pub fn decode_instruction_forward(
             continue;
         }
         if opcode_pc != start
-            && instruction_discriminant(instruction) < 44
+            && opcode_byte_of_code_unit_word(word) < 44
             && !matches!(instruction, Instruction::Reserved)
         {
             return Err(crate::pycode::BytecodeCorruption);
@@ -302,13 +302,14 @@ pub fn decode_instruction_forward_pc(code: &CodeObject, pc: usize) -> usize {
         if opcode_pc >= code_instructions_len(code) {
             return usize::MAX;
         }
-        let instruction = instruction_from_code_unit_word(code_unit_at(code, opcode_pc));
+        let word = code_unit_at(code, opcode_pc);
+        let instruction = instruction_from_code_unit_word(word);
         if matches!(instruction, Instruction::ExtendedArg) {
             opcode_pc += 1;
             continue;
         }
         if opcode_pc != start
-            && instruction_discriminant(instruction) < 44
+            && opcode_byte_of_code_unit_word(word) < 44
             && !matches!(instruction, Instruction::Reserved)
         {
             return usize::MAX;
@@ -348,7 +349,7 @@ pub fn decode_instruction_forward_packed(code: &CodeObject, pc: usize) -> u64 {
             continue;
         }
         if opcode_pc != start
-            && instruction_discriminant(instruction) < 44
+            && opcode_byte_of_code_unit_word(word) < 44
             && !matches!(instruction, Instruction::Reserved)
         {
             return u64::MAX;
@@ -874,11 +875,10 @@ pub fn opcode_for_iter<H: IterOpcodeHandler + ControlFlowOpcodeHandler + ?Sized>
     let anchor = handler.anchor();
     match handler.iter_next(iter)? {
         Some(next) => {
-            let fallthrough = handler.fallthrough_target();
-            // On guard failure this bytecode exits through the exhaustion path.
-            handler.set_next_instr(target)?;
+            // `pyopcode.py FOR_ITER` exhausts only on StopIteration (`None`
+            // here). A guard fail at `space.next` is a deopt that re-runs
+            // `next` in the blackhole, not "iterator done".
             handler.record_for_iter_guard(next, true)?;
-            handler.set_next_instr(fallthrough)?;
             H::push_anchored(&anchor, next)
         }
         None => {
@@ -922,6 +922,21 @@ pub fn opcode_compare_op<H: ArithmeticOpcodeHandler + ?Sized>(
     let anchor = handler.anchor();
     let result = handler.compare_value(a, b, op)?;
     H::push_anchored(&anchor, result)
+}
+
+/// `pyopcode.py IS_OP` → `space.is_w`, then push the bool (inverted when
+/// `is not`).
+pub fn opcode_is_op<H>(handler: &mut H, invert: Invert) -> Result<(), PyError>
+where
+    H: SharedOpcodeHandler<Value = PyObjectRef> + ?Sized,
+{
+    let b = handler.pop_value()?;
+    let a = handler.pop_value()?;
+    let invert = match invert {
+        Invert::No => 0,
+        Invert::Yes => 1,
+    };
+    handler.push_value(crate::runtime_ops::is_op(a, b, invert))
 }
 
 pub fn opcode_unary_negative<H: ArithmeticOpcodeHandler + ?Sized>(
@@ -1002,6 +1017,18 @@ pub fn opcode_return_value<H: ControlFlowOpcodeHandler + ?Sized>(
 }
 
 pub trait OpcodeStepExecutor: SharedOpcodeHandler {
+    /// Dispatch coordinate for `RAISE_VARARGS`. Default `-1` so non-frame
+    /// handlers do not invent a pc. `PyFrame` returns the vable `last_instr`.
+    fn last_instr(&self) -> isize {
+        -1
+    }
+
+    /// Word view of the live frame for residual helpers. Default 0 so a
+    /// non-frame handler cannot invent a pointer. `PyFrame` returns `self`.
+    fn as_pyframe_ptr(&self) -> i64 {
+        0
+    }
+
     fn load_const(&mut self, constant: &ConstantData) -> Result<(), PyError>
     where
         Self: ConstantOpcodeHandler,
@@ -1304,6 +1331,15 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         self.push_value(null)
     }
 
+    /// LOAD_ATTR method branch threaded with the bytecode `nameindex`.
+    /// Default ignores `nameindex` and runs [`Self::load_method`].
+    fn load_method_cached(&mut self, name: &str, _nameindex: usize) -> Result<(), PyError>
+    where
+        Self: SharedOpcodeHandler + NamespaceOpcodeHandler,
+    {
+        OpcodeStepExecutor::load_method(self, name)
+    }
+
     /// LOAD_SPECIAL used by synchronous/asynchronous context managers.
     /// Like PyPy's BEFORE_WITH, this performs a type-MRO lookup and descriptor
     /// binding without consulting the instance's `__getattribute__`.
@@ -1404,11 +1440,6 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         Err(crate::PyError::type_error("import_star not implemented"))
     }
 
-    // ── Stack manipulation ──
-    fn rotate3(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("rotate3 not implemented"))
-    }
-
     // ── Delete operations ──
     fn delete_fast(&mut self, _idx: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("delete_fast not implemented"))
@@ -1421,6 +1452,9 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn delete_attr(&mut self, _name: &str) -> Result<(), PyError> {
         Err(crate::PyError::type_error("delete_attr not implemented"))
     }
+    fn delete_attr_cached(&mut self, name: &str, _nameindex: usize) -> Result<(), PyError> {
+        OpcodeStepExecutor::delete_attr(self, name)
+    }
     fn delete_name(&mut self, _name: &str, _nameindex: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("delete_name not implemented"))
     }
@@ -1432,15 +1466,38 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn contains_op(&mut self, _invert: crate::bytecode::Invert) -> Result<(), PyError> {
         Err(crate::PyError::type_error("contains_op not implemented"))
     }
-    fn is_op(&mut self, _invert: crate::bytecode::Invert) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("is_op not implemented"))
+    /// `pyopcode.py IS_OP` → `space.is_w`. A default that raises is not a
+    /// legal look-inside body: the unique-override bind may miss, and the
+    /// graph would then record this stub.
+    fn is_op(&mut self, invert: crate::bytecode::Invert) -> Result<(), PyError>
+    where
+        Self: SharedOpcodeHandler<Value = PyObjectRef>,
+    {
+        opcode_is_op(self, invert)
     }
 
     // Exception handling
-    fn push_exc_info(&mut self) -> Result<(), PyError> {
-        Ok(())
+    /// `pyopcode.py PUSH_EXC_INFO` — publish the caught exception onto
+    /// `ExecutionContext.sys_exc_info` so `sys.exc_info()` inside a compiled
+    /// handler sees it. A no-op default is not a legal look-inside body.
+    fn push_exc_info(&mut self) -> Result<(), PyError>
+    where
+        Self: SharedOpcodeHandler<Value = PyObjectRef>,
+    {
+        let exc = self.pop_value()?;
+        let prev = crate::eval::get_current_exception();
+        crate::eval::set_current_exception(exc);
+        crate::eval::set_in_flight_exception(pyre_object::PY_NULL);
+        self.push_value(prev)?;
+        self.push_value(exc)
     }
-    fn pop_except(&mut self) -> Result<(), PyError> {
+    /// `pyopcode.py POP_EXCEPT` — restore the previous `sys.exc_info`.
+    fn pop_except(&mut self) -> Result<(), PyError>
+    where
+        Self: SharedOpcodeHandler<Value = PyObjectRef>,
+    {
+        let prev_exc = self.pop_value()?;
+        crate::eval::set_current_exception(prev_exc);
         Ok(())
     }
     fn check_exc_match(&mut self) -> Result<(), PyError> {
@@ -1595,11 +1652,6 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
             "load_build_class not implemented",
         ))
     }
-    fn load_super_attr(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error(
-            "load_super_attr not implemented",
-        ))
-    }
     fn load_super_attr_with(
         &mut self,
         _name_idx: usize,
@@ -1654,11 +1706,6 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn load_from_dict_or_deref(&mut self, _idx: usize, _name: &str) -> Result<(), PyError> {
         Err(crate::PyError::type_error(
             "load_from_dict_or_deref not implemented",
-        ))
-    }
-    fn match_stub(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error(
-            "pattern matching not implemented",
         ))
     }
     // MATCH_MAPPING / MATCH_SEQUENCE / MATCH_KEYS / MATCH_CLASS (PEP 634).
@@ -2171,11 +2218,11 @@ pub fn code_instructions_len(code: &CodeObject) -> usize {
     code.instructions.len()
 }
 
-/// Read one packed two-byte code unit through a scalar residual call. The
-/// `CodeUnits::deref` slice stays inside the helper body and never crosses the
-/// two-phase residual ABI.
+/// Read one packed two-byte code unit. `co_code` is immutable, so a
+/// constant `(code, i)` folds to the word; the slice deref stays inside
+/// the helper when the args are not constant.
 #[inline]
-#[majit_macros::dont_look_inside]
+#[majit_macros::elidable_cannot_raise]
 pub fn code_unit_at(code: &CodeObject, i: usize) -> u16 {
     let unit = code.instructions[i];
     u16::from(u8::from(unit.op)) | (u16::from(u8::from(unit.arg)) << 8)
@@ -2190,6 +2237,15 @@ pub fn oparg_from_u32(value: u32) -> OpArg {
     // SAFETY: `OpArg` is `#[repr(transparent)] struct OpArg(u32)`; every
     // `u32` is a valid `OpArg`.
     unsafe { std::mem::transmute::<u32, OpArg>(value) }
+}
+
+/// The opcode byte of a code unit word: the byte
+/// [`instruction_from_code_unit_word`] reinterprets, read without the
+/// `u8::from(Instruction)` call into the bytecode crate, which lies outside
+/// the extracted LLBC.
+#[inline]
+fn opcode_byte_of_code_unit_word(word: u16) -> u8 {
+    word as u8
 }
 
 #[inline]
@@ -2315,22 +2371,41 @@ pub fn execute_delete_subscr<E: OpcodeStepExecutor>(
 
 pub fn execute_push_exc_info<E: OpcodeStepExecutor>(
     executor: &mut E,
-) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: SharedOpcodeHandler<Value = PyObjectRef>,
+{
     executor.push_exc_info()?;
     Ok(StepResult::Continue)
 }
 
 pub fn execute_pop_except<E: OpcodeStepExecutor>(
     executor: &mut E,
-) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: SharedOpcodeHandler<Value = PyObjectRef>,
+{
     executor.pop_except()?;
     Ok(StepResult::Continue)
 }
 
 pub fn execute_check_exc_match<E: OpcodeStepExecutor>(
     executor: &mut E,
-) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
-    executor.check_exc_match()?;
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: SharedOpcodeHandler<Value = PyObjectRef>,
+{
+    // Do not call the trait default stub — portal interpret residual-calls
+    // `OpcodeStepExecutor::check_exc_match` and raises TypeError.
+    let exc_type = executor.pop_value()?;
+    let exc_value = executor.peek_at(0)?;
+    // Residual-safe word gate: `validate_check_exc_match_class` returns
+    // `Result` and aborts portal interpret as an unbound residual.
+    if !crate::eval::is_valid_check_exc_match_class(exc_type) {
+        return Err(PyError::type_error(crate::eval::CANNOT_CATCH_MSG));
+    }
+    let matched = crate::eval::check_exc_match_against(exc_value, exc_type);
+    executor.push_value(pyre_object::w_bool_from(matched))?;
     Ok(StepResult::Continue)
 }
 
@@ -2523,13 +2598,6 @@ pub fn execute_cleanup_throw<E: OpcodeStepExecutor>(
     executor: &mut E,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
     executor.cleanup_throw()?;
-    Ok(StepResult::Continue)
-}
-
-pub fn execute_match_stub<E: OpcodeStepExecutor>(
-    executor: &mut E,
-) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
-    executor.match_stub()?;
     Ok(StepResult::Continue)
 }
 
@@ -3118,7 +3186,10 @@ pub fn execute_is_op<E: OpcodeStepExecutor>(
     executor: &mut E,
     instruction: Instruction,
     op_arg: OpArg,
-) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: SharedOpcodeHandler<Value = PyObjectRef>,
+{
     let Instruction::IsOp { invert } = instruction else {
         unreachable!()
     };
@@ -3130,11 +3201,30 @@ pub fn execute_raise_varargs<E: OpcodeStepExecutor>(
     executor: &mut E,
     instruction: Instruction,
     op_arg: OpArg,
-) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: SharedOpcodeHandler<Value = PyObjectRef>,
+{
     let Instruction::RaiseVarargs { argc } = instruction else {
         unreachable!()
     };
-    executor.raise_varargs(raise_kind_arg_as_usize(argc, op_arg))?;
+    let argc = raise_kind_arg_as_usize(argc, op_arg);
+    // argc=1 (`raise inst`) must not go through the trait default stub
+    // the translator residual-calls. Pop the operand as a word and
+    // residual-call the concrete helper.
+    if argc == 1 {
+        let w_value = executor.pop_value()?;
+        let exc = crate::eval::raise_prepared_exc(w_value);
+        if exc.is_null() {
+            return Err(crate::call::take_call_error().unwrap_or_else(|| {
+                crate::PyError::type_error("exceptions must derive from BaseException")
+            }));
+        }
+        let mut err = unsafe { crate::PyError::from_exc_object(exc) };
+        err.set_reraise_lasti(executor.last_instr() as i32);
+        return Err(err);
+    }
+    executor.raise_varargs(argc)?;
     Ok(StepResult::Continue)
 }
 
@@ -3142,12 +3232,30 @@ pub fn execute_reraise<E: OpcodeStepExecutor>(
     executor: &mut E,
     instruction: Instruction,
     op_arg: OpArg,
-) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
+) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
+where
+    E: SharedOpcodeHandler<Value = PyObjectRef>,
+{
     let Instruction::Reraise { depth } = instruction else {
         unreachable!()
     };
-    executor.reraise(depth.get(op_arg))?;
-    Ok(StepResult::Continue)
+    // Same stub problem as `raise_varargs` / `check_exc_match`.
+    let oparg = depth.get(op_arg);
+    let reraise_lasti: i32 = if oparg != 0 {
+        crate::baseobjspace::int_w(executor.peek_at(oparg as usize)?)? as i32
+    } else {
+        -1
+    };
+    let w_exc = executor.pop_value()?;
+    if w_exc.is_null() || !unsafe { pyre_object::is_exception(w_exc) } {
+        return Err(PyError::type_error(
+            "exception must derive from BaseException",
+        ));
+    }
+    let mut err = unsafe { PyError::from_exc_object(w_exc) };
+    err.set_attach_tb(false);
+    err.set_reraise_lasti(reraise_lasti);
+    Err(err)
 }
 
 pub fn execute_list_extend<E: OpcodeStepExecutor>(
@@ -3497,7 +3605,8 @@ pub fn execute_delete_attr<E: OpcodeStepExecutor>(
     let Instruction::DeleteAttr { namei } = instruction else {
         unreachable!()
     };
-    executor.delete_attr(code.names[u32_as_usize(namei.get(op_arg))].as_ref())?;
+    let name_idx = u32_as_usize(namei.get(op_arg));
+    executor.delete_attr_cached(code.names[name_idx].as_ref(), name_idx)?;
     Ok(StepResult::Continue)
 }
 
@@ -3569,7 +3678,7 @@ where
     let name_idx = u32_as_usize(attr.name_idx());
     let name = code.names[name_idx].as_ref();
     if attr.is_method() {
-        executor.load_method(name)?;
+        executor.load_method_cached(name, name_idx)?;
     } else {
         executor.load_attr_cached(name, name_idx)?;
     }
@@ -3650,7 +3759,7 @@ pub fn execute_opcode_step<E: OpcodeStepExecutor>(
     next_instr: usize,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
 where
-    E: SharedOpcodeHandler
+    E: SharedOpcodeHandler<Value = PyObjectRef>
         + ConstantOpcodeHandler
         + LocalOpcodeHandler
         + NamespaceOpcodeHandler

@@ -1,6 +1,5 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=first_reads,reread
-# pyre-check: spec-folds=load_attr,store_attr_direct
 # pyre-check: trace-shape=reread:absent=CallMayForceR,build:absent=CallMayForceN
 # `UnboxedPlainAttribute._direct_write` freezes unboxing for the whole class
 # after a type change.  Instances created before the freeze retain an unboxed

@@ -1,4 +1,3 @@
-# pyre-check: spec-folds=load_bound_method_attr,store_attr_direct
 # pyre-check: trace-shape=entry-bridge:push:absent=CallMayForceR,append_first:absent=CallMayForceN
 #
 # `push` binds `a.append` inside an inlined callee.  The folds that shape a

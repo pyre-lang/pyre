@@ -174,7 +174,9 @@ pub(crate) fn authoritative_result_type_from_op(
         // kind; folded to `ConstBool(true)` by `jtransform` before emit.
         OpKind::ConstSymbolic { .. } => Some(ConcreteType::Signed),
         OpKind::ConstFloat(_) => Some(ConcreteType::Float),
-        OpKind::ConstStr(_) | OpKind::ConstInternedStr(_) => Some(ConcreteType::GcRef),
+        OpKind::ConstStr(_) | OpKind::ConstInternedStr(_) | OpKind::ConstRefNull => {
+            Some(ConcreteType::GcRef)
+        }
         OpKind::Input { ty, .. } => concrete_if_known(valuetype_to_concrete_for_legacy(
             ty,
             raw_alloc_flavor_structs,
@@ -1293,6 +1295,7 @@ mod tests {
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
+                    taken_by_address: false,
                 },
                 true,
             )

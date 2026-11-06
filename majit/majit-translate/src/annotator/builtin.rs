@@ -163,6 +163,14 @@ fn allowed_kwds(qualname: &str) -> &'static [&'static str] {
         "enumerate" => &["s_start"],
         // robjmodel_instantiate(s_clspbc, s_nonmovable=None)
         "rpython.rlib.objectmodel.instantiate" => &["s_nonmovable"],
+        "lltype.malloc" => &[
+            "s_flavor",
+            "s_immortal",
+            "s_zero",
+            "s_track_allocation",
+            "s_add_memory_pressure",
+            "s_nonmovable",
+        ],
         // _r_dict_helper(cls, s_eqfn, s_hashfn, s_force_non_null,
         //                s_simple_hash_eq)
         "rpython.rlib.objectmodel.r_dict" | "rpython.rlib.objectmodel.r_ordereddict" => {
@@ -302,6 +310,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // lltype HOST_ENV module assigns (`flowspace/model.rs`'s
     // `bootstrap_std_modules`).
     analyzer_for(&mut reg, "lltype.cast_pointer", lltype_cast_pointer);
+    analyzer_for(
+        &mut reg,
+        "lltype.malloc",
+        crate::translator::rtyper::lltypesystem::lltype::ann_malloc,
+    );
     // `pyre_object::lltype::malloc[_typed]` — GC allocation intrinsics.
     // Keyed by the qualname the HOST_ENV `pyre_object.lltype` module assigns
     // (`flowspace/model.rs`); recognising it as a builtin keeps its body out

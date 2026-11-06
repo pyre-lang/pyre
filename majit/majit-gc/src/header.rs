@@ -266,7 +266,8 @@ impl GcType for GCREFOpaque {
 
 /// `llmemory.GCREF = Ptr(GcOpaqueType('GCREF'))`.
 ///
-/// A thin pointer alias with the same machine ABI as `*mut u8`.
+/// A thin pointer alias with the same machine ABI as `*mut u8`. `*mut u8` itself
+/// stays `rffi.CCHARP` / `llmemory.Address` (`getkind` `'int'`).
 #[allow(non_camel_case_types)]
 pub type GCREF = *mut GCREFOpaque;
 

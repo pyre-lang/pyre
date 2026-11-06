@@ -1865,13 +1865,16 @@ pub(crate) fn is_true_lookup(obj: PyObjectRef) -> Result<bool, PyError> {
     {
         if let Some(w_descr) = unsafe { lookup_in_type(w_type.as_ptr(), "__bool__") } {
             let w_res = unsafe {
-                get_and_call_function(
+                get_and_call_function0(
                     w_descr,
                     pyre_object::gc_roots::shadow_stack_get(obj_slot),
                     w_type.as_ptr(),
-                    &[],
                 )
-            }?;
+            };
+            if w_res.is_null() {
+                return Err(crate::call::take_call_error()
+                    .unwrap_or_else(|| PyError::type_error("call failed")));
+            }
             // The only instances of bool are `w_False` / `w_True`, so any
             // other box is the TypeError, and what it names is the type of
             // what `__bool__` RETURNED.  The docstring above transcribes
@@ -1888,13 +1891,16 @@ pub(crate) fn is_true_lookup(obj: PyObjectRef) -> Result<bool, PyError> {
         }
         if let Some(w_descr) = unsafe { lookup_in_type(w_type.as_ptr(), "__len__") } {
             let w_res = unsafe {
-                get_and_call_function(
+                get_and_call_function0(
                     w_descr,
                     pyre_object::gc_roots::shadow_stack_get(obj_slot),
                     w_type.as_ptr(),
-                    &[],
                 )
-            }?;
+            };
+            if w_res.is_null() {
+                return Err(crate::call::take_call_error()
+                    .unwrap_or_else(|| PyError::type_error("call failed")));
+            }
             let w_index = space_index(w_res)?;
             return Ok(_check_len_result(w_index)? != 0);
         }
@@ -2086,10 +2092,30 @@ pub(crate) unsafe fn normalize_slice(
 /// first, then called with `args_w` alone, so `@staticmethod` /
 /// `@classmethod` / custom-descriptor dunders receive the arguments PyPy
 /// gives them.
-///
-/// Residual (`look_inside_graph` sees the `args_w` loop). The word-ABI
-/// trampoline is `getfunctionptr` (`get_jitcode_calldescr`).
-#[majit_macros::getfunctionptr]
+/// `space.get_and_call_function(w_descr, w_obj)` — zero extra positionals.
+/// Portal jitcode must not pass a `&[]` slice; that constant has no GC header
+/// and `ARRAYLEN_GC` faults on it. The body still uses the slice-taking
+/// helper, which stays inside this residual.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub unsafe fn get_and_call_function0(
+    w_descr: PyObjectRef,
+    w_obj: PyObjectRef,
+    w_type: PyObjectRef,
+) -> PyObjectRef {
+    match get_and_call_function(w_descr, w_obj, w_type, &[]) {
+        Ok(value) => value,
+        Err(err) => {
+            crate::call::set_call_error(err);
+            pyre_object::PY_NULL
+        }
+    }
+}
+
+/// descroperation.py `get_and_call_function(space, w_descr, w_obj, *args_w)`.
+/// The `*args_w` tuple has a fixed length per call site, so the loops over
+/// `args_w` unroll.
+#[majit_macros::unroll_safe]
 pub unsafe fn get_and_call_function(
     w_descr: PyObjectRef,
     w_obj: PyObjectRef,
@@ -2120,10 +2146,23 @@ pub unsafe fn get_and_call_function(
                 crate::function::funccall_result(w_descr, &[w_obj, args_w[0], args_w[1], args_w[2]])
             }
             _ => {
+                // `Vec::with_capacity` allocates. A raw descriptor word is not a
+                // root, so a collection there forwards the object and leaves the
+                // register stale. `pin_root` writes the word onto the shadow stack
+                // before that allocation; `get` reads it back once the list exists.
+                // `w_obj` is pinned the same way. `args_w` is an existing slice, so
+                // `publish` copies it with no temporary array.
+                let _roots = pyre_object::gc_roots::push_roots();
+                let base = _roots.base();
+                let _ = _roots.pin_root(w_descr);
+                let _ = _roots.pin_root(w_obj);
+                let args_at = _roots.publish(args_w);
                 let mut full = Vec::with_capacity(args_w.len() + 1);
-                full.push(w_obj);
-                full.extend_from_slice(args_w);
-                crate::function::funccall_result(w_descr, full.as_slice())
+                full.push(_roots.get(base + 1));
+                for i in 0..args_w.len() {
+                    full.push(_roots.get(args_at + i));
+                }
+                crate::function::funccall_result(_roots.get(base), full.as_slice())
             }
         };
     }
@@ -2683,7 +2722,7 @@ fn string_index_type_error(index: PyObjectRef) -> PyError {
 }
 
 #[inline(never)]
-unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+pub(crate) unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let mut obj = obj;
     let mut index = index;
     if is_slice(index) {
@@ -3005,7 +3044,7 @@ unsafe fn tuple_copy_boxed_items(
 }
 
 #[inline(never)]
-unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+pub(crate) unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let mut obj = obj;
     let mut index = index;
     if is_slice(index) {
@@ -3410,6 +3449,7 @@ unsafe fn getitem_type(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     }
     // Python 3.9+ generic subscript: cls[X] → cls.__class_getitem__(X)
     // (`descroperation.py` getattr lookup).
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     if let Some(method) = lookup_in_type_where(obj, "__class_getitem__") {
         // PyPy's generic lookup treats an explicit None as disabling the
         // inherited subscription hook.  Other non-callable values still
@@ -5522,7 +5562,11 @@ pub(crate) fn setitem_slot(
 }
 
 #[inline(never)]
-unsafe fn setitem_list(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
+pub(crate) unsafe fn setitem_list(
+    obj: PyObjectRef,
+    index: PyObjectRef,
+    value: PyObjectRef,
+) -> PyResult {
     let mut obj = obj;
     let mut index = index;
     let mut value = value;
@@ -6127,6 +6171,25 @@ pub fn finditem_str_named(
         let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(obj) };
         if !strategy.is_null() {
             return Ok(unsafe { (*strategy).getitem_str(obj, key) });
+        }
+        // `finditem_str` / `getitem_str` take an rpython `str` (one GCREF).
+        // A filled `co_names_w` slot is that word; the borrowed `&str`
+        // spelling is two words and cannot be a residual argument.
+        // `finditem_str` passes a null code object: it has no table, so the
+        // lookup is not asked to read one.
+        let w_key = if unsafe { crate::pycode::w_code_name_index_covered(pycode, nameindex) } {
+            unsafe { crate::pycode::w_code_getname_w(pycode, nameindex) }
+        } else {
+            pyre_object::PY_NULL
+        };
+        if !w_key.is_null() {
+            let hash = unsafe { pyre_object::unicodeobject::w_str_hash_memoized(w_key) };
+            return match unsafe {
+                pyre_object::dictmultiobject::w_dict_getitem_str_checked_hashed_w(obj, w_key, hash)
+            } {
+                Ok(hit) => Ok(hit),
+                Err(_) => Err(take_pending_dict_key_error(w_key)),
+            };
         }
         // `objspace.py StdObjSpace.finditem_str` — `w_obj.getitem_str(key)`
         // with no DictOperationGuard.  The lock lives on the user-facing
@@ -7162,6 +7225,9 @@ pub fn clear_all_weakrefs(obj: PyObjectRef) {
 /// (PyPy: Module.getdict → w_dict lookup).
 /// For other objects, looks up the attribute in the per-object side table.
 
+/// `space.getattr` for a borrowed UTF-8 name. A proven literal folds to an
+/// interned unicode Ref; traced opcode paths intern via `getname_w` and enter
+/// [`getattr`] instead.
 pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
     // `space.getattr` — the full path, including the `__getattr__` fallback.
     // A user `__getattr__` may collect, so the receiver is pinned across
@@ -7176,9 +7242,6 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
         false,
     )
     .map_err(|mut err| {
-        // PyPy 9883bb2a9d `DescrOperation.getattr`: enrich an AttributeError
-        // only after the complete `__getattribute__` / `__getattr__` chain has
-        // failed, preserving a more specific inner lookup's existing context.
         err.enrich_attribute_error_str(pyre_object::gc_roots::shadow_stack_get(obj_slot), name);
         err
     })
@@ -7968,7 +8031,7 @@ pub fn getattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
     let obj = pyre_object::gc_roots::shadow_stack_get(operands);
     let w_name = pyre_object::gc_roots::shadow_stack_get(operands + 1);
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-    let result = if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
+    let result = if unsafe { pyre_object::w_str_is_utf8(w_name) } {
         // `getattr_str_impl` rather than `getattr_str`: this entry point already
         // holds the wrapped name, so the enrichment below can hand it over
         // directly instead of letting `enrich_attribute_error_str` allocate a
@@ -7994,13 +8057,16 @@ pub fn getattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
             )
         }
     };
-    result.map_err(|mut err| {
-        err.enrich_attribute_error(
-            pyre_object::gc_roots::shadow_stack_get(operands),
-            pyre_object::gc_roots::shadow_stack_get(operands + 1),
-        );
-        err
-    })
+    match result {
+        Ok(value) => Ok(value),
+        Err(mut err) => {
+            err.enrich_attribute_error(
+                pyre_object::gc_roots::shadow_stack_get(operands),
+                pyre_object::gc_roots::shadow_stack_get(operands + 1),
+            );
+            Err(err)
+        }
+    }
 }
 
 /// `_PyObject_LookupAttr` — the full `space.getattr` protocol for a caller
@@ -8020,7 +8086,7 @@ pub fn lookup_attr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
     let operands = pyre_object::gc_roots::pin_roots(&[obj, w_name]);
     let w_name = pyre_object::gc_roots::shadow_stack_get(operands + 1);
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-    let result = if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
+    let result = if unsafe { pyre_object::w_str_is_utf8(w_name) } {
         getattr_str_impl(
             pyre_object::gc_roots::shadow_stack_get(operands),
             unsafe {
@@ -8743,7 +8809,12 @@ pub fn object_getattribute(mut obj: PyObjectRef, name: &str) -> PyResult {
     // their pure descriptor protocol with no `__getattr__` fallback — that
     // belongs to space.getattr, not the bare object.__getattribute__ slot
     // (descroperation.py).
-    pyre_object::with_roots!(obj => getattr_str_impl(obj, name, false, false))
+    pyre_object::with_roots!(obj => getattr_str_impl(
+        obj,
+        name,
+        false,
+        false,
+    ))
 }
 
 /// typeobject.py `W_TypeObject.descr_getattribute` — the canonical
@@ -11421,6 +11492,21 @@ fn buffer_bytes(
     }
 }
 
+/// Look up a descriptor on an object's type from an already-held Python str.
+///
+/// PyPy equivalent: `space.lookup(w_obj, name)`. The residual path takes the
+/// STR word; this wrapper only unwraps a Python string the caller already has.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn lookup_w(obj: PyObjectRef, w_name: PyObjectRef) -> Option<PyObjectRef> {
+    let w_type = crate::typedef::r#type(obj)?;
+    lookup_in_type_where_wtf8(
+        w_type.as_ptr(),
+        pyre_object::unicodeobject::w_str_get_wtf8(w_name),
+    )
+}
+
 /// Look up a descriptor on an object's type.
 ///
 /// PyPy equivalent: `space.lookup(w_obj, name)`.
@@ -12202,6 +12288,15 @@ fn name_content_hash(name: &Wtf8) -> u64 {
         hash = hash.wrapping_mul(PRIME);
     }
     hash
+}
+
+/// [`name_content_hash`] for the residual-call ABI.  A jitcode carries a
+/// `&Wtf8` as the one word of the str object it was read from
+/// (`w_str_get_wtf8` lowers to the identity on its receiver), so the wrapper
+/// takes that object and reads the name back, as
+/// `jit_instance_getdictvalue` does.
+pub extern "C" fn name_content_hash_jit_abi(w_name: PyObjectRef) -> u64 {
+    name_content_hash(unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_name) })
 }
 
 /// `typeobject.py:541` `cache.names[method_hash] == name`, and the same
@@ -15180,6 +15275,9 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
     Ok(w_none())
 }
 
+/// `space.setattr` for a borrowed UTF-8 name. A proven literal folds to an
+/// interned unicode Ref; traced opcode paths intern via `getname_w` and enter
+/// [`setattr`] instead.
 pub fn setattr_str(obj: PyObjectRef, name: &str, mut value: PyObjectRef) -> PyResult {
     let obj =
         pyre_object::with_roots!(value => crate::module::_weakref::interp__weakref::force(obj))?;
@@ -16481,9 +16579,9 @@ fn missing_attribute_subject(obj: PyObjectRef) -> String {
     }
 }
 
-/// Delete an attribute: `del obj.name`.
-///
-/// PyPy: descroperation.py descr__delattr__
+/// `space.delattr` for a borrowed UTF-8 name. A proven literal folds to an
+/// interned unicode Ref; traced opcode paths intern via `getname_w` and enter
+/// [`delattr`] instead.
 pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     // descroperation.py:254 — space.lookup for __delattr__ through MRO
@@ -19133,8 +19231,15 @@ unsafe fn iter_check_is_iterator(mut w_obj: PyObjectRef, mut w_iterator: PyObjec
     } else if is_instance(w_iterator) {
         false
     } else {
-        pyre_object::with_roots!(w_obj, w_iterator => getattr_str_impl(w_iterator, "__next__", false, false))
-            .is_ok()
+        pyre_object::with_roots!(w_obj, w_iterator => {
+            getattr_str_impl(
+                w_iterator,
+                "__next__",
+                false,
+                false,
+            )
+        })
+        .is_ok()
     };
     if has_next {
         Ok(w_iterator)

@@ -1,6 +1,5 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=main
-# pyre-check: spec-folds=frame_lasti
 # Self-checking guard for the coordinate an app-level `f_lasti` read reports
 # for the frame that is running it.
 #
