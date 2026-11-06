@@ -1709,7 +1709,7 @@ fn descent_decline(
 /// placeholder (`is_symbolic_fnaddr`), an `abort` opcode (`bhimpl_abort`),
 /// an `inline_call_*` callee the blackhole would interpret
 /// (`interpret_unresolved_inline_call`) whose whole-body summary can reach
-/// an `abort`, or a region the scan cannot read.
+/// a blocker or an `abort`, or a region the scan cannot read.
 ///
 /// `reject_unresolved_call` bails at a symbolic placeholder. A runtime
 /// address the static scan does not know is restored by
@@ -1720,7 +1720,9 @@ fn descent_decline(
 /// scan proves there (`entry_array_len`, the length of a gateway's argument
 /// array), so an arm those facts exclude on every path to `pc` is not
 /// counted. Callees named by `inline_call_*` past `pc` count with their
-/// whole-body summary.
+/// whole-body summary only when the blackhole would interpret them.
+/// A callable `jitcode.fnaddr` runs `bhimpl_inline_call_*` natively, so
+/// that callee's blockers are not a section the scan walks.
 pub(crate) fn helper_resume_reaches_blocker(
     jitcode_index: usize,
     pc: usize,
@@ -3092,17 +3094,33 @@ fn summarize_body_blockers_from(
                     summary.first_effect_pc.get_or_insert(d.pc);
                 }
             } else if let Some(callee) = callee_summary(descr_index, effect, trampoline_entry) {
-                // Entering with an effect behind us turns every blocker the
-                // callee holds into one that cannot be rewound.
-                let after = if effect {
-                    callee.blocker_after_effect.or(callee.blocker_effect_free)
-                } else {
-                    callee.blocker_after_effect
-                };
-                if let Some(blocker) = after {
-                    summary.blocker_after_effect.get_or_insert(blocker);
-                } else if let Some(blocker) = callee.blocker_effect_free {
-                    summary.blocker_effect_free.get_or_insert(blocker);
+                let fnaddr = callee_fnaddr(descr_index)
+                    .or_else(|| jitcode_fnaddr_for_descr(descr_index))
+                    .unwrap_or(0);
+                // Descent (`resume_pc` none) walks the callee jitcode. Resume
+                // walks it only when blackhole would
+                // `interpret_unresolved_inline_call`; `bhimpl_inline_call_*`
+                // runs a callable `fnaddr` natively, so that callee's
+                // blockers are not a section this scan numbers.
+                let interpret_callee =
+                    resume_pc.is_none() || blackhole_interprets_inline_callee(fnaddr);
+                if interpret_callee {
+                    // Entering with an effect behind us turns every blocker the
+                    // callee holds into one that cannot be rewound.
+                    let after = if effect {
+                        callee.blocker_after_effect.or(callee.blocker_effect_free)
+                    } else {
+                        callee.blocker_after_effect
+                    };
+                    if let Some(blocker) = after {
+                        summary.blocker_after_effect.get_or_insert(blocker);
+                    } else if let Some(blocker) = callee.blocker_effect_free {
+                        summary.blocker_effect_free.get_or_insert(blocker);
+                    }
+                    // The descent enters this callee, so a region of it the
+                    // callee's own scan could not read is a region of this
+                    // descent.
+                    summary.body_not_walked |= callee.body_not_walked;
                 }
                 // `bhimpl_abort` cannot finish a helper section. Whole-body
                 // admission does not name that `abort` as a blocker; the
@@ -3112,9 +3130,6 @@ fn summarize_body_blockers_from(
                 // natively, so that abort is not a section the scan walks.
                 summary.has_reachable_abort |= callee.has_reachable_abort;
                 if resume_pc.is_some() && callee.has_reachable_abort {
-                    let fnaddr = callee_fnaddr(descr_index)
-                        .or_else(|| jitcode_fnaddr_for_descr(descr_index))
-                        .unwrap_or(0);
                     if blackhole_interprets_inline_callee(fnaddr) {
                         let slot = if effect {
                             &mut summary.blocker_after_effect
@@ -3128,9 +3143,6 @@ fn summarize_body_blockers_from(
                     effect = true;
                     summary.first_effect_pc.get_or_insert(d.pc);
                 }
-                // The descent enters this callee, so a region of it the callee's
-                // own scan could not read is a region of this descent.
-                summary.body_not_walked |= callee.body_not_walked;
             } else {
                 // The `d` operand did not resolve to a JitCode descr, so this
                 // op's callee is a body the scan holds nothing about.  Falling
