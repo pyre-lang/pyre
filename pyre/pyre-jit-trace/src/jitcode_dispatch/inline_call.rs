@@ -3579,27 +3579,57 @@ fn call_site_inside_protected_region<Sym: WalkSym>(sym: &Sym, op_pc: usize) -> b
     )
 }
 
-/// Whether a callee that is not the walk's own code carries a body this fold
-/// can represent.
+/// Whether a callee that is not the walk's own code may take `CALL_ASSEMBLER`.
 ///
-/// This screen is the fold's own precondition, not upstream's.  The whole call
-/// collapses into one `CALL_ASSEMBLER` plus
-/// `GUARD_NOT_FORCED`/`GUARD_NO_EXCEPTION`.  A `raise` that crosses the
-/// boundary needs nothing more: the callee's compiled trace propagates it and
-/// `GUARD_NO_EXCEPTION` resumes the caller into its unwind, as
-/// `do_recursive_call(assembler_call=True)` (`pyjitpl.py`) does for every
-/// callee it reaches.  What the fold cannot represent is a protected region
-/// inside the callee or an `abort_permanent` marker; those stay a residual,
-/// the direction `look_inside_graph` (`codewriter/policy.py`) answers a "no"
-/// with.
+/// `_opimpl_recursive_call` (`pyjitpl.py`) falls through to
+/// `do_recursive_call(assembler_call=True)` with no extra callee screens.
+/// `direct_assembler_call` records `CALL_ASSEMBLER` to
+/// `warmstate.get_assembler_token(greenargs)`; the callee's compiled loop
+/// already contains its handlers. A raise that crosses the boundary is
+/// `handle_possible_exception` (`GUARD_NO_EXCEPTION`).
 ///
-/// Not asked of the walk's own code: `call_site_inside_protected_region` already
-/// read that body's table at this very call site.
+/// `has_abort_permanent` is the `look_inside_graph` (`codewriter/policy.py`)
+/// analog. Missing body facts cannot answer it, so they decline too.
 fn foreign_callee_admits_call_assembler(w_code: *const ()) -> bool {
     let Some(facts) = sub_jitcode_body_facts_for_code(w_code) else {
         return false;
     };
-    !facts.has_exception_table && !facts.has_abort_permanent
+    foreign_callee_facts_admit_call_assembler(facts)
+}
+
+fn foreign_callee_facts_admit_call_assembler(facts: crate::pyjitcode::InlineBodyFacts) -> bool {
+    !facts.has_abort_permanent
+}
+
+#[cfg(test)]
+mod foreign_call_assembler_admission_tests {
+    use super::*;
+    use crate::pyjitcode::InlineBodyFacts;
+
+    fn facts(has_exception_table: bool, has_abort_permanent: bool) -> InlineBodyFacts {
+        InlineBodyFacts {
+            contains_raise: false,
+            has_abort_permanent,
+            exc_override_straight_line: true,
+            exc_override_sample_safe: false,
+            index_sample_safe: false,
+            exc_override_has_nested_call: false,
+            owns_loop_header: false,
+            has_exception_table,
+        }
+    }
+
+    #[test]
+    fn callee_exception_table_does_not_block_call_assembler() {
+        // `_opimpl_recursive_call` fall-through has no callee-table screen;
+        // `look_inside_graph` residualizes `has_abort_permanent` only.
+        assert!(foreign_callee_facts_admit_call_assembler(facts(
+            true, false
+        )));
+        assert!(!foreign_callee_facts_admit_call_assembler(facts(
+            false, true
+        )));
+    }
 }
 
 /// #62: full-body-walk direct `CALL_ASSEMBLER` for a self-recursive call
@@ -3771,13 +3801,11 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // is resolved / synthesised per `callee_key` via `get_assembler_token`.
     //
     // Any other callee is admitted only through
-    // [`foreign_callee_admits_call_assembler`].  That screen is this fold's own
-    // precondition and has no counterpart in `_opimpl_recursive_call`
-    // (`pyjitpl.py`), which puts no condition at all on `assembler_call` — once
-    // control reaches the fall-through it emits unconditionally.  Without the
-    // screen an arbitrary foreign call (e.g. a CALL_KW-bearing leaf) would fold
-    // to CALL_ASSEMBLER, building and entering a frame the callee's own loop
-    // was never traced against.
+    // [`foreign_callee_admits_call_assembler`]. `_opimpl_recursive_call`
+    // (`pyjitpl.py`) puts no condition on `assembler_call` once control
+    // reaches the fall-through. The remaining gate is `has_abort_permanent`,
+    // the `look_inside_graph` analog; a callee exception table lives in the
+    // target token.
     if w_code as usize != caller_code as usize {
         let admit_mutual = ctx
             .session
