@@ -556,6 +556,19 @@ fn field_read_result<'a>(
         })
 }
 
+fn field_read_ty<'a>(graph: &'a FunctionGraph, field: &str) -> Option<&'a ValueType> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|op| match &op.kind {
+            OpKind::FieldRead {
+                field: descr, ty, ..
+            } if descr.name == field => Some(ty),
+            _ => None,
+        })
+}
+
 fn recast_of_var_is_w_root(
     graph: &FunctionGraph,
     var: &majit_translate::flowspace::model::Variable,
@@ -613,30 +626,42 @@ fn prebuilt_none_singleton_narrows_to_w_root() {
     }
 }
 
-/// Overlay `w_cls` is `PyObjectRef`. The FieldRead stays a SomePtr getattr
-/// on the raw dest; the result is then recast to `pyobject::PyObject` so
-/// `instance_getclass` can merge it with `(*obj).w_class`.
+/// GC-owner `Terminator.w_cls` is `PyObjectRef`. `InstanceRepr.getfield`
+/// (`rclass.py`) is already SomeInstance of `pyobject::PyObject`, so
+/// `instance_getclass` merges it with `(*obj).w_class`. Overlay
+/// `SomePtr.getattr` plus `cast_base_ptr_to_instance` is the raw-owner
+/// path (`lltype.py` `ann_cast_opaque_ptr`); mapdict nodes are GC.
 #[test]
 fn map_terminator_w_cls_narrows_to_w_root() {
     let llbc = load_llbc(OBJECT_LLBC);
     common::with_shared_lowering(llbc, |context| {
         let mut saw = false;
+        let mut seen = Vec::new();
         for leaf in ["map_terminator_w_cls", "instance_getclass"] {
             let fns = mapdict_fns(&llbc, leaf);
             assert!(!fns.is_empty(), "{leaf} is in pyre-object LLBC");
             for fd in fns {
                 let graph = lower_fun_decl(&context, fd)
                     .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
-                if let Some(w_cls) = field_read_result(&graph, "w_cls")
-                    && recast_of_var_is_w_root(&graph, w_cls)
-                {
-                    saw = true;
+                if let Some(ty) = field_read_ty(&graph, "w_cls") {
+                    seen.push(ty.clone());
+                    if let ValueType::Ref(Some(root)) = ty
+                        && is_w_root(root)
+                    {
+                        saw = true;
+                        if let Some(w_cls) = field_read_result(&graph, "w_cls") {
+                            assert!(
+                                !recast_of_var_is_w_root(&graph, w_cls),
+                                "GC-owner w_cls FieldRead is already pyobject::PyObject"
+                            );
+                        }
+                    }
                 }
             }
         }
         assert!(
             saw,
-            "FieldRead of w_cls must recast onto pyobject::PyObject"
+            "FieldRead of w_cls is already pyobject::PyObject, got {seen:?}"
         );
     });
 }
