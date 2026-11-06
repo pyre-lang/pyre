@@ -939,8 +939,8 @@ assert result == 300, result
 
 /// `generator.py _invoke_execute_frame` / `pyframe.py execute_frame` keep
 /// `w_arg_or_err` live from entry through `stack_check`, `call_trace` and
-/// `resume_execute_frame`. A young send/throw payload is copied into
-/// `FrameResumeArgs`; a moving collection in that span leaves the copy stale
+/// `resume_execute_frame`. A young send/throw payload sits in that one GC
+/// word; a moving collection in that span leaves a native copy stale
 /// unless the value is re-read from its shadow-stack slot after every
 /// allocating call. The child uses the tree's nursery-stress harness
 /// (`PYPY_GC_NURSERY=1`): a one-byte nursery collects on almost every

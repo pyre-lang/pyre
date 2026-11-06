@@ -17492,7 +17492,7 @@ const generatorentry_driver: GeneratorEntryJitDriver = GeneratorEntryJitDriver;
 /// Pyre stores the suspended PyFrame on the GeneratorIterator as
 /// `frame_ptr`; an exhausted generator has either `exhausted=true` or a
 /// null frame_ptr.  `_invoke_execute_frame(space.w_None)` corresponds to
-/// the frame's own `execute_frame(None, None)` resume — same routing as
+/// the frame's own `execute_frame(None)` resume — same routing as
 /// `generator_send_ex` for the `already_started=true, w_arg=None` path.
 ///
 /// `results` is RPython's traced list; the `Vec` standing in for it here is
@@ -17552,13 +17552,7 @@ fn generator_unpack_into(
             // and that pop consumes the None.  Later resumes after
             // `YIELD_VALUE` use the same push so `x = yield` sees it.
             w_generator_set_started(gen_obj());
-            let result = generator_invoke_execute_frame(
-                gen_obj(),
-                frame,
-                Some(pyre_object::w_none()),
-                None,
-                None,
-            );
+            let result = generator_invoke_execute_frame(gen_obj(), frame, pyre_object::w_none());
             match result {
                 // `_invoke_execute_frame` has already applied PEP 479 and
                 // finalized the frame for any escaping error.
@@ -23221,55 +23215,20 @@ pub unsafe fn generator_frame_is_finished(
 pub unsafe fn generator_invoke_execute_frame(
     gen_obj: PyObjectRef,
     frame: &mut crate::pyframe::PyFrame,
-    w_inputvalue: Option<PyObjectRef>,
-    operr: Option<PyError>,
-    throw_args: Option<([PyObjectRef; 3], usize)>,
+    w_arg_or_err: PyObjectRef,
 ) -> PyResult {
     use pyre_object::generator::*;
     // Own bracket: a caller that resumes in a loop (`unpack_into`) and
     // indexes its own pins from a base does not see this call's pins.
     let _roots = pyre_object::gc_roots::push_roots();
-    // No closure: `and_then` lowers to `target:closure.call`, a symbolic
-    // hash the portal walk cannot execute.
     // `w_arg_or_err` is one GC local in `_invoke_execute_frame` /
-    // `execute_frame`. The sent value and a thrown `OperationError`
-    // (`error.py`) both occupy that local; both are reloaded immediately
-    // before `execute_frame`.
-    let input_word = match w_inputvalue {
-        Some(v) if !v.is_null() => v,
-        _ => pyre_object::PY_NULL,
-    };
-    let operr_word = match operr.as_ref() {
-        Some(err) => err.as_raw() as PyObjectRef,
-        None => pyre_object::PY_NULL,
-    };
-    let (throw_words, throw_len) = match throw_args {
-        Some((words, len)) => (words, Some(len)),
-        None => ([pyre_object::PY_NULL; 3], None),
-    };
-    // Every managed argument is published as one run before the first
-    // normalization, the way `gctransform/framework.py push_roots` stores
-    // all livevars before the call that may collect; a word pinned after
-    // that normalization could still name a moved object.
+    // `execute_frame`. Reload it immediately before `execute_frame`.
     let gen_slot = pyre_object::gc_roots::pin_roots(&[
         gen_obj,
         frame as *mut crate::pyframe::PyFrame as PyObjectRef,
-        input_word,
-        operr_word,
-        throw_words[0],
-        throw_words[1],
-        throw_words[2],
+        w_arg_or_err,
     ]);
-    let input_slot = if input_word.is_null() {
-        None
-    } else {
-        Some(gen_slot + 2)
-    };
-    let operr_slot = if operr_word.is_null() {
-        None
-    } else {
-        Some(gen_slot + 3)
-    };
+    let arg_slot = gen_slot + 2;
     // `FrameAnchor::live` residualizes `&self` as a Ref. The anchor is one
     // word (the depth), so that Ref is the depth itself and the walk
     // refuses it. `frame_anchor_live` takes the depth as an int.
@@ -23293,35 +23252,13 @@ pub unsafe fn generator_invoke_execute_frame(
     // thread resuming the generator.  Like PyPy, the suspended frame stores no
     // EC of its own; `execute_generator_frame` reads the thread-owned slot at
     // this activation boundary.
-    let w_inputvalue = input_slot.map(pyre_object::gc_roots::shadow_stack_get);
-    // Rebuilt by value: a store through `&mut PyError` is a whole-struct
-    // deref store, which has no graph operation.
-    let operr = match (operr_slot, operr) {
-        (Some(slot), Some(_)) => Some(PyError::from_raw(pyre_object::gc_roots::shadow_stack_get(
-            slot,
-        ))),
-        (_, operr) => operr,
-    };
-    let throw_args = throw_len.map(|len| {
-        (
-            [
-                pyre_object::gc_roots::shadow_stack_get(gen_slot + 4),
-                pyre_object::gc_roots::shadow_stack_get(gen_slot + 5),
-                pyre_object::gc_roots::shadow_stack_get(gen_slot + 6),
-            ],
-            len,
-        )
-    });
     // generator.py `_invoke_execute_frame` → `frame.execute_frame(w_arg_or_err)`.
     // `execute_generator_frame` is look-inside and dispatches through
     // `get_eval_fn` the way `interp_jit.py dispatch` applies the jitdriver
     // to every frame. `pyframe.py execute_frame` / `resume_execute_frame`
     // carry no `dont_look_inside`.
-    let executed = (*crate::eval::frame_anchor_live(frame_depth)).execute_generator_frame(
-        w_inputvalue,
-        operr,
-        throw_args,
-    );
+    let executed = (*crate::eval::frame_anchor_live(frame_depth))
+        .execute_generator_frame(pyre_object::gc_roots::shadow_stack_get(arg_slot));
     // `generator.py` `_leak_stopiteration` / `_leak_stopasynciteration`
     // run before the `finally`. The `Result` shell is built only after
     // `frame_anchor` is dropped, so the return block forwards the shell
@@ -23454,10 +23391,10 @@ pub fn genentry_raise_just_started(gen_obj: PyObjectRef) -> PyResult {
     )))
 }
 
-/// `generator.py` `_send_ex`, after a frame that RETURNed:
+/// Raise part of `generator.py` `_send_ex`'s finished arm. The caller has
+/// already run `self.frame_is_finished()`.
 ///
 /// ```python
-/// self.frame_is_finished()
 /// if isinstance(self, AsyncGenerator):
 ///     raise OperationError(space.w_StopAsyncIteration, space.w_None)
 /// else:
@@ -23469,14 +23406,11 @@ pub fn genentry_raise_just_started(gen_obj: PyObjectRef) -> PyResult {
 #[majit_macros::dont_look_inside]
 pub fn genentry_raise_returned(gen_obj: PyObjectRef, w_result: PyObjectRef) -> PyResult {
     use pyre_object::generator::*;
-    // `frame_is_finished` drops `self.frame`; the return value lives only
-    // in this argument until the StopIteration constructor. Both words are
-    // published as one run, and `self.frame` is read off the generator after it.
+    // `gen_obj` / `w_result` stay live across `is_async_generator` and the
+    // StopIteration constructor.
     let roots = pyre_object::gc_roots::push_roots();
     let gen_slot = roots.pin_roots(&[gen_obj, w_result]);
     unsafe {
-        let frame = w_generator_get_frame(roots.get(gen_slot)) as *mut crate::pyframe::PyFrame;
-        generator_frame_is_finished(roots.get(gen_slot), &mut *frame);
         if is_async_generator(roots.get(gen_slot)) {
             return Err(PyError::stop_async_iteration());
         }
@@ -23485,7 +23419,7 @@ pub fn genentry_raise_returned(gen_obj: PyObjectRef, w_result: PyObjectRef) -> P
 }
 
 /// `generator.py` `_invoke_execute_frame(w_arg_or_err)` behind the residual
-/// ABI. Unpack `SApplicationException` into the execute-frame payload.
+/// ABI. The word is the sent value or an `SApplicationException`.
 ///
 /// Upstream traces through `_invoke_execute_frame` into
 /// `frame.execute_frame`, where `interp_jit.py dispatch` meets the `pypyjit`
@@ -23498,32 +23432,13 @@ pub fn generator_invoke_execute_frame_residual(
     frame: *mut crate::pyframe::PyFrame,
     w_arg_or_err: PyObjectRef,
 ) -> PyResult {
-    let (w_inputvalue, operr, throw_args) =
-        if crate::pyopcode::is_s_application_exception(w_arg_or_err) {
-            let (operr, throw_args) = crate::pyopcode::s_application_exception_unpack(w_arg_or_err);
-            (None, Some(operr), throw_args)
-        } else if w_arg_or_err.is_null() {
-            (None, None, None)
-        } else {
-            (Some(w_arg_or_err), None, None)
-        };
-    unsafe { generator_invoke_execute_frame(gen_obj, &mut *frame, w_inputvalue, operr, throw_args) }
+    unsafe { generator_invoke_execute_frame(gen_obj, &mut *frame, w_arg_or_err) }
 }
 
-/// PyPy: GeneratorIterator.send_ex(w_arg_or_err)
-///
-/// Resume a generator frame: push w_arg (for send/next) or inject operr
-/// (for throw), then run the frame until YIELD_VALUE or RETURN_VALUE.
-fn generator_send_ex(
-    gen_obj: PyObjectRef,
-    w_arg: PyObjectRef,
-    operr: Option<PyError>,
-    throw_args: Option<([PyObjectRef; 3], usize)>,
-) -> PyResult {
+/// `generator.py send_ex(w_arg_or_err)`.
+/// The word is the sent value or an `SApplicationException`.
+fn generator_send_ex(gen_obj: PyObjectRef, w_arg_or_err: PyObjectRef) -> PyResult {
     use pyre_object::generator::*;
-    if let Some(operr) = operr {
-        return generator_throw_ex(gen_obj, operr, throw_args);
-    }
     unsafe {
         // `generator.py send_ex`: when already in a trace and the body
         // has two or more yields, hit `generatorentry_driver` instead of
@@ -23535,17 +23450,17 @@ fn generator_send_ex(
             let raw = crate::pycode::w_code_get_ptr(pycode) as *const crate::CodeObject;
             if !raw.is_null() && majit_metainterp::jit::we_are_jitted() && should_not_inline(&*raw)
             {
-                return generatorentry_portal(pycode, gen_obj, w_arg);
+                return generatorentry_portal(pycode, gen_obj, w_arg_or_err);
             }
         }
     }
-    generator_send_ex_body(gen_obj, w_arg)
+    generator_send_ex_body(gen_obj, w_arg_or_err)
 }
 
-/// `send_error`: wrap `operr` in `SApplicationException` and enter `_send_ex`.
+/// `generator.py send_error(operr)`: wrap in `SApplicationException` and enter `send_ex`.
 /// Throw and close stay residual until look-inside of `_send_ex` lands.
 #[majit_macros::dont_look_inside]
-fn generator_throw_ex(
+fn generator_send_error(
     gen_obj: PyObjectRef,
     operr: PyError,
     throw_args: Option<([PyObjectRef; 3], usize)>,
@@ -23580,7 +23495,9 @@ fn generator_throw_ex(
     );
     let arg_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_arg_or_err);
-    generator_send_ex_body(
+    // `send_error` → `send_ex(SApplicationException)`: the merge point
+    // in `send_ex` sees the wrapped word (`generator.py` `send_ex`).
+    generator_send_ex(
         pyre_object::gc_roots::shadow_stack_get(base),
         pyre_object::gc_roots::shadow_stack_get(arg_slot),
     )
@@ -23714,7 +23631,6 @@ pub fn generator_send_ex_body(gen_obj: PyObjectRef, w_arg_or_err: PyObjectRef) -
         // the outer frame has entered the execution context.  Pass the
         // argument on send/`__next__` whether or not the generator has
         // started so `resume_execute_frame` shares that push.
-        // `SApplicationException` injects through `operr` with no sent value.
         let frame_live = if frame_owned {
             pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut crate::pyframe::PyFrame
         } else {
@@ -23736,9 +23652,27 @@ pub fn generator_send_ex_body(gen_obj: PyObjectRef, w_arg_or_err: PyObjectRef) -
                 // generator.py `_send_ex` — if the frame marked itself
                 // finished, it was RETURNed from; otherwise it YIELDed.
                 if (*frame_now).frame_finished_execution() {
+                    // generator.py `_send_ex`: `self.frame_is_finished()`
+                    // then raise. `value` is `w_result` and must survive
+                    // the call that drops `self.frame`. Own bracket so
+                    // the outer three-root set stays static.
+                    let _value_roots = pyre_object::gc_roots::push_roots();
+                    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(value);
+                    let frame_now = if frame_owned {
+                        pyre_object::gc_roots::shadow_stack_get(frame_slot)
+                            as *mut crate::pyframe::PyFrame
+                    } else {
+                        w_generator_get_frame(pyre_object::gc_roots::shadow_stack_get(gen_slot))
+                            as *mut crate::pyframe::PyFrame
+                    };
+                    generator_frame_is_finished(
+                        pyre_object::gc_roots::shadow_stack_get(gen_slot),
+                        &mut *frame_now,
+                    );
                     genentry_raise_returned(
                         pyre_object::gc_roots::shadow_stack_get(gen_slot),
-                        value,
+                        pyre_object::gc_roots::shadow_stack_get(value_slot),
                     )
                 } else {
                     Ok(value)
@@ -23751,70 +23685,39 @@ pub fn generator_send_ex_body(gen_obj: PyObjectRef, w_arg_or_err: PyObjectRef) -
 
 /// Resume the iterator recorded by a suspended `yield from`.
 ///
-/// `Some` is a value yielded by the delegate and is therefore also the
-/// outer generator's result.  `None` means the delegate completed and the
-/// outer frame has been positioned at the completion path.
+/// `pyopcode.py next_yield_from(w_yf, w_inputvalue_or_err)`. `Some` is a
+/// value yielded by the delegate and is therefore also the outer generator's
+/// result.  `None` means the delegate completed and the outer frame has been
+/// positioned at the completion path.
 pub(crate) fn resume_yield_from(
     frame: &mut crate::pyframe::PyFrame,
     w_yf: PyObjectRef,
-    w_arg: PyObjectRef,
-    operr: Option<PyError>,
-    throw_args: Option<([PyObjectRef; 3], usize)>,
+    w_arg_or_err: PyObjectRef,
 ) -> Result<Option<PyObjectRef>, PyError> {
     debug_assert!(!w_yf.is_null());
 
     // `pyframe.py resume_execute_frame` clears `w_yielding_from` before
-    // `next_yield_from`, where the frame, the delegate, the sent value and a
-    // thrown `OperationError` are GC locals across the delegate call. Here
-    // they are native copies, and every delegate call below collects.
+    // `next_yield_from`, where the frame, the delegate, and `w_arg_or_err`
+    // are GC locals across the delegate call.
     let anchor = crate::eval::FrameAnchor::new(frame);
-    // The whole livevar set (delegate, sent value, thrown exception, throw
-    // arguments) is published before one normalizing pass, and every arm
-    // reads it back from the slots: the pass returns the live words, and a
-    // native copy taken before entry can still name a nursery object that a
-    // foreign collection forwarded (`gc_sync::foreign_mutator_seen`).
     let roots = pyre_object::gc_roots::push_roots();
-    let yf_slot = roots.publish(&[w_yf, w_arg]);
+    let yf_slot = roots.publish(&[w_yf, w_arg_or_err]);
     let arg_slot = yf_slot + 1;
-    let exc_slot = operr
-        .as_ref()
-        .map(|err| roots.publish(&[err.as_raw() as pyre_object::PyObjectRef]));
-    let throw_slot = throw_args.map(|(args, argc)| (roots.publish(&args), argc));
     roots.normalize(yf_slot, pyre_object::gc_roots::shadow_stack_len() - yf_slot);
 
-    let result = match operr {
-        Some(err) if err.kind == PyErrorKind::GeneratorExit => {
-            let mut err = err;
-            let err_slot = err.pin(&roots);
-            close_yield_from(roots.get(yf_slot))?;
-            err.reload(&roots, err_slot);
-            unsafe { (*anchor.live()).w_yielding_from = pyre_object::PY_NULL };
-            return Err(err);
-        }
-        Some(mut err) => {
-            if let Some(base) = exc_slot {
-                err.reload(&roots, base);
-            }
-            let throw_args = throw_slot.map(|(base, argc)| {
-                (
-                    [roots.get(base), roots.get(base + 1), roots.get(base + 2)],
-                    argc,
-                )
-            });
-            throw_yield_from(roots.get(yf_slot), err, throw_args)
-        }
-        None if unsafe { pyre_object::is_none(roots.get(arg_slot)) } => {
-            let w_yf = roots.get(yf_slot);
-            if unsafe { pyre_object::generator::is_generator_or_coroutine(w_yf) } {
-                generator_send_ex(w_yf, w_none(), None, None)
-            } else {
-                next(w_yf)
-            }
-        }
-        None => {
-            let send = getattr_str(roots.get(yf_slot), "send")?;
-            crate::call::call_function_impl_result(send, &[roots.get(arg_slot)])
-        }
+    // `pyopcode.py next_yield_from` has no GeneratorExit case: throw /
+    // descr_close already closed and cleared the delegate.
+    let result = if unsafe { pyre_object::generator::is_generator_or_coroutine(roots.get(yf_slot)) }
+    {
+        // `GeneratorOrCoroutine.send_ex(w_arg_or_err)`.
+        generator_send_ex(roots.get(yf_slot), roots.get(arg_slot))
+    } else if unsafe { pyre_object::generator::is_async_gen_asend(roots.get(yf_slot)) } {
+        // `AsyncGenASend.do_send(w_arg_or_err)` — performance only.
+        async_gen_asend_do_send(roots.get(yf_slot), roots.get(arg_slot))
+    } else if unsafe { pyre_object::is_none(roots.get(arg_slot)) } {
+        next(roots.get(yf_slot))
+    } else {
+        delegate_to_nongen(roots.get(yf_slot), roots.get(arg_slot))
     };
 
     let frame = unsafe { &mut *anchor.live() };
@@ -23846,80 +23749,80 @@ pub(crate) fn resume_yield_from(
     }
 }
 
-/// Delegate a thrown exception, preserving the original exception when the
-/// iterator has no `throw` method.
-fn throw_yield_from(
-    w_yf: PyObjectRef,
-    mut err: PyError,
-    throw_args: Option<([PyObjectRef; 3], usize)>,
-) -> PyResult {
-    unsafe {
-        if pyre_object::generator::is_generator_or_coroutine(w_yf) {
-            return generator_send_ex(w_yf, w_none(), Some(err), throw_args);
-        }
-    }
-    // `getattr` and the following call run Python. The delegate, the original
-    // throw arguments and the thrown carrier are native copies;
-    // `OperationError` would be traced. Publish all of them, then normalize
-    // the range once, before `getattr`.
-    let roots = pyre_object::gc_roots::push_roots();
-    let yf_slot = roots.publish(&[w_yf]);
-    let mut exc_slot = err.pin(&roots);
-    let pinned_args = throw_args.map(|(args, argc)| (roots.publish(&args), argc));
-    roots.normalize(yf_slot, pyre_object::gc_roots::shadow_stack_len() - yf_slot);
-    let throw = match getattr_str(roots.get(yf_slot), "throw") {
-        Ok(method) => method,
-        Err(attr_err) if attr_err.kind == PyErrorKind::AttributeError => {
-            err.reload(&roots, exc_slot);
-            return Err(err);
-        }
-        Err(attr_err) => return Err(attr_err),
-    };
-    err.reload(&roots, exc_slot);
-    let throw_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(throw);
-    err.reload(&roots, exc_slot);
-    if let Some((args_base, argc)) = pinned_args {
-        // PEP 380 delegation forwards exactly the original positional throw
-        // arguments, rather than a synthesized exception instance.  The
-        // producer validates `argc` as 1..=3; spell those fixed call shapes
-        // directly so translation does not detour through Rust's opaque
-        // `<[T; 3]>::index(&args, ..argc)` helper.
-        let throw = roots.get(throw_slot);
-        let arg0 = roots.get(args_base);
-        let arg1 = roots.get(args_base + 1);
-        let arg2 = roots.get(args_base + 2);
-        return match argc {
-            1 => crate::call::call_function_impl_result(throw, &[arg0]),
-            2 => crate::call::call_function_impl_result(throw, &[arg0, arg1]),
-            _ => crate::call::call_function_impl_result(throw, &[arg0, arg1, arg2]),
+/// Invoke send or throw by method name on a non-generator delegate.
+///
+/// `pyopcode.py delegate_to_nongen`. A thrown `SApplicationException` looks
+/// up `throw` and forwards the original positional `throw()` arguments; any
+/// other input looks up `send`. When the iterator has no `throw` method, the
+/// original exception is raised.
+fn delegate_to_nongen(w_yf: PyObjectRef, w_arg_or_err: PyObjectRef) -> PyResult {
+    if crate::pyopcode::is_s_application_exception(w_arg_or_err) {
+        // `getattr` and the following call run Python. The delegate and
+        // `SApplicationException` are GC locals; original `throw()` arguments
+        // are re-read off that object after each collecting call.
+        let roots = pyre_object::gc_roots::push_roots();
+        let yf_slot = roots.publish(&[w_yf, w_arg_or_err]);
+        let arg_slot = yf_slot + 1;
+        let mut err = crate::pyopcode::s_application_exception_operr(roots.get(arg_slot));
+        let mut exc_slot = err.pin(&roots);
+        let throw_args = crate::pyopcode::s_application_exception_throw_args(roots.get(arg_slot));
+        let pinned_args = throw_args.map(|(args, argc)| (roots.publish(&args), argc));
+        roots.normalize(yf_slot, pyre_object::gc_roots::shadow_stack_len() - yf_slot);
+        let throw = match getattr_str(roots.get(yf_slot), "throw") {
+            Ok(method) => method,
+            Err(attr_err) if attr_err.kind == PyErrorKind::AttributeError => {
+                err.reload(&roots, exc_slot);
+                return Err(err);
+            }
+            Err(attr_err) => return Err(attr_err),
         };
+        err.reload(&roots, exc_slot);
+        let throw_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(throw);
+        err.reload(&roots, exc_slot);
+        if let Some((args_base, argc)) = pinned_args {
+            // PEP 380 delegation forwards exactly the original positional throw
+            // arguments, rather than a synthesized exception instance.  The
+            // producer validates `argc` as 1..=3; spell those fixed call shapes
+            // directly so translation does not detour through Rust's opaque
+            // `<[T; 3]>::index(&args, ..argc)` helper.
+            let throw = roots.get(throw_slot);
+            let arg0 = roots.get(args_base);
+            let arg1 = roots.get(args_base + 1);
+            let arg2 = roots.get(args_base + 2);
+            return match argc {
+                1 => crate::call::call_function_impl_result(throw, &[arg0]),
+                2 => crate::call::call_function_impl_result(throw, &[arg0, arg1]),
+                _ => crate::call::call_function_impl_result(throw, &[arg0, arg1, arg2]),
+            };
+        }
+        if err.exc_object.is_null() {
+            let slot = err.pin(&roots);
+            let w_exc = err.to_exc_object();
+            err.reload(&roots, slot);
+            err.set_exc_object(w_exc);
+            // The published slot still names the pre-materialise word. Pin again
+            // so `exc_slot` is the slot `pin_root` will forward.
+            exc_slot = err.pin(&roots);
+        }
+        err.reload(&roots, exc_slot);
+        let w_type =
+            crate::typedef::r#type(err.exc_object).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+        let type_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(w_type);
+        err.reload(&roots, exc_slot);
+        crate::call::call_function_impl_result(
+            roots.get(throw_slot),
+            &[roots.get(type_slot), err.exc_object],
+        )
+    } else {
+        let roots = pyre_object::gc_roots::push_roots();
+        let yf_slot = roots.publish(&[w_yf, w_arg_or_err]);
+        let arg_slot = yf_slot + 1;
+        roots.normalize(yf_slot, pyre_object::gc_roots::shadow_stack_len() - yf_slot);
+        let send = getattr_str(roots.get(yf_slot), "send")?;
+        crate::call::call_function_impl_result(send, &[roots.get(arg_slot)])
     }
-    if err.exc_object.is_null() {
-        let slot = err.pin(&roots);
-        let w_exc = err.to_exc_object();
-        err.reload(&roots, slot);
-        err.set_exc_object(w_exc);
-        // The published slot still names the pre-materialise word. Pin again
-        // so `exc_slot` is the slot `pin_root` will forward.
-        exc_slot = err.pin(&roots);
-    }
-    err.reload(&roots, exc_slot);
-    let w_type =
-        crate::typedef::r#type(err.exc_object).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
-    let type_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(w_type);
-    err.reload(&roots, exc_slot);
-    crate::call::call_function_impl_result(
-        roots.get(throw_slot),
-        &[roots.get(type_slot), err.exc_object],
-    )
-}
-
-/// Run a delegated iterator's close operation.  A generator close is kept
-/// in the same resume path so nested delegation unwinds one frame at a time.
-fn close_yield_from(w_yf: PyObjectRef) -> PyResult {
-    gen_close_iter(w_yf)
 }
 
 /// Put the stopped delegate's return value through the `SEND` completion
@@ -24148,7 +24051,7 @@ pub unsafe fn generator_resume_fast_path(w_obj: PyObjectRef) -> Option<Generator
 
 /// PyPy: GeneratorIterator.next() — equivalent to __next__
 fn generator_next(gen_obj: PyObjectRef) -> PyResult {
-    generator_send_ex(gen_obj, w_none(), None, None)
+    generator_send_ex(gen_obj, w_none())
 }
 
 /// __next__ method wrapper
@@ -24457,7 +24360,7 @@ pub(crate) fn generator_send_method(args: &[PyObjectRef]) -> PyResult {
         args[0]
     };
     let value = if args.len() > 1 { args[1] } else { w_none() };
-    generator_send_ex(gen_obj, value, None, None)
+    generator_send_ex(gen_obj, value)
 }
 
 /// PyPy: GeneratorIterator.descr_throw(w_type, w_val=None, w_tb=None)
@@ -24555,10 +24458,9 @@ fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> Py
             slot
         }
         Err(err) => {
-            return generator_send_ex(
+            return generator_send_error(
                 reload(0),
-                w_none(),
-                Some(err),
+                err,
                 Some(([reload(1), reload(2), reload(3)], argc)),
             );
         }
@@ -24570,21 +24472,19 @@ fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> Py
         && !generator_get_delegate(gen_obj).is_null()
         && let Err(e) = generator_close_iter(gen_obj)
     {
-        // `reload` does not allocate. `e` is consumed by `generator_send_ex`;
+        // `reload` does not allocate. `e` is consumed by `generator_send_error`;
         // the resume pins that carrier across the calls that collect.
-        return generator_send_ex(
+        return generator_send_error(
             reload(0),
-            w_none(),
-            Some(e),
+            e,
             Some(([reload(1), reload(2), reload(3)], argc)),
         );
     }
     let w_value = pyre_object::gc_roots::shadow_stack_get(value_slot);
     let err = unsafe { PyError::from_exc_object(w_value) };
-    generator_send_ex(
+    generator_send_error(
         reload(0),
-        w_none(),
-        Some(err),
+        err,
         Some(([reload(1), reload(2), reload(3)], argc)),
     )
 }
@@ -24689,7 +24589,7 @@ fn generator_close_impl(gen_obj: PyObjectRef) -> PyResult {
             .unwrap_or_else(|| PyError::new(PyErrorKind::GeneratorExit, String::new()))
     };
     let sent = pyre_object::with_roots!(gen_obj => {
-        generator_throw_ex(gen_obj, err, None)
+        generator_send_error(gen_obj, err, None)
     });
     let mut e = match sent {
         Ok(_) => {
@@ -24755,14 +24655,14 @@ pub(crate) fn coroutine_await_method(args: &[PyObjectRef]) -> PyResult {
 pub(crate) fn coroutine_wrapper_next_method(args: &[PyObjectRef]) -> PyResult {
     let wrapper = args.first().copied().unwrap_or(PY_NULL);
     let coroutine = unsafe { pyre_object::generator::w_coroutine_wrapper_get_coroutine(wrapper) };
-    generator_send_ex(coroutine, w_none(), None, None)
+    generator_send_ex(coroutine, w_none())
 }
 
 pub(crate) fn coroutine_wrapper_send_method(args: &[PyObjectRef]) -> PyResult {
     let wrapper = args.first().copied().unwrap_or(PY_NULL);
     let coroutine = unsafe { pyre_object::generator::w_coroutine_wrapper_get_coroutine(wrapper) };
     let value = crate::type_methods::arg_or_none(args, 1);
-    generator_send_ex(coroutine, value, None, None)
+    generator_send_ex(coroutine, value)
 }
 
 pub(crate) fn coroutine_wrapper_throw_method(args: &[PyObjectRef]) -> PyResult {
@@ -24956,18 +24856,13 @@ fn async_gen_asend_do_send(awaitable: PyObjectRef, mut arg: PyObjectRef) -> PyRe
     } else {
         arg = pyre_object::gc_roots::shadow_stack_get(arg_slot);
     }
-    let result = generator_send_ex(
-        pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
-        arg,
-        None,
-        None,
-    )
-    .and_then(|value| {
-        async_gen_unwrap_value(
-            pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
-            value,
-        )
-    });
+    let result = generator_send_ex(pyre_object::gc_roots::shadow_stack_get(async_gen_slot), arg)
+        .and_then(|value| {
+            async_gen_unwrap_value(
+                pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
+                value,
+            )
+        });
     if result.is_err() {
         unsafe {
             w_async_generator_set_running(
@@ -25012,11 +24907,16 @@ pub(crate) fn async_gen_asend_close_method(args: &[PyObjectRef]) -> PyResult {
     if state != pyre_object::generator::ASYNC_GEN_STATE_ITER {
         return Ok(w_none());
     }
-    let result = generator_send_ex(
-        pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
-        w_none(),
-        Some(PyError::new(PyErrorKind::GeneratorExit, String::new())),
-        None,
+    // generator.py `AsyncGenAThrow.do_send` closing arm:
+    // `self.async_gen.throw(space.w_GeneratorExit, None, None)`.
+    let result = generator_throw_impl(
+        &[
+            pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
+            crate::builtins::lookup_exc_class("GeneratorExit").unwrap_or(pyre_object::PY_NULL),
+            w_none(),
+            w_none(),
+        ],
+        false,
     );
     unsafe {
         pyre_object::generator::w_async_generator_set_running(
@@ -25176,11 +25076,17 @@ fn async_gen_athrow_do_send(awaitable: PyObjectRef, arg: PyObjectRef) -> PyResul
     let arg = pyre_object::gc_roots::shadow_stack_get(awaitable_slot + 1);
     let result = if throwing {
         if closing {
-            generator_send_ex(
-                async_gen,
-                w_none(),
-                Some(PyError::new(PyErrorKind::GeneratorExit, String::new())),
-                None,
+            // generator.py `AsyncGenAThrow.do_send` closing arm:
+            // `self.async_gen.throw(space.w_GeneratorExit, None, None)`.
+            generator_throw_impl(
+                &[
+                    async_gen,
+                    crate::builtins::lookup_exc_class("GeneratorExit")
+                        .unwrap_or(pyre_object::PY_NULL),
+                    w_none(),
+                    w_none(),
+                ],
+                false,
             )
         } else {
             // `AsyncGenerator.athrow` already warned from the caller-visible
@@ -25189,7 +25095,7 @@ fn async_gen_athrow_do_send(awaitable: PyObjectRef, arg: PyObjectRef) -> PyResul
             generator_throw_impl(&[async_gen, exc_type, exc_value, exc_tb], false)
         }
     } else {
-        generator_send_ex(async_gen, arg, None, None)
+        generator_send_ex(async_gen, arg)
     };
     let result = match result {
         Ok(value) => {
@@ -25253,11 +25159,16 @@ pub(crate) fn async_gen_athrow_close_method(args: &[PyObjectRef]) -> PyResult {
     if state != pyre_object::generator::ASYNC_GEN_STATE_ITER {
         return Ok(w_none());
     }
-    let result = generator_send_ex(
-        pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
-        w_none(),
-        Some(PyError::new(PyErrorKind::GeneratorExit, String::new())),
-        None,
+    // generator.py `AsyncGenAThrow.do_send` closing arm:
+    // `self.async_gen.throw(space.w_GeneratorExit, None, None)`.
+    let result = generator_throw_impl(
+        &[
+            pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
+            crate::builtins::lookup_exc_class("GeneratorExit").unwrap_or(pyre_object::PY_NULL),
+            w_none(),
+            w_none(),
+        ],
+        false,
     );
     unsafe {
         pyre_object::generator::w_async_generator_set_running(

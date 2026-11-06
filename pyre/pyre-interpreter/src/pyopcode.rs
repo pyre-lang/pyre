@@ -54,10 +54,11 @@ pub struct SReturnValue {
 /// (`error.py`); `isinstance(w_arg_or_err, SApplicationException)` is the
 /// throw arm of `generator.py` `_send_ex`.
 ///
-/// [3.15-spec] `SApplicationException` has only `operr`. `throw_yield_from`
-/// keeps the original 1..=3 `throw()` arguments so a non-generator delegate
-/// sees that call shape (PEP 380); `delegate_to_nongen` rebuilds
-/// type/value/tb from `operr` when `throw_argc == 0`.
+/// [3.15-spec] Upstream `SApplicationException` has only `operr`; this one
+/// also keeps the original 1..=3 `throw()` arguments, and `delegate_to_nongen`
+/// forwards them so a non-generator delegate sees that call shape (PEP 380);
+/// with `throw_argc == 0` it rebuilds type/instance from `operr` and calls
+/// `throw(type, instance)`.
 #[repr(C)]
 #[majit_macros::jit_immutable_fields("operr", "throw0", "throw1", "throw2", "throw_argc")]
 pub struct SApplicationException {
@@ -167,17 +168,6 @@ pub fn s_application_exception_throw_args(obj: PyObjectRef) -> Option<([PyObject
     } else {
         Some(([s.throw0, s.throw1, s.throw2], s.throw_argc))
     }
-}
-
-/// `operr` plus the original `throw()` arguments.
-#[inline]
-pub fn s_application_exception_unpack(
-    obj: PyObjectRef,
-) -> (crate::error::PyError, Option<([PyObjectRef; 3], usize)>) {
-    (
-        s_application_exception_operr(obj),
-        s_application_exception_throw_args(obj),
-    )
 }
 
 pub struct SBreakLoop {
