@@ -316,7 +316,7 @@ impl CodeWriter {
     /// portal closure) and BEFORE any `drain_pending_graphs` that publishes a
     /// covered graph — the production pipeline (`lib.rs`) calls this between the
     /// two.
-    pub fn run_two_phase_prepass(&self, callcontrol: &mut CallControl) {
+    pub fn run_two_phase_prepass(&self, callcontrol: &CallControl) {
         let registry = self.dual_gate_registry(callcontrol);
         // Upstream `translator.graphs` is the annotate/rtype closure
         // (`driver.py` task_annotate / task_rtype_lltype) the codewriter
