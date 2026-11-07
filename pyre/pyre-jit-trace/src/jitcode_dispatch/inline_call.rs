@@ -4393,6 +4393,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         // The dict is mutable, so it cannot be the shared empty constant.
         // Walk `w_dict_new_kwargs` so the constructor records instead of a
         // residual helper standing in for it.
+        let pre_kw_pos = ctx.trace_ctx.get_trace_position();
         let Some(dict_op) = super::specialize::try_walker_orthodox_kwargs_dict_new(ctx, op.pc)?
         else {
             cut_declined_subwalk(ctx, pre_fold_pos);
@@ -7822,12 +7823,6 @@ fn try_walker_descend_match_signature<Sym: WalkSym>(
                     "match_signature descent left a ConstPtr operand to the recording-time Arguments box: {}",
                     holders.join("; ")
                 );
-                if fbw_inline_diag_enabled() {
-                    eprintln!(
-                        "match_signature descent left ConstPtr to recording-time Arguments box:\n  {}",
-                        holders.join("\n  ")
-                    );
-                }
                 if binder_can_cut() {
                     cut_declined_subwalk(ctx, saved_pos);
                     drop(args_box);
@@ -7871,9 +7866,10 @@ fn try_walker_descend_match_signature<Sym: WalkSym>(
         Err(
             DispatchError::InlineCallArityMismatch { .. }
             | DispatchError::InlineCallIntArityMismatch { .. }
-            | DispatchError::InlineCallFloatArityMismatch { .. }
-            | DispatchError::OrthodoxSubWalkTraceUnsupported { .. },
+            | DispatchError::InlineCallFloatArityMismatch { .. },
         ) => {
+            // `pyjitpl.py do_residual_or_indirect_call`: walker cannot
+            // `setup_call` this jitcode (`bytecode_for_address` analogue).
             if binder_can_cut() {
                 cut_declined_subwalk(ctx, saved_pos);
                 return Ok(None);
@@ -7887,6 +7883,9 @@ fn try_walker_descend_match_signature<Sym: WalkSym>(
                 symbolic: 0,
             });
         }
+        // `_match_signature` is `@jit.unroll_safe`. `TraceTooLong` is
+        // `pyjitpl.py blackhole_if_trace_too_long`; an unlowered op inside
+        // the binder is not `do_residual_or_indirect_call` of the Python CALL.
         Err(error) => return Err(error),
     }
 
@@ -12985,11 +12984,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // `argument.py` `_match_signature`: `w_kwds = space.newdict(kwargs=True)`
         // then one `space.setitem` per unmatched keyword.  Walk those
         // interpreter calls so the kwargs strategy's construction records.
+        // Capture before the constructor so an `Ok(None)` decline cuts
+        // journaled constructor ops before the residual CALL.
+        let pre_kw_pos = ctx.trace_ctx.get_trace_position();
         let Some(dict_op) = super::specialize::try_walker_orthodox_kwargs_dict_new(ctx, op.pc)?
         else {
+            cut_declined_subwalk(ctx, pre_kw_pos);
             return resolved_inline_decline(op.pc, line!());
         };
         let Some(concrete_dict) = walker_concrete_ref_object(ctx, dict_op) else {
+            cut_declined_subwalk(ctx, pre_kw_pos);
             return resolved_inline_decline(op.pc, line!());
         };
         // `argument.py` `_match_signature`: `w_kwds` is stored in `scope_w`
@@ -13032,6 +13036,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             )?
             .is_none()
             {
+                cut_declined_subwalk(ctx, pre_kw_pos);
                 return resolved_inline_decline(op.pc, line!());
             }
             let concrete_dict = pyre_object::gc_roots::shadow_stack_get(dict_root_slot);
