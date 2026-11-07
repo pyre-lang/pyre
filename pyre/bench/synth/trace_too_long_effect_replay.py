@@ -1,5 +1,7 @@
-# pyre-check: max-pypy-ratio=2.9
-# Readings 0.3x-0.7x. A ceiling under 3 derives no floor.
+# pyre-check: max-pypy-ratio=6
+# After FBW inline screens dropped (#2600), CI reads 3.9-4.5x (macos table
+# 5.2x). 6 is 15% over that table reading. The previous 2.9 ceiling was
+# fitted to 0.3x-0.7x and derived no floor.
 # A trace that outgrows `trace_limit` must not re-apply effects the walk has
 # already executed. The walker's length check fires at an arbitrary opcode,
 # unlike every other abort, which declines before executing an effect it

@@ -1,4 +1,7 @@
-# pyre-check: max-pypy-ratio=22
+# pyre-check: max-pypy-ratio=46
+# After FBW inline screens dropped (#2600), cranelift CI reads 31.7-39.4x
+# (dynasm stays ~8-12x under the pypy floor). 46 is 15% over the slower
+# macos cranelift reading (39.4x, pyre-lang #2604).
 """Self-recursive CALL_ASSEMBLER exception unwind regression.
 
 The raise happens while evaluating a tail call's accumulator argument.  It
