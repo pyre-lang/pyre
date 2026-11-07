@@ -91,12 +91,8 @@ impl<'a> Lowering<'a> {
             )?;
             return Ok(true);
         }
-        if drop_place_is_list_guard(place, self.llbc) {
-            self.emit_one_word_guard_release(mir_bb, place, LIST_LOCK_RELEASE_PATH)?;
-            return Ok(true);
-        }
-        if drop_place_is_set_guard(place, self.llbc) {
-            self.emit_one_word_guard_release(mir_bb, place, SET_LOCK_RELEASE_PATH)?;
+        if drop_place_is_object_lock_guard(place, self.llbc) {
+            self.emit_one_word_guard_release(mir_bb, place, OBJECT_LOCK_RELEASE_PATH)?;
             return Ok(true);
         }
         let root_scope = match glue {
@@ -865,24 +861,22 @@ pub(in crate::front::mir) fn drop_place_is_frame_anchor(
         || tyref_is_frame_anchor(&decl.ty, llbc)
 }
 
-/// The release residual a `ListGuard` drop lowers to (`rthread.py`
+/// The release residual an `ObjectLockGuard` drop lowers to (`rthread.py`
 /// `Lock.release`).
-pub(in crate::front::mir) const LIST_LOCK_RELEASE_PATH: [&str; 3] =
-    ["pyre_object", "listobject", "w_list_lock_release"];
+pub(in crate::front::mir) const OBJECT_LOCK_RELEASE_PATH: [&str; 3] =
+    ["pyre_object", "objlock", "object_lock_release"];
 
-/// The release residual a `SetGuard` drop lowers to. Same `Lock.release`
-/// boundary as [`LIST_LOCK_RELEASE_PATH`], on the set stripe.
-pub(in crate::front::mir) const SET_LOCK_RELEASE_PATH: [&str; 3] =
-    ["pyre_object", "setobject", "w_set_lock_release"];
-
-/// A drop of the list lock's one-word `ListGuard` (`listobject::ListGuard`).
+/// A drop of the shared one-word `ObjectLockGuard` (`objlock::ObjectLockGuard`).
 /// Its `Drop` releases the lock word; without this arm the drop fell through
 /// to a plain goto and the jitcode never released an acquisition.
-pub(in crate::front::mir) fn drop_place_is_list_guard(place: &Place, llbc: &Llbc) -> bool {
+pub(in crate::front::mir) fn drop_place_is_object_lock_guard(place: &Place, llbc: &Llbc) -> bool {
     if !matches!(place.kind, PlaceKind::Local(_)) {
         return false;
     }
-    let Some(node) = tyref_node(&place.ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+    let Some(node) = tyref_node(&place.ty, llbc)
+        .and_then(|n| type_node_peel_aliases(n, llbc))
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+    else {
         return false;
     };
     adt_id_flexible(node)
@@ -890,12 +884,12 @@ pub(in crate::front::mir) fn drop_place_is_list_guard(place: &Place, llbc: &Llbc
         .is_some_and(|td| {
             let path = td.item_meta.name_path();
             let segments: Vec<&str> = path.split("::").collect();
-            segments.last() == Some(&"ListGuard") && segments.contains(&"listobject")
+            segments.last() == Some(&"ObjectLockGuard") && segments.contains(&"objlock")
         })
 }
 
-/// Match the bound `w_list_lock_release` residual a `ListGuard` drop emits.
-pub(crate) fn is_list_lock_release_call(kind: &OpKind) -> bool {
+/// Match the bound `object_lock_release` residual an `ObjectLockGuard` drop emits.
+pub(crate) fn is_object_lock_release_call(kind: &OpKind) -> bool {
     let OpKind::Call {
         target: CallTarget::FunctionPath { segments, .. },
         ..
@@ -903,36 +897,7 @@ pub(crate) fn is_list_lock_release_call(kind: &OpKind) -> bool {
     else {
         return false;
     };
-    segments.last().map(String::as_str) == Some(LIST_LOCK_RELEASE_PATH[2])
-}
-
-/// A drop of the set lock's one-word `SetGuard` (`setobject::SetGuard`).
-pub(in crate::front::mir) fn drop_place_is_set_guard(place: &Place, llbc: &Llbc) -> bool {
-    if !matches!(place.kind, PlaceKind::Local(_)) {
-        return false;
-    }
-    let Some(node) = tyref_node(&place.ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
-        return false;
-    };
-    adt_id_flexible(node)
-        .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| {
-            let path = td.item_meta.name_path();
-            let segments: Vec<&str> = path.split("::").collect();
-            segments.last() == Some(&"SetGuard") && segments.contains(&"setobject")
-        })
-}
-
-/// Match the bound `w_set_lock_release` residual a `SetGuard` drop emits.
-pub(crate) fn is_set_lock_release_call(kind: &OpKind) -> bool {
-    let OpKind::Call {
-        target: CallTarget::FunctionPath { segments, .. },
-        ..
-    } = kind
-    else {
-        return false;
-    };
-    segments.last().map(String::as_str) == Some(SET_LOCK_RELEASE_PATH[2])
+    segments.last().map(String::as_str) == Some(OBJECT_LOCK_RELEASE_PATH[2])
 }
 
 /// Drops supported by both lowering and its liveness analysis.
@@ -987,13 +952,12 @@ pub(crate) fn is_frame_anchor_release_call(kind: &OpKind) -> bool {
 }
 
 /// Guard releases that an exceptional Result rewrite must replay on the
-/// raise edge: shadow-stack closes, the list lock release and the free of
-/// a raw array buffer that ends with the frame.
+/// raise edge: shadow-stack closes, the shared object-lock release and the
+/// free of a raw array buffer that ends with the frame.
 pub(crate) fn is_shadow_stack_bracket_close(kind: &OpKind) -> bool {
     is_root_scope_drop_glue_call(kind)
         || is_frame_anchor_release_call(kind)
-        || is_list_lock_release_call(kind)
-        || is_set_lock_release_call(kind)
+        || is_object_lock_release_call(kind)
         || is_slice_buffer_free_call(kind)
         || is_rust_vec_free_call(kind)
 }
@@ -1247,8 +1211,7 @@ pub(in crate::front::mir) fn glue_call_drop_blocks(
         // the release or glue call. An unmarked word is absent there, and
         // the destructor is skipped.
         let lowers = drop_place_is_frame_anchor(place, body, llbc)
-            || drop_place_is_list_guard(place, llbc)
-            || drop_place_is_set_guard(place, llbc)
+            || drop_place_is_object_lock_guard(place, llbc)
             || match glue {
                 Some(fn_ptr) => drop_lowers_as_glue_call(place, fn_ptr, llbc),
                 None => place_ty_is_root_scope(place, llbc),
