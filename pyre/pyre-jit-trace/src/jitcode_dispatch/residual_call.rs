@@ -5587,6 +5587,11 @@ fn null_ref_sentinel_of_registered_leaf(target: i64, arg_index: usize, nargs: us
                         // passes `PY_NULL` for both tolerances, and `isclose`
                         // reads every slot through its `bound(i)` null filter.
                         "isclose_slow" => nargs == 4,
+                        // `executioncontext::force_vref(inst)` / `jit_force_vref`.
+                        // Chain-end `f_backref` is `vref_None`
+                        // (`non_virtual_ref(None)`). `ptr_is_virtual_ref` of
+                        // NULL is false and the else arm returns `inst`.
+                        "force_vref" | "jit_force_vref" => arg_index == 0 && nargs == 1,
                         _ => false,
                     }
                 })

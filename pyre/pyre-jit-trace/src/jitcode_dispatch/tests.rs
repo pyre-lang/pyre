@@ -29112,6 +29112,18 @@ fn the_mayforce_null_ref_sentinel_table_names_one_slot_per_helper() {
         exempted.is_empty(),
         "unexpected exempt leaves: {exempted:?}"
     );
+    // `force_vref(inst)` / `jit_force_vref`: chain-end `f_backref` is
+    // `vref_None`; `ptr_is_virtual_ref` of NULL is false and the else
+    // arm returns `inst`.
+    let (_, force) = pyre_interpreter::jit_trace_fnaddrs()
+        .into_iter()
+        .find(|&(path, _)| leaf_of(path) == "force_vref")
+        .expect("force_vref is a registered leaf");
+    assert!(is_sentinel(K::None, force, 0, 1), "force_vref arg 0 of 1");
+    assert!(
+        !is_sentinel(K::None, force, 0, 2),
+        "force_vref arg 0 of 2 stays refused"
+    );
 }
 
 #[test]
