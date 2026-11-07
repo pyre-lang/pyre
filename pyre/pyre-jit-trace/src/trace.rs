@@ -1019,7 +1019,7 @@ fn try_commit_midbody_abort_inner(
     // (`residual_call.rs`); the rebuilt callee is that same situation.
     let ran = {
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter(ctx);
-        frame.execute_frame(None, None)
+        frame.execute_frame(None)
     };
     // `type_descr_call_impl`'s tail, which this leg has no frame for: discard
     // `__init__`'s result, raise unless it was `None`, and hand the caller the

@@ -18310,6 +18310,8 @@ thread_local! {
         const { std::cell::OnceCell::new() };
 }
 
+/// Thread-local because `MetaInterpStaticData` is: the index it hands back
+/// names a slot in this thread's `jitcodes`. Same as `ctor_continuation`.
 fn send_ex_continuation_full() -> Option<(i32, usize, usize)> {
     SEND_EX_LEVEL.with(|cell| *cell.get_or_init(build_send_ex_continuation))
 }

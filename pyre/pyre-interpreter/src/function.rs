@@ -5031,9 +5031,7 @@ except TypeError as e:
 ";
         let code = crate::compile_exec(source).expect("compile");
         let mut frame = crate::pyframe::PyFrame::new(code);
-        frame
-            .execute_frame(None, None)
-            .expect("methodcall arity snippet");
+        frame.execute_frame(None).expect("methodcall arity snippet");
         let w_globals = frame.get_w_globals();
         let get = |name: &str| {
             let value = unsafe { pyre_object::w_dict_getitem_str(w_globals, name) }.expect(name);
@@ -5104,7 +5102,7 @@ except TypeError as e:
         let code = crate::compile_exec(source).expect("compile");
         let mut frame = crate::pyframe::PyFrame::new(code);
         frame
-            .execute_frame(None, None)
+            .execute_frame(None)
             .expect("CALL_KW methodcall arity snippet");
         let w_globals = frame.get_w_globals();
         let get = |name: &str| {

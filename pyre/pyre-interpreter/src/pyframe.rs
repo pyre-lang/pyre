@@ -5236,7 +5236,7 @@ impl PyFrame {
         if self._is_generator_or_coroutine() {
             self.initialize_as_generator()
         } else {
-            self.execute_frame(None, None)
+            self.execute_frame(None)
         }
     }
 
@@ -5290,12 +5290,7 @@ impl PyFrame {
 
     /// PyPy-compatible execution entrypoint with optional inbound values.
     #[inline]
-    #[allow(unused_variables)]
-    pub fn execute_frame(
-        &mut self,
-        w_inputvalue: Option<PyObjectRef>,
-        operr: Option<crate::PyError>,
-    ) -> crate::PyResult {
+    pub fn execute_frame(&mut self, w_arg_or_err: Option<PyObjectRef>) -> crate::PyResult {
         // A frame can be executed by a thread that has not run pyre code
         // before — the launcher's interpreter thread, and the Rust tests that
         // drive a frame directly — so this is one of the entry points that
@@ -5307,15 +5302,13 @@ impl PyFrame {
         // handling RecursionError and every newly entered Python frame is
         // still guarded.
         let mut resume = crate::call::FrameResumeArgs {
-            w_inputvalue,
-            operr,
-            throw_args: None,
+            w_arg_or_err: w_arg_or_err.unwrap_or(pyre_object::PY_NULL),
         };
         // `w_arg_or_err` is a GC local from this entry through `call_trace`
         // and `resume_execute_frame` (`pyframe.py execute_frame`).
-        // `stack_check`'s overflow arm allocates `RecursionError` while a
-        // thrown `OperationError` (`error.py`) and the sent value are still
-        // the argument. One shadow-stack bracket covers the whole span.
+        // `stack_check`'s overflow arm allocates `RecursionError` while the
+        // sent value or `SApplicationException` is still the argument. One
+        // shadow-stack bracket covers the whole span.
         let pins = crate::pin_resume_args!(&mut resume);
         crate::stack_check::drain_jit_pending_exception()?;
         crate::reload_resume_args!(pins.as_ref(), &mut resume);
@@ -5324,10 +5317,9 @@ impl PyFrame {
         crate::eval::eval_frame_plain_with_resume(self, &mut resume, pins.as_ref())
     }
 
-    /// Generator/coroutine execution entry carrying the original throw
-    /// arguments for non-generator delegates.  This is the Rust representation
-    /// of PyPy's `SApplicationException` payload passed through
-    /// `PyFrame.execute_frame(w_arg_or_err)`.
+    /// Generator/coroutine execution entry.  PyPy's
+    /// `PyFrame.execute_frame(w_arg_or_err)`: the sent value or an
+    /// `SApplicationException`.
     ///
     /// Dispatches through the registered eval function for the same reason
     /// `run_with_jit` does: `interp_jit.py dispatch` applies the jitdriver to
@@ -5337,17 +5329,8 @@ impl PyFrame {
     /// standard library's loop-bearing code objects, none of which the tracer
     /// could ever see.
     #[inline]
-    pub fn execute_generator_frame(
-        &mut self,
-        w_inputvalue: Option<PyObjectRef>,
-        operr: Option<crate::PyError>,
-        throw_args: Option<([PyObjectRef; 3], usize)>,
-    ) -> crate::PyResult {
-        let mut resume = crate::call::FrameResumeArgs {
-            w_inputvalue,
-            operr,
-            throw_args,
-        };
+    pub fn execute_generator_frame(&mut self, w_arg_or_err: PyObjectRef) -> crate::PyResult {
+        let mut resume = crate::call::FrameResumeArgs { w_arg_or_err };
         crate::call::get_eval_fn()(self, Some(&mut resume))
     }
 
@@ -5355,7 +5338,7 @@ impl PyFrame {
     ///
     /// This is what the default eval function runs, and what every JIT decline
     /// path falls back to.  A declining path that dropped `resume` and called
-    /// `execute_frame(None, None)` instead would silently discard the value a
+    /// `execute_frame(None)` instead would silently discard the value a
     /// `send()` delivered or the exception a `throw()` did, so the payload
     /// travels with the frame through the fallback.
     #[inline]
@@ -5365,7 +5348,7 @@ impl PyFrame {
     ) -> crate::PyResult {
         match resume {
             Some(resume) => self.execute_frame_resumed(resume),
-            None => self.execute_frame(None, None),
+            None => self.execute_frame(None),
         }
     }
 
@@ -5379,7 +5362,7 @@ impl PyFrame {
     ) -> crate::PyResult {
         // Same `w_arg_or_err` bracket as `execute_frame`: the overflow arm
         // allocates before `call_trace` / `resume_execute_frame` consume the
-        // sent value and the thrown `OperationError`.
+        // sent value or `SApplicationException`.
         let pins = crate::pin_resume_args!(resume);
         crate::stack_check::drain_jit_pending_exception()?;
         crate::reload_resume_args!(pins.as_ref(), resume);
@@ -7891,7 +7874,7 @@ x = 7
         let code = crate::compile_exec(source).expect("compile");
         let mut frame = super::PyFrame::new(code);
         frame
-            .execute_frame(None, None)
+            .execute_frame(None)
             .unwrap_or_else(|err| panic!("exec failed: {err:?}"));
         let w_globals = frame.get_w_globals();
         let got = unsafe { pyre_object::w_dict_getitem_str(w_globals, "got") }.expect("got");
@@ -7926,7 +7909,7 @@ x = 7
         let code = crate::compile_exec(source).expect("compile");
         let mut frame = super::PyFrame::new(code);
         frame
-            .execute_frame(None, None)
+            .execute_frame(None)
             .unwrap_or_else(|err| panic!("exec failed: {err:?}"));
         let w_globals = frame.get_w_globals();
         let got = unsafe { pyre_object::w_dict_getitem_str(w_globals, "got") }.expect("got");
@@ -7955,7 +7938,7 @@ x = 7
         let setup_code = crate::compile_exec(setup).expect("compile setup");
         let mut setup_frame = super::PyFrame::new(setup_code);
         setup_frame
-            .execute_frame(None, None)
+            .execute_frame(None)
             .unwrap_or_else(|err| panic!("setup failed: {err:?}"));
         let mapping = unsafe { pyre_object::w_dict_getitem_str(setup_frame.get_w_globals(), "m") }
             .expect("m");

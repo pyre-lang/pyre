@@ -169,17 +169,6 @@ pub fn s_application_exception_throw_args(obj: PyObjectRef) -> Option<([PyObject
     }
 }
 
-/// `operr` plus the original `throw()` arguments.
-#[inline]
-pub fn s_application_exception_unpack(
-    obj: PyObjectRef,
-) -> (crate::error::PyError, Option<([PyObjectRef; 3], usize)>) {
-    (
-        s_application_exception_operr(obj),
-        s_application_exception_throw_args(obj),
-    )
-}
-
 pub struct SBreakLoop {
     pub singleton: bool,
 }

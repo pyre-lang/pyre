@@ -4999,7 +4999,7 @@ fn exec_code_module(
     let mut frame =
         crate::pyframe::createframe_obj(w_code as *const (), w_globals, execution_context, None)?;
     if plain_dispatch {
-        frame.execute_frame(None, None)
+        frame.execute_frame(None)
     } else {
         frame.run_with_jit()
     }
@@ -5166,7 +5166,7 @@ pub fn appleveldef_install_seeded(
     // resolves through `sys.modules`, which the program can have blocked.
     // Only a bundled file that does not compile, or a name it never binds,
     // stays a panic.
-    frame.execute_frame(None, None)?;
+    frame.execute_frame(None)?;
     for &name in names {
         match unsafe {
             pyre_object::w_dict_getitem_str(
