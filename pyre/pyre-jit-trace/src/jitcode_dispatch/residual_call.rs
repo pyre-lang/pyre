@@ -3521,14 +3521,14 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
     };
     frames.push(innermost.miframe);
     banks.push(innermost.banks);
-    let names: Vec<&str> = frames
-        .frames
-        .iter()
-        .map(|frame| frame.jitcode.name())
-        .collect();
     s2built!(
-        "origin={origin} BUILT multi-frame depth={} names={names:?}",
-        frames.frames.len()
+        "origin={origin} BUILT multi-frame depth={} names={:?}",
+        frames.frames.len(),
+        frames
+            .frames
+            .iter()
+            .map(|frame| frame.jitcode.name())
+            .collect::<Vec<_>>()
     );
     Some((frames, banks))
 }
