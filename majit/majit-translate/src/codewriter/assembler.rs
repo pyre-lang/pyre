@@ -15068,7 +15068,7 @@ mod tests {
         );
     }
 
-    /// `E { A, B, C }` with `"C(B)"`: `EC ⊂ EB ⊂ E`, `EA ⊂ E`, `EA` not ⊂ `EB`.
+    /// `E { A, B, C }` with `"C(B)"`: `E::C ⊂ E::B ⊂ E`, `E::A ⊂ E`, `E::A` not ⊂ `E::B`.
     /// The carrier class is not a subclass of `E`. After
     /// `assign_inheritance_ids` and `getclassrepr`, each class has a
     /// distinct vtable whose subclass range matches `minid`/`maxid`.
@@ -15095,9 +15095,9 @@ mod tests {
         ));
 
         class_names_exception_and_not_builtin(&base, "E");
-        class_names_exception_and_not_builtin(&ea, "EA");
-        class_names_exception_and_not_builtin(&eb, "EB");
-        class_names_exception_and_not_builtin(&ec, "EC");
+        class_names_exception_and_not_builtin(&ea, "E::A");
+        class_names_exception_and_not_builtin(&eb, "E::B");
+        class_names_exception_and_not_builtin(&ec, "E::C");
         assert!(ec.borrow().issubclass(&eb));
         assert!(eb.borrow().issubclass(&base));
         assert!(ec.borrow().issubclass(&base));
@@ -15130,7 +15130,7 @@ mod tests {
         let ea_min = ea.borrow().minid.expect("EA minid");
         assert!(
             !(eb_min < ea_min && ea_min < eb_max),
-            "EA must not sit inside EB ({eb_min}..{eb_max} vs {ea_min})"
+            "E::A must not sit inside E::B ({eb_min}..{eb_max} vs {ea_min})"
         );
 
         let lls = [
@@ -15153,7 +15153,7 @@ mod tests {
         }
     }
 
-    /// Exitcase `EB` catches an `EC` instance and misses `EA`.
+    /// Exitcase `E::B` catches an `E::C` instance and misses `E::A`.
     #[test]
     fn minted_exception_exitcase_eb_catches_ec_misses_ea() {
         let (ann, rtyper) = fresh_exception_typer();
@@ -15190,23 +15190,27 @@ mod tests {
         let ec_inst = raised_instance(&rtyper, &ec);
         assert!(
             handler_catches(&ec_inst, eb_ptr),
-            "exitcase EB catches a raised EC"
+            "exitcase E::B catches a raised E::C"
         );
         assert!(
             !handler_catches(&ea_inst, eb_ptr),
-            "exitcase EB misses a raised EA"
+            "exitcase E::B misses a raised E::A"
         );
     }
 
-    /// Literal class key `ArgErr` stays a different host from the struct
-    /// `argument::ArgErr`.
+    /// The minted base is the value class: one host under the declaration
+    /// key, bases `[Exception]`, and a later intern does not replace them.
     #[test]
-    fn minted_exception_class_keeps_literal_key_beside_struct_origin() {
+    fn minted_exception_class_is_the_value_class() {
         let (ann, _rtyper) = fresh_exception_typer();
         let mut reg = crate::front::StructFieldRegistry::default();
         reg.fields.insert(
             "argument::ArgErr".to_string(),
             Vec::<(String, String)>::new(),
+        );
+        reg.fields.insert(
+            "argument::ArgErr::Missing".to_string(),
+            vec![("n".to_string(), "i64".to_string())],
         );
         let id = majit_ir::descr::StructId::from_canonical("argument::ArgErr");
         let identity = crate::front::semantic::ClassIdentity {
@@ -15221,13 +15225,6 @@ mod tests {
         let _guard = crate::test_support::register_struct_origins_serialized(
             std::collections::HashMap::from([("ArgErr".to_string(), "argument".to_string())]),
         );
-        // `CallRegistry::ensure_session` pre-mints every `struct_fields`
-        // key; interning the qualified declaration first lets the leaf
-        // alias `ArgErr` reach that host through the registry identity
-        // (`Bookkeeper.getdesc`).
-        let _ = ann.bookkeeper.intern_class_by_qualname("argument::ArgErr");
-        let struct_host = ann.bookkeeper.intern_class_by_qualname("ArgErr");
-        assert_eq!(struct_host.qualname(), "argument::ArgErr");
         ann.bookkeeper.mint_exception_class_hierarchies(&[
             crate::front::llbc_hints::ExceptionClassHint {
                 enum_path: "argument::ArgErr".to_string(),
@@ -15246,21 +15243,54 @@ mod tests {
         let by_leaf = ann
             .bookkeeper
             .exception_class_base("ArgErr")
-            .expect("base by leaf");
+            .expect("base by origin leaf");
         assert!(Rc::ptr_eq(&base, &by_leaf));
         let exc_host = base.borrow().classdesc.borrow().pyobj.clone();
-        assert_eq!(exc_host.qualname(), "ArgErr");
-        assert_ne!(exc_host, struct_host);
+        assert_eq!(exc_host.qualname(), "argument::ArgErr");
+        let exception = HOST_ENV
+            .lookup_exception_class("Exception")
+            .expect("Exception");
+        assert_eq!(
+            exc_host.class_bases(),
+            Some(std::slice::from_ref(&exception))
+        );
+        let by_path = ann.bookkeeper.intern_class_by_qualname("argument::ArgErr");
+        let by_alias = ann.bookkeeper.intern_class_by_qualname("ArgErr");
+        assert_eq!(by_path, exc_host);
+        assert_eq!(by_alias, exc_host);
+        assert_eq!(
+            by_path.class_bases(),
+            Some(std::slice::from_ref(&exception))
+        );
         let roots = ann.bookkeeper.struct_root_classes();
-        assert_ne!(
-            roots.get("ArgErr").expect("literal key"),
-            roots.get("argument::ArgErr").expect("struct key")
+        assert!(
+            roots.get("ArgErr").is_none(),
+            "the leaf alias is not a second host"
+        );
+        assert_eq!(
+            roots.get("argument::ArgErr").expect("declaration key"),
+            &exc_host
         );
         drop(roots);
         assert!(
             base.borrow().attrs.is_empty(),
-            "literal ArgErr copied struct attrs: {:?}",
+            "the base copied variant attrs: {:?}",
             base.borrow().attrs.keys().collect::<Vec<_>>()
         );
+        let missing = ann
+            .bookkeeper
+            .exception_class_variant("argument::ArgErr", "Missing")
+            .expect("Missing");
+        assert_eq!(missing.borrow().name, "argument::ArgErr::Missing");
+        let missing_host = missing.borrow().classdesc.borrow().pyobj.clone();
+        assert_eq!(
+            missing_host.class_bases(),
+            Some(std::slice::from_ref(&exc_host))
+        );
+        let again = ann
+            .bookkeeper
+            .intern_class_by_qualname("argument::ArgErr::Missing");
+        assert_eq!(again, missing_host);
+        assert_eq!(again.class_bases(), Some(std::slice::from_ref(&exc_host)));
     }
 }

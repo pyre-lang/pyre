@@ -16427,10 +16427,10 @@ mod tests {
         bk.mint_exception_class_hierarchies(&[synth_e_hint()]);
         let registry = CallRegistry::new(Rc::clone(&bk));
         for (name, tag, class_name) in [
-            ("A", 0i64, "EA"),
-            ("B", 1, "EB"),
-            ("C", 2, "EC"),
-            ("D", 3, "ED"),
+            ("A", 0i64, "synth::E::A"),
+            ("B", 1, "synth::E::B"),
+            ("C", 2, "synth::E::C"),
+            ("D", 3, "synth::E::D"),
         ] {
             let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
             let mut graph = LegacyGraph::new("marked_ctor");
@@ -16502,7 +16502,7 @@ mod tests {
             let borrowed = classdef.borrow();
             borrowed.classdesc.borrow().pyobj.clone()
         };
-        let operand = HostObject::new_class("EA", Vec::new());
+        let operand = HostObject::new_class("synth::E::A", Vec::new());
         let op = SpaceOperation {
             result: Some(Variable::new()),
             kind: OpKind::ConstRef(operand.clone()),
@@ -16524,7 +16524,7 @@ mod tests {
         }));
         let message = unwind_panic_text(missing.expect_err("missing registry panics"));
         assert!(
-            message.contains("class ConstRef `EA` requires a CallRegistry"),
+            message.contains("class ConstRef `synth::E::A` requires a CallRegistry"),
             "{message}"
         );
 

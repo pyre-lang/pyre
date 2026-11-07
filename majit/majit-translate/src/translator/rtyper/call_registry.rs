@@ -2901,28 +2901,28 @@ mod tests {
         let bk = Rc::new(Bookkeeper::new());
         let mut fields = crate::front::StructFieldRegistry::default();
         fields.fields.insert(
-            "EA".to_string(),
+            "synth::E::A".to_string(),
             vec![crate::front::semantic::FieldRow::named("n", "usize")],
         );
         fields.fields.insert(
-            "EB".to_string(),
+            "synth::E::B".to_string(),
             vec![
                 crate::front::semantic::FieldRow::named("n", "usize"),
                 crate::front::semantic::FieldRow::named("flag", "bool"),
             ],
         );
         fields.fields.insert(
-            "PT".to_string(),
+            "synth::P::T".to_string(),
             vec![crate::front::semantic::FieldRow::positional(
                 "__pos_0", "usize",
             )],
         );
         fields.fields.insert(
-            "QB".to_string(),
+            "synth::Q::B".to_string(),
             vec![crate::front::semantic::FieldRow::named("n", "usize")],
         );
         fields.fields.insert(
-            "QC".to_string(),
+            "synth::Q::C".to_string(),
             vec![crate::front::semantic::FieldRow::named("extra", "bool")],
         );
         let registry = CallRegistry::new(Rc::clone(&bk));
@@ -2998,8 +2998,15 @@ mod tests {
         assert!(class_pyobj(&eb).class_get("classify").is_none());
 
         let other = bk.intern_class_by_qualname("synth::E");
-        assert_ne!(other, base_host);
-        assert!(other.class_get("classify").is_none());
+        assert_eq!(other, base_host);
+        assert_eq!(
+            other.class_get("classify"),
+            Some(ConstValue::HostObject(classify.host_object.clone()))
+        );
+        let exception = crate::flowspace::model::HOST_ENV
+            .lookup_exception_class("Exception")
+            .expect("Exception");
+        assert_eq!(other.class_bases(), Some(std::slice::from_ref(&exception)));
 
         let pt = bk.exception_class_variant("synth::P", "T").expect("PT");
         assert_eq!(

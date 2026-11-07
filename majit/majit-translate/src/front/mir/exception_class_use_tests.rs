@@ -239,6 +239,43 @@ fn const_match_body(
     )
 }
 
+/// Full match, same shape as [`match_body`].
+///
+/// Disc 0 and 1 return constants. Disc 2 copies `field_place`. The
+/// panic-abort default is outside the lowered closure, so every variant
+/// has an arm and that default stays unreachable.
+fn read_variant_field_body(
+    scrutinee: Value,
+    scrutinee_ty: &Value,
+    field_place: Value,
+    field_ty: &Value,
+) -> Value {
+    let disc_ty = isize_disc_ty();
+    let disc = local_place(2, &disc_ty);
+    let ret = local_place(0, field_ty);
+    unstructured(
+        1,
+        vec![
+            named_local(0, None, field_ty),
+            named_local(1, Some("e"), scrutinee_ty),
+            named_local(2, None, &disc_ty),
+        ],
+        vec![
+            regular(
+                vec![assign(disc.clone(), json!({"Discriminant": scrutinee}))],
+                switch_int(disc, &[(1, 1), (2, 2), (0, 3)], 4),
+            ),
+            ret_block(vec![assign(ret.clone(), const_usize_use("1"))]),
+            ret_block(vec![assign(
+                ret.clone(),
+                json!({"Use": [{"Read": field_place}, "No"]}),
+            )]),
+            ret_block(vec![assign(ret, const_usize_use("0"))]),
+            regular(vec![], json!({"Abort": "UndefinedBehavior"})),
+        ],
+    )
+}
+
 fn match_body(scrutinee: Value, scrutinee_ty: &Value, c_arm_place: Value) -> Value {
     let disc_ty = isize_disc_ty();
     let u = usize_ty();
@@ -515,9 +552,7 @@ fn program_metadata(
     std::collections::HashMap<String, String>,
     std::collections::HashMap<String, Vec<(String, ValueType)>>,
 ) {
-    let hints = crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
-        std::slice::from_ref(llbc),
-    );
+    let hints = super::super::llbc_exception_class_hints(llbc);
     let raw =
         crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc));
     let gc = super::super::harvest_declared_gc_facts(llbc).gc_struct_ids();
@@ -526,7 +561,7 @@ fn program_metadata(
         &gc,
         super::super::lltype::no_immutable_fields(),
         &raw,
-        &hints,
+        hints,
     );
     (known, fields, by_discr, origins, attrs)
 }
@@ -703,7 +738,11 @@ fn assert_isinstance_cascade(graph: &FunctionGraph, label: &str) {
     }
     assert_eq!(
         isinstance_chain(graph),
-        vec!["EC".to_string(), "EB".to_string(), "EA".to_string()],
+        vec![
+            "synth::E::C".to_string(),
+            "synth::E::B".to_string(),
+            "synth::E::A".to_string(),
+        ],
         "{label} children-first isinstance cascade; graph={}",
         graph.dump()
     );
@@ -1081,10 +1120,13 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
     let llbc = fixture_llbc();
     let e = adt(0);
     let u = adt(2);
-    assert_eq!(paint(e.clone(), &llbc), ValueType::Ref(Some("E".into())));
+    assert_eq!(
+        paint(e.clone(), &llbc),
+        ValueType::Ref(Some("synth::E".into()))
+    );
     assert_eq!(
         paint(shared_ref(&e), &llbc),
-        ValueType::Ref(Some("E".into()))
+        ValueType::Ref(Some("synth::E".into()))
     );
     assert_eq!(paint(u, &llbc), ValueType::Ref(Some("synth::U".into())));
 
@@ -1099,20 +1141,25 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
     assert_eq!(origins.get("P").map(String::as_str), Some("synth"));
     assert_eq!(origins.get("Q").map(String::as_str), Some("synth"));
 
-    assert_rows(&fields, "EA", &[("n", "usize", false)]);
+    assert_rows(&fields, "synth::E::A", &[("n", "usize", false)]);
     assert_rows(
         &fields,
-        "EB",
+        "synth::E::B",
         &[("n", "usize", false), ("flag", "bool", false)],
     );
-    assert_absent(&fields, "EC");
-    assert_absent(&fields, "ED");
+    assert_absent(&fields, "synth::E::C");
+    assert_absent(&fields, "synth::E::D");
+    assert_absent(&fields, "EA");
+    assert_absent(&fields, "EB");
     assert_absent(&fields, "E");
     assert_absent(&fields, "synth::E");
     assert_absent(&fields, "fixture::synth::E");
-    assert_rows(&fields, "PT", &[("__pos_0", "usize", true)]);
-    assert_rows(&fields, "QB", &[("n", "usize", false)]);
-    assert_rows(&fields, "QC", &[("extra", "bool", false)]);
+    assert_rows(&fields, "synth::P::T", &[("__pos_0", "usize", true)]);
+    assert_rows(&fields, "synth::Q::B", &[("n", "usize", false)]);
+    assert_rows(&fields, "synth::Q::C", &[("extra", "bool", false)]);
+    assert_absent(&fields, "PT");
+    assert_absent(&fields, "QB");
+    assert_absent(&fields, "QC");
     assert_absent(&fields, "Q");
 
     for key in ["fixture::synth::U", "U", "synth::U"] {
@@ -1142,24 +1189,24 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
     assert!(!by_discr.contains_key("Q"));
 
     assert_eq!(
-        attrs.get("EA"),
+        attrs.get("synth::E::A"),
         Some(&vec![("n".to_string(), ValueType::Unsigned)])
     );
     assert_eq!(
-        attrs.get("EB"),
+        attrs.get("synth::E::B"),
         Some(&vec![
             ("n".to_string(), ValueType::Unsigned),
             ("flag".to_string(), ValueType::Bool),
         ])
     );
-    assert!(attrs.get("EC").is_none());
-    assert!(attrs.get("ED").is_none());
+    assert!(attrs.get("synth::E::C").is_none());
+    assert!(attrs.get("synth::E::D").is_none());
     assert_eq!(
-        attrs.get("PT"),
+        attrs.get("synth::P::T"),
         Some(&vec![("__pos_0".to_string(), ValueType::Unsigned)])
     );
     assert_eq!(
-        attrs.get("QC"),
+        attrs.get("synth::Q::C"),
         Some(&vec![("extra".to_string(), ValueType::Bool)])
     );
     let unmarked_a = attrs.get("synth::U::A").expect("unmarked variant attrs");
@@ -1229,7 +1276,10 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
         let graph = lower(&llbc, name);
         assert_eq!(
             inputs(&graph),
-            vec![(ValueType::Ref(Some("E".into())), Some("E".into()))],
+            vec![(
+                ValueType::Ref(Some("synth::E".into())),
+                Some("synth::E".into()),
+            )],
             "{name} graph={}",
             graph.dump()
         );
@@ -1238,15 +1288,15 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
     let match_e = lower(&llbc, "match_e");
     assert_isinstance_cascade(&match_e, "match_e");
     assert!(
-        true_edge_reaches_field(&match_e, "n", "EB"),
-        "C arm getattr n on EB; graph={}",
+        true_edge_reaches_field(&match_e, "n", "synth::E::B"),
+        "C arm getattr n on synth::E::B; graph={}",
         match_e.dump()
     );
     let classify = lower(&llbc, "classify");
     assert_isinstance_cascade(&classify, "classify");
     assert!(
-        true_edge_reaches_field(&classify, "n", "EB"),
-        "classify C arm getattr n on EB; graph={}",
+        true_edge_reaches_field(&classify, "n", "synth::E::B"),
+        "classify C arm getattr n on synth::E::B; graph={}",
         classify.dump()
     );
 
@@ -1269,6 +1319,8 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
     );
 
     let call = lower(&llbc, "call_classify");
+    // `impl_method_owner` keys the method by the ADT name-path leaf.
+    // The exception class of the value is the Input's `synth::E`.
     let method = super::window_graph_ops(&call).into_iter().any(|op| {
         matches!(
             &op.kind,
@@ -1280,7 +1332,7 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
     });
     assert!(
         method,
-        "classify stays getattr on class E; graph={}",
+        "classify stays getattr on struct leaf E; graph={}",
         call.dump()
     );
 }
@@ -1293,22 +1345,28 @@ fn exception_class_parent_arm_tests_the_child_first() {
     let names: Vec<&str> = arms.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(
         names,
-        ["EC", "EB"],
+        ["synth::E::C", "synth::E::B"],
         "C ⊂ B is tested before B; graph={}",
         graph.dump()
     );
-    let ec = arms.iter().find(|(name, _)| name == "EC").expect("EC");
-    let eb = arms.iter().find(|(name, _)| name == "EB").expect("EB");
+    let ec = arms
+        .iter()
+        .find(|(name, _)| name == "synth::E::C")
+        .expect("synth::E::C");
+    let eb = arms
+        .iter()
+        .find(|(name, _)| name == "synth::E::B")
+        .expect("synth::E::B");
     assert_eq!(
         unsigned_reached(&graph, ec.1),
         Some(2),
-        "EC takes the otherwise arm; graph={}",
+        "synth::E::C takes the otherwise arm; graph={}",
         graph.dump()
     );
     assert_eq!(
         unsigned_reached(&graph, eb.1),
         Some(1),
-        "EB takes the B arm; graph={}",
+        "synth::E::B takes the B arm; graph={}",
         graph.dump()
     );
     let final_false = final_false.expect("otherwise edge");
@@ -1328,22 +1386,28 @@ fn exception_class_listed_child_keeps_its_arm() {
     let names: Vec<&str> = arms.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(
         names,
-        ["EC", "EB", "EA"],
+        ["synth::E::C", "synth::E::B", "synth::E::A"],
         "children-first cascade elides the covered last arm; graph={}",
         graph.dump()
     );
-    let ec = arms.iter().find(|(name, _)| name == "EC").expect("EC");
-    let eb = arms.iter().find(|(name, _)| name == "EB").expect("EB");
+    let ec = arms
+        .iter()
+        .find(|(name, _)| name == "synth::E::C")
+        .expect("synth::E::C");
+    let eb = arms
+        .iter()
+        .find(|(name, _)| name == "synth::E::B")
+        .expect("synth::E::B");
     assert_eq!(
         unsigned_reached(&graph, ec.1),
         Some(2),
-        "EC takes the C arm; graph={}",
+        "synth::E::C takes the C arm; graph={}",
         graph.dump()
     );
     assert_eq!(
         unsigned_reached(&graph, eb.1),
         Some(1),
-        "EB takes the B arm; graph={}",
+        "synth::E::B takes the B arm; graph={}",
         graph.dump()
     );
     let final_false = final_false.expect("D is the false edge");
@@ -1369,7 +1433,7 @@ fn exception_class_non_one_word_field_panics() {
         vec![string_decl.clone()],
         vec![],
     );
-    assert_by_value_string_attr_is_rstr(&bad_str, "BadStrS");
+    assert_by_value_string_attr_is_rstr(&bad_str, "BadStr::S");
 
     let vec_adt = json!({
         "Adt": {
@@ -1394,7 +1458,7 @@ fn exception_class_non_one_word_field_panics() {
         "kind": "Opaque"
     });
     let bad_vec = bad_enum_llbc("BadVec", vec_adt, vec![vec_decl, string_decl], vec![]);
-    expect_one_word_panic(&bad_vec, "BadVecS", "Vec<String>");
+    expect_one_word_panic(&bad_vec, "BadVec::S", "Vec<String>");
 
     let signature = super::interior_struct(
         1,
@@ -1406,11 +1470,11 @@ fn exception_class_non_one_word_field_panics() {
     );
     let raw_marker = marker(1, &["fixture", "_alloc_flavor_Signature"], "raw");
     let bad_sig = bad_enum_llbc("BadSig", adt(1), vec![signature.clone()], vec![raw_marker]);
-    expect_one_word_panic(&bad_sig, "BadSigS", "Signature");
+    expect_one_word_panic(&bad_sig, "BadSig::S", "Signature");
 
     let ok_sig = bad_enum_llbc("OkSig", adt(1), vec![signature], vec![]);
     let (_, fields, _, _, _) = program_metadata(&ok_sig);
-    let rows = row_names(&fields, "OkSigS").expect("OkSigS");
+    let rows = row_names(&fields, "OkSig::S").expect("OkSig::S");
     assert!(
         rows.iter().any(|(name, _, _)| name == "missing"),
         "one-word struct field is placed, got {rows:?}"
@@ -1427,12 +1491,12 @@ fn exception_class_non_one_word_field_panics() {
         vec![],
     );
     let (_, fields, _, _, attrs) = program_metadata(&ok_ptr);
-    let rows = row_names(&fields, "OkPtrS").expect("OkPtrS");
+    let rows = row_names(&fields, "OkPtr::S").expect("OkPtr::S");
     assert!(
         rows.iter().any(|(name, _, _)| name == "missing"),
         "{rows:?}"
     );
-    assert_missing_field_not_str(&fields, &attrs, &["OkPtrS"]);
+    assert_missing_field_not_str(&fields, &attrs, &["OkPtr::S"]);
 }
 
 #[test]
@@ -1736,4 +1800,338 @@ fn exception_class_unmarked_string_field_stays_rust_heap() {
         "a plain String field is not an rstr attr; graph={}",
         transformed.dump()
     );
+}
+
+#[test]
+fn two_marked_enums_with_the_same_leaf_are_distinct_classes() {
+    let n = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let llbc = super::window_llbc_with_globals(
+        vec![
+            enum_decl(
+                0,
+                &["fixture", "a", "E"],
+                vec![variant("A", vec![named_field("n", &n)], 0)],
+            ),
+            enum_decl(
+                1,
+                &["fixture", "b", "E"],
+                vec![variant("A", vec![named_field("n", &n)], 0)],
+            ),
+        ],
+        Vec::new(),
+        vec![
+            marker(0, &["fixture", "a", "_exception_class_E"], ""),
+            marker(1, &["fixture", "b", "_exception_class_E"], ""),
+        ],
+    );
+    let hints = crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
+        std::slice::from_ref(&llbc),
+    );
+    let paths: Vec<_> = hints.iter().map(|hint| hint.enum_path.as_str()).collect();
+    assert_eq!(paths, ["a::E", "b::E"]);
+    let (_, fields, _, _, attrs) = program_metadata(&llbc);
+    assert_rows(&fields, "a::E::A", &[("n", "i64", false)]);
+    assert_rows(&fields, "b::E::A", &[("n", "i64", false)]);
+    assert_absent(&fields, "a::E");
+    assert_absent(&fields, "b::E");
+    assert_absent(&fields, "E");
+    assert_absent(&fields, "EA");
+    assert_eq!(
+        attrs.get("a::E::A"),
+        Some(&vec![("n".to_string(), ValueType::Int)])
+    );
+    assert_eq!(
+        attrs.get("b::E::A"),
+        Some(&vec![("n".to_string(), ValueType::Int)])
+    );
+
+    let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    bk.set_struct_fields(std::rc::Rc::new(fields));
+    bk.mint_exception_class_hierarchies(&hints);
+    let a_base = bk.exception_class_base("a::E").expect("a::E");
+    let b_base = bk.exception_class_base("b::E").expect("b::E");
+    assert!(!std::rc::Rc::ptr_eq(&a_base, &b_base));
+    assert_eq!(a_base.borrow().name, "a::E");
+    assert_eq!(b_base.borrow().name, "b::E");
+    let a_var = bk.exception_class_variant("a::E", "A").expect("a::E::A");
+    let b_var = bk.exception_class_variant("b::E", "A").expect("b::E::A");
+    assert!(!std::rc::Rc::ptr_eq(&a_var, &b_var));
+    assert_eq!(a_var.borrow().name, "a::E::A");
+    assert_eq!(b_var.borrow().name, "b::E::A");
+    let a_host = a_base.borrow().classdesc.borrow().pyobj.clone();
+    let b_host = b_base.borrow().classdesc.borrow().pyobj.clone();
+    assert_ne!(a_host, b_host);
+    assert_eq!(bk.intern_class_by_qualname("a::E"), a_host);
+    assert_eq!(bk.intern_class_by_qualname("b::E"), b_host);
+    let exception = crate::flowspace::model::HOST_ENV
+        .lookup_exception_class("Exception")
+        .expect("Exception");
+    assert_eq!(a_host.class_bases(), Some(std::slice::from_ref(&exception)));
+    let again = bk.intern_class_by_qualname("a::E");
+    assert_eq!(again, a_host);
+    assert_eq!(again.class_bases(), Some(std::slice::from_ref(&exception)));
+    let a_var_host = a_var.borrow().classdesc.borrow().pyobj.clone();
+    let b_var_host = b_var.borrow().classdesc.borrow().pyobj.clone();
+    assert_ne!(a_var_host, b_var_host);
+    assert_eq!(
+        a_var_host.class_bases(),
+        Some(std::slice::from_ref(&a_host))
+    );
+    assert_eq!(
+        b_var_host.class_bases(),
+        Some(std::slice::from_ref(&b_host))
+    );
+    assert_eq!(bk.intern_class_by_qualname("a::E::A"), a_var_host);
+    assert_eq!(bk.intern_class_by_qualname("b::E::A"), b_var_host);
+}
+
+#[test]
+fn marked_variant_keys_do_not_collide_across_declarations() {
+    let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    bk.mint_exception_class_hierarchies(&[
+        crate::front::llbc_hints::ExceptionClassHint {
+            enum_path: "pkg::E".into(),
+            overrides: String::new(),
+            variants: vec!["AB".into()],
+        },
+        crate::front::llbc_hints::ExceptionClassHint {
+            enum_path: "pkg::EA".into(),
+            overrides: String::new(),
+            variants: vec!["B".into()],
+        },
+    ]);
+    let ab = bk
+        .exception_class_variant("pkg::E", "AB")
+        .expect("pkg::E::AB");
+    let b = bk
+        .exception_class_variant("pkg::EA", "B")
+        .expect("pkg::EA::B");
+    assert!(!std::rc::Rc::ptr_eq(&ab, &b));
+    assert_eq!(ab.borrow().name, "pkg::E::AB");
+    assert_eq!(b.borrow().name, "pkg::EA::B");
+    let ab_host = ab.borrow().classdesc.borrow().pyobj.clone();
+    let b_host = b.borrow().classdesc.borrow().pyobj.clone();
+    assert_ne!(ab_host, b_host);
+    assert_eq!(bk.intern_class_by_qualname("pkg::E::AB"), ab_host);
+    assert_eq!(bk.intern_class_by_qualname("pkg::EA::B"), b_host);
+}
+
+#[test]
+#[should_panic(expected = "already interned with bases")]
+fn minting_refuses_a_plain_class_under_the_declaration_key() {
+    let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    let _ = bk.intern_class_by_qualname("pkg::E");
+    bk.mint_exception_class_hierarchies(&[crate::front::llbc_hints::ExceptionClassHint {
+        enum_path: "pkg::E".into(),
+        overrides: String::new(),
+        variants: vec!["A".into()],
+    }]);
+}
+
+fn lowering_state(llbc: &majit_charon_reader::Llbc) -> super::super::CrateLoweringState {
+    let gc = std::collections::HashSet::<majit_ir::descr::StructId>::new();
+    let raw = std::collections::HashSet::<String>::new();
+    super::super::CrateLoweringState::new(
+        llbc,
+        &std::collections::HashSet::new(),
+        std::collections::HashMap::new(),
+        Default::default(),
+        &gc,
+        &raw,
+        None,
+        None,
+    )
+}
+
+/// Artefact B carries a copied `E` and a function that takes `E`. Seeded
+/// with A's marker plus B's own harvest, B paints the declaration key and
+/// registers no tagged rows and no variant-field rows.
+#[test]
+fn copied_marked_enum_uses_the_program_wide_hint() {
+    let defining = super::window_llbc_with_globals(
+        vec![payload_enum(0, "E")],
+        Vec::new(),
+        vec![marker(0, &["fixture", "synth", "_exception_class_E"], "")],
+    );
+    let e_ty = adt(0);
+    let mut copied_enum = payload_enum(0, "E");
+    copied_enum["item_meta"] = super::window_meta(&["fixture", "synth", "E"], false);
+    let take_e = super::window_opaque_fun(
+        1,
+        &["fixture", "synth", "take_e"],
+        vec![e_ty.clone()],
+        e_ty.clone(),
+    );
+    let copied = super::window_llbc_with_globals(vec![copied_enum], vec![take_e], Vec::new());
+
+    let mut hints = Vec::new();
+    crate::front::llbc_hints::extend_program_exception_class_hints(
+        &mut hints,
+        crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(std::slice::from_ref(
+            &defining,
+        )),
+    );
+    crate::front::llbc_hints::extend_program_exception_class_hints(
+        &mut hints,
+        crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(std::slice::from_ref(
+            &copied,
+        )),
+    );
+    super::super::seed_program_exception_class_hints(&copied, hints);
+
+    let parsed: TyRef = serde_json::from_value(e_ty).expect("E ty");
+    assert_eq!(
+        super::super::lltype::tyref_exception_class_key(&parsed, &copied).as_deref(),
+        Some("synth::E")
+    );
+
+    let state_a = lowering_state(&defining);
+    let mut state_b = lowering_state(&copied);
+    for key in ["E", "synth::E", "fixture::synth::E"] {
+        if let Some(rows) = state_b.struct_fields().fields.get(key) {
+            assert!(
+                rows.iter().all(|row| row.name != "__discriminant"),
+                "{key} registered __discriminant"
+            );
+        }
+    }
+    for key in [
+        "synth::E::A",
+        "fixture::synth::E::A",
+        "E::A",
+        "synth::E::B",
+        "fixture::synth::E::B",
+        "E::B",
+    ] {
+        assert!(
+            state_b.struct_fields().fields.get(key).is_none(),
+            "{key} registered rows on the copy"
+        );
+    }
+
+    state_b.absorb_struct_fields(state_a.struct_fields());
+    let program_a = state_a.finish(Vec::new());
+    let program_b = state_b.finish(Vec::new());
+    assert_eq!(program_a.exception_class_hints.len(), 1);
+    assert_eq!(program_a.exception_class_hints[0].enum_path, "synth::E");
+    assert_rows(
+        &program_a.struct_fields,
+        "synth::E::A",
+        &[("n", "usize", false)],
+    );
+    assert!(program_b.exception_class_hints.is_empty());
+    assert_rows(
+        &program_b.struct_fields,
+        "synth::E::A",
+        &[("n", "usize", false)],
+    );
+    for key in ["E", "synth::E", "fixture::synth::E"] {
+        assert!(
+            !program_b.enum_variant_by_discriminant.contains_key(key),
+            "{key} registered enum_variant_by_discriminant"
+        );
+        if let Some(rows) = program_b.struct_fields.fields.get(key) {
+            assert!(
+                rows.iter().all(|row| row.name != "__discriminant"),
+                "{key} registered __discriminant"
+            );
+        }
+    }
+}
+
+/// `C(B) B(A)`, `n` on A and C, none on B. The row lives on A, and a
+/// read of C's `n` names that same owner.
+#[test]
+fn exception_class_field_read_skips_a_non_declaring_parent() {
+    let e = adt(0);
+    let u_size = usize_ty();
+    let flag = bool_ty();
+    let enum_ty = enum_decl(
+        0,
+        &["fixture", "synth", "E"],
+        vec![
+            variant("A", vec![named_field("n", &u_size)], 0),
+            variant("B", vec![named_field("flag", &flag)], 1),
+            variant("C", vec![named_field("n", &u_size)], 2),
+        ],
+    );
+    let match_c = fun(
+        0,
+        &["fixture", "synth", "match_c"],
+        vec![e.clone()],
+        u_size.clone(),
+        read_variant_field_body(
+            local_place(1, &e),
+            &e,
+            downcast_field(local_place(1, &e), &e, 2, 0, &u_size),
+            &u_size,
+        ),
+    );
+    let llbc = super::window_llbc_with_globals(
+        vec![enum_ty],
+        vec![match_c],
+        vec![marker(
+            0,
+            &["fixture", "synth", "_exception_class_E"],
+            "C(B) B(A)",
+        )],
+    );
+    let (_, fields, _, _, attrs) = program_metadata(&llbc);
+    assert_rows(&fields, "synth::E::A", &[("n", "usize", false)]);
+    assert_rows(&fields, "synth::E::B", &[("flag", "bool", false)]);
+    assert_absent(&fields, "synth::E::C");
+    assert_absent(&fields, "synth::E");
+    let mut n_owners: Vec<&str> = fields
+        .fields
+        .iter()
+        .filter(|(_, rows)| rows.iter().any(|row| row.name == "n"))
+        .map(|(key, _)| key.as_str())
+        .collect();
+    n_owners.sort();
+    assert_eq!(n_owners, vec!["synth::E::A"]);
+    assert_eq!(
+        attrs.get("synth::E::A"),
+        Some(&vec![("n".to_string(), ValueType::Unsigned)])
+    );
+    assert_eq!(
+        attrs.get("synth::E::B"),
+        Some(&vec![("flag".to_string(), ValueType::Bool)])
+    );
+    assert!(attrs.get("synth::E::C").is_none());
+    let graph = lower(&llbc, "match_c");
+    assert!(
+        true_edge_reaches_field(&graph, "n", "synth::E::A"),
+        "C arm getattr n on synth::E::A; graph={}",
+        graph.dump()
+    );
+}
+
+#[test]
+#[should_panic(
+    expected = "exception class synth::E::C.n: field type String disagrees with synth::E::A.n field type i64"
+)]
+fn exception_class_inherited_field_type_mismatch_panics() {
+    let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let string_ty = adt(1);
+    let llbc = super::window_llbc_with_globals(
+        vec![
+            enum_decl(
+                0,
+                &["fixture", "synth", "E"],
+                vec![
+                    variant("A", vec![named_field("n", &i64_ty)], 0),
+                    variant("B", vec![], 1),
+                    variant("C", vec![named_field("n", &string_ty)], 2),
+                ],
+            ),
+            opaque_string_decl(1),
+        ],
+        Vec::new(),
+        vec![marker(
+            0,
+            &["fixture", "synth", "_exception_class_E"],
+            "C(B) B(A)",
+        )],
+    );
+    let _ = program_metadata(&llbc);
 }

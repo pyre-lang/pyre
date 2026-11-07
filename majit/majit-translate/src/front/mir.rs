@@ -1767,10 +1767,12 @@ pub(crate) struct CrateLoweringState {
     /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
     /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
     raw_alloc_flavor_structs: std::collections::HashSet<String>,
-    /// `_exception_class_<Enum>` rows from this artefact. Bodies do not
+    /// This artefact's own `_exception_class_<Enum>` markers. Bodies do not
     /// read them. `finish` copies the vec; earlier crates stay out so
-    /// `absorb_semantic_program` is the only merge (a second copy of the
-    /// same intern key panics there).
+    /// `absorb_semantic_program` is the only merge (a repeated intern key
+    /// panics there: the class was declared twice). Paint and registration
+    /// read the program-wide set on the artefact
+    /// (`llbc_exception_class_hints`), seeded in dependency order.
     exception_class_hints: Vec<crate::front::llbc_hints::ExceptionClassHint>,
     /// `_immutable_fields_<Struct>` harvested once for this artefact
     /// (`harvest_immutable_fields_from_llbcs`). Overlay dests and the
@@ -1850,12 +1852,16 @@ impl CrateLoweringState {
             ));
         // Flavor is a program-wide class property; a dependency's raw classes count here too.
         raw_alloc_flavor_structs.extend(program_raw_alloc_flavor_structs.iter().cloned());
-        // This crate's markers only. A later crate's copy is merged by
-        // `absorb_semantic_program`, which rejects a repeated intern key.
+        // Own markers only. `finish` exports this vec;
+        // `absorb_semantic_program` rejects a repeated intern key.
+        // Registration and paint use the program-wide set, which the
+        // frontend seeded on `llbc`. An unseeded artefact's first read
+        // is this same harvest.
         let exception_class_hints =
             crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
                 std::slice::from_ref(llbc),
             );
+        let program_exception_class_hints = llbc_exception_class_hints(llbc);
         // ── Pass 1: walk type_decls + trait_decls ─────────────────────
         let (
             mut known_struct_names,
@@ -1871,7 +1877,7 @@ impl CrateLoweringState {
             gc_struct_ids,
             &immutable_fields,
             &raw_alloc_flavor_structs,
-            &exception_class_hints,
+            program_exception_class_hints,
         );
         promote_cross_crate_stripped_keys(
             llbc,
@@ -1952,7 +1958,7 @@ impl CrateLoweringState {
             &mut struct_fields,
             &mut struct_ids,
             gc_struct_ids,
-            &exception_class_hints,
+            program_exception_class_hints,
         );
         // Concrete `Entry<i64, *mut PyObject>` rows. The generic decl's
         // `key` is a type variable; extra descrs for `OS_DICT_LOOKUP`
@@ -4163,10 +4169,14 @@ fn note_declared_gc_owner(
 )]
 /// Variant fields of a marked exception-class enum, on the minted classes.
 ///
-/// A name an ancestor already publishes is inherited and is not registered
-/// again. An empty variant and a variant whose fields are all inherited
-/// get no rows. The base class gets none. A field that is not one
-/// translated word panics with the enum, variant class, field, and type.
+/// Farthest declaring ancestor, same walk as registration
+/// ([`crate::front::llbc_hints::exception_class_field_owner`],
+/// `ClassDef.get_owner` in `classdesc.py`). A spelling that ancestor
+/// publishes is not registered again. The same spelling with a different
+/// type panics with the class, the field, and both spellings. An empty
+/// variant and a variant whose fields are all inherited get no rows. The
+/// base class gets none. A field that is not one translated word panics
+/// with the enum, variant class, field, and type.
 fn register_exception_class_variant_fields(
     td: &TypeDecl,
     hint: &crate::front::llbc_hints::ExceptionClassHint,
@@ -4203,12 +4213,47 @@ fn register_exception_class_variant_fields(
             continue;
         };
         let class_name =
-            crate::front::llbc_hints::exception_class_qualname(&hint.enum_path, Some(variant_name));
+            crate::front::llbc_hints::exception_class_key(&hint.enum_path, Some(variant_name));
         let mut rows = Vec::new();
         let mut attrs = Vec::new();
         for (index, field) in variant.fields.iter().enumerate() {
             let fname = field_decl_name(index, field);
-            if exception_ancestor_declares(&links, &published, variant_name, &fname) {
+            let owner = crate::front::llbc_hints::exception_class_field_owner(
+                &links,
+                variant_name,
+                |name| {
+                    published.iter().any(|(published_name, names)| {
+                        published_name == name && names.iter().any(|candidate| candidate == &fname)
+                    })
+                },
+            );
+            if owner != variant_name.as_str() {
+                let ancestor_ty = variants
+                    .iter()
+                    .find(|candidate| candidate.name == owner)
+                    .and_then(|candidate| {
+                        candidate.fields.iter().enumerate().find_map(
+                            |(field_index, field_decl)| {
+                                (field_decl_name(field_index, field_decl) == fname)
+                                    .then_some(&field_decl.ty)
+                            },
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "exception class {class_name}.{fname}: {owner} owns the field but has no declaration"
+                        )
+                    });
+                let descendant_spelling = tyref_to_ast_string(&field.ty, llbc);
+                let ancestor_spelling = tyref_to_ast_string(ancestor_ty, llbc);
+                if descendant_spelling != ancestor_spelling {
+                    let owner_class =
+                        crate::front::llbc_hints::exception_class_key(&hint.enum_path, Some(owner));
+                    panic!(
+                        "exception class {class_name}.{fname}: field type {descendant_spelling} \
+                         disagrees with {owner_class}.{fname} field type {ancestor_spelling}"
+                    );
+                }
                 continue;
             }
             if !exception_class_attr_is_one_word(
@@ -4258,31 +4303,6 @@ fn register_exception_class_variant_fields(
         struct_fields.fields.insert(class_name.clone(), rows);
         struct_field_attrs.insert(class_name, attrs);
     }
-}
-
-fn exception_ancestor_declares(
-    links: &[(String, Option<String>)],
-    published: &[(String, Vec<String>)],
-    variant: &str,
-    field: &str,
-) -> bool {
-    let mut current = links
-        .iter()
-        .find(|(name, _)| name == variant)
-        .and_then(|(_, parent)| parent.clone());
-    while let Some(parent) = current {
-        if published.iter().any(|(name, names)| {
-            name == &parent && names.iter().any(|candidate| candidate == field)
-        }) {
-            return true;
-        }
-        let next = parent.clone();
-        current = links
-            .iter()
-            .find(|(name, _)| name == &next)
-            .and_then(|(_, parent)| parent.clone());
-    }
-    false
 }
 
 fn derive_program_metadata(
@@ -4605,7 +4625,16 @@ fn derive_program_metadata(
                 known_struct_names.insert(leaf.clone());
                 let marked_hint =
                     exception_class_hint_for_paths(exception_class_hints, &name, &canon_base);
-                if let Some(hint) = marked_hint {
+                // Variant field rows belong to the defining crate
+                // (`ItemMeta::is_local`). A later crate's copy spells a
+                // nested ADT as its leaf (`charon_adt_to_ast_string`'s
+                // Path arm) where the defining crate records the
+                // crate-stripped path (`field_row_struct_identity`).
+                // `absorb_struct_fields` keeps the row already stored,
+                // so the copy inserts none and the defining rows stay.
+                if let Some(hint) = marked_hint
+                    && td.item_meta.is_local
+                {
                     register_exception_class_variant_fields(
                         td,
                         hint,
@@ -5580,9 +5609,7 @@ impl DuplicateLeafFacts {
                 &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
                     std::slice::from_ref(llbc),
                 ),
-                &crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
-                    std::slice::from_ref(llbc),
-                ),
+                llbc_exception_class_hints(llbc),
             );
         let crate_name = llbc.crate_name().to_string();
         let prefix = format!("{crate_name}::");
@@ -6249,9 +6276,7 @@ impl<'a> LowerContext<'a> {
             &gc_struct_ids,
             &immutable_fields,
             &raw_alloc_flavor_structs,
-            &crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
-                std::slice::from_ref(llbc),
-            ),
+            llbc_exception_class_hints(llbc),
         );
         Self {
             llbc,
@@ -6626,9 +6651,9 @@ pub(crate) use self::lltype::{
     is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration, is_str_family_class_root,
     is_str_length_field_class_root, is_str_oopspec_class_root,
     items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
-    output_type_is_objectptr, push_unichr, same_nominal_adt, strip_crate_prefix,
-    type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn,
-    unichr_call,
+    output_type_is_objectptr, push_unichr, same_nominal_adt, seed_program_exception_class_hints,
+    strip_crate_prefix, type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics,
+    tyref_is_fat_dyn, unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;

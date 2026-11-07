@@ -4434,23 +4434,47 @@ impl Bookkeeper {
         host
     }
 
-    /// Intern an RPython exception class under the literal name.
+    /// Intern one exception class under its declaration key.
     ///
-    /// `intern_class_key` resolves against this bookkeeper's registry
-    /// and already-interned classes, and a TypeDecl is interned under
-    /// its qualified path (`argument::ArgErr`), so the literal Python
-    /// `__name__` key keeps the exception class apart from the value
-    /// ADT. The key here is the name as given (`ArgErr`,
-    /// `ArgErrMissing`). First mint wins: a key that is already present
-    /// is returned unchanged.
+    /// `name` is [`crate::front::llbc_hints::exception_class_key`]: the
+    /// enum's declaration intern key, or `{enum_path}::{variant}`.
+    /// [`Self::intern_class_key`] is the resolution
+    /// [`Self::intern_class_by_qualname`] uses, so the minted host and
+    /// the value ADT's class are one [`Self::struct_root_classes`] entry.
+    /// An entry that is already present is that host. Its bases must be
+    /// the chain this call expects; a different chain was interned
+    /// before the hierarchy was minted and is not reused.
     fn intern_exception_class(&self, name: &str, bases: Vec<HostObject>) -> HostObject {
-        if let Some(existing) = self.struct_root_classes.borrow().get(name) {
-            return existing.clone();
+        let key = self.intern_class_key(name);
+        if let Some(existing) = self.struct_root_classes.borrow().get(&key).cloned() {
+            let actual = existing.class_bases().map(|got| got.to_vec());
+            let matches = actual.as_ref().is_some_and(|got| {
+                got.len() == bases.len() && got.iter().zip(&bases).all(|(got, want)| got == want)
+            });
+            if !matches {
+                let got = actual
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|base| base.qualname().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let want = bases
+                    .iter()
+                    .map(|base| base.qualname().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                panic!(
+                    "exception class `{key}` is already interned with bases [{got}], expected [{want}]"
+                );
+            }
+            return existing;
         }
-        let host = HostObject::new_class(name.to_string(), bases);
-        crate::virtualizable_decl::stamp_host_virtualizable(&host, name);
-        self.stamp_raw_alloc_flavor(&host, name);
-        self.insert_struct_root_class(name.to_string(), host.clone());
+        let host = HostObject::new_class(key.clone(), bases);
+        crate::virtualizable_decl::stamp_host_virtualizable(&host, &key);
+        self.stamp_raw_alloc_flavor(&host, &key);
+        self.stamp_immutable_fields(&host, &key);
+        self.insert_struct_root_class(key, host.clone());
         host
     }
 
@@ -4460,8 +4484,8 @@ impl Bookkeeper {
     /// (`HOST_ENV.lookup_exception_class`, the base
     /// `default_class_bases` gives the error carrier). Each variant
     /// subclasses its parent exception class, not the Rust enum variant.
-    /// Class names are `exception_class_qualname` (enum leaf, or that
-    /// leaf concatenated with the variant). `getuniqueclassdef` runs
+    /// Class names are `exception_class_key` (the declaration intern
+    /// key, or `{enum_path}::{variant}`). `getuniqueclassdef` runs
     /// here so `basedef` is wired. `assign_inheritance_ids` does not:
     /// `run_two_phase_prepass` numbers classdefs after phase A and
     /// before phase B, `CallRegistry::ensure_session` numbers the
@@ -4508,7 +4532,7 @@ impl Bookkeeper {
         let exception = crate::flowspace::model::HOST_ENV
             .lookup_exception_class("Exception")
             .expect("HOST_ENV missing builtin Exception");
-        let base_name = crate::front::llbc_hints::exception_class_qualname(&hint.enum_path, None);
+        let base_name = crate::front::llbc_hints::exception_class_key(&hint.enum_path, None);
         if base_name.is_empty() {
             panic!("_exception_class_ {enum_name}: empty class name");
         }
@@ -4533,7 +4557,7 @@ impl Bookkeeper {
                     }),
             };
             let class_name =
-                crate::front::llbc_hints::exception_class_qualname(&hint.enum_path, Some(&variant));
+                crate::front::llbc_hints::exception_class_key(&hint.enum_path, Some(&variant));
             if class_name.is_empty() {
                 panic!("_exception_class_ {enum_name}: empty class name");
             }
@@ -4596,7 +4620,7 @@ impl Bookkeeper {
             .map(|hierarchy| hierarchy.base)
     }
 
-    /// The variant class `<Enum><Variant>` of the hierarchy `enum_path` names.
+    /// The variant class `{enum_path}::{variant}` of the hierarchy `enum_path` names.
     ///
     /// `None` when the hierarchy or the variant is absent.
     pub fn exception_class_variant(
@@ -4652,10 +4676,10 @@ impl Bookkeeper {
         })
     }
 
-    /// Literal variant class names of the hierarchy `enum_path` names.
+    /// Variant class keys of the hierarchy `enum_path` names.
     ///
     /// Empty when no hierarchy matches. The strings are
-    /// `exception_class_qualname` (`EA`), not the variant leaves.
+    /// `exception_class_key` (`synth::E::A`), not the variant leaves.
     pub fn exception_variant_class_names(&self, enum_path: &str) -> Vec<String> {
         self.matched_exception_hierarchy(enum_path)
             .map(|hierarchy| {
@@ -4663,7 +4687,7 @@ impl Bookkeeper {
                     .variants
                     .iter()
                     .map(|(variant, _)| {
-                        crate::front::llbc_hints::exception_class_qualname(
+                        crate::front::llbc_hints::exception_class_key(
                             &hierarchy.enum_path,
                             Some(variant),
                         )

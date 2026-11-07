@@ -302,8 +302,9 @@ pub(crate) fn result_exc_projected_ok(
 }
 
 /// Whether `query` names this sum, one of its marked payloads, or — when
-/// the sum has a carrier variant — the carrier. Leaf equality is only for
-/// this gate: a `?` residual spells the enum leaf (`S`, `E`).
+/// the sum has a carrier variant — the carrier. A bare leaf matches only
+/// when `canonical_struct_name` resolves it. A different declaration with
+/// the same leaf does not.
 pub(crate) fn exception_sum_claims_error(
     sum: &ExceptionSum,
     query: &str,
@@ -335,15 +336,21 @@ pub(crate) fn exception_sum_claims_error(
     false
 }
 
+/// Whether `query` names the declaration stored as `identity` or `path`.
+///
+/// `exception_class_enum_path_matches` is stored-then-query: exact
+/// spelling, `canonical_struct_name` of the query, or the crate-stripped
+/// query. A bare leaf with no registered origin does not match. The
+/// bookkeeper's `intern_class_key` unique-suffix resolution needs the
+/// field registry, which this front does not have.
 fn names_declared_type(identity: &str, path: &str, query: &str) -> bool {
     if query.is_empty() {
         return false;
     }
-    if query == identity || query == path {
+    if crate::front::llbc_hints::exception_class_enum_path_matches(identity, query) {
         return true;
     }
-    let leaf = type_leaf(query);
-    !leaf.is_empty() && (type_leaf(identity) == leaf || type_leaf(path) == leaf)
+    path != identity && crate::front::llbc_hints::exception_class_enum_path_matches(path, query)
 }
 
 fn payload_identity(payload: &ExceptionSumPayload, carrier_path: &str) -> String {
@@ -393,13 +400,13 @@ fn marked_enum_payload(
         .map(|variant| {
             (
                 variant.clone(),
-                crate::front::llbc_hints::exception_class_qualname(&hint.enum_path, Some(variant)),
+                crate::front::llbc_hints::exception_class_key(&hint.enum_path, Some(variant)),
             )
         })
         .collect();
     Some(ExceptionSumPayload::Marked {
         enum_path: hint.enum_path.clone(),
-        base_class: crate::front::llbc_hints::exception_class_qualname(&hint.enum_path, None),
+        base_class: crate::front::llbc_hints::exception_class_key(&hint.enum_path, None),
         classes,
     })
 }
@@ -4002,7 +4009,7 @@ fn annotation_class_name(var: &Variable) -> Option<String> {
 /// Class the op itself records, before any identity forward.
 ///
 /// A `FieldRead` is not followed: its `ty` is the instance class
-/// (`E` for a marked `Result::Err` payload). `object` and `GCREF`
+/// (the declaration key for a marked `Result::Err` payload). `object` and `GCREF`
 /// are every `GcRef`, not a class.
 fn op_instance_class(kind: &OpKind) -> Option<String> {
     match kind {
@@ -22143,6 +22150,43 @@ mod from_residual_conversion_tests {
         assert_eq!(
             from_impl_args(&graph),
             crate::model::call_args(vec![reads[0].0.clone()])
+        );
+    }
+
+    #[test]
+    fn a_sum_does_not_claim_another_declaration_with_the_same_leaf() {
+        let sum = ExceptionSum {
+            identity: "synth::S".into(),
+            path: "fixture::synth::S".into(),
+            variants: vec![ExceptionSumVariant {
+                name: "Own".into(),
+                discriminant: 0,
+                payload: ExceptionSumPayload::Marked {
+                    enum_path: "module::E".into(),
+                    base_class: "module::E".into(),
+                    classes: vec![("A".into(), "module::E::A".into())],
+                },
+            }],
+        };
+        assert!(!exception_sum_claims_error(&sum, "other::E", CARRIER));
+        assert!(exception_sum_claims_error(&sum, "module::E", CARRIER));
+        assert!(exception_sum_claims_error(
+            &sum,
+            "fixture::module::E",
+            CARRIER
+        ));
+        assert!(!exception_sum_claims_error(&sum, "E", CARRIER));
+
+        let (graph, _) = from_residual_tail("Result<Infallible,other::E>::Err");
+        let kept = foreign_from_residual_sites_in(&graph, spec(), Some(&sum));
+        assert_eq!(kept.len(), 1, "From for other::E stays");
+        assert_eq!(kept[0].error_ty, "other::E");
+
+        let (graph, _) = from_residual_tail("Result<Infallible,module::E>::Err");
+        let claimed = foreign_from_residual_sites_in(&graph, spec(), Some(&sum));
+        assert!(
+            claimed.is_empty(),
+            "the same declaration is already raised, so From is not kept"
         );
     }
 

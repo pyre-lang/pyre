@@ -2927,10 +2927,11 @@ pub(in crate::front::mir) struct ValueTypeInputs {
 pub(in crate::front::mir) struct LlbcDerived {
     pub(in crate::front::mir) value_type_inputs: std::sync::OnceLock<ValueTypeInputs>,
     pub(in crate::front::mir) struct_decls_by_owner: std::sync::OnceLock<StructDeclsByOwner>,
-    /// `_exception_class_<Enum>` hints of this artefact. Paint reads them.
-    /// Registration receives the same harvest from the lowering entry.
-    /// A copied TypeDecl in a later crate does not see a marker that
-    /// lives only on the defining artefact.
+    /// `_exception_class_<Enum>` hints visible while lowering this artefact.
+    /// The production frontend seeds the program-wide set in dependency
+    /// order (earlier artefacts, then this artefact's own markers) before
+    /// any query. Paint and registration read that set. An artefact that
+    /// is never seeded computes its own harvest on first read.
     exception_class_hints: std::sync::OnceLock<Vec<crate::front::llbc_hints::ExceptionClassHint>>,
     /// Module of the unique type whose last path segment is `FrameAnchor`.
     pub(in crate::front::mir) frame_anchor_module: std::sync::OnceLock<Option<String>>,
@@ -4230,15 +4231,20 @@ pub(in crate::front::mir) fn tyref_payload_enum_class_root_with(
         return None;
     }
     // A marked enum is an instance of the minted exception class. The
-    // literal leaf (`E`, `ArgErr`) is that class. The tagged ADT root
-    // stays the paint for every unmarked payload enum.
-    if let Some(leaf) = tyref_exception_class_leaf(ty, llbc) {
-        return Some(leaf);
+    // declaration intern key (`synth::E`, `argument::ArgErr`) is that
+    // class. The tagged ADT root stays the paint for every unmarked
+    // payload enum.
+    if let Some(key) = tyref_exception_class_key(ty, llbc) {
+        return Some(key);
     }
     tyref_class_root_with(ty, llbc, tombstoned)
 }
 
-/// Harvested `_exception_class_<Enum>` hints of one artefact.
+/// `_exception_class_<Enum>` hints visible to this artefact.
+///
+/// The production frontend seeds the program-wide set (dependency order)
+/// before any query. An unseeded artefact, including a single-artefact
+/// unit test, computes its own harvest on first read.
 pub(crate) fn llbc_exception_class_hints(
     llbc: &Llbc,
 ) -> &Vec<crate::front::llbc_hints::ExceptionClassHint> {
@@ -4247,6 +4253,21 @@ pub(crate) fn llbc_exception_class_hints(
             llbc,
         ))
     })
+}
+
+/// Install `hints` as this artefact's program-wide exception-class set.
+///
+/// Call once, after load and after any `type_decls_mut` that drops
+/// `Llbc::derived`, and before a query that reads
+/// [`llbc_exception_class_hints`]. A second call panics: the lock was
+/// already filled, so a query ran before the seed.
+pub(crate) fn seed_program_exception_class_hints(
+    llbc: &Llbc,
+    hints: Vec<crate::front::llbc_hints::ExceptionClassHint>,
+) {
+    if llbc_derived(llbc).exception_class_hints.set(hints).is_err() {
+        panic!("exception class hints queried before the program-wide seed");
+    }
 }
 
 /// The hint whose harvested identity names `name` or `canon_base`.
@@ -4267,11 +4288,11 @@ pub(in crate::front::mir) fn exception_class_hint_for_paths<'a>(
     })
 }
 
-/// Literal base-class name of a marked exception-class enum, or `None`.
+/// Declaration intern key of a marked exception-class enum, or `None`.
 ///
 /// Fieldless enums stay the tag integer. The helper does not call
 /// [`tyref_payload_enum_class_root_with`].
-pub(in crate::front::mir) fn tyref_exception_class_leaf(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+pub(in crate::front::mir) fn tyref_exception_class_key(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     if tyref_is_fieldless_enum_free(ty, llbc) || tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
         return None;
     }
@@ -4281,7 +4302,7 @@ pub(in crate::front::mir) fn tyref_exception_class_leaf(ty: &TyRef, llbc: &Llbc)
     let path = adt_path_of_tyref(ty, llbc)?;
     let canon = strip_crate_prefix(&path);
     let hint = exception_class_hint_for_paths(llbc_exception_class_hints(llbc), &path, &canon)?;
-    Some(crate::front::llbc_hints::exception_class_qualname(
+    Some(crate::front::llbc_hints::exception_class_key(
         &hint.enum_path,
         None,
     ))
@@ -6205,10 +6226,11 @@ pub(in crate::front::mir) fn tyref_input_class_root(
     if let Some(ValueType::Ref(root)) = tyref_niche_option_payload_paint(ty, llbc, tombstoned) {
         return root;
     }
-    // A marked enum parameter is the minted base class (`E`), not the
-    // tagged ADT identity. `derive_subject_inputcells` seeds that ClassDef.
-    if let Some(leaf) = tyref_exception_class_leaf(ty, llbc) {
-        return Some(leaf);
+    // A marked enum parameter is the minted base class (the declaration
+    // intern key), not the tagged ADT identity. `derive_subject_inputcells`
+    // seeds that ClassDef.
+    if let Some(key) = tyref_exception_class_key(ty, llbc) {
+        return Some(key);
     }
     let leaf = tyref_class_root_with(ty, llbc, tombstoned);
     if leaf
@@ -12924,6 +12946,21 @@ fn intern_suffix_keeps_cast_leaf(llbc: &Llbc, leaf: &str) -> bool {
         >= 2
 }
 
+/// Declaration intern key when `name_path` is a marked exception class.
+///
+/// Other ADTs keep the leaf [`charon_adt_to_ast_string`] already renders.
+/// A marked enum's type argument (`Result<usize, synth::E>`) has to name
+/// the same key as its minted class, or a bare leaf collides with another
+/// declaration.
+fn marked_exception_ast_name(llbc: &Llbc, name_path: &str) -> Option<String> {
+    let canon = strip_crate_prefix(name_path);
+    let hint = exception_class_hint_for_paths(llbc_exception_class_hints(llbc), name_path, &canon)?;
+    Some(crate::front::llbc_hints::exception_class_key(
+        &hint.enum_path,
+        None,
+    ))
+}
+
 /// Format a Charon `Adt` type body (`{"id": …, "generics": {"types": […]}}`).
 pub(in crate::front::mir) fn charon_adt_to_ast_string(
     adt: &serde_json::Map<String, serde_json::Value>,
@@ -12949,24 +12986,27 @@ pub(in crate::front::mir) fn charon_adt_to_ast_string(
             .type_by_id(def_id)
             .map(|td| td.item_meta.name_path())
             .unwrap_or_else(|| format!("??adt#{def_id}"));
-        let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+        let head = marked_exception_ast_name(llbc, &name)
+            .unwrap_or_else(|| name.rsplit("::").next().unwrap_or(&name).to_string());
         if type_args.is_empty() {
-            return leaf;
+            return head;
         }
         // Keep supplied type arguments (`bookkeeper.py`
         // `getuniqueclassdef`). An omitted-default spelling is only
         // valid when Charon carries the declared default and the
         // argument equals it.
-        return format!("{leaf}<{}>", type_args.join(","));
+        return format!("{head}<{}>", type_args.join(","));
     }
     // A field type copied from another crate names the ADT by path. The
     // leaf is the same spelling the defining crate's numeric id rendered.
+    // A marked exception class uses its declaration intern key.
     if let Some(path) = id.and_then(|i| i.get("Path")).and_then(|p| p.as_str()) {
-        let leaf = path.rsplit("::").next().unwrap_or(path);
+        let head = marked_exception_ast_name(llbc, path)
+            .unwrap_or_else(|| path.rsplit("::").next().unwrap_or(path).to_string());
         if type_args.is_empty() {
-            return leaf.to_string();
+            return head;
         }
-        return format!("{leaf}<{}>", type_args.join(","));
+        return format!("{head}<{}>", type_args.join(","));
     }
     let key = id
         .and_then(|i| i.as_object())

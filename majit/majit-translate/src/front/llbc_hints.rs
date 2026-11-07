@@ -494,9 +494,10 @@ fn resolve_alloc_flavor_raw_identity(llbc: &Llbc, marker_path: &str, struct_name
 ///
 /// `argument.py` `class ArgErr(Exception)` and its subclasses are one
 /// Rust enum in the interpreter. The const `_exception_class_<Enum>`
-/// declares that enum: a base class `<Enum>` (subclass of the host
-/// `Exception`) and one subclass `<Enum><Variant>` per variant. The
-/// const value is a whitespace-separated list of nesting overrides
+/// declares that enum. The base class is the declaration intern key
+/// (`exception_class_key`, subclass of the host `Exception`) and each
+/// variant is `{enum_path}::{variant}`. The const value is a
+/// whitespace-separated list of nesting overrides
 /// `Variant(ParentVariant)`; a variant that is absent derives from the
 /// base. An empty string is a flat hierarchy.
 const EXCEPTION_CLASS_PREFIX: &str = "_exception_class_";
@@ -520,14 +521,17 @@ pub(crate) fn exception_class_leaf(enum_path: &str) -> &str {
     path_leaf_stripped(enum_path)
 }
 
-/// Class name of the hierarchy: the enum leaf, or that leaf concatenated
-/// with the variant name (`ArgErr` + `Missing` → `ArgErrMissing`).
-/// The names are derived here. They are not spelled in the translator.
-pub(crate) fn exception_class_qualname(enum_path: &str, variant: Option<&str>) -> String {
-    let leaf = path_leaf_stripped(enum_path);
+/// Intern key of one class in the hierarchy.
+///
+/// `None` is the declaration key (`hint.enum_path`), the same string
+/// `intern_class_by_qualname` uses for that TypeDecl. `Some(variant)` is
+/// `{enum_path}::{variant}`, the spelling a ctor stamps (`synth::E::B`)
+/// and an unmarked enum uses for its variant subclass. A leaf is not a
+/// key: `exception_class_leaf` is diagnostic text only.
+pub(crate) fn exception_class_key(enum_path: &str, variant: Option<&str>) -> String {
     match variant {
-        Some(variant) => format!("{leaf}{variant}"),
-        None => leaf.to_string(),
+        Some(variant) => format!("{enum_path}::{variant}"),
+        None => enum_path.to_string(),
     }
 }
 
@@ -550,11 +554,12 @@ pub(crate) fn exception_class_enum_path_matches(stored: &str, query: &str) -> bo
 
 /// Whether `name` is the base or a variant class of one hierarchy.
 ///
-/// Accepted spellings are the qualname (`E`, `EB`), an enum-path
-/// spelling [`exception_class_enum_path_matches`] accepts, and
-/// `owner::variant` when `variant` is declared and `owner` is the
-/// enum path or the base qualname. The ctor stamps `synth::E::B`;
-/// the type of a marked value stamps the base leaf `E`.
+/// Accepted spellings are the declaration key, `{enum_path}::{variant}`,
+/// an enum-path spelling [`exception_class_enum_path_matches`] accepts
+/// (crate-stripped path, or a bare leaf whose origin is registered), and
+/// `owner::variant` when `variant` is declared and `owner` matches the
+/// enum path the same way. A bare leaf with no origin does not match.
+/// The ctor stamps `synth::E::B`.
 pub(crate) fn exception_class_variants_belong(
     enum_path: &str,
     variants: &[&str],
@@ -563,13 +568,13 @@ pub(crate) fn exception_class_variants_belong(
     if name.is_empty() {
         return false;
     }
-    let base = exception_class_qualname(enum_path, None);
+    let base = exception_class_key(enum_path, None);
     if name == base || exception_class_enum_path_matches(enum_path, name) {
         return true;
     }
     if variants
         .iter()
-        .any(|variant| name == exception_class_qualname(enum_path, Some(variant)))
+        .any(|variant| name == exception_class_key(enum_path, Some(variant)))
     {
         return true;
     }
@@ -657,6 +662,44 @@ pub fn parse_exception_class_overrides(
     order
 }
 
+/// Farthest declaring ancestor, same walk as registration.
+///
+/// Walk `links` from `variant` to the root. A parent that does not
+/// declare the field stays in the chain. The result is the farthest
+/// class for which `declares` is true, or `variant` when none declares.
+/// `ClassDef.get_owner` (`classdesc.py`) returns the class in
+/// `getmro()` that holds the attr; `_generalize_attr` leaves that attr
+/// on the topmost declarer. `register_exception_class_variant_fields`
+/// and `exception_class_attr_owner` both call this walk. A cycle in
+/// `links` panics with the chain.
+pub(crate) fn exception_class_field_owner<'a>(
+    links: &'a [(String, Option<String>)],
+    variant: &'a str,
+    declares: impl Fn(&str) -> bool,
+) -> &'a str {
+    let mut owner: Option<&'a str> = None;
+    let mut current = variant;
+    let mut seen = Vec::new();
+    loop {
+        if seen.contains(&current) {
+            panic!("exception class field owner: cycle in override links {seen:?} -> {current}");
+        }
+        seen.push(current);
+        if declares(current) {
+            owner = Some(current);
+        }
+        let Some(parent) = links
+            .iter()
+            .find(|(name, _)| name == current)
+            .and_then(|(_, parent)| parent.as_deref())
+        else {
+            break;
+        };
+        current = parent;
+    }
+    owner.unwrap_or(variant)
+}
+
 fn variant_index(enum_name: &str, variants: &[String], name: &str) -> usize {
     variants
         .iter()
@@ -688,6 +731,31 @@ fn is_exception_variant_ident(name: &str) -> bool {
         _ => return false,
     }
     chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+/// Append one artefact's harvest onto the program-wide hint list.
+///
+/// Callers walk artefacts in dependency order and append each harvest
+/// once. A repeated `enum_path` panics with the same text as
+/// [`crate::front::mir::absorb_semantic_program`]: the class was
+/// declared twice.
+pub fn extend_program_exception_class_hints(
+    acc: &mut Vec<ExceptionClassHint>,
+    own: impl IntoIterator<Item = ExceptionClassHint>,
+) {
+    for hint in own {
+        if acc
+            .iter()
+            .any(|existing| existing.enum_path == hint.enum_path)
+        {
+            let enum_name = exception_class_leaf(&hint.enum_path);
+            panic!(
+                "_exception_class_ {enum_name}: duplicate hierarchy `{}`",
+                hint.enum_path
+            );
+        }
+        acc.push(hint);
+    }
 }
 
 /// `_exception_class_<Enum>` markers in `llbcs`.
@@ -1253,7 +1321,8 @@ fn decode_bool_const(llbc: &Llbc, value: &serde_json::Value) -> Option<bool> {
 mod tests {
     use super::{
         ExceptionClassHint, decode_str_const, exception_class_enum_path_matches,
-        exception_class_qualname, harvest_exception_class_hints_from_llbcs, marker_path_to_fn_path,
+        exception_class_field_owner, exception_class_key, extend_program_exception_class_hints,
+        harvest_exception_class_hints_from_llbcs, marker_path_to_fn_path,
         parse_exception_class_overrides, parse_immutable_entry_list,
     };
     use crate::model::ImmutableRank;
@@ -1717,14 +1786,52 @@ mod tests {
         );
     }
 
+    fn field_owner<'a>(
+        links: &'a [(String, Option<String>)],
+        variant: &'a str,
+        declares: &[&str],
+    ) -> &'a str {
+        exception_class_field_owner(links, variant, |name| declares.contains(&name))
+    }
+
     #[test]
-    fn exception_class_qualname_is_leaf_plus_variant() {
-        assert_eq!(exception_class_qualname("argument::ArgErr", None), "ArgErr");
+    fn exception_class_field_owner_reaches_past_a_non_declaring_parent() {
+        let variants = names(&["C", "B", "A"]);
+        let links = parse_exception_class_overrides("E", "C(B) B(A)", &variants);
+        // B does not declare. A does, so B's farthest declarer is A.
+        // `ClassDef.get_owner` walks the whole `getmro()`.
+        assert_eq!(field_owner(&links, "C", &["A", "C"]), "A");
+        assert_eq!(field_owner(&links, "B", &["A", "C"]), "A");
+        assert_eq!(field_owner(&links, "A", &["A", "C"]), "A");
+        assert_eq!(field_owner(&links, "C", &["B", "C"]), "B");
+        assert_eq!(field_owner(&links, "C", &[]), "C");
+    }
+
+    #[test]
+    #[should_panic(expected = "cycle in override links")]
+    fn exception_class_field_owner_panics_on_a_cycle() {
+        let links = vec![
+            ("A".to_string(), Some("B".to_string())),
+            ("B".to_string(), Some("A".to_string())),
+        ];
+        let _ = exception_class_field_owner(&links, "A", |_| true);
+    }
+
+    #[test]
+    fn exception_class_key_is_the_declaration() {
         assert_eq!(
-            exception_class_qualname("argument::ArgErr", Some("Missing")),
-            "ArgErrMissing"
+            exception_class_key("argument::ArgErr", None),
+            "argument::ArgErr"
         );
-        assert_eq!(exception_class_qualname("synth::E", Some("C")), "EC");
+        assert_eq!(
+            exception_class_key("argument::ArgErr", Some("Missing")),
+            "argument::ArgErr::Missing"
+        );
+        assert_eq!(exception_class_key("synth::E", Some("C")), "synth::E::C");
+        assert_ne!(
+            exception_class_key("pkg::E", Some("AB")),
+            exception_class_key("pkg::EA", Some("B"))
+        );
     }
 
     #[test]
@@ -1735,14 +1842,17 @@ mod tests {
             variants: vec!["A".into(), "B".into(), "C".into()],
         }];
         let belongs = |name: &str| super::exception_class_name_belongs(&hints, name);
-        assert!(belongs("E"));
-        assert!(belongs("EA"));
-        assert!(belongs("EB"));
-        assert!(belongs("EC"));
         assert!(belongs("synth::E"));
         assert!(belongs("fixture::synth::E"));
+        assert!(belongs("synth::E::A"));
         assert!(belongs("synth::E::B"));
-        assert!(belongs("E::B"));
+        assert!(belongs("synth::E::C"));
+        assert!(belongs("fixture::synth::E::B"));
+        assert!(!belongs("E"));
+        assert!(!belongs("EA"));
+        assert!(!belongs("EB"));
+        assert!(!belongs("EC"));
+        assert!(!belongs("E::B"));
         assert!(!belongs("synth::T::Y"));
         assert!(!belongs("synth::E::Y"));
         assert!(!belongs(""));
@@ -2007,5 +2117,46 @@ mod tests {
             ],
         );
         let _ = harvest_exception_class_hints_from_llbcs(std::slice::from_ref(&llbc));
+    }
+
+    #[test]
+    #[should_panic(expected = "exception class hints queried before the program-wide seed")]
+    fn seed_program_exception_class_hints_after_a_query_panics() {
+        let llbc = hint_llbc(
+            vec![enum_type(1, &["fixture", "synth", "E"], &["A"])],
+            vec![marker_global(
+                1,
+                &["fixture", "synth", "_exception_class_E"],
+                "",
+            )],
+        );
+        let _ = crate::front::mir::llbc_exception_class_hints(&llbc);
+        crate::front::mir::seed_program_exception_class_hints(&llbc, Vec::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "_exception_class_ E: duplicate hierarchy `synth::E`")]
+    fn extend_program_exception_class_hints_rejects_a_repeated_enum_path() {
+        let artefact = |marker_id| {
+            hint_llbc(
+                vec![enum_type(1, &["fixture", "synth", "E"], &["A"])],
+                vec![marker_global(
+                    marker_id,
+                    &["fixture", "synth", "_exception_class_E"],
+                    "",
+                )],
+            )
+        };
+        let first = artefact(1);
+        let second = artefact(2);
+        let mut acc = Vec::new();
+        extend_program_exception_class_hints(
+            &mut acc,
+            harvest_exception_class_hints_from_llbcs(std::slice::from_ref(&first)),
+        );
+        extend_program_exception_class_hints(
+            &mut acc,
+            harvest_exception_class_hints_from_llbcs(std::slice::from_ref(&second)),
+        );
     }
 }

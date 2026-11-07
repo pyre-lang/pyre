@@ -8786,10 +8786,13 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// Literal class that declares `field` on a marked enum variant.
+    /// Farthest declaring ancestor, same walk as registration.
     ///
-    /// The furthest ancestor that publishes the same spelling owns the
-    /// attr. A hint with no such ancestor still names this variant's
+    /// [`crate::front::llbc_hints::exception_class_field_owner`] continues
+    /// through a parent that does not declare the field.
+    /// `ClassDef.get_owner` (`classdesc.py`) returns the class in
+    /// `getmro()` that holds the attr; after `_generalize_attr` that
+    /// class is the topmost declarer. No declarer names this variant's
     /// own class. `None` when the enum is not marked.
     fn exception_class_attr_owner(
         &self,
@@ -8810,34 +8813,23 @@ impl<'a> Lowering<'a> {
             &hint.overrides,
             &hint.variants,
         );
-        let mut owner = variant;
-        loop {
-            let parent = links
-                .iter()
-                .find(|(name, _)| name == owner)
-                .and_then(|(_, parent)| parent.as_deref());
-            let Some(parent) = parent else {
-                break;
-            };
-            let declares = variants.iter().any(|candidate| {
-                candidate.name == parent
-                    && candidate
-                        .fields
-                        .iter()
-                        .enumerate()
-                        .any(|(index, field_decl)| {
-                            let spelling = field_decl.name.clone().unwrap_or_else(|| {
-                                majit_charon_reader::ullbc::positional_field_name(index)
-                            });
-                            spelling == field
-                        })
+        let owner =
+            crate::front::llbc_hints::exception_class_field_owner(&links, variant, |name| {
+                variants.iter().any(|candidate| {
+                    candidate.name == name
+                        && candidate
+                            .fields
+                            .iter()
+                            .enumerate()
+                            .any(|(index, field_decl)| {
+                                let spelling = field_decl.name.clone().unwrap_or_else(|| {
+                                    majit_charon_reader::ullbc::positional_field_name(index)
+                                });
+                                spelling == field
+                            })
+                })
             });
-            if !declares {
-                break;
-            }
-            owner = parent;
-        }
-        Some(crate::front::llbc_hints::exception_class_qualname(
+        Some(crate::front::llbc_hints::exception_class_key(
             &hint.enum_path,
             Some(owner),
         ))

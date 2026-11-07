@@ -1162,13 +1162,13 @@ fn exception_sum_predicate() {
             classes,
         } => {
             assert_eq!(enum_path, "synth::E");
-            assert_eq!(base_class, "E");
+            assert_eq!(base_class, "synth::E");
             assert_eq!(
                 classes,
                 &vec![
-                    ("A".to_string(), "EA".to_string()),
-                    ("B".to_string(), "EB".to_string()),
-                    ("C".to_string(), "EC".to_string()),
+                    ("A".to_string(), "synth::E::A".to_string()),
+                    ("B".to_string(), "synth::E::B".to_string()),
+                    ("C".to_string(), "synth::E::C".to_string()),
                 ]
             );
         }
@@ -1351,8 +1351,11 @@ fn exception_sum_caller_links() {
     let specific = &block.exits[1];
     let binding = &block.exits[2];
     let reraise = &block.exits[3];
-    assert_eq!(class_name(&specific.exitcase).as_deref(), Some("EC"));
-    assert_eq!(class_name(&binding.exitcase).as_deref(), Some("E"));
+    assert_eq!(
+        class_name(&specific.exitcase).as_deref(),
+        Some("synth::E::C")
+    );
+    assert_eq!(class_name(&binding.exitcase).as_deref(), Some("synth::E"));
     assert!(specific.llexitcase.is_none() && binding.llexitcase.is_none());
     assert!(specific.last_exception.is_some() && specific.last_exc_value.is_some());
     assert!(binding.last_exception.is_some() && binding.last_exc_value.is_some());
@@ -1372,8 +1375,8 @@ fn exception_sum_caller_links() {
 
     let (ec_at, ec_owner, ec_base) = find_n(&graph, specific.target);
     let (e_at, e_owner, e_base) = find_n(&graph, binding.target);
-    assert_eq!(ec_owner, "EB", "{}", graph.dump());
-    assert_eq!(e_owner, "EA", "{}", graph.dump());
+    assert_eq!(ec_owner, "synth::E::B", "{}", graph.dump());
+    assert_eq!(e_owner, "synth::E::A", "{}", graph.dump());
     assert!(
         exc_value_feeds(&graph, specific, ec_at, &ec_base),
         "EC arm does not bind the caught instance\n{}",
@@ -1520,7 +1523,7 @@ fn exception_sum_handler_reraise_skips_exc_conversion() {
     );
     assert_eq!(
         crate::front::result_exc::raised_value_class_name(&graph, &before[0]).as_deref(),
-        Some("E"),
+        Some("synth::E"),
         "{}\n{}",
         describe_raises(&graph),
         graph.dump()
@@ -1542,7 +1545,7 @@ fn exception_sum_handler_reraise_skips_exc_conversion() {
     );
     assert_eq!(
         crate::front::result_exc::raised_value_class_name(&graph, &after[0]).as_deref(),
-        Some("E"),
+        Some("synth::E"),
         "{}",
         graph.dump()
     );

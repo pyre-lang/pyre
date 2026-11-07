@@ -245,6 +245,13 @@ fn build_semantic_program_via_active_frontend(
             let mut eval_hook_graphs = Vec::new();
             let mut declared_gc = front::mir::DeclaredGcFacts::default();
             let mut raw_alloc_flavor_structs = std::collections::HashSet::new();
+            // `_exception_class_<Enum>` is a program-wide class property.
+            // Each artefact appends its own harvest once, in dependency
+            // order. A repeated `enum_path` panics. `exception_class_hint_ends[i]`
+            // is the end of the prefix artefact `i` may see: earlier crates,
+            // then its own markers. Later crates stay out of that prefix.
+            let mut exception_class_hints: Vec<front::llbc_hints::ExceptionClassHint> = Vec::new();
+            let mut exception_class_hint_ends: Vec<usize> = Vec::new();
             // Root-stack effects, harvested in link order: each artefact is
             // analysed with the effects of the crates it depends on already
             // published, so a call into one of them reads that body's answer.
@@ -264,6 +271,21 @@ fn build_semantic_program_via_active_frontend(
                 let llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
                 llbc.register_rewritten_origportal_fns(rewritten_origportals.iter().cloned());
+                // Seed before any query. `DuplicateLeafFacts::discover`
+                // below reads `llbc_exception_class_hints`.
+                let own_exception_class_hints =
+                    front::llbc_hints::harvest_exception_class_hints_from_llbcs(
+                        std::slice::from_ref(&llbc),
+                    );
+                front::llbc_hints::extend_program_exception_class_hints(
+                    &mut exception_class_hints,
+                    own_exception_class_hints,
+                );
+                front::mir::seed_program_exception_class_hints(
+                    &llbc,
+                    exception_class_hints.clone(),
+                );
+                exception_class_hint_ends.push(exception_class_hints.len());
                 prof.mark(&format!("    harvest {p}"));
                 llbc.register_stack_sensitive_fns(stack_sensitive.iter().cloned());
                 llbc.register_stack_depth_neutral_fns(stack_depth_neutral.iter().cloned());
@@ -363,6 +385,14 @@ fn build_semantic_program_via_active_frontend(
                 llbc.set_exception_carrier(static_addrs.error_carrier.carrier_path);
                 front::mir::mark_foreign_scope_owners(&llbc, &scope_owning_identities);
                 front::mir::apply_published_structs(&mut llbc, &published_structs);
+                // `apply_published_structs` drops `Llbc::derived` through
+                // `type_decls_mut` whenever it has rows to apply. Seed
+                // after that drop and before `collect_*` / lowering. The
+                // slice is this artefact's prefix, not later crates.
+                front::mir::seed_program_exception_class_hints(
+                    &llbc,
+                    exception_class_hints[..exception_class_hint_ends[ord]].to_vec(),
+                );
                 if !eval_hook_graphs.is_empty() {
                     llbc.set_eval_hook_graphs(eval_hook_graphs.clone());
                 }

@@ -4171,7 +4171,7 @@ impl<'a> Lowering<'a> {
                 None => discr_var.clone(),
             };
             let class_name =
-                crate::front::llbc_hints::exception_class_qualname(&info.enum_path, Some(variant));
+                crate::front::llbc_hints::exception_class_key(&info.enum_path, Some(variant));
             let class_var = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
