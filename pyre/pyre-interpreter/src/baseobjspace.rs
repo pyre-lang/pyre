@@ -15288,10 +15288,12 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         // hash to different stripes.
         let _roots = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::pin_roots(&[w_obj, w_newcls, w_oldcls.as_ptr()]);
-        let _stripes = crate::objspace::std::mapdict::lock_instance_stripes(
+        let (w_first, w_second) = crate::objspace::std::mapdict::class_stripe_order(
             pyre_object::gc_roots::shadow_stack_get(base + 2),
             pyre_object::gc_roots::shadow_stack_get(base + 1),
         );
+        let _first_stripe = crate::objspace::std::mapdict::lock_class_stripe(w_first);
+        let _second_stripe = crate::objspace::std::mapdict::lock_class_stripe(w_second);
         if crate::objspace::std::mapdict::has_mapdict_layout(
             pyre_object::gc_roots::shadow_stack_get(base),
         ) {

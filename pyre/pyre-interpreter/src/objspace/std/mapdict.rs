@@ -11,13 +11,12 @@
 //! `_mapdict_setweakref`, etc.
 
 use crate::PyError;
-use parking_lot::ReentrantMutex;
 use pyre_object::PyObjectRef;
 use pyre_object::quasiimmut::{null_mutate_lock, null_mutate_word};
 
 use parking_lot::Mutex;
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
-use std::cell::{Cell, RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -31,95 +30,41 @@ pub use pyre_object::mapdict::{
     terminator_current_allow_unboxing_qmut, terminator_force_allow_unboxing_qmut,
 };
 
-// PyPy serializes mapdict map/storage transitions with the GIL.  Pyre is
-// free-threaded, so use narrow reentrant locks around the same transition
-// boundaries.  The stripe is the instance's class, not its address: a nursery
-// instance moves while the guard is held (`w_list_lock_acquire`).  Attribute
-// state remains on `W_ObjectObject.map/storage`, exactly as upstream.
-struct ForkReentrantLock(UnsafeCell<ReentrantMutex<()>>);
-unsafe impl Sync for ForkReentrantLock {}
+// PyPy serializes mapdict map/storage transitions with the GIL.  The shared
+// `objlock` stripe covers a mutator that has dropped the GIL.  The stripe is
+// the instance's class, not its address: a nursery instance moves while the
+// guard is held (`w_list_lock_acquire`).  Attribute state remains on
+// `W_ObjectObject.map/storage`, exactly as upstream.
+static INSTANCE_LOCKS: pyre_object::objlock::LockFamily = pyre_object::objlock::LockFamily::new();
+static CODE_CACHE_LOCKS: pyre_object::objlock::LockFamily = pyre_object::objlock::LockFamily::new();
 
-impl ForkReentrantLock {
-    fn new() -> Self {
-        Self(UnsafeCell::new(ReentrantMutex::new(())))
-    }
+type MapDictGuard = pyre_object::objlock::ObjectLockGuard;
 
-    fn get(&self) -> &ReentrantMutex<()> {
-        unsafe { &*self.0.get() }
-    }
-
-    unsafe fn reinit_after_fork(&self) {
-        unsafe { self.0.get().write(ReentrantMutex::new(())) };
-    }
-}
-
-static INSTANCE_LOCKS: LazyLock<Vec<ForkReentrantLock>> =
-    LazyLock::new(|| (0..256).map(|_| ForkReentrantLock::new()).collect());
-static CODE_CACHE_LOCKS: LazyLock<Vec<ForkReentrantLock>> =
-    LazyLock::new(|| (0..256).map(|_| ForkReentrantLock::new()).collect());
-
-type MapDictGuard = parking_lot::lock_api::ReentrantMutexGuard<
-    'static,
-    parking_lot::RawMutex,
-    parking_lot::RawThreadId,
-    (),
->;
-
-/// A contended stripe must not be waited on from inside the running-mutator
-/// census: the owner can allocate under the stripe and request a collection,
-/// which then waits for this thread while this thread waits for the stripe.
-/// Leave the census around the blocking acquire, as `w_list_lock` does.
-fn lock_stripe(lock: &'static ReentrantMutex<()>) -> MapDictGuard {
-    if let Some(guard) = lock.try_lock() {
-        return guard;
-    }
-    let blocked = crate::module::thread::before_external_block();
-    let guard = lock.lock();
-    drop(blocked);
-    guard
-}
-
-fn instance_stripe_index(w_class: PyObjectRef) -> usize {
-    (w_class as usize >> 4) & (INSTANCE_LOCKS.len() - 1)
-}
-
-fn lock_instance_stripe(index: usize) -> MapDictGuard {
-    lock_stripe(INSTANCE_LOCKS[index].get())
-}
-
-/// Both class stripes, lower index first, so two transitions cannot deadlock.
-///
-/// One guard when both classes hash to the same stripe. The locks are
-/// reentrant, but a second acquire of the same stripe is not required.
-pub(crate) struct InstanceStripes {
-    _first: MapDictGuard,
-    _second: Option<MapDictGuard>,
-}
-
-/// Residual: the acquire parks in `before_external_block` (`Lock.acquire`).
-/// Stripe indices stay inside this boundary so `INSTANCE_LOCKS` is not a
-/// host path on a looked-inside caller.
 #[majit_macros::dont_look_inside]
-pub(crate) fn lock_instance_stripes(first: PyObjectRef, second: PyObjectRef) -> InstanceStripes {
-    let first = instance_stripe_index(first);
-    let second = instance_stripe_index(second);
-    if first == second {
-        InstanceStripes {
-            _first: lock_instance_stripe(first),
-            _second: None,
-        }
-    } else if first < second {
-        let held = lock_instance_stripe(first);
-        InstanceStripes {
-            _first: held,
-            _second: Some(lock_instance_stripe(second)),
-        }
+fn class_stripe_acquire(w_class: PyObjectRef) -> usize {
+    INSTANCE_LOCKS.acquire(w_class as usize)
+}
+
+pub(crate) fn lock_class_stripe(w_class: PyObjectRef) -> MapDictGuard {
+    let ready = pyre_object::gil_ready::gil_ready_word();
+    let lock = if ready != 0 {
+        class_stripe_acquire(w_class)
     } else {
-        let held = lock_instance_stripe(second);
-        InstanceStripes {
-            _first: held,
-            _second: Some(lock_instance_stripe(first)),
-        }
+        0
+    };
+    unsafe { pyre_object::objlock::ObjectLockGuard::from_word(lock) }
+}
+
+/// Two class stripes are taken lower index first so two `__class__`
+/// transitions cannot deadlock; equal indices take the same reentrant stripe
+/// twice.
+pub(crate) fn class_stripe_order(a: PyObjectRef, b: PyObjectRef) -> (PyObjectRef, PyObjectRef) {
+    if pyre_object::objlock::stripe_index(a as usize)
+        <= pyre_object::objlock::stripe_index(b as usize)
+    {
+        (a, b)
+    } else {
+        (b, a)
     }
 }
 
@@ -135,12 +80,19 @@ fn instance_lock(obj: PyObjectRef) -> (MapDictGuard, PyObjectRef) {
     // minor-collect before this thread resumes, so pin the receiver across that
     // wait and return the forwarded word. Callers dereference that word
     // (`ensure_mapdict_initialized`, `node_write`) with no bracket of their own.
+    // A single-threaded process takes no stripe and nothing can move the receiver here.
+    if pyre_object::gil_ready::gil_ready_word() == 0 {
+        return (
+            unsafe { pyre_object::objlock::ObjectLockGuard::from_word(0) },
+            obj,
+        );
+    }
     let _roots = pyre_object::gc_roots::push_roots();
     let slot = pyre_object::gc_roots::shadow_stack_len();
     let mut obj = pyre_object::gc_roots::pin_root(obj);
     loop {
         let w_class = unsafe { instance_getclass(obj) };
-        let guard = lock_instance_stripe(instance_stripe_index(w_class));
+        let guard = lock_class_stripe(w_class);
         obj = pyre_object::gc_roots::shadow_stack_get(slot);
         if unsafe { instance_getclass(obj) } == w_class {
             return (guard, obj);
@@ -159,16 +111,15 @@ unsafe fn ensure_initialized_pair(
 }
 
 fn code_cache_lock(code: PyObjectRef) -> MapDictGuard {
-    lock_stripe(CODE_CACHE_LOCKS[(code as usize >> 4) & (CODE_CACHE_LOCKS.len() - 1)].get())
+    // All callers are opaque.
+    unsafe {
+        pyre_object::objlock::ObjectLockGuard::from_word(CODE_CACHE_LOCKS.acquire(code as usize))
+    }
 }
 
 pub fn after_fork_child() {
-    for lock in INSTANCE_LOCKS.iter() {
-        unsafe { lock.reinit_after_fork() };
-    }
-    for lock in CODE_CACHE_LOCKS.iter() {
-        unsafe { lock.reinit_after_fork() };
-    }
+    INSTANCE_LOCKS.after_fork_child();
+    CODE_CACHE_LOCKS.after_fork_child();
 }
 
 // ── attribute shapes (mapdict.py:32-42, 720-732) ──────────────────────

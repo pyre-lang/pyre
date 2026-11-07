@@ -9,6 +9,14 @@ use std::mem::ManuallyDrop;
 use std::rc::Rc;
 use std::sync::LazyLock;
 
+const STRIPE_COUNT: usize = 256;
+
+/// Pure arithmetic, no static access, so a look-inside caller can compute
+/// stripe order.
+pub const fn stripe_index(key: usize) -> usize {
+    (key >> 4) & (STRIPE_COUNT - 1)
+}
+
 struct ForkLock(UnsafeCell<parking_lot::ReentrantMutex<()>>);
 unsafe impl Sync for ForkLock {}
 
@@ -38,11 +46,11 @@ impl LockFamily {
     }
 
     fn new_stripes() -> Vec<ForkLock> {
-        (0..256).map(|_| ForkLock::new()).collect()
+        (0..STRIPE_COUNT).map(|_| ForkLock::new()).collect()
     }
 
     pub fn stripe_index(&self, key: usize) -> usize {
-        (key >> 4) & (self.stripes.len() - 1)
+        stripe_index(key)
     }
 
     pub fn stripe(&'static self, key: usize) -> &'static parking_lot::ReentrantMutex<()> {
