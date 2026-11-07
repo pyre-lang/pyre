@@ -624,6 +624,26 @@ pub struct DescentBlockerSummary {
     /// the two slots above); the capture-time resume scan does, because
     /// `bhimpl_abort` cannot finish a helper section.
     pub has_reachable_abort: bool,
+    /// Whether a `*_return` opcode is reachable from this body's entry,
+    /// including through `inline_call_*` callees.
+    pub has_reachable_return: bool,
+}
+
+impl DescentBlockerSummary {
+    /// Lattice join of two summaries (`graphanalyze.py` `join_two_results`).
+    ///
+    /// Bools OR; each `Option` keeps any `Some` (`self.or(other)`).
+    pub fn join(self, other: Self) -> Self {
+        Self {
+            may_execute_effect: self.may_execute_effect || other.may_execute_effect,
+            blocker_effect_free: self.blocker_effect_free.or(other.blocker_effect_free),
+            blocker_after_effect: self.blocker_after_effect.or(other.blocker_after_effect),
+            body_not_walked: self.body_not_walked || other.body_not_walked,
+            first_effect_pc: self.first_effect_pc.or(other.first_effect_pc),
+            has_reachable_abort: self.has_reachable_abort || other.has_reachable_abort,
+            has_reachable_return: self.has_reachable_return || other.has_reachable_return,
+        }
+    }
 }
 
 /// Answers computed on demand from an assembled [`JitCode`] body.

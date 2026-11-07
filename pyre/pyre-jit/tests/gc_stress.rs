@@ -1095,6 +1095,8 @@ def run():
     ba.extend(b"-grown")
     assert slot_ba.__dict__ == {"z": 17}
     assert slot_ba.x == bytearray(b"slot-value")
+    assert slot_ba == bytearray(b"slot-owner")
+    slot_ba.extend(b"-grown")
 
     total = 0
     i = 0
@@ -1106,10 +1108,11 @@ def run():
         total = total + len(pieces[i]) + pieces[i][0]
         i = i + 1
     total = total + len(ba) + ba[0]
+    total = total + len(slot_ba) + slot_ba[0]
     return total
 
 result = run()
-assert result == 2325, result
+assert result == 2456, result
 "#;
     run_on_worker(
         PROGRAM,

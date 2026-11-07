@@ -3840,17 +3840,25 @@ fn declared_return_annotation(
     if token != Some("ref") && !(token == Some(GCREF_RETURN_TYPE) && registered_gc_ptr_return) {
         return None;
     }
+    let bk = registry.bookkeeper();
+    // A by-value Raw ADT is Ptr of that struct (`history.getkind`),
+    // the same shell FieldRead and a `raw:<owner>` token already use.
+    // Before `return_container_root` so a wrapper whose field projection
+    // is SomeString still returns SomePtr. SomeInstance here made
+    // mergeinputargs raise Instance(X) ∪ Ptr(X) (`llannotation.py`
+    // pairtype(SomePtr, SomeObject).union).
+    if let Some(root) = graph.return_class_root.as_deref()
+        && let Some(cell) = bk.raw_struct_ptr_annotation(root)
+    {
+        return Some(cell);
+    }
     if let Some(spelling) = graph.return_container_root.as_deref() {
-        let projected = registry.bookkeeper().project_struct_field_type(spelling);
+        let projected = bk.project_struct_field_type(spelling);
         if !matches!(projected, crate::annotator::model::SomeValue::Impossible) {
             return Some(projected);
         }
     }
     let root = graph.return_class_root.as_deref()?;
-    if crate::annotator::bookkeeper::is_gcref_type_spelling(root) {
-        return None;
-    }
-    let bk = registry.bookkeeper();
     // `llmemory.py` `GCREF`; `lltype.GcOpaqueType` has no ClassDef.
     if crate::annotator::bookkeeper::is_gcref_type_spelling(root) {
         return Some(crate::annotator::bookkeeper::gcref_ptr_annotation());
@@ -3877,13 +3885,6 @@ fn declared_return_annotation(
         } else {
             s
         });
-    }
-    // A by-value Raw ADT is Ptr of that struct (`history.getkind`),
-    // the same shell FieldRead and a `raw:<owner>` token already use.
-    // SomeInstance here made mergeinputargs raise Instance(X) ∪ Ptr(X)
-    // (`llannotation.py` pairtype(SomePtr, SomeObject).union).
-    if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
-        return Some(cell);
     }
     let classdef = bk
         .getuniqueclassdef(&bk.intern_class_by_qualname(root))
@@ -7870,13 +7871,19 @@ fn reconcile_elided_phi_inputargs(
 /// `rclass.py getinstancerepr(rtyper, classdef)` `lowleveltype` for a
 /// named `Ref(Some(name))`.
 ///
-/// `name` is resolved through `Bookkeeper::project_struct_field_type`
-/// so an alias (`PyObjectRef`, `*mut PyObject`, `NonNull<PyObject>`,
-/// `IdentityKey`) becomes the same `SomeInstance(classdef)` the
-/// struct-field projector already uses. A registered classdef is
-/// `getinstancerepr`; `Impossible` / a classdef-less instance is
-/// `llmemory.GCREF`, never `OBJECTPTR`. `getuniqueclassdef_for_struct_root`
-/// is not called on an unknown name (that would mint a shell).
+/// A `StructFieldRegistry` key uses `getuniqueclassdef_for_struct_root`
+/// (the same lookup `derive_subject_inputcells` uses for an Input class
+/// root) so pass-2 `project_struct_rows` completes attrs before
+/// `InstanceRepr.setup`. A harvest leaf whose `canonical_struct_name` is
+/// also a registry key intern's that host — `ensure_session` already
+/// projected it; intern of the leaf would mint a FORCE-only ClassDef
+/// whose pass-2 is skipped. An unregistered alias (`PyObjectRef`,
+/// `*mut PyObject`, `NonNull<PyObject>`, `IdentityKey`) is resolved
+/// through `Bookkeeper::project_struct_field_type`. A registered
+/// classdef is `getinstancerepr`; `Impossible` / a classdef-less
+/// instance is `llmemory.GCREF`, never `OBJECTPTR`.
+/// `getuniqueclassdef_for_struct_root` is not called on an unknown name
+/// (that would mint a shell).
 fn lltype_for_named_ref(
     rtyper: Option<&Rc<crate::translator::rtyper::rtyper::RPythonTyper>>,
     name: &str,
@@ -7891,6 +7898,46 @@ fn lltype_for_named_ref(
     let Some(ann) = rtyper.annotator.upgrade() else {
         return GCREF.clone();
     };
+    if let Some(lltype) = ann.bookkeeper.gc_struct_ptr_lltype(name) {
+        return lltype;
+    }
+    // rtyper.py setconcretetype / bindingrepr reads the ClassDef after
+    // its attrs are complete; same lookup as derive_subject_inputcells.
+    // A harvest leaf intern joins that host via canonical_struct_name.
+    let intern_root = ann
+        .bookkeeper
+        .struct_fields
+        .borrow()
+        .as_ref()
+        .and_then(|reg| {
+            if !reg.fields.contains_key(name) {
+                return None;
+            }
+            let canonical = majit_ir::descr::canonical_struct_name(name);
+            if canonical.as_str() != name && reg.fields.contains_key(canonical.as_str()) {
+                Some(canonical)
+            } else {
+                Some(name.to_string())
+            }
+        });
+    if let Some(intern_root) = intern_root {
+        match ann
+            .bookkeeper
+            .getuniqueclassdef_for_struct_root(&intern_root)
+        {
+            Ok(classdef) => {
+                let repr =
+                    getinstancerepr(rtyper, Some(&classdef), Flavor::Gc).unwrap_or_else(|e| {
+                        panic!("lltype_for_named_ref: getinstancerepr({name}): {e}")
+                    });
+                Repr::setup(repr.as_ref()).unwrap_or_else(|e| {
+                    panic!("lltype_for_named_ref: InstanceRepr.setup({name}): {e}")
+                });
+                return repr.lowleveltype().clone();
+            }
+            Err(_) => return GCREF.clone(),
+        }
+    }
     let SomeValue::Instance(inst) = ann.bookkeeper.project_struct_field_type(name) else {
         return GCREF.clone();
     };
@@ -8039,14 +8086,17 @@ fn backfill_untyped_call_results(
     }
 }
 
-/// Call / `same_as` dest whose front-end `result_ty` names a registered
+/// Call / `same_as` / `Input` dest whose front-end name is a registered
 /// GC struct. Skip's `resolve_types` commits `GcRef` as
 /// `rclass.OBJECTPTR` (`concrete_to_canonical_lltype`); that is
 /// `getinstancerepr(None)`. `rtyper.py` `setconcretetype` uses
 /// `bindingrepr(v).lowleveltype`, and a named `SomeInstance` is
-/// `rclass.py` `getinstancerepr(classdef)`. The name is the Call dest's
-/// declared pointee, the same producer [`backfill_untyped_call_results`]
-/// reads when the dest is untyped.
+/// `rclass.py` `getinstancerepr(classdef)`. An items-block name is
+/// `getrepr` of that layout `Ptr`. The name is the dest's declared
+/// pointee, the same producer [`backfill_untyped_call_results`] reads
+/// when the dest is untyped. Later-block inputargs are a different
+/// Variable (`defining_op` is None); copy the dest lltype along links
+/// so `_convert_link` identity is the same lowleveltype.
 pub(crate) fn stamp_named_ref_call_dests(
     graph: &LegacyGraph,
     rtyper: &Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
@@ -8071,6 +8121,14 @@ pub(crate) fn stamp_named_ref_call_dests(
                 result_ty: ValueType::Ref(Some(name)),
                 ..
             } if op == "same_as" && !name.is_empty() => Some(name.as_str()),
+            OpKind::Input { ty, class_root, .. } => {
+                let from_root = class_root.as_deref().filter(|s| !s.is_empty());
+                let from_ty = match ty {
+                    ValueType::Ref(Some(name)) if !name.is_empty() => Some(name.as_str()),
+                    _ => None,
+                };
+                from_root.or(from_ty)
+            }
             _ => None,
         }
     }
@@ -8092,6 +8150,52 @@ pub(crate) fn stamp_named_ref_call_dests(
                 continue;
             }
             dest.set_concretetype(Some(lltype));
+        }
+    }
+    propagate_named_ref_lltypes_along_links(graph);
+}
+
+/// Skip `convert_link` copies kind only (`maybe_seed_concrete_type` →
+/// `OBJECTPTR` for `GcRef`). After a named dest has the rtyper-precise
+/// `LowLevelType`, identity-copy it onto a later-block inputarg that
+/// still holds that generic skip type. `rtyper.py` `_convert_link`
+/// `convert_from_to` writes the dest repr's `lowleveltype`.
+fn propagate_named_ref_lltypes_along_links(graph: &LegacyGraph) {
+    use crate::model::{LinkArg, getkind};
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+    loop {
+        let mut changed = false;
+        for bi in 0..graph.blocks.len() {
+            for ei in 0..graph.blocks[bi].exits.len() {
+                let target = graph.blocks[bi].exits[ei].target;
+                let n = graph.blocks[bi].exits[ei]
+                    .args
+                    .len()
+                    .min(graph.blocks[target.0].inputargs.len());
+                for i in 0..n {
+                    let LinkArg::Value(src) = &graph.blocks[bi].exits[ei].args[i] else {
+                        continue;
+                    };
+                    let Some(src_ct) = src.concretetype() else {
+                        continue;
+                    };
+                    if src_ct == *OBJECTPTR || getkind(&src_ct) != ConcreteType::GcRef {
+                        continue;
+                    }
+                    let dst = &graph.blocks[target.0].inputargs[i];
+                    let dest_is_generic = match dst.concretetype() {
+                        None => true,
+                        Some(d) => d == *OBJECTPTR,
+                    };
+                    if dest_is_generic {
+                        dst.set_concretetype(Some(src_ct));
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
         }
     }
 }
@@ -13965,6 +14069,294 @@ mod tests {
     }
 
     #[test]
+    fn stamp_named_ref_call_dests_projects_registry_key_before_setup() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::model::SomeValue;
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::legacy_annotator::annotate;
+        use crate::translator::rtyper::legacy_resolve::resolve_types;
+        use crate::translator::rtyper::rclass::{Flavor, OBJECTPTR, getinstancerepr};
+        use crate::translator::rtyper::rmodel::Repr;
+
+        // Two qualified keys share the leaf, so `struct_root_names` skips
+        // the leaf alias (`is_bare_leaf_alias`) and `ensure_session` does
+        // not pre-mint it. Origin-registry canonical of the leaf is `a`,
+        // so pass-2 of a later leaf intern is skipped (`projected_struct_rows`
+        // already holds that canonical). Stamp must intern the canonical
+        // host, the ClassDef `derive_subject_inputcells` would read after
+        // `getuniqueclassdef_for_struct_root` of a completed attr set.
+        let leaf = "StampNamedRefHost";
+        let a = "stamp_a::StampNamedRefHost";
+        let b = "stamp_b::StampNamedRefHost";
+        let _origins = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::from([(leaf.to_string(), "stamp_a".to_string())]),
+        );
+        crate::annotator::classdesc::register_struct_fields(
+            leaf,
+            &[("cells".to_string(), ValueType::Ref(None))],
+        );
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = StructFieldRegistry::default();
+        let rows = vec![("cells".to_string(), "Box<[String]>".to_string())];
+        fields.fields.insert(a.to_string(), rows.clone());
+        fields.fields.insert(b.to_string(), rows.clone());
+        fields.fields.insert(leaf.to_string(), rows);
+        bk.set_struct_fields(Rc::new(fields));
+        let registry = CallRegistry::new(bk.clone());
+        let (_, rtyper) = registry.ensure_session().expect("session");
+        assert!(
+            !bk.struct_root_names().iter().any(|n| n == leaf),
+            "leaf alias of two declarations is not pre-minted"
+        );
+
+        let mut graph = LegacyGraph::new("stamp_named_ref_registry_key");
+        let dest = graph
+            .push_op_var(
+                graph.startblock,
+                crate::model::OpKind::Input {
+                    name: "host".into(),
+                    ty: ValueType::Ref(Some(leaf.into())),
+                    class_root: Some(leaf.into()),
+                },
+                true,
+            )
+            .unwrap();
+        annotate(&graph);
+        resolve_types(&graph, &std::collections::HashSet::new());
+        assert_eq!(
+            dest.concretetype(),
+            Some(OBJECTPTR.clone()),
+            "Skip commits named Ref Input as OBJECTPTR"
+        );
+        stamp_named_ref_call_dests(&graph, &rtyper);
+
+        let intern_root = majit_ir::descr::canonical_struct_name(leaf);
+        let host = bk.intern_class_by_qualname(&intern_root);
+        let classdef = bk
+            .getuniqueclassdef(&host)
+            .expect("canonical host interned by stamp");
+        {
+            let g = classdef.borrow();
+            let cells = g.attrs.get("cells").expect("cells attr projected");
+            assert!(
+                matches!(cells.s_value, SomeValue::List(_)),
+                "registry-key stamp must project FORCE Ref shells to SomeList, got {:?}",
+                cells.s_value
+            );
+        }
+        let expected =
+            getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(expected.as_ref()).expect("setup");
+        assert_eq!(
+            dest.concretetype(),
+            Some(expected.lowleveltype().clone()),
+            "named Ref Input of a registry key is getinstancerepr of the projected ClassDef"
+        );
+    }
+
+    #[test]
+    fn stamp_named_ref_call_dests_paints_items_block_input_as_layout_ptr() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::legacy_annotator::annotate;
+        use crate::translator::rtyper::legacy_resolve::resolve_types;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+
+        let owner = "TypedItemsBlock";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![
+                ("capacity".to_string(), "usize".to_string()),
+                ("items".to_string(), "[u64; 0]".to_string()),
+            ],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Gc,
+                repr_transparent: false,
+                fields: vec![
+                    crate::call::StructFieldLayout {
+                        name: "capacity".into(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    crate::call::StructFieldLayout {
+                        name: "items".into(),
+                        offset: 8,
+                        size: 0,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+        let registry = CallRegistry::new(bk.clone());
+        let (_, rtyper) = registry.ensure_session().expect("session");
+
+        let mut graph = LegacyGraph::new("dealloc_typed_items_block");
+        let block = graph
+            .push_op_var(
+                graph.startblock,
+                crate::model::OpKind::Input {
+                    name: "block".into(),
+                    ty: ValueType::Ref(Some("TypedItemsBlock".into())),
+                    class_root: Some("TypedItemsBlock".into()),
+                },
+                true,
+            )
+            .unwrap();
+        annotate(&graph);
+        resolve_types(&graph, &std::collections::HashSet::new());
+        assert_eq!(
+            block.concretetype(),
+            Some(OBJECTPTR.clone()),
+            "Skip commits named Ref Input as OBJECTPTR"
+        );
+        stamp_named_ref_call_dests(&graph, &rtyper);
+        let ct = block.concretetype().expect("layout Ptr");
+        assert_ne!(ct, *OBJECTPTR, "items-block Input is not OBJECTPTR");
+        let crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(ptr) = ct else {
+            panic!("items-block Input must be a Ptr, got {ct:?}");
+        };
+        let PtrTarget::Struct(st) = &ptr.TO else {
+            panic!("items-block Input must point at a Struct");
+        };
+        assert_eq!(st._name, "TypedItemsBlock");
+        assert_eq!(st._gckind, GcKind::Gc);
+    }
+
+    #[test]
+    fn stamp_named_ref_call_dests_paints_items_block_later_phi_as_layout_ptr() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::front::StructFieldRegistry;
+        use crate::model::{Link, LinkArg};
+        use crate::translator::rtyper::legacy_annotator::annotate;
+        use crate::translator::rtyper::legacy_resolve::resolve_types;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+
+        let owner = "TypedItemsBlock";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![
+                ("capacity".to_string(), "usize".to_string()),
+                ("items".to_string(), "[u64; 0]".to_string()),
+            ],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Gc,
+                repr_transparent: false,
+                fields: vec![
+                    crate::call::StructFieldLayout {
+                        name: "capacity".into(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    crate::call::StructFieldLayout {
+                        name: "items".into(),
+                        offset: 8,
+                        size: 0,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+        let registry = CallRegistry::new(bk.clone());
+        let (_, rtyper) = registry.ensure_session().expect("session");
+
+        let mut graph = LegacyGraph::new("dealloc_typed_items_block");
+        let block = graph
+            .push_op_var(
+                graph.startblock,
+                crate::model::OpKind::Input {
+                    name: "block".into(),
+                    ty: ValueType::Ref(Some("TypedItemsBlock".into())),
+                    class_root: Some("TypedItemsBlock".into()),
+                },
+                true,
+            )
+            .unwrap();
+        let (later, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        graph.blocks[graph.startblock.0].exits.push(Link::new_mixed(
+            vec![LinkArg::Value(block.clone())],
+            later,
+            None,
+        ));
+        annotate(&graph);
+        resolve_types(&graph, &std::collections::HashSet::new());
+        assert_eq!(
+            block.concretetype(),
+            Some(OBJECTPTR.clone()),
+            "Skip commits named Ref Input as OBJECTPTR"
+        );
+        assert_eq!(
+            phi.concretetype(),
+            Some(OBJECTPTR.clone()),
+            "Skip convert_link copies GcRef as OBJECTPTR onto a later-block phi"
+        );
+        stamp_named_ref_call_dests(&graph, &rtyper);
+        let ct = phi.concretetype().expect("layout Ptr");
+        assert_ne!(
+            ct, *OBJECTPTR,
+            "items-block later-block phi is not OBJECTPTR"
+        );
+        let crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(ptr) = ct else {
+            panic!("items-block later-block phi must be a Ptr, got {ct:?}");
+        };
+        let PtrTarget::Struct(st) = &ptr.TO else {
+            panic!("items-block later-block phi must point at a Struct");
+        };
+        assert_eq!(st._name, "TypedItemsBlock");
+        assert_eq!(st._gckind, GcKind::Gc);
+    }
+
+    #[test]
     fn lowleveltype_to_concrete_signed_family_collapses_to_signed() {
         for ll in [
             LowLevelType::Signed,
@@ -16245,6 +16637,7 @@ mod tests {
             size,
             align: 8,
             gckind: GcKind::Raw,
+            repr_transparent: false,
             fields: vec![crate::call::StructFieldLayout {
                 name: name.into(),
                 offset,
@@ -16504,6 +16897,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![crate::call::StructFieldLayout {
                     name: "x".into(),
                     offset: 0,
@@ -18099,6 +18493,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![crate::call::StructFieldLayout {
                     name: "save_point".into(),
                     offset: 0,

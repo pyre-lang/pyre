@@ -1089,9 +1089,25 @@ fn real_main() {
                 // `GcHeader`, so fields such as `instantiate` must not acquire
                 // a GC-managed parent descr merely because the pointer travels
                 // through the Ref bank.
-                struct_storage: vec![majit_translate::StructStorageDescriptor::raw(
-                    "pyobject::PyType",
-                )],
+                //
+                // `SetStrategyRef` / `DictStrategyRef` are the same shape as
+                // `space.fromcache` strategy singletons: the dict/set slot is
+                // one pointer, and the holder lives in `.data` with no type-id
+                // word at `ref - 8`. `StructPtrInfo.make_guards` would emit
+                // `GUARD_GC_TYPE` for a GC SizeDescr (`info.py`), and that
+                // guard always fails on the static. Headerless rather than
+                // raw: `owner: GCREF` would make `getfield_raw_r` a refused
+                // rewrite (`jtransform.py rewrite_op_getfield`), so getfield
+                // stays GC while the layout guard is only `GUARD_NONNULL`.
+                struct_storage: vec![
+                    majit_translate::StructStorageDescriptor::raw("pyobject::PyType"),
+                    majit_translate::StructStorageDescriptor::headerless(
+                        "setobject::SetStrategyRef",
+                    ),
+                    majit_translate::StructStorageDescriptor::headerless(
+                        "dictmultiobject::DictStrategyRef",
+                    ),
+                ],
                 ..Default::default()
             },
             // The bodies behind the opcode residuals the walker descends
@@ -1188,9 +1204,18 @@ fn real_main() {
                     "w_range_iter_step_one_next",
                 ]),
                 // BINARY_SUBSCR residualises `getitem`, so the portal may
-                // not reach `getitem_list`'s look-inside call of
-                // `w_list_getitem_inner`. The walker descends that body by
-                // name (`list_getitem_jitcode`).
+                // not reach `getitem_list`. The walker descends that body
+                // (`getitem_list_jitcode`) so a guard inside the inner
+                // helper still resumes through getitem_list's match
+                // (`resume.py rebuild_from_resumedata`).
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "baseobjspace",
+                    "getitem_list",
+                ]),
+                // `w_list_getitem_inner` is the look-inside callee of
+                // getitem_list while `gil_ready == 0`. Seed it because
+                // BINARY_SUBSCR residualises getitem.
                 majit_translate::CallPath::from_segments([
                     "pyre_object",
                     "listobject",
@@ -1745,6 +1770,16 @@ fn real_main() {
             }
         }
         let frozen_lookups: Vec<_> = leftover_set.into_iter().collect();
+        for member in &frozen_lookups {
+            if let majit_ir::effectinfo::DescrSetMember::Array { array_id: 0 } = member {
+                panic!(
+                    "EffectInfo leftover Array(0): a dest ARRAY was recorded \
+                     without array_identity_hash; prepass add_descr skips \
+                     type_id == 0, so the member would freeze as \
+                     AbsentContainer"
+                );
+            }
+        }
         let mint_count = frozen_mints.len();
         for (i, member) in frozen_lookups.iter().enumerate() {
             member_index.insert(

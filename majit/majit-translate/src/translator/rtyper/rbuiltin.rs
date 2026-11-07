@@ -4897,9 +4897,7 @@ pub fn rtype_cast_ptr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
 /// `unsimplify::split_block` Void-variable recreation
 /// (unsimplify.rs) and the post-rtyper backendopt pipeline
 /// (constfold / removenoops / storesink / inline) also generate
-/// `same_as`.  Body parity verbatim: lift the operand's repr,
-/// inputargs through that repr, emit the low-level `same_as` with
-/// the same lltype.
+/// `same_as`.  Lift the operand's repr, inputargs through that repr.
 pub fn rtype_same_as(hop: &HighLevelOp) -> RTypeResult {
     use crate::translator::rtyper::rtyper::GenopResult;
 

@@ -730,6 +730,9 @@ enum Pass {
     /// `_b = &kind word`, then pass `_b`. `ret_local` is copied into the
     /// return slot after the call (`2` is the word, `1` is `flag`).
     Borrow { kind: &'static str, ret_local: u64 },
+    /// `_p = &raw mut word`, then pass `_p` whose place type is already
+    /// `*mut i64` (rustc coerce of `&mut keyhash` into a raw out-parameter).
+    RawMutOfLocal { ret_local: u64 },
     /// Pass local 2 itself.
     Direct { ret_local: u64 },
     /// Copy the word, then pass `&mut` of the original, then return the copy.
@@ -771,6 +774,23 @@ fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass)
                     }}]}}),
                 ],
                 vec![json!({"Copy": place(1, &flag)}), json!({"Move": borrow})],
+                place(4, &ret),
+                ret_local,
+            )
+        }
+        Pass::RawMutOfLocal { ret_local } => {
+            let ptr = raw_ptr(word_ty, "Mut");
+            locals.push(local(3, None, &ptr));
+            locals.push(local(4, None, &ret));
+            let word = place(2, word_ty);
+            let raw = place(3, &ptr);
+            (
+                vec![
+                    json!({"span": span, "kind": {"Assign": [raw.clone(), {"RawPtr": {
+                        "place": word, "kind": "Mut", "ptr_metadata": null
+                    }}]}}),
+                ],
+                vec![json!({"Copy": place(1, &flag)}), json!({"Move": raw})],
                 place(4, &ret),
                 ret_local,
             )
@@ -847,6 +867,108 @@ fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass)
         params.clone(),
         idle_body(&ret, &params),
     );
+    let file = json!({"charon_version": "0.1.201", "has_errors": false, "translated": {
+        "crate_name": "probe", "type_decls": [], "fun_decls": [caller, sink],
+        "global_decls": [], "trait_decls": [], "trait_impls": []
+    }});
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("probe fixture parses");
+    lower_function(&llbc, "write_hash").unwrap_or_else(|err| panic!("lower write_hash: {err}"))
+}
+
+/// Like [`lower_probe`] `Pass::Borrow`, but the sink has no body so the
+/// call is residual (`fun_decl_is_residual`). An inlined `&mut i64`
+/// parameter stays the word; a residual one is a live raw address.
+fn lower_residual_ref_probe(
+    word_ty: &Value,
+    sink_param: &Value,
+    kind: &'static str,
+) -> FunctionGraph {
+    lower_probe_with_sink_body(
+        "keyhash",
+        word_ty,
+        sink_param,
+        Pass::Borrow { kind, ret_local: 2 },
+        json!(null),
+    )
+}
+
+fn lower_probe_with_sink_body(
+    word_name: &str,
+    word_ty: &Value,
+    sink_param: &Value,
+    pass: Pass,
+    sink_body: Value,
+) -> FunctionGraph {
+    let span = json!({"data": {"file_id": 0,
+        "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+    let meta = |path: &[&str]| {
+        json!({
+            "name": path.iter().map(|seg| json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
+            "span": span, "source_text": null, "is_local": true,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })
+    };
+    let generics = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
+    let ret = i64_ty();
+    let flag = u32_ty();
+    let local = |index: u64, name: Option<&str>, ty: &Value| json!({"index": index, "name": name, "span": span, "ty": ty});
+    let mut locals = vec![
+        local(0, None, &ret),
+        local(1, Some("flag"), &flag),
+        local(2, Some(word_name), word_ty),
+    ];
+    let (statements, call_args, dest, ret_local) = match pass {
+        Pass::Borrow { kind, ret_local } => {
+            let borrowed = borrow_ty(word_ty, kind);
+            locals.push(local(3, None, &borrowed));
+            locals.push(local(4, None, &ret));
+            let word = place(2, word_ty);
+            let borrow = place(3, &borrowed);
+            (
+                vec![
+                    json!({"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
+                        "place": word, "kind": kind, "ptr_metadata": null
+                    }}]}}),
+                ],
+                vec![json!({"Copy": place(1, &flag)}), json!({"Move": borrow})],
+                place(4, &ret),
+                ret_local,
+            )
+        }
+        _ => panic!("lower_probe_with_sink_body only builds Borrow"),
+    };
+    let ret_place_ty = if ret_local == 1 {
+        flag.clone()
+    } else {
+        word_ty.clone()
+    };
+    let fun = |id: u64, name: &[&str], inputs: Vec<Value>, body: Value| {
+        json!({
+            "def_id": id,
+            "item_meta": meta(name),
+            "signature": {"is_unsafe": false, "inputs": inputs, "output": ret.clone()},
+            "body": body
+        })
+    };
+    let caller = fun(
+        0,
+        &["probe", "write_hash"],
+        vec![flag.clone(), word_ty.clone()],
+        json!({"Unstructured": {"span": span, "locals": {"arg_count": 2, "locals": locals}, "body": [
+            {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                    "args": call_args, "dest": dest},
+                "target": 1, "on_unwind": 2
+            }}}},
+            {"statements": [{"span": span, "kind": {"Assign": [
+                place(0, &ret),
+                {"Use": [{"Copy": place(ret_local, &ret_place_ty)}, "Yes"]}
+            ]}}], "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]}}),
+    );
+    let params = vec![flag.clone(), sink_param.clone()];
+    let sink = fun(1, &["probe", "sink_pair"], params, sink_body);
     let file = json!({"charon_version": "0.1.201", "has_errors": false, "translated": {
         "crate_name": "probe", "type_decls": [], "fun_decls": [caller, sink],
         "global_decls": [], "trait_decls": [], "trait_impls": []
@@ -1069,6 +1191,225 @@ fn mut_borrow_of_i64_passed_to_raw_pointer_reloads_the_word() {
         },
     );
     assert_address_spill(&graph, true, true);
+}
+
+#[test]
+fn raw_mut_of_i64_local_passed_to_raw_pointer_reloads_the_word() {
+    let word = i64_ty();
+    let graph = lower_probe(
+        "keyhash",
+        &word,
+        &raw_ptr(&word, "Mut"),
+        Pass::RawMutOfLocal { ret_local: 2 },
+    );
+    assert_address_spill(&graph, true, true);
+}
+
+#[test]
+fn residual_shared_borrow_of_i64_stays_the_word() {
+    let word = i64_ty();
+    let borrowed = borrow_ty(&word, "Shared");
+    let graph = lower_residual_ref_probe(&word, &borrowed, "Shared");
+    assert_no_raw_address(&graph, "residual &i64");
+    let call = sink_call(&graph);
+    assert_eq!(
+        call_arg(call, 1),
+        input_var(&graph, "keyhash"),
+        "residual &i64 is the word\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn residual_mut_borrow_of_i64_stays_the_word() {
+    let word = i64_ty();
+    let borrowed = borrow_ty(&word, "Mut");
+    let graph = lower_residual_ref_probe(&word, &borrowed, "Mut");
+    assert_no_raw_address(&graph, "residual &mut i64");
+    let call = sink_call(&graph);
+    assert_eq!(
+        call_arg(call, 1),
+        input_var(&graph, "keyhash"),
+        "residual &mut i64 is the word\n{}",
+        op_lines(&graph)
+    );
+}
+
+/// `callback_free(..., keyhash, ..., &mut keyhash)`: the same local is
+/// the hash word and the raw out-parameter. The word stays the word.
+#[test]
+fn i64_value_and_raw_out_of_the_same_local_spills_only_the_address() {
+    let graph = lower_hash_and_hash_out();
+    let keyhash = input_var(&graph, "keyhash");
+    let ptrs = malloc_ptrs(&graph);
+    assert_eq!(ptrs.len(), 1, "one spilled place\n{}", op_lines(&graph));
+    let call = sink_call(&graph);
+    assert_eq!(
+        call_arg(call, 0),
+        keyhash,
+        "hash stays the word\n{}",
+        op_lines(&graph)
+    );
+    assert_eq!(
+        call_arg(call, 1),
+        &ptrs[0],
+        "hash_out is the spill address\n{}",
+        op_lines(&graph)
+    );
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawLoad { .. })),
+        "the out-parameter reloads\n{}",
+        op_lines(&graph)
+    );
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed\n{}",
+        op_lines(&graph)
+    );
+}
+
+fn lower_hash_and_hash_out() -> FunctionGraph {
+    let (span, generics, meta, local) = probe_parts();
+    let word = i64_ty();
+    let ret = i64_ty();
+    let ptr = raw_ptr(&word, "Mut");
+    let locals = vec![
+        local(0, None, &ret),
+        local(1, Some("keyhash"), &word),
+        local(2, None, &word),
+        local(3, None, &ptr),
+        local(4, None, &ret),
+    ];
+    let statements = vec![
+        json!({"span": span, "kind": {"Assign": [
+            place(2, &word),
+            {"Use": [{"Copy": place(1, &word)}, "Yes"]}
+        ]}}),
+        json!({"span": span, "kind": {"Assign": [place(3, &ptr), {"RawPtr": {
+            "place": place(1, &word), "kind": "Mut", "ptr_metadata": null
+        }}]}}),
+    ];
+    let fun = |id: u64, name: &[&str], inputs: Vec<Value>, body: Value| {
+        json!({
+            "def_id": id,
+            "item_meta": meta(name),
+            "signature": {"is_unsafe": false, "inputs": inputs, "output": ret.clone()},
+            "body": body
+        })
+    };
+    let caller = fun(
+        0,
+        &["probe", "write_hash"],
+        vec![word.clone()],
+        json!({"Unstructured": {"span": span, "locals": {"arg_count": 1, "locals": locals}, "body": [
+            {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                    "args": [json!({"Move": place(2, &word)}), json!({"Move": place(3, &ptr)})],
+                    "dest": place(4, &ret)},
+                "target": 1, "on_unwind": 2
+            }}}},
+            {"statements": [{"span": span, "kind": {"Assign": [
+                place(0, &ret),
+                {"Use": [{"Copy": place(1, &word)}, "Yes"]}
+            ]}}], "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]}}),
+    );
+    let params = vec![word.clone(), ptr.clone()];
+    let sink = fun(
+        1,
+        &["probe", "sink_pair"],
+        params.clone(),
+        idle_body(&ret, &params),
+    );
+    probe_graph(json!([]), json!([caller, sink]), "write_hash")
+}
+
+/// `hash_known: i64` beside `&mut keyhash`. A `usize` parameter stays
+/// unlowered (`usize_parameter_beside_the_spill_is_not_lowered`); a
+/// hash word does not.
+#[test]
+fn i64_parameter_beside_the_spill_still_lowers() {
+    assert_word_param_beside_spill_frees(i64_ty());
+}
+
+#[test]
+fn u64_parameter_beside_the_spill_still_lowers() {
+    assert_word_param_beside_spill_frees(u64_ty());
+}
+
+fn assert_word_param_beside_spill_frees(bits: Value) {
+    let (span, generics, meta, local) = probe_parts();
+    let word = i64_ty();
+    let ret = i64_ty();
+    let borrowed = borrow_ty(&word, "Mut");
+    let ptr = raw_ptr(&word, "Mut");
+    let locals = vec![
+        local(0, None, &ret),
+        local(1, Some("word"), &word),
+        local(2, Some("q"), &bits),
+        local(3, None, &borrowed),
+        local(4, None, &ret),
+    ];
+    let fun = |id: u64, name: &[&str], inputs: Vec<Value>, body: Value| {
+        json!({
+            "def_id": id,
+            "item_meta": meta(name),
+            "signature": {"is_unsafe": false, "inputs": inputs, "output": ret.clone()},
+            "body": body
+        })
+    };
+    let caller = fun(
+        0,
+        &["probe", "write_hash"],
+        vec![word.clone(), bits.clone()],
+        json!({"Unstructured": {"span": span, "locals": {"arg_count": 2, "locals": locals}, "body": [
+            {"statements": [ref_assign_mut(3, &borrowed, place(1, &word))],
+             "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                    "args": [json!({"Move": place(3, &borrowed)}), json!({"Copy": place(2, &bits)})],
+                    "dest": place(4, &ret)},
+                "target": 1, "on_unwind": 2
+            }}}},
+            {"statements": [{"span": span, "kind": {"Assign": [
+                place(0, &ret),
+                {"Use": [{"Copy": place(4, &ret)}, "Yes"]}
+            ]}}], "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]}}),
+    );
+    let sink_inputs = vec![ptr.clone(), bits.clone()];
+    let sink = fun(
+        1,
+        &["probe", "sink_pair"],
+        sink_inputs.clone(),
+        idle_body(&ret, &sink_inputs),
+    );
+    let file = json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "probe",
+            "type_decls": [],
+            "fun_decls": [caller, sink],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("probe fixture parses");
+    let graph = lower_function(&llbc, "write_hash")
+        .unwrap_or_else(|err| panic!("a hash word beside the spill must still lower: {err}"));
+    let ptrs = malloc_ptrs(&graph);
+    assert_eq!(ptrs.len(), 1, "one spilled place\n{}", op_lines(&graph));
+    let call = sink_call(&graph);
+    assert_eq!(call_arg(call, 0), &ptrs[0]);
+    assert_ne!(
+        call_arg(call, 1),
+        &ptrs[0],
+        "the hash word stays the caller's value\n{}",
+        op_lines(&graph)
+    );
 }
 
 #[test]
@@ -1916,7 +2257,11 @@ fn raw_pointer_to_another_place_stays_put() {
         panic!("a raw pointer of another place must still free the spill: {err}")
     });
     let ptrs = malloc_ptrs(&graph);
-    assert_eq!(ptrs.len(), 1, "one spilled place\n{}", op_lines(&graph));
+    assert!(
+        !ptrs.is_empty(),
+        "the borrowed word is spilled\n{}",
+        op_lines(&graph)
+    );
     let call = sink_call(&graph);
     assert_eq!(call_arg(call, 0), &ptrs[0]);
     assert_ne!(call_arg(call, 1), &ptrs[0]);

@@ -515,16 +515,23 @@ impl<'a> Lowering<'a> {
     /// [`pygraph_initial_block`] already records that parameter as
     /// `Int`. `Rvalue::Ref` of a primitive aliases the scalar, so the
     /// call would pass the word where the callee dereferences an
-    /// address (`*hash_out = digest`). An argument whose place type is
-    /// already a raw pointer is not spilled here.
+    /// address (`*hash_out = digest`). rustc may coerce that borrow to
+    /// a raw pointer of the same pointee (`&mut keyhash` → `*mut i64`);
+    /// the temp still aliases the word, and is spilled the same way.
+    /// A raw pointer that already is an address — a parameter, a
+    /// call-returned `&T`, a `raw_malloc` — is left alone.
     /// [`attach_aliasing_raw_arguments`] passes the spill address when
-    /// that pointer names the spilled place. An `&mut i64` parameter
-    /// is the word on both sides and is left alone. A byte pointer
-    /// stays `Ref`.
+    /// that pointer names the spilled place. An `&mut i64` parameter of
+    /// an inlined callee is the word on both sides and is left alone.
+    /// A residual `&Q` of a copy-sized key is that word (`Calli . rrii`);
+    /// the published trampoline rebuilds `&Q` on the C stack. Spilling
+    /// it stores a GCREF as Unsigned and recasts the malloc into the
+    /// Ref bank. A byte pointer stays `Ref`.
     pub(in crate::front::mir) fn raw_scalar_borrow_spills(
         &self,
         func: &CallFunc,
         arg_tys: &[Option<TyRef>],
+        arg_locals: &[Option<usize>],
     ) -> Vec<RawScalarBorrowSpill> {
         let CallFunc::Regular(reg) = func else {
             return Vec::new();
@@ -537,55 +544,195 @@ impl<'a> Lowering<'a> {
         };
         let mut spills = Vec::new();
         for (index, declared) in fd.signature.inputs.iter().enumerate() {
-            if raw_scalar_address_value_type(declared, self.llbc).is_none() {
-                continue;
-            }
             let Some(passed) = arg_tys.get(index).and_then(Option::as_ref) else {
                 continue;
             };
-            if !tyref_is_ref_of_primitive(passed, self.llbc) {
+            let arg_local = arg_locals.get(index).copied().flatten();
+            if arg_local.is_some_and(|local| self.scalar_address_locals.contains(&local)) {
                 continue;
             }
-            let Some(param_node) = tyref_peel_one_raw_ptr_node(declared, self.llbc) else {
-                continue;
-            };
-            let Some(arg_node) = tyref_peel_one_ref_node(passed, self.llbc) else {
-                continue;
-            };
-            let param_pointee = TyRef::Other(param_node.clone());
-            let arg_pointee = TyRef::Other(arg_node.clone());
-            let Some((item_ty, itemsize, is_item_signed)) = self.raw_word_descr(&param_pointee)
-            else {
-                continue;
-            };
-            let Some((arg_ty, arg_size, _)) = self.raw_word_descr(&arg_pointee) else {
-                continue;
-            };
-            // `Tuple<i64>` is the spill allocation: one signed field,
-            // 8 bytes, align 8, raw gckind. `CallControl::struct_layout_for`
-            // synthesizes that layout, and `jtransform.py`
-            // `_rewrite_raw_malloc` residualizes `ll_raw_malloc_fixedsize`.
-            // A wider pointee (128-bit) never reaches
-            // [`raw_scalar_address_value_type`].
-            if itemsize == 0
-                || itemsize > RAW_SCALAR_SPILL_BYTES
-                || arg_size != itemsize
-                || arg_ty != item_ty
+            if let Some(spill) =
+                self.raw_ptr_param_scalar_spill(*id, index, declared, passed, arg_local)
             {
-                continue;
+                spills.push(spill);
             }
-            let copy_out =
-                raw_ptr_kind_is_mut(declared, self.llbc) && ref_kind_is_mut(passed, self.llbc);
-            spills.push(RawScalarBorrowSpill {
-                fun_id: *id,
-                index,
-                copy_out,
-                item_ty,
-                itemsize,
-                is_item_signed,
-            });
         }
         spills
+    }
+
+    /// `*mut i64` / `*mut bool`, and a raw pointer of a one-word GC
+    /// pointer (`*mut GCREF`, `*mut PyObjectRef`), whose operand is a
+    /// borrow of that word: `&mut local`, `&raw mut local`, or rustc's
+    /// coerce / `.cast()` of that borrow. A byte pointer stays `Ref`.
+    /// A pointer that already is an address is left alone.
+    fn raw_ptr_param_scalar_spill(
+        &self,
+        fun_id: u64,
+        index: usize,
+        declared: &TyRef,
+        passed: &TyRef,
+        arg_local: Option<usize>,
+    ) -> Option<RawScalarBorrowSpill> {
+        if !tyref_is_raw_ptr_of_one_word_spill(declared, self.llbc) {
+            return None;
+        }
+        let passed_ref = tyref_is_ref_of_one_word_spill(passed, self.llbc);
+        let passed_raw = tyref_is_raw_ptr_of_one_word_spill(passed, self.llbc);
+        if !passed_ref && !passed_raw {
+            return None;
+        }
+        if passed_raw && !self.raw_ptr_arg_aliases_primitive_word(arg_local) {
+            return None;
+        }
+        let param_node = tyref_peel_one_raw_ptr_node(declared, self.llbc)?;
+        let arg_node = if passed_ref {
+            tyref_peel_one_ref_node(passed, self.llbc)?
+        } else {
+            tyref_peel_one_raw_ptr_node(passed, self.llbc)?
+        };
+        let param_pointee = TyRef::Other(param_node.clone());
+        let arg_pointee = TyRef::Other(arg_node.clone());
+        let (item_ty, itemsize, is_item_signed) = self.raw_word_descr(&param_pointee)?;
+        let (arg_ty, arg_size, _) = self.raw_word_descr(&arg_pointee)?;
+        // `Tuple<i64>` is the spill allocation: one signed field,
+        // 8 bytes, align 8, raw gckind. `CallControl::struct_layout_for`
+        // synthesizes that layout, and `jtransform.py`
+        // `_rewrite_raw_malloc` residualizes `ll_raw_malloc_fixedsize`.
+        // A wider pointee (128-bit) never reaches
+        // [`raw_scalar_address_value_type`].
+        if itemsize == 0
+            || itemsize > RAW_SCALAR_SPILL_BYTES
+            || arg_size != itemsize
+            || arg_ty != item_ty
+        {
+            return None;
+        }
+        let passed_mut = if passed_ref {
+            ref_kind_is_mut(passed, self.llbc)
+        } else {
+            raw_ptr_kind_is_mut(passed, self.llbc)
+        };
+        Some(RawScalarBorrowSpill {
+            fun_id,
+            index,
+            copy_out: raw_ptr_kind_is_mut(declared, self.llbc) && passed_mut,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        })
+    }
+
+    /// The raw-pointer temp still names a one-word local (`_p = &raw mut
+    /// keyhash`, `_p = (&mut rooted_class as *mut PyObjectRef).cast()`).
+    /// A pointer parameter or a call-returned address does not.
+    fn raw_ptr_arg_aliases_primitive_word(&self, arg_local: Option<usize>) -> bool {
+        let Some(place) = self
+            .resolved_borrow_place(arg_local)
+            .or_else(|| arg_local.and_then(|local| self.pointer_place_of_local(local, 0)))
+        else {
+            return false;
+        };
+        if let PlaceKind::Local(id) = place.kind {
+            let id = id as usize;
+            if self.scalar_address_locals.contains(&id) {
+                return false;
+            }
+            return self.local_accepts_raw_scalar_writeback(id);
+        }
+        tyref_is_one_word_spill_pointee(&place.ty, self.llbc)
+    }
+
+    /// Word a raw-pointer spill may write back into a copy-sized wrapper
+    /// local (`IdentityKey`). A GC heap struct (`RDict`) or `Box<T>` is
+    /// already the address the callee wants. Residual `&Q` is not this
+    /// path: that argument stays the JIT word.
+    pub(in crate::front::mir) fn residual_ref_spill_descr(
+        &self,
+        pointee: &TyRef,
+    ) -> Option<(ValueType, usize, bool)> {
+        // `Box::as_mut(&mut Box<T>)` — the Box is a heap pointer, not a
+        // stacked scalar. Spilling it materializes a slot of the thin
+        // pointer and `as_mut` returns `&mut T` derived from that slot
+        // (`replace_boxed_dynlike`).
+        if self.tyref_is_owned_ptr_adt(pointee) {
+            return None;
+        }
+        if let Some(descr) = self.raw_word_descr(pointee) {
+            return Some(descr);
+        }
+        let transparent = tyref_transparent_inner_value_type(
+            pointee,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )?;
+        // `BytesKey` / `StrKey` paint as the block pointer (`Int` or
+        // `Str`); `IdentityKey` as `Ref`. A 128-bit inner is wider
+        // than the spill slot.
+        match transparent {
+            ValueType::Int128 | ValueType::UInt128 => return None,
+            _ => {}
+        }
+        if let Some(descr) = self.span_raw_for_ty(pointee) {
+            return Some(descr);
+        }
+        // `span_raw_for_ty` is None when the layout is missing *or*
+        // wider than a word. `DynLike` is transparent over a 16-byte
+        // enum; inventing an 8-byte slot then refuses the caller.
+        if self
+            .tyref_layout_byte_size(pointee)
+            .is_some_and(|size| size == 0 || size > RAW_SCALAR_SPILL_BYTES as u64)
+        {
+            return None;
+        }
+        Some((ValueType::Int, RAW_SCALAR_SPILL_BYTES, false))
+    }
+
+    fn tyref_is_gc_heap_object(&self, ty: &TyRef) -> bool {
+        let Some(node) =
+            tyref_node(ty, self.llbc).and_then(|node| strip_ty_indirections(node, self.llbc))
+        else {
+            return false;
+        };
+        if let Some(def_id) = adt_node_def_id(node)
+            && adt_path_is_gc_container(self.llbc, def_id)
+        {
+            return true;
+        }
+        declared_adt_struct_id(node, self.llbc).is_some_and(|sid| self.gc_struct_ids.contains(&sid))
+    }
+
+    /// `Box<T>` / `Unique<T>` / `NonNull<T>` / `Rc` / `Arc`. Residual
+    /// `&mut Box<T>` is the address of the box, not a stacked scalar.
+    fn tyref_is_owned_ptr_adt(&self, ty: &TyRef) -> bool {
+        if self.tyref_is_gc_heap_object(ty) {
+            return true;
+        }
+        let Some(node) =
+            tyref_node(ty, self.llbc).and_then(|node| strip_ty_indirections(node, self.llbc))
+        else {
+            return false;
+        };
+        let Some(def_id) = adt_node_def_id(node) else {
+            return false;
+        };
+        let Some(path) = self
+            .llbc
+            .type_by_id(def_id)
+            .map(|td| td.item_meta.name_path())
+        else {
+            return false;
+        };
+        matches!(
+            path.as_str(),
+            "alloc::boxed::Box"
+                | "core::ptr::Unique"
+                | "core::mem::unique::Unique"
+                | "core::ptr::NonNull"
+                | "alloc::rc::Rc"
+                | "alloc::sync::Arc"
+        )
     }
 
     /// Store the aliased word into a fresh raw address and pass that
@@ -630,8 +777,7 @@ impl<'a> Lowering<'a> {
                 if arg != &resolved_args[spill.index] {
                     continue;
                 }
-                let place =
-                    self.resolved_borrow_place(arg_locals.get(spill.index).copied().flatten());
+                let place = self.spill_group_place(arg_locals.get(spill.index).copied().flatten());
                 if let Some(group) = groups.iter_mut().find(|group| {
                     raw_scalar_groups_share(
                         group,
@@ -705,7 +851,8 @@ impl<'a> Lowering<'a> {
         }
         if !groups.is_empty()
             && (self.raw_scalar_spill_result_escapes(dest_ty)
-                || callee_returns_spill_address(self.llbc, fun_id, &tracked))
+                || (!self.spill_dest_is_gc_or_byte_pointer(dest_ty)
+                    && callee_returns_spill_address(self.llbc, fun_id, &tracked)))
         {
             return Err(LowerError::Unsupported(format!(
                 "bb{mir_bb}: raw scalar spill address would escape through the call result"
@@ -717,7 +864,7 @@ impl<'a> Lowering<'a> {
         for group in groups {
             let ptr = self
                 .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(ptr.clone()),
                 kind: OpKind::raw_malloc(RAW_SCALAR_SPILL_OWNER, false, None),
@@ -834,7 +981,16 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             seen.push(key);
-            if tyref_is_raw_pointer(&ty, self.llbc) || output_type_is_ref(&ty, self.llbc) {
+            if tyref_is_raw_pointer(&ty, self.llbc) {
+                // A thin scalar raw pointer (`*mut i64`) can be the
+                // relocated slot. A GC / byte pointer (`*mut PyObject`,
+                // `GCREF`, `*mut u8`) is not this slot.
+                if raw_scalar_address_value_type(&ty, self.llbc).is_some() {
+                    return true;
+                }
+                continue;
+            }
+            if output_type_is_ref(&ty, self.llbc) {
                 return true;
             }
             match spill_address_payloads(&ty, self.llbc, self.static_addrs.error_carrier) {
@@ -843,6 +999,17 @@ impl<'a> Lowering<'a> {
             }
         }
         false
+    }
+
+    /// `Option<GCREF>` / `*mut PyObject`: a GC object, not the relocated
+    /// spill slot. An opaque callee that receives the slot still does
+    /// not return that slot as this dest.
+    fn spill_dest_is_gc_or_byte_pointer(&self, ty: &TyRef) -> bool {
+        let payload = crate::front::result_exc::tyref_option_payload(ty, self.llbc)
+            .or_else(|| crate::front::result_exc::tyref_result_ok(ty, self.llbc))
+            .unwrap_or_else(|| clone_tyref(ty));
+        tyref_is_raw_pointer(&payload, self.llbc)
+            && raw_scalar_address_value_type(&payload, self.llbc).is_none()
     }
 
     /// A raw parameter that is not a spill still names an address.
@@ -854,22 +1021,30 @@ impl<'a> Lowering<'a> {
     /// copy the pointee back. A field projection is that integer when
     /// its stored operand names a place (`constant_field_path`,
     /// `spill_address_source`). An integer literal
-    /// (`const_expr_literal`) stays the caller's value. An
-    /// address-sized integer this walk cannot place leaves the call
-    /// unlowered: a parameter, a call result, arithmetic, or `pair.0`
-    /// whose operand is not a single place. A pointer this walk cannot
-    /// place, or a pointer or integer that covers the spilled place,
-    /// leaves the call unlowered. Only a thin scalar pointer shares
-    /// the copy-out. A pointer or that integer packed into a tuple,
-    /// struct, enum, or array is still the caller's place
-    /// (`local_hides_spill_alias`): the aggregate is not rewritten, so
-    /// the call stays unlowered. A field that names another place
-    /// stays, and so does a tuple of integer literals. A tuple of
-    /// address-sized integers this walk cannot trace stays unlowered.
-    /// A projected store is part of the same value. An aggregate whose
-    /// type can hold a pointer and whose operands this walk cannot see
-    /// stays unlowered. A pointer to such an aggregate is the same
-    /// check on the pointee.
+    /// (`const_expr_literal`) stays the caller's value. The spilled
+    /// word passed by value (`callback_free(..., keyhash, ..., &mut
+    /// keyhash)`) is that word, not the address: rewriting it would
+    /// hand the malloc pointer to a hash parameter. A word-sized
+    /// `i64` / `u64` this walk cannot place is the same value
+    /// (`hash_known`, `ll_dict_lookup` `hash`). `usize` / `isize` is
+    /// the address integer: a parameter, a call result, arithmetic, or
+    /// `pair.0` whose operand is not a single place leaves the call
+    /// unlowered. A thin scalar raw pointer this walk cannot place
+    /// does too (`*mut i64` with no referent). A GC / byte pointer
+    /// (`*mut PyObject`, `*mut u8`) is not this slot. A pointer or
+    /// integer that covers the spilled place leaves the call
+    /// unlowered. Only a thin scalar pointer shares the copy-out. A
+    /// pointer or that integer packed into a tuple, struct, enum, or
+    /// array is still the caller's place (`local_hides_spill_alias`):
+    /// the aggregate is not rewritten, so the call stays unlowered. A
+    /// field that names another place stays, and so does a tuple of
+    /// integer literals. A tuple of address-sized integers this walk
+    /// cannot trace stays unlowered. A projected store is part of the
+    /// same value. An aggregate whose type can hold a pointer and
+    /// whose operands this walk cannot see stays unlowered. A pointer
+    /// to such an aggregate is the same check on the pointee. A GC
+    /// heap object, or a borrow of one, that does not contain the
+    /// spilled place is not that aggregate (`&RDict` beside `&Q`).
     pub(in crate::front::mir) fn attach_aliasing_raw_arguments(
         &self,
         fun_id: u64,
@@ -887,9 +1062,12 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             let raw = tyref_is_raw_pointer(declared, self.llbc);
-            // `usize` / `u64` can be the spilled address with the pointer
-            // bits still intact. A narrower integer cannot name it.
-            let address_int = !raw && type_holds_full_address(declared, self.llbc);
+            // `usize` / `u64` / `i64` can hold the spilled address with
+            // the pointer bits still intact. A narrower integer cannot
+            // name it. A GCREF / `&T` is not that integer.
+            let address_int = !raw
+                && type_holds_full_address(declared, self.llbc)
+                && tyref_is_integer_scalar(declared, self.llbc);
             let arg_local = arg_locals.get(index).copied().flatten();
             if !raw && !address_int {
                 let hides = match arg_local {
@@ -904,15 +1082,31 @@ impl<'a> Lowering<'a> {
             let Some(op) = arg_operands.get(index) else {
                 return Err(self.unspilled_raw_argument(mir_bb));
             };
-            // A literal is not the spilled address. A place this walk
+            // The spilled word passed by value is that word. Attaching
+            // it would replace the hash with the malloc pointer.
+            if address_int && self.operand_is_spilled_word_value(op, groups) {
+                continue;
+            }
+            // A literal is not the spilled address. A `usize` this walk
             // cannot name (`pair.0`, a parameter, a call result) stays
             // unlowered. `spill_address_source` follows a field when its
-            // stored operand names one place.
+            // stored operand names one place. A GC / byte pointer with
+            // no referent is not this slot. A word-sized `i64` / `u64`
+            // with no pointer provenance is the caller's value.
             let place = match self.spill_address_source(op, 0) {
                 SpillAddressSource::Constant if !raw => continue,
                 SpillAddressSource::Place(place) => place,
                 SpillAddressSource::Constant | SpillAddressSource::Unknown => {
-                    return Err(self.unspilled_raw_argument(mir_bb));
+                    if raw {
+                        if raw_scalar_address_value_type(declared, self.llbc).is_none() {
+                            continue;
+                        }
+                        return Err(self.unspilled_raw_argument(mir_bb));
+                    }
+                    if self.tyref_is_usize_or_isize(declared) {
+                        return Err(self.unspilled_raw_argument(mir_bb));
+                    }
+                    continue;
                 }
             };
             let mut exact = None;
@@ -963,6 +1157,120 @@ impl<'a> Lowering<'a> {
         ))
     }
 
+    /// Place the spill argument names, after peeling `&mut *p` and
+    /// following a raw-pointer temp (`_p = &raw mut keyhash`).
+    fn spill_group_place(&self, arg_local: Option<usize>) -> Option<Place> {
+        self.resolved_borrow_place(arg_local)
+            .or_else(|| arg_local.and_then(|local| self.pointer_place_of_local(local, 0)))
+    }
+
+    /// `Copy(keyhash)` / `Copy(_t)` where `_t = keyhash` is the spilled
+    /// word itself. A pointer temp that names that place is the address.
+    fn operand_is_spilled_word_value(
+        &self,
+        op: &Operand,
+        groups: &[RawScalarAddressGroup],
+    ) -> bool {
+        let place = match op {
+            Operand::Copy(place) | Operand::Move(place) => place,
+            Operand::Const(_) => return false,
+        };
+        self.place_is_spilled_word_value(place, groups, 0)
+    }
+
+    fn place_is_spilled_word_value(
+        &self,
+        place: &Place,
+        groups: &[RawScalarAddressGroup],
+        depth: u8,
+    ) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        if groups.iter().any(|group| {
+            group
+                .place
+                .as_ref()
+                .is_some_and(|named| places_alias(named, place))
+        }) {
+            if let PlaceKind::Local(id) = place.kind
+                && self.pointer_place_of_local(id as usize, 0).is_some()
+            {
+                return false;
+            }
+            return true;
+        }
+        let PlaceKind::Local(id) = place.kind else {
+            return false;
+        };
+        let local = id as usize;
+        if self.pointer_place_of_local(local, 0).is_some() {
+            return false;
+        }
+        let Some(src) = self.value_copy_source(local) else {
+            return false;
+        };
+        self.place_is_spilled_word_value(&src, groups, depth + 1)
+    }
+
+    /// Unique `local = copy src` / `move src`. A Ref / RawPtr / cast is
+    /// not a value copy.
+    fn value_copy_source(&self, local: usize) -> Option<Place> {
+        let mut found = None;
+        for (bb_idx, block) in self.body.body.iter().enumerate() {
+            if !self.forward_reached[bb_idx] {
+                continue;
+            }
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                    continue;
+                };
+                let PlaceKind::Local(index) = dest.kind else {
+                    continue;
+                };
+                if index as usize != local {
+                    continue;
+                }
+                let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = rvalue else {
+                    return None;
+                };
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(clone_place(&src));
+            }
+        }
+        found
+    }
+
+    /// `&RDict` / a GC heap local that does not contain the spilled
+    /// place. A group with no place covers every pointer.
+    fn local_is_unrelated_gc_object(
+        &self,
+        local: usize,
+        ty: &TyRef,
+        groups: &[RawScalarAddressGroup],
+    ) -> bool {
+        if tyref_is_raw_pointer(ty, self.llbc) {
+            return false;
+        }
+        let pointee = tyref_peel_one_ref_node(ty, self.llbc)
+            .map(|node| TyRef::Other(node.clone()))
+            .unwrap_or_else(|| clone_tyref(ty));
+        if !self.tyref_is_gc_heap_object(&pointee) {
+            return false;
+        }
+        groups.iter().all(|group| match group.place.as_ref() {
+            None => false,
+            Some(place) => place_root_local(place) != Some(local),
+        })
+    }
+
+    fn tyref_is_usize_or_isize(&self, ty: &TyRef) -> bool {
+        matches!(self.tyref_literal_uint_atom(ty), Some("Usize"))
+            || matches!(self.tyref_literal_int_atom(ty), Some("Isize"))
+    }
+
     /// `pair = (q,)` with `q` naming the spilled place. The aggregate
     /// still holds the caller's address, so the call cannot be spilled.
     /// A field that names another place does not. An integer literal
@@ -979,6 +1287,9 @@ impl<'a> Lowering<'a> {
         let Some(ty) = self.mir_local_ty(local) else {
             return true;
         };
+        if self.local_is_unrelated_gc_object(local, &ty, groups) {
+            return false;
+        }
         if depth > 8 {
             return self.raw_scalar_spill_result_escapes(&ty);
         }
@@ -1118,7 +1429,9 @@ impl<'a> Lowering<'a> {
             Operand::Copy(place) | Operand::Move(place) => place,
         };
         let raw = tyref_is_raw_pointer(&place.ty, self.llbc);
-        let address_int = !raw && type_holds_full_address(&place.ty, self.llbc);
+        let address_int = !raw
+            && type_holds_full_address(&place.ty, self.llbc)
+            && tyref_is_integer_scalar(&place.ty, self.llbc);
         if raw || address_int {
             match self.spill_address_source(op, depth) {
                 SpillAddressSource::Constant => return false,
@@ -1151,7 +1464,7 @@ impl<'a> Lowering<'a> {
         }
         match op {
             Operand::Const(value) => {
-                if self.const_is_integer_literal(value) {
+                if self.const_is_integer_literal(value) || self.const_is_trait_const(value) {
                     SpillAddressSource::Constant
                 } else {
                     SpillAddressSource::Unknown
@@ -1161,20 +1474,21 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    pub(in crate::front::mir) fn const_is_integer_literal(
-        &self,
-        value: &serde_json::Value,
-    ) -> bool {
+    fn const_is_integer_literal(&self, value: &serde_json::Value) -> bool {
         self.llbc
             .const_expr_literal(value)
             .is_some_and(|literal| literal.get("Scalar").is_some())
     }
 
-    pub(in crate::front::mir) fn place_address_source(
-        &self,
-        place: &Place,
-        depth: u8,
-    ) -> SpillAddressSource {
+    /// Associated const (`T::SIZE`). A compile-time word, never the
+    /// relocated spill address.
+    fn const_is_trait_const(&self, value: &serde_json::Value) -> bool {
+        self.llbc
+            .const_expr_kind(value)
+            .is_some_and(|kind| kind.get("TraitConst").is_some())
+    }
+
+    fn place_address_source(&self, place: &Place, depth: u8) -> SpillAddressSource {
         if depth > 8 {
             return SpillAddressSource::Unknown;
         }
@@ -1454,6 +1768,17 @@ impl<'a> Lowering<'a> {
     ) -> bool {
         match &place.kind {
             PlaceKind::Local(id) => self.local_hides_spill_alias(*id as usize, groups, depth),
+            PlaceKind::Projection(_, _) => {
+                // `q = &pair` already matches `place_extends` against
+                // `pair.word`. Deref of another object (`&*self` beside
+                // `&*key`) is not this slot. A group with no place
+                // covers every pointer.
+                if groups.iter().any(|group| group.place.is_none()) {
+                    self.raw_scalar_spill_result_escapes(&place.ty)
+                } else {
+                    false
+                }
+            }
             _ => self.raw_scalar_spill_result_escapes(&place.ty),
         }
     }
@@ -1494,7 +1819,50 @@ impl<'a> Lowering<'a> {
                 found = Some(place);
             }
         }
+        if found.is_none() {
+            if let Some(src) = self.ptr_identity_cast_source_local(local) {
+                return self.pointer_place_of_local(src, depth + 1);
+            }
+        }
         found.map(|place| self.concrete_borrow_place(place))
+    }
+
+    /// `<*mut T>::cast` / `cast_mut` / `cast_const` destination: the
+    /// receiver still names the same place (`&mut local` / `&raw mut local`).
+    fn ptr_identity_cast_source_local(&self, dest: usize) -> Option<usize> {
+        let mut found = None;
+        for (bb_idx, block) in self.body.body.iter().enumerate() {
+            if !self.forward_reached[bb_idx] {
+                continue;
+            }
+            let Ok(TermKind::Call { call, .. }) = block.term_ref(self.llbc) else {
+                continue;
+            };
+            let PlaceKind::Local(id) = call.dest.kind else {
+                continue;
+            };
+            if id as usize != dest {
+                continue;
+            }
+            let CallFunc::Regular(reg) = &call.func else {
+                return None;
+            };
+            if !self.is_ptr_identity_cast(reg) || call.args.len() != 1 {
+                return None;
+            }
+            let src = match call.args.first()? {
+                Operand::Copy(place) | Operand::Move(place) => match place.kind {
+                    PlaceKind::Local(local) => local as usize,
+                    _ => return None,
+                },
+                Operand::Const(_) => return None,
+            };
+            if found.is_some() {
+                return None;
+            }
+            found = Some(src);
+        }
+        found
     }
 
     pub(in crate::front::mir) fn rvalue_pointer_place(
@@ -1594,9 +1962,9 @@ impl<'a> Lowering<'a> {
                 match place.kind {
                     PlaceKind::Local(index) => {
                         let index = index as usize;
-                        if !(self.local_decl_is_primitive(index) && index < self.local_var.len()) {
+                        if !self.local_accepts_raw_scalar_writeback(index) {
                             return Err(LowerError::Unsupported(format!(
-                                "bb{mir_bb}: raw scalar out-parameter write-back is not a primitive local"
+                                "bb{mir_bb}: raw scalar out-parameter write-back is not a stack word"
                             )));
                         }
                         let loaded = self.emit_raw_scalar_word_load(mir_bb, reload);
@@ -2222,7 +2590,7 @@ pub(in crate::front::mir) fn function_address_escape(
         return unclassified_address_escape();
     };
     let Some(body) = fd.unstructured() else {
-        return unclassified_address_escape();
+        return bodyless_callee_address_escape(llbc, fd, entry);
     };
     stack.push(fun_id);
     let escape = unstructured_address_escape(llbc, &body, entry, stack);
@@ -3610,11 +3978,74 @@ pub(in crate::front::mir) fn call_address_escape(
     };
     match &reg.kind {
         CallKind::Fun(FunId::Regular { id }) => function_address_escape(llbc, *id, &entry, stack),
-        CallKind::Fun(FunId::Other(_))
-        | CallKind::Trait(_)
-        | CallKind::Ptr(_)
-        | CallKind::Unknown => unclassified_address_escape(),
+        CallKind::Trait(payload) => trait_call_address_escape(llbc, call, payload, &entry, stack),
+        CallKind::Fun(FunId::Other(_)) | CallKind::Ptr(_) | CallKind::Unknown => {
+            unclassified_address_escape()
+        }
     }
+}
+
+/// `Hash::hash` / `Equivalent::equivalent` take `&Q` of the spilled word
+/// and return `()` / `bool`. Those destinations cannot name the slot.
+/// A unique impl with a body is walked; a libcore impl that is not in
+/// this LLBC uses the destination type.
+fn trait_call_address_escape(
+    llbc: &Llbc,
+    call: &CallPayload,
+    payload: &serde_json::Value,
+    entry: &[LocalAddress],
+    stack: &mut Vec<u64>,
+) -> AddressEscape {
+    let first_ty = call.args.first().and_then(operand_tyref);
+    if let Some((fn_id, _, _)) = trait_method_on_known_receiver(first_ty, payload, llbc) {
+        return function_address_escape(llbc, fn_id, entry, stack);
+    }
+    if dest_cannot_hold_spill_address(&call.dest.ty, llbc) {
+        return clean_address_escape();
+    }
+    unclassified_address_escape()
+}
+
+/// `()` / `bool` / a narrow integer cannot publish the spill pointer.
+/// An address-width integer, a raw pointer, and a reference can.
+fn dest_cannot_hold_spill_address(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_is_raw_pointer(ty, llbc) || output_type_is_ref(ty, llbc) {
+        return false;
+    }
+    if type_holds_full_address(ty, llbc) {
+        return false;
+    }
+    tyref_is_void_zst(ty, llbc)
+        || tyref_is_literal_bool(ty, llbc)
+        || tyref_is_integer_scalar(ty, llbc)
+}
+
+/// A residual with no body. A returned pointer or reference can be the
+/// slot. A raw-pointer argument can load address bits stored through
+/// it (`opaque_read_of_a_clean_alias`). A borrow of the spilled word
+/// returning a status (`residual_shared_borrow_of_i64_is_spilled`)
+/// cannot name the slot without a cast in a body.
+fn bodyless_callee_address_escape(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    entry: &[LocalAddress],
+) -> AddressEscape {
+    let output = &fd.signature.output;
+    if tyref_is_raw_pointer(output, llbc) || output_type_is_ref(output, llbc) {
+        return unclassified_address_escape();
+    }
+    for local in entry {
+        let Some(index) = local.local.checked_sub(1) else {
+            return unclassified_address_escape();
+        };
+        let Some(declared) = fd.signature.inputs.get(index as usize) else {
+            return unclassified_address_escape();
+        };
+        if tyref_is_raw_pointer(declared, llbc) {
+            return unclassified_address_escape();
+        }
+    }
+    clean_address_escape()
 }
 
 /// `drop(wrapper)` sees a field that names `bits` (`FieldSlot::referent`).

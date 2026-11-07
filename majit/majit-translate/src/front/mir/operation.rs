@@ -146,7 +146,7 @@ impl<'a> Lowering<'a> {
         if !add_dest_used_only_as_single_read_deref(self.llbc, self.body, dest_local) {
             return Ok(false);
         }
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -1364,6 +1364,24 @@ impl<'a> Lowering<'a> {
             .is_some_and(|decl| tyref_is_primitive_scalar(&decl.ty, self.llbc))
     }
 
+    /// `keyhash: i64` and a copy-sized wrapper local (`IdentityKey`).
+    /// A `&Q` parameter is the address, not the word.
+    pub(in crate::front::mir) fn local_accepts_raw_scalar_writeback(&self, local: usize) -> bool {
+        if local >= self.local_var.len() || self.scalar_address_locals.contains(&local) {
+            return false;
+        }
+        if self.local_decl_is_primitive(local) {
+            return true;
+        }
+        let Some(ty) = self.mir_local_ty(local) else {
+            return false;
+        };
+        if tyref_peel_one_ref_node(&ty, self.llbc).is_some() {
+            return false;
+        }
+        self.residual_ref_spill_descr(&ty).is_some()
+    }
+
     /// Preserve the declared RPython reference repr of a typed field value.
     ///
     /// RPython represents an instance attribute as `SomeInstance(classdef)`;
@@ -1747,13 +1765,6 @@ impl<'a> Lowering<'a> {
         path == spec || strip_crate_prefix(&path) == strip_crate_prefix(spec)
     }
 
-    pub(in crate::front::mir) fn error_carrier_class_root(&self, ty: &TyRef) -> Option<String> {
-        if !self.ty_is_error_carrier(ty) {
-            return None;
-        }
-        tyref_class_root_with(ty, self.llbc, self.tombstoned_leaves)
-    }
-
     /// Class root of the carrier's payload: `Deref::Target` (`PyErrorObject`).
     /// The declared field is `PyObjectRef` (`*mut PyObject`); projecting that
     /// class has no common annotator base with the handle, which subclasses
@@ -1774,14 +1785,17 @@ impl<'a> Lowering<'a> {
         )
     }
 
-    /// `PyError(ptr)` is one pointer word. The class is the handle's
-    /// own leaf (`error::PyError`), a subclass of `Deref::Target`.
+    /// `PyError(ptr)` is one pointer word. The class is the carrier's
+    /// inner `Deref::Target` (`PyErrorObject`), the same root
+    /// `ctor_ccharp_field_store` uses (`rtyper.py` `LowLevelOpList.convertvar`
+    /// converts once). A New of the wrapper would be an 8-byte handle
+    /// `to_exc_object` then reads as the inner object.
     pub(in crate::front::mir) fn retag_error_carrier(
         &mut self,
         wrapper_ty: &TyRef,
         value: Variable,
     ) -> (Option<OpKind>, Variable) {
-        let Some(root) = self.error_carrier_class_root(wrapper_ty) else {
+        let Some(root) = self.error_carrier_inner_class_root(wrapper_ty) else {
             return (None, value);
         };
         let res = self
@@ -2082,6 +2096,16 @@ impl<'a> Lowering<'a> {
                     {
                         return Ok((Some(op), res));
                     }
+                    // `*const BytesBlock as *mut Utf8Str`: both pointees are
+                    // rstr `STR` (`type BytesBlock = Utf8Str`). rtyper
+                    // `cast_pointer` to the same type is `same_as`
+                    // (`jtransform.py` `rewrite_op_cast_pointer`).
+                    if operand_tyref(&operand)
+                        .is_some_and(|src| tyref_is_same_rstr_str_ptr_cast(src, dest_ty, self.llbc))
+                    {
+                        stamp_as_rstr_str(&arg);
+                        return Ok((None, arg));
+                    }
                     // A transparent address-cast word is a GCREF pointer even
                     // though its place type is the inner `usize`. Reading it
                     // back (`roots[i].0 as *mut _`) must not emit
@@ -2340,7 +2364,7 @@ impl<'a> Lowering<'a> {
                         .is_some_and(|ty| tyref_is_ptr_to_int_cast_origin(ty, self.llbc));
                     if src_is_ptr_to_int_origin {
                         let dest_int = int_cast_size_and_sign(dest_ty, self.llbc);
-                        let bb_id = self.block_id[mir_bb];
+                        let bb_id = self.emit_bb(mir_bb);
                         if dest_int.is_some_and(|(_, unsigned)| unsigned) {
                             let (retype, result) =
                                 push_ptr_to_unsigned_cast(&mut self.graph, bb_id, arg);
@@ -2792,6 +2816,9 @@ impl<'a> Lowering<'a> {
                     tyref_node(src_ty, self.llbc)
                         .is_some_and(|node| one_level_pointer_pointee(node, self.llbc).is_some())
                 });
+                let same_rstr_str_ptr = operand_tyref(&operand)
+                    .is_some_and(|src| tyref_is_same_rstr_str_ptr_cast(src, &ty, self.llbc));
+
                 let v = self.resolve_operand(mir_bb, operand)?;
                 let src_is_pointer = self.pointer_word_vars.contains(&v)
                     || src_is_pointer_from_ty
@@ -2800,6 +2827,13 @@ impl<'a> Lowering<'a> {
                     && let Some((op, res)) = self.object_array_unsize_newlist(dest_ty, &v)
                 {
                     return Ok((Some(op), res));
+                }
+                // `*const BytesBlock as *mut Utf8Str`: both pointees are
+                // rstr `STR`. rtyper `cast_pointer` to the same type is
+                // `same_as` (`jtransform.py` `rewrite_op_cast_pointer`).
+                if same_rstr_str_ptr {
+                    stamp_as_rstr_str(&v);
+                    return Ok((None, v));
                 }
                 // A same-bank ptr→ptr cast keeps the i64 pointer carrier in
                 // place, so it would alias — but the pointee type it
@@ -3317,6 +3351,22 @@ impl<'a> Lowering<'a> {
             // case) registers 0, identical to the prior heuristic.  An
             // unresolvable place type falls back to the unowned read.
             Rvalue::Discriminant(place) => {
+                // After `result_exc` a `Result<&[T], PyError>` residual is
+                // the pair; Err already raised, so the tag is always Ok.
+                if let PlaceKind::Local(i) = &place.kind
+                    && self
+                        .len_shadow
+                        .get(*i as usize)
+                        .copied()
+                        .flatten()
+                        .is_some()
+                    && self.result_pair_slice_kind(&place.ty).is_some()
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    return Ok((Some(OpKind::ConstInt(0)), res));
+                }
                 // The `Option<&T>` a pair-slice `get` yields is the item's
                 // address, 0 for `None`.
                 if let PlaceKind::Local(opt) = place.kind
@@ -3514,10 +3564,13 @@ impl<'a> Lowering<'a> {
                     self.exception_disc_vars.insert(base.id(), info);
                     return Ok((None, base));
                 }
-                // `*p` on a raw address is the enum's bytes, not the
-                // explicit sum shell. Load the host tag and decode it to
-                // the variant index `host_variant_index` returns;
-                // `SwitchInt` on this `Discriminant` compares that index.
+                // A data-carrying enum's host tag word is not the variant
+                // index when rustc niched it. Load that word (raw address
+                // or GC-ref) and decode it to the index `host_variant_index`
+                // returns; `SwitchInt` on this `Discriminant` compares that
+                // index. `jtransform.py` / `flatten.py` switch on the rtyped
+                // integer `exitswitch` produces — value and switchdict keys
+                // stay in one domain.
                 if let Some(decoded) = self.lower_raw_pointer_discriminant(mir_bb, &place)? {
                     return Ok((None, decoded));
                 }
@@ -3763,9 +3816,12 @@ impl<'a> Lowering<'a> {
         Ok(Some(self.resolve_place(mir_bb, (**inner).clone())?))
     }
 
-    /// `Discriminant(*p)` and `Discriminant((*p).field)` when the enum is
-    /// a Raw host layout with a tag. `None` leaves the explicit-shell read.
-    pub(in crate::front::mir) fn lower_raw_pointer_discriminant(
+    /// `Discriminant(*p)` / `Discriminant((*p).field)` on a raw address, and
+    /// `Discriminant` of a GC-ref data-carrying enum. Loads the host tag
+    /// word and decodes it to the variant index `host_variant_index`
+    /// returns. `None` leaves the explicit-shell read (or a later one-word
+    /// Option niche test).
+    fn lower_raw_pointer_discriminant(
         &mut self,
         mir_bb: usize,
         place: &Place,
@@ -3773,7 +3829,7 @@ impl<'a> Lowering<'a> {
         let Some(tag) = self.raw_enum_host_tag(&place.ty) else {
             return Ok(None);
         };
-        let (base, extra_offset) = match &place.kind {
+        let raw = match &place.kind {
             PlaceKind::Projection(inner, ProjectionElem::Atom(elem))
                 if elem == "Deref"
                     && ty_is_raw_address(
@@ -3783,7 +3839,12 @@ impl<'a> Lowering<'a> {
                         &self.raw_alloc_flavor_structs,
                     ) =>
             {
-                (self.resolve_place(mir_bb, (**inner).clone())?, 0u64)
+                let base = self.resolve_place(mir_bb, (**inner).clone())?;
+                let Some(total) = i64::try_from(tag.offset).ok() else {
+                    return Ok(None);
+                };
+                let offset = self.emit_i64(mir_bb, total);
+                self.emit_raw_tag_load(mir_bb, base, offset, (tag.bits / 8) as usize)
             }
             PlaceKind::Projection(inner, ProjectionElem::Tagged(v))
                 if let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
@@ -3791,18 +3852,36 @@ impl<'a> Lowering<'a> {
                         self.struct_field_offset_from_payload(&inner.ty, field_payload)
                     && let Some(addr) = self.raw_deref_address(mir_bb, inner)? =>
             {
-                (addr, field_off)
+                let Some(total) = field_off.checked_add(tag.offset) else {
+                    return Ok(None);
+                };
+                let Some(total) = i64::try_from(total).ok() else {
+                    return Ok(None);
+                };
+                let offset = self.emit_i64(mir_bb, total);
+                self.emit_raw_tag_load(mir_bb, addr, offset, (tag.bits / 8) as usize)
             }
-            _ => return Ok(None),
+            _ => {
+                // One-word Option niches are a null / scalar test on the
+                // payload word, not an aggregate `__discriminant` load.
+                // Those arms run after this helper returns `None`.
+                if self.tyref_is_niche_option_ptr(&place.ty)
+                    || tyref_option_fieldless_niche(&place.ty, self.llbc).is_some()
+                    || option_nonzero_word_kind_deref_receiver(&place.ty, self.llbc).is_some()
+                {
+                    return Ok(None);
+                }
+                // GC-ref or `&Enum`: the host tag sits on that object at
+                // `discriminant_offset`. `CodeLocations` is Copy and not a
+                // GC type, so the match subject is a `Ref` to the value
+                // (`HashMap::get`); the tag load is still a field read of
+                // `__discriminant`, then `emit_host_variant_index` maps a
+                // Niche encoding (tag 0 = Deferred, anything else =
+                // Decoded) to the variant index SwitchInt compares.
+                let base = self.resolve_place(mir_bb, place.clone())?;
+                self.emit_gc_tag_load(mir_bb, base, &place.ty)
+            }
         };
-        let Some(total) = extra_offset.checked_add(tag.offset) else {
-            return Ok(None);
-        };
-        let Some(total) = i64::try_from(total).ok() else {
-            return Ok(None);
-        };
-        let offset = self.emit_i64(mir_bb, total);
-        let raw = self.emit_raw_tag_load(mir_bb, base, offset, (tag.bits / 8) as usize);
         Ok(Some(self.emit_host_variant_index(mir_bb, raw, &tag)))
     }
 
@@ -3854,6 +3933,51 @@ impl<'a> Lowering<'a> {
                 true,
             )
             .expect("BinOp produces a value")
+    }
+
+    /// Host tag word of a pointer-to-enum (GC-ref or `&Enum`). The
+    /// synthetic `__discriminant` field is that word at
+    /// `discriminant_offset`; `getfield_gc_i` / `getfield_raw_i` loads
+    /// it. `emit_host_variant_index` then maps the niche encoding to the
+    /// variant index.
+    fn emit_gc_tag_load(&mut self, mir_bb: usize, base: Variable, ty: &TyRef) -> Variable {
+        let (owner_root, owner_id) = match self.tyref_adt_class_root(ty) {
+            Some(class_root) => {
+                let canon = decl_path_for_tombstone(&class_root, self.tombstoned_leaves);
+                let sid = self.tyref_adt_layout_id(ty).unwrap_or_else(|| {
+                    let bare = majit_ir::descr::strip_instantiation_suffix(&canon);
+                    majit_ir::descr::StructId::from_canonical(bare)
+                });
+                (Some(canon), Some(sid))
+            }
+            None => (None, None),
+        };
+        let disc_owner_gc =
+            container_declared_gc(ty, self.llbc, self.gc_struct_ids, self.immutable_fields);
+        let bb_id = self.emit_bb(mir_bb);
+        self.graph
+            .push_op_var(
+                bb_id,
+                OpKind::FieldRead {
+                    base,
+                    field: crate::model::FieldDescriptor {
+                        name: "__discriminant".to_string(),
+                        owner_root,
+                        owner_id,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
+                        owner_declared_gc: disc_owner_gc,
+                        host_index: None,
+                        scalar_word: None,
+                    },
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("gc tag load produces a value")
     }
 
     /// Zero-extending load of the tag word. `host_variant_index` masks to
@@ -5605,6 +5729,21 @@ impl<'a> Lowering<'a> {
             .any(|prefix| field_path.starts_with(prefix))
     }
 
+    /// LLBC `TypeDecl::is_repr_transparent` of the destination ADT.
+    pub(in crate::front::mir) fn dest_is_repr_transparent(&self, dest_ty: &TyRef) -> bool {
+        let dest = self
+            .tyref_peel_ref_to_pointee(dest_ty)
+            .unwrap_or_else(|| dest_ty.clone());
+        let Some(node) = tyref_node(&dest, self.llbc) else {
+            return false;
+        };
+        let decl_id = adt_node_def_id(node)
+            .or_else(|| strip_ty_wrappers(node, self.llbc).and_then(adt_node_def_id));
+        decl_id
+            .and_then(|id| self.llbc.type_by_id(id))
+            .is_some_and(|td| td.is_repr_transparent())
+    }
+
     /// Lower `&(*p).f` / `&raw (*p).f` for an inline struct field as
     /// `jtransform.py rewrite_op_getsubstruct` does. Offset zero is `p`
     /// itself. A nonzero offset on a classdef-less `repr(C)` pointee is
@@ -5903,6 +6042,15 @@ impl<'a> Lowering<'a> {
             };
             let item_ty = self.with_item_class_root(item_ty, &place_ty);
             let zero = self.emit_const_uint(mir_bb, 0);
+            if self.item_addr_elem_is_u8(opt as usize) {
+                let item = self.emit_u8_raw_load(mir_bb, addr, zero);
+                return Ok(self.retype_word(
+                    mir_bb,
+                    item,
+                    &ValueType::Unsigned,
+                    &u8_pair_item_ty(&item_ty),
+                ));
+            }
             let helper_ty = Self::pair_helper_item_ty(kind);
             let item = self.emit_path_call(
                 mir_bb,
@@ -5942,6 +6090,15 @@ impl<'a> Lowering<'a> {
                 ),
                 &place_ty,
             );
+            if tyref_slice_elem_is_u8(&slice.ty, self.llbc) {
+                let item = self.emit_u8_raw_load(mir_bb, ptr, index);
+                return Ok(self.retype_word(
+                    mir_bb,
+                    item,
+                    &ValueType::Unsigned,
+                    &u8_pair_item_ty(&item_ty),
+                ));
+            }
             let helper_ty = Self::pair_helper_item_ty(kind);
             let item = self.emit_path_call(
                 mir_bb,
@@ -5981,15 +6138,13 @@ impl<'a> Lowering<'a> {
             {
                 // A window's one-word consumer sees the `CCHARP` data
                 // word; the length stays in the shadow (`link_word`).
+                // `Result<&[T], E>` local 0 is the same shape.
                 // Word-sized pair slices still refuse a one-word read.
                 let local = i as usize;
-                if self
-                    .body
-                    .locals
-                    .locals
-                    .get(local)
-                    .is_some_and(|loc| tyref_is_u8_window(&loc.ty, self.llbc))
-                {
+                if self.body.locals.locals.get(local).is_some_and(|loc| {
+                    tyref_is_u8_window(&loc.ty, self.llbc)
+                        || self.result_pair_slice_kind(&loc.ty).is_some()
+                }) {
                     Ok(self.local_var[local]
                         .as_ref()
                         .expect("pair local is bound")
@@ -6045,6 +6200,18 @@ impl<'a> Lowering<'a> {
                     helper_ty.clone(),
                 );
                 Ok(self.retype_word(mir_bb, item, &helper_ty, &value_ty))
+            }
+            PlaceKind::Local(i)
+                if matches!(
+                    self.local_var
+                        .get(i as usize)
+                        .and_then(|slot| slot.as_ref()),
+                    Some(LocalValue::ItemAddr(_))
+                ) && self.option_pair_item(i as usize).is_some() =>
+            {
+                // Niche `Option<&T>`: the Option is the item address, 0
+                // for `None`. `Try::branch` / a copy reads that word.
+                self.item_addr_var(mir_bb, i as usize)
             }
             PlaceKind::Local(i)
                 if matches!(
@@ -6514,6 +6681,10 @@ impl<'a> Lowering<'a> {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    // `W_BytesObject.data: *const BytesBlock` is `Ptr(STR)`
+                    // from the pointee declaration (`rstr.py` `STR`).
+                    stamp_rstr_str_ptr_from_pointee(&res, &place_ty, self.llbc);
+                    stamp_rstr_str_ptr_from_pointee(&res, &field_ty, self.llbc);
                     let narrow_instance_class = container_is_enum
                         && field_name == "__pos_0"
                         && self.enum_payload_is_nullable_instance_ptr(&place_ty);
@@ -6985,6 +7156,15 @@ impl<'a> Lowering<'a> {
                     {
                         let addr = self.item_addr_var(mir_bb, local)?;
                         let index = self.emit_const_uint(mir_bb, 0);
+                        if self.item_addr_elem_is_u8(local) {
+                            let item = self.emit_u8_raw_load(mir_bb, addr, index);
+                            return Ok(self.retype_word(
+                                mir_bb,
+                                item,
+                                &ValueType::Unsigned,
+                                &u8_pair_item_ty(&item_ty),
+                            ));
+                        }
                         let helper_ty = Self::pair_helper_item_ty(kind);
                         let item = self.emit_path_call(
                             mir_bb,
@@ -7725,6 +7905,19 @@ impl<'a> Lowering<'a> {
                 transparent: false,
             });
         }
+        // `PyError(ptr)` is one pointer word (`retag_error_carrier`).
+        // `tyref_transparent_inner_value_type` returns None for a
+        // transparent GC handle so the wrapper class is kept; that
+        // would emit Ctor + New + setfield. Projection (`self.0` /
+        // `cast_off_error_carrier`) is identity on the same word, so a
+        // New handle is not the residual dest the next call reads
+        // (`pyjitpl.py` `_record_helper` / `make_result_of_lastop`).
+        if n_operands == 1 && self.ty_is_error_carrier(dest_ty) {
+            return Ok(AggregateShape::Operand {
+                index: 0,
+                transparent: true,
+            });
+        }
         if tyref_transparent_inner_value_type(
             dest_ty,
             self.llbc,
@@ -7816,7 +8009,15 @@ impl<'a> Lowering<'a> {
             // Resolved to a `TypeDeclKind::Struct`, so the value is
             // its field writes and nothing else; `jtransform` may
             // lower the constructor to a bare allocation.
-            CallTarget::synthetic_transparent_struct_ctor(owner_path.clone(), ctor_name.clone())
+            let target = CallTarget::synthetic_transparent_struct_ctor(
+                owner_path.clone(),
+                ctor_name.clone(),
+            );
+            if self.dest_is_repr_transparent(dest_ty) {
+                target.with_repr_transparent()
+            } else {
+                target
+            }
         } else if let Some(tag) = enum_variant_tag {
             // A resolved enum variant records its declaration
             // index so a payload-less variant folded to a

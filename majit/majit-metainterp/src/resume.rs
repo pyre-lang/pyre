@@ -5301,6 +5301,108 @@ mod tests {
         assert_eq!(bh.registers_i, vec![0, 321]);
     }
 
+    /// A guard recorded inside a helper after an effect encodes the helper
+    /// section at the guard's resume pc (`capture_resumedata` walks the
+    /// whole framestack). `blackhole_from_resumedata` / `setposition` then
+    /// resume inside the helper, so `run_forever` does not replay the
+    /// skipped `int_mul`. Starting the helper at 0 would return 82.
+    #[test]
+    fn blackhole_from_resumedata_helper_guard_after_effect_does_not_replay() {
+        use crate::blackhole::BlackholeInterpBuilder;
+        use crate::jitcode::JitCodeBuilder;
+        use crate::jitcode::insns::{BC_CATCH_EXCEPTION, BC_LIVE, BC_RVMPROF_CODE};
+        use majit_ir::OpCode;
+
+        let mut helper = JitCodeBuilder::default();
+        helper.record_binop_i(0, OpCode::IntMul, 0, 1);
+        let add_pc = helper.current_pos();
+        let helper_live = helper.live_placeholder();
+        helper.patch_live_offset(helper_live, 3);
+        helper.record_binop_i(2, OpCode::IntAdd, 0, 1);
+        helper.int_return(2);
+        let helper_jc = std::sync::Arc::new(helper.finish());
+
+        let mut parent = JitCodeBuilder::default();
+        parent.inline_call_r_i(0, &[], Some(7));
+        let after_call = parent.current_pos();
+        let _parent_live = parent.live_placeholder();
+        parent.int_return(7);
+        let parent_jc = std::sync::Arc::new(parent.finish());
+        assert_eq!(
+            parent_jc.code[after_call - 1],
+            7,
+            "caller resumes on the inline_call result register"
+        );
+        assert_eq!(
+            helper_jc.code[add_pc], BC_LIVE,
+            "helper resume pc is the -live- after the skipped effect"
+        );
+
+        let mut writer = crate::resumecode::Writer::new(10);
+        writer.append_int(0); // items_resume_section (patched below)
+        writer.append_int(0); // count: no failargs
+        writer.append_int(0); // vable_array length
+        writer.append_int(0); // vref_array length
+        writer.append_int(0); // parent jitcode_pos
+        writer.append_int(after_call as i64);
+        writer.append_int(1); // helper jitcode_pos
+        writer.append_int(add_pc as i64);
+        writer.append_int(tag(40, TAGINT).unwrap() as i64);
+        writer.append_int(tag(2, TAGINT).unwrap() as i64);
+        writer.patch_current_size(0);
+        let rd_numb = writer.create_numbering();
+
+        let mut all_liveness = vec![0, 0, 0];
+        all_liveness.extend_from_slice(&[2, 0, 0]);
+        all_liveness.extend(majit_jitcode::liveness::encode_liveness(&[0, 1]));
+
+        let mut builder = BlackholeInterpBuilder::new();
+        let mut entries: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
+        entries.insert("int_add/ii>i".to_string(), majit_jitcode::insns::BC_INT_ADD);
+        entries.insert("int_mul/ii>i".to_string(), majit_jitcode::insns::BC_INT_MUL);
+        entries.insert(
+            "int_return/i".to_string(),
+            majit_jitcode::insns::BC_INT_RETURN,
+        );
+        entries.insert("live/".to_string(), BC_LIVE);
+        builder.setup_insns(&entries);
+        crate::blackhole::wire_bhimpl_handlers(&mut builder);
+        builder.setup_cached_control_opcodes(
+            BC_LIVE as i32,
+            BC_CATCH_EXCEPTION as i32,
+            BC_RVMPROF_CODE as i32,
+        );
+        let jitcodes = [parent_jc.clone(), helper_jc.clone()];
+        let (bh, virtualizable_ptr) = blackhole_from_resumedata(
+            &mut builder,
+            &jitcodes,
+            &rd_numb,
+            &[],
+            &all_liveness,
+            FailArgSource::Slice(&[]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &NullAllocator,
+            None,
+        );
+        assert_eq!(virtualizable_ptr, 0);
+        assert!(std::sync::Arc::ptr_eq(&bh.jitcode, &helper_jc));
+        assert_eq!(bh.position, add_pc);
+        assert_eq!(bh.registers_i[0], 40);
+        assert_eq!(bh.registers_i[1], 2);
+
+        let outcome = crate::blackhole::run_forever(&mut builder, bh, 0);
+        assert_eq!(
+            outcome,
+            crate::jitexc::JitException::DoneWithThisFrameInt(42),
+            "helper must resume after the skipped mul (40*2) and return 40+2"
+        );
+    }
+
     struct TestVirtualizableInfo;
 
     impl VirtualizableInfo for TestVirtualizableInfo {

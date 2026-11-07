@@ -5496,6 +5496,11 @@ where
     S: JitCodeSym,
     R: JitCodeRuntime,
 {
+    // Portal only (`compile.py` / #2446). Helper-innermost resume puts the
+    // helper last; a whole-body scan of that helper would refuse every
+    // exception bridge whose jitcode names `push_roots` / `make_pyerror` in
+    // an untaken arm. Record-time abort refuses a helper residual that
+    // this walk actually records.
     if frames
         .first()
         .is_some_and(|frame| refuse_reachable_symbolic_residuals(&frame.jitcode))
@@ -9582,6 +9587,35 @@ mod tests {
         let after = symbolic_residual_trace_aborts();
 
         assert_eq!(after - before, 1, "one trace start is one refusal");
+    }
+
+    /// Helper-innermost resume puts the helper last. Preflight stays on
+    /// `frames.first()` (the portal, #2446); a helper-body hash is not a
+    /// reason to refuse the whole framestack. The helper itself still
+    /// reports as refuse-true so record-time abort / compile-refuse see it.
+    #[test]
+    fn resume_framestack_preflight_is_portal_only() {
+        let mut portal = JitCodeBuilder::new();
+        portal.void_return();
+        let portal = std::sync::Arc::new(portal.finish());
+        assert!(!refuse_reachable_symbolic_residuals(&portal));
+
+        let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments([
+            "resume_framestack_preflight_is_portal_only",
+        ]);
+        let mut helper = JitCodeBuilder::new();
+        let unbound = helper.add_fn_ptr(symbolic as usize as *const ());
+        helper.residual_call_void_canonical_via_target_with_effect_info(
+            unbound,
+            &[],
+            residual_effect(majit_ir::descr::ExtraEffect::CannotRaise),
+        );
+        helper.void_return();
+        let helper = std::sync::Arc::new(helper.finish());
+        assert!(refuse_reachable_symbolic_residuals(&helper));
+        // `trace_jitcode_at_resume_framestack` preflights `frames.first()`
+        // only; a helper-only hash must not refuse the portal.
+        assert!(!refuse_reachable_symbolic_residuals(&portal));
     }
 
     #[test]

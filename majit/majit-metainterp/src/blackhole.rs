@@ -911,11 +911,26 @@ impl BlackholeInterpreter {
         self.init_register_files_from_runtime_jitcode(jitcode);
         self.reset_position_state(position);
         if crate::bh_debug_enabled() {
+            let code = &self.jitcode.code;
+            let dest = position
+                .checked_sub(1)
+                .and_then(|i| code.get(i).copied())
+                .unwrap_or(0xff);
+            let start = position.saturating_sub(12);
+            let result_kind = self
+                .jitcode
+                .try_body()
+                .and_then(|body| body.resulttypes.as_ref())
+                .and_then(|types| types.get(&position).copied());
             eprintln!(
-                "[bh-setpos] jitcode={:?} index={:?} position={position} code_len={}",
+                "[bh-setpos] jitcode={:?} index={:?} position={position} code_len={} num_regs=({},{},{}) dest_byte={dest} resulttypes={result_kind:?} bytes[{start}..{position}]={:?}",
                 self.jitcode.name,
                 self.jitcode.try_index(),
                 self.jitcode.code.len(),
+                self.jitcode.num_regs_i(),
+                self.jitcode.num_regs_r(),
+                self.jitcode.num_regs_f(),
+                &code[start..position.min(code.len())],
             );
         }
     }
@@ -1183,6 +1198,39 @@ impl BlackholeInterpreter {
         self.jitcode.code[self.position - 1] as usize
     }
 
+    /// Dest bank of the call this frame is paused after.
+    ///
+    /// `make_result_of_lastop` (`pyjitpl.py`) reads `_resulttypes[self.pc]`.
+    /// Debug only: a helper `_returntype` that disagrees with that encoding
+    /// is a codewriter defect (`jtransform.py rewrite_call` /
+    /// `call.py RESULT == FUNC.RESULT`), not a writeback to paper over.
+    fn encoded_call_result_kind(&self) -> Option<char> {
+        self.jitcode
+            .try_body()
+            .and_then(|body| body.resulttypes.as_ref())
+            .and_then(|types| types.get(&self.position).copied())
+    }
+
+    /// Write a callee return into the dest the caller call allocated.
+    ///
+    /// `blackhole.py _leave_blackhole_interp` dispatches on the callee
+    /// `_returntype` to `_setup_return_value_*`. The dest byte is
+    /// `code[position-1]` in the bank of that kind.
+    fn setup_return_value_from_callee(
+        &mut self,
+        ret_type: BhReturnType,
+        tmp_i: i64,
+        tmp_r: i64,
+        tmp_f: i64,
+    ) {
+        match ret_type {
+            BhReturnType::Void => {}
+            BhReturnType::Int => self.setup_return_value_i(tmp_i),
+            BhReturnType::Ref => self.setup_return_value_r(tmp_r),
+            BhReturnType::Float => self.setup_return_value_f(tmp_f),
+        }
+    }
+
     /// blackhole.py _setup_return_value_i
     ///
     /// Connect the return of values from the called frame to the
@@ -1332,12 +1380,25 @@ impl BlackholeInterpreter {
         let tmp_f = self.tmpreg_f;
 
         let caller = self.nextblackholeinterp.as_mut().unwrap();
-        match ret_type {
-            BhReturnType::Int => caller.setup_return_value_i(tmp_i),
-            BhReturnType::Ref => caller.setup_return_value_r(tmp_r),
-            BhReturnType::Float => caller.setup_return_value_f(tmp_f),
-            BhReturnType::Void => {}
+        if crate::bh_debug_enabled() {
+            let dest = caller
+                .position
+                .checked_sub(1)
+                .and_then(|i| caller.jitcode.code.get(i).copied())
+                .unwrap_or(0xff);
+            eprintln!(
+                "[bh-ret] callee={} ret={:?} -> caller={} pos={} dest={dest} encoded={:?} banks=({},{},{})",
+                self.jitcode.name,
+                ret_type,
+                caller.jitcode.name,
+                caller.position,
+                caller.encoded_call_result_kind(),
+                caller.registers_i.len(),
+                caller.registers_r.len(),
+                caller.registers_f.len(),
+            );
         }
+        caller.setup_return_value_from_callee(ret_type, tmp_i, tmp_r, tmp_f);
 
         // blackhole.py:1645 — return no exception
         Ok(0)
@@ -2192,11 +2253,12 @@ impl BlackholeInterpreter {
             self.last_opcode_position = pos_before;
             if trace {
                 eprintln!(
-                    "[bh-trace] pos={} op={} reg0={} reg1={}",
+                    "[bh-trace] pos={} op={} i0={} i1={} r0={:x}",
                     pos_before,
                     opcode,
                     self.registers_i.first().copied().unwrap_or(-1),
                     self.registers_i.get(1).copied().unwrap_or(-1),
+                    self.registers_r.first().copied().unwrap_or(0) as u64,
                 );
             }
             match self.dispatch_step(opcode, code) {
@@ -5294,6 +5356,78 @@ mod tests {
             assert_eq!(bh.registers_i[7], 42);
         }
 
+        /// `BlackholeInterpreter.setposition` + `run` on a helper (non-portal)
+        /// jitcode. Every JitCode is runnable (`blackhole.py setposition`).
+        #[test]
+        fn helper_jitcode_blackhole_resumes_at_pc_from_register_banks() {
+            use crate::pyjitpl::{MIFrame, MIFrameStack};
+
+            let mut helper = JitCodeBuilder::default();
+            helper.record_binop_i(0, OpCode::IntMul, 0, 1);
+            let add_pc = helper.current_pos();
+            helper.record_binop_i(2, OpCode::IntAdd, 0, 1);
+            helper.int_return(2);
+            let helper_jc = std::sync::Arc::new(helper.finish());
+
+            let mut frame = MIFrame::new(helper_jc, add_pc);
+            frame.int_regs[0] = Some(OpRef::const_int(40));
+            frame.int_regs[1] = Some(OpRef::const_int(2));
+            let framestack = MIFrameStack::new(frame);
+
+            let mut builder = build_test_bh_builder();
+            let outcome =
+                convert_and_run_from_pyjitpl(&mut builder, &framestack, 0, false, None, None);
+            assert_eq!(
+                outcome,
+                crate::jitexc::JitException::DoneWithThisFrameInt(42)
+            );
+        }
+
+        /// An abort after an effect in a helper converts in place:
+        /// `convert_and_run_from_pyjitpl` resumes the helper after the effect
+        /// and writes the result into the caller's pending slot
+        /// (`_setup_return_value_i` / `_done_with_this_frame`). Starting the
+        /// helper at 0 would re-run `int_mul` and return 82.
+        #[test]
+        fn helper_abort_after_effect_converts_into_caller_without_replaying() {
+            use crate::pyjitpl::{MIFrame, MIFrameStack};
+
+            let mut helper = JitCodeBuilder::default();
+            helper.record_binop_i(0, OpCode::IntMul, 0, 1);
+            let add_pc = helper.current_pos();
+            helper.record_binop_i(2, OpCode::IntAdd, 0, 1);
+            helper.int_return(2);
+            let helper_jc = std::sync::Arc::new(helper.finish());
+
+            let mut parent = JitCodeBuilder::default();
+            parent.inline_call_r_i(0, &[], Some(7));
+            let after_call = parent.current_pos();
+            parent.int_return(7);
+            let parent_jc = std::sync::Arc::new(parent.finish());
+            assert_eq!(
+                parent_jc.code[after_call - 1],
+                7,
+                "caller resumes on the inline_call result register"
+            );
+
+            let mut parent_frame = MIFrame::new(parent_jc, after_call);
+            let mut helper_frame = MIFrame::new(helper_jc, add_pc);
+            helper_frame.int_regs[0] = Some(OpRef::const_int(40));
+            helper_frame.int_regs[1] = Some(OpRef::const_int(2));
+
+            let mut framestack = MIFrameStack::new(parent_frame);
+            framestack.push(helper_frame);
+
+            let mut builder = build_test_bh_builder();
+            let outcome =
+                convert_and_run_from_pyjitpl(&mut builder, &framestack, 0, false, None, None);
+            assert_eq!(
+                outcome,
+                crate::jitexc::JitException::DoneWithThisFrameInt(42),
+                "helper must resume after the skipped mul (40*2) and return 40+2"
+            );
+        }
+
         #[test]
         fn test_bh_interp_load_const_and_binop() {
             // Build jitcode: r0 = const(10), r1 = const(20), r2 = r0 + r1
@@ -5435,6 +5569,7 @@ mod tests {
                     size: 8,
                     align: 8,
                     gckind: majit_translate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                    repr_transparent: false,
                     fields: vec![StructFieldLayout {
                         name: "f".into(),
                         offset: 0,
@@ -13485,20 +13620,22 @@ fn handler_debug_fatalerror(
         .collect();
     panic!("{}", String::from_utf8_lossy(&bytes));
 }
-/// blackhole.py `bhimpl_cast_ptr_to_int(a)`. The cast is identity
-/// (the tagging arithmetic lives at the erase site, never here); the
-/// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate.
-/// `ll_assert` remains a translated runtime assertion.
+/// blackhole.py `bhimpl_cast_ptr_to_int(a)`. Identity on the bits, matching
+/// `assembler.py genop_cast_ptr_to_int = _genop_same_as` and
+/// `trace_cast_ptr_to_int`. The operand is a GCREF word
+/// (`lltype._cast_to_int` returns even-aligned `id()` for a GC pointer);
+/// helper jitcode `cast_ptr_to_int` of those GCREFs is the same mov.
+/// A guard resume inside the helper re-executes this cast
+/// (`blackhole_from_resumedata` / `setposition`).
 fn bhimpl_cast_ptr_to_int(a: i64) -> i64 {
-    assert!((a & 1) == 1, "bhimpl_cast_ptr_to_int: not an odd int");
     a
 }
 
-/// blackhole.py `bhimpl_cast_int_to_ptr(i)`. Identity cast; the
-/// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate
-/// before it is reinterpreted as a `GCREF`.
+/// blackhole.py `bhimpl_cast_int_to_ptr(i)`. Identity on the bits, matching
+/// `assembler.py genop_cast_int_to_ptr = _genop_same_as` and
+/// `trace_cast_int_to_ptr`. Round-trips the GCREF word `cast_ptr_to_int`
+/// produced.
 fn bhimpl_cast_int_to_ptr(i: i64) -> i64 {
-    assert!((i & 1) == 1, "bhimpl_cast_int_to_ptr: not an odd int");
     i
 }
 

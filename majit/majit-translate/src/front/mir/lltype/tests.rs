@@ -20,16 +20,18 @@ use majit_charon_reader::{
 
 use crate::front::mir::tests::{
     adt_node, adt_ty, as_usize_cast_fixture, assert_cast_ptr_to_int_then_r_uint, call_leafs,
-    code_struct, empty_generics, empty_llbc, fixture_item_meta, fixture_llbc, fixture_span,
-    fixture_ty, graph_ops, i64_field, i64_ty, ident_path, item_meta_json, kwargs_unerase_cast_llbc,
-    kwargs_unerase_ptr_tys, llbc_with_trait_impls, llbc_with_types, mut_ref_value_field,
-    mut_u8_ty_json, named_adt, option_adt_node, option_adt_node_from_types, option_enum,
-    option_int_arg, option_shared_ref, range_contains_fixture, result_adt_node, result_enum,
-    span_json, struct_decl, trait_clone_call_fixture, trait_clone_kind_payload, transparent_layout,
-    type_decl_alias, type_decl_meta, type_decl_struct, tyref_to_attr_value_type, unit_fn_ptr,
-    usize_ty, vec_decl_json, vec_of, vec_type_decls, vec_usize_ty_json, window_const_slice_ptr,
-    window_empty_generics, window_llbc, window_local, window_meta, window_mut_slice, window_place,
-    window_shared_slice, window_slice, window_span, window_usize,
+    chars_offset_global, code_struct, empty_generics, empty_llbc, fixture_item_meta, fixture_llbc,
+    fixture_span, fixture_ty, graph_ops, i64_field, i64_ty, ident_path, item_meta_json,
+    kwargs_unerase_cast_llbc, kwargs_unerase_ptr_tys, llbc_with_trait_impls, llbc_with_types,
+    mut_ref_value_field, mut_u8_ty_json, named_adt, option_adt_node, option_adt_node_from_types,
+    option_enum, option_int_arg, option_shared_ref, range_contains_fixture, result_adt_node,
+    result_enum, span_json, struct_decl, trait_clone_call_fixture, trait_clone_kind_payload,
+    transparent_layout, type_decl_alias, type_decl_meta, type_decl_struct,
+    tyref_to_attr_value_type, unit_fn_ptr, usize_ty, vec_decl_json, vec_of, vec_type_decls,
+    vec_usize_ty_json, window_const_slice_ptr, window_const_u8_ptr, window_empty_generics,
+    window_graph_ops, window_llbc, window_llbc_with_globals, window_local, window_meta,
+    window_mut_slice, window_opaque_fun, window_place, window_shared_slice, window_slice,
+    window_span, window_unwind_and_return_blocks, window_usize,
 };
 
 #[test]
@@ -1800,17 +1802,17 @@ fn flavor_raw_struct_borrow_is_int_banked_with_class_root() {
         "residual FUNC.RESULT of &RawFlavorStruct is raw:<owner>, got {harvested_token:?}"
     );
     assert_eq!(
-            dont_look_inside_return_token(
-                &get_ptr_fd.signature.output,
-                &llbc,
-                spec,
-                &empty_gc,
-                &empty,
-            )
-            .as_deref(),
-            Some("ref"),
-            "empty flavor set keeps the residual token as ref"
-        );
+        dont_look_inside_return_token(
+            &get_ptr_fd.signature.output,
+            &llbc,
+            spec,
+            &empty_gc,
+            &empty,
+        )
+        .as_deref(),
+        Some("ref"),
+        "empty flavor set keeps the residual token as ref"
+    );
     let graph = crate::test_support::lower_function(&llbc, "inspect").expect("lower inspect");
     let input = graph
         .blocks
@@ -4275,6 +4277,241 @@ fn window_classifier_predicates() {
         &llbc,
         crate::ErrorCarrierSpec::default()
     ));
+}
+
+fn window_local_len_shadow(block_u8: bool, str_view: bool, list_view: bool) -> Option<usize> {
+    let shared = window_shared_slice();
+    let locals: majit_charon_reader::ullbc::Locals = serde_json::from_value(serde_json::json!({
+        "arg_count": 0,
+        "locals": [window_local(0, &shared)]
+    }))
+    .expect("window Locals");
+    let llbc = window_llbc(vec![], vec![]);
+    super::pair_len_shadows_of(
+        &locals,
+        &llbc,
+        &[false],
+        &[str_view],
+        &[list_view],
+        &[block_u8],
+        crate::ErrorCarrierSpec::default(),
+    )[0]
+}
+
+/// A `&[u8]` window that is also a BytesBlock / STR `as_bytes` view
+/// stays one `Ptr(STR)` word (`rstr.py` `STR`): no length shadow.
+#[test]
+fn window_block_u8_local_has_no_length_shadow() {
+    assert!(
+        window_local_len_shadow(false, false, false).is_some(),
+        "a host `&[u8]` window keeps a length shadow"
+    );
+    assert_eq!(
+        window_local_len_shadow(true, false, false),
+        None,
+        "block_u8 window is one Ptr(STR) word"
+    );
+    assert_eq!(
+        window_local_len_shadow(false, true, false),
+        None,
+        "str_view window is one Ptr(STR) word"
+    );
+    assert_eq!(
+        window_local_len_shadow(false, false, true),
+        None,
+        "list_view window stays the list"
+    );
+}
+
+/// `BytesBlock` chars sit at `LOWLEVEL_STRING_CHARS_OFFSET` (hash, then
+/// length, then chars), the same two-word offset `pair_of_str_view` uses.
+#[test]
+fn pair_of_bytes_block_view_chars_offset_is_two_words() {
+    use crate::model::OpKind;
+
+    let offset = super::lowlevel_string_chars_byte_offset();
+    assert_eq!(offset, 2 * crate::layout::target_word_size());
+    assert_eq!(
+        offset as u64,
+        crate::front::from_raw_parts::str_chars_offset()
+    );
+
+    let mut_slice = window_mut_slice();
+    let unit = serde_json::json!({"Tuple": []});
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let take = window_opaque_fun(
+        1,
+        &["fixture", "take_mut_slice"],
+        vec![mut_slice.clone()],
+        unit.clone(),
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "pass_mut_slice"], true),
+        "signature": {"is_unsafe": true, "inputs": [mut_slice], "output": unit},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &unit),
+                window_local(1, &mut_slice)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &mut_slice)}],
+                        "dest": window_place(serde_json::json!({"Local": 0}), &unit)
+                    }, "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                ret
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller, take]);
+    let graph = super::lower_function(&llbc, "pass_mut_slice")
+        .expect("lower pair_of_bytes_block_view site");
+    let consts: Vec<i64> = window_graph_ops(&graph)
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::ConstInt(n) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        consts.contains(&(offset as i64)),
+        "pair_of_bytes_block_view chars offset is two words; consts={consts:?} graph={}",
+        graph.dump()
+    );
+}
+
+/// `from_raw_parts(header.add(CHARS_OFFSET), live_len)` of a window dest
+/// keeps chars as ptr (`rstr.py` `STR`); the add is not identity on the
+/// header (`length_relaxed` is not `ll_strlen`).
+#[test]
+fn window_from_raw_parts_of_header_chars_add_keeps_chars_offset() {
+    use crate::model::OpKind;
+
+    let offset = super::lowlevel_string_chars_byte_offset();
+    let shared = window_shared_slice();
+    let u8_ptr = window_const_u8_ptr();
+    let n = window_usize();
+    let isize_t = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let header_adt = serde_json::json!({
+        "Adt": {"id": 0, "generics": window_empty_generics()}
+    });
+    let header_ptr = serde_json::json!({"RawPtr": [header_adt, "Const"]});
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": isize_t, "attr_info": null},
+            {"name": "length", "ty": n, "attr_info": null}
+        ]},
+        "layout": null
+    });
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let add = window_opaque_fun(
+        1,
+        &["core", "ptr", "const_ptr", "<Impl>", "add"],
+        vec![u8_ptr.clone(), n.clone()],
+        u8_ptr.clone(),
+    );
+    let from_raw = window_opaque_fun(
+        2,
+        &["core", "slice", "raw", "from_raw_parts"],
+        vec![u8_ptr.clone(), n.clone()],
+        shared.clone(),
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "window_header_chars_live_len"], true),
+        "signature": {"is_unsafe": true, "inputs": [header_ptr, n], "output": shared},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &shared),
+                window_local(1, &header_ptr),
+                window_local(2, &n),
+                window_local(3, &u8_ptr),
+                window_local(4, &u8_ptr)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 3}), &u8_ptr),
+                            {"UnaryOp": [
+                                {"Cast": {"RawPtr": [header_ptr, u8_ptr]}},
+                                {"Move": window_place(serde_json::json!({"Local": 1}), &header_ptr)}
+                            ]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [
+                            {"Move": window_place(serde_json::json!({"Local": 3}), &u8_ptr)},
+                            {"Copy": window_place(serde_json::json!({"Global": {
+                                "generics": window_empty_generics(),
+                                "id": 1
+                            }}), &n)}
+                        ],
+                        "dest": window_place(serde_json::json!({"Local": 4}), &u8_ptr)
+                    }, "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 2},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [
+                            {"Move": window_place(serde_json::json!({"Local": 4}), &u8_ptr)},
+                            {"Copy": window_place(serde_json::json!({"Local": 2}), &n)}
+                        ],
+                        "dest": window_place(serde_json::json!({"Local": 0}), &shared)
+                    }, "target": 3, "on_unwind": 1}}}
+                },
+                ret
+            ]
+        }}
+    });
+    let llbc = window_llbc_with_globals(
+        vec![utf8],
+        vec![caller, add, from_raw],
+        vec![
+            serde_json::Value::Null,
+            chars_offset_global(1, "LOWLEVEL_STRING_CHARS_OFFSET"),
+        ],
+    );
+    let graph = super::lower_function(&llbc, "window_header_chars_live_len")
+        .expect("lower window from_raw_parts of header chars add");
+    let consts: Vec<i64> = window_graph_ops(&graph)
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::ConstInt(v) => Some(*v),
+            OpKind::ConstUInt(v) => i64::try_from(*v).ok(),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        consts.contains(&(offset as i64)),
+        "window from_raw_parts of header.add(CHARS_OFFSET) keeps chars offset; consts={consts:?} graph={}",
+        graph.dump()
+    );
 }
 
 #[test]

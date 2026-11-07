@@ -2888,21 +2888,22 @@ pub(crate) unsafe fn bytearray_inplace_repeat(
         crate::builtins::bytearray_check_exports(ba)?;
     }
     if count == 0 {
-        pyre_object::bytearrayobject::w_bytearray_vec_mut(ba).clear();
-        pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, len);
+        let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
+        vec.clear();
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), len);
         return Ok(());
     }
     if len == 0 {
         return Ok(());
     }
     let snapshot = pyre_object::bytearrayobject::w_bytearray_data(ba).to_vec();
-    let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
+    let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
     vec.try_reserve_exact(new_size - len)
         .map_err(|_| crate::builtins::reservation_failed())?;
     for _ in 1..count {
         vec.extend_from_slice(&snapshot);
     }
-    pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, len);
+    pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), len);
     Ok(())
 }
 
@@ -7655,6 +7656,29 @@ pub extern "C" fn compare_slot_jit_abi(a: PyObjectRef, b: PyObjectRef, op: i64) 
         )));
     };
     match compare_slot(a, b, op) {
+        Ok(result) => result,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error_ref(error),
+    }
+}
+
+/// One-word residual ABI for [`list_concat`].
+///
+/// `PyResult` is sret, so the raw function cannot be a residual-call target.
+/// The callee keeps its graph; this is the address `getfunctionptr` would
+/// have supplied.
+#[inline(never)]
+pub extern "C" fn list_concat_jit_abi(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
+    match unsafe { list_concat(a, b) } {
+        Ok(result) => result,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error_ref(error),
+    }
+}
+
+/// One-word residual ABI for [`str_repeat`]. Same sret reason as
+/// [`list_concat_jit_abi`].
+#[inline(never)]
+pub extern "C" fn str_repeat_jit_abi(s: PyObjectRef, n: PyObjectRef) -> PyObjectRef {
+    match unsafe { str_repeat(s, n) } {
         Ok(result) => result,
         Err(error) => crate::runtime_ops::jit_publish_residual_error_ref(error),
     }

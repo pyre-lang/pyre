@@ -2310,8 +2310,13 @@ pub struct GraphTransform {
 
 impl GraphTransform {
     fn apply(&self, graph: &mut FunctionGraph) {
-        if let Some(rt) = &self.return_type {
-            graph.return_type = Some(rt.clone());
+        // A unit `()` graph is already `FUNC.RESULT = void`. A later
+        // registration token (a spec copy whose substituted output is
+        // coloured Ref) must not recolour it.
+        if graph.return_type.as_deref() != Some("()") {
+            if let Some(rt) = &self.return_type {
+                graph.return_type = Some(rt.clone());
+            }
         }
         if let Some(root) = &self.return_class_root {
             graph.return_class_root = Some(root.clone());
@@ -2360,6 +2365,8 @@ pub(crate) enum DecoratorAttr {
     /// `rffi.py llexternal` `canraise=False` on the C function
     /// (`canraise.py analyze_external_call`).
     FuncptrCannotRaise,
+    /// `func._jit_look_inside_ = False` (`rlib/jit.py` `dont_look_inside`).
+    DontLookInside,
 }
 
 impl DecoratorAttr {
@@ -2398,6 +2405,7 @@ impl DecoratorAttr {
             "not_in_trace" => Self::Oopspec("jit.not_in_trace".to_string()),
             "gc_effects" => Self::GcEffects,
             "funcptr_canraise_false" => Self::FuncptrCannotRaise,
+            "dont_look_inside" => Self::DontLookInside,
             _ => return None,
         })
     }
@@ -2472,6 +2480,12 @@ impl FuncObjAttrs {
                 DecoratorAttr::FuncptrCannotRaise => {
                     func.canraise = false;
                     None
+                }
+                DecoratorAttr::DontLookInside => {
+                    if func.jit_look_inside.is_none() {
+                        func.jit_look_inside = Some(false);
+                    }
+                    Some("dont_look_inside")
                 }
             };
             if let Some(token) = token {
@@ -3083,6 +3097,19 @@ impl StoreCore {
         let slot = self.slot_for(path)?;
         let graph = self.slot_graph(&slot)?.graph.clone();
         Some(graph)
+    }
+
+    /// `getattr(funcobj, 'external', None) is not None` (`graphanalyze.py`
+    /// `GraphAnalyzer.analyze` on `direct_call`). A C `llexternal` is
+    /// [`crate::model::LazyGraph::external`]; an unregistered path or a
+    /// graph-less internal funcobj is not.
+    pub(crate) fn is_external(&self, path: &CallPath) -> bool {
+        let Some(slot) = self.slot_for(path) else {
+            return false;
+        };
+        slot.source
+            .as_ref()
+            .is_some_and(|source| source.graph.is_external())
     }
 
     pub(crate) fn get_mut(&mut self, path: &CallPath) -> Option<&mut FunctionGraph> {
@@ -4129,6 +4156,9 @@ pub struct CallControl {
     /// `_exception_class_<Enum>` rows. `CodeWriter::dual_gate_registry`
     /// mints each hierarchy on the bookkeeper after the error carrier.
     pub exception_class_hints: Vec<crate::front::llbc_hints::ExceptionClassHint>,
+    /// By-value field-0 parents (`DeclaredGcFacts::field0_parent_ids`).
+    /// A named struct in this set is an rclass instance root.
+    pub field0_parents: HashSet<majit_ir::descr::StructId>,
     /// `descr.py:364 is_pure = ARRAY_INSIDE._immutable_field(None)` parity.
     /// Pre-computed at `set_struct_fields` time by walking
     /// `immutable_fields_by_struct` for fields with `ImmutableRank::is_array()
@@ -4238,6 +4268,10 @@ pub struct StructLayout {
     /// on the field-0 chain. `Raw` otherwise. Set when the layout is
     /// registered; readers must not treat a missing layout as either kind.
     pub gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind,
+    /// `#[repr(transparent)]` (`TypeDecl::is_repr_transparent`). The
+    /// wrapper's repr is the one non-ZST field's; it is never a
+    /// headerless raw ADT (`raw_struct_ptr_from_layout`).
+    pub repr_transparent: bool,
     /// Per-field layout: (field_name, offset, size, type).
     /// RPython: `symbolic.get_field_token(STRUCT, name, tsc) → (offset, size)`.
     pub fields: Vec<StructFieldLayout>,
@@ -4496,6 +4530,7 @@ impl StructLayout {
             size,
             align,
             gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            repr_transparent: false,
             fields: layout_fields,
             host: None,
             ll_struct: std::cell::RefCell::new(None),
@@ -4798,6 +4833,7 @@ impl CallControl {
             immutable_fields_by_struct: HashMap::new(),
             raw_alloc_flavor_structs: HashSet::new(),
             exception_class_hints: Vec::new(),
+            field0_parents: HashSet::new(),
             immutable_array_types: HashSet::new(),
             unsafe_fn_stubs: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),
@@ -5336,7 +5372,7 @@ impl CallControl {
                 // spelling, so both must hash the canonical form.
                 let canonical = crate::front::typestr::canonical_array_type_id(atid);
                 let atid = canonical.as_ref();
-                let path_hash_u64 = majit_ir::descr::path_hash(atid);
+                let path_hash_u64 = majit_ir::descr::array_identity_hash(atid);
                 let nolength = len_offset.is_none();
                 let length_offset = len_offset.unwrap_or(0);
                 // `descr.py get_array_descr` cache-or-mint:
@@ -10541,6 +10577,18 @@ impl CallControl {
         self.stamp_graph_hint(&path, "elidable");
     }
 
+    /// `func._jit_look_inside_ = False` (`rlib/jit.py` `dont_look_inside`).
+    /// Harvested `_jit_look_inside_` markers used to skip `DecoratorAttr`,
+    /// so a policy-opaque helper with no `function_graphs` row never got
+    /// the attribute CollectAnalyzer reads off `funcobj`.
+    pub fn mark_dont_look_inside(&mut self, path: CallPath) {
+        let func = self.func_effects_mut(&path);
+        if func.jit_look_inside.is_none() {
+            func.jit_look_inside = Some(false);
+        }
+        self.stamp_graph_hint(&path, "dont_look_inside");
+    }
+
     /// RPython: `getattr(func, "_jit_loop_invariant_", False)` (call.py).
     /// Mark a target as loop-invariant.
     pub fn mark_loopinvariant(&mut self, path: CallPath) {
@@ -10795,6 +10843,7 @@ impl CallControl {
                 DecoratorAttr::CannotCollect => self.mark_cannot_collect(path),
                 DecoratorAttr::GcEffects => self.mark_external_gc_effects(path),
                 DecoratorAttr::FuncptrCannotRaise => self.mark_external_cannot_raise(path),
+                DecoratorAttr::DontLookInside => self.mark_dont_look_inside(path),
             }
         }
     }
@@ -11686,7 +11735,10 @@ impl CallControl {
     ///   In majit the codewriter graph has no LL_OPERATIONS; allocations are
     ///   only reachable transitively through calls.
     /// - analyze_direct_call: recurse into callee graphs.
-    /// - analyze_external_call (graphanalyze.py): bottom_result() (False).
+    /// - analyze_external_call (`collectanalyze.py`): `random_effects_on_gcobjs`
+    ///   else `bottom_result()` (False) — only for `funcobj.external`.
+    /// - no `funcobj.graph` (`graphanalyze.py` AttributeError) or an
+    ///   address-less callee: `top_result()` (True).
     /// - _gctransformer_hint_cannot_collect_ (collectanalyze.py):
     ///   functions whose `func.cannot_collect` is set are known not to collect.
     fn analyze_can_collect(
@@ -11717,20 +11769,26 @@ impl CallControl {
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
             None => {
-                // collectanalyze.py: analyze_external_call —
-                // if funcobj.random_effects_on_gcobjs → True,
-                // else → bottom_result() (False).
-                //
-                // `canmallocgc` joins it because a callee in a crate that was
-                // never lowered is how this side spells an allocation
-                // operation, which `analyze_simple_operation` answers True
-                // (collectanalyze.py). Only this analyzer reads it:
-                // `analyze_random_effects` keeps returning False for it, as
-                // `RandomEffectsAnalyzer.analyze_simple_operation` does
+                // graphanalyze.py GraphAnalyzer.analyze on direct_call:
+                //   getattr(funcobj, 'external', None) is not None
+                //     → analyze_external_call
+                //   except AttributeError on funcobj.graph
+                //     → top_result()
+                // CollectAnalyzer.analyze_external_call
+                // (`collectanalyze.py`): random_effects_on_gcobjs else
+                // bottom. `canmallocgc` is this side's
+                // `analyze_simple_operation` spelling for a graph-less
+                // allocation helper (`LL_OPERATIONS[op].canmallocgc`);
+                // RandomEffectsAnalyzer still answers False for it
                 // (effectinfo.py).
-                return self
-                    .external_funcobj(path)
-                    .is_some_and(|f| f.random_effects_on_gcobjs || f.canmallocgc);
+                if self.function_graphs.is_external(path) {
+                    return self
+                        .external_funcobj(path)
+                        .is_some_and(|f| f.random_effects_on_gcobjs || f.canmallocgc);
+                }
+                // Unregistered, graph-less internal, DelayedPointer: the
+                // analyzer cannot see the callee, so it collects.
+                return true;
             }
         };
         if !seen.enter(path.clone(), analyzed) {
@@ -11781,11 +11839,14 @@ impl CallControl {
                                 self, target,
                             ) => {}
                         OpKind::Call { target, .. } => {
-                            // graphanalyze.py: analyze_direct_call — recurse
-                            let callee_path = match self.target_to_path(target) {
+                            // graphanalyze.py: analyze_direct_call — recurse.
+                            // `target_to_path` drops `__fn_const`; the residual
+                            // for a `dont_look_inside` helper is that trampoline.
+                            let callee_path = match self.resolved_direct_path(target) {
                                 Some(p) => p,
-                                // graphanalyze.py: external call → bottom_result (False)
-                                None => continue,
+                                // graphanalyze.py: DelayedPointer / no
+                                // address → top_result() (True).
+                                None => break 'walk true,
                             };
                             if self.analyze_can_collect(&callee_path, seen, analyzed) {
                                 break 'walk true;
@@ -11948,18 +12009,84 @@ impl CallControl {
 
     /// Cached version of analyze_can_collect for a CallTarget.
     /// RPython: collect_analyzer.analyze(op, self.seen_gc) (collectanalyze.py).
-    /// graphanalyze.py: analyze_external_call → bottom_result() (False).
     fn cached_can_collect_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> bool {
         self.analyze_can_collect(path, &mut CallTracker::new(), &mut cache.can_collect)
     }
 
     fn cached_can_collect(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
-        let path = match self.target_to_path(target) {
+        // `target_to_path` drops `__fn_const` (the residual for a
+        // `dont_look_inside` helper is that fn-const trampoline). CollectAnalyzer
+        // still walks the helper's graph (`call.py` `getcalldescr` on
+        // `funcobj.graph`); without the stripped path the site is
+        // `graphanalyze.py` DelayedPointer / no-address `top_result()`.
+        let path = match self.resolved_direct_path(target) {
             Some(p) => p,
-            // graphanalyze.py: analyze_external_call → bottom_result() (False)
-            None => return false,
+            // graphanalyze.py DelayedPointer / unseen callee → top_result()
+            None => return true,
         };
-        self.cached_can_collect_path(&path, cache)
+        if self.cached_can_collect_path(&path, cache) {
+            return true;
+        }
+        if self.func_effects(&path).is_some_and(|f| f.cannot_collect) {
+            return false;
+        }
+        // JitPolicy keeps `dont_look_inside` bodies out of the JitCode
+        // closure (`look_inside_graph`). The residual is often the real
+        // HELPER_FNADDRS path, or its `__majit_call_target_` wrapper, not
+        // `__fn_const`. CollectAnalyzer then walks a signature stub (or
+        // finds no graph) and answers False even when the helper allocates
+        // (`set_strategy_add_key_ptr` compiled `mov x0, x20; blr` with no
+        // gcmap). PyPy still has `funcobj.graph`. SAVE_GCREF.
+        if crate::model::fn_const_segments(target).is_some() {
+            return true;
+        }
+        self.residual_dont_look_inside(&path)
+    }
+
+    /// `func._jit_look_inside_ = False` on the residual's funcobj, including
+    /// the `__majit_call_target_` wrapper spelling and the crate-stripped
+    /// harvest key. `function_graphs.get` of the callsite path alone misses
+    /// both.
+    fn residual_dont_look_inside(&self, path: &CallPath) -> bool {
+        let is_dli = |p: &CallPath| {
+            self.func_effects(p)
+                .is_some_and(|f| f.jit_look_inside == Some(false))
+                || self
+                    .function_graphs
+                    .get(p)
+                    .is_some_and(|g| g.hints.iter().any(|hint| hint == "dont_look_inside"))
+        };
+        if is_dli(path) {
+            return true;
+        }
+        let user = user_path_behind_majit_call_target(path);
+        if let Some(ref user) = user
+            && is_dli(user)
+        {
+            return true;
+        }
+        let stripped = crate::local_crates::strip_alias_crate_prefix(&path.segments)
+            .map(|segs| CallPath::from_segments(segs.iter().map(String::as_str)));
+        if let Some(ref stripped) = stripped {
+            if is_dli(stripped) {
+                return true;
+            }
+            if let Some(user) = user_path_behind_majit_call_target(stripped)
+                && is_dli(&user)
+            {
+                return true;
+            }
+        }
+        if let Some(user) = user
+            && let Some(stripped_segs) =
+                crate::local_crates::strip_alias_crate_prefix(&user.segments)
+        {
+            let stripped = CallPath::from_segments(stripped_segs.iter().map(String::as_str));
+            if is_dli(&stripped) {
+                return true;
+            }
+        }
+        false
     }
 
     fn cached_can_collect_family(
@@ -13541,15 +13668,19 @@ pub fn effectinfo_from_writeanalyze(
             Some(extra) => {
                 for d in extra {
                     if let Some(ad) = d.as_array_descr() {
+                        // `cpu.arraydescrof(ARRAY)` identity
+                        // (`arraydescrof_concrete` / `array_identity_hash`).
+                        // `single_write_descr_array` is this descr
+                        // (`effectinfo.py`); `_optimize_CALL_ARRAYCOPY`
+                        // reads it.
+                        let array_id = ad.cache_key();
                         let ei = d.get_ei_index();
                         if ei != u32::MAX {
                             write_descrs_arrays.push(ei);
                         }
                         array_write_descrs.push((
                             d.clone(),
-                            Some(majit_ir::effectinfo::DescrSetMember::Array {
-                                array_id: ad.cache_key(),
-                            }),
+                            Some(majit_ir::effectinfo::DescrSetMember::Array { array_id }),
                         ));
                     }
                 }
@@ -16371,7 +16502,8 @@ mod tests {
         assert!(cc.immutable_array_types.contains("[*mut PyObject]"));
     }
     use crate::model::{
-        BlockId, ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase,
+        BlockId, CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, ValueType,
+        exception_exitcase,
     };
 
     /// `cachedgraph` stores the AccessDirect copy on the identity-qualified
@@ -16506,6 +16638,7 @@ mod tests {
             size: 8,
             align: 8,
             gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            repr_transparent: false,
             fields: Vec::new(),
             host: None,
             ll_struct: std::cell::RefCell::new(None),
@@ -22069,6 +22202,7 @@ mod tests {
                 size: crate::layout::target_word_size(),
                 align: crate::layout::target_word_size(),
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![],
                 host: None,
                 ll_struct: std::cell::RefCell::new(None),
@@ -23032,32 +23166,164 @@ mod tests {
         );
     }
 
-    /// `collectanalyze.py analyze_simple_operation` answers True for an
-    /// allocation. Upstream sees one because it is an operation in a graph it
-    /// lowered; a callee in a crate `scripts/extract-llbc.py` does not lower
-    /// reaches `analyze_can_collect` with nothing to walk, so the declaration
-    /// registered by `mark_canmallocgc` is the only thing that can answer for
-    /// it.
-    ///
-    /// Three things are pinned here, and each one has been wrong in this file
-    /// before.
-    ///
-    /// **Resolution.** A 2-segment callsite misses `function_graphs`, misses
-    /// the free-fn leaf index (a crate that was never lowered registers no
-    /// graph to match), and only then falls through to the verbatim
-    /// `Some(path)` that makes the registered spelling reachable at all.
-    ///
-    /// **Attribution.** The negative control is the same graph with the
-    /// declaration withheld: the callee resolves identically and answers
-    /// `false`, so a `true` in the positive case is the mark's doing and not
-    /// some other arm's.
-    ///
-    /// **The axis.** `canmallocgc` must leave `analyze_random_effects` alone,
-    /// exactly as `RandomEffectsAnalyzer.analyze_simple_operation` returns
-    /// False for the same operation (`effectinfo.py`). Declaring these
-    /// allocators `random_effects_on_gcobjs` instead does answer can-collect,
-    /// and then `getcalldescr` rejects every elidable caller of a bigint
-    /// allocator — the pairing `rffi.py:160` asserts against.
+    /// A `dont_look_inside` residual is a `__fn_const` FunctionPath.
+    /// `target_to_path` returns None for that spelling, which used to make
+    /// `getcalldescr` answer `can_collect=false` even when the helper's graph
+    /// is an allocation. `resolved_direct_path` is the same strip
+    /// `fn_const_residual_honours_cannot_raise_assertion` already uses.
+    #[test]
+    fn fn_const_residual_walks_the_helper_graph_for_can_collect() {
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("set_strategy_add_key_ptr");
+        let start = graph.startblock;
+        graph.blocks[start.0].operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::New {
+                owner: "SetItemsStorage".to_string(),
+            },
+        });
+        graph.set_return(start, None);
+        let path =
+            CallPath::from_segments(["pyre_object", "setobject", "set_strategy_add_key_ptr"]);
+        cc.register_function_graph(path, graph);
+
+        let target = CallTarget::function_path([
+            crate::model::FN_CONST_HEAD,
+            "pyre_object",
+            "setobject",
+            "set_strategy_add_key_ptr",
+        ]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(target),
+            vec![Type::Ref, Type::Ref],
+            Type::Ref,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert!(
+            descriptor.extra_info.can_collect,
+            "fn-const residual of an allocating helper must SAVE_GCREF"
+        );
+
+        let cc = CallControl::new();
+        let target = CallTarget::function_path([crate::model::FN_CONST_HEAD, "no_graph"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(target),
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert!(
+            descriptor.extra_info.can_collect,
+            "fn-const with no graph is a dont_look_inside residual; SAVE_GCREF"
+        );
+
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["no_collect"]);
+        cc.mark_cannot_collect(path);
+        let target = CallTarget::function_path([crate::model::FN_CONST_HEAD, "no_collect"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(target),
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert!(
+            !descriptor.extra_info.can_collect,
+            "fn-const with cannot_collect stays False"
+        );
+
+        let dli_collects = |cc: &CallControl, target: CallTarget| {
+            let mut cache = AnalysisCache::default();
+            cc.getcalldescr(
+                &direct_call_op(target),
+                Vec::new(),
+                Type::Void,
+                OopSpecIndex::None,
+                None,
+                &mut cache,
+                None,
+            )
+            .extra_info
+            .can_collect
+        };
+
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("set_strategy_add_key_ptr");
+        graph.push_hint("dont_look_inside");
+        graph.set_return(graph.startblock, None);
+        let path =
+            CallPath::from_segments(["pyre_object", "setobject", "set_strategy_add_key_ptr"]);
+        cc.register_function_graph(path, graph);
+        let target =
+            CallTarget::function_path(["pyre_object", "setobject", "set_strategy_add_key_ptr"]);
+        assert!(
+            dli_collects(&cc, target),
+            "dont_look_inside residual on the real path must SAVE_GCREF"
+        );
+
+        let mut cc = CallControl::new();
+        let path =
+            CallPath::from_segments(["pyre_object", "setobject", "set_strategy_add_key_ptr"]);
+        cc.mark_decorator_hints(&path, &["dont_look_inside".to_string()]);
+        let target =
+            CallTarget::function_path(["pyre_object", "setobject", "set_strategy_add_key_ptr"]);
+        assert!(
+            dli_collects(&cc, target),
+            "harvested dont_look_inside with no graph must SAVE_GCREF"
+        );
+
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("set_strategy_add_key_ptr");
+        graph.push_hint("dont_look_inside");
+        graph.set_return(graph.startblock, None);
+        cc.register_function_graph(path, graph);
+        let target = CallTarget::function_path([
+            "pyre_object",
+            "setobject",
+            "__majit_call_target_set_strategy_add_key_ptr",
+        ]);
+        assert!(
+            dli_collects(&cc, target),
+            "majit_call_target wrapper of a dont_look_inside helper must SAVE_GCREF"
+        );
+
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("set_strategy_add_key_ptr");
+        graph.push_hint("dont_look_inside");
+        graph.set_return(graph.startblock, None);
+        cc.register_function_graph(
+            CallPath::from_segments(["setobject", "set_strategy_add_key_ptr"]),
+            graph,
+        );
+        let target = CallTarget::function_path(["crate", "setobject", "set_strategy_add_key_ptr"]);
+        assert!(
+            dli_collects(&cc, target),
+            "crate-stripped dont_look_inside graph must SAVE_GCREF for the crate:: path"
+        );
+    }
+
+    /// `graphanalyze.py GraphAnalyzer.analyze` on `direct_call`: no
+    /// `funcobj.graph` (AttributeError) and an address-less callee are
+    /// `top_result()`; a true C `llexternal` is
+    /// `CollectAnalyzer.analyze_external_call` (`random_effects_on_gcobjs`
+    /// else bottom). `canmallocgc` is this side's
+    /// `analyze_simple_operation` spelling for a graph-less allocation
+    /// helper and must leave `analyze_random_effects` alone
+    /// (`effectinfo.py`); declaring those allocators
+    /// `random_effects_on_gcobjs` instead makes every elidable caller a
+    /// contradiction (`rffi.py:160`).
     #[test]
     fn a_graphless_allocator_collects_without_claiming_random_effects() {
         let callee =
@@ -23084,9 +23350,9 @@ mod tests {
 
         let cc = build(false);
         assert!(
-            !cc.analyze_can_collect(&caller, &mut CallTracker::new(), &mut new_analyzed_calls()),
-            "an undeclared graph-less callee must answer `false` — otherwise \
-             the positive case below would not be attributable to the mark"
+            cc.analyze_can_collect(&caller, &mut CallTracker::new(), &mut new_analyzed_calls()),
+            "graphanalyze.py AttributeError / DelayedPointer — a graph-less \
+             non-external callee collects"
         );
 
         let cc = build(true);
@@ -23099,6 +23365,62 @@ mod tests {
             !cc.analyze_random_effects(&caller, &mut CallTracker::new(), &mut new_analyzed_calls()),
             "effectinfo.py:417-418 — the same allocation answers \
              `RandomEffectsAnalyzer` False, so an elidable caller stays legal"
+        );
+
+        let mut cc = CallControl::new();
+        let ext = CallPath::from_segments(["memcpy"]);
+        cc.function_graphs_mut().insert_lazy(
+            ext.clone(),
+            crate::model::LazyGraph::external(FunctionGraph::new("memcpy")),
+            GraphTransform::default(),
+            None,
+        );
+        assert!(
+            !cc.analyze_can_collect(&ext, &mut CallTracker::new(), &mut new_analyzed_calls()),
+            "CollectAnalyzer.analyze_external_call bottom unless \
+             random_effects_on_gcobjs"
+        );
+        cc.mark_external_gc_effects(ext.clone());
+        assert!(
+            cc.analyze_can_collect(&ext, &mut CallTracker::new(), &mut new_analyzed_calls()),
+            "collectanalyze.py:22 random_effects_on_gcobjs"
+        );
+    }
+
+    /// `getcalldescr` (`call.py`) passes
+    /// `collect_analyzer.analyze(op, self.seen_gc)` into
+    /// `effectinfo_from_writeanalyze`. A residual like `jit_bigint_invert`
+    /// walks to an unextracted allocator (`alloc_rbigint_nursery_collecting`)
+    /// whose graph the analyzer cannot see, so `can_collect` is true even
+    /// when extraeffect is `EF_ELIDABLE_OR_MEMORYERROR`.
+    #[test]
+    fn getcalldescr_of_a_caller_of_an_unseen_callee_collects() {
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("jit_bigint_invert");
+        let start = graph.startblock;
+        graph.blocks[start.0]
+            .operations
+            .push(direct_call_op(CallTarget::function_path([
+                "majit_rlib",
+                "rbigint",
+                "alloc_rbigint_nursery_collecting",
+            ])));
+        graph.set_return(start, None);
+        cc.register_function_graph(CallPath::from_segments(["jit_bigint_invert"]), graph);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(CallTarget::function_path(["jit_bigint_invert"])),
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert!(
+            descriptor.extra_info.can_collect,
+            "graphanalyze.py top_result for an allocator the collect analyzer \
+             cannot see"
         );
     }
 
@@ -27784,6 +28106,7 @@ mod tests {
                 size: 4,
                 align: 1,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![],
                 host: Some(host.clone()),
                 ll_struct: std::cell::RefCell::new(None),
@@ -27822,6 +28145,7 @@ mod tests {
                 size: 32,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "x".to_string(),
                     offset: 16,

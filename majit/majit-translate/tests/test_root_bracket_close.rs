@@ -45,7 +45,7 @@ use majit_translate::front::mir::{
     LowerContext, RootStackState, erased_root_bracket_guards, lower_fun_decl,
     lower_fun_decl_with_root_stack, lower_fun_decl_with_static_addrs,
 };
-use majit_translate::model::{CallTarget, FunctionGraph, OpKind};
+use majit_translate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
 
 fn fun_decl_named<'a>(llbc: &'a Llbc, leaf: &str) -> &'a majit_charon_reader::FunDecl {
     let suffix = format!("::{leaf}");
@@ -746,6 +746,34 @@ fn a_captured_len_getter_lowers_once_root_stack_effects_are_published() {
     });
 }
 
+/// `install_ascii_items` pins the list and the fresh block around the
+/// owner barrier + field stores. `pin_block` / `UnicodeArray::install`
+/// as callees refuse the rewrite (`returns_index` / nested Open); the
+/// in-body `shadow_stack_len` + `pin_root` shape is the one
+/// `ll_listslice_new_int_list` uses, so the walked jitcode has no
+/// residual `push_roots`.
+#[test]
+fn install_ascii_items_bracket_is_scalar_replaced() {
+    let Some(llbc) = object_llbc() else { return };
+    let graph = lower_named(llbc, "install_ascii_items");
+    for leaf in [
+        "push_roots",
+        "shadow_stack_len",
+        "publish_roots",
+        "normalize_roots",
+        "shadow_stack_get",
+        "pin_root",
+        "pin_block",
+        "root_scope_close",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "install_ascii_items still calls {leaf} after the bracket was scalar-replaced"
+        );
+    }
+}
+
 /// `ll_listslice_new_int_list` pins source and dest around `newlist` +
 /// `ll_arraycopy`. The native RootScope is scalar-replaced so a
 /// BINARY_SLICE sub-walk records the copy, not residual `pin_root`.
@@ -1074,14 +1102,13 @@ fn dict_descr_keys_erases_the_incoming_slice_bracket() {
     });
 }
 
-/// `__majit_wrap_cdata_call` pins the incoming `&[PyObjectRef]` and copies
-/// the tail through `shadow_stack_copy_range`. Production harvests
-/// pyre-object's root-stack effects before lowering pyre-module, the same
-/// order `lib.rs` uses; the incoming-slice plan must erase that bracket so
-/// the walker is not left with a residual `push_roots` at wrap pc=41.
-/// `W_CData.call` (`cdataobj.py descr_call`) passes `args_w` through, so a
-/// callee that opens its own bracket (`W_CTypeFunc._call`) must not keep
-/// wrap's pins in the jitcode.
+/// `__majit_wrap_cdata_call` pins the incoming `&[PyObjectRef]` and passes
+/// `args[1:]` through like `W_CData.call` (`cdataobj.py descr_call`).
+/// Production harvests pyre-object's root-stack effects before lowering
+/// pyre-module, the same order `lib.rs` uses; the incoming-slice plan must
+/// erase that bracket so the walker is not left with a residual
+/// `push_roots` at wrap. A callee that opens its own bracket
+/// (`W_CTypeFunc._call`) must not keep wrap's pins in the jitcode.
 #[test]
 fn wrap_cdata_call_erases_the_incoming_slice_bracket() {
     if !std::path::Path::new(OBJECT_LLBC).is_file()
@@ -1114,6 +1141,10 @@ fn wrap_cdata_call_erases_the_incoming_slice_bracket() {
                     "pin_root",
                     "shadow_stack_get",
                     "shadow_stack_copy_range",
+                    "copy_object_slice_range_into_vec",
+                    "ll_vec_alloc_and_set_r",
+                    "ll_vec_free_r",
+                    "gcarray_from_pyobject_vec",
                     "root_scope_close",
                 ] {
                     assert_eq!(
@@ -1123,21 +1154,154 @@ fn wrap_cdata_call_erases_the_incoming_slice_bracket() {
                     );
                 }
                 assert!(
-                    calls_to(&graph, "copy_object_slice_range_into_vec") > 0,
-                    "wrap must rewrite copy_range to copy_object_slice_range_into_vec"
-                );
-                assert!(
                     calls_to(&graph, "call") > 0,
                     "wrap must still reach ctypefunc::call"
                 );
                 assert!(
-                    calls_to(&graph, "ll_vec_alloc_and_set_r") > 0,
-                    "wrap must allocate the rest-args vec"
+                    calls_to(&graph, "__getslice_rangefrom") > 0,
+                    "wrap must pass args[1:] as rtype_getslice / ll_listslice_startonly"
+                );
+
+                // `jtransform` `_handle_oopspec_call` mints `ll_listslice_startonly`
+                // (`rlist.py rtype_getslice`) only when `getslice_marker_identity`
+                // names the array. A leftover marker is a residual with no host
+                // symbol, and the walker aborts `ResidualCallArgUnbound`.
+                let getslice_markers: Vec<Vec<String>> = graph
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.operations)
+                    .filter_map(|op| match &op.kind {
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if segments.last().is_some_and(|s| s == "__getslice_rangefrom") => {
+                            Some(segments.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let inputs: Vec<String> = graph
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.operations)
+                    .filter_map(|op| match &op.kind {
+                        OpKind::Input {
+                            name,
+                            ty,
+                            class_root,
+                            ..
+                        } => Some(format!("{name} ty={ty:?} root={class_root:?}")),
+                        _ => None,
+                    })
+                    .collect();
+                let identity: Vec<_> = graph
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.operations)
+                    .filter(|op| majit_translate::codewriter::getslice::is_getslice_rangefrom(op))
+                    .map(|op| {
+                        majit_translate::codewriter::getslice::getslice_marker_identity(&graph, op)
+                    })
+                    .collect();
+                let mut cc = CallControl::new();
+                // `analyze_pipeline_from_module_paths` in lib.rs marks this oopspec
+                // for the production pipeline (`rgc.py` `@jit.oopspec('list.ll_arraycopy(...)')`).
+                cc.mark_oopspec(
+                    CallPath::from_segments(["ll_arraycopy"]),
+                    "list.ll_arraycopy(source, dest, source_start, dest_start, length)".to_string(),
+                );
+                let config = GraphTransformConfig::default();
+                let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+                let out = transformer.transform(&graph);
+                let after_kinds: Vec<String> = out
+                    .graph
+                    .blocks
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(bi, b)| {
+                        b.operations.iter().enumerate().map(move |(oi, op)| {
+                            let kind = match &op.kind {
+                                OpKind::Call {
+                                    target: CallTarget::FunctionPath { segments, .. },
+                                    ..
+                                } => format!("Call:{}", segments.join("::")),
+                                OpKind::CallResidual {
+                                    funcptr,
+                                    result_kind,
+                                    ..
+                                } => {
+                                    format!("CallResidual:{funcptr:?}:{result_kind}")
+                                }
+                                OpKind::CallMayForce {
+                                    funcptr,
+                                    result_kind,
+                                    ..
+                                } => {
+                                    format!("CallMayForce:{funcptr:?}:{result_kind}")
+                                }
+                                OpKind::InlineCall {
+                                    jitcode,
+                                    result_kind,
+                                    ..
+                                } => {
+                                    format!("InlineCall:{}:{result_kind}", jitcode.name)
+                                }
+                                OpKind::NewArrayClear { .. } => "NewArrayClear".to_string(),
+                                OpKind::NewArray { .. } => "NewArray".to_string(),
+                                OpKind::ArrayLen { .. } => "ArrayLen".to_string(),
+                                OpKind::ArrayRead { .. } => "ArrayRead".to_string(),
+                                OpKind::ArrayWrite { .. } => "ArrayWrite".to_string(),
+                                other => format!("{other:?}")
+                                    .split(' ')
+                                    .next()
+                                    .unwrap_or("?")
+                                    .to_string(),
+                            };
+                            format!("b{bi}.{oi}:{kind}")
+                        })
+                    })
+                    .collect();
+                let helper =
+                    majit_translate::codewriter::getslice::build_ll_listslice_startonly_graph(
+                        "ll_listslice_startonly__ref__majit__object_ref_gcarray",
+                        &ValueType::Ref(None),
+                        Some(majit_translate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+                    );
+                let mut helper_transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+                let helper_out = helper_transformer.transform(&helper);
+                let helper_arraycopy = helper_out.notes.iter().any(|n| {
+                    n.detail.contains("oopspec Arraycopy") || n.detail.contains("jit_ll_arraycopy")
+                });
+                assert!(
+                    helper_arraycopy,
+                    "listslice helper must rewrite ll_arraycopy to OS_ARRAYCOPY; notes={:?}",
+                    helper_out.notes
+                );
+                let has_listslice = after_kinds
+                    .iter()
+                    .any(|s| s.contains("ll_listslice_startonly"));
+                let has_arraycopy = after_kinds.iter().any(|s| {
+                    s.contains("ll_arraycopy")
+                        || s.contains("jit_ll_arraycopy")
+                        || s.contains("ArrayCopy")
+                });
+                let has_new_array = after_kinds
+                    .iter()
+                    .any(|s| s == "NewArrayClear" || s == "NewArray");
+                assert_eq!(
+                    calls_to(&out.graph, "__getslice_rangefrom"),
+                    0,
+                    "jtransform must rewrite wrap's getslice marker; \
+         markers={getslice_markers:?} identity={identity:?} inputs={inputs:?} \
+         after={after_kinds:?} notes={:?}",
+                    out.notes
                 );
                 assert!(
-                    calls_to(&graph, "ll_vec_free_r") > 0,
-                    "wrap must free the rest-args vec; drop elaboration keeps the \
-         definitely-init Drop of rest and rewrite_op_free frees that header"
+                    has_listslice || has_new_array || has_arraycopy,
+                    "wrap getslice must become ll_listslice_startonly or its inlined \
+         NewArrayClear+arraycopy body; markers={getslice_markers:?} \
+         identity={identity:?} inputs={inputs:?} after={after_kinds:?} notes={:?}",
+                    out.notes
                 );
             });
         });

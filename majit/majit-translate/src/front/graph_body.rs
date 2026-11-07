@@ -331,8 +331,13 @@ impl GraphBodyProvider {
         };
         let Some(graph) = krate.build_decl_graph(&self.tables, src.def_id, &stamp, &declared)
         else {
+            let detail = krate
+                .state
+                .last_skip()
+                .map(|(name, msg)| format!(" ({name}: {msg})"))
+                .unwrap_or_default();
             return Err(LowerError::Unsupported(format!(
-                "{}: body did not lower",
+                "{}: body did not lower{detail}",
                 fd.item_meta.name_path()
             )));
         };

@@ -974,10 +974,12 @@ impl TypeLayout {
             (true, "I16") => Some("i16"),
             (true, "I32") => Some("i32"),
             (true, "I64") => Some("i64"),
+            (true, "Isize") => Some("isize"),
             (false, "U8") => Some("u8"),
             (false, "U16") => Some("u16"),
             (false, "U32") => Some("u32"),
             (false, "U64") => Some("u64"),
+            (false, "Usize") => Some("usize"),
             _ => None,
         }
     }
@@ -3638,6 +3640,8 @@ mod tests {
             (r#"{"Signed":"I16"}"#, Some("i16")),
             (r#"{"Signed":"I32"}"#, Some("i32")),
             (r#"{"Unsigned":"U64"}"#, Some("u64")),
+            (r#"{"Signed":"Isize"}"#, Some("isize")),
+            (r#"{"Unsigned":"Usize"}"#, Some("usize")),
             // Wider than a machine word: no int-bank field type spells it.
             (r#"{"Signed":"I128"}"#, None),
             (r#"{"Unsigned":"U128"}"#, None),

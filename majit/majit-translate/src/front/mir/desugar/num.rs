@@ -1238,7 +1238,7 @@ impl<'a> Lowering<'a> {
         let Some(align) = self.size_align_const_from_tyexpr(true, ty) else {
             return Ok(false);
         };
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let push_const = |graph: &mut FunctionGraph, value: i64| {
             let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             graph.block_mut(bb_id).operations.push(SpaceOperation {

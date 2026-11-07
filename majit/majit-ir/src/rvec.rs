@@ -377,6 +377,11 @@ impl SliceOp {
 /// Module that defines every helper in [`VEC_HELPERS`].
 pub const RVEC_MODULE: &str = "majit_rlib::lltypesystem::rvec";
 
+/// Kind-independent `ll_items`: header buffer pointer word (`ll_vec_as_ptr`).
+pub const VEC_AS_PTR: &str = "majit_rlib::lltypesystem::rvec::ll_vec_as_ptr";
+/// Kind-independent `ll_length`: header length word (`ll_vec_as_len`).
+pub const VEC_AS_LEN: &str = "majit_rlib::lltypesystem::rvec::ll_vec_as_len";
+
 /// The raw allocator of a `Vec` header the lowering creates
 /// (`_rewrite_raw_malloc` for a Char array, `OS_RAW_MALLOC_VARSIZE_CHAR`).
 /// An unescaped header is a virtual raw buffer. Item buffers are not this
@@ -555,6 +560,10 @@ const SLICE_HELPERS: [[&str; 3]; 13] = [
         "majit_rlib::lltypesystem::rvec::ll_slice_rotate_right_f",
     ],
 ];
+
+/// `<[u8]>::reverse` on a host `&mut [u8]` pair. Not a [`VecItemKind`]
+/// column: `u8` is not a word-sized list item.
+pub const SLICE_REVERSE_U8: &str = "majit_rlib::lltypesystem::rvec::ll_slice_reverse_u8";
 
 /// `ll_slice_buffer_free`: frees an array's raw item buffer at the end of
 /// the array's storage.

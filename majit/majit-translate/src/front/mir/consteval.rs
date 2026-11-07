@@ -36,7 +36,7 @@ impl<'a> Lowering<'a> {
         hi: i64,
         place_ty: &TyRef,
     ) -> Variable {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let lo_v = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
@@ -1236,7 +1236,9 @@ pub(in crate::front::mir) fn known_array_layout_const(segments: &[String]) -> Op
     let header = crate::layout::target_word_size();
     let items_offset = if path_ends_with_segments(&path, "rlist::TYPED_ITEMS_BLOCK_ITEMS_OFFSET") {
         header.next_multiple_of(align_of::<u64>())
-    } else if path_ends_with_segments(&path, "object_array::ITEMS_BLOCK_ITEMS_OFFSET") {
+    } else if path_ends_with_segments(&path, "object_array::ITEMS_BLOCK_ITEMS_OFFSET")
+        || path_ends_with_segments(&path, "bytesobject::BYTES_BLOCK_CHARS_OFFSET")
+    {
         header
     } else {
         return None;

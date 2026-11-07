@@ -150,10 +150,10 @@ fn forward_snapshot_py_pc(jitcode_index: u32, pc: u32) -> Result<u32, DispatchEr
     let payload = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
         .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: pc as usize })?;
     // A level with no Python code object has no Python pc, and so no entry in
-    // a table keyed by one. Helper bodies and `descr_call`'s tail
-    // (`crate::ctor_continuation`) are such levels; `u32::MAX` is the same
-    // "no coordinate" answer the sentinel arm above gives, and what every
-    // reader of this field already treats as absent.
+    // a table keyed by one. Helper bodies, `descr_call`'s tail
+    // (`crate::ctor_continuation`), and operator tails are such levels;
+    // `u32::MAX` is the same "no coordinate" answer the sentinel arm above
+    // gives, and what every reader of this field already treats as absent.
     if payload.code_ptr.is_null() {
         return Ok(u32::MAX);
     }
@@ -436,10 +436,27 @@ fn inline_snapshot_has_complete_parent_chain(n_parents: usize, n_callees: usize)
 /// eval-loop `goto`s through to a miscompiled `FOR_ITER` item.  Until that merge
 /// point is `should_unroll_one_iteration` (`interp_jit.py`), this path
 /// keeps the empty-parents collapse.  A shorter chain falls through to
-/// the single-frame collapse, whose resume re-executes the entire call.
+/// the single-frame collapse, whose resume re-executes the entire call,
+/// so a guard emitted under it re-runs every side effect the inline
+/// region sequenced before it.
+///
+/// A translated helper is an `InlineFrame` with `w_code == 0`, so the
+/// parent-chain length is not a Python callee depth. Its snapshot is the
+/// paused Python/portal and helper sections
+/// (`walker_capture_transparent_helper_snapshot` / `capture_resumedata`).
+/// Capture encodes that section from `MIFrame.jitcode` (`jitcode.index`);
+/// the walk stamps it as `transparent_helper_jitcode_index`. Leftover
+/// Converted helpers (`HelperChain::Collapsed`) go through
+/// `numbered_helper_guard_resume` (runnable Frames, else CALL orgpc or
+/// residualize).
 pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> bool {
+    if ctx.fbw_mode.transparent_helper_subwalk
+        && ctx.fbw_mode.transparent_helper_jitcode_index.is_some()
+    {
+        return true;
+    }
     if !ctx.fbw_mode.inline_subwalk {
         return false;
     }
@@ -460,6 +477,45 @@ pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
          inline records its caller (`pyjitpl.py` `capture_resumedata`)"
     );
     complete
+}
+
+/// `capture_resumedata` snapshots `virtualizable_boxes[debugdata]` as
+/// `_opimpl_setfield_vable` left it. A helper walk of `get_w_globals` /
+/// `getorcreatedebug` can store a Python object (None, str) in that slot
+/// when the inlined frame was `replace_box`'d onto the portal. Resume then
+/// writes that object as `PyFrame.debugdata` and `get_w_globals` reads its
+/// first word as `w_globals`. Null and a real `FrameDebugData` stay;
+/// `malloc_raw` payloads have no GC tid and stay too.
+fn portal_debugdata_ptr_is_payload(ptr: usize) -> bool {
+    if ptr == 0 {
+        return true;
+    }
+    match majit_gc::get_actual_typeid(majit_ir::GcRef(ptr)) {
+        Some(tid) => tid == crate::descr::FRAME_DEBUG_DATA_GC_TYPE_ID,
+        None => true,
+    }
+}
+
+fn sanitize_portal_debugdata_box(ctx: &mut TraceCtx) {
+    let Some(idx) = ctx
+        .virtualizable_info()
+        .and_then(|info| info.static_field_index_by_name("debugdata"))
+    else {
+        return;
+    };
+    let Some((_, majit_ir::Value::Ref(ptr))) = ctx.virtualizable_entry_at(idx) else {
+        return;
+    };
+    if portal_debugdata_ptr_is_payload(ptr.as_usize()) {
+        return;
+    }
+    let null = ctx.const_ref(0);
+    crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
+        ctx,
+        "debugdata",
+        null,
+        majit_ir::Value::Ref(majit_ir::GcRef::NULL),
+    );
 }
 
 /// `capture_resumedata(after_residual_call=True)` (`pyjitpl.py`) reads
@@ -488,17 +544,27 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     if !ctx.trace_ctx.vable_snapshot_buildable() {
         return Err(DispatchError::GuardSnapshotVableUntyped { pc: op_pc });
     }
-    if let Some((instance, init_result, caller)) = scope.constructor_assembler {
+    sanitize_portal_debugdata_box(ctx.trace_ctx);
+    if let Some((instance, init_result, caller)) = scope.constructor_assembler.clone() {
         return walker_capture_constructor_assembler_guard(
             ctx,
             op_pc,
             instance,
             init_result,
             caller,
+            after_residual_call,
+            scope,
         );
     }
     if let Some((generator, pending)) = scope.send_ex_assembler {
-        return walker_capture_send_ex_assembler_guard(ctx, op_pc, generator, pending);
+        return walker_capture_send_ex_assembler_guard(
+            ctx,
+            op_pc,
+            generator,
+            pending,
+            after_residual_call,
+            scope,
+        );
     }
     // Snapshot semantics for walker-emitted guards
     // (`pyjitpl.py generate_guard` + `capture_resumedata`):
@@ -535,7 +601,13 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // the eval-loop portal and does not own this offset.
     let full_body_sym = ctx.fbw_mode.snapshot_sym;
     if let Some(result) = scope.finished_callee_result {
-        return walker_capture_finished_callee_snapshot(ctx, op_pc, result);
+        return walker_capture_finished_callee_snapshot(
+            ctx,
+            op_pc,
+            result,
+            after_residual_call,
+            scope,
+        );
     }
     // Inline sub-walk: the guard's `op_pc` is a *callee* coordinate that
     // does not exist in the outer (`full_body_sym`) jitcode's py_pc→jitcode
@@ -579,7 +651,17 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         if helper_chain == HelperChain::Unresumable {
             return Err(DispatchError::callee_inline_unsupported(op_pc));
         }
-        if helper_chain == HelperChain::Numbered {
+        if helper_chain == HelperChain::Numbered || helper_chain == HelperChain::Collapsed {
+            // Leftover Converted helpers (`HelperChain::Collapsed`) cannot
+            // number a section of their own (`HelperResume::CallEntry`).
+            // Routing them through `numbered_helper_guard_resume` still
+            // records a runnable leftover body as helper-innermost Frames
+            // (the leftover multi-frame snapshot that keeps CALL-boundary
+            // from re-executing an inlined Python CALL) and refuses an
+            // unrunnable leftover (`history.cut` + `do_residual_call`, or
+            // CALL orgpc when the leftover recorded nothing). Unconditional
+            // leftover Python MF retraces exception/iteration CALLs until
+            // abort; unconditional residualize re-opens CALL-boundary extras.
             match numbered_helper_guard_resume(
                 ctx,
                 op_pc,
@@ -593,12 +675,25 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         op_pc,
                         frames,
                         scope.guard_stamp,
+                        after_residual_call,
+                        scope,
+                    );
+                }
+                NumberedHelperGuard::CallOrgpc(frames) => {
+                    // Python-only CALL orgpc: do not append helper sections.
+                    return walker_encode_numbered_guard_frames(
+                        ctx,
+                        op_pc,
+                        frames,
+                        scope.guard_stamp,
                     );
                 }
                 // Fall through to the root portal's CALL boundary below.
                 NumberedHelperGuard::CallerBoundary => {}
             }
-        } else if walker_inline_guard_resumes_in_callee(ctx) {
+        } else if walker_inline_guard_resumes_in_callee(ctx)
+            && !ctx.fbw_mode.transparent_helper_subwalk
+        {
             // A STRICT straight-line callee (gh#420) whose own frame is not
             // MF-snapshot-able (a kept operand-stack temp the sub-walk does not
             // mirror) propagates the `Unsupported` error the same as the branch
@@ -609,6 +704,11 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // The caller names the guard (`GuardFromEnd` when the guard is
             // not the last op). Overwriting that with `LastOp` attaches the
             // snapshot to a later op and leaves the guard at `resume_pos == -1`.
+            //
+            // A transparent helper whose sections cannot be numbered takes
+            // the Numbered-or-Collapsed arm above. After-residual numbers
+            // Frames only when the remaining section cannot reach a blocker
+            // (`capture_resumedata(after_residual_call=True)`).
             let guard_stamp = scope.guard_stamp;
             return walker_capture_multi_frame_inline_snapshot(
                 ctx,
@@ -1280,7 +1380,6 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // that is the op2 `-live-` after `jit_merge_point` (`jtransform.py
     // handle_jit_marker__jit_merge_point`). Active boxes were collected
     // at that same pc.
-    fill_vable_vref_into(ctx.trace_ctx, &mut scratch.vable, &mut scratch.vref);
     let arm_word = ctx
         .outer_resume_marker_jit_pc
         .map(|m| m as i32)
@@ -1297,6 +1396,11 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     };
     let arm_py_pc = forward_snapshot_py_pc(ctx.outer_jitcode_index, arm_pc_word)?;
+    // `capture_resumedata` snapshots `virtualizable_boxes` as
+    // `_opimpl_setfield_vable` / `write_box_at` left them; the blackhole
+    // re-executes from the guard and writes the arm's own vsd
+    // (`bhimpl_setfield_vable_i`).
+    let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
     let active = std::mem::take(&mut ctx.frame_state.borrow_mut().outer_active_boxes);
     publish_single_frame_snapshot(
         ctx,
@@ -1305,8 +1409,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         ctx.outer_jitcode_index,
         arm_pc_word,
         arm_py_pc,
-        &scratch.vable,
-        &scratch.vref,
+        &vable_boxes,
+        &vref_boxes,
         "carried",
         op_pc,
     );
@@ -2794,6 +2898,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
         jitcode_index,
         call_jit_pc,
         caller_liveness_word,
+        None,
     );
     restore_in_a_call_result(banks, saved);
     let boxes = match boxes {
@@ -2974,44 +3079,72 @@ fn compute_paused_helper_caller_frame<Sym: WalkSym>(
     let result_register = super::residual_call::parent_call_result_color(&pjc, call_jit_pc);
     let banks = [ctx.registers_i, ctx.registers_r, ctx.registers_f];
     let saved = clear_in_a_call_result(ctx.trace_ctx, banks, result_register);
-    let boxes = collect_callee_active_boxes(
+    // `get_list_of_active_boxes(in_a_call=True)` (`pyjitpl.py`
+    // `capture_resumedata`): a helper section admits unread scratch as
+    // typed zero. `collect_callee_active_boxes` is the Python-parent
+    // decline path and would refuse a numbered helper here.
+    //
+    // The result color stays cleared on the cloned banks: PyPy writes
+    // CONST_NULL / CONST_FALSE / CONST_FZERO onto the MIFrame and leaves
+    // it until `make_result_of_lastop`. Attach while cleared, then restore
+    // the live walk so the nested body still sees the pre-call value.
+    let boxes = collect_paused_section_boxes(
         ctx.registers_i,
         ctx.registers_r,
         ctx.registers_f,
         jitcode_index as u32,
         call_jit_pc,
         resume_marker_jit_pc as i32,
+        None,
     );
-    restore_in_a_call_result(banks, saved);
-    let boxes = match boxes {
-        Ok(boxes) => boxes,
-        Err(_) => return Err(unavail("Unavail::PausedHelper/BoxesErr")),
-    };
-    Ok(with_call_result_slot(
-        InlineParentFrame {
-            jitcode_index: jitcode_index as u32,
-            call_jitcode_pc: Some(call_jit_pc),
-            call_pc: Some(call_jit_pc),
-            resume_pc: Some(resume_marker_jit_pc),
-            call_stack_overrides: Vec::new(),
-            blackhole: None,
-            resume_coord: ParentResumeCoord::CallFallthrough(call_jit_pc),
-            resume_marker_jit_pc: Some(resume_marker_jit_pc),
-            boxes,
-            registers_r: None,
-            registers_i: None,
-            registers_f: None,
-            frame_state: None,
-            caller_py_pc: None,
-            result_slot: CallResultSlot::Unknown,
+    let paused = match boxes {
+        Ok(boxes) => {
+            let expected = crate::state::frame_value_count_at(
+                jitcode_index as i32,
+                resume_marker_jit_pc as i32,
+            );
+            assert_eq!(
+                boxes.len(),
+                expected,
+                "paused helper caller boxes must match frame_value_count_at \
+                 (get_list_of_active_boxes in_a_call=True / consume_one_section); \
+                 jitcode_index={jitcode_index} resume_marker_jit_pc={resume_marker_jit_pc} \
+                 got={} expected={expected}",
+                boxes.len(),
+            );
+            with_call_result_slot(
+                InlineParentFrame {
+                    jitcode_index: jitcode_index as u32,
+                    call_jitcode_pc: Some(call_jit_pc),
+                    call_pc: Some(call_jit_pc),
+                    resume_pc: Some(resume_marker_jit_pc),
+                    call_stack_overrides: Vec::new(),
+                    blackhole: None,
+                    resume_coord: ParentResumeCoord::CallFallthrough(call_jit_pc),
+                    resume_marker_jit_pc: Some(resume_marker_jit_pc),
+                    boxes,
+                    registers_r: None,
+                    registers_i: None,
+                    registers_f: None,
+                    frame_state: None,
+                    caller_py_pc: None,
+                    result_slot: CallResultSlot::Unknown,
+                }
+                .attach_live_caller(
+                    ctx.registers_r,
+                    ctx.registers_i,
+                    ctx.registers_f,
+                    &ctx.frame_state,
+                ),
+            )
         }
-        .attach_live_caller(
-            ctx.registers_r,
-            ctx.registers_i,
-            ctx.registers_f,
-            &ctx.frame_state,
-        ),
-    ))
+        Err(_) => {
+            restore_in_a_call_result(banks, saved);
+            return Err(unavail("Unavail::PausedHelper/BoxesErr"));
+        }
+    };
+    restore_in_a_call_result(banks, saved);
+    Ok(paused)
 }
 
 /// A resume section `rebuild_from_resumedata` can turn back into a Python
@@ -3118,21 +3251,37 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
     if !pjc.is_populated() || pjc.code_ptr.is_null() {
         return Err(unavail("Unavail::Helper/NotPopulated"));
     }
-    // Same parent resume as `run_orthodox_helper_subwalk`: the op2 `-live-`
-    // after `jit_merge_point` on a loop-header opcode
-    // (`jtransform.py handle_jit_marker__jit_merge_point`).
+    // `generate_guard(resumepc=orgpc)` / `capture_resumedata`: CALL-entry
+    // re-executes the Python opcode that entered the helper, so this section
+    // is the opcode-start `-live-` (`collapsed_parent_resume_marker`) with
+    // `get_list_of_active_boxes` and no `in_a_call` (the CALL dest is not
+    // written yet). `inline_call_return_marker` is the paused-caller
+    // `next_pc` used when the helper is numbered as its own MIFrame.
     let resume_marker_jit_pc = super::specialize::collapsed_parent_resume_marker(&pjc, call_jit_pc)
         .ok_or_else(|| unavail("Unavail::Helper/NoResumeMarker"))?;
     let boxes = if caller_code.is_some() {
-        collect_callee_active_boxes(
-            ctx.registers_i,
-            ctx.registers_r,
-            ctx.registers_f,
-            jitcode_index,
-            call_jit_pc,
-            resume_marker_jit_pc as i32,
-        )
-        .map_err(|_| unavail("Unavail::Helper/BoxesErr"))?
+        if pjc.code_ptr.is_null() {
+            collect_helper_section_boxes(
+                ctx.registers_i,
+                ctx.registers_r,
+                ctx.registers_f,
+                jitcode_index,
+                call_jit_pc,
+                resume_marker_jit_pc as i32,
+            )
+            .map_err(|_| unavail("Unavail::Helper/BoxesErr"))?
+        } else {
+            collect_callee_active_boxes(
+                ctx.registers_i,
+                ctx.registers_r,
+                ctx.registers_f,
+                jitcode_index,
+                call_jit_pc,
+                resume_marker_jit_pc as i32,
+                None,
+            )
+            .map_err(|_| unavail("Unavail::Helper/BoxesErr"))?
+        }
     } else {
         let vstack_boxes = ctx.frame_state.borrow().vstack_boxes.clone();
         let vstack = ctx.vstack_valid.then_some(vstack_boxes.as_slice());
@@ -3155,7 +3304,7 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
     };
     Ok(InlineParentFrame {
         jitcode_index,
-        call_jitcode_pc: None,
+        call_jitcode_pc: Some(call_jit_pc),
         call_pc: Some(call_jit_pc),
         resume_pc: Some(resume_marker_jit_pc),
         call_stack_overrides: Vec::new(),
@@ -3267,9 +3416,9 @@ pub(crate) fn helper_subwalk_level<Sym: WalkSym>(
     }
     compute_inline_helper_call_entry_frame(ctx, call_jit_pc).map(|caller| {
         Some(HelperLevel {
-            parents: vec![caller],
+            parents: vec![caller.clone()],
             resume: HelperResume::CallEntry,
-            call_entry: HelperCallEntry::Unavailable,
+            call_entry: HelperCallEntry::Frame(caller),
             entry_array_len: None,
             entry_trace_index: 0,
         })
@@ -3280,6 +3429,9 @@ pub(crate) fn helper_subwalk_level<Sym: WalkSym>(
 enum NumberedHelperGuard {
     /// The frames to number, outermost-first.
     Frames(Vec<InlineParentFrame>),
+    /// Python-only snapshot at the CALL's orgpc (`generate_guard(resumepc=orgpc)`).
+    /// Helper sections are not numbered; the capture must not extend them on.
+    CallOrgpc(Vec<InlineParentFrame>),
     /// The root portal's CALL boundary.
     CallerBoundary,
 }
@@ -3291,16 +3443,22 @@ enum NumberedHelperGuard {
 /// and `reject_unresolved_call` bails at a residual call it cannot resolve;
 /// a helper section has no Python coordinate the interpreter could continue
 /// from. When a section can reach one
-/// ([`helper_resume_reaches_blocker`]), the guard resumes at the CALL that
-/// entered the outermost helper level instead ([`HelperCallEntry`]), which
-/// re-runs that call. That is refused once a heap-writing residual (live
-/// heap or a user frame, or an unjournaled `ForIterNext`) or a journaled
-/// live-heap effect (a list pop or append, a store) has executed since the
-/// level was entered, since the re-run would apply it twice; the refusal is
-/// the one an unlowered helper gets, so the descent is cut back to a residual
-/// call when it applied nothing and the trace aborts otherwise. A residual
-/// the executed-effect odometer counts only for its void result (an
-/// allocation, `make_pyerror`) keeps the CALL-entry resume.
+/// ([`helper_resume_reaches_blocker`]), a plain helper guard resumes at the
+/// CALL that entered the outermost helper level instead ([`HelperCallEntry`]),
+/// at that CALL's orgpc (`generate_guard(resumepc=orgpc)`), which re-runs
+/// that call. An `after_residual_call` guard already ran that
+/// residual; it still numbers Frames only when the remaining section
+/// cannot reach a blocker (`generate_guard` with
+/// `after_residual_call=True`). Otherwise `heap_moved` refuses CALL-entry.
+/// A runnable numbering (`capture_resumedata`) succeeds at any helper depth.
+/// CALL-entry is refused once a heap-writing residual (live heap or a user
+/// frame, or an unjournaled `ForIterNext`) or a journaled live-heap effect
+/// (a list pop or append, a store) has executed since the level was entered,
+/// since the re-run would apply it twice; the refusal is the one an unlowered
+/// helper gets, so the descent is cut back to a residual call when it applied
+/// nothing and the trace aborts otherwise. A residual the executed-effect
+/// odometer counts only for its void result (an allocation, `make_pyerror`)
+/// keeps the CALL-entry resume.
 fn numbered_helper_guard_resume<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -3314,10 +3472,42 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
         after_residual_call,
         scope,
     )?);
-    let runs_from = |frame: &InlineParentFrame, entry_array_len: Option<usize>| {
-        frame.resume_marker_jit_pc.is_some_and(|pc| {
-            !helper_resume_reaches_blocker(frame.jitcode_index as usize, pc, entry_array_len)
-        })
+    // GuardTrue/GuardFalse re-evaluate at `orgpc` and take the other arm
+    // (`generate_guard` / blackhole). Scanning the whole remaining body from
+    // the guard counts the untaken miss residual (`dict_missing_or_key_error`)
+    // as a blocker, so `runnable` is false and CALL-entry resumes the Python
+    // frame at that CALL's orgpc. The innermost section scans the fail arm
+    // only.
+    let guard_true = match ctx.trace_ctx.last_op_opcode() {
+        Some(OpCode::GuardTrue) => Some(true),
+        Some(OpCode::GuardFalse) => Some(false),
+        _ => None,
+    };
+    let inner_jit = parent_frames.last().map(|frame| frame.jitcode_index);
+    let inner_pc = parent_frames
+        .last()
+        .and_then(|frame| frame.resume_marker_jit_pc);
+    let runs_from = |frame: &InlineParentFrame, entry_array_len: Option<usize>| -> bool {
+        let Some(pc) = frame.resume_marker_jit_pc else {
+            return false;
+        };
+        let scan_pc = match guard_true {
+            Some(is_true)
+                if Some(frame.jitcode_index) == inner_jit
+                    && frame.resume_marker_jit_pc == inner_pc =>
+            {
+                match helper_guard_fail_resume_pc(frame.jitcode_index as usize, pc, is_true) {
+                    Some(fail_pc) => fail_pc,
+                    // `generate_guard(resumepc=orgpc)`: the fail arm is the
+                    // other successor of `goto_if_not`. `None` when the
+                    // coordinate is not a `goto_if_not_*` and not the
+                    // `-live-` that immediately precedes one.
+                    None => return false,
+                }
+            }
+            _ => pc,
+        };
+        !helper_resume_reaches_blocker(frame.jitcode_index as usize, scan_pc, entry_array_len)
     };
     // `capture_resumedata` numbers every frame on `framestack`. A Python
     // inline level below the helper levels that holds no paused-caller image
@@ -3355,7 +3545,28 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
             .zip(levels.iter().rev())
             .all(|(frame, level)| runs_from(frame, level.helper_entry_array_len))
     };
+    let helper_levels = {
+        let session = ctx.session.borrow();
+        session
+            .framestack
+            .iter()
+            .rev()
+            .take_while(|frame| frame.is_helper_level())
+            .count()
+    };
+    // `generate_guard` (`pyjitpl.py`) + `capture_resumedata(
+    // after_residual_call=True)` numbers the helper MIFrame at the live
+    // after the call when that section can finish. A nested interpreted
+    // `inline_call_*` that can still reach `reject_unresolved_call` /
+    // `abort` is a blocker; an empty Void callee is not.
+    // `heap_moved` then refuses CALL-entry so the residual is not re-run.
     if runnable {
+        debug_assert!(
+            parent_frames
+                .last()
+                .is_some_and(|frame| matches!(frame.resume_coord, ParentResumeCoord::Backxlat(_))),
+            "numbered helper innermost is a helper section, not a pending CALL dest"
+        );
         return Ok(NumberedHelperGuard::Frames(parent_frames));
     }
     let refused = DispatchError::OrthodoxSubWalkTraceUnsupported {
@@ -3363,12 +3574,6 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
         symbolic: 0,
     };
     let session = ctx.session.borrow();
-    let helper_levels = session
-        .framestack
-        .iter()
-        .rev()
-        .take_while(|frame| frame.is_helper_level())
-        .count();
     let outer_index = session.framestack.len() - helper_levels;
     let Some(outer) = session.framestack.get(outer_index) else {
         return Err(refused);
@@ -3385,22 +3590,46 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
         HelperCallEntry::Unavailable => Err(refused),
         HelperCallEntry::CallerBoundary => Ok(NumberedHelperGuard::CallerBoundary),
         HelperCallEntry::Frame(entry) => {
+            // `generate_guard(resumepc=orgpc)` / `capture_resumedata`: the
+            // stored CALL-entry is the opcode-start `-live-` with
+            // `get_list_of_active_boxes` (no `in_a_call`). Encode that
+            // Python section alone; do not append helper frames.
             let mut frames: Vec<InlineParentFrame> = session.framestack[..outer_index]
                 .iter()
                 .flat_map(|frame| frame.parents.iter().cloned())
                 .collect();
             frames.push(entry.clone());
-            Ok(NumberedHelperGuard::Frames(frames))
+            Ok(NumberedHelperGuard::CallOrgpc(frames))
         }
     }
 }
 
+/// Shared Rc clone of the helper MIFrame parked on `helper_live`.
+fn cloned_helper_live_banks(
+    session: &WalkSession,
+    helper_index: usize,
+) -> Option<(RegisterBank, RegisterBank, RegisterBank, Option<usize>)> {
+    session.helper_live.iter().rev().find_map(|live| {
+        (live.jitcode_index == Some(helper_index)).then(|| {
+            (
+                live.registers_i.clone(),
+                live.registers_r.clone(),
+                live.registers_f.clone(),
+                live.call_jitcode_pc,
+            )
+        })
+    })
+}
+
 /// Innermost helper section at the guard's own jitcode coordinate.
 ///
-/// Same coordinate rule as the Python path: `carried_resume_jit_pc`, else
-/// `after_residual_guard_marker` / `live_after_jit_pc`, else
-/// `plain_guard_resume_jitcode_pc`. Box count must equal
-/// `frame_value_count_at`.
+/// Same frame as `innermost_helper_parent_frame` / `get_list_of_active_boxes`,
+/// including `with_caller_py_pc`. A second constructor here omitted that
+/// coordinate, so a runnable numbered guard closed JUMP_BACKWARD under the
+/// wrong header (`extend_transparent_helper_chain` keeps a `Backxlat`
+/// innermost and does not rebuild it). Unread helper scratch is the
+/// register's typed zero (`collect_helper_section_boxes` /
+/// `consume_one_section`). Box count must equal `frame_value_count_at`.
 fn helper_innermost_resume_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -3410,79 +3639,36 @@ fn helper_innermost_resume_frame<Sym: WalkSym>(
     let Some(jitcode_index) = ctx.fbw_mode.transparent_helper_jitcode_index else {
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     };
-    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
-        return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
-    };
-    if pjc.jitcode.code.is_empty() {
-        return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
-    }
-    let helper_jitcode_pc: usize = if let Some(carried) = scope.carried_resume_jit_pc {
-        carried
-    } else if after_residual_call {
-        after_residual_guard_marker(&pjc, op_pc, None)
-            .or_else(|| {
-                (ctx.live_after_jit_pc != usize::MAX
-                    && pjc
-                        .jitcode
-                        .can_decode_live_vars(ctx.live_after_jit_pc, crate::state::op_live()))
-                .then_some(ctx.live_after_jit_pc)
-            })
-            .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })?
-    } else {
-        let pc = plain_guard_resume_jitcode_pc(&pjc, op_pc);
-        if pc < 0 {
-            return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
-        }
-        pc as usize
-    };
-    if !pjc
-        .jitcode
-        .can_decode_live_vars(helper_jitcode_pc, crate::state::op_live())
-    {
-        return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
-    }
-    let boxes = collect_callee_active_boxes(
-        ctx.registers_i,
-        ctx.registers_r,
-        ctx.registers_f,
-        jitcode_index as u32,
-        op_pc,
-        helper_jitcode_pc as i32,
-    )?;
+    let frame =
+        innermost_helper_parent_frame(ctx, jitcode_index, op_pc, after_residual_call, &scope)?;
+    let helper_jitcode_pc = frame.resume_marker_jit_pc.unwrap_or(op_pc);
     let expected =
         crate::state::frame_value_count_at(jitcode_index as i32, helper_jitcode_pc as i32);
-    if boxes.len() != expected {
-        return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
-    }
-    Ok(InlineParentFrame {
-        jitcode_index: jitcode_index as u32,
-        call_jitcode_pc: None,
-        call_pc: None,
-        resume_pc: Some(helper_jitcode_pc),
-        call_stack_overrides: Vec::new(),
-        blackhole: None,
-        resume_coord: ParentResumeCoord::Backxlat(helper_jitcode_pc),
-        resume_marker_jit_pc: Some(helper_jitcode_pc),
-        boxes,
-        registers_r: None,
-        registers_i: None,
-        registers_f: None,
-        frame_state: None,
-        caller_py_pc: None,
-        result_slot: CallResultSlot::Unknown,
-    })
+    assert_eq!(
+        frame.boxes.len(),
+        expected,
+        "innermost helper boxes must match frame_value_count_at \
+         (get_list_of_active_boxes / consume_one_section); \
+         jitcode_index={jitcode_index} helper_jitcode_pc={helper_jitcode_pc} \
+         got={} expected={expected}",
+        frame.boxes.len(),
+    );
+    Ok(frame)
 }
 
-/// Live boxes for one paused parent at the pc the snapshot will publish.
+/// Live boxes for one snapshot section at the pc the snapshot will publish.
 ///
 /// `ResumeDataLoopMemo.number` writes `jitcode_index, pc, [tagged...]` and
 /// `rebuild_from_numbering` splits that stream with `frame_value_count_at`
-/// at the same pc. `frame.boxes` is the image the caller-frame constructor
+/// at the same pc. `frame.boxes` is the image the section constructor
 /// collected with the pending call result nulled
-/// (`MIFrame.get_list_of_active_boxes`, `in_a_call`); the paused banks hold
-/// the restored register, so they are not re-read here. An image whose
-/// length disagrees with the decoder's count is refused, so a parent cannot
-/// donate a tagged value into the next frame header.
+/// (`MIFrame.get_list_of_active_boxes`, `in_a_call`): a translated helper
+/// uses that jitcode's own liveness (`resume.py` `consume_one_section`,
+/// typed zeros for unread scratch); a Python parent declines unread colors.
+/// The paused banks hold the restored register, so they are not re-read
+/// here. An image whose length disagrees with the decoder's count is
+/// refused, so a parent cannot donate a tagged value into the next frame
+/// header.
 fn boxes_matching_resume_liveness(
     frame: &InlineParentFrame,
     pc_word: u32,
@@ -3511,10 +3697,19 @@ fn walker_capture_constructor_assembler_guard<Sym: WalkSym>(
     instance: OpRef,
     init_result: OpRef,
     caller: Option<InlineParentFrame>,
+    after_residual_call: bool,
+    scope: GuardCaptureScope,
 ) -> Result<(), DispatchError> {
     let tail = super::ctor_continuation_assembler_parent_frame(instance, init_result)
         .ok_or(DispatchError::callee_inline_unsupported(op_pc))?;
-    walker_capture_assembler_continuation_guard(ctx, op_pc, tail, caller)
+    walker_capture_assembler_continuation_guard(
+        ctx,
+        op_pc,
+        tail,
+        caller,
+        after_residual_call,
+        scope,
+    )
 }
 
 /// `generator.py GeneratorOrCoroutine._send_ex` after `_invoke_execute_frame`:
@@ -3529,6 +3724,8 @@ fn walker_capture_send_ex_assembler_guard<Sym: WalkSym>(
     op_pc: usize,
     generator: OpRef,
     pending: OpRef,
+    after_residual_call: bool,
+    scope: GuardCaptureScope,
 ) -> Result<(), DispatchError> {
     let Some(mut tail) = super::send_ex_continuation_parent_frame(generator) else {
         return Err(DispatchError::callee_inline_unsupported(op_pc));
@@ -3537,7 +3734,7 @@ fn walker_capture_send_ex_assembler_guard<Sym: WalkSym>(
         Some(slot) => *slot = pending,
         None => return Err(DispatchError::callee_inline_unsupported(op_pc)),
     }
-    walker_capture_assembler_continuation_guard(ctx, op_pc, tail, None)
+    walker_capture_assembler_continuation_guard(ctx, op_pc, tail, None, after_residual_call, scope)
 }
 
 /// Paused callers, then a synthesised assembler-resume tail as the innermost
@@ -3549,6 +3746,8 @@ fn walker_capture_assembler_continuation_guard<Sym: WalkSym>(
     op_pc: usize,
     tail: InlineParentFrame,
     caller: Option<InlineParentFrame>,
+    after_residual_call: bool,
+    scope: GuardCaptureScope,
 ) -> Result<(), DispatchError> {
     let mut parent_frames = {
         let session = ctx.session.borrow();
@@ -3577,29 +3776,687 @@ fn walker_capture_assembler_continuation_guard<Sym: WalkSym>(
         }
     }
     parent_frames.push(tail);
-    walker_capture_transparent_helper_snapshot(ctx, op_pc, parent_frames, GuardStampTarget::LastOp)
+    walker_capture_transparent_helper_snapshot(
+        ctx,
+        op_pc,
+        parent_frames,
+        GuardStampTarget::LastOp,
+        after_residual_call,
+        scope,
+    )
 }
 
-/// Number a helper-guard snapshot: paused callers outermost-first, then
-/// the helper itself when the caller appended that innermost section.
+/// CALL `next_pc` of a paused live bank. Missing `call_jitcode_pc` is a
+/// capture bug: `mark_paused_caller_call` stamps it before the child walk.
+fn paused_live_call_next_pc(
+    live: &LiveFrameRegs,
+) -> Option<(usize, usize, std::sync::Arc<crate::PyJitCode>)> {
+    let jitcode_index = live.jitcode_index?;
+    let call_pc = live.call_jitcode_pc?;
+    let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)?;
+    let next_pc = crate::jitcode_runtime::decode_op_at(&pjc.jitcode.code, call_pc)?.next_pc;
+    Some((jitcode_index, next_pc, pjc))
+}
+
+fn paused_live_result_color(pjc: &crate::PyJitCode, call_jit_pc: usize) -> Option<(char, usize)> {
+    // Same formula as the nested-inline path (`parent_call_result_color`):
+    // bank is `_result_argcode` (the char after `>`), dest is
+    // `bytecode[pc-1]`. `call_result_dest_color` searches for any op
+    // ending at `next_pc` and can pick a non-CALL.
+    super::residual_call::parent_call_result_color(pjc, call_jit_pc)
+}
+
+/// `get_list_of_active_boxes(in_a_call=True)` blanks dest in the boxes
+/// list, not in the `RegisterBank` slots. Those lists are `Rc` shared
+/// with the live MIFrame (`replace_active_box_in_frame`), so a write
+/// here would also clear a nested helper's argument at the same color.
 ///
-/// `parent_frames` is the whole framestack's paused levels flattened in
-/// order, so a level that ran between two frames arrives already at its own
-/// depth — `descr_call`'s tail, held on the `__init__` frame that owns it,
-/// reaches here as `[caller, tail, __init__]` without this path inserting
-/// anything. Nothing here may re-position a level relative to the innermost
-/// callee; a helper descent is not that callee's depth. The outermost
-/// section must name a Python `CodeObject`: a helper-only numbering would
-/// make the helper the vable portal frame (`rebuild_from_resumedata`).
+/// Only a paused CALLER reaches here (`inline_parent_from_paused_live`).
+/// The innermost numbered helper section is collected by
+/// [`collect_helper_section_boxes`] and must not blank dest: a helper
+/// that can reach `reject_unresolved_call` is not numbered
+/// (`helper_resume_reaches_blocker`).
+fn blank_pending_call_dest_in_boxes(
+    boxes: &mut [OpRef],
+    jitcode_index: i32,
+    resume_pc: i32,
+    dest: Option<(char, usize)>,
+) {
+    let Some((bank, color)) = dest else {
+        return;
+    };
+    let banks = crate::state::frame_liveness_reg_indices_by_bank_from_pc(jitcode_index, resume_pc);
+    let (offset, zero) = match bank {
+        'i' => (
+            banks.int.iter().position(|&idx| idx as usize == color),
+            OpRef::const_int(0),
+        ),
+        'r' => (
+            banks
+                .ref_
+                .iter()
+                .position(|&idx| idx as usize == color)
+                .map(|pos| banks.int.len() + pos),
+            OpRef::const_ptr(majit_ir::GcRef(pyre_object::PY_NULL as usize)),
+        ),
+        'f' => (
+            banks
+                .float
+                .iter()
+                .position(|&idx| idx as usize == color)
+                .map(|pos| banks.int.len() + banks.ref_.len() + pos),
+            OpRef::const_float(0.0),
+        ),
+        _ => return,
+    };
+    if let Some(index) = offset {
+        boxes[index] = zero;
+    }
+}
+
+/// True when `jitcode_index` is the walk's portal owner
+/// (`fbw_mode.snapshot_sym`). Portal stack-slot colors sit at
+/// `OpRef::NONE` in the register file; `collect_outer_active_boxes`
+/// recovers them from the virtualizable shadow (`write_stack_slot`
+/// retired the register mirror). `collect_callee_active_boxes` does
+/// not, so a helper-section capture of the paused portal declined
+/// unread stack colors and residualized COMPARE_OP.
+fn paused_live_is_portal_owner<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    jitcode_index: usize,
+) -> bool {
+    if ctx.fbw_mode.snapshot_sym.is_null() {
+        return false;
+    }
+    // SAFETY: `snapshot_sym` is set for the lifetime of
+    // `dispatch_via_miframe` and only the immutable payload is read.
+    let sym = unsafe { &*ctx.fbw_mode.snapshot_sym };
+    if sym.jitcode().is_null() || !sym.owns_virtualizable_shadow() {
+        return false;
+    }
+    unsafe { (*sym.jitcode()).index as usize == jitcode_index }
+}
+
+/// `LiveFrameRegs` → snapshot section: CALL `next_pc`, result register
+/// pending (`get_list_of_active_boxes(in_a_call=True)`). Same owner as
+/// `build_parent_miframe_from_paused_live`. Collection is this constructor
+/// (`pyjitpl.py` `capture_resumedata` one list per framestack frame);
+/// [`boxes_matching_resume_liveness`] only checks the decoder's length.
+fn inline_parent_from_paused_live<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    live: &LiveFrameRegs,
+    op_pc: usize,
+) -> Result<InlineParentFrame, DispatchError> {
+    let Some((jitcode_index, next_pc, pjc)) = paused_live_call_next_pc(live) else {
+        return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
+    };
+    let op_live = crate::state::op_live();
+    let Some(pc_word) = pjc.resolve_resume_pc_with_jitcode_pc(next_pc as i32, op_live) else {
+        return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
+    };
+    // JitCode resume is the trailing `-live-` (`pc_word`) so the blackhole
+    // does not re-run the CALL. Python `last_instr` is the CALL's
+    // fallthrough: `Backxlat(pc_word)` maps that live back onto the CALL
+    // opcode, and the interpreter would re-enter `fn(x)` with the dest
+    // still pending (NULL). Same coord as
+    // `compute_inline_helper_call_entry_frame`.
+    let call_pc = live
+        .call_jitcode_pc
+        .expect("paused_live_call_next_pc required call_jitcode_pc");
+    let pending_dest = paused_live_result_color(&pjc, call_pc);
+    if fbw_mf_diag_enabled() {
+        let dest_at_live = crate::state::call_result_dest_color(&pjc.jitcode.code, pc_word);
+        eprintln!(
+            "[fbw-mf-diag] paused-parent jc={jitcode_index} call_pc={call_pc} \
+             next={next_pc} pc_word={pc_word} dest={pending_dest:?} dest_at_live={dest_at_live:?} \
+             portal={}",
+            paused_live_is_portal_owner(ctx, jitcode_index)
+        );
+    }
+    let mut boxes = if paused_live_is_portal_owner(ctx, jitcode_index) {
+        // SAFETY: gated on `snapshot_sym` non-null and `jitcode()` non-null
+        // by `paused_live_is_portal_owner`.
+        let caller_sym = unsafe { &*ctx.fbw_mode.snapshot_sym };
+        let vstack_boxes = live.frame_state().borrow().vstack_boxes.clone();
+        let vstack = (!vstack_boxes.is_empty()).then_some(vstack_boxes.as_slice());
+        let banks = [&live.registers_i, &live.registers_r, &live.registers_f];
+        let saved = clear_in_a_call_result(ctx.trace_ctx, banks, pending_dest);
+        let boxes = collect_outer_active_boxes(
+            caller_sym,
+            ctx.trace_ctx,
+            &live.registers_i,
+            &live.registers_r,
+            &live.registers_f,
+            jitcode_index as u32,
+            pc_word as i32,
+            call_pc as i32,
+            OuterActiveBoxesEntryTwin::Plain,
+            "paused_portal_in_a_call",
+            vstack,
+        );
+        restore_in_a_call_result(banks, saved);
+        boxes
+    } else {
+        collect_paused_section_boxes(
+            &live.registers_i,
+            &live.registers_r,
+            &live.registers_f,
+            jitcode_index as u32,
+            op_pc,
+            pc_word as i32,
+            pending_dest,
+        )?
+    };
+    blank_pending_call_dest_in_boxes(
+        &mut boxes,
+        jitcode_index as i32,
+        pc_word as i32,
+        pending_dest,
+    );
+    let result_slot = super::call_result_slot(jitcode_index as u32, pc_word as usize, boxes.len());
+    let frame = InlineParentFrame {
+        jitcode_index: jitcode_index as u32,
+        call_jitcode_pc: live.call_jitcode_pc,
+        call_pc: live.call_jitcode_pc,
+        resume_pc: Some(pc_word),
+        call_stack_overrides: Vec::new(),
+        blackhole: None,
+        resume_coord: ParentResumeCoord::CallFallthrough(call_pc),
+        resume_marker_jit_pc: Some(pc_word),
+        boxes,
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: Some(live.frame_state().clone()),
+        caller_py_pc: None,
+        result_slot,
+    }
+    .with_caller_py_pc(jitcode_index as u32, call_pc);
+    let boxes = boxes_matching_resume_liveness(&frame, pc_word as u32, op_pc)?;
+    Ok(InlineParentFrame { boxes, ..frame })
+}
+
+fn innermost_helper_resume_pc(
+    pjc: &crate::PyJitCode,
+    op_pc: usize,
+    after_residual_call: bool,
+    scope: &GuardCaptureScope,
+    live_after_jit_pc: usize,
+    live_before_jit_pc: usize,
+) -> Result<i32, DispatchError> {
+    let op_live = crate::state::op_live();
+    let decodes = |pc: usize| pjc.jitcode.can_decode_live_vars(pc, op_live);
+    if let Some(carried) = scope.carried_resume_jit_pc {
+        if decodes(carried) {
+            return Ok(carried as i32);
+        }
+        return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
+    }
+    // `get_list_of_active_boxes` (`pyjitpl.py`): a plain guard reads
+    // `self.pc - SIZE_LIVE_OP`. A branch guard's capture_pc is already that
+    // `-live-` (`guarded_branch_core` `live_before_jit_pc`); keep it so
+    // the live set decodes. `generate_guard(resumepc=orgpc)` names the
+    // following `goto_if_not_*`; `helper_guard_fail_resume_pc` steps there.
+    // A helper guard that is not itself a `-live-` is not always adjacent
+    // (`preceding_live_marker` requires `next_pc == op_pc`): the walk's
+    // `live_before_jit_pc` is then the marker. `resume_marker_for_jitcode_pc`
+    // can name a later `-live-` (getitem_slot op_pc=74 → marker=80);
+    // numbering past the guard lets `rebuild_from_resumedata` continue
+    // the success path of a failing `guard_class`.
+    let walked_live_before = (live_before_jit_pc != usize::MAX && decodes(live_before_jit_pc))
+        .then_some(live_before_jit_pc);
+    let not_past_guard = |m: usize| (m <= op_pc).then_some(m);
+    let marker = match after_residual_call {
+        true => after_residual_guard_marker(pjc, op_pc, None)
+            .or_else(|| {
+                (live_after_jit_pc != usize::MAX && decodes(live_after_jit_pc))
+                    .then_some(live_after_jit_pc)
+            })
+            .map(|m| m as i32)
+            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC),
+        false => {
+            if pjc.jitcode.can_decode_live_vars(op_pc, op_live)
+                || pjc.jitcode.code.get(op_pc) == Some(&op_live)
+            {
+                op_pc as i32
+            } else {
+                preceding_live_marker(pjc, op_pc)
+                    .or(walked_live_before)
+                    .and_then(not_past_guard)
+                    .or_else(|| {
+                        pjc.resume_marker_for_jitcode_pc(op_pc)
+                            .and_then(not_past_guard)
+                    })
+                    .map(|m| m as i32)
+                    .unwrap_or(op_pc as i32)
+            }
+        }
+    };
+    if marker == majit_ir::resumedata::NO_JITCODE_PC || !decodes(marker as usize) {
+        if !after_residual_call
+            && let Some(live_before) = walked_live_before
+            && live_before <= op_pc
+        {
+            return Ok(live_before as i32);
+        }
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[helper-capture] live-vars helper={} op_pc={op_pc} marker={marker} after_residual={after_residual_call}",
+                pjc.jitcode.name
+            );
+        }
+        return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
+    }
+    Ok(marker)
+}
+
+fn dump_helper_jitcode_once(pjc: &crate::PyJitCode, resume_pc: i32) {
+    use std::collections::HashSet;
+    thread_local! {
+        static DUMPED: std::cell::RefCell<HashSet<i32>> = std::cell::RefCell::new(HashSet::new());
+    }
+    let index = pjc.jitcode.try_index().unwrap_or(usize::MAX) as i32;
+    let first = DUMPED.with(|dumped| dumped.borrow_mut().insert(index));
+    if !first {
+        return;
+    }
+    let code = &pjc.jitcode.code;
+    let pc = resume_pc.max(0) as usize;
+    let start = pc.saturating_sub(8);
+    let end = (pc + 48).min(code.len());
+    eprintln!(
+        "[helper-dump] name={} index={index} resume_pc={resume_pc} num_regs=({},{},{}) nconsts_i={} code_len={} constants_i={:?} reloc_i={:?} fnaddr={:#x} fnaddr_reloc={:?}",
+        pjc.jitcode.name,
+        pjc.jitcode.num_regs_i(),
+        pjc.jitcode.num_regs_r(),
+        pjc.jitcode.num_regs_f(),
+        pjc.jitcode.constants_i.len(),
+        code.len(),
+        pjc.jitcode.constants_i.as_slice(),
+        pjc.jitcode.reloc_consts_i,
+        pjc.jitcode.fnaddr as u64,
+        pjc.jitcode.fnaddr_reloc,
+    );
+    eprintln!(
+        "[helper-dump] bytes[{start}..{end}]={:?}",
+        &code[start..end]
+    );
+    if pc < code.len() {
+        if let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) {
+            eprintln!(
+                "[helper-dump] op@{} key={} next_pc={}",
+                pc, op.key, op.next_pc
+            );
+        }
+    }
+    let dump = pjc.jitcode.dump();
+    if dump.len() <= 8000 {
+        eprintln!("[helper-dump] assembler:\n{dump}");
+    } else {
+        eprintln!(
+            "[helper-dump] assembler (truncated {} bytes):\n{}",
+            dump.len(),
+            &dump[..8000]
+        );
+    }
+}
+
+/// Section `get_list_of_active_boxes` that admits unread live colors.
+///
+/// Same live-set query as [`collect_callee_active_boxes`], but an unread
+/// color is the register's typed zero (`CONST_FALSE` / `CONST_NULL` /
+/// `CONST_FZERO`), not a decline. Canonical helpers seed only their
+/// arguments; flatten still lists a scratch int that setup never wrote.
+/// Python parents do not use this: an unread live color there is a
+/// missing seed, and a typed zero became wrong failargs.
+fn collect_helper_section_boxes(
+    regs_i: &RegisterBank,
+    regs_r: &RegisterBank,
+    regs_f: &RegisterBank,
+    helper_jitcode_index: u32,
+    helper_op_pc: usize,
+    resume_pc: i32,
+) -> Result<Vec<OpRef>, DispatchError> {
+    if resume_pc == majit_ir::resumedata::NO_JITCODE_PC {
+        return Err(DispatchError::callee_inline_unsupported(helper_op_pc));
+    }
+    let banks = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
+        helper_jitcode_index as i32,
+        resume_pc,
+    );
+    let mut active = Vec::with_capacity(banks.int.len() + banks.ref_.len() + banks.float.len());
+    let read = |value: Option<OpRef>, zero: OpRef| match value {
+        Some(v) if v != OpRef::NONE => v,
+        _ => zero,
+    };
+    let zero_i = OpRef::const_int(0);
+    let zero_r = OpRef::const_ptr(majit_ir::GcRef(pyre_object::PY_NULL as usize));
+    let zero_f = OpRef::const_float(0.0);
+    for &idx in &banks.int {
+        active.push(read(regs_i.get(idx as usize), zero_i));
+    }
+    for &idx in &banks.ref_ {
+        active.push(read(regs_r.get(idx as usize), zero_r));
+    }
+    for &idx in &banks.float {
+        active.push(read(regs_f.get(idx as usize), zero_f));
+    }
+    Ok(active)
+}
+
+/// One `get_list_of_active_boxes` at image construction
+/// (`pyjitpl.py` `capture_resumedata`). A helper section admits unread
+/// scratch as typed zero; a Python parent declines unread colors.
+/// `LoopBearingCalleeInlineUnsupported` residualizes the helper
+/// (`bhimpl_inline_call_*`); any other error propagates.
+fn collect_paused_section_boxes(
+    regs_i: &RegisterBank,
+    regs_r: &RegisterBank,
+    regs_f: &RegisterBank,
+    jitcode_index: u32,
+    op_pc: usize,
+    resume_pc: i32,
+    pending_dest: Option<(char, usize)>,
+) -> Result<Vec<OpRef>, DispatchError> {
+    let result = if crate::state::resume_frame_is_translated_helper(jitcode_index as i32) {
+        collect_helper_section_boxes(regs_i, regs_r, regs_f, jitcode_index, op_pc, resume_pc)
+    } else {
+        collect_callee_active_boxes(
+            regs_i,
+            regs_r,
+            regs_f,
+            jitcode_index,
+            op_pc,
+            resume_pc,
+            pending_dest,
+        )
+    };
+    match result {
+        Ok(boxes) => Ok(boxes),
+        Err(DispatchError::LoopBearingCalleeInlineUnsupported { .. }) => {
+            Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn innermost_helper_parent_frame<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    helper_index: usize,
+    op_pc: usize,
+    after_residual_call: bool,
+    scope: &GuardCaptureScope,
+) -> Result<InlineParentFrame, DispatchError> {
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(helper_index as i32) else {
+        if fbw_debug_abort_enabled() {
+            eprintln!("[helper-capture] no payload helper={helper_index} op_pc={op_pc}");
+        }
+        return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
+    };
+    let resume_pc = innermost_helper_resume_pc(
+        &pjc,
+        op_pc,
+        after_residual_call,
+        scope,
+        ctx.live_after_jit_pc,
+        ctx.live_before_jit_pc,
+    )?;
+    // `capture_resumedata` reads this helper MIFrame's own banks
+    // (`get_list_of_active_boxes`). Nested descent parks them on
+    // `helper_live`; `ctx.registers_*` can still name the caller's
+    // file when the guard is recorded through the enclosing walk.
+    let helper_live_banks = cloned_helper_live_banks(&ctx.session.borrow(), helper_index);
+    if fbw_debug_abort_enabled() {
+        let session = ctx.session.borrow();
+        let stack: Vec<Option<usize>> = session
+            .helper_live
+            .iter()
+            .map(|live| live.jitcode_index)
+            .collect();
+        let r0 = helper_live_banks
+            .as_ref()
+            .map(|(i, r, _, _)| (i.get(0), r.get(0)))
+            .unwrap_or_else(|| (ctx.registers_i.get(0), ctx.registers_r.get(0)));
+        eprintln!(
+            "[helper-capture] helper={helper_index} resume_pc={resume_pc} matched={} stack={stack:?} i0={:?} r0={:?}",
+            helper_live_banks.is_some(),
+            r0.0,
+            r0.1,
+        );
+        dump_helper_jitcode_once(&pjc, resume_pc);
+    }
+    let call_jitcode_pc = helper_live_banks
+        .as_ref()
+        .and_then(|(_, _, _, call_pc)| *call_pc);
+    let collected = if let Some((ref regs_i, ref regs_r, ref regs_f, _)) = helper_live_banks {
+        collect_helper_section_boxes(
+            regs_i,
+            regs_r,
+            regs_f,
+            helper_index as u32,
+            op_pc,
+            resume_pc,
+        )
+    } else {
+        collect_helper_section_boxes(
+            ctx.registers_i,
+            ctx.registers_r,
+            ctx.registers_f,
+            helper_index as u32,
+            op_pc,
+            resume_pc,
+        )
+    };
+    let boxes = match collected {
+        Ok(boxes) => boxes,
+        // Missing `-live-` window: residualize the helper. Propagating
+        // LoopBearing would discard the enclosing portal loop.
+        Err(DispatchError::LoopBearingCalleeInlineUnsupported { .. }) => {
+            return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
+        }
+        Err(error) => return Err(error),
+    };
+    // `with_caller_py_pc` maps this helper jitcode pc onto the Python
+    // opcode the helper implements (FOR_ITER, BINARY_OP, …). A helper
+    // jitcode has no Python code, so that lookup is None. A CALL-entry
+    // section that `extend_transparent_helper_chain` pops already carried
+    // the CALL's `caller_py_pc`; a `Backxlat` innermost from
+    // `numbered_helper_guard_resume` does not pop, so copy the walk's
+    // `inline_caller_py_pc` (the Python opcode `vstack_cur_pypc` set)
+    // or JUMP_BACKWARD / last_instr greens close under the wrong header.
+    let mut frame = InlineParentFrame {
+        jitcode_index: helper_index as u32,
+        call_jitcode_pc,
+        call_pc: call_jitcode_pc,
+        resume_pc: Some(resume_pc as usize),
+        call_stack_overrides: Vec::new(),
+        blackhole: None,
+        resume_coord: ParentResumeCoord::Backxlat(resume_pc as usize),
+        resume_marker_jit_pc: Some(resume_pc as usize),
+        boxes,
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
+        caller_py_pc: None,
+        result_slot: CallResultSlot::Unknown,
+    }
+    .with_caller_py_pc(helper_index as u32, resume_pc as usize);
+    if frame.caller_py_pc.is_none() {
+        frame.caller_py_pc = ctx.fbw_mode.inline_caller_py_pc;
+    }
+    Ok(frame)
+}
+
+/// True when `frame` is the same paused MIFrame as `live`.
+///
+/// Recursive inlines share a jitcode (`fib` calling `fib`) and differ by
+/// the CALL that paused them (`capture_resumedata` walks each
+/// `MetaInterp.framestack` entry). Matching on the index alone replaces
+/// the outer activation with the inner COMPARE image, so both sections
+/// resume at the helper CALL and the outer recursive CALL is lost.
+fn same_paused_activation(
+    frame: &InlineParentFrame,
+    live: &LiveFrameRegs,
+    rebuilt: &InlineParentFrame,
+) -> bool {
+    let Some(idx) = live.jitcode_index else {
+        return false;
+    };
+    if frame.jitcode_index != idx as u32 {
+        return false;
+    }
+    match (frame.call_jitcode_pc, live.call_jitcode_pc) {
+        (Some(frame_call), Some(live_call)) => frame_call == live_call,
+        _ => frame.resume_marker_jit_pc == rebuilt.resume_marker_jit_pc,
+    }
+}
+
+fn replace_or_push_paused_live<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    parent_frames: &mut Vec<InlineParentFrame>,
+    live: &LiveFrameRegs,
+    op_pc: usize,
+) -> Result<(), DispatchError> {
+    if live.jitcode_index.is_none() || live.call_jitcode_pc.is_none() {
+        return Ok(());
+    }
+    let rebuilt = inline_parent_from_paused_live(ctx, live, op_pc)?;
+    if let Some(existing) = parent_frames
+        .iter_mut()
+        .find(|frame| same_paused_activation(frame, live, &rebuilt))
+    {
+        *existing = rebuilt;
+    } else {
+        parent_frames.push(rebuilt);
+    }
+    Ok(())
+}
+
+/// Paused Python/portal + outer helpers from `LiveFrameRegs`, then the
+/// current helper at the guard's resume pc. `parent_frames` already holds
+/// Python inline callers; a section for the same paused CALL is replaced
+/// with CALL `next_pc` (`inline_parent_from_paused_live`) so the
+/// opcode-start live from `compute_inline_helper_call_entry_frame` cannot
+/// re-execute the CALL after the helper returns. Recursive activations of
+/// the same jitcode stay distinct.
+fn extend_transparent_helper_chain<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    mut parent_frames: Vec<InlineParentFrame>,
+    op_pc: usize,
+    after_residual_call: bool,
+    scope: &GuardCaptureScope,
+) -> Result<Vec<InlineParentFrame>, DispatchError> {
+    let Some(helper_index) = ctx.fbw_mode.transparent_helper_jitcode_index else {
+        if fbw_debug_abort_enabled() {
+            eprintln!("[helper-capture] no helper_index op_pc={op_pc}");
+        }
+        return Ok(parent_frames);
+    };
+    // `compute_inline_helper_call_entry_frame` may already have pushed this
+    // helper as a CALL-entry section (`CallFallthrough`). A guard inside the
+    // helper (`GUARD_NO_EXCEPTION` / `GUARD_NOT_FORCED` after a residual)
+    // needs the helper's own resume pc (`innermost_helper_parent_frame`),
+    // not that CALL. Matching on `jitcode_index` alone and returning left
+    // the CALL-entry in place, so the helper-innermost bridge re-entered
+    // the residual (`same_paused_activation` exists because index-only
+    // matching also collapses recursive activations).
+    //
+    // A `Backxlat` section for this helper is an operator/ctor tail that
+    // already names the continuation as innermost — leave it.
+    let mut preserved_caller_py_pc = None;
+    if parent_frames
+        .last()
+        .is_some_and(|frame| frame.jitcode_index == helper_index as u32)
+    {
+        match parent_frames.last().map(|frame| frame.resume_coord) {
+            Some(ParentResumeCoord::Backxlat(_)) => return Ok(parent_frames),
+            Some(ParentResumeCoord::CallFallthrough(_)) => {
+                preserved_caller_py_pc = parent_frames.last().and_then(|frame| frame.caller_py_pc);
+                parent_frames.pop();
+            }
+            None => {}
+        }
+    }
+    let (python_live, outer_helpers) = {
+        let session = ctx.session.borrow();
+        // Innermost Python/portal live only. Outer activations already sit
+        // in `parent_frames`; walking every `framestack` live also picks up
+        // a stale portal slot from an earlier helper CALL on that same
+        // frame (subtract at pc=286 while the current pause is COMPARE).
+        // A helper `InlineFrame` (`w_code == 0`) may sit on
+        // `framestack.last()` (`residual_call.rs` `build_multi_frame_miframe`).
+        let python = session
+            .framestack
+            .iter()
+            .rev()
+            .find(|frame| frame.is_portal || frame.w_code != 0)
+            .and_then(|frame| frame.paused_live());
+        let n = session.helper_live.len();
+        let outer = session
+            .helper_live
+            .iter()
+            .take(n.saturating_sub(1))
+            .cloned()
+            .collect::<Vec<_>>();
+        (python, outer)
+    };
+    if let Some(live) = python_live.as_ref() {
+        replace_or_push_paused_live(ctx, &mut parent_frames, live, op_pc)?;
+    }
+    for live in &outer_helpers {
+        let Some(idx) = live.jitcode_index else {
+            return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
+        };
+        if !crate::state::resume_frame_is_translated_helper(idx as i32) {
+            continue;
+        }
+        let rebuilt = inline_parent_from_paused_live(ctx, live, op_pc)?;
+        if parent_frames
+            .iter()
+            .any(|frame| same_paused_activation(frame, live, &rebuilt))
+        {
+            continue;
+        }
+        parent_frames.push(rebuilt);
+    }
+    let mut inner =
+        innermost_helper_parent_frame(ctx, helper_index, op_pc, after_residual_call, scope)?;
+    if inner.caller_py_pc.is_none() {
+        inner.caller_py_pc = preserved_caller_py_pc;
+    }
+    parent_frames.push(inner);
+    if fbw_debug_abort_enabled() {
+        let chain: Vec<(u32, Option<usize>, Option<usize>)> = parent_frames
+            .iter()
+            .map(|frame| {
+                (
+                    frame.jitcode_index,
+                    frame.resume_marker_jit_pc,
+                    frame.call_jitcode_pc,
+                )
+            })
+            .collect();
+        eprintln!("[helper-capture] chain={chain:?} helper={helper_index} op_pc={op_pc}");
+    }
+    Ok(parent_frames)
+}
+
 /// The framestack a guard captures once `finishframe` popped the callee: the
 /// paused callers, the innermost with `result` in the slot
 /// `make_result_of_lastop` writes (`pyjitpl.py do_residual_call`, which
 /// records `GUARD_NOT_FORCED` after it). A deopt resumes in the caller past
 /// its call instead of re-entering the callee the call already ran.
+///
+/// The same [`walker_capture_transparent_helper_snapshot`] path encodes the
+/// chain (`pyjitpl.py capture_resumedata`, one section per framestack frame);
+/// a helper subwalk then appends helper sections rather than collecting again.
 fn walker_capture_finished_callee_snapshot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     result: OpRef,
+    after_residual_call: bool,
+    scope: GuardCaptureScope,
 ) -> Result<(), DispatchError> {
     let mut parent_frames = finished_callee_parent_frames(ctx)
         .ok_or(DispatchError::callee_inline_unsupported(op_pc))?;
@@ -3608,7 +4465,14 @@ fn walker_capture_finished_callee_snapshot<Sym: WalkSym>(
     {
         caller.boxes[idx] = result;
     }
-    walker_capture_transparent_helper_snapshot(ctx, op_pc, parent_frames, GuardStampTarget::LastOp)
+    walker_capture_transparent_helper_snapshot(
+        ctx,
+        op_pc,
+        parent_frames,
+        GuardStampTarget::LastOp,
+        after_residual_call,
+        scope,
+    )
 }
 
 /// The paused callers [`walker_capture_finished_callee_snapshot`] captures,
@@ -3641,14 +4505,53 @@ pub(crate) fn finished_callee_parent_frames<Sym: WalkSym>(
     Some(parent_frames)
 }
 
+/// Number a helper-guard snapshot: paused callers outermost-first, then the
+/// helper itself when the caller appended that innermost section.
+///
+/// `parent_frames` is the whole framestack's paused levels flattened in
+/// order, so a level that ran between two frames arrives already at its own
+/// depth — `descr_call`'s tail, held on the `__init__` frame that owns it,
+/// reaches here as `[caller, tail, __init__]` without this path inserting
+/// anything. A numbered helper chain already appended the innermost helper
+/// section (`numbered_helper_guard_resume`); `extend_transparent_helper_chain`
+/// is then a no-op on that `Backxlat`. Otherwise a helper subwalk appends
+/// the paused portal/Python CALL, outer helpers, and the current helper at
+/// the guard's resume pc. Operator/ctor tails that already name the
+/// continuation as innermost are left unchanged. The outermost section must
+/// name a Python `CodeObject`: a helper-only numbering would make the helper
+/// the vable portal frame (`rebuild_from_resumedata`).
 fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    parent_frames: Vec<InlineParentFrame>,
+    guard_stamp: GuardStampTarget,
+    after_residual_call: bool,
+    scope: GuardCaptureScope,
+) -> Result<(), DispatchError> {
+    let parent_frames = if ctx.fbw_mode.transparent_helper_subwalk {
+        extend_transparent_helper_chain(ctx, parent_frames, op_pc, after_residual_call, &scope)?
+    } else {
+        parent_frames
+    };
+    walker_encode_numbered_guard_frames(ctx, op_pc, parent_frames, guard_stamp)
+}
+
+/// Encode `parent_frames` as the guard's resume snapshot, without appending
+/// helper sections. `CallOrgpc` uses this so a not-runnable helper guard
+/// keeps the Python CALL orgpc image (`generate_guard(resumepc=orgpc)`).
+fn walker_encode_numbered_guard_frames<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     parent_frames: Vec<InlineParentFrame>,
     guard_stamp: GuardStampTarget,
 ) -> Result<(), DispatchError> {
     if parent_frames.is_empty() || !ctx.trace_ctx.vable_snapshot_buildable() {
-        return Err(DispatchError::callee_inline_unsupported(op_pc));
+        // A helper section that cannot be encoded is a capture decline
+        // (`pyjitpl.py capture_resumedata` needs `MIFrame.jitcode` and live
+        // boxes). Residualize the helper (`bhimpl_inline_call_*`); aborting
+        // here would discard the enclosing portal loop
+        // (`LoopBearingCalleeInlineUnsupported` → `TraceAction::Abort`).
+        return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     }
     // A helper-only chain would publish the helper as the jitdriver
     // virtualizable (`consume_vable_info`). Keep that on a Python portal.
@@ -3780,6 +4683,11 @@ pub(crate) fn walker_emit_operator_tail_result_guard<Sym: WalkSym>(
     // caller, then the operator tail. When FORMAT_WITH_SPEC / len / bool
     // sits inside an already-inlined Python callee, dropping the portal
     // and other ancestors would resume without that callee's caller.
+    //
+    // `after_residual_call=false`: the dunder already returned; this is a
+    // tail-result guard, not residual-call fallthrough. Extra enclosing
+    // frames do not change that, and `extend_transparent_helper_chain` is a
+    // no-op when the last frame already names the current helper.
     let mut parent_frames = {
         let session = ctx.session.borrow();
         session
@@ -3790,7 +4698,14 @@ pub(crate) fn walker_emit_operator_tail_result_guard<Sym: WalkSym>(
     };
     parent_frames.push(caller);
     parent_frames.push(tail_frame);
-    walker_capture_transparent_helper_snapshot(ctx, op_pc, parent_frames, GuardStampTarget::LastOp)
+    walker_capture_transparent_helper_snapshot(
+        ctx,
+        op_pc,
+        parent_frames,
+        GuardStampTarget::LastOp,
+        false,
+        GuardCaptureScope::default(),
+    )
 }
 
 /// Emit a multi-frame inline guard snapshot (#68): the inlined callee's OWN
@@ -3818,6 +4733,8 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             callee_op_pc,
             parent_frames,
             guard_stamp,
+            after_residual_call,
+            scope,
         );
     }
     if !ctx.trace_ctx.vable_snapshot_buildable() {
@@ -4052,6 +4969,7 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
         callee_jitcode_index as u32,
         callee_op_pc,
         callee_jitcode_pc,
+        None,
     )?;
 
     // `capture_resumedata` snapshots `virtualizable_boxes` as

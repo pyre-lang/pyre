@@ -4353,6 +4353,15 @@ pub fn translate_op(
                             class_host
                         }
                     };
+                    // A `#[repr(transparent)]` struct is the field value
+                    // (`TypeDecl::is_repr_transparent`); `same_as` is the
+                    // rtyper spelling of that alias. A unit-like zero-arg
+                    // ctor still instantiates.
+                    if target.is_repr_transparent_struct()
+                        && let [arg] = arg_hls.as_slice()
+                    {
+                        return Ok(vec![FlowspaceOp::new("same_as", vec![arg.clone()], result)]);
+                    }
                     // Rust `T { fields }` allocates without running any
                     // `__init__`; the field initializers are the FieldWrite
                     // chain that follows.
@@ -5682,6 +5691,14 @@ pub(crate) fn derive_subject_inputcells(
                             == "object_array::FixedObjectArray"
                         {
                             cells.push(bk.project_struct_field_type(root));
+                            continue;
+                        }
+                        // A declared-Gc MiniMark container is `Ptr` of that
+                        // layout (`rptr.py` `PtrRepr`), the same producer
+                        // `lltype_for_named_ref` uses. After
+                        // `FixedObjectArray` so `len` + items stays SomeList.
+                        if let Some(cell) = bk.gc_struct_ptr_annotation(root) {
+                            cells.push(cell);
                             continue;
                         }
                         // A `&RawStruct` is the address of that struct
@@ -8208,6 +8225,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![crate::call::StructFieldLayout {
                     name: "save_point".into(),
                     offset: 0,
@@ -8233,6 +8251,88 @@ mod tests {
         };
         assert_eq!(st._name, owner);
         assert_eq!(st._gckind, GcKind::Raw);
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_ref_of_items_block_as_someptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+
+        let owner = "TypedItemsBlock";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let mut graph = LegacyGraph::new("dealloc_typed_items_block");
+        let entry = graph.startblock;
+        let receiver = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "block".to_string(),
+                    ty: ValueType::Ref(Some(owner.to_string())),
+                    class_root: Some(owner.to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, receiver);
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![
+                ("capacity".to_string(), "usize".to_string()),
+                ("items".to_string(), "[u64; 0]".to_string()),
+            ],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Gc,
+                repr_transparent: false,
+                fields: vec![
+                    crate::call::StructFieldLayout {
+                        name: "capacity".into(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    crate::call::StructFieldLayout {
+                        name: "items".into(),
+                        offset: 8,
+                        size: 0,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let cells =
+            derive_subject_inputcells(&graph, Some(&bk)).expect("items-block Ref input must seed");
+        let SomeValue::Ptr(ptr) = &cells[0] else {
+            panic!("items-block Ref must seed SomePtr, got {:?}", cells[0]);
+        };
+        let PtrTarget::Struct(st) = &ptr.ll_ptrtype.TO else {
+            panic!("items-block Ref input must point at a Struct");
+        };
+        assert_eq!(st._name, owner);
+        assert_eq!(st._gckind, GcKind::Gc);
     }
 
     #[test]

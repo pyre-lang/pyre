@@ -2882,7 +2882,7 @@ pub(in crate::front::mir) fn window_const_slice_ptr() -> serde_json::Value {
     serde_json::json!({"RawPtr": [window_slice(), "Const"]})
 }
 
-fn window_const_u8_ptr() -> serde_json::Value {
+pub(in crate::front::mir) fn window_const_u8_ptr() -> serde_json::Value {
     serde_json::json!({"RawPtr": [window_u8(), "Const"]})
 }
 
@@ -2911,7 +2911,7 @@ pub(in crate::front::mir) fn window_llbc(
     window_llbc_with_globals(types, funs, Vec::new())
 }
 
-fn window_llbc_with_globals(
+pub(in crate::front::mir) fn window_llbc_with_globals(
     types: Vec<serde_json::Value>,
     funs: Vec<serde_json::Value>,
     globals: Vec<serde_json::Value>,
@@ -12305,7 +12305,7 @@ fn opaque_fun(def_id: u64, path: &[&str]) -> serde_json::Value {
     })
 }
 
-fn chars_offset_global(def_id: u64, leaf: &str) -> serde_json::Value {
+pub(in crate::front::mir) fn chars_offset_global(def_id: u64, leaf: &str) -> serde_json::Value {
     serde_json::json!({
         "def_id": def_id,
         "item_meta": item_meta_json(
@@ -12991,6 +12991,185 @@ fn utf8str_as_u8_add_of_chars_offset_aliases_the_header() {
             .iter()
             .any(|leaf| *leaf == "add"),
         "the header chars add must not residualize; graph={graph:#?}"
+    );
+}
+
+/// `*const BytesBlock as *mut Utf8Str` is `cast_pointer` to the same
+/// `Ptr(STR)` (`type BytesBlock = Utf8Str`). The result carries
+/// `STRPTR`; rtyper `cast_pointer` to the same type is `same_as`.
+fn bytes_block_as_mut_utf8str_fun() -> Llbc {
+    let utf8_adt = serde_json::json!({
+        "Adt": { "id": 0, "generics": empty_generics() }
+    });
+    let bytes_block_adt = serde_json::json!({
+        "Adt": { "id": 1, "generics": empty_generics() }
+    });
+    let src_ptr = serde_json::json!({ "RawPtr": [bytes_block_adt, "Const"] });
+    let dest_ptr = serde_json::json!({ "RawPtr": [utf8_adt, "Mut"] });
+    let isize_t = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let usize_t = usize_ty();
+    let utf8str = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta_json(
+            &["pyre_object", "unicodeobject", "Utf8Str"],
+            "",
+            true
+        ),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": isize_t, "attr_info": null},
+            {"name": "length", "ty": usize_t, "attr_info": null}
+        ]},
+        "layout": null
+    });
+    let bytes_block = serde_json::json!({
+        "def_id": 1,
+        "item_meta": item_meta_json(
+            &["pyre_object", "bytesobject", "BytesBlock"],
+            "",
+            true
+        ),
+        "kind": {"Alias": { "aliased_ty": {
+            "Adt": { "id": 0, "generics": empty_generics() }
+        }}}
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta_json(&["fixture", "cast_bytes_block"], "", true),
+        "signature": {"is_unsafe": true, "inputs": [src_ptr], "output": dest_ptr},
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 1, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": dest_ptr},
+                {"index": 1, "name": "s", "span": span_json(), "ty": src_ptr}
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            {"kind": {"Local": 0}, "ty": dest_ptr},
+                            {"UnaryOp": [
+                                {"Cast": {"RawPtr": [src_ptr, dest_ptr]}},
+                                {"Move": {"kind": {"Local": 1}, "ty": src_ptr}}
+                            ]}
+                        ]}
+                    }],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                },
+                {
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": "UnwindResume"}
+                }
+            ]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [utf8str, bytes_block],
+            "fun_decls": [caller],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes())
+        .expect("BytesBlock as *mut Utf8Str fixture parses")
+}
+
+#[test]
+fn bytes_block_as_mut_utf8str_cast_result_is_strptr() {
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+    let llbc = bytes_block_as_mut_utf8str_fun();
+    let src_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
+        "RawPtr": [{ "Adt": { "id": 1, "generics": empty_generics() } }, "Const"]
+    }))
+    .expect("src TyRef");
+    let dest_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
+        "RawPtr": [{ "Adt": { "id": 0, "generics": empty_generics() } }, "Mut"]
+    }))
+    .expect("dest TyRef");
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let tomb = super::no_tombstoned_leaves();
+    assert!(
+        super::tyref_raw_ptr_pointee_is_string_value(&src_ty, &llbc),
+        "*const BytesBlock pointee is rstr STR"
+    );
+    assert!(
+        super::tyref_raw_ptr_pointee_is_string_value(&dest_ty, &llbc),
+        "*mut Utf8Str pointee is rstr STR"
+    );
+    let empty_flavor = std::collections::HashSet::<String>::new();
+    assert!(
+        !super::ty_is_raw_address(&src_ty, &llbc, &gc, &empty_flavor),
+        "*const BytesBlock is Ptr(STR), not a raw address"
+    );
+    assert!(
+        matches!(
+            super::tyref_to_value_type_with(&src_ty, &llbc, tomb, &gc, &empty_flavor),
+            crate::model::ValueType::Str
+        ),
+        "*const BytesBlock is ValueType::Str"
+    );
+    assert!(
+        matches!(
+            super::tyref_to_value_type_with(&dest_ty, &llbc, tomb, &gc, &empty_flavor),
+            crate::model::ValueType::Str
+        ),
+        "*mut Utf8Str is ValueType::Str"
+    );
+
+    let graph = super::lower_function(&llbc, "cast_bytes_block")
+        .expect("lower *const BytesBlock as *mut Utf8Str");
+    let start = graph
+        .blocks
+        .iter()
+        .find(|b| b.id == graph.startblock)
+        .expect("startblock");
+    let input = start
+        .operations
+        .iter()
+        .find_map(|op| match &op.kind {
+            OpKind::Input { name, ty, .. } if name == "s" => {
+                assert!(
+                    matches!(ty, ValueType::Str),
+                    "Input *const BytesBlock is ValueType::Str"
+                );
+                op.result.clone()
+            }
+            _ => None,
+        })
+        .expect("Input s");
+    assert_eq!(
+        input.concretetype(),
+        Some(STRPTR.clone()),
+        "*const BytesBlock param is Ptr(STR); graph={graph:#?}"
+    );
+    // The returnblock inputarg is a fresh `returnvar_`; the cast
+    // result is the value the startblock link carries (`same_as`
+    // the operand, `jtransform.py` `rewrite_op_cast_pointer`).
+    let ret = start
+        .exits
+        .iter()
+        .find(|link| link.target == graph.returnblock)
+        .and_then(|link| link.args.first())
+        .expect("return link arg");
+    let LinkArg::Value(v) = ret else {
+        panic!("return link is a value; graph={graph:#?}");
+    };
+    assert_eq!(
+        v.concretetype(),
+        Some(STRPTR.clone()),
+        "cast result is Ptr(STR); graph={graph:#?}"
+    );
+    assert!(
+        !call_leafs(&graph_ops(&graph)).iter().any(|leaf| {
+            *leaf == "__cast_instance_intrinsic" || *leaf == "__cast_address_intrinsic"
+        }),
+        "same-type STR pointer cast is same_as, not a marker; graph={graph:#?}"
     );
 }
 
@@ -20619,6 +20798,383 @@ fn bytes_block_chars_folds_header_length_view() {
     );
 }
 
+/// `w_bytearray_data` returns a host `&[u8]` pair: FieldRead of `.data`,
+/// then `from_raw_parts` inlined as `(chars_ptr, length)`. Loads the
+/// real pyre-object LLBC, so ignored by default.
+#[test]
+#[ignore]
+fn w_bytearray_data_aliases_to_bytes_block_header() {
+    use crate::model::{CallTarget, OpKind};
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-object.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+    let graph = super::lower_function(&llbc, "w_bytearray_data").expect("lower w_bytearray_data");
+    let residual = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.last().map(String::as_str) == Some("from_raw_parts")
+            )
+        })
+        .count();
+    let ops: Vec<String> = graph
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(i, b)| {
+            b.operations.iter().map(move |op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => format!("{i}: call {}", segments.join("::")),
+                OpKind::FieldRead { field, .. } => format!(
+                    "{i}: field {} owner={:?} addr={}",
+                    field.name, field.owner_root, field.taken_by_address
+                ),
+                other => format!("{i}: {other:?}"),
+            })
+        })
+        .collect();
+    assert_eq!(
+        residual, 0,
+        "from_raw_parts must inline as the host pair; ops: {ops:#?}"
+    );
+    let saw_data = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. }
+                    if field.name == "data"
+                        && field.owner_root.as_deref() == Some("W_BytearrayObject")
+            )
+        });
+    assert!(
+        saw_data,
+        "w_bytearray_data must read W_BytearrayObject.data; ops: {ops:#?}"
+    );
+    // `addr_of!((*data).chars) as *const u8` is `direct_arrayitems`:
+    // header + items offset, not a value load of chars[0].
+    let saw_items_add = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .any(|op| matches!(&op.kind, OpKind::BinOp { op: add, .. } if add == "add"));
+    assert!(
+        saw_items_add,
+        "pair ptr is header + items offset (direct_arrayitems); ops: {ops:#?}"
+    );
+    let saw_chars_offset = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .any(|op| matches!(&op.kind, OpKind::ConstInt(8)));
+    assert!(
+        saw_chars_offset,
+        "BytesBlock.chars items offset is the length word; ops: {ops:#?}"
+    );
+}
+
+/// `dict_entries_get_str` passes `key.as_bytes()` (`&str` → STR header
+/// view) to `hash_str_hooked_bytes(&[u8])`, whose naked `&[u8]` is the
+/// host pair. The call site must splice `(chars_ptr, ll_strlen)`.
+/// Loads the real pyre-object LLBC, so ignored by default.
+#[test]
+#[ignore]
+fn str_as_bytes_to_host_pair_callee_splices_chars_and_strlen() {
+    use crate::model::{CallTarget, OpKind};
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-object.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+    let graph =
+        super::lower_function(&llbc, "dict_entries_get_str").expect("lower dict_entries_get_str");
+    let ops: Vec<String> = graph
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(i, b)| {
+            b.operations.iter().map(move |op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } => format!("{i}: call {} argc={}", segments.join("::"), args.len()),
+                other => format!("{i}: {other:?}"),
+            })
+        })
+        .collect();
+    let has_strlen = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("__strlen")
+            )
+        });
+    let has_cast = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("cast_ptr_to_int")
+            )
+        });
+    let has_add = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add"));
+    assert!(
+        has_strlen && has_cast && has_add,
+        "STR view → host pair must emit __strlen and cast_ptr_to_int+add; ops: {ops:#?}"
+    );
+    let hooked = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments.last().map(String::as_str) == Some("hash_str_hooked_bytes") => {
+                Some(args.len())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        hooked.iter().all(|&n| n == 2) && (!hooked.is_empty() || has_strlen),
+        "hash_str_hooked_bytes must take the spliced pair, or the body \
+         inlines past it after the conversion; argc={hooked:?}; ops: {ops:#?}"
+    );
+}
+
+/// `BytesIO.read_slice` indexes `w_bytearray_data(buf)[p..p+count]`.
+/// That range is a host `&[u8]` pair subslice (byte add of `p`), then
+/// residual `w_bytes_from_bytes`. Loads the real pyre-interpreter LLBC,
+/// so ignored by default.
+#[test]
+#[ignore]
+fn read_slice_range_index_is_getslice() {
+    use crate::model::{CallTarget, OpKind};
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-interpreter.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
+    let graph = super::lower_function(
+        &llbc,
+        "pyre_interpreter::module::_io::interp_bytesio::<Impl>::read_slice",
+    )
+    .expect("lower read_slice");
+    let ops: Vec<String> = graph
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(i, b)| {
+            b.operations.iter().map(move |op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => format!("{i}: call {}", segments.join("::")),
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } => format!("{i}: method {name}"),
+                other => format!("{i}: {other:?}"),
+            })
+        })
+        .collect();
+    let residual_index = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                segments.last().map(String::as_str) == Some("index")
+                    && segments.iter().any(|s| s == "slice")
+            }
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == "index",
+            _ => false,
+        })
+        .count();
+    assert_eq!(
+        residual_index, 0,
+        "read_slice must not leave residual slice::index; ops: {ops:#?}"
+    );
+    let wrap = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let leaf = segments.last().map(String::as_str);
+                leaf == Some("w_bytes_from_bytes") || leaf == Some("we_are_jitted")
+            }
+            _ => false,
+        })
+        .count();
+    assert!(
+        wrap >= 1,
+        "read_slice must copy the char range via w_bytes_from_bytes; ops: {ops:#?}"
+    );
+    let object_llbc = Llbc::load(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-object.ullbc"
+    ))
+    .expect("load pyre-object LLBC");
+    let callee =
+        super::lower_function(&object_llbc, "w_bytearray_data").expect("lower w_bytearray_data");
+    let callee = std::rc::Rc::new(callee);
+    let mut cc = crate::call::CallControl::new();
+    cc.register_function_graph(
+        crate::CallPath::from_segments(["bytearrayobject", "w_bytearray_data"]),
+        std::rc::Rc::clone(&callee),
+    );
+    cc.register_function_graph(
+        crate::CallPath::from_segments(["pyre_object", "bytearrayobject", "w_bytearray_data"]),
+        callee,
+    );
+    cc.find_all_graphs_for_tests();
+    let config = crate::codewriter::jtransform::GraphTransformConfig::default();
+    let transformed = crate::codewriter::jtransform::Transformer::new(&config)
+        .with_callcontrol(&mut cc)
+        .transform(&graph);
+    let mut saw_data_field = false;
+    let mut saw_bytearray_data = false;
+    let mut saw_strconcat = false;
+    for b in &transformed.graph.blocks {
+        for op in &b.operations {
+            match &op.kind {
+                OpKind::FieldRead { field, .. }
+                    if field.name == "data"
+                        && field.owner_root.as_deref() == Some("W_BytearrayObject") =>
+                {
+                    saw_data_field = true;
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("w_bytearray_data") => {
+                    saw_bytearray_data = true;
+                }
+                OpKind::InlineCall { jitcode, .. } if jitcode.name.contains("w_bytearray_data") => {
+                    saw_bytearray_data = true;
+                }
+                OpKind::ConstFnAddr { path, .. } if path.contains("strconcat") => {
+                    saw_strconcat = true;
+                }
+                OpKind::CallResidual { descriptor, .. }
+                    if descriptor.extra_info.oopspecindex
+                        == majit_ir::descr::OopSpecIndex::StrConcat =>
+                {
+                    saw_strconcat = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        saw_data_field || saw_bytearray_data,
+        "read_slice must inline w_bytearray_data or residual-call the pair; \
+         lowered: {ops:#?}"
+    );
+    assert!(
+        !saw_strconcat,
+        "read_slice p+count must stay int add, not ll_strconcat"
+    );
+    // Charon spells the inherent method `<Impl>::read_slice`; the
+    // shipped jitcode display name is `W_BytesIO::read_slice`.
+}
+
+/// `BytesIO.read` is `read_w`: check_closed + convert_size + RStringIO.read.
+/// The slice+join lives in `read_slice` (returns bytes). `read` must not
+/// wrap a residual `&[u8]` dest.
+#[test]
+#[ignore]
+fn bytesio_read_range_index_is_getslice() {
+    use crate::model::{CallTarget, OpKind};
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-interpreter.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
+    let graph = super::lower_function(
+        &llbc,
+        "pyre_interpreter::module::_io::interp_bytesio::<Impl>::read",
+    )
+    .expect("lower BytesIO.read");
+    let ops: Vec<String> = graph
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(i, b)| {
+            b.operations.iter().map(move |op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => format!("{i}: call {}", segments.join("::")),
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } => format!("{i}: method {name}"),
+                other => format!("{i}: {other:?}"),
+            })
+        })
+        .collect();
+    let calls_read_slice =
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } => name == "read_slice",
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().map(String::as_str) == Some("read_slice"),
+                _ => false,
+            });
+    eprintln!("BytesIO.read ops:\n{ops:#?}");
+    assert!(
+        calls_read_slice,
+        "BytesIO.read must call read_slice (RStringIO.read); ops: {ops:#?}"
+    );
+}
+
 /// The Rust interpreter reloads a possibly-moved pointer explicitly;
 /// RPython's translated graph instead gets the updated GCREF from
 /// `gc_restore_root`.  The source adapter must therefore lower to an
@@ -24792,6 +25348,222 @@ fn match_on_call_returned_option_usize_reads_instantiated_some_pos0() {
         breaks.is_empty(),
         "Break's Option<Never> residual is lltype.Void so there is no Break.__pos_0 FieldRead, got {breaks:?}"
     );
+}
+
+/// `quasiimmut.py make_invalidation_function.invalidation` after #201
+/// deleted the `#[jit_llop]` stand-in: `if is_installed { sweep }`.
+/// `is_installed` is an Acquire load of `QuasiImmutField.ptr`, the same
+/// Atomic load fold `test_mir_atomic_load` uses for a `?` field.
+fn quasi_immut_invalidation_llbc() -> Llbc {
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let unit = interior_unit_ty();
+    let field_adt = interior_adt(0);
+    let field_ref = option_shared_ref(field_adt.clone());
+    let ptr_ty = interior_raw_mut(interior_adt(0));
+    let notify = interior_caller(
+        "jit_force_quasi_immutable",
+        1,
+        vec![field_ref.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("field"), &field_ref),
+            interior_local(2, Some("installed"), &bool_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &unit),
+                    serde_json::json!({"Aggregate": ["Tuple", []]}),
+                )],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(1, &field_ref))],
+                    interior_place(2, &bool_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                serde_json::json!({
+                    "span": interior_span(),
+                    "kind": {
+                        "Switch": {
+                            "discr": {"Copy": interior_place(2, &bool_ty)},
+                            "targets": {"If": [3, 4]}
+                        }
+                    }
+                }),
+            ),
+            interior_bb(
+                vec![],
+                interior_call(
+                    2,
+                    vec![interior_copy(interior_place(1, &field_ref))],
+                    interior_place(0, &unit),
+                    4,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let is_installed = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["quasiimmut", "QuasiImmutField", "is_installed"], true),
+        "signature": {"is_unsafe": true, "inputs": [field_ref.clone()], "output": bool_ty},
+        "body": {
+            "Unstructured": {
+                "span": interior_span(),
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        interior_local(0, None, &bool_ty),
+                        interior_local(1, Some("self"), &field_ref),
+                        interior_local(2, Some("ptr"), &ptr_ty)
+                    ]
+                },
+                "body": [interior_bb(
+                    vec![
+                        interior_assign(
+                            interior_place(2, &ptr_ty),
+                            interior_use(interior_field(1, &field_ref, &field_adt, &ptr_ty, 0)),
+                        ),
+                        interior_assign(
+                            interior_place(0, &bool_ty),
+                            serde_json::json!({"BinaryOp": [
+                                "Ne",
+                                interior_copy(interior_place(2, &ptr_ty)),
+                                interior_copy(interior_place(2, &ptr_ty))
+                            ]}),
+                        ),
+                    ],
+                    interior_return(),
+                )]
+            }
+        }
+    });
+    let sweep = interior_opaque(
+        2,
+        &["quasiimmut", "sweep_quasi_immut_field"],
+        vec![field_ref],
+        unit,
+    );
+    let owner = interior_struct(
+        0,
+        &["quasiimmut", "QuasiImmutField"],
+        &[("ptr", ptr_ty)],
+        8,
+        &[0],
+        false,
+    );
+    llbc_with_types("fixture", vec![owner], vec![notify, is_installed, sweep])
+}
+
+#[test]
+fn notify_version_watchers_traces_installed_check() {
+    // `celldict.py` / `quasiimmut.py make_invalidation_function.invalidation`:
+    // the installed check (`is_installed`, Acquire load of
+    // `QuasiImmutField.ptr`) stays in the trace as `getfield_gc`;
+    // only `sweep_quasi_immut_field` is residual.
+    // #201 dropped `ModuleDictStrategy::jit_force_quasi_immutable`; the
+    // fixture is that invalidation graph (`warmspot.py
+    // rewrite_force_quasi_immutable`).
+    let llbc = quasi_immut_invalidation_llbc();
+    let notify = super::lower_function(&llbc, "jit_force_quasi_immutable")
+        .expect("lower jit_force_quasi_immutable");
+    let notify_calls: Vec<String> = notify
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call { target, .. } => Some(target.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        notify_calls.iter().any(|c| c.contains("is_installed")),
+        "jit_force_quasi_immutable must keep the installed check: {notify_calls:?}"
+    );
+    assert!(
+        notify_calls
+            .iter()
+            .any(|c| c.contains("sweep_quasi_immut_field")),
+        "jit_force_quasi_immutable must residualize the sweep: {notify_calls:?}"
+    );
+    let graph = super::lower_function(&llbc, "is_installed")
+        .expect("lower is_installed: Acquire of QuasiImmutField.ptr must be getfield_gc");
+    let field_reads: Vec<String> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } => Some(format!(
+                "{}::{}",
+                field.owner_root.as_deref().unwrap_or("?"),
+                field.name
+            )),
+            _ => None,
+        })
+        .collect();
+    let has_ptr_read = field_reads.iter().any(|s| s.ends_with("::ptr"));
+    assert!(
+        has_ptr_read,
+        "is_installed: Acquire load of QuasiImmutField.ptr must be getfield_gc; field_reads={field_reads:?}"
+    );
+}
+
+#[test]
+fn look_inside_unit_signature_stamps_void_result() {
+    // `_setitem_str_cell_known` returns `()`. The CFG colours that
+    // empty-tuple ADT Ref; the header must still stamp `FUNC.RESULT`
+    // void so the codewriter widens the returnblock.
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-object.ullbc"
+    );
+    let llbc = crate::test_support::load_ullbc(path);
+    let graph = super::lower_function(&llbc, "_setitem_str_cell_known")
+        .expect("lower _setitem_str_cell_known");
+    assert_eq!(graph.return_type.as_deref(), Some("()"));
+
+    // The production path is the funcobj header + lazy body, not
+    // `lower_function`. Both the header and the built graph must
+    // carry the void stamp so `declared_return_kind` is `'v'`.
+    let program = super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[llbc],
+        crate::HostStaticAddrs::default(),
+        &["celldict"],
+        &["_setitem_str_cell_known"],
+    )
+    .expect("lower celldict::_setitem_str_cell_known");
+    let matches: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|f| f.name == "_setitem_str_cell_known")
+        .collect();
+    assert!(
+        !matches.is_empty(),
+        "no _setitem_str_cell_known funcobj in the celldict program"
+    );
+    for func in &matches {
+        assert_eq!(
+            func.return_type.as_deref(),
+            Some("()"),
+            "header return_type of {} ({:?})",
+            func.name,
+            func.self_ty_root
+        );
+        assert_eq!(
+            func.graph().return_type.as_deref(),
+            Some("()"),
+            "graph return_type of {} ({:?})",
+            func.name,
+            func.self_ty_root
+        );
+    }
 }
 
 #[test]

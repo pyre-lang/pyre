@@ -157,6 +157,18 @@ fn is_ptr_int_cast_target(target: &CallTarget) -> bool {
     )
 }
 
+fn is_cast_instance_target(target: &CallTarget) -> bool {
+    let CallTarget::FunctionPath { segments, .. } = target else {
+        return false;
+    };
+    segments.last().map(String::as_str) == Some("__cast_instance_intrinsic")
+}
+
+fn call_is_header_identity(target: &CallTarget, args: &[crate::model::LinkArg]) -> bool {
+    (args.len() == 1 && is_ptr_int_cast_target(target))
+        || (!args.is_empty() && is_cast_instance_target(target))
+}
+
 fn producer_op<'a>(graph: &'a FunctionGraph, var: &Variable) -> Option<&'a SpaceOperation> {
     let (block_id, idx) = resolve_to_producer_op(graph, var)?;
     graph
@@ -179,9 +191,7 @@ fn peel_ptr_int_casts(graph: &FunctionGraph, var: &Variable) -> Variable {
             return current;
         };
         match &op.kind {
-            OpKind::Call { target, args, .. }
-                if args.len() == 1 && is_ptr_int_cast_target(target) =>
-            {
+            OpKind::Call { target, args, .. } if call_is_header_identity(target, args) => {
                 current = args[0].clone().into_variable();
             }
             OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
@@ -196,9 +206,7 @@ fn canonical_source(graph: &FunctionGraph, var: &Variable) -> Variable {
     let peeled = peel_ptr_int_casts(graph, var);
     match producer_op(graph, &peeled) {
         Some(op) => match &op.kind {
-            OpKind::Call { target, args, .. }
-                if args.len() == 1 && is_ptr_int_cast_target(target) =>
-            {
+            OpKind::Call { target, args, .. } if call_is_header_identity(target, args) => {
                 canonical_source(graph, &args[0].clone().into_variable())
             }
             OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
@@ -246,7 +254,11 @@ fn ptr_add_chars_offset_header(graph: &FunctionGraph, ptr: &Variable) -> Option<
     }
 }
 
-fn len_names_same_header(graph: &FunctionGraph, len: &Variable, header: &Variable) -> bool {
+pub(crate) fn len_names_same_header(
+    graph: &FunctionGraph,
+    len: &Variable,
+    header: &Variable,
+) -> bool {
     let Some(op) = producer_op(graph, len) else {
         return false;
     };

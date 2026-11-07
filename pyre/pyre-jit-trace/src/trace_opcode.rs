@@ -333,22 +333,29 @@ pub(crate) fn null_vable_dead_array_tail(ctx: &mut TraceCtx, from: usize) {
     }
 }
 
-/// Live STANDARD `last_instr` / `valuestackdepth` boxes saved across a
-/// resume-image publish.
+/// Live STANDARD `last_instr` / `pycode` / `valuestackdepth` / `debugdata`
+/// boxes saved across a resume-image publish.
 ///
 /// `pyjitpl.py` `capture_resumedata` saves `frame.pc` before rewriting it for
-/// the snapshot and restores it afterwards. The walker publishes those
-/// scalars into `virtualizable_boxes` because `build_snapshot_vable_vref_boxes`
-/// reads that shadow. The restore writes both scalars back to the live frame
-/// as well as the box (`_opimpl_setfield_vable` synchronizes the field it
-/// stores), so a publish that reached the live frame is undone there too and
-/// the live frame and the box agree afterwards
-/// (`check_synchronized_virtualizable`). `close_loop_args_at` reads the
-/// concrete depth, which the walker otherwise never advances.
+/// the snapshot and restores it afterwards. The walker publishes
+/// `last_instr` / `valuestackdepth` into `virtualizable_boxes` because
+/// `build_snapshot_vable_vref_boxes` reads that shadow. A helper walk that
+/// looks inside `getcode_w` / `get_w_globals` / `getorcreatedebug` can also
+/// `setfield_vable` the portal `pycode` and `debugdata` when an inlined
+/// frame was `replace_box`'d onto the standard virtualizable. Restore those
+/// two with the CALL-site scalars so later snapshots keep the portal
+/// payload. The restore writes the boxes back to the live frame
+/// (`_opimpl_setfield_vable` synchronizes the field it stores), so a publish
+/// that reached the live frame is undone there too and the live frame and
+/// the box agree afterwards (`check_synchronized_virtualizable`).
+/// `close_loop_args_at` reads the concrete depth, which the walker otherwise
+/// never advances.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SavedVableResumeScalars {
     last_instr: Option<(OpRef, Value)>,
+    pycode: Option<(OpRef, Value)>,
     valuestackdepth: Option<(OpRef, Value)>,
+    debugdata: Option<(OpRef, Value)>,
 }
 
 fn vable_static_entry(ctx: &TraceCtx, static_field_name: &str) -> Option<(OpRef, Value)> {
@@ -361,7 +368,9 @@ fn vable_static_entry(ctx: &TraceCtx, static_field_name: &str) -> Option<(OpRef,
 pub(crate) fn save_vable_resume_scalars(ctx: &TraceCtx) -> SavedVableResumeScalars {
     SavedVableResumeScalars {
         last_instr: vable_static_entry(ctx, "last_instr"),
+        pycode: vable_static_entry(ctx, "pycode"),
         valuestackdepth: vable_static_entry(ctx, "valuestackdepth"),
+        debugdata: vable_static_entry(ctx, "debugdata"),
     }
 }
 
@@ -388,8 +397,14 @@ pub(crate) fn restore_vable_resume_scalars(ctx: &mut TraceCtx, saved: SavedVable
     if let Some((opref, concrete)) = saved.last_instr {
         mirror_vable_static_to_boxes(ctx, "last_instr", opref, concrete);
     }
+    if let Some((opref, concrete)) = saved.pycode {
+        mirror_vable_static_to_boxes(ctx, "pycode", opref, concrete);
+    }
     if let Some((opref, concrete)) = saved.valuestackdepth {
         mirror_vable_static_to_boxes(ctx, "valuestackdepth", opref, concrete);
+    }
+    if let Some((opref, concrete)) = saved.debugdata {
+        mirror_vable_static_to_boxes(ctx, "debugdata", opref, concrete);
     }
 }
 

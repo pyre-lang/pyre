@@ -358,7 +358,7 @@ impl<'a> Lowering<'a> {
                 })?;
                 let dest = self.resolve_operand(mir_bb, dest_op)?;
                 let start = {
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     let var = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -413,7 +413,7 @@ impl<'a> Lowering<'a> {
                             ))
                         })?
                         .one()?;
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     let index = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);

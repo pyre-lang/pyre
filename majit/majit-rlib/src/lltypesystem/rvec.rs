@@ -184,6 +184,13 @@ pub fn ll_vec_as_ptr(header: usize) -> usize {
     vec_header_word(header, VEC_PTR_WORD)
 }
 
+/// Length word of any `Vec<T>` header (`rlist.py` `ll_length`:
+/// `return len(l.items)` / the header `length` field). Item-kind
+/// independent: every `Vec<T>` header stores that word at `VEC_LEN_WORD`.
+pub fn ll_vec_as_len(header: usize) -> usize {
+    vec_header_word(header, VEC_LEN_WORD)
+}
+
 fn vec_header_r(l: &mut Vec<GCREF>) -> usize {
     l as *mut Vec<GCREF> as usize
 }
@@ -735,6 +742,27 @@ pub fn ll_slice_reverse_i(items: usize, length: usize) {
         let other = ll_slice_getitem_fast_i(items, length_1_i as usize);
         ll_slice_setitem_fast_i(items, i as usize, other);
         ll_slice_setitem_fast_i(items, length_1_i as usize, tmp);
+        i += 1;
+        length_1_i -= 1;
+    }
+}
+
+/// `<[u8]>::reverse` on a host `&mut [u8]` pair. Word-sized
+/// [`ll_slice_reverse_i`] strides a machine word; this walks bytes.
+/// Same swap loop as [`ll_slice_reverse_i`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_slice_reverse_u8(items: usize, length: usize) {
+    let length = length as isize;
+    let mut i: isize = 0;
+    let mut length_1_i = length - 1 - i;
+    while i < length_1_i {
+        unsafe {
+            let p = items as *mut u8;
+            let a = std::ptr::read(p.add(i as usize));
+            let b = std::ptr::read(p.add(length_1_i as usize));
+            std::ptr::write(p.add(i as usize), b);
+            std::ptr::write(p.add(length_1_i as usize), a);
+        }
         i += 1;
         length_1_i -= 1;
     }
@@ -1627,10 +1655,13 @@ mod tests {
         let mut bytes: Vec<u8> = vec![1, 2, 3];
         let header = &mut bytes as *mut Vec<u8> as usize;
         assert_eq!(ll_vec_as_ptr(header), bytes.as_ptr() as usize);
+        assert_eq!(ll_vec_as_len(header), bytes.len());
         let mut words: Vec<usize> = vec![7, 8];
         let header = &mut words as *mut Vec<usize> as usize;
         assert_eq!(ll_vec_as_ptr(header), words.as_ptr() as usize);
         assert_eq!(ll_vec_as_ptr(header), ll_vec_items_i(&mut words));
+        assert_eq!(ll_vec_as_len(header), words.len());
+        assert_eq!(ll_vec_as_len(header), ll_vec_length_i(&mut words));
     }
 
     #[test]
@@ -1722,6 +1753,12 @@ mod tests {
         ll_slice_setitem_fast_i(items, 4, 40);
         ll_slice_reverse_i(items, ll_vec_length_i(&mut v));
         assert_eq!(v, vec![5, 40, 3, 2, 1, 0]);
+
+        let mut bytes = vec![1u8, 2, 3, 4, 5];
+        ll_slice_reverse_u8(bytes.as_mut_ptr() as usize, bytes.len());
+        assert_eq!(bytes, vec![5, 4, 3, 2, 1]);
+        ll_slice_reverse_u8(bytes.as_mut_ptr() as usize, 1);
+        assert_eq!(bytes, vec![5, 4, 3, 2, 1]);
 
         let floats = [1.5f64, 2.5, 3.5];
         assert_eq!(ll_slice_getitem_fast_f(floats.as_ptr() as usize, 2), 3.5);
@@ -1878,6 +1915,7 @@ mod tests {
             "ll_slice_reverse_i",
             "ll_slice_reverse_r",
             "ll_slice_reverse_f",
+            "ll_slice_reverse_u8",
             "ll_slice_rotate_left_i",
             "ll_slice_rotate_right_r",
             "ll_slice_rotate_left_f",
