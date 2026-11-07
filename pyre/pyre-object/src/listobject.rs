@@ -3332,11 +3332,6 @@ pub unsafe fn ll_list_int_resize_hint_really(obj: PyObjectRef, newsize: i64, ove
     };
     let list = &*(obj as *const W_ListObject);
     let before_len = ll_list_int_length(list);
-    let p = if (before_len as i64) < newsize {
-        before_len
-    } else {
-        newsize as usize
-    };
     // `newitems = malloc(LIST.items.TO, new_allocated)`: a nursery malloc
     // that may collect, so `l` is reloaded after it. Nothing between the
     // malloc and `l.items = newitems` collects, so `newitems` needs no root.
@@ -3344,11 +3339,25 @@ pub unsafe fn ll_list_int_resize_hint_really(obj: PyObjectRef, newsize: i64, ove
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
     let old = ll_list_int_items(list);
-    // `rgc.ll_arraycopy(l.items, newitems, 0, 0, p)`.
-    crate::object_array::ll_arraycopy_int_items_block(old, newitems, 0, 0, p as i64);
-    // The barrier gctransform puts before `l.items = newitems`: an old list
-    // now names a young block.
-    list_write_barrier(obj);
+    // `if before_len:` — skip `ll_arraycopy` on the prebuilt empty array.
+    if before_len > 0 {
+        let p = if (before_len as i64) < newsize {
+            before_len
+        } else {
+            newsize as usize
+        };
+        // `rgc.ll_arraycopy(l.items, newitems, 0, 0, p)`.
+        crate::object_array::ll_arraycopy_int_items_block(old, newitems, 0, 0, p as i64);
+    }
+    // `l.items = newitems`. gctransform inserts `gc_writebarrier` on that
+    // setfield (`framework.py gct_gc_writebarrier`); the codewriter reads
+    // pre-gctransform graphs, so the JIT never sees it, and
+    // `rewrite.py handle_write_barrier_setfield` emits `COND_CALL_GC_WB` on
+    // the traced store. Spell the interpreter barrier as
+    // `gc_hook::try_gc_write_barrier` on the same `list` pointer the store
+    // uses, immediately before it; `drop_guarded_gc_write_barriers` drops
+    // it when that GC-ref setfield follows.
+    crate::gc_hook::try_gc_write_barrier(list as *mut W_ListObject as crate::gc_hook::GCREF);
     ll_list_int_set_items(list, newitems);
     // A block outside the collector's heap (no GC installed) has no other
     // owner to free it; a collector-owned one is left to the collector.
@@ -3485,11 +3494,6 @@ pub unsafe fn ll_list_float_resize_hint_really(obj: PyObjectRef, newsize: i64, o
     };
     let list = &*(obj as *const W_ListObject);
     let before_len = ll_list_float_length(list);
-    let p = if (before_len as i64) < newsize {
-        before_len
-    } else {
-        newsize as usize
-    };
     // `newitems = malloc(LIST.items.TO, new_allocated)`: a nursery malloc
     // that may collect, so `l` is reloaded after it. Nothing between the
     // malloc and `l.items = newitems` collects, so `newitems` needs no root.
@@ -3497,17 +3501,31 @@ pub unsafe fn ll_list_float_resize_hint_really(obj: PyObjectRef, newsize: i64, o
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
     let old = ll_list_float_items(list);
-    // `rgc.ll_arraycopy(l.items, newitems, 0, 0, p)`.
-    crate::object_array::ll_arraycopy_float_items_block(
-        old as *mut FloatItemsBlock,
-        newitems as *mut FloatItemsBlock,
-        0,
-        0,
-        p as i64,
-    );
-    // The barrier gctransform puts before `l.items = newitems`: an old list
-    // now names a young block.
-    list_write_barrier(obj);
+    // `if before_len:` — skip `ll_arraycopy` on the prebuilt empty array.
+    if before_len > 0 {
+        let p = if (before_len as i64) < newsize {
+            before_len
+        } else {
+            newsize as usize
+        };
+        // `rgc.ll_arraycopy(l.items, newitems, 0, 0, p)`.
+        crate::object_array::ll_arraycopy_float_items_block(
+            old as *mut FloatItemsBlock,
+            newitems as *mut FloatItemsBlock,
+            0,
+            0,
+            p as i64,
+        );
+    }
+    // `l.items = newitems`. gctransform inserts `gc_writebarrier` on that
+    // setfield (`framework.py gct_gc_writebarrier`); the codewriter reads
+    // pre-gctransform graphs, so the JIT never sees it, and
+    // `rewrite.py handle_write_barrier_setfield` emits `COND_CALL_GC_WB` on
+    // the traced store. Spell the interpreter barrier as
+    // `gc_hook::try_gc_write_barrier` on the same `list` pointer the store
+    // uses, immediately before it; `drop_guarded_gc_write_barriers` drops
+    // it when that GC-ref setfield follows.
+    crate::gc_hook::try_gc_write_barrier(list as *mut W_ListObject as crate::gc_hook::GCREF);
     ll_list_float_set_items(list, newitems);
     // A block outside the collector's heap (no GC installed) has no other
     // owner to free it; a collector-owned one is left to the collector.
@@ -3810,8 +3828,15 @@ pub unsafe fn ll_list_obj_resize_hint_really(obj: PyObjectRef, newsize: i64, ove
         // `rgc.ll_arraycopy(l.items, newitems, 0, 0, p)`.
         crate::object_array::ll_arraycopy_items_block(old, newitems, 0, 0, p as i64);
     }
-    // The barrier gctransform puts before `l.items = newitems`.
-    list_write_barrier(obj);
+    // `l.items = newitems`. gctransform inserts `gc_writebarrier` on that
+    // setfield (`framework.py gct_gc_writebarrier`); the codewriter reads
+    // pre-gctransform graphs, so the JIT never sees it, and
+    // `rewrite.py handle_write_barrier_setfield` emits `COND_CALL_GC_WB` on
+    // the traced store. Spell the interpreter barrier as
+    // `gc_hook::try_gc_write_barrier` on the same `list` pointer the store
+    // uses, immediately before it; `drop_guarded_gc_write_barriers` drops
+    // it when that GC-ref setfield follows.
+    crate::gc_hook::try_gc_write_barrier(list as *mut W_ListObject as crate::gc_hook::GCREF);
     list.items = newitems;
     // A block outside the collector's heap has no other owner to free it; a
     // collector-owned one is left to the collector.
