@@ -2,7 +2,7 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=fb88aa9c539d6611 platform=linux
+# corpus=f83fa511915d13be platform=linux
 direct-skip (never reaches unported_category)	generatorentry_portal_portal
 direct-skip (never reaches unported_category)	option::Option::<impl core::ops::try_trait::Try<core::option::Option<v0>>>::branch__spec_Utf16Or32Form_1aad9eec5cbb6142
 direct-skip (never reaches unported_category)	pyre_interpreter::type_methods::builtin_encoder
@@ -2086,5 +2086,6 @@ two-phase-rtype-skipped	majit_rlib::jit_libffi::imp::do_ffi_call_sint
 two-phase-rtype-skipped	pyre_interpreter::baseobjspace::_check_len_result
 two-phase-rtype-skipped	pyre_interpreter::module::thread::rlock_class::<Impl>::_release_save
 two-phase-rtype-skipped	pyre_interpreter::type_methods::complex_component_spec
+two-phase-rtype-skipped	pyre_object::dictmultiobject::<Impl>::get_empty_storage
 two-phase-rtype-skipped	pyre_object::gc_hook::try_gc_alloc_collecting_rooted
 two-phase-rtype-skipped	pyre_object::unicodeobject::alloc_utf8_payload
