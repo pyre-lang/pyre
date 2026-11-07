@@ -32,13 +32,10 @@ pub use crate::objspace::descroperation::*;
 /// `baseobjspace.py ObjSpace.make_builtins` / `setbuiltinmodule` set
 /// `self.builtin` once. `module.py Module.__init__` owns the dictionary;
 /// `function.py BuiltinFunction.w_moduleobj` points back to the defining
-/// module. A second call returns the existing Module (`getbuiltinmodule`
-/// reuse). `new_builtin_module_dict` stays the dict allocator.
-pub(crate) fn make_builtins() -> PyObjectRef {
-    let existing = OBJECT_SPACE.builtin.get();
-    if !existing.is_null() {
-        return existing;
-    }
+/// module. Called only from [`ensure_space_builtin`]'s OnceLock initializer.
+/// `new_builtin_module_dict` stays the dict allocator; it reaches
+/// `init_typeobjects` (`TYPEOBJECT_CACHE`), not this OnceLock.
+fn make_builtins() -> PyObjectRef {
     let w_dict = crate::builtins::new_builtin_module_dict();
     let roots = pyre_object::gc_roots::push_roots();
     let dict_slot = roots.base();
@@ -65,6 +62,10 @@ pub(crate) fn make_builtins() -> PyObjectRef {
             };
         }
     }
+    // [3.15-spec] baseobjspace.py make_builtins also sets
+    // builtin.w_dict['__builtins__'] = builtin; the 3.15 builtins module
+    // has no `__builtins__` entry, so `hasattr(builtins, "__builtins__")`
+    // is False here.
     OBJECT_SPACE.builtin.get()
 }
 
@@ -73,11 +74,15 @@ pub(crate) fn make_builtins() -> PyObjectRef {
 /// Nullary process-global elidable reader (`rlib/jit.py @elidable`;
 /// `eval.rs interp_return_log_enabled` spelling). The walker residualizes
 /// it as CALL_PURE; `history.record_result_of_call_pure` cuts an all-Const
-/// (no-arg) call to ConstPtr.
+/// (no-arg) call to ConstPtr. Every frame runs after an
+/// `ExecutionContext::new`, which calls `ensure_space_builtin`, so a traced
+/// call never observes the null slot.
 #[majit_macros::elidable_cannot_raise]
 pub fn space_builtin() -> PyObjectRef {
     OBJECT_SPACE.builtin.get()
 }
+
+static SPACE_BUILTIN_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 /// `ObjSpace.make_builtins` when `space.builtin` is still unset.
 pub fn ensure_space_builtin() -> PyObjectRef {
@@ -85,7 +90,19 @@ pub fn ensure_space_builtin() -> PyObjectRef {
     if !existing.is_null() {
         return existing;
     }
-    make_builtins()
+    // A caller that arrives while another thread is still building the
+    // Module must not wait holding the GIL: the builder drops it inside
+    // `Cache.getorbuild` and would deadlock with this waiter.
+    let mut waiting = SPACE_BUILTIN_INIT
+        .get()
+        .is_none()
+        .then(crate::module::thread::before_external_block);
+    SPACE_BUILTIN_INIT.get_or_init(|| {
+        drop(waiting.take());
+        make_builtins();
+    });
+    drop(waiting);
+    OBJECT_SPACE.builtin.get()
 }
 
 /// `space.builtin.w_dict` (`celldict.py get_global_cache`).

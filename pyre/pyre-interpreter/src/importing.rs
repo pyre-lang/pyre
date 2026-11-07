@@ -1987,7 +1987,13 @@ fn builtin_modules_get(
     execution_context: *const PyExecutionContext,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
     if name == "builtins" {
-        return Ok(Some(crate::baseobjspace::ensure_space_builtin()));
+        // baseobjspace.py ObjSpace.getbuiltinmodule returns the space.builtin set at space init.
+        let w_builtin = crate::baseobjspace::space_builtin();
+        debug_assert!(
+            !w_builtin.is_null(),
+            "space.builtin is built by ExecutionContext::new before any import"
+        );
+        return Ok(Some(w_builtin));
     }
     let (static_name, module_def) = {
         let table = BUILTIN_MODULES.lock();
@@ -2272,19 +2278,6 @@ fn new_builtin_module(
                 )
             };
         }
-    }
-    // `baseobjspace.py make_builtins` installs the self
-    // reference `space.builtin.w_dict['__builtins__'] = space.builtin`
-    // so user code can reach the builtins module through
-    // `import builtins; builtins.__builtins__`.  The `builtins` entry
-    // of this table is `space.builtin`; keep the self-reference on any
-    // other flavour this constructor still builds.
-    if name == "builtins" {
-        crate::module_ns_store(
-            pyre_object::gc_roots::shadow_stack_get(save_point),
-            "__builtins__",
-            pyre_object::gc_roots::shadow_stack_get(module_slot),
-        );
     }
     Ok(pyre_object::gc_roots::shadow_stack_get(module_slot))
 }
