@@ -3113,6 +3113,7 @@ fn analyze_pipeline_from_module_paths(
         total_blocks: 0,
         total_ops: 0,
         total_vable_rewrites: 0,
+        minted_exception_classes: Vec::new(),
     };
 
     mark_phase!("call_control + canonical_trait_impls + register graphs");
@@ -3199,6 +3200,12 @@ fn analyze_pipeline_from_module_paths(
     // The equivalent of what `descr.py setup_descrs` would have picked up
     // for free had the analyzer and the runtime shared one gccache.
     pipeline.ei_descr_mints = majit_ir::descr::ei_descr_mints_snapshot();
+    // The hints still on `call_control` are the hierarchies
+    // `mint_exception_class_hierarchies` recorded. Flatten them before
+    // `call_control` is dropped so the prepass can emit one static per
+    // class without carrying the host arcs across serde.
+    pipeline.minted_exception_classes =
+        front::llbc_hints::minted_exception_class_rows(&call_control.exception_class_hints);
 
     pipeline
 }

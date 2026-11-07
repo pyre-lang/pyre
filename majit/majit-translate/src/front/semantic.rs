@@ -1765,11 +1765,7 @@ mod tests {
     }
 
     fn exception_hint(enum_path: &str) -> crate::front::llbc_hints::ExceptionClassHint {
-        crate::front::llbc_hints::ExceptionClassHint {
-            enum_path: enum_path.to_string(),
-            overrides: String::new(),
-            variants: vec!["A".to_string()],
-        }
+        crate::front::llbc_hints::ExceptionClassHint::new(enum_path, "", vec!["A".to_string()])
     }
 
     fn absorb_hints(

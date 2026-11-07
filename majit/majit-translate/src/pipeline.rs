@@ -235,6 +235,15 @@ pub struct ProgramPipelineResult {
     pub total_blocks: usize,
     pub total_ops: usize,
     pub total_vable_rewrites: usize,
+    /// Parent-before-child rows of minted exception classes.
+    ///
+    /// The prepass renders these into `minted_exception_classes.rs`.
+    /// The names are intern keys, not this process's addresses, so the
+    /// file is not a host-addressed output. `None` is a hierarchy base
+    /// (RPython `Exception`). Skipped by serde: the JSON artifact does
+    /// not carry it, and a consumer reads the generated source.
+    #[serde(skip)]
+    pub minted_exception_classes: Vec<crate::front::llbc_hints::MintedExceptionClassEmit>,
 }
 
 #[cfg(test)]
@@ -287,6 +296,7 @@ mod tests {
             total_blocks: 1,
             total_ops: 1,
             total_vable_rewrites: 0,
+            minted_exception_classes: Vec::new(),
         };
 
         let json = serde_json::to_string(&program).expect("program pipeline should serialize");

@@ -16393,14 +16393,14 @@ mod tests {
     }
 
     fn synth_e_hint() -> crate::front::llbc_hints::ExceptionClassHint {
-        crate::front::llbc_hints::ExceptionClassHint {
-            enum_path: "synth::E".to_string(),
-            overrides: "C(B)".to_string(),
-            variants: ["A", "B", "C", "D"]
+        crate::front::llbc_hints::ExceptionClassHint::new(
+            "synth::E",
+            "C(B)",
+            ["A", "B", "C", "D"]
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
-        }
+        )
     }
 
     fn unwind_panic_text(payload: Box<dyn std::any::Any + Send>) -> String {

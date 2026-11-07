@@ -510,6 +510,25 @@ struct MintedExceptionHierarchy {
     variants: Vec<(String, Rc<RefCell<ClassDef>>)>,
 }
 
+fn classdef_pyobj(classdef: &Rc<RefCell<ClassDef>>) -> HostObject {
+    classdef.borrow().classdesc.borrow().pyobj.clone()
+}
+
+fn minted_hierarchy_matches_hint(
+    stored: &MintedExceptionHierarchy,
+    hint: &crate::front::llbc_hints::ExceptionClassHint,
+) -> bool {
+    if classdef_pyobj(&stored.base) != hint.classes.base {
+        return false;
+    }
+    stored.variants.len() == hint.classes.variants.len()
+        && stored.variants.iter().zip(&hint.classes.variants).all(
+            |((name, classdef), (hint_name, host))| {
+                name == hint_name && classdef_pyobj(classdef) == *host
+            },
+        )
+}
+
 impl std::fmt::Debug for Bookkeeper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Bookkeeper")
@@ -4434,22 +4453,25 @@ impl Bookkeeper {
         host
     }
 
-    /// Intern one exception class under its declaration key.
+    /// Intern the harvested class object under its declaration key.
     ///
-    /// `name` is [`crate::front::llbc_hints::exception_class_key`]: the
-    /// enum's declaration intern key, or `{enum_path}::{variant}`.
+    /// `host` is the object the harvest created.
     /// [`Self::intern_class_key`] is the resolution
     /// [`Self::intern_class_by_qualname`] uses, so the minted host and
     /// the value ADT's class are one [`Self::struct_root_classes`] entry.
-    /// An entry that is already present is that host. Its bases must be
-    /// the chain this call expects; a different chain was interned
-    /// before the hierarchy was minted and is not reused.
-    fn intern_exception_class(&self, name: &str, bases: Vec<HostObject>) -> HostObject {
-        let key = self.intern_class_key(name);
+    /// The same arc is returned. A different arc under that key panics.
+    /// A different base chain panics first, with the chain text: a plain
+    /// class interned before the hierarchy is not reused.
+    fn intern_exception_class(&self, host: &HostObject) -> HostObject {
+        let key = self.intern_class_key(host.qualname());
+        let want = host.class_bases().unwrap_or(&[]);
         if let Some(existing) = self.struct_root_classes.borrow().get(&key).cloned() {
+            if existing == *host {
+                return existing;
+            }
             let actual = existing.class_bases().map(|got| got.to_vec());
             let matches = actual.as_ref().is_some_and(|got| {
-                got.len() == bases.len() && got.iter().zip(&bases).all(|(got, want)| got == want)
+                got.len() == want.len() && got.iter().zip(want).all(|(got, want)| got == want)
             });
             if !matches {
                 let got = actual
@@ -4459,34 +4481,30 @@ impl Bookkeeper {
                     .map(|base| base.qualname().to_string())
                     .collect::<Vec<_>>()
                     .join(", ");
-                let want = bases
+                let want_text = want
                     .iter()
                     .map(|base| base.qualname().to_string())
                     .collect::<Vec<_>>()
                     .join(", ");
                 panic!(
-                    "exception class `{key}` is already interned with bases [{got}], expected [{want}]"
+                    "exception class `{key}` is already interned with bases [{got}], expected [{want_text}]"
                 );
             }
-            return existing;
+            panic!("exception class `{key}` is already interned as a different class object");
         }
-        let host = HostObject::new_class(key.clone(), bases);
-        crate::virtualizable_decl::stamp_host_virtualizable(&host, &key);
-        self.stamp_raw_alloc_flavor(&host, &key);
-        self.stamp_immutable_fields(&host, &key);
+        crate::virtualizable_decl::stamp_host_virtualizable(host, &key);
+        self.stamp_raw_alloc_flavor(host, &key);
+        self.stamp_immutable_fields(host, &key);
         self.insert_struct_root_class(key, host.clone());
-        host
+        host.clone()
     }
 
     /// Mint each `_exception_class_<Enum>` hierarchy.
     ///
-    /// The base subclasses the host `Exception`
-    /// (`HOST_ENV.lookup_exception_class`, the base
-    /// `default_class_bases` gives the error carrier). Each variant
-    /// subclasses its parent exception class, not the Rust enum variant.
-    /// Class names are `exception_class_key` (the declaration intern
-    /// key, or `{enum_path}::{variant}`). `getuniqueclassdef` runs
-    /// here so `basedef` is wired. `assign_inheritance_ids` does not:
+    /// The hosts are the hint's. The base subclasses the host
+    /// `Exception`. Each variant subclasses its parent exception class,
+    /// not the Rust enum variant. `getuniqueclassdef` runs here so
+    /// `basedef` is wired. `assign_inheritance_ids` does not:
     /// `run_two_phase_prepass` numbers classdefs after phase A and
     /// before phase B, `CallRegistry::ensure_session` numbers the
     /// session prefix, and `RPythonTyper::convert_helper_exception_links`
@@ -4496,23 +4514,21 @@ impl Bookkeeper {
     /// `exception_class_llexitcase`.
     ///
     /// A hierarchy whose intern key is already recorded is left as it
-    /// is (`exception_class_enum_path_matches`).
+    /// is (`exception_class_enum_path_matches`). The arriving hosts
+    /// must be those recorded class objects; a different object panics
+    /// in every build, including release.
     pub fn mint_exception_class_hierarchies(
         self: &Rc<Self>,
         hints: &[crate::front::llbc_hints::ExceptionClassHint],
     ) {
         for hint in hints {
-            let already = self
-                .exception_class_hierarchies
-                .borrow()
-                .iter()
-                .any(|stored| {
-                    crate::front::llbc_hints::exception_class_enum_path_matches(
-                        &stored.enum_path,
-                        &hint.enum_path,
-                    )
-                });
-            if already {
+            if let Some(stored) = self.matched_exception_hierarchy(&hint.enum_path) {
+                let enum_name = crate::front::llbc_hints::exception_class_leaf(&hint.enum_path);
+                assert!(
+                    minted_hierarchy_matches_hint(&stored, hint),
+                    "_exception_class_ {enum_name}: hierarchy `{}` arrived with a different class object",
+                    hint.enum_path
+                );
                 continue;
             }
             self.mint_one_exception_hierarchy(hint);
@@ -4524,60 +4540,30 @@ impl Bookkeeper {
         hint: &crate::front::llbc_hints::ExceptionClassHint,
     ) {
         let enum_name = crate::front::llbc_hints::exception_class_leaf(&hint.enum_path);
-        let order = crate::front::llbc_hints::parse_exception_class_overrides(
-            enum_name,
-            &hint.overrides,
-            &hint.variants,
-        );
-        let exception = crate::flowspace::model::HOST_ENV
-            .lookup_exception_class("Exception")
-            .expect("HOST_ENV missing builtin Exception");
-        let base_name = crate::front::llbc_hints::exception_class_key(&hint.enum_path, None);
-        if base_name.is_empty() {
-            panic!("_exception_class_ {enum_name}: empty class name");
-        }
-        let base_host = self.intern_exception_class(&base_name, vec![exception]);
+        let base_name = hint.classes.base.qualname();
+        let base_host = self.intern_exception_class(&hint.classes.base);
         let base = self.getuniqueclassdef(&base_host).unwrap_or_else(|err| {
             panic!("_exception_class_ {enum_name}: getuniqueclassdef({base_name}): {err}")
         });
-        let mut hosts: Vec<(String, HostObject)> = Vec::new();
-        let mut variants = Vec::with_capacity(order.len());
-        for (variant, parent) in order {
-            let parent_host = match parent.as_deref() {
-                None => base_host.clone(),
-                Some(parent_name) => hosts
-                    .iter()
-                    .find(|(name, _)| name == parent_name)
-                    .map(|(_, host)| host.clone())
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "_exception_class_ {enum_name}: parent `{parent_name}` was not minted \
-                             before `{variant}`"
-                        )
-                    }),
-            };
-            let class_name =
-                crate::front::llbc_hints::exception_class_key(&hint.enum_path, Some(&variant));
-            if class_name.is_empty() {
-                panic!("_exception_class_ {enum_name}: empty class name");
-            }
-            let host = self.intern_exception_class(&class_name, vec![parent_host]);
-            let classdef = self.getuniqueclassdef(&host).unwrap_or_else(|err| {
+        let mut variants = Vec::with_capacity(hint.classes.variants.len());
+        for (variant, host) in &hint.classes.variants {
+            let class_name = host.qualname();
+            let interned = self.intern_exception_class(host);
+            let classdef = self.getuniqueclassdef(&interned).unwrap_or_else(|err| {
                 panic!("_exception_class_ {enum_name}: getuniqueclassdef({class_name}): {err}")
             });
             let project = {
                 let guard = self.struct_fields.borrow();
                 guard
                     .as_ref()
-                    .is_some_and(|reg| reg.fields.contains_key(&class_name))
+                    .is_some_and(|reg| reg.fields.contains_key(class_name))
             };
             if project {
-                self.project_struct_rows(&class_name).unwrap_or_else(|err| {
+                self.project_struct_rows(class_name).unwrap_or_else(|err| {
                     panic!("_exception_class_ {enum_name}: project {class_name}: {err}")
                 });
             }
-            hosts.push((variant.clone(), host));
-            variants.push((variant, classdef));
+            variants.push((variant.clone(), classdef));
         }
         self.exception_class_hierarchies
             .borrow_mut()

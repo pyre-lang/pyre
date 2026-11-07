@@ -106,7 +106,7 @@
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::TyRef;
 
-use crate::flowspace::model::{ConstValue, Constant, Variable};
+use crate::flowspace::model::{ConstValue, Constant, HostObject, Variable};
 use crate::front::option_variant::emit_narrow;
 use crate::model::{
     BlockId, CallFuncPtr, CallTarget, ConcreteType, ExitCase, ExitSwitch, FieldDescriptor,
@@ -200,8 +200,11 @@ pub(crate) enum ExceptionSumPayload {
     Marked {
         enum_path: String,
         base_class: String,
-        /// `(variant, qualname)` in declaration order.
-        classes: Vec<(String, String)>,
+        /// The harvested base class object.
+        base_host: HostObject,
+        /// `(variant, qualname, host)` in declaration order. `host` is
+        /// the object on the hint, not a lookup by name.
+        classes: Vec<(String, String, HostObject)>,
     },
     Carrier,
 }
@@ -398,15 +401,24 @@ fn marked_enum_payload(
         .variants
         .iter()
         .map(|variant| {
-            (
-                variant.clone(),
-                crate::front::llbc_hints::exception_class_key(&hint.enum_path, Some(variant)),
-            )
+            let qualname =
+                crate::front::llbc_hints::exception_class_key(&hint.enum_path, Some(variant));
+            let host = hint
+                .classes
+                .variants
+                .iter()
+                .find(|(name, _)| name == variant)
+                .map(|(_, host)| host.clone())
+                .unwrap_or_else(|| {
+                    panic!("_exception_class_ {qualname}: harvested variant has no class object")
+                });
+            (variant.clone(), qualname, host)
         })
         .collect();
     Some(ExceptionSumPayload::Marked {
         enum_path: hint.enum_path.clone(),
         base_class: crate::front::llbc_hints::exception_class_key(&hint.enum_path, None),
+        base_host: hint.classes.base.clone(),
         classes,
     })
 }
@@ -1329,14 +1341,40 @@ fn marked_class_known(payload: &ExceptionSumPayload, class_name: &str) -> bool {
     else {
         return false;
     };
-    class_name == base_class || classes.iter().any(|(_, qualname)| qualname == class_name)
+    class_name == base_class
+        || classes
+            .iter()
+            .any(|(_, qualname, _)| qualname == class_name)
+}
+
+/// The class object `class_name` names inside this one sum.
+///
+/// Names are compared only among the sum's own classes. There is no
+/// global name table. `None` when the name is not one of them.
+fn marked_class_host(payload: &ExceptionSumPayload, class_name: &str) -> Option<HostObject> {
+    let ExceptionSumPayload::Marked {
+        base_class,
+        base_host,
+        classes,
+        ..
+    } = payload
+    else {
+        return None;
+    };
+    if class_name == base_class {
+        return Some(base_host.clone());
+    }
+    classes
+        .iter()
+        .find(|(_, qualname, _)| qualname == class_name)
+        .map(|(_, _, host)| host.clone())
 }
 
 fn cascade_class_handlers(
     graph: &FunctionGraph,
     start: usize,
     payload: &ExceptionSumPayload,
-) -> Result<Vec<(String, usize)>, String> {
+) -> Result<Vec<(HostObject, usize)>, String> {
     let ExceptionSumPayload::Marked { base_class, .. } = payload else {
         return Err("exception sum carrier arm has no class cascade".to_string());
     };
@@ -1349,11 +1387,21 @@ fn cascade_class_handlers(
                     "isinstance class {name} is not a variant of the exception sum"
                 ));
             }
-            handlers.push((name, true_target));
+            let Some(host) = marked_class_host(payload, &name) else {
+                return Err(format!(
+                    "exception sum handler class {name} has no class object"
+                ));
+            };
+            handlers.push((host, true_target));
             block = skip_pure_forwards(graph, false_target);
             continue;
         }
-        handlers.push((base_class.clone(), block));
+        let Some(host) = marked_class_host(payload, base_class) else {
+            return Err(format!(
+                "exception sum handler class {base_class} has no class object"
+            ));
+        };
+        handlers.push((host, block));
         return Ok(handlers);
     }
     Err("exception class cascade did not end".to_string())
@@ -1408,7 +1456,8 @@ fn carrier_arm_reraises(graph: &FunctionGraph, start: usize) -> bool {
 }
 
 struct SumHandlerPlan {
-    class_name: Option<String>,
+    /// Harvested class object. `None` is the carrier arm or a reraise.
+    class_host: Option<HostObject>,
     reraise: bool,
     target: crate::model::BlockId,
     /// `None` is the caught instance, substituted with `last_exc_value`.
@@ -1536,7 +1585,7 @@ fn plan_exception_sum_match(
             ExceptionSumPayload::Carrier => {
                 if carrier_arm_reraises(graph, arm) {
                     handlers.push(SumHandlerPlan {
-                        class_name: None,
+                        class_host: None,
                         reraise: true,
                         target: graph.exceptblock,
                         args: Vec::new(),
@@ -1544,7 +1593,7 @@ fn plan_exception_sum_match(
                 } else {
                     let handler = skip_pure_forwards(graph, arm);
                     handlers.push(SumHandlerPlan {
-                        class_name: None,
+                        class_host: None,
                         reraise: false,
                         target: crate::model::BlockId(handler),
                         args: plan_handler_args(graph, handler, call_block)?,
@@ -1552,9 +1601,9 @@ fn plan_exception_sum_match(
                 }
             }
             ExceptionSumPayload::Marked { .. } => {
-                for (class_name, handler) in cascade_class_handlers(graph, arm, payload)? {
+                for (host, handler) in cascade_class_handlers(graph, arm, payload)? {
                     handlers.push(SumHandlerPlan {
-                        class_name: Some(class_name),
+                        class_host: Some(host),
                         reraise: false,
                         target: crate::model::BlockId(handler),
                         args: plan_handler_args(graph, handler, call_block)?,
@@ -1595,7 +1644,7 @@ fn plan_exception_sum_match(
     // Class arms stay in the caller's case order. The carrier arm is the
     // last exception link (`guessexception` lists the classes, then the
     // carrier).
-    handlers.sort_by_key(|handler| handler.class_name.is_none());
+    handlers.sort_by_key(|handler| handler.class_host.is_none());
     Ok(Some(SumMatchPlan {
         ok_target: ok_link.target,
         ok_pos: ok_pos.filter(|pos| {
@@ -1650,10 +1699,9 @@ fn install_exception_sum_match(
                 ],
                 Some(crate::model::exception_exitcase()),
             )
-        } else if let Some(class_name) = handler.class_name {
-            let class = crate::model::RPythonExceptionClass::from_classdef(
-                crate::annotator::classdesc::ClassDef::new_standalone(class_name, None),
-            );
+        } else if let Some(host) = handler.class_host {
+            // `Constant(cls)`: the harvested class object, not a fresh
+            // `ClassDef`. `Link::new_mixed` leaves `llexitcase` unset.
             let args = handler
                 .args
                 .into_iter()
@@ -1662,7 +1710,11 @@ fn install_exception_sum_match(
                     None => LinkArg::Value(exc_value.clone()),
                 })
                 .collect();
-            (handler.target, args, Some(ExitCase::ExceptionClass(class)))
+            (
+                handler.target,
+                args,
+                Some(ExitCase::Const(ConstValue::HostObject(host))),
+            )
         } else {
             let args = handler
                 .args
@@ -22155,6 +22207,11 @@ mod from_residual_conversion_tests {
 
     #[test]
     fn a_sum_does_not_claim_another_declaration_with_the_same_leaf() {
+        let module_e = crate::front::llbc_hints::ExceptionClassHint::new(
+            "module::E",
+            "",
+            vec!["A".to_string()],
+        );
         let sum = ExceptionSum {
             identity: "synth::S".into(),
             path: "fixture::synth::S".into(),
@@ -22164,7 +22221,12 @@ mod from_residual_conversion_tests {
                 payload: ExceptionSumPayload::Marked {
                     enum_path: "module::E".into(),
                     base_class: "module::E".into(),
-                    classes: vec![("A".into(), "module::E::A".into())],
+                    base_host: module_e.classes.base.clone(),
+                    classes: vec![(
+                        "A".into(),
+                        "module::E::A".into(),
+                        module_e.classes.variants[0].1.clone(),
+                    )],
                 },
             }],
         };

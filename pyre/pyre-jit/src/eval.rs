@@ -5477,6 +5477,35 @@ fn build_gc() -> Box<MiniMarkGC> {
     pyre_jit_trace::descr::restamp_execution_context_size_descr_if_unresolved(
         execution_context_tid,
     );
+    // Minted RPython exception classes. After every existing
+    // registration and after the subclass-range census: an empty table
+    // (no interpreter marker today) moves no id and adds no hierarchy
+    // row, and the const census has no minted peers to expect. Before
+    // `assign_inheritance_ids_now`, so a non-empty table is numbered.
+    // A non-empty table also changes existing ranges at that assign;
+    // `assert_subclass_ranges` compares the published static ranges,
+    // which do not include the new peers.
+    //
+    // Instance size is `size_of::<PyObject>()`, no GC-pointer offsets,
+    // matching `HOST_EXCEPTION_TYPE`. The tid is only for
+    // `subclass_range` via `vtable_to_type_id`. The malloc path still
+    // stamps the header tid of the layout it allocates.
+    {
+        let host_exc_pytype = &pyre_interpreter::error::HOST_EXCEPTION_TYPE as *const _ as usize;
+        let host_exc_tid = *pytype_to_tid
+            .get(&host_exc_pytype)
+            .expect("HOST_EXCEPTION_TYPE is registered");
+        let minted = pyre_jit_trace::minted_exception_classes::MINTED_EXCEPTION_CLASSES;
+        let minted_tids =
+            pyre_jit_trace::minted_exception_classes::register_minted_exception_classes(
+                &mut gc,
+                minted,
+                host_exc_tid,
+            );
+        for (row, tid) in minted.iter().zip(minted_tids) {
+            pytype_to_tid.insert(row.pytype as *const _ as usize, tid);
+        }
+    }
     gc.assign_inheritance_ids_now();
     pyre_interpreter::typedef::init_subclass_ranges();
     assert_subclass_ranges(

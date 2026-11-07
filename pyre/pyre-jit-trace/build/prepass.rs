@@ -62,6 +62,7 @@ const CODEGEN_CACHE_ENTRIES_ENV: &str = "PYRE_JIT_TRACE_CACHE_ENTRIES";
 const CODEGEN_CACHE_USED_MARKER: &str = ".last-used";
 const CODEGEN_OUTPUTS: &[&str] = &[
     "jit_trace_gen.rs",
+    "minted_exception_classes.rs",
     "jit_metadata.json",
     "jitcodes.bin",
     "jitcodes_index.bin",
@@ -114,7 +115,8 @@ const CODEGEN_OUTPUTS: &[&str] = &[
 /// the defect that mode was written for.
 ///
 /// What decides the cross-process verdict after these exclusions:
-/// `jit_trace_gen.rs`, `jitcodes_index.bin`, `jit_drivers.bin`, `insns.bin`,
+/// `jit_trace_gen.rs`, `minted_exception_classes.rs`, `jitcodes_index.bin`,
+/// `jit_drivers.bin`, `insns.bin`,
 /// `descrs_index.bin`, `descr_layouts_index.bin`, `effect_infos_index.bin`,
 /// `ei_descr_mints.bin`, `ei_descr_mints_index.bin`, `ei_descr_stamps.bin`,
 /// `ei_descr_stamps_index.bin`, `ei_descr_lookups.bin`,
@@ -1578,6 +1580,13 @@ fn real_main() {
         eprintln!("[pyre-jit-trace build.rs] generate_trace_code done");
 
         std::fs::write(format!("{out_dir}/jit_trace_gen.rs"), &code).unwrap();
+        // Intern keys only. An empty harvest (no interpreter marker today)
+        // is an empty table, so every build compiles. Not host-addressed:
+        // the `PyType` statics are compiled into the runtime binary.
+        let minted_rs = majit_translate::front::llbc_hints::render_minted_exception_classes_rs(
+            &pipeline.minted_exception_classes,
+        );
+        std::fs::write(format!("{out_dir}/minted_exception_classes.rs"), minted_rs).unwrap();
 
         // RPython runs effectinfo.compute_bitstrings during translation and
         // puts both outputs directly into the translated image: compact

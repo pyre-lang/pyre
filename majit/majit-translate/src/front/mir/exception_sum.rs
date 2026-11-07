@@ -13,7 +13,7 @@ use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::TyRef;
 use serde_json::{Value, json};
 
-use crate::flowspace::model::Variable;
+use crate::flowspace::model::{ConstValue, Variable};
 use crate::front::result_exc::{
     ExceptionSum, ExceptionSumPayload, exception_sum_of_result, tyref_is_result_of_carrier,
     tyref_lowers_as_result_exc,
@@ -1065,7 +1065,19 @@ fn assert_tail_reraise(graph: &FunctionGraph, leaf: &str) {
 
 fn class_name(exitcase: &Option<ExitCase>) -> Option<String> {
     match exitcase {
+        Some(ExitCase::Const(ConstValue::HostObject(host))) if host.is_class() => {
+            Some(host.qualname().to_string())
+        }
         Some(ExitCase::ExceptionClass(class)) => Some(class.classdef().borrow().name.clone()),
+        _ => None,
+    }
+}
+
+fn exitcase_host(exitcase: &Option<ExitCase>) -> Option<crate::flowspace::model::HostObject> {
+    match exitcase {
+        Some(ExitCase::Const(ConstValue::HostObject(host))) if host.is_class() => {
+            Some(host.clone())
+        }
         _ => None,
     }
 }
@@ -1159,18 +1171,38 @@ fn exception_sum_predicate() {
         ExceptionSumPayload::Marked {
             enum_path,
             base_class,
+            base_host,
             classes,
         } => {
             assert_eq!(enum_path, "synth::E");
             assert_eq!(base_class, "synth::E");
+            let names: Vec<(String, String)> = classes
+                .iter()
+                .map(|(variant, qualname, _)| (variant.clone(), qualname.clone()))
+                .collect();
             assert_eq!(
-                classes,
-                &vec![
+                names,
+                vec![
                     ("A".to_string(), "synth::E::A".to_string()),
                     ("B".to_string(), "synth::E::B".to_string()),
                     ("C".to_string(), "synth::E::C".to_string()),
                 ]
             );
+            let hint = crate::front::mir::llbc_exception_class_hints(&llbc)
+                .iter()
+                .find(|hint| hint.enum_path == "synth::E")
+                .expect("harvested E");
+            assert_eq!(base_host, &hint.classes.base);
+            for (variant, _, host) in classes {
+                let expected = hint
+                    .classes
+                    .variants
+                    .iter()
+                    .find(|(name, _)| name == variant)
+                    .map(|(_, host)| host)
+                    .expect("variant host");
+                assert_eq!(host, expected);
+            }
         }
         ExceptionSumPayload::Carrier => panic!("Own payload is the marked enum"),
     }
@@ -1399,6 +1431,83 @@ fn exception_sum_caller_links() {
     );
     assert_no_sum_ctor(&graph);
     assert!(graph.return_type.is_none(), "{:?}", graph.return_type);
+}
+
+/// The handler link's exitcase is the harvested class object. Minting
+/// that object yields the classdef whose `basedef` chain reaches the
+/// base, and the base's bases include the host `Exception`.
+#[test]
+fn exception_sum_handler_exitcase_is_the_minted_class_object() {
+    use crate::flowspace::model::HOST_ENV;
+    use std::rc::Rc;
+
+    let llbc = fixture();
+    let graph = lower_named(&llbc, "exception_sum_match");
+    let hints = crate::front::mir::llbc_exception_class_hints(&llbc);
+    let hint = hints
+        .iter()
+        .find(|hint| hint.enum_path == "synth::E")
+        .expect("harvested E");
+    let c_host = hint
+        .classes
+        .variants
+        .iter()
+        .find(|(name, _)| name == "C")
+        .map(|(_, host)| host.clone())
+        .expect("C");
+    let callers = blocks_calling(&graph, "exception_sum_src");
+    assert_eq!(callers.len(), 1);
+    let block = &graph.blocks[callers[0]];
+    let specific = exitcase_host(&block.exits[1].exitcase).expect("C exitcase");
+    let binding = exitcase_host(&block.exits[2].exitcase).expect("base exitcase");
+    assert_eq!(specific, c_host);
+    assert_eq!(binding, hint.classes.base);
+    let base_exception = HOST_ENV
+        .lookup_exception_class("BaseException")
+        .expect("BaseException");
+    assert!(specific.is_subclass_of(&base_exception));
+    assert!(binding.is_subclass_of(&base_exception));
+
+    let bk = Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    bk.mint_exception_class_hierarchies(hints);
+    let minted_c = bk
+        .getuniqueclassdef(&specific)
+        .expect("getuniqueclassdef(C)");
+    let recorded_c = bk
+        .exception_class_variant("synth::E", "C")
+        .expect("C classdef");
+    assert!(Rc::ptr_eq(&minted_c, &recorded_c));
+    let minted_base = bk.exception_class_base("synth::E").expect("base classdef");
+    let recorded_base = bk
+        .getuniqueclassdef(&binding)
+        .expect("getuniqueclassdef(base)");
+    assert!(Rc::ptr_eq(&minted_base, &recorded_base));
+    let mut current = minted_c;
+    let mut reached_base = false;
+    for _ in 0..8 {
+        if Rc::ptr_eq(&current, &minted_base) {
+            reached_base = true;
+            break;
+        }
+        let next = current.borrow().basedef.clone();
+        let Some(next) = next else {
+            break;
+        };
+        current = next;
+    }
+    assert!(reached_base, "C.basedef chain reaches the base");
+    let exception = HOST_ENV
+        .lookup_exception_class("Exception")
+        .expect("Exception");
+    let base_host = minted_base.borrow().classdesc.borrow().pyobj.clone();
+    assert_eq!(base_host, hint.classes.base);
+    assert!(
+        base_host
+            .class_bases()
+            .is_some_and(|bases| bases.iter().any(|base| base == &exception)),
+        "base host bases {:?}",
+        base_host.class_bases()
+    );
 }
 
 #[test]

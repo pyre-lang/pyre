@@ -2928,26 +2928,26 @@ mod tests {
         let registry = CallRegistry::new(Rc::clone(&bk));
         registry.set_struct_fields(Rc::new(fields));
         bk.mint_exception_class_hierarchies(&[
-            crate::front::llbc_hints::ExceptionClassHint {
-                enum_path: "synth::E".to_string(),
-                overrides: "C(B)".to_string(),
-                variants: vec![
+            crate::front::llbc_hints::ExceptionClassHint::new(
+                "synth::E",
+                "C(B)",
+                vec![
                     "A".to_string(),
                     "B".to_string(),
                     "C".to_string(),
                     "D".to_string(),
                 ],
-            },
-            crate::front::llbc_hints::ExceptionClassHint {
-                enum_path: "synth::P".to_string(),
-                overrides: String::new(),
-                variants: vec!["T".to_string()],
-            },
-            crate::front::llbc_hints::ExceptionClassHint {
-                enum_path: "synth::Q".to_string(),
-                overrides: "C(B)".to_string(),
-                variants: vec!["B".to_string(), "C".to_string()],
-            },
+            ),
+            crate::front::llbc_hints::ExceptionClassHint::new(
+                "synth::P",
+                "",
+                vec!["T".to_string()],
+            ),
+            crate::front::llbc_hints::ExceptionClassHint::new(
+                "synth::Q",
+                "C(B)",
+                vec!["B".to_string(), "C".to_string()],
+            ),
         ]);
         let classify = registry.get_or_register(
             FunctionPathKey::from_segments(["synth", "E", "classify"]),

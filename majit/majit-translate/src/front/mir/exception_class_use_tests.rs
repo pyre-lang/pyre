@@ -1889,16 +1889,8 @@ fn two_marked_enums_with_the_same_leaf_are_distinct_classes() {
 fn marked_variant_keys_do_not_collide_across_declarations() {
     let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
     bk.mint_exception_class_hierarchies(&[
-        crate::front::llbc_hints::ExceptionClassHint {
-            enum_path: "pkg::E".into(),
-            overrides: String::new(),
-            variants: vec!["AB".into()],
-        },
-        crate::front::llbc_hints::ExceptionClassHint {
-            enum_path: "pkg::EA".into(),
-            overrides: String::new(),
-            variants: vec!["B".into()],
-        },
+        crate::front::llbc_hints::ExceptionClassHint::new("pkg::E", "", vec!["AB".into()]),
+        crate::front::llbc_hints::ExceptionClassHint::new("pkg::EA", "", vec!["B".into()]),
     ]);
     let ab = bk
         .exception_class_variant("pkg::E", "AB")
@@ -1921,11 +1913,75 @@ fn marked_variant_keys_do_not_collide_across_declarations() {
 fn minting_refuses_a_plain_class_under_the_declaration_key() {
     let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
     let _ = bk.intern_class_by_qualname("pkg::E");
-    bk.mint_exception_class_hierarchies(&[crate::front::llbc_hints::ExceptionClassHint {
-        enum_path: "pkg::E".into(),
-        overrides: String::new(),
-        variants: vec!["A".into()],
-    }]);
+    bk.mint_exception_class_hierarchies(&[crate::front::llbc_hints::ExceptionClassHint::new(
+        "pkg::E",
+        "",
+        vec!["A".into()],
+    )]);
+}
+
+#[test]
+#[should_panic(expected = "already interned as a different class object")]
+fn interning_a_different_arc_under_a_minted_key_panics() {
+    let hint = crate::front::llbc_hints::ExceptionClassHint::new("pkg::E", "", vec!["A".into()]);
+    let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    let exception = crate::flowspace::model::HOST_ENV
+        .lookup_exception_class("Exception")
+        .expect("Exception");
+    let _ = bk.intern_class_by_qualname_with_bases("pkg::E", vec![exception]);
+    bk.mint_exception_class_hierarchies(&[hint]);
+}
+
+#[test]
+fn isinstance_constref_is_the_harvested_class_object() {
+    let llbc = fixture_llbc();
+    let graph = lower(&llbc, "match_e");
+    let hints = super::super::llbc_exception_class_hints(&llbc);
+    let hint = hints
+        .iter()
+        .find(|hint| hint.enum_path == "synth::E")
+        .expect("harvested E");
+    let mut id = graph.startblock;
+    let mut seen = Vec::new();
+    for _ in 0..8 {
+        let block = graph.block(id);
+        let Some(host) = block.operations.iter().find_map(|op| match &op.kind {
+            OpKind::ConstRef(host) if host.is_class() => Some(host.clone()),
+            _ => None,
+        }) else {
+            break;
+        };
+        let expected = hint
+            .classes
+            .variants
+            .iter()
+            .find(|(_, candidate)| candidate == &host)
+            .map(|(_, candidate)| candidate.clone());
+        let Some(expected) = expected else {
+            panic!(
+                "isinstance host {} is not a variant of the harvested hierarchy",
+                host.qualname()
+            );
+        };
+        assert_eq!(host, expected);
+        seen.push(host.qualname().to_string());
+        let Some(next) = block
+            .exits
+            .iter()
+            .find_map(|link| (link.exitcase == Some(ExitCase::Bool(false))).then_some(link.target))
+        else {
+            break;
+        };
+        id = next;
+    }
+    assert_eq!(
+        seen,
+        vec![
+            "synth::E::C".to_string(),
+            "synth::E::B".to_string(),
+            "synth::E::A".to_string(),
+        ]
+    );
 }
 
 fn lowering_state(llbc: &majit_charon_reader::Llbc) -> super::super::CrateLoweringState {

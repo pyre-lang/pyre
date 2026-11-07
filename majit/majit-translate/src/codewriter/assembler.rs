@@ -282,6 +282,54 @@ fn exception_instance_spec(
     Some((name, message))
 }
 
+/// Intern key of a minted exception class, recognised by host identity.
+///
+/// The class object is one of the hosts on
+/// `CallControl.exception_class_hints`. Comparison is [`HostObject`]
+/// equality (`Arc::ptr_eq`). A same-named host built elsewhere is not
+/// this class, so the lookup is not a name table.
+fn minted_exception_static_name(
+    obj: &crate::flowspace::model::HostObject,
+    callcontrol: Option<&CallControl>,
+) -> Option<String> {
+    let hints = &callcontrol?.exception_class_hints;
+    let matched = hints.iter().any(|hint| {
+        hint.classes.base == *obj || hint.classes.variants.iter().any(|(_, host)| host == obj)
+    });
+    matched.then(|| obj.qualname().to_string())
+}
+
+/// Intern key for a `new_with_vtable` of a minted class.
+///
+/// A nonzero `vtable` that is a hint host's `identity_id` wins, and the
+/// key is that host's qualname. Otherwise `owner` equal to a hint host's
+/// qualname is the key, including when `vtable` is 0. The walk is the
+/// hint list; there is no name table.
+fn minted_exception_size_owner(cc: &CallControl, owner: &str, vtable: i64) -> Option<String> {
+    let hints = &cc.exception_class_hints;
+    if vtable != 0 {
+        for hint in hints {
+            for host in std::iter::once(&hint.classes.base)
+                .chain(hint.classes.variants.iter().map(|(_, host)| host))
+            {
+                if host.identity_id() as i64 == vtable {
+                    return Some(host.qualname().to_string());
+                }
+            }
+        }
+    }
+    for hint in hints {
+        for host in std::iter::once(&hint.classes.base)
+            .chain(hint.classes.variants.iter().map(|(_, host)| host))
+        {
+            if host.qualname() == owner {
+                return Some(owner.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Pytype address for a builtin exception class. `None` when `obj` is not
 /// one, so other host objects keep their existing pool bits. A class with
 /// no row panics: the constant must not fall back to `identity_id`.
@@ -2368,31 +2416,38 @@ impl AssemblerEncode for Assembler {
             // runtime stamps into the new object's header
             // (`bh_new_with_vtable` writes the type word when it is nonzero,
             // and the class word when the backend was given an offset).
-            // A zero vtable would silently leave `ob_type` null, so it
-            // fails loud here.
+            // vtable 0 is the size-descr-only form: the published group
+            // fills `descr.get_vtable()` later. A minted class emits a
+            // type-static sentinel instead of this process's address.
             OpKind::NewWithVtable { owner, vtable } => {
-                let spec = bh_size_spec_from_callcontrol(
-                    callcontrol.expect("new_with_vtable assembly requires a CallControl"),
-                    owner,
-                )
-                .unwrap_or_else(|| {
+                let cc = callcontrol.expect("new_with_vtable assembly requires a CallControl");
+                let spec = bh_size_spec_from_callcontrol(cc, owner).unwrap_or_else(|| {
                     panic!("new_with_vtable: no struct layout registered for owner {owner:?}")
                 });
-                // A registered type static cannot travel as this process's
-                // address: the descr pool is loaded in another process.
-                // The sentinel is the one `constants_r` already uses, and
-                // `owner` carries the name the runtime map resolves. An
-                // address that was never interned keeps the raw word.
-                // vtable 0 is `rewrite_op_malloc`'s size-descr-only form:
-                // `descr.get_vtable()` is filled from the published group.
-                let (vtable_word, type_static_name) = if *vtable == 0 {
-                    (0, String::new())
-                } else {
-                    match self.type_static_size_words(*vtable) {
-                        Some((word, name)) => (word, name),
-                        None => (*vtable as u64, String::new()),
-                    }
-                };
+                // A minted class has no translator-process `PyType`.
+                // Identity against the hint hosts wins, then the size
+                // descr's `owner` when it is one of those hosts' qualnames
+                // (including vtable 0). The name-only intern does not
+                // store a fake address. A registered type static cannot
+                // travel as this process's address either: the descr pool
+                // is loaded in another process. The sentinel is the one
+                // `constants_r` already uses, and `owner` carries the name
+                // the runtime map resolves. An address that was never
+                // interned keeps the raw word. vtable 0 on a class that
+                // is not minted is `rewrite_op_malloc`'s size-descr-only
+                // form: `descr.get_vtable()` is filled from the published
+                // group.
+                let (vtable_word, type_static_name) =
+                    if let Some(key) = minted_exception_size_owner(cc, owner, *vtable) {
+                        self.intern_type_static_name(&key)
+                    } else if *vtable == 0 {
+                        (0, String::new())
+                    } else {
+                        match self.type_static_size_words(*vtable) {
+                            Some((word, name)) => (word, name),
+                            None => (*vtable as u64, String::new()),
+                        }
+                    };
                 let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::Size {
                     size: spec.size,
                     type_id: spec.type_id,
@@ -4334,8 +4389,17 @@ impl AssemblerEncode for Assembler {
             ConstValue::Int(value) => self.emit_const_i(*value, state),
             ConstValue::UInt(value) => self.emit_const_i(*value as i64, state),
             // Builtin host class (`StopIteration`, `OverflowError`, the
-            // carrier): pytype row, `StaticAddr` reloc.
+            // carrier): pytype row, `StaticAddr` reloc. A minted class
+            // is recognised by identity before that lookup and uses the
+            // same reloc channel. The static for its intern key is the
+            // `PyType` in `minted_exception_classes.rs`; the runtime map
+            // rebinds the name.
+            // `ClassRepr.getvtable` / `Assembler.emit_const` keys the
+            // slot on the symbol.
             ConstValue::HostObject(obj) => {
+                if let Some(name) = minted_exception_static_name(obj, callcontrol) {
+                    return self.emit_const_i_reloc(0, ConstIRelocKind::StaticAddr { name }, state);
+                }
                 let bits = exception_class_addr(obj, callcontrol, "goto_if_exception_mismatch")
                     .unwrap_or_else(|| {
                         panic!("goto_if_exception_mismatch: llexitcase {obj:?} is not an exception class")
@@ -10325,6 +10389,99 @@ mod tests {
     }
 
     #[test]
+    fn minted_exception_llexitcase_emits_static_addr_by_identity() {
+        use crate::flatten::{FlatOp, Label, SSARepr};
+        use crate::flowspace::model::HOST_ENV;
+        use crate::front::llbc_hints::ExceptionClassHint;
+        use crate::jitcode::ConstIRelocKind;
+
+        let hint = ExceptionClassHint::new("synth::E", "", vec!["C".to_string()]);
+        let minted = hint
+            .classes
+            .variants
+            .iter()
+            .find(|(name, _)| name == "C")
+            .map(|(_, host)| host.clone())
+            .expect("C");
+        assert_eq!(minted.qualname(), "synth::E::C");
+        let stop = HOST_ENV
+            .lookup_exception_class("StopIteration")
+            .expect("StopIteration");
+        let mut cc = cc_with_exc_rows(&[("interp_exceptions::EXC_STOP_ITERATION_TYPE", 0x30)]);
+        cc.exception_class_hints = vec![hint];
+        let mut flat = SSARepr {
+            name: "minted_mismatch".into(),
+            insns: vec![
+                FlatOp::GotoIfExceptionMismatch {
+                    llexitcase: ConstValue::HostObject(minted.clone()),
+                    target: Label(0),
+                },
+                FlatOp::GotoIfExceptionMismatch {
+                    llexitcase: ConstValue::HostObject(stop.clone()),
+                    target: Label(0),
+                },
+                FlatOp::Label(Label(0)),
+            ],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let body = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
+        assert_eq!(body.constants_i, vec![0, 0x30]);
+        assert!(!body.constants_i.contains(&(minted.identity_id() as i64)));
+        assert!(!body.constants_i.contains(&(stop.identity_id() as i64)));
+        assert_eq!(body.reloc_consts_i.len(), 2);
+        assert_eq!(
+            body.constants_i[body.reloc_consts_i[0].constants_i_index],
+            0
+        );
+        assert_eq!(
+            body.reloc_consts_i[0].kind,
+            ConstIRelocKind::StaticAddr {
+                name: "synth::E::C".to_string(),
+            }
+        );
+        assert_eq!(
+            body.constants_i[body.reloc_consts_i[1].constants_i_index],
+            0x30
+        );
+        assert!(matches!(
+            &body.reloc_consts_i[1].kind,
+            ConstIRelocKind::StaticAddr { name } if name.contains("EXC_STOP_ITERATION_TYPE")
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "no interp_exceptions pytype row for exception class synth::E::C")]
+    fn same_named_host_is_not_the_minted_llexitcase() {
+        use crate::flatten::{FlatOp, Label, SSARepr};
+        use crate::flowspace::model::{HOST_ENV, HostObject};
+        use crate::front::llbc_hints::ExceptionClassHint;
+
+        let hint = ExceptionClassHint::new("synth::E", "", vec!["C".to_string()]);
+        let exception = HOST_ENV
+            .lookup_exception_class("Exception")
+            .expect("Exception");
+        let other = HostObject::new_class("synth::E::C", vec![exception]);
+        let mut cc = cc_with_exc_rows(&[("interp_exceptions::EXC_STOP_ITERATION_TYPE", 0x30)]);
+        cc.exception_class_hints = vec![hint];
+        let mut flat = SSARepr {
+            name: "other_host".into(),
+            insns: vec![
+                FlatOp::GotoIfExceptionMismatch {
+                    llexitcase: ConstValue::HostObject(other),
+                    target: Label(0),
+                },
+                FlatOp::Label(Label(0)),
+            ],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
+    }
+
+    #[test]
     fn assertion_error_message_instance_emits_sentinel_not_identity() {
         use crate::flatten::{FlatOp, RegOrConst, SSARepr};
         use crate::flowspace::model::{ConstValue, Constant, HOST_ENV, HostObject};
@@ -11895,6 +12052,167 @@ mod tests {
             "unexpected setarrayitem_gc_v/iiid key: {:?}",
             asm.insns.keys().collect::<Vec<_>>()
         );
+    }
+
+    fn layout_cc_for_owners(
+        owners: &[&str],
+    ) -> (
+        crate::call::CallControl,
+        parking_lot::MutexGuard<'static, ()>,
+    ) {
+        use crate::call::{CallControl, StructLayout};
+        use std::collections::HashMap;
+
+        let mut cc = CallControl::new();
+        let mut ids = HashMap::new();
+        for owner in owners {
+            let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+            ids.insert((*owner).to_string(), Some(owner_id));
+            cc.set_struct_layout(
+                owner_id,
+                StructLayout {
+                    size: 0,
+                    align: 1,
+                    gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                    fields: Vec::new(),
+                    host: None,
+                    ll_struct: std::cell::RefCell::new(None),
+                    ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
+                },
+            );
+        }
+        let guard = crate::test_support::register_struct_ids_serialized(ids);
+        (cc, guard)
+    }
+
+    fn assemble_new_with_vtable(
+        cc: &crate::call::CallControl,
+        owner: &str,
+        vtable: i64,
+        intern: &[(&str, i64)],
+    ) -> crate::jitcode::BhDescr {
+        use crate::flatten::flatten_graph;
+        use crate::jtransform::{GraphTransformConfig, Transformer};
+        use crate::model::{FunctionGraph, OpKind};
+
+        let mut graph = FunctionGraph::new("new_with_vtable");
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::NewWithVtable {
+                    owner: owner.to_string(),
+                    vtable,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result.clone()));
+        FunctionGraph::set_concretetype_of_inline(&result, crate::model::ConcreteType::GcRef);
+
+        let config = GraphTransformConfig::default();
+        let mut rewritten = Transformer::new(&config).transform(&graph).graph;
+        regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
+        let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
+        let mut flat = flatten_graph(&rewritten, &mut regallocs);
+        let mut asm = Assembler::new();
+        asm.intern_type_static_addrs(intern);
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(cc));
+        let want = majit_ir::descr::struct_id_for_name(owner)
+            .unwrap_or_else(|| panic!("struct id for {owner}"))
+            .as_u64();
+        asm.snapshot_descrs()
+            .into_iter()
+            .find(|descr| {
+                matches!(descr, crate::jitcode::BhDescr::Size { type_id, .. } if *type_id == want)
+            })
+            .unwrap_or_else(|| panic!("new_with_vtable size descr for {owner}"))
+    }
+
+    /// A minted class emits the type-static sentinel with `owner` = the
+    /// intern key. A class that is not minted keeps the address-intern
+    /// sentinel, the raw word, or vtable 0.
+    #[test]
+    fn new_with_vtable_minted_class_emits_type_static_sentinel() {
+        use crate::jitcode::BhDescr;
+
+        let hint = crate::front::llbc_hints::ExceptionClassHint::new(
+            "synth::E",
+            "B(A)",
+            vec!["A".into(), "B".into()],
+        );
+        let host_b = hint
+            .classes
+            .variants
+            .iter()
+            .find(|(name, _)| name == "B")
+            .map(|(_, host)| host.clone())
+            .expect("variant B");
+        let identity = host_b.identity_id() as i64;
+        let (mut cc, _guard) =
+            layout_cc_for_owners(&["synth::E", "synth::E::A", "synth::E::B", "Plain"]);
+        cc.exception_class_hints = vec![hint];
+
+        let minted_by_identity =
+            assemble_new_with_vtable(&cc, "synth::E::B", identity, &[("decoy::Type", identity)]);
+        match minted_by_identity {
+            BhDescr::Size { vtable, owner, .. } => {
+                assert!(is_type_static_const_sentinel(vtable));
+                assert_ne!(vtable, identity as u64);
+                assert_eq!(owner, "synth::E::B");
+                assert_eq!(vtable, type_static_const_sentinel(1usize << 32) as u64);
+            }
+            other => panic!("minted identity: {other:?}"),
+        }
+
+        let minted_by_owner = assemble_new_with_vtable(&cc, "synth::E::B", 0x1111, &[]);
+        match minted_by_owner {
+            BhDescr::Size { vtable, owner, .. } => {
+                assert!(is_type_static_const_sentinel(vtable));
+                assert_ne!(vtable, 0x1111);
+                assert_eq!(owner, "synth::E::B");
+            }
+            other => panic!("minted owner: {other:?}"),
+        }
+
+        let minted_zero = assemble_new_with_vtable(&cc, "synth::E::A", 0, &[]);
+        match minted_zero {
+            BhDescr::Size { vtable, owner, .. } => {
+                assert!(is_type_static_const_sentinel(vtable));
+                assert_ne!(vtable, 0);
+                assert_eq!(owner, "synth::E::A");
+            }
+            other => panic!("minted zero vtable: {other:?}"),
+        }
+
+        cc.exception_class_hints.clear();
+        let addr = 0xABC0;
+        let interned =
+            assemble_new_with_vtable(&cc, "Plain", addr, &[("floatobject::FLOAT_TYPE", addr)]);
+        match interned {
+            BhDescr::Size { vtable, owner, .. } => {
+                assert_eq!(vtable, type_static_const_sentinel(0) as u64);
+                assert_eq!(owner, "floatobject::FLOAT_TYPE");
+            }
+            other => panic!("interned address: {other:?}"),
+        }
+
+        let raw = assemble_new_with_vtable(&cc, "Plain", 0x2222, &[]);
+        match raw {
+            BhDescr::Size { vtable, owner, .. } => {
+                assert_eq!(vtable, 0x2222);
+                assert!(owner.is_empty());
+            }
+            other => panic!("raw address: {other:?}"),
+        }
+
+        let zero = assemble_new_with_vtable(&cc, "Plain", 0, &[]);
+        match zero {
+            BhDescr::Size { vtable, owner, .. } => {
+                assert_eq!(vtable, 0);
+                assert!(owner.is_empty());
+            }
+            other => panic!("zero vtable: {other:?}"),
+        }
     }
 
     #[test]
@@ -15035,11 +15353,11 @@ mod tests {
     }
 
     fn hierarchy_e() -> crate::front::llbc_hints::ExceptionClassHint {
-        crate::front::llbc_hints::ExceptionClassHint {
-            enum_path: "E".to_string(),
-            overrides: "C(B)".to_string(),
-            variants: vec!["A".to_string(), "B".to_string(), "C".to_string()],
-        }
+        crate::front::llbc_hints::ExceptionClassHint::new(
+            "E",
+            "C(B)",
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+        )
     }
 
     fn class_names_exception_and_not_builtin(classdef: &Rc<RefCell<ClassDef>>, name: &str) {
@@ -15079,7 +15397,8 @@ mod tests {
         bk.set_exception_carrier("error::PyErrorObject");
         let carrier = bk.exception_carrier_class().expect("carrier host");
         let carrier_def = bk.getuniqueclassdef(&carrier).expect("carrier classdef");
-        bk.mint_exception_class_hierarchies(&[hierarchy_e()]);
+        let hint = hierarchy_e();
+        bk.mint_exception_class_hierarchies(&[hint.clone()]);
 
         let base = bk.exception_class_base("E").expect("base E");
         let ea = bk.exception_class_variant("E", "A").expect("EA");
@@ -15107,7 +15426,7 @@ mod tests {
         assert!(!carrier_def.borrow().issubclass(&base));
         assert!(!base.borrow().issubclass(&carrier_def));
 
-        bk.mint_exception_class_hierarchies(&[hierarchy_e()]);
+        bk.mint_exception_class_hierarchies(&[hint]);
         assert!(Rc::ptr_eq(
             &bk.exception_class_base("E").expect("second mint"),
             &base
@@ -15226,15 +15545,15 @@ mod tests {
             std::collections::HashMap::from([("ArgErr".to_string(), "argument".to_string())]),
         );
         ann.bookkeeper.mint_exception_class_hierarchies(&[
-            crate::front::llbc_hints::ExceptionClassHint {
-                enum_path: "argument::ArgErr".to_string(),
-                overrides: "TooManyMethod(TooMany)".to_string(),
-                variants: vec![
+            crate::front::llbc_hints::ExceptionClassHint::new(
+                "argument::ArgErr",
+                "TooManyMethod(TooMany)",
+                vec![
                     "Missing".to_string(),
                     "TooMany".to_string(),
                     "TooManyMethod".to_string(),
                 ],
-            },
+            ),
         ]);
         let base = ann
             .bookkeeper

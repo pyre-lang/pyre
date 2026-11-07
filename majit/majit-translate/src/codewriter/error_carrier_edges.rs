@@ -679,11 +679,11 @@ mod tests {
     }
 
     fn e_hints() -> Vec<crate::front::llbc_hints::ExceptionClassHint> {
-        vec![crate::front::llbc_hints::ExceptionClassHint {
-            enum_path: "synth::E".into(),
-            overrides: "C(B)".into(),
-            variants: vec!["A".into(), "B".into(), "C".into()],
-        }]
+        vec![crate::front::llbc_hints::ExceptionClassHint::new(
+            "synth::E",
+            "C(B)",
+            vec!["A".into(), "B".into(), "C".into()],
+        )]
     }
 
     fn lower_with_e_hints(graph: &mut FunctionGraph) {

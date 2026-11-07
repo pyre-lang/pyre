@@ -1874,11 +1874,11 @@ mod exception_class_hierarchy_tests {
     #[test]
     fn dual_gate_registry_mints_declared_exception_hierarchy_once() {
         let mut callcontrol = crate::call::CallControl::new();
-        callcontrol.exception_class_hints = vec![ExceptionClassHint {
-            enum_path: "E".to_string(),
-            overrides: "C(B)".to_string(),
-            variants: vec!["A".to_string(), "B".to_string(), "C".to_string()],
-        }];
+        callcontrol.exception_class_hints = vec![ExceptionClassHint::new(
+            "E",
+            "C(B)",
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+        )];
         callcontrol.set_error_carrier(crate::OwnedErrorCarrierSpec {
             carrier_path: "error::PyErrorObject".to_string(),
             ..Default::default()
