@@ -6854,7 +6854,10 @@ impl<'a> Lowering<'a> {
                             funcptr,
                             args,
                             graphs: None,
-                            family_key: Some((trait_root, method_name)),
+                            family_key: Some(crate::model::IndirectFamilyKey::dyn_trait(
+                                trait_root,
+                                method_name,
+                            )),
                             result_ty,
                         }
                     }
@@ -6890,7 +6893,10 @@ impl<'a> Lowering<'a> {
                         funcptr,
                         args,
                         graphs: None,
-                        family_key: Some((struct_path, field_name)),
+                        family_key: Some(crate::model::IndirectFamilyKey::fnptr_field(
+                            struct_path,
+                            field_name,
+                        )),
                         result_ty,
                     }
                 } else if let Some(family) = fn_ptr_family {

@@ -2135,6 +2135,29 @@ fn dyn_trait_dispatch_ops(
     Ok(ops)
 }
 
+/// Pre-rtyper spelling of a call through a loaded function pointer:
+/// `simple_call(funcptr, *args)`. A harvested struct FnPtr field
+/// (`IndirectFamilyKey::FnPtrField`) annotates the loaded value as the
+/// family's function `SomePBC` (`ClassRepr.getclsfield`); `SomePBC.call`
+/// / `FunctionReprBase.call` emit `indirect_call` with the family graphs.
+/// A stored pointer with no family (`family_key: None`) stays
+/// `SomePtr.call` / `PtrRepr.rtype_simple_call`.
+fn stored_fnptr_simple_call(
+    funcptr: &crate::flowspace::model::Variable,
+    args: &[crate::flowspace::model::Variable],
+    op: &SpaceOperation,
+    value_map: &HashMap<Variable, Hlvalue>,
+) -> Result<Vec<FlowspaceOp>, TyperError> {
+    let funcptr_hl = lookup_operand(value_map, funcptr, op, "funcptr")?;
+    let mut call_args = Vec::with_capacity(args.len() + 1);
+    call_args.push(funcptr_hl);
+    for (i, v) in args.iter().enumerate() {
+        call_args.push(lookup_operand(value_map, v, op, &format!("args[{i}]"))?);
+    }
+    let result = resolve_result_hlvalue(op, value_map)?;
+    Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
+}
+
 /// `rlib/jit.py` `hint` ExtRegistryEntry analyser name for a kwarg kind
 /// that mutates `SomeInstance.flags`. Promote kinds are annotation
 /// identities and return `None`.
@@ -4564,44 +4587,37 @@ pub fn translate_op(
         // (`graphanalyze.py`) reads out of `op.args[-1]` is a product of
         // rtyping, which has not run yet.
         //
-        // `family_key` carries the pre-rtyper identity of the vtable slot, so a
-        // dyn-trait dispatch lowers to the same `getattr` + `simple_call` shape
-        // as its `CallTarget::Indirect` twin. `funcptr` is dropped: it is the
-        // `Field[Adt(vtable), slot]` projection, which the `getattr` re-derives
-        // from the receiver at the level the annotator works in.
-        OpKind::IndirectCall {
-            args,
-            family_key: Some((trait_root, method_name)),
-            ..
-        } => {
-            let arg_hls = args
-                .iter()
-                .enumerate()
-                .map(|(i, v)| lookup_operand(value_map, v, op, &format!("args[{i}]")))
-                .collect::<Result<Vec<_>, _>>()?;
-            let result = resolve_result_hlvalue(op, value_map)?;
-            dyn_trait_dispatch_ops(arg_hls, trait_root, method_name, result, call_registry)
-        }
-        // A stored function pointer has no trait receiver. The annotator
-        // sees `simple_call(funcptr, *args)` whose args[0] is the
-        // `Ptr(FuncType)` value (`SomePtr.call`); `PtrRepr.rtype_simple_call`
-        // then emits `direct_call` or `indirect_call` with
-        // `inputconst(Void, None)`.
+        // `family_key` carries the pre-rtyper identity of the call family.
+        // A dyn-trait vtable slot lowers to the same `getattr` + `simple_call`
+        // shape as its `CallTarget::Indirect` twin; `funcptr` is dropped
+        // because `getattr` re-derives the bound method from the receiver.
+        // A harvested struct FnPtr field keeps the already-loaded `funcptr`
+        // (`SomePBC.call` / `FunctionReprBase.call` once the slot intern is
+        // the family's function PBC); dropping it and getattr'ing the slot
+        // name off `args[0]` is the dyn-trait shape and blocks on
+        // `SomeInstance(PyObject)`.
         OpKind::IndirectCall {
             funcptr,
             args,
-            family_key: None,
+            family_key,
             ..
-        } => {
-            let funcptr_hl = lookup_operand(value_map, funcptr, op, "funcptr")?;
-            let mut call_args = Vec::with_capacity(args.len() + 1);
-            call_args.push(funcptr_hl);
-            for (i, v) in args.iter().enumerate() {
-                call_args.push(lookup_operand(value_map, v, op, &format!("args[{i}]"))?);
+        } => match family_key {
+            Some(crate::model::IndirectFamilyKey::DynTrait {
+                trait_root,
+                method_name,
+            }) => {
+                let arg_hls = args
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| lookup_operand(value_map, v, op, &format!("args[{i}]")))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let result = resolve_result_hlvalue(op, value_map)?;
+                dyn_trait_dispatch_ops(arg_hls, trait_root, method_name, result, call_registry)
             }
-            let result = resolve_result_hlvalue(op, value_map)?;
-            Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
-        }
+            Some(crate::model::IndirectFamilyKey::FnPtrField { .. }) | None => {
+                stored_fnptr_simple_call(funcptr, args, op, value_map)
+            }
+        },
 
         // ─── Pyre-internal: VtableMethodPtr ───
         // TODO(rclass-vtable-rework): pyre-only adaptation of
@@ -8707,10 +8723,8 @@ mod tests {
             .classdef
             .as_ref()
             .expect("PyObject class_root must populate classdef");
-        // Dual-publish leaf `PyObject` is a lookup spelling of one class: it
-        // interns as its declaration `pyobject::PyObject` (`Bookkeeper.getdesc`
-        // keys on the class object). The instance-not-string contract is the
-        // assertion below.
+        // Unique `module::Leaf` intern key (`intern_key_from_registry`):
+        // `PyObject` and `pyobject::PyObject` are one ClassDef.
         assert_eq!(classdef.borrow().name, "pyobject::PyObject");
 
         let projected_root_instance = bk.project_struct_field_type("PyObjectRef");
@@ -13085,11 +13099,11 @@ mod tests {
         assert_eq!(translated[0].result, result_hl);
     }
 
-    /// An IndirectCall that does carry a `family_key` names a dyn-trait vtable
-    /// slot, and lowers to the same pre-rtyper shape as its `CallTarget::
-    /// Indirect` twin: `getattr(receiver, method)` then `simple_call`. The
-    /// annotator never sees an `indirect_call` — `rpbc.py` mints that
-    /// inside `rtype_simple_call`, downstream of here.
+    /// `IndirectFamilyKey::DynTrait` names a dyn-trait vtable slot and
+    /// lowers to the same pre-rtyper shape as its `CallTarget::Indirect`
+    /// twin: `getattr(receiver, method)` then `simple_call`. The annotator
+    /// never sees an `indirect_call` — `rpbc.py` mints that inside
+    /// `rtype_simple_call`, downstream of here.
     #[test]
     fn translate_op_indirect_call_with_family_key_lowers_to_getattr_simple_call() {
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
@@ -13104,7 +13118,7 @@ mod tests {
                 funcptr: vars[1].clone(),
                 args: vec![vars[2].clone()],
                 graphs: None,
-                family_key: Some(("Handler".to_string(), "run".to_string())),
+                family_key: Some(crate::model::IndirectFamilyKey::dyn_trait("Handler", "run")),
                 result_ty: ValueType::Int,
             },
         };
@@ -13129,6 +13143,197 @@ mod tests {
         };
         assert_eq!(m1.id(), m2.id());
         assert_eq!(translated[1].args.len(), 1, "the receiver is not re-passed");
+    }
+
+    /// A harvested struct FnPtr field (`instance_getclass`'s
+    /// `(access.getclass)(obj)`) keeps the already-loaded `funcptr` and
+    /// spells `simple_call(funcptr, *args)`. The dyn-trait getattr of the
+    /// slot name off `args[0]` is the wrong shape for this family.
+    #[test]
+    fn translate_op_indirect_call_fnptr_field_family_lowers_to_simple_call() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11);
+        let funcptr_hl = Hlvalue::Variable(Variable::new());
+        let arg_hl = Hlvalue::Variable(Variable::new());
+        let result_hl = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[1].clone(), funcptr_hl.clone());
+        value_map.insert(vars[2].clone(), arg_hl.clone());
+        value_map.insert(vars[3].clone(), result_hl.clone());
+        let op = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::IndirectCall {
+                funcptr: vars[1].clone(),
+                args: vec![vars[2].clone()],
+                graphs: None,
+                family_key: Some(crate::model::IndirectFamilyKey::fnptr_field(
+                    "mapdict::MapdictMixinAccess",
+                    "getclass",
+                )),
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("a FnPtr-field IndirectCall lowers to simple_call of the loaded funcptr");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        assert_eq!(translated[0].args.len(), 2);
+        assert_eq!(translated[0].args[0], funcptr_hl);
+        assert_eq!(translated[0].args[1], arg_hl);
+        assert_eq!(translated[0].result, result_hl);
+    }
+
+    /// `mapdict::instance_getclass` shape: a loaded FnPtr field called with
+    /// the object. Adapter spells `simple_call(funcptr, *args)`. Annotate
+    /// of an Input `fn` pointer is `SomePtr.call`; production intern of a
+    /// harvested family is a function `SomePBC`. Rtype emits `indirect_call`;
+    /// `lower_indirect_calls` fills the harvested family.
+    #[test]
+    fn instance_getclass_fnptr_field_annotates_and_rtypes_indirect_call_with_family() {
+        use crate::call::CallControl;
+        use crate::parse::CallPath;
+        use crate::translator::rtyper::cutover::specialize_legacy_graph_with_registry_returning_value_to_var;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rpbc::lower_indirect_calls;
+
+        let mut graph = LegacyGraph::new("instance_getclass");
+        let entry = graph.startblock;
+        let f_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "getclass".to_string(),
+                    ty: ValueType::Int,
+                    class_root: Some("fn(i64) -> bool".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        let x_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "obj".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, f_var.clone());
+        graph.push_inputarg_var(entry, x_var.clone());
+        let r_var = graph
+            .push_op_var(
+                entry,
+                OpKind::IndirectCall {
+                    funcptr: f_var,
+                    args: vec![x_var],
+                    graphs: None,
+                    family_key: Some(crate::model::IndirectFamilyKey::fnptr_field(
+                        "mapdict::MapdictMixinAccess",
+                        "getclass",
+                    )),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(r_var.clone()));
+
+        let registry = CallRegistry::new(Rc::new(Bookkeeper::new()));
+        let lifted = function_graph_to_flowspace(&graph, &registry)
+            .expect("FnPtr-field IndirectCall must lift to simple_call");
+        let start = lifted.graph.borrow().startblock.clone();
+        let lifted_ops = start.borrow().operations.clone();
+        let simple = lifted_ops
+            .iter()
+            .find(|op| op.opname == "simple_call")
+            .expect("adapter lowers FnPtr-field IndirectCall to simple_call");
+        assert_eq!(simple.args.len(), 2);
+        assert!(
+            lifted_ops.iter().all(|op| op.opname != "getattr"),
+            "FnPtr-field dispatch must not getattr the slot name off the receiver"
+        );
+
+        let (value_to_var, _) =
+            specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
+                .expect("instance_getclass FnPtr-field graph must annotate and rtype");
+        let result_var = value_to_var.get(&r_var).expect("call result must project");
+        {
+            let cell = result_var.annotation.borrow();
+            match cell.as_ref().map(|rc| rc.as_ref()) {
+                Some(SomeValue::Bool(_)) => {}
+                other => panic!(
+                    "SomePtr.call returns ll_to_annotation of FuncType.RESULT, got {other:?}"
+                ),
+            }
+        }
+        assert_eq!(result_var.concretetype(), Some(LowLevelType::Bool));
+
+        let (ann, _) = registry.ensure_session().expect("session after specialize");
+        let graph_ref = ann
+            .annotated
+            .borrow()
+            .values()
+            .find_map(|g| g.clone())
+            .expect("specialized subject graph");
+        let start = graph_ref.borrow().startblock.clone();
+        let rtyped = start.borrow().operations.clone();
+        let indirect = rtyped
+            .iter()
+            .find(|op| op.opname == "indirect_call")
+            .expect("PtrRepr.rtype_simple_call emits indirect_call");
+        let last = indirect.args.last().expect("trailing graphs arg");
+        let Hlvalue::Constant(c_graphs) = last else {
+            panic!("last arg must be inputconst(Void, None) before family fill");
+        };
+        assert_eq!(c_graphs.concretetype, Some(LowLevelType::Void));
+        assert_eq!(c_graphs.value, ConstValue::None);
+
+        let mut cc = CallControl::new();
+        for owner in [
+            "mapdict::base_user_class_mapdict_getclass",
+            "objectobject::W_OBJECT_OBJECT_MAPDICT_ACCESS",
+        ] {
+            let path = CallPath::for_impl_method(owner, "getclass");
+            cc.register_function_graph(
+                path.clone(),
+                LegacyGraph::new(format!("{owner}::getclass")),
+            );
+            cc.register_trait_family_path("getclass", "mapdict::MapdictMixinAccess", path);
+        }
+        lower_indirect_calls(&mut graph, &cc);
+        let family = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::IndirectCall { graphs, .. } => graphs.clone(),
+                _ => None,
+            })
+            .expect("lower_indirect_calls fills the FnPtr-field family");
+        assert_eq!(
+            family.len(),
+            2,
+            "getclass family has two members: {family:?}"
+        );
+        let leftover = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::IndirectCall {
+                        family_key: Some(_),
+                        ..
+                    }
+                )
+            });
+        assert!(
+            !leftover,
+            "lower_indirect_calls consumes the FnPtr-field family key"
+        );
     }
 
     #[test]

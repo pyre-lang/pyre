@@ -24,8 +24,8 @@ use crate::flowspace::argument::Signature;
 use crate::flowspace::model::ConstValue;
 use crate::jitcode::{BhCallDescr, CallResultErasedKey};
 use crate::model::{
-    CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FlagReturn, FunctionGraph, InstanceFlags,
-    LinkArg, OpKind, SpaceOperation, secondary_entry_roots,
+    CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FlagReturn, FunctionGraph,
+    IndirectFamilyKey, InstanceFlags, LinkArg, OpKind, SpaceOperation, secondary_entry_roots,
 };
 use crate::parse::{CallPath, GraphSpecialization};
 use crate::policy::JitPolicy;
@@ -4957,6 +4957,12 @@ impl CallControl {
         &self.trait_family_registrations
     }
 
+    /// `(trait_root, method_name) → impl CallPath` rows, including harvested
+    /// struct FnPtr field families (`register_trait_family_path`).
+    pub fn indirect_family_impls(&self) -> &HashMap<(String, String), Vec<CallPath>> {
+        &self.trait_method_impls
+    }
+
     /// RPython: isinstance(TYPE, lltype.Struct) check.
     pub fn is_known_struct(&self, name: &str) -> bool {
         is_known_by_value_struct(&self.known_struct_names, name)
@@ -6443,15 +6449,14 @@ impl CallControl {
             function_graphs,
             ..
         } = self;
-        let fillable = |graphs: &Option<Vec<CallPath>>, family_key: &Option<(String, String)>| {
+        let fillable = |graphs: &Option<Vec<CallPath>>, family_key: &Option<IndirectFamilyKey>| {
             graphs.as_deref().is_some_and(<[_]>::is_empty)
-                && family_key
-                    .as_ref()
-                    .is_some_and(|(trait_root, method_name)| {
-                        trait_method_impls
-                            .get(&(trait_root.clone(), method_name.clone()))
-                            .is_some_and(|impls| !impls.is_empty())
-                    })
+                && family_key.as_ref().is_some_and(|key| {
+                    let (trait_root, method_name) = key.as_pair();
+                    trait_method_impls
+                        .get(&(trait_root.to_string(), method_name.to_string()))
+                        .is_some_and(|impls| !impls.is_empty())
+                })
         };
         // Look before writing: the stored graph can be shared with its
         // other aliases and with the pending lift. A graph not built yet
@@ -6481,11 +6486,12 @@ impl CallControl {
                 if !graphs.as_deref().is_some_and(<[_]>::is_empty) {
                     continue;
                 }
-                let Some((trait_root, method_name)) = family_key.as_ref() else {
+                let Some(key) = family_key.as_ref() else {
                     continue;
                 };
+                let (trait_root, method_name) = key.as_pair();
                 let family = trait_method_impls
-                    .get(&(trait_root.clone(), method_name.clone()))
+                    .get(&(trait_root.to_string(), method_name.to_string()))
                     .cloned()
                     .unwrap_or_default();
                 if !family.is_empty() {
@@ -9342,19 +9348,21 @@ fn materialize_indirect_families(graph: &mut FunctionGraph, trait_method_impls: 
             continue;
         };
         // Read the key without clearing it. The two-phase prepass runs
-        // after this fill on the same shared store, and its flowspace
-        // adapter needs the same `(trait_root, method_name)` to emit
-        // the pre-rtyper `getattr` + `simple_call` shape — an
-        // `indirect_call` op does not exist before rtyping. The later
+        // after this fill on the same shared store. A DynTrait key still
+        // needs `(trait_root, method_name)` so the adapter can emit the
+        // pre-rtyper `getattr` + `simple_call` shape; a FnPtrField key
+        // stays so `rpbc::lower_indirect_calls` can fill `c_graphs`.
+        // `indirect_call` does not exist before rtyping. The later
         // `rpbc::lower_indirect_calls` re-enters its own `take()` arm
         // and recomputes `graphs` through `all_impls_for_indirect`,
         // which is this same lookup over the same map, so the value it
         // writes is unchanged.
-        let Some((trait_root, method_name)) = family_key.clone() else {
+        let Some(key) = family_key.as_ref() else {
             continue;
         };
+        let (trait_root, method_name) = key.as_pair();
         let family = trait_method_impls
-            .get(&(trait_root.clone(), method_name.clone()))
+            .get(&(trait_root.to_string(), method_name.to_string()))
             .cloned()
             .unwrap_or_default();
         *graphs = (!family.is_empty()).then_some(family);
@@ -25599,7 +25607,7 @@ mod tests {
                     funcptr,
                     args: Vec::new(),
                     graphs: None,
-                    family_key: Some(("Handler".to_string(), "run".to_string())),
+                    family_key: Some(IndirectFamilyKey::dyn_trait("Handler", "run")),
                     result_ty: ValueType::Void,
                 },
             });
@@ -25619,7 +25627,7 @@ mod tests {
             panic!("caller operation must remain an indirect call");
         };
         assert_eq!(
-            family_key.as_ref().map(|(t, m)| (t.as_str(), m.as_str())),
+            family_key.as_ref().map(|k| k.as_pair()),
             Some(("Handler", "run")),
             "the vtable-slot identity must outlive graph discovery"
         );
@@ -25665,7 +25673,7 @@ mod tests {
                     funcptr,
                     args: Vec::new(),
                     graphs: None,
-                    family_key: Some(("Handler".to_string(), "run".to_string())),
+                    family_key: Some(IndirectFamilyKey::dyn_trait("Handler", "run")),
                     result_ty: ValueType::Void,
                 },
             });
@@ -26187,7 +26195,7 @@ mod tests {
                     funcptr,
                     args: Vec::new(),
                     graphs: Some(Vec::new()),
-                    family_key: Some(("Handler".to_string(), "run".to_string())),
+                    family_key: Some(IndirectFamilyKey::dyn_trait("Handler", "run")),
                     result_ty: ValueType::Void,
                 },
             });
@@ -28119,7 +28127,7 @@ mod tests {
                 funcptr: crate::flowspace::model::Variable::named("fnptr"),
                 args: Vec::new(),
                 graphs: None,
-                family_key: Some(("Trait".to_string(), "m".to_string())),
+                family_key: Some(IndirectFamilyKey::dyn_trait("Trait", "m")),
                 result_ty: ValueType::Void,
             },
             false,

@@ -256,9 +256,9 @@ fn graph_has_fnptr_slot_dispatch(graph: &FunctionGraph, field: &str) -> bool {
         matches!(
             &op.kind,
             OpKind::IndirectCall {
-                family_key: Some((_, name)),
+                family_key: Some(key),
                 ..
-            } if name == field
+            } if key.as_pair().1 == field
         )
     })
 }

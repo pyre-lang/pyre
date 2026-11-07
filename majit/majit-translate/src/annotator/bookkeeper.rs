@@ -6280,6 +6280,17 @@ fn intern_class_key_from_registry(
     if let Some(Some(ci)) = reg.class_identity.get(lookup) {
         return ci.spelling.clone();
     }
+    // A unique `module::Leaf` and its crate-prefix / bare-leaf aliases
+    // are one class object (`Bookkeeper.getdesc`). Exact match of a
+    // shorter spelling used to intern a second ClassDef
+    // (`mapdict::AbstractAttribute` then
+    // `pyre_object::mapdict::AbstractAttribute`); `pbc_call` union of
+    // `MapRef` returns then failed (`Instance ∪ Instance` with no common
+    // base). Nested `module::struct::Code::Int` is not this shape —
+    // `unique_module_leaf_registry_key` refuses it.
+    if let Some(key) = unique_module_leaf_registry_key(reg, lookup) {
+        return reattach_instantiation_suffix(key, lookup);
+    }
     let template = majit_ir::descr::strip_generic_args(lookup);
     if template.as_ref() != lookup {
         // Bookkeeper.getdesc / getuniqueclassdef: one class object
@@ -6299,16 +6310,10 @@ fn intern_class_key_from_registry(
         }
     }
     if reg.fields.get_key_value(lookup).is_some() {
-        // A qualified exact key is identity (`m::T` vs `outer::m::T`).
-        // A bare leaf may be harvest's dual-published alias of one
-        // qualified declaration (`is_bare_leaf_alias`); intern as that
-        // declaration so `[PyObject]` and `pyobject::PyObject` share a
-        // class (`Bookkeeper.getdesc`).
-        if !lookup.contains("::")
-            && let Some(key) = unique_path_suffix_identity(reg, lookup)
-        {
-            return key;
-        }
+        // A registered spelling is identity (`m::T` vs `outer::m::T`,
+        // `Int` vs `module::struct::Code::Int`). Unique `module::Leaf`
+        // dual-publish (`PyObject` → `pyobject::PyObject`) already
+        // returned above (`Bookkeeper.getdesc`).
         return lookup.to_string();
     }
     if let Some(key) = unique_path_suffix_identity(reg, lookup) {
@@ -6328,6 +6333,94 @@ fn intern_class_key_from_registry(
         }
     }
     lookup.to_string()
+}
+
+fn unique_registered_intern_key<'a>(
+    reg: &'a crate::front::StructFieldRegistry,
+    owner: &str,
+) -> Option<&'a str> {
+    let key = unique_suffix_key_owned(owner, reg.fields.keys())?;
+    accept_intern_suffix_match(owner, &key)
+        .then(|| reg.fields.get_key_value(&key).map(|(k, _)| k.as_str()))
+        .flatten()
+}
+
+/// Unique `module::Leaf` registry key for a bare leaf (`AbstractAttribute`
+/// → `mapdict::AbstractAttribute`). Crate-prefixed spellings of the same
+/// path (`pyre_object::mapdict::AbstractAttribute`) collapse to that one
+/// `::`. Nested `module::struct::Leaf` (`Code::Int`) is not unique
+/// `module::Leaf` and must not steal a distinct `Int` struct.
+fn unique_module_leaf_registry_key<'a>(
+    reg: &'a crate::front::StructFieldRegistry,
+    leaf: &str,
+) -> Option<&'a str> {
+    let key = unique_registered_intern_key(reg, leaf)?;
+    let stripped = strip_known_crate_prefix(key);
+    (stripped.matches("::").count() == 1).then_some(key)
+}
+
+fn strip_known_crate_prefix(path: &str) -> &str {
+    for prefix in [
+        "pyre_interpreter::",
+        "pyre_object::",
+        "pyre_module::",
+        "pyre_jit::",
+    ] {
+        if let Some(rest) = path.strip_prefix(prefix) {
+            return rest;
+        }
+    }
+    path
+}
+
+fn unique_suffix_key_owned(
+    owner: &str,
+    keys: impl Iterator<Item = impl AsRef<str>>,
+) -> Option<String> {
+    let leaf = owner.rsplit("::").next().unwrap_or(owner);
+    let mut matches: Vec<String> = Vec::new();
+    for key in keys {
+        let key = key.as_ref();
+        if key == owner {
+            continue;
+        }
+        let key_leaf = key.rsplit("::").next().unwrap_or(key);
+        if key_leaf != leaf {
+            continue;
+        }
+        if !accept_intern_suffix_match(owner, key) {
+            continue;
+        }
+        matches.push(key.to_string());
+    }
+    unique_longest_path_suffix(&matches)
+}
+
+/// One match, or several spellings of the same path (`mapdict::T` and
+/// `pyre_object::mapdict::T`). Two declarations that only share a leaf
+/// (`a::Dup`, `b::Dup`) stay distinct.
+fn unique_longest_path_suffix(matches: &[String]) -> Option<String> {
+    match matches {
+        [] => None,
+        [one] => Some(one.clone()),
+        many => {
+            let longest = many.iter().max_by_key(|s| s.len())?;
+            many.iter()
+                .all(|m| m == longest || crate::front::semantic::is_path_suffix(longest, m))
+                .then(|| longest.clone())
+        }
+    }
+}
+
+fn accept_intern_suffix_match(lookup: &str, key: &str) -> bool {
+    if lookup == key {
+        return true;
+    }
+    // Promote `lookup` onto a unique longer registered/interned spelling
+    // (`celldict::StrKey` → `pyre_object::celldict::StrKey`). Collapsing
+    // a longer exact registry key onto a shorter interned alias
+    // (`module::struct::Code::Int` → `Code::Int`) is refused.
+    crate::front::semantic::is_path_suffix(key, lookup)
 }
 
 fn reattach_instantiation_suffix(registered_key: &str, spelled: &str) -> String {
@@ -8056,6 +8149,118 @@ mod tests {
         assert!(
             names.iter().any(|n| n == "charon_corpus::ClassObject"),
             "crate-root qualified key is kept, got {names:?}"
+        );
+    }
+
+    /// A unique `module::Leaf` and its bare-leaf alias intern as one
+    /// ClassDef even when the alias is interned first (struct-root
+    /// prologue order). `MapRef` = `*const AbstractAttribute`; `pbc_call`
+    /// of the harvested `get_map` family unions those returns.
+    #[test]
+    fn intern_class_unifies_unique_module_leaf_with_bare_alias() {
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let rows = vec![crate::front::semantic::FieldRow::named(
+            "terminator",
+            "usize",
+        )];
+        reg.fields
+            .insert("mapdict::AbstractAttribute".to_string(), rows.clone());
+        reg.fields.insert("AbstractAttribute".to_string(), rows);
+        bk.set_struct_fields(Rc::new(reg));
+
+        let bare = bk.intern_class_by_qualname("AbstractAttribute");
+        let qualified = bk.intern_class_by_qualname("mapdict::AbstractAttribute");
+        assert_eq!(
+            bare, qualified,
+            "bare leaf interned first must reuse the unique module::Leaf class"
+        );
+        let cd_bare = bk.getuniqueclassdef(&bare).expect("bare classdef");
+        let cd_qual = bk
+            .getuniqueclassdef(&qualified)
+            .expect("qualified classdef");
+        assert!(
+            Rc::ptr_eq(&cd_bare, &cd_qual),
+            "pbc_call union of MapRef returns needs one AbstractAttribute ClassDef"
+        );
+    }
+
+    /// Crate-prefixed and crate-stripped spellings of the same `module::Leaf`
+    /// intern as one ClassDef (`pyre_object::mapdict::AbstractAttribute`).
+    #[test]
+    fn intern_class_unifies_crate_prefixed_module_leaf_with_bare_alias() {
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let rows = vec![crate::front::semantic::FieldRow::named(
+            "terminator",
+            "usize",
+        )];
+        reg.fields
+            .insert("mapdict::AbstractAttribute".to_string(), rows.clone());
+        reg.fields
+            .insert("AbstractAttribute".to_string(), rows.clone());
+        reg.fields
+            .insert("pyre_object::mapdict::AbstractAttribute".to_string(), rows);
+        bk.set_struct_fields(Rc::new(reg));
+        let bare = bk.intern_class_by_qualname("AbstractAttribute");
+        let module = bk.intern_class_by_qualname("mapdict::AbstractAttribute");
+        let crate_path = bk.intern_class_by_qualname("pyre_object::mapdict::AbstractAttribute");
+        assert_eq!(bare, module);
+        assert_eq!(module, crate_path);
+    }
+
+    /// `ensure_session` mints `struct_root_names` sorted, so the
+    /// crate-stripped `module::Leaf` is interned before the crate-prefixed
+    /// spelling. Unique-module-leaf intern must still land on one ClassDef.
+    #[test]
+    fn intern_class_unifies_module_leaf_interned_before_crate_prefix() {
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let rows = vec![crate::front::semantic::FieldRow::named(
+            "terminator",
+            "usize",
+        )];
+        reg.fields
+            .insert("mapdict::AbstractAttribute".to_string(), rows.clone());
+        reg.fields
+            .insert("AbstractAttribute".to_string(), rows.clone());
+        reg.fields
+            .insert("pyre_object::mapdict::AbstractAttribute".to_string(), rows);
+        bk.set_struct_fields(Rc::new(reg));
+        let module = bk.intern_class_by_qualname("mapdict::AbstractAttribute");
+        let crate_path = bk.intern_class_by_qualname("pyre_object::mapdict::AbstractAttribute");
+        let bare = bk.intern_class_by_qualname("AbstractAttribute");
+        assert_eq!(module, crate_path);
+        assert_eq!(crate_path, bare);
+    }
+
+    /// Nested `module::struct::Leaf` must not steal a distinct bare `Int`.
+    #[test]
+    fn intern_class_keeps_nested_code_int_apart_from_bare_int() {
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Int".to_string(),
+            vec![crate::front::semantic::FieldRow::named("n", "i64")],
+        );
+        reg.fields.insert(
+            "module::struct::Code::Int".to_string(),
+            vec![crate::front::semantic::FieldRow::named("n", "i64")],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let bare = bk.intern_class_by_qualname("Int");
+        let nested = bk.intern_class_by_qualname("module::struct::Code::Int");
+        assert_ne!(
+            bare, nested,
+            "Code::Int is not a unique module::Leaf alias of Int"
         );
     }
 

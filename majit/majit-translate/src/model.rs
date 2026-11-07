@@ -1022,6 +1022,65 @@ pub fn is_vtable_method_slot_parts(owner: &str, field_name: &str) -> bool {
     leaf.starts_with("method_") && (owner == "{vtable}" || owner.ends_with("::{vtable}"))
 }
 
+/// Pre-rtyping identity of an [`OpKind::IndirectCall`] family.
+///
+/// `rpbc::lower_indirect_calls` fills `c_graphs` from either variant
+/// (`all_impls_for_indirect`), then clears the key. The flowspace adapter
+/// spells the two producers differently: a dyn-trait slot is
+/// `getattr` + `simple_call` (`ClassRepr.getclsfield` then
+/// `FunctionReprBase.call`); a harvested struct FnPtr field is
+/// `simple_call` of the already-loaded field value (`SomePtr.call` /
+/// `PtrRepr.rtype_simple_call`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndirectFamilyKey {
+    /// Dyn-trait vtable slot `(trait_root, method_name)`.
+    DynTrait {
+        trait_root: String,
+        method_name: String,
+    },
+    /// Harvested struct FnPtr field `(struct_path, field_name)`
+    /// (`discover_fnptr_field_families`).
+    FnPtrField {
+        struct_path: String,
+        field_name: String,
+    },
+}
+
+impl IndirectFamilyKey {
+    pub fn dyn_trait(trait_root: impl Into<String>, method_name: impl Into<String>) -> Self {
+        Self::DynTrait {
+            trait_root: trait_root.into(),
+            method_name: method_name.into(),
+        }
+    }
+
+    pub fn fnptr_field(struct_path: impl Into<String>, field_name: impl Into<String>) -> Self {
+        Self::FnPtrField {
+            struct_path: struct_path.into(),
+            field_name: field_name.into(),
+        }
+    }
+
+    /// `(trait_root, method)` or `(struct_path, field)` used to look up
+    /// `CallControl::all_impls_for_indirect`.
+    pub fn as_pair(&self) -> (&str, &str) {
+        match self {
+            Self::DynTrait {
+                trait_root,
+                method_name,
+            } => (trait_root, method_name),
+            Self::FnPtrField {
+                struct_path,
+                field_name,
+            } => (struct_path, field_name),
+        }
+    }
+
+    pub fn is_fnptr_field(&self) -> bool {
+        matches!(self, Self::FnPtrField { .. })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpKind {
     Input {
@@ -1556,12 +1615,12 @@ pub enum OpKind {
         funcptr: crate::flowspace::model::Variable,
         args: Vec<crate::flowspace::model::Variable>,
         graphs: Option<Vec<crate::parse::CallPath>>,
-        /// Pre-rtyping identity of a Rust dyn-trait vtable slot.  The MIR
-        /// frontend preserves the actual `Field[Adt(vtable), slot]` as
-        /// `funcptr`; `rpbc::lower_indirect_calls` consumes this key to fill
-        /// the same `c_graphs` family as `FunctionReprBase.call`, then clears
-        /// it.  Ordinary stored function pointers have no such key.
-        family_key: Option<(String, String)>,
+        /// Pre-rtyping identity of the call family. The MIR frontend
+        /// preserves the loaded `funcptr`; `rpbc::lower_indirect_calls`
+        /// consumes this key to fill the same `c_graphs` family as
+        /// `FunctionReprBase.call`, then clears it. Ordinary stored
+        /// function pointers with no closed family have no such key.
+        family_key: Option<IndirectFamilyKey>,
         result_ty: ValueType,
     },
     /// Virtualizable field read → reads from boxes, no heap op.

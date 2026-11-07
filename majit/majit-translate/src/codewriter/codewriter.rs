@@ -285,6 +285,11 @@ impl CodeWriter {
         // MethodDesc family via the attrfamily merge.  No-op for pyre
         // production (no families).
         registry.populate_trait_family_base_attrs(callcontrol.trait_family_registrations());
+        // Harvested struct FnPtr fields (`MapdictMixinAccess.getclass`):
+        // intern the slot as a function `SomePBC` of the family's
+        // `FunctionDesc`s (`ClassRepr.getclsfield`). Dyn-trait keys in
+        // `indirect_family_impls` are skipped — they are not FnPtr fields.
+        registry.seed_fnptr_field_pbc_attrs(callcontrol.indirect_family_impls());
         // RPython parity: `Translator.buildannotator()` /
         // `Translator.buildrtyper()` (`translator.py`) construct
         // exactly one annotator and one rtyper per Translator and assert

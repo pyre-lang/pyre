@@ -9,8 +9,8 @@ use common::{OBJECT_LLBC, load_llbc_if_present, lower_function, with_shared_lowe
 use majit_charon_reader::Llbc;
 use majit_translate::flowspace::model::Variable;
 use majit_translate::model::{
-    BlockId, CallTarget, ConcreteType, FunctionGraph, OpKind, SpaceOperation, ValueType,
-    VecFieldPart,
+    BlockId, CallTarget, ConcreteType, FunctionGraph, IndirectFamilyKey, OpKind, SpaceOperation,
+    ValueType, VecFieldPart,
 };
 
 /// `None` means the artefact is absent. A checkout that has not extracted
@@ -364,9 +364,9 @@ fn first_input_kind(graph: &FunctionGraph) -> Option<(char, ValueType)> {
     None
 }
 
-fn first_indirect_call(
-    graph: &FunctionGraph,
-) -> Option<(BlockId, &[Variable], Option<&(String, String)>)> {
+fn first_indirect_call<'a>(
+    graph: &'a FunctionGraph,
+) -> Option<(BlockId, &'a [Variable], Option<&'a IndirectFamilyKey>)> {
     for block in &graph.blocks {
         for op in &block.operations {
             if let OpKind::IndirectCall {
@@ -408,7 +408,8 @@ fn w_dict_len_indirect_call_receiver_kind_matches_zst_length_self() {
         caller.dump()
     );
     assert!(
-        family.is_some_and(|(trait_root, method)| {
+        family.is_some_and(|key| {
+            let (trait_root, method) = key.as_pair();
             trait_root.contains("DictStrategy") && method == "length"
         }),
         "IndirectCall family must be DictStrategy::length, got {family:?}\n{}",

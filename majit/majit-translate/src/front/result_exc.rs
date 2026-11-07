@@ -17039,7 +17039,10 @@ mod indirect_call_try_tests {
                     funcptr,
                     args: vec![recv],
                     graphs: None,
-                    family_key: Some(("AsyncAction".into(), "perform".into())),
+                    family_key: Some(crate::model::IndirectFamilyKey::dyn_trait(
+                        "AsyncAction",
+                        "perform",
+                    )),
                     result_ty: ValueType::Ref(None),
                 },
                 true,

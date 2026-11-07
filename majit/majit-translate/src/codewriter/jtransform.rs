@@ -37910,7 +37910,10 @@ mod tests {
                 funcptr,
                 args,
                 graphs: Some(family),
-                family_key: Some(("MapByName".into(), "call".into())),
+                family_key: Some(crate::model::IndirectFamilyKey::dyn_trait(
+                    "MapByName",
+                    "call",
+                )),
                 result_ty: ValueType::Void,
             },
         });

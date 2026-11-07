@@ -387,8 +387,9 @@ pub(crate) fn lower_indirect_calls_with(
                 graphs, family_key, ..
             } = &mut op.kind
             {
-                if let Some((trait_root, method_name)) = family_key.clone() {
-                    let family = call_control.all_impls_for_indirect(&trait_root, &method_name);
+                if let Some(key) = family_key.clone() {
+                    let (trait_root, method_name) = key.as_pair();
+                    let family = call_control.all_impls_for_indirect(trait_root, method_name);
                     if !family.is_empty() {
                         *graphs = Some(family);
                         *family_key = None;
@@ -1039,7 +1040,7 @@ pub(crate) mod tests {
                     funcptr: funcptr.clone(),
                     args: Vec::new(),
                     graphs: None,
-                    family_key: Some(("Handler".to_string(), "run".to_string())),
+                    family_key: Some(crate::model::IndirectFamilyKey::dyn_trait("Handler", "run")),
                     result_ty: ValueType::Void,
                 },
                 true,
@@ -1068,6 +1069,64 @@ pub(crate) mod tests {
             .expect("indirect call survives rtyping");
         assert_eq!(indirect.0, &funcptr);
         assert_eq!(indirect.1.as_ref().map(Vec::len), Some(1));
+        assert!(indirect.2.is_none(), "rtyper must consume the family key");
+    }
+
+    /// A harvested struct FnPtr field fills `c_graphs` from the same
+    /// `all_impls_for_indirect` map as a dyn-trait key, then clears the key.
+    #[test]
+    fn fnptr_field_family_key_fills_graphs_and_clears_key() {
+        use crate::call::CallControl;
+
+        let mut cc = CallControl::new();
+        for owner in [
+            "base_user_class_mapdict_getclass",
+            "W_OBJECT_OBJECT_MAPDICT_ACCESS",
+        ] {
+            cc.register_trait_method(
+                "getclass",
+                Some("mapdict::MapdictMixinAccess"),
+                owner,
+                crate::model::FunctionGraph::new(format!("{owner}::getclass")),
+            );
+        }
+
+        let mut graph = crate::model::FunctionGraph::new("instance_getclass");
+        let funcptr = graph.alloc_value_var();
+        graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::IndirectCall {
+                    funcptr: funcptr.clone(),
+                    args: Vec::new(),
+                    graphs: None,
+                    family_key: Some(crate::model::IndirectFamilyKey::fnptr_field(
+                        "mapdict::MapdictMixinAccess",
+                        "getclass",
+                    )),
+                    result_ty: ValueType::Void,
+                },
+                true,
+            )
+            .unwrap();
+
+        lower_indirect_calls(&mut graph, &cc);
+
+        let indirect = graph.blocks[graph.startblock.0]
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::IndirectCall {
+                    funcptr: actual,
+                    graphs,
+                    family_key,
+                    ..
+                } => Some((actual, graphs, family_key)),
+                _ => None,
+            })
+            .expect("indirect call survives family fill");
+        assert_eq!(indirect.0, &funcptr);
+        assert_eq!(indirect.1.as_ref().map(Vec::len), Some(2));
         assert!(indirect.2.is_none(), "rtyper must consume the family key");
     }
 

@@ -3428,6 +3428,77 @@ fn journal_generalize_attr(this: &Rc<RefCell<ClassDef>>, attr: &str) {
     ann.note_class_attr_slots(&subdefs, attr);
 }
 
+/// A FunDecl store into a harvested FnPtr field is a `SomePtr(FuncType)`
+/// fn-const. The interned slot is the family's function `SomePBC`
+/// (`ClassRepr.getclsfield`). Union of Ptr and PBC has no lattice arm;
+/// the harvest already closed the stored set, so the store does not
+/// narrow the family.
+fn coerce_fnptr_store_to_family_pbc(
+    this: &Rc<RefCell<ClassDef>>,
+    attr: &str,
+    s_value: SomeValue,
+) -> SomeValue {
+    let SomeValue::Ptr(ref ptr) = s_value else {
+        return s_value;
+    };
+    if !matches!(
+        ptr.ll_ptrtype.TO,
+        crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Func(_)
+    ) {
+        return s_value;
+    }
+    let classdef = this.borrow();
+    let Some(existing) = classdef.attrs.get(attr) else {
+        return s_value;
+    };
+    let SomeValue::PBC(pbc) = &existing.s_value else {
+        return s_value;
+    };
+    if pbc.get_kind().ok() != Some(DescKind::Function) {
+        return s_value;
+    }
+    let name = classdef.name.clone();
+    let bk = classdef.bookkeeper.upgrade();
+    drop(classdef);
+    let is_fnptr_field = bk.as_ref().is_some_and(|bk| {
+        bk.struct_fields
+            .borrow()
+            .as_ref()
+            .is_some_and(|reg| fnptr_owner_has_fnptr_field(reg, &name, attr, bk.as_ref()))
+    });
+    if is_fnptr_field {
+        this.borrow()
+            .attrs
+            .get(attr)
+            .map(|a| a.s_value.clone())
+            .unwrap_or(s_value)
+    } else {
+        s_value
+    }
+}
+
+fn fnptr_owner_has_fnptr_field(
+    reg: &crate::front::StructFieldRegistry,
+    owner: &str,
+    field: &str,
+    bk: &Bookkeeper,
+) -> bool {
+    let lookup = owner.replace('.', "::");
+    let canonical = majit_ir::descr::canonical_struct_name(&lookup);
+    for key in [lookup.as_str(), canonical.as_str(), owner] {
+        if let Some(rows) = reg.fields.get(key)
+            && let Some(row) = rows.iter().find(|row| row.name == field)
+        {
+            return crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling_in(
+                &row.ty,
+                Some(bk),
+            )
+            .is_some();
+        }
+    }
+    false
+}
+
 impl ClassDef {
     /// RPython `ClassDef.generalize_attr(self, attr, s_value=None)`
     /// (classdesc.py).
@@ -3463,7 +3534,7 @@ impl ClassDef {
         }
         let mut newattr = Attribute::new(attr);
         if let Some(sv) = s_value {
-            newattr.s_value = sv;
+            newattr.s_value = coerce_fnptr_store_to_family_pbc(this, attr, sv);
         }
         // `rclass.py` sum-type subclasses keep each variant's payload on
         // that subclass. An enum base's only row is `__discriminant`

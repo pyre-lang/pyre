@@ -124,7 +124,9 @@ pub use jtransform::{
     VirtualizableFieldDescriptor, transform_graph,
 };
 pub use layout::{HeuristicLayoutProvider, LayoutProvider};
-pub use model::{Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType};
+pub use model::{
+    Block, BlockId, CallTarget, FunctionGraph, IndirectFamilyKey, OpKind, SpaceOperation, ValueType,
+};
 pub use parse::{CallPath, GraphSpecialization};
 pub use pipeline::{
     CompiledJitDriver, JitDriverSpec, PipelineConfig, PipelineResult, ProgramPipelineResult,
