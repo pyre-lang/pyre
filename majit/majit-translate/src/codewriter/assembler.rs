@@ -3083,6 +3083,16 @@ impl AssemblerEncode for Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            OpKind::InteriorPtrExpose { .. } => panic!(
+                "OpKind::InteriorPtrExpose reached the JitCode assembler; the rtyper \
+                 must lower _interior_ptr._expose before codewriter emission \
+                 (InteriorPtrRepr)"
+            ),
+            OpKind::StoreThroughPtr { .. } => panic!(
+                "OpKind::StoreThroughPtr reached the JitCode assembler; the rtyper \
+                 must lower this store-through to setinteriorfield \
+                 (InteriorPtrRepr.rtype_setattr)"
+            ),
             // `arraylen_gc(array, arraydescr)` — `len(l.items)` reads the
             // GcArray length header. Operand shape `rd>i`: base reg + descr
             // + int result. The descr is `arraydescrof(ARRAY)` with a
@@ -3975,6 +3985,8 @@ impl AssemblerEncode for Assembler {
                 OpKind::ArrayWrite { .. } => "ArrayWrite",
                 OpKind::InteriorFieldRead { .. } => "InteriorFieldRead",
                 OpKind::InteriorFieldWrite { .. } => "InteriorFieldWrite",
+                OpKind::InteriorPtrExpose { .. } => "InteriorPtrExpose",
+                OpKind::StoreThroughPtr { .. } => "StoreThroughPtr",
                 OpKind::Call { .. } => "Call",
                 OpKind::GuardTrue { .. } => "GuardTrue",
                 OpKind::GuardFalse { .. } => "GuardFalse",
@@ -6983,6 +6995,16 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::InteriorFieldWrite { item_ty, .. } => {
             format!("setinteriorfield_gc_{}", value_type_to_kind(item_ty))
         }
+        OpKind::InteriorPtrExpose { .. } => panic!(
+            "OpKind::InteriorPtrExpose reached the JitCode assembler; the rtyper \
+             must lower _interior_ptr._expose before codewriter emission \
+             (InteriorPtrRepr)"
+        ),
+        OpKind::StoreThroughPtr { .. } => panic!(
+            "OpKind::StoreThroughPtr reached the JitCode assembler; the rtyper \
+             must lower this store-through to setinteriorfield \
+             (InteriorPtrRepr.rtype_setattr)"
+        ),
         OpKind::Call { result_ty, .. } => {
             format!("direct_call_{}", value_type_to_kind(result_ty))
         }
@@ -13050,6 +13072,76 @@ mod tests {
     fn raw_malloc_fixedsize_zero_assembles_the_zero_helper() {
         let (body, asm) = assemble_raw_malloc_roundtrip(true);
         assert_raw_malloc_assembly(&body, &asm, 0x2222_0002, 0x1111_0001);
+    }
+
+    /// A GC pointer leaf of a non-first inlined struct lowers to
+    /// `getfield_gc_r` / `setfield_gc_r` on the outer object
+    /// (`heaptracker.py all_fielddescrs`).
+    #[test]
+    fn assemble_nonfirst_inlined_gc_pointer_leaf_is_getfield_setfield_gc_r() {
+        use crate::flatten::flatten_graph;
+        use crate::jtransform::{GraphTransformConfig, Transformer};
+        use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("nested_gc_ptr");
+        let obj = push_input_var(&mut graph, "obj", ValueType::Ref(None));
+        let val = push_input_var(&mut graph, "val", ValueType::Ref(None));
+        let field = FieldDescriptor::new("nested.ptr", Some("InlineOuter".into()));
+        let read = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: obj.clone(),
+                    field: field.clone(),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .expect("field read has a result");
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldWrite {
+                base: obj.clone(),
+                field,
+                value: LinkArg::Value(val.clone()),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, Some(read.clone()));
+
+        FunctionGraph::set_concretetype_of_inline(
+            &obj,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        FunctionGraph::set_concretetype_of_inline(
+            &val,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        FunctionGraph::set_concretetype_of_inline(
+            &read,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+
+        let config = GraphTransformConfig::default();
+        let mut rewritten = Transformer::new(&config).transform(&graph).graph;
+        crate::codewriter::type_state::promote_gc_field_bases(&mut rewritten, None);
+        regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
+        let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
+        let mut flat = flatten_graph(&rewritten, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+        assert!(
+            asm.insns.keys().any(|k| k.starts_with("getfield_gc_r")),
+            "inlined non-first GC pointer read must assemble as getfield_gc_r, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            asm.insns.keys().any(|k| k.starts_with("setfield_gc_r")),
+            "inlined non-first GC pointer write must assemble as setfield_gc_r, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
     }
 
     /// `promote_gc_field_bases` rehomes a Signed GC FieldRead base so

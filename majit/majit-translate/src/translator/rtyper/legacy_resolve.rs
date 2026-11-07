@@ -860,7 +860,7 @@ fn infer_concrete_from_op(
         // default — if the underlying value is actually Int, the
         // canonical `getfield_gc_i/rd>i` key still carries the
         // correct result kind at assembler emit time.
-        OpKind::FieldRead { ty, .. } => {
+        OpKind::FieldRead { ty, .. } | OpKind::InteriorPtrExpose { ty, .. } => {
             let c = valuetype_to_concrete_for_legacy(ty, raw_alloc_flavor_structs);
             if c == ConcreteType::Unknown {
                 ConcreteType::GcRef

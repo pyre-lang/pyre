@@ -1,3 +1,10 @@
+# pyre-check: jitstats-band=guard_failures=75
+# dynasm guard_failures reads 407 default / 8M, 458 at PYPY_GC_NURSERY=64K on one macOS arm64 binary;
+# CI 482 (dynasm windows). A map transition in the hot loop allocates the new map young; the
+# failing GUARD_VALUE keys its jitcounter on the raw pointer (`compile.py`
+# `ResumeGuardDescr.must_compile` `cast_ptr_to_int(refval)`), so a minor collection inside the
+# failure burst promotes the map and splits the counter. The count follows nursery traffic;
+# loops and bridges stay exact. The width is the 407 -> 482 distance.
 # `get_and_call_function`: a __getattribute__ defined as a classmethod or
 # staticmethod is bound through __get__ before it is called, so it receives the
 # arguments the descriptor protocol gives it -- the class, or nothing at all,

@@ -651,7 +651,7 @@ impl<K, V, S> RDict<K, V, S> {
                 crate::gc_roots::pin_root(cloned.entries as crate::pyobject::PyObjectRef)
                     as *mut GcEntries<K, V>;
         }
-        crate::gc_storage::gc_alloc_young_storage_box(cloned, tid)
+        crate::gc_storage::gc_alloc_young_storage_box(cloned, tid) as *mut Self
     }
 
     /// The `entries` field slot, one GcRef (`d.entries`).

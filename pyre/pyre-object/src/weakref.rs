@@ -116,23 +116,30 @@ pub struct W_Weakref {
 #[repr(C)]
 pub struct W_WeakrefUser {
     pub base: W_Weakref,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(W_WeakrefUser, storage)
-            == std::mem::offset_of!(W_WeakrefUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(W_WeakrefUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
 
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_WEAKREF_USER_MAPDICT_ACCESS for W_WeakrefUser;
+}
+
 /// User-subclass `weakref.ref` typeptr (`typedef.py` `_getusercls`).
 /// Instances share `W_Weakref`'s payload and add mapdict `map` / `storage`.
-pub static WEAKREF_LAYOUT_USER_TYPE: PyType = new_user_pytype(
+pub static WEAKREF_LAYOUT_USER_TYPE: PyType = new_user_pytype_with_access(
     "weakref.ReferenceType",
     &WEAKREF_LAYOUT_TYPE,
     std::mem::offset_of!(W_WeakrefUser, map),
+    &W_WEAKREF_USER_MAPDICT_ACCESS,
 );
 
 /// User-subclass weakref layout (`typedef.py` `_getusercls`). Appended
@@ -190,7 +197,7 @@ pub fn w_weakref_user_new(
             w_callable: crate::gc_roots::shadow_stack_get(base + 1),
             w_hash: crate::gc_roots::shadow_stack_get(base + 2),
         },
-        map: 0,
+        map: std::ptr::null(),
         storage: std::ptr::null_mut(),
     };
     if raw.is_null() {

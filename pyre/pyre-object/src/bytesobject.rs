@@ -13,10 +13,11 @@ use crate::pyobject::*;
 pub static BYTES_TYPE: PyType =
     crate::pyobject::new_pytype_with_user_subclass("bytes", &BYTES_USER_TYPE);
 /// `W_BytesObjectUser` (`typedef.py _getusercls(W_BytesObject)`).
-pub static BYTES_USER_TYPE: PyType = crate::pyobject::new_user_pytype(
+pub static BYTES_USER_TYPE: PyType = crate::pyobject::new_user_pytype_with_access(
     "bytes",
     &BYTES_TYPE,
     std::mem::offset_of!(W_BytesObjectUser, map),
+    &W_BYTES_USER_MAPDICT_ACCESS,
 );
 
 /// GC-managed byte buffer behind a `bytearray` body.
@@ -254,16 +255,22 @@ impl W_BytesObject {
 #[repr(C)]
 pub struct W_BytesObjectUser {
     pub base: W_BytesObject,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(W_BytesObjectUser, storage)
-            == std::mem::offset_of!(W_BytesObjectUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(W_BytesObjectUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
+
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_BYTES_USER_MAPDICT_ACCESS for W_BytesObjectUser;
+}
 
 /// `W_BytesObject.data` — the pointer to the block holding the bytes.
 pub const BYTES_DATA_OFFSET: usize = std::mem::offset_of!(W_BytesObject, data);
@@ -443,7 +450,7 @@ pub fn w_bytes_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> PyObje
             len: bytes.len(),
             ctypes_keepalive_refs: 0,
         },
-        map: 0,
+        map: std::ptr::null(),
         storage: std::ptr::null_mut(),
     };
     let obj = if raw.is_null() {

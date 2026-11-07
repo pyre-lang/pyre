@@ -65,8 +65,10 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::annotator::bookkeeper::Bookkeeper;
-use crate::annotator::description::{AnnSignature, FunctionDesc, copy_or_mint_unique_graph};
-use crate::annotator::model::{SomeInstance, SomeValue};
+use crate::annotator::description::{
+    AnnSignature, DescEntry, FunctionDesc, copy_or_mint_unique_graph,
+};
+use crate::annotator::model::{SomeInstance, SomePBC, SomeValue};
 use crate::annotator::signature::{ParamType, TypeMarker};
 use crate::flowspace::argument::Signature;
 use crate::flowspace::model::{ConstValue, Constant, GraphFunc, HostObject};
@@ -561,6 +563,12 @@ pub struct CallRegistry {
     /// populated, on its first lookup (`bookkeeper.py getdesc`: the
     /// descriptor is created the first time the object is seen).
     getdesc: RefCell<Option<Getdesc>>,
+    /// Harvested struct FnPtr field families (`discover_fnptr_field_families`
+    /// / `CallControl::register_trait_family_path`). Interned onto the
+    /// owning `ClassDef` attr as a function `SomePBC` (`ClassRepr.getclsfield`
+    /// analogue) so `simple_call` of the loaded slot goes through
+    /// `SomePBC.call` / `FunctionDesc.pycall` rather than `SomePtr.call`.
+    fnptr_field_families: RefCell<Vec<(String, String, Vec<CallPath>)>>,
 }
 
 /// [`CallRegistry::set_getdesc`]'s callback: the entry for a path the
@@ -577,6 +585,7 @@ impl CallRegistry {
             two_phase: RefCell::new(TwoPhaseTypeCache::default()),
             session: RefCell::new(None),
             getdesc: RefCell::new(None),
+            fnptr_field_families: RefCell::new(Vec::new()),
         }
     }
 
@@ -866,6 +875,74 @@ impl CallRegistry {
         }
     }
 
+    /// Intern each harvested struct FnPtr field as a function `SomePBC` of
+    /// the family's `FunctionDesc`s (`rclass.py ClassRepr.getclsfield`).
+    ///
+    /// `project_struct_field_type` / FORCE intern a `fn` field as
+    /// `SomePtr(FuncType)`. A call through that slot is
+    /// `simple_call(loaded, *args)` with a `SomeInstance` argument;
+    /// `SomePtr.call` requires `annotation_to_lltype` of every arg and
+    /// rejects an instance. The annotator sees a PBC of the stored
+    /// functions instead (`description.py` call families);
+    /// `FunctionsPBCRepr` / `FunctionReprBase.call` emit `indirect_call`
+    /// with `c_graphs`.
+    pub fn seed_fnptr_field_pbc_attrs(&self, families: &HashMap<(String, String), Vec<CallPath>>) {
+        let guard = self.bookkeeper.struct_fields.borrow();
+        let Some(reg) = guard.as_ref() else {
+            return;
+        };
+        let mut rows: Vec<(String, String, Vec<CallPath>)> = Vec::new();
+        for ((struct_path, field), members) in families {
+            let Some(field_ty) = fnptr_field_type_spelling(reg, struct_path, field) else {
+                continue;
+            };
+            if crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling_in(
+                field_ty,
+                Some(self.bookkeeper.as_ref()),
+            )
+            .is_none()
+            {
+                continue;
+            }
+            if members.is_empty() {
+                continue;
+            }
+            rows.push((struct_path.clone(), field.clone(), members.clone()));
+        }
+        drop(guard);
+        rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        *self.fnptr_field_families.borrow_mut() = rows;
+        self.apply_fnptr_field_pbc_attrs();
+    }
+
+    fn apply_fnptr_field_pbc_attrs(&self) {
+        let rows = self.fnptr_field_families.borrow().clone();
+        for (struct_path, field, members) in rows {
+            let mut descs: Vec<DescEntry> = Vec::new();
+            for path in &members {
+                let key = FunctionPathKey::from(path);
+                let Some(entry) = self.lookup_existing(&key).or_else(|| self.lookup(&key)) else {
+                    continue;
+                };
+                descs.push(DescEntry::function(entry.function_desc.clone()));
+            }
+            if descs.is_empty() {
+                continue;
+            }
+            let host = self.bookkeeper.intern_class_by_qualname(&struct_path);
+            let Ok(cd) = self.bookkeeper.getuniqueclassdef(&host) else {
+                continue;
+            };
+            let pbc = SomeValue::PBC(SomePBC::new(descs, false));
+            let mut classdef = cd.borrow_mut();
+            let attr = classdef
+                .attrs
+                .entry(field.clone())
+                .or_insert_with(|| crate::annotator::classdesc::Attribute::new(field.clone()));
+            attr.s_value = pbc;
+        }
+    }
+
     /// Get-or-construct the shared `(annotator, rtyper)` pair.
     ///
     /// First call constructs both from `self.bookkeeper`; subsequent
@@ -977,6 +1054,13 @@ impl CallRegistry {
         // Skip-classify at its `ClassesPBCRepr` instantiation.
         self.bookkeeper.pre_register_enum_variant_classes();
         crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&annotator);
+        // After every struct-root `ClassDef` is interned, overwrite harvested
+        // FnPtr field attrs with the family `SomePBC`. `project_struct_rows`
+        // shells those slots as `SomePtr(FuncType)`; `SomePtr.call` rejects
+        // `SomeInstance` arguments. `ClassRepr.getclsfield` reads a function
+        // PBC; `FunctionReprBase.call` then emits `indirect_call` with the
+        // family's graphs.
+        self.apply_fnptr_field_pbc_attrs();
         translator.set_rtyper(rtyper.clone());
         *self.session.borrow_mut() = Some((annotator.clone(), rtyper.clone()));
         Ok((annotator, rtyper))
@@ -1648,6 +1732,25 @@ fn residual_inst_template_segments(segments: &[String]) -> Option<Vec<String>> {
 /// query path's shape disagrees.
 fn starts_with_uppercase(s: &str) -> bool {
     s.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+}
+
+/// Layout spelling of a named field when `owner` is a struct-field-registry
+/// root. Used to keep dyn-trait family keys off the FnPtr-field PBC intern
+/// (`IndirectFamilyKey::DynTrait` shares `trait_method_impls`).
+fn fnptr_field_type_spelling<'a>(
+    reg: &'a crate::front::StructFieldRegistry,
+    owner: &str,
+    field: &str,
+) -> Option<&'a str> {
+    let canonical = majit_ir::descr::canonical_struct_name(owner);
+    for key in [owner, canonical.as_str()] {
+        if let Some(rows) = reg.fields.get(key)
+            && let Some(row) = rows.iter().find(|row| row.name == field)
+        {
+            return Some(row.ty.as_str());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -2847,6 +2950,70 @@ mod tests {
         assert!(leaf.class_get("right").is_none());
         assert_ne!(a, leaf);
         assert_ne!(b, leaf);
+    }
+
+    /// A harvested struct FnPtr field intern is the family's function
+    /// `SomePBC` (`ClassRepr.getclsfield`), not `SomePtr(FuncType)`.
+    #[test]
+    fn seed_fnptr_field_pbc_attrs_interns_family_as_somepbc() {
+        use crate::annotator::model::DescKind;
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "mapdict::MapdictMixinAccess".to_string(),
+            vec![crate::front::semantic::FieldRow::named(
+                "getclass",
+                "fn(*mut pyobject::PyObject) -> *mut pyobject::PyObject",
+            )],
+        );
+        let registry = CallRegistry::new(bk);
+        registry.set_struct_fields(Rc::new(fields));
+        registry.get_or_register(
+            FunctionPathKey::from_segments(["mapdict", "base_user_class_mapdict_getclass"]),
+            signature(&["obj"]),
+        );
+        registry.get_or_register(
+            FunctionPathKey::from_segments([
+                "objectobject",
+                "W_OBJECT_OBJECT_MAPDICT_ACCESS",
+                "getclass",
+            ]),
+            signature(&["obj"]),
+        );
+        let mut families = std::collections::HashMap::new();
+        families.insert(
+            (
+                "mapdict::MapdictMixinAccess".to_string(),
+                "getclass".to_string(),
+            ),
+            vec![
+                CallPath::from_segments(["mapdict", "base_user_class_mapdict_getclass"]),
+                CallPath::from_segments([
+                    "objectobject",
+                    "W_OBJECT_OBJECT_MAPDICT_ACCESS",
+                    "getclass",
+                ]),
+            ],
+        );
+        registry.seed_fnptr_field_pbc_attrs(&families);
+        let host = registry
+            .bookkeeper()
+            .intern_class_by_qualname("mapdict::MapdictMixinAccess");
+        let cd = registry
+            .bookkeeper()
+            .getuniqueclassdef(&host)
+            .expect("MapdictMixinAccess classdef");
+        let s_value = crate::annotator::classdesc::ClassDef::s_getattr(
+            &cd,
+            "getclass",
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("getattr of harvested FnPtr field");
+        let SomeValue::PBC(pbc) = s_value else {
+            panic!("harvested FnPtr field getattr must be SomePBC, got {s_value:?}");
+        };
+        assert_eq!(pbc.descriptions.len(), 2);
+        assert_eq!(pbc.get_kind().unwrap(), DescKind::Function);
     }
 
     fn cloned_attr(

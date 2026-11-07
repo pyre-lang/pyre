@@ -728,7 +728,8 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCRE
         );
         let _ = crate::gc_roots::pin_root(name as PyObjectRef);
         let qualname =
-            crate::gc_storage::gc_alloc_young_storage_box(name_value, name_storage_gc_type_id());
+            crate::gc_storage::gc_alloc_young_storage_box(name_value, name_storage_gc_type_id())
+                as *mut String;
         let name = crate::gc_roots::shadow_stack_get(save_point + 2) as *mut String;
         (name, qualname)
     };
@@ -1591,6 +1592,13 @@ pub unsafe fn w_type_get_terminator(obj: PyObjectRef) -> MapRef {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_terminator(obj: PyObjectRef, terminator: MapRef) {
+    let _roots = crate::gc_roots::push_roots();
+    let base = crate::gc_roots::pin_roots(&[obj, terminator as PyObjectRef]);
+    crate::gc_hook::try_gc_write_barrier(
+        crate::gc_roots::shadow_stack_get(base) as crate::gc_hook::GCREF
+    );
+    let obj = crate::gc_roots::shadow_stack_get(base);
+    let terminator = crate::gc_roots::shadow_stack_get(base + 1) as MapRef;
     (*(obj as *mut W_TypeObject)).terminator = terminator;
 }
 

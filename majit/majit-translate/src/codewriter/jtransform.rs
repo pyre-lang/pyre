@@ -4084,8 +4084,8 @@ impl<'a> Transformer<'a> {
     /// `TYPE.TO._gckind`). `history.getkind` of a raw `Ptr` is `'int'`.
     /// Harvested `_alloc_flavor_ = raw` is the classdesc fact for the
     /// owner; it is the fallback when no `concretetype` cell is present
-    /// and also when the owner itself is raw (`MapNode::Terminator`
-    /// inherits `MapNode`).
+    /// and also when the owner itself is raw (an enum variant owner
+    /// `X::Variant` inherits `X`, `ClassDesc.get_param`).
     fn malloc_result_is_raw_flavored(
         &self,
         result: Option<&crate::flowspace::model::Variable>,
@@ -5096,6 +5096,15 @@ impl<'a> Transformer<'a> {
                 operand,
                 ..
             } if is_same_as_identity_unary(unop_name) => RewriteResult::Identity(operand.clone()),
+            OpKind::InteriorPtrExpose { .. } => panic!(
+                "OpKind::InteriorPtrExpose reached jtransform; the rtyper must lower \
+                 _interior_ptr._expose before codewriter emission (InteriorPtrRepr)"
+            ),
+            OpKind::StoreThroughPtr { .. } => panic!(
+                "OpKind::StoreThroughPtr reached jtransform; the rtyper must lower \
+                 this store-through to setinteriorfield \
+                 (InteriorPtrRepr.rtype_store_through_ptr)"
+            ),
             // `jtransform.py rewrite_op_force_cast`: same-size raw ptr/int
             // is `_int_to_int_cast` returning None (identity).
             OpKind::UnaryOp {
@@ -9203,8 +9212,10 @@ impl<'a> Transformer<'a> {
         // off the *base register* (`is_gc = kc == 'r'`), not the owner's
         // recorded gckind. When that base is already Int, stamp the loaded
         // word into the int bank so assemble emits `getfield_raw_i`.
-        // Immutable fields already returned `_pure` above
-        // (`MapNodeTerminatorView.w_cls`).
+        // A declared-GC owner keeps the result `'r'` so
+        // `promote_gc_field_bases` can lift the Int base (`history.getkind`
+        // of `Ptr(TO)` follows `TO._gckind`). Immutable fields already
+        // returned `_pure` above (a raw overlay GCREF).
         if let OpKind::FieldRead { base, pure, .. } = &op.kind
             && !*pure
             && self.get_value_kind_var(base) == 'i'
@@ -9212,6 +9223,7 @@ impl<'a> Transformer<'a> {
                 .result
                 .as_ref()
                 .is_some_and(|r| self.get_value_kind_var(r) == 'r')
+            && !crate::codewriter::type_state::field_owner_is_gc(field, self.callcontrol.as_deref())
         {
             self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
             return RewriteResult::Replace(vec![SpaceOperation {
@@ -16608,6 +16620,15 @@ fn remap_op_renamings(
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
         },
+        OpKind::InteriorPtrExpose { base, field, ty } => OpKind::InteriorPtrExpose {
+            base: remap_value(base, aliases),
+            field: field.clone(),
+            ty: ty.clone(),
+        },
+        OpKind::StoreThroughPtr { ptr, value } => OpKind::StoreThroughPtr {
+            ptr: remap_value(ptr, aliases),
+            value: remap_value(value, aliases),
+        },
         OpKind::Call {
             target,
             args,
@@ -18919,6 +18940,159 @@ mod tests {
         assert_eq!(
             w_class_base, &frame,
             "w_class is read off the outer object; ops={ops:?}"
+        );
+    }
+
+    /// GC struct whose first field is another GC struct
+    /// (`GcStruct._first_struct`). Downcast (`cast_pointer`) is Identity;
+    /// a subsequent field read is `getfield_gc_*` on the same object.
+    /// `jtransform.py rewrite_op_getsubstruct` refuses a GC interior.
+    #[test]
+    fn gc_first_struct_downcast_field_read_is_same_object() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let child = "gc_first_struct::Terminator";
+        let parent = "gc_first_struct::AbstractAttribute";
+        let child_id = majit_ir::descr::StructId::from_canonical(child);
+        let parent_id = majit_ir::descr::StructId::from_canonical(parent);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (child.to_string(), Some(child_id)),
+                (parent.to_string(), Some(parent_id)),
+            ]));
+        let word = crate::layout::target_word_size();
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            child_id,
+            StructLayout {
+                size: 4 * word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "base".into(),
+                        offset: 0,
+                        size: 3 * word,
+                        flag: majit_ir::descr::ArrayFlag::Struct,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "w_cls".into(),
+                        offset: 3 * word,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Pointer,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_layout(
+            parent_id,
+            StructLayout {
+                size: 3 * word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "class".into(),
+                        offset: 0,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "terminator".into(),
+                        offset: word,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Pointer,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "cache_attrs".into(),
+                        offset: 2 * word,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let mut graph = FunctionGraph::new("downcast_then_w_cls");
+        let map = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "map".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(graph.startblock, map.clone());
+        let downcast = graph
+            .push_op_var(
+                graph.startblock,
+                crate::model::cast_pointer_call(child, map.clone()),
+                true,
+            )
+            .unwrap();
+        graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: downcast,
+                    field: FieldDescriptor::new("w_cls", Some(child.into())),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+
+        let config = GraphTransformConfig::default();
+        let out = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops: Vec<_> = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::BinOp { op, .. } if op == "add"
+            )),
+            "downcast + field read must not emit an interior int_add; ops={ops:?}"
+        );
+        let w_cls = ops.iter().find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "w_cls"
+            )
+        });
+        let w_cls_base = match &w_cls.expect("w_cls getfield").kind {
+            OpKind::FieldRead { base, .. } => base,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            w_cls_base, &map,
+            "w_cls is read off the same object as the downcast; ops={ops:?}"
         );
     }
 
@@ -32309,8 +32483,8 @@ mod tests {
             LowLevelType, Ptr, PtrTarget, Struct,
         };
 
-        let owner = "jtransform_raw_ctor::MapNode::Terminator";
-        let result_base = "jtransform_raw_ctor::MapNode";
+        let owner = "jtransform_raw_ctor::Kind::Circle";
+        let result_base = "jtransform_raw_ctor::Kind";
         let owner_id = majit_ir::descr::StructId::from_canonical(owner);
         let _registry =
             crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
@@ -32319,7 +32493,7 @@ mod tests {
 
         let mut cc = crate::call::CallControl::new();
         let mut by_discr = std::collections::HashMap::new();
-        by_discr.insert(0, "Terminator".to_string());
+        by_discr.insert(0, "Circle".to_string());
         let mut map = std::collections::HashMap::new();
         map.insert(result_base.to_string(), by_discr);
         cc.set_enum_variant_by_discriminant(map);
@@ -32341,8 +32515,8 @@ mod tests {
             TO: PtrTarget::Struct(Struct::new(owner, vec![])),
         }))));
         let target = CallTarget::synthetic_transparent_enum_variant_ctor(
-            vec!["jtransform_raw_ctor".to_string(), "MapNode".to_string()],
-            "Terminator",
+            vec!["jtransform_raw_ctor".to_string(), "Kind".to_string()],
+            "Circle",
             0,
         );
         let result_ty = ValueType::Ref(Some(owner.to_string()));
@@ -37736,7 +37910,10 @@ mod tests {
                 funcptr,
                 args,
                 graphs: Some(family),
-                family_key: Some(("MapByName".into(), "call".into())),
+                family_key: Some(crate::model::IndirectFamilyKey::dyn_trait(
+                    "MapByName",
+                    "call",
+                )),
                 result_ty: ValueType::Void,
             },
         });

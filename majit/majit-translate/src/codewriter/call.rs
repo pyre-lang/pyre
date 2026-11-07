@@ -24,8 +24,8 @@ use crate::flowspace::argument::Signature;
 use crate::flowspace::model::ConstValue;
 use crate::jitcode::{BhCallDescr, CallResultErasedKey};
 use crate::model::{
-    CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FlagReturn, FunctionGraph, InstanceFlags,
-    LinkArg, OpKind, SpaceOperation, secondary_entry_roots,
+    CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FlagReturn, FunctionGraph,
+    IndirectFamilyKey, InstanceFlags, LinkArg, OpKind, SpaceOperation, secondary_entry_roots,
 };
 use crate::parse::{CallPath, GraphSpecialization};
 use crate::policy::JitPolicy;
@@ -4957,6 +4957,12 @@ impl CallControl {
         &self.trait_family_registrations
     }
 
+    /// `(trait_root, method_name) → impl CallPath` rows, including harvested
+    /// struct FnPtr field families (`register_trait_family_path`).
+    pub fn indirect_family_impls(&self) -> &HashMap<(String, String), Vec<CallPath>> {
+        &self.trait_method_impls
+    }
+
     /// RPython: isinstance(TYPE, lltype.Struct) check.
     pub fn is_known_struct(&self, name: &str) -> bool {
         is_known_by_value_struct(&self.known_struct_names, name)
@@ -5968,6 +5974,13 @@ impl CallControl {
             .take_while(|(inner, _, _)| inner == &owner_canon)
             .filter(|(_, outer, fname)| {
                 crate::front::mir::is_flattened_storage_leaf(outer, fname, path)
+                    || self
+                        .layout_field_offset(
+                            majit_ir::descr::struct_id_for_name(outer),
+                            outer,
+                            fname,
+                        )
+                        .is_some_and(|offset| offset != 0)
             })
             .map(|(_, outer, fname)| (outer.clone(), format!("{fname}.{path}")))
             .collect()
@@ -6436,15 +6449,14 @@ impl CallControl {
             function_graphs,
             ..
         } = self;
-        let fillable = |graphs: &Option<Vec<CallPath>>, family_key: &Option<(String, String)>| {
+        let fillable = |graphs: &Option<Vec<CallPath>>, family_key: &Option<IndirectFamilyKey>| {
             graphs.as_deref().is_some_and(<[_]>::is_empty)
-                && family_key
-                    .as_ref()
-                    .is_some_and(|(trait_root, method_name)| {
-                        trait_method_impls
-                            .get(&(trait_root.clone(), method_name.clone()))
-                            .is_some_and(|impls| !impls.is_empty())
-                    })
+                && family_key.as_ref().is_some_and(|key| {
+                    let (trait_root, method_name) = key.as_pair();
+                    trait_method_impls
+                        .get(&(trait_root.to_string(), method_name.to_string()))
+                        .is_some_and(|impls| !impls.is_empty())
+                })
         };
         // Look before writing: the stored graph can be shared with its
         // other aliases and with the pending lift. A graph not built yet
@@ -6474,11 +6486,12 @@ impl CallControl {
                 if !graphs.as_deref().is_some_and(<[_]>::is_empty) {
                     continue;
                 }
-                let Some((trait_root, method_name)) = family_key.as_ref() else {
+                let Some(key) = family_key.as_ref() else {
                     continue;
                 };
+                let (trait_root, method_name) = key.as_pair();
                 let family = trait_method_impls
-                    .get(&(trait_root.clone(), method_name.clone()))
+                    .get(&(trait_root.to_string(), method_name.to_string()))
                     .cloned()
                     .unwrap_or_default();
                 if !family.is_empty() {
@@ -9335,19 +9348,21 @@ fn materialize_indirect_families(graph: &mut FunctionGraph, trait_method_impls: 
             continue;
         };
         // Read the key without clearing it. The two-phase prepass runs
-        // after this fill on the same shared store, and its flowspace
-        // adapter needs the same `(trait_root, method_name)` to emit
-        // the pre-rtyper `getattr` + `simple_call` shape — an
-        // `indirect_call` op does not exist before rtyping. The later
+        // after this fill on the same shared store. A DynTrait key still
+        // needs `(trait_root, method_name)` so the adapter can emit the
+        // pre-rtyper `getattr` + `simple_call` shape; a FnPtrField key
+        // stays so `rpbc::lower_indirect_calls` can fill `c_graphs`.
+        // `indirect_call` does not exist before rtyping. The later
         // `rpbc::lower_indirect_calls` re-enters its own `take()` arm
         // and recomputes `graphs` through `all_impls_for_indirect`,
         // which is this same lookup over the same map, so the value it
         // writes is unchanged.
-        let Some((trait_root, method_name)) = family_key.clone() else {
+        let Some(key) = family_key.as_ref() else {
             continue;
         };
+        let (trait_root, method_name) = key.as_pair();
         let family = trait_method_impls
-            .get(&(trait_root.clone(), method_name.clone()))
+            .get(&(trait_root.to_string(), method_name.to_string()))
             .cloned()
             .unwrap_or_default();
         *graphs = (!family.is_empty()).then_some(family);
@@ -12991,6 +13006,13 @@ impl CallControl {
                 rows.iter()
                     .filter(|row| {
                         crate::front::mir::is_flattened_storage_leaf(owner, &field.name, &row.name)
+                            || self
+                                .layout_field_offset(
+                                    majit_ir::descr::struct_id_for_name(owner),
+                                    owner,
+                                    &field.name,
+                                )
+                                .is_some_and(|offset| offset != 0)
                     })
                     .map(|row| (owner.to_string(), format!("{}.{}", field.name, row.name))),
             );
@@ -14729,7 +14751,10 @@ fn op_can_raise(op: &OpKind, cc: &CallControl) -> RaiseClass {
     //   anything else truthy -> Yes
     match op {
         // RPython LL: getfield_gc, setfield_gc → cannot raise
-        OpKind::FieldRead { .. } | OpKind::FieldWrite { .. } => RaiseClass::No,
+        OpKind::FieldRead { .. }
+        | OpKind::FieldWrite { .. }
+        | OpKind::InteriorPtrExpose { .. }
+        | OpKind::StoreThroughPtr { .. } => RaiseClass::No,
         // `malloc` / `malloc_varsize` can only raise MemoryError; with
         // `ignore_memoryerror` it is treated as non-raising
         // (canraise = (MemoryError,)).  `new_array_clear` is the cleared
@@ -25582,7 +25607,7 @@ mod tests {
                     funcptr,
                     args: Vec::new(),
                     graphs: None,
-                    family_key: Some(("Handler".to_string(), "run".to_string())),
+                    family_key: Some(IndirectFamilyKey::dyn_trait("Handler", "run")),
                     result_ty: ValueType::Void,
                 },
             });
@@ -25602,7 +25627,7 @@ mod tests {
             panic!("caller operation must remain an indirect call");
         };
         assert_eq!(
-            family_key.as_ref().map(|(t, m)| (t.as_str(), m.as_str())),
+            family_key.as_ref().map(|k| k.as_pair()),
             Some(("Handler", "run")),
             "the vtable-slot identity must outlive graph discovery"
         );
@@ -25648,7 +25673,7 @@ mod tests {
                     funcptr,
                     args: Vec::new(),
                     graphs: None,
-                    family_key: Some(("Handler".to_string(), "run".to_string())),
+                    family_key: Some(IndirectFamilyKey::dyn_trait("Handler", "run")),
                     result_ty: ValueType::Void,
                 },
             });
@@ -26170,7 +26195,7 @@ mod tests {
                     funcptr,
                     args: Vec::new(),
                     graphs: Some(Vec::new()),
-                    family_key: Some(("Handler".to_string(), "run".to_string())),
+                    family_key: Some(IndirectFamilyKey::dyn_trait("Handler", "run")),
                     result_ty: ValueType::Void,
                 },
             });
@@ -26527,6 +26552,68 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A GC pointer leaf of a non-first inlined struct is
+    /// `getfield_gc_r` / `setfield_gc_r` on the outer object at the
+    /// summed offset (`heaptracker.py all_fielddescrs`;
+    /// `lltype.Struct._note_inlined_into`).
+    #[test]
+    fn fielddescrof_flattens_nonfirst_inlined_gc_pointer_leaf() {
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "InlineInner".to_string(),
+            vec![("ptr".to_string(), "GCREF".to_string())],
+        );
+        fields.fields.insert(
+            "InlineOuter".to_string(),
+            vec![
+                ("first".to_string(), "i64".to_string()),
+                ("nested".to_string(), "InlineInner".to_string()),
+            ],
+        );
+        cc.set_struct_fields(fields);
+        cc.set_known_struct_names(["InlineInner".to_string()].into_iter().collect());
+        let (descr, member) = cc
+            .fielddescrof_keyed(0, "InlineOuter", None, "nested.ptr")
+            .expect("dotted GC-pointer leaf of a non-first inlined struct resolves");
+        let fd = descr.as_field_descr().expect("field descr");
+        assert_eq!(fd.offset(), 8, "first (8) + nested.ptr (0)");
+        assert_eq!(fd.field_size(), 8);
+        assert_eq!(fd.field_type(), majit_ir::value::Type::Ref);
+        match member {
+            majit_ir::effectinfo::DescrSetMember::Field { field_name, .. } => {
+                assert_eq!(field_name, "nested.ptr");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A pointer field to a struct is `rewrite_op_getfield`, not an
+    /// inlined substructure (`lltype.Struct._note_inlined_into`).
+    #[test]
+    fn fielddescrof_pointer_field_leaf_is_not_flattened_on_outer() {
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "InlineInner".to_string(),
+            vec![("ptr".to_string(), "GCREF".to_string())],
+        );
+        fields.fields.insert(
+            "PointerOuter".to_string(),
+            vec![
+                ("first".to_string(), "i64".to_string()),
+                ("nested".to_string(), "&InlineInner".to_string()),
+            ],
+        );
+        cc.set_struct_fields(fields);
+        cc.set_known_struct_names(["InlineInner".to_string()].into_iter().collect());
+        assert!(
+            cc.fielddescrof_keyed(0, "PointerOuter", None, "nested.ptr")
+                .is_none(),
+            "pointer field leaf must not flatten onto the outer object"
+        );
     }
 
     /// The embedded object header contributes no slot, the way recursing
@@ -28040,7 +28127,7 @@ mod tests {
                 funcptr: crate::flowspace::model::Variable::named("fnptr"),
                 args: Vec::new(),
                 graphs: None,
-                family_key: Some(("Trait".to_string(), "m".to_string())),
+                family_key: Some(IndirectFamilyKey::dyn_trait("Trait", "m")),
                 result_ty: ValueType::Void,
             },
             false,

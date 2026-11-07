@@ -236,6 +236,8 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "get_raw_address_of_string",
         builtin_get_raw_address_of_string,
     );
+    analyzer_for(&mut reg, "charp2str", builtin_charp2str);
+    analyzer_for(&mut reg, "charpsize2str", builtin_charpsize2str);
     analyzer_for(
         &mut reg,
         "nonmoving_raw_ptr_for_resizable_list",
@@ -964,6 +966,41 @@ pub fn builtin_unichr_as_utf8(
     }
     let _s_int = arg_at(args_s, 0, "builtin_unichr_as_utf8");
     crate::rlib::rutf8::out_of_range_classdef(bk)?;
+    Ok(SomeValue::String(SomeString::new(false, false)))
+}
+
+/// Translator-synthesised `rffi.charp2str(cp)`: `SomeString` with
+/// `no_nul` (`assert_str0`). The front spells a NUL-terminated CCHARP
+/// used as `&str` as `__majit_charp2str(cp)`.
+pub fn builtin_charp2str(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if args_s.len() != 1 {
+        return Err(AnnotatorError::new(
+            "charp2str() takes exactly one argument",
+        ));
+    }
+    let _s_ptr = arg_at(args_s, 0, "builtin_charp2str");
+    Ok(crate::annotator::model::s_str0())
+}
+
+/// Translator-synthesised `rffi.charpsize2str(cp, size)`: `SomeString`
+/// that may contain NULs. The front spells a window `{data, len}` used
+/// as `&str` as `__majit_charpsize2str(cp, size)`.
+pub fn builtin_charpsize2str(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if args_s.len() != 2 {
+        return Err(AnnotatorError::new(
+            "charpsize2str() takes exactly two arguments",
+        ));
+    }
+    let _s_ptr = arg_at(args_s, 0, "builtin_charpsize2str");
+    let _s_size = arg_at(args_s, 1, "builtin_charpsize2str");
     Ok(SomeValue::String(SomeString::new(false, false)))
 }
 
@@ -6533,6 +6570,48 @@ mod tests {
             panic!("CCHARP is a pointer");
         };
         assert_eq!(result, SomeValue::Ptr(SomePtr::new(*ptr_ty)));
+    }
+
+    #[test]
+    fn builtin_charp2str_returns_str0() {
+        use crate::annotator::model::{SomePtr, s_str0};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+
+        let bk = bk();
+        let LowLevelType::Ptr(ptr_ty) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        let s_ptr = SomeValue::Ptr(SomePtr::new(*ptr_ty));
+        let result = builtin_charp2str(&bk, &[Some(s_ptr)], &no_kwds()).unwrap();
+        assert_eq!(
+            result,
+            s_str0(),
+            "charp2str annotates assert_str0 SomeString"
+        );
+    }
+
+    #[test]
+    fn builtin_charpsize2str_returns_somestring() {
+        use crate::annotator::model::{SomeInteger, SomePtr, SomeString};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+
+        let bk = bk();
+        let LowLevelType::Ptr(ptr_ty) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        let s_ptr = SomeValue::Ptr(SomePtr::new(*ptr_ty));
+        let s_size = SomeValue::Integer(SomeInteger::new(false, false));
+        let result = builtin_charpsize2str(&bk, &[Some(s_ptr), Some(s_size)], &no_kwds()).unwrap();
+        assert!(
+            matches!(result, SomeValue::String(SomeString { .. })),
+            "charpsize2str annotates SomeString, got {result:?}"
+        );
+        let SomeValue::String(s) = result else {
+            unreachable!();
+        };
+        assert!(!s.inner.no_nul, "charpsize2str may contain NULs");
     }
 
     #[test]

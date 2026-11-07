@@ -13,7 +13,7 @@ use common::{
 };
 use majit_charon_reader::Llbc;
 use majit_translate::HostStaticAddrs;
-use majit_translate::model::{CallTarget, FunctionGraph, OpKind, VecFieldPart};
+use majit_translate::model::{CallTarget, FunctionGraph, OpKind, VecFieldPart, cast_instance_root};
 
 fn object_llbc() -> Option<&'static Llbc> {
     load_llbc_if_present(OBJECT_LLBC)
@@ -199,6 +199,71 @@ fn gc_alloc_young_storage_box_gets_one_residual_per_storage_shape() {
             }
         }
     }
+    if let Ok(dir) = std::env::var("DUMP_EMPTY_STORAGE") {
+        let _ = std::fs::create_dir_all(&dir);
+        for function in &program.functions {
+            if function.graph().name.rsplit("::").next() != Some("get_empty_storage") {
+                continue;
+            }
+            let graph = function.graph();
+            let mut dump = graph.dump();
+            dump.push_str(&format!(
+                "\n=== header return_type={:?} return_class_root={:?} returnblock={:?} ===\n",
+                graph.return_type, graph.return_class_root, graph.returnblock
+            ));
+            dump.push_str("=== exits ===\n");
+            for block in &graph.blocks {
+                for (i, link) in block.exits.iter().enumerate() {
+                    dump.push_str(&format!(
+                        "  Block {} exit[{i}] -> {} args={:?} case={:?}\n",
+                        block.id.0, link.target.0, link.args, link.exitcase
+                    ));
+                }
+            }
+            dump.push_str("\n=== iter_variables ===\n");
+            for (pos, var) in graph.iter_variables().iter().enumerate() {
+                dump.push_str(&format!(
+                    "v{pos}: name={:?} id={} renamed={}\n",
+                    graph.value_name_for(var),
+                    var.id(),
+                    var.renamed()
+                ));
+            }
+            let leaf = graph.name.replace([':', '<', '>', ' '], "_");
+            let path = std::path::Path::new(&dir).join(format!("{leaf}.dump"));
+            std::fs::write(&path, dump).expect("write get_empty_storage dump");
+        }
+    }
+    let mut gcref_recasts = 0usize;
+    let mut gcrefopaque_roots = std::collections::BTreeSet::new();
+    for function in &program.functions {
+        if function.graph().name.rsplit("::").next() != Some("get_empty_storage") {
+            continue;
+        }
+        for op in function
+            .graph()
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+        {
+            let Some(root) = cast_instance_root(&op.kind) else {
+                continue;
+            };
+            if root == "GCREF" {
+                gcref_recasts += 1;
+            } else if root.contains("GCREFOpaque") {
+                gcrefopaque_roots.insert(root.to_string());
+            }
+        }
+    }
+    assert!(
+        gcrefopaque_roots.is_empty(),
+        "get_empty_storage dest GCREF recast must not intern GCREFOpaque, got {gcrefopaque_roots:?}"
+    );
+    assert!(
+        gcref_recasts >= 1,
+        "get_empty_storage dest GCREF recast must keep the GCREF spelling, got {gcref_recasts}"
+    );
     assert_eq!(
         unspecialized, 0,
         "get_empty_storage must not call the unspecialized residual; inst leaves={inst_leaves:?}"
@@ -210,9 +275,9 @@ fn gc_alloc_young_storage_box_gets_one_residual_per_storage_shape() {
 }
 
 /// `specialize.py` `specialize_argtype`: each `__inst_` copy of
-/// `gc_alloc_young_storage_box` (`dont_look_inside`, `*mut T`) carries
-/// the residual token of the substituted output. The generic template
-/// stays `None`.
+/// `gc_alloc_young_storage_box` (`dont_look_inside`, `llmemory.GCREF`)
+/// is a distinct residual. The return stays `SomePtr`; the generic
+/// template stays `None`.
 #[test]
 fn gc_alloc_young_storage_box_inst_gets_substituted_return_token() {
     let Some(llbc) = object_llbc() else {
@@ -254,16 +319,16 @@ fn gc_alloc_young_storage_box_inst_gets_substituted_return_token() {
     ));
     assert_eq!(
         inst_rdict.return_type.as_deref(),
-        Some("ref"),
-        "substituted *mut RDict is ref; names={names:?}"
+        Some("gcref"),
+        "substituted GCREF residual; names={names:?}"
     );
     let root = inst_rdict
         .return_class_root
         .as_deref()
         .or(inst_rdict.graph().return_class_root.as_deref());
     assert!(
-        root.is_some_and(|root| root.contains("RDict")),
-        "RDict class root, got {root:?}; names={names:?}"
+        root.is_none(),
+        "llmemory.GCREF has no class root, got {root:?}; names={names:?}"
     );
 }
 

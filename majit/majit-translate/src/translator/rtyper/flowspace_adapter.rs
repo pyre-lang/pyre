@@ -2135,6 +2135,29 @@ fn dyn_trait_dispatch_ops(
     Ok(ops)
 }
 
+/// Pre-rtyper spelling of a call through a loaded function pointer:
+/// `simple_call(funcptr, *args)`. A harvested struct FnPtr field
+/// (`IndirectFamilyKey::FnPtrField`) annotates the loaded value as the
+/// family's function `SomePBC` (`ClassRepr.getclsfield`); `SomePBC.call`
+/// / `FunctionReprBase.call` emit `indirect_call` with the family graphs.
+/// A stored pointer with no family (`family_key: None`) stays
+/// `SomePtr.call` / `PtrRepr.rtype_simple_call`.
+fn stored_fnptr_simple_call(
+    funcptr: &crate::flowspace::model::Variable,
+    args: &[crate::flowspace::model::Variable],
+    op: &SpaceOperation,
+    value_map: &HashMap<Variable, Hlvalue>,
+) -> Result<Vec<FlowspaceOp>, TyperError> {
+    let funcptr_hl = lookup_operand(value_map, funcptr, op, "funcptr")?;
+    let mut call_args = Vec::with_capacity(args.len() + 1);
+    call_args.push(funcptr_hl);
+    for (i, v) in args.iter().enumerate() {
+        call_args.push(lookup_operand(value_map, v, op, &format!("args[{i}]"))?);
+    }
+    let result = resolve_result_hlvalue(op, value_map)?;
+    Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
+}
+
 /// `rlib/jit.py` `hint` ExtRegistryEntry analyser name for a kwarg kind
 /// that mutates `SomeInstance.flags`. Promote kinds are annotation
 /// identities and return `None`.
@@ -2459,6 +2482,10 @@ fn function_path_builtin_shim(segments: &[String]) -> Option<&'static str> {
         Some("unichr_as_utf8")
     } else if leaf == shims::GET_RAW_ADDRESS_OF_STRING {
         Some("get_raw_address_of_string")
+    } else if leaf == shims::CHARP2STR {
+        Some("charp2str")
+    } else if leaf == shims::CHARPSIZE2STR {
+        Some("charpsize2str")
     } else if leaf == shims::NONMOVING_RAW_PTR_FOR_RESIZABLE_LIST {
         Some("nonmoving_raw_ptr_for_resizable_list")
     } else {
@@ -2927,7 +2954,26 @@ fn emit_function_path_high_level_op(
                 FlowspaceOp::new("simple_call", vec![bound_method], result),
             ])
         }
-        FunctionPathHighLevel::VecCtor => Ok(vec![FlowspaceOp::new("newlist", vec![], result)]),
+        FunctionPathHighLevel::VecCtor => {
+            // One-word `Vec::new` is the RustVec header (`emit_vec_new`
+            // already rewrites to `ll_vec_newemptylist_*`). A residual
+            // `vec::Vec::new` whose result is that stamped header must
+            // annotate as `SomeRustVec`: kwargs storage is a Tuple of
+            // those headers, and `List ∪ RustVec` has no union arm
+            // (`llannotation.py`).
+            if let Some(header) = op.result.as_ref().and_then(|var| var.concretetype())
+                && let Some(kind) = crate::translator::rtyper::rrustvec::rust_vec_item_kind(&header)
+            {
+                return rust_vec_helper_ops(
+                    majit_ir::rvec::VecOp::NewEmpty,
+                    kind,
+                    arg_hls,
+                    result,
+                    op.result.as_ref(),
+                );
+            }
+            Ok(vec![FlowspaceOp::new("newlist", vec![], result)])
+        }
         FunctionPathHighLevel::NewlistHint => {
             if arg_hls.len() != 1 {
                 return Err(TyperError::message(format!(
@@ -3788,6 +3834,35 @@ pub fn translate_op(
                 ),
             ])
         }
+        // `_interior_ptr._expose` applied to a field address.
+        // Rust takes the address of a GCREF/primitive field; offsets
+        // carry Field(name) and TO is the field type. Distinct from
+        // getattr-as-load (`FieldRead` → `getattr`).
+        OpKind::InteriorPtrExpose { base, field, .. } => {
+            let base_hl = lookup_operand(value_map, base, op, "base")?;
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new(
+                "interior_ptr_expose",
+                vec![
+                    base_hl,
+                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name))),
+                ],
+                result,
+            )])
+        }
+        // setattr-shaped store through a pointer: operands ptr + value,
+        // no field name. Annotator/rtyper form is leaf-TO
+        // `SomeInteriorPtr` / `InteriorPtrRepr` `setinteriorfield`.
+        OpKind::StoreThroughPtr { ptr, value } => {
+            let ptr_hl = lookup_operand(value_map, ptr, op, "ptr")?;
+            let value_hl = lookup_operand(value_map, value, op, "value")?;
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new(
+                "store_through_ptr",
+                vec![ptr_hl, value_hl],
+                result,
+            )])
+        }
 
         // ─── Call port (CallTarget per variant) ───
         // RPython `flowspace/operation.py SimpleCall.opname =
@@ -4512,44 +4587,37 @@ pub fn translate_op(
         // (`graphanalyze.py`) reads out of `op.args[-1]` is a product of
         // rtyping, which has not run yet.
         //
-        // `family_key` carries the pre-rtyper identity of the vtable slot, so a
-        // dyn-trait dispatch lowers to the same `getattr` + `simple_call` shape
-        // as its `CallTarget::Indirect` twin. `funcptr` is dropped: it is the
-        // `Field[Adt(vtable), slot]` projection, which the `getattr` re-derives
-        // from the receiver at the level the annotator works in.
-        OpKind::IndirectCall {
-            args,
-            family_key: Some((trait_root, method_name)),
-            ..
-        } => {
-            let arg_hls = args
-                .iter()
-                .enumerate()
-                .map(|(i, v)| lookup_operand(value_map, v, op, &format!("args[{i}]")))
-                .collect::<Result<Vec<_>, _>>()?;
-            let result = resolve_result_hlvalue(op, value_map)?;
-            dyn_trait_dispatch_ops(arg_hls, trait_root, method_name, result, call_registry)
-        }
-        // A stored function pointer has no trait receiver. The annotator
-        // sees `simple_call(funcptr, *args)` whose args[0] is the
-        // `Ptr(FuncType)` value (`SomePtr.call`); `PtrRepr.rtype_simple_call`
-        // then emits `direct_call` or `indirect_call` with
-        // `inputconst(Void, None)`.
+        // `family_key` carries the pre-rtyper identity of the call family.
+        // A dyn-trait vtable slot lowers to the same `getattr` + `simple_call`
+        // shape as its `CallTarget::Indirect` twin; `funcptr` is dropped
+        // because `getattr` re-derives the bound method from the receiver.
+        // A harvested struct FnPtr field keeps the already-loaded `funcptr`
+        // (`SomePBC.call` / `FunctionReprBase.call` once the slot intern is
+        // the family's function PBC); dropping it and getattr'ing the slot
+        // name off `args[0]` is the dyn-trait shape and blocks on
+        // `SomeInstance(PyObject)`.
         OpKind::IndirectCall {
             funcptr,
             args,
-            family_key: None,
+            family_key,
             ..
-        } => {
-            let funcptr_hl = lookup_operand(value_map, funcptr, op, "funcptr")?;
-            let mut call_args = Vec::with_capacity(args.len() + 1);
-            call_args.push(funcptr_hl);
-            for (i, v) in args.iter().enumerate() {
-                call_args.push(lookup_operand(value_map, v, op, &format!("args[{i}]"))?);
+        } => match family_key {
+            Some(crate::model::IndirectFamilyKey::DynTrait {
+                trait_root,
+                method_name,
+            }) => {
+                let arg_hls = args
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| lookup_operand(value_map, v, op, &format!("args[{i}]")))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let result = resolve_result_hlvalue(op, value_map)?;
+                dyn_trait_dispatch_ops(arg_hls, trait_root, method_name, result, call_registry)
             }
-            let result = resolve_result_hlvalue(op, value_map)?;
-            Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
-        }
+            Some(crate::model::IndirectFamilyKey::FnPtrField { .. }) | None => {
+                stored_fnptr_simple_call(funcptr, args, op, value_map)
+            }
+        },
 
         // ─── Pyre-internal: VtableMethodPtr ───
         // TODO(rclass-vtable-rework): pyre-only adaptation of
@@ -4736,6 +4804,8 @@ fn opkind_variant_name(kind: &OpKind) -> &'static str {
         OpKind::ArrayWrite { .. } => "ArrayWrite",
         OpKind::InteriorFieldRead { .. } => "InteriorFieldRead",
         OpKind::InteriorFieldWrite { .. } => "InteriorFieldWrite",
+        OpKind::InteriorPtrExpose { .. } => "InteriorPtrExpose",
+        OpKind::StoreThroughPtr { .. } => "StoreThroughPtr",
         OpKind::Call { .. } => "Call",
         OpKind::GuardTrue { .. } => "GuardTrue",
         OpKind::GuardFalse { .. } => "GuardFalse",
@@ -5582,9 +5652,19 @@ pub(crate) fn derive_subject_inputcells(
                 // `SomeString` cell that `project_struct_field_type` assigns it.
                 if class_root
                     .as_deref()
-                    .is_some_and(crate::front::mir::is_str_family_class_root)
+                    .is_some_and(crate::annotator::bookkeeper::struct_root_is_string_family)
                 {
                     cells.push(crate::annotator::model::s_str0());
+                    continue;
+                }
+                // `IdentityKey` is the object pointer (`identitydict.py`).
+                // `project_struct_field_type` already aliases it to
+                // `PyObjectRef`; minting `IdentityKey` here made
+                // `generalize_key` raise `PyObject ∪ IdentityKey`.
+                if let (Some(bk), Some(root)) = (bookkeeper, class_root.as_deref())
+                    && crate::annotator::bookkeeper::is_identity_key_spelling(root)
+                {
+                    cells.push(bk.project_struct_field_type(root));
                     continue;
                 }
                 if let (Some(root), Some(bk)) = (class_root.as_ref(), bookkeeper) {
@@ -5664,11 +5744,13 @@ pub(crate) fn derive_subject_inputcells(
                     // generic struct in a harvested foreign-body crate).
                     // A broad `field_rows` knownness seeds every suffixed
                     // closure / Option and union-fails their `call_once`.
-                    let known = bk
-                        .struct_fields
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|reg| split_struct_template_rows_known(reg, root))
+                    let interned = bk.classdef_for_known_struct_root(root);
+                    let known = interned.is_some()
+                        || bk
+                            .struct_fields
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|reg| split_struct_template_rows_known(reg, root))
                         // A `MutRef<T>` cell is a synthetic one-field class with no
                         // struct-field rows, interned by qualname like its constructor.
                         || majit_ir::descr::strip_instantiation_suffix(root) == "MutRef";
@@ -5695,13 +5777,23 @@ pub(crate) fn derive_subject_inputcells(
                             cells.push(cell);
                             continue;
                         }
-                        let cd = bk.getuniqueclassdef_for_struct_root(root).map_err(|e| {
-                            TyperError::message(format!(
-                                "derive_subject_inputcells: startblock.inputargs[{idx}] \
-                                 ({var:?}) `Ref` receiver root {root:?} failed struct-root \
-                                 ClassDef registration: {e:?}"
-                            ))
-                        })?;
+                        let cd = match interned {
+                            Some(cd) => cd,
+                            None if crate::annotator::bookkeeper::struct_root_is_string_family(
+                                root,
+                            ) =>
+                            {
+                                cells.push(crate::annotator::model::s_str0());
+                                continue;
+                            }
+                            None => bk.getuniqueclassdef_for_struct_root(root).map_err(|e| {
+                                TyperError::message(format!(
+                                    "derive_subject_inputcells: startblock.inputargs[{idx}] \
+                                     ({var:?}) `Ref` receiver root {root:?} failed struct-root \
+                                     ClassDef registration: {e:?}"
+                                ))
+                            })?,
+                        };
                         cells.push(crate::annotator::model::SomeValue::Instance(
                             crate::annotator::model::SomeInstance::new(
                                 Some(cd),
@@ -5815,9 +5907,6 @@ pub(crate) fn derive_subject_inputcells(
 /// `struct_instantiation_suffix`: Entry, plus a generic struct in a
 /// harvested foreign-body crate).
 fn split_struct_template_rows_known(reg: &crate::front::StructFieldRegistry, root: &str) -> bool {
-    if reg.fields.contains_key(root) {
-        return true;
-    }
     // A generic enum instantiation whose arguments are type parameters
     // (`option::Option<v0>`) is the template declaration
     // (`bookkeeper.py` `getuniqueclassdef`). Concrete suffixed Option
@@ -5826,14 +5915,7 @@ fn split_struct_template_rows_known(reg: &crate::front::StructFieldRegistry, roo
     if enum_type_parameter_instantiation(reg, root) {
         return true;
     }
-    if reg.field_rows(root).is_none() {
-        return false;
-    }
-    if reg.owner_in_foreign_body_crate(root) {
-        return true;
-    }
-    let stripped = majit_ir::descr::strip_instantiation_suffix(root);
-    stripped.ends_with("::rordereddict_entries::Entry") || stripped == "Entry"
+    reg.struct_root_rows_known(root)
 }
 
 /// True when `root` is `Enum<template><type-param, …>` of a harvested
@@ -7909,6 +7991,33 @@ mod tests {
     }
 
     #[test]
+    fn derive_subject_inputcells_seeds_gcrefopaque_ref_input_as_someptr() {
+        let mut graph = LegacyGraph::new("takes_gcref");
+        let entry = graph.startblock;
+        let p_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "root".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("header::GCREFOpaque".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, p_var);
+
+        let cells = derive_subject_inputcells(&graph, None)
+            .expect("GCREFOpaque argument Input must project to a definite SomeValue cell");
+        assert_eq!(cells.len(), 1);
+        assert!(
+            matches!(cells[0], SomeValue::Ptr(_)),
+            "Ref + class_root GCREFOpaque must seed SomePtr(GCREF), got {:?}",
+            cells[0],
+        );
+    }
+
+    #[test]
     fn derive_subject_inputcells_seeds_ccharp_ref_input_as_someptr() {
         let mut graph = LegacyGraph::new("takes_ccharp");
         let entry = graph.startblock;
@@ -8124,6 +8233,95 @@ mod tests {
         assert!(
             value.classdef.is_none(),
             "nonsplit template rows must not intern Foo<i64>"
+        );
+    }
+
+    /// Crate-stripped Input intern spelling after promote dropped the
+    /// stripped harvest key and left the crate-prefixed key plus the
+    /// bare leaf. `lookup_fields` unique-suffix is ambiguous; intern
+    /// still seeds the ClassDef.
+    #[test]
+    fn derive_subject_inputcells_seeds_crate_prefixed_utf8str_as_somestring() {
+        let mut graph = LegacyGraph::new("ll_stringslice_startstop");
+        let entry = graph.startblock;
+        let recv = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "s".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("pyre_object::unicodeobject::Utf8Str".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, recv);
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "pyre_object::unicodeobject::Utf8Str".to_string(),
+            vec![
+                ("hash".to_string(), "i64".to_string()),
+                ("length".to_string(), "i64".to_string()),
+            ],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("crate-prefixed Utf8Str must seed a definite cell");
+        assert!(
+            matches!(cells[0], SomeValue::String(_)),
+            "Utf8Str harvest rows must seed SomeString, got {:?}",
+            cells[0]
+        );
+    }
+
+    #[test]
+    fn derive_subject_inputcells_interns_crate_stripped_against_crate_prefixed_harvest() {
+        let mut graph = LegacyGraph::new("getitem_str");
+        let entry = graph.startblock;
+        let recv = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "self".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("celldict::ModuleDictStrategy".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, recv);
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        let rows = vec![
+            ("storage".to_string(), "ModuleDictStorage".to_string()),
+            ("owner".to_string(), "i64".to_string()),
+        ];
+        fields.fields.insert(
+            "pyre_object::celldict::ModuleDictStrategy".to_string(),
+            rows.clone(),
+        );
+        fields.fields.insert("ModuleDictStrategy".to_string(), rows);
+        bk.set_struct_fields(Rc::new(fields));
+
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("crate-stripped ModuleDictStrategy must intern");
+        let SomeValue::Instance(value) = &cells[0] else {
+            panic!(
+                "ModuleDictStrategy must seed SomeInstance, got {:?}",
+                cells[0]
+            )
+        };
+        let classdef = value
+            .classdef
+            .as_ref()
+            .expect("crate-prefixed harvest must intern ModuleDictStrategy");
+        assert!(
+            classdef.borrow().attrs.contains_key("storage"),
+            "intern must project crate-prefixed rows onto the crate-stripped ClassDef"
         );
     }
 
@@ -8525,10 +8723,8 @@ mod tests {
             .classdef
             .as_ref()
             .expect("PyObject class_root must populate classdef");
-        // Dual-publish leaf `PyObject` is a lookup spelling of one class: it
-        // interns as its declaration `pyobject::PyObject` (`Bookkeeper.getdesc`
-        // keys on the class object). The instance-not-string contract is the
-        // assertion below.
+        // Unique `module::Leaf` intern key (`intern_key_from_registry`):
+        // `PyObject` and `pyobject::PyObject` are one ClassDef.
         assert_eq!(classdef.borrow().name, "pyobject::PyObject");
 
         let projected_root_instance = bk.project_struct_field_type("PyObjectRef");
@@ -12137,6 +12333,90 @@ mod tests {
     }
 
     #[test]
+    fn translate_op_charp2str_marker_calls_the_builtin() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 2);
+        let cp = Hlvalue::Variable(Variable::new());
+        let result_var = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), cp.clone());
+        value_map.insert(vars[1].clone(), result_var.clone());
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec![crate::runtime_names::shims::CHARP2STR.into()],
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![vars[0].clone()]),
+                result_ty: ValueType::Str,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("__majit_charp2str marker must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("callable must be ConstValue::HostObject");
+        };
+        assert_eq!(
+            *host,
+            HOST_ENV
+                .lookup_builtin("charp2str")
+                .expect("charp2str builtin")
+        );
+        assert_eq!(translated[0].args[1..], [cp]);
+        assert_eq!(translated[0].result, result_var);
+    }
+
+    #[test]
+    fn translate_op_charpsize2str_marker_calls_the_builtin() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 3);
+        let cp = Hlvalue::Variable(Variable::new());
+        let size = Hlvalue::Variable(Variable::new());
+        let result_var = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), cp.clone());
+        value_map.insert(vars[1].clone(), size.clone());
+        value_map.insert(vars[2].clone(), result_var.clone());
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec![crate::runtime_names::shims::CHARPSIZE2STR.into()],
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
+                result_ty: ValueType::Str,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("__majit_charpsize2str marker must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("callable must be ConstValue::HostObject");
+        };
+        assert_eq!(
+            *host,
+            HOST_ENV
+                .lookup_builtin("charpsize2str")
+                .expect("charpsize2str builtin")
+        );
+        assert_eq!(translated[0].args[1..], [cp, size]);
+        assert_eq!(translated[0].result, result_var);
+    }
+
+    #[test]
     fn translate_op_nonmoving_raw_ptr_for_resizable_list_marker_calls_the_builtin() {
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_fixture");
@@ -12819,11 +13099,11 @@ mod tests {
         assert_eq!(translated[0].result, result_hl);
     }
 
-    /// An IndirectCall that does carry a `family_key` names a dyn-trait vtable
-    /// slot, and lowers to the same pre-rtyper shape as its `CallTarget::
-    /// Indirect` twin: `getattr(receiver, method)` then `simple_call`. The
-    /// annotator never sees an `indirect_call` — `rpbc.py` mints that
-    /// inside `rtype_simple_call`, downstream of here.
+    /// `IndirectFamilyKey::DynTrait` names a dyn-trait vtable slot and
+    /// lowers to the same pre-rtyper shape as its `CallTarget::Indirect`
+    /// twin: `getattr(receiver, method)` then `simple_call`. The annotator
+    /// never sees an `indirect_call` — `rpbc.py` mints that inside
+    /// `rtype_simple_call`, downstream of here.
     #[test]
     fn translate_op_indirect_call_with_family_key_lowers_to_getattr_simple_call() {
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
@@ -12838,7 +13118,7 @@ mod tests {
                 funcptr: vars[1].clone(),
                 args: vec![vars[2].clone()],
                 graphs: None,
-                family_key: Some(("Handler".to_string(), "run".to_string())),
+                family_key: Some(crate::model::IndirectFamilyKey::dyn_trait("Handler", "run")),
                 result_ty: ValueType::Int,
             },
         };
@@ -12863,6 +13143,197 @@ mod tests {
         };
         assert_eq!(m1.id(), m2.id());
         assert_eq!(translated[1].args.len(), 1, "the receiver is not re-passed");
+    }
+
+    /// A harvested struct FnPtr field (`instance_getclass`'s
+    /// `(access.getclass)(obj)`) keeps the already-loaded `funcptr` and
+    /// spells `simple_call(funcptr, *args)`. The dyn-trait getattr of the
+    /// slot name off `args[0]` is the wrong shape for this family.
+    #[test]
+    fn translate_op_indirect_call_fnptr_field_family_lowers_to_simple_call() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11);
+        let funcptr_hl = Hlvalue::Variable(Variable::new());
+        let arg_hl = Hlvalue::Variable(Variable::new());
+        let result_hl = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[1].clone(), funcptr_hl.clone());
+        value_map.insert(vars[2].clone(), arg_hl.clone());
+        value_map.insert(vars[3].clone(), result_hl.clone());
+        let op = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::IndirectCall {
+                funcptr: vars[1].clone(),
+                args: vec![vars[2].clone()],
+                graphs: None,
+                family_key: Some(crate::model::IndirectFamilyKey::fnptr_field(
+                    "mapdict::MapdictMixinAccess",
+                    "getclass",
+                )),
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("a FnPtr-field IndirectCall lowers to simple_call of the loaded funcptr");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        assert_eq!(translated[0].args.len(), 2);
+        assert_eq!(translated[0].args[0], funcptr_hl);
+        assert_eq!(translated[0].args[1], arg_hl);
+        assert_eq!(translated[0].result, result_hl);
+    }
+
+    /// `mapdict::instance_getclass` shape: a loaded FnPtr field called with
+    /// the object. Adapter spells `simple_call(funcptr, *args)`. Annotate
+    /// of an Input `fn` pointer is `SomePtr.call`; production intern of a
+    /// harvested family is a function `SomePBC`. Rtype emits `indirect_call`;
+    /// `lower_indirect_calls` fills the harvested family.
+    #[test]
+    fn instance_getclass_fnptr_field_annotates_and_rtypes_indirect_call_with_family() {
+        use crate::call::CallControl;
+        use crate::parse::CallPath;
+        use crate::translator::rtyper::cutover::specialize_legacy_graph_with_registry_returning_value_to_var;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rpbc::lower_indirect_calls;
+
+        let mut graph = LegacyGraph::new("instance_getclass");
+        let entry = graph.startblock;
+        let f_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "getclass".to_string(),
+                    ty: ValueType::Int,
+                    class_root: Some("fn(i64) -> bool".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        let x_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "obj".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, f_var.clone());
+        graph.push_inputarg_var(entry, x_var.clone());
+        let r_var = graph
+            .push_op_var(
+                entry,
+                OpKind::IndirectCall {
+                    funcptr: f_var,
+                    args: vec![x_var],
+                    graphs: None,
+                    family_key: Some(crate::model::IndirectFamilyKey::fnptr_field(
+                        "mapdict::MapdictMixinAccess",
+                        "getclass",
+                    )),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(r_var.clone()));
+
+        let registry = CallRegistry::new(Rc::new(Bookkeeper::new()));
+        let lifted = function_graph_to_flowspace(&graph, &registry)
+            .expect("FnPtr-field IndirectCall must lift to simple_call");
+        let start = lifted.graph.borrow().startblock.clone();
+        let lifted_ops = start.borrow().operations.clone();
+        let simple = lifted_ops
+            .iter()
+            .find(|op| op.opname == "simple_call")
+            .expect("adapter lowers FnPtr-field IndirectCall to simple_call");
+        assert_eq!(simple.args.len(), 2);
+        assert!(
+            lifted_ops.iter().all(|op| op.opname != "getattr"),
+            "FnPtr-field dispatch must not getattr the slot name off the receiver"
+        );
+
+        let (value_to_var, _) =
+            specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
+                .expect("instance_getclass FnPtr-field graph must annotate and rtype");
+        let result_var = value_to_var.get(&r_var).expect("call result must project");
+        {
+            let cell = result_var.annotation.borrow();
+            match cell.as_ref().map(|rc| rc.as_ref()) {
+                Some(SomeValue::Bool(_)) => {}
+                other => panic!(
+                    "SomePtr.call returns ll_to_annotation of FuncType.RESULT, got {other:?}"
+                ),
+            }
+        }
+        assert_eq!(result_var.concretetype(), Some(LowLevelType::Bool));
+
+        let (ann, _) = registry.ensure_session().expect("session after specialize");
+        let graph_ref = ann
+            .annotated
+            .borrow()
+            .values()
+            .find_map(|g| g.clone())
+            .expect("specialized subject graph");
+        let start = graph_ref.borrow().startblock.clone();
+        let rtyped = start.borrow().operations.clone();
+        let indirect = rtyped
+            .iter()
+            .find(|op| op.opname == "indirect_call")
+            .expect("PtrRepr.rtype_simple_call emits indirect_call");
+        let last = indirect.args.last().expect("trailing graphs arg");
+        let Hlvalue::Constant(c_graphs) = last else {
+            panic!("last arg must be inputconst(Void, None) before family fill");
+        };
+        assert_eq!(c_graphs.concretetype, Some(LowLevelType::Void));
+        assert_eq!(c_graphs.value, ConstValue::None);
+
+        let mut cc = CallControl::new();
+        for owner in [
+            "mapdict::base_user_class_mapdict_getclass",
+            "objectobject::W_OBJECT_OBJECT_MAPDICT_ACCESS",
+        ] {
+            let path = CallPath::for_impl_method(owner, "getclass");
+            cc.register_function_graph(
+                path.clone(),
+                LegacyGraph::new(format!("{owner}::getclass")),
+            );
+            cc.register_trait_family_path("getclass", "mapdict::MapdictMixinAccess", path);
+        }
+        lower_indirect_calls(&mut graph, &cc);
+        let family = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::IndirectCall { graphs, .. } => graphs.clone(),
+                _ => None,
+            })
+            .expect("lower_indirect_calls fills the FnPtr-field family");
+        assert_eq!(
+            family.len(),
+            2,
+            "getclass family has two members: {family:?}"
+        );
+        let leftover = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::IndirectCall {
+                        family_key: Some(_),
+                        ..
+                    }
+                )
+            });
+        assert!(
+            !leftover,
+            "lower_indirect_calls consumes the FnPtr-field family key"
+        );
     }
 
     #[test]
@@ -13797,6 +14268,49 @@ mod tests {
         assert_eq!(translated[0].opname, "getitem");
         assert_eq!(translated[1].opname, "setattr");
         assert_eq!(translated[1].args.len(), 3);
+    }
+
+    #[test]
+    fn translate_op_interior_ptr_expose_emits_interior_ptr_expose() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 3);
+        value_map.insert(vars[0].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::InteriorPtrExpose {
+                base: vars[0].clone(),
+                field: crate::model::FieldDescriptor::new("value", Some("Entry".into())),
+                ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("InteriorPtrExpose arm must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "interior_ptr_expose");
+        assert_eq!(translated[0].args.len(), 2);
+    }
+
+    #[test]
+    fn translate_op_store_through_ptr_emits_store_through_ptr() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 2);
+        value_map.insert(vars[0].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::StoreThroughPtr {
+                ptr: vars[0].clone(),
+                value: vars[1].clone(),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("StoreThroughPtr arm must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "store_through_ptr");
+        assert_eq!(translated[0].args.len(), 2);
     }
 
     #[test]

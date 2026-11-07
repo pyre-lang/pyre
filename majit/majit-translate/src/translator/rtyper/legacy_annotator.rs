@@ -2038,6 +2038,8 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         OpKind::ArrayWrite { .. } => ValueType::Void,
         OpKind::InteriorFieldRead { item_ty, .. } => item_ty.clone(),
         OpKind::InteriorFieldWrite { .. } => ValueType::Void,
+        OpKind::InteriorPtrExpose { ty, .. } => ty.clone(),
+        OpKind::StoreThroughPtr { .. } => ValueType::Void,
         // Frontend `DecodedConst::Str` is `Call(["__str_const", text])`
         // (`is_str_const_define`) with `result_ty: Ref(None)` (`getkind`
         // of rstr `Ptr(STR)` is `'r'`). Upstream that value is a bare

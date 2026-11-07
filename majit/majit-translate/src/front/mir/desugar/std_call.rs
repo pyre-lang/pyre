@@ -1782,6 +1782,13 @@ impl<'a> Lowering<'a> {
         );
         let bb_id = self.emit_bb(mir_bb);
         for leaf in leaves {
+            let cell_slot = leaf.field.name == "value"
+                && leaf.field.owner_root.as_deref().is_some_and(|owner| {
+                    owner == "cell::UnsafeCell"
+                        || owner.ends_with("::UnsafeCell")
+                        || owner == "cell::Cell"
+                        || owner.ends_with("::cell::Cell")
+                });
             let read = self.graph.alloc_value_var();
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(read.clone()),
@@ -1796,7 +1803,11 @@ impl<'a> Lowering<'a> {
                 result: None,
                 kind: OpKind::FieldWrite {
                     base: dest.clone(),
-                    field: container_leaf_descriptor(container_field, at_offset_zero, &leaf),
+                    field: if cell_slot {
+                        container_field.clone()
+                    } else {
+                        container_leaf_descriptor(container_field, at_offset_zero, &leaf)
+                    },
                     value: LinkArg::Value(read),
                     ty: leaf.ty,
                 },
@@ -1851,7 +1862,7 @@ impl<'a> Lowering<'a> {
         ty: &TyRef,
     ) -> Option<(ValueType, usize, bool)> {
         if let Some(node) = tyref_node(ty, self.llbc)
-            && let Some(descr) = json_ty_raw_store_descr(node, self.llbc)
+            && let Some(descr) = json_ty_raw_store_descr(node, self.llbc, self.gc_struct_ids)
         {
             return Some(descr);
         }
@@ -1863,7 +1874,7 @@ impl<'a> Lowering<'a> {
             ));
         }
         if let Some(inner) = tyref_atomic_arg(ty, self.llbc)
-            && let Some(descr) = json_ty_raw_store_descr(inner, self.llbc)
+            && let Some(descr) = json_ty_raw_store_descr(inner, self.llbc, self.gc_struct_ids)
         {
             return Some(descr);
         }
@@ -1974,7 +1985,7 @@ impl<'a> Lowering<'a> {
         if !tyref_is_copy_scalar_or_thin_ptr(ty, self.llbc) {
             return None;
         }
-        json_ty_raw_store_descr(tyref_node(ty, self.llbc)?, self.llbc)
+        json_ty_raw_store_descr(tyref_node(ty, self.llbc)?, self.llbc, self.gc_struct_ids)
     }
 
     pub(in crate::front::mir) fn read_mem_slot(
@@ -2805,6 +2816,29 @@ impl<'a> Lowering<'a> {
             .is_some_and(|leaf| matches!(leaf.as_str(), "String" | "Vec"))
     }
 
+    /// `<Box<[T]> as Deref>::deref` → `&[T]`. The Box is already the
+    /// list (`rlist.py` `ll_fixed_items`); the slice is that same value.
+    /// `deref_cast_root` declines (a slice dest has no class root) and
+    /// [`Self::is_container_identity_deref`] only names `String` / `Vec`.
+    pub(in crate::front::mir) fn is_box_slice_identity_deref(
+        &self,
+        reg: &RegularCall,
+        dest_ty: &TyRef,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let np = fd.item_meta.name_path();
+        if !(np.ends_with("::deref") || np.ends_with("::deref_mut")) {
+            return false;
+        }
+        deref_impl_owner_leaf(self.llbc, fd).as_deref() == Some("Box")
+            && tyref_is_slice_ref(dest_ty, self.llbc)
+    }
+
     /// A resolved `core::borrow::Borrow::borrow` whose impl is one of the
     /// core/alloc identity views and whose method has no extracted body.
     /// A `Clause` ref and a local impl with a body stay calls.
@@ -3271,8 +3305,9 @@ impl<'a> Lowering<'a> {
         None
     }
 
-    /// Window → STR copy (`rffi.py` `charpsize2str`,
-    /// `majit_rlib::rffi::buffer::charpsize2str`).
+    /// Window → STR copy (`rffi.py` `charpsize2str`).
+    /// The front spells `__majit_charpsize2str`; the HOST_ENV builtin
+    /// annotates `SomeString` and rtype `gendirectcall`s `ll_charpsize2str`.
     pub(in crate::front::mir) fn emit_charpsize2str(
         &mut self,
         mir_bb: usize,
@@ -3295,18 +3330,65 @@ impl<'a> Lowering<'a> {
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(header.clone()),
             kind: OpKind::Call {
-                target: CallTarget::function_path([
-                    "majit_rlib",
-                    "rffi",
-                    "buffer",
-                    "charpsize2str",
-                ]),
+                target: CallTarget::function_path([crate::runtime_names::shims::CHARPSIZE2STR]),
                 args: crate::model::call_args(vec![ptr, len]),
                 result_ty: ValueType::Str,
             },
         });
         stamp_as_rstr_str(&header);
         header
+    }
+
+    /// NUL-terminated CCHARP → STR (`rffi.py` `charp2str`).
+    /// The front spells `__majit_charp2str`; the HOST_ENV builtin
+    /// annotates `s_str0()` and rtype `gendirectcall`s `ll_charp2str`.
+    pub(in crate::front::mir) fn emit_charp2str(
+        &mut self,
+        mir_bb: usize,
+        ptr: Variable,
+    ) -> Variable {
+        let bb_id = self.emit_bb(mir_bb);
+        self.push_charp2str(bb_id, ptr)
+    }
+
+    pub(in crate::front::mir) fn push_charp2str(
+        &mut self,
+        bb_id: BlockId,
+        ptr: Variable,
+    ) -> Variable {
+        let header = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(header.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path([crate::runtime_names::shims::CHARP2STR]),
+                args: crate::model::call_args(vec![ptr]),
+                result_ty: ValueType::Str,
+            },
+        });
+        stamp_as_rstr_str(&header);
+        header
+    }
+
+    /// Integer / CCHARP word used as `&str`. A window data word copies
+    /// `len` bytes (`charpsize2str`); a NUL-terminated C string copies
+    /// until NUL (`charp2str`). 1-arg `cast_int_to_ptr` of `Int → Str`
+    /// is `Ptr(MAJIT_REF_OPAQUE)` (`lltype.py` `ann_cast_int_to_ptr`).
+    pub(in crate::front::mir) fn emit_int_word_as_rstr_str(
+        &mut self,
+        mir_bb: usize,
+        ptr: Variable,
+    ) -> Variable {
+        if let Some(orig) = self.cast_ptr_to_int_src.get(&ptr).cloned() {
+            return orig;
+        }
+        if let Some(len) = self.window_len_companion(&ptr) {
+            let data = self.ensure_window_ccharp(mir_bb, ptr);
+            return self.emit_charpsize2str(mir_bb, data, len);
+        }
+        let data = self.ensure_window_ccharp(mir_bb, ptr);
+        self.emit_charp2str(mir_bb, data)
     }
 
     /// A raw `*u8` argument is `CCHARP`. Stamp an already-int actual so
@@ -4248,7 +4330,8 @@ impl<'a> Lowering<'a> {
                 .is_some_and(|payload| tyref_is_string_family(&payload, self.llbc))
     }
 
-    /// `alloc::string::<Impl>::from_utf8_lossy` whose dest is `Cow<str>`.
+    /// `alloc::string::<Impl>::from_utf8_lossy`. Dest is `Cow<str>` or
+    /// the fused `&str` / `String` of `&from_utf8_lossy(...)`.
     pub(in crate::front::mir) fn is_string_from_utf8_lossy(
         &self,
         reg: &RegularCall,
@@ -4260,7 +4343,115 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        fd.item_meta.name_path().ends_with("::from_utf8_lossy") && self.tyref_is_cow_str(dest_ty)
+        fd.item_meta.name_path().ends_with("::from_utf8_lossy")
+            && self.dest_is_plain_or_cow_str(dest_ty)
+    }
+
+    /// Dest of a lossy UTF-8 decode: `Cow<str>`, rust-heap `String`, or
+    /// `&str`. Fused `&String::from_utf8_lossy(bytes)` stores `&str`.
+    pub(in crate::front::mir) fn dest_is_plain_or_cow_str(&self, dest_ty: &TyRef) -> bool {
+        self.tyref_is_cow_str(dest_ty)
+            || tyref_is_string_family(dest_ty, self.llbc)
+            || tyref_strips_to_str(dest_ty, self.llbc)
+    }
+
+    /// `CStr` / `OsStr` / `Path::to_string_lossy` → `Cow<str>`.
+    /// `Wtf8::to_string_lossy` is a string-family identity, not this arm.
+    pub(in crate::front::mir) fn is_ffi_to_string_lossy(
+        &self,
+        reg: &RegularCall,
+        dest_ty: &TyRef,
+    ) -> bool {
+        self.ffi_to_string_lossy_is_cstr(reg).is_some() && self.dest_is_plain_or_cow_str(dest_ty)
+    }
+
+    /// `Some(true)` for `CStr::to_string_lossy` (NUL-terminated),
+    /// `Some(false)` for `OsStr` / `Path` (counted bytes).
+    pub(in crate::front::mir) fn ffi_to_string_lossy_is_cstr(
+        &self,
+        reg: &RegularCall,
+    ) -> Option<bool> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return None;
+        };
+        let fd = self.llbc.fn_by_id(*id)?;
+        if !fd.item_meta.name_path().ends_with("::to_string_lossy") {
+            return None;
+        }
+        let owner = impl_method_owner_for_fundecl(self.llbc, fd)
+            .map(|(owner, _)| owner)
+            .or_else(|| {
+                fd.signature
+                    .inputs
+                    .first()
+                    .and_then(|ty| adt_path_of_tyref(ty, self.llbc))
+            })?;
+        match owner.rsplit("::").next()? {
+            "CStr" => Some(true),
+            "OsStr" | "Path" => Some(false),
+            _ => None,
+        }
+    }
+
+    /// `CStr::from_ptr(*const c_char) -> &CStr` is the pointer itself
+    /// (`rffi.py` `CCHARP`). Unrelated `from_ptr` (atomics) keep their arm.
+    pub(in crate::front::mir) fn is_cstr_from_ptr(
+        &self,
+        reg: &RegularCall,
+        dest_ty: &TyRef,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        if !fd.item_meta.name_path().ends_with("::from_ptr") {
+            return false;
+        }
+        self.tyref_is_cstr(dest_ty) || self.tyref_is_cstr(&fd.signature.output)
+    }
+
+    pub(in crate::front::mir) fn tyref_is_cstr(&self, ty: &TyRef) -> bool {
+        adt_path_of_tyref(ty, self.llbc).is_some_and(|p| p.ends_with("::CStr"))
+    }
+
+    /// `Wtf8::to_string_lossy` / string-family `to_string_lossy` is identity
+    /// in the lifted model (already rstr `STR`).
+    pub(in crate::front::mir) fn is_string_family_to_string_lossy(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        fd.item_meta.name_path().ends_with("::to_string_lossy")
+            && first_arg_ty.is_some_and(|ty| tyref_is_string_family(ty, self.llbc))
+            && self.dest_is_plain_or_cow_str(dest_ty)
+    }
+
+    /// `Cow<str>::into_owned` of a lossy-decode dest is the produced string.
+    pub(in crate::front::mir) fn is_cow_str_into_owned(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        fd.item_meta.name_path().ends_with("::into_owned")
+            && first_arg_ty.is_some_and(|ty| self.tyref_is_cow_str(ty))
+            && (tyref_is_string_family(dest_ty, self.llbc)
+                || tyref_strips_to_str(dest_ty, self.llbc))
     }
 
     /// `alloc::borrow::Cow<B>` whose borrowed form `B` is string-family
@@ -4647,9 +4838,15 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
-    /// `String::from_utf8_lossy` → `decode_utf8_with_errors(bytes, "replace")`
+    /// `String::from_utf8_lossy` → `decode_utf8_with_errors(data, len, "replace")`
     /// then Ok payload as a plain string (`unicodehelper.py str_decode_utf8`
     /// replace / U+FFFD). Dest is not a Cow ADT.
+    ///
+    /// `from_utf8_lossy`'s `&[u8]` formal is a window
+    /// (`pair_or_window_fun_inputs`), so the pair-ABI arm splices
+    /// `{data: CCHARP, len}`. `decode_utf8_with_errors` takes that same
+    /// window plus `err_mode`. A one-word STR / CStr is already a
+    /// header: bind it and skip decode.
     pub(in crate::front::mir) fn try_lower_from_utf8_lossy(
         &mut self,
         mir_bb: usize,
@@ -4659,9 +4856,337 @@ impl<'a> Lowering<'a> {
         dest_ty: &TyRef,
         target: usize,
     ) -> Result<bool, LowerError> {
-        if args.len() != 1 || !self.is_string_from_utf8_lossy(reg, dest_ty) {
+        if !self.is_string_from_utf8_lossy(reg, dest_ty) {
             return Ok(false);
         }
+        match args {
+            [bytes] => {
+                let header = if self.var_is_str_repr(bytes) || self.var_has_str_value_type(bytes) {
+                    bytes.clone()
+                } else {
+                    let data = self.ensure_window_ccharp(mir_bb, bytes.clone());
+                    self.emit_charp2str(mir_bb, data)
+                };
+                self.bind_str_view_local(dest_local, header);
+                let target_bb = self.block_id[target];
+                let link_args = self.edge_args(mir_bb, target)?;
+                self.graph
+                    .set_goto(self.emit_bb(mir_bb), target_bb, link_args);
+                Ok(true)
+            }
+            [data, len] => {
+                let data = self.ensure_window_ccharp(mir_bb, data.clone());
+                if self.emit_decode_utf8_replace_to_dest(
+                    mir_bb,
+                    dest_local,
+                    target,
+                    vec![data.clone(), len.clone()],
+                )? {
+                    return Ok(true);
+                }
+                let bytes = self.emit_charpsize2str(mir_bb, data, len.clone());
+                self.bind_str_view_local(dest_local, bytes);
+                let target_bb = self.block_id[target];
+                let link_args = self.edge_args(mir_bb, target)?;
+                self.graph
+                    .set_goto(self.emit_bb(mir_bb), target_bb, link_args);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// `CStr` / `OsStr` / `Path::to_string_lossy` → STR
+    /// (`rffi.py` `charp2str` for a CStr, window decode replace for
+    /// counted OsStr / Path bytes).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Mirrors the other try_lower_* call intercepts"
+    )]
+    pub(in crate::front::mir) fn try_lower_to_string_lossy(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let Some(is_cstr) = self.ffi_to_string_lossy_is_cstr(reg) else {
+            return Ok(false);
+        };
+        if !self.dest_is_plain_or_cow_str(dest_ty) {
+            return Ok(false);
+        }
+        match args {
+            [ptr] => {
+                let data = self.ensure_window_ccharp(mir_bb, ptr.clone());
+                let bytes = self.emit_charp2str(mir_bb, data);
+                self.bind_str_view_local(dest_local, bytes);
+                let target_bb = self.block_id[target];
+                let link_args = self.edge_args(mir_bb, target)?;
+                self.graph
+                    .set_goto(self.emit_bb(mir_bb), target_bb, link_args);
+                Ok(true)
+            }
+            [data, len] => {
+                let data = self.ensure_window_ccharp(mir_bb, data.clone());
+                if is_cstr {
+                    let bytes = self.emit_charp2str(mir_bb, data);
+                    self.bind_str_view_local(dest_local, bytes);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph
+                        .set_goto(self.emit_bb(mir_bb), target_bb, link_args);
+                    return Ok(true);
+                }
+                if self.emit_decode_utf8_replace_to_dest(
+                    mir_bb,
+                    dest_local,
+                    target,
+                    vec![data.clone(), len.clone()],
+                )? {
+                    return Ok(true);
+                }
+                let bytes = self.emit_charpsize2str(mir_bb, data, len.clone());
+                self.bind_str_view_local(dest_local, bytes);
+                let target_bb = self.block_id[target];
+                let link_args = self.edge_args(mir_bb, target)?;
+                self.graph
+                    .set_goto(self.emit_bb(mir_bb), target_bb, link_args);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// `Option`/`Result` `unwrap_or_default` of a string dest is the
+    /// payload or empty rstr `STR`. `unwrap_or` of the same dest uses the
+    /// provided default instead of `""`. CHARON_CORE's body residualizes
+    /// a classdef-less Instance that unions with the SomeString seed.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Mirrors the other try_lower_* call intercepts"
+    )]
+    pub(in crate::front::mir) fn try_lower_unwrap_or_default_string(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        first_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let Some(path) = regular_call_name_path(reg, self.llbc) else {
+            return Ok(false);
+        };
+        let leaf = path.rsplit("::").next();
+        let default_var = match (leaf, args.len()) {
+            (Some("unwrap_or_default"), 1) => None,
+            (Some("unwrap_or"), 2) => Some(args[1].clone()),
+            _ => return Ok(false),
+        };
+        if !tyref_is_string_family(dest_ty, self.llbc) && !self.dest_is_plain_or_cow_str(dest_ty) {
+            return Ok(false);
+        }
+        if self.builder_mode && self.accumulator_is_builder_mode(dest_local) {
+            return Ok(false);
+        }
+        let Some(recv_ty) = first_arg_ty else {
+            return Ok(false);
+        };
+        let Some(peeled) = self.peel_to_option_or_result(recv_ty) else {
+            return Ok(false);
+        };
+        let recv = args[0].clone();
+        let none_extras: Vec<Variable> = default_var.into_iter().collect();
+        if crate::front::result_exc::tyref_is_option(&peeled, self.llbc) {
+            if self.tyref_is_niche_option_ptr(&peeled) {
+                return Ok(false);
+            }
+            let Some((option_owner, some_owner, _)) = self.resolve_option_consumer_owners(&peeled)
+            else {
+                return Ok(false);
+            };
+            let bb_id = self.emit_bb(mir_bb);
+            let disc = emit_enum_disc_read(&mut self.graph, bb_id, recv.clone(), &option_owner);
+            // Option Some=1 is the true arm of `bool(disc)`.
+            self.close_call_diamond(
+                mir_bb,
+                target,
+                dest_local,
+                disc,
+                true,
+                false,
+                std::slice::from_ref(&recv),
+                none_extras.as_slice(),
+                |this, some_bb, mapped| {
+                    let payload = emit_payload_read(
+                        &mut this.graph,
+                        some_bb,
+                        mapped[0].clone(),
+                        &some_owner,
+                        ValueType::Str,
+                        false,
+                    );
+                    stamp_as_rstr_str(&payload);
+                    payload
+                },
+                |this, none_bb, mapped| {
+                    if let Some(default) = mapped.first() {
+                        stamp_as_rstr_str(default);
+                        default.clone()
+                    } else {
+                        emit_str_const(&mut this.graph, none_bb, "")
+                    }
+                },
+            )?;
+            return Ok(true);
+        }
+        if crate::front::result_exc::tyref_is_result(&peeled, self.llbc) {
+            let Some((result_owner, ok_owner, _, _, _, _)) = self.resolve_result_owners(&peeled)
+            else {
+                return Ok(false);
+            };
+            let bb_id = self.emit_bb(mir_bb);
+            let disc = emit_enum_disc_read(&mut self.graph, bb_id, recv.clone(), &result_owner);
+            // Result Ok=0 is the false arm of `bool(disc)`.
+            self.close_call_diamond(
+                mir_bb,
+                target,
+                dest_local,
+                disc,
+                true,
+                false,
+                none_extras.as_slice(),
+                std::slice::from_ref(&recv),
+                |this, err_bb, mapped| {
+                    if let Some(default) = mapped.first() {
+                        stamp_as_rstr_str(default);
+                        default.clone()
+                    } else {
+                        emit_str_const(&mut this.graph, err_bb, "")
+                    }
+                },
+                |this, ok_bb, mapped| {
+                    let payload = emit_payload_read(
+                        &mut this.graph,
+                        ok_bb,
+                        mapped[0].clone(),
+                        &ok_owner,
+                        ValueType::Str,
+                        false,
+                    );
+                    stamp_as_rstr_str(&payload);
+                    payload
+                },
+            )?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Dest of a GCREF recast / `*mut GCREFOpaque` payload.
+    fn dest_is_gcref(&self, dest_ty: &TyRef) -> bool {
+        tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves)
+            .as_deref()
+            .is_some_and(crate::annotator::bookkeeper::is_gcref_type_spelling)
+    }
+
+    /// Niche `Option<*mut GCREFOpaque>::unwrap_or(default)` is
+    /// `ptr_iszero` then the default, else the pointer (`rnone.py`
+    /// `rtype_is_None`). CHARON_CORE's tagged-enum body residualizes a
+    /// classdef-less Instance that dual-gate types Void against GCREF.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Mirrors the other try_lower_* call intercepts"
+    )]
+    pub(in crate::front::mir) fn try_lower_unwrap_or_gcref(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        first_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let Some(path) = regular_call_name_path(reg, self.llbc) else {
+            return Ok(false);
+        };
+        let leaf = path.rsplit("::").next();
+        let default_var = match (leaf, args.len()) {
+            (Some("unwrap_or"), 2) => Some(args[1].clone()),
+            _ => return Ok(false),
+        };
+        if !self.dest_is_gcref(dest_ty) {
+            return Ok(false);
+        }
+        let Some(recv_ty) = first_arg_ty else {
+            return Ok(false);
+        };
+        let Some(peeled) = self.peel_to_option_or_result(recv_ty) else {
+            return Ok(false);
+        };
+        if !crate::front::result_exc::tyref_is_option(&peeled, self.llbc)
+            || !self.tyref_is_niche_option_ptr(&peeled)
+        {
+            return Ok(false);
+        }
+        let recv = args[0].clone();
+        let bb_id = self.emit_bb(mir_bb);
+        let none = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(none.clone()),
+            kind: OpKind::ConstNone,
+        });
+        let disc = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(disc.clone()),
+            kind: OpKind::BinOp {
+                op: "is_".to_string(),
+                lhs: recv.clone(),
+                rhs: none,
+                result_ty: ValueType::Int,
+            },
+        });
+        let none_extras: Vec<Variable> = default_var.into_iter().collect();
+        self.close_call_diamond(
+            mir_bb,
+            target,
+            dest_local,
+            disc,
+            false,
+            false,
+            none_extras.as_slice(),
+            std::slice::from_ref(&recv),
+            |_, _, mapped| {
+                mapped
+                    .first()
+                    .cloned()
+                    .expect("unwrap_or default is threaded")
+            },
+            |_, _, mapped| mapped[0].clone(),
+        )?;
+        Ok(true)
+    }
+
+    /// `decode_utf8_with_errors(data, len, "replace")` then Ok payload as STR.
+    /// The registered FunDecl window-expands `&[u8]` so the call is
+    /// `{CCHARP, len, err_mode}`. `unicodehelper.py str_decode_utf8`
+    /// replace never returns Err.
+    fn emit_decode_utf8_replace_to_dest(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        target: usize,
+        window: Vec<Variable>,
+    ) -> Result<bool, LowerError> {
         let Some(decode_id) = self.decode_utf8_with_errors_fun_decl_id() else {
             return Ok(false);
         };
@@ -4674,14 +5199,15 @@ impl<'a> Lowering<'a> {
         else {
             return Ok(false);
         };
-        let bytes = args[0].clone();
         let bb_id = self.emit_bb(mir_bb);
         let replace = emit_str_const(&mut self.graph, bb_id, "replace");
+        let mut decode_args = window;
+        decode_args.push(replace);
         let result_var = self.emit_fun_decl_call(
             bb_id,
             decode_id,
             segments,
-            vec![bytes, replace],
+            decode_args,
             ValueType::Ref(Some(result_owner.clone())),
         );
         let disc = emit_enum_disc_read(&mut self.graph, bb_id, result_var.clone(), &result_owner);
@@ -5035,6 +5561,27 @@ impl<'a> Lowering<'a> {
             && tyref_is_copy_scalar_or_thin_ptr(dest_ty, self.llbc)
     }
 
+    /// `core::default::<Impl>::default` / `alloc::string::<Impl>::default`
+    /// / `String::new` of a string-family dest: empty rstr `STR`. The
+    /// lookalike `core::default::Default::default` stays residual.
+    pub(in crate::front::mir) fn is_string_family_default(
+        &self,
+        reg: &RegularCall,
+        dest_ty: &TyRef,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let path = fd.item_meta.name_path();
+        (is_core_default_path(path.as_str())
+            || is_alloc_string_default_path(path.as_str())
+            || is_alloc_string_new_path(path.as_str()))
+            && tyref_is_string_family(dest_ty, self.llbc)
+    }
+
     /// `core::tuple::<Impl>::default` whose destination is a non-unit
     /// tuple whose every element has a Default the front end already
     /// lowers (primitive scalar zero, unit / `PhantomData`, empty `Vec`,
@@ -5181,12 +5728,13 @@ impl<'a> Lowering<'a> {
         }
         // A primitive scalar's default is zero. A thin pointer is not
         // accepted: `Box<T>::default` allocates a `T::default()`, not null.
-        // A rust-heap `String` is `{cap, ptr, len}` and is not the empty
-        // rstr `STR` this path emits.
+        // A rust-heap `String` is `{cap, ptr, len}` at the Rust layout
+        // and empty rstr `STR` in the lifted model.
         tyref_default_is_unit(ty, self.llbc)
             || tyref_is_primitive_scalar(ty, self.llbc)
             || tyref_is_vec_value(ty, self.llbc)
             || tyref_is_string_value(ty, self.llbc)
+            || tyref_is_rust_heap_string(ty, self.llbc)
     }
 
     /// Default of `ty`: primitive scalar zero, unit / `PhantomData`,
@@ -5210,7 +5758,7 @@ impl<'a> Lowering<'a> {
         if tyref_is_vec_value(ty, self.llbc) {
             return Some(self.emit_vec_new(bb_id, ty));
         }
-        if tyref_is_string_value(ty, self.llbc) {
+        if tyref_is_string_value(ty, self.llbc) || tyref_is_rust_heap_string(ty, self.llbc) {
             return Some(emit_str_const(&mut self.graph, bb_id, ""));
         }
         None
@@ -5373,6 +5921,7 @@ impl<'a> Lowering<'a> {
                 ),
             },
         });
+        stamp_rust_vec_header(&res, dest_ty, self.llbc);
         res
     }
 
@@ -5665,36 +6214,112 @@ impl<'a> Lowering<'a> {
         path.rsplit("::").next() == Some("default") && matches!(root, "core" | "std" | "alloc")
     }
 
-    /// `<*mut T>::add` / `<*const T>::add` / `::sub` when the pointee has a
-    /// known byte size, so the count can be scaled to a byte offset before
-    /// `lltype.direct_ptradd`.
-    pub(in crate::front::mir) fn ptr_add_pointee_size(
+    /// `TO.OF` for `lltype.direct_ptradd`. A sized scalar or ADT uses its
+    /// byte width (`item_lltype_for_size`). A generic struct (`Entry<K,V>`)
+    /// has only a symbolic Charon layout, so the item is that struct:
+    /// `rewrite_op_direct_ptradd` scales from `sizeof(TO.OF)`.
+    /// `Void` is a zero-sized pointee (the add is a no-op).
+    pub(in crate::front::mir) fn ptr_add_item_lltype(
         &self,
         reg: &RegularCall,
         first_arg_ty: Option<&TyRef>,
-    ) -> Option<i64> {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return None;
-        };
-        let fd = self.llbc.fn_by_id(*id)?;
-        let path = fd.item_meta.name_path();
-        if !is_core_ptr_add_path(path.as_str()) && !is_core_ptr_sub_path(path.as_str()) {
+    ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        if !self.ptr_add_or_sub_call(reg, first_arg_ty) {
             return None;
         }
-        let pointee = first_arg_ty.and_then(|ty| {
+        let pointee = self.ptr_add_pointee_node(first_arg_ty)?;
+        match json_ty_byte_size(pointee, self.llbc) {
+            Some(0) => Some(LowLevelType::Void),
+            Some(n) => Some(item_lltype_for_size(n)),
+            None => self.ptr_add_adt_item_lltype(pointee),
+        }
+    }
+
+    fn ptr_add_pointee_node<'b>(
+        &'b self,
+        first_arg_ty: Option<&'b TyRef>,
+    ) -> Option<&'b serde_json::Value> {
+        first_arg_ty.and_then(|ty| {
             tyref_peel_one_raw_ptr_node(ty, self.llbc)
                 .or_else(|| tyref_peel_one_ref_node(ty, self.llbc))
-        })?;
-        json_ty_byte_size(pointee, self.llbc)
+        })
+    }
+
+    fn ptr_add_adt_item_lltype(
+        &self,
+        pointee: &serde_json::Value,
+    ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, Struct};
+        let id = adt_node_def_id(pointee)?;
+        let decl = self.llbc.type_by_id(id)?;
+        let TypeDeclKind::Struct(fields) = &decl.kind else {
+            return None;
+        };
+        let name = crate::model::crate_relative_struct_owner(
+            &decl.item_meta.name_path(),
+            self.graph.name.split("::").next(),
+        );
+        if name.is_empty() {
+            return None;
+        }
+        let mut ll_fields = Vec::with_capacity(fields.len());
+        for (i, field) in fields.iter().enumerate() {
+            let fname = field_decl_name(i, field);
+            let fty = overlay_field_lltype(&field.ty, self.llbc, self.gc_struct_ids);
+            ll_fields.push((fname, fty));
+        }
+        Some(LowLevelType::Struct(Box::new(Struct::registry_fields(
+            &name,
+            ll_fields,
+            GcKind::Raw,
+        ))))
+    }
+
+    /// `<*mut T>::add` / `::sub`, including a Charon-instantiated
+    /// `{impl#N}` spelling, a residual leaf `add` on a raw pointer, and
+    /// `CallKind::Trait` `Add::add` / `Sub::sub` of a raw pointer.
+    /// `descroperation::add` of two `PyObjectRef` (`*mut PyObject`) is
+    /// Python add: rewriting it as `direct_ptradd` merges Int ∪ Ref at
+    /// `returnvar`.
+    fn ptr_add_or_sub_call(&self, reg: &RegularCall, first_arg_ty: Option<&TyRef>) -> bool {
+        let raw_ptr =
+            first_arg_ty.is_some_and(|ty| tyref_peel_one_raw_ptr_node(ty, self.llbc).is_some());
+        match &reg.kind {
+            CallKind::Fun(FunId::Regular { id }) => {
+                let Some(fd) = self.llbc.fn_by_id(*id) else {
+                    return false;
+                };
+                let path = fd.item_meta.name_path();
+                if is_core_ptr_add_path(path.as_str()) || is_core_ptr_sub_path(path.as_str()) {
+                    return true;
+                }
+                if path.split("::").any(|s| s == "descroperation") {
+                    return false;
+                }
+                raw_ptr
+                    && path
+                        .rsplit("::")
+                        .next()
+                        .is_some_and(|leaf| leaf == "add" || leaf == "sub")
+            }
+            CallKind::Trait(v) => {
+                raw_ptr
+                    && trait_payload_path_and_method(v, self.llbc)
+                        .is_some_and(|(_, method)| method == "add" || method == "sub")
+            }
+            _ => false,
+        }
     }
 
     pub(in crate::front::mir) fn ptr_offset_is_sub(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        self.llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| is_core_ptr_sub_path(fd.item_meta.name_path().as_str()))
+        match &reg.kind {
+            CallKind::Fun(FunId::Regular { id }) => self
+                .llbc
+                .fn_by_id(*id)
+                .is_some_and(|fd| is_core_ptr_sub_path(fd.item_meta.name_path().as_str())),
+            _ => false,
+        }
     }
 
     /// `(header as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET)` — `s.chars`
@@ -5783,7 +6408,7 @@ impl<'a> Lowering<'a> {
         if !tyref_is_copy_scalar_or_thin_ptr(ty, self.llbc) {
             return None;
         }
-        json_ty_raw_store_descr(tyref_node(ty, self.llbc)?, self.llbc)
+        json_ty_raw_store_descr(tyref_node(ty, self.llbc)?, self.llbc, self.gc_struct_ids)
     }
 
     pub(in crate::front::mir) fn emit_zero_constant_of_ty(

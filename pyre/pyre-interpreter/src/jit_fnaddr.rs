@@ -1640,6 +1640,20 @@ fn push_raw_fnaddr(
     }
 }
 
+/// Publish a `MapdictMixinAccess` slot function at its own address.
+///
+/// `CallControl.get_jitcode` stamps `JitCode.fnaddr` from this word
+/// (`getfunctionptr`). The walker `bytecode_for_address` looks up the
+/// Const funcbox, which is the vtable slot. A residual-ABI trampoline
+/// would be a different address and miss.
+fn push_mapdict_access_fnaddr(
+    entries: &mut Vec<(&'static str, i64)>,
+    path: &'static str,
+    addr: usize,
+) {
+    push_raw_fnaddr(entries, path, addr as *const ());
+}
+
 /// Alias-pair form for an address a `runtime_ops` arity-to-address accessor
 /// already checked.
 ///
@@ -2236,6 +2250,22 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         cp0!(&mut entries, path, func);
         if let Some((_crate_seg, rest)) = path.split_once("::") {
             cp0!(&mut entries, rest, func);
+        }
+    });
+
+    // `MapdictMixinAccess` slot functions (`mapdict_mixin_access!`) plus
+    // the shared `base_user_class_mapdict_getclass` FunDecl. `CallControl.get_jitcode`
+    // stamps `JitCode.fnaddr` as `getfunctionptr(graph)` would;
+    // `runtime_fnaddr_by_path` / `runtime_fnaddr_patch` rewrite the shell
+    // onto the vtable word so `bytecode_for_address` hits. Nested slot
+    // addresses are the field itself, captured in pyre-object. The shared
+    // getclass is published once under its FunDecl path. Crate-stripped
+    // aliases match the translator member path
+    // `discover_fnptr_field_families` registers.
+    pyre_object::mapdict::for_each_mapdict_access_fnaddr(|path, addr| {
+        push_mapdict_access_fnaddr(&mut entries, path, addr);
+        if let Some((_crate_seg, rest)) = path.split_once("::") {
+            push_mapdict_access_fnaddr(&mut entries, rest, addr);
         }
     });
 
@@ -8752,6 +8782,63 @@ mod tests {
         assert_eq!(
             bindings["module::_collections::deque_iter::type_object"],
             expected
+        );
+    }
+
+    /// `mapdict_mixin_access!` publishes each slot at the FunDecl path
+    /// `discover_fnptr_field_families` registers, and the address is the
+    /// vtable word (`getfunctionptr` / `CallControl.get_jitcode` /
+    /// `bytecode_for_address`).
+    #[test]
+    fn jit_trace_fnaddrs_publishes_mapdict_access_slot_words() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let qualified = "pyre_object::objectobject::W_OBJECT_OBJECT_MAPDICT_ACCESS::getclass";
+        let stripped = "objectobject::W_OBJECT_OBJECT_MAPDICT_ACCESS::getclass";
+        let mut registry_addr = None;
+        pyre_object::mapdict::for_each_mapdict_access_fnaddr(|path, addr| {
+            if path == qualified {
+                registry_addr = Some(addr as i64);
+            }
+        });
+        let slot = registry_addr.expect(qualified);
+        assert_eq!(
+            bindings[qualified], slot,
+            "{qualified} must be the getclass slot word"
+        );
+        assert_eq!(
+            bindings[stripped], slot,
+            "{stripped} must equal the translator member path"
+        );
+        let field_word =
+            pyre_object::objectobject::W_OBJECT_OBJECT_MAPDICT_ACCESS.getclass as usize as i64;
+        assert_eq!(
+            slot, field_word,
+            "registry capture must equal the static field"
+        );
+        for field in ["get_map", "set_map", "get_storage", "set_storage"] {
+            let path =
+                format!("pyre_object::objectobject::W_OBJECT_OBJECT_MAPDICT_ACCESS::{field}");
+            assert!(
+                bindings.contains_key(path.as_str()),
+                "{path} must publish from the same carrier"
+            );
+        }
+        let shared = "pyre_object::mapdict::base_user_class_mapdict_getclass";
+        let shared_stripped = "mapdict::base_user_class_mapdict_getclass";
+        let shared_addr =
+            pyre_object::mapdict::base_user_class_mapdict_getclass as *const () as usize as i64;
+        assert_eq!(
+            bindings[shared], shared_addr,
+            "{shared} must be the shared getclass FunDecl"
+        );
+        assert_eq!(
+            bindings[shared_stripped], shared_addr,
+            "{shared_stripped} must equal the translator member path"
+        );
+        assert!(
+            !bindings
+                .contains_key("pyre_object::bytesobject::W_BYTES_USER_MAPDICT_ACCESS::getclass"),
+            "default-arm carriers must not publish a per-carrier getclass path"
         );
     }
 

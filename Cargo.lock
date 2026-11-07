@@ -2996,6 +2996,7 @@ dependencies = [
  "majit-rlib",
  "num-traits",
  "parking_lot",
+ "paste",
  "pyre-macros",
  "rustpython-wtf8",
 ]

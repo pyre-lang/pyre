@@ -1641,8 +1641,19 @@ pub(crate) fn latch_bridge_abort_and_publish_carrier_locals<Sym: WalkSym>(
     // A helper jitcode (`drive_helper_innermost_subwalk`) has no PyFrame
     // virtualizable, so `write_boxes` is not called; the latched image
     // stays.
-    if (accepted || abort_blackhole_latched()) && !concrete_callee_frame.is_null() {
-        publish_callee_locals_region(&sub_wc.frame_state, concrete_callee_frame);
+    if accepted || abort_blackhole_latched() {
+        // GCREF local reloaded after a collecting call: `callee_shadow.concrete_frame`.
+        let walked_callee_frame = sub_wc
+            .frame_state
+            .borrow()
+            .callee_shadow
+            .as_ref()
+            .map_or(concrete_callee_frame as usize, |shadow| {
+                shadow.concrete_frame
+            }) as *mut pyre_interpreter::PyFrame;
+        if !walked_callee_frame.is_null() {
+            publish_callee_locals_region(&sub_wc.frame_state, walked_callee_frame);
+        }
     }
     accepted
 }
@@ -2520,10 +2531,17 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             // shadow locals (`virtualizable.py write_boxes`) through main's
             // helper. Relatching this reconstructed parent at `error.stop_pc()`
             // would pair the nested pc with the parent's seed banks.
+            // GCREF local reloaded after a collecting call: `callee_shadow.concrete_frame`.
+            let walked_callee_frame = sub_wc
+                .frame_state
+                .borrow()
+                .callee_shadow
+                .as_ref()
+                .map_or(concrete_callee_frame, |shadow| shadow.concrete_frame);
             let accepted = latch_bridge_abort_and_publish_carrier_locals(
                 &sub_wc,
                 error,
-                concrete_callee_frame as *mut pyre_interpreter::PyFrame,
+                walked_callee_frame as *mut pyre_interpreter::PyFrame,
             );
             if let Some(already_latched) = already_latched {
                 eprintln!(

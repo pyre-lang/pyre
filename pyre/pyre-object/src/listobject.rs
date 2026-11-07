@@ -338,16 +338,22 @@ pub struct W_ListObject {
 #[repr(C)]
 pub struct W_ListObjectUser {
     pub base: W_ListObject,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(W_ListObjectUser, storage)
-            == std::mem::offset_of!(W_ListObjectUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(W_ListObjectUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
+
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_LIST_USER_MAPDICT_ACCESS for W_ListObjectUser;
+}
 
 /// GC type id assigned to `W_ListObject` at `JitDriver` init time.
 /// Held as a constant here (rather than runtime-queried) so
@@ -2104,7 +2110,7 @@ pub fn w_list_user_new_empty(w_class: PyObjectRef) -> PyObjectRef {
             bytes_items: BytesArray::empty(),
             ascii_items: UnicodeArray::empty(),
         },
-        map: 0,
+        map: std::ptr::null(),
         storage: std::ptr::null_mut(),
     };
     if raw.is_null() {

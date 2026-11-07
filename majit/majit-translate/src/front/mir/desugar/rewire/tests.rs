@@ -203,6 +203,26 @@ fn std_extern_path_predicates_match_exact_full_paths_only() {
     ));
     assert!(!super::is_core_default_path("core::tuple::<Impl>::default"));
 
+    assert!(super::is_alloc_string_default_path(
+        "alloc::string::<Impl>::default"
+    ));
+    assert!(super::is_alloc_string_default_path(
+        "alloc::string::String::default"
+    ));
+    assert!(!super::is_alloc_string_default_path(
+        "alloc::string::<Impl>::new"
+    ));
+    assert!(super::is_alloc_string_new_path(
+        "alloc::string::<Impl>::new"
+    ));
+    assert!(super::is_alloc_string_new_path(
+        "alloc::string::String::new"
+    ));
+    assert!(!super::is_alloc_string_new_path(
+        "alloc::string::<Impl>::from"
+    ));
+    assert!(!super::is_alloc_string_new_path("alloc::vec::<Impl>::new"));
+
     assert!(super::is_core_tuple_default_path(
         "core::tuple::<Impl>::default"
     ));
@@ -218,6 +238,9 @@ fn std_extern_path_predicates_match_exact_full_paths_only() {
     ));
     assert!(super::is_core_ptr_add_path(
         "core::ptr::const_ptr::<Impl>::add"
+    ));
+    assert!(super::is_core_ptr_add_path(
+        "core::ptr::mut_ptr::{impl#0}::add"
     ));
     assert!(!super::is_core_ptr_add_path(
         "core::ptr::mut_ptr::<Impl>::wrapping_add"

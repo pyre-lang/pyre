@@ -285,6 +285,11 @@ impl CodeWriter {
         // MethodDesc family via the attrfamily merge.  No-op for pyre
         // production (no families).
         registry.populate_trait_family_base_attrs(callcontrol.trait_family_registrations());
+        // Harvested struct FnPtr fields (`MapdictMixinAccess.getclass`):
+        // intern the slot as a function `SomePBC` of the family's
+        // `FunctionDesc`s (`ClassRepr.getclsfield`). Dyn-trait keys in
+        // `indirect_family_impls` are skipped — they are not FnPtr fields.
+        registry.seed_fnptr_field_pbc_attrs(callcontrol.indirect_family_impls());
         // RPython parity: `Translator.buildannotator()` /
         // `Translator.buildrtyper()` (`translator.py`) construct
         // exactly one annotator and one rtyper per Translator and assert
@@ -458,7 +463,9 @@ impl CodeWriter {
                 // decode helper's argument list is partitioned off the legacy
                 // key Variable's cell, so it has to carry the real kind
                 // before jtransform partitions it.  This is the only copy:
-                // jtransform's own retypes stand after it.
+                // jtransform's own retypes stand after it. Annotation
+                // (`SomeInteriorPtr.offsets`) is copied too, so
+                // `rewrite_store_through_ptr` can read the field name.
                 crate::codewriter::type_state::apply_from_flowspace_variables(&real_value_to_var);
                 crate::codewriter::type_state::apply_from_flowspace_constants(&real_constants);
                 Some((real_value_to_var, const_results))
@@ -763,6 +770,10 @@ impl CodeWriter {
                 &mut graph_owned,
                 value_to_var,
                 callcontrol,
+            );
+            crate::codewriter::interior_ptr::rewrite_store_through_ptr(
+                &mut graph_owned,
+                value_to_var,
             );
         }
         // rstr.py `StringRepr.convert_const` resolves string literals into

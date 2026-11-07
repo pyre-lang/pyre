@@ -2125,7 +2125,7 @@ pub(in crate::front::mir) fn declared_raw_adt_node<'a>(
     // A raw struct's fields are addresses and scalars. A GC pointer field
     // would be `getfield_raw_r`; `rewrite_op_getfield` raises only for a
     // non-pure `getfield_raw_r`, so an `_immutable_fields_` GC field is
-    // still raw storage (`MapNodeTerminatorView.w_cls`).
+    // still raw storage (an `_immutable_fields_` GCREF on a raw overlay).
     let def_id = adt_node_def_id(node)?;
     let mut stack = Vec::new();
     if !adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, immutable_fields, &mut stack) {
@@ -2860,6 +2860,8 @@ pub(in crate::front::mir) struct LlbcDerived {
     /// A copied TypeDecl in a later crate does not see a marker that
     /// lives only on the defining artefact.
     exception_class_hints: std::sync::OnceLock<Vec<crate::front::llbc_hints::ExceptionClassHint>>,
+    pub(in crate::front::mir) fnptr_field_families:
+        std::sync::OnceLock<Vec<(String, String, String)>>,
 }
 
 pub(in crate::front::mir) fn llbc_derived(llbc: &Llbc) -> &LlbcDerived {
@@ -4387,7 +4389,13 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     let adt = node.as_object()?.get("Adt")?.as_object()?;
     let td = llbc.type_by_id(adt_node_def_id(node)?)?;
     if !matches!(td.kind, TypeDeclKind::Enum(_)) {
-        return adt_node_class_root_with(node, llbc, no_tombstoned_leaves());
+        let root = adt_node_class_root_with(node, llbc, no_tombstoned_leaves())?;
+        // GCREFOpaque implements GcType so it is a named ADT, but the
+        // residual is `lltype.GCREF` (`SomePtr`), not a ClassDef.
+        if crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
+            return None;
+        }
+        return Some(root);
     }
     let type_args = adt
         .get("generics")
@@ -5503,6 +5511,20 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     if td.item_meta.name_path() == "alloc::boxed::Box" {
         return None;
     }
+    // `Cell<T>` / `UnsafeCell<T>` are the slot, not a nested RPython
+    // struct (`nestedscope.py CellFamily.ever_mutated`). Expanding the
+    // payload as `{field}.value` misses fielddescrof.
+    if tyref_is_unsafecell(ty, llbc) || tyref_is_std_cell(ty, llbc) {
+        return None;
+    }
+    let path = td.item_meta.name_path();
+    if path == "cell::Cell"
+        || path == "cell::UnsafeCell"
+        || path.ends_with("::UnsafeCell")
+        || path.ends_with("::cell::Cell")
+    {
+        return None;
+    }
     if !matches!(td.kind, TypeDeclKind::Struct(_)) {
         return None;
     }
@@ -5641,18 +5663,25 @@ pub(in crate::front::mir) fn type_decl_by_owner_root<'l>(
     owner: &str,
 ) -> Option<&'l TypeDecl> {
     let index = struct_decls_by_owner(llbc);
-    let start = index.exact.partition_point(|(k, _)| k.as_str() < owner);
-    if let Some((key, pos)) = index.exact.get(start)
+    decl_by_owner_keys(&index.exact, &index.leaf, llbc, owner)
+}
+
+fn decl_by_owner_keys<'l>(
+    exact: &[(String, usize)],
+    leaf: &[(String, usize)],
+    llbc: &'l Llbc,
+    owner: &str,
+) -> Option<&'l TypeDecl> {
+    let start = exact.partition_point(|(k, _)| k.as_str() < owner);
+    if let Some((key, pos)) = exact.get(start)
         && key == owner
     {
         return llbc.type_by_id(*pos as u64);
     }
     let owner_leaf = owner.rsplit("::").next().unwrap_or(owner);
-    let start = index.leaf.partition_point(|(k, _)| k.as_str() < owner_leaf);
-    let end = index
-        .leaf
-        .partition_point(|(k, _)| k.as_str() <= owner_leaf);
-    match &index.leaf[start..end] {
+    let start = leaf.partition_point(|(k, _)| k.as_str() < owner_leaf);
+    let end = leaf.partition_point(|(k, _)| k.as_str() <= owner_leaf);
+    match &leaf[start..end] {
         [(_, pos)] => llbc.type_by_id(*pos as u64),
         _ => None,
     }
@@ -6751,6 +6780,19 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
     if !decl.is_repr_transparent() {
         return None;
     }
+    // `Cell<T>` / `UnsafeCell<T>` are the slot, not `T`. Peeling them
+    // for value typing makes `Cell<bool>::set` and `Cell<PyObjectRef>::set`
+    // share one residual graph named `set` whose slot 0 is Bool ∪ PyObject
+    // (`annrpython.py` `mergeinputargs`). `Cell::get` is a field read
+    // (`is_cell_get`); the wrapper stays the Input class.
+    let path = decl.item_meta.name_path();
+    if path == "core::cell::Cell"
+        || path.ends_with("::Cell")
+        || path == "core::cell::UnsafeCell"
+        || path.ends_with("::UnsafeCell")
+    {
+        return None;
+    }
     match &decl.kind {
         TypeDeclKind::Struct(fields) if !decl.published_struct_copy => {
             let field = if let Some((index, _)) = transparent_nonzst_field(decl, llbc) {
@@ -6819,6 +6861,17 @@ pub(in crate::front::mir) fn transparent_scalar_value_type(
 pub(in crate::front::mir) fn tyref_is_unsafecell(ty: &TyRef, llbc: &Llbc) -> bool {
     adt_path_of_tyref(ty, llbc)
         .is_some_and(|p| p == "core::cell::UnsafeCell" || p.ends_with("::UnsafeCell"))
+}
+
+/// `core::cell::Cell<T>` (not `nestedscope::Cell`).
+pub(in crate::front::mir) fn tyref_is_std_cell(ty: &TyRef, llbc: &Llbc) -> bool {
+    adt_path_of_tyref(ty, llbc).is_some_and(|p| {
+        p == "core::cell::Cell"
+            || p == "std::cell::Cell"
+            || p == "crate::cell::Cell"
+            || p == "cell::Cell"
+            || p.ends_with("::cell::Cell")
+    })
 }
 
 /// `Arg<T>` from `rustpython_compiler_core::bytecode::instruction` —
@@ -7373,7 +7426,8 @@ pub(in crate::front::mir) fn split_struct_instantiation_suffix(
 /// getkind, `SomePtr`), the node is not a pointer (a by-value
 /// transparent handle keeps its own class), the pointee is a Raw
 /// struct (`&mut S` stays `Ref(None)` with `class_root` on the Input),
-/// or the pointee has no class root (`GCREFOpaque`, `*mut u8`). The
+/// or the pointee is GCREF erasure (`GCREFOpaque`) / has no class root
+/// (`*mut u8`). The
 /// spelling is the same `adt_node_class_root_with` produces
 /// (`"pyobject::PyObject"`), which `Bookkeeper::project_struct_field_type` /
 /// `lltype_for_named_ref` resolve to the classdef.
@@ -7408,7 +7462,11 @@ pub(in crate::front::mir) fn registered_gc_ptr_class_root_with(
     let pointee = one_level_pointer_pointee(node, llbc)?;
     let pointee = strip_ty_wrappers(pointee, llbc)?;
     let sid = declared_adt_struct_id(pointee, llbc)?;
-    if !gc_struct_ids.contains(&sid) {
+    let name = adt_node_def_id(pointee)
+        .and_then(|id| llbc.type_by_id(id))
+        .map(|td| strip_crate_prefix(&td.item_meta.name_path()))
+        .unwrap_or_default();
+    if !struct_id_is_declared_gc(gc_struct_ids, sid, &name) {
         return None;
     }
     let root = adt_node_class_root_with(pointee, llbc, tombstoned)?;
@@ -9187,6 +9245,24 @@ pub(in crate::front::mir) fn tyref_is_inline_fat_ptr(ty: &TyRef, llbc: &Llbc) ->
     tyref_is_inline_fat_box(ty, llbc) || tyref_is_fat_ref(ty, llbc)
 }
 
+/// `&[T]` / `&mut [T]`: a `Ref` whose pointee is Charon's `Slice`.
+/// `Box<[T]>::deref` returns this; identity-alias it onto the Box, which
+/// is already the list (`rlist.py` `ll_fixed_items`).
+pub(in crate::front::mir) fn tyref_is_slice_ref(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    let Some(pointee) = node
+        .get("Ref")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.get(1))
+        .and_then(|pointee| strip_ty_indirections(pointee, llbc))
+    else {
+        return false;
+    };
+    pointee.get("Slice").is_some()
+}
+
 pub(in crate::front::mir) fn tyref_is_fat_ref(ty: &TyRef, llbc: &Llbc) -> bool {
     let Some(node) = tyref_node(ty, llbc) else {
         return false;
@@ -10028,11 +10104,42 @@ pub(in crate::front::mir) fn json_ty_byte_size(
         .map(|size| size as i64)
 }
 
+/// Immediate pointee of a thin pointer is a declared-GC ADT
+/// (`history.getkind` of `Ptr(TO)` follows `TO._gckind`). A pointer to
+/// a GCREF stays a raw address: that pointee is itself a pointer, not
+/// an ADT.
+fn json_ty_thin_ptr_pointee_is_declared_gc(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
+    let Some(pointee) = one_level_pointer_pointee(node, llbc)
+        .and_then(|p| type_node_peel_aliases(p, llbc))
+        .and_then(|p| strip_ty_indirections(p, llbc))
+    else {
+        return false;
+    };
+    let Some(sid) = declared_adt_struct_id(pointee, llbc) else {
+        return false;
+    };
+    let name = adt_node_def_id(pointee)
+        .and_then(|id| llbc.type_by_id(id))
+        .map(|td| strip_crate_prefix(&td.item_meta.name_path()))
+        .unwrap_or_default();
+    struct_id_is_declared_gc(gc_struct_ids, sid, &name)
+}
+
 pub(in crate::front::mir) fn json_ty_raw_store_descr(
     node: &serde_json::Value,
     llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> Option<(ValueType, usize, bool)> {
     let node = strip_ty_indirections(node, llbc)?;
+    // A GCREF is not a raw-store word (`rewrite_op_raw_store` refuses
+    // kind `'r'`). The pointee's `GcType` seed is the gckind.
+    if json_ty_thin_ptr_pointee_is_declared_gc(node, llbc, gc_struct_ids) {
+        return None;
+    }
     if json_ty_is_thin_pointer_element(node, llbc) {
         return Some((ValueType::Int, crate::layout::target_word_size(), false));
     }

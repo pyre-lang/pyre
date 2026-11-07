@@ -2275,6 +2275,12 @@ impl RPythonTyper {
             // matching `pair(r_arg1, r_arg2).rtype_*`.
             "getattr" => self.translate_unary_operation(hop, |r, hop| r.rtype_getattr(hop)),
             "setattr" => self.translate_unary_operation(hop, |r, hop| r.rtype_setattr(hop)),
+            "interior_ptr_expose" => {
+                self.translate_unary_operation(hop, |r, hop| r.rtype_interior_ptr_expose(hop))
+            }
+            "store_through_ptr" => {
+                self.translate_unary_operation(hop, |r, hop| r.rtype_store_through_ptr(hop))
+            }
             "len" => self.translate_unary_operation(hop, |r, hop| r.rtype_len(hop)),
             "bool" => self.translate_unary_operation(hop, |r, hop| r.rtype_bool(hop)),
             "simple_call" => self.translate_unary_operation(hop, |r, hop| r.rtype_simple_call(hop)),

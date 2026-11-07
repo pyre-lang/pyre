@@ -6242,6 +6242,10 @@ fn write_frame_local_word(frame_now: usize, abs: usize, word: PyObjectRef) -> bo
     if frame_now == 0 {
         return false;
     }
+    // GCREF local reloaded after a collecting call: `OwnerRootGuard` then `current_live_frame_array`.
+    let Some((frame_now, arr_ptr)) = current_live_frame_array(frame_now) else {
+        return false;
+    };
     // A reused nursery slot's forwarding word is the debug fill. That
     // address is not a live object; writing through it faults.
     // `gc_owns_object` is also false when no collector exists, which is
@@ -6250,11 +6254,7 @@ fn write_frame_local_word(frame_now: usize, abs: usize, word: PyObjectRef) -> bo
     if majit_gc::gc_owns_object_hook_installed() && !majit_gc::gc_owns_object(frame_now) {
         return false;
     }
-    let arr_ptr = unsafe {
-        *((frame_now as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
-            as *const *mut pyre_object::FixedObjectArray)
-    };
-    if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() <= abs {
+    if unsafe { &*arr_ptr }.as_slice().len() <= abs {
         return false;
     }
     unsafe {

@@ -150,16 +150,22 @@ pub fn w_module_new_managed(name: &str) -> PyObjectRef {
 #[repr(C)]
 pub struct ModuleUser {
     pub base: Module,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(ModuleUser, storage)
-            == std::mem::offset_of!(ModuleUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(ModuleUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
+
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_MODULE_USER_MAPDICT_ACCESS for ModuleUser;
+}
 
 /// User-subclass module layout. Appended after the closed ids, ahead of
 /// the target-gated tail (`build_gc`).
@@ -191,7 +197,7 @@ pub fn w_module_user_new(w_class: PyObjectRef) -> PyObjectRef {
     };
     crate::lltype::malloc_typed_stable(ModuleUser {
         base: value,
-        map: 0,
+        map: std::ptr::null(),
         storage: std::ptr::null_mut(),
     }) as PyObjectRef
 }

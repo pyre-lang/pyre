@@ -2,7 +2,8 @@
 //! targets that would otherwise have identical bodies.
 //!
 //! RPython's genc emits one C function per graph (`FunctionCodeGenerator`)
-//! and never merges two graphs. `drain_list_append` keeps a forwarding call
+//! and never merges two graphs; `pyjitpl.py` `MetaInterpStaticData.bytecode_for_address`
+//! asserts the address is absent. `drain_list_append` keeps a forwarding call
 //! for the same reason: one published address must name one function
 //! (`registered_paths_sharing_an_address_are_alias_spellings`).
 //!
@@ -12,13 +13,17 @@
 //! clobber was inlined into interpreter hot loops (dict ops, shadow-stack
 //! push/pop).
 //!
-//! Native: empty `asm!` with `nomem, nostack, preserves_flags` whose template
-//! comment carries a unique `const` immediate. LLVM MergeFunctions sees
-//! distinct IR; inlined copies lower to zero instructions and do not clobber
-//! memory. The token lives in this crate so Charon extracts a Call (the same
-//! shape as `black_box`) rather than an `asm!` terminator the ULLBC reader
-//! maps to `TermKind::Unknown`. wasm32 has no stable inline `asm!`; a
-//! volatile read of the const local is a single-location load.
+//! Native x86_64: `asm!` with `nomem, nostack, preserves_flags` whose
+//! template is a multi-byte NOP whose 32-bit displacement is the low 32
+//! bits of the unique `const` immediate (`0F 1F 80 <disp32>`). LLVM
+//! MergeFunctions sees distinct IR; a folding linker (MSVC `/OPT:ICF`)
+//! sees distinct machine bytes. Inlined copies still do not clobber
+//! memory: a NOP's memory operand is not accessed. Other native targets
+//! keep the comment-only template (distinct IR, zero instructions). The
+//! token lives in this crate so Charon extracts a Call (the same shape as
+//! `black_box`) rather than an `asm!` terminator the ULLBC reader maps to
+//! `TermKind::Unknown`. wasm32 has no stable inline `asm!`; a volatile
+//! read of the const local is a single-location load.
 //!
 //! The translator erases that Call (`Lowering::is_icf_identity_token`):
 //! upstream `dont_look_inside` (`rpython/rlib/jit.py`) is metadata only, and
@@ -39,9 +44,26 @@ pub const fn icf_path_hash(s: &str) -> u64 {
 }
 
 /// Keep this helper body distinct from every other published helper.
+///
+/// Native x86_64 emits a NOP carrying the immediate so a folding linker
+/// (MSVC `/OPT:ICF`) also sees distinct bytes; other native targets keep
+/// the comment form.
 #[inline(always)]
 pub fn icf_identity_token<const ID: u64>() {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: the template is a multi-byte NOP; the memory operand is
+        // not accessed. nomem/nostack/preserves_flags, so the block neither
+        // reads nor writes memory.
+        unsafe {
+            core::arch::asm!(
+                "nop dword ptr [rax + {0}]",
+                const (ID as u32) as i32,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+    }
+    #[cfg(all(not(target_arch = "wasm32"), not(target_arch = "x86_64")))]
     {
         // SAFETY: the template is a comment; nomem/nostack/preserves_flags,
         // so the block neither reads nor writes memory.

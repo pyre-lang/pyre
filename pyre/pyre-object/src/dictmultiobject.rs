@@ -2335,7 +2335,7 @@ pub unsafe fn w_module_dict_switch_to_object_strategy(obj: PyObjectRef) {
     let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
         object_dict_storage_new(),
         object_dict_storage_gc_type_id(),
-    );
+    ) as *mut ObjectDictStorage;
     let new_map = &mut *new_storage;
     for (i, &hash) in hashes.iter().enumerate() {
         new_map.insert(
@@ -5676,7 +5676,7 @@ pub unsafe fn w_dict_switch_int_to_object_strategy(w_dict: PyObjectRef) {
     let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
         object_dict_storage_with_capacity(len),
         object_dict_storage_gc_type_id(),
-    );
+    ) as *mut ObjectDictStorage;
     let new_map = &mut *new_storage;
     // `ll_getitem_fast` on the hash/pair arrays, not `Enumerate`.
     let hash_p = hashes.as_ptr();
@@ -5864,7 +5864,7 @@ pub unsafe fn w_dict_switch_bytes_to_object_strategy(w_dict: PyObjectRef) {
     let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
         object_dict_storage_with_capacity(len),
         object_dict_storage_gc_type_id(),
-    );
+    ) as *mut ObjectDictStorage;
     let new_map = &mut *new_storage;
     let hash_p = hashes.as_ptr();
     let mut i = 0usize;
@@ -7874,7 +7874,7 @@ impl DictStrategy for ObjectDictStrategy {
         crate::gc_storage::gc_alloc_young_storage_box(
             crate::dictmultiobject::object_dict_storage_new(),
             crate::dictmultiobject::object_dict_storage_gc_type_id(),
-        ) as GCREF
+        )
     }
 
     /// `dictmultiobject.py getitem` — `self.unerase
@@ -8060,7 +8060,7 @@ impl DictStrategy for BytesDictStrategy {
         crate::gc_storage::gc_alloc_young_storage_box(
             crate::dictmultiobject::BytesDictStorage::new(),
             crate::dictmultiobject::bytes_dict_storage_gc_type_id(),
-        ) as GCREF
+        )
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.getitem`.
@@ -8276,7 +8276,7 @@ impl DictStrategy for UnicodeDictStrategy {
         crate::gc_storage::gc_alloc_young_storage_box(
             crate::dictmultiobject::object_dict_storage_new(),
             crate::dictmultiobject::object_dict_storage_gc_type_id(),
-        ) as GCREF
+        )
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.getitem`.
@@ -8545,7 +8545,7 @@ impl DictStrategy for IntDictStrategy {
         crate::gc_storage::gc_alloc_young_storage_box(
             crate::dictmultiobject::IntDictStorage::new(),
             crate::dictmultiobject::int_dict_storage_gc_type_id(),
-        ) as GCREF
+        )
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.getitem`.

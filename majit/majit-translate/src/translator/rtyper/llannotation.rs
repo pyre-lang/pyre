@@ -251,40 +251,53 @@ impl SomePtr {
         };
         let example = self.ll_ptrtype._example();
         match example._lookup_adtmeth(attr) {
-            Err(lltype::AttributeError) => match example.getattr(attr) {
-                Ok(v) => {
-                    let s = ll_to_annotation(v);
-                    Ok(gc_class_root_ptr_as_instance(&s).unwrap_or(s))
+            Err(lltype::AttributeError) => {
+                // `direct_ptradd` stamps `CArrayPtr(item)` so
+                // `rewrite_op_direct_ptradd` can read `sizeof(TO.OF)`.
+                // Field getattr of a named struct item reads `Array.OF`
+                // (`_example()` of a length-0 array cannot `getitem(0)`).
+                if let Some(field_t) = carray_item_struct_field_type(&self.ll_ptrtype, attr) {
+                    return Ok(carray_item_field_annotation(field_t));
                 }
-                // A raw-pointer `p.is_null()` whose receiver keeps its
-                // `SomePtr` tag (e.g. the `*mut u8` opaque GCREF from
-                // `try_gc_alloc_stable_raw`, `TO: Opaque(GCREF)`) reaches
-                // this `SomePtr.getattr` rather than the `SomeObject` /
-                // `SomeInstance` `is_null` arms.  `front::mir` already
-                // routed it as `CallTarget::Method { name: "is_null",
-                // receiver_root: "mut_ptr"/"const_ptr" }`, which
-                // `jtransform` lowers to `ptr_iszero` regardless of the
-                // receiver repr; answer the getattr with the same
-                // `ptr_method_is_null` bound method so the result types as
-                // `SomeBool`.  Last-resort after both `_lookup_adtmeth` and
-                // the struct-field `getattr`, so a real `is_null` adt
-                // member or field is never shadowed.
-                Err(_) if attr == "is_null" => {
-                    Ok(SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
-                        "ptr_method_is_null",
-                        SomeValue::Ptr(self.clone()),
-                        "is_null",
-                    )))
+                match example.getattr(attr) {
+                    Ok(v) => {
+                        let s = ll_to_annotation(v);
+                        Ok(gc_class_root_ptr_as_instance(&s).unwrap_or(s))
+                    }
+                    // A raw-pointer `p.is_null()` whose receiver keeps its
+                    // `SomePtr` tag (e.g. the `*mut u8` opaque GCREF from
+                    // `try_gc_alloc_stable_raw`, `TO: Opaque(GCREF)`) reaches
+                    // this `SomePtr.getattr` rather than the `SomeObject` /
+                    // `SomeInstance` `is_null` arms.  `front::mir` already
+                    // routed it as `CallTarget::Method { name: "is_null",
+                    // receiver_root: "mut_ptr"/"const_ptr" }`, which
+                    // `jtransform` lowers to `ptr_iszero` regardless of the
+                    // receiver repr; answer the getattr with the same
+                    // `ptr_method_is_null` bound method so the result types as
+                    // `SomeBool`.  Last-resort after both `_lookup_adtmeth` and
+                    // the struct-field `getattr`, so a real `is_null` adt
+                    // member or field is never shadowed.
+                    Err(_) if attr == "is_null" => {
+                        Ok(SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
+                            "ptr_method_is_null",
+                            SomeValue::Ptr(self.clone()),
+                            "is_null",
+                        )))
+                    }
+                    // `Option<RawStruct>::as_ref` / `<*mut T>::as_ref`: the
+                    // receiver is already the nullable pointer word
+                    // (`raw_struct_ptr_annotation`). Identity, same as
+                    // `front::mir` `is_raw_ptr_as_ref`.
+                    Err(_) if attr == "as_ref" || attr == "as_mut" => {
+                        Ok(SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
+                            "ptr_method_as_ref",
+                            SomeValue::Ptr(self.clone()),
+                            attr,
+                        )))
+                    }
+                    Err(e) => Err(AnnotatorError::new(e)),
                 }
-                // `Option<RawStruct>::as_ref` / `<*mut T>::as_ref`: the
-                // receiver is already the nullable pointer word
-                // (`raw_struct_ptr_annotation`). Identity, same as
-                // `front::mir` `is_raw_ptr_as_ref`.
-                Err(_) if attr == "as_ref" || attr == "as_mut" => Ok(SomeValue::BuiltinMethod(
-                    SomeBuiltinMethod::new("ptr_method_as_ref", SomeValue::Ptr(self.clone()), attr),
-                )),
-                Err(e) => Err(AnnotatorError::new(e)),
-            },
+            }
             Ok(lltype::LowLevelAdtMember::Method { ll_ptrtype, func }) => {
                 Ok(SomeValue::LLADTMeth(SomeLLADTMeth::new(ll_ptrtype, func)))
             }
@@ -357,6 +370,21 @@ impl SomePtr {
                 s_attr.const_()
             );
         };
+        if let Some((struct_t, field_t)) = carray_item_struct_field(&self.ll_ptrtype, attr) {
+            if field_t != lltype::LowLevelType::Void
+                && !carray_item_struct_field_accepts(&field_t, s_value)
+            {
+                let v_lltype = annotation_to_lltype(s_value, None).ok();
+                return Err(AnnotatorError::new(format!(
+                    "{} instance field {:?}:\nexpects {:?}\n    got {:?}",
+                    struct_t._name,
+                    attr,
+                    field_t,
+                    v_lltype.unwrap_or(lltype::LowLevelType::Void)
+                )));
+            }
+            return Ok(SomeValue::Impossible);
+        }
         let mut example = self.ll_ptrtype._example();
         if example.getattr(attr).map_err(AnnotatorError::new)? != lltype::LowLevelValue::Void {
             let v_lltype = annotation_to_lltype(s_value, None)?;
@@ -438,6 +466,71 @@ fn gc_class_root_ptr_as_instance(s: &SomeValue) -> Option<SomeValue> {
         true,
         std::collections::BTreeMap::new(),
     )))
+}
+
+/// Item struct of `CArrayPtr(Struct)` / `Ptr(FixedSizeArray(Struct))`.
+/// `direct_ptradd` stamps the array wrapper so `rewrite_op_direct_ptradd`
+/// can scale `TO.OF`; field getattr/setattr reads that item layout.
+fn carray_item_struct(ptr: &lltype::Ptr) -> Option<&lltype::Struct> {
+    let of = match &ptr.TO {
+        lltype::PtrTarget::Array(arr) => &arr.OF,
+        lltype::PtrTarget::FixedSizeArray(arr) => &arr.OF,
+        _ => return None,
+    };
+    match of {
+        lltype::LowLevelType::Struct(st) => Some(st.as_ref()),
+        _ => None,
+    }
+}
+
+fn carray_item_struct_field_type(ptr: &lltype::Ptr, attr: &str) -> Option<lltype::LowLevelType> {
+    carray_item_struct(ptr)?.getattr_field_type(attr)
+}
+
+/// Address-typed item fields are GC pointer words whose overlay missed
+/// `GCREF`. Annotate them as classdef-less instances so they union with
+/// `SomeInstance(PyObject)`.
+fn carray_item_field_annotation(field_t: lltype::LowLevelType) -> SomeValue {
+    if matches!(field_t, lltype::LowLevelType::Address) {
+        return SomeValue::Instance(crate::annotator::model::SomeInstance::new(
+            None,
+            true,
+            std::collections::BTreeMap::new(),
+        ));
+    }
+    lltype_to_annotation(field_t)
+}
+
+fn is_pointer_word_lltype(ty: &lltype::LowLevelType) -> bool {
+    matches!(
+        ty,
+        lltype::LowLevelType::Ptr(_) | lltype::LowLevelType::Address
+    )
+}
+
+fn carray_item_struct_field<'a>(
+    ptr: &'a lltype::Ptr,
+    attr: &str,
+) -> Option<(&'a lltype::Struct, lltype::LowLevelType)> {
+    let st = carray_item_struct(ptr)?;
+    let field_t = st.getattr_field_type(attr)?;
+    Some((st, field_t))
+}
+
+/// `InstanceRepr.lowleveltype` is `Ptr(GcStruct)`. A store of
+/// `SomeInstance` into an item-struct pointer or Address field is that word.
+fn carray_item_struct_field_accepts(field_t: &lltype::LowLevelType, s_value: &SomeValue) -> bool {
+    match annotation_to_lltype(s_value, None) {
+        Ok(v_lltype) if v_lltype == *field_t => true,
+        Ok(v_lltype) if integer_number_lltype(&v_lltype) && integer_number_lltype(field_t) => true,
+        Ok(v_lltype) if is_pointer_word_lltype(&v_lltype) && is_pointer_word_lltype(field_t) => {
+            true
+        }
+        Err(_) if matches!(s_value, SomeValue::Instance(_)) && is_pointer_word_lltype(field_t) => {
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Named scalar fields of `rust_vec_lltype`'s `Struct(raw) "RustVec"`
@@ -654,6 +747,90 @@ impl SomeInteriorPtr {
                 .map_err(AnnotatorError::new)?;
         }
         Ok(SomeValue::Impossible)
+    }
+
+    /// Address-of a field of this interior pointer.
+    ///
+    /// `_interior_ptr._expose` wraps a nested container and returns a
+    /// GCREF/primitive field as a value. Rust takes the address of that
+    /// field: offsets carry `Field(name)` and `TO` is the field type.
+    pub fn interior_ptr_expose(&self, s_attr: &SomeValue) -> Result<SomeValue, AnnotatorError> {
+        if !s_attr.is_constant() {
+            return Err(AnnotatorError::new(format!(
+                "interior_ptr_expose on ptr {:?} with non-constant field-name",
+                self.ll_ptrtype
+            )));
+        }
+        let Some(attr) = s_attr.const_().and_then(ConstValue::as_text) else {
+            return Err(AnnotatorError::new(format!(
+                "interior_ptr_expose expects a constant string field-name, got {:?}",
+                s_attr.const_()
+            )));
+        };
+        let field_t = interior_ptr_struct_field_type(&self.ll_ptrtype.TO, attr)?;
+        let mut offsets = self.ll_ptrtype.offsets.clone();
+        offsets.push(lltype::InteriorOffset::Field(attr.to_owned()));
+        Ok(SomeValue::InteriorPtr(SomeInteriorPtr::new(
+            lltype::InteriorPtr {
+                PARENTTYPE: self.ll_ptrtype.PARENTTYPE.clone(),
+                TO: Box::new(field_t),
+                offsets,
+            },
+        )))
+    }
+
+    /// Store through a leaf-TO interior pointer. The field name already
+    /// lives in `offsets`; `s_value` must fit `annotation_to_lltype(TO)`.
+    /// Void, like `SomePtr.setattr`.
+    pub fn store_through_ptr(&self, s_value: &SomeValue) -> Result<SomeValue, AnnotatorError> {
+        if self.ll_ptrtype.TO.is_container_type() {
+            return Err(AnnotatorError::new(format!(
+                "store_through_ptr requires a leaf-TO interior pointer, got TO {:?}",
+                self.ll_ptrtype.TO
+            )));
+        }
+        interior_leaf_store_value_fits(&self.ll_ptrtype.TO, s_value)?;
+        Ok(SomeValue::Impossible)
+    }
+}
+
+fn interior_ptr_struct_field_type(
+    to: &lltype::LowLevelType,
+    attr: &str,
+) -> Result<lltype::LowLevelType, AnnotatorError> {
+    match to {
+        lltype::LowLevelType::Struct(st) => st.getattr_field_type(attr).ok_or_else(|| {
+            AnnotatorError::new(format!("struct {} has no field {:?}", st._name, attr))
+        }),
+        lltype::LowLevelType::ForwardReference(fwd) => match fwd.resolved() {
+            Some(lltype::LowLevelType::Struct(st)) => {
+                st.getattr_field_type(attr).ok_or_else(|| {
+                    AnnotatorError::new(format!("struct {} has no field {:?}", st._name, attr))
+                })
+            }
+            other => Err(AnnotatorError::new(format!(
+                "interior_ptr_expose on non-struct TO {other:?}"
+            ))),
+        },
+        other => Err(AnnotatorError::new(format!(
+            "interior_ptr_expose on non-struct TO {other:?}"
+        ))),
+    }
+}
+
+/// `_abstract_ptr.__setattr__` requires `T1 == T2` (`typeOf(val)` vs the
+/// field type). `SomePtr.setattr` feeds `annotation_to_lltype(s_value)`
+/// into that check.
+fn interior_leaf_store_value_fits(
+    expected: &lltype::LowLevelType,
+    s_value: &SomeValue,
+) -> Result<(), AnnotatorError> {
+    match annotation_to_lltype(s_value, None) {
+        Ok(got) if got == *expected => Ok(()),
+        Ok(got) => Err(AnnotatorError::new(format!(
+            "store through interior ptr:\nexpects {expected:?}\n    got {got:?}"
+        ))),
+        Err(err) => Err(err),
     }
 }
 
@@ -1333,6 +1510,152 @@ mod tests {
             ll_to_annotation(lltype::LowLevelValue::InteriorPtr(Box::new(interior))),
             SomeValue::InteriorPtr(_)
         ));
+    }
+
+    #[test]
+    fn someinteriorptr_expose_extends_offsets_and_field_to() {
+        let parent = lltype::LowLevelType::Array(Box::new(lltype::Array::gc(
+            lltype::LowLevelType::Struct(Box::new(lltype::Struct::new(
+                "Entry",
+                vec![("value".into(), lltype::LowLevelType::Signed)],
+            ))),
+        )));
+        let ptr = SomeInteriorPtr::new(lltype::InteriorPtr {
+            PARENTTYPE: Box::new(parent),
+            TO: Box::new(lltype::LowLevelType::Struct(Box::new(lltype::Struct::new(
+                "Entry",
+                vec![("value".into(), lltype::LowLevelType::Signed)],
+            )))),
+            offsets: vec![lltype::InteriorOffset::Index(0)],
+        });
+        let mut s_attr = crate::annotator::model::SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("value")));
+        let SomeValue::InteriorPtr(exposed) = ptr
+            .interior_ptr_expose(&SomeValue::String(s_attr))
+            .expect("expose of a struct field")
+        else {
+            panic!("expose must return SomeInteriorPtr");
+        };
+        assert_eq!(
+            exposed.ll_ptrtype.offsets,
+            vec![
+                lltype::InteriorOffset::Index(0),
+                lltype::InteriorOffset::Field("value".into()),
+            ]
+        );
+        assert_eq!(*exposed.ll_ptrtype.TO, lltype::LowLevelType::Signed);
+    }
+
+    #[test]
+    fn someinteriorptr_store_through_ptr_on_leaf_to_is_impossible() {
+        use crate::annotator::model::SomeInteger;
+
+        let parent = lltype::LowLevelType::Array(Box::new(lltype::Array::gc(
+            lltype::LowLevelType::Struct(Box::new(lltype::Struct::new(
+                "Entry",
+                vec![("value".into(), lltype::LowLevelType::Signed)],
+            ))),
+        )));
+        let ptr = SomeInteriorPtr::new(lltype::InteriorPtr {
+            PARENTTYPE: Box::new(parent),
+            TO: Box::new(lltype::LowLevelType::Signed),
+            offsets: vec![
+                lltype::InteriorOffset::Index(0),
+                lltype::InteriorOffset::Field("value".into()),
+            ],
+        });
+        let result = ptr
+            .store_through_ptr(&SomeValue::Integer(SomeInteger::new(false, false)))
+            .expect("leaf-TO store-through");
+        assert!(matches!(result, SomeValue::Impossible));
+    }
+
+    #[test]
+    fn interior_leaf_store_rejects_integer_width_mismatch() {
+        use crate::annotator::model::SomeInteger;
+
+        let parent = lltype::LowLevelType::Array(Box::new(lltype::Array::gc(
+            lltype::LowLevelType::Struct(Box::new(lltype::Struct::new(
+                "Entry",
+                vec![("value".into(), lltype::LowLevelType::Signed)],
+            ))),
+        )));
+        let ptr = SomeInteriorPtr::new(lltype::InteriorPtr {
+            PARENTTYPE: Box::new(parent),
+            TO: Box::new(lltype::LowLevelType::Signed),
+            offsets: vec![
+                lltype::InteriorOffset::Index(0),
+                lltype::InteriorOffset::Field("value".into()),
+            ],
+        });
+        let err = ptr
+            .store_through_ptr(&SomeValue::Integer(SomeInteger::new(false, true)))
+            .expect_err("Unsigned into Signed leaf is T1 == T2 failure");
+        let msg = err.msg.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("store through interior ptr") && msg.contains("Signed"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn interior_leaf_store_rejects_instance_into_unrelated_gc_ptr() {
+        use crate::annotator::model::SomeInstance;
+
+        let parent = lltype::LowLevelType::Array(Box::new(lltype::Array::gc(
+            lltype::LowLevelType::Struct(Box::new(lltype::Struct::new(
+                "Entry",
+                vec![("value".into(), lltype::GCREF.clone())],
+            ))),
+        )));
+        let ptr = SomeInteriorPtr::new(lltype::InteriorPtr {
+            PARENTTYPE: Box::new(parent),
+            TO: Box::new(lltype::GCREF.clone()),
+            offsets: vec![
+                lltype::InteriorOffset::Index(0),
+                lltype::InteriorOffset::Field("value".into()),
+            ],
+        });
+        let s_inst = SomeValue::Instance(SomeInstance::new(
+            None,
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let err = ptr
+            .store_through_ptr(&s_inst)
+            .expect_err("SomeInstance into GCREF leaf is T1 == T2 failure");
+        let msg = err.msg.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("should return a low-level type")
+                || msg.contains("store through interior ptr"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn unionof_equal_interior_ptrs_keeps_interior() {
+        use crate::annotator::model::unionof;
+
+        let interior = lltype::InteriorPtr {
+            PARENTTYPE: Box::new(lltype::LowLevelType::Array(Box::new(lltype::Array::gc(
+                lltype::LowLevelType::Struct(Box::new(lltype::Struct::new(
+                    "Entry",
+                    vec![("value".into(), lltype::LowLevelType::Signed)],
+                ))),
+            )))),
+            TO: Box::new(lltype::LowLevelType::Signed),
+            offsets: vec![
+                lltype::InteriorOffset::Index(0),
+                lltype::InteriorOffset::Field("value".into()),
+            ],
+        };
+        let a = SomeValue::InteriorPtr(SomeInteriorPtr::new(interior.clone()));
+        let b = SomeValue::InteriorPtr(SomeInteriorPtr::new(interior));
+        let merged = unionof([&a, &b]).expect("equal-ll_ptrtype interiors union");
+        assert!(
+            matches!(merged, SomeValue::InteriorPtr(_)),
+            "unionof of two SomeInteriorPtr with equal ll_ptrtype must stay InteriorPtr, got {merged:?}"
+        );
     }
 
     #[test]

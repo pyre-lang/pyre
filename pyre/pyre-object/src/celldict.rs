@@ -1362,7 +1362,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
         crate::gc_storage::gc_alloc_young_storage_box(
             ModuleDictStorage::default(),
             module_dict_storage_gc_type_id(),
-        ) as crate::gc_hook::GCREF
+        )
     }
 
     /// `celldict.py getitem` — str fast path, else

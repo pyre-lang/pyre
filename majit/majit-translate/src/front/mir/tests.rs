@@ -2382,12 +2382,14 @@ fn identity_registered_gc_ptr_cast_does_not_emit_instance() {
     );
 }
 
-/// `SomePtr.getattr` of a raw-owner GCREF field stays SomePtr
-/// (`lltype.py`). The front end then `cast_base_ptr_to_instance`s onto
-/// the declared class (`CastBasePtrToInstanceEntry`).
+/// The raw-owner recast (`SomePtr.getattr`, `lltype.py`,
+/// `CastBasePtrToInstanceEntry`) applies only to RAW owners, and none
+/// with a GC-pointer field remains in pyre-object. A GC owner's field
+/// is already typed by its declared class (`rclass.py`
+/// `InstanceRepr.getfield`, no `cast_base_ptr_to_instance`).
 #[test]
-fn raw_owner_registered_gc_ptr_field_read_emits_cast_instance() {
-    use crate::model::OpKind;
+fn gc_owner_registered_gc_ptr_field_read_needs_no_cast_instance() {
+    use crate::model::{OpKind, ValueType};
     let graph = lower_object_fn("pyre_object::mapdict::map_terminator_w_cls");
     let ops: Vec<_> = graph
         .blocks
@@ -2395,18 +2397,29 @@ fn raw_owner_registered_gc_ptr_field_read_emits_cast_instance() {
         .flat_map(|block| &block.operations)
         .collect();
     let w_cls = ops.iter().find_map(|op| match &op.kind {
-        OpKind::FieldRead { field, .. } if field.name == "w_cls" => op.result.clone(),
+        OpKind::FieldRead { field, ty, .. } if field.name == "w_cls" => {
+            assert_eq!(
+                field.owner_declared_gc,
+                Some(true),
+                "GC-owner w_cls FieldRead owner_declared_gc; graph={}",
+                graph.dump()
+            );
+            assert!(
+                matches!(ty, ValueType::Ref(_)),
+                "GC-owner w_cls FieldRead is Ref; ty={ty:?} graph={}",
+                graph.dump()
+            );
+            op.result.clone()
+        }
         _ => None,
     });
     let Some(w_cls) = w_cls else {
         panic!("FieldRead w_cls; graph={}", graph.dump());
     };
     assert!(
-        ops.iter().any(|op| {
-            crate::model::cast_instance_of(&op.kind, &w_cls)
-                .is_some_and(|root| root.contains("PyObject"))
-        }),
-        "raw-owner w_cls FieldRead then cast_base_ptr_to_instance; graph={}",
+        ops.iter()
+            .all(|op| crate::model::cast_instance_of(&op.kind, &w_cls).is_none()),
+        "GC-owner w_cls FieldRead is not followed by cast_instance_of; graph={}",
         graph.dump()
     );
 }
@@ -6851,7 +6864,10 @@ fn dyn_trait_field_vtable_slot_reads_the_metadata_word() {
         1,
         "one dyn method IndirectCall: {indirect:?}"
     );
-    assert_eq!(indirect[0].1, ("Storage".to_string(), "head".to_string()));
+    assert_eq!(
+        indirect[0].1,
+        crate::model::IndirectFamilyKey::dyn_trait("Storage", "head")
+    );
 
     let producer = |var: &crate::flowspace::model::Variable| {
         graph
@@ -8795,6 +8811,101 @@ fn user_trait_named_default_is_not_integer_zero() {
     assert!(
         call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
         "a user-defined Default stays a residual trait call; ops={ops:?}"
+    );
+}
+
+#[test]
+fn trait_default_of_string_is_empty_str() {
+    let string_ty = serde_json::json!({"Adt": {
+        "id": 0,
+        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+    }});
+    let llbc = std_trait_call_fixture(
+        "trait_default_string",
+        &["core", "default", "Default"],
+        "default",
+        &[],
+        string_ty,
+        vec![code_struct(0, &["alloc", "string", "String"])],
+    );
+    let graph =
+        super::lower_function(&llbc, "trait_default_string").expect("lower Trait Default String");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == ["__str_const", ""]
+        )),
+        "<String as Default>::default must become __str_const \"\"; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
+        "Trait Default of String must not residualize; ops={ops:?}"
+    );
+}
+
+#[test]
+fn alloc_string_default_is_empty_str() {
+    let string_ty = serde_json::json!({"Adt": {
+        "id": 0,
+        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+    }});
+    let llbc = std_extern_call_fixture_with_types(
+        "default_string",
+        &["alloc", "string", "<Impl>", "default"],
+        &[],
+        string_ty,
+        vec![code_struct(0, &["alloc", "string", "String"])],
+    );
+    let graph = super::lower_function(&llbc, "default_string").expect("lower alloc String default");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == ["__str_const", ""]
+        )),
+        "alloc::string::<Impl>::default must become __str_const \"\"; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
+        "alloc String default must not residualize; ops={ops:?}"
+    );
+}
+
+#[test]
+fn alloc_string_new_is_empty_str() {
+    let string_ty = serde_json::json!({"Adt": {
+        "id": 0,
+        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+    }});
+    let llbc = std_extern_call_fixture_with_types(
+        "new_string",
+        &["alloc", "string", "<Impl>", "new"],
+        &[],
+        string_ty,
+        vec![code_struct(0, &["alloc", "string", "String"])],
+    );
+    let graph = super::lower_function(&llbc, "new_string").expect("lower alloc String::new");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == ["__str_const", ""]
+        )),
+        "alloc::string::<Impl>::new must become __str_const \"\"; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "new"),
+        "alloc String::new must not residualize; ops={ops:?}"
     );
 }
 
@@ -13604,6 +13715,42 @@ pub(in crate::front::mir) fn kwargs_unerase_cast_llbc(src_is_gcref: bool) -> Llb
         }
     });
     Llbc::from_slice(file.to_string().as_bytes()).expect("kwargs unerase fixture parses")
+}
+
+#[test]
+fn dont_look_inside_gcref_ptr_residual_is_gcref_token() {
+    let llbc = kwargs_unerase_cast_llbc(true);
+    let fd = llbc
+        .iter_local_fns()
+        .find(|fd| fd.item_meta.name_path().ends_with("::unerase"))
+        .expect("unerase");
+    let gcref_ty = fd.signature.inputs.first().expect("unerase takes a GCREF");
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let spec = crate::ErrorCarrierSpec::default();
+    let empty = std::collections::HashSet::<String>::new();
+    assert_eq!(
+        super::lltype::dont_look_inside_return_token(
+            gcref_ty,
+            &llbc,
+            spec,
+            &gc_struct_ids,
+            &empty,
+        )
+        .as_deref(),
+        Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE),
+        "a *mut GCREFOpaque residual FUNC.RESULT is gcref, not ref"
+    );
+    assert_eq!(
+        super::lltype::dont_look_inside_return_class_root(
+            gcref_ty,
+            &llbc,
+            spec,
+            &gc_struct_ids,
+            &empty,
+        ),
+        None,
+        "GCREFOpaque must not intern a residual ClassDef"
+    );
 }
 
 #[test]
@@ -20872,7 +21019,7 @@ fn dict_strategy_vtable_call_keeps_its_family_identity() {
         );
         assert_eq!(
             calls[0].1,
-            ("DictStrategy".to_string(), method.to_string()),
+            crate::model::IndirectFamilyKey::dyn_trait("DictStrategy", method),
             "{function}'s MIR vtable slot must name the same PBC family as the trait impls"
         );
         let funcptr = &calls[0].0;
@@ -20916,9 +21063,11 @@ fn dict_strategy_vtable_call_keeps_its_family_identity() {
                     args,
                     family_key: Some(family_key),
                     ..
-                } if family_key.0 == "DictStrategy" => {
-                    Some((funcptr.clone(), args.clone(), family_key.1.clone()))
-                }
+                } if family_key.as_pair().0 == "DictStrategy" => Some((
+                    funcptr.clone(),
+                    args.clone(),
+                    family_key.as_pair().1.to_string(),
+                )),
                 _ => None,
             })
             .collect();
@@ -25690,13 +25839,35 @@ fn oefmt_wtf8_from_bytes_lowers_to_check_utf8_option() {
 /// replace / U+FFFD (`typedef::decode_utf8_with_errors`), never a Cow.
 /// The Result Err arm is `RaiseImplicit(AssertionError)`
 /// (`rtyper/debug.py ll_assert`), never a fabricated `""`.
+/// `oefmt`'s `%s`/`%8` Bytes arm passes `&[u8]`, the window pair ABI.
 #[test]
-#[ignore]
 fn oefmt_from_utf8_lossy_lowers_to_decode_utf8_replace() {
-    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = crate::test_support::load_ullbc(path);
-    let graph = crate::test_support::lower_function(llbc, "oefmt").expect("lower oefmt");
-    let paths = oefmt_call_paths(&graph);
+    let interpreter =
+        crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
+    let object = crate::test_support::load_ullbc(crate::runtime_names::artifacts::OBJECT_ULLBC);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[interpreter, object],
+        crate::HostStaticAddrs {
+            error_carrier: crate::ErrorCarrierSpec {
+                carrier_path: "pyre_interpreter::error::PyError",
+                carrier_class: "",
+                carrier_wrappers: &[],
+                to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+                from_exc_object: Some(("PyError", "from_exc_object")),
+            },
+            ..Default::default()
+        },
+        &["error"],
+        &["oefmt"],
+    )
+    .expect("lower oefmt");
+    let graph = program
+        .functions
+        .iter()
+        .find(|f| f.name == "oefmt")
+        .expect("oefmt graph")
+        .graph();
+    let paths = oefmt_call_paths(graph);
     assert!(
         !paths.iter().any(|segments| {
             segments
@@ -25712,10 +25883,66 @@ fn oefmt_from_utf8_lossy_lowers_to_decode_utf8_replace() {
         "decode_utf8_with_errors must remain in the caller: {paths:#?}"
     );
     assert!(
-        !oefmt_mentions_cow(&graph),
+        !oefmt_mentions_cow(graph),
         "from_utf8_lossy dest is a plain string, not Cow: {graph:#?}"
     );
-    oefmt_decode_utf8_err_arm_is_assert_raise(&graph);
+    oefmt_decode_utf8_err_arm_is_assert_raise(graph);
+}
+
+/// `CStr::from_ptr(p).to_string_lossy()` is `rffi.charp2str`, never a
+/// residual Cow or 1-arg `cast_int_to_ptr` (`Ptr(MAJIT_REF_OPAQUE)`).
+#[test]
+fn gai_strerror_lowers_cstr_lossy_to_charp2str() {
+    let interpreter = Llbc::load(crate::runtime_names::artifacts::INTERPRETER_ULLBC)
+        .expect("load interpreter LLBC");
+    let object =
+        Llbc::load(crate::runtime_names::artifacts::OBJECT_ULLBC).expect("load object LLBC");
+    let program = super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[interpreter, object],
+        crate::HostStaticAddrs {
+            error_carrier: crate::ErrorCarrierSpec {
+                carrier_path: "pyre_interpreter::error::PyError",
+                carrier_class: "",
+                carrier_wrappers: &[],
+                to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+                from_exc_object: Some(("PyError", "from_exc_object")),
+            },
+            ..Default::default()
+        },
+        &["rsocket_rffi"],
+        &["gai_strerror"],
+    )
+    .expect("lower gai_strerror");
+    let names: Vec<_> = program
+        .functions
+        .iter()
+        .map(|f| format!("{}::{}", f.module_path, f.name))
+        .collect();
+    let graph = program
+        .functions
+        .iter()
+        .find(|f| f.name == "gai_strerror")
+        .unwrap_or_else(|| panic!("gai_strerror graph; have {names:#?}"))
+        .graph();
+    let paths = oefmt_call_paths(graph);
+    assert!(
+        !paths.iter().any(|segments| {
+            segments
+                .last()
+                .is_some_and(|leaf| leaf == "to_string_lossy" || leaf == "from_utf8_lossy")
+        }),
+        "to_string_lossy / from_utf8_lossy must not remain a residual: {paths:#?}"
+    );
+    assert!(
+        paths.iter().any(|segments| {
+            segments.last().map(String::as_str) == Some(crate::runtime_names::shims::CHARP2STR)
+        }),
+        "CStr::to_string_lossy copies through rffi.charp2str: {paths:#?}"
+    );
+    assert!(
+        !oefmt_mentions_cow(graph),
+        "to_string_lossy dest is a plain string, not Cow: {graph:#?}"
+    );
 }
 
 /// `decompose_valuefmt` `current: String` is a `StringBuilder`
@@ -26031,10 +26258,12 @@ fn rutf8_codepoint_at_pos_lowers_byte_reads_to_ord() {
     );
 }
 
-/// `PyError(ptr)` is one pointer operand. The ctor store narrows it
-/// once, to the carrier's inner class (`PyErrorObject`), in
-/// `ctor_ccharp_field_store` (`rtyper.py` `LowLevelOpList.convertvar`
-/// converts once).
+/// `PyError(ptr)` is one pointer word. Value typing keeps the handle
+/// class (`tyref_transparent_inner_value_type` is None for a transparent
+/// GC handle), so construction recasts through `retag_error_carrier`
+/// onto that class. Field stores of `.0` still convertvar to the inner
+/// object (`recast_error_carrier_field_store` / `rclass.py`
+/// `InstanceRepr.rtype_setattr`).
 #[test]
 fn pyerror_ptr_ctor_emits_one_cast_instance() {
     let py_ptr = interior_raw_mut(interior_adt(0));
@@ -26123,8 +26352,8 @@ fn pyerror_ptr_ctor_emits_one_cast_instance() {
         .collect();
     assert_eq!(
         roots,
-        ["PyErrorObject"],
-        "PyError(ptr) emits one __cast_instance_intrinsic to the inner class; graph={}",
+        ["error::PyError"],
+        "PyError(ptr) emits one __cast_instance_intrinsic to the handle class; graph={}",
         graph.dump()
     );
 }
@@ -28943,6 +29172,10 @@ fn interior_shared(inner: serde_json::Value) -> serde_json::Value {
     serde_json::json!({"Ref": [null, inner, "Shared"]})
 }
 
+fn interior_mut(inner: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"Ref": [null, inner, "Mut"]})
+}
+
 fn interior_layout(size: u64, offsets: &[u64], transparent: bool) -> serde_json::Value {
     serde_json::json!([{
         "key": "fixture-target",
@@ -29110,8 +29343,20 @@ pub(in crate::front::mir) fn interior_caller(
     locals: Vec<serde_json::Value>,
     body: Vec<serde_json::Value>,
 ) -> serde_json::Value {
+    interior_fun(0, name, arg_count, inputs, output, locals, body)
+}
+
+fn interior_fun(
+    def_id: u64,
+    name: &str,
+    arg_count: u64,
+    inputs: Vec<serde_json::Value>,
+    output: serde_json::Value,
+    locals: Vec<serde_json::Value>,
+    body: Vec<serde_json::Value>,
+) -> serde_json::Value {
     serde_json::json!({
-        "def_id": 0,
+        "def_id": def_id,
         "item_meta": interior_meta(&["fixture", name], true),
         "signature": {"is_unsafe": true, "inputs": inputs, "output": output},
         "body": {
@@ -30210,8 +30455,10 @@ fn interior_field_const_index_stays_direct_ptradd() {
     assert_direct_ptradd_not_residual_add(&ops);
 }
 
-/// `&(*p.add(i)).y` is an address, not a value read, so the add stays
-/// `direct_ptradd`. The census test is the guard; this locks the lowering.
+/// `&(*p.add(i)).y` is an address of a GcArray element field: getitem SSA
+/// plus `_interior_ptr._expose` (offsets carry `Field(name)`, `TO` is the
+/// field type), not a value read and not `direct_ptradd`. Fusion census
+/// still counts this Other.
 #[test]
 fn interior_field_address_of_stays_direct_ptradd() {
     let i64_ty = interior_i64();
@@ -30267,7 +30514,651 @@ fn interior_field_address_of_stays_direct_ptradd() {
     let graph = lower_interior(&llbc, "addr_point");
     let ops = graph_ops(&graph);
     assert_no_interior(&ops);
-    assert_direct_ptradd_not_residual_add(&ops);
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
+        "element ptr::add must emit getitem; ops={ops:?}"
+    );
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op.kind, OpKind::InteriorPtrExpose { .. })),
+        "address-of (*elem).field must emit InteriorPtrExpose; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| is_lltype_direct_ptradd(op)),
+        "element address-of must not stay direct_ptradd; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops)
+            .iter()
+            .any(|leaf| leaf == "add" || leaf == "sub"),
+        "element address-of must not residualize ptr::add; ops={ops:?}"
+    );
+}
+
+/// Helper `Option<(&K, &mut V)>` from a GcArray-of-struct element; caller
+/// `*h(i).unwrap().1 = v` lowers without `Unsupported`.
+#[test]
+fn get_slot_mut_option_tuple_store_through_ptr() {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let adt = interior_adt(0);
+    let ptr = interior_raw_mut(adt.clone());
+    let k_ref = interior_shared(i64_ty.clone());
+    let v_ref = interior_mut(i64_ty.clone());
+    let tuple_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [k_ref.clone(), v_ref.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let option_ty = option_adt_node(1, tuple_ty.clone());
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let key_field = interior_field(3, &ptr, &adt, &i64_ty, 0);
+    let value_field = interior_field(3, &ptr, &adt, &i64_ty, 1);
+    let helper = interior_fun(
+        0,
+        "get_slot_mut",
+        2,
+        vec![ptr.clone(), usize_ty.clone()],
+        option_ty.clone(),
+        vec![
+            interior_local(0, None, &option_ty),
+            interior_local(1, Some("p"), &ptr),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("slot"), &ptr),
+            interior_local(4, Some("k"), &k_ref),
+            interior_local(5, Some("v"), &v_ref),
+            interior_local(6, Some("pair"), &tuple_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &ptr)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(3, &ptr),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![
+                    interior_assign(
+                        interior_place(4, &k_ref),
+                        serde_json::json!({
+                            "Ref": {"place": key_field, "kind": "Shared", "ptr_metadata": null}
+                        }),
+                    ),
+                    interior_assign(
+                        interior_place(5, &v_ref),
+                        serde_json::json!({
+                            "Ref": {"place": value_field, "kind": "Mut", "ptr_metadata": null}
+                        }),
+                    ),
+                    interior_assign(
+                        interior_place(6, &tuple_ty),
+                        serde_json::json!({
+                            "Aggregate": [
+                                {"Adt": [
+                                    {
+                                        "id": 0,
+                                        "builtin": "Tuple",
+                                        "generics": {
+                                            "regions": [],
+                                            "types": [k_ref.clone(), v_ref.clone()],
+                                            "const_generics": [],
+                                            "trait_refs": []
+                                        }
+                                    },
+                                    null,
+                                    null
+                                ]},
+                                [
+                                    {"Move": interior_place(4, &k_ref)},
+                                    {"Move": interior_place(5, &v_ref)}
+                                ]
+                            ]
+                        }),
+                    ),
+                    interior_assign(
+                        interior_place(0, &option_ty),
+                        serde_json::json!({
+                            "Aggregate": [
+                                {"Adt": [
+                                    {
+                                        "id": 1,
+                                        "generics": {
+                                            "regions": [],
+                                            "types": [tuple_ty.clone()],
+                                            "const_generics": [],
+                                            "trait_refs": []
+                                        }
+                                    },
+                                    1,
+                                    null
+                                ]},
+                                [{"Move": interior_place(6, &tuple_ty)}]
+                            ]
+                        }),
+                    ),
+                ],
+                interior_return(),
+            ),
+        ],
+    );
+    let add = interior_opaque(
+        1,
+        &["core", "ptr", "mut_ptr", "<Impl>", "add"],
+        vec![ptr.clone(), usize_ty.clone()],
+        ptr.clone(),
+    );
+    let tuple_field = serde_json::json!({
+        "kind": {
+            "Projection": [
+                interior_place(5, &tuple_ty),
+                {"Field": [null, 1]}
+            ]
+        },
+        "ty": v_ref
+    });
+    let deref_field = serde_json::json!({
+        "kind": {"Projection": [tuple_field, "Deref"]},
+        "ty": i64_ty
+    });
+    let caller = interior_fun(
+        2,
+        "store_through_unwrap_field",
+        3,
+        vec![ptr.clone(), usize_ty.clone(), i64_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("p"), &ptr),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("v"), &i64_ty),
+            interior_local(4, Some("opt"), &option_ty),
+            interior_local(5, Some("pair"), &tuple_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &unit),
+                    serde_json::json!({"Aggregate": ["Tuple", []]}),
+                )],
+                interior_call(
+                    0,
+                    vec![
+                        interior_copy(interior_place(1, &ptr)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(4, &option_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                interior_call(
+                    3,
+                    vec![interior_copy(interior_place(4, &option_ty))],
+                    interior_place(5, &tuple_ty),
+                    4,
+                    3,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    deref_field,
+                    serde_json::json!({
+                        "Use": [{"Copy": interior_place(3, &i64_ty)}, "No"]
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let unwrap = interior_opaque(
+        3,
+        &["core", "option", "<Impl>", "unwrap"],
+        vec![option_ty.clone()],
+        tuple_ty,
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_point(), option_enum(1)],
+        vec![helper, add, caller, unwrap],
+    );
+    let helper_graph = lower_interior(&llbc, "get_slot_mut");
+    let helper_ops = graph_ops(&helper_graph);
+    assert!(
+        helper_ops
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
+        "helper must emit getitem; ops={helper_ops:?}"
+    );
+    let expose = helper_ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::InteriorPtrExpose { .. }))
+        .count();
+    assert!(
+        expose >= 2,
+        "helper must emit address-of for key and value; ops={helper_ops:?}"
+    );
+    let caller_graph = lower_interior(&llbc, "store_through_unwrap_field");
+    let caller_ops = graph_ops(&caller_graph);
+    let stores = caller_ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::StoreThroughPtr { .. }))
+        .count();
+    assert_eq!(
+        stores, 1,
+        "caller must emit one store-through; ops={caller_ops:?}"
+    );
+    assert!(
+        caller_ops
+            .iter()
+            .all(|op| !matches!(op.kind, OpKind::RawStore { .. })),
+        "caller must not raw_store; ops={caller_ops:?}"
+    );
+}
+
+/// Helper returns `&mut (*elem).field` from a GcArray-of-struct element
+/// (`InteriorPtrExpose`); caller `*h(p, i) = v` is one `StoreThroughPtr`.
+#[test]
+fn get_slot_mut_direct_mut_ref_store_through_ptr() {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let adt = interior_adt(0);
+    let ptr = interior_raw_mut(adt.clone());
+    let v_ref = interior_mut(i64_ty.clone());
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let value_field = interior_field(3, &ptr, &adt, &i64_ty, 1);
+    let helper = interior_fun(
+        0,
+        "get_slot_mut",
+        2,
+        vec![ptr.clone(), usize_ty.clone()],
+        v_ref.clone(),
+        vec![
+            interior_local(0, None, &v_ref),
+            interior_local(1, Some("p"), &ptr),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("slot"), &ptr),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &ptr)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(3, &ptr),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &v_ref),
+                    serde_json::json!({
+                        "Ref": {"place": value_field, "kind": "Mut", "ptr_metadata": null}
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let add = interior_opaque(
+        1,
+        &["core", "ptr", "mut_ptr", "<Impl>", "add"],
+        vec![ptr.clone(), usize_ty.clone()],
+        ptr.clone(),
+    );
+    let caller = interior_fun(
+        2,
+        "store_through_unwrap_field",
+        3,
+        vec![ptr.clone(), usize_ty.clone(), i64_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("p"), &ptr),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("v"), &i64_ty),
+            interior_local(4, Some("slot"), &v_ref),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &unit),
+                    serde_json::json!({"Aggregate": ["Tuple", []]}),
+                )],
+                interior_call(
+                    0,
+                    vec![
+                        interior_copy(interior_place(1, &ptr)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(4, &v_ref),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_deref(4, &v_ref, &i64_ty),
+                    serde_json::json!({
+                        "Use": [{"Copy": interior_place(3, &i64_ty)}, "No"]
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let llbc = llbc_with_types("fixture", vec![interior_point()], vec![helper, add, caller]);
+    let helper_graph = lower_interior(&llbc, "get_slot_mut");
+    let helper_ops = graph_ops(&helper_graph);
+    assert!(
+        helper_ops
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
+        "helper must emit getitem; ops={helper_ops:?}"
+    );
+    let expose = helper_ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::InteriorPtrExpose { .. }))
+        .count();
+    assert!(
+        expose >= 1,
+        "helper must emit address-of for the value field; ops={helper_ops:?}"
+    );
+    let caller_graph = lower_interior(&llbc, "store_through_unwrap_field");
+    let caller_ops = graph_ops(&caller_graph);
+    let stores = caller_ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::StoreThroughPtr { .. }))
+        .count();
+    assert_eq!(
+        stores, 1,
+        "caller must emit one store-through; ops={caller_ops:?}"
+    );
+    assert!(
+        caller_ops
+            .iter()
+            .all(|op| !matches!(op.kind, OpKind::RawStore { .. })),
+        "caller must not raw_store; ops={caller_ops:?}"
+    );
+}
+
+/// `*h().1 = v` through field 1 of a Call-returned `(&mut i64, &mut i64)`
+/// tuple is one `StoreThroughPtr` (`unwrap().1` of `get_slot_mut`).
+#[test]
+fn deref_store_through_returned_tuple_field_emits_store_through_ptr() {
+    let i64_ty = interior_i64();
+    let v_ref = interior_mut(i64_ty.clone());
+    let tuple_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [v_ref.clone(), v_ref.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let tuple_field = serde_json::json!({
+        "kind": {
+            "Projection": [
+                interior_place(2, &tuple_ty),
+                {"Field": [null, 1]}
+            ]
+        },
+        "ty": v_ref
+    });
+    let deref_field = serde_json::json!({
+        "kind": {"Projection": [tuple_field, "Deref"]},
+        "ty": i64_ty
+    });
+    let helper = interior_opaque(0, &["fixture", "get_pair"], vec![], tuple_ty.clone());
+    let caller = interior_fun(
+        1,
+        "store_through_tuple_field",
+        1,
+        vec![i64_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("v"), &i64_ty),
+            interior_local(2, Some("pair"), &tuple_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &unit),
+                    serde_json::json!({"Aggregate": ["Tuple", []]}),
+                )],
+                interior_call(0, vec![], interior_place(2, &tuple_ty), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    deref_field,
+                    serde_json::json!({
+                        "Use": [{"Copy": interior_place(1, &i64_ty)}, "No"]
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let llbc = llbc_with_types("fixture", vec![], vec![helper, caller]);
+    let caller_graph = lower_interior(&llbc, "store_through_tuple_field");
+    let caller_ops = graph_ops(&caller_graph);
+    let stores = caller_ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::StoreThroughPtr { .. }))
+        .count();
+    assert_eq!(
+        stores, 1,
+        "caller must emit one store-through; ops={caller_ops:?}"
+    );
+}
+
+/// `*iter_mut().enumerate().next().unwrap().1 = v` over a host `Vec<i64>`
+/// is a store through a library iterator slot, not a translated
+/// interior pointer.
+#[test]
+fn deref_store_through_enumerate_next_unwrap_field_is_unsupported() {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let v_ref = interior_mut(i64_ty.clone());
+    let tuple_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [usize_ty, v_ref.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let tuple_field = serde_json::json!({
+        "kind": {
+            "Projection": [
+                interior_place(3, &tuple_ty),
+                {"Field": [null, 1]}
+            ]
+        },
+        "ty": v_ref
+    });
+    let deref_field = serde_json::json!({
+        "kind": {"Projection": [tuple_field, "Deref"]},
+        "ty": i64_ty
+    });
+    let next = interior_opaque(
+        0,
+        &["core", "iter", "adapters", "enumerate", "<Impl>", "next"],
+        vec![],
+        tuple_ty.clone(),
+    );
+    let unwrap = interior_opaque(
+        1,
+        &["core", "option", "<Impl>", "unwrap"],
+        vec![tuple_ty.clone()],
+        tuple_ty.clone(),
+    );
+    let caller = interior_fun(
+        2,
+        "store_through_enumerate_unwrap_field",
+        1,
+        vec![i64_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("v"), &i64_ty),
+            interior_local(2, Some("opt"), &tuple_ty),
+            interior_local(3, Some("pair"), &tuple_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &unit),
+                    serde_json::json!({"Aggregate": ["Tuple", []]}),
+                )],
+                interior_call(0, vec![], interior_place(2, &tuple_ty), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(2, &tuple_ty))],
+                    interior_place(3, &tuple_ty),
+                    4,
+                    3,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    deref_field,
+                    serde_json::json!({
+                        "Use": [{"Copy": interior_place(1, &i64_ty)}, "No"]
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let llbc = llbc_with_types("fixture", vec![], vec![next, unwrap, caller]);
+    let err = super::lower_function(&llbc, "store_through_enumerate_unwrap_field")
+        .expect_err("enumerate next unwrap field store must decline");
+    match err {
+        super::LowerError::Unsupported(msg) => {
+            assert_eq!(
+                msg,
+                "bb4: deref store is not a field, array element, or raw word"
+            );
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+/// `*p = n` through a `&mut i64` function argument is not a store
+/// through a same-body Call result.
+#[test]
+fn deref_store_of_i64_through_mut_arg_is_unsupported() {
+    let i64_ty = interior_i64();
+    let mut_i64 = interior_mut(i64_ty.clone());
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let caller = interior_caller(
+        "store_through_arg",
+        2,
+        vec![mut_i64.clone(), i64_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("p"), &mut_i64),
+            interior_local(2, Some("n"), &i64_ty),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_deref(1, &mut_i64, &i64_ty),
+                serde_json::json!({
+                    "Use": [{"Copy": interior_place(2, &i64_ty)}, "No"]
+                }),
+            )],
+            interior_return(),
+        )],
+    );
+    let llbc = llbc_with_types("fixture", vec![], vec![caller]);
+    let err = super::lower_function(&llbc, "store_through_arg")
+        .expect_err("arg-sourced i64 deref store must decline");
+    match err {
+        super::LowerError::Unsupported(msg) => {
+            assert_eq!(
+                msg,
+                "bb0: deref store is not a field, array element, or raw word"
+            );
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+/// `*p = s` through `&mut String` is not a leaf field of a GcArray-of-Struct
+/// (`rewrite_op_setinteriorfield`). The rust-heap header is not a copy
+/// scalar or GC pointer word.
+#[test]
+fn deref_store_of_string_through_mut_ref_is_unsupported() {
+    let string_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["alloc", "string", "String"], false),
+        "kind": "Opaque"
+    });
+    let err =
+        lower_deref_store_mut_self(vec![string_decl]).expect_err("String deref store must decline");
+    match err {
+        super::LowerError::Unsupported(msg) => {
+            assert_eq!(
+                msg,
+                "bb0: deref store is not a field, array element, or raw word"
+            );
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
 }
 
 /// A `repr(transparent)` pointee is the inner word, not a GcArray of

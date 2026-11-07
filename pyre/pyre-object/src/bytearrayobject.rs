@@ -8,10 +8,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub static BYTEARRAY_TYPE: PyType =
     crate::pyobject::new_pytype_with_user_subclass("bytearray", &BYTEARRAY_USER_TYPE);
 /// `W_BytearrayObjectUser` (`typedef.py _getusercls(W_BytearrayObject)`).
-pub static BYTEARRAY_USER_TYPE: PyType = crate::pyobject::new_user_pytype(
+pub static BYTEARRAY_USER_TYPE: PyType = crate::pyobject::new_user_pytype_with_access(
     "bytearray",
     &BYTEARRAY_TYPE,
     std::mem::offset_of!(W_BytearrayObjectUser, map),
+    &W_BYTEARRAY_USER_MAPDICT_ACCESS,
 );
 
 /// Python bytearray object.
@@ -66,16 +67,22 @@ pub struct W_BytearrayObject {
 #[repr(C)]
 pub struct W_BytearrayObjectUser {
     pub base: W_BytearrayObject,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(W_BytearrayObjectUser, storage)
-            == std::mem::offset_of!(W_BytearrayObjectUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(W_BytearrayObjectUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
+
+crate::mapdict_mixin_access! {
+    /// Typed mixin accessors (`typedef.py` `_getusercls` `import_from_mixin`).
+    pub static W_BYTEARRAY_USER_MAPDICT_ACCESS for W_BytearrayObjectUser;
+}
 
 /// GC type id assigned to `W_BytearrayObject` at JitDriver init time.
 pub const W_BYTEARRAY_GC_TYPE_ID: u32 = 28;
@@ -289,7 +296,7 @@ pub fn w_bytearray_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> Py
             logical_offset: 0,
             exports: 0,
         },
-        map: 0,
+        map: std::ptr::null(),
         storage: std::ptr::null_mut(),
     };
     let obj = if raw.is_null() {
