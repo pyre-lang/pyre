@@ -5511,6 +5511,116 @@ fn promote_process_evaluator_funcbox<Sym: WalkSym>(
     Ok(expected)
 }
 
+/// Rebuild portal greens/reds from the helper-ABI EvalFn residual and
+/// enter `_opimpl_recursive_call` / `do_recursive_call`.
+///
+/// ICT on the origportal stub can miss (`blackhole_result` absent, or
+/// `bytecode_for_address` empty for this walk). `get_eval_fn()(frame, None)`
+/// is still not the portal runner: `execute_varargs` of that pointer under
+/// `residual_call_r_r` returns the frame. Force the virtualizable, take
+/// `allboxes[1]` as the live `PyFrame`, and record `CALL_ASSEMBLER` /
+/// inline of `jd.portal_runner_adr` with portal ABI.
+fn try_eval_fn_residual_as_recursive_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    allboxes: &[OpRef],
+    op_pc: usize,
+    blackhole_result: Option<(usize, char, usize)>,
+) -> Result<Option<ResidualExecOutcome>, DispatchError> {
+    let Some((frame_box, frame)) = super::inline_call::existing_eval_frame_arg(ctx, allboxes)
+    else {
+        return Ok(None);
+    };
+    let w_code = unsafe { (*frame).pycode };
+    if w_code.is_null() {
+        return Ok(None);
+    }
+    let is_being_profiled = unsafe { (*frame).get_is_being_profiled() };
+    let next_instr = unsafe { (*frame).next_instr() };
+    let next_instr_box = ctx.trace_ctx.const_int(next_instr as i64);
+    let profiled_box = ctx.trace_ctx.const_int(i64::from(is_being_profiled));
+    let pycode_box = OpRef::const_ptr(majit_ir::GcRef(w_code as usize));
+    ctx.trace_ctx.set_opref_concrete(
+        frame_box,
+        majit_ir::Value::Ref(majit_ir::GcRef(frame as usize)),
+    );
+    let mut callee_ec = {
+        let sym_ptr = ctx.fbw_mode.snapshot_sym;
+        if sym_ptr.is_null() {
+            OpRef::NONE
+        } else {
+            unsafe { (*sym_ptr).execution_context() }
+        }
+    };
+    if callee_ec.is_none() {
+        callee_ec = crate::helpers::emit_current_execution_context(
+            ctx.trace_ctx,
+            "ExecutionContext::EvalFnResidual",
+        );
+    }
+    if !matches!(
+        ctx.trace_ctx.concrete_of_opref(callee_ec),
+        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE
+    ) {
+        super::stamp_live_execution_context(ctx.trace_ctx, callee_ec);
+    }
+    let greens_i = [next_instr_box, profiled_box];
+    let greens_r = [pycode_box];
+    let greens_f: [OpRef; 0] = [];
+    let reds_i: [OpRef; 0] = [];
+    let reds_r = [frame_box, callee_ec];
+    let reds_f: [OpRef; 0] = [];
+    let next_pc = blackhole_result.map(|(n, _, _)| n).unwrap_or(op_pc);
+    let dst_bank = blackhole_result.map(|(_, b, _)| b).unwrap_or('r');
+    let dst = blackhole_result.map(|(_, _, d)| d).unwrap_or(0);
+    let op = crate::jitcode_runtime::DecodedOp {
+        key: "recursive_call_r",
+        opname: "recursive_call_r",
+        argcodes: "",
+        pc: op_pc,
+        next_pc,
+    };
+    let (outcome, _) = super::recursive_call_from_green_red_boxes(
+        ctx,
+        &op,
+        crate::state::PyreJitState::PYPYJIT_JD_INDEX,
+        dst_bank,
+        dst,
+        &greens_i,
+        &greens_r,
+        &greens_f,
+        &reds_i,
+        &reds_r,
+        &reds_f,
+    )?;
+    match outcome {
+        DispatchOutcome::Continue | DispatchOutcome::SubReturn { .. } => {
+            let word = if let Some((_, bank, color)) = blackhole_result {
+                let opref = match bank {
+                    'r' => ctx.registers_r.get(color),
+                    'i' => ctx.registers_i.get(color),
+                    'f' => ctx.registers_f.get(color),
+                    _ => None,
+                };
+                opref
+                    .map(|box_ref| super::inline_call::residual_result_word(ctx, box_ref))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            Ok(Some(ResidualExecOutcome::PortalPerformCall {
+                result: Ok(word),
+            }))
+        }
+        DispatchOutcome::SubRaise { exc, exc_concrete } => {
+            ctx.set_last_exc_value(exc, exc_concrete);
+            Ok(Some(ResidualExecOutcome::PortalPerformCall {
+                result: Err(super::inline_call::concrete_value_word(exc_concrete)),
+            }))
+        }
+        _ => Err(DispatchError::callee_inline_unsupported(op_pc)),
+    }
+}
+
 /// `executor.execute_varargs` for one residual, then the caller's
 /// `record_after_execute` hook.
 ///
@@ -5619,114 +5729,6 @@ pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
     }
 }
 
-/// Rebuild portal greens/reds from the helper-ABI EvalFn residual and
-/// enter `_opimpl_recursive_call` / `do_recursive_call`.
-///
-/// `get_eval_fn()(frame, None)` is not the portal runner. `execute_varargs`
-/// of that pointer under `residual_call_r_r` returns the frame. Force the
-/// virtualizable, take `allboxes[1]` as the live `PyFrame`, and record
-/// `CALL_ASSEMBLER` / inline of `jd.portal_runner_adr` with portal ABI.
-fn try_eval_fn_residual_as_recursive_call<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    allboxes: &[OpRef],
-    op_pc: usize,
-    blackhole_result: Option<(usize, char, usize)>,
-) -> Result<Option<ResidualExecOutcome>, DispatchError> {
-    let Some((frame_box, frame)) = super::inline_call::existing_eval_frame_arg(ctx, allboxes)
-    else {
-        return Ok(None);
-    };
-    let w_code = unsafe { (*frame).pycode };
-    if w_code.is_null() {
-        return Ok(None);
-    }
-    let is_being_profiled = unsafe { (*frame).get_is_being_profiled() };
-    let next_instr = unsafe { (*frame).next_instr() };
-    let next_instr_box = ctx.trace_ctx.const_int(next_instr as i64);
-    let profiled_box = ctx.trace_ctx.const_int(i64::from(is_being_profiled));
-    let pycode_box = OpRef::const_ptr(majit_ir::GcRef(w_code as usize));
-    ctx.trace_ctx.set_opref_concrete(
-        frame_box,
-        majit_ir::Value::Ref(majit_ir::GcRef(frame as usize)),
-    );
-    let mut callee_ec = {
-        let sym_ptr = ctx.fbw_mode.snapshot_sym;
-        if sym_ptr.is_null() {
-            OpRef::NONE
-        } else {
-            unsafe { (*sym_ptr).execution_context() }
-        }
-    };
-    if callee_ec.is_none() {
-        callee_ec = crate::helpers::emit_current_execution_context(
-            ctx.trace_ctx,
-            "ExecutionContext::EvalFnResidual",
-        );
-    }
-    if !matches!(
-        ctx.trace_ctx.concrete_of_opref(callee_ec),
-        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE
-    ) {
-        super::stamp_live_execution_context(ctx.trace_ctx, callee_ec);
-    }
-    let greens_i = [next_instr_box, profiled_box];
-    let greens_r = [pycode_box];
-    let greens_f: [OpRef; 0] = [];
-    let reds_i: [OpRef; 0] = [];
-    let reds_r = [frame_box, callee_ec];
-    let reds_f: [OpRef; 0] = [];
-    let next_pc = blackhole_result.map(|(n, _, _)| n).unwrap_or(op_pc);
-    let dst_bank = blackhole_result.map(|(_, b, _)| b).unwrap_or('r');
-    let dst = blackhole_result.map(|(_, _, d)| d).unwrap_or(0);
-    let op = crate::jitcode_runtime::DecodedOp {
-        key: "recursive_call_r",
-        opname: "recursive_call_r",
-        argcodes: "",
-        pc: op_pc,
-        next_pc,
-    };
-    let (outcome, _) = super::recursive_call_from_green_red_boxes(
-        ctx,
-        &op,
-        crate::state::PyreJitState::PYPYJIT_JD_INDEX,
-        dst_bank,
-        dst,
-        &greens_i,
-        &greens_r,
-        &greens_f,
-        &reds_i,
-        &reds_r,
-        &reds_f,
-    )?;
-    match outcome {
-        DispatchOutcome::Continue | DispatchOutcome::SubReturn { .. } => {
-            let word = if let Some((_, bank, color)) = blackhole_result {
-                let opref = match bank {
-                    'r' => ctx.registers_r.get(color),
-                    'i' => ctx.registers_i.get(color),
-                    'f' => ctx.registers_f.get(color),
-                    _ => None,
-                };
-                opref
-                    .map(|box_ref| super::inline_call::residual_result_word(ctx, box_ref))
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            Ok(Some(ResidualExecOutcome::PortalPerformCall {
-                result: Ok(word),
-            }))
-        }
-        DispatchOutcome::SubRaise { exc, exc_concrete } => {
-            ctx.set_last_exc_value(exc, exc_concrete);
-            Ok(Some(ResidualExecOutcome::PortalPerformCall {
-                result: Err(super::inline_call::concrete_value_word(exc_concrete)),
-            }))
-        }
-        _ => Err(DispatchError::callee_inline_unsupported(op_pc)),
-    }
-}
-
 /// `assembler_continuation_escape` is the `CALL_ASSEMBLER` CALL pc plus the
 /// box the synthesised tail still needs (constructor instance, or the
 /// generator `_send_ex` reads). An escape latches that tail plus the caller,
@@ -5796,14 +5798,61 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         let mut boxed = allboxes.to_vec();
         boxed[0] = promote_process_evaluator_funcbox(ctx, boxed[0], addr, op_pc)?;
         let allboxes = boxed.as_slice();
-        if fbw_debug_abort_enabled() {
-            eprintln!(
-                "[eval-fn-residual] pc={op_pc} addr={addr:#x} const={} nboxes={}",
-                allboxes[0].is_constant(),
-                allboxes.len(),
-            );
-        }
         maybe_walker_vable_and_vrefs_before_residual_call(ctx, op_pc);
+        // ICT: `bytecode_for_address(EvalFn)` is the origportal stub
+        // (`recursive_call_*`). Promote first so a non-Const funcbox
+        // can hit. A miss still rebuilds greens/reds from the helper
+        // ABI (`try_eval_fn_residual_as_recursive_call`); never
+        // `execute_varargs` EvalFn.
+        if let Some((next_pc, dst_bank, dst)) = blackhole_result {
+            let mut i_args = Vec::new();
+            let mut r_args = Vec::new();
+            let mut f_args = Vec::new();
+            for (arg, ty) in allboxes.iter().skip(1).zip(call_descr.arg_types()) {
+                match *ty {
+                    majit_ir::Type::Int => i_args.push(*arg),
+                    majit_ir::Type::Ref => r_args.push(*arg),
+                    majit_ir::Type::Float => f_args.push(*arg),
+                    majit_ir::Type::Void => {}
+                }
+            }
+            match try_do_residual_or_indirect_call(
+                ctx,
+                op_pc,
+                next_pc,
+                allboxes[0],
+                &i_args,
+                &r_args,
+                &f_args,
+                dst,
+                dst_bank,
+            ) {
+                Ok(Some((outcome, _))) => {
+                    let word = match dst_bank {
+                        'r' => ctx.registers_r.get(dst),
+                        'i' => ctx.registers_i.get(dst),
+                        'f' => ctx.registers_f.get(dst),
+                        _ => None,
+                    }
+                    .map(|box_ref| super::inline_call::residual_result_word(ctx, box_ref))
+                    .unwrap_or(0);
+                    match outcome {
+                        DispatchOutcome::Continue | DispatchOutcome::SubReturn { .. } => {
+                            return Ok(ResidualExecOutcome::PortalPerformCall { result: Ok(word) });
+                        }
+                        DispatchOutcome::SubRaise { exc, exc_concrete } => {
+                            ctx.set_last_exc_value(exc, exc_concrete);
+                            return Ok(ResidualExecOutcome::PortalPerformCall {
+                                result: Err(super::inline_call::concrete_value_word(exc_concrete)),
+                            });
+                        }
+                        _ => return Err(DispatchError::callee_inline_unsupported(op_pc)),
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+        }
         match super::inline_call::perform_portal_call_from_helper(
             ctx,
             allboxes,
@@ -5823,8 +5872,6 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                         allboxes.len()
                     );
                 }
-                // Never `execute_varargs` EvalFn. Missing helper-ABI frame is
-                // a resume-image gap, not a reason to residualize the pointer.
                 return Err(DispatchError::callee_inline_unsupported(op_pc));
             }
             Err(error) => return Err(error),
@@ -5952,13 +5999,11 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         return Ok(decline_symbolic_or_pure(cannot_raise_pure, call_opcode));
     }
     // `get_eval_fn()(frame, None)` is not the portal-runner ABI. The
-    // intercept above rebuilds greens/reds and enters `do_recursive_call`.
-    // Reaching here with that pointer would `execute_varargs` EvalFn and
-    // return the frame as the result word.
+    // intercept above promotes, retries ICT on the origportal stub, then
+    // `perform_portal_call_from_helper`. Reaching here with that pointer
+    // would `execute_varargs` EvalFn and return the frame as the result
+    // word. `box_bits` can miss a ConstInt that `box_value` still sees.
     if portal_entry_for_funcptr(func_ptr) {
-        if fbw_debug_abort_enabled() {
-            eprintln!("[eval-fn-residual] pc={op_pc} execute_varargs of EvalFn skipped");
-        }
         return Err(DispatchError::callee_inline_unsupported(op_pc));
     }
     // Same unsound-argument set the inline-subwalk gate consults above.
