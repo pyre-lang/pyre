@@ -45,7 +45,7 @@ use majit_translate::front::mir::{
     LowerContext, RootStackState, erased_root_bracket_guards, lower_fun_decl,
     lower_fun_decl_with_root_stack, lower_fun_decl_with_static_addrs,
 };
-use majit_translate::model::{CallTarget, FunctionGraph, OpKind};
+use majit_translate::model::{CallFuncPtr, CallTarget, FunctionGraph, OpKind};
 
 fn fun_decl_named<'a>(llbc: &'a Llbc, leaf: &str) -> &'a majit_charon_reader::FunDecl {
     let suffix = format!("::{leaf}");
@@ -880,6 +880,275 @@ fn ll_listslice_new_int_list_newlist_becomes_new_array() {
         calls_to(&out.graph, "int_ll_newlist"),
         0,
         "int_ll_newlist must not remain a residual call after newlist(length) rewrite"
+    );
+}
+
+/// The public `ll_list_int_resize_hint_really` is the look_inside_iff
+/// wrapper (`iff` / trampoline / `_orig_*`). `newlist(length)` lives in
+/// the `_orig_` body, which is the graph a constant-capacity grow inlines.
+/// After jtransform that call is `new_array`, and the `try_gc_write_barrier`
+/// before `int_set_items` is the gctransform `ll_writebarrier` that must
+/// not survive as a residual (a residual call forces the virtual list on
+/// `list_append_subscr_fresh`).
+#[test]
+fn ll_list_int_resize_hint_really_newlist_becomes_new_array() {
+    let Some(llbc) = object_llbc() else { return };
+    let graph = lower_named(llbc, "_orig_ll_list_int_resize_hint_really");
+    let mut pre_calls: Vec<String> = Vec::new();
+    let mut newlist_result_tys: Vec<String> = Vec::new();
+    let mut cc = CallControl::new();
+    for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            result_ty,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        let Some(leaf) = segments.last() else {
+            continue;
+        };
+        pre_calls.push(leaf.clone());
+        if leaf == "int_ll_newlist" {
+            newlist_result_tys.push(format!("{result_ty:?}"));
+        }
+        let spec = match leaf.as_str() {
+            "int_ll_newlist" => Some("newlist(length)"),
+            "ll_list_int_set_items" => Some("list.int_set_items(l, items)"),
+            "ll_list_int_items" => Some("list.int_items(l)"),
+            "ll_list_int_set_len" => Some("list.int_set_len(l, n)"),
+            "ll_list_int_length" => Some("list.int_len(l)"),
+            _ => None,
+        };
+        if let Some(spec) = spec {
+            cc.mark_oopspec(
+                CallPath::from_segments(segments.iter().map(String::as_str)),
+                spec.to_string(),
+            );
+        }
+    }
+    let config = GraphTransformConfig::default();
+    let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+    let out = transformer.transform(&graph);
+    let kinds: Vec<String> = out
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::NewArray { .. } => Some("NewArray".to_string()),
+            OpKind::NewArrayClear { .. } => Some("NewArrayClear".to_string()),
+            OpKind::FieldWrite { field, .. } => Some(format!("FieldWrite:{}", field.name)),
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => Some(format!(
+                "Call:{}",
+                segments.last().cloned().unwrap_or_default()
+            )),
+            OpKind::CallResidual {
+                funcptr: CallFuncPtr::Value(fp),
+                ..
+            } => {
+                let path = out
+                    .graph
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.operations)
+                    .find_map(|def| {
+                        if def.result.as_ref() == Some(fp) {
+                            match &def.kind {
+                                OpKind::ConstFnAddr { path, .. } => Some(path.clone()),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "unknown".into());
+                Some(format!("CallResidual:{path}"))
+            }
+            OpKind::CallResidual { .. } => Some("CallResidual".to_string()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        kinds.iter().any(|k| k == "NewArray"),
+        "int_ll_newlist oopspec must become NewArray, pre_calls={pre_calls:?} \
+         newlist_result_tys={newlist_result_tys:?} ops={kinds:?} notes={:?}",
+        out.notes
+    );
+    assert_eq!(
+        calls_to(&out.graph, "int_ll_newlist"),
+        0,
+        "int_ll_newlist must not remain a residual call after newlist(length) rewrite"
+    );
+    assert_eq!(
+        calls_to(&out.graph, "try_gc_write_barrier") + calls_to(&out.graph, "list_write_barrier"),
+        0,
+        "the barrier before int_set_items must drop, pre_calls={pre_calls:?} \
+         ops={kinds:?} notes={:?}",
+        out.notes
+    );
+    assert!(
+        kinds
+            .iter()
+            .all(|k| { !k.contains("list_write_barrier") && !k.contains("try_gc_write_barrier") }),
+        "write barrier must not survive as CallResidual, pre_calls={pre_calls:?} \
+         ops={kinds:?} notes={:?}",
+        out.notes
+    );
+}
+
+/// Production `apply_harvested_funcobj_hints` is what the codewriter
+/// consults for `newlist(length)`. The sibling test injects
+/// `mark_oopspec` on the exact CallPath; this one only stamps harvested
+/// `oopspec:` tokens, which is the path `list_append_subscr_fresh` takes.
+#[test]
+fn harvested_int_ll_newlist_oopspec_becomes_new_array() {
+    let Some(llbc) = object_llbc() else { return };
+    let harvested =
+        majit_translate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc));
+    let newlist_keys: Vec<(String, Vec<String>)> = harvested
+        .iter()
+        .filter(|(k, hints)| {
+            k.contains("int_ll_newlist") || hints.iter().any(|h| h.starts_with("oopspec:newlist"))
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let graph = lower_named(llbc, "_orig_ll_list_int_resize_hint_really");
+    let mut cc = CallControl::new();
+    for (path_str, hints) in &harvested {
+        if hints.iter().all(|h| !h.starts_with("oopspec:")) {
+            continue;
+        }
+        // `apply_harvested_funcobj_hints` / `free_function_alias_paths`
+        // register the crate-stripped harvest key and the defining-crate
+        // spelling the callsite uses (`pyre_object::listobject::…`).
+        let stripped: Vec<&str> = path_str.split("::").collect();
+        cc.mark_decorator_hints(&CallPath::from_segments(stripped.iter().copied()), hints);
+        let mut crate_prefixed = vec!["pyre_object"];
+        crate_prefixed.extend(stripped.iter().copied());
+        cc.mark_decorator_hints(&CallPath::from_segments(crate_prefixed), hints);
+    }
+    let mut oopspec_hits: Vec<String> = Vec::new();
+    let mut newlist_result_tys: Vec<String> = Vec::new();
+    for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+        let OpKind::Call {
+            target, result_ty, ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        let CallTarget::FunctionPath { segments, .. } = target else {
+            continue;
+        };
+        let Some(leaf) = segments.last() else {
+            continue;
+        };
+        if *leaf == "int_ll_newlist" {
+            newlist_result_tys.push(format!("{result_ty:?}"));
+            oopspec_hits.push(format!(
+                "{} -> {:?}",
+                segments.join("::"),
+                cc.get_oopspec(target)
+            ));
+        }
+    }
+    let config = GraphTransformConfig::default();
+    let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+    let out = transformer.transform(&graph);
+    let kinds: Vec<String> = out
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::NewArray { .. } => Some("NewArray".to_string()),
+            OpKind::NewArrayClear { .. } => Some("NewArrayClear".to_string()),
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => Some(format!(
+                "Call:{}",
+                segments.last().cloned().unwrap_or_default()
+            )),
+            OpKind::CallResidual { .. } => Some("CallResidual".to_string()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        kinds.iter().any(|k| k == "NewArray"),
+        "harvested newlist(length) must become NewArray, newlist_keys={newlist_keys:?} \
+         oopspec_hits={oopspec_hits:?} newlist_result_tys={newlist_result_tys:?} \
+         ops={kinds:?} notes={:?}",
+        out.notes
+    );
+}
+
+/// `sync_allocated` splits the `allocated` recompute the way
+/// `rlist.py _ll_list_resize_ge` splits the realloc. Under a constant
+/// `allocated` / `new_size` pair (a virtual list) the store is inline, so a
+/// trace does not hand the list to a residual and force it; otherwise
+/// `jit.conditional_call` of `w_list_resync_allocated`, with no branch on the
+/// band test. The target stays EF_CANNOT_RAISE so no `guard_no_exception`
+/// follows the `cond_call`.
+#[test]
+fn sync_allocated_mirrors_ll_list_resize_ge() {
+    let Some(llbc) = object_llbc() else { return };
+    let harvested =
+        majit_translate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc));
+    let resync_hints: Vec<&Vec<String>> = harvested
+        .iter()
+        .filter(|(k, _)| k.ends_with("::w_list_resync_allocated"))
+        .map(|(_, v)| v)
+        .collect();
+    assert!(
+        !resync_hints.is_empty()
+            && resync_hints
+                .iter()
+                .all(|hints| hints.iter().any(|h| h == "dont_look_inside")),
+        "w_list_resync_allocated is the residual cond_call target, harvested {resync_hints:?}"
+    );
+
+    let sync = lower_named(llbc, "sync_allocated");
+    let mut stores_allocated = false;
+    let mut isconstant = 0;
+    let mut cond_call = false;
+    for op in sync.blocks.iter().flat_map(|b| &b.operations) {
+        match &op.kind {
+            OpKind::FieldWrite { field, .. } if field.name == "allocated" => {
+                stores_allocated = true;
+            }
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => match segments.last().map(String::as_str) {
+                Some("isconstant") => isconstant += 1,
+                Some(leaf) if leaf.starts_with("conditional_call") => cond_call = true,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    let kinds: Vec<String> = sync
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .map(|op| format!("{:?}", op.kind).chars().take(120).collect())
+        .collect();
+    assert!(
+        stores_allocated,
+        "the constant arm stores `allocated` inline, ops={kinds:#?}"
+    );
+    assert_eq!(
+        isconstant, 2,
+        "`isconstant(allocated) and isconstant(new_size)`, ops={kinds:#?}"
+    );
+    assert!(
+        cond_call,
+        "the other arm is `jit.conditional_call`, ops={kinds:#?}"
     );
 }
 
