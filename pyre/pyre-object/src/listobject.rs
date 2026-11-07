@@ -526,21 +526,25 @@ impl W_ListObject {
 
     fn sync_allocated(&mut self, old_size: usize) {
         // `list_resize` keeps `allocated` while `allocated >> 1 <= new_size <=
-        // allocated`. The band test uses non-short-circuit `&` so a trace records
-        // no guard for it, and the recompute outside the band is a
-        // `jit.conditional_call` (`rlist.py _ll_list_resize_ge`).
+        // allocated`. The band test uses non-short-circuit `&` so a trace
+        // records no guard for it. rlist.py `_ll_list_resize_ge` uses
+        // `jit.conditional_call` for the realloc (`_ll_list_resize_hint_really`);
+        // this field store is `l.length = newsize` — a look-inside setfield.
+        // A residual `conditional_call` of the helper forces the virtual list.
         let new_size = self.live_len();
         let allocated = self.allocated;
         let keep = (allocated >= 0)
             & ((allocated as usize) >= new_size)
             & (new_size >= ((allocated as usize) >> 1));
-        majit_rlib::jit::conditional_call3(
-            !keep,
-            w_list_resync_allocated,
-            self as *mut W_ListObject as PyObjectRef,
-            old_size as i64,
-            new_size as i64,
-        );
+        if !keep {
+            unsafe {
+                w_list_resync_allocated(
+                    self as *mut W_ListObject as PyObjectRef,
+                    old_size as i64,
+                    new_size as i64,
+                );
+            }
+        }
     }
 
     #[inline]
@@ -1073,12 +1077,8 @@ impl W_ListObject {
 }
 
 /// Recompute the emulated `list_resize` `allocated` after a resize left its
-/// band; the residual target of `W_ListObject::sync_allocated`'s
-/// `jit.conditional_call`. It only stores an integer field, so it is declared
-/// EF_CANNOT_RAISE: a raising effect would put a `guard_no_exception` after the
-/// `cond_call`, and that guard forces the pending `length` setfield of the
-/// append in progress (`pyjitpl.py do_conditional_call`, `check_can_raise`).
-#[majit_macros::dont_look_inside_cannot_raise]
+/// band. Looked inside: it only stores a signed field, the same shape as
+/// `_ll_list_resize_ge`'s `l.length = newsize`.
 pub unsafe fn w_list_resync_allocated(obj: PyObjectRef, old_size: i64, new_size: i64) {
     let list = &mut *(obj as *mut W_ListObject);
     list.allocated = list.resized_allocation(old_size as usize, new_size as usize) as isize;
