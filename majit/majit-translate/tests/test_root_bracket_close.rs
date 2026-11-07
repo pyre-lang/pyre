@@ -886,7 +886,7 @@ fn ll_listslice_new_int_list_newlist_becomes_new_array() {
 /// The public `ll_list_int_resize_hint_really` is the look_inside_iff
 /// wrapper (`iff` / trampoline / `_orig_*`). `newlist(length)` lives in
 /// the `_orig_` body, which is the graph a constant-capacity grow inlines.
-/// After jtransform that call is `new_array`, and `list_write_barrier`
+/// After jtransform that call is `new_array`, and the `try_gc_write_barrier`
 /// before `int_set_items` is the gctransform `ll_writebarrier` that must
 /// not survive as a residual (a residual call forces the virtual list on
 /// `list_append_subscr_fresh`).
@@ -985,10 +985,9 @@ fn ll_list_int_resize_hint_really_newlist_becomes_new_array() {
         "int_ll_newlist must not remain a residual call after newlist(length) rewrite"
     );
     assert_eq!(
-        calls_to(&out.graph, "list_write_barrier")
-            + calls_to(&out.graph, "list_write_barrier_impl"),
+        calls_to(&out.graph, "try_gc_write_barrier") + calls_to(&out.graph, "list_write_barrier"),
         0,
-        "list_write_barrier before int_set_items must drop, pre_calls={pre_calls:?} \
+        "the barrier before int_set_items must drop, pre_calls={pre_calls:?} \
          ops={kinds:?} notes={:?}",
         out.notes
     );
@@ -1088,118 +1087,68 @@ fn harvested_int_ll_newlist_oopspec_becomes_new_array() {
     );
 }
 
-/// Call / fnaddr / field-store ops a residual `conditional_call` of
-/// `w_list_resync_allocated` would leave on a graph.
-fn resync_kinds(graph: &FunctionGraph) -> Vec<String> {
-    graph
-        .blocks
-        .iter()
-        .flat_map(|b| &b.operations)
-        .filter_map(|op| match &op.kind {
-            OpKind::FieldWrite { field, .. } => Some(format!("FieldWrite:{}", field.name)),
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } => Some(format!("Call:{}", segments.join("::"))),
-            OpKind::ConstFnAddr { path, .. } => Some(format!("ConstFnAddr:{path}")),
-            OpKind::CallResidual { .. } => Some("CallResidual".to_string()),
-            _ => None,
-        })
-        .collect()
-}
-
-fn residualizes_resync_via_cond_call(kinds: &[String]) -> bool {
-    let has_cond = kinds.iter().any(|k| k.contains("conditional_call"));
-    let has_resync_fnaddr = kinds.iter().any(|k| {
-        k.contains("w_list_resync_allocated")
-            && (k.starts_with("ConstFnAddr:") || k.starts_with("CallResidual"))
-    });
-    has_cond && has_resync_fnaddr
-}
-
-/// `w_list_resync_allocated` is the `allocated` field store after a
-/// resize left the `list_resize` band. rlist.py `_ll_list_resize_ge`
-/// uses `jit.conditional_call` only for the realloc
-/// (`_ll_list_resize_hint_really`); the field store is
-/// `l.length = newsize` and is looked inside. A residual
-/// `conditional_call` of this helper forces the virtual list.
+/// `sync_allocated` splits the `allocated` recompute the way
+/// `rlist.py _ll_list_resize_ge` splits the realloc. Under a constant
+/// `allocated` / `new_size` pair (a virtual list) the store is inline, so a
+/// trace does not hand the list to a residual and force it; otherwise
+/// `jit.conditional_call` of `w_list_resync_allocated`, with no branch on the
+/// band test. The target stays EF_CANNOT_RAISE so no `guard_no_exception`
+/// follows the `cond_call`.
 #[test]
-fn w_list_resync_allocated_is_looked_inside_setfield() {
+fn sync_allocated_mirrors_ll_list_resize_ge() {
     let Some(llbc) = object_llbc() else { return };
     let harvested =
         majit_translate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc));
-    let resync_hints: Vec<(String, Vec<String>)> = harvested
+    let resync_hints: Vec<&Vec<String>> = harvested
         .iter()
-        .filter(|(k, _)| k.contains("w_list_resync_allocated"))
-        .map(|(k, v)| (k.clone(), v.clone()))
+        .filter(|(k, _)| k.ends_with("::w_list_resync_allocated"))
+        .map(|(_, v)| v)
         .collect();
-    for (path, hints) in &resync_hints {
-        assert!(
-            !hints.iter().any(|h| h == "dont_look_inside"),
-            "{path} must be looked inside, harvested {hints:?}"
-        );
+    assert!(
+        !resync_hints.is_empty()
+            && resync_hints
+                .iter()
+                .all(|hints| hints.iter().any(|h| h == "dont_look_inside")),
+        "w_list_resync_allocated is the residual cond_call target, harvested {resync_hints:?}"
+    );
+
+    let sync = lower_named(llbc, "sync_allocated");
+    let mut stores_allocated = false;
+    let mut isconstant = 0;
+    let mut cond_call = false;
+    for op in sync.blocks.iter().flat_map(|b| &b.operations) {
+        match &op.kind {
+            OpKind::FieldWrite { field, .. } if field.name == "allocated" => {
+                stores_allocated = true;
+            }
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => match segments.last().map(String::as_str) {
+                Some("isconstant") => isconstant += 1,
+                Some(leaf) if leaf.starts_with("conditional_call") => cond_call = true,
+                _ => {}
+            },
+            _ => {}
+        }
     }
-
-    let helper = lower_named(llbc, "w_list_resync_allocated");
+    let kinds: Vec<String> = sync
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .map(|op| format!("{:?}", op.kind).chars().take(120).collect())
+        .collect();
     assert!(
-        !helper.hints.iter().any(|h| h == "dont_look_inside"),
-        "lowered helper must not carry dont_look_inside, hints={:?}",
-        helper.hints
+        stores_allocated,
+        "the constant arm stores `allocated` inline, ops={kinds:#?}"
     );
-    let helper_kinds = resync_kinds(&helper);
-    assert!(
-        helper_kinds.iter().any(|k| k == "FieldWrite:allocated"),
-        "helper body is the allocated setfield, ops={helper_kinds:?}"
-    );
-    assert!(
-        !residualizes_resync_via_cond_call(&helper_kinds),
-        "helper must not residualize itself via conditional_call, ops={helper_kinds:?}"
-    );
-
-    let config = GraphTransformConfig::default();
-    let mut cc = CallControl::new();
-    let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
-    let out = transformer.transform(&helper);
-    let transformed = resync_kinds(&out.graph);
-    assert!(
-        transformed.iter().any(|k| k == "FieldWrite:allocated"),
-        "jtransform must keep the allocated setfield, ops={transformed:?} notes={:?}",
-        out.notes
+    assert_eq!(
+        isconstant, 2,
+        "`isconstant(allocated) and isconstant(new_size)`, ops={kinds:#?}"
     );
     assert!(
-        !residualizes_resync_via_cond_call(&transformed),
-        "jtransform must not residualize the helper via conditional_call, \
-         ops={transformed:?} notes={:?}",
-        out.notes
-    );
-
-    if llbc
-        .iter_local_fns()
-        .any(|fd| fd.item_meta.name_path().ends_with("::sync_allocated"))
-    {
-        let sync = lower_named(llbc, "sync_allocated");
-        let sync_kinds = resync_kinds(&sync);
-        assert!(
-            !residualizes_resync_via_cond_call(&sync_kinds),
-            "sync_allocated must not residualize the helper via conditional_call, \
-             ops={sync_kinds:?}"
-        );
-        assert!(
-            sync_kinds.iter().any(|k| {
-                k.ends_with("::w_list_resync_allocated")
-                    || k == "Call:w_list_resync_allocated"
-                    || k == "FieldWrite:allocated"
-            }),
-            "sync_allocated looks inside the helper or stores allocated, ops={sync_kinds:?}"
-        );
-    }
-
-    let append = lower_named(llbc, "w_list_append");
-    let append_kinds = resync_kinds(&append);
-    assert!(
-        !residualizes_resync_via_cond_call(&append_kinds),
-        "w_list_append must not residualize the helper via conditional_call, \
-         ops={append_kinds:?}"
+        cond_call,
+        "the other arm is `jit.conditional_call`, ops={kinds:#?}"
     );
 }
 

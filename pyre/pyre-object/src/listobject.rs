@@ -526,24 +526,29 @@ impl W_ListObject {
 
     fn sync_allocated(&mut self, old_size: usize) {
         // `list_resize` keeps `allocated` while `allocated >> 1 <= new_size <=
-        // allocated`. The band test uses non-short-circuit `&` so a trace
-        // records no guard for it. rlist.py `_ll_list_resize_ge` uses
-        // `jit.conditional_call` for the realloc (`_ll_list_resize_hint_really`);
-        // this field store is `l.length = newsize` — a look-inside setfield.
-        // A residual `conditional_call` of the helper forces the virtual list.
+        // allocated`. The band test uses non-short-circuit `&` so a trace records
+        // no guard for it. The recompute outside the band is split the way
+        // `rlist.py _ll_list_resize_ge` splits the realloc: a constant pair
+        // stores inline (a virtual list keeps both constant and stays virtual),
+        // otherwise `jit.conditional_call` with no branch on `keep`, which would
+        // record a guard that fails on every band exit.
         let new_size = self.live_len();
         let allocated = self.allocated;
         let keep = (allocated >= 0)
             & ((allocated as usize) >= new_size)
             & (new_size >= ((allocated as usize) >> 1));
-        if !keep {
-            unsafe {
-                w_list_resync_allocated(
-                    self as *mut W_ListObject as PyObjectRef,
-                    old_size as i64,
-                    new_size as i64,
-                );
+        if majit_rlib::jit::isconstant(&allocated) && majit_rlib::jit::isconstant(&new_size) {
+            if !keep {
+                self.allocated = self.resized_allocation(old_size, new_size) as isize;
             }
+        } else {
+            majit_rlib::jit::conditional_call3(
+                !keep,
+                w_list_resync_allocated,
+                self as *mut W_ListObject as PyObjectRef,
+                old_size as i64,
+                new_size as i64,
+            );
         }
     }
 
@@ -1077,8 +1082,12 @@ impl W_ListObject {
 }
 
 /// Recompute the emulated `list_resize` `allocated` after a resize left its
-/// band. Looked inside: it only stores a signed field, the same shape as
-/// `_ll_list_resize_ge`'s `l.length = newsize`.
+/// band; the residual target of `W_ListObject::sync_allocated`'s
+/// `jit.conditional_call`. It only stores an integer field, so it is declared
+/// EF_CANNOT_RAISE: a raising effect would put a `guard_no_exception` after the
+/// `cond_call`, and that guard forces the pending `length` setfield of the
+/// append in progress (`pyjitpl.py do_conditional_call`, `check_can_raise`).
+#[majit_macros::dont_look_inside_cannot_raise]
 pub unsafe fn w_list_resync_allocated(obj: PyObjectRef, old_size: i64, new_size: i64) {
     let list = &mut *(obj as *mut W_ListObject);
     list.allocated = list.resized_allocation(old_size as usize, new_size as usize) as isize;
@@ -3332,11 +3341,6 @@ pub unsafe fn ll_list_int_resize_hint_really(obj: PyObjectRef, newsize: i64, ove
     };
     let list = &*(obj as *const W_ListObject);
     let before_len = ll_list_int_length(list);
-    let p = if (before_len as i64) < newsize {
-        before_len
-    } else {
-        newsize as usize
-    };
     // `newitems = malloc(LIST.items.TO, new_allocated)`: a nursery malloc
     // that may collect, so `l` is reloaded after it. Nothing between the
     // malloc and `l.items = newitems` collects, so `newitems` needs no root.
@@ -3344,11 +3348,23 @@ pub unsafe fn ll_list_int_resize_hint_really(obj: PyObjectRef, newsize: i64, ove
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
     let old = ll_list_int_items(list);
-    // `rgc.ll_arraycopy(l.items, newitems, 0, 0, p)`.
-    crate::object_array::ll_arraycopy_int_items_block(old, newitems, 0, 0, p as i64);
-    // The barrier gctransform puts before `l.items = newitems`: an old list
-    // now names a young block.
-    list_write_barrier(obj);
+    // `if before_len:` — an empty list's block may be the prebuilt empty array.
+    if before_len > 0 {
+        let p = if (before_len as i64) < newsize {
+            before_len
+        } else {
+            newsize as usize
+        };
+        // `rgc.ll_arraycopy(l.items, newitems, 0, 0, p)`.
+        crate::object_array::ll_arraycopy_int_items_block(old, newitems, 0, 0, p as i64);
+    }
+    // `l.items = newitems` under the barrier gctransform emits on `l` before it.
+    // A Signed/Float block holds no GC pointers, so `list_write_barrier`'s
+    // items-block half has nothing to do here. `try_gc_write_barrier` is the
+    // spelling jtransform drops before the store it guards, where
+    // `handle_write_barrier_setfield` emits `COND_CALL_GC_WB`; a residual
+    // barrier call would force a virtual list.
+    crate::gc_hook::try_gc_write_barrier(list as *mut W_ListObject as crate::gc_hook::GCREF);
     ll_list_int_set_items(list, newitems);
     // A block outside the collector's heap (no GC installed) has no other
     // owner to free it; a collector-owned one is left to the collector.
@@ -3485,11 +3501,6 @@ pub unsafe fn ll_list_float_resize_hint_really(obj: PyObjectRef, newsize: i64, o
     };
     let list = &*(obj as *const W_ListObject);
     let before_len = ll_list_float_length(list);
-    let p = if (before_len as i64) < newsize {
-        before_len
-    } else {
-        newsize as usize
-    };
     // `newitems = malloc(LIST.items.TO, new_allocated)`: a nursery malloc
     // that may collect, so `l` is reloaded after it. Nothing between the
     // malloc and `l.items = newitems` collects, so `newitems` needs no root.
@@ -3497,17 +3508,29 @@ pub unsafe fn ll_list_float_resize_hint_really(obj: PyObjectRef, newsize: i64, o
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
     let old = ll_list_float_items(list);
-    // `rgc.ll_arraycopy(l.items, newitems, 0, 0, p)`.
-    crate::object_array::ll_arraycopy_float_items_block(
-        old as *mut FloatItemsBlock,
-        newitems as *mut FloatItemsBlock,
-        0,
-        0,
-        p as i64,
-    );
-    // The barrier gctransform puts before `l.items = newitems`: an old list
-    // now names a young block.
-    list_write_barrier(obj);
+    // `if before_len:` — an empty list's block may be the prebuilt empty array.
+    if before_len > 0 {
+        let p = if (before_len as i64) < newsize {
+            before_len
+        } else {
+            newsize as usize
+        };
+        // `rgc.ll_arraycopy(l.items, newitems, 0, 0, p)`.
+        crate::object_array::ll_arraycopy_float_items_block(
+            old as *mut FloatItemsBlock,
+            newitems as *mut FloatItemsBlock,
+            0,
+            0,
+            p as i64,
+        );
+    }
+    // `l.items = newitems` under the barrier gctransform emits on `l` before it.
+    // A Signed/Float block holds no GC pointers, so `list_write_barrier`'s
+    // items-block half has nothing to do here. `try_gc_write_barrier` is the
+    // spelling jtransform drops before the store it guards, where
+    // `handle_write_barrier_setfield` emits `COND_CALL_GC_WB`; a residual
+    // barrier call would force a virtual list.
+    crate::gc_hook::try_gc_write_barrier(list as *mut W_ListObject as crate::gc_hook::GCREF);
     ll_list_float_set_items(list, newitems);
     // A block outside the collector's heap (no GC installed) has no other
     // owner to free it; a collector-owned one is left to the collector.
@@ -3810,8 +3833,13 @@ pub unsafe fn ll_list_obj_resize_hint_really(obj: PyObjectRef, newsize: i64, ove
         // `rgc.ll_arraycopy(l.items, newitems, 0, 0, p)`.
         crate::object_array::ll_arraycopy_items_block(old, newitems, 0, 0, p as i64);
     }
-    // The barrier gctransform puts before `l.items = newitems`.
-    list_write_barrier(obj);
+    // `l.items = newitems` under the barrier gctransform emits on `l` before it.
+    // The old block leaves the list here, so `list_write_barrier`'s items-block
+    // half has nothing to do. `try_gc_write_barrier` is the spelling jtransform
+    // drops before the store it guards, where `handle_write_barrier_setfield`
+    // emits `COND_CALL_GC_WB`; a residual barrier call would force a virtual
+    // list.
+    crate::gc_hook::try_gc_write_barrier(list as *mut W_ListObject as crate::gc_hook::GCREF);
     list.items = newitems;
     // A block outside the collector's heap has no other owner to free it; a
     // collector-owned one is left to the collector.

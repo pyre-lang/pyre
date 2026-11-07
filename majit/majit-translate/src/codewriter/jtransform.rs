@@ -1029,10 +1029,9 @@ fn is_null_fn_result(result_ty: &ValueType) -> bool {
 /// `try_gc_write_barrier_prebuilt` — the interpreter's spelling of
 /// `llop.gc_writebarrier`, which [`drop_guarded_gc_write_barriers`]
 /// drops when the store it guards follows.
-/// `listobject::list_write_barrier` is the same op on a list: gctransform
-/// would have emitted `ll_writebarrier` before `l.items = newitems`, and
-/// a residual call of that wrapper forces a virtual list the way a
-/// residual `ll_writebarrier` would.
+/// `listobject::list_write_barrier` is not this op: it also barriers the
+/// list's items block, which no `COND_CALL_GC_WB` on the list's own store
+/// covers.
 /// `try_gc_write_barrier_before_move` is a different op
 /// (`gct_gc_writebarrier_before_move`) and is not this.
 /// `try_gc_write_barrier_from_array` is `write_barrier_from_array` and
@@ -1043,16 +1042,13 @@ fn is_gc_write_barrier_path(segments: &[String]) -> bool {
     let [.., module, leaf] = segments else {
         return false;
     };
-    match (module.as_str(), leaf.as_str()) {
-        (
-            "gc_hook",
+    module == "gc_hook"
+        && matches!(
+            leaf.as_str(),
             "try_gc_write_barrier"
-            | "try_gc_write_barrier_managed"
-            | "try_gc_write_barrier_prebuilt",
-        ) => true,
-        ("listobject", "list_write_barrier" | "list_write_barrier_impl") => true,
-        _ => false,
-    }
+                | "try_gc_write_barrier_managed"
+                | "try_gc_write_barrier_prebuilt"
+        )
 }
 
 /// Unary ops `optimize_block` drops as `same_as`.
@@ -3352,11 +3348,10 @@ impl<'a> Transformer<'a> {
         for block_idx in 0..rewritten.blocks.len() {
             self.optimize_block(&mut rewritten, block_idx, &graph_name, exceptblock);
         }
-        // `list.int_set_items` becomes `FieldWrite` only inside
-        // `optimize_block`. A `list_write_barrier` sitting on that store
-        // is the gctransform `ll_writebarrier` that
-        // `handle_write_barrier_setfield` will re-emit as `COND_CALL_GC_WB`,
-        // so drop it now that the store is a GC field write.
+        // An oopspec store such as `list.int_set_items` becomes `FieldWrite`
+        // only inside `optimize_block`, after the barrier before it was
+        // residualized. Drop that barrier now that the store it guards is a
+        // GC field write `handle_write_barrier_setfield` barriers itself.
         drop_guarded_gc_write_barriers(&mut rewritten);
         // A rewrite can itself define a condition as a constant (notably the
         // false result paired with `can_enter_jit`'s `loop_header`).  Follow
@@ -33078,9 +33073,9 @@ mod tests {
         assert!(matches!(ops[1].kind, OpKind::ArrayWrite { .. }));
     }
 
-    /// The `gc_hook` barrier and `listobject::list_write_barrier` are this
-    /// op: a same-named leaf in another module is an ordinary call.
-    /// `write_cell` spells `try_gc_write_barrier_prebuilt`.
+    /// Only the `gc_hook` barrier is this op: a same-named leaf in another
+    /// module is an ordinary call, and `list_write_barrier` also barriers the
+    /// items block. `write_cell` spells `try_gc_write_barrier_prebuilt`.
     #[test]
     fn gc_write_barrier_path_requires_gc_hook_module() {
         let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -33094,7 +33089,7 @@ mod tests {
             "gc_hook",
             "try_gc_write_barrier_prebuilt"
         ])));
-        assert!(is_gc_write_barrier_path(&path(&[
+        assert!(!is_gc_write_barrier_path(&path(&[
             "pyre_object",
             "listobject",
             "list_write_barrier"
@@ -33117,41 +33112,13 @@ mod tests {
         ])));
     }
 
-    /// `list_write_barrier` before the GC store it guards is the same drop
-    /// as `try_gc_write_barrier` (`handle_write_barrier_setfield`).
-    #[test]
-    fn list_write_barrier_before_its_store_is_dropped() {
-        let mut graph = FunctionGraph::new("list_wb_drop");
-        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let entry = graph.startblock;
-        graph.push_op_var(
-            entry,
-            OpKind::Call {
-                target: CallTarget::function_path([
-                    "pyre_object",
-                    "listobject",
-                    "list_write_barrier",
-                ]),
-                args: crate::model::call_args(vec![obj.clone()]),
-                result_ty: ValueType::Bool,
-            },
-            false,
-        );
-        graph.push_op_var(entry, wb_store(&obj, &stored), false);
-        drop_guarded_gc_write_barriers(&mut graph);
-        let ops = &graph.blocks[entry.0].operations;
-        assert!(matches!(ops[0].kind, OpKind::ConstBool(true)));
-        assert!(matches!(ops[1].kind, OpKind::FieldWrite { .. }));
-    }
-
     /// `optimize_block` residualizes `dont_look_inside` barriers to
     /// `CallResidual` plus `-live-` before `list.int_set_items` becomes
     /// `FieldWrite`. The second drop must still see that residual.
     #[test]
-    fn list_write_barrier_residual_before_its_store_is_dropped() {
+    fn gc_write_barrier_residual_before_its_store_is_dropped() {
         use majit_ir::value::Type;
-        let mut graph = FunctionGraph::new("list_wb_residual_drop");
+        let mut graph = FunctionGraph::new("gc_wb_residual_drop");
         let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
         let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
         let entry = graph.startblock;
@@ -33160,7 +33127,7 @@ mod tests {
                 entry,
                 OpKind::ConstFnAddr {
                     value: 0,
-                    path: "pyre_object::listobject::list_write_barrier".into(),
+                    path: "pyre_object::gc_hook::try_gc_write_barrier".into(),
                     symbolic: true,
                 },
                 true,
@@ -33189,7 +33156,7 @@ mod tests {
         let ops = &graph.blocks[entry.0].operations;
         assert!(
             matches!(ops[1].kind, OpKind::ConstBool(true)),
-            "residual list_write_barrier must drop, ops={:?}",
+            "residual try_gc_write_barrier must drop, ops={:?}",
             ops.iter().map(|op| &op.kind).collect::<Vec<_>>()
         );
         assert!(matches!(ops[3].kind, OpKind::FieldWrite { .. }));
