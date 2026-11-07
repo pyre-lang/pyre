@@ -17,14 +17,18 @@ use crate::pyobject::*;
 /// `getdict(space)` returns a stable identity across calls. For the user-supplied
 /// case `w_dict` is the caller's object directly, preserving subclass
 /// identity for `space.finditem_str` dispatch.
+///
+/// `module.py Module._immutable_fields_ = ["w_dict", "w_userclass?"]`.
+/// pyre has no `w_userclass` analog; `w_dict` is allocation-immutable.
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("w_dict")]
 pub struct Module {
     pub ob_header: PyObject,
     /// `module.py:22 self.w_name = w_name`. `PY_NULL` is the anonymous
     /// sentinel installed by `module.__new__` before `module.__init__` runs.
     pub w_name: PyObjectRef,
     /// Authoritative dict object (`PyPy module.w_dict`).  Always non-null
-    /// after construction.
+    /// after construction. Listed in `Module._immutable_fields_`.
     pub w_dict: PyObjectRef,
     /// `mixedmodule.py MixedModule.w_initialdict`: `PY_NULL` as long as the
     /// builtin module has not been imported yet, and when it has been, its

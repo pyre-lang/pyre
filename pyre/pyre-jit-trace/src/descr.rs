@@ -7210,6 +7210,51 @@ static W_CLASSMETHOD_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock
     )
 });
 
+/// `module.py Module` field descrs. `w_dict` is
+/// `Module._immutable_fields_ = ["w_dict", "w_userclass?"]` (pyre has no
+/// `w_userclass` analog): `descr.py get_field_descr` `is_pure =
+/// STRUCT._immutable_field(fieldname) != False` stamps `is_immutable`,
+/// not quasi, matching `PyObject.ob_type` / tuple `wrappeditems`.
+static W_MODULE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_object::module::Module;
+    let word_ref = |key, offset, immutable| (key, offset, WORD, Type::Ref, false, immutable, false);
+    build_object_descr_group_with_def_path(
+        pyre_object::module::W_MODULE_OBJECT_SIZE,
+        W_MODULE_GC_TYPE_ID,
+        &pyre_object::pyobject::MODULE_TYPE as *const _ as usize,
+        &[
+            word_ref("w_name", std::mem::offset_of!(Module, w_name), false),
+            word_ref("w_dict", std::mem::offset_of!(Module, w_dict), true),
+            word_ref(
+                "w_initialdict",
+                std::mem::offset_of!(Module, w_initialdict),
+                false,
+            ),
+            (
+                "startup_called",
+                std::mem::offset_of!(Module, startup_called),
+                std::mem::size_of::<bool>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            word_ref("lifeline", std::mem::offset_of!(Module, lifeline), false),
+        ],
+        "Module",
+        "module::Module",
+    )
+});
+
+fn module_field_descr(field_key: &str) -> DescrRef {
+    field_descr_from_group_named(&*W_MODULE_DESCR_GROUP, field_key)
+}
+
+/// `module.py Module.w_dict` — `_immutable_fields_ = ["w_dict"]`.
+pub fn module_w_dict_descr() -> DescrRef {
+    module_field_descr("w_dict")
+}
+
 static W_MODULE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_native_user_mapdict_group(
         pyre_object::module::W_MODULE_USER_OBJECT_SIZE,
@@ -14477,6 +14522,32 @@ mod tests {
     }
 
     #[test]
+    fn module_w_dict_descr_is_always_pure() {
+        let descr = module_w_dict_descr();
+        let field = descr.as_field_descr().expect("Module.w_dict field descr");
+        assert!(descr.is_always_pure());
+        assert!(!descr.is_quasi_immutable());
+        assert_eq!(field.field_key(), "w_dict");
+        assert_eq!(
+            field.offset(),
+            core::mem::offset_of!(pyre_object::module::Module, w_dict),
+        );
+        assert_eq!(field.field_size(), WORD);
+        assert_eq!(field.field_type(), Type::Ref);
+        let parent = field
+            .get_parent_descr()
+            .expect("Module.w_dict must retain its parent SizeDescr");
+        assert_eq!(
+            parent.as_size_descr().map(|sd| sd.size()),
+            Some(pyre_object::module::W_MODULE_OBJECT_SIZE),
+        );
+        assert_eq!(
+            parent.as_size_descr().map(|sd| sd.type_id()),
+            Some(W_MODULE_GC_TYPE_ID),
+        );
+    }
+
+    #[test]
     fn module_dict_object_mstrategy_descr_is_quasi_immutable() {
         let mstrategy = module_dict_object_mstrategy_descr();
         let mutate = module_dict_object_mutate_mstrategy_descr();
@@ -16106,6 +16177,15 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     ("function::ClassMethodUser", || {
         LazyLock::force(&W_CLASSMETHOD_USER_DESCR_GROUP);
     }),
+    ("Module", || {
+        LazyLock::force(&W_MODULE_DESCR_GROUP);
+    }),
+    ("module::Module", || {
+        LazyLock::force(&W_MODULE_DESCR_GROUP);
+    }),
+    ("pyre_object::module::Module", || {
+        LazyLock::force(&W_MODULE_DESCR_GROUP);
+    }),
     ("module::ModuleUser", || {
         LazyLock::force(&W_MODULE_USER_DESCR_GROUP);
     }),
@@ -17521,6 +17601,31 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     return canonical;
                 }
             }
+            // `module.py Module.w_dict` is `_immutable_fields_ = ["w_dict"]`.
+            // `jtransform.py rewrite_op_getfield` emits `getfield_*_pure`;
+            // `opimpl_getfield_gc_*` folds ConstPtr+`is_always_pure`. The
+            // codewriter names the owner by leaf or by module path. Bridge
+            // to the interned group row before the generic parent lookup
+            // mints a mutable twin.
+            if matches!(
+                owner.as_str(),
+                "Module" | "module::Module" | "pyre_object::module::Module"
+            ) {
+                let leaf = field_key.rsplit('.').next().unwrap_or(field_key);
+                if let Some(canonical) = W_MODULE_DESCR_GROUP
+                    .field_descrs
+                    .iter()
+                    .find(|descr| descr.field_key() == leaf)
+                {
+                    let canonical = canonical.clone() as DescrRef;
+                    if let Some(field) = canonical.as_field_descr()
+                        && field.field_size() == *field_size
+                        && field.field_type() == *field_type
+                    {
+                        return canonical;
+                    }
+                }
+            }
             // `W_ModuleDictObject.mstrategy` is `dictmultiobject.py`
             // `"mstrategy?"`. `jtransform.py rewrite_op_getfield` emits
             // `record_quasiimmut_field` for the translated read; the generated
@@ -18613,6 +18718,16 @@ fn mint_field(
         }
     }
     if let majit_ir::descr::LLType::Struct(struct_id) = &struct_key
+        && is_module_struct(*struct_id)
+        && let Some(canonical) = W_MODULE_DESCR_GROUP
+            .field_descrs
+            .iter()
+            .find(|descr| descr.field_key() == field_name)
+        && *field_size == canonical.field_size()
+    {
+        return Some(canonical.clone() as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
+    }
+    if let majit_ir::descr::LLType::Struct(struct_id) = &struct_key
         && is_w_module_dict_object_struct(*struct_id)
         && let Some(canonical) = W_MODULE_DICT_DESCR_GROUP
             .field_descrs
@@ -18998,6 +19113,14 @@ fn is_module_dict_strategy_struct(struct_id: u64) -> bool {
     .any(|owner| struct_id == majit_ir::descr::path_hash(owner))
 }
 
+/// Whether `struct_id` names `module::Module` under one of the owner
+/// spellings `make_descr_from_bh` bridges.
+fn is_module_struct(struct_id: u64) -> bool {
+    ["Module", "module::Module", "pyre_object::module::Module"]
+        .into_iter()
+        .any(|owner| struct_id == majit_ir::descr::path_hash(owner))
+}
+
 /// Whether `struct_id` names `W_ModuleDictObject` under one of the owner
 /// spellings `make_descr_from_bh` bridges.
 fn is_w_module_dict_object_struct(struct_id: u64) -> bool {
@@ -19208,6 +19331,14 @@ pub(crate) fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) ->
             if field_name.as_str() == "mutate_version" && is_module_dict_strategy_struct(*struct_id)
             {
                 return SetMemberLookup::Resolved(module_dict_mutate_version_descr());
+            }
+            if is_module_struct(*struct_id)
+                && let Some(canonical) = W_MODULE_DESCR_GROUP
+                    .field_descrs
+                    .iter()
+                    .find(|descr| descr.field_key() == field_name.as_str())
+            {
+                return SetMemberLookup::Resolved(canonical.clone() as DescrRef);
             }
             if is_w_module_dict_object_struct(*struct_id)
                 && let Some(canonical) = W_MODULE_DICT_DESCR_GROUP
