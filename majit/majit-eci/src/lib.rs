@@ -2,7 +2,8 @@
 //! build step ll2ctypes runs for it (`compile_shared_lib`).
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 pub mod ansi_print;
 pub mod build;
@@ -43,6 +44,20 @@ pub fn generate_macro_wrapper(name: &str, macro_: &str, args: &[String], result:
         format!("RPY_EXTERN {decl} {{ return {macro_}({argnames}); }}")
     }
 }
+
+/// `cbuild.py` `from_pkg_config` / `from_config_tool` `ImportError`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportError {
+    pub message: String,
+}
+
+impl fmt::Display for ImportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for ImportError {}
 
 /// `cbuild.py` `ExternalCompilationInfo`. Fields follow `_ATTRIBUTES`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -118,6 +133,43 @@ fn py_repr(s: &str) -> String {
     }
     out.push(quote);
     out
+}
+
+/// `py.path.local.sysfind`.
+fn sysfind(execonfigtool: &str) -> Option<PathBuf> {
+    if execonfigtool.contains('/') || execonfigtool.contains('\\') {
+        let path = Path::new(execonfigtool);
+        return path.is_file().then(|| path.to_path_buf());
+    }
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(execonfigtool);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            for ext in ["exe", "bat", "cmd", "com"] {
+                let candidate = dir.join(format!("{execonfigtool}.{ext}"));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `py.process.cmdexec`.
+fn cmdexec(program: &Path, args: &[&str]) -> String {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("{err}"));
+    if !output.status.success() {
+        panic!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 impl ExternalCompilationInfo {
@@ -309,6 +361,44 @@ impl ExternalCompilationInfo {
             link_extra,
             ..ExternalCompilationInfo::default()
         })
+    }
+
+    /// `ExternalCompilationInfo.from_config_tool`.
+    pub fn from_config_tool(execonfigtool: &str) -> Result<Self, ImportError> {
+        let path = sysfind(execonfigtool).ok_or_else(|| ImportError {
+            message: format!("cannot find {}", py_repr(execonfigtool)),
+        })?;
+        Self::run_config_tool(&path, &[])
+    }
+
+    /// `ExternalCompilationInfo.from_pkg_config`.
+    pub fn from_pkg_config(pkgname: &str) -> Result<Self, ImportError> {
+        let result = match Command::new("pkg-config")
+            .args([pkgname, "--exists"])
+            .status()
+        {
+            Ok(status) => status.code().unwrap_or(-1),
+            Err(_) => -1,
+        };
+        if result != 0 {
+            return Err(ImportError {
+                message: format!("failed: 'pkg-config {pkgname} --exists'"),
+            });
+        }
+        Self::run_config_tool(Path::new("pkg-config"), &[pkgname])
+    }
+
+    /// `ExternalCompilationInfo._run_config_tool`.
+    fn run_config_tool(program: &Path, extra: &[&str]) -> Result<Self, ImportError> {
+        let mut cflags_args = extra.to_vec();
+        cflags_args.push("--cflags");
+        let cflags = cmdexec(program, &cflags_args);
+        let eci1 = Self::from_compiler_flags(cflags.trim()).unwrap_or_else(|err| panic!("{err}"));
+        let mut libs_args = extra.to_vec();
+        libs_args.push("--libs");
+        let libs = cmdexec(program, &libs_args);
+        let eci2 = Self::from_linker_flags(libs.trim()).unwrap_or_else(|err| panic!("{err}"));
+        Ok(eci1.merge(&[&eci2]))
     }
 
     /// `ExternalCompilationInfo.write_c_header`.
@@ -882,6 +972,34 @@ mod tests {
         assert_eq!(
             ExternalCompilationInfo::from_linker_flags(r"-I\x"),
             Err(r"compiler flag found in linker options: '-I\\x'".to_string())
+        );
+    }
+
+    #[test]
+    fn from_missing_config_tool() {
+        let err = ExternalCompilationInfo::from_config_tool("dxowqbncpqympqhe-config").unwrap_err();
+        assert_eq!(
+            err.message,
+            "cannot find 'dxowqbncpqympqhe-config'".to_string()
+        );
+    }
+
+    #[test]
+    fn from_pkg_config() {
+        let result = match std::process::Command::new("pkg-config")
+            .args(["ncurses", "--exists"])
+            .status()
+        {
+            Ok(status) => status.code().unwrap_or(-1),
+            Err(_) => -1,
+        };
+        if result != 0 {
+            return;
+        }
+        let eci = ExternalCompilationInfo::from_pkg_config("ncurses").unwrap();
+        assert!(
+            eci.libraries.iter().any(|lib| lib.contains("ncurses")),
+            "{eci:?}"
         );
     }
 

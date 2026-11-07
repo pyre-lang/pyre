@@ -11,6 +11,8 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use parking_lot::Mutex;
+
 use crate::ExternalCompilationInfo;
 pub use crate::platform::CompilationError;
 
@@ -1385,6 +1387,187 @@ fn memory_alignment_compute() -> Result<u64, CompilationError> {
     }
 }
 
+/// `rffi_platform.py` `configure_external_library` configuration dict.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LibraryConfiguration {
+    pub prefix: String,
+    pub include_dir: String,
+    pub library_dir: String,
+}
+
+/// `rffi_platform.py` `PYPY_EXTERNAL_DIR`.
+fn pypy_external_dir() -> PathBuf {
+    let rpython_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("rpython");
+    let mut dir = rpython_dir.join("..").join("..");
+    if cfg!(windows) {
+        for libdir in [
+            PathBuf::from(r"c:\buildslave\support"),
+            PathBuf::from(r"d:\myslave"),
+        ] {
+            if libdir.is_dir() {
+                dir = libdir;
+                break;
+            }
+        }
+    }
+    dir
+}
+
+fn external_library_cache()
+-> &'static Mutex<Vec<((String, ExternalCompilationInfo), ExternalCompilationInfo)>> {
+    static CACHE: OnceLock<
+        Mutex<Vec<((String, ExternalCompilationInfo), ExternalCompilationInfo)>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn glob_prefix(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+    let mut entries = Vec::new();
+    let Ok(read) = fs::read_dir(dir) else {
+        return entries;
+    };
+    for ent in read.flatten() {
+        let name = ent.file_name();
+        if name.to_string_lossy().starts_with(prefix) {
+            entries.push(ent.path());
+        }
+    }
+    entries.sort();
+    entries
+}
+
+/// `rffi_platform.py` `configure_external_library`. `symbol` is unused
+/// upstream (`configure_boehm` still passes `symbol='GC_init'`).
+pub fn configure_external_library(
+    name: &str,
+    eci: ExternalCompilationInfo,
+    mut configurations: Vec<LibraryConfiguration>,
+    _symbol: Option<&str>,
+) -> Result<ExternalCompilationInfo, CompilationError> {
+    if !cfg!(windows) {
+        configurations = Vec::new();
+    }
+    {
+        let cache = external_library_cache().lock();
+        if let Some((_, eci_lib)) = cache
+            .iter()
+            .find(|((n, cached), _)| n == name && cached == &eci)
+        {
+            return Ok(eci_lib.clone());
+        }
+    }
+
+    let mut last_error = None;
+    if !configurations.contains(&LibraryConfiguration::default()) {
+        configurations.push(LibraryConfiguration::default());
+    }
+
+    for configuration in configurations {
+        let mut prefix = configuration.prefix;
+        let include_dir = configuration.include_dir;
+        let library_dir = configuration.library_dir;
+
+        if !prefix.is_empty() && !Path::new(&prefix).is_absolute() {
+            let entries = glob_prefix(&pypy_external_dir(), &prefix);
+            if let Some(last) = entries.last() {
+                prefix = last.to_string_lossy().into_owned();
+            } else {
+                continue;
+            }
+        }
+
+        let include_dir = Path::new(&prefix)
+            .join(&include_dir)
+            .to_string_lossy()
+            .into_owned();
+        let library_dir = Path::new(&prefix)
+            .join(&library_dir)
+            .to_string_lossy()
+            .into_owned();
+
+        let eci_lib = ExternalCompilationInfo {
+            include_dirs: if include_dir.is_empty() {
+                Vec::new()
+            } else {
+                vec![include_dir]
+            },
+            library_dirs: if library_dir.is_empty() {
+                Vec::new()
+            } else {
+                vec![library_dir]
+            },
+            ..ExternalCompilationInfo::default()
+        };
+        let eci_lib = eci_lib.merge(&[&eci]);
+
+        match verify_eci(eci_lib.clone()) {
+            Ok(()) => {
+                external_library_cache()
+                    .lock()
+                    .push(((name.to_string(), eci), eci_lib.clone()));
+                return Ok(eci_lib);
+            }
+            Err(e) => last_error = Some(e),
+        }
+    }
+
+    if let Some(last_error) = last_error {
+        Err(last_error)
+    } else {
+        Err(CompilationError {
+            out: String::new(),
+            err: format!("Library {name} is not installed"),
+        })
+    }
+}
+
+/// `rffi_platform.py` `configure_boehm`.
+pub fn configure_boehm(
+    platform: Option<String>,
+) -> Result<ExternalCompilationInfo, CompilationError> {
+    let (library_dir, libraries, includes, platform) = if cfg!(windows) {
+        let (library_dir, libraries) = if usize::BITS == 32 {
+            ("Release", vec!["gc".to_string()])
+        } else {
+            ("", vec!["gc64_dll".to_string()])
+        };
+        (library_dir, libraries, vec!["gc.h".to_string()], None)
+    } else {
+        (
+            "",
+            vec!["gc".to_string()],
+            vec!["gc/gc.h".to_string()],
+            platform,
+        )
+    };
+    match ExternalCompilationInfo::from_pkg_config("bdw-gc") {
+        Ok(mut eci) => {
+            eci.includes.extend(includes);
+            return Ok(eci);
+        }
+        Err(_) => {}
+    }
+    let eci = ExternalCompilationInfo {
+        platform,
+        includes,
+        libraries,
+        ..ExternalCompilationInfo::default()
+    };
+    configure_external_library(
+        "gc",
+        eci,
+        vec![LibraryConfiguration {
+            prefix: "gc-".into(),
+            include_dir: "include".into(),
+            library_dir: library_dir.into(),
+        }],
+        Some("GC_init"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2308,5 +2491,46 @@ mod tests {
                 .unwrap(),
             padding
         );
+    }
+
+    #[test]
+    fn test_configure_external_library_default() {
+        let eci =
+            configure_external_library("c", ExternalCompilationInfo::default(), Vec::new(), None)
+                .unwrap();
+        assert_eq!(eci, ExternalCompilationInfo::default());
+        let again =
+            configure_external_library("c", ExternalCompilationInfo::default(), Vec::new(), None)
+                .unwrap();
+        assert_eq!(eci, again);
+    }
+
+    #[test]
+    fn test_configure_external_library_missing() {
+        let err = configure_external_library(
+            "not_a_real_lib_xyz",
+            ExternalCompilationInfo {
+                libraries: vec!["not_a_real_lib_xyz".into()],
+                ..ExternalCompilationInfo::default()
+            },
+            Vec::new(),
+            None,
+        )
+        .unwrap_err();
+        assert!(!err.out.is_empty() || !err.err.is_empty(), "{err}");
+    }
+
+    #[test]
+    fn test_configure_boehm() {
+        match configure_boehm(None) {
+            Ok(eci) => {
+                assert!(
+                    eci.libraries.iter().any(|lib| lib.contains("gc"))
+                        || eci.includes.iter().any(|inc| inc.contains("gc")),
+                    "{eci:?}"
+                );
+            }
+            Err(_) => {}
+        }
     }
 }

@@ -1570,42 +1570,22 @@ impl TranslationDriver {
         ))
     }
 
-    /// Upstream `possibly_check_for_boehm(self)` at `:395-403`.
-    ///
-    /// ```python
-    /// def possibly_check_for_boehm(self):
-    ///     if self.config.translation.gc == "boehm":
-    ///         from rpython.rtyper.tool.rffi_platform import configure_boehm
-    ///         from rpython.translator.platform import CompilationError
-    ///         try:
-    ///             configure_boehm(self.translator.platform)
-    ///         except CompilationError as e:
-    ///             i = 'Boehm GC not installed.  Try e.g. "translate.py --gc=minimark"'
-    ///             raise Exception(str(e) + '\n' + i)
-    /// ```
-    ///
-    /// **TODO** — `rpython.rtyper.tool.rffi_platform`
-    /// (`rpython/rtyper/tool/rffi_platform.py`) and
-    /// `rpython.translator.platform` (`rpython/translator/platform/__init__.py`)
-    /// are not ported. The configure_boehm probe links a tiny C
-    /// program against `libgc-dev` to verify the headers + lib are
-    /// installed; without those ports we cannot run the probe, so the
-    /// branch returns `Ok(())` even when `gc=boehm`. Convergence path:
-    /// once `translator.platform` ports, the body becomes the
-    /// upstream try/except shape verbatim — until then, callers that
-    /// set `gc=boehm` skip the verification step at runtime (matching
-    /// upstream behaviour on hosts where Boehm is installed; mismatch
-    /// only on hosts where it is *not*, where upstream raises).
+    /// `driver.py` `possibly_check_for_boehm`.
     pub fn possibly_check_for_boehm(&self) -> Result<(), TaskError> {
-        // Upstream `:396`: `if self.config.translation.gc == "boehm":`.
         let gc = match self.config.get("translation.gc") {
             Ok(ConfigValue::Value(OptionValue::Choice(s))) => s,
             _ => return Ok(()),
         };
         if gc == "boehm" {
-            // Upstream `:397-403`: probe the platform for libgc-dev.
-            // TODO — see the doc-comment above for
-            // the convergence path.
+            // `ECI.platform` is `Option<String>`; `None` is the host, matching
+            // `configure_boehm` when `platform is None`.
+            if let Err(e) = majit_eci::rffi_platform::configure_boehm(None) {
+                return Err(TaskError {
+                    message: format!(
+                        "{e}\nBoehm GC not installed.  Try e.g. \"translate.py --gc=minimark\""
+                    ),
+                });
+            }
         }
         Ok(())
     }
