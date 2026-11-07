@@ -10743,6 +10743,11 @@ fn resume_py_pc_after_residual_live_uses_fallthrough_twin() {
         "after-call -live- resumes at the CALL fallthrough, not the CALL"
     );
     assert_eq!(
+        crate::py_coord::call_site_py_pc_for_resume_word(jitcode_index, live_pc as i32),
+        Some(call_py as u32),
+        "in_a_call reconstruct still measures stack height at the CALL"
+    );
+    assert_eq!(
         crate::py_coord::resume_py_pc_for_jitcode_word(jitcode_index, call_pc as i32),
         call_py as i32,
         "the CALL's own offset still names the CALL"

@@ -9118,8 +9118,18 @@ pub(crate) fn reconstruct_inline_recipe(
             in_a_call,
         );
     }
-    let py_pc =
+    let resume_py =
         crate::py_coord::resume_py_pc_for_jitcode_word(frame.jitcode_index, frame.pc) as usize;
+    // `resume_py_pc_for_jitcode_word` on an `in_a_call` word is the CALL's
+    // fallthrough (interpreter lasti). `get_list_of_active_boxes` still
+    // counts the CALL's operands, so `stack_depth_at` uses the CALL site.
+    let py_pc = if in_a_call {
+        crate::py_coord::call_site_py_pc_for_resume_word(frame.jitcode_index, frame.pc)
+            .map(|pc| pc as usize)
+            .unwrap_or(resume_py)
+    } else {
+        resume_py
+    };
     let Some(w_code) = code_for_jitcode_index(frame.jitcode_index) else {
         decline!("NoCodeForJitcodeIndex");
     };
@@ -9242,7 +9252,7 @@ pub(crate) fn reconstruct_inline_recipe(
     let unreconstructable_operand_floor = if in_a_call {
         let result_slots = usize::from(pending_result_color.is_some());
         liveness
-            .stack_depth_at(py_pc + 1)
+            .stack_depth_at(resume_py)
             .map(|post| nlocals + post.saturating_sub(result_slots))
     } else {
         None

@@ -153,6 +153,19 @@ fn python_call_jit_op(opname: &str) -> bool {
         || opname.starts_with("recursive_call")
 }
 
+/// Jitcode offset and containing Python pc of the Python-call op that ends
+/// at `pc` (`MIFrame.pc` immediately after the call).
+fn python_call_ending_at(jitcode_index: i32, pc: usize) -> Option<(usize, usize)> {
+    let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index)?;
+    if pjc.code_ptr.is_null() || crate::state::jitcode_is_transparent_helper(jitcode_index) {
+        return None;
+    }
+    let call = crate::jitcode_runtime::decoded_ops(pjc.jitcode.code.as_slice())
+        .find(|op| op.next_pc == pc && python_call_jit_op(op.opname))?;
+    let call_py = containing_py_pc_for_jitcode_pc(&pjc.metadata, call.pc) as usize;
+    Some((call.pc, call_py))
+}
+
 /// Python resume pc when `pc` is the byte immediately after a Python-call
 /// jitcode op (`inline_call_return_marker` / trailing `-live-`).
 ///
@@ -163,14 +176,22 @@ fn python_call_jit_op(opname: &str) -> bool {
 /// fallthroughs, and a run already re-keyed onto the next opcode stays.
 fn after_call_resume_py_pc(jitcode_index: i32, pc: usize) -> Option<u32> {
     let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index)?;
-    if pjc.code_ptr.is_null() || crate::state::jitcode_is_transparent_helper(jitcode_index) {
-        return None;
-    }
-    let call = crate::jitcode_runtime::decoded_ops(pjc.jitcode.code.as_slice())
-        .find(|op| op.next_pc == pc && python_call_jit_op(op.opname))?;
-    let call_py = containing_py_pc_for_jitcode_pc(&pjc.metadata, call.pc) as usize;
+    let (_, call_py) = python_call_ending_at(jitcode_index, pc)?;
     let code = unsafe { &*pjc.code_ptr };
     Some(crate::pyjitpl::resume_py_pc_after_python_call(code, call_py) as u32)
+}
+
+/// Containing Python pc of the CALL a resume word sits immediately after.
+///
+/// [`resume_py_pc_for_jitcode_word`] names the CALL's fallthrough for lasti.
+/// `get_list_of_active_boxes` (`pyjitpl.py`) `in_a_call` still measures
+/// operand-stack height at the CALL itself, so reconstruct uses this
+/// coordinate for `stack_depth_at`.
+pub(crate) fn call_site_py_pc_for_resume_word(jitcode_index: i32, pc_word: i32) -> Option<u32> {
+    if pc_word < 0 {
+        return None;
+    }
+    python_call_ending_at(jitcode_index, pc_word as usize).map(|(_, call_py)| call_py as u32)
 }
 
 /// Forward Python instruction coordinate for a carried resume JitCode word.
