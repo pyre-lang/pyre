@@ -867,38 +867,16 @@ pub fn bytecode_only_trace_access_directly_jitcode_index() -> Option<usize> {
         .get_or_init(|| compute_named_jitcode_index("bytecode_only_trace__AccessDirect_None"))
 }
 
-/// Unique Regular graph whose last segment is `leaf`.
-///
-/// `CallControl.get_jitcode` keys by graph (`call.py`); 238 groups share a
-/// last-segment name, so a by-name scan cannot tell two Regular bodies
-/// apart. Restricting to `GraphSpecialization::Regular` plus last segment
-/// is the identity for a look-inside method such as
-/// `executioncontext.py call_trace`. `None` when the pipeline has no such
-/// graph (compact tests), or when two Regular graphs share that last
-/// segment: display names are not graph identity.
-fn compute_unique_regular_leaf_jitcode_index(leaf: &str) -> Option<usize> {
-    unique_regular_leaf_index(jitcode_index().paths.iter().map(|p| p.as_ref()), leaf)
-}
-
-fn unique_regular_leaf_index<'a, I>(paths: I, leaf: &str) -> Option<usize>
-where
-    I: IntoIterator<Item = Option<&'a CallPath>>,
-{
-    let mut hits = paths.into_iter().enumerate().filter_map(|(i, path)| {
-        let path = path?;
-        (path.specialization == GraphSpecialization::Regular && path.last_segment() == Some(leaf))
-            .then_some(i)
-    });
-    let first = hits.next()?;
-    hits.next().is_none().then_some(first)
-}
-
 /// Regular `executioncontext.py call_trace` (`pyframe.py execute_frame`
-/// after `enter`). The inline walker records `gettrace`'s promote on the
-/// callee EC in the parent walk; this index is the graph-key identity.
+/// after `enter`). Resolved by the graph key `CallPath::canonical_key()`
+/// the codewriter allocated (`call.py get_jitcode`) and cached
+/// process-wide. `None` if that graph is absent from the build-time
+/// pipeline. The inline walker records `gettrace`'s promote on the
+/// callee EC in the parent walk.
 pub fn call_trace_jitcode_index() -> Option<usize> {
-    *CALL_TRACE_JITCODE_INDEX
-        .get_or_init(|| compute_unique_regular_leaf_jitcode_index("call_trace"))
+    *CALL_TRACE_JITCODE_INDEX.get_or_init(|| {
+        compute_pathed_jitcode_index("executioncontext::ExecutionContext::call_trace")
+    })
 }
 
 /// The charon `w_tuple_getitem` body in `ALL_JITCODES`, resolved by the graph
@@ -5216,30 +5194,14 @@ mod tests {
     fn call_trace_index_is_the_regular_execute_frame_helper() {
         let idx = call_trace_jitcode_index()
             .expect("generated `call_trace` jitcode must be in the build-time table");
-        assert_eq!(jitcode_index().names[idx], "call_trace");
         let path = jitcode_index().paths[idx]
             .as_ref()
             .expect("call_trace is a Regular graph-backed JitCode");
+        assert_eq!(
+            path.canonical_key(),
+            "executioncontext::ExecutionContext::call_trace"
+        );
         assert_eq!(path.specialization, GraphSpecialization::Regular);
-        assert_eq!(path.last_segment(), Some("call_trace"));
-        assert_eq!(
-            compute_unique_regular_leaf_jitcode_index("call_trace"),
-            Some(idx)
-        );
-    }
-
-    #[test]
-    fn unique_regular_leaf_index_is_none_when_two_regular_graphs_share_the_leaf() {
-        let a = CallPath::from_segments(["owner_a", "call_trace"]);
-        let b = CallPath::from_segments(["owner_b", "call_trace"]);
-        let mut access_direct = CallPath::from_segments(["owner_c", "call_trace"]);
-        access_direct.specialization = GraphSpecialization::AccessDirect;
-        let paths = [Some(&a), Some(&access_direct), Some(&b)];
-        assert_eq!(unique_regular_leaf_index(paths, "call_trace"), None);
-        assert_eq!(
-            unique_regular_leaf_index([Some(&a), Some(&access_direct)], "call_trace"),
-            Some(0)
-        );
     }
 
     #[test]
