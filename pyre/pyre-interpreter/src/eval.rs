@@ -3650,17 +3650,7 @@ unsafe fn load_global_via_cache(
         let w_space_builtin_dict = if crate::baseobjspace::HONOR_BUILTINS {
             pyre_object::PY_NULL
         } else {
-            let ec = crate::call::getexecutioncontext();
-            let w_space_builtin = if ec.is_null() {
-                pyre_object::PY_NULL
-            } else {
-                pyre_object::with_roots!(w_builtin, w_module_dict, pycode => (*ec).get_builtin())
-            };
-            if !w_space_builtin.is_null() && pyre_object::is_module(w_space_builtin) {
-                pyre_object::w_module_get_w_dict(w_space_builtin)
-            } else {
-                pyre_object::PY_NULL
-            }
+            crate::baseobjspace::space_builtin_dict()
         };
         let strategy =
             pyre_object::dictmultiobject::w_module_dict_module_strategy_mut(w_module_dict);

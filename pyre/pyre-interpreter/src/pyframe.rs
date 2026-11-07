@@ -5499,12 +5499,8 @@ impl PyFrame {
         if !self.w_builtin.is_null() {
             return self.w_builtin;
         }
-        // space.builtin
-        let ec = crate::call::getexecutioncontext();
-        if ec.is_null() {
-            return pyre_object::PY_NULL;
-        }
-        unsafe { (*ec).get_builtin() }
+        // pyframe.py get_builtin else-arm: `self.space.builtin`.
+        crate::baseobjspace::space_builtin()
     }
 
     /// `frame.f_backref()` — force the caller vref.  `f_backref` holds a

@@ -916,7 +916,7 @@ pub(crate) fn function_new_impl(
             }
             let frame = unsafe { (*exec_ctx).gettopframe_raw() };
             if frame.is_null() {
-                unsafe { (*exec_ctx).get_builtin_dict() }
+                crate::baseobjspace::space_builtin_dict()
             } else {
                 unsafe { (*frame).fget_f_builtins() }
             }

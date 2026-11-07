@@ -786,13 +786,9 @@ fn load_readonly_buffer(slot: usize) -> Result<(), PyError> {
     Ok(())
 }
 
-/// The `memoryview` builtin type via the live execution context.
+/// The `memoryview` builtin type via `space.builtin`.
 fn memoryview_type() -> Result<PyObjectRef, PyError> {
-    let ec = pyre_interpreter::call::getexecutioncontext();
-    if ec.is_null() {
-        return Err(unpickling_error("memoryview type unavailable"));
-    }
-    unsafe { (*ec).lookup_builtin("memoryview") }
+    crate::module::_pickle::lookup_builtin("memoryview")
         .ok_or_else(|| unpickling_error("memoryview type unavailable"))
 }
 

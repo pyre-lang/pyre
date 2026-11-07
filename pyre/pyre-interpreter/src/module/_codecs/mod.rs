@@ -834,12 +834,7 @@ fn ensure_encodings_imported() -> Result<(), crate::PyError> {
     // `codec_need_encodings` set; the flag is cleared only after both
     // succeed.  The import is a Python-level call, so no `&mut CodecState`
     // is live across it.
-    let ec = crate::call::getexecutioncontext();
-    let w_builtin = if ec.is_null() {
-        pyre_object::PY_NULL
-    } else {
-        unsafe { (*ec).get_builtin() }
-    };
+    let w_builtin = crate::baseobjspace::space_builtin();
     let _roots = pyre_object::gc_roots::push_roots();
     let w_import = if !w_builtin.is_null() && unsafe { is_module(w_builtin) } {
         let builtin_slot = pyre_object::gc_roots::shadow_stack_len();

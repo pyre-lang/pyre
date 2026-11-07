@@ -29,11 +29,17 @@ use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use crate::objspace::descroperation::user_overridden_class;
 pub use crate::objspace::descroperation::*;
 
-/// `baseobjspace.py ObjSpace.make_builtins` initializes `space.builtin`
-/// before any Python frame runs. `module.py Module.__init__` owns the
-/// dictionary; `function.py BuiltinFunction.w_moduleobj` points back to the
-/// defining module. Keep both owners rooted while attaching that identity.
-pub(crate) fn make_builtins(w_dict: PyObjectRef) -> PyObjectRef {
+/// `baseobjspace.py ObjSpace.make_builtins` / `setbuiltinmodule` set
+/// `self.builtin` once. `module.py Module.__init__` owns the dictionary;
+/// `function.py BuiltinFunction.w_moduleobj` points back to the defining
+/// module. A second call returns the existing Module (`getbuiltinmodule`
+/// reuse). `new_builtin_module_dict` stays the dict allocator.
+pub(crate) fn make_builtins() -> PyObjectRef {
+    let existing = OBJECT_SPACE.builtin.get();
+    if !existing.is_null() {
+        return existing;
+    }
+    let w_dict = crate::builtins::new_builtin_module_dict();
     let roots = pyre_object::gc_roots::push_roots();
     let dict_slot = roots.base();
     let _ = roots.pin_root(w_dict);
@@ -50,6 +56,7 @@ pub(crate) fn make_builtins(w_dict: PyObjectRef) -> PyObjectRef {
     );
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(module);
+    OBJECT_SPACE.builtin.set(roots.get(module_slot));
     for key in keys {
         if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(roots.get(dict_slot), &key) }
         {
@@ -58,7 +65,49 @@ pub(crate) fn make_builtins(w_dict: PyObjectRef) -> PyObjectRef {
             };
         }
     }
-    roots.get(module_slot)
+    OBJECT_SPACE.builtin.get()
+}
+
+/// pyframe.py `get_builtin` else-arm `self.space.builtin`.
+///
+/// Nullary process-global elidable reader (`rlib/jit.py @elidable`;
+/// `eval.rs interp_return_log_enabled` spelling). The walker residualizes
+/// it as CALL_PURE; `history.record_result_of_call_pure` cuts an all-Const
+/// (no-arg) call to ConstPtr.
+#[majit_macros::elidable_cannot_raise]
+pub fn space_builtin() -> PyObjectRef {
+    OBJECT_SPACE.builtin.get()
+}
+
+/// `ObjSpace.make_builtins` when `space.builtin` is still unset.
+pub fn ensure_space_builtin() -> PyObjectRef {
+    let existing = OBJECT_SPACE.builtin.get();
+    if !existing.is_null() {
+        return existing;
+    }
+    make_builtins()
+}
+
+/// `space.builtin.w_dict` (`celldict.py get_global_cache`).
+#[inline]
+pub fn space_builtin_dict() -> PyObjectRef {
+    let w_builtin = space_builtin();
+    if w_builtin.is_null() || !unsafe { pyre_object::is_module(w_builtin) } {
+        return PY_NULL;
+    }
+    unsafe { pyre_object::w_module_get_w_dict(w_builtin) }
+}
+
+/// `space.getitem(space.builtin.w_dict, name)` (`pyopcode.py LOAD_GLOBAL`
+/// builtin fallback).
+#[inline]
+pub fn space_lookup_builtin(name: &str) -> Option<PyObjectRef> {
+    let w_dict = space_builtin_dict();
+    if w_dict.is_null() {
+        None
+    } else {
+        unsafe { pyre_object::w_dict_getitem_str(w_dict, name) }
+    }
 }
 
 // ── Pending dict-key-callback error slot ─────────────────────────────
@@ -767,6 +816,9 @@ pub struct ObjSpace {
     /// Captured builtin `__lazy_import__`, the sibling of
     /// `space.w_default_importlib_import`.
     w_default_lazy_import: SpaceAttr,
+    /// `baseobjspace.py ObjSpace.make_builtins` / `setbuiltinmodule` set
+    /// `self.builtin` once.
+    builtin: SpaceAttr,
 }
 
 impl ObjSpace {
@@ -785,6 +837,7 @@ impl ObjSpace {
         w_type_error: SpaceAttr::new(),
         w_attribute_error: SpaceAttr::new(),
         w_default_lazy_import: SpaceAttr::new(),
+        builtin: SpaceAttr::new(),
     };
 
     pub fn sys_state(&self) -> &crate::module::sys::state::SysState {
@@ -878,6 +931,7 @@ impl ObjSpace {
             w_type_error: SpaceAttr::new(),
             w_attribute_error: SpaceAttr::new(),
             w_default_lazy_import: SpaceAttr::new(),
+            builtin: SpaceAttr::new(),
         });
         OBJECT_SPACE_ROOTS
             .lock()
@@ -902,6 +956,7 @@ impl ObjSpace {
         self.w_attribute_error.walk(forward);
         self.sys_state.walk_roots(forward);
         self.w_default_lazy_import.walk(forward);
+        self.builtin.walk(forward);
         self.fromcache.visit_values_mut(|cache| match cache {
             SpaceCacheInstance::ClassDictStrategy(cache) => cache.walk_roots(forward),
             SpaceCacheInstance::SysState(cache) => cache.walk_roots(forward),
@@ -4042,11 +4097,7 @@ pub(crate) fn range_hash_method(args: &[PyObjectRef]) -> PyResult {
 /// the live builtin so `pickle` recreates the iterator via `iter(seq)` /
 /// `enumerate(iterable)`.
 pub(crate) fn builtin_callable(name: &str) -> PyObjectRef {
-    let ctx = crate::call::getexecutioncontext();
-    if ctx.is_null() {
-        return PY_NULL;
-    }
-    unsafe { (*ctx).lookup_builtin(name).unwrap_or(PY_NULL) }
+    space_lookup_builtin(name).unwrap_or(PY_NULL)
 }
 
 /// Python 3.14 `_PyEval_GetBuiltin(name)` for operations whose result is
@@ -18244,11 +18295,9 @@ pub fn frame_builtin_obj(
     if HONOR_BUILTINS {
         return pick_builtin_obj(w_globals, exec_ctx);
     }
-    if !exec_ctx.is_null() {
-        let b = unsafe { (*exec_ctx).get_builtin() };
-        if !b.is_null() {
-            return b;
-        }
+    let b = space_builtin();
+    if !b.is_null() {
+        return b;
     }
     build_default_pick_builtin_module()
 }
@@ -18263,11 +18312,9 @@ pub fn frame_builtin_obj_checked(
     if HONOR_BUILTINS {
         return pick_builtin_obj_checked(w_globals, exec_ctx);
     }
-    if !exec_ctx.is_null() {
-        let b = unsafe { (*exec_ctx).get_builtin() };
-        if !b.is_null() {
-            return Ok(b);
-        }
+    let b = space_builtin();
+    if !b.is_null() {
+        return Ok(b);
     }
     Ok(build_default_pick_builtin_module())
 }
@@ -18301,20 +18348,17 @@ pub fn pick_builtin_obj_checked(
         match finditem_str(w_globals, "__builtins__") {
             Ok(Some(w_builtin)) if !w_builtin.is_null() => {
                 let mut w_builtin = w_builtin;
-                if !exec_ctx.is_null() {
-                    let space_builtin =
-                        pyre_object::with_roots!(w_builtin => unsafe { (*exec_ctx).get_builtin() });
-                    if !space_builtin.is_null() && std::ptr::eq(w_builtin, space_builtin) {
-                        return Ok(w_builtin);
-                    }
-                    // `exec`/`eval` plant the builtins *dict* rather than the
-                    // module (3.14 `PyEval_GetBuiltins`), so the identity test
-                    // has to cover that spelling too — otherwise every frame
-                    // created under an exec'd namespace would allocate a fresh
-                    // aliasing module below.
-                    if std::ptr::eq(w_builtin, unsafe { (*exec_ctx).get_builtin_dict() }) {
-                        return Ok(space_builtin);
-                    }
+                let space_w_builtin = pyre_object::with_roots!(w_builtin => space_builtin());
+                if !space_w_builtin.is_null() && std::ptr::eq(w_builtin, space_w_builtin) {
+                    return Ok(w_builtin);
+                }
+                // `exec`/`eval` plant the builtins *dict* rather than the
+                // module (3.14 `PyEval_GetBuiltins`), so the identity test
+                // has to cover that spelling too — otherwise every frame
+                // created under an exec'd namespace would allocate a fresh
+                // aliasing module below.
+                if std::ptr::eq(w_builtin, space_builtin_dict()) {
+                    return Ok(space_w_builtin);
                 }
                 if unsafe { pyre_object::is_module(w_builtin) } {
                     return Ok(w_builtin);

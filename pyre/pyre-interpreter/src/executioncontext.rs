@@ -772,24 +772,6 @@ pub struct ExecutionContext {
     /// Cached access to process-owned `space.actionflag`.  Every EC points to
     /// the same flag, matching `baseobjspace.py:450`.
     pub actionflag: SpaceActionFlag,
-    /// `pypy/objspace/std/dictmultiobject.py:60-69
-    /// allocate_and_init_instance(module=True)` parity — the builtins
-    /// module's `w_dict` is a `W_ModuleDictObject` backed by
-    /// `ModuleDictStrategy` (`celldict.py`).  Populated once at
-    /// construction time; pinned with `pin_root` so the strategy
-    /// storage survives the EC's lifetime.
-    builtins_module: PyObjectRef,
-    // `space.builtin.w_dict` is a single W_ModuleDictObject in PyPy
-    // (`pypy/interpreter/baseobjspace.py:642`).  Pyre used to keep a
-    // parallel `builtins: DictStorage` snapshot here, but that snapshot froze the builtin set at
-    // EC construction time — runtime mutations to `__builtins__`
-    // weren't visible to new frames.  Reading the live storage from
-    // `builtins_module` each call removes the double-storage gap.
-    /// `baseobjspace.py ObjSpace.make_builtins` creates this Module before
-    /// any frame runs; `pyframe.py get_builtin` reads it without setup.
-    /// Worker ECs share its identity with their object space. The EC keeps
-    /// the traced owner reference until the separate space owner carries it.
-    builtin: PyObjectRef,
     /// `pypy/interpreter/baseobjspace.py` `space.check_signal_action` —
     /// the `CheckSignalAction` registered when the `signal` module loads.
     /// `checksignals` calls its `perform` directly.  Stored as a trait
@@ -981,8 +963,6 @@ pub unsafe fn executioncontext_custom_trace(
         visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).contextvar_context));
         visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).w_asyncgen_firstiter_fn));
         visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).w_asyncgen_finalizer_fn));
-        visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).builtins_module));
-        visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).builtin));
         for wref in &mut (*ec).thread_local_refs {
             visit_ec_obj(f, wref as *mut PyObjectRef);
         }
@@ -1338,13 +1318,12 @@ impl ExecutionContext {
 
     #[inline]
     pub fn new() -> Self {
-        let builtins_module = crate::builtins::new_builtin_module_dict();
-        let builtins_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(builtins_module);
-        let builtin = crate::baseobjspace::make_builtins(pyre_object::gc_roots::shadow_stack_get(
-            builtins_slot,
-        ));
-        let _ = pyre_object::gc_roots::pin_root(builtin);
+        // `space.builtin` is built once per process, so a later EC reuses it
+        // without passing through the type-system entry; `init_typeobjects`
+        // is idempotent for the registry and installs this thread's test
+        // hash hook (its `cfg(any(test, feature = "test-hooks"))` arm).
+        crate::typedef::init_typeobjects();
+        let _ = crate::baseobjspace::ensure_space_builtin();
         Self {
             space: pyre_object::PY_NULL,
             topframeref: std::ptr::null_mut(),
@@ -1367,8 +1346,6 @@ impl ExecutionContext {
             profile_all_generation: 0,
             thread_local_refs: Vec::new(),
             actionflag: SpaceActionFlag::new(),
-            builtins_module: pyre_object::gc_roots::shadow_stack_get(builtins_slot),
-            builtin: pyre_object::gc_roots::shadow_stack_get(builtins_slot + 1),
             check_signal_action: None,
             sys_exc_value: pyre_object::PY_NULL,
             pending_loop_exit: None,
@@ -1424,7 +1401,8 @@ impl ExecutionContext {
         ec.thread_local_refs.clear();
         ec.actionflag = SpaceActionFlag::new();
         // `threadlocals.py` creates ExecutionContext(space): the worker
-        // shares both space.builtin and its dictionary with the parent.
+        // shares space.builtin through the process-wide space; the EC
+        // stores no builtin of its own.
         ec.sys_exc_value = pyre_object::PY_NULL;
         ec.pending_loop_exit = None;
         // executioncontext.py — a fresh ExecutionContext starts at 0.
@@ -2620,14 +2598,14 @@ impl ExecutionContext {
     /// `baseobjspace.py ObjSpace.make_builtins`: the dictionary of the
     /// builtin Module initialized before frame execution.
     pub fn get_builtin_dict(&self) -> PyObjectRef {
-        self.builtins_module
+        crate::baseobjspace::space_builtin_dict()
     }
 
     /// `pyframe.py PyFrame.get_builtin` reads the object-space builtin.
     /// Initialization belongs to `make_builtins`, not this getter: a
     /// cold initialization loop would make JitPolicy reject the hot read.
     pub fn get_builtin(&self) -> PyObjectRef {
-        self.builtin
+        crate::baseobjspace::space_builtin()
     }
 
     /// Direct lookup into the builtins storage, bypassing the dict-object
@@ -2639,11 +2617,8 @@ impl ExecutionContext {
     pub fn lookup_builtin(&self, name: &str) -> Option<PyObjectRef> {
         // `pypy/interpreter/pyopcode.py LOAD_GLOBAL` builtin
         // fallback reads through the builtin Module's W_DictObject
-        // (`space.getitem(space.builtin.w_dict, name)`).  Pyre's
-        // `builtins_module` IS that W_ModuleDictObject; the
-        // dispatching `w_dict_getitem_str` routes through
-        // `ModuleDictStrategy::getitem_str` (`celldict.py`).
-        unsafe { pyre_object::w_dict_getitem_str(self.builtins_module, name) }
+        // (`space.getitem(space.builtin.w_dict, name)`).
+        crate::baseobjspace::space_lookup_builtin(name)
     }
 }
 
@@ -4193,6 +4168,7 @@ mod tests {
     fn builtin_module_is_initialized_and_shared_with_thread_clone() {
         let _roots = pyre_object::gc_roots::push_roots();
         let ec = super::ExecutionContext::new();
+        let other = super::ExecutionContext::new();
         let builtin = ec.get_builtin();
         assert!(!builtin.is_null());
         assert!(unsafe { pyre_object::is_module(builtin) });
@@ -4200,6 +4176,8 @@ mod tests {
             unsafe { pyre_object::w_module_get_w_dict(builtin) },
             ec.get_builtin_dict(),
         );
+        assert_eq!(other.get_builtin(), builtin);
+        assert_eq!(other.get_builtin_dict(), ec.get_builtin_dict());
         let worker = ec.clone_for_thread();
         assert_eq!(worker.get_builtin(), builtin);
         assert_eq!(worker.get_builtin_dict(), ec.get_builtin_dict());
