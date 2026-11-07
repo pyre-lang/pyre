@@ -1,9 +1,15 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=hot,level0,level1,level2,level3,level4,level5
+# pyre-check: selfcheck-compiles=hot,level0,level1,level2,level3,level4,level5,entry-bridge:level0,entry-bridge:level2
 # Every Python activation consumes recursion budget, not only an activation
 # whose code object is already present in the live call chain.  The six
 # distinct callees below each carry a loop so a warmed caller compiles each
 # of them as its own portal loop.
+#
+# `_opimpl_recursive_call` (`pyjitpl.py`) inlines a callee whose greenkey is
+# not already on the framestack, so an acyclic chain inlines the next pycode
+# and residualizes after that. Only `level0` and `level2` therefore mint
+# function-entry bridges; `level1`/`level3`/`level4`/`level5` compile as
+# loops. pypy3 `jit-log-opt` on this file is the same two entry-bridges.
 #
 # The two limits pin the conservative lower-level check used by PyPy's
 # approximative recursion limit. On this six-callee compiled shape, `base + 5`
