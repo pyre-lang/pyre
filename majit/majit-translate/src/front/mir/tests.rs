@@ -30268,6 +30268,7 @@ pub(in crate::front::mir) fn some_ctor_shape() -> super::AggregateShape {
             window: false,
             raw_u8: false,
             str_value: false,
+            owner_root: None,
         }],
     })
 }
@@ -30316,6 +30317,7 @@ pub(in crate::front::mir) fn ok_ctor_shape() -> super::AggregateShape {
             window: false,
             raw_u8: false,
             str_value: false,
+            owner_root: None,
         }],
     })
 }

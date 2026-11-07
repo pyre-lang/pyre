@@ -531,7 +531,7 @@ fn fixture_llbc() -> majit_charon_reader::Llbc {
             match_values,
         ],
         vec![
-            marker(0, &["fixture", "synth", "_exception_class_E"], "C(B)"),
+            marker(0, &["fixture", "synth", "_exception_class_E"], "C(B) B(A)"),
             marker(1, &["fixture", "synth", "_exception_class_P"], ""),
             marker(2, &["fixture", "synth", "_exception_class_Q"], "C(B)"),
         ],
@@ -1142,11 +1142,7 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
     assert_eq!(origins.get("Q").map(String::as_str), Some("synth"));
 
     assert_rows(&fields, "synth::E::A", &[("n", "usize", false)]);
-    assert_rows(
-        &fields,
-        "synth::E::B",
-        &[("n", "usize", false), ("flag", "bool", false)],
-    );
+    assert_rows(&fields, "synth::E::B", &[("flag", "bool", false)]);
     assert_absent(&fields, "synth::E::C");
     assert_absent(&fields, "synth::E::D");
     assert_absent(&fields, "EA");
@@ -1194,10 +1190,7 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
     );
     assert_eq!(
         attrs.get("synth::E::B"),
-        Some(&vec![
-            ("n".to_string(), ValueType::Unsigned),
-            ("flag".to_string(), ValueType::Bool),
-        ])
+        Some(&vec![("flag".to_string(), ValueType::Bool)])
     );
     assert!(attrs.get("synth::E::C").is_none());
     assert!(attrs.get("synth::E::D").is_none());
@@ -1243,7 +1236,7 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
     assert_eq!(
         field_writes(&build_b),
         vec![
-            ("n".to_string(), Some("synth::E::B".to_string())),
+            ("n".to_string(), Some("synth::E::A".to_string())),
             ("flag".to_string(), Some("synth::E::B".to_string())),
         ]
     );
@@ -1252,8 +1245,8 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
     assert_eq!(
         field_writes(&build_c),
         vec![
-            ("n".to_string(), Some("synth::E::C".to_string())),
-            ("flag".to_string(), Some("synth::E::C".to_string())),
+            ("n".to_string(), Some("synth::E::A".to_string())),
+            ("flag".to_string(), Some("synth::E::B".to_string())),
         ]
     );
     let build_d = lower(&llbc, "build_d");
@@ -1288,15 +1281,15 @@ fn marked_exception_class_enum_is_the_minted_hierarchy() {
     let match_e = lower(&llbc, "match_e");
     assert_isinstance_cascade(&match_e, "match_e");
     assert!(
-        true_edge_reaches_field(&match_e, "n", "synth::E::B"),
-        "C arm getattr n on synth::E::B; graph={}",
+        true_edge_reaches_field(&match_e, "n", "synth::E::A"),
+        "C arm getattr n on synth::E::A; graph={}",
         match_e.dump()
     );
     let classify = lower(&llbc, "classify");
     assert_isinstance_cascade(&classify, "classify");
     assert!(
-        true_edge_reaches_field(&classify, "n", "synth::E::B"),
-        "classify C arm getattr n on synth::E::B; graph={}",
+        true_edge_reaches_field(&classify, "n", "synth::E::A"),
+        "classify C arm getattr n on synth::E::A; graph={}",
         classify.dump()
     );
 

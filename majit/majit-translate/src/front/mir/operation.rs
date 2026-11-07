@@ -8137,6 +8137,15 @@ impl<'a> Lowering<'a> {
                     .unwrap_or(spelling_void)
                     || ((result_owner == "Tuple" || result_owner == "Array")
                         && name.starts_with("__pos_"));
+                // `InstanceRepr.setfield` / `ClassDef.get_owner`: a marked
+                // variant stores an inherited field on the declaring
+                // ancestor. A struct, a tuple, and an unmarked enum keep
+                // the constructor's result class (`owner_root: None`).
+                let owner_root = if adt_is_struct {
+                    None
+                } else {
+                    self.exception_class_aggregate_field_owner(dest_ty, &ctor_name, &name)
+                };
                 AggregateField {
                     name,
                     void,
@@ -8153,6 +8162,7 @@ impl<'a> Lowering<'a> {
                         tyref_is_by_value_alloc_string(ty, self.llbc)
                             && self.exception_disc_info_for_ty(dest_ty).is_some()
                     }),
+                    owner_root,
                 }
             })
             .collect();
@@ -8833,6 +8843,32 @@ impl<'a> Lowering<'a> {
             &hint.enum_path,
             Some(owner),
         ))
+    }
+
+    /// Declaring class of field `field` on enum variant `variant`, when
+    /// `dest_ty` is that marked enum.
+    ///
+    /// Peels `dest_ty` the same way [`Self::exception_disc_info_for_ty`]
+    /// does, then reuses [`Self::exception_class_attr_owner`]. The result
+    /// is the class key, including when the declarer is `variant` itself.
+    /// `None` when `dest_ty` is not this enum or the enum is unmarked.
+    fn exception_class_aggregate_field_owner(
+        &self,
+        dest_ty: &TyRef,
+        variant: &str,
+        field: &str,
+    ) -> Option<String> {
+        let node =
+            tyref_node(dest_ty, self.llbc).and_then(|node| strip_ty_wrappers(node, self.llbc))?;
+        let id = adt_node_def_id(node)?;
+        let td = self.llbc.type_by_id(id)?;
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            return None;
+        };
+        if !variants.iter().any(|candidate| candidate.name == variant) {
+            return None;
+        }
+        self.exception_class_attr_owner(&td.item_meta.name_path(), variants, variant, field)
     }
 
     /// Scalar field of an opaque dependency struct.

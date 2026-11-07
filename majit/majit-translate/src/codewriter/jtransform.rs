@@ -11197,6 +11197,40 @@ impl<'a> Transformer<'a> {
                 Vec::new(),
             );
         }
+        // `rclass.py` `InstanceRepr.new_instance` mallocs the instance and
+        // stores the vtable. `jtransform.py` `Transformer.rewrite_op_malloc`
+        // emits that malloc as `new_with_vtable`. A class instance has no
+        // discriminant store. The class is a hint host
+        // (`minted_exception_size_owner`), including a variant that declares
+        // no fields. A spelling that belongs to the hierarchy but is not one
+        // of those hosts has no class to allocate, so it must not fall
+        // through to the tag arm or to a residual call.
+        if args.is_empty()
+            && matches!(target, CallTarget::SyntheticTransparentCtor { .. })
+            && let ValueType::Ref(Some(owner)) = result_ty
+            && let Some(cc) = self.callcontrol.as_deref()
+        {
+            if crate::codewriter::assembler::minted_exception_size_owner(cc, owner, 0).is_some() {
+                let result = op
+                    .result
+                    .clone()
+                    .expect("minted exception class ctor must produce a value");
+                return self.rewrite_ctor_malloc(
+                    graph_name,
+                    graph,
+                    Some(result),
+                    owner.clone(),
+                    true,
+                    Vec::new(),
+                );
+            }
+            if crate::front::llbc_hints::exception_class_name_belongs(
+                &cc.exception_class_hints,
+                owner,
+            ) {
+                panic!("marked exception class `{owner}` has no minted class");
+            }
+        }
         // RPython's rtyper materialises every heap-carried enum variant as
         // `malloc(GcStruct)` plus a tag store and payload stores. Charon gives
         // us the same pre-rtyper shape for user enums: a niladic synthetic
@@ -33236,6 +33270,311 @@ mod tests {
                     == Some("core::ops::range::Bound<i64>")
                 && value.value == crate::flowspace::model::ConstValue::Int(0)
         ));
+    }
+
+    /// `InstanceRepr.new_instance` of a marked class: `new_with_vtable` of
+    /// the variant, then `setfield` on the class that declares each field.
+    /// `B(A)` stores `n` on `A` and `flag` on `B`. `D` declares nothing and
+    /// still allocates. Neither ctor stores `__discriminant` or stays a
+    /// residual call. An unmarked user enum keeps the tag path
+    /// (`niladic_instantiated_enum_variant_lowers_to_new_and_tag_store`).
+    #[test]
+    fn marked_exception_class_ctor_lowers_to_new_with_vtable() {
+        let hint = crate::front::llbc_hints::ExceptionClassHint::new(
+            "synth::E",
+            "B(A)",
+            vec!["A".into(), "B".into(), "D".into()],
+        );
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            "synth::E::A".to_string(),
+            vec![("n".to_string(), "i64".to_string())],
+        );
+        struct_fields.fields.insert(
+            "synth::E::B".to_string(),
+            vec![("flag".to_string(), "bool".to_string())],
+        );
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_fields(struct_fields);
+        cc.exception_class_hints = vec![hint];
+
+        let word = crate::layout::target_word_size();
+        let n_align = 8usize;
+        let n_offset = (word + n_align - 1) & !(n_align - 1);
+        let a_align = word.max(n_align);
+        let a_size = (n_offset + 8 + a_align - 1) & !(a_align - 1);
+        let flag_offset = a_size;
+        let b_size = (flag_offset + 1 + a_align - 1) & !(a_align - 1);
+        let b_spec =
+            crate::codewriter::assembler::bh_size_spec_from_callcontrol(&cc, "synth::E::B")
+                .expect("B size");
+        let d_spec =
+            crate::codewriter::assembler::bh_size_spec_from_callcontrol(&cc, "synth::E::D")
+                .expect("D size");
+        assert_eq!(b_spec.size, b_size);
+        assert_eq!(d_spec.size, word);
+        assert!(d_spec.all_fielddescrs.is_empty());
+        assert!(b_spec.owner.is_empty());
+        assert_eq!(b_spec.vtable, 0);
+        let n_spec = b_spec
+            .all_fielddescrs
+            .iter()
+            .find(|field| field.field_key() == "n")
+            .expect("n");
+        let flag_spec = b_spec
+            .all_fielddescrs
+            .iter()
+            .find(|field| field.field_key() == "flag")
+            .expect("flag");
+        assert_eq!(n_spec.name, "synth::E::A.n");
+        assert_eq!(n_spec.field_key(), "n");
+        assert_eq!(n_spec.offset, n_offset);
+        assert_ne!(n_spec.offset, 0);
+        assert_eq!(flag_spec.name, "synth::E::B.flag");
+        assert_eq!(flag_spec.field_key(), "flag");
+        assert_eq!(flag_spec.offset, flag_offset);
+        if word >= 8 {
+            assert_eq!(n_offset, word);
+            assert_eq!(flag_offset, word + 8);
+            assert_eq!(a_size, 16);
+            assert_eq!(b_size, 24);
+        }
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let build_b = marked_exception_ctor_graph("build_b", "B", "synth::E::B", true);
+        let build_d = marked_exception_ctor_graph("build_d", "D", "synth::E::D", false);
+        let lowered_b = transformer.transform(&build_b).graph;
+        let lowered_d = transformer.transform(&build_d).graph;
+        assert_minted_ctor(&lowered_b, "synth::E::B", true);
+        assert_minted_ctor(&lowered_d, "synth::E::D", false);
+
+        let asm_b = assemble_marked_ctor(&lowered_b, transformer.callcontrol.as_deref());
+        let asm_d = assemble_marked_ctor(&lowered_d, transformer.callcontrol.as_deref());
+        assert_minted_assembly(&asm_b, "synth::E::B", true, n_offset, flag_offset);
+        assert_minted_assembly(&asm_d, "synth::E::D", false, n_offset, flag_offset);
+    }
+
+    fn marked_exception_ctor_graph(
+        name: &str,
+        variant: &str,
+        owner: &str,
+        with_fields: bool,
+    ) -> FunctionGraph {
+        let mut graph = FunctionGraph::new(name);
+        let bb = graph.startblock;
+        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::synthetic_transparent_enum_variant_ctor(
+            vec!["synth".into(), "E".into()],
+            variant,
+            if variant == "D" { 3 } else { 1 },
+        );
+        graph.push_op_with_result_var(
+            bb,
+            OpKind::Call {
+                target,
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Ref(Some(owner.to_string())),
+            },
+            result.clone(),
+        );
+        if with_fields {
+            for (field, field_owner, value) in [("n", "synth::E::A", 7), ("flag", "synth::E::B", 1)]
+            {
+                graph.push_op_var(
+                    bb,
+                    OpKind::FieldWrite {
+                        base: result.clone(),
+                        field: FieldDescriptor::new(field, Some(field_owner.into())),
+                        value: LinkArg::Const(crate::flowspace::model::Constant::new(
+                            crate::flowspace::model::ConstValue::Int(value),
+                        )),
+                        ty: ValueType::Int,
+                    },
+                    false,
+                );
+            }
+        }
+        graph.set_return(bb, Some(result));
+        graph
+    }
+
+    fn assert_minted_ctor(graph: &FunctionGraph, owner: &str, with_fields: bool) {
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::NewWithVtable { owner: allocated, vtable: 0 }
+                    if allocated == owner
+            )),
+            "{owner} must allocate with new_with_vtable: {ops:?}"
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::Call { .. } | OpKind::CallResidual { .. } | OpKind::New { .. }
+            )),
+            "{owner} must not stay a call: {ops:?}"
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. } if field.name == "__discriminant"
+            )),
+            "{owner} must not store a discriminant: {ops:?}"
+        );
+        let writes: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, .. } => {
+                    Some((field.name.as_str(), field.owner_root.as_deref()))
+                }
+                _ => None,
+            })
+            .collect();
+        if with_fields {
+            assert_eq!(
+                writes,
+                vec![("n", Some("synth::E::A")), ("flag", Some("synth::E::B"))]
+            );
+        } else {
+            assert!(writes.is_empty(), "{owner} field writes: {writes:?}");
+        }
+    }
+
+    fn assemble_marked_ctor(
+        graph: &FunctionGraph,
+        cc: Option<&crate::call::CallControl>,
+    ) -> crate::codewriter::assembler::Assembler {
+        use crate::codewriter::assembler::{Assembler, AssemblerExt};
+
+        let mut graph = graph.clone();
+        for op in graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+        {
+            if let OpKind::NewWithVtable { .. } = &op.kind
+                && let Some(result) = &op.result
+            {
+                FunctionGraph::set_concretetype_of_inline(result, ConcreteType::GcRef);
+            }
+        }
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, cc);
+        asm
+    }
+
+    fn assert_minted_assembly(
+        asm: &crate::codewriter::assembler::Assembler,
+        owner: &str,
+        with_fields: bool,
+        n_offset: usize,
+        flag_offset: usize,
+    ) {
+        use crate::jitcode::BhDescr;
+        use majit_jitcode::codewriter::assembler::is_type_static_const_sentinel;
+
+        let keys: Vec<_> = asm.insns.keys().cloned().collect();
+        assert!(
+            keys.iter().any(|key| key.starts_with("new_with_vtable/")),
+            "{owner} jitcode missing new_with_vtable: {keys:?}"
+        );
+        assert!(
+            keys.iter().all(|key| !key.contains("residual_call")),
+            "{owner} jitcode has a residual call: {keys:?}"
+        );
+        if with_fields {
+            assert!(
+                keys.iter().any(|key| key.starts_with("setfield_gc_")),
+                "{owner} jitcode missing setfield_gc: {keys:?}"
+            );
+        } else {
+            assert!(
+                keys.iter().all(|key| !key.starts_with("setfield_gc_")),
+                "{owner} jitcode stored a field: {keys:?}"
+            );
+        }
+        let descrs = asm.snapshot_descrs();
+        let size = descrs.iter().find_map(|descr| match descr {
+            BhDescr::Size {
+                vtable,
+                owner: descr_owner,
+                ..
+            } if descr_owner == owner => Some(*vtable),
+            _ => None,
+        });
+        let vtable = size.unwrap_or_else(|| panic!("{owner} size descr missing: {descrs:?}"));
+        assert!(is_type_static_const_sentinel(vtable));
+        if with_fields {
+            let fields: Vec<_> = descrs
+                .iter()
+                .filter_map(|descr| match descr {
+                    BhDescr::Field {
+                        name,
+                        owner,
+                        offset,
+                        ..
+                    } => Some((name.as_str(), owner.as_str(), *offset)),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                fields.contains(&("n", "synth::E::A", n_offset)),
+                "n descr: {fields:?}"
+            );
+            assert!(
+                fields.contains(&("flag", "synth::E::B", flag_offset)),
+                "flag descr: {fields:?}"
+            );
+        }
+    }
+
+    /// A hierarchy spelling that is not a minted host must not take the
+    /// tag arm or residualise.
+    #[test]
+    #[should_panic(expected = "marked exception class `fixture::synth::E::B` has no minted class")]
+    fn marked_exception_ctor_without_minted_host_panics() {
+        let mut cc = crate::call::CallControl::new();
+        cc.exception_class_hints = vec![crate::front::llbc_hints::ExceptionClassHint::new(
+            "synth::E",
+            "B(A)",
+            vec!["A".into(), "B".into()],
+        )];
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("missing_host");
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let owner = "fixture::synth::E::B".to_string();
+        let target = CallTarget::synthetic_transparent_enum_variant_ctor(
+            vec!["fixture".into(), "synth".into(), "E".into()],
+            "B",
+            1,
+        );
+        let result_ty = ValueType::Ref(Some(owner));
+        let op = SpaceOperation {
+            result: Some(result_var),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let _ = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[],
+            &result_ty,
+            "missing_host",
+            &mut graph,
+        );
     }
 
     /// `jtransform.py rewrite_op_malloc`: a niladic enum-variant ctor whose

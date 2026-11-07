@@ -305,7 +305,11 @@ fn minted_exception_static_name(
 /// key is that host's qualname. Otherwise `owner` equal to a hint host's
 /// qualname is the key, including when `vtable` is 0. The walk is the
 /// hint list; there is no name table.
-fn minted_exception_size_owner(cc: &CallControl, owner: &str, vtable: i64) -> Option<String> {
+pub(crate) fn minted_exception_size_owner(
+    cc: &CallControl,
+    owner: &str,
+    vtable: i64,
+) -> Option<String> {
     let hints = &cc.exception_class_hints;
     if vtable != 0 {
         for hint in hints {
@@ -5629,6 +5633,162 @@ pub fn definition_path_type_id(definition_path: &str, is_gc_managed: bool) -> u6
     majit_ir::descr::path_hash_for_gc_kind(definition_path, is_gc_managed)
 }
 
+fn align_up_pow2(offset: usize, align: usize) -> usize {
+    let align = align.max(1);
+    (offset + align - 1) & !(align - 1)
+}
+
+/// Parent chain of a minted class, rootmost ancestor first.
+///
+/// `InstanceRepr._setup_repr` embeds the parent struct as `super`. The
+/// base class is the root and contributes no variant fields: its chain
+/// is empty and the instance is `OBJECT`'s `typeptr` word. A variant
+/// walks `parse_exception_class_overrides` to the base, then reverses so
+/// the farthest ancestor is laid out first. A cycle uses the same panic
+/// as `exception_class_field_owner`.
+fn minted_exception_variant_chain(
+    hint: &crate::front::llbc_hints::ExceptionClassHint,
+    key: &str,
+) -> Option<Vec<String>> {
+    use crate::front::llbc_hints::{
+        exception_class_key, exception_class_leaf, parse_exception_class_overrides,
+    };
+    let base = exception_class_key(&hint.enum_path, None);
+    if hint.classes.base.qualname() == key || key == base {
+        return Some(Vec::new());
+    }
+    let variant = hint
+        .classes
+        .variants
+        .iter()
+        .find(|(_, host)| host.qualname() == key)?
+        .0
+        .as_str();
+    let enum_name = exception_class_leaf(&hint.enum_path);
+    let links = parse_exception_class_overrides(enum_name, &hint.overrides, &hint.variants);
+    let mut upward = Vec::new();
+    let mut current = variant.to_string();
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        if seen.iter().any(|name| name == &current) {
+            panic!("exception class field owner: cycle in override links {seen:?} -> {current}");
+        }
+        seen.push(current.clone());
+        upward.push(exception_class_key(&hint.enum_path, Some(&current)));
+        let Some(parent) = links
+            .iter()
+            .find(|(name, _)| name == &current)
+            .and_then(|(_, parent)| parent.clone())
+        else {
+            break;
+        };
+        current = parent;
+    }
+    upward.reverse();
+    Some(upward)
+}
+
+fn minted_exception_chain_for_key(cc: &CallControl, key: &str) -> Vec<String> {
+    for hint in &cc.exception_class_hints {
+        if let Some(chain) = minted_exception_variant_chain(hint, key) {
+            return chain;
+        }
+    }
+    panic!("marked exception class `{key}` has no minted class");
+}
+
+/// Field rows of one minted class, embedded the way `InstanceRepr`
+/// embeds `super`.
+///
+/// The root word is `OBJECT`'s `typeptr` (`rclass.py`). Each class then
+/// places only the fields it declares, after the previous class's
+/// aligned size. Alignment carries forward: a subclass whose own field
+/// is a byte still rounds with an ancestor `i64`'s alignment, because
+/// the outer struct's alignment includes the nested `super`.
+fn minted_exception_instance_layout(
+    cc: &CallControl,
+    chain: &[String],
+) -> (usize, Vec<crate::jitcode::BhFieldSpec>) {
+    let word = crate::layout::target_word_size();
+    let mut super_size = word;
+    let mut super_align = word.max(1);
+    let mut specs = Vec::new();
+    if chain.is_empty() {
+        return (align_up_pow2(super_size, super_align), specs);
+    }
+    for class_key in chain {
+        let mut offset = super_size;
+        let mut class_align = super_align;
+        let rows = cc
+            .struct_field_entries(class_key)
+            .map(|rows| rows.to_vec())
+            .unwrap_or_default();
+        for row in &rows {
+            if row.name == "__discriminant"
+                || crate::codewriter::heaptracker::is_header_word(class_key, &row.name)
+            {
+                continue;
+            }
+            let (flag, ty, size) = type_flag_from_str(&row.ty, &cc.raw_alloc_flavor_structs);
+            if ty == majit_ir::value::Type::Void || size == 0 {
+                continue;
+            }
+            let align = scalar_align(size).max(1);
+            class_align = class_align.max(align);
+            offset = align_up_pow2(offset, align);
+            let index = specs.len();
+            let rank = cc.field_immutability(Some(class_key), &row.name);
+            let is_quasi = rank.map(|rank| rank.is_quasi_immutable()).unwrap_or(false);
+            specs.push(bh_field_spec_from_parts(
+                index as u32,
+                class_key,
+                &row.name,
+                offset,
+                size,
+                ty,
+                flag,
+                rank.is_some(),
+                is_quasi,
+                index,
+                is_quasi && row.is_atomic,
+                is_quasi && row.is_atomic,
+            ));
+            offset += size;
+        }
+        offset = align_up_pow2(offset, class_align);
+        super_size = offset;
+        super_align = class_align;
+    }
+    (super_size, specs)
+}
+
+/// Size of a minted exception class, including a variant with no fields
+/// of its own.
+///
+/// `minted_exception_size_owner` is the host walk. A match always yields
+/// a spec: the chain is that host's ancestors, and a missing chain is
+/// the same missing-class panic as the constructor arm. `vtable` stays
+/// 0 and `owner` stays empty here; `OpKind::NewWithVtable` overwrites
+/// both with the type-static sentinel and the class key.
+fn minted_exception_instance_size_spec(
+    cc: &CallControl,
+    owner: &str,
+) -> Option<crate::jitcode::BhSizeSpec> {
+    let key = minted_exception_size_owner(cc, owner, 0)?;
+    let chain = minted_exception_chain_for_key(cc, &key);
+    let (size, all_fielddescrs) = minted_exception_instance_layout(cc, &chain);
+    let (is_gc_managed, headerless) = cc.struct_storage_for(owner).unwrap_or((true, false));
+    Some(crate::jitcode::BhSizeSpec {
+        size,
+        is_gc_managed,
+        headerless,
+        type_id: bh_size_type_id(owner, owner, is_gc_managed),
+        vtable: 0,
+        owner: String::new(),
+        all_fielddescrs,
+    })
+}
+
 pub(crate) fn bh_size_spec_from_callcontrol(
     cc: &CallControl,
     owner: &str,
@@ -5638,6 +5798,14 @@ pub(crate) fn bh_size_spec_from_callcontrol(
     }
     let canonical_owner = majit_ir::descr::canonical_struct_name(owner);
     let owner = canonical_owner.as_str();
+    // `rclass.py` `InstanceRepr._setup_repr` embeds the parent struct as
+    // `super`, rooted at `OBJECT`'s `typeptr` word. A minted class always
+    // has that size, including a variant that declares no fields. This
+    // wins over a registered empty `StructLayout` and over a missing row
+    // list: neither is the instance struct.
+    if let Some(spec) = minted_exception_instance_size_spec(cc, owner) {
+        return Some(spec);
+    }
     // RPython keys SizeDescrs on the concrete low-level STRUCT object. A Rust
     // generic TypeDecl is only a template: `Option<usize>::Some` and
     // `Option<BinOpKind>::Some` can have different payload banks and therefore
@@ -12212,6 +12380,109 @@ mod tests {
                 assert!(owner.is_empty());
             }
             other => panic!("zero vtable: {other:?}"),
+        }
+    }
+
+    /// A size-0 layout does not describe a minted class. The size is the
+    /// `typeptr` word plus ancestor fields (`InstanceRepr._setup_repr`),
+    /// and `new_with_vtable` still carries the type-static sentinel.
+    #[test]
+    fn new_with_vtable_minted_class_embeds_ancestor_fields() {
+        use crate::jitcode::BhDescr;
+
+        let hint = crate::front::llbc_hints::ExceptionClassHint::new(
+            "synth::E",
+            "B(A)",
+            vec!["A".into(), "B".into(), "D".into()],
+        );
+        let (mut cc, _guard) =
+            layout_cc_for_owners(&["synth::E", "synth::E::A", "synth::E::B", "synth::E::D"]);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "synth::E::A".to_string(),
+            vec![("n".to_string(), "i64".to_string())],
+        );
+        fields.fields.insert(
+            "synth::E::B".to_string(),
+            vec![("flag".to_string(), "bool".to_string())],
+        );
+        cc.set_struct_fields(fields);
+        cc.exception_class_hints = vec![hint];
+
+        let word = crate::layout::target_word_size();
+        let n_align = 8usize;
+        let n_offset = (word + n_align - 1) & !(n_align - 1);
+        let class_align = word.max(n_align);
+        let a_size = (n_offset + 8 + class_align - 1) & !(class_align - 1);
+        let flag_offset = a_size;
+        let b_size = (flag_offset + 1 + class_align - 1) & !(class_align - 1);
+
+        let b_spec = bh_size_spec_from_callcontrol(&cc, "synth::E::B").expect("B");
+        let d_spec = bh_size_spec_from_callcontrol(&cc, "synth::E::D").expect("D");
+        let base_spec = bh_size_spec_from_callcontrol(&cc, "synth::E").expect("base");
+        assert_eq!(b_spec.size, b_size);
+        assert_eq!(d_spec.size, word);
+        assert_eq!(base_spec.size, word);
+        assert!(d_spec.all_fielddescrs.is_empty());
+        assert!(base_spec.all_fielddescrs.is_empty());
+        assert!(b_spec.owner.is_empty());
+        assert_eq!(b_spec.vtable, 0);
+        assert_eq!(b_spec.all_fielddescrs.len(), 2);
+        assert_eq!(b_spec.all_fielddescrs[0].field_key(), "n");
+        assert_eq!(b_spec.all_fielddescrs[0].name, "synth::E::A.n");
+        assert_eq!(b_spec.all_fielddescrs[0].offset, n_offset);
+        assert_ne!(n_offset, 0);
+        assert_eq!(b_spec.all_fielddescrs[1].field_key(), "flag");
+        assert_eq!(b_spec.all_fielddescrs[1].name, "synth::E::B.flag");
+        assert_eq!(b_spec.all_fielddescrs[1].offset, flag_offset);
+        if word >= 8 {
+            assert_eq!(n_offset, word);
+            assert_eq!(flag_offset, word + 8);
+            assert_eq!(a_size, 16);
+            assert_eq!(b_size, 24);
+        }
+        assert_eq!(
+            cc.struct_layout_for("synth::E::B")
+                .map(|layout| layout.size),
+            Some(0),
+            "the registered layout stays empty; the minted spec replaces it"
+        );
+
+        let assembled_b = assemble_new_with_vtable(&cc, "synth::E::B", 0, &[]);
+        match assembled_b {
+            BhDescr::Size {
+                vtable,
+                owner,
+                size,
+                all_fielddescrs,
+                ..
+            } => {
+                assert!(is_type_static_const_sentinel(vtable));
+                assert_eq!(owner, "synth::E::B");
+                assert_eq!(size, b_size);
+                assert_eq!(all_fielddescrs.len(), 2);
+                assert_eq!(all_fielddescrs[0].name, "synth::E::A.n");
+                assert_eq!(all_fielddescrs[0].offset, n_offset);
+                assert_eq!(all_fielddescrs[1].name, "synth::E::B.flag");
+                assert_eq!(all_fielddescrs[1].offset, flag_offset);
+            }
+            other => panic!("assembled B: {other:?}"),
+        }
+        let assembled_d = assemble_new_with_vtable(&cc, "synth::E::D", 0, &[]);
+        match assembled_d {
+            BhDescr::Size {
+                vtable,
+                owner,
+                size,
+                all_fielddescrs,
+                ..
+            } => {
+                assert!(is_type_static_const_sentinel(vtable));
+                assert_eq!(owner, "synth::E::D");
+                assert_eq!(size, word);
+                assert!(all_fielddescrs.is_empty());
+            }
+            other => panic!("assembled D: {other:?}"),
         }
     }
 

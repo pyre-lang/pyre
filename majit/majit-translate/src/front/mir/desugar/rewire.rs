@@ -359,6 +359,27 @@ pub(in crate::front::mir) struct AggregateField {
     /// rust-heap header; `jtransform` copies it when this write's type is
     /// `Str` and the operand is `{cap, ptr, len}`.
     pub(in crate::front::mir) str_value: bool,
+    /// Declaring class of a marked exception-class field
+    /// (`ClassDef.get_owner`). `None` keeps the constructor's result class.
+    pub(in crate::front::mir) owner_root: Option<String>,
+}
+
+/// Owner of a constructor `setfield`.
+///
+/// `InstanceRepr.setfield` resolves the attribute in the class that
+/// declares it (`ClassDef.get_owner`). That class is the `owner_root`
+/// when the aggregate is a marked variant. A different owner must not
+/// reuse the variant's `StructId`: `fielddescrof` would retarget the
+/// parent size descr to the variant. An unmarked field keeps the ctor.
+fn ctor_field_write_owner(
+    ctor: &AggregateCtor,
+    field: &AggregateField,
+) -> (String, Option<majit_ir::descr::StructId>) {
+    match field.owner_root.as_deref() {
+        Some(owner) if owner != ctor.result_owner.as_str() => (owner.to_string(), None),
+        Some(owner) => (owner.to_string(), ctor.owner_id),
+        None => (ctor.result_owner.clone(), ctor.owner_id),
+    }
 }
 
 /// Emit `ctor`'s constructor and field writes into `block` over the operand
@@ -403,15 +424,16 @@ pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
                         ValueType::Int,
                     ),
                 ] {
+                    let (field_owner, field_owner_id) = ctor_field_write_owner(ctor, field);
                     graph.block_mut(block).operations.push(SpaceOperation {
                         result: None,
                         kind: OpKind::FieldWrite {
                             base: res.clone(),
                             field: crate::model::FieldDescriptor::new(
                                 field.name.clone(),
-                                Some(ctor.result_owner.clone()),
+                                Some(field_owner),
                             )
-                            .with_owner_id(ctor.owner_id)
+                            .with_owner_id(field_owner_id)
                             .with_base_is_deref(false)
                             .with_vec_part(part)
                             .with_owner_declared_gc(Some(false)),
@@ -423,17 +445,15 @@ pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
                 continue;
             }
             let len_name = pair_len_field_name(&field.name);
+            let (field_owner, field_owner_id) = ctor_field_write_owner(ctor, field);
             for (name, value) in [(field.name.clone(), value.clone()), (len_name, len.clone())] {
                 graph.block_mut(block).operations.push(SpaceOperation {
                     result: None,
                     kind: OpKind::FieldWrite {
                         base: res.clone(),
-                        field: crate::model::FieldDescriptor::new(
-                            name,
-                            Some(ctor.result_owner.clone()),
-                        )
-                        .with_owner_id(ctor.owner_id)
-                        .with_base_is_deref(false),
+                        field: crate::model::FieldDescriptor::new(name, Some(field_owner.clone()))
+                            .with_owner_id(field_owner_id)
+                            .with_base_is_deref(false),
                         value: crate::model::LinkArg::Value(value),
                         ty: ValueType::Unsigned,
                     },
@@ -442,14 +462,15 @@ pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
             continue;
         }
         let (value, ty) = ctor_ccharp_field_store(graph, block, ctor, field, value)?;
+        let (field_owner, field_owner_id) = ctor_field_write_owner(ctor, field);
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
                 base: res.clone(),
                 field: crate::model::FieldDescriptor {
                     name: field.name.clone(),
-                    owner_root: Some(ctor.result_owner.clone()),
-                    owner_id: ctor.owner_id,
+                    owner_root: Some(field_owner),
+                    owner_id: field_owner_id,
                     // Built by value: the store is not a dereference of a
                     // live container (`base_is_local_aggregate`).
                     base_is_deref: Some(false),
@@ -488,14 +509,15 @@ pub(in crate::front::mir) fn emit_aggregate_ctor(
             continue;
         }
         let (value, ty) = ctor_ccharp_field_store(graph, block, ctor, field, value)?;
+        let (field_owner, field_owner_id) = ctor_field_write_owner(ctor, field);
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
                 base: res.clone(),
                 field: crate::model::FieldDescriptor {
                     name: field.name.clone(),
-                    owner_root: Some(ctor.result_owner.clone()),
-                    owner_id: ctor.owner_id,
+                    owner_root: Some(field_owner),
+                    owner_id: field_owner_id,
                     // Built by value: the store is not a dereference of a
                     // live container (`base_is_local_aggregate`).
                     base_is_deref: Some(false),
