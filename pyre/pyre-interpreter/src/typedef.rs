@@ -24999,6 +24999,11 @@ fn init_float_type(ns: PyObjectRef) {
                 }
                 Err(e) => {
                     use rustpython_common::float_ops::HexFloatError;
+                    // [3.15-spec] `float_fromhex` wording in `floatobject.c`
+                    // (`hexadecimal value too large to represent as a float`,
+                    // `invalid hexadecimal floating-point string`,
+                    // `hexadecimal string too long to convert`). PyPy
+                    // `descr_fromhex` raises `too large` / `invalid hex string`.
                     Err(match e {
                         HexFloatError::Overflow => crate::PyError::overflow_error(
                             "hexadecimal value too large to represent as a float",
@@ -30610,9 +30615,12 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             pyre_object::bytesobject::bytes_like_data(buffer).to_vec()
         } else {
             // `PyObject_GetIter` — a non-iterable operand is the "can't extend" case.
-            let it = crate::baseobjspace::iter(other).map_err(|e| {
+            // [3.15-spec] `bytearray_extend_impl` rewrites via
+            // `PyErr_ExceptionMatches(PyExc_TypeError)` (subclasses included).
+            // PyPy `_from_byte_sequence` lets `space.iter` propagate.
+            let it = crate::baseobjspace::iter(other).map_err(|mut e| {
                 let other = pyre_object::gc_roots::shadow_stack_get(base + 1);
-                if e.kind == crate::PyErrorKind::TypeError {
+                if crate::baseobjspace::type_error_matched(&mut e) {
                     crate::PyError::type_error(format!(
                         "can't extend bytearray with {}",
                         crate::baseobjspace::object_functionstr_type_name(other)
@@ -30634,8 +30642,8 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             loop {
                 match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(it_slot)) {
                     Ok(v) => {
-                        let b = bytearray_byte_arg(v).map_err(|e| {
-                            if is_str && e.kind == crate::PyErrorKind::TypeError {
+                        let b = bytearray_byte_arg(v).map_err(|mut e| {
+                            if is_str && crate::baseobjspace::type_error_matched(&mut e) {
                                 crate::PyError::type_error(
                                     "expected iterable of integers; got: 'str'",
                                 )

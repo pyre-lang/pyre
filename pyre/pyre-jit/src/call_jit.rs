@@ -2344,7 +2344,7 @@ pub fn install_jit_call_bridge() {
         register_jit_exc_clearer(jit_exc_clear_shim);
         // compile.py `memory_error = MemoryError()` parity — give
         // the backend malloc helpers a way to set `JIT_EXC_VALUE` to
-        // pyre's lazy `W_BaseException(MemoryError, "")` singleton
+        // the prebuilt `W_BaseException(MemoryError, "")` singleton
         // before propagating NULL on OOM.  Backend-shared (mirrors
         // RPython where the same `memory_error` instance is reachable
         // from both the x86 and aarch64 backends).

@@ -2589,7 +2589,9 @@ pub unsafe fn w_exception_set_group_exceptions_repr(obj: PyObjectRef, value: PyO
 /// singleton instance the JIT raises through
 /// `PropagateExceptionDescr.handle_fail` when a malloc helper returns
 /// NULL.  RPython allocates the singleton at translation time; pyre
-/// allocates lazily on first OOM (most workloads never trigger it).
+/// materializes it when `MemoryError` is registered
+/// (`install_default_builtins`), so a MiniMark max-heap breach does not
+/// `malloc_typed` the instance.
 ///
 /// Stored as `usize` because `PyObjectRef` is `*mut PyObject`, which is
 /// neither `Send` nor `Sync` — `OnceLock<usize>` is the standard escape

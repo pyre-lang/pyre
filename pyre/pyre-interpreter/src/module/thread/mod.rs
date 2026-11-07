@@ -3024,6 +3024,9 @@ crate::py_module! {
             }))
         },
         "start_joinable_thread"  / * = start_joinable_thread; crate::Signature::new(vec!["function", "handle", "daemon"], None, None, 0, 0),
+        // [3.15-spec] `thread.start_new_thread(function, args, kwargs=None, /)`
+        // — positional-only (`_threadmodule.c` clinic). PyPy accepts the
+        // names as keywords. Measured on python3.15t.
         "start_new_thread"       / * = start_new_thread; crate::Signature::new(vec!["function", "args", "kwargs"], None, None, 0, 3),
         "start_new"              / * = start_new_thread; crate::Signature::new(vec!["function", "args", "kwargs"], None, None, 0, 3),
     },

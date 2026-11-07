@@ -22,14 +22,20 @@ pub fn get_double(obj: PyObjectRef) -> f64 {
 pub fn try_get_double(mut obj: PyObjectRef) -> Result<f64, pyre_interpreter::PyError> {
     unsafe {
         if is_float(obj) {
+            // [3.15-spec] `PyFloat_AsDouble` reads the payload of a float
+            // subclass (`lib-python/3/test/test_capi/test_float.py`
+            // `test_asdouble`: `FloatSubclass2(4.25)` is 4.25). PyPy
+            // `_get_double` calls `space.float` unless `type(w_x) is float`,
+            // so an override runs. Measured: `math.degrees(F(1.0))` on
+            // python3.15t uses 1.0; pypy3 uses `F.__float__`. `_get_double`
+            // has no `@jit.*` governing the payload.
             return Ok(floatobject::w_float_get_value(obj));
         }
         // Reading the payload answers only for an operand whose Python class
         // is the builtin: `is_int` / `is_long` / `is_bool` read `ob_type`,
         // which a strict subclass shares while overriding `__float__`.  The
         // subclass falls to the ladder below; an inherited `int.__float__`
-        // reproduces the payload.  The `float` arm stays ungated because the
-        // conversion short-circuits on the layout and ignores an override.
+        // reproduces the payload.
         if pyre_object::is_exact_builtin_instance(obj)
             && let Some(value) =
                 pyre_object::with_roots!(obj => pyre_interpreter::builtins::int_payload_as_f64(obj))
