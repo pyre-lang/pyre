@@ -2855,7 +2855,7 @@ fn cell_get_of_a_struct_field_is_that_fields_value_read() {
     });
     let cell_get = window_opaque_fun(
         2,
-        &["core", "cell", "Cell", "get"],
+        &["cell", "Cell", "get"],
         vec![cell_ref.clone()],
         bool_ty.clone(),
     );

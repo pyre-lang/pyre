@@ -4354,17 +4354,20 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         return Err(DispatchError::callee_inline_unsupported(op.pc));
     };
 
-    // `pyframe.py execute_frame`: `executioncontext.call_trace(self)` after
-    // the callee frame exists. Callee-prologue resume stays at this CALL
-    // (`HelperReturn::CalleePrologue`); the frame box is the generated body's
-    // second red (`call_trace_jit_abi(ec, frame)`).
+    // `pyframe.py execute_frame`: stack check / `ec.enter(self)` then
+    // `executioncontext.call_trace(self)`. Charge and the frame-chain enter
+    // run first so `f_backref` is the caller's vref (or `vref_None` at the
+    // chain end) before the prologue walk; a body that reads `f_back` then
+    // `force_vref`s that slot, not the constructor-default NULL. Callee-
+    // prologue resume stays at this CALL (`HelperReturn::CalleePrologue`);
+    // the frame box is the generated body's second red
+    // (`call_trace_jit_abi(ec, frame)`). `enter` records no guards.
     let concrete_frame = match ctx.trace_ctx.concrete_of_opref(callee_frame) {
         Some(majit_ir::Value::Ref(gcref)) if gcref.0 != 0 => {
             gcref.0 as *mut pyre_interpreter::PyFrame
         }
         _ => std::ptr::null_mut(),
     };
-    super::walker_call_trace_hook_reads(ctx, op.pc, callee_frame, concrete_frame)?;
 
     // `pyframe.py execute_frame`'s `ec.enter(self)`, which upstream records
     // ahead of the callee's `jit_merge_point` and this fold otherwise jumps
@@ -4383,7 +4386,28 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         .const_int(i64::from(open_inline_activations(ctx.session) + 1));
     let (saved_depth, displaced_activation) =
         record_activation_charge(ctx, op.pc, ec, callee_frame, units)?;
-    let callee_vref = record_ec_enter_frame_chain(ctx.trace_ctx, callee_frame, ec);
+    // Live `ExecutionContext` for the concrete `f_backref` store. Do not
+    // publish a tracing vref into `topframeref` here: `execute_varargs`
+    // of this CALL still runs the interpreter `enter`/`leave` of its own
+    // frame, and a pair in `virtualref_boxes` would be finished by
+    // `vrefs_after_residual_call` before `GUARD_NOT_FORCED`.
+    let concrete_ec =
+        pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
+    let callee_vref =
+        record_ec_enter_frame_chain(ctx.trace_ctx, callee_frame, ec, concrete_frame, concrete_ec);
+    // `pyframe.py execute_frame`: `enter` then `call_trace`. Walk the
+    // generated `call_trace` JitCode with this door's `ec` box (the same
+    // box enter just stored into), not a freshly interned context box.
+    // Converted / CalleePrologue guards still resume at this CALL
+    // (`HelperReturn::CalleePrologue`); `enter` records no guards.
+    walker_inline_execute_frame_call_trace(
+        ctx,
+        op.pc,
+        ec,
+        callee_frame,
+        concrete_ec,
+        concrete_frame,
+    )?;
 
     // do_residual_call step 1 (`pyjitpl.py`): FORCE_TOKEN +
     // SETFIELD_GC(vable_token) before the assembler call.
@@ -7876,12 +7900,13 @@ fn walker_ec_enter(
 /// (`pyjitpl.py _opimpl_inline_call1`) so `gettrace()`'s `jit.promote` and
 /// the `profilefunc is not None` test land in this walk.
 ///
-/// `pyframe.py execute_frame` runs `call_trace` after `enter`. This walk
-/// records just before `enter`: prologue guards resume at the CALL entry
-/// (pyre has no `execute_frame` frame to pause past `call_trace`). The
-/// order is unobservable on the unarmed path because `enter` writes only
-/// `topframeref`/`f_backref`, which that path does not read. Compact tests
-/// that omit `snapshot_sym` skip.
+/// `pyframe.py execute_frame` runs `enter` then `call_trace`. Doors that
+/// enter a callee record `walker_ec_enter` before this walk, so a body that
+/// reads `f_back` sees the caller's vref (or `vref_None` at the chain end),
+/// not the constructor-default NULL. Converted / CalleePrologue guards
+/// still resume at the CALL entry (`HelperReturn::CalleePrologue` /
+/// `HelperResume::CallEntry`): pyre has no `execute_frame` frame to pause
+/// past `call_trace`. Compact tests that omit `snapshot_sym` skip.
 pub(crate) fn walker_inline_execute_frame_call_trace<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -7958,8 +7983,10 @@ fn caller_frame_box_for(ctx: &TraceCtx, frame_ptr: usize) -> Option<OpRef> {
 /// residual call and reaches the interpreter's own `execute_frame`, which runs
 /// `call_trace` / `return_trace` / `leave`.  A hook installed AFTER the trace
 /// was recorded fails `gettrace()`'s `jit.promote` at that inlined entry;
-/// `CALL_ASSEMBLER` and `walk_generator_resume` pin the same reads through
-/// `walker_call_trace_hook_reads`. A profiler uses the `is_being_profiled`
+/// `CALL_ASSEMBLER` pins the same reads through
+/// `walker_inline_execute_frame_call_trace` after `record_ec_enter_frame_chain`;
+/// `walk_generator_resume` pins them through `walker_call_trace_hook_reads`
+/// (that door does not enter again). A profiler uses the `is_being_profiled`
 /// green / back-edge read.
 ///
 /// `eval_with_jit_inner` (`pyre-jit/src/eval.rs`) routing every frame for
@@ -8181,12 +8208,21 @@ pub(crate) fn unwind_entered_scopes_above<Sym: WalkSym>(
 ///
 /// [`walker_ec_enter`] is the seeded-callee form: it has a live callee frame
 /// at recording time, so it mirrors every store concretely and takes a
-/// tracing-time vref of the frame.  This fold builds its callee out of
-/// recorded operations alone and executes the call through the ordinary
-/// callable, which enters a frame of its own, so there is no object for a
-/// tracing-time vref to name: the `VIRTUAL_REF` is recorded without one
+/// tracing-time vref of the frame (the pair is pushed immediately).  This
+/// fold builds its callee out of recorded operations and executes the call
+/// through the ordinary callable, which enters a frame of its own.  The
+/// `VIRTUAL_REF` is recorded without a tracing-time pair
 /// (`TraceCtx::record_virtual_ref`) and returned for the caller to track
-/// across the guards that resume inside the scope.
+/// across the guards that resume inside the scope; pushing the pair before
+/// `CALL_ASSEMBLER` execute would let `vrefs_after_residual_call` finish it
+/// ahead of `GUARD_NOT_FORCED`.
+///
+/// The IR stores are heap-cached the same way `walker_ec_enter` caches
+/// them, and a live minted frame (when the fold holds one) gets the
+/// concrete `f_backref = topframeref` store so compiled `CALL_ASSEMBLER`
+/// code that reads `f_back` does not `force_vref` the constructor-default
+/// NULL.  Live `topframeref` is not overwritten: the residual execute
+/// still uses the interpreter's own `enter`.
 ///
 /// A force of this vref by the callee — `gettopframe_nohidden` under
 /// `locals()`, or `ExecutionContext.leave`'s `frame.f_backref()` when a
@@ -8199,23 +8235,55 @@ pub(crate) fn unwind_entered_scopes_above<Sym: WalkSym>(
 /// execute_frame`'s `ec.enter(self)` already traced ahead of it.  pyre's
 /// portal sits one level up, at `execute_frame` itself, so the fold jumps
 /// over the enter unless it records it here.
-fn record_ec_enter_frame_chain(ctx: &mut TraceCtx, callee_frame: OpRef, callee_ec: OpRef) -> OpRef {
-    let caller_topframeref = ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[callee_ec],
-        crate::descr::ec_topframeref_descr(),
-    );
+fn record_ec_enter_frame_chain(
+    ctx: &mut TraceCtx,
+    callee_frame: OpRef,
+    callee_ec: OpRef,
+    concrete_frame: *mut pyre_interpreter::PyFrame,
+    concrete_ec: *mut pyre_interpreter::PyExecutionContext,
+) -> OpRef {
+    let topframeref_descr = crate::descr::ec_topframeref_descr();
+    let f_backref_descr = crate::descr::pyframe_f_backref_descr();
+    let caller_topframeref_raw = if concrete_ec.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { (*concrete_ec).topframeref() }
+    };
+    let pinned_caller_topframeref = pin_frame_chain_ptr(caller_topframeref_raw);
+    let caller_topframeref =
+        ctx.record_op_with_descr(OpCode::GetfieldGcR, &[callee_ec], topframeref_descr.clone());
+    let concrete_caller_topframeref =
+        live_frame_chain_ptr(pinned_caller_topframeref.as_ref(), caller_topframeref_raw);
+    if !concrete_ec.is_null() {
+        ctx.set_opref_concrete(
+            caller_topframeref,
+            majit_ir::Value::Ref(majit_ir::GcRef(concrete_caller_topframeref as usize)),
+        );
+    }
     ctx.record_op_with_descr(
         OpCode::SetfieldGc,
         &[callee_frame, caller_topframeref],
-        crate::descr::pyframe_f_backref_descr(),
+        f_backref_descr.clone(),
     );
+    ctx.heapcache_setfield_cached(callee_frame, f_backref_descr.index(), caller_topframeref);
     let vref = ctx.record_virtual_ref(callee_frame);
     ctx.record_op_with_descr(
         OpCode::SetfieldGc,
         &[callee_ec, vref],
-        crate::descr::ec_topframeref_descr(),
+        topframeref_descr.clone(),
     );
+    ctx.heapcache_setfield_cached(callee_ec, topframeref_descr.index(), vref);
+    if !concrete_frame.is_null() {
+        pyre_object::gc_hook::try_gc_write_barrier(concrete_frame as pyre_object::gc_hook::GCREF);
+        majit_gc::bh_probe_note_store(
+            concrete_frame as usize,
+            crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
+            4,
+        );
+        unsafe {
+            (*concrete_frame).f_backref = concrete_caller_topframeref;
+        }
+    }
     vref
 }
 
@@ -8366,7 +8434,13 @@ mod portal_frame_chain_tests {
             let frame = OpRef::input_arg_ref(0);
             let ec = OpRef::input_arg_ref(1);
 
-            let vref = record_ec_enter_frame_chain(&mut ctx, frame, ec);
+            let vref = record_ec_enter_frame_chain(
+                &mut ctx,
+                frame,
+                ec,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
             assert_eq!(ctx.virtualref_boxes_len(), 0);
             ctx.track_recorded_virtual_ref(frame, vref);
             assert_eq!(ctx.virtualref_boxes_len(), 2);
@@ -12698,20 +12772,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         if concrete_ec.is_null() {
             None
         } else {
-            // `pyframe.py execute_frame` runs `call_trace` after `enter`.
-            // Converted guards resume at this CALL entry (no `execute_frame`
-            // MIFrame to pause past `call_trace`), so the walk records here —
-            // callee frame seeded, nothing entered. `enter` writes only
-            // `topframeref`/`f_backref`, which the unarmed `call_trace` path
-            // does not read.
-            walker_inline_execute_frame_call_trace(
-                ctx,
-                op.pc,
-                ca_callee_ec,
-                ca_callee_frame,
-                concrete_ec,
-                ca_concrete_frame,
-            )?;
+            // `pyframe.py execute_frame`: `enter` then `call_trace`. Record
+            // enter first so `f_backref` is the caller's vref (or `vref_None`
+            // at the chain end) before the prologue walk; a later
+            // `sys._getframe(...).f_back` then `force_vref`s that slot, not
+            // the constructor-default NULL. Converted / CalleePrologue
+            // guards still resume at this CALL (`HelperReturn::CalleePrologue`);
+            // `enter` records no guards. A declined prologue walk undoes the
+            // concrete chain this enter installed (`entered_ec` is still
+            // None, so the later leave would not run).
             walker_ec_enter(
                 ctx.trace_ctx,
                 ca_callee_frame,
@@ -12719,6 +12788,17 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 ca_concrete_frame,
                 concrete_ec,
             );
+            if let Err(e) = walker_inline_execute_frame_call_trace(
+                ctx,
+                op.pc,
+                ca_callee_ec,
+                ca_callee_frame,
+                concrete_ec,
+                ca_concrete_frame,
+            ) {
+                abandon_entered_frame(ctx.trace_ctx, ca_concrete_frame, concrete_ec);
+                return Err(e);
+            }
             // This inlined level is an activation `execute_frame` would have
             // charged the recursion counter for.  Counting it at RUN time is
             // what a recorded call would do, and that is exactly wrong here: a
@@ -19837,9 +19917,11 @@ fn walk_generator_resume<Sym: WalkSym>(
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
 
-    // `pyframe.py execute_frame` runs `ec.call_trace(self)` before
-    // `resume_execute_frame`; tracing through the resumed body walks the
-    // generated `call_trace` JitCode here, as on the inline door.
+    // `pyframe.py execute_frame` runs `enter` then `ec.call_trace(self)`
+    // then `resume_execute_frame`. This door walks `call_trace` on a frame
+    // whose `f_backref` was set at the original enter; it does not enter
+    // again. Tracing through the resumed body walks the generated
+    // `call_trace` JitCode here, as on the inline door.
     let gen_frame = live_generator_frame(frame_root);
     super::walker_call_trace_hook_reads(ctx, op.pc, frame_box, gen_frame)?;
 

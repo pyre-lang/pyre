@@ -14751,9 +14751,10 @@ fn fused_goto_if_not_int<Sym: WalkSym>(
 /// answer only decides whether to record a door at all, and every caller bails
 /// before recording any IR; the other half — a hook installed after the trace
 /// was recorded — is `gettrace()`'s `jit.promote` walked at an inlined
-/// callee entry (`walker_inline_execute_frame_call_trace`), the
-/// [`walker_call_trace_hook_reads`] pins on `CALL_ASSEMBLER` and generator
-/// resume, and the `is_being_profiled` green / back-edge read for a profiler.
+/// callee entry (`walker_inline_execute_frame_call_trace`, also the
+/// `CALL_ASSEMBLER` door after `record_ec_enter_frame_chain`), the
+/// [`walker_call_trace_hook_reads`] pin on generator resume, and the
+/// `is_being_profiled` green / back-edge read for a profiler.
 pub(crate) fn ec_hook_installed() -> bool {
     let ec = pyre_interpreter::call::getexecutioncontext();
     !ec.is_null() && unsafe { !(*ec).w_tracefunc().is_null() || (*ec).profilefunc.is_some() }
@@ -15198,11 +15199,11 @@ pub(crate) fn inlined_loop_header_call_assembler(
 /// `blackhole_if_trace_too_long` (`pyjitpl.py`) inside it resumes at that
 /// CALL (`HelperReturn::CalleePrologue` / `HelperResume::CallEntry`).
 ///
-/// `pyframe.py execute_frame` runs `call_trace` after `enter`. Doors walk it
-/// just before `enter` because those prologue guards resume at the CALL
-/// entry (no `execute_frame` frame to pause past `call_trace`). The order is
-/// unobservable on the unarmed path: `enter` writes only `topframeref` /
-/// `f_backref`, which that path does not read.
+/// `pyframe.py execute_frame` runs `enter` then `call_trace`. Doors that
+/// enter a callee record enter first, matching that order, so a body that
+/// reads `f_back` sees the caller's vref (or `vref_None` at the chain end).
+/// Callee-prologue resume stays at the CALL entry (no `execute_frame` frame
+/// to pause past `call_trace`).
 pub(super) fn walker_walk_call_trace<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -15296,8 +15297,11 @@ pub(super) fn walker_walk_call_trace<Sym: WalkSym>(
     }
 }
 
-/// `CALL_ASSEMBLER` and generator-resume door: the running ExecutionContext
-/// box plus the callee frame the door holds, then [`walker_walk_call_trace`].
+/// Generator-resume door: the running ExecutionContext box plus the
+/// resumed frame the door holds, then [`walker_walk_call_trace`].
+/// `CALL_ASSEMBLER` walks `call_trace` through
+/// `walker_inline_execute_frame_call_trace` with the assembler `ec` box
+/// after `record_ec_enter_frame_chain`.
 pub(super) fn walker_call_trace_hook_reads<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,

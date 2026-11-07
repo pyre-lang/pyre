@@ -4259,6 +4259,27 @@ impl OptContext {
                 // info lives on the replay op, so `make_guards(preamble_op)`
                 // names that result rather than the export-time box.
                 self.set_preamble_forwarded_info(&produced_op.preamble_op, info);
+                // shortpreamble.py `ShortInputArg(box, renamed)`: `preamble_op`
+                // IS the renamed InputArg. Heap GETFIELD args name that
+                // renamed box (`produce_arg`). The SAME_AS stand-in above
+                // stays at the original label box, so plant the exported
+                // Instance/known_class on the renamed InputArg that
+                // `use_box` actually reads.
+                if produced_op.kind == PreambleOpKind::InputArg
+                    && let Some(idx) = produced_op.label_arg_idx
+                    && let Some(renamed_box) = short_inputargs.get(idx).cloned()
+                    && !renamed_box.to_opref().is_constant()
+                    && !renamed_box.to_opref().is_none()
+                {
+                    if !self.has_forwarding(&renamed_box) {
+                        match info {
+                            crate::optimizeopt::info::OpInfo::Unknown => {
+                                renamed_box.clear_forwarded();
+                            }
+                            other => renamed_box.set_forwarded_info(other.clone()),
+                        }
+                    }
+                }
             }
         }
 

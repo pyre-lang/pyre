@@ -6094,7 +6094,8 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // time.  `mayforce_null_ref_arg_is_checked_sentinel` names slots the
     // helper tests before use (`bh_call_fn_N`'s `null_or_self`, …), so a
     // concrete NULL there is executed.
-    let helper = call_descr.get_extra_info().runtime_helper;
+    let extra = call_descr.get_extra_info();
+    let helper = extra.runtime_helper;
     // `bh_load_method_self_fn` dereferences `attr` (`is_method`) before it
     // looks at `obj`. A null or unaligned word is not a PyObject — a
     // bit-cast of 1 reaches this executor as an Int box the Ref null-check
@@ -6120,6 +6121,15 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             Some(majit_ir::Value::Int(addr)) => addr,
             _ => 0,
         };
+        // `virtualref.py force_virtual_if_necessary` returns a non-vref
+        // (including NULL / `vref_None`) unchanged. `do_residual_call`
+        // routes `OS_JIT_FORCE_VIRTUAL` by `oopspecindex`, never by the
+        // callee name. Pyre's NULL-Ref-arg refusal is the only gate that
+        // would still decline this residual; skip it for that oopspec so
+        // the chain-end `f_backref` records like upstream.
+        if extra.oopspecindex == majit_ir::OopSpecIndex::JitForceVirtual {
+            continue;
+        }
         if mayforce_null_ref_arg_is_checked_sentinel(helper, target, i, args.len()) {
             continue;
         }
@@ -7976,6 +7986,10 @@ pub(crate) fn do_not_in_trace_call_result<Sym: WalkSym>(
 /// through to the may-force residual, which is the non-standard vref path
 /// `optimize_jit_force_virtual` later folds when the box is a trace Virtual.
 ///
+/// A NULL / `vref_None` argument is `virtualref.py force_virtual_if_necessary`'s
+/// `if not inst: return inst`: the result is a known-null box, not a residual
+/// whose reconstruct later compiled `GUARD_CLASS`.
+///
 /// Missing concrete pointers for the `PTR_EQ` still fail loud: recording
 /// `CALL_MAY_FORCE_*` while PyPy would have returned `standard_box` is
 /// silent divergence.
@@ -8033,6 +8047,16 @@ pub(crate) fn walker_do_jit_force_virtual<Sym: WalkSym>(
         .trace_ctx
         .box_bits(vref_box)
         .filter(|&bits| !unresolved(bits));
+    // `virtualref.py force_virtual_if_necessary`: `if not inst: return inst`.
+    // `_do_jit_force_virtual` still PTR_EQ's a non-null non-standard box.
+    // A NULL / `vref_None` argument is that first line: the result is a
+    // known-null box so a later `GUARD_CLASS` does not compile a class
+    // load through the residual's reconstruct of this oopspec.
+    if vref_concrete == Some(0) {
+        let null = ctx.trace_ctx.const_null();
+        write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, null)?;
+        return Ok(Some(DispatchOutcome::Continue));
+    }
     let standard_concrete = ctx
         .trace_ctx
         .box_bits(standard_box)

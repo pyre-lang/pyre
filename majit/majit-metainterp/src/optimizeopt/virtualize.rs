@@ -2923,6 +2923,15 @@ impl majit_ir::SizeDescr for VRefSizeDescr {
     fn all_fielddescrs(&self) -> &[Arc<dyn majit_ir::FieldDescr>] {
         &VREF_ALL_FIELDDESCRS
     }
+    /// `heaptracker.py gc_fielddescrs` is `all_fielddescrs(only_gc=True)`.
+    /// `virtualref.py:17-20` registers both payload fields as GC pointers
+    /// (`virtual_token: GCREF`, `forced: OBJECTPTR`), so the lists agree.
+    /// `rewrite.py clear_gc_fields` delayed-zeros this view; the default
+    /// empty list left `token`/`forced` as recycled nursery bytes until
+    /// the first SETFIELD.
+    fn gc_fielddescrs(&self) -> &[Arc<dyn majit_ir::FieldDescr>] {
+        &VREF_ALL_FIELDDESCRS
+    }
 }
 
 #[cfg(test)]

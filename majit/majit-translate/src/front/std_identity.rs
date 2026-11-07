@@ -28,7 +28,9 @@ fn path_has(segments: &[String], needle: &str) -> bool {
 
 fn is_std_crate(name: &str) -> bool {
     // `sync::...` is the std lock path with the `std::` prefix already peeled.
-    matches!(name, "core" | "std" | "alloc" | "sync")
+    // `cell::...` is the same peel for `core::cell` (`FOREIGN_STDLIB_EXTERNALS`
+    // keys `cell::Cell::get`).
+    matches!(name, "core" | "std" | "alloc" | "sync" | "cell")
 }
 
 fn is_std_fn_path(segments: &[String]) -> bool {
@@ -802,6 +804,30 @@ mod tests {
         assert!(
             matches!(new, OpKind::UnaryOp { ref op, .. } if op == "same_as"),
             "AtomicUsize::new is identity on the inner usize"
+        );
+    }
+
+    #[test]
+    fn charon_short_cell_get_stays_a_call() {
+        let v = dummy_var();
+        let get = lower_std_primitive_op(
+            call(
+                path(&["cell", "Cell", "get"]),
+                vec![v.clone()],
+                ValueType::Int,
+            ),
+            Some("cell::Cell"),
+            None,
+            Some("I64"),
+            None,
+            false,
+            true,
+            Some(&[("value".into(), ValueType::Int)]),
+            false,
+        );
+        assert!(
+            matches!(get, OpKind::Call { .. }),
+            "a Charon-short Cell read is a place read handled in lower_call, not a by-value wrapper payload"
         );
     }
 

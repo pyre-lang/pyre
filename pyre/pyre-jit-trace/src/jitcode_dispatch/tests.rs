@@ -12040,6 +12040,11 @@ fn resume_py_pc_after_residual_live_uses_fallthrough_twin() {
         "after-call -live- resumes at the CALL fallthrough, not the CALL"
     );
     assert_eq!(
+        crate::py_coord::call_site_py_pc_for_resume_word(jitcode_index, live_pc as i32),
+        Some(call_py as u32),
+        "in_a_call reconstruct still measures stack height at the CALL"
+    );
+    assert_eq!(
         crate::py_coord::resume_py_pc_for_jitcode_word(jitcode_index, call_pc as i32),
         call_py as i32,
         "the CALL's own offset still names the CALL"
@@ -21376,6 +21381,84 @@ fn jit_force_virtual_known_nonstandard_records_no_ptr_eq() {
         wc.trace_ctx.profiler().snapshot().heapcached_ops,
         heapcached_before + 1
     );
+}
+
+#[test]
+fn jit_force_virtual_null_non_vref_returns_the_null_box() {
+    // `virtualref.py force_virtual_if_necessary`: a non-vref (NULL /
+    // `vref_None`) is returned unchanged. `_do_jit_force_virtual` answers
+    // with that known-null box so a later `GUARD_CLASS` does not compile
+    // a class load through a residual reconstruct.
+    let mut tc = fresh_trace_ctx();
+    let mut vable_buf = vec![0u8; 65536];
+    bind_fake_vable(&mut tc, &mut vable_buf);
+    let standard = tc
+        .standard_virtualizable_box()
+        .expect("bind_fake_vable seeds virtualizable_boxes[-1]");
+    let func = tc.const_int(0);
+    let vref = tc.const_null();
+    assert_ne!(vref, standard);
+    let regs_r = [vref, tc.const_null(), tc.const_null(), tc.const_null()];
+    let regs_i = [func];
+    let force_virtual_descr = call_descr_with_oopspec(
+        42,
+        majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
+        majit_ir::OopSpecIndex::JitForceVirtual,
+    );
+    let descr_pool = vec![force_virtual_descr.clone()];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let ei = force_virtual_descr
+        .as_call_descr()
+        .expect("call descr")
+        .get_extra_info();
+    let allboxes = vec![func, vref];
+    let ops_before = wc.trace_ctx.num_ops();
+    let outcome = walker_do_jit_force_virtual(&mut wc, ei, &allboxes, 0, 'r', 0)
+        .expect("NULL non-vref is the force_virtual identity, not an error");
+    assert_eq!(outcome, Some(DispatchOutcome::Continue));
+    assert_eq!(
+        wc.trace_ctx.num_ops(),
+        ops_before,
+        "must not record PTR_EQ for a NULL non-vref"
+    );
+    let got = wc.registers_r.get(0);
+    let null = wc.trace_ctx.const_null();
+    assert_eq!(got, Some(null));
 }
 
 #[test]
@@ -32120,6 +32203,22 @@ fn the_mayforce_null_ref_sentinel_table_names_one_slot_per_helper() {
     assert!(
         exempted.is_empty(),
         "unexpected exempt leaves: {exempted:?}"
+    );
+    // `force_vref(inst)` is a registered leaf. NULL is not a name-row
+    // sentinel: `do_residual_call` routes `OS_JIT_FORCE_VIRTUAL` by
+    // `oopspecindex` (`virtualref.py force_virtual_if_necessary` returns
+    // a non-vref including NULL unchanged).
+    let (_, force) = pyre_interpreter::jit_trace_fnaddrs()
+        .into_iter()
+        .find(|&(path, _)| leaf_of(path) == "force_vref")
+        .expect("force_vref is a registered leaf");
+    assert!(
+        !is_sentinel(K::None, force, 0, 1),
+        "force_vref NULL is not a name-row sentinel"
+    );
+    assert!(
+        !is_sentinel(K::None, force, 0, 2),
+        "force_vref arg 0 of 2 stays refused"
     );
 }
 

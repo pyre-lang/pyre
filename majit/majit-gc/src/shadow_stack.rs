@@ -1319,6 +1319,13 @@ pub fn shadow_stack_slot() -> ShadowStackSlot {
 }
 
 impl ShadowStackSlot {
+    /// The cached word [`cache_root_stack_slot`] stores and
+    /// [`slot_from_cached`] reconstructs.
+    #[inline]
+    pub fn as_raw(self) -> usize {
+        self.0 as usize
+    }
+
     /// `push` through this resolved handle: one store and a bump of
     /// `root_stack_top` (`ShadowStackRootWalker.push_stack`).
     #[inline]
