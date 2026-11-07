@@ -15764,6 +15764,103 @@ fn ref_copy_with_out_of_range_src_register_surfaces_typed_error() {
     );
 }
 
+#[test]
+fn ref_copy_of_unbound_register_leaves_dest_unbound() {
+    // `pyjitpl.py _opimpl_any_copy` / `copy_constants` `MissingValue`:
+    // copying a never-written register is legal; dest holds the missing
+    // value. A later op that consumes dest still raises
+    // `RegisterReadUnbound`.
+    let ref_copy_byte = *insns_opname_to_byte()
+        .get("ref_copy/r>r")
+        .expect("`ref_copy/r>r` must be in insns table");
+    let raise_byte = *insns_opname_to_byte()
+        .get("raise/r")
+        .expect("`raise/r` must be in insns table");
+    // src=0 (unbound), dst=1 (starts bound with a stale concrete).
+    let code = [ref_copy_byte, 0x00, 0x01, raise_byte, 0x01];
+    let mut tc = fresh_trace_ctx();
+    let dest_pre = tc.const_ref(0xC0DE_0001);
+    let registers_r = [OpRef::NONE, dest_pre];
+    let stale = 0xBEEFusize as pyre_object::PyObjectRef;
+    let concrete_registers_r = [ConcreteValue::Null, ConcreteValue::Ref(stale)];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: (concrete_registers_r).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: dest_pre,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(registers_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+
+        vstack_reorder_ceiling: u32::MAX,
+
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let (outcome, next_pc) =
+        step(&code, 0, &mut wc).expect("ref_copy of an unbound source must not abort");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 3);
+    assert_eq!(
+        wc.registers_r.get(1),
+        Some(OpRef::NONE),
+        "unbound source leaves dest unbound",
+    );
+    assert_eq!(
+        wc.registers_r.get(0),
+        Some(OpRef::NONE),
+        "src register must remain unbound",
+    );
+    assert_eq!(
+        wc.frame_state.borrow().concrete_registers_r[1],
+        ConcreteValue::Null,
+        "unbound copy must clear dest's stale concrete shadow",
+    );
+    assert_eq!(
+        wc.frame_state.borrow().vstack_last_ref,
+        dest_pre,
+        "a link renaming is not the opcode's result, so ref_copy must leave \
+             the operand-stack TOS candidate alone",
+    );
+    let err = step(&code, 3, &mut wc)
+        .expect_err("a later use of the unbound dest must surface RegisterReadUnbound");
+    assert_eq!(
+        err,
+        DispatchError::RegisterReadUnbound {
+            pc: 3,
+            reg: 1,
+            bank: "r"
+        },
+    );
+}
+
 /// Drive a single `int_<binop>/ii>i` handler: the codewriter
 /// encodes `[opcode, src1, src2, dst]`. Asserts the recorder
 /// captured `OpCode::<expected>` with `[regs_i[src1],

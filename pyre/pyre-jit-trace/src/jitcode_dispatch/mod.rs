@@ -5763,8 +5763,18 @@ pub fn walk<Sym: WalkSym>(
                 let coordinate_belongs_to_this_frame =
                     walk_err_coordinate_belongs_to_this_frame(&error, ctx);
                 if fbw_state::fbw_debug_abort_enabled() {
+                    let decoded = crate::jitcode_runtime::decode_op_at(code, opcode_position);
+                    let opname = decoded.as_ref().map(|op| op.opname).unwrap_or("?");
+                    let operands = decoded.as_ref().map(|op| {
+                        let end = op.next_pc.min(code.len());
+                        code.get((op.pc + 1)..end).unwrap_or(&[]).to_vec()
+                    });
+                    let bound_r: Vec<usize> = (0..ctx.registers_r.len())
+                        .filter(|&i| ctx.registers_r.get(i).is_some_and(|value| !value.is_none()))
+                        .collect();
                     eprintln!(
                         "[walk-abort] err={:?} stop_pc={} opcode_position={} \
+                         op={opname} operands={operands:?} bound_r={bound_r:?} \
                          helper={} inline={} claimed={} callee_jc={:?}",
                         error,
                         error.stop_pc(),
@@ -6386,11 +6396,14 @@ fn read_ref_reg<Sym: WalkSym>(
     Ok(value)
 }
 
-/// [`read_ref_reg`] without the unbound-slot check, for the handful of arms
-/// that give an unwritten slot their own, more specific decline — the
-/// `*_vable_*` family reads its object operand this way so an unseeded
-/// virtualizable register still surfaces [`DispatchError::VableBoxNotSeeded`]
-/// instead of the generic [`DispatchError::RegisterReadUnbound`].
+/// [`read_ref_reg`] without the unbound-slot check.
+///
+/// `ref_copy/r>r` uses this so an unwritten source leaves dest unbound —
+/// `pyjitpl.py` `_opimpl_any_copy` / `copy_constants` `MissingValue`
+/// (None when translated). The `*_vable_*` family also reads its object
+/// operand this way so an unseeded virtualizable register still surfaces
+/// [`DispatchError::VableBoxNotSeeded`] instead of the generic
+/// [`DispatchError::RegisterReadUnbound`].
 fn read_ref_reg_raw<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -17483,6 +17496,13 @@ fn handle<Sym: WalkSym>(
             // records *no* IR op for a copy — pure SSA-level rename.
             // Operand layout `i>i`: 1B src + 1B dst.
             //
+            // `copy_constants` fills every register with `MissingValue()`
+            // (None when translated). Copying a never-written register is
+            // legal: dest holds that missing value. `read_int_reg` is the
+            // Int-bank raw reader (no `RegisterReadUnbound` gate). An
+            // unbound source also clears dest's concrete shadow so a stale
+            // Int does not survive. A later USE of dest is the error.
+            //
             // Int-bank concrete shadow: propagate the source slot's Int-bank concrete
             // shadow alongside the symbolic OpRef, mirroring the
             // `ref_copy/r>r` concrete-shadow chain.  Without this, a
@@ -17491,7 +17511,11 @@ fn handle<Sym: WalkSym>(
             // even when the source had a known concrete (e.g. a
             // constant Int seeded by `allocate_callee_register_banks`).
             let src_val = read_int_reg(code, op, 0, ctx)?;
-            let src_concrete = read_int_reg_concrete(code, op, 0, ctx);
+            let src_concrete = if src_val.is_none() {
+                ConcreteValue::Null
+            } else {
+                read_int_reg_concrete(code, op, 0, ctx)
+            };
             let dst = code[op.pc + 2] as usize;
             write_int_reg(ctx, op.pc, dst, src_val, src_concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
@@ -17533,6 +17557,13 @@ fn handle<Sym: WalkSym>(
             // Float-bank sibling of `int_copy/i>i` — pure SSA-level
             // rename, no IR op recorded. Operand layout `f>f`: 1B src
             // + 1B dst.
+            //
+            // `pyjitpl.py _opimpl_any_copy` / `copy_constants` `MissingValue`:
+            // copy of a never-written register is legal; dest holds
+            // `OpRef::NONE`. `read_float_reg` is the Float-bank raw reader
+            // (no unbound gate). The Float bank has no per-register
+            // concrete side table (`read_float_reg_concrete` reads the
+            // OpRef itself), so copying the unbound OpRef is the clear.
             let src_val = read_float_reg(code, op, 0, ctx)?;
             let dst = code[op.pc + 2] as usize;
             let len = ctx.registers_f.len();
@@ -17649,7 +17680,17 @@ fn handle<Sym: WalkSym>(
             // num_regs_and_consts_r)`, which `setposition` (RPython
             // `pyjitpl.py`) pre-populates with the const OpRef.
             // No IR op recorded.
-            let src_val = read_ref_reg(code, op, 0, ctx)?;
+            //
+            // `pyjitpl.py` `_opimpl_any_copy` is
+            // `@arguments("box") def _opimpl_any_copy(self, box): return box`.
+            // `copy_constants` fills every register with `MissingValue()`
+            // (None when translated). Copying a never-written register is
+            // legal: dest holds the missing value. Read src without the
+            // unbound check (`read_ref_reg_raw`); an unbound source leaves
+            // dest unbound (`OpRef::NONE`) and clears dest's concrete
+            // shadow so a stale Ref does not survive. A later USE of dest
+            // still raises `RegisterReadUnbound`.
+            let src_val = read_ref_reg_raw(code, op, 0, ctx)?;
             // Propagate the source slot's concrete
             // shadow alongside the symbolic OpRef.  This is the
             // critical chain: catch_exception → seeds last_exc_value
@@ -17660,7 +17701,11 @@ fn handle<Sym: WalkSym>(
             // GUARD_CLASS against.  Without this propagation the
             // copy chain wipes the concrete and silently disables
             // the guard.
-            let src_concrete = read_ref_reg_concrete(code, op, 0, ctx);
+            let src_concrete = if src_val.is_none() {
+                ConcreteValue::Null
+            } else {
+                read_ref_reg_concrete(code, op, 0, ctx)
+            };
             let dst = code[op.pc + 2] as usize;
             // A copy is a link renaming (`flatten.py insert_renamings`,
             // `same_as`). Restoring TOS after the write is what keeps

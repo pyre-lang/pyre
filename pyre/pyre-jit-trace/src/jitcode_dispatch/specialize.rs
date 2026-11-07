@@ -8224,6 +8224,12 @@ fn orthodox_helper_boxed<Sym: WalkSym>(
 /// leaves the trace cut back to the call site.  The descent itself must
 /// produce the concrete; missing it declines rather than allocating a
 /// second shadow.
+///
+/// `_match_signature` is `@jit.unroll_safe`. A constructor that
+/// crosses `trace_limit` is `pyjitpl.py blackhole_if_trace_too_long`
+/// (`SwitchToBlackhole(ABORT_TOO_LONG)`); `do_residual_or_indirect_call`
+/// is the next-trace path after `dont_trace_here`, not a same-walk
+/// residual of the enclosing Python CALL.
 pub(crate) fn try_walker_orthodox_kwargs_dict_new<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -8241,6 +8247,9 @@ pub(crate) fn try_walker_orthodox_kwargs_dict_new<Sym: WalkSym>(
 
 /// Walk `w_dict_store` for one `_match_signature` keyword that named no
 /// parameter (`space.setitem(w_kwds, w_key, w_value)`).
+///
+/// `TraceTooLong` is `pyjitpl.py blackhole_if_trace_too_long` and
+/// propagates; a genuine constructor decline is `Ok(None)`.
 pub(crate) fn try_walker_orthodox_kwargs_dict_setitem<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
