@@ -491,7 +491,12 @@ pub fn decode_instruction_forward_packed(code: &CodeObject, pc: usize) -> u64 {
 /// opcode. The PC projection and the opcode/oparg projection each repeat
 /// that walk; this returns both from the single pass. `usize::MAX` /
 /// `u64::MAX` are the corruption sentinels of the two projections.
+///
+/// The combined return is two words, so a residual cannot publish it.
+/// `@jit.unroll_safe` matches `dispatch_bytecode` and the scalar
+/// projections: the EXTENDED_ARG loop is bounded by the bytecode format.
 #[inline]
+#[majit_macros::unroll_safe]
 pub fn decode_instruction_forward_dispatch(code: &CodeObject, pc: usize) -> (usize, u64) {
     let mut start = pc;
     while start > 0

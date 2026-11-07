@@ -104,6 +104,16 @@ extern "C" fn shadow_stack_try_pop_to_word(depth: i64) {
     majit_gc::shadow_stack::try_pop_to(depth as usize);
 }
 
+/// Word ABI for `majit_gc::shadow_stack::slot_from_cached`. The residual
+/// descr is one unsigned word in and an Address word out; wasm32's
+/// in-module `call_indirect` types that as `(i64) -> i64`.
+extern "C" fn slot_from_cached_word(raw: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::slot_from_cached_word");
+    // SAFETY: residual `raw` is 0 or a word `cache_root_stack_slot` stored
+    // for this thread (`slot_from_cached`).
+    unsafe { majit_gc::shadow_stack::slot_from_cached(raw as usize).as_raw() as i64 }
+}
+
 /// Word ABI for `majit_gc::bh_probe_note_store(usize, usize, u32)`; the
 /// interpreter's traced frame-enter paths call it beside the write barrier.
 extern "C" fn bh_probe_note_store_word(obj: i64, offset: i64, site: i64) {
@@ -2170,6 +2180,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "majit_gc::shadow_stack::try_pop_to",
         shadow_stack_try_pop_to_word,
+    );
+    cp1!(
+        &mut entries,
+        "majit_gc::shadow_stack::slot_from_cached",
+        slot_from_cached_word,
     );
     cp3!(
         &mut entries,
@@ -7367,7 +7382,7 @@ mod tests {
         object_dict_getitem_str_hashed_word, object_dict_getitem_str_word,
         pyframe_load_global_value_word, pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs,
         shadow_stack_get_word, shadow_stack_push_word, shadow_stack_try_pop_to_word,
-        unicode_dict_getitem_str_hashed_word, unicode_dict_getitem_str_word,
+        slot_from_cached_word, unicode_dict_getitem_str_hashed_word, unicode_dict_getitem_str_word,
         w_dict_getitem_str_object_strategy_hashed_word, w_dict_lookup_bytes_strategy_word,
         w_dict_lookup_identity_strategy_word, w_dict_lookup_int_strategy_word,
         w_list_pop_end_inner_word, w_list_pop_end_word, w_module_dict_lookup_object_entries_word,
@@ -7700,12 +7715,16 @@ mod tests {
                 "majit_gc::shadow_stack::try_pop_to",
                 shadow_stack_try_pop_to_word as *const () as usize as i64,
             ),
+            (
+                "majit_gc::shadow_stack::slot_from_cached",
+                slot_from_cached_word as *const () as usize as i64,
+            ),
         ] {
             assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
         }
     }
 
-    /// The three published addresses answer through the word ABI a residual
+    /// The published addresses answer through the word ABI a residual
     /// call reaches them with, and the round trip preserves the reference.
     ///
     /// Calling each through its registry address, transmuted to the signature
@@ -7731,6 +7750,12 @@ mod tests {
         try_pop_to(depth);
         assert_eq!(push(marker), depth, "try_pop_to left the depth unrestored");
         try_pop_to(depth);
+
+        let slot_from_cached: extern "C" fn(i64) -> i64 =
+            unsafe { std::mem::transmute(addr("majit_gc::shadow_stack::slot_from_cached")) };
+        let resolved = slot_from_cached(0);
+        assert_ne!(resolved, 0, "zero raw falls back to the live slot");
+        assert_eq!(slot_from_cached(resolved), resolved);
     }
 
     #[test]

@@ -3,6 +3,47 @@
 use super::std_call::{AtomicClass, interior_deref_root_local, rewrite_interior_index_slots};
 use super::*;
 
+/// `core::cell::...` or Charon dropping the `core::` crate prefix
+/// (`cell::Cell::get`, the same spelling `FOREIGN_STDLIB_EXTERNALS` keys).
+/// User and nestedscope `Cell` keep a crate prefix and stay residual.
+fn is_std_cell_module_path(path: &str) -> bool {
+    path.starts_with("core::cell::")
+        || path.starts_with("std::cell::")
+        || path.starts_with("cell::Cell::")
+        || path.starts_with("cell::<Impl>::")
+}
+
+#[cfg(test)]
+mod std_cell_module_path_tests {
+    use super::is_std_cell_module_path;
+
+    #[test]
+    fn accepts_core_std_and_charon_short_cell_get() {
+        for path in [
+            "core::cell::Cell::get",
+            "std::cell::Cell::get",
+            "cell::Cell::get",
+            "cell::Cell::<Impl>::get",
+            "cell::<Impl>::get",
+            "core::cell::<Impl>::get",
+        ] {
+            assert!(is_std_cell_module_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn rejects_user_and_nestedscope_cell() {
+        for path in [
+            "fixture::Cell::get",
+            "my_crate::Cell::get",
+            "pyre_object::nestedscope::Cell::get",
+            "pyre_object::nestedscope::w_cell_get",
+        ] {
+            assert!(!is_std_cell_module_path(path), "{path}");
+        }
+    }
+}
+
 impl<'a> Lowering<'a> {
     pub(in crate::front::mir) fn lower_call(
         &mut self,
@@ -8992,9 +9033,13 @@ impl<'a> Lowering<'a> {
     }
 
     /// `Cell<T>` is `#[repr(transparent)]` over `T`, so `get` of a field place
-    /// is that field's value read. `core::cell::Cell` only. `RefCell` /
-    /// `OnceCell` / `UnsafeCell` / `LazyCell` do not match: `OnceCell::get`
-    /// returns `Option<&T>`.
+    /// is that field's value read. `core::cell::Cell` only. Charon sometimes
+    /// drops the `core::` crate prefix, emitting `cell::Cell::get` — the
+    /// same spelling `FOREIGN_STDLIB_EXTERNALS` keys. User and nestedscope
+    /// `Cell::get` keep a crate prefix (`fixture::Cell::get`,
+    /// `pyre_object::nestedscope`) and stay residual. `RefCell` / `OnceCell`
+    /// / `UnsafeCell` / `LazyCell` do not match: `OnceCell::get` returns
+    /// `Option<&T>`.
     fn is_cell_get(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -9008,12 +9053,12 @@ impl<'a> Lowering<'a> {
         if let Some((owner, leaf)) = path.rsplit_once("::")
             && leaf_is_get(leaf)
             && owner_is_cell(owner)
-            && path.starts_with("core::cell::")
+            && is_std_cell_module_path(&path)
         {
             return true;
         }
         impl_method_owner_for_fundecl(self.llbc, fd).is_some_and(|(owner, leaf)| {
-            leaf_is_get(&leaf) && owner_is_cell(&owner) && path.starts_with("core::cell::")
+            leaf_is_get(&leaf) && owner_is_cell(&owner) && is_std_cell_module_path(&path)
         })
     }
 

@@ -293,6 +293,10 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "decode_instruction_forward_packed",
         "pyopcode.py dispatch_bytecode EXTENDED_ARG loop (opcode/oparg projection)",
     ),
+    (
+        "decode_instruction_forward_dispatch",
+        "pyopcode.py dispatch_bytecode EXTENDED_ARG loop (pc+packed projection)",
+    ),
     // `ctypefunc.py W_CTypeFunc._call` carries `@jit.unroll_safe`, and the two
     // halves it is split into here both take it: the body that converts the
     // arguments into the libffi exchange buffer, and the `finally` that
