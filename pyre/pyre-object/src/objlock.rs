@@ -77,6 +77,10 @@ impl LockFamily {
         self.acquire_unconditionally(key)
     }
 
+    /// A contended stripe must not be waited on from inside the running-mutator
+    /// census: the owner can allocate under the stripe and request a collection,
+    /// which then waits for this thread while this thread waits for the stripe.
+    /// Leave the census around the blocking acquire (`before_external_block`).
     pub fn acquire_unconditionally(&'static self, key: usize) -> usize {
         let lock = self.stripe(key);
         let guard = if let Some(guard) = lock.try_lock() {
