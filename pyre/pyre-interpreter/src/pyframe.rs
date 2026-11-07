@@ -4079,32 +4079,21 @@ impl PyFrame {
         self.get_w_globals()
     }
 
-    /// `pyframe.py PyFrame.get_w_globals`: the normal case reads the
-    /// promoted code object's first-seen globals. A frame executing a shared
-    /// code object in another namespace carries the override in debugdata.
+    /// `pyframe.py PyFrame.get_w_globals`: debugdata.w_globals when the
+    /// frame carries an override, else `jit.promote(self.pycode).w_globals`.
+    /// [`Self::getcode_w`] is that promote: it makes the code object a
+    /// constant so the `w_globals` read folds.
     ///
-    /// Both arms read a redirected field (`debugdata` via [`Self::getdebug_data`],
-    /// else `pycode`). `hook_access_field` inserts
-    /// `jit_force_virtualizable` on those reads; `jtransform` deletes the
-    /// Call in looked-inside graphs (`pyopcode.py LOAD_GLOBAL` /
-    /// `MAKE_FUNCTION`). pyre residualizes those opcodes through this
-    /// accessor (`bh_load_global_fn`, residual MAKE_FUNCTION), so a native
-    /// force here would abort loops pypy compiles. The residual graph that
-    /// keeps the Call is `typeobject.py ensure_module_attr` inside
-    /// `type_create_new_type`.
+    /// Both arms read a redirected field (`debugdata` / `pycode`).
+    /// `hook_access_field` inserts `jit_force_virtualizable`; `jtransform`
+    /// deletes the Call in looked-inside graphs. A native force here would
+    /// abort residual IMPORT_NAME / MAKE_FUNCTION (`flatten.rs`
+    /// `load_import_globals`).
     #[inline]
     pub fn get_w_globals(&self) -> PyObjectRef {
         if let Some(data) = self.getdebug_data() {
             return data.w_globals;
         }
-        if self.pycode.is_null() {
-            return pyre_object::PY_NULL;
-        }
-        // `pyframe.py get_w_globals` `return jit.promote(self.pycode).w_globals`.
-        // [`Self::getcode_w`] is that promote. Without it the code object
-        // stays a varying value on the trace and the globals read is a load
-        // the optimizer cannot fold; `w_globals` is not a virtualizable
-        // field, so nothing else pins it to a constant.
         unsafe { crate::w_code_get_w_globals(self.getcode_w()) }
     }
 
