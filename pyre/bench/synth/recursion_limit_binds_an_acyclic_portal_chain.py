@@ -1,9 +1,9 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=hot,level0,entry-bridge:level0,entry-bridge:level1,entry-bridge:level2,entry-bridge:level3,entry-bridge:level4,entry-bridge:level5
+# pyre-check: selfcheck-compiles=hot,level0,level1,level2,level3,level4,level5
 # Every Python activation consumes recursion budget, not only an activation
 # whose code object is already present in the live call chain.  The six
-# distinct callees below each carry a loop so a warmed caller can cross their
-# entries through compiled portal/CALL_ASSEMBLER paths.
+# distinct callees below each carry a loop so a warmed caller compiles each
+# of them as its own portal loop.
 #
 # The two limits pin the conservative lower-level check used by PyPy's
 # approximative recursion limit. On this six-callee compiled shape, `base + 5`
