@@ -1656,8 +1656,12 @@ pub(crate) fn constvalue_kind(cv: &ConstValue) -> char {
         | ConstValue::InheritanceId { .. }
         | ConstValue::LLAddress(_)
         | ConstValue::AddressAsInt(_) => 'i',
-        ConstValue::Int128(_) | ConstValue::UInt128(_) | ConstValue::Long(_) => {
+        ConstValue::Int128(_) | ConstValue::UInt128(_) => {
             panic!("getkind: 128-bit integer constant is too large (history.py:62)")
+        }
+        ConstValue::Long(_) => {
+            // `history.getkind`: `NotImplementedError("type %s is too large" % TYPE)`.
+            panic!("getkind: type Long is too large (history.py:62 NotImplementedError)")
         }
         // `history.py getkind`: SingleFloat is stored in an int when
         // supported; LongFloat is too large only when
@@ -1777,6 +1781,23 @@ mod tests {
         var: &crate::flowspace::model::Variable,
     ) -> Register {
         Register::new(RegKind::Int, regallocs[&RegKind::Int].coloring[var])
+    }
+
+    #[test]
+    fn constvalue_kind_long_is_too_large() {
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            constvalue_kind(&ConstValue::Long(malachite_bigint::BigInt::from(1) << 200))
+        }));
+        let payload = panicked.expect_err("history.getkind raises for a too-large constant");
+        let msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .expect("getkind panic is a string");
+        assert!(
+            msg.contains("type Long is too large"),
+            "getkind Long message: {msg}"
+        );
     }
 
     #[test]

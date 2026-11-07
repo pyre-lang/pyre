@@ -1304,7 +1304,9 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         _ => {}
     }
 
-    if args.iter().any(|v| matches!(v, ConstValue::RInt(_, _, _)))
+    if args
+        .iter()
+        .any(|v| matches!(v, ConstValue::RInt(_, _, _) | ConstValue::Long(_)))
         && matches!(
             kind,
             OpKind::Add
@@ -1780,7 +1782,9 @@ fn numeric_i128(v: &ConstValue) -> Option<i128> {
 }
 
 /// Integer-valued constants: `Int`, `UInt`, `Int128`, `UInt128`, `Bool`,
-/// `RInt`. `rint_value` interprets the stored payload by `class.sign`.
+/// `RInt`, `Long`. `rint_value` interprets the stored payload by
+/// `class.sign`. `Long` is the host `long` (`PureOperation.constfold`
+/// → `self.pyfunc(*args)`).
 fn integer_numeric(v: &ConstValue) -> Option<crate::rlib::rarithmetic::RIntValue> {
     use crate::rlib::rarithmetic::{RIntValue, rint_value};
     match v {
@@ -1790,6 +1794,7 @@ fn integer_numeric(v: &ConstValue) -> Option<crate::rlib::rarithmetic::RIntValue
         ConstValue::UInt128(n) => Some(RIntValue::Unsigned(*n)),
         ConstValue::Bool(b) => Some(RIntValue::Signed(i128::from(*b))),
         ConstValue::RInt(c, n, _) => Some(rint_value(*c, n)),
+        ConstValue::Long(n) => Some(RIntValue::SignedBig(n.clone())),
         _ => None,
     }
 }
@@ -1797,7 +1802,7 @@ fn integer_numeric(v: &ConstValue) -> Option<crate::rlib::rarithmetic::RIntValue
 fn const_integer_type(v: &ConstValue) -> Option<crate::annotator::model::KnownType> {
     use crate::annotator::model::KnownType;
     match v {
-        ConstValue::Int(_) => Some(KnownType::Int),
+        ConstValue::Int(_) | ConstValue::Long(_) => Some(KnownType::Int),
         ConstValue::UInt(_) => Some(KnownType::Ruint),
         ConstValue::Int128(_) => Some(KnownType::LongLongLong),
         ConstValue::UInt128(_) => Some(KnownType::ULongLongLong),
@@ -4895,6 +4900,39 @@ mod tests {
         );
         assert_eq!(
             fold(OpKind::Gt, vec![cu(u64::MAX), ci(-1)]),
+            Some(ConstValue::Bool(true)),
+        );
+    }
+
+    #[test]
+    fn constfold_long_add_int_and_eq_int128() {
+        // `PureOperation.constfold` → `self.pyfunc(*args)` on host long.
+        let two_200: BigInt = BigInt::from(1) << 200;
+        assert_eq!(
+            fold(
+                OpKind::Add,
+                vec![c(ConstValue::Long(two_200.clone())), ci(1)]
+            ),
+            Some(ConstValue::Long(two_200 + 1))
+        );
+        assert_eq!(
+            fold(
+                OpKind::Eq,
+                vec![
+                    c(ConstValue::Long(BigInt::from(5))),
+                    c(ConstValue::Int128(5))
+                ]
+            ),
+            Some(ConstValue::Bool(true)),
+        );
+        assert_eq!(
+            fold(
+                OpKind::Ne,
+                vec![
+                    c(ConstValue::Long(BigInt::from(5))),
+                    c(ConstValue::Int128(6))
+                ]
+            ),
             Some(ConstValue::Bool(true)),
         );
     }

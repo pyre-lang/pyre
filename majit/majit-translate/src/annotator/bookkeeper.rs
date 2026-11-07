@@ -5736,9 +5736,14 @@ impl Bookkeeper {
                 Ok(SomeValue::Integer(s))
             }
             ConstValue::Long(i) => {
-                let mut s = SomeInteger::new(*i >= malachite_bigint::BigInt::from(0), false);
-                s.base.const_box = Some(Constant::new(x.clone()));
-                Ok(SomeValue::Integer(s))
+                // `Bookkeeper.immutablevalue` `tp is long`: a value
+                // outside `[-sys.maxint-1, sys.maxint]` raises
+                // `ValueError("seeing a prebuilt long (value %s)" % hex(x))`.
+                // `ConstValue::Long` is that case by construction.
+                Err(AnnotatorError::new(format!(
+                    "seeing a prebuilt long (value {})",
+                    python_hex_long(i)
+                )))
             }
             ConstValue::RInt(_, _, _) => {
                 // `immutablevalue` consults `extregistry.is_registered(x)`
@@ -6140,6 +6145,15 @@ impl Default for Bookkeeper {
     }
 }
 
+/// Python `hex(x)` of a host integer (`Bookkeeper.immutablevalue` long arm).
+fn python_hex_long(n: &malachite_bigint::BigInt) -> String {
+    if n < &malachite_bigint::BigInt::from(0) {
+        format!("-0x{:x}", -n.clone())
+    } else {
+        format!("0x{:x}", n)
+    }
+}
+
 /// The `::`-qualified keys of a field registry, indexed for [`is_bare_leaf_alias`].
 struct QualifiedKeys<'a> {
     /// `(struct id, key)` for qualified keys that have a struct id, sorted.
@@ -6287,15 +6301,20 @@ fn intern_class_key_from_registry(
         }
     }
     if reg.fields.get_key_value(lookup).is_some() {
-        // A qualified exact key is identity (`m::T` vs `outer::m::T`).
-        // A bare leaf may be harvest's dual-published alias of one
-        // qualified declaration (`is_bare_leaf_alias`); intern as that
-        // declaration so `[PyObject]` and `pyobject::PyObject` share a
-        // class (`Bookkeeper.getdesc`).
+        // `Bookkeeper.getdesc` keys on the class object. A qualified
+        // exact key is identity (`m::T` vs `outer::m::T`). A bare leaf
+        // intern's as a qualified declaration only when harvest wrote
+        // `class_identity[leaf] = Some(ClassIdentity { id, spelling })`
+        // of that declaration (`front/mir.rs` crate-prefix
+        // requalification). Function entry already returns
+        // `ci.spelling` for any identity hit; this arm is the same
+        // record with the fields-key gate.
         if !lookup.contains("::")
-            && let Some(key) = unique_path_suffix_identity(reg, lookup)
+            && let Some(Some(ci)) = reg.class_identity.get(lookup)
+            && ci.spelling != lookup
+            && reg.fields.contains_key(&ci.spelling)
         {
-            return key;
+            return reattach_instantiation_suffix(&ci.spelling, lookup);
         }
         return lookup.to_string();
     }
@@ -9598,6 +9617,32 @@ mod tests {
     }
 
     #[test]
+    fn intern_bare_leaf_without_alias_record_stays_its_own_key() {
+        // `Bookkeeper.getdesc` keys on the class object. A dual-publish
+        // leaf without `class_identity` is not harvest's alias of the
+        // qualified key; uniqueness of a path suffix is not proof.
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "a::Dup".to_string(),
+            vec![("left".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "Dup".to_string(),
+            vec![("left".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        assert_eq!(bk.intern_class_key("Dup"), "Dup");
+        let leaf = bk.intern_class_by_qualname("Dup");
+        let qualified = bk.intern_class_by_qualname("a::Dup");
+        assert_ne!(leaf, qualified);
+        let leaf_cd = bk.getuniqueclassdef(&leaf).expect("Dup classdef");
+        let qualified_cd = bk.getuniqueclassdef(&qualified).expect("a::Dup classdef");
+        assert!(!Rc::ptr_eq(&leaf_cd, &qualified_cd));
+    }
+
+    #[test]
     fn header_struct_spellings_reuse_one_class_identity_and_base() {
         use crate::front::StructFieldRegistry;
 
@@ -12413,6 +12458,21 @@ mod tests {
             }
             other => panic!("expected SomeInteger, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn immutablevalue_long_raises_value_error() {
+        let bk = bk();
+        let n = malachite_bigint::BigInt::from(1) << 200;
+        let err = bk
+            .immutablevalue(&ConstValue::Long(n))
+            .expect_err("Bookkeeper.immutablevalue long arm");
+        assert_eq!(
+            err.msg.as_deref(),
+            Some(
+                "seeing a prebuilt long (value 0x100000000000000000000000000000000000000000000000000)"
+            )
+        );
     }
 
     #[test]

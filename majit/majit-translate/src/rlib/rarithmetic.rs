@@ -597,7 +597,15 @@ pub fn compute_restype(self_type: KnownType, other_type: KnownType) -> KnownType
 pub fn construct_int_type(restype: KnownType, value: RIntValue) -> Option<ConstValue> {
     match restype {
         KnownType::Float => Some(ConstValue::float(value.as_f64())),
-        KnownType::Int => i64::try_from(&value.to_bigint()).ok().map(ConstValue::Int),
+        // `base_int._widen` → `restype(value)`. Host `int` of a value
+        // outside the signed word is a `long`.
+        KnownType::Int => {
+            let v = value.to_bigint();
+            Some(match i64::try_from(&v) {
+                Ok(n) => ConstValue::Int(n),
+                Err(_) => ConstValue::Long(v),
+            })
+        }
         KnownType::Bool => Some(ConstValue::Bool(!value.is_zero())),
         KnownType::RInt(c) => rint_new(c, value.to_bigint()).ok(),
         KnownType::Rint | KnownType::LongLong => {
@@ -1102,6 +1110,19 @@ mod tests {
         let min8 = -max8.clone() - 1;
         assert_eq!(min8, BigInt::from(-128));
         assert_eq!(max8, BigInt::from(127));
+    }
+
+    #[test]
+    fn construct_int_type_int_emits_long_outside_signed_word() {
+        let big: BigInt = (BigInt::from(1) << 200) + 1;
+        assert_eq!(
+            construct_int_type(KnownType::Int, RIntValue::SignedBig(big.clone())),
+            Some(ConstValue::Long(big))
+        );
+        assert_eq!(
+            construct_int_type(KnownType::Int, RIntValue::Signed(7)),
+            Some(ConstValue::Int(7))
+        );
     }
 
     #[test]
