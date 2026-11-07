@@ -40,6 +40,63 @@ pub(in crate::front::mir) struct RawScalarAddressGroup {
     pub(in crate::front::mir) is_item_signed: bool,
 }
 
+/// One non-void field copied into a storage-raw spill allocation.
+#[derive(Clone)]
+pub(in crate::front::mir) struct StorageRawField {
+    pub(in crate::front::mir) name: String,
+    pub(in crate::front::mir) ty: ValueType,
+    pub(in crate::front::mir) host_index: Option<(u32, u32)>,
+}
+
+/// `jtransform.py rewrite_op_setfield` refuses `setfield_raw_r`. A GC
+/// pointer field cannot live in the raw malloc spill.
+fn storage_raw_field_is_gc_ref(ty: &ValueType) -> bool {
+    matches!(
+        ty,
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder
+    )
+}
+
+/// Residual call argument that is a borrow of a storage-raw local.
+/// The declared parameter is the address (`history.getkind` of
+/// `Ptr(TO)` raw); the actual is still the virtual aggregate.
+/// `one_word` is a cross-crate Opaque whose defining layout is one
+/// content word (`RootScope::pin_roots`): extract that field, do not
+/// malloc a pointer.
+pub(in crate::front::mir) struct StorageRawBorrowSpill {
+    pub(in crate::front::mir) fun_id: u64,
+    pub(in crate::front::mir) index: usize,
+    pub(in crate::front::mir) copy_out: bool,
+    pub(in crate::front::mir) one_word: bool,
+    pub(in crate::front::mir) owner: String,
+    pub(in crate::front::mir) owner_id: Option<majit_ir::descr::StructId>,
+    pub(in crate::front::mir) fields: Vec<StorageRawField>,
+}
+
+pub(in crate::front::mir) struct StorageRawReload {
+    pub(in crate::front::mir) ptr: Variable,
+    /// Virtual aggregate copied into `ptr`. Copy-out writes these fields
+    /// back so an `&mut self` mutation is visible on the local.
+    pub(in crate::front::mir) word: Variable,
+    pub(in crate::front::mir) copy_out: bool,
+    pub(in crate::front::mir) one_word: bool,
+    pub(in crate::front::mir) owner: String,
+    pub(in crate::front::mir) owner_id: Option<majit_ir::descr::StructId>,
+    pub(in crate::front::mir) fields: Vec<StorageRawField>,
+}
+
+/// One raw allocation covering every argument that aliases the same
+/// virtual multi-word storage-raw value.
+struct StorageRawAddressGroup {
+    indices: Vec<usize>,
+    word: Variable,
+    copy_out: bool,
+    one_word: bool,
+    owner: String,
+    owner_id: Option<majit_ir::descr::StructId>,
+    fields: Vec<StorageRawField>,
+}
+
 /// Where an address-sized integer's bits came from.
 pub(in crate::front::mir) enum SpillAddressSource {
     /// `const_expr_literal` integer. The bits are not a spill address.
@@ -1628,6 +1685,558 @@ impl<'a> Lowering<'a> {
             });
         }
         Ok(())
+    }
+
+    /// Residual parameters whose declared type is a raw address of a
+    /// multi-word storage-raw ADT and whose operand is still that
+    /// aggregate (a borrow, or the by-value local `Rvalue::Ref` aliases).
+    ///
+    /// `history.getkind` banks `Ptr(TO)` raw as `int`. `Rvalue::Ref` of
+    /// a local aliases the virtual (`emit_aggregate_ctor` is still
+    /// `Ref`), so the call would pass the aggregate where the callee
+    /// FieldReads through a pointer (`RootedItems::get`). A one-word
+    /// value is already the content word (`root_scope_close`) and is
+    /// not spilled here. An interior address
+    /// (`rewrite_op_getsubstruct`) is already Int and is skipped at
+    /// install. By-value stays the virtual so an inline field of a GC
+    /// object keeps those words. Cross-crate the defining TypeDecl is
+    /// Opaque; harvest `raw_word_owners` and `struct_fields` name it.
+    pub(in crate::front::mir) fn storage_raw_borrow_spills(
+        &self,
+        func: &CallFunc,
+        arg_tys: &[Option<TyRef>],
+    ) -> Vec<StorageRawBorrowSpill> {
+        let CallFunc::Regular(reg) = func else {
+            return Vec::new();
+        };
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return Vec::new();
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Vec::new();
+        };
+        let mut spills = Vec::new();
+        for (index, declared) in fd.signature.inputs.iter().enumerate() {
+            let Some(param_node) = tyref_peel_one_ref_node(declared, self.llbc)
+                .or_else(|| tyref_peel_one_raw_ptr_node(declared, self.llbc))
+            else {
+                continue;
+            };
+            let pointee = TyRef::Other(param_node.clone());
+            // Same-crate one-word paint is already the content word
+            // (`tyref_is_one_word_storage_raw_value`). A published copy
+            // (`apply_published_structs`) is also one-word storage-raw,
+            // but `opaque_traced_method_self_root` may have recast that
+            // word to a Ref instance. Collect here; install skips a
+            // Signed actual and rebinds a recast to the word.
+            if !self.pointee_is_storage_raw_spill_owner(&pointee) {
+                continue;
+            }
+            let Some((owner, owner_id, fields)) = self.storage_raw_spill_shape(&pointee) else {
+                continue;
+            };
+            let one_word = !self.storage_raw_shape_is_multi_word(&pointee, &fields);
+            let Some(passed) = arg_tys.get(index).and_then(Option::as_ref) else {
+                continue;
+            };
+            if tyref_is_raw_pointer(passed, self.llbc) {
+                continue;
+            }
+            // A Signed actual is already the content word or the
+            // interior address; install skips it. A recast of that
+            // word (`opaque_traced_method_self_root`) leaves a Ref
+            // current (`RootScope::get`) and must still collect so
+            // install rebinds to the word. Extracting a true `&E`
+            // pointer that is already Signed would pass `e.x`; that
+            // actual is Signed and is skipped at install.
+            if !tyref_is_storage_raw_spill_actual(
+                passed,
+                self.llbc,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            ) && !self.tyref_is_virtual_of_storage_raw_pointee(passed, &pointee)
+            {
+                continue;
+            }
+            // Identity-alias of `&mut` is the by-value local; copy-out
+            // still writes that virtual (`emit_storage_raw_field_copy`).
+            // One-word ABI is the content word (`history.getkind` int);
+            // the callee cannot store through it.
+            let copy_out = !one_word
+                && ref_kind_is_mut(declared, self.llbc)
+                && (ref_kind_is_mut(passed, self.llbc)
+                    || tyref_peel_one_ref_node(passed, self.llbc).is_none());
+            spills.push(StorageRawBorrowSpill {
+                fun_id: *id,
+                index,
+                copy_out,
+                one_word,
+                owner,
+                owner_id,
+                fields,
+            });
+        }
+        spills
+    }
+
+    /// Owner, layout identity, and non-void fields of a storage-raw
+    /// pointee. `CallControl::struct_layout_for` sizes
+    /// `lltype.malloc(..., flavor='raw')` from that owner
+    /// (`rewrite_op_raw_malloc`). An Opaque TypeDecl (cross-crate
+    /// `RootedItems`) has no field list; harvest `struct_fields` does.
+    fn storage_raw_spill_shape(
+        &self,
+        pointee: &TyRef,
+    ) -> Option<(
+        String,
+        Option<majit_ir::descr::StructId>,
+        Vec<StorageRawField>,
+    )> {
+        let node = tyref_node(pointee, self.llbc)
+            .and_then(|node| strip_ty_indirections(node, self.llbc))?;
+        let def_id = adt_node_def_id(node)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        let owner =
+            super::class_identity_spelling(&td.item_meta.name_path(), self.tombstoned_leaves);
+        if owner.is_empty() {
+            return None;
+        }
+        let owner_leaf = owner.rsplit("::").next().unwrap_or(owner.as_str());
+        if majit_charon_reader::ullbc::is_closure_leaf(owner_leaf) {
+            return None;
+        }
+        let owner_id = Some(super::struct_id_for_type_decl(td));
+        if let Some(decls) = type_decl_struct_fields(td, self.llbc) {
+            let mut fields = Vec::new();
+            for (i, field) in decls.iter().enumerate() {
+                // Void occupies no storage (`heaptracker.py`
+                // `_names_without_voids`). `PhantomData` is size 0
+                // (`type_str_leaf_is_void_zst`); a trailing ZST must
+                // not become a GC-ref field (`RootScope._not_send`).
+                if tyref_is_void_zst(&field.ty, self.llbc)
+                    || tyref_is_zero_sized(&field.ty, self.llbc)
+                {
+                    continue;
+                }
+                let name = super::field_decl_name(i, field);
+                let ty = self.named_field_value_type(pointee, &name)?;
+                if ty == ValueType::Void {
+                    continue;
+                }
+                if storage_raw_field_is_gc_ref(&ty) {
+                    return None;
+                }
+                fields.push(StorageRawField {
+                    name,
+                    ty,
+                    host_index: host_field_index(None, i),
+                });
+            }
+            if fields.is_empty() {
+                return None;
+            }
+            return Some((owner, owner_id, fields));
+        }
+        let rows = self.struct_fields?.field_rows(&owner)?;
+        let mut fields = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            if row.name == "typeptr" || row.name.starts_with("c__pad") {
+                continue;
+            }
+            let ty = self.harvested_storage_raw_field_value_type(&row.ty)?;
+            if ty == ValueType::Void {
+                continue;
+            }
+            if storage_raw_field_is_gc_ref(&ty) {
+                return None;
+            }
+            fields.push(StorageRawField {
+                name: row.name.clone(),
+                ty,
+                host_index: host_field_index(None, i),
+            });
+        }
+        if fields.is_empty() {
+            return None;
+        }
+        Some((owner, owner_id, fields))
+    }
+
+    pub(in crate::front::mir) fn pointee_is_storage_raw_spill_owner(
+        &self,
+        pointee: &TyRef,
+    ) -> bool {
+        if tyref_is_storage_raw_value(
+            pointee,
+            self.llbc,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        ) {
+            return true;
+        }
+        self.tyref_is_harvested_raw_word_owner(pointee)
+    }
+
+    fn tyref_is_harvested_raw_word_owner(&self, ty: &TyRef) -> bool {
+        let Some(reg) = self.struct_fields else {
+            return false;
+        };
+        let Some(node) =
+            tyref_node(ty, self.llbc).and_then(|node| strip_ty_indirections(node, self.llbc))
+        else {
+            return false;
+        };
+        if flavor_raw_adt_node(node, self.llbc, &self.raw_alloc_flavor_structs) {
+            return false;
+        }
+        let Some(def_id) = adt_node_def_id(node) else {
+            return false;
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return false;
+        };
+        let path = td.item_meta.name_path();
+        let stripped = strip_crate_prefix(&path);
+        if struct_id_is_declared_gc(
+            self.gc_struct_ids,
+            super::struct_id_for_type_decl(td),
+            &stripped,
+        ) {
+            return false;
+        }
+        let identity = super::class_identity_spelling(&path, self.tombstoned_leaves);
+        let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+        reg.raw_word_owners.contains(&identity)
+            || reg.raw_word_owners.contains(&path)
+            || reg.raw_word_owners.contains(&stripped)
+            || reg.raw_word_owners.contains(leaf)
+    }
+
+    fn tyref_owner_spelling(&self, ty: &TyRef) -> Option<String> {
+        let node =
+            tyref_node(ty, self.llbc).and_then(|node| strip_ty_indirections(node, self.llbc))?;
+        let def_id = adt_node_def_id(node)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        let spelling =
+            super::class_identity_spelling(&td.item_meta.name_path(), self.tombstoned_leaves);
+        (!spelling.is_empty()).then_some(spelling)
+    }
+
+    fn tyref_is_virtual_of_storage_raw_pointee(&self, passed: &TyRef, pointee: &TyRef) -> bool {
+        if tyref_is_raw_pointer(passed, self.llbc) {
+            return false;
+        }
+        let Some(passed_node) = tyref_peel_one_ref_node(passed, self.llbc).or_else(|| {
+            tyref_node(passed, self.llbc).and_then(|node| strip_ty_indirections(node, self.llbc))
+        }) else {
+            return false;
+        };
+        let Some(pointee_node) =
+            tyref_node(pointee, self.llbc).and_then(|node| strip_ty_indirections(node, self.llbc))
+        else {
+            return false;
+        };
+        match (adt_node_def_id(passed_node), adt_node_def_id(pointee_node)) {
+            (Some(a), Some(b)) if a == b => true,
+            _ => {
+                self.tyref_owner_spelling(&TyRef::Other(passed_node.clone()))
+                    == self.tyref_owner_spelling(pointee)
+                    && self.tyref_owner_spelling(pointee).is_some()
+            }
+        }
+    }
+
+    fn storage_raw_shape_is_multi_word(&self, pointee: &TyRef, fields: &[StorageRawField]) -> bool {
+        let word = crate::layout::target_word_size() as i64;
+        if let Some(node) =
+            tyref_node(pointee, self.llbc).and_then(|node| strip_ty_indirections(node, self.llbc))
+            && let Some(size) = json_ty_byte_size(node, self.llbc)
+        {
+            return size > word;
+        }
+        fields.len() > 1
+    }
+
+    fn harvested_storage_raw_field_value_type(&self, type_str: &str) -> Option<ValueType> {
+        if crate::call::type_str_leaf_is_void_zst(type_str) {
+            return Some(ValueType::Void);
+        }
+        if self.harvested_type_str_is_raw_word_owner(type_str) {
+            return Some(ValueType::Int);
+        }
+        Some(super::tuple_field_value_type(type_str))
+    }
+
+    fn harvested_type_str_is_raw_word_owner(&self, type_str: &str) -> bool {
+        let Some(reg) = self.struct_fields else {
+            return false;
+        };
+        let stripped = type_str.trim();
+        let leaf = stripped.rsplit("::").next().unwrap_or(stripped);
+        reg.raw_word_owners.contains(stripped) || reg.raw_word_owners.contains(leaf)
+    }
+
+    /// Result of an `OpKind::Input` in this graph: a parameter, not a
+    /// constructed virtual. One-word extract of that pointer would
+    /// FieldRead a field of `e` (`raw_ptr_method_call`).
+    fn var_is_graph_input(&self, var: &Variable) -> bool {
+        self.graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(op.kind, OpKind::Input { .. }) && op.result.as_ref() == Some(var)
+            })
+        })
+    }
+
+    /// `lltype.malloc(..., flavor='raw')` of the pointee, copy the
+    /// virtual fields in, and pass that pointer. Arguments that alias
+    /// one Variable share the allocation. An actual that is already
+    /// Signed is an interior address (`rewrite_op_getsubstruct`) and is
+    /// left alone. A later recast of the same virtual
+    /// (`opaque_traced_method_self_root`) still copies from
+    /// `resolved_args`. `&mut` copy-out is [`reload_storage_raw_addresses`].
+    pub(in crate::front::mir) fn install_storage_raw_address_call(
+        &mut self,
+        mir_bb: usize,
+        op_kind: &mut OpKind,
+        spills: &[StorageRawBorrowSpill],
+        resolved_args: &[Variable],
+    ) -> Result<Vec<StorageRawReload>, LowerError> {
+        if spills.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fun_id = spills[0].fun_id;
+        let groups = {
+            let OpKind::Call { target, args, .. } = &*op_kind else {
+                return Ok(Vec::new());
+            };
+            if !self.call_target_is_fun(target, fun_id) || args.len() != resolved_args.len() {
+                return Ok(Vec::new());
+            }
+            let mut groups: Vec<StorageRawAddressGroup> = Vec::new();
+            for spill in spills {
+                if spill.fun_id != fun_id {
+                    continue;
+                }
+                let Some(arg) = args.get(spill.index).and_then(LinkArg::as_variable) else {
+                    continue;
+                };
+                // Already the content word or an interior address
+                // (`rewrite_op_getsubstruct`). A recast of that word
+                // (`opaque_traced_method_self_root`) leaves a Ref
+                // current while `resolved_args` is still Signed; that
+                // case rebinds to the word below, it is not skipped.
+                if crate::model::FunctionGraph::concretetype_of(arg)
+                    == crate::model::ConcreteType::Signed
+                {
+                    continue;
+                }
+                // `fn f(e: &E) { e.m() }`: the current arg is the
+                // pointer Input itself, possibly unstamped. Extracting
+                // would FieldRead `e.x`. A leftover virtual
+                // (`emit_aggregate_ctor` dest, same Variable, Unknown)
+                // is not an Input: extract the content word
+                // (`RootScope::get`). A recast uses a different
+                // Variable and falls through.
+                if spill.one_word
+                    && arg == &resolved_args[spill.index]
+                    && self.var_is_graph_input(arg)
+                {
+                    continue;
+                }
+                if let Some(group) = groups
+                    .iter_mut()
+                    .find(|group| group.word == resolved_args[spill.index])
+                {
+                    group.indices.push(spill.index);
+                    group.copy_out |= spill.copy_out;
+                    group.one_word &= spill.one_word;
+                    continue;
+                }
+                groups.push(StorageRawAddressGroup {
+                    indices: vec![spill.index],
+                    word: resolved_args[spill.index].clone(),
+                    copy_out: spill.copy_out,
+                    one_word: spill.one_word,
+                    owner: spill.owner.clone(),
+                    owner_id: spill.owner_id,
+                    fields: spill.fields.clone(),
+                });
+            }
+            groups
+        };
+        let mut reloads = Vec::new();
+        let mut replacements = Vec::new();
+        for group in groups {
+            let already_word = crate::model::FunctionGraph::concretetype_of(&group.word)
+                == crate::model::ConcreteType::Signed;
+            let ptr = if already_word {
+                // Content word (`RootScope.save_point`) or interior
+                // address. Pass it; a recast of this Variable is the
+                // current Call arg and is overwritten.
+                group.word.clone()
+            } else if group.one_word {
+                self.emit_storage_raw_word_extract(mir_bb, &group)
+            } else {
+                let bb_id = self.emit_bb(mir_bb);
+                let ptr = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(ptr.clone()),
+                    kind: OpKind::raw_malloc(group.owner.clone(), false, None),
+                });
+                self.emit_storage_raw_field_copy(
+                    mir_bb,
+                    &group.word,
+                    false,
+                    &ptr,
+                    true,
+                    &group.owner,
+                    group.owner_id,
+                    &group.fields,
+                );
+                ptr
+            };
+            for index in &group.indices {
+                replacements.push((*index, ptr.clone()));
+            }
+            reloads.push(StorageRawReload {
+                ptr,
+                word: group.word,
+                copy_out: group.copy_out,
+                one_word: group.one_word,
+                owner: group.owner,
+                owner_id: group.owner_id,
+                fields: group.fields,
+            });
+        }
+        let OpKind::Call { args, .. } = op_kind else {
+            return Ok(reloads);
+        };
+        for (index, ptr) in replacements {
+            args[index] = LinkArg::Value(ptr);
+        }
+        Ok(reloads)
+    }
+
+    /// Read a mutable storage-raw out-parameter back into the virtual
+    /// aggregate, then free the spill. The original Variable is the
+    /// ctor result; FieldWrite with `base_is_deref false` updates those
+    /// words so a later FieldRead of the local sees the callee's store.
+    pub(in crate::front::mir) fn reload_storage_raw_addresses(
+        &mut self,
+        mir_bb: usize,
+        reloads: &[StorageRawReload],
+    ) -> Result<(), LowerError> {
+        for reload in reloads {
+            if reload.one_word || reload.ptr == reload.word {
+                continue;
+            }
+            if reload.copy_out {
+                self.emit_storage_raw_field_copy(
+                    mir_bb,
+                    &reload.ptr,
+                    true,
+                    &reload.word,
+                    false,
+                    &reload.owner,
+                    reload.owner_id,
+                    &reload.fields,
+                );
+            }
+            let bb_id = self.emit_bb(mir_bb);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::RawFree {
+                    ptr: reload.ptr.clone(),
+                },
+            });
+        }
+        Ok(())
+    }
+
+    /// Content word of a one-word Opaque storage-raw virtual
+    /// (`RootScope.save_point`). Same-crate paint already interned that
+    /// word (`tyref_is_one_word_storage_raw_value`); this is the
+    /// cross-crate TypeDeclKind::Opaque case.
+    fn emit_storage_raw_word_extract(
+        &mut self,
+        mir_bb: usize,
+        group: &StorageRawAddressGroup,
+    ) -> Variable {
+        let field = match group.fields.first() {
+            Some(field) => field,
+            None => {
+                return self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+            }
+        };
+        let loaded = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        let src_field = FieldDescriptor::new(field.name.clone(), Some(group.owner.clone()))
+            .with_owner_id(group.owner_id)
+            .with_base_is_deref(false)
+            .with_host_index(field.host_index);
+        let bb_id = self.emit_bb(mir_bb);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(loaded.clone()),
+            kind: OpKind::FieldRead {
+                base: group.word.clone(),
+                field: src_field,
+                ty: field.ty.clone(),
+                pure: false,
+            },
+        });
+        loaded
+    }
+
+    fn emit_storage_raw_field_copy(
+        &mut self,
+        mir_bb: usize,
+        src: &Variable,
+        src_is_ptr: bool,
+        dest: &Variable,
+        dest_is_ptr: bool,
+        owner: &str,
+        owner_id: Option<majit_ir::descr::StructId>,
+        fields: &[StorageRawField],
+    ) {
+        let bb_id = self.emit_bb(mir_bb);
+        for field in fields {
+            let loaded = self
+                .graph
+                .alloc_value_var_with_type(concretetype_for_field(&field.ty));
+            let src_field = FieldDescriptor::new(field.name.clone(), Some(owner.to_string()))
+                .with_owner_id(owner_id)
+                .with_owner_declared_gc(src_is_ptr.then_some(false))
+                .with_base_is_deref(src_is_ptr)
+                .with_host_index(field.host_index);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(loaded.clone()),
+                kind: OpKind::FieldRead {
+                    base: src.clone(),
+                    field: src_field,
+                    ty: field.ty.clone(),
+                    pure: false,
+                },
+            });
+            let dest_field = FieldDescriptor::new(field.name.clone(), Some(owner.to_string()))
+                .with_owner_id(owner_id)
+                .with_owner_declared_gc(dest_is_ptr.then_some(false))
+                .with_base_is_deref(dest_is_ptr)
+                .with_host_index(field.host_index);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: dest.clone(),
+                    field: dest_field,
+                    value: LinkArg::Value(loaded),
+                    ty: field.ty.clone(),
+                },
+            });
+        }
     }
 
     pub(in crate::front::mir) fn argument_borrow_place(&self, local: usize) -> Option<Place> {

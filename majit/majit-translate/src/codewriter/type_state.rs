@@ -861,6 +861,28 @@ fn cast_insertion_index(block: &crate::model::Block, operand: &Variable) -> usiz
     index
 }
 
+/// True when `var` is the dest of `getfield_raw` of an Int/Unsigned field
+/// on a raw owner. `rewrite_op_getfield` banks that dest as `getkind(RESULT)`
+/// (`'i'`). Restamping it `GcRef` for a Ref successor assembles
+/// `getfield_raw_r`, which the assembler refuses.
+fn is_raw_int_field_read_result(graph: &FunctionGraph, var: &Variable) -> bool {
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            op.result
+                .as_ref()
+                .is_some_and(|result| result.id() == var.id())
+                && matches!(
+                    &op.kind,
+                    OpKind::FieldRead {
+                        ty: ValueType::Int | ValueType::Unsigned,
+                        field,
+                        ..
+                    } if field.owner_declared_gc == Some(false)
+                )
+        })
+    })
+}
+
 /// A merge mints a fresh inputarg. Promoting that phi, or `SSA_to_SSI`
 /// threading one afterwards, leaves the predecessor's own variable
 /// `Signed`, and `flatten.py` `insert_renamings` then copies an int into
@@ -886,26 +908,73 @@ pub(crate) fn align_gc_link_args(graph: &mut FunctionGraph) {
     };
     loop {
         let mut changed = false;
-        for block in &graph.blocks {
-            for link in &block.exits {
+        let mut redirects: Vec<(usize, usize, usize, Variable)> = Vec::new();
+        for (block_index, block) in graph.blocks.iter().enumerate() {
+            for (exit_index, link) in block.exits.iter().enumerate() {
                 let Some(target) = graph.blocks.iter().find(|b| b.id == link.target) else {
                     continue;
                 };
-                for (arg, input) in link.args.iter().zip(target.inputargs.iter()) {
+                for (arg_index, (arg, input)) in
+                    link.args.iter().zip(target.inputargs.iter()).enumerate()
+                {
                     let Some(var) = arg.as_variable() else {
                         continue;
                     };
                     let arg_ty = FunctionGraph::concretetype_of(var);
                     let in_ty = FunctionGraph::concretetype_of(input);
                     if in_ty == ConcreteType::GcRef && soft(&arg_ty) {
-                        FunctionGraph::set_concretetype_of_inline(var, ConcreteType::GcRef);
-                        changed = true;
+                        if is_raw_int_field_read_result(graph, var) {
+                            // `lltype.cast_int_to_ptr` (`ann_cast_int_to_ptr`):
+                            // the getfield dest stays Signed (`getfield_raw_i`).
+                            redirects.push((block_index, exit_index, arg_index, var.clone()));
+                        } else {
+                            FunctionGraph::set_concretetype_of_inline(var, ConcreteType::GcRef);
+                            changed = true;
+                        }
                     } else if arg_ty == ConcreteType::GcRef && soft_phi(&in_ty, link.target) {
                         FunctionGraph::set_concretetype_of_inline(input, ConcreteType::GcRef);
                         changed = true;
                     }
                 }
             }
+        }
+        if !redirects.is_empty() {
+            let mut built: Vec<(usize, usize, usize, usize, SpaceOperation, Variable)> =
+                Vec::with_capacity(redirects.len());
+            for (seq, (block_index, exit_index, arg_index, src)) in
+                redirects.into_iter().enumerate()
+            {
+                let at = cast_insertion_index(&graph.blocks[block_index], &src);
+                let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+                built.push((
+                    seq,
+                    at,
+                    block_index,
+                    exit_index,
+                    SpaceOperation {
+                        result: Some(result.clone()),
+                        kind: OpKind::UnaryOp {
+                            op: "cast_int_to_ptr".into(),
+                            operand: src,
+                            result_ty: ValueType::Ref(None),
+                        },
+                    },
+                    result,
+                ));
+                graph.blocks[block_index].exits[exit_index].args[arg_index] =
+                    LinkArg::Value(built.last().expect("just pushed").5.clone());
+            }
+            built.sort_by(|left, right| {
+                right
+                    .2
+                    .cmp(&left.2)
+                    .then(right.1.cmp(&left.1))
+                    .then(right.0.cmp(&left.0))
+            });
+            for (_, at, block_index, _, op, _) in built {
+                graph.blocks[block_index].operations.insert(at, op);
+            }
+            changed = true;
         }
         if !changed {
             break;
@@ -1136,21 +1205,19 @@ pub(crate) fn field_owner_is_gc(
     if field.is_vtable_method_slot() {
         return false;
     }
-    // The front records `Struct._gckind` on the descriptor. A Raw owner
-    // stays a raw address even when this `CallControl` has no layout
-    // registered for the leaf name (`getattr(..., '_gckind', 'gc')` is
-    // the fallback only when the producer did not record a kind).
-    if let Some(declared_gc) = field.owner_declared_gc {
-        return declared_gc;
-    }
+    // The embedding's `struct_storage` row is `STRUCT._gckind` itself; the
+    // front's structural stamp is used only when no row exists.
     let Some(owner) = field.owner_root.as_deref() else {
-        return true;
+        return field.owner_declared_gc.unwrap_or(true);
     };
     let Some(cc) = callcontrol else {
-        return true;
+        return field.owner_declared_gc.unwrap_or(true);
     };
     if let Some((is_gc, _)) = cc.struct_storage_for(owner) {
         return is_gc;
+    }
+    if let Some(declared_gc) = field.owner_declared_gc {
+        return declared_gc;
     }
     match cc.declared_gckind_for(owner) {
         Some(crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw) => false,
@@ -1686,6 +1753,51 @@ mod tests {
             &op.kind,
             OpKind::BinOp { lhs, .. } if lhs.id() == base.id()
         )));
+    }
+
+    #[test]
+    fn align_gc_link_args_casts_a_raw_int_field_read_instead_of_restamping() {
+        let mut graph = FunctionGraph::new("raw_int_field_read_return");
+        let base = push_input(&mut graph, "self", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
+        let read = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base.clone(),
+                    field: FieldDescriptor::new("ptr", Some("SpaceActionFlag".into()))
+                        .with_owner_declared_gc(Some(false)),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&read, ConcreteType::Signed);
+        let ret_arg = graph.block(graph.returnblock).inputargs[0].clone();
+        FunctionGraph::set_concretetype_of_inline(&ret_arg, ConcreteType::GcRef);
+        graph.set_return(graph.startblock, Some(read.clone()));
+
+        align_gc_link_args(&mut graph);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&read),
+            ConcreteType::Signed,
+            "getfield_raw dest stays Signed so rewrite_op_getfield emits getfield_raw_i"
+        );
+        let passed = graph.block(graph.startblock).exits[0].args[0]
+            .as_variable()
+            .expect("cast result")
+            .clone();
+        assert_ne!(passed.id(), read.id());
+        assert_eq!(FunctionGraph::concretetype_of(&passed), ConcreteType::GcRef);
+        assert!(graph.block(graph.startblock).operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, operand, .. }
+                    if op == "cast_int_to_ptr" && operand.id() == read.id()
+            )
+        }));
     }
 
     #[test]

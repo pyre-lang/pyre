@@ -1605,6 +1605,86 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// `getfield_raw_i` of a raw pointer field, then `lltype.cast_int_to_ptr`
+    /// (`ann_cast_int_to_ptr`) when that word is used as a Ref dest.
+    /// `rewrite_op_getfield` banks the dest as `getkind(RESULT)`; aliasing
+    /// the dest as the Ref lets `align_gc_link_args` restamp it `GcRef` and
+    /// the assembler refuses `getfield_raw_r`.
+    pub(in crate::front::mir) fn emit_raw_int_field_as_ref_dest(
+        &mut self,
+        mir_bb: usize,
+        value: Variable,
+        dest_ty: &TyRef,
+    ) -> Variable {
+        if crate::model::FunctionGraph::concretetype_of(&value)
+            != crate::model::ConcreteType::Signed
+        {
+            return value;
+        }
+        if tyref_is_one_word_storage_raw_value(
+            dest_ty,
+            self.llbc,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        ) {
+            return value;
+        }
+        // `&mut i64` is the address of that field (`rptr.py` interior of
+        // a primitive). Recasting the loaded word stores the scalar as a
+        // pointer (`mut_borrow_of_struct_field_writes_the_word_back`).
+        // `&mut ActionFlag` is a Ref of a raw ADT: the FieldRead loaded
+        // a pointer (`SpaceActionFlag.ptr`) and still recasts.
+        if tyref_is_ref_of_primitive(dest_ty, self.llbc) {
+            return value;
+        }
+        let dest_vt = tyref_to_value_type_with(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        );
+        // `&mut ActionFlag` is a Charon `Ref` whose storage-raw pointee
+        // paints Int (`ty_is_raw_address`). FUNC.RESULT is still `r`
+        // (`rclass.py` `getinstancerepr` of the class), so aliasing the
+        // `getfield_raw` dest lets `align_gc_link_args` restamp it.
+        if !matches!(dest_vt, ValueType::Ref(_)) && !output_type_is_ref(dest_ty, self.llbc) {
+            return value;
+        }
+        if !self.producer_is_raw_int_field_read(&value) {
+            return value;
+        }
+        if let Some(root) = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves) {
+            return self.cast_ref_word(mir_bb, value, &root);
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        let dest = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(dest.clone()),
+            kind: cast_int_to_ptr_call(value),
+        });
+        dest
+    }
+
+    fn producer_is_raw_int_field_read(&self, value: &Variable) -> bool {
+        let Some((block_id, idx)) = resolve_to_producer_op(&self.graph, value) else {
+            return false;
+        };
+        let Some(op) = self.graph.block(block_id).operations.get(idx) else {
+            return false;
+        };
+        matches!(
+            &op.kind,
+            OpKind::FieldRead {
+                ty: ValueType::Int | ValueType::Unsigned,
+                field,
+                ..
+            } if field.owner_declared_gc == Some(false)
+        )
+    }
+
     /// Named instance class of `value`, walking a `cast_int_to_ptr` to
     /// its operand so a later identity recast sees the round-trip source
     /// (`FieldRead` / call dest), not the GCREF word `ann_cast_int_to_ptr`
@@ -1828,8 +1908,12 @@ impl<'a> Lowering<'a> {
                 // Plain use — reuse the operand's Variable without
                 // emitting a copy op. RPython does the same: a flow
                 // graph never has a redundant `same_as` between two
-                // Variables that already alias.
-                Ok((None, v))
+                // Variables that already alias. A raw Int field used as
+                // a Ref dest still needs `cast_int_to_ptr`.
+                Ok((
+                    None,
+                    self.emit_raw_int_field_as_ref_dest(mir_bb, v, dest_ty),
+                ))
             }
             Rvalue::BinaryOp(op_json, lhs, rhs) => {
                 // Peek kinds before `resolve_operand` consumes the
@@ -2693,7 +2777,10 @@ impl<'a> Lowering<'a> {
                 // A Deref reborrow of an existing `&[u8]` keeps the identity.
                 let v = self.resolve_place(mir_bb, place)?;
                 self.mark_place_address_of(mir_bb, projection, before, &v);
-                Ok((None, v))
+                Ok((
+                    None,
+                    self.emit_raw_int_field_as_ref_dest(mir_bb, v, dest_ty),
+                ))
             }
             // `RawPtr { place, ... }` — `&raw const x` / `&raw mut x`.
             // Same aliasing model as `Ref`: the JIT treats raw pointers
@@ -2713,7 +2800,10 @@ impl<'a> Lowering<'a> {
                 let before = self.graph.block(self.emit_bb(mir_bb)).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
                 self.mark_place_address_of(mir_bb, projection, before, &v);
-                Ok((None, v))
+                Ok((
+                    None,
+                    self.emit_raw_int_field_as_ref_dest(mir_bb, v, dest_ty),
+                ))
             }
             // `Repeat(elem, elem_ty, count)` — `[v; N]` literal. The
             // decodable shape follows upstream `transform.py` and
@@ -2968,7 +3058,10 @@ impl<'a> Lowering<'a> {
                     }
                     return Ok((Some(bank), converted));
                 }
-                Ok((None, v))
+                Ok((
+                    None,
+                    self.emit_raw_int_field_as_ref_dest(mir_bb, v, dest_ty),
+                ))
             }
             // `Len(place)` — slice / array length. Synthetic 1-arg
             // call; needs no descriptor for now.
@@ -3237,6 +3330,25 @@ impl<'a> Lowering<'a> {
                             if let Some(value) = coerced.as_variable() {
                                 *arg = value.clone();
                             }
+                        }
+                        // By-value one-word storage-raw is the packed
+                        // content word (`history.getkind` int). The
+                        // virtual ctor is a Ref; returning it disagrees
+                        // with FUNC.RESULT (`func_result_kind`,
+                        // `interpret_abort_switch_to_blackhole`). A
+                        // pointer field (`Holder.p` CCHARP) stays the
+                        // virtual store; Return packs a leftover.
+                        if pair_lens.iter().all(Option::is_none)
+                            && tyref_one_word_storage_raw_packs_as_word(
+                                dest_ty,
+                                self.llbc,
+                                self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
+                            )
+                        {
+                            let packed = self
+                                .emit_one_word_storage_raw_ctor(mir_bb, dest_ty, &ctor, &arg_vars);
+                            return Ok((None, packed));
                         }
                         let res = emit_aggregate_ctor_with_pairs(
                             &mut self.graph,
@@ -3854,6 +3966,212 @@ impl<'a> Lowering<'a> {
                 true,
             )
             .expect("BinOp produces a value")
+    }
+
+    /// Signed `ConstInt`. `push_op_var` mints `Unknown` (`getkind` ref);
+    /// a one-word storage-raw return must already be Signed when
+    /// `func_result_kind` reads the CFG (`flatten.py` `make_return`).
+    fn emit_signed_const(&mut self, mir_bb: usize, value: i64) -> Variable {
+        let bb_id = self.emit_bb(mir_bb);
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::ConstInt(value),
+        });
+        res
+    }
+
+    fn emit_signed_binop(
+        &mut self,
+        mir_bb: usize,
+        op: &str,
+        lhs: Variable,
+        rhs: Variable,
+    ) -> Variable {
+        let bb_id = self.emit_bb(mir_bb);
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::BinOp {
+                op: op.to_string(),
+                lhs,
+                rhs,
+                result_ty: ValueType::Int,
+            },
+        });
+        res
+    }
+
+    fn ensure_signed_word(&mut self, mir_bb: usize, value: Variable) -> Variable {
+        if crate::model::FunctionGraph::concretetype_of(&value)
+            == crate::model::ConcreteType::Signed
+        {
+            return value;
+        }
+        let zero = self.emit_signed_const(mir_bb, 0);
+        self.emit_signed_binop(mir_bb, "or", value, zero)
+    }
+
+    /// Pack field pieces into the one-word storage-raw register.
+    ///
+    /// `history.getkind` of the interned `Ptr(Struct raw)` is `"int"`:
+    /// that Int is the content word (`RootScope.save_point`, packed
+    /// `SwitchToBlackhole`). Recoloring the virtual constructor to Int
+    /// would pass identity, not the word.
+    fn emit_pack_storage_raw_word(
+        &mut self,
+        mir_bb: usize,
+        pieces: &[(u64, u64, Variable)],
+    ) -> Variable {
+        let word = crate::layout::target_word_size() as u64;
+        let live: Vec<(u64, u64, Variable)> = pieces
+            .iter()
+            .filter(|(_, size, _)| *size > 0)
+            .cloned()
+            .collect();
+        if live.is_empty() {
+            return self.emit_signed_const(mir_bb, 0);
+        }
+        if live.len() == 1 && live[0].0 == 0 && live[0].1 >= word {
+            return self.ensure_signed_word(mir_bb, live[0].2.clone());
+        }
+        let mut acc: Option<Variable> = None;
+        for (offset, size, value) in live {
+            let mut bits = self.ensure_signed_word(mir_bb, value);
+            let width = (size.min(word) * 8) as u32;
+            if width > 0 && width < 64 {
+                let mask = self.emit_signed_const(mir_bb, (1i64 << width) - 1);
+                bits = self.emit_signed_binop(mir_bb, "and", bits, mask);
+            }
+            if offset > 0 {
+                let shift = self.emit_signed_const(mir_bb, (offset * 8) as i64);
+                bits = self.emit_signed_binop(mir_bb, "lshift", bits, shift);
+            }
+            acc = Some(match acc {
+                None => bits,
+                Some(prev) => self.emit_signed_binop(mir_bb, "or", prev, bits),
+            });
+        }
+        acc.unwrap_or_else(|| self.emit_signed_const(mir_bb, 0))
+    }
+
+    /// Construct a one-word storage-raw ADT as its packed content word.
+    fn emit_one_word_storage_raw_ctor(
+        &mut self,
+        mir_bb: usize,
+        dest_ty: &TyRef,
+        ctor: &AggregateCtor,
+        args: &[Variable],
+    ) -> Variable {
+        let layout = tyref_one_word_storage_raw_fields(
+            dest_ty,
+            self.llbc,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )
+        .unwrap_or_default();
+        let word = crate::layout::target_word_size() as u64;
+        let mut pieces = Vec::new();
+        let mut layout_i = 0usize;
+        for (i, field) in ctor.fields.iter().enumerate() {
+            if field.void {
+                continue;
+            }
+            let Some(arg) = args.get(i) else {
+                continue;
+            };
+            let (offset, size) = layout
+                .iter()
+                .find(|(name, _, _)| name == &field.name)
+                .map(|(_, offset, size)| (*offset, *size))
+                .or_else(|| {
+                    let row = layout.get(layout_i)?;
+                    Some((row.1, row.2))
+                })
+                .unwrap_or((0, word));
+            layout_i += 1;
+            pieces.push((offset, size, arg.clone()));
+        }
+        self.emit_pack_storage_raw_word(mir_bb, &pieces)
+    }
+
+    /// Field of a packed one-word storage-raw value: shift the word and
+    /// mask to the field width. `RootScope.save_point` is the word.
+    fn emit_one_word_storage_raw_field_extract(
+        &mut self,
+        mir_bb: usize,
+        word: Variable,
+        offset: u64,
+        size: u64,
+    ) -> Variable {
+        let word_bytes = crate::layout::target_word_size() as u64;
+        if offset == 0 && size >= word_bytes {
+            return self.ensure_signed_word(mir_bb, word);
+        }
+        let mut bits = self.ensure_signed_word(mir_bb, word);
+        if offset > 0 {
+            let shift = self.emit_signed_const(mir_bb, (offset * 8) as i64);
+            bits = self.emit_signed_binop(mir_bb, "rshift", bits, shift);
+        }
+        let width = (size.min(word_bytes) * 8) as u32;
+        if width > 0 && width < 64 {
+            let mask = self.emit_signed_const(mir_bb, (1i64 << width) - 1);
+            bits = self.emit_signed_binop(mir_bb, "and", bits, mask);
+        }
+        bits
+    }
+
+    /// A still-virtual one-word storage-raw value: FieldRead each content
+    /// field (`base_is_deref` false) and pack. Same-crate construction
+    /// already interned the word; this is a leftover virtual (phi, copy).
+    pub(in crate::front::mir) fn emit_one_word_storage_raw_from_virtual(
+        &mut self,
+        mir_bb: usize,
+        virt: &Variable,
+        dest_ty: &TyRef,
+    ) -> Variable {
+        let layout = tyref_one_word_storage_raw_fields(
+            dest_ty,
+            self.llbc,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )
+        .unwrap_or_default();
+        if layout.is_empty() {
+            return self.ensure_signed_word(mir_bb, virt.clone());
+        }
+        let owner = tyref_node(dest_ty, self.llbc)
+            .and_then(|n| strip_ty_indirections(n, self.llbc))
+            .and_then(adt_node_def_id)
+            .and_then(|id| self.llbc.type_by_id(id))
+            .map(|td| {
+                super::class_identity_spelling(&td.item_meta.name_path(), self.tombstoned_leaves)
+            })
+            .filter(|spelling| !spelling.is_empty())
+            .unwrap_or_default();
+        let bb_id = self.emit_bb(mir_bb);
+        let mut pieces = Vec::new();
+        for (name, offset, size) in layout {
+            let loaded = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(loaded.clone()),
+                kind: OpKind::FieldRead {
+                    base: virt.clone(),
+                    field: FieldDescriptor::new(name, Some(owner.clone()))
+                        .with_base_is_deref(false),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+            });
+            pieces.push((offset, size, loaded));
+        }
+        self.emit_pack_storage_raw_word(mir_bb, &pieces)
     }
 
     /// Zero-extending load of the tag word. `host_variant_index` masks to
@@ -6118,6 +6436,13 @@ impl<'a> Lowering<'a> {
                     && let Some((owner_root, field_name, field_ty, owner_id, host_index)) =
                         self.resolve_adt_field(&inner.ty, field_payload)
                 {
+                    let container_ty = clone_tyref(&inner.ty);
+                    let container_is_one_word_storage_raw = tyref_is_one_word_storage_raw_value(
+                        &container_ty,
+                        self.llbc,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    );
                     // Decl field / Charon Field `place.ty` stay the binder
                     // TypeVar (`Result<T,E>::Ok.0`). Substitute from the
                     // container's `Adt.generics.types` so a `*mut u8`
@@ -6511,9 +6836,12 @@ impl<'a> Lowering<'a> {
                     if read_rstr_attr {
                         ty = ValueType::Str;
                     }
+                    // `rewrite_op_getfield`: kind is `getkind(RESULT)`, the
+                    // dest register. Unknown banks as `'r'`, so an Int field
+                    // of a raw owner becomes `getfield_raw_r`.
                     let res = self
                         .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        .alloc_value_var_with_type(concretetype_for_field(&ty));
                     let narrow_instance_class = container_is_enum
                         && field_name == "__pos_0"
                         && self.enum_payload_is_nullable_instance_ptr(&place_ty);
@@ -6546,6 +6874,23 @@ impl<'a> Lowering<'a> {
                         );
                     if dyn_vtable {
                         field = field.with_vec_part(crate::model::VecFieldPart::FatVtable);
+                    }
+                    if container_is_one_word_storage_raw
+                        && crate::model::FunctionGraph::concretetype_of(&base)
+                            == crate::model::ConcreteType::Signed
+                    {
+                        if let Some((offset, size)) = tyref_one_word_storage_raw_field_bits(
+                            &container_ty,
+                            host_index,
+                            &field.name,
+                            self.llbc,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                        ) {
+                            return Ok(self.emit_one_word_storage_raw_field_extract(
+                                mir_bb, base, offset, size,
+                            ));
+                        }
                     }
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
@@ -6617,9 +6962,13 @@ impl<'a> Lowering<'a> {
                     // `W_BytesObject.data` is the `rstr.py` `STR` owner.
                     // `SomePtr.getattr` (`lltype.py`) of a pointer field stays
                     // SomePtr. A registered GC pointer dest is
-                    // `cast_base_ptr_to_instance`.
+                    // `cast_base_ptr_to_instance`. A Ref dest that is not a
+                    // registered class still needs `cast_int_to_ptr` so the
+                    // `getfield_raw` dest stays Signed.
                     if owner_declared_gc == Some(false) {
-                        return Ok(self.recast_gcref_word_to_registered_dest(bb_id, &place_ty, res));
+                        let recast =
+                            self.recast_gcref_word_to_registered_dest(bb_id, &place_ty, res);
+                        return Ok(self.emit_raw_int_field_as_ref_dest(mir_bb, recast, &place_ty));
                     }
                     return Ok(res);
                 }
@@ -7205,7 +7554,7 @@ impl<'a> Lowering<'a> {
                     let bb_id = self.emit_bb(mir_bb);
                     let res = self
                         .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        .alloc_value_var_with_type(concretetype_for_field(&ty));
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::FieldRead {
@@ -7223,6 +7572,19 @@ impl<'a> Lowering<'a> {
                     && let Some(offset) = v.get("Offset")
                 {
                     return self.resolve_offset_place(mir_bb, *inner, offset);
+                }
+                if let ProjectionElem::Atom(name) = &elem
+                    && name == "Deref"
+                {
+                    let base = self.resolve_place(mir_bb, *inner)?;
+                    // `*p` of a raw pointer is the address word
+                    // (`history.py` `getkind` of `Ptr` with `_gckind ==
+                    // 'raw'` is `'int'`). A primitive deref is `raw_load`
+                    // above; a one-word storage-raw pointee is the word
+                    // itself. A Ref pointee of a raw Int field is
+                    // `cast_int_to_ptr` so the `getfield_raw` dest stays
+                    // Signed.
+                    return Ok(self.emit_raw_int_field_as_ref_dest(mir_bb, base, &place_ty));
                 }
                 match elem {
                     ProjectionElem::Tagged(_) | ProjectionElem::Atom(_) => {

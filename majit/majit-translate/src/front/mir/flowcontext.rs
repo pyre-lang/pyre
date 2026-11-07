@@ -3533,6 +3533,22 @@ impl<'a> Lowering<'a> {
                         ))
                     })?
                     .one()?;
+                // One-word storage-raw FUNC.RESULT is int
+                // (`history.getkind`). A leftover virtual constructor
+                // is still Ref (`func_result_kind`).
+                let ret_ty = &self.body.locals.locals[0].ty;
+                let ret = if tyref_is_one_word_storage_raw_value(
+                    ret_ty,
+                    self.llbc,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                ) && crate::model::FunctionGraph::concretetype_of(&ret)
+                    != crate::model::ConcreteType::Signed
+                {
+                    self.emit_one_word_storage_raw_from_virtual(mir_bb, &ret, ret_ty)
+                } else {
+                    self.emit_raw_int_field_as_ref_dest(mir_bb, ret, ret_ty)
+                };
                 self.graph.set_return(bb_id, Some(ret));
                 Ok(())
             }

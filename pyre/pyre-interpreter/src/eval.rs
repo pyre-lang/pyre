@@ -4535,7 +4535,7 @@ pub fn load_super_attr_value(
     name_idx: usize,
     is_two_arg: bool,
 ) -> Result<PyObjectRef, PyError> {
-    let code = unsafe { &*(crate::w_code_get_ptr(w_code) as *const crate::CodeObject) };
+    let code = unsafe { &*(crate::w_code_get_ptr(w_code)) };
     let Some(name) = code.names.get(name_idx) else {
         return Err(PyError::runtime_error(format!(
             "LOAD_SUPER_ATTR name index {name_idx} out of range"

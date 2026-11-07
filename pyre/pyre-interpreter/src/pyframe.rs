@@ -4064,7 +4064,7 @@ impl PyFrame {
     /// through `self.pycode` directly.
     #[inline]
     pub fn getcode(&self) -> &CodeObject {
-        unsafe { &*(crate::w_code_get_ptr(self.getcode_w()) as *const CodeObject) }
+        unsafe { &*(crate::w_code_get_ptr(self.getcode_w())) }
     }
 
     /// PyPy-compatible `fget_code`.
@@ -4178,8 +4178,7 @@ impl PyFrame {
         let _ = outer_func;
         let allocation = self.aux_allocation();
         self.pycode = code;
-        let raw =
-            unsafe { crate::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject };
+        let raw = unsafe { crate::w_code_get_ptr(code as pyre_object::PyObjectRef) };
         if !self.locals_cells_stack_w.is_null()
             && !pyre_object::gc_hook::try_gc_owns_object(
                 self.locals_cells_stack_w as pyre_object::gc_hook::GCREF,
@@ -6572,8 +6571,7 @@ impl PyFrame {
         let root_base = _roots.publish(&[code as PyObjectRef, w_globals, closure, w_builtin]);
         let args_base = _roots.publish(args);
         _roots.normalize(root_base, 4 + args.len());
-        let code_ref =
-            unsafe { &*(crate::w_code_get_ptr(_roots.get(root_base)) as *const CodeObject) };
+        let code_ref = unsafe { &*(crate::w_code_get_ptr(_roots.get(root_base))) };
         let num_locals = code_ref.varnames.len();
         let num_cells = ncells(code_ref);
         let max_stack = code_ref.max_stackdepth as usize;
@@ -7084,7 +7082,7 @@ pub fn createframe_obj(
     //
     // Preserve the exact object either on `PyCode.w_globals` (normal case) or
     // the rare `FrameDebugData.w_globals` override.
-    let raw = unsafe { crate::w_code_get_ptr(code as PyObjectRef) as *const CodeObject };
+    let raw = unsafe { crate::w_code_get_ptr(code as PyObjectRef) };
     let code_ref = unsafe { &*raw };
     let num_locals = code_ref.varnames.len();
     let num_cells = ncells(code_ref);

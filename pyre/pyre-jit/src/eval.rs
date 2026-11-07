@@ -322,8 +322,9 @@ impl FrameView {
     }
 }
 
-/// Cell written by `cache_root_stack_slot` (`gc_enter_roots_frame`). Zero when
-/// the context is missing or the slot is not resolved yet.
+/// The `root_stack_slot` cell, which caches `shadow_stack_slot().as_word()`
+/// (`gc_enter_roots_frame`). Zero when the context is missing or the slot is
+/// not resolved yet.
 #[inline]
 fn cached_root_raw(ec: *const pyre_interpreter::PyExecutionContext) -> usize {
     if ec.is_null() {
@@ -8307,8 +8308,8 @@ fn jd1_trace_threshold() -> u32 {
 
 /// jd1 (`unpackiterable_driver`) merge-point hook body. On the hot iterator
 /// type, drives one `JitCodeMachine` trace of the extracted
-/// `unpackiterable_portal` loop with `w_iterator`/`items` as the two
-/// `reds='auto'` values. Inert when jd1 is disabled (see
+/// `unpackiterable_portal` loop with the extracted `reds='auto'` banks.
+/// Inert when jd1 is disabled (see
 /// [`jd1_experiment_enabled`]).
 fn unpack_merge_point_jit(
     greenkey: pyre_object::PyObjectRef,
@@ -9188,7 +9189,7 @@ fn drive_unpack_iterable_trace(
     let w_iterator = roots.get(base + 1);
     let items = roots.get(base + 2);
 
-    // Extracted merge-point reds: root_base, items_slot, RootScope cell.
+    // Extracted merge-point reds: root_base, items_slot, packed RootScope.
     let live_values = pyre_jit_trace::unpack_state::jd1_live_values_at(portal_root_base);
 
     // `elect_active_jitdriver_sd` honours `descriptor.index` first, which is how
@@ -9389,7 +9390,7 @@ fn drive_unpack_iterable_trace(
     }
 
     // Seed every bank the extracted `jit_merge_point` names.  Green is
-    // the type object; reds are root_base / items_slot / RootScope cell.
+    // the type object; reds are root_base / items_slot / packed RootScope.
     let green_args = [(
         majit_metainterp::JitArgKind::Ref,
         greenkey_raw as usize as i64,
@@ -9407,9 +9408,9 @@ fn drive_unpack_iterable_trace(
             root_base + 1,
         ),
         (
-            majit_metainterp::JitArgKind::Ref,
-            majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Ref),
-            pyre_object::gc_roots::shadow_stack_cell() as usize as i64,
+            majit_metainterp::JitArgKind::Int,
+            majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Int),
+            root_base,
         ),
     ];
 
@@ -9417,7 +9418,7 @@ fn drive_unpack_iterable_trace(
         greenkey: pyre_object::PY_NULL,
         root_base: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
         items_slot: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int),
-        roots_cell: majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Ref),
+        roots_cell: majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Int),
     };
 
     // The `jit_merge_point` opcode byte offset in the extracted body — the
@@ -11539,11 +11540,17 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
     // Re-read only after `perform_actions`, which can run signal Python.
     let mut marker_ec = pyre_interpreter::call::getexecutioncontext();
     // One EC per activation (`interp_jit.py` `PyFrame.dispatch`). The
-    // shadow-stack cell is the `gc_enter_roots_frame` cache: resolved once
-    // here, before the marker, so the pointer is not live across
+    // shadow-stack cell is the `gc_enter_roots_frame` cache: filled here
+    // once, before the marker, so the pointer is not live across
     // `split_before_jit_merge_point`. Later opcodes load that cell.
     if !marker_ec.is_null() {
-        majit_gc::shadow_stack::cache_root_stack_slot(unsafe { &(*marker_ec).root_stack_slot });
+        if unsafe { (*marker_ec).root_stack_slot.get() } == 0 {
+            unsafe {
+                (*marker_ec)
+                    .root_stack_slot
+                    .set(majit_gc::shadow_stack::shadow_stack_slot().as_word());
+            }
+        }
     }
 
     loop {
@@ -11555,7 +11562,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         f = if raw_slot == 0 {
             gc_roots::reload_top_root(f as *mut PyFrame as pyre_object::PyObjectRef) as *mut PyFrame
         } else {
-            // SAFETY: `raw_slot` is the word `cache_root_stack_slot` stored for this thread.
+            // SAFETY: `raw_slot` is this thread's cached `shadow_stack_slot().as_word()`.
             reload_loop_frame!(f, unsafe {
                 majit_gc::shadow_stack::slot_from_cached(raw_slot)
             })
@@ -11591,7 +11598,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         let root_slot = if marker_ec.is_null() {
             majit_gc::shadow_stack::shadow_stack_slot()
         } else {
-            // SAFETY: the word is `root_stack_slot` as `cache_root_stack_slot` stored for this thread.
+            // SAFETY: the word is this thread's cached `shadow_stack_slot().as_word()`.
             unsafe { majit_gc::shadow_stack::slot_from_cached((*marker_ec).root_stack_slot.get()) }
         };
         // `f` is the marker's red `frame` — the one frame value declared
@@ -13368,7 +13375,8 @@ fn compile_and_run_once(
     }
 
     // pyjitpl.py `initialize_state_from_start`: `newframe(mainjitcode)`
-    // then, on the interpret arm, `setup_call(original_boxes)`.
+    // then `setup_call(original_boxes)`. The interpret arm starts at pc 0
+    // from that `setup_call`, as `_compile_and_run_once` does.
     // Virtualizable boxes were already seeded by `setup_tracing`.
     // The `trace_bytecode` arm keeps the previous seed: one root frame
     // and no `setup_call` (`rebuild_portal_framestack_from_resume`).
@@ -13378,7 +13386,6 @@ fn compile_and_run_once(
         if interpret {
             let boxes = portal_original_boxes(meta, frame_root.frame(), target_pc, &portal);
             meta.seed_root_portal_frame(portal, &boxes);
-            meta.seat_root_portal_at(entry);
         } else {
             meta.rebuild_portal_framestack_from_resume(portal, &[entry as i32]);
         }
@@ -18439,10 +18446,8 @@ mod tests {
     /// `w_code_get_ptr`), not an arbitrary copy of the same source —
     /// `CallControl.jitcodes` is keyed by raw pointer identity.
     fn register_test_portal(_unused: &pyre_interpreter::CodeObject, w_code: *const ()) {
-        let raw_code = unsafe {
-            pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                as *const pyre_interpreter::CodeObject
-        };
+        let raw_code =
+            unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
         let canonical_code = unsafe { &*raw_code };
         crate::jit::codewriter::register_portal_jitdriver(canonical_code);
     }

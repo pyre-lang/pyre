@@ -806,10 +806,7 @@ pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
     if code.is_null() {
         return METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code, None));
     }
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
+    let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef) };
     if !raw_code.is_null() {
         let callbacks = crate::callbacks::try_get().unwrap_or_else(|| {
             panic!(
@@ -2128,10 +2125,7 @@ pub fn depth_based_vsd_for_wcode(w_code: usize, py_pc: usize) -> Option<usize> {
     if w_code == 0 {
         return None;
     }
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
+    let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef) };
     if raw_code.is_null() {
         return None;
     }
@@ -5291,10 +5285,7 @@ fn concrete_code_object(frame: usize) -> Option<&'static pyre_interpreter::CodeO
     if w_code.is_null() {
         return None;
     }
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
+    let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     // A non-null `w_code` does not make the inner pointer non-null; every other
     // caller of `w_code_get_ptr` in the tree checks the result before
     // dereferencing it.
@@ -5804,10 +5795,7 @@ fn flush_walk_end_state_to_frame_inner(
     if w_code.is_null() {
         return decline("null w_code");
     }
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
+    let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef) };
     let Some(depth) = crate::liveness::liveness_for(raw_code)
         .depth_at_py_pc()
         .get(resume_py_pc)
@@ -6314,10 +6302,7 @@ pub(crate) fn outer_call_operands_below(
     if w_code.is_null() {
         return None;
     }
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
+    let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef) };
     if raw_code.is_null() {
         return None;
     }
@@ -6360,10 +6345,7 @@ pub(crate) fn can_flush_walk_end_state_after_outer_call(
     if w_code.is_null() {
         return false;
     }
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
+    let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef) };
     if raw_code.is_null() {
         return false;
     }
@@ -6613,10 +6595,7 @@ pub(crate) fn capture_frame_stack_from_mirror(
     if w_code.is_null() {
         return None;
     }
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
+    let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef) };
     // The synchronized value is published when it is a unit the opcode at
     // `py_pc` owns: its own pc, or one of its cache words once it has advanced
     // over them (`PyFrame::executing_instr`).  Any other value does not belong
@@ -9043,10 +9022,7 @@ pub(crate) fn reconstruct_inline_recipe(
     if w_code.is_null() {
         decline!("NullWCode");
     }
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
+    let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     if raw_code.is_null() {
         decline!("NullRawCode");
     }
@@ -14157,10 +14133,8 @@ mod tests {
         all_liveness: &[u8],
         num_liveness_ops: usize,
     ) {
-        let raw_code = unsafe {
-            pyre_interpreter::w_code_get_ptr(code_ref as pyre_object::PyObjectRef)
-                as *const CodeObject
-        };
+        let raw_code =
+            unsafe { pyre_interpreter::w_code_get_ptr(code_ref as pyre_object::PyObjectRef) };
         let mut builder = majit_metainterp::JitCodeBuilder::default();
         let live_patch = builder.live_placeholder();
         builder.patch_live_offset(live_patch, 0);
@@ -14203,10 +14177,8 @@ mod tests {
         live_f: &[u8],
     ) -> *mut JitCode {
         use majit_jitcode::liveness::encode_liveness;
-        let raw_code = unsafe {
-            pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                as *const CodeObject
-        };
+        let raw_code =
+            unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
         let mut all_liveness = vec![live_i.len() as u8, live_r.len() as u8, live_f.len() as u8];
         all_liveness.extend(encode_liveness(live_i));
         all_liveness.extend(encode_liveness(live_r));
@@ -18386,9 +18358,8 @@ mod indirectcalltargets_tests {
         let raw_code = pyre_interpreter::compile_exec(source).expect("source must compile");
         let code = pyre_interpreter::w_code_new(Box::into_raw(Box::new(raw_code)) as *const ())
             as *const ();
-        let raw_code = unsafe {
-            pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef) as *const CodeObject
-        };
+        let raw_code =
+            unsafe { pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef) };
         (code, raw_code)
     }
 

@@ -82,10 +82,12 @@ impl ResidualSlot for pyre_object::celldict::StrKey {}
 /// `PyError` is `#[repr(transparent)]` over `PyObjectRef` — one `'r'` word.
 impl ResidualSlot for crate::PyError {}
 
-/// Word-ABI bridges for the three shadow-stack operations `eval::FrameAnchor`
-/// reaches.  `majit_ir::GcRef` is `#[repr(transparent)]` over one `usize`, so
-/// each of the raw functions is `(usize) -> usize`, `(usize) -> usize` and
-/// `(usize) -> ()` — and `usize` is 32-bit on wasm32.  A residual call whose
+/// Word-ABI bridges for the five shadow-stack operations `eval::FrameAnchor`
+/// and the portal prologue reach (`push`, `get`, `try_pop_to`,
+/// `shadow_stack_slot`, `slot_from_cached`).  `majit_ir::GcRef` is
+/// `#[repr(transparent)]` over one `usize`, so each of the raw functions is
+/// `(usize) -> usize`, `(usize) -> usize`, `(usize) -> ()`, `() -> usize` and
+/// `(usize) -> usize` — and `usize` is 32-bit on wasm32.  A residual call whose
 /// descr types are all words lowers to an in-module `(i64xn) -> i64` (or
 /// `(i64xn) -> ()`) `call_indirect`, which type-checks its callee on every
 /// call, so the raw functions are a different table type there.
@@ -102,6 +104,18 @@ extern "C" fn shadow_stack_get_word(index: i64) -> i64 {
 extern "C" fn shadow_stack_try_pop_to_word(depth: i64) {
     majit_ir::icf_identity!("jit_fnaddr::shadow_stack_try_pop_to_word");
     majit_gc::shadow_stack::try_pop_to(depth as usize);
+}
+
+extern "C" fn shadow_stack_slot_word() -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::shadow_stack_slot_word");
+    majit_gc::shadow_stack::shadow_stack_slot().as_word() as i64
+}
+
+extern "C" fn slot_from_cached_word(raw: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::slot_from_cached_word");
+    // SAFETY: the word is the residual operand the interpreter read
+    // from `root_stack_slot`, 0 or a slot `shadow_stack_slot().as_word()` cached in `root_stack_slot` for this thread.
+    unsafe { majit_gc::shadow_stack::slot_from_cached(raw as usize) }.as_word() as i64
 }
 
 /// Word ABI for `majit_gc::bh_probe_note_store(usize, usize, u32)`; the
@@ -2170,6 +2184,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "majit_gc::shadow_stack::try_pop_to",
         shadow_stack_try_pop_to_word,
+    );
+    cp0!(
+        &mut entries,
+        "majit_gc::shadow_stack::shadow_stack_slot",
+        shadow_stack_slot_word,
+    );
+    cp1!(
+        &mut entries,
+        "majit_gc::shadow_stack::slot_from_cached",
+        slot_from_cached_word,
     );
     cp3!(
         &mut entries,
@@ -5451,6 +5475,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::executioncontext::space_decrement_ticker",
         crate::executioncontext::space_decrement_ticker_jit_abi,
     );
+    cp0!(
+        &mut entries,
+        "pyre_interpreter::module::signal::signalstate::pypysig_getaddr_occurred",
+        crate::module::signal::signalstate::pypysig_getaddr_occurred_jit_abi,
+    );
     // The `anchor` handler graph residualizes `FrameAnchor::new` itself
     // (its aggregate return keeps it out of inlining), and `push_anchored`
     // reads back through `FrameAnchor::live`; bind both under the exact
@@ -7366,11 +7395,12 @@ mod tests {
         jit_trace_fnaddrs, module_dict_getdictvalue_no_unwrapping_pure_word,
         object_dict_getitem_str_hashed_word, object_dict_getitem_str_word,
         pyframe_load_global_value_word, pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs,
-        shadow_stack_get_word, shadow_stack_push_word, shadow_stack_try_pop_to_word,
-        unicode_dict_getitem_str_hashed_word, unicode_dict_getitem_str_word,
-        w_dict_getitem_str_object_strategy_hashed_word, w_dict_lookup_bytes_strategy_word,
-        w_dict_lookup_identity_strategy_word, w_dict_lookup_int_strategy_word,
-        w_list_pop_end_inner_word, w_list_pop_end_word, w_module_dict_lookup_object_entries_word,
+        shadow_stack_get_word, shadow_stack_push_word, shadow_stack_slot_word,
+        shadow_stack_try_pop_to_word, slot_from_cached_word, unicode_dict_getitem_str_hashed_word,
+        unicode_dict_getitem_str_word, w_dict_getitem_str_object_strategy_hashed_word,
+        w_dict_lookup_bytes_strategy_word, w_dict_lookup_identity_strategy_word,
+        w_dict_lookup_int_strategy_word, w_list_pop_end_inner_word, w_list_pop_end_word,
+        w_module_dict_lookup_object_entries_word,
     };
     use std::collections::HashMap;
 
@@ -7698,12 +7728,20 @@ mod tests {
                 "majit_gc::shadow_stack::try_pop_to",
                 shadow_stack_try_pop_to_word as *const () as usize as i64,
             ),
+            (
+                "majit_gc::shadow_stack::shadow_stack_slot",
+                shadow_stack_slot_word as *const () as usize as i64,
+            ),
+            (
+                "majit_gc::shadow_stack::slot_from_cached",
+                slot_from_cached_word as *const () as usize as i64,
+            ),
         ] {
             assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
         }
     }
 
-    /// The three published addresses answer through the word ABI a residual
+    /// The five published addresses answer through the word ABI a residual
     /// call reaches them with, and the round trip preserves the reference.
     ///
     /// Calling each through its registry address, transmuted to the signature
@@ -7729,6 +7767,15 @@ mod tests {
         try_pop_to(depth);
         assert_eq!(push(marker), depth, "try_pop_to left the depth unrestored");
         try_pop_to(depth);
+
+        let slot: extern "C" fn() -> i64 =
+            unsafe { std::mem::transmute(addr("majit_gc::shadow_stack::shadow_stack_slot")) };
+        let from_cached: extern "C" fn(i64) -> i64 =
+            unsafe { std::mem::transmute(addr("majit_gc::shadow_stack::slot_from_cached")) };
+        let resolved = slot();
+        assert_ne!(resolved, 0);
+        assert_eq!(from_cached(0), resolved);
+        assert_eq!(from_cached(resolved), resolved);
     }
 
     #[test]

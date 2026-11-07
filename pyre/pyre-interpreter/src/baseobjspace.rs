@@ -23532,7 +23532,7 @@ fn generator_send_ex(
         // merge point allocates, so the reds are the arguments themselves.
         let pycode = w_generator_get_pycode(gen_obj);
         if !pycode.is_null() {
-            let raw = crate::pycode::w_code_get_ptr(pycode) as *const crate::CodeObject;
+            let raw = crate::pycode::w_code_get_ptr(pycode);
             if !raw.is_null() && majit_metainterp::jit::we_are_jitted() && should_not_inline(&*raw)
             {
                 return generatorentry_portal(pycode, gen_obj, w_arg);

@@ -839,9 +839,7 @@ fn try_commit_midbody_abort_inner(
             "outer call boundary not flushable",
         ));
     }
-    let raw = unsafe {
-        pyre_interpreter::w_code_get_ptr(payload.w_code) as *const pyre_interpreter::CodeObject
-    };
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(payload.w_code) };
     if raw.is_null() {
         return Err(MidBodyDecline::BeforeRun("null callee code ptr"));
     }
@@ -7603,9 +7601,7 @@ fn abort_permanent_owner(
         .binary_search_by_key(&(marker_jit_pc as u32), |&(off, _)| off)
         .ok()?;
     let py_pc = table[idx].1 as usize;
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const CodeObject
-    };
+    let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     if raw_code.is_null() {
         return None;
     }
@@ -7863,8 +7859,7 @@ fn loop_inlines_abort_permanent_callee(
         for op in crate::jitcode_runtime::decoded_ops(body.code) {
             if op.opname == "abort_permanent" {
                 let raw_code =
-                    pyre_interpreter::w_code_get_ptr(callee_w_code as pyre_object::PyObjectRef)
-                        as *const CodeObject;
+                    pyre_interpreter::w_code_get_ptr(callee_w_code as pyre_object::PyObjectRef);
                 let callee_name = if raw_code.is_null() {
                     "<unknown>".to_string()
                 } else {
@@ -7903,8 +7898,7 @@ fn loop_inlines_abort_permanent_callee(
             // `abort_permanent` marker.
             return None;
         }
-        let raw_code = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const CodeObject;
+        let raw_code = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef);
         if raw_code.is_null() {
             return None;
         }
@@ -7989,8 +7983,7 @@ fn loop_inlines_abort_permanent_callee(
                 // the ordinary walk will encounter any marker it reaches.
                 return None;
             }
-            let raw = pyre_interpreter::w_code_get_ptr(code_ptr as pyre_object::PyObjectRef)
-                as *const CodeObject;
+            let raw = pyre_interpreter::w_code_get_ptr(code_ptr as pyre_object::PyObjectRef);
             if raw.is_null() {
                 continue;
             }
@@ -8375,8 +8368,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
             crate::jitcode_dispatch::census_record(e.variant_name());
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                 let raw_code =
-                    unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) }
-                        as *const CodeObject;
+                    unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
                 let (name, path) = if raw_code.is_null() {
                     ("<unknown>", "<unknown>")
                 } else {
@@ -8909,10 +8901,7 @@ mod tests {
 
         let code = compile_exec("None").expect("test code should compile");
         let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
-        let raw_code = unsafe {
-            w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                as *const pyre_interpreter::CodeObject
-        };
+        let raw_code = unsafe { w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
 
         let mut builder = majit_metainterp::JitCodeBuilder::default();
         builder.ensure_r_regs(2);

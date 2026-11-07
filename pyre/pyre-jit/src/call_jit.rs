@@ -1271,8 +1271,7 @@ pub(crate) extern "C" fn record_discarded_level_traceback(
     }
     let last_instruction = py_pc.saturating_sub(1);
     let w_code = w_code_value as PyObjectRef;
-    let raw_code =
-        unsafe { pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject };
+    let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
     if raw_code.is_null() {
         return;
     }
@@ -4715,10 +4714,8 @@ fn trace_and_compile_from_bridge_body(
                 }
                 continue;
             }
-            let raw = unsafe {
-                pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                    as *const pyre_interpreter::CodeObject
-            };
+            let raw =
+                unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
             if raw.is_null() {
                 return None;
             }
@@ -6509,9 +6506,7 @@ fn fill_positional_defaults_for_jit_call<'a>(
         return Cow::Borrowed(args);
     }
 
-    let code = unsafe {
-        &*(pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject)
-    };
+    let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code)) };
     let nparams = code.arg_count as usize;
     if args.len() >= nparams {
         return Cow::Borrowed(args);
@@ -6584,9 +6579,7 @@ fn scope_args_for_jit_callee(
     for i in 0..args.len() {
         positional.push(roots.get(base + 2 + i));
     }
-    let code_ref = unsafe {
-        &*(pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject)
-    };
+    let code_ref = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code)) };
     if let Ok(filled) =
         pyre_interpreter::call::fill_user_function_args(callable, code_ref, &positional, false)
     {
@@ -6605,10 +6598,7 @@ fn scope_args_for_jit_callee(
 /// so defaults stay unbound here. `pack_varargs` still builds the
 /// `*args` / `**kwargs` locals `createframe` writes.
 fn scope_args_for_jit_code(code: *const (), args: &[PyObjectRef]) -> Vec<PyObjectRef> {
-    let code_ref = unsafe {
-        &*(pyre_interpreter::w_code_get_ptr(code as PyObjectRef)
-            as *const pyre_interpreter::CodeObject)
-    };
+    let code_ref = unsafe { &*(pyre_interpreter::w_code_get_ptr(code as PyObjectRef)) };
     pyre_interpreter::call::pack_varargs(code_ref, args.to_vec())
 }
 
@@ -7634,9 +7624,7 @@ pub extern "C" fn bh_load_global_fn(
     frame_ptr: *mut PyFrame,
     namei: i64,
 ) -> PyObjectRef {
-    let code = unsafe {
-        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr) as *const pyre_interpreter::CodeObject)
-    };
+    let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code_ptr)) };
     let raw = namei as usize;
     let idx = raw >> 1;
 
@@ -7801,9 +7789,7 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
     frame_ptr: *mut PyFrame,
     namei: i64,
 ) -> PyObjectRef {
-    let code = unsafe {
-        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr) as *const pyre_interpreter::CodeObject)
-    };
+    let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code_ptr)) };
     let idx = namei as usize;
     if idx >= code.names.len() {
         return PY_NULL;
@@ -7962,9 +7948,7 @@ pub extern "C" fn bh_load_attr_fn(
     w_code_ptr: PyObjectRef,
     name_idx: i64,
 ) -> PyObjectRef {
-    let code = unsafe {
-        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr) as *const pyre_interpreter::CodeObject)
-    };
+    let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code_ptr)) };
     // `name_idx` is a `co_names` index baked into the residual call by the
     // codewriter from the originating LOAD_ATTR oparg, so it is in range for
     // the code object loaded out of the resume frame.  The bound is a codegen
@@ -8010,9 +7994,7 @@ pub extern "C" fn bh_store_attr_fn(
     w_code_ptr: PyObjectRef,
     name_idx: i64,
 ) {
-    let code = unsafe {
-        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr) as *const pyre_interpreter::CodeObject)
-    };
+    let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code_ptr)) };
     // Same `co_names`-index codegen invariant as `bh_load_attr_fn`.
     let idx = name_idx as usize;
     debug_assert!(
@@ -8037,9 +8019,7 @@ pub extern "C" fn bh_store_attr_fn(
 /// (`MayForce`); on error the exception is published through
 /// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException`.
 pub extern "C" fn bh_delete_attr_fn(obj: PyObjectRef, w_code_ptr: PyObjectRef, name_idx: i64) {
-    let code = unsafe {
-        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr) as *const pyre_interpreter::CodeObject)
-    };
+    let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code_ptr)) };
     let idx = name_idx as usize;
     debug_assert!(
         idx < code.names.len(),
@@ -8070,9 +8050,7 @@ pub extern "C" fn bh_import_from_fn(
     w_code: PyObjectRef,
     name_idx: i64,
 ) -> PyObjectRef {
-    let code = unsafe {
-        &*(pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject)
-    };
+    let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code)) };
     let idx = name_idx as usize;
     debug_assert!(
         idx < code.names.len(),
@@ -8319,9 +8297,7 @@ pub extern "C" fn bh_load_method_self_fn(
     w_code_ptr: PyObjectRef,
     name_idx: i64,
 ) -> PyObjectRef {
-    let code = unsafe {
-        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr) as *const pyre_interpreter::CodeObject)
-    };
+    let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code_ptr)) };
     // Same `co_names`-index codegen invariant as `bh_load_attr_fn`; the
     // release-path `PY_NULL` is also the legitimate "no self prepended"
     // result, so the debug assert is what catches an invalid index.
@@ -8979,9 +8955,7 @@ pub extern "C" fn bh_load_deref_value_fn(
         slot
     };
     if value == pyre_object::PY_NULL {
-        let code = unsafe {
-            &*(pyre_interpreter::w_code_get_ptr(w_code_ptr) as *const pyre_interpreter::CodeObject)
-        };
+        let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code_ptr)) };
         let exc_obj = pyre_interpreter::pyframe::deref_unbound_error(code, deref_idx as usize)
             .to_exc_object();
         publish_residual_call_exception(exc_obj);
@@ -9260,9 +9234,7 @@ pub extern "C" fn bh_load_fast_check_fn(
 /// publishing it through the residual-exception channel. It allocates but
 /// runs no user code and never raises (`CallFlavor::PlainCannotRaise`).
 pub extern "C" fn bh_unbound_local_error_fn(w_code_ptr: PyObjectRef, name_idx: i64) -> PyObjectRef {
-    let code = unsafe {
-        &*(pyre_interpreter::w_code_get_ptr(w_code_ptr) as *const pyre_interpreter::CodeObject)
-    };
+    let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code_ptr)) };
     // `name_idx` is a `co_varnames` index baked into the residual call by the
     // codewriter from the originating LOAD_FAST_CHECK oparg.  An out-of-range
     // index is a codegen invariant rather than a runtime-reachable error;

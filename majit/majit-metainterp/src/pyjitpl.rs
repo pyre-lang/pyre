@@ -11997,6 +11997,15 @@ impl<M: Clone> MetaInterp<M> {
         {
             return;
         }
+        // A failed instruction has no executable blackhole continuation
+        // (`run_blackhole_interp_to_cancel_tracing` / `publish_walk_abort_handoff`).
+        if self
+            .tracing
+            .as_ref()
+            .is_some_and(|ctx| ctx.abort_after_panic || ctx.symbolic_residual_abort)
+        {
+            return;
+        }
         let (virt_array_values, virtualizable_ptr, raising_exception) = self
             .tracing
             .as_ref()
@@ -18232,22 +18241,6 @@ impl<M: Clone> MetaInterp<M> {
     ) {
         self.reset_framestack_from_start(mainjitcode, original_boxes);
         self.reset_compile_and_run_once_loop_header_stamp();
-    }
-
-    /// Seat the root portal MIFrame at a JitCode `-live-` after `setup_call`.
-    ///
-    /// `MIFrame.setup_call` always starts at 0. A generator FunctionEntry
-    /// starts at the resolved resume marker (`derive_resume_marker`) so
-    /// `interpret` walks from that `-live-` with the live frame's value stack
-    /// (`resume_execute_frame` already pushed the sent value). Greens stay
-    /// `(next_instr, is_being_profiled, pycode)`.
-    pub fn seat_root_portal_at(&mut self, jitcode_pc: usize) {
-        if jitcode_pc == 0 {
-            return;
-        }
-        let frame = self.framestack.current_mut();
-        frame.setup_resume_at_op(jitcode_pc);
-        frame.code_cursor = jitcode_pc;
     }
 
     fn reset_framestack_from_start(
@@ -24984,23 +24977,6 @@ mod metainterp_static_data_tests {
         );
         assert_eq!(meta.portal_call_depth, 0);
         assert_eq!(meta.call_ids, vec![0]);
-    }
-
-    #[test]
-    fn seat_root_portal_at_moves_cursor_to_resume_live() {
-        use crate::jitcode::JitCodeBuilder;
-        let mut builder = JitCodeBuilder::new();
-        builder.load_const_i_value(0, 0);
-        let mainjitcode = builder.finish();
-        mainjitcode.set_jitdriver_sd(0);
-        let mainjitcode = std::sync::Arc::new(mainjitcode);
-        let mut meta = MetaInterp::<()>::new(0);
-        meta.finish_setup_descrs_for_jitdrivers();
-        meta.seed_root_portal_frame(mainjitcode, &[]);
-        meta.seat_root_portal_at(7);
-        let frame = meta.framestack.current_mut();
-        assert_eq!(frame.pc, 7);
-        assert_eq!(frame.code_cursor, 7);
     }
 
     #[test]
