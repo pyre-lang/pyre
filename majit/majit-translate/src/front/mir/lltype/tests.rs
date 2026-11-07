@@ -1195,15 +1195,24 @@ fn hkey_alias_of_c_void_ptr_is_voidp() {
         ],
         vec![],
     );
-    let hkey = TyRef::Other(serde_json::json!({
-        "Adt": {"id": 1, "generics": empty_generics()}
-    }));
-    let voidpp = TyRef::Other(serde_json::json!({
-        "Adt": {"id": 2, "generics": empty_generics()}
-    }));
-    let gcref = TyRef::Other(serde_json::json!({
-        "Adt": {"id": 4, "generics": empty_generics()}
-    }));
+    let hkey = TyRef::Other(
+        serde_json::json!({
+            "Adt": {"id": 1, "generics": empty_generics()}
+        })
+        .into(),
+    );
+    let voidpp = TyRef::Other(
+        serde_json::json!({
+            "Adt": {"id": 2, "generics": empty_generics()}
+        })
+        .into(),
+    );
+    let gcref = TyRef::Other(
+        serde_json::json!({
+            "Adt": {"id": 4, "generics": empty_generics()}
+        })
+        .into(),
+    );
     assert!(
         tyref_is_raw_c_void_ptr(&hkey, &llbc),
         "type HKEY = *mut c_void is VOIDP"
@@ -1312,12 +1321,10 @@ fn option_of_voidpp_is_not_pointer_niche() {
         ],
         vec![],
     );
-    let option_voidpp = TyRef::Other(option_adt_node(0, voidpp));
-    let option_gc_obj_ptr_ptr = TyRef::Other(option_adt_node(0, gc_obj_ptr_ptr));
-    let option_phkey = TyRef::Other(option_adt_node(
-        0,
-        serde_json::json!({"RawPtr": [hkey, "Mut"]}),
-    ));
+    let option_voidpp = TyRef::Other(option_adt_node(0, voidpp).into());
+    let option_gc_obj_ptr_ptr = TyRef::Other(option_adt_node(0, gc_obj_ptr_ptr).into());
+    let option_phkey =
+        TyRef::Other(option_adt_node(0, serde_json::json!({"RawPtr": [hkey, "Mut"]})).into());
     assert!(
         !super::tyref_is_niche_option(&option_voidpp, &llbc),
         "Option<*mut *mut c_void> keeps the tag"

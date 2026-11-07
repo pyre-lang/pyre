@@ -2314,5 +2314,6 @@ two-phase-rtype-skipped	pyre_interpreter::builtins::compute_range_length
 two-phase-rtype-skipped	pyre_interpreter::builtins::w_range_new
 two-phase-rtype-skipped	pyre_interpreter::module::thread::rlock_class::<Impl>::_release_save
 two-phase-rtype-skipped	pyre_interpreter::type_methods::complex_component_spec
+two-phase-rtype-skipped	pyre_object::dictmultiobject::<Impl>::get_empty_storage
 two-phase-rtype-skipped	pyre_object::gc_hook::try_gc_alloc_collecting_rooted
 two-phase-rtype-skipped	pyre_object::unicodeobject::alloc_utf8_payload
