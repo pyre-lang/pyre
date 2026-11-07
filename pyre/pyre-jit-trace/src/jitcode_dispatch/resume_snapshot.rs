@@ -3022,13 +3022,14 @@ fn jitcode_index_names_python_code(jitcode_index: u32) -> bool {
 }
 
 /// Capture the current inlined Python frame at a translated helper call's
-/// entry boundary, for a helper whose return the walk converts before it
-/// becomes the call's result ([`HelperReturn::Converted`]). No `MIFrame`
-/// holds that conversion, so a guard inside the helper rebuilds its Python
-/// caller at the CALL and re-executes the call, while the already-paused
-/// outer frames remain below it. The caller still needs its own concrete
-/// blackhole image: without it the multi-frame conversion declines and the
-/// helper-local abort pc can escape into an outer frame's coordinate space.
+/// entry boundary, for a helper whose return is not the call's result
+/// ([`HelperReturn::Converted`] / [`HelperReturn::CalleePrologue`]). No
+/// `MIFrame` holds that conversion, so a guard inside the helper rebuilds
+/// its Python caller at the CALL and re-executes the call, while the
+/// already-paused outer frames remain below it. The caller still needs its
+/// own concrete blackhole image: without it the multi-frame conversion
+/// declines and the helper-local abort pc can escape into an outer frame's
+/// coordinate space.
 pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_jit_pc: usize,
@@ -3225,8 +3226,8 @@ impl HelperLevel {
 /// past its call (`get_list_of_active_boxes(in_a_call=True)`), then the
 /// helper. That holds only when every helper level below is numbered too and
 /// the helper's return is the call's result. An inlined Python caller that
-/// cannot pause past the call (or whose call result is converted) resumes at
-/// the CALL entry instead; an `Err` there declines the descent. A helper under
+/// cannot pause past the call (or whose return is not the call's result)
+/// resumes at the CALL entry instead; an `Err` there declines the descent. A helper under
 /// a numbered helper that cannot be numbered is pushed as
 /// [`HelperResume::Unresumable`] so its guards are refused rather than
 /// numbered at the enclosing helper's position.
@@ -3239,7 +3240,7 @@ pub(crate) fn helper_subwalk_level<Sym: WalkSym>(
         let chain = ctx.session.borrow().helper_chain();
         return Ok(match chain {
             HelperChain::Numbered => Some(
-                (ret == HelperReturn::CallResult)
+                (!ret.resumes_at_call_entry())
                     .then(|| compute_paused_helper_caller_frame(ctx, call_jit_pc).ok())
                     .flatten()
                     .map_or_else(HelperLevel::unresumable, HelperLevel::nested_section),
@@ -3247,7 +3248,7 @@ pub(crate) fn helper_subwalk_level<Sym: WalkSym>(
             HelperChain::NoHelper | HelperChain::Collapsed | HelperChain::Unresumable => None,
         });
     }
-    if ret == HelperReturn::CallResult
+    if !ret.resumes_at_call_entry()
         && let Ok(caller) = compute_inline_caller_frame(ctx, call_jit_pc)
     {
         let call_entry = if ctx.fbw_mode.inline_subwalk {
