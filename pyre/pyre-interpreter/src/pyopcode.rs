@@ -488,11 +488,12 @@ pub fn decode_instruction_forward_packed(code: &CodeObject, pc: usize) -> u64 {
 /// that walk; this returns both from the single pass. `usize::MAX` /
 /// `u64::MAX` are the corruption sentinels of the two projections.
 ///
+/// The combined return is two words, so a residual cannot publish it.
 /// Same `@jit.unroll_safe` as the two projections (`dispatch_bytecode`'s
-/// EXTENDED_ARG loop). `instruction_discriminant` rather than
-/// `u8::from(instruction)`: Charon lowers `From` as
-/// `instruction::<Impl>::from`, which is not in the CallRegistry and
-/// skips `eval_loop_jit_portal` in the prepass.
+/// EXTENDED_ARG loop); the loop is bounded by the bytecode format.
+/// `instruction_discriminant` rather than `u8::from(instruction)`: Charon
+/// lowers `From` as `instruction::<Impl>::from`, which is not in the
+/// CallRegistry and skips `eval_loop_jit_portal` in the prepass.
 #[inline]
 #[majit_macros::unroll_safe]
 pub fn decode_instruction_forward_dispatch(code: &CodeObject, pc: usize) -> (usize, u64) {

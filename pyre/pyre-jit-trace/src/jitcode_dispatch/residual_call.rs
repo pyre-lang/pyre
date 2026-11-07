@@ -7937,6 +7937,10 @@ pub(crate) fn do_not_in_trace_call_result<Sym: WalkSym>(
 /// through to the may-force residual, which is the non-standard vref path
 /// `optimize_jit_force_virtual` later folds when the box is a trace Virtual.
 ///
+/// A NULL / `vref_None` argument is `virtualref.py force_virtual_if_necessary`'s
+/// `if not inst: return inst`: the result is a known-null box, not a residual
+/// whose reconstruct later compiled `GUARD_CLASS`.
+///
 /// Missing concrete pointers for the `PTR_EQ` still fail loud: recording
 /// `CALL_MAY_FORCE_*` while PyPy would have returned `standard_box` is
 /// silent divergence.
@@ -7994,6 +7998,16 @@ pub(crate) fn walker_do_jit_force_virtual<Sym: WalkSym>(
         .trace_ctx
         .box_bits(vref_box)
         .filter(|&bits| !unresolved(bits));
+    // `virtualref.py force_virtual_if_necessary`: `if not inst: return inst`.
+    // `_do_jit_force_virtual` still PTR_EQ's a non-null non-standard box.
+    // A NULL / `vref_None` argument is that first line: the result is a
+    // known-null box so a later `GUARD_CLASS` does not compile a class
+    // load through the residual's reconstruct of this oopspec.
+    if vref_concrete == Some(0) {
+        let null = ctx.trace_ctx.const_null();
+        write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, null)?;
+        return Ok(Some(DispatchOutcome::Continue));
+    }
     let standard_concrete = ctx
         .trace_ctx
         .box_bits(standard_box)
