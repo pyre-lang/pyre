@@ -7856,16 +7856,21 @@ impl<'a> Lowering<'a> {
                 // zero-sized field occupies no storage and gets no slot,
                 // so no write is generated for it. Unit `()` / unsuffixed
                 // `Array` have no `__pos_N` member (`getattr(Tuple, __pos_0)`
-                // raises). Never ask.
-                let void = crate::codewriter::call::get_type_flag(
+                // raises). Never ask. A declared TyRef uses
+                // `tyref_is_void_zst` as the Void answer
+                // (`Struct._names_without_voids` drops a field whose
+                // lowered type IS Void).
+                let spelling_void = crate::codewriter::call::get_type_flag(
                     &field_ty,
                     &self.raw_alloc_flavor_structs,
                 )
                 .1 == majit_ir::value::Type::Void
-                    || declared_ty.is_some_and(|ty| tyref_is_void_zst(ty, self.llbc))
-                    || ((result_owner == "Tuple" || result_owner == "Array")
-                        && name.starts_with("__pos_"))
                     || crate::front::result_exc::type_spelling_is_uninhabited(&field_ty);
+                let void = declared_ty
+                    .map(|ty| tyref_is_void_zst(ty, self.llbc))
+                    .unwrap_or(spelling_void)
+                    || ((result_owner == "Tuple" || result_owner == "Array")
+                        && name.starts_with("__pos_"));
                 AggregateField {
                     name,
                     void,
@@ -8004,13 +8009,20 @@ impl<'a> Lowering<'a> {
                 // sees `BuildHasherDefault<H>` and `_names_without_voids`
                 // can drop the ZST (`rordereddict.py` has no hasher field).
                 let dest_adt = dest_ty.and_then(|ty| tyref_adt_map(ty, self.llbc));
-                let inst_adt = match head_adt {
+                let spelling_adt = match head_adt {
                     Some(h) if !render_adt_type_args(h, self.llbc, 0).is_empty() => Some(h),
                     _ => dest_adt.or(head_adt),
                 };
-                let inst_args = inst_adt
+                let inst_args = spelling_adt
                     .map(|h| render_adt_type_args(h, self.llbc, 0))
                     .unwrap_or_default();
+                // Instantiated field TyRef (`substitute_spill_typevars`):
+                // `_names_without_voids` sees `BuildHasherDefault<H>`
+                // on `RDict.hash_builder: S`, not the type-var `S`.
+                // `concrete_instantiation_adt` prefers a fully-substituted
+                // dest/head so a generic dest does not hide a concrete head.
+                let intern_adt = concrete_instantiation_adt(head_adt, dest_adt, self.llbc);
+                let subst_owner = intern_adt.map(|h| serde_json::json!({ "Adt": h.clone() }));
                 let field_rows: Vec<(String, String, Option<TyRef>)> = fields
                     .iter()
                     .enumerate()
@@ -8026,12 +8038,16 @@ impl<'a> Lowering<'a> {
                                 &self.raw_alloc_flavor_structs,
                             )
                         };
+                        let declared_ty = subst_owner
+                            .as_ref()
+                            .and_then(|owner| substitute_spill_typevars(&f.ty, owner, self.llbc))
+                            .unwrap_or_else(|| clone_tyref(&f.ty));
                         (
                             f.name.clone().unwrap_or_else(|| {
                                 majit_charon_reader::ullbc::positional_field_name(i)
                             }),
                             field_ty,
-                            Some(clone_tyref(&f.ty)),
+                            Some(declared_ty),
                         )
                     })
                     .collect();
@@ -8048,8 +8064,7 @@ impl<'a> Lowering<'a> {
                 // The aggregate head is often a bare type_id (same as the
                 // enum arm below). Prefer the destination place's
                 // TypeDeclRef when the head has no type arguments.
-                let dest_adt = dest_ty.and_then(|ty| tyref_adt_map(ty, self.llbc));
-                let inst_adt = concrete_instantiation_adt(head_adt, dest_adt, self.llbc);
+                let inst_adt = intern_adt;
                 let type_leaf = inst_adt
                     .and_then(|h| struct_instantiation_suffix(&name_path, h, self.llbc))
                     .map(|suffix| majit_ir::descr::with_instantiation_suffix(&type_leaf, &suffix))

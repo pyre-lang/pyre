@@ -14442,6 +14442,9 @@ fn field_metadata(
 /// (`heaptracker.py` `_names_without_voids`). Charon emits the std
 /// path (`core::hash::BuildHasherDefault<…>`) as Opaque without a
 /// layout, so the matcher uses the leaf rather than `layout.size`.
+/// Uninhabited atoms are `!` / TyKind `Never` / `Infallible` and the
+/// resolved std paths `core::convert::Infallible` /
+/// `std::convert::Infallible` (`type_spelling_is_uninhabited`).
 pub(crate) fn type_str_leaf_is_void_zst(type_str: &str) -> bool {
     if type_str == "()" {
         return true;
@@ -14456,7 +14459,8 @@ pub(crate) fn type_str_leaf_is_void_zst(type_str: &str) -> bool {
     // or generic container (`Vec<_>`, `PhantomData<_>`) is not.
     // `Option<`, `core::option::Option<`, and `std::option::Option<`
     // peel the same way. Bare `Never` / `Infallible` / `!` are the
-    // same Void atom (`VoidRepr`).
+    // same Void atom (`VoidRepr`) when the spelling is a TyKind or a
+    // resolved std path.
     if let Some(payload) = crate::front::result_exc::option_spelling_payload(type_str) {
         return crate::front::result_exc::type_spelling_is_uninhabited(payload);
     }
@@ -24947,6 +24951,8 @@ mod tests {
         ));
         assert!(type_str_leaf_is_void_zst("Option<!>"));
         assert!(!type_str_leaf_is_void_zst("option::Option<u8>"));
+        assert!(!type_str_leaf_is_void_zst("crate::convert::Infallible"));
+        assert!(!type_str_leaf_is_void_zst("crate::foo::Never"));
     }
 
     /// `Option<uninhabited-atom>` is Void (`_names_without_voids`).

@@ -23,13 +23,13 @@ use crate::front::mir::tests::{
     empty_struct_attrs, fixture_item_meta, fixture_llbc, graph_call_leaves, graph_ops, i64_field,
     ident_path, interior_bb, interior_caller, interior_i64, interior_local, interior_meta,
     interior_opaque, interior_raw_mut, interior_return, interior_usize, leftover_fmt_message_paths,
-    llbc_with_types, lower_object_fn, ok_ctor_shape, option_adt_node, option_enum, option_int_arg,
-    option_ok_or_else_site, push_fn_const, replace_struct_ctors, result_adt_node, result_enum,
-    rows, same_as_count, some_ctor_ops, some_ctor_shape, struct_ctor_graph, struct_ctor_ops,
-    struct_decl, struct_news, tyref_to_attr_value_type, window_call_leafs, window_empty_generics,
-    window_graph_ops, window_llbc, window_local, window_meta, window_mut_u8_ptr, window_opaque_fun,
-    window_place, window_shared_slice, window_slice, window_span, window_u8,
-    window_unwind_and_return_blocks, window_usize,
+    llbc_with_types, lower_object_fn, named_adt, ok_ctor_shape, option_adt_node, option_enum,
+    option_int_arg, option_ok_or_else_site, push_fn_const, replace_struct_ctors, result_adt_node,
+    result_enum, rows, same_as_count, some_ctor_ops, some_ctor_shape, struct_ctor_graph,
+    struct_ctor_ops, struct_decl, struct_news, type_decl_struct, tyref_to_attr_value_type,
+    window_call_leafs, window_empty_generics, window_graph_ops, window_llbc, window_local,
+    window_meta, window_mut_u8_ptr, window_opaque_fun, window_place, window_shared_slice,
+    window_slice, window_span, window_u8, window_unwind_and_return_blocks, window_usize,
 };
 
 /// Per-graph simplification after lowering — the model-layer slice of
@@ -8007,6 +8007,102 @@ fn resolve_aggregate_adt_option_unit_some_payload_is_void() {
             assert!(
                 ctor.fields[0].void,
                 "unit payload occupies no slot and gets no FieldWrite"
+            );
+        }
+        other => panic!("expected Ctor, got {other:?}"),
+    }
+}
+
+/// `RDict.hash_builder: S` instantiated at `BuildHasherDefault<H>` is
+/// Void (`lltype.py` `Struct._names_without_voids`; RPython `RDict`
+/// has no hasher field). Identity uses the substituted TyRef, not
+/// the type-var spelling.
+#[test]
+fn resolve_aggregate_adt_rdict_hasher_field_is_void() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(
+                0,
+                &["rordereddict", "RDict"],
+                vec![
+                    serde_json::json!({
+                        "name": "num_live_items",
+                        "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                        "attr_info": null
+                    }),
+                    serde_json::json!({
+                        "name": "hash_builder",
+                        "ty": {"TypeVar": {"Bound": [0, 2]}},
+                        "attr_info": null
+                    }),
+                ],
+            ),
+            type_decl_struct(1, &["dictmultiobject", "BytesKey"], vec![]),
+            type_decl_struct(2, &["pyobject", "PyObject"], vec![]),
+            type_decl_struct(3, &["core", "hash", "BuildHasherDefault"], vec![]),
+            type_decl_struct(4, &["dictmultiobject", "ObjectKeyHasher"], vec![]),
+        ],
+        vec![],
+    );
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let body: super::Unstructured = serde_json::from_value(serde_json::json!({
+        "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+    }))
+    .unwrap();
+    let dont_look_inside = std::collections::HashSet::new();
+    let accum = super::AccumulatorFacts::build(&llbc, &body);
+    let tombstoned = std::collections::HashSet::new();
+    let gc_struct_ids_llbc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let lowering = super::Lowering::new(
+        &llbc,
+        "fixture".into(),
+        &body,
+        crate::HostStaticAddrs::default(),
+        &[],
+        None,
+        &dont_look_inside,
+        &tombstoned,
+        &gc_struct_ids_llbc,
+        super::no_immutable_fields(),
+        &std::collections::HashSet::<String>::new(),
+        &accum,
+        &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+        false,
+        false,
+    )
+    .unwrap();
+    let kind = serde_json::json!({"Adt": [0]});
+    let dest = TyRef::Other(named_adt(
+        0,
+        vec![adt_node(1), adt_node(2), named_adt(3, vec![adt_node(4)])],
+    ));
+    let (_path, _leaf, fields, _, _, _) = lowering
+        .resolve_aggregate_adt(&kind, Some(&dest))
+        .expect("RDict constructor");
+    let hasher = fields
+        .iter()
+        .find(|(name, _, _)| name == "hash_builder")
+        .expect("hash_builder field");
+    assert!(
+        hasher
+            .2
+            .as_ref()
+            .is_some_and(|ty| super::tyref_is_void_zst(ty, &llbc)),
+        "instantiated hasher TyRef is Void"
+    );
+    let shape = lowering
+        .aggregate_shape(&kind, &dest, 2)
+        .expect("RDict shape");
+    match shape {
+        super::AggregateShape::Ctor(ctor) => {
+            assert_eq!(ctor.fields.len(), 2);
+            assert!(!ctor.fields[0].void, "num_live_items stays stored");
+            assert!(
+                ctor.fields[1].void,
+                "hash_builder occupies no slot (`_names_without_voids`)"
             );
         }
         other => panic!("expected Ctor, got {other:?}"),

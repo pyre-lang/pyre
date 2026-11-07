@@ -15,7 +15,7 @@ use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
 
 use majit_charon_reader::{
     Llbc,
-    ullbc::{NameSeg, TyRef},
+    ullbc::{NameSeg, TyRef, TypeDeclKind},
 };
 
 use crate::front::mir::tests::{
@@ -5634,6 +5634,30 @@ fn phantom_data_opaque(def_id: u64) -> serde_json::Value {
     })
 }
 
+fn inhabited_never_struct(def_id: u64) -> serde_json::Value {
+    type_decl_struct(
+        def_id,
+        &["Never"],
+        vec![serde_json::json!({
+            "name": null,
+            "ty": {"Scalar": {"Integer": {"Unsigned": "U32"}}},
+            "attr_info": null
+        })],
+    )
+}
+
+fn inhabited_infallible_enum(def_id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": fixture_item_meta(ident_path(&["Infallible"])),
+        "kind": {"Enum": [{
+            "name": "A",
+            "fields": [],
+            "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+        }]}
+    })
+}
+
 /// `Option<U>` is Void only when `U` is an uninhabited atom.
 /// `PhantomData<Infallible>` is Void via the PhantomData leaf.
 #[test]
@@ -5649,6 +5673,13 @@ fn option_of_uninhabited_atom_is_void_zst() {
         vec![],
     );
     let opt = |arg: serde_json::Value| TyRef::Other(option_adt_node(0, arg));
+
+    let inf_atom = TyRef::Other(adt_node(1));
+    assert!(super::tyref_decl_is_uninhabited(&inf_atom, &llbc));
+    assert!(super::tyref_is_void_zst(&inf_atom, &llbc));
+    let never_kind = TyRef::Other(serde_json::json!("Never"));
+    assert!(super::tyref_is_never(&never_kind, &llbc));
+    assert!(super::tyref_is_void_zst(&never_kind, &llbc));
 
     for (label, arg) in [
         ("Never", serde_json::json!("Never")),
@@ -5694,6 +5725,141 @@ fn option_of_uninhabited_atom_is_void_zst() {
         "PhantomData<Infallible> is Void via PhantomData"
     );
     assert!(!super::tyref_is_option_of_uninhabited(&phantom_ty, &llbc));
+}
+
+/// `struct Never(u32)` and `enum Infallible { A }` keep their storage.
+/// `_names_without_voids` (`lltype.py`) drops a field whose lowered
+/// type IS Void; a user Adt named Never / Infallible is inhabited.
+#[test]
+fn inhabited_never_struct_and_infallible_enum_are_not_void_zst() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            option_enum(0),
+            inhabited_never_struct(1),
+            inhabited_infallible_enum(2),
+            type_decl_struct(
+                3,
+                &["Holder"],
+                vec![
+                    serde_json::json!({
+                        "name": "n",
+                        "ty": adt_node(1),
+                        "attr_info": null
+                    }),
+                    serde_json::json!({
+                        "name": "i",
+                        "ty": adt_node(2),
+                        "attr_info": null
+                    }),
+                    serde_json::json!({
+                        "name": "on",
+                        "ty": option_adt_node(0, adt_node(1)),
+                        "attr_info": null
+                    }),
+                    serde_json::json!({
+                        "name": "oi",
+                        "ty": option_adt_node(0, adt_node(2)),
+                        "attr_info": null
+                    }),
+                ],
+            ),
+        ],
+        vec![],
+    );
+    let never_ty = TyRef::Other(adt_node(1));
+    let inf_ty = TyRef::Other(adt_node(2));
+    assert!(!super::tyref_is_never(&never_ty, &llbc));
+    assert!(!super::tyref_decl_is_uninhabited(&never_ty, &llbc));
+    assert!(!super::tyref_is_void_zst(&never_ty, &llbc));
+    assert!(!super::tyref_decl_is_uninhabited(&inf_ty, &llbc));
+    assert!(!super::tyref_is_void_zst(&inf_ty, &llbc));
+
+    let opt_never = TyRef::Other(option_adt_node(0, adt_node(1)));
+    let opt_inf = TyRef::Other(option_adt_node(0, adt_node(2)));
+    assert!(!super::tyref_is_option_of_uninhabited(&opt_never, &llbc));
+    assert!(!super::tyref_is_void_zst(&opt_never, &llbc));
+    assert!(!super::tyref_is_option_of_uninhabited(&opt_inf, &llbc));
+    assert!(!super::tyref_is_void_zst(&opt_inf, &llbc));
+
+    let td = llbc.type_by_id(3).expect("Holder TypeDecl");
+    let TypeDeclKind::Struct(fields) = &td.kind else {
+        panic!("Holder is a struct");
+    };
+    for f in fields {
+        let label = f.name.as_deref().unwrap_or("?");
+        assert!(
+            !super::tyref_is_void_zst(&f.ty, &llbc),
+            "Holder.{label} stays stored"
+        );
+    }
+}
+
+/// `type T = BuildHasherDefault<H>` peels to the hasher ZST
+/// (`type_node_peel_aliases`). RPython `RDict` has no hasher field
+/// (`rordereddict.py`).
+#[test]
+fn alias_of_build_hasher_default_is_void_zst() {
+    let hasher = named_adt(1, vec![adt_node(2)]);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_alias(
+                0,
+                &["dictmultiobject", "ObjectKeyBuildHasher"],
+                hasher.clone(),
+            ),
+            type_decl_struct(1, &["core", "hash", "BuildHasherDefault"], vec![]),
+            type_decl_struct(2, &["dictmultiobject", "ObjectKeyHasher"], vec![]),
+        ],
+        vec![],
+    );
+    let alias_ty = TyRef::Other(adt_node(0));
+    assert!(
+        super::tyref_is_zero_sized(&alias_ty, &llbc),
+        "ObjectKeyBuildHasher alias peels to BuildHasherDefault"
+    );
+    assert!(super::tyref_is_void_zst(&alias_ty, &llbc));
+    let direct = TyRef::Other(hasher);
+    assert!(super::tyref_is_void_zst(&direct, &llbc));
+}
+
+/// `RDict.hash_builder: S` instantiated at `BuildHasherDefault<H>` is
+/// Void (`substitute_spill_typevars`). `_names_without_voids`
+/// (`lltype.py`) drops a field whose lowered type IS Void.
+#[test]
+fn substituted_build_hasher_default_typevar_field_is_void_zst() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            type_decl_struct(
+                0,
+                &["rordereddict", "RDict"],
+                vec![serde_json::json!({
+                    "name": "hash_builder",
+                    "ty": {"TypeVar": {"Bound": [0, 2]}},
+                    "attr_info": null
+                })],
+            ),
+            type_decl_struct(1, &["dictmultiobject", "BytesKey"], vec![]),
+            type_decl_struct(2, &["pyobject", "PyObject"], vec![]),
+            type_decl_struct(3, &["core", "hash", "BuildHasherDefault"], vec![]),
+            type_decl_struct(4, &["dictmultiobject", "ObjectKeyHasher"], vec![]),
+        ],
+        vec![],
+    );
+    let field_ty = TyRef::Other(serde_json::json!({"TypeVar": {"Bound": [0, 2]}}));
+    assert!(!super::tyref_is_void_zst(&field_ty, &llbc));
+    let owner = named_adt(
+        0,
+        vec![adt_node(1), adt_node(2), named_adt(3, vec![adt_node(4)])],
+    );
+    let subst = crate::front::mir::substitute_spill_typevars(&field_ty, &owner, &llbc)
+        .expect("S instantiates to BuildHasherDefault");
+    assert!(
+        super::tyref_is_void_zst(&subst, &llbc),
+        "instantiated hasher field is lltype.Void"
+    );
 }
 
 #[test]
