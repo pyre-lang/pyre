@@ -1823,6 +1823,36 @@ pub unsafe fn w_exception_set_traceback(obj: PyObjectRef, value: PyObjectRef) {
     }
 }
 
+// W_BaseException.getdict / setdict run under PyPy's GIL
+// (`pypy/module/exceptions/interp_exceptions.py`). The stripe covers a
+// mutator that has dropped the GIL. Keyed on instance_getclass: exceptions move.
+static EXCEPTION_DICT_LOCKS: crate::objlock::LockFamily = crate::objlock::LockFamily::new();
+
+/// The guard is the zero word while `gil_ready` is unpublished.
+unsafe fn w_exception_dict_lock(obj: PyObjectRef) -> crate::objlock::ObjectLockGuard {
+    let ready = crate::gil_ready::gil_ready_word();
+    let lock = if ready != 0 {
+        unsafe { w_exception_dict_lock_acquire(obj) }
+    } else {
+        0
+    };
+    unsafe { crate::objlock::ObjectLockGuard::from_word(lock) }
+}
+
+/// # Safety
+/// `obj` must be a live exception. The caller must release the returned handle
+/// exactly once on the acquiring thread.
+#[majit_macros::dont_look_inside]
+unsafe fn w_exception_dict_lock_acquire(obj: PyObjectRef) -> usize {
+    // A nursery exception can move while its guard is held. Stripe on its
+    // stable class identity, not the movable instance address.
+    EXCEPTION_DICT_LOCKS.acquire(unsafe { crate::mapdict::instance_getclass(obj) } as usize)
+}
+
+pub fn exception_dict_locks_after_fork_child() {
+    EXCEPTION_DICT_LOCKS.after_fork_child();
+}
+
 /// `interp_exceptions.py getdict` parity —
 ///
 /// ```python
@@ -1848,9 +1878,15 @@ pub unsafe fn w_exception_getdict(obj: PyObjectRef) -> PyObjectRef {
         let obj_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(obj);
         let w_dict = crate::dictmultiobject::w_dict_new_instance();
+        let dict_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(w_dict);
+        let _guard = w_exception_dict_lock(crate::gc_roots::shadow_stack_get(obj_slot));
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let exc = obj as *mut W_BaseException;
-        (*exc).w_dict = w_dict;
+        if !(*exc).w_dict.is_null() {
+            return (*exc).w_dict;
+        }
+        (*exc).w_dict = crate::gc_roots::shadow_stack_get(dict_slot);
         exception_write_barrier(obj);
         (*exc).w_dict
     }
@@ -1876,6 +1912,15 @@ pub unsafe fn w_exception_peek_dict(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     unsafe {
+        // Contended stripe wait may collect: the receiver and dict are rooted across it and reloaded.
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(obj);
+        let value_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(w_dict);
+        let _guard = w_exception_dict_lock(crate::gc_roots::shadow_stack_get(obj_slot));
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let w_dict = crate::gc_roots::shadow_stack_get(value_slot);
         (*(obj as *mut W_BaseException)).w_dict = w_dict;
         exception_write_barrier(obj);
     }
