@@ -2049,11 +2049,23 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
         _ => sym.live_vable_frame_addr(),
     };
     let root = if live_root != 0 { live_root } else { snapshot };
+    if fbw_debug_abort_enabled() {
+        eprintln!(
+            "[pf-enter] origin={origin} snapshot={snapshot:#x} live_root={live_root:#x} \
+             root={root:#x} readable_snap={} readable_root={} depth={} frame_type={:#x}",
+            crate::state::is_readable_pyframe_addr(snapshot),
+            crate::state::is_readable_pyframe_addr(root),
+            framestack.frames.len(),
+            std::ptr::addr_of!(pyre_interpreter::pyframe::FRAME_TYPE) as usize,
+        );
+    }
     // Named by the first capability that refuses, and reported only then.
     // Emitted ahead of the test, the line announced every passing preflight
     // under the decline tag as well, so a census could not tell a rejected root
     // from an accepted one.
-    let refused = if crate::state::concrete_nlocals(snapshot).is_none() {
+    let refused = if !crate::state::is_readable_pyframe_addr(snapshot) {
+        Some("non-heap-snapshot")
+    } else if crate::state::concrete_nlocals(snapshot).is_none() {
         Some("nlocals")
     } else if crate::state::capture_frame_locals(root).is_none() {
         Some("locals")
@@ -2101,6 +2113,31 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
             return false;
         };
         let frame_ptr = frame_ptr as usize;
+        if fbw_debug_abort_enabled() {
+            let aligned = crate::state::is_aligned_gc_payload_addr(frame_ptr);
+            let ob_type = if aligned {
+                unsafe { (*(frame_ptr as *const pyre_object::PyObject)).ob_type as usize }
+            } else {
+                0
+            };
+            eprintln!(
+                "[pf-frame] origin={origin} index={index}/{} jitcode={} pc={} \
+                 frame_reg={frame_reg} frame_ptr={frame_ptr:#x} aligned={aligned} \
+                 is_frame={} ob_type={ob_type:#x}",
+                framestack.frames.len(),
+                frame.jitcode.name(),
+                frame.pc,
+                crate::state::is_readable_pyframe_addr(frame_ptr),
+            );
+        }
+        if !crate::state::is_readable_pyframe_addr(frame_ptr) {
+            latchdbg!(
+                "origin={origin} pf-non-heap-frame index={index}/{} jitcode={} frame_reg={frame_reg} frame_ptr={frame_ptr:#x}",
+                framestack.frames.len(),
+                frame.jitcode.name()
+            );
+            return false;
+        }
         let Some(stack_base) = crate::state::concrete_nlocals(frame_ptr) else {
             latchdbg!("origin={origin} pf-nlocals");
             return false;
@@ -3485,8 +3522,13 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
     frames.push(innermost.miframe);
     banks.push(innermost.banks);
     s2built!(
-        "origin={origin} BUILT multi-frame depth={}",
-        frames.frames.len()
+        "origin={origin} BUILT multi-frame depth={} names={:?}",
+        frames.frames.len(),
+        frames
+            .frames
+            .iter()
+            .map(|frame| frame.jitcode.name())
+            .collect::<Vec<_>>()
     );
     Some((frames, banks))
 }

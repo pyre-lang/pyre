@@ -5117,10 +5117,7 @@ pub(crate) fn frame_debugdata_box_is_known_non_null(ctx: &TraceCtx, op: OpRef) -
 /// the same reload applies to the frame, whose own corpse is not rewritten
 /// by `walk_pyframe_roots`.
 fn current_live_frame_array(frame: usize) -> Option<(usize, *mut pyre_object::FixedObjectArray)> {
-    if frame == 0 {
-        return None;
-    }
-    let frame = majit_gc::gc_current_object_address(frame);
+    let frame = live_pyframe_addr(frame)?;
     let arr_ptr = unsafe {
         *((frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
             as *const *mut pyre_object::FixedObjectArray)
@@ -5280,12 +5277,52 @@ pub(crate) fn concrete_frame_array_len(frame: usize) -> Option<usize> {
     Some(unsafe { &*arr_ptr }.len())
 }
 
+/// `gc/base.py is_valid_gc_object`: a GCREF is an object or NULL.
+/// `header_of` needs a `GcHeader` immediately before the payload, so a
+/// word smaller than `GcHeader::SIZE` is not a payload either. An
+/// unaligned word is not a GCREF.
+pub(crate) fn is_aligned_gc_payload_addr(frame: usize) -> bool {
+    if frame == 0 || frame < majit_gc::header::GcHeader::SIZE {
+        return false;
+    }
+    let align = std::mem::align_of::<usize>();
+    frame & (align - 1) == 0
+}
+
+/// Follow a nursery forwarding stub, then require `ob_type == FRAME_TYPE`.
+///
+/// `incminimark.py get_possibly_forwarded_type_id` resolves the live
+/// object before `get_type_id`. On 64-bit the stub's first payload word
+/// is the forwarding address, so a type check on the old address reads
+/// that word as `ob_type`.
+fn live_pyframe_addr(frame: usize) -> Option<usize> {
+    if !is_aligned_gc_payload_addr(frame) {
+        return None;
+    }
+    let live = majit_gc::gc_current_object_address(frame);
+    if !is_aligned_gc_payload_addr(live) {
+        return None;
+    }
+    if !unsafe { py_type_check(live as PyObjectRef, &pyre_interpreter::pyframe::FRAME_TYPE) } {
+        return None;
+    }
+    Some(live)
+}
+
+/// A live `PyFrame` is an aligned GCREF whose `ob_type` is `FRAME_TYPE`
+/// (`specialize.rs` / `PyFrame::new`). Preflight (`concrete_nlocals`)
+/// returns `None` here rather than load `pycode` at
+/// `PYFRAME_PYCODE_OFFSET` from a Ref-bank word that is only GCREF-shaped.
+pub(crate) fn is_readable_pyframe_addr(frame: usize) -> bool {
+    live_pyframe_addr(frame).is_some()
+}
+
 /// pyframe.py:111: valuestackdepth = co_nlocals + ncellvars + nfreevars.
 /// Returns the stack base index (nlocals + ncells) for the given frame.
 /// This is the number of non-stack slots in the unified locals_cells_stack_w
 /// array: local variables + cell/free variable slots.
 fn concrete_code_object(frame: usize) -> Option<&'static pyre_interpreter::CodeObject> {
-    let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
+    let frame_ptr = live_pyframe_addr(frame)? as *const u8;
     let w_code =
         unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
     if w_code.is_null() {
@@ -5320,6 +5357,7 @@ pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
 /// overrun `locals_cells_stack_w`, or the frame is already at the merge
 /// point's depth.
 pub(crate) fn merge_point_stack_depth_to_recover(frame: usize, target_pc: usize) -> Option<usize> {
+    let frame = live_pyframe_addr(frame)?;
     let concrete = concrete_stack_depth(frame)?;
     let w_code = unsafe {
         *((frame as *const u8).add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const usize)
@@ -5335,10 +5373,7 @@ pub(crate) fn merge_point_stack_depth_to_recover(frame: usize, target_pc: usize)
 
 /// Return the absolute valuestackdepth.
 pub(crate) fn concrete_stack_depth(frame: usize) -> Option<usize> {
-    if frame == 0 {
-        return None;
-    }
-    let frame = majit_gc::gc_current_object_address(frame);
+    let frame = live_pyframe_addr(frame)?;
     Some(unsafe { *((frame as *const u8).add(PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize) })
 }
 
@@ -16700,6 +16735,35 @@ mod tests {
             ctx.virtualizable_data_boxes().len(),
             crate::virtualizable_gen::NUM_VABLE_SCALARS + array_len,
         );
+    }
+
+    /// `gc/base.py is_valid_gc_object`: a GCREF is an object or NULL.
+    /// A near-null even word (an fd in a Ref bank) must not load `pycode`.
+    #[test]
+    fn concrete_nlocals_rejects_a_near_null_frame_word() {
+        assert_eq!(concrete_nlocals(0), None);
+        assert_eq!(concrete_nlocals(4), None);
+        assert_eq!(concrete_stack_depth(4), None);
+        assert_eq!(concrete_frame_array_len(4), None);
+        assert!(!is_readable_pyframe_addr(4));
+        assert!(!is_aligned_gc_payload_addr(4));
+    }
+
+    /// `specialize.rs` identifies a live `PyFrame` by `ob_type == FRAME_TYPE`.
+    /// An aligned `INT_TYPE` header must not load `pycode` at
+    /// `PYFRAME_PYCODE_OFFSET`.
+    #[test]
+    fn concrete_nlocals_rejects_a_non_frame_object() {
+        let mut obj = pyre_object::PyObject {
+            ob_type: &super::INT_TYPE,
+            w_class: std::ptr::null_mut(),
+        };
+        let addr = (&mut obj) as *mut pyre_object::PyObject as usize;
+        assert!(is_aligned_gc_payload_addr(addr));
+        assert!(!is_readable_pyframe_addr(addr));
+        assert_eq!(concrete_nlocals(addr), None);
+        assert_eq!(concrete_stack_depth(addr), None);
+        assert_eq!(concrete_frame_array_len(addr), None);
     }
 
     /// A walk that resumed from a guard leaves `PyFrame.valuestackdepth` at
