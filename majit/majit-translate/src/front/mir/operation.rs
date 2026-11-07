@@ -1605,6 +1605,86 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// `getfield_raw_i` of a raw pointer field, then `lltype.cast_int_to_ptr`
+    /// (`ann_cast_int_to_ptr`) when that word is used as a Ref dest.
+    /// `rewrite_op_getfield` banks the dest as `getkind(RESULT)`; aliasing
+    /// the dest as the Ref lets `align_gc_link_args` restamp it `GcRef` and
+    /// the assembler refuses `getfield_raw_r`.
+    pub(in crate::front::mir) fn emit_raw_int_field_as_ref_dest(
+        &mut self,
+        mir_bb: usize,
+        value: Variable,
+        dest_ty: &TyRef,
+    ) -> Variable {
+        if crate::model::FunctionGraph::concretetype_of(&value)
+            != crate::model::ConcreteType::Signed
+        {
+            return value;
+        }
+        if tyref_is_one_word_storage_raw_value(
+            dest_ty,
+            self.llbc,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        ) {
+            return value;
+        }
+        // `&mut i64` is the address of that field (`rptr.py` interior of
+        // a primitive). Recasting the loaded word stores the scalar as a
+        // pointer (`mut_borrow_of_struct_field_writes_the_word_back`).
+        // `&mut ActionFlag` is a Ref of a raw ADT: the FieldRead loaded
+        // a pointer (`SpaceActionFlag.ptr`) and still recasts.
+        if tyref_is_ref_of_primitive(dest_ty, self.llbc) {
+            return value;
+        }
+        let dest_vt = tyref_to_value_type_with(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        );
+        // `&mut ActionFlag` is a Charon `Ref` whose storage-raw pointee
+        // paints Int (`ty_is_raw_address`). FUNC.RESULT is still `r`
+        // (`rclass.py` `getinstancerepr` of the class), so aliasing the
+        // `getfield_raw` dest lets `align_gc_link_args` restamp it.
+        if !matches!(dest_vt, ValueType::Ref(_)) && !output_type_is_ref(dest_ty, self.llbc) {
+            return value;
+        }
+        if !self.producer_is_raw_int_field_read(&value) {
+            return value;
+        }
+        if let Some(root) = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves) {
+            return self.cast_ref_word(mir_bb, value, &root);
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        let dest = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(dest.clone()),
+            kind: cast_int_to_ptr_call(value),
+        });
+        dest
+    }
+
+    fn producer_is_raw_int_field_read(&self, value: &Variable) -> bool {
+        let Some((block_id, idx)) = resolve_to_producer_op(&self.graph, value) else {
+            return false;
+        };
+        let Some(op) = self.graph.block(block_id).operations.get(idx) else {
+            return false;
+        };
+        matches!(
+            &op.kind,
+            OpKind::FieldRead {
+                ty: ValueType::Int | ValueType::Unsigned,
+                field,
+                ..
+            } if field.owner_declared_gc == Some(false)
+        )
+    }
+
     /// Named instance class of `value`, walking a `cast_int_to_ptr` to
     /// its operand so a later identity recast sees the round-trip source
     /// (`FieldRead` / call dest), not the GCREF word `ann_cast_int_to_ptr`
@@ -1828,8 +1908,12 @@ impl<'a> Lowering<'a> {
                 // Plain use — reuse the operand's Variable without
                 // emitting a copy op. RPython does the same: a flow
                 // graph never has a redundant `same_as` between two
-                // Variables that already alias.
-                Ok((None, v))
+                // Variables that already alias. A raw Int field used as
+                // a Ref dest still needs `cast_int_to_ptr`.
+                Ok((
+                    None,
+                    self.emit_raw_int_field_as_ref_dest(mir_bb, v, dest_ty),
+                ))
             }
             Rvalue::BinaryOp(op_json, lhs, rhs) => {
                 // Peek kinds before `resolve_operand` consumes the
@@ -2704,7 +2788,10 @@ impl<'a> Lowering<'a> {
                 // A Deref reborrow of an existing `&[u8]` keeps the identity.
                 let v = self.resolve_place(mir_bb, place)?;
                 self.mark_place_address_of(mir_bb, projection, before, &v);
-                Ok((None, v))
+                Ok((
+                    None,
+                    self.emit_raw_int_field_as_ref_dest(mir_bb, v, dest_ty),
+                ))
             }
             // `RawPtr { place, ... }` — `&raw const x` / `&raw mut x`.
             // Same aliasing model as `Ref`: the JIT treats raw pointers
@@ -2724,7 +2811,10 @@ impl<'a> Lowering<'a> {
                 let before = self.graph.block(self.emit_bb(mir_bb)).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
                 self.mark_place_address_of(mir_bb, projection, before, &v);
-                Ok((None, v))
+                Ok((
+                    None,
+                    self.emit_raw_int_field_as_ref_dest(mir_bb, v, dest_ty),
+                ))
             }
             // `Repeat(elem, elem_ty, count)` — `[v; N]` literal. The
             // decodable shape follows upstream `transform.py` and
@@ -2973,7 +3063,10 @@ impl<'a> Lowering<'a> {
                     }
                     return Ok((Some(bank), converted));
                 }
-                Ok((None, v))
+                Ok((
+                    None,
+                    self.emit_raw_int_field_as_ref_dest(mir_bb, v, dest_ty),
+                ))
             }
             // `Len(place)` — slice / array length. Synthetic 1-arg
             // call; needs no descriptor for now.
@@ -3247,9 +3340,11 @@ impl<'a> Lowering<'a> {
                         // content word (`history.getkind` int). The
                         // virtual ctor is a Ref; returning it disagrees
                         // with FUNC.RESULT (`func_result_kind`,
-                        // `interpret_abort_switch_to_blackhole`).
+                        // `interpret_abort_switch_to_blackhole`). A
+                        // pointer field (`Holder.p` CCHARP) stays the
+                        // virtual store; Return packs a leftover.
                         if pair_lens.iter().all(Option::is_none)
-                            && tyref_is_one_word_storage_raw_value(
+                            && tyref_one_word_storage_raw_packs_as_word(
                                 dest_ty,
                                 self.llbc,
                                 self.gc_struct_ids,
@@ -6835,9 +6930,13 @@ impl<'a> Lowering<'a> {
                     // `W_BytesObject.data` is the `rstr.py` `STR` owner.
                     // `SomePtr.getattr` (`lltype.py`) of a pointer field stays
                     // SomePtr. A registered GC pointer dest is
-                    // `cast_base_ptr_to_instance`.
+                    // `cast_base_ptr_to_instance`. A Ref dest that is not a
+                    // registered class still needs `cast_int_to_ptr` so the
+                    // `getfield_raw` dest stays Signed.
                     if owner_declared_gc == Some(false) {
-                        return Ok(self.recast_gcref_word_to_registered_dest(bb_id, &place_ty, res));
+                        let recast =
+                            self.recast_gcref_word_to_registered_dest(bb_id, &place_ty, res);
+                        return Ok(self.emit_raw_int_field_as_ref_dest(mir_bb, recast, &place_ty));
                     }
                     return Ok(res);
                 }
@@ -7445,47 +7544,15 @@ impl<'a> Lowering<'a> {
                 if let ProjectionElem::Atom(name) = &elem
                     && name == "Deref"
                 {
-                    let inner_is_raw_ptr = tyref_is_raw_pointer(&inner.ty, self.llbc);
-                    let inner_ty = clone_tyref(&inner.ty);
                     let base = self.resolve_place(mir_bb, *inner)?;
                     // `*p` of a raw pointer is the address word
                     // (`history.py` `getkind` of `Ptr` with `_gckind ==
-                    // 'raw'` is `'int'`). Aliasing that word as the
-                    // referent lets `align_gc_link_args` restamp the
-                    // `getfield_raw` dest `GcRef` when the return is a
-                    // GC/`Ref` struct (`rewrite_op_getfield` then
-                    // refuses `getfield_raw_r`). A primitive deref is
-                    // `raw_load` above; a one-word storage-raw pointee
-                    // is the word itself.
-                    if (inner_is_raw_ptr || scalar_address)
-                        && crate::model::FunctionGraph::concretetype_of(&base)
-                            == crate::model::ConcreteType::Signed
-                    {
-                        let dest_vt = tyref_to_value_type_with(
-                            &place_ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                            &self.raw_alloc_flavor_structs,
-                        );
-                        if matches!(dest_vt, ValueType::Ref(_)) {
-                            if let Some(root) =
-                                tyref_class_root_with(&place_ty, self.llbc, self.tombstoned_leaves)
-                            {
-                                return Ok(self.cast_ref_word(mir_bb, base, &root));
-                            }
-                            let bb_id = self.emit_bb(mir_bb);
-                            let ptr_ty =
-                                overlay_field_lltype(&inner_ty, self.llbc, self.gc_struct_ids);
-                            return Ok(emit_dest_typed_cast_int_to_ptr(
-                                &mut self.graph,
-                                bb_id,
-                                base,
-                                ptr_ty,
-                            ));
-                        }
-                    }
-                    return Ok(base);
+                    // 'raw'` is `'int'`). A primitive deref is `raw_load`
+                    // above; a one-word storage-raw pointee is the word
+                    // itself. A Ref pointee of a raw Int field is
+                    // `cast_int_to_ptr` so the `getfield_raw` dest stays
+                    // Signed.
+                    return Ok(self.emit_raw_int_field_as_ref_dest(mir_bb, base, &place_ty));
                 }
                 match elem {
                     ProjectionElem::Tagged(_) | ProjectionElem::Atom(_) => {

@@ -1742,6 +1742,13 @@ impl<'a> Lowering<'a> {
             if tyref_is_raw_pointer(passed, self.llbc) {
                 continue;
             }
+            // A Signed actual is already the content word or the
+            // interior address; install skips it. A recast of that
+            // word (`opaque_traced_method_self_root`) leaves a Ref
+            // current (`RootScope::get`) and must still collect so
+            // install rebinds to the word. Extracting a true `&E`
+            // pointer that is already Signed would pass `e.x`; that
+            // actual is Signed and is skipped at install.
             if !tyref_is_storage_raw_spill_actual(
                 passed,
                 self.llbc,
@@ -1802,7 +1809,13 @@ impl<'a> Lowering<'a> {
         if let Some(decls) = type_decl_struct_fields(td, self.llbc) {
             let mut fields = Vec::new();
             for (i, field) in decls.iter().enumerate() {
-                if tyref_is_void_zst(&field.ty, self.llbc) {
+                // Void occupies no storage (`heaptracker.py`
+                // `_names_without_voids`). `PhantomData` is size 0
+                // (`type_str_leaf_is_void_zst`); a trailing ZST must
+                // not become a GC-ref field (`RootScope._not_send`).
+                if tyref_is_void_zst(&field.ty, self.llbc)
+                    || tyref_is_zero_sized(&field.ty, self.llbc)
+                {
                     continue;
                 }
                 let name = super::field_decl_name(i, field);
@@ -1963,6 +1976,17 @@ impl<'a> Lowering<'a> {
         reg.raw_word_owners.contains(stripped) || reg.raw_word_owners.contains(leaf)
     }
 
+    /// Result of an `OpKind::Input` in this graph: a parameter, not a
+    /// constructed virtual. One-word extract of that pointer would
+    /// FieldRead a field of `e` (`raw_ptr_method_call`).
+    fn var_is_graph_input(&self, var: &Variable) -> bool {
+        self.graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(op.kind, OpKind::Input { .. }) && op.result.as_ref() == Some(var)
+            })
+        })
+    }
+
     /// `lltype.malloc(..., flavor='raw')` of the pointee, copy the
     /// virtual fields in, and pass that pointer. Arguments that alias
     /// one Variable share the allocation. An actual that is already
@@ -2003,6 +2027,19 @@ impl<'a> Lowering<'a> {
                 // case rebinds to the word below, it is not skipped.
                 if crate::model::FunctionGraph::concretetype_of(arg)
                     == crate::model::ConcreteType::Signed
+                {
+                    continue;
+                }
+                // `fn f(e: &E) { e.m() }`: the current arg is the
+                // pointer Input itself, possibly unstamped. Extracting
+                // would FieldRead `e.x`. A leftover virtual
+                // (`emit_aggregate_ctor` dest, same Variable, Unknown)
+                // is not an Input: extract the content word
+                // (`RootScope::get`). A recast uses a different
+                // Variable and falls through.
+                if spill.one_word
+                    && arg == &resolved_args[spill.index]
+                    && self.var_is_graph_input(arg)
                 {
                     continue;
                 }

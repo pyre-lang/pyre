@@ -5073,6 +5073,38 @@ impl CallControl {
         Some(layout)
     }
 
+    /// `symbolic.get_size(STRUCT)` from harvested field rows, not cached
+    /// on the layout table. `jtransform.py _rewrite_raw_malloc` sizes a
+    /// residual `lltype.malloc(..., flavor='raw')` from the STRUCT; a
+    /// test that only `set_struct_fields` still has those `_names`.
+    /// Caching here would mint a heuristic layout for `fielddescrof`.
+    pub(crate) fn heuristic_layout_from_field_rows(
+        &self,
+        name: &str,
+    ) -> Option<std::rc::Rc<StructLayout>> {
+        let rows = self.struct_fields.field_rows(name)?;
+        if rows.is_empty() {
+            return None;
+        }
+        let pairs: Vec<(String, String)> = rows
+            .iter()
+            .map(|row| (row.name.clone(), row.ty.clone()))
+            .collect();
+        let imm_ranks: HashMap<String, crate::model::ImmutableRank> = self
+            .immutable_fields_by_struct
+            .get(name)
+            .map(|fields| fields.iter().cloned().collect())
+            .unwrap_or_default();
+        Some(std::rc::Rc::new(StructLayout::from_type_strings(
+            &pairs,
+            &self.known_struct_names,
+            &HashMap::new(),
+            &HashMap::new(),
+            &imm_ranks,
+            &self.raw_alloc_flavor_structs,
+        )))
+    }
+
     /// `Struct._gckind` for a type whose layout was registered.
     /// `None` when `name` is not one analysed struct or enum.
     pub fn declared_gckind_for(
@@ -16461,6 +16493,30 @@ mod tests {
         assert_eq!(layout.fields[0].size, 8);
         assert_eq!(layout.fields[0].flag, ArrayFlag::Struct);
         assert_eq!(layout.size, 8);
+    }
+
+    /// `symbolic.get_size(STRUCT)` of a harvested named struct: field rows
+    /// alone size a residual `raw_malloc`, without `register_struct_ids`.
+    /// Nested unknown names are a word.
+    #[test]
+    fn named_struct_layout_from_field_rows_sizes_raw_malloc() {
+        let owner = "dictmultiobject::DictOperationGuard";
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![
+                ("roots".into(), "gc_roots::RootScope".into()),
+                ("root_base".into(), "usize".into()),
+            ],
+        );
+        cc.set_struct_fields(fields);
+        let layout = cc
+            .heuristic_layout_from_field_rows(owner)
+            .expect("heuristic size from field rows");
+        let word = crate::layout::target_word_size();
+        assert_eq!(layout.size, 2 * word);
+        assert_eq!(layout.align, word);
     }
 
     /// `engine::Request.pattern_codes` is `&[u32]` (two words). Sequential

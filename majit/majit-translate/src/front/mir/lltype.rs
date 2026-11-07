@@ -2128,6 +2128,14 @@ pub(in crate::front::mir) fn declared_raw_adt_node<'a>(
     if majit_charon_reader::ullbc::is_closure_leaf(leaf) {
         return None;
     }
+    // A STR-family newtype (`celldict.py` StrKey, `rstr` STR) erases to
+    // the inner string. Packing FieldReads `__pos_0` of that identity.
+    if is_str_family_class_root(&name) || is_str_family_class_root(leaf) {
+        return None;
+    }
+    if adt_is_transparent_str_pointer_newtype(node, llbc) {
+        return None;
+    }
     if tyref_is_zero_sized(&TyRef::Other(node.clone()), llbc) {
         return None;
     }
@@ -2141,6 +2149,35 @@ pub(in crate::front::mir) fn declared_raw_adt_node<'a>(
         return None;
     }
     Some(node)
+}
+
+/// `#[repr(transparent)]` over a STR pointer (`StrPtrKey(*mut Utf8Str)`).
+/// Erasure is the field's lltype (`ValueType::Str`), not a class-root
+/// table (`celldict.py` StrKey).
+fn adt_is_transparent_str_pointer_newtype(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    let Some(def_id) = adt_node_def_id(node) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(def_id) else {
+        return false;
+    };
+    if !td.is_repr_transparent() {
+        return false;
+    }
+    let Some(fields) = type_decl_struct_fields(td, llbc) else {
+        return false;
+    };
+    let mut found = None;
+    for field in fields {
+        if tyref_is_void_zst(&field.ty, llbc) {
+            continue;
+        }
+        if found.is_some() {
+            return false;
+        }
+        found = Some(&field.ty);
+    }
+    found.is_some_and(|ty| tyref_raw_ptr_pointee_is_string_value(ty, llbc))
 }
 
 /// The ADT's fields are raw words: scalars, nested raw structs, or one
@@ -2221,6 +2258,13 @@ pub(in crate::front::mir) fn adt_fields_are_raw_storage(
     stack: &mut Vec<u64>,
 ) -> bool {
     fields.iter().enumerate().all(|(i, field)| {
+        // Void occupies no storage (`heaptracker.py`
+        // `_names_without_voids`). An Opaque `PhantomData` is not
+        // itself a raw word; skipping it keeps the owner raw
+        // (`RootScope._not_send`).
+        if tyref_is_void_zst(&field.ty, llbc) || tyref_is_zero_sized(&field.ty, llbc) {
+            return true;
+        }
         if field_ty_is_raw_word(&field.ty, llbc, gc_struct_ids, immutable_fields, stack) {
             return true;
         }
@@ -2293,7 +2337,171 @@ pub(in crate::front::mir) fn tyref_is_one_word_storage_raw_value(
     let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
         return false;
     };
-    json_ty_byte_size(node, llbc) == Some(crate::layout::target_word_size() as i64)
+    if json_ty_byte_size(node, llbc) != Some(crate::layout::target_word_size() as i64) {
+        return false;
+    }
+    // A unique pointer field that is not a storage-raw ADT address
+    // is a handle: `ObjPtrKey(*mut Obj)` stays a constructor
+    // (`bookkeeper.py` `immutablevalue` of an instance) and
+    // `Holder.p` stays the CCHARP store (`rffi.py` CCHARP).
+    // `SpaceActionFlag` (`*mut ActionFlag` raw) is that address word.
+    if tyref_one_word_is_pointer_handle(ty, llbc, gc_struct_ids) {
+        return false;
+    }
+    // `Atomic<T>` is a field of the parent (`rptr.py` `InteriorPtrRepr`),
+    // not a packed content word. Packing `Inner { tag: AtomicU64 }` as
+    // Int recasts that word to a new instance, and FieldRead of `tag`
+    // no longer traces to the owner.
+    !tyref_one_word_has_atomic_interior_field(ty, llbc)
+}
+
+/// By-value nested `Atomic<T>` field, or a nested raw ADT that has one.
+/// Pointer fields are not interiors (`SpaceActionFlag.ptr`).
+fn tyref_one_word_has_atomic_interior_field(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_one_word_has_atomic_interior_field_inner(ty, llbc, &mut Vec::new())
+}
+
+fn tyref_one_word_has_atomic_interior_field_inner(
+    ty: &TyRef,
+    llbc: &Llbc,
+    stack: &mut Vec<u64>,
+) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    if one_level_pointer_pointee(node, llbc).is_some() {
+        return false;
+    }
+    let Some(def_id) = adt_node_def_id(node) else {
+        return false;
+    };
+    if stack.contains(&def_id) {
+        return false;
+    }
+    let Some(td) = llbc.type_by_id(def_id) else {
+        return false;
+    };
+    let Some(fields) = type_decl_struct_fields(td, llbc) else {
+        return false;
+    };
+    stack.push(def_id);
+    let found = fields.iter().any(|field| {
+        if tyref_is_void_zst(&field.ty, llbc) || tyref_is_zero_sized(&field.ty, llbc) {
+            return false;
+        }
+        if tyref_atomic_arg(&field.ty, llbc).is_some() {
+            return true;
+        }
+        tyref_one_word_has_atomic_interior_field_inner(&field.ty, llbc, stack)
+    });
+    stack.pop();
+    found
+}
+
+/// Unique non-void field is a pointer whose pointee is not a
+/// storage-raw ADT.
+fn tyref_one_word_is_pointer_handle(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    let Some(def_id) = adt_node_def_id(node) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(def_id) else {
+        return false;
+    };
+    let Some(fields) = type_decl_struct_fields(td, llbc) else {
+        return false;
+    };
+    let mut found = None;
+    for field in fields {
+        if tyref_is_void_zst(&field.ty, llbc) || tyref_is_zero_sized(&field.ty, llbc) {
+            continue;
+        }
+        if found.is_some() {
+            return false;
+        }
+        found = Some(&field.ty);
+    }
+    let Some(field_ty) = found else {
+        return false;
+    };
+    if !field_ty_is_pointer_word(field_ty, llbc) {
+        return false;
+    }
+    let Some(field_node) = tyref_node(field_ty, llbc).and_then(|n| strip_ty_indirections(n, llbc))
+    else {
+        return true;
+    };
+    let Some(pointee) =
+        one_level_pointer_pointee(field_node, llbc).and_then(|n| strip_ty_indirections(n, llbc))
+    else {
+        return true;
+    };
+    declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields()).is_none()
+}
+
+/// Pack construction into the content word (`SwitchToBlackhole` i32+bool,
+/// `RootScope.save_point`). A unique pointer field (`Holder.p` CCHARP)
+/// is stored as that field (`rffi.py` CCHARP); packing drops the store.
+/// Return still packs a leftover virtual
+/// (`emit_one_word_storage_raw_from_virtual`).
+pub(in crate::front::mir) fn tyref_one_word_storage_raw_packs_as_word(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> bool {
+    tyref_is_one_word_storage_raw_value(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+        && !tyref_one_word_storage_raw_has_pointer_field(ty, llbc)
+}
+
+fn tyref_one_word_storage_raw_has_pointer_field(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    let Some(def_id) = adt_node_def_id(node) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(def_id) else {
+        return false;
+    };
+    let Some(fields) = type_decl_struct_fields(td, llbc) else {
+        return true;
+    };
+    fields.iter().any(|field| {
+        // `PhantomData` is size 0 (`type_str_leaf_is_void_zst`).
+        // `tyref_is_void_zst` already includes that except a
+        // fieldless enum; skip both so a trailing ZST is not a
+        // pointer field (`RootScope._not_send`).
+        !tyref_is_void_zst(&field.ty, llbc)
+            && !tyref_is_zero_sized(&field.ty, llbc)
+            && field_ty_is_pointer_word(&field.ty, llbc)
+    })
+}
+
+/// Pointer-shaped field: `*mut T` / `&T` / `Box` / `NonNull`.
+/// A void ZST is not a pointer; do not consult `tyref_is_void_zst` first
+/// (`*mut u8` CCHARP has no layout row and must still skip packing).
+fn field_ty_is_pointer_word(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_peel_one_raw_ptr_node(ty, llbc).is_some()
+        || tyref_peel_one_ref_node(ty, llbc).is_some()
+        || tyref_is_raw_u8_ptr(ty, llbc)
+        || tyref_is_raw_pointer(ty, llbc)
+    {
+        return true;
+    }
+    tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_indirections(n, llbc))
+        .is_some_and(|n| {
+            n.get("RawPtr").is_some()
+                || n.get("Ref").is_some()
+                || one_level_pointer_pointee(n, llbc).is_some()
+        })
 }
 
 /// Non-void fields of a one-word storage-raw ADT: `(name, byte offset, byte size)`.
@@ -3295,9 +3503,21 @@ pub(in crate::front::mir) fn adt_field_read_value_type(
             // A by-value raw struct such as `Position` is not a GC
             // pointer. `getkind` of that word is int, so the load is
             // `getfield_raw_i`. A mutable `getfield_raw_r` is refused.
+            // An `Atomic<T>` interior (`rptr.py` `InteriorPtrRepr`)
+            // stays the parent class: packing it as Int recasts a new
+            // instance and FieldRead of the atomic field drops the owner.
             if tyref_is_raw_value(place_ty, llbc, gc_struct_ids)
                 || tyref_is_raw_value(field_ty, llbc, gc_struct_ids)
             {
+                if tyref_one_word_has_atomic_interior_field(place_ty, llbc)
+                    || tyref_one_word_has_atomic_interior_field(field_ty, llbc)
+                {
+                    if let Some(root) = tyref_class_root_with(place_ty, llbc, tombstoned)
+                        .or_else(|| tyref_class_root_with(field_ty, llbc, tombstoned))
+                    {
+                        return ValueType::Ref(Some(root));
+                    }
+                }
                 return ValueType::Int;
             }
             tyref_to_value_type_with(
@@ -7094,18 +7314,22 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
             }
             // A STR-pointer field already returned above: the value is
             // `ValueType::Str` from the field lltype, whatever the
-            // wrapper is named. A registered GC pointer that reaches
-            // this arm is a different word (`IdentityKey`, `PyError`).
-            // Peeling it would intern the handle as the payload, so the
-            // wrapper stays.
-            if registered_gc_ptr_class_root_with(
-                &field_ty,
-                llbc,
-                tombstoned,
-                gc_struct_ids,
-                raw_alloc_flavor_structs,
-            )
-            .is_some()
+            // wrapper is named. A classed instance pointer
+            // (`IdentityKey`, `PyError`, `ObjPtrKey`) is a different
+            // word. Peeling it would intern the handle as the payload,
+            // so the wrapper stays. `*mut Obj` may paint Int when the
+            // pointee is not in `gc_struct_ids`; the field is still
+            // that instance pointer.
+            if transparent_field_is_classed_pointer(&field_ty, llbc, gc_struct_ids)
+                || matches!(inner, ValueType::Ref(_))
+                || registered_gc_ptr_class_root_with(
+                    &field_ty,
+                    llbc,
+                    tombstoned,
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                )
+                .is_some()
             {
                 return None;
             }
@@ -7113,6 +7337,30 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
         }
         _ => None,
     }
+}
+
+/// Unique field is a pointer to a named non-raw ADT (`*mut Obj`).
+/// A STR pointer already returned `ValueType::Str`; a scalar / raw
+/// struct pointer stays the inner word (`history.getkind` int).
+fn transparent_field_is_classed_pointer(
+    field_ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
+    let Some(node) = tyref_node(field_ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    let Some(pointee) = one_level_pointer_pointee(node, llbc) else {
+        return false;
+    };
+    let Some(pointee) = strip_ty_indirections(pointee, llbc) else {
+        return false;
+    };
+    if pointee.get("Scalar").is_some() || node_is_string_value(pointee, llbc) {
+        return false;
+    }
+    adt_node_def_id(pointee).is_some()
+        && declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields()).is_none()
 }
 
 pub(in crate::front::mir) fn transparent_scalar_value_type(

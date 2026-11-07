@@ -3547,7 +3547,7 @@ impl<'a> Lowering<'a> {
                 {
                     self.emit_one_word_storage_raw_from_virtual(mir_bb, &ret, ret_ty)
                 } else {
-                    ret
+                    self.emit_raw_int_field_as_ref_dest(mir_bb, ret, ret_ty)
                 };
                 self.graph.set_return(bb_id, Some(ret));
                 Ok(())

@@ -560,9 +560,66 @@ fn str_family_dict_key_newtype_constructs_as_str() {
         .expect("lower ObjPtrKey wrap");
     assert!(
         graph_has_wrapper_ctor_or_pos0(&wrap_obj),
-        "a transparent newtype over a non-STR GC object pointer stays a constructor; graph={}",
+        "a transparent newtype over a non-STR GC object pointer stays a constructor; dump={}; graph={}",
+        objptrkey_classifier_dump(&obj_llbc),
         wrap_obj.dump()
     );
+}
+
+fn objptrkey_classifier_dump(llbc: &Llbc) -> String {
+    use super::{
+        adt_node_def_id, adt_path_is_gc_container, declared_raw_adt_node, no_immutable_fields,
+        one_level_pointer_pointee, registered_gc_ptr_class_root_with, strip_ty_indirections,
+        transparent_field_is_classed_pointer, ty_is_raw_address,
+        tyref_is_one_word_storage_raw_value, tyref_is_raw_pointer, tyref_node,
+        tyref_one_word_is_pointer_handle, tyref_one_word_storage_raw_has_pointer_field,
+        tyref_one_word_storage_raw_packs_as_word, tyref_to_value_type_with,
+        tyref_transparent_inner_value_type,
+    };
+    let facts = crate::front::mir::harvest_declared_gc_facts(llbc);
+    let gc = facts.gc_struct_ids();
+    let flavor = std::collections::HashSet::<String>::new();
+    let tomb = no_tombstoned_leaves();
+    let wrapper = wrapper_tyref();
+    let inner_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    });
+    let inner_ptr = TyRef::Other(serde_json::json!({"RawPtr": [inner_adt.clone(), "Mut"]}));
+    let obj = TyRef::Other(inner_adt.clone());
+    let vec_path = llbc
+        .type_by_id(2)
+        .map(|td| td.item_meta.name_path())
+        .unwrap_or_else(|| "<missing>".into());
+    let obj_node = tyref_node(&obj, llbc).and_then(|n| strip_ty_indirections(n, llbc));
+    let ptr_node = tyref_node(&inner_ptr, llbc).and_then(|n| strip_ty_indirections(n, llbc));
+    let ptr_pointee =
+        ptr_node.and_then(|n| one_level_pointer_pointee(n, llbc).and_then(adt_node_def_id));
+    format!(
+        "vec_path={vec_path:?} gc_container_vec={gc_container} gc_ids={gc_n} obj_raw={obj_raw} \
+         ptr_raw_addr={ptr_raw} ptr_is_rawptr={ptr_rawptr} ptr_pointee={ptr_pointee:?} \
+         inner_vt={inner_vt:?} wrapper_vt={wrapper_vt:?} transparent_inner={transparent:?} \
+         registered_gc={reg:?} classed_ptr={classed} classed_handle={handle} \
+         wrapper_one_word={one_word} wrapper_has_ptr={has_ptr} wrapper_packs={packs} \
+         obj_decl={obj_decl:?} ptr_node={ptr_node:?}",
+        gc_container = adt_path_is_gc_container(llbc, 2),
+        gc_n = gc.len(),
+        obj_raw =
+            obj_node.is_some_and(
+                |n| declared_raw_adt_node(n, llbc, &gc, no_immutable_fields()).is_some()
+            ),
+        ptr_raw = ty_is_raw_address(&inner_ptr, llbc, &gc, &flavor),
+        ptr_rawptr = tyref_is_raw_pointer(&inner_ptr, llbc),
+        inner_vt = tyref_to_value_type_with(&inner_ptr, llbc, tomb, &gc, &flavor),
+        wrapper_vt = tyref_to_value_type_with(&wrapper, llbc, tomb, &gc, &flavor),
+        transparent = tyref_transparent_inner_value_type(&wrapper, llbc, tomb, &gc, &flavor),
+        reg = registered_gc_ptr_class_root_with(&inner_ptr, llbc, tomb, &gc, &flavor),
+        classed = transparent_field_is_classed_pointer(&inner_ptr, llbc, &gc),
+        handle = tyref_one_word_is_pointer_handle(&wrapper, llbc, &gc),
+        one_word = tyref_is_one_word_storage_raw_value(&wrapper, llbc, &gc, &flavor),
+        has_ptr = tyref_one_word_storage_raw_has_pointer_field(&wrapper, llbc),
+        packs = tyref_one_word_storage_raw_packs_as_word(&wrapper, llbc, &gc, &flavor),
+        obj_decl = llbc.type_by_id(0).map(|td| td.item_meta.name_path()),
+    )
 }
 
 /// `shadow_stack_get(base) as *mut UnicodeValueStorage` in the real
@@ -1982,6 +2039,216 @@ fn packed_i32_bool_storage_raw_struct_is_one_word() {
     );
 }
 
+/// `RootScope { save_point: usize, _not_send: PhantomData<*const ()> }`:
+/// the trailing ZST is not a pointer field, so the struct packs as the
+/// save-point word (`history.getkind` int).
+#[test]
+fn phantom_data_field_does_not_block_one_word_pack() {
+    let word = crate::layout::target_word_size() as u64;
+    let word_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let phantom = serde_json::json!({
+        "def_id": 1,
+        "item_meta": fixture_item_meta(ident_path(&["core", "marker", "PhantomData"])),
+        "kind": {"Struct": []},
+        "layout": [{
+            "key": "host",
+            "value": {
+                "size": 0,
+                "align": 1,
+                "variant_layouts": [{"field_offsets": []}],
+                "repr": {"transparent": false}
+            }
+        }]
+    });
+    let phantom_ty = serde_json::json!({"Adt": {
+        "id": 1,
+        "generics": {
+            "regions": [],
+            "types": [{"RawPtr": [{"Tuple": []}, "Shared"]}],
+            "const_generics": [],
+            "trait_refs": []
+        },
+        "builtin": null
+    }});
+    let mut owner = struct_decl(
+        0,
+        ident_path(&["fixture", "RootScope"]),
+        serde_json::json!([
+            {"name": "save_point", "ty": word_ty, "attr_info": null},
+            {"name": "_not_send", "ty": phantom_ty, "attr_info": null}
+        ]),
+        false,
+    );
+    owner["layout"] = serde_json::json!([{
+        "key": "host",
+        "value": {
+            "size": word,
+            "align": word,
+            "variant_layouts": [{"field_offsets": [0, word]}],
+            "repr": {"transparent": false}
+        }
+    }]);
+    let adt = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [], "types": [],
+                "const_generics": [], "trait_refs": []
+            },
+            "builtin": null
+        }
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [owner, phantom],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
+        std::collections::HashSet::new();
+    let empty_flavor: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let by_value = TyRef::Other(adt);
+    let phantom_field = TyRef::Other(serde_json::json!({"Adt": {
+        "id": 1,
+        "generics": {
+            "regions": [],
+            "types": [{"RawPtr": [{"Tuple": []}, "Shared"]}],
+            "const_generics": [],
+            "trait_refs": []
+        },
+        "builtin": null
+    }}));
+    assert!(
+        super::tyref_is_zero_sized(&phantom_field, &llbc),
+        "PhantomData is size 0"
+    );
+    assert!(
+        super::tyref_is_void_zst(&phantom_field, &llbc),
+        "PhantomData is Void (`_names_without_voids`)"
+    );
+    assert!(
+        !super::tyref_one_word_storage_raw_has_pointer_field(&by_value, &llbc),
+        "trailing PhantomData is not a pointer field"
+    );
+    assert!(
+        super::tyref_is_one_word_storage_raw_value(&by_value, &llbc, &empty_gc, &empty_flavor),
+        "RootScope is the save_point word"
+    );
+    assert!(
+        super::tyref_one_word_storage_raw_packs_as_word(&by_value, &llbc, &empty_gc, &empty_flavor),
+        "construction packs save_point"
+    );
+}
+
+/// `Inner { tag: AtomicU64 }` is a word-sized raw struct, but the atomic
+/// field is `InteriorPtrRepr` of the parent. Packing it as Int recasts
+/// the word to a new instance and FieldRead of `tag` drops the owner.
+#[test]
+fn atomic_field_struct_is_not_one_word_pack() {
+    let word = crate::layout::target_word_size() as u64;
+    let u64_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+    let atomic_ty = serde_json::json!({"Adt": {
+        "id": 0,
+        "generics": {
+            "regions": [],
+            "types": [u64_ty],
+            "const_generics": [],
+            "trait_refs": []
+        },
+        "builtin": null
+    }});
+    let inner_ty = serde_json::json!({"Adt": {
+        "id": 1,
+        "generics": {
+            "regions": [], "types": [],
+            "const_generics": [], "trait_refs": []
+        },
+        "builtin": null
+    }});
+    let atomic = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["core", "sync", "atomic", "Atomic"])),
+        "kind": "Opaque"
+    });
+    let mut inner = struct_decl(
+        1,
+        ident_path(&["fixture", "Inner"]),
+        serde_json::json!([{"name": "tag", "ty": atomic_ty, "attr_info": null}]),
+        false,
+    );
+    inner["layout"] = serde_json::json!([{
+        "key": "host",
+        "value": {
+            "size": word,
+            "align": word,
+            "variant_layouts": [{"field_offsets": [0]}],
+            "repr": {"transparent": false}
+        }
+    }]);
+    let mut owner = struct_decl(
+        2,
+        ident_path(&["fixture", "Owner"]),
+        serde_json::json!([{"name": "inner", "ty": inner_ty, "attr_info": null}]),
+        false,
+    );
+    owner["layout"] = serde_json::json!([{
+        "key": "host",
+        "value": {
+            "size": word,
+            "align": word,
+            "variant_layouts": [{"field_offsets": [0]}],
+            "repr": {"transparent": false}
+        }
+    }]);
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [atomic, inner, owner],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
+        std::collections::HashSet::new();
+    let empty_flavor: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let inner_adt = TyRef::Other(serde_json::json!({"Adt": {
+        "id": 1,
+        "generics": {
+            "regions": [], "types": [],
+            "const_generics": [], "trait_refs": []
+        },
+        "builtin": null
+    }}));
+    let owner_adt = TyRef::Other(serde_json::json!({"Adt": {
+        "id": 2,
+        "generics": {
+            "regions": [], "types": [],
+            "const_generics": [], "trait_refs": []
+        },
+        "builtin": null
+    }}));
+    assert!(
+        !super::tyref_is_one_word_storage_raw_value(&inner_adt, &llbc, &empty_gc, &empty_flavor),
+        "Inner {{ tag: AtomicU64 }} is InteriorPtrRepr, not a packed word"
+    );
+    assert!(
+        !super::tyref_is_one_word_storage_raw_value(&owner_adt, &llbc, &empty_gc, &empty_flavor),
+        "Owner {{ inner: Inner }} is not a packed word of that interior"
+    );
+}
+
 /// A by-value multi-word storage-raw struct stays the virtual aggregate
 /// (`history.getkind` of the `Ptr` is the address, not the content).
 /// Its borrow is that address (`ty_is_raw_address`).
@@ -2077,6 +2344,97 @@ fn multi_word_storage_raw_struct_by_value_is_ref_borrow_is_int() {
     assert!(
         super::tyref_is_storage_raw_spill_actual(&by_value, &llbc, &empty_gc, &empty_flavor),
         "identity-alias of that borrow is the by-value virtual"
+    );
+}
+
+/// `Holder { p: *mut u8 }` is one-word storage-raw, but the field is
+/// CCHARP. Packing would drop the Unsigned store.
+#[test]
+fn holder_ccharp_field_does_not_pack_as_word() {
+    let word = crate::layout::target_word_size() as u64;
+    let p_ty = mut_u8_ty_json();
+    let mut owner = struct_decl(
+        0,
+        ident_path(&["fixture", "Holder"]),
+        serde_json::json!([{
+            "name": "p",
+            "ty": p_ty,
+            "attr_info": null
+        }]),
+        false,
+    );
+    owner["layout"] = serde_json::json!([{
+        "key": "host",
+        "value": {
+            "size": word,
+            "align": word,
+            "variant_layouts": [{"field_offsets": [0]}],
+            "repr": {"transparent": false}
+        }
+    }]);
+    let adt = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [], "types": [],
+                "const_generics": [], "trait_refs": []
+            },
+            "builtin": null
+        }
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [owner],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
+        std::collections::HashSet::new();
+    let empty_flavor: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let by_value = TyRef::Other(adt);
+    let p_tyref = TyRef::Other(mut_u8_ty_json());
+    let td = llbc.type_by_id(0).expect("Holder decl");
+    let fields = super::type_decl_struct_fields(td, &llbc);
+    let field0_ty = fields
+        .and_then(|f| f.first())
+        .map(|f| format!("{:?}", f.ty.label()));
+    assert!(
+        super::tyref_one_word_is_pointer_handle(&by_value, &llbc, &empty_gc),
+        "Holder.p CCHARP is a pointer handle, not a packed word"
+    );
+    assert!(
+        !super::tyref_is_one_word_storage_raw_value(&by_value, &llbc, &empty_gc, &empty_flavor),
+        "Holder construction stays the CCHARP FieldWrite"
+    );
+    assert!(
+        super::tyref_is_raw_pointer(&p_tyref, &llbc),
+        "p_ty json is RawPtr; field0={field0_ty:?} peel={:?}",
+        super::tyref_peel_one_raw_ptr_node(&p_tyref, &llbc).is_some()
+    );
+    assert!(
+        super::field_ty_is_pointer_word(&p_tyref, &llbc),
+        "p is a pointer word; field0={field0_ty:?}"
+    );
+    assert!(
+        super::tyref_one_word_storage_raw_has_pointer_field(&by_value, &llbc),
+        "Holder.p is a pointer field; field0={field0_ty:?} fields={}",
+        fields.map(|f| f.len()).unwrap_or(0)
+    );
+    assert!(
+        !super::tyref_one_word_storage_raw_packs_as_word(
+            &by_value,
+            &llbc,
+            &empty_gc,
+            &empty_flavor
+        ),
+        "Holder construction stays the CCHARP FieldWrite"
     );
 }
 

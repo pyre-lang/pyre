@@ -7025,11 +7025,16 @@ impl<'a> Transformer<'a> {
                     "raw malloc of {owner} has no CallControl; size comes from CallControl::struct_layout_for"
                 )
             });
-            cc.struct_layout_for(owner).unwrap_or_else(|| {
-                panic!(
-                    "raw malloc of {owner} has no StructLayout; size comes from CallControl::struct_layout_for"
-                )
-            })
+            // `lltype.malloc(STRUCT, flavor='raw')` sizes from the STRUCT
+            // (`symbolic.get_size`). Production registered exact layouts;
+            // a test that only `set_struct_fields` still has `_names`.
+            cc.struct_layout_for(owner)
+                .or_else(|| cc.heuristic_layout_from_field_rows(owner))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "raw malloc of {owner} has no StructLayout; size comes from CallControl::struct_layout_for"
+                    )
+                })
         };
         // `support.py build_ll_0_raw_malloc_fixedsize` calls
         // `lltype.malloc(STRUCT, flavor='raw')`, which is C `malloc`.
