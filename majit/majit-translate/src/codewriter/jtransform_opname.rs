@@ -328,6 +328,7 @@ fn transduce_op(
                     OpKind::ArrayLen {
                         base,
                         array_type_id: array_type_id_of(&array),
+                        array: Some(array.clone()),
                         nolength: array_nolength(&array),
                         gckind: crate::model::ArrayGcKind::Gc,
                     },
@@ -449,12 +450,14 @@ fn transduce_op(
                         length: size,
                         item_ty,
                         array_type_id,
+                        array: Some(array.clone()),
                     }
                 } else {
                     OpKind::NewArray {
                         length: size,
                         item_ty,
                         array_type_id,
+                        array: Some(array.clone()),
                     }
                 };
                 out.push_op_with_result_var(block, kind, result);
@@ -1373,6 +1376,7 @@ fn emit_getarrayitem(
                 index,
                 item_ty: value_type_of(&result),
                 array_type_id: array_type_id_of(&array),
+                array: Some(array.clone()),
                 nolength: array_nolength(&array),
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: array._immutable_field(),
@@ -1401,6 +1405,7 @@ fn emit_getarrayitem(
                 index,
                 item_ty,
                 array_type_id: array_type_id_of(&array),
+                array: Some(array.clone()),
                 nolength: array_nolength(&array),
                 gckind: crate::model::ArrayGcKind::Raw,
                 pure: false,
@@ -1446,6 +1451,7 @@ fn emit_setarrayitem(
                 item_ty: hlvalue_value_type(&op.args[2]),
                 nolength: array_nolength(&array),
                 array_type_id: array_type_id_of(&array),
+                array: Some(array.clone()),
                 gckind: crate::model::ArrayGcKind::Gc,
             },
             false,
@@ -1472,6 +1478,7 @@ fn emit_setarrayitem(
                 value,
                 item_ty,
                 array_type_id: array_type_id_of(&array),
+                array: Some(array.clone()),
                 nolength: array_nolength(&array),
                 gckind: crate::model::ArrayGcKind::Raw,
             },
@@ -3686,6 +3693,7 @@ mod tests {
                         length,
                         item_ty,
                         array_type_id,
+                        array: _,
                     } => {
                         assert_eq!(length, &n);
                         assert_eq!(*item_ty, ValueType::Void);
@@ -3743,6 +3751,7 @@ mod tests {
                     OpKind::NewArray {
                         item_ty,
                         array_type_id,
+                        array: _,
                         ..
                     } => {
                         assert_eq!(*item_ty, ValueType::Int);
@@ -3817,6 +3826,7 @@ mod tests {
                 match &op.kind {
                     OpKind::ArrayLen {
                         array_type_id,
+                        array: _,
                         nolength,
                         ..
                     } => {
@@ -3827,6 +3837,7 @@ mod tests {
                     OpKind::ArrayRead {
                         item_ty,
                         array_type_id,
+                        array: _,
                         nolength,
                         pure,
                         ..
@@ -3840,6 +3851,7 @@ mod tests {
                     OpKind::ArrayWrite {
                         item_ty,
                         array_type_id,
+                        array: _,
                         nolength,
                         ..
                     } => {
@@ -3924,6 +3936,7 @@ mod tests {
                     OpKind::ArrayRead {
                         item_ty,
                         array_type_id,
+                        array: _,
                         nolength,
                         pure,
                         ..
@@ -3937,6 +3950,7 @@ mod tests {
                     OpKind::ArrayWrite {
                         item_ty,
                         array_type_id,
+                        array: _,
                         nolength,
                         ..
                     } => {

@@ -79,22 +79,26 @@ pub fn array_identity_of_base(
                 base: b,
                 item_ty,
                 array_type_id,
+                array: _,
                 ..
             }
             | OpKind::ArrayWrite {
                 base: b,
                 item_ty,
                 array_type_id,
+                array: _,
                 ..
             } if same(b) => return Some((item_ty.clone(), array_type_id.clone())),
             OpKind::NewArray {
                 item_ty,
                 array_type_id,
+                array: _,
                 ..
             }
             | OpKind::NewArrayClear {
                 item_ty,
                 array_type_id,
+                array: _,
                 ..
             } if op.result.as_ref().is_some_and(same) => {
                 return Some((item_ty.clone(), array_type_id.clone()));
@@ -102,6 +106,7 @@ pub fn array_identity_of_base(
             OpKind::ArrayLen {
                 base: b,
                 array_type_id,
+                array: _,
                 ..
             } if len_only.is_none() && same(b) => len_only = Some(array_type_id.clone()),
             OpKind::Input {
@@ -385,6 +390,9 @@ pub fn build_ll_listslice_startonly_graph(
     array_type_id: Option<&str>,
 ) -> FunctionGraph {
     let array_type_id = array_type_id.map(str::to_string);
+    let array = array_type_id
+        .as_deref()
+        .and_then(crate::codewriter::call::array_lltype_for_op_spelling);
     let mut graph = FunctionGraph::new(name);
     let start_block = graph.startblock;
 
@@ -415,6 +423,7 @@ pub fn build_ll_listslice_startonly_graph(
         OpKind::ArrayLen {
             base: l1.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
             nolength: false,
             gckind: crate::model::ArrayGcKind::Gc,
         },
@@ -436,6 +445,7 @@ pub fn build_ll_listslice_startonly_graph(
             length: newlength.clone(),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
         },
     );
     emit_ll_arraycopy_call(&mut graph, start_block, l1, start, new_list, newlength);
@@ -457,6 +467,9 @@ pub fn build_ll_listslice_minusone_graph(
     array_type_id: Option<&str>,
 ) -> FunctionGraph {
     let array_type_id = array_type_id.map(str::to_string);
+    let array = array_type_id
+        .as_deref()
+        .and_then(crate::codewriter::call::array_lltype_for_op_spelling);
     let mut graph = FunctionGraph::new(name);
     let start_block = graph.startblock;
 
@@ -478,6 +491,7 @@ pub fn build_ll_listslice_minusone_graph(
         OpKind::ArrayLen {
             base: l1.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
             nolength: false,
             gckind: crate::model::ArrayGcKind::Gc,
         },
@@ -529,6 +543,7 @@ pub fn build_ll_listslice_minusone_graph(
             length: newlength.clone(),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
         },
     );
     let start = push(&mut graph, copy, OpKind::ConstInt(0));
@@ -559,6 +574,9 @@ pub fn build_ll_listslice_rangeto_graph(
     array_type_id: Option<&str>,
 ) -> FunctionGraph {
     let array_type_id = array_type_id.map(str::to_string);
+    let array = array_type_id
+        .as_deref()
+        .and_then(crate::codewriter::call::array_lltype_for_op_spelling);
     let mut graph = FunctionGraph::new(name);
     let start_block = graph.startblock;
 
@@ -586,6 +604,7 @@ pub fn build_ll_listslice_rangeto_graph(
         OpKind::ArrayLen {
             base: l1.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
             nolength: false,
             gckind: crate::model::ArrayGcKind::Gc,
         },
@@ -624,6 +643,7 @@ pub fn build_ll_listslice_rangeto_graph(
             length: c_len.clone(),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
         },
     );
     let start = push(&mut graph, copy, OpKind::ConstInt(0));
@@ -654,6 +674,9 @@ pub fn build_ll_listslice_startstop_graph(
     array_type_id: Option<&str>,
 ) -> FunctionGraph {
     let array_type_id = array_type_id.map(str::to_string);
+    let array = array_type_id
+        .as_deref()
+        .and_then(crate::codewriter::call::array_lltype_for_op_spelling);
     let mut graph = FunctionGraph::new(name);
     let start_block = graph.startblock;
 
@@ -683,6 +706,7 @@ pub fn build_ll_listslice_startstop_graph(
         OpKind::ArrayLen {
             base: l1.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
             nolength: false,
             gckind: crate::model::ArrayGcKind::Gc,
         },
@@ -731,6 +755,7 @@ pub fn build_ll_listslice_startstop_graph(
             length: newlength.clone(),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
         },
     );
     emit_ll_arraycopy_call(
@@ -1037,6 +1062,7 @@ mod tests {
                 index,
                 item_ty: ValueType::Ref(None),
                 array_type_id: Some("objref".into()),
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
@@ -1063,6 +1089,7 @@ mod tests {
                 index,
                 item_ty: ValueType::Ref(None),
                 array_type_id: Some("objref".into()),
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
@@ -1119,6 +1146,9 @@ mod tests {
             OpKind::ArrayLen {
                 base: args.clone(),
                 array_type_id: Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.into()),
+                array: crate::codewriter::call::array_lltype_for_op_spelling(
+                    crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID,
+                ),
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
             },
@@ -1138,6 +1168,7 @@ mod tests {
             OpKind::ArrayLen {
                 base: bytes.clone(),
                 array_type_id: Some("bytes".into()),
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
             },
@@ -1218,6 +1249,7 @@ mod tests {
             OpKind::ArrayLen {
                 base: items.clone(),
                 array_type_id: Some("[i64]".into()),
+                array: crate::codewriter::call::array_lltype_for_op_spelling("[i64]"),
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
             },
@@ -1257,6 +1289,7 @@ mod tests {
                 index,
                 item_ty: ValueType::Float,
                 array_type_id: Some("[f64]".into()),
+                array: crate::codewriter::call::array_lltype_for_op_spelling("[f64]"),
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,

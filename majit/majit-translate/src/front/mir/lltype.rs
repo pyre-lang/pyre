@@ -1037,12 +1037,15 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
         }
         // `"()"` is a declared unit (`residual_return_shell` → `s_None`).
         // `None` is unknown; `residual_return_shell` declines it.
-        // A token it declines keeps the original Skip.
+        // A bodyless extern then takes FUNC.RESULT from the LLBC fn
+        // signature (`rffi.py` `llexternal` `ext_type.RESULT` /
+        // `extfunc.py` `ExtFuncEntry.compute_result_annotation`).
+        // A token the shell declines keeps the original Skip.
         // `rffi.py llexternal`'s C pointer result is a raw address, even
         // when the C char type is u8. Rust's erased managed-byte-pointer
         // convention belongs to Rust bodies, not foreign declarations;
         // agree with tyref_to_external_lltype's Address / getkind('int').
-        let token = if fd.is_extern() && tyref_is_raw_pointer(&fd.signature.output, llbc) {
+        let mut token = if fd.is_extern() && tyref_is_raw_pointer(&fd.signature.output, llbc) {
             Some("i64".to_string())
         } else {
             dont_look_inside_return_token(
@@ -1053,6 +1056,11 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
                 raw_alloc_flavor_structs,
             )
         };
+        if token.is_none() {
+            token = crate::translator::rtyper::cutover::residual_token_from_lltype(
+                &tyref_to_external_lltype(&fd.signature.output, llbc),
+            );
+        }
         if crate::translator::rtyper::cutover::residual_return_shell(token.as_deref()).is_none() {
             continue;
         }

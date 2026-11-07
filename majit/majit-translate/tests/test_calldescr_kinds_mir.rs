@@ -119,6 +119,7 @@ fn sizehint_deref_loads_an_int_word() {
         Some(OpKind::ArrayRead {
             item_ty: ValueType::Int,
             array_type_id: Some(array_type_id),
+            array: _,
             ..
         }) if array_type_id == "[i64]" => {}
         other => {
@@ -140,6 +141,7 @@ fn sizehint_deref_loads_an_int_word() {
             OpKind::ArrayWrite {
                 item_ty: ValueType::Int,
                 array_type_id: Some(array_type_id),
+                array: _,
                 ..
             } if array_type_id == "[i64]"
         )),

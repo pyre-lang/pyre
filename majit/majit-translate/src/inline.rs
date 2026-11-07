@@ -722,28 +722,34 @@ pub(crate) fn remap_op_kind(
             length,
             item_ty,
             array_type_id,
+            array,
         } => OpKind::NewArray {
             length: remap_var(length),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
         },
         OpKind::NewArrayClear {
             length,
             item_ty,
             array_type_id,
+            array,
         } => OpKind::NewArrayClear {
             length: remap_var(length),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
         },
         OpKind::NewListClear {
             length,
             item_ty,
             array_type_id,
+            array,
         } => OpKind::NewListClear {
             length: remap_var(length),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
         },
         OpKind::FieldRead {
             base,
@@ -772,6 +778,7 @@ pub(crate) fn remap_op_kind(
             index,
             item_ty,
             array_type_id,
+            array,
             nolength,
             gckind,
             pure,
@@ -780,6 +787,7 @@ pub(crate) fn remap_op_kind(
             index: remap_var(index),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
             nolength: *nolength,
             gckind: *gckind,
             // Preserve the source foldable/immutable flag through the
@@ -790,11 +798,13 @@ pub(crate) fn remap_op_kind(
         OpKind::ArrayLen {
             base,
             array_type_id,
+            array,
             nolength,
             gckind,
         } => OpKind::ArrayLen {
             base: remap_var(base),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
             nolength: *nolength,
             gckind: *gckind,
         },
@@ -804,6 +814,7 @@ pub(crate) fn remap_op_kind(
             value,
             item_ty,
             array_type_id,
+            array,
             nolength,
             gckind,
         } => OpKind::ArrayWrite {
@@ -812,6 +823,7 @@ pub(crate) fn remap_op_kind(
             value: value.map_value(remap_var),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
             nolength: *nolength,
             gckind: *gckind,
         },
@@ -821,12 +833,14 @@ pub(crate) fn remap_op_kind(
             field,
             item_ty,
             array_type_id,
+            array,
         } => OpKind::InteriorFieldRead {
             base: remap_var(base),
             index: remap_var(index),
             field: field.clone(),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
         },
         OpKind::InteriorFieldWrite {
             base,
@@ -835,6 +849,7 @@ pub(crate) fn remap_op_kind(
             value,
             item_ty,
             array_type_id,
+            array,
         } => OpKind::InteriorFieldWrite {
             base: remap_var(base),
             index: remap_var(index),
@@ -842,6 +857,7 @@ pub(crate) fn remap_op_kind(
             value: remap_var(value),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+            array: array.clone(),
         },
         OpKind::Call {
             target,
@@ -1998,6 +2014,7 @@ mod tests {
                 index: idx_var,
                 item_ty: ValueType::Ref(None),
                 array_type_id: None,
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,

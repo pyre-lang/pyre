@@ -13563,6 +13563,7 @@ mod tests {
                 index: vars[2].clone(),
                 item_ty: ValueType::Int,
                 array_type_id: None,
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
@@ -13588,6 +13589,7 @@ mod tests {
             kind: OpKind::ArrayLen {
                 base: vars[1].clone(),
                 array_type_id: Some("[PyObjectRef]".to_string()),
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
             },
@@ -13647,6 +13649,7 @@ mod tests {
                 value: crate::model::LinkArg::Value(vars[3].clone()),
                 item_ty: ValueType::Int,
                 array_type_id: None,
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
             },
@@ -13679,6 +13682,7 @@ mod tests {
                 field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
                 item_ty: ValueType::Int,
                 array_type_id: None,
+                array: None,
             },
         };
         let translated = translate_op(&op, &value_map, &empty_call_registry())
@@ -13714,6 +13718,7 @@ mod tests {
             field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
             item_ty: ValueType::Int,
             array_type_id: None,
+            array: None,
         };
         assert!(
             op_canraise(&interior),
@@ -13789,6 +13794,7 @@ mod tests {
                 value: vars[3].clone(),
                 item_ty: ValueType::Int,
                 array_type_id: None,
+                array: None,
             },
         };
         let translated = translate_op(&op, &value_map, &empty_call_registry())

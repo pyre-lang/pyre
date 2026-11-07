@@ -6171,18 +6171,19 @@ fn search_value_type_of(var: &Variable) -> ValueType {
     }
 }
 
-fn search_array_type_id(base: &Variable) -> Option<String> {
-    let arr = match base.concretetype() {
+fn search_array_of_base(base: &Variable) -> Array {
+    match base.concretetype() {
         Some(LowLevelType::Ptr(ptr)) => match ptr.TO {
-            PtrTarget::Array(arr) => Some(arr),
-            _ => None,
+            PtrTarget::Array(arr) => arr,
+            _ => Array::gc(LowLevelType::Char),
         },
-        Some(LowLevelType::Array(arr)) => Some(*arr),
-        _ => None,
-    };
-    Some(array_type_id_of_lltype(
-        &arr.unwrap_or_else(|| Array::gc(LowLevelType::Char)),
-    ))
+        Some(LowLevelType::Array(arr)) => *arr,
+        _ => Array::gc(LowLevelType::Char),
+    }
+}
+
+fn search_array_type_id(base: &Variable) -> Option<String> {
+    Some(array_type_id_of_lltype(&search_array_of_base(base)))
 }
 
 fn search_linkarg(hlv: &Hlvalue) -> LinkArg {
@@ -6306,6 +6307,7 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
         }
         "getarraysize" => {
             let base = search_expect_var(&op.args[0]);
+            let array = Some(search_array_of_base(&base));
             let array_type_id = search_array_type_id(&base);
             let result = search_expect_var(&op.result);
             out.push_op_with_result_var(
@@ -6313,6 +6315,7 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                 OpKind::ArrayLen {
                     base,
                     array_type_id,
+                    array,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                 },
@@ -6321,6 +6324,7 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
         }
         "getarrayitem" => {
             let base = search_expect_var(&op.args[0]);
+            let array = Some(search_array_of_base(&base));
             let array_type_id = search_array_type_id(&base);
             let index = search_materialize(out, block, &op.args[1]);
             let result = search_expect_var(&op.result);
@@ -6331,6 +6335,7 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                     index,
                     item_ty: search_value_type_of(&result),
                     array_type_id,
+                    array,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
@@ -6340,6 +6345,7 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
         }
         "setarrayitem" => {
             let base = search_expect_var(&op.args[0]);
+            let array = Some(search_array_of_base(&base));
             let array_type_id = search_array_type_id(&base);
             let index = search_materialize(out, block, &op.args[1]);
             let value = search_linkarg(&op.args[2]);
@@ -6355,6 +6361,7 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                     value,
                     item_ty,
                     array_type_id,
+                    array,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                 },
@@ -6465,6 +6472,7 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                     result,
                 );
             } else {
+                let array = Some(search_array_of_base(&result));
                 let array_type_id = search_array_type_id(&result);
                 out.push_op_with_result_var(
                     block,
@@ -6472,6 +6480,7 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                         length,
                         item_ty: ValueType::Int,
                         array_type_id,
+                        array,
                     },
                     result,
                 );

@@ -1290,6 +1290,7 @@ mod tests {
                     index,
                     item_ty: ValueType::Int,
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
@@ -1338,6 +1339,7 @@ mod tests {
                         array_type_id.as_deref(),
                     ),
                     array_type_id,
+                    array: None,
                     nolength,
                 },
             });
@@ -1909,6 +1911,7 @@ mod tests {
         let arraylen = OpKind::ArrayLen {
             base: base.clone(),
             array_type_id: None,
+            array: None,
             nolength: false,
             gckind: crate::model::ArrayGcKind::Gc,
         };

@@ -847,6 +847,7 @@ fn slice_marker_suffix(graph: &FunctionGraph, slice: &Variable) -> Option<String
             OpKind::ArrayLen {
                 base,
                 array_type_id: Some(id),
+                array: _,
                 ..
             } if same(base) => {
                 if let Some((item_ty, array_type_id)) = identity_from_array_type_id(id) {
@@ -1113,6 +1114,7 @@ mod tests {
                 OpKind::ArrayLen {
                     base: slice.clone(),
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                 },
@@ -1215,6 +1217,7 @@ mod tests {
                 OpKind::ArrayLen {
                     base: receiver_b,
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                 },
@@ -1265,6 +1268,7 @@ mod tests {
                 OpKind::ArrayLen {
                     base: site_slice,
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                 },
@@ -1975,6 +1979,7 @@ mod tests {
                     index: slot.clone(),
                     item_ty: ValueType::Ref(None),
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
@@ -1992,6 +1997,7 @@ mod tests {
                     value: LinkArg::Value(base),
                     item_ty: ValueType::Ref(None),
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                 },
@@ -2234,6 +2240,7 @@ mod tests {
                 OpKind::ArrayLen {
                     base: slice.clone(),
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                 },
@@ -2268,6 +2275,7 @@ mod tests {
                 OpKind::ArrayLen {
                     base: slice.clone(),
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                 },
@@ -2301,6 +2309,7 @@ mod tests {
                 OpKind::ArrayLen {
                     base: slice.clone(),
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                 },
@@ -2425,6 +2434,7 @@ mod tests {
                 OpKind::ArrayLen {
                     base: cast,
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                 },
@@ -2921,6 +2931,7 @@ mod tests {
             OpKind::ArrayLen {
                 base: slice.clone(),
                 array_type_id: Some("[i64]".into()),
+                array: crate::codewriter::call::array_lltype_for_op_spelling("[i64]"),
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
             },

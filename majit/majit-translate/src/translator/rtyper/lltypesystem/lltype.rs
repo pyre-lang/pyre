@@ -8205,6 +8205,78 @@ mod tests {
     }
 
     #[test]
+    fn hashing_self_referential_gcstruct_ptr_and_gcarray_terminates() {
+        // `LowLevelType.__hash__`: hashing `Ptr` of a recursive GcStruct
+        // (built through `GcForwardReference.become`) and `GcArray` of
+        // that Ptr must terminate, and the same value hashes equally twice.
+        let fwd = ForwardReference::gc();
+        let body = Struct::gc(
+            "T",
+            vec![(
+                "next".into(),
+                LowLevelType::Ptr(Box::new(Ptr {
+                    TO: PtrTarget::ForwardReference(fwd.clone()),
+                })),
+            )],
+        );
+        fwd.r#become(LowLevelType::Struct(Box::new(body))).unwrap();
+        let ptr_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::ForwardReference(fwd),
+        }));
+
+        let mut first = std::collections::hash_map::DefaultHasher::new();
+        ptr_ty.hash(&mut first);
+        let ptr_hash = first.finish();
+        let mut second = std::collections::hash_map::DefaultHasher::new();
+        ptr_ty.hash(&mut second);
+        assert_eq!(ptr_hash, second.finish());
+
+        let arr = Array::gc(ptr_ty);
+        let mut first = std::collections::hash_map::DefaultHasher::new();
+        arr.hash(&mut first);
+        let arr_hash = first.finish();
+        let mut second = std::collections::hash_map::DefaultHasher::new();
+        arr.hash(&mut second);
+        assert_eq!(arr_hash, second.finish());
+    }
+
+    #[test]
+    fn separately_constructed_gcarray_char_eq_and_hash() {
+        let a = Array::gc(LowLevelType::Char);
+        let b = Array::gc(LowLevelType::Char);
+        assert_eq!(a, b);
+        let mut left = std::collections::hash_map::DefaultHasher::new();
+        a.hash(&mut left);
+        let mut right = std::collections::hash_map::DefaultHasher::new();
+        b.hash(&mut right);
+        assert_eq!(left.finish(), right.finish());
+    }
+
+    #[test]
+    fn gcarray_eq_distinguishes_item_type_and_struct_identity() {
+        assert_ne!(
+            Array::gc(LowLevelType::Signed),
+            Array::gc(LowLevelType::Unsigned)
+        );
+        let ptr_t = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc("T", vec![("x".into(), LowLevelType::Signed)])),
+        }));
+        let ptr_u = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc("U", vec![("x".into(), LowLevelType::Signed)])),
+        }));
+        assert_ne!(Array::gc(ptr_t), Array::gc(ptr_u));
+        let named_signed = Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+            "x",
+            vec![("v".into(), LowLevelType::Signed)],
+        ))));
+        let named_float = Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+            "x",
+            vec![("v".into(), LowLevelType::Float)],
+        ))));
+        assert_ne!(named_signed, named_float);
+    }
+
+    #[test]
     fn debug_of_recursive_struct_type_terminates() {
         // A recursive struct type — a struct with a `Ptr` field pointing
         // back to itself, e.g. `pyframe::PyFrame` — is legal. Formatting

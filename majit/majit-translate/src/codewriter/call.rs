@@ -1342,14 +1342,67 @@ pub enum RwTag {
 }
 
 /// One effect tuple's identity. `index` is the `DescrIndexRegistry` slot
-/// of `(T, fieldname)` / `ARRAY`. That slot is keyed by the owner's name
-/// alone, so a struct effect also carries the owner's `StructId`: two
-/// structs spelled with one name are two `T`s.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// of `(T, fieldname)` / `ARRAY` when a descr is allocated. That slot is
+/// keyed by the owner's name alone, so a struct effect also carries the
+/// owner's `StructId`: two structs spelled with one name are two `T`s.
+/// Array / interiorfield tuples carry the interned ARRAY id
+/// (`effectinfo_from_writeanalyze` `add_array` / `add_interiorfield`).
+/// A FieldOffset over a Struct or FixedSizeArray allocates no ei_index
+/// (`add_interiorfield` returns); those keys hold the lltype itself.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct RwKey {
     tag: RwTag,
     index: u32,
     owner_id: Option<majit_ir::descr::StructId>,
+    array_id: Option<u64>,
+    unconsidered: Option<RwUnconsidered>,
+}
+
+impl RwKey {
+    fn field(tag: RwTag, index: u32, owner_id: Option<majit_ir::descr::StructId>) -> Self {
+        Self {
+            tag,
+            index,
+            owner_id,
+            array_id: None,
+            unconsidered: None,
+        }
+    }
+
+    fn array(tag: RwTag, index: u32, array_id: u64) -> Self {
+        Self {
+            tag,
+            index,
+            owner_id: None,
+            array_id: Some(array_id),
+            unconsidered: None,
+        }
+    }
+
+    fn unconsidered(tag: RwTag, unconsidered: RwUnconsidered) -> Self {
+        Self {
+            tag,
+            index: 0,
+            owner_id: None,
+            array_id: None,
+            unconsidered: Some(unconsidered),
+        }
+    }
+
+    fn with_tag(&self, tag: RwTag) -> Self {
+        let mut key = self.clone();
+        key.tag = tag;
+        key
+    }
+}
+
+/// Container of a writeanalyze tuple that is not an `lltype.Array`
+/// (`writeanalyze.py` `_get_effect_for_offset` still emits it;
+/// `add_interiorfield` / `consider_array` then drop it).
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum RwUnconsidered {
+    Struct(crate::translator::rtyper::lltypesystem::lltype::Struct),
+    FixedSizeArray(crate::translator::rtyper::lltypesystem::lltype::FixedSizeArray),
 }
 
 /// The rest of an effect tuple: what `add_struct` / `add_array` /
@@ -1362,7 +1415,7 @@ pub enum RwOperand {
         name: String,
     },
     Array {
-        array_type_id: Option<String>,
+        array: Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
         ir_type: majit_ir::value::Type,
         len_offset: Option<usize>,
         /// `consider_array(T)` (`effectinfo.py`): `ARRAY.OF is not Void`
@@ -1370,7 +1423,7 @@ pub enum RwOperand {
         consider: bool,
     },
     InteriorField {
-        array_type_id: Option<String>,
+        array: Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
         field_name: String,
         len_offset: Option<usize>,
         /// `isinstance(T, lltype.Array) and consider_array(T)`
@@ -1441,7 +1494,7 @@ impl AnalyzerResult for ReadWriteEffects {
                 }
                 let into = std::sync::Arc::make_mut(&mut set);
                 for (key, operand) in other.iter() {
-                    into.entry(*key).or_insert_with(|| operand.clone());
+                    into.entry(key.clone()).or_insert_with(|| operand.clone());
                 }
                 Self::Set(set)
             }
@@ -1465,21 +1518,6 @@ type ReadWriteAnalyzedCalls = UnionFind<GraphKey, Dependency<ReadWriteEffects>>;
 
 /// `DependencyTracker(self.readwrite_analyzer)` (`call.py` `seen_rw`).
 type ReadWriteTracker = DependencyTracker<ReadWriteEffects, GraphKey>;
-
-/// What `resolve_array_identity` reads off a result, standing in for
-/// `op.args[0].concretetype`.
-enum ValueProducer {
-    Field {
-        owner_root: Option<String>,
-        name: String,
-    },
-    Array {
-        array_type_id: String,
-    },
-    Call {
-        target: CallTarget,
-    },
-}
 
 /// `FreshMallocs` (writeanalyze.py): which variables can only hold an
 /// object this graph allocated itself.
@@ -1594,70 +1632,18 @@ impl FreshMallocs {
     }
 }
 
-/// `compute_graph_info(graph)` of the read/write analyzer: `FreshMallocs(graph)`,
-/// plus the `value_producers` / `phi_sources` that give each array
-/// operand its ARRAY type.
+/// `compute_graph_info(graph)` of the read/write analyzer:
+/// `FreshMallocs(graph)`. Array / interiorfield tuples take the ARRAY
+/// from `OpKind.array` / `op.args[0].concretetype`
+/// (`writeanalyze.py` `analyze_simple_operation`).
 struct ReadWriteGraphInfo {
     fresh_mallocs: FreshMallocs,
-    value_producers: HashMap<crate::flowspace::model::Variable, ValueProducer>,
-    phi_sources: HashMap<crate::flowspace::model::Variable, Option<LinkArg>>,
 }
 
 impl ReadWriteGraphInfo {
     fn new(graph: &FunctionGraph) -> Self {
-        let mut value_producers: HashMap<crate::flowspace::model::Variable, ValueProducer> =
-            HashMap::new();
-        for op in graph.blocks.iter().flat_map(|b| &b.operations) {
-            let Some(var) = op.result.as_ref() else {
-                continue;
-            };
-            // `producer_array_identity` returns `None` for every other kind,
-            // including `ArrayRead` with no `array_type_id` and `Input`, the
-            // same answer as a missing key. A later ignored result clears an
-            // earlier kept one so last-insert still wins.
-            let kept = match &op.kind {
-                OpKind::FieldRead { field, .. } => Some(ValueProducer::Field {
-                    owner_root: field.owner_root.clone(),
-                    name: field.name.clone(),
-                }),
-                OpKind::ArrayRead {
-                    array_type_id: Some(array_type_id),
-                    ..
-                } => Some(ValueProducer::Array {
-                    array_type_id: array_type_id.clone(),
-                }),
-                OpKind::Call { target, .. } => Some(ValueProducer::Call {
-                    target: target.clone(),
-                }),
-                _ => None,
-            };
-            match kept {
-                Some(kind) => {
-                    value_producers.insert(var.clone(), kind);
-                }
-                None => {
-                    value_producers.remove(var);
-                }
-            }
-        }
-        let mut phi_sources: HashMap<crate::flowspace::model::Variable, Option<LinkArg>> =
-            HashMap::new();
-        for block in &graph.blocks {
-            for link in &block.exits {
-                if let Some(target_block) = graph.blocks.get(link.target.0) {
-                    for (target_arg, src) in target_block.inputargs.iter().zip(link.args.iter()) {
-                        phi_sources
-                            .entry(target_arg.clone())
-                            .and_modify(|entry| *entry = None)
-                            .or_insert_with(|| Some(src.clone()));
-                    }
-                }
-            }
-        }
         Self {
             fresh_mallocs: FreshMallocs::new(graph),
-            value_producers,
-            phi_sources,
         }
     }
 }
@@ -3162,6 +3148,17 @@ impl StoreCore {
         entries
     }
 
+    /// `(path, GraphKey)` for every registered spelling. Does not clone a
+    /// declaration header (`iter_declared` / `slot_declaration`).
+    pub(crate) fn iter_path_keys(&self) -> Vec<(CallPath, GraphKey)> {
+        self.register_declared();
+        self.path_to_key
+            .borrow()
+            .iter()
+            .map(|(path, key)| (path.clone(), key.clone()))
+            .collect()
+    }
+
     /// Remove one built graph so a caller can mutate it while still
     /// borrowing the rest of the store. Alias paths keep their `GraphKey`.
     fn take_graph(&mut self, key: &GraphKey) -> Option<(FunctionGraph, Vec<CallPath>, bool)> {
@@ -3797,6 +3794,15 @@ impl JitPolicy for BfsPolicyView<'_> {
     }
 }
 
+/// One handle per ARRAY lltype, as `GcCache._cache_array` keys
+/// `get_array_descr` on the ARRAY object (`LowLevelType.__eq__`).
+#[derive(Clone, Debug, Default)]
+struct ArrayIntern {
+    ids: rustc_hash::FxHashMap<crate::translator::rtyper::lltypesystem::lltype::Array, u64>,
+    /// Index is the interned id.
+    arrays: Vec<crate::translator::rtyper::lltypesystem::lltype::Array>,
+}
+
 pub struct CallControl {
     /// Registered graphs, keyed by call path through a funcobj-identity
     /// indirection so alias spellings share one `FunctionGraph` (and thus
@@ -4021,6 +4027,25 @@ pub struct CallControl {
     /// (`heap.py:540-560`, `heap.rs`'s `array_effect_index`).
     pub descr_indices: DescrIndexRegistry,
 
+    /// One handle per ARRAY lltype, as `GcCache._cache_array` keys
+    /// `get_array_descr` on the ARRAY object (`LowLevelType.__eq__`).
+    /// `RefCell` so `arraydescrof` (`&self`) can intern, matching
+    /// `DescrIndexRegistry.inner`.
+    array_intern: std::cell::RefCell<ArrayIntern>,
+    /// Codewriter descr objects keyed by interned ARRAY id. Distinct
+    /// ARRAYs get distinct Arcs even when their dump spelling hashes
+    /// the same (`path_hash` stays the runtime identity until Step 7).
+    array_descrs: std::cell::RefCell<
+        rustc_hash::FxHashMap<u64, std::sync::Arc<dyn majit_ir::descr::ArrayDescr>>,
+    >,
+    /// First interned ARRAY id that published a given `path_hash` into
+    /// `gc_cache._cache_array`. Later ARRAYs with the same dump reuse
+    /// that runtime hash but mint a fresh Arc.
+    array_descr_path_hash_owner: std::cell::RefCell<rustc_hash::FxHashMap<u64, u64>>,
+    /// Interior-field descrs keyed by `(ARRAY id, field name)`.
+    interiorfield_descrs:
+        std::cell::RefCell<rustc_hash::FxHashMap<(u64, String), majit_ir::descr::DescrRef>>,
+
     /// The effect analyzers' `_analyzed_calls` results. `call.py`
     /// builds `raise_analyzer`, `virtualizable_analyzer`,
     /// `quasiimmut_analyzer`, `randomeffects_analyzer` and
@@ -4048,10 +4073,8 @@ pub struct CallControl {
     /// `ArrayFlag::Struct` (like RPython's `isinstance(TYPE, lltype.Struct)`).
     known_struct_names: HashSet<String>,
 
-    /// RPython: struct field type info — maps struct_name → [(field_name, type_string)].
-    /// Used by `resolve_array_identity` to determine the ARRAY element type
-    /// when the base of an array access comes from a FieldRead.
-    /// Equivalent to `op.args[0].concretetype.TO` in RPython's rtyped graph.
+    /// Struct field type info — maps struct_name → [(field_name, type_string)].
+    /// `field_type` / `struct_field_entries` feed `cpu.fielddescrof`.
     struct_fields: crate::front::StructFieldRegistry,
 
     /// The interpreter's fallible-return carrier (`ErrorCarrierSpec`): the
@@ -4600,12 +4623,10 @@ impl StructLayout {
 /// with three independent counters (`next_field_index`,
 /// `next_array_index`, `next_interiorfield_index`).
 ///
-/// Array descriptors are keyed by `(item_ty, array_type_id, len_offset)` per
-/// RPython's `cpu.arraydescrof(ARRAY)`, which distinguishes by ARRAY
-/// lltype identity, including `ARRAY._hints['nolength']`
-/// (`GcArray(Signed)` vs `GcArray(Ptr(STRUCT_X))`, `effectinfo.py`).
-/// Interior-field descriptors are keyed by
-/// `(array_type_id, field_name)` per
+/// Array descriptors are keyed by the interned ARRAY id
+/// (`CallControl::intern_array`) per RPython's `cpu.arraydescrof(ARRAY)`,
+/// which distinguishes by ARRAY lltype identity (`LowLevelType.__eq__`).
+/// Interior-field descriptors are keyed by `(ARRAY id, field_name)` per
 /// `cpu.interiorfielddescrof(ARRAY, fieldname)` — a separate namespace
 /// from struct field indices.
 #[derive(Default)]
@@ -4627,16 +4648,14 @@ struct DescrIndexRegistryInner {
     /// Keyed owner first, then field name, so a lookup borrows both parts
     /// instead of building an owned key.
     field_indices: rustc_hash::FxHashMap<Option<String>, rustc_hash::FxHashMap<String, u32>>,
-    /// (item_ty_discriminant, array_type_id, len_offset) → unbounded `ei_index`.
+    /// interned ARRAY id → unbounded `ei_index`.
     /// RPython: cpu.arraydescrof(ARRAY).get_ei_index()
-    array_indices:
-        rustc_hash::FxHashMap<(u8, Option<usize>), rustc_hash::FxHashMap<Option<String>, u32>>,
-    /// (array_type_id, field_name) → unbounded `ei_index`.
+    array_indices: rustc_hash::FxHashMap<u64, u32>,
+    /// (ARRAY id, field_name) → unbounded `ei_index`.
     /// RPython: cpu.interiorfielddescrof(ARRAY, fieldname).get_ei_index()
     /// Separate from field_indices — RPython keys on (ARRAY, fieldname)
     /// not (STRUCT, fieldname).
-    interiorfield_indices:
-        rustc_hash::FxHashMap<Option<String>, rustc_hash::FxHashMap<String, u32>>,
+    interiorfield_indices: rustc_hash::FxHashMap<(u64, String), u32>,
     next_field_index: u32,
     next_array_index: u32,
     next_interiorfield_index: u32,
@@ -4669,64 +4688,39 @@ impl DescrIndexRegistry {
     }
 
     /// RPython: `cpu.arraydescrof(ARRAY).get_ei_index()`
-    pub fn array_index(
-        &self,
-        item_ty_discriminant: u8,
-        array_type_id: &Option<String>,
-        len_offset: Option<usize>,
-    ) -> u32 {
+    pub fn array_index(&self, array_id: u64) -> u32 {
         let mut inner = self.inner.borrow_mut();
-        // `canonical_array_type_id` borrows its input unless it renames it,
-        // so the common lookup keys on the caller's own string.
-        let canonical_id: std::borrow::Cow<'_, Option<String>> = match array_type_id
-            .as_deref()
-            .map(crate::front::typestr::canonical_array_type_id)
-        {
-            Some(std::borrow::Cow::Borrowed(id))
-                if array_type_id
-                    .as_deref()
-                    .is_some_and(|orig| std::ptr::eq(orig, id)) =>
-            {
-                std::borrow::Cow::Borrowed(array_type_id)
-            }
-            other => std::borrow::Cow::Owned(other.map(std::borrow::Cow::into_owned)),
-        };
-        let shape = (item_ty_discriminant, len_offset);
-        if let Some(&idx) = inner
-            .array_indices
-            .get(&shape)
-            .and_then(|ids| ids.get(canonical_id.as_ref()))
-        {
+        if let Some(&idx) = inner.array_indices.get(&array_id) {
             return idx;
         }
         let idx = inner.next_array_index;
         inner.next_array_index += 1;
-        inner
-            .array_indices
-            .entry(shape)
-            .or_default()
-            .insert(canonical_id.into_owned(), idx);
+        inner.array_indices.insert(array_id, idx);
         idx
     }
 
     /// RPython: `cpu.interiorfielddescrof(ARRAY, fieldname).get_ei_index()`
-    pub fn interiorfield_index(&self, array_type_id: &Option<String>, field_name: &str) -> u32 {
+    pub fn interiorfield_index(&self, array_id: u64, field_name: &str) -> u32 {
         let mut inner = self.inner.borrow_mut();
-        if let Some(&idx) = inner
-            .interiorfield_indices
-            .get(array_type_id)
-            .and_then(|fields| fields.get(field_name))
-        {
+        let key = (array_id, field_name.to_string());
+        if let Some(&idx) = inner.interiorfield_indices.get(&key) {
             return idx;
         }
         let idx = inner.next_interiorfield_index;
         inner.next_interiorfield_index += 1;
-        inner
-            .interiorfield_indices
-            .entry(array_type_id.clone())
-            .or_default()
-            .insert(field_name.to_string(), idx);
+        inner.interiorfield_indices.insert(key, idx);
         idx
+    }
+
+    /// Number of `cpu.arraydescrof(ARRAY).get_ei_index()` slots published.
+    pub fn array_index_count(&self) -> u32 {
+        self.inner.borrow().next_array_index
+    }
+
+    /// Number of `cpu.interiorfielddescrof(ARRAY, fieldname).get_ei_index()`
+    /// slots published.
+    pub fn interiorfield_index_count(&self) -> u32 {
+        self.inner.borrow().next_interiorfield_index
     }
 }
 
@@ -4777,6 +4771,10 @@ impl CallControl {
             has_libffi_call: false,
             callinfocollection: majit_ir::CallInfoCollection::new(),
             descr_indices: DescrIndexRegistry::default(),
+            array_intern: std::cell::RefCell::new(ArrayIntern::default()),
+            array_descrs: std::cell::RefCell::new(rustc_hash::FxHashMap::default()),
+            array_descr_path_hash_owner: std::cell::RefCell::new(rustc_hash::FxHashMap::default()),
+            interiorfield_descrs: std::cell::RefCell::new(rustc_hash::FxHashMap::default()),
             analysis_cache: AnalysisCache::default(),
             struct_size_log: std::cell::RefCell::new(None),
             field_footprint: std::cell::RefCell::new(FieldDescrofMemoEntry::default()),
@@ -5162,20 +5160,191 @@ impl CallControl {
         })
     }
 
+    /// Dense first-seen id for `ARRAY`. `GcCache._cache_array` keys
+    /// `get_array_descr` on the ARRAY object (`LowLevelType.__eq__`).
+    pub(crate) fn intern_array(
+        &self,
+        array: &crate::translator::rtyper::lltypesystem::lltype::Array,
+    ) -> u64 {
+        // `build_number` / `_numbertypes`: 64-bit SignedLongLong is Signed.
+        let mut key = array.clone();
+        key.OF = array_of_lltype_identity(&array.OF);
+        let mut intern = self.array_intern.borrow_mut();
+        if let Some(&id) = intern.ids.get(&key) {
+            drop(intern);
+            debug_assert_eq!(self.interned_array(id), key);
+            return id;
+        }
+        let id = intern.arrays.len() as u64;
+        intern.ids.insert(key.clone(), id);
+        intern.arrays.push(key.clone());
+        drop(intern);
+        debug_assert_eq!(self.interned_array(id), key);
+        id
+    }
+
+    pub(crate) fn interned_array(
+        &self,
+        id: u64,
+    ) -> crate::translator::rtyper::lltypesystem::lltype::Array {
+        self.array_intern.borrow().arrays[id as usize].clone()
+    }
+
+    /// Intern the ARRAY when present, else the ARRAY a dump names
+    /// (`cpu.arraydescrof(ARRAY)` / `descr.py get_array_descr` keys on
+    /// the ARRAY object). Unique dumps first, then a harvested named
+    /// struct `GcArray` (`get_ll_dict` `DICTENTRYARRAY`).
+    pub(crate) fn intern_array_or_spelling(
+        &self,
+        array: &Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
+        array_type_id: &Option<String>,
+    ) -> u64 {
+        if let Some(arr) = array {
+            return self.intern_array(arr);
+        }
+        if let Some(spelling) = array_type_id.as_deref() {
+            if let Some(arr) = self.array_from_dump_spelling(spelling) {
+                return self.intern_array(&arr);
+            }
+            panic!("intern_array_or_spelling: no ARRAY lltype for spelling {spelling:?}");
+        }
+        panic!("intern_array_or_spelling: no ARRAY lltype")
+    }
+
+    /// Unique dump ARRAY, else `GcArray` / `Vec` / `[T]` / `[T; N]` of
+    /// a reconstructed item OF (`cpu.arraydescrof(ARRAY)`). Harvested
+    /// struct fields fill `ARRAY.OF` so `interiorfielddescrof`
+    /// `getattr_field_type` is not Void; a unique primitive item is
+    /// that primitive; an unharvested named item is a raw STRUCT of
+    /// that dump name.
+    pub(crate) fn array_from_dump_spelling(
+        &self,
+        spelling: &str,
+    ) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+        internable_array_for_spelling(spelling)
+            .or_else(|| self.dump_struct_array_for_spelling(spelling))
+    }
+
+    /// ARRAY a dump names after unique internable spellings. Item OF
+    /// comes from [`dump_item_of_lltype`]. Empty harvested `_flds` is
+    /// not an ARRAY: `getattr_field_type` would treat every interior
+    /// field as Void.
+    fn dump_struct_array_for_spelling(
+        &self,
+        spelling: &str,
+    ) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+        use crate::flowspace::model::ConstValue;
+        use crate::model::ArrayGcKind;
+        use crate::translator::rtyper::lltypesystem::lltype::Array;
+        let item = extract_element_type_from_str(spelling)?;
+        let of = self.dump_item_of_lltype(&item)?;
+        let nolength = crate::front::typestr::nolength_from_array_type_id(Some(spelling));
+        Some(
+            match crate::front::typestr::gckind_from_array_type_id(Some(spelling)) {
+                ArrayGcKind::Gc if nolength => {
+                    Array::gc_with_hints(of, vec![("nolength".into(), ConstValue::Bool(true))])
+                }
+                ArrayGcKind::Gc => Array::gc(of),
+                ArrayGcKind::Raw if nolength => {
+                    Array::with_hints(of, vec![("nolength".into(), ConstValue::Bool(true))])
+                }
+                ArrayGcKind::Raw => Array::new(of),
+            },
+        )
+    }
+
+    /// Item OF a dump ARRAY. Unique primitives first, then a harvested
+    /// named struct (`get_ll_dict` `DICTENTRY`), then a raw STRUCT
+    /// named by the dump item (`[OnceLock<usize>;35]`).
+    fn dump_item_of_lltype(
+        &self,
+        item: &str,
+    ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, Struct};
+        let item = unwrap_dump_array_item(item);
+        if let Some(ll) = dump_field_lltype(&item) {
+            return Some(ll);
+        }
+        if let Some((name, rows)) = self.dump_struct_rows_for_item(&item) {
+            let mut fields = Vec::with_capacity(rows.len());
+            for row in rows {
+                fields.push((
+                    row.name.clone(),
+                    dump_field_lltype(&row.ty).unwrap_or(LowLevelType::Void),
+                ));
+            }
+            if fields.is_empty() {
+                return None;
+            }
+            return Some(LowLevelType::Struct(Box::new(Struct::registry_fields(
+                name,
+                fields,
+                GcKind::Raw,
+            ))));
+        }
+        dump_named_struct_item_lltype(&item)
+    }
+
+    /// Harvested struct for a dump item spelling. Prefers the concrete
+    /// `Entry<i64, *mut PyObject>` monomorph `get_ll_dict` would have
+    /// built; skips `??TypeVar` templates.
+    fn dump_struct_rows_for_item(
+        &self,
+        item: &str,
+    ) -> Option<(&str, &[crate::front::semantic::FieldRow])> {
+        if let Some((key, rows)) = self.struct_fields.fields.get_key_value(item)
+            && dump_rows_are_concrete(rows)
+        {
+            return Some((key.as_str(), rows.as_slice()));
+        }
+        let mut matches: Vec<(&str, &[crate::front::semantic::FieldRow])> = self
+            .struct_fields
+            .fields
+            .iter()
+            .filter(|(key, rows)| {
+                dump_rows_are_concrete(rows) && dump_item_matches_harvest(item, key)
+            })
+            .map(|(key, rows)| (key.as_str(), rows.as_slice()))
+            .collect();
+        if matches.is_empty() {
+            return None;
+        }
+        if let Some(&(key, rows)) = matches.iter().find(|(key, _)| *key == item) {
+            return Some((key, rows));
+        }
+        if let Some(&(key, rows)) = matches.iter().find(|(key, _)| {
+            key.starts_with("pyre_object::")
+                && key.contains("i64")
+                && (key.contains("PyObject") || key.contains("pyobject"))
+        }) {
+            return Some((key, rows));
+        }
+        matches.sort_by_key(|(key, _)| std::cmp::Reverse(key.len()));
+        matches.first().copied()
+    }
+
+    /// Intern the ARRAY on an `OpKind`.
+    pub(crate) fn intern_op_array(
+        &self,
+        array: &Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
+        array_type_id: &Option<String>,
+    ) -> u64 {
+        self.intern_array_or_spelling(array, array_type_id)
+    }
+
     /// `cpu.arraydescrof(ARRAY)` for callers that do not already hold the
-    /// codewriter-side `array_index` — resolves it via
-    /// [`DescrIndexRegistry::array_index`] keyed on
-    /// `(value_type_discriminant(item_ty), array_type_id, len_offset)`, the same key
-    /// the `writeanalyze` walker in this file uses, then
-    /// hands the resulting `ei_index` to [`arraydescrof`].
+    /// codewriter-side `array_index` — resolves a well-known dump to an
+    /// ARRAY then [`DescrIndexRegistry::array_index`] keyed on the interned
+    /// ARRAY id, the same key the `writeanalyze` walker in this file uses,
+    /// then hands the resulting `ei_index` to [`arraydescrof`].
     ///
     /// Bytecode emit (`assembler.rs::arraydescrof`) and the per-callee
-    /// `writeanalyze` walker must agree on the same `(item_ty,
-    /// array_type_id, len_offset)` → `ei_index` mapping; routing both through
-    /// `descr_indices.array_index` mirrors `effectinfo.py add_array`'s
-    /// shared `cpu.arraydescrof(ARRAY).get_ei_index()` namespace and
-    /// keeps `force_from_effectinfo` (`heap.py`) from aliasing
-    /// distinct ARRAY identities onto the same bitstring slot.
+    /// `writeanalyze` walker must agree on the same interned ARRAY →
+    /// `ei_index` mapping; routing both through `descr_indices.array_index`
+    /// mirrors `effectinfo.py add_array`'s shared
+    /// `cpu.arraydescrof(ARRAY).get_ei_index()` namespace and keeps
+    /// `force_from_effectinfo` (`heap.py`) from aliasing distinct ARRAY
+    /// identities onto the same bitstring slot.
     pub fn arraydescrof_for_type(
         &self,
         item_ty: &crate::model::ValueType,
@@ -5183,12 +5352,63 @@ impl CallControl {
         ir_type: majit_ir::value::Type,
         len_offset: Option<usize>,
     ) -> majit_ir::descr::DescrRef {
-        let idx = self.descr_indices.array_index(
-            value_type_discriminant(item_ty),
-            array_type_id,
-            len_offset,
-        );
-        self.arraydescrof(idx, array_type_id, ir_type, len_offset)
+        let array = array_carrier_from_type_id(array_type_id);
+        self.arraydescrof_for_op(item_ty, array_type_id, &array, ir_type, len_offset)
+    }
+
+    /// `cpu.arraydescrof(ARRAY)` for an `OpKind` that already carries the
+    /// ARRAY lltype (or a well-known dump). Layout comes from the ARRAY
+    /// (`arr._hints`, `arr.OF`) when it is present.
+    pub fn arraydescrof_for_op(
+        &self,
+        item_ty: &crate::model::ValueType,
+        array_type_id: &Option<String>,
+        array: &Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
+        ir_type: majit_ir::value::Type,
+        len_offset: Option<usize>,
+    ) -> majit_ir::descr::DescrRef {
+        let _ = item_ty;
+        let resolved = if array.is_some() {
+            array.clone()
+        } else {
+            array_carrier_from_type_id(array_type_id)
+        };
+        // Identity-less mint (`arraydescrof_concrete` None arm): no ARRAY
+        // and no dump, so no interned id and no `add_array` ei_index.
+        if resolved.is_none() && array_type_id.as_deref().map_or(true, str::is_empty) {
+            return self.arraydescrof_with_array(
+                u32::MAX,
+                array_type_id,
+                None,
+                ir_type,
+                len_offset,
+            );
+        }
+        let id = self.intern_array_or_spelling(&resolved, array_type_id);
+        let idx = self.descr_indices.array_index(id);
+        let len_offset = resolved
+            .as_ref()
+            .map(array_len_offset_from_hints)
+            .unwrap_or(len_offset);
+        self.arraydescrof_with_array(idx, array_type_id, resolved.as_ref(), ir_type, len_offset)
+    }
+
+    /// `cpu.arraydescrof(ARRAY)` — the public assembler entry keyed on
+    /// the ARRAY lltype (`get_array_descr(gccache, ARRAY)`).
+    pub fn arraydescrof_array(
+        &self,
+        array: &crate::translator::rtyper::lltypesystem::lltype::Array,
+    ) -> majit_ir::descr::DescrRef {
+        let item_ty = offset_array_item_value_type(&array.OF);
+        let ir_type = effect_array_ir_type(&item_ty);
+        let spelling = Some(array_type_id_of_lltype(array));
+        self.arraydescrof_for_op(
+            &item_ty,
+            &spelling,
+            &Some(array.clone()),
+            ir_type,
+            array_len_offset_from_hints(array),
+        )
     }
 
     /// RPython: `cpu.arraydescrof(ARRAY)` — descr.py get_array_descr.
@@ -5208,22 +5428,34 @@ impl CallControl {
         ir_type: majit_ir::value::Type,
         len_offset: Option<usize>,
     ) -> majit_ir::descr::DescrRef {
-        self.arraydescrof_concrete(idx, array_type_id, ir_type, len_offset, Some(idx))
+        self.arraydescrof_with_array(idx, array_type_id, None, ir_type, len_offset)
+    }
+
+    fn arraydescrof_with_array(
+        &self,
+        idx: u32,
+        array_type_id: &Option<String>,
+        array: Option<&crate::translator::rtyper::lltypesystem::lltype::Array>,
+        ir_type: majit_ir::value::Type,
+        len_offset: Option<usize>,
+    ) -> majit_ir::descr::DescrRef {
+        self.arraydescrof_concrete(idx, array_type_id, array, ir_type, len_offset, Some(idx))
             .0 as majit_ir::descr::DescrRef
     }
 
     pub fn arraydescrof_keyed(
         &self,
         idx: u32,
-        array_type_id: &Option<String>,
+        array: &crate::translator::rtyper::lltypesystem::lltype::Array,
         ir_type: majit_ir::value::Type,
         len_offset: Option<usize>,
     ) -> (
         majit_ir::descr::DescrRef,
         Option<majit_ir::effectinfo::DescrSetMember>,
     ) {
+        let spelling = Some(array_type_id_of_lltype(array));
         let (descr, key) =
-            self.arraydescrof_concrete(idx, array_type_id, ir_type, len_offset, Some(idx));
+            self.arraydescrof_concrete(idx, &spelling, Some(array), ir_type, len_offset, Some(idx));
         (descr as majit_ir::descr::DescrRef, key)
     }
 
@@ -5245,6 +5477,7 @@ impl CallControl {
         &self,
         idx: u32,
         array_type_id: &Option<String>,
+        array: Option<&crate::translator::rtyper::lltypesystem::lltype::Array>,
         ir_type: majit_ir::value::Type,
         len_offset: Option<usize>,
         ei_publish: Option<u32>,
@@ -5252,6 +5485,43 @@ impl CallControl {
         std::sync::Arc<dyn majit_ir::descr::ArrayDescr>,
         Option<majit_ir::effectinfo::DescrSetMember>,
     ) {
+        let intern_id =
+            if array.is_some() || array_type_id.as_deref().is_some_and(|s| !s.is_empty()) {
+                Some(self.intern_array_or_spelling(&array.cloned(), array_type_id))
+            } else {
+                None
+            };
+        if let Some(id) = intern_id
+            && let Some(cached) = self.array_descrs.borrow().get(&id).cloned()
+        {
+            cached.set_index(idx);
+            if let Some(arr_idx) = ei_publish {
+                cached.set_ei_index(arr_idx);
+            }
+            let spelling = array_type_id
+                .as_deref()
+                .map(|s| crate::front::typestr::canonical_array_type_id(s).into_owned())
+                .or_else(|| array.map(array_type_id_of_lltype));
+            let key = spelling.map(|atid| majit_ir::effectinfo::DescrSetMember::Array {
+                array_id: majit_ir::descr::path_hash(&atid),
+            });
+            return (cached, key);
+        }
+        let (array_type_id, len_offset, ir_type) = if let Some(arr) = array {
+            let spelling = array_type_id
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| Some(array_type_id_of_lltype(arr)));
+            let item_ty = offset_array_item_value_type(&arr.OF);
+            (
+                spelling,
+                array_len_offset_from_hints(arr),
+                effect_array_ir_type(&item_ty),
+            )
+        } else {
+            (array_type_id.clone(), len_offset, ir_type)
+        };
+        let array_type_id = &array_type_id;
         // RPython: ARRAY_INSIDE.OF — extract element type from full ARRAY type.
         let elem_name = array_type_id
             .as_deref()
@@ -5386,24 +5656,61 @@ impl CallControl {
                         is_pure,
                         concrete_type, // descr.py:366-370 Float-only marker
                     );
-                let ad_arc: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> =
+                let from_gc: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> =
                     majit_ir::descr::descr_arc_as_array_descr(cached.clone())
                         .expect("gc_cache._cache_array slot held a non-ArrayDescr Arc");
-                // descr.py get_array_descr: cache[ARRAY_OR_STRUCT] is keyed on the
-                // ARRAY lltype identity, and `nolength` is a property of
-                // that lltype.  A hit that disagrees on lendescr/base_size
-                // means two producers stamped the same atid with
-                // disagreeing `nolength`.
-                let cached_len_offset = ad_arc.len_descr().map(|fd| fd.offset());
-                let cached_base_size = ad_arc.base_size();
-                assert!(
-                    ad_arc.len_descr().is_some() == len_offset.is_some()
-                        && cached_base_size == base_size,
-                    "get_array_descr cache hit for atid {atid:?} disagrees \
-                     with this call: requested len_offset={len_offset:?} \
-                     base_size={base_size}, cached len_offset={cached_len_offset:?} \
-                     base_size={cached_base_size}",
-                );
+                // Runtime `_cache_array` still keys `path_hash(spelling)`.
+                // Two ARRAYs with the same dump share that hash; the
+                // codewriter keeps one Arc per interned ARRAY. Layout
+                // (`nolength`, lendescr) comes from this ARRAY, not from
+                // the path_hash-shared runtime slot.
+                let from_gc_agrees = from_gc.len_descr().is_some() == len_offset.is_some()
+                    && from_gc.base_size() == base_size;
+                let ad_arc: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> = {
+                    let mut owner = self.array_descr_path_hash_owner.borrow_mut();
+                    let reuse_gc = from_gc_agrees
+                        && owner
+                            .get(&path_hash_u64)
+                            .copied()
+                            .map(|existing| intern_id == Some(existing))
+                            .unwrap_or(true);
+                    if reuse_gc {
+                        if let Some(id) = intern_id {
+                            owner.insert(path_hash_u64, id);
+                        }
+                        drop(owner);
+                        from_gc
+                    } else {
+                        drop(owner);
+                        let lendescr: Option<majit_ir::descr::DescrRef> = len_offset.map(|off| {
+                            use majit_ir::descr::SimpleFieldDescr;
+                            let word_size = crate::layout::target_word_size();
+                            std::sync::Arc::new(SimpleFieldDescr::new_with_name(
+                                u32::MAX,
+                                off,
+                                word_size,
+                                majit_ir::value::Type::Int,
+                                false,
+                                majit_ir::descr::ArrayFlag::Signed,
+                                "len".to_string(),
+                                "len",
+                            )) as majit_ir::descr::DescrRef
+                        });
+                        let mut ad = majit_ir::descr::SimpleArrayDescr::with_flag(
+                            u32::MAX,
+                            base_size,
+                            item_size,
+                            0,
+                            item_type,
+                            flag,
+                        );
+                        ad.lendescr = lendescr;
+                        ad.is_pure = is_pure;
+                        ad.concrete_type = concrete_type;
+                        ad.set_cache_key(path_hash_u64);
+                        std::sync::Arc::new(ad) as std::sync::Arc<dyn majit_ir::descr::ArrayDescr>
+                    }
+                };
                 // descr.py get_array_descr assigns interiors then
                 // gccache.init_array_descr. Attach after the Arc wrap
                 // stamps through that same init (`OnceLock` first-wins).
@@ -5480,6 +5787,9 @@ impl CallControl {
                 (arc as std::sync::Arc<dyn majit_ir::descr::ArrayDescr>, None)
             }
         };
+        if let Some(id) = intern_id {
+            self.array_descrs.borrow_mut().insert(id, ad_arc.clone());
+        }
         // Per-trace codewriter id stamp — analyzer's
         // `descr_indices.array_index` identifies this descr in BhDescr
         // round-trips on `pyre-jit-trace::state` decoders.
@@ -6044,7 +6354,17 @@ impl CallControl {
         array_type_id: &Option<String>,
         field_name: &str,
     ) -> Option<majit_ir::descr::DescrRef> {
-        self.interiorfielddescrof_keyed(idx, array_type_id, field_name)
+        self.interiorfielddescrof_with_array(idx, array_type_id, &None, field_name)
+    }
+
+    pub fn interiorfielddescrof_with_array(
+        &self,
+        idx: u32,
+        array_type_id: &Option<String>,
+        array: &Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
+        field_name: &str,
+    ) -> Option<majit_ir::descr::DescrRef> {
+        self.interiorfielddescrof_keyed(idx, array_type_id, array, field_name)
             .map(|(descr, _)| descr)
     }
 
@@ -6052,13 +6372,45 @@ impl CallControl {
         &self,
         idx: u32,
         array_type_id: &Option<String>,
+        array: &Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
         field_name: &str,
     ) -> Option<(
         majit_ir::descr::DescrRef,
         majit_ir::effectinfo::DescrSetMember,
     )> {
         use majit_ir::descr::ArrayFlag;
-        let array_str = array_type_id.as_deref()?;
+        let intern_id = self.intern_array_or_spelling(array, array_type_id);
+        if let Some(cached) = self
+            .interiorfield_descrs
+            .borrow()
+            .get(&(intern_id, field_name.to_string()))
+            .cloned()
+        {
+            cached.set_index(idx);
+            let array_str = array_type_id
+                .as_deref()
+                .map(|s| crate::front::typestr::canonical_array_type_id(s).into_owned())
+                .or_else(|| array.as_ref().map(array_type_id_of_lltype))?;
+            let member = majit_ir::effectinfo::DescrSetMember::InteriorField {
+                array_id: majit_ir::descr::path_hash(&array_str),
+                name: field_name.to_string(),
+            };
+            return Some((cached, member));
+        }
+        let array_str = match (array_type_id.as_deref(), array.as_ref()) {
+            (Some(s), _) => s,
+            (None, Some(arr)) => {
+                // Spelling is only used to recover ARRAY.OF's registered
+                // struct name; the cache identity is intern_id.
+                return self.interiorfielddescrof_keyed(
+                    idx,
+                    &Some(array_type_id_of_lltype(arr)),
+                    array,
+                    field_name,
+                );
+            }
+            (None, None) => return None,
+        };
         // ARRAY.OF.fieldname — extract the element type from the
         // container type, then look up field info in `self.struct_fields`.
         let elem_name =
@@ -6263,15 +6615,32 @@ impl CallControl {
                         }),
                     },
                 );
-                let descr = majit_ir::descr::gc_cache().lock().get_interiorfield_descr(
+                let descr_from_gc = majit_ir::descr::gc_cache().lock().get_interiorfield_descr(
                     array_key,
                     field_name.to_string(),
                     String::new(),
-                    array_descr,
-                    field_descr,
+                    array_descr.clone(),
+                    field_descr.clone(),
                 );
+                let already = self
+                    .interiorfield_descrs
+                    .borrow()
+                    .values()
+                    .any(|d| std::sync::Arc::ptr_eq(d, &descr_from_gc));
+                let descr: majit_ir::descr::DescrRef = if already {
+                    std::sync::Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
+                        idx,
+                        array_descr,
+                        field_descr,
+                    )) as majit_ir::descr::DescrRef
+                } else {
+                    descr_from_gc
+                };
                 descr.set_index(idx);
-                return Some((descr as majit_ir::descr::DescrRef, member));
+                self.interiorfield_descrs
+                    .borrow_mut()
+                    .insert((intern_id, field_name.to_string()), descr.clone());
+                return Some((descr, member));
             }
             offset = offset.saturating_add(field_size);
         }
@@ -12671,6 +13040,7 @@ impl CallControl {
                 base,
                 item_ty,
                 array_type_id,
+                array,
                 nolength,
                 ..
             } => self.readwrite_array_result(
@@ -12678,13 +13048,14 @@ impl CallControl {
                 base,
                 item_ty,
                 array_type_id,
+                array,
                 *nolength,
-                graphinfo,
             ),
             OpKind::ArrayWrite {
                 base,
                 item_ty,
                 array_type_id,
+                array,
                 nolength,
                 ..
             } => self.readwrite_array_result(
@@ -12692,33 +13063,35 @@ impl CallControl {
                 base,
                 item_ty,
                 array_type_id,
+                array,
                 *nolength,
-                graphinfo,
             ),
             // `getinteriorfield` / `setinteriorfield`.
             OpKind::InteriorFieldRead {
                 base,
                 field,
                 array_type_id,
+                array,
                 ..
             } => self.readwrite_interiorfield_result(
                 RwTag::ReadInteriorField,
                 base,
                 &field.name,
                 array_type_id,
-                graphinfo,
+                array,
             ),
             OpKind::InteriorFieldWrite {
                 base,
                 field,
                 array_type_id,
+                array,
                 ..
             } => self.readwrite_interiorfield_result(
                 RwTag::InteriorField,
                 base,
                 &field.name,
                 array_type_id,
-                graphinfo,
+                array,
             ),
             // `WriteAnalyzer.analyze_simple_operation` (`writeanalyze.py`):
             // `gc_add_memory_pressure` returns `top_set`.
@@ -12799,29 +13172,26 @@ impl CallControl {
                             .is_some_and(|ty| !matches!(ty, LowLevelType::Void)),
                         _ => false,
                     };
-                    let (array_type_id, len_offset) = if consider {
-                        let array_type_id = Some(array_type_id_of_lltype(arr));
-                        let len_offset = array_len_offset_from_hints(arr);
-                        (array_type_id, len_offset)
+                    let len_offset = if consider {
+                        array_len_offset_from_hints(arr)
                     } else {
-                        (Some(arr._short_name()), None)
+                        None
                     };
                     let tag = if read {
                         RwTag::ReadInteriorField
                     } else {
                         RwTag::InteriorField
                     };
-                    let index = self
-                        .descr_indices
-                        .interiorfield_index(&array_type_id, &offset.fldname);
                     ReadWriteEffects::singleton(
-                        RwKey {
+                        self.rw_interiorfield_key(
                             tag,
-                            index,
-                            owner_id: None,
-                        },
+                            arr,
+                            &offset.fldname,
+                            consider,
+                            field_is_void,
+                        ),
                         RwOperand::InteriorField {
-                            array_type_id,
+                            array: Some(arr.clone()),
                             field_name: offset.fldname.clone(),
                             len_offset,
                             consider,
@@ -12833,25 +13203,16 @@ impl CallControl {
                     // returns `('interiorfield', Ptr(T), fldname)` for a
                     // FieldOffset over a Struct. `add_interiorfield`
                     // (`effectinfo.py`) returns without a descr
-                    // ("let's not consider structs for now") via
-                    // `consider: false`.
-                    let array_type_id = Some(st._name.clone());
+                    // ("let's not consider structs for now").
                     let tag = if read {
                         RwTag::ReadInteriorField
                     } else {
                         RwTag::InteriorField
                     };
-                    let index = self
-                        .descr_indices
-                        .interiorfield_index(&array_type_id, &offset.fldname);
                     ReadWriteEffects::singleton(
-                        RwKey {
-                            tag,
-                            index,
-                            owner_id: None,
-                        },
+                        RwKey::unconsidered(tag, RwUnconsidered::Struct(st.clone())),
                         RwOperand::InteriorField {
-                            array_type_id,
+                            array: None,
                             field_name: offset.fldname.clone(),
                             len_offset: None,
                             consider: false,
@@ -12863,23 +13224,15 @@ impl CallControl {
                     // returns `('interiorfield', Ptr(T), fldname)` for a
                     // FieldOffset over a FixedSizeArray. `add_interiorfield`
                     // (`effectinfo.py`) returns for any non-Array.
-                    let array_type_id = Some(fsa._short_name());
                     let tag = if read {
                         RwTag::ReadInteriorField
                     } else {
                         RwTag::InteriorField
                     };
-                    let index = self
-                        .descr_indices
-                        .interiorfield_index(&array_type_id, &offset.fldname);
                     ReadWriteEffects::singleton(
-                        RwKey {
-                            tag,
-                            index,
-                            owner_id: None,
-                        },
+                        RwKey::unconsidered(tag, RwUnconsidered::FixedSizeArray(fsa.clone())),
                         RwOperand::InteriorField {
-                            array_type_id,
+                            array: None,
                             field_name: offset.fldname.clone(),
                             len_offset: None,
                             consider: false,
@@ -12894,27 +13247,16 @@ impl CallControl {
                 if let Some(arr) = offset_array(&offset.0) {
                     let consider = consider_array(arr);
                     let item_ty = offset_array_item_value_type(&arr.OF);
-                    let (array_type_id, len_offset) = if consider {
-                        let array_type_id = Some(array_type_id_of_lltype(arr));
-                        let len_offset = array_len_offset_from_hints(arr);
-                        (array_type_id, len_offset)
+                    let len_offset = if consider {
+                        array_len_offset_from_hints(arr)
                     } else {
-                        (Some(arr._short_name()), None)
+                        None
                     };
                     let tag = if read { RwTag::ReadArray } else { RwTag::Array };
-                    let index = self.descr_indices.array_index(
-                        value_type_discriminant(&item_ty),
-                        &array_type_id,
-                        len_offset,
-                    );
                     ReadWriteEffects::singleton(
-                        RwKey {
-                            tag,
-                            index,
-                            owner_id: None,
-                        },
+                        self.rw_array_key(tag, arr, consider),
                         RwOperand::Array {
-                            array_type_id,
+                            array: Some(arr.clone()),
                             ir_type: effect_array_ir_type(&item_ty),
                             len_offset,
                             consider,
@@ -12925,25 +13267,14 @@ impl CallControl {
                     // `(prefix + 'array', Ptr(TYPE))` for any array
                     // container. `consider_array` (`effectinfo.py`) is
                     // false: a FixedSizeArray is not a GcArray.
-                    let array_type_id = Some(fsa._short_name());
                     let item_ty = offset_array_item_value_type(&fsa.OF);
                     let tag = if read { RwTag::ReadArray } else { RwTag::Array };
-                    let len_offset = None;
-                    let index = self.descr_indices.array_index(
-                        value_type_discriminant(&item_ty),
-                        &array_type_id,
-                        len_offset,
-                    );
                     ReadWriteEffects::singleton(
-                        RwKey {
-                            tag,
-                            index,
-                            owner_id: None,
-                        },
+                        RwKey::unconsidered(tag, RwUnconsidered::FixedSizeArray(fsa.clone())),
                         RwOperand::Array {
-                            array_type_id,
+                            array: None,
                             ir_type: effect_array_ir_type(&item_ty),
-                            len_offset,
+                            len_offset: None,
                             consider: false,
                         },
                     )
@@ -12965,11 +13296,7 @@ impl CallControl {
             .descr_indices
             .field_index(&field.owner_root, &field.name);
         let mut result = ReadWriteEffects::singleton(
-            RwKey {
-                tag,
-                index,
-                owner_id: field.owner_id,
-            },
+            RwKey::field(tag, index, field.owner_id),
             RwOperand::Field {
                 owner_root: field.owner_root.clone(),
                 owner_id: field.owner_id,
@@ -13002,11 +13329,7 @@ impl CallControl {
             let owner_root = Some(outer);
             let index = self.descr_indices.field_index(&owner_root, &dotted);
             result.insert(
-                RwKey {
-                    tag,
-                    index,
-                    owner_id: None,
-                },
+                RwKey::field(tag, index, None),
                 RwOperand::Field {
                     owner_root,
                     owner_id: None,
@@ -13024,38 +13347,37 @@ impl CallControl {
         base: &crate::flowspace::model::Variable,
         item_ty: &crate::model::ValueType,
         array_type_id: &Option<String>,
-        nolength: bool,
-        graphinfo: &ReadWriteGraphInfo,
+        array: &Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
+        _nolength: bool,
     ) -> ReadWriteEffects {
-        let resolved_id = resolve_array_identity(
-            base,
-            array_type_id,
-            &graphinfo.value_producers,
-            &graphinfo.phi_sources,
-            self,
-        )
-        .or_else(|| array_type_id.clone());
-        let headerless =
-            nolength || crate::front::typestr::nolength_from_array_type_id(resolved_id.as_deref());
-        let len_offset = if headerless { None } else { Some(0) };
-        let index = self.descr_indices.array_index(
-            value_type_discriminant(item_ty),
-            &resolved_id,
-            len_offset,
-        );
-        ReadWriteEffects::singleton(
-            RwKey {
-                tag,
-                index,
-                owner_id: None,
-            },
-            RwOperand::Array {
-                array_type_id: resolved_id,
-                ir_type: effect_array_ir_type(item_ty),
-                len_offset,
-                consider: true,
-            },
-        )
+        if let Some(arr) = self.resolve_rw_array(array, array_type_id, base) {
+            let consider = consider_array(&arr);
+            let len_offset = array_len_offset_from_hints(&arr);
+            return ReadWriteEffects::singleton(
+                self.rw_array_key(tag, &arr, consider),
+                RwOperand::Array {
+                    array: Some(arr),
+                    ir_type: effect_array_ir_type(item_ty),
+                    len_offset,
+                    consider,
+                },
+            );
+        }
+        // `_array_result` still records `("array", TYPE)`; `add_array`
+        // (`effectinfo.py`) returns when `ARRAY = T.TO` is not a
+        // `GcArray` (`consider_array`).
+        if let Some(unconsidered) = unconsidered_from_concretetype(base.concretetype().as_ref()) {
+            return ReadWriteEffects::singleton(
+                RwKey::unconsidered(tag, unconsidered),
+                RwOperand::Array {
+                    array: None,
+                    ir_type: effect_array_ir_type(item_ty),
+                    len_offset: None,
+                    consider: false,
+                },
+            );
+        }
+        ReadWriteEffects::bottom_result()
     }
 
     /// `_interiorfield_result(op.args[0].concretetype, name)`.
@@ -13065,39 +13387,100 @@ impl CallControl {
         base: &crate::flowspace::model::Variable,
         field_name: &str,
         array_type_id: &Option<String>,
-        graphinfo: &ReadWriteGraphInfo,
+        array: &Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
     ) -> ReadWriteEffects {
-        let resolved_id = resolve_array_identity(
-            base,
-            array_type_id,
-            &graphinfo.value_producers,
-            &graphinfo.phi_sources,
-            self,
-        )
-        .or_else(|| array_type_id.clone());
-        let len_offset =
-            if crate::front::typestr::nolength_from_array_type_id(resolved_id.as_deref()) {
-                None
-            } else {
-                Some(0)
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        if let Some(arr) = self.resolve_rw_array(array, array_type_id, base) {
+            let consider = consider_array(&arr);
+            let field_is_void = !match &arr.OF {
+                LowLevelType::Struct(st) => st
+                    .getattr_field_type(field_name)
+                    .is_some_and(|ty| !matches!(ty, LowLevelType::Void)),
+                _ => false,
             };
-        let index = self
-            .descr_indices
-            .interiorfield_index(&resolved_id, field_name);
-        ReadWriteEffects::singleton(
-            RwKey {
-                tag,
-                index,
-                owner_id: None,
-            },
-            RwOperand::InteriorField {
-                array_type_id: resolved_id,
-                field_name: field_name.to_string(),
-                len_offset,
-                consider: true,
-                field_is_void: false,
-            },
-        )
+            let len_offset = array_len_offset_from_hints(&arr);
+            return ReadWriteEffects::singleton(
+                self.rw_interiorfield_key(tag, &arr, field_name, consider, field_is_void),
+                RwOperand::InteriorField {
+                    array: Some(arr),
+                    field_name: field_name.to_string(),
+                    len_offset,
+                    consider,
+                    field_is_void,
+                },
+            );
+        }
+        // `add_interiorfield` (`effectinfo.py`): `T.TO` is not an
+        // `lltype.Array` ("let's not consider structs for now").
+        if let Some(unconsidered) = unconsidered_from_concretetype(base.concretetype().as_ref()) {
+            return ReadWriteEffects::singleton(
+                RwKey::unconsidered(tag, unconsidered),
+                RwOperand::InteriorField {
+                    array: None,
+                    field_name: field_name.to_string(),
+                    len_offset: None,
+                    consider: false,
+                    field_is_void: false,
+                },
+            );
+        }
+        ReadWriteEffects::bottom_result()
+    }
+
+    /// `cpu.arraydescrof(ARRAY).get_ei_index()` only after `consider_array`.
+    fn rw_array_key(
+        &self,
+        tag: RwTag,
+        arr: &crate::translator::rtyper::lltypesystem::lltype::Array,
+        consider: bool,
+    ) -> RwKey {
+        let array_id = self.intern_array(arr);
+        let index = if consider {
+            self.descr_indices.array_index(array_id)
+        } else {
+            0
+        };
+        RwKey::array(tag, index, array_id)
+    }
+
+    /// `cpu.interiorfielddescrof(ARRAY, fieldname).get_ei_index()` only
+    /// after `add_interiorfield` would call it.
+    fn rw_interiorfield_key(
+        &self,
+        tag: RwTag,
+        arr: &crate::translator::rtyper::lltypesystem::lltype::Array,
+        field_name: &str,
+        consider: bool,
+        field_is_void: bool,
+    ) -> RwKey {
+        let array_id = self.intern_array(arr);
+        let index = if consider && !field_is_void {
+            self.descr_indices.interiorfield_index(array_id, field_name)
+        } else {
+            0
+        };
+        RwKey::array(tag, index, array_id)
+    }
+
+    /// ARRAY of a writeanalyze tuple: `op.args[0].concretetype` when it is
+    /// `Ptr(ARRAY)` / `ARRAY`, else the dump ARRAY (`cpu.arraydescrof`).
+    /// `None` when TO is not an Array (`consider_array` / `add_array`
+    /// drop it), including a dump spelling that does not reconstruct.
+    fn resolve_rw_array(
+        &self,
+        array: &Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
+        array_type_id: &Option<String>,
+        base: &crate::flowspace::model::Variable,
+    ) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+        if let Some(arr) = array {
+            return Some(arr.clone());
+        }
+        if let Some(arr) = array_from_concretetype(base.concretetype().as_ref()) {
+            return Some(arr);
+        }
+        array_type_id
+            .as_deref()
+            .and_then(|spelling| self.array_from_dump_spelling(spelling))
     }
 }
 
@@ -13316,7 +13699,7 @@ fn add_array(
     cc: &CallControl,
 ) {
     let RwOperand::Array {
-        array_type_id,
+        array,
         ir_type,
         len_offset,
         consider,
@@ -13329,8 +13712,11 @@ fn add_array(
     if !consider {
         return;
     }
+    let Some(arr) = array else {
+        unreachable!("consider_array effect carries no ARRAY");
+    };
     indices.push(index);
-    descrs.push(cc.arraydescrof_keyed(index, array_type_id, *ir_type, *len_offset));
+    descrs.push(cc.arraydescrof_keyed(index, arr, *ir_type, *len_offset));
 }
 
 /// `add_interiorfield` (`effectinfo.py`):
@@ -13343,7 +13729,7 @@ fn add_interiorfield(
     cc: &CallControl,
 ) {
     let RwOperand::InteriorField {
-        array_type_id,
+        array,
         field_name,
         consider,
         field_is_void,
@@ -13357,8 +13743,13 @@ fn add_interiorfield(
     if !consider || *field_is_void {
         return;
     }
+    let Some(arr) = array else {
+        unreachable!("consider_array interiorfield carries no ARRAY");
+    };
     indices.push(index);
-    if let Some((descr, key)) = cc.interiorfielddescrof_keyed(index, array_type_id, field_name) {
+    if let Some((descr, key)) =
+        cc.interiorfielddescrof_keyed(index, &None, &Some(arr.clone()), field_name)
+    {
         descrs.push((descr, Some(key)));
     }
 }
@@ -13400,7 +13791,7 @@ pub fn effectinfo_from_writeanalyze(
             _ => continue,
         };
         let RwOperand::InteriorField {
-            array_type_id,
+            array,
             len_offset,
             consider,
             ..
@@ -13415,21 +13806,17 @@ pub fn effectinfo_from_writeanalyze(
         if !consider {
             continue;
         }
-        let index = cc.descr_indices.array_index(
-            value_type_discriminant(&crate::model::ValueType::Ref(None)),
-            array_type_id,
-            *len_offset,
-        );
-        let val = RwKey {
-            tag,
-            index,
-            owner_id: None,
+        let Some(arr) = array else {
+            panic!("consider_array interiorfield extraef has no ARRAY");
         };
+        let array_id = cc.intern_array(arr);
+        let index = cc.descr_indices.array_index(array_id);
+        let val = RwKey::array(tag, index, array_id);
         if !effects.contains_key(&val) {
             extraef.push((
                 val,
                 RwOperand::Array {
-                    array_type_id: array_type_id.clone(),
+                    array: Some(arr.clone()),
                     ir_type: majit_ir::value::Type::Ref,
                     len_offset: *len_offset,
                     consider: true,
@@ -13438,7 +13825,8 @@ pub fn effectinfo_from_writeanalyze(
         }
     }
     // preserve order in the added effects issue #2984
-    let extraef_keys: rustc_hash::FxHashSet<RwKey> = extraef.iter().map(|(key, _)| *key).collect();
+    let extraef_keys: rustc_hash::FxHashSet<RwKey> =
+        extraef.iter().map(|(key, _)| key.clone()).collect();
     let in_effects = |key: RwKey| effects.contains_key(&key) || extraef_keys.contains(&key);
 
     let mut readonly_descrs_fields = Vec::new();
@@ -13455,8 +13843,8 @@ pub fn effectinfo_from_writeanalyze(
     let mut interior_write_descrs = Vec::new();
     let all_effects = effects
         .iter()
-        .map(|(key, operand)| (*key, operand))
-        .chain(extraef.iter().map(|(key, operand)| (*key, operand)));
+        .map(|(key, operand)| (key.clone(), operand))
+        .chain(extraef.iter().map(|(key, operand)| (key.clone(), operand)));
     for (key, operand) in all_effects {
         let index = key.index;
         match key.tag {
@@ -13468,10 +13856,7 @@ pub fn effectinfo_from_writeanalyze(
                 cc,
             ),
             RwTag::ReadStruct => {
-                if !in_effects(RwKey {
-                    tag: RwTag::Struct,
-                    ..key
-                }) {
+                if !in_effects(key.with_tag(RwTag::Struct)) {
                     add_struct(
                         &mut readonly_descrs_fields,
                         &mut field_read_descrs_raw,
@@ -13489,10 +13874,7 @@ pub fn effectinfo_from_writeanalyze(
                 cc,
             ),
             RwTag::ReadInteriorField => {
-                if !in_effects(RwKey {
-                    tag: RwTag::InteriorField,
-                    ..key
-                }) {
+                if !in_effects(key.with_tag(RwTag::InteriorField)) {
                     add_interiorfield(
                         &mut readonly_descrs_interiorfields,
                         &mut interior_read_descrs_raw,
@@ -13510,10 +13892,7 @@ pub fn effectinfo_from_writeanalyze(
                 cc,
             ),
             RwTag::ReadArray => {
-                if !in_effects(RwKey {
-                    tag: RwTag::Array,
-                    ..key
-                }) {
+                if !in_effects(key.with_tag(RwTag::Array)) {
                     add_array(
                         &mut readonly_descrs_arrays,
                         &mut array_read_descrs_raw,
@@ -13776,94 +14155,6 @@ pub fn effectinfo_from_writeanalyze(
         can_collect,
         call_release_gil_target,
     }
-}
-
-/// RPython: `op.args[0].concretetype` — resolve full ARRAY identity.
-///
-/// Returns the full ARRAY type string (e.g. `"Vec<Point>"`, `"Vec<i64>"`),
-/// matching RPython's ARRAY lltype which is the cache key for
-/// `cpu.arraydescrof(ARRAY)` (descr.py get_array_descr).
-///
-/// Resolution order:
-/// 1. Parser-set `array_type_id` (full container type from variable decl)
-/// 2. Producer chain trace-back for `op.args[0].concretetype`:
-///    - FieldRead: field type from struct_fields (full type string)
-///    - ArrayRead: propagate the array's own array_type_id
-///    - Call: return type from the callee graph's return_type
-/// 3. Phi/link source chain (limited depth)
-/// 4. None (conservative: falls back to item_ty-only keying)
-fn resolve_array_identity(
-    base: &crate::flowspace::model::Variable,
-    op_array_type_id: &Option<String>,
-    value_producers: &HashMap<crate::flowspace::model::Variable, ValueProducer>,
-    phi_sources: &HashMap<crate::flowspace::model::Variable, Option<LinkArg>>,
-    cc: &CallControl,
-) -> Option<String> {
-    fn producer_array_identity(
-        value: &crate::flowspace::model::Variable,
-        value_producers: &HashMap<crate::flowspace::model::Variable, ValueProducer>,
-        cc: &CallControl,
-    ) -> Option<String> {
-        let producer = value_producers.get(value)?;
-        match producer {
-            // FieldRead: self.array → full ARRAY type from struct registry.
-            // RPython: op.args[0].concretetype is the ARRAY lltype directly.
-            ValueProducer::Field { owner_root, name } => owner_root
-                .as_deref()
-                .and_then(|owner| cc.field_type(owner, name))
-                .map(ToOwned::to_owned),
-            // ArrayRead with known array_type_id: propagate.
-            ValueProducer::Array { array_type_id } => Some(array_type_id.clone()),
-            // Call result: RPython resolves via result.concretetype → full type.
-            ValueProducer::Call { target } => cc
-                .target_to_path(target)
-                .and_then(|callee_path| cc.function_graphs().get(&callee_path))
-                .and_then(|g| g.return_type.clone()),
-        }
-    }
-
-    fn const_array_identity(value: &crate::flowspace::model::ConstValue) -> Option<String> {
-        match value {
-            crate::flowspace::model::ConstValue::List(_) => Some("list".to_string()),
-            crate::flowspace::model::ConstValue::Tuple(_) => Some("tuple".to_string()),
-            crate::flowspace::model::ConstValue::ByteStr(_) => Some("str".to_string()),
-            crate::flowspace::model::ConstValue::UniStr(_) => Some("unicode".to_string()),
-            crate::flowspace::model::ConstValue::HostObject(obj) => {
-                Some(obj.instance_class().unwrap_or(obj).qualname().to_string())
-            }
-            _ => None,
-        }
-    }
-
-    // 1. Parser-set element type (from FnArg or typed let binding).
-    if op_array_type_id.is_some() {
-        return op_array_type_id.clone();
-    }
-    // 2. Trace back to producer — RPython: op.args[0].concretetype.
-    if let Some(identity) = producer_array_identity(base, value_producers, cc) {
-        return Some(identity);
-    }
-    // 3. Phi/link: RPython concretetype propagates through block boundaries.
-    // Follow inputarg → source link-arg chain (limited depth to avoid cycles).
-    let mut source = LinkArg::Value(base.clone());
-    for _ in 0..4 {
-        match &source {
-            LinkArg::Value(var) => {
-                if let Some(identity) = producer_array_identity(var, value_producers, cc) {
-                    return Some(identity);
-                }
-                // `None` entries mark inputargs merged from multiple
-                // predecessors — stop chasing and fall back to the
-                // `item_ty`-only path so the descr stays conservative.
-                let Some(Some(next)) = phi_sources.get(var) else {
-                    break;
-                };
-                source = next.clone();
-            }
-            LinkArg::Const(value) => return const_array_identity(&value.value),
-        }
-    }
-    None
 }
 
 /// RPython: `ARRAY.OF` — extract element type from full ARRAY type string.
@@ -14935,26 +15226,6 @@ fn exceptblock_is_reraise_of_caught_exception(graph: &FunctionGraph) -> bool {
         .any(|value| families.find_rep(value.clone()) == except_rep)
 }
 
-/// Map ValueType to a small integer for array descriptor indexing.
-fn value_type_discriminant(ty: &crate::model::ValueType) -> u8 {
-    use crate::model::ValueType;
-    match ty {
-        // ValueType::Bool maps to the same array-descriptor bucket as
-        // Int — RPython's `cpu.arraydescrof(ARRAY)` records `BOOL_TYPE`
-        // and `INT_TYPE` under the same `'int'` kind for descriptor
-        // indexing (`lltypesystem/lloperation.py _freeze_ getkind`).
-        ValueType::Int | ValueType::Unsigned | ValueType::Bool => 0,
-        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => 1,
-        ValueType::Float => 2,
-        ValueType::Void => 3,
-        ValueType::State => 4,
-        ValueType::Unknown => 5,
-        ValueType::Int128 => 6,
-        ValueType::UInt128 => 7,
-        ValueType::SingleFloat => 8,
-    }
-}
-
 //
 // RPython equivalent: effect classification in `call.py::getcalldescr()`
 // combined with the builtin function tables.
@@ -15487,6 +15758,264 @@ fn array_of_lltype_identity_for(
     }
 }
 
+/// Well-known ARRAY for a dump spelling `canonical_array_type_id` aliases.
+/// Object-ref gcarray → `GcArray(OBJECTPTR)`; `[i64]`/`GcArray<i64>` →
+/// `GcArray(Signed)`; `[f64]`/`GcArray<f64>` → `GcArray(Float)`; `[str]` →
+/// `GcArray(OBJECTPTR)` (`rmodel.externalvsinternal(..., gcref=True)`).
+/// `[u8]` is not unique (`GcArray(Char)` / `CCHARP.TO` / `STR.chars`).
+pub(crate) fn well_known_array_for_spelling(
+    spelling: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+    use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+    use majit_jitcode::codewriter::jtransform::{
+        LIST_FLOAT_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY, OBJECT_REF_GCARRAY_TYPE_ID,
+    };
+    let canonical = crate::front::typestr::canonical_array_type_id(spelling);
+    match canonical.as_ref() {
+        LIST_INT_ITEMS_ARRAY => Some(Array::gc(LowLevelType::Signed)),
+        LIST_FLOAT_ITEMS_ARRAY => Some(Array::gc(LowLevelType::Float)),
+        OBJECT_REF_GCARRAY_TYPE_ID => Some(Array::gc(OBJECTPTR.clone())),
+        "[str]" => Some(Array::gc(OBJECTPTR.clone())),
+        _ => None,
+    }
+}
+
+/// Length-prefixed `GcArray(Char)` for a `[u8]` items block.
+pub(crate) fn gcarray_char() -> crate::translator::rtyper::lltypesystem::lltype::Array {
+    use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+    Array::gc(LowLevelType::Char)
+}
+
+/// `rffi.CCHARP.TO` = `Array(Char, hints={'nolength': True})`.
+pub(crate) fn ccharp_array() -> crate::translator::rtyper::lltypesystem::lltype::Array {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    match &*crate::translator::rtyper::lltypesystem::rffi::CCHARP {
+        LowLevelType::Ptr(ptr) => match &ptr.TO {
+            PtrTarget::Array(arr) => arr.clone(),
+            other => panic!("CCHARP.TO is not Array: {other:?}"),
+        },
+        other => panic!("CCHARP is not a Ptr: {other:?}"),
+    }
+}
+
+/// ARRAY an OpKind dump names. Unique internable dumps, then the
+/// length-prefixed `[u8]` `GcArray(Char)` producers choose (not unique:
+/// `CCHARP.TO` / `STR.chars` dump the same).
+pub(crate) fn array_lltype_for_op_spelling(
+    spelling: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+    internable_array_for_spelling(spelling).or_else(|| {
+        let canonical = crate::front::typestr::canonical_array_type_id(spelling);
+        let tail = canonical.rsplit("::").next().unwrap_or(canonical.as_ref());
+        (tail == "[u8]").then(gcarray_char)
+    })
+}
+
+/// Unique ARRAY a dump names: well-known, then `Box<[String]>` /
+/// `[String]` `GcArray(STRPTR)` (`rstr.py` `TEMP`), then headerless
+/// `Vec<T>` `GcArray(OF, nolength)`. `[u8]` is not unique.
+fn internable_array_for_spelling(
+    spelling: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+    well_known_array_for_spelling(spelling).or_else(|| {
+        let canonical = crate::front::typestr::canonical_array_type_id(spelling);
+        let tail = canonical.rsplit("::").next().unwrap_or(canonical.as_ref());
+        unique_dump_array(tail)
+    })
+}
+
+fn unique_dump_array(tail: &str) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+    use crate::flowspace::model::ConstValue;
+    use crate::translator::rtyper::lltypesystem::lltype::Array;
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+    match tail {
+        "Box<[String]>" | "[String]" => Some(Array::gc(STRPTR.clone())),
+        _ => tail.strip_prefix("Vec<").and_then(|rest| {
+            let inner = rest.strip_suffix('>')?;
+            unique_vec_item_lltype(inner).map(|of| {
+                Array::gc_with_hints(of, vec![("nolength".into(), ConstValue::Bool(true))])
+            })
+        }),
+    }
+}
+
+/// Item OF a `Vec<T>` dump names exactly once. `u8` is `Char`
+/// (`rffi.CCHARP.TO.OF`); `char` is `UniChar`; `String` is `STRPTR`
+/// (`rstr.py` `TEMP.OF`).
+fn unique_vec_item_lltype(
+    item: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+    Some(match item {
+        "u8" => LowLevelType::Char,
+        "char" => LowLevelType::UniChar,
+        "i64" | "isize" => LowLevelType::Signed,
+        "u64" | "usize" => LowLevelType::Unsigned,
+        "f64" => LowLevelType::Float,
+        "f32" => LowLevelType::SingleFloat,
+        "bool" => LowLevelType::Bool,
+        "String" | "str" => STRPTR.clone(),
+        _ => return None,
+    })
+}
+
+fn dump_rows_are_concrete(rows: &[crate::front::semantic::FieldRow]) -> bool {
+    !rows.is_empty() && rows.iter().all(|row| !row.ty.contains("??"))
+}
+
+fn dump_item_matches_harvest(item: &str, key: &str) -> bool {
+    let item_base = majit_ir::descr::strip_generic_args(item);
+    let key_base = majit_ir::descr::strip_generic_args(key);
+    let item_base = item_base.as_ref();
+    let key_base = key_base.as_ref();
+    item_base == key_base
+        || crate::front::semantic::is_path_suffix(key_base, item_base)
+        || crate::front::semantic::is_path_suffix(item_base, key_base)
+}
+
+/// Field OF a harvested struct dump. Pointers to `PyObject` are
+/// `OBJECTPTR` (`rmodel.externalvsinternal(..., gcref=True)`).
+fn dump_field_lltype(
+    ty: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+    let ty = ty.trim();
+    if let Some(ll) = unique_vec_item_lltype(ty) {
+        return Some(ll);
+    }
+    match ty {
+        "i8" | "i16" | "i32" => Some(LowLevelType::Signed),
+        "u16" | "u32" => Some(LowLevelType::Unsigned),
+        "*mut PyObject" | "*const PyObject" | "PyObjectRef" | "GCREF" => Some(OBJECTPTR.clone()),
+        "()" => Some(LowLevelType::Void),
+        _ if (ty.contains("PyObject") || ty.contains("pyobject"))
+            && (ty.starts_with('*') || ty.starts_with('&') || ty.contains("PyObjectRef")) =>
+        {
+            Some(OBJECTPTR.clone())
+        }
+        _ => None,
+    }
+}
+
+/// `Box<[T]>` / `Box<[T; N]>` extract as `[T]` / `[T; N]`; the ARRAY
+/// item OF is `T`.
+fn unwrap_dump_array_item(item: &str) -> String {
+    let mut item = item.trim().to_string();
+    while item.starts_with('[') && item.ends_with(']') {
+        match extract_element_type_from_str(&item) {
+            Some(inner) if inner != item => item = inner,
+            _ => break,
+        }
+    }
+    item
+}
+
+/// Raw STRUCT named by a dump item that is neither a unique primitive
+/// nor a harvested field list. Intern keys on `Struct._name`, so
+/// `[OnceLock<usize>;35]` and `[OnceLock<fn>;1]` intern apart, and
+/// `[(TokenKind,TextRange)]` intern apart from a named TokenKind ARRAY.
+fn dump_named_struct_item_lltype(
+    item: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, Struct};
+    let item = item.trim();
+    if item.is_empty() || item.starts_with('[') || item.starts_with('*') || item.starts_with('&') {
+        return None;
+    }
+    let named = {
+        let base = majit_ir::descr::strip_generic_args(item);
+        let base = base.as_ref();
+        !base.is_empty()
+            && base
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+    };
+    let tuple = item.starts_with('(') && item.ends_with(')');
+    if !named && !tuple {
+        return None;
+    }
+    Some(LowLevelType::Struct(Box::new(Struct::registry_fields(
+        item,
+        vec![],
+        GcKind::Raw,
+    ))))
+}
+
+pub(crate) fn array_carrier_from_type_id(
+    array_type_id: &Option<String>,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+    array_type_id
+        .as_deref()
+        .and_then(internable_array_for_spelling)
+}
+
+/// `ARRAY = op.args[0].concretetype.TO` when the operand is `Ptr(ARRAY)`
+/// or an ARRAY lltype (`Transformer.rewrite_op_getarrayitem`).
+/// `ForwardReference.become` is followed (`lltype.py`). `FixedSizeArray`
+/// is a `Struct` subclass (`lltype.py`); writeanalyze still records it as
+/// an array TYPE, so intern a raw nolength ARRAY of the same OF. A
+/// Struct TO (STR after `become`) is not an ARRAY.
+pub(crate) fn array_from_concretetype(
+    ty: Option<&crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    match ty {
+        Some(LowLevelType::ForwardReference(fwd)) => {
+            array_from_concretetype(fwd.resolved().as_ref())
+        }
+        Some(LowLevelType::Ptr(ptr)) => match &ptr.TO {
+            PtrTarget::Array(arr) => Some(arr.clone()),
+            PtrTarget::FixedSizeArray(fa) => Some(array_from_fixed_size(fa)),
+            PtrTarget::ForwardReference(fwd) => array_from_concretetype(fwd.resolved().as_ref()),
+            _ => None,
+        },
+        Some(LowLevelType::Array(arr)) => Some((**arr).clone()),
+        Some(LowLevelType::FixedSizeArray(fa)) => Some(array_from_fixed_size(fa)),
+        _ => None,
+    }
+}
+
+/// Container of a writeanalyze `("array", TYPE)` / `("interiorfield",
+/// TYPE, name)` tuple whose `T.TO` is not an `lltype.Array`.
+fn unconsidered_from_concretetype(
+    ty: Option<&crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
+) -> Option<RwUnconsidered> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    match ty {
+        Some(LowLevelType::ForwardReference(fwd)) => {
+            unconsidered_from_concretetype(fwd.resolved().as_ref())
+        }
+        Some(LowLevelType::Struct(st)) => Some(RwUnconsidered::Struct((**st).clone())),
+        Some(LowLevelType::FixedSizeArray(fa)) => {
+            Some(RwUnconsidered::FixedSizeArray((**fa).clone()))
+        }
+        Some(LowLevelType::Ptr(ptr)) => match &ptr.TO {
+            PtrTarget::Struct(st) => Some(RwUnconsidered::Struct(st.clone())),
+            PtrTarget::FixedSizeArray(fa) => Some(RwUnconsidered::FixedSizeArray(fa.clone())),
+            PtrTarget::ForwardReference(fwd) => {
+                unconsidered_from_concretetype(fwd.resolved().as_ref())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn array_from_fixed_size(
+    fa: &crate::translator::rtyper::lltypesystem::lltype::FixedSizeArray,
+) -> crate::translator::rtyper::lltypesystem::lltype::Array {
+    use crate::flowspace::model::ConstValue;
+    use crate::translator::rtyper::lltypesystem::lltype::{Array, GcKind};
+    let hints = vec![("nolength".into(), ConstValue::Bool(true))];
+    match fa._gckind {
+        GcKind::Gc => Array::gc_with_hints(fa.OF.clone(), hints),
+        GcKind::Raw | GcKind::Prebuilt => Array::with_hints(fa.OF.clone(), hints),
+    }
+}
+
 /// `descr.py get_array_descr` cache key: one spelling per ARRAY lltype.
 /// The key follows `_gckind` and `ARRAY.OF` with `lltype.build_number`
 /// identity; the element spelling is the Rust name `get_type_flag` reads
@@ -15494,20 +16023,36 @@ fn array_of_lltype_identity_for(
 pub(crate) fn array_type_id_of_lltype(
     arr: &crate::translator::rtyper::lltypesystem::lltype::Array,
 ) -> String {
+    try_array_type_id_of_lltype(arr)
+        .unwrap_or_else(|| panic!("array_type_id_of_lltype: unsupported ARRAY.OF {:?}", arr.OF))
+}
+
+fn try_array_type_id_of_lltype(
+    arr: &crate::translator::rtyper::lltypesystem::lltype::Array,
+) -> Option<String> {
     use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
     use majit_jitcode::codewriter::jtransform::{
         LIST_FLOAT_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY, LIST_OBJ_ITEMS_ARRAY,
     };
     let of = array_of_lltype_identity(&arr.OF);
+    let nolength = arr
+        ._hints
+        .get("nolength")
+        .and_then(crate::flowspace::model::ConstValue::truthy)
+        .unwrap_or(false);
     if arr._gckind == GcKind::Gc {
         match &of {
-            LowLevelType::Signed => LIST_INT_ITEMS_ARRAY.to_string(),
-            LowLevelType::Float => LIST_FLOAT_ITEMS_ARRAY.to_string(),
-            LowLevelType::Ptr(p) if p._needsgc() => LIST_OBJ_ITEMS_ARRAY.to_string(),
-            of => format!("GcArray<{}>", array_item_spelling(of)),
+            LowLevelType::Signed => Some(LIST_INT_ITEMS_ARRAY.to_string()),
+            LowLevelType::Float => Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
+            // Dump `[u8]` is the length-prefixed bytes block (`gcarray_char`).
+            // `GcArray<u8>` would be a second `_cache_array` key for the same
+            // ARRAY (`cpu.arraydescrof` / `descr.py get_array_descr`).
+            LowLevelType::Char if !nolength => Some("[u8]".to_string()),
+            LowLevelType::Ptr(p) if p._needsgc() => Some(LIST_OBJ_ITEMS_ARRAY.to_string()),
+            of => Some(format!("GcArray<{}>", try_array_item_spelling(of)?)),
         }
     } else {
-        format!("Vec<{}>", array_item_spelling(&of))
+        Some(format!("Vec<{}>", try_array_item_spelling(&of)?))
     }
 }
 
@@ -15558,13 +16103,6 @@ fn try_array_item_spelling(
     })
 }
 
-fn array_item_spelling(
-    of: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
-) -> String {
-    try_array_item_spelling(of)
-        .unwrap_or_else(|| panic!("array_type_id_of_lltype: unsupported ARRAY.OF {of:?}"))
-}
-
 /// ARRAY identity for `arraydescrof_concrete`. A named `array_type_id`
 /// publishes `DescrSetMember::Array`; `None` mints a descr with no key
 /// and S4c degrades to `EF_RANDOM_EFFECTS`. STR.chars is
@@ -15608,10 +16146,16 @@ fn effect_array_gckind(
 
 fn effect_array_op_facts(
     base: &crate::flowspace::model::Variable,
-) -> (Option<String>, bool, crate::model::ArrayGcKind) {
+) -> (
+    Option<String>,
+    Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
+    bool,
+    crate::model::ArrayGcKind,
+) {
     let arr = effect_array_of_base(base);
     (
         Some(array_type_id_of_lltype(&arr)),
+        Some(arr.clone()),
         effect_array_nolength(&arr),
         effect_array_gckind(&arr),
     )
@@ -15845,6 +16389,23 @@ fn effect_malloc_array_type_id(hlv: &crate::flowspace::model::Hlvalue) -> Option
     }
 }
 
+fn effect_malloc_array(
+    hlv: &crate::flowspace::model::Hlvalue,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+    use crate::flowspace::model::{ConstValue, Hlvalue};
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    match hlv {
+        Hlvalue::Constant(c) => match &c.value {
+            ConstValue::LowLevelType(lltype) => match &**lltype {
+                LowLevelType::Array(a) => Some((**a).clone()),
+                _ => None,
+            },
+            _ => None,
+        },
+        Hlvalue::Variable(_) => None,
+    }
+}
+
 /// `jtransform.py rewrite_op_malloc_varsize` uses `ARRAY.OF` for the
 /// array descr; `item_ty` is that element's register kind, not the
 /// RESULT pointer's.
@@ -15946,13 +16507,14 @@ fn effect_transduce_op(
         }
         "getarraysize" => {
             let base = effect_expect_var(&op.args[0]);
-            let (array_type_id, nolength, gckind) = effect_array_op_facts(&base);
+            let (array_type_id, array, nolength, gckind) = effect_array_op_facts(&base);
             let result = effect_expect_var(&op.result);
             out.push_op_with_result_var(
                 block,
                 OpKind::ArrayLen {
                     base,
                     array_type_id,
+                    array,
                     nolength,
                     gckind,
                 },
@@ -15961,7 +16523,7 @@ fn effect_transduce_op(
         }
         "getarrayitem" => {
             let base = effect_expect_var(&op.args[0]);
-            let (array_type_id, nolength, gckind) = effect_array_op_facts(&base);
+            let (array_type_id, array, nolength, gckind) = effect_array_op_facts(&base);
             let index = effect_materialize(out, block, &op.args[1]);
             let result = effect_expect_var(&op.result);
             out.push_op_with_result_var(
@@ -15971,6 +16533,7 @@ fn effect_transduce_op(
                     index,
                     item_ty: effect_value_type_of(&result),
                     array_type_id,
+                    array,
                     nolength,
                     gckind,
                     pure: false,
@@ -15980,7 +16543,7 @@ fn effect_transduce_op(
         }
         "setarrayitem" => {
             let base = effect_expect_var(&op.args[0]);
-            let (array_type_id, nolength, gckind) = effect_array_op_facts(&base);
+            let (array_type_id, array, nolength, gckind) = effect_array_op_facts(&base);
             let index = effect_materialize(out, block, &op.args[1]);
             let value = effect_linkarg(&op.args[2]);
             let item_ty = match &op.args[2] {
@@ -15995,6 +16558,7 @@ fn effect_transduce_op(
                     value,
                     item_ty,
                     array_type_id,
+                    array,
                     nolength,
                     gckind,
                 },
@@ -16160,6 +16724,7 @@ fn effect_transduce_op(
                         item_ty: effect_malloc_array_item_ty(&op.args[0])
                             .unwrap_or_else(|| effect_value_type_of(&result)),
                         array_type_id: effect_malloc_array_type_id(&op.args[0]),
+                        array: effect_malloc_array(&op.args[0]),
                     },
                     result,
                 );
@@ -16237,6 +16802,7 @@ fn effect_transduce_op(
             // records `("readinteriorfield", TYPE, name)`.
             let base = effect_expect_var(&op.args[0]);
             let array_type_id = effect_array_type_id(&base);
+            let array = Some(effect_array_of_base(&base));
             let index = effect_materialize(out, block, &op.args[1]);
             let field_name = effect_field_name(&op.args[2]);
             let owner_root = effect_interior_owner(&base);
@@ -16249,6 +16815,7 @@ fn effect_transduce_op(
                     field: FieldDescriptor::new(field_name, owner_root),
                     item_ty: effect_value_type_of(&result),
                     array_type_id,
+                    array,
                 },
                 result,
             );
@@ -16260,6 +16827,7 @@ fn effect_transduce_op(
             // `("interiorfield", TYPE, name)`.
             let base = effect_expect_var(&op.args[0]);
             let array_type_id = effect_array_type_id(&base);
+            let array = Some(effect_array_of_base(&base));
             let index = effect_materialize(out, block, &op.args[1]);
             let field_name = effect_field_name(&op.args[2]);
             let owner_root = effect_interior_owner(&base);
@@ -16283,6 +16851,7 @@ fn effect_transduce_op(
                     value,
                     item_ty,
                     array_type_id,
+                    array,
                 },
                 false,
             );
@@ -16746,6 +17315,592 @@ mod tests {
         for id in [&a, &b, &ccharp, &signed_arr, &gc_arr, &longfloat_arr] {
             assert_unsigned_item(id);
         }
+    }
+
+    /// `GcCache._cache_array` keys on ARRAY `LowLevelType.__eq__`, so
+    /// collision pairs A/B/C (plan §2.5) intern as distinct ids.
+    #[test]
+    fn intern_array_splits_collision_pairs() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        use crate::translator::rtyper::lltypesystem::rffi;
+        let cc = CallControl::new();
+        let a_t = Array::gc(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc("T", vec![("x".into(), LowLevelType::Signed)])),
+        })));
+        let a_u = Array::gc(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc("U", vec![("x".into(), LowLevelType::Signed)])),
+        })));
+        assert_ne!(cc.intern_array(&a_t), cc.intern_array(&a_u));
+
+        fn raw_struct_ptr(name: &str) -> LowLevelType {
+            LowLevelType::Ptr(Box::new(Ptr {
+                TO: PtrTarget::Struct(Struct::new(name, vec![("x".into(), LowLevelType::Signed)])),
+            }))
+        }
+        let b_a = rffi::CArray(raw_struct_ptr("A"));
+        let b_b = rffi::CArray(raw_struct_ptr("B"));
+        let b_c = rffi::CArray(rffi::CCHARP.clone());
+        let id_ba = cc.intern_array(&b_a);
+        let id_bb = cc.intern_array(&b_b);
+        let id_bc = cc.intern_array(&b_c);
+        assert_ne!(id_ba, id_bb);
+        assert_ne!(id_ba, id_bc);
+        assert_ne!(id_bb, id_bc);
+
+        let c_signed = Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+            "x",
+            vec![("v".into(), LowLevelType::Signed)],
+        ))));
+        let c_float = Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+            "x",
+            vec![("v".into(), LowLevelType::Float)],
+        ))));
+        assert_ne!(cc.intern_array(&c_signed), cc.intern_array(&c_float));
+    }
+
+    #[test]
+    fn intern_array_shares_gcarray_char_and_returns_equal_array() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        let cc = CallControl::new();
+        let a = Array::gc(LowLevelType::Char);
+        let b = Array::gc(LowLevelType::Char);
+        let id = cc.intern_array(&a);
+        assert_eq!(id, cc.intern_array(&b));
+        assert_eq!(cc.interned_array(id), a);
+    }
+
+    #[test]
+    fn intern_array_collapses_signed_longlong_on_64bit() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        let cc = CallControl::new();
+        let signed = Array::gc(LowLevelType::Signed);
+        let longlong = Array::gc(LowLevelType::SignedLongLong);
+        if crate::layout::target_signed_size() == 8 {
+            assert_eq!(cc.intern_array(&signed), cc.intern_array(&longlong));
+        } else {
+            assert_ne!(cc.intern_array(&signed), cc.intern_array(&longlong));
+        }
+    }
+
+    #[test]
+    fn intern_array_ids_are_dense_first_seen() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        let cc = CallControl::new();
+        assert_eq!(cc.intern_array(&Array::gc(LowLevelType::Char)), 0);
+        assert_eq!(cc.intern_array(&Array::gc(LowLevelType::Signed)), 1);
+        assert_eq!(cc.intern_array(&Array::gc(LowLevelType::Char)), 0);
+    }
+
+    /// `[u8]` is `GcArray(Char)`; `CCHARP.TO` is raw `Array(Char, nolength)`.
+    #[test]
+    fn gcarray_char_and_ccharp_intern_apart() {
+        let cc = CallControl::new();
+        assert_ne!(
+            cc.intern_array(&gcarray_char()),
+            cc.intern_array(&ccharp_array())
+        );
+        assert_eq!(
+            well_known_array_for_spelling("[str]"),
+            well_known_array_for_spelling(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID)
+        );
+    }
+
+    /// `cpu.arraydescrof(ARRAY)` / `descr.py get_array_descr` keys on the
+    /// ARRAY object. Dump `[u8]` and `gcarray_char()` are that ARRAY, so
+    /// the descr-set member is `path_hash("[u8]")`, not `GcArray<u8>`.
+    #[test]
+    fn array_type_id_gc_char_is_bytes_block() {
+        use majit_ir::effectinfo::DescrSetMember;
+        assert_eq!(array_type_id_of_lltype(&gcarray_char()), "[u8]");
+        let cc = CallControl::new();
+        let dump = cc
+            .array_from_dump_spelling("[u8]")
+            .expect("[u8] reconstructs GcArray(Char)");
+        assert_eq!(cc.intern_array(&dump), cc.intern_array(&gcarray_char()));
+        let (_, key) =
+            cc.arraydescrof_keyed(0, &gcarray_char(), majit_ir::value::Type::Int, Some(0));
+        assert_eq!(
+            key,
+            Some(DescrSetMember::Array {
+                array_id: majit_ir::descr::path_hash("[u8]"),
+            })
+        );
+    }
+
+    /// `get_ll_dict` `DICTENTRYARRAY`: a dump `GcArray<rordereddict_entries::Entry>`
+    /// interned from harvested `Entry<i64, *mut PyObject>` rows shares one
+    /// ARRAY id; empty `_flds` intern apart so interiorfield is not Void.
+    #[test]
+    fn dump_gcarray_entry_interns_harvested_fields() {
+        use crate::front::StructFieldRegistry;
+        use crate::front::semantic::FieldRow;
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Struct};
+        let entry = "pyre_object::rordereddict_entries::Entry<i64,*mut PyObject>";
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            entry.to_string(),
+            vec![
+                FieldRow::named("key", "i64"),
+                FieldRow::named("f_valid", "bool"),
+                FieldRow::named("value", "*mut PyObject"),
+                FieldRow::named("f_hash", "u64"),
+            ],
+        );
+        fields.fields.insert(
+            "Entry".to_string(),
+            vec![
+                FieldRow::named("key", "??TypeVar"),
+                FieldRow::named("f_valid", "bool"),
+                FieldRow::named("value", "??TypeVar"),
+                FieldRow::named("f_hash", "u64"),
+            ],
+        );
+        let mut cc = CallControl::new();
+        cc.set_struct_fields(fields);
+        assert!(internable_array_for_spelling("GcArray<rordereddict_entries::Entry>").is_none());
+        let spelling = Some("GcArray<rordereddict_entries::Entry>".to_string());
+        let id = cc.intern_array_or_spelling(&None, &spelling);
+        assert_eq!(id, cc.intern_array_or_spelling(&None, &spelling));
+        assert_eq!(
+            id,
+            cc.intern_array_or_spelling(&None, &Some(format!("GcArray<{entry}>")))
+        );
+        let arr = cc.interned_array(id);
+        let LowLevelType::Struct(st) = &arr.OF else {
+            panic!("DICTENTRYARRAY.OF is Struct, got {:?}", arr.OF);
+        };
+        assert_eq!(st._name, entry);
+        assert!(matches!(
+            st.getattr_field_type("key"),
+            Some(LowLevelType::Signed)
+        ));
+        assert!(matches!(
+            st.getattr_field_type("f_valid"),
+            Some(LowLevelType::Bool)
+        ));
+        assert!(
+            st.getattr_field_type("value")
+                .is_some_and(|ty| !matches!(ty, LowLevelType::Void))
+        );
+        assert!(matches!(
+            st.getattr_field_type("f_hash"),
+            Some(LowLevelType::Unsigned)
+        ));
+        let dummy = Array::gc(LowLevelType::Struct(Box::new(Struct::new(entry, vec![]))));
+        assert_ne!(id, cc.intern_array(&dummy));
+    }
+
+    /// Harvested enum rows use `__discriminant`; `Struct.registry_fields`
+    /// keeps that name so intern of `GcArray<Entry<…>>` does not panic.
+    #[test]
+    fn dump_gcarray_enum_entry_interns_discriminant_field() {
+        use crate::front::StructFieldRegistry;
+        use crate::front::semantic::FieldRow;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let entry = "Entry<usize,CodeLocations>";
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            entry.to_string(),
+            vec![FieldRow::named("__discriminant", "u32")],
+        );
+        let mut cc = CallControl::new();
+        cc.set_struct_fields(fields);
+        let spelling = Some(format!("GcArray<{entry}>"));
+        let id = cc.intern_array_or_spelling(&None, &spelling);
+        let arr = cc.interned_array(id);
+        let LowLevelType::Struct(st) = &arr.OF else {
+            panic!("ARRAY.OF is Struct, got {:?}", arr.OF);
+        };
+        assert_eq!(st._name, entry);
+        assert!(matches!(
+            st.getattr_field_type("__discriminant"),
+            Some(LowLevelType::Unsigned)
+        ));
+    }
+
+    /// `[OnceLock<usize>;35]` is `lltype.Array` with `_hints['nolength']`
+    /// (`gckind_from_array_type_id` / `nolength_from_array_type_id`). The
+    /// item is not unique-dump; intern uses the dump item as a raw STRUCT
+    /// name when harvest has no rows.
+    #[test]
+    fn dump_fixed_array_oncelock_interns_named_struct_item() {
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
+        let cc = CallControl::new();
+        let spelling = Some("[OnceLock<usize>;35]".to_string());
+        let id = cc.intern_array_or_spelling(&None, &spelling);
+        assert_eq!(id, cc.intern_array_or_spelling(&None, &spelling));
+        assert_ne!(
+            id,
+            cc.intern_array_or_spelling(&None, &Some("[OnceLock<fn>;1]".to_string()))
+        );
+        let arr = cc.interned_array(id);
+        assert_eq!(arr._gckind, GcKind::Raw);
+        assert_eq!(
+            arr._hints.get("nolength"),
+            Some(&crate::flowspace::model::ConstValue::Bool(true))
+        );
+        let LowLevelType::Struct(st) = &arr.OF else {
+            panic!("OF is Struct, got {:?}", arr.OF);
+        };
+        assert_eq!(st._name, "OnceLock<usize>");
+    }
+
+    /// `[(TokenKind,TextRange)]` item OF is the dump tuple, interned as
+    /// a raw STRUCT of that name (`lltype.Array` of a tuple struct).
+    #[test]
+    fn dump_tuple_item_array_interns_named_struct_item() {
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
+        let cc = CallControl::new();
+        let spelling = Some("[(TokenKind,TextRange)]".to_string());
+        let id = cc.intern_array_or_spelling(&None, &spelling);
+        assert_eq!(id, cc.intern_array_or_spelling(&None, &spelling));
+        let arr = cc.interned_array(id);
+        assert_eq!(arr._gckind, GcKind::Raw);
+        assert_eq!(
+            arr._hints.get("nolength"),
+            Some(&crate::flowspace::model::ConstValue::Bool(true))
+        );
+        let LowLevelType::Struct(st) = &arr.OF else {
+            panic!("OF is Struct, got {:?}", arr.OF);
+        };
+        assert_eq!(st._name, "(TokenKind,TextRange)");
+    }
+
+    /// `Box<[ConstantData;3]>` is `Box<[T; N]>`: extract yields
+    /// `[ConstantData;3]`, the ARRAY item OF is `ConstantData`.
+    #[test]
+    fn dump_box_fixed_array_interns_named_struct_item() {
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
+        let cc = CallControl::new();
+        let spelling = Some("Box<[ConstantData;3]>".to_string());
+        let id = cc.intern_array_or_spelling(&None, &spelling);
+        assert_eq!(id, cc.intern_array_or_spelling(&None, &spelling));
+        let arr = cc.interned_array(id);
+        assert_eq!(arr._gckind, GcKind::Gc);
+        let LowLevelType::Struct(st) = &arr.OF else {
+            panic!("OF is Struct, got {:?}", arr.OF);
+        };
+        assert_eq!(st._name, "ConstantData");
+    }
+
+    /// `[u32;624]` unique item OF is Unsigned (`rrandom` mt_n).
+    #[test]
+    fn dump_fixed_array_u32_interns_unsigned_item() {
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
+        let cc = CallControl::new();
+        let spelling = Some("[u32;624]".to_string());
+        let id = cc.intern_array_or_spelling(&None, &spelling);
+        assert_eq!(id, cc.intern_array_or_spelling(&None, &spelling));
+        let arr = cc.interned_array(id);
+        assert_eq!(arr._gckind, GcKind::Raw);
+        assert!(matches!(arr.OF, LowLevelType::Unsigned));
+        assert_eq!(
+            arr._hints.get("nolength"),
+            Some(&crate::flowspace::model::ConstValue::Bool(true))
+        );
+    }
+
+    /// `op.args[0].concretetype.TO` a `FixedSizeArray` is interned as a
+    /// raw nolength ARRAY of the same OF.
+    #[test]
+    fn array_from_concretetype_fixed_size_array_is_nolength_raw() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FixedSizeArray, GcKind, LowLevelType, Ptr, PtrTarget,
+        };
+        let fa = FixedSizeArray::new(LowLevelType::Unsigned, 35);
+        let ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::FixedSizeArray(fa),
+        }));
+        let arr = array_from_concretetype(Some(&ty)).expect("FixedSizeArray ARRAY");
+        assert_eq!(arr._gckind, GcKind::Raw);
+        assert!(matches!(arr.OF, LowLevelType::Unsigned));
+        assert_eq!(
+            arr._hints.get("nolength"),
+            Some(&crate::flowspace::model::ConstValue::Bool(true))
+        );
+    }
+
+    /// `ARRAY = op.args[0].concretetype.TO` after `ForwardReference.become`
+    /// (`rewrite_op_getarrayitem`).
+    #[test]
+    fn array_from_concretetype_follows_forward_reference_to_array() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, ForwardReference, LowLevelType, Ptr, PtrTarget,
+        };
+        let arr = Array::gc(LowLevelType::Signed);
+        let fwd = ForwardReference::gc();
+        fwd.r#become(LowLevelType::Array(Box::new(arr.clone())))
+            .expect("become Array");
+        let ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::ForwardReference(fwd),
+        }));
+        let got = array_from_concretetype(Some(&ty)).expect("FR ARRAY");
+        assert_eq!(got, arr);
+    }
+
+    /// A dump spelling that is not an ARRAY lltype does not panic
+    /// writeanalyze: `add_array` (`effectinfo.py`) publishes no descr.
+    #[test]
+    fn readwrite_array_unreconstructable_dump_is_not_considered() {
+        let mut g = FunctionGraph::new("dyn_getitem");
+        let start = g.startblock;
+        let base = g.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        let index = g.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        g.push_inputarg_var(start, base.clone());
+        g.push_inputarg_var(start, index.clone());
+        g.push_op_var(
+            start,
+            OpKind::ArrayRead {
+                base,
+                index,
+                item_ty: ValueType::Int,
+                array_type_id: Some("dyn Debug".to_string()),
+                array: None,
+                nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
+                pure: false,
+            },
+            true,
+        );
+        g.set_return(start, None);
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["dyn_getitem"]);
+        cc.register_function_graph(path.clone(), g);
+        let effects = cc.analyze_readwrite(
+            &path,
+            &mut ReadWriteTracker::new(),
+            &mut UnionFind::new(|_| Dependency::new(ReadWriteEffects::bottom_result())),
+        );
+        let ReadWriteEffects::Set(set) = &effects else {
+            panic!("unreconstructable dump ArrayRead is not top");
+        };
+        let mut indices = Vec::new();
+        let mut descrs = Vec::new();
+        for (key, operand) in set.iter() {
+            if key.tag == RwTag::ReadArray {
+                add_array(&mut indices, &mut descrs, key.index, operand, &cc);
+            }
+        }
+        assert!(indices.is_empty(), "add_array publishes no index");
+        assert!(descrs.is_empty(), "add_array publishes no descr");
+    }
+
+    /// `add_array` (`effectinfo.py`): `ARRAY = T.TO`; `consider_array` is
+    /// false when TO is not `lltype.GcArray`. STRPTR is `Ptr` of a
+    /// `ForwardReference` that `become`s `GcStruct rpy_string`
+    /// (`rstr.py`); writeanalyze records the tuple and publishes no descr.
+    #[test]
+    fn readwrite_array_strptr_is_not_considered() {
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+        let mut g = FunctionGraph::new("strptr_getitem");
+        let start = g.startblock;
+        let base = variable_with_lltype("s", (*STRPTR).clone());
+        let index = g.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        g.push_inputarg_var(start, base.clone());
+        g.push_inputarg_var(start, index.clone());
+        g.push_op_var(
+            start,
+            OpKind::ArrayRead {
+                base,
+                index,
+                item_ty: ValueType::Int,
+                array_type_id: None,
+                array: None,
+                nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
+                pure: false,
+            },
+            true,
+        );
+        g.set_return(start, None);
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["strptr_getitem"]);
+        cc.register_function_graph(path.clone(), g);
+        let effects = cc.analyze_readwrite(
+            &path,
+            &mut ReadWriteTracker::new(),
+            &mut UnionFind::new(|_| Dependency::new(ReadWriteEffects::bottom_result())),
+        );
+        let ReadWriteEffects::Set(set) = &effects else {
+            panic!("STRPTR ArrayRead is not top");
+        };
+        let mut indices = Vec::new();
+        let mut descrs = Vec::new();
+        for (key, operand) in set.iter() {
+            assert_eq!(key.tag, RwTag::ReadArray);
+            assert!(
+                matches!(
+                    operand,
+                    RwOperand::Array {
+                        consider: false,
+                        ..
+                    }
+                ),
+                "STR is not consider_array, got {operand:?}"
+            );
+            add_array(&mut indices, &mut descrs, key.index, operand, &cc);
+        }
+        assert!(indices.is_empty(), "add_array publishes no index");
+        assert!(descrs.is_empty(), "add_array publishes no descr");
+    }
+
+    /// `Box<[String]>` is `rstr.py` `TEMP = GcArray(Ptr(STR))`, interned
+    /// apart from `GcArray(OBJECTPTR)`.
+    #[test]
+    fn box_string_slice_is_gcarray_strptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::Array;
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+        let arr = array_lltype_for_op_spelling("Box<[String]>").expect("Box<[String]> ARRAY");
+        assert_eq!(arr, Array::gc(STRPTR.clone()));
+        let cc = CallControl::new();
+        assert_ne!(
+            cc.intern_array(&arr),
+            cc.intern_array(&Array::gc(OBJECTPTR.clone()))
+        );
+    }
+
+    /// `cpu.arraydescrof(ARRAY)` / `get_array_descr(gccache, ARRAY)`:
+    /// collision B (raw CArray of distinct pointees) and collision A
+    /// (GcArray of distinct GC pointees) mint distinct descr Arcs; the
+    /// same ARRAY twice shares one Arc.
+    #[test]
+    fn arraydescrof_splits_collision_raw_ptr_and_gc_ptr_arrays() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        use crate::translator::rtyper::lltypesystem::rffi;
+        let cc = CallControl::new();
+        fn raw_struct_ptr(name: &str) -> LowLevelType {
+            LowLevelType::Ptr(Box::new(Ptr {
+                TO: PtrTarget::Struct(Struct::new(name, vec![("x".into(), LowLevelType::Signed)])),
+            }))
+        }
+        let a = rffi::CArray(raw_struct_ptr("A"));
+        let b = rffi::CArray(raw_struct_ptr("B"));
+        let c = rffi::CArray(rffi::CCHARP.clone());
+        let da = cc.arraydescrof_array(&a);
+        let db = cc.arraydescrof_array(&b);
+        let dc = cc.arraydescrof_array(&c);
+        assert!(!std::sync::Arc::ptr_eq(&da, &db));
+        assert!(!std::sync::Arc::ptr_eq(&da, &dc));
+        assert!(!std::sync::Arc::ptr_eq(&db, &dc));
+        let da2 = cc.arraydescrof_array(&a);
+        assert!(std::sync::Arc::ptr_eq(&da, &da2));
+
+        let t = Array::gc(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc("T", vec![("x".into(), LowLevelType::Signed)])),
+        })));
+        let u = Array::gc(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc("U", vec![("x".into(), LowLevelType::Signed)])),
+        })));
+        let dt = cc.arraydescrof_array(&t);
+        let du = cc.arraydescrof_array(&u);
+        assert!(!std::sync::Arc::ptr_eq(&dt, &du));
+        let dt2 = cc.arraydescrof_array(&t);
+        assert!(std::sync::Arc::ptr_eq(&dt, &dt2));
+    }
+
+    /// Collisions A–C get distinct `array_index` / `interiorfield_index`;
+    /// two `GcArray(Char)` values share one.
+    #[test]
+    fn descr_index_registry_splits_collision_pairs() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        use crate::translator::rtyper::lltypesystem::rffi;
+        let cc = CallControl::new();
+        let a_t = Array::gc(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc("T", vec![("x".into(), LowLevelType::Signed)])),
+        })));
+        let a_u = Array::gc(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc("U", vec![("x".into(), LowLevelType::Signed)])),
+        })));
+        let ia = cc.intern_array(&a_t);
+        let ib = cc.intern_array(&a_u);
+        assert_ne!(
+            cc.descr_indices.array_index(ia),
+            cc.descr_indices.array_index(ib)
+        );
+
+        fn raw_struct_ptr(name: &str) -> LowLevelType {
+            LowLevelType::Ptr(Box::new(Ptr {
+                TO: PtrTarget::Struct(Struct::new(name, vec![("x".into(), LowLevelType::Signed)])),
+            }))
+        }
+        let b_a = rffi::CArray(raw_struct_ptr("A"));
+        let b_b = rffi::CArray(raw_struct_ptr("B"));
+        let b_c = rffi::CArray(rffi::CCHARP.clone());
+        let i_ba = cc.intern_array(&b_a);
+        let i_bb = cc.intern_array(&b_b);
+        let i_bc = cc.intern_array(&b_c);
+        assert_ne!(
+            cc.descr_indices.array_index(i_ba),
+            cc.descr_indices.array_index(i_bb)
+        );
+        assert_ne!(
+            cc.descr_indices.array_index(i_ba),
+            cc.descr_indices.array_index(i_bc)
+        );
+        assert_ne!(
+            cc.descr_indices.array_index(i_bb),
+            cc.descr_indices.array_index(i_bc)
+        );
+
+        let c_signed = Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+            "x",
+            vec![("v".into(), LowLevelType::Signed)],
+        ))));
+        let c_float = Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+            "x",
+            vec![("v".into(), LowLevelType::Float)],
+        ))));
+        let i_cs = cc.intern_array(&c_signed);
+        let i_cf = cc.intern_array(&c_float);
+        assert_ne!(
+            cc.descr_indices.interiorfield_index(i_cs, "v"),
+            cc.descr_indices.interiorfield_index(i_cf, "v"),
+        );
+
+        let char_a = Array::gc(LowLevelType::Char);
+        let char_b = Array::gc(LowLevelType::Char);
+        assert_eq!(
+            cc.descr_indices.array_index(cc.intern_array(&char_a)),
+            cc.descr_indices.array_index(cc.intern_array(&char_b)),
+        );
+    }
+
+    /// Collision C: same struct `_name`, different `_flds` → two
+    /// interiorfield descr Arcs (`get_interiorfield_descr` keys on ARRAY).
+    #[test]
+    fn interiorfielddescrof_splits_same_named_struct_arrays() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Struct};
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(["x".to_string()].into_iter().collect());
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry
+            .fields
+            .insert("x".to_string(), vec![("v".to_string(), "i64".to_string())]);
+        cc.set_struct_fields(registry);
+        let signed = Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+            "x",
+            vec![("v".into(), LowLevelType::Signed)],
+        ))));
+        let float = Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+            "x",
+            vec![("v".into(), LowLevelType::Float)],
+        ))));
+        let spelling = Some(array_type_id_of_lltype(&signed));
+        let d_signed = cc
+            .interiorfielddescrof_with_array(0, &spelling, &Some(signed), "v")
+            .expect("signed interiorfield");
+        let d_float = cc
+            .interiorfielddescrof_with_array(1, &spelling, &Some(float), "v")
+            .expect("float interiorfield");
+        assert!(!std::sync::Arc::ptr_eq(&d_signed, &d_float));
     }
 
     /// `descr.py get_type_flag`: a Ptr whose TO._gckind == 'raw' is
@@ -21445,8 +22600,6 @@ mod tests {
     /// rejects the shared atid.
     #[test]
     fn interiorfield_base_matches_arraydescrof_on_a_narrow_word() {
-        use majit_ir::value::Type;
-
         let elem = "overaligned_entry::Entry";
         let atid = format!("GcArray<{elem}>");
         let sid = majit_ir::descr::StructId::from_canonical(elem);
@@ -21473,8 +22626,15 @@ mod tests {
         cc.set_struct_fields(rows);
         cc.set_struct_layout(sid, layout);
 
+        let arr = {
+            use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Struct};
+            Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+                elem,
+                vec![("f_hash".into(), LowLevelType::UnsignedLongLong)],
+            ))))
+        };
         let (descr, _) = cc
-            .interiorfielddescrof_keyed(1, &Some(atid.clone()), "f_hash")
+            .interiorfielddescrof_keyed(1, &Some(atid.clone()), &Some(arr.clone()), "f_hash")
             .expect("interior field descr");
         let interior = descr.as_interior_field_descr().expect("InteriorFieldDescr");
         assert_eq!(interior.array_descr().base_size(), 8);
@@ -21483,7 +22643,7 @@ mod tests {
             8
         );
 
-        let array = cc.arraydescrof(2, &Some(atid), Type::Ref, Some(0));
+        let array = cc.arraydescrof_array(&arr);
         let array = array.as_array_descr().expect("ArrayDescr");
         assert_eq!(array.base_size(), 8);
         assert_eq!(array.len_descr().map(|fd| fd.offset()), Some(0));
@@ -21530,8 +22690,22 @@ mod tests {
         cc.set_struct_fields(fields);
         cc.set_struct_layout(sid, layout);
 
+        let arr = {
+            use crate::translator::rtyper::lltypesystem::lltype::{
+                Array, GCREF, LowLevelType, Struct,
+            };
+            Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+                elem,
+                vec![
+                    ("key".into(), LowLevelType::Signed),
+                    ("f_valid".into(), LowLevelType::Bool),
+                    ("value".into(), GCREF.clone()),
+                    ("f_hash".into(), LowLevelType::UnsignedLongLong),
+                ],
+            ))))
+        };
         let (descr, _) = cc
-            .interiorfielddescrof_keyed(1, &Some(atid), "value")
+            .interiorfielddescrof_keyed(1, &Some(atid), &Some(arr), "value")
             .expect("interior field descr");
         let offset = descr
             .as_interior_field_descr()
@@ -22932,26 +24106,23 @@ mod tests {
                 std::sync::Arc::ptr_eq(&slice_descr, &list_descr),
                 "{slice_id} and {list_id} minted two descrs"
             );
-            let slice_ei =
-                cc.descr_indices
-                    .array_index(value_type_discriminant(&item_ty), &slice_ty, Some(0));
-            let list_ei =
-                cc.descr_indices
-                    .array_index(value_type_discriminant(&item_ty), &list_ty, Some(0));
+            let slice_ei = cc
+                .descr_indices
+                .array_index(cc.intern_array_or_spelling(&None, &slice_ty));
+            let list_ei = cc
+                .descr_indices
+                .array_index(cc.intern_array_or_spelling(&None, &list_ty));
             assert_eq!(slice_ei, list_ei, "{slice_id} vs {list_id}");
             assert_eq!(slice_descr.get_ei_index(), slice_ei);
         }
-        let int_ty = ValueType::Int;
-        let i64_ei = cc.descr_indices.array_index(
-            value_type_discriminant(&int_ty),
-            &Some("[i64]".to_string()),
-            Some(0),
-        );
-        let u32_ei = cc.descr_indices.array_index(
-            value_type_discriminant(&int_ty),
-            &Some("[u32]".to_string()),
-            Some(0),
-        );
+        let i64_ei = cc
+            .descr_indices
+            .array_index(cc.intern_array_or_spelling(&None, &Some("[i64]".to_string())));
+        let u32_ei = cc.descr_indices.array_index(cc.intern_array(
+            &crate::translator::rtyper::lltypesystem::lltype::Array::gc(
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Unsigned,
+            ),
+        ));
         assert_ne!(i64_ei, u32_ei);
     }
 
@@ -22992,16 +24163,19 @@ mod tests {
                 length: crate::flowspace::model::Variable::new(),
                 item_ty: ValueType::Int,
                 array_type_id: None,
+                array: None,
             },
             OpKind::NewArrayClear {
                 length: crate::flowspace::model::Variable::new(),
                 item_ty: ValueType::Ref(None),
                 array_type_id: None,
+                array: None,
             },
             OpKind::NewListClear {
                 length: crate::flowspace::model::Variable::new(),
                 item_ty: ValueType::Ref(None),
                 array_type_id: None,
+                array: None,
             },
         ];
 
@@ -24093,34 +25267,6 @@ mod tests {
             None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
-    }
-
-    #[test]
-    fn resolve_array_identity_follows_phi_chain_to_constant_link_arg() {
-        use crate::flowspace::model::Variable;
-        let cc = CallControl::new();
-        let base = Variable::new();
-        let forwarded = Variable::new();
-        let value_producers: HashMap<Variable, ValueProducer> = HashMap::new();
-        let mut phi_sources: HashMap<Variable, Option<LinkArg>> = HashMap::new();
-        phi_sources.insert(base.clone(), Some(LinkArg::Value(forwarded.clone())));
-        phi_sources.insert(
-            forwarded,
-            Some(LinkArg::from(crate::flowspace::model::ConstValue::List(
-                std::sync::Arc::new(vec![]),
-            ))),
-        );
-
-        assert_eq!(
-            resolve_array_identity(
-                &base,
-                &Option::<String>::None,
-                &value_producers,
-                &phi_sources,
-                &cc,
-            ),
-            Some("list".to_string())
-        );
     }
 
     #[test]
@@ -26657,13 +27803,25 @@ mod tests {
         cc.set_struct_fields(registry);
         cc.set_known_struct_names([ELEM.to_string()].into_iter().collect());
 
-        let array = Some(format!("Vec<{ELEM}>"));
+        let spelling = Some(format!("Vec<{ELEM}>"));
+        let arr = {
+            use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Struct};
+            Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+                ELEM,
+                vec![
+                    ("marker".into(), LowLevelType::Void),
+                    ("value".into(), LowLevelType::Signed),
+                ],
+            ))))
+        };
         assert!(
-            cc.interiorfielddescrof(0, &array, "marker").is_none(),
+            cc.interiorfielddescrof_with_array(0, &spelling, &Some(arr.clone()), "marker")
+                .is_none(),
             "a zero-sized element field has no interior descr to mint"
         );
         assert!(
-            cc.interiorfielddescrof(1, &array, "value").is_some(),
+            cc.interiorfielddescrof_with_array(1, &spelling, &Some(arr), "value")
+                .is_some(),
             "the stored element field still resolves"
         );
     }
@@ -28447,6 +29605,7 @@ mod tests {
                 OpKind::InteriorFieldRead {
                     field,
                     array_type_id,
+                    array: _,
                     index: idx,
                     ..
                 } => Some((
@@ -28515,6 +29674,7 @@ mod tests {
                 OpKind::InteriorFieldWrite {
                     field,
                     array_type_id,
+                    array: _,
                     item_ty,
                     ..
                 } => Some((
@@ -28754,10 +29914,10 @@ mod tests {
             matches!(
                 operand,
                 RwOperand::Array {
-                    array_type_id,
+                    array: Some(a),
                     consider: true,
                     ..
-                } if array_type_id.as_deref() == Some(expected_id.as_str())
+                } if array_type_id_of_lltype(a) == expected_id
             ),
             "array write of Array(Signed), got {operand:?}"
         );
@@ -29025,23 +30185,17 @@ mod tests {
             .iter()
             .find(|(key, _)| key.tag == RwTag::Array)
             .expect("ArrayItemsOffset array effect");
-        let (ifield_array_type_id, ifield_len_offset) = set
+        let ifield_array = set
             .iter()
             .find(|(key, _)| key.tag == RwTag::InteriorField)
             .map(|(_, operand)| match operand {
                 RwOperand::InteriorField {
-                    array_type_id,
-                    len_offset,
-                    ..
-                } => (array_type_id, *len_offset),
+                    array: Some(arr), ..
+                } => arr.clone(),
                 other => panic!("interiorfield operand, got {other:?}"),
             })
             .expect("FieldOffset interiorfield effect");
-        let extra_index = cc.descr_indices.array_index(
-            value_type_discriminant(&crate::model::ValueType::Ref(None)),
-            ifield_array_type_id,
-            ifield_len_offset,
-        );
+        let extra_index = cc.descr_indices.array_index(cc.intern_array(&ifield_array));
         assert_eq!(
             items_key.index, extra_index,
             "ArrayItemsOffset index vs extraef array_index"
@@ -29387,6 +30541,268 @@ mod tests {
             ),
             "nolength GcArray(Struct) FieldOffset has len_offset None, got {operand:?}"
         );
+    }
+
+    fn collision_a_array(name: &str) -> crate::translator::rtyper::lltypesystem::lltype::Array {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        Array::gc(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc(name, vec![("x".into(), LowLevelType::Signed)])),
+        })))
+    }
+
+    fn array_write_graph(
+        name: &str,
+        array: crate::translator::rtyper::lltypesystem::lltype::Array,
+    ) -> FunctionGraph {
+        let mut g = FunctionGraph::new(name);
+        let start = g.startblock;
+        let base = g.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        let index = g.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        let value = g.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        g.push_inputarg_var(start, base.clone());
+        g.push_inputarg_var(start, index.clone());
+        g.push_inputarg_var(start, value.clone());
+        g.push_op_var(
+            start,
+            OpKind::ArrayWrite {
+                base,
+                index,
+                value: LinkArg::Value(value),
+                item_ty: ValueType::Ref(None),
+                array_type_id: Some(array_type_id_of_lltype(&array)),
+                array: Some(array),
+                nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
+            },
+            false,
+        );
+        g.set_return(start, None);
+        g
+    }
+
+    fn effectinfo_of_graph(
+        cc: &mut CallControl,
+        name: &str,
+        graph: FunctionGraph,
+    ) -> majit_ir::descr::EffectInfo {
+        let path = CallPath::from_segments([name]);
+        cc.register_function_graph(path.clone(), graph);
+        let effects = cc.analyze_readwrite(
+            &path,
+            &mut ReadWriteTracker::new(),
+            &mut UnionFind::new(|_| Dependency::new(ReadWriteEffects::bottom_result())),
+        );
+        effectinfo_from_writeanalyze(
+            &effects,
+            ExtraEffect::CanRaise,
+            OopSpecIndex::None,
+            false,
+            true,
+            None,
+            name,
+            cc,
+            EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+        )
+    }
+
+    /// Collision A: `GcArray(Ptr(T))` vs `GcArray(Ptr(U))` write-array
+    /// sets differ; a third callee writing T shares T's member.
+    #[test]
+    fn effectinfo_write_arrays_split_collision_a() {
+        let mut cc = CallControl::new();
+        let arr_t = collision_a_array("T");
+        let arr_u = collision_a_array("U");
+        let ei_t = effectinfo_of_graph(
+            &mut cc,
+            "write_t",
+            array_write_graph("write_t", arr_t.clone()),
+        );
+        let ei_u = effectinfo_of_graph(&mut cc, "write_u", array_write_graph("write_u", arr_u));
+        let ei_t2 = effectinfo_of_graph(&mut cc, "write_t2", array_write_graph("write_t2", arr_t));
+        let wt = ei_t
+            ._write_descrs_arrays
+            .as_ref()
+            .expect("T writes an array");
+        let wu = ei_u
+            ._write_descrs_arrays
+            .as_ref()
+            .expect("U writes an array");
+        let wt2 = ei_t2
+            ._write_descrs_arrays
+            .as_ref()
+            .expect("T again writes an array");
+        assert_eq!(wt.len(), 1);
+        assert_eq!(wu.len(), 1);
+        assert!(
+            !std::sync::Arc::ptr_eq(&wt[0], &wu[0]),
+            "GcArray(Ptr(T)) and GcArray(Ptr(U)) must mint two write-array descrs"
+        );
+        assert_ne!(wt[0].get_ei_index(), wu[0].get_ei_index());
+        assert!(std::sync::Arc::ptr_eq(&wt[0], &wt2[0]));
+        assert_eq!(wt[0].get_ei_index(), wt2[0].get_ei_index());
+    }
+
+    fn interior_struct_array(
+        field_ty: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) -> crate::translator::rtyper::lltypesystem::lltype::Array {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Struct};
+        Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+            "x",
+            vec![("v".into(), field_ty)],
+        ))))
+    }
+
+    fn interior_write_graph(
+        name: &str,
+        array: crate::translator::rtyper::lltypesystem::lltype::Array,
+    ) -> FunctionGraph {
+        let mut g = FunctionGraph::new(name);
+        let start = g.startblock;
+        let base = g.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        let index = g.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        let value = g.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        g.push_inputarg_var(start, base.clone());
+        g.push_inputarg_var(start, index.clone());
+        g.push_inputarg_var(start, value.clone());
+        g.push_op_var(
+            start,
+            OpKind::InteriorFieldWrite {
+                base,
+                index,
+                field: crate::model::FieldDescriptor::new("v", Some("x".into())),
+                value,
+                item_ty: ValueType::Int,
+                array_type_id: Some(array_type_id_of_lltype(&array)),
+                array: Some(array),
+            },
+            false,
+        );
+        g.set_return(start, None);
+        g
+    }
+
+    /// extraef (`effectinfo.py`) adds the interiorfield ARRAY to the array
+    /// set; Signed vs Float struct elements are two members.
+    #[test]
+    fn effectinfo_extraef_interiorfield_splits_same_named_struct_arrays() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(["x".to_string()].into_iter().collect());
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry
+            .fields
+            .insert("x".to_string(), vec![("v".to_string(), "i64".to_string())]);
+        cc.set_struct_fields(registry);
+        let signed = interior_struct_array(LowLevelType::Signed);
+        let float = interior_struct_array(LowLevelType::Float);
+        let ei_s = effectinfo_of_graph(
+            &mut cc,
+            "ifield_signed",
+            interior_write_graph("ifield_signed", signed),
+        );
+        let ei_f = effectinfo_of_graph(
+            &mut cc,
+            "ifield_float",
+            interior_write_graph("ifield_float", float),
+        );
+        let ws = ei_s
+            ._write_descrs_arrays
+            .as_ref()
+            .expect("extraef records the Signed ARRAY");
+        let wf = ei_f
+            ._write_descrs_arrays
+            .as_ref()
+            .expect("extraef records the Float ARRAY");
+        assert_eq!(ws.len(), 1);
+        assert_eq!(wf.len(), 1);
+        assert!(!std::sync::Arc::ptr_eq(&ws[0], &wf[0]));
+        assert_ne!(ws[0].get_ei_index(), wf[0].get_ei_index());
+    }
+
+    fn analyze_converted_on(
+        cc: &mut CallControl,
+        name: &str,
+        graph: crate::flowspace::model::FunctionGraph,
+    ) -> ReadWriteEffects {
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        cc.register_function_graph(CallPath::from_segments([name]), converted);
+        cc.analyze_readwrite(
+            &CallPath::from_segments([name]),
+            &mut ReadWriteTracker::new(),
+            &mut UnionFind::new(|_| Dependency::new(ReadWriteEffects::bottom_result())),
+        )
+    }
+
+    /// FieldOffset over a Struct / FixedSizeArray allocates no ei_index
+    /// (`add_interiorfield` returns).
+    #[test]
+    fn field_offset_struct_and_fsa_allocate_no_ei_index() {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::llmemory::{AddressOffset, FieldOffset};
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FixedSizeArray, LowLevelType, Ptr, Struct,
+        };
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        let mut cc = CallControl::new();
+        let before_a = cc.descr_indices.array_index_count();
+        let before_i = cc.descr_indices.interiorfield_index_count();
+
+        let st = Struct::gc("S", vec![("x".to_string(), LowLevelType::Signed)]);
+        let st_ll = LowLevelType::Struct(Box::new(st));
+        let ptr_ll =
+            LowLevelType::from(Ptr::from_container_type(st_ll.clone()).expect("struct ptr"));
+        let base = variable_with_lltype("s", ptr_ll);
+        let ofs = AddressOffset::FieldOffset(FieldOffset {
+            TYPE: st_ll,
+            fldname: "x".to_string(),
+        });
+        let result = variable_with_lltype("v", LowLevelType::Void);
+        let struct_graph = rtyped_one_op_with_inputs(
+            "gsi_field_no_ei",
+            "gc_store_indexed",
+            vec![base.clone()],
+            vec![
+                crate::flowspace::model::Hlvalue::Variable(base),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::AddressOffset(ofs), LowLevelType::Signed),
+            ],
+            result,
+        );
+        let effects = analyze_converted_on(&mut cc, "gsi_field_no_ei", struct_graph);
+        assert!(!ReadWriteEffects::is_top_result(&effects));
+        assert_eq!(cc.descr_indices.array_index_count(), before_a);
+        assert_eq!(cc.descr_indices.interiorfield_index_count(), before_i);
+
+        let fsa = FixedSizeArray::new(LowLevelType::Signed, 3);
+        let fsa_ll = LowLevelType::FixedSizeArray(Box::new(fsa));
+        let ptr_ll = LowLevelType::from(Ptr::from_container_type(fsa_ll.clone()).expect("fsa ptr"));
+        let base = variable_with_lltype("a", ptr_ll);
+        let ofs = AddressOffset::FieldOffset(FieldOffset {
+            TYPE: fsa_ll,
+            fldname: "item0".to_string(),
+        });
+        let result = variable_with_lltype("v", LowLevelType::Void);
+        let fsa_graph = rtyped_one_op_with_inputs(
+            "gsi_fsa_field_no_ei",
+            "gc_store_indexed",
+            vec![base.clone()],
+            vec![
+                crate::flowspace::model::Hlvalue::Variable(base),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::AddressOffset(ofs), LowLevelType::Signed),
+            ],
+            result,
+        );
+        let effects = analyze_converted_on(&mut cc, "gsi_fsa_field_no_ei", fsa_graph);
+        assert!(!ReadWriteEffects::is_top_result(&effects));
+        assert_eq!(cc.descr_indices.array_index_count(), before_a);
+        assert_eq!(cc.descr_indices.interiorfield_index_count(), before_i);
     }
 
     /// `WriteAnalyzer.analyze_simple_operation`: `gc_store_indexed` of a

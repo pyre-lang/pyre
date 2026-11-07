@@ -1273,6 +1273,9 @@ pub enum OpKind {
         /// ARRAY identity for `cpu.arraydescrof(ARRAY)`, same role as
         /// `ArrayRead::array_type_id`.
         array_type_id: Option<String>,
+        /// ARRAY lltype (`rewrite_op_getarrayitem` `ARRAY =
+        /// op.args[0].concretetype.TO`). `array_type_id` is the dump spelling.
+        array: Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
     },
     /// RPython `new_array_clear(v_length, arraydescr)` — the cleared
     /// fixed-size array allocation `do_fixed_newlist_clear` emits
@@ -1295,6 +1298,9 @@ pub enum OpKind {
         /// ARRAY identity for `cpu.arraydescrof(ARRAY)`, same role as
         /// `ArrayRead::array_type_id`.
         array_type_id: Option<String>,
+        /// ARRAY lltype (`rewrite_op_getarrayitem` `ARRAY =
+        /// op.args[0].concretetype.TO`). `array_type_id` is the dump spelling.
+        array: Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
     },
     /// The compound resizable-list allocation `opimpl_newlist_clear`
     /// records (`pyjitpl.py`) — the resized-layout counterpart to
@@ -1321,6 +1327,9 @@ pub enum OpKind {
         /// ARRAY identity for `cpu.arraydescrof(ARRAY)`, same role as
         /// `NewArrayClear::array_type_id`.
         array_type_id: Option<String>,
+        /// ARRAY lltype (`rewrite_op_getarrayitem` `ARRAY =
+        /// op.args[0].concretetype.TO`). `array_type_id` is the dump spelling.
+        array: Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
     },
     ArrayRead {
         base: crate::flowspace::model::Variable,
@@ -1330,6 +1339,9 @@ pub enum OpKind {
         /// Distinguishes arrays with the same item_ty but different
         /// container types (e.g. `Vec<Point>` vs `Vec<Line>`).
         array_type_id: Option<String>,
+        /// ARRAY lltype (`rewrite_op_getarrayitem` `ARRAY =
+        /// op.args[0].concretetype.TO`). `array_type_id` is the dump spelling.
+        array: Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
         /// RPython: `ARRAY_INSIDE._hints.get('nolength', False)`
         /// (descr.py:359). `true` when the operand addresses a raw
         /// items region with no length header; `false` (the common
@@ -1361,6 +1373,9 @@ pub enum OpKind {
         base: crate::flowspace::model::Variable,
         /// ARRAY identity for `cpu.arraydescrof(ARRAY)`.
         array_type_id: Option<String>,
+        /// ARRAY lltype (`rewrite_op_getarraysize` `ARRAY =
+        /// op.args[0].concretetype.TO`). `array_type_id` is the dump spelling.
+        array: Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
         /// `ARRAY_INSIDE._hints.get('nolength', False)` (descr.py).
         /// `false` (length-prefixed) lays the length word at offset 0.
         nolength: bool,
@@ -1381,6 +1396,9 @@ pub enum OpKind {
         item_ty: ValueType,
         /// RPython: ARRAY identity for `cpu.arraydescrof(ARRAY)`.
         array_type_id: Option<String>,
+        /// ARRAY lltype (`rewrite_op_setarrayitem` `ARRAY =
+        /// op.args[0].concretetype.TO`). `array_type_id` is the dump spelling.
+        array: Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
         /// RPython: `ARRAY_INSIDE._hints.get('nolength', False)`
         /// (descr.py:359). See `ArrayRead::nolength`.
         nolength: bool,
@@ -1433,6 +1451,9 @@ pub enum OpKind {
         field: FieldDescriptor,
         item_ty: ValueType,
         array_type_id: Option<String>,
+        /// ARRAY lltype (`rewrite_op_getinteriorfield`
+        /// `v_inst.concretetype.TO`). `array_type_id` is the dump spelling.
+        array: Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
     },
     /// RPython: setinteriorfield_gc — write a field of an array-of-structs element.
     /// effectinfo.py:349-350: generates "interiorfield" effect.
@@ -1444,6 +1465,9 @@ pub enum OpKind {
         value: crate::flowspace::model::Variable,
         item_ty: ValueType,
         array_type_id: Option<String>,
+        /// ARRAY lltype (`rewrite_op_setinteriorfield`
+        /// `v_inst.concretetype.TO`). `array_type_id` is the dump spelling.
+        array: Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
     },
     Call {
         target: CallTarget,
