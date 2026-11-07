@@ -10,8 +10,6 @@
 
 use crate::objspace::std::mapdict::instance_getclass;
 use pyre_object::*;
-use std::cell::UnsafeCell;
-use std::sync::LazyLock;
 
 const BLOCKLEN: i64 = 62;
 const CENTER: i64 = (BLOCKLEN - 1) / 2;
@@ -90,54 +88,35 @@ pub struct W_Deque {
 }
 
 // PyPy's deque block/endpoint transitions execute atomically under its GIL.
-// CPython 3.14's free-threaded deque preserves the same boundary with object
-// critical sections.  Pyre keeps the semantic state on W_Deque and uses the
-// same narrow address-striped reentrant synchronization adaptation as its
-// list/dict/set ports.  The stripes are reset after fork because a vanished
-// thread may have held one in the parent.
-struct ForkDequeLock(UnsafeCell<parking_lot::ReentrantMutex<()>>);
-unsafe impl Sync for ForkDequeLock {}
+// The stripe covers a mutator that has dropped the GIL (see pyre_object::objlock).
+static DEQUE_LOCKS: pyre_object::objlock::LockFamily = pyre_object::objlock::LockFamily::new();
 
-impl ForkDequeLock {
-    fn new() -> Self {
-        Self(UnsafeCell::new(parking_lot::ReentrantMutex::new(())))
-    }
+type DequeGuard = pyre_object::objlock::ObjectLockGuard;
 
-    fn get(&self) -> &parking_lot::ReentrantMutex<()> {
-        unsafe { &*self.0.get() }
-    }
-
-    unsafe fn reinit_after_fork(&self) {
-        unsafe { self.0.get().write(parking_lot::ReentrantMutex::new(())) };
-    }
+/// The guard is the zero word while `gil_ready` is unpublished.
+unsafe fn w_deque_lock(obj: PyObjectRef) -> DequeGuard {
+    let ready = pyre_object::gil_ready::gil_ready_word();
+    let lock = if ready != 0 {
+        w_deque_lock_acquire(obj)
+    } else {
+        0
+    };
+    pyre_object::objlock::ObjectLockGuard::from_word(lock)
 }
 
-static DEQUE_LOCKS: LazyLock<Vec<ForkDequeLock>> =
-    LazyLock::new(|| (0..256).map(|_| ForkDequeLock::new()).collect());
-
-type DequeGuard = parking_lot::lock_api::ReentrantMutexGuard<
-    'static,
-    parking_lot::RawMutex,
-    parking_lot::RawThreadId,
-    (),
->;
-
+/// # Safety
+/// `obj` must be a live deque. The caller must release the returned handle
+/// exactly once on the acquiring thread.
 #[majit_macros::dont_look_inside]
-unsafe fn w_deque_lock(obj: PyObjectRef) -> DequeGuard {
-    let lock = DEQUE_LOCKS[(obj as usize >> 4) & (DEQUE_LOCKS.len() - 1)].get();
-    if let Some(guard) = lock.try_lock() {
-        return guard;
-    }
-    let blocked = majit_gc::gc_sync::before_external_block();
-    let guard = lock.lock();
-    drop(blocked);
-    guard
+unsafe fn w_deque_lock_acquire(obj: PyObjectRef) -> usize {
+    // A nursery object can move while its guard is held.  Stripe on its stable
+    // class identity, not the movable instance address, so every operation on
+    // one deque continues to acquire the same lock after collection.
+    DEQUE_LOCKS.acquire(pyre_object::mapdict::instance_getclass(obj) as usize)
 }
 
 pub fn deque_locks_after_fork_child() {
-    for lock in DEQUE_LOCKS.iter() {
-        unsafe { lock.reinit_after_fork() };
-    }
+    DEQUE_LOCKS.after_fork_child();
 }
 
 fn block(block: PyObjectRef) -> &'static mut W_DequeBlock {
@@ -1205,11 +1184,10 @@ impl W_Deque {
         match pos {
             Some(pos) => {
                 // The guard cannot span the loop above: `eq_w` runs arbitrary
-                // Python, and holding a stripe across it would let user code
-                // reach a second deque and invert the acquisition order. It
-                // does cover the write-back, and the epoch is re-read under it
-                // so a mutation that landed after the last comparison is
-                // reported rather than silently overwritten by the snapshot.
+                // Python while the stripe is held. It does cover the write-back,
+                // and the epoch is re-read under it so a mutation that landed
+                // after the last comparison is reported rather than silently
+                // overwritten by the snapshot.
                 let _deque_guard =
                     unsafe { w_deque_lock(pyre_object::gc_roots::shadow_stack_get(own_base)) };
                 let self_obj = pyre_object::gc_roots::shadow_stack_get(own_base);

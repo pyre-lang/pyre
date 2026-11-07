@@ -7,59 +7,40 @@
 
 use crate::pyobject::*;
 use pyre_macros::pyre_class;
-use std::cell::UnsafeCell;
-use std::sync::LazyLock;
 
-// PyPy's GIL makes W_Count.next_w's read/add/write sequence indivisible.
-// Pyre is free-threaded, so preserve W_Count as the sole semantic owner and
-// serialize only that sequence with the same address-striped reentrant shape
-// used for PyPy's GIL-protected list/dict transitions.
-struct ForkCountLock(UnsafeCell<parking_lot::ReentrantMutex<()>>);
-unsafe impl Sync for ForkCountLock {}
+// W_Count.next_w's read/add/write is indivisible under PyPy's GIL.
+// The stripe covers a mutator that has dropped the GIL (see objlock).
+static COUNT_LOCKS: crate::objlock::LockFamily = crate::objlock::LockFamily::new();
 
-impl ForkCountLock {
-    fn new() -> Self {
-        Self(UnsafeCell::new(parking_lot::ReentrantMutex::new(())))
-    }
+pub type CountGuard = crate::objlock::ObjectLockGuard;
 
-    fn get(&self) -> &parking_lot::ReentrantMutex<()> {
-        unsafe { &*self.0.get() }
-    }
-
-    unsafe fn reinit_after_fork(&self) {
-        unsafe { self.0.get().write(parking_lot::ReentrantMutex::new(())) };
-    }
-}
-
-static COUNT_LOCKS: LazyLock<Vec<ForkCountLock>> =
-    LazyLock::new(|| (0..256).map(|_| ForkCountLock::new()).collect());
-
-pub type CountGuard = parking_lot::lock_api::ReentrantMutexGuard<
-    'static,
-    parking_lot::RawMutex,
-    parking_lot::RawThreadId,
-    (),
->;
-
-#[majit_macros::dont_look_inside]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
+/// The guard is the zero word while `gil_ready` is unpublished.
 pub unsafe fn w_count_lock(obj: PyObjectRef) -> CountGuard {
-    let lock = COUNT_LOCKS[(obj as usize >> 4) & (COUNT_LOCKS.len() - 1)].get();
-    if let Some(guard) = lock.try_lock() {
-        return guard;
-    }
-    let blocked = majit_gc::gc_sync::before_external_block();
-    let guard = lock.lock();
-    drop(blocked);
-    guard
+    let ready = crate::gil_ready::gil_ready_word();
+    let lock = if ready != 0 {
+        unsafe { w_count_lock_acquire(obj) }
+    } else {
+        0
+    };
+    unsafe { crate::objlock::ObjectLockGuard::from_word(lock) }
+}
+
+/// # Safety
+/// `obj` must be a live `count`. The caller must release the returned handle
+/// exactly once on the acquiring thread.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_count_lock_acquire(obj: PyObjectRef) -> usize {
+    // A nursery object can move while its guard is held.  Stripe on its stable
+    // class identity, not the movable instance address, so every operation on
+    // one count continues to acquire the same lock after collection.
+    COUNT_LOCKS.acquire(unsafe { crate::mapdict::instance_getclass(obj) } as usize)
 }
 
 pub fn count_locks_after_fork_child() {
-    for lock in COUNT_LOCKS.iter() {
-        unsafe { lock.reinit_after_fork() };
-    }
+    COUNT_LOCKS.after_fork_child();
 }
 
 // ── W_Count — pypy/module/itertools/interp_itertools.py:class W_Count ──

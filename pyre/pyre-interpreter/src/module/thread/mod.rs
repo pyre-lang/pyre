@@ -74,7 +74,7 @@ static EXECUTION_CONTEXTS: LazyLock<ForkMutex<indexmap::IndexMap<i64, usize>>> =
     LazyLock::new(|| ForkMutex::new(indexmap::IndexMap::new()));
 static THREAD_ATFORK_REGISTERED: AtomicBool = AtomicBool::new(false);
 
-/// `listobject.rs ForkListLock`: a process-global `parking_lot` mutex whose
+/// `objlock.rs ForkLock`: a process-global `parking_lot` mutex whose
 /// native state is rebuilt after `fork` without taking the inherited lock.
 ///
 /// `RPyThreadAfterFork` (`thread_pthread.c`) walks `alllocks` and calls
@@ -105,7 +105,7 @@ impl<T> ForkMutex<T> {
 
     /// Write a fresh mutex around the live payload.  Must not lock: the
     /// inherited waiter table can hang on Linux.  Same write as
-    /// `cpyext::ForkMutex::reinit_after_fork` / `ForkListLock::reinit_after_fork`.
+    /// `cpyext::ForkMutex::reinit_after_fork` / `objlock::ForkLock::reinit_after_fork`.
     #[cfg(unix)]
     pub(crate) unsafe fn reinit_after_fork(&self) {
         let value = unsafe { (*self.inner.get()).data_ptr().read() };

@@ -94,6 +94,17 @@ pub fn publish_gil_ready() {
     }
 }
 
+/// Serializes test publishes of the process-global `gil_ready` word.
+#[cfg(test)]
+static GIL_READY_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Take [`GIL_READY_TEST_LOCK`] around [`publish_gil_ready`].
+#[cfg(test)]
+pub(crate) fn publish_gil_ready_for_test() {
+    let _guard = GIL_READY_TEST_LOCK.lock();
+    publish_gil_ready();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,19 +121,10 @@ mod tests {
 
     /// `publish_gil_ready` unlinks the instance `gil_ready_current_qmut`
     /// handed out (`quasiimmut.py make_invalidation_function._invalidate_now`).
-    /// Restore the unpublished word so later list-lock tests still see 0.
+    /// The word is never reset, as in production.
     #[test]
     fn publish_gil_ready_invalidates_the_current_qmut() {
-        struct RestoreGilReadyWord;
-        impl Drop for RestoreGilReadyWord {
-            fn drop(&mut self) {
-                // SAFETY: test-only restore of the unpublished word.
-                unsafe {
-                    (*(&raw mut GIL_READY_STATE)).gil_ready = 0;
-                }
-            }
-        }
-        let _restore = RestoreGilReadyWord;
+        let _guard = super::GIL_READY_TEST_LOCK.lock();
         let recorded = gil_ready_current_qmut();
         assert!(recorded.is_current());
         publish_gil_ready();

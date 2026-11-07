@@ -41,8 +41,12 @@ impl LockFamily {
         (0..256).map(|_| ForkLock::new()).collect()
     }
 
+    pub fn stripe_index(&self, key: usize) -> usize {
+        (key >> 4) & (self.stripes.len() - 1)
+    }
+
     pub fn stripe(&'static self, key: usize) -> &'static parking_lot::ReentrantMutex<()> {
-        self.stripes[(key >> 4) & (self.stripes.len() - 1)].get()
+        self.stripes[self.stripe_index(key)].get()
     }
 
     pub fn acquire(&'static self, key: usize) -> usize {

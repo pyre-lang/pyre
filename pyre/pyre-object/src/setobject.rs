@@ -2225,7 +2225,7 @@ type SetGuard = crate::objlock::ObjectLockGuard;
 
 #[inline]
 fn set_lock_index(obj: PyObjectRef) -> usize {
-    (obj as usize >> 4) & 255
+    SET_LOCKS.stripe_index(obj as usize)
 }
 
 /// Acquire a set's stripe without letting a contending mutator prevent a GC
