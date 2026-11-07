@@ -165,7 +165,7 @@ impl<'a> Lowering<'a> {
         let inner = type_decl_ref_generics(body.get("Adt")?.as_object()?, self.llbc)?
             .get("types")?
             .get(0)?;
-        let inner_ty = TyRef::Other(inner.clone());
+        let inner_ty = TyRef::Other(inner.clone().into());
         if tyref_is_shared_u8_slice(&inner_ty, self.llbc)
             || tyref_is_bare_u8_slice(&inner_ty, self.llbc)
         {
@@ -298,7 +298,9 @@ impl<'a> Lowering<'a> {
                     .as_object()
                     .and_then(|o| o.get("Adt"))
                     .and_then(serde_json::Value::as_object)
-                    .and_then(|adt| adt_head_instantiation_suffix(adt, self.llbc))
+                    .and_then(|adt| {
+                        adt_head_instantiation_suffix(adt, self.llbc, self.tombstoned_leaves)
+                    })
                     .is_some();
         if !payload_ok {
             return None;
@@ -307,7 +309,7 @@ impl<'a> Lowering<'a> {
         // spelling a static `Some(..)` construction of this instantiation mints.
         // An empty suffix is the template ClassDef; its `Some.__pos_0` is the
         // typevar and getattr cannot succeed (`bookkeeper.py` `getuniqueclassdef`).
-        let suffix = tyref_enum_instantiation_suffix(dest_ty, self.llbc);
+        let suffix = tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves);
         if suffix.is_empty() {
             return None;
         }
@@ -363,7 +365,7 @@ impl<'a> Lowering<'a> {
         let stripped = strip_ty_wrappers(payload, self.llbc)?;
         let rendered = charon_type_value_to_ast_string(stripped, self.llbc, 0);
         let payload_ty = tyref_enum_payload_value_type(
-            &TyRef::Other(payload.clone()),
+            &TyRef::Other(payload.clone().into()),
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
@@ -379,7 +381,7 @@ impl<'a> Lowering<'a> {
         {
             return Some((rendered, ValueType::Str));
         }
-        if tyref_is_string_family(&TyRef::Other(payload.clone()), self.llbc) {
+        if tyref_is_string_family(&TyRef::Other(payload.clone().into()), self.llbc) {
             return Some((rendered, payload_ty));
         }
         if rendered.starts_with("Vec<") || rendered.starts_with("VecDeque<") {
@@ -391,7 +393,7 @@ impl<'a> Lowering<'a> {
         // gate (`type_node_is_mut_ref`). `None` is `convert_const(None)`
         // on that `ListRepr` (`rlist.py`). Shared `&[u8]` already
         // returned as a window above.
-        if tyref_is_u8_list(&TyRef::Other(payload.clone()), self.llbc)
+        if tyref_is_u8_list(&TyRef::Other(payload.clone().into()), self.llbc)
             || (type_node_is_mut_ref(payload, self.llbc)
                 && (rendered.starts_with('[') || rendered.starts_with("Slice<")))
         {
@@ -402,7 +404,7 @@ impl<'a> Lowering<'a> {
         // `FixedSizeListRepr`). A mut slice of the same items is the
         // `{ptr, len}` pair and is not this niche.
         if let Some(root) =
-            object_pointer_gcarray_list_root(&TyRef::Other(payload.clone()), self.llbc)
+            object_pointer_gcarray_list_root(&TyRef::Other(payload.clone().into()), self.llbc)
         {
             return Some((root.clone(), ValueType::Ref(Some(root))));
         }
@@ -464,7 +466,7 @@ impl<'a> Lowering<'a> {
         let option_owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
         let payload_ty = self.tyref_option_payload_value_type(dest_ty)?;
@@ -537,6 +539,8 @@ impl<'a> Lowering<'a> {
             array_type_id: None,
             object_array_type_id: None,
             string_byte_view: false,
+            some_vsid: self.stamp_variant_vsid(dest_ty, "Some"),
+            none_vsid: self.stamp_variant_vsid(dest_ty, "None"),
         })
     }
 
@@ -624,6 +628,8 @@ impl<'a> Lowering<'a> {
             niche,
             niche_null_cast: self.option_niche_null_cast(dest_ty),
             payload_narrow_root,
+            some_vsid: self.stamp_variant_vsid(dest_ty, "Some"),
+            none_vsid: self.stamp_variant_vsid(dest_ty, "None"),
         })
     }
 
@@ -703,9 +709,12 @@ impl<'a> Lowering<'a> {
         }
         let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
         let call_once_owner = closure_env_call_once_owner(self.llbc.type_by_id(env_def_id)?);
-        let result_suffix =
-            crate::front::result_exc::tyref_result_instantiation_suffix(dest_ty, self.llbc)
-                .unwrap_or_default();
+        let result_suffix = crate::front::result_exc::tyref_result_instantiation_suffix(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+        )
+        .unwrap_or_default();
         let ok_ty = self.tyref_adt_type_arg(dest_ty, 0)?;
         let err_ty = self.tyref_adt_type_arg(dest_ty, 1)?;
         Some(crate::front::checked_arith::CheckedArithOkOrElseSite {
@@ -727,6 +736,8 @@ impl<'a> Lowering<'a> {
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
             ),
+            ok_vsid: self.stamp_variant_vsid(dest_ty, "Ok"),
+            err_vsid: self.stamp_variant_vsid(dest_ty, "Err"),
         })
     }
 
@@ -763,6 +774,8 @@ impl<'a> Lowering<'a> {
             option_owner,
             some_owner,
             payload_ty,
+            some_vsid: self.stamp_variant_vsid(dest_ty, "Some"),
+            none_vsid: self.stamp_variant_vsid(dest_ty, "None"),
         })
     }
 
@@ -802,6 +815,8 @@ impl<'a> Lowering<'a> {
             some_owner,
             payload_ty,
             layout_owner,
+            some_vsid: self.stamp_variant_vsid(dest_ty, "Some"),
+            none_vsid: self.stamp_variant_vsid(dest_ty, "None"),
         })
     }
 
@@ -864,6 +879,8 @@ impl<'a> Lowering<'a> {
             ok_owner,
             layout_owner,
             payload_ty,
+            ok_vsid: self.stamp_variant_vsid(dest_ty, "Ok"),
+            err_vsid: self.stamp_variant_vsid(dest_ty, "Err"),
         })
     }
 
@@ -899,17 +916,20 @@ impl<'a> Lowering<'a> {
     ) -> Option<TyRef> {
         let def_id = self.tyref_adt_def_id(dest_ty)?;
         let payload_node = tyref_node(payload, self.llbc)?.clone();
-        Some(TyRef::Other(serde_json::json!({
-            "Adt": {
-                "id": def_id,
-                "generics": {
-                    "regions": [],
-                    "types": [payload_node],
-                    "const_generics": [],
-                    "trait_refs": []
+        Some(TyRef::Other(
+            serde_json::json!({
+                "Adt": {
+                    "id": def_id,
+                    "generics": {
+                        "regions": [],
+                        "types": [payload_node],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
                 }
-            }
-        })))
+            })
+            .into(),
+        ))
     }
 
     /// When the dest place dropped its generics, rebuild the dest type
@@ -922,7 +942,7 @@ impl<'a> Lowering<'a> {
         option_owner: &mut String,
         some_owner: &mut String,
     ) {
-        if !tyref_enum_instantiation_suffix(dest_ty, self.llbc).is_empty() {
+        if !tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves).is_empty() {
             return;
         }
         let Some(hint) = payload_hint else {
@@ -934,7 +954,7 @@ impl<'a> Lowering<'a> {
         let Some(inst) = self.option_dest_with_payload(dest_ty, hint) else {
             return;
         };
-        if tyref_enum_instantiation_suffix(&inst, self.llbc).is_empty() {
+        if tyref_enum_instantiation_suffix(&inst, self.llbc, self.tombstoned_leaves).is_empty() {
             return;
         }
         if let Some((owner, some, _)) = self.resolve_option_dest_owners(&inst) {
@@ -1006,6 +1026,8 @@ impl<'a> Lowering<'a> {
             recv_err_ast: crate::front::result_exc::tyref_result_err(&recv_ty, self.llbc)
                 .map(|ty| tyref_to_ast_string(&ty, self.llbc))
                 .unwrap_or_default(),
+            ok_vsid: self.stamp_variant_vsid(&recv_ty, "Ok"),
+            err_vsid: self.stamp_variant_vsid(&recv_ty, "Err"),
         })
     }
 
@@ -1054,24 +1076,14 @@ impl<'a> Lowering<'a> {
         else {
             return kind;
         };
-        let CallTarget::Method {
-            name,
-            receiver_root,
-            ..
-        } = &target
-        else {
+        let CallTarget::Method { name, .. } = &target else {
             return OpKind::Call {
                 target,
                 args,
                 result_ty,
             };
         };
-        if name != "branch"
-            || !receiver_root.as_deref().is_some_and(|root| {
-                majit_ir::descr::strip_instantiation_suffix(majit_ir::descr::class_root_leaf(root))
-                    == "Result"
-            })
-        {
+        if name != "branch" {
             return OpKind::Call {
                 target,
                 args,
@@ -1135,12 +1147,32 @@ impl<'a> Lowering<'a> {
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
             ),
+            continue_vsid: self.stamp_variant_vsid(dest_ty, "Continue"),
+            break_vsid: self.stamp_variant_vsid(dest_ty, "Break"),
+            ok_vsid: self.stamp_variant_vsid(recv_ty, "Ok"),
+            err_vsid: self.stamp_variant_vsid(recv_ty, "Err"),
         };
         OpKind::Call {
             target: target.with_branch_payloads(payloads),
             args,
             result_ty,
         }
+    }
+
+    pub(in crate::front::mir) fn stamp_variant_vsid(
+        &self,
+        ty: &TyRef,
+        variant: &str,
+    ) -> Option<majit_ir::descr::StructId> {
+        stamp_enum_variant_instance_layout(
+            self.llbc,
+            ty,
+            variant,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+            &self.struct_layouts,
+        )
     }
 
     pub(in crate::front::mir) fn layout_of_tyref(
@@ -1173,6 +1205,7 @@ impl<'a> Lowering<'a> {
             err_ast: crate::front::result_exc::tyref_result_err(&output_ty, self.llbc)
                 .map(|ty| tyref_to_ast_string(&ty, self.llbc))
                 .unwrap_or_default(),
+            err_vsid: self.stamp_variant_vsid(&output_ty, "Err"),
         })
     }
 
@@ -1187,7 +1220,7 @@ impl<'a> Lowering<'a> {
         let result_owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(ty, self.llbc)
+            tyref_enum_instantiation_suffix(ty, self.llbc, self.tombstoned_leaves)
         );
         let ok_owner = Self::tagged_pair_payload_owner(td, &result_owner, 0)?;
         let err_owner = Self::tagged_pair_payload_owner(td, &result_owner, 1)?;
@@ -1315,6 +1348,11 @@ impl<'a> Lowering<'a> {
             result_scalar_niche: false,
             niche_null_cast: None,
             int_null: None,
+            recv_tag0_vsid: None,
+            recv_tag1_vsid: None,
+            result_tag0_vsid: None,
+            result_tag1_vsid: None,
+            result_none_vsid: None,
         };
 
         if is_option {
@@ -1532,6 +1570,21 @@ impl<'a> Lowering<'a> {
             };
             site.fn_item_ctor = Some(self.constructor_fn_item_shape(fd, &built)?);
         }
+        if is_option {
+            site.recv_tag1_vsid = self.stamp_variant_vsid(&recv_ty, "Some");
+        } else {
+            site.recv_tag0_vsid = self.stamp_variant_vsid(&recv_ty, "Ok");
+            site.recv_tag1_vsid = self.stamp_variant_vsid(&recv_ty, "Err");
+        }
+        if let Some(dest) = self.peel_to_option_or_result(dest_ty) {
+            if crate::front::result_exc::tyref_is_option(&dest, self.llbc) {
+                site.result_tag1_vsid = self.stamp_variant_vsid(&dest, "Some");
+                site.result_none_vsid = self.stamp_variant_vsid(&dest, "None");
+            } else if crate::front::result_exc::tyref_is_result(&dest, self.llbc) {
+                site.result_tag0_vsid = self.stamp_variant_vsid(&dest, "Ok");
+                site.result_tag1_vsid = self.stamp_variant_vsid(&dest, "Err");
+            }
+        }
         Some(site)
     }
 
@@ -1588,6 +1641,9 @@ impl<'a> Lowering<'a> {
             error_ty,
             niche: self.tyref_is_niche_option_ptr(recv_ty),
             scalar_niche,
+            some_vsid: self.stamp_variant_vsid(recv_ty, "Some"),
+            ok_vsid: self.stamp_variant_vsid(dest_ty, "Ok"),
+            err_vsid: self.stamp_variant_vsid(dest_ty, "Err"),
         })
     }
 
@@ -1612,12 +1668,12 @@ impl<'a> Lowering<'a> {
         let receiver_owner = format!(
             "{}{}",
             recv_decl.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(recv_ty, self.llbc)
+            tyref_enum_instantiation_suffix(recv_ty, self.llbc, self.tombstoned_leaves)
         );
         let result_owner = format!(
             "{}{}",
             dest_decl.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let receiver_ok_owner = Self::tagged_pair_payload_owner(recv_decl, &receiver_owner, 0)?;
         let receiver_err_owner = Self::tagged_pair_payload_owner(recv_decl, &receiver_owner, 1)?;
@@ -1637,6 +1693,9 @@ impl<'a> Lowering<'a> {
                 (String::new(), Some(segments), true)
             };
 
+        // Carrier Ok forwards T; dest Ok is not rebuilt. Still register
+        // that instantiation STRUCT (`getinstancerepr` on first meeting).
+        let _ = self.stamp_variant_vsid(dest_ty, "Ok");
         Some(crate::front::result_map_err::ResultMapErrSite {
             result_var: result_var.clone(),
             receiver_owner,
@@ -1695,6 +1754,9 @@ impl<'a> Lowering<'a> {
             args_tuple_suffix: payload_tuple_suffix(&recv_err, self.llbc),
             fn_item_segments,
             closure_env_is_trivially_dropless,
+            receiver_ok_vsid: self.stamp_variant_vsid(recv_ty, "Ok"),
+            receiver_err_vsid: self.stamp_variant_vsid(recv_ty, "Err"),
+            result_err_vsid: self.stamp_variant_vsid(dest_ty, "Err"),
         })
     }
 
@@ -2141,7 +2203,10 @@ impl<'a> Lowering<'a> {
         // the same PTR with `oddint == 0` (`cast_int_to_ptr` /
         // `ann_cast_int_to_ptr` → `SomePtr(PTRTYPE)`).
         if let Some(payload) = crate::front::result_exc::tyref_option_payload(option_ty, self.llbc)
-            && let Some(ptr) = self.dest_overlay_ptr_lltype(&payload)
+            && let Some(ptr) = self.dest_overlay_ptr_lltype(
+                &payload,
+                crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            )
         {
             return emit_typed_nullptr(&mut self.graph, bb_id, ptr);
         }

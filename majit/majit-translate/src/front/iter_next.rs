@@ -1939,7 +1939,7 @@ mod tests {
         let opt = g
             .push_op_var(
                 a,
-                crate::model::cast_instance_call_result("GCREF", raw.clone(), ValueType::Ref(None)),
+                crate::model::cast_instance_call("GCREF", raw.clone()),
                 true,
             )
             .unwrap();
@@ -2085,12 +2085,8 @@ mod tests {
         let opt_c = c_args[0].clone();
         let none = g.push_const_none(c);
         let sentinel = if recast_none {
-            g.push_op_var(
-                c,
-                crate::model::cast_instance_call_result("GCREF", none, ValueType::Ref(None)),
-                true,
-            )
-            .unwrap()
+            g.push_op_var(c, crate::model::cast_instance_call("GCREF", none), true)
+                .unwrap()
         } else {
             none
         };

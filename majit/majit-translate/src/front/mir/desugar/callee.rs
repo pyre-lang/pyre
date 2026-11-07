@@ -26,15 +26,11 @@ pub(in crate::front::mir) enum FnPtrFamily {
     Unknown,
 }
 
-/// Crate-stripped paths of the prebuilt eval hook in this artefact.
-///
 /// `register_eval_override`'s `FnDef` argument, then every other `FnDef`
-/// assigned to that parameter's type (the plain evaluator). Callers in
-/// another crate see the registrar as an external `FunDecl`; the
-/// translator unions the lists before lowering.
-pub(crate) fn discover_eval_hook_graphs(llbc: &Llbc) -> Vec<String> {
+/// assigned to that parameter's type (the plain evaluator).
+fn discover_eval_hook_families(llbc: &Llbc) -> (Vec<String>, Vec<String>) {
     let Some(eval_ty) = eval_fn_type_id(llbc) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let registrar_ids = registrar_fun_ids(llbc);
     let mut overrides = Vec::new();
@@ -85,6 +81,23 @@ pub(crate) fn discover_eval_hook_graphs(llbc: &Llbc) -> Vec<String> {
             }
         }
     }
+    (overrides, plain)
+}
+
+/// The registered-override graph of the EvalFn family (`register_eval_override`'s
+/// `FnDef` argument). The plain evaluator is not in this list.
+pub(crate) fn discover_eval_override_graphs(llbc: &Llbc) -> Vec<String> {
+    discover_eval_hook_families(llbc).0
+}
+
+/// Crate-stripped paths of the prebuilt eval hook in this artefact.
+///
+/// `register_eval_override`'s `FnDef` argument, then every other `FnDef`
+/// assigned to that parameter's type (the plain evaluator). Callers in
+/// another crate see the registrar as an external `FunDecl`; the
+/// translator unions the lists before lowering.
+pub(crate) fn discover_eval_hook_graphs(llbc: &Llbc) -> Vec<String> {
+    let (mut overrides, plain) = discover_eval_hook_families(llbc);
     for path in plain {
         if !overrides.contains(&path) {
             overrides.push(path);
@@ -2932,11 +2945,9 @@ pub(in crate::front::mir) fn promoted_const_copied_global(body: &Unstructured) -
 /// (or other by-value literal). Anything richer is not this wrapper.
 /// The block walk is the same linear `Goto`/`Return` walk as
 /// [`promoted_const_copied_global`].
-pub(in crate::front::mir) fn promoted_const_copied_const(
-    body: &Unstructured,
-) -> Option<serde_json::Value> {
+pub(in crate::front::mir) fn promoted_const_copied_const(body: &Unstructured) -> Option<JsonVal> {
     let blocks = promoted_const_linear_blocks(body)?;
-    let mut copied: Option<(u64, serde_json::Value)> = None;
+    let mut copied: Option<(u64, JsonVal)> = None;
     let mut returned_ref: Option<u64> = None;
     for block in blocks {
         for stmt in &block.statements {
@@ -3242,7 +3253,35 @@ pub(in crate::front::mir) fn rdict_insert_get_cast_root(
 }
 
 /// Call-path segments for a specialized leaf of this declaration.
+///
+/// A FunDecl with `trait_impl_id` keeps the impl's trait-ref + Self
+/// identity (`CallControl.graphs_from` / `Bookkeeper.getdesc`) even when
+/// the `Self` type is an ADT. rustc's method-call rule binds owner-leaf
+/// to the inherent method; `impl Flags for BuiltinCodeFlags` must not
+/// share that slot. Inherent methods (no `trait_impl_id`) stay
+/// `CallPath::for_impl_method`.
 pub(in crate::front::mir) fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str) -> Vec<String> {
+    if let Some(impl_id) = trait_impl_id_for_fundecl(fd) {
+        if let Some((owner, _)) = impl_method_owner_for_fundecl(llbc, fd) {
+            if let Some(identity) = crate::front::clause_spec::render_trait_impl(llbc, impl_id) {
+                return trait_impl_identity_path(&owner, &identity, leaf);
+            }
+            return crate::parse::CallPath::for_trait_impl_method(&owner, impl_id, leaf).segments;
+        }
+        let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+        let module = stripped
+            .rsplit_once("::")
+            .map(|(module, _)| module)
+            .unwrap_or("");
+        // Primitive `Self` (`impl PartialOrd<char> for char`): no ADT
+        // owner, so `name_path` is `cmp::impls::<Impl>::le` for every
+        // width. The impl's trait ref and Self type is that identity.
+        if let Some(identity) = crate::front::clause_spec::render_trait_impl(llbc, impl_id)
+            && !module.is_empty()
+        {
+            return trait_impl_identity_path(module, &identity, leaf);
+        }
+    }
     if let Some((owner, _)) = impl_method_owner_for_fundecl(llbc, fd) {
         // `method-call-expr`: inherent methods are looked up before trait
         // methods for the same receiver. `CallControl.graphs_from` /
@@ -3263,16 +3302,6 @@ pub(in crate::front::mir) fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str
         .rsplit_once("::")
         .map(|(module, _)| module)
         .unwrap_or("");
-    // Primitive `Self` (`impl PartialOrd<char> for char`): no ADT owner,
-    // so `name_path` is `cmp::impls::<Impl>::le` for every width.
-    // `CallControl.graphs_from` keeps one graph per function object;
-    // the impl's trait ref and Self type is that identity.
-    if let Some(impl_id) = trait_impl_id_for_fundecl(fd)
-        && let Some(identity) = crate::front::clause_spec::render_trait_impl(llbc, impl_id)
-        && !module.is_empty()
-    {
-        return trait_impl_identity_path(module, &identity, leaf);
-    }
     // Same key `free_function_alias_paths` registers: the module portion
     // of `name_path` is one segment when it contains `<Impl>`, not a
     // split of that token.
@@ -3307,17 +3336,20 @@ pub(in crate::front::mir) fn registered_path_for_fun_decl(
 
 /// The `()` type expected by drop glue.
 pub(in crate::front::mir) fn unit_tyref() -> TyRef {
-    TyRef::Other(serde_json::json!({
-        "Adt": {
-            "id": 0, "builtin": "Tuple",
-            "generics": {
-                "regions": [],
-                "types": [],
-                "const_generics": [],
-                "trait_refs": []
+    TyRef::Other(
+        serde_json::json!({
+            "Adt": {
+                "id": 0, "builtin": "Tuple",
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
             }
-        }
-    }))
+        })
+        .into(),
+    )
 }
 /// The scalar `TypedItemsBlock` accessor, kept separate from the object-array
 /// pair because its consumers must emit `GcArray(Signed|Float)` operations,
@@ -4139,7 +4171,7 @@ pub(in crate::front::mir) fn struct_pointee_array_type_id(
     if decl.published_struct_copy || !matches!(decl.kind, TypeDeclKind::Struct(_)) {
         return None;
     }
-    if tyref_transparent_nonzst_field(&TyRef::Other(pointee.clone()), llbc).is_some() {
+    if tyref_transparent_nonzst_field(&TyRef::Other(pointee.clone().into()), llbc).is_some() {
         return None;
     }
     let root = adt_node_class_root_with(pointee, llbc, tombstoned)?;
@@ -4582,53 +4614,90 @@ pub(in crate::front::mir) fn struct_field_ptr_add_trace(
     })
 }
 
-pub(in crate::front::mir) fn block_has_struct_field_value_use(
+/// Locals `d` for which this block has a `(*d).field` value use.
+pub(in crate::front::mir) fn struct_field_value_dests_in_block(
     llbc: &Llbc,
     bb: &BasicBlock,
-    dest: usize,
-) -> bool {
-    let mut fields = 0usize;
-    let mut other = 0usize;
+    dests: &mut bit_set::BitSet,
+) {
     for stmt in &bb.statements {
         match stmt.stmt_kind_ref() {
             Ok(StmtKind::Assign(place, rvalue)) => {
-                scan_rvalue_struct_field(rvalue, dest, &mut fields, &mut other);
-                if place_is_immediate_struct_field_of(place, dest) {
-                    fields += 1;
-                }
+                collect_struct_field_dests_from_rvalue(&rvalue, dests);
+                collect_struct_field_dest_from_place(&place, dests);
             }
             Ok(StmtKind::Assert(assert)) => {
-                bump_struct_field_use(
-                    operand_struct_field_use(&assert.cond, dest),
-                    &mut fields,
-                    &mut other,
-                );
+                collect_struct_field_dest_from_operand(&assert.cond, dests);
             }
             _ => {}
         }
     }
     match bb.term_ref(llbc) {
-        Ok(TermKind::Switch { discr, .. }) => bump_struct_field_use(
-            operand_struct_field_use(discr, dest),
-            &mut fields,
-            &mut other,
-        ),
+        Ok(TermKind::Switch { discr, .. }) => collect_struct_field_dest_from_operand(&discr, dests),
         Ok(TermKind::Call { call, .. }) => {
             if let CallFunc::Dynamic(op, _) = &call.func {
-                bump_struct_field_use(operand_struct_field_use(op, dest), &mut fields, &mut other);
+                collect_struct_field_dest_from_operand(op, dests);
             }
             for arg in &call.args {
-                bump_struct_field_use(operand_struct_field_use(arg, dest), &mut fields, &mut other);
+                collect_struct_field_dest_from_operand(arg, dests);
             }
         }
-        Ok(TermKind::Assert { assert, .. }) => bump_struct_field_use(
-            operand_struct_field_use(&assert.cond, dest),
-            &mut fields,
-            &mut other,
-        ),
+        Ok(TermKind::Assert { assert, .. }) => {
+            collect_struct_field_dest_from_operand(&assert.cond, dests)
+        }
         _ => {}
     }
-    fields > 0
+}
+
+pub(in crate::front::mir) fn collect_struct_field_dest_from_place(
+    place: &Place,
+    dests: &mut bit_set::BitSet,
+) {
+    let PlaceKind::Projection(inner, elem) = &place.kind else {
+        return;
+    };
+    if let Some(dest) = struct_field_deref_local(inner, elem) {
+        dests.insert(dest);
+    }
+}
+
+pub(in crate::front::mir) fn collect_struct_field_dest_from_operand(
+    op: &Operand,
+    dests: &mut bit_set::BitSet,
+) {
+    let (Operand::Copy(place) | Operand::Move(place)) = op else {
+        return;
+    };
+    collect_struct_field_dest_from_place(place, dests);
+}
+
+pub(in crate::front::mir) fn collect_struct_field_dests_from_rvalue(
+    rvalue: &Rvalue,
+    dests: &mut bit_set::BitSet,
+) {
+    match rvalue {
+        Rvalue::Use(op, _)
+        | Rvalue::UnaryOp(_, op)
+        | Rvalue::Cast(_, op, _)
+        | Rvalue::Repeat(op, _, _, _)
+        | Rvalue::ShallowInitBox(op, _) => collect_struct_field_dest_from_operand(op, dests),
+        Rvalue::BinaryOp(_, lhs, rhs) => {
+            collect_struct_field_dest_from_operand(lhs, dests);
+            collect_struct_field_dest_from_operand(rhs, dests);
+        }
+        Rvalue::Aggregate(_, operands) => {
+            for op in operands {
+                collect_struct_field_dest_from_operand(op, dests);
+            }
+        }
+        // Address-of, length, and discriminant are not value field uses.
+        Rvalue::Ref { .. }
+        | Rvalue::RawPtr { .. }
+        | Rvalue::Len(_)
+        | Rvalue::Discriminant(_)
+        | Rvalue::NullaryOp(_, _)
+        | Rvalue::Unknown => {}
+    }
 }
 
 /// `index_mut` result used only as the element: one deref load, one deref

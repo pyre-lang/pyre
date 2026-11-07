@@ -66,6 +66,10 @@ pub(crate) struct CheckedArithUintSite {
     pub some_owner: String,
     /// The `Option` payload `T` — the `Some::__pos_0` field kind.
     pub payload_ty: ValueType,
+    /// Instance STRUCT of the built `Some`.
+    pub some_vsid: Option<majit_ir::descr::StructId>,
+    /// Instance STRUCT of the built `None`.
+    pub none_vsid: Option<majit_ir::descr::StructId>,
 }
 
 /// Rewrite every recorded unsigned `checked_{add,sub,mul}` site into the native
@@ -490,6 +494,7 @@ fn rewire_one_checked_arith_uint_site(
         &site.option_owner,
         disc,
         Some((&site.some_owner, value, site.payload_ty.clone())),
+        [site.none_vsid, site.some_vsid],
     );
     Ok(())
 }
@@ -901,6 +906,8 @@ mod tests {
             option_owner: "core::option::Option<usize>".to_string(),
             some_owner: "core::option::Option<usize>::Some".to_string(),
             payload_ty: ValueType::Unsigned,
+            some_vsid: None,
+            none_vsid: None,
         }
     }
 

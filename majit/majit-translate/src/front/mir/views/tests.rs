@@ -566,8 +566,9 @@ fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
     let objptr = serde_json::json!({
         "RawPtr": [{"Adt": {"id": 0, "generics": {"types": []}}}, "Mut"]
     });
-    let kind =
-        |node: serde_json::Value| super::tyref_pair_slice_item_kind(&TyRef::Other(node), &llbc);
+    let kind = |node: serde_json::Value| {
+        super::tyref_pair_slice_item_kind(&TyRef::Other(node.into()), &llbc)
+    };
     assert_eq!(
         kind(serde_json::json!({ "Ref": ["'_", { "Slice": [usize_ty.clone(), null] }, "Shared"] })),
         Some(VecItemKind::Int)

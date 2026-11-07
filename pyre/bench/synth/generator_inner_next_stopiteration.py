@@ -1,10 +1,13 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=_rlistdir
-# The inner `_rlistdir` next is a residual StopIteration from
-# `ll_generatorentry_portal_runner_shim` (several_yields portal). `join`'s
-# ForIter then fails a non-exception guard inside the compiled `loop _rlistdir`.
-# pyopcode.py FOR_ITER `e.match(StopIteration)` already consumed that publish;
-# blackhole.py `_prepare_resume_from_failure` must not re-raise it, or
+# pyre-check: selfcheck-compiles=entry-bridge:_rlistdir
+# `_rlistdir` has two yields, so `generator.py should_not_inline` sends
+# `send_ex` through `generatorentry_driver` instead of inlining the body.
+# The first next() finishes as an entry-bridge of that pycode — the same
+# arm PyPy records (`_rlistdir` is an entry bridge; the closed loop is
+# `_scandir`). The inner next is a residual StopIteration from
+# `ll_generatorentry_portal_runner_shim`. pyopcode.py FOR_ITER
+# `e.match(StopIteration)` already consumed that publish; blackhole.py
+# `_prepare_resume_from_failure` must not re-raise it, or
 # generator.py `_leak_stopiteration` reports
 # RuntimeError: generator raised StopIteration.
 ROUNDS = 400

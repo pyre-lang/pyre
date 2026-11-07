@@ -154,13 +154,15 @@ fn forward_snapshot_py_pc(jitcode_index: u32, pc: u32) -> Result<u32, DispatchEr
     // (`crate::ctor_continuation`) are such levels; `u32::MAX` is the same
     // "no coordinate" answer the sentinel arm above gives, and what every
     // reader of this field already treats as absent.
-    if payload.code_ptr.is_null() {
+    if payload.code_ptr.is_null()
+        || crate::state::jitcode_is_transparent_helper(jitcode_index as i32)
+    {
         return Ok(u32::MAX);
     }
-    payload
-        .resume_position_for_jitcode_pc(pc as usize)
-        .map(|(_, py_pc)| py_pc)
-        .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: pc as usize })
+    // Same reconstruction rebuild uses (`resume_py_pc_for_jitcode_word`): a
+    // trailing `-live-` after a Python-call jitcode op is the CALL's
+    // fallthrough, not the containing CALL / cache word.
+    Ok(crate::py_coord::resume_py_pc_for_jitcode_word(jitcode_index as i32, pc as i32) as u32)
 }
 
 pub(crate) fn vstack_box_for_snapshot(value: OpRef) -> Option<OpRef> {
@@ -579,6 +581,13 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         if helper_chain == HelperChain::Unresumable {
             return Err(DispatchError::callee_inline_unsupported(op_pc));
         }
+        if guard_resume_pc_probe_enabled() {
+            eprintln!(
+                "[guard-pc] helper_chain={helper_chain:?} op_pc={op_pc} \
+                 after_residual={after_residual_call} n_parents={}",
+                parent_frames.len()
+            );
+        }
         if helper_chain == HelperChain::Numbered {
             match numbered_helper_guard_resume(
                 ctx,
@@ -596,8 +605,23 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     );
                 }
                 // Fall through to the root portal's CALL boundary below.
-                NumberedHelperGuard::CallerBoundary => {}
+                NumberedHelperGuard::CallerBoundary => {
+                    if guard_resume_pc_probe_enabled() {
+                        eprintln!(
+                            "[guard-pc] numbered_helper CallerBoundary op_pc={op_pc} \
+                             after_residual={after_residual_call}"
+                        );
+                    }
+                }
             }
+        } else if capture_converted_driver_helper_guard(
+            ctx,
+            op_pc,
+            after_residual_call,
+            &scope,
+            &parent_frames,
+        ) {
+            return Ok(());
         } else if walker_inline_guard_resumes_in_callee(ctx) {
             // A STRICT straight-line callee (gh#420) whose own frame is not
             // MF-snapshot-able (a kept operand-stack temp the sub-walk does not
@@ -718,7 +742,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         py = exact_after_marker
                             .and_then(|marker| jc.payload.forward_py_pc_for_jitcode_pc(marker))
                             .unwrap_or_else(|| {
-                                crate::pyjitpl::semantic_fallthrough_pc(code, py as usize) as u32
+                                crate::pyjitpl::resume_py_pc_after_python_call(code, py as usize)
+                                    as u32
                             });
                         let call_pc_has_catch = pyre_interpreter::pycode::lookup_exceptiontable(
                             &code.exceptiontable,
@@ -1348,9 +1373,12 @@ fn publish_single_frame_snapshot<Sym: WalkSym>(
         let opcode = match guard_stamp {
             GuardStampTarget::LastOp => ctx.trace_ctx.last_op_opcode(),
         };
+        let jc_name = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
+            .map(|pjc| pjc.jitcode.name().to_string())
+            .unwrap_or_default();
         eprintln!(
             "[guard-pc] {origin} {opcode:?} op_pc={op_pc} jc={jitcode_index} \
-             jit_pc={pc} py_pc={py_pc} active={}",
+             name={jc_name} jit_pc={pc} py_pc={py_pc} active={}",
             active.len(),
         );
     }
@@ -1758,17 +1786,24 @@ fn assemble_call_stack_overrides<Sym: WalkSym>(
     // Ref(0) is valid only for the synthesized null_or_self sentinel.  A null
     // proof value means the sparse vstack/color reconstruction is incomplete;
     // decline instead of publishing an invalid operand region.
-    let proof_value = overrides
-        .iter()
-        .find_map(|&(slot, value)| (slot == proof_slot).then_some(value));
-    // A missing callable stays unresolved. `outer_active_boxes` is ordered by
-    // liveness color, so its first non-null entry is not the CALL's callable.
-    if !matches!(proof_value, Some(value) if !value.is_null()) {
-        return Err(AssembleFail::Proof(ProofGap {
-            depth,
-            stack_end,
-            proof_slot,
-        }));
+    //
+    // An instruction that consumes no operands (`LOAD_GLOBAL`, `LOAD_NAME`,
+    // `LOAD_DEREF`, `BUILD_TUPLE 0`, …) has `deepest == stack_end`. That
+    // coordinate is one past the last occupied slot, so there is no operand
+    // to prove; the operand region is empty.
+    if proof_slot != stack_end {
+        let proof_value = overrides
+            .iter()
+            .find_map(|&(slot, value)| (slot == proof_slot).then_some(value));
+        // A missing callable stays unresolved. `outer_active_boxes` is ordered by
+        // liveness color, so its first non-null entry is not the CALL's callable.
+        if !matches!(proof_value, Some(value) if !value.is_null()) {
+            return Err(AssembleFail::Proof(ProofGap {
+                depth,
+                stack_end,
+                proof_slot,
+            }));
+        }
     }
     // Report-only: a slot left absent here is what makes the outer-call flush
     // decline, and the consumer can only say "not capturable". Name each source
@@ -1802,6 +1837,75 @@ fn assemble_call_stack_overrides<Sym: WalkSym>(
         }
     }
     Ok(overrides)
+}
+
+/// Floor-fallback CALL shape.
+///
+/// Used only when `exact_py_pc_for_jitcode_pc` returns `None` and
+/// `containing_py_pc_for_jitcode_pc` names an argument-setup opcode. Walk
+/// that prefix to the CALL (`range(stop)` is `LOAD_GLOBAL` then `LOAD_FAST`
+/// then `CALL`). When the exact owning instruction is known, this walk is
+/// not consulted: a helper at a `LOAD_GLOBAL` orgpc is that instruction,
+/// even if a CALL follows.
+fn call_shape_after_arg_prefix(
+    code: &pyre_interpreter::CodeObject,
+    mut py_pc: usize,
+) -> Option<(usize, usize)> {
+    for _ in 0..32 {
+        let (instruction, op_arg) = pyre_interpreter::decode_instruction_at(code, py_pc)?;
+        match instruction {
+            pyre_interpreter::Instruction::Call { argc } => {
+                return Some((argc.get(op_arg) as usize, 1));
+            }
+            pyre_interpreter::Instruction::CallKw { argc } => {
+                return Some((argc.get(op_arg) as usize, 2));
+            }
+            pyre_interpreter::Instruction::LoadGlobal { .. }
+            | pyre_interpreter::Instruction::LoadFast { .. }
+            | pyre_interpreter::Instruction::LoadFastBorrow { .. }
+            | pyre_interpreter::Instruction::LoadFastCheck { .. }
+            | pyre_interpreter::Instruction::LoadFastAndClear { .. }
+            | pyre_interpreter::Instruction::LoadFastLoadFast { .. }
+            | pyre_interpreter::Instruction::LoadFastBorrowLoadFastBorrow { .. }
+            | pyre_interpreter::Instruction::LoadConst { .. }
+            | pyre_interpreter::Instruction::LoadCommonConstant { .. }
+            | pyre_interpreter::Instruction::LoadFromDictOrGlobals { .. }
+            | pyre_interpreter::Instruction::LoadSmallInt { .. }
+            | pyre_interpreter::Instruction::LoadName { .. }
+            | pyre_interpreter::Instruction::LoadDeref { .. }
+            | pyre_interpreter::Instruction::PushNull
+            | pyre_interpreter::Instruction::Copy { .. }
+            | pyre_interpreter::Instruction::Swap { .. }
+            | pyre_interpreter::Instruction::ExtendedArg
+            | pyre_interpreter::Instruction::Resume { .. }
+            | pyre_interpreter::Instruction::Nop
+            | pyre_interpreter::Instruction::Cache
+            | pyre_interpreter::Instruction::NotTaken => py_pc += 1,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// CALL / CALL_KW shape at `py_pc`.
+///
+/// `exact_owning_instruction` is whether `exact_py_pc_for_jitcode_pc` named
+/// this PC. When it did, classify by `instruction` alone. When it did not,
+/// the floor may sit on an argument-setup opcode of a later CALL, and
+/// `call_shape_after_arg_prefix` walks that prefix.
+fn call_shape_at_py_pc(
+    code: &pyre_interpreter::CodeObject,
+    py_pc: usize,
+    instruction: pyre_interpreter::Instruction,
+    op_arg: pyre_interpreter::OpArg,
+    exact_owning_instruction: bool,
+) -> Option<(usize, usize)> {
+    match instruction {
+        pyre_interpreter::Instruction::Call { argc } => Some((argc.get(op_arg) as usize, 1usize)),
+        pyre_interpreter::Instruction::CallKw { argc } => Some((argc.get(op_arg) as usize, 2usize)),
+        _ if !exact_owning_instruction => call_shape_after_arg_prefix(code, py_pc),
+        _ => None,
+    }
 }
 
 enum CallerOperandSlots {
@@ -1840,9 +1944,8 @@ enum CallerOperandSlots {
 /// (`try_walker_inline_format`) reaches this with the f-string opcode as the
 /// caller instruction, and with no arm here every one of those bodies passed
 /// each of that route's own screens and then lost the caller image, so the
-/// body stayed a residual call.  FORMAT_SIMPLE has no such route yet (its
-/// residual carries no spec operand to hand the two-parameter dunder), so it
-/// is not listed.  `POP_JUMP_IF_FALSE` / `POP_JUMP_IF_TRUE` are the truth-test
+/// body stayed a residual call.  `FORMAT_SIMPLE` is the one-value form
+/// (`format_simple` pops TOS).  `POP_JUMP_IF_FALSE` / `POP_JUMP_IF_TRUE` are the truth-test
 /// half: `opcode_pop_jump_if` pops one value and calls `truth_value`, and
 /// `try_walker_inline_truth_bool` inlines an overriding `__bool__` from that
 /// residual.  With no arm `CallStack::NoOperandShape` left the body a residual
@@ -1855,6 +1958,31 @@ enum CallerOperandSlots {
 /// entry stack is `[callable, self_or_null, starargs, kwargs_or_null]`
 /// (`call_function_ex`), and with no arm `CallStack::NoOperandShape` left
 /// `add(*args)` a residual `bh_call_function_ex_fn`.
+///
+/// `UNARY_NEGATIVE` / `UNARY_INVERT` / `UNARY_NOT` / `TO_BOOL` /
+/// `CALL_INTRINSIC_1` are the one-value half: `opcode_unary_negative`,
+/// `opcode_unary_invert`, `opcode_unary_not`, `to_bool`, and
+/// `call_intrinsic_1` each pop that one TOS and the helper (`neg`,
+/// `invert`, `not_`, `is_true`, `pos`) is the callee. With no arm
+/// `CallStack::NoOperandShape` left `-x` a residual `CallMayForceR`.
+/// `IS_OP` / `CONTAINS_OP` are the two-operand compare half (`is_op` /
+/// `contains_op`). `STORE_SUBSCR` is the three-operand store
+/// (`opcode_store_subscr`).
+///
+/// `LOAD_GLOBAL` / `LOAD_NAME` / `LOAD_DEREF` consume none
+/// (`opcode_load_global`, `opcode_load_name`, `load_deref`), so
+/// `deepest == stack_end`. `MAKE_FUNCTION` / `FORMAT_SIMPLE` /
+/// `CONVERT_VALUE` pop one (`opcode_make_function`, `format_simple`,
+/// `convert_value`). `DELETE_SUBSCR` pops two (`delete_subscript`).
+/// `BUILD_TUPLE` / `BUILD_LIST` / `BUILD_SET` / `BUILD_MAP` consume the
+/// oparg-sized contiguous TOS block (`opcode_build_tuple`,
+/// `opcode_build_list`, `build_set`, `opcode_build_map`).
+///
+/// Prefer the exact owning instruction. The prefix walk is only the floor
+/// fallback: `exact_py_pc_for_jitcode_pc` is `None` and the containing PC
+/// is an argument-setup opcode. An exact `LOAD_GLOBAL` is classified as
+/// that instruction (`caller_non_call_operand_count` = 0), even when a
+/// CALL follows.
 fn caller_operand_slots<Sym: WalkSym>(
     caller_sym: &Sym,
     call_jitcode_pc: usize,
@@ -1862,15 +1990,12 @@ fn caller_operand_slots<Sym: WalkSym>(
 ) -> Option<CallerOperandSlots> {
     let jc = unsafe { caller_sym.jitcode().as_ref()? };
     let code = unsafe { (jc.payload.code_ptr as *const pyre_interpreter::CodeObject).as_ref()? };
-    // The floor pivot names the block head. A helper entered from a CALL
-    // whose jit pc still sits in that block must use the exact owning
-    // instruction, or `LOAD_GLOBAL` is what the operand shape sees.
-    let py_pc = crate::pyjitcode::exact_py_pc_for_jitcode_pc(
+    let exact_py_pc = crate::pyjitcode::exact_py_pc_for_jitcode_pc(
         &jc.payload.metadata.py_exact_by_jit_pc,
         call_jitcode_pc,
     )
-    .map(|pc| pc as usize)
-    .unwrap_or_else(|| {
+    .map(|pc| pc as usize);
+    let py_pc = exact_py_pc.unwrap_or_else(|| {
         crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, call_jitcode_pc)
             as usize
     });
@@ -1880,11 +2005,7 @@ fn caller_operand_slots<Sym: WalkSym>(
     // (`eval.rs`) pops the names first and then the identical argument block,
     // so the two shapes differ only in where the stack ends above the
     // arguments, and both name the same synthetic sentinel and callable proof.
-    let call_shape = match instruction {
-        pyre_interpreter::Instruction::Call { argc } => Some((argc.get(op_arg) as usize, 1usize)),
-        pyre_interpreter::Instruction::CallKw { argc } => Some((argc.get(op_arg) as usize, 2usize)),
-        _ => None,
-    };
+    let call_shape = call_shape_at_py_pc(code, py_pc, instruction, op_arg, exact_py_pc.is_some());
     if let Some((argc, slots_above_args)) = call_shape {
         let null_or_self = stack_end.checked_sub(argc + slots_above_args)?;
         return Some(CallerOperandSlots::Call {
@@ -1904,7 +2025,34 @@ fn caller_operand_slots<Sym: WalkSym>(
             callable,
         });
     }
-    let operand_count = match instruction {
+    let Some(operand_count) = caller_non_call_operand_count(instruction, op_arg) else {
+        if fbw_debug_abort_enabled() {
+            let jit_op = crate::jitcode_runtime::decode_op_at(
+                jc.payload.jitcode.code.as_slice(),
+                call_jitcode_pc,
+            )
+            .map(|op| op.key)
+            .unwrap_or("");
+            eprintln!(
+                "[caller-operand-shape-absent] instruction={instruction:?} py_pc={py_pc} jit_pc={call_jitcode_pc} jit_op={jit_op}"
+            );
+        }
+        return None;
+    };
+    Some(CallerOperandSlots::Operands {
+        deepest: stack_end.checked_sub(operand_count)?,
+    })
+}
+
+/// How many contiguous TOS slots `instruction` consumes, for the
+/// `CallerOperandSlots::Operands` proof. `None` is the conservative decline.
+/// `op_arg` is the decoded oparg: `BUILD_TUPLE n` and siblings size the
+/// block from it.
+fn caller_non_call_operand_count(
+    instruction: pyre_interpreter::Instruction,
+    op_arg: pyre_interpreter::OpArg,
+) -> Option<usize> {
+    Some(match instruction {
         // `[iterable]` for GET_ITER, `[iterator]` for FOR_ITER, and `[owner]`
         // for the attribute read whose descriptor body is the callee.
         // `stack_end` is `nlocals + depth_at_py_pc` (`depth_for_jitcode_pc_pred`),
@@ -1924,6 +2072,18 @@ fn caller_operand_slots<Sym: WalkSym>(
         // (`CallStack::ProofSlotUnresolved`).
         pyre_interpreter::Instruction::PopJumpIfFalse { .. }
         | pyre_interpreter::Instruction::PopJumpIfTrue { .. } => 1,
+        // `[value]`. `opcode_unary_negative` / `opcode_unary_invert` /
+        // `opcode_unary_not` each pop that one value before the helper
+        // (`unary_negative_value` → `neg`, `unary_invert_value` → `invert`,
+        // `unary_not_value` → `not_`). `to_bool` (`eval.rs`) pops the same
+        // one value and calls `is_true`. `call_intrinsic_1` pops the same
+        // one value for UNARY_POSITIVE (`pos`) and the other one-argument
+        // intrinsics.
+        pyre_interpreter::Instruction::UnaryNegative
+        | pyre_interpreter::Instruction::UnaryInvert
+        | pyre_interpreter::Instruction::UnaryNot
+        | pyre_interpreter::Instruction::ToBool
+        | pyre_interpreter::Instruction::CallIntrinsic1 { .. } => 1,
         // `[lhs, rhs]`, and `[value, owner]` for the attribute store whose
         // setter body is the callee — `store_attr_cached` pops the owner
         // first, so `value` is the deeper of the two.
@@ -1931,33 +2091,222 @@ fn caller_operand_slots<Sym: WalkSym>(
         // `FORMAT_WITH_SPEC` has the same shape: `format_with_spec`
         // (`eval.rs`) pops the spec and then the value, so `value` — the
         // receiver whose `__format__` is dispatched — is the deeper one.
+        //
+        // `IS_OP` / `CONTAINS_OP` are the same two-operand block: `is_op`
+        // (`eval.rs`) pops `b` then `a`; `contains_op` pops haystack then
+        // needle.
         pyre_interpreter::Instruction::BinaryOp { .. }
         | pyre_interpreter::Instruction::CompareOp { .. }
         | pyre_interpreter::Instruction::StoreAttr { .. }
-        | pyre_interpreter::Instruction::FormatWithSpec => 2,
+        | pyre_interpreter::Instruction::FormatWithSpec
+        | pyre_interpreter::Instruction::IsOp { .. }
+        | pyre_interpreter::Instruction::ContainsOp { .. } => 2,
         // `[obj, start, stop]`. `binary_slice` pops stop, start, then obj, so
         // `obj` is the deepest of the three. `try_walker_orthodox_binary_slice`
         // inlines each bound's `__index__` from this residual; with no arm
         // `CallStack::NoOperandShape` left the body a residual `BinarySlice`.
         pyre_interpreter::Instruction::BinarySlice => 3,
-        other => {
-            if fbw_debug_abort_enabled() {
-                let jit_op = crate::jitcode_runtime::decode_op_at(
-                    jc.payload.jitcode.code.as_slice(),
-                    call_jitcode_pc,
-                )
-                .map(|op| op.key)
-                .unwrap_or("");
-                eprintln!(
-                    "[caller-operand-shape-absent] instruction={other:?} py_pc={py_pc} jit_pc={call_jitcode_pc} jit_op={jit_op}"
-                );
-            }
-            return None;
-        }
-    };
-    Some(CallerOperandSlots::Operands {
-        deepest: stack_end.checked_sub(operand_count)?,
+        // `[value, obj, key]`. `opcode_store_subscr` pops key, obj, then
+        // value, so `value` is the deepest of the three.
+        pyre_interpreter::Instruction::StoreSubscr => 3,
+        // `[global_super, cls, self]`. `load_super_attr_with` pops self,
+        // cls, then global_super, so `global_super` is the deepest of the
+        // three.
+        pyre_interpreter::Instruction::LoadSuperAttr { .. } => 3,
+        // No stack operands. `opcode_load_global` / `opcode_load_name` /
+        // `load_deref` / `opcode_load_const` each push a looked-up or
+        // constant value; `opcode_load_fast_borrow_load_fast_borrow`
+        // pushes two locals; `opcode_jump_backward` only sets the next
+        // instruction. `deepest == stack_end`.
+        pyre_interpreter::Instruction::LoadGlobal { .. }
+        | pyre_interpreter::Instruction::LoadName { .. }
+        | pyre_interpreter::Instruction::LoadDeref { .. }
+        | pyre_interpreter::Instruction::LoadConst { .. }
+        | pyre_interpreter::Instruction::LoadFastBorrowLoadFastBorrow { .. }
+        | pyre_interpreter::Instruction::JumpBackward { .. } => 0,
+        // `[value]`. `opcode_make_function` pops the code object;
+        // `format_simple` / `convert_value` pop the value;
+        // `opcode_store_name` / `opcode_store_global` / `opcode_store_fast`
+        // pop the stored value. `execute_get_len` peeks TOS and
+        // `import_from` peeks the module; both use that one TOS slot as
+        // the operand.
+        pyre_interpreter::Instruction::MakeFunction
+        | pyre_interpreter::Instruction::FormatSimple
+        | pyre_interpreter::Instruction::ConvertValue { .. }
+        | pyre_interpreter::Instruction::StoreName { .. }
+        | pyre_interpreter::Instruction::StoreGlobal { .. }
+        | pyre_interpreter::Instruction::StoreFast { .. }
+        | pyre_interpreter::Instruction::GetLen
+        | pyre_interpreter::Instruction::ImportFrom { .. } => 1,
+        // `[obj, key]`. `delete_subscript` pops index then obj.
+        // `import_name` pops fromlist then level.
+        pyre_interpreter::Instruction::DeleteSubscr
+        | pyre_interpreter::Instruction::ImportName { .. } => 2,
+        // Contiguous TOS of `n` items. `opcode_build_tuple` /
+        // `opcode_build_list` / `build_set` each `pop_n`/`dropvalues`
+        // that many.
+        pyre_interpreter::Instruction::BuildTuple { count }
+        | pyre_interpreter::Instruction::BuildList { count }
+        | pyre_interpreter::Instruction::BuildSet { count } => count.get(op_arg) as usize,
+        // Contiguous TOS of `2 * n` items (`opcode_build_map` `pop_n(size * 2)`).
+        pyre_interpreter::Instruction::BuildMap { count } => (count.get(op_arg) as usize) * 2,
+        _ => return None,
     })
+}
+
+#[cfg(test)]
+mod caller_operand_slots_tests {
+    use super::*;
+
+    /// `CallerOperandSlots::Operands { deepest }` is `stack_end - 1` for a
+    /// unary: `opcode_unary_negative` pops that one TOS value.
+    #[test]
+    fn caller_operand_slots_unary_negative_is_the_tos_value() {
+        assert_eq!(
+            caller_non_call_operand_count(
+                pyre_interpreter::Instruction::UnaryNegative,
+                pyre_interpreter::OpArg::NULL,
+            ),
+            Some(1)
+        );
+        let stack_end = 8usize;
+        assert_eq!(
+            stack_end.checked_sub(
+                caller_non_call_operand_count(
+                    pyre_interpreter::Instruction::UnaryNegative,
+                    pyre_interpreter::OpArg::NULL,
+                )
+                .unwrap()
+            ),
+            Some(7)
+        );
+    }
+
+    /// `CallerOperandSlots::Operands { deepest }` is `stack_end - 2` for
+    /// `IS_OP`: `is_op` pops `b` then `a`, the contiguous TOS pair.
+    #[test]
+    fn caller_operand_slots_is_op_is_the_two_tos_values() {
+        let instruction = pyre_interpreter::Instruction::IsOp {
+            invert: pyre_interpreter::bytecode::Arg::marker(),
+        };
+        assert_eq!(
+            caller_non_call_operand_count(instruction, pyre_interpreter::OpArg::NULL),
+            Some(2)
+        );
+        let stack_end = 8usize;
+        assert_eq!(
+            stack_end.checked_sub(
+                caller_non_call_operand_count(instruction, pyre_interpreter::OpArg::NULL).unwrap()
+            ),
+            Some(6)
+        );
+    }
+
+    /// `LOAD_GLOBAL` consumes no stack operands (`opcode_load_global`), so
+    /// `deepest == stack_end`.
+    #[test]
+    fn caller_operand_slots_load_global_consumes_none() {
+        let instruction = pyre_interpreter::Instruction::LoadGlobal {
+            namei: pyre_interpreter::bytecode::Arg::marker(),
+        };
+        assert_eq!(
+            caller_non_call_operand_count(instruction, pyre_interpreter::OpArg::NULL),
+            Some(0)
+        );
+        let stack_end = 8usize;
+        assert_eq!(
+            stack_end.checked_sub(
+                caller_non_call_operand_count(instruction, pyre_interpreter::OpArg::NULL).unwrap()
+            ),
+            Some(stack_end)
+        );
+    }
+
+    /// `BUILD_TUPLE n` consumes `n` contiguous TOS slots
+    /// (`opcode_build_tuple` `pop_n(size)`).
+    #[test]
+    fn caller_operand_slots_build_tuple_consumes_oparg_items() {
+        let instruction = pyre_interpreter::Instruction::BuildTuple {
+            count: pyre_interpreter::bytecode::Arg::marker(),
+        };
+        let op_arg = pyre_interpreter::OpArg::new(3);
+        assert_eq!(caller_non_call_operand_count(instruction, op_arg), Some(3));
+        let stack_end = 8usize;
+        assert_eq!(
+            stack_end.checked_sub(caller_non_call_operand_count(instruction, op_arg).unwrap()),
+            Some(5)
+        );
+        let empty = pyre_interpreter::OpArg::new(0);
+        assert_eq!(caller_non_call_operand_count(instruction, empty), Some(0));
+    }
+
+    fn first_instruction_pc(
+        code: &pyre_interpreter::CodeObject,
+        pred: impl Fn(pyre_interpreter::Instruction) -> bool,
+    ) -> Option<usize> {
+        (0..code.instructions.len()).find_map(|pc| {
+            pyre_interpreter::decode_instruction_at(code, pc)
+                .and_then(|(instruction, _)| pred(instruction).then_some(pc))
+        })
+    }
+
+    fn nested_function_code(src: &str) -> pyre_interpreter::CodeObject {
+        let module = pyre_interpreter::compile_exec(src).expect("compile");
+        module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                pyre_interpreter::bytecode::ConstantData::Code { code } => Some((**code).clone()),
+                _ => None,
+            })
+            .expect("source should contain a function")
+    }
+
+    /// `range(stop)` is `LOAD_GLOBAL` then `LOAD_FAST` then `CALL`. The prefix
+    /// walk finds that CALL only as the floor fallback; an exact `LOAD_GLOBAL`
+    /// is classified as consuming no operands.
+    #[test]
+    fn caller_operand_slots_exact_load_global_is_not_the_later_call() {
+        let code = nested_function_code("def f(stop):\n    return range(stop)\n");
+        let load_global_pc = first_instruction_pc(&code, |instruction| {
+            matches!(
+                instruction,
+                pyre_interpreter::Instruction::LoadGlobal { .. }
+            )
+        })
+        .expect("range(stop) starts with LOAD_GLOBAL");
+        let call_pc = first_instruction_pc(&code, |instruction| {
+            matches!(instruction, pyre_interpreter::Instruction::Call { .. })
+        })
+        .expect("range(stop) ends with CALL");
+        let (load_instruction, load_op_arg) =
+            pyre_interpreter::decode_instruction_at(&code, load_global_pc).unwrap();
+        let (call_instruction, call_op_arg) =
+            pyre_interpreter::decode_instruction_at(&code, call_pc).unwrap();
+        let expected = match call_instruction {
+            pyre_interpreter::Instruction::Call { argc } => {
+                Some((argc.get(call_op_arg) as usize, 1usize))
+            }
+            _ => unreachable!("call_pc is CALL"),
+        };
+        assert_eq!(call_shape_after_arg_prefix(&code, load_global_pc), expected);
+        assert_eq!(
+            call_shape_at_py_pc(&code, load_global_pc, load_instruction, load_op_arg, true,),
+            None
+        );
+        assert_eq!(
+            call_shape_at_py_pc(&code, load_global_pc, load_instruction, load_op_arg, false,),
+            expected
+        );
+        assert_eq!(
+            caller_non_call_operand_count(load_instruction, load_op_arg),
+            Some(0)
+        );
+        assert_eq!(
+            call_shape_at_py_pc(&code, call_pc, call_instruction, call_op_arg, true),
+            expected
+        );
+    }
 }
 
 /// Name the live color that refused a caller image.
@@ -2102,6 +2451,16 @@ pub(in crate::jitcode_dispatch) fn refresh_paused_parent_concretes<Sym: WalkSym>
         return;
     }
     let caller_sym = unsafe { &*sym_ptr };
+    if caller_sym.jitcode().is_null() {
+        return;
+    }
+    // A paused helper's CALL pc is not a coordinate in the portal
+    // snapshot. Mixing the two is `CallStack::NoOperandShape` at a
+    // `LoadSmallInt` that happens to share the helper's byte offset.
+    let snapshot_index = unsafe { (*caller_sym.jitcode()).index as u32 };
+    if snapshot_index != parent.jitcode_index {
+        return;
+    }
     if let Some(overrides) = collect_call_stack_overrides(caller_sym, ctx, call_pc) {
         parent.call_stack_overrides = overrides;
     }
@@ -2553,40 +2912,23 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         let call_is_void =
             crate::jitcode_runtime::decode_op_at(jc.payload.jitcode.code.as_slice(), call_jit_pc)
                 .is_some_and(|op| op.result_argcode() == 'v');
-        // #73 phase-3 (twin-first): the forward `after_residual_fallthrough`
-        // twin carries the containing-then-fallthrough coordinate; the
-        // containing lookup survives for the empty-twin class and as the audit
-        // oracle.
-        let legacy_fallthrough = || unsafe {
-            let call_py =
-                crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, call_jit_pc)
-                    as usize;
-            let code = &*jc.payload.code_ptr;
-            crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32
-        };
-        let fallthrough = match jc
-            .payload
-            .after_residual_fallthrough_py_pc_for_jitcode_pc(call_jit_pc)
-        {
-            Some(ft) => {
-                if pcmap_afterresidual_audit_enabled() {
-                    assert_eq!(
-                        ft,
-                        legacy_fallthrough(),
-                        "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: inline-caller fallthrough-py twin diverged at jit_pc {call_jit_pc}"
-                    );
-                }
-                ft
-            }
-            None => {
-                crate::py_coord::note_empty_twin_fallback(
-                    "inline_caller_fallthrough",
-                    jc.index,
-                    call_jit_pc as i32,
+        let call_py =
+            crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, call_jit_pc)
+                as usize;
+        let code = &*jc.payload.code_ptr;
+        if pcmap_afterresidual_audit_enabled() {
+            let legacy = crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32;
+            if let Some(ft) = jc
+                .payload
+                .after_residual_fallthrough_py_pc_for_jitcode_pc(call_jit_pc)
+            {
+                assert_eq!(
+                    ft, legacy,
+                    "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: inline-caller fallthrough-py twin diverged at jit_pc {call_jit_pc}"
                 );
-                legacy_fallthrough()
             }
-        };
+        }
+        let fallthrough = crate::pyjitpl::resume_py_pc_after_python_call(code, call_py) as u32;
         (
             jc.index as u32,
             fallthrough,
@@ -2727,11 +3069,11 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     let call_is_void =
         crate::jitcode_runtime::decode_op_at(pjc.jitcode.code.as_slice(), call_jit_pc)
             .is_some_and(|op| op.result_argcode() == 'v');
-    let legacy_fallthrough_py_pc = || unsafe {
+    let fallthrough_py_after_call = || unsafe {
         let call_py =
             crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
         let code = &*pjc.code_ptr;
-        crate::pyjitpl::semantic_fallthrough_pc(code, call_py) as u32
+        crate::pyjitpl::resume_py_pc_after_python_call(code, call_py) as u32
     };
     // The call result is the top operand-stack slot only when it remains live
     // at the return point; a call whose value is immediately discarded can
@@ -2745,7 +3087,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
             .map(|depth| depth as usize),
         None => {
             let raw = || {
-                let fallthrough_py_pc = legacy_fallthrough_py_pc();
+                let fallthrough_py_pc = fallthrough_py_after_call();
                 unsafe {
                     crate::liveness::liveness_for(pjc.code_ptr)
                         .depth_at_py_pc()
@@ -2950,19 +3292,21 @@ fn with_call_result_slot(mut frame: InlineParentFrame) -> InlineParentFrame {
     frame
 }
 
-/// Pause the enclosing helper at its CALL into a nested helper.
+/// Pause a helper at `call_jit_pc` from that helper's own register banks.
 ///
 /// `capture_inline_parent_blackhole` would snapshot the Python banks
 /// (`paused_python_live`); this caller is the helper's own jitcode, so the
 /// live helper banks go on `attach_live_caller` and `blackhole` stays empty.
 /// `build_parent_miframe` rebuilds that `MIFrame` from those banks.
-fn compute_paused_helper_caller_frame<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
+pub(crate) fn compute_paused_helper_caller_frame_from(
+    trace_ctx: &mut TraceCtx,
+    registers_i: &RegisterBank,
+    registers_r: &RegisterBank,
+    registers_f: &RegisterBank,
+    frame_state: &WalkFrameState,
+    jitcode_index: usize,
     call_jit_pc: usize,
 ) -> Result<InlineParentFrame, InlineCallerFrameDecline> {
-    let Some(jitcode_index) = ctx.fbw_mode.transparent_helper_jitcode_index else {
-        return Err(unavail("Unavail::PausedHelper/NoIndex"));
-    };
     let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
         return Err(unavail("Unavail::PausedHelper/NoPjc"));
     };
@@ -2972,12 +3316,12 @@ fn compute_paused_helper_caller_frame<Sym: WalkSym>(
     let resume_marker_jit_pc = inline_call_return_marker(&pjc, call_jit_pc)
         .ok_or_else(|| unavail("Unavail::PausedHelper/NoMarker"))?;
     let result_register = super::residual_call::parent_call_result_color(&pjc, call_jit_pc);
-    let banks = [ctx.registers_i, ctx.registers_r, ctx.registers_f];
-    let saved = clear_in_a_call_result(ctx.trace_ctx, banks, result_register);
+    let banks = [registers_i, registers_r, registers_f];
+    let saved = clear_in_a_call_result(trace_ctx, banks, result_register);
     let boxes = collect_callee_active_boxes(
-        ctx.registers_i,
-        ctx.registers_r,
-        ctx.registers_f,
+        registers_i,
+        registers_r,
+        registers_f,
         jitcode_index as u32,
         call_jit_pc,
         resume_marker_jit_pc as i32,
@@ -3005,18 +3349,32 @@ fn compute_paused_helper_caller_frame<Sym: WalkSym>(
             caller_py_pc: None,
             result_slot: CallResultSlot::Unknown,
         }
-        .attach_live_caller(
-            ctx.registers_r,
-            ctx.registers_i,
-            ctx.registers_f,
-            &ctx.frame_state,
-        ),
+        .attach_live_caller(registers_r, registers_i, registers_f, frame_state),
     ))
+}
+
+/// Pause the enclosing helper at its CALL into a nested helper.
+pub(crate) fn compute_paused_helper_caller_frame<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    call_jit_pc: usize,
+) -> Result<InlineParentFrame, InlineCallerFrameDecline> {
+    let Some(jitcode_index) = ctx.fbw_mode.transparent_helper_jitcode_index else {
+        return Err(unavail("Unavail::PausedHelper/NoIndex"));
+    };
+    compute_paused_helper_caller_frame_from(
+        ctx.trace_ctx,
+        ctx.registers_i,
+        ctx.registers_r,
+        ctx.registers_f,
+        &ctx.frame_state,
+        jitcode_index,
+        call_jit_pc,
+    )
 }
 
 /// A resume section `rebuild_from_resumedata` can turn back into a Python
 /// frame. The codeless slot 0 (and constructor tails) have no `CodeObject`.
-fn jitcode_index_names_python_code(jitcode_index: u32) -> bool {
+pub(crate) fn jitcode_index_names_python_code(jitcode_index: u32) -> bool {
     crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
         .is_some_and(|pjc| pjc.is_populated() && !pjc.code_ptr.is_null())
 }
@@ -3218,6 +3576,53 @@ impl HelperLevel {
     }
 }
 
+/// Publish the CALL image a helper sub-walk resumes through.
+///
+/// A nested helper's byte offset is not a coordinate in the Python jitcode.
+/// Keep the outermost Python CALL (`entry_py_pc`, `outer_jitcode_index`,
+/// `outer_active_boxes`, `outer_resume_marker_jit_pc`) so a portal entered
+/// from inside the helper still names that call (`ResumeDataLoopMemo.number`
+/// section 0 / `rebuild_from_resumedata`).
+pub(crate) fn publish_helper_outer_call_image<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    call_site_marker: Option<usize>,
+    outer_jitcode_index: u32,
+    call_site_active: Vec<OpRef>,
+    saved_entry: EntryPyPc,
+    saved_oji: u32,
+    saved_active: &[OpRef],
+    numbered_call_result: bool,
+) {
+    if !ctx.fbw_mode.inline_subwalk && !numbered_call_result {
+        // Portal banks are still live. Converted helpers do not push a
+        // `HelperLevel`, so capture the CALL image here for a later
+        // helper→portal `perform_call` (`capture_resumedata` section 0).
+        // A numbered `CallResult` helper already holds that paused
+        // caller as `HelperLevel::section` (`pyjitpl.py` `newframe` /
+        // `capture_resumedata`); the synthetic parent would collapse a
+        // guard to the CALL.
+        let captured = compute_inline_caller_frame(ctx, op_pc)
+            .ok()
+            .map(with_call_result_slot);
+        ctx.session.borrow_mut().helper_outer_call_parent = captured;
+    }
+    if !(ctx.fbw_mode.inline_subwalk && matches!(saved_entry, EntryPyPc::Jit(_))) {
+        ctx.entry_py_pc = EntryPyPc::Jit(op_pc);
+    }
+    let keep_portal_boxes = ctx.fbw_mode.inline_subwalk
+        && matches!(saved_entry, EntryPyPc::Jit(_))
+        && !crate::state::jitcode_is_transparent_helper(saved_oji as i32)
+        && !saved_active.is_empty();
+    if keep_portal_boxes {
+        ctx.frame_state.borrow_mut().outer_active_boxes = saved_active.to_vec();
+        return;
+    }
+    ctx.outer_resume_marker_jit_pc = call_site_marker;
+    ctx.outer_jitcode_index = outer_jitcode_index;
+    ctx.frame_state.borrow_mut().outer_active_boxes = call_site_active;
+}
+
 /// The helper level to push when the current walk enters a helper at
 /// `call_jit_pc`, or `None` when its guards keep the enclosing resume.
 ///
@@ -3247,22 +3652,33 @@ pub(crate) fn helper_subwalk_level<Sym: WalkSym>(
             HelperChain::NoHelper | HelperChain::Collapsed | HelperChain::Unresumable => None,
         });
     }
-    if ret == HelperReturn::CallResult
-        && let Ok(caller) = compute_inline_caller_frame(ctx, call_jit_pc)
-    {
-        let call_entry = if ctx.fbw_mode.inline_subwalk {
-            compute_inline_helper_call_entry_frame(ctx, call_jit_pc)
-                .map_or(HelperCallEntry::Unavailable, HelperCallEntry::Frame)
-        } else {
-            HelperCallEntry::CallerBoundary
-        };
-        return Ok(Some(HelperLevel::section(
-            with_call_result_slot(caller),
-            call_entry,
-        )));
+    if ret == HelperReturn::CallResult {
+        // The helper return is the call's result, so the helper is its
+        // own `MIFrame` (`pyjitpl.py` `perform_call` / `newframe`). A
+        // missing post-call marker or unresolved dest declines here,
+        // before any helper store. `Ok(None)` at the root is only for
+        // Converted.
+        match compute_inline_caller_frame(ctx, call_jit_pc) {
+            Ok(caller) => {
+                let caller = with_call_result_slot(caller);
+                if caller.result_slot == CallResultSlot::Unknown {
+                    return Err(unavail("Unavail::CallResult/UnknownSlot"));
+                }
+                let call_entry = if ctx.fbw_mode.inline_subwalk {
+                    compute_inline_helper_call_entry_frame(ctx, call_jit_pc)
+                        .map_or(HelperCallEntry::Unavailable, HelperCallEntry::Frame)
+                } else {
+                    HelperCallEntry::CallerBoundary
+                };
+                return Ok(Some(HelperLevel::section(caller, call_entry)));
+            }
+            Err(err) if !ctx.fbw_mode.inline_subwalk => return Err(err),
+            Err(_) => {}
+        }
     }
     if !ctx.fbw_mode.inline_subwalk {
-        // The root portal resumes at its CALL boundary (`entry_py_pc`).
+        // Converted root: the portal resumes at its CALL boundary
+        // (`entry_py_pc`). Result-bearing roots already returned above.
         return Ok(None);
     }
     compute_inline_helper_call_entry_frame(ctx, call_jit_pc).map(|caller| {
@@ -3274,6 +3690,73 @@ pub(crate) fn helper_subwalk_level<Sym: WalkSym>(
             entry_trace_index: 0,
         })
     })
+}
+
+/// Number a Converted helper's own guard from the SubWalkDriver MIFrames.
+///
+/// Converted portal-root helpers do not push `HelperLevel`, so
+/// `helper_chain` stays `NoHelper` and the guard would collapse to the
+/// Python CALL (`publish_helper_outer_call_image`). That CALL re-runs
+/// `__index__` after the helper has already executed it. The driver still
+/// holds those helpers as `MIFrame`s; `capture_resumedata` /
+/// `ResumeDataLoopMemo.number` numbers every framestack level, so the
+/// snapshot is the portal CALL image, the paused driver ancestors, and
+/// this helper at the guard. No `HelperLevel` is pushed.
+fn capture_converted_driver_helper_guard<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    after_residual_call: bool,
+    scope: &GuardCaptureScope,
+    parent_frames: &[InlineParentFrame],
+) -> bool {
+    if !ctx.fbw_mode.transparent_helper_subwalk || !super::inline_call::subwalk_driver_is_active() {
+        return false;
+    }
+    // A Python inline with a complete parent chain already numbers through
+    // `walker_capture_multi_frame_inline_snapshot`. Stealing those guards
+    // (helpers inside `__index__`) rewrites bound failargs. This path is
+    // only the Converted CALL-entry collapse: `n_parents == 0` while the
+    // driver still holds the helper MIFrames.
+    if walker_inline_guard_resumes_in_callee(ctx) {
+        return false;
+    }
+    // CALL-entry re-runs the helper (`resume_in_blackhole`). A list store
+    // (`fbw_store_journal_push`, `calls[0] += 1`) or a STORE_ATTR fold
+    // (`store_attr_direct`, `self.n += 1`) would apply twice. Bound's
+    // `__index__` is a pure load; its executed-effect delta is the cell/gc
+    // journal of W_Range setfields (`fbw_gc_store_journal_push`) and must
+    // keep the CALL-entry snapshot (stable failargs).
+    let Some(mark) = ctx.fbw_mode.transparent_helper_journal_at_entry else {
+        return false;
+    };
+    let now = fbw_effect_journal_mark();
+    let journaled = fbw_journaled_effect_delta_since(mark);
+    let executed = now.executed.saturating_sub(mark.executed);
+    if now.stores <= mark.stores && executed <= journaled {
+        return false;
+    }
+    let Ok(innermost) = helper_innermost_resume_frame(ctx, op_pc, after_residual_call, scope)
+    else {
+        return false;
+    };
+    let mut frames = parent_frames.to_vec();
+    let has_python_section = frames
+        .iter()
+        .any(|frame| jitcode_index_names_python_code(frame.jitcode_index));
+    if !has_python_section {
+        if let Some(portal) = super::inline_call::portal_parent_from_helper_outer(ctx) {
+            frames.insert(0, portal);
+        }
+    }
+    super::inline_call::insert_paused_driver_helper_parents(ctx, &mut frames);
+    frames.push(innermost);
+    if !frames
+        .iter()
+        .any(|frame| jitcode_index_names_python_code(frame.jitcode_index))
+    {
+        return false;
+    }
+    walker_capture_transparent_helper_snapshot(ctx, op_pc, frames, scope.guard_stamp).is_ok()
 }
 
 /// How a guard inside a numbered helper chain resumes.
@@ -3492,6 +3975,14 @@ fn boxes_matching_resume_liveness(
     // No box is invented for a slot the image does not hold: a section of
     // the wrong length cannot be numbered, so the guard is not recorded.
     if frame.boxes.len() != expected {
+        // A helper whose live-vars table has no row at this word still
+        // carries the `in_a_call` image collected at pause. An empty
+        // expected count must not donate those boxes into the next
+        // section header (`ResumeDataLoopMemo.number`).
+        let helper = crate::state::jitcode_is_transparent_helper(frame.jitcode_index as i32);
+        if helper && expected == 0 {
+            return Ok(Vec::new());
+        }
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     }
     Ok(frame.boxes.clone())
@@ -3578,6 +4069,28 @@ fn walker_capture_assembler_continuation_guard<Sym: WalkSym>(
     }
     parent_frames.push(tail);
     walker_capture_transparent_helper_snapshot(ctx, op_pc, parent_frames, GuardStampTarget::LastOp)
+}
+
+/// Resume word of a paused parent, including a helper whose `-live-` is
+/// not a Python `pc_map` startpoint (`capture_resumedata` still numbers
+/// every `framestack` frame). `resolve_resume_pc_with_jitcode_pc` is the
+/// Python path; a helper falls back to the carried marker itself.
+fn parent_resume_pc_word(frame: &InlineParentFrame) -> Option<u32> {
+    let word = frame
+        .resume_marker_jit_pc
+        .or(frame.resume_pc)
+        .map(|m| m as i32)
+        .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
+    let payload = crate::state::pyjitcode_for_jitcode_index(frame.jitcode_index as i32)?;
+    if let Some(offset) = payload.resolve_resume_pc_with_jitcode_pc(word, crate::state::op_live()) {
+        return Some(offset as u32);
+    }
+    if word < 0 {
+        return None;
+    }
+    let helper = payload.code_ptr.is_null()
+        || crate::state::jitcode_is_transparent_helper(frame.jitcode_index as i32);
+    helper.then_some(word as u32)
 }
 
 /// Number a helper-guard snapshot: paused callers outermost-first, then
@@ -3682,17 +4195,19 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
     // length differs from that window refuses the capture.
     let mut captured: Vec<(u32, u32, u32, Vec<OpRef>)> = Vec::with_capacity(parent_frames.len());
     for frame in &parent_frames {
-        let word = frame
-            .resume_marker_jit_pc
-            .map(|marker| marker as i32)
-            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
-        let pc_word = crate::state::pyjitcode_for_jitcode_index(frame.jitcode_index as i32)
-            .and_then(|payload| {
-                payload.resolve_resume_pc_with_jitcode_pc(word, crate::state::op_live())
-            })
-            .map(|offset| offset as u32)
+        let pc_word = parent_resume_pc_word(frame)
             .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })?;
-        let py_pc = forward_snapshot_py_pc(frame.jitcode_index, pc_word)?;
+        let py_pc = if crate::state::jitcode_is_transparent_helper(frame.jitcode_index as i32)
+            || crate::state::pyjitcode_for_jitcode_index(frame.jitcode_index as i32)
+                .is_some_and(|pjc| pjc.code_ptr.is_null())
+        {
+            u32::MAX
+        } else if matches!(frame.resume_coord, ParentResumeCoord::CallFallthrough(_)) {
+            resolve_parent_resume_py_pc(frame)
+                .unwrap_or(forward_snapshot_py_pc(frame.jitcode_index, pc_word)?)
+        } else {
+            forward_snapshot_py_pc(frame.jitcode_index, pc_word)?
+        };
         let boxes = boxes_matching_resume_liveness(frame, pc_word, op_pc)?;
         captured.push((frame.jitcode_index, pc_word, py_pc, boxes));
     }
@@ -3702,6 +4217,41 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
             (*jitcode_index, *pc_word, *py_pc, boxes.as_slice())
         })
         .collect();
+    if guard_resume_pc_probe_enabled() {
+        let names: Vec<String> = frames
+            .iter()
+            .map(|(jitcode_index, pc_word, py_pc, boxes)| {
+                let pjc = crate::state::pyjitcode_for_jitcode_index(*jitcode_index as i32);
+                let jc_name = pjc
+                    .as_ref()
+                    .map(|p| p.jitcode.name().to_string())
+                    .unwrap_or_default();
+                let (opname, pred) = pjc
+                    .as_ref()
+                    .map(|p| {
+                        let slice = p.jitcode.code.as_slice();
+                        let here = crate::jitcode_runtime::decode_op_at(slice, *pc_word as usize)
+                            .map(|op| op.opname.to_string())
+                            .unwrap_or_else(|| "-".into());
+                        let pred = crate::jitcode_runtime::decoded_ops(slice)
+                            .find(|op| op.next_pc == *pc_word as usize)
+                            .map(|op| op.opname.to_string())
+                            .unwrap_or_else(|| "-".into());
+                        (here, pred)
+                    })
+                    .unwrap_or_else(|| ("-".into(), "-".into()));
+                format!(
+                    "{jc_name}@{pc_word}/{opname}<{pred}/py={py_pc}/n={}",
+                    boxes.len()
+                )
+            })
+            .collect();
+        eprintln!(
+            "[guard-pc] helper-frames op_pc={op_pc} n={} [{}]",
+            frames.len(),
+            names.join(" | ")
+        );
+    }
     match guard_stamp {
         GuardStampTarget::LastOp => ctx
             .trace_ctx
@@ -4064,18 +4614,7 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     // top frame last (innermost).
     let mut frames: Vec<(u32, u32, u32, &[OpRef])> = Vec::with_capacity(parent_frames.len() + 1);
     for pf in &parent_frames {
-        let pf_word = pf
-            .resume_marker_jit_pc
-            .map(|m| m as i32)
-            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
-        let Some(pf_pc_word) = crate::state::pyjitcode_for_jitcode_index(pf.jitcode_index as i32)
-            .and_then(|payload| {
-                let resolved =
-                    payload.resolve_resume_pc_with_jitcode_pc(pf_word, crate::state::op_live());
-                resolved
-            })
-            .map(|offset| offset as u32)
-        else {
+        let Some(pf_pc_word) = parent_resume_pc_word(pf) else {
             return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: callee_op_pc });
         };
         let pf_py_pc = forward_snapshot_py_pc(pf.jitcode_index, pf_pc_word)?;

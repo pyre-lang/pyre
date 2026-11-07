@@ -268,6 +268,24 @@ pub unsafe fn is_tuple_iter(obj: PyObjectRef) -> bool {
     !obj.is_null() && std::ptr::eq((*obj).ob_type, &TUPLE_ITER_TYPE)
 }
 
+/// `iterobject.py W_AbstractSeqIterObject.descr_iter` — `return self`.
+/// Shared by `sequenceiterator`, the producer-specific `W_SeqIterObject`
+/// identities, `list_iterator`, and `tuple_iterator`.
+///
+/// # Safety
+/// `obj` must point to a valid sequence iterator of those types.
+pub unsafe fn w_seqiter_iter(obj: PyObjectRef) -> PyObjectRef {
+    obj
+}
+
+/// `iterobject.py W_ReverseSeqIterObject.descr_iter` — `return self`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListReverseIterObject`.
+pub unsafe fn w_reverseseqiter_iter(obj: PyObjectRef) -> PyObjectRef {
+    obj
+}
+
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime

@@ -839,9 +839,7 @@ fn try_commit_midbody_abort_inner(
             "outer call boundary not flushable",
         ));
     }
-    let raw = unsafe {
-        pyre_interpreter::w_code_get_ptr(payload.w_code) as *const pyre_interpreter::CodeObject
-    };
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(payload.w_code) };
     if raw.is_null() {
         return Err(MidBodyDecline::BeforeRun("null callee code ptr"));
     }
@@ -1790,7 +1788,7 @@ fn record_carrier_crossed_frame_traceback(
     if exc_ptr.is_null() {
         return true;
     }
-    let w_code = crate::state::recover_inline_callee_code(recipe.code_ptr);
+    let w_code = crate::state::recover_inline_callee_code(recipe.jitcode_index);
     // A synthetic frame carries the sentinel or null instead of a real code
     // object; the hook dereferences it, so both checks precede `is_code`, whose
     // type check would deref the sentinel.
@@ -2076,7 +2074,8 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             crate::jitcode_dispatch::census_record("P2Drain::SetupFailed");
             return p2_drain_abort();
         };
-        let Some(callee_pjc) = crate::state::pyjitcode_for_code(recipe.code_ptr) else {
+        let Some(callee_pjc) = crate::state::pyjitcode_for_jitcode_index(recipe.jitcode_index)
+        else {
             discard_bridge_carrier_walk(
                 ctx,
                 sym,
@@ -2697,7 +2696,8 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
             }
             continue;
         }
-        let Some(middle_pjc) = crate::state::pyjitcode_for_code(middle.code_ptr) else {
+        let Some(middle_pjc) = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index)
+        else {
             crate::jitcode_dispatch::census_record("P2Drain::NoMiddlePjc");
             return None;
         };
@@ -2785,8 +2785,8 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
             }
             continue;
         }
-        let middle_pjc =
-            crate::state::pyjitcode_for_code(middle.code_ptr).expect("pre-validated above");
+        let middle_pjc = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index)
+            .expect("pre-validated above");
         if let Some(catch_target) = carrier_catch_target(
             middle_pjc.jitcode.code.as_slice(),
             middle.jitcode_pc as usize,
@@ -2938,7 +2938,7 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::MiddleSetupFailed");
         return None;
     };
-    let Some(middle_pjc) = crate::state::pyjitcode_for_code(middle.code_ptr) else {
+    let Some(middle_pjc) = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index) else {
         crate::jitcode_dispatch::census_record("P2Drain::NoMiddlePjc");
         return None;
     };
@@ -3309,7 +3309,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::MiddleSetupFailed");
         return None;
     };
-    let Some(middle_pjc) = crate::state::pyjitcode_for_code(middle.code_ptr) else {
+    let Some(middle_pjc) = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index) else {
         crate::jitcode_dispatch::census_record("P2Drain::NoMiddlePjc");
         return None;
     };
@@ -3508,8 +3508,8 @@ fn adopt_blackhole_crn(snapshot: usize, live_root: usize, resume_py_pc: usize) {
 }
 
 /// Canonical `CodeObject*` for the live portal frame, matching
-/// `MetaInterpStaticData::canonical_code_key_opt`: a raw code pointer is
-/// already the key, a `W_Code` wrapper unwraps through `w_code_get_ptr`.
+/// `MetaInterpStaticData::canonical_code_key_opt`: the frame's `PyCode`
+/// wrapper unwraps through `w_code_get_ptr`.
 fn live_root_code_key(root_addr: usize) -> Option<usize> {
     if root_addr == 0 {
         return None;
@@ -3520,9 +3520,11 @@ fn live_root_code_key(root_addr: usize) -> Option<usize> {
     if pycode.is_null() {
         return None;
     }
-    if !pyre_interpreter::live_code_wrapper(pycode).is_null() {
-        return Some(pycode as usize);
-    }
+    #[cfg(debug_assertions)]
+    debug_assert!(
+        unsafe { pyre_interpreter::pycode::is_code(pycode as pyre_object::PyObjectRef) },
+        "live_root_code_key `pycode` must be a PyCode wrapper"
+    );
     let raw = unsafe { pyre_interpreter::w_code_get_ptr(pycode as pyre_object::PyObjectRef) };
     if raw.is_null() {
         None
@@ -6267,23 +6269,21 @@ fn run_perfn_walk<Sym: WalkSym>(
             }
             *jump_args = rebuilt;
         }
-        // pyjitpl.py raise_continue_running_normally parity: a
-        // walk that ends at a merge point hands the interpreter (and the
-        // compiled loop's heap-reloading preamble) the END-of-walk frame
-        // state, so the walked iteration — whose residual calls executed
-        // concretely — is not re-run.  After `close_loop_args_at` (whose
-        // jump-arg derivation reads the pre-walk frame) is the one safe
-        // commit point.  All-or-nothing inside the helper; a `false`
+        // pyjitpl.py `reached_loop_header` closes the loop from the tracer's
+        // CURRENT boxes; `raise_continue_running_normally` unpacks those live
+        // boxes into ContinueRunningNormally.  The interpreter continues from
+        // the tracer's frame and never rolls already-executed work back to
+        // replay it.  A residual recorded symbolically (`int_pow_nomod`) has
+        // still run concretely during the walk, so the end frame is
+        // authoritative even when `fbw_has_unjournaled_effect()` is set.
+        // Always attempt `flush_walk_loop_end_state_to_frame`; the helper's
+        // all-or-nothing slot/depth refusal is the remaining gate.  A `false`
         // return keeps the legacy replay.
         //
-        // Commit preconditions:
-        //   - no unjournaled effect (a symbolically recorded residual
-        //     call only the replay applies);
-        //   - the frame flush resolves every live slot (all-or-nothing);
-        // then the committed flag routes the portal to adopt the end
-        // state instead of replaying.  The store-journal epilogue below
-        // settles the walk's eager list stores either way (commit keeps
-        // them, non-commit rolls them back for the replay).
+        // After `close_loop_args_at` (whose jump-arg derivation reads the
+        // pre-walk frame) is the one safe commit point.  The store-journal
+        // epilogue below settles the walk's eager list stores either way
+        // (commit keeps them, non-commit rolls them back for the replay).
         if let Ok((outcome, _end_pc)) = &walk_result {
             let header_pc = match outcome {
                 crate::jitcode_dispatch::DispatchOutcome::CloseLoop { .. } => close_loop_restart_pc,
@@ -6300,25 +6300,28 @@ fn run_perfn_walk<Sym: WalkSym>(
                 _ => None,
             };
             if let Some(header_pc) = header_pc {
-                if crate::jitcode_dispatch::fbw_has_unjournaled_effect() {
-                    if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
-                        eprintln!(
-                            "[fbw-end-flush] declined at header_pc={header_pc} \
-                             (unjournaled effect) — legacy replay kept"
-                        );
-                    }
-                } else if crate::state::flush_walk_loop_end_state_to_frame(ctx, cf_addr, header_pc)
-                {
+                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    let unjournaled = crate::jitcode_dispatch::fbw_has_unjournaled_effect();
+                    let (value_unavailable, symbolic) =
+                        crate::jitcode_dispatch::fbw_unjournaled_kinds();
+                    eprintln!(
+                        "[fbw-end-flush] loop-end header_pc={header_pc} \
+                         unjournaled={unjournaled} value_unavailable={value_unavailable} \
+                         symbolic={symbolic}"
+                    );
+                }
+                if crate::state::flush_walk_loop_end_state_to_frame(ctx, cf_addr, header_pc) {
                     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                         eprintln!(
                             "[fbw-end-flush] COMMIT header_pc={header_pc} bridge={} \
-                             journal_len={} outcome={outcome:?}",
+                             journal_len={} unjournaled={} outcome={outcome:?}",
                             ctx.is_bridge_trace,
                             crate::jitcode_dispatch::fbw_store_journal_len(),
+                            crate::jitcode_dispatch::fbw_has_unjournaled_effect(),
                         );
                     }
-                    // The loop header IS where this walk ended; the sticky
-                    // unjournaled check above is the whole gate.
+                    // The loop header IS where this walk ended; the flush's
+                    // all-or-nothing slot/depth refusal is the remaining gate.
                     let leg = if matches!(
                         outcome,
                         crate::jitcode_dispatch::DispatchOutcome::SegmentTrace { .. }
@@ -6349,8 +6352,10 @@ fn run_perfn_walk<Sym: WalkSym>(
         // whose prior STORE_ATTR ran once during the walk, then again on
         // replay).  Flush the abort-point frame (locals + last_instr) so the
         // portal resumes at the unsupported opcode instead of replaying.
-        // The marker-only fallback uses the same no-unjournaled-effect
-        // predicate as the CloseLoop end-flush above.  A latched inline-callee
+        // The marker-only fallback still refuses an unjournaled effect:
+        // unlike CloseLoop (`reached_loop_header` publishes the current
+        // boxes), this resume re-runs the unsupported opcode rather than
+        // adopting a completed loop-header image.  A latched inline-callee
         // forward abort has already distinguished an outside mark from a mark
         // inside its discarded attempt.
         let live_root_addr = sym.live_vable_frame_addr();
@@ -6850,11 +6855,14 @@ fn run_perfn_walk<Sym: WalkSym>(
         // walked iterations already counted, instead of discarding the walk
         // and dropping an in-flight FOR_ITER item via the conservative #30
         // header-guard drop (or, for the `Unsupported` shape, re-executing the
-        // walk's residual effects from loop entry).  Same
-        // no-unjournaled-effect / no-sub-walk predicate and same all-or-nothing
-        // `flush_walk_end_state_to_frame` gate as the CloseLoop / marker legs;
-        // when the flush declines (a slot the shadow cannot resolve) the legacy
-        // drop stands (the residual S3 case).
+        // walk's residual effects from loop entry).  Same no-unjournaled-effect
+        // / no-sub-walk predicate and same all-or-nothing
+        // `flush_walk_end_state_to_frame` gate as the marker abort leg.
+        // CloseLoop publishes the walked end frame even with an unjournaled
+        // residual (`reached_loop_header`); this abort path still vetoes,
+        // because its resume is not a completed loop-header image.  When the
+        // flush declines (a slot the shadow cannot resolve) the legacy drop
+        // stands (the residual S3 case).
         let kept_stack_abort_pc = match &walk_result {
             Err(
                 crate::jitcode_dispatch::DispatchError::BranchGuardUnrestorableKeptStackPermanent {
@@ -7121,13 +7129,16 @@ fn run_perfn_walk<Sym: WalkSym>(
     // the walk that stopped with every live register bound;
     // `can_convert_seeded_inline` is the seeded-inline modeling-gap family
     // the WalkAbort adopt gate already accepts; a multi-frame latch is the
-    // whole handoff.  Only an image whose banks were written for the
-    // Python frame is converted (`convert_and_run_from_pyjitpl` copies
-    // live `MIFrame` boxes).  A latch that crossed a failed helper
+    // whole handoff.  A single-frame latch after a heap-writing residual
+    // is the same handoff: `_compile_and_run_once` except `SwitchToBlackhole`
+    // always `run_blackhole_interp_to_cancel_tracing`, and entry replay
+    // would re-apply that residual.  Only an image whose banks were written
+    // for the Python frame is converted (`convert_and_run_from_pyjitpl`
+    // copies live `MIFrame` boxes).  A latch that crossed a failed helper
     // sub-walk is not such an image: `try_adopt_single_frame_blackhole`
     // already declines it (callee pc vs caller banks), and this
-    // predicate must not republish it.  An incomplete image is discarded
-    // (`discard_staged_abort`). Convert
+    // predicate must not republish it when heap-writing is zero.  An
+    // incomplete image is discarded (`discard_staged_abort`). Convert
     // (`run_python_portal_abort_blackhole` → `convert_and_run_from_pyjitpl`)
     // needs a published latch; without one the caller takes the
     // deadframe `resume_in_blackhole` (`resume.py` `blackhole_from_resumedata`).
@@ -7146,6 +7157,8 @@ fn run_perfn_walk<Sym: WalkSym>(
             error.leaves_complete_image()
                 || error.can_convert_seeded_inline()
                 || crate::jitcode_dispatch::multi_frame_blackhole_is_latched()
+                || (crate::jitcode_dispatch::abort_blackhole_latched()
+                    && crate::jitcode_dispatch::fbw_heap_writing_effect_count() > 0)
         }
         _ => crate::jitcode_dispatch::abort_blackhole_latched(),
     };
@@ -7603,9 +7616,7 @@ fn abort_permanent_owner(
         .binary_search_by_key(&(marker_jit_pc as u32), |&(off, _)| off)
         .ok()?;
     let py_pc = table[idx].1 as usize;
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const CodeObject
-    };
+    let raw_code = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     if raw_code.is_null() {
         return None;
     }
@@ -7863,8 +7874,7 @@ fn loop_inlines_abort_permanent_callee(
         for op in crate::jitcode_runtime::decoded_ops(body.code) {
             if op.opname == "abort_permanent" {
                 let raw_code =
-                    pyre_interpreter::w_code_get_ptr(callee_w_code as pyre_object::PyObjectRef)
-                        as *const CodeObject;
+                    pyre_interpreter::w_code_get_ptr(callee_w_code as pyre_object::PyObjectRef);
                 let callee_name = if raw_code.is_null() {
                     "<unknown>".to_string()
                 } else {
@@ -7903,8 +7913,7 @@ fn loop_inlines_abort_permanent_callee(
             // `abort_permanent` marker.
             return None;
         }
-        let raw_code = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const CodeObject;
+        let raw_code = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef);
         if raw_code.is_null() {
             return None;
         }
@@ -7989,8 +7998,7 @@ fn loop_inlines_abort_permanent_callee(
                 // the ordinary walk will encounter any marker it reaches.
                 return None;
             }
-            let raw = pyre_interpreter::w_code_get_ptr(code_ptr as pyre_object::PyObjectRef)
-                as *const CodeObject;
+            let raw = pyre_interpreter::w_code_get_ptr(code_ptr as pyre_object::PyObjectRef);
             if raw.is_null() {
                 continue;
             }
@@ -8375,8 +8383,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
             crate::jitcode_dispatch::census_record(e.variant_name());
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                 let raw_code =
-                    unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) }
-                        as *const CodeObject;
+                    unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
                 let (name, path) = if raw_code.is_null() {
                     ("<unknown>", "<unknown>")
                 } else {
@@ -8738,6 +8745,7 @@ mod tests {
             metadata,
             std::ptr::null(),
             false,
+            std::ptr::null(),
         );
         let wrapper = Box::new(crate::state::JitCode {
             index: -1,
@@ -9493,6 +9501,7 @@ mod tests {
             metadata,
             code_ptr,
             false,
+            code_ref,
         ));
         crate::state::install_jitcode_for(code_ref, pyjit);
         assert!(

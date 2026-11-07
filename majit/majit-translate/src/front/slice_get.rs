@@ -260,6 +260,10 @@ pub(crate) struct SliceGetSite {
     /// `<[*mut PyObject]>::get` returns `Option<&PyObjectRef>`: the successful
     /// list item and the null arm must both retain the `PyObject` ClassDef.
     pub payload_narrow_root: Option<String>,
+    /// Instance STRUCT of the built `Some`, when the dest TyRef is concrete.
+    pub some_vsid: Option<majit_ir::descr::StructId>,
+    /// Instance STRUCT of the built `None`.
+    pub none_vsid: Option<majit_ir::descr::StructId>,
 }
 
 /// Rewrite every recorded `<[T]>::get` call site into the bounds-checked
@@ -442,6 +446,7 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
             &site.option_owner,
             1,
             Some((&site.some_owner, elem, site.payload_ty.clone())),
+            site.some_vsid,
         );
         emit_narrow(graph, then_bb, some_var, &narrow_root)
     };
@@ -460,7 +465,8 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
         let null = graph.push_niche_null(else_bb, site.niche_null_cast.as_ref());
         emit_narrow(graph, else_bb, null, &site.payload_narrow_root)
     } else {
-        let none_var = emit_option_variant(graph, else_bb, &site.option_owner, 0, None);
+        let none_var =
+            emit_option_variant(graph, else_bb, &site.option_owner, 0, None, site.none_vsid);
         emit_narrow(graph, else_bb, none_var, &narrow_root)
     };
     let else_link_args = reproduce_exit_args(
@@ -529,6 +535,8 @@ mod tests {
             niche: false,
             niche_null_cast: None,
             payload_narrow_root: None,
+            some_vsid: None,
+            none_vsid: None,
         }
     }
 

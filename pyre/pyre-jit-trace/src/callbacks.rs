@@ -38,6 +38,12 @@ pub struct CallJitCallbacks {
     /// backend exception cells set — `pyjitpl.py execute_raised` writes
     /// only `metainterp.last_exc_value`, never the backend cells.
     pub drain_backend_jit_exc: fn(),
+    /// Forward `payload.w_code` of every jitcode owned by the running
+    /// `CodeWriter`'s `CallControl.jitcodes`. That dict is the owner while
+    /// the drain compiles a queued skeleton; `MetaInterpStaticData.jitcodes`
+    /// only sees the populated result after install. `walk_jitcode_code_roots_in`
+    /// calls this so one walker covers both owners.
+    pub walk_writer_jitcode_code_roots: fn(&mut dyn FnMut(&mut majit_ir::GcRef)),
 }
 
 // Safety: function pointers are 'static and never mutated after init

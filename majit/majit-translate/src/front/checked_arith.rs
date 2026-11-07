@@ -171,6 +171,8 @@ pub(crate) struct CheckedArithOkOrElseSite {
     pub result_suffix: String,
     pub ok_payload_ty: ValueType,
     pub err_payload_ty: ValueType,
+    pub ok_vsid: Option<majit_ir::descr::StructId>,
+    pub err_vsid: Option<majit_ir::descr::StructId>,
 }
 
 fn int_const(i: i64) -> LinkArg {
@@ -771,6 +773,7 @@ fn rewire_checked_arith_ok_or_else(
             normal_inputs[0].clone(),
             site.ok_payload_ty.clone(),
             &site.result_suffix,
+            site.ok_vsid,
         )
     };
     let normal_exit_args = saved_c_exit
@@ -813,6 +816,7 @@ fn rewire_checked_arith_ok_or_else(
             err_value,
             site.err_payload_ty,
             &site.result_suffix,
+            site.err_vsid,
         );
         let overflow_exit_args = saved_c_exit
             .args
@@ -1314,6 +1318,8 @@ mod tests {
             result_suffix: String::new(),
             ok_payload_ty: ValueType::Int,
             err_payload_ty: ValueType::Ref(None),
+            ok_vsid: None,
+            err_vsid: None,
         };
         let rewritten =
             rewire_checked_arith_call_sites(&mut g, std::slice::from_ref(&opt), &[paired]);
@@ -1436,6 +1442,9 @@ mod tests {
             error_ty: ValueType::Ref(None),
             niche: false,
             scalar_niche: false,
+            some_vsid: None,
+            ok_vsid: None,
+            err_vsid: None,
         };
         let try_rewritten =
             crate::front::result_exc::rewire_option_ok_or_else_try_sites(&mut g, &[try_site], true);
@@ -1466,6 +1475,8 @@ mod tests {
             result_suffix: String::new(),
             ok_payload_ty: ValueType::Int,
             err_payload_ty: ValueType::Ref(None),
+            ok_vsid: None,
+            err_vsid: None,
         };
         let rewritten =
             rewire_checked_arith_call_sites(&mut g, std::slice::from_ref(&opt), &[paired]);
@@ -1600,6 +1611,8 @@ mod tests {
             result_suffix: String::new(),
             ok_payload_ty: ValueType::Int,
             err_payload_ty: ValueType::Ref(None),
+            ok_vsid: None,
+            err_vsid: None,
         };
         let rewritten =
             rewire_checked_arith_call_sites(&mut g, std::slice::from_ref(&opt), &[paired]);
@@ -1724,6 +1737,8 @@ mod tests {
             result_suffix: String::new(),
             ok_payload_ty: ValueType::Int,
             err_payload_ty: ValueType::Ref(None),
+            ok_vsid: None,
+            err_vsid: None,
         };
         let (site, idx) = find_ok_or_else_continuation(&g, c.0, &opt_c, &[paired])
             .expect("the reminted call is still the recorded continuation");

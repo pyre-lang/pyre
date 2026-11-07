@@ -432,9 +432,17 @@ pub fn enter_runtime_thread() {
 }
 
 /// Get the current eval function (JIT-aware if registered, plain otherwise).
-/// Respects the force-plain-eval mode.
+/// Respects the force-plain-eval mode in the interpreter.
 #[inline]
 pub fn get_eval_fn() -> EvalFn {
+    // `we_are_jitted` is `_we_are_jitted` (`rlib/jit.py`): the interpreter
+    // reads false, jitcode folds true (`fold_we_are_jitted_calls`). The
+    // recorded EvalFn is therefore always `current_eval_fn_addr` (the portal
+    // `EVAL_OVERRIDE`, `guess_call_kind` `'recursive'` via
+    // `jitdriver_sd_from_portal_runner_ptr`). `force_plain_eval` stays an
+    // interpreter-only switch so blackhole / bridge residual execute does
+    // not re-enter compiled code; it must not specialize the helper body.
+    //
     // The thread-local read stays in `is_force_plain_eval`. Inlined here it
     // is a call whose target is the `FORCE_PLAIN_EVAL` static, a symbolic
     // path the portal walk cannot execute.
@@ -442,12 +450,11 @@ pub fn get_eval_fn() -> EvalFn {
     // Both arms produce the address word and one transmute follows: a
     // function item in one arm and a transmuted word in the other merge as
     // `Ptr(Func) ∪ Integer`, which the annotator has no arm for.
-    let addr = if is_force_plain_eval() {
+    let addr = if majit_rlib::jit::we_are_jitted() {
+        current_eval_fn_addr()
+    } else if is_force_plain_eval() {
         plain_eval_fn_addr()
     } else {
-        // `EVAL_OVERRIDE` is a `OnceLock` static. Reading it in the portal
-        // graph is a symbolic path. The word comes back from a residual
-        // and is the registered eval function.
         current_eval_fn_addr()
     };
     unsafe { std::mem::transmute::<usize, EvalFn>(addr) }
@@ -460,7 +467,18 @@ pub fn plain_eval_fn_addr() -> usize {
 }
 
 /// Address of the process eval function (`EVAL_OVERRIDE`, else plain).
-#[majit_macros::dont_look_inside]
+///
+/// `rlib/jit.py` `@elidable` (`_elidable_function_`) plus
+/// `call.py getcalldescr` `EF_ELIDABLE_CANNOT_RAISE`: the OnceLock is
+/// written once at startup (`register_eval_override`) and the helper
+/// cannot raise. `function.py funccall` calls `new_frame.run`
+/// (`run._always_inline_`) which inlines into the portal
+/// `execute_frame`; the jitted path therefore sees no residual eval-fn
+/// getter. `we_are_jitted` already folds `get_eval_fn` onto this helper,
+/// so the helper itself must be the elidable residual — a
+/// `dont_look_inside` `EF_CAN_RAISE` call would `may_force` every
+/// virtual (the callee `PyFrame`, its vref) before the portal enter.
+#[majit_macros::elidable_cannot_raise]
 pub fn current_eval_fn_addr() -> usize {
     EVAL_OVERRIDE.get().copied().unwrap_or(eval_frame_plain) as usize
 }
@@ -1294,9 +1312,7 @@ fn prepare_user_call(
     let mut w_code = unsafe { crate::getcode(callable) };
     let mut w_globals = unsafe { function_get_globals_obj(callable) };
     let mut closure = unsafe { function_get_closure(callable) };
-    let func_code = unsafe {
-        crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
-    };
+    let func_code = unsafe { crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     let code_ref = unsafe { &*func_code };
     let final_args = pyre_object::with_roots!(callable, closure, w_code, w_globals => fill_user_function_args(callable, code_ref, args, methodcall))?;
     let func_frame = pyre_object::with_roots!(callable => make_user_call_frame(w_code, &final_args, w_globals, execution_context, closure))?;
@@ -1427,9 +1443,7 @@ pub fn call_user_function_resolved(
     let w_code = unsafe { crate::getcode(callable) };
     let w_globals = unsafe { function_get_globals_obj(callable) };
     let closure = unsafe { function_get_closure(callable) };
-    let func_code = unsafe {
-        crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
-    };
+    let func_code = unsafe { crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     let code_ref = unsafe { &*func_code };
 
     // Generator function
@@ -2862,9 +2876,7 @@ pub fn call_user_function_plain_with_ctx(
     let mut w_code = unsafe { crate::getcode(callable) };
     let mut w_globals = unsafe { function_get_globals_obj(callable) };
     let mut closure = unsafe { function_get_closure(callable) };
-    let func_code = unsafe {
-        crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
-    };
+    let func_code = unsafe { crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     let code_ref = unsafe { &*func_code };
     let final_args = pyre_object::with_roots!(callable, closure, w_code, w_globals => fill_user_function_args(callable, code_ref, args, false))?;
 
@@ -4349,10 +4361,7 @@ fn call_with_kwargs_in_ctx_impl(
         // For user functions: resolve kwargs to parameter slots
         {
             let w_code = unsafe { crate::getcode(current_callable()) };
-            let code = unsafe {
-                &*(crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                    as *const crate::CodeObject)
-            };
+            let code = unsafe { &*(crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef)) };
             let total_params = (code.arg_count + code.kwonlyarg_count) as usize;
             let n_pos_params = code.arg_count as usize;
             let has_varkw = code.flags.contains(crate::CodeFlags::VARKEYWORDS);
@@ -4666,8 +4675,7 @@ fn call_with_kwargs_in_ctx_impl(
                     unreachable!("varkw publishes a slot or the other arm keeps the word")
                 }
             };
-            let code_flags =
-                unsafe { (*(crate::w_code_get_ptr(w_code_now) as *const crate::CodeObject)).flags };
+            let code_flags = unsafe { (*(crate::w_code_get_ptr(w_code_now))).flags };
             let mut func_frame = crate::pyframe::FrameBox::new(
                 crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
                     w_code_now as *const (),
@@ -4838,9 +4846,9 @@ pub(crate) fn call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) ->
 /// wraps it for callers that expect a bare `PyObjectRef` and stash the
 /// error in `PENDING_CALL_ERROR` instead.
 ///
-/// Residual (`look_inside_graph` sees the `args` loop). The word-ABI
-/// trampoline is `getfunctionptr` (`get_jitcode_calldescr`).
-#[majit_macros::getfunctionptr]
+/// Look-inside: `baseobjspace.py call_function` has no JIT hint;
+/// RPython specializes `*args_w` per arity, so `look_inside_graph` accepts it.
+#[majit_macros::unroll_safe]
 pub fn call_function_impl_result(
     callable: PyObjectRef,
     args: &[PyObjectRef],
@@ -5749,9 +5757,7 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
     let mut w_code = unsafe { crate::getcode(func) };
     let mut w_globals = unsafe { function_get_globals_obj(func) };
     let mut closure = unsafe { function_get_closure(func) };
-    let func_code = unsafe {
-        crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
-    };
+    let func_code = unsafe { crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     let exec_ctx = take_last_exec_ctx();
 
     let code_ref = unsafe { &*func_code };
@@ -5859,9 +5865,7 @@ fn call_user_function_resolved_frameless(
     let w_code = unsafe { crate::getcode(func) };
     let w_globals = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
-    let func_code = unsafe {
-        crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
-    };
+    let func_code = unsafe { crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     let exec_ctx = take_last_exec_ctx();
     let code_ref = unsafe { &*func_code };
 
@@ -7573,9 +7577,7 @@ fn build_class_inner(
     let w_code = unsafe { crate::getcode(body_fn) };
     let w_globals = unsafe { function_get_globals_obj(body_fn) };
     let closure = unsafe { function_get_closure(body_fn) };
-    let func_code = unsafe {
-        crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
-    };
+    let func_code = unsafe { crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
     // Debug: dump code object for __class__ cell investigation. Reads the real
     // process env + writes real stderr, so keep it out of the sandbox build.
     #[cfg(not(feature = "sandbox"))]

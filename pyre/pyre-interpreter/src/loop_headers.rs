@@ -126,43 +126,14 @@ pub fn target_dominates(succ: &[Vec<usize>], target_pc: usize, source_pc: usize)
     !seen[source_pc]
 }
 
-/// True when a backward jump returns from an exception handler to earlier
-/// code rather than closing a loop.
-///
-/// `pypy/module/pypyjit/interp_jit.py` `PyFrame.jump_absolute` calls
-/// `can_enter_jit` on every backward `JUMP_ABSOLUTE`. Remaining-sibling
-/// after `except` is `JUMP_FORWARD` on PyPy (`pyopcode.py` `JUMP_FORWARD`)
-/// and never reaches `jump_absolute`. 3.15 places the handler at the end
-/// of the bytecode, so that rejoin is `JUMP_BACKWARD_NO_INTERRUPT` — a
-/// backward offset whose target does not dominate the jump (the handler
-/// is reached through the exception edge). SEND/YIELD await loops use
-/// the same opcode with a dominating target and still tick.
-/// `find_loop_header_pcs` already uses this domination test;
-/// `jump_absolute` on a true loop back-edge (`JUMP_BACKWARD`) still
-/// always ticks.
-///
-/// Residual like `code_pc_is_loop_header`: the CFG walk is a predicate the
-/// fnaddr table can name. Leaving it open pulled the no-interrupt arm of
-/// `execute_jump_backward` into the two-phase Skip set.
+/// Uncached form of `code_jump_is_handler_only` used by static analysis.
 #[majit_macros::dont_look_inside]
 pub fn backward_jump_is_handler_only_target(
     code: &CodeObject,
     source_pc: usize,
     target_pc: usize,
 ) -> bool {
-    if let Some(info) = handler_only_info_for(code) {
-        return info
-            .handler_only_edges
-            .binary_search(&(source_pc, target_pc))
-            .is_ok();
-    }
     !target_dominates(&code_successors(code), target_pc, source_pc)
-}
-
-fn handler_only_info_for(code: &CodeObject) -> Option<&'static LoopHeaderInfo> {
-    let w_code = crate::pycode::live_code_wrapper(code as *const CodeObject as *const ());
-    let info = ensure_loop_header_info(w_code)?;
-    Some(unsafe { &*info })
 }
 
 /// Scan `code` for JUMP_BACKWARD targets — the PCs where
@@ -279,6 +250,38 @@ pub fn code_pc_is_loop_header(w_code: pyre_object::PyObjectRef, pc: usize) -> bo
     };
     let info = unsafe { &*info };
     info.header_pcs.binary_search(&pc).is_ok()
+}
+
+/// True when the backward jump `(source_pc, target_pc)` on `w_code` is a
+/// remaining-sibling handler rejoin rather than a loop back-edge.
+///
+/// `pypy/module/pypyjit/interp_jit.py` `PyFrame.jump_absolute` calls
+/// `can_enter_jit` on every backward `JUMP_ABSOLUTE`. Remaining-sibling
+/// after `except` is `JUMP_FORWARD` on PyPy (`pyopcode.py` `JUMP_FORWARD`)
+/// and never reaches `jump_absolute`. 3.15 places the handler at the end
+/// of the bytecode, so that rejoin is `JUMP_BACKWARD_NO_INTERRUPT` — a
+/// backward offset whose target does not dominate the jump (the handler
+/// is reached through the exception edge). SEND/YIELD await loops use
+/// the same opcode with a dominating target and still tick.
+/// `find_loop_header_pcs` already uses this domination test;
+/// `jump_absolute` on a true loop back-edge (`JUMP_BACKWARD`) still
+/// always ticks.
+///
+/// The edges are the cached scan on `PyCode.loop_header_info`. A null
+/// wrapper, or a null or unaligned `code_ptr`, answers false.
+#[majit_macros::dont_look_inside]
+pub fn code_jump_is_handler_only(
+    w_code: pyre_object::PyObjectRef,
+    source_pc: usize,
+    target_pc: usize,
+) -> bool {
+    let Some(info) = ensure_loop_header_info(w_code) else {
+        return false;
+    };
+    let info = unsafe { &*info };
+    info.handler_only_edges
+        .binary_search(&(source_pc, target_pc))
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -422,6 +425,10 @@ mod tests {
             let Some(target) = backward_jump_target(&code, pc, instr, op_arg) else {
                 continue;
             };
+            assert_eq!(
+                code_jump_is_handler_only(w_code, pc, target),
+                backward_jump_is_handler_only_target(&code, pc, target),
+            );
             match instr {
                 Instruction::JumpBackwardNoInterrupt { .. } => {
                     assert!(
@@ -452,6 +459,7 @@ mod tests {
                 _ => {}
             }
         }
+        assert!(!code_jump_is_handler_only(std::ptr::null_mut(), 0, 0));
         assert!(
             no_interrupt_handler_only >= 1,
             "expected a remaining-sibling JUMP_BACKWARD_NO_INTERRUPT"
@@ -469,6 +477,7 @@ mod tests {
         let code = first_function_code(
             "def f(n):\n    acc = 0\n    i = 0\n    while i < n:\n        try:\n            acc += 1\n        except ValueError:\n            acc += 2\n        i += 1\n    return acc\n",
         );
+        let w_code = wrapper_for(&code);
         let mut scan_state = OpArgState::default();
         let mut saw_handler_only = false;
         let mut saw_while_backedge = false;
@@ -477,6 +486,10 @@ mod tests {
             let Some(target) = backward_jump_target(&code, pc, instr, op_arg) else {
                 continue;
             };
+            assert_eq!(
+                code_jump_is_handler_only(w_code, pc, target),
+                backward_jump_is_handler_only_target(&code, pc, target),
+            );
             match instr {
                 Instruction::JumpBackwardNoInterrupt { .. } => {
                     assert!(backward_jump_is_handler_only_target(&code, pc, target));
@@ -489,6 +502,7 @@ mod tests {
                 _ => {}
             }
         }
+        assert!(!code_jump_is_handler_only(std::ptr::null_mut(), 0, 0));
         assert!(saw_handler_only);
         assert!(saw_while_backedge);
         assert_eq!(find_loop_header_pcs(&code).len(), 1);

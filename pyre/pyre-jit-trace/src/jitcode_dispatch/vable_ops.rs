@@ -1653,7 +1653,9 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
     match dst_bank {
         'i' => write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?,
-        'r' => write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?,
+        'r' => {
+            write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
+        }
         'f' => {
             let len = ctx.registers_f.len();
             let _ = ctx
@@ -1788,23 +1790,6 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     let encoded_captured =
         vable_value_concrete(code, op, 2, ctx, value_bank, encoded_value).unwrap_or(Value::Void);
     let mut store_root = VableStoreRoot::capture(encoded_captured);
-    // Pin a TOS-recovered box's concrete now; recapturing the stamp after
-    // `walker_promote_vable_array_index` is a from-space copy
-    // (`fwd=false free=true`).
-    if encoded_value.is_none()
-        && value_bank == 'r'
-        && ctx.vstack_valid
-        && let Some(&tos) = ctx.frame_state.borrow().vstack_boxes.last()
-        && !tos.is_none()
-    {
-        if let Some(tos_c) = ctx
-            .trace_ctx
-            .lookup_opref_concrete(tos)
-            .or_else(|| ctx.trace_ctx.concrete_of_opref(tos))
-        {
-            store_root.recapture(tos_c);
-        }
-    }
     let mut value = encoded_value;
     // A STORE_FAST (`index < nlocals`) pops the operand-stack TOS and writes
     // it into a local slot.  When the popped value lives in an operand-stack
@@ -1819,16 +1804,42 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // (`GuardSnapshotVableUntyped`).  Gate on a live mirror + a Ref store into
     // the local region so a genuine null / non-mirrored slot keeps the legacy
     // read.
-    if value.is_none()
-        && value_bank == 'r'
-        && ctx.vstack_valid
-        && let Some(nlocals) = active_frame_nlocals(ctx)
-        && index_value >= 0
-        && index_value < nlocals
-        && let Some(&tos) = ctx.frame_state.borrow().vstack_boxes.last()
-        && !tos.is_none()
-    {
-        value = tos;
+    //
+    // A stack-region store (`index >= nlocals`) is `pyframe.pushvalue`.
+    // GET_ITER's iterator push follows a looked-inside residual whose dest
+    // can still read `NONE` when the helper return was Converted; leftover
+    // TOS (`indices` after `[0]*r`, `range` from LOAD_GLOBAL) is then the
+    // last `vstack_boxes` occupant. `vstack_last_ref` is the opcode result
+    // `write_ref_reg` just stamped (`make_result_of_lastop`).
+    if value.is_none() && value_bank == 'r' && ctx.vstack_valid {
+        let last_ref = ctx.frame_state.borrow().vstack_last_ref;
+        let tos = ctx
+            .frame_state
+            .borrow()
+            .vstack_boxes
+            .last()
+            .copied()
+            .filter(|tos| !tos.is_none());
+        let nlocals = active_frame_nlocals(ctx);
+        let stack_region = nlocals.is_some_and(|n| index_value >= 0 && index_value >= n);
+        let recovered =
+            if stack_region && last_ref != OpRef::NONE && !opref_is_null_const_ptr(last_ref) {
+                Some(last_ref)
+            } else {
+                tos
+            };
+        if let Some(recovered) = recovered {
+            if let Some(recovered_c) = ctx
+                .trace_ctx
+                .lookup_opref_concrete(recovered)
+                .or_else(|| ctx.trace_ctx.concrete_of_opref(recovered))
+            {
+                store_root.recapture(recovered_c);
+            }
+            if stack_region || nlocals.is_some_and(|n| index_value >= 0 && index_value < n) {
+                value = recovered;
+            }
+        }
     }
     let captured =
         vable_effective_value_concrete(code, op, 2, ctx, value_bank, encoded_value, value)

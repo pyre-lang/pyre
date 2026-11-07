@@ -1125,6 +1125,10 @@ pub struct SemanticProgram {
     /// the body again. `populate_call_registry_from_call_graphs` reads it.
     pub atomic_load_decls:
         Vec<crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl>,
+    /// Live assembler layout table for this translation (`descr.py`
+    /// `get_size_descr` cache[STRUCT]). One `Rc` per translation, shared
+    /// with every crate's lowering and with `CallControl`.
+    pub struct_layouts: crate::codewriter::call::StructLayoutTable,
 }
 
 /// Graph lookup table built from a `SemanticProgram` so registration and

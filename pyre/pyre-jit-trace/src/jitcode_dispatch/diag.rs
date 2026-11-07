@@ -170,33 +170,25 @@ pub(crate) fn resolve_resume_coord_py_pc(
             if pjc.code_ptr.is_null() {
                 return None;
             }
-            // #73 Slice 4: read the forward after-residual fallthrough twin.
-            // The containing lookup survives only for the empty-twin class
-            // (populated code with no Python map) and as the audit oracle.
-            let legacy = || {
-                let call_py_pc =
-                    crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc)
-                        as usize;
-                let code = unsafe { &*pjc.code_ptr };
-                crate::pyjitpl::semantic_fallthrough_pc(code, call_py_pc) as u32
-            };
-            let twin = pjc
-                .after_residual_fallthrough_py_pc_populated()
-                .then(|| pjc.after_residual_fallthrough_py_pc_for_jitcode_pc(call_jit_pc))
-                .flatten();
-            match twin {
-                Some(ft) => {
-                    if pcmap_afterresidual_audit_enabled() {
-                        assert_eq!(
-                            ft,
-                            legacy(),
-                            "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: parent-resume fallthrough-py twin diverged at jit_pc {call_jit_pc}"
-                        );
-                    }
-                    Some(ft)
+            let call_py_pc =
+                crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc)
+                    as usize;
+            let code = unsafe { &*pjc.code_ptr };
+            let resume = crate::pyjitpl::resume_py_pc_after_python_call(code, call_py_pc) as u32;
+            if pcmap_afterresidual_audit_enabled() {
+                let twin = pjc
+                    .after_residual_fallthrough_py_pc_populated()
+                    .then(|| pjc.after_residual_fallthrough_py_pc_for_jitcode_pc(call_jit_pc))
+                    .flatten();
+                let legacy = crate::pyjitpl::semantic_fallthrough_pc(code, call_py_pc) as u32;
+                if let Some(ft) = twin {
+                    assert_eq!(
+                        ft, legacy,
+                        "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: parent-resume fallthrough-py twin diverged at jit_pc {call_jit_pc}"
+                    );
                 }
-                None => Some(legacy()),
             }
+            Some(resume)
         }
     }
 }
@@ -375,7 +367,6 @@ spec_folds! {
     BinaryOpDescent      => ("binary_op_descent",        "residual_call,inline_call", "-"),
     CompareOpDescent     => ("compare_op_descent",       "residual_call", "-"),
     Setslice             => ("setslice",                 "residual_call", "-"),
-    GetIter              => ("get_iter",                 "residual_call", "-"),
     ForIterNext          => ("for_iter_next",            "residual_call", "-"),
     MakeFunction         => ("make_function",            "residual_call", "-"),
     Newtuple             => ("newtuple",                 "residual_call", "-"),
@@ -385,7 +376,6 @@ spec_folds! {
     BuiltinIsinstance    => ("builtin_isinstance",       "residual_call", "-"),
     BuiltinTypeGetattr   => ("builtin_type_getattr",     "residual_call", "-"),
     BuiltinGetattr       => ("builtin_getattr",          "residual_call", "-"),
-    BuiltinRange         => ("builtin_range",            "residual_call", "-"),
     BuiltinLocals        => ("builtin_locals",           "residual_call", "-"),
     SysGetframe          => ("sys_getframe",             "residual_call", "-"),
     SysExcInfo           => ("sys_exc_info",             "residual_call", "-"),

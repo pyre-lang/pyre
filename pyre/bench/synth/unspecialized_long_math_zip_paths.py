@@ -1,8 +1,8 @@
 # pyre-check: requires-modules=math
 # Throughput over paths that have no hand fold: `zip` over two tuples
-# (positional and `strict=True`), whose step `W_Zip.next_w` stays a residual
-# call, `bigint ** int` through the descended `long_pow` body, and the
-# descended `math.frexp` / `math.ldexp` gateways.
+# (positional and `strict=True`) through `W_Zip.next_w` /
+# `zip_two_tuple_next`, `bigint ** int` through the descended `long_pow`
+# body, and the descended `math.frexp` / `math.ldexp` gateways.
 #
 # Every result is reduced to an integer checksum: the float legs go through
 # `int(round(x * 1e6))` so the comparison cannot turn into a float-formatting

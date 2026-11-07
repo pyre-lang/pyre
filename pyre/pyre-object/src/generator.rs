@@ -247,6 +247,19 @@ pub unsafe fn is_generator(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &GENERATOR_TYPE) }
 }
 
+/// `generator.py GeneratorIterator.descr__iter` — `return self`.
+///
+/// `#[inline(never)]` is load-bearing: rustc otherwise folds this body into
+/// `space.iter` and the GET_ITER descent has no graph to look up
+/// (`specialize.rs GENERATOR_ITER_DESCENT`).
+///
+/// # Safety
+/// `obj` must point to a valid generator.
+#[inline(never)]
+pub unsafe fn w_generator_iter(obj: PyObjectRef) -> PyObjectRef {
+    obj
+}
+
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime

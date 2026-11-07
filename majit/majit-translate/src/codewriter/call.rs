@@ -3864,6 +3864,10 @@ pub struct CallControl {
     /// `PipelineConfig::helper_graphs` — host-declared BFS seeds beside the
     /// portals (`call.py inline_calls_to`).
     helper_seed_graphs: Vec<CallPath>,
+    /// `register_eval_override`'s `FnDef` argument graphs. After
+    /// `rewrite_jit_merge_point`, those graphs become origportal-for-EvalFn
+    /// stubs (`direct_call` of `portal_runner_ptr`).
+    eval_override_graphs: Vec<CallPath>,
 
     /// RPython: `JitDriverStaticData` — metadata for each jitdriver.
     /// `jitdrivers_sd[i]` holds the green/red arg layout for driver i.
@@ -4318,7 +4322,7 @@ fn is_known_by_value_struct(
         || type_name.starts_with("Box<")
         || type_name.starts_with("Arc<")
         || type_name.starts_with("Rc<")
-        || type_name.starts_with("Vec<")
+        || crate::vec_layout::field_layout_is_inline_vec(type_name)
         || type_name.starts_with("Option<")
         || type_name == "String"
         || atomic_wrapper_leaf(type_name, &HashSet::new()).is_some()
@@ -4761,6 +4765,7 @@ impl CallControl {
             bfs_policy_state: crate::policy::JitPolicyState::new(),
             bfs_look_inside_function: Box::new(|_| true),
             helper_seed_graphs: Vec::new(),
+            eval_override_graphs: Vec::new(),
             jitdrivers_sd: Vec::new(),
             jitcodes: indexmap::IndexMap::new(),
             function_fnaddrs: HashMap::new(),
@@ -4805,6 +4810,15 @@ impl CallControl {
             bookkeeper: std::cell::RefCell::new(None),
         };
         cc.stamp_ll_math_llexternal_canraise();
+        cc
+    }
+
+    /// Adopt a live layout table. `new()` writes no layouts, so replacing
+    /// the empty `Rc` here is the first write. Tests that call [`Self::new`]
+    /// keep a fresh table.
+    pub fn with_struct_layouts(handle: StructLayoutTable) -> Self {
+        let mut cc = Self::new();
+        cc.struct_layouts = handle;
         cc
     }
 
@@ -4862,6 +4876,30 @@ impl CallControl {
         field_name: &str,
     ) -> Option<crate::model::ImmutableRank> {
         let owner = owner_root?;
+        if let Some(rank) = self.rank_in(owner, field_name) {
+            return Some(rank);
+        }
+        // `rclass.py _parse_field_list` keys the declaration on the class
+        // object. A marker const's harvest key is the const leaf
+        // (`CodeObject`); the field-read `owner_root` is the interned
+        // path (`bytecode::CodeObject`). `canonical_struct_name` is that
+        // class object once `STRUCT_ORIGIN_REGISTRY` is live.
+        let canon = majit_ir::descr::canonical_struct_name(owner);
+        if canon != owner
+            && let Some(rank) = self.rank_in(&canon, field_name)
+        {
+            return Some(rank);
+        }
+        let leaf = majit_ir::descr::class_root_leaf(owner);
+        let leaf = leaf.split('<').next().unwrap_or(leaf);
+        if leaf != owner && leaf != canon {
+            self.rank_in(leaf, field_name)
+        } else {
+            None
+        }
+    }
+
+    fn rank_in(&self, owner: &str, field_name: &str) -> Option<crate::model::ImmutableRank> {
         self.immutable_fields_by_struct
             .get(owner)
             .and_then(|fields| {
@@ -4969,10 +5007,12 @@ impl CallControl {
         struct_id: majit_ir::descr::StructId,
         layout: StructLayout,
     ) {
-        self.struct_layouts
-            .borrow_mut()
-            .insert(struct_id, std::rc::Rc::new(layout));
-        self.clear_fielddescrof_memo();
+        let mut table = self.struct_layouts.borrow_mut();
+        if let std::collections::hash_map::Entry::Vacant(entry) = table.entry(struct_id) {
+            entry.insert(std::rc::Rc::new(layout));
+            drop(table);
+            self.clear_fielddescrof_memo();
+        }
     }
 
     /// The layout table the annotator seeds from. Same `Rc` `set_struct_layout`
@@ -5031,6 +5071,17 @@ impl CallControl {
     pub fn struct_layout_for(&self, name: &str) -> Option<std::rc::Rc<StructLayout>> {
         let sid = majit_ir::descr::struct_id_for_name(name)?;
         self.layout_of(sid, name)
+    }
+
+    /// The layout stored under `sid`. No template fallback and no
+    /// positional synthesis: a missing instance is missing, matching
+    /// `descr.py` `get_field_descr(STRUCT, fieldname)` keyed on that
+    /// STRUCT object.
+    pub fn struct_layout_for_id(
+        &self,
+        sid: majit_ir::descr::StructId,
+    ) -> Option<std::rc::Rc<StructLayout>> {
+        self.struct_layouts.borrow().get(&sid).cloned()
     }
 
     /// The layout stored under `sid`, whose spelling is `name`. A
@@ -5772,7 +5823,12 @@ impl CallControl {
             })
         };
         let concrete_offset = owner_id.and_then(offset_of);
-        let template_offset = if concrete_offset.is_none() {
+        // `get_field_descr(STRUCT, fieldname)` does not reuse another
+        // STRUCT's token. A distinct `owner_id` is its own STRUCT; the
+        // template spelling's offset is that other type.
+        let template_offset = if concrete_offset.is_none()
+            && owner_id.is_none_or(|id| registry_struct_id == Some(id))
+        {
             registry_struct_id.and_then(offset_of)
         } else {
             None
@@ -6598,6 +6654,17 @@ impl CallControl {
         self.helper_seed_graphs.push(path);
     }
 
+    /// The EvalFn-family override graphs `discover_eval_override_graphs`
+    /// harvested. Empty when this translation has no `register_eval_override`.
+    pub fn set_eval_override_graphs(&mut self, paths: Vec<CallPath>) {
+        self.eval_override_graphs = paths;
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn eval_override_graphs(&self) -> &[CallPath] {
+        &self.eval_override_graphs
+    }
+
     pub fn register_function_fnaddr(&mut self, path: CallPath, fnaddr: i64) {
         self.function_fnaddrs.insert(path, fnaddr);
     }
@@ -6788,17 +6855,63 @@ impl CallControl {
         }
     }
 
+    /// Register an inherent method under the owner-leaf CallPath.
+    ///
+    /// rustc's method-call rule (Reference, "Method-call expressions"):
+    /// `Type::method(..)` / `value.method()` picks the inherent method
+    /// before any trait method of the same name. Owner-leaf therefore
+    /// binds the inherent graph; a trait-impl that occupied the slot is
+    /// replaced. Upstream `codewriter/call.py CallControl.get_jitcode(graph)`
+    /// keys by the graph object; the CallPath must be injective over the
+    /// graphs a direct call can name.
+    pub fn register_inherent_method(
+        &mut self,
+        impl_type: &str,
+        method_name: &str,
+        graph: impl Into<GraphSource>,
+    ) {
+        self.register_function_graph(CallPath::for_impl_method(impl_type, method_name), graph);
+    }
+
+    /// Register a concrete trait-impl method under its trait-impl identity
+    /// (`CallPath::for_trait_impl_method`, `<Impl#{id}>`).
+    ///
+    /// When `fill_owner_leaf` is set, owner-leaf is filled only if vacant:
+    /// an inherent of this leaf on this owner already occupies it. The
+    /// `dyn Trait` PBC family lists the identity path, never the inherent
+    /// that may sit at owner-leaf. Primitive `Self` (no ADT owner) leaves
+    /// owner-leaf unset so two widths do not collapse onto one path.
+    pub fn register_trait_impl_method(
+        &mut self,
+        impl_type: &str,
+        impl_id: u64,
+        method_name: &str,
+        trait_root: Option<&str>,
+        fill_owner_leaf: bool,
+        graph: impl Into<GraphSource>,
+    ) {
+        let graph = graph.into();
+        let identity = CallPath::for_trait_impl_method(impl_type, impl_id, method_name);
+        self.register_function_graph(identity.clone(), graph.clone());
+        if let Some(trait_root) = trait_root {
+            self.register_trait_family_path(method_name, trait_root, identity);
+        }
+        if fill_owner_leaf {
+            let owner_leaf = CallPath::for_impl_method(impl_type, method_name);
+            if !self.function_graphs.names_funcobj(&owner_leaf) {
+                self.register_function_graph(owner_leaf, graph);
+            }
+        }
+    }
+
     /// Add one concrete graph to the PBC row for an indirect trait call,
     /// without also making it a name-based concrete-method candidate.
     ///
     /// RPython keeps these two relations separate: `FunctionReprBase.call`
     /// obtains `c_graphs` from `row_of_graphs.values()`, while concrete
-    /// method lookup follows the receiver's class/MRO.  Pyre's concrete
-    /// trait-impl methods are registered through the inherent-method path to
-    /// preserve that receiver lookup, but they still belong to the PBC row
-    /// used by a `dyn Trait` vtable call.  Required trait methods have no
-    /// default graph, so omitting this membership makes their otherwise
-    /// closed family look unknown to every graph analyzer.
+    /// method lookup follows the receiver's class/MRO.  Required trait
+    /// methods have no default graph, so omitting this membership makes
+    /// their otherwise closed family look unknown to every graph analyzer.
     pub fn register_trait_family_member(
         &mut self,
         method_name: &str,
@@ -6962,7 +7075,30 @@ impl CallControl {
     /// keeping the assignment separate mirrors that construction order and
     /// prevents graph identity from standing in for runner identity.
     pub fn set_jitdriver_portal_runner(&mut self, index: usize, runner: Option<CallPath>) {
-        self.jitdrivers_sd[index].portal_runner = runner;
+        self.jitdrivers_sd[index].portal_runner = runner.clone();
+        if let Some(runner) = runner {
+            self.stamp_portal_runner_dont_look_inside(&runner);
+        }
+    }
+
+    /// `warmspot.py helper_func` annotates `ll_portal_runner` from the FUNC
+    /// lltype (`annhelper.getgraph(func, args_s, s_result)`), so
+    /// `default_specialize` never sees the caller's `access_directly` frame.
+    /// Pyre harvests the runner as an ordinary graph; `_jit_look_inside_ =
+    /// False` is the analogue so `default_specialize` strips the flag instead
+    /// of minting an AccessDirect cachedgraph outside `jit_graphs`
+    /// (`check_access_directly_sanity`).
+    fn stamp_portal_runner_dont_look_inside(&mut self, runner: &CallPath) {
+        let mut paths = vec![runner.clone()];
+        let resolved = self.resolved_callable_path(runner);
+        if resolved != *runner {
+            paths.push(resolved);
+        }
+        for path in paths {
+            if let Some(func) = self.function_graphs.func_mut(&path) {
+                func.jit_look_inside = Some(false);
+            }
+        }
     }
 
     /// warmspot.py `jd.virtualizable_info = vinfos[VTYPEPTR]`.
@@ -7211,13 +7347,43 @@ impl CallControl {
 
     /// call.py `jitdriver_sd_from_portal_runner_ptr(funcptr)`.
     ///
+    /// `funcptr is jd.portal_runner_ptr` is function-object identity.
+    /// Harvest may spell the same funcobj with a defining-crate prefix,
+    /// and an AccessDirect cachedgraph (if one were minted) is still
+    /// that funcptr. All of those must classify `'recursive'` so
+    /// origportal emits `recursive_call_*`. `ensure_access_directly_copy`
+    /// does not mint that cachedgraph: portal_runner_ptr is residual
+    /// (`guess_call_kind` Recursive) and the copy would sit outside
+    /// `jit_graphs` (`check_access_directly_sanity`).
     pub fn jitdriver_sd_from_portal_runner_ptr(
         &self,
         path: &CallPath,
     ) -> Option<&JitDriverStaticData> {
-        self.jitdrivers_sd
-            .iter()
-            .find(|sd| sd.portal_runner.as_ref() == Some(path))
+        self.jitdrivers_sd.iter().find(|sd| {
+            sd.portal_runner
+                .as_ref()
+                .is_some_and(|runner| self.portal_runner_ptr_is(path, runner))
+        })
+    }
+
+    /// `funcptr is jd.portal_runner_ptr` for one driver's runner spelling.
+    fn portal_runner_ptr_is(&self, path: &CallPath, runner: &CallPath) -> bool {
+        let origin = access_directly_origin_path(path).unwrap_or_else(|| path.clone());
+        if path == runner || &origin == runner || &access_directly_path(runner) == path {
+            return true;
+        }
+        let runner_resolved = self.resolved_callable_path(runner);
+        if origin == runner_resolved || path == &runner_resolved {
+            return true;
+        }
+        if self.resolved_callable_path(&origin) == runner_resolved {
+            return true;
+        }
+        // `JitDriverSpec.portal_runner` is crate-stripped (`call_jit::…`);
+        // a retargeted site may keep the harvested `pyre_jit::call_jit::…`.
+        runner.segments.len() >= 2
+            && (origin.segments.ends_with(runner.segments.as_slice())
+                || path.segments.ends_with(runner.segments.as_slice()))
     }
 
     /// `call.py jitdriver_sd_from_portal_runner_ptr(funcptr) is not None`.
@@ -7676,6 +7842,16 @@ impl CallControl {
     /// backs a residual call in upstream only if the graph is not looked
     /// inside.
     fn ensure_access_directly_copy(&mut self, origin: &CallPath) -> Option<CallPath> {
+        // Origportal / EvalFn stubs `direct_call` portal_runner_ptr with
+        // the live frame. That frame is often `access_directly` (portal
+        // reds; callers of EvalFn). An AccessDirect cachedgraph of the
+        // runner would be `called` and outside `jit_graphs` — the
+        // `check_access_directly_sanity` panic. Recursive/close_stack
+        // callees are not looked inside (`guess_call_kind`); keep the
+        // call on the regular residual, same as `jit_look_inside=false`.
+        if self.is_portal_recursive_call(origin) {
+            return None;
+        }
         let aliases = self.function_graphs.alias_paths(origin);
         // `cachedgraph` stores the `(AccessDirect, None)` graph on the
         // same FunctionDesc as the regular graph. Trait-impl methods
@@ -14600,7 +14776,7 @@ pub(crate) fn get_type_flag(
         // `{cap, ptr, len}`. The field is the three-word value, so
         // `&mut vec_field` is the address of that value. A one-word
         // pointer load reads `cap`.
-        s if s.starts_with("Vec<") => (
+        s if crate::vec_layout::field_layout_is_inline_vec(s) => (
             ArrayFlag::Struct,
             majit_ir::value::Type::Ref,
             3 * crate::layout::target_word_size(),
@@ -14653,6 +14829,13 @@ pub(crate) fn get_type_flag(
             (flag, item_type, elem_size.saturating_mul(len))
         }
         s if let Some(leaf) = atomic_wrapper_leaf(s, raw_alloc_flavor_structs) => leaf,
+        // descr.py get_type_flag reads FLAG_* off the lltype. A linked
+        // `repr(transparent)` wrapper is that inner scalar; the assembler
+        // peels the same table (`tyref_transparent_inner_value_type` /
+        // `external_transparent_scalar_kinds`).
+        s if let Some(flag) = crate::front::mir::type_flag_for_external_transparent_scalar(s) => {
+            flag
+        }
         // Unknown type — treat as GC pointer (conservative)
         _ => (
             ArrayFlag::Pointer,
@@ -16768,6 +16951,29 @@ mod tests {
         assert_eq!(get_type_flag("*mut u8", &empty), fallback);
         assert_eq!(get_type_flag("*const PyObject", &empty), fallback);
         assert_eq!(get_type_flag("*mut PyObject", &empty), fallback);
+    }
+
+    /// A linked `repr(transparent)` wrapper uses the same table the
+    /// assembler peels (`external_transparent_scalar_kinds`), not a
+    /// per-leaf string arm in `get_type_flag`.
+    #[test]
+    fn get_type_flag_external_transparent_scalar_is_inner_width() {
+        use majit_ir::descr::ArrayFlag;
+        let expected = (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4);
+        for spelling in [
+            "rustpython_compiler_core::bytecode::CodeFlags",
+            "bytecode::CodeFlags",
+            "CodeFlags",
+        ] {
+            assert_eq!(
+                get_type_flag(spelling, &HashSet::new()),
+                expected,
+                "{spelling}"
+            );
+        }
+        let (flag, ty, _) = get_type_flag("NotALinkedScalar", &HashSet::new());
+        assert_eq!(flag, ArrayFlag::Pointer);
+        assert_eq!(ty, majit_ir::value::Type::Ref);
     }
 
     /// `BuildHasherDefault<H>` is `PhantomData` (`hash.rs`); RPython's
@@ -22657,13 +22863,44 @@ mod tests {
             Vec::new(),
             original.clone(),
         );
+        cc.register_function_graph(runner.clone(), FunctionGraph::new("ll_portal_runner_shim"));
         cc.set_jitdriver_portal_runner(0, Some(runner.clone()));
+        assert_eq!(
+            cc.function_graphs()
+                .get(&runner)
+                .expect("runner graph remains registered")
+                .func
+                .jit_look_inside,
+            Some(false),
+            "portal_runner_ptr is residual support code (`helper_func` / `_jit_look_inside_ = False`)"
+        );
 
         assert_eq!(
             cc.guess_call_kind(&direct_call_op(CallTarget::function_path(
                 runner.segments.clone()
             ))),
             CallKind::Recursive
+        );
+        let ad_runner = access_directly_path(&runner);
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(CallTarget::from_call_path(&ad_runner))),
+            CallKind::Recursive,
+            "AccessDirect cachedgraph of portal_runner_ptr is still that funcptr"
+        );
+        let harvested = CallPath::from_segments(["pyre_jit", "call_jit", "ll_portal_runner_shim"]);
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(CallTarget::function_path(
+                harvested.segments.clone()
+            ))),
+            CallKind::Recursive,
+            "harvested crate-prefix spelling is still portal_runner_ptr"
+        );
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(CallTarget::from_call_path(
+                &access_directly_path(&harvested)
+            ))),
+            CallKind::Recursive,
+            "harvested crate-prefix AccessDirect spelling is still portal_runner_ptr"
         );
         for non_runner in [portal, original] {
             assert_ne!(
@@ -27308,6 +27545,187 @@ mod tests {
             cc.target_to_path(&bare),
             None,
             "a name leaf must not pick either impl"
+        );
+    }
+
+    /// One type with an inherent `bits` that calls an inner type's inherent
+    /// `bits`, and a trait impl `bits` whose body is `Self::bits(self)`.
+    /// rustc picks the inherent at owner-leaf; the trait-impl stays on
+    /// `for_trait_impl_method`. Both registration orders must agree.
+    fn bits_collision_graphs() -> (FunctionGraph, FunctionGraph, FunctionGraph) {
+        let inner_path = CallPath::for_impl_method("InnerFlags", "bits");
+        let inherent_path = CallPath::for_impl_method("OwnerFlags", "bits");
+        let inner = FunctionGraph::new("bits")
+            .with_owner_root("InnerFlags")
+            .with_source_identity("InnerFlags::bits");
+        let inherent_call =
+            CallTarget::method("bits", Some("InnerFlags".into())).with_resolved_path(inner_path);
+        let inherent = graph_calling("bits", inherent_call)
+            .with_owner_root("OwnerFlags")
+            .with_source_identity("OwnerFlags::bits");
+        let trait_call =
+            CallTarget::method("bits", Some("OwnerFlags".into())).with_resolved_path(inherent_path);
+        let trait_impl = graph_calling("bits", trait_call)
+            .with_owner_root("OwnerFlags")
+            .with_source_identity("OwnerFlags::<impl Flags>::bits");
+        (inner, inherent, trait_impl)
+    }
+
+    fn bits_collision_spec_identity_path() -> CallPath {
+        CallPath::from_segments(crate::front::mir::trait_impl_identity_path(
+            "OwnerFlags",
+            "Flags",
+            "bits",
+        ))
+    }
+
+    fn register_bits_collision_identity(cc: &mut CallControl, trait_impl: FunctionGraph) {
+        cc.register_function_graph(bits_collision_spec_identity_path(), trait_impl);
+    }
+
+    fn assert_bits_collision_bindings(cc: &mut CallControl) {
+        let inner_path = CallPath::for_impl_method("InnerFlags", "bits");
+        let inherent_path = CallPath::for_impl_method("OwnerFlags", "bits");
+        let trait_path = CallPath::for_trait_impl_method("OwnerFlags", 18817, "bits");
+        let spec_path = bits_collision_spec_identity_path();
+        assert_ne!(
+            cc.function_graphs.key_for(&inherent_path),
+            cc.function_graphs.key_for(&trait_path),
+            "owner-leaf and trait-impl identity name distinct graphs"
+        );
+        assert_eq!(
+            cc.function_graphs.key_for(&spec_path),
+            cc.function_graphs.key_for(&trait_path),
+            "spec_segments identity path names the trait-impl graph"
+        );
+        assert_ne!(
+            cc.function_graphs.key_for(&inherent_path),
+            cc.function_graphs.key_for(&spec_path),
+            "spec_segments identity path must not steal owner-leaf"
+        );
+        assert_eq!(
+            cc.function_graphs.key_for(&inherent_path),
+            cc.function_graphs
+                .get(&inherent_path)
+                .map(|g| g.graph_key()),
+        );
+        let inherent_graph = cc
+            .function_graphs
+            .get(&inherent_path)
+            .expect("inherent owner-leaf");
+        assert_eq!(
+            inherent_graph.source_identity.as_deref(),
+            Some("OwnerFlags::bits"),
+            "owner-leaf must bind the inherent method"
+        );
+        let trait_graph = cc
+            .function_graphs
+            .get(&trait_path)
+            .expect("trait-impl identity");
+        assert_eq!(
+            trait_graph.source_identity.as_deref(),
+            Some("OwnerFlags::<impl Flags>::bits"),
+        );
+        let family = cc.all_impls_for_indirect("Flags", "bits");
+        assert_eq!(
+            family,
+            vec![trait_path.clone()],
+            "dyn Trait family lists the trait-impl identity, never the inherent"
+        );
+        let call_target =
+            |graph: &FunctionGraph| match &graph.block(graph.startblock).operations[0].kind {
+                OpKind::Call { target, .. } => target.clone(),
+                other => panic!("expected a Call, got {other:?}"),
+            };
+        assert_eq!(
+            cc.target_to_path(&call_target(&inherent_graph)),
+            Some(inner_path.clone()),
+            "inherent bits targets the inner type's bits"
+        );
+        assert_eq!(
+            cc.target_to_path(&call_target(&trait_graph)),
+            Some(inherent_path.clone()),
+            "trait-impl body Self::bits targets the inherent, not itself"
+        );
+        let jc_inner = cc.get_jitcode(&inner_path);
+        let jc_inherent = cc.get_jitcode(&inherent_path);
+        let jc_trait = cc.get_jitcode(&trait_path);
+        assert!(
+            !std::sync::Arc::ptr_eq(&jc_inner, &jc_inherent)
+                && !std::sync::Arc::ptr_eq(&jc_inherent, &jc_trait)
+                && !std::sync::Arc::ptr_eq(&jc_inner, &jc_trait),
+            "each of the three graphs gets its own jitcode"
+        );
+        // `get_jitcode` keys shells on CallPath (`call.py` keys on the
+        // graph object). Alias spellings of one funcobj share GraphKey
+        // (`key_for` above); they do not share a shell Arc.
+    }
+
+    #[test]
+    fn inherent_bits_wins_owner_leaf_when_trait_impl_registers_first() {
+        let mut cc = CallControl::new();
+        let (inner, inherent, trait_impl) = bits_collision_graphs();
+        cc.register_trait_impl_method(
+            "OwnerFlags",
+            18817,
+            "bits",
+            Some("Flags"),
+            true,
+            trait_impl.clone(),
+        );
+        register_bits_collision_identity(&mut cc, trait_impl);
+        cc.register_inherent_method("OwnerFlags", "bits", inherent);
+        cc.register_inherent_method("InnerFlags", "bits", inner);
+        assert_bits_collision_bindings(&mut cc);
+    }
+
+    #[test]
+    fn inherent_bits_wins_owner_leaf_when_inherent_registers_first() {
+        let mut cc = CallControl::new();
+        let (inner, inherent, trait_impl) = bits_collision_graphs();
+        cc.register_inherent_method("InnerFlags", "bits", inner);
+        cc.register_inherent_method("OwnerFlags", "bits", inherent);
+        cc.register_trait_impl_method(
+            "OwnerFlags",
+            18817,
+            "bits",
+            Some("Flags"),
+            true,
+            trait_impl.clone(),
+        );
+        register_bits_collision_identity(&mut cc, trait_impl);
+        assert_bits_collision_bindings(&mut cc);
+    }
+
+    /// Vacant owner-leaf (no inherent of this leaf) aliases the trait-impl
+    /// graph. The PBC family still lists the identity path
+    /// (`FunctionReprBase.call` / `row_of_graphs.values()`); ICT matching
+    /// splits the identity segment off the owner path.
+    #[test]
+    fn vacant_trait_impl_family_keeps_identity_path() {
+        let mut cc = CallControl::new();
+        let identity = CallPath::for_trait_impl_method("IntDictStrategy", 42, "length");
+        let owner_leaf = CallPath::for_impl_method("IntDictStrategy", "length");
+        let graph = FunctionGraph::new("length")
+            .with_owner_root("IntDictStrategy")
+            .with_source_identity("IntDictStrategy::<impl DictStrategy>::length");
+        cc.register_trait_impl_method(
+            "IntDictStrategy",
+            42,
+            "length",
+            Some("DictStrategy"),
+            true,
+            graph,
+        );
+        assert_eq!(
+            cc.all_impls_for_indirect("DictStrategy", "length"),
+            vec![identity.clone()],
+            "family lists the trait-impl identity"
+        );
+        assert_eq!(
+            cc.function_graphs.key_for(&identity),
+            cc.function_graphs.key_for(&owner_leaf),
+            "vacant owner-leaf aliases the trait-impl graph"
         );
     }
 

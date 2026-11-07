@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::call::{CallControl, CallKind};
 use crate::model::{
-    BlockId, CallFuncPtr, ExitSwitch, FunctionGraph, Link, OpKind, SpaceOperation,
+    BlockId, CallFuncPtr, CallTarget, ExitSwitch, FunctionGraph, Link, OpKind, SpaceOperation,
     remap_control_flow_metadata_var,
 };
 
@@ -1685,7 +1685,32 @@ pub fn can_remove_op(kind: &OpKind) -> bool {
         {
             true
         }
+        // The MIR front emits these as host Calls because it skips the rtyper
+        // step that would have turned them into the llop / same_as. They are
+        // the CanRemove peers: `cast_ptr_to_int` is in
+        // `enum_ops_without_sideeffects`, and `r_uint` / `intmask` are
+        // `_noop_rewrite` identities (`rtype_intmask`, `r_uint`
+        // `ForTypeEntry::specialize_call`, `exception_cannot_occur`). Left
+        // as Calls, an unused `p as usize` that `GcRef` retypes back to the
+        // source pointer (`pointer_word_vars`) survives into jitcode as
+        // `CastPtrToInt` and forces the virtual `NewWithVtable`.
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } if call_is_can_remove_llop_marker(segments) => true,
         _ => is_pure_op(kind),
+    }
+}
+
+/// Host-Call spelling of a CanRemove llop / identity marker.
+fn call_is_can_remove_llop_marker(segments: &[String]) -> bool {
+    let Some((leaf, rest)) = segments.split_last() else {
+        return false;
+    };
+    match leaf.as_str() {
+        "cast_ptr_to_int" => rest.last().map(String::as_str) == Some("lltype"),
+        "r_uint" | "intmask" => rest.last().map(String::as_str) == Some("rarithmetic"),
+        _ => false,
     }
 }
 
@@ -1942,6 +1967,36 @@ mod tests {
                 "{name} is absent from the lltype float table"
             );
         }
+
+        let llop_call = |path: &[&str]| OpKind::Call {
+            target: CallTarget::function_path(path.iter().map(|s| (*s).to_string())),
+            args: crate::model::call_args(vec![crate::flowspace::model::Variable::new()]),
+            result_ty: crate::model::ValueType::Int,
+        };
+        assert!(can_remove_op(&llop_call(&[
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_ptr_to_int",
+        ])));
+        assert!(can_remove_op(&llop_call(&[
+            "rpython",
+            "rlib",
+            "rarithmetic",
+            "r_uint",
+        ])));
+        assert!(can_remove_op(&llop_call(&[
+            "rpython",
+            "rlib",
+            "rarithmetic",
+            "intmask",
+        ])));
+        assert!(!can_remove_op(&llop_call(&[
+            "pyre_interpreter",
+            "pyframe",
+            "remember_frame_locals",
+        ])));
     }
 
     #[test]

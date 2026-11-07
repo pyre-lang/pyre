@@ -971,15 +971,6 @@ fn gcarray_length_r(l2: GCREF) -> usize {
     raw_read_ptr(raw_ptradd(l2 as usize, GCARRAY_LEN_OFFSET))
 }
 
-/// Item `index` of a length-prefixed object GcArray, read from the array
-/// word so a collection that moves `l2` is visible on the next index.
-fn gcarray_getitem_r(l2: GCREF, index: usize) -> GCREF {
-    raw_read_ptr(raw_ptradd(
-        l2 as usize,
-        GCARRAY_ITEMS_OFFSET + index * ITEM_SIZE_R,
-    )) as GCREF
-}
-
 /// First item of a length-prefixed GcArray. `array_items_base` rounds
 /// the length word up to the item alignment (`repr(C)` `{ length, items }`).
 fn gcarray_items_base(ll_list: GCREF, align: usize) -> *mut u8 {
@@ -1017,9 +1008,11 @@ pub fn ll_copy_list_to_raw_array_r(ll_list: GCREF, dst_ptr: usize) {
 }
 
 /// `rlist.ll_extend(l1, l2)` when `l2` is a one-word object slice: the
-/// GcArray word, not a `(items, length)` pair. Length is the array's
-/// header; each item is read by index from `l2` after `_ll_resize_ge`,
-/// which may collect.
+/// GcArray word, not a `(items, length)` pair. Body of `rlist.py ll_extend`:
+/// `len1`, `len2`, `ovfcheck(len1 + len2)`, `_ll_resize_ge`, then one
+/// `ll_arraycopy(l2, l1, 0, len1, len2)`. There is no loop in `ll_extend`;
+/// the copy is [`ll_gcarray_arraycopy_r`], residual like `rgc.ll_arraycopy`
+/// (`OS_ARRAYCOPY`).
 ///
 /// `ovfcheck(len1 + len2)`: a wrapping sum would undersize the resize.
 /// Overflow is MemoryError, the same `Vec capacity overflow` panic as
@@ -1031,11 +1024,34 @@ pub fn ll_vec_extend_r(l: &mut Vec<GCREF>, l2: GCREF) {
         .checked_add(len2)
         .unwrap_or_else(|| panic!("Vec capacity overflow"));
     ll_vec_resize_ge_r(l, newlength);
-    let mut i = 0;
-    while i < len2 {
-        let item = gcarray_getitem_r(l2, i);
-        ll_vec_setitem_fast_r(l, len1 + i, item);
-        i += 1;
+    ll_gcarray_arraycopy_r(l2, ll_vec_items_r(l), 0, len1, len2);
+}
+
+/// `rgc.ll_arraycopy` from a length-prefixed object GcArray into a raw Vec
+/// item buffer. `source` is the GC array word itself (`rgc.ll_arraycopy`
+/// takes the GC arrays), not an interior address; `dest` is the Vec items
+/// address (`ll_items`). Residual like [`ll_slice_arraycopy_r`]:
+/// `ll_arraycopy` is `@jit.oopspec('list.ll_arraycopy(...)')`
+/// (`OS_ARRAYCOPY`). Inside a residual no collection can happen, so
+/// reading `source` once is sound.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_gcarray_arraycopy_r(
+    source: GCREF,
+    dest: usize,
+    source_start: usize,
+    dest_start: usize,
+    length: usize,
+) {
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            slice_item_addr(
+                raw_ptradd(source as usize, GCARRAY_ITEMS_OFFSET),
+                source_start,
+                ITEM_SIZE_R,
+            ) as *const u8,
+            slice_item_addr(dest, dest_start, ITEM_SIZE_R) as *mut u8,
+            item_bytes(length, ITEM_SIZE_R).expect("Vec capacity overflow"),
+        );
     }
 }
 
@@ -1885,6 +1901,8 @@ mod tests {
             "ll_copy_list_to_raw_array_i",
             "ll_copy_list_to_raw_array_f",
             "ll_copy_list_to_raw_array_r",
+            "ll_slice_arraycopy_r",
+            "ll_gcarray_arraycopy_r",
         ] {
             let path = format!("{module}::{leaf}");
             assert!(
@@ -1977,6 +1995,27 @@ mod tests {
         ll_copy_list_to_raw_array_r(&mut refs as *mut Refs as GCREF, rdst.as_mut_ptr() as usize);
         assert_eq!(rdst[0], 0x10 as GCREF);
         assert_eq!(rdst[1], 0x20 as GCREF);
+    }
+
+    #[test]
+    fn extend_copies_three_gcarray_items_onto_nonempty_vec() {
+        #[repr(C)]
+        struct GcArrayWord {
+            length: usize,
+            items: [GCREF; 3],
+        }
+        let mut src = GcArrayWord {
+            length: 3,
+            items: [0x10 as GCREF, 0x20 as GCREF, 0x30 as GCREF],
+        };
+        let mut l = ll_vec_newemptylist_r();
+        ll_vec_append_r(&mut l, 0x01 as GCREF);
+        ll_vec_extend_r(&mut l, &mut src as *mut GcArrayWord as GCREF);
+        assert_eq!(ll_vec_length_r(&mut l), 4);
+        assert_eq!(ll_vec_getitem_fast_r(&mut l, 0), 0x01 as GCREF);
+        assert_eq!(ll_vec_getitem_fast_r(&mut l, 1), 0x10 as GCREF);
+        assert_eq!(ll_vec_getitem_fast_r(&mut l, 2), 0x20 as GCREF);
+        assert_eq!(ll_vec_getitem_fast_r(&mut l, 3), 0x30 as GCREF);
     }
 
     /// `ovfcheck(len1 + len2)` in `ll_extend`: a wrapping sum is MemoryError,

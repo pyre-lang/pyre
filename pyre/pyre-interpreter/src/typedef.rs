@@ -34396,7 +34396,7 @@ fn generator_name_value(obj: PyObjectRef, qualname: bool) -> crate::PyResult {
     if pycode.is_null() || unsafe { pyre_object::is_none(pycode) } {
         return Ok(w_str_new_managed("<finished>"));
     }
-    let code_ptr = unsafe { crate::pycode::w_code_get_ptr(pycode) } as *const crate::CodeObject;
+    let code_ptr = unsafe { crate::pycode::w_code_get_ptr(pycode) };
     if code_ptr.is_null() {
         return Ok(w_str_new_managed("<finished>"));
     }
@@ -34655,7 +34655,7 @@ fn generator_descr_sizeof(args: &[PyObjectRef]) -> crate::PyResult {
     crate::type_methods::arity_no_args(args, "__sizeof__")?;
     let generator = args[0];
     let w_code = unsafe { pyre_object::generator::w_generator_get_pycode(generator) };
-    let code = unsafe { &*(crate::pycode::w_code_get_ptr(w_code) as *const crate::CodeObject) };
+    let code = unsafe { &*(crate::pycode::w_code_get_ptr(w_code)) };
     // `_PyFrame_NumSlotsForCodeObject`: locals-plus followed by the maximum
     // operand stack. `pyframe::ncells` excludes cellvars that alias locals,
     // matching CPython's `co_nlocalsplus` rather than blindly summing names.
@@ -35597,7 +35597,11 @@ fn init_memory_iterator_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__iter__",
-            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1)
+            make_builtin_function_with_arity(
+                "__iter__",
+                crate::baseobjspace::seqiter_iter_method,
+                1,
+            )
         )
     };
     unsafe {
@@ -35630,7 +35634,11 @@ fn init_array_iterator_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__iter__",
-            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1)
+            make_builtin_function_with_arity(
+                "__iter__",
+                crate::baseobjspace::seqiter_iter_method,
+                1,
+            )
         )
     };
     unsafe {
@@ -36047,7 +36055,11 @@ fn init_list_iterator_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__iter__",
-            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1)
+            make_builtin_function_with_arity(
+                "__iter__",
+                crate::baseobjspace::seqiter_iter_method,
+                1,
+            )
         )
     };
     unsafe {
@@ -36115,7 +36127,11 @@ fn init_tuple_iterator_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__iter__",
-            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1)
+            make_builtin_function_with_arity(
+                "__iter__",
+                crate::baseobjspace::seqiter_iter_method,
+                1,
+            )
         )
     };
     unsafe {

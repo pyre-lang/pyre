@@ -1028,16 +1028,159 @@ pub(crate) fn discover_transparent_scalar_kinds(
     discovered
 }
 
-/// Transparent scalars whose defining crate is not in the extraction set.
+/// Path, register-bank kind, and inner width of a transparent scalar whose
+/// defining crate is outside the extraction set.
 ///
 /// `rustpython_compiler_core::bytecode::CodeFlags` is the `bitflags!`
 /// `repr(transparent)` `u32` wrapper. No other external type is listed.
-pub(in crate::front::mir) fn external_transparent_scalar_kinds()
--> Vec<(String, majit_charon_reader::TransparentScalarKind)> {
-    vec![(
-        "rustpython_compiler_core::bytecode::CodeFlags".to_string(),
+/// Width is the inner scalar (`u32` → 4): Charon's foreign Opaque view
+/// omits the field type and may leave `repr.transparent` false, so the
+/// assembler (`tyref_transparent_inner_value_type`) and `get_type_flag`
+/// both read this row rather than a second name table.
+const EXTERNAL_TRANSPARENT_SCALARS: &[(&str, majit_charon_reader::TransparentScalarKind, usize)] =
+    &[(
+        "rustpython_compiler_core::bytecode::CodeFlags",
         majit_charon_reader::TransparentScalarKind::Unsigned,
-    )]
+        4,
+    )];
+
+/// Transparent scalars whose defining crate is not in the extraction set.
+pub(crate) fn external_transparent_scalar_kinds()
+-> Vec<(String, majit_charon_reader::TransparentScalarKind)> {
+    EXTERNAL_TRANSPARENT_SCALARS
+        .iter()
+        .map(|(path, kind, _size)| ((*path).to_string(), *kind))
+        .collect()
+}
+
+fn type_str_matches_external_transparent_path(type_str: &str, path: &str) -> bool {
+    let stripped = strip_crate_prefix(path);
+    static_key_matches(path, stripped.as_str(), type_str)
+        || path_has_suffix_ignoring_raw(type_str, path)
+        || path_has_suffix_ignoring_raw(type_str, stripped.as_str())
+}
+
+/// Inner width of a linked external scalar, when Charon's layout row is
+/// missing (`size_align_for_target` on a foreign Opaque).
+pub(in crate::front::mir) fn external_transparent_scalar_size(path: &str) -> Option<u64> {
+    for (registered, _kind, size) in EXTERNAL_TRANSPARENT_SCALARS {
+        if type_str_matches_external_transparent_path(path, registered) {
+            return Some(*size as u64);
+        }
+    }
+    None
+}
+
+/// `descr.py get_type_flag` for a field whose type spelling is a linked
+/// transparent scalar rather than the peeled `u32` / `i64` / … form.
+///
+/// Same table the assembler peels through `llbc.transparent_scalar_kind`.
+pub(crate) fn type_flag_for_external_transparent_scalar(
+    type_str: &str,
+) -> Option<(majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize)> {
+    for (path, kind, size) in EXTERNAL_TRANSPARENT_SCALARS {
+        if type_str_matches_external_transparent_path(type_str, path) {
+            return Some(transparent_scalar_kind_type_flag(*kind, *size as u64));
+        }
+    }
+    None
+}
+
+/// Linked scalar kind for `path`: the exact `Llbc` row first, then the
+/// same suffix walk `get_type_flag` uses for `bytecode::CodeFlags` /
+/// `CodeFlags` against the crate-qualified table row.
+pub(in crate::front::mir) fn transparent_scalar_kind_for_path(
+    path: &str,
+    llbc: &Llbc,
+) -> Option<majit_charon_reader::TransparentScalarKind> {
+    if let Some(kind) = llbc.transparent_scalar_kind(path) {
+        return Some(kind);
+    }
+    for (registered, kind, _size) in EXTERNAL_TRANSPARENT_SCALARS {
+        if type_str_matches_external_transparent_path(path, registered) {
+            return Some(*kind);
+        }
+    }
+    None
+}
+
+/// Inner `ValueType` of a linked transparent scalar, including an
+/// external wrapper whose path spelling is a suffix of the table row.
+///
+/// `Llbc::transparent_scalar_kind` is the exact-path half (the kinds
+/// `link_transparent_scalar_types` published). The suffix walk is the
+/// same match `get_type_flag` uses when the field type is spelled
+/// `bytecode::CodeFlags` rather than the crate-qualified row.
+pub(crate) fn transparent_scalar_inner_value_for_path(
+    path: &str,
+    llbc: &Llbc,
+) -> Option<ValueType> {
+    Some(transparent_scalar_value_type(
+        transparent_scalar_kind_for_path(path, llbc)?,
+    ))
+}
+
+/// Layout spelling `get_type_flag` already classifies (`u32`, `i64`, …).
+pub(in crate::front::mir) fn transparent_scalar_kind_spelling(
+    kind: majit_charon_reader::TransparentScalarKind,
+    size: u64,
+) -> String {
+    match (kind, size) {
+        (majit_charon_reader::TransparentScalarKind::Signed, 1) => "i8".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Signed, 2) => "i16".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Signed, 4) => "i32".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Signed, _) => "i64".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Unsigned, 1) => "u8".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Unsigned, 2) => "u16".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Unsigned, 4) => "u32".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Unsigned, _) => "u64".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Bool, _) => "bool".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Float, 4) => "f32".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Float, _) => "f64".to_string(),
+    }
+}
+
+fn transparent_scalar_kind_type_flag(
+    kind: majit_charon_reader::TransparentScalarKind,
+    size: u64,
+) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
+    use majit_ir::descr::ArrayFlag;
+    match (kind, size) {
+        (majit_charon_reader::TransparentScalarKind::Signed, 1) => {
+            (ArrayFlag::Signed, majit_ir::value::Type::Int, 1)
+        }
+        (majit_charon_reader::TransparentScalarKind::Signed, 2) => {
+            (ArrayFlag::Signed, majit_ir::value::Type::Int, 2)
+        }
+        (majit_charon_reader::TransparentScalarKind::Signed, 4) => {
+            (ArrayFlag::Signed, majit_ir::value::Type::Int, 4)
+        }
+        (majit_charon_reader::TransparentScalarKind::Signed, _) => {
+            (ArrayFlag::Signed, majit_ir::value::Type::Int, 8)
+        }
+        (majit_charon_reader::TransparentScalarKind::Unsigned, 1) => {
+            (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1)
+        }
+        (majit_charon_reader::TransparentScalarKind::Unsigned, 2) => {
+            (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 2)
+        }
+        (majit_charon_reader::TransparentScalarKind::Unsigned, 4) => {
+            (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4)
+        }
+        (majit_charon_reader::TransparentScalarKind::Unsigned, _) => {
+            (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 8)
+        }
+        (majit_charon_reader::TransparentScalarKind::Bool, _) => {
+            (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1)
+        }
+        // `get_type_flag("f32")`: SingleFloat is FLAG_UNSIGNED, int-banked.
+        (majit_charon_reader::TransparentScalarKind::Float, 4) => {
+            (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4)
+        }
+        (majit_charon_reader::TransparentScalarKind::Float, _) => {
+            (ArrayFlag::Float, majit_ir::value::Type::Float, 8)
+        }
+    }
 }
 
 pub(in crate::front::mir) fn link_transparent_scalar_types<L: std::borrow::Borrow<Llbc>>(
@@ -3100,8 +3243,9 @@ pub(in crate::front::mir) fn decode_const_lit(
 /// constants as live host values, so an expression such as pyre's
 /// `MASK: Signed = i64::MAX` must likewise become one literal Constant in the
 /// translated graph. Restrict this recovery to the exact `core::num::<Impl>`
-/// owner, the `MIN` / `MAX` leaves, and a primitive fixed-width integer type;
-/// user constants and target-width `isize` / `usize` remain residual.
+/// owner, the `MIN` / `MAX` leaves, and a primitive integer type.
+/// Target-width `isize` / `usize` fold to `sys.maxint` of the extraction
+/// target.
 pub(in crate::front::mir) fn const_eval_core_num_associated_const(
     llbc: &Llbc,
     def_id: u64,
@@ -3144,6 +3288,11 @@ pub(in crate::front::mir) fn const_eval_core_num_associated_const(
             "I16" => (i16::MIN as i64, i16::MAX as i64),
             "I32" => (i32::MIN as i64, i32::MAX as i64),
             "I64" => (i64::MIN, i64::MAX),
+            "Isize" => match llbc.target_pointer_size()? {
+                8 => (i64::MIN, i64::MAX),
+                4 => (i32::MIN as i64, i32::MAX as i64),
+                _ => return None,
+            },
             _ => return None,
         };
         return Some(ConstLit::Int(if leaf == "MIN" { min } else { max }));
@@ -3154,6 +3303,11 @@ pub(in crate::front::mir) fn const_eval_core_num_associated_const(
             "U16" => u16::MAX as u64,
             "U32" => u32::MAX as u64,
             "U64" => u64::MAX,
+            "Usize" => match llbc.target_pointer_size()? {
+                8 => u64::MAX,
+                4 => u32::MAX as u64,
+                _ => return None,
+            },
             _ => return None,
         };
         return Some(ConstLit::UInt(if leaf == "MIN" { 0 } else { max }));
@@ -3659,7 +3813,7 @@ pub(in crate::front::mir) fn tyref_json(ty: &TyRef) -> serde_json::Value {
     match ty {
         TyRef::Dedup { id } => serde_json::json!({"Deduplicated": id}),
         TyRef::Inline { value: (id, body) } => serde_json::json!({"Value": [id, body]}),
-        TyRef::Other(v) => v.clone(),
+        TyRef::Other(v) => (*v.0).clone(),
     }
 }
 
@@ -3928,7 +4082,7 @@ pub(in crate::front::mir) fn instantiated_field_size_align(
     // The TypeDecl stays Opaque: including it peels `length_cell` to the
     // inner integer and `getattr("value")` panics (`getfield_raw_r`).
     {
-        let tyref = TyRef::Other(body.clone());
+        let tyref = TyRef::Other(body.clone().into());
         if let Some(arg) = tyref_atomic_arg(&tyref, llbc) {
             return instantiated_field_size_align(llbc, arg, subst, clauses, depth + 1);
         }

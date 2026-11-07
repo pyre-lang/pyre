@@ -3,6 +3,47 @@
 use super::std_call::{AtomicClass, interior_deref_root_local, rewrite_interior_index_slots};
 use super::*;
 
+/// `core::cell::...` or Charon dropping the `core::` crate prefix
+/// (`cell::Cell::get`, the same spelling `FOREIGN_STDLIB_EXTERNALS` keys).
+/// User and nestedscope `Cell` keep a crate prefix and stay residual.
+fn is_std_cell_module_path(path: &str) -> bool {
+    path.starts_with("core::cell::")
+        || path.starts_with("std::cell::")
+        || path.starts_with("cell::Cell::")
+        || path.starts_with("cell::<Impl>::")
+}
+
+#[cfg(test)]
+mod std_cell_module_path_tests {
+    use super::is_std_cell_module_path;
+
+    #[test]
+    fn accepts_core_std_and_charon_short_cell_get() {
+        for path in [
+            "core::cell::Cell::get",
+            "std::cell::Cell::get",
+            "cell::Cell::get",
+            "cell::Cell::<Impl>::get",
+            "cell::<Impl>::get",
+            "core::cell::<Impl>::get",
+        ] {
+            assert!(is_std_cell_module_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn rejects_user_and_nestedscope_cell() {
+        for path in [
+            "fixture::Cell::get",
+            "my_crate::Cell::get",
+            "pyre_object::nestedscope::Cell::get",
+            "pyre_object::nestedscope::w_cell_get",
+        ] {
+            assert!(!is_std_cell_module_path(path), "{path}");
+        }
+    }
+}
+
 impl<'a> Lowering<'a> {
     pub(in crate::front::mir) fn lower_call(
         &mut self,
@@ -76,6 +117,9 @@ impl<'a> Lowering<'a> {
         if self.lower_owner_root_guard_call(mir_bb, &call, dest_local, target)? {
             return Ok(());
         }
+        if self.lower_erased_gc_root_registration_call(mir_bb, &call, dest_local, target)? {
+            return Ok(());
+        }
         self.refuse_residual_owner_root_guard(mir_bb, &call)?;
         if self.lower_global_initializer_call(mir_bb, &call, dest_local, target)? {
             return Ok(());
@@ -91,10 +135,21 @@ impl<'a> Lowering<'a> {
         // `pair-slice local read as one word`. Slice methods on the mut
         // view (`rotate_right`) still take `is_pair_call`, which splits
         // the header.
-        if let CallFunc::Regular(reg) = &call.func
-            && self.try_lower_object_vec_whole_list_view(mir_bb, &call, dest_local, target, reg)?
-        {
-            return Ok(());
+        //
+        // A shared RangeFrom / RangeTo / Range subslice of the same Vec
+        // is that whole-list GcArray plus `rlist.py` `rtype_getslice`
+        // (`ll_listslice_startonly` / `ll_listslice_rangeto` /
+        // `ll_listslice_startstop`). Emit the marker here so a residual
+        // `alloc::vec::<Impl>::index` never reaches
+        // `rewire_one_slice_index_site`. `&mut` dests stay
+        // `pair_subslice`.
+        if let CallFunc::Regular(reg) = &call.func {
+            if self.try_lower_object_vec_whole_list_view(mir_bb, &call, dest_local, target, reg)? {
+                return Ok(());
+            }
+            if self.try_lower_object_vec_shared_subslice(mir_bb, &call, dest_local, target, reg)? {
+                return Ok(());
+            }
         }
         if self.is_pair_call(&call, dest_local) {
             return self.lower_pair_call(mir_bb, call, dest_local, target);
@@ -122,28 +177,32 @@ impl<'a> Lowering<'a> {
         // `history.py` `getkind` banks every raw `Ptr` as `int`, and
         // [`pygraph_initial_block`] already records that parameter as
         // `Int`. The call that produced the pointer uses the same bank.
-        // A byte pointer stays the `Ref` erasure of
-        // [`tyref_to_value_type_with`]: pyre erases a GC reference to
-        // `*mut u8`. A reference stays an address. Naming its pointee
-        // here would retype a call-returned `&T` to the scalar, and
-        // `*dest` is `rewrite_op_raw_load`.
+        // `std::alloc::alloc` / `alloc_zeroed` is that same Address
+        // (`llmemory.raw_malloc`); its `*mut u8` dest is CCHARP, not
+        // a GC reference. A GC malloc erased to `*mut u8` stays the
+        // `Ref` erasure of [`tyref_to_value_type_with`]. A reference
+        // stays an address. Naming its pointee here would retype a
+        // call-returned `&T` to the scalar, and `*dest` is
+        // `rewrite_op_raw_load`.
         //
         // [`is_typed_array_base_adapter`] spells that same `*mut i64` /
         // `*mut f64`, then [`is_items_block_base_ptr_add`] collapses the
         // body onto the GC block header. `getkind` of a GC pointer is
         // `ref`, so the call keeps the `Ref` [`tyref_to_value_type_with`]
-        // already recorded for that header. The items-block accessors
-        // ([`items_block_accessor_returns_its_block`]) collapse onto their
-        // block too (`rlist.py` `ll_items` is `l.items`), so their `*mut u8`
-        // result keeps that `Ref` record, not `CCHARP`.
-        let callee_returns_gc_block = match &call.func {
-            CallFunc::Regular(reg) => regular_call_name_path(reg, self.llbc)
-                .as_deref()
-                .is_some_and(|p| {
-                    is_typed_array_base_adapter(p) || items_block_accessor_returns_its_block(p)
-                }),
-            _ => false,
+        // already recorded for that header.
+        let callee_path = match &call.func {
+            CallFunc::Regular(reg) => regular_call_name_path(reg, self.llbc),
+            _ => None,
         };
+        let callee_returns_gc_block = callee_path.as_deref().is_some_and(|p| {
+            is_typed_array_base_adapter(p) || items_block_accessor_returns_its_block(p)
+        });
+        // `std::alloc::alloc` / `alloc_zeroed` is `llmemory.raw_malloc`
+        // (`rbuiltin.py` `rtype_raw_malloc` / `rtype_std_alloc_raw`).
+        // The result is Address / CCHARP; `history.py` `getkind` is `'int'`.
+        let callee_is_std_alloc_raw = callee_path
+            .as_deref()
+            .is_some_and(is_std_alloc_raw_name_path);
         // The destination place sometimes carries a bare `Option` type_id
         // with no generics. The callee `FunDecl` output still names the
         // concrete instantiation (`Option<usize>`, `Option<*mut PyObject>`),
@@ -157,8 +216,14 @@ impl<'a> Lowering<'a> {
         };
         let dest_class_ty: &TyRef = match &fd_output {
             Some(out)
-                if tyref_enum_instantiation_suffix(&call.dest.ty, self.llbc).is_empty()
-                    && !tyref_enum_instantiation_suffix(out, self.llbc).is_empty() =>
+                if tyref_enum_instantiation_suffix(
+                    &call.dest.ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                )
+                .is_empty()
+                    && !tyref_enum_instantiation_suffix(out, self.llbc, self.tombstoned_leaves)
+                        .is_empty() =>
             {
                 out
             }
@@ -166,6 +231,8 @@ impl<'a> Lowering<'a> {
         };
         let result_ty = if is_unit_type(&call.dest.ty, self.llbc) {
             ValueType::Void
+        } else if callee_is_std_alloc_raw {
+            ValueType::Int
         } else if !callee_returns_gc_block
             && !graph_is_items_block_base_accessor(&self.graph.name)
             && let Some(ccharp) = raw_u8_ccharp_bank(&call.dest.ty, self.llbc)
@@ -637,7 +704,10 @@ impl<'a> Lowering<'a> {
         // whether a given callee is scoped.
         let mut callee_name_path: Option<String> = None;
         // `v.extend_from_slice(s)` on a `Vec` of one-word items is
-        // `ll_extend` from the pair.
+        // `ll_extend` from the pair (`rlist.py` `ll_extend` /
+        // `AbstractListRepr.rtype_method_extend`). The helper is
+        // `rust_vec_helper_segments` / `rust_vec_helper_ops` arity 3
+        // `(l, items, length)` (`rrustvec.rs` `"extend_from_slice"`).
         let vec_extend_kind = match &call.func {
             CallFunc::Regular(reg)
                 if matches!(pair_lens.as_slice(), [(1, _)])
@@ -743,13 +813,13 @@ impl<'a> Lowering<'a> {
                 let args = splice_pair_lens(args, pair_lens);
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
-                        segments: majit_ir::rvec::vec_helper_path(
+                        // `ll_extend` from the `(items, length)` pair
+                        // (`rlist.py` `ll_extend` /
+                        // `AbstractListRepr.rtype_method_extend`).
+                        segments: rust_vec_helper_segments(
                             majit_ir::rvec::VecOp::ExtendFromSlice,
                             kind,
-                        )
-                        .split("::")
-                        .map(str::to_string)
-                        .collect(),
+                        ),
                         fun_decl_id: None,
                         specialization: crate::parse::GraphSpecialization::Regular,
                     },
@@ -952,13 +1022,13 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // Rust exposes RPython's generated shadow-stack publication as
-                // a normal `pin_root(PyObjectRef)` call.  Its pointer argument
-                // is actually `llmemory.GCREF`, irrespective of the source
-                // pointer's external repr, so cast it the way
-                // `gct_gc_identityhash` casts a GC helper's pointer argument
-                // (`framework.py`) — before FunctionDesc propagation,
-                // so strings, W_Root instances, and other GC pointers do not
-                // union at the helper's single input cell.
+                // a normal `pin_root(PyObjectRef)` / `pin_roots(&[…])` call.
+                // The last pointer argument is actually `llmemory.GCREF`,
+                // irrespective of the source pointer's external repr, so cast
+                // it the way `gct_gc_identityhash` casts a GC helper's pointer
+                // argument (`framework.py`) — before FunctionDesc
+                // propagation, so strings, W_Root instances, and other GC
+                // pointers do not union at the helper's single input cell.
                 //
                 // The pointer is the LAST argument: the `RootScope` method form
                 // `gc_root_pin_path` also admits passes `&self` first, and
@@ -1033,6 +1103,7 @@ impl<'a> Lowering<'a> {
                         if let Some(raw) = self.emit_dest_overlay_cast(
                             bb_id,
                             Some(&src_vt),
+                            first_arg_ty.as_ref(),
                             args[0].clone(),
                             &call.dest.ty,
                         ) {
@@ -1079,6 +1150,7 @@ impl<'a> Lowering<'a> {
                                 if let Some(raw) = self.emit_dest_overlay_cast(
                                     bb_id,
                                     Some(&src_vt),
+                                    first_arg_ty.as_ref(),
                                     args[0].clone(),
                                     &call.dest.ty,
                                 ) {
@@ -1261,7 +1333,12 @@ impl<'a> Lowering<'a> {
                         || self.is_reflexive_into_iter(&reg)
                         || self.is_hint_must_use(&reg)
                         || self.is_arguments_from_str(&reg)
-                        || self.is_rbigint_translated_alias(&reg, first_arg_ty.as_ref()))
+                        || self.is_rbigint_translated_alias(&reg, first_arg_ty.as_ref())
+                        || self.is_transparent_scalar_word_identity(
+                            &reg,
+                            first_arg_ty.as_ref(),
+                            &call.dest.ty,
+                        ))
                 {
                     self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
@@ -4173,6 +4250,7 @@ impl<'a> Lowering<'a> {
                             if let Some(raw) = self.emit_dest_overlay_cast(
                                 bb_id,
                                 src.as_ref(),
+                                first_arg_ty.as_ref(),
                                 args[0].clone(),
                                 &call.dest.ty,
                             ) {
@@ -4780,45 +4858,13 @@ impl<'a> Lowering<'a> {
                     } else if let Some(len_var) = fat_len {
                         len_var
                     } else {
-                        // `.len()` of a declared virtualizable array is
-                        // `arraylen_vable`, which needs the field read unmarked.
-                        self.release_declared_vable_array_address(&args[0]);
-                        let res = self
-                            .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
-                        let kind = if first_arg_is_string_byte_view {
-                            OpKind::Call {
-                                target: CallTarget::FunctionPath {
-                                    segments: vec!["__strlen".to_string()],
-                                    fun_decl_id: None,
-                                    specialization: crate::parse::GraphSpecialization::Regular,
-                                },
-                                args: crate::model::call_args(vec![args[0].clone()]),
-                                result_ty: ValueType::Int,
-                            }
-                        } else if first_arg_is_list_view {
-                            OpKind::Call {
-                                target: CallTarget::FunctionPath {
-                                    segments: vec!["__len".to_string()],
-                                    fun_decl_id: None,
-                                    specialization: crate::parse::GraphSpecialization::Regular,
-                                },
-                                args: crate::model::call_args(vec![args[0].clone()]),
-                                result_ty: ValueType::Int,
-                            }
-                        } else {
-                            OpKind::ArrayLen {
-                                base: self.object_slice_arraylen_base(bb_id, &reg, args[0].clone()),
-                                array_type_id: self.slice_object_array_type_id(&reg),
-                                nolength: false,
-                                gckind: crate::model::ArrayGcKind::Gc,
-                            }
-                        };
-                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                            result: Some(res.clone()),
-                            kind,
-                        });
-                        res
+                        self.emit_slice_len(
+                            bb_id,
+                            &args[0],
+                            first_arg_is_string_byte_view,
+                            first_arg_is_list_view,
+                            self.slice_object_array_type_id(&reg),
+                        )
                     };
                     self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
@@ -7600,7 +7646,11 @@ impl<'a> Lowering<'a> {
         // local, not this not-yet-defined result.
         let result_var = self
             .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            .alloc_value_var_with_type(if callee_is_std_alloc_raw {
+                crate::model::ConcreteType::Signed
+            } else {
+                crate::model::ConcreteType::Unknown
+            });
         // `*mut TypedItemsBlock` is `GcArray(Signed)` storage. Keep that
         // ARRAY layout on the call result so `do_fixed_newlist` reads
         // `op.result.concretetype.TO` instead of the callee's leaf name.
@@ -7795,6 +7845,7 @@ impl<'a> Lowering<'a> {
             let suffix = crate::front::result_exc::tyref_result_instantiation_suffix(
                 &call.dest.ty,
                 self.llbc,
+                self.tombstoned_leaves,
             );
             // `Result<(), PyError>`: the transformed callee returns void
             // (`tyref_result_ok_is_unit`), so the payload is `Void`, not the
@@ -7832,6 +7883,8 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.static_addrs.error_carrier,
                         ),
+                        ok_vsid: self.stamp_variant_vsid(&call.dest.ty, "Ok"),
+                        err_vsid: self.stamp_variant_vsid(&call.dest.ty, "Err"),
                     });
             }
         }
@@ -7934,7 +7987,7 @@ impl<'a> Lowering<'a> {
             && args.len() == 2
             && let Some((narrow, unsigned)) = {
                 let body = match &call.dest.ty {
-                    TyRef::Inline { value: (_, v) } | TyRef::Other(v) => Some(v),
+                    TyRef::Inline { value: (_, v) } | TyRef::Other(v) => Some(v.as_ref()),
                     TyRef::Dedup { id } => self.llbc.dedup_body(*id),
                 };
                 body.and_then(|body| strip_ty_indirections(body, self.llbc))
@@ -8565,6 +8618,7 @@ impl<'a> Lowering<'a> {
         // post-pass runs after result_exc hung LastException so the Err
         // arm can call the mapper and raise. A plain Result dest stays a
         // regular call of the extracted core body.
+
         let map_err_path = match &op_kind {
             OpKind::Call {
                 target: CallTarget::Method { name, .. },
@@ -8979,9 +9033,13 @@ impl<'a> Lowering<'a> {
     }
 
     /// `Cell<T>` is `#[repr(transparent)]` over `T`, so `get` of a field place
-    /// is that field's value read. `core::cell::Cell` only. `RefCell` /
-    /// `OnceCell` / `UnsafeCell` / `LazyCell` do not match: `OnceCell::get`
-    /// returns `Option<&T>`.
+    /// is that field's value read. `core::cell::Cell` only. Charon sometimes
+    /// drops the `core::` crate prefix, emitting `cell::Cell::get` — the
+    /// same spelling `FOREIGN_STDLIB_EXTERNALS` keys. User and nestedscope
+    /// `Cell::get` keep a crate prefix (`fixture::Cell::get`,
+    /// `pyre_object::nestedscope`) and stay residual. `RefCell` / `OnceCell`
+    /// / `UnsafeCell` / `LazyCell` do not match: `OnceCell::get` returns
+    /// `Option<&T>`.
     fn is_cell_get(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -8995,12 +9053,12 @@ impl<'a> Lowering<'a> {
         if let Some((owner, leaf)) = path.rsplit_once("::")
             && leaf_is_get(leaf)
             && owner_is_cell(owner)
-            && path.starts_with("core::cell::")
+            && is_std_cell_module_path(&path)
         {
             return true;
         }
         impl_method_owner_for_fundecl(self.llbc, fd).is_some_and(|(owner, leaf)| {
-            leaf_is_get(&leaf) && owner_is_cell(&owner) && path.starts_with("core::cell::")
+            leaf_is_get(&leaf) && owner_is_cell(&owner) && is_std_cell_module_path(&path)
         })
     }
 
@@ -9009,6 +9067,13 @@ impl<'a> Lowering<'a> {
         spec: &'a std::cell::RefCell<crate::front::clause_spec::SpecQueue>,
     ) {
         self.spec = Some(spec);
+    }
+
+    pub(in crate::front::mir) fn set_gc_root_effects(
+        &mut self,
+        cache: &'a gc_root_registration::EffectMemo,
+    ) {
+        self.gc_root_effects = Some(cache);
     }
 
     pub(in crate::front::mir) fn set_spec_body(&mut self) {
@@ -9054,7 +9119,7 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let path = fd.item_meta.name_path();
-        if !self.dont_look_inside.contains(&strip_crate_prefix(&path)) {
+        if !fun_decl_is_dont_look_inside(self.llbc, fd, self.dont_look_inside) {
             return None;
         }
         // Impl methods go through `enqueue_spec` (`cachedgraph`). A free
@@ -9224,8 +9289,7 @@ impl<'a> Lowering<'a> {
         // An impl method has no HELPER_FNADDRS row (`HelperFnAddrSkip::Generic`
         // and the impl-path split), so `FunctionDesc.cachedgraph` is its
         // specialized graph.
-        let path = fd.item_meta.name_path();
-        if self.dont_look_inside.contains(&strip_crate_prefix(&path))
+        if fun_decl_is_dont_look_inside(self.llbc, fd, self.dont_look_inside)
             && impl_method_owner_for_fundecl(self.llbc, fd).is_none()
         {
             return None;
@@ -9279,9 +9343,7 @@ impl<'a> Lowering<'a> {
         // (`complete_pending_blocks failed: Blocked block`). Decline the
         // Method hint for such a callee so it routes as a `FunctionPath`.
         let method_hint = if method_hint.is_some()
-            && self
-                .dont_look_inside
-                .contains(&strip_crate_prefix(&fd.item_meta.name_path()))
+            && fun_decl_is_dont_look_inside(self.llbc, fd, self.dont_look_inside)
         {
             None
         } else {
@@ -9484,10 +9546,7 @@ impl<'a> Lowering<'a> {
             return None;
         };
         let fd = self.llbc.fn_by_id(*id)?;
-        if self
-            .dont_look_inside
-            .contains(&strip_crate_prefix(&fd.item_meta.name_path()))
-        {
+        if fun_decl_is_dont_look_inside(self.llbc, fd, self.dont_look_inside) {
             return None;
         }
         if fd.first_arg_local_name().is_some_and(|n| n != "self") {
