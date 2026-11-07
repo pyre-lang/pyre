@@ -5530,94 +5530,15 @@ fn promote_process_evaluator_funcbox<Sym: WalkSym>(
     Ok(expected)
 }
 
-/// `executor.execute_varargs` for one residual, then the caller's
-/// `record_after_execute` hook.
-///
-/// Forces callers (`direct_call_may_force`, `direct_call_release_gil`,
-/// `direct_libffi_call`, `direct_assembler_call`) record after
-/// `vrefs_after_residual_call`, with the concrete result already known
-/// (`history.record_nospec`). Non-forces callers record where
-/// `execute_and_record_varargs` does: as soon as the helper returns, before
-/// any later op this executor emits for that call. `None` records nothing
-/// here; the caller then records a symbolic op on a decline
-/// (`!hook_state.ran`).
-///
-/// Escape handoff for a `CALL_ASSEMBLER` whose result is not the caller's
-/// dest. Constructor: `descr_call`'s tail after `__init__`. Send-ex:
-/// `_send_ex`'s tail after the portal return (`frame_finished_execution`).
-#[derive(Clone, Copy)]
-pub(crate) enum AssemblerContinuationEscape {
-    Constructor { call_pc: usize, instance: OpRef },
-    SendEx { call_pc: usize, generator: OpRef },
-}
-
-/// The executor's up-front refusal, decided before anything runs: the
-/// `(reason, funcptr, symbolic)` that makes
-/// [`try_execute_residual_call_via_executor_inner`] return
-/// `OrthodoxSubWalkTraceUnsupported` before executing the call.
-pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    _call_opcode: OpCode,
-    allboxes: &[OpRef],
-    _call_descr: &dyn majit_ir::descr::CallDescr,
-) -> Option<(&'static str, i64, i64)> {
-    // Orthodox sub-jitcode walk safety (#171 wall-5d): a residual call whose
-    // funcbox is NULL or a `symbolic_fnaddr` placeholder — a 64-bit `DefaultHasher`
-    // hash of an in-body helper's `CallPath`/`CallTarget`, minted when
-    // `jit_trace_fnaddrs()` has no entry for it (e.g. the zero-arg
-    // `SyntheticTransparentCtor "Tuple"` unit constructor inside
-    // `w_list_append`) — must not be recorded while inlining a sub-jitcode
-    // body.  The production fall-throughs below leave such a call symbolic when
-    // folding declines, on the contract that it runs at runtime against live
-    // state; but a sub-walk's recorded trace is committed and compiled, so the
-    // backend bakes the hash as a code address and the trace branches straight
-    // to it -> SIGSEGV.  Decline the whole descent so it aborts gracefully at
-    // the first un-lowered helper.  Symbolic hashes carry the
-    // `SYMBOLIC_FNADDR_BASE` high-16-bit tag no real funcptr can carry.
-    //
-    // A published address is the weaker claim that the funcptr is real, not
-    // that its signature fits the residual ABI.  The executor writes one word
-    // per `arg_types()` entry, so a helper taking a fat pointer receives its
-    // second half from whichever register the caller last wrote, and reading
-    // that as a length dereferences an address nothing chose --- a fault
-    // inside the callee, past every check this walk makes.
-    // `is_abi_unsound_argument_residual` names exactly the helpers published
-    // with such a parameter, so the descent declines before running one and
-    // the interpreter makes the call with the argument whole.
-    //
-    // A may-force residual inside a transparent helper records like any
-    // other residual (`do_residual_call`: `CALL_MAY_FORCE_*`, then
-    // `GUARD_NOT_FORCED` / the exception guard). `capture_resumedata`
-    // snapshots every `MIFrame`, and a helper walk is its own frame
-    // (`helper_subwalk_level` / `compute_inline_caller_frame`), so those
-    // guards resume inside the helper plus its callers.
-    if ctx.fbw_mode.inline_subwalk
-        && allboxes.first().is_some_and(|b| b.is_constant())
-        && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
-    {
-        if addr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(addr) {
-            // `symbolic` resolves against `symbolic_fnaddr_paths` in the
-            // build's jit metadata, so carry the hash for the report.
-            Some(("symbolic", addr, addr))
-        } else if pyre_interpreter::is_abi_unsound_argument_residual(addr as usize) {
-            // A real funcptr reached here, so there is no hash to carry, and
-            // zero is what this variant spells for that.
-            Some(("abi-unsound-arg", addr, 0))
-        } else {
-            None
-        }
-    } else {
-        None
-    }
-}
-
 /// Rebuild portal greens/reds from the helper-ABI EvalFn residual and
 /// enter `_opimpl_recursive_call` / `do_recursive_call`.
 ///
-/// `get_eval_fn()(frame, None)` is not the portal runner. `execute_varargs`
-/// of that pointer under `residual_call_r_r` returns the frame. Force the
-/// virtualizable, take `allboxes[1]` as the live `PyFrame`, and record
-/// `CALL_ASSEMBLER` / inline of `jd.portal_runner_adr` with portal ABI.
+/// ICT on the origportal stub can miss (`blackhole_result` absent, or
+/// `bytecode_for_address` empty for this walk). `get_eval_fn()(frame, None)`
+/// is still not the portal runner: `execute_varargs` of that pointer under
+/// `residual_call_r_r` returns the frame. Force the virtualizable, take
+/// `allboxes[1]` as the live `PyFrame`, and record `CALL_ASSEMBLER` /
+/// inline of `jd.portal_runner_adr` with portal ABI.
 fn try_eval_fn_residual_as_recursive_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     allboxes: &[OpRef],
@@ -5719,6 +5640,87 @@ fn try_eval_fn_residual_as_recursive_call<Sym: WalkSym>(
     }
 }
 
+/// `executor.execute_varargs` for one residual, then the caller's
+/// `record_after_execute` hook.
+///
+/// Forces callers (`direct_call_may_force`, `direct_call_release_gil`,
+/// `direct_libffi_call`, `direct_assembler_call`) record after
+/// `vrefs_after_residual_call`, with the concrete result already known
+/// (`history.record_nospec`). Non-forces callers record where
+/// `execute_and_record_varargs` does: as soon as the helper returns, before
+/// any later op this executor emits for that call. `None` records nothing
+/// here; the caller then records a symbolic op on a decline
+/// (`!hook_state.ran`).
+///
+/// Escape handoff for a `CALL_ASSEMBLER` whose result is not the caller's
+/// dest. Constructor: `descr_call`'s tail after `__init__`. Send-ex:
+/// `_send_ex`'s tail after the portal return (`frame_finished_execution`).
+#[derive(Clone, Copy)]
+pub(crate) enum AssemblerContinuationEscape {
+    Constructor { call_pc: usize, instance: OpRef },
+    SendEx { call_pc: usize, generator: OpRef },
+}
+
+/// The executor's up-front refusal, decided before anything runs: the
+/// `(reason, funcptr, symbolic)` that makes
+/// [`try_execute_residual_call_via_executor_inner`] return
+/// `OrthodoxSubWalkTraceUnsupported` before executing the call.
+pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    _call_opcode: OpCode,
+    allboxes: &[OpRef],
+    _call_descr: &dyn majit_ir::descr::CallDescr,
+) -> Option<(&'static str, i64, i64)> {
+    // Orthodox sub-jitcode walk safety (#171 wall-5d): a residual call whose
+    // funcbox is NULL or a `symbolic_fnaddr` placeholder — a 64-bit `DefaultHasher`
+    // hash of an in-body helper's `CallPath`/`CallTarget`, minted when
+    // `jit_trace_fnaddrs()` has no entry for it (e.g. the zero-arg
+    // `SyntheticTransparentCtor "Tuple"` unit constructor inside
+    // `w_list_append`) — must not be recorded while inlining a sub-jitcode
+    // body.  The production fall-throughs below leave such a call symbolic when
+    // folding declines, on the contract that it runs at runtime against live
+    // state; but a sub-walk's recorded trace is committed and compiled, so the
+    // backend bakes the hash as a code address and the trace branches straight
+    // to it -> SIGSEGV.  Decline the whole descent so it aborts gracefully at
+    // the first un-lowered helper.  Symbolic hashes carry the
+    // `SYMBOLIC_FNADDR_BASE` high-16-bit tag no real funcptr can carry.
+    //
+    // A published address is the weaker claim that the funcptr is real, not
+    // that its signature fits the residual ABI.  The executor writes one word
+    // per `arg_types()` entry, so a helper taking a fat pointer receives its
+    // second half from whichever register the caller last wrote, and reading
+    // that as a length dereferences an address nothing chose --- a fault
+    // inside the callee, past every check this walk makes.
+    // `is_abi_unsound_argument_residual` names exactly the helpers published
+    // with such a parameter, so the descent declines before running one and
+    // the interpreter makes the call with the argument whole.
+    //
+    // A may-force residual inside a transparent helper records like any
+    // other residual (`do_residual_call`: `CALL_MAY_FORCE_*`, then
+    // `GUARD_NOT_FORCED` / the exception guard). `capture_resumedata`
+    // snapshots every `MIFrame`, and a helper walk is its own frame
+    // (`helper_subwalk_level` / `compute_inline_caller_frame`), so those
+    // guards resume inside the helper plus its callers.
+    if ctx.fbw_mode.inline_subwalk
+        && allboxes.first().is_some_and(|b| b.is_constant())
+        && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
+    {
+        if addr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(addr) {
+            // `symbolic` resolves against `symbolic_fnaddr_paths` in the
+            // build's jit metadata, so carry the hash for the report.
+            Some(("symbolic", addr, addr))
+        } else if pyre_interpreter::is_abi_unsound_argument_residual(addr as usize) {
+            // A real funcptr reached here, so there is no hash to carry, and
+            // zero is what this variant spells for that.
+            Some(("abi-unsound-arg", addr, 0))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
 /// `assembler_continuation_escape` is the `CALL_ASSEMBLER` CALL pc plus the
 /// box the synthesised tail still needs (constructor instance, or the
 /// generator `_send_ex` reads). An escape latches that tail plus the caller,
@@ -5781,14 +5783,61 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         let mut boxed = allboxes.to_vec();
         boxed[0] = promote_process_evaluator_funcbox(ctx, boxed[0], addr, op_pc)?;
         let allboxes = boxed.as_slice();
-        if fbw_debug_abort_enabled() {
-            eprintln!(
-                "[eval-fn-residual] pc={op_pc} addr={addr:#x} const={} nboxes={}",
-                allboxes[0].is_constant(),
-                allboxes.len(),
-            );
-        }
         maybe_walker_vable_and_vrefs_before_residual_call(ctx, op_pc);
+        // ICT: `bytecode_for_address(EvalFn)` is the origportal stub
+        // (`recursive_call_*`). Promote first so a non-Const funcbox
+        // can hit. A miss still rebuilds greens/reds from the helper
+        // ABI (`try_eval_fn_residual_as_recursive_call`); never
+        // `execute_varargs` EvalFn.
+        if let Some((next_pc, dst_bank, dst)) = blackhole_result {
+            let mut i_args = Vec::new();
+            let mut r_args = Vec::new();
+            let mut f_args = Vec::new();
+            for (arg, ty) in allboxes.iter().skip(1).zip(call_descr.arg_types()) {
+                match *ty {
+                    majit_ir::Type::Int => i_args.push(*arg),
+                    majit_ir::Type::Ref => r_args.push(*arg),
+                    majit_ir::Type::Float => f_args.push(*arg),
+                    majit_ir::Type::Void => {}
+                }
+            }
+            match try_do_residual_or_indirect_call(
+                ctx,
+                op_pc,
+                next_pc,
+                allboxes[0],
+                &i_args,
+                &r_args,
+                &f_args,
+                dst,
+                dst_bank,
+            ) {
+                Ok(Some((outcome, _))) => {
+                    let word = match dst_bank {
+                        'r' => ctx.registers_r.get(dst),
+                        'i' => ctx.registers_i.get(dst),
+                        'f' => ctx.registers_f.get(dst),
+                        _ => None,
+                    }
+                    .map(|box_ref| super::inline_call::residual_result_word(ctx, box_ref))
+                    .unwrap_or(0);
+                    match outcome {
+                        DispatchOutcome::Continue | DispatchOutcome::SubReturn { .. } => {
+                            return Ok(ResidualExecOutcome::PortalPerformCall { result: Ok(word) });
+                        }
+                        DispatchOutcome::SubRaise { exc, exc_concrete } => {
+                            ctx.set_last_exc_value(exc, exc_concrete);
+                            return Ok(ResidualExecOutcome::PortalPerformCall {
+                                result: Err(super::inline_call::concrete_value_word(exc_concrete)),
+                            });
+                        }
+                        _ => return Err(DispatchError::callee_inline_unsupported(op_pc)),
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+        }
         match super::inline_call::perform_portal_call_from_helper(
             ctx,
             allboxes,
@@ -5808,8 +5857,6 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                         allboxes.len()
                     );
                 }
-                // Never `execute_varargs` EvalFn. Missing helper-ABI frame is
-                // a resume-image gap, not a reason to residualize the pointer.
                 return Err(DispatchError::callee_inline_unsupported(op_pc));
             }
             Err(error) => return Err(error),
@@ -5930,13 +5977,11 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         return Ok(decline_symbolic_or_pure(cannot_raise_pure, call_opcode));
     }
     // `get_eval_fn()(frame, None)` is not the portal-runner ABI. The
-    // intercept above rebuilds greens/reds and enters `do_recursive_call`.
-    // Reaching here with that pointer would `execute_varargs` EvalFn and
-    // return the frame as the result word.
+    // intercept above promotes, retries ICT on the origportal stub, then
+    // `perform_portal_call_from_helper`. Reaching here with that pointer
+    // would `execute_varargs` EvalFn and return the frame as the result
+    // word. `box_bits` can miss a ConstInt that `box_value` still sees.
     if portal_entry_for_funcptr(func_ptr) {
-        if fbw_debug_abort_enabled() {
-            eprintln!("[eval-fn-residual] pc={op_pc} execute_varargs of EvalFn skipped");
-        }
         return Err(DispatchError::callee_inline_unsupported(op_pc));
     }
     // Same unsound-argument set the inline-subwalk gate consults above.

@@ -7623,7 +7623,6 @@ impl CallControl {
         self.eval_override_graphs = paths;
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn eval_override_graphs(&self) -> &[CallPath] {
         &self.eval_override_graphs
     }
@@ -8095,7 +8094,11 @@ impl CallControl {
     /// Warmspot creates this helper after the portal graph has been split;
     /// keeping the assignment separate mirrors that construction order and
     /// prevents graph identity from standing in for runner identity.
+    /// Canonicalize to the registered graph spelling once
+    /// (`funcptr is jd.portal_runner_ptr`); later comparisons use that
+    /// identity (`GraphKey` / resolved path), not a CallPath suffix.
     pub fn set_jitdriver_portal_runner(&mut self, index: usize, runner: Option<CallPath>) {
+        let runner = runner.map(|path| self.resolved_callable_path(&path));
         self.jitdrivers_sd[index].portal_runner = runner.clone();
         if let Some(runner) = runner {
             self.stamp_portal_runner_dont_look_inside(&runner);
@@ -8110,12 +8113,7 @@ impl CallControl {
     /// of minting an AccessDirect cachedgraph outside `jit_graphs`
     /// (`check_access_directly_sanity`).
     fn stamp_portal_runner_dont_look_inside(&mut self, runner: &CallPath) {
-        let mut paths = vec![runner.clone()];
-        let resolved = self.resolved_callable_path(runner);
-        if resolved != *runner {
-            paths.push(resolved);
-        }
-        for path in paths {
+        for path in self.function_graphs.alias_paths(runner) {
             if let Some(func) = self.function_graphs.func_mut(&path) {
                 func.jit_look_inside = Some(false);
             }
@@ -8369,13 +8367,10 @@ impl CallControl {
     /// call.py `jitdriver_sd_from_portal_runner_ptr(funcptr)`.
     ///
     /// `funcptr is jd.portal_runner_ptr` is function-object identity.
-    /// Harvest may spell the same funcobj with a defining-crate prefix,
-    /// and an AccessDirect cachedgraph (if one were minted) is still
-    /// that funcptr. All of those must classify `'recursive'` so
-    /// origportal emits `recursive_call_*`. `ensure_access_directly_copy`
-    /// does not mint that cachedgraph: portal_runner_ptr is residual
-    /// (`guess_call_kind` Recursive) and the copy would sit outside
-    /// `jit_graphs` (`check_access_directly_sanity`).
+    /// Harvest aliases share a `GraphKey`; crate-prefix vs crate-stripped
+    /// spellings resolve to the same registered graph
+    /// (`resolved_callable_path`). An AccessDirect cachedgraph of that
+    /// funcobj (if one were minted) peels to the same origin.
     pub fn jitdriver_sd_from_portal_runner_ptr(
         &self,
         path: &CallPath,
@@ -8390,21 +8385,28 @@ impl CallControl {
     /// `funcptr is jd.portal_runner_ptr` for one driver's runner spelling.
     fn portal_runner_ptr_is(&self, path: &CallPath, runner: &CallPath) -> bool {
         let origin = access_directly_origin_path(path).unwrap_or_else(|| path.clone());
-        if path == runner || &origin == runner || &access_directly_path(runner) == path {
+        self.same_portal_runner_funcobj(&origin, runner)
+            || self.same_portal_runner_funcobj(path, runner)
+    }
+
+    /// Same funcobj: `GraphKey` of the registered graph, or the resolved
+    /// harvest spelling (`callable_graph_path`).
+    fn same_portal_runner_funcobj(&self, a: &CallPath, b: &CallPath) -> bool {
+        if a == b {
             return true;
         }
-        let runner_resolved = self.resolved_callable_path(runner);
-        if origin == runner_resolved || path == &runner_resolved {
+        let a_res = self.resolved_callable_path(a);
+        let b_res = self.resolved_callable_path(b);
+        if a_res == b_res {
             return true;
         }
-        if self.resolved_callable_path(&origin) == runner_resolved {
-            return true;
+        match (
+            self.function_graphs.key_for(&a_res),
+            self.function_graphs.key_for(&b_res),
+        ) {
+            (Some(ak), Some(bk)) => ak == bk,
+            _ => false,
         }
-        // `JitDriverSpec.portal_runner` is crate-stripped (`call_jit::…`);
-        // a retargeted site may keep the harvested `pyre_jit::call_jit::…`.
-        runner.segments.len() >= 2
-            && (origin.segments.ends_with(runner.segments.as_slice())
-                || path.segments.ends_with(runner.segments.as_slice()))
     }
 
     /// `call.py jitdriver_sd_from_portal_runner_ptr(funcptr) is not None`.
@@ -8867,16 +8869,6 @@ impl CallControl {
     /// backs a residual call in upstream only if the graph is not looked
     /// inside.
     fn ensure_access_directly_copy(&mut self, origin: &CallPath) -> Option<CallPath> {
-        // Origportal / EvalFn stubs `direct_call` portal_runner_ptr with
-        // the live frame. That frame is often `access_directly` (portal
-        // reds; callers of EvalFn). An AccessDirect cachedgraph of the
-        // runner would be `called` and outside `jit_graphs` — the
-        // `check_access_directly_sanity` panic. Recursive/close_stack
-        // callees are not looked inside (`guess_call_kind`); keep the
-        // call on the regular residual, same as `jit_look_inside=false`.
-        if self.is_portal_recursive_call(origin) {
-            return None;
-        }
         let aliases = self.function_graphs.alias_paths(origin);
         // `cachedgraph` stores the `(AccessDirect, None)` graph on the
         // same FunctionDesc as the regular graph. Trait-impl methods
@@ -25934,6 +25926,9 @@ mod tests {
             original.clone(),
         );
         cc.register_function_graph(runner.clone(), FunctionGraph::new("ll_portal_runner_shim"));
+        let harvested = CallPath::from_segments(["pyre_jit", "call_jit", "ll_portal_runner_shim"]);
+        cc.function_graphs_mut()
+            .share_path(harvested.clone(), &runner);
         cc.set_jitdriver_portal_runner(0, Some(runner.clone()));
         assert_eq!(
             cc.function_graphs()
@@ -25957,7 +25952,6 @@ mod tests {
             CallKind::Recursive,
             "AccessDirect cachedgraph of portal_runner_ptr is still that funcptr"
         );
-        let harvested = CallPath::from_segments(["pyre_jit", "call_jit", "ll_portal_runner_shim"]);
         assert_eq!(
             cc.guess_call_kind(&direct_call_op(CallTarget::function_path(
                 harvested.segments.clone()

@@ -3501,8 +3501,13 @@ fn register_configured_jitdrivers(
         // `split_graph_and_record_jitdriver` has copied the loop into
         // `portal_graph`. The copy keeps the marker. `guess_call_kind`
         // classifies a direct call to `portal_runner_ptr` as recursive.
+        // The runner identity is the canonical spelling
+        // `set_jitdriver_portal_runner` stored.
+        let runner = call_control
+            .jitdriver_sd_from_jitdriver(index)
+            .and_then(|jd| jd.portal_runner.clone());
         if spec.split_portal
-            && let Some(runner) = spec.portal_runner.clone()
+            && let Some(runner) = runner
             && let Some(original) = call_control.function_graphs_mut().get_mut(&spec.portal)
         {
             crate::codewriter::support::rewrite_jit_merge_point(
@@ -3514,12 +3519,9 @@ fn register_configured_jitdrivers(
             );
         }
     }
-    // 4.3 origportal-for-EvalFn is skipped in production: a slim
-    // `direct_call(portal_runner_ptr)` stub of `eval_with_jit` hits
-    // `assembler.rs` `fielddescrof` (`Cow<str>::Owned.__pos_0` on a
-    // discriminant-only layout) once the inliner walks the cloned
-    // producers. Keep + 4.2 A/B still record may-force inside helpers
-    // and route an EvalFn residual through `do_recursive_call`.
+    // `warmspot.py` origportal mutation applied to the EvalFn graph
+    // callers invoke: `direct_call(portal_runner_ptr, greens + reds)`.
+    crate::codewriter::support::rewrite_eval_override_graphs(call_control, specs);
     // `interp_jit.py class __extend__(PyFrame)` replaces the interpreter
     // function with the portal. `warmspot.py rewrite_jit_merge_point`
     // leaves the origportal as `return portal_runner(*args)`, and every
