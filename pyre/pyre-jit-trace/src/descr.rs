@@ -5436,7 +5436,10 @@ pub fn is_module_dict_version_field(descr: &DescrRef) -> bool {
 /// as a getfield). `imp` is `&'static dyn DictStrategy`
 /// (`two_word_fat_struct`); its data word and vtable word are `imp` /
 /// `imp.vtable` (`VecFieldPart::FatVtable`). `owner` is the GC owner of a
-/// per-dict strategy instance. None of the fields is `_immutable_fields_`.
+/// per-dict strategy instance. `kind` / `imp` / `imp.vtable` / `owner` are
+/// `_immutable_fields_`: the holder stands for the frozen strategy
+/// instance and is replaced, never mutated, on a strategy switch
+/// (`dictmultiobject.py W_DictMultiObject.set_strategy`).
 static DICT_STRATEGY_REF_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
     LazyLock::new(|| {
         use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
@@ -5477,7 +5480,7 @@ static DICT_STRATEGY_REF_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup
                 kind_offset,
                 core::mem::size_of::<StrategyKind>(),
                 Type::Int,
-                false,
+                true,
                 false,
                 ArrayFlag::Signed,
                 0,
@@ -5488,7 +5491,7 @@ static DICT_STRATEGY_REF_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup
                 imp_offset,
                 WORD,
                 Type::Ref,
-                false,
+                true,
                 false,
                 ArrayFlag::Pointer,
                 1,
@@ -5499,7 +5502,7 @@ static DICT_STRATEGY_REF_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup
                 imp_offset + WORD,
                 WORD,
                 Type::Ref,
-                false,
+                true,
                 false,
                 ArrayFlag::Pointer,
                 2,
@@ -5510,7 +5513,7 @@ static DICT_STRATEGY_REF_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup
                 owner_offset,
                 WORD,
                 Type::Ref,
-                false,
+                true,
                 false,
                 ArrayFlag::Pointer,
                 3,
@@ -14432,7 +14435,7 @@ mod tests {
             core::mem::size_of::<StrategyKind>()
         );
         assert_eq!(kind_field.field_type(), Type::Int);
-        assert!(!kind.is_always_pure());
+        assert!(kind.is_always_pure());
         assert!(!kind.is_quasi_immutable());
         assert_eq!(owner_field.field_key(), "owner");
         assert_eq!(
@@ -14441,12 +14444,16 @@ mod tests {
         );
         assert_eq!(owner_field.field_size(), WORD);
         assert_eq!(owner_field.field_type(), Type::Ref);
-        assert!(!owner.is_always_pure());
+        assert!(owner.is_always_pure());
         assert!(!owner.is_quasi_immutable());
         let imp = dict_strategy_ref_field_descr("imp");
         let vtable = dict_strategy_ref_field_descr("imp.vtable");
         let imp_field = imp.as_field_descr().expect("imp field descr");
         let vtable_field = vtable.as_field_descr().expect("imp.vtable field descr");
+        assert!(imp.is_always_pure());
+        assert!(!imp.is_quasi_immutable());
+        assert!(vtable.is_always_pure());
+        assert!(!vtable.is_quasi_immutable());
         assert_eq!(
             imp_field.offset(),
             core::mem::offset_of!(DictStrategyRef, imp),

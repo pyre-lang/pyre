@@ -7189,7 +7189,13 @@ pub fn nullable_to_option(w: PyObjectRef) -> Option<PyObjectRef> {
 ///
 /// It derefs to `dyn DictStrategy`, so `dict.dstrategy.getitem(..)` and every
 /// other call through the slot reads exactly as before.
+///
+/// The holder stands for the frozen strategy instance
+/// (`dictmultiobject.py DictStrategy` subclasses) and is replaced, never
+/// mutated, on a strategy switch (`dictmultiobject.py
+/// W_DictMultiObject.set_strategy`).
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("kind", "imp", "owner")]
 pub struct DictStrategyRef {
     /// `DictStrategy` class identity as a stored field (`convert_const`
     /// of a prebuilt).  Compared by [`strategy_is`] instead of a
