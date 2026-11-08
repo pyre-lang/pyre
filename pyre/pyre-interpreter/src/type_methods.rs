@@ -819,16 +819,12 @@ fn extend_from_iterable(list: PyObjectRef, other: PyObjectRef) -> Result<(), cra
     // before iterating.  A `__length_hint__` returning a negative value
     // raises ValueError, and one exceeding a C ssize_t raises OverflowError
     // (via `int_w`), rather than being silently ignored.
-    // `length_hint` returns the default verbatim when there is no hint and
-    // rejects a negative real hint, so -1 marks "no hint".  `_resize_hint`
-    // reads `space.length_hint(w_iterable, 0)`; the emulated allocation reads
-    // `PyObject_LengthHint(iterable, 8)`.
-    let raw_hint = crate::baseobjspace::length_hint(
+    let hint = crate::baseobjspace::length_hint(
         pyre_object::gc_roots::shadow_stack_get(root_base + 1),
-        -1,
+        8,
     )?;
-    let length_hint = usize::try_from(raw_hint).unwrap_or(0);
-    let hint = if raw_hint < 0 { 8 } else { length_hint };
+    // `length_hint` has already rejected negative and non-i64 values.
+    let hint = hint as usize;
     let target = pyre_object::gc_roots::shadow_stack_get(root_base);
     let source = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     let current_size = unsafe { pyre_object::w_list_len(target) };
@@ -839,6 +835,10 @@ fn extend_from_iterable(list: PyObjectRef, other: PyObjectRef) -> Result<(), cra
         if current_size + hint > (isize::MAX as usize) / std::mem::size_of::<PyObjectRef>() {
             return Err(crate::PyError::memory_error(""));
         }
+        // ListStrategy._extend_from_iterable: `w_list._resize_hint(w_list.length() + length_hint)`.
+        // [3.15-spec] The backing capacity is what `list.__sizeof__` reports, so the
+        // reservation is sized the `list_extend_iter_lock_held` way: `list_preallocate_exact`
+        // for an empty receiver, `list_resize(m + n)` otherwise, with a default hint of 8.
         let exact_dict = unsafe {
             pyre_object::is_dict(source)
                 && crate::objspace::std::mapdict::instance_getclass(source)
@@ -854,18 +854,6 @@ fn extend_from_iterable(list: PyObjectRef, other: PyObjectRef) -> Result<(), cra
             // is refused before the iterator is walked.
             return Err(crate::PyError::memory_error(""));
         }
-        // ListStrategy._extend_from_iterable: `w_list._resize_hint(newsize_hint)`.
-        if length_hint != 0
-            && let Some(newsize_hint) = current_size.checked_add(length_hint)
-            && !unsafe {
-                pyre_object::listobject::w_list_resize_hint(
-                    pyre_object::gc_roots::shadow_stack_get(root_base),
-                    newsize_hint as i64,
-                )
-            }
-        {
-            return Err(crate::PyError::memory_error(""));
-        }
     }
     let extended = do_extend_from_iterable(
         pyre_object::gc_roots::shadow_stack_get(root_base),
@@ -873,22 +861,13 @@ fn extend_from_iterable(list: PyObjectRef, other: PyObjectRef) -> Result<(), cra
     )?;
     // "cut back if the length hint was too large":
     // `if extended < length_hint: w_list._resize_hint(w_list.length())`.
-    let length =
-        unsafe { pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(root_base)) };
-    if extended < length_hint
-        && !unsafe {
-            pyre_object::listobject::w_list_resize_hint(
-                pyre_object::gc_roots::shadow_stack_get(root_base),
-                length as i64,
-            )
+    // [3.15-spec] The cut back is `list_resize(Py_SIZE(self))`.
+    if extended < hint {
+        unsafe {
+            pyre_object::listobject::w_list_finish_extend(pyre_object::gc_roots::shadow_stack_get(
+                root_base,
+            ));
         }
-    {
-        return Err(crate::PyError::memory_error(""));
-    }
-    unsafe {
-        pyre_object::listobject::w_list_finish_extend(pyre_object::gc_roots::shadow_stack_get(
-            root_base,
-        ));
     }
     Ok(())
 }

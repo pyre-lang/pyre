@@ -1719,9 +1719,15 @@ macro_rules! typed_items_block_grow {
                     );
                 }
                 if !old.is_null() {
-                    dealloc_typed_items_block(
-                        crate::gc_roots::shadow_stack_get(old_root) as *mut TypedItemsBlock
-                    );
+                    // A block outside the collector's heap (no GC installed, or
+                    // the items-block gate off) has no other owner to free it.
+                    // Traced code allocates its blocks from the collector, so
+                    // this arm is the interpreter's alone.
+                    if !majit_rlib::jit::we_are_jitted() {
+                        dealloc_typed_items_block(
+                            crate::gc_roots::shadow_stack_get(old_root) as *mut TypedItemsBlock
+                        );
+                    }
                 }
                 Some(crate::gc_roots::shadow_stack_get(fresh_root) as *mut TypedItemsBlock)
             }

@@ -10214,11 +10214,6 @@ enum FbwListEffect {
     Append {
         list: pyre_object::PyObjectRef,
         length_before: usize,
-        /// `PyListObject.allocated` as the specialization read it before the
-        /// append.  The length rewind alone would leave the over-allocation
-        /// the eager append computed, so the undo restores the field the same
-        /// way it restores the length.
-        allocated_before: isize,
     },
     PopEnd {
         list: pyre_object::PyObjectRef,

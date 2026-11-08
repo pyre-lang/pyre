@@ -1515,16 +1515,11 @@ pub(crate) fn fbw_store_journal_pop() {
 /// append's gate), so the rewind is allocation-free.
 // Consumed by the #171 `list.append` orthodox descent
 // (`try_walker_orthodox_list_append`).
-pub(crate) fn fbw_list_journal_push_append(
-    list: pyre_object::PyObjectRef,
-    length_before: usize,
-    allocated_before: isize,
-) {
+pub(crate) fn fbw_list_journal_push_append(list: pyre_object::PyObjectRef, length_before: usize) {
     FBW_LIST_EFFECT_JOURNAL.with(|j| {
         j.borrow_mut().push(FbwListEffect::Append {
             list,
             length_before,
-            allocated_before,
         })
     });
     // gh#467: see `fbw_store_journal_push`.
@@ -1588,7 +1583,6 @@ pub(crate) fn fbw_append_promote_journal_rollback_newest() {
 pub(crate) fn fbw_rewind_unjournaled_list_append(
     list: pyre_object::PyObjectRef,
     length_before: usize,
-    allocated_before: isize,
 ) {
     unsafe {
         let current = pyre_object::w_list_len(list);
@@ -1637,7 +1631,6 @@ pub(crate) fn fbw_rewind_unjournaled_list_append(
                 return;
             }
         }
-        pyre_object::listobject::w_list_set_allocated(list, allocated_before);
     }
 }
 
@@ -3143,15 +3136,13 @@ mod foriter_delivery_tests {
             pyre_object::listobject::w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
         unsafe { w_list_append(list, w_int_new(4)) };
         let len0 = unsafe { w_list_len(list) };
-        let alloc0 = unsafe { pyre_object::listobject::w_list_allocated(list) };
         assert!(unsafe { w_list_can_append_without_realloc(list) });
 
-        fbw_list_journal_push_append(list, len0, alloc0);
+        fbw_list_journal_push_append(list, len0);
         unsafe { w_list_append(list, w_int_new(5)) };
         let mark = fbw_effect_journal_mark();
         let len1 = unsafe { w_list_len(list) };
-        let alloc1 = unsafe { pyre_object::listobject::w_list_allocated(list) };
-        fbw_list_journal_push_append(list, len1, alloc1);
+        fbw_list_journal_push_append(list, len1);
         unsafe { w_list_append(list, w_int_new(6)) };
         assert_eq!(unsafe { w_list_len(list) }, len0 + 2);
         assert_eq!(fbw_executed_effect_count(), 2);
@@ -3265,12 +3256,11 @@ fn undo_store_journal_entry(
 
 fn undo_list_effect_entry(entry: FbwListEffect) {
     unsafe {
-        let (list, length_before, allocated_before) = match entry {
+        let (list, length_before) = match entry {
             FbwListEffect::Append {
                 list,
                 length_before,
-                allocated_before,
-            } => (list, length_before, allocated_before),
+            } => (list, length_before),
             FbwListEffect::PopEnd {
                 list,
                 length_before,
@@ -3381,7 +3371,6 @@ fn undo_list_effect_entry(entry: FbwListEffect) {
             // walker has a BytesBlock store emitter.
             pyre_object::listobject::ListStrategy::Bytes => {}
         }
-        pyre_object::listobject::w_list_set_allocated(list, allocated_before);
     }
 }
 

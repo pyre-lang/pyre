@@ -23601,7 +23601,7 @@ pub fn sort_list_in_place(
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         // [3.15-spec] `list_sort_impl` restores `saved_ob_item`/`saved_allocated`
         // so `__sizeof__` after sort equals before. Read physical capacity
-        // before the Empty detach; `w_list_allocated` is not this value.
+        // before the Empty detach; Range has no backing.
         let saved_capacity = pyre_object::listobject::w_list_physical_size(list);
         // Snapshot through getitem + pin, not a bare Vec: integer/float/range
         // strategies box each element (`getitems_copy`), and a Rust Vec of
@@ -23640,7 +23640,7 @@ pub fn sort_list_in_place(
         if let Some(saved_capacity) = saved_capacity {
             let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
             let live = pyre_object::listobject::w_list_len(list);
-            pyre_object::listobject::w_list_publish_allocated_capacity(
+            pyre_object::listobject::w_list_publish_physical_capacity(
                 list,
                 saved_capacity.max(live),
             );

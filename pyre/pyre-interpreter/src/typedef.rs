@@ -7780,23 +7780,16 @@ crate::builtin_wrapper_descriptor!(
 fn list_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_slot(args, 0)?;
     let list = crate::type_methods::require_list_receiver(args, "__sizeof__", false)?;
-    // CPython 3.14 `list___sizeof___impl`: dynamic `tp_basicsize` plus one
-    // pointer-sized word for every logically allocated item slot.
     let w_type = crate::typedef::r#type(list)
         .map(|tp| tp.as_ptr())
         .unwrap_or_else(|| gettypeobject(&pyre_object::LIST_TYPE));
     let basicsize = cpython_type_layout(w_type)
         .expect("list and its subclasses have CPython layout metadata")
         .0;
-    let allocated = unsafe { pyre_object::listobject::w_list_allocated(list) };
-    // `list_sort_impl` temporarily writes -1 while the items are detached, and
-    // that sentinel is what the modification check reads back. It is not part
-    // of the size a build without a global interpreter lock reports: a list
-    // observed mid-sort answers its `tp_basicsize` and nothing more, so the
-    // detached state contributes no slots rather than wrapping in `size_t`.
-    let slots = allocated.max(0) as usize;
-    let size =
-        (basicsize as usize).wrapping_add(slots.wrapping_mul(std::mem::size_of::<PyObjectRef>()));
+    // [3.15-spec] list___sizeof___impl (Py_GIL_DISABLED arm) ↔ PyPy has no list.__sizeof__
+    let capacity = unsafe { pyre_object::listobject::w_list_allocated(list) } as usize;
+    let size = (basicsize as usize)
+        .wrapping_add(capacity.wrapping_mul(std::mem::size_of::<PyObjectRef>()));
     Ok(w_int_new(size as i64))
 }
 
