@@ -1,5 +1,6 @@
 # CPython-suite gap: iterator consumers do not hot-loop mixed-MRO StopIteration subclasses.
 # parity-tests reason: pins exhaustion classification without inflating the synth protocol gate.
+# pyre-check: pypy-diverges: yield-from StopIteration value is the slot (PropStop(5) with value property 99 -> 5; raising property -> no error); pypy3 getattr's the property
 
 """Iterator consumers recognize StopIteration through either MRO order."""
 
@@ -46,5 +47,59 @@ for _ in range(3000):
         assert consume_for(stop_type) == [2, 1, 0]
         assert max(MixedStop(3, stop_type)) == 2
         assert collect_args(*MixedStop(3, stop_type)) == (2, 1, 0)
+
+
+class PropStop(StopIteration):
+    @property
+    def value(self):
+        return 99
+
+
+class ItProp:
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raise PropStop(5)
+
+
+def g_prop():
+    return (yield from ItProp())
+
+
+try:
+    next(g_prop())
+except StopIteration as e:
+    assert e.value == 5, e.value
+else:
+    raise AssertionError('g_prop yielded')
+
+
+class BadStop(StopIteration):
+    @property
+    def value(self):
+        raise KeyError('boom')
+
+
+class ItBad:
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raise BadStop()
+
+
+def g_bad():
+    return (yield from ItBad())
+
+
+try:
+    next(g_bad())
+except StopIteration as e:
+    assert e.value is None, e.value
+except Exception as e:
+    raise AssertionError(f'expected no error from the property, got {type(e).__name__}: {e}')
+else:
+    raise AssertionError('g_bad yielded')
 
 print("OK")

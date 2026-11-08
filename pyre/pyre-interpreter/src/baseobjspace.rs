@@ -23763,25 +23763,28 @@ pub fn generator_send_ex_body(gen_obj: PyObjectRef, w_arg_or_err: PyObjectRef) -
     }
 }
 
-/// Resume the iterator recorded by a suspended `yield from`.
+/// `pyopcode.py next_yield_from(w_yf, w_inputvalue_or_err)`.
 ///
-/// `pyopcode.py next_yield_from(w_yf, w_inputvalue_or_err)`. `Some` is a
-/// value yielded by the delegate and is therefore also the outer generator's
-/// result.  `None` means the delegate completed and the outer frame has been
-/// positioned at the completion path.
-pub(crate) fn resume_yield_from(
+/// Fetch the next item of the current `yield from`.  `Ok(Some(v))` is the
+/// value the delegate yielded — pyre's stand-in for `pushvalue` plus
+/// `raise Yield`; the caller pushes it or returns it as this frame's yield.
+/// `Ok(None)` means the delegate is exhausted: the stop value is already on
+/// the frame stack.  `Err` is any other exception; `w_yielding_from` stays
+/// null.  SEND dispatch and `resume_execute_frame` both call this.
+pub(crate) fn next_yield_from(
     frame: &mut crate::pyframe::PyFrame,
     w_yf: PyObjectRef,
-    w_arg_or_err: PyObjectRef,
+    w_inputvalue_or_err: PyObjectRef,
 ) -> Result<Option<PyObjectRef>, PyError> {
     debug_assert!(!w_yf.is_null());
 
     // `pyframe.py resume_execute_frame` clears `w_yielding_from` before
-    // `next_yield_from`, where the frame, the delegate, and `w_arg_or_err`
-    // are GC locals across the delegate call.
+    // `next_yield_from`, where the frame, the delegate, and
+    // `w_inputvalue_or_err` are GC locals across the delegate call.  The
+    // tracer callback and `send_ex` both run Python.
     let anchor = crate::eval::FrameAnchor::new(frame);
     let roots = pyre_object::gc_roots::push_roots();
-    let yf_slot = roots.publish(&[w_yf, w_arg_or_err]);
+    let yf_slot = roots.publish(&[w_yf, w_inputvalue_or_err]);
     let arg_slot = yf_slot + 1;
     roots.normalize(yf_slot, pyre_object::gc_roots::shadow_stack_len() - yf_slot);
 
@@ -23789,10 +23792,10 @@ pub(crate) fn resume_yield_from(
     // descr_close already closed and cleared the delegate.
     let result = if unsafe { pyre_object::generator::is_generator_or_coroutine(roots.get(yf_slot)) }
     {
-        // `GeneratorOrCoroutine.send_ex(w_arg_or_err)`.
+        // `GeneratorOrCoroutine.send_ex(w_inputvalue_or_err)`.
         generator_send_ex(roots.get(yf_slot), roots.get(arg_slot))
     } else if unsafe { pyre_object::generator::is_async_gen_asend(roots.get(yf_slot)) } {
-        // `AsyncGenASend.do_send(w_arg_or_err)` — performance only.
+        // `AsyncGenASend.do_send(w_inputvalue_or_err)` — performance only.
         async_gen_asend_do_send(roots.get(yf_slot), roots.get(arg_slot))
     } else if unsafe { pyre_object::is_none(roots.get(arg_slot)) } {
         next(roots.get(yf_slot))
@@ -23800,12 +23803,15 @@ pub(crate) fn resume_yield_from(
         delegate_to_nongen(roots.get(yf_slot), roots.get(arg_slot))
     };
 
-    let frame = unsafe { &mut *anchor.live() };
     match result {
         Ok(value) => {
-            // pyopcode.py `next_yield_from`: publish the delegate
-            // only after its call has yielded.  While the delegate is
-            // executing, `gi_yieldfrom` must therefore remain None.
+            // Pin the yielded value before the `w_yielding_from` store; that
+            // write barrier can collect.  Publish the delegate only after
+            // its call has yielded, so `gi_yieldfrom` stays None while the
+            // delegate runs (`pyopcode.py next_yield_from`).
+            let result_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(value);
+            let frame = unsafe { &mut *anchor.live() };
             frame.w_yielding_from = roots.get(yf_slot);
             if pyre_object::gc_hook::try_gc_owns_object(
                 frame as *mut crate::pyframe::PyFrame as pyre_object::gc_hook::GCREF,
@@ -23814,17 +23820,61 @@ pub(crate) fn resume_yield_from(
                     frame as *mut crate::pyframe::PyFrame as pyre_object::gc_hook::GCREF,
                 );
             }
-            Ok(Some(value))
+            Ok(Some(roots.get(result_slot)))
         }
         Err(err) => {
-            frame.w_yielding_from = pyre_object::PY_NULL;
-            let (stop, err) = err.matches_stop_iteration_keep();
-            if stop {
-                finish_yield_from(frame, err)?;
-                Ok(None)
-            } else {
-                Err(err)
+            let (stop, mut err) = err.matches_stop_iteration_keep();
+            if !stop {
+                return Err(err);
             }
+            let err_slot = err.pin(&roots);
+            // [3.15-spec] `pyopcode.py next_yield_from` calls
+            // `_report_stopiteration_sometimes` (generator | AsyncGenASend |
+            // traceback).  `INSTRUMENTED_END_SEND` / `monitor_stop_iteration`
+            // reports only when the delegate is a generator or an exact
+            // coroutine.  Measured python3.15.0rc2: `yield from inner()` and `await coro_inner()`
+            // fire StopIteration in the consumer; `yield from It()` with a
+            // Python `__next__` fires only in `__next__`; `await
+            // a.__anext__()` fires none in the consumer.  pypy3 reports the
+            // last two in the consumer.  No `@jit.*` on `next_yield_from` or
+            // `_report_stopiteration_sometimes`.  Reuse
+            // `ExecutionContext::exception_trace` on the live frame; FOR_ITER
+            // keeps `_report_stopiteration_sometimes` unchanged.
+            if unsafe { pyre_object::generator::is_generator_or_coroutine(roots.get(yf_slot)) } {
+                let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+                if !ec.is_null() {
+                    let traced = unsafe { (*ec).exception_trace(anchor.live(), &mut err) };
+                    err.reload(&roots, err_slot);
+                    traced?;
+                }
+            }
+            err.reload(&roots, err_slot);
+            // [3.15-spec] `pyopcode.py next_yield_from` does
+            // `space.getattr(e.get_w_value(space), "value")` and swallows
+            // AttributeError.  `_PyGen_FetchStopIterationValue` reads the
+            // StopIteration value slot.  Measured python3.15.0rc2:
+            // `PropStop(5)` with a `value` property returning 99 yields 5;
+            // a `value` property that raises `KeyError` yields no error
+            // (slot `None`).  pypy3 answers 99 / `KeyError`.  Read
+            // `w_exception_get_value`, the word `MEMBER_STOP_ITERATION_VALUE`
+            // returns.  `matches_stop_iteration_keep` can be true with a
+            // null `exc_object` (kind tag); that carrier has no value slot,
+            // so the result is None.  No `@jit.*` governs the getattr.
+            let w_stop_value = if !err.exc_object.is_null()
+                && unsafe { pyre_object::is_exception(err.exc_object) }
+            {
+                let value = unsafe {
+                    pyre_object::interp_exceptions::w_exception_get_value(err.exc_object)
+                };
+                if value.is_null() { w_none() } else { value }
+            } else {
+                w_none()
+            };
+            let value_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(w_stop_value);
+            let frame = unsafe { &mut *anchor.live() };
+            frame.pushvalue(roots.get(value_slot));
+            Ok(None)
         }
     }
 }
@@ -23905,22 +23955,12 @@ fn delegate_to_nongen(w_yf: PyObjectRef, w_arg_or_err: PyObjectRef) -> PyResult 
     }
 }
 
-/// Put the stopped delegate's return value through the `SEND` completion
-/// edge.  The iterator remains on the operand stack until `END_SEND` removes
-/// it, exactly as it does when exhaustion happens during bytecode dispatch.
-fn finish_yield_from(frame: &mut crate::pyframe::PyFrame, err: PyError) -> Result<(), PyError> {
+/// Position the frame at the SEND completion target after the delegate is
+/// exhausted.  `pyframe.py resume_execute_frame` continues after
+/// `next_yield_from` returns; SEND's completion edge is that continuation.
+/// The iterator remains on the operand stack until `END_SEND` removes it.
+pub(crate) fn position_after_send(frame: &mut crate::pyframe::PyFrame) -> Result<(), PyError> {
     use crate::bytecode::Instruction;
-
-    // `getattr` collects, which moves a nursery frame.
-    let anchor = crate::eval::FrameAnchor::new(frame);
-    let value = if !err.exc_object.is_null() && unsafe { pyre_object::is_exception(err.exc_object) }
-    {
-        getattr_str(err.exc_object, "value").unwrap_or_else(|_| w_none())
-    } else {
-        w_none()
-    };
-    let frame = unsafe { &mut *anchor.live() };
-    frame.pushvalue(value);
 
     let code = frame.code();
     let last_instr = frame.last_instr.max(0) as usize;
