@@ -7588,6 +7588,17 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         }
         exec_result
     };
+    // `executor.py _do_call` wraps each `cpu.bh_call_*` in
+    // `except Exception as e: metainterp.execute_raised(e)`, so the exception
+    // lands in `MetaInterp.last_exc_value` before
+    // `pyjitpl.py execute_and_record_varargs` records. The `Err` word is a
+    // bare copy; recording below can leave it pointing at a moved nursery
+    // object while `walk_session_roots` forwards the session slot.
+    if let Err(exc) = exec_result {
+        ctx.set_last_exc_value_concrete(ConcreteValue::Ref(
+            exc as usize as pyre_object::PyObjectRef,
+        ));
+    }
     // Publish the Ref into the slot reserved above `residual_locals_roots`.
     // The word returned here is the address at publication. A later minor
     // forwards the slot; the Ok arm re-reads it.
@@ -7879,7 +7890,12 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                                 let live = pin.as_ref().map_or(value as usize, |p| p.get().0);
                                 (OpRef::const_ptr(majit_ir::GcRef(live)), pin, 0, false)
                             }
-                            Err(exc) => (OpRef::const_ptr(majit_ir::GcRef::NULL), None, exc, true),
+                            Err(exc) => (
+                                OpRef::const_ptr(majit_ir::GcRef::NULL),
+                                None,
+                                published_residual_exc(ctx, exc),
+                                true,
+                            ),
                         };
                     match escape {
                         AssemblerContinuationEscape::Constructor { call_pc, .. } => {
@@ -7923,7 +7939,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                         0,
                         false,
                     ),
-                    Err(exc) => (None, exc, true),
+                    Err(exc) => (None, published_residual_exc(ctx, exc), true),
                 };
                 // Same portal latch as the escape-flush commit above.
                 // `run_perfn_walk`'s VableEscape epilogue adopts this image
@@ -8108,8 +8124,8 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             // raise — an exception surfacing out of a frame that raised
             // nothing.  `BH_LAST_EXC_VALUE` stays as `execute_residual_call`
             // left it (cleared on read): the escape's consumers take the
-            // exception from `exec_result` directly, so restoring it would only
-            // outlive the walk.
+            // forwarded value published by `execute_raised`, so restoring it
+            // would only outlive the walk.
             if exec_result.is_err()
                 && let Some(cb) = crate::callbacks::try_get()
             {
@@ -8401,31 +8417,16 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                 }
             }
         }
-        Err(bh_exc) => {
+        Err(_) => {
             fbw_count_executed_residual(is_void, is_may_force);
-            // `metainterp.execute_raised(exception, constant=False)`
-            // analogue — seed the standing exception
-            // state so downstream walker chain (`reraise/`,
-            // `last_exc_value/>r`, `handle_possible_exception` guard
-            // emission) sees a non-null `last_exc_value` and routes
-            // through the GuardException path.
-            //
-            // `execute_residual_call` consumes `BH_LAST_EXC_VALUE` when it
-            // returns this `Err`.  Do not republish it: RPython transfers the
-            // value into `MetaInterp.last_exc_value` exactly once, and the
-            // walker shadow below is that owner.  Do not republish the
-            // consumed value into TLS as well.  An
-            // uncaught raise is carried by the trace's exception FINISH; an
-            // aborted walk re-executes the live opcode.
-            //
-            // `execute_ll_raised(llexception, constant=False)` writes only
-            // `last_exc_value` (the concrete) and the flag.  `last_exc_box` is
-            // the `GUARD_EXCEPTION` result `handle_possible_exception` assigns
-            // when the class is not already const — never `ConstPtr` of this
-            // recording-time object.
-            ctx.set_last_exc_value_concrete(ConcreteValue::Ref(
-                bh_exc as usize as pyre_object::PyObjectRef,
-            ));
+            // The value was handed to `last_exc_value` at execute time
+            // (`executor.py _do_call` → `metainterp.execute_raised(e)`), before
+            // `pyjitpl.py execute_and_record_varargs` records. This arm does
+            // only the `constant=False` flag and the backend-cell drain.
+            debug_assert!(
+                matches!(ctx.last_exc_value_concrete(), ConcreteValue::Ref(p) if !p.is_null()),
+                "execute_raised published last_exc_value before recording"
+            );
             // `execute_raised(..., constant=False)`:
             // a residual exception has not had its class proven by a guard yet.
             ctx.fbw_mode.class_of_last_exc_is_const = false;
@@ -8445,6 +8446,14 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         }
     }
     Ok(ResidualExecOutcome::Executed(exec_result))
+}
+
+/// The forwarded exception `execute_raised` published (step 1).
+fn published_residual_exc<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, stale: i64) -> i64 {
+    match ctx.last_exc_value_concrete() {
+        ConcreteValue::Ref(p) if !p.is_null() => p as usize as i64,
+        _ => stale,
+    }
 }
 
 /// `pyjitpl.py MetaInterp.direct_call_release_gil` port.
