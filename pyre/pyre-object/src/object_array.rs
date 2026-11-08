@@ -490,9 +490,11 @@ pub extern "C" fn jit_ll_arraycopy(
 /// rgc.py `ll_arraycopy` for the object `ItemsBlock` ARRAY.
 ///
 /// `@specialize.ll()` gives every ARRAY its own `ll_arraycopy` graph, and its
-/// `length <= 1` `copy_item` head ("Hack to ensure that we get a proper
-/// effectinfo.write_descrs_arrays") is the getarrayitem / setarrayitem
-/// writeanalyze reads that ARRAY's effects off. Longer copies run the shared
+/// `length <= 1` head is rgc.py `copy_item` (`dest[di] = source[si]`): a
+/// getarrayitem plus the `setarrayitem` writeanalyze reads that ARRAY's
+/// effects off ("Hack to ensure that we get a proper
+/// effectinfo.write_descrs_arrays"). The store is [`items_block_set_ref`],
+/// the write-barriered `setarrayitem`. Longer copies run the shared
 /// barrier-plus-memcpy body, [`jit_ll_arraycopy`].
 ///
 /// # Safety
@@ -507,10 +509,9 @@ pub unsafe fn ll_arraycopy_items_block(
 ) {
     if length <= 1 {
         if length == 1 {
-            // rgc.py `copy_item`: `dest[dest_start] = source[source_start]`.
+            // rgc.py `copy_item`: `dest[di] = source[si]`.
             let item = unsafe { *items_block_items_base(source).add(source_start as usize) };
-            let dest_managed = majit_gc::gc_varsize_layout(dest as usize).is_some();
-            unsafe { arraycopy_store_item(dest, dest_start as usize, item, dest_managed) };
+            unsafe { items_block_set_ref(dest, dest_start as usize, item) };
         }
         return;
     }

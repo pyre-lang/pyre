@@ -627,9 +627,10 @@ impl W_ListObject {
             return Some(obj);
         }
         if capacity == 0 {
+            // rlist._ll_list_resize_hint_really newsize <= 0 / _ll_new_empty_item_array
             let list = &mut *(obj as *mut W_ListObject);
             let old = list.bytes_items.block;
-            list.bytes_items.block = std::ptr::null_mut();
+            list.bytes_items.block = crate::object_array::ll_prebuilt_empty_items_block();
             list.bytes_items.set_len(0);
             if !majit_rlib::jit::we_are_jitted() {
                 dealloc_list_items_block(old);
@@ -705,9 +706,10 @@ impl W_ListObject {
             return Some(obj);
         }
         if capacity == 0 {
+            // rlist._ll_list_resize_hint_really newsize <= 0 / _ll_new_empty_item_array
             let list = &mut *(obj as *mut W_ListObject);
             let old = list.ascii_items.block;
-            list.ascii_items.block = std::ptr::null_mut();
+            list.ascii_items.block = crate::object_array::ll_prebuilt_empty_items_block();
             list.ascii_items.set_len(0);
             if !majit_rlib::jit::we_are_jitted() {
                 dealloc_list_items_block(old);
@@ -3415,11 +3417,15 @@ pub unsafe fn ll_list_int_resize_hint_really(obj: PyObjectRef, newsize: i64, ove
     if newsize <= 0 {
         debug_assert!(newsize == 0, "negative list length");
         let list = &mut *(obj as *mut W_ListObject);
+        let old = ll_list_int_items(list);
         ll_list_int_set_len(list, 0);
         ll_list_int_set_items(
             list,
             crate::object_array::ll_prebuilt_empty_int_items_block(),
         );
+        if !majit_rlib::jit::we_are_jitted() {
+            crate::object_array::dealloc_typed_items_block(old);
+        }
         return;
     }
     let list = &*(obj as *const W_ListObject);
@@ -3617,11 +3623,15 @@ pub unsafe fn ll_list_float_resize_hint_really(obj: PyObjectRef, newsize: i64, o
     if newsize <= 0 {
         debug_assert!(newsize == 0, "negative list length");
         let list = &mut *(obj as *mut W_ListObject);
+        let old = ll_list_float_items(list);
         ll_list_float_set_len(list, 0);
         ll_list_float_set_items(
             list,
             crate::object_array::ll_prebuilt_empty_float_items_block(),
         );
+        if !majit_rlib::jit::we_are_jitted() {
+            crate::object_array::dealloc_typed_items_block(old);
+        }
         return;
     }
     let list = &*(obj as *const W_ListObject);
@@ -5613,12 +5623,17 @@ unsafe fn resize_backing_to(obj: PyObjectRef, root_base: usize, target: usize) -
                 (list.int_items.block, list.int_items.len())
             };
             let fresh = if target == 0 {
+                // rlist._ll_list_resize_hint_really newsize <= 0 / _ll_new_empty_item_array
                 // A block outside the collector's heap (no GC installed) has no other
                 // owner to free it; a collector-owned one is left to the collector.
                 if !majit_rlib::jit::we_are_jitted() {
                     crate::object_array::dealloc_typed_items_block(old);
                 }
-                std::ptr::null_mut()
+                if float {
+                    crate::object_array::ll_prebuilt_empty_float_items_block()
+                } else {
+                    crate::object_array::ll_prebuilt_empty_int_items_block()
+                }
             } else {
                 let grown = if float {
                     crate::object_array::try_grow_float_items_block(old, target, len)
@@ -5668,8 +5683,8 @@ fn list_resize_target(current_cap: usize, old_size: usize, new_size: usize) -> u
 ///
 /// Empty dest with `target > 0` switches to SizeListStrategy with that
 /// sizehint (`list_preallocate_exact` / `list_resize` reservation). Size
-/// dest is a no-op: the existing sizehint already wins in
-/// `switch_to_correct_strategy`. Range dest is `_resize_hint`'s no-op.
+/// dest stores `target` into the existing sizehint cell
+/// (`SizeListStrategy._resize_hint`). Range dest is `_resize_hint`'s no-op.
 unsafe fn publish_physical_capacity(_obj: PyObjectRef, root_base: usize, target: usize) -> bool {
     let obj = crate::gc_roots::shadow_stack_get(root_base);
     match (*(obj as *const W_ListObject)).strategy {
@@ -5691,7 +5706,19 @@ unsafe fn publish_physical_capacity(_obj: PyObjectRef, root_base: usize, target:
             list.items = crate::gc_roots::shadow_stack_get(state_slot) as *mut ItemsBlock;
             true
         }
-        ListStrategy::Size | ListStrategy::SimpleRange | ListStrategy::Range => true,
+        ListStrategy::Size => {
+            // SizeListStrategy._resize_hint: store the hint into the
+            // already-allocated sizehint cell. No malloc, no pin, no
+            // write barrier for the int store.
+            let Ok(sizehint) = isize::try_from(target) else {
+                return false;
+            };
+            let obj = crate::gc_roots::shadow_stack_get(root_base);
+            let list = &*(obj as *const W_ListObject);
+            set_sizehint_state_value(list.items, sizehint as i64);
+            true
+        }
+        ListStrategy::SimpleRange | ListStrategy::Range => true,
         _ => {
             if let Some(current) = strategy_capacity(&*(obj as *const W_ListObject)) {
                 if current != target && !resize_backing_to(obj, root_base, target) {
@@ -5797,15 +5824,19 @@ unsafe fn reserve_for_extend_target(list: &W_ListObject, extra: usize) -> Option
     }
 }
 
-/// `rlist.py _ll_list_resize_hint`: look inside when capacity and `extra` are
-/// constant. Empty dest is `EmptyListStrategy._resize_hint` (SizeListStrategy,
-/// no backing alloc); a typed dest is `_ll_list_resize_hint_really` with
-/// overallocate-False so the 3.15 `list_resize` / `list_preallocate_exact`
-/// target is installed exactly.
+/// `rlist.py _ll_list_resize_hint`:
+/// `@jit.look_inside_iff(lambda l, newsize: jit.isconstant(len(l.items)) and jit.isconstant(newsize))`.
+/// Callers pass `newsize = length() + extra`; Empty dest is
+/// `EmptyListStrategy._resize_hint` (SizeListStrategy, no backing alloc);
+/// a typed dest is `_ll_list_resize_hint_really` with overallocate-False so
+/// the 3.15 `list_resize` / `list_preallocate_exact` target is installed exactly.
 fn w_list_reserve_for_extend_iff(obj: PyObjectRef, extra: usize) -> bool {
     unsafe {
-        let cap = strategy_capacity(&*(obj as *const W_ListObject)).unwrap_or(0);
-        majit_rlib::jit::isconstant(&cap) && majit_rlib::jit::isconstant(&extra)
+        let list = &*(obj as *const W_ListObject);
+        let cap = strategy_capacity(list).unwrap_or(0);
+        let live_len = list.live_len();
+        let newsize = live_len.wrapping_add(extra);
+        majit_rlib::jit::isconstant(&cap) && majit_rlib::jit::isconstant(&newsize)
     }
 }
 
@@ -5851,7 +5882,12 @@ pub unsafe fn w_list_reserve_for_extend(obj: PyObjectRef, extra: usize) {
                 list.strategy = ListStrategy::Size;
                 list.items = state as *mut ItemsBlock;
             }
-            ListStrategy::Size | ListStrategy::SimpleRange | ListStrategy::Range => {}
+            ListStrategy::Size => {
+                // SizeListStrategy._resize_hint: store the hint into the
+                // already-allocated sizehint cell. No malloc, no extra pin.
+                set_sizehint_state_value(list.items, target as i64);
+            }
+            ListStrategy::SimpleRange | ListStrategy::Range => {}
             _ => {
                 if let Some(current) = strategy_capacity(list)
                     && current != target
@@ -7022,19 +7058,19 @@ pub unsafe fn w_list_clear(obj: PyObjectRef) {
         }
         ListStrategy::Integer | ListStrategy::IntOrFloat => {
             let list = &mut *(obj as *mut W_ListObject);
-            list.int_items.install(IntArray::empty());
+            list.int_items.set_len(0);
         }
         ListStrategy::Float => {
             let list = &mut *(obj as *mut W_ListObject);
-            list.float_items.install(FloatArray::empty());
+            list.float_items.set_len(0);
         }
         ListStrategy::Bytes => {
             let list = &mut *(obj as *mut W_ListObject);
-            list.bytes_items.install(BytesArray::empty());
+            list.bytes_items.set_len(0);
         }
         ListStrategy::Ascii => {
             let list = &mut *(obj as *mut W_ListObject);
-            list.ascii_items.install(UnicodeArray::empty());
+            list.ascii_items.set_len(0);
         }
         ListStrategy::SimpleRange => {
             let _ = install_range_state(obj, ListStrategy::SimpleRange, &[0]);
@@ -7048,6 +7084,7 @@ pub unsafe fn w_list_clear(obj: PyObjectRef) {
     let obj = crate::gc_roots::shadow_stack_get(root_base);
     let list = &mut *(obj as *mut W_ListObject);
     list.set_length_relaxed(0);
+    let _ = publish_physical_capacity(obj, root_base, 0);
 }
 
 /// listobject.py EmptyListStrategy.switch_to_correct_strategy —
@@ -8806,7 +8843,10 @@ mod tests {
             w_list_clear(list);
             let l = &*(list as *const W_ListObject);
             assert_eq!(l.strategy, ListStrategy::Integer);
-            assert!(l.int_items.block.is_null());
+            assert!(std::ptr::eq(
+                l.int_items.block,
+                crate::object_array::ll_prebuilt_empty_int_items_block()
+            ));
             assert!(l.float_items.block.is_null());
             assert!(l.bytes_items.block.is_null());
             assert!(l.ascii_items.block.is_null());
@@ -8816,6 +8856,73 @@ mod tests {
             let l = &*(list as *const W_ListObject);
             assert_eq!(l.strategy, ListStrategy::Integer);
             assert_eq!(w_list_len(list), 1);
+        }
+    }
+
+    #[test]
+    fn typed_clear_to_capacity_zero_uses_prebuilt_empty_block() {
+        let integer = w_list_new(vec![w_int_new(1), w_int_new(2)]);
+        let float = w_list_new(vec![
+            crate::floatobject::w_float_new(1.5),
+            crate::floatobject::w_float_new(2.5),
+        ]);
+        let bytes = w_list_new(vec![
+            crate::bytesobject::w_bytes_from_bytes(b"a"),
+            crate::bytesobject::w_bytes_from_bytes(b"b"),
+        ]);
+        let ascii = w_list_new(vec![crate::w_str_new("a"), crate::w_str_new("b")]);
+        unsafe {
+            w_list_clear(integer);
+            let l = &*(integer as *const W_ListObject);
+            assert_eq!(l.strategy, ListStrategy::Integer);
+            assert!(
+                std::ptr::eq(
+                    l.int_items.block,
+                    crate::object_array::ll_prebuilt_empty_int_items_block()
+                ),
+                "Integer block after clear"
+            );
+            w_list_append(integer, w_int_new(9));
+            assert_eq!(w_list_len(integer), 1);
+
+            w_list_clear(float);
+            let l = &*(float as *const W_ListObject);
+            assert_eq!(l.strategy, ListStrategy::Float);
+            assert!(
+                std::ptr::eq(
+                    l.float_items.block,
+                    crate::object_array::ll_prebuilt_empty_float_items_block()
+                ),
+                "Float block after clear"
+            );
+            w_list_append(float, crate::floatobject::w_float_new(3.5));
+            assert_eq!(w_list_len(float), 1);
+
+            w_list_clear(bytes);
+            let l = &*(bytes as *const W_ListObject);
+            assert_eq!(l.strategy, ListStrategy::Bytes);
+            assert!(
+                std::ptr::eq(
+                    l.bytes_items.block,
+                    crate::object_array::ll_prebuilt_empty_items_block()
+                ),
+                "Bytes block after clear"
+            );
+            w_list_append(bytes, crate::bytesobject::w_bytes_from_bytes(b"c"));
+            assert_eq!(w_list_len(bytes), 1);
+
+            w_list_clear(ascii);
+            let l = &*(ascii as *const W_ListObject);
+            assert_eq!(l.strategy, ListStrategy::Ascii);
+            assert!(
+                std::ptr::eq(
+                    l.ascii_items.block,
+                    crate::object_array::ll_prebuilt_empty_items_block()
+                ),
+                "Ascii block after clear"
+            );
+            w_list_append(ascii, crate::w_str_new("c"));
+            assert_eq!(w_list_len(ascii), 1);
         }
     }
 
