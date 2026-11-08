@@ -735,6 +735,36 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 parent_frames.len()
             );
         }
+        // `GUARD_NO_EXCEPTION` / `GUARD_EXCEPTION` failure is `blackhole.py
+        // handle_exception_in_frame`: skip `-live-`, jump to this frame's
+        // `catch_exception`. Swallowing a numbering miss collapsed those
+        // guards to the Python CALL (`BINARY_POWER`) and left the residual
+        // exception pending for a caller's `except OverflowError`.
+        // Number this looked-inside helper before `numbered_helper_guard_resume`:
+        // its after-residual `Frames` and CALL-entry collapse resume as if
+        // the residual returned, so the exception becomes a stack value.
+        // `GUARD_NOT_FORCED` keeps the CALL-boundary collapse
+        // `helper_subwalk_level` `Ok(None)` preserved for FOR_ITER.
+        let exception_guard = matches!(
+            ctx.trace_ctx.last_guard_opcode(),
+            Some(OpCode::GuardNoException | OpCode::GuardException)
+        );
+        if exception_guard && ctx.fbw_mode.transparent_helper_subwalk {
+            let frames = looked_inside_helper_resume_frames(
+                ctx,
+                op_pc,
+                after_residual_call,
+                &scope,
+                parent_frames.clone(),
+                true,
+            )?;
+            return walker_capture_transparent_helper_snapshot(
+                ctx,
+                op_pc,
+                frames,
+                scope.guard_stamp,
+            );
+        }
         if helper_chain == HelperChain::Numbered {
             match numbered_helper_guard_resume(
                 ctx,
@@ -767,13 +797,6 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         // a residual call does not push a frame. Portal helpers that
         // `helper_subwalk_level` left unpushed (`NoHelper`) are still this
         // walk (`transparent_helper_subwalk`).
-        // `GUARD_NO_EXCEPTION` / `GUARD_EXCEPTION` failure is `blackhole.py
-        // handle_exception_in_frame`: skip `-live-`, jump to this frame's
-        // `catch_exception`. Swallowing a numbering miss collapsed those
-        // guards to the Python CALL (`BINARY_POWER`) and left the residual
-        // exception pending for a caller's `except OverflowError`.
-        // `GUARD_NOT_FORCED` keeps the CALL-boundary collapse
-        // `helper_subwalk_level` `Ok(None)` preserved for FOR_ITER.
         // A non-exception guard in an unpublished portal helper
         // (`HelperChain::NoHelper`) uses the same numbering when every
         // helper section has a resume marker that
@@ -791,26 +814,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         // `_setup_return_value_*` writes the helper's return into a Python caller
         // paused after the CALL (`get_list_of_active_boxes(in_a_call=True)`),
         // never into a CALL-entry image.
-        let exception_guard = matches!(
-            ctx.trace_ctx.last_guard_opcode(),
-            Some(OpCode::GuardNoException | OpCode::GuardException)
-        );
-        if ctx.fbw_mode.transparent_helper_subwalk && exception_guard {
-            let frames = looked_inside_helper_resume_frames(
-                ctx,
-                op_pc,
-                after_residual_call,
-                &scope,
-                parent_frames.clone(),
-                true,
-            )?;
-            return walker_capture_transparent_helper_snapshot(
-                ctx,
-                op_pc,
-                frames,
-                scope.guard_stamp,
-            );
-        } else if ctx.fbw_mode.transparent_helper_subwalk && helper_chain == HelperChain::NoHelper {
+        if ctx.fbw_mode.transparent_helper_subwalk && helper_chain == HelperChain::NoHelper {
             let converted = unpublished_helper_resumes_at_call_entry(ctx);
             if !converted {
                 let frames = looked_inside_helper_resume_frames(
@@ -2168,20 +2172,6 @@ fn caller_non_call_operand_count(
         // inlines each bound's `__index__` from this residual; with no arm
         // `CallStack::NoOperandShape` left the body a residual `BinarySlice`.
         pyre_interpreter::Instruction::BinarySlice => 3,
-        // `[list, iterable]`. `list_extend` pops the iterable; the list is
-        // peeked in place (`list_extend_value`).
-        pyre_interpreter::Instruction::ListExtend { .. } => 1,
-        // `[collection, value]`. `opcode_list_append` / `set_add` /
-        // `set_update` / `dict_update` / `dict_merge` each pop the value;
-        // the receiver is peeked in place.
-        pyre_interpreter::Instruction::ListAppend { .. }
-        | pyre_interpreter::Instruction::SetAdd { .. }
-        | pyre_interpreter::Instruction::SetUpdate { .. }
-        | pyre_interpreter::Instruction::DictUpdate { .. }
-        | pyre_interpreter::Instruction::DictMerge { .. } => 1,
-        // `[dict, key, value]`. `map_add` pops value then key; the dict is
-        // peeked in place (`map_add_value`).
-        pyre_interpreter::Instruction::MapAdd { .. } => 2,
         // `[value, obj, key]`. `opcode_store_subscr` pops key, obj, then
         // value, so `value` is the deepest of the three.
         pyre_interpreter::Instruction::StoreSubscr => 3,
@@ -2232,15 +2222,16 @@ fn caller_non_call_operand_count(
         // Contiguous TOS of `2 * n` items (`opcode_build_map` `pop_n(size * 2)`).
         pyre_interpreter::Instruction::BuildMap { count } => (count.get(op_arg) as usize) * 2,
         // `[collection, value]`. `list_extend` / `list_append` / `set_add` /
-        // `set_update` / `dict_update` pop TOS then `peek_at(oparg - 1)`
-        // (`eval.rs`). On entry the collection sits `oparg` below TOS, so
-        // the contiguous block is `oparg + 1`. `LIST_EXTEND 1` is
-        // `[list, iterable]`.
+        // `set_update` / `dict_update` / `dict_merge` pop TOS then
+        // `peek_at(oparg - 1)` (`eval.rs` `list_extend` / `opcode_list_append`).
+        // On entry the collection sits `oparg` below TOS, so the contiguous
+        // block is `oparg + 1`. `LIST_EXTEND 1` is `[list, iterable]`.
         pyre_interpreter::Instruction::ListExtend { i }
         | pyre_interpreter::Instruction::ListAppend { i }
         | pyre_interpreter::Instruction::SetAdd { i }
         | pyre_interpreter::Instruction::SetUpdate { i }
-        | pyre_interpreter::Instruction::DictUpdate { i } => (i.get(op_arg) as usize) + 1,
+        | pyre_interpreter::Instruction::DictUpdate { i }
+        | pyre_interpreter::Instruction::DictMerge { i } => (i.get(op_arg) as usize) + 1,
         // `[dict, key, value]`. `map_add` pops value then key, then
         // `peek_at(oparg - 1)` (`eval.rs`).
         pyre_interpreter::Instruction::MapAdd { i } => (i.get(op_arg) as usize) + 2,
@@ -2316,8 +2307,8 @@ mod caller_operand_slots_tests {
         );
     }
 
-    /// `LIST_EXTEND 1` consumes `[list, iterable]`: pop the iterable, then
-    /// `peekvalue(oparg - 1)` the list (`pyopcode.py` `LIST_EXTEND`).
+    /// `LIST_EXTEND 1` is `[list, iterable]`: pop the iterable, then
+    /// `peek_at(oparg - 1)` the list (`eval.rs` `list_extend`).
     #[test]
     fn caller_operand_slots_list_extend_is_collection_plus_iterable() {
         let instruction = pyre_interpreter::Instruction::ListExtend {
@@ -3479,8 +3470,7 @@ pub(crate) fn compute_paused_helper_caller_frame<Sym: WalkSym>(
 /// A resume section `rebuild_from_resumedata` can turn back into a Python
 /// frame. The codeless slot 0 (and constructor tails) have no `CodeObject`.
 pub(crate) fn jitcode_index_names_python_code(jitcode_index: u32) -> bool {
-    crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
-        .is_some_and(|pjc| pjc.is_populated() && !pjc.code_ptr.is_null())
+    crate::state::jitcode_names_python_code(jitcode_index as i32)
 }
 
 /// Capture the current inlined Python frame at a translated helper call's
@@ -4150,6 +4140,20 @@ pub(crate) fn numbered_helper_guard_resume<Sym: WalkSym>(
         return Ok(NumberedHelperGuard::Frames(parent_frames));
     }
     if heap_moved || journal_delta != 0 {
+        // The residual already ran. `capture_resumedata` still numbers the
+        // live helper at this guard (`pyjitpl.py`); CALL-entry collapse
+        // would re-enter the Python CALL and run the callback twice
+        // (`blackhole.py` `convert_and_run_from_pyjitpl` copies `MIFrame.pc`,
+        // never a pc before an effect that frame applied).
+        if python_chain_complete && sections_have_markers {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[numbered-helper-guard] frames-after-effect op_pc={op_pc} \
+                     blocker={any_blocker} heap_moved={heap_moved} journal_delta={journal_delta}"
+                );
+            }
+            return Ok(NumberedHelperGuard::Frames(parent_frames));
+        }
         if fbw_debug_abort_enabled() {
             for (i, frame) in parent_frames.iter().enumerate() {
                 let blocker = frame.resume_marker_jit_pc.map(|pc| {

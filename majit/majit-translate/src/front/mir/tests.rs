@@ -2895,6 +2895,26 @@ fn w_set_items_fieldread_bases_are_defined() {
     );
 }
 
+/// `funccall_flat_from_args` stores locals with `set_locals_w` and does
+/// not call `remember_frame_locals` (`function.py` `funccall` FLATPYCALL).
+#[test]
+fn funccall_flat_from_args_does_not_residualize_remember_frame_locals() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
+    let graph = super::lower_function(&llbc, "pyre_interpreter::function::funccall_flat_from_args")
+        .expect("lower funccall_flat_from_args");
+    assert!(
+        !calls_leaf(&graph, "remember_frame_locals"),
+        "funccall_flat_from_args still calls remember_frame_locals\n{}",
+        graph.dump()
+    );
+    assert!(
+        !calls_leaf(&graph, "remember_frame_locals_array"),
+        "funccall_flat_from_args still calls remember_frame_locals_array\n{}",
+        graph.dump()
+    );
+}
+
 /// `w_type_set_w_doc` is `type_write_barrier(obj); t.w_doc = w_doc`.
 /// The barrier call is dropped and the `setfield` stays; the backend
 /// rewrite puts `COND_CALL_GC_WB` in front of it.
