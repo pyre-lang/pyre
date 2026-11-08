@@ -1682,7 +1682,8 @@ fn descent_decline(
 /// scan proves there (`entry_array_len`, the length of a gateway's argument
 /// array), so an arm those facts exclude on every path to `pc` is not
 /// counted. Callees named by `inline_call_*` past `pc` count with their
-/// whole-body summary.
+/// whole-body summary. An inline callee with a callable `fnaddr` contributes
+/// no body blockers: the blackhole calls it natively (`bhimpl_inline_call_*`).
 pub(crate) fn helper_resume_reaches_blocker(
     jitcode_index: usize,
     pc: usize,
@@ -1710,7 +1711,21 @@ pub(crate) fn helper_resume_reaches_blocker(
                 descrs
                     .at(descr_index)
                     .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
-                    .map(descent_blocker_summary)
+                    .map(|callee_index| {
+                        // `bhimpl_inline_call_*` calls `jitcode.fnaddr` and does
+                        // not interpret this body; the native call can still
+                        // allocate, raise or write the heap.
+                        let calls_native = jitcode_fnaddr_for_descr(descr_index)
+                            .is_some_and(|fnaddr| !blackhole_interprets_inline_callee(fnaddr));
+                        if calls_native {
+                            DescentBlockerSummary {
+                                may_execute_effect: true,
+                                ..DescentBlockerSummary::default()
+                            }
+                        } else {
+                            descent_blocker_summary(callee_index)
+                        }
+                    })
             },
             &mut |_blocker, _effect| true,
             &mut residual_call_is_effect_free,

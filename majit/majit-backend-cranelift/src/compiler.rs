@@ -380,6 +380,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_alloc_nursery_typed(Some(alloc_nursery_typed_via_active_runtime));
     majit_gc::set_active_thread_has_gc_box(Some(gc_box::present));
     majit_gc::set_active_raise_memory_error(Some(raise_memory_error));
+    majit_gc::set_active_exception_occurred(Some(jit_exc_is_pending));
     majit_gc::set_active_alloc_nursery_headerless_no_collect(Some(
         alloc_nursery_headerless_no_collect_via_active_runtime,
     ));

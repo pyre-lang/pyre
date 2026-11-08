@@ -205,7 +205,14 @@ pub fn try_gc_alloc(type_id: u32, payload_size: usize) -> Option<GCREF> {
 // The `NoRoute` / `Failed` split is the allocator's contract, not this hook
 // layer's, so it lives with the allocator (`majit_gc`). The hooks here answer
 // in `Option<GCREF>` and classify with `GcAllocOutcome::from_hook`.
-pub use majit_gc::{GcAllocOutcome, gc_alloc_failed};
+pub use majit_gc::{GcAllocOutcome, gc_alloc_failed, gc_alloc_failed_pending};
+
+/// Null from [`try_gc_alloc_stable_raw`] / [`GcAllocOutcome::allocated_or_raise`]
+/// is a host malloc only when no collector refused the request.
+#[inline]
+pub fn host_fallback_on_null(raw: GCREF) -> bool {
+    raw.is_null() && !majit_gc::gc_alloc_failed_pending()
+}
 
 pub fn register_gc_alloc_with_placement_hook(hook: GcAllocWithPlacementHookFn) {
     GC_ALLOC_WITH_PLACEMENT_HOOK.set(Some(hook));
@@ -1359,14 +1366,42 @@ mod tests {
 
     #[test]
     fn only_no_route_returns_the_caller_to_its_raw_path() {
-        // `Failed` does not return at all, so the surviving `None` is the sole
-        // licence for a `malloc_raw` fallback.
+        // `allocated_or_abort` still aborts on `Failed`, so the surviving
+        // `None` is the sole licence for a `malloc_raw` fallback there.
         assert!(GcAllocOutcome::NoRoute.allocated_or_abort(24).is_none());
         let mut probe = 0u8;
         assert_eq!(
             GcAllocOutcome::Allocated((&mut probe as *mut u8).cast()).allocated_or_abort(24),
             Some((&mut probe as *mut u8).cast())
         );
+    }
+
+    #[test]
+    fn allocated_or_raise_failed_returns_none_after_storing_memory_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _hook_lock = hook_test_guard();
+        static PENDING: AtomicBool = AtomicBool::new(false);
+        fn raise() {
+            PENDING.store(true, Ordering::SeqCst);
+        }
+        fn occurred() -> bool {
+            PENDING.load(Ordering::SeqCst)
+        }
+        PENDING.store(false, Ordering::SeqCst);
+        majit_gc::set_active_raise_memory_error(Some(raise));
+        majit_gc::set_active_exception_occurred(Some(occurred));
+        assert!(GcAllocOutcome::Failed.allocated_or_raise().is_none());
+        assert!(majit_gc::gc_alloc_failed_pending());
+        assert!(!host_fallback_on_null(core::ptr::null_mut()));
+        // `exc_data` is not reset by a later malloc (`rpyexc_occurred`).
+        assert!(GcAllocOutcome::NoRoute.allocated_or_raise().is_none());
+        assert!(majit_gc::gc_alloc_failed_pending());
+        assert!(!host_fallback_on_null(core::ptr::null_mut()));
+        PENDING.store(false, Ordering::SeqCst);
+        assert!(!majit_gc::gc_alloc_failed_pending());
+        assert!(host_fallback_on_null(core::ptr::null_mut()));
+        majit_gc::set_active_raise_memory_error(None);
+        majit_gc::set_active_exception_occurred(None);
     }
 
     #[test]

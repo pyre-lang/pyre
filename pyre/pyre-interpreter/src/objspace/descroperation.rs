@@ -1054,13 +1054,15 @@ pub(crate) fn _int_add(x: i64, y: i64) -> PyResult {
     let Some(r) = x.checked_add(y) else {
         return _int_add_ovf(x, y);
     };
-    Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
-        ob_header: PyObject {
-            ob_type: &INT_TYPE as *const PyType,
-            w_class: get_instantiate(&INT_TYPE),
-        },
-        intval: r,
-    }) as PyObjectRef)
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_IntObject {
+            ob_header: PyObject {
+                ob_type: &INT_TYPE as *const PyType,
+                w_class: get_instantiate(&INT_TYPE),
+            },
+            intval: r,
+        }
+    ) as PyObjectRef)
 }
 
 /// `_ovf2long` of `descr_add`, traced like `ovf2long`: the success trace of
@@ -1087,13 +1089,15 @@ pub(crate) fn _int_sub(x: i64, y: i64) -> PyResult {
     };
     let _roots = pyre_object::gc_roots::push_roots();
     let w_class = pyre_object::gc_roots::pin_root(get_instantiate(&INT_TYPE));
-    Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
-        ob_header: PyObject {
-            ob_type: &INT_TYPE as *const PyType,
-            w_class,
-        },
-        intval: r,
-    }) as PyObjectRef)
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_IntObject {
+            ob_header: PyObject {
+                ob_type: &INT_TYPE as *const PyType,
+                w_class,
+            },
+            intval: r,
+        }
+    ) as PyObjectRef)
 }
 
 /// `_ovf2long` of `descr_sub`, traced like `ovf2long`: the success trace of
@@ -1117,13 +1121,15 @@ pub(crate) fn _int_mul(x: i64, y: i64) -> PyResult {
     };
     let _roots = pyre_object::gc_roots::push_roots();
     let w_class = pyre_object::gc_roots::pin_root(get_instantiate(&INT_TYPE));
-    Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
-        ob_header: PyObject {
-            ob_type: &INT_TYPE as *const PyType,
-            w_class,
-        },
-        intval: r,
-    }) as PyObjectRef)
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_IntObject {
+            ob_header: PyObject {
+                ob_type: &INT_TYPE as *const PyType,
+                w_class,
+            },
+            intval: r,
+        }
+    ) as PyObjectRef)
 }
 
 /// `_ovf2long` of `descr_mul`, traced like `ovf2long`: the success trace of
@@ -1146,13 +1152,15 @@ pub(crate) fn _truediv(x: i64, y: i64) -> PyResult {
         return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
     let value = (x as f64) / (y as f64);
-    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-        ob_header: PyObject {
-            ob_type: &FLOAT_TYPE as *const PyType,
-            w_class: get_instantiate(&FLOAT_TYPE),
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_FloatObject {
+            ob_header: PyObject {
+                ob_type: &FLOAT_TYPE as *const PyType,
+                w_class: get_instantiate(&FLOAT_TYPE),
+            },
+            floatval: value,
         },
-        floatval: value,
-    }) as PyObjectRef)
+    ) as PyObjectRef)
 }
 
 /// `descr_truediv`: unbox, then `_truediv`, catching the mantissa
@@ -1860,35 +1868,41 @@ unsafe fn is_float_pair(a: PyObjectRef, b: PyObjectRef) -> bool {
 /// body lives in each leaf the way it lives in [`_truediv`].
 #[inline(never)]
 pub(crate) fn _float_add(x: f64, y: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-        ob_header: PyObject {
-            ob_type: &FLOAT_TYPE as *const PyType,
-            w_class: get_instantiate(&FLOAT_TYPE),
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_FloatObject {
+            ob_header: PyObject {
+                ob_type: &FLOAT_TYPE as *const PyType,
+                w_class: get_instantiate(&FLOAT_TYPE),
+            },
+            floatval: x + y,
         },
-        floatval: x + y,
-    }) as PyObjectRef)
+    ) as PyObjectRef)
 }
 
 #[inline(never)]
 pub(crate) fn _float_sub(x: f64, y: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-        ob_header: PyObject {
-            ob_type: &FLOAT_TYPE as *const PyType,
-            w_class: get_instantiate(&FLOAT_TYPE),
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_FloatObject {
+            ob_header: PyObject {
+                ob_type: &FLOAT_TYPE as *const PyType,
+                w_class: get_instantiate(&FLOAT_TYPE),
+            },
+            floatval: x - y,
         },
-        floatval: x - y,
-    }) as PyObjectRef)
+    ) as PyObjectRef)
 }
 
 #[inline(never)]
 pub(crate) fn _float_mul(x: f64, y: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-        ob_header: PyObject {
-            ob_type: &FLOAT_TYPE as *const PyType,
-            w_class: get_instantiate(&FLOAT_TYPE),
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_FloatObject {
+            ob_header: PyObject {
+                ob_type: &FLOAT_TYPE as *const PyType,
+                w_class: get_instantiate(&FLOAT_TYPE),
+            },
+            floatval: x * y,
         },
-        floatval: x * y,
-    }) as PyObjectRef)
+    ) as PyObjectRef)
 }
 
 #[inline(never)]
@@ -1896,13 +1910,15 @@ pub(crate) fn _float_truediv(x: f64, y: f64) -> PyResult {
     if y == 0.0 {
         return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
-    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-        ob_header: PyObject {
-            ob_type: &FLOAT_TYPE as *const PyType,
-            w_class: get_instantiate(&FLOAT_TYPE),
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_FloatObject {
+            ob_header: PyObject {
+                ob_type: &FLOAT_TYPE as *const PyType,
+                w_class: get_instantiate(&FLOAT_TYPE),
+            },
+            floatval: x / y,
         },
-        floatval: x / y,
-    }) as PyObjectRef)
+    ) as PyObjectRef)
 }
 
 unsafe fn float_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -2044,21 +2060,27 @@ unsafe fn int_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // intobject.py `_pow_nomod`: exponentiation by squaring with an
     // overflow check at each machine multiplication. `checked_mul` is the
     // Rust source spelling the MIR front lowers back to `int_mul_ovf`.
+    // `int_pow_nomod`'s error is built by an allocating constructor, so the
+    // exponent object stays rooted for `_pow_ovf2long`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let exponent_root = pyre_object::gc_roots::pin_roots(&[b]);
     match int_pow_nomod(va, vb) {
         Ok(r) => Ok(w_int_new(r)),
-        Err(_) => pow_ovf2long(va, vb),
+        Err(_) => pow_ovf2long(va, pyre_object::gc_roots::shadow_stack_get(exponent_root)),
     }
 }
 
-/// intobject.py `_pow_ovf2long`: `W_LongObject.fromint(iv)` then `descr_pow`,
-/// which returns the wrapped long. The recovery is one opaque residual so
-/// the traced `int_pow` except arm is a bound word-ABI `PyObjectRef` call
-/// (`getfunctionptr` of `_pow_ovf2long`) rather than a `BigInt` payload the
-/// residual ABI cannot publish.
-#[majit_macros::dont_look_inside]
-fn pow_ovf2long(iv: i64, iw: i64) -> PyResult {
-    let base = BigInt::from(iv);
-    Ok(w_long_new(bigint_int_pow_nomod(&base, iw)?))
+/// intobject.py `_pow_ovf2long`: `W_LongObject.fromint(iv)` then its
+/// `descr_pow` with the original exponent object.
+/// `call.py CallControl.get_jitcode_calldescr` publishes the native
+/// function pointer the blackhole's `inline_call` invokes.
+#[majit_macros::getfunctionptr]
+unsafe fn pow_ovf2long(iv: i64, w_iw: PyObjectRef) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let exponent_root = pyre_object::gc_roots::pin_roots(&[w_iw]);
+    let w_iv = pyre_object::longobject::w_long_from_i64(iv);
+    let w_iw = pyre_object::gc_roots::shadow_stack_get(exponent_root);
+    long_pow(w_iv, w_iw)
 }
 
 /// Negative-exponent `int ** int` float route, kept opaque so `int_pow`
@@ -2116,10 +2138,6 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
     if va.int_eq(1) {
         return Ok(w_long_new(BigInt::from(1)));
-    }
-    if va.int_eq(-1) {
-        let even = vb.digit(0) & 1 == 0;
-        return Ok(w_long_new(BigInt::from(if even { 1 } else { -1 })));
     }
     // longobject.py: `descr_pow` keeps a `W_IntObject` exponent
     // unwrapped (`exp_bigint` stays None) and calls `rbigint.int_pow`; only a
@@ -2678,7 +2696,7 @@ pub(crate) unsafe fn list_concat(mut a: PyObjectRef, mut b: PyObjectRef) -> PyRe
     if len_a == 0
         && let Some(clone) = pyre_object::with_roots!(a, b => pyre_object::listobject::w_list_clone_if_shared_strategy(b))
     {
-        return Ok(clone);
+        return crate::runtime_ops::obj_or_memory_error(clone);
     }
     // `W_ListObject.descr_add`: same-strategy storage append, otherwise
     // `getitems_copy` into an object list. Bytes/Ascii keep the loop below.
@@ -2686,7 +2704,7 @@ pub(crate) unsafe fn list_concat(mut a: PyObjectRef, mut b: PyObjectRef) -> PyRe
         a,
         b => pyre_object::listobject::w_list_add_unwrapped(a, b)
     ) {
-        return Ok(sum);
+        return crate::runtime_ops::obj_or_memory_error(sum);
     }
     // `w_list_getitem` boxes on the Range/Integer/Float strategies, and
     // `w_list_new` itself allocates, so a copy already made would sit
@@ -2710,11 +2728,14 @@ pub(crate) unsafe fn list_concat(mut a: PyObjectRef, mut b: PyObjectRef) -> PyRe
             fetched += 1;
         }
     }
-    let mut items = Vec::with_capacity(fetched);
+    let mut items = Vec::new();
+    items
+        .try_reserve_exact(fetched)
+        .map_err(|_| crate::builtins::reservation_failed())?;
     for i in 0..fetched {
         items.push(pyre_object::gc_roots::shadow_stack_get(items_base + i));
     }
-    Ok(w_list_new(items))
+    crate::runtime_ops::obj_or_memory_error(w_list_new(items))
 }
 
 pub(crate) unsafe fn tuple_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -2751,7 +2772,7 @@ pub(crate) unsafe fn list_repeat(mut list: PyObjectRef, n: PyObjectRef) -> PyRes
     if let Some(clone) =
         pyre_object::with_roots!(list => pyre_object::listobject::w_list_clone_if_size(list))
     {
-        return Ok(clone);
+        return crate::runtime_ops::obj_or_memory_error(clone);
     }
     let len = w_list_len(list);
     let cap = len
@@ -2767,7 +2788,7 @@ pub(crate) unsafe fn list_repeat(mut list: PyObjectRef, n: PyObjectRef) -> PyRes
     if let Some(repeated) = pyre_object::with_roots!(
         list => pyre_object::listobject::w_list_repeat_unwrapped(list, count)
     ) {
-        return Ok(repeated);
+        return crate::runtime_ops::obj_or_memory_error(repeated);
     }
     // RPython `ll_mul` allocates the result through `ll_newlist(resultlen)`;
     // the fallible Rust helper is translated as `newlist_hint(cap)`, keeping
@@ -2799,7 +2820,7 @@ pub(crate) unsafe fn list_repeat(mut list: PyObjectRef, n: PyObjectRef) -> PyRes
     for i in 0..pinned.len() {
         items.push(pinned[i]);
     }
-    Ok(w_list_new(items))
+    crate::runtime_ops::obj_or_memory_error(w_list_new(items))
 }
 
 /// listobject.py descr_inplace_mul — repeat the list in place; the
@@ -6619,13 +6640,15 @@ pub fn float_pow_raw(x: f64, y: f64) -> Result<f64, PyError> {
 #[inline(never)]
 pub(crate) fn float_pow_impl(x: f64, y: f64) -> PyResult {
     match float_pow_inner(x, y) {
-        Ok(z) => Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-            ob_header: PyObject {
-                ob_type: &FLOAT_TYPE as *const PyType,
-                w_class: get_instantiate(&FLOAT_TYPE),
-            },
-            floatval: z,
-        }) as PyObjectRef),
+        Ok(z) => crate::runtime_ops::fresh_alloc_or_memory_error!(
+            pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+                ob_header: PyObject {
+                    ob_type: &FLOAT_TYPE as *const PyType,
+                    w_class: get_instantiate(&FLOAT_TYPE),
+                },
+                floatval: z,
+            }) as PyObjectRef
+        ),
         // Negative numbers raised to fractional powers become complex.
         Err(FloatPowError::Domain) => unsafe {
             complex_pow(w_complex_new(x, 0.0), w_complex_new(y, 0.0))
@@ -7809,27 +7832,31 @@ fn bad_operand_type(descr: &str, a: PyObjectRef) -> PyError {
 /// no overflow diamond.
 #[inline(never)]
 pub(crate) fn _int_neg(x: i64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
-        ob_header: PyObject {
-            ob_type: &INT_TYPE as *const PyType,
-            w_class: get_instantiate(&INT_TYPE),
-        },
-        // `0 - x`, not `wrapping_neg`: Charon leaves the rustc intrinsic
-        // as `residual_call_ir_i`, while subtraction is `int_sub`.
-        intval: 0i64.wrapping_sub(x),
-    }) as PyObjectRef)
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_IntObject {
+            ob_header: PyObject {
+                ob_type: &INT_TYPE as *const PyType,
+                w_class: get_instantiate(&INT_TYPE),
+            },
+            // `0 - x`, not `wrapping_neg`: Charon leaves the rustc intrinsic
+            // as `residual_call_ir_i`, while subtraction is `int_sub`.
+            intval: 0i64.wrapping_sub(x),
+        }
+    ) as PyObjectRef)
 }
 
 /// floatobject.py `descr_float` copy arm: `W_FloatObject(self.floatval)`.
 #[inline(never)]
 pub fn _float_pos(x: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-        ob_header: PyObject {
-            ob_type: &FLOAT_TYPE as *const PyType,
-            w_class: get_instantiate(&FLOAT_TYPE),
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_FloatObject {
+            ob_header: PyObject {
+                ob_type: &FLOAT_TYPE as *const PyType,
+                w_class: get_instantiate(&FLOAT_TYPE),
+            },
+            floatval: x,
         },
-        floatval: x,
-    }) as PyObjectRef)
+    ) as PyObjectRef)
 }
 
 /// ll_math.py `sqrt_nonneg`: `math_sqrt(x)`. The domain check stays in the
@@ -7864,85 +7891,99 @@ pub fn ll_math_sqrt(x: f64) -> Result<f64, PyError> {
 /// ll_math.py `ll_math_sin` after the finite pin: `W_FloatObject(sin(x))`.
 #[inline(never)]
 pub fn _float_sin(x: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-        ob_header: PyObject {
-            ob_type: &FLOAT_TYPE as *const PyType,
-            w_class: get_instantiate(&FLOAT_TYPE),
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_FloatObject {
+            ob_header: PyObject {
+                ob_type: &FLOAT_TYPE as *const PyType,
+                w_class: get_instantiate(&FLOAT_TYPE),
+            },
+            floatval: x.sin(),
         },
-        floatval: x.sin(),
-    }) as PyObjectRef)
+    ) as PyObjectRef)
 }
 
 /// ll_math.py `ll_math_cos` after the finite pin: `W_FloatObject(cos(x))`.
 #[inline(never)]
 pub fn _float_cos(x: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-        ob_header: PyObject {
-            ob_type: &FLOAT_TYPE as *const PyType,
-            w_class: get_instantiate(&FLOAT_TYPE),
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_FloatObject {
+            ob_header: PyObject {
+                ob_type: &FLOAT_TYPE as *const PyType,
+                w_class: get_instantiate(&FLOAT_TYPE),
+            },
+            floatval: x.cos(),
         },
-        floatval: x.cos(),
-    }) as PyObjectRef)
+    ) as PyObjectRef)
 }
 
 /// ll_math.py `ll_math_tan` after the finite pin: `W_FloatObject(tan(x))`.
 #[inline(never)]
 pub fn _float_tan(x: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-        ob_header: PyObject {
-            ob_type: &FLOAT_TYPE as *const PyType,
-            w_class: get_instantiate(&FLOAT_TYPE),
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_FloatObject {
+            ob_header: PyObject {
+                ob_type: &FLOAT_TYPE as *const PyType,
+                w_class: get_instantiate(&FLOAT_TYPE),
+            },
+            floatval: x.tan(),
         },
-        floatval: x.tan(),
-    }) as PyObjectRef)
+    ) as PyObjectRef)
 }
 
 /// ll_math.py `ll_math_atan`: `W_FloatObject(atan(x))`.
 #[inline(never)]
 pub fn _float_atan(x: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-        ob_header: PyObject {
-            ob_type: &FLOAT_TYPE as *const PyType,
-            w_class: get_instantiate(&FLOAT_TYPE),
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_FloatObject {
+            ob_header: PyObject {
+                ob_type: &FLOAT_TYPE as *const PyType,
+                w_class: get_instantiate(&FLOAT_TYPE),
+            },
+            floatval: x.atan(),
         },
-        floatval: x.atan(),
-    }) as PyObjectRef)
+    ) as PyObjectRef)
 }
 
 /// ll_math.py `ll_math_exp` after the overflow pin: `W_FloatObject(exp(x))`.
 #[inline(never)]
 pub fn _float_exp(x: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-        ob_header: PyObject {
-            ob_type: &FLOAT_TYPE as *const PyType,
-            w_class: get_instantiate(&FLOAT_TYPE),
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_FloatObject {
+            ob_header: PyObject {
+                ob_type: &FLOAT_TYPE as *const PyType,
+                w_class: get_instantiate(&FLOAT_TYPE),
+            },
+            floatval: x.exp(),
         },
-        floatval: x.exp(),
-    }) as PyObjectRef)
+    ) as PyObjectRef)
 }
 
 /// ll_math.py `ll_math_log1p` after `x > -1`: `W_FloatObject(log1p(x))`.
 #[inline(never)]
 pub fn _float_log1p(x: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-        ob_header: PyObject {
-            ob_type: &FLOAT_TYPE as *const PyType,
-            w_class: get_instantiate(&FLOAT_TYPE),
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_FloatObject {
+            ob_header: PyObject {
+                ob_type: &FLOAT_TYPE as *const PyType,
+                w_class: get_instantiate(&FLOAT_TYPE),
+            },
+            floatval: x.ln_1p(),
         },
-        floatval: x.ln_1p(),
-    }) as PyObjectRef)
+    ) as PyObjectRef)
 }
 
 /// ll_math.py `ll_math_asin` after the `[-1, 1]` pin: `W_FloatObject(asin(x))`.
 #[inline(never)]
 pub fn _float_asin(x: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-        ob_header: PyObject {
-            ob_type: &FLOAT_TYPE as *const PyType,
-            w_class: get_instantiate(&FLOAT_TYPE),
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_FloatObject {
+            ob_header: PyObject {
+                ob_type: &FLOAT_TYPE as *const PyType,
+                w_class: get_instantiate(&FLOAT_TYPE),
+            },
+            floatval: x.asin(),
         },
-        floatval: x.asin(),
-    }) as PyObjectRef)
+    ) as PyObjectRef)
 }
 
 /// Unboxed `W_FloatObject` leaf. `|x| $compute` names the parameter; it is
@@ -7951,7 +7992,7 @@ macro_rules! float_math1_leaf {
     ($vis:vis $fn:ident, |$x:ident| $compute:expr) => {
         #[inline(never)]
         $vis fn $fn($x: f64) -> PyResult {
-            Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+            crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
                 ob_header: PyObject {
                     ob_type: &FLOAT_TYPE as *const PyType,
                     w_class: get_instantiate(&FLOAT_TYPE),
@@ -8031,13 +8072,15 @@ macro_rules! float_math2_leaf {
     ($fn:ident, |$x:ident, $y:ident| $compute:expr) => {
         #[inline(never)]
         pub fn $fn($x: f64, $y: f64) -> PyResult {
-            Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-                ob_header: PyObject {
-                    ob_type: &FLOAT_TYPE as *const PyType,
-                    w_class: get_instantiate(&FLOAT_TYPE),
-                },
-                floatval: $compute,
-            }) as PyObjectRef)
+            crate::runtime_ops::fresh_alloc_or_memory_error!(
+                pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+                    ob_header: PyObject {
+                        ob_type: &FLOAT_TYPE as *const PyType,
+                        w_class: get_instantiate(&FLOAT_TYPE),
+                    },
+                    floatval: $compute,
+                },) as PyObjectRef
+            )
         }
     };
 }
@@ -8067,13 +8110,15 @@ macro_rules! int_from_float_leaf {
     ($fn:ident, |$x:ident| $compute:expr) => {
         #[inline(never)]
         pub fn $fn($x: f64) -> PyResult {
-            Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
-                ob_header: PyObject {
-                    ob_type: &INT_TYPE as *const PyType,
-                    w_class: get_instantiate(&INT_TYPE),
-                },
-                intval: $compute,
-            }) as PyObjectRef)
+            crate::runtime_ops::fresh_alloc_or_memory_error!(
+                pyre_object::lltype::malloc_typed_managed(W_IntObject {
+                    ob_header: PyObject {
+                        ob_type: &INT_TYPE as *const PyType,
+                        w_class: get_instantiate(&INT_TYPE),
+                    },
+                    intval: $compute,
+                },) as PyObjectRef
+            )
         }
     };
 }
@@ -8136,13 +8181,15 @@ pub fn _float_ldexp_raw(x: f64, exp: i64) -> f64 {
 /// ll_math.py `ll_math_ldexp` after the finite-x pin.
 #[inline(never)]
 pub fn _float_ldexp(x: f64, exp: i64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-        ob_header: PyObject {
-            ob_type: &FLOAT_TYPE as *const PyType,
-            w_class: get_instantiate(&FLOAT_TYPE),
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_FloatObject {
+            ob_header: PyObject {
+                ob_type: &FLOAT_TYPE as *const PyType,
+                w_class: get_instantiate(&FLOAT_TYPE),
+            },
+            floatval: ldexp_exact_bits!(x, exp),
         },
-        floatval: ldexp_exact_bits!(x, exp),
-    }) as PyObjectRef)
+    ) as PyObjectRef)
 }
 
 /// app_math.py `isqrt` on a positive machine int that fits an exact
@@ -8154,13 +8201,15 @@ pub fn _int_isqrt(n: i64) -> PyResult {
     let too_high = i64::from(guess > n / guess);
     let too_low = i64::from(guess < n / (guess + 1));
     let root = guess - too_high + too_low;
-    Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
-        ob_header: PyObject {
-            ob_type: &INT_TYPE as *const PyType,
-            w_class: get_instantiate(&INT_TYPE),
-        },
-        intval: root,
-    }) as PyObjectRef)
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_IntObject {
+            ob_header: PyObject {
+                ob_type: &INT_TYPE as *const PyType,
+                w_class: get_instantiate(&INT_TYPE),
+            },
+            intval: root,
+        }
+    ) as PyObjectRef)
 }
 
 /// interp_math.py `isclose` with both keyword tolerances defaulted,
@@ -8176,13 +8225,15 @@ pub fn _float_isclose(a: f64, b: f64) -> PyResult {
 /// floatobject.py `descr_abs`: `W_FloatObject(abs(self.floatval))`.
 #[inline(never)]
 pub fn _float_abs(x: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-        ob_header: PyObject {
-            ob_type: &FLOAT_TYPE as *const PyType,
-            w_class: get_instantiate(&FLOAT_TYPE),
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_FloatObject {
+            ob_header: PyObject {
+                ob_type: &FLOAT_TYPE as *const PyType,
+                w_class: get_instantiate(&FLOAT_TYPE),
+            },
+            floatval: x.abs(),
         },
-        floatval: x.abs(),
-    }) as PyObjectRef)
+    ) as PyObjectRef)
 }
 
 /// intobject.py `descr_abs` after `ovfcheck(abs(a))`.
@@ -8190,25 +8241,29 @@ pub fn _float_abs(x: f64) -> PyResult {
 /// `int_sub` rather than a residual intrinsic.
 #[inline(never)]
 pub fn _int_abs(x: i64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
-        ob_header: PyObject {
-            ob_type: &INT_TYPE as *const PyType,
-            w_class: get_instantiate(&INT_TYPE),
-        },
-        intval: if x < 0 { 0i64.wrapping_sub(x) } else { x },
-    }) as PyObjectRef)
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_IntObject {
+            ob_header: PyObject {
+                ob_type: &INT_TYPE as *const PyType,
+                w_class: get_instantiate(&INT_TYPE),
+            },
+            intval: if x < 0 { 0i64.wrapping_sub(x) } else { x },
+        }
+    ) as PyObjectRef)
 }
 
 /// floatobject.py `descr_neg`: `W_FloatObject(-self.floatval)`.
 #[inline(never)]
 pub(crate) fn _float_neg(x: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-        ob_header: PyObject {
-            ob_type: &FLOAT_TYPE as *const PyType,
-            w_class: get_instantiate(&FLOAT_TYPE),
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_FloatObject {
+            ob_header: PyObject {
+                ob_type: &FLOAT_TYPE as *const PyType,
+                w_class: get_instantiate(&FLOAT_TYPE),
+            },
+            floatval: -x,
         },
-        floatval: -x,
-    }) as PyObjectRef)
+    ) as PyObjectRef)
 }
 
 /// Unary negation.
@@ -8339,13 +8394,15 @@ pub fn invert(mut a: PyObjectRef) -> PyResult {
 /// intobject.py `descr_invert`: `wrapint(~self.intval)`.
 #[inline(never)]
 pub(crate) fn _int_invert(x: i64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
-        ob_header: PyObject {
-            ob_type: &INT_TYPE as *const PyType,
-            w_class: get_instantiate(&INT_TYPE),
-        },
-        intval: !x,
-    }) as PyObjectRef)
+    crate::runtime_ops::fresh_alloc_or_memory_error!(pyre_object::lltype::malloc_typed_managed(
+        W_IntObject {
+            ob_header: PyObject {
+                ob_type: &INT_TYPE as *const PyType,
+                w_class: get_instantiate(&INT_TYPE),
+            },
+            intval: !x,
+        }
+    ) as PyObjectRef)
 }
 
 pub fn invert_inner(mut a: PyObjectRef) -> PyResult {

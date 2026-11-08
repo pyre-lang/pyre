@@ -645,16 +645,16 @@ mod impl_fnaddr_binding_tests {
     #[test]
     fn impl_binding_strips_module_path_from_type_name() {
         let desc = HelperFnAddr::new_impl_method(
-            "pyre_object::celldict::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
+            "host_object::celldict::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
             std::ptr::null(),
             4,
-            "pyre_object::celldict::ModuleDictStrategy",
+            "host_object::celldict::ModuleDictStrategy",
         );
         assert!(desc.is_impl_method());
         assert_eq!(
             desc.impl_fnaddr_binding(),
             Some((
-                "pyre_object::celldict",
+                "host_object::celldict",
                 "ModuleDictStrategy",
                 "_orig__getdictvalue_no_unwrapping_pure_unlikely_name"
             ))
@@ -664,7 +664,7 @@ mod impl_fnaddr_binding_tests {
     #[test]
     fn free_function_row_has_no_impl_binding() {
         let desc = HelperFnAddr::new(
-            "pyre_object::celldict::next_version_tag_serial",
+            "host_object::celldict::next_version_tag_serial",
             std::ptr::null(),
             0,
         );
@@ -675,31 +675,31 @@ mod impl_fnaddr_binding_tests {
     #[test]
     fn impl_binding_keeps_qualified_type_when_not_under_module_path() {
         let desc = HelperFnAddr::new_impl_method(
-            "pyre_object::other::bar",
+            "host_object::other::bar",
             std::ptr::null(),
             1,
-            "pyre_object::a::Foo",
+            "host_object::a::Foo",
         );
         assert_eq!(
             desc.impl_fnaddr_binding(),
-            Some(("pyre_object::other", "a::Foo", "bar"))
+            Some(("host_object::other", "a::Foo", "bar"))
         );
     }
 
     #[test]
     fn impl_method_fnaddr_paths_include_type_qualified_spellings() {
         let desc = HelperFnAddr::new_impl_method(
-            "pyre_object::celldict::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
+            "host_object::celldict::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
             std::ptr::null(),
             4,
-            "pyre_object::celldict::ModuleDictStrategy",
+            "host_object::celldict::ModuleDictStrategy",
         );
         let paths = desc.impl_method_fnaddr_paths();
         assert_eq!(
             paths,
             vec![
-                "pyre_object::celldict::ModuleDictStrategy::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
-                "pyre_object::ModuleDictStrategy::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
+                "host_object::celldict::ModuleDictStrategy::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
+                "host_object::ModuleDictStrategy::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
             ]
         );
     }
@@ -707,14 +707,14 @@ mod impl_fnaddr_binding_tests {
     #[test]
     fn impl_method_fnaddr_paths_keep_qualified_type() {
         let desc = HelperFnAddr::new_impl_method(
-            "pyre_object::other::bar",
+            "host_object::other::bar",
             std::ptr::null(),
             1,
-            "pyre_object::a::Foo",
+            "host_object::a::Foo",
         );
         assert_eq!(
             desc.impl_method_fnaddr_paths(),
-            vec!["pyre_object::other::a::Foo::bar"]
+            vec!["host_object::other::a::Foo::bar"]
         );
     }
 }

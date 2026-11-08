@@ -385,6 +385,9 @@ pub fn w_str_new(s: &str) -> PyObjectRef {
 /// rollback switch is off or the alloc hook is absent it falls back to the immortal
 /// [`w_str_from_wtf8_immortal`] so a managed header never pairs with a
 /// non-greyable value.  Mirrors [`w_str_subclass_from_wtf8`]'s value handling.
+/// `call.py CallControl.get_jitcode_calldescr` publishes the native entry the
+/// blackhole's `inline_call` invokes.
+#[majit_macros::getfunctionptr]
 pub fn w_str_new_managed(s: &str) -> PyObjectRef {
     w_str_from_wtf8_managed(Wtf8Buf::from_string(s.to_string()))
 }

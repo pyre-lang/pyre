@@ -1,5 +1,6 @@
 use crate::PyError;
 use crate::bytecode::{BinaryOperator, ComparisonOperator};
+use crate::objspace::std::frame;
 use pyre_object::{PyObjectRef, w_bool_from};
 
 use crate::{
@@ -142,6 +143,22 @@ pub fn binary_value(
     mut b: PyObjectRef,
     op: BinaryOperator,
 ) -> Result<PyObjectRef, PyError> {
+    // `frame.py build_frame` installs `_intshortcut` on BINARY_ADD,
+    // INPLACE_ADD, BINARY_SUBTRACT and INPLACE_SUBTRACT: two exact ints
+    // reach neither the in-place special nor `space.<op>`.
+    match op {
+        BinaryOperator::Add | BinaryOperator::InplaceAdd
+            if unsafe { frame::both_exact_int(a, b) } =>
+        {
+            return unsafe { frame::int_add_arm(a, b) };
+        }
+        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract
+            if unsafe { frame::both_exact_int(a, b) } =>
+        {
+            return unsafe { frame::int_sub_arm(a, b) };
+        }
+        _ => {}
+    }
     // descroperation.py `inplace_impl` — consult the in-place
     // special first; fall through to the binary op below when absent or
     // `NotImplemented`.
@@ -288,7 +305,10 @@ fn binary_value_from_tag_inner(
         return binary_value(a, b, op);
     }
     match op_tag {
+        // `frame.py _intshortcut`, see `binary_value`.
+        0 if unsafe { frame::both_exact_int(a, b) } => unsafe { frame::int_add_arm(a, b) },
         0 => add(a, b),
+        1 if unsafe { frame::both_exact_int(a, b) } => unsafe { frame::int_sub_arm(a, b) },
         1 => sub(a, b),
         2 => mul(a, b),
         3 => floordiv(a, b),
@@ -846,7 +866,7 @@ pub fn newlist_from_iter_hint(last_val: PyObjectRef) -> Result<PyObjectRef, PyEr
             0
         }
     };
-    Ok(pyre_object::listobject::w_list_new_with_sizehint(hint))
+    crate::runtime_ops::obj_or_memory_error(pyre_object::listobject::w_list_new_with_sizehint(hint))
 }
 
 /// LIST_EXTEND — extend `list` in place with the items of `iterable`.

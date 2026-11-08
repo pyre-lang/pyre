@@ -478,6 +478,9 @@ pub struct GraphStoreTdcCut {
 pub struct SubjectTdcPlan {
     pub cuts: Vec<GraphStoreTdcCut>,
     pub value_to_var: crate::translator::rtyper::flowspace_adapter::LegacyToTyped,
+    /// Callee graphs of the raising op of each `cutoff` block, from
+    /// `translator.callgraph` at the op's tag.
+    pub cutoff_callees: Vec<crate::flowspace::model::GraphRef>,
 }
 
 /// Whole-program two-phase type cache, keyed by subject [`CallPath`].

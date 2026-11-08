@@ -11955,28 +11955,60 @@ impl CodeWriter {
                         // current_depth must track interpreter parity so that
                         // subsequent CALL handlers don't underflow.
                         Instruction::LoadName { namei } => {
-                            // pyopcode.py LOAD_NAME — w_locals probe +
-                            // LOAD_GLOBAL fallback, a runtime namespace lookup
-                            // that cannot fold at codewriter time (module-loop
-                            // names mutate every iteration).  Record the
-                            // `load_name` HLOp with the portal frame as
-                            // receiver; the canonical splice lowers it to a
-                            // `bh_load_name_fn(frame, w_name, namei)` residual
-                            // call. The full-body walker traces this residual,
-                            // using the same contract as the LoadAttr arm.
+                            // `pyopcode.py LOAD_NAME`. When `load_name_value`
+                            // is fully bound, record that method as an HLOp
+                            // and flatten it to `inline_call_ir_r`
+                            // (`jtransform.py handle_regular_call`).
+                            // Otherwise keep the `bh_load_name_fn` residual.
                             let name_idx = namei.get(op_arg) as usize;
-                            let attr_name =
-                                super::flow::Constant::string(code.names[name_idx].as_str());
                             let loaded_dst_reg = stack_base + current_depth;
-                            let result_value = emit_frontend_load_name(
-                                &mut graph,
-                                &current_block.block(),
-                                frame_var.into(),
-                                attr_name.into(),
-                                name_idx,
-                                py_pc as i64,
-                            );
-                            let result_fv: super::flow::FlowValue = result_value.into();
+                            let result_fv: super::flow::FlowValue = {
+                                if fully_bound_callee_body(inline_call_targets::LOAD_NAME_VALUE)
+                                    .is_some()
+                                {
+                                    let name = code.names.get(name_idx).expect(
+                                        "LOAD_NAME co_names index is validated by the compiler",
+                                    );
+                                    let w_name = unsafe {
+                                        pyre_interpreter::pycode::w_code_getname_w_or_new(
+                                            w_code as pyre_object::PyObjectRef,
+                                            name_idx,
+                                            name.as_ref(),
+                                        )
+                                    };
+                                    let storage = unsafe { pyre_object::w_str_storage(w_name) };
+                                    let name_const = super::flow::Constant::new(
+                                        super::flow::ConstantValue::Signed(storage as i64),
+                                        Some(Kind::Ref),
+                                    );
+                                    emit_graph_op_with_result(
+                                        &mut graph,
+                                        &current_block.block(),
+                                        "load_name_value",
+                                        vec![
+                                            frame_var.into(),
+                                            name_const.into(),
+                                            super::flow::Constant::signed(name_idx as i64).into(),
+                                        ],
+                                        Kind::Ref,
+                                        py_pc as i64,
+                                    )
+                                    .into()
+                                } else {
+                                    let attr_name = super::flow::Constant::string(
+                                        code.names[name_idx].as_str(),
+                                    );
+                                    emit_frontend_load_name(
+                                        &mut graph,
+                                        &current_block.block(),
+                                        frame_var.into(),
+                                        attr_name.into(),
+                                        name_idx,
+                                        py_pc as i64,
+                                    )
+                                    .into()
+                                }
+                            };
                             current_state.stack.push(result_fv.clone());
                             emit_pushvalue_ref!(current_depth, loaded_dst_reg, result_fv, py_pc);
                         }

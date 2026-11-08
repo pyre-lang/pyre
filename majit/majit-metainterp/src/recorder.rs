@@ -517,7 +517,7 @@ impl Trace {
     /// must run before that attach.
     pub fn new() -> Self {
         Trace {
-            ops: Vec::with_capacity(256),
+            ops: Vec::new(),
             inputargs: Box::new(Vec::new()),
             max_num_inputargs: 0,
             op_count: 0,

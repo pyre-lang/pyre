@@ -445,10 +445,14 @@ impl OptimizationInfoItem for InputArgRc {
 ///   `self.storage.rd_numb / rd_consts / rd_virtuals` off the same
 ///   descriptor). No owned `Vec<Const>` copy — all readers observe
 ///   the pool the GC walker updates.
+/// - `source_jct`: owning loop token retained for the whole bridge
+///   (`pyjitpl.py MetaInterp.handle_guard_failure` keeps
+///   `self.resumekey_original_loop_token`).
 pub struct BridgeRetraceResult {
     pub is_exception_guard: bool,
     pub fail_types: Vec<Type>,
     pub storage: Option<Arc<ResumeStorage>>,
+    pub source_jct: Arc<JitCellToken>,
 }
 
 /// Result of checking a back-edge.
@@ -16367,6 +16371,8 @@ impl<M: Clone> MetaInterp<M> {
     pub fn start_retrace_from_guard(
         &mut self,
         descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
+        fail_descr: &dyn FailDescr,
+        source_jct: Arc<JitCellToken>,
         green_key: u64,
         fail_values: &[i64],
     ) -> Option<BridgeRetraceResult> {
@@ -16379,10 +16385,8 @@ impl<M: Clone> MetaInterp<M> {
         //   self.create_history(...)
         // compile.py AbstractResumeGuardDescr._trace_and_compile_from_bridge:
         // the gate is the descr's `rd_loop_token.loop_token_wref()`; `giveup`
-        // when that weakref is dead. `pyjitpl.py handle_guard_failure`
-        // keeps tracing while the same wref is live. A memmgr prune of
-        // `alive_loops` that drops the token makes that weakref dead, which
-        // gives up.
+        // when that weakref is dead. The caller already resolved that token
+        // (`descr_owning_jct`) and passes it as `source_jct`.
         // `handle_guard_failure` runs on a fresh `MetaInterp` after
         // `execute_token` unwinds. A residual guard while the recorder is
         // parked must not call `enter_profiler_tracing`.
@@ -16404,14 +16408,6 @@ impl<M: Clone> MetaInterp<M> {
         self.begin_attempt();
         self.enter_profiler_tracing();
         self.try_to_free_some_loops();
-        let fail_descr = descr_arc
-            .as_fail_descr()
-            .expect("bridge source op.descr must implement FailDescr");
-        if majit_backend::descr_owning_jct(fail_descr).is_none() {
-            crate::mc_diag_bump(7); // start_retrace bailed: loop_token_wref dead
-            self.leave_profiler_tracing();
-            return None;
-        }
         // `get_procedure_token` is `compile.py compile_retrace` only —
         // applying it here would refuse an ordinary bridge when the
         // warm-state cell was cleared but the source descr still names
@@ -16494,17 +16490,15 @@ impl<M: Clone> MetaInterp<M> {
         //                                   & loop_token.FORCE_BRIDGE_SEGMENTING)
         // Bridge entry reads ONLY the source loop token's bit, never the
         // greenkey-side JC_FORCE_FINISH (warmstate.py reads that flag at
-        // loop entry, not bridge entry).
-        let source_jct = majit_backend::descr_owning_jct(fail_descr);
+        // loop entry, not bridge entry). `source_jct` is the caller's
+        // already-resolved token.
         // compile.py `ResumeGuardDescr._trace_and_compile_from_bridge`:
         // jitdriver_sd is the source loop's outermost driver, including when
         // this guard was recorded while inlining another recursive portal.
-        let source_jitdriver_index = source_jct
-            .as_ref()
-            .and_then(|token| token.outermost_jitdriver_index);
-        self.force_finish_trace = source_jct.as_ref().is_some_and(|jct| {
-            jct.retraced_count.get() & majit_backend::JitCellToken::FORCE_BRIDGE_SEGMENTING != 0
-        });
+        let source_jitdriver_index = source_jct.outermost_jitdriver_index;
+        self.force_finish_trace = source_jct.retraced_count.get()
+            & majit_backend::JitCellToken::FORCE_BRIDGE_SEGMENTING
+            != 0;
         let mut ctx = crate::trace_ctx::TraceCtx::new(recorder, green_key, self.staticdata.clone());
         if let Some(index) = source_jitdriver_index {
             let descriptor = self
@@ -16521,12 +16515,10 @@ impl<M: Clone> MetaInterp<M> {
         // same backend reference as the source loop.
         ctx.set_cpu(Some(&*self.backend));
         ctx.set_metainterp_cpu(self.cpu.clone());
-        // pyjitpl.py:2898 `self.resumekey_original_loop_token = ...`.
+        // pyjitpl.py `self.resumekey_original_loop_token = ...`.
         // Stash the source token on the trace context so
         // `prepare_trace_segmenting` can set FORCE_BRIDGE_SEGMENTING here.
-        if let Some(jct) = source_jct {
-            ctx.set_resumekey_original_loop_token(jct);
-        }
+        ctx.set_resumekey_original_loop_token(Arc::clone(&source_jct));
         // pyjitpl.py:2789 warmrunnerstate.trace_limit snapshot for bridge traces.
         let jd_no = source_jitdriver_index.unwrap_or(self.active_jitdriver_sd.unwrap_or(0));
         ctx.set_trace_limit(self.warm_state_for_driver(jd_no).trace_limit() as usize);
@@ -16604,6 +16596,7 @@ impl<M: Clone> MetaInterp<M> {
             is_exception_guard,
             fail_types,
             storage,
+            source_jct,
         })
     }
 
@@ -16839,10 +16832,18 @@ impl<M: Clone> MetaInterp<M> {
     pub fn handle_guard_failure(
         &mut self,
         descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
+        fail_descr: &dyn FailDescr,
+        source_jct: Arc<JitCellToken>,
         green_key: u64,
         fail_values: &[i64],
     ) -> Option<BridgeRetraceResult> {
-        let retrace = self.start_retrace_from_guard(descr_arc, green_key, fail_values)?;
+        let retrace = self.start_retrace_from_guard(
+            descr_arc,
+            fail_descr,
+            source_jct,
+            green_key,
+            fail_values,
+        )?;
         self.prepare_exception_resumption(retrace.is_exception_guard);
         Some(retrace)
     }
@@ -17030,8 +17031,20 @@ impl<M: Clone> MetaInterp<M> {
         if !(descr_arc.is_resume_guard() || descr_arc.is_resume_guard_copied()) {
             return false;
         }
-        self.start_retrace_from_guard(descr_arc, green_key, live_values)
-            .is_some()
+        let Some(fail_descr) = descr_arc.as_fail_descr() else {
+            return false;
+        };
+        let Some(source_jct) = majit_backend::descr_owning_jct(fail_descr) else {
+            return false;
+        };
+        self.start_retrace_from_guard(
+            descr_arc.clone(),
+            fail_descr,
+            source_jct,
+            green_key,
+            live_values,
+        )
+        .is_some()
     }
 
     /// Check if a function call should be inlined during tracing.
@@ -32289,10 +32302,20 @@ mod tests {
             .unwrap()
             .set_rd_loop_token_clt(source_token.compiled_loop_token_expect());
         let _keep_source = source_token;
-        assert!(majit_backend::descr_owning_jct(descr_arc.as_fail_descr().unwrap()).is_some());
+        let fail_descr = descr_arc
+            .as_fail_descr()
+            .expect("bridge source op.descr must implement FailDescr");
+        let source_jct = majit_backend::descr_owning_jct(fail_descr)
+            .expect("live loop_token_wref starts a bridge without compiled_loops");
 
         let retrace = meta
-            .start_retrace_from_guard(descr_arc, green_key.get_uhash(), &[42])
+            .start_retrace_from_guard(
+                descr_arc.clone(),
+                fail_descr,
+                source_jct,
+                green_key.get_uhash(),
+                &[42],
+            )
             .expect("live loop_token_wref starts a bridge without compiled_loops");
         assert_eq!(retrace.fail_types, vec![Type::Int]);
         assert_eq!(meta.active_jitdriver_sd, Some(source_driver));

@@ -1680,7 +1680,7 @@ fn emit_impl_helper_fnaddr_register_fn(
     });
     quote! {
         #[doc(hidden)]
-        #[allow(non_snake_case, dead_code)]
+        #[allow(non_snake_case, unused)]
         #[unsafe(export_name = #export_name)]
         extern "C" fn #register_ident() {
             let addr = {
@@ -1759,7 +1759,7 @@ fn emit_impl_helper_fnaddr_wasm_ctor(
         #[cfg(target_arch = "wasm32")]
         #[::ctor::ctor(unsafe)]
         #[doc(hidden)]
-        #[allow(non_snake_case, dead_code)]
+        #[allow(non_snake_case, unused)]
         fn #ctor_ident() {
             unsafe extern "C" {
                 #[link_name = #export_name]
@@ -5628,7 +5628,7 @@ mod tests {
         );
         assert_eq!(
             skip(
-                "fn f(&self, v: VersionTag, o: PyObjectRef, k: &str) -> Option<PyObjectRef> { None }"
+                "fn f(&self, v: *mut VersionTag, o: PyObjectRef, k: &str) -> Option<PyObjectRef> { None }"
             ),
             None
         );
@@ -6058,7 +6058,7 @@ mod tests {
     #[test]
     fn shared_self_receiver_emits_one_word_trampoline() {
         let func = parse_fn(
-            "fn _orig_leaf_unlikely_name(&self, v: VersionTag, o: PyObjectRef, k: &str) -> Option<PyObjectRef> { None }",
+            "fn _orig_leaf_unlikely_name(&self, v: *mut VersionTag, o: PyObjectRef, k: &str) -> Option<PyObjectRef> { None }",
         );
         assert_eq!(trampoline_skip_reason(&func, "elidable", &[]), None);
         let wrapper: Ident = syn::parse_str("leaf").unwrap();
@@ -6076,7 +6076,7 @@ mod tests {
         assert!(text.contains("* const Self"), "{text}");
         assert!(text.contains("Self :: _orig_leaf_unlikely_name"), "{text}");
         assert!(
-            text.contains("VersionTag ((__majit_arg_1) as u64)"),
+            text.contains("((__majit_arg_1) as usize) as * mut VersionTag"),
             "{text}"
         );
         assert!(text.contains("register_impl_method"), "{text}");

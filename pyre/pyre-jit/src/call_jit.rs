@@ -5505,6 +5505,9 @@ fn trace_bridge_via_interpret(
     let Some(descr_fd) = descr_arc.as_fail_descr() else {
         return BridgeResolution::ResumeBlackhole;
     };
+    let Some(source_jct) = majit_backend::descr_owning_jct(descr_fd) else {
+        return BridgeResolution::ResumeBlackhole;
+    };
     let fail_arg_count = descr_fd.fail_arg_types().len();
     let Some(frontend_fail_values) = raw_values.get(..fail_arg_count) else {
         return BridgeResolution::ResumeBlackhole;
@@ -5514,6 +5517,8 @@ fn trace_bridge_via_interpret(
         let (driver, _) = crate::eval::driver_pair();
         driver.meta_interp_mut().handle_guard_failure(
             descr_arc.clone(),
+            descr_fd,
+            source_jct,
             green_key,
             frontend_fail_values,
         )

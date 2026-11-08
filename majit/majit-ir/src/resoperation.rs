@@ -3426,6 +3426,13 @@ impl Op {
         self.args_slice()[idx].clone()
     }
 
+    /// Borrowed `AbstractResOp.getarg`. Do not hold the reference across
+    /// `setarg`, `emit`, or a re-entrant pass call.
+    #[inline]
+    pub fn arg_ref(&self, idx: usize) -> &Operand {
+        &self.args_slice()[idx]
+    }
+
     /// True iff argument `idx` is a live-tracking bound operand
     /// (`Operand::Op` / `Operand::InputArg`) that reads its producer's
     /// current `op.pos`, rather than a `Const` / `None` slot. The

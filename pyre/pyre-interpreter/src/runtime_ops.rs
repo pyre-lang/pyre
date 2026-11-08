@@ -330,6 +330,23 @@ pub(crate) fn obj_or_memory_error(obj: PyObjectRef) -> Result<PyObjectRef, crate
     Ok(obj)
 }
 
+/// Interpreter half of `ExceptionTransformer.gen_exc_check` for a fresh
+/// managed allocation. It expands in place so the leaf's own graph holds the
+/// null test on the allocation result, which `fuse_boxing_alloc_with` drops
+/// from the jitcode once the allocation becomes `new_with_vtable`; native
+/// execution keeps it.
+macro_rules! fresh_alloc_or_memory_error {
+    ($obj:expr) => {{
+        let obj: pyre_object::PyObjectRef = $obj;
+        if obj.is_null() {
+            Err(crate::PyError::memory_error(""))
+        } else {
+            Ok(obj)
+        }
+    }};
+}
+pub(crate) use fresh_alloc_or_memory_error;
+
 /// [`jit_publish_residual_error`] for a residual whose result is an object:
 /// the null reference is the garbage result the following
 /// `GuardNoException` never reads.
@@ -2415,6 +2432,15 @@ mod tests {
     fn obj_or_memory_error_converts_null_to_memory_error() {
         let err = obj_or_memory_error(PY_NULL).expect_err("null is MemoryError");
         assert!(matches!(err.kind, crate::PyErrorKind::MemoryError));
+    }
+
+    #[test]
+    fn fresh_alloc_or_memory_error_maps_null_and_passes_live() {
+        let err = fresh_alloc_or_memory_error!(PY_NULL).expect_err("null is MemoryError");
+        assert!(matches!(err.kind, crate::PyErrorKind::MemoryError));
+        let obj = w_int_new(1);
+        let out = fresh_alloc_or_memory_error!(obj).expect("non-null is Ok");
+        assert_eq!(out, obj);
     }
 
     #[test]

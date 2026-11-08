@@ -1049,6 +1049,11 @@ pub fn jit_exc_raise(value: i64) {
     JIT_EXC_TYPE.store(exc_type, Ordering::Relaxed);
 }
 
+/// Check if an exception is currently pending.
+pub fn jit_exc_is_pending() -> bool {
+    JIT_EXC_VALUE.load(Ordering::Relaxed) != 0
+}
+
 /// grab_exc_value parity: read the pending exception value and clear both
 /// slots. Called host-side after a trace returns through a guard exit.
 pub fn jit_exc_take() -> i64 {
@@ -1404,6 +1409,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_alloc_nursery_typed(Some(wasm_alloc_nursery_typed));
     majit_gc::set_active_thread_has_gc_box(Some(gc_box::present));
     majit_gc::set_active_raise_memory_error(Some(raise_memory_error));
+    majit_gc::set_active_exception_occurred(Some(jit_exc_is_pending));
     majit_gc::set_active_alloc_nursery_headerless_no_collect(Some(
         wasm_alloc_nursery_headerless_no_collect,
     ));

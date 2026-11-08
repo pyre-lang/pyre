@@ -303,6 +303,28 @@ pub(crate) extern "C" fn pyframe_load_global_value_word(
     }
 }
 
+/// One-word residual ABI for `PyFrame.load_name_value`
+/// (`pyopcode.py LOAD_NAME`); `llmodel.py bh_call_r` passes the `&str`
+/// as one rstr STR word.
+#[inline(never)]
+pub(crate) extern "C" fn pyframe_load_name_value_word(
+    frame: i64,
+    name: i64,
+    nameindex: i64,
+) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::pyframe_load_name_value_word");
+    let frame = unsafe { &mut *(frame as usize as *mut crate::pyframe::PyFrame) };
+    let name = unsafe { str_from_rstr_word(name) };
+    match <crate::pyframe::PyFrame as crate::pyopcode::NamespaceOpcodeHandler>::load_name_value(
+        frame,
+        name,
+        nameindex as usize,
+    ) {
+        Ok(v) => v as usize as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err) as usize as i64,
+    }
+}
+
 /// Word-ABI residual for `finditem_str_named`;
 /// `llmodel.py bh_call_r` passes the `&str` as one rstr STR word.
 #[inline(never)]
@@ -2494,6 +2516,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyframe::PyFrame::<impl pyre_interpreter::pyopcode::NamespaceOpcodeHandler<pyre_interpreter::pyframe::PyFrame>>::load_global_value",
         pyframe_load_global_value_word,
+    );
+    // LOAD_NAME's `inline_call_ir_r` (`flatten.rs inline_call_targets`).
+    // The graph is `PyFrame.load_name_value`; this bridge is the one-word
+    // address blackhole `bh_call_r` calls. Argument order is the graph's
+    // (self, name, nameindex); the jitcode calldescr is i=[nameindex],
+    // r=[frame, name].
+    cp3!(
+        &mut entries,
+        "pyframe::PyFrame::<impl pyre_interpreter::pyopcode::NamespaceOpcodeHandler<pyre_interpreter::pyframe::PyFrame>>::load_name_value",
+        pyframe_load_name_value_word,
     );
     // `try_hash_value` is a residual in every jitcode that calls it
     // (`set_add_value`'s non-int arm among them); this is its one-word bridge.
@@ -7496,12 +7528,13 @@ mod tests {
         is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
         jit_trace_fnaddrs, module_dict_getdictvalue_no_unwrapping_pure_word,
         object_dict_getitem_str_hashed_word, object_dict_getitem_str_word, occupied_published_addr,
-        pyframe_load_global_value_word, pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs,
-        shadow_stack_get_word, shadow_stack_push_word, shadow_stack_try_pop_to_word,
-        unicode_dict_getitem_str_hashed_word, unicode_dict_getitem_str_word,
-        w_dict_getitem_str_object_strategy_hashed_word, w_dict_lookup_bytes_strategy_word,
-        w_dict_lookup_identity_strategy_word, w_dict_lookup_int_strategy_word,
-        w_list_pop_end_inner_word, w_list_pop_end_word, w_module_dict_lookup_object_entries_word,
+        pyframe_load_global_value_word, pyframe_load_name_value_word, pyre_class_pytype_addrs,
+        pyre_class_pytype_by_struct_addrs, shadow_stack_get_word, shadow_stack_push_word,
+        shadow_stack_try_pop_to_word, unicode_dict_getitem_str_hashed_word,
+        unicode_dict_getitem_str_word, w_dict_getitem_str_object_strategy_hashed_word,
+        w_dict_lookup_bytes_strategy_word, w_dict_lookup_identity_strategy_word,
+        w_dict_lookup_int_strategy_word, w_list_pop_end_inner_word, w_list_pop_end_word,
+        w_module_dict_lookup_object_entries_word,
     };
     use std::collections::HashMap;
 
@@ -8388,6 +8421,10 @@ mod tests {
             (
                 "pyframe::PyFrame::<impl pyre_interpreter::pyopcode::NamespaceOpcodeHandler<pyre_interpreter::pyframe::PyFrame>>::load_global_value",
                 pyframe_load_global_value_word as *const () as usize as i64,
+            ),
+            (
+                "pyframe::PyFrame::<impl pyre_interpreter::pyopcode::NamespaceOpcodeHandler<pyre_interpreter::pyframe::PyFrame>>::load_name_value",
+                pyframe_load_name_value_word as *const () as usize as i64,
             ),
             (
                 "pyre_interpreter::baseobjspace::finditem_str_named",

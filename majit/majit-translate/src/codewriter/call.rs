@@ -23690,7 +23690,7 @@ mod tests {
 
         let mut cc_impl = CallControl::new();
         cc_impl.register_macro_impl_helper_trace_fnaddr(
-            "pyre_object::celldict",
+            "host_object::celldict",
             "ModuleDictStrategy",
             METHOD,
             0x1111,
@@ -23707,7 +23707,7 @@ mod tests {
 
         let mut cc_free = CallControl::new();
         cc_free.register_macro_helper_trace_fnaddr(
-            "pyre_object::celldict::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
+            "host_object::celldict::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
             0x2222,
         );
         assert_eq!(cc_free.lookup_function_fnaddr(&method_path), None);

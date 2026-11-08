@@ -66,7 +66,9 @@ fn newlist_hint(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     let sizehint = crate::baseobjspace::int_w(args[0])?;
     isize::try_from(sizehint)
         .map_err(|_| crate::PyError::overflow_error("integer does not fit in signed word"))?;
-    Ok(pyre_object::listobject::w_list_new_with_sizehint(sizehint))
+    crate::runtime_ops::obj_or_memory_error(pyre_object::listobject::w_list_new_with_sizehint(
+        sizehint,
+    ))
 }
 
 /// `interp_magic.py resizelist_hint`: forward to the live list strategy.

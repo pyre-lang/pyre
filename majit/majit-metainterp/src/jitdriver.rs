@@ -11480,14 +11480,16 @@ impl<S: JitState> JitDriver<S> {
         // `cpu.grab_exc_value(deadframe)` itself. The bridge entry parked
         // that word in `GUARD_EXC_VALUE` (`GuardExcRoot`); this call does
         // not take a copied `i64`.
-        let retrace =
-            match self
-                .meta
-                .handle_guard_failure(descr_arc.clone(), green_key, frontend_fail_values)
-            {
-                Some(r) => r,
-                None => return false,
-            };
+        let retrace = match self.meta.handle_guard_failure(
+            descr_arc.clone(),
+            descr_fd,
+            std::sync::Arc::clone(&jct),
+            green_key,
+            frontend_fail_values,
+        ) {
+            Some(r) => r,
+            None => return false,
+        };
 
         // resume.py rebuild_from_resumedata parity: decode rd_numb
         // to reconstruct the complete frame for bridge tracing.

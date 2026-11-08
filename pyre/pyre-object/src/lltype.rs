@@ -631,21 +631,23 @@ pub fn malloc_typed_managed<T: GcType>(value: T) -> *mut T {
     // `Some(null)` is a GC that owns the heap and could not satisfy the
     // request, which the fallback below must not answer; only a missing hook
     // leaves this path free to take it.
-    if let Some(raw) =
-        crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(type_id, T::SIZE))
-            .allocated_or_abort(T::SIZE)
+    match crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(type_id, T::SIZE))
+        .allocated_or_raise()
     {
-        unsafe {
-            std::ptr::write(raw as *mut T, value);
-            // The no-collect allocator may fall back to old-gen when the
-            // nursery is full.  In that case the freshly-written payload
-            // can already contain nursery references and must enter the
-            // remembered set.  Nursery allocations ignore this barrier.
-            crate::gc_hook::try_gc_write_barrier_managed(raw);
+        Some(raw) => {
+            unsafe {
+                std::ptr::write(raw as *mut T, value);
+                // The no-collect allocator may fall back to old-gen when the
+                // nursery is full.  In that case the freshly-written payload
+                // can already contain nursery references and must enter the
+                // remembered set.  Nursery allocations ignore this barrier.
+                crate::gc_hook::try_gc_write_barrier_managed(raw);
+            }
+            raw as *mut T
         }
-        return raw as *mut T;
+        None if crate::gc_hook::gc_alloc_failed_pending() => std::ptr::null_mut(),
+        None => malloc_typed(value),
     }
-    malloc_typed(value)
 }
 
 /// `malloc_fixedsize` (`framework.py` `gct_fv_gc_malloc`) with the address
@@ -673,7 +675,11 @@ pub fn malloc_typed_young_nonmoving<T: GcType>(value: T) -> *mut T {
     };
     let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw(type_id, T::SIZE);
     if raw.is_null() {
-        malloc_typed(value)
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            std::ptr::null_mut()
+        } else {
+            malloc_typed(value)
+        }
     } else {
         unsafe {
             std::ptr::write(raw as *mut T, value);
@@ -706,6 +712,9 @@ pub fn malloc_typed_stable<T: GcType>(value: T) -> *mut T {
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(type_id, T::SIZE);
     if raw.is_null() {
+        if crate::gc_hook::gc_alloc_failed_pending() {
+            return std::ptr::null_mut();
+        }
         malloc_typed(value)
     } else {
         unsafe {

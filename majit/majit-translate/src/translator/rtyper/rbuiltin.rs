@@ -4610,14 +4610,17 @@ fn scale_copy_count(
 }
 
 /// `std::ptr::null_mut::<T>()` / `null::<T>()` — the `lltype.nullptr`
-/// analog (rbuiltin.py:412-418) for the `{core,std}.ptr.{null_mut,null}`
-/// host builtins.  Upstream routes nullptr through `rtype_const_result`
-/// because its annotation is a constant SomePtr; the pyre analyzer
-/// (`ptr_null_constant`) instead returns a non-constant classdef-less
-/// `SomeInstance(can_be_None=True)` so the value stays joinable with
-/// typed receivers, and the null value is recovered here from the
-/// callable's definition: `convert_const(None)` on the result repr is
-/// `null_instance()` (rclass.py `convert_const` None arm).
+/// analog (`rbuiltin.py` `rtype_const_result`) for the
+/// `{core,std}.ptr.{null_mut,null}` host builtins.  Upstream routes
+/// nullptr through `rtype_const_result` because its annotation is a
+/// constant SomePtr; the pyre analyzer (`ptr_null_constant`) returns a
+/// non-constant `SomeInstance(can_be_None=True)`, classed when the front
+/// end spelled the GC pointee and classdef-less when unspelled, so the
+/// value stays joinable with typed receivers of that class. The null
+/// value is recovered here from the callable's definition:
+/// `convert_const(None)` on the result repr is `null_instance()`
+/// (`rclass.py` `InstanceRepr.convert_const` None arm). A spelling
+/// constant is consumed at annotation; this typer ignores it.
 fn rtype_ptr_null(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::flowspace::model::Hlvalue;
 

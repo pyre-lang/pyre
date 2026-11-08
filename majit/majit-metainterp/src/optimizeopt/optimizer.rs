@@ -3220,6 +3220,14 @@ impl Optimizer {
         for pass in &self.passes {
             pass.setup();
         }
+        // `Optimization.pure_from_args*` inserts into `optimizer.optpure`
+        // immediately. Publish the ring before rewrite/intbounds run so
+        // reverse-pure facts land on the live `OptPure` table.
+        for pass in &self.passes {
+            if pass.name() == "pure" {
+                pass.install_preamble_pure_ops(&mut ctx);
+            }
+        }
 
         // earlyforce.py:32: self.optimizer.optearlyforce = self
         // Find the EarlyForce pass index so force paths can route
@@ -3524,32 +3532,20 @@ impl Optimizer {
             let inputargs_are_the_jump_target = !self.building_bridge;
             for i in 0..terminal_op.num_args() {
                 let arg = terminal_op.arg(i);
-                let resolved = ctx.resolve_operand_operand(&arg).to_opref();
+                let resolved_box = ctx.resolve_operand_operand(&arg);
                 let expected_ref = inputargs_are_the_jump_target
                     && i < inputargs.len()
                     && inputargs[i].ty() == Some(majit_ir::Type::Ref);
                 // setup_optimizations seeds `trace_inputargs` into
-                // ctx.inputargs (optimizer.py:34), and `opref_type`
-                // consults it via the inputarg-slot fallback after the
-                // op/value_types chain. PtrInfo presence is an additional
-                // Ref-only side channel for inputargs not in `new_operations`.
-                let resolved_has_ptr_info = ctx
-                    .resolve_operand_operand_opt(&arg)
-                    .as_ref()
-                    .is_some_and(|b| ctx.has_ptr_info(b));
+                // ctx.inputargs (`optimizer.py Optimizer.__init__`).
+                // The replacement box carries `Box.type` (`Operand::type_`);
+                // PtrInfo presence is an additional Ref-only side channel
+                // for inputargs not in `new_operations`.
+                let resolved_has_ptr_info = ctx.has_ptr_info(&resolved_box);
                 let resolved_is_ref =
-                    ctx.opref_type(resolved) == Some(majit_ir::Type::Ref) || resolved_has_ptr_info;
-                if expected_ref
-                    && !resolved_is_ref
-                    && ctx
-                        .get_box_replacement_operand_opt(resolved)
-                        .and_then(|cb| cb.const_value())
-                        .is_none()
-                {
-                    let arg_is_virtual = ctx
-                        .resolve_operand_operand_opt(&arg)
-                        .as_ref()
-                        .is_some_and(|b| ctx.is_virtual(b));
+                    resolved_box.type_() == majit_ir::Type::Ref || resolved_has_ptr_info;
+                if expected_ref && !resolved_is_ref && resolved_box.const_value().is_none() {
+                    let arg_is_virtual = ctx.is_virtual(&resolved_box);
                     if arg_is_virtual {
                         force_needed.push(i);
                     } else {
@@ -3571,8 +3567,7 @@ impl Optimizer {
                         }
                     }
                 } else {
-                    let arg = ctx.materialize_operand_at(resolved);
-                    terminal_op.setarg(i, arg);
+                    terminal_op.setarg(i, resolved_box);
                 }
             }
             for i in force_needed {
@@ -3781,17 +3776,19 @@ impl Optimizer {
                         // allocation (`ResOperation(...)`); a later `_forwarded`
                         // write (PtrInfo copy below) lands on that box.
                         let (fresh, b_fresh) = ctx.reserve_virtual_box(arg_type);
-                        let arg0 = ctx.materialize_operand_at(orig);
+                        let orig_box = ctx.get_box_replacement_operand_opt(orig);
+                        let arg0 = orig_box
+                            .clone()
+                            .unwrap_or_else(|| ctx.materialize_operand_at(orig));
                         let mut op = Op::new(same_as, std::slice::from_ref(&arg0));
                         op.pos().set(fresh);
-                        // unroll.py:146 + compile.py:327 parity: accumulate the
-                        // alias op in `extra_same_as` and splice it between the
-                        // preamble body and the label at final assembly. Emitting
+                        // unroll.py + compile.py: accumulate the alias op in
+                        // `extra_same_as` and splice it between the preamble
+                        // body and the label at final assembly. Emitting
                         // directly into `ctx.new_operations` would push the op
                         // past the already-sent terminal JUMP and force the
                         // loop-tail relocation workaround below.
                         loop_info.extra_same_as.push(op);
-                        let orig_box = ctx.get_box_replacement_operand_opt(orig);
                         if let Some(info) = orig_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
                             let fresh_info = match info {
                                 crate::optimizeopt::info::PtrInfo::Virtual(mut vinfo) => {
@@ -5107,42 +5104,15 @@ impl Optimizer {
         //    `optimize_with_constants_and_inputs_oprc` threads the recorder's
         //    own ops and documents the transfer on its own signature.
         for i in 0..op_rc.num_args() {
-            // `get_box_replacement` is the consumer walk (`optimizer.py`
-            // `get_box_replacement(op.getarg(i))`). A slot that already holds
-            // its chain terminal keeps it: `setarg` of the same box changes
-            // nothing. The old resolver stays in the debug witness only:
-            // compute the new terminal first so the witness's
-            // `materialize_operand_at` cannot heal before the comparison.
+            // `optimizer.py Optimizer.get_box_replacement(op.getarg(i))`.
+            // A slot that already holds its chain terminal keeps it:
+            // `setarg` of the same box changes nothing.
             let replaced = {
                 let arg = &op_rc.args_slice()[i];
                 arg.with_box_replacement(|terminal| {
                     (!terminal.same_box(arg)).then(|| terminal.clone())
                 })
             };
-            #[cfg(debug_assertions)]
-            {
-                let arg = op_rc.arg(i);
-                let resolved = replaced.clone().unwrap_or_else(|| arg.clone());
-                let old = match ctx.resolve_operand_operand_opt(&arg) {
-                    Some(b) => b,
-                    None => {
-                        let argref = arg.to_opref();
-                        if argref.is_none() {
-                            arg.clone()
-                        } else {
-                            ctx.materialize_operand_at(argref)
-                                .get_box_replacement(false)
-                        }
-                    }
-                };
-                debug_assert!(
-                    resolved.same_box(&old),
-                    "propagate_from_pass_range {:?} arg {i}: new {:?} old {:?}",
-                    op_rc.opcode,
-                    resolved.to_opref(),
-                    old.to_opref()
-                );
-            }
             if let Some(resolved) = replaced {
                 op_rc.setarg(i, resolved);
             }
@@ -5421,7 +5391,7 @@ impl Optimizer {
     fn restore_emit_shelter(
         ctx: &mut OptContext,
         saved_in_final_emission: bool,
-        saved_pending_mark: &mut Option<OpRef>,
+        saved_pending_mark: &mut Option<Operand>,
         saved_pending_class: &mut Option<super::PendingGuardClassPostprocess>,
     ) {
         ctx.in_final_emission = saved_in_final_emission;
@@ -5438,12 +5408,10 @@ impl Optimizer {
     /// is in `new_operations`.
     fn apply_deferred_guard_postprocess(
         ctx: &mut OptContext,
-        pending_mark: Option<OpRef>,
+        pending_mark: Option<Operand>,
         pending_class: Option<super::PendingGuardClassPostprocess>,
     ) {
-        if let Some(opref) = pending_mark
-            && let Some(b) = ctx.get_box_replacement_operand_opt(opref)
-        {
+        if let Some(b) = pending_mark {
             ctx.mark_last_guard(&b);
         }
         if let Some(pp) = pending_class {
@@ -5464,7 +5432,7 @@ impl Optimizer {
             // the `last_guard_pos` read; `info.py
             // get_last_guard_pos` reads the PtrInfo field (None if no
             // PtrInfo, mapped to -1 = "no guard recorded").
-            let pp_obj_box = ctx.get_box_replacement_operand_opt(pp.obj);
+            let pp_obj_box = Some(ctx.resolve_operand_operand(&pp.obj));
             let old_guard_pos = pp_obj_box
                 .as_ref()
                 .and_then(|b| ctx.last_guard_pos(b))

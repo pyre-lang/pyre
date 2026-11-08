@@ -1055,6 +1055,7 @@ two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::float_pow
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::float_pow_overflow_error
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::float_pow_raw
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::inplace_pow
+two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::int_pow
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::invert
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::invert_inner
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::list_concat_type_error
@@ -1072,6 +1073,7 @@ two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::pos_inner
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::pow
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::pow3
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::pow_binary
+two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::pow_ovf2long
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::repeat_count
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::sequence_repeat
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::str_concat_type_error

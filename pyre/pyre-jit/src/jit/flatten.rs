@@ -2822,6 +2822,7 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "format_with_spec"
             | "convert_value"
             | "load_global_value"
+            | "load_name_value"
             | "load_common_constant"
             | "load_deref_value"
             | "make_cell_value"
@@ -5955,6 +5956,9 @@ where
     {
         return Some(insn);
     }
+    if let Some(insn) = lower_load_name_value_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     if let Some(insn) = lower_import_from_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -6795,6 +6799,8 @@ pub(crate) mod inline_call_targets {
     pub const CONVERT_VALUE: &str = "pyre_interpreter::runtime_ops::convert_value";
     /// LOAD_GLOBAL — `pyopcode.py LOAD_GLOBAL` → `_load_global`.
     pub const LOAD_GLOBAL_VALUE: &str = "pyframe::PyFrame::<impl pyre_interpreter::pyopcode::NamespaceOpcodeHandler<pyre_interpreter::pyframe::PyFrame>>::load_global_value";
+    /// LOAD_NAME — `pyopcode.py LOAD_NAME` (w_locals probe, then `_load_global`).
+    pub const LOAD_NAME_VALUE: &str = "pyframe::PyFrame::<impl pyre_interpreter::pyopcode::NamespaceOpcodeHandler<pyre_interpreter::pyframe::PyFrame>>::load_name_value";
 }
 
 /// The body of a fixed callee path whose host addresses this build has fully
@@ -7428,6 +7434,44 @@ where
     };
     build_orthodox_inline_call_ir_r(
         inline_call_targets::LOAD_GLOBAL_VALUE,
+        vec![Operand::ConstInt(nameindex)],
+        vec![frame, name],
+        dst_reg,
+    )
+}
+
+/// Lower the LOAD_NAME pyre HLOp `load_name_value(frame, name, nameindex)`
+/// → `result: Ref` to `inline_call_ir_r(JitCode, ListI([nameindex]),
+/// ListR([frame, name])) → reg` of `PyFrame.load_name_value`, the
+/// `jtransform.py handle_regular_call` shape of `pyopcode.py LOAD_NAME`.
+/// The opcode arm records this HLOp only after
+/// `fully_bound_callee_body` returned Some, so there is no residual
+/// fallback here.
+///
+/// Returns `None` for non-`load_name_value` opnames so the caller can fall
+/// through to other lowering arms.
+pub fn lower_load_name_value_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    _ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "load_name_value" || op.args.len() != 3 {
+        return None;
+    }
+    let frame = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let name = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+    let nameindex = const_int_for_value_arg(&op.args[2])?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    build_orthodox_inline_call_ir_r(
+        inline_call_targets::LOAD_NAME_VALUE,
         vec![Operand::ConstInt(nameindex)],
         vec![frame, name],
         dst_reg,
@@ -14531,6 +14575,93 @@ mod tests {
             assert!(
                 insn.is_none(),
                 "unbound load_global_value has no residual fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn lower_load_name_value_hlop_emits_inline_call_ir_r_when_bound() {
+        // `load_name_value(frame, name, nameindex)` →
+        // `inline_call_ir_r(LOAD_NAME_VALUE, ListI([nameindex]),
+        // ListR([frame, name])) → reg` when the body is fully bound.
+        // The opcode arm only records the HLOp after
+        // `fully_bound_callee_body` returned Some, so there is no residual
+        // fallback (`set_display_new`).
+        let frame_var = Variable::new(VariableId(8), Kind::Ref);
+        let result_var = Variable::new(VariableId(9), Kind::Ref);
+        let (ctx, _, _) = load_attr_lowering_fixture();
+        let name_const = Constant::new(
+            super::super::flow::ConstantValue::Signed(0x3000),
+            Some(Kind::Ref),
+        );
+        let op = super::super::flow::SpaceOperation::new(
+            "load_name_value",
+            vec![
+                frame_var.into(),
+                name_const.into(),
+                Constant::signed(3).into(),
+            ],
+            Some(result_var.into()),
+            0,
+        );
+        let mut get_register = |var: Variable| match var.id {
+            VariableId(8) => Register {
+                kind: Kind::Ref,
+                index: 101,
+            },
+            VariableId(9) => Register {
+                kind: Kind::Ref,
+                index: 102,
+            },
+            _ => panic!("unexpected var id {:?}", var.id),
+        };
+        let mut lower_constant = super::flatten_constant_operand_for_test;
+        let insn = super::lower_load_name_value_hlop_to_insn(
+            &op,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        );
+        if super::fully_bound_callee_body(super::inline_call_targets::LOAD_NAME_VALUE).is_some() {
+            let insn = insn.expect("bound load_name_value must lower to inline_call_ir_r");
+            match insn {
+                Insn::Op {
+                    opname,
+                    args,
+                    result,
+                } => {
+                    assert_eq!(opname, "inline_call_ir_r");
+                    assert!(
+                        matches!(&args[0], Operand::Descr(descr)
+                            if matches!(&**descr, DescrOperand::JitCode(jc)
+                                if jc.name() == "load_name_value")),
+                        "LOAD_NAME_VALUE jitcode, got {:?}",
+                        args[0]
+                    );
+                    assert!(
+                        matches!(&args[1], Operand::ListOfKind(list)
+                            if list.kind == Kind::Int
+                                && matches!(&list.content[..], [Operand::ConstInt(3)])),
+                        "ListI = [nameindex], got {:?}",
+                        args[1]
+                    );
+                    assert!(
+                        matches!(&args[2], Operand::ListOfKind(list)
+                            if list.kind == Kind::Ref
+                                && matches!(&list.content[..],
+                                    [Operand::Register(r), Operand::ConstRef(0x3000)]
+                                    if r.index == 101)),
+                        "ListR = [frame, name], got {:?}",
+                        args[2]
+                    );
+                    assert_eq!(result.map(|r| r.index), Some(102));
+                }
+                _ => panic!("expected Insn::Op, got {insn:?}"),
+            }
+        } else {
+            assert!(
+                insn.is_none(),
+                "unbound load_name_value has no residual fallback"
             );
         }
     }

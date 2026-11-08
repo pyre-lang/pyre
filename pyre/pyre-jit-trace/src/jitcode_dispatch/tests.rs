@@ -1880,6 +1880,73 @@ fn a_callable_callees_reachable_abort_is_not_a_resume_blocker() {
     assert_eq!(resume.blocker_after_effect, None);
 }
 
+/// An inline callee with a callable `fnaddr` contributes no body blockers:
+/// the blackhole calls it natively (`bhimpl_inline_call_*`).
+#[test]
+fn helper_resume_skips_blockers_of_a_natively_called_inline_callee() {
+    fn install_inline_helper(name: &str, descr: u16) -> usize {
+        let mut code = inline_call_with_descr(descr);
+        code.extend(void_return());
+        let runtime_jc = majit_metainterp::jitcode::JitCode::new(name);
+        runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+            code,
+            startpoints: Some([0_usize, 4].into_iter().collect()),
+            ..Default::default()
+        });
+        let payload = std::sync::Arc::new(crate::PyJitCode::from_core_degenerate(
+            std::sync::Arc::new(runtime_jc),
+            std::ptr::null(),
+            false,
+        ));
+        crate::state::install_codeless_jitcode(payload) as usize
+    }
+
+    fn first_jitcode_descr(want_callable: bool) -> Option<u16> {
+        let descrs = crate::jitcode_runtime::descr_ref_table();
+        for slot in 0..descrs.len().min(u16::MAX as usize + 1) {
+            let Some(index) = descrs
+                .at(slot)
+                .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
+            else {
+                continue;
+            };
+            let Some(jc) = crate::jitcode_runtime::get_jitcode_ref_by_index(index) else {
+                continue;
+            };
+            if majit_jitcode::codewriter::call::is_callable_fnaddr(jc.fnaddr) != want_callable {
+                continue;
+            }
+            let summary = super::inline_call::summarize_body_blockers(
+                jc.code.as_slice(),
+                jc.num_regs_i(),
+                jc.constants_i.as_slice(),
+                |_| Some(majit_jitcode::codewriter::jitcode::DescentBlockerSummary::default()),
+            );
+            if summary.blocker_effect_free.is_none() && summary.blocker_after_effect.is_none() {
+                continue;
+            }
+            return Some(slot as u16);
+        }
+        None
+    }
+
+    let interpreted = first_jitcode_descr(false)
+        .expect("a JitCode descr whose callee has residual blockers and a non-callable fnaddr");
+    let native = first_jitcode_descr(true)
+        .expect("a JitCode descr whose callee has residual blockers and a callable fnaddr");
+    let interpreted_helper =
+        install_inline_helper("helper_resume_interpreted_inline_callee", interpreted);
+    let native_helper = install_inline_helper("helper_resume_native_inline_callee", native);
+    assert!(
+        super::inline_call::helper_resume_reaches_blocker(interpreted_helper, 0, None),
+        "an interpreted inline callee still contributes its body blockers"
+    );
+    assert!(
+        !super::inline_call::helper_resume_reaches_blocker(native_helper, 0, None),
+        "a natively called inline callee contributes no body blockers"
+    );
+}
+
 /// Resume does not treat a residual whose funcbox register is a runtime-only
 /// unknown as a blocker: `ResumeDataDirectReader.consume_one_section`
 /// restores it. Whole-body admission already agreed.

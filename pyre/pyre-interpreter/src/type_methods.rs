@@ -949,7 +949,7 @@ pub fn descr_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         if let Some(clone) = pyre_object::with_roots!(list =>
             pyre_object::listobject::w_list_clone_if_shared_strategy(list)
         ) {
-            return Ok(clone);
+            return crate::runtime_ops::obj_or_memory_error(clone);
         }
         let n = w_list_len(list);
         let _roots = pyre_object::gc_roots::push_roots();
@@ -964,11 +964,14 @@ pub fn descr_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 fetched += 1;
             }
         }
-        let mut items = Vec::with_capacity(fetched);
+        let mut items = Vec::new();
+        items
+            .try_reserve_exact(fetched)
+            .map_err(|_| crate::builtins::reservation_failed())?;
         for i in 0..fetched {
             items.push(pyre_object::gc_roots::shadow_stack_get(items_base + i));
         }
-        Ok(w_list_new(items))
+        crate::runtime_ops::obj_or_memory_error(w_list_new(items))
     }
 }
 

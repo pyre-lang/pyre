@@ -18474,81 +18474,89 @@ fn null_mut_gcref_dest_annotates_someptr() {
     );
 }
 
-/// A GC-instance dest keeps today's classdef-less nullable `SomeInstance`
-/// (`ptr_null_constant`); it is not recast onto GCREF.
+/// `std::ptr::null_mut::<GcStruct>()` of a registered GC ADT is a
+/// spelled `core.ptr.null_mut` (`lltype.nullptr` of that instance class).
 #[test]
-fn null_mut_of_classed_gc_ptr_stays_null_mut() {
-    use crate::model::{CallTarget, OpKind};
-    let dest = interior_raw_mut(interior_adt(0));
+fn null_mut_of_gc_struct_is_spelled_null_mut() {
+    use crate::model::{LinkArg, OpKind};
+    let adt = interior_adt(0);
+    let ptr = interior_raw_mut(adt.clone());
     let caller = interior_caller(
-        "null_gc_inst",
+        "null_gc_ptr",
         0,
         vec![],
-        dest.clone(),
-        vec![interior_local(0, None, &dest)],
+        ptr.clone(),
+        vec![interior_local(0, None, &ptr)],
         vec![
             interior_bb(
                 vec![],
-                interior_call(1, vec![], interior_place(0, &dest), 2, 1),
+                interior_call(1, vec![], interior_place(0, &ptr), 2, 1),
             ),
             interior_bb(vec![], interior_unwind()),
             interior_bb(vec![], interior_return()),
         ],
     );
-    let null_mut = interior_opaque(1, &["std", "ptr", "null_mut"], vec![], dest);
-    let gctype = serde_json::json!({
-        "def_id": 0,
-        "item_meta": interior_meta(&["majit_gc", "header", "GcType"], false)
-    });
-    let gctype_impl = serde_json::json!({
-        "impl_trait": {
-            "id": 0,
-            "generics": {
-                "types": [{"Value": [0, {"Adt": {
-                    "id": 0,
-                    "generics": {
-                        "regions": [],
-                        "types": [],
-                        "const_generics": [],
-                        "trait_refs": []
-                    }
-                }}]}]
-            }
-        }
-    });
+    let null_mut = interior_opaque(1, &["std", "ptr", "null_mut"], vec![], ptr);
     let llbc = llbc_with_types_traits(
         "fixture",
         vec![interior_struct(
             0,
-            &["fixture", "GcStorage"],
-            &[("n", interior_i64())],
+            &["fixture", "GcStruct"],
+            &[("word", interior_i64())],
             8,
             &[0],
             false,
         )],
         vec![caller, null_mut],
-        vec![gctype],
-        vec![gctype_impl],
+        vec![serde_json::json!({
+            "def_id": 0,
+            "item_meta": interior_meta(&["majit_gc", "header", "GcType"], false)
+        })],
+        vec![serde_json::json!({
+            "impl_trait": {
+                "id": 0,
+                "generics": {
+                    "types": [{"Value": [0, adt]}]
+                }
+            }
+        })],
     );
-    let graph = lower_interior(&llbc, "null_gc_inst");
+    let graph = lower_interior(&llbc, "null_gc_ptr");
     let ops: Vec<_> = graph
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
         .collect();
-    assert!(
-        ops.iter().any(|op| {
+    let spelled = ops
+        .iter()
+        .find(|op| {
             matches!(
                 &op.kind,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } if segments.as_slice() == ["core", "ptr", "null_mut"]
-                    || segments.as_slice() == ["std", "ptr", "null_mut"]
+                OpKind::Call { target, .. } if target.to_string() == "core::ptr::null_mut"
             )
-        }),
-        "GC-instance dest keeps null_mut; ops={ops:?}"
-    );
+        })
+        .unwrap_or_else(|| panic!("expected core::ptr::null_mut; ops={ops:?}"));
+    match &spelled.kind {
+        OpKind::Call {
+            args, result_ty, ..
+        } => {
+            assert_eq!(
+                result_ty,
+                &crate::model::ValueType::Ref(Some("GcStruct".to_string()))
+            );
+            match args.as_slice() {
+                [LinkArg::Const(c)] => {
+                    assert_eq!(
+                        c.value.as_pystr(),
+                        Some("GcStruct"),
+                        "null_mut must carry T's class-root spelling"
+                    );
+                }
+                other => panic!("expected one class-root spelling, got {other:?}"),
+            }
+        }
+        other => panic!("expected spelled null_mut call, got {other:?}"),
+    }
     assert!(
         ops.iter()
             .all(|op| crate::model::cast_instance_root(&op.kind) != Some("GCREF")),
@@ -30133,15 +30141,15 @@ fn check_option_filter_repr(repr: OptionRecvRepr) {
         }
     }
 
-    // Pointer niche: `set_branch` peels `eq(is_none, false)`
-    // (`flowcontext.py FlowContext.not_` / `guessbool`), so Bool(true)
-    // is None. Scalar `ne` 0 and aggregate `__discriminant` stay Some=1.
+    // Pointer-niche `eq(is_none, False)` is peeled at `set_branch`
+    // (`flowcontext.py FlowContext.not_` / `guessbool`): the switch is
+    // `bool(is_none)` and true is the None arm.
     let (some, none) = match repr {
         OptionRecvRepr::PointerNiche => (
             bool_exit_target(&graph, start, false),
             bool_exit_target(&graph, start, true),
         ),
-        _ => (
+        OptionRecvRepr::ScalarNiche | OptionRecvRepr::Aggregate => (
             bool_exit_target(&graph, start, true),
             bool_exit_target(&graph, start, false),
         ),

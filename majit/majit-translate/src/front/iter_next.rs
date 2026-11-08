@@ -641,14 +641,16 @@ fn stopiteration_exitcase() -> ExitCase {
 }
 
 /// Split the nullable-pointer form of an Option switch into `(None, Some)`.
-/// `true_is_some` is the leftover `eq(is_none, false)` / `ne` polarity
-/// (`ptr_nonzero`: true = Some). After `set_branch` peels a switch-only
-/// `not_` (`flowcontext.py FlowContext.not_` / `guessbool`), the closed
-/// block switches on `is_none` (`ptr_iszero`: true = None).
+///
+/// `ne(opt, null)` and unpeeled `eq(is_none, False)` are `ptr_nonzero`:
+/// false is None, true is Some. `set_branch` peels a switch-only
+/// `eq(is_none, False)` (`flowcontext.py FlowContext.not_` /
+/// `guessbool`), so the switch is `bool(is_none)` (`rnone.py`
+/// `rtype_is_None` `ptr_iszero`) and true is None.
 fn split_niche_bool_exits(
     exits: &[Link],
     name: &str,
-    true_is_some: bool,
+    true_is_none: bool,
 ) -> Result<(Link, Link), String> {
     if exits.len() != 2 {
         return Err(format!(
@@ -660,20 +662,8 @@ fn split_niche_bool_exits(
     let mut some: Option<Link> = None;
     for link in exits {
         match link.exitcase {
-            Some(ExitCase::Bool(false)) => {
-                if true_is_some {
-                    none = Some(link.clone());
-                } else {
-                    some = Some(link.clone());
-                }
-            }
-            Some(ExitCase::Bool(true)) => {
-                if true_is_some {
-                    some = Some(link.clone());
-                } else {
-                    none = Some(link.clone());
-                }
-            }
+            Some(ExitCase::Bool(b)) if b == true_is_none => none = Some(link.clone()),
+            Some(ExitCase::Bool(_)) => some = Some(link.clone()),
             _ => {
                 return Err(format!(
                     "{name}: niche Option switch has non-bool exit case {:?}",
@@ -787,6 +777,21 @@ pub(crate) fn rewire_next_call_sites(
 /// side effect and its result is bit-identical to its operand.
 fn is_recast_narrow(kind: &OpKind) -> bool {
     crate::model::cast_instance_root(kind).is_some()
+}
+
+/// `core::ptr::null_mut` as a None sentinel: unspelled, or spelled with
+/// the GC pointee's class-root constant (`push_null_gc_ptr_with_spelling`).
+fn is_null_mut_none_sentinel(kind: &OpKind) -> bool {
+    match kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments == &["core", "ptr", "null_mut"] => {
+            args.is_empty() || matches!(args.as_slice(), [LinkArg::Const(_)])
+        }
+        _ => false,
+    }
 }
 
 /// An unregistered `next()` returns an opaque `Ref`; the MIR immediately
@@ -1362,16 +1367,34 @@ fn rewire_one_next_site(
         let branch_value_vars = vec![disc_var.clone()];
         (none_link, some_link, true, branch_value_vars)
     } else {
-        // The current MIR fold preserves PyPy identity semantics for
-        // nullable strings/lists: `is_none = opt is null`. A value use
-        // keeps `d = is_none == false` (`ptr_nonzero`). A switch-only use
-        // is `flowcontext.py FlowContext.not_` / `guessbool`: the closed
-        // block switches on `is_none` (`ptr_iszero`). The older direct
-        // `ne(opt, null)` spelling is the same `ptr_nonzero` predicate.
-        // Recognise those exact pure forms; accepting an arbitrary boolean
-        // chain here could reverse the None/Some arms and would not be a
-        // faithful `ll_listnext` rewrite.
+        // Identity-null is `is_none = opt is null`. A value use keeps
+        // `d = is_none == false` (`ptr_nonzero`). A branch use peels
+        // that eq (`flowcontext.py FlowContext.not_` / `guessbool`) so
+        // the switch is `bool(is_none)` (`ptr_iszero`) and true is None.
+        // Direct `ne(opt, null)` is the older spelling. Recognise those
+        // exact pure forms; an arbitrary boolean chain could reverse the
+        // arms and would not be a faithful `ll_listnext` rewrite.
         let ops = &graph.blocks[c].operations;
+        let find_is_none = || {
+            ops.iter()
+                .enumerate()
+                .find_map(|(i, op)| match (&op.kind, op.result.as_ref()) {
+                    (OpKind::BinOp { op, lhs, rhs, .. }, Some(result))
+                        if op == "is_" && (*lhs == opt_c || *rhs == opt_c) =>
+                    {
+                        Some((
+                            i,
+                            result.clone(),
+                            if *lhs == opt_c {
+                                rhs.clone()
+                            } else {
+                                lhs.clone()
+                            },
+                        ))
+                    }
+                    _ => None,
+                })
+        };
         let direct =
             ops.iter()
                 .enumerate()
@@ -1388,31 +1411,13 @@ fn rewire_one_next_site(
                                 lhs.clone()
                             },
                             vec![result.clone()],
-                            true,
+                            false,
                         ))
                     }
                     _ => None,
                 });
         let identity_inversion = || {
-            let (is_idx, is_none, null_var) =
-                ops.iter().enumerate().find_map(|(i, op)| {
-                    match (&op.kind, op.result.as_ref()) {
-                        (OpKind::BinOp { op, lhs, rhs, .. }, Some(result))
-                            if op == "is_" && (*lhs == opt_c || *rhs == opt_c) =>
-                        {
-                            Some((
-                                i,
-                                result.clone(),
-                                if *lhs == opt_c {
-                                    rhs.clone()
-                                } else {
-                                    lhs.clone()
-                                },
-                            ))
-                        }
-                        _ => None,
-                    }
-                })?;
+            let (is_idx, is_none, null_var) = find_is_none()?;
             let (false_idx, false_var) = ops.iter().enumerate().find_map(|(i, op)| {
                 matches!(op.kind, OpKind::ConstBool(false))
                     .then(|| op.result.clone().map(|v| (i, v)))
@@ -1435,40 +1440,26 @@ fn rewire_one_next_site(
                 disc_var.clone(),
                 null_var,
                 vec![is_none, false_var, disc_var],
-                true,
-            ))
-        };
-        let identity_is_none = || {
-            let (is_idx, is_none, null_var) =
-                ops.iter().enumerate().find_map(|(i, op)| {
-                    match (&op.kind, op.result.as_ref()) {
-                        (OpKind::BinOp { op, lhs, rhs, .. }, Some(result))
-                            if op == "is_" && (*lhs == opt_c || *rhs == opt_c) =>
-                        {
-                            Some((
-                                i,
-                                result.clone(),
-                                if *lhs == opt_c {
-                                    rhs.clone()
-                                } else {
-                                    lhs.clone()
-                                },
-                            ))
-                        }
-                        _ => None,
-                    }
-                })?;
-            Some((
-                vec![is_idx],
-                is_none.clone(),
-                null_var,
-                vec![is_none],
                 false,
             ))
         };
-        let (mut pure_indices, disc_var, null_var, mut branch_value_vars, true_is_some) = direct
+        let identity_peeled = || {
+            let (is_idx, is_none, null_var) = find_is_none()?;
+            let has_eq_false = ops.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::BinOp { op, lhs, rhs, .. }
+                        if op == "eq" && (*lhs == is_none || *rhs == is_none)
+                )
+            });
+            if has_eq_false {
+                return None;
+            }
+            Some((vec![is_idx], is_none.clone(), null_var, vec![is_none], true))
+        };
+        let (mut pure_indices, disc_var, null_var, mut branch_value_vars, true_is_none) = direct
             .or_else(identity_inversion)
-            .or_else(identity_is_none)
+            .or_else(identity_peeled)
             .ok_or_else(|| {
                 format!(
                     "{name}: block {c} lacks both an Option __discriminant read and a nullable-pointer test"
@@ -1495,11 +1486,7 @@ fn rewire_one_next_site(
             null_indices.push(idx);
             match &op.kind {
                 OpKind::ConstNone => break,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    args,
-                    ..
-                } if args.is_empty() && segments == &["core", "ptr", "null_mut"] => break,
+                kind if is_null_mut_none_sentinel(kind) => break,
                 OpKind::Call { args, .. } if is_recast_narrow(&op.kind) => {
                     null_source = args[0].clone().into_variable();
                 }
@@ -1541,7 +1528,7 @@ fn rewire_one_next_site(
             &name,
         )?;
         let (none_link, some_link) =
-            split_niche_bool_exits(&graph.blocks[c].exits, &name, true_is_some)?;
+            split_niche_bool_exits(&graph.blocks[c].exits, &name, true_is_none)?;
         branch_value_vars.push(bool_var.clone());
         (none_link, some_link, false, branch_value_vars)
     };
@@ -2028,7 +2015,22 @@ mod tests {
             Link::new_mixed(Vec::new(), some_target, Some(ExitCase::Bool(true))),
             Link::new_mixed(Vec::new(), none_target, Some(ExitCase::Bool(false))),
         ];
-        let (none, some) = split_niche_bool_exits(&exits, "test", true).expect("split niche exits");
+        let (none, some) =
+            split_niche_bool_exits(&exits, "test", false).expect("split niche exits");
+        assert_eq!(none.target, none_target);
+        assert_eq!(some.target, some_target);
+    }
+
+    #[test]
+    fn peeled_identity_null_exits_split_true_none_false_some() {
+        let none_target = crate::model::BlockId(3);
+        let some_target = crate::model::BlockId(4);
+        let exits = vec![
+            Link::new_mixed(Vec::new(), none_target, Some(ExitCase::Bool(true))),
+            Link::new_mixed(Vec::new(), some_target, Some(ExitCase::Bool(false))),
+        ];
+        let (none, some) =
+            split_niche_bool_exits(&exits, "test", true).expect("split peeled exits");
         assert_eq!(none.target, none_target);
         assert_eq!(some.target, some_target);
     }

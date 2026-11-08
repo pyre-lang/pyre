@@ -571,9 +571,9 @@ impl PotentialShortOp {
                         // alias (`ShortBoxes.add_op_to_short`).
                         alt.label_arg_idx = None;
                         // shortpreamble.py `ResOperation(opnum, [shortop.res])`
-                        // — the alias source is the Box itself; resolve to
-                        // the canonical (possibly producer-bound) box.
-                        alt.same_as_source = Some(ctx.materialize_operand_at(compound.res));
+                        // — `CompoundOp.one.res` is that box (`add_potential_op`
+                        // stores the result operand on the leaf).
+                        alt.same_as_source = Some(compound.one.res.clone());
                         // shortpreamble.py:333 `self.produced_short_boxes[
                         // new_name] = lst[i]` — keyed by the alias box.
                         sb.produced_short_boxes.insert(alt.res.clone(), alt.clone());
@@ -834,17 +834,12 @@ impl ShortBoxes {
     ) -> Option<majit_ir::operand::Operand> {
         let opref = arg.to_opref();
         // shortpreamble.py:288 isinstance(op, Const) → return op.
-        if opref.is_constant() {
-            return Some(majit_ir::operand::Operand::from_opref(opref));
+        if arg.is_constant() {
+            return Some(arg.clone());
         }
         // shortpreamble.py `if op in self.produced_short_boxes` — the
-        // dict membership is Box identity; an unbound position view falls
-        // back to its canonical box.
-        let okey = if arg.is_resop() || arg.is_inputarg() {
-            arg.clone()
-        } else {
-            ctx.materialize_operand_at(opref)
-        };
+        // dict membership is Box identity.
+        let okey = arg.clone();
         if let Some(existing) = self.produced_short_boxes.get(&okey) {
             // shortpreamble.py:285 `return ...preamble_op` — the
             // dependency's replay op object itself, so preamble-op
@@ -1759,10 +1754,10 @@ impl ProducedShortOp {
         if let Some(crate::optimizeopt::info::OpInfo::Ptr(rc)) = exported_infos.get(&source_obj) {
             ctx.setinfo_from_preamble(&source_obj, rc, Some(exported_infos));
         }
-        let index_const = ctx.make_constant_int(index);
+        let index_const = Operand::const_(majit_ir::Const::Int(index));
         let mut getarrayitem_op = Op::new(
             OpCode::getarrayitem_for_type(result_type),
-            &[source_obj.clone(), ctx.materialize_operand_at(index_const)],
+            &[source_obj.clone(), index_const],
         );
         getarrayitem_op.setdescr(descr.clone());
         // shortpreamble.py:80-85 mutates array info through the same original

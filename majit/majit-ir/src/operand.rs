@@ -30,6 +30,7 @@ use crate::resoperation::{OpRc, OpRef};
 use crate::tempvar::{TempVar, TempVarRc};
 use crate::value::{Const, GcRef, InputArgRc, Type, Value};
 use std::cell::{Cell, RefCell};
+use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ptr;
 use std::rc::Rc;
@@ -203,6 +204,50 @@ enum Opnd {
     NullRef,
     Const(ManuallyDrop<Rc<Cell<Value>>>),
     TempVar(ManuallyDrop<TempVarRc>),
+}
+
+/// Borrowed tagged view of an [`Operand`]. [`Operand::with_view`] decodes the
+/// packed word once so `type_` and `const_value` share that decode. The view
+/// does not increment an `Rc` (`resoperation.py` `AbstractValue` field reads).
+pub struct OperandView<'a> {
+    inner: Opnd,
+    _lt: PhantomData<&'a Operand>,
+}
+
+impl OperandView<'_> {
+    /// The operand's `Type` (`Int` / `Float` / `Ref` / `Void`).
+    pub fn type_(&self) -> Type {
+        match &self.inner {
+            Opnd::Op(op) => op.pos().get().ty().unwrap_or(op.type_),
+            Opnd::InputArg(ia) => ia.tp.get(),
+            Opnd::SmallInt(_) => Type::Int,
+            Opnd::SmallWide(id) => wide_value(*id).get_type(),
+            Opnd::NullRef => Type::Ref,
+            Opnd::Const(cell) => cell.get().get_type(),
+            Opnd::None => Type::Void,
+            Opnd::TempVar(_) => Type::Int,
+        }
+    }
+
+    /// The inline constant value (`history.py` `Const.getint` family),
+    /// `None` for non-`Const`.
+    pub fn const_value(&self) -> Option<Value> {
+        match &self.inner {
+            Opnd::SmallInt(encoded) => Some(Value::Int(small_int_value(*encoded))),
+            Opnd::SmallWide(id) => Some(wide_value(*id)),
+            Opnd::NullRef => Some(Value::Ref(GcRef::NULL)),
+            Opnd::Const(cell) => Some(cell.get()),
+            Opnd::Op(_) | Opnd::InputArg(_) | Opnd::TempVar(_) | Opnd::None => None,
+        }
+    }
+
+    /// `resoperation.py is_constant`.
+    pub fn is_constant(&self) -> bool {
+        matches!(
+            self.inner,
+            Opnd::SmallInt(_) | Opnd::SmallWide(_) | Opnd::NullRef | Opnd::Const(_)
+        )
+    }
 }
 
 impl Operand {
@@ -716,6 +761,17 @@ impl Operand {
         f(&view)
     }
 
+    /// Decode the packed tag once and pass a borrowed [`OperandView`]. Combined
+    /// type/constant queries share that decode (`resoperation.py` field reads
+    /// on the already-held box).
+    #[inline]
+    pub fn with_view<R>(&self, f: impl FnOnce(OperandView<'_>) -> R) -> R {
+        f(OperandView {
+            inner: self.view(),
+            _lt: PhantomData,
+        })
+    }
+
     /// Packed word of the `_forwarded` chain terminal, not counted: `self`
     /// or a hop's `_forwarded` slot keeps it alive.
     fn replacement_packed(&self, not_const: bool) -> u64 {
@@ -1096,6 +1152,16 @@ mod tests {
         assert_eq!(o_c.type_(), Type::Int);
         assert_eq!(o_c.const_value(), Some(Value::Int(9)));
         assert_eq!(o_c.const_int(), Some(9));
+        o_c.with_view(|v| {
+            assert_eq!(v.type_(), Type::Int);
+            assert_eq!(v.const_value(), Some(Value::Int(9)));
+            assert!(v.is_constant());
+        });
+        o_op.with_view(|v| {
+            assert_eq!(v.type_(), Type::Int);
+            assert_eq!(v.const_value(), None);
+            assert!(!v.is_constant());
+        });
 
         let o_n = Operand::none();
         assert!(o_n.is_none());

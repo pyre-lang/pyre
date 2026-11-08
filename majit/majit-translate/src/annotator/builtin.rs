@@ -399,9 +399,9 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     analyzer_for(&mut reg, "core.ptr.null", ptr_null_constant);
     analyzer_for(&mut reg, "std.ptr.null", ptr_null_constant);
     // `Option<fn>`'s null niche. A GC pointer's null is
-    // `ptr_null_constant` (classdef-less `SomeInstance`); a raw function
-    // pointer's null is `SomePtr(FuncType)` (`fn_null_constant`), the
-    // same `ll_ptrtype` as the matching `fn` value so the two arms union.
+    // `ptr_null_constant` (classdef-less only when unspelled); a raw
+    // function pointer's null is `SomePtr(FuncType)` (`fn_null_constant`),
+    // the same `ll_ptrtype` as the matching `fn` value so the two arms union.
     analyzer_for(&mut reg, "core.ptr.null_fn", fn_null_constant);
     // Raw-address niche `None` (`Option<&Raw>`, `Option<NonNull<Raw>>`).
     // A spelled class root is `lltype.nullptr(T)` (`SomePtr` of that raw
@@ -1700,38 +1700,56 @@ fn std_alloc_raw(
     Ok(raw_alloc_ptr_somevalue())
 }
 
-/// Analyzer for `std::ptr::null_mut::<T>()` / `std::ptr::null::<T>()`
-/// — the null pointer constant (`lltype.nullptr(T)` analogue;
-/// `rbuiltin.py` typer folds it to a null `Ptr` constant).  Pyre's
-/// erased-pointer projection keeps pointee classes off the annotation
-/// (`annotation_state.rs` `Ref` table row), so the shell is the
-/// classdef-less `SomeInstance` with `can_be_none=true`: the
-/// `Instance(None) ∪ Instance(cd)` union arm (`model.rs`'s `union`) keeps
-/// it joinable with any typed receiver while preserving the
-/// nullability bit.
+/// `None` of an instance class: `s_None ∪ SomeInstance(cd)` is
+/// `SomeInstance(cd, can_be_None=True)` (`model.py`), and `rclass.py`
+/// `InstanceRepr.convert_const(None)` is its `nullptr`. A front end that
+/// knows the GC pointee passes its class-root spelling; with no argument
+/// the pointee is unknown and the null stays the classdef-less top.
 fn ptr_null_constant(
-    _bk: &Rc<Bookkeeper>,
+    bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    // `ptr::null()` / `ptr::null_mut()` are zero-arg; a call site
-    // carrying arguments is a malformed lowering, not a null constant.
-    if !args_s.is_empty() || !kwds.is_empty() {
+    let classdef_less = || {
+        SomeValue::Instance(super::model::SomeInstance::new(
+            None,
+            true,
+            std::collections::BTreeMap::new(),
+        ))
+    };
+    if !kwds.is_empty() {
         return Err(AnnotatorError::new(
             "ptr::null()/ptr::null_mut() take no arguments",
         ));
     }
-    Ok(SomeValue::Instance(super::model::SomeInstance::new(
-        None,
-        true,
-        std::collections::BTreeMap::new(),
-    )))
+    match args_s {
+        [] => Ok(classdef_less()),
+        [Some(s_ty)] => {
+            let Some(spelling) = s_ty.const_().and_then(|c| c.as_pystr()) else {
+                return Err(AnnotatorError::new(
+                    "ptr::null()/ptr::null_mut() take no arguments",
+                ));
+            };
+            match bk.getuniqueclassdef_for_struct_root(spelling) {
+                Ok(classdef) => Ok(SomeValue::Instance(super::model::SomeInstance::new(
+                    Some(classdef),
+                    true,
+                    std::collections::BTreeMap::new(),
+                ))),
+                Err(_) => Ok(classdef_less()),
+            }
+        }
+        _ => Err(AnnotatorError::new(
+            "ptr::null()/ptr::null_mut() take no arguments",
+        )),
+    }
 }
 
 /// Null `Option<fn>` — `lltype.nullptr(FuncType)` as `SomePtr`, not the
-/// classdef-less `SomeInstance` that `ptr_null_constant` returns for a
-/// GC pointer. `llannotation.py` `pairtype(SomePtr, SomePtr).union`
-/// requires the same `ll_ptrtype` as the function-pointer field read.
+/// `SomeInstance` that `ptr_null_constant` returns for a GC pointer
+/// (classdef-less only when unspelled). `llannotation.py`
+/// `pairtype(SomePtr, SomePtr).union` requires the same `ll_ptrtype` as
+/// the function-pointer field read.
 /// An optional constant spelling is the FUNC type `lltype.nullptr` takes
 /// (`getfunctionptr`); without it the coarse empty `FuncType` is used.
 ///
@@ -3763,6 +3781,51 @@ mod tests {
             err.to_string().contains("don't know how to convert from"),
             "Instance→Ptr convert must fail, got {err}"
         );
+    }
+
+    /// Spelled `core.ptr.null_mut` is `None` of that instance class
+    /// (`s_None ∪ SomeInstance(cd)` is `SomeInstance(cd, can_be_None=True)`).
+    #[test]
+    fn spelled_gc_null_is_nullable_instance_of_its_class() {
+        use crate::annotator::model::{SomeValue, unionof};
+        use crate::flowspace::model::{ConstValue, Constant};
+
+        let bk = bk();
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root("GcPointee")
+            .expect("GC classdef");
+        let mut s_ty = crate::annotator::model::s_str0();
+        s_ty.set_const_box(Constant::new(ConstValue::byte_str("GcPointee")));
+        let s_null = ptr_null_constant(&bk, &[Some(s_ty)], &std::collections::HashMap::new())
+            .expect("spelled null_mut");
+        let SomeValue::Instance(i) = &s_null else {
+            panic!("spelled null_mut must be SomeInstance, got {s_null:?}");
+        };
+        assert!(
+            i.classdef.is_some(),
+            "spelled GC null must intern T's classdef"
+        );
+        assert!(i.can_be_none, "None of an instance class is nullable");
+        let inst_classdef = i.classdef.as_ref().expect("classdef");
+        assert!(
+            Rc::ptr_eq(inst_classdef, &classdef),
+            "null instance must be the interned GC classdef"
+        );
+        let classed = SomeValue::Instance(super::super::model::SomeInstance::new(
+            Some(classdef.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let merged = unionof([&classed, &s_null]).expect("None unions with Some of T");
+        let SomeValue::Instance(merged_i) = &merged else {
+            panic!("union must stay SomeInstance, got {merged:?}");
+        };
+        let merged_cd = merged_i.classdef.as_ref().expect("union keeps classdef");
+        assert!(
+            Rc::ptr_eq(merged_cd, &classdef),
+            "SomeInstance(cd) ∪ s_None stays SomeInstance(cd)"
+        );
+        assert!(merged_i.can_be_none, "union is nullable");
     }
 
     /// `lltype.nullptr(FUNC)` of a spelled signature is the same

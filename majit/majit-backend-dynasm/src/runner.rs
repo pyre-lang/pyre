@@ -512,6 +512,7 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
     majit_gc::set_active_alloc_nursery_typed(Some(dynasm_alloc_nursery_typed));
     majit_gc::set_active_thread_has_gc_box(Some(gc_box::present));
     majit_gc::set_active_raise_memory_error(Some(raise_memory_error));
+    majit_gc::set_active_exception_occurred(Some(crate::jit_exc_is_pending));
     majit_gc::set_active_alloc_nursery_headerless_no_collect(Some(
         dynasm_alloc_nursery_headerless_no_collect,
     ));

@@ -6267,22 +6267,26 @@ pub fn __majit_wrap_builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
                 if value != i64::MIN {
                     let mask = value >> 63;
                     let intval = (value ^ mask).wrapping_sub(mask);
-                    return Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
-                        ob_header: PyObject {
-                            ob_type: &INT_TYPE as *const PyType,
-                            w_class: get_instantiate(&INT_TYPE),
-                        },
-                        intval,
-                    }) as PyObjectRef);
+                    return crate::runtime_ops::fresh_alloc_or_memory_error!(
+                        pyre_object::lltype::malloc_typed_managed(W_IntObject {
+                            ob_header: PyObject {
+                                ob_type: &INT_TYPE as *const PyType,
+                                w_class: get_instantiate(&INT_TYPE),
+                            },
+                            intval,
+                        }) as PyObjectRef
+                    );
                 }
             } else if is_exact_builtin_instance(w_val) && is_float(w_val) {
-                return Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
-                    ob_header: PyObject {
-                        ob_type: &FLOAT_TYPE as *const PyType,
-                        w_class: get_instantiate(&FLOAT_TYPE),
-                    },
-                    floatval: w_float_get_value(w_val).abs(),
-                }) as PyObjectRef);
+                return crate::runtime_ops::fresh_alloc_or_memory_error!(
+                    pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+                        ob_header: PyObject {
+                            ob_type: &FLOAT_TYPE as *const PyType,
+                            w_class: get_instantiate(&FLOAT_TYPE),
+                        },
+                        floatval: w_float_get_value(w_val).abs(),
+                    }) as PyObjectRef
+                );
             } else if is_exact_builtin_instance(w_val) && pyre_object::is_complex(w_val) {
                 return builtin_abs_complex(w_val);
             }

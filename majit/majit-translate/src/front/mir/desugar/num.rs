@@ -378,9 +378,7 @@ impl<'a> Lowering<'a> {
     ///
     /// Upstream writes that null as `lltype.nullptr(T)` of the raw
     /// `Ptr` (`rbuiltin.py` `rtype_null_raw`, `annotator/builtin.rs`
-    /// `raw_ptr_null_constant`). A GC `null_mut` recast through
-    /// `__cast_instance_intrinsic` is a `Ptr(GcStruct)` that
-    /// `pairtype(GCRefRepr, Repr).convert_from_to` refuses.
+    /// `raw_ptr_null_constant`).
     ///
     /// Raw is [`ty_is_raw_address`] / [`raw_address_owner_root`]
     /// (`gc_struct_ids`). An `_alloc_flavor_ = raw` pointee that still
@@ -389,7 +387,9 @@ impl<'a> Lowering<'a> {
     /// annotates a nullable `SomeInstance` of that classdef
     /// (`classdesc.get_param('_alloc_flavor_')`). `raw_struct_ptr_annotation`
     /// is storage-raw only and does not accept a flavor-raw spelling.
-    /// A GC pointee returns `false` and keeps `null_mut`.
+    /// A GC pointee whose class root is registered becomes a spelled
+    /// `core.ptr.null_mut` (`push_null_gc_ptr_with_spelling`); any other
+    /// pointee returns `false` and keeps the unspelled `null_mut`.
     pub(in crate::front::mir) fn try_lower_raw_adt_ptr_null(
         &mut self,
         mir_bb: usize,
@@ -506,13 +506,40 @@ impl<'a> Lowering<'a> {
             self.graph.set_goto(bb_id, target_bb, link_args);
             return Ok(true);
         }
-        let Some(spelling) = self.raw_adt_ptr_null_spelling(&call.dest.ty) else {
+        if let Some(spelling) = self.raw_adt_ptr_null_spelling(&call.dest.ty) {
+            let bb_id = self.emit_bb(mir_bb);
+            let res = self
+                .graph
+                .push_null_raw_ptr_with_spelling(bb_id, spelling.as_deref());
+            self.local_var[dest_local] = Some(LocalValue::One(res));
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(true);
+        }
+        if !is_core_ptr_null_fun_path(&path) {
+            return Ok(false);
+        }
+        let Some(root) = tyref_class_root_with(&call.dest.ty, self.llbc, self.tombstoned_leaves)
+        else {
             return Ok(false);
         };
+        let dest_vt = tyref_to_value_type_with(
+            &call.dest.ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        );
+        if dest_vt != ValueType::Ref(Some(root.clone())) {
+            return Ok(false);
+        }
         let bb_id = self.emit_bb(mir_bb);
-        let res = self
-            .graph
-            .push_null_raw_ptr_with_spelling(bb_id, spelling.as_deref());
+        let res = self.graph.push_null_gc_ptr_with_spelling(
+            bb_id,
+            &root,
+            ValueType::Ref(Some(root.clone())),
+        );
         self.local_var[dest_local] = Some(LocalValue::One(res));
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;

@@ -4706,6 +4706,11 @@ const RUNTIME_RESIDUAL_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         &["self", "payload_size"],
         LowLevelType::Address,
     ),
+    (
+        &["GcAllocOutcome", "allocated_or_raise"],
+        &["self"],
+        LowLevelType::Address,
+    ),
     // `OnceLock<fn(...)>` for the `sys.exc_info` JIT-direct helper.
     (
         &["pyre_interpreter", "function", "SYS_EXC_INFO_DIRECT_FN"],
@@ -7205,6 +7210,96 @@ fn run_annotator_simplify_isolated(
     }
 }
 
+/// A callee whose annotation `annrpython.py RPythonAnnotator.complete`
+/// (blocked blocks) or `RPythonAnnotator.simplify` would have refused.
+fn cutoff_callee_annotation_incomplete(
+    annotator: &crate::annotator::annrpython::RPythonAnnotator,
+    call_registry: &CallRegistry,
+    callee: &GraphRef,
+) -> bool {
+    let startblock = callee.borrow().startblock.clone();
+    match annotator.annotated.borrow().get(&BlockKey::of(&startblock)) {
+        Some(Some(_)) => {}
+        _ => return true,
+    }
+    {
+        let blocked = annotator.blocked_blocks.borrow();
+        if callee
+            .borrow()
+            .iterblocks()
+            .iter()
+            .any(|block| blocked.contains_key(&BlockKey::of(block)))
+        {
+            return true;
+        }
+    }
+    let graph_key = GraphKey::of(callee);
+    let entry_call_paths: Vec<crate::parse::CallPath> =
+        match call_registry.find_entry_with_cached_graph(callee) {
+            Some((canonical, _)) => call_registry
+                .keys_for_entry(&canonical)
+                .into_iter()
+                .map(|key| key.to_call_path())
+                .collect(),
+            None => Vec::new(),
+        };
+    let tp = call_registry.two_phase();
+    if tp.rtype_skipped.contains(&graph_key) {
+        return true;
+    }
+    entry_call_paths
+        .iter()
+        .any(|path| tp.annotate_skipped.contains_key(path))
+}
+
+/// Index `n` of `transform.py` `cutoff_alwaysraising_block` /
+/// `cutoff_alwaysraising_op_counts`. `None` when that helper would
+/// assert (empty operations, mixed annotation order).
+fn tdc_cutoff_raising_op_index(block: &crate::flowspace::model::Block) -> Option<usize> {
+    use crate::translator::transform::cutoff_alwaysraising_op_counts;
+    let can_succeed: Vec<bool> = block
+        .operations
+        .iter()
+        .map(|op| match &op.result {
+            Hlvalue::Variable(v) => v.annotation.borrow().is_some(),
+            Hlvalue::Constant(_) => true,
+        })
+        .collect();
+    let n = can_succeed.iter().filter(|annotated| **annotated).count();
+    if n >= block.operations.len()
+        || !can_succeed[..n].iter().all(|annotated| *annotated)
+        || !can_succeed[n..].iter().all(|annotated| !*annotated)
+    {
+        return None;
+    }
+    Some(cutoff_alwaysraising_op_counts(block).0)
+}
+
+/// Callees of `flow_block.operations[op_index]` in
+/// `translator.py update_call_graph`. `None` when the tag has no
+/// callgraph entry.
+fn tdc_cutoff_callees_at_tag(
+    ann: &crate::annotator::annrpython::RPythonAnnotator,
+    caller: &GraphRef,
+    flow_block: &BlockRef,
+    op_index: usize,
+) -> Option<Vec<GraphRef>> {
+    let caller_key = GraphKey::of(caller);
+    let tag_block = BlockKey::of(flow_block);
+    let callgraph = ann.translator.callgraph.borrow();
+    let mut callees = Vec::new();
+    for (key, edge) in callgraph.iter() {
+        if key.caller == caller_key && key.tag_block == tag_block && key.tag_index == op_index {
+            callees.push(edge.callee.clone());
+        }
+    }
+    if callees.is_empty() {
+        None
+    } else {
+        Some(callees)
+    }
+}
+
 /// Decide the GraphStore cut from `annotator.links_followed` on the
 /// still-unsimplified flowspace graph (`transform.py` `transform_dead_code`).
 /// Every unfollowed exit of every annotated block is recorded; a
@@ -7215,7 +7310,8 @@ fn record_tdc_cut_for_flow_graph(
     ann: &crate::annotator::annrpython::RPythonAnnotator,
     flow: &GraphRef,
     graph: &LegacyGraph,
-) -> (Vec<GraphStoreTdcCut>, usize) {
+    no_callgraph_tag: &mut usize,
+) -> (Vec<GraphStoreTdcCut>, usize, Vec<GraphRef>) {
     use crate::translator::transform::{
         cutoff_alwaysraising_result_var, link_not_in_links_followed,
         transform_dead_code_would_cutoff,
@@ -7224,14 +7320,14 @@ fn record_tdc_cut_for_flow_graph(
         let g = flow.borrow();
         (g.returnblock.clone(), g.exceptblock.clone())
     };
-    let annotated = ann.annotated.borrow();
     let mut cuts = Vec::new();
     let mut none_origin = 0usize;
+    let mut cutoff_callees = Vec::new();
     for flow_block in flow.borrow().iterblocks() {
         if Rc::ptr_eq(&flow_block, &ret) || Rc::ptr_eq(&flow_block, &exc) {
             continue;
         }
-        match annotated.get(&BlockKey::of(&flow_block)) {
+        match ann.annotated.borrow().get(&BlockKey::of(&flow_block)) {
             Some(Some(_)) => {}
             _ => continue,
         }
@@ -7281,6 +7377,14 @@ fn record_tdc_cut_for_flow_graph(
         } else {
             None
         };
+        if cutoff {
+            if let Some(op_index) = tdc_cutoff_raising_op_index(&fb) {
+                match tdc_cutoff_callees_at_tag(ann, flow, &flow_block, op_index) {
+                    Some(callees) => cutoff_callees.extend(callees),
+                    None => *no_callgraph_tag += 1,
+                }
+            }
+        }
         cuts.push(GraphStoreTdcCut {
             drop_exits,
             keep_exits,
@@ -7288,7 +7392,7 @@ fn record_tdc_cut_for_flow_graph(
             cutoff_result,
         });
     }
-    (cuts, none_origin)
+    (cuts, none_origin, cutoff_callees)
 }
 
 fn tdc_plan_has_work(plan: &SubjectTdcPlan) -> bool {
@@ -7305,6 +7409,7 @@ fn record_tdc_cuts_for_subjects(
     let mut seen: HashSet<crate::model::GraphKey> = HashSet::new();
     let mut plans: HashMap<crate::model::GraphKey, SubjectTdcPlan> = HashMap::new();
     let mut none_origin = 0usize;
+    let mut no_callgraph_tag = 0usize;
     let jobs: Vec<(crate::parse::CallPath, GraphRef, LegacyToTyped)> = {
         let tp = call_registry.two_phase();
         tp.subjects
@@ -7330,12 +7435,21 @@ fn record_tdc_cuts_for_subjects(
         let Some(legacy) = function_graphs.get(&path) else {
             continue;
         };
-        let (cuts, n) = record_tdc_cut_for_flow_graph(annotator, &flow, legacy.as_ref());
+        let (cuts, n, cutoff_callees) =
+            record_tdc_cut_for_flow_graph(annotator, &flow, legacy.as_ref(), &mut no_callgraph_tag);
         none_origin += n;
-        plans.insert(store_key, SubjectTdcPlan { cuts, value_to_var });
+        plans.insert(
+            store_key,
+            SubjectTdcPlan {
+                cuts,
+                value_to_var,
+                cutoff_callees,
+            },
+        );
     }
     if rtyper_verbose_enabled() {
         eprintln!("[PREPASS graphstore cut none-origin] unfollowed={none_origin}");
+        eprintln!("[PREPASS tdc cutoff no-callgraph-tag] n={no_callgraph_tag}");
     }
     call_registry.two_phase().tdc_plans = plans;
 }
@@ -7602,6 +7716,7 @@ fn apply_tdc_cuts_to_graphstore(
         crate::model::GraphKey,
         Vec<GraphStoreTdcCut>,
         LegacyToTyped,
+        Vec<crate::flowspace::model::GraphRef>,
     )> = {
         let tp = call_registry.two_phase();
         let mut subjects: Vec<_> = tp.subjects.iter().collect();
@@ -7632,11 +7747,22 @@ fn apply_tdc_cuts_to_graphstore(
                 store_key,
                 plan.cuts.clone(),
                 plan.value_to_var.clone(),
+                plan.cutoff_callees.clone(),
             ));
         }
         jobs
     };
-    for (path, store_key, cuts, value_to_var) in jobs {
+    for (path, store_key, cuts, value_to_var, cutoff_callees) in jobs {
+        // `annrpython.py RPythonAnnotator.complete` refuses blocked
+        // blocks before `transform.py transform_dead_code`. A cutoff
+        // whose callee annotation is incomplete is that refusal.
+        if let Some((annotator, _)) = call_registry.session_if_started()
+            && cutoff_callees.iter().any(|callee| {
+                cutoff_callee_annotation_incomplete(&annotator, call_registry, callee)
+            })
+        {
+            continue;
+        }
         let mut unmapped = 0usize;
         let mut removed = 0usize;
         let did = function_graphs.with_built_mut(&path, |legacy| {
@@ -8535,6 +8661,33 @@ pub(crate) fn dual_gate_outcome_from_cache(
         }
     }
 
+    // `annrpython.py RPythonAnnotator.complete` raises AnnotatorError
+    // on blocked blocks before `rtyper.py RPythonTyper.specialize` and
+    // `transform.py transform_dead_code`. A cutoff that follows a call
+    // whose callee annotation is incomplete is that blocked-block
+    // error: Skip rather than run the specialize-time baseline.
+    // `RPythonAnnotator.simplify` (`rtype_skipped`) and Phase-A
+    // `annotate_skipped` are the same program-level refusal.
+    if let Some((annotator, _)) = call_registry.session_if_started() {
+        let callees = {
+            let tp = call_registry.two_phase();
+            function_graphs
+                .key_for(path)
+                .and_then(|store_key| tp.tdc_plans.get(&store_key))
+                .map(|plan| plan.cutoff_callees.clone())
+        };
+        if let Some(callees) = callees
+            && callees.iter().any(|callee| {
+                cutoff_callee_annotation_incomplete(&annotator, call_registry, callee)
+            })
+        {
+            return Ok(DualGateOutcome::Skip(
+                "two-phase: transform_dead_code cutoff follows an incomplete callee annotation"
+                    .to_string(),
+            ));
+        }
+    }
+
     // Legacy-baseline comparison oracle (the `dual_gate_check_with_registry`
     // pattern): the real path is trusted only when it agrees with the proven
     // legacy walker at `ConcreteType` granularity.
@@ -8561,6 +8714,12 @@ pub(crate) fn dual_gate_outcome_from_cache(
     let excluded_legacy = followed_legacy
         .as_ref()
         .map(|followed| annotator_unfollowed_legacy_vars(&value_to_var, followed));
+    // Flatten sees the post-`transform_dead_code` graph (`rtyper.py`
+    // `specialize` runs `annotator.simplify()` first). Phase B already
+    // cut the live GraphStore (`apply_tdc_cuts_to_graphstore`).
+    // `transform.py transform_dead_code` deletes the unfollowed link
+    // object and records generated errlinks as followed, so a second
+    // positional replay is not idempotent.
     if let Some(divergence) =
         compare_real_against_legacy(&value_to_var, &constants, legacy, excluded_legacy.as_ref())
     {
@@ -11311,7 +11470,7 @@ mod tests {
         flow: &GraphRef,
         value_to_var: &LegacyToTyped,
     ) -> (usize, usize) {
-        let (cuts, _) = record_tdc_cut_for_flow_graph(ann, flow, legacy);
+        let (cuts, _, _) = record_tdc_cut_for_flow_graph(ann, flow, legacy, &mut 0);
         let mut unmapped = 0;
         let mut removed = 0;
         apply_transform_dead_code_cut_to_legacy(
@@ -11337,7 +11496,7 @@ mod tests {
         value_to_var: &LegacyToTyped,
         real_state: &HashMap<Variable, ConcreteType>,
     ) -> (bool, usize) {
-        let (cuts, _) = record_tdc_cut_for_flow_graph(ann, flow, legacy);
+        let (cuts, _, _) = record_tdc_cut_for_flow_graph(ann, flow, legacy, &mut 0);
         let followed = annotator_followed_legacy_vars(ann, flow, value_to_var);
         let excluded = annotator_unfollowed_legacy_vars(value_to_var, &followed);
         if !collect_divergences_on(real_state, legacy, Some(&excluded)).is_empty() {
@@ -11664,7 +11823,7 @@ mod tests {
         gs.block_mut(start).operations = vec![hint_op(&v, &r0)];
         crate::model::FunctionGraph::set_concretetype_of_inline(&v, ConcreteType::GcRef);
 
-        let (cuts, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs);
+        let (cuts, _, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs, &mut 0);
         let path = crate::parse::CallPath::for_impl_method("TdcCut", "exc_exit");
         let mut store = crate::codewriter::call::GraphStore::default();
         store.insert(path.clone(), gs);
@@ -11691,6 +11850,7 @@ mod tests {
                 SubjectTdcPlan {
                     cuts,
                     value_to_var: HashMap::new(),
+                    cutoff_callees: vec![],
                 },
             );
         }
@@ -11730,7 +11890,7 @@ mod tests {
         GraphRef,
     ) {
         let (gs, flow, ann, start, _ret, _v) = unfollowed_exception_exit_fixture();
-        let (cuts, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs);
+        let (cuts, _, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs, &mut 0);
         let caller_path = crate::parse::CallPath::for_impl_method("TdcCut", "caller");
         let callee_path = crate::parse::CallPath::for_impl_method("TdcCut", "callee");
         let mut store = crate::codewriter::call::GraphStore::default();
@@ -11809,6 +11969,7 @@ mod tests {
                 SubjectTdcPlan {
                     cuts,
                     value_to_var: HashMap::new(),
+                    cutoff_callees: vec![],
                 },
             );
         }
@@ -11909,7 +12070,7 @@ mod tests {
     #[test]
     fn somenone_impossible_call_does_not_skip_caller() {
         let (gs, flow, ann, start, _ret, _v) = unfollowed_exception_exit_fixture();
-        let (cuts, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs);
+        let (cuts, _, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs, &mut 0);
         let caller_path = crate::parse::CallPath::for_impl_method("TdcCut", "somenone_caller");
         let mut store = crate::codewriter::call::GraphStore::default();
         store.insert(caller_path.clone(), gs);
@@ -11948,6 +12109,7 @@ mod tests {
                 SubjectTdcPlan {
                     cuts,
                     value_to_var: HashMap::new(),
+                    cutoff_callees: vec![],
                 },
             );
         }
@@ -11968,7 +12130,7 @@ mod tests {
         use crate::annotator::model::SomePBC;
 
         let (gs, flow, ann, start, _ret, _v) = unfollowed_exception_exit_fixture();
-        let (cuts, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs);
+        let (cuts, _, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs, &mut 0);
         let caller_path = crate::parse::CallPath::for_impl_method("TdcCut", "pbc_caller");
         let callee_path = crate::parse::CallPath::for_impl_method("TdcCut", "missing_callee");
         let mut store = crate::codewriter::call::GraphStore::default();
@@ -12018,6 +12180,7 @@ mod tests {
                 SubjectTdcPlan {
                     cuts,
                     value_to_var: HashMap::new(),
+                    cutoff_callees: vec![],
                 },
             );
         }
@@ -12038,7 +12201,7 @@ mod tests {
         use crate::annotator::description::GraphCacheKey;
 
         let (gs, flow, ann, start, _ret, _v) = unfollowed_exception_exit_fixture();
-        let (cuts, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs);
+        let (cuts, _, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs, &mut 0);
         let caller_path = crate::parse::CallPath::for_impl_method("TdcCut", "spec_caller");
         let callee_path = crate::parse::CallPath::for_impl_method("TdcCut", "spec_callee");
         let mut store = crate::codewriter::call::GraphStore::default();
@@ -12133,6 +12296,7 @@ mod tests {
                 SubjectTdcPlan {
                     cuts,
                     value_to_var: HashMap::new(),
+                    cutoff_callees: vec![],
                 },
             );
         }
@@ -12173,7 +12337,7 @@ mod tests {
     #[test]
     fn tdc_graphstore_cut_skips_nonraising_unfollowed_bool_switch() {
         let (mut gs, flow, ann, start, body_id) = unfollowed_same_target_bool_switch_fixture();
-        let cuts = record_tdc_cut_for_flow_graph(&ann, &flow, &gs).0;
+        let cuts = record_tdc_cut_for_flow_graph(&ann, &flow, &gs, &mut 0).0;
         assert!(cuts.iter().any(|cut| !cut.drop_exits.is_empty()));
         let (unmapped, removed) = run_recorded_tdc_cut(&ann, &mut gs, &flow, &HashMap::new());
         assert_eq!(unmapped, 0);
@@ -12184,7 +12348,7 @@ mod tests {
         assert!(gs.block(start).exits[0].exitcase.is_none());
 
         let (mut gs, flow, ann, start, ret, _) = unfollowed_exception_exit_fixture();
-        let cuts = record_tdc_cut_for_flow_graph(&ann, &flow, &gs).0;
+        let cuts = record_tdc_cut_for_flow_graph(&ann, &flow, &gs, &mut 0).0;
         assert!(cuts.iter().any(|cut| !cut.drop_exits.is_empty()));
         let (unmapped, removed) = run_recorded_tdc_cut(&ann, &mut gs, &flow, &HashMap::new());
         assert_eq!(unmapped, 0);
@@ -13301,7 +13465,7 @@ mod tests {
         seed_annotated(&ann, &flow, std::slice::from_ref(&fs_start));
         follow_link(&ann, &copied_handler);
 
-        let cuts = record_tdc_cut_for_flow_graph(&ann, &flow, &gs).0;
+        let cuts = record_tdc_cut_for_flow_graph(&ann, &flow, &gs, &mut 0).0;
         let keep: HashSet<(crate::model::BlockId, usize)> = cuts
             .iter()
             .flat_map(|cut| cut.keep_exits.iter().copied())
@@ -13436,6 +13600,7 @@ mod tests {
                         },
                     ],
                     value_to_var: HashMap::new(),
+                    cutoff_callees: vec![],
                 },
             );
         }
@@ -13545,6 +13710,7 @@ mod tests {
                         cutoff_result: Some(Variable::new()),
                     }],
                     value_to_var: HashMap::new(),
+                    cutoff_callees: vec![],
                 },
             );
         }
@@ -15708,6 +15874,335 @@ mod tests {
                 .any(|d| d.contains("legacy=GcRef, real=Unknown")),
             "a legacy var with no typed twin must still diverge: {unpaired_hit:?}"
         );
+    }
+
+    /// Family C with `real=Void` on the Ok extract: the `is_null` Call
+    /// colors it, so the uncut graph diverges. `transform_dead_code`
+    /// drops the unfollowed Ok exit; after that cut the extract is gone
+    /// from flatten's coloring and `collect_divergences_on` is empty.
+    /// The live graph is not mutated — Match still owns the publish cut.
+    #[test]
+    fn collect_divergences_accepts_void_ok_payload_after_tdc_cut() {
+        let mut graph = LegacyGraph::new("always_err_wrap_new");
+        let vars = mint_vars(&mut graph, 4);
+        let v_ok = vars[3].clone();
+        let ok_id = BlockId(3);
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[0]),
+            operations: vec![],
+            exitswitch: Some(crate::model::ExitSwitch::LastException),
+            exits: vec![
+                crate::model::Link::new_mixed(vec![], ok_id, None),
+                crate::model::Link::new_mixed(
+                    vec![
+                        LinkArg::Value(vars[1].clone()),
+                        LinkArg::Value(vars[2].clone()),
+                    ],
+                    graph.exceptblock,
+                    None,
+                ),
+            ],
+            framestate: None,
+            dead: false,
+        };
+        let ok_block = Block {
+            id: ok_id,
+            inputargs: vec![],
+            operations: vec![
+                crate::model::SpaceOperation {
+                    result: Some(v_ok.clone()),
+                    kind: crate::model::OpKind::FieldRead {
+                        base: vars[0].clone(),
+                        field: crate::model::FieldDescriptor {
+                            name: "__pos_0".to_string(),
+                            owner_root: Some("Result::Ok".to_string()),
+                            owner_id: None,
+                            base_is_deref: Some(false),
+                            taken_by_address: false,
+                            inline_vec: false,
+                            vec_part: None,
+                            owner_declared_gc: None,
+                            host_index: None,
+                            scalar_word: None,
+                        },
+                        ty: ValueType::Ref(None),
+                        pure: false,
+                    },
+                },
+                crate::model::SpaceOperation {
+                    result: None,
+                    kind: crate::model::OpKind::Call {
+                        target: crate::model::CallTarget::Method {
+                            name: "is_null".to_string(),
+                            receiver_root: Some("mut_ptr".to_string()),
+                            resolved_path: None,
+                            fun_decl_id: None,
+                            branch_payloads: None,
+                        },
+                        args: crate::model::call_args(vec![v_ok.clone()]),
+                        result_ty: ValueType::Bool,
+                    },
+                },
+            ],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(v_ok.clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: vec![v_ok.clone()],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        let exceptblock = Block {
+            id: graph.exceptblock,
+            inputargs: block_inputargs(&vars, &[1, 2]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock, exceptblock, ok_block];
+        crate::model::FunctionGraph::set_concretetype_of_inline(&v_ok, ConcreteType::GcRef);
+        assert!(
+            colored_operand_vars(&graph).contains(&v_ok),
+            "the is_null Call colors the Ok extract on the uncut graph"
+        );
+
+        let mut real_state = HashMap::new();
+        real_state.insert(v_ok.clone(), ConcreteType::Void);
+        let mut excluded = HashSet::new();
+        excluded.insert(v_ok.clone());
+        let uncut = collect_divergences_on(&real_state, &graph, Some(&excluded));
+        assert!(
+            uncut.iter().any(|d| d.contains("legacy=GcRef, real=Void")),
+            "uncut Family C graph still colors the Void Ok extract: {uncut:?}"
+        );
+
+        let cuts = vec![GraphStoreTdcCut {
+            drop_exits: vec![(graph.startblock, 0)],
+            keep_exits: vec![],
+            cutoff: false,
+            cutoff_result: None,
+        }];
+        let value_to_var: LegacyToTyped = HashMap::new();
+        let mut snapshot = graph.clone();
+        let mut unmapped = 0usize;
+        let mut removed = 0usize;
+        assert!(
+            apply_transform_dead_code_cut_to_legacy(
+                &mut snapshot,
+                &cuts,
+                &value_to_var,
+                &mut unmapped,
+                &mut removed,
+            ),
+            "drop-only Ok-exit cut must resolve"
+        );
+        assert_eq!(unmapped, 0);
+        assert!(removed >= 1, "the unfollowed Ok exit must be dropped");
+        assert!(
+            collect_divergences_on(&real_state, &snapshot, Some(&excluded)).is_empty(),
+            "after TDC drops the Ok arm, the extract is uncolored or unreachable"
+        );
+        let still_uncut = collect_divergences_on(&real_state, &graph, Some(&excluded));
+        assert!(
+            still_uncut
+                .iter()
+                .any(|d| d.contains("legacy=GcRef, real=Void")),
+            "the live graph stays uncut: {still_uncut:?}"
+        );
+    }
+
+    /// Canraise caller whose unfollowed success is a `transform.py`
+    /// `transform_dead_code` cutoff at `simple_call`. `annotate_callee_start`
+    /// is the `annrpython.py RPythonAnnotator.complete` blocked-block
+    /// stand-in: false leaves the callee startblock unannotated.
+    fn tdc_cutoff_incomplete_callee_fixture(
+        annotate_callee_start: bool,
+    ) -> (
+        std::rc::Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        GraphRef,
+        GraphRef,
+        LegacyGraph,
+    ) {
+        let mut gs = LegacyGraph::new("cutoff_caller");
+        let start = gs.startblock;
+        let ret = gs.returnblock;
+        let except = gs.exceptblock;
+        let src = gs.alloc_value_var();
+        let etype = gs.block(except).inputargs[0].clone();
+        let evalue = gs.block(except).inputargs[1].clone();
+        let retvar = gs.block(ret).inputargs[0].clone();
+        gs.block_mut(start).inputargs = vec![src.clone()];
+        gs.block_mut(start).exitswitch = Some(crate::model::ExitSwitch::LastException);
+        gs.closeblock(
+            start,
+            vec![
+                crate::model::Link::new_mixed(vec![LinkArg::Value(retvar.clone())], ret, None),
+                crate::model::Link::new_mixed(
+                    vec![
+                        LinkArg::Value(etype.clone()),
+                        LinkArg::Value(evalue.clone()),
+                    ],
+                    except,
+                    Some(crate::model::exception_exitcase()),
+                ),
+            ],
+        );
+
+        let fs_src = Variable::new();
+        let fs_call = Variable::new();
+        let fs_start =
+            crate::flowspace::model::Block::shared(vec![Hlvalue::Variable(fs_src.clone())]);
+        {
+            let mut b = fs_start.borrow_mut();
+            b.operations
+                .push(crate::flowspace::model::SpaceOperation::new(
+                    "simple_call",
+                    vec![Hlvalue::Variable(fs_src.clone())],
+                    Hlvalue::Variable(fs_call),
+                ));
+            b.exitswitch = Some(Hlvalue::Constant(
+                crate::flowspace::model::c_last_exception(),
+            ));
+        }
+        let flow = crate::flowspace::model::FunctionGraph::new("cutoff_caller", fs_start.clone())
+            .into_ref();
+        let fs_ret = flow.borrow().returnblock.clone();
+        let fs_exc = flow.borrow().exceptblock.clone();
+        let fs_retvar = match &fs_ret.borrow().inputargs[0] {
+            Hlvalue::Variable(var) => var.clone(),
+            _ => panic!("returnblock inputarg"),
+        };
+        let (fs_etype, fs_evalue) = {
+            let ex = fs_exc.borrow();
+            let t = match &ex.inputargs[0] {
+                Hlvalue::Variable(var) => var.clone(),
+                _ => panic!("etype"),
+            };
+            let val = match &ex.inputargs[1] {
+                Hlvalue::Variable(var) => var.clone(),
+                _ => panic!("evalue"),
+            };
+            (t, val)
+        };
+        let success = crate::flowspace::model::Link::new(
+            vec![Hlvalue::Variable(fs_retvar)],
+            Some(fs_ret),
+            None,
+        )
+        .into_ref();
+        let exception = crate::flowspace::model::Link::new(
+            vec![Hlvalue::Variable(fs_etype), Hlvalue::Variable(fs_evalue)],
+            Some(fs_exc),
+            Some(Hlvalue::Constant(crate::flowspace::model::Constant::new(
+                crate::flowspace::model::ConstValue::builtin("Exception"),
+            ))),
+        )
+        .into_ref();
+        stamp_origin(&success, start, 0);
+        stamp_origin(&exception, start, 1);
+        fs_start.closeblock(vec![success, exception]);
+
+        let callee_start = crate::flowspace::model::Block::shared(vec![]);
+        let callee =
+            crate::flowspace::model::FunctionGraph::new("cutoff_callee", callee_start.clone())
+                .into_ref();
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        seed_annotated(&ann, &flow, std::slice::from_ref(&fs_start));
+        if annotate_callee_start {
+            ann.annotated
+                .borrow_mut()
+                .insert(BlockKey::of(&callee_start), Some(callee.clone()));
+        }
+        ann.translator
+            .update_call_graph(&flow, &callee, (BlockKey::of(&fs_start), 0));
+        (ann, flow, callee, gs)
+    }
+
+    /// Dual-gate incompleteness: unannotated startblock, `rtype_skipped`,
+    /// `annotate_skipped`, `blocked_blocks`, and a finished always-raising
+    /// callee (`annrpython.py RPythonAnnotator.complete` /
+    /// `RPythonAnnotator.simplify`).
+    #[test]
+    fn cutoff_callee_annotation_incomplete_conditions() {
+        let (ann, flow, callee, gs) = tdc_cutoff_incomplete_callee_fixture(false);
+        let (cuts, _, callees) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs, &mut 0);
+        assert!(
+            cuts.iter().any(|cut| cut.cutoff),
+            "fixture must record a transform_dead_code cutoff"
+        );
+        assert!(callees.iter().any(|c| Rc::ptr_eq(c, &callee)));
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        assert!(cutoff_callee_annotation_incomplete(
+            &ann, &registry, &callee
+        ));
+
+        let (ann, flow, callee, gs) = tdc_cutoff_incomplete_callee_fixture(true);
+        let (cuts, _, callees) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs, &mut 0);
+        assert!(
+            cuts.iter().any(|cut| cut.cutoff),
+            "fixture must record a transform_dead_code cutoff"
+        );
+        assert!(callees.iter().any(|c| Rc::ptr_eq(c, &callee)));
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        assert!(!cutoff_callee_annotation_incomplete(
+            &ann, &registry, &callee
+        ));
+
+        let (ann, _, callee, _) = tdc_cutoff_incomplete_callee_fixture(true);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        registry
+            .two_phase()
+            .rtype_skipped
+            .insert(GraphKey::of(&callee));
+        assert!(cutoff_callee_annotation_incomplete(
+            &ann, &registry, &callee
+        ));
+
+        let (ann, _, callee, _) = tdc_cutoff_incomplete_callee_fixture(true);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let key = FunctionPathKey::from_segments(["cutoff_callee"]);
+        let func = GraphFunc::new(
+            "cutoff_callee",
+            Constant::new(ConstValue::Dict(Default::default())),
+        );
+        let pygraph = Rc::new(PyGraph {
+            graph: callee.clone(),
+            func,
+            signature: RefCell::new(Signature::new(Vec::new(), None, None)),
+            defaults: RefCell::new(Some(Vec::new())),
+            access_directly: std::cell::Cell::new(false),
+        });
+        registry.register_callee(key.clone(), Signature::new(Vec::new(), None, None), pygraph);
+        registry
+            .two_phase()
+            .annotate_skipped
+            .insert(key.to_call_path(), "phaseA".to_string());
+        assert!(cutoff_callee_annotation_incomplete(
+            &ann, &registry, &callee
+        ));
+
+        let (ann, _, callee, _) = tdc_cutoff_incomplete_callee_fixture(true);
+        let start = callee.borrow().startblock.clone();
+        ann.blocked_blocks
+            .borrow_mut()
+            .insert(BlockKey::of(&start), (start.clone(), callee.clone(), None));
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        assert!(cutoff_callee_annotation_incomplete(
+            &ann, &registry, &callee
+        ));
     }
 
     /// An unfollowed non-raising arm (`unwrap_or_else` None successor)

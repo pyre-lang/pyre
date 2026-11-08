@@ -5418,7 +5418,11 @@ fn trait_path_is_majit_gc_gctype(path: &str) -> bool {
 /// never a parent. A reference or raw pointer is not the inlined parent
 /// (`Struct.__init__` inlines a container only as the first field). `Ref`
 /// and `RawPtr` stay in place here; only an `Adt` node yields an id.
-fn struct_field0_type_id(llbc: &Llbc, td: &TypeDecl) -> Option<majit_ir::descr::StructId> {
+fn struct_field0_type_id(
+    llbc: &Llbc,
+    td: &TypeDecl,
+    gc_seeds: &[majit_ir::descr::StructId],
+) -> Option<majit_ir::descr::StructId> {
     if td.published_struct_copy {
         return None;
     }
@@ -5436,13 +5440,16 @@ fn struct_field0_type_id(llbc: &Llbc, td: &TypeDecl) -> Option<majit_ir::descr::
     }
     match &inner.kind {
         TypeDeclKind::Struct(_) => {
-            // `lltype.py Struct._install_extras` / `_first_struct`: only a
-            // field-0 container of the same `_gckind` is an inlined parent;
-            // a by-value integer struct is a raw Signed value.
-            if type_decl_is_by_value_integer_newtype(inner, llbc) {
+            let inner_id = struct_id_for_type_decl(inner);
+            // `lltype.py Struct._first_struct`: first field is an inlined
+            // parent only when `self._gckind == FIRSTTYPE._gckind`. A
+            // by-value integer tuple is Raw unless it is a `GcType` seed.
+            if type_decl_is_by_value_integer_newtype(inner, llbc)
+                && !gc_seeds.iter().any(|seed| *seed == inner_id)
+            {
                 return None;
             }
-            Some(struct_id_for_type_decl(inner))
+            Some(inner_id)
         }
         _ => None,
     }
@@ -5483,7 +5490,7 @@ pub(crate) fn harvest_declared_gc_facts(llbc: &Llbc) -> DeclaredGcFacts {
         if type_decl_is_builtin_adt(td) {
             continue;
         }
-        let Some(field0) = struct_field0_type_id(llbc, td) else {
+        let Some(field0) = struct_field0_type_id(llbc, td, &facts.seeds) else {
             continue;
         };
         facts.field0.push((struct_id_for_type_decl(td), field0));
