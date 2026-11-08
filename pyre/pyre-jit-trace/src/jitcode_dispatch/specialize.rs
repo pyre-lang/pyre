@@ -7081,7 +7081,6 @@ const UNWRAP_CELL_DESCENT: HelperDescent = HelperDescent {
 /// `W_IntRangeIterator`; overflow stays `W_LongRangeIterator`.
 const RANGE_ITER_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::functional::w_range_iter",
-    commit_label: "range_iter_commit",
     decline_tag: "RANGE-ITER-SUBWALK",
 };
 
@@ -7090,7 +7089,6 @@ const RANGE_ITER_DESCENT: HelperDescent = HelperDescent {
 /// (`builtin_range` / this descent). The leaf applies `space.index`.
 const RANGE_NEW_STOP_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::builtins::w_range_new_stop",
-    commit_label: "range_new_stop_commit",
     decline_tag: "RANGE-NEW-STOP-SUBWALK",
 };
 
@@ -7098,7 +7096,6 @@ const RANGE_NEW_STOP_DESCENT: HelperDescent = HelperDescent {
 /// (`gateway.py BuiltinCode2.fastcall_2`).
 const RANGE_NEW_START_STOP_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::builtins::w_range_new_start_stop",
-    commit_label: "range_new_start_stop_commit",
     decline_tag: "RANGE-NEW-START-STOP-SUBWALK",
 };
 
@@ -7107,14 +7104,12 @@ const RANGE_NEW_START_STOP_DESCENT: HelperDescent = HelperDescent {
 /// and the zero-step `ValueError`.
 const RANGE_NEW_STEP_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::builtins::w_range_new_start_stop_step",
-    commit_label: "range_new_step_commit",
     decline_tag: "RANGE-NEW-STEP-SUBWALK",
 };
 
 /// `functional.py W_Zip.iter_w` — `return self`.
 const ZIP_ITER_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::functional::w_zip_iter",
-    commit_label: "zip_iter_commit",
     decline_tag: "ZIP-ITER-SUBWALK",
 };
 
@@ -7124,49 +7119,42 @@ const ZIP_ITER_DESCENT: HelperDescent = HelperDescent {
 /// up by this path.
 const ZIP_NEXT_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::baseobjspace::zip_two_tuple_next",
-    commit_label: "zip_next_commit",
     decline_tag: "ZIP-NEXT-SUBWALK",
 };
 
 /// `functional.py W_Map.iter_w` — `return self`.
 const MAP_ITER_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::functional::w_map_iter",
-    commit_label: "map_iter_commit",
     decline_tag: "MAP-ITER-SUBWALK",
 };
 
 /// `functional.py W_Filter.iter_w` — `return self`.
 const FILTER_ITER_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::functional::w_filter_iter",
-    commit_label: "filter_iter_commit",
     decline_tag: "FILTER-ITER-SUBWALK",
 };
 
 /// `iterobject.py W_AbstractSeqIterObject.descr_iter` — `return self`.
 const SEQITER_ITER_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::iterobject::w_seqiter_iter",
-    commit_label: "seqiter_iter_commit",
     decline_tag: "SEQITER-ITER-SUBWALK",
 };
 
 /// `iterobject.py W_ReverseSeqIterObject.descr_iter` — `return self`.
 const REVERSESEQITER_ITER_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::iterobject::w_reverseseqiter_iter",
-    commit_label: "reverseseqiter_iter_commit",
     decline_tag: "REVERSESEQITER-ITER-SUBWALK",
 };
 
 /// `functional.py W_AbstractRangeIterator.descr_iter` — `return self`.
 const RANGE_ITERATOR_ITER_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::functional::w_range_iterator_iter",
-    commit_label: "range_iterator_iter_commit",
     decline_tag: "RANGE-ITERATOR-ITER-SUBWALK",
 };
 
 /// `generator.py GeneratorIterator.descr__iter` — `return self`.
 const GENERATOR_ITER_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::generator::w_generator_iter",
-    commit_label: "generator_iter_commit",
     decline_tag: "GENERATOR-ITER-SUBWALK",
 };
 
@@ -14813,7 +14801,6 @@ fn walker_emit_canonical_message_raise<Sym: WalkSym>(
 
 const NEWDICT_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::dictmultiobject::newdict_empty",
-    commit_label: "newdict_commit",
     decline_tag: "NEWDICT-SUBWALK",
 };
 
@@ -19782,7 +19769,6 @@ pub(crate) fn try_walker_orthodox_zip_next<Sym: WalkSym>(
         unsafe { &*prep.sym_ptr },
         &prep.body,
         prep.nested,
-        descent.commit_label,
         &[],
         &[],
         &[zip_op],

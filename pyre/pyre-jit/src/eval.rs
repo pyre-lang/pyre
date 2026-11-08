@@ -21774,7 +21774,8 @@ mod tests {
 
         let source = "try:\n    x = 1\nexcept Exception:\n    pass\n";
         let code = compile_exec(source).expect("try/except module should compile");
-        let w_code = pyre_interpreter::pycode::w_code_new(std::ptr::from_ref(&code).cast());
+        let w_code =
+            pyre_interpreter::pycode::w_code_new(std::ptr::from_ref(&code).cast()).unwrap();
         let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let portal = live_only_pyjitcode(raw, &[]);
         portal.stamp_w_code(w_code.cast());
