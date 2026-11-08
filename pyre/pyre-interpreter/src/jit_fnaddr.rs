@@ -5877,33 +5877,21 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     cpa1!(
         &mut entries,
-        "pyre_object::dict_eq_hook::signal_hash_error",
-        "pyre_object::signal_hash_error",
-        pyre_object::dict_eq_hook::signal_hash_error,
+        "pyre_object::interp_exceptions::rpyexc_raise",
+        "pyre_object::rpyexc_raise",
+        pyre_object::interp_exceptions::rpyexc_raise,
     );
     cpa0!(
         &mut entries,
-        "pyre_object::dict_eq_hook::take_hash_error",
-        "pyre_object::take_hash_error",
-        pyre_object::dict_eq_hook::take_hash_error,
-    );
-    cpa1!(
-        &mut entries,
-        "pyre_object::dict_eq_hook::signal_eq_error",
-        "pyre_object::signal_eq_error",
-        pyre_object::dict_eq_hook::signal_eq_error,
+        "pyre_object::interp_exceptions::rpyexc_occurred",
+        "pyre_object::rpyexc_occurred",
+        pyre_object::interp_exceptions::rpyexc_occurred,
     );
     cpa0!(
         &mut entries,
-        "pyre_object::dict_eq_hook::take_eq_error",
-        "pyre_object::take_eq_error",
-        pyre_object::dict_eq_hook::take_eq_error,
-    );
-    cpa0!(
-        &mut entries,
-        "pyre_object::dict_eq_hook::eq_error_pending",
-        "pyre_object::eq_error_pending",
-        pyre_object::dict_eq_hook::eq_error_pending,
+        "pyre_object::interp_exceptions::rpyexc_fetch",
+        "pyre_object::rpyexc_fetch",
+        pyre_object::interp_exceptions::rpyexc_fetch,
     );
     cpa0!(
         &mut entries,

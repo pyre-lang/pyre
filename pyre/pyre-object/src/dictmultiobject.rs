@@ -282,14 +282,10 @@ pub unsafe fn object_key_for(obj: PyObjectRef) -> ObjectKey {
     let obj = crate::gc_roots::pin_root(obj);
     let hash = crate::dict_eq_hook::try_hash_w(obj)
         .unwrap_or_else(|| crate::dict_eq_hook::missing_hash_hook());
-    if crate::dict_eq_hook::take_hash_error() {
-        // Infallible path: swallow the error and use structural hash.
-        // Checked callers should use `object_key_for_checked` instead.
-    }
-    // Clear any stale eq flag so the upcoming bucket probe starts clean;
-    // an infallible probe's own error is then swallowed by the next key
-    // construction, never leaking into a later checked op.
-    crate::dict_eq_hook::take_eq_error();
+    // Infallible path: `hash_w` raised through `rpyexc_raise`. Swallow
+    // that one exception (`rpyexc_fetch`) so a later checked op does not
+    // observe it. Checked callers use `object_key_for_checked`.
+    let _ = crate::interp_exceptions::rpyexc_fetch();
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     ObjectKey { hash, obj }
 }
@@ -659,9 +655,6 @@ unsafe fn dict_entries_get_str(
         } else {
             crate::dict_eq_hook::hash_str_hooked_bytes(key.as_bytes())
         };
-        // Clear any stale eq flag so a str-subclass comparison in the probe
-        // starts clean, matching `object_key_for`'s pre-probe reset (:125).
-        crate::dict_eq_hook::take_eq_error();
         dict_entries_probe_str(entries, hash, key)
     } else {
         dict_entries_probe_object(entries, crate::w_str_new(key))
@@ -685,7 +678,6 @@ unsafe fn dict_entries_get_str(
 unsafe fn dict_entries_index_of_str_or_absent(entries: &ObjectDictStorage, key: &str) -> isize {
     if crate::dict_eq_hook::has_hash_str_hook() {
         let hash = crate::dict_eq_hook::hash_str_hooked_bytes(key.as_bytes());
-        crate::dict_eq_hook::take_eq_error();
         entries.index_or_absent(&StrLookupKey { hash, key })
     } else {
         entries.index_or_absent(&object_key_for(crate::w_str_new(key)))
@@ -703,7 +695,6 @@ unsafe fn dict_entries_index_of_str(
         } else {
             crate::dict_eq_hook::hash_str_hooked_bytes(key.as_bytes())
         };
-        crate::dict_eq_hook::take_eq_error();
         dict_entries_index_of_str_hashed(entries, hash, key)
     } else {
         dict_entries_index_of_object(entries, crate::w_str_new(key))
@@ -771,10 +762,7 @@ unsafe fn object_key_for_new_str(key: &str, hash: i64) -> ObjectKey {
     let obj = crate::w_str_new(key);
     let hash = match hash {
         0 => match crate::dict_eq_hook::try_hash_str(key.as_bytes()) {
-            Some(hash) => {
-                crate::dict_eq_hook::take_eq_error();
-                hash
-            }
+            Some(hash) => hash,
             None => return object_key_for(obj),
         },
         memoized => memoized,
@@ -783,10 +771,20 @@ unsafe fn object_key_for_new_str(key: &str, hash: i64) -> ObjectKey {
     ObjectKey { hash, obj }
 }
 
-/// Fallible variant of [`object_key_for`].  When the `hash_w` hook
-/// signals an error (unhashable type, user `__hash__` raised), this
-/// returns `Err(DictKeyError)`.  The caller retrieves the concrete
-/// error from the interpreter-side error slot.
+/// Fallible variant of [`object_key_for`].  When `hash_w` raises
+/// (unhashable type, user `__hash__`), this peeks the one ll exception
+/// state (`rpyexc_occurred`) and returns `Err(DictKeyError)`. The
+/// caller fetches the instance with `rpyexc_fetch` /
+/// `take_pending_dict_key_error`.
+///
+/// Residual (`dont_look_inside`, `rlib/jit.py`): the crate-boundary
+/// `hash_w` hook is `fn -> i64` with the raise on the one ll exception
+/// word (`rpyexc_raise`). A looked-inside `if rpyexc_occurred()` is
+/// `goto_if_not` plus `new` on the `Err` arm, which a helper sub-walk
+/// refuses (`OrthodoxSubWalkTraceUnsupported`). `dont_look_inside`
+/// residuals carry `EF_CAN_RAISE`, so the check is `GUARD_NO_EXCEPTION`
+/// after the call (`jtransform.py handle_residual_call`).
+#[majit_macros::dont_look_inside]
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -799,12 +797,9 @@ pub unsafe fn object_key_for_checked(obj: PyObjectRef) -> Result<ObjectKey, Dict
     let obj = crate::gc_roots::pin_root(obj);
     let hash = crate::dict_eq_hook::try_hash_w(obj)
         .unwrap_or_else(|| crate::dict_eq_hook::missing_hash_hook());
-    if crate::dict_eq_hook::take_hash_error() {
+    if crate::interp_exceptions::rpyexc_occurred() {
         return Err(DictKeyError);
     }
-    // Clean slate for the bucket probe that follows in the caller; its
-    // eq error is read back via `take_dict_key_error` after the access.
-    crate::dict_eq_hook::take_eq_error();
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     Ok(ObjectKey { hash, obj })
 }
@@ -826,19 +821,17 @@ pub unsafe fn object_key_for_checked(obj: PyObjectRef) -> Result<ObjectKey, Dict
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn object_key_hashed(obj: PyObjectRef, hash: i64) -> ObjectKey {
-    // Clean slate for the bucket probe that follows in the caller, as in
-    // `object_key_for_checked`.
-    crate::dict_eq_hook::take_eq_error();
     ObjectKey { hash, obj }
 }
 
+#[majit_macros::dont_look_inside]
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn hash_key_checked(obj: PyObjectRef) -> Result<(), DictKeyError> {
     let _ = crate::dict_eq_hook::try_hash_w(obj);
-    if crate::dict_eq_hook::take_hash_error() {
+    if crate::interp_exceptions::rpyexc_occurred() {
         return Err(DictKeyError);
     }
     Ok(())
@@ -897,20 +890,17 @@ pub struct DictKeyError;
 
 /// `true` when the most recent checked dict op raised through either key
 /// callback of the `r_dict(eq_w, hash_w)` pair: `space.hash_w` at key
-/// construction or `space.eq_w` during the bucket probe.  Reading clears
-/// both flags.  The concrete `PyError` rides the interpreter-side
-/// pending slot, retrieved via `take_pending_hash_error`.
+/// construction or `space.eq_w` during the bucket probe.
 ///
-/// Drain this where the lookup returns: `AbstractTypedStrategy.getitem` /
-/// `getitem_str` propagate the `r_dict` error there.
+/// Peeks the one ll exception state (`rpyexc_occurred`). Does not
+/// consume it: the interpreter recovers the `PyError` with
+/// `rpyexc_fetch_exception` (`take_pending_dict_key_error`).
 ///
 /// # Safety
-/// Thread-local flag read and clear; no pointer is dereferenced.
+/// Residual-exception peek; no pointer is dereferenced.
 #[inline]
 pub unsafe fn take_dict_key_error() -> bool {
-    let hash = crate::dict_eq_hook::take_hash_error();
-    let eq = crate::dict_eq_hook::take_eq_error();
-    hash || eq
+    crate::interp_exceptions::rpyexc_occurred()
 }
 
 /// Test-only structural hash hook.  Walks the same built-in type ladder
@@ -2937,9 +2927,8 @@ pub(crate) unsafe fn dict_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
     // is how a raised probe is made to look like the `r_dict(space.eq_w,
     // space.hash_w)` lookup it stands for: `ll_dict_lookup` propagates at the
     // first comparison, so no later key — however it would have compared — can
-    // still be found.  The flag is cleared per op in
-    // `object_key_for(_checked)`, so this only fires after a raise within the
-    // current probe.
+    // still be found.  `object_key_for` fetches a leftover rpyexc; this only
+    // fires after a raise within the current probe.
     //
     // This has to sit above the identity shortcut, not below it.  A bucket can
     // hold both a key whose `__eq__` raises and the incoming key's own object;
@@ -2947,7 +2936,7 @@ pub(crate) unsafe fn dict_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
     // afterwards, `insert` would REPLACE rather than append, and the checked
     // store's `dict_entries_pop_last` undo would then drop an unrelated last
     // entry while leaving the replaced value overwritten.
-    if crate::dict_eq_hook::eq_error_pending() {
+    if crate::interp_exceptions::rpyexc_occurred() {
         return false;
     }
     if std::ptr::eq(a, b) {
@@ -3243,10 +3232,10 @@ pub const SCAN_DICT_KEY_MISS: isize = -1;
 /// both regular object-strategy dicts and object-strategy module dicts via
 /// [`scan_object_entries`]/[`scan_clear_generation`].
 ///
-/// One `Signed`: a slot, or [`SCAN_DICT_KEY_MISS`].  A raising `keyeq` parks
-/// the exception (`eq_error_pending`) and returns the miss without consuming
-/// the flag.  `dont_look_inside`: residual `getfunctionptr` of the non-virtual
-/// half of `ll_dict_lookup`.
+/// One `Signed`: a slot, or [`SCAN_DICT_KEY_MISS`].  A raising `keyeq`
+/// leaves rpyexc pending and returns the miss without fetching it
+/// (`ll_dict_lookup`).  `dont_look_inside`: residual `getfunctionptr` of
+/// the non-virtual half of `ll_dict_lookup`.
 #[majit_macros::dont_look_inside]
 pub unsafe fn scan_dict_key_reentrant(
     mut obj: PyObjectRef,
@@ -3299,7 +3288,7 @@ pub unsafe fn scan_dict_key_reentrant(
                 key = crate::gc_roots::shadow_stack_get(key_slot);
                 // Error beats restart: a pending `keyeq` raise is an
                 // `OperationError`, not a returned value (`ll_dict_lookup`).
-                if crate::dict_eq_hook::eq_error_pending() {
+                if crate::interp_exceptions::rpyexc_occurred() {
                     return SCAN_DICT_KEY_MISS;
                 }
                 // Validate the paranoia condition before acting on the result:
@@ -3669,8 +3658,7 @@ pub unsafe fn w_dict_setdefault_checked(
     // key raises TypeError *before* insertion (parity with the
     // empty-dict setitem rejecting unhashable).  Route through
     // `w_dict_store_checked` and propagate its `Result` directly:
-    // `object_key_for_checked` consumes the hook error slot, so a
-    // post-hoc `take_hash_error()` would observe no pending error.
+    // `object_key_for_checked` peeks `rpyexc_occurred` after `hash_w`.
     if strategy_is(dstrategy, StrategyKind::Empty) {
         crate::dictmultiobject::EMPTY_DICT_STRATEGY.switch_to_correct_strategy(obj, key);
         w_dict_store_checked(
@@ -4006,8 +3994,6 @@ pub unsafe fn w_dict_object_setitem_reentrant(
     hash: i64,
     value: *mut PyObject,
 ) -> i64 {
-    // Clean slate for the bucket probe (`object_key_hashed`).
-    crate::dict_eq_hook::take_eq_error();
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::pin_roots(&[obj, key, value]);
     let index = scan_dict_key_reentrant(obj, hash, key);
@@ -5562,7 +5548,6 @@ unsafe fn w_dict_index_of_unicode_locked(obj: PyObjectRef, key: PyObjectRef) -> 
     }
     let key_str = crate::w_str_get_value_opt(key)?;
     let hash = w_str_memoized_hash(key, key_str)?;
-    crate::dict_eq_hook::take_eq_error();
     let dict = &*(obj as *const W_DictObject);
     let entries = &*(dict.dstorage as *const ObjectDictStorage);
     dict_entries_index_of_str_hashed(entries, hash, key_str)
@@ -6106,7 +6091,6 @@ pub unsafe fn w_dict_unicode_lookup_index(
     lock_dict_refs!(_dict_guard, w_dict, w_key);
     let dict = &*(w_dict as *const W_DictObject);
     let entries = &*(dict.dstorage as *const ObjectDictStorage);
-    crate::dict_eq_hook::take_eq_error();
     crate::dict_eq_hook::begin_callback_free_probe();
     let found = entries.index_of(&ObjectKey { hash, obj: w_key });
     let probe_needed_user_code = crate::dict_eq_hook::end_callback_free_probe();
@@ -6180,7 +6164,6 @@ pub unsafe fn w_dict_unicode_value_at_checked(
     if entry_key.hash != hash {
         return std::ptr::null_mut();
     }
-    crate::dict_eq_hook::take_eq_error();
     crate::dict_eq_hook::begin_callback_free_probe();
     let same_key = dict_keys_equal(entry_key.obj, w_key);
     let probe_needed_user_code = crate::dict_eq_hook::end_callback_free_probe();
@@ -8931,6 +8914,7 @@ mod tests {
     /// `register_hash_w_hook` cell is thread-local and libtest spawns a
     /// fresh thread per `#[test]`, so each dict-building test installs it.
     fn install_test_hash_hook() {
+        crate::interp_exceptions::install_test_rpyexc();
         crate::dict_eq_hook::register_hash_w_hook(builtin_structural_hash);
         crate::dict_eq_hook::register_hash_str_hook(builtin_structural_str_hash);
     }
@@ -9075,7 +9059,7 @@ mod tests {
     /// error flag, and returns `false` (the Rust `Eq` callback cannot raise).
     unsafe fn raising_eq(a: PyObjectRef, _b: PyObjectRef) -> bool {
         RAISING_EQ_CALLS.with(|c| c.set(c.get() + 1));
-        crate::dict_eq_hook::signal_eq_error(a);
+        crate::interp_exceptions::rpyexc_raise(a);
         false
     }
 
@@ -9113,11 +9097,14 @@ mod tests {
             assert!(result.is_err());
             // The probe stopped at the first raising comparison.
             assert_eq!(RAISING_EQ_CALLS.with(std::cell::Cell::get), 1);
+            // Fetch before the next probe: `r_dict` lookup raises, and the
+            // next getitem runs after that exception is taken.
+            assert!(crate::interp_exceptions::rpyexc_occurred());
+            let _ = crate::interp_exceptions::rpyexc_fetch();
+            assert!(!crate::interp_exceptions::rpyexc_occurred());
             // The dict is unchanged: k1 intact, k2 never inserted.
             assert_eq!(w_int_get_value(w_dict_lookup(dict, k1).unwrap()), 1);
             assert!(w_dict_lookup(dict, k2).is_none());
-            // The error flag was consumed by the store, not left dangling.
-            assert!(!crate::dict_eq_hook::take_eq_error());
         }
     }
 
@@ -9148,9 +9135,10 @@ mod tests {
         }
     }
 
-    /// A raising `keyeq` during the scan parks the flag (`eq_error_pending`)
-    /// and returns the miss without consuming it (`ll_dict_lookup`).  A
-    /// second take is empty; the dict is unchanged; `__eq__` runs once.
+    /// A raising `keyeq` during the scan leaves rpyexc pending
+    /// (`rpyexc_occurred`) and returns the miss without fetching it
+    /// (`ll_dict_lookup`). Fetch then clears; the dict is unchanged;
+    /// `__eq__` runs once.
     #[test]
     fn test_scan_dict_key_reentrant_eq_error_leaves_flag() {
         let _guard = RAISING_EQ_CALLS_LOCK.lock();
@@ -9172,6 +9160,7 @@ mod tests {
 
             assert_eq!(miss, SCAN_DICT_KEY_MISS);
             assert!(take_dict_key_error());
+            let _ = crate::interp_exceptions::rpyexc_fetch();
             assert!(!take_dict_key_error());
             assert_eq!(RAISING_EQ_CALLS.with(std::cell::Cell::get), 1);
             assert_eq!(w_int_get_value(w_dict_lookup(dict, k1).unwrap()), 1);

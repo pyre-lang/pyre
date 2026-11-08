@@ -55,7 +55,6 @@ thread_local! {
             .with(|cell| cell as *const _),
         jit_pending_exception: crate::stack_check::capture_jit_pending_exception_area(),
         pending_call_error: crate::call::capture_pending_call_error_area(),
-        pending_hash_error: crate::baseobjspace::capture_pending_hash_error_area(),
     };
 }
 
@@ -68,7 +67,6 @@ struct PyFrameRootArea {
     guard_exception: *const Cell<i64>,
     jit_pending_exception: *const Cell<i64>,
     pending_call_error: *const (),
-    pending_hash_error: *const (),
 }
 use crate::pyframe::PyFrame;
 
@@ -1172,7 +1170,6 @@ pub unsafe fn walk_pyframe_roots_area(
             walk_raw_exception_cell_area(area.jit_pending_exception, visitor);
         }
         crate::call::walk_pending_call_error_area(area.pending_call_error, visitor);
-        crate::baseobjspace::walk_pending_hash_error_area(area.pending_hash_error, visitor);
     }
     // incminimark.py:339-355 prebuilt-object scanning parity: a minor
     // collection scans an old/prebuilt object only when the write barrier

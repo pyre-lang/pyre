@@ -5827,9 +5827,16 @@ pub fn walk<Sym: WalkSym>(
                 let coordinate_belongs_to_this_frame =
                     walk_err_coordinate_belongs_to_this_frame(&error, ctx);
                 if fbw_state::fbw_debug_abort_enabled() {
+                    let helper_index = ctx.fbw_mode.transparent_helper_jitcode_index;
+                    let helper_name = helper_index.and_then(|idx| {
+                        crate::jitcode_runtime::get_jitcode_ref_by_index(idx)
+                            .map(|jc| jc.name.clone())
+                    });
+                    let op_key = decode_op_at(code, opcode_position).map(|op| op.key);
                     eprintln!(
                         "[walk-abort] err={:?} stop_pc={} opcode_position={} \
-                         helper={} inline={} claimed={} callee_jc={:?}",
+                         helper={} inline={} claimed={} callee_jc={:?} \
+                         helper_index={:?} helper_name={:?} op={:?}",
                         error,
                         error.stop_pc(),
                         opcode_position,
@@ -5837,6 +5844,9 @@ pub fn walk<Sym: WalkSym>(
                         ctx.fbw_mode.inline_subwalk,
                         coordinate_belongs_to_this_frame,
                         ctx.inline_callee_consts.map(|c| c.jitcode_index),
+                        helper_index,
+                        helper_name,
+                        op_key,
                     );
                 }
                 // `LoopBearingCalleeInlineUnsupported { blackhole_required: false }`

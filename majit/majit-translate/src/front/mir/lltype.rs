@@ -16238,7 +16238,8 @@ pub(in crate::front::mir) fn field_row_struct_identity(
 /// primitive ITEM is [`crate::annotator::bookkeeper::flexible_gcarray_block_annotation`].
 /// A pointer ITEM (`FixedSizeListRepr` of a W_Root / instance) stays the
 /// list path. `wrapper` supplies `??TypeVar#N` arguments for harvested
-/// generic rows; the array-of-ADT row already carries the TypeDecl path.
+/// generic rows. ARRAY.OF is the substituted item (`get_ll_dict` one
+/// DICTENTRYARRAY per instantiation), not the TypeDecl template.
 /// An unsubstituted `??TypeVar#N` field is one GC word (`llmemory.GCREF`),
 /// the same seed [`gcarray_item_struct_ptr_annotation`] uses for the ITEM
 /// pointer. Declared-GC of the ITEM is path identity
@@ -16386,13 +16387,19 @@ fn raw_struct_array_item_lltype_inner(
             };
             fields.push((row.name.clone(), ll));
         }
-        // ARRAY.OF is the registry key `field_rows` already resolved for
-        // the harvest TypeDecl path stored on the `[ADT; N]` row
-        // (`field_row_struct_identity`). `get_array_descr` /
-        // `interiorfielddescrof` look that path up as `ARRAY.OF`, the same
-        // key a by-value ADT field uses.
+        // Field rows resolve through the TypeDecl path (`resolved_owner_key`)
+        // so a second same-leaf `Entry` does not steal them. ARRAY.OF is the
+        // specialized DICTENTRY (`rordereddict.py` `get_ll_dict`): keep
+        // `<K,V>` so `interiorfielddescrof` looks up harvest
+        // `Entry<ObjectKey,*mut PyObject>` (`ll_valid_from_flag`), not the
+        // typevar template. Harvest keys join args with `,` and no spaces.
+        let of_name = if item.contains('<') {
+            item.replace(", ", ",")
+        } else {
+            name.clone()
+        };
         Some(LowLevelType::Struct(Box::new(Struct::registry_fields(
-            &name,
+            &of_name,
             fields,
             GcKind::Raw,
         ))))

@@ -158,6 +158,43 @@ fn unsubstituted_entries_item_ptr_stops_without_guessing_offset() {
     assert!(err.to_string().contains("direct_arrayitems"), "{err}");
 }
 
+/// `get_ll_dict` `DICTENTRYARRAY` for `Entry<ObjectKey, *mut PyObject>`:
+/// Charon FunDecl JSON keeps TypeVars, so the rows come from substituted
+/// spec copies. `interiorfielddescrof` looks up this spelling exactly.
+#[test]
+fn objectkey_entry_instantiation_rows_are_registered() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let gc_struct_ids = harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let tombstoned = super::tombstoned_leaves_of(&llbc);
+    let mut known_struct_names = std::collections::HashSet::new();
+    let mut struct_fields = crate::front::semantic::StructFieldRegistry::default();
+    super::register_ordereddict_entry_instantiation_rows(
+        &llbc,
+        &mut known_struct_names,
+        &mut struct_fields,
+        &gc_struct_ids,
+        &tombstoned,
+    );
+    let elem = "rordereddict_entries::Entry<ObjectKey,*mut PyObject>";
+    assert!(
+        known_struct_names.contains(elem),
+        "missing {elem}; Entry keys: {:?}",
+        known_struct_names
+            .iter()
+            .filter(|name| name.contains("Entry"))
+            .collect::<Vec<_>>()
+    );
+    let rows = struct_fields
+        .fields
+        .get(elem)
+        .unwrap_or_else(|| panic!("no field rows for {elem}"));
+    assert!(
+        rows.iter().any(|row| row.name == "f_valid"),
+        "f_valid missing from {elem} rows: {rows:?}"
+    );
+}
+
 /// A one-word-item Vec header pointer is int-banked, matching
 /// `descr.py get_type_flag` of a raw Ptr and `rrustvec.rs rust_vec_lltype`.
 #[test]

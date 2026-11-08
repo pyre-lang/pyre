@@ -1580,6 +1580,20 @@ pub(crate) fn helper_blackhole_resumes_at_call<Sym: WalkSym>(
         && ctx.fbw_mode.helper_return == HelperReturn::CalleePrologue
 }
 
+/// Snapshot the live meta-interpreter framestack for an abort at `resume_pc`.
+/// RPython's `run_blackhole_interp_to_cancel_tracing` routes every
+/// `SwitchToBlackhole` through `convert_and_run_from_pyjitpl`, which copies the
+/// current frame and all paused callers at their current program counters.
+/// [`WalkContext`] and [`WalkSession::framestack`] own the corresponding banks.
+///
+/// The caller must supply the next instruction for a completed step, or the
+/// stopped instruction for a capability gap.  Propagation through enclosing
+/// `walk()` calls must preserve the first image; otherwise the caller would
+/// replace the innermost frame where execution stopped.
+///
+/// Return `false` without publishing a partial image when any live value is
+/// unresolved.  `blackhole_if_trace_too_long` still raises; convert then
+/// declines to entry replay when no image is representable.
 pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     resume_pc: usize,
@@ -1633,8 +1647,8 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         // `walk()` has already executed this step, so returning TraceTooLong
         // is safe only when every pre-drive adopter gate is known to pass.
         // RPython's `run_blackhole_interp_to_cancel_tracing()` cannot return
-        // to entry replay. Keep the same boundary: incomplete images merely
-        // keep recording until a later step supplies a complete handoff.
+        // to entry replay. An incomplete image still raises `ABORT_TOO_LONG`;
+        // convert then declines to entry replay.
         let Some(jitcode_index) = i32::try_from(miframe.jitcode.index()).ok() else {
             latchdbg!("origin={origin} sf-jitcode-index");
             return false;
@@ -1778,15 +1792,13 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
     }
 }
 
-/// Helper crossed `trace_limit` with a Continue snapshot, no latched
-/// image, and zero executed effects across the walk.
+/// Helper crossed `trace_limit` with a Continue snapshot.
 ///
-/// `convert_and_run_from_pyjitpl` (`blackhole.py`) copies the live helper
-/// frame; unit tests and a declined preflight cannot. Returning
-/// `TraceTooLong` lets the enclosing Python CALL latch at that CALL
-/// (`latch_abort_blackhole`, origin `mod2730-too-long`). Journals stay
-/// applied: the leftover is only the 0-effect case, so there is no suffix
-/// to undo and no CALL to restart.
+/// `blackhole_if_trace_too_long` (`pyjitpl.py`) always raises
+/// `SwitchToBlackhole(ABORT_TOO_LONG)`. `convert_and_run_from_pyjitpl`
+/// (`blackhole.py`) copies the live helper frame when the latch published
+/// one; a declined preflight lets the enclosing Python CALL latch at that
+/// CALL (`latch_abort_blackhole`, origin `mod2730-too-long`).
 pub(crate) fn helper_too_long_result<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     pc: usize,
@@ -2107,15 +2119,15 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
             return false;
         };
         let frame_reg = crate::state::portal_red_regs_at(jitcode_index).0;
+        // Codeless continuation (`ctor_continuation`, `OperatorTail`):
+        // `PyJitCode::from_core_degenerate` leaves `portal_frame_reg` at
+        // `u16::MAX`. Skip PyFrame / virtualizable validation; keep the
+        // MIFrame so `_setup_return_value_r` (`blackhole.py`) lands the
+        // callee return in this level. `convert_and_run_from_pyjitpl`
+        // copies every framestack level, including one without a
+        // virtualizable. The remaining-body scan runs innermost-first
+        // below, once every Python level has been checked.
         if frame_reg == u16::MAX {
-            // Codeless continuation (`ctor_continuation`, `OperatorTail`):
-            // `PyJitCode::from_core_degenerate` leaves `portal_frame_reg` at
-            // `u16::MAX`. Skip PyFrame / virtualizable validation; keep the
-            // MIFrame so `_setup_return_value_r` (`blackhole.py`) lands the
-            // callee return in this level. `convert_and_run_from_pyjitpl`
-            // copies every framestack level, including one without a
-            // virtualizable. The remaining-body scan runs innermost-first
-            // below, once every Python level has been checked.
             continue;
         }
         let Some(frame_ptr) = banks
@@ -2153,7 +2165,13 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
             || (index > 0 && frame_ptr == root)
             || seen.contains(&frame_ptr)
         {
-            latchdbg!("origin={origin} pf-shape");
+            latchdbg!(
+                "origin={origin} pf-shape index={index}/{} jitcode={} \
+                 frame_ptr={frame_ptr:#x} root={root:#x} stack_depth={stack_depth} \
+                 stack_base={stack_base} array_len={array_len}",
+                framestack.frames.len(),
+                frame.jitcode.name()
+            );
             return false;
         }
         seen.push(frame_ptr);
@@ -2463,9 +2481,9 @@ pub(crate) fn build_trace_too_long_single_frame_miframe<Sym: WalkSym>(
     // spanning pc 8..19, and no build emits byte 5 as an opcode at all.
     //
     // `build_multi_frame_miframe` already declines this class for its own
-    // innermost frame. A declined fill is not a rollback: the walk either
-    // keeps executing (`mc_diag_bump(26)`) or, with zero effects, lets the
-    // enclosing CALL latch.
+    // innermost frame. A declined fill is not a rollback: `_interpret`
+    // still raises `SwitchToBlackhole(ABORT_TOO_LONG)`
+    // (`blackhole_if_trace_too_long`) so the enclosing CALL can latch.
     if !instruction_starts_at(&jitcode, resume_pc) {
         if fbw_debug_abort_enabled() {
             eprintln!(

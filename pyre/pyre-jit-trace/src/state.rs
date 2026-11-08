@@ -2316,14 +2316,25 @@ pub fn portal_red_regs_at(jitcode_index: i32) -> (u16, u16) {
     })
 }
 
+/// True when this jitcode names a Python `CodeObject`.
+///
+/// Helpers and constructor tails do not. `convert_and_run_from_pyjitpl`
+/// copies those MIFrames without a per-level virtualizable, so
+/// [`per_frame_vables_from_framestack`] yields `(0, 0)` for them even when
+/// `portal_red_regs_at` reports a red frame color inherited from the portal.
+pub fn jitcode_names_python_code(jitcode_index: i32) -> bool {
+    pyjitcode_for_jitcode_index(jitcode_index)
+        .is_some_and(|pjc| pjc.is_populated() && !pjc.code_ptr.is_null())
+}
+
 /// One `(frame_ptr, stack_base)` per `framestack` level, outermost first.
 ///
 /// `blackhole.py convert_and_run_from_pyjitpl` copies each MIFrame
 /// independently; pyre's extra `virtualizable_ptr` field has to be
 /// rebound to that level's own red frame so traceback recording and
 /// `executioncontext.py enter`/`leave` do not share the portal frame.
-/// A helper jitcode with no portal frame red, or an unstamped register,
-/// yields `(0, 0)` for that level.
+/// A helper jitcode — no Python `CodeObject`, no portal frame red, or an
+/// unstamped register — yields `(0, 0)` for that level.
 pub fn per_frame_vables_from_framestack(
     framestack: &majit_metainterp::MIFrameStack,
 ) -> Vec<(i64, usize)> {
@@ -2335,7 +2346,7 @@ pub fn per_frame_vables_from_framestack(
                 return (0, 0);
             };
             let frame_reg = portal_red_regs_at(jitcode_index).0;
-            if frame_reg == u16::MAX {
+            if frame_reg == u16::MAX || !jitcode_names_python_code(jitcode_index) {
                 return (0, 0);
             }
             let Some(frame_ptr) = frame.ref_value_for_blackhole(frame_reg as usize) else {
@@ -2366,7 +2377,7 @@ pub fn per_frame_vables_from_abort_banks(
             )
         });
         let frame_reg = portal_red_regs_at(jitcode_index).0;
-        if frame_reg == u16::MAX {
+        if frame_reg == u16::MAX || !jitcode_names_python_code(jitcode_index) {
             per_frame.push((0, 0));
             continue;
         }
@@ -15649,7 +15660,7 @@ mod tests {
         sym.execution_context = OpRef::input_arg_ref(1);
         sym.nlocals = 2;
         sym.valuestackdepth = 2;
-        sym.concrete_vable_ptr = frame_ptr as *mut u8;
+        sym.set_concrete_vable_ptr_unrooted(frame_ptr as *mut u8);
 
         let portal_values = vec![
             RebuiltValue::Const(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL)),
@@ -15858,7 +15869,7 @@ mod tests {
         sym.execution_context = OpRef::input_arg_ref(1);
         sym.nlocals = 2;
         sym.valuestackdepth = 2;
-        sym.concrete_vable_ptr = frame_ptr as *mut u8;
+        sym.set_concrete_vable_ptr_unrooted(frame_ptr as *mut u8);
 
         let portal_values = vec![
             RebuiltValue::Const(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL)),

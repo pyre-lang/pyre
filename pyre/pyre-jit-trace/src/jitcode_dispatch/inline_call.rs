@@ -9371,22 +9371,26 @@ fn wrapper_args_item_pointers<Sym: WalkSym>(
 /// Record `NewArrayClear` for a wrapper `&[PyObjectRef]` and execute the
 /// allocation. `opimpl_new_array_clear` records with `resvalue`; a residual
 /// that rebuilds the slice (`object_gcarray_slice`) reads that word.
+///
+/// The caller holds `push_roots` (`shadowstack.py`) until
+/// `run_sub_jitcode_walk` returns; this pins the block in that scope so
+/// `execute_and_record` (`pyjitpl.py`) can collect while recording.
 fn emit_wrapper_args_array<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     wrapper_items: &[OpRef],
     wrapper_item_concretes: &[ConcreteValue],
-) -> (OpRef, ConcreteValue) {
+) -> (OpRef, Option<usize>) {
     let array_descr = crate::state::pyobject_gcarray_descr();
     let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
     let item_ptrs = wrapper_args_item_pointers(ctx, wrapper_items, wrapper_item_concretes);
-    let (args_array, array_concrete) = if wrapper_items.is_empty() {
+    let (args_array, block_slot) = if wrapper_items.is_empty() {
         let args_array = ctx.trace_ctx.record_op_with_descr_value(
             OpCode::NewArrayClear,
             &[len],
             array_descr.clone(),
             Some(majit_ir::Value::Ref(majit_ir::GcRef(0))),
         );
-        (args_array, ConcreteValue::Null)
+        (args_array, None)
     } else if let Some(ptrs) = item_ptrs {
         let block = unsafe { pyre_object::object_array::alloc_list_items_block_gc(&ptrs) };
         if block.is_null() {
@@ -9395,9 +9399,10 @@ fn emit_wrapper_args_array<Sym: WalkSym>(
                 &[len],
                 array_descr.clone(),
             );
-            (args_array, ConcreteValue::Null)
+            (args_array, None)
         } else {
-            let _block_roots = pyre_object::gc_roots::push_roots();
+            // Caller-owned `push_roots` (`shadowstack.py`) keeps the block
+            // live across `execute_and_record` (`pyjitpl.py`) recording.
             let block_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(block as pyre_object::PyObjectRef);
             let args_array = ctx.trace_ctx.record_op_with_descr_value(
@@ -9406,18 +9411,13 @@ fn emit_wrapper_args_array<Sym: WalkSym>(
                 array_descr.clone(),
                 Some(majit_ir::Value::Ref(majit_ir::GcRef(block as usize))),
             );
-            let live = pyre_object::gc_roots::shadow_stack_get(block_slot);
-            ctx.trace_ctx.set_opref_concrete(
-                args_array,
-                majit_ir::Value::Ref(majit_ir::GcRef(live as usize)),
-            );
-            (args_array, ConcreteValue::Ref(live))
+            (args_array, Some(block_slot))
         }
     } else {
         let args_array =
             ctx.trace_ctx
                 .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
-        (args_array, ConcreteValue::Null)
+        (args_array, None)
     };
     ctx.trace_ctx
         .heap_cache_mut()
@@ -9432,7 +9432,14 @@ fn emit_wrapper_args_array<Sym: WalkSym>(
         ctx.trace_ctx
             .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
     }
-    (args_array, array_concrete)
+    if let Some(slot) = block_slot {
+        let live = pyre_object::gc_roots::shadow_stack_get(slot);
+        ctx.trace_ctx.set_opref_concrete(
+            args_array,
+            majit_ir::Value::Ref(majit_ir::GcRef(live as usize)),
+        );
+    }
+    (args_array, block_slot)
 }
 
 /// Stamp wrapper arguments, walk the generated body, restore the caller
@@ -9487,7 +9494,8 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         }
     }
 
-    let (args_array, args_array_concrete) =
+    let _args_roots = pyre_object::gc_roots::push_roots();
+    let (args_array, args_block_slot) =
         emit_wrapper_args_array(ctx, wrapper_items, wrapper_item_concretes);
     // Nested in an active `SubWalkDriver` (generator-next inlining a body
     // that type-calls `list(...)`), the yield would cut this gateway args
@@ -9568,6 +9576,16 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
     // Bracket the session-wide exception slot around the callee so a NULL
     // return only reads as a raise when the callee installed the exception.
     let exc_before_subwalk = ctx.last_exc_value();
+    let args_array_concrete = args_block_slot.map_or(ConcreteValue::Null, |s| {
+        ConcreteValue::Ref(pyre_object::gc_roots::shadow_stack_get(s))
+    });
+    ctx.trace_ctx.set_opref_concrete(
+        args_array,
+        match args_array_concrete {
+            ConcreteValue::Ref(live) => majit_ir::Value::Ref(majit_ir::GcRef(live as usize)),
+            _ => majit_ir::Value::Ref(majit_ir::GcRef(0)),
+        },
+    );
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op.pc,
@@ -10012,7 +10030,8 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         }
     }
 
-    let (args_array, args_array_concrete) =
+    let _args_roots = pyre_object::gc_roots::push_roots();
+    let (args_array, args_block_slot) =
         emit_wrapper_args_array(ctx, &wrapper_items, &wrapper_item_concretes);
     // Same residual-step cut as `walk_translated_builtin_wrapper`.
     keep_residual_recordings_across_suspend::<Sym>();
@@ -10048,6 +10067,16 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     ctx.fbw_mode.helper_return = HelperReturn::CallResult;
     let helper_frame = enter_helper_level(ctx, nested_helper_entry);
     let exc_before_subwalk = ctx.last_exc_value();
+    let args_array_concrete = args_block_slot.map_or(ConcreteValue::Null, |s| {
+        ConcreteValue::Ref(pyre_object::gc_roots::shadow_stack_get(s))
+    });
+    ctx.trace_ctx.set_opref_concrete(
+        args_array,
+        match args_array_concrete {
+            ConcreteValue::Ref(live) => majit_ir::Value::Ref(majit_ir::GcRef(live as usize)),
+            _ => majit_ir::Value::Ref(majit_ir::GcRef(0)),
+        },
+    );
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op.pc,
@@ -23293,13 +23322,28 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                     // cache so replay records the CALL once.  `inline_call_*`
                     // records nothing before suspend and dest-write resume
                     // does not rewind it.
+                    //
+                    // This cut is walker-only: `pyjitpl.py` `_interpret` /
+                    // `perform_call` never drops ops whose result a live
+                    // `MIFrame` register still holds. `history.py`
+                    // `History.cut` is only `compile_trace` /
+                    // `reached_loop_header` discarding the JUMP/FINISH the
+                    // compile itself appended (`finally: self.history.cut`).
+                    // A nested helper seeded after the residual opcode start
+                    // (`emit_wrapper_args_array` then `run_sub_jitcode_walk`)
+                    // still names those boxes; skip the cut the way
+                    // `keep_residual_recordings_across_suspend` does.
                     if let Some(heap_cache) = self.exchange.step_heap_cache.take() {
-                        trace_ctx.cut_trace_with_snapshots(
-                            self.exchange
-                                .step_trace_position
-                                .expect("residual sub-walk missed the parent step boundary"),
-                        );
-                        *trace_ctx.heap_cache_mut() = heap_cache;
+                        let cut_at = self
+                            .exchange
+                            .step_trace_position
+                            .expect("residual sub-walk missed the parent step boundary");
+                        if pending_frame_holds_recorded_after(&self.exchange.pending, &cut_at) {
+                            self.exchange.residual_step = false;
+                        } else {
+                            trace_ctx.cut_trace_with_snapshots(cut_at);
+                            *trace_ctx.heap_cache_mut() = heap_cache;
+                        }
                     }
                     {
                         let frame = self
@@ -24141,6 +24185,38 @@ fn splice_ancestor_helper_slice<Sym: WalkSym>(
     splice_helper_frames_before_innermost(helpers)
 }
 
+/// Whether `opref` is a recorded result at or after `cut_at`.
+///
+/// `OpRef::raw` panics on `Const*`. Constants are not `History.cut` victims:
+/// they do not live in `value_slots`. `InputArg*` are the loop's inputs,
+/// captured before any residual preamble.
+fn opref_is_recorded_at_or_after(
+    opref: OpRef,
+    cut_at: &majit_metainterp::recorder::TracePosition,
+) -> bool {
+    match opref {
+        OpRef::IntOp(i) | OpRef::RefOp(i) | OpRef::FloatOp(i) => i >= cut_at._index,
+        _ => false,
+    }
+}
+
+/// A pending callee `MIFrame` still holds a box `History.cut(cut_at)` would
+/// drop. Mirrors `pyjitpl.py` `compile_trace` taking `cut_at` after every
+/// live register is recorded (`history.py` `History.cut`).
+fn pending_frame_holds_recorded_after<Sym: WalkSym>(
+    pending: &Option<SubWalkFrame<'_, Sym>>,
+    cut_at: &majit_metainterp::recorder::TracePosition,
+) -> bool {
+    pending.as_ref().is_some_and(|frame| {
+        frame
+            .registers_r
+            .iter()
+            .chain(frame.registers_i.iter())
+            .chain(frame.registers_f.iter())
+            .any(|op| opref_is_recorded_at_or_after(op, cut_at))
+    })
+}
+
 /// Keep ops the active residual handler recorded before it yields.
 ///
 /// `SubWalkDriver::drive` cuts a residual step back to the opcode start and
@@ -24284,6 +24360,32 @@ mod subwalk_checkpoint_tests {
         assert!(!exchange.residual_step);
         snapshot_residual_heap_before_suspend::<crate::state::PyreSym>(&heap_cache);
         assert!(exchange.step_heap_cache.is_none());
+    }
+
+    #[test]
+    fn recorded_box_index_at_or_after_the_cut_is_a_live_callee_register() {
+        let cut_at = majit_metainterp::recorder::TracePosition {
+            _pos: 0,
+            _count: 178,
+            _index: 178,
+            snapshot_data_len: 0,
+            snapshot_array_data_len: 0,
+        };
+        assert!(opref_is_recorded_at_or_after(OpRef::RefOp(180), &cut_at));
+        assert!(opref_is_recorded_at_or_after(OpRef::RefOp(178), &cut_at));
+        assert!(!opref_is_recorded_at_or_after(OpRef::RefOp(177), &cut_at));
+        assert!(!opref_is_recorded_at_or_after(OpRef::IntOp(10), &cut_at));
+        assert!(!opref_is_recorded_at_or_after(
+            OpRef::ConstInt(180),
+            &cut_at
+        ));
+        assert!(!opref_is_recorded_at_or_after(OpRef::NONE, &cut_at));
+        assert!(!opref_is_recorded_at_or_after(
+            OpRef::InputArgRef(180),
+            &cut_at
+        ));
+        let empty: Option<SubWalkFrame<'_, crate::state::PyreSym>> = None;
+        assert!(!pending_frame_holds_recorded_after(&empty, &cut_at));
     }
 
     /// Two callees entered by one CALL step: the replay after the second

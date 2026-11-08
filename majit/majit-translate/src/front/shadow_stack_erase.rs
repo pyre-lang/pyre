@@ -6277,11 +6277,10 @@ mod tests {
     #[test]
     fn analyze_refuses_returning_an_open_frame_anchor() {
         let llbc = stack_ops_llbc();
-        let copy = |i| json!({"Read": place(i)});
         let body = body_of(
-            2,
+            1,
             vec![
-                bb(call_fun(5, vec![copy(1)], 0, 1)),
+                bb(call_fun(1, vec![], 0, 1)),
                 bb(json!("Return")),
                 bb(json!("UnwindResume")),
             ],

@@ -9445,6 +9445,18 @@ impl<'a> Lowering<'a> {
             } else {
                 None
             };
+        // Dual-gate Skip wipes the ARRAY stamp on the result Variable.
+        // `do_fixed_newlist` then recovers from the Call's `result_ty`
+        // naming TypedItemsBlock (`newlist_typed_items_block_from_call`).
+        // `result_narrow_root` already recovered that pointee for the
+        // concretetype stamp above.
+        if let OpKind::Call { result_ty, .. } = &mut op_kind
+            && matches!(result_ty, ValueType::Ref(None))
+            && let Some(root) = result_narrow_root.as_ref()
+            && crate::front::mir::type_spelling_is_typed_items_block(root)
+        {
+            *result_ty = ValueType::Ref(Some(root.clone()));
+        }
         self.note_rust_heap_string_attr_call(
             &op_kind,
             &resolved_call_args,

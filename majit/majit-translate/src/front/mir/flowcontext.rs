@@ -91,11 +91,13 @@ pub(in crate::front::mir) struct InteriorFieldAlias {
     pub(in crate::front::mir) header: InteriorHeader,
     pub(in crate::front::mir) index_local: usize,
     pub(in crate::front::mir) index_var: Variable,
-    /// `GcArray<Entry>` / `GcArray<Point>`. `extract_element_type_from_str`
-    /// takes the angle-bracket interior, so the leaf is
-    /// `strip_instantiation_suffix`'d. The `GcArray<>` wrapper is the
-    /// length-prefixed ARRAY spelling: `nolength_from_array_type_id` is
-    /// false, matching `interiorfielddescrof_keyed`.
+    /// `GcArray<Entry>` / `GcArray<Point>` for a non-generic pointee;
+    /// `GcArray<rordereddict_entries::Entry<K,V>>` when the class root is
+    /// instantiation-suffixed. `extract_element_type_from_str` peels the
+    /// `GcArray<>` wrapper (first `<` to last `>`), so a suffixed Entry
+    /// element keeps `<K,V>`. The wrapper is the length-prefixed ARRAY
+    /// spelling: `nolength_from_array_type_id` is false, matching
+    /// `interiorfielddescrof_keyed`.
     pub(in crate::front::mir) array_type_id: String,
 }
 

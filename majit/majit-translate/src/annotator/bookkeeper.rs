@@ -12956,7 +12956,9 @@ mod tests {
     #[test]
     fn project_struct_field_type_struct_item_gcarray_uses_qualified_item_rows() {
         // Harvest stores `[module::Entry<…>;0]`. Intern looks up that
-        // path; a second same-leaf `Entry` does not steal the rows.
+        // TypeDecl path for field rows so a second same-leaf `Entry` does
+        // not steal them. ARRAY.OF is the specialized DICTENTRY
+        // (`get_ll_dict`), so `_name` keeps the substituted `<K,V>`.
         use crate::front::StructFieldRegistry;
 
         let bk = bk();
@@ -13003,8 +13005,8 @@ mod tests {
                             crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Struct(
                                 st,
                             ) => assert_eq!(
-                                st._name, "rordereddict_entries::Entry",
-                                "{spelling} ARRAY.OF must keep the harvest TypeDecl path"
+                                st._name, "rordereddict_entries::Entry<i64,*mut u8>",
+                                "{spelling} ARRAY.OF must be the specialized DICTENTRY"
                             ),
                             other => panic!("{spelling} ITEM must be STRUCT, got {other:?}"),
                         }

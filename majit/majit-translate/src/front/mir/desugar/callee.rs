@@ -5642,16 +5642,19 @@ pub(in crate::front::mir) fn struct_field_index_named(
 }
 
 /// `GcArray<Point>` / `GcArray<Entry>` for a named, non-transparent struct
-/// pointee node. A scalar, a pointer, or a `repr(transparent)` pointee is
-/// `None`, so list `ArrayRead` intercepts and `direct_ptradd` keep those
-/// `.add` calls.
+/// pointee node. A class root that already carries `<K,V>`
+/// (`rordereddict_entries::Entry`) keeps that suffix: one ARRAY per
+/// `get_ll_dict` `DICTENTRYARRAY`, not one shared `GcArray<Entry>`.
+/// A scalar, a pointer, or a `repr(transparent)` pointee is `None`, so list
+/// `ArrayRead` intercepts and `direct_ptradd` keep those `.add` calls.
 ///
 /// `get_array_descr` keys one ARRAY lltype, and `nolength` is a property of
 /// that lltype. `interiorfielddescrof_keyed` mints the length-prefixed
 /// shape (`!nolength`, items at `array_items_base`). A `[T]`
 /// spelling is an item run (`nolength_from_array_type_id`), so it cannot
 /// share an atid with that mint. `GcArray<T>` stays length-prefixed and
-/// `extract_element_type_from_str` still peels it to `T`.
+/// `extract_element_type_from_str` still peels it to `T` (a suffixed
+/// `Entry<K,V>` keeps the arguments: first `<` to last `>`).
 pub(in crate::front::mir) fn gc_array_id_for_named_struct_node(
     pointee: &serde_json::Value,
     llbc: &Llbc,
@@ -5665,8 +5668,7 @@ pub(in crate::front::mir) fn gc_array_id_for_named_struct_node(
         return None;
     }
     let root = adt_node_class_root_with(pointee, llbc, tombstoned)?;
-    let leaf = majit_ir::descr::strip_instantiation_suffix(&root);
-    Some(format!("GcArray<{leaf}>"))
+    Some(format!("GcArray<{root}>"))
 }
 
 /// `GcArray<Point>` / `GcArray<Entry>` for a `*mut`/`*const` named,

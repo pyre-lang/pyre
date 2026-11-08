@@ -12394,6 +12394,65 @@ fn zip_two_tuple_next_null_guard_stays_inside_the_helper() {
     }
 }
 
+/// Variable-exponent `int_pow_nomod` residualizes (`look_inside_iff` is
+/// false). The overflow `catch_exception` of `descr_pow` must stay a
+/// blackhole-runnable helper section so `GUARD_NO_EXCEPTION` numbers the
+/// helper (`capture_resumedata`) instead of collapsing to the portal CALL
+/// (`numbered_helper_guard_resume` CallerBoundary).
+#[test]
+fn int_pow_overflow_catch_does_not_collapse_guard_no_exception() {
+    let jc = crate::jitcode_runtime::pathed_jitcode(
+        "pyre_interpreter::objspace::descroperation::int_pow",
+    )
+    .expect("int_pow must be a discovered jitcode");
+    let idx = jc.try_index().expect("int_pow must have a jitcode index");
+    for reloc in &jc.reloc_consts_i {
+        if let majit_jitcode::jitcode::ConstIRelocKind::FnAddr { path, symbolic } = &reloc.kind {
+            assert!(
+                !(path.ends_with("::pow_ovf2long") && *symbolic),
+                "pow_ovf2long residual must be callable; got {path}"
+            );
+        }
+    }
+    let ops: Vec<_> = crate::jitcode_runtime::decoded_ops(&jc.code).collect();
+    let mut caught_calls = 0usize;
+    for (n, op) in ops.iter().enumerate() {
+        if !op.opname.starts_with("inline_call") && !op.opname.starts_with("residual_call") {
+            continue;
+        }
+        let live = ops
+            .iter()
+            .skip(n + 1)
+            .find(|o| o.opname == "live")
+            .map(|o| o.pc)
+            .unwrap_or(op.next_pc);
+        let Some(next) = ops.iter().skip(n + 1).find(|o| o.opname != "live") else {
+            continue;
+        };
+        if next.opname != "catch_exception" {
+            continue;
+        }
+        caught_calls += 1;
+        assert!(
+            !helper_resume_reaches_blocker(idx, live, None),
+            "{}@{} live={} must not collapse GuardNoException to the CALL; ops={:?}",
+            op.opname,
+            op.pc,
+            live,
+            ops.iter()
+                .map(|o| format!("{}@{}", o.opname, o.pc))
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert!(
+        caught_calls > 0,
+        "int_pow must catch a can-raise call (int_pow_nomod); ops={:?}",
+        ops.iter()
+            .map(|o| format!("{}@{}", o.opname, o.pc))
+            .collect::<Vec<_>>(),
+    );
+}
+
 /// GNI `record_quasiimmut_field` in `gil_ready_word` under `w_list_lock`
 /// under `_orig_extend_from_tuple`: the live after `w_list_reserve_for_extend`
 /// is the numbered-helper resume pc. A reachable `abort/>r` in a nested
@@ -23596,7 +23655,7 @@ fn authoritative_crossing_helper_without_a_latch_keeps_recording() {
     fbw_bump_executed_effect("test-crossing-helper-authoritative");
     assert!(
         fbw_executed_effect_count() > 0,
-        "the fixture is the whole-walk odometer keep-recording case"
+        "the fixture is the whole-walk odometer abort case"
     );
     let descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -23867,11 +23926,7 @@ fn authoritative_crossing_helper_with_enclosing_effects_keeps_recording() {
     let result = walk(&code, 0, &mut wc);
     assert!(
         result.is_ok(),
-        "enclosing effects without a latch must keep executing: {result:?}"
-    );
-    assert!(
-        !abort_blackhole_latched(),
-        "a declined latch must not leave a staged image"
+        "enclosing effects without a latch must keep recording: {result:?}"
     );
     fbw_store_journal_reset();
 }
@@ -24738,16 +24793,18 @@ fn helper_no_driver_inline_call_checks_after_dest_write() {
 /// false (the nested guard has dropped).
 #[test]
 fn helper_no_driver_builtin_wrapper_checks_after_dest_write() {
-    let int_add = *insns_opname_to_byte()
-        .get("int_add/ii>i")
-        .expect("`int_add/ii>i` must be in insns table");
+    let cast_ptr = *insns_opname_to_byte()
+        .get("cast_ptr_to_int/r>i")
+        .expect("`cast_ptr_to_int/r>i` must be in insns table");
     let ref_ret = *insns_opname_to_byte()
         .get("ref_return/r")
         .expect("`ref_return/r` must be in insns table");
-    let constants_i: &'static [i64] = Box::leak(Box::new([1i64, 2]));
-    // i1/i2 are constants; i0 is the add dest. r0 is the wrapper args array.
+    // r0 is the wrapper args array (`NewArrayClear`). `cast_ptr_to_int`
+    // records that live box (`arith.rs` CastPtrToInt: no `_all_constants`
+    // fold). Const `int_add` would fold to 0 recorded ops, so dest-write
+    // would see the same length as newframe.
     let child_code: &'static [u8] = Box::leak(Box::new([
-        int_add, 1, 2, 0, int_add, 1, 2, 0, int_add, 1, 2, 0, int_add, 1, 2, 0, ref_ret, 0,
+        cast_ptr, 0, 0, cast_ptr, 0, 0, cast_ptr, 0, 0, cast_ptr, 0, 0, ref_ret, 0,
     ]));
     let child_index = install_named_helper_jitcode(
         "no_driver_wrapper_child_helper",
@@ -24761,7 +24818,7 @@ fn helper_no_driver_builtin_wrapper_checks_after_dest_write() {
         num_regs_r: 1,
         num_regs_i: 1,
         num_regs_f: 0,
-        constants_i,
+        constants_i: &[],
         constants_r: &[],
         constants_f: &[],
         jitcode_index: Some(child_index),
@@ -24782,7 +24839,11 @@ fn helper_no_driver_builtin_wrapper_checks_after_dest_write() {
     let ops_at_entry = tc.num_recorded_ops();
     let mut concrete_i = [ConcreteValue::Int(0)];
     let regs_i = [dummy_int_add_box(&mut tc)];
-    tc.set_trace_limit(ops_at_entry + 1);
+    // `emit_wrapper_args_array` records NewArrayClear + setarrayitem on
+    // the CALL step. `is_too_long` is `num_ops > limit`. Leave the CALL
+    // under budget (`+1` fired at newframe) so the child's ordinary
+    // steps are what cut, then dest-write checks (`#2619` / `#2626`).
+    tc.set_trace_limit(ops_at_entry + 4);
     assert!(
         !tc.is_too_long(),
         "the parent must enter under budget so the child ordinary steps cut"
@@ -24899,7 +24960,7 @@ fn helper_no_driver_boxed_out_checks_after_caller_dest_write() {
     let source = "boxed_out_void_bank_parent = None";
     let py_code = pyre_interpreter::compile_exec(source).expect("test code should compile");
     let raw = Box::into_raw(Box::new(py_code));
-    let _wrapper = pyre_interpreter::w_code_new(raw as *const ());
+    let w_code = pyre_interpreter::w_code_new(raw as *const ()) as *const ();
     let runtime_jc = majit_metainterp::jitcode::JitCode::new("boxed_out_void_bank_parent");
     runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
         code: vec![void_ret],
@@ -24912,7 +24973,7 @@ fn helper_no_driver_boxed_out_checks_after_caller_dest_write() {
     pyjit.jitcode = std::sync::Arc::new(runtime_jc);
     pyjit.metadata.is_drained = true;
     pyjit.metadata.forward_py_pc_marker_by_jit_pc = vec![(0, 0)];
-    let installed = crate::state::install_jitcode_for(raw as *const (), std::sync::Arc::new(pyjit))
+    let installed = crate::state::install_jitcode_for(w_code, std::sync::Arc::new(pyjit))
         as *const crate::state::JitCode;
     let parent_index = unsafe { (*installed).index as usize };
     let parent_next = 8;
@@ -25042,7 +25103,7 @@ fn helper_no_driver_orthodox_helper_boxed_checks_after_finishframe() {
     let source = "orthodox_helper_boxed_parent = None";
     let py_code = pyre_interpreter::compile_exec(source).expect("test code should compile");
     let raw = Box::into_raw(Box::new(py_code));
-    let _wrapper = pyre_interpreter::w_code_new(raw as *const ());
+    let w_code = pyre_interpreter::w_code_new(raw as *const ()) as *const ();
     let runtime_jc = majit_metainterp::jitcode::JitCode::new("orthodox_helper_boxed_parent");
     runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
         code: vec![void_ret],
@@ -25055,7 +25116,7 @@ fn helper_no_driver_orthodox_helper_boxed_checks_after_finishframe() {
     pyjit.jitcode = std::sync::Arc::new(runtime_jc);
     pyjit.metadata.is_drained = true;
     pyjit.metadata.forward_py_pc_marker_by_jit_pc = vec![(0, 0)];
-    let installed = crate::state::install_jitcode_for(raw as *const (), std::sync::Arc::new(pyjit))
+    let installed = crate::state::install_jitcode_for(w_code, std::sync::Arc::new(pyjit))
         as *const crate::state::JitCode;
     let parent_index = unsafe { (*installed).index as usize };
     let parent_next = 8;

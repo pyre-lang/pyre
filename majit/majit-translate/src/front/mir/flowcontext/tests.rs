@@ -14270,6 +14270,10 @@ fn result_and_then_of_a_constructor_builds_the_variant() {
 /// `od_malloc_i64_entries` returns `*mut GcEntries<i64, *mut PyObject>`
 /// and a generic `Entry` local must not publish a type-variable row.
 /// The bare `Entry` leaf keeps its type-variable `key`.
+/// `interiorfielddescrof` does an exact `fields.get` of the ARRAY
+/// element's class root, so the harvest registers the fully-qualified
+/// path, the crate-stripped class root (`adt_node_class_root_with`),
+/// and the leaf — one DICTENTRYARRAY per `get_ll_dict` instantiation.
 #[test]
 fn concrete_i64_entry_rows_publish_one_qualified_spelling() {
     let obj_ty = 0u64;
@@ -14412,6 +14416,22 @@ fn concrete_i64_entry_rows_publish_one_qualified_spelling() {
         .and_then(|rows| rows.iter().find(|row| row.name == "key"))
         .map(|row| row.ty.as_str());
     assert_eq!(bare_key, Some("??TypeVar#0"));
+    let crate_stripped = "rordereddict_entries::Entry<i64,*mut PyObject>";
+    let leaf = "Entry<i64,*mut PyObject>";
+    let expected = [qualified, crate_stripped, leaf];
+    for name in expected {
+        assert_eq!(
+            program.struct_fields.fields.get(name),
+            Some(&vec![
+                crate::front::semantic::FieldRow::named("key", "i64"),
+                crate::front::semantic::FieldRow::named("f_valid", "bool"),
+                crate::front::semantic::FieldRow::named("value", "*mut PyObject"),
+                crate::front::semantic::FieldRow::named("f_hash", "u64"),
+            ]),
+            "{name}"
+        );
+        assert!(program.known_struct_names.contains(name), "{name}");
+    }
     let published: Vec<_> = program
         .struct_fields
         .fields
@@ -14426,7 +14446,14 @@ fn concrete_i64_entry_rows_publish_one_qualified_spelling() {
         })
         .cloned()
         .collect();
-    assert_eq!(published, vec![qualified.to_string()]);
+    let mut published_sorted = published.clone();
+    published_sorted.sort();
+    let mut expected_sorted = expected
+        .iter()
+        .map(|name| name.to_string())
+        .collect::<Vec<_>>();
+    expected_sorted.sort();
+    assert_eq!(published_sorted, expected_sorted);
     assert!(
         program
             .struct_fields

@@ -5666,6 +5666,24 @@ impl CallControl {
         is_known_by_value_struct(&self.known_struct_names, name)
     }
 
+    /// Field-row owner for ARRAY.OF. Prefer a harvested instantiation
+    /// (`get_ll_dict` DICTENTRY) when interned OF kept `<K,V>`; fall back
+    /// to the TypeDecl template when that key is absent (one-word keys
+    /// share the template layout).
+    fn array_of_field_owner(&self, elem_name: &str) -> Option<String> {
+        let compact = elem_name.replace(", ", ",");
+        if self.struct_fields.fields.contains_key(&compact) {
+            return Some(compact);
+        }
+        let template = majit_ir::descr::strip_generic_args(&compact);
+        if template.as_ref() != compact.as_str()
+            && self.struct_fields.fields.contains_key(template.as_ref())
+        {
+            return Some(template.into_owned());
+        }
+        None
+    }
+
     /// RPython: register actual struct layout from `symbolic.get_field_token()`.
     /// The runtime calls this with layouts from `std::mem::offset_of!()` etc.
     pub fn set_struct_layout(
@@ -6109,8 +6127,9 @@ impl CallControl {
         };
         let array_type_id = &array_type_id;
         // `descr.py get_array_descr`: `isinstance(ARRAY.OF, lltype.Struct)`
-        // is the interned ARRAY's OF when present. Dump-only peels the
-        // TypeDecl path harvest stored on an `[ADT; N]` row.
+        // is the interned ARRAY's OF when present. Dump-only peels
+        // `GcArray<Entry<K,V>>` keeping `<K,V>` (`extract_element_type_from_str`,
+        // `get_ll_dict` DICTENTRYARRAY).
         let interned_of_struct = arr.and_then(|arr| match array_of_lltype_identity(&arr.OF) {
             crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Struct(s) => {
                 Some(s._name)
@@ -6118,13 +6137,15 @@ impl CallControl {
             _ => None,
         });
         let elem_name = interned_of_struct.clone().or_else(|| {
-            array_type_id.as_deref().and_then(|s| {
-                extract_element_type_from_str(s)
-                    .or_else(|| Some(s.to_string()))
-                    .map(|n| majit_ir::descr::strip_generic_args(&n).into_owned())
-            })
+            array_type_id
+                .as_deref()
+                .and_then(|s| extract_element_type_from_str(s).or_else(|| Some(s.to_string())))
         });
-        let elem_ref = elem_name.as_deref();
+        let elem_name = elem_name.map(|n| n.replace(", ", ","));
+        let field_owner = elem_name
+            .as_deref()
+            .and_then(|n| self.array_of_field_owner(n));
+        let elem_ref = field_owner.as_deref().or(elem_name.as_deref());
         // Interned ARRAY.OF is the `isinstance(ARRAY.OF, lltype.Struct)`
         // answer (`descr.py get_array_descr`). Dump-only peels the
         // harvest path; an interned non-Struct OF is not Struct even
@@ -7043,19 +7064,19 @@ impl CallControl {
             }
             (None, None) => return None,
         };
-        // ARRAY.OF.fieldname — interned OF is the TypeDecl path harvest
-        // stored on the `[ADT; N]` row. Dump-only peels that path from
-        // the container spelling (`consider_array(ARRAY)`).
+        // ARRAY.OF.fieldname — interned OF is the specialized DICTENTRY
+        // (`get_ll_dict`). Dump-only peels `GcArray<Entry<K,V>>` keeping
+        // `<K,V>` (`extract_element_type_from_str`, `consider_array(ARRAY)`).
         let elem_name = if let Some(name) = interned_of_struct.clone() {
             name
         } else {
-            let raw =
-                extract_element_type_from_str(array_str).unwrap_or_else(|| array_str.to_string());
-            majit_ir::descr::strip_generic_args(&raw).into_owned()
+            extract_element_type_from_str(array_str).unwrap_or_else(|| array_str.to_string())
         };
+        let elem_name = elem_name.replace(", ", ",");
         if interned_of_struct.is_none() && !self.is_known_struct(&elem_name) {
             return None;
         }
+        let elem_name = self.array_of_field_owner(&elem_name).unwrap_or(elem_name);
         // PyPy `descr.py fielddescr = get_field_descr(gc_ll_descr,
         // REALARRAY.OF, name)` — the inner FieldDescr.index is the
         // stable per-parent slot from `heaptracker.get_fielddescr_index_in()`
@@ -24496,6 +24517,236 @@ mod tests {
         if crate::layout::target_word_size() == 8 {
             assert_eq!(offset, 16);
         }
+    }
+
+    /// `Entry<ObjectKey, *mut PyObject>` cannot reuse the typevar-key
+    /// template: ObjectKey is two words, so `f_valid` sits at 16 and the
+    /// item is 40. `interiorfielddescrof` peels `GcArray<Entry<K,V>>` to
+    /// the suffixed element (`extract_element_type_from_str`) and reads
+    /// that instantiation's layout (`get_ll_dict` `DICTENTRYARRAY`).
+    /// Production ARRAY identity uses the `adt_ast_head` leaf `ObjectKey`.
+    #[test]
+    fn interiorfielddescrof_objectkey_entry_f_valid_offset() {
+        let object_key = "ObjectKey";
+        let elem = "rordereddict_entries::Entry<ObjectKey,*mut PyObject>";
+        let atid = format!("GcArray<{elem}>");
+        assert_eq!(extract_element_type_from_str(&atid).as_deref(), Some(elem));
+        let object_key_sid = majit_ir::descr::StructId::from_canonical(object_key);
+        let entry_template_sid =
+            majit_ir::descr::StructId::from_canonical("rordereddict_entries::Entry");
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (object_key.to_string(), Some(object_key_sid)),
+                (
+                    "rordereddict_entries::Entry".to_string(),
+                    Some(entry_template_sid),
+                ),
+            ]));
+        let object_key_rows = [
+            ("hash".into(), "i64".into()),
+            ("obj".into(), "*mut PyObject".into()),
+        ];
+        let object_key_layout = StructLayout::from_type_strings(
+            &object_key_rows,
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(object_key_layout.size, 16);
+        let entry_rows = [
+            ("key".into(), object_key.to_string()),
+            ("f_valid".into(), "bool".into()),
+            ("value".into(), "*mut PyObject".into()),
+            ("f_hash".into(), "u64".into()),
+        ];
+        let names = std::collections::HashSet::from([object_key.to_string(), elem.to_string()]);
+        let sizes = std::collections::HashMap::from([(object_key.to_string(), 16)]);
+        let aligns = std::collections::HashMap::from([(object_key.to_string(), 8)]);
+        let entry_layout = StructLayout::from_type_strings(
+            &entry_rows,
+            &names,
+            &sizes,
+            &aligns,
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let f_valid_offset = entry_layout
+            .fields
+            .iter()
+            .find(|field| field.name == "f_valid")
+            .expect("f_valid field")
+            .offset;
+        assert_eq!(f_valid_offset, 16);
+        if crate::layout::target_word_size() == 8 {
+            assert_eq!(entry_layout.size, 40);
+        }
+        let entry_size = entry_layout.size;
+        let entry_sid = majit_ir::descr::struct_id_for_name(elem).expect("Entry instantiation id");
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(names);
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(object_key.to_string(), object_key_rows.to_vec());
+        fields.fields.insert(elem.to_string(), entry_rows.to_vec());
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(object_key_sid, object_key_layout);
+        cc.set_struct_layout(entry_sid, entry_layout);
+
+        let arr = {
+            use crate::translator::rtyper::lltypesystem::lltype::{
+                Array, GCREF, LowLevelType, Struct,
+            };
+            Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+                elem,
+                vec![
+                    (
+                        "key".into(),
+                        LowLevelType::Struct(Box::new(Struct::new(
+                            object_key,
+                            vec![
+                                ("hash".into(), LowLevelType::Signed),
+                                ("obj".into(), GCREF.clone()),
+                            ],
+                        ))),
+                    ),
+                    ("f_valid".into(), LowLevelType::Bool),
+                    ("value".into(), GCREF.clone()),
+                    ("f_hash".into(), LowLevelType::UnsignedLongLong),
+                ],
+            ))))
+        };
+        let (descr, _) = cc
+            .interiorfielddescrof_keyed(1, &Some(atid), &Some(arr), "f_valid")
+            .expect("interior field descr");
+        let interior = descr.as_interior_field_descr().expect("InteriorFieldDescr");
+        assert_eq!(interior.field_descr().offset(), 16);
+        assert_eq!(interior.array_descr().item_size(), entry_size);
+    }
+
+    /// Intern of `GcEntries<ObjectKey,*mut PyObject>` names ARRAY.OF as
+    /// the specialized DICTENTRY (`get_ll_dict`). `interiorfielddescrof`
+    /// then reads harvest `Entry<ObjectKey,*mut PyObject>` (`ll_valid_from_flag`):
+    /// `f_valid` at 16, item 40. The typevar template is `f_valid` at 8.
+    #[test]
+    fn interned_objectkey_gcentries_interior_f_valid_offset() {
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+
+        let object_key = "ObjectKey";
+        let elem = "rordereddict_entries::Entry<ObjectKey,*mut PyObject>";
+        let object_key_sid = majit_ir::descr::StructId::from_canonical(object_key);
+        let entry_template_sid =
+            majit_ir::descr::StructId::from_canonical("rordereddict_entries::Entry");
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (object_key.to_string(), Some(object_key_sid)),
+                (
+                    "rordereddict_entries::Entry".to_string(),
+                    Some(entry_template_sid),
+                ),
+            ]));
+        let object_key_rows = [
+            ("hash".into(), "i64".into()),
+            ("obj".into(), "*mut PyObject".into()),
+        ];
+        let object_key_layout = StructLayout::from_type_strings(
+            &object_key_rows,
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(object_key_layout.size, 16);
+        let entry_rows = [
+            ("key".into(), object_key.to_string()),
+            ("f_valid".into(), "bool".into()),
+            ("value".into(), "*mut PyObject".into()),
+            ("f_hash".into(), "u64".into()),
+        ];
+        let names = std::collections::HashSet::from([
+            object_key.to_string(),
+            elem.to_string(),
+            "rordereddict_entries::Entry".to_string(),
+        ]);
+        let sizes = std::collections::HashMap::from([(object_key.to_string(), 16)]);
+        let aligns = std::collections::HashMap::from([(object_key.to_string(), 8)]);
+        let entry_layout = StructLayout::from_type_strings(
+            &entry_rows,
+            &names,
+            &sizes,
+            &aligns,
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let f_valid_offset = entry_layout
+            .fields
+            .iter()
+            .find(|field| field.name == "f_valid")
+            .expect("f_valid field")
+            .offset;
+        assert_eq!(f_valid_offset, 16);
+        let entry_size = entry_layout.size;
+        let entry_sid = majit_ir::descr::struct_id_for_name(elem).expect("Entry instantiation id");
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(object_key.to_string(), object_key_rows.to_vec());
+        fields.fields.insert(elem.to_string(), entry_rows.to_vec());
+        fields.fields.insert(
+            "rordereddict_entries::Entry".to_string(),
+            vec![
+                ("key".into(), "??TypeVar#0".into()),
+                ("f_valid".into(), "bool".into()),
+                ("value".into(), "??TypeVar#1".into()),
+                ("f_hash".into(), "u64".into()),
+            ],
+        );
+        fields.fields.insert(
+            "rordereddict_entries::GcEntries".to_string(),
+            vec![
+                ("length".into(), "usize".into()),
+                (
+                    "items".into(),
+                    "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]".into(),
+                ),
+            ],
+        );
+        fields.note_declared_gc_name("PyObject");
+        fields.note_declared_gc_name("rordereddict_entries::GcEntries");
+        let interned = crate::front::mir::struct_item_flexible_gcarray_block_annotation(
+            &fields,
+            "rordereddict_entries::GcEntries<ObjectKey,*mut PyObject>",
+            "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]",
+        )
+        .expect("intern GcEntries<ObjectKey>");
+        let SomeValue::Ptr(ptr) = interned else {
+            panic!("intern must be SomePtr, got {interned:?}")
+        };
+        let PtrTarget::Array(arr) = ptr.ll_ptrtype.TO else {
+            panic!("intern must be Ptr(GcArray), got {:?}", ptr.ll_ptrtype.TO)
+        };
+        match &arr.OF {
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Struct(st) => {
+                assert_eq!(st._name, elem, "ARRAY.OF must be the specialized DICTENTRY")
+            }
+            other => panic!("ITEM must be STRUCT, got {other:?}"),
+        }
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(names);
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(object_key_sid, object_key_layout);
+        cc.set_struct_layout(entry_sid, entry_layout);
+        let atid = array_type_id_of_lltype(&arr);
+        let (descr, _) = cc
+            .interiorfielddescrof_keyed(1, &Some(atid), &Some(arr), "f_valid")
+            .expect("interior field descr");
+        let interior = descr.as_interior_field_descr().expect("InteriorFieldDescr");
+        assert_eq!(interior.field_descr().offset(), 16);
+        assert_eq!(interior.array_descr().item_size(), entry_size);
     }
 
     /// `getkind(SingleFloat) == 'int'` (history.py): `f32` banks to the

@@ -2534,8 +2534,14 @@ fn charon_unit_tykind_to_ast_string(v: &serde_json::Value) -> String {
     }
 }
 
-/// One concrete `rordereddict_entries::Entry` / `GcEntries` use found in a
-/// signature or a local. `found` holds the rendered type arguments.
+/// One concrete `rordereddict_entries::Entry` / `GcEntries` use. `found`
+/// holds the rendered type arguments. Charon keeps `entry_valid` generic
+/// (`K`, `V`, `S`); FunDecl JSON stores those arguments as TypeVars.
+/// The ObjectKey spec is a translator clone (`specialize.py`
+/// `FunctionDesc.cachedgraph`) whose `getinteriorfield` ARRAY identity is
+/// `GcArray<Entry<ObjectKey,…>>`. Walk unsubstituted JSON and each
+/// concrete callee's substituted body, the same sources
+/// [`collect_ref_enum_instantiations`] uses.
 struct EntryInstantiationScan<'a> {
     llbc: &'a Llbc,
     entry_id: u64,
@@ -2551,92 +2557,106 @@ impl EntryInstantiationScan<'_> {
         let Some(root) = root else {
             return;
         };
+        self.consider_value(root);
+    }
+
+    fn consider_ty(&mut self, ty: &TyRef) {
+        self.consider(tyref_node(ty, self.llbc));
+    }
+
+    fn consider_unstructured(&mut self, u: &Unstructured) {
+        for local in &u.locals.locals {
+            self.consider_ty(&local.ty);
+        }
+        let forward_blocks = forward_reachable_mask(self.llbc, u);
+        for (bb_idx, bb) in u.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
+            if let Ok(TermKind::Call { call, .. }) = bb.term_ref(self.llbc) {
+                self.consider_ty(&call.dest.ty);
+                for arg in &call.args {
+                    match arg {
+                        Operand::Copy(place) | Operand::Move(place) => {
+                            self.consider_ty(&place.ty);
+                        }
+                        Operand::Const(_) => {}
+                    }
+                }
+            }
+            for st in &bb.statements {
+                let Ok(StmtKind::Assign(place, _)) = st.stmt_kind_ref() else {
+                    continue;
+                };
+                self.consider_ty(&place.ty);
+            }
+        }
+    }
+
+    fn consider_value(&mut self, root: &serde_json::Value) {
         let mut stack = vec![(root, 0usize)];
         while let Some((node, depth)) = stack.pop() {
-            if depth > 24 {
+            if depth > 32 {
                 continue;
             }
-            let Some(obj) = node.as_object() else {
-                continue;
-            };
-            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-                if !self.seen_dedup.insert(id) {
-                    continue;
+            match node {
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        stack.push((item, depth + 1));
+                    }
                 }
-                if let Some(body) = self.llbc.dedup_body(id) {
-                    stack.push((body, depth + 1));
-                }
-                continue;
-            }
-            if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
-                && arr.len() == 2
-            {
-                stack.push((&arr[1], depth + 1));
-                continue;
-            }
-            if let Some(adt) = obj.get("Adt").and_then(serde_json::Value::as_object) {
-                if let Some(id) = type_decl_ref_adt_id(adt)
-                    && (id == self.entry_id || self.gc_entries_id == Some(id))
-                {
-                    let args = render_adt_type_args(adt, self.llbc, depth, self.tombstoned);
-                    if !args.is_empty()
-                        && args
-                            .iter()
-                            .all(|arg| !arg.is_empty() && !arg.contains("??"))
+                serde_json::Value::Object(obj) => {
+                    if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64)
+                        && self.seen_dedup.insert(id)
+                        && let Some(body) = self.llbc.dedup_body(id)
                     {
-                        let suffix = args.join(",");
-                        if self.seen_suffix.insert(suffix) {
-                            self.found.push(args);
+                        stack.push((body, depth + 1));
+                    }
+                    if let Some(adt) = obj.get("Adt").and_then(serde_json::Value::as_object)
+                        && let Some(id) = type_decl_ref_adt_id(adt)
+                        && (id == self.entry_id || self.gc_entries_id == Some(id))
+                    {
+                        let args = render_adt_type_args(adt, self.llbc, depth, self.tombstoned);
+                        if !args.is_empty()
+                            && args
+                                .iter()
+                                .all(|arg| !arg.is_empty() && !arg.contains("??"))
+                        {
+                            let suffix = args.join(",");
+                            if self.seen_suffix.insert(suffix) {
+                                self.found.push(args);
+                            }
                         }
                     }
-                }
-                if let Some(types) = type_decl_ref_generics(adt, self.llbc)
-                    .and_then(serde_json::Value::as_object)
-                    .and_then(|generics| generics.get("types"))
-                    .and_then(serde_json::Value::as_array)
-                {
-                    for ty in types {
-                        stack.push((ty, depth + 1));
+                    for value in obj.values() {
+                        stack.push((value, depth + 1));
                     }
                 }
-                continue;
-            }
-            if let Some(inner) = obj
-                .get("RawPtr")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|arr| arr.first())
-                .or_else(|| {
-                    obj.get("Ref")
-                        .and_then(serde_json::Value::as_array)
-                        .and_then(|arr| arr.get(1))
-                })
-                .or_else(|| {
-                    obj.get("Array")
-                        .and_then(serde_json::Value::as_array)
-                        .and_then(|arr| arr.first())
-                })
-                .or_else(|| {
-                    obj.get("Slice")
-                        .and_then(serde_json::Value::as_array)
-                        .and_then(|arr| arr.first())
-                })
-            {
-                stack.push((inner, depth + 1));
+                _ => {}
             }
         }
     }
 }
 
-/// Publish concrete `Entry<i64, *mut PyObject>` field rows.
+/// Publish field rows for every concrete `Entry<K, V>` instantiation.
 ///
 /// Charon leaves `rordereddict_entries::Entry` generic, so
 /// `derive_program_metadata` records `key` as a type variable.
-/// `_handle_dict_lookup_call` extra descrs need that concrete `i64` key
-/// (`arraydescrof(DICTENTRYARRAY)`). A fully concrete use of `Entry`, or
-/// the same arguments on `GcEntries`, supplies the rows. Only the
-/// qualified spelling is inserted. `#[repr(C)]` places `key`, `f_valid`,
-/// `value`, and `f_hash` in declaration order.
-fn register_ordereddict_i64_entry_rows(
+/// `_handle_dict_lookup_call` extra descrs need the monomorph
+/// `get_ll_dict` would have built (`arraydescrof(DICTENTRYARRAY)`).
+/// A fully concrete use of `Entry`, or the same arguments on
+/// `GcEntries`, supplies the rows. ObjectKey is 16 bytes, so the
+/// generic template (typevar key = one GC word) cannot stand in for
+/// that instantiation. Insert the full path, the crate-stripped
+/// class-root spelling, and the leaf so `interiorfielddescrof` lookup
+/// matches `adt_node_class_root_with`. `#[repr(C)]` places `key`,
+/// `f_valid`, `value`, and `f_hash` in declaration order.
+///
+/// Spec copies are not in the extracted FunDecl JSON
+/// (`specialize.py` `FunctionDesc.cachedgraph`). Walk each concrete
+/// generic callee through its substituted signature and body, the
+/// same queue [`collect_ref_enum_instantiations`] uses.
+fn register_ordereddict_entry_instantiation_rows(
     llbc: &Llbc,
     known_struct_names: &mut std::collections::HashSet<String>,
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
@@ -2668,6 +2688,8 @@ fn register_ordereddict_i64_entry_rows(
         tombstoned,
         found: Vec::new(),
     };
+    let mut queue: Vec<(u64, Vec<Value>, Vec<Value>, Vec<Value>)> = Vec::new();
+    let mut seen: std::collections::HashSet<(u64, String)> = std::collections::HashSet::new();
     for fd in llbc.iter_local_fns() {
         for ty in fd
             .signature
@@ -2675,12 +2697,40 @@ fn register_ordereddict_i64_entry_rows(
             .iter()
             .chain(std::iter::once(&fd.signature.output))
         {
-            scan.consider(tyref_node(ty, llbc));
+            scan.consider_ty(ty);
         }
-        if let Some(locals) = fd.unstructured_locals() {
-            for local in &locals.locals {
-                scan.consider(tyref_node(&local.ty, llbc));
-            }
+        if let Some(body) = fd.body.as_ref()
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(body.get())
+        {
+            scan.consider_value(&value);
+        }
+        if let Some(u) = fd.unstructured() {
+            scan.consider_unstructured(&u);
+            intern_enqueue_generic_calls(llbc, &u, &mut queue, &mut seen);
+        }
+    }
+    while let Some((id, types, const_generics, trait_refs)) = queue.pop() {
+        let Some(callee) = llbc.fn_by_id(id) else {
+            continue;
+        };
+        let sig = crate::front::clause_spec::substituted_signature(
+            &callee.signature,
+            llbc,
+            &types,
+            &const_generics,
+        );
+        for ty in sig.inputs.iter().chain(std::iter::once(&sig.output)) {
+            scan.consider_ty(ty);
+        }
+        if let Some(u) = crate::front::clause_spec::substituted_unstructured(
+            callee,
+            llbc,
+            &trait_refs,
+            &types,
+            &const_generics,
+        ) {
+            scan.consider_unstructured(&u);
+            intern_enqueue_generic_calls(llbc, &u, &mut queue, &mut seen);
         }
     }
     let Some(td) = llbc.type_by_id(entry_id) else {
@@ -2691,7 +2741,6 @@ fn register_ordereddict_i64_entry_rows(
     };
     for args in scan.found {
         let mut rows = Vec::with_capacity(fields.len());
-        let mut key_is_i64 = false;
         let mut valid = false;
         let mut value = false;
         let mut hash = false;
@@ -2710,7 +2759,6 @@ fn register_ordereddict_i64_entry_rows(
                 break;
             }
             match fname.as_str() {
-                "key" => key_is_i64 = concrete_ty == "i64",
                 "f_valid" => valid = true,
                 "value" => value = true,
                 "f_hash" => hash = true,
@@ -2718,12 +2766,22 @@ fn register_ordereddict_i64_entry_rows(
             }
             rows.push(field_row_from_decl(index, field, concrete_ty, llbc));
         }
-        if !concrete || !key_is_i64 || !valid || !value || !hash {
+        if !concrete || !valid || !value || !hash {
             continue;
         }
-        let name = format!("{entry_path}<{}>", args.join(","));
-        struct_fields.fields.entry(name.clone()).or_insert(rows);
-        known_struct_names.insert(name);
+        let args_joined = args.join(",");
+        let names = [
+            format!("{entry_path}<{args_joined}>"),
+            format!("{}<{args_joined}>", strip_crate_prefix(&entry_path)),
+            format!("Entry<{args_joined}>"),
+        ];
+        for name in names {
+            struct_fields
+                .fields
+                .entry(name.clone())
+                .or_insert_with(|| rows.clone());
+            known_struct_names.insert(name);
+        }
     }
 }
 
@@ -3110,10 +3168,10 @@ impl CrateLoweringState {
             gc_struct_ids,
             program_exception_class_hints,
         );
-        // Concrete `Entry<i64, *mut PyObject>` rows. The generic decl's
-        // `key` is a type variable; extra descrs for `OS_DICT_LOOKUP`
-        // need the monomorph `get_ll_dict` would have built.
-        register_ordereddict_i64_entry_rows(
+        // Concrete `Entry<K, V>` rows. The generic decl's `key` is a
+        // type variable; extra descrs for `OS_DICT_LOOKUP` need the
+        // monomorph `get_ll_dict` would have built.
+        register_ordereddict_entry_instantiation_rows(
             llbc,
             &mut known_struct_names,
             &mut struct_fields,

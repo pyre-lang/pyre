@@ -535,6 +535,7 @@ mod tests {
             0
         }
 
+        crate::interp_exceptions::install_test_rpyexc();
         crate::dict_eq_hook::register_hash_w_hook(hash_object);
         crate::dict_eq_hook::register_hash_str_hook(hash_str);
     }

@@ -237,6 +237,25 @@ extern "C" fn object_residual_raise(value: i64) {
     }
 }
 
+extern "C" fn rpyexc_peek_bh() -> i64 {
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get())
+}
+
+extern "C" fn rpyexc_fetch_bh() -> i64 {
+    let value = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.replace(0));
+    jit_clear_published_exception();
+    value
+}
+
+/// Interpreter-only rpyexc peek/fetch: `BH_LAST_EXC_VALUE`. Production
+/// `install_jit_call_bridge` points these at the backend cell
+/// `GUARD_NO_EXCEPTION` resets; skip the write when that already ran.
+pub fn register_interpreter_rpyexc_fallback() {
+    pyre_object::interp_exceptions::register_residual_exc_publisher(object_residual_raise);
+    pyre_object::interp_exceptions::register_residual_exc_peek_if_unset(rpyexc_peek_bh);
+    pyre_object::interp_exceptions::register_residual_exc_fetch_if_unset(rpyexc_fetch_bh);
+}
+
 type JitExcClearer = extern "C" fn();
 
 majit_gc::oncelock_fn_static!(static JIT_EXC_CLEARER: OnceLock<JitExcClearer>);

@@ -5149,6 +5149,7 @@ mod tests {
             0
         }
 
+        crate::interp_exceptions::install_test_rpyexc();
         crate::dict_eq_hook::register_hash_w_hook(hash_int);
         crate::dict_eq_hook::register_hash_str_hook(hash_str);
     }
@@ -6026,7 +6027,7 @@ mod tests {
             w_set_clear(clear);
         }
         if RAISE_INSTANCE_HASH.with(|cell| cell.get()) {
-            crate::dict_eq_hook::signal_hash_error(obj);
+            crate::interp_exceptions::rpyexc_raise(obj);
             return 0;
         }
         INSTANCE_HASH.with(|cell| cell.get())
@@ -6040,6 +6041,7 @@ mod tests {
         INSTANCE_HASH.with(|cell| cell.set(11));
         CLEAR_SET.with(|cell| cell.set(std::ptr::null_mut()));
         RAISE_INSTANCE_HASH.with(|cell| cell.set(false));
+        crate::interp_exceptions::install_test_rpyexc();
         crate::dict_eq_hook::register_hash_w_hook(identity_test_hash);
         crate::dict_eq_hook::register_hash_str_hook(identity_test_hash_str);
     }
