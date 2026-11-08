@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use crate::call::CallDescriptor;
 use crate::codewriter::support::{NormalizedArg, decode_builtin_call};
 use crate::model::{
-    CallFuncPtr, CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation,
-    ValueType, VecFieldPart, remap_control_flow_metadata_var,
+    CallFuncPtr, CallTarget, ExitSwitch, FieldDescriptor, FunctionGraph, LinkArg, OpKind,
+    SpaceOperation, ValueType, VecFieldPart, remap_control_flow_metadata_var,
 };
 use majit_ir::descr::{EffectInfo, ExtraEffect, OopSpecIndex};
 
@@ -1043,17 +1043,33 @@ fn is_null_fn_result(result_ty: &ValueType) -> bool {
 /// stays residual (`framework.py transform_generic_set`).
 ///
 /// `typeobject::type_write_barrier` is erased in `front/mir.rs` `is_source_write_barrier_call`.
+/// Leaf of `gc_hook::try_gc_write_barrier*`, including the
+/// `__majit_call_target_` trampoline `getfunctionptr` residualizes
+/// (`call.rs user_path_behind_majit_call_target`).
+fn gc_write_barrier_leaf(leaf: &str) -> bool {
+    let leaf = leaf.strip_prefix("__majit_call_target_").unwrap_or(leaf);
+    matches!(
+        leaf,
+        "try_gc_write_barrier" | "try_gc_write_barrier_managed" | "try_gc_write_barrier_prebuilt"
+    )
+}
+
 fn is_gc_write_barrier_path(segments: &[String]) -> bool {
     let [.., module, leaf] = segments else {
         return false;
     };
-    module == "gc_hook"
-        && matches!(
-            leaf.as_str(),
-            "try_gc_write_barrier"
-                | "try_gc_write_barrier_managed"
-                | "try_gc_write_barrier_prebuilt"
-        )
+    module == "gc_hook" && gc_write_barrier_leaf(leaf)
+}
+
+/// `CallControl::fnaddr_binding_for_target` / `CallPath::canonical_key`
+/// string of a residual funcptr (`segments.join("::")`).
+fn is_gc_write_barrier_fnaddr_path(path: &str) -> bool {
+    // `split("::")` is not `DoubleEndedIterator` (`&str` Pattern of
+    // length > 1); `rsplit` walks the same segments from the leaf.
+    let mut segs = path.rsplit("::");
+    let leaf = segs.next();
+    let module = segs.next();
+    matches!((module, leaf), (Some("gc_hook"), Some(leaf)) if gc_write_barrier_leaf(leaf))
 }
 
 /// Unary ops `optimize_block` drops as `same_as`.
@@ -1152,7 +1168,13 @@ fn value_type_is_gc_ref(ty: &ValueType) -> bool {
     matches!(ty, ValueType::Ref(_))
 }
 
-/// Operand of an identity-cast Call that produced `var`, if any.
+/// Operand of an identity-cast Call or UnaryOp that produced `var`, if any.
+///
+/// Same identity set [`is_drop_guard_identity_op`] skips between a
+/// `gc_writebarrier` and the store it guards (`jtransform.py
+/// rewrite_op_same_as` / `rewrite_op_cast_pointer`, plus the `deref`
+/// reborrow). `canonical_gc_base` follows these so a barrier on an
+/// identity cast of `list` matches a `setfield_gc` whose base is `list`.
 fn identity_cast_operand(
     graph: &FunctionGraph,
     var: &crate::flowspace::model::Variable,
@@ -1162,14 +1184,18 @@ fn identity_cast_operand(
             if op.result.as_ref() != Some(var) {
                 continue;
             }
-            if let OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                args,
-                ..
-            } = &op.kind
-                && (is_identity_cast_path(segments) || is_ptr_from_ref_path(segments))
-            {
-                return args.iter().find_map(LinkArg::as_variable).cloned();
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if is_same_as_identity_call_path(segments) => {
+                    return args.iter().find_map(LinkArg::as_variable).cloned();
+                }
+                OpKind::UnaryOp { op, operand, .. } if is_same_as_identity_unary(op) => {
+                    return Some(operand.clone());
+                }
+                _ => {}
             }
         }
     }
@@ -1242,6 +1268,10 @@ fn link_arg_is_null_ref(graph: &FunctionGraph, arg: &LinkArg) -> bool {
 
 /// Ops `rewrite_op_direct_call` / `optimize_block` drop as `same_as` —
 /// they are not the store the barrier guards and they cannot collect.
+///
+/// `jtransform.py handle_residual_call` emits `-live-` after a raising
+/// residual (`jtransform.py` residual_call then `-live-`). `Live` and
+/// the `ConstFnAddr` of a later residual cannot collect.
 fn is_drop_guard_identity_op(kind: &OpKind) -> bool {
     match kind {
         OpKind::UnaryOp { op, .. } if is_same_as_identity_unary(op) => true,
@@ -1249,19 +1279,146 @@ fn is_drop_guard_identity_op(kind: &OpKind) -> bool {
             target: CallTarget::FunctionPath { segments, .. },
             ..
         } if is_same_as_identity_call_path(segments) => true,
+        OpKind::Live { .. } | OpKind::ConstFnAddr { .. } => true,
         _ => false,
     }
+}
+
+/// Argument of an interpreter `llop.gc_writebarrier` spelling: a source
+/// `Call` or the `CallResidual` `handle_residual_call` rewrites a
+/// `dont_look_inside` barrier into (`jtransform.py` residual_call).
+fn gc_write_barrier_arg<'a>(
+    graph: &'a FunctionGraph,
+    kind: &'a OpKind,
+) -> Option<&'a crate::flowspace::model::Variable> {
+    match kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if args.len() == 1 && is_gc_write_barrier_path(segments) => args[0].as_variable(),
+        OpKind::CallResidual {
+            funcptr,
+            args_r,
+            args_i,
+            args_f,
+            ..
+        } if args_r.len() == 1
+            && args_i.is_empty()
+            && args_f.is_empty()
+            && residual_funcptr_is_gc_write_barrier(graph, funcptr) =>
+        {
+            Some(&args_r[0])
+        }
+        _ => None,
+    }
+}
+
+fn residual_funcptr_is_gc_write_barrier(graph: &FunctionGraph, funcptr: &CallFuncPtr) -> bool {
+    match funcptr {
+        CallFuncPtr::Target(CallTarget::FunctionPath { segments, .. }) => {
+            is_gc_write_barrier_path(segments)
+        }
+        CallFuncPtr::Target(_) => false,
+        CallFuncPtr::Value(var) => funcptr_var_is_gc_write_barrier(graph, var),
+    }
+}
+
+fn funcptr_var_is_gc_write_barrier(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> bool {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(var) {
+                continue;
+            }
+            return match &op.kind {
+                OpKind::ConstFnAddr { path, .. } => is_gc_write_barrier_fnaddr_path(path),
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if args.is_empty() => is_gc_write_barrier_path(segments),
+                OpKind::UnaryOp {
+                    op: name, operand, ..
+                } if is_same_as_identity_unary(name) => {
+                    funcptr_var_is_gc_write_barrier(graph, operand)
+                }
+                _ => false,
+            };
+        }
+    }
+    false
+}
+
+/// Unique fall-through successor of `block`.
+///
+/// `exitswitch is None` with one Link is a Goto; `exitswitch is
+/// c_last_exception` uses `exits[0]` (`exitcase is None`) as the normal
+/// successor (`flowspace/model.py Block.canraise`). A Value/Fused switch
+/// is not unique — `rewrite.py handle_write_barrier_setfield` only sees
+/// the store that gctransform placed immediately after the barrier.
+fn fallthrough_successor(graph: &FunctionGraph, block_idx: usize) -> Option<crate::model::BlockId> {
+    let block = graph.blocks.get(block_idx)?;
+    let link = match &block.exitswitch {
+        None if block.exits.len() == 1 => block.exits.first()?,
+        Some(ExitSwitch::LastException) => {
+            let link = block.exits.first()?;
+            if link.exitcase.is_some() {
+                return None;
+            }
+            link
+        }
+        _ => return None,
+    };
+    Some(link.target)
+}
+
+/// Next non-identity op after `from_op` in `from_block`, walking unique
+/// fall-through successors. Charon puts every Call as a MIR terminator, so
+/// a source `try_gc_write_barrier(list); l.items = newitems` pair is two
+/// consecutive blocks (`framework.py gct_gc_writebarrier` inserts the
+/// barrier as the immediately preceding op in the same block; flatten then
+/// concatenates the fall-through so jitcode looks adjacent).
+fn next_non_identity_kind_after(
+    graph: &FunctionGraph,
+    from_block: usize,
+    from_op: usize,
+) -> Option<&OpKind> {
+    let block = graph.blocks.get(from_block)?;
+    if let Some(next) = block.operations[from_op + 1..]
+        .iter()
+        .find(|op| !is_drop_guard_identity_op(&op.kind))
+    {
+        return Some(&next.kind);
+    }
+    let mut current = from_block;
+    for _ in 0..8 {
+        let target = fallthrough_successor(graph, current)?;
+        let block = graph.blocks.get(target.0)?;
+        if let Some(next) = block
+            .operations
+            .iter()
+            .find(|op| !is_drop_guard_identity_op(&op.kind))
+        {
+            return Some(&next.kind);
+        }
+        current = target.0;
+    }
+    None
 }
 
 /// `framework.py gct_gc_writebarrier` turns `llop.gc_writebarrier` into a
 /// call the JIT rewriter does not keep: `rewrite.py
 /// handle_write_barrier_setfield` already grows `COND_CALL_GC_WB` on the
 /// `SETFIELD_GC` of a pointer. The interpreter spells that barrier as an
-/// explicit `try_gc_write_barrier(obj)` /
-/// `try_gc_write_barrier_prebuilt(obj)` right before the store it guards,
-/// so the one-arg call is dropped only when the next non-identity op is a
-/// non-null GC `FieldWrite` / `ArrayWrite` of the same base: that store
-/// lowers to the op the backend barriers.
+/// explicit `try_gc_write_barrier` /
+/// `try_gc_write_barrier_prebuilt` on the same pointer the store uses,
+/// immediately before it, so the one-arg call is dropped only when the
+/// next non-identity op is a non-null GC `FieldWrite` / `ArrayWrite` of
+/// that pointer ([`canonical_gc_base`] follows identity casts): that
+/// store lowers to the op the backend barriers.
 ///
 /// `try_gc_write_barrier_from_array` stays residual.
 /// `framework.py transform_generic_set` emits it as `direct_call` and
@@ -1282,34 +1439,20 @@ fn drop_guarded_gc_write_barriers(graph: &mut FunctionGraph) {
     let mut drops: Vec<(usize, usize)> = Vec::new();
     for (bi, block) in graph.blocks.iter().enumerate() {
         for (oi, op) in block.operations.iter().enumerate() {
-            let OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                args,
-                ..
-            } = &op.kind
-            else {
+            let Some(arg) = gc_write_barrier_arg(graph, &op.kind).cloned() else {
                 continue;
             };
-            if args.len() != 1 || !is_gc_write_barrier_path(segments) {
-                continue;
-            }
-            let Some(arg) = args[0].as_variable() else {
+            let Some(next) = next_non_identity_kind_after(graph, bi, oi) else {
                 continue;
             };
-            let canon = canonical_gc_base(graph, &aliases, arg);
-            let Some(next) = block.operations[oi + 1..]
-                .iter()
-                .find(|next| !is_drop_guard_identity_op(&next.kind))
-            else {
-                continue;
-            };
-            let Some((base, value)) = gc_ref_store_base_and_value(&next.kind) else {
+            let Some((base, value)) = gc_ref_store_base_and_value(next) else {
                 continue;
             };
             if link_arg_is_null_ref(graph, value) {
                 continue;
             }
-            if base == arg || canonical_gc_base(graph, &aliases, base) == canon {
+            let canon = canonical_gc_base(graph, &aliases, &arg);
+            if base == &arg || canonical_gc_base(graph, &aliases, base) == canon {
                 drops.push((bi, oi));
             }
         }
@@ -3305,6 +3448,16 @@ impl<'a> Transformer<'a> {
         for block_idx in 0..rewritten.blocks.len() {
             self.optimize_block(&mut rewritten, block_idx, &graph_name, exceptblock);
         }
+        // `jtransform.py optimize_block` / `_handle_list_call` rewrites
+        // oopspecs such as `list.int_set_items` to `setfield_gc_r` only
+        // inside the loop above. A gctransform-spelled
+        // `try_gc_write_barrier` in front of that Call is not yet a
+        // FieldWrite, so the drop before `optimize_block` leaves it. The
+        // codewriter reads pre-gctransform graphs (`jtransform.py` never
+        // sees `llop.gc_writebarrier`); `rewrite.py
+        // handle_write_barrier_setfield` emits `COND_CALL_GC_WB` on the
+        // lowered setfield. Drop again now that the store is that op.
+        drop_guarded_gc_write_barriers(&mut rewritten);
         // A rewrite can itself define a condition as a constant (notably the
         // false result paired with `can_enter_jit`'s `loop_header`).  Follow
         // that constant exit after rewriting, matching the block-following
@@ -33350,6 +33503,17 @@ mod tests {
             "celldict",
             "object_mutable_cell_write_barrier"
         ])));
+        assert!(is_gc_write_barrier_path(&path(&[
+            "pyre_object",
+            "gc_hook",
+            "__majit_call_target_try_gc_write_barrier"
+        ])));
+        assert!(is_gc_write_barrier_fnaddr_path(
+            "pyre_object::gc_hook::try_gc_write_barrier"
+        ));
+        assert!(is_gc_write_barrier_fnaddr_path(
+            "pyre_object::gc_hook::__majit_call_target_try_gc_write_barrier"
+        ));
     }
 
     #[test]
@@ -33382,6 +33546,295 @@ mod tests {
             RewriteResult::Keep => {}
             _ => panic!("expected residual Keep for before_move"),
         }
+    }
+
+    /// A barrier on an identity cast of `list` matches a `setfield_gc`
+    /// whose base is `list` (`list as *mut W_ListObject as GCREF`).
+    /// [`canonical_gc_base`] follows the UnaryOp.
+    #[test]
+    fn gc_write_barrier_on_identity_cast_of_store_base_is_dropped() {
+        let mut graph = FunctionGraph::new("wb_identity_cast");
+        let list = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let entry = graph.startblock;
+        let cast = graph
+            .push_op_var(
+                entry,
+                OpKind::UnaryOp {
+                    op: "cast_pointer".to_string(),
+                    operand: list.clone(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(entry, wb_call(&cast, "try_gc_write_barrier"), false);
+        graph.push_op_var(entry, wb_store(&list, &stored), false);
+        drop_guarded_gc_write_barriers(&mut graph);
+        let ops = &graph.blocks[entry.0].operations;
+        assert!(matches!(ops[1].kind, OpKind::ConstBool(true)));
+        assert!(matches!(ops[2].kind, OpKind::FieldWrite { .. }));
+    }
+
+    /// `jtransform.py _handle_list_call` rewrites `list.int_set_items` to
+    /// `setfield_gc_r(int_items.block)`. The drop must see that FieldWrite,
+    /// not the unlowered Call (`rewrite.py handle_write_barrier_setfield`
+    /// barriers the setfield).
+    #[test]
+    fn gc_write_barrier_before_list_int_set_items_drops_after_setfield_lower() {
+        let mut graph = FunctionGraph::new("wb_list_int_set_items");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let items = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let entry = graph.startblock;
+        graph.push_op_var(entry, wb_call(&l, "try_gc_write_barrier"), false);
+        graph.push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::function_path([
+                    "pyre_object",
+                    "listobject",
+                    "ll_list_int_set_items",
+                ]),
+                args: crate::model::call_args(vec![l.clone(), items.clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        drop_guarded_gc_write_barriers(&mut graph);
+        assert!(
+            is_wb_call(&graph.blocks[entry.0].operations[0].kind),
+            "unlowered list.int_set_items Call is not the setfield the backend barriers"
+        );
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::ConstInt(0),
+        };
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.int_set_items",
+                &op,
+                &[l.clone(), items.clone()],
+                &mut graph,
+                "wb_list_int_set_items",
+            )
+            .expect("list.int_set_items must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        graph.blocks[entry.0].operations[1] = ops.into_iter().next().unwrap();
+        drop_guarded_gc_write_barriers(&mut graph);
+        let kinds = &graph.blocks[entry.0].operations;
+        assert!(matches!(kinds[0].kind, OpKind::ConstBool(true)));
+        assert!(matches!(kinds[1].kind, OpKind::FieldWrite { .. }));
+    }
+
+    /// `jtransform.py handle_residual_call` rewrites a `dont_look_inside`
+    /// barrier to `ConstFnAddr` + `residual_call` + `-live-` before the
+    /// already-lowered `setfield_gc_r`. The second drop in
+    /// `Transformer.transform` must still see that residual as
+    /// `llop.gc_writebarrier` (`rewrite.py handle_write_barrier_setfield`
+    /// barriers the setfield).
+    #[test]
+    fn gc_write_barrier_residual_before_setfield_is_dropped() {
+        let mut graph = FunctionGraph::new("wb_residual_setfield");
+        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let entry = graph.startblock;
+        let fnaddr = graph
+            .push_op_var(
+                entry,
+                OpKind::ConstFnAddr {
+                    value: 1,
+                    path: "pyre_object::gc_hook::try_gc_write_barrier".to_string(),
+                    symbolic: true,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::CallResidual {
+                funcptr: CallFuncPtr::Value(fnaddr),
+                descriptor: CallDescriptor::from_signature(
+                    &[majit_ir::value::Type::Ref],
+                    majit_ir::value::Type::Int,
+                    EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::None),
+                ),
+                args_i: vec![],
+                args_r: vec![obj.clone()],
+                args_f: vec![],
+                result_kind: 'i',
+                indirect_targets: None,
+            },
+            false,
+        );
+        graph.push_op_var(entry, OpKind::live(), false);
+        graph.push_op_var(entry, wb_store(&obj, &stored), false);
+        drop_guarded_gc_write_barriers(&mut graph);
+        let kinds = &graph.blocks[entry.0].operations;
+        assert!(matches!(kinds[0].kind, OpKind::ConstFnAddr { .. }));
+        assert!(
+            matches!(kinds[1].kind, OpKind::ConstBool(true)),
+            "residual barrier stayed {:?}",
+            kinds[1].kind
+        );
+        assert!(matches!(kinds[2].kind, OpKind::Live { .. }));
+        assert!(matches!(kinds[3].kind, OpKind::FieldWrite { .. }));
+    }
+
+    fn residual_wb(
+        fnaddr: crate::flowspace::model::Variable,
+        obj: &crate::flowspace::model::Variable,
+    ) -> OpKind {
+        OpKind::CallResidual {
+            funcptr: CallFuncPtr::Value(fnaddr),
+            descriptor: CallDescriptor::from_signature(
+                &[majit_ir::value::Type::Ref],
+                majit_ir::value::Type::Int,
+                EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::None),
+            ),
+            args_i: vec![],
+            args_r: vec![obj.clone()],
+            args_f: vec![],
+            result_kind: 'i',
+            indirect_targets: None,
+        }
+    }
+
+    /// Charon puts every Call as a MIR terminator, so the gctransform
+    /// same-block `gc_writebarrier` + `setfield` pair is two FunctionGraph
+    /// blocks joined by Goto. Flatten concatenates them; the drop must
+    /// follow that unique fall-through (`rewrite.py
+    /// handle_write_barrier_setfield`).
+    #[test]
+    fn gc_write_barrier_before_store_in_fallthrough_block_is_dropped() {
+        let mut graph = FunctionGraph::new("wb_fallthrough");
+        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let entry = graph.startblock;
+        graph.push_op_var(entry, wb_call(&obj, "try_gc_write_barrier"), false);
+        let store_block = graph.create_block();
+        graph.push_op_var(store_block, wb_store(&obj, &stored), false);
+        graph.set_goto(entry, store_block, vec![]);
+        drop_guarded_gc_write_barriers(&mut graph);
+        assert!(matches!(
+            graph.blocks[entry.0].operations[0].kind,
+            OpKind::ConstBool(true)
+        ));
+        assert!(matches!(
+            graph.blocks[store_block.0].operations[0].kind,
+            OpKind::FieldWrite { .. }
+        ));
+    }
+
+    /// `jtransform.py handle_residual_call` leaves `ConstFnAddr` +
+    /// `residual_call` + `-live-` as the last ops of the barrier's block;
+    /// the lowered `setfield_gc_r` is the fall-through successor.
+    #[test]
+    fn gc_write_barrier_residual_before_setfield_in_next_block_is_dropped() {
+        let mut graph = FunctionGraph::new("wb_residual_fallthrough");
+        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let entry = graph.startblock;
+        let fnaddr = graph
+            .push_op_var(
+                entry,
+                OpKind::ConstFnAddr {
+                    value: 1,
+                    path: "pyre_object::gc_hook::try_gc_write_barrier".to_string(),
+                    symbolic: true,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(entry, residual_wb(fnaddr, &obj), false);
+        graph.push_op_var(entry, OpKind::live(), false);
+        let store_block = graph.create_block();
+        graph.push_op_var(store_block, wb_store(&obj, &stored), false);
+        graph.set_goto(entry, store_block, vec![]);
+        drop_guarded_gc_write_barriers(&mut graph);
+        let kinds = &graph.blocks[entry.0].operations;
+        assert!(matches!(kinds[0].kind, OpKind::ConstFnAddr { .. }));
+        assert!(
+            matches!(kinds[1].kind, OpKind::ConstBool(true)),
+            "residual barrier stayed {:?}",
+            kinds[1].kind
+        );
+        assert!(matches!(kinds[2].kind, OpKind::Live { .. }));
+        assert!(matches!(
+            graph.blocks[store_block.0].operations[0].kind,
+            OpKind::FieldWrite { .. }
+        ));
+    }
+
+    /// A can-raise barrier's normal successor (`exits[0].exitcase is None`)
+    /// is still the unique fall-through (`flowspace/model.py Block.canraise`).
+    #[test]
+    fn gc_write_barrier_before_store_on_last_exception_normal_exit_is_dropped() {
+        let mut graph = FunctionGraph::new("wb_canraise_fallthrough");
+        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let etype = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let evalue = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let entry = graph.startblock;
+        graph.push_op_var(entry, wb_call(&obj, "try_gc_write_barrier"), false);
+        let store_block = graph.create_block();
+        graph.push_op_var(store_block, wb_store(&obj, &stored), false);
+        let normal = crate::model::Link::from_variables(&graph, vec![], store_block, None);
+        let except = crate::model::Link::from_variables(
+            &graph,
+            vec![etype, evalue],
+            graph.exceptblock,
+            None,
+        );
+        graph.set_control_flow_metadata(
+            entry,
+            Some(ExitSwitch::LastException),
+            vec![normal, except],
+        );
+        drop_guarded_gc_write_barriers(&mut graph);
+        assert!(matches!(
+            graph.blocks[entry.0].operations[0].kind,
+            OpKind::ConstBool(true)
+        ));
+    }
+
+    /// A bool switch is not a unique fall-through: the store on one arm is
+    /// not the gctransform "immediately following" setfield.
+    #[test]
+    fn gc_write_barrier_before_switched_store_stays_residual() {
+        let mut graph = FunctionGraph::new("wb_switch");
+        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let cond = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let entry = graph.startblock;
+        graph.push_op_var(entry, wb_call(&obj, "try_gc_write_barrier"), false);
+        let store_block = graph.create_block();
+        let other = graph.create_block();
+        graph.push_op_var(store_block, wb_store(&obj, &stored), false);
+        let false_link = crate::model::Link::from_variables(
+            &graph,
+            vec![],
+            other,
+            Some(crate::model::ExitCase::Bool(false)),
+        );
+        let true_link = crate::model::Link::from_variables(
+            &graph,
+            vec![],
+            store_block,
+            Some(crate::model::ExitCase::Bool(true)),
+        );
+        graph.set_control_flow_metadata(
+            entry,
+            Some(ExitSwitch::Value(cond)),
+            vec![false_link, true_link],
+        );
+        drop_guarded_gc_write_barriers(&mut graph);
+        assert!(is_wb_call(&graph.blocks[entry.0].operations[0].kind));
     }
 
     /// `rtuple.py TupleRepr.newtuple`: a non-empty tuple lowers to
