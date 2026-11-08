@@ -42,6 +42,7 @@ const NON_SUM_ID: u64 = 9;
 const LEAK_SINK_ID: u64 = 10;
 const LEAK_ID: u64 = 11;
 const RETHROW_ID: u64 = 12;
+const FROM_FN_ID: u64 = 13;
 
 fn carrier_spec() -> crate::ErrorCarrierSpec<'static> {
     crate::ErrorCarrierSpec {
@@ -254,7 +255,13 @@ fn opaque(id: u64, name: &str, inputs: Vec<Value>, output: Value) -> Value {
     })
 }
 
-fn parse_llbc(types: Vec<Value>, funs: Vec<Value>, globals: Vec<Value>) -> Llbc {
+fn parse_llbc(
+    types: Vec<Value>,
+    funs: Vec<Value>,
+    globals: Vec<Value>,
+    traits: Vec<Value>,
+    impls: Vec<Value>,
+) -> Llbc {
     let file = json!({
         "charon_version": "0.1.201",
         "has_errors": false,
@@ -263,11 +270,31 @@ fn parse_llbc(types: Vec<Value>, funs: Vec<Value>, globals: Vec<Value>) -> Llbc 
             "type_decls": types,
             "fun_decls": funs,
             "global_decls": globals,
-            "trait_decls": [],
-            "trait_impls": []
+            "trait_decls": traits,
+            "trait_impls": impls
         }
     });
     Llbc::from_slice(file.to_string().as_bytes()).expect("exception sum fixture parses")
+}
+
+/// `{"Value": [id, Adt]}` so `resolve_tyexpr_to_adt_def_id_free` sees the decl.
+fn hashed_adt(id: u64) -> Value {
+    json!({"Value": [id, adt_ref(id)]})
+}
+
+fn from_fn_meta() -> Value {
+    json!({
+        "name": [
+            {"Ident": ["fixture", 0]},
+            {"Ident": ["synth", 0]},
+            {"Impl": {"Trait": 0}},
+            {"Ident": ["from", 0]}
+        ],
+        "span": span(),
+        "source_text": null,
+        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+        "is_local": false
+    })
 }
 
 fn result_of(ok: &Value, err: &Value) -> Value {
@@ -774,15 +801,41 @@ fn fixture() -> Llbc {
             caller,
             own,
             non_sum,
-            opaque(LEAK_SINK_ID, "exception_sum_leak_sink", vec![s], u.clone()),
+            opaque(
+                LEAK_SINK_ID,
+                "exception_sum_leak_sink",
+                vec![s.clone()],
+                u.clone(),
+            ),
             leak,
             rethrow,
+            json!({
+                "def_id": FROM_FN_ID,
+                "item_meta": from_fn_meta(),
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [e.clone()],
+                    "output": s.clone()
+                },
+                "body": "Opaque"
+            }),
         ],
         vec![marker(
             0,
             &["fixture", "synth", "_exception_class_E"],
             "C(B)",
         )],
+        vec![json!({
+            "def_id": 0,
+            "item_meta": meta(&["core", "convert", "From"], false)
+        })],
+        vec![json!({
+            "impl_trait": {
+                "id": 0,
+                "generics": {"types": [hashed_adt(S_ID), hashed_adt(E_ID)]}
+            },
+            "methods": [{"skip_binder": {"id": FROM_FN_ID}}]
+        })],
     )
 }
 
@@ -1298,24 +1351,34 @@ fn exception_sum_selector_raises() {
         describe_raises(&graph),
         graph.dump()
     );
-    assert_eq!(
-        fields.len(),
-        1,
-        "{}\n{}",
-        describe_raises(&graph),
-        graph.dump()
-    );
     assert!(
-        err_arg_leaf_is_e(&fields[0]),
-        "k residual owner {}\n{}",
-        fields[0],
+        fields.is_empty(),
+        "a different error is From::from, not the Err field ({fields:?})\n{}",
         graph.dump()
     );
-    assert_eq!(others, 1, "{}\n{}", describe_raises(&graph), graph.dump());
+    assert_eq!(others, 2, "{}\n{}", describe_raises(&graph), graph.dump());
     let leafs = call_leafs(&graph);
     assert!(
         leafs.iter().any(|leaf| leaf == "exception_sum_k"),
         "k call missing {leafs:?}\n{}",
+        graph.dump()
+    );
+    assert_eq!(
+        leafs.iter().filter(|leaf| leaf.as_str() == "from").count(),
+        1,
+        "From::from once {leafs:?}\n{}",
+        graph.dump()
+    );
+    assert!(
+        !leafs.iter().any(|leaf| leaf == "from_residual"),
+        "from_residual remains {leafs:?}\n{}",
+        graph.dump()
+    );
+    assert!(
+        !leafs
+            .iter()
+            .any(|leaf| leaf == "to_exc_object" || leaf == "pyerror_to_exc_object"),
+        "conversion runs after the front {leafs:?}\n{}",
         graph.dump()
     );
     assert_eq!(
@@ -1324,7 +1387,6 @@ fn exception_sum_selector_raises() {
         "{leafs:?}\n{}",
         graph.dump()
     );
-    assert_no_forbidden_leafs(&graph);
     assert_no_sum_ctor(&graph);
     assert!(graph.return_type.is_none(), "{:?}", graph.return_type);
     assert!(
@@ -1556,12 +1618,12 @@ fn exception_sum_own_raise_skips_exc_conversion() {
 }
 
 #[test]
-fn exception_sum_err_payload_field_read_skips_exc_conversion() {
+fn exception_sum_unclassed_from_and_carrier_convert() {
     let llbc = fixture();
     let mut graph = lower_named(&llbc, "exception_sum_f");
     let before = fresh_raises(&graph);
     let mut ctor = None;
-    let mut field = None;
+    let mut from_result = None;
     let mut carrier = None;
     for var in &before {
         match classify(&graph, var.clone()) {
@@ -1571,18 +1633,19 @@ fn exception_sum_err_payload_field_read_skips_exc_conversion() {
                 ctor = Some(var.clone());
             }
             Raised::Field { owner } => {
-                assert!(
-                    err_arg_leaf_is_e(&owner),
-                    "k residual owner {owner}\n{}",
-                    graph.dump()
-                );
-                field = Some(var.clone());
+                panic!("Err field raised as itself ({owner})\n{}", graph.dump())
             }
-            Raised::Other => carrier = Some(var.clone()),
+            Raised::Other => {
+                if from_call_arg_is_err_field(&graph, var) {
+                    from_result = Some(var.clone());
+                } else {
+                    carrier = Some(var.clone());
+                }
+            }
         }
     }
     let ctor = ctor.expect("own ctor raise");
-    let field = field.expect("Err payload field read");
+    let from_result = from_result.expect("From::from raise");
     let carrier = carrier.expect("carrier raise");
     apply_runtime_edges(&mut graph, &llbc);
     let after = fresh_raises(&graph);
@@ -1592,8 +1655,8 @@ fn exception_sum_err_payload_field_read_skips_exc_conversion() {
         graph.dump()
     );
     assert!(
-        after.iter().any(|var| var == &field),
-        "field-read raise converted\n{}",
+        !after.iter().any(|var| var == &from_result),
+        "unclassed From result stayed a fresh raise\n{}",
         graph.dump()
     );
     assert!(
@@ -1608,13 +1671,36 @@ fn exception_sum_err_payload_field_read_skips_exc_conversion() {
         describe_raises(&graph),
         graph.dump()
     );
-    assert!(
-        after
+    assert_eq!(
+        call_leafs(&graph)
             .iter()
-            .any(|var| raise_call_leaf(&graph, var) == Some("to_exc_object")),
-        "carrier materialisation missing\n{}",
+            .filter(|leaf| leaf.as_str() == "to_exc_object")
+            .count(),
+        2,
+        "From result and carrier both materialise\n{}",
         graph.dump()
     );
+}
+
+fn from_call_arg_is_err_field(graph: &FunctionGraph, var: &Variable) -> bool {
+    let Some(OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        args,
+        ..
+    }) = producing(graph, var)
+    else {
+        return false;
+    };
+    if segments.last().map(String::as_str) != Some("from") {
+        return false;
+    }
+    let Some(arg) = args.first().and_then(LinkArg::as_variable) else {
+        return false;
+    };
+    match classify(graph, arg.clone()) {
+        Raised::Field { owner } => err_arg_leaf_is_e(&owner),
+        _ => false,
+    }
 }
 
 #[test]
@@ -1659,22 +1745,6 @@ fn exception_sum_handler_reraise_skips_exc_conversion() {
         graph.dump()
     );
     assert_no_forbidden_leafs(&graph);
-}
-
-fn raise_call_leaf(graph: &FunctionGraph, var: &Variable) -> Option<&'static str> {
-    let kind = producing(graph, &follow_same_as(graph, var.clone()))?;
-    let OpKind::Call {
-        target: CallTarget::FunctionPath { segments, .. },
-        ..
-    } = kind
-    else {
-        return None;
-    };
-    match segments.last().map(String::as_str) {
-        Some("to_exc_object") => Some("to_exc_object"),
-        Some("pyerror_to_exc_object") => Some("pyerror_to_exc_object"),
-        _ => None,
-    }
 }
 
 #[test]
@@ -1735,4 +1805,115 @@ fn exception_sum_value_use_unsupported() {
         err,
         "unsupported MIR: exception sum fixture::synth::S used as a value"
     );
+}
+
+fn fn_ptr_result(
+    llbc: &Llbc,
+    output: Value,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    let ty = TyRef::Other(json!({
+        "FnPtr": {
+            "skip_binder": {
+                "inputs": [],
+                "output": output,
+                "is_unsafe": false
+            }
+        }
+    }));
+    super::lltype::func_type_from_fn_ptr_ty(&ty, llbc, carrier_spec())
+        .expect("fn pointer")
+        .result
+}
+
+fn i64_ty() -> Value {
+    json!({"Scalar": {"Integer": {"Signed": "I64"}}})
+}
+
+fn f64_ty() -> Value {
+    json!({"Scalar": {"Float": "F64"}})
+}
+
+fn unit_ty() -> Value {
+    json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    })
+}
+
+#[test]
+fn fn_ptr_result_of_exception_sum_is_the_ok_payload() {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+
+    let llbc = fixture();
+    assert_eq!(
+        fn_ptr_result(&llbc, result_of(&i64_ty(), &adt_ref(S_ID))),
+        LowLevelType::Signed,
+        "Result<i64, S> returns the Ok payload (`getfunctionptr`)"
+    );
+    assert_eq!(
+        fn_ptr_result(&llbc, result_of(&f64_ty(), &adt_ref(CARRIER_ID))),
+        LowLevelType::Float,
+        "Result<f64, PyError> stays the carrier payload"
+    );
+    assert_eq!(
+        fn_ptr_result(&llbc, result_of(&unit_ty(), &adt_ref(CARRIER_ID))),
+        LowLevelType::Void,
+        "Result<(), PyError> stays Void"
+    );
+    assert_eq!(
+        fn_ptr_result(&llbc, result_of(&i64_ty(), &adt_ref(T_ID))),
+        OBJECTPTR.clone(),
+        "Result<i64, T> is not a sum and stays the ADT"
+    );
+}
+
+#[test]
+fn from_into_the_sum_uses_declaration_identity() {
+    let llbc = fixture();
+    let conv = super::lltype::from_impl_conversion_declared(
+        &llbc,
+        "synth::S",
+        "fixture::synth::S",
+        "synth::E",
+    )
+    .expect("From<E> for S");
+    assert_eq!(conv.segments.last().map(String::as_str), Some("from"));
+    assert!(
+        conv.segments
+            .iter()
+            .any(|seg| super::is_trait_impl_identity_segment(seg)),
+        "{:?}",
+        conv.segments
+    );
+    assert!(conv.pass_payload);
+    let qualified = super::lltype::from_impl_conversion_declared(
+        &llbc,
+        "synth::S",
+        "fixture::synth::S",
+        "fixture::synth::E",
+    )
+    .expect("crate-qualified E is the same declaration");
+    assert_eq!(qualified.segments, conv.segments);
+    for missing in ["other::E", "module::E", "E"] {
+        let err = super::lltype::from_impl_conversion_declared(
+            &llbc,
+            "synth::S",
+            "fixture::synth::S",
+            missing,
+        )
+        .expect_err(missing);
+        assert!(
+            err.contains(missing) && err.contains("no From impl"),
+            "{missing}: {err}"
+        );
+    }
 }

@@ -7175,10 +7175,15 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             );
             let mut conversions = Vec::with_capacity(foreign_sites.len());
             for site in &foreign_sites {
+                let conversion = if let Some(sum) = exception_sum.as_ref() {
+                    from_impl_conversion_declared(lo.llbc, &sum.identity, &sum.path, &site.error_ty)
+                } else {
+                    from_impl_conversion(lo.llbc, carrier.carrier_path, &site.error_ty)
+                };
                 conversions.push(
-                    from_impl_conversion(lo.llbc, carrier.carrier_path, &site.error_ty).map_err(
-                        |err| LowerError::Unsupported(format!("{}: {err}", lo.graph.name)),
-                    )?,
+                    conversion.map_err(|err| {
+                        LowerError::Unsupported(format!("{}: {err}", lo.graph.name))
+                    })?,
                 );
             }
             crate::front::result_exc::apply_foreign_from_residuals(

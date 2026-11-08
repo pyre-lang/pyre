@@ -1726,20 +1726,54 @@ pub(in crate::front::mir) fn input_param_value_type(
 /// registers, so `from` stays a `FunctionPath` (it is an associated
 /// function; a `CallTarget::Method` would bind the argument as the
 /// receiver). Zero matches and several matches both decline: raising
-/// the foreign payload would skip `From::from`.
+/// the foreign payload would skip `From::from`. Carrier matching is
+/// [`same_type_spelling`] on the rendered types.
 pub(in crate::front::mir) fn from_impl_conversion(
     llbc: &Llbc,
     carrier_path: &str,
     error_ty: &str,
 ) -> Result<crate::front::result_exc::FromResidualConversion, String> {
     use crate::front::result_exc::same_type_spelling;
+    from_impl_conversions(llbc, carrier_path, error_ty, &|llbc, self_ty, arg_ty| {
+        let self_rendered = charon_type_value_to_ast_string(self_ty, llbc, 0);
+        let arg_rendered = charon_type_value_to_ast_string(arg_ty, llbc, 0);
+        same_type_spelling(&self_rendered, carrier_path)
+            && same_type_spelling(&arg_rendered, error_ty)
+    })
+}
+
+/// `From::from` into an exception sum, matched by declaration identity.
+///
+/// Self and the argument resolve to TypeDecls. [`names_declared_type`]
+/// compares those declarations with the sum and with `error_ty`. A
+/// rendered leaf is not a match: `other::E` and `module::E` stay apart,
+/// and a type that does not resolve to a decl does not match. Zero
+/// matches and several matches both decline.
+pub(in crate::front::mir) fn from_impl_conversion_declared(
+    llbc: &Llbc,
+    sum_identity: &str,
+    sum_path: &str,
+    error_ty: &str,
+) -> Result<crate::front::result_exc::FromResidualConversion, String> {
+    from_impl_conversions(llbc, sum_identity, error_ty, &|llbc, self_ty, arg_ty| {
+        type_json_names_declaration(llbc, self_ty, sum_identity, sum_path)
+            && type_json_is_named_by(llbc, arg_ty, error_ty)
+    })
+}
+
+fn from_impl_conversions(
+    llbc: &Llbc,
+    target: &str,
+    error_ty: &str,
+    matches_impl: &dyn Fn(&Llbc, &serde_json::Value, &serde_json::Value) -> bool,
+) -> Result<crate::front::result_exc::FromResidualConversion, String> {
     let from_id = llbc
         .iter_trait_decls()
         .find(|decl| decl.item_meta.name_path() == "core::convert::From")
         .map(|decl| decl.def_id);
     let Some(from_id) = from_id else {
         return Err(format!(
-            "core::convert::From is absent, so {error_ty} cannot convert into {carrier_path}"
+            "core::convert::From is absent, so {error_ty} cannot convert into {target}"
         ));
     };
     let mut found = Vec::new();
@@ -1763,11 +1797,7 @@ pub(in crate::front::mir) fn from_impl_conversion(
         let (Some(self_ty), Some(arg_ty)) = (types.first(), types.get(1)) else {
             continue;
         };
-        let self_rendered = charon_type_value_to_ast_string(self_ty, llbc, 0);
-        let arg_rendered = charon_type_value_to_ast_string(arg_ty, llbc, 0);
-        if !same_type_spelling(&self_rendered, carrier_path)
-            || !same_type_spelling(&arg_rendered, error_ty)
-        {
+        if !matches_impl(llbc, self_ty, arg_ty) {
             continue;
         }
         let Some(methods) = row.get("methods").and_then(serde_json::Value::as_array) else {
@@ -1814,13 +1844,64 @@ pub(in crate::front::mir) fn from_impl_conversion(
     }
     match found.len() {
         1 => Ok(found.remove(0)),
-        0 => Err(format!(
-            "no From impl converts {error_ty} into {carrier_path}"
-        )),
+        0 => Err(format!("no From impl converts {error_ty} into {target}")),
         _ => Err(format!(
-            "several From impls convert {error_ty} into {carrier_path}"
+            "several From impls convert {error_ty} into {target}"
         )),
     }
+}
+
+/// ADT def id of a trait-impl type argument, through the hash-cons
+/// wrappers [`charon_type_value_to_ast_string`] follows. `None` when the
+/// argument is not a nominal ADT.
+fn adt_def_id_of_type_json(llbc: &Llbc, ty: &serde_json::Value) -> Option<u64> {
+    if let Some(id) = resolve_tyexpr_to_adt_def_id_free(llbc, ty) {
+        return Some(id);
+    }
+    let obj = ty.as_object()?;
+    if let Some(arr) = obj
+        .get("HashConsedValue")
+        .and_then(serde_json::Value::as_array)
+        && arr.len() == 2
+    {
+        return adt_def_id_of_type_json(llbc, &arr[1]);
+    }
+    adt_node_def_id(ty)
+}
+
+fn type_decl_identity(llbc: &Llbc, def_id: u64) -> Option<(String, String)> {
+    let td = llbc.type_by_id(def_id)?;
+    let path = td.item_meta.name_path();
+    let identity = class_identity_spelling(&path, &tombstoned_leaves_of(llbc));
+    Some((identity, path))
+}
+
+/// `ty` resolves to the declaration stored as `identity` / `path`.
+fn type_json_names_declaration(
+    llbc: &Llbc,
+    ty: &serde_json::Value,
+    identity: &str,
+    path: &str,
+) -> bool {
+    let Some(def_id) = adt_def_id_of_type_json(llbc, ty) else {
+        return false;
+    };
+    let Some((decl_identity, decl_path)) = type_decl_identity(llbc, def_id) else {
+        return false;
+    };
+    crate::front::result_exc::names_declared_type(&decl_identity, &decl_path, identity)
+        || crate::front::result_exc::names_declared_type(&decl_identity, &decl_path, path)
+}
+
+/// `query` names the declaration `ty` resolves to.
+fn type_json_is_named_by(llbc: &Llbc, ty: &serde_json::Value, query: &str) -> bool {
+    let Some(def_id) = adt_def_id_of_type_json(llbc, ty) else {
+        return false;
+    };
+    let Some((decl_identity, decl_path)) = type_decl_identity(llbc, def_id) else {
+        return false;
+    };
+    crate::front::result_exc::names_declared_type(&decl_identity, &decl_path, query)
 }
 
 /// Detect a trait-default body — a function whose penultimate NameSeg
@@ -7981,7 +8062,9 @@ pub(crate) fn stamp_fn_ptr_spelling(
     let (carrier, handle) = exception_carrier_keys_from_spec(error_carrier);
     let is_carrier =
         |e: &str| exception_carrier_type_spelling_keys(e, carrier.as_deref(), handle.as_deref());
-    let Some(ft) = func_type_from_fn_spelling(spelling, &is_carrier) else {
+    // Spelling has no TypeDecl, so it cannot see an exception sum. The
+    // Charon `FnPtr` path (`func_type_from_fn_ptr_ty`) peels those.
+    let Some(ft) = func_type_from_fn_spelling(spelling, &is_carrier, &|_| false) else {
         return;
     };
     stamp_func_type(var, ft);
@@ -8046,7 +8129,11 @@ fn fn_ptr_tyref_to_lltype(
     use crate::translator::rtyper::cutover::valuetype_to_lltype;
     use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
     use crate::translator::rtyper::rclass::OBJECTPTR;
-    if crate::front::result_exc::tyref_is_result_of_carrier(ty, llbc, error_carrier)
+    // `getfunctionptr` builds `FuncType` from `graph.getreturnvar().concretetype`,
+    // the return after the exception transform. A carrier `Result` and an
+    // exception-sum `Result` both return the Ok payload. Any other `Result`
+    // stays the ADT (`OBJECTPTR` for a class pointer).
+    if crate::front::result_exc::tyref_lowers_as_result_exc(ty, llbc, error_carrier)
         && let Some(ok) = crate::front::result_exc::tyref_result_ok(ty, llbc)
     {
         return fn_ptr_tyref_to_lltype(&ok, llbc, error_carrier);

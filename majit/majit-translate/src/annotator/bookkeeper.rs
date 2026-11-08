@@ -7006,9 +7006,11 @@ pub(crate) fn fn_ptr_somevalue_for_spelling_in(
     bk: Option<&Bookkeeper>,
 ) -> Option<SomeValue> {
     use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
-    let ft = func_type_from_fn_spelling(spelling, &|e| {
-        bk.is_some_and(|bk| bk.exception_carrier_type_spelling(e))
-    })?;
+    let ft = func_type_from_fn_spelling(
+        spelling,
+        &|e| bk.is_some_and(|bk| bk.exception_carrier_type_spelling(e)),
+        &|_| false,
+    )?;
     Some(SomeValue::Ptr(super::model::SomePtr::new(Ptr {
         TO: PtrTarget::Func(ft),
     })))
@@ -7025,11 +7027,17 @@ fn empty_functype() -> crate::translator::rtyper::lltypesystem::lltype::FuncType
 /// `FuncType` of a Rust fn-pointer spelling. One Rust `fn` type is one
 /// `FuncType` (`lltype.py` `FuncType` / `getfunctionptr`), whether the
 /// producer is a parameter seed, a field read, or a reified fn item.
-/// `is_carrier` is the exception-carrier test (`exception_carrier_type_spelling`)
-/// so a `Result<T, E>` payload peels when `E` is that carrier.
+/// `is_carrier` peels `Result<T, E>` when `E` is the exception carrier.
+/// `is_exception_sum` peels when `E` is an exception sum. That predicate
+/// is declaration identity (`exception_class_enum_path_matches`), the
+/// comparison `names_declared_type` uses. A leaf compare is not it.
+/// `FuncType.RESULT` is then `valuetype_to_lltype` of `T`
+/// (`getfunctionptr` of `graph.getreturnvar().concretetype` after the
+/// exception transform).
 pub(crate) fn func_type_from_fn_spelling(
     spelling: &str,
     is_carrier: &dyn Fn(&str) -> bool,
+    is_exception_sum: &dyn Fn(&str) -> bool,
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::FuncType> {
     use crate::translator::rtyper::lltypesystem::lltype::FuncType;
     let t = spelling.trim();
@@ -7062,7 +7070,7 @@ pub(crate) fn func_type_from_fn_spelling(
         crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void
     } else {
         let ret = after.strip_prefix("->")?;
-        fn_ptr_result_lltype(ret.trim(), is_carrier)
+        fn_ptr_result_lltype(ret.trim(), is_carrier, is_exception_sum)
     };
     Some(FuncType { args, result })
 }
@@ -7122,16 +7130,23 @@ fn peel_ref_and_ptr_prefixes(spelling: &str) -> &str {
 }
 
 /// Ok payload of `Result<T, E>` when `E` is the exception carrier
-/// (`tyref_is_result_of_carrier`). Other `Result` types stay the ADT;
+/// (`tyref_is_result_of_carrier`) or an exception sum
+/// (`tyref_lowers_as_result_exc`). `is_exception_sum` is declaration
+/// identity, not a leaf compare. Any other `Result` stays the ADT;
 /// `FuncType.RESULT` is then `valuetype_to_lltype` of that payload,
 /// matching `getcallable` / `getfunctionptr`.
 fn result_ok_of_exception_carrier<'a>(
     spelling: &'a str,
     is_carrier: &dyn Fn(&str) -> bool,
+    is_exception_sum: &dyn Fn(&str) -> bool,
 ) -> Option<&'a str> {
     let args = spelling.trim().strip_prefix("Result<")?.strip_suffix('>')?;
     let parts = split_generic_args(args);
-    if parts.len() == 2 && is_carrier(parts[1].trim()) {
+    if parts.len() != 2 {
+        return None;
+    }
+    let err = parts[1].trim();
+    if is_carrier(err) || is_exception_sum(err) {
         Some(parts[0].trim())
     } else {
         None
@@ -7177,16 +7192,17 @@ fn fn_ptr_arg_lltype(
 /// set `FuncType.RESULT` to the callee return variable's lltype
 /// (`bindingrepr(v).lowleveltype`); `valuetype_to_lltype` is that
 /// projection from the return `ValueType`. A `Result<T, E>` whose `E` is
-/// the exception carrier is the residual-call payload `T`
-/// (`tyref_is_result_of_carrier`).
+/// the exception carrier or an exception sum is the residual-call payload
+/// `T` (`tyref_lowers_as_result_exc`).
 fn fn_ptr_result_lltype(
     spelling: &str,
     is_carrier: &dyn Fn(&str) -> bool,
+    is_exception_sum: &dyn Fn(&str) -> bool,
 ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
     use crate::model::ValueType;
     use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
-    if let Some(ok) = result_ok_of_exception_carrier(spelling, is_carrier) {
-        return fn_ptr_result_lltype(ok, is_carrier);
+    if let Some(ok) = result_ok_of_exception_carrier(spelling, is_carrier, is_exception_sum) {
+        return fn_ptr_result_lltype(ok, is_carrier, is_exception_sum);
     }
     let t = spelling.trim();
     if t == "()" {
@@ -8557,6 +8573,44 @@ mod tests {
                 result: LowLevelType::Signed,
             }),
             "carrier Result<i64, E> is Signed (`valuetype_to_lltype` of the payload)"
+        );
+
+        let is_synth_s = |err: &str| {
+            crate::front::llbc_hints::exception_class_enum_path_matches("synth::S", err)
+        };
+        let sum_signed = |spelling: &str| {
+            func_type_from_fn_spelling(spelling, &|_| false, &is_synth_s)
+                .unwrap_or_else(|| panic!("{spelling} is a fn pointer"))
+                .result
+        };
+        assert_eq!(
+            sum_signed("fn() -> Result<i64, synth::S>"),
+            LowLevelType::Signed,
+            "an exception sum returns the Ok payload (`getfunctionptr`)"
+        );
+        assert_eq!(
+            sum_signed("fn() -> Result<i64, fixture::synth::S>"),
+            LowLevelType::Signed,
+            "the crate-qualified path is the same declaration"
+        );
+        assert_eq!(
+            sum_signed("fn() -> Result<i64, other::S>"),
+            OBJECTPTR.clone(),
+            "another module's S is not this sum"
+        );
+        assert_eq!(
+            func_type_from_fn_spelling("fn() -> Result<i64, Plain>", &|_| false, &|_| false)
+                .expect("plain Result is a fn pointer")
+                .result,
+            OBJECTPTR.clone(),
+            "a non-sum non-carrier ADT error stays OBJECTPTR"
+        );
+        assert_eq!(
+            func_type_from_fn_spelling("fn() -> Result<i64, synth::S>", &|_| false, &|_| false)
+                .expect("sum spelling without the predicate")
+                .result,
+            OBJECTPTR.clone(),
+            "the carrier predicate does not treat a sum as the carrier"
         );
     }
 

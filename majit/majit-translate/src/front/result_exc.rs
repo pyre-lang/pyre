@@ -346,7 +346,7 @@ pub(crate) fn exception_sum_claims_error(
 /// query. A bare leaf with no registered origin does not match. The
 /// bookkeeper's `intern_class_key` unique-suffix resolution needs the
 /// field registry, which this front does not have.
-fn names_declared_type(identity: &str, path: &str, query: &str) -> bool {
+pub(crate) fn names_declared_type(identity: &str, path: &str, query: &str) -> bool {
     if query.is_empty() {
         return false;
     }
@@ -1242,11 +1242,17 @@ fn disc_switch_base(graph: &FunctionGraph, block: usize) -> Option<Variable> {
 /// `__cast_instance_intrinsic`). A non-carrier `Result` payload read is
 /// `__pos_0` of that cast, not of the forwarded shell
 /// (`enum_payload_class` in `resolve_place`).
-fn value_aliases(graph: &FunctionGraph, mut var: Variable, base: &Variable) -> bool {
-    for _ in 0..8 {
+fn value_aliases(graph: &FunctionGraph, var: &Variable, base: &Variable) -> bool {
+    let mut var = var.clone();
+    let mut seen = Vec::new();
+    loop {
         if &var == base {
             return true;
         }
+        if seen.iter().any(|have| have == &var) {
+            return false;
+        }
+        seen.push(var.clone());
         let Some(kind) = producing_op(graph, &var) else {
             return false;
         };
@@ -1267,11 +1273,10 @@ fn value_aliases(graph: &FunctionGraph, mut var: Variable, base: &Variable) -> b
         };
         var = next;
     }
-    false
 }
 
 fn switched_on(graph: &FunctionGraph, block: usize, expected: &Variable) -> bool {
-    disc_switch_base(graph, block).is_some_and(|base| value_aliases(graph, base, expected))
+    disc_switch_base(graph, block).is_some_and(|base| value_aliases(graph, &base, expected))
 }
 
 fn pos0_read_var(graph: &FunctionGraph, block: usize, base: &Variable) -> Option<Variable> {
@@ -1283,39 +1288,284 @@ fn pos0_read_var(graph: &FunctionGraph, block: usize, base: &Variable) -> Option
                 base: read_base,
                 field,
                 ..
-            } if field.name == "__pos_0" && value_aliases(graph, read_base.clone(), base) => {
+            } if field.name == "__pos_0" && value_aliases(graph, read_base, base) => {
                 op.result.clone()
             }
             _ => None,
         })
 }
 
-fn isinstance_split(graph: &FunctionGraph, block: usize) -> Option<(String, usize, usize)> {
-    let class_name = graph.blocks[block].operations.iter().find_map(|op| {
-        let OpKind::IsInstance { class_carrier, .. } = &op.kind else {
-            return None;
-        };
-        let OpKind::ConstRef(obj) = producing_op(graph, class_carrier)? else {
-            return None;
-        };
-        Some(obj.simple_name().to_string())
-    })?;
-    let mut true_target = None;
-    let mut false_target = None;
-    for link in &graph.blocks[block].exits {
-        match &link.exitcase {
-            Some(ExitCase::Bool(true)) => true_target = Some(link.target.0),
-            Some(ExitCase::Bool(false)) => false_target = Some(link.target.0),
-            _ => return None,
-        }
-    }
-    Some((class_name, true_target?, false_target?))
+fn block_has_isinstance(graph: &FunctionGraph, block: usize) -> bool {
+    graph.blocks[block]
+        .operations
+        .iter()
+        .any(|op| matches!(op.kind, OpKind::IsInstance { .. }))
 }
 
-fn skip_pure_forwards(graph: &FunctionGraph, mut block: usize) -> usize {
-    for _ in 0..8 {
-        if isinstance_split(graph, block).is_some() {
-            return block;
+fn producer_in_block<'a>(
+    graph: &'a FunctionGraph,
+    block: usize,
+    var: &Variable,
+) -> Option<&'a OpKind> {
+    graph.blocks[block]
+        .operations
+        .iter()
+        .find_map(|op| (op.result.as_ref() == Some(var)).then_some(&op.kind))
+}
+
+fn aliases_var(graph: &FunctionGraph, var: &Variable, base: &Variable) -> bool {
+    var == base || value_aliases(graph, var, base) || value_aliases(graph, base, var)
+}
+
+/// `var` is a tracked sum / exception value, or a `__pos_0` /
+/// `__discriminant` / identity view of one produced in `block`.
+fn value_is_sum_view(
+    graph: &FunctionGraph,
+    block: usize,
+    var: &Variable,
+    roots: &[Variable],
+    seen: &mut Vec<Variable>,
+) -> bool {
+    if seen.iter().any(|have| have == var) {
+        return false;
+    }
+    seen.push(var.clone());
+    if roots
+        .iter()
+        .any(|root| var == root || value_aliases(graph, var, root))
+    {
+        return true;
+    }
+    let Some(kind) = producer_in_block(graph, block, var) else {
+        return false;
+    };
+    match kind {
+        OpKind::FieldRead { base, field, .. }
+            if field.name == "__pos_0" || field.name == "__discriminant" =>
+        {
+            value_is_sum_view(graph, block, base, roots, seen)
+        }
+        OpKind::UnaryOp { op, operand, .. } if op == "same_as" || op == "cast_pointer" => {
+            value_is_sum_view(graph, block, operand, roots, seen)
+        }
+        OpKind::Call { args, .. }
+            if crate::model::cast_instance_root(kind).is_some()
+                || crate::model::cast_pointer_root(kind).is_some() =>
+        {
+            args.first()
+                .and_then(LinkArg::as_variable)
+                .is_some_and(|arg| value_is_sum_view(graph, block, arg, roots, seen))
+        }
+        _ => false,
+    }
+}
+
+fn forward_var(graph: &FunctionGraph, var: &Variable, link: &Link) -> Option<Variable> {
+    if let Some(bound) = forward_alias(graph, var, link) {
+        return Some(bound);
+    }
+    let inputs = &graph.blocks[link.target.0].inputargs;
+    for (index, arg) in link.args.iter().enumerate() {
+        let LinkArg::Value(arg) = arg else {
+            continue;
+        };
+        if aliases_var(graph, arg, var) {
+            return inputs.get(index).cloned();
+        }
+    }
+    None
+}
+
+/// Follow `exc` across `link`. A `__pos_0` of it that the link carries
+/// is the variant payload (the caught exception); a later hop does not
+/// narrow again, so a field of that exception stays a field.
+fn forward_exception(
+    graph: &FunctionGraph,
+    block: usize,
+    exc: Option<Variable>,
+    link: &Link,
+    narrow_payload: bool,
+) -> (Option<Variable>, bool) {
+    let Some(current) = exc else {
+        return (None, narrow_payload);
+    };
+    if narrow_payload
+        && let Some(payload) = pos0_read_var(graph, block, &current)
+        && let Some(next) = forward_var(graph, &payload, link)
+    {
+        return (Some(next), false);
+    }
+    if let Some(next) = forward_var(graph, &current, link) {
+        return (Some(next), narrow_payload);
+    }
+    (None, narrow_payload)
+}
+
+fn push_bypassed(bypassed: &mut Vec<(usize, Vec<Variable>)>, block: usize, roots: Vec<Variable>) {
+    if let Some((_, existing)) = bypassed.iter_mut().find(|(have, _)| *have == block) {
+        for root in roots {
+            if !existing.iter().any(|have| have == &root) {
+                existing.push(root);
+            }
+        }
+        return;
+    }
+    bypassed.push((block, roots));
+}
+
+fn tests_caught_exception(
+    graph: &FunctionGraph,
+    block: usize,
+    obj: &Variable,
+    caught: &Variable,
+) -> bool {
+    if aliases_var(graph, obj, caught) {
+        return true;
+    }
+    pos0_read_var(graph, block, caught).is_some_and(|payload| aliases_var(graph, obj, &payload))
+}
+
+/// `set_branch` switches on `op.bool(isinstance)` (`flowcontext.py`
+/// `op.bool(w_value).eval`). The test is the `IsInstance`; the bool is
+/// only that hop.
+fn exitswitch_selects_isinstance(
+    graph: &FunctionGraph,
+    switch_var: &Variable,
+    isinstance_result: &Variable,
+) -> bool {
+    if switch_var == isinstance_result {
+        return true;
+    }
+    match producing_op(graph, switch_var) {
+        Some(OpKind::UnaryOp { op, operand, .. })
+            if op == "bool" && operand == isinstance_result =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+struct InstanceSplit {
+    class_name: String,
+    tested: Variable,
+    true_link: Link,
+    false_link: Link,
+}
+
+/// `IsInstance` is a handler test when it tests the caught payload and
+/// this block's exitswitch is that result (`InstanceRepr.rtype_isinstance`
+/// keeps both operands and its own branch).
+fn isinstance_split(
+    graph: &FunctionGraph,
+    block: usize,
+    caught: Option<&Variable>,
+) -> Result<Option<InstanceSplit>, String> {
+    let ops = &graph.blocks[block].operations;
+    let tests: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter_map(|(index, op)| matches!(op.kind, OpKind::IsInstance { .. }).then_some(index))
+        .collect();
+    if tests.is_empty() {
+        return Ok(None);
+    }
+    let Some(ExitSwitch::Value(switch_var)) = graph.blocks[block].exitswitch.clone() else {
+        return Err(format!(
+            "isinstance in block {block} is not the block exitswitch"
+        ));
+    };
+    let driving = tests.iter().copied().find(|index| {
+        ops[*index]
+            .result
+            .as_ref()
+            .is_some_and(|result| exitswitch_selects_isinstance(graph, &switch_var, result))
+    });
+    let Some(driving) = driving else {
+        return Err(format!(
+            "isinstance in block {block} is not the block exitswitch"
+        ));
+    };
+    if tests.len() != 1 {
+        return Err(format!(
+            "isinstance in block {block} is not the block exitswitch"
+        ));
+    }
+    let OpKind::IsInstance {
+        obj, class_carrier, ..
+    } = &ops[driving].kind
+    else {
+        return Err(format!(
+            "isinstance in block {block} is not the block exitswitch"
+        ));
+    };
+    let Some(caught) = caught else {
+        return Err(format!(
+            "isinstance in block {block} does not test the caught exception"
+        ));
+    };
+    if !tests_caught_exception(graph, block, obj, caught) {
+        return Err(format!(
+            "isinstance in block {block} does not test the caught exception"
+        ));
+    }
+    let class_name = match producing_op(graph, class_carrier) {
+        Some(OpKind::ConstRef(class_obj)) => class_obj.simple_name().to_string(),
+        _ => {
+            return Err(format!("isinstance in block {block} has no class constant"));
+        }
+    };
+    if graph.blocks[block].exits.len() != 2 {
+        return Err(format!(
+            "isinstance in block {block} is not the block exitswitch"
+        ));
+    }
+    let mut true_link = None;
+    let mut false_link = None;
+    for link in &graph.blocks[block].exits {
+        match &link.exitcase {
+            Some(ExitCase::Bool(true)) => true_link = Some(link.clone()),
+            Some(ExitCase::Bool(false)) => false_link = Some(link.clone()),
+            _ => {
+                return Err(format!(
+                    "isinstance in block {block} is not the block exitswitch"
+                ));
+            }
+        }
+    }
+    let Some(true_link) = true_link else {
+        return Err(format!(
+            "isinstance in block {block} is not the block exitswitch"
+        ));
+    };
+    let Some(false_link) = false_link else {
+        return Err(format!(
+            "isinstance in block {block} is not the block exitswitch"
+        ));
+    };
+    Ok(Some(InstanceSplit {
+        class_name,
+        tested: obj.clone(),
+        true_link,
+        false_link,
+    }))
+}
+
+fn skip_pure_forwards_tracking(
+    graph: &FunctionGraph,
+    mut block: usize,
+    mut exc: Option<Variable>,
+    mut narrow_payload: bool,
+    bypassed: &mut Vec<(usize, Vec<Variable>)>,
+) -> Result<(usize, Option<Variable>), String> {
+    let mut seen = Vec::new();
+    loop {
+        if seen.contains(&block) {
+            return Err(format!("exception sum forward revisits block {block}"));
+        }
+        seen.push(block);
+        if block_has_isinstance(graph, block) {
+            return Ok((block, exc));
         }
         let body = &graph.blocks[block];
         let pure = body.operations.iter().all(|op| match &op.kind {
@@ -1323,13 +1573,17 @@ fn skip_pure_forwards(graph: &FunctionGraph, mut block: usize) -> usize {
             OpKind::UnaryOp { op, .. } => op == "same_as",
             _ => false,
         });
-        if pure && body.exits.len() == 1 && body.exitswitch.is_none() {
-            block = body.exits[0].target.0;
-            continue;
+        if !(pure && body.exits.len() == 1 && body.exitswitch.is_none()) {
+            return Ok((block, exc));
         }
-        return block;
+        let link = body.exits[0].clone();
+        let roots = exc.iter().cloned().collect();
+        push_bypassed(bypassed, block, roots);
+        let (next_exc, still_narrow) = forward_exception(graph, block, exc, &link, narrow_payload);
+        exc = next_exc;
+        narrow_payload = still_narrow;
+        block = link.target.0;
     }
-    block
 }
 
 fn marked_class_known(payload: &ExceptionSumPayload, class_name: &str) -> bool {
@@ -1370,41 +1624,93 @@ fn marked_class_host(payload: &ExceptionSumPayload, class_name: &str) -> Option<
         .map(|(_, _, host)| host.clone())
 }
 
+struct ClassArm {
+    host: HostObject,
+    target: usize,
+    /// The caught exception in `target`'s namespace, when the link binds it.
+    caught: Option<Variable>,
+}
+
+fn forward_tested(
+    graph: &FunctionGraph,
+    tested: &Variable,
+    also: &Option<Variable>,
+    link: &Link,
+) -> Option<Variable> {
+    if let Some(bound) = forward_var(graph, tested, link) {
+        return Some(bound);
+    }
+    also.as_ref()
+        .filter(|current| *current != tested)
+        .and_then(|current| forward_var(graph, current, link))
+}
+
 fn cascade_class_handlers(
     graph: &FunctionGraph,
     start: usize,
     payload: &ExceptionSumPayload,
-) -> Result<Vec<(HostObject, usize)>, String> {
+    exc: Option<Variable>,
+    bypassed: &mut Vec<(usize, Vec<Variable>)>,
+) -> Result<Vec<ClassArm>, String> {
     let ExceptionSumPayload::Marked { base_class, .. } = payload else {
         return Err("exception sum carrier arm has no class cascade".to_string());
     };
-    let mut block = skip_pure_forwards(graph, start);
+    let (mut block, mut exc) = skip_pure_forwards_tracking(graph, start, exc, true, bypassed)?;
     let mut handlers = Vec::new();
-    for _ in 0..8 {
-        if let Some((name, true_target, false_target)) = isinstance_split(graph, block) {
-            if !marked_class_known(payload, &name) {
-                return Err(format!(
-                    "isinstance class {name} is not a variant of the exception sum"
-                ));
-            }
-            let Some(host) = marked_class_host(payload, &name) else {
-                return Err(format!(
-                    "exception sum handler class {name} has no class object"
-                ));
-            };
-            handlers.push((host, true_target));
-            block = skip_pure_forwards(graph, false_target);
-            continue;
+    let mut seen = Vec::new();
+    loop {
+        if seen.contains(&block) {
+            return Err(format!("exception class cascade revisits block {block}"));
         }
-        let Some(host) = marked_class_host(payload, base_class) else {
-            return Err(format!(
-                "exception sum handler class {base_class} has no class object"
-            ));
-        };
-        handlers.push((host, block));
-        return Ok(handlers);
+        seen.push(block);
+        match isinstance_split(graph, block, exc.as_ref())? {
+            Some(split) => {
+                if !marked_class_known(payload, &split.class_name) {
+                    return Err(format!(
+                        "isinstance class {} is not a variant of the exception sum",
+                        split.class_name
+                    ));
+                }
+                let Some(host) = marked_class_host(payload, &split.class_name) else {
+                    return Err(format!(
+                        "exception sum handler class {} has no class object",
+                        split.class_name
+                    ));
+                };
+                let roots = exc.iter().cloned().collect();
+                push_bypassed(bypassed, block, roots);
+                let caught = forward_tested(graph, &split.tested, &exc, &split.true_link);
+                handlers.push(ClassArm {
+                    host,
+                    target: split.true_link.target.0,
+                    caught,
+                });
+                let next_exc = forward_tested(graph, &split.tested, &exc, &split.false_link);
+                let (next, next_exc) = skip_pure_forwards_tracking(
+                    graph,
+                    split.false_link.target.0,
+                    next_exc,
+                    false,
+                    bypassed,
+                )?;
+                block = next;
+                exc = next_exc;
+            }
+            None => {
+                let Some(host) = marked_class_host(payload, base_class) else {
+                    return Err(format!(
+                        "exception sum handler class {base_class} has no class object"
+                    ));
+                };
+                handlers.push(ClassArm {
+                    host,
+                    target: block,
+                    caught: exc,
+                });
+                return Ok(handlers);
+            }
+        }
     }
-    Err("exception class cascade did not end".to_string())
 }
 
 fn result_err_reaches_return(graph: &FunctionGraph, block: usize) -> bool {
@@ -1422,37 +1728,99 @@ fn result_err_reaches_return(graph: &FunctionGraph, block: usize) -> bool {
     })
 }
 
-fn block_calls_into(graph: &FunctionGraph, block: usize) -> bool {
-    graph.blocks[block]
-        .operations
-        .iter()
-        .any(|op| match &op.kind {
-            OpKind::Call {
-                target: CallTarget::Method { name, .. },
-                ..
-            } => name == "into",
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } => segments.last().map(String::as_str) == Some("into"),
-            _ => false,
-        })
+fn call_target_is_into(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::Method { name, .. } => name == "into",
+        CallTarget::FunctionPath { segments, .. } => {
+            segments.last().map(String::as_str) == Some("into")
+        }
+        _ => false,
+    }
 }
 
-fn carrier_arm_reraises(graph: &FunctionGraph, start: usize) -> bool {
+/// `Some(operand)` when `kind` is a call named `into`. The operand is
+/// missing when the call has no variable argument.
+fn into_operand<'a>(kind: &'a OpKind) -> Option<Option<&'a Variable>> {
+    let OpKind::Call { target, args, .. } = kind else {
+        return None;
+    };
+    if !call_target_is_into(target) {
+        return None;
+    }
+    Some(args.first().and_then(LinkArg::as_variable))
+}
+
+fn into_aliases_caught(
+    graph: &FunctionGraph,
+    block: usize,
+    caught: Option<&Variable>,
+    operand: &Variable,
+) -> bool {
+    let narrowed = caught.and_then(|current| pos0_read_var(graph, block, current));
+    caught.is_some_and(|current| aliases_var(graph, operand, current))
+        || narrowed
+            .as_ref()
+            .is_some_and(|current| aliases_var(graph, operand, current))
+}
+
+/// `Ok(true)` when this block has an identity `into` of the caught
+/// value. A call named `into` whose argument is not that value (or its
+/// alias) is not a reraise.
+fn identity_into(
+    graph: &FunctionGraph,
+    block: usize,
+    caught: Option<&Variable>,
+) -> Result<bool, String> {
+    let mut found = false;
+    for op in &graph.blocks[block].operations {
+        let Some(operand) = into_operand(&op.kind) else {
+            continue;
+        };
+        found = true;
+        let aliases =
+            operand.is_some_and(|operand| into_aliases_caught(graph, block, caught, operand));
+        if !aliases {
+            return Err(format!(
+                "exception sum carrier arm reraises through {}, which is not the caught value",
+                op_kind_brief(&op.kind)
+            ));
+        }
+    }
+    Ok(found)
+}
+
+fn carrier_arm_reraises(
+    graph: &FunctionGraph,
+    start: usize,
+    mut caught: Option<Variable>,
+) -> Result<bool, String> {
     let mut block = start;
-    for _ in 0..6 {
-        if result_err_reaches_return(graph, block) || block_calls_into(graph, block) {
-            return true;
+    let mut seen = Vec::new();
+    let mut narrow_payload = true;
+    let mut reraises = false;
+    loop {
+        if seen.contains(&block) {
+            return Ok(reraises);
+        }
+        seen.push(block);
+        if identity_into(graph, block, caught.as_ref())? {
+            reraises = true;
+        }
+        if result_err_reaches_return(graph, block) {
+            reraises = true;
         }
         let body = &graph.blocks[block];
         if body.exits.len() == 1 && body.exitswitch.is_none() {
-            block = body.exits[0].target.0;
+            let link = body.exits[0].clone();
+            let (next, still_narrow) =
+                forward_exception(graph, block, caught, &link, narrow_payload);
+            caught = next;
+            narrow_payload = still_narrow;
+            block = link.target.0;
             continue;
         }
-        return false;
+        return Ok(reraises);
     }
-    false
 }
 
 struct SumHandlerPlan {
@@ -1471,26 +1839,30 @@ struct SumMatchPlan {
     handlers: Vec<SumHandlerPlan>,
 }
 
+/// `guessexception` passes `last_exc_value` on the exception link. That
+/// value is the one the cascade tested, or the one the match link bound.
+/// An input that is neither, and that does not reach the call, is not a
+/// caught exception. A handler that does not bind it has no such argument.
 fn plan_handler_args(
     graph: &FunctionGraph,
     handler: usize,
     call_block: usize,
+    caught: Option<&Variable>,
 ) -> Result<Vec<Option<LinkArg>>, String> {
     let mut args = Vec::new();
-    let mut missed = 0usize;
     for input in &graph.blocks[handler].inputargs {
+        if caught.is_some_and(|caught| aliases_var(graph, input, caught)) {
+            args.push(None);
+            continue;
+        }
         match back_sub_arg_to(graph, handler, LinkArg::Value(input.clone()), call_block) {
             Some(arg) => args.push(Some(arg)),
             None => {
-                missed += 1;
-                args.push(None);
+                return Err(format!(
+                    "handler block {handler} binds {input}, which is not the caught exception"
+                ));
             }
         }
-    }
-    if missed != 1 {
-        return Err(format!(
-            "handler block {handler} binds {missed} caught values, expected 1"
-        ));
     }
     Ok(args)
 }
@@ -1516,31 +1888,123 @@ fn map_sum_switch_arms(
         .map(|(index, _)| index)
         .collect();
     let mut arms = Vec::new();
+    let mut saw_default = false;
     for link in exits {
-        let index = match &link.exitcase {
-            Some(ExitCase::Const(ConstValue::Int(disc))) => sum
-                .variants
-                .iter()
-                .position(|variant| variant.discriminant == *disc)
-                .ok_or_else(|| {
-                    format!("exception sum switch discriminant {disc} has no variant")
-                })?,
+        match &link.exitcase {
+            Some(ExitCase::Const(ConstValue::Int(disc))) => {
+                let index = sum
+                    .variants
+                    .iter()
+                    .position(|variant| variant.discriminant == *disc)
+                    .ok_or_else(|| {
+                        format!("exception sum switch discriminant {disc} has no variant")
+                    })?;
+                arms.push((index, link.clone()));
+            }
             Some(ExitCase::Const(ConstValue::UniStr(label))) if label == "default" => {
-                if missing.len() != 1 {
-                    return Err(format!(
-                        "exception sum switch default covers {} variants",
-                        missing.len()
-                    ));
+                if saw_default {
+                    return Err("exception sum switch has a second default".to_string());
                 }
-                missing[0]
+                saw_default = true;
+                if missing.is_empty() {
+                    return Err("exception sum switch default covers 0 variants".to_string());
+                }
+                // One default link is the handler for every variant it
+                // covers. Each variant still has to plan as its own handler.
+                for index in &missing {
+                    arms.push((*index, link.clone()));
+                }
             }
             other => {
                 return Err(format!("exception sum switch exit {other:?}"));
             }
-        };
-        arms.push((index, link.clone()));
+        }
     }
     Ok(arms)
+}
+
+fn bypassed_op_name(kind: &OpKind) -> String {
+    match kind {
+        OpKind::FieldRead { field, .. } => format!("FieldRead({})", field.name),
+        OpKind::FieldWrite { field, .. } => format!("FieldWrite({})", field.name),
+        other => op_kind_brief(other),
+    }
+}
+
+fn bypass_op_allowed(
+    graph: &FunctionGraph,
+    block: usize,
+    index: usize,
+    roots: &[Variable],
+) -> bool {
+    let op = &graph.blocks[block].operations[index];
+    let mut seen = Vec::new();
+    match &op.kind {
+        OpKind::FieldRead { base, field, .. }
+            if field.name == "__pos_0" || field.name == "__discriminant" =>
+        {
+            value_is_sum_view(graph, block, base, roots, &mut seen)
+        }
+        OpKind::UnaryOp { op, operand, .. } if op == "same_as" || op == "cast_pointer" => {
+            value_is_sum_view(graph, block, operand, roots, &mut seen)
+        }
+        OpKind::UnaryOp { op, operand, .. } if op == "bool" => {
+            let Some(OpKind::IsInstance { obj, .. }) = producer_in_block(graph, block, operand)
+            else {
+                return false;
+            };
+            value_is_sum_view(graph, block, obj, roots, &mut Vec::new())
+        }
+        OpKind::Call { args, .. }
+            if crate::model::cast_instance_root(&op.kind).is_some()
+                || crate::model::cast_pointer_root(&op.kind).is_some() =>
+        {
+            args.first()
+                .and_then(LinkArg::as_variable)
+                .is_some_and(|arg| value_is_sum_view(graph, block, arg, roots, &mut seen))
+        }
+        OpKind::IsInstance { obj, .. } => value_is_sum_view(graph, block, obj, roots, &mut seen),
+        OpKind::ConstRef(_) => {
+            let Some(result) = op.result.as_ref() else {
+                return false;
+            };
+            graph.blocks[block].operations.iter().any(|other| {
+                let OpKind::IsInstance {
+                    obj, class_carrier, ..
+                } = &other.kind
+                else {
+                    return false;
+                };
+                class_carrier == result
+                    && value_is_sum_view(graph, block, obj, roots, &mut Vec::new())
+            })
+        }
+        _ => false,
+    }
+}
+
+/// `ExceptionTransformer.transform_block` only `split_block`s. A block
+/// this installer unlinks may contain the discriminant read, the
+/// `__pos_0` payload read, `same_as` and the identity casts
+/// `value_aliases` already follows, and the `isinstance` cascade
+/// (`ConstRef`, `IsInstance`, `op.bool`). The recognized reraise tail
+/// (`return Err` / identity `into`) is the handler arm, not one of
+/// these blocks.
+fn reject_bypassed_block(
+    graph: &FunctionGraph,
+    block: usize,
+    roots: &[Variable],
+) -> Result<(), String> {
+    for (index, op) in graph.blocks[block].operations.iter().enumerate() {
+        if bypass_op_allowed(graph, block, index, roots) {
+            continue;
+        }
+        return Err(format!(
+            "exception sum match bypasses {} in block {block}",
+            bypassed_op_name(&op.kind)
+        ));
+    }
+    Ok(())
 }
 
 fn plan_exception_sum_match(
@@ -1563,8 +2027,8 @@ fn plan_exception_sum_match(
     let err_block = err_link.target.0;
     let payload_read = pos0_read_var(graph, err_block, &err_shell)
         .ok_or_else(|| format!("{name}: exception sum Err arm lacks the __pos_0 read"))?;
-    let sum_block = if switched_on(graph, err_block, &payload_read) {
-        err_block
+    let (sum_block, sum_value) = if switched_on(graph, err_block, &payload_read) {
+        (err_block, payload_read.clone())
     } else {
         let (next, bound) = follow_single_exit(graph, err_block, &payload_read).map_err(|err| {
             format!("{name}: exception sum payload does not reach its switch ({err})")
@@ -1574,16 +2038,23 @@ fn plan_exception_sum_match(
                 "{name}: exception sum payload is not switched on its discriminant"
             ));
         }
-        next
+        (next, bound)
     };
+    let mut bypassed = Vec::new();
+    push_bypassed(&mut bypassed, switch_block, vec![shell.clone()]);
+    push_bypassed(&mut bypassed, err_block, vec![err_shell.clone()]);
+    if sum_block != err_block {
+        push_bypassed(&mut bypassed, sum_block, vec![sum_value.clone()]);
+    }
     let variant_arms = map_sum_switch_arms(graph, sum_block, sum)?;
     let mut handlers = Vec::new();
     for (index, link) in variant_arms {
         let payload = &sum.variants[index].payload;
         let arm = link.target.0;
+        let caught = forward_var(graph, &sum_value, &link);
         match payload {
             ExceptionSumPayload::Carrier => {
-                if carrier_arm_reraises(graph, arm) {
+                if carrier_arm_reraises(graph, arm, caught.clone())? {
                     handlers.push(SumHandlerPlan {
                         class_host: None,
                         reraise: true,
@@ -1591,22 +2062,29 @@ fn plan_exception_sum_match(
                         args: Vec::new(),
                     });
                 } else {
-                    let handler = skip_pure_forwards(graph, arm);
+                    let (handler, caught) =
+                        skip_pure_forwards_tracking(graph, arm, caught, true, &mut bypassed)?;
                     handlers.push(SumHandlerPlan {
                         class_host: None,
                         reraise: false,
                         target: crate::model::BlockId(handler),
-                        args: plan_handler_args(graph, handler, call_block)?,
+                        args: plan_handler_args(graph, handler, call_block, caught.as_ref())?,
                     });
                 }
             }
             ExceptionSumPayload::Marked { .. } => {
-                for (host, handler) in cascade_class_handlers(graph, arm, payload)? {
+                for class_arm in cascade_class_handlers(graph, arm, payload, caught, &mut bypassed)?
+                {
                     handlers.push(SumHandlerPlan {
-                        class_host: Some(host),
+                        class_host: Some(class_arm.host),
                         reraise: false,
-                        target: crate::model::BlockId(handler),
-                        args: plan_handler_args(graph, handler, call_block)?,
+                        target: crate::model::BlockId(class_arm.target),
+                        args: plan_handler_args(
+                            graph,
+                            class_arm.target,
+                            call_block,
+                            class_arm.caught.as_ref(),
+                        )?,
                     });
                 }
             }
@@ -1640,6 +2118,21 @@ fn plan_exception_sum_match(
                 format!("{name}: exception sum Ok arm value is not defined at the call")
             })?;
         ok_args.push(arg);
+    }
+    let mut kept = vec![
+        ok_block,
+        graph.returnblock.0,
+        graph.exceptblock.0,
+        call_block,
+    ];
+    for handler in &handlers {
+        kept.push(handler.target.0);
+    }
+    for (block, roots) in &bypassed {
+        if kept.contains(block) {
+            continue;
+        }
+        reject_bypassed_block(graph, *block, roots)?;
     }
     // Class arms stay in the caller's case order. The carrier arm is the
     // last exception link (`guessexception` lists the classes, then the
@@ -1762,27 +2255,14 @@ fn sum_from_residual_forwards(graph: &FunctionGraph, result: &Variable) -> bool 
 struct ResidualRaisePlan {
     value: Variable,
     delete: Option<SumCtorLoc>,
-    /// `Break` stored `Result<Infallible, E>`. Read `__pos_0` of
-    /// [`Self::read_base`] and raise that; `From` is the identity.
+    /// `Break` stored `Result<Infallible, E>` when that residual is already
+    /// this sum. Read `__pos_0` of [`Self::read_base`] and raise that value.
     shell: Option<PeeledBreakShell>,
     read_base: Variable,
     /// Minted base class of the raised instance, when the plan knows it.
     /// Absent for the carrier and for a value whose class is not a
     /// marked variant.
     class_name: Option<String>,
-}
-
-fn marked_base_for_error(sum: &ExceptionSum, error_ty: &str) -> Option<String> {
-    sum.variants
-        .iter()
-        .find_map(|variant| match &variant.payload {
-            ExceptionSumPayload::Marked {
-                enum_path,
-                base_class,
-                ..
-            } if names_declared_type(enum_path, base_class, error_ty) => Some(base_class.clone()),
-            _ => None,
-        })
 }
 
 /// The `__pos_0` read of `::Err` / `::Break` that [`residual_payload`]
@@ -1840,24 +2320,27 @@ fn plan_sum_residual_raise(
     };
     match residual_payload(graph, arg, spec.carrier_path, spec.carrier_wrappers) {
         Ok(ResidualPayload::Foreign { error_ty, shell }) => {
+            // Already this sum: reraise the instance. A local `S::Variant`
+            // ctor still peels to its payload. A different error type is
+            // not that instance — `From::from` has to have been recorded
+            // first (`SimpleCall.eval`), and wrapping the payload in a
+            // variant is not that call.
             if names_declared_type(&sum.identity, &sum.path, &error_ty) {
-                let loc =
-                    peel_sum_ctor_from(graph, arg, sum).ok_or_else(|| sum_used_as_value(sum))?;
-                let inner = loc.inner.clone();
-                return Ok(planned(inner, Some(loc), None));
-            }
-            if let Some(base) = marked_base_for_error(sum, &error_ty) {
+                if let Some(loc) = peel_sum_ctor_from(graph, arg, sum) {
+                    let inner = loc.inner.clone();
+                    return Ok(planned(inner, Some(loc), None));
+                }
                 if shell.is_some() {
                     return Ok(ResidualRaisePlan {
                         value: arg.clone(),
                         delete: None,
                         shell,
                         read_base: read_base.clone(),
-                        class_name: Some(base),
+                        class_name: None,
                     });
                 }
                 let value = residual_field_var(graph, arg).unwrap_or_else(|| arg.clone());
-                return Ok(planned(value, None, Some(base)));
+                return Ok(planned(value, None, None));
             }
             Err(format!(
                 "from_residual would raise {error_ty} without From::from"
@@ -4989,10 +5472,14 @@ fn residual_payload(
 /// `OperationError`. `FromResidual<Option<Infallible>>` (Option `?`)
 /// is the extracted `core::option::<Impl>::from_residual` body (`None`).
 ///
-/// Residuals an enclosing exception sum already raises are skipped.
-/// `From<E> for S` is the identity on the instance, and a same-type or
-/// carrier residual is a reraise / the existing carrier propagation —
-/// none of them calls `From::from`.
+/// A residual whose error type already names this sum (declaration
+/// identity, [`names_declared_type`]) is a reraise of that value, so
+/// `From::from` is not inserted. A marked payload and another declaration
+/// with the same leaf are not that sum: the caller resolves `From<E> for S`
+/// and [`apply_foreign_from_residuals`] records the call. A missing callee
+/// is `Unsupported` at that lookup. The carrier itself never reaches here
+/// (`residual_payload` keeps it). A carrier graph stays method-only; an
+/// enclosing sum also accepts a `FunctionPath` leaf `from_residual`.
 pub(crate) fn foreign_from_residual_sites_in(
     graph: &FunctionGraph,
     spec: crate::ErrorCarrierSpec<'_>,
@@ -5007,7 +5494,12 @@ pub(crate) fn foreign_from_residual_sites_in(
             let Some(result) = op.result.clone() else {
                 continue;
             };
-            if !from_residual_forwards_to_return(graph, &result) {
+            let forwards = if sum.is_some() {
+                sum_from_residual_forwards(graph, &result)
+            } else {
+                from_residual_forwards_to_return(graph, &result)
+            };
+            if !forwards {
                 continue;
             }
             let OpKind::Call { args, .. } = &op.kind else {
@@ -5024,8 +5516,7 @@ pub(crate) fn foreign_from_residual_sites_in(
             let ResidualPayload::Foreign { error_ty, shell } = payload else {
                 continue;
             };
-            if sum.is_some_and(|sum| exception_sum_claims_error(sum, &error_ty, spec.carrier_path))
-            {
+            if sum.is_some_and(|sum| names_declared_type(&sum.identity, &sum.path, &error_ty)) {
                 continue;
             }
             if !from_residual_is_result_residual(&op.kind, &error_ty) {
@@ -5171,10 +5662,12 @@ fn from_residual_forwards_to_return(graph: &FunctionGraph, r: &Variable) -> bool
 /// for `Result` only builds `Err(From::from(e))`, so reminting the call to
 /// `T` feeds a valueless normal edge into `returnblock` and
 /// `func_result_kind` sees `void` against the declared payload kind
-/// (`history.getkind`). When `e` is already the carrier, `From::from` is
-/// the identity and the payload is raised directly. A different error
-/// type is raised only after [`apply_foreign_from_residuals`] has inserted
-/// that `From` impl. `lower_result_exc_returns` already raises `return Err`
+/// (`history.getkind`). An exception-sum residual that already is that
+/// sum is reraised. Any other error type is raised only after
+/// [`apply_foreign_from_residuals`] has inserted `From::from`, and the
+/// raise uses that call's result (`SimpleCall.eval` records the
+/// conversion). When `e` is already the carrier and there is no sum, the
+/// payload is raised directly. `lower_result_exc_returns` already raises `return Err`
 /// the same way (`exceptiontransform.py` `create_exception_handling`).
 ///
 /// Frame-exit cleanups on that tail (root-bracket closes,
@@ -22245,11 +22738,209 @@ mod from_residual_conversion_tests {
         assert_eq!(kept[0].error_ty, "other::E");
 
         let (graph, _) = from_residual_tail("Result<Infallible,module::E>::Err");
-        let claimed = foreign_from_residual_sites_in(&graph, spec(), Some(&sum));
-        assert!(
-            claimed.is_empty(),
-            "the same declaration is already raised, so From is not kept"
+        let payload = foreign_from_residual_sites_in(&graph, spec(), Some(&sum));
+        assert_eq!(
+            payload.len(),
+            1,
+            "a marked payload is not the sum, so From stays"
         );
+        assert_eq!(payload[0].error_ty, "module::E");
+    }
+
+    fn sum_named(identity: &str, path: &str) -> ExceptionSum {
+        ExceptionSum {
+            identity: identity.to_string(),
+            path: path.to_string(),
+            variants: Vec::new(),
+        }
+    }
+
+    fn rewire_as_sum(
+        graph: &mut FunctionGraph,
+        residual: Variable,
+        sum: ExceptionSum,
+    ) -> Result<RewireOutcome, String> {
+        let mut call = ResultExcCall::new(residual, None, ValueType::Ref(None));
+        call.sum = Some(sum);
+        rewire_result_exc_call_sites(graph, &vec![call], false, spec())
+    }
+
+    fn function_path_tail(owner: &str) -> (FunctionGraph, Variable) {
+        let mut graph = FunctionGraph::new("from_residual_tail");
+        let base = graph.alloc_value_var();
+        graph.blocks[graph.startblock.0].inputargs = vec![base.clone()];
+        let payload = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new("__pos_0", Some(owner.to_string())),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("payload");
+        let residual = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["fixture", "synth", "from_residual"]),
+                    args: crate::model::call_args(vec![payload]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("from_residual");
+        graph.set_return(graph.startblock, Some(residual.clone()));
+        (graph, residual)
+    }
+
+    fn assert_no_from_call(graph: &FunctionGraph) {
+        assert!(
+            graph.blocks.iter().all(|block| {
+                block
+                    .operations
+                    .iter()
+                    .all(|op| !is_from_impl_call(&op.kind))
+            }),
+            "From::from is not in the graph\n{}",
+            graph.dump()
+        );
+    }
+
+    #[test]
+    fn same_sum_residual_reraises_without_from() {
+        let sum = sum_named("synth::S", "fixture::synth::S");
+        for owner in [
+            "Result<Infallible,synth::S>::Err",
+            "Result<Infallible,fixture::synth::S>::Err",
+        ] {
+            let (mut graph, residual) = from_residual_tail(owner);
+            assert!(
+                foreign_from_residual_sites_in(&graph, spec(), Some(&sum)).is_empty(),
+                "{owner}"
+            );
+            rewire_as_sum(&mut graph, residual, sum.clone()).expect(owner);
+            let arg = raised_carrier(&graph);
+            let Some(OpKind::FieldRead { field, .. }) = producing_op(&graph, &arg) else {
+                panic!(
+                    "{owner}: reraise reads the residual value\n{}",
+                    graph.dump()
+                );
+            };
+            assert_eq!(field.name, "__pos_0");
+            assert!(
+                field
+                    .owner_root
+                    .as_deref()
+                    .is_some_and(|root| root.contains("synth::S")),
+                "{owner} {:?}",
+                field.owner_root
+            );
+            assert_no_from_call(&graph);
+        }
+    }
+
+    #[test]
+    fn different_error_inserts_from_and_raises_its_result() {
+        let (mut graph, residual) = from_residual_tail("Result<Infallible,module::E>::Err");
+        let sum = sum_named("synth::S", "fixture::synth::S");
+        let sites = foreign_from_residual_sites_in(&graph, spec(), Some(&sum));
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].error_ty, "module::E");
+        apply_foreign_from_residuals(
+            &mut graph,
+            &sites,
+            &[FromResidualConversion {
+                segments: from_segments(),
+                pass_payload: true,
+            }],
+        )
+        .expect("splice");
+        rewire_as_sum(&mut graph, residual, sum).expect("converted residual raises");
+        let arg = raised_carrier(&graph);
+        let kind = producing_op(&graph, &arg).expect("From::from");
+        assert!(is_from_impl_call(kind), "{kind:?}");
+        let OpKind::Call { args, .. } = kind else {
+            panic!("raised value is the From call");
+        };
+        let reads = pos0_reads(&graph);
+        assert_eq!(reads.len(), 1);
+        assert_eq!(*args, crate::model::call_args(vec![reads[0].0.clone()]));
+    }
+
+    #[test]
+    fn different_error_without_from_is_unsupported() {
+        let (mut graph, residual) = from_residual_tail("Result<Infallible,module::E>::Err");
+        let err = match rewire_as_sum(
+            &mut graph,
+            residual,
+            sum_named("synth::S", "fixture::synth::S"),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("missing From lowered"),
+        };
+        assert!(
+            err.contains("without From::from") && err.contains("module::E"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn same_leaf_in_another_module_is_not_the_same_sum() {
+        let (graph, _) = from_residual_tail("Result<Infallible,module::S>::Err");
+        assert!(
+            foreign_from_residual_sites_in(
+                &graph,
+                spec(),
+                Some(&sum_named("module::S", "crate_a::module::S"))
+            )
+            .is_empty(),
+            "module::S is that sum"
+        );
+        let other = foreign_from_residual_sites_in(
+            &graph,
+            spec(),
+            Some(&sum_named("other::S", "crate_b::other::S")),
+        );
+        assert_eq!(other.len(), 1, "other::S is a different declaration");
+        assert_eq!(other[0].error_ty, "module::S");
+
+        let synth = sum_named("synth::S", "fixture::synth::S");
+        let (other_graph, _) = from_residual_tail("Result<Infallible,other::S>::Err");
+        let kept = foreign_from_residual_sites_in(&other_graph, spec(), Some(&synth));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].error_ty, "other::S");
+        for owner in [
+            "Result<Infallible,synth::S>::Err",
+            "Result<Infallible,fixture::synth::S>::Err",
+        ] {
+            let (same, _) = from_residual_tail(owner);
+            assert!(
+                foreign_from_residual_sites_in(&same, spec(), Some(&synth)).is_empty(),
+                "{owner}"
+            );
+        }
+        let (bare, _) = from_residual_tail("Result<Infallible,S>::Err");
+        let bare_sites = foreign_from_residual_sites_in(&bare, spec(), Some(&synth));
+        assert_eq!(bare_sites.len(), 1, "a bare leaf is not the declaration");
+        assert_eq!(bare_sites[0].error_ty, "S");
+    }
+
+    #[test]
+    fn sum_collects_function_path_from_residual_of_a_different_error() {
+        let (graph, _) = function_path_tail("Result<Infallible,module::E>::Err");
+        assert!(
+            foreign_from_residual_sites_in(&graph, spec(), None).is_empty(),
+            "a carrier graph does not collect FunctionPath from_residual"
+        );
+        let sum = sum_named("synth::S", "fixture::synth::S");
+        let sites = foreign_from_residual_sites_in(&graph, spec(), Some(&sum));
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].error_ty, "module::E");
+        let (same, _) = function_path_tail("Result<Infallible,synth::S>::Err");
+        assert!(foreign_from_residual_sites_in(&same, spec(), Some(&sum)).is_empty());
     }
 
     #[test]
@@ -25132,5 +25823,622 @@ mod toint_overflow_tests {
         .expect("declined fusion is not a translation error");
         assert_eq!(fused.len(), 0);
         assert_eq!(graph, before, "declined map_err fusion leaves the graph");
+    }
+}
+
+#[cfg(test)]
+mod exception_sum_match_installer_tests {
+    use super::{
+        ExceptionSum, ExceptionSumPayload, ExceptionSumVariant, ResultExcCall,
+        install_exception_sum_match,
+    };
+    use crate::flowspace::model::{ConstValue, Constant, HostObject};
+    use crate::front::llbc_hints::ExceptionClassHint;
+    use crate::model::{
+        BlockId, CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FunctionGraph, Link, LinkArg,
+        OpKind, ValueType,
+    };
+
+    struct OpenMatch {
+        graph: FunctionGraph,
+        result: crate::flowspace::model::Variable,
+        switch: BlockId,
+        shell: crate::flowspace::model::Variable,
+        err: BlockId,
+        err_shell: crate::flowspace::model::Variable,
+    }
+
+    fn read_field(
+        graph: &mut FunctionGraph,
+        block: BlockId,
+        base: crate::flowspace::model::Variable,
+        name: &str,
+    ) -> crate::flowspace::model::Variable {
+        graph
+            .push_op_var(
+                block,
+                OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new(name, None),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect(name)
+    }
+
+    fn seal(graph: &mut FunctionGraph, block: BlockId, tag: i64) {
+        let value = graph
+            .push_op_var(block, OpKind::ConstInt(tag), true)
+            .expect("const");
+        graph.set_return(block, Some(value));
+    }
+
+    fn int_link(
+        graph: &FunctionGraph,
+        args: Vec<crate::flowspace::model::Variable>,
+        target: BlockId,
+        disc: i64,
+    ) -> Link {
+        Link::from_variables(
+            graph,
+            args,
+            target,
+            Some(ExitCase::Const(ConstValue::Int(disc))),
+        )
+    }
+
+    fn default_link(
+        graph: &FunctionGraph,
+        args: Vec<crate::flowspace::model::Variable>,
+        target: BlockId,
+    ) -> Link {
+        Link::from_variables(
+            graph,
+            args,
+            target,
+            Some(ExitCase::Const(ConstValue::UniStr("default".into()))),
+        )
+    }
+
+    fn open_match(name: &str) -> OpenMatch {
+        let mut graph = FunctionGraph::new(name);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["exception_sum_src"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call");
+        let (switch, switch_in) = graph.create_block_with_arg_vars(1);
+        let shell = switch_in[0].clone();
+        let disc = read_field(&mut graph, switch, shell.clone(), "__discriminant");
+        let (ok, _) = graph.create_block_with_arg_vars(0);
+        seal(&mut graph, ok, 0);
+        let (err, err_in) = graph.create_block_with_arg_vars(1);
+        let err_shell = err_in[0].clone();
+        graph.set_goto(graph.startblock, switch, vec![result.clone()]);
+        graph.set_control_flow_metadata(
+            switch,
+            Some(ExitSwitch::Value(disc)),
+            vec![
+                Link::from_variables(
+                    &graph,
+                    vec![],
+                    ok,
+                    Some(ExitCase::Const(ConstValue::Int(0))),
+                ),
+                default_link(&graph, vec![shell.clone()], err),
+            ],
+        );
+        OpenMatch {
+            graph,
+            result,
+            switch,
+            shell,
+            err,
+            err_shell,
+        }
+    }
+
+    fn marked_payload(enum_path: &str, hint: &ExceptionClassHint) -> ExceptionSumPayload {
+        ExceptionSumPayload::Marked {
+            enum_path: enum_path.to_string(),
+            base_class: enum_path.to_string(),
+            base_host: hint.classes.base.clone(),
+            classes: hint
+                .classes
+                .variants
+                .iter()
+                .map(|(name, host)| (name.clone(), format!("{enum_path}::{name}"), host.clone()))
+                .collect(),
+        }
+    }
+
+    fn hint_for(enum_path: &str, variants: &[&str]) -> ExceptionClassHint {
+        ExceptionClassHint::new(
+            enum_path,
+            "",
+            variants.iter().map(|name| (*name).to_string()).collect(),
+        )
+    }
+
+    fn sum_of(variants: Vec<ExceptionSumVariant>) -> ExceptionSum {
+        ExceptionSum {
+            identity: "synth::S".into(),
+            path: "synth::S".into(),
+            variants,
+        }
+    }
+
+    fn one_marked(enum_path: &str, variants: &[&str]) -> (ExceptionClassHint, ExceptionSum) {
+        let hint = hint_for(enum_path, variants);
+        let sum = sum_of(vec![ExceptionSumVariant {
+            name: "Own".into(),
+            discriminant: 0,
+            payload: marked_payload(enum_path, &hint),
+        }]);
+        (hint, sum)
+    }
+
+    fn install(
+        open: &mut OpenMatch,
+        sum: &ExceptionSum,
+    ) -> Result<Option<super::SiteOutcome>, String> {
+        let calls = [ResultExcCall {
+            result: open.result.clone(),
+            suffix: None,
+            payload_ty: ValueType::Int,
+            sum: Some(sum.clone()),
+        }];
+        let call_block = open.graph.startblock.0;
+        install_exception_sum_match(
+            &mut open.graph,
+            call_block,
+            &open.result,
+            &ValueType::Int,
+            &calls,
+            sum,
+        )
+    }
+
+    fn assert_refused(open: &mut OpenMatch, sum: &ExceptionSum, needle: &str) {
+        let before = open.graph.clone();
+        match install(open, sum) {
+            Err(err) => assert!(err.contains(needle), "{err}"),
+            Ok(None) => panic!("exception sum match was not recognized"),
+            Ok(Some(_)) => panic!("exception sum match lowered"),
+        }
+        assert_eq!(open.graph, before, "refusal left the graph changed");
+    }
+
+    fn exit_host(exitcase: &Option<ExitCase>) -> Option<HostObject> {
+        match exitcase {
+            Some(ExitCase::Const(ConstValue::HostObject(host))) => Some(host.clone()),
+            _ => None,
+        }
+    }
+
+    fn call_exits(open: &OpenMatch) -> &Vec<Link> {
+        let block = &open.graph.blocks[open.graph.startblock.0];
+        assert!(
+            matches!(block.exitswitch, Some(ExitSwitch::LastException)),
+            "{:?}",
+            block.exitswitch
+        );
+        &block.exits
+    }
+
+    #[test]
+    fn bypassed_field_write_is_unsupported() {
+        let (_hint, sum) = one_marked("synth::E", &["A"]);
+        let mut open = open_match("field_write");
+        let payload = read_field(&mut open.graph, open.err, open.err_shell.clone(), "__pos_0");
+        let disc = read_field(&mut open.graph, open.err, payload.clone(), "__discriminant");
+        let (handler, _) = open.graph.create_block_with_arg_vars(0);
+        seal(&mut open.graph, handler, 1);
+        open.graph.set_control_flow_metadata(
+            open.err,
+            Some(ExitSwitch::Value(disc)),
+            vec![int_link(&open.graph, vec![], handler, 0)],
+        );
+        open.graph.push_op_var(
+            open.switch,
+            OpKind::FieldWrite {
+                base: open.shell.clone(),
+                field: FieldDescriptor::new("n", None),
+                value: LinkArg::Const(Constant::new(ConstValue::Int(1))),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        assert_refused(&mut open, &sum, "FieldWrite");
+    }
+
+    #[test]
+    fn into_of_unrelated_value_is_not_a_reraise() {
+        let sum = sum_of(vec![ExceptionSumVariant {
+            name: "Carrier".into(),
+            discriminant: 0,
+            payload: ExceptionSumPayload::Carrier,
+        }]);
+        let mut open = open_match("into_unrelated");
+        let payload = read_field(&mut open.graph, open.err, open.err_shell.clone(), "__pos_0");
+        let disc = read_field(&mut open.graph, open.err, payload.clone(), "__discriminant");
+        let (arm, inputs) = open.graph.create_block_with_arg_vars(1);
+        let other = open
+            .graph
+            .push_op_var(arm, OpKind::ConstInt(1), true)
+            .expect("other");
+        open.graph.push_op_var(
+            arm,
+            OpKind::Call {
+                target: CallTarget::method("into", None),
+                args: vec![LinkArg::Value(other)],
+                result_ty: ValueType::Ref(None),
+            },
+            true,
+        );
+        seal(&mut open.graph, arm, 2);
+        let _ = inputs;
+        open.graph.set_control_flow_metadata(
+            open.err,
+            Some(ExitSwitch::Value(disc)),
+            vec![int_link(&open.graph, vec![payload], arm, 0)],
+        );
+        assert_refused(&mut open, &sum, "into");
+        let before = open.graph.clone();
+        let err = match install(&mut open, &sum) {
+            Err(err) => err,
+            Ok(_) => panic!("second install lowered"),
+        };
+        assert!(err.contains("not the caught value"), "{err}");
+        assert_eq!(open.graph, before);
+    }
+
+    #[test]
+    fn into_of_the_caught_value_reraises() {
+        let sum = sum_of(vec![ExceptionSumVariant {
+            name: "Carrier".into(),
+            discriminant: 0,
+            payload: ExceptionSumPayload::Carrier,
+        }]);
+        let mut open = open_match("into_identity");
+        let payload = read_field(&mut open.graph, open.err, open.err_shell.clone(), "__pos_0");
+        let disc = read_field(&mut open.graph, open.err, payload.clone(), "__discriminant");
+        let (arm, inputs) = open.graph.create_block_with_arg_vars(1);
+        let converted = open
+            .graph
+            .push_op_var(
+                arm,
+                OpKind::Call {
+                    target: CallTarget::method("into", None),
+                    args: vec![LinkArg::Value(inputs[0].clone())],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("into");
+        open.graph.set_return(arm, Some(converted));
+        open.graph.set_control_flow_metadata(
+            open.err,
+            Some(ExitSwitch::Value(disc)),
+            vec![int_link(&open.graph, vec![payload], arm, 0)],
+        );
+        assert!(
+            install(&mut open, &sum)
+                .expect("identity into lowers")
+                .is_some(),
+            "identity into was not an exception-sum match"
+        );
+        let exits = call_exits(&open);
+        assert_eq!(exits.len(), 2, "{}", open.graph.dump());
+        let reraise = &exits[1];
+        assert_eq!(reraise.exitcase, Some(crate::model::exception_exitcase()));
+        assert_eq!(reraise.target, open.graph.exceptblock);
+        assert_eq!(reraise.args.len(), 2);
+    }
+
+    #[test]
+    fn isinstance_of_unrelated_object_is_not_a_handler() {
+        let (hint, sum) = one_marked("synth::E", &["A"]);
+        let mut open = open_match("isinstance_unrelated");
+        let payload = read_field(&mut open.graph, open.err, open.err_shell.clone(), "__pos_0");
+        let disc = read_field(&mut open.graph, open.err, payload.clone(), "__discriminant");
+        let (arm, _inputs) = open.graph.create_block_with_arg_vars(1);
+        let (yes, _) = open.graph.create_block_with_arg_vars(0);
+        let (no, _) = open.graph.create_block_with_arg_vars(0);
+        seal(&mut open.graph, yes, 1);
+        seal(&mut open.graph, no, 2);
+        let other = open
+            .graph
+            .push_op_var(arm, OpKind::ConstInt(1), true)
+            .expect("other");
+        let class = open
+            .graph
+            .push_op_var(
+                arm,
+                OpKind::ConstRef(hint.classes.variants[0].1.clone()),
+                true,
+            )
+            .expect("class");
+        let test = open
+            .graph
+            .push_op_var(
+                arm,
+                OpKind::IsInstance {
+                    obj: other,
+                    class_carrier: class,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .expect("isinstance");
+        open.graph.set_branch(arm, test, yes, vec![], no, vec![]);
+        open.graph.set_control_flow_metadata(
+            open.err,
+            Some(ExitSwitch::Value(disc)),
+            vec![int_link(&open.graph, vec![payload], arm, 0)],
+        );
+        assert_refused(&mut open, &sum, "does not test the caught exception");
+    }
+
+    #[test]
+    fn isinstance_exitswitch_must_be_the_test() {
+        let (hint, sum) = one_marked("synth::E", &["A"]);
+        let mut open = open_match("isinstance_exitswitch");
+        let payload = read_field(&mut open.graph, open.err, open.err_shell.clone(), "__pos_0");
+        let disc = read_field(&mut open.graph, open.err, payload.clone(), "__discriminant");
+        let (arm, inputs) = open.graph.create_block_with_arg_vars(1);
+        let (yes, yes_in) = open.graph.create_block_with_arg_vars(1);
+        let (no, no_in) = open.graph.create_block_with_arg_vars(1);
+        seal(&mut open.graph, yes, 1);
+        seal(&mut open.graph, no, 2);
+        let class = open
+            .graph
+            .push_op_var(
+                arm,
+                OpKind::ConstRef(hint.classes.variants[0].1.clone()),
+                true,
+            )
+            .expect("class");
+        open.graph.push_op_var(
+            arm,
+            OpKind::IsInstance {
+                obj: inputs[0].clone(),
+                class_carrier: class,
+                result_ty: ValueType::Bool,
+            },
+            true,
+        );
+        let other = open
+            .graph
+            .push_op_var(arm, OpKind::ConstInt(1), true)
+            .expect("other");
+        open.graph.set_control_flow_metadata(
+            arm,
+            Some(ExitSwitch::Value(other)),
+            vec![
+                Link::from_variables(
+                    &open.graph,
+                    vec![inputs[0].clone()],
+                    no,
+                    Some(ExitCase::Bool(false)),
+                ),
+                Link::from_variables(
+                    &open.graph,
+                    vec![inputs[0].clone()],
+                    yes,
+                    Some(ExitCase::Bool(true)),
+                ),
+            ],
+        );
+        let _ = (yes_in, no_in);
+        open.graph.set_control_flow_metadata(
+            open.err,
+            Some(ExitSwitch::Value(disc)),
+            vec![int_link(&open.graph, vec![payload], arm, 0)],
+        );
+        assert_refused(&mut open, &sum, "exitswitch");
+    }
+
+    #[test]
+    fn handler_that_ignores_the_exception_lowers() {
+        let (hint, sum) = one_marked("synth::E", &["A"]);
+        let mut open = open_match("ignore_exception");
+        let cast = open
+            .graph
+            .push_op_var(
+                open.err,
+                crate::model::cast_instance_call("Result::Err", open.err_shell.clone()),
+                true,
+            )
+            .expect("cast");
+        let payload = read_field(&mut open.graph, open.err, cast, "__pos_0");
+        let disc = read_field(&mut open.graph, open.err, payload, "__discriminant");
+        let (handler, _) = open.graph.create_block_with_arg_vars(0);
+        seal(&mut open.graph, handler, 1);
+        open.graph.set_control_flow_metadata(
+            open.err,
+            Some(ExitSwitch::Value(disc)),
+            vec![default_link(&open.graph, vec![], handler)],
+        );
+        assert!(
+            install(&mut open, &sum)
+                .expect("handler that ignores the exception lowers")
+                .is_some(),
+            "handler that ignores the exception was not an exception-sum match"
+        );
+        let exits = call_exits(&open);
+        assert_eq!(exits.len(), 2, "{}", open.graph.dump());
+        assert!(exits[1].args.is_empty(), "{:?}", exits[1].args);
+        assert!(exits[1].last_exc_value.is_some());
+        assert_eq!(
+            exit_host(&exits[1].exitcase).expect("class").qualname(),
+            hint.classes.base.qualname()
+        );
+    }
+
+    #[test]
+    fn handler_binding_an_untested_value_is_unsupported() {
+        let (_hint, sum) = one_marked("synth::E", &["A"]);
+        let mut open = open_match("untested_binding");
+        let payload = read_field(&mut open.graph, open.err, open.err_shell.clone(), "__pos_0");
+        let disc = read_field(&mut open.graph, open.err, payload, "__discriminant");
+        let (handler, _) = open.graph.create_block_with_arg_vars(1);
+        seal(&mut open.graph, handler, 1);
+        open.graph.set_control_flow_metadata(
+            open.err,
+            Some(ExitSwitch::Value(disc.clone())),
+            vec![int_link(&open.graph, vec![disc], handler, 0)],
+        );
+        assert_refused(&mut open, &sum, "not the caught exception");
+    }
+
+    #[test]
+    fn nine_chained_class_handlers_lower() {
+        const NAMES: [&str; 9] = ["V0", "V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8"];
+        let (hint, sum) = one_marked("synth::E", &NAMES);
+        let mut open = open_match("nine_handlers");
+        let payload = read_field(&mut open.graph, open.err, open.err_shell.clone(), "__pos_0");
+        let disc = read_field(&mut open.graph, open.err, payload.clone(), "__discriminant");
+        let mut tests = Vec::new();
+        for _ in 0..9 {
+            tests.push(open.graph.create_block_with_arg_vars(1));
+        }
+        let mut trues = Vec::new();
+        for _ in 0..9 {
+            trues.push(open.graph.create_block_with_arg_vars(1));
+        }
+        let (terminal, terminal_in) = open.graph.create_block_with_arg_vars(1);
+        seal(&mut open.graph, terminal, 100);
+        for index in 0..9 {
+            let (block, inputs) = &tests[index];
+            let obj = inputs[0].clone();
+            let class = open
+                .graph
+                .push_op_var(
+                    *block,
+                    OpKind::ConstRef(hint.classes.variants[index].1.clone()),
+                    true,
+                )
+                .expect("class");
+            let flag = open
+                .graph
+                .push_op_var(
+                    *block,
+                    OpKind::IsInstance {
+                        obj: obj.clone(),
+                        class_carrier: class,
+                        result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .expect("isinstance");
+            let (true_block, _) = trues[index];
+            seal(&mut open.graph, true_block, index as i64);
+            let (false_block, false_arg) = if index + 1 < 9 {
+                (tests[index + 1].0, tests[index + 1].1[0].clone())
+            } else {
+                (terminal, terminal_in[0].clone())
+            };
+            let _ = false_arg;
+            open.graph.set_branch(
+                *block,
+                flag,
+                true_block,
+                vec![obj.clone()],
+                false_block,
+                vec![obj],
+            );
+        }
+        open.graph.set_control_flow_metadata(
+            open.err,
+            Some(ExitSwitch::Value(disc)),
+            vec![int_link(&open.graph, vec![payload], tests[0].0, 0)],
+        );
+        assert!(
+            install(&mut open, &sum)
+                .expect("nine class handlers lower")
+                .is_some(),
+            "nine class handlers were not an exception-sum match"
+        );
+        let exits = call_exits(&open);
+        assert_eq!(exits.len(), 11, "{}", open.graph.dump());
+        for index in 0..9 {
+            let link = &exits[index + 1];
+            assert_eq!(
+                exit_host(&link.exitcase).expect("class").qualname(),
+                format!("synth::E::V{index}")
+            );
+            assert_eq!(link.args.len(), 1, "{index}");
+            assert_eq!(
+                link.args[0].as_variable(),
+                link.last_exc_value.as_ref().and_then(LinkArg::as_variable)
+            );
+        }
+        assert_eq!(
+            exit_host(&exits[10].exitcase).expect("base").qualname(),
+            "synth::E"
+        );
+        assert_eq!(
+            exits[10].args[0].as_variable(),
+            exits[10]
+                .last_exc_value
+                .as_ref()
+                .and_then(LinkArg::as_variable)
+        );
+    }
+
+    #[test]
+    fn default_arm_covers_two_variants() {
+        let hint_e = hint_for("synth::E", &["A"]);
+        let hint_f = hint_for("synth::F", &["B"]);
+        let sum = sum_of(vec![
+            ExceptionSumVariant {
+                name: "E".into(),
+                discriminant: 0,
+                payload: marked_payload("synth::E", &hint_e),
+            },
+            ExceptionSumVariant {
+                name: "F".into(),
+                discriminant: 1,
+                payload: marked_payload("synth::F", &hint_f),
+            },
+        ]);
+        let mut open = open_match("default_two");
+        let payload = read_field(&mut open.graph, open.err, open.err_shell.clone(), "__pos_0");
+        let disc = read_field(&mut open.graph, open.err, payload, "__discriminant");
+        let (handler, _) = open.graph.create_block_with_arg_vars(0);
+        seal(&mut open.graph, handler, 1);
+        open.graph.set_control_flow_metadata(
+            open.err,
+            Some(ExitSwitch::Value(disc)),
+            vec![default_link(&open.graph, vec![], handler)],
+        );
+        assert!(
+            install(&mut open, &sum)
+                .expect("default covering two variants lowers")
+                .is_some(),
+            "default covering two variants was not an exception-sum match"
+        );
+        let exits = call_exits(&open);
+        assert_eq!(exits.len(), 3, "{}", open.graph.dump());
+        assert_eq!(
+            exit_host(&exits[1].exitcase).expect("E").qualname(),
+            hint_e.classes.base.qualname()
+        );
+        assert_eq!(
+            exit_host(&exits[2].exitcase).expect("F").qualname(),
+            hint_f.classes.base.qualname()
+        );
+        assert_eq!(exits[1].target, exits[2].target);
+        assert!(exits[1].args.is_empty());
+        assert!(exits[2].args.is_empty());
     }
 }
