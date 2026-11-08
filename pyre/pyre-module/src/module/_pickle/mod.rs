@@ -220,18 +220,11 @@ pub(crate) fn import_module(name: &str) -> Result<PyObjectRef, PyError> {
         .ok_or_else(|| PyError::value_error(format!("Can't find module {name:?} in sys.modules")))
 }
 
-/// The live execution context reached through the thread-owned space state.
-fn current_ec() -> Option<*const pyre_interpreter::PyExecutionContext> {
-    let ec = pyre_interpreter::call::getexecutioncontext();
-    if ec.is_null() { None } else { Some(ec) }
-}
-
-/// Resolve a name in the `builtins` module through the execution context's
-/// `lookup_builtin` (the `LOAD_GLOBAL` fallback path). This bypasses the
-/// module-object `getattr` wrapper, whose hash table does not see builtins
-/// installed on the underlying storage.
+/// Resolve a name in `space.builtin` (the `LOAD_GLOBAL` fallback path).
+/// This bypasses the module-object `getattr` wrapper, whose hash table
+/// does not see builtins installed on the underlying storage.
 pub(crate) fn lookup_builtin(name: &str) -> Option<PyObjectRef> {
-    current_ec().and_then(|ec| unsafe { (*ec).lookup_builtin(name) })
+    pyre_interpreter::baseobjspace::space_lookup_builtin(name)
 }
 
 // ── `_compat_pickle` fix_imports tables (space.fromcache(State)) ──────

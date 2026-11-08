@@ -587,11 +587,7 @@ pub fn is_contiguous(obj: PyObjectRef) -> Result<bool, PyError> {
     Ok(true)
 }
 
-/// The `memoryview` builtin type via the live execution context.
+/// The `memoryview` builtin type via `space.builtin`.
 fn memoryview_type() -> Option<PyObjectRef> {
-    let ec = crate::call::getexecutioncontext();
-    if ec.is_null() {
-        return None;
-    }
-    unsafe { (*ec).lookup_builtin("memoryview") }
+    crate::baseobjspace::space_lookup_builtin("memoryview")
 }

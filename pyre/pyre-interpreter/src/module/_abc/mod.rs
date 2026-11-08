@@ -150,15 +150,7 @@ static BUILTIN_TYPE_ERROR: std::sync::OnceLock<usize> = std::sync::OnceLock::new
 /// under the default `honor__builtins__=False`, not the `__builtins__` entry of
 /// the module dict.
 fn builtin_type_error() -> Option<PyObjectRef> {
-    let ec = pyre_interpreter::call::getexecutioncontext();
-    if ec.is_null() {
-        return None;
-    }
-    let w_builtin = unsafe { (*ec).get_builtin() };
-    if w_builtin.is_null() || !unsafe { pyre_object::is_module(w_builtin) } {
-        return None;
-    }
-    let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+    let w_dict = pyre_interpreter::baseobjspace::space_builtin_dict();
     if w_dict.is_null() {
         return None;
     }

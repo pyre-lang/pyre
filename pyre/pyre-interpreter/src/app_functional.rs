@@ -168,11 +168,11 @@ pub(crate) fn install_applevel_builtins() {
     let Ok(handles) = install_handles() else {
         return;
     };
-    let ctx = crate::call::getexecutioncontext();
-    if ctx.is_null() {
+    let w_builtin = crate::baseobjspace::space_builtin();
+    if w_builtin.is_null() {
         return;
     }
-    let builtins = unsafe { (*ctx).get_builtin_dict() };
+    let builtins = crate::baseobjspace::space_builtin_dict();
     if builtins.is_null() {
         return;
     }
@@ -205,7 +205,7 @@ pub(crate) fn install_applevel_builtins() {
             "sorted",
             sorted_slot,
             SIGS[SORTED],
-            ctx,
+            w_builtin,
         );
     }
     if sum_placeholder {
@@ -214,7 +214,7 @@ pub(crate) fn install_applevel_builtins() {
             "sum",
             sum_slot,
             SIGS[SUM],
-            ctx,
+            w_builtin,
         );
     }
 }
@@ -246,7 +246,7 @@ fn publish_one(
     name: &str,
     func_slot: usize,
     sig_text: &str,
-    ctx: *const crate::PyExecutionContext,
+    w_builtin: PyObjectRef,
 ) {
     crate::module_ns_delete(builtins, name);
     let func = pyre_object::gc_roots::shadow_stack_get(func_slot);
@@ -264,7 +264,6 @@ fn publish_one(
     unsafe {
         crate::function::fset_func_text_signature(func, sig);
     }
-    let w_builtin = unsafe { (*ctx).get_builtin() };
     let func = pyre_object::gc_roots::shadow_stack_get(func_slot);
     unsafe {
         crate::function::builtin_function_set_module_obj(func, w_builtin);

@@ -3532,14 +3532,15 @@ fn expand_elidable_promote(
     };
 
     // rlib/jit.py elidable_promote — promote each selected arg
-    // (`hint(arg, promote=True)`).  Indices cover the full arg list
-    // including self, matching `_get_args`.
+    // (`hint(arg, promote=True)`) in `promote_args` order.  Indices
+    // cover the full arg list including self, matching `_get_args`.
     let mut promote_stmts: Vec<proc_macro2::TokenStream> = Vec::new();
-    if let Some(kind) = promoted_self {
-        promote_stmts.push(kind.stmt());
-    }
+    let mut self_promote_stmt = promoted_self.map(PromotedSelfKind::stmt);
     for &idx in &promote_indices {
         if has_self && idx == 0 {
+            if let Some(stmt) = self_promote_stmt.take() {
+                promote_stmts.push(stmt);
+            }
             continue;
         }
         let named_idx = if has_self { idx - 1 } else { idx };
@@ -5583,6 +5584,40 @@ mod tests {
         assert!(
             compact.contains("letx=majit_ir::jit::promote(x)"),
             "{compact}"
+        );
+    }
+
+    fn elidable_promote_arg1_and_self_offsets(compact: &str) -> (usize, usize) {
+        let arg1 = compact
+            .find("letx=majit_ir::jit::promote(x)")
+            .expect("arg-1 promote");
+        let self_promote = compact
+            .find("let__majit_self=unsafe{&*majit_ir::jit::promote(selfas*constSelf)}")
+            .expect("self promote");
+        (arg1, self_promote)
+    }
+
+    #[test]
+    fn elidable_promote_args_1_0_promotes_named_arg_before_self() {
+        let func = parse_fn("fn leaf(&self, x: i64) -> i64 { x }");
+        let tokens = expand_elidable_promote(func, "1,0").expect("expand");
+        let compact = compact_tokens(&tokens);
+        let (arg1, self_promote) = elidable_promote_arg1_and_self_offsets(&compact);
+        assert!(
+            arg1 < self_promote,
+            "arg-1 promote must precede self: {compact}"
+        );
+    }
+
+    #[test]
+    fn elidable_promote_args_0_1_promotes_self_before_named_arg() {
+        let func = parse_fn("fn leaf(&self, x: i64) -> i64 { x }");
+        let tokens = expand_elidable_promote(func, "0,1").expect("expand");
+        let compact = compact_tokens(&tokens);
+        let (arg1, self_promote) = elidable_promote_arg1_and_self_offsets(&compact);
+        assert!(
+            self_promote < arg1,
+            "self promote must precede arg-1: {compact}"
         );
     }
 

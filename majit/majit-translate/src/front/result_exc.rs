@@ -4523,12 +4523,12 @@ fn is_uninhabited_ok(ty: &str) -> bool {
     type_spelling_is_uninhabited(ty) || type_leaf(ty) == "??scalar"
 }
 
-/// Uninhabited atom: `!`, `Never`, `Infallible`, after stripping a
-/// leading `crate::` / `core::` / `std::` path
-/// (`core::convert::Infallible`). A unary generic (`Option<_>`,
-/// `Vec<_>`, `PhantomData<_>`) is not an atom; callers that have one
-/// extract the argument and test it here. `_names_without_voids`
-/// (`lltype.py`) drops a field whose translated type is Void.
+/// Uninhabited atom: `!`, TyKind `Never`, `Infallible`, or the resolved
+/// std paths `core::convert::Infallible` / `std::convert::Infallible`.
+/// A unary generic (`Option<_>`, `Vec<_>`, `PhantomData<_>`) is not an
+/// atom; callers that have one extract the argument and test it here.
+/// `_names_without_voids` (`lltype.py`) drops a field whose translated
+/// type is Void.
 pub(crate) fn type_spelling_is_uninhabited(ty: &str) -> bool {
     matches!(
         path_peeled_uninhabited_atom(ty),
@@ -4536,20 +4536,24 @@ pub(crate) fn type_spelling_is_uninhabited(ty: &str) -> bool {
     )
 }
 
-/// Last path segment when `ty` starts with `crate::` / `core::` /
-/// `std::`; otherwise the trimmed spelling. Generics, tuples, pointers,
-/// and references stay as written so they cannot match an atom name.
+/// Remainder of `core::convert::` / `std::convert::` when that remainder
+/// is a single segment; otherwise the trimmed spelling. Generics,
+/// tuples, pointers, and references stay as written so they cannot
+/// match an atom name.
 fn path_peeled_uninhabited_atom(ty: &str) -> &str {
     let t = ty.trim();
     if t.contains('<') || t.contains('(') || t.starts_with('*') || t.starts_with('&') {
         return t;
     }
-    let first = t.split("::").next().unwrap_or(t);
-    if matches!(first, "crate" | "core" | "std") {
-        t.rsplit("::").next().unwrap_or(t).trim()
-    } else {
-        t
+    for prefix in ["core::convert::", "std::convert::"] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            let rest = rest.trim();
+            if !rest.is_empty() && !rest.contains("::") {
+                return rest;
+            }
+        }
     }
+    t
 }
 
 /// Payload spelling of `Option<...>`. `Option<`, `core::option::Option<`,
@@ -4612,18 +4616,19 @@ mod uninhabited_atom_tests {
     };
 
     #[test]
-    fn type_spelling_is_uninhabited_accepts_path_peeled_atoms_only() {
+    fn type_spelling_is_uninhabited_accepts_tykind_and_std_convert_atoms() {
         for ty in [
             "!",
             "Never",
             "Infallible",
             "core::convert::Infallible",
             "std::convert::Infallible",
-            "crate::convert::Infallible",
         ] {
             assert!(type_spelling_is_uninhabited(ty), "{ty}");
         }
         for ty in [
+            "crate::convert::Infallible",
+            "crate::foo::Never",
             "Option<!>",
             "Option<Never>",
             "Option<Infallible>",

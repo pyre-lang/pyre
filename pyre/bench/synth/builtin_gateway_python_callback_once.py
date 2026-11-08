@@ -1,4 +1,13 @@
 # pyre-check: max-pypy-ratio=12
+# pyre-check: jitstats-band=guard_failures=232
+# wasm guard_failures reads 7539, 7539, 7539 on this macOS arm64 wasm-host
+# binary at check.py's 4MB PYPY_GC_NURSERY pin, 7754 at PYPY_GC_NURSERY=2M
+# (bridges 23 -> 25), and 7522 at 8M. dynasm and cranelift read 7522 on
+# every run. The wasm guest runs the minor-GC schedule off its allocation
+# volume, and moving the builtin module from each ExecutionContext to the
+# object space changed that volume. At the 4MB pin loops and bridges match
+# the baseline; the band covers guard_failures only. The width is the
+# 7522 -> 7754 distance.
 # macOS reads 3.3x on dynasm and 7.0x on cranelift.
 # Regression oracle: a builtin that calls back into Python -- a dict subscript
 # into `__hash__` then `__eq__`, `in` over a list into `__eq__`, `int` into

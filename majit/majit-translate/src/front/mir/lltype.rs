@@ -3258,17 +3258,20 @@ pub(in crate::front::mir) fn tyref_is_enum_free(ty: &TyRef, llbc: &Llbc) -> bool
         .is_some_and(|td| matches!(td.kind, TypeDeclKind::Enum(_)))
 }
 
-/// Declared `Never` / `!` FunDecl output. A callee with that spelling is
-/// a Rust abort (`ll_assert`; `rtyper/debug.py`) and lowers as
-/// `RaiseImplicit` the way `TermKind::Abort` does. Charon hash-conses
-/// the primitive as a type-name string through Deduplicated / Value
-/// (`charon_type_value_to_ast_string`).
+/// Charon's TyKind `Never` (`!`), after peeling Deduplicated / Value.
+/// The primitive is a type-name string (`{"Value":[id,"Never"]}`); an
+/// Adt whose leaf is `Never` is a user type and stays off this path.
+/// A callee with this output is a Rust abort (`ll_assert`;
+/// `rtyper/debug.py`) and lowers as `RaiseImplicit` the way
+/// `TermKind::Abort` does.
 pub(in crate::front::mir) fn tyref_is_never(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_node(ty, llbc).is_some_and(|node| type_node_is_never(node, llbc))
 }
 
 fn type_node_is_never(node: &serde_json::Value, llbc: &Llbc) -> bool {
     if let Some(s) = node.as_str() {
+        // Charon hash-conses `!` as `"Never"`; `"!"` is the same TyKind
+        // string in fixtures.
         return matches!(s, "Never" | "!");
     }
     if let Some(id) = node.get("Deduplicated").and_then(serde_json::Value::as_u64) {
@@ -3282,6 +3285,27 @@ fn type_node_is_never(node: &serde_json::Value, llbc: &Llbc) -> bool {
         return type_node_is_never(&arr[1], llbc);
     }
     false
+}
+
+/// The Adt's TypeDecl is `Enum` with zero variants
+/// (`core::convert::Infallible`). `_names_without_voids`
+/// (`lltype.py`) drops a field whose lowered type is Void.
+pub(in crate::front::mir) fn tyref_decl_is_uninhabited(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    let node = strip_ty_indirections(node, llbc).unwrap_or(node);
+    if node
+        .as_object()
+        .is_some_and(|obj| obj.contains_key("Ref") || obj.contains_key("RawPtr"))
+    {
+        return false;
+    }
+    let Some(def_id) = adt_node_def_id(node) else {
+        return false;
+    };
+    llbc.type_by_id(def_id)
+        .is_some_and(|td| matches!(&td.kind, TypeDeclKind::Enum(vs) if vs.is_empty()))
 }
 
 /// Whether `ty` resolves to a type Charon's resolved layout reports as
@@ -3336,48 +3360,20 @@ pub(in crate::front::mir) fn tyref_is_void_zst(ty: &TyRef, llbc: &Llbc) -> bool 
     is_unit_type(&peeled, llbc) || tyref_is_zero_sized(&peeled, llbc)
 }
 
-/// `Option<U>` whose `U` is an uninhabited atom (`Never` / `Infallible` /
-/// `!`). `Try::Residual` of a tagged Option; `_names_without_voids`
-/// (`lltype.py`) drops that field. A `Ref` / `RawPtr` payload, and a
-/// generic container (`Vec<_>`, `PhantomData<_>`), stay non-Void.
+/// `Option<U>` whose `U` is an uninhabited atom (TyKind `Never` or an
+/// empty-enum TypeDecl). `Try::Residual` of a tagged Option;
+/// `_names_without_voids` (`lltype.py`) drops that field. A `Ref` /
+/// `RawPtr` payload, and a generic container (`Vec<_>`, `PhantomData<_>`),
+/// stay non-Void.
 pub(in crate::front::mir) fn tyref_is_option_of_uninhabited(ty: &TyRef, llbc: &Llbc) -> bool {
-    if let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, llbc) {
-        return tyref_uninhabited_atom(&payload, llbc);
-    }
-    // Instantiation spelling when the generic Option TypeDecl hid the
-    // argument (`layout.size` of that decl is not this residual).
-    let spelling = tyref_to_ast_string(ty, llbc);
-    crate::front::result_exc::option_spelling_payload(&spelling)
-        .is_some_and(crate::front::result_exc::type_spelling_is_uninhabited)
+    crate::front::result_exc::tyref_option_payload(ty, llbc)
+        .is_some_and(|payload| tyref_uninhabited_atom(&payload, llbc))
 }
 
-/// Uninhabited atom: `Never` / `!`, or a named ADT such as `Infallible`.
-/// A `Ref` / `RawPtr` of one is still a pointer word. A generic
-/// container whose argument is uninhabited is not an atom.
+/// Uninhabited atom: TyKind `Never` / `!`, or a TypeDecl `Enum` with
+/// zero variants. A `Ref` / `RawPtr` of one is still a pointer word.
 fn tyref_uninhabited_atom(ty: &TyRef, llbc: &Llbc) -> bool {
-    if tyref_is_never(ty, llbc) {
-        return true;
-    }
-    let Some(node) = tyref_node(ty, llbc) else {
-        return false;
-    };
-    let node = strip_ty_indirections(node, llbc).unwrap_or(node);
-    if node
-        .as_object()
-        .is_some_and(|obj| obj.contains_key("Ref") || obj.contains_key("RawPtr"))
-    {
-        return false;
-    }
-    if node
-        .get("Adt")
-        .and_then(|a| a.as_object())
-        .is_some_and(|adt| type_decl_ref_generics(adt, llbc).is_some_and(generic_args_are_nonempty))
-    {
-        return false;
-    }
-    crate::front::result_exc::type_spelling_is_uninhabited(&charon_type_value_to_ast_string(
-        node, llbc, 0,
-    ))
+    tyref_is_never(ty, llbc) || tyref_decl_is_uninhabited(ty, llbc)
 }
 
 /// Discriminant of `Option`'s `None` variant, from the enum's declared
@@ -3422,8 +3418,29 @@ pub(in crate::front::mir) fn tyref_adt_def_id_of(ty: &TyRef, llbc: &Llbc) -> Opt
 }
 
 pub(in crate::front::mir) fn tyref_is_zero_sized(ty: &TyRef, llbc: &Llbc) -> bool {
-    if adt_path_of_tyref(ty, llbc)
-        .is_some_and(|path| crate::codewriter::call::type_str_leaf_is_void_zst(&path))
+    if tyref_decl_is_uninhabited(ty, llbc) {
+        return true;
+    }
+    // PhantomData / BuildHasherDefault stay Void via the ADT leaf,
+    // including a `type T = BuildHasherDefault<H>` alias
+    // (`type_node_peel_aliases`). Uninhabited atoms and `Option<!>`
+    // use TyKind / empty-enum identity (`Struct._names_without_voids`
+    // drops a field whose lowered type IS Void).
+    if tyref_node(ty, llbc)
+        .and_then(|n| type_node_peel_aliases(n, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| {
+            let path = td.item_meta.name_path();
+            let leaf = path
+                .split('<')
+                .next()
+                .unwrap_or(path.as_str())
+                .rsplit("::")
+                .next()
+                .unwrap_or(path.as_str());
+            leaf == "PhantomData" || leaf == "BuildHasherDefault"
+        })
     {
         return true;
     }

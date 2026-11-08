@@ -1919,13 +1919,9 @@ impl FrameBox {
             frame.f_generator_wref = frame_root.get(inputs + 4);
             frame.w_yielding_from = frame_root.get(inputs + 5);
             frame.f_backref = frame_root.get(inputs + 6) as *mut PyFrame;
-            // pyframe.py `__init__` stores `self.builtin` only under
-            // `honor__builtins__`.
-            frame.w_builtin = if crate::baseobjspace::HONOR_BUILTINS {
-                frame_root.get(inputs + 7)
-            } else {
-                PY_NULL
-            };
+            // Boxing copies the field; the constructors decide whether to set it
+            // (`pyframe.py PyFrame.__init__` under `honor__builtins__`).
+            frame.w_builtin = frame_root.get(inputs + 7);
             if unscanned_debugdata {
                 let debug = unsafe { &mut *frame.debugdata };
                 debug.w_globals = frame_root.get(inputs + FRAME_BOX_DEBUG_INPUT);
@@ -4079,32 +4075,21 @@ impl PyFrame {
         self.get_w_globals()
     }
 
-    /// `pyframe.py PyFrame.get_w_globals`: the normal case reads the
-    /// promoted code object's first-seen globals. A frame executing a shared
-    /// code object in another namespace carries the override in debugdata.
+    /// `pyframe.py PyFrame.get_w_globals`: debugdata.w_globals when the
+    /// frame carries an override, else `jit.promote(self.pycode).w_globals`.
+    /// [`Self::getcode_w`] is that promote: it makes the code object a
+    /// constant so the `w_globals` read folds.
     ///
-    /// Both arms read a redirected field (`debugdata` via [`Self::getdebug_data`],
-    /// else `pycode`). `hook_access_field` inserts
-    /// `jit_force_virtualizable` on those reads; `jtransform` deletes the
-    /// Call in looked-inside graphs (`pyopcode.py LOAD_GLOBAL` /
-    /// `MAKE_FUNCTION`). pyre residualizes those opcodes through this
-    /// accessor (`bh_load_global_fn`, residual MAKE_FUNCTION), so a native
-    /// force here would abort loops pypy compiles. The residual graph that
-    /// keeps the Call is `typeobject.py ensure_module_attr` inside
-    /// `type_create_new_type`.
+    /// Both arms read a redirected field (`debugdata` / `pycode`).
+    /// `hook_access_field` inserts `jit_force_virtualizable`; `jtransform`
+    /// deletes the Call in looked-inside graphs. A native force here would
+    /// abort residual IMPORT_NAME / MAKE_FUNCTION (`flatten.rs`
+    /// `load_import_globals`).
     #[inline]
     pub fn get_w_globals(&self) -> PyObjectRef {
         if let Some(data) = self.getdebug_data() {
             return data.w_globals;
         }
-        if self.pycode.is_null() {
-            return pyre_object::PY_NULL;
-        }
-        // `pyframe.py get_w_globals` `return jit.promote(self.pycode).w_globals`.
-        // [`Self::getcode_w`] is that promote. Without it the code object
-        // stays a varying value on the trace and the globals read is a load
-        // the optimizer cannot fold; `w_globals` is not a virtualizable
-        // field, so nothing else pins it to a constant.
         unsafe { crate::w_code_get_w_globals(self.getcode_w()) }
     }
 
@@ -5493,12 +5478,8 @@ impl PyFrame {
         if !self.w_builtin.is_null() {
             return self.w_builtin;
         }
-        // space.builtin
-        let ec = crate::call::getexecutioncontext();
-        if ec.is_null() {
-            return pyre_object::PY_NULL;
-        }
-        unsafe { (*ec).get_builtin() }
+        // pyframe.py get_builtin else-arm: `self.space.builtin`.
+        crate::baseobjspace::space_builtin()
     }
 
     /// `frame.f_backref()` — force the caller vref.  `f_backref` holds a
@@ -7972,5 +7953,73 @@ x = 7
         let plain = frame.make_arguments(1, false, pyre_object::PY_NULL);
         assert!(!plain.methodcall);
         assert_eq!(plain.arguments_w.len(), 1);
+    }
+
+    thread_local! {
+        static YOUNG_FRAME_ALLOCS: std::cell::RefCell<Vec<usize>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn headered_young_alloc(type_id: u32, payload_size: usize) -> pyre_object::gc_hook::GCREF {
+        let header = super::GC_HEADER_SIZE;
+        let align = majit_gc::header::GcHeader::ALIGN.max(std::mem::align_of::<super::PyFrame>());
+        let layout = std::alloc::Layout::from_size_align(header + payload_size.max(1), align)
+            .expect("young frame layout");
+        let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+        if raw.is_null() {
+            return std::ptr::null_mut();
+        }
+        unsafe {
+            (raw as *mut majit_gc::header::GcHeader)
+                .write(majit_gc::header::GcHeader::new(type_id));
+        }
+        let payload = unsafe { raw.add(header) };
+        YOUNG_FRAME_ALLOCS.with(|slots| slots.borrow_mut().push(payload as usize));
+        payload as pyre_object::gc_hook::GCREF
+    }
+
+    fn young_frame_alloc_is_owned(addr: usize) -> bool {
+        YOUNG_FRAME_ALLOCS.with(|slots| slots.borrow().contains(&addr))
+    }
+
+    struct ClearYoungFrameHooks;
+    impl Drop for ClearYoungFrameHooks {
+        fn drop(&mut self) {
+            pyre_object::gc_hook::clear_gc_alloc_young_nonmoving_hook();
+            pyre_object::gc_hook::clear_gc_owns_object_hook();
+            YOUNG_FRAME_ALLOCS.with(|slots| slots.borrow_mut().clear());
+        }
+    }
+
+    /// `FrameBox::new` boxes an already-initialized frame; an exec/eval
+    /// custom builtin installed after construction must survive the GC
+    /// allocation branch.
+    #[test]
+    fn frame_box_keeps_an_installed_builtin() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let _clear = ClearYoungFrameHooks;
+
+        let code = crate::compile_exec("a = 1").expect("compile");
+        let mut frame = super::PyFrame::new(code);
+        let roots = pyre_object::gc_roots::push_roots();
+        let installed_slot = roots.base();
+        let _ = roots.pin_root(pyre_object::w_dict_new());
+        frame.w_builtin = roots.get(installed_slot);
+        let snapshot = frame.build_snapshot_frame(super::FrameLocalsArrayAllocation::StdAlloc);
+        YOUNG_FRAME_ALLOCS.with(|slots| {
+            slots
+                .borrow_mut()
+                .push(snapshot.locals_cells_stack_w as usize)
+        });
+        pyre_object::gc_hook::register_gc_alloc_young_nonmoving_hook(headered_young_alloc);
+        pyre_object::gc_hook::register_gc_owns_object_hook(young_frame_alloc_is_owned);
+        let boxed = super::FrameBox::new(snapshot);
+        assert!(
+            boxed.is_gc_owned(),
+            "FrameBox::new must take the GC allocation branch"
+        );
+        assert_eq!(boxed.w_builtin, roots.get(installed_slot));
     }
 }

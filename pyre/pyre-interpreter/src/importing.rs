@@ -1978,16 +1978,22 @@ pub fn getbuiltinmodule(
 
 /// `space.builtin_modules[name]`.
 ///
-/// The `builtins` entry is `space.builtin`: every frame falls back to the
-/// execution context's module for `LOAD_GLOBAL`, so `import builtins` binds
-/// that one. Every other entry is built by [`new_builtin_module`] the first
-/// time it is named and kept in [`BUILTIN_MODULES`].
+/// The `builtins` entry is `space.builtin`: every frame falls back to that
+/// Module for `LOAD_GLOBAL`, so `import builtins` binds that one. Every
+/// other entry is built by [`new_builtin_module`] the first time it is named
+/// and kept in [`BUILTIN_MODULES`].
 fn builtin_modules_get(
     name: &str,
     execution_context: *const PyExecutionContext,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
-    if name == "builtins" && !execution_context.is_null() {
-        return Ok(Some(unsafe { (*execution_context).get_builtin() }));
+    if name == "builtins" {
+        // baseobjspace.py ObjSpace.getbuiltinmodule returns the space.builtin set at space init.
+        let w_builtin = crate::baseobjspace::space_builtin();
+        debug_assert!(
+            !w_builtin.is_null(),
+            "space.builtin is built by ExecutionContext::new before any import"
+        );
+        return Ok(Some(w_builtin));
     }
     let (static_name, module_def) = {
         let table = BUILTIN_MODULES.lock();
@@ -2272,22 +2278,6 @@ fn new_builtin_module(
                 )
             };
         }
-    }
-    // `baseobjspace.py make_builtins` installs the self
-    // reference `space.builtin.w_dict['__builtins__'] = space.builtin`
-    // so user code can reach the builtins module through
-    // `import builtins; builtins.__builtins__`.  The pyre split
-    // between EC.builtins_module (used by LOAD_GLOBAL fallback) and
-    // the import-time module (returned here) is a known pre-existing
-    // adaptation; install the self-reference on the imported flavour
-    // so `import builtins; builtins.__builtins__ is builtins` holds
-    // for user code regardless of the split.
-    if name == "builtins" {
-        crate::module_ns_store(
-            pyre_object::gc_roots::shadow_stack_get(save_point),
-            "__builtins__",
-            pyre_object::gc_roots::shadow_stack_get(module_slot),
-        );
     }
     Ok(pyre_object::gc_roots::shadow_stack_get(module_slot))
 }
@@ -3958,10 +3948,8 @@ pub fn get_interpreter_sys_module() -> Option<PyObjectRef> {
 /// The other half of [`get_interpreter_sys_module`]: `PyInterpreterState`
 /// carries `builtins` beside `sysdict`, and `finalize_modules_delete_special`
 /// reads both from there rather than through a mapping the program owns.
-/// The module this returns is the registry's, not
-/// `ExecutionContext::get_builtin()`'s -- the two are the split described at
-/// `builtin_modules_get`, and finalization wants the one whose dict
-/// `sys.modules` published.
+/// The module this returns is the registry's `sys.modules['builtins']`
+/// entry (`space.builtin` after `make_builtins` / `Module.install`).
 pub fn get_interpreter_builtins_module() -> Option<PyObjectRef> {
     nullable_to_option(sys_modules_registry_get(prebuilt_str_storage("builtins")))
 }
@@ -4929,8 +4917,8 @@ fn exec_code_module(
     // `_imp.exec_dynamic`-style entry) still inherit the builtins
     // pointer with no surprises.
     if unsafe { pyre_object::w_dict_getitem_str(w_globals, "__builtins__") }.is_none() {
-        let ctx = unsafe { &*execution_context };
-        let mut w_builtin = pyre_object::with_roots!(w_code, w_globals => ctx.get_builtin());
+        let mut w_builtin =
+            pyre_object::with_roots!(w_code, w_globals => crate::baseobjspace::space_builtin());
         if !w_builtin.is_null() {
             pyre_object::with_roots!(w_code, w_globals, w_builtin => unsafe {
                 pyre_object::w_dict_setitem_str(w_globals, "__builtins__", w_builtin);
@@ -7781,11 +7769,7 @@ fn dunder_import_binding(
 
     // `space.builtin` -- the one Module every frame uses for its LOAD_GLOBAL
     // fallback, and the object `import builtins` publishes.
-    let w_builtin = if execution_context.is_null() {
-        pyre_object::PY_NULL
-    } else {
-        unsafe { (*execution_context).get_builtin() }
-    };
+    let w_builtin = crate::baseobjspace::space_builtin();
     let w_import = if !w_builtin.is_null() && unsafe { is_module(w_builtin) } {
         // Pinned before the read: it is a `getattr` on a module, which can run
         // a module-level `__getattr__` and collect underneath the receiver.

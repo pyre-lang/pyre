@@ -20826,13 +20826,9 @@ pub fn exec_or_eval(
         // call-method path; dict-subclass `setdefault` overrides do
         // not fire for eval() in PyPy.  Dispatch on the dict object so
         // the str-keyed write fans into the storage proxy.
-        let w_builtin = if !exec_ctx.is_null() {
-            planted_builtins(
-                pyre_object::with_roots!(w_globals => unsafe { (*exec_ctx).get_builtin() }),
-            )
-        } else {
-            pyre_object::PY_NULL
-        };
+        let w_builtin = planted_builtins(pyre_object::with_roots!(w_globals => {
+            crate::baseobjspace::space_builtin()
+        }));
         if w_builtin.is_null() || w_globals.is_null() {
             return Ok(());
         }
@@ -20877,10 +20873,8 @@ pub fn exec_or_eval(
         let w_builtin = pyre_object::with_roots!(w_globals => {
             if !caller_frame.is_null() {
                 planted_builtins(unsafe { (*caller_frame).get_builtin() })
-            } else if !exec_ctx.is_null() {
-                planted_builtins(unsafe { (*exec_ctx).get_builtin() })
             } else {
-                pyre_object::PY_NULL
+                planted_builtins(crate::baseobjspace::space_builtin())
             }
         });
         if w_builtin.is_null() || w_globals.is_null() {
