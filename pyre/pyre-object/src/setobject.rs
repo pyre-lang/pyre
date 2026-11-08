@@ -6407,6 +6407,7 @@ mod tests {
             assert!(crate::w_list_sizehint(dest).is_none());
             // Two items from an empty receiver: `list_resize` allocates 8 slots.
             assert_eq!(crate::w_list_allocated(dest), 8);
+            assert_eq!(crate::w_list_physical_size(dest), Some(8));
         }
     }
 
