@@ -2189,6 +2189,13 @@ pub(in crate::front::mir) fn declared_raw_adt_node<'a>(
     if struct_id_is_declared_gc(gc_struct_ids, sid, &name) {
         return None;
     }
+    // A closure environment is the callable's instance, not a C struct
+    // (`rpbc.py FunctionsPBCRepr`). `note_raw_word_owner` and
+    // `raw_struct_ptr_from_layout` already leave it out.
+    let leaf = name.rsplit("::").next().unwrap_or(name.as_str());
+    if majit_charon_reader::ullbc::is_closure_leaf(leaf) {
+        return None;
+    }
     if tyref_is_zero_sized(&TyRef::Other(node.clone()), llbc) {
         return None;
     }
@@ -2282,6 +2289,11 @@ pub(in crate::front::mir) fn adt_fields_are_raw_storage(
     stack: &mut Vec<u64>,
 ) -> bool {
     fields.iter().enumerate().all(|(i, field)| {
+        // A Void field occupies no storage (`lltype.py`
+        // `Struct._names_without_voids`).
+        if tyref_is_void_zst(&field.ty, llbc) || tyref_is_zero_sized(&field.ty, llbc) {
+            return true;
+        }
         if field_ty_is_raw_word(&field.ty, llbc, gc_struct_ids, immutable_fields, stack) {
             return true;
         }

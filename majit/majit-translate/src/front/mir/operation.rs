@@ -6763,9 +6763,12 @@ impl<'a> Lowering<'a> {
                     if read_rstr_attr {
                         ty = ValueType::Str;
                     }
+                    // `rewrite_op_getfield`: kind is `getkind(RESULT)`, the
+                    // dest register. Unknown banks as `'r'`, so an Int field
+                    // of a raw owner becomes `getfield_raw_r`.
                     let res = self
                         .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        .alloc_value_var_with_type(concretetype_for_field(&ty));
                     let narrow_instance_class = container_is_enum
                         && field_name == "__pos_0"
                         && self.enum_payload_is_nullable_instance_ptr(&place_ty);
@@ -7461,7 +7464,7 @@ impl<'a> Lowering<'a> {
                     let bb_id = self.emit_bb(mir_bb);
                     let res = self
                         .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        .alloc_value_var_with_type(concretetype_for_field(&ty));
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::FieldRead {
