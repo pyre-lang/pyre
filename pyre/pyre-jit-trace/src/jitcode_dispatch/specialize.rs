@@ -2434,7 +2434,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             ctx,
             op_pc,
             dict_op,
-            &pyre_interpreter::objspace::std::mapdict::MAP_DICT_STRATEGY_REF as *const _ as i64,
+            pyre_interpreter::objspace::std::mapdict::map_dict_strategy_ref() as *const _ as i64,
         )?;
 
         let carrier_op =
@@ -5758,7 +5758,6 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
         dst_bank,
         &SPECIALISED_TUPLE2_DESCENT,
         Some(&mut produced),
-        false, // not a BinaryOperator tag
     )?;
     if !matches!(outcome, Some(DispatchOutcome::Continue)) {
         ctx.trace_ctx.cut_trace_with_snapshots(pre_body);
@@ -6485,7 +6484,7 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
             ctx,
             op_pc,
             strategy,
-            &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64,
+            pyre_object::dictmultiobject::unicode_dict_strategy_ref() as *const _ as i64,
         )?;
         walker_guard_exact_str(ctx, op_pc, key_op)?;
 
@@ -6724,7 +6723,6 @@ fn try_walker_orthodox_subscr_tuple_item<Sym: WalkSym>(
         dst_bank,
         &TUPLE_GETITEM_DESCENT,
         None,
-        false, // index payload, not a BinaryOperator tag
     )?;
     orthodox_descent_unit(ctx, op_pc, walked, Some(pre_fold_pos))
 }
@@ -7487,15 +7485,15 @@ fn emit_int_ovf_to_long<Sym: WalkSym>(
     }))
 }
 
-/// The machine-int body of `int_add` / `int_sub` / `int_mul` / bitwise
-/// `or`/`xor` and of `int_floordiv` / `int_mod` (`descroperation.rs`):
-/// unbox, `int_*_ovf` or `int_or`/`xor` or the `OS_INT_PY_DIV` /
-/// `OS_INT_PY_MOD` elidable, rebox.  Used when a helper walk cannot
-/// stamp its resume word (`GuardResumeCoordinateUnavailable`) so the
-/// call would otherwise become `CallMayForce`.  Does not walk
-/// `binary_value_from_tag` — that re-enters the same `add` inline and
-/// recurses.  `&` declines so `and_` / `_invoke_binop` /
-/// `_check_notimplemented` record (`intshortcut` is add/sub only).
+/// The machine-int body of `int_add` / `int_sub` / `int_mul` and of
+/// `int_floordiv` / `int_mod` (`descroperation.rs`): unbox, `int_*_ovf`
+/// or the `OS_INT_PY_DIV` / `OS_INT_PY_MOD` elidable, rebox.  Used when
+/// a helper walk cannot stamp its resume word
+/// (`GuardResumeCoordinateUnavailable`) so the call would otherwise
+/// become `CallMayForce`.  Does not walk `binary_value_from_tag` — that
+/// re-enters the same `add` inline and recurses.  `&`/`|`/`^` decline so
+/// `and_` / `or_` / `xor` / `_invoke_binop` / `_check_notimplemented`
+/// record (`intshortcut` is add/sub only).
 pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -7550,8 +7548,6 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
         Some(B::Add | B::InplaceAdd) => OpCode::IntAddOvf,
         Some(B::Subtract | B::InplaceSubtract) => OpCode::IntSubOvf,
         Some(B::Multiply | B::InplaceMultiply) => OpCode::IntMulOvf,
-        Some(B::Or | B::InplaceOr) => OpCode::IntOr,
-        Some(B::Xor | B::InplaceXor) => OpCode::IntXor,
         Some(B::FloorDivide | B::InplaceFloorDivide | B::Remainder | B::InplaceRemainder) => {
             OpCode::CallI
         }
@@ -7582,10 +7578,7 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
         walker_emit_int_div_domain_guards(ctx, op_pc, lhs_raw, rhs_raw, la, rb)?;
         let is_div = matches!(op, Some(B::FloorDivide | B::InplaceFloorDivide));
         walker_emit_int_py_div_or_mod(ctx, lhs_raw, rhs_raw, la, rb, is_div)
-    } else if matches!(
-        opcode,
-        OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf
-    ) {
+    } else {
         let (raw, ovf_flag) = record_int_ovf(ctx, op_pc, opcode, lhs_raw, rhs_raw, Some((la, rb)))?;
         let heap_ovf = match opcode {
             OpCode::IntAddOvf => la.checked_add(rb).is_none(),
@@ -7621,36 +7614,7 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
             return Ok(None);
         };
         (raw, concrete)
-    } else {
-        let raw = ctx.trace_ctx.record_op(opcode, &[lhs_raw, rhs_raw]);
-        let concrete = match opcode {
-            OpCode::IntOr => la | rb,
-            OpCode::IntXor => la ^ rb,
-            _ => return Ok(None),
-        };
-        ctx.trace_ctx
-            .set_opref_concrete(raw, majit_ir::Value::Int(concrete));
-        (raw, concrete)
     };
-    let lhs_obj = lhs_pin
-        .as_ref()
-        .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
-        .unwrap_or(lhs_obj);
-    let rhs_obj = rhs_pin
-        .as_ref()
-        .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
-        .unwrap_or(rhs_obj);
-    let both_bools = unsafe { pyre_object::is_bool(lhs_obj) && pyre_object::is_bool(rhs_obj) };
-    if both_bools && matches!(opcode, OpCode::IntOr | OpCode::IntXor) {
-        let observed = concrete != 0;
-        let Some(boxed) = walker_newbool_guarded(ctx, op_pc, raw, observed, dst_bank)? else {
-            return Ok(None);
-        };
-        let _ = (dst, dst_bank);
-        return Ok(Some(DispatchOutcome::SubReturn {
-            result: Some(boxed),
-        }));
-    }
     // `walker_box_int` records `wrapint` and that recording can minor-collect.
     // Allocate the concrete after it and stamp before the next call, the
     // same order as `walker_read_int_mutable_cell`. A `w_int_new` before
@@ -7991,7 +7955,7 @@ fn try_walker_orthodox_descent<Sym: WalkSym>(
     descent: &HelperDescent,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     try_walker_orthodox_descent_ex(
-        ctx, op_pc, int_args, ref_args, float_args, dst, dst_bank, descent, None, true,
+        ctx, op_pc, int_args, ref_args, float_args, dst, dst_bank, descent, None,
     )
 }
 
@@ -8005,23 +7969,12 @@ fn try_walker_orthodox_descent_ex<Sym: WalkSym>(
     dst_bank: char,
     descent: &HelperDescent,
     boxed_out: Option<&mut Option<OpRef>>,
-    guard_raising_binop: bool,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     let Some(prep) = prepare_orthodox_descent(ctx, op_pc, descent) else {
         return Ok(None);
     };
     run_prepared_orthodox_descent(
-        ctx,
-        op_pc,
-        prep,
-        int_args,
-        ref_args,
-        float_args,
-        dst,
-        dst_bank,
-        descent,
-        boxed_out,
-        guard_raising_binop,
+        ctx, op_pc, prep, int_args, ref_args, float_args, dst, dst_bank, descent, boxed_out,
     )
 }
 
@@ -8085,7 +8038,6 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
     dst_bank: char,
     descent: &HelperDescent,
     boxed_out: Option<&mut Option<OpRef>>,
-    guard_raising_binop: bool,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     // A box that already carries its object is authoritative: the collector
@@ -8197,21 +8149,6 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
     if let Some(slot) = boxed_out {
         *slot = Some(result);
     }
-    // `handle_possible_exception`: a successful descent of `//` / `%`
-    // still has to carry `GUARD_NO_EXCEPTION` so a later zero divisor
-    // deopts instead of dest-writing NULL into the caller's `+=` slot.
-    // The first int concrete is a `BinaryOperator` tag only on
-    // `binary_value_from_tag`: a descent whose ints are payloads
-    // (`w_specialised_tuple_ii_new`) passes `guard_raising_binop` false.
-    // COMPARE tags reuse those integers (`==` is 4, which
-    // `binary_op_from_tag` reads as Remainder).
-    if guard_raising_binop && descent.path == BINARY_OP_DESCENT.path {
-        super::inline_call::maybe_guard_no_exception_after_raising_binop(
-            ctx,
-            op_pc,
-            &int_concretes,
-        )?;
-    }
     Ok(Some(DispatchOutcome::Continue))
 }
 
@@ -8240,7 +8177,6 @@ fn orthodox_helper_boxed<Sym: WalkSym>(
         'v',
         descent,
         Some(&mut boxed),
-        false,
     )? {
         Some(DispatchOutcome::Continue) => {
             if allow_void {
@@ -10770,7 +10706,7 @@ fn walker_emit_exact_dict_hit<Sym: WalkSym>(
         canonical_dict,
     )?;
 
-    let strategy_ref = &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64;
+    let strategy_ref = pyre_object::dictmultiobject::unicode_dict_strategy_ref() as *const _ as i64;
     let lookup_helper = pyre_interpreter::residual_word_addr!(
         2,
         crate::helpers::jit_dict_exact_unicode_lookup_or_null
@@ -10903,7 +10839,7 @@ fn walker_emit_int_dict_lookup_index<Sym: WalkSym>(
         ctx,
         op_pc,
         dict_op,
-        &pyre_object::dictmultiobject::INT_DICT_STRATEGY_REF as *const _ as i64,
+        pyre_object::dictmultiobject::int_dict_strategy_ref() as *const _ as i64,
     )?;
     let int_type = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     walker_guard_exact_instance(
@@ -15415,7 +15351,6 @@ fn try_walker_orthodox_int_descr_str<Sym: WalkSym>(
         'r',
         &INT_DESCR_STR_DESCENT,
         None,
-        false,
     )?;
     orthodox_descent_unit(ctx, op_pc, walked, Some(pre_fold_pos))
 }
@@ -15448,9 +15383,8 @@ pub(crate) fn try_walker_orthodox_newutf8<Sym: WalkSym>(
     let concrete_len = unsafe {
         (*(boxed_result as *const pyre_object::unicodeobject::W_UnicodeObject)).len as i64
     };
-    // The length is a payload, not a `BinaryOperator` tag. Stamp it before
-    // the walk; the shared descent stamps ref operands itself and must not
-    // read this int as a raising operator.
+    // Stamp length before the walk; the shared descent stamps ref operands
+    // itself and leaves int concretes to the caller.
     ctx.trace_ctx
         .set_opref_concrete(length, majit_ir::Value::Int(concrete_len));
     let mut produced = None;
@@ -15466,7 +15400,6 @@ pub(crate) fn try_walker_orthodox_newutf8<Sym: WalkSym>(
         'v',
         &NEWUTF8_DESCENT,
         Some(&mut produced),
-        false,
     )?;
     match walked {
         Some(DispatchOutcome::Continue) => {}
@@ -16673,6 +16606,14 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
             )
         }
     };
+    // `_opimpl_setfield_vable` already left the abort-point scalars on the
+    // vable (`pyjitpl.py`); do not rewrite them for the helper walk (#245).
+    // Record the pair on the paused portal `LiveFrameRegs` so a
+    // ForceQuasiImmutable multi-frame blackhole can resume the CALL
+    // (`blackhole.py _setup_return_value_*` / `_copy_data_from_miframe`).
+    if !nested_helper && sym.owns_virtualizable_shadow() {
+        super::vable_ops::record_paused_portal_abort_point(ctx.session, ctx.trace_ctx);
+    }
     let active = if nested_helper {
         ctx.frame_state.borrow().outer_active_boxes.clone()
     } else {
@@ -16715,6 +16656,21 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
 
     let walk_start = ctx.trace_ctx.get_trace_position();
     let saved_fbw_mode = ctx.fbw_mode.clone();
+    // Pause this Python MIFrame (portal or inlined callee) with the banks
+    // `convert_and_run_from_pyjitpl` / `_copy_data_from_miframe` copy.
+    // `record_paused_portal_abort_point` may already have left abort-point
+    // scalars on a placeholder live; bind keeps those and fills the banks.
+    // A nested helper walk already occupies a helper MIFrame — rebinding
+    // would overwrite that frame with the inner helper's register file.
+    if !saved_fbw_mode.transparent_helper_subwalk {
+        super::vable_ops::bind_paused_caller_regs(
+            ctx.session,
+            ctx.registers_r,
+            ctx.registers_i,
+            ctx.registers_f,
+            &ctx.frame_state,
+        );
+    }
     ctx.fbw_mode.inline_subwalk = true;
     ctx.fbw_mode.subwalk_floor = Some(walk_start);
     ctx.fbw_mode.helper_return = nested_entry.ret;
@@ -16738,6 +16694,9 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ctx.descr_refs = saved_descr_refs;
     ctx.raw_descrs = saved_raw_descrs;
     ctx.sub_jitcode_lookup = saved_lookup;
+    if !nested_helper && sym.owns_virtualizable_shadow() {
+        super::vable_ops::clear_paused_portal_abort_point(ctx.session);
+    }
 
     // `abort/` in a helper body is an un-lowered `OpKind` — the same class
     // as a symbolic residual (`try_execute_residual_call_via_executor_inner` →
@@ -16862,7 +16821,16 @@ fn run_codewriter_helper_inline_call_body<Sym: WalkSym>(
         };
         nested_entry.level = Some(append_helper_parent(level, parent));
     }
-    run_orthodox_helper_subwalk(
+    // `do_residual_or_indirect_call` keeps the caller `MIFrame` current
+    // while `perform_call` / `newframe` pushes the callee (`pyjitpl.py`).
+    // `helper_subwalk_level` therefore numbers the caller at the CALL;
+    // install the callee index only after that pause, matching
+    // `walk_translated_builtin_wrapper`.
+    let saved_th_index = ctx.fbw_mode.transparent_helper_jitcode_index;
+    if let Some(index) = residual_call::helper_index_for_sub_body(sub_body) {
+        ctx.fbw_mode.transparent_helper_jitcode_index = Some(index);
+    }
+    let result = run_orthodox_helper_subwalk(
         ctx,
         op_pc,
         sym,
@@ -16876,7 +16844,9 @@ fn run_codewriter_helper_inline_call_body<Sym: WalkSym>(
         ref_arg_concretes,
         float_args,
     )
-    .map(|(outcome, _)| outcome)
+    .map(|(outcome, _)| outcome);
+    ctx.fbw_mode.transparent_helper_jitcode_index = saved_th_index;
+    result
 }
 
 /// Re-read a ref the collector may have moved.
@@ -20723,7 +20693,6 @@ pub(crate) fn try_walker_descend_frame_get_w_globals<Sym: WalkSym>(
         dst_bank,
         &GET_W_GLOBALS_DESCENT,
         None,
-        false,
     )?;
     orthodox_descent_unit(ctx, op_pc, walked, None)
 }

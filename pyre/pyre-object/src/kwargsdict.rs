@@ -62,14 +62,12 @@ fn kwargs_at(items: &[PyObjectRef], i: usize) -> PyObjectRef {
 /// singleton — matches PyPy's `space.fromcache(KwargsDictStrategy)`.
 pub static KWARGS_DICT_STRATEGY: KwargsDictStrategy = KwargsDictStrategy;
 
-/// The [`crate::dictmultiobject::DictStrategyRef`] holder a dict's `dstrategy`
-/// slot points at.
-pub static KWARGS_DICT_STRATEGY_REF: crate::dictmultiobject::DictStrategyRef =
-    crate::dictmultiobject::DictStrategyRef {
-        kind: crate::dictmultiobject::StrategyKind::Kwargs,
-        imp: &KWARGS_DICT_STRATEGY,
-        owner: std::ptr::null_mut(),
-    };
+crate::define_prebuilt_dict_strategy_ref!(
+    KWARGS_DICT_STRATEGY_REF,
+    kwargs_dict_strategy_ref,
+    crate::dictmultiobject::StrategyKind::Kwargs,
+    &KWARGS_DICT_STRATEGY
+);
 
 /// `KwargsDictStrategy` backing — erased `([], [])` parallel arrays
 /// (`kwargsdict.py`). GC-managed storage box (mirrors the other
@@ -196,7 +194,7 @@ impl KwargsDictStrategy {
         let w_dict = roots.get(dict_slot);
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
         dict.dstorage = fresh;
-        dict.dstrategy = &crate::dictmultiobject::UNICODE_DICT_STRATEGY_REF;
+        dict.dstrategy = crate::dictmultiobject::unicode_dict_strategy_ref();
         crate::dictmultiobject::dict_write_barrier(w_dict);
         for i in 0..len {
             // `w_dict.setitem` (`kwargsdict.py switch_to_unicode_strategy`).
@@ -288,7 +286,7 @@ unsafe fn kwargs_getitem_correct_indirection(
 /// be on this strategy: `_getitem_correct_indirection` on an exact unicode key.
 ///
 /// # Safety
-/// `w_dict` must be a live dict whose strategy is `KWARGS_DICT_STRATEGY_REF`,
+/// `w_dict` must be a live dict whose strategy is [`kwargs_dict_strategy_ref`],
 /// and `w_key` a live exact str.
 pub unsafe fn w_dict_lookup_or_null_kwargs_strategy(
     w_dict: PyObjectRef,
@@ -513,7 +511,7 @@ impl DictStrategy for KwargsDictStrategy {
             kwargs_dict_storage_gc_type_id(),
         );
         crate::dictmultiobject::w_dict_new_with(
-            &KWARGS_DICT_STRATEGY_REF,
+            kwargs_dict_strategy_ref(),
             new_storage as crate::gc_hook::GCREF,
         )
     }

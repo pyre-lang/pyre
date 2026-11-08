@@ -772,6 +772,15 @@ pub(crate) struct LiveFrameRegs {
     pub(crate) registers_i: RegisterBank,
     pub(crate) registers_f: RegisterBank,
     frame_state: WalkFrameState,
+    /// Portal jitcode `last_instr` / `valuestackdepth` as of the CALL that
+    /// paused this frame (`_opimpl_setfield_vable` /
+    /// `_opimpl_setarrayitem_vable` before the helper). Guard snapshots
+    /// during the helper walk use the opcode-entry image mirrored onto
+    /// `virtualizable_boxes`; a ForceQuasiImmutable abort resumes this
+    /// MIFrame at the CALL's `next_pc` (`blackhole.py
+    /// _setup_return_value_*`) and needs this abort-point pair.
+    abort_point_valuestackdepth: Option<usize>,
+    abort_point_last_instr: Option<isize>,
 }
 
 impl LiveFrameRegs {
@@ -786,7 +795,16 @@ impl LiveFrameRegs {
             registers_i: registers_i.clone(),
             registers_f: registers_f.clone(),
             frame_state: frame_state.clone(),
+            abort_point_valuestackdepth: None,
+            abort_point_last_instr: None,
         }
+    }
+
+    pub(crate) fn abort_point_scalars(&self) -> (Option<usize>, Option<isize>) {
+        (
+            self.abort_point_valuestackdepth,
+            self.abort_point_last_instr,
+        )
     }
 
     pub(crate) fn frame_state(&self) -> &WalkFrameState {
@@ -6517,12 +6535,33 @@ pub(crate) fn find_catch_for_exc_resume(code: &[u8], resume_live_pos: usize) -> 
 /// `catch_exception` target of a helper jitcode section at `jitcode_pc`.
 /// `None` when the section has no handler, so the exception continues to
 /// the caller (`handle_exception_in_frame` / `_handle_jitexception`).
+///
+/// `blackhole.py handle_exception_in_frame` jumps to the `catch_exception`
+/// after `-live-`, including a `reraise` body. `pyjitpl.py
+/// finishframe_exception` does the same; `opimpl_reraise` then pops this
+/// MIFrame and continues in the parent (`int_pow` / `descr_pow`), which
+/// `capture_resumedata` numbers separately. The target is unfiltered.
 pub fn helper_section_catch_target(jitcode_index: i32, jitcode_pc: i32) -> Option<usize> {
     if jitcode_pc < 0 {
         return None;
     }
     let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index)?;
-    find_catch_for_exc_resume(pjc.jitcode.code.as_slice(), jitcode_pc as usize)
+    let code = pjc.jitcode.code.as_slice();
+    find_catch_for_exc_resume(code, jitcode_pc as usize)
+}
+
+/// `rclass.ll_issubclass` for `goto_if_exception_mismatch`. Same fallback
+/// as `Backend::bh_issubclass` / `MetaInterp::issubclass_of`: subclass
+/// ranges when the GC descriptor published them, else exact typeptr.
+fn walker_ll_issubclass(typeptr: i64, bounding_class: i64) -> bool {
+    if let (Some((cls_min, cls_max)), Some((subcls_min, _))) = (
+        majit_gc::subclass_range(bounding_class as usize),
+        majit_gc::subclass_range(typeptr as usize),
+    ) {
+        cls_min <= subcls_min && subcls_min < cls_max
+    } else {
+        typeptr == bounding_class
+    }
 }
 
 /// Mirror of `blackhole.rs BlackholeInterpreter::find_catch_before_resume_live`
@@ -18033,6 +18072,50 @@ fn handle<Sym: WalkSym>(
             let exc_concrete = ctx.last_exc_value_concrete();
             write_ref_reg(ctx, op.pc, dst, exc, exc_concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "goto_if_exception_mismatch/iL" => {
+            // `pyjitpl.py opimpl_goto_if_exception_mismatch`:
+            //
+            //   last_exc_value = metainterp.last_exc_value
+            //   assert last_exc_value
+            //   assert metainterp.class_of_last_exc_is_const
+            //   if not rclass.ll_isinstance(real_instance, cls):
+            //       self.pc = next_exc_target
+            //
+            // Canonical `iL`: [vtable:u8][target:L]. Match falls through;
+            // mismatch jumps. `blackhole.py bhimpl_goto_if_exception_mismatch`
+            // is the same `ll_issubclass` test. No guard: the class is a
+            // Const (`class_of_last_exc_is_const`).
+            let vtablebox = read_int_reg(code, op, 0, ctx)?;
+            let target = read_label(code, op, 1);
+            let exc_ptr = match ctx.last_exc_value_concrete() {
+                ConcreteValue::Ref(p) if !p.is_null() => p,
+                _ => {
+                    return Err(DispatchError::LastExceptionWithoutActiveException { pc: op.pc });
+                }
+            };
+            let _ = ctx
+                .last_exc_value()
+                .ok_or(DispatchError::LastExceptionWithoutActiveException { pc: op.pc })?;
+            let bounding = match ctx.trace_ctx.concrete_of_opref(vtablebox) {
+                Some(Value::Int(v)) => v,
+                _ => {
+                    return Err(DispatchError::GotoIfNotValueNotConcrete {
+                        pc: op.pc,
+                        value: vtablebox,
+                    });
+                }
+            };
+            let typeptr = unsafe {
+                (*(exc_ptr as *const pyre_object::interp_exceptions::W_BaseException))
+                    .ob_header
+                    .ob_type as i64
+            };
+            let is_match = walker_ll_issubclass(typeptr, bounding);
+            Ok((
+                DispatchOutcome::Continue,
+                if is_match { op.next_pc } else { target },
+            ))
         }
         "last_exception/>i" => {
             // RPython parity: `pyjitpl.py opimpl_last_exception`:

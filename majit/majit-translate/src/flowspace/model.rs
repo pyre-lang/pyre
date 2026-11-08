@@ -2731,7 +2731,7 @@ impl HostEnv {
             HostObject::new_builtin_callable(crate::runtime_names::modules::MALLOC_RAW),
         );
 
-        // `majit_gc::header::alloc_varsize_with_gc_header_immortal[_zeroed]`
+        // `majit_gc::header::alloc_varsize_with_gc_header[_immortal][_zeroed]`
         // / `dealloc_varsize_with_gc_header` — concrete `malloc_varsize`
         // analogues (`init_gc_object_immortal`). Generic `alloc_with_gc_header`
         // has no look-inside graph; these do, so they are host builtins the
@@ -2740,6 +2740,18 @@ impl HostEnv {
         // prefix `majit_gc.header`. The crate-stripped alias `header` is the
         // same HostObject Arc (`BUILTIN_TYPER` is identity-keyed).
         let gc_header_module = HostObject::new_module(crate::runtime_names::modules::GC_HEADER);
+        gc_header_module.module_set(
+            "alloc_varsize_with_gc_header",
+            HostObject::new_builtin_callable(
+                crate::runtime_names::modules::ALLOC_VARSIZE_GC_HEADER,
+            ),
+        );
+        gc_header_module.module_set(
+            "alloc_varsize_with_gc_header_zeroed",
+            HostObject::new_builtin_callable(
+                crate::runtime_names::modules::ALLOC_VARSIZE_GC_HEADER_ZEROED,
+            ),
+        );
         gc_header_module.module_set(
             "alloc_varsize_with_gc_header_immortal",
             HostObject::new_builtin_callable(

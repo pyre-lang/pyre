@@ -619,7 +619,25 @@ impl LlexternalInput {
             // The residual callee is `ccall_<name>` (`call_external_function`).
             // `jit_trace_fnaddrs` must carry that path or the funcbox stays a
             // symbolic hash and the tracer cannot run the wrapper.
-            let ccall_fnaddr = self.ccall_fnaddr_registration();
+            //
+            // Aroundstate (`invoke`, `rffi.py` `call_external_function` with
+            // `_call_aroundstate_target_`): one HELPER_FNADDRS row, the
+            // wrapper itself. Occupied merge and `desc.get()` agree on that
+            // address (`ccall_c_tzset` / `ccall_c_dup`). The descr stub is
+            // `CallDescr.create_call_stub` at `getcalldescr`, not a second
+            // row for the same path.
+            //
+            // `releasegil=False` + `save_err` (`rposix.py` `c_getlogin`):
+            // `#[dont_look_inside]` (`rffi.py` `need_wrapper` +
+            // `jit.dont_look_inside`) registers the descr-word adapter under
+            // the same `module_path!()::ccall_{name}` path. A second row of
+            // the wrapper is a different address; merge last-wins one while
+            // the occupied census compares every row.
+            let ccall_fnaddr = if invoke || !self.ccall_dont_look_inside_emits_adapter() {
+                self.ccall_fnaddr_registration()
+            } else {
+                quote! {}
+            };
             let identity = crate::icf_identity_tokens(&call_name, &syn::Generics::default());
             Ok(quote! {
                 #save_err_assert
@@ -927,6 +945,28 @@ impl LlexternalInput {
             &format_ident!("__RFFI_FP_FNADDR_{}", self.name),
             &format_ident!("__rffi_register_fnaddr_{}", self.name),
         )
+    }
+
+    /// Whether `#[dont_look_inside]` on `ccall_{name}` will emit a
+    /// `__majit_call_target_*` HELPER_FNADDRS row under the same path.
+    ///
+    /// `trampoline_skip_reason` is the same gate `dont_look_inside` uses.
+    /// A Path alias such as `crate::rffi::INT` / `libc::pid_t` skips, so
+    /// those ccalls still need the wrapper row (`c_close`, `c_getpid`).
+    /// A thin pointer result with no skipped args (`c_getlogin`) emits
+    /// the adapter.
+    fn ccall_dont_look_inside_emits_adapter(&self) -> bool {
+        let call_name = format_ident!("ccall_{}", self.name);
+        let (params, _) = self.params();
+        let result = &self.result;
+        let Ok(dummy) = syn::parse2::<syn::ItemFn>(quote! {
+            unsafe fn #call_name(#(#params),*) -> #result {
+                ::core::panic!()
+            }
+        }) else {
+            return false;
+        };
+        crate::trampoline_skip_reason(&dummy, "dont_look_inside", &[]).is_none()
     }
 
     /// Publish `ccall_<name>` the same way. The path is
@@ -1284,6 +1324,49 @@ mod tests {
             no_elidable.contains("_funcptr_canraise_false_c_strlen"),
             "{no_elidable}"
         );
+    }
+
+    #[test]
+    fn aroundstate_ccall_registers_the_wrapper() {
+        // `rffi.py` `invoke_around_handlers`: `ccall_c_tzset` / `ccall_c_dup`.
+        let tzset = expand(r#"c_tzset = "tzset", [], ()"#);
+        assert!(tzset.contains("__RFFI_CCALL_FNADDR_c_tzset"), "{tzset}");
+        assert!(tzset.contains("call_aroundstate_target"), "{tzset}");
+        let dup = expand(r#"c_dup = "dup", [i32], i32, save_err = RFFI_SAVE_ERRNO"#);
+        assert!(dup.contains("__RFFI_CCALL_FNADDR_c_dup"), "{dup}");
+        assert!(dup.contains("call_aroundstate_target"), "{dup}");
+    }
+
+    #[test]
+    fn dont_look_inside_save_err_pointer_ccall_does_not_register_the_wrapper() {
+        // `rposix.py` `c_getlogin`: `releasegil=False`, `save_err=RFFI_SAVE_ERRNO`.
+        // The adapter row is `#[dont_look_inside]` on the real expansion; a
+        // wrapper row at the same path would disagree with `desc.get()`.
+        // The sandbox stub has no adapter, so it still publishes the wrapper.
+        let out = expand(
+            r#"c_getlogin = "getlogin", [], *mut u8, releasegil = false, save_err = RFFI_SAVE_ERRNO"#,
+        );
+        let stub_marker = "any (not (feature = \"host_env\") , feature = \"sandbox\")";
+        let fnaddr = "__RFFI_CCALL_FNADDR_c_getlogin";
+        let dli = out.find("dont_look_inside").expect(&out);
+        let stub = out.find(stub_marker).expect(&out);
+        let row = out.find(fnaddr).expect(&out);
+        assert!(
+            dli < stub,
+            "dont_look_inside is on the real expansion: {out}"
+        );
+        assert!(row > stub, "wrapper row is stub-only: {out}");
+    }
+
+    #[test]
+    fn dont_look_inside_save_err_keeps_wrapper_when_adapter_is_skipped() {
+        // `crate::rffi::INT` / `pid_t` are Path aliases `dont_look_inside`
+        // cannot lower, so the wrapper row is the only HELPER_FNADDRS entry.
+        let out = expand(
+            r#"c_getpid = "getpid", [], pid_t, releasegil = false, save_err = RFFI_SAVE_ERRNO"#,
+        );
+        assert!(out.contains("dont_look_inside"), "{out}");
+        assert!(out.contains("__RFFI_CCALL_FNADDR_c_getpid"), "{out}");
     }
 
     #[test]

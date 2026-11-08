@@ -2501,8 +2501,9 @@ mod tests {
     /// without their names, so the erasure is the field's lltype
     /// (`ValueType::Str`), not a class-root table. Construction, the
     /// positional field, and an `&self` receiver are `SomeString`.
-    /// `ObjPtrKey(*mut Obj)` stays a constructor. `__pos_0` on a string
-    /// shell is `same_as` of that word; `SomeChar` is not.
+    /// `ObjPtrKey(*mut Obj)` peels to that `Ref` the same way.
+    /// `__pos_0` on a string shell is `same_as` of that word; `SomeChar`
+    /// is not.
     #[test]
     fn erased_str_ptr_newtype_annotates_somestring_on_construct_field_and_receiver() {
         use crate::annotator::model::{SomeString, s_str0, union};
@@ -2846,10 +2847,10 @@ mod tests {
             })
         });
         assert!(
-            constructs_obj_key
-                && !returns_input(&obj_g)
+            !constructs_obj_key
+                && returns_input(&obj_g)
                 && !matches!(input_ty(&obj_g), ValueType::Str),
-            "ObjPtrKey stays a class; graph={}",
+            "ObjPtrKey(ptr) is the inner Ref; graph={}",
             obj_g.dump()
         );
 

@@ -201,12 +201,18 @@ def run_layout_sidecar(engine) -> int:
             {"item_meta": {"name": f"ty{i}", "doc": "\u00e9" * 64}, "layout": [i]}
             for i in range(60_000)
         ]
+        # SerDedup's first definition can precede type_decls in Charon's
+        # name tables. The tuple field must retain that definition when the
+        # sidecar drops function bodies (VersionTag(u64) on wasm32).
+        type_decls[0]["kind"] = {"Struct": [{"ty": {"Deduplicated": 36}}]}
+        item_names = [{"Value": [36, {"Scalar": {"Integer": {"Unsigned": "U64"}}}]}]
         fun_decls = [{"body": "\u2603" * 512, "index": i} for i in range(2_000)]
         artefact = {
             "charon_version": "probe",
             "translated": {
                 "crate_name": "probe",
                 "files": [{"name": {"Local": "src/lib.rs"}}],
+                "item_names": item_names,
                 "type_decls": type_decls,
                 "fun_decls": fun_decls,
             },
@@ -222,6 +228,8 @@ def run_layout_sidecar(engine) -> int:
             "has_errors": False,
             "translated": {
                 "crate_name": "probe",
+                "files": [{"name": {"Local": "src/lib.rs"}}],
+                "item_names": item_names,
                 "type_decls": type_decls,
                 "fun_decls": [],
             },
@@ -230,7 +238,7 @@ def run_layout_sidecar(engine) -> int:
         wide = len(encoded) > engine.LAYOUT_DECODE_WINDOW
         leftover = list(dest.parent.glob(f".{dest.name}.tmp-*"))
         ok = slim == expected and wide and leftover == []
-        print(f"{'ok  ' if ok else 'FAIL'} layout sidecar keeps type_decls and drops bodies")
+        print(f"{'ok  ' if ok else 'FAIL'} layout sidecar keeps type dedup definitions and drops bodies")
         return 0 if ok else 1
     finally:
         shutil.rmtree(root, ignore_errors=True)

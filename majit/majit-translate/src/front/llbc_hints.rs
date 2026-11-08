@@ -7,7 +7,8 @@
 //! `_random_effects_on_gcobjs_<NAME>`,
 //! `_callable_elidable_function_<NAME>`,
 //! `_funcptr_canraise_false_<NAME>`,
-//! `_jit_llop_<NAME>`).
+//! `_jit_llop_<NAME>`,
+//! `_MAJIT_MAY_FORCE_<NAME>`).
 //!
 //! The source attribute (`#[elidable]` / `#[dont_look_inside]` / …) is
 //! consumed by the proc-macro at expansion time and does NOT survive in
@@ -45,6 +46,11 @@ const CONST_PREFIX_HINTS: &[(&str, &[&str])] = &[
     ("_jit_elidable_or_memerror_", &["elidable_or_memerror"]),
     ("_jit_cannot_raise_", &["cannot_raise"]),
     ("_jit_loop_invariant_", &["loopinvariant"]),
+    // `#[jit_may_force]` — harvested like `_jit_cannot_raise_`. RPython
+    // has no may-force attribute; `graphanalyze.py` `analyze` returns
+    // `top_result()` for an `indirect_call` whose graph set is None, and
+    // the walker residualizes the surface.
+    ("_MAJIT_MAY_FORCE_", &["may_force"]),
     ("_jit_unroll_safe_", &["unroll_safe"]),
     // objectmodel.py `not_rpython` sets `_not_rpython_ = True`;
     // flowspace/objspace.py:21 rejects the function before graph building.
@@ -122,6 +128,17 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
                     &mut out,
                     marker_path_to_fn_path(&path, "_jit_look_inside_", &function_paths),
                     hint,
+                );
+                continue;
+            }
+            // `#[jit_may_force]` body-local `const _MAJIT_MAY_FORCE` (no
+            // function-name suffix). The suffixed sibling
+            // `_MAJIT_MAY_FORCE_<fn>` is harvested via `CONST_PREFIX_HINTS`.
+            if leaf == "_MAJIT_MAY_FORCE" {
+                push_hint(
+                    &mut out,
+                    marker_path_to_fn_path(&path, "_MAJIT_MAY_FORCE", &function_paths),
+                    "may_force",
                 );
                 continue;
             }
@@ -1035,7 +1052,7 @@ fn bool_assigned_to_return(llbc: &Llbc, init_id: u64) -> Option<bool> {
 /// Read the `&'static str` value of an oopspec marker const. The init
 /// body assigns `Local(0) = Const(ConstantExpr)` whose kind is the
 /// string literal (`[{"Str": spec}, ty]`), mirroring [`global_marker_bool`]'s bool path.
-fn global_marker_str(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
+pub(crate) fn global_marker_str(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
     if let Some(value) = gd.rest.get("value")
         && let Some(spec) = decode_str_const(llbc, value)
     {

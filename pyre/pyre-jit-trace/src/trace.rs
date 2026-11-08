@@ -2265,22 +2265,12 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         _ => None,
     };
     // `finishframe` nulls `last_exc_value` before `make_result_of_lastop`
-    // on the caller. This bridge's grab is that value, and the seed above
-    // copied it into `current_exc_*` as well. `POP_EXCEPT` does not write
-    // those slots, so the mirror here is still the grab, not an outer
-    // exception the handler restored. With the grab still set,
-    // `seed_standing_exception_for_walk` keeps the carrier copy and
-    // `dispatch_via_miframe` resumes the caller at its handler.
-    if subwalk_result.is_some()
-        && ctx.bridge_source_is_exception_guard()
-        && !sym.last_exc_value().is_null()
-    {
-        sym.set_current_exc_value(pyre_object::PY_NULL);
-        sym.set_current_exc_box(majit_ir::OpRef::NONE);
-        sym.set_last_exc_value(pyre_object::PY_NULL);
-        sym.set_last_exc_box(majit_ir::OpRef::NONE);
-        sym.set_class_of_last_exc_is_const(false);
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    // on the caller. Innermost `SubReturn` and a catching middle that then
+    // `SubReturn`s both go through `drive_middles_finishframe`, which
+    // clears. Keep the same clear here so a later drain abort still sees
+    // a consumed grab (`seed_standing_exception_for_walk`).
+    if subwalk_result.is_some() && ctx.bridge_source_is_exception_guard() {
+        finishframe_clear_last_exc(&session, sym);
     }
     if let Some(result) = subwalk_result {
         // Depth-N: after the deepest callee returns cleanly, `finishframe`
@@ -2565,6 +2555,31 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     p2_drain_abort()
 }
 
+/// `pyjitpl.py MetaInterp.finishframe`: `self.last_exc_value = nullptr`
+/// before `make_result_of_lastop` on the caller. A catching helper that
+/// `SubReturn`s has consumed the grab; leaving it on the portal sym seeds
+/// `current_exception_seed` into remaining VALUE-path middles and the
+/// root (`drive_bridge_frame_subwalk`), so `check`'s `except OverflowError`
+/// compiles instead of `_pow_ovf2long`.
+fn finishframe_clear_last_exc<Sym: WalkSym>(
+    session: &std::cell::RefCell<crate::jitcode_dispatch::WalkSession>,
+    sym: &mut Sym,
+) {
+    {
+        let mut sess = session.borrow_mut();
+        sess.last_exc_value = None;
+        sess.last_exc_value_concrete = crate::state::ConcreteValue::Null;
+    }
+    if !sym.last_exc_value().is_null() {
+        sym.set_current_exc_value(pyre_object::PY_NULL);
+        sym.set_current_exc_box(majit_ir::OpRef::NONE);
+        sym.set_last_exc_value(pyre_object::PY_NULL);
+        sym.set_last_exc_box(majit_ir::OpRef::NONE);
+        sym.set_class_of_last_exc_is_const(false);
+    }
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+}
+
 /// `pyjitpl.py finishframe` over paused carrier middles after a callee
 /// `SubReturn`. Deepest-first: deliver `result` into each middle and walk it.
 /// A middle `SubReturn` continues this walk. A middle `SubRaise` is
@@ -2586,6 +2601,7 @@ fn drive_middles_finishframe<Sym: WalkSym>(
     middles: &[majit_metainterp::ReconstructRecipe],
     mut result: majit_ir::OpRef,
 ) -> Option<TraceAction> {
+    finishframe_clear_last_exc(session, sym);
     for i in (0..middles.len()).rev() {
         match drive_middle_frame_and_thread(
             live_trace_ctx(meta),

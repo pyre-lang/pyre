@@ -995,6 +995,7 @@ impl CodeWriter {
         // align SSI phis and rebucket kind lists, then cast a GcRef link
         // that still feeds a Signed inputarg.
         super::type_state::promote_gc_field_bases(rewritten_graph, Some(callcontrol));
+        super::type_state::stamp_unknown_call_args(rewritten_graph);
         super::type_state::align_gc_link_args(rewritten_graph);
         // Stamp address results before kind lists are split, so a cell
         // that moves to the int bank is not left inside a ref list.

@@ -7,10 +7,12 @@ use common::{
     INTERPRETER_LLBC, MODULE_LLBC, load_llbc, lower_named_with_static_addrs, with_shared_lowering,
 };
 use majit_charon_reader::Llbc;
-use majit_translate::codewriter::call::CallControl;
+use majit_ir::descr::{ExtraEffect, OopSpecIndex};
+use majit_ir::value::Type;
+use majit_translate::codewriter::call::{AnalysisCache, CallControl};
 use majit_translate::codewriter::codewriter::CodeWriter;
 use majit_translate::codewriter::jitcode::JitCode;
-use majit_translate::model::{CallTarget, ExitCase, ExitSwitch, LinkArg, OpKind};
+use majit_translate::model::{CallTarget, ExitCase, ExitSwitch, LinkArg, OpKind, SpaceOperation};
 use majit_translate::{CallPath, ErrorCarrierSpec, GraphTransformConfig, HostStaticAddrs};
 
 /// Load `pyre-interpreter.ullbc` once and share it across every test.
@@ -2109,4 +2111,368 @@ fn reconfigure_encoding_join_carries_str() {
         })
     });
     assert!(has_str_utf8, "reconfigure lost reminted str_utf8_w");
+}
+
+fn path_from_graph_name(name: &str) -> CallPath {
+    CallPath::from_segments(name.split("::").filter(|s| !s.is_empty()))
+}
+
+fn call_leaf(target: &CallTarget) -> String {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => segments.last().cloned().unwrap_or_default(),
+        CallTarget::Method { name, .. } => name.clone(),
+        other => format!("{other:?}"),
+    }
+}
+
+fn graph_summarize(graph: &majit_translate::model::FunctionGraph) -> String {
+    let except_exits = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.exits.iter())
+        .filter(|link| link.target == graph.exceptblock)
+        .count();
+    let mut lines = vec![format!(
+        "name={} return_type={:?} hints={:?} cannot_raise={} canraise={} except_exits={}",
+        graph.name,
+        graph.return_type,
+        graph.hints,
+        graph.func.cannot_raise_assertion,
+        graph.func.canraise,
+        except_exits,
+    )];
+    for block in &graph.blocks {
+        let switch = match &block.exitswitch {
+            Some(ExitSwitch::LastException) => " LastException".to_string(),
+            Some(other) => format!(" {other:?}"),
+            None => String::new(),
+        };
+        for op in &block.operations {
+            if let OpKind::Call { target, .. } = &op.kind {
+                lines.push(format!(
+                    "  b{} call {}{switch}",
+                    block.id.0,
+                    call_leaf(target),
+                ));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn extraeffect_of(
+    cc: &CallControl,
+    graph: &majit_translate::model::FunctionGraph,
+    arg_types: Vec<Type>,
+    result_type: Type,
+) -> Result<ExtraEffect, String> {
+    let path = path_from_graph_name(&graph.name);
+    let target = CallTarget::from_call_path(&path);
+    let op = SpaceOperation {
+        result: None,
+        kind: OpKind::Call {
+            target,
+            args: Vec::new(),
+            result_ty: majit_translate::model::ValueType::Int,
+        },
+    };
+    let mut cache = AnalysisCache::default();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cc.getcalldescr(
+            &op,
+            arg_types,
+            result_type,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        )
+    }));
+    match result {
+        Ok(descr) => Ok(descr.extra_info.extraeffect),
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_else(|| "getcalldescr panicked".to_string());
+            Err(msg)
+        }
+    }
+}
+
+fn dump_insn_text(line: &str) -> &str {
+    let text = line.trim();
+    text.split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or(text)
+}
+
+/// True when some `catch_exception L` target residual-calls and `ref_return`s
+/// without rebuilding a Result shell (`switch` on `__discriminant`).
+fn catch_arm_ref_returns_residual(dump: &str) -> bool {
+    let mut labels: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut current: Option<String> = None;
+    let mut buf = String::new();
+    let flush = |current: &mut Option<String>,
+                 buf: &mut String,
+                 labels: &mut std::collections::BTreeMap<String, String>| {
+        if let Some(name) = current.take() {
+            labels.insert(name, std::mem::take(buf));
+        }
+    };
+    for line in dump.lines() {
+        let text = dump_insn_text(line);
+        if text == "---" {
+            flush(&mut current, &mut buf, &mut labels);
+            continue;
+        }
+        if let Some(name) = text.strip_suffix(':')
+            && name.starts_with('L')
+            && name[1..].chars().all(|c| c.is_ascii_digit())
+        {
+            flush(&mut current, &mut buf, &mut labels);
+            current = Some(name.to_string());
+            continue;
+        }
+        if current.is_some() {
+            buf.push_str(text);
+            buf.push('\n');
+        }
+    }
+    flush(&mut current, &mut buf, &mut labels);
+    dump.lines()
+        .filter_map(|line| {
+            dump_insn_text(line)
+                .strip_prefix("catch_exception ")
+                .map(str::trim)
+        })
+        .any(|target| {
+            let Some(body) = labels.get(target) else {
+                return false;
+            };
+            (body.contains("residual_call") || body.contains("pow_ovf2long"))
+                && body.contains("ref_return")
+                && !body.contains("switch")
+                && !body.contains("reraise")
+        })
+}
+
+fn jitcode_dump_of(
+    cc: &mut CallControl,
+    graph: &majit_translate::model::FunctionGraph,
+) -> Result<String, String> {
+    let path = path_from_graph_name(&graph.name);
+    let jitcode = std::sync::Arc::new(JitCode::new(graph.name.clone()));
+    let mut codewriter = CodeWriter::new();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        codewriter.transform_graph_to_jitcode(
+            graph,
+            &path,
+            cc,
+            &GraphTransformConfig::default(),
+            &jitcode,
+            false,
+            0,
+        );
+    }));
+    match result {
+        Ok(()) => Ok(jitcode.dump()),
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_else(|| "transform_graph_to_jitcode panicked".to_string());
+            Err(msg)
+        }
+    }
+}
+
+/// `int_pow` must lower `match int_pow_nomod { Ok => w_int_new, Err => pow_ovf2long }`
+/// to descr_pow's `try: _pow except OverflowError: return _pow_ovf2long`.
+/// The look_inside_iff trampoline residual is the raise channel of that try
+/// (`ovfcheck` / `Result::Err`), so its calldescr is CanRaise and a
+/// `catch_exception` targets the ovf2long arm.
+#[test]
+fn int_pow_trampoline_residual_is_canraise_with_catch_to_ovf2long() {
+    let llbc = interp();
+    let names = [
+        "int_pow",
+        "int_pow_nomod",
+        "int_pow_nomod_trampoline",
+        "_orig_int_pow_nomod",
+        "__majit_call_target_int_pow_nomod",
+        "__majit_call_target_int_pow_nomod_trampoline",
+        "pow_ovf2long",
+    ];
+    let mut graphs = Vec::new();
+    for name in names {
+        match lower_function(llbc, name) {
+            Ok(graph) => {
+                eprintln!("=== graph {name} ===\n{}", graph_summarize(&graph));
+                graphs.push((name, graph));
+            }
+            Err(err) => eprintln!("=== graph {name} MISSING: {err:?} ==="),
+        }
+    }
+
+    let mut cc = CallControl::new();
+    cc.set_struct_fields(with_shared_lowering(llbc, |ctx| {
+        ctx.struct_field_registry()
+    }));
+    for (_, graph) in &graphs {
+        cc.register_function_graph(path_from_graph_name(&graph.name), graph.clone());
+    }
+
+    let two_ints = vec![Type::Int, Type::Int];
+    let two_refs = vec![Type::Ref, Type::Ref];
+    for (name, graph) in &graphs {
+        let (args, result) = if *name == "int_pow" {
+            (two_refs.clone(), Type::Ref)
+        } else if *name == "pow_ovf2long" {
+            (two_ints.clone(), Type::Ref)
+        } else {
+            (two_ints.clone(), Type::Int)
+        };
+        match extraeffect_of(&cc, graph, args, result) {
+            Ok(ee) => eprintln!("extraeffect {name} = {ee:?}"),
+            Err(err) => eprintln!("extraeffect {name} FAIL: {err}"),
+        }
+    }
+
+    let int_pow = graphs
+        .iter()
+        .find(|(name, _)| *name == "int_pow")
+        .map(|(_, g)| g)
+        .expect("int_pow lowers");
+    let nomod_call = int_pow.blocks.iter().find(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target, .. }
+                    if call_leaf(target).contains("int_pow_nomod")
+            )
+        })
+    });
+    if let Some(block) = nomod_call {
+        assert!(
+            matches!(block.exitswitch, Some(ExitSwitch::LastException)),
+            "int_pow's int_pow_nomod call must be LastException (descr_pow try/except); \
+             switch={:?} dump=\n{}",
+            block.exitswitch,
+            int_pow.dump()
+        );
+        let follow_call = |start: usize| -> String {
+            let mut id = start;
+            for _ in 0..int_pow.blocks.len() {
+                let body = &int_pow.blocks[id];
+                for op in &body.operations {
+                    if let OpKind::Call { target, .. } = &op.kind {
+                        return call_leaf(target);
+                    }
+                }
+                match body.exits.as_slice() {
+                    [link] if body.exitswitch.is_none() => id = link.target.0,
+                    _ => break,
+                }
+            }
+            format!("no-call-in-b{id}")
+        };
+        let exc = block
+            .exits
+            .iter()
+            .find(|link| link.last_exception.is_some())
+            .unwrap_or_else(|| panic!("nomod call has an exception exit: {}", int_pow.dump()));
+        let exc_leaf = follow_call(exc.target.0);
+        assert!(
+            exc_leaf.contains("pow_ovf2long"),
+            "exception edge must skip the Result match and reach pow_ovf2long, got {exc_leaf}: {}",
+            int_pow.dump()
+        );
+        let ok = block
+            .exits
+            .iter()
+            .find(|link| link.last_exception.is_none())
+            .unwrap_or_else(|| panic!("nomod call has a normal exit: {}", int_pow.dump()));
+        let ok_leaf = follow_call(ok.target.0);
+        assert!(
+            ok_leaf.contains("w_int_new"),
+            "normal edge must skip the Result match and reach w_int_new, got {ok_leaf}: {}",
+            int_pow.dump()
+        );
+    } else {
+        panic!(
+            "int_pow does not call int_pow_nomod; dump=\n{}",
+            int_pow.dump()
+        );
+    }
+
+    let trampoline_adapter = graphs
+        .iter()
+        .find(|(name, _)| *name == "__majit_call_target_int_pow_nomod_trampoline")
+        .map(|(_, g)| g);
+    if let Some(adapter) = trampoline_adapter {
+        let ee = extraeffect_of(&cc, adapter, two_ints, Type::Int)
+            .unwrap_or_else(|err| panic!("adapter getcalldescr: {err}"));
+        assert!(
+            ee > ExtraEffect::CannotRaise,
+            "int_pow_nomod_trampoline adapter extraeffect must be CanRaise \
+             (Result::Err is its raise channel), got {ee:?}"
+        );
+    }
+
+    let mut int_pow_runtime = int_pow.clone();
+    let hints = majit_translate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
+        std::slice::from_ref(llbc),
+    );
+    majit_translate::codewriter::error_carrier_edges::lower_error_carrier_edges(
+        &mut int_pow_runtime,
+        &majit_translate::OwnedErrorCarrierSpec::own(ERROR_CARRIER),
+        &|name| majit_translate::front::llbc_hints::exception_class_name_belongs(&hints, name),
+    );
+    let mut dump_cc = CallControl::new();
+    dump_cc.set_struct_fields(with_shared_lowering(llbc, |ctx| {
+        ctx.struct_field_registry()
+    }));
+    for (name, graph) in &graphs {
+        if *name == "int_pow" {
+            dump_cc.register_function_graph(
+                path_from_graph_name(&int_pow_runtime.name),
+                int_pow_runtime.clone(),
+            );
+        } else {
+            dump_cc.register_function_graph(path_from_graph_name(&graph.name), graph.clone());
+        }
+    }
+    match jitcode_dump_of(&mut dump_cc, &int_pow_runtime) {
+        Ok(dump) => {
+            eprintln!("=== int_pow jitcode ===\n{dump}");
+            assert!(
+                dump.contains("catch_exception"),
+                "int_pow jitcode must catch the nomod overflow into pow_ovf2long: {dump}"
+            );
+            assert!(
+                catch_arm_ref_returns_residual(&dump),
+                "int_pow catch arm must residual-call the ovf2long recovery and ref_return \
+                 (descr_pow except OverflowError: return _pow_ovf2long), got {dump}"
+            );
+        }
+        Err(err) => panic!("int_pow jitcode FAIL: {err}"),
+    }
+    if let Some((_, wrapper)) = graphs.iter().find(|(name, _)| *name == "int_pow_nomod") {
+        match jitcode_dump_of(&mut dump_cc, wrapper) {
+            Ok(dump) => eprintln!("=== int_pow_nomod jitcode ===\n{dump}"),
+            Err(err) => eprintln!("int_pow_nomod jitcode FAIL: {err}"),
+        }
+    }
+    if let Some((_, trampoline)) = graphs
+        .iter()
+        .find(|(name, _)| *name == "int_pow_nomod_trampoline")
+    {
+        match jitcode_dump_of(&mut dump_cc, trampoline) {
+            Ok(dump) => eprintln!("=== int_pow_nomod_trampoline jitcode ===\n{dump}"),
+            Err(err) => eprintln!("int_pow_nomod_trampoline jitcode FAIL: {err}"),
+        }
+    }
 }

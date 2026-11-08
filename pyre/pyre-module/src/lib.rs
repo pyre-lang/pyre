@@ -974,9 +974,15 @@ mod tests {
                 crate::module::_cffi_backend::cdataobj::raw_write_ptr as *const () as usize as i64,
             ),
         ];
-        for (module_key, interpreter_key, expected) in cases {
-            assert_eq!(bindings[module_key], *expected);
-            assert_eq!(bindings[interpreter_key], *expected);
+        for (module_key, interpreter_key, fallback) in cases {
+            assert_eq!(
+                bindings[module_key],
+                pyre_interpreter::occupied_published_addr(module_key, *fallback)
+            );
+            assert_eq!(
+                bindings[interpreter_key],
+                pyre_interpreter::occupied_published_addr(interpreter_key, *fallback)
+            );
         }
     }
 
@@ -1091,16 +1097,17 @@ mod tests {
         crate::register();
         let bindings: HashMap<&'static str, i64> =
             pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
-        let expected =
+        let fallback =
             crate::module::gc::interp_gc::run_finalizers_now as *const () as usize as i64;
-
-        assert_eq!(
-            bindings["pyre_module::module::gc::interp_gc::run_finalizers_now"],
-            expected
-        );
-        assert_eq!(
-            bindings["pyre_interpreter::module::gc::interp_gc::run_finalizers_now"],
-            expected
-        );
+        for path in [
+            "pyre_module::module::gc::interp_gc::run_finalizers_now",
+            "pyre_interpreter::module::gc::interp_gc::run_finalizers_now",
+        ] {
+            assert_eq!(
+                bindings.get(path).copied(),
+                Some(pyre_interpreter::occupied_published_addr(path, fallback)),
+                "missing {path}"
+            );
+        }
     }
 }

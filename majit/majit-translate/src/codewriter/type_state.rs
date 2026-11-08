@@ -903,12 +903,129 @@ pub(crate) fn align_gc_link_args(graph: &mut FunctionGraph) {
                     } else if arg_ty == ConcreteType::GcRef && soft_phi(&in_ty, link.target) {
                         FunctionGraph::set_concretetype_of_inline(input, ConcreteType::GcRef);
                         changed = true;
+                    } else if let Some(kind) = hard_reg_kind(in_ty) {
+                        // A link-only phi minted Unknown/Void is not an op
+                        // result, so `authoritative_result_types` never
+                        // stamps it. `regalloc.py consider` then skips it
+                        // and `insert_renamings` would have no colour for
+                        // a non-Void source. Pull the unset end to the
+                        // already-kinded dest (`make_dependencies` live
+                        // set is considered vars; the link arg is a use).
+                        if unset_link_end(arg_ty, link.target, protect_unit_return, returnblock) {
+                            FunctionGraph::set_concretetype_of_inline(var, kind);
+                            changed = true;
+                        }
+                    } else if let Some(kind) = hard_reg_kind(arg_ty)
+                        && unset_link_end(in_ty, link.target, protect_unit_return, returnblock)
+                    {
+                        FunctionGraph::set_concretetype_of_inline(input, kind);
+                        changed = true;
                     }
                 }
             }
         }
         if !changed {
             break;
+        }
+    }
+}
+
+fn hard_reg_kind(ty: ConcreteType) -> Option<ConcreteType> {
+    match ty {
+        ConcreteType::Signed | ConcreteType::GcRef | ConcreteType::Float => Some(ty),
+        ConcreteType::Void | ConcreteType::Unknown => None,
+    }
+}
+
+fn unset_link_end(
+    ty: ConcreteType,
+    target: crate::model::BlockId,
+    protect_unit_return: bool,
+    returnblock: crate::model::BlockId,
+) -> bool {
+    ty == ConcreteType::Unknown
+        || (ty == ConcreteType::Void && !(protect_unit_return && target == returnblock))
+}
+
+/// `make_three_lists` / `get_value_kind_var(Unknown) = 'r'` put an
+/// untyped operand in a kind list without writing `.concretetype`.
+/// Stamp that cell so `perform_register_allocation` `consider`s it
+/// (`regalloc.py` colours every non-Void var live across a link) and
+/// [`align_gc_link_args`] can pull the predecessor phi.
+pub(crate) fn stamp_unknown_call_args(graph: &mut FunctionGraph) {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::CallResidual {
+                    args_i,
+                    args_r,
+                    args_f,
+                    ..
+                }
+                | OpKind::CallElidable {
+                    args_i,
+                    args_r,
+                    args_f,
+                    ..
+                }
+                | OpKind::CallMayForce {
+                    args_i,
+                    args_r,
+                    args_f,
+                    ..
+                }
+                | OpKind::ConditionalCall {
+                    args_i,
+                    args_r,
+                    args_f,
+                    ..
+                }
+                | OpKind::ConditionalCallValue {
+                    args_i,
+                    args_r,
+                    args_f,
+                    ..
+                }
+                | OpKind::RecordKnownResult {
+                    args_i,
+                    args_r,
+                    args_f,
+                    ..
+                } => {
+                    stamp_unknown_vars(args_i, ConcreteType::Signed);
+                    stamp_unknown_vars(args_r, ConcreteType::GcRef);
+                    stamp_unknown_vars(args_f, ConcreteType::Float);
+                }
+                OpKind::InlineCall {
+                    args_i,
+                    args_r,
+                    args_f,
+                    ..
+                } => {
+                    stamp_unknown_vars(args_i, ConcreteType::Signed);
+                    stamp_unknown_vars(args_r, ConcreteType::GcRef);
+                    stamp_unknown_vars(args_f, ConcreteType::Float);
+                }
+                OpKind::IsConstant {
+                    value, kind_char, ..
+                }
+                | OpKind::IsVirtual {
+                    value, kind_char, ..
+                } => {
+                    if let Some(kind) = hard_reg_kind(kind_char_to_concrete(*kind_char)) {
+                        stamp_unknown_vars(std::slice::from_ref(value), kind);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn stamp_unknown_vars(vars: &[Variable], ty: ConcreteType) {
+    for var in vars {
+        if FunctionGraph::concretetype_of(var) == ConcreteType::Unknown {
+            FunctionGraph::set_concretetype_of_inline(var, ty);
         }
     }
 }
@@ -1784,6 +1901,76 @@ mod tests {
             FunctionGraph::concretetype_of(&void_inputs[0]),
             ConcreteType::GcRef,
             "a Void phi that is not the return leftover is the same pointer"
+        );
+    }
+
+    #[test]
+    fn align_gc_link_args_stamps_a_void_source_from_a_gcref_dest() {
+        let mut graph = FunctionGraph::new("void_src_gcref_dest");
+        let src = push_input(&mut graph, "p", ValueType::Void);
+        FunctionGraph::set_concretetype_of_inline(&src, ConcreteType::Void);
+        let (dst_bb, dst_inputs) = graph.create_block_with_arg_vars(1);
+        FunctionGraph::set_concretetype_of_inline(&dst_inputs[0], ConcreteType::GcRef);
+        graph.set_return(dst_bb, Some(dst_inputs[0].clone()));
+        graph.set_goto(graph.startblock, dst_bb, vec![src.clone()]);
+
+        align_gc_link_args(&mut graph);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&src),
+            ConcreteType::GcRef,
+            "a Void link source feeding a GcRef dest must leave the void bank"
+        );
+    }
+
+    #[test]
+    fn align_gc_link_args_stamps_an_unknown_source_from_a_signed_dest() {
+        let mut graph = FunctionGraph::new("unknown_src_signed_dest");
+        let src = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, src.clone());
+        let (dst_bb, dst_inputs) = graph.create_block_with_arg_vars(1);
+        FunctionGraph::set_concretetype_of_inline(&dst_inputs[0], ConcreteType::Signed);
+        graph.set_return(dst_bb, Some(dst_inputs[0].clone()));
+        graph.set_goto(graph.startblock, dst_bb, vec![src.clone()]);
+
+        align_gc_link_args(&mut graph);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&src),
+            ConcreteType::Signed,
+            "an Unknown link source feeding a Signed dest must be considered by regalloc"
+        );
+    }
+
+    #[test]
+    fn stamp_unknown_call_args_stamps_a_ref_list_operand() {
+        let mut graph = FunctionGraph::new("stamp_call_arg");
+        let obj = graph.alloc_value_var();
+        assert_eq!(FunctionGraph::concretetype_of(&obj), ConcreteType::Unknown);
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::InlineCall {
+                    jitcode: crate::jitcode::JitCodeHandle::new(std::sync::Arc::new(
+                        crate::jitcode::JitCode::new("callee"),
+                    )),
+                    args_i: vec![],
+                    args_r: vec![obj.clone()],
+                    args_f: Vec::new(),
+                    result_kind: 'r',
+                    arg_classes: String::new(),
+                },
+            });
+        graph.set_return(graph.startblock, None);
+
+        stamp_unknown_call_args(&mut graph);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&obj),
+            ConcreteType::GcRef,
+            "an Unknown residual/inline ref operand must be considered by regalloc"
         );
     }
 

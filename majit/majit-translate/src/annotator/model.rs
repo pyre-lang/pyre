@@ -3643,6 +3643,12 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         // above where a classdef-less instance absorbs any instance.  A
         // classdef-BEARING instance ∪ `Ptr` stays genuinely incompatible
         // and falls through to the loud default.
+        //
+        // `llannotation.py` `pairtype(SomePtr, SomeObject).union` is
+        // UnionError. A nullable classdef-less instance is not
+        // `lltype.nullptr(GcArray)`; that spelling is
+        // `cast_int_to_ptr(Ptr(GcArray(ITEM)), 0)` at the producer
+        // (`ann_cast_int_to_ptr`).
         (SomeValue::Instance(inst), SomeValue::Ptr(_))
         | (SomeValue::Ptr(_), SomeValue::Instance(inst))
             if inst.classdef.is_none() =>
@@ -5771,6 +5777,43 @@ mod tests {
             difference_Exception_Instance(&exc, &base_inst),
             SomeValue::Impossible
         ));
+    }
+
+    #[test]
+    fn union_classdef_less_instance_and_array_ptr_stays_instance() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget,
+        };
+        let nullable = SomeValue::Instance(SomeInstance::new(
+            None,
+            true,
+            std::collections::BTreeMap::new(),
+        ));
+        let live = SomeValue::Instance(SomeInstance::new(
+            None,
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let gc = SomeValue::Ptr(SomePtr::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Signed)),
+        }));
+        let raw = SomeValue::Ptr(SomePtr::new(Ptr {
+            TO: PtrTarget::Array(Array::new(LowLevelType::Signed)),
+        }));
+        for ptr in [&gc, &raw] {
+            for inst in [&nullable, &live] {
+                let u = union(inst, ptr).unwrap();
+                assert!(
+                    matches!(u, SomeValue::Instance(_)),
+                    "classdef-less Instance ∪ SomePtr(Array) stays the instance, got {u:?}"
+                );
+            }
+        }
+        let same = union(&gc, &gc).unwrap();
+        assert!(
+            matches!(same, SomeValue::Ptr(_)),
+            "SomePtr ∪ SomePtr of the same ll_ptrtype stays Ptr, got {same:?}"
+        );
     }
 
     #[test]

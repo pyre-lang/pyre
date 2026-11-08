@@ -5935,10 +5935,10 @@ unsafe fn fbw_bind_star_kwargs(
     let dstrategy = unsafe { (*(kwargs as *const pyre_object::W_DictObject)).dstrategy };
     if !std::ptr::eq(
         dstrategy,
-        &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF,
+        pyre_object::dictmultiobject::unicode_dict_strategy_ref(),
     ) && !std::ptr::eq(
         dstrategy,
-        &pyre_object::kwargsdict::KWARGS_DICT_STRATEGY_REF,
+        pyre_object::kwargsdict::kwargs_dict_strategy_ref(),
     ) {
         return None;
     }
@@ -5970,7 +5970,7 @@ unsafe fn fbw_bind_star_kwargs(
     let _ = roots.pin_root(kwargs);
     let lookup = if std::ptr::eq(
         dstrategy,
-        &pyre_object::kwargsdict::KWARGS_DICT_STRATEGY_REF,
+        pyre_object::kwargsdict::kwargs_dict_strategy_ref(),
     ) {
         pyre_object::kwargsdict::w_dict_lookup_or_null_kwargs_strategy
     } else {
@@ -10269,7 +10269,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[len_op, expected])?;
         let lookup = if std::ptr::eq(
             kw.strategy,
-            &pyre_object::kwargsdict::KWARGS_DICT_STRATEGY_REF,
+            pyre_object::kwargsdict::kwargs_dict_strategy_ref(),
         ) {
             crate::helpers::jit_dict_exact_kwargs_lookup_or_null as *const ()
         } else {
@@ -21411,44 +21411,6 @@ pub(crate) fn promote_published_null_return_since<Sym: WalkSym>(
     }
 }
 
-/// `//` / `%` and the other exact-int raisers publish + return NULL.
-/// After a successful inline of those tags, record `GUARD_NO_EXCEPTION`
-/// so a later zero divisor deopts instead of dest-writing NULL into
-/// the caller's `+=` slot (`flip_floor`).
-pub(crate) fn maybe_guard_no_exception_after_raising_binop<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    pc: usize,
-    int_arg_concretes: &[ConcreteValue],
-) -> Result<(), DispatchError> {
-    let Some(ConcreteValue::Int(tag)) = int_arg_concretes.first().copied() else {
-        return Ok(());
-    };
-    use pyre_interpreter::bytecode::BinaryOperator as B;
-    let raises = matches!(
-        pyre_interpreter::runtime_ops::binary_op_from_tag(tag),
-        Some(
-            B::FloorDivide
-                | B::InplaceFloorDivide
-                | B::Remainder
-                | B::InplaceRemainder
-                | B::TrueDivide
-                | B::InplaceTrueDivide
-                | B::Power
-                | B::InplacePower
-                | B::Lshift
-                | B::InplaceLshift
-                | B::Subscr
-        )
-    );
-    if !raises {
-        return Ok(());
-    }
-    ctx.trace_ctx
-        .record_guard(majit_ir::OpCode::GuardNoException, &[], 0);
-    walker_capture_snapshot_for_last_guard(ctx, pc)?;
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run_inline_call_subwalk<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -21749,22 +21711,15 @@ fn inline_fnaddr_call_setup_from_jc<Sym: WalkSym>(
     })
 }
 
-/// A helper CALL's outcome plus whether the CALL was turned into a residual
-/// that already recorded its own post-call exception guard.
-///
-/// A caller that adds a second guard of its own from the operator tag would
-/// record `GUARD_NO_EXCEPTION` twice for one call.
+/// A helper CALL's outcome. Residual CanRaise CALLs record
+/// `GUARD_NO_EXCEPTION` inside `handle_possible_exception`.
 struct InlineCallOutcome {
     outcome: DispatchOutcome,
-    guard_no_exception_recorded: bool,
 }
 
 impl From<DispatchOutcome> for InlineCallOutcome {
     fn from(outcome: DispatchOutcome) -> Self {
-        Self {
-            outcome,
-            guard_no_exception_recorded: false,
-        }
+        Self { outcome }
     }
 }
 
@@ -22010,7 +21965,6 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
         outcome: DispatchOutcome::SubReturn {
             result: (dst_bank != 'v').then_some(recorded),
         },
-        guard_no_exception_recorded: can_raise,
     })
 }
 
@@ -22462,7 +22416,11 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                 // helper latch (`finish_helper_abort_latch`); a failed splice
                 // discarded the staged image and either kept executing or
                 // returned this leftover `TraceTooLong`.
-                Err(error @ DispatchError::TraceTooLong { .. }) => {
+                // `ABORT_FORCE_QUASIIMMUT` is the same unwind
+                // (`opimpl_jit_force_quasi_immutable`): splice ran in
+                // `prepare_force_quasi_immutable_abort`.
+                Err(error @ DispatchError::TraceTooLong { .. })
+                | Err(error @ DispatchError::ForceQuasiImmutable { .. }) => {
                     self.exchange.completed.clear();
                     while !self.frames.is_empty() {
                         let _ = self.pop_frame();
@@ -23030,6 +22988,82 @@ pub(crate) fn splice_active_driver_ancestors<Sym: WalkSym>(trace_ctx: &TraceCtx)
             unsafe { std::slice::from_raw_parts(exchange.ancestor_frames, exchange.ancestor_len) };
         splice_ancestor_helper_slice(trace_ctx, ancestors, exchange.active_caller_pc)
     })
+}
+
+/// Paused helper sections for live looked-inside ancestors that
+/// `helper_subwalk_level` left unpublished (`Ok(None)` under a portal).
+///
+/// `capture_resumedata` numbers every `MIFrame` on `metainterp.framestack`.
+/// Those ancestors are the paused parent of the current `inline_call`
+/// (`int_pow` / `descr_pow` when the walk is inside the `look_inside_iff`
+/// trampoline). Outermost-first, excluding the currently walked innermost
+/// helper. Empty when the driver has no unpublished helper parent.
+pub(crate) fn unpublished_ancestor_helper_resume_frames<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> Result<Vec<InlineParentFrame>, DispatchError> {
+    SUBWALK_DRIVER.with(|slot| {
+        let pointer = slot.get();
+        if pointer.is_null() {
+            return Ok(Vec::new());
+        }
+        // SAFETY: same scoped driver pointer as `splice_active_driver_ancestors`.
+        let exchange = unsafe { &*(pointer as *const SubWalkExchange<'_, Sym>) };
+        if exchange.ancestor_len == 0 {
+            return Ok(Vec::new());
+        }
+        let ancestors =
+            unsafe { std::slice::from_raw_parts(exchange.ancestor_frames, exchange.ancestor_len) };
+        collect_unpublished_ancestor_helper_parents(
+            ctx.trace_ctx,
+            ctx.session,
+            ancestors,
+            exchange.active_caller_pc,
+            op_pc,
+        )
+    })
+}
+
+fn collect_unpublished_ancestor_helper_parents<Sym: WalkSym>(
+    trace_ctx: &mut TraceCtx,
+    session: &std::cell::RefCell<WalkSession>,
+    ancestors: &[SubWalkFrame<'_, Sym>],
+    innermost_caller_pc: usize,
+    op_pc: usize,
+) -> Result<Vec<InlineParentFrame>, DispatchError> {
+    let mut frames = Vec::new();
+    for i in 0..ancestors.len() {
+        let frame = &ancestors[i];
+        if !frame.fbw_mode.transparent_helper_subwalk {
+            continue;
+        }
+        let child_caller_pc = ancestors
+            .get(i + 1)
+            .map(|child| child.caller_pc)
+            .unwrap_or(innermost_caller_pc);
+        if helper_activation_already_on_framestack(&session.borrow(), &frame.frame_state) {
+            continue;
+        }
+        let Some(index) = frame
+            .fbw_mode
+            .transparent_helper_jitcode_index
+            .or(frame.body.jitcode_index)
+        else {
+            return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
+        };
+        let parent = paused_helper_caller_frame_from_banks(
+            trace_ctx,
+            index,
+            child_caller_pc,
+            &frame.registers_i,
+            &frame.registers_r,
+            &frame.registers_f,
+            &frame.frame_state,
+        )
+        .map_err(|_| DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })?;
+        frames.push(parent);
+    }
+    Ok(frames)
 }
 
 /// True when this helper activation already has an `MIFrame` in the image
@@ -23844,9 +23878,21 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
                     .or_else(|| (ctx.vstack_cur_pypc != 0).then_some(ctx.vstack_cur_pypc)),
                 ..ctx.fbw_mode.clone()
             };
+            // Same stamp as `run_orthodox_helper_subwalk`: a portal
+            // look-inside is `EntryPyPc::Jit(call_pc)` so
+            // `looked_inside_helper_resume_frames` can pause the Python
+            // caller. `capture_resumedata` numbers that MIFrame. Inheriting
+            // `EntryPyPc::Py` made `GUARD_NO_EXCEPTION` collapse to the
+            // Python CALL.
+            let helper_entry_py_pc =
+                if ctx.fbw_mode.inline_subwalk && matches!(ctx.entry_py_pc, EntryPyPc::Jit(_)) {
+                    ctx.entry_py_pc
+                } else {
+                    EntryPyPc::Jit(pc)
+                };
             (
                 fbw_mode,
-                ctx.entry_py_pc,
+                helper_entry_py_pc,
                 ctx.outer_resume_marker_jit_pc,
                 ctx.outer_jitcode_index,
             )
@@ -23960,7 +24006,14 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
             // register image is the resume coordinate, so do not mark the
             // abort as a callee-pc capability gap: that flag declines
             // single-frame adopt.
-            if !matches!(error, DispatchError::TraceTooLong { .. }) {
+            // `ABORT_FORCE_QUASIIMMUT` is the same unwind
+            // (`opimpl_jit_force_quasi_immutable`). A failed helper splice
+            // discarded the image so the enclosing Python CALL may latch
+            // (`mod2730`); the flag would decline that single-frame adopt.
+            if !matches!(
+                error,
+                DispatchError::TraceTooLong { .. } | DispatchError::ForceQuasiImmutable { .. }
+            ) {
                 ctx.session.borrow_mut().crossed_inline_subwalk = true;
             }
             if fbw_debug_abort_enabled() {
@@ -24637,7 +24690,6 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         &ref_arg_concretes,
         &[],
     )?;
-    let guard_no_exception_recorded = walked.guard_no_exception_recorded;
     let callee_outcome =
         promote_published_null_return_since(ctx, walked.outcome, op.pc, exc_before_subwalk)?;
 
@@ -24672,15 +24724,6 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 // every `x is y` recorded a guard for an operator the call
                 // never performs.
                 if is_binary_from_tag {
-                    // A CALL residualized through `jitcode.fnaddr` already
-                    // recorded its own `GUARD_NO_EXCEPTION`.
-                    if !guard_no_exception_recorded {
-                        maybe_guard_no_exception_after_raising_binop(
-                            ctx,
-                            op.pc,
-                            &int_arg_concretes,
-                        )?;
-                    }
                     if let Some(ConcreteValue::Int(tag)) = int_arg_concretes.first().copied() {
                         use pyre_interpreter::bytecode::BinaryOperator as B;
                         if matches!(

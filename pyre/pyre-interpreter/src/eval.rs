@@ -3386,6 +3386,7 @@ fn store_name_into_dict(w_ns: PyObjectRef, name: &str, hash: i64, value: PyObjec
 ///
 /// # Safety
 /// `w_name` must point to a valid `str` object.
+#[inline(never)]
 pub unsafe fn store_name_value_w(
     frame: &mut PyFrame,
     w_name: PyObjectRef,
@@ -3405,14 +3406,13 @@ pub unsafe fn store_name_value_w(
     let w_name = roots.get(name_slot);
     let value = roots.get(value_slot);
     let w_locals = roots.get(locals_slot);
-    // The trace's own `box_str_constant` names the key, so it is the same
-    // string object on every execution — `rstr.py ll_strhash`'s memo
-    // makes it hashed once rather than once per store.
-    let hash = unsafe { pyre_object::unicodeobject::w_str_hash_memoized(w_name) };
+    // `pyopcode.py STORE_NAME` is `space.setitem_str(w_locals, name, w)`.
+    // Hash is 0: `ModuleDictStrategy.setitem_str` discards it, and a
+    // non-module mapping hashes the borrowed bytes (`store_name_into_dict`).
     // A lone surrogate has no `&str` dict key. `setitem` below keeps the
     // object (`W_UnicodeObject.text_w` returns the buffer verbatim).
     if let Some(name) = unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_name) }
-        && store_name_into_dict(w_locals, name, hash, value)
+        && store_name_into_dict(w_locals, name, 0, value)
     {
         return Ok(());
     }
@@ -3462,17 +3462,24 @@ pub unsafe fn delete_name_w(frame: &mut PyFrame, w_name: PyObjectRef) -> Result<
 ///
 /// # Safety
 /// `w_name` must point to a valid `str` object.
+#[inline(never)]
 pub unsafe fn store_global_value_w(
     frame: &mut PyFrame,
     mut w_name: PyObjectRef,
     mut value: PyObjectRef,
 ) -> Result<(), PyError> {
-    let hash = unsafe { pyre_object::unicodeobject::w_str_hash_memoized(w_name) };
+    // `pyopcode.py STORE_GLOBAL` keeps the name, value and globals in
+    // GC-traced frame/argument slots. Hash is 0: `ModuleDictStrategy.setitem_str`
+    // discards it, and a non-module mapping hashes the borrowed bytes
+    // (`store_name_into_dict`). Avoid `is_some_and` so the walker does not
+    // record a synthetic closure ctor (`pyframe.py get_f_trace_opcodes`).
     let mut w_globals = frame.get_w_globals();
     if !w_globals.is_null() {
         let stored = pyre_object::with_roots!(value, w_globals, w_name => unsafe {
-            pyre_object::unicodeobject::w_str_get_value_opt(w_name)
-                .is_some_and(|name| store_name_into_dict(w_globals, name, hash, value))
+            match pyre_object::unicodeobject::w_str_get_value_opt(w_name) {
+                Some(name) => store_name_into_dict(w_globals, name, 0, value),
+                None => false,
+            }
         });
         if !stored {
             crate::baseobjspace::setitem(w_globals, w_name, value)?;

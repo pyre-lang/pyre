@@ -833,9 +833,8 @@ enum RewriteResult {
     /// alias into the rename map. `optimize_block` `None` return.
     Identity(crate::flowspace::model::Variable),
     /// Fold the result to a Constant. `optimize_block` `isinstance(op1, Constant)`.
-    /// Production rewrites Identity a `Const*` producer Variable; this
-    /// arm is hit by the test fold `__test_fold_to_const_int`.
-    #[cfg_attr(not(test), expect(dead_code))]
+    /// Used for a Constant `v_input` of `cast_int_to_ptr` whose dest is
+    /// int-kind (`history.getkind` of a raw Ptr).
     Constant(crate::flowspace::model::Constant),
     /// Keep the op unchanged
     Keep,
@@ -1714,6 +1713,15 @@ fn lltype_is_gc(tp: &crate::translator::rtyper::lltypesystem::lltype::LowLevelTy
         | LowLevelType::InteriorPtr(_) => to._gckind() == GcKind::Gc,
         _ => false,
     }
+}
+
+/// `history.getkind` of a `Ptr` whose `TO._gckind` is not `'gc'` is
+/// `'int'` (`rclass.py getgcflavor`). The rtyper writes that `Ptr` onto
+/// the result; restamping it to `OBJECT` would make `_is_gc` true.
+fn result_lltype_is_raw_ptr(var: &crate::flowspace::model::Variable) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    var.concretetype()
+        .is_some_and(|ct| matches!(ct, LowLevelType::Ptr(_)) && !lltype_is_gc(&ct))
 }
 
 /// A flow-graph `Constant` (`jtransform.py` `isinstance(v, Constant)`).
@@ -4240,6 +4248,33 @@ impl<'a> Transformer<'a> {
         }
     }
 
+    /// A GC-owner field whose MIR type is a GC pointer stays in the ref
+    /// bank. `rewrite_op_getfield` restamps a raw STRUCT load from an
+    /// Int base as Int (`getfield_raw_i`); a Signed base on a GC owner is
+    /// a mis-banked pointer `promote_gc_field_bases` rehomes, not a raw
+    /// struct. `history.getkind` of a GC `Ptr` is `"ref"`.
+    ///
+    /// A rtyper-written `Ptr` whose `TO._gckind` is raw is already int
+    /// (`rclass.py getgcflavor` / `history.getkind`). Isolated
+    /// `transform_graph` has `callcontrol is None` (`jtransform.py
+    /// Transformer.get_vinfo`), so [`Self::flavor_raw_ref_is_int_banked`]
+    /// cannot see the harvest; the lltype is the same fact.
+    fn gc_pointer_field_stays_ref(
+        &self,
+        field: &FieldDescriptor,
+        ty: &ValueType,
+        result: Option<&crate::flowspace::model::Variable>,
+    ) -> bool {
+        if result.is_some_and(result_lltype_is_raw_ptr) {
+            return false;
+        }
+        matches!(
+            ty,
+            ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder
+        ) && !self.flavor_raw_ref_is_int_banked(ty)
+            && crate::codewriter::type_state::field_owner_is_gc(field, self.callcontrol.as_deref())
+    }
+
     /// `jtransform.py Transformer.rewrite_op_malloc` reads `d['flavor']`
     /// from the result STRUCT (`rclass.py getgcflavor` /
     /// `TYPE.TO._gckind`). `history.getkind` of a raw `Ptr` is `'int'`.
@@ -4934,24 +4969,29 @@ impl<'a> Transformer<'a> {
     /// register holding the void call's garbage.  Only the
     /// declared-void-vs-resolved-Ref shell case and a declared raw ADT's
     /// coarse Ref token are rewritten; other calls keep `result_ty`.
+    ///
+    /// `declared` is `FUNC.RESULT` of the called function's lltype
+    /// (`call.py getcalldescr` for `direct_call` and `indirect_call`
+    /// alike): `declared_result_type_for_target` for a direct target, the
+    /// trait method family's signature (`declared_result_type_for_indirect`
+    /// / family witness graphs) for a vtable/indirect call.
     fn effective_call_result_ty(
         &self,
-        target: &CallTarget,
+        declared: Option<majit_ir::value::Type>,
+        target: Option<&CallTarget>,
         op_result: Option<&crate::flowspace::model::Variable>,
         result_ty: &ValueType,
     ) -> ValueType {
-        let declared_void = self
-            .callcontrol
-            .as_deref()
-            .and_then(|cc| cc.declared_result_type_for_target(target))
-            == Some(majit_ir::value::Type::Void);
-        if declared_void && self.resolve_call_result(op_result, result_ty).kind == 'r' {
+        if declared == Some(majit_ir::value::Type::Void)
+            && self.resolve_call_result(op_result, result_ty).kind == 'r'
+        {
             ValueType::Void
         } else if matches!(result_ty, ValueType::Ref(_))
-            && self
-                .callcontrol
-                .as_deref()
-                .is_some_and(|cc| cc.declared_raw_result_for_target(target))
+            && target.is_some_and(|target| {
+                self.callcontrol
+                    .as_deref()
+                    .is_some_and(|cc| cc.declared_raw_result_for_target(target))
+            })
         {
             // `call.py getcalldescr` uses FUNC.RESULT, not the frontend's
             // aggregate token. This also covers a caller whose annotation
@@ -5571,13 +5611,14 @@ impl<'a> Transformer<'a> {
                 funcptr,
                 args,
                 graphs,
-                family_key: _,
+                family_key,
                 result_ty,
             } if self.config.classify_calls => self.lower_indirect_call_op(
                 op,
                 funcptr,
                 args,
                 graphs.as_deref(),
+                family_key.as_ref(),
                 result_ty,
                 graph_name,
                 graph,
@@ -7174,6 +7215,15 @@ impl<'a> Transformer<'a> {
             }
             _ => unreachable!("rewrite_op_raw_malloc"),
         };
+        // Without a `CallControl` there is no calldescr to build; the op
+        // stays `RawMalloc`, as `rewrite_op_direct_call` leaves a plain
+        // `Call` when tests pass `callcontrol is None` (`jtransform.py`
+        // `get_vinfo`: `if self.callcontrol is None: return None  # for tests`).
+        // Varsizes (`Array(Char)` scoped cells) would otherwise unwrap in
+        // `_handle_oopspec_call`.
+        if self.callcontrol.is_none() {
+            return RewriteResult::Keep;
+        }
         if let Some(n) = length {
             return self._rewrite_raw_malloc_varsize(
                 op,
@@ -7409,6 +7459,11 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
         ptr: crate::flowspace::model::Variable,
     ) -> RewriteResult {
+        // Same test skip as `rewrite_op_raw_malloc`: `OS_RAW_FREE` needs a
+        // calldescr, and `getcalldescr` is behind `CallControl`.
+        if self.callcontrol.is_none() {
+            return RewriteResult::Keep;
+        }
         let target = CallTarget::function_path(["majit_rlib", "rffi", "ll_raw_free"]);
         let call = SpaceOperation {
             result: None,
@@ -9375,6 +9430,12 @@ impl<'a> Transformer<'a> {
         // word into the int bank so assemble emits `getfield_raw_i`.
         // Immutable fields already returned `_pure` above
         // (`MapNodeTerminatorView.w_cls`).
+        //
+        // A GC owner with a Signed base is not that raw-struct arm:
+        // `promote_gc_field_bases` rehomes the base (`cast_int_to_ptr` /
+        // stamp). Stamping the loaded GC pointer Int puts it in the
+        // caller's `args_i` while the callee jitcode still banks it as
+        // Ref (`ObjectKey.obj` → `dict_entries_probe_hashed`).
         if let OpKind::FieldRead { base, pure, .. } = &op.kind
             && !*pure
             && self.get_value_kind_var(base) == 'i'
@@ -9383,21 +9444,33 @@ impl<'a> Transformer<'a> {
                 .as_ref()
                 .is_some_and(|r| self.get_value_kind_var(r) == 'r')
         {
-            self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
-            return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::FieldRead {
-                    base: base.clone(),
-                    field: field.clone(),
-                    ty: ValueType::Int,
-                    pure: false,
-                },
-            }]);
+            if self.gc_pointer_field_stays_ref(field, ty, op.result.as_ref()) {
+                self.stamp_value_kind_from_value_type(graph, op.result.clone(), ty);
+            } else {
+                self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
+                return RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::FieldRead {
+                        base: base.clone(),
+                        field: field.clone(),
+                        ty: ValueType::Int,
+                        pure: false,
+                    },
+                }]);
+            }
         }
         if &typed_ty != ty {
             let OpKind::FieldRead { base, pure, .. } = &op.kind else {
                 return RewriteResult::Keep;
             };
+            // rtyper may have typed a `*mut PyObject` field as Signed.
+            // `history.getkind` of that GC pointer is still `"ref"`.
+            if self.gc_pointer_field_stays_ref(field, ty, op.result.as_ref())
+                && matches!(typed_ty, ValueType::Int | ValueType::Unsigned)
+            {
+                self.stamp_value_kind_from_value_type(graph, op.result.clone(), ty);
+                return RewriteResult::Keep;
+            }
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
                 kind: OpKind::FieldRead {
@@ -10412,51 +10485,101 @@ impl<'a> Transformer<'a> {
                 }
                 return rewritten;
             }
+            // `rbuiltin.py rtype_cast_int_to_ptr`: drop the Void PTRTYPE
+            // constant (`hop.inputargs(lltype.Void, lltype.Signed)`) and
+            // genop unary `cast_int_to_ptr` with `v_input`. The 2-arg
+            // front-end Call (`emit_typed_nullptr`) still has that
+            // marker; production feeds this rich MIR graph rather than
+            // the rtyped flowspace hop, so do the same drop here — for
+            // Ref results as for Int results.
             if is_lltype_cast_path(segments, "cast_int_to_ptr")
-                && args.len() == 1
-                && matches!(result_ty, ValueType::Ref(_) | ValueType::Str)
+                && let Some(input) = cast_int_to_ptr_v_input(op, args)
             {
-                let arg = resolve_alias(&args[0], &self.aliases);
-                // A raw-flavor dest is int-kind (`history.getkind`).
-                // Stamp Signed and keep the int word before the
-                // `cast_ptr_to_int` round-trip fold
-                // (`rewrite_op_cast_ptr_to_int`); that fold would
-                // restore the GC source.
-                if self.cast_int_to_ptr_is_int_identity(result_ty, op.result.as_ref()) {
-                    self.stamp_int_banked_cast_int_to_ptr_result(graph, op.result.clone());
-                    return RewriteResult::Identity(arg);
+                match input {
+                    CastIntToPtrInput::Var(v_input) => {
+                        let arg = resolve_alias(&v_input, &self.aliases);
+                        // A raw-flavor dest is int-kind (`history.getkind`).
+                        // Stamp Signed and keep the int word before the
+                        // `cast_ptr_to_int` round-trip fold
+                        // (`rewrite_op_cast_ptr_to_int`); that fold would
+                        // restore the GC source.
+                        if matches!(result_ty, ValueType::Int | ValueType::Unsigned)
+                            || self.cast_int_to_ptr_is_int_identity(result_ty, op.result.as_ref())
+                        {
+                            self.stamp_int_banked_cast_int_to_ptr_result(graph, op.result.clone());
+                            return RewriteResult::Identity(arg);
+                        }
+                        if matches!(result_ty, ValueType::Ref(_) | ValueType::Str) {
+                            if let Some(src) = self.cast_ptr_to_int_src.get(&arg).cloned() {
+                                return RewriteResult::Identity(src);
+                            }
+                            if self.get_value_kind_var(&arg) == 'i' {
+                                // Stamp the operand Signed so flatten emits
+                                // `cast_int_to_ptr/i>r` (`insns.rs`), not an
+                                // unwired `/r>r` from an unstamped Unknown.
+                                self.stamp_value_kind(
+                                    graph,
+                                    Some(arg.clone()),
+                                    crate::codewriter::type_state::ConcreteType::Signed,
+                                );
+                                self.stamp_value_kind_from_value_type(
+                                    graph,
+                                    op.result.clone(),
+                                    result_ty,
+                                );
+                                return rewrite_as_unary_llop(
+                                    op,
+                                    &v_input,
+                                    "cast_int_to_ptr",
+                                    result_ty.clone(),
+                                );
+                            }
+                            return RewriteResult::Identity(arg);
+                        }
+                    }
+                    CastIntToPtrInput::Const(c) => {
+                        if matches!(result_ty, ValueType::Int | ValueType::Unsigned)
+                            || self.cast_int_to_ptr_is_int_identity(result_ty, op.result.as_ref())
+                        {
+                            self.stamp_int_banked_cast_int_to_ptr_result(graph, op.result.clone());
+                            return RewriteResult::Constant(c);
+                        }
+                        if matches!(result_ty, ValueType::Ref(_) | ValueType::Str)
+                            && let Some(n) = c.value.as_int()
+                        {
+                            // A Constant integer is not a Variable slot.
+                            // Materialize it, then the unary llop
+                            // `rtype_cast_int_to_ptr` would have emitted.
+                            let v_input = graph.alloc_value_var_with_type(
+                                crate::codewriter::type_state::ConcreteType::Signed,
+                            );
+                            self.stamp_value_kind(
+                                graph,
+                                Some(v_input.clone()),
+                                crate::codewriter::type_state::ConcreteType::Signed,
+                            );
+                            self.stamp_value_kind_from_value_type(
+                                graph,
+                                op.result.clone(),
+                                result_ty,
+                            );
+                            return RewriteResult::Replace(vec![
+                                SpaceOperation {
+                                    result: Some(v_input.clone()),
+                                    kind: OpKind::ConstInt(n),
+                                },
+                                SpaceOperation {
+                                    result: op.result.clone(),
+                                    kind: OpKind::UnaryOp {
+                                        op: "cast_int_to_ptr".into(),
+                                        operand: v_input,
+                                        result_ty: result_ty.clone(),
+                                    },
+                                },
+                            ]);
+                        }
+                    }
                 }
-                if let Some(src) = self.cast_ptr_to_int_src.get(&arg).cloned() {
-                    return RewriteResult::Identity(src);
-                }
-                if self.get_value_kind_var(&arg) == 'i' {
-                    // Stamp the operand Signed so flatten emits
-                    // `cast_int_to_ptr/i>r` (`insns.rs`), not an unwired
-                    // `/r>r` from an unstamped Unknown.
-                    self.stamp_value_kind(
-                        graph,
-                        Some(arg.clone()),
-                        crate::codewriter::type_state::ConcreteType::Signed,
-                    );
-                    self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
-                    return rewrite_as_unary_llop(
-                        op,
-                        &args[0],
-                        "cast_int_to_ptr",
-                        result_ty.clone(),
-                    );
-                }
-                return RewriteResult::Identity(arg);
-            }
-            // A raw-pointer dest (`*const T`) is int-kind
-            // (`history.getkind`), so the cast is `rewrite_op_force_cast`'s
-            // same-size `_int_to_int_cast`: the result aliases the int word.
-            if is_lltype_cast_path(segments, "cast_int_to_ptr")
-                && args.len() == 1
-                && matches!(result_ty, ValueType::Int | ValueType::Unsigned)
-            {
-                self.stamp_int_banked_cast_int_to_ptr_result(graph, op.result.clone());
-                return RewriteResult::Identity(resolve_alias(&args[0], &self.aliases));
             }
             if args.len() == 1
                 && path_segments_end_with(segments, &["longlong2float", "float2longlong"])
@@ -11338,8 +11461,16 @@ impl<'a> Transformer<'a> {
                     // aggregate-shaped unit shell would disagree with the
                     // callee's `void_return`.  Reconcile it just like the
                     // residual-call arm below.
-                    let effective_result_ty =
-                        self.effective_call_result_ty(target, op.result.as_ref(), result_ty);
+                    let declared = self
+                        .callcontrol
+                        .as_deref()
+                        .and_then(|cc| cc.declared_result_type_for_target(target));
+                    let effective_result_ty = self.effective_call_result_ty(
+                        declared,
+                        Some(target),
+                        op.result.as_ref(),
+                        result_ty,
+                    );
                     let non_void_args = self
                         .callcontrol
                         .as_deref()
@@ -11428,8 +11559,16 @@ impl<'a> Transformer<'a> {
                     // Reconcile a `Result<(), PyError>` scoped callee's
                     // declared void `RESULT` against the `Ref` the front
                     // typed the unit `()` shell (see `effective_call_result_ty`).
-                    let effective_result_ty =
-                        self.effective_call_result_ty(target, op.result.as_ref(), result_ty);
+                    let declared = self
+                        .callcontrol
+                        .as_deref()
+                        .and_then(|cc| cc.declared_result_type_for_target(target));
+                    let effective_result_ty = self.effective_call_result_ty(
+                        declared,
+                        Some(target),
+                        op.result.as_ref(),
+                        result_ty,
+                    );
                     let result_ir_type = self
                         .resolve_call_result(op.result.as_ref(), &effective_result_ty)
                         .ir_type;
@@ -15123,10 +15262,12 @@ impl<'a> Transformer<'a> {
         funcptr: &crate::flowspace::model::Variable,
         args: &[crate::flowspace::model::Variable],
         graphs: Option<&[crate::parse::CallPath]>,
+        family_key: Option<&(String, String)>,
         result_ty: &ValueType,
         graph_name: &str,
         graph: &mut crate::model::FunctionGraph,
     ) -> RewriteResult {
+        let funcptr_target = self.fn_const_target_of(graph, funcptr);
         let materialized_funcptr = self.materialize_fn_const_funcptr_value(graph, funcptr);
         let funcptr_value = materialized_funcptr
             .as_ref()
@@ -15145,9 +15286,30 @@ impl<'a> Transformer<'a> {
         let args = filtered_args.as_slice();
         let (args_i, args_r, args_f, _) =
             self.rewrite_call_three_lists(args, graph_name, "call argument (indirect)");
-        let resolved_result = self.resolve_call_result(op.result.as_ref(), result_ty);
+        // `call.py getcalldescr`: RESULT is FUNC.RESULT of the called
+        // function, for `indirect_call` as for `direct_call`. A vtable
+        // method returning `()` has Void RESULT; `front::mir` still types
+        // the unit shell Ref. Reuse the direct-call correction.
+        let declared = self.callcontrol.as_deref().and_then(|cc| {
+            funcptr_target
+                .as_ref()
+                .and_then(|target| cc.declared_result_type_for_target(target))
+                .or_else(|| {
+                    family_key.and_then(|(trait_root, method_name)| {
+                        cc.declared_result_type_for_indirect(trait_root, method_name)
+                    })
+                })
+                .or_else(|| cc.declared_result_type_for_graphs(graphs))
+        });
+        let effective_result_ty = self.effective_call_result_ty(
+            declared,
+            funcptr_target.as_ref(),
+            op.result.as_ref(),
+            result_ty,
+        );
+        let resolved_result = self.resolve_call_result(op.result.as_ref(), &effective_result_ty);
         let result_kind = resolved_result.kind;
-        self.stamp_call_result(graph, op.result.clone(), result_ty);
+        self.stamp_call_result(graph, op.result.clone(), &effective_result_ty);
         let non_void_args = resolve_non_void_arg_types_from_vars(args);
         let result_ir_type = resolved_result.ir_type;
         let cc_mut = self
@@ -17523,8 +17685,59 @@ fn raw_list_header_store(
     });
 }
 
+/// Operand of a front-end `lltype.cast_int_to_ptr` Call after dropping
+/// the Void PTRTYPE marker (`rbuiltin.py rtype_cast_int_to_ptr`).
+enum CastIntToPtrInput {
+    Var(crate::flowspace::model::Variable),
+    Const(crate::flowspace::model::Constant),
+}
+
+/// `rbuiltin.py rtype_cast_int_to_ptr`:
+/// `v_type, v_input = hop.inputargs(lltype.Void, lltype.Signed)` then
+/// `hop.genop('cast_int_to_ptr', [v_input], resulttype=PTRTYPE)`.
+///
+/// The front-end Call is 2-arg `(PTRTYPE, int)` (`emit_typed_nullptr`).
+/// `call_arg_vars` already drops a Constant PTRTYPE, so a Variable
+/// integer arrives as `args.len() == 1`. A Constant integer (`0`) is
+/// dropped too; recover it from the original Call args.
+fn cast_int_to_ptr_v_input(
+    op: &SpaceOperation,
+    args: &[crate::flowspace::model::Variable],
+) -> Option<CastIntToPtrInput> {
+    if let OpKind::Call {
+        args: call_args, ..
+    } = &op.kind
+    {
+        let v_input = if call_args.len() == 2
+            && matches!(
+                &call_args[0],
+                LinkArg::Const(c)
+                    if matches!(
+                        c.value,
+                        crate::flowspace::model::ConstValue::LowLevelType(_)
+                    )
+            ) {
+            Some(&call_args[1])
+        } else if call_args.len() == 1 {
+            Some(&call_args[0])
+        } else {
+            None
+        };
+        if let Some(v_input) = v_input {
+            return match v_input {
+                LinkArg::Value(v) => Some(CastIntToPtrInput::Var(v.clone())),
+                LinkArg::Const(c) => Some(CastIntToPtrInput::Const(c.clone())),
+            };
+        }
+    }
+    match args {
+        [v] => Some(CastIntToPtrInput::Var(v.clone())),
+        _ => None,
+    }
+}
+
 /// Project a 1-arg host call to the unary llop the rtyper would have
-/// emitted (`Float2LongLongEntry.specialize_call`,
+/// emitted (`rtype_cast_int_to_ptr`, `Float2LongLongEntry.specialize_call`,
 /// `rewrite_op_cast_ptr_to_int`).
 fn rewrite_as_unary_llop(
     op: &SpaceOperation,
@@ -19956,6 +20169,203 @@ mod tests {
             !asm.insns.keys().any(|k| k.starts_with("getfield_raw_r")),
             "raw pointer field must not assemble getfield_raw_r, got {:?}",
             asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// `ObjectKey.obj` is a GC pointer. A Signed base is a mis-banked
+    /// GC address (`promote_gc_field_bases` rehomes it). The loaded
+    /// word stays Ref so a later `inline_call` puts it in `args_r`.
+    #[test]
+    fn gc_pointer_field_from_int_base_stays_in_the_ref_bank() {
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::model::FieldDescriptor;
+
+        let owner = "dictmultiobject::ObjectKey";
+        let mut graph = FunctionGraph::new("lookup_object_key_obj");
+        let key = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, key.clone());
+        let obj = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: key,
+                    field: FieldDescriptor::new("obj", Some(owner.into()))
+                        .with_owner_declared_gc(Some(true)),
+                    ty: ValueType::Ref(Some("pyobject::PyObject".into())),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(obj.clone()));
+
+        let out = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let (ty, result) = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { field, ty, .. } if field.name == "obj" => {
+                    Some((ty.clone(), op.result.clone()))
+                }
+                _ => None,
+            })
+            .expect("obj FieldRead");
+        assert!(
+            matches!(ty, ValueType::Ref(_)),
+            "GC pointer field must keep Ref ty, got {ty:?}"
+        );
+        let result = result.expect("obj FieldRead has a result");
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            ConcreteType::GcRef,
+            "GC pointer field must stay in the ref bank"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&obj),
+            ConcreteType::GcRef,
+            "the original result cell is the same pointer"
+        );
+    }
+
+    /// rtyper may have typed `*mut PyObject` as Signed. The MIR field
+    /// type is still a GC pointer; do not overlay Int onto it.
+    #[test]
+    fn gc_pointer_field_with_signed_cell_stays_in_the_ref_bank() {
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::model::FieldDescriptor;
+
+        let owner = "dictmultiobject::ObjectKey";
+        let mut graph = FunctionGraph::new("lookup_object_key_obj_signed");
+        let key = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, key.clone());
+        let obj = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: key,
+                    field: FieldDescriptor::new("obj", Some(owner.into()))
+                        .with_owner_declared_gc(Some(true)),
+                    ty: ValueType::Ref(Some("pyobject::PyObject".into())),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&obj, ConcreteType::Signed);
+        graph.set_return(graph.startblock, Some(obj.clone()));
+
+        let out = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let (ty, result) = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { field, ty, .. } if field.name == "obj" => {
+                    Some((ty.clone(), op.result.clone()))
+                }
+                _ => None,
+            })
+            .expect("obj FieldRead");
+        assert!(
+            matches!(ty, ValueType::Ref(_)),
+            "GC pointer field must keep Ref ty, got {ty:?}"
+        );
+        let result = result.expect("obj FieldRead has a result");
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            ConcreteType::GcRef,
+            "a Signed rtyper cell on a GC pointer field is restamped Ref"
+        );
+    }
+
+    /// Parent of `dict_entries_probe_hashed`: hash stays Int, obj is
+    /// Ref, so `make_three_lists` yields I[hash] R[entries, obj].
+    #[test]
+    fn gc_pointer_field_from_int_base_enters_the_call_ref_list() {
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::model::{CallTarget, FieldDescriptor, LinkArg};
+
+        let owner = "dictmultiobject::ObjectKey";
+        let mut graph = FunctionGraph::new("w_dict_lookup_probe_hashed");
+        let key = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let entries = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.push_inputarg_var(graph.startblock, key.clone());
+        graph.push_inputarg_var(graph.startblock, entries.clone());
+        let hash = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: key.clone(),
+                    field: FieldDescriptor::new("hash", Some(owner.into()))
+                        .with_owner_declared_gc(Some(true)),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&hash, ConcreteType::Signed);
+        let obj = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: key,
+                    field: FieldDescriptor::new("obj", Some(owner.into()))
+                        .with_owner_declared_gc(Some(true)),
+                    ty: ValueType::Ref(Some("pyobject::PyObject".into())),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let probed = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["dict_entries_probe_hashed"]),
+                    args: vec![
+                        LinkArg::Value(entries.clone()),
+                        LinkArg::Value(hash.clone()),
+                        LinkArg::Value(obj.clone()),
+                    ],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(probed));
+
+        let _out = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&hash),
+            ConcreteType::Signed,
+            "ObjectKey.hash stays in the int bank"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&obj),
+            ConcreteType::GcRef,
+            "ObjectKey.obj stays in the ref bank so make_three_lists puts it in args_r"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&entries),
+            ConcreteType::GcRef
+        );
+        let kinds: String = [&entries, &hash, &obj]
+            .into_iter()
+            .map(|var| match FunctionGraph::concretetype_of(var) {
+                ConcreteType::Signed => 'i',
+                ConcreteType::GcRef => 'r',
+                ConcreteType::Float => 'f',
+                ConcreteType::Void => 'v',
+                ConcreteType::Unknown => '?',
+            })
+            .collect();
+        assert_eq!(
+            kinds, "rir",
+            "probe_hashed args are entries, hash, obj → I[hash] R[entries, obj]"
         );
     }
 
@@ -36457,6 +36867,80 @@ mod tests {
         }
     }
 
+    /// `rbuiltin.py rtype_cast_int_to_ptr` drops the Void PTRTYPE
+    /// constant and genops unary `cast_int_to_ptr`. The 2-arg front-end
+    /// Call (`emit_typed_nullptr`: PTRTYPE + Const Int(0), result Ref)
+    /// must become that llop (kind r), not a residual symbolic fnaddr.
+    #[test]
+    fn lltype_cast_int_to_ptr_two_arg_gc_nullptr_becomes_unop() {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("cast_int_to_ptr_gc_nullptr");
+        let ptr_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Unsigned)),
+        }));
+        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        result.set_concretetype(Some(ptr_ty.clone()));
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: Some(result.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path([
+                        "rpython",
+                        "rtyper",
+                        "lltypesystem",
+                        "lltype",
+                        "cast_int_to_ptr",
+                    ]),
+                    args: vec![
+                        LinkArg::from(ConstValue::LowLevelType(Box::new(ptr_ty))),
+                        LinkArg::from(ConstValue::Int(0)),
+                    ],
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+        graph.set_return(graph.startblock, Some(result.clone()));
+        let out = Transformer::new(&config).transform(&graph);
+        let ops: Vec<_> = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            ops.iter().all(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => !is_lltype_cast_path(segments, "cast_int_to_ptr"),
+                _ => true,
+            }),
+            "2-arg Call must not remain; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp {
+                    op,
+                    result_ty: ValueType::Ref(_),
+                    ..
+                } if op == "cast_int_to_ptr"
+            )),
+            "GC 2-arg form becomes unary cast_int_to_ptr with Ref kind; ops={ops:?}"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            ConcreteType::GcRef,
+            "GC Ptr getkind is ref"
+        );
+    }
+
     /// `rewrite_op_force_cast` / `_int_to_int_cast`: CCHARP →
     /// CArrayPtr(Signed) is same-size raw, so the UnaryOp aliases.
     #[test]
@@ -40564,6 +41048,7 @@ mod tests {
                 ("items".to_string(), "[u64; 0]".to_string()),
             ],
         );
+        struct_fields.note_declared_gc_name("TypedItemsBlock");
         let mut cc = crate::call::CallControl::new();
         cc.set_struct_fields(struct_fields);
 

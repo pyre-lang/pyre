@@ -977,7 +977,12 @@ impl<'a> Lowering<'a> {
                             }
                         }
                         PlaceKind::Local(i) => {
-                            self.local_var[i as usize] = Some(LocalValue::One(value_var(&value)));
+                            let i = i as usize;
+                            if self.is_cell_local(i) {
+                                self.emit_cell_store(mir_bb, i, value_var(&value))?;
+                                return Ok(());
+                            }
+                            self.local_var[i] = Some(LocalValue::One(value_var(&value)));
                             return Ok(());
                         }
                         _ => {}
@@ -1022,6 +1027,22 @@ impl<'a> Lowering<'a> {
                     // move must not overwrite the class word.
                     let store_rstr_attr = self.exception_disc_info_for_ty(&field_base_ty).is_some()
                         && tyref_is_by_value_alloc_string(dest_ty, self.llbc);
+                    // GcArray length is immutable after allocation
+                    // (`lltype.py` `Array.getlength`; `rlist.py`
+                    // `ll_fixed_length`). A FieldWrite of the offset-0
+                    // integer of a declared two-field `{integer, [T; 0]}`
+                    // wrapper is a producer bug. Prefix fields of a
+                    // `GcStruct` with `_arrayfld`, and an ordinary
+                    // two-field struct that is not a declared `GcArray`,
+                    // stay ordinary stores.
+                    if self
+                        .flexible_gcarray_header_array_type_id(&field_base_ty, field_payload)
+                        .is_some()
+                    {
+                        return Err(LowerError::Unsupported(format!(
+                            "bb{mir_bb}: write of a GcArray length header (immutable after allocation)"
+                        )));
+                    }
                     // A multi-word inline field is the aggregate, not a
                     // pointer. Storing the temporary's address into the
                     // first word overwrites the discriminant.
@@ -1040,6 +1061,9 @@ impl<'a> Lowering<'a> {
                     // recursion; `jtransform.py rewrite_op_getsubstruct`).
                     // The typeptr leaf stays for `rewrite_op_setfield` /
                     // `is_typeptr_getset` to drop on a vtable object.
+                    // An integer newtype (`VersionTag(u64)`) is one word
+                    // (`history.getkind`): leaf-copy would GETFIELD
+                    // `__pos_0` with that Int as the base.
                     if !store_rstr_attr
                         && let Some(nested) = tyref_by_value_struct_decl(
                             dest_ty,
@@ -2475,6 +2499,16 @@ impl<'a> Lowering<'a> {
                         self.cast_ptr_to_int_src.insert(result.clone(), orig);
                         return Ok((Some(retype), result));
                     }
+                    // `i64 as *mut Utf8Str` is `cast_int_to_ptr(Ptr(STR), int)`:
+                    // the value is rstr `STR` (`node_is_string_value`), not
+                    // the 1-arg `MAJIT_REF_OPAQUE` placeholder.
+                    if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                        && tyref_raw_ptr_pointee_is_string_value(dest_ty, self.llbc)
+                    {
+                        let bb_id = self.emit_bb(mir_bb);
+                        let raw = emit_cast_int_to_strptr(&mut self.graph, bb_id, arg);
+                        return Ok((None, raw));
+                    }
                     // An address word cast to a raw-flavored instance pointer is
                     // `cast_int_to_ptr` of the raw `InstanceRepr` lowleveltype
                     // (`rbuiltin.py` `gen_cast`); routing it through GCREF would
@@ -2662,9 +2696,11 @@ impl<'a> Lowering<'a> {
                 // but LOGICAL negation on `bool`.  `BoolRepr` has no
                 // logical invert — it inherits `IntegerRepr`'s bitwise
                 // `~` — so `!bool` lowered to `invert` is an op the rtyper
-                // rejects.  Lower `!bool` to `eq(b, False)`, the orthodox
-                // logical negation, leaving integer `!` on the `invert`
-                // path.
+                // rejects.  A value use of `!bool` is `eq(b, False)`.
+                // A branch use is `flowcontext.py FlowContext.not_` /
+                // `guessbool`: `set_branch` peels that eq and swaps the
+                // exits, so no negation op feeds the switch. Integer `!`
+                // stays on the `invert` path.
                 let operand_is_bool =
                     matches!(self.operand_value_kind(&operand), Some(ValueType::Bool));
                 let op_label = unary_op_label(&op_json)?;
@@ -2727,6 +2763,10 @@ impl<'a> Lowering<'a> {
             // itself. Aliasing the dest local to the referent Variable
             // keeps the IR small, treating `&x` as a same-Variable copy.
             Rvalue::Ref { place, kind, .. } => {
+                if let Some(cell) = self.cell_local_of_address_place(&place) {
+                    let v = self.defined_local(mir_bb, cell)?;
+                    return Ok((None, v));
+                }
                 // `&mut *p` of a cell parameter is that cell. The reborrow
                 // does not load `value`.
                 if borrow_kind_is_exclusive(&kind)
@@ -2766,6 +2806,10 @@ impl<'a> Lowering<'a> {
             // `&raw const *p` is the address `p`. Resolving the deref
             // would `RawLoad` the pointee (`rewrite_op_raw_load`).
             Rvalue::RawPtr { place, .. } => {
+                if let Some(cell) = self.cell_local_of_address_place(&place) {
+                    let v = self.defined_local(mir_bb, cell)?;
+                    return Ok((None, v));
+                }
                 if let Some(inner) = self.raw_primitive_reborrow_inner(&place) {
                     let v = self.resolve_place(mir_bb, inner)?;
                     return Ok((None, v));
@@ -2872,12 +2916,14 @@ impl<'a> Lowering<'a> {
                 // directions ([`Lowering::ptr_cast_marker`]). `lltype.cast_pointer`
                 // (`lltype.py`) is pointer-to-pointer. UnaryOp Cast already
                 // calls `ptr_cast_marker` without a Charon kind gate;
-                // `ptr_cast_marker` requires a Ref source, so an int-to-ptr
-                // Scalar still falls through. A flavor-raw dest, a dest rstr
-                // `STR` (`*mut Utf8Str` / `shadow_stack_get as *mut Utf8Str`),
-                // and a dest GCREF (`rgc.cast_instance_to_gcref`) must reach
-                // the marker even when Charon spells the kind as something
-                // other than `RawPtr` (`*const () as *const CodeObject`).
+                // `ptr_cast_marker` requires a Ref source for a class
+                // narrow, and a Ref or Str source for dest-Str restore, so
+                // an int-to-ptr Scalar still falls through. A flavor-raw
+                // dest, a dest rstr `STR` (`*mut Utf8Str` /
+                // `shadow_stack_get as *mut Utf8Str`), and a dest GCREF
+                // (`rgc.cast_instance_to_gcref`) must reach the marker even
+                // when Charon spells the kind as something other than
+                // `RawPtr` (`*const () as *const CodeObject`).
                 let dest_flavor_raw = flavor_raw_pointer_class_root(
                     &ty,
                     self.llbc,
@@ -2965,6 +3011,14 @@ impl<'a> Lowering<'a> {
                     self.gc_struct_ids,
                     &self.raw_alloc_flavor_structs,
                 );
+                if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                    && matches!(dst_kind, ValueType::Str)
+                    && tyref_raw_ptr_pointee_is_string_value(&ty, self.llbc)
+                {
+                    let bb_id = self.emit_bb(mir_bb);
+                    let raw = emit_cast_int_to_strptr(&mut self.graph, bb_id, v);
+                    return Ok((None, raw));
+                }
                 let crosses_raw_ref = (src_raw_addr && matches!(dst_kind, ValueType::Ref(_)))
                     || (matches!(src_kind, Some(ValueType::Ref(_))) && dest_raw_addr);
                 if crosses_raw_ref
@@ -3059,16 +3113,19 @@ impl<'a> Lowering<'a> {
                     let bb_id = self.emit_bb(mir_bb);
                     return Ok((None, self.bind_array_view_len_in_block(bb_id, logical_len)));
                 }
-                let len_leaf = if self
+                let str_view_place = self
                     .string_byte_view_locals
                     .iter()
-                    .any(|local| place_references_local(&place, *local))
+                    .any(|local| place_references_local(&place, *local));
+                let recv_ty = place.ty.clone();
+                let base = self.resolve_place(mir_bb, place)?;
+                let len_leaf = if str_view_place
+                    || self.var_is_str_family_len_receiver(&base, Some(&recv_ty))
                 {
                     "__strlen"
                 } else {
                     "__len"
                 };
-                let base = self.resolve_place(mir_bb, place)?;
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -4338,6 +4395,12 @@ impl<'a> Lowering<'a> {
         &self,
         dest_ty: &TyRef,
     ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+        // `ann_cast_int_to_ptr` of `Ptr(STR)` is the string itself
+        // (`node_is_string_value`). Overlay would recast that header as a
+        // raw `SomePtr` and merge `Ptr ∪ String` with a field-load STR.
+        if tyref_raw_ptr_pointee_is_string_value(dest_ty, self.llbc) {
+            return None;
+        }
         let pointee = tyref_peel_one_raw_ptr_node(dest_ty, self.llbc)?;
         // `ann_cast_int_to_ptr(PTRTYPE, s_int)` keeps PTRTYPE; whether that
         // is a raw `Ptr(Struct)` or a GC pointer is `PTRTYPE.TO._gckind`.
@@ -4656,7 +4719,12 @@ impl<'a> Lowering<'a> {
     /// A `Ref` source is required for the narrow / address arms: an
     /// `addr_usize as *const Struct` reinterpret is `cast_int_to_ptr`
     /// territory and must alias instead. Dest-Str is the STR exception
-    /// for a pointer source (`rbuiltin.py` `gen_cast`).
+    /// for a pointer source (`rbuiltin.py` `gen_cast`). Dest-Str restore
+    /// also accepts a `Str` source — the same rstr `STR` header at a
+    /// different pointer mutability (`*mut UnicodeValueStorage` →
+    /// `*const UnicodeValueStorage`). Two-phase may seed that Input as
+    /// `SomeInstance(PyObject)`; the dest of this cast is still
+    /// `Ptr(STR)` / `SomeString`.
     pub(in crate::front::mir) fn dest_ty_is_rstr_str(&self, dest_ty: &TyRef) -> bool {
         tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves)
             .is_some_and(|root| is_rstr_str_layout_declaration(&root))
@@ -4718,6 +4786,7 @@ impl<'a> Lowering<'a> {
         // (`alloc_utf8_payload`) stays the identity alias.
         if let Some(root) = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves)
             && is_rstr_str_layout_declaration(&root)
+            && matches!(src_kind, Some(ValueType::Ref(_)) | Some(ValueType::Str))
         {
             if !src_is_pointer {
                 return None;
@@ -6138,6 +6207,9 @@ impl<'a> Lowering<'a> {
                     "bb{mir_bb}: const struct local {i} read as one word"
                 )))
             }
+            PlaceKind::Local(i) if self.is_cell_local(i as usize) => {
+                self.emit_cell_load(mir_bb, i as usize)
+            }
             PlaceKind::Local(i) => self
                 .local_var
                 .get(i as usize)
@@ -6229,8 +6301,15 @@ impl<'a> Lowering<'a> {
                     }
                     // An opaque dependency view has no field list, but the
                     // linked scalar bank still types the wrapper as its inner
-                    // word. The only projection that view emits is `__pos_0`.
-                    if field_name == "__pos_0"
+                    // word. Charon spells the positional field `_0`
+                    // (`is_positional`); the front names it `__pos_0`.
+                    // A by-value integer newtype (`VersionTag(u64)`) is
+                    // the same word (`history.getkind`).
+                    // A `&Newtype` is an address: `(*self).0` loads that
+                    // integer (`history.getkind` of the field). Aliasing
+                    // the deref would return the Ref receiver as the
+                    // payload.
+                    if (field_name == "__pos_0" || field_name == "_0")
                         && tyref_transparent_inner_value_type(
                             &inner.ty,
                             self.llbc,
@@ -6240,9 +6319,26 @@ impl<'a> Lowering<'a> {
                         )
                         .is_some()
                     {
-                        let wrapper_ty = clone_tyref(&inner.ty);
-                        let base = self.resolve_place(mir_bb, *inner)?;
-                        return Ok(self.cast_off_error_carrier(mir_bb, &wrapper_ty, base));
+                        let load_from_address = match &inner.kind {
+                            PlaceKind::Projection(pre, ProjectionElem::Atom(atom))
+                                if atom == "Deref" =>
+                            {
+                                tyref_transparent_inner_value_type(
+                                    &pre.ty,
+                                    self.llbc,
+                                    self.tombstoned_leaves,
+                                    self.gc_struct_ids,
+                                    &self.raw_alloc_flavor_structs,
+                                )
+                                .is_none()
+                            }
+                            _ => false,
+                        };
+                        if !load_from_address {
+                            let wrapper_ty = clone_tyref(&inner.ty);
+                            let base = self.resolve_place(mir_bb, *inner)?;
+                            return Ok(self.cast_off_error_carrier(mir_bb, &wrapper_ty, base));
+                        }
                     }
                     // A one-word niche `Option` is represented by its payload
                     // pointer, so the
@@ -6472,6 +6568,35 @@ impl<'a> Lowering<'a> {
                         container_is_enum,
                         owner_is_closure_env,
                     )? {
+                        return Ok(res);
+                    }
+                    // Length header of a declared two-field `GcArray`
+                    // wrapper (`lltype.py`): offset-0 integer immediately
+                    // before the `[T; 0]` tail. That word is `getarraysize`
+                    // / `ll_fixed_length` (`rlist.py`), not `getattr` of a
+                    // named field. Found by the `GcType` declaration plus
+                    // the two-field layout, never by the Rust field name
+                    // (`capacity` / `length`). A `GcStruct` with extra
+                    // prefix fields, and an ordinary struct with an
+                    // `_arrayfld` tail, keep those as `getattr`.
+                    if let Some(array_type_id) =
+                        self.flexible_gcarray_header_array_type_id(&inner.ty, field_payload)
+                    {
+                        let base = self.resolve_place(mir_bb, *inner)?;
+                        let bb_id = self.emit_bb(mir_bb);
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: OpKind::ArrayLen {
+                                base,
+                                array_type_id: Some(array_type_id),
+                                array: None,
+                                nolength: false,
+                                gckind: crate::model::ArrayGcKind::Gc,
+                            },
+                        });
                         return Ok(res);
                     }
                     if let Some((owner, flat_name, owner_id)) =
@@ -7460,7 +7585,13 @@ impl<'a> Lowering<'a> {
                 // and field-bearing strategy holders, whose address is stored
                 // in W_DictObject.dstrategy. A bare ConstRefAddr would instead
                 // annotate the latter as SomePtr and lose its instance repr.
-                if let Some(root) = self.refs_static_struct_root(&place_ty)
+                // `FnPtrCell` hook statics are Opaque in the consuming
+                // crate's LLBC (`majit_gc::hook_cell::FnPtrCell`), so
+                // `refs_static_struct_root` is empty; `immutablevalue`
+                // still annotates the prebuilt with its class.
+                if let Some(root) = self
+                    .refs_static_struct_root(&place_ty)
+                    .or_else(|| tyref_class_root_with(&place_ty, self.llbc, self.tombstoned_leaves))
                     && let Some(op @ OpKind::ConstRefAddr(_)) = self.static_addr_op(&segments)
                 {
                     let bb_id = self.emit_bb(mir_bb);
@@ -8176,7 +8307,9 @@ impl<'a> Lowering<'a> {
                 // TypeDecl (`bookkeeper.py` `getuniqueclassdef(cls)`).
                 let dest_adt = dest_ty.and_then(|ty| tyref_adt_map(ty, self.llbc));
                 let inst_adt = concrete_instantiation_adt(head_adt, dest_adt, self.llbc);
-                let suffix = inst_adt.and_then(|h| adt_head_instantiation_suffix(h, self.llbc));
+                let suffix = inst_adt.and_then(|h| {
+                    adt_head_instantiation_suffix(h, self.llbc, self.tombstoned_leaves)
+                });
                 let leaf =
                     enum_ctor_class_identity(&name_path, suffix.as_deref(), self.tombstoned_leaves);
                 let variant_owner = vec![leaf];
@@ -8314,6 +8447,124 @@ impl<'a> Lowering<'a> {
             .as_object()
     }
 
+    /// Field-base Adt, also peeling one `RawPtr`. `(*p).f` is Deref+Adt;
+    /// `p.f` on `*mut Block` is the pointee Adt (`strip_ty_wrappers`
+    /// does not peel `RawPtr`).
+    fn flexible_gcarray_field_base_adt<'s>(
+        &'s self,
+        base_ty: &'s TyRef,
+    ) -> Option<&'s serde_json::Map<String, serde_json::Value>> {
+        if let Some(adt) = self.field_base_adt(base_ty) {
+            return Some(adt);
+        }
+        let node = tyref_node(base_ty, self.llbc)?;
+        let stripped = strip_ty_wrappers(node, self.llbc)?;
+        let pointee = type_node_raw_ptr_pointee(stripped, self.llbc)?;
+        strip_ty_wrappers(pointee, self.llbc)?
+            .as_object()?
+            .get("Adt")?
+            .as_object()
+    }
+
+    /// ARRAY identity for a `GcArray` length-header read
+    /// (`ll_fixed_length` / `arraylen_gc`). The header is the offset-0
+    /// integer word of a declared two-field `{integer, [T; 0]}` wrapper
+    /// (`lltype.py` `GcArray`). A `GcStruct` with `_arrayfld` keeps
+    /// prefix fields (`Struct.__init__`); those reads stay `getattr`.
+    /// Shape alone is not enough: an ordinary two-field struct is not
+    /// a `GcArray`.
+    pub(in crate::front::mir) fn flexible_gcarray_header_array_type_id(
+        &self,
+        base_ty: &TyRef,
+        payload: &serde_json::Value,
+    ) -> Option<String> {
+        let (variant_idx, field_idx) = indexed_field_parts(payload)?;
+        if variant_idx.is_some() {
+            return None;
+        }
+        let offset = self.struct_field_offset_from_payload(base_ty, payload);
+        let is_length_header = match offset {
+            Some(0) => true,
+            Some(_) => false,
+            None => field_idx == 0,
+        };
+        if !is_length_header {
+            return None;
+        }
+        let type_id = type_decl_ref_adt_id(self.flexible_gcarray_field_base_adt(base_ty)?)?;
+        let td = self.llbc.type_by_id(type_id)?;
+        if !self.type_decl_is_declared_gc(td) {
+            return None;
+        }
+        let fields = type_decl_struct_fields(td, self.llbc)?;
+        if fields.len() != 2 {
+            return None;
+        }
+        let last = fields.last()?;
+        let last_spelling = tyref_to_field_layout_string(
+            &last.ty,
+            self.llbc,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        );
+        let (item, 0) = shaped_array_parts(&last_spelling)? else {
+            return None;
+        };
+        let header = fields.get(field_idx)?;
+        if !tyref_is_integer_scalar(&header.ty, self.llbc) {
+            return None;
+        }
+        Some(flexible_gcarray_array_type_id(item))
+    }
+
+    fn type_decl_is_declared_gc(&self, td: &TypeDecl) -> bool {
+        let name = strip_crate_prefix(&td.item_meta.name_path());
+        struct_id_is_declared_gc(
+            self.gc_struct_ids,
+            super::struct_id_for_type_decl(td),
+            &name,
+        )
+    }
+
+    /// ITEM of a declared two-field `{integer, scalar [T; 0]}` wrapper
+    /// (`TypedItemsBlock`). The translated value is the GcArray itself
+    /// (`ll_fixed_items`). Requires a declared `GcType`; the two-field
+    /// shape is not enough. ITEM follows
+    /// [`crate::annotator::bookkeeper::flexible_gcarray_primitive_item`].
+    pub(in crate::front::mir) fn tyref_scalar_flexible_gcarray_item(
+        &self,
+        ty: &TyRef,
+    ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+        let adt = self.flexible_gcarray_field_base_adt(ty)?;
+        let type_id = type_decl_ref_adt_id(adt)?;
+        let td = self.llbc.type_by_id(type_id)?;
+        if !self.type_decl_is_declared_gc(td) {
+            return None;
+        }
+        let fields = type_decl_struct_fields(td, self.llbc)?;
+        if fields.len() != 2 {
+            return None;
+        }
+        if !tyref_is_integer_scalar(&fields[0].ty, self.llbc) {
+            return None;
+        }
+        let last = fields.last()?;
+        let last_spelling = tyref_to_field_layout_string(
+            &last.ty,
+            self.llbc,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        );
+        crate::annotator::bookkeeper::flexible_gcarray_primitive_item(&last_spelling)
+    }
+
+    /// Two-field `{integer, scalar [T; 0]}` wrapper (`TypedItemsBlock`).
+    /// The translated value is the GcArray itself (`ll_fixed_items`).
+    /// Requires a declared `GcType`; the two-field shape is not enough.
+    pub(in crate::front::mir) fn tyref_is_scalar_flexible_gcarray(&self, ty: &TyRef) -> bool {
+        self.tyref_scalar_flexible_gcarray_item(ty).is_some()
+    }
+
     /// Resolve a `Field` projection `[variant, index]` off the place whose
     /// type is `base_ty`.  The projection names only the variant and the
     /// field index; the owning ADT, with the generic arguments of this use,
@@ -8372,7 +8623,7 @@ impl<'a> Lowering<'a> {
         let owner_root = if majit_charon_reader::ullbc::is_closure_leaf(&owner_leaf) {
             strip_crate_prefix(&name_path)
         } else {
-            match adt_head_instantiation_suffix(head, self.llbc) {
+            match adt_head_instantiation_suffix(head, self.llbc, self.tombstoned_leaves) {
                 Some(suffix) => majit_ir::descr::with_instantiation_suffix(&owner_base, &suffix),
                 None => match struct_instantiation_suffix(&name_path, head, self.llbc) {
                     Some(suffix) => {
@@ -8731,7 +8982,7 @@ impl<'a> Lowering<'a> {
         let def_id = inline_adt_def_id(v)?;
         let name_path = self.llbc.type_by_id(def_id)?.item_meta.name_path();
         let adt = v.as_object()?.get("Adt")?.as_object()?;
-        match adt_head_instantiation_suffix(adt, self.llbc) {
+        match adt_head_instantiation_suffix(adt, self.llbc, self.tombstoned_leaves) {
             Some(suffix) => Some(majit_ir::descr::with_instantiation_suffix(
                 &name_path, &suffix,
             )),
@@ -9907,6 +10158,42 @@ pub(in crate::front::mir) fn overlay_field_lltype(
     tyref_to_external_lltype(ty, llbc)
 }
 
+/// `lltype.cast_int_to_ptr(Ptr(STR), int)` for an integer word that is
+/// already an rstr `STR` (`alloc_utf8_payload` / `bh_alloc_str_nofill`).
+/// The 1-arg form annotates as `SomePtr(MAJIT_REF_OPAQUE)` and unions
+/// with a field-load `SomeString` (`w_str_storage`) at
+/// `module_dict_key_block`. `ann_cast_int_to_ptr` of `Ptr(STR)` is the
+/// string itself (`node_is_string_value`).
+pub(in crate::front::mir) fn emit_cast_int_to_strptr(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    addr: Variable,
+) -> Variable {
+    use crate::flowspace::model::ConstValue;
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+    let ptr_ty = STRPTR.clone();
+    let raw = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+    stamp_as_rstr_str(&raw);
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(raw.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::function_path([
+                "rpython",
+                "rtyper",
+                "lltypesystem",
+                "lltype",
+                "cast_int_to_ptr",
+            ]),
+            args: vec![
+                crate::model::LinkArg::from(ConstValue::LowLevelType(Box::new(ptr_ty))),
+                crate::model::LinkArg::from(addr),
+            ],
+            result_ty: ValueType::Str,
+        },
+    });
+    raw
+}
+
 /// `lltype.cast_int_to_ptr(PTRTYPE, int)` (`lltype.py` `ann_cast_int_to_ptr`).
 /// Same 2-arg shape as [`emit_rffi_cast_to_carray_ptr`]; dest is the overlay
 /// `Ptr`. Raw `Ptr` `getkind` is `'int'` (`history.py`).
@@ -10033,17 +10320,33 @@ pub(in crate::front::mir) fn emit_cast_int_to_voidpp(
     )
 }
 
+/// `Ptr(GcArray(ITEM))` (`lltype.py` `GcArray`).
+pub(in crate::front::mir) fn ptr_gcarray_lltype(
+    item: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr, PtrTarget};
+    LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Array(Array::gc(item)),
+    }))
+}
+
 /// Typed nullptr: `lltype.cast_int_to_ptr(PTRTYPE, 0)`.
 /// `cast_int_to_ptr` when `oddint == 0` is `nullptr(PTRTYPE.TO)`;
 /// `ann_cast_int_to_ptr` returns `SomePtr(PTRTYPE)`.
+/// `history.getkind` of a raw Ptr is `'int'`; a GC Ptr is `'r'`.
 pub(in crate::front::mir) fn emit_typed_nullptr(
     graph: &mut FunctionGraph,
     bb_id: BlockId,
     ptr_ty: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
 ) -> Variable {
     use crate::flowspace::model::ConstValue;
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
     let raw = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
     raw.set_concretetype(Some(ptr_ty.clone()));
+    let result_ty = match &ptr_ty {
+        LowLevelType::Ptr(p) if p._gckind() == GcKind::Gc => ValueType::Ref(None),
+        _ => ValueType::Int,
+    };
     graph.block_mut(bb_id).operations.push(SpaceOperation {
         result: Some(raw.clone()),
         kind: OpKind::Call {
@@ -10058,7 +10361,7 @@ pub(in crate::front::mir) fn emit_typed_nullptr(
                 crate::model::LinkArg::from(ConstValue::LowLevelType(Box::new(ptr_ty))),
                 crate::model::LinkArg::from(ConstValue::Int(0)),
             ],
-            result_ty: ValueType::Int,
+            result_ty,
         },
     });
     raw

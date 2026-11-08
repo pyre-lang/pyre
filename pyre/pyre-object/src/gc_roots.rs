@@ -1049,15 +1049,16 @@ pub extern "C" fn pin_roots_jit_abi(array: *const crate::object_array::GcTypedAr
 /// Flow-graph entry for a `Vec<PyObjectRef>` used as `&[PyObjectRef]`.
 ///
 /// The vec is the address of its header. Slice consumers read one
-/// length-prefixed object array. The residual call is
-/// [`gcarray_from_pyobject_vec_jit_abi`].
+/// length-prefixed object array. The published descr-word adapter calls
+/// this function (`dont_look_inside` residual), so the body must copy
+/// through [`gcarray_from_pyobject_vec_jit_abi`]. A null placeholder
+/// leaves `arraylen_gc` of the slice unstamped.
 #[inline]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn gcarray_from_pyobject_vec(
     items: &Vec<PyObjectRef>,
 ) -> *mut crate::object_array::GcTypedArray {
-    let _ = items;
-    std::ptr::null_mut()
+    gcarray_from_pyobject_vec_jit_abi(items as *const Vec<PyObjectRef> as *const u8)
 }
 
 /// `ItemsBlock` and `GcTypedArray` share the length word at offset 0 and the
@@ -1667,6 +1668,31 @@ mod tests {
             gcarray_from_pyobject_vec_jit_abi(&empty as *const Vec<PyObjectRef> as *const u8);
         assert!(!empty_array.is_null());
         assert_eq!(crate::object_array::gcarray_len(empty_array), 0);
+    }
+
+    /// The descr-word adapter residual-calls this graph function, not the
+    /// `*_jit_abi` sibling. A null placeholder made `arraylen_gc` of
+    /// `&vec` unstamped (`cffi_lib_attr_cell` / wrap_cdata_call).
+    #[test]
+    fn gcarray_from_pyobject_vec_adapter_returns_a_live_array() {
+        let items = vec![dummy(0x10), dummy(0x20), dummy(0x30)];
+        let array = gcarray_from_pyobject_vec(&items);
+        assert!(!array.is_null());
+        assert_eq!(crate::object_array::gcarray_len(array), 3);
+        assert_eq!(crate::object_array::getarrayitem_ref(array, 0), dummy(0x10));
+        assert_eq!(crate::object_array::getarrayitem_ref(array, 1), dummy(0x20));
+        assert_eq!(crate::object_array::getarrayitem_ref(array, 2), dummy(0x30));
+
+        let via_adapter = super::__majit_call_target_gcarray_from_pyobject_vec(
+            &items as *const Vec<PyObjectRef> as usize as i64,
+        );
+        assert_ne!(via_adapter, 0);
+        let adapted = via_adapter as usize as *mut crate::object_array::GcTypedArray;
+        assert_eq!(crate::object_array::gcarray_len(adapted), 3);
+        assert_eq!(
+            crate::object_array::getarrayitem_ref(adapted, 0),
+            dummy(0x10)
+        );
     }
 
     /// The scope guard is returned by value and dropped at end of
