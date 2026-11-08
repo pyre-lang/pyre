@@ -11608,7 +11608,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // #62: a self-recursive call the inline path declined (e.g. the
     // branchy `fib`) gets a direct `CALL_ASSEMBLER` to its own loop token
     // instead of the heavyweight func-entry
-    // residency residual. Independent of inline eligibility.
+    // residency residual. Emits CALL_ASSEMBLER only where
+    // `_opimpl_recursive_call` sets `assembler_call`.
     if let Some(ca) = try_walker_call_assembler_self_recursive(
         ctx,
         op,

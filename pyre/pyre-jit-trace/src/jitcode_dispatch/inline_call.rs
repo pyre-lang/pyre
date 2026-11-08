@@ -3567,8 +3567,10 @@ fn loop_carried_slot_keeps_fold_profitable<Sym: WalkSym>(
 /// already contains its handlers. A raise that crosses the boundary is
 /// `handle_possible_exception` (`GUARD_NO_EXCEPTION`).
 ///
-/// `has_abort_permanent` is the `look_inside_graph` (`codewriter/policy.py`)
-/// analog. Missing body facts cannot answer it, so they decline too.
+/// The `has_abort_permanent` decline (and the missing-facts decline) is a
+/// pyre-only screen with no upstream counterpart. `guess_call_kind`
+/// (`call.py`) returns `'recursive'` for a portal-runner call before any
+/// look-inside policy.
 fn foreign_callee_admits_call_assembler(w_code: *const ()) -> bool {
     let Some(facts) = sub_jitcode_body_facts_for_code(w_code) else {
         return false;
@@ -3600,8 +3602,10 @@ mod foreign_call_assembler_admission_tests {
 
     #[test]
     fn callee_exception_table_does_not_block_call_assembler() {
-        // `_opimpl_recursive_call` fall-through has no callee-table screen;
-        // `look_inside_graph` residualizes `has_abort_permanent` only.
+        // `_opimpl_recursive_call` fall-through has no callee-table screen.
+        // The `has_abort_permanent` decline is a pyre-only screen with no
+        // upstream counterpart (`guess_call_kind` returns `'recursive'` for
+        // a portal-runner call before any look-inside policy).
         assert!(foreign_callee_facts_admit_call_assembler(facts(
             true, false
         )));
@@ -3636,13 +3640,11 @@ mod foreign_call_assembler_admission_tests {
 /// identity is pinned upstream by the same `LOAD_GLOBAL` machinery the
 /// residual path already relies on.
 ///
-/// Parity note: upstream `_opimpl_recursive_call` (`pyjitpl.py`)
-/// counts same-greenkey portal frames on the framestack and flips to
-/// `assembler_call` only at `count >= memmgr.max_unroll_recursion`,
-/// inlining (`perform_call`) below the bound.  The inline attempt immediately
-/// preceding this function applies the same count, including reconstructed
-/// carrier frames, so reaching this fold at the recursion boundary has the
-/// same transition.
+/// Parity note: upstream `_opimpl_recursive_call` (`pyjitpl.py`) sets
+/// `assembler_call` only when `inlining` is on and `can_inline_callable` is
+/// false (the unroll bound first calls `dont_trace_here`). This fold consults
+/// that same predicate before recording IR. The inline attempt immediately
+/// preceding it applies the bound, including reconstructed carrier frames.
 pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -3720,6 +3722,32 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     else {
         return Ok(None);
     };
+    // `_opimpl_recursive_call` residualizes with `assembler_call = False`
+    // when `warmrunnerstate.inlining` is off. With inlining on, a callee
+    // `can_inline_callable` accepts is inlined through `perform_call`
+    // unless it is already `max_unroll_recursion` deep on the framestack;
+    // then `dont_trace_here` marks the key and the call falls through to
+    // `assembler_call = True`, as does a callee `can_inline_callable`
+    // rejects. FBW reaches this point only after its own inline attempt
+    // declined. That attempt applies the unroll bound through
+    // `disable_noninlinable_function_for_key`, so the key then answers
+    // false here; when it declined for a reason `can_inline_callable`
+    // does not check, upstream would still inline and this path leaves a
+    // plain residual. No driver means a skeleton walk: leave the call a
+    // plain residual.
+    let callee_green_key = crate::driver::make_green_key_typed(w_code, 0, is_being_profiled);
+    let assembler_call = {
+        let Some((driver, _)) = crate::driver::try_driver_pair() else {
+            return Ok(None);
+        };
+        let warm_state = driver
+            .meta_interp_mut()
+            .warm_state_for_driver(crate::state::PyreJitState::PYPYJIT_JD_INDEX);
+        warm_state.inlining() && !warm_state.can_inline_callable_for_key(&callee_green_key)
+    };
+    if !assembler_call {
+        return Ok(None);
+    }
     // Positional args fill `locals[0..co_argcount]`. Keyword-only defaults,
     // the empty `*args` tuple and the empty `**kwargs` dict are filled below
     // from the function object (`_match_signature`), so a scope that owns
@@ -3773,9 +3801,9 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // Any other callee is admitted only through
     // [`foreign_callee_admits_call_assembler`]. `_opimpl_recursive_call`
     // (`pyjitpl.py`) puts no condition on `assembler_call` once control
-    // reaches the fall-through. The remaining gate is `has_abort_permanent`,
-    // the `look_inside_graph` analog; a callee exception table lives in the
-    // target token.
+    // reaches the fall-through. The remaining `has_abort_permanent` (and
+    // missing-facts) decline is a pyre-only screen with no upstream
+    // counterpart; a callee exception table lives in the target token.
     if w_code as usize != caller_code as usize {
         let admit_mutual = ctx
             .session
