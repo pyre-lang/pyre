@@ -19162,6 +19162,100 @@ fn option_u8_window_discriminant_is_pointer_null_test() {
     }
 }
 
+/// `Rvalue::Discriminant` of `Option<*mut GCREFOpaque>` is
+/// `bool(self)` (`lltype.py` `SomePtr.bool` / `ptr_nonzero`).
+/// `is_(SomePtr, ConstNone)` folds because `SomePtr.can_be_none` is
+/// False (`binaryop.py` `is__default`); `transform.py`
+/// `transform_dead_code` would cut the None arm.
+#[test]
+fn option_gcref_discriminant_is_ptr_nonzero() {
+    use crate::model::OpKind;
+
+    let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let gcrefopaque = serde_json::json!({
+        "Adt": {"id": 1, "generics": empty_generics()}
+    });
+    let payload = serde_json::json!({"RawPtr": [gcrefopaque, "Mut"]});
+    let option_ty = option_adt_node(0, payload);
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "gcref_disc"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [option_ty.clone()],
+            "output": disc_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &disc_ty),
+                window_local(1, &option_ty)
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": window_span(),
+                    "kind": {"Assign": [
+                        window_place(serde_json::json!({"Local": 0}), &disc_ty),
+                        {"Discriminant": window_place(
+                            serde_json::json!({"Local": 1}),
+                            &option_ty
+                        )}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let llbc = window_llbc(
+        vec![
+            option_enum(0),
+            type_decl_struct(1, &["majit_gc", "header", "GCREFOpaque"], vec![]),
+        ],
+        vec![caller],
+    );
+    let graph = crate::test_support::lower_function(&llbc, "gcref_disc")
+        .unwrap_or_else(|err| panic!("lower GCREF Discriminant: {err}"));
+    let ops: Vec<&crate::model::SpaceOperation> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    let bool_ops = ops
+        .iter()
+        .filter(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "bool"))
+        .count();
+    assert!(
+        bool_ops >= 1,
+        "Option<GCREF> Discriminant must emit bool(self); graph={}",
+        graph.dump()
+    );
+    let has_is_const_none = ops
+        .iter()
+        .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_"))
+        && ops.iter().any(|op| matches!(&op.kind, OpKind::ConstNone));
+    assert!(
+        !has_is_const_none,
+        "Option<GCREF> Discriminant must not emit is_(p, ConstNone); graph={}",
+        graph.dump()
+    );
+    let disc_reads = ops
+        .iter()
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+            )
+        })
+        .count();
+    assert_eq!(
+        disc_reads,
+        0,
+        "Option<GCREF> Discriminant must not read __discriminant; graph={}",
+        graph.dump()
+    );
+}
+
 fn option_ref_niche_fixture_types() -> (serde_json::Value, serde_json::Value, serde_json::Value) {
     let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
     let pointee = serde_json::json!({

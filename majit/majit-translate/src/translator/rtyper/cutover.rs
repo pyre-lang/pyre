@@ -3903,11 +3903,11 @@ fn declared_return_annotation(
         }
     }
     let root = graph.return_class_root.as_deref()?;
-    if crate::annotator::bookkeeper::is_gcref_type_spelling(root) {
-        return None;
-    }
     let bk = registry.bookkeeper();
     // `llmemory.py` `GCREF`; `lltype.GcOpaqueType` has no ClassDef.
+    // `llannotation.py` `lltype_to_annotation` of that Ptr is `SomePtr`.
+    // A leftover `"gcref"` token on a registered GC pointer keeps its
+    // `return_class_root` (not a GCREF spelling) and intern's SomeInstance.
     if crate::annotator::bookkeeper::is_gcref_type_spelling(root) {
         return Some(crate::annotator::bookkeeper::gcref_ptr_annotation());
     }
@@ -18929,6 +18929,14 @@ mod tests {
             declared_return_annotation(&registry, &graph),
             None,
             "a real GCREF residual has no class root"
+        );
+        graph.return_type = Some("ref".into());
+        graph.return_class_root = Some("*mut GCREFOpaque".into());
+        let gcref_root = declared_return_annotation(&registry, &graph)
+            .expect("a GCREF class_root intern's SomePtr");
+        assert!(
+            matches!(gcref_root, SomeValue::Ptr(_)),
+            "llannotation.py lltype_to_annotation(GCREF) is SomePtr, got {gcref_root:?}"
         );
         let gcref = residual_return_annotation(Some(GCREF_RETURN_TYPE), None)
             .expect("gcref token shells as SomePtr");

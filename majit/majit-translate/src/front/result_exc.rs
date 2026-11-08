@@ -7034,18 +7034,22 @@ fn install_last_exception(
     mut exc: Link,
     exitcase: crate::model::ExitCase,
 ) {
-    // Caught value unused: `last_exception` / `last_exc_value` stay
-    // metadata (`flowspace/model.py` `Link.last_exception` extravars)
-    // and are not in `args`, so `error_carrier_edges` needs no landing
-    // (`except OperationError` that drops `e`).
+    // Hop catches that drop `e` keep `last_exception` / `last_exc_value`
+    // as extravars only, so `error_carrier_edges` does not insert a
+    // `from_exc_object` landing. Uncaught / reraise edges name
+    // `exceptblock`; `BlockRecorder.guessexception` puts the same
+    // Variables on `Link.args` and `Link.extravars`.
     let va = graph.alloc_value_var();
     let vb = graph.alloc_value_var();
     exc.exitcase = Some(exitcase);
     // `flatten.rs` `GotoIfExceptionMismatch` reads `link.llexitcase`.
     // The legacy walker never populates it (`iter_next.rs` StopIteration).
     let mut exc = exc.with_llexitcase_from_exitcase();
-    exc.last_exception = Some(LinkArg::Value(va));
-    exc.last_exc_value = Some(LinkArg::Value(vb));
+    exc.last_exception = Some(LinkArg::Value(va.clone()));
+    exc.last_exc_value = Some(LinkArg::Value(vb.clone()));
+    if exc.target == graph.exceptblock {
+        exc.args = vec![LinkArg::Value(va), LinkArg::Value(vb)];
+    }
     graph.set_control_flow_metadata(
         crate::model::BlockId(a),
         Some(ExitSwitch::LastException),

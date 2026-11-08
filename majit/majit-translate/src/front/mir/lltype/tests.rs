@@ -6,7 +6,8 @@ use super::{
     raw_field_address_value_type, shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
     tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root, tyref_is_closure_env,
     tyref_is_gcref_spelling, tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr,
-    tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_positional_aggregate_root,
+    tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_is_void_zst,
+    tyref_niche_option_gc_payload_spelling, tyref_positional_aggregate_root,
     tyref_ptr_pointee_is_vec, tyref_ref_param_class_root, tyref_shaped_tuple_root,
     tyref_to_attr_value_type_for_struct_field, tyref_to_value_type, tyref_tuple_suffix,
 };
@@ -15,7 +16,7 @@ use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
 
 use majit_charon_reader::{
     Llbc,
-    ullbc::{NameSeg, TyRef, TypeDeclKind},
+    ullbc::{Locals, NameSeg, TyRef, TypeDeclKind},
 };
 
 use crate::front::mir::tests::{
@@ -159,6 +160,14 @@ fn niche_option_gc_payload_spelling_is_option_of_instance_or_string() {
     assert!(!is_niche_option_gc_payload_spelling("Option<&[u8]>"));
     assert!(!is_niche_option_gc_payload_spelling(
         "Option<*mut GCREFOpaque>"
+    ));
+    // `&PyObjectRef` is `*mut PyObject`; the payload pretty-print is
+    // `&*mut PyObject`. Peel the shared borrow, then the raw GC pointer.
+    assert!(is_niche_option_gc_payload_spelling(
+        "Option<&*mut PyObject>"
+    ));
+    assert!(is_niche_option_gc_payload_spelling(
+        "Option<&*mut pyobject::PyObject>"
     ));
 }
 
@@ -8517,6 +8526,9 @@ fn result_with_pointer_like_err_still_paints_class_root() {
 #[test]
 fn option_of_raw_pointer_stays_classdef_less() {
     // `Option<*mut u8>` is the null-word niche, not an enum class.
+    // `*mut u8` is not a GC pointee (`is_niche_option_gc_payload_spelling`
+    // is false); the Input stamp stays classdef-less. A GC pointee such as
+    // `*mut pyobject::PyObject` is a different test.
     let llbc = llbc_with_types("fixture", vec![option_enum(0)], vec![]);
     let node = option_adt_node(0, raw_mut_u8_arg());
     assert_eq!(
@@ -8585,6 +8597,493 @@ fn option_of_unit_param_seeds_enum_template() {
         super::tyref_ref_param_class_root(&borrowed, &llbc, tomb, None),
         Some("option::Option".into()),
         "&Option<()> param seeds the harvested Option template"
+    );
+}
+
+fn fixture_llbc_with_gctype(
+    types: Vec<serde_json::Value>,
+    gctype_type_ids: &[u64],
+    extra_impls: Vec<serde_json::Value>,
+) -> Llbc {
+    let mut trait_impls: Vec<serde_json::Value> = gctype_type_ids
+        .iter()
+        .copied()
+        .map(gctype_impl_for_adt)
+        .collect();
+    trait_impls.extend(extra_impls);
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": types,
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": handle_trait_decls(),
+            "trait_impls": trait_impls
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+}
+
+fn option_payload_stamp_decls() -> Vec<serde_json::Value> {
+    let gcrefopaque = serde_json::json!({
+        "Adt": {"id": 1, "generics": empty_generics()}
+    });
+    let object_adt = serde_json::json!({
+        "Adt": {"id": 3, "generics": empty_generics()}
+    });
+    vec![
+        option_enum(0),
+        type_decl_struct(1, &["majit_gc", "header", "GCREFOpaque"], vec![]),
+        type_decl_alias(2, &["majit_gc", "header", "GCREF"], {
+            serde_json::json!({"RawPtr": [gcrefopaque, "Mut"]})
+        }),
+        type_decl_struct(3, &["pyre_object", "pyobject", "PyObject"], vec![]),
+        type_decl_alias(4, &["pyre_object", "pyobject", "PyObjectRef"], {
+            serde_json::json!({"RawPtr": [object_adt, "Mut"]})
+        }),
+        type_decl_struct(5, &["object_array", "TypedItemsBlock"], vec![]),
+    ]
+}
+
+fn option_payload_stamp_llbc() -> Llbc {
+    fixture_llbc_with_gctype(
+        option_payload_stamp_decls(),
+        &[3, 5],
+        vec![serde_json::json!({
+            "impl_trait": {
+                "id": 1,
+                "generics": {"types": [adt_node(3)]}
+            },
+            "types": [{
+                "kind": {"TraitType": [1, 0]},
+                "skip_binder": {"value": raw_mut_adt(3)}
+            }]
+        })],
+    )
+}
+
+fn option_adt_ty(payload: serde_json::Value) -> serde_json::Value {
+    option_adt_node(0, payload)
+}
+
+fn raw_mut_adt(id: u64) -> serde_json::Value {
+    serde_json::json!({"RawPtr": [adt_node(id), "Mut"]})
+}
+
+fn stamp_option_self_input(llbc: &Llbc, opt_ty: &serde_json::Value) -> (ValueType, Option<String>) {
+    let inputs = stamp_option_method_inputs(llbc, opt_ty, None);
+    inputs
+        .into_iter()
+        .find(|(name, _, _)| name == "self")
+        .map(|(_, ty, root)| (ty, root))
+        .expect("self Input")
+}
+
+fn stamp_option_method_inputs(
+    llbc: &Llbc,
+    opt_ty: &serde_json::Value,
+    closure_ty: Option<&serde_json::Value>,
+) -> Vec<(String, ValueType, Option<String>)> {
+    let span = fixture_span();
+    let mut locals_json = vec![
+        serde_json::json!({"index": 0, "name": null, "span": span, "ty": {"Tuple": []}}),
+        serde_json::json!({"index": 1, "name": "self", "span": span, "ty": opt_ty}),
+    ];
+    let arg_count = if let Some(closure_ty) = closure_ty {
+        locals_json.push(serde_json::json!({
+            "index": 2, "name": "f", "span": span, "ty": closure_ty
+        }));
+        2
+    } else {
+        1
+    };
+    let locals: Locals = serde_json::from_value(serde_json::json!({
+        "arg_count": arg_count,
+        "locals": locals_json
+    }))
+    .expect("fixture Locals");
+    let mut graph = FunctionGraph::new("option::Option::unwrap_or_else");
+    let empty_s: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let empty_u: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let gc_struct_ids = super::harvest_declared_gc_facts(llbc).gc_struct_ids();
+    super::super::flowcontext::pygraph_initial_block(
+        &mut graph,
+        &locals,
+        llbc,
+        None,
+        &empty_s,
+        &empty_u,
+        &gc_struct_ids,
+        false,
+        &empty_s,
+    );
+    graph
+        .block(graph.startblock)
+        .operations
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::Input {
+                name,
+                ty,
+                class_root,
+            } => Some((name.clone(), ty.clone(), class_root.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Substituted pointer-niche `Option<P>` Input stamp from `local.ty`.
+/// GCREF → `SomePtr` class_root; GC instance / `&PyObjectRef` /
+/// `*mut TypedItemsBlock` → `Option<{payload}>` so
+/// `is_niche_option_gc_payload_spelling` noneifies. `Option<i64>` is the
+/// tagged enum and stays `option::Option<i64>`.
+#[test]
+fn substituted_pointer_niche_option_param_input_stamp() {
+    let llbc = option_payload_stamp_llbc();
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let empty_s: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let helper =
+        |ty: &TyRef| tyref_niche_option_gc_payload_spelling(ty, &llbc, &gc_struct_ids, &empty_s);
+
+    let gcref_ty = TyRef::Other(option_adt_ty(raw_mut_adt(1)));
+    let gcref_root = helper(&gcref_ty);
+    assert!(
+        gcref_root
+            .as_deref()
+            .is_some_and(crate::annotator::bookkeeper::is_gcref_type_spelling),
+        "Option<*mut GCREFOpaque> stamps a GCREF class_root, got {gcref_root:?}"
+    );
+    let (gcref_ty_in, gcref_class) = stamp_option_self_input(&llbc, &option_adt_ty(raw_mut_adt(1)));
+    assert!(
+        !matches!(gcref_ty_in, ValueType::Void),
+        "GCREF Option self is not Void"
+    );
+    assert!(
+        gcref_class
+            .as_deref()
+            .is_some_and(crate::annotator::bookkeeper::is_gcref_type_spelling),
+        "Input stamp of Option<*mut GCREFOpaque> is GCREF, got {gcref_class:?}"
+    );
+
+    let py_ty = option_adt_ty(raw_mut_adt(3));
+    let (py_in, py_class) = stamp_option_self_input(&llbc, &py_ty);
+    assert!(
+        !matches!(py_in, ValueType::Void),
+        "Option<*mut PyObject> self is not Void"
+    );
+    assert!(
+        py_class
+            .as_deref()
+            .is_some_and(is_niche_option_gc_payload_spelling),
+        "Option<*mut PyObject> stamps a niche Option, got {py_class:?}"
+    );
+    assert!(
+        py_class.as_deref().is_some_and(|r| r.contains("PyObject")),
+        "payload spelling names PyObject, got {py_class:?}"
+    );
+
+    let borrowed_raw = serde_json::json!({"Ref": ["Erased", raw_mut_adt(3), "Shared"]});
+    let (borrowed_raw_in, borrowed_raw_class) =
+        stamp_option_self_input(&llbc, &option_adt_ty(borrowed_raw));
+    assert!(
+        !matches!(borrowed_raw_in, ValueType::Void),
+        "Option<&*mut PyObject> self is not Void"
+    );
+    assert!(
+        borrowed_raw_class
+            .as_deref()
+            .is_some_and(is_niche_option_gc_payload_spelling),
+        "Option<&*mut PyObject> stamps a niche Option, got {borrowed_raw_class:?}"
+    );
+
+    let borrowed_ref = serde_json::json!({"Ref": ["Erased", adt_node(4), "Shared"]});
+    let (borrowed_in, borrowed_class) =
+        stamp_option_self_input(&llbc, &option_adt_ty(borrowed_ref));
+    assert!(
+        !matches!(borrowed_in, ValueType::Void),
+        "Option<&PyObjectRef> self is not Void"
+    );
+    assert!(
+        borrowed_class
+            .as_deref()
+            .is_some_and(is_niche_option_gc_payload_spelling),
+        "Option<&PyObjectRef> stamps a niche Option, got {borrowed_class:?}"
+    );
+    assert!(
+        borrowed_class
+            .as_deref()
+            .is_some_and(|r| r.contains("PyObjectRef") || r.contains("PyObject")),
+        "peeled shared-borrow payload is PyObjectRef, got {borrowed_class:?}"
+    );
+
+    let block_ty = option_adt_ty(raw_mut_adt(5));
+    let (block_in, block_class) = stamp_option_self_input(&llbc, &block_ty);
+    assert!(
+        !matches!(block_in, ValueType::Void),
+        "Option<*mut TypedItemsBlock> self is not Void"
+    );
+    assert!(
+        block_class
+            .as_deref()
+            .is_some_and(is_niche_option_gc_payload_spelling),
+        "Option<*mut TypedItemsBlock> stamps a niche Option, got {block_class:?}"
+    );
+    assert!(
+        block_class
+            .as_deref()
+            .is_some_and(|r| r.contains("TypedItemsBlock")),
+        "payload spelling names TypedItemsBlock, got {block_class:?}"
+    );
+
+    let alias_ty = option_adt_ty(adt_node(4));
+    let (alias_in, alias_class) = stamp_option_self_input(&llbc, &alias_ty);
+    assert!(
+        !matches!(alias_in, ValueType::Void),
+        "Option<PyObjectRef> self is not Void"
+    );
+    assert!(
+        alias_class
+            .as_deref()
+            .is_some_and(is_niche_option_gc_payload_spelling),
+        "Option<PyObjectRef> stamps a niche Option, got {alias_class:?}"
+    );
+
+    let borrowed_object = serde_json::json!({"Ref": ["Erased", adt_node(3), "Shared"]});
+    let (borrowed_object_in, borrowed_object_class) =
+        stamp_option_self_input(&llbc, &option_adt_ty(borrowed_object));
+    assert!(
+        !matches!(borrowed_object_in, ValueType::Void),
+        "Option<&PyObject> self is not Void"
+    );
+    assert!(
+        borrowed_object_class
+            .as_deref()
+            .is_some_and(is_niche_option_gc_payload_spelling),
+        "Option<&PyObject> stamps a niche Option, got {borrowed_object_class:?}"
+    );
+
+    let borrowed_block = serde_json::json!({"Ref": ["Erased", adt_node(5), "Shared"]});
+    let (borrowed_block_in, borrowed_block_class) =
+        stamp_option_self_input(&llbc, &option_adt_ty(borrowed_block));
+    assert!(
+        !matches!(borrowed_block_in, ValueType::Void),
+        "Option<&TypedItemsBlock> self is not Void"
+    );
+    assert!(
+        borrowed_block_class
+            .as_deref()
+            .is_some_and(is_niche_option_gc_payload_spelling),
+        "Option<&TypedItemsBlock> stamps a niche Option, got {borrowed_block_class:?}"
+    );
+
+    let assoc = serde_json::json!({
+        "TraitType": [
+            { "trait_decl_ref": { "skip_binder": { "id": 1 } } },
+            0,
+            { "regions": [], "types": [], "const_generics": [], "trait_refs": [] }
+        ]
+    });
+    let (assoc_in, assoc_class) = stamp_option_self_input(&llbc, &option_adt_ty(assoc));
+    assert!(
+        !matches!(assoc_in, ValueType::Void),
+        "Option<H::Value> self is not Void"
+    );
+    assert!(
+        assoc_class
+            .as_deref()
+            .is_some_and(is_niche_option_gc_payload_spelling),
+        "unique-impl TraitType payload *mut PyObject stamps a niche Option, got {assoc_class:?}"
+    );
+
+    let i64_ty = option_adt_ty(option_int_arg(true));
+    let (i64_in, i64_class) = stamp_option_self_input(&llbc, &i64_ty);
+    assert!(
+        !matches!(i64_in, ValueType::Void),
+        "Option<i64> self is not Void"
+    );
+    assert_eq!(
+        i64_class.as_deref(),
+        Some("option::Option<i64>"),
+        "tagged Option<i64> keeps its enum class_root, got {i64_class:?}"
+    );
+    assert!(
+        !i64_class
+            .as_deref()
+            .is_some_and(is_niche_option_gc_payload_spelling),
+        "Option<i64> is not a pointer-niche GC payload"
+    );
+}
+
+/// A pointee named `PyObject` that is not in `gc_struct_ids` must not
+/// noneify. The Input stamp keys on the declaration, not the leaf name.
+#[test]
+fn undeclared_named_object_pointee_is_not_noneify_stamp() {
+    let llbc = llbc_with_types("fixture", option_payload_stamp_decls(), vec![]);
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    assert!(
+        gc_struct_ids.is_empty(),
+        "fixture PyObject without a GcType impl is not harvested"
+    );
+    let empty_s: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let py_ty = option_adt_ty(raw_mut_adt(3));
+    let helper = tyref_niche_option_gc_payload_spelling(
+        &TyRef::Other(py_ty.clone()),
+        &llbc,
+        &gc_struct_ids,
+        &empty_s,
+    );
+    assert_eq!(
+        helper, None,
+        "undeclared PyObject pointee must not stamp, got {helper:?}"
+    );
+    let (py_in, py_class) = stamp_option_self_input(&llbc, &py_ty);
+    assert!(
+        !matches!(py_in, ValueType::Void),
+        "Option<*mut PyObject> self is not Void"
+    );
+    assert!(
+        !py_class
+            .as_deref()
+            .is_some_and(is_niche_option_gc_payload_spelling),
+        "Input class_root of undeclared PyObject is not a GC payload, got {py_class:?}"
+    );
+}
+
+/// `Option<&RawEnum>` is the int-bank null word (`borrowed_pointee_is_raw_enum`),
+/// not a GC instance. The uppercase `&T` heuristic in
+/// `is_niche_option_gc_payload_spelling` would otherwise stamp
+/// `Option<&MappedObj>` and noneify; rtype then fails
+/// `cast_int_to_ptr` InstanceRepr → IntegerRepr.
+#[test]
+fn substituted_raw_enum_borrow_option_is_not_gc_payload_stamp() {
+    let mut option = option_enum(0);
+    option["layout"] = serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": 8,
+            "align": 8,
+            "variant_layouts": [
+                {"field_offsets": []},
+                {"field_offsets": [0]}
+            ],
+            "repr": {"transparent": false}
+        }
+    }]);
+    let mut raw_enum = local_payload_enum(1);
+    raw_enum["layout"] = serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": 16,
+            "align": 8,
+            "variant_layouts": [
+                {"field_offsets": []},
+                {"field_offsets": [8]}
+            ],
+            "repr": {"transparent": false}
+        }
+    }]);
+    let llbc = llbc_with_types("fixture", vec![option, raw_enum], vec![]);
+    let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
+        std::collections::HashSet::new();
+    let empty_s: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let opt_ty = option_adt_ty(option_shared_ref(adt_node(1)));
+    let helper = tyref_niche_option_gc_payload_spelling(
+        &TyRef::Other(opt_ty.clone()),
+        &llbc,
+        &empty_gc,
+        &empty_s,
+    );
+    assert_eq!(
+        helper, None,
+        "Option<&RawEnum> must not stamp a GC Option spelling, got {helper:?}"
+    );
+    let (ty_in, class) = stamp_option_self_input(&llbc, &opt_ty);
+    assert!(
+        !matches!(ty_in, ValueType::Void),
+        "raw-enum Option self is not Void"
+    );
+    assert!(
+        !class
+            .as_deref()
+            .is_some_and(is_niche_option_gc_payload_spelling),
+        "Input class_root of Option<&RawEnum> is not a GC payload, got {class:?}"
+    );
+}
+
+/// Niched `unwrap_or_else` keeps `self` as an Input even when Charon
+/// records a size-0 layout on the generic Option decl. The ZST closure
+/// `f` stays an Input too (`tyref_keeps_callable_identity`).
+#[test]
+fn niched_unwrap_or_else_keeps_self_input() {
+    let mut option = option_enum(0);
+    option["layout"] = serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": 0,
+            "align": 8,
+            "variant_layouts": [
+                {"field_offsets": []},
+                {"field_offsets": [0]}
+            ],
+            "repr": {"transparent": false}
+        }
+    }]);
+    let llbc = fixture_llbc_with_gctype(
+        vec![
+            option,
+            type_decl_struct(1, &["pyre_object", "pyobject", "PyObject"], vec![]),
+            {
+                let mut closure = type_decl_struct(
+                    2,
+                    &["object_array", "alloc_typed_items_block", "closure"],
+                    vec![],
+                );
+                closure["src"] = serde_json::json!({"Closure": {"info": {"kind": "FnOnce"}}});
+                closure
+            },
+        ],
+        &[1],
+        vec![],
+    );
+    let opt_ty = option_adt_ty(raw_mut_adt(1));
+    let closure_ty = adt_node(2);
+    let ty = TyRef::Other(opt_ty.clone());
+    assert!(
+        !tyref_is_void_zst(&ty, &llbc),
+        "pointer-niche Option is not Void even with size-0 generic layout"
+    );
+    let inputs = stamp_option_method_inputs(&llbc, &opt_ty, Some(&closure_ty));
+    let names: Vec<&str> = inputs.iter().map(|(n, _, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"self"),
+        "niched unwrap_or_else keeps self Input, got {names:?}"
+    );
+    assert!(
+        names.contains(&"f"),
+        "ZST closure f stays an Input, got {names:?}"
+    );
+    let self_input = inputs
+        .iter()
+        .find(|(n, _, _)| n == "self")
+        .expect("self Input");
+    assert!(
+        !matches!(self_input.1, ValueType::Void),
+        "self is a payload word, not Void"
+    );
+    assert!(
+        self_input
+            .2
+            .as_deref()
+            .is_some_and(is_niche_option_gc_payload_spelling),
+        "self class_root is the niche Option spelling, got {:?}",
+        self_input.2
+    );
+    let f_input = inputs.iter().find(|(n, _, _)| n == "f").expect("f Input");
+    assert!(
+        !matches!(f_input.1, ValueType::Void),
+        "ZST closure is not dropped as Void"
     );
 }
 

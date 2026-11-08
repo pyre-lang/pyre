@@ -5459,6 +5459,89 @@ fn link_extravar_to_hlvalue(
     }
 }
 
+fn is_type_of_evalue(kind: &OpKind, evalue: &Variable) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments.as_slice() == ["type"]
+            && args.len() == 1
+            && args[0].as_variable() == Some(evalue)
+    )
+}
+
+fn translated_type_of_evalue(ops: &[FlowspaceOp], etype: &Hlvalue, evalue: &Hlvalue) -> bool {
+    ops.iter().any(|op| {
+        op.opname == "type"
+            && op.args.as_slice() == std::slice::from_ref(evalue)
+            && op.result == *etype
+    })
+}
+
+/// Restore the exceptblock link shape `flowcontext.py` produces.
+///
+/// `BlockRecorder.guessexception` puts the same `last_exception` /
+/// `last_exc_value` on `Link.args` and `Link.extravars`. `exc_from_raise`
+/// and `tweak_generator_body_graph` compute `w_type = op.type(w_value)`
+/// before the `(w_type, w_value)` link. `RaiseImplicit.nomoreblocks`
+/// keeps class Constants unwrapped.
+fn restore_exceptblock_link_shape(
+    legacy: &FunctionGraph,
+    legacy_block: &crate::model::Block,
+    legacy_link: &crate::model::Link,
+    translated_ops: &mut Vec<FlowspaceOp>,
+    last_exception: &Option<Hlvalue>,
+    last_exc_value: &Option<Hlvalue>,
+    args: &mut Vec<Hlvalue>,
+) {
+    if legacy_link.target != legacy.exceptblock {
+        return;
+    }
+    if let (Some(last_exc), Some(last_val)) = (last_exception, last_exc_value) {
+        if args.len() == 2 && (&args[0] != last_exc || &args[1] != last_val) {
+            args[0] = last_exc.clone();
+            args[1] = last_val.clone();
+        }
+        return;
+    }
+    if last_exception.is_some() || last_exc_value.is_some() {
+        return;
+    }
+    let [LinkArg::Value(etype_legacy), LinkArg::Value(evalue_legacy)] = legacy_link.args.as_slice()
+    else {
+        return;
+    };
+    let (Some(etype), Some(evalue)) = (args.first(), args.get(1)) else {
+        return;
+    };
+    if translated_type_of_evalue(translated_ops, etype, evalue)
+        || legacy_block.operations.iter().any(|op| {
+            op.result.as_ref() == Some(etype_legacy) && is_type_of_evalue(&op.kind, evalue_legacy)
+        })
+    {
+        return;
+    }
+    let duplicated = etype_legacy == evalue_legacy;
+    let produced_non_type = legacy_block.operations.iter().any(|op| {
+        op.result.as_ref() == Some(etype_legacy) && !is_type_of_evalue(&op.kind, evalue_legacy)
+    });
+    // `exc_from_raise` types the raised instance even when that instance
+    // is a block inputarg (`(evalue, evalue)`). A distinct inputarg in
+    // slot 0 may already be class-shaped from a predecessor.
+    if !duplicated && legacy_block.inputargs.iter().any(|v| v == etype_legacy) {
+        return;
+    }
+    if !(duplicated || produced_non_type) {
+        return;
+    }
+    let evalue = evalue.clone();
+    let etype = Hlvalue::Variable(Variable::new());
+    translated_ops.push(FlowspaceOp::new("type", vec![evalue], etype.clone()));
+    args[0] = etype;
+}
+
 /// Derive per-inputarg `SomeValue` cells for a subject's startblock,
 /// preferring an explicit `Variable.annotation` seed (test-fixture
 /// hand-built graphs without front-end Input ops) and falling through
@@ -7074,37 +7157,15 @@ fn function_graph_to_flowspace_inner(
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            // RPython `FlowContext.exc_from_raise` always computes
-            // `w_type = op.type(w_value)` before constructing the
-            // `(w_type, w_value)` link to `exceptblock`
-            // (`flowspace/flowcontext.py`).  Pyre's pre-flowspace
-            // model historically elided that operation and used the
-            // exception value in both slots because `flatten.make_return`
-            // only emits the second slot.  The rtyper observes the link
-            // earlier, however: `_convert_link` assigns
-            // `ExceptionData.r_exception_type` to slot 0 and must therefore
-            // receive the class representation, not the instance
-            // representation.
-            //
-            // Restore the upstream flowspace shape at this adapter boundary.
-            // Limit the reconstruction to the exact legacy adaptation:
-            // a direct, non-LastException link to `exceptblock` whose two
-            // arguments are the same Variable.  Ordinary exception edges
-            // already carry their distinct link-scoped `(last_exception,
-            // last_exc_value)` variables and must remain untouched.
-            let duplicated_direct_raise = legacy_link.target == legacy.exceptblock
-                && legacy_link.last_exception.is_none()
-                && legacy_link.last_exc_value.is_none()
-                && matches!(
-                    legacy_link.args.as_slice(),
-                    [LinkArg::Value(etype), LinkArg::Value(evalue)] if etype == evalue
-                );
-            if duplicated_direct_raise {
-                let evalue = args[1].clone();
-                let etype = Hlvalue::Variable(Variable::new());
-                translated_ops.push(FlowspaceOp::new("type", vec![evalue], etype.clone()));
-                args[0] = etype;
-            }
+            restore_exceptblock_link_shape(
+                legacy,
+                legacy_block,
+                legacy_link,
+                &mut translated_ops,
+                &last_exception,
+                &last_exc_value,
+                &mut args,
+            );
             let exitcase = exitcase_to_hlvalue(legacy_link.exitcase.as_ref(), call_registry)?;
             let mut link = FlowspaceLink::new(args, Some(target), exitcase);
             // RPython `Link.__init__` (`flowspace/model.rs:Link::new`) leaves
@@ -15532,6 +15593,237 @@ mod tests {
         assert_eq!(type_op.args, vec![exc_link.args[1].clone().unwrap()]);
         assert_eq!(exc_link.args[0].as_ref(), Some(&type_op.result));
         assert_ne!(exc_link.args[0], exc_link.args[1]);
+    }
+
+    #[test]
+    fn function_graph_to_flowspace_types_same_block_instance_direct_raise() {
+        // `tweak_generator_body_graph` / `exc_from_raise`: slot 0 is
+        // `op.type(evalue)` even when the pre-flowspace graph put a
+        // different same-block instance Variable there.
+        let mut graph = LegacyGraph::new("direct_raise_distinct");
+        let vars = mint_vars(&mut graph, 5);
+        setbinding(&vars[1], ValueType::Ref(None));
+
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![SpaceOperation {
+                result: Some(vars[2].clone()),
+                kind: OpKind::BinOp {
+                    op: "add".to_string(),
+                    lhs: vars[1].clone(),
+                    rhs: vars[1].clone(),
+                    result_ty: ValueType::Ref(None),
+                },
+            }],
+            exitswitch: None,
+            exits: vec![crate::model::Link::new_mixed(
+                vec![
+                    LinkArg::Value(vars[2].clone()),
+                    LinkArg::Value(vars[1].clone()),
+                ],
+                graph.exceptblock,
+                None,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[3]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        let exceptblock = Block {
+            id: graph.exceptblock,
+            inputargs: block_inputargs(&vars, &[3, 4]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock, exceptblock];
+
+        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
+            .expect("direct raise graph assembles");
+        let flowspace_graph = output.graph.borrow();
+        let startblock = flowspace_graph.startblock.borrow();
+        let type_op = startblock
+            .operations
+            .iter()
+            .find(|op| op.opname == "type")
+            .expect("direct raise must gain a type operation");
+        let exc_link = startblock.exits[0].borrow();
+        assert_eq!(type_op.args, vec![exc_link.args[1].clone().unwrap()]);
+        assert_eq!(exc_link.args[0].as_ref(), Some(&type_op.result));
+        assert_ne!(exc_link.args[0], exc_link.args[1]);
+    }
+
+    #[test]
+    fn function_graph_to_flowspace_keeps_existing_type_of_evalue() {
+        let mut graph = LegacyGraph::new("direct_raise_typed");
+        let vars = mint_vars(&mut graph, 5);
+        setbinding(&vars[1], ValueType::Ref(None));
+
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![SpaceOperation {
+                result: Some(vars[2].clone()),
+                kind: OpKind::Call {
+                    target: crate::model::CallTarget::function_path(["type"]),
+                    args: crate::model::call_args(vec![vars[1].clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+            }],
+            exitswitch: None,
+            exits: vec![crate::model::Link::new_mixed(
+                vec![
+                    LinkArg::Value(vars[2].clone()),
+                    LinkArg::Value(vars[1].clone()),
+                ],
+                graph.exceptblock,
+                None,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[3]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        let exceptblock = Block {
+            id: graph.exceptblock,
+            inputargs: block_inputargs(&vars, &[3, 4]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock, exceptblock];
+
+        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
+            .expect("typed direct raise graph assembles");
+        let flowspace_graph = output.graph.borrow();
+        let startblock = flowspace_graph.startblock.borrow();
+        let type_ops: Vec<_> = startblock
+            .operations
+            .iter()
+            .filter(|op| op.opname == "type")
+            .collect();
+        assert_eq!(
+            type_ops.len(),
+            1,
+            "existing type(evalue) must not be wrapped again"
+        );
+        let exc_link = startblock.exits[0].borrow();
+        assert_eq!(type_ops[0].args, vec![exc_link.args[1].clone().unwrap()]);
+        assert_eq!(exc_link.args[0].as_ref(), Some(&type_ops[0].result));
+    }
+
+    #[test]
+    fn function_graph_to_flowspace_guessexception_rewrites_exceptblock_args() {
+        // `BlockRecorder.guessexception`: when extras exist, exceptblock
+        // args are those Variables, even if the pre-flowspace link
+        // forwarded a different pair.
+        let mut graph = LegacyGraph::new("canraise_exceptblock_mismatch");
+        let vars = mint_vars(&mut graph, 12);
+        setbinding(&vars[1], ValueType::Int);
+        setbinding(&vars[2], ValueType::Int);
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1, 2]),
+            operations: vec![SpaceOperation {
+                result: Some(vars[3].clone()),
+                kind: OpKind::BinOp {
+                    op: "add".to_string(),
+                    lhs: vars[1].clone(),
+                    rhs: vars[2].clone(),
+                    result_ty: ValueType::Int,
+                },
+            }],
+            exitswitch: Some(crate::model::ExitSwitch::LastException),
+            exits: vec![
+                link_to_returnblock(vec![LinkArg::Value(vars[3].clone())], graph.returnblock),
+                crate::model::Link::new_mixed(
+                    vec![
+                        LinkArg::Value(vars[1].clone()),
+                        LinkArg::Value(vars[2].clone()),
+                    ],
+                    graph.exceptblock,
+                    Some(crate::model::exception_exitcase()),
+                )
+                .extravars(
+                    Some(LinkArg::Value(vars[10].clone())),
+                    Some(LinkArg::Value(vars[11].clone())),
+                ),
+            ],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[4]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        let exceptblock = Block {
+            id: graph.exceptblock,
+            inputargs: block_inputargs(&vars, &[10, 11]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock, exceptblock];
+
+        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
+            .expect("guessexception graph assembles");
+        let flowspace_graph = output.graph.borrow();
+        let startblock = flowspace_graph.startblock.borrow();
+        let exc_link = startblock.exits[1].borrow();
+        assert_eq!(
+            exc_link.args[0].as_ref(),
+            exc_link.last_exception.as_ref(),
+            "guessexception args[0] is last_exception"
+        );
+        assert_eq!(
+            exc_link.args[1].as_ref(),
+            exc_link.last_exc_value.as_ref(),
+            "guessexception args[1] is last_exc_value"
+        );
+    }
+
+    #[test]
+    fn function_graph_to_flowspace_raise_implicit_constants_stay_unwrapped() {
+        let mut graph = LegacyGraph::new("raise_implicit");
+        graph.set_raise_implicit(graph.startblock, "Exception");
+        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
+            .expect("RaiseImplicit graph assembles");
+        let flowspace_graph = output.graph.borrow();
+        let startblock = flowspace_graph.startblock.borrow();
+        assert!(
+            startblock.operations.iter().all(|op| op.opname != "type"),
+            "RaiseImplicit.nomoreblocks keeps class Constants"
+        );
+        let exc_link = startblock.exits[0].borrow();
+        assert!(exc_link.last_exception.is_none());
+        assert!(matches!(exc_link.args[0], Some(Hlvalue::Constant(_))));
+        assert!(matches!(exc_link.args[1], Some(Hlvalue::Constant(_))));
     }
 
     #[test]

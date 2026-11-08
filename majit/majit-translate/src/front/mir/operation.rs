@@ -3622,7 +3622,12 @@ impl<'a> Lowering<'a> {
                 // is that inhabitant's declared tag (`const_discriminant_locals`
                 // / fieldless identity), not a `__discriminant` getfield of
                 // a missing aggregate (`rewrite_op_getfield` of Void).
+                // A pointer-niche Option is the payload word
+                // (`aggregate_shape` checks niche before void); Charon's
+                // size-0 generic Option decl must not ConstInt the tag
+                // without reading `self`.
                 if tyref_is_void_zst(&place.ty, self.llbc)
+                    && !self.tyref_is_niche_option_ptr(&place.ty)
                     && (crate::front::result_exc::tyref_is_option(&place.ty, self.llbc)
                         || crate::front::result_exc::tyref_is_option_ref(&place.ty, self.llbc))
                 {
@@ -3661,6 +3666,36 @@ impl<'a> Lowering<'a> {
                 if self.tyref_is_niche_option_ptr(&place.ty) {
                     let option_ty = clone_tyref(&place.ty);
                     let mut base = self.resolve_place(mir_bb, place)?;
+                    // GCREF payload: Discriminant is `ptr_nonzero`
+                    // (`lltype.py` `SomePtr.bool`). `is_(SomePtr, ConstNone)`
+                    // folds (`SomePtr.can_be_none` is False;
+                    // `binaryop.py` `is__default`), so
+                    // `transform.py` `transform_dead_code` would cut the
+                    // None arm. Do not flip `can_be_none`.
+                    // `llannotation.py` `lltype_to_annotation` of GCREF
+                    // is SomePtr; `rnone.py` `rtype_is_None` is
+                    // `ptr_iszero`. `is_null` of GCREF already uses
+                    // `eq(bool(p), False)`.
+                    if crate::front::result_exc::tyref_option_payload(&option_ty, self.llbc)
+                        .is_some_and(|payload| {
+                            tyref_is_gcref_spelling(&payload, self.llbc)
+                                || crate::annotator::bookkeeper::is_gcref_type_spelling(
+                                    &tyref_to_ast_string(&payload, self.llbc),
+                                )
+                        })
+                    {
+                        let bb_id = self.emit_bb(mir_bb);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: OpKind::UnaryOp {
+                                op: "bool".to_string(),
+                                operand: base,
+                                result_ty: ValueType::Bool,
+                            },
+                        });
+                        self.niche_disc_vars.insert(res.id());
+                        return Ok((None, res));
+                    }
                     let null_cast = self.option_niche_null_cast(&option_ty);
                     if self.option_niche_int_null(&option_ty).is_none()
                         && crate::model::niche_is_none_uses_const_none(null_cast.as_ref())
