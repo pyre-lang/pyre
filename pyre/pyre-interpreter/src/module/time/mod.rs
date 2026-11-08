@@ -50,59 +50,43 @@ crate::py_module! {
         // CPython exposes a different surface there.)
         #[cfg(all(unix, feature = "host_env"))]
         {
-            crate::__pyre_store!(ns, "clock_gettime", crate::make_builtin_function_with_arity("clock_gettime", t::clock_gettime, 1));
-            crate::__pyre_store!(ns, "clock_gettime_ns", crate::make_builtin_function_with_arity("clock_gettime_ns", t::clock_gettime_ns, 1));
-            #[cfg(not(target_os = "redox"))]
-            {
-                crate::__pyre_store!(ns, "clock_getres", crate::make_builtin_function_with_arity("clock_getres", t::clock_getres, 1));
-                // clock_settime{,_ns} set the system clock (a privileged
-                // syscall that escapes mediation); omit them under sandbox.
-                #[cfg(not(feature = "sandbox"))]
+            if majit_rlib::rtime::HAS_CLOCK_GETTIME_RUNTIME {
+                crate::__pyre_store!(ns, "clock_gettime", crate::make_builtin_function_with_arity("clock_gettime", t::clock_gettime, 1));
+                crate::__pyre_store!(ns, "clock_gettime_ns", crate::make_builtin_function_with_arity("clock_gettime_ns", t::clock_gettime_ns, 1));
+                #[cfg(not(target_os = "redox"))]
                 {
-                    crate::__pyre_store!(ns, "clock_settime", crate::make_builtin_function_with_arity("clock_settime", t::clock_settime, 2));
-                    crate::__pyre_store!(ns, "clock_settime_ns", crate::make_builtin_function_with_arity("clock_settime_ns", t::clock_settime_ns, 2));
+                    crate::__pyre_store!(ns, "clock_getres", crate::make_builtin_function_with_arity("clock_getres", t::clock_getres, 1));
+                    // clock_settime{,_ns} set the system clock (a privileged
+                    // syscall that escapes mediation); omit them under sandbox.
+                    #[cfg(not(feature = "sandbox"))]
+                    {
+                        crate::__pyre_store!(ns, "clock_settime", crate::make_builtin_function_with_arity("clock_settime", t::clock_settime, 2));
+                        crate::__pyre_store!(ns, "clock_settime_ns", crate::make_builtin_function_with_arity("clock_settime_ns", t::clock_settime_ns, 2));
+                    }
                 }
-            }
-            crate::__pyre_store!(ns, "CLOCK_REALTIME",
-                pyre_object::w_int_new(majit_rlib::rtime::CLOCK_REALTIME as i64));
-            crate::__pyre_store!(ns, "CLOCK_MONOTONIC",
-                pyre_object::w_int_new(majit_rlib::rtime::CLOCK_MONOTONIC as i64));
-            // The two darwin clocks that keep counting across sleep, and the
-            // `_APPROX` pair that read a cached value instead of taking the
-            // timebase lock.
-            #[cfg(target_vendor = "apple")]
-            for (name, val) in [
-                ("CLOCK_MONOTONIC_RAW", majit_rlib::rtime::CLOCK_MONOTONIC_RAW as i64),
-                ("CLOCK_MONOTONIC_RAW_APPROX", majit_rlib::rtime::CLOCK_MONOTONIC_RAW_APPROX as i64),
-                ("CLOCK_UPTIME_RAW", majit_rlib::rtime::CLOCK_UPTIME_RAW as i64),
-                ("CLOCK_UPTIME_RAW_APPROX", majit_rlib::rtime::CLOCK_UPTIME_RAW_APPROX as i64),
-            ] {
-                crate::__pyre_store!(ns, name, pyre_object::w_int_new(val));
-            }
-            #[cfg(not(any(
-                target_os = "illumos",
-                target_os = "netbsd",
-                target_os = "solaris",
-                target_os = "openbsd",
-                target_os = "wasi",
-            )))]
-            crate::__pyre_store!(ns, "CLOCK_PROCESS_CPUTIME_ID",
-                pyre_object::w_int_new(majit_rlib::rtime::CLOCK_PROCESS_CPUTIME_ID as i64));
-            #[cfg(not(any(
-                target_os = "illumos",
-                target_os = "netbsd",
-                target_os = "solaris",
-                target_os = "openbsd",
-                target_os = "redox",
-            )))]
-            {
-                crate::__pyre_store!(ns, "CLOCK_THREAD_CPUTIME_ID",
-                    pyre_object::w_int_new(majit_rlib::rtime::CLOCK_THREAD_CPUTIME_ID as i64));
-                // thread_time reads CLOCK_THREAD_CPUTIME_ID, so it is exposed on
-                // exactly the platforms that carry the constant — the same gate
-                // `_get_time_info` uses for its "thread_time" arm.
-                crate::__pyre_store!(ns, "thread_time", crate::make_builtin_function_with_arity("thread_time", t::thread_time, 0));
-                crate::__pyre_store!(ns, "thread_time_ns", crate::make_builtin_function_with_arity("thread_time_ns", t::thread_time_ns, 0));
+                // `Module` walks `rtime.ALL_DEFINED_CLOCKS` and wraps each.
+                for (name, val) in majit_rlib::rtime::all_defined_clocks() {
+                    crate::__pyre_store!(ns, name, pyre_object::w_int_new(val as i64));
+                }
+                // [3.15-spec] `time.CLOCK_MONOTONIC_RAW_APPROX` /
+                // `CLOCK_UPTIME_RAW` / `CLOCK_UPTIME_RAW_APPROX`:
+                // `Modules/timemodule.c` `PyModule_AddIntMacro` under
+                // `#ifdef CLOCK_UPTIME_RAW`. `rtime.constant_names` does not
+                // list them, so `ALL_DEFINED_CLOCKS` omits them.
+                #[cfg(target_vendor = "apple")]
+                for (name, val) in [
+                    ("CLOCK_MONOTONIC_RAW_APPROX", libc::CLOCK_MONOTONIC_RAW_APPROX as i64),
+                    ("CLOCK_UPTIME_RAW", libc::CLOCK_UPTIME_RAW as i64),
+                    ("CLOCK_UPTIME_RAW_APPROX", libc::CLOCK_UPTIME_RAW_APPROX as i64),
+                ] {
+                    crate::__pyre_store!(ns, name, pyre_object::w_int_new(val));
+                }
+                // `interp_time.HAS_THREAD_TIME` on POSIX:
+                // `HAS_CLOCK_GETTIME_RUNTIME and CLOCK_PROCESS_CPUTIME_ID is not None`.
+                if majit_rlib::rtime::CLOCK_PROCESS_CPUTIME_ID.is_some() {
+                    crate::__pyre_store!(ns, "thread_time", crate::make_builtin_function_with_arity("thread_time", t::thread_time, 0));
+                    crate::__pyre_store!(ns, "thread_time_ns", crate::make_builtin_function_with_arity("thread_time_ns", t::thread_time_ns, 0));
+                }
             }
         }
         // `Module.startup` calls `_init_timezone`, and exposes `tzset` on

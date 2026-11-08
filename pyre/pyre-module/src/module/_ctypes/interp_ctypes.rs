@@ -37,40 +37,27 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
     // branches on `os.name`, so both names have to exist wherever the module
     // is real; where there is no `dlfcn.h` they are 0.  `RTLD_LAZY`/`RTLD_NOW`
     // have no such caller and stay with the platform that defines them.
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "RTLD_LOCAL",
+        pyre_object::w_int_new(ctypes_h::RTLD_LOCAL as i64)
+    );
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "RTLD_GLOBAL",
+        pyre_object::w_int_new(ctypes_h::RTLD_GLOBAL as i64)
+    );
     #[cfg(unix)]
     {
         pyre_interpreter::__pyre_put_new!(
             ns_slot,
-            "RTLD_LOCAL",
-            pyre_object::w_int_new(ctypes_h::RTLD_LOCAL as i64)
-        );
-        pyre_interpreter::__pyre_put_new!(
-            ns_slot,
-            "RTLD_GLOBAL",
-            pyre_object::w_int_new(ctypes_h::RTLD_GLOBAL as i64)
-        );
-        pyre_interpreter::__pyre_put_new!(
-            ns_slot,
             "RTLD_LAZY",
-            pyre_object::w_int_new(majit_rlib::rdynload::RTLD_LAZY as i64)
+            pyre_object::w_int_new(majit_rlib::rdynload::RTLD_LAZY.unwrap() as i64)
         );
         pyre_interpreter::__pyre_put_new!(
             ns_slot,
             "RTLD_NOW",
-            pyre_object::w_int_new(majit_rlib::rdynload::RTLD_NOW as i64)
-        );
-    }
-    #[cfg(not(unix))]
-    {
-        pyre_interpreter::__pyre_put_new!(
-            ns_slot,
-            "RTLD_LOCAL",
-            pyre_object::w_int_new(ctypes_h::RTLD_LOCAL as i64)
-        );
-        pyre_interpreter::__pyre_put_new!(
-            ns_slot,
-            "RTLD_GLOBAL",
-            pyre_object::w_int_new(ctypes_h::RTLD_GLOBAL as i64)
+            pyre_object::w_int_new(majit_rlib::rdynload::RTLD_NOW.unwrap() as i64)
         );
     }
     pyre_interpreter::__pyre_put_new!(

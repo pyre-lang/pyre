@@ -204,6 +204,54 @@ impl StructLayout {
         *self.padding_drop_cache.borrow_mut() = Some(drops.clone());
         Ok(drops)
     }
+
+    /// Spell the `rffi.CStruct` that `Struct.build_result` returns as a
+    /// `#[repr(C)]` Rust struct. `nested` maps a nested struct's
+    /// `StructLayout.name` to its Rust name.
+    pub fn rust_struct_source(&self, rust_name: &str, nested: &[(&str, &str)]) -> String {
+        let mut out = String::new();
+        out.push_str("#[repr(C)]\n");
+        out.push_str("#[derive(Clone, Copy)]\n");
+        out.push_str(&format!("pub struct {rust_name} {{\n"));
+        for (fname, fty) in &self.fields {
+            out.push_str(&format!(
+                "    pub {fname}: {},\n",
+                field_type_rust(fty, nested)
+            ));
+        }
+        out.push_str("}\n");
+        out.push_str(&format!(
+            "const _: () = assert!(::core::mem::size_of::<{rust_name}>() == {} && ::core::mem::align_of::<{rust_name}>() == {});\n",
+            self.size, self.align
+        ));
+        out
+    }
+}
+
+/// Rust type spelled by `StructLayout::rust_struct_source` for one field.
+fn field_type_rust(tp: &FieldType, nested: &[(&str, &str)]) -> String {
+    match tp {
+        FieldType::Int(IntType { signed, bits }) => {
+            if *signed {
+                format!("i{bits}")
+            } else {
+                format!("u{bits}")
+            }
+        }
+        FieldType::Double => "f64".to_string(),
+        FieldType::FixedSizeArray { of, length } => {
+            format!("[{}; {length}]", field_type_rust(of, nested))
+        }
+        FieldType::Array { of } => format!("[{}; 0]", field_type_rust(of, nested)),
+        FieldType::Struct(s) => nested
+            .iter()
+            .find(|(name, _)| *name == s.name)
+            .map(|(_, rust)| (*rust).to_string())
+            .unwrap_or_else(|| panic!("nested Struct {} has no Rust name", s.name)),
+        FieldType::Nested { c_name } => {
+            panic!("build_result has resolved Nested {c_name}")
+        }
+    }
 }
 
 /// `rffi_platform.py` `Field`.
@@ -2108,6 +2156,42 @@ mod tests {
             })
         );
         assert_eq!(get("XYZZY"), &ConfigValue::Int(42));
+
+        #[cfg(unix)]
+        {
+            let timeval_cconfig = CConfig {
+                compilation_info: ExternalCompilationInfo {
+                    includes: vec!["sys/time.h".into()],
+                    ..ExternalCompilationInfo::default()
+                },
+                entries: vec![(
+                    "TIMEVAL".into(),
+                    CConfigEntry::struct_type(
+                        "struct timeval",
+                        vec![
+                            ("tv_sec".into(), FieldType::int()),
+                            ("tv_usec".into(), FieldType::int()),
+                        ],
+                        None,
+                    ),
+                )],
+                single_entries: Vec::new(),
+            };
+            let timeval_results = configure(&timeval_cconfig, false).unwrap();
+            let layout = match &timeval_results[0].1 {
+                ConfigValue::Struct(s) => s,
+                other => panic!("{other:?}"),
+            };
+            let src = layout.rust_struct_source("TIMEVAL", &[]);
+            assert!(src.contains("pub c_tv_sec:"), "{src}");
+            assert!(
+                src.contains(&format!(
+                    "const _: () = assert!(::core::mem::size_of::<TIMEVAL>() == {} && ::core::mem::align_of::<TIMEVAL>() == {});",
+                    layout.size, layout.align
+                )),
+                "{src}"
+            );
+        }
     }
 
     fn nested_xy_header(inner_first: bool) -> String {

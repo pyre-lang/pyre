@@ -35,19 +35,15 @@ pub(super) const CTYPES_MAX_ARGCOUNT: usize = 1024;
 /// `SIZEOF_TIME_T`.
 pub(super) const SIZEOF_TIME_T: usize = core::mem::size_of::<TimeT>();
 
-/// `dlfcn.h RTLD_LOCAL`.
-#[cfg(unix)]
-pub(super) const RTLD_LOCAL: i32 = majit_rlib::rdynload::RTLD_LOCAL;
-/// `dlfcn.h RTLD_GLOBAL`.
-#[cfg(unix)]
-pub(super) const RTLD_GLOBAL: i32 = majit_rlib::rdynload::RTLD_GLOBAL;
-
-// [3.14-spec] `lib_pypy/_ctypes/__init__.py` sets `RTLD_LOCAL = 0` and
-// `RTLD_GLOBAL = 256` on every platform; `_ctypes.c` (`_ctypes_add_objects`
-// tail) defines `RTLD_LOCAL` as 0 where `dlfcn.h` does not declare it and
-// `RTLD_GLOBAL` as `RTLD_LOCAL` where it is undeclared too, so both are 0
-// on Windows.
-#[cfg(not(unix))]
-pub(super) const RTLD_LOCAL: i32 = 0;
-#[cfg(not(unix))]
-pub(super) const RTLD_GLOBAL: i32 = 0;
+// [3.14-spec] `_ctypes.c` (`_ctypes_add_objects` tail) defines `RTLD_LOCAL`
+// as 0 where it is not declared and `RTLD_GLOBAL` as `RTLD_LOCAL` where it
+// is undeclared too. `rdynload.cConfig` is `DefinedConstantInteger`; a
+// `None` value takes that fallback.
+pub(super) const RTLD_LOCAL: i32 = match majit_rlib::rdynload::cConfig::RTLD_LOCAL {
+    Some(v) => v,
+    None => 0,
+};
+pub(super) const RTLD_GLOBAL: i32 = match majit_rlib::rdynload::cConfig::RTLD_GLOBAL {
+    Some(v) => v,
+    None => RTLD_LOCAL,
+};

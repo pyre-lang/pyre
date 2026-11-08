@@ -8,46 +8,28 @@ use crate::rffi::{self, CCHARP, VOIDP};
 
 pub use crate::rffi::INT;
 
+/// `rdynload.cConfig` (`rffi_platform.configure(CConfig)`).
+#[allow(non_snake_case)]
+pub mod cConfig {
+    include!(concat!(env!("OUT_DIR"), "/rdynload_cconfig.rs"));
+}
+
 /// `rdynload.DLLHANDLE`.
 #[cfg(unix)]
 pub type DLLHANDLE = VOIDP;
 
-/// `rdynload.RTLD_LOCAL`.
+/// `rdynload.RTLD_LOCAL` (`cConfig.RTLD_LOCAL`).
 #[cfg(unix)]
-pub const RTLD_LOCAL: INT = libc::RTLD_LOCAL;
-/// `rdynload.RTLD_GLOBAL`.
+pub const RTLD_LOCAL: Option<INT> = cConfig::RTLD_LOCAL;
+/// `rdynload.RTLD_GLOBAL` (`cConfig.RTLD_GLOBAL`).
 #[cfg(unix)]
-pub const RTLD_GLOBAL: INT = libc::RTLD_GLOBAL;
-/// `rdynload.RTLD_NOW`.
+pub const RTLD_GLOBAL: Option<INT> = cConfig::RTLD_GLOBAL;
+/// `rdynload.RTLD_NOW` (`cConfig.RTLD_NOW`).
 #[cfg(unix)]
-pub const RTLD_NOW: INT = libc::RTLD_NOW;
-/// `rdynload.RTLD_LAZY`.
+pub const RTLD_NOW: Option<INT> = cConfig::RTLD_NOW;
+/// `rdynload.RTLD_LAZY` (`cConfig.RTLD_LAZY`).
 #[cfg(unix)]
-pub const RTLD_LAZY: INT = libc::RTLD_LAZY;
-
-/// `rdynload.cConfig.RTLD_NODELETE`.
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd"
-))]
-pub const RTLD_NODELETE: INT = libc::RTLD_NODELETE;
-/// `rdynload.cConfig.RTLD_NOLOAD`.
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd"
-))]
-pub const RTLD_NOLOAD: INT = libc::RTLD_NOLOAD;
-/// `rdynload.cConfig.RTLD_DEEPBIND`.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub const RTLD_DEEPBIND: INT = libc::RTLD_DEEPBIND;
+pub const RTLD_LAZY: Option<INT> = cConfig::RTLD_LAZY;
 
 // `rdynload.eci`. `libraries=['dl']` except FreeBSD/NetBSD; Darwin also
 // defines `MACOSX`.
@@ -225,9 +207,11 @@ fn _retry_as_ldscript(err: &[u8], mode: INT) -> Result<Result<DLLHANDLE, i32>, r
 
 /// `rdynload._dlopen_default_mode`.
 #[cfg(unix)]
-pub fn _dlopen_default_mode() -> INT {
-    let mut mode = RTLD_NOW;
-    mode |= RTLD_LOCAL;
+pub const fn _dlopen_default_mode() -> INT {
+    let mut mode = RTLD_NOW.unwrap();
+    if let Some(local) = RTLD_LOCAL {
+        mode |= local;
+    }
     mode
 }
 
@@ -239,8 +223,8 @@ pub fn dlopen(
 ) -> Result<Result<DLLHANDLE, DLOpenError>, rffi::MemoryError> {
     if mode == -1 {
         mode = _dlopen_default_mode();
-    } else if (mode & (RTLD_LAZY | RTLD_NOW)) == 0 {
-        mode |= RTLD_NOW;
+    } else if (mode & (RTLD_LAZY.unwrap() | RTLD_NOW.unwrap())) == 0 {
+        mode |= RTLD_NOW.unwrap();
     }
     let ll_libname = rffi::scoped_str2charp::new(name)?;
     let res = unsafe { c_dlopen(ll_libname.buf, mode) };
@@ -385,6 +369,40 @@ pub fn dlsym_byordinal(handle: DLLHANDLE, index: INT) -> Result<VOIDP, INT> {
 #[cfg(windows)]
 pub use crate::rwin32::GetModuleHandle;
 
+#[cfg(test)]
+mod cconfig_tests {
+    #[test]
+    fn cconfig_rtld_matches_dlfcn_where_defined() {
+        #[cfg(unix)]
+        {
+            assert_eq!(super::cConfig::RTLD_LAZY, Some(libc::RTLD_LAZY));
+            assert_eq!(super::cConfig::RTLD_NOW, Some(libc::RTLD_NOW));
+            assert_eq!(super::cConfig::RTLD_GLOBAL, Some(libc::RTLD_GLOBAL));
+            assert_eq!(super::cConfig::RTLD_LOCAL, Some(libc::RTLD_LOCAL));
+            assert_eq!(super::RTLD_LAZY, super::cConfig::RTLD_LAZY);
+            assert_eq!(super::RTLD_NOW, super::cConfig::RTLD_NOW);
+            assert_eq!(super::RTLD_GLOBAL, super::cConfig::RTLD_GLOBAL);
+            assert_eq!(super::RTLD_LOCAL, super::cConfig::RTLD_LOCAL);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(super::cConfig::RTLD_NODELETE, Some(libc::RTLD_NODELETE));
+            assert_eq!(super::cConfig::RTLD_NOLOAD, Some(libc::RTLD_NOLOAD));
+            assert_eq!(super::cConfig::RTLD_DEEPBIND, None);
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(super::cConfig::RTLD_LAZY, None);
+            assert_eq!(super::cConfig::RTLD_NOW, None);
+            assert_eq!(super::cConfig::RTLD_GLOBAL, None);
+            assert_eq!(super::cConfig::RTLD_LOCAL, None);
+            assert_eq!(super::cConfig::RTLD_NODELETE, None);
+            assert_eq!(super::cConfig::RTLD_NOLOAD, None);
+            assert_eq!(super::cConfig::RTLD_DEEPBIND, None);
+        }
+    }
+}
+
 #[cfg(all(test, feature = "host_env", not(feature = "sandbox")))]
 mod tests {
     #[cfg(unix)]
@@ -409,7 +427,10 @@ mod tests {
     fn default_mode_includes_now() {
         let mode = super::_dlopen_default_mode();
         // `RTLD_LOCAL` is 0 on Linux, so only the combined value is portable.
-        assert_eq!(mode, super::RTLD_NOW | super::RTLD_LOCAL);
+        assert_eq!(
+            mode,
+            super::RTLD_NOW.unwrap() | super::RTLD_LOCAL.unwrap_or(0)
+        );
     }
 
     #[cfg(target_os = "linux")]

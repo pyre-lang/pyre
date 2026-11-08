@@ -259,34 +259,46 @@ pub fn default_abi() -> u32 {
     0
 }
 
-/// `moduledef.get_dict_rtld_constants` — the names `rdynload` found, with
-/// the four cffi always needs defaulted to 0 where the platform lacks them.
+/// `moduledef.get_dict_rtld_constants`.
+fn get_dict_rtld_constants() -> Vec<(&'static str, i64)> {
+    let mut found = Vec::new();
+    #[cfg(any(unix, windows))]
+    {
+        for (name, value) in [
+            ("RTLD_LAZY", majit_rlib::rdynload::cConfig::RTLD_LAZY),
+            ("RTLD_NOW", majit_rlib::rdynload::cConfig::RTLD_NOW),
+            ("RTLD_GLOBAL", majit_rlib::rdynload::cConfig::RTLD_GLOBAL),
+            ("RTLD_LOCAL", majit_rlib::rdynload::cConfig::RTLD_LOCAL),
+            (
+                "RTLD_NODELETE",
+                majit_rlib::rdynload::cConfig::RTLD_NODELETE,
+            ),
+            ("RTLD_NOLOAD", majit_rlib::rdynload::cConfig::RTLD_NOLOAD),
+            (
+                "RTLD_DEEPBIND",
+                majit_rlib::rdynload::cConfig::RTLD_DEEPBIND,
+            ),
+        ] {
+            if let Some(value) = value {
+                found.push((name, value as i64));
+            }
+        }
+    }
+    for name in ["RTLD_LAZY", "RTLD_NOW", "RTLD_GLOBAL", "RTLD_LOCAL"] {
+        if found.iter().all(|(n, _)| *n != name) {
+            found.push((name, 0));
+        }
+    }
+    found
+}
+
+/// `moduledef` `for _name, _value in get_dict_rtld_constants().items()`.
 pub(super) fn register_rtld_constants(ns: pyre_object::PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ns = pyre_object::gc_roots::pin_root(ns);
-    #[cfg(unix)]
-    let found: &[(&str, i64)] = &[
-        ("RTLD_LAZY", libc::RTLD_LAZY as i64),
-        ("RTLD_NOW", libc::RTLD_NOW as i64),
-        ("RTLD_GLOBAL", libc::RTLD_GLOBAL as i64),
-        ("RTLD_LOCAL", libc::RTLD_LOCAL as i64),
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
-        ("RTLD_NODELETE", libc::RTLD_NODELETE as i64),
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
-        ("RTLD_NOLOAD", libc::RTLD_NOLOAD as i64),
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        ("RTLD_DEEPBIND", libc::RTLD_DEEPBIND as i64),
-    ];
-    #[cfg(not(unix))]
-    let found: &[(&str, i64)] = &[
-        ("RTLD_LAZY", 0),
-        ("RTLD_NOW", 0),
-        ("RTLD_GLOBAL", 0),
-        ("RTLD_LOCAL", 0),
-    ];
-    for (name, value) in found {
-        pyre_interpreter::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(*value));
+    for (name, value) in get_dict_rtld_constants() {
+        pyre_interpreter::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(value));
     }
 }
 

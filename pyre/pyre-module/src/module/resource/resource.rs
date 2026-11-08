@@ -34,9 +34,9 @@ fn struct_rusage_type() -> pyre_object::PyObjectRef {
     })
 }
 
-/// `sys/resource.h` `getrlimit` / `setrlimit`. C names `getrlimit` /
-/// `setrlimit`, `releasegil=False`, no `save_err`. Args match libc:
-/// `(int, *mut rlimit) -> int` and `(int, *const rlimit) -> int`.
+/// `sys/resource.h` `getrusage` / `getrlimit` / `setrlimit`. C names
+/// `getrusage` / `getrlimit` / `setrlimit`, `releasegil=False`, no
+/// `save_err`.
 mod ll {
     use majit_rlib::rffi::INT;
 
@@ -46,6 +46,13 @@ mod ll {
         };
     }
 
+    majit_rlib::rffi::llexternal!(
+        pub(super) c_getrusage = "getrusage",
+        [INT, *mut libc::rusage],
+        INT,
+        compilation_info = ECI,
+        releasegil = false
+    );
     majit_rlib::rffi::llexternal!(
         pub(super) c_getrlimit = "getrlimit",
         [INT, *mut libc::rlimit],
@@ -62,17 +69,22 @@ mod ll {
     );
 }
 
-/// `resource.getrusage` `struct_rusage` from `rtime.RUSAGE` / `libc::rusage`.
+/// `resource.getrusage` `struct_rusage` from `libc::rusage` (`lib_pypy`
+/// `_resource_build.py` `struct rusage`).
 /// `ru_utime` / `ru_stime` are timeval floats, then the 14 integer fields.
 /// This is `resource.getrusage`, not `time.clock`.
-fn make_struct_rusage(r: &majit_rlib::rtime::RUSAGE) -> pyre_object::PyObjectRef {
+fn make_struct_rusage(r: &libc::rusage) -> pyre_object::PyObjectRef {
+    /// `_resource_build.py` `doubletime`.
+    fn timeval_to_float(t: &libc::timeval) -> f64 {
+        t.tv_sec as f64 + t.tv_usec as f64 * 0.000001
+    }
     let mut fields = pyre_object::gc_roots::RootedItems::new();
-    fields.push(pyre_object::floatobject::w_float_new(
-        majit_rlib::rtime::decode_timeval(&r.ru_utime),
-    ));
-    fields.push(pyre_object::floatobject::w_float_new(
-        majit_rlib::rtime::decode_timeval(&r.ru_stime),
-    ));
+    fields.push(pyre_object::floatobject::w_float_new(timeval_to_float(
+        &r.ru_utime,
+    )));
+    fields.push(pyre_object::floatobject::w_float_new(timeval_to_float(
+        &r.ru_stime,
+    )));
     fields.push(pyre_object::w_int_new(r.ru_maxrss as i64));
     fields.push(pyre_object::w_int_new(r.ru_ixrss as i64));
     fields.push(pyre_object::w_int_new(r.ru_idrss as i64));
@@ -198,8 +210,8 @@ const RLIM_SAVED: Option<(libc::rlim_t, libc::rlim_t)> = None;
 ///
 /// Exposes getrusage / getrlimit / setrlimit plus the standard RUSAGE_*
 /// and RLIMIT_* constants, the `struct_rusage` type attribute, and the
-/// `error = OSError` alias. Calls `rtime.c_getrusage` and `c_getrlimit`
-/// / `c_setrlimit`.
+/// `error = OSError` alias. Calls `c_getrusage`, `c_getrlimit` and
+/// `c_setrlimit`.
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -224,11 +236,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     ));
                 };
                 let who = pyre_object::with_roots!(w_who => resource_id(w_who))?;
-                // `rtime.c_getrusage` (`releasegil=False`, no `save_err`).
-                // This is `resource.getrusage`, not `time.clock`.
-                let mut ru = unsafe { std::mem::zeroed::<majit_rlib::rtime::RUSAGE>() };
+                // `lib_pypy/resource.py` `getrusage`: `lib.getrusage(who, ru)`
+                let mut ru = unsafe { std::mem::zeroed::<libc::rusage>() };
                 let ret = pyre_object::with_roots!(w_who => unsafe {
-                    majit_rlib::rtime::c_getrusage(who, &mut ru)
+                    ll::c_getrusage(who, &mut ru)
                 });
                 if ret == -1 {
                     let errno = majit_rlib::rposix::_get_errno();
