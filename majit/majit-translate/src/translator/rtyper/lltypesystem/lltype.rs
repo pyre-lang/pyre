@@ -33,9 +33,10 @@ use crate::flowspace::model::{
     ConcretetypePlaceholder, ConstValue, FunctionGraph, GraphKey, GraphRef, Hlvalue,
 };
 use crate::rlib::rarithmetic::{
-    RIntValue, normalizedinttype, rint_new, rint_value, signed_int_overflow_message,
+    RIntValue, mask_bigint, normalizedinttype, rint_new, rint_value, signed_int_overflow_message,
 };
 use crate::translator::rtyper::error::TyperError;
+use malachite_bigint::BigInt;
 
 thread_local! {
     /// RPython `_ptr._become()` mutates the pointer object in place so
@@ -5590,10 +5591,10 @@ impl std::fmt::Display for CastWhateverError {
 /// RPython `lltype.typeOf` for a flow-graph `Constant.value`.
 pub fn typeOf_const(value: &ConstValue) -> Result<LowLevelType, CastWhateverError> {
     match value {
-        ConstValue::Int(_)
-        | ConstValue::Long(_)
-        | ConstValue::AddressOffset(_)
-        | ConstValue::InheritanceId { .. } => Ok(LowLevelType::Signed),
+        ConstValue::Int(_) | ConstValue::AddressOffset(_) | ConstValue::InheritanceId { .. } => {
+            Ok(LowLevelType::Signed)
+        }
+        ConstValue::Long(n) => Err(typeof_prebuilt_long_overflow(n)),
         ConstValue::UInt(_) => Ok(LowLevelType::Unsigned),
         ConstValue::Int128(_) => Ok(LowLevelType::SignedLongLongLong),
         ConstValue::UInt128(_) => Ok(LowLevelType::UnsignedLongLongLong),
@@ -5656,6 +5657,8 @@ pub(crate) struct TruncatedInt {
     /// Truncated integer-valued f64 when `long(value)` does not fit
     /// i128 (`cast_primitive` Float source). `None` for integer sources.
     float_exact: Option<f64>,
+    /// `long(value)` when the source is `ConstValue::Long`.
+    exact_bigint: Option<BigInt>,
 }
 
 impl TruncatedInt {
@@ -5665,6 +5668,21 @@ impl TruncatedInt {
             is_zero,
             fits_i128,
             float_exact,
+            exact_bigint: None,
+        }
+    }
+
+    fn from_bigint(n: BigInt) -> Self {
+        let masked = &n & mask_bigint(128);
+        let low = u128::try_from(&masked)
+            .unwrap_or_else(|_| unreachable!("mask_bigint(128) is in 0..=u128::MAX"));
+        let fits_i128 = i128::try_from(&n).is_ok();
+        Self {
+            low,
+            is_zero: n == BigInt::from(0),
+            fits_i128,
+            float_exact: None,
+            exact_bigint: Some(n),
         }
     }
 
@@ -5690,11 +5708,25 @@ impl TruncatedInt {
     pub(crate) fn exact_int_display(&self) -> String {
         if let Some(n) = self.as_i128() {
             n.to_string()
+        } else if let Some(n) = &self.exact_bigint {
+            n.to_string()
         } else if let Some(f) = self.float_exact {
             format!("{:.0}", f)
         } else {
             self.low.to_string()
         }
+    }
+}
+
+/// `lltype.typeOf` `tp is long` (`lltype.py`). Never returns Signed.
+fn typeof_prebuilt_long_overflow(n: &BigInt) -> CastWhateverError {
+    // `longlongmask(val) == val` (`rarithmetic.longlongmask`).
+    if i64::try_from(n).is_ok() {
+        CastWhateverError::overflow_error(format!(
+            "integer {n} is out of bounds for Signed (it would fit SignedLongLong, but we won't implicitly return SignedLongLong for typeOf({n}) where type({n}) is long)"
+        ))
+    } else {
+        CastWhateverError::overflow_error(format!("integer {n} is out of bounds"))
     }
 }
 
@@ -5712,9 +5744,7 @@ pub(crate) fn truncated_from_const(value: &ConstValue) -> Result<TruncatedInt, C
         ConstValue::UInt(n) => Ok(TruncatedInt::from_u128(*n as u128)),
         ConstValue::Int128(n) => Ok(TruncatedInt::from_i128(*n)),
         ConstValue::UInt128(n) => Ok(TruncatedInt::from_u128(*n)),
-        ConstValue::Long(n) => Err(CastWhateverError::overflow_error(
-            signed_int_overflow_message(n, 128),
-        )),
+        ConstValue::Long(n) => Ok(TruncatedInt::from_bigint(n.clone())),
         ConstValue::RInt(c, n, _) => Ok(match rint_value(*c, n) {
             RIntValue::Signed(v) => TruncatedInt::from_i128(v),
             RIntValue::Unsigned(v) => TruncatedInt::from_u128(v),
@@ -8205,6 +8235,78 @@ mod tests {
     }
 
     #[test]
+    fn hashing_self_referential_gcstruct_ptr_and_gcarray_terminates() {
+        // `LowLevelType.__hash__`: hashing `Ptr` of a recursive GcStruct
+        // (built through `GcForwardReference.become`) and `GcArray` of
+        // that Ptr must terminate, and the same value hashes equally twice.
+        let fwd = ForwardReference::gc();
+        let body = Struct::gc(
+            "T",
+            vec![(
+                "next".into(),
+                LowLevelType::Ptr(Box::new(Ptr {
+                    TO: PtrTarget::ForwardReference(fwd.clone()),
+                })),
+            )],
+        );
+        fwd.r#become(LowLevelType::Struct(Box::new(body))).unwrap();
+        let ptr_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::ForwardReference(fwd),
+        }));
+
+        let mut first = std::collections::hash_map::DefaultHasher::new();
+        ptr_ty.hash(&mut first);
+        let ptr_hash = first.finish();
+        let mut second = std::collections::hash_map::DefaultHasher::new();
+        ptr_ty.hash(&mut second);
+        assert_eq!(ptr_hash, second.finish());
+
+        let arr = Array::gc(ptr_ty);
+        let mut first = std::collections::hash_map::DefaultHasher::new();
+        arr.hash(&mut first);
+        let arr_hash = first.finish();
+        let mut second = std::collections::hash_map::DefaultHasher::new();
+        arr.hash(&mut second);
+        assert_eq!(arr_hash, second.finish());
+    }
+
+    #[test]
+    fn separately_constructed_gcarray_char_eq_and_hash() {
+        let a = Array::gc(LowLevelType::Char);
+        let b = Array::gc(LowLevelType::Char);
+        assert_eq!(a, b);
+        let mut left = std::collections::hash_map::DefaultHasher::new();
+        a.hash(&mut left);
+        let mut right = std::collections::hash_map::DefaultHasher::new();
+        b.hash(&mut right);
+        assert_eq!(left.finish(), right.finish());
+    }
+
+    #[test]
+    fn gcarray_eq_distinguishes_item_type_and_struct_identity() {
+        assert_ne!(
+            Array::gc(LowLevelType::Signed),
+            Array::gc(LowLevelType::Unsigned)
+        );
+        let ptr_t = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc("T", vec![("x".into(), LowLevelType::Signed)])),
+        }));
+        let ptr_u = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc("U", vec![("x".into(), LowLevelType::Signed)])),
+        }));
+        assert_ne!(Array::gc(ptr_t), Array::gc(ptr_u));
+        let named_signed = Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+            "x",
+            vec![("v".into(), LowLevelType::Signed)],
+        ))));
+        let named_float = Array::gc(LowLevelType::Struct(Box::new(Struct::new(
+            "x",
+            vec![("v".into(), LowLevelType::Float)],
+        ))));
+        assert_ne!(named_signed, named_float);
+    }
+
+    #[test]
     fn debug_of_recursive_struct_type_terminates() {
         // A recursive struct type — a struct with a `Ptr` field pointing
         // back to itself, e.g. `pyframe::PyFrame` — is legal. Formatting
@@ -10297,6 +10399,34 @@ mod tests {
             }
             other => panic!("expected RInt(-1), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn typeof_const_long_raises_overflow_error() {
+        let fits_longlong = ConstValue::Long(BigInt::from(1i64 << 62));
+        let err = typeOf_const(&fits_longlong).expect_err("typeOf long that fits longlongmask");
+        assert_eq!(
+            err.to_string(),
+            "integer 4611686018427387904 is out of bounds for Signed (it would fit SignedLongLong, but we won't implicitly return SignedLongLong for typeOf(4611686018427387904) where type(4611686018427387904) is long)"
+        );
+        let huge: BigInt = BigInt::from(1) << 200;
+        let err = typeOf_const(&ConstValue::Long(huge.clone())).expect_err("typeOf huge long");
+        assert_eq!(err.to_string(), format!("integer {huge} is out of bounds"));
+    }
+
+    #[test]
+    fn truncated_from_const_long_overflow_uses_destination_bits() {
+        let schar = crate::rlib::rarithmetic::built_rint("r_schar_long_trunc", true, 8);
+        let ty = build_number(Some("SCHAR_LONG_TRUNC"), KnownType::RInt(schar))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let n: BigInt = BigInt::from(1) << 200;
+        let value = ConstValue::Long(n.clone());
+        truncated_from_const(&value).expect("Long truncates as unbounded long(value)");
+        let err = number_cast(&ty, &value).expect_err("signed_int.__new__ OverflowError");
+        assert_eq!(
+            err.to_string(),
+            crate::rlib::rarithmetic::signed_int_overflow_message(&n, 8)
+        );
     }
 
     #[test]

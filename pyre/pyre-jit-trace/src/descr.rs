@@ -254,7 +254,7 @@ fn get_or_create_array_descr(
     len_offset: Option<usize>,
 ) -> DescrRef {
     get_or_create_array_descr_with_full_id(
-        base_size, item_size, type_id, item_type, signed, len_offset, None, false, true,
+        base_size, item_size, type_id, item_type, signed, len_offset, None, false, true, 0,
     )
 }
 
@@ -268,6 +268,7 @@ fn get_or_create_array_descr_with_full_id(
     array_type_id: Option<String>,
     load_is_acquire: bool,
     is_gc_managed: bool,
+    packed_cache_key: u64,
 ) -> DescrRef {
     let key = ArrayDescrKey {
         base_size,
@@ -281,20 +282,20 @@ fn get_or_create_array_descr_with_full_id(
         is_gc_managed,
     };
     let mut cache = ARRAY_DESCR_REGISTRY.lock();
+    // Packed `BhDescr::Array.type_id` is `cpu.arraydescrof`'s cache
+    // key (`descr.py get_array_descr` `_cache_array[ARRAY]`). Dump
+    // spelling is not that ARRAY and is not a second gccache slot.
     if let Some(existing) = cache.get(&key) {
+        if packed_cache_key != 0 && !key.load_is_acquire {
+            majit_ir::descr_registry::register_keyed_array(
+                majit_ir::descr::LLType::Array(packed_cache_key),
+                existing.clone(),
+            );
+        }
         return existing.clone();
     }
-    // `descr.py get_array_descr(gccache, ARRAY)`: when the
-    // caller has an `array_type_id` (the codewriter lltype identity
-    // proxy), `gc_cache._cache_array[LLType::Array(path_hash(atid))]`
-    // is the authoritative cache slot — consult it FIRST so a prior
-    // analyzer-side `gc_cache.get_array_descr` mint
-    // (`SimpleArrayDescr`) is reused instead of layered under a fresh
-    // runtime `SimpleArrayDescr`.  Matches PyPy `cpu.arraydescrof(ARRAY)`
-    // per-ARRAY object identity — both analyzer and pyre runtime
-    // consumers share one Arc per `LLType::Array(path_hash(atid))`.
-    if let Some(ref atid) = key.array_type_id {
-        let gc_key = majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(atid));
+    if packed_cache_key != 0 {
+        let gc_key = majit_ir::descr::LLType::Array(packed_cache_key);
         if let Some(existing) = majit_ir::descr::gc_cache()
             .lock()
             ._cache_array
@@ -306,13 +307,6 @@ fn get_or_create_array_descr_with_full_id(
                     .is_some_and(|ad| ad.load_is_acquire() == key.load_is_acquire)
             })
         {
-            // Analyzer `arraydescrof_concrete` mints `type_id = 0`.
-            // `init_array_descr` leaves `UNSET_GC_TYPE_ID` until
-            // `register_unresolved_array_tids`. Runtime
-            // `pyobject_gcarray_descr` carries the collector tid; stamp
-            // it onto the shared Arc so `gen_initialize_tid` does not
-            // fall back to `OBJECT_GC_TYPE_ID` (frame-locals walk as a
-            // 16-byte PyObject — `fib_recursive` SIGSEGV).
             if !majit_ir::descr::array_tid_is_unresolved(type_id)
                 && type_id != 0
                 && let Some(ad) = existing.as_array_descr()
@@ -320,10 +314,6 @@ fn get_or_create_array_descr_with_full_id(
             {
                 ad.set_type_id(type_id);
             }
-            // Memoise into the local structural cache so subsequent
-            // `get_or_create_array_descr_with_full_id` calls with the
-            // same structural key hit the local fast path without
-            // re-consulting gc_cache.
             cache.insert(key.clone(), existing.clone());
             return existing;
         }
@@ -342,10 +332,17 @@ fn get_or_create_array_descr_with_full_id(
     // onto slot 0 at the `BhDescr` boundary.
     // `array_type_id` None and `type_id == 0` → no identity carrier
     // at all (legacy `make_array_descr` no-identity path); stay 0.
-    let cache_key = match key.array_type_id.as_deref() {
-        Some(atid) => majit_ir::descr::path_hash(atid),
-        None if type_id != 0 => type_id as u64,
-        None => 0,
+    // Packed `BhDescr::Array.type_id` is the producer `cache_key`
+    // (`cpu.arraydescrof` / `descr.py get_array_descr`). Dump spelling
+    // is not a second `_cache_array` key.
+    let cache_key = if packed_cache_key != 0 {
+        packed_cache_key
+    } else {
+        match key.array_type_id.as_deref() {
+            Some(atid) => majit_ir::descr::path_hash(atid),
+            None if type_id != 0 => type_id as u64,
+            None => 0,
+        }
     };
     // `descr.py` ArrayDescr — a single flag-bearing descriptor.
     // The runtime mint produces the same `SimpleArrayDescr` the
@@ -397,11 +394,9 @@ fn get_or_create_array_descr_with_full_id(
     // identify it.  Acquire descrs stay on the registry key that
     // includes `load_is_acquire`; `_cache_array` cannot distinguish
     // that bit.
-    if !key.load_is_acquire
-        && let Some(ref atid) = key.array_type_id
-    {
+    if !key.load_is_acquire && cache_key != 0 {
         majit_ir::descr_registry::register_keyed_array(
-            majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(atid)),
+            majit_ir::descr::LLType::Array(cache_key),
             arc.clone(),
         );
     }
@@ -434,6 +429,7 @@ pub fn raw_carray_descr(item_type: Type, item_size: usize, is_item_signed: bool)
         Some(format!("majit::raw_carray_{prefix}{}", item_size * 8)),
         false,
         false,
+        0,
     )
 }
 
@@ -4143,6 +4139,7 @@ pub fn make_array_descr_with_full_id(
         array_type_id,
         load_is_acquire,
         true,
+        0,
     )
 }
 
@@ -13286,6 +13283,49 @@ mod tests {
         assert_eq!(ad.item_size(), 8);
     }
 
+    /// Opcode `BhDescr::Array.type_id` is the producer `cache_key`
+    /// (`cpu.arraydescrof` / `descr.py get_array_descr`). Packed `type_id`
+    /// is the only gccache slot; dump spelling is not a second key.
+    #[test]
+    fn make_descr_from_bh_array_publishes_packed_cache_key() {
+        use majit_ir::descr::{LLType, gc_cache};
+        use majit_ir::effectinfo::DescrSetMember;
+        use majit_jitcode::jitcode::BhDescr;
+        let cache_key = majit_ir::descr::path_hash("GcArray<char>");
+        let descr = make_descr_from_bh(&BhDescr::Array {
+            base_size: 0,
+            itemsize: 4,
+            len_offset: None,
+            type_id: cache_key,
+            gc_type_id: u32::MAX,
+            item_type: Type::Int,
+            is_array_of_pointers: false,
+            is_array_of_structs: false,
+            is_item_signed: false,
+            is_gc_managed: true,
+            ei_index: 6,
+            array_type_id: Some("GcArray<char>".into()),
+            interior_fields: Vec::new(),
+            load_is_acquire: false,
+        });
+        assert!(
+            gc_cache()
+                .lock()
+                ._cache_array
+                .contains_key(&LLType::Array(cache_key)),
+            "gccache must own packed type_id {cache_key}"
+        );
+        match descr_from_set_member(&DescrSetMember::Array {
+            array_id: cache_key,
+        }) {
+            SetMemberLookup::Resolved(d) => assert!(Arc::ptr_eq(&d, &descr)),
+            SetMemberLookup::AbsentContainer => {
+                panic!("stamp lookup of packed cache_key: AbsentContainer")
+            }
+            SetMemberLookup::Ambiguous => panic!("stamp lookup of packed cache_key: Ambiguous"),
+        }
+    }
+
     /// A traced integer-dict `NEW_ARRAY_CLEAR` must keep the collector
     /// tid `register_dict_entries` published, not the sequential id
     /// `init_array_descr` mints for an unknown ARRAY.
@@ -18147,8 +18187,19 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     .expect("runtime gcarray descr is an ArrayDescr");
                 assert!(
                     ad.base_size() == *base_size && ad.item_size() == *itemsize,
-                    "build-time layout of {array_type_id:?} disagrees with the runtime block",
+                    "build-time layout of {array_type_id:?} disagrees with the runtime block: \
+                     runtime base={} item={} bh base={} item={} type_id={type_id:#x}",
+                    ad.base_size(),
+                    ad.item_size(),
+                    *base_size,
+                    *itemsize,
                 );
+                if *type_id != 0 && !*load_is_acquire {
+                    majit_ir::descr_registry::register_keyed_array(
+                        majit_ir::descr::LLType::Array(*type_id),
+                        runtime.clone(),
+                    );
+                }
                 runtime
             } else {
                 // `descr.py get_array_descr gccache._cache_array[ARRAY_OR_STRUCT]`
@@ -18170,6 +18221,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     array_type_id.clone(),
                     *load_is_acquire,
                     *is_gc_managed,
+                    *type_id,
                 )
             };
             // `effectinfo.py compute_bitstrings` republish: the

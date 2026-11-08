@@ -409,6 +409,7 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
                     OpKind::ArrayLen {
                         base: site.iter_arg.clone(),
                         array_type_id: array_type_id.clone(),
+                        array: crate::codewriter::call::array_from_variable(&site.iter_arg),
                         nolength: false,
                         gckind: crate::model::ArrayGcKind::Gc,
                     },
@@ -480,6 +481,7 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
                         index: bp_idx.clone(),
                         item_ty: item_ty.clone(),
                         array_type_id: array_type_id.clone(),
+                        array: crate::codewriter::call::array_from_variable(&map[&site.iter_arg]),
                         nolength: crate::front::typestr::nolength_from_array_type_id(
                             array_type_id.as_deref(),
                         ),
@@ -515,6 +517,7 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
                         index: bp_idx.clone(),
                         item_ty: item_ty.clone(),
                         array_type_id: array_type_id.clone(),
+                        array: crate::codewriter::call::array_from_variable(&map[&site.iter_arg]),
                         nolength: crate::front::typestr::nolength_from_array_type_id(
                             array_type_id.as_deref(),
                         ),
@@ -908,6 +911,7 @@ mod tests {
             OpKind::ArrayLen {
                 base: l.clone(),
                 array_type_id: Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.into()),
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
             },

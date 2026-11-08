@@ -758,6 +758,7 @@ fn block_emptied_after_the_head_collapse_is_still_rewired_past() {
             value: LinkArg::Value(value),
             item_ty: ValueType::Int,
             array_type_id: None,
+            array: None,
             nolength: false,
             gckind: crate::model::ArrayGcKind::Gc,
         },
@@ -2604,6 +2605,7 @@ fn items_block_set_ref_call_is_one_array_write() {
             base,
             item_ty,
             array_type_id,
+            array: _,
             ..
         } = &op.kind
         {

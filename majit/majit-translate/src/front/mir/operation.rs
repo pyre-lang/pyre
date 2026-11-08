@@ -318,7 +318,8 @@ impl<'a> Lowering<'a> {
                             || field_ty_is_inline_vec(place_ty, self.llbc),
                     ),
                 item_ty,
-                array_type_id: Some(alias.array_type_id),
+                array_type_id: Some(alias.array_type_id.clone()),
+                array: None,
             },
         });
         Ok(Some(res))
@@ -373,7 +374,8 @@ impl<'a> Lowering<'a> {
                 field,
                 value: value_var,
                 item_ty,
-                array_type_id: Some(alias.array_type_id),
+                array_type_id: Some(alias.array_type_id.clone()),
+                array: None,
             },
         });
         Ok(())
@@ -834,6 +836,7 @@ impl<'a> Lowering<'a> {
                         value: value.clone(),
                         item_ty,
                         array_type_id: alias.array_type_id.clone(),
+                        array: None,
                         nolength: crate::front::typestr::nolength_from_array_type_id(
                             alias.array_type_id.as_deref(),
                         ),
@@ -895,6 +898,7 @@ impl<'a> Lowering<'a> {
                         value: value.clone(),
                         item_ty: ValueType::Str,
                         array_type_id: Some(STRING_GCREF_GCARRAY_TYPE_ID.to_string()),
+                        array: None,
                         nolength: crate::front::typestr::nolength_from_array_type_id(Some(
                             STRING_GCREF_GCARRAY_TYPE_ID,
                         )),
@@ -938,6 +942,7 @@ impl<'a> Lowering<'a> {
                         value: value.clone(),
                         item_ty,
                         array_type_id: Some(array_type_id.clone()),
+                        array: None,
                         nolength: crate::front::typestr::nolength_from_array_type_id(Some(
                             array_type_id.as_str(),
                         )),
@@ -1256,7 +1261,8 @@ impl<'a> Lowering<'a> {
                         gckind: crate::front::typestr::gckind_from_array_type_id(
                             projection_array_type_id.as_deref(),
                         ),
-                        array_type_id: projection_array_type_id,
+                        array_type_id: projection_array_type_id.clone(),
+                        array: None,
                         nolength: projection_array_nolength,
                     }
                 } else {
@@ -6837,6 +6843,7 @@ impl<'a> Lowering<'a> {
                             gckind: crate::front::typestr::gckind_from_array_type_id(
                                 array_type_id.as_deref(),
                             ),
+                            array: None,
                             array_type_id,
                             nolength,
                             pure: false,
@@ -7151,6 +7158,7 @@ impl<'a> Lowering<'a> {
                             index,
                             item_ty,
                             array_type_id: Some(array_type_id.clone()),
+                            array: None,
                             nolength: crate::front::typestr::nolength_from_array_type_id(Some(
                                 array_type_id.as_str(),
                             )),
@@ -7188,6 +7196,7 @@ impl<'a> Lowering<'a> {
                             index,
                             item_ty: ValueType::Ref(None),
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                            array: None,
                             nolength: false,
                             gckind: crate::model::ArrayGcKind::Gc,
                             pure: false,

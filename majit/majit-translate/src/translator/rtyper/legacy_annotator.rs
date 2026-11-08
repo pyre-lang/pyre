@@ -1883,7 +1883,9 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         ConstValue::UInt(_) => ValueType::Unsigned,
         ConstValue::Int128(_) => ValueType::Int128,
         ConstValue::UInt128(_) => ValueType::UInt128,
-        ConstValue::Long(_) => ValueType::Int,
+        // `lltype.typeOf` of a prebuilt long raises OverflowError; this
+        // function has no error channel, same as Placeholder.
+        ConstValue::Long(_) => ValueType::Unknown,
         ConstValue::Float(_) | ConstValue::LongFloat(_) => ValueType::Float,
         ConstValue::SingleFloat(_) => ValueType::SingleFloat,
         ConstValue::Placeholder => ValueType::Unknown,
@@ -3176,6 +3178,10 @@ mod tests {
             union_type(&ValueType::Int, &ValueType::Bool),
             ValueType::Int
         );
+        assert_eq!(
+            const_value_type(&ConstValue::Long(malachite_bigint::BigInt::from(1) << 200)),
+            ValueType::Unknown
+        );
         assert_eq!(const_value_type(&ConstValue::Bool(true)), ValueType::Bool);
         assert_eq!(
             union_type(&const_value_type(&ConstValue::Bool(false)), &ValueType::Int),
@@ -4192,6 +4198,7 @@ mod tests {
                 OpKind::ArrayLen {
                     base,
                     array_type_id: None,
+                    array: None,
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                 },

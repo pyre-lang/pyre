@@ -2451,6 +2451,7 @@ impl<'a> Lowering<'a> {
                                 index: args[1].clone(),
                                 item_ty: item_ty.clone(),
                                 array_type_id: array_type_id.clone(),
+                                array: None,
                                 nolength: crate::front::typestr::nolength_from_array_type_id(
                                     array_type_id.as_deref(),
                                 ),
@@ -2659,6 +2660,7 @@ impl<'a> Lowering<'a> {
                             index: args[1].clone(),
                             item_ty: item_ty.clone(),
                             array_type_id: Some(array_type_id.clone()),
+                            array: None,
                             nolength: crate::front::typestr::nolength_from_array_type_id(Some(
                                 array_type_id.as_str(),
                             )),
@@ -2725,6 +2727,7 @@ impl<'a> Lowering<'a> {
                             index: args[1].clone(),
                             item_ty: ValueType::Ref(None),
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                            array: None,
                             nolength: false,
                             gckind: crate::model::ArrayGcKind::Gc,
                             pure: false,
@@ -2785,6 +2788,7 @@ impl<'a> Lowering<'a> {
                             index: args[1].clone(),
                             item_ty: item_ty.clone(),
                             array_type_id: Some(array_type_id.clone()),
+                            array: None,
                             nolength: crate::front::typestr::nolength_from_array_type_id(Some(
                                 array_type_id.as_str(),
                             )),
@@ -2859,6 +2863,7 @@ impl<'a> Lowering<'a> {
                             index: args[1].clone(),
                             item_ty: item_ty.clone(),
                             array_type_id: Some(array_type_id.clone()),
+                            array: None,
                             nolength: crate::front::typestr::nolength_from_array_type_id(Some(
                                 array_type_id.as_str(),
                             )),
@@ -2929,6 +2934,7 @@ impl<'a> Lowering<'a> {
                             value,
                             item_ty: ValueType::Ref(None),
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                            array: None,
                             nolength: false,
                             gckind: crate::model::ArrayGcKind::Gc,
                         },
@@ -2993,6 +2999,7 @@ impl<'a> Lowering<'a> {
                                 value,
                                 item_ty: ValueType::Ref(None),
                                 array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                                array: None,
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                             },
@@ -3080,6 +3087,7 @@ impl<'a> Lowering<'a> {
                             index: idx_a.clone(),
                             item_ty: elem_ty.clone(),
                             array_type_id: elem_array_type_id.clone(),
+                            array: None,
                             nolength: false,
                             gckind: crate::model::ArrayGcKind::Gc,
                             pure: false,
@@ -3092,6 +3100,7 @@ impl<'a> Lowering<'a> {
                             index: idx_b.clone(),
                             item_ty: elem_ty.clone(),
                             array_type_id: elem_array_type_id.clone(),
+                            array: None,
                             nolength: false,
                             gckind: crate::model::ArrayGcKind::Gc,
                             pure: false,
@@ -3105,6 +3114,7 @@ impl<'a> Lowering<'a> {
                             value: LinkArg::Value(elem_b),
                             item_ty: elem_ty.clone(),
                             array_type_id: elem_array_type_id.clone(),
+                            array: None,
                             nolength: false,
                             gckind: crate::model::ArrayGcKind::Gc,
                         },
@@ -3117,6 +3127,7 @@ impl<'a> Lowering<'a> {
                             value: LinkArg::Value(elem_a),
                             item_ty: elem_ty.clone(),
                             array_type_id: elem_array_type_id.clone(),
+                            array: None,
                             nolength: false,
                             gckind: crate::model::ArrayGcKind::Gc,
                         },
@@ -4726,6 +4737,7 @@ impl<'a> Lowering<'a> {
                             OpKind::ArrayLen {
                                 base: self.object_slice_arraylen_base(bb_id, &reg, args[0].clone()),
                                 array_type_id: self.slice_object_array_type_id(&reg),
+                                array: None,
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                             }
@@ -4813,6 +4825,7 @@ impl<'a> Lowering<'a> {
                             OpKind::ArrayLen {
                                 base: self.object_slice_arraylen_base(bb_id, &reg, args[0].clone()),
                                 array_type_id: self.slice_object_array_type_id(&reg),
+                                array: None,
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                             }
@@ -4881,6 +4894,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::ArrayLen {
                             base: args[0].clone(),
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                            array: None,
                             nolength: false,
                             gckind: crate::model::ArrayGcKind::Gc,
                         },
@@ -4949,6 +4963,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::ArrayLen {
                             base: args[0].clone(),
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                            array: None,
                             nolength: false,
                             gckind: crate::model::ArrayGcKind::Gc,
                         },
@@ -4996,6 +5011,7 @@ impl<'a> Lowering<'a> {
                         OpKind::ArrayLen {
                             base: args[0].clone(),
                             array_type_id: None,
+                            array: None,
                             nolength: false,
                             gckind: crate::model::ArrayGcKind::Gc,
                         }

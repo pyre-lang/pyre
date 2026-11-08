@@ -5820,14 +5820,24 @@ mod tests {
         )]));
         let bk = bk();
         let mut reg = StructFieldRegistry::default();
+        let pyobj = "pyobject::PyObject";
+        let pyobj_id = majit_ir::descr::StructId::from_canonical(pyobj);
+        let pyobj_identity = crate::front::semantic::ClassIdentity {
+            id: pyobj_id,
+            spelling: pyobj.to_string(),
+        };
         reg.fields.insert(
-            "pyobject::PyObject".to_string(),
+            pyobj.to_string(),
             vec![("type_ptr".to_string(), "usize".to_string())],
         );
-        reg.fields.insert(
-            "PyObject".to_string(),
-            reg.fields["pyobject::PyObject"].clone(),
-        );
+        reg.fields
+            .insert("PyObject".to_string(), reg.fields[pyobj].clone());
+        // Harvest crate-prefix requalification writes the leaf as an
+        // alias of the qualified declaration (`class_identity[leaf]`).
+        reg.class_identity
+            .insert(pyobj.to_string(), Some(pyobj_identity.clone()));
+        reg.class_identity
+            .insert("PyObject".to_string(), Some(pyobj_identity));
         bk.set_struct_fields(Rc::new(reg));
         let classdef = bk
             .getuniqueclassdef_for_struct_root("pyobject::PyObject")

@@ -1453,6 +1453,7 @@ fn set_ref_set_locals_w_real() {
                     OpKind::ArrayWrite {
                         value: crate::model::LinkArg::Value(value),
                         array_type_id: Some(array_type_id),
+                        array: _,
                         ..
                     } if value == cast_result && array_type_id == super::OBJECT_REF_GCARRAY_TYPE_ID
                 )

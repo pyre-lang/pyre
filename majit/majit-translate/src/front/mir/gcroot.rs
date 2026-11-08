@@ -431,6 +431,7 @@ impl<'a> Lowering<'a> {
                             index,
                             item_ty: ValueType::Ref(None),
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                            array: None,
                             nolength: false,
                             gckind: crate::model::ArrayGcKind::Gc,
                             pure: false,

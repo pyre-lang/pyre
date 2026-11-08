@@ -357,6 +357,7 @@ pub(crate) fn slice_len_op(
         return OpKind::ArrayLen {
             base,
             array_type_id: Some(id.to_owned()),
+            array: None,
             nolength: false,
             gckind: crate::model::ArrayGcKind::Gc,
         };

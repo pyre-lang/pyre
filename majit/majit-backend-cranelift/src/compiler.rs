@@ -5098,6 +5098,34 @@ mod longevity_last_usage_tests {
     }
 }
 
+/// `assembler.py` `flush_cc`: emit the icmp, or keep the CC in
+/// `guard_success_cc` when the next op accepts it.
+fn publish_or_materialise_cc(
+    builder: &mut FunctionBuilder,
+    opref_vars: &IndexMap<u32, Variable>,
+    cc: IntCC,
+    a: CValue,
+    b: CValue,
+    vi: u32,
+    ops: &[OpRc],
+    op_idx: usize,
+    guard_success_cc: &mut Option<GuardSuccessCc>,
+) {
+    // `assembler.py` `flush_cc`: a condition still pending here was
+    // published by an earlier op and never consumed.
+    debug_assert!(
+        guard_success_cc.is_none(),
+        "flush_cc: guard_success_cc already set"
+    );
+    if next_op_can_accept_cc(ops, op_idx) {
+        *guard_success_cc = Some(GuardSuccessCc { cc, lhs: a, rhs: b });
+        return;
+    }
+    let cmp = builder.ins().icmp(cc, a, b);
+    let r = builder.ins().uextend(cl_types::I64, cmp);
+    builder.def_var(var(opref_vars, vi), r);
+}
+
 /// `x86/regalloc.py` `_consider_compop` + `force_allocate_reg_or_cc` /
 /// `assembler.py` `flush_cc`: emit the icmp, or keep the CC in
 /// `guard_success_cc` when the next op accepts it.
@@ -5112,19 +5140,45 @@ fn emit_icmp(
     guard_success_cc: &mut Option<GuardSuccessCc>,
 ) {
     let (a, b) = resolve_binop(builder, opref_vars, op);
-    // `assembler.py` `flush_cc`: a condition still pending here was
-    // published by an earlier op and never consumed.
-    debug_assert!(
-        guard_success_cc.is_none(),
-        "flush_cc: guard_success_cc already set"
+    publish_or_materialise_cc(
+        builder,
+        opref_vars,
+        cc,
+        a,
+        b,
+        vi,
+        ops,
+        op_idx,
+        guard_success_cc,
     );
-    if next_op_can_accept_cc(ops, op_idx) {
-        *guard_success_cc = Some(GuardSuccessCc { cc, lhs: a, rhs: b });
-        return;
-    }
-    let cmp = builder.ins().icmp(cc, a, b);
-    let r = builder.ins().uextend(cl_types::I64, cmp);
-    builder.def_var(var(opref_vars, vi), r);
+}
+
+/// `assembler.py` `genop_int_is_true` / `genop_int_is_zero` +
+/// `regalloc.py` `consider_int_is_true`: TEST the operand against zero
+/// and `flush_cc` (`Conditions['Z']` / `Conditions['NZ']`).
+fn emit_test_location(
+    builder: &mut FunctionBuilder,
+    opref_vars: &IndexMap<u32, Variable>,
+    cc: IntCC,
+    op: &Op,
+    vi: u32,
+    ops: &[OpRc],
+    op_idx: usize,
+    guard_success_cc: &mut Option<GuardSuccessCc>,
+) {
+    let a = resolve_opref(builder, opref_vars, op.arg(0).to_opref());
+    let zero = builder.ins().iconst(cl_types::I64, 0);
+    publish_or_materialise_cc(
+        builder,
+        opref_vars,
+        cc,
+        a,
+        zero,
+        vi,
+        ops,
+        op_idx,
+        guard_success_cc,
+    );
 }
 
 /// `assembler.py` `implement_guard`: jump to the fail stub on
@@ -14138,20 +14192,26 @@ impl CraneliftBackend {
                     let r = builder.ins().bnot(a);
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
-                OpCode::IntIsZero => {
-                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let cmp = builder.ins().icmp(IntCC::Equal, a, zero);
-                    let r = builder.ins().uextend(cl_types::I64, cmp);
-                    builder.def_var(var(&opref_var_map, vi), r);
-                }
-                OpCode::IntIsTrue => {
-                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
-                    let zero = builder.ins().iconst(cl_types::I64, 0);
-                    let cmp = builder.ins().icmp(IntCC::NotEqual, a, zero);
-                    let r = builder.ins().uextend(cl_types::I64, cmp);
-                    builder.def_var(var(&opref_var_map, vi), r);
-                }
+                OpCode::IntIsZero => emit_test_location(
+                    &mut builder,
+                    &opref_var_map,
+                    IntCC::Equal,
+                    op,
+                    vi,
+                    ops,
+                    op_idx,
+                    &mut guard_success_cc,
+                ),
+                OpCode::IntIsTrue => emit_test_location(
+                    &mut builder,
+                    &opref_var_map,
+                    IntCC::NotEqual,
+                    op,
+                    vi,
+                    ops,
+                    op_idx,
+                    &mut guard_success_cc,
+                ),
                 OpCode::IntForceGeZero => {
                     let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let zero = builder.ins().iconst(cl_types::I64, 0);
@@ -24059,6 +24119,144 @@ mod tests {
             }
         }
         fail_first && !slt_uextend
+    }
+
+    fn icmp_cc_is_uextended(clif: &str, cc: &str) -> bool {
+        let mut icmp_name: Option<&str> = None;
+        for line in clif.lines() {
+            let t = line.trim();
+            if let Some(name) = icmp_name {
+                if let Some((_lhs, rhs)) = t.split_once(" = uextend.i64 ")
+                    && rhs.trim() == name
+                {
+                    return true;
+                }
+            } else if let Some((lhs, rhs)) = t.split_once(" = icmp")
+                && lhs.starts_with('v')
+                && rhs
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|tok| tok == cc)
+            {
+                icmp_name = Some(lhs);
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn test_int_is_zero_guard_false_accepts_cc() {
+        let mut backend = CraneliftBackend::new();
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ia0 = OpRef::input_arg_int(0);
+        let ops = [
+            mk_op(OpCode::Label, &[ia0], OpRef::NONE.raw()),
+            mk_op(OpCode::IntIsZero, &[ia0], 1),
+            mk_op(OpCode::GuardFalse, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[ia0], OpRef::NONE.raw()),
+        ];
+        ops[2].setfailargs(smallvec::smallvec![rb(ia0)]);
+
+        let token = JitCellToken::new(1_610_010);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let clif = backend.last_body_clif.clone();
+        assert!(
+            !icmp_cc_is_uextended(&clif, "eq"),
+            "IntIsZero + GuardFalse must keep the CC, without materialising the bool:\n{clif}"
+        );
+
+        let fail = backend.execute_token(&token, &[Value::Int(0)]);
+        latest_matches(&backend, &fail, &compiled_fail_descr(&token, 0));
+        assert_eq!(backend.get_int_value(&fail, 0), 0);
+
+        let pass = backend.execute_token(&token, &[Value::Int(5)]);
+        assert!(backend.get_latest_descr(&pass).is_finish());
+        assert_eq!(backend.get_int_value(&pass, 0), 5);
+    }
+
+    #[test]
+    fn test_int_is_true_cond_call_n_accepts_cc() {
+        static mut INT_IS_TRUE_COND_CALL_N_RESULT: i64 = 0;
+
+        extern "C" fn set_value(v: i64) {
+            unsafe {
+                INT_IS_TRUE_COND_CALL_N_RESULT = v;
+            }
+        }
+
+        unsafe {
+            INT_IS_TRUE_COND_CALL_N_RESULT = 0;
+        }
+
+        let mut backend = CraneliftBackend::new();
+        let descr = make_call_descr(vec![Type::Int], Type::Void);
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let ops = vec![
+            mk_op(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+            ),
+            mk_op(OpCode::IntIsTrue, &[OpRef::input_arg_int(0)], 2),
+            mk_op_with_descr(
+                OpCode::CondCallN,
+                &[
+                    OpRef::int_op(2),
+                    OpRef::const_int(set_value as *const () as i64),
+                    OpRef::input_arg_int(1),
+                ],
+                OpRef::NONE.raw(),
+                descr,
+            ),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+
+        let token = JitCellToken::new(1_610_011);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let clif = backend.last_body_clif.clone();
+        assert!(
+            !icmp_cc_is_uextended(&clif, "ne"),
+            "IntIsTrue + CondCallN must keep the CC, without materialising the bool:\n{clif}"
+        );
+
+        let skipped = backend.execute_token(&token, &[Value::Int(0), Value::Int(99)]);
+        assert_eq!(backend.get_int_value(&skipped, 0), 99);
+        assert_eq!(unsafe { INT_IS_TRUE_COND_CALL_N_RESULT }, 0);
+
+        let taken = backend.execute_token(&token, &[Value::Int(5), Value::Int(99)]);
+        assert_eq!(backend.get_int_value(&taken, 0), 99);
+        assert_eq!(unsafe { INT_IS_TRUE_COND_CALL_N_RESULT }, 99);
+    }
+
+    #[test]
+    fn test_int_is_zero_later_use_materialises() {
+        let mut backend = CraneliftBackend::new();
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ia0 = OpRef::input_arg_int(0);
+        let ops = [
+            mk_op(OpCode::Label, &[ia0], OpRef::NONE.raw()),
+            mk_op(OpCode::IntIsZero, &[ia0], 1),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+        ];
+
+        let token = JitCellToken::new(1_610_012);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let clif = backend.last_body_clif.clone();
+        assert!(
+            icmp_cc_is_uextended(&clif, "eq"),
+            "IntIsZero with a later use must materialise the bool:\n{clif}"
+        );
+
+        let zero = backend.execute_token(&token, &[Value::Int(0)]);
+        assert!(backend.get_latest_descr(&zero).is_finish());
+        assert_eq!(backend.get_int_value(&zero, 0), 1);
+
+        let five = backend.execute_token(&token, &[Value::Int(5)]);
+        assert!(backend.get_latest_descr(&five).is_finish());
+        assert_eq!(backend.get_int_value(&five, 0), 0);
     }
 
     /// `compile.py` `PropagateExceptionDescr.handle_fail` through the exit

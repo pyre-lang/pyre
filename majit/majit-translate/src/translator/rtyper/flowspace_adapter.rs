@@ -8499,14 +8499,28 @@ mod tests {
 
         let bk = Rc::new(Bookkeeper::new());
         let mut fields = crate::front::StructFieldRegistry::default();
+        let pyobj = "pyobject::PyObject";
+        let pyobj_id = majit_ir::descr::StructId::from_canonical(pyobj);
+        let pyobj_identity = crate::front::semantic::ClassIdentity {
+            id: pyobj_id,
+            spelling: pyobj.to_string(),
+        };
         fields.fields.insert(
             "PyObject".to_string(),
             vec![("type_ptr".to_string(), "usize".to_string())],
         );
         fields.fields.insert(
-            "pyobject::PyObject".to_string(),
+            pyobj.to_string(),
             vec![("type_ptr".to_string(), "usize".to_string())],
         );
+        // Harvest crate-prefix requalification writes the leaf as an
+        // alias of the qualified declaration (`class_identity[leaf]`).
+        fields
+            .class_identity
+            .insert(pyobj.to_string(), Some(pyobj_identity.clone()));
+        fields
+            .class_identity
+            .insert("PyObject".to_string(), Some(pyobj_identity));
         bk.set_struct_fields(Rc::new(fields));
 
         let cells = derive_subject_inputcells(&graph, Some(&bk))
@@ -13563,6 +13577,7 @@ mod tests {
                 index: vars[2].clone(),
                 item_ty: ValueType::Int,
                 array_type_id: None,
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
@@ -13588,6 +13603,7 @@ mod tests {
             kind: OpKind::ArrayLen {
                 base: vars[1].clone(),
                 array_type_id: Some("[PyObjectRef]".to_string()),
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
             },
@@ -13647,6 +13663,7 @@ mod tests {
                 value: crate::model::LinkArg::Value(vars[3].clone()),
                 item_ty: ValueType::Int,
                 array_type_id: None,
+                array: None,
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
             },
@@ -13679,6 +13696,7 @@ mod tests {
                 field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
                 item_ty: ValueType::Int,
                 array_type_id: None,
+                array: None,
             },
         };
         let translated = translate_op(&op, &value_map, &empty_call_registry())
@@ -13714,6 +13732,7 @@ mod tests {
             field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
             item_ty: ValueType::Int,
             array_type_id: None,
+            array: None,
         };
         assert!(
             op_canraise(&interior),
@@ -13789,6 +13808,7 @@ mod tests {
                 value: vars[3].clone(),
                 item_ty: ValueType::Int,
                 array_type_id: None,
+                array: None,
             },
         };
         let translated = translate_op(&op, &value_map, &empty_call_registry())
