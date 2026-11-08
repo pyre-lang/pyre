@@ -7621,11 +7621,14 @@ fn cond_call_slowpath_nargs(call_descr: &dyn CallDescr) -> Option<usize> {
 }
 
 /// Sibling of `emit_indirect_call_from_parts` for the cond_call slow path.
-/// Shares `emit_call_with_gc_roots` (`callbuilder.py` `emit`,
-/// `_build_cond_call_slowpath` plus the caller's gcmap); the CALL is a
-/// `CallConv::PreserveAll` direct `call` of the shared stub (`cond_call` /
-/// `CondCallSlowPath.generate_body` loads the target into a register and
-/// `CALL`s the helper).
+///
+/// `cond_call` / `CondCallSlowPath.generate_body`: the call site only
+/// `push_gcmap(store=True)` and `CALL`s the shared PreserveAll stub.
+/// `_reload_frame_if_necessary` and `pop_gcmap` run inside the stub
+/// (`_build_cond_call_slowpath`), so a DEFAULT-conv write barrier cannot
+/// force stack homes on values live across the never-taken cond_call.
+/// After the stub returns, read the reloaded jitframe from the pinned
+/// register (`set_pinned_reg` in the stub) and reload GC refs.
 fn emit_cond_call_slowpath_call(
     module: &mut JITModule,
     builder: &mut FunctionBuilder,
@@ -7633,7 +7636,6 @@ fn emit_cond_call_slowpath_call(
     func_ref: OpRef,
     arg_refs: &[OpRef],
     call_descr: &dyn CallDescr,
-    call_conv: cranelift_codegen::isa::CallConv,
     ptr_type: cranelift_codegen::ir::Type,
     jf_ptr: CValue,
     ref_root_slots: &[(u32, usize)],
@@ -7643,7 +7645,7 @@ fn emit_cond_call_slowpath_call(
     ref_root_base_ofs: i32,
     per_call_gcmap: i64,
     stub_addr: usize,
-) {
+) -> CValue {
     let mut stub_args: Vec<CValue> = Vec::with_capacity(1 + arg_refs.len());
     let func_ptr_raw = resolve_opref(builder, opref_vars, func_ref);
     let func_ptr = if ptr_type != cl_types::I64 {
@@ -7658,34 +7660,45 @@ fn emit_cond_call_slowpath_call(
     }
 
     let can_collect = call_descr.get_extra_info().check_can_collect();
-    emit_call_with_gc_roots(
-        module,
-        builder,
-        opref_vars,
-        can_collect,
-        call_conv,
-        ptr_type,
-        jf_ptr,
-        ref_root_slots,
-        defined_ref_vars,
-        stale_ref_vars,
-        demoted_failarg_slots,
-        ref_root_base_ofs,
-        per_call_gcmap,
-        |module, builder| {
-            let mut stub_sig = Signature::new(cranelift_codegen::isa::CallConv::PreserveAll);
-            stub_sig.params.push(AbiParam::new(ptr_type));
-            for _ in arg_refs {
-                stub_sig.params.push(AbiParam::new(cl_types::I64));
-            }
-            let name = format!("host_{stub_addr:x}");
-            let func_id = module
-                .declare_function(&name, Linkage::Import, &stub_sig)
-                .expect("cond_call_slowpath import");
-            let fref = module.declare_func_in_func(func_id, builder.func);
-            let _call = builder.ins().call(fref, &stub_args);
-        },
-    );
+    if can_collect {
+        spill_ref_roots(
+            builder,
+            opref_vars,
+            jf_ptr,
+            ref_root_slots,
+            defined_ref_vars,
+            stale_ref_vars,
+            demoted_failarg_slots,
+            ref_root_base_ofs,
+        );
+        emit_push_gcmap(builder, jf_ptr, per_call_gcmap);
+    }
+
+    let mut stub_sig = Signature::new(cranelift_codegen::isa::CallConv::PreserveAll);
+    stub_sig.params.push(AbiParam::new(ptr_type));
+    for _ in arg_refs {
+        stub_sig.params.push(AbiParam::new(cl_types::I64));
+    }
+    let name = format!("host_{stub_addr:x}");
+    let func_id = module
+        .declare_function(&name, Linkage::Import, &stub_sig)
+        .expect("cond_call_slowpath import");
+    let fref = module.declare_func_in_func(func_id, builder.func);
+    let _call = builder.ins().call(fref, &stub_args);
+
+    let new_jf = builder.ins().get_pinned_reg(ptr_type);
+    if can_collect {
+        reload_ref_roots(
+            builder,
+            opref_vars,
+            new_jf,
+            ref_root_slots,
+            defined_ref_vars,
+            demoted_failarg_slots,
+            ref_root_base_ofs,
+        );
+    }
+    new_jf
 }
 
 /// x86/assembler.py _cmp_guard_class:
@@ -11135,6 +11148,9 @@ pub struct CraneliftBackend {
     /// CLIF of the body most recently compiled by this backend.
     #[cfg(test)]
     last_body_clif: String,
+    /// Mach-inst disassembly (`set_disasm`) of that body.
+    #[cfg(test)]
+    last_body_vcode: String,
     /// Test hook: fail `do_compile` after trampolines are allocated and
     /// before `adr_jump_offset` is stamped, matching an emission /
     /// `materialize_loop` error after `write_pending_failure_recoveries`.
@@ -11358,6 +11374,8 @@ impl CraneliftBackend {
             jitframe_facts: jitframe_facts_at_cpu_init(),
             #[cfg(test)]
             last_body_clif: String::new(),
+            #[cfg(test)]
+            last_body_vcode: String::new(),
             #[cfg(test)]
             fail_after_pending_trampolines: false,
             #[cfg(test)]
@@ -11991,6 +12009,17 @@ impl CraneliftBackend {
             }
             let sig_ref = builder.import_signature(callee_sig);
             builder.ins().call_indirect(sig_ref, func_ptr, call_args);
+            // `_build_cond_call_slowpath`: CALL eax; `_reload_frame_if_necessary`;
+            // `pop_gcmap`; `_pop_all_regs_from_frame`; RET. PreserveAll is the
+            // push/pop-all-regs pair, so the DEFAULT-conv jitframe write
+            // barrier inside the stub does not clobber the caller's registers.
+            // `enable_pinned_reg` is module-wide, so the stub reads/writes
+            // the jitframe base in the pinned register rather than taking it
+            // as an extra parameter.
+            let new_jf =
+                emit_reload_frame_if_necessary(&mut self.module, &mut builder, ptr_type, call_conv);
+            emit_pop_gcmap(&mut builder, new_jf, 0);
+            builder.ins().set_pinned_reg(new_jf);
             builder.ins().return_(&[]);
             builder.finalize(frontend_config);
             self.func_ctx = func_ctx;
@@ -16489,14 +16518,13 @@ impl CraneliftBackend {
                         if let Some(nargs) = cond_call_slowpath_nargs(call_descr) {
                             let stub_addr = cond_call_slowpaths[nargs]
                                 .expect("cond_call_slowpath compiled before FunctionBuilder");
-                            emit_cond_call_slowpath_call(
+                            jf_ptr = emit_cond_call_slowpath_call(
                                 module,
                                 &mut builder,
                                 &opref_var_map,
                                 func_ref,
                                 &arg_refs,
                                 call_descr,
-                                call_conv,
                                 ptr_type,
                                 call_jf,
                                 &live_ref_root_raw,
@@ -16525,14 +16553,14 @@ impl CraneliftBackend {
                                 ref_root_base_ofs,
                                 per_call_gcmap,
                             );
+                            jf_ptr = emit_reload_frame_if_necessary(
+                                module,
+                                &mut builder,
+                                ptr_type,
+                                call_conv,
+                            );
+                            builder.ins().set_pinned_reg(jf_ptr);
                         }
-                        jf_ptr = emit_reload_frame_if_necessary(
-                            module,
-                            &mut builder,
-                            ptr_type,
-                            call_conv,
-                        );
-                        builder.ins().set_pinned_reg(jf_ptr);
                     }
 
                     // `enqueue_cond_call` peeks the next op;
@@ -19676,6 +19704,7 @@ impl CraneliftBackend {
         }
         #[cfg(test)]
         {
+            ctx.set_disasm(true);
             self.last_body_clif = ctx.func.display().to_string();
         }
         if let Err(e) = self.module.define_function(func_id, &mut ctx) {
@@ -19696,6 +19725,13 @@ impl CraneliftBackend {
             .compiled_code()
             .map(|code| code.code_info().total_size as usize)
             .unwrap_or(0);
+        #[cfg(test)]
+        {
+            self.last_body_vcode = ctx
+                .compiled_code()
+                .and_then(|code| code.vcode.clone())
+                .unwrap_or_default();
+        }
         if std::env::var_os("MAJIT_DUMP_CLIF").is_some() {
             eprintln!("[jit][code-size] trace_id={trace_id} body_bytes={body_code_bytes}");
             if let Some(text) = ctx.compiled_code().and_then(|code| code.vcode.as_deref()) {
@@ -24230,6 +24266,169 @@ mod tests {
         let taken = backend.execute_token(&token, &[Value::Int(5), Value::Int(99)]);
         assert_eq!(backend.get_int_value(&taken, 0), 99);
         assert_eq!(unsafe { INT_IS_TRUE_COND_CALL_N_RESULT }, 99);
+    }
+
+    fn vcode_blocks(vcode: &str) -> Vec<(usize, String)> {
+        let mut blocks = Vec::new();
+        let mut cur_id: Option<usize> = None;
+        let mut cur_body = String::new();
+        for line in vcode.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("block")
+                && let Some(num) = rest.strip_suffix(':')
+                && let Ok(id) = num.parse::<usize>()
+            {
+                if let Some(prev) = cur_id {
+                    blocks.push((prev, std::mem::take(&mut cur_body)));
+                }
+                cur_id = Some(id);
+            } else if cur_id.is_some() {
+                cur_body.push_str(line);
+                cur_body.push('\n');
+            }
+        }
+        if let Some(prev) = cur_id {
+            blocks.push((prev, cur_body));
+        }
+        blocks
+    }
+
+    fn vcode_jump_labels(body: &str) -> Vec<usize> {
+        let mut labels = Vec::new();
+        let bytes = body.as_bytes();
+        let mut i = 0;
+        while i + 5 < bytes.len() {
+            if bytes[i..].starts_with(b"label") {
+                let digits: String = body[i + 5..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(n) = digits.parse::<usize>() {
+                    labels.push(n);
+                }
+                i += 5;
+            } else {
+                i += 1;
+            }
+        }
+        labels
+    }
+
+    fn vcode_block_has_direct_call(body: &str) -> bool {
+        body.lines().any(|line| {
+            let t = line.trim_start();
+            t.starts_with("bl ")
+                || t.starts_with("bl\t")
+                || t.starts_with("blr ")
+                || t.starts_with("blr\t")
+                || t.starts_with("call ")
+                || t.starts_with("call\t")
+                || t.starts_with("callq ")
+                || t.starts_with("callq\t")
+        })
+    }
+
+    fn vcode_has_stack_slot_access(body: &str, x86: bool) -> bool {
+        if x86 {
+            body.contains("(%rsp)") || body.contains("(%rbp)")
+        } else {
+            body.contains("[sp")
+        }
+    }
+
+    fn assert_hot_loop_has_no_stack_reload(vcode: &str, x86: bool) {
+        assert!(!vcode.is_empty(), "compiled body produced no vcode");
+        let blocks = vcode_blocks(vcode);
+        let mut lo: Option<usize> = None;
+        let mut hi: Option<usize> = None;
+        for (id, body) in &blocks {
+            for t in vcode_jump_labels(body) {
+                if t <= *id {
+                    lo = Some(lo.map_or(t, |n| n.min(t)));
+                    hi = Some(hi.map_or(*id, |n| n.max(*id)));
+                }
+            }
+        }
+        let (lo, hi) = lo
+            .zip(hi)
+            .unwrap_or_else(|| panic!("no back-edge in vcode:\n{vcode}"));
+        let mut hot = String::new();
+        for (id, body) in &blocks {
+            if *id < lo || *id > hi {
+                continue;
+            }
+            if vcode_block_has_direct_call(body) {
+                continue;
+            }
+            hot.push_str(&format!("block{id}:\n{body}"));
+            assert!(
+                !vcode_has_stack_slot_access(body, x86),
+                "hot loop block{id} spilled a loop-carried value to the stack:\n{body}\n--- vcode ---\n{vcode}"
+            );
+        }
+        assert!(
+            !hot.trim().is_empty(),
+            "hot loop had no non-call blocks in {lo}..={hi}:\n{vcode}"
+        );
+    }
+
+    /// `CondCallSlowPath.generate_body` / `_build_cond_call_slowpath`: a
+    /// never-taken `COND_CALL` must not give loop-carried values a stack home.
+    /// The PreserveAll stub owns the DEFAULT-conv write barrier, so the hot
+    /// loop block has no `(%rsp)` / `[sp` spill/reload of those values.
+    ///
+    /// `isa::lookup(x86_64-unknown-linux-gnu)` is disabled in this crate's
+    /// cranelift-codegen (`Support for this target is disabled`), and
+    /// `CraneliftBackend` has no ISA-override hook, so the assertion runs
+    /// against the host vcode.
+    #[test]
+    fn test_cond_call_n_never_taken_keeps_loop_values_in_regs() {
+        extern "C" fn sink(a: i64, b: i64) {
+            let _ = (a, b);
+        }
+
+        // More loop-carried ints than the callee-saved set, so a clobbering
+        // call at the cond_call site forces stack homes, but few enough to
+        // fit the allocatable registers without one: aarch64 saves
+        // x19..x28 minus the pinned x21 (9) and allocates ~27; x86-64 saves
+        // rbx, r12..r14 (4; rbp is the frame pointer, r15 pinned) and
+        // allocates 13.
+        const N: u32 = if cfg!(target_arch = "x86_64") { 8 } else { 12 };
+        let mut backend = make_gc_backend();
+        let descr = make_call_descr(vec![Type::Int, Type::Int], Type::Void);
+        let ia: Vec<OpRef> = (0..N).map(OpRef::input_arg_int).collect();
+        let inputargs: Vec<_> = (0..N).map(InputArg::new_int_rc).collect();
+        let mut ops = vec![
+            mk_op(OpCode::Label, &ia, OpRef::NONE.raw()),
+            mk_op(OpCode::IntLt, &[ia[0], OpRef::const_int(8)], 100),
+            mk_op(OpCode::GuardTrue, &[OpRef::int_op(100)], OpRef::NONE.raw()),
+            mk_op_with_descr(
+                OpCode::CondCallN,
+                &[
+                    OpRef::const_int(0),
+                    OpRef::const_int(sink as *const () as i64),
+                    ia[1],
+                    ia[2],
+                ],
+                OpRef::NONE.raw(),
+                descr,
+            ),
+        ];
+        let mut jump_args = Vec::with_capacity(N as usize);
+        for i in 0..N {
+            ops.push(mk_op(
+                OpCode::IntAdd,
+                &[ia[i as usize], OpRef::const_int(i as i64 + 1)],
+                101 + i,
+            ));
+            jump_args.push(OpRef::int_op(101 + i));
+        }
+        ops.push(mk_op(OpCode::Jump, &jump_args, OpRef::NONE.raw()));
+        ops[2].setfailargs(smallvec::smallvec![rb(ia[0])]);
+
+        let token = JitCellToken::new(1_610_020);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        assert_hot_loop_has_no_stack_reload(&backend.last_body_vcode, cfg!(target_arch = "x86_64"));
     }
 
     #[test]
