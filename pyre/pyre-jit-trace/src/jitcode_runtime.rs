@@ -3492,6 +3492,17 @@ pub fn decode_op_at(code: &[u8], pc: usize) -> Option<DecodedOp> {
     })
 }
 
+/// JitCode ops that pause a Python caller (`MIFrame.pc` immediately after
+/// the call, `pyjitpl.py` `get_list_of_active_boxes` `in_a_call` /
+/// `after_residual_call`). `cond_call` is not one: it is not a Python CALL.
+pub fn is_python_call_jit_op(opname: &str) -> bool {
+    opname.starts_with("residual_call")
+        || opname.starts_with("inline_call")
+        || opname.starts_with("call_assembler")
+        || opname.starts_with("call_may_force")
+        || opname.starts_with("recursive_call")
+}
+
 /// Iterator over every instruction in a jitcode `code` slice. Yields
 /// `DecodedOp` in linear order (fallthrough layout — branch targets in
 /// `L`-typed operands are not followed). Stops on the first decode

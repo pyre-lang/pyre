@@ -466,6 +466,12 @@ pub(crate) struct LoopScanIndex {
     pub(crate) loop_headers: Vec<usize>,
     /// Last `residual_call*`, for queries against any loop-header merge.
     pub(crate) last_residual_call: Option<usize>,
+    /// Exact `op.next_pc` of each Python-call jitcode op, sorted, with that
+    /// op's own pc. `python_call_ending_at` binary-searches this instead of
+    /// re-decoding the body on every snapshot capture (`pyjitpl.py`
+    /// `get_list_of_active_boxes` `in_a_call`: `MIFrame.pc` is already the
+    /// byte after the call).
+    pub(crate) python_call_endings: Vec<(usize, usize)>,
 }
 
 impl LoopScanIndex {
@@ -476,8 +482,12 @@ impl LoopScanIndex {
             label_gotos: Vec::new(),
             loop_headers: Vec::new(),
             last_residual_call: None,
+            python_call_endings: Vec::new(),
         };
         for op in crate::jitcode_runtime::decoded_ops(code) {
+            if crate::jitcode_runtime::is_python_call_jit_op(op.opname) {
+                index.python_call_endings.push((op.next_pc, op.pc));
+            }
             if op.opname == "jit_merge_point" {
                 index.merge_points.push(op.pc);
             } else if op.opname == "abort_permanent" {
@@ -495,6 +505,18 @@ impl LoopScanIndex {
             }
         }
         index
+            .python_call_endings
+            .sort_unstable_by_key(|&(next, _)| next);
+        index
+    }
+
+    /// Call-op pc whose fallthrough is `pc`, if `pc` is immediately after a
+    /// Python-call jitcode op.
+    pub(crate) fn python_call_ending_at(&self, pc: usize) -> Option<usize> {
+        self.python_call_endings
+            .binary_search_by_key(&pc, |&(next, _)| next)
+            .ok()
+            .map(|i| self.python_call_endings[i].1)
     }
 
     /// The first `jit_merge_point` at or after `pc`.

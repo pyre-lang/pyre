@@ -127,17 +127,6 @@ pub fn trivia_normalized_py_pc_for_jitcode_pc(jitcode_index: i32, pc_word: i32) 
     }
 }
 
-/// JitCode ops that pause a Python caller (`MIFrame.pc` immediately after
-/// the call, `pyjitpl.py` `get_list_of_active_boxes` `in_a_call` /
-/// `after_residual_call`). `cond_call` is not one: it is not a Python CALL.
-fn python_call_jit_op(opname: &str) -> bool {
-    opname.starts_with("residual_call")
-        || opname.starts_with("inline_call")
-        || opname.starts_with("call_assembler")
-        || opname.starts_with("call_may_force")
-        || opname.starts_with("recursive_call")
-}
-
 /// Jitcode offset and containing Python pc of the Python-call op that ends
 /// at `pc` (`MIFrame.pc` immediately after the call).
 fn python_call_ending_at(jitcode_index: i32, pc: usize) -> Option<(usize, usize)> {
@@ -145,10 +134,9 @@ fn python_call_ending_at(jitcode_index: i32, pc: usize) -> Option<(usize, usize)
     if pjc.code_ptr.is_null() || crate::state::jitcode_is_transparent_helper(jitcode_index) {
         return None;
     }
-    let call = crate::jitcode_runtime::decoded_ops(pjc.jitcode.code.as_slice())
-        .find(|op| op.next_pc == pc && python_call_jit_op(op.opname))?;
-    let call_py = containing_py_pc_for_jitcode_pc(&pjc.metadata, call.pc) as usize;
-    Some((call.pc, call_py))
+    let call_pc = pjc.loop_scan().python_call_ending_at(pc)?;
+    let call_py = containing_py_pc_for_jitcode_pc(&pjc.metadata, call_pc) as usize;
+    Some((call_pc, call_py))
 }
 
 /// Python resume pc when `pc` is the byte immediately after a Python-call
