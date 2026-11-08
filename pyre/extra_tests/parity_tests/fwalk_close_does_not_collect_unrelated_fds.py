@@ -1,14 +1,12 @@
 # pyre-check: platforms=linux,darwin
-# CPython-suite gap: test_os.FwalkTests.test_fd_finalization only grades the
-# fwalk generator's own descriptors.  On a tracing GC, a collection taken
-# from close() would also run `__del__` of unrelated FileIO left by earlier
-# tests, so `getfd()` drops below the snapshot and the assertion reads
-# `3 != 6`.
+# CPython-suite gap: test_os.FwalkTests.test_fd_finalization now collects
+# before the snapshot (same as test_fd_leak), so leftover FileIO from earlier
+# tests do not move getfd(). It still does not pin that `os.fwalk().close()`
+# itself must not collect those FileIO: a collection taken from close() would
+# run `__del__` of the leaked handles and `getfd()` would drop.
 # parity-tests reason: `os.fwalk` holds an exhausted `scandir` iterator at the
 # topdown yield.  `W_ScandirIterator.fail` / `_close` (interp_scandir.py) is
-# what makes that iterator's finalizer a no-op; `may_ignore_finalizer` is the
-# same hint so `fwalk().close()` does not keep the exhausted scandir on the
-# finalizer queue.
+# what makes that iterator's finalizer a no-op.
 
 """fwalk().close() must not finalize FileIO that is not in its frame."""
 

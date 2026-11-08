@@ -2089,6 +2089,10 @@ class FwalkTests(WalkTests):
             os.close(fd)
             return fd
         for topdown in (False, True):
+            # PyPy: garbage from earlier tests may still hold fds, as in
+            # test_fd_leak. The collection after close() (BytesFwalkTests
+            # wrapping generator) would then lower getfd() below the snapshot.
+            support.gc_collect()
             old_fd = getfd()
             it = self.fwalk(os_helper.TESTFN, topdown=topdown)
             self.assertEqual(getfd(), old_fd)
