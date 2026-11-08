@@ -221,9 +221,10 @@ pub enum ListStrategy {
     Object = 0,
     Integer = 1,
     Float = 2,
-    /// listobject.py EmptyListStrategy — newly created or cleared list
-    /// without any storage yet. First append picks a typed strategy via
-    /// switch_to_correct_strategy.
+    /// listobject.py EmptyListStrategy — newly created list without any
+    /// storage yet. First append picks a typed strategy via
+    /// switch_to_correct_strategy. `W_ListObject.clear` does not switch
+    /// back here ([3.15-spec]); sort detaches with `__init__([])`.
     Empty = 3,
     /// listobject.py IntOrFloatListStrategy.  Entries share the
     /// `int_items` signed-longlong array: int32 values use RPython's
@@ -5823,6 +5824,22 @@ unsafe fn publish_allocated_capacity(_obj: PyObjectRef, root_base: usize, target
     true
 }
 
+/// [3.15-spec] `list_sort_impl` restores `saved_allocated` onto the
+/// reinstalled backing so `__sizeof__` after sort equals before. Exact
+/// `target` slots (`_ll_list_resize` overallocate-False / `list_new_prealloc`).
+///
+/// # Safety
+/// `obj` must be a valid `W_ListObject`.
+pub unsafe fn w_list_publish_allocated_capacity(obj: PyObjectRef, target: usize) {
+    let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
+    let _list_guard = w_list_lock(obj);
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let _ = publish_allocated_capacity(obj, root_base, target);
+    debug_assert_allocated_matches_capacity(crate::gc_roots::shadow_stack_get(root_base));
+}
+
 /// After a mutation that changed `ob_size`, apply one `list_resize` and
 /// make the physical backing match. Range/Empty/Size stay extra 0.
 unsafe fn sync_physical_after_len_change(_obj: PyObjectRef, root_base: usize, old_size: usize) {
@@ -6032,8 +6049,9 @@ pub unsafe fn w_list_finish_batch_resize(obj: PyObjectRef, old_size: usize, old_
     debug_assert_allocated_matches_capacity(crate::gc_roots::shadow_stack_get(root_base));
 }
 
-/// Set CPython's raw `PyListObject.allocated` field. `list.sort` uses `-1`
-/// while the saved item array is detached, then restores the previous value.
+/// Set CPython's raw `PyListObject.allocated` field. Fast-before-walk rewind
+/// still writes a prior `allocated` through this entry; `list.sort` no longer
+/// uses the `-1` marker.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -7086,11 +7104,15 @@ pub unsafe fn w_list_init_items(obj: PyObjectRef, items: Vec<PyObjectRef>) {
     debug_assert_allocated_matches_capacity(obj);
 }
 
-/// listobject.py W_ListObject.clear — switches to EmptyListStrategy.
+/// listobject.py `W_ListObject.clear`.
 ///
-/// Drops any typed storage and resets the list to the EmptyListStrategy
-/// state, exactly like PyPy. The next append will pick a fresh typed
-/// strategy via switch_to_correct_strategy.
+/// [3.15-spec] listobject.py W_ListObject.clear switches to EmptyListStrategy ↔ v3.15.0
+/// list_clear leaves the list "touched" (allocated 0, not -1), which list_sort_impl detects; EmptyListStrategy's
+/// docstring: lists do not switch back when becoming empty.
+///
+/// Already-Empty is a no-op (`list_clear_impl` early return on `ob_item == NULL`);
+/// a detached list during sort stays Empty so a bare `L.clear()` callback does
+/// not muck. SizeListStrategy is Empty's subclass and also has no backing.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -7100,28 +7122,45 @@ pub unsafe fn w_list_clear(obj: PyObjectRef) {
     let obj = crate::gc_roots::pin_root(obj);
     let _list_guard = w_list_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(root_base);
-    let list = &mut *(obj as *mut W_ListObject);
-    // `list_sort_impl` has already detached the storage and set size to zero.
-    // CPython's `list.clear()` is then a no-op and leaves the -1 sentinel, so
-    // it must not spuriously report "list modified during sort".
-    if list.live_len() == 0 && list.allocated == -1 {
+    let strategy = (*(obj as *const W_ListObject)).strategy;
+    if matches!(strategy, ListStrategy::Empty | ListStrategy::Size) {
         return;
     }
-    if list.strategy == ListStrategy::Object {
-        list.drop_object_items();
-    } else {
-        list.items = std::ptr::null_mut();
-        list.set_length_relaxed(0);
+    match strategy {
+        ListStrategy::Empty | ListStrategy::Size => unreachable!(),
+        ListStrategy::Object => {
+            let list = &mut *(obj as *mut W_ListObject);
+            list.set_object_items_from_vec(Vec::new());
+        }
+        ListStrategy::Integer | ListStrategy::IntOrFloat => {
+            let list = &mut *(obj as *mut W_ListObject);
+            list.int_items.install(IntArray::empty());
+        }
+        ListStrategy::Float => {
+            let list = &mut *(obj as *mut W_ListObject);
+            list.float_items.install(FloatArray::empty());
+        }
+        ListStrategy::Bytes => {
+            let list = &mut *(obj as *mut W_ListObject);
+            list.bytes_items.install(BytesArray::empty());
+        }
+        ListStrategy::Ascii => {
+            let list = &mut *(obj as *mut W_ListObject);
+            list.ascii_items.install(UnicodeArray::empty());
+        }
+        ListStrategy::SimpleRange => {
+            let _ = install_range_state(obj, ListStrategy::SimpleRange, &[0]);
+        }
+        ListStrategy::Range => {
+            let list = &*(obj as *const W_ListObject);
+            let (start, step) = range_list_start_step(list);
+            let _ = install_range_state(obj, ListStrategy::Range, &[start, step, 0]);
+        }
     }
-    // Empty strategy reads neither typed array; the next append reinstalls the
-    // matching one through `switch_to_correct_strategy`.
-    list.int_items.install(IntArray::empty());
-    list.float_items.install(FloatArray::empty());
-    list.bytes_items.install(BytesArray::empty());
-    list.ascii_items.install(UnicodeArray::empty());
-    list.strategy = ListStrategy::Empty;
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let list = &mut *(obj as *mut W_ListObject);
     list.set_length_relaxed(0);
-    // `list_clear_impl`: `allocated = 0`, `ob_item = NULL`.
+    // `list_clear_impl`: `allocated = 0`.
     list.allocated = 0;
     debug_assert_allocated_matches_capacity(obj);
 }
@@ -8840,12 +8879,13 @@ mod tests {
         unsafe {
             w_list_clear(list);
             let l = &*(list as *const W_ListObject);
-            assert_eq!(l.strategy, ListStrategy::Empty);
+            assert_eq!(l.strategy, ListStrategy::Integer);
             assert!(l.int_items.block.is_null());
             assert!(l.float_items.block.is_null());
             assert!(l.bytes_items.block.is_null());
             assert!(l.ascii_items.block.is_null());
-            // The next append reinstalls the matching typed storage.
+            assert_eq!(w_list_len(list), 0);
+            assert_eq!(w_list_physical_size(list), Some(0));
             w_list_append(list, w_int_new(9));
             let l = &*(list as *const W_ListObject);
             assert_eq!(l.strategy, ListStrategy::Integer);
@@ -9716,17 +9756,71 @@ mod tests {
     }
 
     #[test]
-    fn test_clear_resets_to_empty_strategy() {
-        // listobject.py W_ListObject.clear → EmptyListStrategy.
+    fn test_clear_keeps_typed_strategy_empty_backing() {
+        // [3.15-spec] list_clear leaves the list touched; strategy stays Integer.
         let list = w_list_new(vec![w_int_new(1), w_int_new(2)]);
         unsafe {
             assert!(w_list_uses_int_storage(list));
             w_list_clear(list);
             assert!(
-                w_list_uses_empty_storage(list),
-                "clear must switch to EmptyListStrategy"
+                w_list_uses_int_storage(list),
+                "clear must keep IntegerListStrategy"
             );
+            assert!(!w_list_uses_empty_storage(list));
             assert_eq!(w_list_len(list), 0);
+            assert_eq!(w_list_physical_size(list), Some(0));
+            w_list_append(list, crate::unicodeobject::w_str_new("x"));
+            assert_eq!(
+                (*(list as *const W_ListObject)).strategy,
+                ListStrategy::Object
+            );
+            assert_eq!(w_list_len(list), 1);
+        }
+    }
+
+    #[test]
+    fn test_clear_on_empty_strategy_is_noop() {
+        let list = w_list_new(Vec::new());
+        unsafe {
+            assert!(w_list_uses_empty_storage(list));
+            w_list_clear(list);
+            assert!(w_list_uses_empty_storage(list));
+            assert_eq!(w_list_len(list), 0);
+        }
+    }
+
+    #[test]
+    fn test_delslice_and_setslice_empty_keep_integer_strategy() {
+        let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
+        let empty = w_list_new(Vec::new());
+        unsafe {
+            w_list_delslice(list, 0, 3);
+            assert!(w_list_uses_int_storage(list));
+            assert_eq!(w_list_len(list), 0);
+
+            let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
+            w_list_setslice(list, 0, 3, empty).unwrap();
+            assert!(w_list_uses_int_storage(list));
+            assert_eq!(w_list_len(list), 0);
+        }
+    }
+
+    #[test]
+    fn test_publish_allocated_capacity_restores_exact_slots() {
+        let list = w_list_new(Vec::new());
+        unsafe {
+            for i in 0..19 {
+                w_list_append(list, w_int_new(i));
+            }
+            assert_eq!(w_list_physical_size(list), Some(24));
+            assert_eq!(w_list_len(list), 19);
+            let items = w_list_items_copy_as_vec(list);
+            w_list_init_items(list, items);
+            assert_eq!(w_list_physical_size(list), Some(19));
+            w_list_publish_allocated_capacity(list, 24);
+            assert_eq!(w_list_physical_size(list), Some(24));
+            assert_eq!(w_list_len(list), 19);
+            debug_assert_allocated_matches_capacity(list);
         }
     }
 
