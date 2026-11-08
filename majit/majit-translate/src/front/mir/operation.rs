@@ -8091,6 +8091,17 @@ impl<'a> Lowering<'a> {
                 });
             }
         }
+        // `Cow<str-family>` is rstr (`unicodehelper.py str_decode_utf8`).
+        // Both `Cow::Borrowed` and `Cow::Owned` carry one payload field;
+        // constructing the ADT would seed `SomeInstance(borrow::Cow)` and
+        // disagree with `tyref_to_value_type` painting the dest `Str`.
+        // `Cow<[u8]>` and any non-string payload keep the enum ctor.
+        if n_operands == 1 && tyref_is_cow_str(dest_ty, self.llbc) {
+            return Ok(AggregateShape::Operand {
+                index: 0,
+                transparent: true,
+            });
+        }
         // Resolve the user-defined owner + field names and types from the
         // Adt kind's `type_id` when possible.  Charon encodes
         // `AggregateKind::Adt(type_id, variant_idx, ..)` as

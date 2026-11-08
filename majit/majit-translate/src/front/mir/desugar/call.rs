@@ -1416,7 +1416,7 @@ impl<'a> Lowering<'a> {
                         .is_some_and(|t| tyref_is_string_family(t, self.llbc));
                     let from_lossy_cow = first_arg_ty
                         .as_ref()
-                        .is_some_and(|t| self.tyref_is_cow_str(t))
+                        .is_some_and(|t| tyref_is_cow_str(t, self.llbc))
                         && first_arg_is_string_byte_view;
                     if from_string || from_lossy_cow {
                         // A builder-mode accumulator's Shared borrow feeding this

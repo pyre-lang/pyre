@@ -5453,6 +5453,8 @@ impl Bookkeeper {
                         .trim();
                     if crate::front::mir::is_str_family_class_root(inner)
                         || crate::front::mir::is_str_family_class_root(pointee)
+                        || crate::front::mir::is_cow_str_family_class_root(inner)
+                        || crate::front::mir::is_cow_str_family_class_root(pointee)
                         || crate::front::mir::is_raw_ptr_to_str_family_spelling(inner)
                     {
                         super::model::s_str0()
@@ -5724,7 +5726,8 @@ impl Bookkeeper {
             // (`op_gc_restore_root`) and `LLHelpers.ll_strlen` read it as
             // the string itself.
             _ if crate::front::mir::is_str_family_class_root(stripped)
-                || crate::front::mir::is_rstr_str_layout_declaration(stripped) =>
+                || crate::front::mir::is_rstr_str_layout_declaration(stripped)
+                || crate::front::mir::is_cow_str_family_class_root(stripped) =>
             {
                 return super::model::s_str0();
             }
@@ -9501,6 +9504,33 @@ mod tests {
             panic!("owned String is SomeString");
         };
         assert!(!owned_string.inner.can_be_none);
+        let SomeValue::String(cow_str) = bk.project_struct_field_type("borrow::Cow<str>") else {
+            panic!("borrow::Cow<str> is SomeString");
+        };
+        assert!(!cow_str.inner.can_be_none);
+        let SomeValue::String(cow_static) = bk.project_struct_field_type("Cow<'static, str>")
+        else {
+            panic!("Cow<'static, str> is SomeString");
+        };
+        assert!(!cow_static.inner.can_be_none);
+        let SomeValue::String(opt_cow) = bk.project_struct_field_type("Option<borrow::Cow<str>>")
+        else {
+            panic!("Option<borrow::Cow<str>> is nullable SomeString");
+        };
+        assert!(
+            opt_cow.inner.can_be_none,
+            "Option<Cow<str>> is SomeString(can_be_None=True)"
+        );
+        assert_ne!(
+            bk.project_struct_field_type("borrow::Cow<[u8]>"),
+            crate::annotator::model::s_str0(),
+            "Cow<[u8]> is not rstr"
+        );
+        assert_ne!(
+            bk.project_struct_field_type("Option<borrow::Cow<[u8]>>"),
+            crate::annotator::model::s_str0(),
+            "Option<Cow<[u8]>> is not rstr"
+        );
     }
 
     #[test]

@@ -9517,6 +9517,104 @@ fn classify_option_ptr_none(option_decl: serde_json::Value) -> (bool, bool, supe
     (void, niche, shape)
 }
 
+fn cow_enum_decl(def_id: u64) -> serde_json::Value {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": {
+            "name": [
+                {"Ident": ["alloc", 0]},
+                {"Ident": ["borrow", 0]},
+                {"Ident": ["Cow", 0]}
+            ],
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        },
+        "kind": {"Enum": [
+            {
+                "name": "Borrowed",
+                "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+            },
+            {
+                "name": "Owned",
+                "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+            }
+        ]}
+    })
+}
+
+fn cow_aggregate_shape(payload: serde_json::Value, n_operands: usize) -> super::AggregateShape {
+    let llbc = llbc_with_types("fixture", vec![cow_enum_decl(0)], vec![]);
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let body: super::Unstructured = serde_json::from_value(serde_json::json!({
+        "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+    }))
+    .unwrap();
+    let dont_look_inside = std::collections::HashSet::new();
+    let accum = super::AccumulatorFacts::build(&llbc, &body);
+    let tombstoned = std::collections::HashSet::new();
+    let gc_struct_ids_llbc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let lowering = super::Lowering::new(
+        &llbc,
+        "fixture".into(),
+        &body,
+        crate::HostStaticAddrs::default(),
+        &[],
+        None,
+        &dont_look_inside,
+        &tombstoned,
+        &gc_struct_ids_llbc,
+        super::no_immutable_fields(),
+        &std::collections::HashSet::<String>::new(),
+        &accum,
+        &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+        false,
+        false,
+    )
+    .unwrap();
+    let dest = TyRef::Other(named_adt(0, vec![payload]));
+    let kind = serde_json::json!({"Adt": [0, 0]});
+    lowering
+        .aggregate_shape(&kind, &dest, n_operands)
+        .expect("Cow aggregate_shape")
+}
+
+/// `Cow::Borrowed` / `Cow::Owned` of a string-family payload is the
+/// payload itself (`unicodehelper.py str_decode_utf8`). `Cow<[u8]>`
+/// keeps the enum constructor.
+#[test]
+fn cow_str_aggregate_is_transparent_payload_cow_bytes_is_ctor() {
+    let str_payload =
+        serde_json::json!({"Adt": {"builtin": "Str", "generics": window_empty_generics()}});
+    let str_shape = cow_aggregate_shape(str_payload, 1);
+    assert!(
+        matches!(
+            str_shape,
+            super::AggregateShape::Operand {
+                index: 0,
+                transparent: true
+            }
+        ),
+        "Cow<str> aggregate is the payload, got {str_shape:?}"
+    );
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let bytes_payload =
+        serde_json::json!({"Adt": {"builtin": "Slice", "generics": {"types": [u8_ty]}}});
+    let bytes_shape = cow_aggregate_shape(bytes_payload, 1);
+    assert!(
+        matches!(bytes_shape, super::AggregateShape::Ctor(_)),
+        "Cow<[u8]> aggregate stays a ctor, got {bytes_shape:?}"
+    );
+}
+
 /// `Option<*mut PyObject>::None` is a pointer-niche Option. `tyref_is_void_zst`
 /// must not win over `tyref_is_niche_option_ptr` even when Charon records a
 /// size-0 layout on the generic Option decl (the empty `None` variant).

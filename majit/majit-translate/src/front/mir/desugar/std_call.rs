@@ -4444,28 +4444,8 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        fd.item_meta.name_path().ends_with("::from_utf8_lossy") && self.tyref_is_cow_str(dest_ty)
-    }
-
-    /// `alloc::borrow::Cow<B>` whose borrowed form `B` is string-family
-    /// (`Cow<str>` / `Cow<&str>`).
-    ///
-    /// `Deref` takes `&self`, so the receiver is `&Cow<str>`.
-    /// [`Self::tyref_adt_type_arg`] reads the Adt node and does not peel
-    /// `Ref`; [`adt_path_of_tyref`] already does, which is why the path
-    /// check would pass and the payload check would not.
-    pub(in crate::front::mir) fn tyref_is_cow_str(&self, ty: &TyRef) -> bool {
-        let Some(path) = adt_path_of_tyref(ty, self.llbc) else {
-            return false;
-        };
-        if !path.ends_with("::Cow") {
-            return false;
-        }
-        let peeled = self.tyref_peel_ref_to_pointee(ty);
-        let adt_ty = peeled.as_ref().unwrap_or(ty);
-        self.tyref_adt_type_arg(adt_ty, 0).is_some_and(|payload| {
-            tyref_is_string_family(&payload, self.llbc) || tyref_strips_to_str(&payload, self.llbc)
-        })
+        fd.item_meta.name_path().ends_with("::from_utf8_lossy")
+            && tyref_is_cow_str(dest_ty, self.llbc)
     }
 
     pub(in crate::front::mir) fn fun_decl_id_path_ends_with(&self, suffix: &[&str]) -> Option<u64> {

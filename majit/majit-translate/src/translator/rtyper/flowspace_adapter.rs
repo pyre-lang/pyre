@@ -5948,10 +5948,10 @@ pub(crate) fn derive_subject_inputcells(
                 // `bytes_block_chars`'s exact `(chars, length)` raw-slice
                 // view back to this header, so seed the header with the same
                 // `SomeString` cell that `project_struct_field_type` assigns it.
-                if class_root
-                    .as_deref()
-                    .is_some_and(crate::front::mir::is_str_family_class_root)
-                {
+                if class_root.as_deref().is_some_and(|root| {
+                    crate::front::mir::is_str_family_class_root(root)
+                        || crate::front::mir::is_cow_str_family_class_root(root)
+                }) {
                     cells.push(crate::annotator::model::s_str0());
                     continue;
                 }
@@ -7998,6 +7998,72 @@ mod tests {
     }
 
     #[test]
+    fn derive_subject_inputcells_seeds_cow_str_class_root_as_somestring() {
+        // `Option::map` mergeinputargs slot 0 is the Cow payload. A
+        // `from_utf8_lossy` dest is already SomeString (`stamp_as_rstr_str`);
+        // the classdef instance of `borrow::Cow<str>` must seed the same
+        // shell (`unicodehelper.py str_decode_utf8`).
+        use crate::annotator::model::{SomeString, union};
+        let s_new = SomeValue::String(SomeString::new(false, false));
+        for (name, ty, class_root) in [
+            (
+                "class_root",
+                ValueType::Ref(Some("borrow::Cow<str>".to_string())),
+                Some("borrow::Cow<str>".to_string()),
+            ),
+            (
+                "payload_only",
+                ValueType::Ref(Some("borrow::Cow<str>".to_string())),
+                None,
+            ),
+            (
+                "bytes_stays_instance",
+                ValueType::Ref(Some("borrow::Cow<[u8]>".to_string())),
+                Some("borrow::Cow<[u8]>".to_string()),
+            ),
+        ] {
+            let mut graph = LegacyGraph::new(name);
+            let entry = graph.startblock;
+            let var = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: "s".to_string(),
+                        ty,
+                        class_root,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_inputarg_var(entry, var);
+            let cells = derive_subject_inputcells(&graph, None)
+                .expect("Cow Input must project to a definite SomeValue cell");
+            assert_eq!(cells.len(), 1);
+            if name == "bytes_stays_instance" {
+                assert!(
+                    matches!(cells[0], SomeValue::Instance(_)),
+                    "{name}: Cow<[u8]> stays Instance, got {:?}",
+                    cells[0]
+                );
+                continue;
+            }
+            let SomeValue::String(_) = &cells[0] else {
+                panic!(
+                    "{name}: Cow<str> Input must seed SomeString, got {:?}",
+                    cells[0]
+                );
+            };
+            let joined = union(&cells[0], &s_new).unwrap_or_else(|e| {
+                panic!("{name}: Cow<str> Input must union with String::new(): {e}")
+            });
+            assert!(
+                matches!(joined, SomeValue::String(_)),
+                "{name}: Cow<str> Input ∪ String::new() must stay SomeString, got {joined:?}"
+            );
+        }
+    }
+
+    #[test]
     fn derive_subject_inputcells_seeds_raw_ptr_to_str_as_nullable_somestring() {
         for (name, ty, class_root, expect_none) in [
             (
@@ -8090,6 +8156,16 @@ mod tests {
                 "opt_rstr",
                 ValueType::Str,
                 Some("Option<unicodeobject::Utf8Str>".to_string()),
+            ),
+            (
+                "opt_cow_str",
+                ValueType::Str,
+                Some("Option<borrow::Cow<str>>".to_string()),
+            ),
+            (
+                "opt_cow_static",
+                ValueType::Str,
+                Some("option::Option<Cow<'static, str>>".to_string()),
             ),
         ] {
             let mut graph = LegacyGraph::new(name);

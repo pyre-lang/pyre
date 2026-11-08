@@ -3210,9 +3210,15 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     if tyref_is_u8_window(ty, llbc) {
         return ValueType::Int;
     }
+    // `alloc::borrow::Cow<str-family>` is rstr (`unicodehelper.py
+    // str_decode_utf8` returns a plain str). Painting the ADT as a
+    // payload enum seeds `SomeInstance(borrow::Cow)` which cannot
+    // union with the SomeString `from_utf8_lossy` already stamps
+    // (`stamp_as_rstr_str`). `Cow<[u8]>` is not this family.
     if tyref_is_string_value(ty, llbc)
         || tyref_raw_ptr_pointee_is_string_value(ty, llbc)
         || tyref_is_option_of_string_value(ty, llbc)
+        || tyref_is_cow_str(ty, llbc)
     {
         return ValueType::Str;
     }
@@ -5157,6 +5163,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_is_str(
     tyref_is_string_value(ty, llbc)
         || tyref_raw_ptr_pointee_is_string_value(ty, llbc)
         || tyref_is_option_of_string_value(ty, llbc)
+        || tyref_is_cow_str(ty, llbc)
 }
 
 /// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to the
@@ -5366,9 +5373,13 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     if tyref_is_u8_window(ty, llbc) {
         return ValueType::Int;
     }
+    // Matching [`tyref_to_value_type`]: `Cow<str-family>` is rstr
+    // (`unicodehelper.py str_decode_utf8`). A Cow field must seed
+    // `SomeString` so a write of a stamped lossy dest unions.
     if tyref_is_string_value(ty, llbc)
         || tyref_raw_ptr_pointee_is_string_value(ty, llbc)
         || tyref_is_option_of_string_value(ty, llbc)
+        || tyref_is_cow_str(ty, llbc)
     {
         return ValueType::Str;
     }
@@ -5693,6 +5704,55 @@ pub(crate) fn is_os_path_family_root(root: &str) -> bool {
     )
 }
 
+/// `Cow<str-family>` class-root spelling (`borrow::Cow<str>`,
+/// `Cow<'static, str>`, `alloc::borrow::Cow<&str>`).
+///
+/// `unicodehelper.py str_decode_utf8` returns a plain str, so a live
+/// Cow of a string payload is `SomeString`. `Cow<[u8]>` and any
+/// non-string payload stay the Cow ADT. Distinct from
+/// [`is_str_family_class_root`]: Cow is not an rstr `{hash, chars}`
+/// header, only an identity view of one.
+pub(crate) fn is_cow_str_family_class_root(root: &str) -> bool {
+    cow_class_root_payload(root).is_some_and(|payload| {
+        let payload = payload
+            .trim()
+            .trim_start_matches('&')
+            .trim_start_matches("mut ");
+        is_str_family_class_root(payload)
+    })
+}
+
+/// Inner `B` of a `Cow<B>` / `Cow<'a, B>` class-root spelling, or `None`
+/// when `root` is not a Cow leaf.
+pub(crate) fn cow_class_root_generic_inner(root: &str) -> Option<&str> {
+    let rest = if let Some(rest) = root.strip_prefix("Cow<") {
+        rest
+    } else {
+        let i = root.find("::Cow<")?;
+        &root[i + "::Cow<".len()..]
+    };
+    rest.strip_suffix('>')
+}
+
+fn cow_class_root_payload(root: &str) -> Option<&str> {
+    let inner = cow_class_root_generic_inner(root)?;
+    let mut depth = 0i32;
+    let mut comma = None;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ',' if depth == 0 => comma = Some(i),
+            _ => {}
+        }
+    }
+    let payload = match comma {
+        Some(i) => inner[i + 1..].trim(),
+        None => inner.trim(),
+    };
+    (!payload.is_empty()).then_some(payload)
+}
+
 /// A `*const T` / `*mut T` whose pointee is [`is_str_family_class_root`].
 /// A Rust `&T` / owned `String` spelling has no raw-pointer prefix.
 pub(crate) fn is_raw_ptr_to_str_family_spelling(ty: &str) -> bool {
@@ -5803,6 +5863,8 @@ pub(crate) fn is_niche_option_gc_payload_spelling(
     }
     if is_str_family_class_root(inner)
         || is_str_family_class_root(pointee)
+        || is_cow_str_family_class_root(inner)
+        || is_cow_str_family_class_root(pointee)
         || is_raw_ptr_to_str_family_spelling(inner)
     {
         return true;
@@ -6267,14 +6329,19 @@ pub(in crate::front::mir) fn wtf8_string_identity_segments(segments: &[String]) 
     false
 }
 
-/// Identity-view family: rstr `STR` wrappers or a rust-heap `String`.
+/// Identity-view family: rstr `STR` wrappers, a rust-heap `String`, or
+/// `Cow<str-family>` (`unicodehelper.py str_decode_utf8` returns a
+/// plain str; the Cow ADT is that rstr).
 ///
 /// `as_str` / `as_ref` / `as_bytes` / `to_string` / `deref` are identity
 /// on either spelling (`rstr.py` has one string type). A rust-heap
 /// `String` still paints `ValueType::Ref` so `ll_strconcat` does not
-/// consume a `{cap, ptr, len}` header.
+/// consume a `{cap, ptr, len}` header. `Cow<str>` paints `ValueType::Str`
+/// ([`tyref_is_cow_str`]).
 pub(in crate::front::mir) fn tyref_is_string_family(ty: &TyRef, llbc: &Llbc) -> bool {
-    tyref_is_string_value(ty, llbc) || tyref_is_rust_heap_string(ty, llbc)
+    tyref_is_string_value(ty, llbc)
+        || tyref_is_rust_heap_string(ty, llbc)
+        || tyref_is_cow_str(ty, llbc)
 }
 
 /// `Path` / `PathBuf` / `OsStr` / `OsString` behind the usual wrappers.
@@ -6332,6 +6399,63 @@ pub(in crate::front::mir) fn tyref_strips_to_slice(ty: &TyRef, llbc: &Llbc) -> b
         return false;
     };
     node.get("Slice").is_some() || node.get("Adt").and_then(type_decl_ref_builtin) == Some("Slice")
+}
+
+/// `alloc::borrow::Cow<B>` whose borrowed form `B` is string-family
+/// (`Cow<str>` / `Cow<&str>` / `Cow<String>`).
+///
+/// `unicodehelper.py str_decode_utf8` returns a plain str, so a live
+/// `Cow<str>` value is `SomeString` (`rstr.py` has one string type) —
+/// not a `SomeInstance` of the Cow ADT. `Cow<[u8]>` and any non-string
+/// payload stay the Cow enum. Payload membership uses the rstr / rust-heap
+/// string predicates directly so this does not recurse through
+/// [`tyref_is_string_family`].
+///
+/// A use-site whose `generics.types` is empty or a TypeVar still paints
+/// when the interned class root carries a str-family suffix
+/// (`borrow::Cow<str>`): that is the `Option::map` mergeinputargs slot
+/// the payload-enum paint otherwise seeds as `SomeInstance`.
+pub(in crate::front::mir) fn tyref_is_cow_str(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(path) = adt_path_of_tyref(ty, llbc) else {
+        return false;
+    };
+    if !path.ends_with("::Cow") {
+        return false;
+    }
+    if tyref_cow_payload_is_str_family(ty, llbc) {
+        return true;
+    }
+    tyref_class_root_with(ty, llbc, no_tombstoned_leaves())
+        .as_deref()
+        .is_some_and(is_cow_str_family_class_root)
+}
+
+fn tyref_cow_payload_is_str_family(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_cow_payload_ty(ty, llbc).is_some_and(|payload| {
+        tyref_is_string_value(&payload, llbc)
+            || tyref_is_rust_heap_string(&payload, llbc)
+            || tyref_strips_to_str(&payload, llbc)
+    })
+}
+
+/// `B` of `Cow<'a, B>`. Charon puts only type arguments in `generics.types`,
+/// so the payload is the last entry (one-arg `Cow<str>` or a two-arg
+/// encoding that still lists `B` last).
+fn tyref_cow_payload_ty(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
+    let adt = tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))?
+        .as_object()?
+        .get("Adt")?
+        .as_object()?;
+    let node = type_decl_ref_generics(adt, llbc)?
+        .as_object()?
+        .get("types")?
+        .as_array()?
+        .last()?;
+    match serde_json::from_value(node.clone()) {
+        Ok(parsed) => Some(parsed),
+        Err(_) => Some(TyRef::Other(node.clone())),
+    }
 }
 
 /// `<String as AsRef<[u8]>>::as_ref` / `<str as AsRef<[u8]>>::as_ref`: std
@@ -9501,20 +9625,26 @@ pub(in crate::front::mir) fn tyref_is_option_of_object_pointer_slice(
 /// `Option` of an rstr `STR` value: a nullable `SomeString`.
 ///
 /// `P` is a value the classifier paints `ValueType::Str`
-/// ([`tyref_is_string_value`]): the builtin `str`, `Utf8Str` /
-/// `BytesBlock`, a shared `&str` / `&Wtf8` / `&Wtf8Buf`, or a
-/// by-value `Wtf8Buf` / `Utf8Str`. `&[u8]` is the
+/// ([`tyref_is_string_value`] / [`tyref_is_cow_str`]): the builtin
+/// `str`, `Utf8Str` / `BytesBlock`, a shared `&str` / `&Wtf8` /
+/// `&Wtf8Buf`, a by-value `Wtf8Buf` / `Utf8Str`, or
+/// `Cow<str-family>` (`unicodehelper.py str_decode_utf8` returns a
+/// plain str; `rstr.py` has one string type). `&[u8]` is the
 /// [`tyref_is_u8_window`] window, painted `Int`. A rust-heap
 /// `String` (`{cap, ptr, len}`) is not this family, so
 /// `Option<String>` / `Option<&String>` / `Option<*mut String>`
-/// stay out. `Option<Vec<u8>>` is a list.
+/// stay out. `Option<Cow<[u8]>>` stays the Cow ADT. `Option<Vec<u8>>`
+/// is a list.
 /// The `Some` word of the admitted set is the string itself
 /// (`tyref_is_niche_option`); painting the Option as the payload-enum
 /// class makes a `Some` arm that aliases the base (`__pos_0`) join
-/// `Instance(Option) ∪ String`.
+/// `Instance(Option) ∪ String`. `is_some` / `is not None` is then
+/// `rnone.py` `rtype_is_None` → `ptr_nonzero` / `ptr_iszero`, not a
+/// `__discriminant` getattr.
 pub(in crate::front::mir) fn tyref_is_option_of_string_value(ty: &TyRef, llbc: &Llbc) -> bool {
-    crate::front::result_exc::tyref_option_payload(ty, llbc)
-        .is_some_and(|payload| tyref_is_string_value(&payload, llbc))
+    crate::front::result_exc::tyref_option_payload(ty, llbc).is_some_and(|payload| {
+        tyref_is_string_value(&payload, llbc) || tyref_is_cow_str(&payload, llbc)
+    })
 }
 
 /// Class root of a pointer-niche `Option<&RawStruct>` whose pointee is a
