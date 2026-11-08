@@ -2430,11 +2430,18 @@ fn prepare_frame_resume(
         } else {
             w_arg_or_err
         };
-        match crate::baseobjspace::resume_yield_from(frame, w_yf, w_arg) {
+        // `next_yield_from` and the tracer it may call both run Python, so
+        // the frame is re-read off the anchor for the SEND completion pc.
+        let anchor = FrameAnchor::new(frame);
+        match crate::baseobjspace::next_yield_from(unsafe { &mut *anchor.live() }, w_yf, w_arg) {
             Ok(Some(value)) => return Ok(FrameResume::Yielded(value)),
             // The delegate's StopIteration value is already on the outer
-            // frame stack and its SEND completion target is installed.
-            Ok(None) => return Ok(FrameResume::Dispatch(None)),
+            // frame stack; install the SEND completion target the way
+            // `resume_execute_frame` continues after `next_yield_from`.
+            Ok(None) => {
+                crate::baseobjspace::position_after_send(unsafe { &mut *anchor.live() })?;
+                return Ok(FrameResume::Dispatch(None));
+            }
             // The delegate's error is thrown into this frame's own dispatch;
             // the sent value was the delegate's and is not resumed here.
             Err(err) => return Ok(FrameResume::Dispatch(Some(err))),
@@ -5797,97 +5804,20 @@ impl OpcodeStepExecutor for PyFrame {
         // Iterator sits under the index-or-NULL slot GET_ITER pushed.
         let iter = PyFrame::peek_at(self, 1);
         let anchor = FrameAnchor::new(self);
-        // `next_yield_from` keeps the awaitable live across `send_ex` /
-        // `space.next`; both run Python and relocate a nursery-born
-        // coroutine.  Reload it before the type check and before storing
-        // `w_yielding_from`.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let iter_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(iter);
-        let value_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(value);
-        let iter = pyre_object::gc_roots::shadow_stack_get(iter_slot);
-        let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
-        let result = if unsafe { pyre_object::is_none(value) } {
-            // generator.py / pyopcode.py `next_yield_from`: coroutine
-            // objects are not public iterators, but the interpreter's SEND
-            // machinery resumes both GeneratorIterator and Coroutine through
-            // their shared `send_ex(None)` path.
-            if unsafe { pyre_object::generator::is_generator_or_coroutine(iter) } {
-                crate::baseobjspace::generator_next_method(&[
-                    pyre_object::gc_roots::shadow_stack_get(iter_slot),
-                ])
-            } else {
-                crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot))
+        match crate::baseobjspace::next_yield_from(unsafe { &mut *anchor.live() }, iter, value) {
+            Ok(Some(v)) => {
+                // `next_yield_from` dropped its roots on return; pin across
+                // the stack write barrier.
+                let _roots = pyre_object::gc_roots::push_roots();
+                let v = pyre_object::gc_roots::pin_root(v);
+                Self::push_anchored(&anchor, v)
             }
-        } else {
-            let send = crate::baseobjspace::getattr_str(
-                pyre_object::gc_roots::shadow_stack_get(iter_slot),
-                "send",
-            )?;
-            crate::call::call_function_impl_result(
-                send,
-                &[pyre_object::gc_roots::shadow_stack_get(value_slot)],
-            )
-        };
-        let iter = pyre_object::gc_roots::shadow_stack_get(iter_slot);
-        match result {
-            Ok(result) => {
-                // `send_ex` / `space.next` may collect; pin the yielded value
-                // before the `w_yielding_from` store, which is itself a
-                // write-barrier and must not observe a pre-move local.
-                let result_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(result);
-                let frame = unsafe { &mut *anchor.live() };
-                frame.w_yielding_from = iter;
-                if pyre_object::gc_hook::try_gc_owns_object(
-                    frame as *mut PyFrame as pyre_object::gc_hook::GCREF,
-                ) {
-                    pyre_object::gc_hook::try_gc_write_barrier(
-                        frame as *mut PyFrame as pyre_object::gc_hook::GCREF,
-                    );
-                }
-                Self::push_anchored(
-                    &anchor,
-                    pyre_object::gc_roots::shadow_stack_get(result_slot),
-                )
+            Ok(None) => {
+                // The stop value is already on the frame stack.
+                unsafe { &mut *anchor.live() }.set_last_instr_from_next_instr(target);
+                Ok(())
             }
-            Err(e) => {
-                let (stop, e) = e.matches_stop_iteration_keep();
-                if stop {
-                    let frame = unsafe { &mut *anchor.live() };
-                    if std::ptr::eq(frame.w_yielding_from, iter) {
-                        frame.w_yielding_from = pyre_object::PY_NULL;
-                    }
-                    // `pypy/interpreter/pyopcode.py next_yield_from`:
-                    //     try:
-                    //         w_stop_value = space.getattr(e.get_w_value(space),
-                    //                                      space.newtext("value"))
-                    //     except OperationError as e:
-                    //         if not e.match(space, space.w_AttributeError):
-                    //             raise
-                    //         w_stop_value = space.w_None
-                    //     self.pushvalue(w_stop_value)
-                    //
-                    // CPython 3.13 emits SEND with an EOI target; pyre's
-                    // dispatch lands here on StopIteration and must surface
-                    // the exception's `.value` as the yield-from result so
-                    // `val = yield from inner()` captures `inner`'s return.
-                    let value = if !e.exc_object.is_null()
-                        && unsafe { pyre_object::is_exception(e.exc_object) }
-                    {
-                        crate::baseobjspace::getattr_str(e.exc_object, "value")
-                            .unwrap_or_else(|_| pyre_object::w_none())
-                    } else {
-                        pyre_object::w_none()
-                    };
-                    Self::push_anchored(&anchor, value)?;
-                    unsafe { &mut *anchor.live() }.set_last_instr_from_next_instr(target);
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            }
+            Err(e) => Err(e),
         }
     }
 

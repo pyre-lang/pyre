@@ -3,6 +3,7 @@
 # Python-level `__next__` while a tracer is installed.  A runtime that
 # swallowed that StopIteration without reporting it would pass the whole
 # module.
+# pyre-check: pypy-diverges: SEND reports StopIteration in the yield-from frame only for a generator or coroutine delegate; pypy3 also reports a Python __next__ iterator and AsyncGenASend
 #
 # parity-tests reason: FOR_ITER's exhaustion arm catches the StopIteration and
 # jumps, so the consuming frame never dispatches it and never reaches the
@@ -246,6 +247,102 @@ def a_line_callback_jump_backwards_rereads_last_instr():
     ], seen
 
 
+def send_yield_from_a_generator_reports_in_that_frame():
+    """SEND's StopIteration event is the generator-or-coroutine arm only.
+
+    FOR_ITER reports a generator iterator, a Python `__next__` with a
+    traceback, and AsyncGenASend.  SEND does not: `INSTRUMENTED_END_SEND` /
+    `monitor_stop_iteration` fires in the `yield from` / `await` frame only
+    when the delegate is a generator or an exact coroutine.  Measured python3.15.0rc2:
+
+        yield from inner()                 -> ('g_gen', 'StopIteration')
+        await coro_inner()                 -> ('coro_outer', 'StopIteration')
+        yield from It() Python __next__    -> only ('__next__', 'StopIteration')
+        await a.__anext__()                -> no StopIteration in the consumer
+
+    pypy3 reports the last two in the consumer as well, because
+    `next_yield_from` calls `_report_stopiteration_sometimes` unchanged.
+    The FOR_ITER rows above stay on that helper; these four rows pin SEND.
+    """
+
+    def inner():
+        return 7
+        yield
+
+    def g_gen():
+        r = yield from inner()
+        assert r == 7
+
+    def consume():
+        for _ in g_gen():
+            pass
+
+    seen = exception_events_in(consume)
+    assert ('g_gen', 'StopIteration') in seen, seen
+
+
+def send_await_a_coroutine_reports_in_that_frame():
+    async def coro_inner():
+        return 3
+
+    async def coro_outer():
+        r = await coro_inner()
+        return r
+
+    def drive(c):
+        try:
+            c.send(None)
+        except StopIteration as e:
+            return e.value
+
+    seen = exception_events_in(lambda: drive(coro_outer()))
+    assert ('coro_outer', 'StopIteration') in seen, seen
+
+
+def send_yield_from_a_python_next_does_not_report_in_the_consumer():
+    class It:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise StopIteration(5)
+
+    def g_it():
+        r = yield from It()
+        assert r == 5
+
+    def consume():
+        for _ in g_it():
+            pass
+
+    seen = exception_events_in(consume)
+    assert ('g_it', 'StopIteration') not in seen, seen
+    assert ('__next__', 'StopIteration') in seen, seen
+
+
+def send_await_asend_does_not_report_stopiteration_in_the_consumer():
+    async def agen():
+        yield 1
+
+    async def use_asend():
+        a = agen()
+        v = await a.__anext__()
+        try:
+            await a.__anext__()
+        except StopAsyncIteration:
+            pass
+        return v
+
+    def drive(c):
+        try:
+            c.send(None)
+        except StopIteration as e:
+            return e.value
+
+    seen = exception_events_in(lambda: drive(use_asend()))
+    assert ('use_asend', 'StopIteration') not in seen, seen
+
+
 a_python_level_next_reports_to_the_consuming_frame()
 the_rule_is_the_traceback_and_not_the_iterator()
 a_natively_signalled_end_reports_nothing()
@@ -253,4 +350,8 @@ the_loop_still_ends_normally()
 a_warm_generator_loop_reports_its_end()
 a_line_callback_arms_opcode_events_for_that_instruction()
 a_line_callback_jump_backwards_rereads_last_instr()
+send_yield_from_a_generator_reports_in_that_frame()
+send_await_a_coroutine_reports_in_that_frame()
+send_yield_from_a_python_next_does_not_report_in_the_consumer()
+send_await_asend_does_not_report_stopiteration_in_the_consumer()
 print('OK')
