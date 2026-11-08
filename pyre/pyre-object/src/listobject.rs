@@ -1630,18 +1630,24 @@ fn boxed_from_floats(values: &[f64], we_are_jitted: bool) -> Vec<PyObjectRef> {
     items
 }
 
+/// `listobject.py EmptyListStrategy.switch_to_correct_strategy` /
+/// `BytesListStrategy.is_correct_type`: `type(w_item) is W_BytesObject`.
+/// Layout identity (`py_type_check` of `BYTES_TYPE`) so a constant item
+/// folds to `guard_class`; a `w_class` walk (`is_exact_type`) residualizes
+/// a nullness guard inside the helper after `allocated` has been stored.
 #[inline]
 pub fn is_bytes_strategy_item(item: PyObjectRef) -> bool {
-    unsafe { is_exact_type(item, &BYTES_TYPE) }
+    unsafe { py_type_check(item, &BYTES_TYPE) }
 }
 
 fn all_bytes(items: &[PyObjectRef]) -> bool {
     items.iter().all(|&item| is_bytes_strategy_item(item))
 }
 
+/// `listobject.py`: `type(w_item) is W_UnicodeObject and w_item.is_ascii()`.
 #[inline]
 pub fn is_ascii_strategy_item(item: PyObjectRef) -> bool {
-    unsafe { is_exact_type(item, &STR_TYPE) && w_str_is_ascii(item) }
+    unsafe { py_type_check(item, &STR_TYPE) && w_str_is_ascii(item) }
 }
 
 fn all_ascii(items: &[PyObjectRef]) -> bool {
@@ -4014,6 +4020,28 @@ pub fn ll_list_bytes_set_len(l: &mut W_ListObject, n: usize) {
     l.bytes_items.set_len(n);
 }
 
+/// `_ll_list_resize_hint_really` `l.items = newitems` for Bytes storage.
+///
+/// `#[inline(never)]` keeps the oopspec call in the caller's graph so
+/// jtransform can emit `setfield_gc_r(bytes_items.block)`. rustc otherwise
+/// inlines the store as `FieldWrite(block)` on the nested `BytesArray`.
+#[inline(never)]
+#[majit_macros::oopspec("list.bytes_set_items(l, items)")]
+pub fn ll_list_bytes_set_items(l: &mut W_ListObject, items: *mut ItemsBlock) {
+    l.bytes_items.block = items;
+}
+
+/// `rlist.py LIST.ll_items` for Bytes storage (`l.items`).
+///
+/// `#[inline(never)]` keeps the oopspec call in the caller's graph so
+/// jtransform can emit `getfield_gc_r(bytes_items.block)`. rustc otherwise
+/// inlines the load as `FieldRead(block)` on a nested `BytesArray` copy.
+#[inline(never)]
+#[majit_macros::oopspec("list.bytes_items(l)")]
+pub fn ll_list_bytes_items(l: &W_ListObject) -> *mut ItemsBlock {
+    l.bytes_items.block
+}
+
 /// `ll_length` for AsciiListStrategy. The length word sits at the same
 /// offset as `ascii_items`; the oopspec reads that word.
 #[majit_macros::oopspec("list.ascii_len(l)")]
@@ -4121,6 +4149,7 @@ fn ll_list_ascii_resize_hint_really_iff(
 
 /// `rlist.py _ll_list_resize_hint_really` — reallocate the erased `STR` block
 /// to `newsize` slots, over-allocated (0, 4, 8, 16, 24, …) when `overallocate`.
+/// Same shape as [`ll_list_bytes_resize_hint_really`].
 #[majit_macros::look_inside_iff(ll_list_ascii_resize_hint_really_iff)]
 pub unsafe fn ll_list_ascii_resize_hint_really(obj: PyObjectRef, newsize: i64, overallocate: bool) {
     // rlist.py `_ll_list_resize_hint_really`: malloc then `l.items = newitems`.
@@ -4130,9 +4159,9 @@ pub unsafe fn ll_list_ascii_resize_hint_really(obj: PyObjectRef, newsize: i64, o
     if newsize <= 0 {
         debug_assert!(newsize == 0, "negative list length");
         let list = &mut *(obj as *mut W_ListObject);
-        let old = list.ascii_items.block;
+        let old = ll_list_ascii_items(list);
         ll_list_ascii_set_len(list, 0);
-        list.ascii_items.block = crate::object_array::ll_prebuilt_empty_items_block();
+        ll_list_ascii_set_items(list, crate::object_array::ll_prebuilt_empty_items_block());
         if !majit_rlib::jit::we_are_jitted() {
             dealloc_list_items_block(old);
         }
@@ -4146,9 +4175,12 @@ pub unsafe fn ll_list_ascii_resize_hint_really(obj: PyObjectRef, newsize: i64, o
         newsize
     };
     let newitems = crate::object_array::ll_new_items_array(new_allocated);
+    if crate::gc_hook::gc_alloc_failed_pending() && newitems.is_null() {
+        return;
+    }
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
-    let old = list.ascii_items.block;
+    let old = ll_list_ascii_items(list);
     if before_len > 0 {
         let p = if (before_len as i64) < newsize {
             before_len
@@ -4157,8 +4189,8 @@ pub unsafe fn ll_list_ascii_resize_hint_really(obj: PyObjectRef, newsize: i64, o
         };
         crate::object_array::ll_arraycopy_items_block(old, newitems, 0, 0, p as i64);
     }
-    list_write_barrier(obj);
-    list.ascii_items.block = newitems;
+    crate::gc_hook::try_gc_write_barrier(list as *mut W_ListObject as crate::gc_hook::GCREF);
+    ll_list_ascii_set_items(list, newitems);
     if !majit_rlib::jit::we_are_jitted() {
         dealloc_list_items_block(old);
     }
@@ -4251,6 +4283,8 @@ fn ll_list_bytes_resize_hint_really_iff(
 
 /// `rlist.py _ll_list_resize_hint_really` — reallocate the erased bytes block
 /// to `newsize` slots, over-allocated (0, 4, 8, 16, 24, …) when `overallocate`.
+/// The items/set_items oopspecs keep the block field on `W_ListObject` so the
+/// nested `BytesArray` copy does not record `getfield` + `abort/>r`.
 #[majit_macros::look_inside_iff(ll_list_bytes_resize_hint_really_iff)]
 pub unsafe fn ll_list_bytes_resize_hint_really(obj: PyObjectRef, newsize: i64, overallocate: bool) {
     let _roots = crate::gc_roots::push_roots();
@@ -4259,9 +4293,9 @@ pub unsafe fn ll_list_bytes_resize_hint_really(obj: PyObjectRef, newsize: i64, o
     if newsize <= 0 {
         debug_assert!(newsize == 0, "negative list length");
         let list = &mut *(obj as *mut W_ListObject);
-        let old = list.bytes_items.block;
+        let old = ll_list_bytes_items(list);
         ll_list_bytes_set_len(list, 0);
-        list.bytes_items.block = crate::object_array::ll_prebuilt_empty_items_block();
+        ll_list_bytes_set_items(list, crate::object_array::ll_prebuilt_empty_items_block());
         if !majit_rlib::jit::we_are_jitted() {
             dealloc_list_items_block(old);
         }
@@ -4275,9 +4309,12 @@ pub unsafe fn ll_list_bytes_resize_hint_really(obj: PyObjectRef, newsize: i64, o
         newsize
     };
     let newitems = crate::object_array::ll_new_items_array(new_allocated);
+    if crate::gc_hook::gc_alloc_failed_pending() && newitems.is_null() {
+        return;
+    }
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
-    let old = list.bytes_items.block;
+    let old = ll_list_bytes_items(list);
     if before_len > 0 {
         let p = if (before_len as i64) < newsize {
             before_len
@@ -4286,8 +4323,8 @@ pub unsafe fn ll_list_bytes_resize_hint_really(obj: PyObjectRef, newsize: i64, o
         };
         crate::object_array::ll_arraycopy_items_block(old, newitems, 0, 0, p as i64);
     }
-    list_write_barrier(obj);
-    list.bytes_items.block = newitems;
+    crate::gc_hook::try_gc_write_barrier(list as *mut W_ListObject as crate::gc_hook::GCREF);
+    ll_list_bytes_set_items(list, newitems);
     if !majit_rlib::jit::we_are_jitted() {
         dealloc_list_items_block(old);
     }
@@ -4301,6 +4338,7 @@ pub unsafe fn ll_list_bytes_resize_ge(obj: PyObjectRef, newsize: usize) {
     let list = &*(obj as *const W_ListObject);
     let allocated = ll_list_bytes_capacity(list);
     let cond = allocated < newsize;
+    // `l` is a livevar across `_ll_list_resize_hint_really`, which may malloc.
     let roots = crate::gc_roots::push_roots();
     let _ = roots.pin_root(obj);
     if majit_rlib::jit::isconstant(&allocated) && majit_rlib::jit::isconstant(&newsize) {
@@ -4308,6 +4346,9 @@ pub unsafe fn ll_list_bytes_resize_ge(obj: PyObjectRef, newsize: usize) {
             ll_list_bytes_resize_hint_really(obj, newsize as i64, true);
         }
     } else {
+        // No branch on `cond` after `jit.conditional_call`: rlist.py
+        // `_ll_list_resize_ge` has none, and one here records a
+        // `guard_false(cond)` that fails on every grow.
         majit_rlib::jit::conditional_call3(
             cond,
             ll_list_bytes_resize_hint_really,
@@ -4315,6 +4356,10 @@ pub unsafe fn ll_list_bytes_resize_ge(obj: PyObjectRef, newsize: usize) {
             newsize as i64,
             true,
         );
+    }
+    // `exceptiontransform.py` `gen_exc_check` after the call.
+    if crate::gc_hook::gc_alloc_failed_pending() {
+        return;
     }
     let list = &mut *(roots.get(roots.base()) as *mut W_ListObject);
     ll_list_bytes_set_len(list, newsize);
@@ -5487,6 +5532,8 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
         }
         ListStrategy::IntOrFloat => {
             if let Some(item) = int_or_float_encode_item(value) {
+                // ll_append (rlist.py): length = ll_length();
+                // _ll_resize_ge(length+1); ll_setitem_fast(length, item).
                 let length = ll_list_int_length(list);
                 let roots = crate::gc_roots::push_roots();
                 let _ = roots.pin_root(obj);
@@ -5508,6 +5555,8 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
         }
         ListStrategy::Bytes => {
             if is_bytes_strategy_item(value) {
+                // ll_append (rlist.py): length = ll_length();
+                // _ll_resize_ge(length+1); ll_setitem_fast(length, item).
                 let length = ll_list_bytes_length(list);
                 let roots = crate::gc_roots::push_roots();
                 let base = roots.base();
