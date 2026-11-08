@@ -5394,11 +5394,10 @@ fn cannot_create_instances_error(w_type: PyObjectRef) -> PyError {
 
 /// typeobject.py `space.get(w_newdescr, space.w_None, w_type=self)`.
 ///
-/// `baseobjspace.py get` is look-inside. Here it is residual:
-/// `baseobjspace::get` reaches `oefmt`, whose `&[u8]` slice-window
-/// `__getitem__` does not lower yet (`Tuple(Ptr Array Char, Int)`).
+/// `baseobjspace.py get` carries no JIT hint, so neither does this.
+/// `#[inline(never)]` keeps it a Charon graph boundary like
+/// `descr_call_call_obj_args`.
 #[inline(never)]
-#[majit_macros::dont_look_inside]
 fn descr_call_get(
     descr: PyObjectRef,
     obj: PyObjectRef,

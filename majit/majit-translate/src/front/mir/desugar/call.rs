@@ -800,6 +800,22 @@ impl<'a> Lowering<'a> {
                         return Ok(());
                     }
                 }
+                // `String::from_utf8_lossy(&[u8])` of a CCHARP window is
+                // `unicodehelper.py str_decode_utf8` replace, not a residual
+                // 2-arg host `from_utf8_lossy` (`try_lower_from_utf8_lossy`).
+                if self.is_string_from_utf8_lossy(&reg, &call.dest.ty) {
+                    let spliced = splice_pair_lens(args.clone(), pair_lens.clone());
+                    if self.try_lower_from_utf8_lossy(
+                        mir_bb,
+                        &reg,
+                        &spliced,
+                        dest_local,
+                        &call.dest.ty,
+                        target,
+                    )? {
+                        return Ok(());
+                    }
+                }
                 let name = regular_call_name_path(&reg, self.llbc).unwrap_or_default();
                 self.pair_callee_decl(mir_bb, &reg, &name, &pair_lens, false)?;
                 // The `?`-site capture below keys the callee's scope on it.
