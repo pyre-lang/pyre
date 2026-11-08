@@ -6849,8 +6849,14 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
                 // while `project_struct_field_type` and the str-family input
                 // seed record `SomeString`. The word is the STR (`ll_strhash`
                 // / `ll_streq`). Construction and `.0` are then the identity.
-                // A `*mut` object pointer (`IdentityKey`, `PyError`) types as
-                // `Ref`, so the GC-handle arm below still keeps the wrapper.
+                // A registered GC pointer peels the same way: `history.getkind`
+                // of a GC `Ptr` is `'ref'`, and `repr(transparent)` construction
+                // / `.0` are the identity on that word. Keep the wrapper only
+                // when the wrapper itself is a registered GC class
+                // (`gc_struct_ids` contains its StructId — the intern
+                // `adt_node_class_root_identity` names for a GcType struct).
+                // Peeling that object would intern the allocated instance as
+                // its payload pointer.
                 let inner = tyref_to_value_type_with(
                     &field.ty,
                     llbc,
@@ -6861,12 +6867,6 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
                 if matches!(inner, ValueType::Str) {
                     return Some(inner);
                 }
-                // A STR-pointer field already returned above: the value is
-                // `ValueType::Str` from the field lltype, whatever the
-                // wrapper is named. A registered GC pointer that reaches
-                // this arm is a different word (`IdentityKey`, `PyError`).
-                // Peeling it would intern the handle as the payload, so the
-                // wrapper stays.
                 if registered_gc_ptr_class_root_with(
                     &field.ty,
                     llbc,
@@ -6875,6 +6875,7 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
                     raw_alloc_flavor_structs,
                 )
                 .is_some()
+                    && gc_struct_ids.contains(&struct_id_for_type_decl(decl))
                 {
                     return None;
                 }

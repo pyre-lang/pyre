@@ -11,7 +11,7 @@ use super::{
     tyref_to_attr_value_type_for_struct_field, tyref_to_value_type, tyref_tuple_suffix,
 };
 
-use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
+use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
 
 use majit_charon_reader::{
     Llbc,
@@ -468,9 +468,9 @@ fn graph_has_wrapper_ctor_or_pos0(graph: &FunctionGraph) -> bool {
 /// `StrKey(*mut Utf8Str)`, `BytesKey(*mut BytesBlock)`, and
 /// `other::StrKey(*mut Utf8Str)` are `ValueType::Str`: construction and
 /// `.0` are the identity (`AbstractTypedStrategy` keys by the unwrapped
-/// rstr). A transparent newtype over a non-STR GC object pointer stays a
-/// wrapper constructor. `ObjPtrKey(*mut Obj)` is also covered by
-/// `erased_str_ptr_newtype_annotates_somestring_on_construct_field_and_receiver`.
+/// rstr). A GC object pointer peels the same way: `ObjPtrKey(*mut Obj)`
+/// is that `Ref`. `erased_str_ptr_newtype_annotates_somestring_on_construct_field_and_receiver`
+/// covers the annotator side.
 #[test]
 fn str_family_dict_key_newtype_constructs_as_str() {
     let str_llbc = family_ptr_newtype_llbc(
@@ -549,8 +549,7 @@ fn str_family_dict_key_newtype_constructs_as_str() {
         unwrap_lookalike.dump()
     );
 
-    // `rint.rs` `erased_str_ptr_newtype_annotates_somestring_on_construct_field_and_receiver`
-    // already annotates `ObjPtrKey(*mut Obj)` as a constructor.
+    // `ObjPtrKey(*mut Obj)` is the inner Ref: construction is identity.
     let obj_llbc = pointer_newtype_llbc(
         &["fixture", "Obj"],
         &["fixture", "ObjPtrKey"],
@@ -560,10 +559,17 @@ fn str_family_dict_key_newtype_constructs_as_str() {
     );
     let wrap_obj = crate::test_support::lower_function(&obj_llbc, "wrap_obj_ptr")
         .expect("lower ObjPtrKey wrap");
+    let unwrap_obj = crate::test_support::lower_function(&obj_llbc, "unwrap_obj_ptr")
+        .expect("lower ObjPtrKey unwrap");
     assert!(
-        graph_has_wrapper_ctor_or_pos0(&wrap_obj),
-        "a transparent newtype over a non-STR GC object pointer stays a constructor; graph={}",
+        !graph_has_wrapper_ctor_or_pos0(&wrap_obj),
+        "ObjPtrKey(ptr) is the inner Ref, not a constructor; graph={}",
         wrap_obj.dump()
+    );
+    assert!(
+        !graph_has_wrapper_ctor_or_pos0(&unwrap_obj),
+        "ObjPtrKey.0 is identity; graph={}",
+        unwrap_obj.dump()
     );
 }
 
@@ -6139,6 +6145,17 @@ fn paint_handle(
     super::tyref_to_value_type(&ty, &llbc)
 }
 
+fn peel_transparent_inner(llbc: &Llbc, ty: &TyRef) -> Option<ValueType> {
+    let gc = super::harvest_declared_gc_facts(llbc).gc_struct_ids();
+    super::tyref_transparent_inner_value_type(
+        ty,
+        llbc,
+        no_tombstoned_leaves(),
+        &gc,
+        &std::collections::HashSet::<String>::new(),
+    )
+}
+
 fn assert_handle_class(llbc: &Llbc, ty: &TyRef, class: Option<&str>) {
     let tomb = no_tombstoned_leaves();
     assert_eq!(
@@ -6294,7 +6311,10 @@ fn transparent_gc_handle_keeps_the_wrapper_class() {
 
     let (llbc, ty) = load_handle(decls.clone(), serde_json::json!([null]), 3);
     let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
-    assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Ref(None));
+    assert_eq!(
+        super::tyref_to_value_type(&ty, &llbc),
+        ValueType::Ref(Some("PyObject".into()))
+    );
     assert_handle_class(&llbc, &ty, Some("PyError"));
     assert_eq!(
         super::tyref_to_field_layout_string(
@@ -6334,7 +6354,7 @@ fn transparent_gc_handle_keeps_the_wrapper_class() {
         serde_json::json!([pyerror_deref_impl(23, 2), pyerror_deref_impl(24, 4)]),
         3,
     );
-    assert_eq!(split, ValueType::Ref(None));
+    assert_eq!(split, ValueType::Ref(Some("PyObject".into())));
 
     let ambiguous = deref_impl(
         1,
@@ -6351,7 +6371,7 @@ fn transparent_gc_handle_keeps_the_wrapper_class() {
     );
     assert_eq!(
         paint_handle(decls.clone(), serde_json::json!([ambiguous]), 3),
-        ValueType::Ref(None)
+        ValueType::Ref(Some("PyObject".into()))
     );
 
     let vec_target = serde_json::json!({
@@ -6371,7 +6391,7 @@ fn transparent_gc_handle_keeps_the_wrapper_class() {
     );
     assert_eq!(
         paint_handle(decls, serde_json::json!([no_class]), 3),
-        ValueType::Ref(None)
+        ValueType::Ref(Some("PyObject".into()))
     );
 
     let mut copy_name = ident_path(&["fixture", "Handle"]);
@@ -6427,6 +6447,92 @@ fn transparent_gc_handle_keeps_the_wrapper_class() {
         ValueType::Ref(Some("Handle".into()))
     );
     assert_handle_class(&llbc, &ty, Some("Handle"));
+}
+
+/// A `repr(transparent)` wrapper whose unique non-ZST field is a GC
+/// pointer peels to that `Ref`. Construction and `.0` are identity.
+/// The wrapper stays only when it is itself a registered GC class.
+#[test]
+fn transparent_gc_ptr_wrapper_peels_unless_wrapper_is_gc_class() {
+    let gc_object_ref = ValueType::Ref(Some("PyObject".into()));
+
+    // Handle intern (`Deref::Target`) keeps the wrapper class on the
+    // value, but construction / `.0` still peel: the wrapper is not a
+    // GcType struct (`gc_struct_ids` has `PyErrorObject`, not `PyError`).
+    let (llbc, ty) = load_handle(
+        pointer_handle_decls(),
+        serde_json::json!([pyerror_deref_impl(23, 2)]),
+        3,
+    );
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let pyerror_sid = super::struct_id_for_type_decl(llbc.type_by_id(3).expect("PyError decl"));
+    assert!(
+        !gc.contains(&pyerror_sid),
+        "PyError is a handle, not a GcType struct"
+    );
+    assert_eq!(
+        super::tyref_to_value_type(&ty, &llbc),
+        ValueType::Ref(Some("PyError".into()))
+    );
+    assert_eq!(
+        peel_transparent_inner(&llbc, &ty),
+        Some(gc_object_ref.clone())
+    );
+
+    // `IdentityKey` is the same shape: `repr(transparent)` over a GC
+    // pointer, no `GcType` on the wrapper. Peel to the field `Ref`.
+    // Native construction / `.0` are identity on that word.
+    let mut identity_decls = pointer_handle_decls();
+    identity_decls.push((
+        6,
+        struct_decl(
+            6,
+            ident_path(&["fixture", "IdentityKey"]),
+            raw_ptr_field(1),
+            true,
+        ),
+    ));
+    let (llbc, ty) = load_handle(identity_decls, serde_json::json!([null]), 6);
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let identity_sid =
+        super::struct_id_for_type_decl(llbc.type_by_id(6).expect("IdentityKey decl"));
+    assert!(
+        !gc.contains(&identity_sid),
+        "IdentityKey is a dict-key word, not a GcType struct"
+    );
+    assert_eq!(
+        peel_transparent_inner(&llbc, &ty),
+        Some(gc_object_ref.clone())
+    );
+    assert_eq!(
+        super::tyref_to_value_type(&ty, &llbc),
+        gc_object_ref.clone()
+    );
+
+    // The wrapper itself carries `GcType`: keep it so the allocated
+    // object is not interned as its payload pointer.
+    let mut gc_wrapper_decls = pointer_handle_decls();
+    gc_wrapper_decls.push((
+        6,
+        struct_decl(
+            6,
+            ident_path(&["fixture", "GcWrapper"]),
+            raw_ptr_field(1),
+            true,
+        ),
+    ));
+    let (llbc, ty) = load_handle(
+        gc_wrapper_decls,
+        serde_json::json!([gctype_impl_for_adt(6)]),
+        6,
+    );
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let wrapper_sid = super::struct_id_for_type_decl(llbc.type_by_id(6).expect("GcWrapper decl"));
+    assert!(
+        gc.contains(&wrapper_sid),
+        "GcType impl registers the wrapper"
+    );
+    assert_eq!(peel_transparent_inner(&llbc, &ty), None);
 }
 
 /// A by-value store of a `#[repr(transparent)]` GC handle into an
@@ -6544,12 +6650,11 @@ fn transparent_handle_enum_payload_store_is_one_fieldwrite() {
     );
 }
 
-/// `rclass.py` `InstanceRepr.new_instance` / `setfield`: a transparent-handle
-/// Ctor stores the carrier word the field row names. A payload-class
-/// (`PyObject`) cast cannot join the carrier (`binaryop.py`
-/// `pairtype(SomeInstance, SomeInstance).union`).
+/// `repr(transparent)` construction of a GC-pointer handle is the
+/// identity on that word (`history.getkind` of a GC `Ptr`). There is no
+/// second object and no `__pos_0` FieldWrite.
 #[test]
-fn transparent_handle_ctor_recasts_payload_to_carrier_before_field_store() {
+fn transparent_handle_ctor_is_identity_of_the_payload_pointer() {
     let decls = pointer_handle_decls();
     let handle_adt = serde_json::json!({
         "Adt": {"id": 3, "generics": window_empty_generics()}
@@ -6642,30 +6747,30 @@ fn transparent_handle_ctor_recasts_payload_to_carrier_before_field_store() {
         .iter()
         .flat_map(|block| &block.operations)
         .collect();
-    let write = ops.iter().find_map(|op| match &op.kind {
-        OpKind::FieldWrite {
-            field,
-            value: LinkArg::Value(value),
-            ..
-        } if field.name == "__pos_0" => Some((op, value.clone())),
-        _ => None,
-    });
-    let Some((_, stored)) = write else {
-        panic!(
-            "transparent-handle Ctor must FieldWrite __pos_0; graph={}",
-            graph.dump()
-        );
-    };
-    assert_pos0_consumes_carrier_recast(&ops, &stored, &graph);
+    assert!(
+        ops.iter()
+            .all(|op| !matches!(op.kind, OpKind::FieldWrite { .. })),
+        "transparent-handle construction is identity, not a FieldWrite; graph={}",
+        graph.dump()
+    );
+    assert!(
+        ops.iter().all(|op| !matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { .. },
+                ..
+            }
+        )),
+        "transparent-handle construction is identity, not a synthetic ctor; graph={}",
+        graph.dump()
+    );
 }
 
-/// `rclass.py` `InstanceRepr.rtype_setattr` / `HighLevelOp.inputargs`
-/// / `convertvar`: the same handle built through a constructor fn item
+/// The same handle built through a constructor fn item
 /// (`src: "AdtConstructor"` → `constructor_fn_item_shape` →
-/// `emit_aggregate_value` → `emit_aggregate_ctor`) converts onto the
-/// carrier before the `__pos_0` FieldWrite.
+/// `emit_aggregate_value`) is the payload operand.
 #[test]
-fn transparent_handle_ctor_fn_item_recasts_payload_to_carrier_before_field_store() {
+fn transparent_handle_ctor_fn_item_is_identity_of_the_payload() {
     let decls = pointer_handle_decls();
     let handle_adt = serde_json::json!({
         "Adt": {"id": 3, "generics": window_empty_generics()}
@@ -6710,74 +6815,31 @@ fn transparent_handle_ctor_fn_item_recasts_payload_to_carrier_before_field_store
         let shape = lowering
             .constructor_fn_item_shape(fd, &handle_ty)
             .expect("constructor_fn_item_shape of the handle");
+        assert_eq!(
+            shape,
+            crate::front::mir::AggregateShape::Operand {
+                index: 0,
+                transparent: true
+            }
+        );
         let mut graph = FunctionGraph::new("ctor_handle_fn_item");
         let block = graph.startblock;
         let payload = graph.alloc_value_var();
-        crate::front::mir::emit_aggregate_value(&mut graph, block, &shape, &[payload.clone()])
-            .expect("emit constructor-fn-item aggregate");
+        let built =
+            crate::front::mir::emit_aggregate_value(&mut graph, block, &shape, &[payload.clone()])
+                .expect("emit constructor-fn-item aggregate");
+        assert_eq!(built, payload, "transparent ctor is the payload word");
         let ops: Vec<_> = graph
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
             .collect();
-        let write = ops.iter().find_map(|op| match &op.kind {
-            OpKind::FieldWrite {
-                field,
-                value: LinkArg::Value(value),
-                ..
-            } if field.name == "__pos_0" => Some((op, value.clone())),
-            _ => None,
-        });
-        let Some((_, stored)) = write else {
-            panic!(
-                "constructor-fn-item handle Ctor must FieldWrite __pos_0; graph={}",
-                graph.dump()
-            );
-        };
-        assert_pos0_consumes_carrier_recast(&ops, &stored, &graph);
-        let recast = ops
-            .iter()
-            .find(|op| {
-                op.result.as_ref() == Some(&stored)
-                    && crate::model::cast_instance_root(&op.kind) == Some("PyErrorObject")
-            })
-            .expect("carrier recast feeding __pos_0");
-        let OpKind::Call { args, .. } = &recast.kind else {
-            panic!("carrier recast is a Call; graph={}", graph.dump());
-        };
-        assert_eq!(
-            args.first(),
-            Some(&LinkArg::Value(payload)),
-            "fn-item FieldWrite must consume a recast of the raw operand, not a payload-class recast; graph={}",
+        assert!(
+            ops.is_empty(),
+            "identity construction emits no ops; graph={}",
             graph.dump()
         );
     });
-}
-
-fn assert_pos0_consumes_carrier_recast(
-    ops: &[&crate::model::SpaceOperation],
-    stored: &crate::flowspace::model::Variable,
-    graph: &FunctionGraph,
-) {
-    let recast_before_store = ops.iter().any(|op| {
-        op.result.as_ref() == Some(stored)
-            && crate::model::cast_instance_root(&op.kind) == Some("PyErrorObject")
-    });
-    assert!(
-        recast_before_store,
-        "Ctor field store must consume a carrier recast; graph={}",
-        graph.dump()
-    );
-    let carrier_casts = ops
-        .iter()
-        .filter(|op| crate::model::cast_instance_root(&op.kind) == Some("PyErrorObject"))
-        .count();
-    assert_eq!(
-        carrier_casts,
-        1,
-        "one carrier recast feeds the FieldWrite; graph={}",
-        graph.dump()
-    );
 }
 
 /// A by-value Copy newtype around one integer word is that integer

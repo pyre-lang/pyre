@@ -27635,10 +27635,9 @@ fn rutf8_codepoint_at_pos_lowers_byte_reads_to_ord() {
     );
 }
 
-/// `PyError(ptr)` is one pointer operand. The ctor store narrows it
-/// once, to the carrier's inner class (`PyErrorObject`), in
-/// `ctor_ccharp_field_store` (`rtyper.py` `LowLevelOpList.convertvar`
-/// converts once).
+/// `PyError(ptr)` is the payload pointer. Construction peels to that
+/// word; `retag_error_carrier` recasts once to the handle class
+/// (`error::PyError`). No FieldWrite / synthetic ctor.
 #[test]
 fn pyerror_ptr_ctor_emits_one_cast_instance() {
     let py_ptr = interior_raw_mut(interior_adt(0));
@@ -27719,16 +27718,36 @@ fn pyerror_ptr_ctor_emits_one_cast_instance() {
         },
     )
     .expect("lower PyError(ptr) ctor");
-    let roots: Vec<&str> = graph
+    let ops: Vec<_> = graph
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
+        .collect();
+    let roots: Vec<&str> = ops
+        .iter()
         .filter_map(|op| crate::model::cast_instance_root(&op.kind))
         .collect();
     assert_eq!(
         roots,
-        ["PyErrorObject"],
-        "PyError(ptr) emits one __cast_instance_intrinsic to the inner class; graph={}",
+        ["error::PyError"],
+        "PyError(ptr) recasts the payload to the handle class; graph={}",
+        graph.dump()
+    );
+    assert!(
+        ops.iter()
+            .all(|op| !matches!(op.kind, OpKind::FieldWrite { .. })),
+        "PyError(ptr) construction is identity, not a FieldWrite; graph={}",
+        graph.dump()
+    );
+    assert!(
+        ops.iter().all(|op| !matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { .. },
+                ..
+            }
+        )),
+        "PyError(ptr) construction is identity, not a synthetic ctor; graph={}",
         graph.dump()
     );
 }
