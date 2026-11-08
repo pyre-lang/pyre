@@ -3742,6 +3742,7 @@ pub(crate) fn runtime_gcarray_descr(array_type_id: &str) -> Option<DescrRef> {
     match canonical.as_ref() {
         jt::LIST_INT_ITEMS_ARRAY => Some(int_gcarray_descr()),
         jt::LIST_FLOAT_ITEMS_ARRAY => Some(float_gcarray_descr()),
+        jt::LIST_GCREF_ITEMS_ARRAY => Some(gcref_gcarray_descr()),
         jt::LIST_OBJ_ITEMS_ARRAY => Some(pyobject_gcarray_descr()),
         other => entries_gcarray_descr_for_type_id(other),
     }
@@ -3942,13 +3943,49 @@ pub(crate) fn float_gcarray_descr() -> DescrRef {
     descr
 }
 
+/// `Ptr(GcArray(GCREF))` — unresized list of str, and every other fixed
+/// list whose item `externalvsinternal` wraps as `GCREF`. See
+/// [`int_gcarray_descr`]. `Type::Ref` is `FLAG_POINTER`
+/// (`get_type_flag("GCREF")`), so the descr traces item slots.
+pub(crate) fn gcref_gcarray_descr() -> DescrRef {
+    let token = &pyre_object::LIST_OF_STR_GCARRAY_TOKEN;
+    let live = pyre_object::gc_list_of_str_gc_type_id();
+    let descr = crate::descr::make_array_descr_with_full_id(
+        token.base_size,
+        token.item_size,
+        live,
+        Some(token.len_offset),
+        Type::Ref,
+        false,
+        Some(majit_jitcode::codewriter::jtransform::LIST_GCREF_ITEMS_ARRAY.to_string()),
+        false,
+    );
+    if live != majit_rlib::lltypesystem::rlist::UNSET_GC_TYPE_ID
+        && let Some(ad) = descr.as_array_descr()
+        && ad.type_id() != live
+    {
+        ad.set_type_id(live);
+    }
+    majit_ir::descr_registry::force_register_keyed_array(
+        majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(
+            majit_jitcode::codewriter::jtransform::LIST_GCREF_ITEMS_ARRAY,
+        )),
+        descr.clone(),
+    );
+    descr
+}
+
 /// `GcLLDescr_framework.init_array_descr`: after the host has declared the
-/// collector tids for `GcArray(Signed)` / `GcArray(Float)`, publish the
-/// runtime ArrayDescrs under `LIST_INT_ITEMS_ARRAY` / `LIST_FLOAT_ITEMS_ARRAY`
-/// so the first tracing `new_array` sees a real tid.
+/// collector tids for `GcArray(Signed)` / `GcArray(Float)` /
+/// `GcArray(GCREF)`, publish the runtime ArrayDescrs under
+/// `LIST_INT_ITEMS_ARRAY` / `LIST_FLOAT_ITEMS_ARRAY` /
+/// `LIST_GCREF_ITEMS_ARRAY` so the first tracing `new_array` sees a real
+/// tid. The GCREF cell is still unset when `build_gc` publishes the scalar
+/// pair; the host calls this again after `set_gc_list_of_str_gc_type_id`.
 pub fn publish_typed_items_gcarray_descrs() {
     let _ = int_gcarray_descr();
     let _ = float_gcarray_descr();
+    let _ = gcref_gcarray_descr();
 }
 
 /// `descr.py SizeDescr` for the host `PyFrame` virtualizable struct.

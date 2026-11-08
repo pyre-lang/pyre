@@ -104,6 +104,21 @@ impl FixedSizeListRepr {
     }
 }
 
+/// Lowleveltype of an unresized list of str.
+///
+/// `FixedSizeListRepr._setup_repr` calls
+/// `externalvsinternal(..., gcref=True)` (`rmodel.py`). `StringRepr` is
+/// `Ptr(STR)`, a GC pointer, so the internal item is `GCRefRepr`
+/// (`GCREF`) and the list is `Ptr(GcArray(GCREF))`. Each slot still holds
+/// the `STR` pointer the convertvar helper allocated; the wrap is that
+/// cast, not a second copy.
+pub(crate) fn list_of_str_lltype() -> LowLevelType {
+    let arr = Array::gc(crate::translator::rtyper::lltypesystem::lltype::GCREF.clone());
+    LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Array(arr),
+    }))
+}
+
 /// RPython `AbstractBaseListRepr.recast(self, llops, v)` (`rlist.py`):
 ///
 /// ```python

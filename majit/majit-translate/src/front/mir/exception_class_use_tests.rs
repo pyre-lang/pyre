@@ -916,6 +916,29 @@ fn opaque_string_decl(id: u64) -> Value {
     })
 }
 
+fn opaque_vec_decl(id: u64) -> Value {
+    json!({
+        "def_id": id,
+        "item_meta": super::window_meta(&["alloc", "vec", "Vec"], false),
+        "kind": "Opaque"
+    })
+}
+
+fn vec_adt_of(vec_id: u64, item_id: u64) -> Value {
+    json!({
+        "Adt": {
+            "id": vec_id,
+            "builtin": null,
+            "generics": {
+                "regions": [],
+                "types": [adt(item_id)],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    })
+}
+
 fn str_ref_ty() -> Value {
     json!({"Ref": ["Erased", {"Adt": {"builtin": "Str"}}, "Shared"]})
 }
@@ -1453,8 +1476,49 @@ fn exception_class_non_one_word_field_panics() {
         "item_meta": super::window_meta(&["alloc", "string", "String"], false),
         "kind": "Opaque"
     });
-    let bad_vec = bad_enum_llbc("BadVec", vec_adt, vec![vec_decl, string_decl], vec![]);
-    expect_one_word_panic(&bad_vec, "BadVec::S", "Vec<String>");
+    let bad_vec = bad_enum_llbc(
+        "BadVec",
+        vec_adt,
+        vec![vec_decl.clone(), string_decl],
+        vec![],
+    );
+    let (_, fields, _, _, attrs) = program_metadata(&bad_vec);
+    assert_rows(
+        &fields,
+        "BadVec::S",
+        &[("missing", crate::front::mir::RPY_LIST_OF_STR, false)],
+    );
+    assert_eq!(
+        attrs.get("BadVec::S"),
+        Some(&vec![(
+            "missing".to_string(),
+            ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string()))
+        )])
+    );
+    let (flag, kind, size) = crate::codewriter::call::get_type_flag(
+        crate::front::mir::RPY_LIST_OF_STR,
+        &std::collections::HashSet::new(),
+    );
+    assert_eq!(flag, majit_ir::descr::ArrayFlag::Pointer);
+    assert_eq!(kind, majit_ir::value::Type::Ref);
+    assert_eq!(size, crate::layout::target_word_size());
+
+    let signature_for_vec = super::interior_struct(
+        2,
+        &["fixture", "Signature"],
+        &[("word", super::interior_usize())],
+        8,
+        &[0],
+        false,
+    );
+    let vec_of_sig = vec_adt_of(1, 2);
+    let bad_vec_sig = bad_enum_llbc(
+        "BadVecSig",
+        vec_of_sig,
+        vec![vec_decl, signature_for_vec],
+        vec![],
+    );
+    expect_one_word_panic(&bad_vec_sig, "BadVecSig::S", "Vec<Signature>");
 
     let signature = super::interior_struct(
         1,
@@ -2186,4 +2250,452 @@ fn exception_class_inherited_field_type_mismatch_panics() {
         )],
     );
     let _ = program_metadata(&llbc);
+}
+
+fn list_of_str_helper_addr() -> i64 {
+    crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path([
+        "lltypesystem",
+        "rlist",
+        "jit_ll_list_str_from_rust_vec",
+    ]))
+}
+
+fn names_list_of_str_helper(graph: &FunctionGraph) -> bool {
+    let expected = list_of_str_helper_addr();
+    super::window_graph_ops(graph)
+        .iter()
+        .any(|op| matches!(&op.kind, OpKind::ConstFnAddr { value, .. } if *value == expected))
+}
+
+fn assert_list_coerce_then_setfield(graph: &FunctionGraph, source: &Variable) {
+    let expected = list_of_str_helper_addr();
+    let mut found = false;
+    for block in &graph.blocks {
+        let ops = &block.operations;
+        for window in ops.windows(4) {
+            let addr = matches!(
+                &window[0].kind,
+                OpKind::ConstFnAddr { value, .. } if *value == expected
+            );
+            let OpKind::CallResidual { args_r, .. } = &window[1].kind else {
+                continue;
+            };
+            let live = matches!(window[2].kind, OpKind::Live { .. });
+            let write = match &window[3].kind {
+                OpKind::FieldWrite {
+                    field, value, ty, ..
+                } => {
+                    field.name == "missing"
+                        && *ty == ValueType::Ref(None)
+                        && matches!(value, LinkArg::Value(stored) if window[1].result.as_ref() == Some(stored))
+                }
+                _ => false,
+            };
+            if addr && args_r == &vec![source.clone()] && live && write {
+                found = true;
+            }
+        }
+    }
+    assert!(
+        found,
+        "rust-heap Vec<String> is converted to the list before setfield; graph={}",
+        graph.dump()
+    );
+}
+
+fn assert_rpy_list_of_str_is_fixed_list()
+-> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::annotator::model::SomeValue;
+    let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    let projected = bk.project_struct_field_type(crate::front::mir::RPY_LIST_OF_STR);
+    let SomeValue::List(list) = &projected else {
+        panic!("rpy_list_of_str projects to {projected:?}");
+    };
+    {
+        let item = list.listdef.listitem_rc();
+        let item = item.borrow();
+        assert!(!item.resized, "the list is unresized");
+        assert!(!item.mutated, "the list is not mutated");
+        assert_eq!(item.s_value, crate::annotator::model::s_str0());
+    }
+    let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+    let rtyper = std::rc::Rc::new(crate::translator::rtyper::rtyper::RPythonTyper::new(&ann));
+    rtyper.initialize_exceptiondata().expect("exceptiondata");
+    let repr = crate::translator::rtyper::rmodel::rtyper_makerepr(&projected, &rtyper)
+        .expect("SomeList rtyper_makerepr");
+    assert_eq!(repr.class_name(), "FixedSizeListRepr");
+    // `externalvsinternal(..., gcref=True)` wraps `Ptr(STR)` as `GCREF`,
+    // so the list pointer is `Ptr(GcArray(GCREF))`, not `Ptr(GcArray(Ptr(STR)))`.
+    let ll = crate::translator::rtyper::rlist::list_of_str_lltype();
+    assert_eq!(repr.lowleveltype(), &ll);
+    let helper = crate::translator::rtyper::rlist::build_ll_fixed_length_helper_graph(
+        "ll_fixed_length",
+        ll.clone(),
+    )
+    .expect("ll_fixed_length");
+    let graph = helper.graph.borrow();
+    let block = graph.startblock.borrow();
+    assert!(
+        block
+            .operations
+            .iter()
+            .any(|op| op.opname == "getarraysize"),
+        "ll_fixed_length is getarraysize"
+    );
+    ll
+}
+
+fn enum_vec_string_field_llbc(
+    leaf: &str,
+    marked: bool,
+    funs: Vec<Value>,
+) -> majit_charon_reader::Llbc {
+    let vec_ty = vec_adt_of(1, 2);
+    let types = vec![
+        enum_decl(
+            0,
+            &["fixture", leaf],
+            vec![variant("S", vec![named_field("missing", &vec_ty)], 0)],
+        ),
+        opaque_vec_decl(1),
+        opaque_string_decl(2),
+    ];
+    let globals = if marked {
+        vec![marker(
+            0,
+            &["fixture", &format!("_exception_class_{leaf}")],
+            "",
+        )]
+    } else {
+        Vec::new()
+    };
+    super::window_llbc_with_globals(types, funs, globals)
+}
+
+fn vec_string_len_reader(enum_leaf: &str, fun_id: u64, len_fun_id: u64) -> Value {
+    let enum_ty = adt(0);
+    let enum_ref = shared_ref(&enum_ty);
+    let vec_ty = vec_adt_of(1, 2);
+    let out = usize_ty();
+    let disc_ty = isize_disc_ty();
+    let deref = super::window_place(
+        json!({"Projection": [local_place(1, &enum_ref), "Deref"]}),
+        &enum_ty,
+    );
+    let field = downcast_field(deref.clone(), &enum_ty, 0, 0, &vec_ty);
+    let disc = local_place(2, &disc_ty);
+    let ret = local_place(0, &out);
+    fun(
+        fun_id,
+        &["fixture", enum_leaf, "len_missing"],
+        vec![enum_ref.clone()],
+        out.clone(),
+        unstructured(
+            1,
+            vec![
+                named_local(0, None, &out),
+                named_local(1, Some("self"), &enum_ref),
+                named_local(2, None, &disc_ty),
+            ],
+            vec![
+                regular(
+                    vec![assign(disc.clone(), json!({"Discriminant": deref}))],
+                    switch_int(disc, &[(0, 1)], 2),
+                ),
+                regular(vec![], call_regular(len_fun_id, field, ret, 3, 2)),
+                regular(vec![], json!({"Abort": "UndefinedBehavior"})),
+                ret_block(vec![]),
+            ],
+        ),
+    )
+}
+
+fn vec_len_fun(id: u64) -> Value {
+    super::window_opaque_fun(
+        id,
+        &["alloc", "vec", "<Impl>", "len"],
+        vec![vec_adt_of(1, 2)],
+        usize_ty(),
+    )
+}
+
+#[test]
+fn exception_class_vec_string_attr_coerces_rust_heap_on_write() {
+    let vec_ty = vec_adt_of(1, 2);
+    let enum_ty = adt(0);
+    let build = build_aggregate(
+        0,
+        "build_s",
+        0,
+        0,
+        &enum_ty,
+        &[vec_ty.clone()],
+        vec![copy_of(local_place(1, &vec_ty))],
+    );
+    let llbc = enum_vec_string_field_llbc("BadVec", true, vec![build]);
+    let _list_ll = assert_rpy_list_of_str_is_fixed_list();
+    let graph = lower(&llbc, "build_s");
+    let source = sole_input(&graph);
+    let writes = missing_field_writes(&graph);
+    assert_eq!(writes.len(), 1, "{}", graph.dump());
+    assert_eq!(
+        writes[0].0,
+        ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string())),
+        "front stores the attr as the list word; graph={}",
+        graph.dump()
+    );
+    assert!(
+        matches!(&writes[0].1, LinkArg::Value(value) if value == &source),
+        "the operand is still the rust-heap local; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !names_list_of_str_helper(&graph),
+        "the copy is a jtransform rewrite; graph={}",
+        graph.dump()
+    );
+    let found = inputs(&graph);
+    assert!(
+        found.iter().any(|(ty, root)| {
+            matches!(ty, ValueType::Ref(Some(name)) if name == "Vec<String>")
+                || root.as_deref() == Some("Vec<String>")
+        }),
+        "the local stays a rust-heap header so the copy has a source; inputs={found:?}"
+    );
+    let transformed = transform_graph(&graph);
+    assert_list_coerce_then_setfield(&transformed, &source);
+}
+
+#[test]
+fn exception_class_vec_string_len_is_fixed_list_length() {
+    let list_ll = assert_rpy_list_of_str_is_fixed_list();
+    let len_fun = vec_len_fun(0);
+    let reader = vec_string_len_reader("BadVec", 1, 0);
+    let llbc = enum_vec_string_field_llbc("BadVec", true, vec![len_fun, reader]);
+    let graph = lower(&llbc, "len_missing");
+    let reads: Vec<&crate::model::SpaceOperation> = super::window_graph_ops(&graph)
+        .into_iter()
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "missing" && field.vec_part.is_none()
+            )
+        })
+        .collect();
+    assert_eq!(reads.len(), 1, "{}", graph.dump());
+    let OpKind::FieldRead { field, ty, .. } = &reads[0].kind else {
+        unreachable!("filtered to FieldRead");
+    };
+    assert!(
+        !field.inline_vec,
+        "the list word is not an inline Vec header"
+    );
+    assert_eq!(
+        *ty,
+        ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string()))
+    );
+    let produced = reads[0].result.as_ref().expect("field read result");
+    assert_eq!(
+        produced.concretetype().as_ref(),
+        Some(&list_ll),
+        "the getattr word is the FixedSizeListRepr pointer; graph={}",
+        graph.dump()
+    );
+    let len_calls: Vec<&crate::model::SpaceOperation> = super::window_graph_ops(&graph)
+        .into_iter()
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("__len"),
+            _ => false,
+        })
+        .collect();
+    assert_eq!(len_calls.len(), 1, "{}", graph.dump());
+    let OpKind::Call { args, .. } = &len_calls[0].kind else {
+        unreachable!("filtered to Call");
+    };
+    assert!(
+        matches!(args.first(), Some(LinkArg::Value(value)) if Some(value) == reads[0].result.as_ref()),
+        "len's receiver is the list word; graph={}",
+        graph.dump()
+    );
+    let len_parts = super::window_graph_ops(&graph).into_iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldRead { field, .. }
+                if field.name == "missing" && field.vec_part == Some(crate::model::VecFieldPart::Len)
+        )
+    });
+    assert!(
+        !len_parts,
+        "missing.len() is not the rust header length word; graph={}",
+        graph.dump()
+    );
+}
+
+#[test]
+fn exception_class_unmarked_vec_string_field_stays_three_words() {
+    let vec_ty = vec_adt_of(1, 2);
+    let enum_ty = adt(0);
+    let build = build_aggregate(
+        0,
+        "build_s",
+        0,
+        0,
+        &enum_ty,
+        &[vec_ty.clone()],
+        vec![copy_of(local_place(1, &vec_ty))],
+    );
+    let len_fun = vec_len_fun(1);
+    let reader = vec_string_len_reader("Plain", 2, 1);
+    let unmarked = enum_vec_string_field_llbc("Plain", false, vec![build, len_fun, reader]);
+    let (_, fields, _, _, attrs) = program_metadata(&unmarked);
+    let mut saw_row = false;
+    for key in ["Plain::S", "fixture::Plain::S", "synth::Plain::S"] {
+        let Some(rows) = row_names(&fields, key) else {
+            continue;
+        };
+        for (name, ty, _) in &rows {
+            if name == "missing" {
+                saw_row = true;
+                assert_eq!(ty.as_str(), "Vec<String>", "{key} row {rows:?}");
+            }
+        }
+        let Some(attr_rows) = attrs.get(key) else {
+            continue;
+        };
+        for (name, ty) in attr_rows {
+            if name == "missing" {
+                assert_ne!(
+                    *ty,
+                    ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string())),
+                    "{key} attr {attr_rows:?}"
+                );
+            }
+        }
+    }
+    assert!(saw_row, "unmarked Vec<String> row absent");
+    let (flag, kind, size) =
+        crate::codewriter::call::get_type_flag("Vec<String>", &std::collections::HashSet::new());
+    assert_eq!(flag, majit_ir::descr::ArrayFlag::Struct);
+    assert_eq!(kind, majit_ir::value::Type::Ref);
+    assert_eq!(size, 3 * crate::layout::target_word_size());
+
+    let graph = lower(&unmarked, "build_s");
+    let writes = missing_field_writes(&graph);
+    assert_eq!(writes.len(), 1, "{}", graph.dump());
+    assert!(
+        writes[0].0 != ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string())),
+        "an unmarked enum keeps the rust-heap store; got {writes:?} graph={}",
+        graph.dump()
+    );
+    let transformed = transform_graph(&graph);
+    assert!(
+        !names_list_of_str_helper(&transformed),
+        "no coerce without the exception-class flag; graph={}",
+        transformed.dump()
+    );
+
+    let len_graph = lower(&unmarked, "len_missing");
+    // `.len()` of an unmarked inline `Vec` is the header length word.
+    // The whole-header read is not kept when nothing else consumes it.
+    let inline_header = super::window_graph_ops(&len_graph).into_iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldRead { field, ty, .. }
+                if field.name == "missing"
+                    && field.inline_vec
+                    && *ty != ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string()))
+        )
+    });
+    assert!(
+        inline_header,
+        "unmarked read keeps the inline Vec; graph={}",
+        len_graph.dump()
+    );
+    let len_part = super::window_graph_ops(&len_graph).into_iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldRead { field, .. }
+                if field.name == "missing" && field.vec_part == Some(crate::model::VecFieldPart::Len)
+        )
+    });
+    assert!(
+        len_part,
+        "unmarked len is the header length word; graph={}",
+        len_graph.dump()
+    );
+    let calls_len = super::window_graph_ops(&len_graph)
+        .iter()
+        .any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("__len"),
+            _ => false,
+        });
+    assert!(
+        !calls_len,
+        "unmarked len is not Call __len; graph={}",
+        len_graph.dump()
+    );
+
+    let holder_ty = adt(0);
+    let holder = super::interior_struct(
+        0,
+        &["fixture", "Holder"],
+        &[("missing", vec_ty.clone())],
+        24,
+        &[0],
+        false,
+    );
+    let build_holder = build_struct_aggregate(
+        0,
+        "build_holder",
+        0,
+        &holder_ty,
+        &[vec_ty.clone()],
+        vec![copy_of(local_place(1, &vec_ty))],
+    );
+    let plain = super::window_llbc_with_globals(
+        vec![holder, opaque_vec_decl(1), opaque_string_decl(2)],
+        vec![build_holder],
+        Vec::new(),
+    );
+    let (_, fields, _, _, attrs) = program_metadata(&plain);
+    for key in ["Holder", "fixture::Holder"] {
+        if let Some(rows) = row_names(&fields, key) {
+            for (name, ty, _) in &rows {
+                if name == "missing" {
+                    assert_eq!(ty.as_str(), "Vec<String>", "{key} row {rows:?}");
+                }
+            }
+        }
+        if let Some(rows) = attrs.get(key) {
+            for (name, ty) in rows {
+                if name == "missing" {
+                    assert_ne!(
+                        *ty,
+                        ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string())),
+                        "{key} attr {rows:?}"
+                    );
+                }
+            }
+        }
+    }
+    let graph = lower(&plain, "build_holder");
+    let writes = missing_field_writes(&graph);
+    assert_eq!(writes.len(), 1, "{}", graph.dump());
+    assert!(
+        writes[0].0 != ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string())),
+        "a plain struct keeps the rust-heap store; got {writes:?} graph={}",
+        graph.dump()
+    );
+    let transformed = transform_graph(&graph);
+    assert!(
+        !names_list_of_str_helper(&transformed),
+        "a plain Vec<String> field is not a list-of-str attr; graph={}",
+        transformed.dump()
+    );
 }

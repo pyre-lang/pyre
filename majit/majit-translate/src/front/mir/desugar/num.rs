@@ -1612,6 +1612,7 @@ impl<'a> Lowering<'a> {
                     window: false,
                     raw_u8: false,
                     str_value: false,
+                    list_of_str: false,
                     owner_root: None,
                 })
                 .collect(),

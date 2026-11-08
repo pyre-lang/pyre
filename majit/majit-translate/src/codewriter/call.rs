@@ -15562,6 +15562,15 @@ pub(crate) fn get_type_flag(
                 crate::layout::target_word_size(),
             )
         }
+        // Unresized list of str (`FixedSizeListRepr`): one
+        // `Ptr(GcArray(GCREF))` word (`externalvsinternal` wraps
+        // `Ptr(STR)`). `HighLevelOp.convertvar` stores that pointer.
+        // The three-word rust `Vec` header stays the next arm.
+        s if s == crate::front::mir::RPY_LIST_OF_STR => (
+            ArrayFlag::Pointer,
+            majit_ir::value::Type::Ref,
+            crate::layout::target_word_size(),
+        ),
         // `{cap, ptr, len}`. The field is the three-word value, so
         // `&mut vec_field` is the address of that value. A one-word
         // pointer load reads `cap`.
@@ -16568,18 +16577,34 @@ pub(crate) fn array_type_id_of_lltype(
         .unwrap_or_else(|| panic!("array_type_id_of_lltype: unsupported ARRAY.OF {:?}", arr.OF))
 }
 
+/// `GCREF = Ptr(GcOpaqueType('GCREF'))` (`llmemory.py`). A gc struct
+/// pointer is `OBJECTPTR` and stays `LIST_OBJ_ITEMS_ARRAY`.
+fn ptr_to_is_gc_gcref(p: &crate::translator::rtyper::lltypesystem::lltype::Ptr) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+    match &p.TO {
+        PtrTarget::Opaque(op) => op.tag == "GCREF" && op._gckind == GcKind::Gc,
+        _ => false,
+    }
+}
+
 fn try_array_type_id_of_lltype(
     arr: &crate::translator::rtyper::lltypesystem::lltype::Array,
 ) -> Option<String> {
     use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
     use majit_jitcode::codewriter::jtransform::{
-        LIST_FLOAT_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY, LIST_OBJ_ITEMS_ARRAY,
+        LIST_FLOAT_ITEMS_ARRAY, LIST_GCREF_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY, LIST_OBJ_ITEMS_ARRAY,
     };
     let of = array_of_lltype_identity(&arr.OF);
     if arr._gckind == GcKind::Gc {
         match &of {
             LowLevelType::Signed => Some(LIST_INT_ITEMS_ARRAY.to_string()),
             LowLevelType::Float => Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
+            // Before the gc-pointer arm: `try_array_item_spelling` names
+            // every gc pointer `GCREF`, and that arm is `GcArray(OBJECTPTR)`.
+            // `GcArray(GCREF)` is its own ARRAY (`init_array_descr`).
+            LowLevelType::Ptr(p) if ptr_to_is_gc_gcref(p) => {
+                Some(LIST_GCREF_ITEMS_ARRAY.to_string())
+            }
             LowLevelType::Ptr(p) if p._needsgc() => Some(LIST_OBJ_ITEMS_ARRAY.to_string()),
             of => Some(format!("GcArray<{}>", try_array_item_spelling(of)?)),
         }
@@ -18253,6 +18278,30 @@ mod tests {
         assert_eq!(
             array_of_lltype_identity_for(&LowLevelType::Signed, 4),
             LowLevelType::Signed
+        );
+    }
+
+    /// `GcArray(GCREF)` is `LIST_GCREF_ITEMS_ARRAY`. A gc struct pointer
+    /// stays `LIST_OBJ_ITEMS_ARRAY` (`GcArray(OBJECTPTR)`).
+    #[test]
+    fn array_type_id_gc_gcref_opaque_is_its_own_array() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, GCREF, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        use majit_jitcode::codewriter::jtransform::{LIST_GCREF_ITEMS_ARRAY, LIST_OBJ_ITEMS_ARRAY};
+        assert_eq!(
+            array_type_id_of_lltype(&Array::gc(GCREF.clone())),
+            LIST_GCREF_ITEMS_ARRAY
+        );
+        let point = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc(
+                "Point",
+                vec![("x".into(), LowLevelType::Signed)],
+            )),
+        }));
+        assert_eq!(
+            array_type_id_of_lltype(&Array::gc(point)),
+            LIST_OBJ_ITEMS_ARRAY
         );
     }
 

@@ -4267,9 +4267,19 @@ fn register_exception_class_variant_fields(
             // maps to `s_str0()` (`SomeString`). The register bank is
             // `ValueType::Str` (`Ptr(STR)`). A borrow or raw pointer is
             // not this helper, so it keeps the address row.
+            //
+            // A by-value `Vec<String>` is an unresized list of str
+            // (`ArgErrMissing.__init__` stores `missing` as that list).
+            // The row spelling is [`RPY_LIST_OF_STR`]: one pointer word,
+            // `SomeList(s_str0())`, `Ptr(GcArray(GCREF))`
+            // (`externalvsinternal` wraps `Ptr(STR)`). It is not
+            // published as `Vec<String>` or `Slice<String>`.
             let by_value_string = tyref_is_by_value_alloc_string(&field.ty, llbc);
+            let by_value_list_of_str = tyref_is_by_value_vec_string(&field.ty, llbc);
             let row_ty = if by_value_string {
                 "str".to_string()
+            } else if by_value_list_of_str {
+                RPY_LIST_OF_STR.to_string()
             } else {
                 annotation_struct_field_type(
                     &field.ty,
@@ -4280,6 +4290,8 @@ fn register_exception_class_variant_fields(
             };
             let attr_ty = if by_value_string {
                 ValueType::Str
+            } else if by_value_list_of_str {
+                ValueType::Ref(Some(RPY_LIST_OF_STR.to_string()))
             } else {
                 tyref_to_attr_value_type_with(
                     &field.ty,
@@ -6637,7 +6649,7 @@ pub(crate) use self::gcroot::{
 #[cfg(test)]
 pub(crate) use self::lltype::stamp_fn_ptr_spelling;
 pub(crate) use self::lltype::{
-    STR_FAMILY_DECLARED_PATHS, STR_LENGTH_FIELD_CLASS_ROOTS, ThreadLocalRefLlop,
+    RPY_LIST_OF_STR, STR_FAMILY_DECLARED_PATHS, STR_LENGTH_FIELD_CLASS_ROOTS, ThreadLocalRefLlop,
     adt_head_instantiation_suffix, charon_array_len_to_string, charon_literal_to_ast_string,
     charon_type_value_to_ast_string, collect_foreign_opaque_method_externals,
     collect_policy_opaque_fn_stubs_from_llbc, fixed_array_index_identity, fnptr_indirect_enabled,
@@ -6656,7 +6668,9 @@ pub(crate) use self::operation::{
     cast_int_to_ptr_call, cast_ptr_to_int_call, lltype_for_direct_ptradd_pointer, value_type_bank,
 };
 pub(crate) use self::removeassert::bind_array_view_len_in_block;
-pub(crate) use self::strformat::interpolant_is_rust_heap_string;
+pub(crate) use self::strformat::{
+    interpolant_is_rust_heap_string, interpolant_is_rust_heap_vec_string,
+};
 pub(crate) use self::views::{fat_part_concretetype, fat_part_value_type, pair_len_field_name};
 
 /// Graphs that pass a pointer to `OwnerRootGuard` (or to an aggregate that

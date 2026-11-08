@@ -5515,6 +5515,24 @@ fn build_gc() -> Box<MiniMarkGC> {
             .map(|alias| alias.pytype),
         |classptr| gc.subclass_range(classptr),
     );
+    // `GcArray(GCREF)`, the unresized list of str (`FixedSizeListRepr`).
+    // `TypeInfo::varsize` has no subclass range, so `register` accepts it
+    // after `assign_inheritance_ids_now`, and `assert_subclass_ranges` has
+    // already run. Nothing below reads a fixed tid. Inserting it beside
+    // the Signed/Float arrays would move PyCode (43), the `types.len() == 170`
+    // snapshot, `MODULE_FIRST_TYPE_ID`, and the minted exception rows.
+    let list_token = &pyre_object::LIST_OF_STR_GCARRAY_TOKEN;
+    let gc_list_of_str_tid = gc.register_type(TypeInfo::varsize(
+        list_token.base_size,
+        list_token.item_size,
+        list_token.len_offset,
+        true,
+        Vec::new(),
+    ));
+    pyre_object::object_array::set_gc_list_of_str_gc_type_id(gc_list_of_str_tid);
+    // The call next to the Signed/Float registration ran while this cell
+    // was still unset. Publish again so the live tid owns the descr.
+    pyre_jit_trace::state::publish_typed_items_gcarray_descrs();
     Box::new(gc)
 }
 
@@ -19735,6 +19753,36 @@ mod tests {
             rebuilt.subclass_range(classptr)
         });
         assert_matches_gc();
+    }
+
+    /// `GcArray(GCREF)` is registered after every fixed tid. The slot is
+    /// declared, and the varsize row traces its items as GC pointers.
+    #[test]
+    fn gc_list_of_str_tid_is_declared_and_traces_items() {
+        let gc = build_gc();
+        let tid = pyre_object::gc_list_of_str_gc_type_id();
+        assert_ne!(tid, majit_rlib::lltypesystem::rlist::UNSET_GC_TYPE_ID);
+        assert!(
+            (tid as usize) < gc.types.len(),
+            "declared tid {tid} is outside the registry ({})",
+            gc.types.len()
+        );
+        let info = gc.types.get(tid);
+        let token = &pyre_object::LIST_OF_STR_GCARRAY_TOKEN;
+        assert_eq!(info.size, token.base_size);
+        assert_eq!(info.item_size, token.item_size);
+        assert_eq!(info.length_offset, token.len_offset);
+        assert!(info.items_have_gc_ptrs);
+        assert_eq!(info.var_gc_ptr_offsets, vec![0]);
+        assert!(info.has_gc_ptrs);
+        assert!(!info.has_subclass_range);
+        let key = majit_ir::descr::path_hash(
+            majit_jitcode::codewriter::jtransform::LIST_GCREF_ITEMS_ARRAY,
+        );
+        assert_eq!(
+            majit_ir::descr::gc_cache().lock().resolve_array_tid(key),
+            Some(tid)
+        );
     }
 
     #[test]

@@ -1043,10 +1043,16 @@ impl<'a> Lowering<'a> {
                             "bb{mir_bb}: write of a GcArray length header (immutable after allocation)"
                         )));
                     }
+                    // Same seam for a by-value `Vec<String>`: one list word,
+                    // not a leaf copy of `{cap, ptr, len}` over the class word.
+                    let store_list_of_str =
+                        self.exception_disc_info_for_ty(&field_base_ty).is_some()
+                            && tyref_is_by_value_vec_string(dest_ty, self.llbc);
                     // A multi-word inline field is the aggregate, not a
                     // pointer. Storing the temporary's address into the
                     // first word overwrites the discriminant.
                     if !store_rstr_attr
+                        && !store_list_of_str
                         && self.struct_field_offset_from_payload(&field_base_ty, field_payload)
                             == Some(0)
                         && let Some(plan) = self.move_plan(dest_ty)
@@ -1065,6 +1071,7 @@ impl<'a> Lowering<'a> {
                     // (`history.getkind`): leaf-copy would GETFIELD
                     // `__pos_0` with that Int as the base.
                     if !store_rstr_attr
+                        && !store_list_of_str
                         && let Some(nested) = tyref_by_value_struct_decl(
                             dest_ty,
                             self.llbc,
@@ -1180,6 +1187,8 @@ impl<'a> Lowering<'a> {
                                 );
                             let ty = if store_rstr_attr {
                                 ValueType::Str
+                            } else if store_list_of_str {
+                                ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string()))
                             } else {
                                 overlaid
                             };
@@ -6703,6 +6712,12 @@ impl<'a> Lowering<'a> {
                     let read_rstr_attr = self.exception_disc_info_for_ty(&inner.ty).is_some()
                         && (tyref_is_by_value_alloc_string(&field_ty, self.llbc)
                             || tyref_is_by_value_alloc_string(&place_ty, self.llbc));
+                    // A by-value `Vec<String>` attr is the list pointer.
+                    // `inline_vec` would make `missing.len()` read the rust
+                    // header's length word (`inline_vec_field_part`).
+                    let read_list_of_str = self.exception_disc_info_for_ty(&inner.ty).is_some()
+                        && (tyref_is_by_value_vec_string(&field_ty, self.llbc)
+                            || tyref_is_by_value_vec_string(&place_ty, self.llbc));
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.emit_bb(mir_bb);
                     let base = if let Some(root) = narrow_root {
@@ -6766,6 +6781,8 @@ impl<'a> Lowering<'a> {
                         );
                     if read_rstr_attr {
                         ty = ValueType::Str;
+                    } else if read_list_of_str {
+                        ty = ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string()));
                     }
                     let res = self
                         .graph
@@ -6797,8 +6814,9 @@ impl<'a> Lowering<'a> {
                         .with_base_is_deref(base_is_deref)
                         .with_host_index(host_index)
                         .with_inline_vec(
-                            field_ty_is_inline_vec(&field_ty, self.llbc)
-                                || field_ty_is_inline_vec(&place_ty, self.llbc),
+                            !read_list_of_str
+                                && (field_ty_is_inline_vec(&field_ty, self.llbc)
+                                    || field_ty_is_inline_vec(&place_ty, self.llbc)),
                         );
                     if dyn_vtable {
                         field = field.with_vec_part(crate::model::VecFieldPart::FatVtable);
@@ -6815,6 +6833,9 @@ impl<'a> Lowering<'a> {
                     if read_rstr_attr {
                         stamp_as_rstr_str(&res);
                         self.exception_rstr_attr_vars.push(res.clone());
+                    }
+                    if read_list_of_str {
+                        stamp_as_rpy_list_of_str(&res);
                     }
                     stamp_raw_u8_ccharp(&res, &place_ty, self.llbc);
                     stamp_raw_u8_ccharp(&res, &field_ty, self.llbc);
@@ -8160,6 +8181,10 @@ impl<'a> Lowering<'a> {
                         || field_ty == "*const u8",
                     str_value: declared_ty.is_some_and(|ty| {
                         tyref_is_by_value_alloc_string(ty, self.llbc)
+                            && self.exception_disc_info_for_ty(dest_ty).is_some()
+                    }),
+                    list_of_str: declared_ty.is_some_and(|ty| {
+                        tyref_is_by_value_vec_string(ty, self.llbc)
                             && self.exception_disc_info_for_ty(dest_ty).is_some()
                     }),
                     owner_root,

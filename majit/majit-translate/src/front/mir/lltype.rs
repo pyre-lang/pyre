@@ -5868,13 +5868,49 @@ pub(in crate::front::mir) fn tyref_is_by_value_alloc_string(ty: &TyRef, llbc: &L
         .is_some_and(|td| td.item_meta.name_path() == "alloc::string::String")
 }
 
+/// Row spelling of an RPython list of str.
+///
+/// `project_struct_field_type` maps this to an unresized `SomeList` of
+/// `s_str0()`. `FixedSizeListRepr` lowers that to one
+/// `Ptr(GcArray(GCREF))` word: `externalvsinternal(..., gcref=True)`
+/// wraps `Ptr(STR)`. A marked exception class stores a by-value
+/// `Vec<String>` as that word (`ArgErrMissing.__init__` stores
+/// `missing` as a list of str). The spelling is not `Vec<String>` and
+/// not `Slice<String>`: those stay the rust header and the slice the
+/// projectors already know.
+pub(crate) const RPY_LIST_OF_STR: &str = "rpy_list_of_str";
+
+/// By-value `Vec<String>` (`alloc::vec::Vec` whose first type argument
+/// is by-value `alloc::string::String`). A borrow or raw pointer is the
+/// address. The allocator parameter, when Charon keeps it, is not an item.
+pub(in crate::front::mir) fn tyref_is_by_value_vec_string(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(td) = exception_class_by_value_adt(ty, llbc) else {
+        return false;
+    };
+    if td.item_meta.name_path() != "alloc::vec::Vec" {
+        return false;
+    }
+    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
+        return false;
+    };
+    let args = adt_node_type_subst(node, llbc);
+    if !matches!(args.len(), 1 | 2) {
+        return false;
+    }
+    let Some(item) = args.first() else {
+        return false;
+    };
+    tyref_is_by_value_alloc_string(&TyRef::Other(item.clone()), llbc)
+}
+
 /// Whether a marked-enum variant field is one translated word.
 ///
-/// A by-value `String` is one rstr word (`Ptr(STR)`). A `Vec` whose
-/// items are not one word, a by-value `VecDeque`, and a by-value
-/// raw-flavor or multi-word struct are not. A pointer or borrow of
-/// those types is the address. `Wtf8Buf`, a `Vec` of one-word items,
-/// scalars, and GC refs are.
+/// A by-value `String` is one rstr word (`Ptr(STR)`). A by-value
+/// `Vec<String>` is one list-of-str word (`Ptr(GcArray(GCREF))`).
+/// A `Vec` whose items are not one word and not that string list, a
+/// by-value `VecDeque`, and a by-value raw-flavor or multi-word struct
+/// are not. A pointer or borrow of those types is the address.
+/// `Wtf8Buf`, a `Vec` of one-word items, scalars, and GC refs are.
 pub(in crate::front::mir) fn exception_class_attr_is_one_word(
     ty: &TyRef,
     llbc: &Llbc,
@@ -5882,6 +5918,9 @@ pub(in crate::front::mir) fn exception_class_attr_is_one_word(
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
     if tyref_is_by_value_alloc_string(ty, llbc) {
+        return true;
+    }
+    if tyref_is_by_value_vec_string(ty, llbc) {
         return true;
     }
     if tyref_is_string_value(ty, llbc) {

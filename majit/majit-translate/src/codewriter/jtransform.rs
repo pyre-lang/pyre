@@ -201,6 +201,16 @@ pub struct GraphTransformConfig {
     /// same shape as `ll_int2dec` for a non-string operand).
     #[serde(default = "default_rust_string_str_helper")]
     pub rust_string_str_helper: String,
+    /// `HighLevelOp.convertvar` from a rust-heap `Vec<String>`
+    /// (`{cap, ptr, len}`) into an unresized list of str
+    /// (`Ptr(GcArray(GCREF))`; `externalvsinternal` wraps `Ptr(STR)`).
+    ///
+    /// The path is split on `::` before `CallTarget::function_path`: each
+    /// segment is one path component. Bound through `HELPER_FNADDRS`
+    /// (`register_macro_helper_trace_fnaddr`), canonical
+    /// `lltypesystem::rlist::jit_ll_list_str_from_rust_vec`.
+    #[serde(default = "default_rust_vec_list_str_helper")]
+    pub rust_vec_list_str_helper: String,
 }
 
 /// The [`GraphTransformConfig::jitdriver_receiver_roots`] default: pyre's own
@@ -258,6 +268,18 @@ fn default_rust_string_str_helper() -> String {
     "jit_ll_str_from_rust_string".to_string()
 }
 
+/// The [`GraphTransformConfig::rust_vec_list_str_helper`] default.
+///
+/// `HighLevelOp.convertvar` into `FixedSizeListRepr`. The macro registry
+/// publishes `lltypesystem::rlist::jit_ll_list_str_from_rust_vec`.
+fn default_rust_vec_list_str_helper() -> String {
+    "lltypesystem::rlist::jit_ll_list_str_from_rust_vec".to_string()
+}
+
+fn helper_path_target(path: &str) -> CallTarget {
+    CallTarget::function_path(path.split("::").filter(|segment| !segment.is_empty()))
+}
+
 impl Default for GraphTransformConfig {
     fn default() -> Self {
         Self {
@@ -274,6 +296,7 @@ impl Default for GraphTransformConfig {
             float_str_helper: default_float_str_helper(),
             str_eq_helper: default_str_eq_helper(),
             rust_string_str_helper: default_rust_string_str_helper(),
+            rust_vec_list_str_helper: default_rust_vec_list_str_helper(),
         }
     }
 }
@@ -869,7 +892,7 @@ pub(crate) enum JitMarkerKey {
 }
 
 pub use majit_jitcode::codewriter::jtransform::{
-    LIST_FLOAT_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY, LIST_OBJ_ITEMS_ARRAY,
+    LIST_FLOAT_ITEMS_ARRAY, LIST_GCREF_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY, LIST_OBJ_ITEMS_ARRAY,
 };
 
 /// Leaf of a type path, ignoring a generic argument list and a turbofish `::`.
@@ -5404,6 +5427,35 @@ impl<'a> Transformer<'a> {
             {
                 self.rewrite_rust_heap_string_setfield(graph, op, base, field, value, graph_name)
             }
+            // `setfield` converts the operand to the field repr
+            // (`HighLevelOp.convertvar`) before
+            // `Transformer.rewrite_op_setfield`. An unresized list-of-str
+            // field written from a rust-heap `Vec<String>` allocates the
+            // `GcArray(GCREF)` (`externalvsinternal` wraps `Ptr(STR)`),
+            // then that store takes `rewrite_op_setfield` when
+            // `lower_virtualizable` is on. An empty helper name leaves
+            // the write on the plain arm.
+            OpKind::FieldWrite {
+                base,
+                field,
+                value,
+                ty,
+            } if !self.config.rust_vec_list_str_helper.is_empty()
+                && matches!(
+                    ty,
+                    ValueType::Ref(Some(root))
+                        if root == crate::front::mir::RPY_LIST_OF_STR
+                )
+                && matches!(
+                    value,
+                    LinkArg::Value(operand)
+                        if crate::front::mir::interpolant_is_rust_heap_vec_string(graph, operand)
+                ) =>
+            {
+                self.rewrite_rust_heap_vec_string_setfield(
+                    graph, op, base, field, value, graph_name,
+                )
+            }
             OpKind::FieldWrite {
                 field, value, ty, ..
             } if self.config.lower_virtualizable => {
@@ -7943,6 +7995,107 @@ impl<'a> Transformer<'a> {
         coerced.set_concretetype(Some(
             crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone(),
         ));
+        (
+            coerced.clone(),
+            vec![
+                funcptr_op,
+                SpaceOperation {
+                    result: Some(coerced),
+                    kind: OpKind::CallResidual {
+                        funcptr: CallFuncPtr::Value(funcptr),
+                        descriptor: CallDescriptor::from_signature(
+                            &[majit_ir::value::Type::Ref],
+                            majit_ir::value::Type::Ref,
+                            EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::None),
+                        ),
+                        args_i: vec![],
+                        args_r: vec![operand.clone()],
+                        args_f: vec![],
+                        result_kind: 'r',
+                        indirect_targets: None,
+                    },
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::live(),
+                },
+            ],
+        )
+    }
+
+    /// `setfield` of an unresized list-of-str field from a rust-heap
+    /// `Vec<String>`. The operand is still `{cap, ptr, len}`; the field
+    /// is `Ptr(GcArray(GCREF))` (`FixedSizeListRepr` after
+    /// `externalvsinternal`).
+    ///
+    /// `HighLevelOp.convertvar` emits the copy, then
+    /// `Transformer.rewrite_op_setfield` sees the converted value.
+    /// `optimize_block` does not feed `Replace` ops back into
+    /// `rewrite_operation`, so the store is passed through here when
+    /// `lower_virtualizable` is on.
+    fn rewrite_rust_heap_vec_string_setfield(
+        &mut self,
+        graph: &mut FunctionGraph,
+        op: &SpaceOperation,
+        base: &crate::flowspace::model::Variable,
+        field: &FieldDescriptor,
+        value: &LinkArg,
+        graph_name: &str,
+    ) -> RewriteResult {
+        let LinkArg::Value(operand) = value else {
+            return RewriteResult::Keep;
+        };
+        let (coerced, mut ops) = self.coerce_operand_to_list_of_str(graph, operand);
+        if ops.is_empty() {
+            return RewriteResult::Keep;
+        }
+        let stored = LinkArg::Value(coerced);
+        let list_ty = ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string()));
+        let write = SpaceOperation {
+            result: op.result.clone(),
+            kind: OpKind::FieldWrite {
+                base: base.clone(),
+                field: field.clone(),
+                value: stored.clone(),
+                ty: list_ty.clone(),
+            },
+        };
+        let follow_up = if !self.config.lower_virtualizable {
+            vec![write]
+        } else {
+            let rewritten =
+                self.rewrite_op_setfield(&write, field, &stored, &list_ty, graph_name, graph);
+            match rewritten {
+                RewriteResult::Keep => vec![write],
+                RewriteResult::Replace(more) => more,
+                RewriteResult::Identity(_) | RewriteResult::Constant(_) => {
+                    unreachable!("rewrite_op_setfield returns Keep or Replace")
+                }
+            }
+        };
+        ops.extend(follow_up);
+        RewriteResult::Replace(ops)
+    }
+
+    /// Copy a rust-heap `Vec<String>` (`{cap, ptr, len}`) into an
+    /// unresized list of str (`HighLevelOp.convertvar` into
+    /// `FixedSizeListRepr`). Identity when the operand is already that
+    /// list pointer.
+    fn coerce_operand_to_list_of_str(
+        &mut self,
+        graph: &mut FunctionGraph,
+        operand: &crate::flowspace::model::Variable,
+    ) -> (crate::flowspace::model::Variable, Vec<SpaceOperation>) {
+        if !crate::front::mir::interpolant_is_rust_heap_vec_string(graph, operand) {
+            return (operand.clone(), Vec::new());
+        }
+        let target = helper_path_target(&self.config.rust_vec_list_str_helper);
+        let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
+        let coerced = self.fresh_synthetic_variable_typed(
+            graph,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        coerced.set_concretetype(Some(crate::translator::rtyper::rlist::list_of_str_lltype()));
         (
             coerced.clone(),
             vec![
@@ -41680,10 +41833,11 @@ mod tests {
     }
 
     /// `do_fixed_newlist` (jtransform.py): `Ptr(GcArray(GCREF))` emits
-    /// `new_array_clear` with the `GcArray(OBJECTPTR)` identity, so the
-    /// collector can trace the items.
+    /// `new_array_clear` with `LIST_GCREF_ITEMS_ARRAY`. Items are GC
+    /// pointers (`ValueType::Ref`), so the opcode is the clearing one.
+    /// `GcArray(OBJECTPTR)` stays `LIST_OBJ_ITEMS_ARRAY`.
     #[test]
-    fn handle_list_call_newlist_fixed_gcref_assigns_object_ref_array_id() {
+    fn handle_list_call_newlist_fixed_gcref_assigns_gcref_array_id() {
         use crate::translator::rtyper::lltypesystem::lltype::{
             Array, GCREF, LowLevelType, Ptr, PtrTarget,
         };
@@ -41729,8 +41883,8 @@ mod tests {
                 );
                 assert_eq!(
                     array_type_id.as_deref(),
-                    Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
-                    "fixed GCREF array must name the GcArray(OBJECTPTR) identity"
+                    Some(LIST_GCREF_ITEMS_ARRAY),
+                    "fixed GCREF array must name GcArray<GCREF>"
                 );
             }
             other => panic!("expected NewArrayClear, got {other:?}"),

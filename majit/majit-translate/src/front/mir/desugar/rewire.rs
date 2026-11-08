@@ -359,6 +359,12 @@ pub(in crate::front::mir) struct AggregateField {
     /// rust-heap header; `jtransform` copies it when this write's type is
     /// `Str` and the operand is `{cap, ptr, len}`.
     pub(in crate::front::mir) str_value: bool,
+    /// Declared value type is an unresized list of str
+    /// (`Ptr(GcArray(GCREF))`). A by-value `Vec<String>` attr of a
+    /// marked exception class. The operand stays the rust-heap header;
+    /// `jtransform` runs `HighLevelOp.convertvar` when this write's type
+    /// is that list and the operand is `{cap, ptr, len}`.
+    pub(in crate::front::mir) list_of_str: bool,
     /// Declaring class of a marked exception-class field
     /// (`ClassDef.get_owner`). `None` keeps the constructor's result class.
     pub(in crate::front::mir) owner_root: Option<String>,
@@ -549,6 +555,15 @@ fn ctor_ccharp_field_store(
     field: &AggregateField,
     value: &Variable,
 ) -> Result<(Variable, ValueType), LowerError> {
+    if field.list_of_str {
+        // The operand stays the moved rust-heap header.
+        // `HighLevelOp.convertvar` runs in `jtransform` before
+        // `rewrite_op_setfield`.
+        return Ok((
+            value.clone(),
+            ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string())),
+        ));
+    }
     if field.str_value {
         return Ok((value.clone(), ValueType::Str));
     }

@@ -5109,6 +5109,19 @@ impl Bookkeeper {
             "()" => return super::model::s_none(),
             _ => {}
         }
+        // Unresized list of str (`FixedSizeListRepr`, `Ptr(GcArray(GCREF))`
+        // after `externalvsinternal` wraps `Ptr(STR)`). A marked exception
+        // class stores a by-value `Vec<String>` as this one word.
+        // `HighLevelOp.convertvar` is the repr conversion at the store.
+        if stripped == crate::front::mir::RPY_LIST_OF_STR {
+            let listdef = super::listdef::ListDef::new(
+                Some(self.clone()),
+                super::model::s_str0(),
+                false,
+                false,
+            );
+            return SomeValue::List(super::model::SomeList::new(listdef));
+        }
         for list_wrapper in ["Vec<", "VecDeque<", "Slice<"] {
             if let Some(inner) = strip_generic_one(stripped, list_wrapper) {
                 let s_inner = self.project_struct_field_type(inner);

@@ -15976,6 +15976,41 @@ mod tests {
             );
         }
     }
+
+    /// `gcref_gcarray_descr` is `cpu.arraydescrof(GcArray(GCREF))`. The
+    /// pool key is `LIST_GCREF_ITEMS_ARRAY`, and items are GC pointers.
+    #[test]
+    fn gcref_gcarray_descr_publishes_under_the_codewriter_array_identity() {
+        // Publish the object-ref array first so this test owns the
+        // `OBJECT_REF` slot. The GCREF publication must leave tid 9 there.
+        let _pyobj = crate::state::pyobject_gcarray_descr();
+        crate::state::publish_typed_items_gcarray_descrs();
+        let descr = crate::state::gcref_gcarray_descr();
+        let array = descr
+            .as_array_descr()
+            .expect("gcref gcarray descr must be an ArrayDescr");
+        let token = &pyre_object::LIST_OF_STR_GCARRAY_TOKEN;
+        let atid = majit_jitcode::codewriter::jtransform::LIST_GCREF_ITEMS_ARRAY;
+        let cache_key = majit_ir::descr::path_hash(atid);
+        assert_eq!(array.base_size(), token.base_size);
+        assert_eq!(array.item_size(), token.item_size);
+        assert!(array.is_array_of_pointers());
+        assert!(!array.is_array_of_structs());
+        assert_eq!(
+            majit_ir::descr::gc_cache()
+                .lock()
+                .resolve_array_tid(cache_key),
+            Some(array.type_id()),
+        );
+        assert_eq!(
+            majit_ir::descr::gc_cache()
+                .lock()
+                .resolve_array_tid(majit_ir::descr::path_hash(
+                    majit_jitcode::codewriter::jtransform::OBJECT_REF_GCARRAY_TYPE_ID,
+                )),
+            Some(PY_OBJECT_ARRAY_GC_TYPE_ID),
+        );
+    }
 }
 
 /// CallDescr for `pyre_object::longobject::jit_w_long_fits_int(obj) -> i64`.
