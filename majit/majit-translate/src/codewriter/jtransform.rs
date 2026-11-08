@@ -5381,13 +5381,15 @@ impl<'a> Transformer<'a> {
             }
             // `setfield` converts the operand to the field repr
             // (`rtyper.py` `HighLevelOp.convertvar` →
-            // `pairtype(r_from, r_to).convert_from_to`). A `ValueType::Str`
+            // `pairtype(r_from, r_to).convert_from_to`) before
+            // `Transformer.rewrite_op_setfield`. A `ValueType::Str`
             // field (`Ptr(STR)`) written from a rust-heap `String`
-            // (`{cap, ptr, len}`) copies into `STR`. An operand that is
-            // already `Ptr(STR)` — a `Wtf8Buf` value — is that
-            // conversion's identity (`coerce_operand_to_rstr_str`), so
-            // this arm does not match and the write stays as it is.
-            // Not gated on `lower_virtualizable`.
+            // (`{cap, ptr, len}`) copies into `STR`, then that store
+            // takes `rewrite_op_setfield` when `lower_virtualizable` is
+            // on. An operand that is already `Ptr(STR)` — a `Wtf8Buf`
+            // value — is that conversion's identity
+            // (`coerce_operand_to_rstr_str`), so this arm does not match
+            // and the write falls through to the plain arm.
             OpKind::FieldWrite {
                 base,
                 field,
@@ -5400,7 +5402,7 @@ impl<'a> Transformer<'a> {
                         if crate::front::mir::interpolant_is_rust_heap_string(graph, operand)
                 ) =>
             {
-                self.rewrite_rust_heap_string_setfield(graph, op, base, field, value)
+                self.rewrite_rust_heap_string_setfield(graph, op, base, field, value, graph_name)
             }
             OpKind::FieldWrite {
                 field, value, ty, ..
@@ -7862,6 +7864,13 @@ impl<'a> Transformer<'a> {
 
     /// `setfield` of a `ValueType::Str` field from a rust-heap `String`.
     /// The operand is still `{cap, ptr, len}`; the field is `Ptr(STR)`.
+    ///
+    /// `HighLevelOp.convertvar` emits the copy, then
+    /// `Transformer.rewrite_op_setfield` sees the converted value.
+    /// `optimize_block` does not feed `Replace` ops back into
+    /// `rewrite_operation`, so the store is passed through here when
+    /// `lower_virtualizable` is on. The gate matches the plain
+    /// `FieldWrite` arm.
     fn rewrite_rust_heap_string_setfield(
         &mut self,
         graph: &mut FunctionGraph,
@@ -7869,6 +7878,7 @@ impl<'a> Transformer<'a> {
         base: &crate::flowspace::model::Variable,
         field: &FieldDescriptor,
         value: &LinkArg,
+        graph_name: &str,
     ) -> RewriteResult {
         let LinkArg::Value(operand) = value else {
             return RewriteResult::Keep;
@@ -7877,7 +7887,7 @@ impl<'a> Transformer<'a> {
         if ops.is_empty() {
             return RewriteResult::Keep;
         }
-        ops.push(SpaceOperation {
+        let write = SpaceOperation {
             result: op.result.clone(),
             kind: OpKind::FieldWrite {
                 base: base.clone(),
@@ -7885,7 +7895,31 @@ impl<'a> Transformer<'a> {
                 value: LinkArg::Value(coerced),
                 ty: ValueType::Str,
             },
-        });
+        };
+        let follow_up = if !self.config.lower_virtualizable {
+            vec![write]
+        } else {
+            let rewritten = {
+                let OpKind::FieldWrite {
+                    field, value, ty, ..
+                } = &write.kind
+                else {
+                    unreachable!("coerced rust-heap string store is a FieldWrite");
+                };
+                self.rewrite_op_setfield(&write, field, value, ty, graph_name, graph)
+            };
+            // `rewrite_op_setfield` returns `Keep` or `Replace`.
+            // `emit_string_contains` / `rewrite_emitted` reject the other
+            // variants the same way: a setfield is not an alias or a constant.
+            match rewritten {
+                RewriteResult::Keep => vec![write],
+                RewriteResult::Replace(more) => more,
+                RewriteResult::Identity(_) | RewriteResult::Constant(_) => {
+                    unreachable!("rewrite_op_setfield returns Keep or Replace")
+                }
+            }
+        };
+        ops.extend(follow_up);
         RewriteResult::Replace(ops)
     }
 
@@ -39450,6 +39484,273 @@ mod tests {
                 .iter()
                 .all(|op| !matches!(op.kind, OpKind::FieldWrite { .. }))
         }));
+    }
+
+    /// `HighLevelOp.convertvar` copies a rust-heap `String` into `Ptr(STR)`
+    /// before `Transformer.rewrite_op_setfield`. `setup_repr_llfields` adds
+    /// only `vable_token: GCREF`, so no virtualizable field is
+    /// `ValueType::Str`. The coerced store and a plain `Ptr(STR)` store
+    /// must take the same `rewrite_op_setfield` result: the ordinary kind
+    /// retarget (`getkind(Ptr(STR))` is GcRef), or a typeptr drop.
+    #[test]
+    fn coerced_rust_heap_string_setfield_reaches_rewrite_op_setfield() {
+        let ordinary = crate::model::FieldDescriptor::new("missing", Some("BadStr::S".into()));
+        let typeptr = crate::model::FieldDescriptor::new("ob_type", Some("PyObject".into()));
+        for field in [ordinary, typeptr] {
+            let typeptr_field = crate::codewriter::heaptracker::is_typeptr_field(&field);
+            for lower_virtualizable in [true, false] {
+                let config = GraphTransformConfig {
+                    lower_virtualizable,
+                    ..GraphTransformConfig::default()
+                };
+                let plain = transform_str_field_store(&config, false, field.clone());
+                let coerced = transform_str_field_store(&config, true, field.clone());
+                let plain_tags = setfield_op_tags(&plain.graph);
+                let coerced_tags = setfield_op_tags(&coerced.graph);
+                assert_eq!(
+                    plain_tags,
+                    tags_after_rust_string_coerce(&coerced_tags),
+                    "lower_virtualizable={lower_virtualizable} typeptr={typeptr_field}\n\
+                     plain={plain_tags:?}\ncoerced={coerced_tags:?}\n{}",
+                    coerced.graph.dump()
+                );
+                assert_eq!(
+                    dropped_setfield_notes(&plain),
+                    dropped_setfield_notes(&coerced),
+                    "typeptr/void drops are rewrite_op_setfield notes"
+                );
+                assert_eq!(plain.vable_rewrites, 0);
+                assert_eq!(coerced.vable_rewrites, 0);
+                let expected = if lower_virtualizable && typeptr_field {
+                    None
+                } else if lower_virtualizable {
+                    Some(ValueType::Ref(None))
+                } else {
+                    Some(ValueType::Str)
+                };
+                assert_eq!(
+                    store_ty(&plain_tags),
+                    expected,
+                    "plain rewrite_op_setfield result, lower_virtualizable={lower_virtualizable}"
+                );
+                assert!(
+                    rust_string_copy_present(&coerced.graph),
+                    "rust-heap operand is copied before the store: {}",
+                    coerced.graph.dump()
+                );
+                assert!(
+                    !rust_string_copy_present(&plain.graph),
+                    "Ptr(STR) is convertvar identity: {}",
+                    plain.graph.dump()
+                );
+                if expected.is_some() {
+                    assert_coerced_store_uses_copy_result(&coerced.graph);
+                    assert_plain_store_uses_str_input(&plain.graph);
+                } else {
+                    assert!(
+                        plain
+                            .notes
+                            .iter()
+                            .any(|note| note.detail.contains("setfield(ob_type) → dropped")),
+                        "typeptr drop note missing: {:?}",
+                        plain.notes
+                    );
+                }
+            }
+        }
+    }
+
+    fn transform_str_field_store(
+        config: &GraphTransformConfig,
+        rust_heap: bool,
+        field: crate::model::FieldDescriptor,
+    ) -> GraphTransformResult {
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+        let mut graph = FunctionGraph::new(if rust_heap {
+            "rust_heap_setfield"
+        } else {
+            "plain_str_setfield"
+        });
+        let bb = graph.startblock;
+        let base = graph
+            .push_op_var(
+                bb,
+                OpKind::Input {
+                    name: "obj".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: field.owner_root.clone(),
+                },
+                true,
+            )
+            .unwrap();
+        let value = graph
+            .push_op_var(
+                bb,
+                OpKind::Input {
+                    name: "s".into(),
+                    ty: if rust_heap {
+                        ValueType::Ref(Some("String".into()))
+                    } else {
+                        ValueType::Str
+                    },
+                    class_root: rust_heap.then(|| "String".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        if rust_heap {
+            FunctionGraph::set_concretetype_of_inline(&value, ConcreteType::GcRef);
+        } else {
+            value.set_concretetype(Some(STRPTR.clone()));
+        }
+        graph.push_op_var(
+            bb,
+            OpKind::FieldWrite {
+                base,
+                field,
+                value: LinkArg::Value(value),
+                ty: ValueType::Str,
+            },
+            false,
+        );
+        graph.set_return(bb, None);
+        Transformer::new(config).transform(&graph)
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum SetfieldOpTag {
+        Input,
+        CopyAddr,
+        CopyCall,
+        Live,
+        Store(ValueType),
+        Other(String),
+    }
+
+    fn setfield_op_tags(graph: &FunctionGraph) -> Vec<SetfieldOpTag> {
+        let copy_addr = rust_string_copy_addr();
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .map(|op| match &op.kind {
+                OpKind::Input { .. } => SetfieldOpTag::Input,
+                OpKind::ConstFnAddr { value, .. } if *value == copy_addr => SetfieldOpTag::CopyAddr,
+                OpKind::CallResidual { .. } => SetfieldOpTag::CopyCall,
+                OpKind::Live { .. } => SetfieldOpTag::Live,
+                OpKind::FieldWrite { ty, .. } | OpKind::VableFieldWrite { ty, .. } => {
+                    SetfieldOpTag::Store(ty.clone())
+                }
+                other => SetfieldOpTag::Other(format!("{other:?}")),
+            })
+            .collect()
+    }
+
+    fn tags_after_rust_string_coerce(tags: &[SetfieldOpTag]) -> Vec<SetfieldOpTag> {
+        let mut out = Vec::with_capacity(tags.len());
+        let mut index = 0;
+        while index < tags.len() {
+            if matches!(
+                tags.get(index..index + 3),
+                Some([
+                    SetfieldOpTag::CopyAddr,
+                    SetfieldOpTag::CopyCall,
+                    SetfieldOpTag::Live
+                ])
+            ) {
+                index += 3;
+                continue;
+            }
+            out.push(tags[index].clone());
+            index += 1;
+        }
+        out
+    }
+
+    fn store_ty(tags: &[SetfieldOpTag]) -> Option<ValueType> {
+        let mut stores = tags.iter().filter_map(|tag| match tag {
+            SetfieldOpTag::Store(ty) => Some(ty.clone()),
+            _ => None,
+        });
+        let ty = stores.next();
+        assert!(stores.next().is_none(), "one store: {tags:?}");
+        ty
+    }
+
+    fn rust_string_copy_addr() -> i64 {
+        crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path([
+            "jit_ll_str_from_rust_string",
+        ]))
+    }
+
+    fn rust_string_copy_present(graph: &FunctionGraph) -> bool {
+        let expected = rust_string_copy_addr();
+        graph.blocks.iter().any(|block| {
+            block.operations.iter().any(
+                |op| matches!(&op.kind, OpKind::ConstFnAddr { value, .. } if *value == expected),
+            )
+        })
+    }
+
+    fn dropped_setfield_notes(result: &GraphTransformResult) -> Vec<String> {
+        result
+            .notes
+            .iter()
+            .filter(|note| note.detail.contains("→ dropped"))
+            .map(|note| note.detail.clone())
+            .collect()
+    }
+
+    fn assert_coerced_store_uses_copy_result(graph: &FunctionGraph) {
+        let mut copy_result = None;
+        let mut stored = None;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::CallResidual { .. } => copy_result = op.result.clone(),
+                    OpKind::FieldWrite {
+                        value: LinkArg::Value(value),
+                        ..
+                    } => stored = Some(value.clone()),
+                    OpKind::VableFieldWrite { .. } => {
+                        panic!("no ValueType::Str virtualizable field: {}", graph.dump())
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            stored.as_ref(),
+            copy_result.as_ref(),
+            "the store must use the Ptr(STR) copy, not the rust-heap header: {}",
+            graph.dump()
+        );
+    }
+
+    fn assert_plain_store_uses_str_input(graph: &FunctionGraph) {
+        let input = graph.blocks.iter().find_map(|block| {
+            block.operations.iter().find_map(|op| match &op.kind {
+                OpKind::Input {
+                    ty: ValueType::Str, ..
+                } => op.result.clone(),
+                _ => None,
+            })
+        });
+        let stored = graph.blocks.iter().find_map(|block| {
+            block.operations.iter().find_map(|op| match &op.kind {
+                OpKind::FieldWrite {
+                    value: LinkArg::Value(value),
+                    ..
+                } => Some(value.clone()),
+                _ => None,
+            })
+        });
+        assert_eq!(
+            stored,
+            input,
+            "plain Ptr(STR) store keeps its operand: {}",
+            graph.dump()
+        );
     }
 
     /// `jtransform.py rewrite_op_setfield` / `is_typeptr_getset` drops

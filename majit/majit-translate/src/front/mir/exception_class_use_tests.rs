@@ -983,8 +983,11 @@ fn assert_coerce_then_setfield(graph: &FunctionGraph, source: &Variable) {
                 OpKind::FieldWrite {
                     field, value, ty, ..
                 } => {
+                    // `rewrite_op_setfield` retypes from the coerced value.
+                    // `Ptr(STR)` is GcRef, so the store's `ty` is `Ref`,
+                    // the same retarget a plain `Ptr(STR)` store gets.
                     field.name == "missing"
-                        && *ty == ValueType::Str
+                        && *ty == ValueType::Ref(None)
                         && matches!(value, LinkArg::Value(stored) if window[1].result.as_ref() == Some(stored))
                 }
                 _ => false,
