@@ -2007,6 +2007,31 @@ impl FrameBox {
         ptr
     }
 
+    /// Extra translated livevar on an already-owned GC frame.
+    ///
+    /// Portal tracing pins the interpreter's live virtualizable instead of
+    /// allocating [`PyFrame::snapshot_for_tracing`]: MetaInterp reads that
+    /// same `PyFrame` (`virtualizable.py` `read_boxes`). Drop only releases
+    /// this pin; the owner's handle keeps the frame.
+    ///
+    /// `None` when `ptr` is not collector-owned — a `new_boxed` bootstrap
+    /// frame still needs a snapshot because two `FrameBox`es would both
+    /// `Drop`-free it.
+    pub fn pin_existing(ptr: *mut PyFrame) -> Option<Self> {
+        if ptr.is_null() {
+            return None;
+        }
+        if !pyre_object::gc_hook::try_gc_owns_object(ptr as pyre_object::gc_hook::GCREF) {
+            return None;
+        }
+        Some(FrameBox {
+            ptr,
+            owner_root: Some(majit_gc::shadow_stack::OwnerRootGuard::new(
+                majit_ir::GcRef(ptr as usize),
+            )),
+        })
+    }
+
     /// Reconstruct ownership from a pointer previously produced by
     /// [`FrameBox::into_raw`].
     ///

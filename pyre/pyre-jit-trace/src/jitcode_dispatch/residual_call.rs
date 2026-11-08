@@ -675,6 +675,13 @@ pub(crate) struct AbortHandoffFrame {
     pub(crate) banks: majit_metainterp::BlackholeAbortBanks,
 }
 
+fn mint_abort_handoff_miframe(
+    jitcode: std::sync::Arc<majit_metainterp::jitcode::JitCode>,
+    pc: usize,
+) -> majit_metainterp::MIFrame {
+    majit_metainterp::take_standalone_frame(jitcode, pc)
+}
+
 fn abort_handoff_from_minted(miframe: majit_metainterp::MIFrame) -> AbortHandoffFrame {
     let banks = majit_metainterp::BlackholeAbortBanks::from_miframe_const_boxes(&miframe);
     AbortHandoffFrame { miframe, banks }
@@ -1428,7 +1435,7 @@ fn build_paused_portal_miframe<Sym: WalkSym>(
         crate::state::pyjitcode_for_jitcode_index(index)
             .and_then(|pjc| parent_call_result_color(&pjc, pc))
     });
-    let miframe = majit_metainterp::MIFrame::new(jitcode, resume_pc);
+    let miframe = mint_abort_handoff_miframe(jitcode, resume_pc);
     let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
     fill_abort_miframe_register_banks(
         ctx.trace_ctx,
@@ -1494,7 +1501,7 @@ pub(crate) fn build_helper_parent_miframe(
     if !instruction_starts_at(&jitcode, resume_pc) {
         return None;
     }
-    let miframe = majit_metainterp::MIFrame::new(jitcode, resume_pc);
+    let miframe = mint_abort_handoff_miframe(jitcode, resume_pc);
     let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
     fill_abort_miframe_register_banks(
         trace_ctx,
@@ -2197,7 +2204,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
         i32::try_from(jitcode.index()).ok()?,
         i32::try_from(resume_pc).ok()?,
     )?;
-    let mut miframe = majit_metainterp::MIFrame::new(jitcode.clone(), resume_pc);
+    let mut miframe = mint_abort_handoff_miframe(jitcode.clone(), resume_pc);
 
     // pyjitpl.py make_result_of_lastop: the residual returned before its
     // ordinary dispatcher writeback, while `resume_pc` already points past
@@ -2448,7 +2455,7 @@ pub(crate) fn build_trace_too_long_single_frame_miframe<Sym: WalkSym>(
         }
         return None;
     }
-    let miframe = majit_metainterp::MIFrame::new(jitcode, resume_pc);
+    let miframe = mint_abort_handoff_miframe(jitcode, resume_pc);
     let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
     fill_trace_too_long_register_banks(ctx, &mut banks)
         .then_some(AbortHandoffFrame { miframe, banks })
@@ -2746,7 +2753,7 @@ fn build_codeless_continuation_parent<Sym: WalkSym>(
         }
         return None;
     }
-    let miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), resume_pc);
+    let miframe = mint_abort_handoff_miframe(pjc.jitcode.clone(), resume_pc);
     let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
     // `_copy_data_from_miframe` (`blackhole.py`) copies every live box the
     // MIFrame holds. The only register that may still be empty is the
@@ -3175,7 +3182,7 @@ fn copy_captured_parent_blackhole<Sym: WalkSym>(
     origin: &'static str,
     index: usize,
 ) -> Option<AbortHandoffFrame> {
-    let miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), concrete.resume_pc);
+    let miframe = mint_abort_handoff_miframe(pjc.jitcode.clone(), concrete.resume_pc);
     let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
     for &(color, value) in &concrete.int_values {
         let bank_len = banks.registers_i.len();
@@ -3272,7 +3279,7 @@ fn build_parent_miframe_from_live_banks<Sym: WalkSym>(
     let result = parent
         .call_jitcode_pc
         .and_then(|pc| parent_call_result_color(pjc, pc));
-    let miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), resume_pc);
+    let miframe = mint_abort_handoff_miframe(pjc.jitcode.clone(), resume_pc);
     let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
     for color in 0..banks.registers_i.len() {
         if result == Some(('i', color)) {

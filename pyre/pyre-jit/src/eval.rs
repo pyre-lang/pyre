@@ -12,7 +12,7 @@ use crate::jit::state::{PyreEnv, PyreJitState, PyreMeta};
 use crate::jit::trace::trace_bytecode;
 use pyre_interpreter::PyExecutionContext;
 use pyre_interpreter::executioncontext::ActionFlagOps;
-use pyre_interpreter::pyframe::PyFrame;
+use pyre_interpreter::pyframe::{FrameBox, PyFrame};
 use pyre_interpreter::{
     PyError, PyResult, StepResult, decode_instruction_forward_dispatch, execute_opcode_step,
 };
@@ -13457,7 +13457,19 @@ fn compile_and_run_once(
                 }
                 action
             } else {
-                let concrete_frame = frame_root.frame().snapshot_for_tracing();
+                // RPython MetaInterp traces the live virtualizable
+                // (`virtualizable.py` `read_boxes`). Pin that frame instead of
+                // allocating `snapshot_for_tracing` on every too-long abort.
+                // Array stores already land on the live frame
+                // (`own_frame_array_store_target`); only `last_instr` /
+                // `valuestackdepth` need a start-of-trace copy for a declined
+                // abort that replays from the merge point.
+                let pinned = FrameBox::pin_existing(frame_root.frame() as *mut PyFrame);
+                let traced_on_live = pinned.is_some();
+                let concrete_frame =
+                    pinned.unwrap_or_else(|| frame_root.frame().snapshot_for_tracing());
+                let saved_last_instr = frame_root.frame().last_instr;
+                let saved_valuestackdepth = frame_root.frame().valuestackdepth;
                 let live_frame_addr = frame_root.frame() as *const PyFrame as usize;
                 let (action, executed_frame, walk_end_flushed) = trace_bytecode(
                     meta,
@@ -13479,9 +13491,11 @@ fn compile_and_run_once(
                     .map_or(true, |ctx| ctx.aborted_framestack.is_none())
                 {
                     if walk_end_flushed {
-                        frame_root
-                            .frame()
-                            .restore_resume_state_from(&executed_frame);
+                        if !traced_on_live {
+                            frame_root
+                                .frame()
+                                .restore_resume_state_from(&executed_frame);
+                        }
                     } else if let Some(restart_pc) = walk_end_restart_pc {
                         // A marker inside a super-instruction closes the loop at
                         // `loop_header_pc + 1`, and the walk already advanced
@@ -13492,6 +13506,12 @@ fn compile_and_run_once(
                         let frame = frame_root.frame();
                         frame.set_last_instr_from_next_instr(restart_pc);
                         correct_resume_vsd(frame, restart_pc);
+                    } else if traced_on_live
+                        && matches!(action, majit_metainterp::TraceAction::Abort)
+                    {
+                        let frame = frame_root.frame();
+                        frame.last_instr = saved_last_instr;
+                        frame.valuestackdepth = saved_valuestackdepth;
                     }
                 } else {
                     published_abort_image = true;
@@ -13647,8 +13667,9 @@ fn compile_and_run_once(
 ///
 /// Called when counter threshold fires and no compiled code exists.
 /// Starts tracing via `compile_and_run_once`, the same call
-/// `warmstate.py` makes; a key that already has a runnable procedure
-/// token runs through `run_compiled_detailed_with_bridge_keyed` instead.
+/// `warmstate.py bound_reached` makes. A compiled procedure token
+/// enters through [`maybe_compile_and_run`]'s `RunCompiled` arm
+/// (`EnterJitAssembler` / [`execute_assembler`]), not here.
 /// The `back_edge_*` family on `JitDriver` is not on this path — nothing
 /// under `pyre/` calls any of it.
 // dont_look_inside: JIT-driver counter/back-edge slow path the tracer must not enter.
@@ -13662,11 +13683,10 @@ fn bound_reached(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
-    let mut frame_root = FrameRoot::new(frame);
     if majit_metainterp::majit_log_enabled() {
-        let locals: Vec<(usize, Option<i64>)> = (0..locals_w!(frame_root.frame()).len().min(5))
+        let locals: Vec<(usize, Option<i64>)> = (0..locals_w!(frame).len().min(5))
             .map(|i| {
-                let value = locals_w!(frame_root.frame())[i];
+                let value = locals_w!(frame)[i];
                 let decoded = if value.is_null() || !unsafe { pyre_object::pyobject::is_int(value) }
                 {
                     None
@@ -13680,102 +13700,27 @@ fn bound_reached(
             "[jit][bound-reached] key={} pc={} arg0={:?} locals={:?}",
             green_key,
             loop_header_pc,
-            debug_first_arg_int(frame_root.frame()),
+            debug_first_arg_int(frame),
             locals,
         );
     }
     // warmstate.py bound_reached: `jitcounter.decay_all_counters()` and
     // then `rstack.stack_almost_full()` run inside `MetaInterp::bound_reached`
-    // (compile_and_run_once → JitDriver::bound_reached), in that order.
-    // warmstate.py:437-444: MetaInterp.compile_and_run_once
-    frame_root
-        .frame()
-        .set_last_instr_from_next_instr(loop_header_pc);
-    let mut jit_state = build_jit_state(frame_root.frame(), info);
-    // `warmstate.py maybe_compile_and_run` reads `procedure_token =
-    // cell.get_procedure_token()` once and both decides and runs on that one
-    // object. Read it once here too: the decision below and the run further
-    // down used to walk the cell chain separately for the same answer.
-    let procedure_token = driver.runnable_procedure_token(green_key);
-    if procedure_token.is_none() {
-        return compile_and_run_once(
-            frame_root.frame(),
-            green_key,
-            loop_header_pc,
-            CompileOnceStart::BackEdge,
-            driver,
-            info,
-            env,
-        );
-    }
-    // warmstate.py: procedure_token → EnterJitAssembler.
-    // Same bracket, same reason, as the `execute_assembler` door: a guard that
-    // fails between a walker-recorded `enter` and its `leave` leaves the
-    // callee's `JitVirtualRef` published in `topframeref`, and this door
-    // reaches the same traces.
-    let _topframeref_guard =
-        TopFrameRefGuard::new(jit_state.execution_context as *mut PyExecutionContext);
-    // The run takes the token this decision read, which is what
-    // `EnterJitAssembler(procedure_token, ...)` carries upstream.
-    let outcome = procedure_token.as_ref().map(|procedure_token| {
-        driver.run_compiled_detailed_with_bridge_token(
-            green_key,
-            procedure_token,
-            loop_header_pc,
-            &mut jit_state,
-            env,
-            || {},
-        )
-    });
-    if let Some(mut outcome) = outcome {
-        // Drain the exception `park_jit_pending_error` parked
-        // (`unpackiterable_driver`). A prologue overflow is already in
-        // `pos_exc_value` (`jit_publish_exception` /
-        // `_build_stack_check_slowpath`), not in this slot.
-        if let Err(exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
-            return Some(LoopResult::Done(Err(exc)));
-        }
-        // compile.py handle_fail: bridge/blackhole decision.
-        if let DetailedDriverRunOutcome::GuardFailure {
-            ref descr_arc,
-            should_bridge,
-            owning_key,
-            ref mut raw_values,
-            guard_exc,
-            savedata,
-            deadframe: _,
-        } = outcome
-        {
-            match dispatch_handle_fail(
-                &mut frame_root,
-                green_key,
-                descr_arc,
-                should_bridge,
-                owning_key,
-                raw_values,
-                guard_exc,
-                info,
-                savedata,
-                true,
-                false,
-            ) {
-                HandleFailDispatch::ContinueRunningNormally => {
-                    return Some(LoopResult::ContinueRunningNormally);
-                }
-                HandleFailDispatch::Done(r) => return Some(LoopResult::Done(r)),
-                HandleFailDispatch::ExitFrameWithException(err) => {
-                    return Some(LoopResult::ExitFrameWithException(err));
-                }
-                HandleFailDispatch::Fallthrough => {}
-            }
-        } else {
-            match handle_jit_outcome(outcome, &jit_state, frame_root.frame(), info, green_key) {
-                JitAction::Return(result) => return Some(LoopResult::Done(result)),
-                JitAction::ContinueRunningNormally | JitAction::Continue => {}
-            }
-        }
-    }
-    None
+    // (`compile_and_run_once` → `JitDriver::bound_reached`), in that order.
+    // Do not build a `PyreJitState` or `FrameRoot` here: those belong to
+    // `compile_and_run_once` / `execute_assembler`. Holding them across the
+    // call blocked the tail call and allocated a second virtualizable root
+    // on every too-long abort (`trace_too_long_effect_replay`).
+    frame.set_last_instr_from_next_instr(loop_header_pc);
+    compile_and_run_once(
+        frame,
+        green_key,
+        loop_header_pc,
+        CompileOnceStart::BackEdge,
+        driver,
+        info,
+        env,
+    )
 }
 
 /// RPython warmstate.py maybe_compile_and_run parity.

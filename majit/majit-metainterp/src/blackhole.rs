@@ -651,10 +651,13 @@ pub struct BlackholeAbortBanks {
 impl BlackholeAbortBanks {
     /// Sized to the tracing MIFrame's `num_regs_and_consts_*` banks.
     pub fn sized_for(miframe: &MIFrame) -> Self {
+        // blackhole.py `setposition` sizes `registers_*` from the jitcode
+        // (`num_regs_and_consts_*`); a reused MIFrame's register files only
+        // grow (`copy_constants`), so their length is not the jitcode's.
         Self {
-            registers_i: vec![None; miframe.int_regs.len()],
-            registers_r: vec![None; miframe.ref_regs.len()],
-            registers_f: vec![None; miframe.float_regs.len()],
+            registers_i: vec![None; miframe.jitcode.num_regs_and_consts_i()],
+            registers_r: vec![None; miframe.jitcode.num_regs_and_consts_r()],
+            registers_f: vec![None; miframe.jitcode.num_regs_and_consts_f()],
         }
     }
 

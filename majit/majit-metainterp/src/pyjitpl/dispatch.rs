@@ -1695,6 +1695,43 @@ pub fn recycle_framestack(mut stack: MIFrameStack) {
     });
 }
 
+/// `pyjitpl.py MetaInterp.newframe` reuse half for an FBW abort latch
+/// that mints one MIFrame without a live `MetaInterp.framestack`.
+///
+/// `run_pending_abort_blackhole` / `discard_pending_abort_blackhole`
+/// `recycle_framestack` the published abort image onto
+/// [`STANDALONE_FREE_FRAMES`]. The next latch pops that pool.
+/// `setup_reused` is the translated `copy_constants` grow; abort
+/// handoff leaves MIFrame regs unset and copies through
+/// `BlackholeAbortBanks`, so leftover ConstPtrs are cleared before
+/// the latch GC-walks `ref_regs`.
+pub fn take_standalone_frame(jitcode: Arc<JitCode>, pc: usize) -> MIFrame {
+    STANDALONE_FREE_FRAMES.with(|free| {
+        let mut list = free.borrow_mut();
+        if let Some(mut frame) = list.pop() {
+            frame.setup_reused(jitcode, pc, None, None);
+            frame.int_regs.fill(None);
+            frame.ref_regs.fill(None);
+            frame.float_regs.fill(None);
+            frame
+        } else {
+            MIFrame::new(jitcode, pc)
+        }
+    })
+}
+
+/// Return one abort-handoff MIFrame to [`STANDALONE_FREE_FRAMES`].
+///
+/// Bridge cash (`cash_single_frame_blackhole`) drops the latched
+/// frame after `drive_single_frame_blackhole`; without this the next
+/// `take_standalone_frame` always `MIFrame::new`. Portal abort already
+/// `recycle_framestack`s via `RecycleFramestackOnDrop`.
+pub fn recycle_standalone_frame(frame: MIFrame) {
+    let mut stack = MIFrameStack::empty();
+    stack.recycle_frame(frame);
+    recycle_framestack(stack);
+}
+
 impl Default for StandaloneFrameStack {
     fn default() -> Self {
         Self::new()

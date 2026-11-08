@@ -8,7 +8,8 @@ pub use dispatch::implement_guard_value_on_frames;
 pub use dispatch::{
     ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
     MergePointBanks, RecycleFramestackOnDrop, StandaloneFrameStack, decode_jit_merge_point_banks,
-    recycle_framestack, residual_write_effect_info, setup_frame_from_merge_point, trace_jitcode,
+    recycle_framestack, recycle_standalone_frame, residual_write_effect_info,
+    setup_frame_from_merge_point, take_standalone_frame, trace_jitcode,
     trace_jitcode_at_resume_framestack, trace_jitcode_from_merge_point, trace_jitcode_with_args,
     trace_jitcode_with_args_and_runtime,
 };

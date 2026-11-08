@@ -260,9 +260,10 @@ pub use pyjitpl::{
     record_application_traceback_for_recording, record_application_traceback_hook_address,
     record_discarded_level_traceback_for_recording, record_discarded_level_traceback_hook_address,
     record_inline_application_traceback_for_recording,
-    record_inline_application_traceback_hook_address, residual_write_effect_info,
-    resolve_exception_context_for_recording, resolve_exception_context_hook_address,
-    resolve_symbolic_fnaddr_path, setup_frame_from_merge_point, trace_jitcode,
+    record_inline_application_traceback_hook_address, recycle_standalone_frame,
+    residual_write_effect_info, resolve_exception_context_for_recording,
+    resolve_exception_context_hook_address, resolve_symbolic_fnaddr_path,
+    setup_frame_from_merge_point, take_standalone_frame, trace_jitcode,
     trace_jitcode_at_resume_framestack, trace_jitcode_from_merge_point, trace_jitcode_with_args,
     trace_jitcode_with_args_and_runtime,
 };

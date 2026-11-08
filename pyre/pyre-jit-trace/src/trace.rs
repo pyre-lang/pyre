@@ -3801,6 +3801,7 @@ fn cash_single_frame_blackhole(
             staged.jitcode_index, terminal.position, terminal.last_opcode_position,
         );
     }
+    majit_metainterp::recycle_standalone_frame(staged.miframe);
     true
 }
 
@@ -4589,13 +4590,24 @@ fn try_adopt_single_frame_blackhole(
         );
         return false;
     }
-    let Some(mut locals_undo) = crate::state::capture_frame_locals(vable_frame) else {
-        assert!(
-            !preflighted,
-            "preflighted blackhole frame locals became uncapturable"
-        );
-        crate::jitcode_dispatch::relatch_single_frame_blackhole(latched);
-        return false;
+    // Portal tracing that pinned the live virtualizable already wrote
+    // locals through `own_frame_array_store_target` /
+    // `store_live_frame_array_slot`. Publishing them again is a live→live
+    // copy (`write_back_outer_locals`). Bridges still step a snapshot.
+    let already_on_live =
+        !live_trace_ctx(meta).is_bridge_trace && cf_addr == root_addr && vable_frame == root_addr;
+    let mut locals_undo = if already_on_live {
+        Vec::new()
+    } else {
+        let Some(undo) = crate::state::capture_frame_locals(vable_frame) else {
+            assert!(
+                !preflighted,
+                "preflighted blackhole frame locals became uncapturable"
+            );
+            crate::jitcode_dispatch::relatch_single_frame_blackhole(latched);
+            return false;
+        };
+        undo
     };
     let mut captured_stack = if publishes_root_stack {
         // The two sources side by side, so the reason this leg has its own is
@@ -4696,7 +4708,8 @@ fn try_adopt_single_frame_blackhole(
             majit_gc::shadow_stack::push_resume_ref_roots(stack.roots_mut());
         }
     }
-    if !crate::state::write_back_outer_locals(live_trace_ctx(meta), vable_frame) {
+    if !already_on_live && !crate::state::write_back_outer_locals(live_trace_ctx(meta), vable_frame)
+    {
         crate::state::restore_frame_locals(vable_frame, &locals_undo);
         majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
         assert!(
