@@ -8322,8 +8322,8 @@ fn jd1_trace_threshold() -> u32 {
 
 /// jd1 (`unpackiterable_driver`) merge-point hook body. On the hot iterator
 /// type, drives one `JitCodeMachine` trace of the extracted
-/// `unpackiterable_portal` loop with `w_iterator`/`items` as the two
-/// `reds='auto'` values. Inert when jd1 is disabled (see
+/// `unpackiterable_portal` loop with the extracted `reds='auto'` banks.
+/// Inert when jd1 is disabled (see
 /// [`jd1_experiment_enabled`]).
 fn unpack_merge_point_jit(
     greenkey: pyre_object::PyObjectRef,
