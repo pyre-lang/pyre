@@ -165,8 +165,10 @@ pyre_interpreter::py_module! {
         }
     },
     functions: {
-        // `stack_effect(opcode, oparg=None, /, *, jump=None)` — opcode and
-        // oparg are positional-only; jump is keyword-only.
+        // [3.15-spec] `stack_effect(opcode, oparg=None, /, *, jump=None)` —
+        // opcode and oparg are positional-only; jump is keyword-only.
+        // `_opcode_stack_effect_impl` clinic input. PyPy `stack_effect`
+        // accepts `opcode=` / `oparg=`. Measured on python3.15t.
         "stack_effect"             / * = stack_effect; crate::Signature::new(vec!["opcode", "oparg", "jump"], None, None, 1, 2),
         "get_executor"             / 2 = |_| Ok(w_none()),
         "get_specialization_stats" / 0 = |_| Ok(w_none()),

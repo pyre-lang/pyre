@@ -618,6 +618,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     }
                 },
                 pyre_interpreter::HOPELESS,
+                // [3.15-spec] `select.select(rlist, wlist, xlist, timeout=None, /)`
+                // — all positional-only (`selectmodule.c` clinic). PyPy
+                // `select` accepts the names as keywords. Measured:
+                // `select.select(rlist=[], wlist=[], xlist=[], timeout=0)` is
+                // TypeError on python3.15t.
                 pyre_interpreter::gateway::Signature::new(
                     vec!["rlist", "wlist", "xlist", "timeout"],
                     None,

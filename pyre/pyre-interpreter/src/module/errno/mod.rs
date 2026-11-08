@@ -320,8 +320,12 @@ pyre_interpreter::py_module! {
                     ("ENOEXEC", host_errno::ENOEXEC),
                     ("EBADF", host_errno::EBADF),
                     ("ECHILD", host_errno::ECHILD),
-                    ("EAGAIN", host_errno::EAGAIN),
+                    // [3.15-spec] Later-wins: `EWOULDBLOCK` first, then
+                    // `EAGAIN`, matching `errnomodule.c` `add_errcode` and
+                    // unix `interp_errno.py` `errors`. When the host aliases
+                    // the two, `errorcode` answers `"EAGAIN"`.
                     ("EWOULDBLOCK", host_errno::EWOULDBLOCK),
+                    ("EAGAIN", host_errno::EAGAIN),
                     ("ENOMEM", host_errno::ENOMEM),
                     ("EACCES", host_errno::EACCES),
                     ("EFAULT", host_errno::EFAULT),
@@ -484,8 +488,9 @@ pyre_interpreter::py_module! {
                 ("ENOEXEC", 8),
                 ("EBADF", 9),
                 ("ECHILD", 10),
-                ("EAGAIN", 35),
+                // [3.15-spec] Later-wins: `EAGAIN` over `EWOULDBLOCK` when both are 35.
                 ("EWOULDBLOCK", 35),
+                ("EAGAIN", 35),
                 ("ENOMEM", 12),
                 ("EACCES", 13),
                 ("EFAULT", 14),

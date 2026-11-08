@@ -1226,21 +1226,22 @@ fn validate_utime_args(
     let time_t_overflow =
         || crate::PyError::overflow_error("timestamp out of range for platform time_t");
     let validate_seconds = |w_value: PyObjectRef| -> Result<(), crate::PyError> {
-        if unsafe { pyre_object::is_int_or_long(w_value) } {
+        // [3.15-spec] same converter as native `time_from_secs`:
+        // `PyIndex_Check` then `PyFloat_AsDouble` (`float_w`). PyPy
+        // `convert_seconds` uses `space.int_w` unless the value is a float.
+        if unsafe { pyre_object::is_int_or_long(w_value) }
+            || unsafe { crate::baseobjspace::lookup(w_value, "__index__") }.is_some()
+        {
             crate::builtins::space_index_w(w_value).map_err(|_| time_t_overflow())?;
             return Ok(());
         }
-        let w_float = crate::builtins::builtin_float(&[w_value]).map_err(|error| {
+        let seconds = crate::baseobjspace::float_w(w_value).map_err(|error| {
             if error.kind == crate::PyErrorKind::OverflowError {
                 time_t_overflow()
             } else {
-                crate::PyError::type_error(format!(
-                    "argument must be int or float, not {}",
-                    crate::type_methods::arg_type_name(w_value)
-                ))
+                error
             }
         })?;
-        let seconds = unsafe { pyre_object::w_float_get_value(w_float) };
         if seconds.is_nan() {
             return Err(crate::PyError::value_error(
                 "Invalid value NaN (not a number)",

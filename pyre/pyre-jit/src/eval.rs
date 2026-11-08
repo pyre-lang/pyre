@@ -5684,10 +5684,10 @@ fn walk_guard_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 ///
 /// This is presently latent rather than a live fix: the per-kind instances are
 /// materialized lazily by the `_ovf` direct-raise resolver, which the current
-/// walker-driven pipeline never reaches, and the MemoryError singleton is
-/// created only on an allocation failure. The enumeration reports only
-/// initialized slots, so with none created the walk costs a handful of
-/// `OnceLock` reads and visits nothing.
+/// walker-driven pipeline never reaches. The MemoryError singleton is
+/// created when `MemoryError` is registered (`install_default_builtins`).
+/// The enumeration reports only initialized slots, so with none created the
+/// walk costs a handful of `OnceLock` reads and visits nothing.
 fn walk_immortal_exception_singleton_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     pyre_object::interp_exceptions::for_each_immortal_exception_singleton(|exc| unsafe {
         pyre_interpreter::eval::walk_raw_exception_roots(exc, visitor)

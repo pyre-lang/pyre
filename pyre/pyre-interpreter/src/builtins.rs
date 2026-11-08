@@ -4516,6 +4516,10 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
     pyre_object::with_roots!(base_exc, exception, os_error, runtime_error => {
         crate::__pyre_store!(ns, "MemoryError", exc_type);
     });
+    // compile.py `memory_error = MemoryError()`: the singleton is a
+    // translation-time prebuilt. Materialize it now so a later MiniMark
+    // max-heap breach does not `malloc_typed` + `handle_alloc_error`.
+    let _ = pyre_object::interp_exceptions::memory_error_singleton();
     let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, os_error, runtime_error =>
         make_exc_type_with_doc(
             "ReferenceError",
