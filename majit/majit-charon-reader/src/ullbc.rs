@@ -1614,7 +1614,8 @@ impl TypeLayout {
     /// representation there: `get_type_flag` would route `i128` through its
     /// unknown-type fallback and describe a sixteen-byte integer as an
     /// eight-byte GC reference. Declining keeps the caller on its existing
-    /// no-discriminator path instead.
+    /// no-discriminator path instead. Pointer-width tags (`Isize`/`Usize`)
+    /// spell as `isize`/`usize`, the same field-type bank as `i64`/`u64`.
     pub fn discriminant_int_type(&self) -> Option<&'static str> {
         let int_ty = self.discriminator.as_ref()?.get("Branch")?.get("int_ty")?;
         let (signed, width) = if let Some(width) = int_ty.get("Signed") {
@@ -1627,10 +1628,12 @@ impl TypeLayout {
             (true, "I16") => Some("i16"),
             (true, "I32") => Some("i32"),
             (true, "I64") => Some("i64"),
+            (true, "Isize") => Some("isize"),
             (false, "U8") => Some("u8"),
             (false, "U16") => Some("u16"),
             (false, "U32") => Some("u32"),
             (false, "U64") => Some("u64"),
+            (false, "Usize") => Some("usize"),
             _ => None,
         }
     }
@@ -4714,6 +4717,8 @@ mod tests {
             (r#"{"Signed":"I16"}"#, Some("i16")),
             (r#"{"Signed":"I32"}"#, Some("i32")),
             (r#"{"Unsigned":"U64"}"#, Some("u64")),
+            (r#"{"Signed":"Isize"}"#, Some("isize")),
+            (r#"{"Unsigned":"Usize"}"#, Some("usize")),
             // Wider than a machine word: no int-bank field type spells it.
             (r#"{"Signed":"I128"}"#, None),
             (r#"{"Unsigned":"U128"}"#, None),

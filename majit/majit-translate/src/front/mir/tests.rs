@@ -8913,6 +8913,46 @@ fn clone_lookalike_path_stays_residual() {
     );
 }
 
+#[test]
+fn nonnull_new_unchecked_is_identity_not_a_host_call() {
+    let ptr_ty = serde_json::json!({
+        "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]
+    });
+    let llbc = std_extern_call_fixture(
+        "nonnull_new_unchecked",
+        &["core", "ptr", "non_null", "NonNull", "new_unchecked"],
+        &[ptr_ty.clone()],
+        ptr_ty,
+    );
+    let graph = crate::test_support::lower_function(&llbc, "nonnull_new_unchecked")
+        .expect("lower NonNull::new_unchecked");
+    let ops = graph_ops(&graph);
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "new_unchecked"),
+        "NonNull::new_unchecked must not residualize as a host call; ops={ops:?}"
+    );
+}
+
+#[test]
+fn nonnull_as_ptr_is_identity_not_a_host_call() {
+    let ptr_ty = serde_json::json!({
+        "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]
+    });
+    let llbc = std_extern_call_fixture(
+        "nonnull_as_ptr",
+        &["core", "ptr", "non_null", "NonNull", "as_ptr"],
+        &[ptr_ty.clone()],
+        ptr_ty,
+    );
+    let graph = crate::test_support::lower_function(&llbc, "nonnull_as_ptr")
+        .expect("lower NonNull::as_ptr");
+    let ops = graph_ops(&graph);
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "as_ptr"),
+        "NonNull::as_ptr must not residualize as a host call; ops={ops:?}"
+    );
+}
+
 pub(in crate::front::mir) fn named_adt(
     id: u64,
     types: Vec<serde_json::Value>,
@@ -19803,7 +19843,7 @@ fn call_method_ok_payload_narrows_to_the_instance_class() {
 /// arm, so the resulting graph directly exposes whether the classifier
 /// chose aggregate construction or the nullable-pointer identities.
 fn lower_option_source_with_payload(payload: serde_json::Value) -> FunctionGraph {
-    lower_option_fn_retyped("option_source", payload, false, false, false, None)
+    lower_option_fn_retyped("option_source", payload, false, false, false, None, false)
 }
 
 fn lower_option_source_with_payload_ext(
@@ -19817,11 +19857,16 @@ fn lower_option_source_with_payload_ext(
         inject_layoutless_nominal,
         false,
         None,
+        false,
     )
 }
 
 fn lower_option_source_with_aliased_payload(payload: serde_json::Value) -> FunctionGraph {
-    lower_option_fn_retyped("option_source", payload, true, false, false, None)
+    lower_option_fn_retyped("option_source", payload, true, false, false, None, false)
+}
+
+fn lower_option_source_with_transparent_newtype(field: serde_json::Value) -> FunctionGraph {
+    lower_option_fn_retyped("option_source", field, false, false, false, None, true)
 }
 
 fn lower_option_fn_retyped(
@@ -19831,6 +19876,7 @@ fn lower_option_fn_retyped(
     inject_layoutless_nominal: bool,
     inject_string: bool,
     option_layout_size: Option<u64>,
+    wrap_transparent_newtype: bool,
 ) -> FunctionGraph {
     fn replace_dedup(
         value: &mut serde_json::Value,
@@ -20046,6 +20092,147 @@ fn lower_option_fn_retyped(
         payload = serde_json::json!({
             "Adt": {
                 "id": hole,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+    }
+    if wrap_transparent_newtype {
+        let decls = translated
+            .get_mut("type_decls")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("corpus type_decls");
+        let occupy = |decls: &mut Vec<serde_json::Value>| -> usize {
+            if let Some(hole) = decls.iter().position(serde_json::Value::is_null) {
+                hole
+            } else {
+                let id = decls.len();
+                decls.push(serde_json::Value::Null);
+                id
+            }
+        };
+        let is_non_null_decl = |decl: &serde_json::Value| -> bool {
+            let Some(names) = decl
+                .get("item_meta")
+                .and_then(|meta| meta.get("name"))
+                .and_then(serde_json::Value::as_array)
+            else {
+                return false;
+            };
+            let path: Vec<&str> = names
+                .iter()
+                .filter_map(|seg| seg.get("Ident")?.get(0)?.as_str())
+                .collect();
+            path == ["core", "ptr", "non_null", "NonNull"]
+        };
+        let existing_non_null = decls.iter().find_map(|decl| {
+            is_non_null_decl(decl)
+                .then(|| decl.get("def_id")?.as_u64())
+                .flatten()
+        });
+        let payload_is_generic_adt = payload
+            .get("Adt")
+            .and_then(|adt| adt.get("generics")?.get("types")?.as_array())
+            .is_some_and(|types| !types.is_empty());
+        // Dummy Adt-id 4 with a type argument is the NonNull stand-in
+        // (`non_null_payload`). Do not retarget a different generic
+        // (Box, Vec) onto NonNull.
+        let payload_adt_id = payload
+            .get("Adt")
+            .and_then(|adt| adt.get("id"))
+            .and_then(serde_json::Value::as_u64);
+        if payload_is_generic_adt && payload_adt_id == Some(4) {
+            let non_null_id = if let Some(id) = existing_non_null {
+                id
+            } else {
+                let id = occupy(decls) as u64;
+                let mut nn = decls
+                    .iter()
+                    .find(|decl| decl.get("def_id").and_then(serde_json::Value::as_u64) == Some(5))
+                    .expect("sized nominal def-id 5")
+                    .clone();
+                nn["def_id"] = serde_json::json!(id);
+                if let Some(meta) = nn.get_mut("item_meta").and_then(|m| m.as_object_mut()) {
+                    meta.insert(
+                        "name".to_string(),
+                        serde_json::json!([
+                            {"Ident": ["core", 0]},
+                            {"Ident": ["ptr", 0]},
+                            {"Ident": ["non_null", 0]},
+                            {"Ident": ["NonNull", 0]}
+                        ]),
+                    );
+                }
+                // rustc `NonNull<T>` is `repr(transparent)` over `*const T`.
+                nn["kind"] = serde_json::json!({
+                    "Struct": [{
+                        "name": "_0",
+                        "is_positional": true,
+                        "ty": {
+                            "RawPtr": [
+                                {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                                "Const"
+                            ]
+                        }
+                    }]
+                });
+                nn["layout"] = serde_json::json!([{
+                    "key": "",
+                    "value": {
+                        "size": 8,
+                        "align": 8,
+                        "variant_layouts": [{"field_offsets": [0]}],
+                        "repr": {"transparent": true}
+                    }
+                }]);
+                decls[id as usize] = nn;
+                id
+            };
+            if let Some(adt) = payload.get_mut("Adt").and_then(|a| a.as_object_mut()) {
+                adt.insert("id".to_string(), serde_json::json!(non_null_id));
+            }
+        }
+        let wrapper_id = occupy(decls);
+        let template = decls
+            .iter()
+            .find(|decl| decl.get("def_id").and_then(serde_json::Value::as_u64) == Some(5))
+            .expect("sized nominal def-id 5")
+            .clone();
+        let mut wrapper = template;
+        wrapper["def_id"] = serde_json::json!(wrapper_id);
+        if let Some(meta) = wrapper.get_mut("item_meta").and_then(|m| m.as_object_mut()) {
+            meta.insert(
+                "name".to_string(),
+                serde_json::json!([
+                    {"Ident": ["charon_corpus", 0]},
+                    {"Ident": ["TransparentHandle", 0]}
+                ]),
+            );
+        }
+        wrapper["kind"] = serde_json::json!({
+            "Struct": [{
+                "name": "_0",
+                "is_positional": true,
+                "ty": payload.clone()
+            }]
+        });
+        wrapper["layout"] = serde_json::json!([{
+            "key": "",
+            "value": {
+                "size": 8,
+                "align": 8,
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"transparent": true}
+            }
+        }]);
+        decls[wrapper_id] = wrapper;
+        payload = serde_json::json!({
+            "Adt": {
+                "id": wrapper_id,
                 "generics": {
                     "regions": [],
                     "types": [],
@@ -21158,7 +21345,8 @@ fn option_object_ref_none_match_and_try_lowers_to_niche_null_not_void_constnone(
     // record; `option_source` constructs `None` so that dest hits
     // `aggregate_shape`.
     for (fn_name, layout) in [("option_source", None), ("option_source", Some(0u64))] {
-        let graph = lower_option_fn_retyped(fn_name, payload.clone(), false, false, false, layout);
+        let graph =
+            lower_option_fn_retyped(fn_name, payload.clone(), false, false, false, layout, false);
         let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
         let as_value = const_none_link_args(&graph);
         assert!(
@@ -21176,7 +21364,15 @@ fn option_object_ref_none_match_and_try_lowers_to_niche_null_not_void_constnone(
              (NoneRepr leak), got {as_value:?}"
         );
     }
-    let graph = lower_option_fn_retyped("option_question_mark", payload, false, false, false, None);
+    let graph = lower_option_fn_retyped(
+        "option_question_mark",
+        payload,
+        false,
+        false,
+        false,
+        None,
+        false,
+    );
     let (_null_muts, transparent_ctors) = niche_ctor_shape(&graph);
     let as_value = const_none_link_args(&graph);
     let from_residuals = option_core_leaf_call_count(&graph, "from_residual");
@@ -23263,6 +23459,63 @@ fn niche_option_non_niche_payloads_remain_aggregate() {
     }
 }
 
+fn non_null_payload() -> serde_json::Value {
+    // Adt id is rewritten onto `core::ptr::non_null::NonNull` when the
+    // transparent wrapper is injected (`wrap_transparent_newtype`).
+    serde_json::json!({
+        "Adt": {
+            "id": 4,
+            "generics": {
+                "regions": [],
+                "types": [{
+                    "Adt": {
+                        "id": 4,
+                        "generics": {
+                            "regions": [], "types": [],
+                            "const_generics": [], "trait_refs": []
+                        }
+                    }
+                }],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    })
+}
+
+/// `Option<Newtype(NonNull<T>)>` is rustc's pointer niche: `None` is
+/// `null_mut()`, `Some` is the payload, discriminant is a pointer
+/// compare, no `SyntheticTransparentCtor`.
+#[test]
+fn niche_option_transparent_newtype_over_non_null_is_null() {
+    let graph = lower_option_source_with_transparent_newtype(non_null_payload());
+    let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+    assert!(
+        null_muts >= 1,
+        "Option<Newtype(NonNull<T>)>::None is push_niche_null_ptr, got {null_muts}"
+    );
+    assert_eq!(
+        transparent_ctors, 0,
+        "no SyntheticTransparentCtor None/Some for Option<Newtype(NonNull<T>)>"
+    );
+}
+
+/// A `repr(transparent)` newtype over a raw pointer has no rustc niche
+/// (`Some(null)` is distinct from `None`), so the Option stays tagged.
+#[test]
+fn niche_option_transparent_newtype_over_raw_ptr_stays_tagged() {
+    let graph = lower_option_source_with_transparent_newtype(object_ref_payload());
+    let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+    assert_eq!(
+        null_muts, 0,
+        "Option<Newtype(*mut T)> must not collapse None to the payload null word"
+    );
+    assert!(
+        transparent_ctors >= 2,
+        "Option<Newtype(*mut T)> must retain the tagged Some and None aggregates"
+    );
+}
+
 /// `option_question_mark` with a String payload: Option `?` is a regular
 /// call of the extracted `branch` body plus a ControlFlow discriminant
 /// switch. The rewrite used to inline a niche null-test (`null_muts >= 1`,
@@ -23278,6 +23531,7 @@ fn niche_option_string_match_is_none_identity() {
         false,
         true,
         None,
+        false,
     );
     assert_eq!(
         option_core_leaf_call_count(&graph, "branch"),

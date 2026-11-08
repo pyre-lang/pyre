@@ -79,7 +79,7 @@ impl<T> ResidualRet for *mut T {}
 impl ResidualSlot for pyre_object::identitydict::IdentityKey {}
 impl ResidualSlot for pyre_object::dictmultiobject::BytesKey {}
 impl ResidualSlot for pyre_object::celldict::StrKey {}
-/// `PyError` is `#[repr(transparent)]` over `PyObjectRef` — one `'r'` word.
+/// `PyError` is `#[repr(transparent)]` over `NonNull<PyObject>` — one `'r'` word.
 impl ResidualSlot for crate::PyError {}
 
 /// Word-ABI bridges for the three shadow-stack operations `eval::FrameAnchor`
@@ -912,10 +912,10 @@ pub mod word_publish {
         type Reg = i64;
         const IS_WORD: bool = false;
         fn from_reg(reg: i64) -> Self {
-            Self(reg as usize as pyre_object::PyObjectRef)
+            crate::PyError::from_raw(reg as usize as pyre_object::PyObjectRef)
         }
         fn into_reg(self) -> i64 {
-            self.0 as usize as i64
+            self.as_raw() as usize as i64
         }
     }
 

@@ -2109,9 +2109,51 @@ impl Bookkeeper {
     /// str-family pointee. GC instance-ness is the pointee's harvested
     /// layout gckind (`lltype.py` `Struct._first_struct`), never the
     /// spelling. No layouts answers not-GC for the instance arm.
+    /// A by-value one-field rustc pointer-niche payload is reconstructed
+    /// from the owner's declared field row.
     pub fn is_niche_option_gc_payload_spelling(&self, ty: &str) -> bool {
+        {
+            let layouts = self.struct_layouts.borrow();
+            if crate::front::mir::is_niche_option_gc_payload_spelling(ty, layouts.as_ref()) {
+                return true;
+            }
+        }
+        let Some(inner) = majit_ir::descr::option_payload_spelling(ty.trim()) else {
+            return false;
+        };
+        if inner.starts_with("*mut ")
+            || inner.starts_with("*const ")
+            || inner.starts_with('&')
+            || crate::front::mir::is_rustc_pointer_niche_spelling(inner)
+        {
+            return false;
+        }
+        let Some(row_ty) = self.niche_option_one_field_pointer_payload(inner) else {
+            return false;
+        };
         let layouts = self.struct_layouts.borrow();
-        crate::front::mir::is_niche_option_gc_payload_spelling(ty, layouts.as_ref())
+        crate::front::mir::is_niche_option_gc_payload_spelling(
+            &format!("Option<{}>", row_ty.trim()),
+            layouts.as_ref(),
+        )
+    }
+
+    /// Stamp `registered_gc_ptr_payload_root` peels one
+    /// `#[repr(transparent)]` rustc pointer-niche field so a by-value
+    /// `Option` of that newtype is the nullable GC word. Intern
+    /// reconstructs that from the payload's declared field row.
+    /// `rclass.py` `InstanceRepr.convert_const(None)` is `null_instance`.
+    fn niche_option_one_field_pointer_payload(&self, inner: &str) -> Option<String> {
+        let key = self.intern_class_key(inner);
+        let row_ty = {
+            let guard = self.struct_fields.borrow();
+            let rows = guard.as_ref()?.fields.get(&key)?;
+            if rows.len() != 1 {
+                return None;
+            }
+            rows[0].ty.clone()
+        };
+        crate::front::mir::is_rustc_pointer_niche_spelling(&row_ty).then_some(row_ty)
     }
 
     /// Intern of a by-value payload of type `ty`.
@@ -9877,6 +9919,89 @@ mod tests {
             s_none(),
             "Option of an unregistered payload is s_None"
         );
+    }
+
+    fn bk_with_owner_rows_and_pointee_layout(
+        owner: &str,
+        rows: Vec<crate::front::semantic::FieldRow>,
+        pointee: &str,
+        gc: bool,
+    ) -> (Rc<Bookkeeper>, parking_lot::MutexGuard<'static, ()>) {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(owner.to_string(), rows);
+        bk.set_struct_fields(Rc::new(reg));
+        let (layouts, ids) = if gc {
+            crate::test_support::gc_layout_table_for(&[pointee])
+        } else {
+            crate::test_support::raw_layout_table_for(&[pointee])
+        };
+        bk.set_struct_layouts(layouts);
+        (bk, ids)
+    }
+
+    #[test]
+    fn niche_option_one_field_pointer_payload_is_gc() {
+        let owner = "error::PyError";
+        let (bk, _ids) = bk_with_owner_rows_and_pointee_layout(
+            owner,
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0",
+                "NonNull<object::PyObject>",
+            )],
+            "object::PyObject",
+            true,
+        );
+        assert!(bk.is_niche_option_gc_payload_spelling("Option<error::PyError>"));
+    }
+
+    #[test]
+    fn niche_option_one_field_raw_ptr_payload_is_not_gc() {
+        let owner = "error::PyError";
+        let (bk, _ids) = bk_with_owner_rows_and_pointee_layout(
+            owner,
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0",
+                "*mut object::PyObject",
+            )],
+            "object::PyObject",
+            true,
+        );
+        assert!(!bk.is_niche_option_gc_payload_spelling("Option<error::PyError>"));
+    }
+
+    #[test]
+    fn niche_option_two_field_owner_is_not_gc() {
+        let owner = "error::PyError";
+        let (bk, _ids) = bk_with_owner_rows_and_pointee_layout(
+            owner,
+            vec![
+                crate::front::semantic::FieldRow::positional(
+                    "__pos_0",
+                    "NonNull<object::PyObject>",
+                ),
+                crate::front::semantic::FieldRow::named("extra", "i64"),
+            ],
+            "object::PyObject",
+            true,
+        );
+        assert!(!bk.is_niche_option_gc_payload_spelling("Option<error::PyError>"));
+    }
+
+    #[test]
+    fn niche_option_one_field_pointer_payload_raw_layout_is_not_gc() {
+        let owner = "error::PyError";
+        let (bk, _ids) = bk_with_owner_rows_and_pointee_layout(
+            owner,
+            vec![crate::front::semantic::FieldRow::positional(
+                "__pos_0",
+                "NonNull<object::PyObject>",
+            )],
+            "object::PyObject",
+            false,
+        );
+        assert!(!bk.is_niche_option_gc_payload_spelling("Option<error::PyError>"));
     }
 
     #[test]

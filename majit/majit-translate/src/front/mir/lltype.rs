@@ -4620,11 +4620,11 @@ pub(in crate::front::mir) fn discr_int_ty_raw_store(
         "i8" => (ValueType::Int, 1, true),
         "i16" => (ValueType::Int, 2, true),
         "i32" => (ValueType::Int, 4, true),
-        "i64" => (ValueType::Int, 8, true),
+        "i64" | "isize" => (ValueType::Int, 8, true),
         "u8" => (ValueType::Unsigned, 1, false),
         "u16" => (ValueType::Unsigned, 2, false),
         "u32" => (ValueType::Unsigned, 4, false),
-        "u64" => (ValueType::Unsigned, 8, false),
+        "u64" | "usize" => (ValueType::Unsigned, 8, false),
         _ => return None,
     })
 }
@@ -5838,6 +5838,21 @@ fn peel_niche_option_payload_pointer(inner: &str) -> (bool, &str) {
     (false, inner)
 }
 
+/// The spelling-side twin of [`type_node_is_rustc_pointer_niche`].
+/// True when rustc can niche `Option` over this payload: a reference
+/// (`&T` / `&mut T`) or a `NonNull` / `Box` / `Arc` / `Rc` with generic
+/// args. A raw `*mut T` / `*const T` has no invalid bit-pattern.
+pub(crate) fn is_rustc_pointer_niche_spelling(ty: &str) -> bool {
+    let ty = ty.trim();
+    if ty.starts_with('&') {
+        return true;
+    }
+    let leaf = majit_ir::descr::class_root_leaf(ty);
+    let name = leaf.split('<').next().unwrap_or(leaf);
+    matches!(name, "NonNull" | "Box" | "Arc" | "Rc")
+        && majit_ir::descr::generic_args_span(leaf).is_some()
+}
+
 /// Pointer-niche payload pointee after every `*mut` / `&` / `NonNull`
 /// wrapper. `is_ptr` is true when at least one wrapper was a pointer.
 /// A type-alias leaf that the stamp did not resolve is not a pointer;
@@ -5938,9 +5953,13 @@ fn type_node_is_declared_classed_adt(node: &serde_json::Value, llbc: &Llbc) -> b
 /// noneified Instance: classed Instance ∪ Ptr is a UnionError). A GC
 /// instance pointer is `model.py` `SomeInstance.noneify` via
 /// [`registered_gc_ptr_class_root_with`] when the pointee is in
-/// `gc_struct_ids`. Intern reconstructs that from the class-root
-/// spelling with the pointee's layout gckind
-/// ([`is_niche_option_gc_payload_spelling`]). Decide by the
+/// `gc_struct_ids`, including after one transparent rustc pointer-niche
+/// peel ([`registered_gc_ptr_payload_root`]). Intern reconstructs that
+/// from the class-root spelling with the pointee's layout gckind
+/// ([`is_niche_option_gc_payload_spelling`]). The one-field pointer-niche
+/// peel is reconstructed by
+/// [`crate::annotator::bookkeeper::Bookkeeper::is_niche_option_gc_payload_spelling`]
+/// from the payload's declared field row. Decide by the
 /// substituted payload's declaration, never the graph name.
 pub(in crate::front::mir) fn tyref_niche_option_gc_payload_spelling(
     ty: &TyRef,
@@ -6061,9 +6080,30 @@ fn registered_gc_ptr_payload_root(
         return Some(root);
     }
     let node = tyref_node(payload, llbc)?;
-    let pointee = type_node_shared_ref_pointee(node, llbc)?;
+    if let Some(pointee) = type_node_shared_ref_pointee(node, llbc)
+        && let Some(root) = registered_gc_ptr_class_root_with(
+            &TyRef::Other(pointee.clone()),
+            llbc,
+            tomb,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        )
+    {
+        return Some(root);
+    }
+    // Peel one `#[repr(transparent)]` rustc pointer-niche field
+    // (`tyref_is_niche_option` uses the same one-peel rule).
+    // `one_level_pointer_pointee` sees `NonNull` / `&` / thin Box, not a
+    // newtype of one; the field is that pointer, and
+    // `registered_gc_ptr_class_root_with` reads the GC pointee.
+    // `rclass.py` `InstanceRepr.convert_const(None)` is `null_instance`.
+    let node = type_node_peel_aliases(node, llbc)?;
+    let field = type_node_peel_one_transparent_field(node, llbc)?;
+    if !type_node_is_rustc_pointer_niche(&field, llbc) {
+        return None;
+    }
     registered_gc_ptr_class_root_with(
-        &TyRef::Other(pointee.clone()),
+        &TyRef::Other(field),
         llbc,
         tomb,
         gc_struct_ids,
@@ -7471,6 +7511,79 @@ pub(in crate::front::mir) fn tyref_transparent_nonzst_field(
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let decl = llbc.type_by_id(adt_node_def_id(node)?)?;
     transparent_nonzst_field(decl, llbc)
+}
+
+/// The unique non-ZST field of a `#[repr(transparent)]` struct, as a type
+/// node. One peel only: a nested transparent wrapper is left for the
+/// caller to re-test with rustc's pointer-niche rules.
+fn type_node_peel_one_transparent_field(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<serde_json::Value> {
+    let td = llbc.type_by_id(adt_node_def_id(node)?)?;
+    let (index, _) = transparent_nonzst_field(td, llbc)?;
+    let TypeDeclKind::Struct(fields) = &td.kind else {
+        return None;
+    };
+    let field = fields.get(index)?;
+    let field_ty =
+        substitute_spill_typevars(&field.ty, node, llbc).unwrap_or_else(|| clone_tyref(&field.ty));
+    tyref_node(&field_ty, llbc).cloned()
+}
+
+/// Types rustc actually niches `Option` over: `NonNull`, `&T`, `&mut T`,
+/// thin `Box`/`Arc`/`Rc`, fn pointer. A raw `*mut T` has no niche, so a
+/// newtype over one must not be admitted.
+fn type_node_is_rustc_pointer_niche(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    let Some(node) = type_node_peel_aliases(node, llbc) else {
+        return false;
+    };
+    if type_node_is_mut_ref(node, llbc)
+        || type_node_is_thin_box(node, llbc)
+        || type_node_is_thin_arc_or_rc(node, llbc)
+        || type_node_is_fn_ptr(node, llbc)
+    {
+        return true;
+    }
+    if let Some(shared_pointee) = type_node_shared_ref_pointee(node, llbc) {
+        let Some(stripped) = strip_ty_wrappers(shared_pointee, llbc) else {
+            return false;
+        };
+        if tyref_is_bare_u8_slice(&TyRef::Other(stripped.clone()), llbc) {
+            return false;
+        }
+        if type_node_raw_ptr_pointee(stripped, llbc).is_some() {
+            return true;
+        }
+        if let Some(def_id) = adt_node_def_id(stripped)
+            && llbc.type_by_id(def_id).is_some_and(|td| {
+                let target = std::env::var("TARGET").unwrap_or_default();
+                match td.layout_for_target(llbc, &target).and_then(|l| l.size) {
+                    Some(_) => true,
+                    None => type_decl_is_sized_pointee(td, llbc, 0),
+                }
+            })
+        {
+            return true;
+        }
+    }
+    let Some(stripped) = strip_ty_wrappers(node, llbc) else {
+        return false;
+    };
+    let Some(def_id) = adt_node_def_id(stripped) else {
+        return false;
+    };
+    match llbc
+        .type_by_id(def_id)
+        .map(|td| td.item_meta.name_path())
+        .as_deref()
+    {
+        Some("core::ptr::non_null::NonNull") => true,
+        Some("alloc::vec::Vec") => {
+            tyref_rust_vec_item_kind(&TyRef::Other(stripped.clone()), llbc).is_none()
+        }
+        _ => false,
+    }
 }
 
 /// Unique sized field of a one-word std handle that is not
@@ -9914,6 +10027,21 @@ pub(in crate::front::mir) fn tyref_is_niche_option(ty: &TyRef, llbc: &Llbc) -> b
     // `Option<PathBuf>` is that same projection (`rpath.py`
     // `_posix_rnormpath` `s_Str0`).
     if tyref_is_string_or_os_path_family(&TyRef::Other(payload.clone()), llbc) {
+        return true;
+    }
+    // Peel one `#[repr(transparent)]` single-field struct so
+    // `Option<Newtype(NonNull<T>)>` inherits NonNull's null niche.
+    // rustc niches that Option (`None` = null, `Some` = the pointer);
+    // it does not niche `Option<Newtype(*mut T)>` (a raw pointer has
+    // no invalid bit-pattern). Re-test the field with the rustc-niche
+    // rules already used above (`NonNull`, `&T`, `&mut T`, thin
+    // `Box`/`Arc`/`Rc`, fn pointer). Do not re-run the raw-pointer
+    // arms: that would admit a newtype over `*mut T` / `PyObjectRef`.
+    // rclass.py InstanceRepr.convert_const(None) = null_instance;
+    // rnone.py rtype_is_None = ptr_iszero.
+    if let Some(field) = type_node_peel_one_transparent_field(payload, llbc)
+        && type_node_is_rustc_pointer_niche(&field, llbc)
+    {
         return true;
     }
     let Some(def_id) = adt_node_def_id(payload) else {
@@ -13483,6 +13611,7 @@ fn intern_fieldless_enum_int_ty(int_ty: &str) -> String {
         "u16" => "i16",
         "u32" => "i32",
         "u64" => "i64",
+        "usize" => "isize",
         other => other,
     }
     .to_string()

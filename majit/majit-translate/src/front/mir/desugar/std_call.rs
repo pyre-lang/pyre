@@ -8730,6 +8730,8 @@ impl<'a> Lowering<'a> {
     ///   represents `None` as null and `Some(p)` as the pointer, so the
     ///   constructed value *is* `p`.  Gated on the destination being that
     ///   niche `Option<NonNull>` (`tyref_is_niche_option_ptr`).
+    /// - `NonNull::new_unchecked(p) -> NonNull<T>` — the same word as `p`.
+    ///   RPython has no `NonNull`; this is `same_as` / `cast_pointer`.
     /// - `NonNull::as_ptr(self) -> *mut T` — reads the pointer back out, which
     ///   is the receiver itself.
     ///
@@ -8750,7 +8752,9 @@ impl<'a> Lowering<'a> {
         {
             return Some(arg.clone());
         }
-        if fmt_path_ends_with(segments, &["non_null", "NonNull", "as_ptr"]) {
+        if fmt_path_ends_with(segments, &["non_null", "NonNull", "new_unchecked"])
+            || fmt_path_ends_with(segments, &["non_null", "NonNull", "as_ptr"])
+        {
             return Some(arg.clone());
         }
         None

@@ -2,13 +2,14 @@ use super::{
     adt_def_is_raw_storage, adt_field_read_value_type, charon_type_value_to_ast_string,
     charon_type_value_to_enum_arg, dont_look_inside_return_token, field_ty_is_raw_word,
     is_niche_option_gc_payload_spelling, is_oparg_newtype_spelling, is_os_path_family_root,
-    is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration, is_str_family_class_root,
-    json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, no_immutable_fields,
-    no_tombstoned_leaves, payload_tuple_suffix, raw_field_address_value_type,
-    raw_ptr_pointee_is_non_adt_spelling, shaped_array_parts, type_decl_is_closure_env,
-    tyref_array_suffix, tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root,
-    tyref_is_closure_env, tyref_is_gcref_spelling, tyref_is_ptr_to_int_cast_origin,
-    tyref_is_raw_byte_ptr, tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_is_void_zst,
+    is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration,
+    is_rustc_pointer_niche_spelling, is_str_family_class_root, json_ty_is_thin_pointer_element,
+    json_ty_scalar_element_spelling, no_immutable_fields, no_tombstoned_leaves,
+    payload_tuple_suffix, raw_field_address_value_type, raw_ptr_pointee_is_non_adt_spelling,
+    shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
+    tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root, tyref_is_closure_env,
+    tyref_is_gcref_spelling, tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr,
+    tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_is_void_zst,
     tyref_niche_option_gc_payload_spelling, tyref_positional_aggregate_root,
     tyref_ptr_pointee_is_vec, tyref_raw_ptr_to_classed_instance_spelling,
     tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
@@ -382,6 +383,29 @@ fn niche_option_gc_payload_spelling_is_option_of_instance_or_string() {
     assert!(!intern("Option<pyobject::PyObject>"));
     assert!(!intern("Option<W_BufferedReader>"));
     assert!(!intern("Option<*mut u8>"));
+}
+
+#[test]
+fn is_rustc_pointer_niche_spelling_matches_rustc_option_niche() {
+    assert!(is_rustc_pointer_niche_spelling("&T"));
+    assert!(is_rustc_pointer_niche_spelling("&mut T"));
+    assert!(is_rustc_pointer_niche_spelling("NonNull<object::PyObject>"));
+    assert!(is_rustc_pointer_niche_spelling(
+        "core::ptr::non_null::NonNull<object::PyObject>"
+    ));
+    assert!(is_rustc_pointer_niche_spelling("Box<T>"));
+    assert!(is_rustc_pointer_niche_spelling("alloc::boxed::Box<T>"));
+    assert!(is_rustc_pointer_niche_spelling("Arc<T>"));
+    assert!(is_rustc_pointer_niche_spelling("Rc<T>"));
+    assert!(!is_rustc_pointer_niche_spelling("*mut object::PyObject"));
+    assert!(!is_rustc_pointer_niche_spelling("*const object::PyObject"));
+    assert!(!is_rustc_pointer_niche_spelling("error::PyError"));
+    assert!(!is_rustc_pointer_niche_spelling("i64"));
+    assert!(!is_rustc_pointer_niche_spelling("Box"));
+    assert!(!is_rustc_pointer_niche_spelling("fn()"));
+    assert!(!is_rustc_pointer_niche_spelling(
+        "Option<NonNull<object::PyObject>>"
+    ));
 }
 
 /// `node_is_string_value` identifies the rstr `STR` layout set by
@@ -4321,6 +4345,135 @@ fn a_shelled_variant_carries_the_inherited_discriminant_as_its_first_row() {
         .field_offsets;
     assert_eq!(offsets.get("__discriminant"), Some(&0));
     assert_eq!(offsets.get("loop_header_pc"), Some(&8));
+}
+
+/// A pointer-niche payload enum (`CodePageFail { NoTranslation, Os(PyError) }`
+/// with `PyError = NonNull<PyObject>`) records its tag as `Branch.int_ty =
+/// Isize`. That width has a field-type spelling, so the base registers
+/// `__discriminant` and the payload at byte 0 seats on the tag — the same
+/// explicit shell a missing layout takes.
+#[test]
+fn a_pointer_niche_payload_enum_takes_the_explicit_shell() {
+    let span = || {
+        serde_json::json!({"data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 1}
+        }})
+    };
+    let item_meta = |name: &str| {
+        serde_json::json!({
+            "name": [
+                {"Ident": ["fixture", 0]},
+                {"Ident": [name, 0]}
+            ],
+            "span": span(),
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": true
+        })
+    };
+    let ptr_field = |name: &str| {
+        serde_json::json!({
+            "name": name,
+            "ty": {"RawPtr": [
+                {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                "Mut"
+            ]},
+            "attr_info": null
+        })
+    };
+    let variant = |name: &str, fields: Vec<serde_json::Value>, discriminant: u64| {
+        serde_json::json!({
+            "name": name,
+            "fields": fields,
+            "discriminant": {"Scalar": {"Unsigned": ["U8", discriminant.to_string()]}}
+        })
+    };
+    let fail = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta("Fail"),
+        "kind": {"Enum": [
+            variant("NoTranslation", vec![], 0),
+            variant("Os", vec![ptr_field("os")], 1)
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 8,
+                "align": 8,
+                "discriminator": {"Branch": {
+                    "offset": 0,
+                    "int_ty": {"Signed": "Isize"},
+                    "children": [[{"start": 0, "end": 0}, {"Known": 0}]],
+                    "fallback": {"Known": 1}
+                }},
+                "variant_layouts": [
+                    {"field_offsets": []},
+                    {"field_offsets": [0]}
+                ],
+                "repr": {"transparent": false}
+            }
+        }]
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [fail],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let (_, _, fields, _, _, _, exact_layouts, _) = super::derive_program_metadata(
+        &llbc,
+        &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
+        &[],
+    );
+
+    assert_eq!(
+        fields.fields.get("fixture::Fail"),
+        Some(&vec![crate::front::semantic::FieldRow::named(
+            "__discriminant",
+            "isize"
+        )]),
+        "the spelled Isize tag is the base's one __discriminant row"
+    );
+
+    let os_rows = fields
+        .fields
+        .get("fixture::Fail::Os")
+        .expect("payload variant registers rows");
+    assert_eq!(
+        os_rows
+            .first()
+            .map(|row| (row.name.as_str(), row.ty.as_str())),
+        Some(("__discriminant", "isize")),
+        "the payload rows must start with the inherited tag, not the pointer field"
+    );
+
+    let variant_sid = majit_ir::descr::StructId::from_canonical("Fail::Os");
+    let offsets = &exact_layouts
+        .get(&variant_sid)
+        .expect("shelled variant registers an exact layout")
+        .field_offsets;
+    assert_eq!(offsets.get("__discriminant"), Some(&0));
+    let payload_off = offsets.get("os").copied();
+    assert!(
+        payload_off.is_some_and(|off| off != 0),
+        "the payload must not alias the tag at byte 0, got {payload_off:?}"
+    );
 }
 
 /// An `ArrayRead` element is addressable two ways: a scalar names its

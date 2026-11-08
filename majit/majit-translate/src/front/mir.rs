@@ -3950,6 +3950,7 @@ fn int_type_byte_width(int_ty: &str) -> u64 {
         "i8" | "u8" => 1,
         "i16" | "u16" => 2,
         "i32" | "u32" => 4,
+        "i64" | "u64" | "isize" | "usize" => 8,
         _ => 8,
     }
 }
@@ -7589,12 +7590,13 @@ pub(crate) use self::lltype::{
     fixed_array_index_identity, fnptr_indirect_enabled, host_rthread_threadlocalref_llop,
     is_flattened_storage_leaf, is_niche_option_gc_payload_spelling, is_oparg_newtype_spelling,
     is_os_path_family_root, is_raw_ptr_to_str_family_spelling, is_rstr_str_family_spelling,
-    is_rstr_str_layout_declaration, is_str_family_class_root, is_str_length_field_class_root,
-    is_str_oopspec_class_root, items_block_accessor_returns_its_block, llbc_exception_class_hints,
-    nonzero_option_zero, output_type_is_objectptr, push_unichr,
-    raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt, seed_program_exception_class_hints,
-    strip_crate_prefix, struct_item_flexible_gcarray_block_annotation, type_decl_ref_adt_id,
-    type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
+    is_rstr_str_layout_declaration, is_rustc_pointer_niche_spelling, is_str_family_class_root,
+    is_str_length_field_class_root, is_str_oopspec_class_root,
+    items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
+    output_type_is_objectptr, push_unichr, raw_ptr_pointee_is_non_adt_spelling, same_nominal_adt,
+    seed_program_exception_class_hints, strip_crate_prefix,
+    struct_item_flexible_gcarray_block_annotation, type_decl_ref_adt_id, type_decl_ref_builtin,
+    type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;
