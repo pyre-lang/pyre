@@ -186,21 +186,16 @@ use crate::pyframe::PyFrame;
 
 /// The payload a suspended frame is resumed with.
 ///
-/// `generator.py _invoke_execute_frame` hands the frame the sent value
-/// and, on `throw()`, the operation error — `pyframe.py
-/// resume_execute_frame` then consumes them.  `throw_args` unpacks the
-/// original three-argument form from `SApplicationException` for a
-/// non-generator delegate.
+/// `generator.py _invoke_execute_frame` hands the frame one
+/// `w_arg_or_err` word — the sent value, or an `SApplicationException`
+/// (`pyframe.py execute_frame` / `resume_execute_frame`). Original
+/// `throw()` arguments for a non-generator delegate live on that object.
 ///
-/// Passed by `&mut` and `take()`n field by field as the resume consumes each
-/// one, so this stays a single pointer in [`EvalFn`]: spreading the three
-/// options across the signature would widen the ABI of every ordinary Python
-/// call, which is the hottest path in the interpreter, for the benefit of the
-/// one caller that resumes a frame.
+/// Passed by `&mut` so this stays a single pointer in [`EvalFn`]: putting
+/// the word in every ordinary Python call would widen the hottest path for
+/// the one caller that resumes a frame.
 pub struct FrameResumeArgs {
-    pub w_inputvalue: Option<PyObjectRef>,
-    pub operr: Option<crate::PyError>,
-    pub throw_args: Option<([PyObjectRef; 3], usize)>,
+    pub w_arg_or_err: PyObjectRef,
 }
 
 type EvalFn = fn(&mut PyFrame, Option<&mut FrameResumeArgs>) -> PyResult;
@@ -6580,7 +6575,7 @@ mod function_call_args_tests {
         let source = "def f(a, b=2, *, c=3):\n    return (a, b, c)\n";
         let code = crate::compile_exec(source).expect("compile");
         let mut frame = crate::pyframe::PyFrame::new(code);
-        frame.execute_frame(None, None).expect("define f");
+        frame.execute_frame(None).expect("define f");
         let w_globals = frame.get_w_globals();
         let f = unsafe { pyre_object::w_dict_getitem_str(w_globals, "f") }.expect("f");
         let w_1 = pyre_object::w_int_new(1);
@@ -6628,7 +6623,7 @@ r = (c.a, c.k)
 ";
         let code = crate::compile_exec(source).expect("compile");
         let mut frame = crate::pyframe::PyFrame::new(code);
-        frame.execute_frame(None, None).expect("construct C");
+        frame.execute_frame(None).expect("construct C");
         let w_globals = frame.get_w_globals();
         let r = unsafe { pyre_object::w_dict_getitem_str(w_globals, "r") }.expect("r");
         unsafe {
@@ -6655,9 +6650,7 @@ mod forgotten_self_hint_tests {
         crate::test_hooks::install_hash_hook();
         let code = crate::compile_exec(source).expect("compile");
         let mut frame = crate::pyframe::PyFrame::new(code);
-        frame
-            .execute_frame(None, None)
-            .expect("forgotten-self snippet");
+        frame.execute_frame(None).expect("forgotten-self snippet");
         frame.get_w_globals()
     }
 
@@ -6853,7 +6846,7 @@ mod call_kw_parse_into_scope_tests {
         let code = crate::compile_exec(source).expect("compile");
         let mut frame = crate::pyframe::PyFrame::new(code);
         frame
-            .execute_frame(None, None)
+            .execute_frame(None)
             .expect("call_kw parse_into_scope snippet");
         frame.get_w_globals()
     }
@@ -7089,7 +7082,7 @@ except TypeError as e:
         let globals = frame.get_w_globals();
         frame.setdictscope(globals, false).expect("setdictscope");
         frame
-            .execute_frame(None, None)
+            .execute_frame(None)
             .expect("call_kw stored signature snippet");
         frame.get_w_globals()
     }

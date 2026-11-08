@@ -2420,22 +2420,17 @@ enum FrameResume {
 /// same transient `gi_yieldfrom is None` state as PyPy.
 fn prepare_frame_resume(
     frame: &mut PyFrame,
-    w_inputvalue: Option<PyObjectRef>,
-    operr: Option<PyError>,
-    throw_args: Option<([PyObjectRef; 3], usize)>,
+    w_arg_or_err: PyObjectRef,
 ) -> Result<FrameResume, PyError> {
-    let mut pending_operr = operr;
     if !frame.w_yielding_from.is_null() {
         let w_yf = frame.w_yielding_from;
         frame.w_yielding_from = pyre_object::PY_NULL;
-        let w_arg = w_inputvalue.unwrap_or_else(pyre_object::w_none);
-        match crate::baseobjspace::resume_yield_from(
-            frame,
-            w_yf,
-            w_arg,
-            pending_operr.take(),
-            throw_args,
-        ) {
+        let w_arg = if w_arg_or_err.is_null() {
+            pyre_object::w_none()
+        } else {
+            w_arg_or_err
+        };
+        match crate::baseobjspace::resume_yield_from(frame, w_yf, w_arg) {
             Ok(Some(value)) => return Ok(FrameResume::Yielded(value)),
             // The delegate's StopIteration value is already on the outer
             // frame stack and its SEND completion target is installed.
@@ -2445,16 +2440,15 @@ fn prepare_frame_resume(
             Err(err) => return Ok(FrameResume::Dispatch(Some(err))),
         }
     }
-    if pending_operr.is_none()
-        && let Some(w_arg_or_err) = w_inputvalue
-    {
-        // `pending_operr` is None on this path. Returning here keeps that
-        // handle out of the live set across `resume_execute_frame`, which
-        // can collect.
-        let _ = frame.resume_execute_frame(w_arg_or_err)?;
-        return Ok(FrameResume::Dispatch(None));
+    if crate::pyopcode::is_s_application_exception(w_arg_or_err) {
+        return Ok(FrameResume::Dispatch(Some(
+            crate::pyopcode::s_application_exception_operr(w_arg_or_err),
+        )));
     }
-    Ok(FrameResume::Dispatch(pending_operr))
+    if !w_arg_or_err.is_null() {
+        let _ = frame.resume_execute_frame(w_arg_or_err)?;
+    }
+    Ok(FrameResume::Dispatch(None))
 }
 
 /// Seed a suspended frame with its resumption payload, leaving it positioned to
@@ -2470,12 +2464,7 @@ pub fn prepare_frame_resume_for_dispatch(
     frame: &mut PyFrame,
     resume: &mut crate::call::FrameResumeArgs,
 ) -> Result<Option<PyObjectRef>, PyError> {
-    match prepare_frame_resume(
-        frame,
-        resume.w_inputvalue.take(),
-        resume.operr.take(),
-        resume.throw_args.take(),
-    )? {
+    match prepare_frame_resume(frame, resume.w_arg_or_err)? {
         FrameResume::Yielded(value) => Ok(Some(value)),
         FrameResume::Dispatch(Some(mut err)) => {
             let mut next_instr = frame.next_instr();
@@ -2508,44 +2497,23 @@ pub fn prepare_frame_resume_for_dispatch(
 /// transformer writes the root.
 pub struct ResumeArgPins {
     pub roots: pyre_object::gc_roots::RootScope,
-    pub input_slot: Option<usize>,
-    pub operr_slot: Option<usize>,
+    pub arg_slot: Option<usize>,
 }
 
-/// Open the `w_arg_or_err` bracket on `resume` and reload the locals from
-/// the slots. Expands in the caller so `try_pin` is not a FunDecl.
+/// Open the `w_arg_or_err` bracket on `resume` and reload the local from
+/// the slot. Expands in the caller so `try_pin` is not a FunDecl.
 #[macro_export]
 macro_rules! pin_resume_args {
     ($resume:expr) => {{
-        let input_word = match $resume.w_inputvalue {
-            Some(v) if !v.is_null() => v,
-            _ => pyre_object::PY_NULL,
-        };
-        let operr_word = match $resume.operr.as_ref() {
-            Some(err) => err.as_raw() as pyre_object::PyObjectRef,
-            None => pyre_object::PY_NULL,
-        };
-        if input_word.is_null() && operr_word.is_null() {
+        let word = $resume.w_arg_or_err;
+        if word.is_null() {
             None
         } else {
             let roots = pyre_object::gc_roots::push_roots();
-            // One publish+normalize for the whole live set: sequential
-            // `pin_root` would query after the first write and leave the
-            // later value invisible to a foreign collection
-            // (`RootScope::pin_roots`).
-            let base = roots.pin_roots(&[input_word, operr_word]);
+            let base = roots.pin_roots(&[word]);
             let pins = $crate::eval::ResumeArgPins {
                 roots,
-                input_slot: if input_word.is_null() {
-                    None
-                } else {
-                    Some(base)
-                },
-                operr_slot: if operr_word.is_null() {
-                    None
-                } else {
-                    Some(base + 1)
-                },
+                arg_slot: Some(base),
             };
             $crate::reload_resume_args!(Some(&pins), $resume);
             Some(pins)
@@ -2559,18 +2527,8 @@ macro_rules! pin_resume_args {
 macro_rules! reload_resume_args {
     ($pins:expr, $resume:expr) => {{
         if let Some(pins) = $pins {
-            if let Some(slot) = pins.input_slot {
-                let current = pins.roots.get(slot);
-                $resume.w_inputvalue = if current.is_null() {
-                    None
-                } else {
-                    Some(current)
-                };
-            }
-            if let Some(slot) = pins.operr_slot
-                && let Some(err) = $resume.operr.as_mut()
-            {
-                err.reload(&pins.roots, slot);
+            if let Some(slot) = pins.arg_slot {
+                $resume.w_arg_or_err = pins.roots.get(slot);
             }
         }
     }};
@@ -2639,9 +2597,8 @@ pub(crate) fn eval_frame_plain_with_resume(
     // overrides eval-body, leave overrides everything).
     let (mut outer_result, w_exitvalue) = (|| -> (PyResult, PyObjectRef) {
         // `execute_frame` calls `call_trace` before `resume_execute_frame`.
-        // The sent value and `OperationError` (`error.py`) are GC locals
-        // there (`w_arg_or_err`). The caller's `ResumeArgPins` already
-        // roots them from `stack_check` through this hook and the resume.
+        // `w_arg_or_err` is a GC local there. The caller's `ResumeArgPins`
+        // already roots it from `stack_check` through this hook and the resume.
         let trace = execution_context.call_trace(frame_anchor.live());
         crate::reload_resume_args!(pins, resume);
         if let Err(e) = trace {
@@ -6578,7 +6535,7 @@ mod tests {
         crate::test_hooks::install_hash_hook();
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let result = frame.execute_frame(None, None);
+        let result = frame.execute_frame(None);
         (result, frame)
     }
 
@@ -6845,7 +6802,7 @@ mod tests {
         }
         let mut frame = PyFrame::new(code);
         let err = frame
-            .execute_frame(None, None)
+            .execute_frame(None)
             .expect_err("expected bytecode corruption");
         assert_eq!(err.kind, PyErrorKind::BytecodeCorruption);
         assert_eq!(err.message_text(), "bytecode corruption");

@@ -22430,15 +22430,15 @@ fn get_and_call_function_has_no_residual_array_index() {
 /// than routing them through `<[T; 3]>::index(&args, ..argc)`.
 #[test]
 #[ignore]
-fn throw_yield_from_has_no_residual_array_index() {
+fn delegate_to_nongen_has_no_residual_array_index() {
     use crate::model::OpKind;
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-interpreter.ullbc"
     );
     let llbc = crate::test_support::load_ullbc(path);
-    let graph = crate::test_support::lower_function(llbc, "throw_yield_from")
-        .expect("lower throw_yield_from");
+    let graph = crate::test_support::lower_function(llbc, "delegate_to_nongen")
+        .expect("lower delegate_to_nongen");
     let residual = graph
         .blocks
         .iter()
