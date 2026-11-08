@@ -642,6 +642,9 @@ fn extend_from_list(mut list: PyObjectRef, mut other: PyObjectRef) -> Result<(),
         let n = w_list_len(other);
         // list_preallocate_exact sizes the emulated allocation for both arms.
         pyre_object::listobject::w_list_reserve_for_extend(list, n);
+        // The reservation can allocate (the sizehint cell, a resized backing).
+        list = pyre_object::gc_roots::shadow_stack_get(root_base);
+        other = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
         if matches!(
             pyre_object::listobject::w_list_strategy(list),
             pyre_object::listobject::ListStrategy::Empty

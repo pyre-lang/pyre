@@ -11,7 +11,8 @@ use crate::object_array::{
     FloatItemsBlock, ItemsBlock, TypedItemsBlock, alloc_list_items_block_gc,
     alloc_typed_items_block, alloc_typed_items_block_nursery, dealloc_list_items_block,
     gc_float_array_gc_type_id, gc_int_array_gc_type_id, items_block_capacity,
-    items_block_items_base, items_block_set_ref, jit_ll_arraycopy, typed_items_block_items_base,
+    items_block_items_base, items_block_set_ref, jit_ll_arraycopy, ll_new_int_items,
+    typed_items_block_items_base,
 };
 use crate::pyobject::*;
 use crate::{
@@ -380,8 +381,13 @@ impl crate::lltype::GcType for W_ListObjectUser {
 /// space reference is process-global in pyre, leaving its sole per-instance
 /// field (`sizehint`) as one Signed cell.  This is GC state, not a Python int:
 /// diagnostic APIs must not expose the strategy implementation as a W_Root.
+///
+/// `ll_new_int_items` carries `oopspec("newlist(length)")`, so a traced
+/// `EmptyListStrategy._resize_hint` records `new_array` rather than a
+/// residual `alloc_typed_items_block`.
+#[inline(always)]
 unsafe fn alloc_sizehint_state(sizehint: i64) -> *mut TypedItemsBlock {
-    let state = alloc_typed_items_block(1, gc_int_array_gc_type_id());
+    let state = ll_new_int_items(1);
     if crate::gc_hook::gc_alloc_failed_pending() && state.is_null() {
         return state;
     }
@@ -5791,23 +5797,90 @@ unsafe fn reserve_for_extend_target(list: &W_ListObject, extra: usize) -> Option
     }
 }
 
+/// `rlist.py _ll_list_resize_hint`: look inside when capacity and `extra` are
+/// constant. Empty dest is `EmptyListStrategy._resize_hint` (SizeListStrategy,
+/// no backing alloc); a typed dest is `_ll_list_resize_hint_really` with
+/// overallocate-False so the 3.15 `list_resize` / `list_preallocate_exact`
+/// target is installed exactly.
+fn w_list_reserve_for_extend_iff(obj: PyObjectRef, extra: usize) -> bool {
+    unsafe {
+        let cap = strategy_capacity(&*(obj as *const W_ListObject)).unwrap_or(0);
+        majit_rlib::jit::isconstant(&cap) && majit_rlib::jit::isconstant(&extra)
+    }
+}
+
 /// Reserve slots before `list.extend` consumes its source.
+///
+/// Empty dest is spelled in this body (`EmptyListStrategy._resize_hint`), not
+/// a helper that indexes the caller's shadow-stack slots: that callee is
+/// stack-sensitive and `shadow_stack_erase` would keep `push_roots` as a
+/// residual the walker cannot lower.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
+#[majit_macros::look_inside_iff(w_list_reserve_for_extend_iff)]
 pub unsafe fn w_list_reserve_for_extend(obj: PyObjectRef, extra: usize) {
     if extra == 0 {
         return;
     }
+    // No `return` while the RootScope is live: that refuses
+    // `shadow_stack_erase` (`returns-with-published-slots`) and leaves
+    // `push_roots` as an address-less residual.
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
     let obj = crate::gc_roots::pin_root(obj);
     let _list_guard = w_list_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(root_base);
     let list = &mut *(obj as *mut W_ListObject);
-    // Empty dest: `list_preallocate_exact` `(extra+1)&~1`; else `list_resize`.
     if let Some(target) = reserve_for_extend_target(list, extra) {
-        let _ = publish_physical_capacity(obj, root_base, target);
+        // Empty dest: `list_preallocate_exact` `(extra+1)&~1` as SizeListStrategy
+        // sizehint (`EmptyListStrategy._resize_hint`). Typed dest: `list_resize`
+        // via `_ll_list_resize_hint_really` (exact `target` slots).
+        match list.strategy {
+            ListStrategy::Empty => {
+                // `EmptyListStrategy._resize_hint`: SizeListStrategy(space, hint).
+                // The sizehint cell is the `_really` `newitems` livevar: pin
+                // only the list, malloc, reload, store. An extra pin in this
+                // arm disagrees with Size/typed arms at the match merge
+                // (`depth-disagrees-at-merge`) and leaves `push_roots` in the jitcode.
+                let state = alloc_sizehint_state(target as i64);
+                let obj = crate::gc_roots::shadow_stack_get(root_base);
+                list_write_barrier(obj);
+                let obj = crate::gc_roots::shadow_stack_get(root_base);
+                let list = &mut *(obj as *mut W_ListObject);
+                list.strategy = ListStrategy::Size;
+                list.items = state as *mut ItemsBlock;
+            }
+            ListStrategy::Size | ListStrategy::SimpleRange | ListStrategy::Range => {}
+            _ => {
+                if let Some(current) = strategy_capacity(list)
+                    && current != target
+                {
+                    let obj = crate::gc_roots::shadow_stack_get(root_base);
+                    match (*(obj as *const W_ListObject)).strategy {
+                        ListStrategy::Object => {
+                            ll_list_obj_resize_hint_really(obj, target as i64, false)
+                        }
+                        ListStrategy::Integer | ListStrategy::IntOrFloat => {
+                            ll_list_int_resize_hint_really(obj, target as i64, false)
+                        }
+                        ListStrategy::Float => {
+                            ll_list_float_resize_hint_really(obj, target as i64, false)
+                        }
+                        ListStrategy::Bytes => {
+                            ll_list_bytes_resize_hint_really(obj, target as i64, false)
+                        }
+                        ListStrategy::Ascii => {
+                            ll_list_ascii_resize_hint_really(obj, target as i64, false)
+                        }
+                        ListStrategy::Empty
+                        | ListStrategy::Size
+                        | ListStrategy::SimpleRange
+                        | ListStrategy::Range => {}
+                    }
+                }
+            }
+        }
     }
 }
 
