@@ -3696,6 +3696,13 @@ pub(crate) fn fbw_heap_writing_effect_count() -> usize {
     FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.get())
 }
 
+/// Tally a snapshot-safe keep-recording `Continue` that is already
+/// over `trace_limit` (`pyjitpl.py` `_interpret` would abort after
+/// this step). Frame-transition outcomes do not call this: they are
+/// not snapshot-safe after an executed step, so the post-step check
+/// is deferred. `_interpret`'s cut for a portal frame exit runs at
+/// `blackhole_if_trace_too_long_before_portal_finish` after the
+/// unwind/return ops and before the FINISH compile.
 pub(crate) fn bump_keep_recording_too_long_once(session: &std::cell::RefCell<WalkSession>) {
     let mut session = session.borrow_mut();
     if !session.keep_recording_too_long_tallied {
@@ -4033,15 +4040,20 @@ pub(crate) fn fbw_ensure_boxed_for_ca<Sym: WalkSym>(
 /// — the same resume coordinate (`entry_py_pc` / `outer_active_boxes`) every
 /// other FBW guard uses, since pyre's blackhole can only re-enter the outer
 /// Python opcode boundary.  No-op when there is no standard virtualizable.
+/// Portal exits record this after `blackhole_if_trace_too_long_before_portal_finish`,
+/// as `compile_done_with_this_frame` / `compile_exit_frame_with_exception`
+/// record `store_token_in_vable` after `_interpret`'s `blackhole_if_trace_too_long`,
+/// and not at all when that check aborts.
 pub(crate) fn fbw_store_token_in_vable<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
 ) -> Result<(), DispatchError> {
     if ctx.trace_ctx.store_token_in_vable_setfield() {
         ctx.trace_ctx.record_guard(OpCode::GuardNotForced2, &[], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)
+    } else {
+        Ok(())
     }
-    Ok(())
 }
 
 /// `pyopcode.py handle_operation_error`'s `frame_finished_execution = True`
@@ -4074,12 +4086,14 @@ pub(crate) fn fbw_record_top_level_frame_finished<Sym: WalkSym>(
 
 /// Shared top-level finish path for the three value-returning arms
 /// (`ref_return` / `int_return` / `float_return`).  Re-boxes `result` to
-/// `Type::Ref`, publishes the return coordinate into `last_instr`, stores the
-/// virtualizable token through `FORCE_TOKEN` + `GUARD_NOT_FORCED_2`, and stashes
+/// `Type::Ref`, publishes the return coordinate into `last_instr`, and stashes
 /// the finish payload for `full_body_walk_trace`.  Deliberately
 /// does NOT record the `FINISH` op: under the gate the compile consumer
 /// (`finish_and_compile` -> `recorder.finish`, mod.rs) records it from
 /// `finish_args`, so recording it here too would double it.
+/// `store_token_in_vable` is recorded after
+/// `blackhole_if_trace_too_long_before_portal_finish`, matching
+/// `compile_done_with_this_frame`.
 ///
 /// Returns the FINISH operand (`N_aryOp._args`) and stores the same pair
 /// on the walk session so `walk_session_roots` can forward a `ConstPtr`.
@@ -4090,7 +4104,6 @@ pub(crate) fn fbw_terminate_with_finish<Sym: WalkSym>(
 ) -> Result<(OpRef, Type), DispatchError> {
     let finish_value = fbw_ensure_boxed_for_ca(ctx, op_pc, result)?;
     fbw_publish_exit_last_instr(ctx, op_pc);
-    fbw_store_token_in_vable(ctx, op_pc)?;
     let payload = (finish_value, Type::Ref);
     ctx.session.borrow_mut().finish_payload = Some(payload);
     Ok(payload)
@@ -4098,18 +4111,19 @@ pub(crate) fn fbw_terminate_with_finish<Sym: WalkSym>(
 
 /// Void variant of [`fbw_terminate_with_finish`] for the top-level
 /// `void_return/` portal exit (`compile_done_with_this_frame`'s VOID
-/// branch, pyjitpl.py).  Publishes the return coordinate and stores the
-/// virtualizable back the same way, then stashes a `Type::Void`-marked payload so
+/// branch, pyjitpl.py).  Publishes the return coordinate, then stashes a
+/// `Type::Void`-marked payload so
 /// [`crate::trace::full_body_walk_trace`] builds a `TraceAction::Finish`
 /// with no args (`done_with_this_frame_descr_from_types(&[])` resolves the
 /// void descr).  Like the value path it does NOT record the `FINISH` op —
 /// the compile consumer records it from the empty `finish_args`.
+/// `store_token_in_vable` is recorded after
+/// `blackhole_if_trace_too_long_before_portal_finish`.
 pub(crate) fn fbw_terminate_void_with_finish<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
 ) -> Result<(OpRef, Type), DispatchError> {
     fbw_publish_exit_last_instr(ctx, op_pc);
-    fbw_store_token_in_vable(ctx, op_pc)?;
     let payload = (OpRef::NONE, Type::Void);
     ctx.session.borrow_mut().finish_payload = Some(payload);
     Ok(payload)

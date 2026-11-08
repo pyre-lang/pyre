@@ -4254,6 +4254,13 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // stores precede it and the call stays adjacent to `GUARD_NOT_FORCED`.
     // A decline before the hook still records the symbolic `CALL_ASSEMBLER`.
     let ei = call_descr.get_extra_info().clone();
+    // PyPy: the CALL_ASSEMBLER prefix (funccall frame construction,
+    // `pyframe.py` `execute_frame` `enter` + `call_trace`) is look-inside
+    // of `execute_frame`, a non-portal MIFrame; `_interpret` too-long there
+    // resumes multi-frame inside `execute_frame` (`blackhole.py`
+    // `convert_and_run_from_pyjitpl`), never at the caller's CALL pc.
+    // Over-limit FINISH is stopped by
+    // `blackhole_if_trace_too_long_before_portal_finish`.
     let mut ran = false;
     let mut ca_result = OpRef::NONE;
     let exec = {
@@ -8648,16 +8655,7 @@ pub(crate) fn walk_translated_builtin_wrapper<Sym: WalkSym>(
                 )))
             }
         }
-        DispatchOutcome::Terminate {
-            finish_arg,
-            finish_arg_type,
-        } => Ok(Some((
-            DispatchOutcome::Terminate {
-                finish_arg,
-                finish_arg_type,
-            },
-            op.next_pc,
-        ))),
+        outcome @ DispatchOutcome::Terminate { .. } => Ok(Some((outcome, op.next_pc))),
         DispatchOutcome::SwitchToBlackhole {
             reason,
             raising_exception,
@@ -9051,16 +9049,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
                 )))
             }
         }
-        DispatchOutcome::Terminate {
-            finish_arg,
-            finish_arg_type,
-        } => Ok(Some((
-            DispatchOutcome::Terminate {
-                finish_arg,
-                finish_arg_type,
-            },
-            op.next_pc,
-        ))),
+        outcome @ DispatchOutcome::Terminate { .. } => Ok(Some((outcome, op.next_pc))),
         DispatchOutcome::SwitchToBlackhole {
             reason,
             raising_exception,
@@ -24126,16 +24115,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
             }
         }
-        DispatchOutcome::Terminate {
-            finish_arg,
-            finish_arg_type,
-        } => Ok((
-            DispatchOutcome::Terminate {
-                finish_arg,
-                finish_arg_type,
-            },
-            op.next_pc,
-        )),
+        outcome @ DispatchOutcome::Terminate { .. } => Ok((outcome, op.next_pc)),
         DispatchOutcome::SwitchToBlackhole {
             reason,
             raising_exception,
@@ -24623,16 +24603,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
             }
         }
-        DispatchOutcome::Terminate {
-            finish_arg,
-            finish_arg_type,
-        } => Ok((
-            DispatchOutcome::Terminate {
-                finish_arg,
-                finish_arg_type,
-            },
-            op.next_pc,
-        )),
+        outcome @ DispatchOutcome::Terminate { .. } => Ok((outcome, op.next_pc)),
         DispatchOutcome::SwitchToBlackhole {
             reason,
             raising_exception,
@@ -24864,16 +24835,7 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
                 Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
             }
         }
-        DispatchOutcome::Terminate {
-            finish_arg,
-            finish_arg_type,
-        } => Ok((
-            DispatchOutcome::Terminate {
-                finish_arg,
-                finish_arg_type,
-            },
-            op.next_pc,
-        )),
+        outcome @ DispatchOutcome::Terminate { .. } => Ok((outcome, op.next_pc)),
         DispatchOutcome::SwitchToBlackhole {
             reason,
             raising_exception,

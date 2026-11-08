@@ -944,6 +944,49 @@ pub(crate) fn helper_too_long_decision(
     }
 }
 
+/// `_interpret` (`pyjitpl.py`) `blackhole_if_trace_too_long` at the
+/// ChangeFrame where an opcode's own MIFrame exits. The portal
+/// (`interp_jit.py` `PyFrame.dispatch`) reaches each opcode through
+/// `self.handle_bytecode(...)`, a separate MIFrame. `RETURN_VALUE`'s
+/// `Return`, or an `OperationError` with no handler, leaves that frame
+/// first, so `_interpret` runs the length check before the portal
+/// frame's `except Return: return self.popvalue()` reaches `finishframe` /
+/// `finishframe_exception` → `compile_done_with_this_frame` /
+/// `compile_exit_frame_with_exception`. Those compile paths have no
+/// length check of their own; this seam is the check that precedes them.
+/// `fbw_store_token_in_vable` is recorded after this seam, as
+/// `compile_done_with_this_frame` / `compile_exit_frame_with_exception`
+/// record `store_token_in_vable` after `_interpret`'s
+/// `blackhole_if_trace_too_long`, and not at all when it aborts.
+///
+/// FBW records those unwind/return ops inside this opcode's SubRaise /
+/// SubReturn / Terminate handling, so the cut runs here after the
+/// frame-exit ops (and after the current-frame handler scan found no
+/// handler, for SubRaise) and before the FINISH compile. Inlined
+/// SubReturn / SubRaise is not this helper: those continue the walk.
+///
+/// Does not return `TraceTooLong`: the callee already ran and
+/// `fbw_terminate_with_*` stashed the pending return or exception
+/// (`FBW_FINISH_CONCRETE`). The Terminate consumer keeps TraceCtx
+/// live, marks the session, and still emits `TraceAction::Finish`.
+/// `compile_finish_from_active_session` has no length check
+/// (`compile_segmented_trace_prefix`); the mark makes it return
+/// `Err(SwitchToBlackhole)` after jitdriver publishes CRN banks —
+/// `finishframe_exception` after `except SwitchToBlackhole as stb:
+/// self.aborted_tracing`.
+pub(crate) fn blackhole_if_trace_too_long_before_portal_finish<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) {
+    if !ctx.is_top_level || !ctx.trace_ctx.is_too_long() {
+        return;
+    }
+    crate::state::note_root_trace_too_long(
+        ctx.trace_ctx.current_merge_points_first_green_key_pair(),
+        ctx.trace_ctx.resumekey_original_loop_token().cloned(),
+    );
+    ctx.session.borrow_mut().trace_too_long = true;
+}
+
 #[cfg(test)]
 pub(crate) fn stage_test_helper_abort_image() {
     FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {

@@ -765,6 +765,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                 DispatchOutcome::Terminate {
                     finish_arg,
                     finish_arg_type,
+                    portal_finish_too_long: wc.session.borrow().trace_too_long,
                 },
                 walk_position,
             ))

@@ -3005,9 +3005,12 @@ pub enum DispatchOutcome {
     /// (`N_aryOp._args`). `Type::Void` is a `void_return/` with no
     /// operand (`OpRef::NONE`). A raised exit is the same `Type::Ref`
     /// operand distinguished by [`fbw_finish_is_exception`].
+    /// `portal_finish_too_long` is `WalkSession::trace_too_long` after
+    /// `blackhole_if_trace_too_long_before_portal_finish`.
     Terminate {
         finish_arg: OpRef,
         finish_arg_type: Type,
+        portal_finish_too_long: bool,
     },
     /// Sub-walk frame returned with a result OpRef (Some) or void
     /// (None — no `>X` slot in the callee's `*_return` op). Surfaced
@@ -3284,12 +3287,14 @@ impl PartialEq for DispatchOutcome {
                 Self::Terminate {
                     finish_arg: a_arg,
                     finish_arg_type: a_ty,
+                    portal_finish_too_long: a_too_long,
                 },
                 Self::Terminate {
                     finish_arg: b_arg,
                     finish_arg_type: b_ty,
+                    portal_finish_too_long: b_too_long,
                 },
-            ) => a_arg == b_arg && a_ty == b_ty,
+            ) => a_arg == b_arg && a_ty == b_ty && a_too_long == b_too_long,
             (Self::SubReturn { result: a }, Self::SubReturn { result: b }) => a == b,
             (
                 Self::SubRaise {
@@ -5930,7 +5935,10 @@ pub fn walk<Sym: WalkSym>(
         // frame (`SubWalkFrame::drive` newframe), a nested call that
         // `finishframe`d (parked-completed residual replay, dest-write, or
         // no-driver dest-write after `run_sub_jitcode_walk_from` Ok),
-        // and `finishframe_exception` (caught `SubRaise`).
+        // and `finishframe_exception` (caught `SubRaise`). Portal
+        // frame-exit outcomes check at
+        // `blackhole_if_trace_too_long_before_portal_finish` after their
+        // unwind/return ops.
         //
         // The walker layer holds `&mut TraceCtx` and cannot reach
         // `MetaInterp::blackhole_if_trace_too_long` for the full bookkeeping;
@@ -5995,9 +6003,12 @@ pub fn walk<Sym: WalkSym>(
             // `blackhole_if_trace_too_long` (`pyjitpl.py`) latches it at
             // this post-step pc; `convert_and_run_from_pyjitpl` copies
             // the helper with its own jitcode, pc, and registers. Latch
-            // that image here. `finishframe` / `finishframe_exception`
-            // run first: a SubReturn / SubRaise is not snapshot-safe, so
-            // the length check does not fire until after that transition.
+            // that image here. A SubReturn / SubRaise is not snapshot-safe
+            // after the callee has already run, so this post-step check
+            // does not abort those outcomes. Portal no-handler SubRaise /
+            // Terminate run `_interpret`'s cut at
+            // `blackhole_if_trace_too_long_before_portal_finish` after
+            // the unwind/return ops.
             // A declined or failed latch with zero executed effects still
             // returns `TraceTooLong` so the enclosing Python CALL can
             // latch; an effectful walk without a complete image keeps
@@ -6033,14 +6044,46 @@ pub fn walk<Sym: WalkSym>(
                     pc: opcode_position,
                     ops,
                 });
-            } else {
+            } else if snapshot_safe {
                 bump_keep_recording_too_long_once(ctx.session);
             }
+            // Frame-transition outcomes (`SubRaise` / `SubReturn` /
+            // `Terminate` / `CloseLoop` / `SwitchToBlackhole`) are not
+            // snapshot-safe after an executed step, so this post-step
+            // check does not abort them. `_interpret` (`pyjitpl.py`)
+            // still runs `blackhole_if_trace_too_long` after each
+            // look-inside step of portal `finishframe` /
+            // `finishframe_exception`; FBW recorded those ops inside
+            // this opcode, so that cut runs at the portal Terminate /
+            // no-handler SubRaise arm
+            // (`blackhole_if_trace_too_long_before_portal_finish`)
+            // before the FINISH compile.
         }
         match outcome {
             DispatchOutcome::Continue => {}
-            DispatchOutcome::Terminate { .. }
-            | DispatchOutcome::SubReturn { .. }
+            DispatchOutcome::Terminate {
+                finish_arg,
+                finish_arg_type,
+                ..
+            } => {
+                // Portal frame exit: `*_return` / yield already recorded
+                // the look-inside ops inside `fbw_terminate_with_finish`.
+                // `_interpret` (`pyjitpl.py`) would have aborted between
+                // those steps and `compile_done_with_this_frame`.
+                blackhole_if_trace_too_long_before_portal_finish(ctx);
+                if !ctx.session.borrow().trace_too_long {
+                    fbw_store_token_in_vable(ctx, opcode_position)?;
+                }
+                return Ok((
+                    DispatchOutcome::Terminate {
+                        finish_arg,
+                        finish_arg_type,
+                        portal_finish_too_long: ctx.session.borrow().trace_too_long,
+                    },
+                    pc,
+                ));
+            }
+            DispatchOutcome::SubReturn { .. }
             | DispatchOutcome::SwitchToBlackhole { .. }
             | DispatchOutcome::CloseLoop { .. }
             | DispatchOutcome::CompileTracePending { .. }
@@ -6204,19 +6247,10 @@ node,
                     // the exit's token protocol; the inlined-callee sibling is
                     // `walker_ec_leave`.
                     fbw_record_top_level_frame_finished(ctx);
-                    // `pyjitpl.py compile_exit_frame_with_exception` opens
-                    // with `store_token_in_vable()`, exactly as
-                    // `compile_done_with_this_frame` does. Keep this exit lazy
-                    // too; a traceback reader forces it through the armed
-                    // deadframe only if redirected fields are observed.
-                    fbw_store_token_in_vable(ctx, recording_opcode_position)?;
                     if let Some(pin) = &exc_pin {
                         exc_concrete = ConcreteValue::Ref(pin.get().0 as pyre_object::PyObjectRef);
                     }
-                    // Runtime node after the vable token, same order as
-                    // `compile_exit_frame_with_exception` (`pyjitpl.py`) plus
-                    // `record_application_traceback` (`pytraceback.py`):
-                    // store_token, then attach.  Prefer the IR-virtual
+                    // Prefer the IR-virtual
                     // `NewWithVtable` node (`record_prepend_application_traceback`)
                     // so a function-entry raise (`thrower` / `raise KeyError(i)`)
                     // keeps the exception and frame virtual through
@@ -6268,10 +6302,6 @@ node,
 node,
                         );
                     }
-                    // The concrete bit lands only once `fbw_store_token_in_vable`
-                    // above has accepted the exit (see
-                    // `commit_top_level_frame_unwound`); the recorded store is
-                    // already in the trace.
                     commit_top_level_frame_unwound(ctx);
                     // RPython parity: framestack exhausted with no handler
                     // match → `compile_exit_frame_with_exception(last_exc_box)`.
@@ -6287,10 +6317,22 @@ node,
                     }
                     let (finish_arg, finish_arg_type) =
                         fbw_terminate_with_raise(ctx, exc, exc_concrete);
+                    // No in-frame handler: unwind ops are recorded.
+                    // `_interpret` (`pyjitpl.py`) `blackhole_if_trace_too_long`
+                    // after those `handle_operation_error` steps, before
+                    // `compile_exit_frame_with_exception`.
+                    blackhole_if_trace_too_long_before_portal_finish(ctx);
+                    if !ctx.session.borrow().trace_too_long {
+                        // `compile_exit_frame_with_exception` records
+                        // `store_token_in_vable` after that check, and not
+                        // at all when it aborts.
+                        fbw_store_token_in_vable(ctx, recording_opcode_position)?;
+                    }
                     return Ok((
                         DispatchOutcome::Terminate {
                             finish_arg,
                             finish_arg_type,
+                            portal_finish_too_long: ctx.session.borrow().trace_too_long,
                         },
                         pc,
                     ));
@@ -17727,8 +17769,8 @@ fn handle<Sym: WalkSym>(
             if ctx.is_top_level {
                 // Slice b: route the loop-free portal exit through
                 // `TraceAction::Finish` so the compile pipeline records
-                // the FINISH from `finish_args`.  Re-box to Type::Ref +
-                // store_token_in_vable, then stash the payload; do NOT
+                // the FINISH from `finish_args`.  Re-box to Type::Ref,
+                // then stash the payload; do NOT
                 // call `ctx.trace_ctx.finish()` here (would double-record).
                 //
                 // No-replay portal exit: also stash the CONCRETE return
@@ -17746,6 +17788,7 @@ fn handle<Sym: WalkSym>(
                     DispatchOutcome::Terminate {
                         finish_arg,
                         finish_arg_type,
+                        portal_finish_too_long: false,
                     },
                     op.next_pc,
                 ))
@@ -17792,6 +17835,7 @@ fn handle<Sym: WalkSym>(
                     DispatchOutcome::Terminate {
                         finish_arg,
                         finish_arg_type,
+                        portal_finish_too_long: false,
                     },
                     op.next_pc,
                 ))
@@ -17821,6 +17865,7 @@ fn handle<Sym: WalkSym>(
                     DispatchOutcome::Terminate {
                         finish_arg,
                         finish_arg_type,
+                        portal_finish_too_long: false,
                     },
                     op.next_pc,
                 ))
@@ -17856,6 +17901,7 @@ fn handle<Sym: WalkSym>(
                     DispatchOutcome::Terminate {
                         finish_arg,
                         finish_arg_type,
+                        portal_finish_too_long: false,
                     },
                     op.next_pc,
                 ))
@@ -17889,9 +17935,8 @@ fn handle<Sym: WalkSym>(
                 // Slice b: route the void portal exit through
                 // `TraceAction::Finish` (empty args) so the compile
                 // pipeline records the FINISH(void) from `finish_args`,
-                // mirroring the three value-returning arms.  Store the
-                // assembler token in the vable + GUARD_NOT_FORCED_2 like
-                // those arms, then stash a void-marked payload; do NOT
+                // mirroring the three value-returning arms.  Stash a
+                // void-marked payload; do NOT
                 // call `ctx.trace_ctx.finish()` here (would double-record).
                 //
                 // No-replay portal exit: stash `Null` (= void → None at
@@ -17904,6 +17949,7 @@ fn handle<Sym: WalkSym>(
                     DispatchOutcome::Terminate {
                         finish_arg,
                         finish_arg_type,
+                        portal_finish_too_long: false,
                     },
                     op.next_pc,
                 ))
