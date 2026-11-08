@@ -5305,6 +5305,19 @@ fn legacy_const_define_hlvalue(
                     key.segments()
                 ))
             })?;
+            // `executioncontext.py` `setllprofile`: a `ProfileFunc` family
+            // member is a `FunctionDesc` PBC (`bookkeeper.py` `getdesc`),
+            // not `getfunctionptr` / `SomePtr`. Both the field annotation
+            // and this constant must be `SomePBC` or the store unions
+            // `SomePtr` with `SomePBC`.
+            if call_registry
+                .bookkeeper()
+                .is_profilefunc_graph_path(segments)
+            {
+                return Ok(Some(Hlvalue::Constant(Constant::new(
+                    ConstValue::HostObject(entry.host_object.clone()),
+                ))));
+            }
             // A fn-const is address-taken data for a static method table
             // (`typedef` `[(name, fn, arity)]`).  Its LL carrier is
             // unconditionally `ConstFnAddr` (the const-define arm below),
@@ -5769,6 +5782,15 @@ pub(crate) fn derive_subject_inputcells(
                 && let Some(s_vec) = bk.project_rust_vec(root)
             {
                 cells.push(s_vec);
+                continue;
+            }
+            // `executioncontext.py` `setllprofile`: `Option<ProfileFunc>`
+            // is a nullable PBC. Seed it before the generic `fn` arm so
+            // the parameter does not union `SomePtr` with the field.
+            if let (Some(bk), Some(root)) = (bookkeeper, class_root.as_deref())
+                && bk.is_profilefunc_type_spelling(root)
+            {
+                cells.push(bk.profilefunc_pbc_or_none());
                 continue;
             }
             // A function pointer is the same Int bank (`history.getkind` of
@@ -17132,6 +17154,60 @@ mod tests {
             Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed),
             "legacy Variable cell must stay Int/Signed"
         );
+    }
+
+    #[test]
+    fn profilefunc_family_fn_const_folds_to_hostobject_not_llptr() {
+        use crate::flowspace::argument::Signature;
+        use crate::model::CallTarget;
+
+        struct RestoreFamily;
+        impl Drop for RestoreFamily {
+            fn drop(&mut self) {
+                crate::profilefunc_family::register_profilefunc_family(Vec::new(), Vec::new());
+            }
+        }
+        let _restore = RestoreFamily;
+
+        let registry = empty_call_registry();
+        let family_key =
+            crate::translator::rtyper::call_registry::FunctionPathKey::from_segments(["hook_a"]);
+        let empty_sig = Signature::new(Vec::<String>::new(), None, None);
+        let family_entry = registry.get_or_register(family_key, empty_sig);
+        crate::profilefunc_family::register_profilefunc_family(
+            vec!["hook_a".into()],
+            vec!["ProfileFunc".into()],
+        );
+        registry.intern_profilefunc_family();
+
+        let family_define = OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: vec![
+                    crate::model::FN_CONST_HEAD.to_string(),
+                    "hook_a".to_string(),
+                ],
+                fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            args: Vec::new(),
+            result_ty: ValueType::Int,
+        };
+        let family_op = SpaceOperation {
+            result: Some(Variable::new()),
+            kind: family_define,
+        };
+        match legacy_const_define_hlvalue(&family_op, Some(&registry))
+            .expect("family fn const folds")
+        {
+            Some(Hlvalue::Constant(c)) => {
+                assert_eq!(
+                    c.value,
+                    ConstValue::HostObject(family_entry.host_object.clone()),
+                    "setllprofile stores a FunctionDesc, not getfunctionptr"
+                );
+            }
+            other => panic!("expected HostObject FunctionDesc, got {other:?}"),
+        }
     }
 
     #[test]

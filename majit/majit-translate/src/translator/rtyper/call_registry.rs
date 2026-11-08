@@ -1038,6 +1038,27 @@ impl CallRegistry {
         None
     }
 
+    /// Intern the harvested `ProfileFunc` family onto the bookkeeper
+    /// (`executioncontext.py` `setllprofile`). Uses [`Self::lookup_existing`]
+    /// so a dummy `get_or_register` cannot mint a second `HostObject` /
+    /// `FunctionDesc` for a path populate already registered
+    /// (`HostObject` Arc identity / `bookkeeper.py` `getdesc`).
+    pub fn intern_profilefunc_family(&self) {
+        let paths = crate::profilefunc_family::profilefunc_graphs();
+        let spellings = crate::profilefunc_family::profilefunc_spellings();
+        let mut descriptions = Vec::new();
+        for path in &paths {
+            let key = FunctionPathKey::from_segments(path.split("::").map(str::to_string));
+            if let Some(entry) = self.lookup_existing(&key) {
+                descriptions.push(crate::annotator::description::DescEntry::function(
+                    entry.function_desc.clone(),
+                ));
+            }
+        }
+        self.bookkeeper
+            .set_profilefunc_family(descriptions, paths, spellings);
+    }
+
     /// Look up an existing entry without creating one.  Returns
     /// `None` when the path has not yet been registered.
     ///

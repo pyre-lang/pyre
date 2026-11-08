@@ -95,6 +95,16 @@ pub struct Llbc {
     /// the set harvested across the linked artefacts. Not a path-keyed
     /// map: membership is a short ordered list.
     eval_hook_graphs: parking_lot::RwLock<Vec<String>>,
+    /// Crate-stripped call paths of the `ProfileFunc` family stored into
+    /// `ExecutionContext.profilefunc` (`setllprofile` / `_trace`). Empty
+    /// until the translator publishes the set harvested across the linked
+    /// artefacts. Not a path-keyed map: membership is a short ordered list.
+    profilefunc_graphs: parking_lot::RwLock<Vec<String>>,
+    /// Type spellings of that family (`ProfileFunc`, `Option<ProfileFunc>`,
+    /// and the expanded `fn(...)` Charon renders after peeling the alias).
+    /// Field projection matches these because `tyref_to_ast_string` peels
+    /// `TypeDeclKind::Alias` to the `FnPtr` signature.
+    profilefunc_spellings: parking_lot::RwLock<Vec<String>>,
     /// Root-stack effects of the linked artefacts analysed before this one:
     /// the crates whose every body was analysed, and the sorted paths of
     /// the bodies among them that can leave the shadow stack changed.
@@ -295,6 +305,8 @@ pub struct LinkStateSnapshot {
     transparent_scalar_kinds: Vec<(String, TransparentScalarKind)>,
     foldable_const_lits: Vec<(u64, String)>,
     eval_hook_graphs: Vec<String>,
+    profilefunc_graphs: Vec<String>,
+    profilefunc_spellings: Vec<String>,
     exception_carrier: String,
     root_stack_effects: (Vec<String>, Vec<String>),
     stack_sensitive_fns: Vec<String>,
@@ -474,6 +486,8 @@ impl Llbc {
             transparent_scalar_kinds: parking_lot::RwLock::new(Vec::new()),
             foldable_const_lits: parking_lot::RwLock::new(Vec::new()),
             eval_hook_graphs: parking_lot::RwLock::new(Vec::new()),
+            profilefunc_graphs: parking_lot::RwLock::new(Vec::new()),
+            profilefunc_spellings: parking_lot::RwLock::new(Vec::new()),
             root_stack_effects: parking_lot::RwLock::new((Vec::new(), Vec::new())),
             exception_carrier: parking_lot::RwLock::new(String::new()),
             eval_fn_type_id: std::sync::OnceLock::new(),
@@ -539,6 +553,31 @@ impl Llbc {
     /// them. Empty before that publish.
     pub fn eval_hook_graphs(&self) -> Vec<String> {
         self.eval_hook_graphs.read().clone()
+    }
+
+    /// Publish the `ProfileFunc` family harvested from the linked artefacts
+    /// (`setllprofile` / `store_profilefunc` / `_trace`). An empty publish
+    /// clears it.
+    pub fn set_profilefunc_graphs(&self, paths: Vec<String>) {
+        *self.profilefunc_graphs.write() = paths;
+    }
+
+    /// Crate-stripped paths of functions stored into `profilefunc`, when
+    /// the translator has published them. Empty before that publish.
+    pub fn profilefunc_graphs(&self) -> Vec<String> {
+        self.profilefunc_graphs.read().clone()
+    }
+
+    /// Publish the type spellings of the `ProfileFunc` slot (alias leaf,
+    /// `Option<…>`, expanded `fn(...)` after alias peel). An empty publish
+    /// clears it.
+    pub fn set_profilefunc_spellings(&self, spellings: Vec<String>) {
+        *self.profilefunc_spellings.write() = spellings;
+    }
+
+    /// Published `ProfileFunc` type spellings. Empty before that publish.
+    pub fn profilefunc_spellings(&self) -> Vec<String> {
+        self.profilefunc_spellings.read().clone()
     }
 
     /// Publish the root-stack effects harvested from other artefacts of the
@@ -780,6 +819,8 @@ impl Llbc {
             transparent_scalar_kinds: self.transparent_scalar_kinds.read().clone(),
             foldable_const_lits: self.foldable_const_lits.read().clone(),
             eval_hook_graphs: self.eval_hook_graphs.read().clone(),
+            profilefunc_graphs: self.profilefunc_graphs.read().clone(),
+            profilefunc_spellings: self.profilefunc_spellings.read().clone(),
             exception_carrier: self.exception_carrier.read().clone(),
             root_stack_effects: self.root_stack_effects.read().clone(),
             stack_sensitive_fns: self.stack_sensitive_fns.read().clone(),
@@ -810,6 +851,8 @@ impl Llbc {
         *self.transparent_scalar_kinds.write() = snapshot.transparent_scalar_kinds;
         *self.foldable_const_lits.write() = snapshot.foldable_const_lits;
         *self.eval_hook_graphs.write() = snapshot.eval_hook_graphs;
+        *self.profilefunc_graphs.write() = snapshot.profilefunc_graphs;
+        *self.profilefunc_spellings.write() = snapshot.profilefunc_spellings;
         *self.exception_carrier.write() = snapshot.exception_carrier;
         *self.root_stack_effects.write() = snapshot.root_stack_effects;
         *self.stack_sensitive_fns.write() = snapshot.stack_sensitive_fns;
@@ -1911,6 +1954,8 @@ mod tests {
         assert!(l.transparent_scalar_kind("CodeFlags").is_none());
         assert!(l.foldable_const_lit(1).is_none());
         assert!(l.eval_hook_graphs().is_empty());
+        assert!(l.profilefunc_graphs().is_empty());
+        assert!(l.profilefunc_spellings().is_empty());
         assert!(l.exception_carrier().is_empty());
         assert!(!l.is_stack_sensitive_fn("p"));
         assert!(!l.is_stack_depth_neutral_fn("p"));
@@ -1934,6 +1979,8 @@ mod tests {
         )]);
         l.register_foldable_const_lit(1, "lit".into());
         l.set_eval_hook_graphs(vec!["hook".into()]);
+        l.set_profilefunc_graphs(vec!["app_profile_call".into()]);
+        l.set_profilefunc_spellings(vec!["ProfileFunc".into()]);
         l.set_exception_carrier("Bookkeeper");
         l.set_root_stack_effects(vec!["c".into()], vec!["p".into()]);
         l.register_stack_sensitive_fns(["p".into()]);
@@ -1957,6 +2004,8 @@ mod tests {
         );
         assert_eq!(l.foldable_const_lit(1).as_deref(), Some("lit"));
         assert_eq!(l.eval_hook_graphs(), vec!["hook".to_string()]);
+        assert_eq!(l.profilefunc_graphs(), vec!["app_profile_call".to_string()]);
+        assert_eq!(l.profilefunc_spellings(), vec!["ProfileFunc".to_string()]);
         assert_eq!(l.exception_carrier(), "Bookkeeper");
         assert!(l.is_stack_sensitive_fn("p"));
         assert!(l.is_stack_depth_neutral_fn("p"));

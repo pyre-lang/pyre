@@ -5,11 +5,13 @@ use majit_charon_reader::Llbc;
 use serde_json::json;
 
 use crate::front::mir::tests::{
-    assign_stmt, bb, call_term, const_artifact, deref_place, fixture_llbc, fmt_arguments_adt,
-    fmt_arguments_decl, fmt_format_decl, format_as_bytes_window_llbc, hint_must_use_decl,
-    item_meta_json, llbc_with_trait_impls, llbc_with_types, local_of, move_op, opaque_decl,
-    place_of, ptr_ty, ref_rvalue, ref_string, span_json, string_adt, string_as_bytes_decl,
-    string_decl, subject_decl, unit_ty, window_shared_slice, window_slice,
+    adt_node, assign_stmt, bb, call_term, const_artifact, deref_place, empty_generics,
+    fixture_llbc, fmt_arguments_adt, fmt_arguments_decl, fmt_format_decl,
+    format_as_bytes_window_llbc, hint_must_use_decl, item_meta_json, llbc_with_trait_impls,
+    llbc_with_types, local_of, move_op, opaque_decl, option_adt_node, option_enum, place_of,
+    ptr_ty, ref_rvalue, ref_string, span_json, string_adt, string_as_bytes_decl, string_decl,
+    subject_decl, type_decl_alias, type_decl_struct, unit_fn_ptr, unit_ty, window_shared_slice,
+    window_slice,
 };
 
 /// Every row of the fn-pointer family decision, including the two the
@@ -828,4 +830,235 @@ fn add_dest_struct_field_guard_classifies_uses() {
         serde_json::from_value::<Unstructured>(body_json).expect("call fixture parses")
     };
     assert!(accepts(&call_body), "a call argument is a value field use");
+}
+
+/// Distinctive `fn(bool) -> bool` so this fixture cannot collide with
+/// `unit_fn_ptr` / BuiltinCodeFn. Member names are invented (`hook_a` /
+/// `hook_b`); discovery keys on the `ProfileFunc` type, not those names.
+fn bool_fn_ptr() -> serde_json::Value {
+    json!({
+        "FnPtr": {
+            "skip_binder": {
+                "inputs": [{"Scalar": "Bool"}],
+                "output": {"Scalar": "Bool"},
+                "is_unsafe": false
+            }
+        }
+    })
+}
+
+fn const_fndef(fun: u64, ty: &serde_json::Value) -> serde_json::Value {
+    json!({"Const": [{
+        "FnDef": {
+            "kind": {"Fun": fun},
+            "generics": empty_generics()
+        }
+    }, ty]})
+}
+
+fn profilefunc_fun(
+    def_id: u64,
+    name: &str,
+    inputs: Vec<serde_json::Value>,
+    output: serde_json::Value,
+    arg_count: u64,
+    locals: Vec<serde_json::Value>,
+    blocks: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(&["fixture", name], "", true),
+        "signature": {"is_unsafe": false, "inputs": inputs, "output": output},
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": arg_count, "locals": locals},
+            "body": blocks
+        }}
+    })
+}
+
+fn matching_profilefunc_member(def_id: u64, name: &str) -> serde_json::Value {
+    let ty = json!({"Scalar": "Bool"});
+    profilefunc_fun(
+        def_id,
+        name,
+        vec![ty.clone()],
+        ty.clone(),
+        1,
+        vec![local_of(0, &ty), local_of(1, &ty)],
+        vec![bb(vec![], json!("Return"))],
+    )
+}
+
+fn profilefunc_family_llbc() -> Llbc {
+    let bool_fn = bool_fn_ptr();
+    let profilefunc_adt = adt_node(1);
+    let option_ty = option_adt_node(0, profilefunc_adt.clone());
+    let ec_ty = adt_node(2);
+    let unit = json!({"Tuple": []});
+    let types = vec![
+        option_enum(0),
+        type_decl_alias(1, &["fixture", "ProfileFunc"], bool_fn.clone()),
+        type_decl_struct(
+            2,
+            &["fixture", "ExecutionContext"],
+            vec![json!({
+                "name": "profilefunc",
+                "ty": option_ty,
+                "attr_info": null
+            })],
+        ),
+    ];
+    let hook_a = matching_profilefunc_member(0, "hook_a");
+    let hook_b = matching_profilefunc_member(1, "hook_b");
+    let other_fn = profilefunc_fun(
+        2,
+        "other_fn",
+        vec![],
+        unit.clone(),
+        0,
+        vec![local_of(0, &unit)],
+        vec![bb(vec![], json!("Return"))],
+    );
+    let setllprofile = profilefunc_fun(
+        3,
+        "setllprofile",
+        vec![ec_ty.clone(), option_adt_node(0, profilefunc_adt.clone())],
+        unit.clone(),
+        2,
+        vec![
+            local_of(0, &unit),
+            local_of(1, &ec_ty),
+            local_of(2, &option_adt_node(0, profilefunc_adt.clone())),
+            local_of(3, &profilefunc_adt),
+        ],
+        vec![bb(
+            vec![assign_stmt(
+                place_of(3, &profilefunc_adt),
+                json!({"Use": [const_fndef(0, &bool_fn), "Yes"]}),
+            )],
+            json!("Return"),
+        )],
+    );
+    let setprofile = profilefunc_fun(
+        4,
+        "setprofile",
+        vec![ec_ty.clone()],
+        unit.clone(),
+        1,
+        vec![local_of(0, &unit), local_of(1, &ec_ty)],
+        vec![
+            bb(
+                vec![],
+                call_term(
+                    3,
+                    vec![move_op(place_of(1, &ec_ty)), const_fndef(1, &bool_fn)],
+                    place_of(0, &unit),
+                    1,
+                    2,
+                ),
+            ),
+            bb(vec![], json!("Return")),
+            bb(vec![], json!("UnwindResume")),
+        ],
+    );
+    llbc_with_types(
+        "fixture",
+        types,
+        vec![hook_a, hook_b, other_fn, setllprofile, setprofile],
+    )
+}
+
+/// `discover_eval_hook_graphs` analogue: the family is the `ProfileFunc`
+/// type plus stores into that slot (`setllprofile` / `setprofile`), not
+/// baked member names.
+#[test]
+fn discover_profilefunc_graphs_keys_on_type_not_member_names() {
+    let llbc = profilefunc_family_llbc();
+    let graphs = super::discover_profilefunc_graphs(&llbc);
+    assert!(
+        graphs
+            .iter()
+            .any(|path| path == "hook_a" || path.ends_with("::hook_a")),
+        "signature-matching / stored FnDef hook_a must be in the family, got {graphs:?}"
+    );
+    assert!(
+        graphs
+            .iter()
+            .any(|path| path == "hook_b" || path.ends_with("::hook_b")),
+        "signature-matching / setprofile-stored FnDef hook_b must be in the family, got {graphs:?}"
+    );
+    assert!(
+        graphs
+            .iter()
+            .all(|path| !path.ends_with("other_fn") && path != "other_fn"),
+        "a FunDecl whose fn type is not ProfileFunc stays out, got {graphs:?}"
+    );
+    let spellings = super::discover_profilefunc_spellings(&llbc);
+    assert!(
+        spellings
+            .iter()
+            .any(|s| s == "ProfileFunc" || s.ends_with("::ProfileFunc")),
+        "alias leaf must be published, got {spellings:?}"
+    );
+    assert!(
+        spellings.iter().any(|s| s.contains("fn(")),
+        "expanded fn(...) after alias peel must be published, got {spellings:?}"
+    );
+}
+
+#[test]
+fn discover_profilefunc_graphs_ignores_unrelated_fn_pointer_fields() {
+    let unit = json!({"Tuple": []});
+    let types = vec![
+        option_enum(0),
+        type_decl_struct(
+            1,
+            &["fixture", "Hooks"],
+            vec![json!({
+                "name": "callback",
+                "ty": option_adt_node(0, unit_fn_ptr()),
+                "attr_info": null
+            })],
+        ),
+    ];
+    let other = profilefunc_fun(
+        0,
+        "plain_callback",
+        vec![],
+        unit.clone(),
+        0,
+        vec![local_of(0, &unit)],
+        vec![bb(vec![], json!("Return"))],
+    );
+    let llbc = llbc_with_types("fixture", types, vec![other]);
+    assert!(
+        super::discover_profilefunc_graphs(&llbc).is_empty(),
+        "a non-profilefunc Option<fn> field must not become a PBC family"
+    );
+    assert!(
+        super::discover_profilefunc_spellings(&llbc).is_empty(),
+        "no ProfileFunc alias / profilefunc field ⇒ no published spelling"
+    );
+}
+
+#[test]
+#[ignore]
+fn interpreter_ullbc_discovers_app_profile_call_as_profilefunc_member() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let graphs = super::discover_profilefunc_graphs(&llbc);
+    assert!(
+        graphs
+            .iter()
+            .any(|p| p.ends_with("app_profile_call") || p == "app_profile_call"),
+        "executioncontext.py setprofile stores app_profile_call; got {graphs:?}"
+    );
+    let spellings = super::discover_profilefunc_spellings(&llbc);
+    assert!(
+        spellings
+            .iter()
+            .any(|s| s == "ProfileFunc" || s.ends_with("::ProfileFunc")),
+        "ProfileFunc alias must be published from the interpreter artefact, got {spellings:?}"
+    );
 }

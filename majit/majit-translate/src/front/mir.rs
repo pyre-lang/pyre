@@ -283,6 +283,40 @@ pub(crate) fn prelink_crate(
     if !eval_hook_graphs.is_empty() && llbc.eval_hook_graphs() != eval_hook_graphs {
         llbc.set_eval_hook_graphs(eval_hook_graphs);
     }
+    let published_profilefunc = llbc.profilefunc_graphs();
+    let profilefunc_paths = if published_profilefunc.is_empty() {
+        discover_profilefunc_graphs(llbc)
+    } else {
+        published_profilefunc
+    };
+    let mut profilefunc_graphs = Vec::new();
+    for path in profilefunc_paths {
+        if !profilefunc_graphs.contains(&path) {
+            profilefunc_graphs.push(path);
+        }
+    }
+    if !profilefunc_graphs.is_empty() && llbc.profilefunc_graphs() != profilefunc_graphs {
+        llbc.set_profilefunc_graphs(profilefunc_graphs);
+    }
+    let published_spellings = llbc.profilefunc_spellings();
+    let spelling_paths = if published_spellings.is_empty() {
+        discover_profilefunc_spellings(llbc)
+    } else {
+        published_spellings
+    };
+    let mut profilefunc_spellings = Vec::new();
+    for spelling in spelling_paths {
+        if !profilefunc_spellings.contains(&spelling) {
+            profilefunc_spellings.push(spelling);
+        }
+    }
+    if !profilefunc_spellings.is_empty() && llbc.profilefunc_spellings() != profilefunc_spellings {
+        llbc.set_profilefunc_spellings(profilefunc_spellings);
+    }
+    crate::profilefunc_family::register_profilefunc_family(
+        llbc.profilefunc_graphs(),
+        llbc.profilefunc_spellings(),
+    );
     paint_tombstones
 }
 
@@ -561,6 +595,58 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             }
         }
     }
+    let mut profilefunc_graphs = Vec::new();
+    let mut profilefunc_spellings = Vec::new();
+    for llbc in llbcs {
+        let published = llbc.profilefunc_graphs();
+        let paths = if published.is_empty() {
+            if function_filter.is_some() {
+                Vec::new()
+            } else {
+                discover_profilefunc_graphs(llbc)
+            }
+        } else {
+            published
+        };
+        for path in paths {
+            if !profilefunc_graphs.contains(&path) {
+                profilefunc_graphs.push(path);
+            }
+        }
+        let published_spellings = llbc.profilefunc_spellings();
+        let spellings = if published_spellings.is_empty() {
+            if function_filter.is_some() {
+                Vec::new()
+            } else {
+                discover_profilefunc_spellings(llbc)
+            }
+        } else {
+            published_spellings
+        };
+        for spelling in spellings {
+            if !profilefunc_spellings.contains(&spelling) {
+                profilefunc_spellings.push(spelling);
+            }
+        }
+    }
+    if !profilefunc_graphs.is_empty() {
+        for llbc in llbcs {
+            if llbc.profilefunc_graphs() != profilefunc_graphs {
+                llbc.set_profilefunc_graphs(profilefunc_graphs.clone());
+            }
+        }
+    }
+    if !profilefunc_spellings.is_empty() {
+        for llbc in llbcs {
+            if llbc.profilefunc_spellings() != profilefunc_spellings {
+                llbc.set_profilefunc_spellings(profilefunc_spellings.clone());
+            }
+        }
+    }
+    crate::profilefunc_family::register_profilefunc_family(
+        profilefunc_graphs,
+        profilefunc_spellings,
+    );
     let mut merged: Option<crate::front::semantic::SemanticProgram> = None;
     // Dedup key combines `self_ty_root` (the impl owner, when known),
     // `trait_impl_id` (Charon's function-object identity for a trait
@@ -7563,7 +7649,8 @@ pub(crate) use self::consteval::{
     register_foldable_const_lits,
 };
 pub(crate) use self::desugar::callee::{
-    discover_eval_hook_graphs, release_declared_vable_array_address,
+    discover_eval_hook_graphs, discover_profilefunc_graphs, discover_profilefunc_spellings,
+    release_declared_vable_array_address,
 };
 pub(crate) use self::desugar::rewire::{
     AggregateCtor, AggregateShape, emit_aggregate_value, is_core_clone_impls_clone_path,

@@ -497,6 +497,16 @@ pub struct Bookkeeper {
     /// program declares a handful, and lookup walks it. Lives on the
     /// bookkeeper next to `exception_carrier`.
     exception_class_hierarchies: RefCell<Vec<MintedExceptionHierarchy>>,
+    /// `FunctionDesc`s of the closed `ProfileFunc` family stored into
+    /// `ExecutionContext.profilefunc` (`executioncontext.py` `setllprofile`).
+    /// Empty until [`Self::set_profilefunc_family`]. The field annotates as
+    /// a nullable `SomePBC` of these descs (`description.py` `CallFamily`).
+    profilefunc_family: RefCell<Vec<super::description::DescEntry>>,
+    /// Crate-stripped call paths of [`Self::profilefunc_family`].
+    profilefunc_paths: RefCell<Vec<String>>,
+    /// Type spellings of that slot (`ProfileFunc`, `Option<ProfileFunc>`,
+    /// expanded `fn(...)` after alias peel).
+    profilefunc_spellings: RefCell<Vec<String>>,
 }
 
 /// One `_exception_class_<Enum>` hierarchy after mint.
@@ -1858,6 +1868,9 @@ impl Bookkeeper {
             raw_alloc_flavor_structs: RefCell::new(HashSet::new()),
             immutable_fields_structs: RefCell::new(HashMap::new()),
             exception_class_hierarchies: RefCell::new(Vec::new()),
+            profilefunc_family: RefCell::new(Vec::new()),
+            profilefunc_paths: RefCell::new(Vec::new()),
+            profilefunc_spellings: RefCell::new(Vec::new()),
         }
     }
 
@@ -1964,6 +1977,70 @@ impl Bookkeeper {
             .map(|(field, rank)| ConstValue::byte_str(format!("{field}{}", rank.suffix())))
             .collect();
         host.class_set("_immutable_fields_", ConstValue::List(Arc::new(items)));
+    }
+
+    /// Install the closed `ProfileFunc` family (`setllprofile` /
+    /// `_trace`). `descriptions` are the interned `FunctionDesc`s
+    /// `CallRegistry` already holds for those paths — a second
+    /// `HostObject::new_user_function` would be a distinct callable
+    /// (`HostObject` Arc identity).
+    pub fn set_profilefunc_family(
+        &self,
+        descriptions: Vec<super::description::DescEntry>,
+        paths: Vec<String>,
+        spellings: Vec<String>,
+    ) {
+        *self.profilefunc_family.borrow_mut() = descriptions;
+        *self.profilefunc_paths.borrow_mut() = paths;
+        *self.profilefunc_spellings.borrow_mut() = spellings;
+    }
+
+    /// Nullable PBC of the published `ProfileFunc` family, or `s_None`
+    /// when no member is interned yet so a later store can union in.
+    pub(crate) fn profilefunc_pbc_or_none(&self) -> SomeValue {
+        let descs = self.profilefunc_family.borrow().clone();
+        if descs.is_empty() {
+            super::model::s_none()
+        } else {
+            SomeValue::PBC(super::model::SomePBC::new(descs, true))
+        }
+    }
+
+    /// Whether `spelling` names the `ProfileFunc` slot. Matches the alias
+    /// leaf and published expanded `fn(...)` spellings; generic `fn` /
+    /// `Option<fn>` stay `SomePtr`.
+    pub(crate) fn is_profilefunc_type_spelling(&self, spelling: &str) -> bool {
+        if crate::profilefunc_family::spelling_is_profilefunc(spelling) {
+            return true;
+        }
+        let inner = strip_generic_one(spelling.trim(), "Option<")
+            .map(str::trim)
+            .unwrap_or(spelling.trim());
+        self.profilefunc_spellings.borrow().iter().any(|known| {
+            let known_inner = strip_generic_one(known.trim(), "Option<")
+                .map(str::trim)
+                .unwrap_or(known.trim());
+            known == spelling
+                || known == inner
+                || known_inner == inner
+                || known_inner == spelling.trim()
+        })
+    }
+
+    /// Whether `segments` name a published `ProfileFunc` family member.
+    pub(crate) fn is_profilefunc_graph_path(&self, segments: &[String]) -> bool {
+        if crate::profilefunc_family::is_profilefunc_graph_path(segments) {
+            return true;
+        }
+        if segments.is_empty() {
+            return false;
+        }
+        let key = segments.join("::");
+        self.profilefunc_paths.borrow().iter().any(|path| {
+            path == &key
+                || path.ends_with(&format!("::{key}"))
+                || key.ends_with(&format!("::{path}"))
+        })
     }
 
     /// Name the interpreter's error carrier object (see the
@@ -4509,6 +4586,15 @@ impl Bookkeeper {
                         &crate::model::ValueType::Int,
                     )
                     .is_some_and(|shell| shell == attr.s_value);
+                // `ProfileFunc` / `Option<ProfileFunc>` may still FORCE as
+                // the Int-bank shell (`Ptr(FuncType)` getkind) or the
+                // untyped instance shell. Replace with the PBC projection.
+                let is_profilefunc_force_shell = self.is_profilefunc_type_spelling(&row.ty)
+                    && (is_untyped_force_shell
+                        || crate::codewriter::annotation_state::valuetype_to_someshell(
+                            &crate::model::ValueType::Int,
+                        )
+                        .is_some_and(|shell| shell == attr.s_value));
                 // `tyref_to_attr_value_type` banks `&[u8]` as Int, so FORCE
                 // shells a window field as the Int-bank shell. The layout
                 // spelling is still `{data: CCHARP, len: Signed}`
@@ -4535,6 +4621,7 @@ impl Bookkeeper {
                 if matches!(attr.s_value, SomeValue::Impossible)
                     || (is_untyped_force_shell && !matches!(s_value, SomeValue::Impossible))
                     || is_ptr_integer_force_shell
+                    || is_profilefunc_force_shell
                     || is_window_integer_force_shell
                     || is_raw_boxed_slice_integer_force_shell
                 {
@@ -5468,6 +5555,12 @@ impl Bookkeeper {
         if t == "IdentityKey" || t.ends_with("::IdentityKey") {
             return self.project_struct_field_type("PyObjectRef");
         }
+        // `executioncontext.py` `profilefunc`: a nullable PBC of the closed
+        // function family `setllprofile` stores (`description.py`
+        // `CallFamily`). Generic `fn` / `Option<fn>` stay `SomePtr`.
+        if self.is_profilefunc_type_spelling(t) {
+            return self.profilefunc_pbc_or_none();
+        }
         // A function-pointer field is `Ptr(FuncType)` (`lltype.py FuncType`,
         // `SomePtr`), not a classdef-less `SomeInstance`.  Raw `fn` has
         // `_gckind == 'raw'`, so `getkind` is Signed — the dual-gate twin
@@ -5701,6 +5794,13 @@ impl Bookkeeper {
             return SomeValue::Impossible;
         }
         if let Some(inner) = strip_generic_leaf(stripped, "Option") {
+            // `executioncontext.py` `profilefunc`: `Option<ProfileFunc>` is
+            // a nullable PBC, not the generic `Option<fn>` `Ptr(FuncType)`.
+            if self.is_profilefunc_type_spelling(inner.trim())
+                || self.is_profilefunc_type_spelling(stripped)
+            {
+                return self.profilefunc_pbc_or_none();
+            }
             // `Option<fn>` is the nullable `Ptr(FuncType)`, not
             // `union(SomePtr, s_None)`. `s_None` is `SomeNone`
             // (`annotator/model.py` `s_None`); `pairtype(SomeObject,
@@ -18451,6 +18551,64 @@ mod tests {
             matches!(t.items[0], SomeValue::Integer(_)),
             "slots().0 is *mut usize, got {:?}",
             t.items[0]
+        );
+    }
+
+    #[test]
+    fn profilefunc_field_projects_as_nullable_pbc_not_fn_ptr() {
+        use crate::annotator::description::{DescEntry, FunctionDesc};
+        use crate::flowspace::argument::Signature;
+        use crate::flowspace::model::HostObject;
+
+        let bk = bk();
+        let empty = bk.project_struct_field_type("Option<ProfileFunc>");
+        assert!(
+            matches!(empty, SomeValue::None_(_)),
+            "empty family seeds s_None so a later store can union in, got {empty:?}"
+        );
+
+        let host = HostObject::new_user_function(compiled_graph_func(
+            "def hook_a():\n    return None\n",
+            Vec::new(),
+        ));
+        let desc = Rc::new(RefCell::new(FunctionDesc::new(
+            bk.clone(),
+            Some(host),
+            "hook_a",
+            Signature::new(Vec::<String>::new(), None, None),
+            None,
+            None,
+        )));
+        bk.set_profilefunc_family(
+            vec![DescEntry::function(desc)],
+            vec!["hook_a".into()],
+            vec!["ProfileFunc".into(), "Option<ProfileFunc>".into()],
+        );
+        let SomeValue::PBC(pbc) = bk.project_struct_field_type("Option<ProfileFunc>") else {
+            panic!(
+                "executioncontext.py profilefunc is a nullable PBC, got {:?}",
+                bk.project_struct_field_type("Option<ProfileFunc>")
+            );
+        };
+        assert!(pbc.can_be_none, "Option<ProfileFunc> is can_be_None");
+        assert_eq!(pbc.descriptions.len(), 1);
+        let SomeValue::PBC(bare) = bk.project_struct_field_type("ProfileFunc") else {
+            panic!(
+                "ProfileFunc itself is the same family, got {:?}",
+                bk.project_struct_field_type("ProfileFunc")
+            );
+        };
+        assert!(bare.can_be_none);
+        let builtin =
+            bk.project_struct_field_type("fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>");
+        assert!(
+            matches!(builtin, SomeValue::Ptr(_)),
+            "BuiltinCodeFn stays SomePtr, got {builtin:?}"
+        );
+        let generic = bk.project_struct_field_type("Option<fn()>");
+        assert!(
+            matches!(generic, SomeValue::Ptr(_)),
+            "generic Option<fn> stays SomePtr, got {generic:?}"
         );
     }
 }

@@ -6099,6 +6099,9 @@ impl<'a> Lowering<'a> {
         // [`tyref_to_value_type_with`] gives. A ref null copied into that
         // inputarg is the `Move` from Ref to Int.
         let value_ty = self.value_type_of(dest_ty);
+        if tyref_is_profilefunc_family(dest_ty, self.llbc) {
+            return Some(self.graph.push_const_none(bb_id));
+        }
         if matches!(value_ty, ValueType::Int)
             && (type_node_is_fn_ptr(node, self.llbc)
                 || tyref_option_payload_is_fn_ptr(dest_ty, self.llbc))

@@ -92,6 +92,7 @@ mod parse;
     )
 )]
 pub mod pipeline;
+mod profilefunc_family;
 mod runtime_names;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -243,6 +244,8 @@ fn build_semantic_program_via_active_frontend(
             let mut unsafe_fn_stubs = Vec::new();
             let mut foreign_opaque_method_externals = Vec::new();
             let mut eval_hook_graphs = Vec::new();
+            let mut profilefunc_graphs = Vec::new();
+            let mut profilefunc_spellings = Vec::new();
             let mut declared_gc = front::mir::DeclaredGcFacts::default();
             let mut raw_alloc_flavor_structs = std::collections::HashSet::new();
             // `_exception_class_<Enum>` is a program-wide class property.
@@ -367,12 +370,26 @@ fn build_semantic_program_via_active_frontend(
                         eval_hook_graphs.push(path);
                     }
                 }
+                for path in front::mir::discover_profilefunc_graphs(&llbc) {
+                    if !profilefunc_graphs.contains(&path) {
+                        profilefunc_graphs.push(path);
+                    }
+                }
+                for spelling in front::mir::discover_profilefunc_spellings(&llbc) {
+                    if !profilefunc_spellings.contains(&spelling) {
+                        profilefunc_spellings.push(spelling);
+                    }
+                }
             }
             discovered.sort_by(|a, b| a.0.cmp(&b.0));
             discovered.dedup();
             let foldable_cross = front::mir::register_foldable_const_lits(foldable_cross);
             let cross_tombstoned_leaves = duplicate_leaf_facts.tombstoned_leaves();
             crate::local_crates::register_local_crate_roots(crate_names);
+            crate::profilefunc_family::register_profilefunc_family(
+                profilefunc_graphs.clone(),
+                profilefunc_spellings.clone(),
+            );
 
             let mut graph_bodies = front::graph_body::GraphBodyProvider::new(
                 static_addrs,
@@ -405,6 +422,12 @@ fn build_semantic_program_via_active_frontend(
                 );
                 if !eval_hook_graphs.is_empty() {
                     llbc.set_eval_hook_graphs(eval_hook_graphs.clone());
+                }
+                if !profilefunc_graphs.is_empty() {
+                    llbc.set_profilefunc_graphs(profilefunc_graphs.clone());
+                }
+                if !profilefunc_spellings.is_empty() {
+                    llbc.set_profilefunc_spellings(profilefunc_spellings.clone());
                 }
                 llbc.set_root_stack_effects(root_stack_crates.clone(), root_stack_touching.clone());
                 llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
