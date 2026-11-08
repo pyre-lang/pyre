@@ -3396,6 +3396,7 @@ impl<'a> Lowering<'a> {
                             &call.dest.ty,
                             &args[0],
                             src_is_pointer_operand,
+                            first_arg_ty.as_ref(),
                         )
                     {
                         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -4197,6 +4198,7 @@ impl<'a> Lowering<'a> {
                                         Some(&ValueType::Ref(None)),
                                         &orig,
                                     ),
+                                    None,
                                 ) {
                                     Some((kind, res)) => {
                                         self.graph.block_mut(bb_id).operations.push(
@@ -4229,6 +4231,7 @@ impl<'a> Lowering<'a> {
                                         Some(&ValueType::Ref(None)),
                                         &orig,
                                     ),
+                                    None,
                                 ) {
                                     Some((kind, res)) => {
                                         self.graph.block_mut(bb_id).operations.push(

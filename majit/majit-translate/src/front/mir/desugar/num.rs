@@ -480,6 +480,32 @@ impl<'a> Lowering<'a> {
             self.graph.set_goto(bb_id, target_bb, link_args);
             return Ok(true);
         }
+        // `null_mut()` dest GCREF (`*mut GCREFOpaque` / `header::GCREF` /
+        // `llmemory.GCREF`) is `_some_erased` (`rerased.py`) /
+        // `cast_instance_to_gcref` (`annlowlevel.py`). `ptr_null_constant`
+        // is a non-constant classdef-less `SomeInstance`; recast onto
+        // GCREF the way the Utf8Str dest recast recasts onto SomeString.
+        // `cast_instance_intrinsic` then returns
+        // `lltype_to_annotation(GCREF)` (`SomePtr`), not a constant
+        // nullptr. Family union is `SomePtr ∪ SomePtr`, not
+        // `Instance(None) ∪ SomePtr`.
+        if tyref_is_gcref_spelling(&call.dest.ty, self.llbc) {
+            // `recast_instance_to_gcref` / `cast_instance_call("GCREF")`
+            // stamps `ValueType::Ref(Some("GCREF"))` so a later
+            // GCREF→GCREF aliases (`src_already_gcref`).
+            // `tyref_to_value_type_with` keeps `GCREFOpaque` / `*mut u8`
+            // as `Ref(None)`; only VOIDP and `ty_is_raw_address` are Int.
+            let recast_ty = ValueType::Ref(Some("GCREF".to_string()));
+            let bb_id = self.emit_bb(mir_bb);
+            let res = self
+                .graph
+                .push_niche_null(bb_id, Some(&("GCREF".to_string(), recast_ty)));
+            self.local_var[dest_local] = Some(LocalValue::One(res));
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(true);
+        }
         let Some(spelling) = self.raw_adt_ptr_null_spelling(&call.dest.ty) else {
             return Ok(false);
         };

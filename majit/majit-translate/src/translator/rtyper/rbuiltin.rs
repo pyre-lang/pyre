@@ -5016,6 +5016,25 @@ pub fn rtype_cast_instance_intrinsic(
     // surfaces a `TyperError` here instead of panicking on a raw
     // `args_v[0]` index, matching the other typers in this module.
     let r_arg0 = arg_repr(hop, 0)?;
+    let gcref = crate::translator::rtyper::lltypesystem::lltype::GCREF.clone();
+    // `rerased.py` `_rtype_erase`: `NoneRepr.lowleveltype is Void` yields
+    // `hop.inputconst(GCREF, nullptr(GCREF.TO))`, not `cast_opaque_ptr`
+    // of a Void. `CastObjectToPtrEntry.specialize_call` does the same
+    // for `NoneRepr` (`annlowlevel.py`).
+    if r_arg0.lowleveltype() == &LowLevelType::Void && result_lltype == gcref {
+        hop.exception_cannot_occur()?;
+        let LowLevelType::Ptr(dest) = &gcref else {
+            return Err(TyperError::message(
+                "rtype_cast_instance_intrinsic: GCREF is not a Ptr",
+            ));
+        };
+        let null = crate::translator::rtyper::lltypesystem::lltype::nullptr(LowLevelType::from(
+            dest.TO.clone(),
+        ))
+        .map_err(TyperError::message)?;
+        let c = HighLevelOp::inputconst(&gcref, &ConstValue::LLPtr(Box::new(null)))?;
+        return Ok(Some(Hlvalue::Constant(c)));
+    }
     let v_ptr = hop.inputarg(&r_arg0, 0)?;
     // `TupleRepr.convert_from_to` (`rtuple.py`) returns the value
     // unchanged when the two tuple reprs have the same lowleveltype.
@@ -5103,7 +5122,6 @@ pub fn rtype_cast_instance_intrinsic(
     // concrete GC pointer to/from llmemory.GCREF with `cast_opaque_ptr`
     // (`rgcref.py __extend__`).  The same marker also carries ordinary
     // class-pointer narrows, which remain `cast_pointer` per rclass.py.
-    let gcref = crate::translator::rtyper::lltypesystem::lltype::GCREF.clone();
     // `cast_pointer` is legal only between related structs: upstream decides
     // that with `castable(PTRTYPE, CURTYPE)` (`lltype.py`), which
     // raises `InvalidCast` for an unrelated pair.  An unrelated pair of GC
@@ -7736,6 +7754,60 @@ mod tests {
         assert!(llops._called_exception_is_here_or_cannot_occur);
     }
 
+    #[test]
+    fn rtype_force_cast_gcref_emits_force_cast() {
+        // `rffi.py` `cast` of a raw pointer to GCREF:
+        // `ForceCastEntry.specialize_call` (`ll2ctypes.py`)
+        // `genop('force_cast', [v_arg], GCREF)`.
+        use crate::annotator::model::{SomePtr, SomeType};
+        use crate::flowspace::model::{ConstValue, Constant, Hlvalue, Variable};
+        use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+        use crate::translator::rtyper::rmodel::PtrRepr;
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let LowLevelType::Ptr(ccharp) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        let mut s_restype = SomeValue::Type(SomeType::new());
+        s_restype.set_const_box(Constant::new(ConstValue::LowLevelType(Box::new(
+            (*GCREF).clone(),
+        ))));
+        hop.args_s.borrow_mut().push(s_restype);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Ptr(SomePtr::new((*ccharp).clone())));
+        hop.args_v
+            .borrow_mut()
+            .push(Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::LowLevelType(Box::new((*GCREF).clone())),
+                LowLevelType::Void,
+            )));
+        let var = Variable::named("p");
+        var.set_concretetype(Some((*CCHARP).clone()));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(var));
+        hop.args_r.borrow_mut().push(None);
+        hop.args_r
+            .borrow_mut()
+            .push(Some(Arc::new(PtrRepr::new(*ccharp)) as Arc<dyn Repr>));
+
+        let result = rtype_force_cast(&hop, &HashMap::new())
+            .expect("ForceCastEntry rtypes GCREF")
+            .expect("force_cast returns a value");
+        let llops = hop.llops.borrow();
+        let last = llops.ops.last().expect("the llop is emitted");
+        assert_eq!(last.opname, "force_cast");
+        assert_eq!(result, last.result);
+        let Hlvalue::Variable(v) = &last.result else {
+            panic!("force_cast result is a Variable, got {:?}", last.result);
+        };
+        assert_eq!(v.concretetype(), Some((*GCREF).clone()));
+        assert!(llops._called_exception_is_here_or_cannot_occur);
+    }
+
     fn dict_constructor_hop() -> (
         std::rc::Rc<crate::annotator::annrpython::RPythonAnnotator>,
         HighLevelOp,
@@ -8311,6 +8383,66 @@ mod tests {
         assert!(
             msg.contains("not castable") || msg.contains("refuses"),
             "GCREF → Raw must still error, got {msg}"
+        );
+    }
+
+    #[test]
+    fn rtype_cast_instance_intrinsic_void_none_to_gcref_is_nullptr_const() {
+        // `rerased.py` `_rtype_erase` Void arm: `NoneRepr` rtypes to
+        // `inputconst(GCREF, nullptr(GCREF.TO))`.
+        use crate::annotator::bookkeeper::gcref_ptr_annotation;
+        use crate::annotator::model::s_none;
+        use crate::flowspace::model::Hlvalue;
+        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, PtrTarget};
+        use crate::translator::rtyper::pairtype::ReprClassId;
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let s_none = s_none();
+        let r_none = hop.rtyper.getrepr(&s_none).expect("NoneRepr");
+        assert_eq!(r_none.repr_class_id(), ReprClassId::NoneRepr);
+        assert_eq!(r_none.lowleveltype(), &LowLevelType::Void);
+        hop.args_s.borrow_mut().push(s_none);
+        hop.args_r.borrow_mut().push(Some(r_none));
+        let r_gcref = hop
+            .rtyper
+            .getrepr(&gcref_ptr_annotation())
+            .expect("PtrRepr GCREF");
+        *hop.r_result.borrow_mut() = Some(r_gcref);
+
+        let out = rtype_cast_instance_intrinsic(&hop, &HashMap::new())
+            .expect("Void → GCREF")
+            .expect("nullptr constant");
+        let Hlvalue::Constant(c) = out else {
+            panic!("Void dest-GCREF must be inputconst, got {out:?}");
+        };
+        let ConstValue::LLPtr(ptr) = &c.value else {
+            panic!("expected LLPtr nullptr, got {:?}", c.value);
+        };
+        assert!(!ptr.nonzero(), "nullptr(GCREF.TO) must be null");
+        assert_eq!(c.concretetype.as_ref(), Some(&*GCREF));
+        let Some(LowLevelType::Ptr(ll_ptr)) = &c.concretetype else {
+            panic!("concretetype must be Ptr, got {:?}", c.concretetype);
+        };
+        assert!(
+            matches!(&ll_ptr.TO, PtrTarget::Opaque(op) if op.tag == "GCREF"),
+            "nullptr(GCREF.TO), got {:?}",
+            ll_ptr.TO
+        );
+        let ops = hop.llops.borrow();
+        assert!(
+            ops.ops.iter().all(|op| op.opname != "cast_opaque_ptr"),
+            "Void dest-GCREF must not emit cast_opaque_ptr, ops={:?}",
+            ops.ops
+                .iter()
+                .map(|op| op.opname.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            ops._called_exception_is_here_or_cannot_occur,
+            "rtype_cast_instance_intrinsic calls exception_cannot_occur"
         );
     }
 }

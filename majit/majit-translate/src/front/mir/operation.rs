@@ -1672,6 +1672,59 @@ impl<'a> Lowering<'a> {
         (crate::model::cast_instance_call("GCREF", arg.clone()), res)
     }
 
+    /// Reinterpret a raw (non-GC) pointer as `llmemory.GCREF`.
+    /// `rffi.py` `cast` → `lltype.py` `force_cast`. `cast_opaque_ptr` /
+    /// `annlowlevel.py` `cast_instance_to_gcref` take a GC pointer only.
+    pub(in crate::front::mir) fn recast_raw_ptr_to_gcref(
+        &mut self,
+        arg: &Variable,
+    ) -> (OpKind, Variable) {
+        let gcref = crate::translator::rtyper::lltypesystem::lltype::GCREF.clone();
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        res.set_concretetype(Some(gcref.clone()));
+        (
+            rffi_cast_kind(
+                gcref,
+                arg.clone(),
+                ValueType::Ref(Some("GCREF".to_string())),
+            ),
+            res,
+        )
+    }
+
+    /// Dest-GCREF source gckind. Prefer the Rust pointee declaration
+    /// ([`Self::ptr_pointee_is_gc`]). A recovered orig with no `TyRef`
+    /// uses the classed producer; dest-GCREF `ConstRefNull` is
+    /// `erase(None)` (`rerased.py` `_some_erased`).
+    fn src_gcref_cast_is_gc_pointee(
+        &self,
+        src_ty: Option<&TyRef>,
+        producer_kind: Option<&OpKind>,
+        producer_ty: Option<&ValueType>,
+        src_kind: Option<&ValueType>,
+        src_root: Option<&str>,
+    ) -> bool {
+        if src_ty.is_some() {
+            return self.ptr_pointee_is_gc(src_ty);
+        }
+        if matches!(producer_kind, Some(OpKind::ConstRefNull)) {
+            return true;
+        }
+        let classed_gc = |ty: Option<&ValueType>, root: Option<&str>| match ty {
+            Some(ValueType::Ref(Some(root))) => {
+                !crate::annotator::bookkeeper::is_gcref_type_spelling(root)
+            }
+            Some(ValueType::Str) => true,
+            Some(ValueType::Ref(_)) => {
+                root.is_some_and(|r| !crate::annotator::bookkeeper::is_gcref_type_spelling(r))
+            }
+            _ => false,
+        };
+        classed_gc(producer_ty, None) || classed_gc(src_kind, src_root)
+    }
+
     /// Extract the `offset` operand from an `Index { offset, from_end }`
     /// projection element and resolve it to a Variable. A `from_end` index
     /// names `len - offset`; callers that know the sequence length subtract
@@ -2151,6 +2204,7 @@ impl<'a> Lowering<'a> {
                             dest_ty,
                             &arg,
                             src_is_pointer,
+                            operand_tyref(&operand),
                         )
                     {
                         return Ok((Some(op), res));
@@ -2237,6 +2291,7 @@ impl<'a> Lowering<'a> {
                             dest_ty,
                             &arg,
                             self.cast_src_is_pointer(None, Some(&ValueType::Ref(None)), &arg),
+                            None,
                         ) {
                             Some((op, res)) => return Ok((Some(op), res)),
                             None => return Ok((None, arg)),
@@ -2461,6 +2516,7 @@ impl<'a> Lowering<'a> {
                             dest_ty,
                             &orig,
                             self.cast_src_is_pointer(None, Some(&ValueType::Ref(None)), &orig),
+                            None,
                         ) {
                             Some((op, res)) => return Ok((Some(op), res)),
                             None => return Ok((None, orig)),
@@ -2481,6 +2537,7 @@ impl<'a> Lowering<'a> {
                             dest_ty,
                             &orig,
                             self.cast_src_is_pointer(None, Some(&ValueType::Ref(None)), &orig),
+                            None,
                         ) {
                             Some((op, res)) => return Ok((Some(op), res)),
                             None => return Ok((None, orig)),
@@ -2565,6 +2622,7 @@ impl<'a> Lowering<'a> {
                                     dest_ty,
                                     &arg,
                                     src_is_pointer,
+                                    operand_tyref(&operand),
                                 ) {
                                     Some((op, res)) => (Some(op), res),
                                     None => match self.raw_owner_retype(
@@ -2792,6 +2850,7 @@ impl<'a> Lowering<'a> {
                     tyref_node(src_ty, self.llbc)
                         .is_some_and(|node| one_level_pointer_pointee(node, self.llbc).is_some())
                 });
+                let src_ty_owned = operand_tyref(&operand).cloned();
                 let v = self.resolve_operand(mir_bb, operand)?;
                 let src_is_pointer = self.pointer_word_vars.contains(&v)
                     || src_is_pointer_from_ty
@@ -2865,6 +2924,7 @@ impl<'a> Lowering<'a> {
                             &ty,
                             &v,
                             src_is_pointer,
+                            src_ty_owned.as_ref(),
                         )
                         .or_else(|| {
                             self.raw_owner_retype(src_kind.as_ref(), src_root.as_deref(), &ty, &v)
@@ -4577,18 +4637,15 @@ impl<'a> Lowering<'a> {
     ///   `r_to.lowleveltype`. Stamp `__cast_instance_intrinsic` with
     ///   `ValueType::Str`, not
     ///   [`Self::instance_narrow_for_type`]'s default `Ref(Some(root))`.
-    /// * **dest-GCREF** — `p as *mut GCREFOpaque` from a classed GC
-    ///   pointer (`Ref(Some(root))` / registered GC class root). The
-    ///   class is the type of the value being cast
-    ///   (`annlowlevel.py` `cast_instance_to_gcref`), read off `arg`'s
-    ///   producer when the caller hint is blank. Aliasing keeps
-    ///   `SomeInstance` on a GCREF-declared result; the MethodDesc
-    ///   PBC then unions `Ptr(GCREF) ∪ Instance`. Upstream
-    ///   `rgc.cast_instance_to_gcref` / `annlowlevel.cast_instance_to_gcref`
-    ///   is an explicit op whose annotation is `lltype_to_annotation(GCREF)`
-    ///   (`SomePtr`). [`Self::recast_instance_to_gcref`] stamps
-    ///   `__cast_instance_intrinsic("GCREF")`. A GCREF→GCREF or raw/int
-    ///   source stays an alias.
+    /// * **dest-GCREF** — `p as *mut GCREFOpaque`. Split on the source
+    ///   pointee's gckind ([`Self::ptr_pointee_is_gc`]): a GC pointee is
+    ///   `annlowlevel.py` `cast_instance_to_gcref` /
+    ///   `lltype.py` `cast_opaque_ptr` ([`Self::recast_instance_to_gcref`]);
+    ///   a raw pointer (tuple storage, `*mut u8`, VOIDP) is `rffi.py`
+    ///   `cast` → `lltype.py` `force_cast` ([`Self::recast_raw_ptr_to_gcref`]).
+    ///   Both annotate `lltype_to_annotation(GCREF)` (`SomePtr`).
+    ///   GCREF→GCREF stays an alias. A genuine integer keeps
+    ///   `cast_int_to_ptr`.
     ///
     /// A `Ref` source is required for the narrow / address arms: an
     /// `addr_usize as *const Struct` reinterpret is `cast_int_to_ptr`
@@ -4623,6 +4680,7 @@ impl<'a> Lowering<'a> {
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::front::mir) fn ptr_cast_marker(
         &mut self,
         src_kind: Option<&ValueType>,
@@ -4630,6 +4688,7 @@ impl<'a> Lowering<'a> {
         dest_ty: &TyRef,
         arg: &Variable,
         src_is_pointer: bool,
+        src_ty: Option<&TyRef>,
     ) -> Option<(OpKind, Variable)> {
         let dest_kind = tyref_to_value_type_with(
             dest_ty,
@@ -4665,64 +4724,68 @@ impl<'a> Lowering<'a> {
                 res,
             ));
         }
+        // dest-GCREF (`*mut GCREFOpaque` / `llmemory.GCREF`). Split on
+        // the source pointee's gckind (`ptr_pointee_is_gc`, same
+        // predicate as `is_raw_ptr_is_null_keeps_is_none`):
+        // GC → `annlowlevel.py` `cast_instance_to_gcref` /
+        // `lltype.py` `cast_opaque_ptr`; raw → `rffi.py` `cast` /
+        // `lltype.py` `force_cast`. Run before the `Ref` gate so a
+        // classdef-less raw pointer (`*mut (Vec, Vec)` kwargs storage)
+        // still annotates `lltype_to_annotation(GCREF)` (`SomePtr`).
+        // GCREF→GCREF stays an alias (`same_as`). An int source is
+        // `cast_int_to_ptr`, not this erase.
+        if tyref_is_gcref_spelling(dest_ty, self.llbc) {
+            let producer = resolve_to_producer_op(&self.graph, arg).and_then(|(block_id, idx)| {
+                self.graph
+                    .blocks
+                    .iter()
+                    .find(|block| block.id == block_id)
+                    .and_then(|block| block.operations.get(idx))
+            });
+            let producer_ty = producer.and_then(|op| match &op.kind {
+                OpKind::Call { result_ty, .. }
+                | OpKind::UnaryOp { result_ty, .. }
+                | OpKind::BinOp { result_ty, .. }
+                | OpKind::Input { ty: result_ty, .. }
+                | OpKind::FieldRead { ty: result_ty, .. }
+                | OpKind::LoadStatic { ty: result_ty, .. } => Some(result_ty),
+                _ => None,
+            });
+            let src_already_gcref = match producer_ty {
+                Some(ValueType::Ref(Some(root))) => {
+                    crate::annotator::bookkeeper::is_gcref_type_spelling(root)
+                }
+                _ => match src_kind {
+                    Some(ValueType::Ref(Some(root))) => {
+                        crate::annotator::bookkeeper::is_gcref_type_spelling(root)
+                    }
+                    Some(ValueType::Ref(_)) => {
+                        src_root.is_some_and(crate::annotator::bookkeeper::is_gcref_type_spelling)
+                    }
+                    _ => false,
+                },
+            };
+            if src_already_gcref {
+                return None;
+            }
+            if src_is_pointer || matches!(src_kind, Some(ValueType::Ref(_))) {
+                if self.src_gcref_cast_is_gc_pointee(
+                    src_ty,
+                    producer.map(|op| &op.kind),
+                    producer_ty,
+                    src_kind,
+                    src_root,
+                ) {
+                    return Some(self.recast_instance_to_gcref(arg));
+                }
+                return Some(self.recast_raw_ptr_to_gcref(arg));
+            }
+            return None;
+        }
         if !matches!(src_kind, Some(ValueType::Ref(_))) {
             return None;
         }
         if !matches!(dest_kind, ValueType::Ref(_)) {
-            return None;
-        }
-        if tyref_is_gcref_spelling(dest_ty, self.llbc) {
-            // `annlowlevel.py` `cast_instance_to_gcref` /
-            // `rgc.cast_instance_to_gcref`: the erase is the type of the
-            // value being cast, not the caller's src hint. Recovery
-            // (`p as usize as *mut GCREFOpaque`) passes `Ref(None)` / no
-            // root; read the class off `arg`'s producer
-            // (`resolve_to_producer_op`, same walk as
-            // [`Self::address_cast_pointer`]). GCREF→GCREF and unclassed
-            // `Ref(None)` fall through to the hint and stay an alias.
-            let src_classed = {
-                let from_arg = resolve_to_producer_op(&self.graph, arg)
-                    .and_then(|(block_id, idx)| {
-                        self.graph
-                            .blocks
-                            .iter()
-                            .find(|block| block.id == block_id)
-                            .and_then(|block| block.operations.get(idx))
-                    })
-                    .and_then(|op| match &op.kind {
-                        OpKind::Call { result_ty, .. }
-                        | OpKind::UnaryOp { result_ty, .. }
-                        | OpKind::BinOp { result_ty, .. }
-                        | OpKind::Input { ty: result_ty, .. }
-                        | OpKind::FieldRead { ty: result_ty, .. }
-                        | OpKind::LoadStatic { ty: result_ty, .. } => Some(result_ty),
-                        _ => None,
-                    })
-                    .is_some_and(|ty| match ty {
-                        ValueType::Ref(Some(root)) => {
-                            !crate::annotator::bookkeeper::is_gcref_type_spelling(root)
-                        }
-                        _ => false,
-                    });
-                if from_arg {
-                    true
-                } else {
-                    match src_kind {
-                        Some(ValueType::Ref(Some(root)))
-                            if !crate::annotator::bookkeeper::is_gcref_type_spelling(root) =>
-                        {
-                            true
-                        }
-                        Some(ValueType::Ref(_)) => src_root.is_some_and(|r| {
-                            !crate::annotator::bookkeeper::is_gcref_type_spelling(r)
-                        }),
-                        _ => false,
-                    }
-                }
-            };
-            if src_classed {
-                return Some(self.recast_instance_to_gcref(arg));
-            }
             return None;
         }
         let (segments, result_ty) =
@@ -6596,6 +6659,7 @@ impl<'a> Lowering<'a> {
                                 &place_ty,
                                 &res,
                                 self.cast_src_is_pointer(Some(&field_ty), Some(&ty), &res),
+                                Some(&field_ty),
                             ) {
                                 self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                                     result: Some(narrowed.clone()),
@@ -10106,31 +10170,35 @@ pub(in crate::front::mir) fn push_direct_ptradd(
 
 /// `rffi.cast(PTRTYPE, v)` (`rffi.py` `cast` = `ll2ctypes.force_cast`).
 /// `ForceCastEntry` (`ll2ctypes.py`) → `genop('force_cast', [v_arg], RESTYPE)`.
+pub(in crate::front::mir) fn rffi_cast_kind(
+    restype: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    v: Variable,
+    result_ty: ValueType,
+) -> OpKind {
+    use crate::flowspace::model::ConstValue;
+    OpKind::Call {
+        target: CallTarget::function_path(["rpython", "rtyper", "lltypesystem", "rffi", "cast"]),
+        args: vec![
+            crate::model::LinkArg::from(ConstValue::LowLevelType(Box::new(restype))),
+            crate::model::LinkArg::from(v),
+        ],
+        result_ty,
+    }
+}
+
+/// `rffi.cast(PTRTYPE, v)` (`rffi.py` `cast` = `ll2ctypes.force_cast`).
+/// `ForceCastEntry` (`ll2ctypes.py`) → `genop('force_cast', [v_arg], RESTYPE)`.
 pub(in crate::front::mir) fn emit_rffi_cast(
     graph: &mut FunctionGraph,
     bb: BlockId,
     v: Variable,
     ptr_ty: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
 ) -> Variable {
-    use crate::flowspace::model::ConstValue;
     let raw = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
     raw.set_concretetype(Some(ptr_ty.clone()));
     graph.block_mut(bb).operations.push(SpaceOperation {
         result: Some(raw.clone()),
-        kind: OpKind::Call {
-            target: CallTarget::function_path([
-                "rpython",
-                "rtyper",
-                "lltypesystem",
-                "rffi",
-                "cast",
-            ]),
-            args: vec![
-                crate::model::LinkArg::from(ConstValue::LowLevelType(Box::new(ptr_ty))),
-                crate::model::LinkArg::from(v),
-            ],
-            result_ty: ValueType::Int,
-        },
+        kind: rffi_cast_kind(ptr_ty, v, ValueType::Int),
     });
     raw
 }

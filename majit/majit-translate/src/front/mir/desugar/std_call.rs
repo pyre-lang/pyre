@@ -5855,6 +5855,7 @@ impl<'a> Lowering<'a> {
                 dest_ty,
                 &res,
                 self.cast_src_is_pointer(None, Some(&ValueType::Ref(None)), &res),
+                None,
             )
         {
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -6961,6 +6962,14 @@ impl<'a> Lowering<'a> {
         &self,
         ptr_ty: Option<&TyRef>,
     ) -> bool {
+        self.ptr_pointee_is_gc(ptr_ty)
+    }
+
+    /// A Rust pointer's gckind is the pointee type's declaration: T is GC
+    /// iff T implements `GcType` or is a first-field ancestor of one
+    /// (`PyObject`). Same predicate as
+    /// [`Self::is_raw_ptr_is_null_keeps_is_none`].
+    pub(in crate::front::mir) fn ptr_pointee_is_gc(&self, ptr_ty: Option<&TyRef>) -> bool {
         let Some(ty) = ptr_ty else {
             return false;
         };

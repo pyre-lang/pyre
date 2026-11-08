@@ -2157,6 +2157,12 @@ fn cast_instance_intrinsic(
         // annotation. A GC-erasure identity around the cast
         // (`reload_top_root`, `try_gc_current_object_address`) is peeled
         // before annotation (`retarget_gc_erasure_identity_args`).
+        //
+        // `annlowlevel.py` `cast_instance_to_gcref` and `rerased.py`
+        // `_some_erased` annotate as `lltype_to_annotation(GCREF)` (the
+        // non-constant `projected` SomePtr), including `SomeNone`
+        // (`erase(None)`). `nullptr(GCREF.TO)` is `_rtype_erase`'s Void
+        // arm (`rbuiltin.rs` `rtype_cast_instance_intrinsic`).
         return match operand {
             SomeValue::String(_)
             | SomeValue::Instance(_)
@@ -3605,6 +3611,102 @@ mod tests {
         );
     }
 
+    /// Dest-GCREF `null_mut` recast (`_some_erased` / `cast_instance_to_gcref`)
+    /// and an `as GCREF` member union to `SomePtr(GCREF)`. Family rtype is
+    /// `PtrRepr` identity; there is no InstanceRepr→PtrRepr convert.
+    #[test]
+    fn dest_gcref_null_mut_family_unions_to_someptr_and_rtypes() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::bookkeeper::{gcref_ptr_annotation, is_gcref_type_spelling};
+        use crate::annotator::model::{SomeObjectTrait, unionof};
+        use crate::flowspace::model::{Hlvalue, Variable};
+        use crate::translator::rtyper::pairtype::ReprClassId;
+        use crate::translator::rtyper::rtyper::{LowLevelOpList, RPythonTyper};
+
+        let bk = bk();
+        let s_null_mut = ptr_null_constant(&bk, &[], &no_kwds()).expect("ptr_null_constant");
+        assert!(
+            matches!(&s_null_mut, SomeValue::Instance(inst) if inst.classdef.is_none() && inst.can_be_none),
+            "GC-instance dest null_mut stays classdef-less SomeInstance, got {s_null_mut:?}"
+        );
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("GCREF"))
+            .expect("GCREF root constant");
+        assert!(is_gcref_type_spelling("GCREF"));
+        let s_null = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_null_mut.clone()), Some(s_root.clone())],
+            &no_kwds(),
+        )
+        .expect("dest-GCREF recast of null_mut");
+        assert!(
+            matches!(&s_null, SomeValue::Ptr(_)),
+            "dest-GCREF null_mut annotates SomePtr(GCREF), got {s_null:?}"
+        );
+        assert!(
+            !s_null.is_constant(),
+            "non-constant ptr_null_constant recast is lltype_to_annotation(GCREF), got {s_null:?}"
+        );
+        let s_none_gcref = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_none()), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("dest-GCREF recast of None_");
+        assert!(
+            matches!(&s_none_gcref, SomeValue::Ptr(_)),
+            "None_ dest-GCREF annotates SomePtr(GCREF), got {s_none_gcref:?}"
+        );
+        assert!(
+            !s_none_gcref.is_constant(),
+            "None_ dest-GCREF is _some_erased / lltype_to_annotation(GCREF), got {s_none_gcref:?}"
+        );
+        let s_cast = gcref_ptr_annotation();
+        assert!(
+            matches!(&s_cast, SomeValue::Ptr(_)),
+            "as GCREF is SomePtr, got {s_cast:?}"
+        );
+        let family = unionof([&s_null, &s_cast]).expect("family SomePtr ∪ SomePtr");
+        assert!(
+            matches!(&family, SomeValue::Ptr(_)),
+            "family return is SomePtr(GCREF), got {family:?}"
+        );
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let r_null = rtyper.getrepr(&s_null).expect("null member PtrRepr");
+        let r_cast = rtyper.getrepr(&s_cast).expect("cast member PtrRepr");
+        let r_family = rtyper.getrepr(&family).expect("family PtrRepr");
+        assert_eq!(r_null.repr_class_id(), ReprClassId::PtrRepr);
+        assert_eq!(r_cast.repr_class_id(), ReprClassId::PtrRepr);
+        assert_eq!(r_family.repr_class_id(), ReprClassId::PtrRepr);
+        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+        let v = Hlvalue::Variable(Variable::named("storage"));
+        llops
+            .convertvar(v.clone(), r_null.as_ref(), r_family.as_ref())
+            .expect("null member convert is PtrRepr identity");
+        llops
+            .convertvar(v.clone(), r_cast.as_ref(), r_family.as_ref())
+            .expect("cast member convert is PtrRepr identity");
+
+        let r_inst = rtyper
+            .getrepr(&s_null_mut)
+            .expect("InstanceRepr of null_mut");
+        assert_eq!(r_inst.repr_class_id(), ReprClassId::InstanceRepr);
+        let err = llops
+            .convertvar(v, r_inst.as_ref(), r_family.as_ref())
+            .expect_err("no InstanceRepr→PtrRepr pairtype");
+        assert!(
+            err.to_string().contains("don't know how to convert from"),
+            "Instance→Ptr convert must fail, got {err}"
+        );
+    }
+
     /// `lltype.nullptr(FUNC)` of a spelled signature is the same
     /// `SomePtr` as a `Some` of that `fn` type (`getfunctionptr`).
     #[test]
@@ -4996,6 +5098,40 @@ mod tests {
             crate::model::getkind(&LowLevelType::Ptr(Box::new(ptr.ll_ptrtype.clone()))),
             crate::model::ConcreteType::Signed,
             "CArrayPtr kinds as Signed"
+        );
+    }
+
+    /// Raw pointer → GCREF is `rffi.py` `cast` /
+    /// `ForceCastEntry.compute_result_annotation` (`lltype_to_annotation(GCREF)`).
+    #[test]
+    fn rffi_cast_gcref_annotates_someptr() {
+        use crate::annotator::model::{SomeObjectTrait, SomeType};
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType, SomePtr};
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+
+        let mut s_restype = SomeValue::Type(SomeType::new());
+        s_restype.set_const_box(Constant::new(ConstValue::LowLevelType(Box::new(
+            (*GCREF).clone(),
+        ))));
+        let LowLevelType::Ptr(ccharp) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        let s_p = SomeValue::Ptr(SomePtr::new(*ccharp));
+        let out = rffi_cast(&bk(), &[Some(s_restype), Some(s_p)], &no_kwds())
+            .expect("ForceCastEntry of CCHARP to GCREF");
+        let want = crate::translator::rtyper::llannotation::lltype_to_annotation((*GCREF).clone());
+        assert!(
+            matches!(&out, SomeValue::Ptr(_)),
+            "rffi.cast(GCREF, p) annotates SomePtr(GCREF), got {out:?}"
+        );
+        assert_eq!(
+            out, want,
+            "rffi.cast(GCREF, p) is lltype_to_annotation(GCREF)"
+        );
+        assert!(
+            !out.is_constant(),
+            "ForceCastEntry of a live pointer is non-constant SomePtr, got {out:?}"
         );
     }
 
