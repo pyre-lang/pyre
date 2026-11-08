@@ -360,6 +360,14 @@ pub struct SetStrategyRef {
     pub owner: GCREF,
 }
 
+/// MiniMark-allocated by `malloc_typed_immortal` with the tid from `set_strategy_ref_gc_type_id`.
+impl crate::lltype::GcType for SetStrategyRef {
+    fn type_id() -> u32 {
+        set_strategy_ref_gc_type_id()
+    }
+    const SIZE: usize = std::mem::size_of::<SetStrategyRef>();
+}
+
 unsafe impl Sync for SetStrategyRef {}
 unsafe impl Send for SetStrategyRef {}
 
@@ -372,6 +380,59 @@ impl std::ops::Deref for SetStrategyRef {
     }
 }
 
+/// Runtime-assigned GC type id for a `SetStrategyRef` holder.
+static SET_STRATEGY_REF_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Record the GC type id registered for the `SetStrategyRef` box.
+pub fn set_set_strategy_ref_gc_type_id(id: u32) {
+    SET_STRATEGY_REF_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the runtime-assigned GC type id for the `SetStrategyRef` box.
+#[majit_macros::dont_look_inside]
+pub fn set_strategy_ref_gc_type_id() -> u32 {
+    SET_STRATEGY_REF_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Rewrite a prebuilt holder's GC header type id, keeping its immortal flags.
+///
+/// `define_prebuilt_set_strategy_ref!` accessors allocate through
+/// `malloc_typed_immortal`, which stamps tid 0 when no collector has
+/// registered `SetStrategyRef` yet. `build_gc` restamps the live tid
+/// after `register_leaf_storage_box` publishes it, the way
+/// `GCTypeLayoutBuilder.consider_constant` visits prebuilts after type
+/// ids are assigned.
+pub fn stamp_prebuilt_set_strategy_ref(holder: &'static SetStrategyRef, tid: u32) {
+    unsafe {
+        let hdr = majit_gc::header::header_of(holder as *const SetStrategyRef as usize);
+        *hdr = majit_gc::header::GcHeader::with_flags(tid, (*hdr).flags());
+    }
+}
+
+/// Same-file `LOAD_GLOBAL` of the OnceLock plus `get_or_init`, matching
+/// [`crate::noneobject::w_none`]. The registered refs row is the GC object,
+/// not the lock. `get_or_init` lives in the accessor body so the translator
+/// folds it to `ConstRefAddr`.
+macro_rules! define_prebuilt_set_strategy_ref {
+    ($cell:ident, $accessor:ident, $kind:expr, $imp:expr) => {
+        static $cell: ::std::sync::OnceLock<usize> = ::std::sync::OnceLock::new();
+        /// Process-wide `space.fromcache(StrategyCls)` holder. Prebuilt GC
+        /// object (`malloc_typed_immortal`), matching `w_not_implemented`.
+        #[inline]
+        pub fn $accessor() -> &'static crate::setobject::SetStrategyRef {
+            let addr = *$cell.get_or_init(|| {
+                crate::lltype::malloc_typed_immortal(crate::setobject::SetStrategyRef {
+                    kind: $kind,
+                    imp: $imp,
+                    owner: ::std::ptr::null_mut(),
+                }) as usize
+            });
+            unsafe { &*(addr as *const crate::setobject::SetStrategyRef) }
+        }
+    };
+}
+
 /// `setobject.py ObjectSetStrategy`. The erased box is [`SetItemsStorage`]
 /// (`newset` → `r_dict(eq_w, hash_w)`).
 pub struct ObjectSetStrategy;
@@ -380,12 +441,16 @@ pub struct ObjectSetStrategy;
 /// (`space.fromcache(ObjectSetStrategy)`).
 pub static OBJECT_SET_STRATEGY: ObjectSetStrategy = ObjectSetStrategy;
 
-/// Holder `W_SetObject.strategy` points at.
-pub static OBJECT_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
-    kind: SetStrategyKind::Object,
-    imp: &OBJECT_SET_STRATEGY,
-    owner: std::ptr::null_mut(),
-};
+// Each holder is a prebuilt GC object (`space.fromcache` /
+// `GCTypeLayoutBuilder.consider_constant` / `init_gc_object_immortal`).
+// A bare Rust static would lose the header at `addr-8`.
+// Holder `W_SetObject.strategy` points at.
+define_prebuilt_set_strategy_ref!(
+    OBJECT_SET_STRATEGY_REF,
+    object_set_strategy_ref,
+    SetStrategyKind::Object,
+    &OBJECT_SET_STRATEGY
+);
 
 /// `setobject.py EmptySetStrategy`. `get_empty_storage` is `erase(None)`.
 pub struct EmptySetStrategy;
@@ -394,12 +459,13 @@ pub struct EmptySetStrategy;
 /// (`space.fromcache(EmptySetStrategy)`).
 pub static EMPTY_SET_STRATEGY: EmptySetStrategy = EmptySetStrategy;
 
-/// Holder installed by `W_BaseSetObject.switch_to_empty_strategy`.
-pub static EMPTY_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
-    kind: SetStrategyKind::Empty,
-    imp: &EMPTY_SET_STRATEGY,
-    owner: std::ptr::null_mut(),
-};
+// Holder installed by `W_BaseSetObject.switch_to_empty_strategy`.
+define_prebuilt_set_strategy_ref!(
+    EMPTY_SET_STRATEGY_REF,
+    empty_set_strategy_ref,
+    SetStrategyKind::Empty,
+    &EMPTY_SET_STRATEGY
+);
 
 /// `setobject.py IntegerSetStrategy`. The erased box is [`IntSetStorage`]
 /// (`erase({})` of plain ints). `is_correct_type` is `is_plain_int1`.
@@ -409,12 +475,13 @@ pub struct IntegerSetStrategy;
 /// (`space.fromcache(IntegerSetStrategy)`).
 pub static INTEGER_SET_STRATEGY: IntegerSetStrategy = IntegerSetStrategy;
 
-/// Holder installed by `EmptySetStrategy.add` for a plain int.
-pub static INTEGER_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
-    kind: SetStrategyKind::Int,
-    imp: &INTEGER_SET_STRATEGY,
-    owner: std::ptr::null_mut(),
-};
+// Holder installed by `EmptySetStrategy.add` for a plain int.
+define_prebuilt_set_strategy_ref!(
+    INTEGER_SET_STRATEGY_REF,
+    integer_set_strategy_ref,
+    SetStrategyKind::Int,
+    &INTEGER_SET_STRATEGY
+);
 
 /// `setobject.py BytesSetStrategy`. The erased box is [`BytesSetStorage`]
 /// (`erase({})` of the `bytes` block). `is_correct_type` is
@@ -425,12 +492,13 @@ pub struct BytesSetStrategy;
 /// (`space.fromcache(BytesSetStrategy)`).
 pub static BYTES_SET_STRATEGY: BytesSetStrategy = BytesSetStrategy;
 
-/// Holder installed by `EmptySetStrategy.add` for an exact `bytes`.
-pub static BYTES_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
-    kind: SetStrategyKind::Bytes,
-    imp: &BYTES_SET_STRATEGY,
-    owner: std::ptr::null_mut(),
-};
+// Holder installed by `EmptySetStrategy.add` for an exact `bytes`.
+define_prebuilt_set_strategy_ref!(
+    BYTES_SET_STRATEGY_REF,
+    bytes_set_strategy_ref,
+    SetStrategyKind::Bytes,
+    &BYTES_SET_STRATEGY
+);
 
 /// `setobject.py AsciiSetStrategy`. The erased box is [`AsciiSetStorage`]
 /// (`erase({})` of the utf8 text). `is_correct_type` is
@@ -441,12 +509,13 @@ pub struct AsciiSetStrategy;
 /// (`space.fromcache(AsciiSetStrategy)`).
 pub static ASCII_SET_STRATEGY: AsciiSetStrategy = AsciiSetStrategy;
 
-/// Holder installed by `EmptySetStrategy.add` for an exact ASCII `str`.
-pub static ASCII_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
-    kind: SetStrategyKind::Ascii,
-    imp: &ASCII_SET_STRATEGY,
-    owner: std::ptr::null_mut(),
-};
+// Holder installed by `EmptySetStrategy.add` for an exact ASCII `str`.
+define_prebuilt_set_strategy_ref!(
+    ASCII_SET_STRATEGY_REF,
+    ascii_set_strategy_ref,
+    SetStrategyKind::Ascii,
+    &ASCII_SET_STRATEGY
+);
 
 /// `setobject.py IdentitySetStrategy`. The erased box is [`IdentitySetStorage`]
 /// (`erase({})` of the object itself). `is_correct_type` is
@@ -457,13 +526,13 @@ pub struct IdentitySetStrategy;
 /// (`space.fromcache(IdentitySetStrategy)`).
 pub static IDENTITY_SET_STRATEGY: IdentitySetStrategy = IdentitySetStrategy;
 
-/// Holder installed by `EmptySetStrategy.add` when
-/// `W_TypeObject.compares_by_identity` holds.
-pub static IDENTITY_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
-    kind: SetStrategyKind::Identity,
-    imp: &IDENTITY_SET_STRATEGY,
-    owner: std::ptr::null_mut(),
-};
+// Holder installed by `EmptySetStrategy.add` when `W_TypeObject.compares_by_identity` holds.
+define_prebuilt_set_strategy_ref!(
+    IDENTITY_SET_STRATEGY_REF,
+    identity_set_strategy_ref,
+    SetStrategyKind::Identity,
+    &IDENTITY_SET_STRATEGY
+);
 
 /// Python set object.
 ///
@@ -484,10 +553,10 @@ pub struct W_SetObject {
     /// `EmptySetStrategy.get_empty_storage` (`erase(None)`).
     pub sstorage: GCREF,
     /// `setobject.py W_BaseSetObject.strategy`, one word. `w_set_new` stores
-    /// [`EMPTY_SET_STRATEGY_REF`]; the first add stores
-    /// [`INTEGER_SET_STRATEGY_REF`], [`BYTES_SET_STRATEGY_REF`],
-    /// [`ASCII_SET_STRATEGY_REF`], [`IDENTITY_SET_STRATEGY_REF`], or
-    /// [`OBJECT_SET_STRATEGY_REF`].
+    /// [`empty_set_strategy_ref`]; the first add stores
+    /// [`integer_set_strategy_ref`], [`bytes_set_strategy_ref`],
+    /// [`ascii_set_strategy_ref`], [`identity_set_strategy_ref`], or
+    /// [`object_set_strategy_ref`].
     pub strategy: &'static SetStrategyRef,
     /// Element count, read WITHOUT the stripe lock.
     ///
@@ -1184,7 +1253,7 @@ where
         let set = unsafe { &mut *(obj as *mut W_SetObject) };
         let len = unsafe { (*storage).len() };
         set.sstorage = storage as GCREF;
-        set.strategy = &OBJECT_SET_STRATEGY_REF;
+        set.strategy = object_set_strategy_ref();
         // `clear` during `hash_w` has already published length 0 on the empty
         // strategy. The installed table is the pre-callback image, so the
         // length has to come from that table. `hash` stays as it was: a
@@ -1853,7 +1922,7 @@ impl AbstractUnwrappedSetStrategy for IntegerSetStrategy {
         SetStrategyKind::Int
     }
     fn strategy_ref(&self) -> &'static SetStrategyRef {
-        &INTEGER_SET_STRATEGY_REF
+        integer_set_strategy_ref()
     }
     fn storage_gc_type_id(&self) -> u32 {
         int_set_storage_gc_type_id()
@@ -1887,7 +1956,7 @@ impl AbstractUnwrappedSetStrategy for BytesSetStrategy {
         SetStrategyKind::Bytes
     }
     fn strategy_ref(&self) -> &'static SetStrategyRef {
-        &BYTES_SET_STRATEGY_REF
+        bytes_set_strategy_ref()
     }
     fn storage_gc_type_id(&self) -> u32 {
         bytes_set_storage_gc_type_id()
@@ -1937,7 +2006,7 @@ impl AbstractUnwrappedSetStrategy for AsciiSetStrategy {
         SetStrategyKind::Ascii
     }
     fn strategy_ref(&self) -> &'static SetStrategyRef {
-        &ASCII_SET_STRATEGY_REF
+        ascii_set_strategy_ref()
     }
     fn storage_gc_type_id(&self) -> u32 {
         ascii_set_storage_gc_type_id()
@@ -1995,7 +2064,7 @@ impl AbstractUnwrappedSetStrategy for IdentitySetStrategy {
         SetStrategyKind::Identity
     }
     fn strategy_ref(&self) -> &'static SetStrategyRef {
-        &IDENTITY_SET_STRATEGY_REF
+        identity_set_strategy_ref()
     }
     fn storage_gc_type_id(&self) -> u32 {
         identity_set_storage_gc_type_id()
@@ -2645,7 +2714,7 @@ fn set_write_barrier(obj: PyObjectRef) {
 unsafe fn switch_to_empty_strategy(obj: PyObjectRef) {
     {
         let s = &mut *(obj as *mut W_SetObject);
-        s.strategy = &EMPTY_SET_STRATEGY_REF;
+        s.strategy = empty_set_strategy_ref();
         s.sstorage = EMPTY_SET_STRATEGY.get_empty_storage();
         s.set_len_relaxed(0);
         s.hash = -1;
@@ -2676,7 +2745,7 @@ unsafe fn switch_empty_to_object_strategy(obj: PyObjectRef) {
     {
         let set = &mut *(obj as *mut W_SetObject);
         set.sstorage = storage;
-        set.strategy = &OBJECT_SET_STRATEGY_REF;
+        set.strategy = object_set_strategy_ref();
     }
     set_write_barrier(obj);
 }
@@ -2766,7 +2835,7 @@ pub fn w_set_new() -> PyObjectRef {
             w_class: get_instantiate(&SET_TYPE),
         },
         sstorage: std::ptr::null_mut(),
-        strategy: &EMPTY_SET_STRATEGY_REF,
+        strategy: empty_set_strategy_ref(),
         len: crate::object_array::length_cell(0),
         hash: -1,
         set_id: fresh_set_id(),
@@ -2802,7 +2871,7 @@ fn alloc_set_object(set_type: &'static PyType) -> PyObjectRef {
             w_class: crate::gc_roots::shadow_stack_get(class_slot),
         },
         sstorage: EMPTY_SET_STRATEGY.get_empty_storage(),
-        strategy: &EMPTY_SET_STRATEGY_REF,
+        strategy: empty_set_strategy_ref(),
         len: crate::object_array::length_cell(0),
         hash: -1,
         set_id: fresh_set_id(),
@@ -2850,7 +2919,7 @@ pub fn w_set_user_new_empty(w_class: PyObjectRef, frozen: bool) -> PyObjectRef {
                 w_class: crate::gc_roots::shadow_stack_get(class_slot),
             },
             sstorage: EMPTY_SET_STRATEGY.get_empty_storage(),
-            strategy: &EMPTY_SET_STRATEGY_REF,
+            strategy: empty_set_strategy_ref(),
             len: crate::object_array::length_cell(0),
             hash: -1,
             set_id: fresh_set_id(),
@@ -4395,7 +4464,7 @@ impl SetStrategy for ObjectSetStrategy {
             // Box first, then the kind, so the word is never Object over null.
             d.sstorage =
                 crate::gc_storage::gc_alloc_storage_box(copied, set_items_gc_type_id()) as GCREF;
-            d.strategy = &OBJECT_SET_STRATEGY_REF;
+            d.strategy = object_set_strategy_ref();
             d.set_len_relaxed((*object_set_storage_ptr(d)).len());
             d.hash = -1;
         }
@@ -4686,7 +4755,7 @@ pub unsafe fn w_set_install_int_items(obj: PyObjectRef, items: &[i64]) {
     let _guard = w_set_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let storage = crate::gc_roots::shadow_stack_get(storage_slot) as GCREF;
-    publish_set_listview_storage(obj, storage, &INTEGER_SET_STRATEGY_REF, len);
+    publish_set_listview_storage(obj, storage, integer_set_strategy_ref(), len);
 }
 
 /// Install `BytesSetStrategy` from `listview_bytes`, including `[]`.
@@ -4708,7 +4777,7 @@ pub unsafe fn w_set_install_bytes_items(
     let _guard = w_set_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let storage = crate::gc_roots::shadow_stack_get(storage_slot) as GCREF;
-    publish_set_listview_storage(obj, storage, &BYTES_SET_STRATEGY_REF, len);
+    publish_set_listview_storage(obj, storage, bytes_set_strategy_ref(), len);
 }
 
 /// Install `AsciiSetStrategy` from `listview_ascii`, including `[]`.
@@ -4745,7 +4814,7 @@ pub unsafe fn w_set_install_ascii_items(
     let _guard = w_set_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(base);
     let storage = crate::gc_roots::shadow_stack_get(storage_slot) as GCREF;
-    publish_set_listview_storage(obj, storage, &ASCII_SET_STRATEGY_REF, len);
+    publish_set_listview_storage(obj, storage, ascii_set_strategy_ref(), len);
 }
 
 /// `IntegerSetStrategy.listview_int`. `None` unless the strategy is
@@ -6436,5 +6505,51 @@ mod tests {
             assert_eq!(set_int_values(set), vec![1, 2]);
             assert_eq!(set_hash(set), -1);
         }
+    }
+
+    #[test]
+    fn prebuilt_set_strategy_holders_carry_immortal_gc_header() {
+        let holder: &'static SetStrategyRef = unsafe {
+            &*majit_gc::header::alloc_with_gc_header_immortal(
+                SetStrategyRef {
+                    kind: SetStrategyKind::Object,
+                    imp: &OBJECT_SET_STRATEGY,
+                    owner: std::ptr::null_mut(),
+                },
+                set_strategy_ref_gc_type_id(),
+            )
+        };
+        const T: u32 = 7;
+        stamp_prebuilt_set_strategy_ref(holder, T);
+        unsafe {
+            let hdr = majit_gc::header::header_of(holder as *const SetStrategyRef as usize);
+            assert_eq!((*hdr).type_id(), T);
+            assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS));
+            assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+        }
+    }
+
+    #[test]
+    fn process_wide_set_strategy_holders_are_header_bearing_prebuilt_objects() {
+        let tid = set_strategy_ref_gc_type_id();
+        let holders = [
+            object_set_strategy_ref() as *const _ as usize,
+            empty_set_strategy_ref() as *const _ as usize,
+            integer_set_strategy_ref() as *const _ as usize,
+            bytes_set_strategy_ref() as *const _ as usize,
+            ascii_set_strategy_ref() as *const _ as usize,
+            identity_set_strategy_ref() as *const _ as usize,
+        ];
+        for addr in holders {
+            unsafe {
+                let hdr = majit_gc::header::header_of(addr);
+                assert_eq!((*hdr).type_id(), tid);
+                assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS));
+            }
+        }
+        assert!(std::ptr::eq(
+            object_set_strategy_ref(),
+            object_set_strategy_ref()
+        ));
     }
 }

@@ -1294,6 +1294,9 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
     // before its instance finalizer resolves `__del__` through that class.
     f(&mut set.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut set.lifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    // Grey `strategy`. Upstream `W_BaseSetObject.strategy` is a GC pointer
+    // (`setobject.py`); `dict_object_custom_trace` greys `dstrategy` the same way.
+    f(std::ptr::addr_of_mut!(set.strategy) as *mut majit_ir::GcRef);
     // `sstorage` (`setobject.py`). The box traces its own entries
     // (`set_items_storage_custom_trace`, `int_set_storage_custom_trace`,
     // `bytes_set_storage_custom_trace`, `ascii_set_storage_custom_trace`,
@@ -5014,7 +5017,8 @@ fn build_gc() -> Box<MiniMarkGC> {
     }
     // setobject.py stores the copied r_dict behind `sstorage`;
     // rordereddict.py makes that table a GcStruct("dicttable") the collector
-    // traces itself. `set_object_custom_trace` only greys the `sstorage` slot.
+    // traces itself. `set_object_custom_trace` greys the `sstorage` slot and
+    // `strategy`.
     // Keep this runtime id at the absolute registration tail.
     register_traced_storage_box::<pyre_object::setobject::SetItemsStorage>(
         &mut gc,
@@ -5135,6 +5139,27 @@ fn build_gc() -> Box<MiniMarkGC> {
             pyre_interpreter::objspace::std::classdict::class_dict_strategy_ref(),
         ] {
             pyre_object::dictmultiobject::stamp_prebuilt_dict_strategy_ref(holder, tid);
+        }
+    }
+    register_leaf_storage_box::<pyre_object::setobject::SetStrategyRef>(
+        &mut gc,
+        pyre_object::gc_storage::storage_box_destructor::<pyre_object::setobject::SetStrategyRef>,
+        pyre_object::setobject::set_set_strategy_ref_gc_type_id,
+    );
+    // GCTypeLayoutBuilder.consider_constant visits prebuilt constants after
+    // type ids are assigned. Accessors may have allocated at tid 0; restamp
+    // the live tid on every holder.
+    {
+        let tid = pyre_object::setobject::set_strategy_ref_gc_type_id();
+        for holder in [
+            pyre_object::setobject::object_set_strategy_ref(),
+            pyre_object::setobject::empty_set_strategy_ref(),
+            pyre_object::setobject::integer_set_strategy_ref(),
+            pyre_object::setobject::bytes_set_strategy_ref(),
+            pyre_object::setobject::ascii_set_strategy_ref(),
+            pyre_object::setobject::identity_set_strategy_ref(),
+        ] {
+            pyre_object::setobject::stamp_prebuilt_set_strategy_ref(holder, tid);
         }
     }
     // bytearray `data` storage box (off-GC storage). A leaf `Vec<u8>` (no inner
