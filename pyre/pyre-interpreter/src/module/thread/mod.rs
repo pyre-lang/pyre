@@ -789,6 +789,7 @@ pub(crate) fn after_fork_child() {
     crate::objspace::std::mapdict::after_fork_child();
     pyre_object::dictmultiobject::module_dict_locks_after_fork_child();
     crate::module::_collections::deque_locks_after_fork_child();
+    crate::module::_io::interp_bytesio::bytesio_locks_after_fork_child();
     #[cfg(all(
         feature = "cpyext",
         not(feature = "sandbox"),

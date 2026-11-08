@@ -69,13 +69,18 @@ pub fn monitoring_use_tool_id(tool_id: usize, w_name: PyObjectRef) -> Result<(),
     if !unsafe { pyre_object::is_str(w_name) } {
         return Err(crate::PyError::value_error("tool name must be a str"));
     }
-    if !monitoring_tool_name(tool_id).is_null() {
-        return Err(crate::PyError::value_error(format!(
+    // use_tool_id claims the slot with one compare-and-swap so two concurrent claims cannot both succeed.
+    match MONITORING_TOOL_NAMES[tool_id].compare_exchange(
+        0,
+        w_name as usize,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    ) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(crate::PyError::value_error(format!(
             "tool {tool_id} is already in use"
-        )));
+        ))),
     }
-    monitoring_set_tool_name(tool_id, w_name);
-    Ok(())
 }
 
 /// The id `_lsprof` claims, matching `sys.monitoring.PROFILER_ID`.

@@ -35,10 +35,87 @@ while i < 200:
 print(total)
 ";
 
-fn run(label: &str, env: &[(&str, &str)]) -> String {
+// [3.15-spec] follows v3.15.2 and `test_truncate_size_changes_stream`:
+// re-checks closed after convert_size, so a close in `__index__` raises
+// ValueError; truncate leaves tell() as the callback left it (`truncate_w`
+// restores the pre-conversion position).
+const CHECK_ORDER_PROGRAM: &str = r#"
+import io
+
+class CloseOnIndex:
+    def __init__(self, stream):
+        self.stream = stream
+    def __index__(self):
+        self.stream.close()
+        return 1
+
+b = io.BytesIO(b"abc")
+try:
+    b.read(CloseOnIndex(b))
+except ValueError:
+    pass
+else:
+    raise SystemExit("read close-on-index did not raise")
+
+b = io.BytesIO(b"abc")
+try:
+    b.readline(CloseOnIndex(b))
+except ValueError:
+    pass
+else:
+    raise SystemExit("readline close-on-index did not raise")
+
+b = io.BytesIO(b"abc")
+v = b.getbuffer()
+indexed = []
+class RecordIndex:
+    def __index__(self):
+        indexed.append(1)
+        return 1
+try:
+    b.truncate(RecordIndex())
+except BufferError:
+    pass
+else:
+    raise SystemExit("truncate export did not raise")
+if indexed:
+    raise SystemExit("truncate called __index__")
+del v
+
+b = io.BytesIO(b"abc")
+try:
+    b.truncate(CloseOnIndex(b))
+except ValueError:
+    pass
+else:
+    raise SystemExit("truncate close-on-index did not raise")
+
+b = io.BytesIO(b"abcdef")
+b.seek(2)
+class SeekOnIndex:
+    def __index__(self):
+        b.seek(5)
+        return 3
+got = b.truncate(SeekOnIndex())
+if got != 3:
+    raise SystemExit("truncate returned %r" % (got,))
+if b.tell() != 5:
+    raise SystemExit("truncate tell %r" % (b.tell(),))
+
+b = io.BytesIO(b"abcdef")
+b.seek(4)
+got = b.truncate(2)
+if got != 2:
+    raise SystemExit("truncate plain returned %r" % (got,))
+if b.tell() != 4:
+    raise SystemExit("truncate plain tell %r" % (b.tell(),))
+print("OK")
+"#;
+
+fn run_source(label: &str, source: &str, env: &[(&str, &str)]) -> String {
     let mut path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     path.push(format!("stdio_buffer_textio_rooting_{label}.py"));
-    std::fs::write(&path, PROGRAM).expect("write the program under test");
+    std::fs::write(&path, source).expect("write the program under test");
 
     let mut cmd = Command::new(PYRE);
     cmd.arg(&path);
@@ -55,6 +132,10 @@ fn run(label: &str, env: &[(&str, &str)]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+fn run(label: &str, env: &[(&str, &str)]) -> String {
+    run_source(label, PROGRAM, env)
+}
+
 #[test]
 fn default_nursery_stdio_buffer_textio() {
     assert_eq!(run("default", &[]), "1890");
@@ -63,4 +144,9 @@ fn default_nursery_stdio_buffer_textio() {
 #[test]
 fn small_nursery_stdio_buffer_textio() {
     assert_eq!(run("64k", &[("PYPY_GC_NURSERY", "64K")]), "1890");
+}
+
+#[test]
+fn bytesio_checks_closed_and_exports_before_callbacks() {
+    assert_eq!(run_source("check-order", CHECK_ORDER_PROGRAM, &[]), "OK");
 }

@@ -32,10 +32,10 @@ pub use interp_fileio::{
     FILEIO_USER_TYPE, W_FILEIO_USER_GC_TYPE_ID_CELL, W_FILEIO_USER_PYRE_CLASS_DESCRIPTOR, W_FileIO,
     W_FileIOUser,
 };
-mod interp_bytesio;
+pub(crate) mod interp_bytesio;
 pub use interp_bytesio::{
     BYTESIO_USER_TYPE, W_BYTESIO_USER_GC_TYPE_ID_CELL, W_BYTESIO_USER_PYRE_CLASS_DESCRIPTOR,
-    W_BytesIO, W_BytesIOUser,
+    W_BytesIO, W_BytesIOUser, bytesio_locks_after_fork_child,
 };
 mod interp_stringio;
 pub use interp_stringio::{

@@ -247,14 +247,46 @@ impl W_BytesIO {
         super::pin_io_self(self.self_obj())
     }
 
-    fn reset_buffer(&mut self) {
-        self.buffer = pyre_object::bytearrayobject::w_bytearray_new(0);
-        self.pos = AT_END;
-        self.closed = false;
+    fn reset_buffer(slot: usize) {
+        // `w_bytearray_new` can collect; `gct_direct_call` reloads live roots
+        // afterwards, which here is `from_slot` before the store.
+        let buffer = pyre_object::bytearrayobject::w_bytearray_new(0);
+        let this = Self::from_slot(slot);
+        this.buffer = buffer;
+        this.pos = AT_END;
+        this.closed = false;
         pyre_object::gc_hook::try_gc_write_barrier(
-            self as *mut Self as pyre_object::gc_hook::GCREF,
+            this as *mut Self as pyre_object::gc_hook::GCREF,
         );
     }
+}
+
+// interp_bytesio.py W_BytesIO read/write/seek/truncate run under
+// PyPy's GIL; the stripe covers a mutator that has dropped the GIL;
+// keyed on the class because the receiver can move.
+static BYTESIO_LOCKS: pyre_object::objlock::LockFamily = pyre_object::objlock::LockFamily::new();
+
+/// The guard is the zero word while `gil_ready` is unpublished.
+fn bytesio_lock(obj: PyObjectRef) -> pyre_object::objlock::ObjectLockGuard {
+    let ready = pyre_object::gil_ready::gil_ready_word();
+    let lock = if ready != 0 {
+        bytesio_lock_acquire(obj)
+    } else {
+        0
+    };
+    unsafe { pyre_object::objlock::ObjectLockGuard::from_word(lock) }
+}
+
+/// # Safety
+/// `obj` must be a live BytesIO. The caller must release the returned handle
+/// exactly once on the acquiring thread.
+#[majit_macros::dont_look_inside]
+fn bytesio_lock_acquire(obj: PyObjectRef) -> usize {
+    BYTESIO_LOCKS.acquire(unsafe { pyre_object::mapdict::instance_getclass(obj) } as usize)
+}
+
+pub fn bytesio_locks_after_fork_child() {
+    BYTESIO_LOCKS.after_fork_child();
 }
 
 #[crate::pyre_methods(
@@ -303,12 +335,16 @@ impl W_BytesIO {
         // `reset_buffer` (allocation) and `write`.
         let _roots = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::pin_roots(&[self.self_obj(), w_initial_bytes]);
-        Self::from_slot(base).check_exports()?;
-        let this = Self::from_slot(base);
-        this.reset_buffer();
+        {
+            let _guard = bytesio_lock(pyre_object::gc_roots::shadow_stack_get(base));
+            let this = Self::from_slot(base);
+            this.check_exports()?;
+            Self::reset_buffer(base);
+        }
         let w_initial_bytes = pyre_object::gc_roots::shadow_stack_get(base + 1);
         if !unsafe { pyre_object::is_none(w_initial_bytes) } {
-            this.write(w_initial_bytes)?;
+            Self::from_slot(base).write(w_initial_bytes)?;
+            let _guard = bytesio_lock(pyre_object::gc_roots::shadow_stack_get(base));
             Self::from_slot(base).seek_pos(0, 0);
         }
         Ok(())
@@ -319,10 +355,20 @@ impl W_BytesIO {
         #[default(pyre_object::w_none())] w_size: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
         // interp_bytesio.py read_w plus interp_iobase.py `convert_size`.
+        // [3.15-spec] `_io_BytesIO_read_impl` begins with `CHECK_CLOSED`; clinic
+        // `_io_BytesIO_read` (size via `_Py_convert_optional_to_ssize_t`) runs
+        // first, identically in v3.15.0 and v3.15.2; a close in `__index__`
+        // raises ValueError. PyPy `read_w` returns b"" (`RStringIO.close`
+        // leaves AT_END).
         self.check_closed()?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
         let size = super::iobase_convert_size(w_size)?;
+        let _guard = bytesio_lock(pyre_object::gc_roots::shadow_stack_get(slot));
+        let this = Self::from_slot(slot);
+        this.check_closed()?;
         Ok(pyre_object::bytesobject::w_bytes_from_bytes(
-            &self.read_bytes(size),
+            &this.read_bytes(size),
         ))
     }
 
@@ -338,22 +384,39 @@ impl W_BytesIO {
         &mut self,
         #[default(pyre_object::w_none())] w_limit: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
-        // interp_bytesio.py:105-108 plus interp_iobase.py `convert_size`.
+        // interp_bytesio.py readline_w plus interp_iobase.py `convert_size`.
+        // [3.15-spec] `_io_BytesIO_readline_impl` begins with `CHECK_CLOSED`;
+        // clinic `_io_BytesIO_readline` (size via `_Py_convert_optional_to_ssize_t`)
+        // runs first, identically in v3.15.0 and v3.15.2; a close in `__index__`
+        // raises ValueError. PyPy `readline_w` returns b"" (`RStringIO.close`
+        // leaves AT_END).
         self.check_closed()?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
         let limit = super::iobase_convert_size(w_limit)?;
+        let _guard = bytesio_lock(pyre_object::gc_roots::shadow_stack_get(slot));
+        let this = Self::from_slot(slot);
+        this.check_closed()?;
         Ok(pyre_object::bytesobject::w_bytes_from_bytes(
-            &self.readline_bytes(limit),
+            &this.readline_bytes(limit),
         ))
     }
 
     fn readinto(&mut self, w_buffer: PyObjectRef) -> Result<i64, crate::PyError> {
         // interp_bytesio.py readinto_w: hold the writable export through copy.
+        // [3.15-spec] `_io_BytesIO_readinto_impl` begins with `CHECK_CLOSED`;
+        // clinic `_io_BytesIO_readinto` (`PyObject_GetBuffer`) runs first,
+        // identically in v3.15.0 and v3.15.2; a close in `__buffer__` raises
+        // ValueError. PyPy `readinto_w` reads 0 from the AT_END closed stream.
         self.check_closed()?;
         let _roots = pyre_object::gc_roots::push_roots();
         let slot = self.pin_self();
         let mut output = unsafe { crate::builtins::WritableBuffer::acquire(w_buffer)? };
         let output = unsafe { output.as_mut_slice() };
-        let data = Self::from_slot(slot).read_bytes(output.len() as i64);
+        let _guard = bytesio_lock(pyre_object::gc_roots::shadow_stack_get(slot));
+        let this = Self::from_slot(slot);
+        this.check_closed()?;
+        let data = this.read_bytes(output.len() as i64);
         output[..data.len()].copy_from_slice(&data);
         Ok(data.len() as i64)
     }
@@ -374,6 +437,7 @@ impl W_BytesIO {
         // A `__buffer__` written in Python may have closed or exported the
         // stream, so repeat both checks — against the receiver as it stands
         // now, which that callback may also have moved.
+        let _guard = bytesio_lock(pyre_object::gc_roots::shadow_stack_get(base));
         let this = Self::from_slot(base);
         this.check_closed()?;
         this.check_exports()?;
@@ -384,31 +448,49 @@ impl W_BytesIO {
         &mut self,
         #[default(pyre_object::w_none())] w_size: PyObjectRef,
     ) -> Result<i64, crate::PyError> {
-        // `W_BytesIO.truncate_w`. Pin across `index_int_w_preserve_negative`
-        // (`__index__`).
+        // [3.15-spec] v3.15.0 `_io_BytesIO_truncate_impl` runs `CHECK_CLOSED` /
+        // `CHECK_EXPORTS` before `PyLong_AsLong` only, so a close in `__index__`
+        // resizes the released buffer; v3.15.2 (gh-159739, "Recheck BytesIO
+        // state after converting truncate size") rechecks both after conversion.
+        // Neither writes `self->pos`, so a seek in `__index__` stands
+        // (`Lib/test/test_io/test_memoryio.py` `test_truncate_size_changes_stream`
+        // at v3.15.2). PyPy `truncate_w` restores the `pos` saved before
+        // `r_longlong_w`. The stripe cannot span that `__index__` call.
         self.check_closed()?;
         let _roots = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::pin_roots(&[self.self_obj(), w_size]);
-        let this = Self::from_slot(base);
-        this.check_exports()?;
-        let pos = this.tell_pos();
+        let pos = {
+            let _guard = bytesio_lock(pyre_object::gc_roots::shadow_stack_get(base));
+            let this = Self::from_slot(base);
+            this.check_exports()?;
+            this.tell_pos()
+        };
         let w_size = pyre_object::gc_roots::shadow_stack_get(base + 1);
         let size = if unsafe { pyre_object::is_none(w_size) } {
             pos
         } else {
             crate::baseobjspace::index_int_w_preserve_negative(w_size)?
         };
-        let this = Self::from_slot(base);
         if size < 0 {
             return Err(crate::PyError::value_error(format!(
                 "negative size value {size:?}"
             )));
         }
+        let _guard = bytesio_lock(pyre_object::gc_roots::shadow_stack_get(base));
+        let this = Self::from_slot(base);
+        this.check_closed()?;
+        // First `check_exports` is `truncate_w`'s. This second one is the
+        // gh-159739 recheck, which also keeps a view's storage from shrinking
+        // (`truncate_to` / `w_bytearray_sync_alloc`).
+        this.check_exports()?;
+        // Restore the live position: `seek_pos(cur, 0)` stores `cur` when
+        // `cur > size` (mode 0 only maps `position == getsize()` to AT_END).
+        let cur = this.tell_pos();
         this.truncate_to(size);
-        if size == pos {
+        if size == cur {
             this.seek_pos(0, 2);
         } else {
-            this.seek_pos(pos, 0);
+            this.seek_pos(cur, 0);
         }
         Ok(size)
     }
@@ -417,17 +499,27 @@ impl W_BytesIO {
         // interp_bytesio.py getbuffer_w. The bytearray exporter owns the release
         // accounting, while the BytesIO remains the view's reported owner.
         self.check_closed()?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
+        let _guard = bytesio_lock(pyre_object::gc_roots::shadow_stack_get(slot));
+        let this = Self::from_slot(slot);
+        this.check_closed()?;
         Ok(crate::builtins::w_memoryview_new_simple_with_owner(
-            self.buffer,
-            self.self_obj(),
+            this.buffer,
+            this.self_obj(),
         ))
     }
 
     fn getvalue(&self) -> Result<PyObjectRef, crate::PyError> {
         // interp_bytesio.py getvalue_w.
         self.check_closed()?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
+        let _guard = bytesio_lock(pyre_object::gc_roots::shadow_stack_get(slot));
+        let this = Self::from_slot(slot);
+        this.check_closed()?;
         Ok(pyre_object::bytesobject::w_bytes_from_bytes(unsafe {
-            pyre_object::bytearrayobject::w_bytearray_data(self.buffer)
+            pyre_object::bytearrayobject::w_bytearray_data(this.buffer)
         }))
     }
 
@@ -446,6 +538,7 @@ impl W_BytesIO {
         let arg_base = pyre_object::gc_roots::pin_roots(&[pos]);
         let pos =
             crate::baseobjspace::index_int_w(pyre_object::gc_roots::shadow_stack_get(arg_base))?;
+        let _guard = bytesio_lock(pyre_object::gc_roots::shadow_stack_get(slot));
         let this = Self::from_slot(slot);
         this.check_closed()?;
         match whence {
@@ -513,15 +606,21 @@ impl W_BytesIO {
         // storage from under a live `getbuffer()` result; closing an exported
         // buffer has to raise `BufferError: Existing exports of data: object
         // cannot be re-sized`, so the check runs ahead of the store.
-        if self.closed {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
+        let _guard = bytesio_lock(pyre_object::gc_roots::shadow_stack_get(slot));
+        let this = Self::from_slot(slot);
+        if this.closed {
             return Ok(());
         }
-        self.check_exports()?;
-        self.buffer = pyre_object::bytearrayobject::w_bytearray_new(0);
-        self.pos = AT_END;
-        self.closed = true;
+        this.check_exports()?;
+        let buffer = pyre_object::bytearrayobject::w_bytearray_new(0);
+        let this = Self::from_slot(slot);
+        this.buffer = buffer;
+        this.pos = AT_END;
+        this.closed = true;
         pyre_object::gc_hook::try_gc_write_barrier(
-            self as *mut Self as pyre_object::gc_hook::GCREF,
+            this as *mut Self as pyre_object::gc_hook::GCREF,
         );
         Ok(())
     }
@@ -537,8 +636,12 @@ impl W_BytesIO {
         let _roots = pyre_object::gc_roots::push_roots();
         let sp = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(self.self_obj());
-        let _ = pyre_object::gc_roots::pin_root(self.getvalue()?);
-        let _ = pyre_object::gc_roots::pin_root(w_int_new(self.tell_pos()));
+        let _guard = bytesio_lock(pyre_object::gc_roots::shadow_stack_get(sp));
+        let this = Self::from_slot(sp);
+        this.check_closed()?;
+        let _ = pyre_object::gc_roots::pin_root(this.getvalue()?);
+        let this = Self::from_slot(sp);
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(this.tell_pos()));
         let dict = crate::baseobjspace::getdict_native(pyre_object::gc_roots::shadow_stack_get(sp));
         let _ = pyre_object::gc_roots::pin_root(if dict.is_null() { w_none() } else { dict });
         Ok(w_tuple_new(vec![
@@ -548,25 +651,37 @@ impl W_BytesIO {
         ]))
     }
 
-    fn __setstate__(&mut self, mut w_state: PyObjectRef) -> Result<(), crate::PyError> {
+    fn __setstate__(&mut self, w_state: PyObjectRef) -> Result<(), crate::PyError> {
         // interp_bytesio.py:212-227.
         self.check_closed()?;
-        let length = pyre_object::with_roots!(w_state => crate::baseobjspace::len_w(w_state))?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
+        let state_slot = pyre_object::gc_roots::pin_roots(&[w_state]);
+        let length =
+            crate::baseobjspace::len_w(pyre_object::gc_roots::shadow_stack_get(state_slot))?;
         if length != 3 {
             return Err(crate::PyError::type_error(format!(
                 "{}.__setstate__ argument should be 3-tuple, got {}",
-                crate::type_methods::arg_type_name(self.self_obj()),
-                crate::type_methods::arg_type_name(w_state)
+                crate::type_methods::arg_type_name(Self::from_slot(slot).self_obj()),
+                crate::type_methods::arg_type_name(pyre_object::gc_roots::shadow_stack_get(
+                    state_slot
+                ))
             )));
         }
-        let state = crate::baseobjspace::unpackiterable(w_state, 3)?;
-        let _roots = pyre_object::gc_roots::push_roots();
+        let state = crate::baseobjspace::unpackiterable(
+            pyre_object::gc_roots::shadow_stack_get(state_slot),
+            3,
+        )?;
         let sp = pyre_object::gc_roots::pin_roots(&state);
-        let slot = self.pin_self();
-        self.check_exports()?;
-        self.truncate_to(0);
-        let content = pyre_object::gc_roots::shadow_stack_get(sp);
-        self.write(content)?;
+        // Content is installed before the position is validated, as descr_setstate
+        // does; the guard never spans the `__buffer__` / `__index__` / `update` calls.
+        {
+            let _guard = bytesio_lock(pyre_object::gc_roots::shadow_stack_get(slot));
+            let this = Self::from_slot(slot);
+            this.check_exports()?;
+            this.truncate_to(0);
+        }
+        Self::from_slot(slot).write(pyre_object::gc_roots::shadow_stack_get(sp))?;
         let pos = crate::baseobjspace::index_int_w_preserve_negative(
             pyre_object::gc_roots::shadow_stack_get(sp + 1),
         )?;
@@ -575,8 +690,11 @@ impl W_BytesIO {
                 "position value cannot be negative",
             ));
         }
+        {
+            let _guard = bytesio_lock(pyre_object::gc_roots::shadow_stack_get(slot));
+            Self::from_slot(slot).seek_pos(pos, 0);
+        }
         let this = Self::from_slot(slot);
-        this.seek_pos(pos, 0);
         let w_dict = pyre_object::gc_roots::shadow_stack_get(sp + 2);
         if !unsafe { pyre_object::is_none(w_dict) } {
             let own_dict = crate::baseobjspace::getdict_native(this.self_obj());
@@ -635,5 +753,28 @@ mod tests {
             assert!(crate::baseobjspace::getdictvalue_native(obj, "x").is_none());
             assert_eq!(W_BytesIO::from_obj(obj).unwrap().w_dict, w_dict);
         }
+    }
+
+    #[test]
+    fn bytesio_concurrent_writes_keep_every_byte() {
+        // The stripe is skipped while `gil_ready` is 0; test threads do not hold the GIL.
+        pyre_object::gil_ready::publish_gil_ready();
+        let obj = W_BytesIO::allocate_stable(W_BytesIO::default());
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = W_BytesIO::from_obj(obj).unwrap().pin_self();
+        W_BytesIO::reset_buffer(slot);
+        let obj_addr = obj as usize;
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    let obj = obj_addr as PyObjectRef;
+                    for _ in 0..500 {
+                        let _guard = bytesio_lock(obj);
+                        W_BytesIO::from_obj(obj).unwrap().write_bytes(b"x").unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(W_BytesIO::from_obj(obj).unwrap().getsize(), 1000);
     }
 }
