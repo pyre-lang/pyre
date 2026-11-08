@@ -211,6 +211,16 @@ pub struct GraphTransformConfig {
     /// `lltypesystem::rlist::jit_ll_list_str_from_rust_vec`.
     #[serde(default = "default_rust_vec_list_str_helper")]
     pub rust_vec_list_str_helper: String,
+    /// `HighLevelOp.convertvar` from a by-value raw-flavor struct into the
+    /// one-word `*mut T` a marked exception class stores.
+    ///
+    /// The path is split on `::` before `CallTarget::function_path`. Bound
+    /// through `HELPER_FNADDRS`, canonical
+    /// `lltypesystem::rraw::jit_ll_box_raw_moved`. An empty name leaves the
+    /// write on the plain `setfield` arm. A field declared as that pointer
+    /// has no raw-owned row, so this conversion does not run.
+    #[serde(default = "default_raw_owned_box_helper")]
+    pub raw_owned_box_helper: String,
 }
 
 /// The [`GraphTransformConfig::jitdriver_receiver_roots`] default: pyre's own
@@ -276,6 +286,14 @@ fn default_rust_vec_list_str_helper() -> String {
     "lltypesystem::rlist::jit_ll_list_str_from_rust_vec".to_string()
 }
 
+/// The [`GraphTransformConfig::raw_owned_box_helper`] default.
+///
+/// `lltype.malloc(STRUCT, flavor='raw')` of the moved bytes. The macro
+/// registry publishes `lltypesystem::rraw::jit_ll_box_raw_moved`.
+fn default_raw_owned_box_helper() -> String {
+    "lltypesystem::rraw::jit_ll_box_raw_moved".to_string()
+}
+
 fn helper_path_target(path: &str) -> CallTarget {
     CallTarget::function_path(path.split("::").filter(|segment| !segment.is_empty()))
 }
@@ -297,6 +315,7 @@ impl Default for GraphTransformConfig {
             str_eq_helper: default_str_eq_helper(),
             rust_string_str_helper: default_rust_string_str_helper(),
             rust_vec_list_str_helper: default_rust_vec_list_str_helper(),
+            raw_owned_box_helper: default_raw_owned_box_helper(),
         }
     }
 }
@@ -5456,6 +5475,23 @@ impl<'a> Transformer<'a> {
                     graph, op, base, field, value, graph_name,
                 )
             }
+            // A marked exception class stores a by-value raw-flavor struct
+            // as `*mut T`. The operand is still the moved value; the row's
+            // raw-owned payload is what distinguishes it from a field
+            // declared as that pointer (`PyCode._signature`). Recognition
+            // stays on that row: the store type is `ValueType::Unsigned`
+            // (`descr.py get_type_flag` of a raw `Ptr`), and that type is
+            // not what selects this arm. An empty helper name, a missing
+            // row, or an operand that is already the pointer leaves the
+            // write on the plain arm.
+            OpKind::FieldWrite {
+                base,
+                field,
+                value,
+                ty,
+            } if self.raw_owned_move(field, value, graph).is_some() => {
+                self.rewrite_raw_owned_setfield(graph, op, base, field, value, ty, graph_name)
+            }
             OpKind::FieldWrite {
                 field, value, ty, ..
             } if self.config.lower_virtualizable => {
@@ -8122,6 +8158,230 @@ impl<'a> Transformer<'a> {
                 },
             ],
         )
+    }
+
+    /// Raw-owned payload when this `setfield` still holds the moved
+    /// by-value struct. `None` leaves the write on the plain arm.
+    fn raw_owned_move(
+        &self,
+        field: &FieldDescriptor,
+        value: &LinkArg,
+        graph: &FunctionGraph,
+    ) -> Option<crate::front::semantic::RawOwnedField> {
+        if self.config.raw_owned_box_helper.is_empty() {
+            return None;
+        }
+        let cc = self.callcontrol.as_deref()?;
+        let owner = field.owner_root.as_deref()?;
+        let row = cc
+            .struct_field_entries(owner)?
+            .iter()
+            .find(|row| row.name == field.name)?;
+        let raw = row.raw_owned.clone()?;
+        let LinkArg::Value(operand) = value else {
+            return None;
+        };
+        if self.operand_is_already_raw_pointer(graph, operand) {
+            return None;
+        }
+        Some(raw)
+    }
+
+    /// The operand word is already the `*mut T` this field stores.
+    ///
+    /// A missing concretetype is still the by-value struct (the front
+    /// operand is the moved local). `Ptr` / `InteriorPtr`, the box
+    /// helper's result, and a `FieldRead` of a raw-owned row are the
+    /// pointer.
+    fn operand_is_already_raw_pointer(
+        &self,
+        graph: &FunctionGraph,
+        operand: &crate::flowspace::model::Variable,
+    ) -> bool {
+        if matches!(
+            operand.concretetype(),
+            Some(
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(_)
+                    | crate::translator::rtyper::lltypesystem::lltype::LowLevelType::InteriorPtr(_)
+            )
+        ) {
+            return true;
+        }
+        let Some(op) = defining_op(graph, operand) else {
+            return false;
+        };
+        match &op.kind {
+            OpKind::CallResidual { funcptr, .. } => {
+                let crate::model::CallFuncPtr::Value(func_var) = funcptr else {
+                    return false;
+                };
+                let Some(def) = defining_op(graph, func_var) else {
+                    return false;
+                };
+                let OpKind::ConstFnAddr { path, .. } = &def.kind else {
+                    return false;
+                };
+                let leaf = self
+                    .config
+                    .raw_owned_box_helper
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or("");
+                !leaf.is_empty() && path.contains(leaf)
+            }
+            OpKind::FieldRead {
+                field: read_field, ..
+            } => {
+                let Some(cc) = self.callcontrol.as_deref() else {
+                    return false;
+                };
+                let Some(owner) = read_field.owner_root.as_deref() else {
+                    return false;
+                };
+                cc.struct_field_entries(owner).is_some_and(|rows| {
+                    rows.iter()
+                        .any(|row| row.name == read_field.name && row.raw_owned.is_some())
+                })
+            }
+            _ => false,
+        }
+    }
+
+    /// Box the moved raw-flavor struct, then `rewrite_op_setfield` of
+    /// that pointer. `optimize_block` does not feed `Replace` back into
+    /// `rewrite_operation`.
+    ///
+    /// `history.py getkind`: a `Ptr` whose `TO._gckind` is `'raw'`
+    /// (`rclass.py getgcflavor`) is `'int'`. `descr.py get_type_flag`
+    /// banks that word `FLAG_UNSIGNED`. The helper result is that
+    /// pointer, so its cell is `Signed` and the following store is
+    /// `ValueType::Unsigned`. The cell stays `Unknown` until after
+    /// `rewrite_op_setfield`: `get_value_type(Signed)` is `Int`, and
+    /// that would replace the unsigned flag with `FLAG_SIGNED`.
+    ///
+    /// The moved operand is the by-value struct. Only
+    /// `ConcreteType::GcRef` (`try_getkind` of a non-raw `Ptr`) is a GC
+    /// pointer; a missing concretetype is `Unknown`, and
+    /// `get_value_kind_var`'s Unknown→`'r'` fallback is not one. A real
+    /// `Ptr` never reaches here (`operand_is_already_raw_pointer`).
+    fn rewrite_raw_owned_setfield(
+        &mut self,
+        graph: &mut FunctionGraph,
+        op: &SpaceOperation,
+        base: &crate::flowspace::model::Variable,
+        field: &FieldDescriptor,
+        value: &LinkArg,
+        _ty: &ValueType,
+        graph_name: &str,
+    ) -> RewriteResult {
+        let Some(raw) = self.raw_owned_move(field, value, graph) else {
+            return RewriteResult::Keep;
+        };
+        let LinkArg::Value(operand) = value else {
+            return RewriteResult::Keep;
+        };
+        let size = i64::try_from(raw.size).expect("raw-owned attr size fits in Signed");
+        let align = i64::try_from(raw.align).expect("raw-owned attr align fits in Signed");
+        let size_var = self.fresh_synthetic_variable_typed(
+            graph,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        let align_var = self.fresh_synthetic_variable_typed(
+            graph,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        let target = helper_path_target(&self.config.raw_owned_box_helper);
+        let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
+        // `Unknown` so `rewrite_op_setfield` keeps `ValueType::Unsigned`.
+        // `fresh_synthetic_variable_typed(Signed)` would stamp first.
+        let boxed = graph.alloc_value_var();
+        let stored = LinkArg::Value(boxed.clone());
+        let stored_ty = ValueType::Unsigned;
+        let operand_is_gc_ref = operand.concretetype().as_ref().is_some_and(|lltype| {
+            crate::model::try_getkind(lltype, true, true, true).ok()
+                == Some(crate::model::ConcreteType::GcRef)
+        });
+        let (arg_types, args_i, args_r) = if operand_is_gc_ref {
+            (
+                vec![
+                    majit_ir::value::Type::Ref,
+                    majit_ir::value::Type::Int,
+                    majit_ir::value::Type::Int,
+                ],
+                vec![size_var.clone(), align_var.clone()],
+                vec![operand.clone()],
+            )
+        } else {
+            (
+                vec![
+                    majit_ir::value::Type::Int,
+                    majit_ir::value::Type::Int,
+                    majit_ir::value::Type::Int,
+                ],
+                vec![operand.clone(), size_var.clone(), align_var.clone()],
+                vec![],
+            )
+        };
+        let mut ops = vec![
+            SpaceOperation {
+                result: Some(size_var),
+                kind: OpKind::ConstInt(size),
+            },
+            SpaceOperation {
+                result: Some(align_var),
+                kind: OpKind::ConstInt(align),
+            },
+            funcptr_op,
+            SpaceOperation {
+                result: Some(boxed.clone()),
+                kind: OpKind::CallResidual {
+                    funcptr: CallFuncPtr::Value(funcptr),
+                    descriptor: CallDescriptor::from_signature(
+                        &arg_types,
+                        majit_ir::value::Type::Int,
+                        EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::None),
+                    ),
+                    args_i,
+                    args_r,
+                    args_f: vec![],
+                    result_kind: 'i',
+                    indirect_targets: None,
+                },
+            },
+            SpaceOperation {
+                result: None,
+                kind: OpKind::live(),
+            },
+        ];
+        let write = SpaceOperation {
+            result: op.result.clone(),
+            kind: OpKind::FieldWrite {
+                base: base.clone(),
+                field: field.clone(),
+                value: stored.clone(),
+                ty: stored_ty.clone(),
+            },
+        };
+        let follow_up = if !self.config.lower_virtualizable {
+            vec![write]
+        } else {
+            let rewritten =
+                self.rewrite_op_setfield(&write, field, &stored, &stored_ty, graph_name, graph);
+            match rewritten {
+                RewriteResult::Keep => vec![write],
+                RewriteResult::Replace(more) => more,
+                RewriteResult::Identity(_) | RewriteResult::Constant(_) => {
+                    unreachable!("rewrite_op_setfield returns Keep or Replace")
+                }
+            }
+        };
+        self.stamp_value_kind(
+            graph,
+            Some(boxed),
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        ops.extend(follow_up);
+        RewriteResult::Replace(ops)
     }
 
     /// Skip-spine expansion of `pairtype(AbstractStringRepr,

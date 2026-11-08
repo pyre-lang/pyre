@@ -4158,6 +4158,400 @@ fn note_declared_gc_owner(
         .insert(majit_ir::descr::StructId::from_canonical(&leaf));
 }
 
+/// One declaring class's contribution to an inherited exception attr.
+///
+/// `row_ty` / `attr_ty` / `raw_owned` are the row registration already
+/// publishes for that declaration. `s_value` is
+/// `Bookkeeper::project_struct_field_type` of `row_ty`, the annotation
+/// `Attribute.merge` unions.
+struct ExceptionClassAttrDecl {
+    variant_name: String,
+    field_index: usize,
+    is_positional: bool,
+    is_atomic: bool,
+    /// `tyref_to_ast_string` of the declared type.
+    declared: String,
+    row_ty: String,
+    attr_ty: ValueType,
+    raw_owned: Option<crate::front::semantic::RawOwnedField>,
+    s_value: crate::annotator::model::SomeValue,
+    one_word: bool,
+    kind: ExceptionClassAttrKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExceptionClassAttrKind {
+    /// By-value `String` → `"str"` / `ValueType::Str`.
+    Str,
+    /// By-value `Vec<String>` → [`RPY_LIST_OF_STR`].
+    ListOfStr,
+    /// By-value raw-flavor struct → `*mut T` plus `raw_owned`.
+    RawOwned,
+    Ordinary,
+}
+
+struct ExceptionClassAttrGroup {
+    owner: String,
+    field: String,
+    decls: Vec<ExceptionClassAttrDecl>,
+}
+
+fn exception_class_attr_types_panic(
+    class_name: &str,
+    field_name: &str,
+    decls: &[&ExceptionClassAttrDecl],
+) -> ! {
+    let mut spellings = Vec::new();
+    for decl in decls {
+        if !spellings.iter().any(|spelling| spelling == &decl.declared) {
+            spellings.push(decl.declared.as_str());
+        }
+    }
+    panic!(
+        "exception class {class_name}.{field_name}: field type {}",
+        spellings.join(" ∪ ")
+    )
+}
+
+fn exception_class_annotation_is_uninformative(
+    annotation: &crate::annotator::model::SomeValue,
+) -> bool {
+    match annotation {
+        crate::annotator::model::SomeValue::Impossible => true,
+        // No `ClassDef`: `unionof` cannot see the pointee (`SomeInstance`
+        // with `classdef=None`). Two different names compare equal.
+        crate::annotator::model::SomeValue::Instance(instance) => instance.classdef.is_none(),
+        _ => false,
+    }
+}
+
+fn exception_class_annotation_is_list_of_str(
+    annotation: &crate::annotator::model::SomeValue,
+) -> bool {
+    let crate::annotator::model::SomeValue::List(list) = annotation else {
+        return false;
+    };
+    let item = list.listdef.listitem_rc();
+    let item = item.borrow();
+    !item.resized
+        && !item.mutated
+        && matches!(item.s_value, crate::annotator::model::SomeValue::String(_))
+}
+
+/// Storage spelling of a generalized annotation. Signed `SomeInteger` is
+/// `lltype.Signed` (`isize`); unsigned is `lltype.Unsigned` (`usize`).
+fn exception_class_annotation_repr(
+    annotation: &crate::annotator::model::SomeValue,
+) -> Option<(String, ValueType)> {
+    use crate::annotator::model::SomeValue;
+    match annotation {
+        SomeValue::Integer(int) => {
+            if int.unsigned {
+                Some(("usize".to_string(), ValueType::Unsigned))
+            } else {
+                Some(("isize".to_string(), ValueType::Int))
+            }
+        }
+        SomeValue::Bool(_) => Some(("bool".to_string(), ValueType::Bool)),
+        SomeValue::Float(_) => Some(("f64".to_string(), ValueType::Float)),
+        SomeValue::SingleFloat(_) => Some(("f32".to_string(), ValueType::SingleFloat)),
+        SomeValue::String(_) => Some(("str".to_string(), ValueType::Str)),
+        SomeValue::Char(_) | SomeValue::UnicodeCodePoint(_) => {
+            Some(("char".to_string(), ValueType::Int))
+        }
+        SomeValue::List(_) if exception_class_annotation_is_list_of_str(annotation) => Some((
+            RPY_LIST_OF_STR.to_string(),
+            ValueType::Ref(Some(RPY_LIST_OF_STR.to_string())),
+        )),
+        _ => None,
+    }
+}
+
+fn exception_class_declared_attr(
+    variant_name: &str,
+    field_index: usize,
+    field: &FieldDecl,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    bk: &std::rc::Rc<crate::annotator::bookkeeper::Bookkeeper>,
+) -> ExceptionClassAttrDecl {
+    let by_value_string = tyref_is_by_value_alloc_string(&field.ty, llbc);
+    let by_value_list_of_str = tyref_is_by_value_vec_string(&field.ty, llbc);
+    let raw_owned_attr = if by_value_string || by_value_list_of_str {
+        None
+    } else {
+        exception_class_raw_owned_attr(
+            &field.ty,
+            llbc,
+            no_tombstoned_leaves(),
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        )
+    };
+    let kind = if by_value_string {
+        ExceptionClassAttrKind::Str
+    } else if by_value_list_of_str {
+        ExceptionClassAttrKind::ListOfStr
+    } else if raw_owned_attr.is_some() {
+        ExceptionClassAttrKind::RawOwned
+    } else {
+        ExceptionClassAttrKind::Ordinary
+    };
+    // A by-value `alloc::string::String` is the rstr attr. `"str"` is the
+    // spelling `project_struct_field_type` maps to `s_str0()`. The register
+    // bank is `ValueType::Str`. A borrow or raw pointer keeps the address.
+    //
+    // A by-value `Vec<String>` is an unresized list of str
+    // (`ArgErrMissing.__init__` stores `missing` as that list). The row
+    // spelling is [`RPY_LIST_OF_STR`]: one pointer word,
+    // `SomeList(s_str0())`. It is not published as `Vec<String>`.
+    //
+    // A by-value raw-flavor struct is the one-word `*mut T` row
+    // (`PyCode._signature` / `BuiltinCode.sig`). `raw_owned` records the
+    // moved value so the store boxes it; a field declared as `*mut T` does
+    // not.
+    let (row_ty, attr_ty, raw_owned) = if by_value_string {
+        ("str".to_string(), ValueType::Str, None)
+    } else if by_value_list_of_str {
+        (
+            RPY_LIST_OF_STR.to_string(),
+            ValueType::Ref(Some(RPY_LIST_OF_STR.to_string())),
+            None,
+        )
+    } else if let Some(raw) = raw_owned_attr {
+        let raw_owned = crate::front::semantic::RawOwnedField {
+            type_path: raw.type_path,
+            size: raw.size,
+            align: raw.align,
+        };
+        (
+            raw.spelling,
+            ValueType::Ref(Some(raw.class_root)),
+            Some(raw_owned),
+        )
+    } else {
+        (
+            annotation_struct_field_type(&field.ty, llbc, gc_struct_ids, raw_alloc_flavor_structs),
+            tyref_to_attr_value_type_with(
+                &field.ty,
+                llbc,
+                no_tombstoned_leaves(),
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            ),
+            None,
+        )
+    };
+    let s_value = bk.project_struct_field_type(&row_ty);
+    ExceptionClassAttrDecl {
+        variant_name: variant_name.to_string(),
+        field_index,
+        is_positional: field.name.is_none(),
+        is_atomic: tyref_atomic_arg(&field.ty, llbc).is_some(),
+        declared: tyref_to_ast_string(&field.ty, llbc),
+        row_ty,
+        attr_ty,
+        raw_owned,
+        s_value,
+        one_word: exception_class_attr_is_one_word(
+            &field.ty,
+            llbc,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        ),
+        kind,
+    }
+}
+
+fn exception_class_order_owner<'a>(
+    owner: &str,
+    decls: &'a [ExceptionClassAttrDecl],
+) -> Vec<&'a ExceptionClassAttrDecl> {
+    let mut ordered = Vec::with_capacity(decls.len());
+    if let Some(owner_decl) = decls.iter().find(|decl| decl.variant_name == owner) {
+        ordered.push(owner_decl);
+    }
+    for decl in decls {
+        if decl.variant_name != owner {
+            ordered.push(decl);
+        }
+    }
+    ordered
+}
+
+fn exception_class_owner_field_row(
+    owner: &ExceptionClassAttrDecl,
+    field_name: &str,
+    row_ty: String,
+    raw_owned: Option<crate::front::semantic::RawOwnedField>,
+) -> crate::front::semantic::FieldRow {
+    let mut row = if owner.is_positional {
+        crate::front::semantic::FieldRow::positional(
+            majit_charon_reader::ullbc::positional_field_name(owner.field_index),
+            row_ty,
+        )
+    } else {
+        crate::front::semantic::FieldRow::named(field_name, row_ty)
+    };
+    row = row.with_atomic(owner.is_atomic);
+    if let Some(raw_owned) = raw_owned {
+        row = row.with_raw_owned(raw_owned);
+    }
+    row
+}
+
+fn exception_class_publish_owner(
+    owner: &ExceptionClassAttrDecl,
+    field_name: &str,
+) -> (crate::front::semantic::FieldRow, (String, ValueType)) {
+    let row = exception_class_owner_field_row(
+        owner,
+        field_name,
+        owner.row_ty.clone(),
+        owner.raw_owned.clone(),
+    );
+    (row, (field_name.to_string(), owner.attr_ty.clone()))
+}
+
+fn exception_class_rows_agree(decls: &[&ExceptionClassAttrDecl]) -> bool {
+    let owner = decls[0];
+    decls.iter().all(|decl| {
+        decl.row_ty == owner.row_ty
+            && decl.attr_ty == owner.attr_ty
+            && decl.raw_owned == owner.raw_owned
+    })
+}
+
+fn exception_class_flags_agree(
+    decls: &[&ExceptionClassAttrDecl],
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> bool {
+    let owner_flag =
+        crate::codewriter::call::get_type_flag(&decls[0].row_ty, raw_alloc_flavor_structs);
+    decls.iter().all(|decl| {
+        crate::codewriter::call::get_type_flag(&decl.row_ty, raw_alloc_flavor_structs) == owner_flag
+    })
+}
+
+/// `ClassDef._generalize_attr` / `Attribute.merge` for one inherited name.
+///
+/// The owner's declaration is first (`getallsubdefs` yields the owner,
+/// then subclasses). `unionof` merges the projected `s_value`s. A
+/// `UnionError` is the `AnnotatorError`. The row is registered on the
+/// owner only.
+fn exception_class_generalized_owner_row(
+    class_name: &str,
+    field_name: &str,
+    owner_variant: &str,
+    decls: &[ExceptionClassAttrDecl],
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> (crate::front::semantic::FieldRow, (String, ValueType)) {
+    let ordered = exception_class_order_owner(owner_variant, decls);
+    if ordered.is_empty() || ordered[0].variant_name != owner_variant {
+        panic!(
+            "exception class {class_name}.{field_name}: {owner_variant} owns the field but has no declaration"
+        );
+    }
+    let distinct = ordered
+        .iter()
+        .any(|decl| decl.declared != ordered[0].declared);
+    // A single declaration that is not one word keeps the placement
+    // panic. Differing declarations name both types.
+    if !ordered[0].one_word && !distinct {
+        panic!(
+            "exception class {class_name}.{field_name}: field type {} is not a one-word attr",
+            ordered[0].declared
+        );
+    }
+    if ordered.iter().any(|decl| !decl.one_word) && distinct {
+        exception_class_attr_types_panic(class_name, field_name, &ordered);
+    }
+    // `SomeImpossibleValue` is bottom (`impossible ∪ X = X`). A
+    // declaration this bookkeeper cannot project must not disappear
+    // into the other side's annotation.
+    if ordered
+        .iter()
+        .any(|decl| exception_class_annotation_is_uninformative(&decl.s_value))
+        && distinct
+    {
+        exception_class_attr_types_panic(class_name, field_name, &ordered);
+    }
+    let acc = match crate::annotator::model::unionof(ordered.iter().map(|decl| &decl.s_value)) {
+        Ok(acc) => acc,
+        Err(_) => exception_class_attr_types_panic(class_name, field_name, &ordered),
+    };
+    let owner = ordered[0];
+    if ordered.iter().any(|decl| decl.raw_owned != owner.raw_owned) {
+        exception_class_attr_types_panic(class_name, field_name, &ordered);
+    }
+    match owner.kind {
+        ExceptionClassAttrKind::Str => {
+            if !matches!(acc, crate::annotator::model::SomeValue::String(_)) {
+                exception_class_attr_types_panic(class_name, field_name, &ordered);
+            }
+        }
+        ExceptionClassAttrKind::ListOfStr => {
+            if !exception_class_annotation_is_list_of_str(&acc) {
+                exception_class_attr_types_panic(class_name, field_name, &ordered);
+            }
+        }
+        ExceptionClassAttrKind::RawOwned | ExceptionClassAttrKind::Ordinary => {}
+    }
+    if exception_class_rows_agree(&ordered) {
+        return exception_class_publish_owner(owner, field_name);
+    }
+    match owner.kind {
+        // The by-value row is the representation of that annotation.
+        ExceptionClassAttrKind::Str | ExceptionClassAttrKind::ListOfStr => {
+            exception_class_publish_owner(owner, field_name)
+        }
+        ExceptionClassAttrKind::RawOwned => {
+            if exception_class_flags_agree(&ordered, raw_alloc_flavor_structs) {
+                exception_class_publish_owner(owner, field_name)
+            } else {
+                exception_class_attr_types_panic(class_name, field_name, &ordered);
+            }
+        }
+        ExceptionClassAttrKind::Ordinary => {
+            // `i64` and `isize` share `get_type_flag` on a 64-bit target
+            // and `unionof` does not widen, so the owner's row is already
+            // that signed integer. A wider union takes the declaration
+            // whose flag is the annotation's (`lltype.Signed` / `Unsigned`),
+            // or that canonical spelling when none matches.
+            let widened = ordered.iter().any(|decl| decl.s_value != acc);
+            if exception_class_flags_agree(&ordered, raw_alloc_flavor_structs) && !widened {
+                return exception_class_publish_owner(owner, field_name);
+            }
+            let Some((canon_ty, canon_vt)) = exception_class_annotation_repr(&acc) else {
+                exception_class_attr_types_panic(class_name, field_name, &ordered);
+            };
+            let target =
+                crate::codewriter::call::get_type_flag(&canon_ty, raw_alloc_flavor_structs);
+            if crate::codewriter::call::get_type_flag(&owner.row_ty, raw_alloc_flavor_structs)
+                == target
+                && owner.attr_ty == canon_vt
+            {
+                return exception_class_publish_owner(owner, field_name);
+            }
+            if let Some(decl) = ordered.iter().find(|decl| {
+                crate::codewriter::call::get_type_flag(&decl.row_ty, raw_alloc_flavor_structs)
+                    == target
+                    && decl.attr_ty == canon_vt
+            }) {
+                return (
+                    exception_class_owner_field_row(owner, field_name, decl.row_ty.clone(), None),
+                    (field_name.to_string(), decl.attr_ty.clone()),
+                );
+            }
+            (
+                exception_class_owner_field_row(owner, field_name, canon_ty, None),
+                (field_name.to_string(), canon_vt),
+            )
+        }
+    }
+}
+
 #[expect(
     clippy::type_complexity,
     reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
@@ -4166,12 +4560,17 @@ fn note_declared_gc_owner(
 ///
 /// Farthest declaring ancestor, same walk as registration
 /// ([`crate::front::llbc_hints::exception_class_field_owner`],
-/// `ClassDef.get_owner` in `classdesc.py`). A spelling that ancestor
-/// publishes is not registered again. The same spelling with a different
-/// type panics with the class, the field, and both spellings. An empty
+/// `ClassDef.get_owner`). `ClassDef._generalize_attr` keeps one attribute
+/// on that owner: `Attribute.merge` unions every declaring class's value
+/// annotation (`unionof` of the `s_value`s) and the subclass copies are
+/// not registered. A `UnionError`, or a result that is not one translated
+/// word (`exception_class_attr_is_one_word`), panics with the owner class,
+/// the field, and both declared types. The owner's row is that generalized
+/// annotation and the representation derived from it. A by-value `String`,
+/// `Vec<String>`, or raw-flavor struct keeps that row kind only when the
+/// union is still that kind; `raw_owned` stays on the owner row. An empty
 /// variant and a variant whose fields are all inherited get no rows. The
-/// base class gets none. A field that is not one translated word panics
-/// with the enum, variant class, field, and type.
+/// base class gets none.
 fn register_exception_class_variant_fields(
     td: &TypeDecl,
     hint: &crate::front::llbc_hints::ExceptionClassHint,
@@ -4200,6 +4599,50 @@ fn register_exception_class_variant_fields(
             .collect();
         published.push((variant.name.clone(), names));
     }
+    let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    let mut groups: Vec<ExceptionClassAttrGroup> = Vec::new();
+    let declares = |published: &[(String, Vec<String>)], variant_name: &str, fname: &str| {
+        published.iter().any(|(published_name, names)| {
+            published_name == variant_name && names.iter().any(|candidate| candidate == fname)
+        })
+    };
+    for variant_name in &hint.variants {
+        let Some(variant) = variants
+            .iter()
+            .find(|variant| variant.name == *variant_name)
+        else {
+            continue;
+        };
+        for (index, field) in variant.fields.iter().enumerate() {
+            let fname = field_decl_name(index, field);
+            let owner = crate::front::llbc_hints::exception_class_field_owner(
+                &links,
+                variant_name,
+                |name| declares(&published, name, &fname),
+            );
+            let decl = exception_class_declared_attr(
+                variant_name,
+                index,
+                field,
+                llbc,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+                &bk,
+            );
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| group.owner == owner && group.field == fname)
+            {
+                group.decls.push(decl);
+            } else {
+                groups.push(ExceptionClassAttrGroup {
+                    owner: owner.to_string(),
+                    field: fname,
+                    decls: vec![decl],
+                });
+            }
+        }
+    }
     for variant_name in &hint.variants {
         let Some(variant) = variants
             .iter()
@@ -4216,93 +4659,28 @@ fn register_exception_class_variant_fields(
             let owner = crate::front::llbc_hints::exception_class_field_owner(
                 &links,
                 variant_name,
-                |name| {
-                    published.iter().any(|(published_name, names)| {
-                        published_name == name && names.iter().any(|candidate| candidate == &fname)
-                    })
-                },
+                |name| declares(&published, name, &fname),
             );
             if owner != variant_name.as_str() {
-                let ancestor_ty = variants
-                    .iter()
-                    .find(|candidate| candidate.name == owner)
-                    .and_then(|candidate| {
-                        candidate.fields.iter().enumerate().find_map(
-                            |(field_index, field_decl)| {
-                                (field_decl_name(field_index, field_decl) == fname)
-                                    .then_some(&field_decl.ty)
-                            },
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "exception class {class_name}.{fname}: {owner} owns the field but has no declaration"
-                        )
-                    });
-                let descendant_spelling = tyref_to_ast_string(&field.ty, llbc);
-                let ancestor_spelling = tyref_to_ast_string(ancestor_ty, llbc);
-                if descendant_spelling != ancestor_spelling {
-                    let owner_class =
-                        crate::front::llbc_hints::exception_class_key(&hint.enum_path, Some(owner));
-                    panic!(
-                        "exception class {class_name}.{fname}: field type {descendant_spelling} \
-                         disagrees with {owner_class}.{fname} field type {ancestor_spelling}"
-                    );
-                }
                 continue;
             }
-            if !exception_class_attr_is_one_word(
-                &field.ty,
-                llbc,
-                gc_struct_ids,
+            let group = groups
+                .iter()
+                .find(|group| group.owner == owner && group.field == fname)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "exception class {class_name}.{fname}: {owner} owns the field but has no declaration"
+                    )
+                });
+            let (row, attr) = exception_class_generalized_owner_row(
+                &class_name,
+                &fname,
+                owner,
+                &group.decls,
                 raw_alloc_flavor_structs,
-            ) {
-                let spelling = tyref_to_ast_string(&field.ty, llbc);
-                panic!(
-                    "exception class {class_name}.{fname}: field type {spelling} is not a one-word attr"
-                );
-            }
-            // A by-value `alloc::string::String` is the rstr attr.
-            // `"str"` is the spelling `project_struct_field_type` already
-            // maps to `s_str0()` (`SomeString`). The register bank is
-            // `ValueType::Str` (`Ptr(STR)`). A borrow or raw pointer is
-            // not this helper, so it keeps the address row.
-            //
-            // A by-value `Vec<String>` is an unresized list of str
-            // (`ArgErrMissing.__init__` stores `missing` as that list).
-            // The row spelling is [`RPY_LIST_OF_STR`]: one pointer word,
-            // `SomeList(s_str0())`, `Ptr(GcArray(GCREF))`
-            // (`externalvsinternal` wraps `Ptr(STR)`). It is not
-            // published as `Vec<String>` or `Slice<String>`.
-            let by_value_string = tyref_is_by_value_alloc_string(&field.ty, llbc);
-            let by_value_list_of_str = tyref_is_by_value_vec_string(&field.ty, llbc);
-            let row_ty = if by_value_string {
-                "str".to_string()
-            } else if by_value_list_of_str {
-                RPY_LIST_OF_STR.to_string()
-            } else {
-                annotation_struct_field_type(
-                    &field.ty,
-                    llbc,
-                    gc_struct_ids,
-                    raw_alloc_flavor_structs,
-                )
-            };
-            let attr_ty = if by_value_string {
-                ValueType::Str
-            } else if by_value_list_of_str {
-                ValueType::Ref(Some(RPY_LIST_OF_STR.to_string()))
-            } else {
-                tyref_to_attr_value_type_with(
-                    &field.ty,
-                    llbc,
-                    no_tombstoned_leaves(),
-                    gc_struct_ids,
-                    raw_alloc_flavor_structs,
-                )
-            };
-            attrs.push((fname.clone(), attr_ty));
-            rows.push(field_row_from_decl(index, field, row_ty, llbc));
+            );
+            rows.push(row);
+            attrs.push(attr);
         }
         if rows.is_empty() {
             continue;

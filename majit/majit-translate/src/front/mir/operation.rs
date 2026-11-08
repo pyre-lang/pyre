@@ -1048,11 +1048,21 @@ impl<'a> Lowering<'a> {
                     let store_list_of_str =
                         self.exception_disc_info_for_ty(&field_base_ty).is_some()
                             && tyref_is_by_value_vec_string(dest_ty, self.llbc);
+                    // A by-value raw-flavor struct is one `*mut T` word.
+                    // The moved bytes are boxed later; copying the struct
+                    // over the class word would publish the interior.
+                    let store_raw_owned = self.exception_disc_info_for_ty(&field_base_ty).is_some()
+                        && tyref_is_by_value_raw_flavor_struct(
+                            dest_ty,
+                            self.llbc,
+                            &self.raw_alloc_flavor_structs,
+                        );
                     // A multi-word inline field is the aggregate, not a
                     // pointer. Storing the temporary's address into the
                     // first word overwrites the discriminant.
                     if !store_rstr_attr
                         && !store_list_of_str
+                        && !store_raw_owned
                         && self.struct_field_offset_from_payload(&field_base_ty, field_payload)
                             == Some(0)
                         && let Some(plan) = self.move_plan(dest_ty)
@@ -1072,6 +1082,7 @@ impl<'a> Lowering<'a> {
                     // `__pos_0` with that Int as the base.
                     if !store_rstr_attr
                         && !store_list_of_str
+                        && !store_raw_owned
                         && let Some(nested) = tyref_by_value_struct_decl(
                             dest_ty,
                             self.llbc,
@@ -1189,6 +1200,20 @@ impl<'a> Lowering<'a> {
                                 ValueType::Str
                             } else if store_list_of_str {
                                 ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string()))
+                            } else if store_raw_owned {
+                                // The row is one raw `*mut T`. `history.py
+                                // getkind` of that `Ptr` (`rclass.py
+                                // getgcflavor`) is `'int'`. `descr.py
+                                // get_type_flag` is `FLAG_UNSIGNED`.
+                                exception_class_raw_owned_attr(
+                                    dest_ty,
+                                    self.llbc,
+                                    self.tombstoned_leaves,
+                                    self.gc_struct_ids,
+                                    &self.raw_alloc_flavor_structs,
+                                )
+                                .expect("raw-owned exception attr has a pointer row");
+                                ValueType::Unsigned
                             } else {
                                 overlaid
                             };
@@ -5825,6 +5850,12 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         place: &Place,
     ) -> Result<Option<Variable>, LowerError> {
+        // A raw-owned exception attr is the pointer word the instance
+        // holds (`PyCode._signature`), not an interior address of the
+        // by-value struct.
+        if self.place_is_raw_owned_exception_field(place) {
+            return Ok(None);
+        }
         let Some(offset) = self.inline_substruct_field_offset(place) else {
             return Ok(None);
         };
@@ -5909,6 +5940,24 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Field of a marked exception class whose type is a by-value
+    /// raw-flavor struct. `&field` is the stored `*mut T`, the same
+    /// word a declared pointer field yields from `&*ptr`.
+    pub(in crate::front::mir) fn place_is_raw_owned_exception_field(&self, place: &Place) -> bool {
+        let PlaceKind::Projection(inner, ProjectionElem::Tagged(elem)) = &place.kind else {
+            return false;
+        };
+        if elem.as_object().and_then(|map| map.get("Field")).is_none() {
+            return false;
+        }
+        self.exception_disc_info_for_ty(&inner.ty).is_some()
+            && tyref_is_by_value_raw_flavor_struct(
+                &place.ty,
+                self.llbc,
+                &self.raw_alloc_flavor_structs,
+            )
+    }
+
     /// `&T` of a transparent scalar is the word, so the field read stays a
     /// value. Any other projection borrow is the place address.
     ///
@@ -5919,6 +5968,9 @@ impl<'a> Lowering<'a> {
         if owner_root_guard::tyref_is_guard(&place.ty, self.llbc)
             || owner_root_guard::tyref_is_option_of_guard(&place.ty, self.llbc)
         {
+            return false;
+        }
+        if self.place_is_raw_owned_exception_field(place) {
             return false;
         }
         Self::place_ref_is_address_of(place)
@@ -6718,6 +6770,19 @@ impl<'a> Lowering<'a> {
                     let read_list_of_str = self.exception_disc_info_for_ty(&inner.ty).is_some()
                         && (tyref_is_by_value_vec_string(&field_ty, self.llbc)
                             || tyref_is_by_value_vec_string(&place_ty, self.llbc));
+                    // A by-value raw-flavor struct attr is the `*mut T`
+                    // word. `inline_vec` would treat that pointer as a
+                    // rust header.
+                    let read_raw_owned = self.exception_disc_info_for_ty(&inner.ty).is_some()
+                        && (tyref_is_by_value_raw_flavor_struct(
+                            &field_ty,
+                            self.llbc,
+                            &self.raw_alloc_flavor_structs,
+                        ) || tyref_is_by_value_raw_flavor_struct(
+                            &place_ty,
+                            self.llbc,
+                            &self.raw_alloc_flavor_structs,
+                        ));
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.emit_bb(mir_bb);
                     let base = if let Some(root) = narrow_root {
@@ -6783,6 +6848,25 @@ impl<'a> Lowering<'a> {
                         ty = ValueType::Str;
                     } else if read_list_of_str {
                         ty = ValueType::Ref(Some(crate::front::mir::RPY_LIST_OF_STR.to_string()));
+                    } else if read_raw_owned {
+                        let raw_ty = if tyref_is_by_value_raw_flavor_struct(
+                            &place_ty,
+                            self.llbc,
+                            &self.raw_alloc_flavor_structs,
+                        ) {
+                            &place_ty
+                        } else {
+                            &field_ty
+                        };
+                        let raw = exception_class_raw_owned_attr(
+                            raw_ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                        )
+                        .expect("raw-owned exception attr has a pointer row");
+                        ty = ValueType::Ref(Some(raw.class_root));
                     }
                     let res = self
                         .graph
@@ -6815,6 +6899,7 @@ impl<'a> Lowering<'a> {
                         .with_host_index(host_index)
                         .with_inline_vec(
                             !read_list_of_str
+                                && !read_raw_owned
                                 && (field_ty_is_inline_vec(&field_ty, self.llbc)
                                     || field_ty_is_inline_vec(&place_ty, self.llbc)),
                         );
@@ -8187,6 +8272,20 @@ impl<'a> Lowering<'a> {
                         tyref_is_by_value_vec_string(ty, self.llbc)
                             && self.exception_disc_info_for_ty(dest_ty).is_some()
                     }),
+                    raw_owned_root: if self.exception_disc_info_for_ty(dest_ty).is_some() {
+                        declared_ty.and_then(|ty| {
+                            exception_class_raw_owned_attr(
+                                ty,
+                                self.llbc,
+                                self.tombstoned_leaves,
+                                self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
+                            )
+                            .map(|raw| raw.class_root)
+                        })
+                    } else {
+                        None
+                    },
                     owner_root,
                 }
             })

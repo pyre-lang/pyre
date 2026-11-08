@@ -1613,6 +1613,7 @@ impl<'a> Lowering<'a> {
                     raw_u8: false,
                     str_value: false,
                     list_of_str: false,
+                    raw_owned_root: None,
                     owner_root: None,
                 })
                 .collect(),

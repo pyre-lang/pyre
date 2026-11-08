@@ -78,3 +78,19 @@ pub fn malloc_raw<T>(value: T) -> *mut T {
 /// The `majit_gc` add_memory_pressure hook is process-global, so every test that installs it or charges pressure holds this lock.
 #[cfg(test)]
 pub(crate) static MEMORY_PRESSURE_HOOK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serializes every test that installs `majit_gc::set_active_raise_memory_error`.
+#[cfg(test)]
+pub(crate) static RAISE_MEMORY_ERROR_HOOK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Clears `majit_gc::set_active_raise_memory_error` on drop. Construct it after
+/// locking [`RAISE_MEMORY_ERROR_HOOK_TEST`] so the hook clears before the mutex.
+#[cfg(test)]
+pub(crate) struct ClearRaiseHook;
+
+#[cfg(test)]
+impl Drop for ClearRaiseHook {
+    fn drop(&mut self) {
+        majit_gc::set_active_raise_memory_error(None);
+    }
+}

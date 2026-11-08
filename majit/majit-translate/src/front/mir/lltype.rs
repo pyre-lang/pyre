@@ -5903,12 +5903,97 @@ pub(in crate::front::mir) fn tyref_is_by_value_vec_string(ty: &TyRef, llbc: &Llb
     tyref_is_by_value_alloc_string(&TyRef::Other(item.clone()), llbc)
 }
 
+/// By-value raw-flavor struct: one `*mut T` word on a marked exception
+/// class (`rclass.py` `getgcflavor`, the same pointer `Ptr(raw STRUCT)`
+/// a declared `*mut T` field already publishes).
+pub(in crate::front::mir) struct ExceptionClassRawOwnedAttr {
+    pub spelling: String,
+    pub class_root: String,
+    pub type_path: String,
+    pub size: u64,
+    pub align: u64,
+}
+
+/// By-value struct whose TypeDecl is in the harvested raw-flavor set.
+///
+/// A `Ref` or `RawPtr` stays the address ([`exception_class_by_value_adt`]).
+/// An opaque `Vec` is not a struct. The raw marker is what makes the
+/// by-value value one pointer word.
+pub(in crate::front::mir) fn tyref_is_by_value_raw_flavor_struct(
+    ty: &TyRef,
+    llbc: &Llbc,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> bool {
+    let Some(td) = exception_class_by_value_adt(ty, llbc) else {
+        return false;
+    };
+    if !matches!(td.kind, TypeDeclKind::Struct(_)) {
+        return false;
+    }
+    crate::front::llbc_hints::alloc_flavor_raw_contains(
+        raw_alloc_flavor_structs,
+        &td.item_meta.name_path(),
+    )
+}
+
+/// Pointer row for a by-value raw-flavor struct field.
+///
+/// `None` when the field is not that struct. The spelling is
+/// [`super::annotation_struct_field_type`] of a synthesized `*mut T`,
+/// and the class root is [`flavor_raw_pointer_class_root`] of that
+/// pointer. A missing type node, class root, or layout size/align is a
+/// placement failure: the store would otherwise copy the struct inline.
+pub(in crate::front::mir) fn exception_class_raw_owned_attr(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> Option<ExceptionClassRawOwnedAttr> {
+    if !tyref_is_by_value_raw_flavor_struct(ty, llbc, raw_alloc_flavor_structs) {
+        return None;
+    }
+    let td = exception_class_by_value_adt(ty, llbc).expect("raw-flavor struct decl");
+    let type_path = td.item_meta.name_path();
+    let node = tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_indirections(node, llbc))
+        .unwrap_or_else(|| panic!("raw-owned attr {type_path} has no type node"));
+    let pointer = TyRef::Other(serde_json::json!({"RawPtr": [node, "Mut"]}));
+    let spelling = super::annotation_struct_field_type(
+        &pointer,
+        llbc,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    );
+    let class_root =
+        flavor_raw_pointer_class_root(&pointer, llbc, tombstoned, raw_alloc_flavor_structs)
+            .unwrap_or_else(|| panic!("raw-owned attr {type_path} has no class root"));
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let layout = td
+        .layout_for_target(llbc, &target)
+        .unwrap_or_else(|| panic!("raw-owned attr {type_path} has no layout"));
+    let size = layout
+        .size
+        .unwrap_or_else(|| panic!("raw-owned attr {type_path} has no size"));
+    let align = layout
+        .align
+        .unwrap_or_else(|| panic!("raw-owned attr {type_path} has no align"));
+    Some(ExceptionClassRawOwnedAttr {
+        spelling,
+        class_root,
+        type_path,
+        size,
+        align,
+    })
+}
+
 /// Whether a marked-enum variant field is one translated word.
 ///
 /// A by-value `String` is one rstr word (`Ptr(STR)`). A by-value
 /// `Vec<String>` is one list-of-str word (`Ptr(GcArray(GCREF))`).
-/// A `Vec` whose items are not one word and not that string list, a
-/// by-value `VecDeque`, and a by-value raw-flavor or multi-word struct
+/// A by-value raw-flavor struct is one `*mut T` word. A `Vec` whose
+/// items are not one word and not that string list, a by-value
+/// `VecDeque`, and a by-value multi-word struct that is not raw-flavor
 /// are not. A pointer or borrow of those types is the address.
 /// `Wtf8Buf`, a `Vec` of one-word items, scalars, and GC refs are.
 pub(in crate::front::mir) fn exception_class_attr_is_one_word(
@@ -5946,7 +6031,7 @@ pub(in crate::front::mir) fn exception_class_attr_is_one_word(
     };
     let path = td.item_meta.name_path();
     if crate::front::llbc_hints::alloc_flavor_raw_contains(raw_alloc_flavor_structs, &path) {
-        return false;
+        return true;
     }
     let target = std::env::var("TARGET").unwrap_or_default();
     let size = td

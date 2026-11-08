@@ -5708,13 +5708,18 @@ fn minted_exception_chain_for_key(cc: &CallControl, key: &str) -> Vec<String> {
 fn minted_exception_instance_layout(
     cc: &CallControl,
     chain: &[String],
-) -> (usize, Vec<crate::jitcode::BhFieldSpec>) {
+) -> (
+    usize,
+    Vec<crate::jitcode::BhFieldSpec>,
+    Vec<crate::front::llbc_hints::MintedRawOwnedDrop>,
+) {
     let word = crate::layout::target_word_size();
     let mut super_size = word;
     let mut super_align = word.max(1);
     let mut specs = Vec::new();
+    let mut drops = Vec::new();
     if chain.is_empty() {
-        return (align_up_pow2(super_size, super_align), specs);
+        return (align_up_pow2(super_size, super_align), specs, drops);
     }
     for class_key in chain {
         let mut offset = super_size;
@@ -5736,6 +5741,12 @@ fn minted_exception_instance_layout(
             let align = scalar_align(size).max(1);
             class_align = class_align.max(align);
             offset = align_up_pow2(offset, align);
+            if let Some(raw) = &row.raw_owned {
+                drops.push(crate::front::llbc_hints::MintedRawOwnedDrop {
+                    offset,
+                    type_path: raw.type_path.clone(),
+                });
+            }
             let index = specs.len();
             let rank = cc.field_immutability(Some(class_key), &row.name);
             let is_quasi = rank.map(|rank| rank.is_quasi_immutable()).unwrap_or(false);
@@ -5759,7 +5770,24 @@ fn minted_exception_instance_layout(
         super_size = offset;
         super_align = class_align;
     }
-    (super_size, specs)
+    (super_size, specs, drops)
+}
+
+/// Fill `raw_owned` from the instance layout of each minted class.
+///
+/// The field row stays on the declaring class. A subclass instance is
+/// allocated with the subclass tid, so its destructor repeats every
+/// ancestor's raw-owned attr at the offset `super` embedding gives that
+/// field. A class whose chain has no such attr keeps an empty list.
+pub(crate) fn attach_minted_exception_raw_owned_drops(
+    cc: &CallControl,
+    rows: &mut [crate::front::llbc_hints::MintedExceptionClassEmit],
+) {
+    for row in rows {
+        let chain = minted_exception_chain_for_key(cc, &row.name);
+        let (_size, _specs, drops) = minted_exception_instance_layout(cc, &chain);
+        row.raw_owned = drops;
+    }
 }
 
 /// Size of a minted exception class, including a variant with no fields
@@ -5776,7 +5804,7 @@ fn minted_exception_instance_size_spec(
 ) -> Option<crate::jitcode::BhSizeSpec> {
     let key = minted_exception_size_owner(cc, owner, 0)?;
     let chain = minted_exception_chain_for_key(cc, &key);
-    let (size, all_fielddescrs) = minted_exception_instance_layout(cc, &chain);
+    let (size, all_fielddescrs, _drops) = minted_exception_instance_layout(cc, &chain);
     let (is_gc_managed, headerless) = cc.struct_storage_for(owner).unwrap_or((true, false));
     Some(crate::jitcode::BhSizeSpec {
         size,

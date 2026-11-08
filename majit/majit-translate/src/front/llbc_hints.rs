@@ -887,14 +887,31 @@ pub(crate) fn push_program_exception_class_hint(
     acc.push(hint);
 }
 
+/// One raw-owned attribute the minted class's light destructor frees.
+///
+/// `offset` is the pointer slot in the instance (`OBJECT` typeptr, then
+/// each ancestor's declared fields). `type_path` is the TypeDecl
+/// `name_path` the slot boxes. A subclass repeats an inherited attr at
+/// the embedded-super offset: the field row stays on the declaring
+/// class, and the subclass instance has its own tid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintedRawOwnedDrop {
+    pub offset: usize,
+    pub type_path: String,
+}
+
 /// One minted class, parent before child, for the runtime static table.
 ///
 /// `parent` is an index into the same list. `None` is a hierarchy base:
 /// its RPython parent is host `Exception`, which is not a row.
+/// `raw_owned` is empty until the instance layout fills it. A class
+/// with no raw-owned attr, including one that only inherits none, stays
+/// empty and gets no destructor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MintedExceptionClassEmit {
     pub name: String,
     pub parent: Option<usize>,
+    pub raw_owned: Vec<MintedRawOwnedDrop>,
 }
 
 /// Flatten harvested hierarchies into parent-before-child rows.
@@ -943,7 +960,11 @@ fn push_minted_exception_row(
     if rows.iter().any(|row| row.name == name) {
         panic!("duplicate minted exception class `{name}`");
     }
-    rows.push(MintedExceptionClassEmit { name, parent });
+    rows.push(MintedExceptionClassEmit {
+        name,
+        parent,
+        raw_owned: Vec::new(),
+    });
     hosts.push(host.clone());
 }
 
@@ -969,10 +990,38 @@ pub fn render_minted_exception_classes_rs(rows: &[MintedExceptionClassEmit]) -> 
         idents.push(ident);
     }
     for (row, ident) in rows.iter().zip(&idents) {
+        let destructor = format!("{ident}_destructor");
+        if destructor == "MINTED_EXCEPTION_CLASSES"
+            || idents.iter().any(|existing| existing == &destructor)
+        {
+            panic!(
+                "minted exception class ident collision: {destructor} from `{}`",
+                row.name
+            );
+        }
         out.push_str(&format!(
             "static {ident}: pyre_object::PyType = pyre_object::pyobject::new_pytype(\"{}\");\n",
             escape_rust_string(&row.name)
         ));
+        if row.raw_owned.is_empty() {
+            continue;
+        }
+        out.push_str(&format!(
+            "unsafe fn {destructor}(obj_addr: usize) {{\n    unsafe {{\n"
+        ));
+        for raw in &row.raw_owned {
+            if raw.type_path.is_empty() {
+                panic!(
+                    "minted exception class `{}` raw-owned attr has an empty type path",
+                    row.name
+                );
+            }
+            out.push_str(&format!(
+                "        drop_raw_owned_attr::<{}>(obj_addr, {});\n",
+                raw.type_path, raw.offset
+            ));
+        }
+        out.push_str("    }\n}\n");
     }
     out.push_str("pub static MINTED_EXCEPTION_CLASSES: &[MintedExceptionClass] = &[\n");
     for (row, ident) in rows.iter().zip(&idents) {
@@ -980,8 +1029,13 @@ pub fn render_minted_exception_classes_rs(rows: &[MintedExceptionClassEmit]) -> 
             None => "None".to_string(),
             Some(parent) => format!("Some({parent})"),
         };
+        let destructor = if row.raw_owned.is_empty() {
+            "None".to_string()
+        } else {
+            format!("Some({ident}_destructor)")
+        };
         out.push_str(&format!(
-            "    MintedExceptionClass {{ name: \"{}\", pytype: &{ident}, parent: {parent} }},\n",
+            "    MintedExceptionClass {{ name: \"{}\", pytype: &{ident}, parent: {parent}, destructor: {destructor} }},\n",
             escape_rust_string(&row.name)
         ));
     }

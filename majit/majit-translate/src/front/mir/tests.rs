@@ -30269,6 +30269,7 @@ pub(in crate::front::mir) fn some_ctor_shape() -> super::AggregateShape {
             raw_u8: false,
             str_value: false,
             list_of_str: false,
+            raw_owned_root: None,
             owner_root: None,
         }],
     })
@@ -30319,6 +30320,7 @@ pub(in crate::front::mir) fn ok_ctor_shape() -> super::AggregateShape {
             raw_u8: false,
             str_value: false,
             list_of_str: false,
+            raw_owned_root: None,
             owner_root: None,
         }],
     })

@@ -365,6 +365,13 @@ pub(in crate::front::mir) struct AggregateField {
     /// `jtransform` runs `HighLevelOp.convertvar` when this write's type
     /// is that list and the operand is `{cap, ptr, len}`.
     pub(in crate::front::mir) list_of_str: bool,
+    /// Class root of a by-value raw-flavor struct stored as `*mut T`.
+    /// Presence selects the raw-owned move. The stored word is
+    /// `ValueType::Unsigned`: `history.py getkind` of a raw `Ptr`
+    /// (`rclass.py getgcflavor`) is `'int'`, and `descr.py get_type_flag`
+    /// is `FLAG_UNSIGNED`. `None` keeps the declared field type, including
+    /// a field that was already declared as that pointer.
+    pub(in crate::front::mir) raw_owned_root: Option<String>,
     /// Declaring class of a marked exception-class field
     /// (`ClassDef.get_owner`). `None` keeps the constructor's result class.
     pub(in crate::front::mir) owner_root: Option<String>,
@@ -566,6 +573,14 @@ fn ctor_ccharp_field_store(
     }
     if field.str_value {
         return Ok((value.clone(), ValueType::Str));
+    }
+    if field.raw_owned_root.is_some() {
+        // The operand stays the moved by-value struct. `jtransform`
+        // boxes it before `rewrite_op_setfield`. The stored word is the
+        // raw pointer: `history.py getkind` is `'int'` and
+        // `descr.py get_type_flag` is `FLAG_UNSIGNED`
+        // (`rclass.py getgcflavor`).
+        return Ok((value.clone(), ValueType::Unsigned));
     }
     if ctor_field_is_raw_u8(ctor, field) {
         if value.concretetype().as_ref().is_some_and(lltype_is_ccharp) {

@@ -1520,25 +1520,58 @@ fn exception_class_non_one_word_field_panics() {
     );
     expect_one_word_panic(&bad_vec_sig, "BadVecSig::S", "Vec<Signature>");
 
-    let signature = super::interior_struct(
-        1,
-        &["fixture", "Signature"],
-        &[("word", super::interior_usize())],
-        8,
-        &[0],
-        false,
+    let bad_sig = bad_enum_llbc(
+        "BadSig",
+        adt(1),
+        signature_types(),
+        vec![signature_raw_marker()],
     );
-    let raw_marker = marker(1, &["fixture", "_alloc_flavor_Signature"], "raw");
-    let bad_sig = bad_enum_llbc("BadSig", adt(1), vec![signature.clone()], vec![raw_marker]);
-    expect_one_word_panic(&bad_sig, "BadSig::S", "Signature");
+    let ok_raw = bad_enum_llbc(
+        "OkRawPtr",
+        super::interior_raw_mut(adt(1)),
+        signature_types(),
+        vec![signature_raw_marker()],
+    );
+    let (_, bad_fields, _, _, bad_attrs) = program_metadata(&bad_sig);
+    let (_, raw_fields, _, _, raw_attrs) = program_metadata(&ok_raw);
+    let bad_row = missing_field_row(&bad_fields, "BadSig::S");
+    let raw_row = missing_field_row(&raw_fields, "OkRawPtr::S");
+    assert_eq!(bad_row.ty, "*mut Signature");
+    assert_eq!(bad_row.ty, raw_row.ty);
+    assert_eq!(bad_attrs.get("BadSig::S"), raw_attrs.get("OkRawPtr::S"));
+    assert_eq!(
+        bad_attrs.get("BadSig::S"),
+        Some(&vec![(
+            "missing".to_string(),
+            ValueType::Ref(Some("Signature".to_string()))
+        )])
+    );
+    let raw_set = crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+        std::slice::from_ref(&bad_sig),
+    );
+    let bad_flag = crate::codewriter::call::get_type_flag(&bad_row.ty, &raw_set);
+    let raw_flag = crate::codewriter::call::get_type_flag(&raw_row.ty, &raw_set);
+    assert_eq!(bad_flag, raw_flag);
+    assert_eq!(bad_flag.2, crate::layout::target_word_size());
+    let owned = bad_row
+        .raw_owned
+        .as_ref()
+        .expect("by-value raw-flavor struct is raw-owned");
+    assert_eq!(owned.type_path, "fixture::Signature");
+    assert!(owned.type_path.ends_with("Signature"));
+    assert_eq!(owned.size, 8);
+    assert_eq!(owned.align, 8);
+    assert!(raw_row.raw_owned.is_none());
 
-    let ok_sig = bad_enum_llbc("OkSig", adt(1), vec![signature], vec![]);
+    let ok_sig = bad_enum_llbc("OkSig", adt(1), signature_types(), vec![]);
     let (_, fields, _, _, _) = program_metadata(&ok_sig);
-    let rows = row_names(&fields, "OkSig::S").expect("OkSig::S");
+    let ok_row = missing_field_row(&fields, "OkSig::S");
     assert!(
-        rows.iter().any(|(name, _, _)| name == "missing"),
-        "one-word struct field is placed, got {rows:?}"
+        !ok_row.ty.starts_with("*mut"),
+        "one-word struct field stays inline, got {}",
+        ok_row.ty
     );
+    assert!(ok_row.raw_owned.is_none());
 
     let ok_ptr = bad_enum_llbc(
         "OkPtr",
@@ -2222,10 +2255,57 @@ fn exception_class_field_read_skips_a_non_declaring_parent() {
     );
 }
 
+/// Owner `x: i64`, subclass `x: isize`. `ClassDef._generalize_attr`
+/// merges both signed integers onto the owner; the subclass has no row.
 #[test]
-#[should_panic(
-    expected = "exception class synth::E::C.n: field type String disagrees with synth::E::A.n field type i64"
-)]
+fn exception_class_inherited_i64_isize_merges_on_owner() {
+    let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let isize_ty = isize_disc_ty();
+    let llbc = super::window_llbc_with_globals(
+        vec![enum_decl(
+            0,
+            &["fixture", "synth", "E"],
+            vec![
+                variant("A", vec![named_field("x", &i64_ty)], 0),
+                variant("B", vec![named_field("x", &isize_ty)], 1),
+            ],
+        )],
+        Vec::new(),
+        vec![marker(
+            0,
+            &["fixture", "synth", "_exception_class_E"],
+            "B(A)",
+        )],
+    );
+    let (_, fields, _, _, attrs) = program_metadata(&llbc);
+    assert_rows(&fields, "synth::E::A", &[("x", "i64", false)]);
+    assert_absent(&fields, "synth::E::B");
+    assert_absent(&fields, "synth::E");
+    let row = &fields.fields["synth::E::A"][0];
+    let raw = std::collections::HashSet::new();
+    assert_eq!(
+        crate::codewriter::call::get_type_flag(&row.ty, &raw),
+        crate::codewriter::call::get_type_flag("isize", &raw),
+        "i64 and isize are one signed integer"
+    );
+    assert!(row.raw_owned.is_none());
+    assert_eq!(
+        attrs.get("synth::E::A"),
+        Some(&vec![("x".to_string(), ValueType::Int)])
+    );
+    assert!(attrs.get("synth::E::B").is_none());
+    let mut owners: Vec<&str> = fields
+        .fields
+        .iter()
+        .filter(|(_, rows)| rows.iter().any(|candidate| candidate.name == "x"))
+        .map(|(key, _)| key.as_str())
+        .collect();
+    owners.sort();
+    assert_eq!(owners, vec!["synth::E::A"]);
+}
+
+#[test]
+#[should_panic(expected = "exception class synth::E::A.x: field type i64 ∪ String")]
 fn exception_class_inherited_field_type_mismatch_panics() {
     let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
     let string_ty = adt(1);
@@ -2235,9 +2315,8 @@ fn exception_class_inherited_field_type_mismatch_panics() {
                 0,
                 &["fixture", "synth", "E"],
                 vec![
-                    variant("A", vec![named_field("n", &i64_ty)], 0),
-                    variant("B", vec![], 1),
-                    variant("C", vec![named_field("n", &string_ty)], 2),
+                    variant("A", vec![named_field("x", &i64_ty)], 0),
+                    variant("B", vec![named_field("x", &string_ty)], 1),
                 ],
             ),
             opaque_string_decl(1),
@@ -2246,7 +2325,7 @@ fn exception_class_inherited_field_type_mismatch_panics() {
         vec![marker(
             0,
             &["fixture", "synth", "_exception_class_E"],
-            "C(B) B(A)",
+            "B(A)",
         )],
     );
     let _ = program_metadata(&llbc);
@@ -2697,5 +2776,540 @@ fn exception_class_unmarked_vec_string_field_stays_three_words() {
         !names_list_of_str_helper(&transformed),
         "a plain Vec<String> field is not a list-of-str attr; graph={}",
         transformed.dump()
+    );
+}
+
+fn signature_string_decl() -> Value {
+    json!({
+        "def_id": 2,
+        "item_meta": super::window_meta(&["alloc", "string", "String"], false),
+        "kind": "Opaque"
+    })
+}
+
+/// One-word layout. The field is `alloc::string::String`, a GC container,
+/// so the struct's `_gckind` stays Gc and `*mut Signature` is the
+/// flavor-raw class root (`ValueType::Ref` on the attr and the read).
+/// The raw-owned store writes that pointer as `ValueType::Unsigned`
+/// (`descr.py get_type_flag`).
+fn signature_struct() -> Value {
+    super::interior_struct(
+        1,
+        &["fixture", "Signature"],
+        &[("word", adt(2))],
+        8,
+        &[0],
+        false,
+    )
+}
+
+fn signature_types() -> Vec<Value> {
+    vec![signature_struct(), signature_string_decl()]
+}
+
+fn signature_raw_marker() -> Value {
+    marker(1, &["fixture", "_alloc_flavor_Signature"], "raw")
+}
+
+fn missing_field_row<'a>(
+    fields: &'a crate::front::semantic::StructFieldRegistry,
+    key: &str,
+) -> &'a crate::front::semantic::FieldRow {
+    fields
+        .fields
+        .get(key)
+        .and_then(|rows| rows.iter().find(|row| row.name == "missing"))
+        .unwrap_or_else(|| panic!("{key} has no missing row"))
+}
+
+fn names_raw_box(graph: &FunctionGraph) -> bool {
+    super::window_graph_ops(graph).iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::ConstFnAddr { path, .. } if path.contains("jit_ll_box_raw_moved")
+        )
+    })
+}
+
+fn transform_with_fields(
+    graph: &FunctionGraph,
+    fields: crate::front::semantic::StructFieldRegistry,
+    helper: Option<&str>,
+) -> FunctionGraph {
+    let mut cc = crate::call::CallControl::new();
+    cc.set_struct_fields(fields);
+    let mut config = crate::codewriter::jtransform::GraphTransformConfig::default();
+    if let Some(helper) = helper {
+        config.raw_owned_box_helper = helper.to_string();
+    }
+    crate::codewriter::jtransform::Transformer::new(&config)
+        .with_callcontrol(&mut cc)
+        .transform(graph)
+        .graph
+}
+
+fn const_int_of(ops: &[crate::model::SpaceOperation], var: &Variable) -> Option<(usize, i64)> {
+    ops.iter()
+        .enumerate()
+        .find_map(|(index, op)| match &op.kind {
+            OpKind::ConstInt(value) if op.result.as_ref() == Some(var) => Some((index, *value)),
+            _ => None,
+        })
+}
+
+fn assert_raw_box_then_setfield(graph: &FunctionGraph, source: &Variable, size: i64, align: i64) {
+    let mut found = false;
+    for block in &graph.blocks {
+        let ops = &block.operations;
+        for (index, op) in ops.iter().enumerate() {
+            let OpKind::CallResidual {
+                args_r,
+                args_i,
+                funcptr,
+                descriptor,
+                result_kind,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if !args_r.is_empty() || args_i.len() != 3 || &args_i[0] != source {
+                continue;
+            }
+            let crate::model::CallFuncPtr::Value(func_var) = funcptr else {
+                continue;
+            };
+            let Some(def_index) = ops[..index]
+                .iter()
+                .rposition(|earlier| earlier.result.as_ref() == Some(func_var))
+            else {
+                continue;
+            };
+            let OpKind::ConstFnAddr { path, .. } = &ops[def_index].kind else {
+                continue;
+            };
+            if !path.contains("jit_ll_box_raw_moved") {
+                continue;
+            }
+            let Some((size_index, size_value)) = const_int_of(&ops[..index], &args_i[1]) else {
+                continue;
+            };
+            let Some((align_index, align_value)) = const_int_of(&ops[..index], &args_i[2]) else {
+                continue;
+            };
+            assert_eq!(size_value, size, "{}", graph.dump());
+            assert_eq!(align_value, align, "{}", graph.dump());
+            assert!(
+                size_index < align_index && align_index < def_index,
+                "size, align, then the helper; graph={}",
+                graph.dump()
+            );
+            assert_eq!(*result_kind, 'i', "{}", graph.dump());
+            assert_eq!(descriptor.result_type, 'i', "{}", graph.dump());
+            assert_eq!(
+                descriptor.result_ir_type(),
+                majit_ir::value::Type::Int,
+                "{}",
+                graph.dump()
+            );
+            assert_eq!(descriptor.arg_classes, "iii", "{}", graph.dump());
+            assert!(
+                index + 2 < ops.len(),
+                "helper, live, then the store; graph={}",
+                graph.dump()
+            );
+            assert!(
+                matches!(ops[index + 1].kind, OpKind::Live { .. }),
+                "graph={}",
+                graph.dump()
+            );
+            let OpKind::FieldWrite {
+                field, value, ty, ..
+            } = &ops[index + 2].kind
+            else {
+                panic!("the store follows live; graph={}", graph.dump());
+            };
+            let boxed = op.result.as_ref().expect("boxed pointer");
+            assert_eq!(
+                FunctionGraph::concretetype_of(boxed),
+                crate::model::ConcreteType::Signed,
+                "raw pointer is int kind; graph={}",
+                graph.dump()
+            );
+            assert_eq!(field.name, "missing");
+            assert!(
+                matches!(value, LinkArg::Value(stored) if stored == boxed),
+                "the store operand is the boxed pointer; graph={}",
+                graph.dump()
+            );
+            assert_eq!(
+                *ty,
+                ValueType::Unsigned,
+                "stored ty {ty:?}; graph={}",
+                graph.dump()
+            );
+            found = true;
+        }
+    }
+    assert!(
+        found,
+        "raw-owned store boxes the moved value; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !field_writes(graph).iter().any(|(name, _)| name == "word"),
+        "the projection does not copy the struct leaf; graph={}",
+        graph.dump()
+    );
+}
+
+fn read_missing_fun(enum_leaf: &str, by_value: bool) -> Value {
+    let enum_ty = adt(0);
+    let enum_ref = shared_ref(&enum_ty);
+    let sig_ty = adt(1);
+    let field_ty = if by_value {
+        sig_ty.clone()
+    } else {
+        super::interior_raw_mut(sig_ty.clone())
+    };
+    let borrow_ty = shared_ref(&sig_ty);
+    let out = usize_ty();
+    let disc_ty = isize_disc_ty();
+    let deref = super::window_place(
+        json!({"Projection": [local_place(1, &enum_ref), "Deref"]}),
+        &enum_ty,
+    );
+    let field = downcast_field(deref.clone(), &enum_ty, 0, 0, &field_ty);
+    let place = if by_value {
+        field
+    } else {
+        super::window_place(json!({"Projection": [field, "Deref"]}), &sig_ty)
+    };
+    let borrowed = json!({"Ref": {"place": place, "kind": "Shared", "ptr_metadata": null}});
+    let disc = local_place(2, &disc_ty);
+    let ret = local_place(0, &out);
+    let tmp = local_place(3, &borrow_ty);
+    fun(
+        1,
+        &["fixture", enum_leaf, "read_missing"],
+        vec![enum_ref.clone()],
+        out.clone(),
+        unstructured(
+            1,
+            vec![
+                named_local(0, None, &out),
+                named_local(1, Some("self"), &enum_ref),
+                named_local(2, None, &disc_ty),
+                named_local(3, None, &borrow_ty),
+            ],
+            vec![
+                regular(
+                    vec![assign(disc.clone(), json!({"Discriminant": deref}))],
+                    switch_int(disc, &[(0, 1)], 2),
+                ),
+                regular(
+                    vec![assign(tmp.clone(), borrowed)],
+                    call_regular(0, tmp, ret, 3, 2),
+                ),
+                regular(vec![], json!({"Abort": "UndefinedBehavior"})),
+                ret_block(vec![]),
+            ],
+        ),
+    )
+}
+
+struct SigFieldRead {
+    ty: ValueType,
+    inline_vec: bool,
+    taken_by_address: bool,
+    concretetype: Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
+    result: Variable,
+}
+
+fn sig_field_read(graph: &FunctionGraph) -> SigFieldRead {
+    let reads: Vec<&crate::model::SpaceOperation> = super::window_graph_ops(graph)
+        .into_iter()
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "missing"
+            )
+        })
+        .collect();
+    assert_eq!(reads.len(), 1, "{}", graph.dump());
+    let OpKind::FieldRead { field, ty, .. } = &reads[0].kind else {
+        unreachable!("filtered to FieldRead");
+    };
+    let result = reads[0].result.clone().expect("field read result");
+    SigFieldRead {
+        ty: ty.clone(),
+        inline_vec: field.inline_vec,
+        taken_by_address: field.taken_by_address,
+        concretetype: result.concretetype(),
+        result,
+    }
+}
+
+fn use_sig_receiver(graph: &FunctionGraph) -> Variable {
+    super::window_graph_ops(graph)
+        .into_iter()
+        .find_map(|op| match &op.kind {
+            OpKind::Call { target, args, .. } => {
+                let leaf = match target {
+                    CallTarget::FunctionPath { segments, .. } => {
+                        segments.last().map(String::as_str)
+                    }
+                    CallTarget::Method { name, .. } => Some(name.as_str()),
+                    _ => None,
+                };
+                if leaf != Some("use_sig") {
+                    return None;
+                }
+                match args.first() {
+                    Some(LinkArg::Value(value)) => Some(value.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("use_sig call; graph={}", graph.dump()))
+}
+
+#[test]
+fn exception_class_raw_owned_attr_boxes_on_write() {
+    let sig_ty = adt(1);
+    let enum_ty = adt(0);
+    let build = build_aggregate(
+        0,
+        "build_s",
+        0,
+        0,
+        &enum_ty,
+        &[sig_ty.clone()],
+        vec![copy_of(local_place(1, &sig_ty))],
+    );
+    let llbc = bad_enum_with_funs(
+        "BadSig",
+        sig_ty,
+        signature_types(),
+        vec![signature_raw_marker()],
+        vec![build],
+    );
+    let graph = lower(&llbc, "build_s");
+    let source = sole_input(&graph);
+    let writes = missing_field_writes(&graph);
+    assert_eq!(writes.len(), 1, "{}", graph.dump());
+    assert_eq!(
+        writes[0].0,
+        ValueType::Unsigned,
+        "front stores the raw pointer as an unsigned word; graph={}",
+        graph.dump()
+    );
+    assert!(
+        matches!(&writes[0].1, LinkArg::Value(value) if value == &source),
+        "the operand is still the moved value; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !field_writes(&graph).iter().any(|(name, _)| name == "word"),
+        "front does not copy the struct leaf; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !names_raw_box(&graph),
+        "the box is a jtransform rewrite; graph={}",
+        graph.dump()
+    );
+    let owner = field_writes(&graph)
+        .into_iter()
+        .find(|(name, _)| name == "missing")
+        .and_then(|(_, owner)| owner);
+    assert_eq!(owner.as_deref(), Some("BadSig::S"));
+
+    let (_, fields, _, _, _) = program_metadata(&llbc);
+    assert!(missing_field_row(&fields, "BadSig::S").raw_owned.is_some());
+    let transformed = transform_with_fields(&graph, fields.clone(), None);
+    assert_raw_box_then_setfield(&transformed, &source, 8, 8);
+
+    let plain = transform_with_fields(&graph, fields, Some(""));
+    let plain_writes = missing_field_writes(&plain);
+    assert_eq!(plain_writes.len(), 1, "{}", plain.dump());
+    assert!(
+        matches!(&plain_writes[0].1, LinkArg::Value(value) if value == &source),
+        "an empty helper name leaves the moved value; graph={}",
+        plain.dump()
+    );
+    assert!(
+        !names_raw_box(&plain),
+        "an empty helper name does not box; graph={}",
+        plain.dump()
+    );
+}
+
+#[test]
+fn exception_class_declared_raw_pointer_store_is_not_reboxed() {
+    let ptr_ty = super::interior_raw_mut(adt(1));
+    let enum_ty = adt(0);
+    let build = build_aggregate(
+        0,
+        "build_s",
+        0,
+        0,
+        &enum_ty,
+        &[ptr_ty.clone()],
+        vec![copy_of(local_place(1, &ptr_ty))],
+    );
+    let llbc = bad_enum_with_funs(
+        "OkRawPtr",
+        ptr_ty,
+        signature_types(),
+        vec![signature_raw_marker()],
+        vec![build],
+    );
+    let (_, fields, _, _, _) = program_metadata(&llbc);
+    assert!(
+        missing_field_row(&fields, "OkRawPtr::S")
+            .raw_owned
+            .is_none()
+    );
+    let graph = lower(&llbc, "build_s");
+    let source = sole_input(&graph);
+    let transformed = transform_with_fields(&graph, fields, None);
+    assert!(
+        !names_raw_box(&transformed),
+        "a declared pointer is already the word; graph={}",
+        transformed.dump()
+    );
+    let writes = missing_field_writes(&transformed);
+    assert_eq!(writes.len(), 1, "{}", transformed.dump());
+    assert!(
+        matches!(&writes[0].1, LinkArg::Value(value) if value == &source),
+        "the operand stays the pointer; graph={}",
+        transformed.dump()
+    );
+}
+
+#[test]
+fn exception_class_raw_owned_attr_read_matches_raw_pointer() {
+    let use_sig = super::window_opaque_fun(
+        0,
+        &["fixture", "use_sig"],
+        vec![shared_ref(&adt(1))],
+        usize_ty(),
+    );
+    let by_value = bad_enum_with_funs(
+        "BadSig",
+        adt(1),
+        signature_types(),
+        vec![signature_raw_marker()],
+        vec![use_sig.clone(), read_missing_fun("BadSig", true)],
+    );
+    let declared = bad_enum_with_funs(
+        "OkRawPtr",
+        super::interior_raw_mut(adt(1)),
+        signature_types(),
+        vec![signature_raw_marker()],
+        vec![use_sig, read_missing_fun("OkRawPtr", false)],
+    );
+    let by_graph = lower(&by_value, "read_missing");
+    let ptr_graph = lower(&declared, "read_missing");
+    let by_read = sig_field_read(&by_graph);
+    let ptr_read = sig_field_read(&ptr_graph);
+    let root = ValueType::Ref(Some("Signature".to_string()));
+    assert_eq!(by_read.ty, root, "{}", by_graph.dump());
+    assert_eq!(by_read.ty, ptr_read.ty, "{}", ptr_graph.dump());
+    assert!(!by_read.inline_vec, "{}", by_graph.dump());
+    assert!(!ptr_read.inline_vec, "{}", ptr_graph.dump());
+    assert!(!by_read.taken_by_address, "{}", by_graph.dump());
+    assert!(!ptr_read.taken_by_address, "{}", ptr_graph.dump());
+    assert_eq!(
+        by_read.concretetype,
+        ptr_read.concretetype,
+        "by={} ptr={}",
+        by_graph.dump(),
+        ptr_graph.dump()
+    );
+    assert_eq!(
+        use_sig_receiver(&by_graph),
+        by_read.result,
+        "{}",
+        by_graph.dump()
+    );
+    assert_eq!(
+        use_sig_receiver(&ptr_graph),
+        ptr_read.result,
+        "{}",
+        ptr_graph.dump()
+    );
+}
+
+#[test]
+fn exception_class_raw_owned_destructor_includes_inherited_attr() {
+    let mut registry = crate::front::semantic::StructFieldRegistry::default();
+    registry.fields.insert(
+        "Arg::TooMany".to_string(),
+        [
+            crate::front::semantic::FieldRow::named("signature", "*mut Signature").with_raw_owned(
+                crate::front::semantic::RawOwnedField {
+                    type_path: "fixture::Signature".to_string(),
+                    size: 8,
+                    align: 8,
+                },
+            ),
+        ],
+    );
+    registry.fields.insert(
+        "Arg::TooManyMethod".to_string(),
+        [crate::front::semantic::FieldRow::named("extra", "usize")],
+    );
+    let hint = crate::front::llbc_hints::ExceptionClassHint::new(
+        "Arg",
+        "TooManyMethod(TooMany)",
+        vec!["TooMany".into(), "TooManyMethod".into()],
+    );
+    let mut rows =
+        crate::front::llbc_hints::minted_exception_class_rows(std::slice::from_ref(&hint));
+    let mut cc = crate::call::CallControl::new();
+    cc.set_struct_fields(registry);
+    cc.exception_class_hints = vec![hint];
+    crate::codewriter::assembler::attach_minted_exception_raw_owned_drops(&cc, &mut rows);
+
+    let word = crate::layout::target_word_size();
+    let row = |name: &str| {
+        rows.iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("{name} missing from {rows:?}"))
+    };
+    let base = row("Arg");
+    let parent = row("Arg::TooMany");
+    let child = row("Arg::TooManyMethod");
+    assert!(base.raw_owned.is_empty(), "{:?}", base.raw_owned);
+    assert_eq!(parent.raw_owned.len(), 1);
+    assert_eq!(child.raw_owned.len(), 1);
+    assert_eq!(parent.raw_owned[0].offset, word);
+    assert_eq!(child.raw_owned[0].offset, word);
+    assert_eq!(parent.raw_owned[0].type_path, "fixture::Signature");
+    assert_eq!(child.raw_owned[0].type_path, "fixture::Signature");
+
+    let src = crate::front::llbc_hints::render_minted_exception_classes_rs(&rows);
+    assert_eq!(
+        src.matches("drop_raw_owned_attr::<fixture::Signature>")
+            .count(),
+        2,
+        "{src}"
+    );
+    assert!(src.contains(&format!(
+        "drop_raw_owned_attr::<fixture::Signature>(obj_addr, {word})"
+    )));
+    assert!(src.contains("unsafe fn MINTED_EXC_Arg__TooMany_destructor"));
+    assert!(src.contains("unsafe fn MINTED_EXC_Arg__TooManyMethod_destructor"));
+    assert!(src.contains("destructor: Some(MINTED_EXC_Arg__TooMany_destructor)"));
+    assert!(src.contains("destructor: Some(MINTED_EXC_Arg__TooManyMethod_destructor)"));
+    assert!(src.contains(
+        "MintedExceptionClass { name: \"Arg\", pytype: &MINTED_EXC_Arg, parent: None, destructor: None }"
+    ));
+    assert!(
+        !src.contains("fn MINTED_EXC_Arg_destructor"),
+        "the base owns no raw attr; src={src}"
     );
 }

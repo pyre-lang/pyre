@@ -171,6 +171,18 @@ impl SemanticFunction {
     }
 }
 
+/// Moved by-value raw-flavor struct stored as one `*mut T` word.
+///
+/// `type_path` is the TypeDecl `name_path` the class destructor names.
+/// `size` and `align` are that decl's layout, the bytes the store copies
+/// into the raw box.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawOwnedField {
+    pub type_path: String,
+    pub size: u64,
+    pub align: u64,
+}
+
 /// One harvested struct-field registry row: the published name, the field
 /// type string, and whether Charon `FieldDecl::name` was `None`.
 ///
@@ -179,6 +191,9 @@ impl SemanticFunction {
 /// a declared field called `__pos_0` stays `is_positional == false`.
 /// `is_atomic` is the wrapper identity `tyref_atomic_arg` sees before
 /// harvest spells the field as its inner scalar.
+/// `raw_owned` is set only when a marked exception class boxes a by-value
+/// raw-flavor struct into the `*mut T` word this row publishes. A field
+/// declared as that pointer stays `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FieldRow {
     pub name: String,
@@ -187,6 +202,8 @@ pub struct FieldRow {
     pub is_positional: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_atomic: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_owned: Option<RawOwnedField>,
 }
 
 impl FieldRow {
@@ -196,6 +213,7 @@ impl FieldRow {
             ty: ty.into(),
             is_positional: false,
             is_atomic: false,
+            raw_owned: None,
         }
     }
 
@@ -205,11 +223,17 @@ impl FieldRow {
             ty: ty.into(),
             is_positional: true,
             is_atomic: false,
+            raw_owned: None,
         }
     }
 
     pub fn with_atomic(mut self, is_atomic: bool) -> Self {
         self.is_atomic = is_atomic;
+        self
+    }
+
+    pub fn with_raw_owned(mut self, raw: RawOwnedField) -> Self {
+        self.raw_owned = Some(raw);
         self
     }
 }
@@ -239,6 +263,8 @@ impl<'de> Deserialize<'de> for FieldRow {
                 is_positional: bool,
                 #[serde(default)]
                 is_atomic: bool,
+                #[serde(default)]
+                raw_owned: Option<RawOwnedField>,
             },
         }
         match De::deserialize(deserializer)? {
@@ -248,11 +274,13 @@ impl<'de> Deserialize<'de> for FieldRow {
                 ty,
                 is_positional,
                 is_atomic,
+                raw_owned,
             } => Ok(Self {
                 name,
                 ty,
                 is_positional,
                 is_atomic,
+                raw_owned,
             }),
         }
     }

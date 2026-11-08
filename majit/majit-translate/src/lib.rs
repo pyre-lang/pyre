@@ -3206,6 +3206,10 @@ fn analyze_pipeline_from_module_paths(
     // class without carrying the host arcs across serde.
     pipeline.minted_exception_classes =
         front::llbc_hints::minted_exception_class_rows(&call_control.exception_class_hints);
+    assembler::attach_minted_exception_raw_owned_drops(
+        &call_control,
+        &mut pipeline.minted_exception_classes,
+    );
 
     pipeline
 }
