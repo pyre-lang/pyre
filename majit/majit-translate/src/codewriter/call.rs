@@ -24,8 +24,8 @@ use crate::flowspace::argument::Signature;
 use crate::flowspace::model::ConstValue;
 use crate::jitcode::{BhCallDescr, CallResultErasedKey};
 use crate::model::{
-    CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FlagReturn, FunctionGraph, InstanceFlags,
-    LinkArg, OpKind, SpaceOperation, secondary_entry_roots,
+    CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FlagReturn, FunctionGraph,
+    IndirectFamilyKey, InstanceFlags, LinkArg, OpKind, SpaceOperation, secondary_entry_roots,
 };
 use crate::parse::{CallPath, GraphSpecialization};
 use crate::policy::JitPolicy;
@@ -2681,10 +2681,14 @@ impl FuncObjAttrs {
 #[derive(Clone)]
 enum StorePass {
     /// [`CallControl::materialize_deferred_indirect_families`].
-    MaterializeIndirectFamilies(std::rc::Rc<TraitMethodImpls>),
+    MaterializeIndirectFamilies {
+        trait_method_impls: std::rc::Rc<TraitMethodImpls>,
+        fnptr_field_impls: std::rc::Rc<FnPtrFieldImpls>,
+    },
     /// [`CallControl::lower_registered_indirect_calls`].
     LowerIndirectCalls {
         trait_method_impls: std::rc::Rc<TraitMethodImpls>,
+        fnptr_field_impls: std::rc::Rc<FnPtrFieldImpls>,
         builtin_wrappers: std::rc::Rc<[CallPath]>,
     },
     /// [`CallControl::replace_force_virtualizable_with_call`].
@@ -2698,6 +2702,15 @@ enum StorePass {
 /// root reconstructed through `for_impl_method`. An inherent of the same
 /// leaf occupies that two-segment spelling.
 type TraitMethodImpls = HashMap<(String, String), Vec<CallPath>>;
+
+/// `(struct_path, field_name) -> concrete callee paths` for harvested
+/// struct FnPtr fields (`discover_fnptr_field_families`).
+///
+/// Separate from [`TraitMethodImpls`]: `IndirectFamilyKey::DynTrait` and
+/// `IndirectFamilyKey::FnPtrField` are distinct family objects
+/// (`FunctionReprBase.call` / `description.py FunctionDesc` key families
+/// by the family object, never a flattened name pair shared across kinds).
+type FnPtrFieldImpls = HashMap<(String, String), Vec<CallPath>>;
 
 impl GraphSlot {
     fn built(graph: std::rc::Rc<FunctionGraph>) -> Self {
@@ -2982,16 +2995,21 @@ impl StoreCore {
 
     fn apply_pass(&self, pass: &StorePass, graph: &mut FunctionGraph) {
         match pass {
-            StorePass::MaterializeIndirectFamilies(trait_method_impls) => {
-                materialize_indirect_families(graph, trait_method_impls);
+            StorePass::MaterializeIndirectFamilies {
+                trait_method_impls,
+                fnptr_field_impls,
+            } => {
+                materialize_indirect_families(graph, trait_method_impls, fnptr_field_impls);
             }
             StorePass::LowerIndirectCalls {
                 trait_method_impls,
+                fnptr_field_impls,
                 builtin_wrappers,
             } => {
                 let families = StoreIndirectFamilies {
                     store: self,
                     trait_method_impls,
+                    fnptr_field_impls,
                     builtin_wrappers,
                 };
                 crate::translator::rtyper::rpbc::lower_indirect_calls_with(graph, &families, false);
@@ -3896,10 +3914,15 @@ impl std::ops::Deref for FuncRef<'_> {
 struct StoreIndirectFamilies<'a> {
     store: &'a StoreCore,
     trait_method_impls: &'a TraitMethodImpls,
+    fnptr_field_impls: &'a FnPtrFieldImpls,
     builtin_wrappers: &'a [CallPath],
 }
 
 impl crate::translator::rtyper::rpbc::IndirectCallFamilies for StoreIndirectFamilies<'_> {
+    fn all_impls_for_family(&self, key: &IndirectFamilyKey) -> Vec<CallPath> {
+        impls_for_family_key(self.trait_method_impls, self.fnptr_field_impls, key)
+    }
+
     fn all_impls_for_indirect(&self, trait_root: &str, method_name: &str) -> Vec<CallPath> {
         impls_for_indirect(self.trait_method_impls, trait_root, method_name)
     }
@@ -3908,17 +3931,11 @@ impl crate::translator::rtyper::rpbc::IndirectCallFamilies for StoreIndirectFami
         self.builtin_wrappers
     }
 
-    fn declared_result_type_for_indirect(
-        &self,
-        trait_root: &str,
-        method_name: &str,
-    ) -> Option<Type> {
-        declared_result_type(
-            trait_root,
-            method_name,
-            self.all_impls_for_indirect(trait_root, method_name),
-            |path| self.store.get(path),
-        )
+    fn declared_result_type_for_indirect(&self, key: &IndirectFamilyKey) -> Option<Type> {
+        let (owner, name) = family_key_labels(key);
+        declared_result_type(owner, name, self.all_impls_for_family(key), |path| {
+            self.store.get(path)
+        })
     }
 }
 
@@ -4399,7 +4416,16 @@ pub struct CallControl {
     /// `op.args[-1].value` = exact candidate graph list, not a
     /// method-name global).  Inherent impls do not populate this map;
     /// they use `function_graphs` directly via `[impl_type, method_name]`.
+    /// Harvested struct FnPtr fields live in [`Self::fnptr_field_impls`].
     trait_method_impls: HashMap<(String, String), Vec<CallPath>>,
+
+    /// Harvested struct FnPtr field families
+    /// (`discover_fnptr_field_families` / [`IndirectFamilyKey::FnPtrField`]).
+    ///
+    /// Own key space: a dyn-trait method and a struct field that share a
+    /// spelling cannot collide (`FunctionReprBase.call` /
+    /// `description.py FunctionDesc` key families by the family object).
+    fnptr_field_impls: HashMap<(String, String), Vec<CallPath>>,
 
     /// O(1) index over `trait_method_impls` keyed by method name alone:
     /// `method_name → [impl_type, …]` across every declaring trait.
@@ -5385,6 +5411,7 @@ impl CallControl {
             return_notify: HashMap::new(),
             external_funcobjs: HashMap::new(),
             trait_method_impls: HashMap::new(),
+            fnptr_field_impls: HashMap::new(),
             method_to_impl_types: HashMap::new(),
             candidate_graphs: HashSet::new(),
             bfs_policy_state: crate::policy::JitPolicyState::new(),
@@ -5589,6 +5616,14 @@ impl CallControl {
     /// The opt-in receiver-driven method-dispatch families.
     pub fn trait_family_registrations(&self) -> &[TraitFamilyRegistration] {
         &self.trait_family_registrations
+    }
+
+    /// Harvested struct FnPtr field families (`register_fnptr_field_family_path`).
+    ///
+    /// By type: this map holds only [`IndirectFamilyKey::FnPtrField`]
+    /// members. Dyn-trait families stay on [`Self::trait_method_impls`].
+    pub fn fnptr_field_family_impls(&self) -> &HashMap<(String, String), Vec<CallPath>> {
+        &self.fnptr_field_impls
     }
 
     /// RPython: isinstance(TYPE, lltype.Struct) check.
@@ -7353,18 +7388,15 @@ impl CallControl {
     fn fill_resolvable_empty_indirect_family(&mut self, path: &CallPath) {
         let CallControl {
             trait_method_impls,
+            fnptr_field_impls,
             function_graphs,
             ..
         } = self;
-        let fillable = |graphs: &Option<Vec<CallPath>>, family_key: &Option<(String, String)>| {
+        let fillable = |graphs: &Option<Vec<CallPath>>, family_key: &Option<IndirectFamilyKey>| {
             graphs.as_deref().is_some_and(<[_]>::is_empty)
-                && family_key
-                    .as_ref()
-                    .is_some_and(|(trait_root, method_name)| {
-                        trait_method_impls
-                            .get(&(trait_root.clone(), method_name.clone()))
-                            .is_some_and(|impls| !impls.is_empty())
-                    })
+                && family_key.as_ref().is_some_and(|key| {
+                    !impls_for_family_key(trait_method_impls, fnptr_field_impls, key).is_empty()
+                })
         };
         // Look before writing: the stored graph can be shared with its
         // other aliases and with the pending lift. A graph not built yet
@@ -7394,13 +7426,10 @@ impl CallControl {
                 if !graphs.as_deref().is_some_and(<[_]>::is_empty) {
                     continue;
                 }
-                let Some((trait_root, method_name)) = family_key.as_ref() else {
+                let Some(key) = family_key.as_ref() else {
                     continue;
                 };
-                let family = trait_method_impls
-                    .get(&(trait_root.clone(), method_name.clone()))
-                    .cloned()
-                    .unwrap_or_default();
+                let family = impls_for_family_key(trait_method_impls, fnptr_field_impls, key);
                 if !family.is_empty() {
                     *graphs = Some(family);
                 }
@@ -7418,9 +7447,11 @@ impl CallControl {
         let builtin_wrappers: std::rc::Rc<[CallPath]> =
             self.builtin_wrapper_indirect_graphs().into();
         let trait_method_impls = std::rc::Rc::new(self.trait_method_impls.clone());
+        let fnptr_field_impls = std::rc::Rc::new(self.fnptr_field_impls.clone());
         self.function_graphs
             .run_pass(StorePass::LowerIndirectCalls {
                 trait_method_impls,
+                fnptr_field_impls,
                 builtin_wrappers,
             });
     }
@@ -7783,6 +7814,28 @@ impl CallControl {
         let members = self
             .trait_method_impls
             .entry((trait_root.to_string(), method_name.to_string()))
+            .or_default();
+        if !members.iter().any(|member| member == &path) {
+            members.push(path);
+        }
+    }
+
+    /// Record one concrete callee in the PBC row for a harvested struct
+    /// FnPtr field (`IndirectFamilyKey::FnPtrField`).
+    ///
+    /// `path` is the function object's registry key
+    /// (`FunctionReprBase.call` / `description.py FunctionDesc`). Dyn-trait
+    /// families use [`Self::register_trait_family_path`]; the two stores
+    /// do not share a flattened name pair.
+    pub fn register_fnptr_field_family_path(
+        &mut self,
+        struct_path: &str,
+        field_name: &str,
+        path: CallPath,
+    ) {
+        let members = self
+            .fnptr_field_impls
+            .entry((struct_path.to_string(), field_name.to_string()))
             .or_default();
         if !members.iter().any(|member| member == &path) {
             members.push(path);
@@ -8460,8 +8513,12 @@ impl CallControl {
     /// first and would read `graphs: None` as an unknown family/top result.
     fn materialize_deferred_indirect_families(&mut self) {
         let trait_method_impls = std::rc::Rc::new(self.trait_method_impls.clone());
+        let fnptr_field_impls = std::rc::Rc::new(self.fnptr_field_impls.clone());
         self.function_graphs
-            .run_pass(StorePass::MaterializeIndirectFamilies(trait_method_impls));
+            .run_pass(StorePass::MaterializeIndirectFamilies {
+                trait_method_impls,
+                fnptr_field_impls,
+            });
     }
 
     /// Variable ids whose annotation carries `access_directly`.
@@ -10223,22 +10280,22 @@ impl CallControl {
 
     /// The shared low-level result type of an indirect-call family.
     ///
-    /// RPython's `FunctionReprBase.call` gets this from the selected
-    /// call-family row's `FuncType.RESULT`.  Charon may leave a dependency's
+    /// RPython's `FunctionReprBase.call` / `call.py getcalldescr` take
+    /// `FUNC.RESULT` of the called family.  A dyn-trait method and a
+    /// harvested FnPtr field are distinct family objects
+    /// ([`IndirectFamilyKey`]); both resolve through
+    /// [`Self::all_impls_for_family`].  Charon may leave a dependency's
     /// transparent newtype opaque in the caller artefact, so the front-end
     /// destination alone can only say `Ref`; the locally defined family
     /// member still carries the authoritative translated result type.
     pub(crate) fn declared_result_type_for_indirect(
         &self,
-        trait_root: &str,
-        method_name: &str,
+        key: &IndirectFamilyKey,
     ) -> Option<Type> {
-        declared_result_type(
-            trait_root,
-            method_name,
-            self.all_impls_for_indirect(trait_root, method_name),
-            |path| self.function_graphs.get(path),
-        )
+        let (owner, name) = family_key_labels(key);
+        declared_result_type(owner, name, self.all_impls_for_family(key), |path| {
+            self.function_graphs.get(path)
+        })
     }
 
     /// `FUNC.RESULT` of an indirect-call family attached as `c_graphs`.
@@ -10271,6 +10328,43 @@ fn impls_for_indirect(
         .unwrap_or_default()
 }
 
+/// Lookup one family by [`IndirectFamilyKey`]. Dyn-trait and FnPtr-field
+/// keys never share a map (`FunctionReprBase.call` / `FunctionDesc`).
+fn impls_for_family_key(
+    trait_method_impls: &TraitMethodImpls,
+    fnptr_field_impls: &FnPtrFieldImpls,
+    key: &IndirectFamilyKey,
+) -> Vec<CallPath> {
+    match key {
+        IndirectFamilyKey::DynTrait {
+            trait_root,
+            method_name,
+        } => impls_for_indirect(trait_method_impls, trait_root, method_name),
+        IndirectFamilyKey::FnPtrField {
+            struct_path,
+            field_name,
+        } => fnptr_field_impls
+            .get(&(struct_path.clone(), field_name.clone()))
+            .cloned()
+            .unwrap_or_default(),
+    }
+}
+
+/// Label pair `declared_result_type` prints for a family (`owner::name`).
+/// Dyn-trait: `(trait_root, method_name)`; FnPtr-field: `(struct_path, field_name)`.
+fn family_key_labels(key: &IndirectFamilyKey) -> (&str, &str) {
+    match key {
+        IndirectFamilyKey::DynTrait {
+            trait_root,
+            method_name,
+        } => (trait_root, method_name),
+        IndirectFamilyKey::FnPtrField {
+            struct_path,
+            field_name,
+        } => (struct_path, field_name),
+    }
+}
+
 /// The result type every registered member of an indirect-call family
 /// declares.
 fn declared_result_type(
@@ -10298,7 +10392,11 @@ fn declared_result_type(
 }
 
 /// [`CallControl::materialize_deferred_indirect_families`] on one graph.
-fn materialize_indirect_families(graph: &mut FunctionGraph, trait_method_impls: &TraitMethodImpls) {
+fn materialize_indirect_families(
+    graph: &mut FunctionGraph,
+    trait_method_impls: &TraitMethodImpls,
+    fnptr_field_impls: &FnPtrFieldImpls,
+) {
     for op in graph
         .blocks
         .iter_mut()
@@ -10311,21 +10409,18 @@ fn materialize_indirect_families(graph: &mut FunctionGraph, trait_method_impls: 
             continue;
         };
         // Read the key without clearing it. The two-phase prepass runs
-        // after this fill on the same shared store, and its flowspace
-        // adapter needs the same `(trait_root, method_name)` to emit
-        // the pre-rtyper `getattr` + `simple_call` shape — an
-        // `indirect_call` op does not exist before rtyping. The later
+        // after this fill on the same shared store. A DynTrait key still
+        // needs `(trait_root, method_name)` so the adapter can emit the
+        // pre-rtyper `getattr` + `simple_call` shape; a FnPtrField key
+        // stays so `rpbc::lower_indirect_calls` can fill `c_graphs`.
+        // `indirect_call` does not exist before rtyping. The later
         // `rpbc::lower_indirect_calls` re-enters its own `take()` arm
-        // and recomputes `graphs` through `all_impls_for_indirect`,
-        // which is this same lookup over the same map, so the value it
-        // writes is unchanged.
-        let Some((trait_root, method_name)) = family_key.clone() else {
+        // and recomputes `graphs` through `all_impls_for_family`,
+        // which is this same lookup, so the value it writes is unchanged.
+        let Some(key) = family_key.as_ref() else {
             continue;
         };
-        let family = trait_method_impls
-            .get(&(trait_root.clone(), method_name.clone()))
-            .cloned()
-            .unwrap_or_default();
+        let family = impls_for_family_key(trait_method_impls, fnptr_field_impls, key);
         *graphs = (!family.is_empty()).then_some(family);
     }
 }
@@ -11431,6 +11526,16 @@ impl CallControl {
     /// even among residual members (`call.py:259-280`).
     pub fn all_impls_for_indirect(&self, trait_root: &str, method_name: &str) -> Vec<CallPath> {
         impls_for_indirect(&self.trait_method_impls, trait_root, method_name)
+    }
+
+    /// Candidate graphs of one indirect-call family, keyed by
+    /// [`IndirectFamilyKey`] (discriminant included).
+    ///
+    /// `FunctionReprBase.call` / `description.py FunctionDesc` look up
+    /// the family object itself; a dyn-trait method and a struct FnPtr
+    /// field that share a spelling stay distinct.
+    pub fn all_impls_for_family(&self, key: &IndirectFamilyKey) -> Vec<CallPath> {
+        impls_for_family_key(&self.trait_method_impls, &self.fnptr_field_impls, key)
     }
 
     /// Candidate PBC family for the generated `BuiltinCode.func`
@@ -28970,7 +29075,7 @@ mod tests {
                     funcptr,
                     args: Vec::new(),
                     graphs: None,
-                    family_key: Some(("Handler".to_string(), "run".to_string())),
+                    family_key: Some(IndirectFamilyKey::dyn_trait("Handler", "run")),
                     result_ty: ValueType::Void,
                 },
             });
@@ -28990,8 +29095,8 @@ mod tests {
             panic!("caller operation must remain an indirect call");
         };
         assert_eq!(
-            family_key.as_ref().map(|(t, m)| (t.as_str(), m.as_str())),
-            Some(("Handler", "run")),
+            family_key.as_ref(),
+            Some(&IndirectFamilyKey::dyn_trait("Handler", "run")),
             "the vtable-slot identity must outlive graph discovery"
         );
         assert_eq!(
@@ -29036,7 +29141,7 @@ mod tests {
                     funcptr,
                     args: Vec::new(),
                     graphs: None,
-                    family_key: Some(("Handler".to_string(), "run".to_string())),
+                    family_key: Some(IndirectFamilyKey::dyn_trait("Handler", "run")),
                     result_ty: ValueType::Void,
                 },
             });
@@ -29583,7 +29688,7 @@ mod tests {
                     funcptr,
                     args: Vec::new(),
                     graphs: Some(Vec::new()),
-                    family_key: Some(("Handler".to_string(), "run".to_string())),
+                    family_key: Some(IndirectFamilyKey::dyn_trait("Handler", "run")),
                     result_ty: ValueType::Void,
                 },
             });
@@ -31527,7 +31632,7 @@ mod tests {
                 funcptr: crate::flowspace::model::Variable::named("fnptr"),
                 args: Vec::new(),
                 graphs: None,
-                family_key: Some(("Trait".to_string(), "m".to_string())),
+                family_key: Some(IndirectFamilyKey::dyn_trait("Trait", "m")),
                 result_ty: ValueType::Void,
             },
             false,

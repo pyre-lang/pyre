@@ -7284,7 +7284,10 @@ fn dyn_trait_field_vtable_slot_reads_the_metadata_word() {
         1,
         "one dyn method IndirectCall: {indirect:?}"
     );
-    assert_eq!(indirect[0].1, ("Storage".to_string(), "head".to_string()));
+    assert_eq!(
+        indirect[0].1,
+        crate::model::IndirectFamilyKey::dyn_trait("Storage", "head")
+    );
 
     let producer = |var: &crate::flowspace::model::Variable| {
         graph
@@ -25718,7 +25721,7 @@ fn dict_strategy_vtable_call_keeps_its_family_identity() {
         );
         assert_eq!(
             calls[0].1,
-            ("DictStrategy".to_string(), method.to_string()),
+            crate::model::IndirectFamilyKey::dyn_trait("DictStrategy", method),
             "{function}'s MIR vtable slot must name the same PBC family as the trait impls"
         );
         let funcptr = &calls[0].0;
@@ -25760,10 +25763,14 @@ fn dict_strategy_vtable_call_keeps_its_family_identity() {
                 OpKind::IndirectCall {
                     funcptr,
                     args,
-                    family_key: Some(family_key),
+                    family_key:
+                        Some(crate::model::IndirectFamilyKey::DynTrait {
+                            trait_root,
+                            method_name,
+                        }),
                     ..
-                } if family_key.0 == "DictStrategy" => {
-                    Some((funcptr.clone(), args.clone(), family_key.1.clone()))
+                } if trait_root == "DictStrategy" => {
+                    Some((funcptr.clone(), args.clone(), method_name.clone()))
                 }
                 _ => None,
             })

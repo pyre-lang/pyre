@@ -50,6 +50,7 @@ use crate::flowspace::argument::CallShape;
 use crate::flowspace::argument::Signature;
 use crate::flowspace::bytecode::cpython_code_signature;
 use crate::flowspace::model::{BlockRef, ConstValue, Constant, GraphKey, GraphRef, HostObject};
+use crate::model::IndirectFamilyKey;
 use crate::tool::algo::unionfind::UnionFind;
 
 /// Key of `Bookkeeper.immutable_cache` (`bookkeeper.py`).
@@ -580,6 +581,19 @@ pub struct Bookkeeper {
     /// Type spellings of that slot (`ProfileFunc`, `Option<ProfileFunc>`,
     /// expanded `fn(...)` after alias peel).
     profilefunc_spellings: RefCell<Vec<String>>,
+    /// Harvested FnPtr-field families (`IndirectFamilyKey::FnPtrField`).
+    ///
+    /// The family object is the key (`FunctionReprBase.call` /
+    /// `description.py FunctionDesc`). Intern of a family field does not
+    /// project `SomePtr(FuncType)` (`project_struct_rows`); the attribute
+    /// starts as `s_ImpossibleValue` (`classdesc.py Attribute.__init__`).
+    fnptr_family_fields: RefCell<HashSet<IndirectFamilyKey>>,
+    /// Function objects that are members of a harvested FnPtr-field
+    /// family (`CallControl.fnptr_field_family_impls`). The set is the
+    /// `Bookkeeper.getdesc` domain (`bookkeeper.py`), not a field-keyed
+    /// table: `immutablevalue` of a FunDecl constant of a member is
+    /// `SomePBC([self.getdesc(x)])`.
+    fnptr_family_functions: RefCell<HashSet<HostObject>>,
 }
 
 /// One `_exception_class_<Enum>` hierarchy after mint.
@@ -1951,6 +1965,8 @@ impl Bookkeeper {
             profilefunc_family: RefCell::new(Vec::new()),
             profilefunc_paths: RefCell::new(Vec::new()),
             profilefunc_spellings: RefCell::new(Vec::new()),
+            fnptr_family_fields: RefCell::new(HashSet::new()),
+            fnptr_family_functions: RefCell::new(HashSet::new()),
         }
     }
 
@@ -4905,7 +4921,22 @@ impl Bookkeeper {
                     self.transparent_scalar_annotation(&row.ty).is_some()
                         && matches!(&attr.s_value, SomeValue::Instance(_))
                         && matches!(s_value, SomeValue::Integer(_));
-                if matches!(attr.s_value, SomeValue::Impossible)
+                // A harvested FnPtr-field family does not intern a field
+                // type (`project_struct_field_type`). The attribute starts
+                // as `s_ImpossibleValue` (`classdesc.py Attribute.__init__`);
+                // `ClassDef.add_source_for_attribute` unions sources onto it.
+                // Drop only the FORCE Int-bank / untyped `SomePtr(FuncType)`
+                // shell of a `fn` spelling — not a real annotation.
+                if self.is_fnptr_family_field(n, &row.name) {
+                    let is_int_force_shell =
+                        crate::codewriter::annotation_state::valuetype_to_someshell(
+                            &crate::model::ValueType::Int,
+                        )
+                        .is_some_and(|shell| shell == attr.s_value);
+                    if is_int_force_shell || is_fnptr_type_intern(&attr.s_value) {
+                        attr.s_value = SomeValue::Impossible;
+                    }
+                } else if matches!(attr.s_value, SomeValue::Impossible)
                     || (is_untyped_force_shell && !matches!(s_value, SomeValue::Impossible))
                     || is_ptr_integer_force_shell
                     || is_profilefunc_force_shell
@@ -5368,6 +5399,103 @@ impl Bookkeeper {
         self.stamp_immutable_fields(&host, &key);
         self.insert_struct_root_class(key, host.clone());
         host
+    }
+
+    /// Record a harvested FnPtr-field family (`IndirectFamilyKey::FnPtrField`)
+    /// and the member function objects (`Bookkeeper.getdesc` domain).
+    ///
+    /// Intern of this field does not project a field type
+    /// (`project_struct_rows`). A FunDecl constant of a member annotates
+    /// as `SomePBC([getdesc(func)])` (`bookkeeper.py immutablevalue`).
+    pub(crate) fn register_fnptr_family_field(
+        &self,
+        struct_path: &str,
+        field: &str,
+        hosts: Vec<HostObject>,
+    ) {
+        let mut spellings = vec![struct_path.to_string()];
+        let intern = self.intern_class_key(struct_path);
+        if intern != struct_path {
+            spellings.push(intern);
+        }
+        let dotted = struct_path.replace("::", ".");
+        if dotted != struct_path {
+            let intern_dotted = self.intern_class_key(&dotted);
+            if !spellings.contains(&intern_dotted) {
+                spellings.push(intern_dotted);
+            }
+        }
+        let mut fields = self.fnptr_family_fields.borrow_mut();
+        for spelling in spellings {
+            fields.insert(IndirectFamilyKey::fnptr_field(spelling, field));
+        }
+        let mut functions = self.fnptr_family_functions.borrow_mut();
+        for host in hosts {
+            functions.insert(host);
+        }
+    }
+
+    /// Whether `(owner, field)` is a harvested FnPtr-field family slot.
+    pub(crate) fn is_fnptr_family_field(&self, owner: &str, field: &str) -> bool {
+        let key = IndirectFamilyKey::fnptr_field(owner, field);
+        if self.fnptr_family_fields.borrow().contains(&key) {
+            return true;
+        }
+        let intern = self.intern_class_key(owner);
+        intern != owner
+            && self
+                .fnptr_family_fields
+                .borrow()
+                .contains(&IndirectFamilyKey::fnptr_field(intern, field))
+    }
+
+    /// `Bookkeeper.getdesc` of a FunDecl constant that is a harvested
+    /// family member (`bookkeeper.py immutablevalue` callable arm).
+    fn fnptr_family_member_host(
+        &self,
+        llptr: &crate::translator::rtyper::lltypesystem::lltype::_ptr,
+    ) -> Option<HostObject> {
+        use crate::translator::rtyper::lltypesystem::lltype::{_ptr_obj, PtrObj};
+        let PtrObj::Strong(_ptr_obj::Func(func)) = &llptr._obj0 else {
+            return None;
+        };
+        let members = self.fnptr_family_functions.borrow();
+        if members.is_empty() {
+            return None;
+        }
+        if let Some(gid) = func.graph {
+            let mut graph_hits = Vec::new();
+            for host in members.iter() {
+                if let Some(entry) = self.descs.borrow().get(host)
+                    && function_desc_has_graph_id(entry, gid)
+                {
+                    graph_hits.push(host.clone());
+                }
+            }
+            if graph_hits.len() == 1 {
+                return Some(graph_hits[0].clone());
+            }
+        }
+        let name = func._name.as_str();
+        let last = name.rsplit("::").next().unwrap_or(name);
+        let mut exact = Vec::new();
+        let mut last_hits = Vec::new();
+        for host in members.iter() {
+            let q = host.qualname();
+            if q == name || name.strip_suffix(q).is_some_and(|p| p.ends_with("::")) {
+                exact.push(host.clone());
+            }
+            if q == last {
+                last_hits.push(host.clone());
+            }
+        }
+        if exact.len() == 1 {
+            return Some(exact[0].clone());
+        }
+        if last_hits.len() == 1 {
+            return Some(last_hits[0].clone());
+        }
+        None
     }
 
     /// Intern the harvested class object under its declaration key.
@@ -6231,31 +6359,13 @@ impl Bookkeeper {
         if let Some(inner) = crate::fat_ptr_layout::wrapper_inner(stripped, &["AtomicPtr"]) {
             return self.project_struct_field_type(&format!("*mut {inner}"));
         }
-        // `cell::UnsafeCell<T>` is the cell word (`lltype.py` `getfield`).
-        // `field_row_struct_identity` qualifies the leaf, so the
-        // prefix-only `UnsafeCell<` peel below would miss and mint
-        // `SomeInstance(cell::UnsafeCell)`.
-        if let Some(inner) = strip_generic_leaf(stripped, "UnsafeCell") {
+        // `Cell<T>` / `UnsafeCell<T>` are the slot, not a nested class
+        // (`nestedscope.py CellFamily.ever_mutated`). Charon spells the
+        // wrapper as `cell::UnsafeCell<RBigInt>`; a prefix-only peel
+        // intern's that name as ClassDef and setattr of the cell word
+        // unions `RBigInt ∪ UnsafeCell`.
+        if let Some(inner) = peel_transparent_slot_wrapper(stripped) {
             return self.project_struct_field_type(inner);
-        }
-        for wrapper in [
-            "Rc<",
-            "Arc<",
-            "Box<",
-            "RefCell<",
-            "Cell<",
-            "Pin<",
-            "NonNull<",
-            "NonZero<",
-            "MaybeUninit<",
-            "ManuallyDrop<",
-            "UnsafeCell<",
-            "Wrapping<",
-            "Reverse<",
-        ] {
-            if let Some(inner) = strip_generic_one(stripped, wrapper) {
-                return self.project_struct_field_type(inner);
-            }
         }
         if let Some(inner) = strip_generic_one(stripped, "Cow<") {
             let parts = split_generic_args(inner);
@@ -7202,7 +7312,18 @@ impl Bookkeeper {
                 let entry = self.getdesc_for_const(x)?;
                 Ok(SomeValue::PBC(SomePBC::new(vec![entry], false)))
             }
-            ConstValue::LLPtr(_) => {
+            ConstValue::LLPtr(llptr) => {
+                // bookkeeper.py `immutablevalue`: `callable(x)` →
+                // `SomePBC([self.getdesc(x)])`. A FunDecl constant of a
+                // harvested family member is that function object
+                // (`CallControl.fnptr_field_family_impls`).
+                if let Some(host) = self.fnptr_family_member_host(llptr)
+                    && let Ok(desc) = self.getdesc(&host)
+                {
+                    let mut pbc = SomePBC::new(vec![desc], false);
+                    pbc.base.const_box = Some(Constant::new(x.clone()));
+                    return Ok(SomeValue::PBC(pbc));
+                }
                 assert!(crate::translator::rtyper::extregistry::is_registered(x));
                 let entry = crate::translator::rtyper::extregistry::lookup(x).expect(
                     "Bookkeeper.immutablevalue(LLPtr): extregistry.lookup must succeed after \
@@ -8309,26 +8430,11 @@ fn collect_referenced_struct_names(
         }
         return;
     }
-    for wrapper in [
-        "Vec<",
-        "VecDeque<",
-        "Rc<",
-        "Arc<",
-        "Box<",
-        "RefCell<",
-        "Cell<",
-        "Pin<",
-        "NonNull<",
-        "NonZero<",
-        "MaybeUninit<",
-        "ManuallyDrop<",
-        "UnsafeCell<",
-        "Wrapping<",
-        "Reverse<",
-        "HashSet<",
-        "BTreeSet<",
-        "IndexSet<",
-    ] {
+    if let Some(inner) = peel_transparent_slot_wrapper(stripped) {
+        collect_referenced_struct_names(inner, reg, out);
+        return;
+    }
+    for wrapper in ["Vec<", "VecDeque<", "HashSet<", "BTreeSet<", "IndexSet<"] {
         if let Some(inner) = strip_generic_one(stripped, wrapper) {
             collect_referenced_struct_names(inner, reg, out);
             return;
@@ -8472,6 +8578,32 @@ pub(crate) fn exception_carrier_type_spelling_keys(
 #[cfg(test)]
 pub(crate) fn fn_ptr_somevalue_for_spelling(spelling: &str) -> Option<SomeValue> {
     fn_ptr_somevalue_for_spelling_in(spelling, getbookkeeper().as_deref())
+}
+
+/// `SomePtr(FuncType)` with no constant — FORCE / field-type intern,
+/// not a FunDecl store (`const_box` is the LLPtr).
+fn is_fnptr_type_intern(s: &SomeValue) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+    matches!(
+        s,
+        SomeValue::Ptr(ptr)
+            if matches!(ptr.ll_ptrtype.TO, PtrTarget::Func(_))
+                && ptr.base.const_box.is_none()
+    )
+}
+
+fn function_desc_has_graph_id(entry: &DescEntry, gid: usize) -> bool {
+    let Some(fd) = entry.as_function() else {
+        return false;
+    };
+    let fd = fd.borrow();
+    let mut graphs = fd.getgraphs();
+    if let Some(g) = fd.built_source_template() {
+        graphs.push(g);
+    }
+    graphs
+        .iter()
+        .any(|g| GraphKey::of(&g.graph).as_usize() == gid)
 }
 
 pub(crate) fn fn_ptr_somevalue_for_spelling_in(
@@ -8812,6 +8944,31 @@ fn adt_generic_args<'a>(spelling: &'a str, leaf: &str) -> Option<Vec<&'a str>> {
 fn is_thin_arrow_gt(bytes: &[u8], i: usize) -> bool {
     bytes.get(i) == Some(&b'>') && i > 0 && bytes[i - 1] == b'-'
 }
+
+/// Inner of a one-arg transparent slot wrapper, including a qualified
+/// path (`cell::UnsafeCell<RBigInt>`). The wrapper is the slot, not a
+/// ClassDef (`nestedscope.py CellFamily.ever_mutated`).
+fn peel_transparent_slot_wrapper(field_ty: &str) -> Option<&str> {
+    crate::fat_ptr_layout::wrapper_inner(
+        field_ty,
+        &[
+            "Rc",
+            "Arc",
+            "Box",
+            "RefCell",
+            "Cell",
+            "Pin",
+            "NonNull",
+            "NonZero",
+            "MaybeUninit",
+            "ManuallyDrop",
+            "UnsafeCell",
+            "Wrapping",
+            "Reverse",
+        ],
+    )
+}
+
 
 /// The field-registry encoding of a Charon `RawPtr` node. A marker ADT
 /// wrapping a pointer is a different constructor and does not match.
@@ -9522,6 +9679,39 @@ mod tests {
                 SomeValue::Integer(_)
             ),
             "qualified AtomicPtr<f64> is *mut f64"
+        );
+    }
+
+    #[test]
+    fn project_struct_field_type_peels_qualified_cell_wrappers() {
+        let bk = bk();
+        assert!(
+            matches!(
+                bk.project_struct_field_type("Cell<bool>"),
+                SomeValue::Bool(_)
+            ),
+            "Cell<bool> is the bool slot"
+        );
+        assert!(
+            matches!(
+                bk.project_struct_field_type("cell::Cell<bool>"),
+                SomeValue::Bool(_)
+            ),
+            "cell::Cell<bool> is the bool slot"
+        );
+        assert!(
+            matches!(
+                bk.project_struct_field_type("core::cell::UnsafeCell<i64>"),
+                SomeValue::Integer(_)
+            ),
+            "qualified UnsafeCell<i64> is the integer word"
+        );
+        assert!(
+            matches!(
+                bk.project_struct_field_type("UnsafeCell<i64>"),
+                SomeValue::Integer(_)
+            ),
+            "UnsafeCell<i64> is the integer word"
         );
     }
 
@@ -10320,6 +10510,90 @@ mod tests {
             names.iter().any(|n| n == "charon_corpus::ClassObject"),
             "crate-root qualified key is kept, got {names:?}"
         );
+    }
+
+    /// Harvest `class_identity` of one declaration: the crate-stripped
+    /// `mapdict::AbstractAttribute`, its crate-prefix spelling, and the
+    /// bare leaf intern as one ClassDef. `MapRef` = `*const
+    /// AbstractAttribute`; `pbc_call` of the harvested `get_map` family
+    /// unions those returns (`Bookkeeper.getdesc`).
+    #[test]
+    fn intern_class_unifies_abstract_attribute_spellings_via_class_identity() {
+        use crate::front::StructFieldRegistry;
+
+        let identity = "mapdict::AbstractAttribute";
+        let aliases = [
+            "AbstractAttribute",
+            "mapdict::AbstractAttribute",
+            "pyre_object::mapdict::AbstractAttribute",
+        ];
+        let rows = vec![("terminator".to_string(), "usize".to_string())];
+        for order in [
+            [aliases[0], aliases[1], aliases[2]],
+            [aliases[1], aliases[2], aliases[0]],
+            [aliases[2], aliases[0], aliases[1]],
+        ] {
+            let bk = bk();
+            let mut reg = StructFieldRegistry::default();
+            for alias in aliases {
+                reg.fields.insert(alias.to_string(), rows.clone());
+            }
+            harvest_class_identity(&mut reg, identity, &aliases);
+            bk.set_struct_fields(Rc::new(reg));
+
+            let first = bk.intern_class_by_qualname(order[0]);
+            let second = bk.intern_class_by_qualname(order[1]);
+            let third = bk.intern_class_by_qualname(order[2]);
+            assert_eq!(first, second, "one host, intern order {:?}", order);
+            assert_eq!(second, third, "one host, intern order {:?}", order);
+            for alias in aliases {
+                assert_eq!(
+                    bk.intern_class_key(alias),
+                    identity,
+                    "{alias} intern key is the declaration spelling"
+                );
+            }
+            let first_cd = bk.getuniqueclassdef(&first).expect("first classdef");
+            let second_cd = bk.getuniqueclassdef(&second).expect("second classdef");
+            let third_cd = bk.getuniqueclassdef(&third).expect("third classdef");
+            assert!(
+                Rc::ptr_eq(&first_cd, &second_cd) && Rc::ptr_eq(&second_cd, &third_cd),
+                "pbc_call union of MapRef returns needs one AbstractAttribute ClassDef, order {:?}",
+                order
+            );
+        }
+    }
+
+    /// Nested `module::struct::Code::Int` is a distinct declaration from
+    /// bare `Int`. Harvest writes two identities; intern must not merge them.
+    #[test]
+    fn intern_class_keeps_nested_code_int_apart_from_bare_int() {
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let rows = vec![("n".to_string(), "i64".to_string())];
+        reg.fields.insert("Int".to_string(), rows.clone());
+        reg.fields
+            .insert("module::struct::Code::Int".to_string(), rows);
+        harvest_class_identity(&mut reg, "Int", &["Int"]);
+        harvest_class_identity(
+            &mut reg,
+            "module::struct::Code::Int",
+            &["module::struct::Code::Int"],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let bare = bk.intern_class_by_qualname("Int");
+        let nested = bk.intern_class_by_qualname("module::struct::Code::Int");
+        assert_ne!(bare, nested, "Code::Int must not steal Int");
+        assert_eq!(bk.intern_class_key("Int"), "Int");
+        assert_eq!(
+            bk.intern_class_key("module::struct::Code::Int"),
+            "module::struct::Code::Int"
+        );
+        let bare_cd = bk.getuniqueclassdef(&bare).expect("Int classdef");
+        let nested_cd = bk.getuniqueclassdef(&nested).expect("Code::Int classdef");
+        assert!(!Rc::ptr_eq(&bare_cd, &nested_cd));
     }
 
     #[test]

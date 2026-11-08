@@ -125,7 +125,9 @@ pub use jtransform::{
     VirtualizableFieldDescriptor, transform_graph,
 };
 pub use layout::{HeuristicLayoutProvider, LayoutProvider};
-pub use model::{Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType};
+pub use model::{
+    Block, BlockId, CallTarget, FunctionGraph, IndirectFamilyKey, OpKind, SpaceOperation, ValueType,
+};
 pub use parse::{CallPath, GraphSpecialization};
 pub use pipeline::{
     CompiledJitDriver, JitDriverSpec, PipelineConfig, PipelineResult, ProgramPipelineResult,
@@ -2342,9 +2344,9 @@ fn analyze_pipeline_from_module_paths(
     }
     prof.mark("  register concrete indirect-call families");
     for (struct_path, field, path) in &program.fnptr_field_families {
-        call_control.register_trait_family_path(
-            field,
+        call_control.register_fnptr_field_family_path(
             struct_path,
+            field,
             crate::parse::CallPath::from_segments(path.split("::")),
         );
     }

@@ -77,7 +77,8 @@ use majit_translate::{
         lower_function_with_static_addrs,
     },
     model::{
-        CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType, cast_instance_root,
+        CallTarget, FunctionGraph, IndirectFamilyKey, LinkArg, OpKind, SpaceOperation, ValueType,
+        cast_instance_root,
     },
     translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget},
 };
@@ -261,9 +262,9 @@ fn graph_has_fnptr_slot_dispatch(graph: &FunctionGraph, field: &str) -> bool {
         matches!(
             &op.kind,
             OpKind::IndirectCall {
-                family_key: Some((_, name)),
+                family_key: Some(IndirectFamilyKey::FnPtrField { field_name, .. }),
                 ..
-            } if name == field
+            } if field_name == field
         )
     })
 }

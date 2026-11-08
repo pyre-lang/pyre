@@ -336,19 +336,23 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
 }
 
 /// What [`lower_indirect_calls_with`] reads to fill an indirect call's
-/// `c_graphs` row: the call family of each `(trait_root, method_name)`, the
+/// `c_graphs` row: the call family of each [`IndirectFamilyKey`], the
 /// builtin-wrapper family, and the result type the family declares.
 pub(crate) trait IndirectCallFamilies {
+    fn all_impls_for_family(&self, key: &crate::model::IndirectFamilyKey) -> Vec<CallPath>;
     fn all_impls_for_indirect(&self, trait_root: &str, method_name: &str) -> Vec<CallPath>;
     fn builtin_wrapper_indirect_graphs(&self) -> &[CallPath];
     fn declared_result_type_for_indirect(
         &self,
-        trait_root: &str,
-        method_name: &str,
+        key: &crate::model::IndirectFamilyKey,
     ) -> Option<majit_ir::value::Type>;
 }
 
 impl IndirectCallFamilies for CallControl {
+    fn all_impls_for_family(&self, key: &crate::model::IndirectFamilyKey) -> Vec<CallPath> {
+        CallControl::all_impls_for_family(self, key)
+    }
+
     fn all_impls_for_indirect(&self, trait_root: &str, method_name: &str) -> Vec<CallPath> {
         CallControl::all_impls_for_indirect(self, trait_root, method_name)
     }
@@ -359,10 +363,9 @@ impl IndirectCallFamilies for CallControl {
 
     fn declared_result_type_for_indirect(
         &self,
-        trait_root: &str,
-        method_name: &str,
+        key: &crate::model::IndirectFamilyKey,
     ) -> Option<majit_ir::value::Type> {
-        CallControl::declared_result_type_for_indirect(self, trait_root, method_name)
+        CallControl::declared_result_type_for_indirect(self, key)
     }
 }
 
@@ -387,8 +390,8 @@ pub(crate) fn lower_indirect_calls_with(
                 graphs, family_key, ..
             } = &mut op.kind
             {
-                if let Some((trait_root, method_name)) = family_key.clone() {
-                    let family = call_control.all_impls_for_indirect(&trait_root, &method_name);
+                if let Some(key) = family_key.clone() {
+                    let family = call_control.all_impls_for_family(&key);
                     if !family.is_empty() {
                         *graphs = Some(family);
                         *family_key = None;
@@ -481,7 +484,9 @@ pub(crate) fn lower_indirect_calls_with(
         // result here as well: a dependency LLBC can expose a transparent
         // scalar wrapper only as an opaque declaration, while a local family
         // member still supplies the complete translated signature.
-        let declared = call_control.declared_result_type_for_indirect(&trait_root, &method_name);
+        let declared = call_control.declared_result_type_for_indirect(
+            &crate::model::IndirectFamilyKey::dyn_trait(trait_root.as_str(), method_name.as_str()),
+        );
         if let Some(declared) = declared {
             result_ty = match declared {
                 majit_ir::value::Type::Int => ValueType::Int,
@@ -1039,7 +1044,7 @@ pub(crate) mod tests {
                     funcptr: funcptr.clone(),
                     args: Vec::new(),
                     graphs: None,
-                    family_key: Some(("Handler".to_string(), "run".to_string())),
+                    family_key: Some(crate::model::IndirectFamilyKey::dyn_trait("Handler", "run")),
                     result_ty: ValueType::Void,
                 },
                 true,
@@ -1068,6 +1073,64 @@ pub(crate) mod tests {
             .expect("indirect call survives rtyping");
         assert_eq!(indirect.0, &funcptr);
         assert_eq!(indirect.1.as_ref().map(Vec::len), Some(1));
+        assert!(indirect.2.is_none(), "rtyper must consume the family key");
+    }
+
+    /// A harvested struct FnPtr field fills `c_graphs` from its own
+    /// family store (`all_impls_for_family`), then clears the key.
+    #[test]
+    fn fnptr_field_family_key_fills_graphs_and_clears_key() {
+        use crate::call::CallControl;
+        use crate::parse::CallPath;
+
+        let mut cc = CallControl::new();
+        for owner in [
+            "base_user_class_mapdict_getclass",
+            "W_OBJECT_OBJECT_MAPDICT_ACCESS",
+        ] {
+            cc.register_fnptr_field_family_path(
+                "mapdict::MapdictMixinAccess",
+                "getclass",
+                CallPath::for_impl_method(owner, "getclass"),
+            );
+        }
+
+        let mut graph = crate::model::FunctionGraph::new("instance_getclass");
+        let funcptr = graph.alloc_value_var();
+        graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::IndirectCall {
+                    funcptr: funcptr.clone(),
+                    args: Vec::new(),
+                    graphs: None,
+                    family_key: Some(crate::model::IndirectFamilyKey::fnptr_field(
+                        "mapdict::MapdictMixinAccess",
+                        "getclass",
+                    )),
+                    result_ty: ValueType::Void,
+                },
+                true,
+            )
+            .unwrap();
+
+        lower_indirect_calls(&mut graph, &cc);
+
+        let indirect = graph.blocks[graph.startblock.0]
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::IndirectCall {
+                    funcptr: actual,
+                    graphs,
+                    family_key,
+                    ..
+                } => Some((actual, graphs, family_key)),
+                _ => None,
+            })
+            .expect("indirect call survives family fill");
+        assert_eq!(indirect.0, &funcptr);
+        assert_eq!(indirect.1.as_ref().map(Vec::len), Some(2));
         assert!(indirect.2.is_none(), "rtyper must consume the family key");
     }
 

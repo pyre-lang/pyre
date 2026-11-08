@@ -19913,7 +19913,9 @@ mod tests {
                         funcptr: vars[2].clone(),
                         args: vec![vars[0].clone()],
                         graphs: None,
-                        family_key: Some(("Handler".into(), "run".into())),
+                        family_key: Some(crate::model::IndirectFamilyKey::dyn_trait(
+                            "Handler", "run",
+                        )),
                         result_ty: ValueType::Int,
                     },
                 },

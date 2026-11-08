@@ -538,7 +538,7 @@ pub fn discover_fnptr_field_families(llbc: &Llbc) -> Vec<(String, String, String
 
 /// Crate-stripped full defining type path used as the family key together
 /// with the field name. Shared by harvest, `fnptr_struct_field_target`,
-/// and `register_trait_family_path`.
+/// and `register_fnptr_field_family_path`.
 pub(in crate::front::mir) fn fnptr_field_family_struct_key(td: &TypeDecl) -> String {
     strip_crate_prefix(&td.item_meta.name_path())
 }

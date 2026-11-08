@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use crate::call::CallDescriptor;
 use crate::codewriter::support::{NormalizedArg, decode_builtin_call};
 use crate::model::{
-    CallFuncPtr, CallTarget, ExitSwitch, FieldDescriptor, FunctionGraph, LinkArg, OpKind,
-    SpaceOperation, ValueType, VecFieldPart, remap_control_flow_metadata_var,
+    CallFuncPtr, CallTarget, ExitSwitch, FieldDescriptor, FunctionGraph, IndirectFamilyKey,
+    LinkArg, OpKind, SpaceOperation, ValueType, VecFieldPart, remap_control_flow_metadata_var,
 };
 use majit_ir::descr::{EffectInfo, ExtraEffect, OopSpecIndex};
 
@@ -5129,8 +5129,8 @@ impl<'a> Transformer<'a> {
     /// `declared` is `FUNC.RESULT` of the called function's lltype
     /// (`call.py getcalldescr` for `direct_call` and `indirect_call`
     /// alike): `declared_result_type_for_target` for a direct target, the
-    /// trait method family's signature (`declared_result_type_for_indirect`
-    /// / family witness graphs) for a vtable/indirect call.
+    /// called family's `FUNC.RESULT` (`declared_result_type_for_indirect`
+    /// / family witness graphs) for a dyn-trait or FnPtr-field call.
     fn effective_call_result_ty(
         &self,
         declared: Option<majit_ir::value::Type>,
@@ -15915,7 +15915,7 @@ impl<'a> Transformer<'a> {
         funcptr: &crate::flowspace::model::Variable,
         args: &[crate::flowspace::model::Variable],
         graphs: Option<&[crate::parse::CallPath]>,
-        family_key: Option<&(String, String)>,
+        family_key: Option<&IndirectFamilyKey>,
         result_ty: &ValueType,
         graph_name: &str,
         graph: &mut crate::model::FunctionGraph,
@@ -15947,11 +15947,7 @@ impl<'a> Transformer<'a> {
             funcptr_target
                 .as_ref()
                 .and_then(|target| cc.declared_result_type_for_target(target))
-                .or_else(|| {
-                    family_key.and_then(|(trait_root, method_name)| {
-                        cc.declared_result_type_for_indirect(trait_root, method_name)
-                    })
-                })
+                .or_else(|| family_key.and_then(|key| cc.declared_result_type_for_indirect(key)))
                 .or_else(|| cc.declared_result_type_for_graphs(graphs))
         });
         let effective_result_ty = self.effective_call_result_ty(
@@ -41047,7 +41043,10 @@ mod tests {
                 funcptr,
                 args,
                 graphs: Some(family),
-                family_key: Some(("MapByName".into(), "call".into())),
+                family_key: Some(crate::model::IndirectFamilyKey::dyn_trait(
+                    "MapByName",
+                    "call",
+                )),
                 result_ty: ValueType::Void,
             },
         });
