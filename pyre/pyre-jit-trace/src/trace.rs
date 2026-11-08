@@ -5933,40 +5933,36 @@ fn run_perfn_walk<Sym: WalkSym>(
                     }
                 }
             } else if let Some(bridge_stack) = sym.bridge_stack_oprefs() {
-                // Non-branch-guard resume at the opcode-entry
-                // marker: the walk re-executes the opcode from the top, reading
-                // its operand-stack inputs POSITIONALLY — `registers_r[nlocals +
-                // stack_idx]` (trace_opcode.rs `stack_slot_reg_idx`) — so
-                // the slot-indexed `bridge_stack` tail seeds color `nlocals + i`.
-                //
-                // The reserved-red skip is per-PC-wrong here.  `portal_frame_reg`
-                // / `portal_ec_reg` are a SINGLE global pair naming where the
-                // reds live at PORTAL ENTRY, not at an arbitrary interior resume
-                // PC; under free register coloring the reds sit at the
-                // operand-stack base `[nlocals, nlocals + 1]`, exactly the colors
-                // a shallow live operand stack occupies.  A live (non-NONE)
-                // `bridge_stack[i]` is the authoritative per-PC witness that slot
-                // `nlocals + i` holds a real operand-stack value at THIS PC — and
-                // a single color cannot simultaneously hold that value and the
-                // red, so the red is provably not live at color `nlocals + i`
-                // here (its identity is recovered through the frame field, e.g.
-                // `ensure_execution_context` / the standard-vable box, not this
-                // register).  Seeding the temp is therefore correct and the skip
-                // is what dropped it: on `re/_parser.py:append` (nlocals=2) the
-                // live callable at slot 2 = color 2 = `portal_frame_reg` was
-                // skipped, so `residual_call` read the stale entry frame/ec seed
-                // as its callable → SIGSEGV in dispatch_callable /
-                // `exception_is_valid_obj_as_class_w` (#389 with-gate probe).
-                //
-                // A NONE `bridge_stack[i]` (dead/empty slot) leaves the color's
-                // red seed intact — the red genuinely still owns the color there.
+                // Non-branch-guard resume at the opcode-entry marker: the
+                // walk re-executes the opcode from the top.
+                // `bridge_stack[i]` is the live value of semantic slot
+                // `nlocals + i`. The convert-image bank (`argboxes_r` →
+                // `top_regs_r`) is post-regalloc (`pyjitpl.py`
+                // `MIFrame.registers_r`, copied by `_copy_data_from_miframe`),
+                // so each slot lands at the color `pcdep_color_slots` names
+                // at this pc (`seed_ref_slots_at_pcdep_colors` /
+                // `reconstructed_ref_slot_color`, the inversion
+                // `setup_bridge_sym` uses). A slot with no live color is
+                // skipped. Writing `nlocals + i` as a color overwrites
+                // `portal_frame_reg` when that dedicated red sits inside the
+                // slot prefix (`os._fwalk`: nlocals=18, stack[8] → color 26
+                // = frame). Empty `pcdep` is identity coloring (skeleton /
+                // fixture); those reds sit at `nlocals + max_stackdepth + 11`.
                 let nl = sym.nlocals();
-                for (i, opref) in bridge_stack.iter().enumerate() {
-                    if !opref.is_none() {
-                        let color = (nl + i) as u8;
-                        seed(color, opref);
-                    }
-                }
+                let pcdep = crate::state::pcdep_trivia_at(pjc.jitcode.index() as i32, entry as i32)
+                    .unwrap_or_default();
+                crate::state::seed_ref_slots_at_pcdep_colors(
+                    &pcdep,
+                    bridge_stack
+                        .iter()
+                        .enumerate()
+                        .map(|(i, opref)| (nl + i, opref)),
+                    |color, opref| {
+                        if let Ok(c) = u8::try_from(color) {
+                            seed(c, opref);
+                        }
+                    },
+                );
                 // The value just returned by an in-flight callee is the one
                 // non-pcdep operand at this opcode-entry coordinate.  RPython
                 // has already installed it in the caller MIFrame's result

@@ -15906,11 +15906,16 @@ impl CodeWriter {
             let mut splice_regallocs = graph_regallocs.clone();
             // `interp_jit.py reds = ['frame', 'ec']`: both portal inputs
             // are live in every MIFrame at every guard. Give them dedicated
-            // Ref colors above the ordinary allocator range so neither can be
-            // coalesced with a local/stack value at an interior resume point.
-            // This is the post-color equivalent of adding interference edges
-            // from the always-live reds to every Ref, without perturbing the
-            // coloring of the body itself.
+            // Ref colors at `RegAllocator.num_colors` and `num_colors + 1`
+            // (the next unused colors after the body's coloring) so neither
+            // shares a body variable's color. `num_colors` is the count of
+            // used colors, not `nlocals + max_stackdepth`, so the integers
+            // can fall inside the slot prefix; convert-image seeds invert
+            // slot→color through `pcdep_color_slots`
+            // (`seed_ref_slots_at_pcdep_colors`) rather than writing
+            // `nlocals + i` as a color. This is the post-color equivalent
+            // of adding interference edges from the always-live reds to
+            // every Ref, without perturbing the coloring of the body itself.
             {
                 let ref_alloc = &mut splice_regallocs[Kind::Ref.index()];
                 let frame_color = ref_alloc.num_colors;
