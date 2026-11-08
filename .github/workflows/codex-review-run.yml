@@ -22,11 +22,14 @@ name: codex-review-run
 #   - Codex runs sandboxed (no network for its shell commands) rather than with
 #     `--dangerously-bypass-approvals-and-sandbox`;
 #   - the report is scrubbed of the credential before it is posted;
-#   - fork PRs wait for a maintainer to approve the `codex-review` environment.
+#   - untrusted fork PRs wait for a maintainer to approve the `codex-review`
+#     environment. Same-repo PRs and the trusted-fork allowlist below skip
+#     that gate. Keep the two `fromJSON` lists (announce and approve) identical:
+#     ["youknowone/pyre"]
 #
 # A pending commit status is announced outside the approval gate because a
-# `workflow_run` run is invisible on the PR. Without it, a fork PR's wait for
-# a maintainer to approve the environment would be silent.
+# `workflow_run` run is invisible on the PR. Without it, a gated fork PR's
+# wait for a maintainer to approve the environment would be silent.
 #
 # This workflow only fires once it is on the default branch — `workflow_run`
 # never triggers from a PR branch.
@@ -61,11 +64,11 @@ jobs:
         env:
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          IS_FORK: ${{ github.event.workflow_run.head_repository.full_name != github.repository }}
+          NEEDS_APPROVAL: ${{ github.event.workflow_run.head_repository.full_name != github.repository && !contains(fromJSON('["youknowone/pyre"]'), github.event.workflow_run.head_repository.full_name) }}
         with:
           script: |
-            const isFork = process.env.IS_FORK === 'true';
-            const description = isFork
+            const needsApproval = process.env.NEEDS_APPROVAL === 'true';
+            const description = needsApproval
               ? 'Waiting for a maintainer to approve the codex-review environment — Review deployments on this run'
               : 'Queued';
             // This context must stay identical to the review job's context, or
@@ -83,14 +86,16 @@ jobs:
     name: Approve fork review
     # A fork PR is code nobody has read yet. Gate it on a maintainer approving
     # the `codex-review` environment before the review job is handed the
-    # credential. Same-repo PRs skip this job and review immediately.
+    # credential. Same-repo PRs and trusted forks skip this job and review
+    # immediately. Random forks still wait.
     #
     # A draft PR skips the trigger job, which leaves the run `skipped` rather
     # than `success` — without that guard a draft fork PR would raise an
     # approval request for a review that has nothing to do.
     if: >-
       ${{ github.event.workflow_run.conclusion == 'success'
-      && github.event.workflow_run.head_repository.full_name != github.repository }}
+      && github.event.workflow_run.head_repository.full_name != github.repository
+      && !contains(fromJSON('["youknowone/pyre"]'), github.event.workflow_run.head_repository.full_name) }}
     runs-on: ubuntu-latest
     environment: codex-review
     steps:
@@ -103,7 +108,8 @@ jobs:
   review:
     name: Codex parity review
     needs: [approve]
-    # `approve` is skipped for same-repo PRs and must have succeeded for forks.
+    # `approve` is skipped for same-repo PRs and trusted forks, and must have
+    # succeeded for other forks.
     if: >-
       ${{ always() && github.event.workflow_run.conclusion == 'success'
       && (needs.approve.result == 'success' || needs.approve.result == 'skipped') }}
