@@ -2,7 +2,7 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=79a2a45e51c5399e platform=linux
+# corpus=9ac4d85cd672829d platform=linux
 direct-skip (never reaches unported_category)	generatorentry_portal_portal
 direct-skip (never reaches unported_category)	option::Option::<impl core::ops::try_trait::Try<core::option::Option<v0>>>::branch__spec_Utf16Or32Form_1aad9eec5cbb6142
 direct-skip (never reaches unported_category)	pyre_interpreter::type_methods::builtin_encoder
@@ -163,7 +163,6 @@ two-phase-annotate-skipped	pyre_interpreter::baseobjspace::fixedview
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::float_w
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::gateway_int_w
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::generator_next
-two-phase-annotate-skipped	pyre_interpreter::baseobjspace::generator_next_method
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::generator_send_ex
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::generatorentry_portal
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::get
@@ -221,6 +220,7 @@ two-phase-annotate-skipped	pyre_interpreter::baseobjspace::native_slot_del
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::native_slot_get
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::native_slot_set
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::next
+two-phase-annotate-skipped	pyre_interpreter::baseobjspace::next_yield_from
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::object_delattr
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::object_getattribute_surrogate
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::object_percent_t
@@ -232,7 +232,6 @@ two-phase-annotate-skipped	pyre_interpreter::baseobjspace::p_recursive_issubclas
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::pairwise_next_w
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::property_no_accessor
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::range_compute_slice
-two-phase-annotate-skipped	pyre_interpreter::baseobjspace::resume_yield_from
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::reversed_descr_next
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::seq_iter_descr_next
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::set
@@ -1772,9 +1771,6 @@ two-phase-annotate-skipped	pyre_module::module::fcntl::interp_fcntl::ioctl_mutab
 two-phase-annotate-skipped	pyre_module::module::fcntl::interp_fcntl::ioctl_readonly
 two-phase-annotate-skipped	pyre_module::module::fcntl::interp_fcntl::stage_ioctl
 two-phase-annotate-skipped	pyre_module::module::gc::hook::__majit_wrap_set
-two-phase-annotate-skipped	pyre_module::module::math::interp_math::__majit_wrap_math_sqrt
-two-phase-annotate-skipped	pyre_module::module::math::interp_math::sqrt_from_double
-two-phase-annotate-skipped	pyre_module::module::math::interp_math::sqrt_translate_ll_error
 two-phase-annotate-skipped	pyre_module::module::mmap::interp_mmap::__majit_wrap_mmap_flush
 two-phase-annotate-skipped	pyre_module::module::mmap::interp_mmap::__majit_wrap_mmap_flush::<Impl>::call_once
 two-phase-annotate-skipped	pyre_module::module::mmap::interp_mmap::__majit_wrap_mmap_size
@@ -2091,6 +2087,5 @@ two-phase-rtype-skipped	majit_rlib::jit_libffi::imp::do_ffi_call_sint
 two-phase-rtype-skipped	pyre_interpreter::baseobjspace::_check_len_result
 two-phase-rtype-skipped	pyre_interpreter::module::thread::rlock_class::<Impl>::_release_save
 two-phase-rtype-skipped	pyre_interpreter::type_methods::complex_component_spec
-two-phase-rtype-skipped	pyre_object::dictmultiobject::<Impl>::get_empty_storage
 two-phase-rtype-skipped	pyre_object::gc_hook::try_gc_alloc_collecting_rooted
 two-phase-rtype-skipped	pyre_object::unicodeobject::alloc_utf8_payload
