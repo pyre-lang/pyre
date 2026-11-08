@@ -253,24 +253,6 @@ thread_local! {
     static FBW_FRAME_VSD_UNDO: std::cell::RefCell<Vec<(usize, usize)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
-    /// `(frame, slot, value, concrete)` for the most recent operand-stack Ref
-    /// store a generator-resume sub-walk made into its own suspended frame.
-    ///
-    /// The yield interception needs the value the body is suspending WITH, and
-    /// `emit_abort_permanent!` has already put it there: the marker is preceded
-    /// by one `setarrayitem_vable_r` per live operand-stack slot, ascending, so
-    /// the last of them writes the top of stack — which for `YIELD_VALUE` is
-    /// exactly the value the opcode pops.  Latched at the store rather than
-    /// re-read off the frame at the marker because the interception wants the
-    /// OpRef as well as the object, and only the store site holds both.
-    ///
-    /// One entry, last write wins, carrying the frame it was made on and the
-    /// slot it landed in.  A nested resume that overwrote it names a different
-    /// frame, and the interception then declines rather than taking another
-    /// generator's value.
-    static FBW_GENERATOR_YIELD_TOS: std::cell::Cell<Option<GeneratorStackStore>> =
-        const { std::cell::Cell::new(None) };
-
     /// Armed by the bridge tracer (`call_jit::trace_and_compile_from_bridge`)
     /// before a guard-failure walk.  When
     /// set, the `run_perfn_walk` epilogue lets a bridge `Terminate` walk keep
@@ -469,7 +451,6 @@ pub(crate) fn fbw_store_journal_reset() {
     FBW_EXIT_LAST_INSTR_UNDO.with(|c| c.borrow_mut().clear());
     FBW_LOCALS_MIRROR_UNDO.with(|c| c.borrow_mut().clear());
     FBW_FRAME_VSD_UNDO.with(|c| c.borrow_mut().clear());
-    FBW_GENERATOR_YIELD_TOS.with(|c| c.set(None));
 }
 
 /// Walk-local TLS stacked while a nested `compile_and_run_once` runs.
@@ -506,7 +487,6 @@ pub struct ParkedWalkTls {
     exit_last_instr_undo: Vec<(usize, isize)>,
     locals_mirror_undo: Vec<FbwLocalsMirrorUndo>,
     frame_vsd_undo: Vec<(usize, usize)>,
-    generator_yield_tos: Option<GeneratorStackStore>,
     finish_is_exception: bool,
     finish_concrete: Option<FinishConcrete>,
     // `warmstate.py bound_reached` gives a nested run a fresh MetaInterp;
@@ -595,7 +575,6 @@ pub fn park_walk_tls() {
             .with(|c| std::mem::take(&mut *c.borrow_mut())),
         locals_mirror_undo: FBW_LOCALS_MIRROR_UNDO.with(|c| std::mem::take(&mut *c.borrow_mut())),
         frame_vsd_undo: FBW_FRAME_VSD_UNDO.with(|c| std::mem::take(&mut *c.borrow_mut())),
-        generator_yield_tos: FBW_GENERATOR_YIELD_TOS.with(|c| c.take()),
         finish_is_exception: FBW_FINISH_IS_EXCEPTION.with(|c| c.replace(false)),
         finish_concrete: FBW_FINISH_CONCRETE.with(|c| c.take()),
         bridge_noreplay_armed: FBW_BRIDGE_NOREPLAY_ARMED.with(|c| c.replace(false)),
@@ -651,7 +630,6 @@ pub fn restore_walk_tls() {
     FBW_EXIT_LAST_INSTR_UNDO.with(|c| *c.borrow_mut() = parked.exit_last_instr_undo);
     FBW_LOCALS_MIRROR_UNDO.with(|c| *c.borrow_mut() = parked.locals_mirror_undo);
     FBW_FRAME_VSD_UNDO.with(|c| *c.borrow_mut() = parked.frame_vsd_undo);
-    FBW_GENERATOR_YIELD_TOS.with(|c| c.set(parked.generator_yield_tos));
     FBW_FINISH_IS_EXCEPTION.with(|c| c.set(parked.finish_is_exception));
     FBW_FINISH_CONCRETE.with(|c| c.set(parked.finish_concrete));
     FBW_BRIDGE_NOREPLAY_ARMED.with(|c| c.set(parked.bridge_noreplay_armed));
@@ -813,10 +791,6 @@ pub(crate) fn walk_parked_walk_tls_stack(
         }
         for (frame, _) in &mut parked.frame_vsd_undo {
             visit_managed_addr(frame, visitor);
-        }
-        if let Some(store) = parked.generator_yield_tos.as_mut() {
-            visit_managed_addr(&mut store.frame, visitor);
-            store.value.trace_const_ptr(visitor);
         }
         if let Some(finish) = parked.finish_concrete.as_mut() {
             let value = match finish {
@@ -1412,33 +1386,6 @@ pub(crate) fn fbw_frame_vsd_commit() {
     FBW_FRAME_VSD_UNDO.with(|c| c.borrow_mut().clear());
 }
 
-/// One operand-stack Ref store made into a resumed generator's own frame.
-#[derive(Clone, Copy)]
-pub(crate) struct GeneratorStackStore {
-    /// The suspended frame the store landed on.
-    pub(crate) frame: usize,
-    /// Absolute `locals_cells_stack_w` slot it wrote.
-    pub(crate) slot: usize,
-    /// The stored value.
-    pub(crate) value: OpRef,
-}
-
-/// Record an operand-stack Ref store a generator-resume sub-walk made into its
-/// own suspended frame.  See [`FBW_GENERATOR_YIELD_TOS`].
-pub(crate) fn fbw_note_generator_stack_store(store: GeneratorStackStore) {
-    FBW_GENERATOR_YIELD_TOS.with(|c| c.set(Some(store)));
-}
-
-/// The latched store, if the last one was made on `frame` and landed on `slot`.
-pub(crate) fn fbw_generator_stack_store_at(
-    frame: usize,
-    slot: usize,
-) -> Option<GeneratorStackStore> {
-    FBW_GENERATOR_YIELD_TOS
-        .with(|c| c.get())
-        .filter(|store| store.frame == frame && store.slot == slot)
-}
-
 /// Arm all three frame undos, called by each walk-time store into a frame the
 /// walk did not create, before that store lands.
 ///
@@ -1527,18 +1474,12 @@ pub(crate) fn frame_vsd_undo_cell_ptr() -> *const std::cell::RefCell<Vec<(usize,
     FBW_FRAME_VSD_UNDO.with(|c| c as *const _)
 }
 
-pub(crate) fn generator_yield_tos_cell_ptr() -> *const std::cell::Cell<Option<GeneratorStackStore>>
-{
-    FBW_GENERATOR_YIELD_TOS.with(|c| c as *const _)
-}
-
 /// Forward the frame identity of each live undo list. Slot vectors are
 /// walked by [`super::fbw_store_journal_root_walker_area`]; this covers
 /// the raw address keys those lists compare on restore.
 pub(crate) fn walk_live_frame_keyed_undo_cells(
     exit_last_instr_undo: *const std::cell::RefCell<Vec<(usize, isize)>>,
     frame_vsd_undo: *const std::cell::RefCell<Vec<(usize, usize)>>,
-    generator_yield_tos: *const std::cell::Cell<Option<GeneratorStackStore>>,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
     // SAFETY: the owner is synchronously collecting or STW-quiesced; each
@@ -1550,10 +1491,6 @@ pub(crate) fn walk_live_frame_keyed_undo_cells(
     let vsd = unsafe { &mut *(*frame_vsd_undo).as_ptr() };
     for (frame, _) in vsd.iter_mut() {
         visit_managed_addr(frame, visitor);
-    }
-    if let Some(store) = unsafe { &mut *(*generator_yield_tos).as_ptr() }.as_mut() {
-        visit_managed_addr(&mut store.frame, visitor);
-        store.value.trace_const_ptr(visitor);
     }
 }
 

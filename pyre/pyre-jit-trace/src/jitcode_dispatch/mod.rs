@@ -1844,19 +1844,11 @@ pub(crate) fn publish_callee_locals_region(
     );
 }
 
-/// Apply `PyFrame.frame_finished_execution = True` on the concrete frame a
-/// `*_return` just finished.
-///
-/// `pyopcode.py` `RETURN_VALUE` stores the bit before returning, and the
-/// codewriter emits that read-or-write of `PyFrame.flags` immediately before
-/// `*_return`. The walker records it by executing that jitcode. The recorded
-/// `setfield_gc` stays record-only for a frame the walk did not allocate, and
-/// a no-replay portal exit never re-executes the trace, so the concrete bit
-/// still has to land on that pre-existing frame here. `YIELD_VALUE` does not
-/// reach this function: its frame exit is the `abort_permanent` arm, which
-/// finishes the trace without the store. `generator.py` `send_ex` reads the
-/// bit to tell the two apart.
-fn finish_current_frame_execution<Sym: WalkSym>(
+/// Publishes the return coordinate of an inline callee. The finished bit is
+/// the RETURN_VALUE flags store the jitcode executes (`pyopcode.py
+/// dispatch_bytecode`), never inferred from a return (`pyjitpl.py
+/// _opimpl_any_return` → `finishframe`).
+fn publish_inline_return_last_instr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     opcode_position: usize,
 ) {
@@ -1869,83 +1861,12 @@ fn finish_current_frame_execution<Sym: WalkSym>(
     if !ctx.is_top_level {
         residual_call::record_and_publish_inline_callee_last_instr(ctx, opcode_position);
     }
-    // `pyopcode.py RETURN_VALUE` stores `frame_finished_execution` on `self`
-    // before `raise Return`. A generator-resume sub-walk is portal-shaped, so
-    // that `setfield_gc` of flags is the standard-virtualizable record-only
-    // store (`setfield_gc_via_heapcache` skips the live write when `obj` is
-    // the vable box). `_send_ex` (`generator.py`) reads the live bit after
-    // this `*_return` to tell RETURN from YIELD; without it the RETURN
-    // `w_none` is yielded as an item. `YIELD_VALUE` does not reach here.
-    // Nested helper / Python-callee walks inherit `generator_resume` through
-    // `FbwWalkMode` clone (`run_sub_jitcode_walk_from`); only this body's
-    // own pycode may write the bit (`RETURN_VALUE` on `self`).
-    if let Some(resume) = ctx.fbw_mode.generator_resume {
-        if ctx.inline_w_code() == resume.w_pycode && resume.w_pycode != 0 {
-            let frame = pyre_object::gc_roots::shadow_stack_get(resume.frame_root)
-                as *mut pyre_interpreter::PyFrame;
-            if !frame.is_null() {
-                unsafe { (*frame).set_frame_finished_execution(true) };
-            }
-        }
-    }
-    let concrete_frame = if ctx.is_top_level {
-        // `fbw_store_token_in_vable` captures a guard snapshot and that
-        // capture returns `Err`. Setting the bit before the `?` would leave
-        // it on a frame whose walk was declined. `commit_top_level_frame_finished`
-        // runs only after `fbw_terminate_with_finish` returns `Ok`.
-        return;
-    } else {
-        let jitcode_index = ctx
-            .inline_callee_consts
-            .map_or(-1, |consts| consts.jitcode_index);
-        let mut concrete = std::ptr::null_mut();
-        if let Some(jitcode) = crate::state::pyjitcode_for_jitcode_index(jitcode_index) {
-            let frame_reg = jitcode.metadata.portal_frame_reg as usize;
-            concrete = match ctx
-                .frame_state
-                .borrow()
-                .concrete_registers_r
-                .get(frame_reg)
-                .copied()
-            {
-                Some(ConcreteValue::Ref(frame_ptr)) => frame_ptr as *mut pyre_interpreter::PyFrame,
-                _ => std::ptr::null_mut(),
-            };
-        }
-        // `sys._getframe` marks the inlined callee's own red frame escaped
-        // (`CalleeLocalsShadow`).  After the walk rewrites that frame as
-        // `NewWithVtable`, `portal_frame_reg` can name a different box, and
-        // finishing that other box leaves the returned object with only
-        // `FLAG_ESCAPED`.  `frame.clear()` then refuses a frame that has
-        // already returned. A frame the walk allocated already received the
-        // jitcode store; this covers the pre-existing escaped object the
-        // record-only `setfield_gc` did not write.
-        if let Some(shadow) = ctx.frame_state.borrow().callee_shadow.as_ref() {
-            let shadow_concrete = if shadow.concrete_frame == 0 {
-                std::ptr::null_mut()
-            } else {
-                shadow.concrete_frame as *mut pyre_interpreter::PyFrame
-            };
-            if !shadow_concrete.is_null() && unsafe { (*shadow_concrete).escaped() } {
-                concrete = shadow_concrete;
-            }
-        }
-        if concrete.is_null() || unsafe { !(*concrete).escaped() } {
-            // An unescaped inline frame has no observer after return.
-            // optimizeopt.virtualize removes that virtual MIFrame.
-            return;
-        }
-        concrete
-    };
-    if !concrete_frame.is_null() {
-        unsafe { (*concrete_frame).set_frame_finished_execution(true) };
-    }
 }
 
-/// `PyFrame.frame_finished_execution = True` on the live portal frame, after
-/// `fbw_terminate_with_finish` has accepted the exit. See
-/// [`finish_current_frame_execution`].
-fn commit_top_level_frame_finished<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) {
+/// `handle_operation_error` no-handler propagation stores
+/// `frame_finished_execution` on the live portal frame after the exit is
+/// accepted; `fbw_record_top_level_frame_finished` records the matching IR.
+fn commit_top_level_frame_unwound<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) {
     let frame = ctx.session.borrow().recording_frame_ptr;
     if frame == 0 {
         return;
@@ -2445,16 +2366,15 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     pub class_of_last_exc_is_const: bool,
     /// Set for the sub-walk that resumes a suspended generator body in place of
     /// the `jit_next` residual a `FOR_ITER` over it would otherwise leave.
-    /// `None` for every other walk, which is what keeps the yield interception
-    /// and the durable-frame journal off every path but this one.
+    /// `None` for every other walk, which is what keeps the durable-frame
+    /// journal off every path but this one.
     pub generator_resume: Option<GeneratorResumeSubwalk>,
 }
 
 /// The suspended generator a resume sub-walk is running on.
 ///
-/// Two coordinates and one address, all fixed before the walk starts: the
-/// frame the body executes on, the marker the body's single `yield` lowered
-/// to, and the Python pc that marker stands at.
+/// The frame the body executes on is fixed before the walk starts so
+/// walk-time writes are journalled (`fbw_arm_durable_frame_undo`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GeneratorResumeSubwalk {
     /// The suspended `PyFrame` — `gen.frame`, the frame the generator will be
@@ -2473,13 +2393,6 @@ pub struct GeneratorResumeSubwalk {
     /// generator, not a baked address — so suspension stores land on the
     /// same box the compiled loop re-reads.
     pub frame_box: OpRef,
-    /// JitCode offset of the `abort_permanent` the body's `yield` lowered to.
-    /// Exact rather than "any `abort_permanent`": a body can carry markers for
-    /// unported opcodes too, and those still abort.
-    pub yield_marker_jit_pc: usize,
-    /// Python pc of that `yield`.  The coordinate the frame is left suspended
-    /// at, so the next resume continues after it.
-    pub yield_py_pc: u32,
 }
 
 impl<Sym: WalkSym> Clone for FbwWalkMode<Sym> {
@@ -6239,9 +6152,9 @@ node,
                     }
                     // The concrete bit lands only once `fbw_store_token_in_vable`
                     // above has accepted the exit (see
-                    // `finish_current_frame_execution`); the recorded store is
+                    // `commit_top_level_frame_unwound`); the recorded store is
                     // already in the trace.
-                    commit_top_level_frame_finished(ctx);
+                    commit_top_level_frame_unwound(ctx);
                     // RPython parity: framestack exhausted with no handler
                     // match → `compile_exit_frame_with_exception(last_exc_box)`.
                     // Stash the exception the same way the value-return arms
@@ -10293,8 +10206,8 @@ impl FbwNamespaceStore {
 /// Extra-area cells for the store-journal walker.
 ///
 /// Frame-address journals (`exit_last_instr_undo`, `frame_vsd_undo`,
-/// `locals_mirror_undo.frame`, `generator_yield_tos.frame`,
-/// `unflushed_escaped_callee`, `escape_flush_undo.frame`) are visited by
+/// `locals_mirror_undo.frame`, `unflushed_escaped_callee`,
+/// `escape_flush_undo.frame`) are visited by
 /// [`fbw_state::visit_journalled_frame_roots`], the same helper
 /// [`fbw_state::walk_parked_walk_tls_stack`] calls.
 struct FbwStoreJournalRootArea {
@@ -10313,7 +10226,6 @@ struct FbwStoreJournalRootArea {
     locals_mirror_undo: *const std::cell::RefCell<Vec<FbwLocalsMirrorUndo>>,
     exit_last_instr_undo: *const std::cell::RefCell<Vec<(usize, isize)>>,
     frame_vsd_undo: *const std::cell::RefCell<Vec<(usize, usize)>>,
-    generator_yield_tos: *const std::cell::Cell<Option<fbw_state::GeneratorStackStore>>,
     unflushed_escaped_callee: *const std::cell::Cell<usize>,
     published_inline_frame: *const std::cell::Cell<*mut pyre_interpreter::PyFrame>,
     published_last_instr: *const std::cell::Cell<Option<PublishedLastInstr>>,
@@ -10340,7 +10252,6 @@ thread_local! {
         locals_mirror_undo: locals_mirror_undo_cell_ptr(),
         exit_last_instr_undo: fbw_state::exit_last_instr_undo_cell_ptr(),
         frame_vsd_undo: fbw_state::frame_vsd_undo_cell_ptr(),
-        generator_yield_tos: fbw_state::generator_yield_tos_cell_ptr(),
         unflushed_escaped_callee: residual_call::unflushed_escaped_callee_cell_ptr(),
         published_inline_frame: residual_call::published_inline_frame_cell_ptr(),
         published_last_instr: residual_call::published_last_instr_cell_ptr(),
@@ -10725,7 +10636,7 @@ pub unsafe fn fbw_store_journal_root_walker_area(
         visitor(unsafe { &mut *(&mut entry.item as *mut pyre_object::PyObjectRef).cast() });
     }
     // Same field list as `walk_parked_walk_tls_stack`: frame-address words
-    // plus the slots / yield value those journals already forwarded
+    // plus the slots those journals already forwarded
     // (`fbw_state::visit_journalled_frame_roots`).
     let escape_undo = unsafe { &mut *(*area.escape_flush_undo).as_ptr() };
     let locals_mirror = unsafe { &mut *(*area.locals_mirror_undo).as_ptr() };
@@ -10739,7 +10650,6 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     fbw_state::walk_live_frame_keyed_undo_cells(
         area.exit_last_instr_undo,
         area.frame_vsd_undo,
-        area.generator_yield_tos,
         visitor,
     );
     residual_call::walk_live_inline_frame_addr_cells(
@@ -16046,63 +15956,6 @@ fn handle<Sym: WalkSym>(
             Err(DispatchError::AbortMarkerReached { pc: op.pc })
         }
         "abort_permanent/" => {
-            // A generator-resume sub-walk arriving at the marker its own
-            // `yield` lowered to is not aborting: that marker is the
-            // suspension, and the value it suspends with is the FOR_ITER item
-            // the resume was walked for.
-            if let Some(item) = generator_resume_yield(ctx, op.pc)? {
-                return Ok((
-                    DispatchOutcome::SubReturn { result: Some(item) },
-                    op.next_pc,
-                ));
-            }
-            // `YIELD_VALUE` on any walk except the generator-resume sub-walk
-            // is a frame exit (`dispatch`'s `except Yield`), the same FINISH
-            // `ref_return/r` records. The frame stays suspended: do not set
-            // `FLAG_FRAME_FINISHED`.
-            if let Some((yielded, yield_py_pc)) = portal_yield_frame_exit(ctx, op.pc) {
-                if !yielded.is_constant() {
-                    if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) =
-                        ctx.trace_ctx.concrete_of_opref(yielded)
-                    {
-                        if ptr != 0 {
-                            ctx.trace_ctx.set_opref_concrete(
-                                yielded,
-                                majit_ir::Value::Ref(majit_ir::GcRef(ptr)),
-                            );
-                        }
-                    }
-                }
-                if ctx.is_top_level {
-                    if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) =
-                        ctx.trace_ctx.concrete_of_opref(yielded)
-                    {
-                        if ptr != 0 {
-                            fbw_finish_concrete_set(ConcreteValue::Ref(
-                                ptr as pyre_object::PyObjectRef,
-                            ));
-                        }
-                    }
-                    let (finish_arg, finish_arg_type) =
-                        fbw_terminate_with_finish(ctx, yielded, op.pc)?;
-                    // After the finish's own `last_instr` store, so the hint
-                    // flushes the yield coordinate and the popped depth.
-                    flush_yield_exit(ctx, yield_py_pc);
-                    return Ok((
-                        DispatchOutcome::Terminate {
-                            finish_arg,
-                            finish_arg_type,
-                        },
-                        op.next_pc,
-                    ));
-                }
-                return Ok((
-                    DispatchOutcome::SubReturn {
-                        result: Some(yielded),
-                    },
-                    op.next_pc,
-                ));
-            }
             // pyre-only `BC_ABORT_PERMANENT` fail-path
             // (`bhimpl_abort_permanent`, `blackhole.rs`): emitted for
             // paths that must always terminate the frame (BigInt-overflow
@@ -17690,7 +17543,7 @@ fn handle<Sym: WalkSym>(
             //
             // Walker selects between the two via `ctx.is_top_level`.
             let result = read_ref_reg(code, op, 0, ctx)?;
-            finish_current_frame_execution(ctx, op.pc);
+            publish_inline_return_last_instr(ctx, op.pc);
             // PyPy `box.value = result` parity at the frame boundary:
             // the callee's slot-keyed concrete shadow (`concrete_registers_r`)
             // carries the live PyObject pointer; mirror it onto the
@@ -17726,7 +17579,6 @@ fn handle<Sym: WalkSym>(
                     }
                 }
                 let (finish_arg, finish_arg_type) = fbw_terminate_with_finish(ctx, result, op.pc)?;
-                commit_top_level_frame_finished(ctx);
                 Ok((
                     DispatchOutcome::Terminate {
                         finish_arg,
@@ -17752,7 +17604,7 @@ fn handle<Sym: WalkSym>(
             // `inline_call_*_i` would land the int OpRef in its `>i` slot.
             // Operand layout `i`: 1B int register at op.pc+1.
             let result = read_int_reg(code, op, 0, ctx)?;
-            finish_current_frame_execution(ctx, op.pc);
+            publish_inline_return_last_instr(ctx, op.pc);
             // PyPy `box.value = result` parity at the frame boundary —
             // see `ref_return/r` comment above for rationale.
             if !result.is_constant() {
@@ -17773,7 +17625,6 @@ fn handle<Sym: WalkSym>(
                     fbw_finish_concrete_set(ConcreteValue::Int(v));
                 }
                 let (finish_arg, finish_arg_type) = fbw_terminate_with_finish(ctx, result, op.pc)?;
-                commit_top_level_frame_finished(ctx);
                 Ok((
                     DispatchOutcome::Terminate {
                         finish_arg,
@@ -17799,11 +17650,10 @@ fn handle<Sym: WalkSym>(
             // 1B signed const at op.pc+1.
             let value = code[op.pc + 1] as i8 as i64;
             let result = OpRef::ConstInt(value);
-            finish_current_frame_execution(ctx, op.pc);
+            publish_inline_return_last_instr(ctx, op.pc);
             if ctx.is_top_level {
                 fbw_finish_concrete_set(ConcreteValue::Int(value));
                 let (finish_arg, finish_arg_type) = fbw_terminate_with_finish(ctx, result, op.pc)?;
-                commit_top_level_frame_finished(ctx);
                 Ok((
                     DispatchOutcome::Terminate {
                         finish_arg,
@@ -17830,7 +17680,7 @@ fn handle<Sym: WalkSym>(
             // which bank to write into.
             // Operand layout `f`: 1B float register at op.pc+1.
             let result = read_float_reg(code, op, 0, ctx)?;
-            finish_current_frame_execution(ctx, op.pc);
+            publish_inline_return_last_instr(ctx, op.pc);
             if ctx.is_top_level {
                 // Slice b: portal-exit FINISH carries Type::Ref;
                 // `fbw_ensure_boxed_for_ca` re-boxes the float via
@@ -17839,7 +17689,6 @@ fn handle<Sym: WalkSym>(
                     fbw_finish_concrete_set(ConcreteValue::Float(v));
                 }
                 let (finish_arg, finish_arg_type) = fbw_terminate_with_finish(ctx, result, op.pc)?;
-                commit_top_level_frame_finished(ctx);
                 Ok((
                     DispatchOutcome::Terminate {
                         finish_arg,
@@ -17872,7 +17721,7 @@ fn handle<Sym: WalkSym>(
             // register on the caller side (the codewriter emits no `>X`
             // marker for void calls).
             // No operand bytes (the `/` argcodes is empty).
-            finish_current_frame_execution(ctx, op.pc);
+            publish_inline_return_last_instr(ctx, op.pc);
             if ctx.is_top_level {
                 // Slice b: route the void portal exit through
                 // `TraceAction::Finish` (empty args) so the compile
@@ -17888,7 +17737,6 @@ fn handle<Sym: WalkSym>(
                 // applied effects.
                 fbw_finish_concrete_set(ConcreteValue::Null);
                 let (finish_arg, finish_arg_type) = fbw_terminate_void_with_finish(ctx, op.pc)?;
-                commit_top_level_frame_finished(ctx);
                 Ok((
                     DispatchOutcome::Terminate {
                         finish_arg,

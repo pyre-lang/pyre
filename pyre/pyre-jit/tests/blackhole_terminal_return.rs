@@ -12,7 +12,7 @@ use pyre_interpreter::{Mode, alloc_execution_context, compile_source_with_filena
 use pyre_jit::call_jit::{BlackholeResult, blackhole_resume_via_rd_numb};
 
 #[test]
-fn terminal_ref_return_finishes_the_frame_and_leaves_its_execution_scope() {
+fn terminal_ref_return_leaves_its_execution_scope() {
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(|| {
@@ -99,7 +99,8 @@ fn terminal_ref_return_finishes_the_frame_and_leaves_its_execution_scope() {
                     panic!("one ref_return must complete, not resume at a merge point");
                 };
                 assert_eq!(returned, frame_ptr.cast());
-                assert!(frame.frame_finished_execution());
+                // The stream has no RETURN_VALUE flags store, and `_done_with_this_frame` stores nothing.
+                assert!(!frame.frame_finished_execution());
                 assert!(unsafe { (*ec_ptr).topframeref().is_null() });
             }
         })

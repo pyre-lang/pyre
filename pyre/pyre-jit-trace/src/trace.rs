@@ -3927,6 +3927,7 @@ fn cash_multi_frame_blackhole(
     // Convert's `bh_portal_runner_c` levels instead take
     // `finish_per_code_blackhole_level` (`call_jit.rs`).
     let finish_level = |frame_ptr: i64, exit: majit_metainterp::blackhole::LevelExit| {
+        // Only no-handler exception leave stores the bit (`handle_operation_error`); a return executed its own flags store.
         crate::state::finish_blackhole_level_frame(
             frame_ptr,
             matches!(exit, majit_metainterp::blackhole::LevelExit::Exception),
@@ -5562,10 +5563,25 @@ fn run_perfn_walk<Sym: WalkSym>(
     let is_plain_portal = !ctx.is_bridge_trace;
     let sidecar_entry = pjc.function_entry_for(start_pc);
     let uses_entry_sidecar = is_plain_portal && sidecar_entry.is_some();
+    let is_resume_sidecar = sidecar_entry.is_some_and(|off| pjc.is_resume_entry_offset(off));
     let entry_coord = if sym.bridge_walk_entry_pc().is_some() {
         // Guard resume with a carried jitcode coordinate: the walk enters at
         // the carried offset (override below).
         sym.bridge_walk_entry_pc()
+    } else if is_resume_sidecar {
+        sidecar_entry.filter(|&off| {
+            let landed =
+                crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, off) as usize;
+            let landed = if pjc.code_ptr.is_null() {
+                landed
+            } else {
+                crate::jitcode_dispatch::skip_python_trivia_forward(
+                    unsafe { &*pjc.code_ptr },
+                    landed,
+                )
+            };
+            landed >= start_pc
+        })
     } else if uses_entry_sidecar {
         // The resume-marker table forward-carries a py_pc that emitted no op of
         // its own to the next py that did.  When lowering stopped early — an
@@ -5650,6 +5666,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         // entry sidecar names the instruction's first op, the
         // `get_is_being_profiled` diamond `interp_jit.py PyFrame.dispatch`
         // evaluates before its `while`; the walk starts past it.
+        None if pjc.is_resume_entry_offset(entry_coord) => entry_coord,
         None => {
             let merge = pjc
                 .loop_scan()
@@ -5846,7 +5863,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         // virtualizable array before dispatching the header.  This is the
         // non-bridge counterpart of `setup_bridge_sym`'s color/slot inversion;
         // without it loop-carried collection operands remain `OpRef::NONE`.
-        if !is_bridge_trace {
+        if !is_bridge_trace && !pjc.is_resume_entry_offset(entry) {
             let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
             if let Some(pcdep) =
                 crate::state::pcdep_trivia_at(pjc.jitcode.index() as i32, entry as i32)
@@ -7506,30 +7523,14 @@ fn scan_loop_body_abort_permanent_pc(
         .abort_permanents
         .iter()
         .copied()
-        .filter(|&pc| pc > merge_point)
-        .filter(|&pc| {
-            // `YIELD_VALUE` lowers to `abort_permanent` as the suspension
-            // marker (`codewriter` `Instruction::YieldValue`). That is
-            // `dispatch`'s `except Yield` (`interp_jit.py`), which
-            // `compile_done_with_this_frame`s (`pyjitpl.py`). A scan that
-            // treats it as an unported in-loop opcode declines the walk
-            // that crosses a generator loop header after the single
-            // unrolled iteration (`should_unroll_one_iteration`). First
-            // resume is not a function-entry green, so ignoring the marker
-            // cannot open a separate entry compile at
-            // `after_return_generator_index`.
-            !abort_permanent_owner(w_code, &pjc, pc).is_some_and(|(_, instr)| {
-                matches!(instr, pyre_interpreter::Instruction::YieldValue { .. })
-            })
-        });
+        .filter(|&pc| pc > merge_point);
 
     // A backward goto closes the loop headed at `merge_point` only when it
     // jumps to that header.  One that jumps further back closes an ENCLOSING
     // loop, and letting it set the end here stretches this loop's body across
     // the enclosing one: a nested loop would then pick up abort_permanent
     // markers that belong to the enclosing body and decline a walk that never
-    // goes near them.  (`YIELD_VALUE` markers are dropped above as portal
-    // frame exits; remaining markers are unported ops.)  Take the nearest
+    // goes near them.  Take the nearest
     // header first, then its last back edge, so a `continue` earlier in the
     // body cannot truncate the region either.  With no candidate at all the
     // region stays open to the end of the code, the conservative direction.
@@ -7564,10 +7565,7 @@ fn scan_loop_body_abort_permanent_pc(
     // A generator is where the difference shows.  Its body is a single entry
     // whose target is the PEP 479 epilogue, so a whole-tail scan sweeps up
     // markers sitting between the back edge and that target and declines a
-    // loop over ops it never runs.  `YIELD_VALUE` is the frame exit on a
-    // loop-header green (`dispatch`'s `except Yield`), so the filter below
-    // skips it. First resume is not published as a function-entry green, so
-    // this skip cannot compile a separate entry at that pc.
+    // loop over ops it never runs.
     //
     // `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY` drops the handler region too and
     // `PYRE_FBW_LOOPBODY_SCAN_FULL` restores the whole-tail scan, so both ends
@@ -7584,20 +7582,7 @@ fn scan_loop_body_abort_permanent_pc(
     };
     abort_permanent_pcs
         .filter(|pc| {
-            // `YIELD_VALUE` is the frame exit on a loop-header green.
-            // `interp_jit.py` `PyFrame.dispatch`'s `except Yield` pops the
-            // value, `jit.hint(self, force_virtualizable=True)`, and returns.
-            // `pyjitpl.py` `compile_done_with_this_frame` finishes the trace
-            // from that return. `portal_yield_frame_exit` records the same
-            // exit when the walk reaches the marker from a header after the
-            // unrolled iteration. First resume is not a function-entry green,
-            // so this skip cannot compile a separate entry there.
             let owner = abort_permanent_owner(w_code, &pjc, *pc);
-            if owner.as_ref().is_some_and(|(_, instr)| {
-                matches!(instr, pyre_interpreter::Instruction::YieldValue { .. })
-            }) {
-                return false;
-            }
             if *pc < loop_end {
                 return true;
             }

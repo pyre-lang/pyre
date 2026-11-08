@@ -119,6 +119,11 @@ pub struct PyJitCodeMetadata {
     /// are decided on per frame by `loop_body_abort_permanent_pc`, so they get
     /// the exact inverse.  Empty for skeleton / fixture metadata.
     pub abort_permanent_py_pc_by_jit_pc: Vec<(u32, u32)>,
+    /// Yield resume continuation: Python pc (`last_instr + 1`) → first
+    /// jitcode offset of the frame-reload prelude
+    /// (`interp_jit.py` `dispatch` `except Yield`,
+    /// `tweak_generator_body_graph`). Empty for skeleton / fixture metadata.
+    pub resume_entry_by_py_pc: Vec<(u32, u32)>,
     /// Trace-entry green py_pc → JitCode byte offset where tracing enters
     /// for that green. True-portal jitcode (`interp_jit.py PyFrame.dispatch`)
     /// emits `jit_merge_point` at every instruction start, and PyPy's JitCell
@@ -887,9 +892,10 @@ impl PyJitCode {
     ///
     /// `merge_entry_for` cannot answer a generator resume coordinate:
     /// `merge_entry_by_green` is `find_loop_header_pcs` plus function entry.
-    /// Widening that table would start inlined FOR_ITER portal traces at the
-    /// yield's `abort_permanent`. The shipped per-Python-PC tables already
-    /// carry what `derive_resume_marker` reads.
+    /// A yield is a return plus a resume continuation (`interp_jit.py`
+    /// `dispatch` `except Yield`, `tweak_generator_body_graph`);
+    /// `first_op_offset` prefers that continuation when
+    /// `resume_entry_by_py_pc` has the pc.
     pub fn resume_marker_offset(&self, py_pc: usize) -> Option<usize> {
         let metadata = &self.metadata;
         if metadata.block_head_py_by_jit_pc.is_empty() {
@@ -910,11 +916,32 @@ impl PyJitCode {
     /// bytecode that reads the exception from the frame
     /// (`PUSH_EXC_INFO` `getarrayitem_vable_r`).
     pub fn first_op_offset(&self, py_pc: usize) -> Option<usize> {
+        if let Some(off) = self.resume_entry_for(py_pc) {
+            return Some(off);
+        }
         let first_op_by_py_pc = self.first_op_by_py_pc()?;
         if py_pc >= first_op_by_py_pc.len() {
             return None;
         }
         derive_first_op(&first_op_by_py_pc, py_pc)
+    }
+
+    /// Jitcode offset of the yield-resume prelude at `py_pc`, if this body
+    /// published one (`resume_entry_by_py_pc`).
+    pub fn resume_entry_for(&self, py_pc: usize) -> Option<usize> {
+        self.metadata
+            .resume_entry_by_py_pc
+            .iter()
+            .find(|&&(py, _)| py as usize == py_pc)
+            .map(|&(_, off)| off as usize)
+    }
+
+    /// Whether `offset` is a published yield-resume prelude start.
+    pub fn is_resume_entry_offset(&self, offset: usize) -> bool {
+        self.metadata
+            .resume_entry_by_py_pc
+            .iter()
+            .any(|&(_, off)| off as usize == offset)
     }
 
     fn first_op_by_py_pc(&self) -> Option<Vec<usize>> {
@@ -947,7 +974,8 @@ impl PyJitCode {
     /// generic `last_exc_value` landing (`flatten.py` `generate_last_exc`
     /// only appears on an exception link raised inside the same trace).
     pub fn function_entry_for(&self, py_pc: usize) -> Option<usize> {
-        self.merge_entry_for(py_pc)
+        self.resume_entry_for(py_pc)
+            .or_else(|| self.merge_entry_for(py_pc))
             .or_else(|| self.first_op_offset(py_pc))
     }
     /// Predecessor index into a jitcode-pc twin — the entry
@@ -1434,6 +1462,7 @@ impl PyJitCodeMetadata {
             py_floor_by_jit_pc: Vec::new(),
             py_exact_by_jit_pc: Vec::new(),
             abort_permanent_py_pc_by_jit_pc: Vec::new(),
+            resume_entry_by_py_pc: Vec::new(),
             merge_entry_by_green: Vec::new(),
             loop_header_by_green: Vec::new(),
             pcdep_by_jit_pc: Vec::new(),

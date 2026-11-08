@@ -389,7 +389,7 @@ fn vstack_mirror_push_tos(boxes: &mut Vec<OpRef>, new_depth: usize, tos: OpRef) 
 /// `LOAD_COMMON_CONSTANT`) never keeps `last_ref`: that ref belongs to
 /// the previous opcode (a FOR_ITER item, a generator-send `None`). When
 /// the const box is not known yet it is [`OpRef::NONE`] — the int-bank
-/// hole `portal_yield_frame_exit` falls through from.
+/// hole for a const box produced later at the vable store.
 fn vstack_result_to_tos_box(last_ref: OpRef, const_result: bool, from_const: OpRef) -> OpRef {
     if const_result { from_const } else { last_ref }
 }
@@ -1868,8 +1868,7 @@ mod tests {
 
     /// `sum(1 for _ in early)`: FOR_ITER pushes the item, STORE_FAST pops it,
     /// LOAD_SMALL_INT pushes an int-bank 1 whose Ref is not known yet. The
-    /// mirror TOS must be NONE, not the popped item — otherwise
-    /// `portal_yield_frame_exit` finishes with that item.
+    /// mirror TOS must be NONE, not the popped item.
     #[test]
     fn for_iter_item_does_not_survive_store_fast_then_load_small_int() {
         let iter = box_at(0x1110);
@@ -1908,9 +1907,9 @@ mod tests {
     }
 
     /// A FunctionEntry that seeds on the yield pc takes its first boundary
-    /// out of `YIELD_VALUE`. Left Unmodeled that latch kills the mirror,
-    /// and `portal_yield_frame_exit` then finishes with a stale
-    /// `vstack_last_ref` (the FOR_ITER item).
+    /// out of `YIELD_VALUE`. Left Unmodeled that latch kills the mirror;
+    /// `YIELD_VALUE` is pop-only so the yielded TOS is not recovered from
+    /// a stale `vstack_last_ref` (the FOR_ITER item).
     #[test]
     fn yield_value_is_pop_only_or_side_store() {
         use pyre_interpreter::bytecode::{Arg, Instruction};

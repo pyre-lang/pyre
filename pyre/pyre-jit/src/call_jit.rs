@@ -266,7 +266,7 @@ mod tests {
             unsafe { (*ec.as_mut_ptr()).set_topframeref(&mut child) };
             let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
             bh.virtualizable_ptr = std::ptr::from_mut(&mut parent) as i64;
-            let _ = super::leave_resumed_blackhole_frame(&bh, false, pyre_object::w_none(), true);
+            let _ = super::leave_resumed_blackhole_frame(&bh, true, pyre_object::w_none(), true);
             assert!(parent.frame_finished_execution());
             assert!(!child.frame_finished_execution());
             assert!(std::ptr::eq(
@@ -297,7 +297,7 @@ mod tests {
             pyre_interpreter::call::set_last_exec_ctx(ec.as_ptr());
             let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
             bh.virtualizable_ptr = base as i64;
-            let _ = super::leave_resumed_blackhole_frame(&bh, false, pyre_object::w_none(), true);
+            let _ = super::leave_resumed_blackhole_frame(&bh, true, pyre_object::w_none(), true);
             // Clear the TLS anchor before an assertion can unwind the frame owner.
             pyre_interpreter::call::set_last_exec_ctx(std::ptr::null_mut());
             assert!(frames[0].frame_finished_execution());
@@ -325,7 +325,8 @@ mod tests {
             let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
             bh.virtualizable_ptr = std::ptr::from_mut(&mut child) as i64;
             let _ = super::leave_resumed_blackhole_frame(&bh, false, pyre_object::w_none(), true);
-            assert!(child.frame_finished_execution());
+            // A return leaves the flag to RETURN_VALUE's own store.
+            assert!(!child.frame_finished_execution());
             assert!(!parent.frame_finished_execution());
             assert!(std::ptr::eq(
                 ec.topframeref(),
@@ -2903,12 +2904,12 @@ fn leave_resumed_blackhole_frame(
         leave_compiled_frame_chain(recovered, chain_got_exception);
     } else if frame_is_on_unforced_ec_chain(ec, recovered) {
         // Not the open scope. `leave` must not rewrite `topframeref` or it
-        // would drop an inlined callee still sitting there. The blackhole's
-        // own frame still needs the `dispatch_bytecode` / `handle_operation_error`
-        // finish mark if it is a live chain member (the portal under that
-        // callee).
-        unsafe {
-            (*recovered).set_frame_finished_execution(true);
+        // would drop an inlined callee still sitting there.
+        // `handle_operation_error` marks a frame left by a no-handler
+        // exception; a return already executed the RETURN_VALUE flags store,
+        // and a yield stores nothing.
+        if got_exception {
+            unsafe { (*recovered).set_frame_finished_execution(true) };
         }
     }
     if let (Some(mut err), Some(slot)) = (hook_err, hook_err_slot) {
@@ -3001,10 +3002,12 @@ fn leave_compiled_frame_chain(frame_ptr: *mut PyFrame, got_exception: bool) {
     // resume-data frame chain itself is not the application frame chain, and
     // releasing a BlackholeInterpreter does not restore `topframeref`.
     unsafe {
-        // `PyFrame.dispatch_bytecode` / `handle_operation_error` marks the leaving
-        // frame finished. Only dereference the recovered red after proving
-        // that it names this execution context's still-open frame scope.
-        (*frame_ptr).set_frame_finished_execution(true);
+        // `handle_operation_error` marks a frame left by a no-handler
+        // exception; a return already executed the RETURN_VALUE flags store,
+        // and a yield stores nothing.
+        if got_exception {
+            (*frame_ptr).set_frame_finished_execution(true);
+        }
         (*ec).set_topframeref((*frame_ptr).f_backref);
         if (*frame_ptr).escaped() || got_exception {
             // `f_back = frame.f_backref()` — with the parens, so an inlined

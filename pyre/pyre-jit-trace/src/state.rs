@@ -1193,21 +1193,14 @@ pub fn jitcode_is_transparent_helper(jitcode_index: i32) -> bool {
 /// `PyFrame.frame_finished_execution = True` for a blackhole level that has
 /// left its caller by no-handler exception propagation.
 ///
-/// A normal return already carries the bit: `pyopcode.py RETURN_VALUE` stores
-/// it in the jitcode, and the blackhole replays that `setfield_gc` before
-/// `*_return`. A level that leaves by `ref_return` without the bit is a yield
-/// (`interp_jit.py dispatch` `except Yield`) and stays unfinished so `_send_ex`
-/// yields its item. Only the no-handler propagation (`handle_operation_error`),
-/// which has no jitcode op, is finished here.
-///
 /// A zero pointer is the inlined level whose frame was never materialized, the
 /// state upstream reaches by keeping the MIFrame virtual; there is no object to
 /// mark and no observer that could ask.
+///
+/// Only `handle_operation_error` no-handler propagation stores the bit here;
+/// a return already executed the RETURN_VALUE flags store.
 pub fn finish_blackhole_level_frame(frame_ptr: i64, got_exception: bool) {
-    if frame_ptr == 0 {
-        return;
-    }
-    if !got_exception {
+    if frame_ptr == 0 || !got_exception {
         return;
     }
     // SAFETY: the caller resolved this from the blackhole level's own
@@ -15641,6 +15634,7 @@ mod tests {
                 py_floor_by_jit_pc: Vec::new(),
                 py_exact_by_jit_pc: Vec::new(),
                 abort_permanent_py_pc_by_jit_pc: Vec::new(),
+                resume_entry_by_py_pc: Vec::new(),
                 merge_entry_by_green: Vec::new(),
                 loop_header_by_green: Vec::new(),
                 pcdep_by_jit_pc: vec![(0, Vec::new())],

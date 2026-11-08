@@ -10,7 +10,7 @@
 # Post-inner declining residual forces abort while inner item in-flight.
 # N is large enough that pypy's user time clears startup noise (~0.24s).
 # A single-yield generator is inlined at FOR_ITER: `dispatch`'s `except Yield`
-# `popvalue` (`generator_resume_yield`) returns the suspended value.
+# `popvalue` returns the suspended value.
 # `MAJIT_STATS` on this loop records `caro_no_merge_entry=0` and one compiled
 # trace (`loops_compiled=1`), so gouter/ginner are not left interpreted.
 # That compiled loop reads 2.2-4.3x, under this ceiling.

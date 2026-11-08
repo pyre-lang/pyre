@@ -1329,27 +1329,38 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
                     ctx.trace_ctx.field_store(struct_ptr, &descr, value);
                 }
             }
-        } else if ctx.trace_ctx.standard_virtualizable_box() != Some(obj)
-            && let Some(fd) = descr.as_field_descr()
-        {
-            // The standard virtualizable's box carries the trace-stepping
-            // heap copy rather than the live frame
-            // ([`fbw_publish_exit_last_instr`]), so its stores keep their
-            // own concrete counterparts.
-            let (offset, size, ty) = (fd.offset(), fd.field_size(), fd.field_type());
-            let obj_ptr = concrete_ref_operand_ptr(code, op, 0, obj, ctx);
-            let value = concrete_store_value_operand(code, op, 1, value_bank, valuebox, ctx);
-            let before = obj_ptr.and_then(|p| ctx.trace_ctx.field_sanity_load(p, &descr, ty));
-            walker_execute_gc_store(
-                ctx,
-                obj_ptr,
-                WalkedGcStore::Field(&descr),
-                offset,
-                size,
-                before,
-                value,
-                op.pc,
-            )?;
+        } else if let Some(fd) = descr.as_field_descr() {
+            let is_vable = ctx.trace_ctx.standard_virtualizable_box() == Some(obj);
+            let vable_managed = is_vable
+                && ctx.trace_ctx.virtualizable_info().is_some_and(|info| {
+                    info.static_field_by_descr(&descr).is_some()
+                        || info.array_field_by_descr(&descr).is_some()
+                });
+            if !vable_managed {
+                // The standard virtualizable's box names the
+                // `snapshot_for_tracing` copy, so a non-virtualizable field
+                // store is executed on the live frame
+                // `own_frame_array_store_target` resolves, which is
+                // `_opimpl_setfield_gc_any` → `execute_and_record`.
+                let (offset, size, ty) = (fd.offset(), fd.field_size(), fd.field_type());
+                let obj_ptr = if is_vable {
+                    super::vable_ops::own_frame_array_store_target(ctx, obj).map(|p| p as i64)
+                } else {
+                    concrete_ref_operand_ptr(code, op, 0, obj, ctx)
+                };
+                let value = concrete_store_value_operand(code, op, 1, value_bank, valuebox, ctx);
+                let before = obj_ptr.and_then(|p| ctx.trace_ctx.field_sanity_load(p, &descr, ty));
+                walker_execute_gc_store(
+                    ctx,
+                    obj_ptr,
+                    WalkedGcStore::Field(&descr),
+                    offset,
+                    size,
+                    before,
+                    value,
+                    op.pc,
+                )?;
+            }
         }
         ctx.trace_ctx
             .profiler()
@@ -1406,7 +1417,20 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
     let obj = read_ref_reg(code, op, 0, ctx)?;
     let descr = read_descr(code, op, 1, ctx)?;
     let descr_index = descr.index();
-    let concrete_obj_ptr = concrete_ref_operand_ptr(code, op, 0, obj, ctx);
+    let is_vable = ctx.trace_ctx.standard_virtualizable_box() == Some(obj);
+    let vable_managed = is_vable
+        && ctx.trace_ctx.virtualizable_info().is_some_and(|info| {
+            info.static_field_by_descr(&descr).is_some()
+                || info.array_field_by_descr(&descr).is_some()
+        });
+    // Ordinary fields on the standard virtualizable (for example `flags`)
+    // live on the interpreter frame `own_frame_array_store_target` resolves,
+    // not on the `snapshot_for_tracing` copy `box_value` names.
+    let concrete_obj_ptr = if is_vable && !vable_managed {
+        super::vable_ops::own_frame_array_store_target(ctx, obj).map(|p| p as i64)
+    } else {
+        concrete_ref_operand_ptr(code, op, 0, obj, ctx)
+    };
     // The cache-miss record below appends to `opencoder.py Trace._ops` and can
     // minor-collect before the sanity load reads the receiver.
     let obj_pin = concrete_obj_ptr.and_then(|p| residual_call::owner_root_if_gc(p as usize));

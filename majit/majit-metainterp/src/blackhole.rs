@@ -736,8 +736,8 @@ impl BlackholeInterpreter {
     ///
     /// Nothing else: upstream's `setposition` assigns `jitcode` and `position`
     /// and touches no other state.  `aborted` / `abort_permanent_bail` /
-    /// `got_exception` are reset where an interpreter is handed back
-    /// ([`BlackholeInterpBuilder::release_interp`]) and start `false` on a
+    /// `got_exception` are reset where an interpreter is handed
+    /// back ([`BlackholeInterpBuilder::release_interp`]) and start `false` on a
     /// fresh one, and `exception_last_value` is cleared by
     /// [`Self::cleanup_registers`] — which is upstream's owner for it too.
     /// Clearing it here dropped the exception a caller had already been

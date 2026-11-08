@@ -1115,8 +1115,8 @@ fn current_inline_vable_target<Sym: WalkSym>(
 /// `setup_reconstructed_callee_frame` built and left in `callee_shadow`
 /// without publishing it (see `drive_bridge_frame_subwalk`).  Both are
 /// allocated by the walk; the strict-fold arm above already writes the
-/// second.
-fn own_frame_array_store_target<Sym: WalkSym>(
+/// second. `setfield_gc` on an ordinary frame field uses this target too.
+pub(super) fn own_frame_array_store_target<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     vable: OpRef,
 ) -> Option<usize> {
@@ -2018,17 +2018,6 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     {
         if let Some(frame) = durable_resume_frame(ctx, frame) {
             fbw_arm_durable_frame_undo(frame);
-            if ctx
-                .fbw_mode
-                .generator_resume
-                .is_some_and(|resume| resume.frame == frame)
-            {
-                fbw_note_generator_stack_store(GeneratorStackStore {
-                    frame,
-                    slot: index_value as usize,
-                    value,
-                });
-            }
         }
         if let Some(nlocals) = crate::state::concrete_nlocals(frame) {
             crate::jitcode_dispatch::fbw_note_locals_mirror_undo(frame, nlocals);

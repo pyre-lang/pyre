@@ -717,6 +717,131 @@ fn entry_frame_state(code: &CodeObject, frame_inputs: FrameInputs) -> FrameState
     }
 }
 
+/// Resume prelude for a yield continuation (`tweak_generator_body_graph`
+/// `_insert_reads`): reload live locals and `D` stack slots from the frame
+/// and join the body at `resume_py_pc`.
+fn emit_resume_entry_from_frame(
+    code: &CodeObject,
+    graph: &mut super::flow::FunctionGraph,
+    joinpoints: &mut VecMap<usize, Vec<SpamBlockRef>>,
+    pendingblocks: &mut VecDeque<SpamBlockRef>,
+    all_walker_blocks: &mut Vec<SpamBlockRef>,
+    frame_var: super::flow::Variable,
+    ec_var: super::flow::Variable,
+    stack_base_absolute: usize,
+    resume_py_pc: usize,
+    depth_at_yield: u16,
+) -> super::flow::BlockRef {
+    let prelude_block = graph.new_block(Vec::new());
+    let nlocals = code.varnames.len();
+    let lv = pyre_jit_trace::state::liveness_for(code as *const _);
+    let mut locals_w = vec![None; nlocals];
+    for i in 0..nlocals {
+        if lv.is_local_live(resume_py_pc, i) {
+            let v_local_idx: super::flow::FlowValue =
+                super::flow::Constant::signed(local_to_vable_slot(i) as i64).into();
+            let loaded = emit_graph_op_with_result(
+                graph,
+                &prelude_block,
+                "getarrayitem_vable_r",
+                vable_getarrayitem_ref_graph_args(frame_var.into(), v_local_idx.into()),
+                Kind::Ref,
+                resume_py_pc as i64,
+            );
+            locals_w[i] = Some(loaded.into());
+        }
+    }
+    let mut stack = Vec::with_capacity(depth_at_yield as usize);
+    for j in 0..depth_at_yield as usize {
+        let v_idx: super::flow::FlowValue =
+            super::flow::Constant::signed((stack_base_absolute + j) as i64).into();
+        let loaded = emit_graph_op_with_result(
+            graph,
+            &prelude_block,
+            "getarrayitem_vable_r",
+            vable_getarrayitem_ref_graph_args(frame_var.into(), v_idx.into()),
+            Kind::Ref,
+            resume_py_pc as i64,
+        );
+        stack.push(loaded.into());
+    }
+    let state = FrameState::new(
+        locals_w,
+        stack,
+        None,
+        frame_blocks_for_offset(code, resume_py_pc),
+        resume_py_pc,
+    )
+    .with_portal_extras((frame_var.into(), Some(ec_var.into())));
+    let prelude_spam = SpamBlockRef::new(prelude_block.clone(), Some(state.clone()));
+    all_walker_blocks.push(prelude_spam.clone());
+    let _ = mergeblock(
+        code,
+        graph,
+        joinpoints,
+        &prelude_spam,
+        &state,
+        resume_py_pc,
+        pendingblocks,
+        all_walker_blocks,
+    );
+    prelude_block
+}
+
+/// Follow a `mergeblock` supersede forwarder to the block flatten will emit.
+fn surviving_graph_block(block: &super::flow::BlockRef) -> super::flow::BlockRef {
+    let mut cur = block.clone();
+    for _ in 0..1024 {
+        let next = {
+            let b = cur.borrow();
+            if !b.dead || b.exitswitch.is_some() || b.exits.len() != 1 {
+                None
+            } else {
+                match b.exits[0].borrow().target.clone() {
+                    Some(target) if target != cur => Some(target),
+                    _ => None,
+                }
+            }
+        };
+        match next {
+            Some(target) => cur = target,
+            None => return cur,
+        }
+    }
+    cur
+}
+
+/// First non-label, non-`-live-` insn of a resume prelude in `ssarepr`.
+fn resume_prelude_first_insn_index(
+    ssarepr: &SSARepr,
+    prelude: &super::flow::BlockRef,
+) -> Option<usize> {
+    let prelude_addr = prelude.as_ptr_addr();
+    let mut block_name: Option<&str> = None;
+    let mut link_name: Option<&str> = None;
+    for (name, block) in &ssarepr.label_blocks {
+        if block.as_ptr_addr() != prelude_addr {
+            continue;
+        }
+        if name.starts_with("block") {
+            if block_name.is_none() {
+                block_name = Some(name.as_str());
+            }
+        } else if link_name.is_none() {
+            link_name = Some(name.as_str());
+        }
+    }
+    let name = block_name.or(link_name)?;
+    let label_idx = ssarepr.insns.iter().position(|insn| match insn {
+        super::flatten::Insn::Label(label) => label.name == name,
+        _ => false,
+    })?;
+    ssarepr.insns[label_idx + 1..]
+        .iter()
+        .position(|insn| !matches!(insn, super::flatten::Insn::Label(_)) && !insn.is_live())
+        .map(|off| label_idx + 1 + off)
+}
+
 #[derive(Debug)]
 struct SpamBlock {
     /// `flowcontext.py:40` underlying `Block`.
@@ -7884,6 +8009,7 @@ impl CodeWriter {
         // hygiene requires captured identifiers be in scope at the
         // macro DEFINITION site.
         let mut pendingblocks: VecDeque<SpamBlockRef> = VecDeque::new();
+        let mut resume_entries: Vec<(usize, super::flow::BlockRef)> = Vec::new();
         // Upstream `build_flow` relies on `block.dead` alone
         // (`flowcontext.py if not block.dead: record_block(block)`).
         // Pyre matches this: supersede may re-walk a PC under widened
@@ -15012,62 +15138,54 @@ impl CodeWriter {
                         // StoreName pops 1 value from the stack.
                         // (This is separate from the above because pyopcode.rs pops.)
 
-                        // YieldValue: the suspension leaves the yielded value on
-                        // the stack; the fall-through model then replaces it
-                        // with the value the next resume sends. Net: 0.
-                        //
-                        // `pyopcode.py` `YIELD_VALUE` (not an async generator)
-                        // does not pop: it raises `Yield` with the value still
-                        // on the value stack. `interp_jit.py` `dispatch`'s
-                        // `except Yield` does `popvalue()` and returns that
-                        // value; `pyframe.py` `execute_frame` pops the same
-                        // way. `emit_abort_permanent!` materializes
-                        // `pre_opcode_stack` — the stack as this opcode was
-                        // entered, top slot the yielded value — and sets
-                        // `last_instr` to `py_pc - 1`, so a bail re-runs
-                        // `YIELD_VALUE`. A generator-resume sub-walk reads
-                        // that top slot (`generator_resume_yield`) and
-                        // publishes `last_instr` at the yield so the next
-                        // resume enters after it. Every other walk treats
-                        // the marker as the frame exit `dispatch`'s
-                        // `except Yield` is: the yielded value finishes
-                        // the trace (`compile_done_with_this_frame`).
-                        //
-                        // The pop and the slot reload run AFTER the marker. They
-                        // are the sent value the following opcodes expect
-                        // (`liveness.rs` net 0), not the value the suspension
-                        // returns. Emitting them first would not change the
-                        // marker — it reads the entry snapshot — but the
-                        // marker has to be the suspension, recorded while the
-                        // yielded value is still the modelled TOS.
+                        // `pyopcode.py` `YIELD_VALUE` raises `Yield` with the
+                        // value on the stack. `interp_jit.py` `PyFrame.dispatch`
+                        // `except Yield` pops it, hints `force_virtualizable`,
+                        // and returns it. The next send is a new dispatch at
+                        // `last_instr + 1` (`tweak_generator_body_graph`).
                         Instruction::YieldValue { .. } => {
-                            emit_abort_permanent!(py_pc);
-                            let _ = current_state.stack.pop();
-                            // `pyframe.py execute_frame` resumes with
-                            // `pushvalue(w_inputvalue)` and then `dispatch`es;
-                            // the next opcode's `popvalue` reads that slot of
-                            // `locals_cells_stack_w` (`jtransform.py
-                            // do_fixed_list_getitem`). Load it here so the sent
-                            // value is a graph result: a Variable with no
-                            // producer never interferes in `regalloc.py
-                            // make_dependencies` and can share a color with a
-                            // later merge's pycode reload.
-                            let sent_slot =
-                                (stack_base_absolute + current_depth as usize - 1) as i64;
-                            let v_sent_idx: super::flow::FlowValue =
-                                super::flow::Constant::signed(sent_slot).into();
-                            let sent = emit_graph_op_with_result(
+                            let depth_at_yield = current_depth;
+                            let resume_py_pc = py_pc + 1;
+                            let tos_index =
+                                stack_base_absolute + depth_at_yield.saturating_sub(1) as usize;
+                            let yielded = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
                                 "getarrayitem_vable_r",
                                 vable_getarrayitem_ref_graph_args(
                                     frame_var.into(),
-                                    v_sent_idx.into(),
+                                    super::flow::Constant::signed(tos_index as i64).into(),
                                 ),
                                 Kind::Ref,
                                 py_pc as i64,
                             );
-                            current_state.stack.push(sent.into());
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let _ = current_state.stack.pop();
+                            record_graph_op(
+                                &current_block.block(),
+                                "hint_force_virtualizable",
+                                vec![frame_var.into()],
+                                None,
+                                py_pc as i64,
+                            );
+                            emit_ref_return!(0, yielded.into());
+                            if resume_py_pc < num_instrs
+                                && !resume_entries.iter().any(|&(pc, _)| pc == resume_py_pc)
+                            {
+                                let prelude = emit_resume_entry_from_frame(
+                                    code,
+                                    &mut graph,
+                                    &mut joinpoints,
+                                    &mut pendingblocks,
+                                    &mut all_walker_blocks,
+                                    frame_var,
+                                    ec_var,
+                                    stack_base_absolute,
+                                    resume_py_pc,
+                                    depth_at_yield,
+                                );
+                                resume_entries.push((resume_py_pc, prelude));
+                            }
                         }
 
                         // ReturnGenerator: pushes 1. Net: +1.
@@ -15089,8 +15207,10 @@ impl CodeWriter {
                             push_fresh_ref(&mut current_state, &mut graph);
                             // Genuine trace boundary: SEND suspends the frame
                             // (StepResult::Yield) and resumes it in a different
-                            // stack context, which a residual call cannot express —
-                            // the same reason YIELD_VALUE aborts above.
+                            // stack context, which a residual call cannot express.
+                            // YIELD_VALUE is a return plus a resume continuation
+                            // (`interp_jit.py` `dispatch` `except Yield`,
+                            // `tweak_generator_body_graph`); SEND stays an abort.
                             emit_abort_permanent!(py_pc);
                         }
 
@@ -15834,6 +15954,51 @@ impl CodeWriter {
         // The other `all_passes` entries are structural no-ops on the walker's
         // empty-`operations` blocks (see their classification in
         // `simplify.rs`).
+        if !resume_entries.is_empty() {
+            let old_start = graph.startblock.clone();
+            let mut dispatch_inputs: Vec<super::flow::FlowValue> = (0..entry_arg_slots(code))
+                .map(|_| graph.fresh_variable(Kind::Ref).into())
+                .collect();
+            dispatch_inputs.push(frame_var.into());
+            dispatch_inputs.push(ec_var.into());
+            let dispatch = graph.new_block(dispatch_inputs.clone());
+            let li = emit_graph_op_with_result(
+                &mut graph,
+                &dispatch,
+                "getfield_vable_i",
+                vable_getfield_ref_graph_args(frame_var.into(), VABLE_LAST_INSTR_FIELD_IDX),
+                Kind::Int,
+                -1,
+            );
+            let sel = emit_graph_op_with_result(
+                &mut graph,
+                &dispatch,
+                "int_add",
+                vec![li.into(), super::flow::Constant::signed(1).into()],
+                Kind::Int,
+                -1,
+            );
+            dispatch.borrow_mut().exitswitch = Some(super::flow::ExitSwitch::Value(sel.into()));
+            for &(r, ref prelude) in &resume_entries {
+                let case: super::flow::FlowValue = super::flow::Constant::signed(r as i64).into();
+                let link =
+                    super::flow::Link::new(Vec::new(), Some(prelude.clone()), Some(case.clone()))
+                        .with_llexitcase(case)
+                        .into_ref();
+                append_exit(&dispatch, link);
+            }
+            let default_case: super::flow::FlowValue =
+                super::flow::Constant::string("default").into();
+            let default_link = super::flow::Link::new(
+                dispatch_inputs,
+                Some(old_start),
+                Some(default_case.clone()),
+            )
+            .with_llexitcase(default_case)
+            .into_ref();
+            append_exit(&dispatch, default_link);
+            graph.startblock = dispatch;
+        }
         eliminate_empty_blocks(&graph);
         super::simplify::constfold_exitswitch(&graph);
         // Port-boundary guard: after the collapse, no link reachable from
@@ -15855,6 +16020,9 @@ impl CodeWriter {
         // remove_trivial_links merges single-entry/single-exit chains; the
         // canonical splice reads the simplified graph directly.
         super::simplify::remove_trivial_links(&graph);
+        for (_, prelude) in resume_entries.iter_mut() {
+            *prelude = surviving_graph_block(prelude);
+        }
 
         // rtyper-analog lowering: expand the flowspace `newlist`/`newtuple`
         // ops (BUILD_LIST/BUILD_TUPLE, `flowcontext.py`) into the
@@ -16479,6 +16647,7 @@ impl CodeWriter {
             pcdep_color_slots,
             const_ref_slots_at_pc,
             &trace_arm_blocks,
+            &resume_entries,
         )
     }
 
@@ -16555,6 +16724,7 @@ impl CodeWriter {
         pcdep_color_slots: Vec<Vec<(u8, u16, u16)>>,
         const_ref_slots_at_pc: Vec<Vec<(u16, i64)>>,
         trace_arm_blocks: &[super::flow::BlockRef],
+        resume_entries: &[(usize, super::flow::BlockRef)],
     ) -> Option<PyJitCode> {
         // call.py — `(fnaddr, calldescr) = get_jitcode_calldescr(graph);
         // jitcode = JitCode(name, fnaddr, calldescr)`.  Stage the values
@@ -16641,6 +16811,12 @@ impl CodeWriter {
                 })
                 .collect()
         };
+        let resume_insn_some: Vec<(usize, usize)> = resume_entries
+            .iter()
+            .filter_map(|&(py_pc, ref prelude)| {
+                resume_prelude_first_insn_index(&ssarepr, prelude).map(|idx| (py_pc, idx))
+            })
+            .collect();
         let mut combined_indices = pc_map.clone();
         combined_indices.extend(after_call_some.iter().map(|(_, idx)| *idx));
         combined_indices.extend(first_insn_some.iter().map(|(_, idx)| *idx));
@@ -16653,6 +16829,8 @@ impl CodeWriter {
                 combined_indices.push(end_idx);
             }
         }
+        let resume_range_base = combined_indices.len();
+        combined_indices.extend(resume_insn_some.iter().map(|(_, idx)| *idx));
         let (jitcode, combined_bytes) = {
             let mut asm = self.assembler.borrow_mut();
             assembler.finish_with_positions_from(&mut *asm, ssarepr, &combined_indices, num_regs)
@@ -16774,6 +16952,15 @@ impl CodeWriter {
                 "trace_arm_ranges must be sorted and disjoint"
             );
         }
+        let mut resume_entry_by_py_pc: Vec<(u32, u32)> = resume_insn_some
+            .iter()
+            .enumerate()
+            .filter_map(|(k, (py_pc, _))| {
+                let off = u32::try_from(combined_bytes[resume_range_base + k]).ok()?;
+                Some((u32::try_from(*py_pc).ok()?, off))
+            })
+            .collect();
+        resume_entry_by_py_pc.sort_unstable_by_key(|&(py, off)| (py, off));
         // `usize::MAX` = the PC emitted no jitcode of its own (trivia /
         // folded). This local build-time table seeds the floor and marker twins.
         let mut first_jit_pc_by_py_pc: Vec<usize> = vec![usize::MAX; pc_map.len()];
@@ -17519,6 +17706,7 @@ impl CodeWriter {
             py_floor_by_jit_pc,
             py_exact_by_jit_pc,
             abort_permanent_py_pc_by_jit_pc,
+            resume_entry_by_py_pc,
             merge_entry_by_green,
             loop_header_by_green,
             pcdep_by_jit_pc,
@@ -20706,6 +20894,83 @@ mod tests {
             assert!(
                 pyjit.merge_entry_for(*header).is_some(),
                 "loop header {header} must stay a merge green, got {greens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn yield_value_lowers_as_force_virtualizable_return() {
+        use pyre_interpreter::bytecode::Instruction;
+
+        let code = first_nested_function_code(
+            "def g(a):\n    x = a + 1\n    y = yield x\n    yield (a, y)\n",
+        );
+        let mut yield_pcs = Vec::new();
+        for pc in 0..code.instructions.len() {
+            if matches!(
+                pyre_interpreter::decode_instruction_at(&code, pc),
+                Some((Instruction::YieldValue { .. }, _))
+            ) {
+                yield_pcs.push(pc);
+            }
+        }
+        assert!(
+            !yield_pcs.is_empty(),
+            "fixture must contain YIELD_VALUE, instructions={:?}",
+            code.instructions
+        );
+
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code) as *const CodeObject) };
+        let writer = CodeWriter::new();
+        let pyjit = writer
+            .transform_graph_to_jitcode(code)
+            .expect("generator body must produce a jitcode");
+        let opnames: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code)
+            .map(|op| op.opname)
+            .collect();
+        assert!(
+            opnames.contains(&"hint_force_virtualizable"),
+            "YIELD_VALUE must hint force_virtualizable, got {opnames:?}"
+        );
+        assert!(
+            opnames.contains(&"ref_return"),
+            "YIELD_VALUE must ref_return the yielded value, got {opnames:?}"
+        );
+        for &ypc in &yield_pcs {
+            assert!(
+                pyjit
+                    .metadata
+                    .abort_permanent_py_pc_by_jit_pc
+                    .iter()
+                    .all(|&(_, py)| py as usize != ypc),
+                "YIELD_VALUE pc {ypc} must not emit abort_permanent, markers={:?}",
+                pyjit.metadata.abort_permanent_py_pc_by_jit_pc
+            );
+        }
+        assert_eq!(
+            pyjit.metadata.resume_entry_by_py_pc.len(),
+            yield_pcs.len(),
+            "one resume prelude per yield, entries={:?} yield_pcs={yield_pcs:?}",
+            pyjit.metadata.resume_entry_by_py_pc
+        );
+        for &ypc in &yield_pcs {
+            let resume_pc = ypc + 1;
+            let entry = pyjit
+                .metadata
+                .resume_entry_by_py_pc
+                .iter()
+                .find(|&&(py, _)| py as usize == resume_pc);
+            let Some(&(_, off)) = entry else {
+                panic!(
+                    "missing resume entry for yield pc {ypc} -> {resume_pc}, entries={:?}",
+                    pyjit.metadata.resume_entry_by_py_pc
+                );
+            };
+            assert_eq!(
+                pyjit.first_op_offset(resume_pc),
+                Some(off as usize),
+                "first_op_offset({resume_pc}) must be the resume prelude"
             );
         }
     }
