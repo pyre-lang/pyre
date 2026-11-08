@@ -10195,10 +10195,28 @@ fn assembled_struct_quasi_descr_is_the_group_mutate_row(
     expected_field: DescrRef,
     expected_mutate: DescrRef,
 ) -> usize {
+    assembled_struct_quasi_descr_is_the_group_mutate_row_keys(
+        owner_leaf,
+        field_leaf,
+        mutate_leaf,
+        expected_field,
+        expected_mutate,
+        &["record_quasiimmut_field/rdd", "record_quasiimmut_field/idd"],
+    )
+}
+
+fn assembled_struct_quasi_descr_is_the_group_mutate_row_keys(
+    owner_leaf: &str,
+    field_leaf: &str,
+    mutate_leaf: &str,
+    expected_field: DescrRef,
+    expected_mutate: DescrRef,
+    keys: &[&str],
+) -> usize {
     let mut seen = 0usize;
     for jc in crate::jitcode_runtime::all_jitcodes() {
         for op in crate::jitcode_runtime::decoded_ops(&jc.code) {
-            if op.key != "record_quasiimmut_field/rdd" && op.key != "record_quasiimmut_field/idd" {
+            if !keys.iter().any(|k| op.key == *k) {
                 continue;
             }
             if op.pc + 6 > jc.code.len() {
@@ -10400,6 +10418,102 @@ fn assembled_classmethod_w_function_quasi_descr_is_the_group_mutate_row() {
     assert!(
         seen > 0,
         "translation must assemble at least one ClassMethod.w_function? /rdd with mutate_w_function"
+    );
+}
+
+#[test]
+fn assembled_ec_w_tracefunc_quasi_descr_is_the_group_mutate_row() {
+    // `executioncontext.py ExecutionContext._immutable_fields_` `w_tracefunc?`.
+    // The translated `gettrace` read is `jit.promote(self.w_tracefunc)`.
+    let expected_field = crate::descr::ec_w_tracefunc_descr();
+    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
+        .expect("ExecutionContext.w_tracefunc has mutate_w_tracefunc");
+    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
+        "ExecutionContext",
+        "w_tracefunc",
+        "mutate_w_tracefunc",
+        expected_field,
+        expected_mutate,
+    );
+    assert!(
+        seen > 0,
+        "translation must assemble at least one ExecutionContext.w_tracefunc? /rdd with mutate_w_tracefunc"
+    );
+}
+
+#[test]
+fn assembled_ec_profilefunc_quasi_descr_is_the_group_mutate_row() {
+    // `executioncontext.py ExecutionContext._immutable_fields_` `profilefunc?`.
+    let expected_field = crate::descr::ec_profilefunc_descr();
+    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
+        .expect("ExecutionContext.profilefunc has mutate_profilefunc");
+    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
+        "ExecutionContext",
+        "profilefunc",
+        "mutate_profilefunc",
+        expected_field,
+        expected_mutate,
+    );
+    assert!(
+        seen > 0,
+        "translation must assemble at least one ExecutionContext.profilefunc? /rdd with mutate_profilefunc"
+    );
+}
+
+#[test]
+fn assembled_gil_ready_quasi_descr_is_the_group_mutate_row() {
+    // `gil.py GILThreadLocals._immutable_fields_ = ['gil_ready?']`.
+    // The static is headerless, so a translated `gil_ready_word` field
+    // read assembles `record_quasiimmut_field` as `/idd` (int-banked
+    // raw place). `/rdd` would mean the assembler banked the static as
+    // a GC ref.
+    let expected_field = crate::descr::gil_ready_descr();
+    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
+        .expect("GilReadyState.gil_ready has mutate_gil_ready");
+    let rdd = assembled_struct_quasi_descr_is_the_group_mutate_row_keys(
+        "GilReadyState",
+        "gil_ready",
+        "mutate_gil_ready",
+        expected_field.clone(),
+        expected_mutate.clone(),
+        &["record_quasiimmut_field/rdd"],
+    );
+    assert_eq!(
+        rdd, 0,
+        "GilReadyState.gil_ready? must assemble as /idd (int-banked raw place), not /rdd"
+    );
+    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row_keys(
+        "GilReadyState",
+        "gil_ready",
+        "mutate_gil_ready",
+        expected_field,
+        expected_mutate,
+        &["record_quasiimmut_field/idd"],
+    );
+    assert!(
+        seen > 0,
+        "translation must assemble at least one GilReadyState.gil_ready? /idd with mutate_gil_ready"
+    );
+}
+
+#[test]
+fn assembled_pycode_w_globals_quasi_descr_is_the_group_mutate_row() {
+    // `pycode.py PyCode._immutable_fields_` `w_globals?`.
+    // `jtransform.py rewrite_op_getfield` emits `record_quasiimmut_field`
+    // with mutate_field `mutate_w_globals`.
+    let expected_field = crate::descr::pycode_w_globals_descr();
+    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
+        .expect("PyCode.w_globals has mutate_w_globals");
+    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
+        "PyCode",
+        "w_globals",
+        "mutate_w_globals",
+        expected_field,
+        expected_mutate,
+    );
+    assert!(
+        seen > 0,
+        "translation must assemble at least one PyCode.w_globals? /rdd with mutate_w_globals"
     );
 }
 
@@ -12278,6 +12392,43 @@ fn zip_two_tuple_next_null_guard_stays_inside_the_helper() {
             guard.pc
         );
     }
+}
+
+/// GNI `record_quasiimmut_field` in `gil_ready_word` under `w_list_lock`
+/// under `_orig_extend_from_tuple`: the live after `w_list_reserve_for_extend`
+/// is the numbered-helper resume pc. A reachable `abort/>r` in a nested
+/// grow helper (bytes/ascii `getsubstruct`) would collapse that guard.
+#[test]
+fn orig_extend_from_tuple_resume_after_reserve_is_runnable() {
+    let orig = crate::jitcode_runtime::pathed_jitcode(
+        "pyre_interpreter::type_methods::_orig_extend_from_tuple",
+    )
+    .expect("_orig_extend_from_tuple must be a discovered jitcode");
+    let idx = orig
+        .try_index()
+        .expect("_orig_extend_from_tuple must have a jitcode index");
+    let ops: Vec<_> = crate::jitcode_runtime::decoded_ops(&orig.code).collect();
+    // Second inline is `w_list_reserve_for_extend`; the live after it is
+    // the numbered helper's loop-head resume.
+    let reserve = ops
+        .iter()
+        .filter(|op| op.opname.starts_with("inline_call"))
+        .nth(1)
+        .expect("_orig_extend_from_tuple inlines w_tuple_len then reserve");
+    let live = ops
+        .iter()
+        .find(|op| op.opname == "live" && op.pc >= reserve.next_pc)
+        .map(|op| op.pc)
+        .unwrap_or(reserve.next_pc);
+    assert!(
+        !helper_resume_reaches_blocker(idx, live, None),
+        "_orig_extend_from_tuple live@{} after reserve@{} must stay numbered; ops={:?}",
+        live,
+        reserve.pc,
+        ops.iter()
+            .map(|o| format!("{}@{}", o.opname, o.pc))
+            .collect::<Vec<_>>(),
+    );
 }
 
 #[test]

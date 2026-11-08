@@ -1665,6 +1665,9 @@ fn analyze_pipeline_from_module_paths(
                 layout_pairs.as_deref(),
             );
         }
+        crate::annotator::classdesc::register_flattened_list_storage_leaves(
+            &program.struct_field_attrs,
+        );
     }
     mark_phase!("build_semantic_program_from_parsed_files");
     // A clause specialization is another graph of its generic funcobj

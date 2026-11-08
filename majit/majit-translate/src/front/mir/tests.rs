@@ -2911,6 +2911,61 @@ fn type_write_barrier_call_leaves_only_the_setfield() {
     );
 }
 
+/// `_orig_ll_list_int_resize_hint_really` is `list_write_barrier(obj)`
+/// then `ll_list_int_set_items`. The barrier call is dropped; the items
+/// store stays so the backend rewrite can put `COND_CALL_GC_WB` in front
+/// of that `setfield_gc`.
+#[test]
+fn orig_list_resize_drops_list_write_barrier() {
+    use crate::model::{CallTarget, OpKind};
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = crate::test_support::load_ullbc(path);
+    let graph = crate::test_support::with_shared_lowering(llbc, |context| {
+        let fd = llbc
+            .iter_local_fns()
+            .find(|fd| {
+                fd.item_meta
+                    .name_path()
+                    .ends_with("_orig_ll_list_int_resize_hint_really")
+            })
+            .or_else(|| {
+                llbc.iter_local_fns().find(|fd| {
+                    fd.item_meta
+                        .name_path()
+                        .ends_with("::ll_list_int_resize_hint_really")
+                })
+            })
+            .unwrap_or_else(|| panic!("ll_list_int_resize_hint_really in pyre-object LLBC"));
+        super::lower_fun_decl(context, fd)
+            .unwrap_or_else(|err| panic!("lower resize orig: {err:?}"))
+    });
+    assert!(
+        !calls_leaf(&graph, "list_write_barrier"),
+        "resize orig still calls list_write_barrier\n{}",
+        graph.dump()
+    );
+    let has_items_store =
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| match &op.kind {
+                OpKind::FieldWrite { field, .. } => field.name.contains("int_items"),
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments
+                    .last()
+                    .is_some_and(|s| s == "ll_list_int_set_items"),
+                _ => false,
+            });
+    assert!(
+        has_items_store,
+        "resize orig lost its items store\n{}",
+        graph.dump()
+    );
+}
+
 /// `write_cell`'s in-place `ObjectMutableCell` arm is
 /// `try_gc_write_barrier_prebuilt(cell); cell.w_value = w_value`. It does
 /// not call `try_gc_owns_object` itself. jtransform

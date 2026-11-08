@@ -1485,6 +1485,303 @@ fn harvested_int_ll_newlist_oopspec_becomes_new_array() {
     );
 }
 
+/// `gil.py GILThreadLocals.gil_ready` is a harvested `_alloc_flavor_ = raw`
+/// `static mut`. The Global emits an Address-stamped ConstRefAddr and
+/// `__cast_instance_intrinsic` onto the class root so getattr of
+/// `gil_ready` annotates; the instance pointer is int-kinded
+/// (`descr.py get_type_flag` of a raw Ptr).
+#[test]
+fn orig_gil_ready_word_static_is_int_banked_address() {
+    let llbc = object_llbc();
+    let harvested = majit_translate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+        std::slice::from_ref(llbc),
+    );
+    assert!(
+        harvested.iter().any(|s| s.contains("GilReadyState")),
+        "harvested flavor set must include GilReadyState, got {harvested:?}"
+    );
+    let graph = with_shared_lowering(llbc, |ctx| {
+        lower_fun_decl_with_static_addrs(
+            ctx,
+            fun_decl_named(llbc, "gil_ready_word"),
+            HostStaticAddrs {
+                refs: &[("gil_ready::GIL_READY_STATE", 0x1111)],
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("lower gil_ready_word: {e:?}"))
+    });
+    let mut const_ref = Vec::new();
+    let mut casts = 0usize;
+    let mut cast_kind = None;
+    for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+        match &op.kind {
+            OpKind::ConstRefAddr(addr) => {
+                let ct = op.result.as_ref().map(FunctionGraph::concretetype_of);
+                let ll = op.result.as_ref().and_then(|v| v.concretetype());
+                const_ref.push((*addr, ct, ll));
+            }
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                result_ty,
+                ..
+            } if segments.last().map(String::as_str) == Some("__cast_instance_intrinsic") => {
+                casts += 1;
+                cast_kind = Some((
+                    op.result.as_ref().map(FunctionGraph::concretetype_of),
+                    result_ty.clone(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        const_ref
+            .iter()
+            .map(|(addr, _, _)| *addr)
+            .collect::<Vec<_>>(),
+        vec![0x1111],
+        "gil_ready_word must load GIL_READY_STATE as ConstRefAddr: {const_ref:?} graph={graph:?}"
+    );
+    assert!(
+        const_ref.iter().any(|(_, ct, ll)| {
+            *ct == Some(majit_translate::ConcreteType::Signed)
+                && matches!(
+                    ll,
+                    Some(majit_translate::translator::rtyper::lltypesystem::lltype::LowLevelType::Address)
+                )
+        }),
+        "GIL_READY_STATE address word must be llmemory.Address, got {const_ref:?} graph={graph:?}"
+    );
+    assert_eq!(
+        casts, 1,
+        "raw-flavor STRUCT static wraps as the class instance: {graph:?}"
+    );
+    assert_eq!(
+        cast_kind,
+        Some((
+            Some(majit_translate::ConcreteType::Signed),
+            majit_translate::ValueType::Int
+        )),
+        "raw instance pointer is int-kinded: {graph:?}"
+    );
+}
+
+/// `jtransform.py rewrite_op_getfield` of `gil_ready?` is
+/// `-live-` + `record_quasiimmut_field` + `getfield_*_pure`. A residual
+/// Call of the static field would leave the sub-walk with a symbolic
+/// fnaddr (`get_jitcode_shell_falls_back_to_symbolic_fnaddr`).
+#[test]
+fn orig_gil_ready_word_transforms_to_quasiimmut_field_read() {
+    let llbc = object_llbc();
+    let ranks = majit_translate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
+        std::slice::from_ref(llbc),
+    );
+    assert!(
+        ranks.get("GilReadyState").is_some_and(|fields| {
+            fields
+                .iter()
+                .any(|(name, rank)| name == "gil_ready" && rank.is_quasi_immutable())
+        }),
+        "harvested _immutable_fields_ for GilReadyState: {:?}",
+        ranks.get("GilReadyState")
+    );
+    let flavors = majit_translate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+        std::slice::from_ref(llbc),
+    );
+    let graph = with_shared_lowering(llbc, |ctx| {
+        lower_fun_decl_with_static_addrs(
+            ctx,
+            fun_decl_named(llbc, "gil_ready_word"),
+            HostStaticAddrs {
+                refs: &[("gil_ready::GIL_READY_STATE", 0x1111)],
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("lower gil_ready_word: {e:?}"))
+    });
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "gil_ready"
+            )),
+        "gil_ready_word front graph must FieldRead gil_ready: {graph:?}"
+    );
+    let mut cc = CallControl::new();
+    cc.immutable_fields_by_struct = ranks;
+    cc.raw_alloc_flavor_structs = flavors;
+    let out = Transformer::new(&GraphTransformConfig::default())
+        .with_callcontrol(&mut cc)
+        .transform(&graph);
+    let kinds: Vec<String> = out
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .map(|op| match &op.kind {
+            OpKind::RecordQuasiImmutField {
+                field,
+                mutate_field,
+                ..
+            } => {
+                format!("RecordQuasiImmutField:{}:{}", field.name, mutate_field.name)
+            }
+            OpKind::FieldRead { field, pure, .. } => {
+                format!("FieldRead:{}:pure={pure}", field.name)
+            }
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => format!("Call:{}", segments.join("::")),
+            OpKind::CallResidual { .. } => "CallResidual".to_string(),
+            OpKind::ConstRefAddr(_) => "ConstRefAddr".to_string(),
+            OpKind::Live { .. } => "Live".to_string(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert!(
+        kinds
+            .iter()
+            .any(|k| k == "RecordQuasiImmutField:gil_ready:mutate_gil_ready"),
+        "rewrite_op_getfield must emit record_quasiimmut_field for gil_ready?: {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|k| k == "FieldRead:gil_ready:pure=true"),
+        "quasi-immut gil_ready read must be getfield_*_pure: {kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|k| k.starts_with("CallResidual")
+            || (k.starts_with("Call:") && !k.contains("__cast_instance_intrinsic"))),
+        "gil_ready_word must not residualize the static field read: {kinds:?}"
+    );
+}
+
+/// `_orig_ll_list_int_resize_hint_really` is the look_inside body the
+/// LIST_EXTEND unroll walks. Its `int_ll_newlist` must become `new_array`
+/// the same way `ll_listslice_new_int_list` does; a residual call aborts
+/// the helper subwalk at that pc.
+#[test]
+fn orig_ll_list_int_resize_hint_really_newlist_becomes_new_array() {
+    let llbc = object_llbc();
+    let hints =
+        majit_translate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc));
+    let harvested: Vec<(String, Vec<String>)> = hints
+        .iter()
+        .filter(|(k, _)| k.contains("int_ll_newlist") || k.contains("ll_list_int_resize_hint"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let graph = lower_named(llbc, "_orig_ll_list_int_resize_hint_really");
+    let mut call_shapes = Vec::new();
+    let mut cc = CallControl::new();
+    for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            result_ty,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.last().is_some_and(|s| s == "int_ll_newlist") {
+            let ct = op
+                .result
+                .as_ref()
+                .and_then(|v| v.concretetype())
+                .map(|t| format!("{t:?}"));
+            call_shapes.push((segments.join("::"), format!("{result_ty:?}"), ct));
+            cc.mark_oopspec(
+                CallPath::from_segments(segments.iter().map(String::as_str)),
+                "newlist(length)".to_string(),
+            );
+        }
+    }
+    let config = GraphTransformConfig::default();
+    let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+    let out = transformer.transform(&graph);
+    let kinds: Vec<String> = out
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::NewArray { .. } => Some("NewArray".to_string()),
+            OpKind::NewArrayClear { .. } => Some("NewArrayClear".to_string()),
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => Some(format!(
+                "Call:{}",
+                segments.last().cloned().unwrap_or_default()
+            )),
+            OpKind::CallResidual { .. } => Some("CallResidual".to_string()),
+            _ => None,
+        })
+        .collect();
+    let new_arrays = kinds.iter().filter(|k| *k == "NewArray").count();
+    assert!(
+        new_arrays > 0,
+        "int_ll_newlist in _orig_ll_list_int_resize_hint_really must become NewArray, \
+         harvested={harvested:?} call_shapes={call_shapes:?} ops={kinds:?} notes={:?}",
+        out.notes
+    );
+    assert_eq!(
+        calls_to(&out.graph, "int_ll_newlist"),
+        0,
+        "int_ll_newlist must not remain a residual call after newlist(length) rewrite; \
+         harvested={harvested:?} call_shapes={call_shapes:?}"
+    );
+    assert_eq!(
+        calls_to(&out.graph, "list_write_barrier"),
+        0,
+        "list_write_barrier must not remain a residual; the items setfield \
+         takes COND_CALL_GC_WB from rewrite.py; \
+         harvested={harvested:?} call_shapes={call_shapes:?} ops={kinds:?}"
+    );
+
+    // Dual-gate Skip kind-collapses the result to OBJECTPTR. The Call's
+    // result_ty still names TypedItemsBlock; recover the ARRAY from that
+    // spelling, the way `newlist_clear` recovers FixedObjectArray.
+    let collapsed = lower_named(llbc, "_orig_ll_list_int_resize_hint_really");
+    let mut cc = CallControl::new();
+    for op in collapsed.blocks.iter().flat_map(|b| &b.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.last().is_some_and(|s| s == "int_ll_newlist") {
+            cc.mark_oopspec(
+                CallPath::from_segments(segments.iter().map(String::as_str)),
+                "newlist(length)".to_string(),
+            );
+            if let Some(result) = &op.result {
+                result.set_concretetype(None);
+            }
+        }
+    }
+    let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+    let out = transformer.transform(&collapsed);
+    let collapsed_new_arrays = out
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter(|op| matches!(op.kind, OpKind::NewArray { .. }))
+        .count();
+    assert!(
+        collapsed_new_arrays > 0,
+        "kind-collapsed TypedItemsBlock result must still become NewArray, \
+         call_shapes={call_shapes:?} notes={:?}",
+        out.notes
+    );
+}
+
 /// `from_storage_and_strategy` is `instantiate` plus field stores.
 /// `w_list_adopt_int_items` is that cluster: `malloc_typed_managed` fuses
 /// to `NewWithVtable`, and the live Integer storage is the oopspec

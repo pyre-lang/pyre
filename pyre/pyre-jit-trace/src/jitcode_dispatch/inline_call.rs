@@ -8932,8 +8932,8 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
     }
     if let Some(w_type) = type_call_class {
         // Pin the class and the type-dict version the `__new__` / `__init__`
-        // lookups resolved against, then each argument's class: the wrapper
-        // this call dispatches to is a constant of the pinned class.
+        // lookups resolved against: the wrapper this call dispatches to is a
+        // constant of the pinned class.
         let type_const = ctx.trace_ctx.const_ref(w_type as i64);
         walker_emit_fold_guard_with_snapshot(
             ctx,
@@ -8945,17 +8945,28 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
             .heap_cache_mut()
             .replace_box(r_args[0], type_const);
         walker_pin_type_version_tag(ctx, op.pc, type_const)?;
-        for (&arg, (concrete, pin)) in r_args[2..]
-            .iter()
-            .zip(arg_concretes[2..].iter().zip(&arg_pins[2..]))
-        {
-            let ConcreteValue::Ref(concrete) = *concrete else {
-                unreachable!("resolve_type_call_builtin_new admits ref arguments only")
-            };
-            let concrete = pinned_obj(pin, concrete);
-            let w_class =
-                unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete) };
-            walker_guard_exception_attr_slot(ctx, op.pc, arg, concrete, w_class)?;
+        // typeobject.py `W_TypeObject.descr_call`: `promote(self)` then
+        // `space.call_obj_args(w_newfunc, self, __args__)`. Constructor
+        // arguments are not getclass'd. `resolve_type_call_builtin_new`
+        // reads each argument's class only to decline a heaptype when
+        // `__init__` is `object.__init__` (a conversion dunder on `__new__`
+        // may change the result type). A builtin `__init__` (`list(x)`)
+        // does not use that fact, so a GuardValue on a unique mapdict map
+        // (`class E` per call in `list_length_hint_validate`) is extra.
+        if type_call_init.is_none() {
+            for (&arg, (concrete, pin)) in r_args[2..]
+                .iter()
+                .zip(arg_concretes[2..].iter().zip(&arg_pins[2..]))
+            {
+                let ConcreteValue::Ref(concrete) = *concrete else {
+                    unreachable!("resolve_type_call_builtin_new admits ref arguments only")
+                };
+                let concrete = pinned_obj(pin, concrete);
+                let w_class = unsafe {
+                    pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete)
+                };
+                walker_guard_exception_attr_slot(ctx, op.pc, arg, concrete, w_class)?;
+            }
         }
         callable_guard_op = ctx.trace_ctx.const_ref(live_callable() as i64);
         receiver_op = Some(type_const);
@@ -22200,31 +22211,42 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
             // are undone by the cut and do not block.  The abort
             // propagates and the caller's own decline decides
             // (`aborted_tracing`).
+            if fbw_inline_diag_enabled() {
+                let abort_pc = error.stop_pc();
+                let symbolic = match &error {
+                    DispatchError::OrthodoxSubWalkTraceUnsupported { symbolic, .. } => {
+                        *symbolic as u64
+                    }
+                    _ => 0,
+                };
+                let name = sub_body
+                    .jitcode_index
+                    .and_then(crate::jitcode_runtime::get_jitcode_ref_by_index)
+                    .or_else(|| crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index))
+                    .map(|jc| jc.name.as_str())
+                    .unwrap_or("<missing>");
+                let disp = if rewind.nothing_unrewindable_applied() {
+                    "rollback"
+                } else {
+                    "propagate"
+                };
+                eprintln!(
+                    "[subwalk-abort] name={} jc={:?} sub_index={} pc={} abort_pc={} \
+                     err={} symbolic={:#x} disp={disp} effects={}/{} unjournaled={}/{}",
+                    name,
+                    sub_body.jitcode_index,
+                    sub_index,
+                    pc,
+                    abort_pc,
+                    error.variant_name(),
+                    symbolic,
+                    rewind.effects_before,
+                    fbw_executed_effect_count(),
+                    rewind.unjournaled_before,
+                    fbw_has_unjournaled_effect(),
+                );
+            }
             if !rewind.nothing_unrewindable_applied() {
-                if fbw_inline_diag_enabled() {
-                    let abort_pc = error.stop_pc();
-                    let symbolic = match &error {
-                        DispatchError::OrthodoxSubWalkTraceUnsupported { symbolic, .. } => {
-                            *symbolic as u64
-                        }
-                        _ => 0,
-                    };
-                    let name = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
-                        .map(|jc| jc.name.as_str())
-                        .unwrap_or("<missing>");
-                    eprintln!(
-                        "[subwalk-abort] name={} pc={} abort_pc={} symbolic={:#x} \
-                         disp=propagate effects={}/{} unjournaled={}/{}",
-                        name,
-                        pc,
-                        abort_pc,
-                        symbolic,
-                        rewind.effects_before,
-                        fbw_executed_effect_count(),
-                        rewind.unjournaled_before,
-                        fbw_has_unjournaled_effect(),
-                    );
-                }
                 return Err(error);
             }
             cut_declined_subwalk(ctx, pre_fold_pos);

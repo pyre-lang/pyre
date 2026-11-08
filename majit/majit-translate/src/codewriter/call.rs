@@ -15258,36 +15258,48 @@ pub fn effectinfo_from_writeanalyze(
             }
         }
     }
-    // `rgc.ll_arraycopy` writeanalyze sees one `setarrayitem` ARRAY.
-    // A residual `OS_ARRAYCOPY` helper has no graph, so recover that
-    // ARRAY from `extradescrs` (`do_fixed_list_ll_arraycopy` already
-    // holds it) and put it in `_write_descrs_arrays` so
-    // `single_write_descr_array` is set (`effectinfo.py`).
+    // `rgc.ll_arraycopy` writeanalyze sees one dest `setarrayitem`
+    // (`copy_item` when `length <= 1`, the head that exists so
+    // `effectinfo.write_descrs_arrays` is that ARRAY). Heapcache then
+    // sets `single_write_descr_array` (`effectinfo.py`) and
+    // `_clear_caches_arraycopy` keeps `quasiimmut_seen`.
     //
-    // No dest ARRAY (`extradescrs` None) is unanalyzable: upstream
-    // `GraphAnalyzer.analyze` returns `WriteAnalyzer.top_result`
-    // (`top_set` in `writeanalyze.py`) when the funcobj has no graph.
-    // `effectinfo_from_writeanalyze` maps `top_set` to
-    // `EF_RANDOM_EFFECTS` (None descr lists), never "writes no array".
-    if array_write_descrs.is_empty() && oopspecindex == OopSpecIndex::Arraycopy {
+    // The residual helper `jit_ll_arraycopy` still has a graph
+    // (`pin_root`, memcpy). Writeanalyze of that body can name extra
+    // ARRAYs that are not dest[di] = source[si]. `do_fixed_list_ll_arraycopy`
+    // already holds dest in `extradescrs`; that ARRAY is the
+    // writeanalyze result of `copy_item`. Replace the write-array set
+    // with it so `single_write_descr_array` is dest.
+    //
+    // No dest ARRAY (`extradescrs` None) and no writeanalyze ARRAY is
+    // unanalyzable: upstream `GraphAnalyzer.analyze` returns
+    // `WriteAnalyzer.top_result` (`top_set` in `writeanalyze.py`) when
+    // the funcobj has no graph. `effectinfo_from_writeanalyze` maps
+    // `top_set` to `EF_RANDOM_EFFECTS` (None descr lists), never
+    // "writes no array".
+    if oopspecindex == OopSpecIndex::Arraycopy {
         match extradescrs.as_ref() {
             Some(extra) => {
-                for d in extra {
-                    if let Some(ad) = d.as_array_descr() {
+                let dest: Vec<(DescrRef, u64)> = extra
+                    .iter()
+                    .filter_map(|d| d.as_array_descr().map(|ad| (d.clone(), ad.cache_key())))
+                    .collect();
+                if !dest.is_empty() {
+                    write_descrs_arrays.clear();
+                    array_write_descrs.clear();
+                    for (d, array_id) in dest {
                         let ei = d.get_ei_index();
                         if ei != u32::MAX {
                             write_descrs_arrays.push(ei);
                         }
                         array_write_descrs.push((
-                            d.clone(),
-                            Some(majit_ir::effectinfo::DescrSetMember::Array {
-                                array_id: ad.cache_key(),
-                            }),
+                            d,
+                            Some(majit_ir::effectinfo::DescrSetMember::Array { array_id }),
                         ));
                     }
                 }
             }
-            None => {
+            None if array_write_descrs.is_empty() => {
                 return effectinfo_random_effects(
                     oopspecindex,
                     extradescrs.clone(),
@@ -15295,6 +15307,7 @@ pub fn effectinfo_from_writeanalyze(
                     call_release_gil_target,
                 );
             }
+            None => {}
         }
     }
     // Sort + dedupe the index lists so the bitstrings match PyPy's
@@ -32990,6 +33003,64 @@ mod tests {
                 .is_some_and(|v| !v.is_empty()),
             "extraef still records the array write, got {ei:?}"
         );
+    }
+
+    /// `rgc.ll_arraycopy` writeanalyze names dest only (`copy_item`). Extra
+    /// ARRAY writes from the residual helper body must not leave
+    /// `single_write_descr_array` unset: heapcache `_clear_caches_arraycopy`
+    /// then `reset_keep_likely_virtuals`.
+    #[test]
+    fn os_arraycopy_dest_extradescr_wins_over_extra_writeanalyze_arrays() {
+        let cc = CallControl::new();
+        let dest = cc.arraydescrof_for_type(
+            &ValueType::Int,
+            &Some("dest_items".to_string()),
+            Type::Int,
+            Some(0),
+        );
+        let mut effects = ReadWriteEffects::Set(Default::default());
+        effects.insert(
+            RwKey::dump_array(RwTag::Array, 1),
+            RwOperand::Array {
+                array: None,
+                array_type_id: Some("dest_items".to_string()),
+                ir_type: Type::Int,
+                len_offset: Some(0),
+                consider: true,
+            },
+        );
+        effects.insert(
+            RwKey::dump_array(RwTag::Array, 2),
+            RwOperand::Array {
+                array: None,
+                array_type_id: Some("pin_root_stack".to_string()),
+                ir_type: Type::Ref,
+                len_offset: Some(0),
+                consider: true,
+            },
+        );
+        let ei = effectinfo_from_writeanalyze(
+            &effects,
+            ExtraEffect::CannotRaise,
+            OopSpecIndex::Arraycopy,
+            false,
+            true,
+            Some(vec![dest.clone()]),
+            "jit_ll_arraycopy",
+            &cc,
+            EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+        );
+        assert_eq!(ei.extraeffect, ExtraEffect::CannotRaise);
+        assert_eq!(ei.oopspecindex, OopSpecIndex::Arraycopy);
+        let single = ei
+            .single_write_descr_array
+            .as_ref()
+            .expect("dest ARRAY is single_write_descr_array");
+        assert_eq!(
+            single.as_array_descr().map(|ad| ad.cache_key()),
+            dest.as_array_descr().map(|ad| ad.cache_key()),
+        );
+        assert_eq!(ei._write_descrs_arrays.as_ref().map(|v| v.len()), Some(1));
     }
 
     /// `writeanalyze.py` `_get_effect_for_offset` keys an ArrayItemsOffset

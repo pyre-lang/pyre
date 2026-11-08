@@ -2679,6 +2679,18 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::opcode_ops::list_extend_value",
         crate::opcode_ops::jit_opcode_ops_list_extend_value,
     );
+    // `list_extend_items` inlines `extend_from_tuple`. The look_inside_iff
+    // wrapper residual-calls `<name>_trampoline` when the predicate is
+    // false; a symbolic trampoline poisons `fully_bound_callee_body` of
+    // `list_extend_value` and LIST_EXTEND stays a MayForce residual.
+    // Bind the word-ABI adapter (`getfunctionptr` of the trampoline),
+    // same as `ll_list_*_resize_hint_really_trampoline`.
+    cpa2!(
+        &mut entries,
+        "pyre_interpreter::type_methods::extend_from_tuple_trampoline",
+        "pyre_interpreter::extend_from_tuple_trampoline",
+        crate::type_methods::__majit_call_target_extend_from_tuple_trampoline,
+    );
     // SET_ADD's void `inline_call_r_v` (`flatten.rs inline_call_targets`).
     // The graph is `set_add_value`; this bridge is the one-word address
     // blackhole calls.

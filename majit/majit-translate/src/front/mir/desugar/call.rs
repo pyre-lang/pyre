@@ -3474,7 +3474,8 @@ impl<'a> Lowering<'a> {
                     }
                 }
                 // Source-level write-barrier helpers guard the `setfield` the
-                // caller performs next (`type_write_barrier`).
+                // caller performs next (`type_write_barrier`,
+                // `list_write_barrier` before `l.items = newitems`).
                 // Jitcode is produced before the GC transform, so it carries
                 // no barrier: the backend rewrite inserts `COND_CALL_GC_WB`
                 // in front of that `setfield_gc` (`handle_write_barrier_setfield`).

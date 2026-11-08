@@ -688,7 +688,8 @@ fn const_ref_addr_define_hlvalue(addr: i64, result: &Variable) -> Hlvalue {
             LowLevelType::Void,
         ))
     } else if matches!(result.concretetype(), Some(LowLevelType::Address)) {
-        // A `FnPtrCell` / `OnceLock<fn>` static is a raw host address
+        // A `FnPtrCell` / `OnceLock<fn>` static, or a harvested
+        // `_alloc_flavor_ = "raw"` static, is a raw host address
         // (`llmemory.Address`), not a GCREF singleton. `raw_load`
         // keeps an int-kinded addr (`inputarg_llop_intkind_or_signed`).
         use crate::translator::rtyper::lltypesystem::lltype::_address;

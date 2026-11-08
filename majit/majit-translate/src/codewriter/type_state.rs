@@ -1286,6 +1286,12 @@ pub(crate) fn field_owner_is_gc(
     if let Some((is_gc, _)) = cc.struct_storage_for(owner) {
         return is_gc;
     }
+    // `rclass.py getgcflavor` / `classdesc.py ClassDesc.get_param('_alloc_flavor_')`.
+    // Harvested `"raw"` is the declared gckind and wins over a field-shape
+    // `owner_declared_gc` that walked a host pointer field as GC.
+    if crate::front::llbc_hints::alloc_flavor_raw_contains(&cc.raw_alloc_flavor_structs, owner) {
+        return false;
+    }
     if let Some(declared_gc) = field.owner_declared_gc {
         return declared_gc;
     }
@@ -2182,6 +2188,18 @@ mod tests {
         assert!(
             field_owner_is_gc(&unnamed, None),
             "a descriptor with no owner_root is treated as GC"
+        );
+    }
+
+    #[test]
+    fn field_owner_is_gc_harvested_raw_flavor_wins_over_declared_gc() {
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs.insert("FlavorRaw".to_string());
+        let field =
+            FieldDescriptor::new("x", Some("FlavorRaw".into())).with_owner_declared_gc(Some(true));
+        assert!(
+            !field_owner_is_gc(&field, Some(&cc)),
+            "classdesc _alloc_flavor_ = raw is the declared gckind"
         );
     }
 

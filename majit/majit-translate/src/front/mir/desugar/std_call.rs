@@ -2,6 +2,16 @@
 
 use super::*;
 
+/// Name paths `is_source_write_barrier_call` erases. Jitcode is produced
+/// before the GC transform, so these calls do not survive: the backend
+/// rewrite inserts `COND_CALL_GC_WB` in front of the following
+/// `setfield_gc`.
+fn is_source_write_barrier_name_path(path: &str) -> bool {
+    let leaf = path.rsplit("::").next().unwrap_or(path);
+    let leaf = leaf.strip_prefix("__majit_call_target_").unwrap_or(leaf);
+    leaf == "type_write_barrier" || leaf == "list_write_barrier"
+}
+
 /// Static class of a local an atomic `load` / `store` arm cares about
 /// (`rptr.py InteriorPtrRepr`). Indexed by MIR local.
 #[derive(Clone, Debug)]
@@ -556,14 +566,16 @@ impl<'a> Lowering<'a> {
     }
 
     /// Source-level write-barrier helpers in front of a following `setfield`.
-    /// `typeobject::type_write_barrier` for `W_TypeObject` fields.
+    /// `typeobject::type_write_barrier` for `W_TypeObject` fields;
+    /// `listobject::list_write_barrier` for `W_ListObject` item-block stores
+    /// (`_ll_list_resize_hint_really` `l.items = newitems`).
     pub(in crate::front::mir) fn is_source_write_barrier_call(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
-        self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            fd.item_meta.name_path_str() == "pyre_object::typeobject::type_write_barrier"
-        })
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| is_source_write_barrier_name_path(fd.item_meta.name_path_str()))
     }
 
     /// Address-taken `[T; N]` field whose result is `var`.

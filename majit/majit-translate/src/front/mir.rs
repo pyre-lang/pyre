@@ -5225,6 +5225,27 @@ pub(crate) fn type_spelling_is_fixed_object_array(spelling: &str) -> bool {
     bare.rsplit("::").next().unwrap_or(bare) == "FixedObjectArray"
 }
 
+/// Physical `GcArray(Signed|Float)` owner (`TypedItemsBlock`). A rust helper
+/// returning `*mut TypedItemsBlock` may kind-collapse the Variable to
+/// OBJECTPTR while the Call's `result_ty` still names that block.
+pub(crate) fn type_spelling_is_typed_items_block(spelling: &str) -> bool {
+    let normalized = peel_ref_prefix(spelling);
+    let mut bare = normalized;
+    loop {
+        let next = bare
+            .strip_prefix("*const ")
+            .or_else(|| bare.strip_prefix("*mut "))
+            .or_else(|| bare.strip_prefix("&mut "))
+            .or_else(|| bare.strip_prefix('&'))
+            .map(str::trim_start);
+        match next {
+            Some(rest) if rest != bare => bare = rest,
+            _ => break,
+        }
+    }
+    bare.rsplit("::").next().unwrap_or(bare) == "TypedItemsBlock"
+}
+
 /// Derive whole-program type-metadata fields of `SemanticProgram` from
 /// Charon's `type_decls` + `trait_decls` tables.
 ///

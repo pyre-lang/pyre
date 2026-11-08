@@ -2298,7 +2298,10 @@ pub(in crate::front::mir) fn one_word_pointer_bank_pointee<'l>(
 /// `None` when `ty` is not a struct or enum. A `GcType` seed is Gc. An owner
 /// the raw-address classifier rejects (exception carrier, a GC-pointer field)
 /// stays a GC base: the pointer bank already kept it as `Ref`. Only an owner
-/// [`declared_raw_adt_node`] accepts is Raw.
+/// [`declared_raw_adt_node`] accepts is Raw, plus an owner whose harvested
+/// `_alloc_flavor_` is `"raw"` (`rclass.py getgcflavor`): that classdesc
+/// fact is the gckind even when a field of the STRUCT would fail the
+/// storage-raw walk.
 pub(in crate::front::mir) fn container_declared_gc(
     ty: &TyRef,
     llbc: &Llbc,
@@ -2315,14 +2318,10 @@ pub(in crate::front::mir) fn container_declared_gc(
     // determines STRUCT._gckind even when the struct contains GC-shaped
     // fields. Use the same declaration as the argument/calldescr classifier;
     // jtransform.py rewrite_op_getfield must not promote its Int base to Ref.
-    if adt_node_def_id(pointee)
-        .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| {
-            crate::front::llbc_hints::alloc_flavor_raw_contains(
-                raw_alloc_flavor_structs,
-                td.item_meta.name_path_str(),
-            )
-        })
+    // `static mut` places are often `*mut STRUCT`; check the unpeeled node
+    // as well as the one-level pointee.
+    if flavor_raw_adt_node(pointee, llbc, raw_alloc_flavor_structs)
+        || flavor_raw_adt_node(node, llbc, raw_alloc_flavor_structs)
     {
         return Some(false);
     }
@@ -7735,6 +7734,28 @@ pub(in crate::front::mir) fn tyref_is_fnptrcell(ty: &TyRef, llbc: &Llbc) -> bool
 pub(in crate::front::mir) fn tyref_is_oncelock(ty: &TyRef, llbc: &Llbc) -> bool {
     adt_path_of_tyref(ty, llbc)
         .is_some_and(|p| path_ends_with_segments(&p, "sync::once_lock::OnceLock"))
+}
+
+/// Harvested `_alloc_flavor_ = "raw"` ADT (`rclass.py getgcflavor` /
+/// `classdesc.py ClassDesc.get_param`). A static of that STRUCT is a
+/// raw host instance (`bookkeeper.immutablevalue`), not a GC object.
+///
+/// `static mut` places are often `*mut STRUCT` (`&raw const`); peel one
+/// `Ref` / `RawPtr` so the harvest still matches.
+pub(in crate::front::mir) fn tyref_is_raw_alloc_flavor(
+    ty: &TyRef,
+    llbc: &Llbc,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    if flavor_raw_adt_node(node, llbc, raw_alloc_flavor_structs) {
+        return true;
+    }
+    one_level_pointer_pointee(node, llbc)
+        .and_then(|p| strip_ty_indirections(p, llbc))
+        .is_some_and(|p| flavor_raw_adt_node(p, llbc, raw_alloc_flavor_structs))
 }
 
 /// `std::sync::OnceLock<F>` (or `core::sync::once_lock::OnceLock<F>`)

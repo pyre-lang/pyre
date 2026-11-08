@@ -3410,7 +3410,18 @@ fn lltype_cast_pointer(
         match arg_at(args_s, 1, "lltype_cast_pointer") {
             SomeValue::Ptr(s_p) => {
                 if let Err(msg) = castable(ptr_ty.as_ref(), &s_p.ll_ptrtype) {
-                    return Err(AnnotatorError::new(msg));
+                    // `castable` is Struct-to-Struct (`lltype.py`). A raw
+                    // interned node (`MapRef` / `_NONGCREF`) overlay onto a
+                    // prefix Struct (`MapNodeTerminatorView`) is Opaque →
+                    // typed with the same `_gckind` — `cast_opaque_ptr`.
+                    // `emit_dest_overlay_cast` still spells that recast as
+                    // `cast_pointer`.
+                    let dest_struct = matches!(ptr_ty.TO, PtrTarget::Struct(_));
+                    let src_opaque = matches!(s_p.ll_ptrtype.TO, PtrTarget::Opaque(_));
+                    let same_gc = s_p.ll_ptrtype._gckind() == ptr_ty._gckind();
+                    if !(dest_struct && src_opaque && same_gc) {
+                        return Err(AnnotatorError::new(msg));
+                    }
                 }
             }
             // Overlay dest recasts a GC object (`SomeInstance`) onto a
@@ -5518,6 +5529,37 @@ mod tests {
             crate::model::ConcreteType::Signed,
             "raw overlay Ptr kinds as Signed"
         );
+    }
+
+    #[test]
+    fn lltype_cast_pointer_nongcref_onto_raw_overlay_struct() {
+        // Overlay dest recasts `_NONGCREF` (`MapRef` after getattr
+        // `terminator`) onto `Ptr(Struct MapNodeTerminatorView)`.
+        // `castable` is Struct-to-Struct; Opaque → typed, same `_gckind`,
+        // is `cast_opaque_ptr`.
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            GCREF, GcKind, LowLevelType, NONGCREF, Ptr, SomePtr, Struct,
+        };
+
+        let overlay = Struct::registry_fields(
+            "MapNodeTerminatorView",
+            vec![
+                ("_discriminant".into(), LowLevelType::Signed),
+                ("terminator".into(), LowLevelType::Signed),
+                ("w_cls".into(), (*GCREF).clone()),
+            ],
+            GcKind::Raw,
+        );
+        let ptr = Ptr::from_container_type(LowLevelType::Struct(Box::new(overlay)))
+            .expect("overlay Struct yields a Ptr");
+        let s_ptrt = const_lltype(LowLevelType::Ptr(Box::new(ptr.clone())));
+        let s_p = SomeValue::Ptr(SomePtr::new((*NONGCREF).clone()));
+        let out = lltype_cast_pointer(&bk(), &[Some(s_ptrt), Some(s_p)], &no_kwds())
+            .expect("NONGCREF overlay onto raw Struct");
+        let SomeValue::Ptr(out_ptr) = &out else {
+            panic!("expected SomePtr, got {out:?}");
+        };
+        assert_eq!(out_ptr.ll_ptrtype, ptr);
     }
 
     #[test]

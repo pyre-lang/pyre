@@ -8629,7 +8629,8 @@ impl<'a> Lowering<'a> {
                 // A `FnPtrCell<F>` static (`global_hook!`) or a
                 // `OnceLock<T>` static (`oncelock_fn_static!`,
                 // `define_prebuilt_dict_strategy_ref`) is a prebuilt
-                // constant (`bookkeeper.py Bookkeeper.immutablevalue`).
+                // constant (`bookkeeper.py Bookkeeper.immutablevalue` /
+                // `llmemory.Address`).
                 // The cell is not a class instance: wrapping it in
                 // `__cast_instance_intrinsic` would mint
                 // `SomeInstance(OnceLock)` and drop the subsequent
@@ -8660,6 +8661,45 @@ impl<'a> Lowering<'a> {
                         kind: op,
                     });
                     return Ok(res);
+                }
+                // A harvested `_alloc_flavor_ = "raw"` STRUCT static
+                // (`rclass.py getgcflavor`) is a prebuilt raw instance
+                // (`bookkeeper.immutablevalue`). The address word is
+                // `llmemory.Address`; `__cast_instance_intrinsic` onto
+                // the class root makes getattr of named fields annotate
+                // (`llmemory.SomeAddress.getattr` only accepts
+                // `signed`/`char`/… access types). `descr.py
+                // get_type_flag` of a raw `Ptr` is `FLAG_UNSIGNED`, so
+                // the instance pointer is int-kinded.
+                if tyref_is_raw_alloc_flavor(&place_ty, self.llbc, &self.raw_alloc_flavor_structs)
+                    && let Some(op @ OpKind::ConstRefAddr(_)) = self.static_addr_op(&segments)
+                {
+                    let bb_id = self.emit_bb(mir_bb);
+                    let raw = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+                    raw.set_concretetype(Some(
+                        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Address,
+                    ));
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(raw.clone()),
+                        kind: op,
+                    });
+                    if let Some(root) = self.raw_flavor_static_struct_root(&place_ty) {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: crate::model::cast_instance_call_result(
+                                root,
+                                raw,
+                                crate::model::ValueType::Int,
+                            ),
+                        });
+                        return Ok(res);
+                    }
+                    return Ok(raw);
                 }
                 // Bookkeeper.immutablevalue annotates a prebuilt instance
                 // with its class regardless of whether that class has fields.
@@ -10202,8 +10242,50 @@ impl<'a> Lowering<'a> {
         if path_ends_with_segments(&path, "sync::once_lock::OnceLock") {
             return None;
         }
+        // `rclass.py getgcflavor` of `_alloc_flavor_ = "raw"` is a raw
+        // STRUCT address, not a GC `SomeInstance`. Wrapping it here
+        // would bank `gil.py GILThreadLocals.gil_ready` as a GCREF.
+        if crate::front::llbc_hints::alloc_flavor_raw_contains(
+            &self.raw_alloc_flavor_structs,
+            &path,
+        ) {
+            return None;
+        }
         match &td.kind {
             TypeDeclKind::Struct(_) => Some(strip_crate_prefix(&path)),
+            _ => None,
+        }
+    }
+
+    /// Class root of a harvested `_alloc_flavor_ = "raw"` STRUCT static
+    /// (`rclass.py getgcflavor` / `bookkeeper.immutablevalue`). A
+    /// `static mut` place is often `*mut STRUCT`; peel one pointer like
+    /// [`tyref_is_raw_alloc_flavor`].
+    pub(in crate::front::mir) fn raw_flavor_static_struct_root(
+        &self,
+        ty: &TyRef,
+    ) -> Option<String> {
+        if !tyref_is_raw_alloc_flavor(ty, self.llbc, &self.raw_alloc_flavor_structs) {
+            return None;
+        }
+        let node = tyref_node(ty, self.llbc).and_then(|n| strip_ty_indirections(n, self.llbc))?;
+        let adt = if flavor_raw_adt_node(node, self.llbc, &self.raw_alloc_flavor_structs) {
+            node
+        } else {
+            let p = one_level_pointer_pointee(node, self.llbc)?;
+            let p = strip_ty_indirections(p, self.llbc)?;
+            if !flavor_raw_adt_node(p, self.llbc, &self.raw_alloc_flavor_structs) {
+                return None;
+            }
+            p
+        };
+        let def_id = adt_node_def_id(adt)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        if td.published_struct_copy {
+            return None;
+        }
+        match &td.kind {
+            TypeDeclKind::Struct(_) => Some(strip_crate_prefix(&td.item_meta.name_path())),
             _ => None,
         }
     }

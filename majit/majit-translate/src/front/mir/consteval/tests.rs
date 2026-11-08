@@ -2050,6 +2050,135 @@ fn fnptrcell_struct_global_does_not_cast_instance() {
     );
 }
 
+fn raw_flavor_struct_global_llbc() -> majit_charon_reader::Llbc {
+    let cell_ty = serde_json::json!({
+        "Adt": {"id": 0, "generics": empty_generics()}
+    });
+    let type_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta_json(&["fixture", "RawFlavorStruct"], "", true),
+        "kind": {"Struct": [{
+            "name": "word",
+            "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+            "attr_info": null
+        }]}
+    });
+    let funs = vec![serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta_json(&["fixture", "read_cell"], "", true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": cell_ty},
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": cell_ty}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": cell_ty},
+                        {"Use": [{"Read": {
+                            "kind": {"Global": {"generics": empty_generics(), "id": 1}},
+                            "ty": cell_ty
+                        }}, "No"]}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }}
+    })];
+    let globals = vec![
+        serde_json::Value::Null,
+        serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["fixture", "CELL"], "", true),
+            "global_kind": "Static",
+            "ty": cell_ty
+        }),
+        serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta_json(&["fixture", "_alloc_flavor_RawFlavorStruct"], "", true),
+            "global_kind": "NamedConst",
+            "value": {"Value": [1, [{"Str": "raw"}, {"Ref": [
+                "Erased",
+                {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                "Shared"
+            ]}]]}
+        }),
+    ];
+    llbc_with_types_funs_globals("fixture", vec![type_decl], funs, globals)
+}
+
+/// A harvested `_alloc_flavor_ = "raw"` Struct Global emits an
+/// Address-stamped ConstRefAddr then `__cast_instance_intrinsic` onto
+/// the class root (`bookkeeper.immutablevalue`). `gil.py
+/// GILThreadLocals.gil_ready` is this shape.
+#[test]
+fn raw_alloc_flavor_struct_global_casts_to_int_instance() {
+    super::register_foldable_const_lits(Vec::new());
+    let llbc = raw_flavor_struct_global_llbc();
+    let harvested =
+        crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc));
+    assert!(
+        harvested.iter().any(|s| s.contains("RawFlavorStruct")),
+        "harvested flavor set: {harvested:?}"
+    );
+    let graph = super::lower_function_with_static_addrs(&llbc, "read_cell", fnptrcell_refs())
+        .expect("raw-flavor Struct Global lowers");
+    assert_eq!(const_ref_addrs(&graph), vec![0x1111]);
+    let cell = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|op| match op.kind {
+            OpKind::ConstRefAddr(_) => op.result.clone(),
+            _ => None,
+        })
+        .expect("ConstRefAddr dest");
+    assert_eq!(
+        crate::model::FunctionGraph::concretetype_of(&cell),
+        crate::model::ConcreteType::Signed,
+        "llmemory.Address getkind is int"
+    );
+    assert!(
+        matches!(
+            cell.concretetype(),
+            Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Address)
+        ),
+        "raw-flavor static address is Address, got {:?}",
+        cell.concretetype()
+    );
+    let casts: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath { segments, .. },
+                result_ty,
+                ..
+            } if segments.last().map(String::as_str) == Some("__cast_instance_intrinsic") => {
+                Some((
+                    op.result
+                        .as_ref()
+                        .map(crate::model::FunctionGraph::concretetype_of),
+                    result_ty.clone(),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        casts,
+        vec![(
+            Some(crate::model::ConcreteType::Signed),
+            crate::model::ValueType::Int
+        )],
+        "raw-flavor STRUCT wraps as an int-kinded instance: {graph:?}"
+    );
+}
+
 fn fnptrcell_get_llbc() -> majit_charon_reader::Llbc {
     let cell = serde_json::json!({
         "Adt": {"id": 0, "generics": empty_generics()}

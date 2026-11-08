@@ -1941,6 +1941,14 @@ enum CallerOperandSlots {
 /// `contains_op`). `STORE_SUBSCR` is the three-operand store
 /// (`opcode_store_subscr`).
 ///
+/// `LIST_EXTEND` / `LIST_APPEND` / `SET_ADD` / `SET_UPDATE` / `DICT_UPDATE`
+/// pop the TOS value and peek the collection at `oparg - 1`
+/// (`pyopcode.py` `LIST_EXTEND` / `LIST_APPEND` / `SET_ADD`). The entry
+/// block is that collection plus the popped value, `oparg + 1` slots.
+/// `MAP_ADD` pops key and value, then peeks the dict (`map_add`), so the
+/// block is `oparg + 2`. With no arm `CallStack::NoOperandShape` left
+/// `LIST_EXTEND` a residual `CallMayForce`.
+///
 /// `LOAD_GLOBAL` / `LOAD_NAME` / `LOAD_DEREF` consume none
 /// (`opcode_load_global`, `opcode_load_name`, `load_deref`); count 0 is
 /// `CallerOperandSlots::Empty`. `MAKE_FUNCTION` / `FORMAT_SIMPLE` /
@@ -2160,6 +2168,19 @@ fn caller_non_call_operand_count(
         | pyre_interpreter::Instruction::BuildSet { count } => count.get(op_arg) as usize,
         // Contiguous TOS of `2 * n` items (`opcode_build_map` `pop_n(size * 2)`).
         pyre_interpreter::Instruction::BuildMap { count } => (count.get(op_arg) as usize) * 2,
+        // `[collection, value]`. `list_extend` / `list_append` / `set_add` /
+        // `set_update` / `dict_update` pop TOS then `peek_at(oparg - 1)`
+        // (`eval.rs`). On entry the collection sits `oparg` below TOS, so
+        // the contiguous block is `oparg + 1`. `LIST_EXTEND 1` is
+        // `[list, iterable]`.
+        pyre_interpreter::Instruction::ListExtend { i }
+        | pyre_interpreter::Instruction::ListAppend { i }
+        | pyre_interpreter::Instruction::SetAdd { i }
+        | pyre_interpreter::Instruction::SetUpdate { i }
+        | pyre_interpreter::Instruction::DictUpdate { i } => (i.get(op_arg) as usize) + 1,
+        // `[dict, key, value]`. `map_add` pops value then key, then
+        // `peek_at(oparg - 1)` (`eval.rs`).
+        pyre_interpreter::Instruction::MapAdd { i } => (i.get(op_arg) as usize) + 2,
         _ => return None,
     })
 }
@@ -2229,6 +2250,22 @@ mod caller_operand_slots_tests {
                 caller_non_call_operand_count(instruction, pyre_interpreter::OpArg::NULL).unwrap()
             ),
             Some(stack_end)
+        );
+    }
+
+    /// `LIST_EXTEND 1` consumes `[list, iterable]`: pop the iterable, then
+    /// `peekvalue(oparg - 1)` the list (`pyopcode.py` `LIST_EXTEND`).
+    #[test]
+    fn caller_operand_slots_list_extend_is_collection_plus_iterable() {
+        let instruction = pyre_interpreter::Instruction::ListExtend {
+            i: pyre_interpreter::bytecode::Arg::marker(),
+        };
+        let op_arg = pyre_interpreter::OpArg::new(1);
+        assert_eq!(caller_non_call_operand_count(instruction, op_arg), Some(2));
+        let stack_end = 8usize;
+        assert_eq!(
+            stack_end.checked_sub(caller_non_call_operand_count(instruction, op_arg).unwrap()),
+            Some(6)
         );
     }
 
