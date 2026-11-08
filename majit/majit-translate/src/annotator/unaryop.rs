@@ -6935,50 +6935,54 @@ mod tests {
         for (item, kind, unsigned) in cases {
             let item_const =
                 Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(Box::new(item))));
-            let hl = HLOperation::new(OpKind::NewRustVec, vec![item_const]);
-            let Some(SomeValue::RustVec(s_vec)) = hl.consider(&ann).unwrap() else {
-                panic!("newrustvec must type as SomeRustVec");
-            };
-            assert_eq!(s_vec.item_kind(), Some(kind));
-            if kind == VecItemKind::Int {
-                let SomeValue::Integer(s_int) = &*s_vec.s_item else {
-                    panic!("int item must be SomeInteger, got {:?}", s_vec.s_item);
+            for ctor in [OpKind::NewRustVec, OpKind::NewRustVecFixed] {
+                let hl = HLOperation::new(ctor, vec![item_const.clone()]);
+                let Some(SomeValue::RustVec(s_vec)) = hl.consider(&ann).unwrap() else {
+                    panic!("{} must type as SomeRustVec", ctor.opname());
                 };
-                assert_eq!(s_int.unsigned, unsigned);
-            } else {
-                assert_eq!(
-                    s_vec.s_item.as_ref(),
-                    SomeRustVec::for_kind(kind).s_item.as_ref()
-                );
-            }
-            let s_self = SomeValue::RustVec(s_vec);
-            for (name, analyser) in [
-                ("append", "rustvec_method_append"),
-                ("reverse", "rustvec_method_reverse"),
-                ("free", "rustvec_method_free"),
-                ("items", "rustvec_method_items"),
-                ("extend_from_slice", "rustvec_method_extend_from_slice"),
-                ("extend", "rustvec_method_extend"),
-                ("insert", "rustvec_method_insert"),
-            ] {
-                let SomeValue::BuiltinMethod(bound) = s_self.find_method(name).unwrap() else {
-                    panic!("Vec.{name} must be recognized");
-                };
-                assert_eq!(bound.analyser_name, analyser);
+                assert_eq!(s_vec.item_kind(), Some(kind));
+                if kind == VecItemKind::Int {
+                    let SomeValue::Integer(s_int) = &*s_vec.s_item else {
+                        panic!("int item must be SomeInteger, got {:?}", s_vec.s_item);
+                    };
+                    assert_eq!(s_int.unsigned, unsigned);
+                } else {
+                    assert_eq!(
+                        s_vec.s_item.as_ref(),
+                        SomeRustVec::for_kind(kind).s_item.as_ref()
+                    );
+                }
+                let s_self = SomeValue::RustVec(s_vec);
+                for (name, analyser) in [
+                    ("append", "rustvec_method_append"),
+                    ("reverse", "rustvec_method_reverse"),
+                    ("free", "rustvec_method_free"),
+                    ("items", "rustvec_method_items"),
+                    ("extend_from_slice", "rustvec_method_extend_from_slice"),
+                    ("extend", "rustvec_method_extend"),
+                    ("insert", "rustvec_method_insert"),
+                ] {
+                    let SomeValue::BuiltinMethod(bound) = s_self.find_method(name).unwrap() else {
+                        panic!("Vec.{name} must be recognized");
+                    };
+                    assert_eq!(bound.analyser_name, analyser);
+                }
             }
         }
-        let bad = HLOperation::new(
-            OpKind::NewRustVec,
-            vec![Hlvalue::Constant(Constant::new(ConstValue::byte_str("x")))],
-        );
-        assert!(bad.consider(&ann).is_err());
-        let void_item = HLOperation::new(
-            OpKind::NewRustVec,
-            vec![Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(
-                Box::new(LowLevelType::Void),
-            )))],
-        );
-        assert!(void_item.consider(&ann).is_err());
+        for ctor in [OpKind::NewRustVec, OpKind::NewRustVecFixed] {
+            let bad = HLOperation::new(
+                ctor,
+                vec![Hlvalue::Constant(Constant::new(ConstValue::byte_str("x")))],
+            );
+            assert!(bad.consider(&ann).is_err());
+            let void_item = HLOperation::new(
+                ctor,
+                vec![Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(
+                    Box::new(LowLevelType::Void),
+                )))],
+            );
+            assert!(void_item.consider(&ann).is_err());
+        }
     }
 
     #[test]

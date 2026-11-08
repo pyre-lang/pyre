@@ -3227,6 +3227,17 @@ impl<'a> Lowering<'a> {
         {
             return Ok(());
         }
+        // `vec![e0, …, eN-1]` Array store into `(*box).Field(1).Field(0)`.
+        // The into_vec terminator emits `ll_vec_newlist` + `ll_setitem_fast`
+        // (`rlist.py` `rtype_newlist`). Nested FieldWrite of the Array into
+        // a classdef-less box is not a fresh-alloc store, so prune cannot
+        // reclaim it; skip the assign and leave the unused `new_uninit` for
+        // `prune_dead_boxing_remnants`.
+        if let Some(box_local) = vec_literal_uninit_array_place(&dest)
+            && vec_literal_cluster(self.llbc, self.body, box_local).is_some()
+        {
+            return Ok(());
+        }
         // `_t = copy _slot` for an erased bracket's `base()` result: the index
         // has no reader left either, since every `get` it fed is answered by
         // the pinned value, so the temporary mints no Variable.

@@ -112,10 +112,13 @@ fn is_getslice_marker(segments: &[String], name: &str) -> bool {
 /// identity (`flowspace/model.rs`). Identity correspondence is
 /// preserved out-of-band by [`LegacyToTyped`].
 /// The high-level operations one `ll_vec_*` helper call stands for:
-/// `newrustvec(ITEM[, hint])`, `len`, `getitem`, `setitem`, or a
-/// `getattr` + `simple_call` of the `append` / `reverse` / `free` / `items` /
-/// `extend_from_slice` / `extend` / `insert` method. `ITEM` is a constant item
-/// lowleveltype (`lltype.py` `malloc` / `ann_malloc`).
+/// `newrustvec(ITEM[, hint])`, `newrustvec_fixed(ITEM, n)`, `len`,
+/// `getitem`, `setitem`, or a `getattr` + `simple_call` of the `append` /
+/// `reverse` / `free` / `items` / `extend_from_slice` / `extend` / `insert` method.
+/// `ITEM` is a constant item lowleveltype (`lltype.py` `malloc` /
+/// `ann_malloc`). `newrustvec_fixed` is `rlist.py` `rtype_newlist` /
+/// `ll_newlist(N)`: len=N and cap=N. `newrustvec(ITEM, n)` stays
+/// `ll_newlist_hint` (len=0, cap=n).
 fn rust_vec_helper_ops(
     op: majit_ir::rvec::VecOp,
     kind: majit_ir::rvec::VecItemKind,
@@ -127,7 +130,12 @@ fn rust_vec_helper_ops(
     let path = majit_ir::rvec::vec_helper_path(op, kind);
     let arity = match op {
         VecOp::NewEmpty => 0,
-        VecOp::NewHint | VecOp::Length | VecOp::Reverse | VecOp::Free | VecOp::Items => 1,
+        VecOp::NewHint
+        | VecOp::NewFixed
+        | VecOp::Length
+        | VecOp::Reverse
+        | VecOp::Free
+        | VecOp::Items => 1,
         VecOp::GetItem | VecOp::Append | VecOp::AllocAndSet | VecOp::Extend | VecOp::Prepend => 2,
         VecOp::SetItem | VecOp::ExtendFromSlice | VecOp::InsertNonneg => 3,
     };
@@ -138,14 +146,19 @@ fn rust_vec_helper_ops(
         )));
     }
     let (opname, method) = match op {
-        VecOp::NewEmpty | VecOp::NewHint | VecOp::AllocAndSet => {
+        VecOp::NewEmpty | VecOp::NewHint | VecOp::AllocAndSet | VecOp::NewFixed => {
             let item = newrustvec_item_lltype(kind, legacy_result);
             let item_const =
                 Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(Box::new(item))));
             let mut args = Vec::with_capacity(arg_hls.len() + 1);
             args.push(item_const);
             args.extend(arg_hls);
-            return Ok(vec![FlowspaceOp::new("newrustvec", args, result)]);
+            let opname = if matches!(op, VecOp::NewFixed) {
+                "newrustvec_fixed"
+            } else {
+                "newrustvec"
+            };
+            return Ok(vec![FlowspaceOp::new(opname, args, result)]);
         }
         VecOp::Length => ("len", None),
         VecOp::GetItem => ("getitem", None),
@@ -12797,6 +12810,7 @@ mod tests {
                 let nargs = match op {
                     VecOp::NewEmpty => 0,
                     VecOp::NewHint
+                    | VecOp::NewFixed
                     | VecOp::Length
                     | VecOp::Reverse
                     | VecOp::Free
@@ -12844,9 +12858,14 @@ mod tests {
                 let last = translated.last().expect("at least one op");
                 assert_eq!(last.result, result_var, "{path}");
                 match op {
-                    VecOp::NewEmpty | VecOp::NewHint | VecOp::AllocAndSet => {
+                    VecOp::NewEmpty | VecOp::NewHint | VecOp::AllocAndSet | VecOp::NewFixed => {
                         assert_eq!(translated.len(), 1);
-                        assert_eq!(last.opname, "newrustvec");
+                        let expected_opname = if matches!(op, VecOp::NewFixed) {
+                            "newrustvec_fixed"
+                        } else {
+                            "newrustvec"
+                        };
+                        assert_eq!(last.opname, expected_opname);
                         let Hlvalue::Constant(item) = &last.args[0] else {
                             panic!("{path}: item lowleveltype must be a Constant");
                         };
@@ -12964,6 +12983,63 @@ mod tests {
         assert_eq!(ll.as_ref(), &LowLevelType::Unsigned);
         assert_eq!(flow_result.concretetype(), None);
         assert_eq!(translated[0].result, result_var);
+    }
+
+    /// `ll_vec_newlist_*` (`VecOp::NewFixed`) is `newrustvec_fixed`, which
+    /// annotates as `SomeRustVec`. Distinct from `newrustvec(ITEM, n)`
+    /// (`NewHint` / `ll_newlist_hint`).
+    #[test]
+    fn translate_op_ll_vec_newlist_annotates_as_somerustvec() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::operation::{HLOperation, OpKind as HlOpKind};
+        use majit_ir::rvec::{VecItemKind, VecOp, vec_helper_path};
+
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 3);
+        let result_var = Hlvalue::Variable(Variable::new());
+        let n_hl = Hlvalue::Constant(crate::flowspace::model::Constant::new(
+            crate::flowspace::model::ConstValue::Int(2),
+        ));
+        value_map.insert(vars[1].clone(), result_var.clone());
+        value_map.insert(vars[2].clone(), n_hl.clone());
+        let path = vec_helper_path(VecOp::NewFixed, VecItemKind::Ref);
+        let spaceop = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: path.split("::").map(String::from).collect(),
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![vars[2].clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated = translate_op(&spaceop, &value_map, &empty_call_registry())
+            .unwrap_or_else(|err| panic!("{path} must lower: {err:?}"));
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "newrustvec_fixed");
+        assert_eq!(translated[0].result, result_var);
+        assert_eq!(translated[0].args.len(), 2);
+        let Hlvalue::Constant(item) = &translated[0].args[0] else {
+            panic!("item lowleveltype must be a Constant");
+        };
+        let ConstValue::LowLevelType(ll) = &item.value else {
+            panic!("item must be a constant lowleveltype, got {:?}", item.value);
+        };
+        assert_eq!(
+            ll.as_ref(),
+            &crate::translator::rtyper::lltypesystem::lltype::GCREF.clone()
+        );
+        assert_eq!(translated[0].args[1], n_hl);
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let hl = HLOperation::new(HlOpKind::NewRustVecFixed, translated[0].args.clone());
+        let Some(SomeValue::RustVec(s_vec)) = hl.consider(&ann).unwrap() else {
+            panic!("newrustvec_fixed must type as SomeRustVec");
+        };
+        assert_eq!(s_vec.item_kind(), Some(VecItemKind::Ref));
     }
 
     #[test]

@@ -9225,7 +9225,8 @@ fn op_vec_alloc_kind(op: &SpaceOperation) -> Option<majit_ir::rvec::VecItemKind>
         Some((
             majit_ir::rvec::VecOp::NewEmpty
             | majit_ir::rvec::VecOp::NewHint
-            | majit_ir::rvec::VecOp::AllocAndSet,
+            | majit_ir::rvec::VecOp::AllocAndSet
+            | majit_ir::rvec::VecOp::NewFixed,
             kind,
         )) => Some(kind),
         _ => None,

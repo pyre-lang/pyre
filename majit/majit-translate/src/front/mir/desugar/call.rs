@@ -5761,39 +5761,22 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `vec![e0, …, eN]` lowers to
-                // `box_assume_init_into_vec_unsafe(box [e0, …, eN])`, whose
-                // `box_assume_init` primitive is unregistered, so the legacy
-                // CodeWriter residualizes it as a plain call (the same
-                // treatment `w_int_new` / `w_float_new` get).  A recognizer
-                // that rewrites this shape to `OpKind::NewList` (feeding the
-                // repr-generic `rtype_newlist`) is UNCONDITIONAL: it plants
-                // `NewList` into a graph regardless of whether that graph
-                // two-phase lifts or drops to the legacy walker, and the legacy
-                // walker never runs `rtype_newlist`, so a dropped graph's raw
-                // `NewList` reaches the assembler default arm and emits
-                // `newlist/r>r` — an opname with no blackhole handler —
-                // breaking `default_bh_builder_unwired_set_matches_task_85_snapshot`.
-                //
-                // Two graphs carry a vec! and still drop to the legacy walker,
-                // each behind an independent non-vec! wall the recognizer does
-                // not touch:
-                //   • `_pypy_generic_alias::make_generic_alias`: `collect_parameters`
-                //     → `push_unique` → `slice::iter::Iter::next` (unregistered),
-                //     plus a `collect_parameters` `UnionError: r_uint ∪ int`.
-                //   • `typedef::set_method_difference`: `&args[1..]` →
-                //     `core::slice::index::<Impl>::index` (unregistered), and the
-                //     `set_copy_real` → `w_set_copy_storage_from` storage-copy
-                //     chain (its `__deref_write` wall is gone as of the off-GC
-                //     storage box S1 — `w_set_copy_storage_from` reassigns the
-                //     `items` GC field; the chain now walls only on the
-                //     `w_set_new` `setattr("items")`/`d.len` `int ∪ r_uint`
-                //     annotator UnionError).
-                // Until BOTH graphs fully lift (slice-iterator + slice-index +
-                // the collect_parameters UnionError — all annotator-completeness
-                // axis walls, not vec! walls), the unconditional recognizer is
-                // unsafe.  `rtype_newlist`'s Fixed arm stays implemented and
-                // dormant; the residual call is the correct lowering meanwhile.
+                // `vec![e0, …, eN-1]` is `new_uninit<[T; N]>` + Array store
+                // into `(*box).Field(1).Field(0)` + `box_assume_init_into_vec_unsafe`.
+                // Emit `ll_vec_newlist_{kind}(N)` then `ll_vec_setitem_fast`
+                // per item (`rlist.py` `rtype_newlist` / `ll_newlist` /
+                // `ll_setitem_fast`). The 2026-09-27 raw-repr decision: do
+                // not plant `OpKind::NewList` (`rtype_newlist` is a GC list).
+                if self.try_lower_vec_literal_into_vec(
+                    mir_bb,
+                    &original_segments,
+                    &arg_locals,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 // For a method/direct callee this equals the callee's
                 // `name_path()`; the scope predicate keys on the module
                 // path, which the built `CallTarget::Method` drops.
@@ -10044,6 +10027,68 @@ fn passes_attr_as_rust_heap(formal: Option<&TyRef>, place: Option<&TyRef>, llbc:
 }
 
 impl Lowering<'_> {
+    /// `vec![e0, …, eN-1]` → `ll_vec_newlist_{kind}(N)` +
+    /// `ll_vec_setitem_fast_{kind}` per item (`rlist.py` `rtype_newlist`).
+    /// The leftover `new_uninit` box and Array ctor are swept by
+    /// `prune_dead_boxing_remnants`.
+    fn try_lower_vec_literal_into_vec(
+        &mut self,
+        mir_bb: usize,
+        original_segments: &[String],
+        arg_locals: &[Option<usize>],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if !is_box_assume_init_into_vec_unsafe_path(original_segments) {
+            return Ok(false);
+        }
+        let Some(box_local) = arg_locals.first().copied().flatten() else {
+            return Ok(false);
+        };
+        let Some(kind) = tyref_rust_vec_item_kind(dest_ty, self.llbc) else {
+            return Ok(false);
+        };
+        let Some(cluster) = vec_literal_cluster(self.llbc, self.body, box_local) else {
+            return Ok(false);
+        };
+        if cluster.item_kind != kind {
+            return Ok(false);
+        }
+        let operands = cluster.operands.to_vec();
+        let n = operands.len();
+        let n_var = self.emit_const_uint(mir_bb, n as u64);
+        let v = self.emit_path_call(
+            mir_bb,
+            &rust_vec_helper_segments(majit_ir::rvec::VecOp::NewFixed, kind).join("::"),
+            vec![n_var],
+            ValueType::Int,
+        );
+        stamp_rust_vec_header(&v, dest_ty, self.llbc);
+        for (i, op) in operands.into_iter().enumerate() {
+            let idx = self.emit_const_uint(mir_bb, i as u64);
+            let elem = self.resolve_operand(mir_bb, op)?;
+            let bb_id = self.emit_bb(mir_bb);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(rust_vec_helper_segments(
+                        majit_ir::rvec::VecOp::SetItem,
+                        kind,
+                    )),
+                    args: crate::model::call_args(vec![v.clone(), idx, elem]),
+                    result_ty: ValueType::Void,
+                },
+            });
+        }
+        self.local_var[dest_local] = Some(LocalValue::One(v));
+        let bb_id = self.emit_bb(mir_bb);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
     /// Signed-word `raw_load` of a fn-pointer niche (`FnPtrCell::get` at
     /// offset 0, `OnceLock<fn>::get` at the LLBC payload offset).
     fn emit_signed_word_fn_ptr_load(

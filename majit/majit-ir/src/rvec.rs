@@ -267,10 +267,14 @@ pub enum VecOp {
     Prepend,
     /// `v.insert(i, x)` — `ll_insert_nonneg`.
     InsertNonneg,
+    /// `vec![e0, …, eN-1]` — `rlist.py ll_newlist(N)`. Args are `(length,)`.
+    /// Distinct from [`VecOp::NewHint`] (`ll_newlist_hint`): this helper
+    /// yields `len = N` and `cap = N`. It has no `newlist` oopspec.
+    NewFixed,
 }
 
 impl VecOp {
-    pub const ALL: [VecOp; 14] = [
+    pub const ALL: [VecOp; 15] = [
         VecOp::NewEmpty,
         VecOp::NewHint,
         VecOp::Length,
@@ -285,6 +289,7 @@ impl VecOp {
         VecOp::Extend,
         VecOp::Prepend,
         VecOp::InsertNonneg,
+        VecOp::NewFixed,
     ];
 
     fn row(self) -> usize {
@@ -303,6 +308,7 @@ impl VecOp {
             VecOp::Extend => 11,
             VecOp::Prepend => 12,
             VecOp::InsertNonneg => 13,
+            VecOp::NewFixed => 14,
         }
     }
 }
@@ -427,7 +433,7 @@ pub const VEC_BUF_ALLOC_CLEAR: &str = "majit_rlib::lltypesystem::rvec::vec_buf_a
 
 /// `(operation, item kind)` → helper path, rows in [`VecOp::ALL`] order and
 /// columns in [`VecItemKind::ALL`] order. Every path is spelled here once.
-const VEC_HELPERS: [[&str; 3]; 14] = [
+const VEC_HELPERS: [[&str; 3]; 15] = [
     [
         "majit_rlib::lltypesystem::rvec::ll_vec_newemptylist_i",
         "majit_rlib::lltypesystem::rvec::ll_vec_newemptylist_r",
@@ -501,6 +507,11 @@ const VEC_HELPERS: [[&str; 3]; 14] = [
         "majit_rlib::lltypesystem::rvec::ll_vec_insert_nonneg_i",
         "majit_rlib::lltypesystem::rvec::ll_vec_insert_nonneg_r",
         "majit_rlib::lltypesystem::rvec::ll_vec_insert_nonneg_f",
+    ],
+    [
+        "majit_rlib::lltypesystem::rvec::ll_vec_newlist_i",
+        "majit_rlib::lltypesystem::rvec::ll_vec_newlist_r",
+        "majit_rlib::lltypesystem::rvec::ll_vec_newlist_f",
     ],
 ];
 
@@ -849,6 +860,19 @@ mod tests {
                 "{path}"
             );
             assert_eq!(vec_helper_for_path(path), Some((VecOp::AllocAndSet, kind)));
+        }
+    }
+
+    #[test]
+    fn new_fixed_row_names_ll_newlist() {
+        for kind in VecItemKind::ALL {
+            let path = vec_helper_path(VecOp::NewFixed, kind);
+            assert!(
+                path.ends_with(&format!("::ll_vec_newlist_{}", kind.kind_char())),
+                "{path}"
+            );
+            assert_eq!(vec_helper_for_path(path), Some((VecOp::NewFixed, kind)));
+            assert_ne!(path, vec_helper_path(VecOp::NewHint, kind));
         }
     }
 }

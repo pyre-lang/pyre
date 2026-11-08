@@ -12472,6 +12472,387 @@ fn an_object_array_literal_unsize_is_newlist() {
     );
 }
 
+/// `vec![e0, …, eN-1]`: `new_uninit<[T; N]>` + Array store into
+/// `(*box).Field(1).Field(0)` + `box_assume_init_into_vec_unsafe`.
+fn vec_literal_into_vec_fixture(
+    caller: &str,
+    item_ty: serde_json::Value,
+    n: u64,
+    extra_type_decls: Vec<serde_json::Value>,
+) -> Llbc {
+    let generics = |types: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "regions": [], "types": types, "const_generics": [], "trait_refs": []
+        })
+    };
+    let empty_generics = generics(Vec::new());
+    let span = || {
+        serde_json::json!({
+            "data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }
+        })
+    };
+    let item_meta = |path: &[&str], is_local: bool| {
+        serde_json::json!({
+            "name": path.iter().map(|segment| serde_json::json!({"Ident": [segment, 0]})).collect::<Vec<_>>(),
+            "span": span(),
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let named = |path: &[&str], def_id: u64| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta(path, false),
+            "kind": {"Struct": []}
+        })
+    };
+    let n_lit = serde_json::json!({
+        "Const": [
+            {"Integer": {"Unsigned": ["Usize", n.to_string()]}},
+            {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+        ]
+    });
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", n.to_string()]}},
+        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+    ]);
+    let array_ty = serde_json::json!({"Array": [item_ty.clone(), array_len, null]});
+    let vec_ty = serde_json::json!({
+        "Adt": {"id": 0, "generics": generics(vec![item_ty.clone()])}
+    });
+    let box_ty = serde_json::json!({
+        "Adt": {"id": 2, "generics": generics(vec![array_ty.clone()])}
+    });
+    let place =
+        |i: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": i}, "ty": ty});
+    let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty});
+    let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "span": span(), "comments_before": []});
+    let mv = |i: u64, ty: &serde_json::Value| serde_json::json!({"Move": place(i, ty)});
+    let box_local = n + 1;
+    let mut locals = vec![local(0, &vec_ty)];
+    for i in 1..=n {
+        locals.push(local(i, &item_ty));
+    }
+    locals.push(local(box_local, &box_ty));
+    let elements: Vec<serde_json::Value> = (1..=n).map(|i| mv(i, &item_ty)).collect();
+    let deref = serde_json::json!({
+        "kind": {"Projection": [place(box_local, &box_ty), "Deref"]},
+        "ty": array_ty
+    });
+    let field1 = serde_json::json!({
+        "kind": {"Projection": [deref, {"Field": [null, 1]}]},
+        "ty": array_ty
+    });
+    let field0 = serde_json::json!({
+        "kind": {"Projection": [field1, {"Field": [null, 0]}]},
+        "ty": array_ty
+    });
+    let array_store = stmt(serde_json::json!({
+        "Assign": [field0, {
+            "Aggregate": [
+                {"Array": [item_ty.clone(), n_lit]},
+                elements
+            ]
+        }]
+    }));
+    let opaque =
+        |def_id: u64, path: &[&str], inputs: Vec<serde_json::Value>, output: serde_json::Value| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": item_meta(path, false),
+                "signature": {
+                    "is_unsafe": true,
+                    "inputs": inputs,
+                    "output": output
+                },
+                "body": "Opaque"
+            })
+        };
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(&["fixture", caller], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": vec![item_ty.clone(); n as usize],
+            "output": vec_ty.clone()
+        },
+        "body": {
+            "Unstructured": {
+                "span": span(),
+                "locals": {
+                    "arg_count": n,
+                    "locals": locals
+                },
+                "body": [
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {
+                            "span": span(),
+                            "kind": {
+                                "Call": {
+                                    "call": {
+                                        "func": {
+                                            "Regular": {
+                                                "kind": {"Fun": 1},
+                                                "generics": empty_generics.clone()
+                                            }
+                                        },
+                                        "args": []}, "dest": place(box_local, &box_ty),
+                                    "target": 2,
+                                    "on_unwind": 1
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span(), "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [array_store],
+                        "kind": "Regular",
+                        "terminator": {
+                            "span": span(),
+                            "kind": {
+                                "Call": {
+                                    "call": {
+                                        "func": {
+                                            "Regular": {
+                                                "kind": {"Fun": 2},
+                                                "generics": empty_generics.clone()
+                                            }
+                                        },
+                                        "args": [mv(box_local, &box_ty)]}, "dest": place(0, &vec_ty),
+                                    "target": 4,
+                                    "on_unwind": 3
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span(), "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": span(), "kind": "Return"}
+                    }
+                ]
+            }
+        }
+    });
+    let mut type_decls = vec![
+        named(&["alloc", "vec", "Vec"], 0),
+        named(&["PyObject"], 1),
+        named(&["alloc", "boxed", "Box"], 2),
+    ];
+    type_decls.extend(extra_type_decls);
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": type_decls,
+            "fun_decls": [
+                caller,
+                opaque(1, &["alloc", "boxed", "Box", "new_uninit"], vec![], box_ty.clone()),
+                opaque(
+                    2,
+                    &["alloc", "boxed", "box_assume_init_into_vec_unsafe"],
+                    vec![box_ty],
+                    vec_ty
+                )
+            ],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("vec! fixture parses")
+}
+
+fn assert_vec_literal_lowers(
+    llbc: &Llbc,
+    caller: &str,
+    n: usize,
+    newlist_leaf: &str,
+    setitem_leaf: &str,
+) {
+    let graph = crate::test_support::lower_function(llbc, caller)
+        .unwrap_or_else(|e| panic!("{caller}: {e}"));
+    let ops = graph_ops(&graph);
+    let leaves: Vec<&str> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !leaves
+            .iter()
+            .any(|leaf| *leaf == "new_uninit" || *leaf == "box_assume_init_into_vec_unsafe"),
+        "{caller}: residual new_uninit/into_vec survived; leaves={leaves:?} ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, .. } if field.name == "Field_0"
+        )),
+        "{caller}: FieldWrite Field_0 survived; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::NewList { .. })),
+        "{caller}: must not emit OpKind::NewList; ops={ops:?}"
+    );
+    let newlist = ops.iter().find(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some(newlist_leaf)
+        )
+    });
+    let Some(newlist) = newlist else {
+        panic!("{caller}: missing {newlist_leaf}; leaves={leaves:?} ops={ops:?}");
+    };
+    let header = newlist
+        .result
+        .as_ref()
+        .expect("{newlist_leaf} produces a value");
+    let inputs = graph.block(graph.startblock).inputargs.clone();
+    assert_eq!(inputs.len(), n, "{caller}: inputargs");
+    let setitems: Vec<_> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments.last().map(String::as_str) == Some(setitem_leaf) => Some(args),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        setitems.len(),
+        n,
+        "{caller}: expected {n} {setitem_leaf}; leaves={leaves:?} ops={ops:?}"
+    );
+    for (i, args) in setitems.iter().enumerate() {
+        assert_eq!(args.len(), 3, "{caller} setitem {i} arity");
+        assert_eq!(
+            args[0].as_variable(),
+            Some(header),
+            "{caller} setitem {i} header"
+        );
+        let elem = args[2]
+            .as_variable()
+            .unwrap_or_else(|| panic!("{caller} setitem {i} element"));
+        assert_eq!(
+            traces_to_start_input(&graph, elem),
+            Some(&inputs[i]),
+            "{caller} setitem {i} element"
+        );
+    }
+}
+
+fn traces_to_start_input<'a>(
+    graph: &'a crate::model::FunctionGraph,
+    mut var: &'a crate::flowspace::model::Variable,
+) -> Option<&'a crate::flowspace::model::Variable> {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(var.id()) {
+            return None;
+        }
+        let start = graph.block(graph.startblock);
+        if let Some(found) = start.inputargs.iter().find(|v| *v == var) {
+            return Some(found);
+        }
+        let mut next = None;
+        'blocks: for block in &graph.blocks {
+            for op in &block.operations {
+                if op.result.as_ref() == Some(var)
+                    && let OpKind::UnaryOp {
+                        op: name, operand, ..
+                    } = &op.kind
+                    && name == "same_as"
+                {
+                    next = Some(operand);
+                    break 'blocks;
+                }
+            }
+            if let Some(idx) = block.inputargs.iter().position(|v| v == var) {
+                for pred in &graph.blocks {
+                    for link in &pred.exits {
+                        if link.target == block.id
+                            && let Some(arg) = link.args.get(idx).and_then(|a| a.as_variable())
+                            && arg != var
+                        {
+                            next = Some(arg);
+                            break 'blocks;
+                        }
+                    }
+                }
+            }
+        }
+        match next {
+            Some(v) => var = v,
+            None => return None,
+        }
+    }
+}
+
+#[test]
+fn vec_literal_object_ptr_lowers_to_newlist_r() {
+    let objptr = serde_json::json!({
+        "RawPtr": [{"Adt": {"id": 1, "generics": {
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        }}}, "Mut"]
+    });
+    let llbc = vec_literal_into_vec_fixture("vec_literal_object_ptr", objptr, 1, vec![]);
+    assert_vec_literal_lowers(
+        &llbc,
+        "vec_literal_object_ptr",
+        1,
+        "ll_vec_newlist_r",
+        "ll_vec_setitem_fast_r",
+    );
+}
+
+#[test]
+fn vec_literal_i64_lowers_to_newlist_i() {
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let llbc = vec_literal_into_vec_fixture("vec_literal_i64", i64_ty, 2, vec![]);
+    assert_vec_literal_lowers(
+        &llbc,
+        "vec_literal_i64",
+        2,
+        "ll_vec_newlist_i",
+        "ll_vec_setitem_fast_i",
+    );
+}
+
 #[test]
 fn slice_from_ref_of_an_object_pointer_is_newlist() {
     let generics = || {
