@@ -2415,7 +2415,7 @@ fn exact_vstack_step_uses_depth_of_its_own_python_opcode() {
         vstack_step_depth(&pyjit, 0, floor_pc as u32),
         floor_depth as usize
     );
-    let frame = ActiveResumeFrame(std::sync::Arc::new(pyjit));
+    let frame = ActiveResumeFrame(std::sync::Arc::new(pyjit), 0);
     let (pc, _, depth) = frame
         .vstack_step_coordinate_for_jitcode_pc(0, u32::MAX)
         .unwrap();

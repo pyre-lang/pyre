@@ -3529,6 +3529,60 @@ pub(crate) fn collect_callee_active_boxes(
     Ok(active)
 }
 
+/// Overlay the callee sub-walk's operand-stack mirror onto live Ref-bank
+/// colors that map to stack slots.
+///
+/// `collect_outer_active_boxes` overlays `vstack_boxes[sem - nlocals]` for
+/// the portal frame.  The callee sub-walk is sym-less and owns no
+/// virtualizable, so [`collect_callee_active_boxes`] used to encode only
+/// `registers_r`.  A coalesced `LOAD_FAST` / `COPY` / `MATCH_CLASS` kept
+/// slot lives in the walk mirror and may still be `OpRef::NONE` in the
+/// register bank; without this overlay a branch-guard snapshot would
+/// encode NONE for a live Ref.
+///
+/// Fill holes only: a color that already holds a box stays on the
+/// register / callee-shadow recovery path.  Only `OpRef::NONE` is a hole.
+/// A present null constant (`ConstPtr(GcRef(0))` / CONST_NULL) is a real
+/// value — a `PUSH_NULL` / `self_or_null` — and is kept, matching
+/// `get_list_of_active_boxes` (`pyjitpl.py`) and `collect_outer_active_boxes`.
+/// The mirror substitutes whenever `m != OpRef::NONE`, including a mirror
+/// CONST_NULL.  Preferring the mirror over a set register (the portal
+/// CALL-site overlay) is wrong here because the branch-guard capture keys
+/// pcdep at the resume coordinate while `vstack_boxes` is the walk's
+/// current stack — a reused color then publishes a kept operand (the dict
+/// `d` in `lookup(d, k)`) as a live local.  Local slots (`< stack_base`)
+/// stay on the register / shadow path.
+pub(crate) fn overlay_callee_vstack_on_ref_regs(
+    regs_r: &mut [OpRef],
+    stack_base: usize,
+    stack_depth: usize,
+    pcdep: &[(u8, u16, u16)],
+    vstack: &[OpRef],
+) {
+    if vstack.is_empty() {
+        return;
+    }
+    for (color, value) in regs_r.iter_mut().enumerate() {
+        if *value != OpRef::NONE {
+            continue;
+        }
+        let Some(slot) =
+            crate::state::semantic_ref_slot_for_reg_color(stack_base, stack_depth, pcdep, color)
+        else {
+            continue;
+        };
+        if slot < stack_base {
+            continue;
+        }
+        let Some(&m) = vstack.get(slot - stack_base) else {
+            continue;
+        };
+        if m != OpRef::NONE {
+            *value = m;
+        }
+    }
+}
+
 /// Whether a loop-carried operand parked below the call keeps the fold
 /// worthwhile.
 ///
@@ -3612,6 +3666,58 @@ mod foreign_call_assembler_admission_tests {
         assert!(!foreign_callee_facts_admit_call_assembler(facts(
             false, true
         )));
+    }
+}
+
+#[cfg(test)]
+mod overlay_callee_vstack_tests {
+    use super::*;
+    use majit_ir::GcRef;
+
+    fn box_at(word: usize) -> OpRef {
+        OpRef::const_ptr(GcRef(word))
+    }
+
+    #[test]
+    fn overlay_fills_none_stack_color_from_callee_mirror() {
+        let mut regs = vec![OpRef::NONE; 5];
+        let vstack = vec![box_at(0x100), box_at(0x200)];
+        overlay_callee_vstack_on_ref_regs(&mut regs, 2, 2, &[(1, 3, 2)], &vstack);
+        assert_eq!(regs[3], box_at(0x100));
+    }
+
+    #[test]
+    fn overlay_does_not_overwrite_set_register() {
+        let mut regs = vec![OpRef::NONE; 5];
+        regs[3] = box_at(0x999);
+        let vstack = vec![box_at(0x100)];
+        overlay_callee_vstack_on_ref_regs(&mut regs, 2, 1, &[(1, 3, 2)], &vstack);
+        assert_eq!(regs[3], box_at(0x999));
+    }
+
+    #[test]
+    fn overlay_keeps_null_const_stack_color() {
+        let mut regs = vec![OpRef::NONE; 5];
+        regs[3] = OpRef::const_ptr(GcRef(0));
+        let vstack = vec![box_at(0x100)];
+        overlay_callee_vstack_on_ref_regs(&mut regs, 2, 1, &[(1, 3, 2)], &vstack);
+        assert_eq!(regs[3], OpRef::const_ptr(GcRef(0)));
+    }
+
+    #[test]
+    fn overlay_fills_none_stack_color_from_null_const_mirror() {
+        let mut regs = vec![OpRef::NONE; 5];
+        let vstack = vec![OpRef::const_ptr(GcRef(0))];
+        overlay_callee_vstack_on_ref_regs(&mut regs, 2, 1, &[(1, 3, 2)], &vstack);
+        assert_eq!(regs[3], OpRef::const_ptr(GcRef(0)));
+    }
+
+    #[test]
+    fn overlay_does_not_write_local_slots() {
+        let mut regs = vec![OpRef::NONE; 5];
+        let vstack = vec![box_at(0x100)];
+        overlay_callee_vstack_on_ref_regs(&mut regs, 2, 1, &[(1, 1, 0)], &vstack);
+        assert_eq!(regs[1], OpRef::NONE);
     }
 }
 
@@ -11194,61 +11300,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // All of these sit before the first recorded op (the `GETFIELD_GC_R`
     // below), so returning costs nothing but the inline.
     {
-        // POP_JUMP_IF_NONE / POP_JUMP_IF_NOT_NONE lower to a bare
-        // `ptr_eq`/`ptr_ne` against the None singleton whose `Kind::Int`
-        // result feeds the exitswitch -- no residual call and no boxed
-        // bool.  The tested operand's bank does not matter:
-        // `collect_callee_active_boxes` sizes the frame's section from the
-        // liveness at the carried `jitcode_pc`, the coordinate the decoder
-        // reads, so an int-specialized local encodes in the bank it lives in.
-        // POP_JUMP_IF_TRUE/FALSE stay inlinable: their `bool` truth folds in the
-        // int bank.  A strict straight-line callee has no branch at all, so
-        // this scan never fires for it.
-        // Stored bound methods carry their explicit receiver and callee frame,
-        // so their Ref operands remain available to the resume path.
-        //
-        // This precondition used to abort the enclosing trace rather than
-        // decline the inline, because residualizing it let loops compile that
-        // then printed traceback tuples missing their OUTERMOST frame.  That
-        // node is now recorded — the two bridge handler-entry arms attach the
-        // catching frame's own node — so the decline joins every other
-        // precondition here and returns `Ok(None)`.
-        //
-        // The abort was expensive out of all proportion to the inline it was
-        // protecting: a callee that walks a traceback (`while tb is not None`)
-        // lowers to exactly this instruction, so any handler calling such a
-        // helper aborted every retrace of the enclosing loop.  The guard whose
-        // bridge the retrace was building therefore never got one and deopted
-        // on every delivery.
-        if bound_method.is_none() {
-            let liveness = crate::liveness::liveness_for(raw_callee_code);
-            let has_is_none_branch = (0..callee_code.instructions.len()).any(|pc| {
-                matches!(
-                    pyre_interpreter::decode_instruction_at(callee_code, pc),
-                    Some((
-                        pyre_interpreter::bytecode::Instruction::PopJumpIfNone { .. }
-                            | pyre_interpreter::bytecode::Instruction::PopJumpIfNotNone { .. },
-                        _
-                    ))
-                ) && (
-                    // Kept operands. A branch that leaves slots
-                    // on the value stack needs its guard resume to restore
-                    // them, and the inline sub-walk's mirror does not model
-                    // them, so the kept Ref reads NULL and
-                    // `walker_branch_guard` raises
-                    // BranchGuardUnrestorableKeptStackPermanent — a
-                    // permanent abort that discards the enclosing loop
-                    // trace.  `stack_depth_at` is the depth BEFORE the
-                    // instruction and the branch pops the tested value, so
-                    // `depth > 1` is exactly "a kept slot survives".  An
-                    // unreachable pc has no depth and cannot fire a guard.
-                    liveness.stack_depth_at(pc).is_some_and(|depth| depth > 1)
-                )
-            });
-            if has_is_none_branch {
-                return resolved_inline_decline(op.pc, line!());
-            }
-        }
         let nlocals = callee_code.varnames.len();
         let ncells = pyre_interpreter::ncells(callee_code);
         let frame_array_size = nlocals + ncells + callee_code.max_stackdepth as usize;

@@ -433,7 +433,40 @@ fn vstack_slot_box_from_pcdep_registers<Sym: WalkSym>(
     stack_slot: usize,
 ) -> OpRef {
     if ctx.fbw_mode.inline_subwalk {
-        return OpRef::NONE;
+        // `walk_generator_resume` is portal-shaped and keeps the
+        // empty-parents collapse (`walker_inline_guard_resumes_in_callee`).
+        // Filling the mirror here makes a kept-stack `FOR_ITER` look
+        // covered so the guard compiles against that collapse snapshot
+        // and drops an item (`generator_frame_handout_image` 2999/3000).
+        if ctx.fbw_mode.generator_resume.is_some() {
+            return OpRef::NONE;
+        }
+        // Same pcdep color → `registers_r` read as the outer path, keyed off
+        // the innermost inlined callee (`ActiveResumeFrame::current`) rather
+        // than `fbw_mode.snapshot_sym` (the portal).  Returning NONE here
+        // left MATCH_CLASS / LOAD_FAST TOS holes; COPY of a missing source
+        // then latched `vstack_valid = false`, and a later kept-stack
+        // POP_JUMP_IF_NONE raised `BranchGuardUnrestorableKeptStackPermanent`.
+        let Some(frame) = ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym) else {
+            return OpRef::NONE;
+        };
+        let pjc = &frame.0;
+        let pcdep = pjc.pcdep_for_jitcode_pc(jit_pc).unwrap_or(&[]);
+        if pcdep.is_empty() {
+            return OpRef::NONE;
+        }
+        let stack_base = if pjc.code_ptr.is_null() {
+            pjc.metadata.stack_base
+        } else {
+            // SAFETY: `code_ptr` is the callee CodeObject this sub-walk executes.
+            let code = unsafe { &*pjc.code_ptr };
+            crate::state::callee_layout_for_call_assembler(code).0
+        };
+        let slot = stack_base + stack_slot;
+        let Some(color) = crate::state::semantic_slot_color_for_ref_slot(pcdep, slot) else {
+            return OpRef::NONE;
+        };
+        return ctx.registers_r.get(color).unwrap_or(OpRef::NONE);
     }
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
     if sym_ptr.is_null() {

@@ -11000,7 +11000,13 @@ enum VstackOpClass {
 ///   `walker_capture_multi_frame_inline_snapshot` (the framestack
 ///   → `ensure_jitcode_index` → `pyjitcode_for_jitcode_index` chain) so the
 ///   gate and the snapshot encoder consult one consistent active frame.
-struct ActiveResumeFrame(std::sync::Arc<crate::PyJitCode>);
+///
+/// `.1` is that same SD `jitcode.index` (`codewriter.py` `len(all_jitcodes)`):
+/// `outer` copies `RuntimeJitCode.index`, `current` copies
+/// `ensure_jitcode_index`.  Branch-arm Ref liveness and the snapshot encoder
+/// key the liveness store off this index, not a later `try_index()` on the
+/// payload.
+struct ActiveResumeFrame(std::sync::Arc<crate::PyJitCode>, i32);
 
 impl ActiveResumeFrame {
     /// The outermost portal/main frame (`fbw_mode.snapshot_sym`).  `None`
@@ -11018,7 +11024,7 @@ impl ActiveResumeFrame {
             return None;
         }
         let jc = unsafe { &*sym.jitcode() };
-        Some(ActiveResumeFrame(jc.payload.clone()))
+        Some(ActiveResumeFrame(jc.payload.clone(), jc.index))
     }
 
     /// The active frame at the current walk point: the innermost inlined
@@ -11032,7 +11038,7 @@ impl ActiveResumeFrame {
             Some(callee_w_code) => {
                 let idx = crate::state::ensure_jitcode_index(callee_w_code as *const ())?;
                 let pjc = crate::state::pyjitcode_for_jitcode_index(idx)?;
-                Some(ActiveResumeFrame(pjc))
+                Some(ActiveResumeFrame(pjc, idx))
             }
             None => Self::outer(snapshot_sym),
         }
@@ -14551,7 +14557,14 @@ fn guarded_branch_core<Sym: WalkSym>(
         // the decline and silently miscompile.  `kept_stack` reads the
         // correct per-function depth and closes that gap.
         if (kept_stack || kept_stack_any_leg) && !mirror_covers_kept {
-            let liveness = branch_arm_resume_ref_liveness(ctx.fbw_mode.clone(), other_target);
+            // Same empty-parents collapse as the vstack-mirror gate:
+            // a generator-resume sub-walk compiling a kept-stack arm
+            // against the caller FOR_ITER snapshot drops an item.
+            let liveness = if ctx.fbw_mode.generator_resume.is_some() {
+                None
+            } else {
+                branch_arm_resume_ref_liveness(gate_frame.as_ref(), other_target)
+            };
             // Hazard (1): the not-taken arm reads a regular Ref register
             // the blackhole resumes as NULL (the conditional-expression
             // boxed-int NULL-deref crash).
@@ -14573,9 +14586,9 @@ fn guarded_branch_core<Sym: WalkSym>(
                     Some((live_ref, num_regs_r)) => {
                         branch_arm_reads_unrestorable_ref(code, other_target, live_ref, *num_regs_r)
                     }
-                    // Liveness unavailable (`fbw_mode.snapshot_sym` is
-                    // null, or the coordinate is unresolved) — cannot
-                    // prove restorable, so decline.
+                    // Liveness unavailable (`gate_frame` is None, the
+                    // frame has no code_ptr, or its SD index is unset)
+                    // — cannot prove restorable, so decline.
                     None => true,
                 };
             // Hazard (2): the not-taken edge carries `ref_copy` renames
