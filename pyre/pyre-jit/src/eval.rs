@@ -12346,26 +12346,6 @@ pub(crate) fn green_pc_position(pc: i64) -> Option<usize> {
     usize::try_from(pc).ok()
 }
 
-/// Shrink `frame.valuestackdepth` to the liveness-table depth at `resume_pc`
-/// when that table is strictly smaller than the live field.
-///
-/// ContinueRunningNormally legs do not call this: `handle_jitexception`
-/// (`warmspot.py`) forwards to `portal_ptr(*args)` and leaves the vsd
-/// `bhimpl_setfield_vable_i` already wrote. Remaining callers are the
-/// non-CRN `walk_end_restart_pc` and interpret-abort sites in
-/// `compile_and_run_once`.
-#[majit_macros::dont_look_inside]
-pub(crate) fn correct_resume_vsd(frame: &mut PyFrame, resume_pc: usize) {
-    if let Some(corrected) =
-        pyre_jit_trace::state::depth_based_vsd_for_wcode(frame.pycode as usize, resume_pc)
-    {
-        if corrected < frame.valuestackdepth {
-            frame.valuestackdepth = corrected;
-            frame.clear_stack_above(corrected);
-        }
-    }
-}
-
 /// Blackhole `ContinueRunningNormally` handoff: stamp `last_instr` from the
 /// merge-point next_instr in `green_int[0]` so `eval_loop_jit` resumes there.
 ///
@@ -13499,14 +13479,15 @@ fn compile_and_run_once(
                         }
                     } else if let Some(restart_pc) = walk_end_restart_pc {
                         // A marker inside a super-instruction closes the loop at
-                        // `loop_header_pc + 1`, and the walk already advanced
-                        // `valuestackdepth` through the super-instruction. Set both the
-                        // resume pc and its operand depth so the handed-back frame is
-                        // self-consistent, mirroring the flush leg above and the
-                        // blackhole legs (`apply_blackhole_crn_handoff`).
+                        // `loop_header_pc + 1`. The walk already advanced
+                        // `valuestackdepth` through the super-instruction, so
+                        // the handed-back frame keeps that producer depth.
+                        // Stamp only `last_instr`, matching
+                        // `apply_blackhole_crn_handoff` (`warmspot.py
+                        // handle_jitexception` leaves the vsd
+                        // `bhimpl_setfield_vable_i` wrote).
                         let frame = frame_root.frame();
                         frame.set_last_instr_from_next_instr(restart_pc);
-                        correct_resume_vsd(frame, restart_pc);
                     } else if traced_on_live
                         && matches!(action, majit_metainterp::TraceAction::Abort)
                     {
@@ -13562,8 +13543,10 @@ fn compile_and_run_once(
                 panic!("interpret blackhole bailed on residual {name}");
             }
             if bh_pc != usize::MAX {
+                // `aborted_tracing` (`pyjitpl.py`) returns to the
+                // interpreter with the frame the blackhole left
+                // (`bhimpl_setfield_vable_i`). Stamp only `last_instr`.
                 frame_root.frame().set_last_instr_from_next_instr(bh_pc);
-                correct_resume_vsd(frame_root.frame(), bh_pc);
             }
         } else if outcome.is_none()
             && !driver.has_compiled_loop(green_key)

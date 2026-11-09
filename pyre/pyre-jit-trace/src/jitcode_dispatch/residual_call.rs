@@ -8961,8 +8961,8 @@ pub(super) fn maybe_publish_inline_callee_last_instr_concrete<Sym: WalkSym>(
     // `last_instr + 1` and its operand stack from `valuestackdepth`; the walk
     // keeps the operand stack symbolic, so `valuestackdepth` stays at whatever
     // the frame was built with while `last_instr` advances per opcode.
-    // `capture_frame_scalars` and `correct_resume_vsd` move the two words
-    // together; this site moves one, and nothing downstream re-pairs them.
+    // `capture_frame_scalars` moves the two words together; this site
+    // moves one, and nothing downstream re-pairs them.
     // Pairing it here with the forward analysis's depth at `callee_py_pc + 1`
     // was measured and does not fix
     // `bench/synth/_pending/loop_callee_for_header_resume.py`; it does not fix
