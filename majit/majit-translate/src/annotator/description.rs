@@ -4438,6 +4438,99 @@ mod tests {
         assert!(!Rc::ptr_eq(&g_inst, &g_tuple));
     }
 
+    #[test]
+    fn specialize_ll_dont_look_inside_splits_list_and_instance() {
+        // `rgc.py` `ll_arraycopy` `_annspecialcase_ = specialize:ll`
+        // (`objectmodel.py` `specialize.ll`, `annlowlevel.py`
+        // `lowlevelspecialize`). `annotation_to_lltype` has no
+        // SomeList / SomeInstance case, so the cache key is the
+        // annotation class (`SomeValueTag`). List and Instance must
+        // not share a unique graph: `mergeinputargs` refuses
+        // List ∪ Instance. `_jit_look_inside_ = False` still reaches
+        // `FunctionDesc.specialize` (`description.py`);
+        // `policy.py look_inside_graph` residualizes later.
+        let (_ann, bk) = ann_bk();
+        let mut func = compiled_graph_func(
+            "def arraycopy(source, dest, source_start, dest_start, length):\n    return None\n",
+            Vec::new(),
+        );
+        func.annspecialcase = Some("specialize:ll".to_string());
+        func._jit_look_inside_ = Some(false);
+        let signature = func.code.as_ref().unwrap().signature.clone();
+        let host = HostObject::new_user_function(func);
+        let desc = bk
+            .newfuncdesc_with_signature(&host, signature.clone())
+            .expect("newfuncdesc");
+        let fd = desc.as_function().expect("FunctionDesc");
+        assert!(
+            matches!(
+                fd.borrow().specializer.as_ref(),
+                Some(Specializer::Ll { .. })
+            ),
+            "Bookkeeper.newfuncdesc must install specialize:ll"
+        );
+        fd.borrow_mut().install_external_stub(
+            dont_look_inside_stub("arraycopy", signature),
+            SomeValue::Impossible,
+        );
+
+        let list = SomeValue::List(SomeList::new(ListDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+        )));
+        let inst = SomeValue::Instance(SomeInstance::new(
+            Some(ClassDef::new_standalone("pyobject::PyObject", None)),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let signed = SomeValue::Integer(SomeInteger::default());
+        let list_args = vec![
+            Some(list.clone()),
+            Some(list.clone()),
+            Some(signed.clone()),
+            Some(signed.clone()),
+            Some(signed.clone()),
+        ];
+        let inst_args = vec![
+            Some(inst.clone()),
+            Some(inst.clone()),
+            Some(signed.clone()),
+            Some(signed.clone()),
+            Some(signed.clone()),
+        ];
+        fd.borrow()
+            .pycall(
+                None,
+                &ArgumentsForTranslation::new(list_args.clone(), None, None),
+                &SomeValue::Impossible,
+                None,
+            )
+            .expect("list pycall");
+        fd.borrow()
+            .pycall(
+                None,
+                &ArgumentsForTranslation::new(inst_args.clone(), None, None),
+                &SomeValue::Impossible,
+                None,
+            )
+            .expect("instance pycall");
+        let g_list = fd
+            .borrow()
+            .specialize(&mut list_args.clone(), None)
+            .expect("list specialize")
+            .expect_graph()
+            .unwrap();
+        let g_inst = fd
+            .borrow()
+            .specialize(&mut inst_args.clone(), None)
+            .expect("instance specialize")
+            .expect_graph()
+            .unwrap();
+        assert!(!Rc::ptr_eq(&g_list, &g_inst));
+    }
+
     /// Signature-only `dont_look_inside` stub: startblock inputargs
     /// match the formals, closed onto a returnblock whose result is
     /// `SomeImpossibleValue` (`ExtRegistryEntry.compute_result_annotation`).

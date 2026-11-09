@@ -9,6 +9,7 @@
 /// - #[not_in_trace]: rlib/jit.py — Disappears from final assembler
 /// - #[always_inline]: objectmodel.py — Backend optimizer must inline
 /// - #[not_rpython]: objectmodel.py — Reject from RPython flow graphs
+/// - #[specialize_ll]: objectmodel.py specialize.ll — one graph per lltype
 ///
 /// majit-specific extensions:
 /// - #[jit_llop]: ExtRegistryEntry._about_ — declare the llop a call specializes to
@@ -3591,6 +3592,15 @@ pub fn specialize_call_location(_attr: TokenStream, item: TokenStream) -> TokenS
         "_annspecialcase_call_location_",
         "specialize_call_location",
     )
+}
+
+/// `objectmodel.py specialize.ll`: attach `_annspecialcase_ = 'specialize:ll'`
+/// without changing ABI. `LowLevelAnnotatorPolicy.lowlevelspecialize` keys
+/// `FunctionDesc.cachedgraph` on `annotation_to_lltype` (or the annotation
+/// class), so each ARRAY pointer type owns a graph (`rgc.py` `ll_arraycopy`).
+#[proc_macro_attribute]
+pub fn specialize_ll(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    host_function_marker(item, "_annspecialcase_ll_", "specialize_ll")
 }
 
 fn host_function_marker(item: TokenStream, prefix: &str, attribute: &str) -> TokenStream {

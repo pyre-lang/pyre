@@ -345,6 +345,9 @@ pub extern "C" fn jit_ll_arraymove(
 /// helper (`call.py`): the `assert!` on negative starts is a native
 /// contract, not a Python exception. Without it the residual is
 /// `CallMayForceR` and a transparent BINARY_SLICE walk declines.
+/// `rgc.py` `ll_arraycopy` is `@specialize.ll()`: each ARRAY pointer
+/// type owns a graph (`annlowlevel.py` `lowlevelspecialize`).
+#[majit_macros::specialize_ll]
 #[majit_macros::dont_look_inside_cannot_raise]
 #[majit_macros::oopspec("list.ll_arraycopy(source, dest, source_start, dest_start, length)")]
 pub extern "C" fn jit_ll_arraycopy(

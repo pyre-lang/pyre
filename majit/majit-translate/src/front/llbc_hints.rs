@@ -8,7 +8,8 @@
 //! `_callable_elidable_function_<NAME>`,
 //! `_funcptr_canraise_false_<NAME>`,
 //! `_jit_llop_<NAME>`,
-//! `_MAJIT_MAY_FORCE_<NAME>`).
+//! `_MAJIT_MAY_FORCE_<NAME>`,
+//! `_annspecialcase_ll_<NAME>`).
 //!
 //! The source attribute (`#[elidable]` / `#[dont_look_inside]` / …) is
 //! consumed by the proc-macro at expansion time and does NOT survive in
@@ -65,6 +66,8 @@ const CONST_PREFIX_HINTS: &[(&str, &[&str])] = &[
         "_annspecialcase_call_location_",
         &["specialize:call_location"],
     ),
+    // objectmodel.py specialize.ll (`rgc.py` `ll_arraycopy`).
+    ("_annspecialcase_ll_", &["specialize:ll"]),
     // rffi.py `call_external_function._gctransformer_hint_close_stack_ = True`
     // (`call.py` `guess_call_kind` / `get_jitcode` residual gate).
     ("_gctransformer_hint_close_stack_", &["close_stack"]),
@@ -1772,6 +1775,24 @@ mod tests {
                 &functions,
             ),
             "jit::isconstant"
+        );
+    }
+
+    #[test]
+    fn ll_marker_recovers_its_function_attribute() {
+        let (prefix, hints) = super::CONST_PREFIX_HINTS
+            .iter()
+            .find(|(prefix, _)| *prefix == "_annspecialcase_ll_")
+            .unwrap();
+        assert_eq!(*hints, &["specialize:ll"]);
+        let functions = HashSet::from(["object_array::jit_ll_arraycopy".to_string()]);
+        assert_eq!(
+            marker_path_to_fn_path(
+                "pyre_object::object_array::jit_ll_arraycopy::_annspecialcase_ll_jit_ll_arraycopy",
+                prefix,
+                &functions,
+            ),
+            "object_array::jit_ll_arraycopy"
         );
     }
 
