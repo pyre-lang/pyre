@@ -1,14 +1,10 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=entry-bridge:bump,loop:_int_sum
-# `main`'s loop aborts with ABORT_ESCAPE on every attempt. The
-# `f.f_locals[...] = ...` store is the may-force residual `bh_store_subscr_fn`;
-# its FrameLocalsProxy write-through forces the traced frame (`force_locals`
-# clears the residual-call vable token), and `vable_after_residual_call`
-# raises `SwitchToBlackhole(ABORT_ESCAPE)`. What reaches the JIT is `bump`'s
-# entry bridge and the `_int_sum` loop. The descent that would record the
-# store instead (`try_walker_orthodox_frame_locals_setitem` ->
-# `fast_local_index`) stops at the may-force `hash_w_strict` residual inside
-# the transparent helper.
+# pyre-check: selfcheck-compiles=loop:main,loop:_int_sum
+# `main`'s loop compiles: the `f.f_locals[...] = ...` store descends
+# (`try_walker_orthodox_frame_locals_setitem` -> `fast_local_index`), and an
+# exact-`str` key is decided by its WTF-8 bytes, so no may-force `hash_w_strict`
+# residual stops the walk inside the transparent helper. pypy3 reports the same
+# two loops and no abort.
 # Self-checking regression guard for the frame-escape flush that resumes past
 # the abort. The synthetic suite discovers it as a self-checking fixture.
 # A residual (may-force) callee stores its own frame; the loop body then reads

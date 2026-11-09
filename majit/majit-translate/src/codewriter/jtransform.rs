@@ -1025,6 +1025,8 @@ const RECOGNIZED_JITDRIVER_RECEIVER_ROOTS: &[&str] = &[
     "UnpackIterableJitDriver",
     "GeneratorEntryJitDriver",
     "TupleHashJitDriver",
+    "ListExtendJitDriver",
+    "FilterJitDriver",
 ];
 
 /// The null-pointer builtins `HostEnv::bootstrap` registers
@@ -1582,14 +1584,24 @@ fn drop_guarded_gc_write_barriers(graph: &mut FunctionGraph) {
     }
     drops.sort_by(|a, b| b.cmp(a));
     for (bi, oi) in drops {
-        let is_void_list_wb = match &graph.blocks[bi].operations[oi].kind {
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } => is_list_write_barrier_path(segments),
-            _ => false,
-        };
-        if is_void_list_wb {
+        // `lloperation.py` `gc_writebarrier` / `rewrite.py` `gen_write_barrier`
+        // are void (`COND_CALL_GC_WB`). `list_write_barrier` is the same.
+        // A leftover Bool dest becomes `ConstBool(true)` so a reader of that
+        // dest stays defined; a void call is just removed.
+        let op = &graph.blocks[bi].operations[oi];
+        let is_void = op.result.is_none()
+            || match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    result_ty,
+                    ..
+                } => is_list_write_barrier_path(segments) || matches!(result_ty, ValueType::Void),
+                OpKind::CallResidual {
+                    result_kind: 'v', ..
+                } => true,
+                _ => false,
+            };
+        if is_void {
             graph.blocks[bi].operations.remove(oi);
         } else {
             graph.blocks[bi].operations[oi].kind = OpKind::ConstBool(true);
@@ -3869,6 +3881,8 @@ impl<'a> Transformer<'a> {
     /// `copygraph(graph, shallowvars=True)` and `Transformer.transform`
     /// rewrites that object.
     pub fn transform_owned(&mut self, graph: FunctionGraph) -> GraphTransformResult {
+        crate::call::set_compiling_graph(Some(graph.name.clone()));
+        crate::translator::rtyper::cutover::stamp_rootscope_int_bank(&graph);
         if let Some(cc) = self.callcontrol.as_deref_mut() {
             self.analysis_cache = std::mem::take(&mut cc.analysis_cache);
         }
@@ -3876,6 +3890,7 @@ impl<'a> Transformer<'a> {
         if let Some(cc) = self.callcontrol.as_deref_mut() {
             cc.analysis_cache = std::mem::take(&mut self.analysis_cache);
         }
+        crate::call::set_compiling_graph(None);
         result
     }
 
@@ -35920,6 +35935,17 @@ mod tests {
             jit_marker_key_from_target(&tuplehash_merge, &default_jitdriver_receiver_roots()),
             Some(JitMarkerKey::JitMergePoint)
         );
+        let list_extend_merge =
+            CallTarget::method("jit_merge_point", Some("ListExtendJitDriver".into()));
+        assert_eq!(
+            jit_marker_key_from_target(&list_extend_merge, &default_jitdriver_receiver_roots()),
+            Some(JitMarkerKey::JitMergePoint)
+        );
+        let filter_merge = CallTarget::method("jit_merge_point", Some("FilterJitDriver".into()));
+        assert_eq!(
+            jit_marker_key_from_target(&filter_merge, &default_jitdriver_receiver_roots()),
+            Some(JitMarkerKey::JitMergePoint)
+        );
 
         let merge = CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into()));
         assert_eq!(
@@ -41205,7 +41231,7 @@ mod tests {
         OpKind::Call {
             target: CallTarget::function_path(["pyre_object", "gc_hook", leaf]),
             args: crate::model::call_args(vec![obj.clone()]),
-            result_ty: ValueType::Bool,
+            result_ty: ValueType::Void,
         }
     }
 
@@ -41232,7 +41258,7 @@ mod tests {
                 "try_gc_write_barrier_from_array",
             ]),
             args: crate::model::call_args(vec![obj.clone(), index.clone()]),
-            result_ty: ValueType::Bool,
+            result_ty: ValueType::Void,
         }
     }
 
@@ -41271,8 +41297,8 @@ mod tests {
         graph.push_op_var(entry, wb_store(&obj, &stored), false);
         drop_guarded_gc_write_barriers(&mut graph);
         let ops = &graph.blocks[entry.0].operations;
-        assert!(matches!(ops[0].kind, OpKind::ConstBool(true)));
-        assert!(matches!(ops[1].kind, OpKind::FieldWrite { .. }));
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0].kind, OpKind::FieldWrite { .. }));
     }
 
     /// `rewrite.py gen_write_barrier`: the barrier belongs to the store,
@@ -41287,8 +41313,8 @@ mod tests {
         graph.push_op_var(entry, wb_call(&obj, "try_gc_write_barrier"), false);
         drop_guarded_gc_write_barriers(&mut graph);
         let ops = &graph.blocks[entry.0].operations;
+        assert_eq!(ops.len(), 1);
         assert!(matches!(ops[0].kind, OpKind::FieldWrite { .. }));
-        assert!(matches!(ops[1].kind, OpKind::ConstBool(true)));
     }
 
     /// A barrier whose argument has no neighbouring GC store in its block
@@ -41477,14 +41503,14 @@ mod tests {
             kind: OpKind::Call {
                 target: target.clone(),
                 args: crate::model::call_args(vec![obj.clone()]),
-                result_ty: ValueType::Bool,
+                result_ty: ValueType::Void,
             },
         };
         match transformer.rewrite_op_direct_call(
             &op,
             &target,
             std::slice::from_ref(&obj),
-            &ValueType::Bool,
+            &ValueType::Void,
             "wb_before_move",
             &mut graph,
         ) {
@@ -41517,8 +41543,9 @@ mod tests {
         graph.push_op_var(entry, wb_store(&list, &stored), false);
         drop_guarded_gc_write_barriers(&mut graph);
         let ops = &graph.blocks[entry.0].operations;
-        assert!(matches!(ops[1].kind, OpKind::ConstBool(true)));
-        assert!(matches!(ops[2].kind, OpKind::FieldWrite { .. }));
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0].kind, OpKind::UnaryOp { .. }));
+        assert!(matches!(ops[1].kind, OpKind::FieldWrite { .. }));
     }
 
     /// `jtransform.py _handle_list_call` rewrites `list.int_set_items` to
@@ -41573,8 +41600,8 @@ mod tests {
         graph.blocks[entry.0].operations[1] = ops.into_iter().next().unwrap();
         drop_guarded_gc_write_barriers(&mut graph);
         let kinds = &graph.blocks[entry.0].operations;
-        assert!(matches!(kinds[0].kind, OpKind::ConstBool(true)));
-        assert!(matches!(kinds[1].kind, OpKind::FieldWrite { .. }));
+        assert_eq!(kinds.len(), 1);
+        assert!(matches!(kinds[0].kind, OpKind::FieldWrite { .. }));
     }
 
     /// `jtransform.py handle_residual_call` rewrites a `dont_look_inside`
@@ -41606,13 +41633,13 @@ mod tests {
                 funcptr: CallFuncPtr::Value(fnaddr),
                 descriptor: CallDescriptor::from_signature(
                     &[majit_ir::value::Type::Ref],
-                    majit_ir::value::Type::Int,
+                    majit_ir::value::Type::Void,
                     EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::None),
                 ),
                 args_i: vec![],
                 args_r: vec![obj.clone()],
                 args_f: vec![],
-                result_kind: 'i',
+                result_kind: 'v',
                 indirect_targets: None,
             },
             false,
@@ -41621,14 +41648,10 @@ mod tests {
         graph.push_op_var(entry, wb_store(&obj, &stored), false);
         drop_guarded_gc_write_barriers(&mut graph);
         let kinds = &graph.blocks[entry.0].operations;
+        assert_eq!(kinds.len(), 3);
         assert!(matches!(kinds[0].kind, OpKind::ConstFnAddr { .. }));
-        assert!(
-            matches!(kinds[1].kind, OpKind::ConstBool(true)),
-            "residual barrier stayed {:?}",
-            kinds[1].kind
-        );
-        assert!(matches!(kinds[2].kind, OpKind::Live { .. }));
-        assert!(matches!(kinds[3].kind, OpKind::FieldWrite { .. }));
+        assert!(matches!(kinds[1].kind, OpKind::Live { .. }));
+        assert!(matches!(kinds[2].kind, OpKind::FieldWrite { .. }));
     }
 
     fn residual_wb(
@@ -41639,13 +41662,13 @@ mod tests {
             funcptr: CallFuncPtr::Value(fnaddr),
             descriptor: CallDescriptor::from_signature(
                 &[majit_ir::value::Type::Ref],
-                majit_ir::value::Type::Int,
+                majit_ir::value::Type::Void,
                 EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::None),
             ),
             args_i: vec![],
             args_r: vec![obj.clone()],
             args_f: vec![],
-            result_kind: 'i',
+            result_kind: 'v',
             indirect_targets: None,
         }
     }
@@ -41666,10 +41689,7 @@ mod tests {
         graph.push_op_var(store_block, wb_store(&obj, &stored), false);
         graph.set_goto(entry, store_block, vec![]);
         drop_guarded_gc_write_barriers(&mut graph);
-        assert!(matches!(
-            graph.blocks[entry.0].operations[0].kind,
-            OpKind::ConstBool(true)
-        ));
+        assert!(graph.blocks[entry.0].operations.is_empty());
         assert!(matches!(
             graph.blocks[store_block.0].operations[0].kind,
             OpKind::FieldWrite { .. }
@@ -41703,13 +41723,9 @@ mod tests {
         graph.set_goto(entry, store_block, vec![]);
         drop_guarded_gc_write_barriers(&mut graph);
         let kinds = &graph.blocks[entry.0].operations;
+        assert_eq!(kinds.len(), 2);
         assert!(matches!(kinds[0].kind, OpKind::ConstFnAddr { .. }));
-        assert!(
-            matches!(kinds[1].kind, OpKind::ConstBool(true)),
-            "residual barrier stayed {:?}",
-            kinds[1].kind
-        );
-        assert!(matches!(kinds[2].kind, OpKind::Live { .. }));
+        assert!(matches!(kinds[1].kind, OpKind::Live { .. }));
         assert!(matches!(
             graph.blocks[store_block.0].operations[0].kind,
             OpKind::FieldWrite { .. }
@@ -41742,10 +41758,7 @@ mod tests {
             vec![normal, except],
         );
         drop_guarded_gc_write_barriers(&mut graph);
-        assert!(matches!(
-            graph.blocks[entry.0].operations[0].kind,
-            OpKind::ConstBool(true)
-        ));
+        assert!(graph.blocks[entry.0].operations.is_empty());
     }
 
     /// A bool switch is not a unique fall-through: the store on one arm is

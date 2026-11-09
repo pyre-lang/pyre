@@ -5239,6 +5239,23 @@ impl<'a> Lowering<'a> {
                 // stays `InstanceRepr` (`rclass.py` `getgcflavor`); a
                 // type object is this case (`raw_struct_ptr_from_layout`).
                 if args.len() == 1 && self.is_raw_ptr_is_null(&reg) {
+                    // GCREF (`llmemory.py` `GCREF = Ptr(GcOpaqueType('GCREF'))`)
+                    // operand typed GCREF so `bool` lowers to `ptr_nonzero`
+                    // rather than `int_is_true` (`w_pytraceback_new`
+                    // `raw.is_null()`).
+                    if first_arg_ty
+                        .as_ref()
+                        .is_some_and(|ty| tyref_is_gcref_spelling(ty, self.llbc))
+                    {
+                        if !matches!(
+                            crate::model::FunctionGraph::concretetype_of(&args[0]),
+                            crate::model::ConcreteType::GcRef
+                        ) {
+                            args[0].set_concretetype(Some(
+                                crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+                            ));
+                        }
+                    }
                     let keep_is_none = self.is_raw_ptr_is_null_keeps_is_none(first_arg_ty.as_ref());
                     let res = self
                         .graph
@@ -6272,6 +6289,16 @@ impl<'a> Lowering<'a> {
                 // `name_path()`; the scope predicate keys on the module
                 // path, which the built `CallTarget::Method` drops.
                 callee_name_path = Some(segments.join("::"));
+                if self.try_lower_then_some(
+                    mir_bb,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 if self.try_lower_checked_neg(
                     mir_bb,
                     &reg.kind,

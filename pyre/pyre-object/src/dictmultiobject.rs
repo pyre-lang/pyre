@@ -567,6 +567,19 @@ pub unsafe fn dict_entries_key_obj_at(
     entries.slot_key(index).map(|stored| stored.obj)
 }
 
+/// `entries[i].key` object word after `_ll_dictnext` returned `i`
+/// (`rordereddict.py`). One `PyObjectRef`; `ObjectKey` by value is two words.
+#[inline]
+pub unsafe fn dict_entries_live_key_obj(entries: &ObjectDictStorage, slot: usize) -> PyObjectRef {
+    entries.live_key(slot).obj
+}
+
+/// `entries[i].value` after `_ll_dictnext` returned `i` (`rordereddict.py`).
+#[inline]
+pub unsafe fn dict_entries_live_value(entries: &ObjectDictStorage, slot: usize) -> PyObjectRef {
+    entries.live_value(slot)
+}
+
 /// The stored key's cached digest at an entry index — `rordereddict.py:1053
 /// entries.hash(i)`, the hash compared before `keyeq` is allowed to run.
 ///
@@ -1152,6 +1165,20 @@ pub unsafe fn w_dict_bytes_storage_mut<'a>(obj: PyObjectRef) -> &'a mut BytesDic
     &mut *(dict.dstorage as *mut BytesDictStorage)
 }
 
+/// Typed accessor for `IdentityDictStrategy.unerase(w_dict.dstorage)` —
+/// `identitydict.py`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject` on
+/// [`crate::identitydict::IDENTITY_DICT_STRATEGY`].
+#[inline]
+pub unsafe fn w_dict_identity_storage<'a>(
+    obj: PyObjectRef,
+) -> &'a crate::identitydict::IdentityDictStorage {
+    let dict = &*(obj as *const W_DictObject);
+    &*(dict.dstorage as *const crate::identitydict::IdentityDictStorage)
+}
+
 /// GC type id assigned to `W_DictObject` at JitDriver init time.
 pub const W_DICT_GC_TYPE_ID: u32 = 29;
 /// `gctypelayout.py` `TypeLayoutBuilder.get_type_id` identity for `W_DictObject`.
@@ -1267,6 +1294,20 @@ dict_storage_gc_type_id!(
     ObjectDictStorage,
     "Runtime-assigned GC type id for the `ObjectDictStorage` box."
 );
+
+/// `dictmultiobject.py create_empty_unicode_key_dict` — the empty
+/// `r_dict(unicode_eq, unicode_hash)` (`rordereddict.py ll_newdict`).
+/// `gc_alloc_young_storage_box` takes the `RDict` payload by value, which does
+/// not fit a residual argument slot, so the residual boundary is this zero-arg
+/// graph.
+#[majit_macros::dont_look_inside]
+#[inline(never)]
+pub fn create_empty_unicode_key_dict() -> GCREF {
+    crate::gc_storage::gc_alloc_young_storage_box(
+        object_dict_storage_new(),
+        object_dict_storage_gc_type_id(),
+    ) as GCREF
+}
 dict_storage_gc_type_id!(
     INT_DICT_STORAGE_GC_TYPE_ID,
     INT_DICT_STORAGE_GC_TYPE_ID_CELL,
@@ -1365,7 +1406,7 @@ impl W_DictMultiObject for W_DictObject {
 /// which jitcode never contains.
 #[majit_macros::dont_look_inside]
 #[inline]
-pub(crate) fn dict_write_barrier(obj: PyObjectRef) {
+pub fn dict_write_barrier(obj: PyObjectRef) {
     // `FixedObjectArray::set_ref`: inspect TRACK_YOUNG_PTRS inline and
     // enter the barrier only while the old holder still needs to be
     // remembered. The dict body is remembered for the `dstorage` field
@@ -1433,6 +1474,21 @@ pub unsafe fn w_dict_get_strategy(
     }
     let dict = &*(obj as *const W_DictObject);
     dict.dstrategy.imp
+}
+
+/// `DictStrategyRef.kind` on `W_DictObject.dstrategy` /
+/// `W_ModuleDictObject.mstrategy` — a getfield, not a vtable
+/// `strategy_kind` call (`strategy_is`).
+///
+/// # Safety
+/// `obj` must be a valid `W_DictObject` or `W_ModuleDictObject`.
+#[inline]
+pub unsafe fn w_dict_strategy_kind(obj: PyObjectRef) -> StrategyKind {
+    if is_module_dict(obj) {
+        let strat_ptr = (*(obj as *const W_ModuleDictObject)).mstrategy;
+        return (*strat_ptr).kind;
+    }
+    (*(obj as *const W_DictObject)).dstrategy.kind
 }
 
 /// `pypy/objspace/std/dictmultiobject.py W_DictMultiObject.set_strategy`
@@ -5316,6 +5372,137 @@ pub unsafe fn w_dict_nth_item(
     w_dict_get_strategy(obj).nth_item(obj, index)
 }
 
+/// `_ll_dictnext` (`rordereddict.py`) residual: first live slot at or after
+/// `from`, or `-1`. The non-virtual arm of `@jit.look_inside_iff`
+/// (`isvirtual(iter)` and `isvirtual(iter.dict)`); the oopspec residual is
+/// `_ll_1_odictiter_next`. `*mut` so `dont_look_inside` emits the word-ABI
+/// trampoline.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub unsafe fn object_dict_ll_dictnext(d: *mut ObjectDictStorage, from: i64) -> i64 {
+    (*d).next_valid_slot_i(from as usize)
+}
+
+/// `_ll_dictnext` residual for `IntDictStrategy` storage.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub unsafe fn int_dict_ll_dictnext(d: *mut IntDictStorage, from: i64) -> i64 {
+    (*d).next_valid_slot_i(from as usize)
+}
+
+/// `_ll_dictnext` residual for `BytesDictStrategy` storage.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub unsafe fn bytes_dict_ll_dictnext(d: *mut BytesDictStorage, from: i64) -> i64 {
+    (*d).next_valid_slot_i(from as usize)
+}
+
+/// `_ll_dictnext` residual for `IdentityDictStrategy` storage.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub unsafe fn identity_dict_ll_dictnext(
+    d: *mut crate::identitydict::IdentityDictStorage,
+    from: i64,
+) -> i64 {
+    (*d).next_valid_slot_i(from as usize)
+}
+
+/// `_ll_dictnext` residual for `ModuleDictStrategy` storage.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub unsafe fn module_dict_ll_dictnext(
+    d: *mut crate::celldict::ModuleDictStorage,
+    from: i64,
+) -> i64 {
+    (*d).next_valid_slot_i(from as usize)
+}
+
+/// `entries[i].key` after `_ll_dictnext` (`rordereddict.py` `rtype_next`
+/// getfield). Residual so the walked graph does not call `ptr::add`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub unsafe fn object_dict_live_key_obj(d: *mut ObjectDictStorage, slot: i64) -> *mut PyObject {
+    dict_entries_live_key_obj(&*d, slot as usize)
+}
+
+/// `entries[i].value` after `_ll_dictnext`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub unsafe fn object_dict_live_value(d: *mut ObjectDictStorage, slot: i64) -> *mut PyObject {
+    dict_entries_live_value(&*d, slot as usize)
+}
+
+/// Integer `entries[i].key` after `_ll_dictnext`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub unsafe fn int_dict_live_key(d: *mut IntDictStorage, slot: i64) -> i64 {
+    (*d).live_key(slot as usize)
+}
+
+/// `entries[i].value` after `_ll_dictnext` on int storage.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub unsafe fn int_dict_live_value(d: *mut IntDictStorage, slot: i64) -> *mut PyObject {
+    (*d).live_value(slot as usize)
+}
+
+/// Bytes `entries[i].key` block after `_ll_dictnext`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub unsafe fn bytes_dict_live_key(
+    d: *mut BytesDictStorage,
+    slot: i64,
+) -> *mut crate::bytesobject::BytesBlock {
+    (*d).live_key(slot as usize).0
+}
+
+/// `entries[i].value` after `_ll_dictnext` on bytes storage.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub unsafe fn bytes_dict_live_value(d: *mut BytesDictStorage, slot: i64) -> *mut PyObject {
+    (*d).live_value(slot as usize)
+}
+
+/// Identity `entries[i].key` after `_ll_dictnext`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub unsafe fn identity_dict_live_key(
+    d: *mut crate::identitydict::IdentityDictStorage,
+    slot: i64,
+) -> *mut PyObject {
+    (*d).live_key(slot as usize).0
+}
+
+/// `entries[i].value` after `_ll_dictnext` on identity storage.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub unsafe fn identity_dict_live_value(
+    d: *mut crate::identitydict::IdentityDictStorage,
+    slot: i64,
+) -> *mut PyObject {
+    (*d).live_value(slot as usize)
+}
+
+/// `ModuleDictStrategy.wrapkey` of `entries[i].key` after `_ll_dictnext`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub unsafe fn module_dict_live_key_obj(
+    d: *mut crate::celldict::ModuleDictStorage,
+    slot: i64,
+) -> *mut PyObject {
+    crate::celldict::_wrapkey((*d).live_key(slot as usize).as_str())
+}
+
+/// `unwrap_cell` of `entries[i].value` after `_ll_dictnext` on module storage.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub unsafe fn module_dict_live_value(
+    d: *mut crate::celldict::ModuleDictStorage,
+    slot: i64,
+) -> *mut PyObject {
+    crate::celldict::unwrap_cell((*d).live_value(slot as usize))
+}
+
 /// The next `(slot, key, value)` at or after `from`, and the slot to resume
 /// from — `_ll_dictnext` (`rordereddict.py`).
 ///
@@ -5329,10 +5516,119 @@ pub unsafe fn w_dict_next_item(
     from: usize,
 ) -> Option<(usize, PyObjectRef, PyObjectRef)> {
     lock_dict_refs!(_dict_guard, obj);
-    let strategy = w_dict_get_strategy(obj);
-    let slot = strategy.next_slot(obj, from)?;
-    let (key, value) = strategy.nth_item(obj, slot)?;
-    Some((slot, key, value))
+    // `_new_next` (`dictmultiobject.py`) does
+    // `getattr(self, 'next_' + TP + '_entry')` after the iterator's
+    // strategy is known. Promote `DictStrategyRef.kind` so the match is a
+    // green `guard_value`. The slot scan is `_ll_dictnext`
+    // (`rordereddict.py`): residual unless the dict is virtual.
+    let kind = majit_ir::jit::promote(w_dict_strategy_kind(obj));
+    match kind {
+        StrategyKind::Empty | StrategyKind::EmptyKwargs => None,
+        StrategyKind::Object | StrategyKind::Unicode => {
+            let d =
+                w_dict_object_storage(obj) as *const ObjectDictStorage as *mut ObjectDictStorage;
+            let slot = object_dict_ll_dictnext(d, from as i64);
+            if slot < 0 {
+                None
+            } else {
+                Some((
+                    slot as usize,
+                    object_dict_live_key_obj(d, slot),
+                    object_dict_live_value(d, slot),
+                ))
+            }
+        }
+        StrategyKind::Int => {
+            let d = w_dict_int_storage(obj) as *const IntDictStorage as *mut IntDictStorage;
+            let slot = int_dict_ll_dictnext(d, from as i64);
+            if slot < 0 {
+                None
+            } else {
+                let roots = crate::gc_roots::push_roots();
+                let value_slot = roots.base();
+                let _ = roots.pin_root(int_dict_live_value(d, slot));
+                let w_key = crate::w_int_new(int_dict_live_key(d, slot));
+                Some((slot as usize, w_key, roots.get(value_slot)))
+            }
+        }
+        StrategyKind::Bytes => {
+            let d = w_dict_bytes_storage(obj) as *const BytesDictStorage as *mut BytesDictStorage;
+            let slot = bytes_dict_ll_dictnext(d, from as i64);
+            if slot < 0 {
+                None
+            } else {
+                let roots = crate::gc_roots::push_roots();
+                let value_slot = roots.base();
+                let _ = roots.pin_root(bytes_dict_live_value(d, slot));
+                let w_key = crate::w_bytes_from_block(bytes_dict_live_key(d, slot));
+                Some((slot as usize, w_key, roots.get(value_slot)))
+            }
+        }
+        StrategyKind::Identity => {
+            let d = w_dict_identity_storage(obj) as *const crate::identitydict::IdentityDictStorage
+                as *mut crate::identitydict::IdentityDictStorage;
+            let slot = identity_dict_ll_dictnext(d, from as i64);
+            if slot < 0 {
+                None
+            } else {
+                Some((
+                    slot as usize,
+                    identity_dict_live_key(d, slot),
+                    identity_dict_live_value(d, slot),
+                ))
+            }
+        }
+        StrategyKind::Module => {
+            if w_module_dict_is_object_strategy(obj) {
+                let d = (*(obj as *const W_ModuleDictObject)).dstorage as *mut ObjectDictStorage;
+                let slot = object_dict_ll_dictnext(d, from as i64);
+                if slot < 0 {
+                    None
+                } else {
+                    Some((
+                        slot as usize,
+                        object_dict_live_key_obj(d, slot),
+                        object_dict_live_value(d, slot),
+                    ))
+                }
+            } else {
+                let d = w_module_dict_module_storage(obj)
+                    as *const crate::celldict::ModuleDictStorage
+                    as *mut crate::celldict::ModuleDictStorage;
+                let slot = module_dict_ll_dictnext(d, from as i64);
+                if slot < 0 {
+                    None
+                } else {
+                    let roots = crate::gc_roots::push_roots();
+                    let key_slot = roots.base();
+                    let _ = roots.pin_root(module_dict_live_key_obj(d, slot));
+                    let value = module_dict_live_value(d, slot);
+                    Some((slot as usize, roots.get(key_slot), value))
+                }
+            }
+        }
+        StrategyKind::Kwargs => {
+            let n = crate::kwargsdict::w_dict_kwargs_len(obj);
+            if from >= n {
+                None
+            } else {
+                Some((
+                    from,
+                    crate::kwargsdict::w_dict_kwargs_key_at(obj, from),
+                    crate::kwargsdict::w_dict_kwargs_value_at(obj, from),
+                ))
+            }
+        }
+        StrategyKind::Map | StrategyKind::Class => {
+            let strategy = w_dict_get_strategy(obj);
+            if from >= strategy.length(obj) {
+                None
+            } else {
+                let (key, value) = strategy.nth_item(obj, from)?;
+                Some((from, key, value))
+            }
+        }
+    }
 }
 
 /// The first live entry slot at or after `from`, for a walk that reads the
@@ -7085,7 +7381,14 @@ pub trait DictStrategy {
     /// # Safety
     /// `w_dict` must be a valid PyObjectRef.
     unsafe fn next_slot(&self, w_dict: PyObjectRef, from: usize) -> Option<usize> {
-        (from < self.length(w_dict)).then_some(from)
+        // `_ll_dictnext` (`rordereddict.py`) returns the index when
+        // `index < entries_len` and the entry is valid. The default
+        // numbers densely, so the live test is the bound alone.
+        if from < self.length(w_dict) {
+            Some(from)
+        } else {
+            None
+        }
     }
 
     /// [`Self::next_slot`] descending, for `reversed(d)`: PyPy's
@@ -8505,15 +8808,12 @@ impl DictStrategy for UnicodeDictStrategy {
     }
 
     fn get_empty_storage(&self) -> GCREF {
-        // `dictmultiobject.py create_empty_unicode_key_dict`
-        // returns an empty `r_dict(unicode_eq, unicode_hash)`, a nursery
-        // `dicttable`. Type namespaces (`type(name, (), {})`) land here
-        // on the first str store; a born-old box promoted the type at
-        // every minor through the remembered set.
-        crate::gc_storage::gc_alloc_young_storage_box(
-            crate::dictmultiobject::object_dict_storage_new(),
-            crate::dictmultiobject::object_dict_storage_gc_type_id(),
-        ) as GCREF
+        // `dictmultiobject.py UnicodeDictStrategy.get_empty_storage`:
+        // `create_empty_unicode_key_dict(space)`, a nursery `dicttable`. Type
+        // namespaces (`type(name, (), {})`) land here on the first str store;
+        // a born-old box promoted the type at every minor through the
+        // remembered set.
+        create_empty_unicode_key_dict()
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.getitem`.

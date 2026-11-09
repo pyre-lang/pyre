@@ -1226,10 +1226,21 @@ enum GetterAnswer {
     Slice { slice_local: usize, k: usize },
 }
 
-/// Peel a closure call of a [`SlotGetter`] down to the static slot index and
-/// the temporaries that only build the capture (`peel_closure_capture`,
-/// `peel_captured_index`, `peel_getter_addend`).
-fn try_slot_getter_call(
+/// Own pin dests [`try_slot_getter_call`] peels a capture against.
+fn slot_getter_own_pin_spec(spec: &Special) -> bool {
+    matches!(
+        spec,
+        Special::Index { .. }
+            | Special::IndexPair { .. }
+            | Special::SliceBase { .. }
+            | Special::SliceIndex { .. }
+            | Special::SliceIndexPair { .. }
+    )
+}
+
+/// Peel a classified [`SlotGetter`] as far as the captured own pin dest.
+/// `None` means the capture is not an own pin dest in `specials`.
+fn slot_getter_own_index_local(
     body: &Unstructured,
     llbc: &Llbc,
     call: &majit_charon_reader::ullbc::CallPayload,
@@ -1238,7 +1249,7 @@ fn try_slot_getter_call(
     call_dests: &bit_set::BitSet,
     forward_blocks: &[bool],
     cache: &mut HashMap<u64, Option<SlotGetter>>,
-) -> Option<(GetterAnswer, Vec<usize>)> {
+) -> Option<(SlotGetter, usize, super::PeeledCapture, Vec<usize>)> {
     let CallFunc::Regular(reg) = &call.func else {
         return None;
     };
@@ -1248,14 +1259,7 @@ fn try_slot_getter_call(
     let mut bases = HashMap::new();
     let mut candidates = bit_set::BitSet::new();
     for (local, spec) in specials {
-        if matches!(
-            spec,
-            Special::Index { .. }
-                | Special::IndexPair { .. }
-                | Special::SliceBase { .. }
-                | Special::SliceIndex { .. }
-                | Special::SliceIndexPair { .. }
-        ) {
+        if slot_getter_own_pin_spec(spec) {
             bases.insert(*local, 0);
             candidates.insert(0);
         }
@@ -1282,9 +1286,59 @@ fn try_slot_getter_call(
     };
     let (index_local, _, index_carriers) =
         super::peel_captured_index(llbc, body, &index, &peeled.capture)?;
+    specials
+        .get(&index_local)
+        .is_some_and(slot_getter_own_pin_spec)
+        .then_some((kind, index_local, peeled, index_carriers))
+}
+
+/// Peel a closure call of a [`SlotGetter`] down to the static slot index and
+/// the temporaries that only build the capture (`peel_closure_capture`,
+/// `peel_captured_index`, `peel_getter_addend`).
+fn try_slot_getter_call(
+    body: &Unstructured,
+    llbc: &Llbc,
+    call: &majit_charon_reader::ullbc::CallPayload,
+    specials: &HashMap<usize, Special>,
+    assigned: &HashMap<usize, usize>,
+    call_dests: &bit_set::BitSet,
+    forward_blocks: &[bool],
+    cache: &mut HashMap<u64, Option<SlotGetter>>,
+) -> Option<(GetterAnswer, Vec<usize>)> {
+    let (kind, index_local, peeled, index_carriers) = slot_getter_own_index_local(
+        body,
+        llbc,
+        call,
+        specials,
+        assigned,
+        call_dests,
+        forward_blocks,
+        cache,
+    )?;
     let peel_kind = match kind {
         SlotGetter::Capture | SlotGetter::CapturePlusConst(_) => super::RootSlotGetter::Capture,
         SlotGetter::CapturePlusArg => super::RootSlotGetter::CapturePlusArg,
+    };
+    let offsets: HashMap<usize, super::RootSlotSum> = HashMap::new();
+    let len_index: HashMap<usize, (usize, usize)> = HashMap::new();
+    let aliases: HashMap<usize, usize> = HashMap::new();
+    let mut bases = HashMap::new();
+    let mut candidates = bit_set::BitSet::new();
+    for (local, spec) in specials {
+        if slot_getter_own_pin_spec(spec) {
+            bases.insert(*local, 0);
+            candidates.insert(0);
+        }
+    }
+    let index = super::RootGetterIndex {
+        assigned,
+        bases: &bases,
+        offsets: &offsets,
+        len_index: &len_index,
+        candidates: &candidates,
+        aliases: &aliases,
+        call_dests,
+        forward_blocks,
     };
     let addend = super::peel_getter_addend(llbc, body, &index, peel_kind, &call.args)?;
     let body_addend = match kind {
@@ -1324,6 +1378,16 @@ fn try_slot_getter_call(
         return None;
     }
     Some((answer, carriers))
+}
+
+fn call_is_slot_getter(
+    call: &majit_charon_reader::ullbc::CallPayload,
+    llbc: &Llbc,
+    cache: &mut HashMap<u64, Option<SlotGetter>>,
+) -> bool {
+    call_fun_decl_id(call)
+        .and_then(|id| slot_getter_of(llbc, id, cache))
+        .is_some()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2489,6 +2553,25 @@ fn run_erase_walk(cx: &mut EraseWalk<'_>) -> Result<(), Refusal> {
                         cx.reach(bb, ERASE_SINGLE_EDGE, depth, lo, rel, open)?;
                         continue;
                     }
+                    // Classified getter of an own pin dest this walk did
+                    // not answer. Erasing the pin would leave residual
+                    // `shadow_stack_get` of that dest (`shadowstack.py`
+                    // `push_roots`). A getter of a nested leftover is
+                    // ParamSlots of that leftover, not of this body's pins.
+                    if slot_getter_own_index_local(
+                        body,
+                        llbc,
+                        call,
+                        &cx.specials,
+                        &cx.stmt_assigned,
+                        cx.call_dests,
+                        cx.forward_blocks,
+                        cx.getter_cache,
+                    )
+                    .is_some()
+                    {
+                        return Err("calls-stack-sensitive-fn");
+                    }
                     // Observes at Known(0) reads the caller's slots.
                     // Inside our Open the callee reads our pins, which
                     // become slot locals (`eval_slice_index` / `getindex_w`).
@@ -3119,6 +3202,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     // caller drops, so it is not this body's slots. ParamSlots methods
     // of that dest read the nested bracket.
     let owned_scope_locals = owned_scope_receiver_locals(body, llbc, &forward_blocks);
+    let mut getter_cache: HashMap<u64, Option<SlotGetter>> = HashMap::new();
     for (bb, block) in body.body().iter().enumerate() {
         if !forward_blocks[bb] {
             continue;
@@ -3127,6 +3211,13 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             && classify_call(call, llbc).is_none()
             && !call_is_anchor_identity(call, llbc)
         {
+            // `reload_import = |i| get(base + i)` is ParamSlots on the
+            // addend, but the captured `base` is this body's pin dest.
+            // The walk answers it as Get (`shadowstack.py` `push_roots`);
+            // refusing here would keep residual `pin_roots` + `get`.
+            if call_is_slot_getter(call, llbc, &mut getter_cache) {
+                continue;
+            }
             let effect = resolved_callee_effect(call, llbc, &|id| callee_effect_of(llbc, id));
             if effect.refuses_erase()
                 && !callee_leftover_is_owned_scope(call, llbc, &owned_scope_locals)
@@ -3176,7 +3267,6 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     }
     let mut const_locals: HashMap<usize, usize> = HashMap::new();
     let mut array_lens: HashMap<usize, usize> = HashMap::new();
-    let mut getter_cache: HashMap<u64, Option<SlotGetter>> = HashMap::new();
     if n_blocks == 0 {
         return Ok(None);
     }
@@ -5437,6 +5527,48 @@ fn copy_field_maps(
     }
 }
 
+/// Pin dests and leftover-slice dests as [`try_slot_getter_call`] specials.
+/// CapturePlusArg peels the captured local against this map so harvest
+/// treats `reload_import(k)` as Get of an own index (`shadowstack.py`
+/// `push_roots`), not ParamSlots of the relative addend.
+fn harvest_own_index_specials(
+    indices: &HashMap<usize, Depth>,
+    pairs: &HashMap<usize, Depth>,
+    slice_bases: &HashSet<usize>,
+) -> HashMap<usize, Special> {
+    let mut specials = HashMap::new();
+    for (&local, &d) in indices {
+        if let Some(k) = d.lower_bound() {
+            specials.insert(
+                local,
+                Special::Index {
+                    k,
+                    relative: false,
+                    floor: 0,
+                },
+            );
+        }
+    }
+    for (&local, &d) in pairs {
+        if let Some(k) = d.lower_bound() {
+            specials.insert(
+                local,
+                Special::IndexPair {
+                    k,
+                    relative: false,
+                    floor: 0,
+                },
+            );
+        }
+    }
+    for &local in slice_bases {
+        specials
+            .entry(local)
+            .or_insert(Special::SliceBase { slice_local: local });
+    }
+    specials
+}
+
 fn stack_walk(
     body: &Unstructured,
     llbc: &Llbc,
@@ -5454,6 +5586,27 @@ fn stack_walk(
             returns_index: false,
         };
     }
+    let forward_blocks = super::forward_reachable_mask(llbc, body);
+    let mut stmt_assigned: HashMap<usize, usize> = HashMap::new();
+    let mut call_dests = bit_set::BitSet::new();
+    for (bb, block) in body.body().iter().enumerate() {
+        if !forward_blocks[bb] {
+            continue;
+        }
+        for stmt in &block.statements {
+            if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref()
+                && let Some(dest) = place_local(place)
+            {
+                *stmt_assigned.entry(dest).or_default() += 1;
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
+            && let Some(dest) = place_local(&call.dest)
+        {
+            call_dests.insert(dest);
+        }
+    }
+    let mut getter_cache: HashMap<u64, Option<SlotGetter>> = HashMap::new();
     let mut why = String::new();
     let mut saw_open = false;
     let mut depth_in: Vec<Option<Depth>> = vec![None; n_blocks];
@@ -5866,7 +6019,22 @@ fn stack_walk(
                                 depth = d;
                             }
                         }
-                        if !call_is_anchor_identity(call, llbc) {
+                        // CapturePlusArg of an own pin dest is Get of
+                        // that dest plus the call-site addend, not
+                        // ParamSlots of Const 0 (`shadowstack.py`
+                        // `push_roots`).
+                        let getter_own = try_slot_getter_call(
+                            body,
+                            llbc,
+                            call,
+                            &harvest_own_index_specials(&indices, &pairs, &slice_bases),
+                            &stmt_assigned,
+                            &call_dests,
+                            &forward_blocks,
+                            &mut getter_cache,
+                        )
+                        .is_some();
+                        if !getter_own && !call_is_anchor_identity(call, llbc) {
                             let callee = resolved_callee_effect(call, llbc, effect);
                             // Four fields independently (`GraphAnalyzer` product
                             // transfer). Observes does not gate param-slots or

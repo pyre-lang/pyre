@@ -4248,6 +4248,11 @@ pub fn function_call_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
 /// whether or not a trace is recording: the CALL walker intercepts the
 /// `CallFn` residual, and after `abort: force quasi-immut` the regular
 /// interpreter still wants the gateway rather than `space.call_function`.
+///
+/// `unroll_safe`: `function.py Function.funccall` is `*args_w`-specialised
+/// so that graph has no loop (`policy.py look_inside_graph`). The slice
+/// form may inline `pin_roots` of a 0..=4-word run as a short loop.
+#[majit_macros::unroll_safe]
 pub fn funccall_result(
     func: PyObjectRef,
     args: &[PyObjectRef],
@@ -4338,6 +4343,10 @@ pub fn funccall_result(
 /// `try_new_for_call_with_closure_and_globals_obj` with one-shot
 /// `pin_roots` (`gc_push_roots` publishes the whole live set), matching
 /// `_flat_pycall_defaults`.
+///
+/// `unroll_safe`: `funccallunrolling` expands the copy in flowspace; rustc
+/// may inline `pin_roots` of that same bounded run as a loop.
+#[majit_macros::unroll_safe]
 fn funccall_flat_from_args(
     func: PyObjectRef,
     code: PyObjectRef,
@@ -4364,8 +4373,8 @@ fn funccall_flat_from_args(
     let closure = unsafe { function_get_closure(func) };
     // Pin globals/closure on the same scope as func/code/args so
     // `createframe` / `getexecutioncontext` / `FrameBox::new` /
-    // `frame_into_generator_for_function` / `get_eval_fn` stay under one
-    // `push_roots`, matching `_flat_pycall_defaults`.
+    // `frame_into_generator_for_function` / `eval_current_frame_raw` stay
+    // under one `push_roots`, matching `_flat_pycall_defaults`.
     let env_base = _roots.pin_roots(&[w_globals, closure]);
     let mut func = _roots.get(root_base);
 
@@ -4414,9 +4423,19 @@ fn funccall_flat_from_args(
             crate::call::frame_into_generator_for_function(new_frame, func)
         })
     } else {
+        // `function.py Function.funccall`: `return new_frame.run(...)`.
+        // `pyframe.py run` else is `execute_frame(None)`. ResidualRet of
+        // `get_eval_fn() -> PyResult` is one word; `eval_current_frame_raw`
+        // is the GCREF + pending-error form (`call_user_function_with_ctx`).
         pyre_object::with_roots!(func => {
-            let eval_fn = crate::call::get_eval_fn();
-            eval_fn(&mut new_frame, None)
+            let result = crate::call::eval_current_frame_raw(&mut new_frame);
+            if result.is_null() {
+                Err(crate::call::take_call_error().unwrap_or_else(|| {
+                    crate::PyError::value_error("call failed")
+                }))
+            } else {
+                Ok(result)
+            }
         })
     }
 }
@@ -4819,14 +4838,10 @@ fn _flat_pycall(
             }
         }
     } else {
-        let eval_fn = crate::call::get_eval_fn();
-        match eval_fn(&mut new_frame, None) {
-            Ok(v) => v,
-            Err(e) => {
-                crate::call::set_call_error(e);
-                pyre_object::PY_NULL
-            }
-        }
+        // `function.py _flat_pycall`: `return new_frame.run(...)`.
+        // ResidualRet of `get_eval_fn() -> PyResult` is one word;
+        // `eval_current_frame_raw` is the GCREF + pending-error form.
+        crate::call::eval_current_frame_raw(&mut new_frame)
     }
 }
 
@@ -4928,14 +4943,10 @@ fn _flat_pycall_defaults(
             }
         }
     } else {
-        let eval_fn = crate::call::get_eval_fn();
-        match eval_fn(&mut new_frame, None) {
-            Ok(v) => v,
-            Err(e) => {
-                crate::call::set_call_error(e);
-                pyre_object::PY_NULL
-            }
-        }
+        // `function.py _flat_pycall_defaults`: `return new_frame.run`.
+        // ResidualRet of `get_eval_fn() -> PyResult` is one word;
+        // `eval_current_frame_raw` is the GCREF + pending-error form.
+        crate::call::eval_current_frame_raw(&mut new_frame)
     }
 }
 

@@ -1532,6 +1532,73 @@ fn root_bracket_erasure_answers_a_pin_roots_run() {
         assert_eq!(plan.free_sites.get(&bb), Some(&3), "free call in bb{bb}");
     }
 
+    // `_5 = try_gc_write_barrier(arr); _5 = pin_roots(&[..])`: the dest is
+    // not a unique Call def, so the pin stays. Erasing it would leave
+    // `shadow_stack_get` reading the barrier Int (`rewrite.py`
+    // `gen_write_barrier` / `llop.gc_writebarrier` VOID).
+    let mut shared_dest = body_of(vec![mv(19), mv(20)]);
+    shared_dest.body_mut()[1].statements.pop();
+    shared_dest.body_mut()[1].set_terminator_kind(call(6, vec![mv(9)], 5, 2));
+    shared_dest.body_mut()[3].statements.remove(0);
+    shared_dest.body_mut()[3].set_terminator_kind(call(7, vec![copy(12)], 13, 4));
+    shared_dest.body_mut()[4].statements.remove(0);
+    shared_dest.body_mut()[5].set_terminator_kind(call(7, vec![mv(16)], 17, 6));
+    shared_dest.body_mut()[2].set_terminator_kind(call(5, vec![copy(6)], 5, 3));
+    let plan = super::analyze_root_brackets_with(
+        &fixture_llbc(),
+        &shared_dest,
+        &super::MovedOutLocals::with_set(&shared_dest, bit_set::BitSet::new()),
+        name_of,
+        touches,
+    );
+    assert!(
+        !plan.scopes.contains(3),
+        "a pin_roots dest another Call writes keeps the bracket"
+    );
+
+    // `pin_roots` whose `get` this pass cannot name stays: erasing the pin
+    // leaves `shadow_stack_get` of that dest (`dunder_import_inner`
+    // `reload_import`).
+    let mut unread = body_of(vec![mv(19), mv(20)]);
+    unread.body_mut()[1].statements.pop();
+    unread.body_mut()[1].set_terminator_kind(call(6, vec![mv(9)], 5, 2));
+    unread.body_mut()[3].statements.remove(0);
+    unread.body_mut()[3].set_terminator_kind(call(5, vec![copy(1)], 13, 4));
+    unread.body_mut()[4].statements.remove(0);
+    unread.body_mut()[5].set_terminator_kind(call(5, vec![copy(1)], 17, 6));
+    let plan = super::analyze_root_brackets_with(
+        &fixture_llbc(),
+        &unread,
+        &super::MovedOutLocals::with_set(&unread, bit_set::BitSet::new()),
+        name_of,
+        touches,
+    );
+    assert!(
+        !plan.scopes.contains(3),
+        "a pin_roots run with no named get keeps the bracket"
+    );
+
+    // A classified `get` of a different dest (`shadow_stack_len` /
+    // `w_mod`) is not a read of the `pin_roots` dest.
+    let mut run_dests = std::collections::HashMap::new();
+    run_dests.insert(5usize, (3usize, 1usize));
+    let mut bases = std::collections::HashMap::new();
+    bases.insert(5usize, 3usize);
+    let offsets: std::collections::HashMap<usize, super::RootSlotSum> =
+        std::collections::HashMap::new();
+    assert!(
+        !super::scope_gets_read_pin_run(3, &[(4, 8, 0)], &run_dests, &bases, &offsets),
+        "a get of a len dest is not a read of the pin_roots dest"
+    );
+    assert!(
+        super::scope_gets_read_pin_run(3, &[(4, 5, 0)], &run_dests, &bases, &offsets),
+        "a get of the pin_roots dest is a read"
+    );
+    assert!(
+        super::scope_gets_read_pin_run(3, &[], &std::collections::HashMap::new(), &bases, &offsets),
+        "a pin_root-only bracket has no pin_roots dest to require"
+    );
+
     // A read of a slot some other guard's pin filled is not this one's.
     let mut stray = body_of(vec![mv(19), mv(20)]);
     stray.body_mut()[3].set_terminator_kind(call(7, vec![copy(13)], 18, 4));

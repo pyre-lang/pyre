@@ -71,6 +71,19 @@ impl JitCodeSym for UnpackSym {
             .expect("jd1 drain body must contain a jit_merge_point")
             .pc
     }
+
+    fn set_redboxes(&mut self, redboxes: &[(OpRef, Type)]) {
+        // pyjitpl.py opimpl_jit_merge_point → reached_loop_header redboxes
+        if let Some(&(op, _)) = redboxes.first() {
+            self.root_base = op;
+        }
+        if let Some(&(op, _)) = redboxes.get(1) {
+            self.items_slot = op;
+        }
+        if let Some(&(op, _)) = redboxes.get(2) {
+            self.save_point = op;
+        }
+    }
 }
 
 /// jd1 `JitState`: reuses [`PyreMeta`] (the "shape of the traced code") and the

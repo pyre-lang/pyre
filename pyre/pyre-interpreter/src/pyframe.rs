@@ -497,14 +497,39 @@ pub mod frame_locals_proxy {
             let _ = roots.pin_root(key);
             let candidate_slot = key_slot + 1;
             let _ = roots.pin_root(pyre_object::PY_NULL);
-            // The scan hashes the key first whether it was reached to write or
-            // to read, so an unhashable key is a `TypeError` here rather than
-            // whatever the extras dict would go on to say about it.
-            let key_hash = crate::baseobjspace::hash_w_strict(roots.get(key_slot))?;
+            // Same exact-`str` split as [`Self::locals_plus_value`]: WTF-8
+            // bytes decide a unicode key (`framelocalsproxy_getkeyindex`), so
+            // that arm never residualizes `hash_w` (`descroperation.py`). A
+            // `hash_w_strict` residual inside this `@unroll_safe` helper is
+            // `EF_RANDOM_EFFECTS`; look-inside then
+            // `residualize_inline_call_via_fnaddr` sees the graph's symbolic
+            // fnaddr and aborts `OrthodoxSubWalkTraceUnsupported`.
+            let exact_str_key = unsafe {
+                pyre_object::pyobject::is_exact_type(
+                    roots.get(key_slot),
+                    &pyre_object::pyobject::STR_TYPE,
+                )
+            };
+            // Non-str keys still hash first so an unhashable key is a
+            // `TypeError` here rather than whatever the extras dict would
+            // go on to say about it.
+            let key_hash = if exact_str_key {
+                0
+            } else {
+                crate::baseobjspace::hash_w_strict(roots.get(key_slot))?
+            };
             // `code` addresses the compiler code object, which lives outside
             // the GC heap and so stays valid across those collections.
             let code = self.frame().code();
-            let matches = |name: &str| -> Result<bool, crate::PyError> {
+            let same_name = |name: &str| -> Result<bool, crate::PyError> {
+                if exact_str_key {
+                    // Comparing WTF-8 bytes decides an exact `str` key
+                    // outright, so it needs neither the hash nor a candidate
+                    // allocation (`locals_plus_value`).
+                    return Ok(unsafe { pyre_object::w_str_get_wtf8(roots.get(key_slot)) }
+                        .as_bytes()
+                        == name.as_bytes());
+                }
                 roots.set(candidate_slot, pyre_object::w_str_new_managed(name));
                 // A name whose hash differs is never compared, so a key that
                 // claims equality with a name it does not hash like does not
@@ -526,20 +551,20 @@ pub mod frame_locals_proxy {
                 if hidden_local(code, index) {
                     continue;
                 }
-                if matches(code.varnames[index].as_str())? {
+                if same_name(code.varnames[index].as_str())? {
                     return Ok(Some(index));
                 }
             }
             let npure = super::npure_cellvars(code);
             for i in 0..npure {
                 let name = code.cellvars[super::nth_pure_cellvar_index(code, i)].as_str();
-                if matches(name)? {
+                if same_name(name)? {
                     return Ok(Some(nvar + i));
                 }
             }
             let nfree = code.freevars.len();
             for i in 0..nfree {
-                if matches(code.freevars[i].as_str())? {
+                if same_name(code.freevars[i].as_str())? {
                     return Ok(Some(nvar + npure + i));
                 }
             }
@@ -1583,6 +1608,13 @@ pub const PYFRAME_GC_TYPE_ID: u32 = 37;
 pub static PYFRAME_GC_TYPE_ID_CELL: pyre_object::lltype::TypeIdCell =
     pyre_object::lltype::TypeIdCell::with(PYFRAME_GC_TYPE_ID);
 
+impl pyre_object::lltype::GcType for PyFrame {
+    fn type_id() -> u32 {
+        PYFRAME_GC_TYPE_ID
+    }
+    const SIZE: usize = std::mem::size_of::<PyFrame>();
+}
+
 /// GC type id appended after the existing runtime registration census.
 /// `FrameDebugData` is stationary old-gen for a GC-owned frame.  Keep this
 /// at the tail of `pyre-jit::eval::build_gc` so older type ids never shift.
@@ -1719,6 +1751,17 @@ unsafe fn alloc_frame_locals_array(
         return std::ptr::null_mut();
     }
     unsafe { alloc_fixed_array_with_header(len, fill) }
+}
+
+/// `rlist.py _ll_alloc_and_clear` for `PyFrame.locals_cells_stack_w`
+/// (`[None] * size` in `PyFrame.__init__`). A traced call is
+/// `new_array_clear`; the fill loop stays in this body so
+/// `look_inside_graph` does not residualize `__init__`.
+#[inline(never)]
+#[majit_macros::oopspec("newlist_clear(count)")]
+unsafe fn ll_new_frame_locals_array(count: i64) -> *mut FixedObjectArray {
+    let count = if count < 0 { 0 } else { count as usize };
+    unsafe { alloc_frame_locals_array(count, PY_NULL, FrameLocalsArrayAllocation::NurseryGc) }
 }
 
 /// Write barrier for a batch of stores into a frame's
@@ -1984,17 +2027,19 @@ impl FrameBox {
             // is already on `frame_root`; the hook's own slot carries the
             // locals array, and the read-back below goes through `frame_root`
             // like the other fields.
+            //
+            // The `*_raw` twin is `#[dont_look_inside]` (`rlib/jit.py`) so
+            // `policy.py look_inside_graph` residualizes the hook instead of
+            // recording `GC_ALLOC_COLLECTING_ROOTED_HOOK` as `__dyn_call`.
             let mut allocation_root = frame_root.get(inputs + 2) as pyre_object::gc_hook::GCREF;
-            pyre_object::gc_hook::GcAllocOutcome::from_hook(unsafe {
-                pyre_object::gc_hook::try_gc_alloc_collecting_rooted(
+            unsafe {
+                pyre_object::gc_hook::try_gc_alloc_collecting_rooted_raw(
                     PYFRAME_GC_TYPE_ID,
                     std::mem::size_of::<PyFrame>(),
                     &mut allocation_root,
                     &mut needs_write_barrier,
                 )
-            })
-            .allocated_or_raise()
-            .unwrap_or(std::ptr::null_mut())
+            }
         };
         if !raw.is_null() {
             // RPython allocation results stay live in the translated shadow
@@ -2517,6 +2562,11 @@ pub struct FrameLocalsRoot {
 }
 
 impl FrameLocalsRoot {
+    /// Residual when the dest is not a local-aggregate erase: returning
+    /// `Self` is two words and is not ResidualRet-safe. Walked
+    /// `createframe` / `finish_for_call_with_globals_obj` keep this
+    /// constructor so `gc_root_registration` can erase the opener
+    /// (`gctransform/framework.py` roots the frame; the CALL must not stay).
     #[majit_macros::dont_look_inside]
     pub fn new(frame_ptr: *mut PyFrame) -> Self {
         if frame_ptr.is_null() {
@@ -2585,7 +2635,15 @@ pub fn unregister_frame_locals_slot(frame_ptr: *mut PyFrame) {
 /// projection, which `vable_projection_census` allows only on
 /// `FrameBox::new`. `inline(never)` keeps the deref in this function's
 /// LLBC so the census does not attribute it to the caller.
+///
+/// `dont_look_inside`: `jtransform.py is_virtualizable_getset` allows
+/// the array SETFIELD only when `fresh_virtualizable` is on the same
+/// graph (`PyFrame.__init__`). This helper's `frame_ptr` argument has
+/// no such flag, so a candidate graph panics with "virtualizable array
+/// is passed around". The write cannot collect; residual CALL is the
+/// census isolation.
 #[inline(never)]
+#[majit_macros::dont_look_inside]
 unsafe fn store_locals_cells_stack_w(frame_ptr: *mut PyFrame, array: *mut FixedObjectArray) {
     unsafe {
         (*frame_ptr).locals_cells_stack_w = array;
@@ -4537,8 +4595,11 @@ impl PyFrame {
     ///
     /// The binding is the canonical `W_DictObject`, not the raw `DictStorage`
     /// proxy, so those opcodes route through the object.
-    fn bind_unoptimized_locals_scope(&mut self) -> Result<(), crate::PyError> {
-        let flags = self.co_flags();
+    ///
+    /// `pyframe.py initialize_frame_scopes` reads `flags = code.co_flags`
+    /// off the `PyCode` argument (`pycode.py` `_immutable_fields_ co_flags`).
+    fn bind_unoptimized_locals_scope(&mut self, code: PyObjectRef) -> Result<(), crate::PyError> {
+        let flags = unsafe { (*(code as *const crate::pycode::PyCode)).co_flags };
         if flags & crate::astcompiler::consts::CO_OPTIMIZED != 0 {
             return Ok(());
         }
@@ -4602,7 +4663,10 @@ impl PyFrame {
         let _ = roots.pin_root(self as *mut PyFrame as PyObjectRef);
         let outer_slot = frame_slot + 1;
         let _ = roots.pin_root(outer_func);
-        unsafe { (*(roots.get(frame_slot) as *mut PyFrame)).bind_unoptimized_locals_scope()? };
+        unsafe {
+            (*(roots.get(frame_slot) as *mut PyFrame))
+                .bind_unoptimized_locals_scope(_code as PyObjectRef)?
+        };
 
         // `pyframe.py initialize_frame_scopes` reads the `code` argument,
         // which is this frame's `self.pycode`. The compiler `CodeObject` is
@@ -6805,35 +6869,14 @@ impl PyFrame {
         closure: PyObjectRef,
         allocation: FrameLocalsArrayAllocation,
     ) -> Result<Self, crate::PyError> {
-        // The RPython shadowstack transform roots every live call argument
-        // around `pick_builtin`, which may allocate or execute a mapping
-        // lookup.  A JIT residual call passes Rust copies of gcmap-backed
-        // values here; after a collection only the gcmap/shadow slots are
-        // forwarded, so never carry the original slice across that call.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let mut live = Vec::with_capacity(3 + args.len());
-        live.push(code as PyObjectRef);
-        live.push(w_globals);
-        live.push(closure);
-        live.extend_from_slice(args);
-        let root_base = _roots.pin_roots(&live);
-        let w_builtin = crate::baseobjspace::frame_builtin_obj_checked(
-            _roots.get(root_base + 1),
-            execution_context,
-        )?;
-        // Reload the argument tail of `live` from the forwarded slots; the
-        // buffer that published the roots is the one handed on.
-        for i in 0..args.len() {
-            live[3 + i] = _roots.get(root_base + 3 + i);
-        }
         Self::finish_for_call_with_globals_obj(
-            _roots.get(root_base) as *const (),
-            &live[3..],
-            _roots.get(root_base + 1),
+            code,
+            args,
+            w_globals,
             execution_context,
-            _roots.get(root_base + 2),
-            w_builtin,
+            closure,
             allocation,
+            true,
         )
     }
 
@@ -6850,42 +6893,36 @@ impl PyFrame {
         closure: PyObjectRef,
         allocation: FrameLocalsArrayAllocation,
     ) -> Result<Self, crate::PyError> {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let mut live = Vec::with_capacity(3 + args.len());
-        live.push(code as PyObjectRef);
-        live.push(w_globals);
-        live.push(closure);
-        live.extend_from_slice(args);
-        let root_base = _roots.pin_roots(&live);
-        let w_builtin =
-            crate::baseobjspace::frame_builtin_obj(_roots.get(root_base + 1), execution_context);
-        // Reload the argument tail of `live` from the forwarded slots; the
-        // buffer that published the roots is the one handed on.
-        for i in 0..args.len() {
-            live[3 + i] = _roots.get(root_base + 3 + i);
-        }
         Self::finish_for_call_with_globals_obj(
-            _roots.get(root_base) as *const (),
-            &live[3..],
-            _roots.get(root_base + 1),
+            code,
+            args,
+            w_globals,
             execution_context,
-            _roots.get(root_base + 2),
-            w_builtin,
+            closure,
             allocation,
+            false,
         )
     }
 
-    /// Common tail of the frame builders: everything in `Frame.__init__`
-    /// except the `pick_builtin` resolution, which is lifted to the callers
-    /// so the fallible variant can propagate its error.
+    /// Common `Frame.__init__` body (`pyframe.py initialize_frame_scopes` /
+    /// `function.py _flat_pycall`). `pyframe.py Frame.__init__` resolves
+    /// `self.builtin` through `pick_builtin(w_globals)` after the livevars
+    /// are rooted (`baseobjspace.py createframe`); `checked` selects
+    /// `frame_builtin_obj_checked` vs `frame_builtin_obj`. The result is
+    /// stored in the reserved `root_base + 3` slot published as `PY_NULL`.
+    ///
+    /// `pyframe.py initialize_frame_scopes` is `@jit.unroll_safe`; this fused
+    /// `__init__` tail owns those cell/arg loops. Without the hint
+    /// `policy.py look_inside_graph` residualizes the constructor.
+    #[majit_macros::unroll_safe]
     fn finish_for_call_with_globals_obj(
         code: *const (),
         args: &[PyObjectRef],
         w_globals: PyObjectRef,
         execution_context: *const PyExecutionContext,
         closure: PyObjectRef,
-        w_builtin: PyObjectRef,
         allocation: FrameLocalsArrayAllocation,
+        checked: bool,
     ) -> Result<Self, crate::PyError> {
         // `alloc_frame_locals_array` is a collection point.  Keep the call
         // inputs in real shadow-stack slots and populate the new locals array
@@ -6899,16 +6936,44 @@ impl PyFrame {
         //
         // Through the bracket's own cell rather than the free functions, which
         // re-resolve the thread local on every call.
-        let root_base = _roots.publish(&[code as PyObjectRef, w_globals, closure, w_builtin]);
+        let root_base = _roots.publish(&[code as PyObjectRef, w_globals, closure, PY_NULL]);
         let args_base = _roots.publish(args);
         _roots.normalize(root_base, 4 + args.len());
+        // `pyframe.py Frame.__init__` resolves `self.builtin` here, with the
+        // args already rooted.
+        let w_builtin = if checked {
+            crate::baseobjspace::frame_builtin_obj_checked(
+                _roots.get(root_base + 1),
+                execution_context,
+            )?
+        } else {
+            crate::baseobjspace::frame_builtin_obj(_roots.get(root_base + 1), execution_context)
+        };
+        _roots.set(root_base + 3, w_builtin);
         let code_ref = unsafe { &*(crate::w_code_get_ptr(_roots.get(root_base))) };
         let num_locals = code_ref.varnames.len();
         let num_cells = ncells(code_ref);
         let max_stack = code_ref.max_stackdepth as usize;
 
+        // `rlist.py _ll_alloc_and_clear` / `PyFrame.__init__` `[None] * size`.
+        // The nursery helper is `#[oopspec("newlist_clear(count)")]` so
+        // `jtransform.py do_fixed_newlist_clear` rewrites the call to
+        // `new_array_clear`; `alloc_frame_locals_array`'s fill loop would
+        // otherwise make `policy.py look_inside_graph` residualize this
+        // constructor (`contains_loop`).
         let locals_cells_stack_w = unsafe {
-            alloc_frame_locals_array(num_locals + num_cells + max_stack, PY_NULL, allocation)
+            match allocation {
+                FrameLocalsArrayAllocation::NurseryGc => {
+                    ll_new_frame_locals_array((num_locals + num_cells + max_stack) as i64)
+                }
+                FrameLocalsArrayAllocation::OldGenGc | FrameLocalsArrayAllocation::StdAlloc => {
+                    alloc_frame_locals_array(
+                        num_locals + num_cells + max_stack,
+                        PY_NULL,
+                        allocation,
+                    )
+                }
+            }
         };
         if pyre_object::gc_hook::gc_alloc_failed_pending() && locals_cells_stack_w.is_null() {
             return Err(crate::runtime_ops::fetch_memory_error());
@@ -7023,7 +7088,7 @@ impl PyFrame {
             // scope binding it would have done.  `FunctionType(co, globals)` over
             // a module-level code object arrives here, and without the binding its
             // `STORE_NAME`s land in a throwaway mapping instead of `globals`.
-            if let Err(err) = frame.bind_unoptimized_locals_scope() {
+            if let Err(err) = frame.bind_unoptimized_locals_scope(_roots.get(root_base)) {
                 drop(_locals_root);
                 std::mem::forget(frame);
                 return Err(err);
@@ -7055,21 +7120,19 @@ impl PyFrame {
         unsafe { &*(*(self.pycode as *const crate::pycode::PyCode)).code_ptr }
     }
 
-    /// `pycode.py` `PyCode.co_flags` — the compiler flag word
-    /// (`astcompiler/consts.py` `CO_*` bits). `CodeFlags` is
-    /// `repr(transparent)` over that `u32`; `bits()` is the word.
-    /// `pyframe.py` `_is_generator_or_coroutine` reads
-    /// `self.getcode().co_flags`; `getcode` is
-    /// `hint(self.pycode, promote=True)`. The translated `bitflags` `bits`
-    /// body reads that word.
+    /// `pyframe.py` `self.getcode().co_flags`: `getcode` is
+    /// `hint(self.pycode, promote=True)` and `co_flags` is the `PyCode`
+    /// field (`pycode.py` `_immutable_fields_`).
     #[inline]
     pub fn co_flags(&self) -> u32 {
-        self.getcode().flags.bits()
+        unsafe { (*(self.getcode_w() as *const crate::pycode::PyCode)).co_flags }
     }
 
     #[inline]
     pub fn _is_generator_or_coroutine(&self) -> bool {
-        let flags = self.co_flags();
+        // pyframe.py `_is_generator_or_coroutine`:
+        // `(self.getcode().co_flags & (CO_COROUTINE | CO_GENERATOR | CO_ASYNC_GENERATOR)) != 0`
+        let flags = unsafe { (*(self.getcode_w() as *const crate::pycode::PyCode)).co_flags };
         flags
             & (crate::astcompiler::consts::CO_GENERATOR
                 | crate::astcompiler::consts::CO_COROUTINE

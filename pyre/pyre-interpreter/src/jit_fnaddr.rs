@@ -3002,6 +3002,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::root_scope_close_word",
         pyre_object::gc_roots::root_scope_close_word,
     );
+    // The bracket's open. `dont_look_inside` residualises `push_roots`; the
+    // result is one `save_point` word. An unbound path aborts any walk that
+    // inlines `next` through the shortcut pin.
+    pa0!(
+        &mut entries,
+        "pyre_object::gc_roots::push_roots",
+        "pyre_object::push_roots",
+        pyre_object::gc_roots::push_roots,
+    );
     cpa2!(
         &mut entries,
         "pyre_object::typeobject::w_type_set_uses_object_setattr",
@@ -3272,6 +3281,21 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "w_dict_new",
         pyre_object::dictmultiobject::w_dict_new
     );
+    // `dictmultiobject.py create_empty_unicode_key_dict` residualises as
+    // `r_dict` / `ll_newdict` (`rordereddict.py`). Zero-arg `fn() -> GCREF`
+    // so the storage-box malloc resolves; the payload-by-value
+    // `gc_alloc_young_storage_box` graph does not fit a residual slot.
+    pa0!(
+        &mut entries,
+        "pyre_object::dictmultiobject::create_empty_unicode_key_dict",
+        "pyre_object::create_empty_unicode_key_dict",
+        pyre_object::dictmultiobject::create_empty_unicode_key_dict,
+    );
+    p0!(
+        &mut entries,
+        "create_empty_unicode_key_dict",
+        pyre_object::dictmultiobject::create_empty_unicode_key_dict
+    );
     // `w_dict_new_instance` is `#[dont_look_inside]` (it dispatches through the
     // `MAKE_INSTANCE_DICT_HOOK` fn-pointer cell); bind its zero-arg
     // `fn() -> PyObjectRef` so the residual call resolves, mirroring `w_dict_new`.
@@ -3529,6 +3553,18 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::gc_hook::try_gc_alloc_nursery_raw",
         "pyre_object::try_gc_alloc_nursery_raw",
         pyre_object::gc_hook::try_gc_alloc_nursery_raw,
+    );
+    // Collecting twin of the nursery residual: `malloc_fixedsize`
+    // (`incminimark.py`) when the nursery is full runs `collect_and_reserve`.
+    // `FrameBox::new` / `PyFrame.__init__` reaches it once
+    // `look_inside_graph` admits the constructor (`unroll_safe` on
+    // `_flat_pycall` / `initialize_frame_scopes`). A `GCREF` return is one
+    // residual word; the `Option<GCREF>` accessor is not (`ResidualRet`).
+    upa4!(
+        &mut entries,
+        "pyre_object::gc_hook::try_gc_alloc_collecting_rooted_raw",
+        "pyre_object::try_gc_alloc_collecting_rooted_raw",
+        pyre_object::gc_hook::try_gc_alloc_collecting_rooted_raw,
     );
     // `w_int_gc_alloc` is the collector-heap arm of `w_int_new`, reached from
     // inside a descended body whenever a fold boxes an int. Bind the
@@ -4158,6 +4194,24 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::pycode::w_code_get_w_globals",
         crate::pycode::w_code_get_w_globals,
+    );
+    // `pycode.py frame_stores_global` is a field store. These two helpers are
+    // the pyre-only live-wrapper / stamped-globals registries for the raw
+    // `CodeObject` / GC `PyCode` split; both take a process-global Mutex
+    // HashMap and are `dont_look_inside`. Void + `"ir"` / `"r"` is
+    // ResidualRet-safe. Bind both so a walked `createframe` residual is a
+    // real address rather than a symbolic abort.
+    pa2!(
+        &mut entries,
+        "pyre_interpreter::pycode::register_live_code_wrapper",
+        "pyre_interpreter::register_live_code_wrapper",
+        crate::pycode::register_live_code_wrapper,
+    );
+    pa1!(
+        &mut entries,
+        "pyre_interpreter::pycode::register_w_globals_stamped_code",
+        "pyre_interpreter::register_w_globals_stamped_code",
+        crate::pycode::register_w_globals_stamped_code,
     );
     // `name_idx` is `u32 -> u32`. The word bridge is what the residual reads.
     cp1!(
@@ -5656,6 +5710,33 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::dict_entries_insert_hashed",
         dict_entries_insert_hashed_word,
     );
+    // `rordereddict.py ll_dict_setitem` callback-free / reentrant probes
+    // (`@jit.dont_look_inside`, `rlib/jit.py`).
+    publish_upa6(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_object_setitem_callback_free",
+        "pyre_object::w_dict_object_setitem_callback_free",
+        |obj, key, hash, hash_known, value, hash_out| unsafe {
+            pyre_object::dictmultiobject::w_dict_object_setitem_callback_free(
+                obj, key, hash, hash_known, value, hash_out,
+            )
+        },
+        pyre_object::dictmultiobject::w_dict_object_setitem_callback_free,
+    );
+    upa4!(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_object_setitem_reentrant",
+        "pyre_object::w_dict_object_setitem_reentrant",
+        pyre_object::dictmultiobject::w_dict_object_setitem_reentrant,
+    );
+    // `instance_write_barrier` analog: GC header-flag test stays residual
+    // (`rlib/jit.py dont_look_inside`).
+    pa1!(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_write_barrier",
+        "pyre_object::dict_write_barrier",
+        pyre_object::dictmultiobject::dict_write_barrier,
+    );
     upa1!(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_pop_last",
@@ -5741,6 +5822,99 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::dictmultiobject::w_dict_unicode_key_hash",
         "pyre_object::w_dict_unicode_key_hash",
         pyre_object::dictmultiobject::__majit_call_target_w_dict_unicode_key_hash,
+    );
+    // `_ll_dictnext` (`rordereddict.py`) residual: signed slot or -1.
+    // `support.py _ll_1_odictiter_next`. The trampoline is the word ABI
+    // `dont_look_inside` emits for each monomorphic storage.
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::object_dict_ll_dictnext",
+        "pyre_object::object_dict_ll_dictnext",
+        pyre_object::dictmultiobject::__majit_call_target_object_dict_ll_dictnext,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::int_dict_ll_dictnext",
+        "pyre_object::int_dict_ll_dictnext",
+        pyre_object::dictmultiobject::__majit_call_target_int_dict_ll_dictnext,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::bytes_dict_ll_dictnext",
+        "pyre_object::bytes_dict_ll_dictnext",
+        pyre_object::dictmultiobject::__majit_call_target_bytes_dict_ll_dictnext,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::identity_dict_ll_dictnext",
+        "pyre_object::identity_dict_ll_dictnext",
+        pyre_object::dictmultiobject::__majit_call_target_identity_dict_ll_dictnext,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::module_dict_ll_dictnext",
+        "pyre_object::module_dict_ll_dictnext",
+        pyre_object::dictmultiobject::__majit_call_target_module_dict_ll_dictnext,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::object_dict_live_key_obj",
+        "pyre_object::object_dict_live_key_obj",
+        pyre_object::dictmultiobject::__majit_call_target_object_dict_live_key_obj,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::object_dict_live_value",
+        "pyre_object::object_dict_live_value",
+        pyre_object::dictmultiobject::__majit_call_target_object_dict_live_value,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::int_dict_live_key",
+        "pyre_object::int_dict_live_key",
+        pyre_object::dictmultiobject::__majit_call_target_int_dict_live_key,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::int_dict_live_value",
+        "pyre_object::int_dict_live_value",
+        pyre_object::dictmultiobject::__majit_call_target_int_dict_live_value,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::bytes_dict_live_key",
+        "pyre_object::bytes_dict_live_key",
+        pyre_object::dictmultiobject::__majit_call_target_bytes_dict_live_key,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::bytes_dict_live_value",
+        "pyre_object::bytes_dict_live_value",
+        pyre_object::dictmultiobject::__majit_call_target_bytes_dict_live_value,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::identity_dict_live_key",
+        "pyre_object::identity_dict_live_key",
+        pyre_object::dictmultiobject::__majit_call_target_identity_dict_live_key,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::identity_dict_live_value",
+        "pyre_object::identity_dict_live_value",
+        pyre_object::dictmultiobject::__majit_call_target_identity_dict_live_value,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::module_dict_live_key_obj",
+        "pyre_object::module_dict_live_key_obj",
+        pyre_object::dictmultiobject::__majit_call_target_module_dict_live_key_obj,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::dictmultiobject::module_dict_live_value",
+        "pyre_object::module_dict_live_value",
+        pyre_object::dictmultiobject::__majit_call_target_module_dict_live_value,
     );
     // A runtime-mutable global counter, not a build-time constant: bind the
     // read seam by address so the JIT calls it instead of folding whatever
@@ -6187,6 +6361,39 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::stack_check::drain_jit_pending_exception",
         crate::stack_check::drain_jit_pending_exception_jit_abi,
+    );
+    // jd3 `DoneWithThisFrameInt` analogue: Void marker then Int kind /
+    // parked append-count. Both helpers are `dont_look_inside` TLS takes
+    // (`call.rs` `list_extend_compiled_kind` / `list_extend_compiled_i`).
+    cp0!(
+        &mut entries,
+        "pyre_interpreter::call::list_extend_compiled_kind",
+        crate::call::list_extend_compiled_kind,
+    );
+    cp0!(
+        &mut entries,
+        "pyre_interpreter::call::list_extend_compiled_i",
+        crate::call::list_extend_compiled_i,
+    );
+    // jd4 `DoneWithThisFrameRef` analogue: Void marker then Int kind /
+    // parked object. Both helpers are `dont_look_inside` TLS takes
+    // (`call.rs` `filter_compiled_kind` / `filter_compiled_obj`).
+    cp0!(
+        &mut entries,
+        "pyre_interpreter::call::filter_compiled_kind",
+        crate::call::filter_compiled_kind,
+    );
+    cpa0!(
+        &mut entries,
+        "pyre_interpreter::call::filter_compiled_obj",
+        "pyre_interpreter::filter_compiled_obj",
+        crate::call::filter_compiled_obj,
+    );
+    cpa3!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::filter_jitdriver_jit_abi",
+        "pyre_interpreter::filter_jitdriver_jit_abi",
+        crate::baseobjspace::filter_jitdriver_jit_abi,
     );
 
     // `ncells` / `npure_cellvars` take a `CodeObject` and carry
@@ -9923,6 +10130,24 @@ mod tests {
             &bindings,
             "pyre_interpreter::pycode::w_code_get_w_globals",
             crate::pycode::w_code_get_w_globals as *const () as usize as i64,
+        );
+        let live = crate::pycode::register_live_code_wrapper as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::pycode::register_live_code_wrapper"],
+            live,
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::register_live_code_wrapper"],
+            live
+        );
+        let stamped = crate::pycode::register_w_globals_stamped_code as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::pycode::register_w_globals_stamped_code"],
+            stamped,
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::register_w_globals_stamped_code"],
+            stamped,
         );
         assert_occupied_binding(
             &bindings,

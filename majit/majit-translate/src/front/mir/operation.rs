@@ -4562,16 +4562,16 @@ impl<'a> Lowering<'a> {
                 if self.tyref_is_niche_option_ptr(&place.ty) {
                     let option_ty = clone_tyref(&place.ty);
                     let mut base = self.resolve_place(mir_bb, place)?;
-                    // GCREF payload: Discriminant is `ptr_nonzero`
-                    // (`lltype.py` `SomePtr.bool`). `is_(SomePtr, ConstNone)`
-                    // folds (`SomePtr.can_be_none` is False;
-                    // `binaryop.py` `is__default`), so
-                    // `transform.py` `transform_dead_code` would cut the
-                    // None arm. Do not flip `can_be_none`.
-                    // `llannotation.py` `lltype_to_annotation` of GCREF
-                    // is SomePtr; `rnone.py` `rtype_is_None` is
-                    // `ptr_iszero`. `is_null` of GCREF already uses
-                    // `eq(bool(p), False)`.
+                    // GCREF payload: the flow op is `bool` (`lltype.py`
+                    // `SomePtr.bool`, rtyped by `rptr.py`
+                    // `PtrRepr.rtype_bool` to `ptr_nonzero`).
+                    // `is_(SomePtr, ConstNone)` folds
+                    // (`SomePtr.can_be_none` is False; `binaryop.py`
+                    // `is__default`), so `transform.py`
+                    // `transform_dead_code` would cut the None arm. Do
+                    // not flip `can_be_none`. The operand is typed
+                    // GCREF so the legacy `bool` lowering reads a ref
+                    // register, not the int bank.
                     if crate::front::result_exc::tyref_option_payload(&option_ty, self.llbc)
                         .is_some_and(|payload| {
                             tyref_is_gcref_spelling(&payload, self.llbc)
@@ -4580,6 +4580,14 @@ impl<'a> Lowering<'a> {
                                 )
                         })
                     {
+                        if !matches!(
+                            crate::model::FunctionGraph::concretetype_of(&base),
+                            crate::model::ConcreteType::GcRef
+                        ) {
+                            base.set_concretetype(Some(
+                                crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+                            ));
+                        }
                         let bb_id = self.emit_bb(mir_bb);
                         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                             result: Some(res.clone()),

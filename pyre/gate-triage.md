@@ -272,7 +272,7 @@ effect unless the probe in §6c is enabled. The former
 `PYRE_PORTAL_METATRACE_ENTRY` knob is retired: the probe requires a split
 portal and enters at pc 0 through `initialize_state_from_start`.
 
-### §6c — Default-OFF diagnostics, censuses and probes (67): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (68): keep, cost nothing
 
 Deleting one of these environment reads does not change behavior when the
 variable is unset. They remain listed so diagnostics are not mistaken for dead
@@ -303,7 +303,7 @@ configuration.
 `MAJIT_PROBE_SUBSCR`, `MAJIT_PROFILE_PIPELINE`,
 `PYRE_RERAISE_DIAG`, `MAJIT_SIZE_SHELL_OWNERS`, `PYRE_SNAPSHOT_DIAG`,
 `PYRE_SS_COLLECT_ALL`, `PYRE_SS_STATS`,
-`PYRE_UNJOURNALED_SITE`, `PYRE_UNREGISTERED_CENSUS`,
+`PYRE_UNJOURNALED_SITE`, `PYRE_UNPACK_INTO_DEBUG`, `PYRE_UNREGISTERED_CENSUS`,
 `PYRE_VSTACK_EXACT_AUDIT`,
 `PYRE_WASM_DUMP_BAD_TRACE`, `PYRE_WASM_EXEC_TRACE`, `PYRE_WASM_FBW_CENSUS`,
 `PYRE_WASM_GUARD_CENSUS`, `PYRE_WASM_JIT_STATS`, `PYRE_WASM_CALL_HIST`,
