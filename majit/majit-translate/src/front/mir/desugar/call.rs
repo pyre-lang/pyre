@@ -56,6 +56,15 @@ impl<'a> Lowering<'a> {
             melt_abort_message_chain(&mut self.graph, bb_id);
             return Ok(());
         }
+        // `null_mut()` of a scalar `_arrayfld` GcArray (`*mut TypedItemsBlock`)
+        // is `lltype.nullptr(GcArray(ITEM))`. Residual `ptr_null_constant`
+        // is a classdef-less Instance; dest recast is skipped when the
+        // Call dest already names that root. Runs before the raw/spelled-GC
+        // `null_mut` arms because a declared scalar flexible GcArray dest
+        // is also a spelled GC root.
+        if self.try_lower_gcarray_ptr_null(mir_bb, &call, dest_local, target)? {
+            return Ok(());
+        }
         // `null_mut::<T>()` / `null::<T>()` of a Raw pointee is
         // `lltype.nullptr(T)` (`null_raw`). The generic call-result
         // `__cast_instance_intrinsic` tail below would recast a GC
@@ -69,13 +78,6 @@ impl<'a> Lowering<'a> {
         // `SomeString(can_be_None=True)` so the live STR arm unions
         // (`annmodel.SomeString.noneify`).
         if self.try_lower_str_family_ptr_null(mir_bb, &call, dest_local, target)? {
-            return Ok(());
-        }
-        // `null_mut()` of a scalar `_arrayfld` GcArray (`*mut TypedItemsBlock`)
-        // is `lltype.nullptr(GcArray(ITEM))`. Residual `ptr_null_constant`
-        // is a classdef-less Instance; dest recast is skipped when the
-        // Call dest already names that root.
-        if self.try_lower_gcarray_ptr_null(mir_bb, &call, dest_local, target)? {
             return Ok(());
         }
         // A bracket [`RootBracketPlan`] erased: the opener, the pin, the
