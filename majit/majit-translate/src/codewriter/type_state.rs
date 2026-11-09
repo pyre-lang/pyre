@@ -120,10 +120,13 @@ pub(crate) fn valuetype_to_concrete_for_legacy(
     vt: &ValueType,
     raw_alloc_flavor_structs: &HashSet<String>,
 ) -> ConcreteType {
-    if let ValueType::Ref(Some(name)) = vt
-        && crate::front::llbc_hints::alloc_flavor_raw_contains(raw_alloc_flavor_structs, name)
-    {
-        return ConcreteType::Signed;
+    if let ValueType::Ref(Some(name)) = vt {
+        // `history.getkind` of a raw `Ptr` is int (`rclass.py getgcflavor`).
+        if crate::front::llbc_hints::alloc_flavor_raw_contains(raw_alloc_flavor_structs, name)
+            || crate::front::mir::is_root_scope_class_root(name)
+        {
+            return ConcreteType::Signed;
+        }
     }
     valuetype_to_concrete(vt)
 }
@@ -274,7 +277,8 @@ pub(crate) fn authoritative_result_types(
 /// `Signed`/`Unknown`/`Void` base.
 ///
 /// Raw owners (`CallControl::struct_storage_for` →
-/// `is_gc_managed=false`) are left alone: a `Signed` base stays an
+/// `is_gc_managed=false`, or a harvested `_alloc_flavor_ = "raw"` class
+/// at `rclass.py getgcflavor`) are left alone: a `Signed` base stays an
 /// address (`getfield_raw` / `setfield_raw`), a `GcRef` base stays a
 /// Ref-banked raw struct (`PyType` / `CLASSTYPE` travels through the
 /// Ref bank even though its storage is not a GC object).
@@ -584,6 +588,28 @@ fn stamp_vtable_method_slots(graph: &mut FunctionGraph) {
 /// declare. Only a `GcRef` or `Unknown` cell is rewritten: a `Void` cell
 /// has no register, and stamping it Signed makes liveness ask the int
 /// allocator for a color it never assigned.
+/// `history.py` `getkind` of `Ptr(GcOpaqueType)` is `'ref'`.
+///
+/// `llmemory.py` `GCREF` / a look-inside `createframe` returning that
+/// pointer can still sit in the int bank (`*mut` as a word). `call.py`
+/// `FUNC.RESULT` is Ref; stamp the returnblock so `flatten.py`
+/// `make_return` `ref_return`s and `coerce_cross_bank_links` retypes a
+/// Signed source onto that bank (`cast_int_to_ptr`).
+pub(crate) fn promote_gcref_returnblock(graph: &FunctionGraph) {
+    if graph.return_type.as_deref() != Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE) {
+        return;
+    }
+    let Some(var) = graph.block(graph.returnblock).inputargs.first() else {
+        return;
+    };
+    match FunctionGraph::concretetype_of(var) {
+        ConcreteType::Signed | ConcreteType::Unknown => {
+            FunctionGraph::set_concretetype_of_inline(var, ConcreteType::GcRef);
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn force_int_bank_cells(graph: &FunctionGraph) {
     fn stamp_signed(var: &crate::flowspace::model::Variable) {
         let ty = FunctionGraph::concretetype_of(var);
@@ -691,18 +717,25 @@ fn redirect_signed_base_through_cast(
 /// banks diverge. `cast_ptr_to_int` / `cast_int_to_ptr` deliver the
 /// destination bank.
 ///
-/// Links that `make_link` turns into `make_return` are left alone: that
-/// path colours the source, and a cast there would change the return
-/// opcode. `last_exception` and `last_exc_value` are skipped the same
-/// way `insert_renamings` skips them. A raising block keeps its last
-/// op last, unless that op defines the cast operand.
+/// A one-value return link is the same split: `flatten.py` `make_return`
+/// colours the source, while `call.py` `get_jitcode_calldescr` reads
+/// `FUNC.RESULT` from the returnblock. A residual GCREF (`*mut` /
+/// `PyObjectRef`) can sit in the int bank on the link and as `GcRef` on
+/// the returnblock, so the callee emits `int_return` against the caller's
+/// `inline_call_*_r` (`jtransform.py` `rewrite_call` `reskind`). Retype
+/// the source onto the returnblock's bank so those two are one decision.
+/// Two-arg raise returns and `last_exception` / `last_exc_value` stay
+/// skipped the same way `insert_renamings` skips them. A raising block
+/// keeps its last op last, unless that op defines the cast operand.
 pub(crate) fn coerce_cross_bank_links(graph: &mut FunctionGraph) {
     let mut pending: Vec<Vec<PendingCast>> = Vec::with_capacity(graph.blocks.len());
     for block_index in 0..graph.blocks.len() {
         let mut casts = Vec::new();
         let exit_count = graph.blocks[block_index].exits.len();
         for exit_index in 0..exit_count {
-            if !link_reaches_insert_renamings(graph, block_index, exit_index) {
+            if !link_reaches_insert_renamings(graph, block_index, exit_index)
+                && !link_is_value_return(graph, block_index, exit_index)
+            {
                 continue;
             }
             let target = graph.blocks[block_index].exits[exit_index].target;
@@ -835,6 +868,15 @@ fn link_reaches_insert_renamings(
             .last_exc_value
             .as_ref()
             .is_some_and(|arg| link.args.contains(arg))
+}
+
+/// One-value `make_return` link: the target is the returnblock and the
+/// returned word is `FUNC.RESULT`. Two-arg raise returns stay off this
+/// path (`flatten.py` `make_return` with `evalue`).
+fn link_is_value_return(graph: &FunctionGraph, block_index: usize, exit_index: usize) -> bool {
+    let target = graph.blocks[block_index].exits[exit_index].target;
+    let target_block = &graph.blocks[target.0];
+    target_block.exits.is_empty() && target_block.inputargs.len() == 1
 }
 
 /// Index at which a cast of `operand` still dominates its use and, in a
@@ -1255,6 +1297,15 @@ pub(crate) fn field_owner_is_gc(
     if field.is_vtable_method_slot() {
         return false;
     }
+    // `rclass.py getgcflavor`: `_alloc_flavor_ = "raw"` is STRUCT._gckind
+    // `'raw'` even when a Vec field made `owner_declared_gc` Some(true).
+    // `history.getkind` of that Ptr is int; the field read is getfield_raw.
+    if let Some(owner) = field.owner_root.as_deref()
+        && let Some(cc) = callcontrol
+        && crate::front::llbc_hints::alloc_flavor_raw_contains(&cc.raw_alloc_flavor_structs, owner)
+    {
+        return false;
+    }
     // The embedding's `struct_storage` row is `STRUCT._gckind` itself; the
     // front's structural stamp is used only when no row exists.
     let Some(owner) = field.owner_root.as_deref() else {
@@ -1305,6 +1356,18 @@ mod tests {
     /// `RustVecRepr.lowleveltype` (`rrustvec.rs` `rust_vec_lltype`).
     /// `apply_from_flowspace_variables` copies that lltype.
     /// `history.getkind` of the raw header stays int.
+    #[test]
+    fn valuetype_to_concrete_for_legacy_int_banks_rootscope() {
+        let empty = HashSet::new();
+        assert_eq!(
+            valuetype_to_concrete_for_legacy(
+                &ValueType::Ref(Some("gc_roots::RootScope".into())),
+                &empty
+            ),
+            ConcreteType::Signed
+        );
+    }
+
     #[test]
     fn apply_from_flowspace_variables_copies_signed_over_a_rust_vec_stamp() {
         use crate::model::getkind;
@@ -1578,6 +1641,48 @@ mod tests {
 
         assert_eq!(
             FunctionGraph::concretetype_of(&operand),
+            ConcreteType::Signed
+        );
+    }
+
+    #[test]
+    fn promote_gcref_returnblock_stamps_a_signed_gcref_result() {
+        let mut graph = FunctionGraph::new("createframe")
+            .with_return_type(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE);
+        let src = push_input(&mut graph, "p", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&src, ConcreteType::Signed);
+        let return_var = graph.block(graph.returnblock).inputargs[0].clone();
+        FunctionGraph::set_concretetype_of_inline(&return_var, ConcreteType::Signed);
+        graph.set_return(graph.startblock, Some(src.clone()));
+
+        promote_gcref_returnblock(&graph);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&return_var),
+            ConcreteType::GcRef
+        );
+
+        coerce_cross_bank_links(&mut graph);
+        assert!(graph.block(graph.startblock).operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, operand, .. }
+                    if op == "cast_int_to_ptr" && operand.id() == src.id()
+            )
+        }));
+    }
+
+    #[test]
+    fn promote_gcref_returnblock_leaves_a_non_gcref_signed_result() {
+        let mut graph = FunctionGraph::new("int_fn").with_return_type("i64");
+        let src = push_input(&mut graph, "n", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&src, ConcreteType::Signed);
+        let return_var = graph.block(graph.returnblock).inputargs[0].clone();
+        FunctionGraph::set_concretetype_of_inline(&return_var, ConcreteType::Signed);
+        graph.set_return(graph.startblock, Some(src));
+
+        promote_gcref_returnblock(&graph);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&return_var),
             ConcreteType::Signed
         );
     }
@@ -2091,6 +2196,105 @@ mod tests {
         );
     }
 
+    /// `rclass.py getgcflavor` / `STRUCT._gckind`: a harvested
+    /// `_alloc_flavor_ = "raw"` owner is raw even when the descriptor
+    /// recorded `owner_declared_gc = Some(true)` because a `Vec` field
+    /// failed `adt_def_is_raw_storage`.
+    #[test]
+    fn field_owner_is_gc_flavor_raw_codeobject_is_raw() {
+        let field = FieldDescriptor::new("max_stackdepth", Some("bytecode::CodeObject".into()))
+            .with_owner_declared_gc(Some(true));
+        assert!(
+            field_owner_is_gc(&field, None),
+            "without the harvest the recorded Some(true) still wins"
+        );
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("bytecode::CodeObject".to_string());
+        assert!(
+            !field_owner_is_gc(&field, Some(&cc)),
+            "getgcflavor of CodeObject is raw"
+        );
+    }
+
+    /// `promote_gc_field_bases` must not `cast_int_to_ptr` a flavor-raw
+    /// Signed base (`history.getkind` of that Ptr is int). The same word
+    /// is also an int call argument (`ncells(code_ptr)`), which is the
+    /// stay-int shape that used to insert the cast when the owner was
+    /// mis-recorded as GC.
+    #[test]
+    fn promote_gc_field_bases_does_not_cast_flavor_raw_int_base() {
+        let mut graph = FunctionGraph::new("codeobject_field");
+        let base = push_input(&mut graph, "code", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
+        let read = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base.clone(),
+                    field: FieldDescriptor::new(
+                        "max_stackdepth",
+                        Some("bytecode::CodeObject".into()),
+                    )
+                    .with_owner_declared_gc(Some(true)),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&read, ConcreteType::Signed);
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::InlineCall {
+                    jitcode: crate::jitcode::JitCodeHandle::new(std::sync::Arc::new(
+                        crate::jitcode::JitCode::new("ncells"),
+                    )),
+                    args_i: vec![base.clone()],
+                    args_r: Vec::new(),
+                    args_f: Vec::new(),
+                    result_kind: 'i',
+                    arg_classes: String::new(),
+                },
+            });
+        graph.set_return(graph.startblock, Some(read));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("bytecode::CodeObject".to_string());
+        promote_gc_field_bases(&mut graph, Some(&cc));
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&base),
+            ConcreteType::Signed,
+            "flavor-raw code_ptr stays int"
+        );
+        let ops = &graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "cast_int_to_ptr"
+            )),
+            "getfield_raw of a flavor-raw struct does not go through cast_int_to_ptr"
+        );
+        let OpKind::FieldRead {
+            base: field_base, ..
+        } = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { .. } => Some(&op.kind),
+                _ => None,
+            })
+            .expect("field read")
+        else {
+            unreachable!("field read");
+        };
+        assert_eq!(field_base.id(), base.id());
+    }
+
     #[test]
     fn arraylen_result_is_signed_like_arraylen_vable() {
         let mut graph = FunctionGraph::new("arraylen_kind");
@@ -2224,7 +2428,7 @@ mod tests {
     }
 
     #[test]
-    fn coerce_cross_bank_links_leaves_a_return_link_alone() {
+    fn coerce_cross_bank_links_retypes_a_gcref_return_link_to_signed() {
         let mut graph = FunctionGraph::new("return_link");
         let src = push_input(&mut graph, "p", ValueType::Ref(None));
         FunctionGraph::set_concretetype_of_inline(&src, ConcreteType::GcRef);
@@ -2234,13 +2438,48 @@ mod tests {
 
         coerce_cross_bank_links(&mut graph);
 
+        let passed = graph.block(graph.startblock).exits[0].args[0]
+            .as_variable()
+            .expect("cast result")
+            .clone();
+        assert_ne!(passed.id(), src.id());
         assert_eq!(
-            graph.block(graph.startblock).exits[0].args[0]
-                .as_variable()
-                .map(|var| var.id()),
-            Some(src.id()),
-            "make_return colours the source, so a return link is not cast"
+            FunctionGraph::concretetype_of(&passed),
+            ConcreteType::Signed
         );
+        assert!(graph.block(graph.startblock).operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, operand, .. }
+                    if op == "cast_ptr_to_int" && operand.id() == src.id()
+            )
+        }));
+    }
+
+    #[test]
+    fn coerce_cross_bank_links_retypes_a_signed_return_link_to_gcref() {
+        let mut graph = FunctionGraph::new("return_link_int_to_ref");
+        let src = push_input(&mut graph, "p", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&src, ConcreteType::Signed);
+        let return_var = graph.block(graph.returnblock).inputargs[0].clone();
+        FunctionGraph::set_concretetype_of_inline(&return_var, ConcreteType::GcRef);
+        graph.set_return(graph.startblock, Some(src.clone()));
+
+        coerce_cross_bank_links(&mut graph);
+
+        let passed = graph.block(graph.startblock).exits[0].args[0]
+            .as_variable()
+            .expect("cast result")
+            .clone();
+        assert_ne!(passed.id(), src.id());
+        assert_eq!(FunctionGraph::concretetype_of(&passed), ConcreteType::GcRef);
+        assert!(graph.block(graph.startblock).operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, operand, .. }
+                    if op == "cast_int_to_ptr" && operand.id() == src.id()
+            )
+        }));
     }
 
     #[test]

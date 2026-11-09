@@ -4271,6 +4271,12 @@ fn declared_return_annotation(
         }
         return None;
     }
+    // `RootScope` residual / method `&self` is the save_point word.
+    // SomeInstance here made dual-gate stamp GcRef onto a caller actual
+    // while FUNC.ARGS stayed Int.
+    if crate::front::mir::is_root_scope_class_root(root) {
+        return Some(crate::annotator::model::s_int());
+    }
     if crate::annotator::bookkeeper::struct_root_is_string_family(root) {
         return crate::codewriter::annotation_state::valuetype_to_someshell(
             &crate::model::ValueType::Str,
@@ -4351,6 +4357,9 @@ fn raw_ptr_token_annotation(
     }
     if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
         return Some(cell);
+    }
+    if crate::front::mir::is_root_scope_class_root(root) {
+        return Some(crate::annotator::model::s_int());
     }
     // `rordereddict.py` `DICTENTRY` is `lltype.py` `Struct` inlined in
     // `GcArray`; `llannotation.py` `lltype_to_annotation` of
@@ -9444,7 +9453,7 @@ pub(crate) fn stamp_named_ref_call_dests(
     graph: &LegacyGraph,
     rtyper: &Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
 ) {
-    use crate::model::{OpKind, ValueType};
+    use crate::model::{ConcreteType, FunctionGraph, OpKind, ValueType};
     use crate::translator::rtyper::lltypesystem::lltype::GCREF;
     use crate::translator::rtyper::rclass::OBJECTPTR;
 
@@ -9476,6 +9485,12 @@ pub(crate) fn stamp_named_ref_call_dests(
             let Some(dest) = &op.result else {
                 continue;
             };
+            // `RootScope` is the save_point address word. Skip's OBJECTPTR
+            // paint would put that word in a residual Ref register.
+            if crate::front::mir::is_root_scope_class_root(name) {
+                FunctionGraph::set_concretetype_of_inline(dest, ConcreteType::Signed);
+                continue;
+            }
             let ct = dest.concretetype();
             if ct.as_ref().is_some_and(|ll| ll != &*OBJECTPTR) {
                 continue;
@@ -9485,6 +9500,62 @@ pub(crate) fn stamp_named_ref_call_dests(
                 continue;
             }
             dest.set_concretetype(Some(lltype));
+        }
+    }
+}
+
+fn call_target_is_rootscope_method(target: &crate::model::CallTarget) -> bool {
+    if let Some(root) = target.receiver_root() {
+        return crate::front::mir::is_root_scope_class_root(root);
+    }
+    let Some(segs) = target.path_segments() else {
+        return false;
+    };
+    let joined = segs.join("::");
+    joined.contains("gc_roots") && joined.contains("RootScope")
+}
+
+/// Skip-arm `resolve_types` can leave a `RootScope` receiver as
+/// classdef-less `OBJECTPTR` (`valuetype_to_someshell(Ref)`). `call.py`
+/// `getcalldescr` then sees actuals `[Ref, …]` against FUNC.ARGS `[Int, …]`.
+/// Stamp the save_point word and method `&self` as Signed
+/// (`history.py` `getkind` of a raw `Ptr` / `llmemory.Address`).
+pub(crate) fn stamp_rootscope_int_bank(graph: &LegacyGraph) {
+    use crate::model::{ConcreteType, FunctionGraph, OpKind, ValueType};
+
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let Some(dest) = &op.result {
+                let rootscope_dest = match &op.kind {
+                    OpKind::Input {
+                        ty: ValueType::Ref(Some(name)),
+                        ..
+                    }
+                    | OpKind::Call {
+                        result_ty: ValueType::Ref(Some(name)),
+                        ..
+                    } => crate::front::mir::is_root_scope_class_root(name),
+                    OpKind::Input {
+                        class_root: Some(root),
+                        ..
+                    } => crate::front::mir::is_root_scope_class_root(root),
+                    OpKind::UnaryOp {
+                        op: opname,
+                        result_ty: ValueType::Ref(Some(name)),
+                        ..
+                    } if opname == "same_as" => crate::front::mir::is_root_scope_class_root(name),
+                    _ => false,
+                };
+                if rootscope_dest {
+                    FunctionGraph::set_concretetype_of_inline(dest, ConcreteType::Signed);
+                }
+            }
+            if let OpKind::Call { target, args, .. } = &op.kind
+                && call_target_is_rootscope_method(target)
+                && let Some(receiver) = args.first().and_then(|arg| arg.as_variable())
+            {
+                FunctionGraph::set_concretetype_of_inline(receiver, ConcreteType::Signed);
+            }
         }
     }
 }
@@ -16409,6 +16480,40 @@ mod tests {
             layout_result.concretetype(),
             Some(expected.lowleveltype().clone()),
             "CAST dest intern uses the ByteStr leaf when result_ty is the layout owner"
+        );
+    }
+
+    #[test]
+    fn stamp_rootscope_int_bank_signs_method_receiver() {
+        use crate::model::{CallTarget, ConcreteType, FunctionGraph, OpKind, SpaceOperation};
+
+        let mut graph = LegacyGraph::new("exception_kind_str_wtf8");
+        let receiver = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&receiver, ConcreteType::GcRef);
+        let array = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&array, ConcreteType::GcRef);
+        let dest = graph.alloc_value_var();
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: Some(dest),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path([
+                        "pyre_object",
+                        "gc_roots",
+                        "RootScope",
+                        "pin_roots",
+                    ]),
+                    args: crate::model::call_args(vec![receiver.clone(), array]),
+                    result_ty: ValueType::Int,
+                },
+            });
+        stamp_rootscope_int_bank(&graph);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&receiver),
+            ConcreteType::Signed,
+            "RootScope method &self is the save_point int"
         );
     }
 

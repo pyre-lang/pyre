@@ -1801,10 +1801,14 @@ impl<'a> RegAlloc<'a> {
         // handles the same Call*/CallMayForce*/CallReleaseGil* opcodes,
         // so a collecting callee must record the live Ref slots that
         // before_call just synced to the jitframe.  call_result_gpr is
-        // excluded for the same reason as `consider_call`
-        // (x86/callbuilder.py push_gcmap, aarch64/callbuilder.py push_gcmap).
+        // excluded and `noregs` is the shadow-stack flag for the same
+        // reason as `consider_call` (`x86/callbuilder.py push_gcmap`,
+        // `aarch64/callbuilder.py push_gcmap`).
         let gcmap = if can_collect {
-            Some(self.get_gcmap(&[call_result_gpr()], false) as usize)
+            Some(self.get_gcmap(
+                &[call_result_gpr()],
+                crate::regalloc::RegAlloc::CALL_PUSH_GCMAP_NOREGS,
+            ) as usize)
         } else {
             None
         };
@@ -1878,7 +1882,10 @@ impl<'a> RegAlloc<'a> {
         } else {
             None
         };
-        let gcmap = self.get_gcmap(&[call_result_gpr()], false) as usize;
+        let gcmap = self.get_gcmap(
+            &[call_result_gpr()],
+            crate::regalloc::RegAlloc::CALL_PUSH_GCMAP_NOREGS,
+        ) as usize;
         self.perform_with_gcmap_ptr(i, arglocs, result_loc, gcmap, asm);
     }
 

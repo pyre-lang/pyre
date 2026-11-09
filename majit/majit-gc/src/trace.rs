@@ -1270,6 +1270,25 @@ impl TypeRegistry {
         // No row address is published until `freeze_types`; fill it there once
         // the pointer-bearing auxiliary tables have stable storage.
         self.layout_table.push(TypeEntry::default());
+        // KEEP-UNTIL-PRODUCT-FIX: leftover-B shutdown holder is tid 868.
+        if id == 868 {
+            let info = &self.entries[id];
+            eprintln!(
+                "[gc-tid868] size={} is_object={} has_gc_ptrs={} offsets={:?} \
+                 item_size={} length_offset={} custom={} parent={:?} \
+                 is_weakref={} destructor={}",
+                info.size,
+                info.is_object,
+                info.has_gc_ptrs,
+                info.gc_ptr_offsets,
+                info.item_size,
+                info.length_offset,
+                info.custom_trace.is_some(),
+                info.parent,
+                info.is_weakref,
+                info.destructor.is_some(),
+            );
+        }
         id as u32
     }
 
@@ -1568,6 +1587,50 @@ impl TypeRegistry {
         })
     }
 
+    /// Collector tid of a fixed-size type with this payload size and
+    /// `offsets_to_gc_pointers`, or `None`.
+    ///
+    /// `TypeLayoutBuilder.get_type_id(S)` returns the existing id for a
+    /// STRUCT already in `id_of_type`. After `freeze_types`
+    /// (`can_add_new_types` is false) a reconstructed SizeDescr still
+    /// has to reuse that row rather than `register`. Offset order is
+    /// not identity: both sides are sorted. When the offset bags differ
+    /// and exactly one fixed type has this size, that row is the STRUCT.
+    pub fn find_fixed_type(&self, size: usize, gc_ptr_offsets: &[usize]) -> Option<u32> {
+        let mut want = gc_ptr_offsets.to_vec();
+        want.sort_unstable();
+        want.dedup();
+
+        let mut unique_size: Option<u32> = None;
+        let mut unique_size_ambiguous = false;
+
+        for (id, info) in self.entries.iter().enumerate() {
+            if info.item_size != 0 || info.size != size {
+                continue;
+            }
+            let mut have = info.gc_ptr_offsets.clone();
+            have.sort_unstable();
+            have.dedup();
+            if have == want {
+                return Some(id as u32);
+            }
+            if want.is_empty() {
+                continue;
+            }
+            if unique_size_ambiguous {
+                continue;
+            }
+            match unique_size {
+                None => unique_size = Some(id as u32),
+                Some(_) => {
+                    unique_size = None;
+                    unique_size_ambiguous = true;
+                }
+            }
+        }
+        unique_size
+    }
+
     /// Number of registered types.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -1686,6 +1749,19 @@ mod tests {
         let mut reg = TypeRegistry::new();
         reg.freeze_types();
         let _ = reg.get_type_id(GcTypeKey::of(&KEY), || TypeInfo::simple(8));
+    }
+
+    #[test]
+    fn find_fixed_type_reuses_existing_layout() {
+        let mut reg = TypeRegistry::new();
+        let id = reg.register(TypeInfo::with_gc_ptrs(104, vec![16, 24]));
+        assert_eq!(reg.find_fixed_type(104, &[24, 16]), Some(id));
+        assert_eq!(reg.find_fixed_type(104, &[16, 24, 32]), Some(id));
+        assert_eq!(reg.find_fixed_type(48, &[16]), None);
+        let _other = reg.register(TypeInfo::with_gc_ptrs(104, vec![8]));
+        assert_eq!(reg.find_fixed_type(104, &[16, 24]), Some(id));
+        assert_eq!(reg.find_fixed_type(104, &[0]), None);
+        assert_eq!(reg.find_fixed_type(16, &[]), None);
     }
 
     #[test]

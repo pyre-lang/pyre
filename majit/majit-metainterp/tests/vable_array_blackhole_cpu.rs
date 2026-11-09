@@ -7,7 +7,7 @@
 //! `Ptr(GcArray)` after `make_sure_not_resized` (`virtualizable.py`), so
 //! that chain must be the one that answers.
 
-use majit_metainterp::blackhole::{BlackholeInterpBuilder, wire_bhimpl_handlers};
+use majit_metainterp::blackhole::{BhJitDriverSd, BlackholeInterpBuilder, wire_bhimpl_handlers};
 use majit_metainterp::jitcode::{self, JitCodeBuilder};
 use majit_metainterp::virt_array::{VirtArray, register_virt_array_field};
 use majit_metainterp::virtualizable::{VableArrayStorage, VirtualizableInfo};
@@ -99,6 +99,47 @@ fn setarrayitem_vable_i_then_arraylen_vable_use_the_cpu_chain() {
 
     let mut bh = builder.acquire_interp();
     bh.virtualizable_info = &info;
+    bh.setposition(jitcode, 0);
+    bh.registers_r[0] = &mut state as *mut State as i64;
+    bh.registers_i[1] = 1;
+    bh.registers_i[2] = 99;
+    let _ = bh.run();
+
+    assert_eq!(state.regs.to_vec(), vec![10, 99, 30]);
+    assert_eq!(bh.tmpreg_i, 3);
+}
+
+#[test]
+fn setarrayitem_vable_uses_type_vinfo_when_driver_vinfo_is_null() {
+    // blackhole.py `bhimpl_setarrayitem_vable_*` `fdescr.get_vinfo()`:
+    // TYPE vinfo, not the current driver's. A novable driver (filter)
+    // leaves `bh.virtualizable_info` unset; the jitcode still runs vable
+    // ops of another type.
+    let cpu = TestBackend::new();
+    let mut builder = bh_builder();
+    builder.set_cpu(&cpu);
+
+    let info = build_vinfo();
+    builder.setup_jitdrivers_sd(vec![BhJitDriverSd {
+        virtualizable_info: &info,
+        ..Default::default()
+    }]);
+
+    let mut b = JitCodeBuilder::new();
+    b.vable_setarrayitem_int_with_base(0, 0, 1, 2);
+    b.vable_arraylen_with_base(3, 0, 0);
+    b.int_return(3);
+    let jitcode = std::sync::Arc::new(b.finish());
+
+    let mut state = State {
+        regs: VirtArray::from_slice(&[10i64, 20, 30]),
+    };
+
+    let mut bh = builder.acquire_interp();
+    assert!(
+        bh.virtualizable_info.is_null(),
+        "novable resume leaves the driver vinfo unset"
+    );
     bh.setposition(jitcode, 0);
     bh.registers_r[0] = &mut state as *mut State as i64;
     bh.registers_i[1] = 1;

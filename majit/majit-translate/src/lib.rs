@@ -3357,6 +3357,10 @@ fn register_configured_jitdrivers(
         // before `split_graph_and_record_jitdriver`, so an autoreds portal
         // splits once numreds is known. `jtransform.py try_handle_jit_marker`
         // still rediscovers those reds when emitting the merge-point op.
+        // `rewrite_jit_merge_point` needs that same numreds (`spec.reds` is
+        // empty when `reds='auto'`).
+        let mut rewrite_numreds = spec.reds.len();
+        let mut seed_red_kinds = spec.red_kinds.clone();
         let portal_path = if !spec.split_portal {
             spec.portal.clone()
         } else {
@@ -3367,6 +3371,55 @@ fn register_configured_jitdrivers(
             // (`annrpython.py recursivecall`), not the pre-fixpoint set.
             drop(portal_graph);
             call_control.annotate_access_directly(std::slice::from_ref(&spec.portal));
+            // `support.py autodetect_jit_markers_redvars` runs on the portal
+            // graph *before* the copy, so the original marker already carries
+            // the reds `rewrite_jit_merge_point` will pass to portal_runner.
+            let numreds = {
+                let original = call_control
+                    .function_graphs_mut()
+                    .get_mut(&spec.portal)
+                    .expect("portal graph remains after annotate_access_directly");
+                let (marker_block, marker_index) =
+                    crate::codewriter::support::find_jit_merge_point(original, driver_roots)
+                        .expect("no jit_merge_point found in configured portal graph");
+                if spec.autoreds {
+                    let greens = match &original
+                        .block(marker_block)
+                        .operations
+                        .get(marker_index)
+                        .expect("find_jit_merge_point returned a live marker")
+                        .kind
+                    {
+                        crate::model::OpKind::Call { args, .. } => args
+                            .iter()
+                            .skip(1)
+                            .take(spec.greens.len())
+                            .filter_map(|a| a.as_variable().cloned())
+                            .collect::<Vec<_>>(),
+                        _ => panic!("jit_merge_point must be a call"),
+                    };
+                    let reds = crate::codewriter::jtransform::autodetect_jit_markers_redvars(
+                        original,
+                        &greens,
+                        driver_roots,
+                    );
+                    match &mut original.block_mut(marker_block).operations[marker_index].kind {
+                        crate::model::OpKind::Call { args, .. } => {
+                            // `listobject.py` `_do_extend_jitdriver.jit_merge_point`
+                            // kwargs are the greens; `reds='auto'` appends the
+                            // live set (`support.py` `op.args.extend(reds_v)`).
+                            args.truncate(1 + spec.greens.len());
+                            args.extend(reds.iter().cloned().map(crate::model::LinkArg::from));
+                        }
+                        _ => panic!("jit_merge_point must be a call"),
+                    }
+                    seed_red_kinds = crate::codewriter::support::ir_kinds_for_seed(original, &reds);
+                    reds.len()
+                } else {
+                    spec.reds.len()
+                }
+            };
+            rewrite_numreds = numreds;
             let original = call_control
                 .function_graphs()
                 .get(&spec.portal)
@@ -3398,42 +3451,6 @@ fn register_configured_jitdrivers(
             let (marker_block, marker_index) =
                 crate::codewriter::support::find_jit_merge_point(&portal, driver_roots)
                     .expect("no jit_merge_point found in configured portal graph");
-            // `support.py autodetect_jit_markers_redvars` before
-            // `split_before_jit_merge_point`: declared reds stay as written,
-            // autoreds learn the live set at the marker.
-            let numreds = if spec.autoreds {
-                let greens = match &portal
-                    .block(marker_block)
-                    .operations
-                    .get(marker_index)
-                    .expect("find_jit_merge_point returned a live marker")
-                    .kind
-                {
-                    crate::model::OpKind::Call { args, .. } => args
-                        .iter()
-                        .skip(1)
-                        .take(spec.greens.len())
-                        .filter_map(|a| a.as_variable().cloned())
-                        .collect::<Vec<_>>(),
-                    _ => panic!("jit_merge_point must be a call"),
-                };
-                let reds = crate::codewriter::jtransform::autodetect_jit_markers_redvars(
-                    &portal,
-                    &greens,
-                    driver_roots,
-                );
-                // support.py autodetect_jit_markers_redvars: `op.args.extend(reds_v)`
-                // so `decode_hp_hint_args` can split greens/reds off the marker.
-                match &mut portal.block_mut(marker_block).operations[marker_index].kind {
-                    crate::model::OpKind::Call { args, .. } => {
-                        args.extend(reds.iter().cloned().map(crate::model::LinkArg::from));
-                    }
-                    _ => panic!("jit_merge_point must be a call"),
-                }
-                reds.len()
-            } else {
-                spec.reds.len()
-            };
             portal.startblock = crate::codewriter::support::split_before_jit_merge_point(
                 &mut portal,
                 marker_block,
@@ -3446,8 +3463,9 @@ fn register_configured_jitdrivers(
             crate::codewriter::support::seed_split_portal_input_ops(
                 &mut portal,
                 split_start,
+                &spec.greens,
                 &spec.green_kinds,
-                &spec.red_kinds,
+                &seed_red_kinds,
                 &spec.red_types,
             );
             // `warmspot.py split_graph_and_record_jitdriver` copies the
@@ -3511,7 +3529,7 @@ fn register_configured_jitdrivers(
                 original,
                 &runner,
                 spec.greens.len(),
-                spec.reds.len(),
+                rewrite_numreds,
                 driver_roots,
             );
         }

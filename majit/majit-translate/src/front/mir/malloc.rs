@@ -1336,6 +1336,34 @@ pub(in crate::front::mir) fn link_arg_as_alias_op(
     }
 }
 
+fn frame_box_payload_arg<'a>(
+    fields: &'a [(
+        crate::model::FieldDescriptor,
+        crate::model::LinkArg,
+        ValueType,
+    )],
+) -> Option<&'a crate::model::LinkArg> {
+    fields
+        .iter()
+        .find(|(field, _, _)| field.name == "owner_root")
+        .or_else(|| fields.iter().find(|(field, _, _)| field.name == "ptr"))
+        .map(|(_, value, _)| value)
+}
+
+fn error_carrier_payload_arg<'a>(
+    fields: &'a [(
+        crate::model::FieldDescriptor,
+        crate::model::LinkArg,
+        ValueType,
+    )],
+) -> Option<&'a crate::model::LinkArg> {
+    fields
+        .iter()
+        .find(|(field, _, _)| field.name == "__pos_0" || field.name == "0")
+        .or_else(|| fields.first())
+        .map(|(_, value, _)| value)
+}
+
 pub(in crate::front::mir) fn emit_materialized_struct_copy(
     graph: &mut FunctionGraph,
     out: &mut Vec<crate::model::SpaceOperation>,
@@ -1347,6 +1375,32 @@ pub(in crate::front::mir) fn emit_materialized_struct_copy(
     )],
     has_vtable: bool,
 ) -> Variable {
+    // `createframe` returns the GC `PyFrame`. A by-value escape of the
+    // host handle is that GCREF, not a second malloc of the wrapper.
+    // `OperationError` is the exception instance; the host `PyError`
+    // handle is that same GCREF.
+    let payload = if frame_box::owner_is_frame_box(owner) {
+        frame_box_payload_arg(fields)
+    } else if owner_is_error_carrier(owner) {
+        error_carrier_payload_arg(fields)
+    } else {
+        None
+    };
+    if let Some(payload) = payload {
+        match payload {
+            LinkArg::Value(var) => return var.clone(),
+            other => {
+                if let Some(kind) = link_arg_as_alias_op(other, &ValueType::Ref(None)) {
+                    let result = graph.alloc_value_var();
+                    out.push(crate::model::SpaceOperation {
+                        result: Some(result.clone()),
+                        kind,
+                    });
+                    return result;
+                }
+            }
+        }
+    }
     let result = graph.alloc_value_var();
     out.push(crate::model::SpaceOperation {
         result: Some(result.clone()),

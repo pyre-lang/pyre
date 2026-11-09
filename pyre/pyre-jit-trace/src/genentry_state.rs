@@ -48,6 +48,16 @@ impl JitCodeSym for GenEntrySym {
             .expect("jd2 portal body must contain a jit_merge_point")
             .pc
     }
+
+    fn set_redboxes(&mut self, redboxes: &[(OpRef, Type)]) {
+        // pyjitpl.py opimpl_jit_merge_point → reached_loop_header redboxes
+        if let Some(&(op, _)) = redboxes.first() {
+            self.r#gen = op;
+        }
+        if let Some(&(op, _)) = redboxes.get(1) {
+            self.w_arg = op;
+        }
+    }
 }
 
 /// jd2 `JitState`: reuses [`PyreMeta`] and the empty [`PyreEnv`], driving

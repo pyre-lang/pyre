@@ -2722,6 +2722,28 @@ fn flavor_raw_struct_borrow_is_int_banked_with_class_root() {
         !super::ty_is_raw_address(param_ty, &llbc, &empty_gc, &harvested),
         "flavor-raw &RawFlavorStruct is not storage-raw; ty_is_raw_address stays false"
     );
+    assert_eq!(
+        super::container_declared_gc(
+            param_ty,
+            &llbc,
+            &empty_gc,
+            super::no_immutable_fields(),
+            &harvested,
+        ),
+        Some(false),
+        "getgcflavor of a flavor-raw struct is raw even with a Vec field"
+    );
+    assert_eq!(
+        super::container_declared_gc(
+            param_ty,
+            &llbc,
+            &empty_gc,
+            super::no_immutable_fields(),
+            &empty,
+        ),
+        Some(true),
+        "without the harvest a Vec field fails declared_raw_adt_node and defaults to gc"
+    );
     assert!(
         !super::ty_is_raw_address(param_ty, &llbc, &empty_gc, &empty),
         "empty flavor set keeps ty_is_raw_address false"
@@ -17727,6 +17749,270 @@ fn tyref_is_gcref_spelling_is_exactly_one_pointer_onto_gcrefopaque() {
         mut_mut_token.as_deref(),
         Some("ref"),
         "*mut *mut GCREFOpaque slot token"
+    );
+}
+
+/// Live interpreter ULLBC sees `GCREFOpaque` as a Foreign Opaque
+/// (`GcType` lives in majit-gc). `history.py` `getkind` of
+/// `Ptr(GcOpaqueType)` is `'ref'`; `llmemory.py` `GCREF`.
+#[test]
+fn foreign_opaque_gcrefopaque_ptr_is_gcref_ref() {
+    let opaque = serde_json::json!({
+        "def_id": 0,
+        "item_meta": crate::front::mir::tests::interior_meta(
+            &["majit_gc", "header", "GCREFOpaque"],
+            false,
+        ),
+        "kind": "Opaque",
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 0,
+                "align": 1,
+                "variant_layouts": [{"field_offsets": []}],
+                "repr": {"transparent": false}
+            }
+        }]
+    });
+    let llbc = crate::front::mir::tests::llbc_with_types("pyre_interpreter", vec![opaque], vec![]);
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let empty = std::collections::HashSet::<String>::new();
+    let ty = fixture_ty(serde_json::json!({
+        "RawPtr": [{
+            "Adt": {"id": 0, "generics": empty_generics()}
+        }, "Mut"]
+    }));
+    assert!(
+        tyref_is_gcref_spelling(&ty, &llbc),
+        "Foreign Opaque *mut GCREFOpaque is llmemory.GCREF"
+    );
+    assert!(
+        !super::ty_is_raw_address(&ty, &llbc, &gc, &empty),
+        "GcOpaqueType is not a raw Ptr"
+    );
+    assert_eq!(
+        super::tyref_to_value_type_with(&ty, &llbc, super::no_tombstoned_leaves(), &gc, &empty,),
+        ValueType::Ref(None)
+    );
+    assert_eq!(
+        dont_look_inside_return_token(&ty, &llbc, crate::ErrorCarrierSpec::default(), &gc, &empty,)
+            .as_deref(),
+        Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE)
+    );
+}
+
+/// `heapify_pyframe_w_root` / `try_createframe` return `*mut GCREFOpaque`.
+/// `flatten.py` `make_return` of that dest must `ref_return`.
+#[test]
+fn live_heapify_try_createframe_output_is_gcref() {
+    let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
+    let gc = super::harvest_declared_gc_facts(llbc).gc_struct_ids();
+    let empty = std::collections::HashSet::<String>::new();
+    for name in ["heapify_pyframe_w_root", "try_createframe"] {
+        let fd = llbc
+            .local_fn(name)
+            .unwrap_or_else(|| panic!("missing {name} in interpreter ULLBC"));
+        let out = &fd.signature.output;
+        let path = fd.item_meta.name_path();
+        let vt =
+            super::tyref_to_value_type_with(out, llbc, super::no_tombstoned_leaves(), &gc, &empty);
+        let token = dont_look_inside_return_token(
+            out,
+            llbc,
+            crate::ErrorCarrierSpec::default(),
+            &gc,
+            &empty,
+        );
+        let spelling = tyref_is_gcref_spelling(out, llbc);
+        let raw = super::ty_is_raw_address(out, llbc, &gc, &empty);
+        let voidp = super::raw_c_void_ptr_bank(out, llbc);
+        let scalar = super::raw_scalar_address_value_type(out, llbc);
+        assert!(
+            spelling,
+            "{path}: output is GCREF spelling; vt={vt:?} token={token:?} raw={raw} voidp={voidp:?} scalar={scalar:?}"
+        );
+        assert!(
+            !raw,
+            "{path}: GCREF is not a raw address; vt={vt:?} token={token:?}"
+        );
+        assert_eq!(
+            vt,
+            ValueType::Ref(None),
+            "{path}: getkind(Ptr(GcOpaqueType)) is ref; token={token:?} raw={raw} voidp={voidp:?} scalar={scalar:?}"
+        );
+        assert_eq!(
+            token.as_deref(),
+            Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE),
+            "{path}: residual FUNC.RESULT is gcref; vt={vt:?} raw={raw} voidp={voidp:?} scalar={scalar:?}"
+        );
+    }
+}
+
+/// Isolated `lower_function` does not apply `SemanticFunctionHeader`.
+/// `call.py` `FUNC.RESULT` is the header token copied onto the graph
+/// at registration (`GraphTransform.apply`).
+#[test]
+fn live_try_createframe_header_stamps_gcref() {
+    use crate::model::{CallTarget, FunctionGraph, OpKind};
+    let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[llbc],
+        crate::HostStaticAddrs::default(),
+        &[],
+        &["try_createframe"],
+    )
+    .expect("header of try_createframe");
+    let func = program
+        .functions
+        .iter()
+        .find(|f| f.name == "try_createframe")
+        .unwrap_or_else(|| {
+            panic!(
+                "try_createframe missing; names={:?}",
+                program
+                    .functions
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        func.return_type.as_deref(),
+        Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE),
+        "look_inside FUNC.RESULT of GCREF; class_root={:?}",
+        func.return_class_root
+    );
+    let graph = crate::test_support::lower_function(llbc, "try_createframe")
+        .expect("lower try_createframe");
+    let heapify: Vec<String> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| {
+            let OpKind::Call {
+                target, result_ty, ..
+            } = &op.kind
+            else {
+                return None;
+            };
+            let name = match target {
+                CallTarget::FunctionPath { segments, .. } => segments.last()?.as_str(),
+                CallTarget::Method { name, .. } => name.as_str(),
+                _ => return None,
+            };
+            if !name.contains("heapify") {
+                return None;
+            }
+            Some(format!(
+                "{name} dest_ct={:?} result_ty={result_ty:?} var={:?}",
+                op.result.as_ref().map(FunctionGraph::concretetype_of),
+                op.result.as_ref().map(|r| r.name())
+            ))
+        })
+        .collect();
+    assert!(
+        heapify
+            .iter()
+            .any(|row| row.contains("result_ty=Ref(None)")),
+        "heapify dest is GCREF; header={:?} heapify={heapify:?}",
+        func.return_type
+    );
+}
+
+/// `w_code_get_ptr` returns `*const CodeObject`. `history.py` `getkind`
+/// of that raw `Ptr` is `'int'` (`rclass.py` `getgcflavor`). The header
+/// stamps `raw:<owner>` so `call.py` `RESULT == FUNC.RESULT` rewrites a
+/// frontend Ref dest to `inline_call_*_i`.
+#[test]
+fn live_w_code_get_ptr_result_kind() {
+    let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
+    let gc = super::harvest_declared_gc_facts(llbc).gc_struct_ids();
+    let flavors =
+        crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc));
+    let fd = llbc
+        .local_fn("w_code_get_ptr")
+        .expect("w_code_get_ptr in interpreter ULLBC");
+    let out = &fd.signature.output;
+    let vt =
+        super::tyref_to_value_type_with(out, llbc, super::no_tombstoned_leaves(), &gc, &flavors);
+    let token =
+        dont_look_inside_return_token(out, llbc, crate::ErrorCarrierSpec::default(), &gc, &flavors);
+    let spelling = tyref_is_gcref_spelling(out, llbc);
+    assert!(
+        !spelling,
+        "raw CodeObject pointer is not GCREF; vt={vt:?} token={token:?}"
+    );
+    let token = token.expect("w_code_get_ptr residual token");
+    assert!(
+        token.starts_with("raw:") && token.contains("CodeObject"),
+        "signature token is raw:CodeObject; vt={vt:?} token={token}"
+    );
+    match &vt {
+        ValueType::Ref(Some(root)) => {
+            assert!(
+                root.contains("CodeObject"),
+                "front dest names CodeObject; vt={vt:?}"
+            );
+        }
+        ValueType::Int => {}
+        other => panic!("front dest of *const CodeObject is Ref or Int; got {other:?}"),
+    }
+
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[llbc],
+        crate::HostStaticAddrs::default(),
+        &[],
+        &["w_code_get_ptr", "try_createframe"],
+    )
+    .expect("header of w_code_get_ptr");
+    let func = program
+        .functions
+        .iter()
+        .find(|f| f.name == "w_code_get_ptr")
+        .expect("w_code_get_ptr semantic");
+    let header = func
+        .return_type
+        .as_deref()
+        .expect("look_inside FUNC.RESULT of raw Ptr");
+    assert!(
+        header.starts_with("raw:") && header.contains("CodeObject"),
+        "look_inside FUNC.RESULT is raw:CodeObject; header={header:?} class_root={:?}",
+        func.return_class_root
+    );
+
+    let caller = program
+        .functions
+        .iter()
+        .find(|f| f.name == "try_createframe")
+        .expect("try_createframe semantic");
+    let calls: Vec<&ValueType> = caller
+        .graph()
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter_map(|op| {
+            let OpKind::Call {
+                target, result_ty, ..
+            } = &op.kind
+            else {
+                return None;
+            };
+            let name = match target {
+                CallTarget::FunctionPath { segments, .. } => segments.last()?.as_str(),
+                CallTarget::Method { name, .. } => name.as_str(),
+                _ => return None,
+            };
+            (name == "w_code_get_ptr").then_some(result_ty)
+        })
+        .collect();
+    assert!(!calls.is_empty(), "try_createframe inlines w_code_get_ptr");
+    assert!(
+        calls.iter().any(|ty| match ty {
+            ValueType::Ref(Some(root)) => root.contains("CodeObject"),
+            ValueType::Int => true,
+            _ => false,
+        }),
+        "try_createframe dest of w_code_get_ptr is *const CodeObject; calls={calls:?}"
     );
 }
 

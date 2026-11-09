@@ -3833,7 +3833,7 @@ static W_SLICE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// it is a `Type::Ref` row of `gc_fielddescrs` and `clear_gc_fields` zeroes
 /// it.
 static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_object_descr_group_with_def_path(
+    let group = build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
         PYFRAME_GC_TYPE_ID,
         // `NewWithVtable` writes this typeptr at `cpu.vtable_offset`
@@ -3973,7 +3973,16 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         ],
         "PyFrame",
         "pyframe::PyFrame",
-    )
+    );
+    // `FrameBox::new` is `try_gc_alloc_young_nonmoving_raw`. A look-inside
+    // `NewWithVtable` of the same type must match that allocator: residual
+    // eval holds `&mut PyFrame` across collections, and there is no
+    // shadowstack rewrite (`pyframe.py PyFrame.__init__._always_inline_`
+    // returns the malloc'd `W_Root`). `SizeDescr::non_moving` is the
+    // old-generation arm; this flag declines the nursery and takes
+    // `malloc_big_fixedsize_fn` (`external_malloc(alloc_young=True)`).
+    group.size_descr.set_young_nonmoving(true);
+    group
 });
 
 impl Descr for PyreSizeDescr {
@@ -11289,6 +11298,20 @@ mod tests {
         assert!(
             storage_array.non_moving(),
             "the mapdict custom tracer marks raw storage pointers but cannot rewrite them"
+        );
+    }
+
+    #[test]
+    fn jit_emitted_pyframes_are_young_nonmoving() {
+        let frame_descr = pyframe_size_descr();
+        let frame_size = frame_descr.as_size_descr().expect("PyFrame SizeDescr");
+        assert!(
+            !frame_size.non_moving(),
+            "a PyFrame NewWithVtable must not take the old-generation arm"
+        );
+        assert!(
+            frame_size.young_nonmoving(),
+            "FrameBox::new is try_gc_alloc_young_nonmoving_raw; JIT NewWithVtable matches it"
         );
     }
 

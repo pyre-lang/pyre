@@ -7147,6 +7147,10 @@ impl<'a> Assembler386<'a> {
         if is_call_release_gil {
             cb.emit_call_release_gil(Self::argloc_imm(arglocs, 3));
         } else if descr.get_extra_info().check_can_collect() {
+            // x86/assembler.py `_emit_call`: `effectinfo is None or
+            // effectinfo.check_can_collect()` then `cb.emit()`. Extra info
+            // is never None on a CallDescr here; the collect bit is the
+            // remaining half of that test.
             cb.emit();
         } else {
             cb.emit_no_collect();
@@ -8211,6 +8215,9 @@ impl<'a> Assembler386<'a> {
         let [len_loc, ..] = arglocs else {
             panic!("varsize allocation expects a length location, got {arglocs:?}");
         };
+        if let Some(descr) = op.getdescr() {
+            majit_ir::descr::stamp_and_assert_array_tid_for_malloc(&descr, "genop_new_array");
+        }
         let (base_size, item_size, type_id, len_ofs) = op
             .with_array_descr(|ad| {
                 (

@@ -1685,6 +1685,10 @@ fn python_portal_bh_jitdrivers_sd(
         .first()
         .map(|jd| jd.mainjitcode_calldescr.extra_info.clone())
         .unwrap_or_default();
+    let orig_vinfo = table
+        .first()
+        .map(|jd| jd.virtualizable_info)
+        .unwrap_or(std::ptr::null());
     let jd0 = majit_metainterp::blackhole::BhJitDriverSd {
         result_type: majit_metainterp::blackhole::BhReturnType::Ref,
         portal_runner_ptr: Some(bh_portal_runner_c),
@@ -1699,6 +1703,7 @@ fn python_portal_bh_jitdrivers_sd(
             'r',
             extra_info,
         ),
+        virtualizable_info: orig_vinfo,
     };
     match table.first_mut() {
         Some(slot) => *slot = jd0,
@@ -3382,11 +3387,11 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     let (mut bh, virtualizable_ptr) = bh;
 
     // resume.py: virtualizable_ptr was read by consume_vable_info
-    // from the vable section. Set on the blackhole for vable bytecodes.
-    // A novable resume runs no vable opcodes, so both the pointer and the
-    // vinfo handle are written null instead of jd0's. The interp comes
-    // from the shared pool; `release_interp` already cleared the vable
-    // triple, and this restates the zeros for a novable resume.
+    // from the vable section. A novable driver's resume data has no
+    // vable section (`vinfo_arg` is None above), so the identity pointer
+    // stays 0. vable opcodes in an inlined callee still run:
+    // `blackhole.py` `bhimpl_setarrayitem_vable_r` uses
+    // `fdescr.get_vinfo()` (TYPE vinfo), not the current driver.
     if !novable {
         if virtualizable_ptr != 0 {
             bh.virtualizable_ptr = virtualizable_ptr;
@@ -3394,10 +3399,8 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             // Fallback for guards without vable section.
             bh.virtualizable_ptr = deadframe.get(0);
         }
-        bh.virtualizable_info = crate::eval::get_virtualizable_info();
     } else {
         bh.virtualizable_ptr = 0;
-        bh.virtualizable_info = std::ptr::null();
     }
     // Inlined callees keep operand slots in the MIFrame register file
     // (`pyjitpl.py get_list_of_active_boxes`). `consume_one_section`
@@ -3424,6 +3427,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             interp = cur.nextblackholeinterp.as_deref();
         }
     }
+    bh.virtualizable_info = crate::eval::get_virtualizable_info();
     // Last read of `deadframe`.  `blackhole_from_resumedata` has copied every
     // live value into the blackhole register banks, which the collector reaches
     // through their own root source (`walk_bh_regs`), so the off-heap copy is
@@ -3461,6 +3465,10 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // `handle_jitexc_from_bh` unreachable. Only jd0's slot is replaced.
     let jitdrivers_sd: std::sync::Arc<[majit_metainterp::blackhole::BhJitDriverSd]> = {
         let mut table = driver.meta_interp().staticdata.bh_jitdrivers_sd().to_vec();
+        let orig_vinfo = table
+            .first()
+            .map(|jd| jd.virtualizable_info)
+            .unwrap_or(std::ptr::null());
         let jd0 = majit_metainterp::blackhole::BhJitDriverSd {
             result_type: majit_metainterp::blackhole::BhReturnType::Ref,
             portal_runner_ptr: Some(bh_portal_runner_c),
@@ -3470,6 +3478,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                 .jitdrivers_sd
                 .first()
                 .and_then(|jd| jd.handle_jitexc_from_bh),
+            virtualizable_info: orig_vinfo,
             mainjitcode_calldescr: {
                 // `get_portal_runner` returns this descr paired with
                 // `bh_portal_runner_c`, and the blackhole recursive-portal resume
@@ -6617,6 +6626,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                 guard_exc,
                 guard_driver_has_no_vable(&descr_arc),
                 savedata,
+                None,
             );
             handle_blackhole_result(bh).unwrap_or(0)
         }

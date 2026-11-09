@@ -1545,6 +1545,11 @@ impl<'a> RegAlloc<'a> {
         }
     }
 
+    /// `Aarch64CallBuilder.push_gcmap` / `CallBuilderX86.push_gcmap`:
+    /// `noregs = self.asm.cpu.gc_ll_descr.is_shadow_stack()`. Dynasm always
+    /// installs the shadow-stack root map (`gen_shadowstack_header`).
+    pub(crate) const CALL_PUSH_GCMAP_NOREGS: bool = true;
+
     /// aarch64/regalloc.py get_gcmap.
     pub fn get_gcmap(&self, forbidden_regs: &[RegLoc], noregs: bool) -> *mut usize {
         let frame_depth = self.fm.get_frame_depth();

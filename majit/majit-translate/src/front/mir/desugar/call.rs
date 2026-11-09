@@ -65,6 +65,25 @@ impl<'a> Lowering<'a> {
         if self.try_lower_gcarray_ptr_null(mir_bb, &call, dest_local, target)? {
             return Ok(());
         }
+        // `jit_publish_residual_error` is `rpyexc_raise`: the residual
+        // ABI's garbage result is never read (`exceptiontransform.py`
+        // `transform_jump_to_except_block` returns `error_constant`).
+        // Close the block on `exceptblock` so flatten emits the raise
+        // rather than a residual CALL to an unpublished path hash.
+        if let CallFunc::Regular(reg) = &call.func
+            && regular_call_name_path(reg, self.llbc)
+                .as_deref()
+                .is_some_and(is_residual_error_publisher)
+        {
+            let Some(arg) = call.args.first().cloned() else {
+                return Err(LowerError::Unsupported(
+                    "residual-error publisher with no carrier argument".into(),
+                ));
+            };
+            let carrier = self.resolve_operand(mir_bb, arg)?;
+            crate::front::exc_from_raise::set_raise_from_instance(&mut self.graph, bb_id, carrier);
+            return Ok(());
+        }
         // `null_mut::<T>()` / `null::<T>()` of a Raw pointee is
         // `lltype.nullptr(T)` (`null_raw`). The generic call-result
         // `__cast_instance_intrinsic` tail below would recast a GC
@@ -6106,6 +6125,16 @@ impl<'a> Lowering<'a> {
                 // `name_path()`; the scope predicate keys on the module
                 // path, which the built `CallTarget::Method` drops.
                 callee_name_path = Some(segments.join("::"));
+                if self.try_lower_then_some(
+                    mir_bb,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 if self.try_lower_checked_neg(
                     mir_bb,
                     &reg.kind,

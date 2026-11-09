@@ -437,17 +437,29 @@ pub fn current_eval_fn_addr() -> usize {
 /// Execute a newly-created frame through the process-selected evaluator using
 /// the one-word residual ABI.
 ///
-/// `Function.call_args` calls the frame runner directly. This helper is that
-/// call: `get_eval_fn()` is an indirect call whose family is the registered
+/// `function.py Function.funccall` / `_flat_pycall` / `_flat_pycall_defaults`
+/// return `new_frame.run`; `pyframe.py run` else is `execute_frame(None)`.
+/// pyre's `execute_frame` is the plain evaluator; the JIT-aware runner is
+/// `get_eval_fn`. ResidualRet of `PyResult` is one word, so the result is a
+/// GCREF and the exception rides the pending-error channel (`CALL_MAY_FORCE`).
+/// Looking inside would residualize `get_eval_fn() -> PyResult`.
+///
+/// `get_eval_fn()` is an indirect call whose family is the registered
 /// evaluators (`graphs_from`). `find_all_graphs` follows that family, so
-/// `eval_with_jit` and the rewritten portal stub are in the closure. The
-/// result/exception split stays on the pending-error channel used by the
-/// other bare-`PyObjectRef` call boundaries.
+/// `eval_with_jit` and the rewritten portal stub are in the closure.
+#[majit_macros::dont_look_inside]
 pub fn eval_current_frame_raw(frame: &mut PyFrame) -> PyObjectRef {
     clear_call_error();
     match get_eval_fn()(frame, None) {
         Ok(value) => value,
         Err(error) => {
+            if std::env::var_os("PYRE_JD4_DEBUG").is_some() {
+                eprintln!(
+                    "[evalraw] plain={} frame={:p} err={error}",
+                    is_force_plain_eval(),
+                    frame as *mut PyFrame,
+                );
+            }
             set_call_error(error);
             PY_NULL
         }
@@ -650,6 +662,311 @@ pub fn genentry_body_result_for(w_gen: PyObjectRef) -> Option<Result<PyObjectRef
             return Some(Err(crate::PyError::from_exc_object(word)));
         }
         Some(Ok(word))
+    }
+}
+
+/// jd3 (`listobject.py` `_do_extend_jitdriver`) merge-point hook.
+/// `strategy_type` is the `ListStrategy` discriminant (upstream
+/// `type(w_list.strategy)`); `greenkey` is `iterator_greenkey`; `w_iterator`
+/// and `w_list` are the pinned reds; `i` is the loop-carried append count;
+/// `root_base` is the pinned iterator-slot Int red.
+type ListExtendMergeFn = fn(
+    strategy_type: i64,
+    greenkey: PyObjectRef,
+    w_iterator: PyObjectRef,
+    w_list: PyObjectRef,
+    i: i64,
+    root_base: i64,
+);
+majit_gc::oncelock_fn_static!(static LIST_EXTEND_MERGE_HOOK: OnceLock<ListExtendMergeFn>);
+
+pub fn register_list_extend_merge_hook(f: ListExtendMergeFn) {
+    let _ = LIST_EXTEND_MERGE_HOOK.set(f);
+}
+
+/// Called from `ListExtendJitDriver::jit_merge_point`. No-op until the JIT
+/// installs the hook.
+#[inline]
+pub fn list_extend_merge_point(
+    strategy_type: i64,
+    greenkey: PyObjectRef,
+    w_iterator: PyObjectRef,
+    w_list: PyObjectRef,
+    i: i64,
+    root_base: i64,
+) {
+    if let Some(f) = LIST_EXTEND_MERGE_HOOK.get() {
+        f(strategy_type, greenkey, w_iterator, w_list, i, root_base);
+    }
+}
+
+thread_local! {
+    /// `DoneWithThisFrameInt` analogue for jd3. 0 = fall through into the
+    /// drain body; 1 = compiled append-count parked in [`LIST_EXTEND_COMPILED_I`];
+    /// 2 = compiled exception parked in [`LIST_EXTEND_COMPILED_EXC`]
+    /// (`warmspot.py` `handle_jitexception` / `ExitFrameWithExceptionRef`).
+    static LIST_EXTEND_COMPILED_KIND: Cell<i64> = const { Cell::new(0) };
+    /// Append count parked when [`LIST_EXTEND_COMPILED_KIND`] is 1.
+    static LIST_EXTEND_COMPILED_I: Cell<i64> = const { Cell::new(0) };
+    /// Exception parked when [`LIST_EXTEND_COMPILED_KIND`] is 2.
+    static LIST_EXTEND_COMPILED_EXC: Cell<i64> = const { Cell::new(0) };
+}
+
+/// `warmspot.py` `handle_jitexception` `DoneWithThisFrameInt`: the compiled
+/// `_do_extend_from_iterable` drain finished and returns `i`.
+pub fn park_list_extend_done(i: i64) {
+    LIST_EXTEND_COMPILED_KIND.with(|c| c.set(1));
+    LIST_EXTEND_COMPILED_I.with(|c| c.set(i));
+    LIST_EXTEND_COMPILED_EXC.with(|c| c.set(0));
+}
+
+/// `warmspot.py` `handle_jitexception` `ExitFrameWithExceptionRef`.
+pub fn park_list_extend_err(mut err: crate::PyError) {
+    LIST_EXTEND_COMPILED_KIND.with(|c| c.set(2));
+    LIST_EXTEND_COMPILED_I.with(|c| c.set(0));
+    LIST_EXTEND_COMPILED_EXC.with(|c| c.set(err.to_exc_object() as i64));
+}
+
+/// Int kind parked by a compiled jd3 enter. Clears the slot.
+///
+/// `dont_look_inside`: TLS `.with` is leftover-Unknown to the annotator.
+/// `extern "C"` so `jit_fnaddr.rs` `cp0!` can publish the word ABI.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn list_extend_compiled_kind() -> i64 {
+    LIST_EXTEND_COMPILED_KIND.with(|slot| {
+        let kind = slot.get();
+        slot.set(0);
+        kind
+    })
+}
+
+/// Append count parked when [`list_extend_compiled_kind`] was 1. Clears the slot.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn list_extend_compiled_i() -> i64 {
+    LIST_EXTEND_COMPILED_I.with(|slot| {
+        let i = slot.get();
+        slot.set(0);
+        i
+    })
+}
+
+/// Exception parked when [`list_extend_compiled_kind`] was 2. Clears the
+/// exception slot. `dont_look_inside` so the portal loop has no
+/// `Result<(), PyError>` shell.
+#[majit_macros::dont_look_inside]
+pub fn list_extend_compiled_take_err() -> crate::PyError {
+    let word = LIST_EXTEND_COMPILED_EXC.with(|slot| {
+        let word = slot.get();
+        slot.set(0);
+        word
+    });
+    unsafe { crate::PyError::from_exc_object(word as PyObjectRef) }
+}
+
+/// Shadow-stack root walker for the parked jd3 exception. The object is
+/// reachable from nothing else between the merge-point hook and the
+/// portal's kind check, and compilation in the hook can collect.
+pub fn walk_list_extend_compiled_exc(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    LIST_EXTEND_COMPILED_EXC.with(|slot| unsafe {
+        crate::eval::walk_raw_exception_cell_area(slot as *const _, visitor)
+    });
+}
+
+/// Address of this thread's parked-exception cell, for the per-mutator
+/// `PyFrameRootArea` (`rthread.py` `_trace_tlref`).
+pub(crate) fn capture_list_extend_compiled_exc_area() -> *const Cell<i64> {
+    LIST_EXTEND_COMPILED_EXC.with(|slot| slot as *const _)
+}
+
+/// `warmspot.py rewrite_jit_merge_point` for `_do_extend_jitdriver`.
+type ListExtendPortalRunnerFn =
+    fn(PyObjectRef, PyObjectRef, PyObjectRef) -> Result<i64, crate::PyError>;
+majit_gc::oncelock_fn_static!(static LIST_EXTEND_PORTAL_RUNNER_HOOK: OnceLock<ListExtendPortalRunnerFn>);
+
+pub fn register_list_extend_portal_runner_hook(f: ListExtendPortalRunnerFn) {
+    let _ = LIST_EXTEND_PORTAL_RUNNER_HOOK.set(f);
+}
+
+/// `warmspot.py ll_portal_runner` for `_do_extend_jitdriver`. Falls back to
+/// [`crate::type_methods::list_extend_portal`] when the JIT has not installed
+/// a runner.
+#[inline]
+pub fn list_extend_portal_runner(
+    greenkey: PyObjectRef,
+    w_iterator: PyObjectRef,
+    w_list: PyObjectRef,
+) -> Result<i64, crate::PyError> {
+    match LIST_EXTEND_PORTAL_RUNNER_HOOK.get() {
+        Some(f) => f(greenkey, w_iterator, w_list),
+        None => crate::type_methods::list_extend_portal(greenkey, w_iterator, w_list),
+    }
+}
+
+/// jd4 (`functional.py` `filter_jitdriver`) merge-point hook.
+/// `reverse` is the Int green (0 for `filter`, 1 for `filterfalse`);
+/// `callable_greenkey` is `_try_fetch_pycode` or `type(predicate)`;
+/// `greenkey` is `iterator_greenkey`; `w_iterable` and `w_predicate` are
+/// the pinned reds; `root_base` is the pinned iterator-slot Int red.
+///
+/// The hook still returns `Option<PyResult>` (`DoneWithThisFrameRef` /
+/// `ExitFrameWithExceptionRef` in `warmspot.py` `ll_portal_runner`). The
+/// marker itself is Void (`rlib/jit.py`
+/// `ext_enter_leave_marker_compute_result_annotation` → `s_None`;
+/// `extregistry.py` `hop.genop('jit_marker', ..., resulttype=lltype.Void)`),
+/// so [`filter_merge_point`] parks the Option and the portal reads it as
+/// an Int kind after the marker. An Option result on the marker inside
+/// the portal loop is leftover-Unknown to the rtyper.
+type FilterMergeFn = fn(
+    reverse: i64,
+    callable_greenkey: PyObjectRef,
+    greenkey: PyObjectRef,
+    w_iterable: PyObjectRef,
+    w_predicate: PyObjectRef,
+    root_base: i64,
+) -> Option<Result<PyObjectRef, crate::PyError>>;
+majit_gc::oncelock_fn_static!(static FILTER_MERGE_HOOK: OnceLock<FilterMergeFn>);
+
+pub fn register_filter_merge_hook(f: FilterMergeFn) {
+    let _ = FILTER_MERGE_HOOK.set(f);
+}
+
+thread_local! {
+    /// `DoneWithThisFrameRef` analogue for jd4. 0 = fall through into the
+    /// skip body; 1 = compiled match parked in [`FILTER_COMPILED_OBJ`];
+    /// 2 = compiled exception parked in [`FILTER_COMPILED_OBJ`]
+    /// (`warmspot.py` `ExitFrameWithExceptionRef`).
+    static FILTER_COMPILED_KIND: Cell<i64> = const { Cell::new(0) };
+    /// Matching object parked when [`FILTER_COMPILED_KIND`] is 1.
+    static FILTER_COMPILED_OBJ: Cell<i64> = const { Cell::new(0) };
+}
+
+/// Called from `FilterJitDriver::jit_merge_point`. Void, matching RPython
+/// `jit_marker`. The JIT hook's Option is parked for
+/// [`filter_compiled_kind`] / [`filter_compiled_obj`].
+///
+/// `dont_look_inside`: the TLS `.with` reads have no extractable graph
+/// (`stack_check.rs` `TL_JIT_PENDING_EXCEPTION`).
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn filter_merge_point(
+    reverse: i64,
+    callable_greenkey: PyObjectRef,
+    greenkey: PyObjectRef,
+    w_iterable: PyObjectRef,
+    w_predicate: PyObjectRef,
+    root_base: i64,
+) {
+    let parked = FILTER_MERGE_HOOK.get().and_then(|f| {
+        f(
+            reverse,
+            callable_greenkey,
+            greenkey,
+            w_iterable,
+            w_predicate,
+            root_base,
+        )
+    });
+    match parked {
+        None => {
+            FILTER_COMPILED_KIND.with(|c| c.set(0));
+            FILTER_COMPILED_OBJ.with(|c| c.set(0));
+        }
+        Some(Ok(obj)) => {
+            FILTER_COMPILED_KIND.with(|c| c.set(1));
+            FILTER_COMPILED_OBJ.with(|c| c.set(obj as i64));
+        }
+        Some(Err(mut err)) => {
+            FILTER_COMPILED_KIND.with(|c| c.set(2));
+            FILTER_COMPILED_OBJ.with(|c| c.set(err.to_exc_object() as i64));
+        }
+    }
+}
+
+/// Int kind parked by [`filter_merge_point`]. Clears the slot.
+///
+/// `dont_look_inside`: TLS `.with` is leftover-Unknown to the annotator.
+/// `extern "C"` so `jit_fnaddr.rs` `cp0!` can publish the word ABI.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn filter_compiled_kind() -> i64 {
+    FILTER_COMPILED_KIND.with(|slot| {
+        let kind = slot.get();
+        slot.set(0);
+        kind
+    })
+}
+
+/// Matching object parked when [`filter_compiled_kind`] was 1. Clears the slot.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn filter_compiled_obj() -> PyObjectRef {
+    FILTER_COMPILED_OBJ.with(|slot| {
+        let obj = slot.get();
+        slot.set(0);
+        obj as PyObjectRef
+    })
+}
+
+/// Exception parked when [`filter_compiled_kind`] was 2. Clears the object
+/// slot. `dont_look_inside` so the portal loop has no `Result<(), PyError>`
+/// shell (`unpackiterable` host-boundary `drain_jit_pending_exception`).
+#[majit_macros::dont_look_inside]
+pub fn filter_compiled_take_err() -> crate::PyError {
+    unsafe { crate::PyError::from_exc_object(filter_compiled_obj()) }
+}
+
+/// Shadow-stack root walker for the parked jd4 match. The object is
+/// reachable from nothing else between the merge-point hook and the
+/// portal's kind check, and compilation in the hook can collect.
+pub fn walk_filter_compiled_obj(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    FILTER_COMPILED_OBJ.with(|slot| unsafe {
+        crate::eval::walk_raw_exception_cell_area(slot as *const _, visitor)
+    });
+}
+
+/// Address of this thread's parked-match cell, for the per-mutator
+/// `PyFrameRootArea` (`rthread.py` `_trace_tlref`).
+pub(crate) fn capture_filter_compiled_area() -> *const Cell<i64> {
+    FILTER_COMPILED_OBJ.with(|slot| slot as *const _)
+}
+
+/// `warmspot.py rewrite_jit_merge_point` for `filter_jitdriver`.
+type FilterPortalRunnerFn = fn(
+    i64,
+    PyObjectRef,
+    PyObjectRef,
+    PyObjectRef,
+    PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError>;
+majit_gc::oncelock_fn_static!(static FILTER_PORTAL_RUNNER_HOOK: OnceLock<FilterPortalRunnerFn>);
+
+pub fn register_filter_portal_runner_hook(f: FilterPortalRunnerFn) {
+    let _ = FILTER_PORTAL_RUNNER_HOOK.set(f);
+}
+
+/// `warmspot.py ll_portal_runner` for `filter_jitdriver`. Falls back to
+/// [`crate::filter_jitdriver_portal`] when the JIT has not installed a runner.
+#[inline]
+pub fn filter_portal_runner(
+    reverse: i64,
+    callable_greenkey: PyObjectRef,
+    greenkey: PyObjectRef,
+    w_iterable: PyObjectRef,
+    w_predicate: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    match FILTER_PORTAL_RUNNER_HOOK.get() {
+        Some(f) => f(
+            reverse,
+            callable_greenkey,
+            greenkey,
+            w_iterable,
+            w_predicate,
+        ),
+        None => crate::filter_jitdriver_portal(
+            reverse,
+            callable_greenkey,
+            greenkey,
+            w_iterable,
+            w_predicate,
+        ),
     }
 }
 
@@ -4971,6 +5288,55 @@ pub fn call_function_impl_result(
     Err(not_callable_error(_roots.get(root_base)))
 }
 
+/// `baseobjspace.py call_function` specialized at `nargs == 1`.
+///
+/// RPython specialises `*args_w` per call-site arity (`len(args_w)` is
+/// constant in each specialised graph), so that graph has no loop and
+/// `policy.py look_inside_graph` keeps it in the candidate set. The
+/// slice form [`call_function_impl_result`] carries `for i in 0..args.len()`
+/// and is residual (`contains_loop`). `_filter_jitdriver` calls
+/// `space.call_function(w_predicate, w_obj)` — this is that specialised
+/// graph.
+///
+/// Speedhack arms match `call_function` at `nargs < 5`: `_Method` then
+/// `Function.funccall`. Everything else falls through to the residual
+/// unspecialised dispatcher.
+///
+/// `unroll_safe`: RPython's specialised graph stores the two incoming
+/// refs as unrolled `gc_push_roots` writes. rustc may inline
+/// `RootScope.pin_roots` of that two-word slice as a two-iteration
+/// loop; the hint is `policy.py look_inside_graph` clearing
+/// `contains_loop` for the same stores.
+#[majit_macros::unroll_safe]
+pub fn call_function_1(w_func: PyObjectRef, w_arg: PyObjectRef) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = _roots.pin_roots(&[w_func, w_arg]);
+    crate::stack_check::drain_jit_pending_exception()?;
+    let w_func = _roots.get(root_base);
+    let w_arg = _roots.get(root_base + 1);
+    unsafe {
+        if pyre_object::is_method(w_func) {
+            let func = pyre_object::w_method_get_func(w_func);
+            if crate::is_function_carrier(func) {
+                let w_self = pyre_object::w_method_get_self(w_func);
+                let receiver = if !w_self.is_null() {
+                    w_self
+                } else {
+                    pyre_object::w_method_get_class(w_func)
+                };
+                if receiver.is_null() {
+                    return crate::function::funccall_result(func, &[w_arg]);
+                }
+                return crate::function::funccall_result(func, &[receiver, w_arg]);
+            }
+        }
+        if crate::is_function_carrier(w_func) {
+            return crate::function::funccall_result(w_func, &[w_arg]);
+        }
+    }
+    call_function_impl_result(w_func, &[w_arg])
+}
+
 /// CPython: typeobject.c calculate_metaclass
 pub(crate) fn calculate_metaclass(
     mut w_winner: PyObjectRef,
@@ -7402,15 +7768,17 @@ fn build_class_inner(
     let w_globals = unsafe { function_get_globals_obj(body_fn) };
     let closure = unsafe { function_get_closure(body_fn) };
 
-    let mut frame =
-        crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code as *const (),
-            &[],
-            w_globals,
-            exec_ctx,
-            closure,
-            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        )?)?;
+    let w_frame = PyFrame::try_createframe(
+        w_code as *const (),
+        w_globals,
+        exec_ctx,
+        closure,
+        crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
+    );
+    if w_frame.is_null() {
+        return Err(crate::runtime_ops::fetch_memory_error());
+    }
+    let mut frame = crate::framebox_from_w_root!(w_frame);
     // compiling.py `build_class`: `frame.setdictscope(w_namespace)` then
     // `frame.run()`.  The body executes against a namespace OBJECT so
     // STORE_NAME / LOAD_NAME route through the object form, not the raw

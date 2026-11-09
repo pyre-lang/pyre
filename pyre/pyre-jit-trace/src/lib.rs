@@ -149,6 +149,8 @@ pub mod state;
 pub mod super_inst_expand;
 mod trace_opcode;
 
+pub mod extend_state;
+pub mod filter_state;
 pub mod genentry_state;
 #[cfg(test)]
 mod ullbc_semantic;

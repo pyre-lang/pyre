@@ -141,6 +141,7 @@ fn load_jitcode(index: usize) -> Arc<JitCode> {
     ));
     crate::runtime_fnaddr_patch::materialize_type_static_consts(std::slice::from_mut(&mut jitcode));
     crate::runtime_fnaddr_patch::materialize_empty_array_consts(std::slice::from_mut(&mut jitcode));
+    dump_jd3_typecheck_jitcode(&jitcode);
     // RPython codewriter.py:80: `all_jitcodes[jitcode.index] is jitcode`.
     // Check per entry so any regression in
     // `collect_jitcodes_in_alloc_order` is caught immediately.
@@ -152,6 +153,50 @@ fn load_jitcode(index: usize) -> Arc<JitCode> {
         jitcode.index(),
     );
     jitcode
+}
+
+fn dump_jd3_typecheck_jitcode(jitcode: &JitCode) {
+    static WANT: OnceLock<bool> = OnceLock::new();
+    if !WANT.get_or_init(|| std::env::var_os("PYRE_JD3_DEBUG").is_some()) {
+        return;
+    }
+    if !matches!(
+        jitcode.name.as_str(),
+        "is_list_iter"
+            | "is_dict_view_iterator"
+            | "py_type_check"
+            | "is_range_iter"
+            | "is_range_iter_one_arg"
+    ) {
+        return;
+    }
+    let Some(body) = jitcode.try_body() else {
+        return;
+    };
+    let consts_r: Vec<i64> = body.constants_r.iter().map(|c| c.get()).collect();
+    eprintln!(
+        "[jd3dump-jc] {} constants_i={:x?} constants_r={:x?} reloc_i={:?} reloc_r={:?} type_static={:?} LIST_ITER={:x} RANGE_ONE={:x} DICT_ITEM={:x}",
+        jitcode.name,
+        body.constants_i,
+        consts_r,
+        body.reloc_consts_i,
+        body.reloc_consts_r,
+        body.type_static_consts,
+        std::ptr::from_ref(&pyre_object::iterobject::LIST_ITER_TYPE) as u64,
+        std::ptr::from_ref(&pyre_object::functional::RANGE_ITER_ONE_ARG_TYPE) as u64,
+        std::ptr::from_ref(&pyre_object::dictmultiobject::DICT_ITEMITERATOR_TYPE) as u64,
+    );
+    for op in decoded_ops(&body.code) {
+        let operands = if op.next_pc > op.pc + 1 {
+            &body.code[op.pc + 1..op.next_pc]
+        } else {
+            &[]
+        };
+        eprintln!(
+            "[jd3dump-jc] {} pc={} {} /{} operands={:?}",
+            jitcode.name, op.pc, op.opname, op.argcodes, operands
+        );
+    }
 }
 
 pub(crate) fn get_jitcode_ref_by_index(index: usize) -> Option<&'static Arc<JitCode>> {
@@ -2014,6 +2059,12 @@ fn register_struct_tid_now(size: usize, offsets: Vec<usize>) -> u32 {
         return 0;
     }
     majit_gc::gc_sync::gc_op(|gc| {
+        if let Some(tid) = gc.types.find_fixed_type(size, &offsets) {
+            return tid;
+        }
+        if gc.types.is_frozen() {
+            return 0;
+        }
         gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(size, offsets))
     })
 }

@@ -17605,6 +17605,29 @@ pub fn iterator_greenkey(w_iterable: PyObjectRef) -> PyObjectRef {
     crate::typedef::r#type(w_iterable).map_or(pyre_object::PY_NULL, |p| p.as_ptr())
 }
 
+/// `baseobjspace.py` `_try_fetch_pycode`.
+///
+/// Unwrap a bound `_Method` to its `w_function`, then if that is a
+/// `Function` (including `FunctionWithFixedCode` / `BuiltinFunction`)
+/// return `.code`. Anything else is `PY_NULL`.
+pub fn try_fetch_pycode(w_func: PyObjectRef) -> PyObjectRef {
+    if w_func.is_null() {
+        return pyre_object::PY_NULL;
+    }
+    unsafe {
+        let w_func = if pyre_object::function::is_method(w_func) {
+            pyre_object::function::w_method_get_func(w_func)
+        } else {
+            w_func
+        };
+        if crate::function::is_function(w_func) {
+            crate::function::getcode(w_func)
+        } else {
+            pyre_object::PY_NULL
+        }
+    }
+}
+
 /// pypy/interpreter/baseobjspace.py:29-32
 /// `unpackiterable_driver = JitDriver(greens=['greenkey'], reds='auto',
 /// name='unpackiterable')`.
@@ -17659,6 +17682,167 @@ impl GeneratorEntryJitDriver {
 
 #[allow(non_upper_case_globals)]
 const generatorentry_driver: GeneratorEntryJitDriver = GeneratorEntryJitDriver;
+
+/// `functional.py` `filter_jitdriver` — greens=`['reverse', 'callable_greenkey', 'greenkey']`,
+/// reds=`'auto'`, name=`filter`.
+struct FilterJitDriver;
+
+impl FilterJitDriver {
+    /// `functional.py` `_filter_jitdriver`
+    /// `filter_jitdriver.jit_merge_point(reverse=..., callable_greenkey=..., greenkey=...)`.
+    ///
+    /// Void, matching RPython `jit_marker` (`extregistry.py`
+    /// `hop.genop(..., resulttype=lltype.Void)`). Greens come first, then
+    /// the live reds `w_iterable`, `w_predicate`, and the pinned
+    /// iterator-slot Int. A compiled finish is parked as an Int kind
+    /// (`call.rs` `filter_compiled_kind`) rather than returned from this
+    /// marker: an Option result here is leftover-Unknown as a loop phi.
+    #[inline]
+    fn jit_merge_point(
+        &self,
+        reverse: i64,
+        callable_greenkey: PyObjectRef,
+        greenkey: PyObjectRef,
+        w_iterable: PyObjectRef,
+        w_predicate: PyObjectRef,
+        root_base: i64,
+    ) {
+        crate::call::filter_merge_point(
+            reverse,
+            callable_greenkey,
+            greenkey,
+            w_iterable,
+            w_predicate,
+            root_base,
+        )
+    }
+}
+
+#[allow(non_upper_case_globals)]
+const filter_driver: FilterJitDriver = FilterJitDriver;
+
+/// `functional.py` `_filter_jitdriver` prologue: compute the greens and
+/// enter the split portal (`warmspot.py rewrite_jit_merge_point` →
+/// `portal_runner`).
+///
+/// `dont_look_inside`: `W_Filter.next_w` unrolls one iteration then *calls*
+/// `_filter_jitdriver`. Inlining this portal into a parent Python trace
+/// puts the search loop's GCREFs on that trace's JITFRAME (`gcmap` slot
+/// at byte 320 was a nursery-BAD after `filterfalse_hold` then
+/// `takewhile_hold`). The filter driver still traces
+/// `filter_jitdriver_portal_portal`.
+#[majit_macros::dont_look_inside]
+fn filter_jitdriver(w_iterable: PyObjectRef, w_predicate: PyObjectRef, reverse: bool) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::pin_roots(&[w_iterable, w_predicate]);
+    let w_predicate = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+    let callable_greenkey = if w_predicate.is_null() {
+        pyre_object::PY_NULL
+    } else {
+        let code = try_fetch_pycode(w_predicate);
+        if code.is_null() {
+            crate::typedef::r#type(w_predicate).map_or(pyre_object::PY_NULL, |p| p.as_ptr())
+        } else {
+            code
+        }
+    };
+    let _ = pyre_object::gc_roots::pin_root(callable_greenkey);
+    let callable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let greenkey = iterator_greenkey(pyre_object::gc_roots::shadow_stack_get(root_base));
+    crate::call::filter_portal_runner(
+        i64::from(reverse),
+        pyre_object::gc_roots::shadow_stack_get(callable_slot),
+        greenkey,
+        pyre_object::gc_roots::shadow_stack_get(root_base),
+        pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+    )
+}
+
+/// Word ABI for [`filter_jitdriver`]. `W_Filter.next_w` calls
+/// `_filter_jitdriver`; `PyResult` is not ResidualRet. `jit_may_force`
+/// residualizes the portal so a parent Python trace does not inline the
+/// search loop (`warmspot.py rewrite_jit_merge_point` → `portal_runner`).
+#[majit_macros::jit_may_force]
+pub extern "C" fn filter_jitdriver_jit_abi(
+    w_iterable: PyObjectRef,
+    w_predicate: PyObjectRef,
+    reverse: i64,
+) -> PyObjectRef {
+    match filter_jitdriver(w_iterable, w_predicate, reverse != 0) {
+        Ok(obj) => obj,
+        Err(err) => {
+            crate::call::set_call_error(err.clone());
+            crate::runtime_ops::jit_publish_residual_error_ref(err)
+        }
+    }
+}
+
+/// Split-portal body of `_filter_jitdriver`: the loop that starts at
+/// `jit_merge_point`. Pin order `[w_iterable, w_predicate, callable_greenkey,
+/// greenkey]`. `pred_slot` is the pinned predicate so the merge-point reds
+/// stay Int slots, matching `_do_extend_jitdriver`.
+///
+/// `functional.py` `_filter_jitdriver` returns the first object for which
+/// `pred ^ reverse`; `space.next` StopIteration propagates.
+pub fn filter_jitdriver_portal(
+    reverse: i64,
+    callable_greenkey: PyObjectRef,
+    greenkey: PyObjectRef,
+    w_iterable: PyObjectRef,
+    w_predicate: PyObjectRef,
+) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base =
+        pyre_object::gc_roots::pin_roots(&[w_iterable, w_predicate, callable_greenkey, greenkey])
+            as i64;
+    let pred_slot = root_base + 1;
+    loop {
+        filter_driver.jit_merge_point(
+            reverse,
+            pyre_object::gc_roots::shadow_stack_get((root_base + 2) as usize),
+            pyre_object::gc_roots::shadow_stack_get((root_base + 3) as usize),
+            pyre_object::gc_roots::shadow_stack_get(root_base as usize),
+            pyre_object::gc_roots::shadow_stack_get(pred_slot as usize),
+            root_base,
+        );
+        // `warmspot.py` `DoneWithThisFrameRef` / `ExitFrameWithExceptionRef`
+        // analogue: the marker is Void, so a compiled match is an Int kind
+        // parked by `filter_merge_point`. Extra residual vs PyPy; the
+        // helpers are `dont_look_inside` so the annotator sees i64.
+        let kind = crate::call::filter_compiled_kind();
+        if kind == 1 {
+            return Ok(crate::call::filter_compiled_obj());
+        }
+        if kind == 2 {
+            return Err(crate::call::filter_compiled_take_err());
+        }
+        let w_obj = next(pyre_object::gc_roots::shadow_stack_get(root_base as usize))?;
+        let _item_roots = pyre_object::gc_roots::push_roots();
+        let _ = pyre_object::gc_roots::pin_root(w_obj);
+        let w_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_predicate = pyre_object::gc_roots::shadow_stack_get(pred_slot as usize);
+        let pred = if w_predicate.is_null() {
+            is_true(pyre_object::gc_roots::shadow_stack_get(w_obj_slot))?
+        } else {
+            let _ = pyre_object::gc_roots::pin_root(w_predicate);
+            let predicate_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            // `baseobjspace.py call_function(w_predicate, w_obj)`: RPython
+            // specialises `*args_w` at `nargs == 1`. The slice dispatcher
+            // is residual (`contains_loop`); this specialised graph is
+            // look_inside (`funccall` / `funccall_flat_from_args`).
+            let w_pred = crate::call::call_function_1(
+                pyre_object::gc_roots::shadow_stack_get(predicate_slot),
+                pyre_object::gc_roots::shadow_stack_get(w_obj_slot),
+            )?;
+            let _ = pyre_object::gc_roots::pin_root(w_pred);
+            let pred_result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            is_true(pyre_object::gc_roots::shadow_stack_get(pred_result_slot))?
+        };
+        if pred ^ (reverse != 0) {
+            return Ok(pyre_object::gc_roots::shadow_stack_get(w_obj_slot));
+        }
+    }
+}
 
 /// pypy/interpreter/generator.py `_create_unpack_into` body.
 ///
@@ -20916,60 +21100,9 @@ pub(crate) fn dropwhile_next_w(obj: PyObjectRef) -> PyResult {
 
 /// interp_itertools.py W_FilterFalse.next_w.
 pub(crate) fn filterfalse_next_w(obj: PyObjectRef) -> PyResult {
-    unsafe {
-        // itertools.filterfalse — W_Filter.next_w (functional.py) with
-        // reverse=True; the trailing _filter_jitdriver loop applies the
-        // same predicate test until an element passes.
-        //
-        //     def next_w(self):
-        //         w_obj = self.space.next(self.w_iterable)  # may raise w_StopIteration
-        //         if self.w_predicate is None:
-        //             pred = self.space.is_true(w_obj)
-        //         else:
-        //             w_pred = self.space.call_function(self.w_predicate, w_obj)
-        //             pred = self.space.is_true(w_pred)
-        //         if pred ^ self.reverse:
-        //             return w_obj
-
-        // `W_Filter.next_w` with `reverse=True`. Pin the filterfalse and
-        // the yielded item across `next` / the predicate / `is_true`.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let _ = pyre_object::gc_roots::pin_root(obj);
-        let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        loop {
-            let w_iterable = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
-                as *const pyre_object::interp_itertools::W_FilterFalse))
-                .w_iterable;
-            let w_obj = {
-                let _iter_roots = pyre_object::gc_roots::push_roots();
-                let _ = pyre_object::gc_roots::pin_root(w_iterable);
-                let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                next(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?
-            };
-            let _r = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(w_obj);
-            let w_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            let w_predicate = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
-                as *const pyre_object::interp_itertools::W_FilterFalse))
-                .w_predicate;
-            let pred = if w_predicate.is_null() {
-                is_true(pyre_object::gc_roots::shadow_stack_get(w_obj_slot))?
-            } else {
-                let _ = pyre_object::gc_roots::pin_root(w_predicate);
-                let predicate_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                let w_pred = crate::call::call_function_impl_result(
-                    pyre_object::gc_roots::shadow_stack_get(predicate_slot),
-                    &[pyre_object::gc_roots::shadow_stack_get(w_obj_slot)],
-                )?;
-                let _ = pyre_object::gc_roots::pin_root(w_pred);
-                let pred_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                is_true(pyre_object::gc_roots::shadow_stack_get(pred_slot))?
-            };
-            if !pred {
-                return Ok(pyre_object::gc_roots::shadow_stack_get(w_obj_slot));
-            }
-        }
-    }
+    // `W_FilterFalse` is `W_Filter` with `reverse = True`
+    // (`interp_itertools.py`); the two Rust types share fields.
+    filter_next_unroll(obj, true)
 }
 
 /// interp_itertools.py W_ISlice.next_w.
@@ -22007,59 +22140,77 @@ pub(crate) fn zip_longest_next_w(obj: PyObjectRef) -> PyResult {
 
 /// functional.py W_Filter.next_w.
 pub(crate) fn filter_next_w(obj: PyObjectRef) -> PyResult {
-    unsafe {
-        // `pypy/module/__builtin__/functional.py W_Filter.next_w`
-        // (reverse=False): pull from the iterator until the predicate (or
-        // truthiness, when None) passes.
-        //
-        //     def next_w(self):
-        //         w_obj = self.space.next(self.w_iterable)  # may raise w_StopIteration
-        //         if self.w_predicate is None:
-        //             pred = self.space.is_true(w_obj)
-        //         else:
-        //             w_pred = self.space.call_function(self.w_predicate, w_obj)
-        //             pred = self.space.is_true(w_pred)
-        //         if pred ^ self.reverse:
-        //             return w_obj
+    // `functional.py` `W_Filter.next_w` (`reverse = False`).
+    filter_next_unroll(obj, false)
+}
 
-        // `next`, the predicate, and `is_true`/`__bool__` all run Python and
-        // can move the filter and the yielded item; pin the filter and re-read
-        // its fields after each call, and pin the item across the predicate.
+/// `functional.py` `W_Filter.next_w`: unroll one iteration, then
+/// `_filter_jitdriver` when that item does not pass `pred ^ reverse`.
+fn filter_next_unroll(obj: PyObjectRef, reverse: bool) -> PyResult {
+    unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        loop {
-            let w_iterable = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
-                as *const pyre_object::functional::W_Filter))
-                .w_iterable;
-            let w_obj = {
-                let _iter_roots = pyre_object::gc_roots::push_roots();
-                let _ = pyre_object::gc_roots::pin_root(w_iterable);
-                let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                next(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?
-            };
-            let _r = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(w_obj);
-            let w_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            let w_predicate = (*(pyre_object::gc_roots::shadow_stack_get(obj_slot)
-                as *const pyre_object::functional::W_Filter))
-                .w_predicate;
-            let pred = if w_predicate.is_null() {
-                is_true(pyre_object::gc_roots::shadow_stack_get(w_obj_slot))?
-            } else {
-                let _ = pyre_object::gc_roots::pin_root(w_predicate);
-                let predicate_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                let w_pred = crate::call::call_function_impl_result(
-                    pyre_object::gc_roots::shadow_stack_get(predicate_slot),
-                    &[pyre_object::gc_roots::shadow_stack_get(w_obj_slot)],
-                )?;
-                let _ = pyre_object::gc_roots::pin_root(w_pred);
-                let pred_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                is_true(pyre_object::gc_roots::shadow_stack_get(pred_slot))?
-            };
-            if pred {
-                return Ok(pyre_object::gc_roots::shadow_stack_get(w_obj_slot));
-            }
+        let (w_predicate, w_iterable) =
+            filter_owner_fields(pyre_object::gc_roots::shadow_stack_get(obj_slot), reverse);
+        let w_obj = {
+            let _iter_roots = pyre_object::gc_roots::push_roots();
+            let _ = pyre_object::gc_roots::pin_root(w_iterable);
+            let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            next(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?
+        };
+        let _r = pyre_object::gc_roots::push_roots();
+        let _ = pyre_object::gc_roots::pin_root(w_obj);
+        let w_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_predicate =
+            filter_owner_fields(pyre_object::gc_roots::shadow_stack_get(obj_slot), reverse).0;
+        let pred = if w_predicate.is_null() {
+            is_true(pyre_object::gc_roots::shadow_stack_get(w_obj_slot))?
+        } else {
+            let _ = pyre_object::gc_roots::pin_root(w_predicate);
+            let predicate_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            // `baseobjspace.py call_function(w_predicate, w_obj)`: RPython
+            // specialises `*args_w` at `nargs == 1`. The slice dispatcher
+            // is residual (`contains_loop`); this specialised graph is
+            // look_inside (`funccall` / `funccall_flat_from_args`).
+            let w_pred = crate::call::call_function_1(
+                pyre_object::gc_roots::shadow_stack_get(predicate_slot),
+                pyre_object::gc_roots::shadow_stack_get(w_obj_slot),
+            )?;
+            let _ = pyre_object::gc_roots::pin_root(w_pred);
+            let pred_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            is_true(pyre_object::gc_roots::shadow_stack_get(pred_slot))?
+        };
+        if pred ^ reverse {
+            return Ok(pyre_object::gc_roots::shadow_stack_get(w_obj_slot));
+        }
+        let (w_predicate, w_iterable) =
+            filter_owner_fields(pyre_object::gc_roots::shadow_stack_get(obj_slot), reverse);
+        // `W_Filter.next_w` returns `_filter_jitdriver`. Residual of that
+        // call is the word ABI (`filter_jitdriver_jit_abi`). Null is
+        // `take_call_error` after `set_call_error`, matching
+        // `call_user_function_with_ctx`.
+        let w_found = filter_jitdriver_jit_abi(w_iterable, w_predicate, i64::from(reverse));
+        if w_found.is_null() {
+            let err = crate::call::take_call_error().unwrap_or_else(crate::PyError::stop_iteration);
+            crate::runtime_ops::jit_clear_published_exception();
+            Err(err)
+        } else {
+            Ok(w_found)
+        }
+    }
+}
+
+/// `W_Filter` and `W_FilterFalse` keep the same two fields; pyre uses
+/// distinct types (`interp_itertools.py` subclasses `W_Filter`).
+unsafe fn filter_owner_fields(obj: PyObjectRef, reverse: bool) -> (PyObjectRef, PyObjectRef) {
+    unsafe {
+        if reverse {
+            let state = &*(obj as *const pyre_object::interp_itertools::W_FilterFalse);
+            (state.w_predicate, state.w_iterable)
+        } else {
+            let state = &*(obj as *const pyre_object::functional::W_Filter);
+            (state.w_predicate, state.w_iterable)
         }
     }
 }

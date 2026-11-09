@@ -506,10 +506,12 @@ pub struct GcRewriterImpl {
     /// Upstream has no such twin: `gen_malloc_fixedsize` is reached only by an
     /// oversized NEW there, and an oversized object is non-moving whichever arm
     /// it takes.  pyre reuses the same generator for a descr that demands a
-    /// non-moving address at *any* size — `PYFRAME_DESCR_GROUP.size_descr` is
-    /// the live one — and that demand is not something
-    /// `malloc_big_fixedsize`'s own allocator can answer any more, now that it
-    /// dispatches on size and its small arm is the nursery.
+    /// non-moving address at *any* size — `W_OBJECT_OBJECT_DESCR_GROUP.size_descr`
+    /// is the live old-generation one — and that demand is not something
+    /// `malloc_big_fixedsize`'s own allocator can answer, because that helper
+    /// is `external_malloc(alloc_young=True)`.  A type whose host malloc is
+    /// young-nonmoving (`PYFRAME_DESCR_GROUP.size_descr.young_nonmoving`)
+    /// declines the nursery and takes this helper, not the old-generation twin.
     pub malloc_big_fixedsize_oldgen_fn: i64,
     /// gc.py:45 `self.malloc_array_descr = get_call_descr(...)`.
     pub malloc_array_descr: DescrRef,
@@ -1307,6 +1309,11 @@ impl GcRewriterImpl {
 
     fn handle_new(&self, op: &OpRc, st: &mut RewriteState) {
         let descr_arc = op.getdescr().expect("NEW must have a SizeDescr");
+        // `gc.py init_size_descr` then `handle_new_fixedsize`
+        // `gen_initialize_tid(op, descr.tid)`. A reconstructed
+        // `BhDescr::Size` still carries the STRUCT `cache_key`; stamp
+        // the collector id before the header write.
+        majit_ir::descr::stamp_and_assert_size_tid_for_malloc(&descr_arc, "handle_new");
         let descr = descr_arc
             .as_size_descr()
             .expect("NEW descr must be SizeDescr");
@@ -1317,8 +1324,8 @@ impl GcRewriterImpl {
             // declines goes to `malloc_fixedsize` at the same raw size.
             let size = round_up(descr.size());
             let result_pos = op.pos().get();
-            let obj_ref = if descr.non_moving() {
-                self.gen_malloc_fixedsize(size, descr.type_id(), true, result_pos, st)
+            let obj_ref = if descr.non_moving() || descr.young_nonmoving() {
+                self.gen_malloc_fixedsize(size, descr.type_id(), descr.non_moving(), result_pos, st)
             } else if let Some(r) = self.gen_malloc_nursery(size, result_pos, st) {
                 r
             } else {
@@ -1399,11 +1406,13 @@ impl GcRewriterImpl {
         // CALL_R helper (`malloc_big_fixedsize`) does it inside the
         // helper so `gen_malloc_fixedsize` does NOT call
         // `gen_initialize_tid` after the fact.
-        // A descr marked `non_moving` declines the nursery the same way an
-        // oversized one does, and lands on the same generator; there it picks
-        // `malloc_big_fixedsize_oldgen_fn`, because the upstream helper answers
-        // by size and would put a small non-moving struct in the nursery.
-        let nursery_ref = if descr.non_moving() {
+        // A descr marked `non_moving` or `young_nonmoving` declines the
+        // nursery the same way an oversized one does, and lands on the same
+        // generator. `non_moving` picks `malloc_big_fixedsize_oldgen_fn`
+        // because the young helper would still be a movable nursery bump at
+        // this size; `young_nonmoving` picks `malloc_big_fixedsize_fn`,
+        // `external_malloc(alloc_young=True)`.
+        let nursery_ref = if descr.non_moving() || descr.young_nonmoving() {
             None
         } else {
             self.gen_malloc_nursery(size, op.pos().get(), st)
@@ -1508,6 +1517,12 @@ impl GcRewriterImpl {
     /// is ported below and emits CALL_R + CHECK_MEMORY_ERROR like
     /// rewrite.py:768-846.
     fn handle_new_array(&self, descr_ref: DescrRef, op: &OpRc, st: &mut RewriteState, kind: i64) {
+        // `gc.py init_array_descr` then `malloc_array` `check_typeid`.
+        // A no-identity mint (`arraydescrof_concrete` without ARRAY)
+        // is invisible to `register_unresolved_array_tids`; stamp here
+        // while the GIL is held so path #2 `gen_initialize_tid` does
+        // not bake `UNSET_GC_TYPE_ID`.
+        majit_ir::descr::stamp_and_assert_array_tid_for_malloc(&descr_ref, "handle_new_array");
         let descr = descr_ref
             .as_array_descr()
             .expect("handle_new_array descr must be ArrayDescr");
@@ -1959,8 +1974,8 @@ impl GcRewriterImpl {
     /// `external_malloc(typeid, 0, alloc_young=True)`.  A young object needs no
     /// barrier for a young pointer stored into it.  Both backend helpers now
     /// call that entry point (`dynasm_malloc_big_fixedsize` /
-    /// `gc_malloc_big_fixedsize_helper` → `alloc_nursery_typed`, which is
-    /// `MiniMarkGC::alloc_with_type`), so the stamp is applied.
+    /// `gc_malloc_big_fixedsize_helper` → `alloc_young_nonmoving_typed`), so
+    /// the stamp is applied.
     ///
     /// "This is always true because it's a fixed-size object" is the load-bearing
     /// half of upstream's comment, and it is about cards, not about size.
@@ -3940,6 +3955,7 @@ mod tests {
         w_class: Option<i64>,
         headerless: bool,
         non_moving: bool,
+        young_nonmoving: bool,
         gc_fields: Vec<Arc<dyn FieldDescr>>,
     }
 
@@ -3973,6 +3989,9 @@ mod tests {
         }
         fn non_moving(&self) -> bool {
             self.non_moving
+        }
+        fn young_nonmoving(&self) -> bool {
+            self.young_nonmoving
         }
         fn gc_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
             &self.gc_fields
@@ -4166,6 +4185,7 @@ mod tests {
             w_class: None,
             headerless: false,
             non_moving: false,
+            young_nonmoving: false,
             gc_fields: Vec::new(),
         })
     }
@@ -4186,6 +4206,7 @@ mod tests {
             w_class: None,
             headerless: true,
             non_moving: false,
+            young_nonmoving: false,
             gc_fields,
         })
     }
@@ -4198,6 +4219,20 @@ mod tests {
             w_class: None,
             headerless: false,
             non_moving: true,
+            young_nonmoving: false,
+            gc_fields: Vec::new(),
+        })
+    }
+
+    fn young_nonmoving_size_descr(size: usize, type_id: u32) -> DescrRef {
+        Arc::new(TestSizeDescr {
+            size,
+            type_id,
+            vtable: 0,
+            w_class: None,
+            headerless: false,
+            non_moving: false,
+            young_nonmoving: true,
             gc_fields: Vec::new(),
         })
     }
@@ -4214,6 +4249,7 @@ mod tests {
             w_class: None,
             headerless: false,
             non_moving: false,
+            young_nonmoving: false,
             gc_fields,
         })
     }
@@ -4232,6 +4268,7 @@ mod tests {
             w_class,
             headerless: false,
             non_moving: false,
+            young_nonmoving: false,
             gc_fields,
         })
     }
@@ -4244,6 +4281,7 @@ mod tests {
             w_class: None,
             headerless: false,
             non_moving: false,
+            young_nonmoving: false,
             gc_fields: Vec::new(),
         })
     }
@@ -4389,7 +4427,51 @@ mod tests {
                 .expect("malloc_big_fixedsize fn const"),
             TEST_MALLOC_BIG_FIXEDSIZE_OLDGEN_FN,
             "a non_moving descr takes the old-generation twin: the plain helper \
-             dispatches on size and would nursery-allocate this one"
+             is young-nonmoving and would not give a stable old-gen address"
+        );
+        assert_eq!(
+            result[0]
+                .arg(1)
+                .to_opref()
+                .inline_const_bits()
+                .expect("headered total size const"),
+            round_up(payload_size + crate::header::GcHeader::SIZE) as i64
+        );
+    }
+
+    /// A `young_nonmoving` descr declines the nursery at a size the bump
+    /// path would accept, and takes `malloc_big_fixedsize_fn`
+    /// (`external_malloc(alloc_young=True)`), not the old-generation twin.
+    #[test]
+    fn test_young_nonmoving_new_declines_nursery_at_small_size() {
+        let rw = make_rewriter();
+        let payload_size = 32;
+        let type_id = 37;
+        let ops = vec![Op::with_descr(
+            OpCode::New,
+            &[],
+            young_nonmoving_size_descr(payload_size, type_id),
+        )];
+
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
+
+        assert!(
+            result
+                .iter()
+                .all(|op| op.opcode != OpCode::CallMallocNursery),
+            "a young_nonmoving descr must never reach the nursery bump path"
+        );
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].opcode, OpCode::CallR);
+        assert_eq!(result[1].opcode, OpCode::CheckMemoryError);
+        assert_eq!(
+            result[0]
+                .arg(0)
+                .to_opref()
+                .inline_const_bits()
+                .expect("malloc_big_fixedsize fn const"),
+            TEST_MALLOC_BIG_FIXEDSIZE_FN,
+            "a young_nonmoving descr takes malloc_big_fixedsize_fn, not the old-generation twin"
         );
         assert_eq!(
             result[0]
@@ -6614,6 +6696,43 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![TEST_MALLOC_BIG_FIXEDSIZE_FN],
             "an oversized NEW takes the size-dispatching helper"
+        );
+        assert_eq!(
+            result
+                .iter()
+                .filter(|o| o.opcode == OpCode::CondCallGcWb)
+                .count(),
+            0,
+            "the fresh young object is wb_applied, so the store needs no barrier"
+        );
+    }
+
+    /// A small `young_nonmoving` NEW is the same young helper as an oversized
+    /// one, so the first SETFIELD_GC is not a barrier.
+    #[test]
+    fn test_setfield_gc_after_young_nonmoving_alloc_no_wb() {
+        let rw = make_rewriter();
+        let new_op = Op::with_descr(OpCode::New, &[], young_nonmoving_size_descr(32, 37));
+        new_op.pos().set(OpRef::ref_op(0));
+        let ops = vec![
+            new_op,
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[ro(OpRef::ref_op(0)), ro(OpRef::ref_op(1))],
+                ref_field_descr(),
+            ),
+        ];
+
+        let result = rw.rewrite_ops(&ops);
+
+        assert_eq!(
+            result
+                .iter()
+                .filter(|o| o.opcode == OpCode::CallR)
+                .filter_map(|o| o.arg(0).to_opref().inline_const_bits())
+                .collect::<Vec<_>>(),
+            vec![TEST_MALLOC_BIG_FIXEDSIZE_FN],
+            "a young_nonmoving NEW takes malloc_big_fixedsize_fn"
         );
         assert_eq!(
             result

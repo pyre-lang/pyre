@@ -284,9 +284,11 @@ pub(in crate::front::mir) fn refuse_inlined_struct_field_writes(
     Ok(())
 }
 
-/// Drop `cast_int_to_ptr` of a reference-typed field load. The place type
-/// of the cast is an integer, but the value was loaded as a reference, so
-/// the integer bank does not hold it.
+/// Drop `cast_int_to_ptr` of a reference-typed field load, or of an
+/// erased `FrameBox` / `OwnerRootGuard` / `PyError` word. The place type of
+/// the cast is an integer, but the value is the GCREF (`createframe`'s
+/// `W_Root`, or `OperationError` as the instance), so the integer bank
+/// does not hold it.
 pub(in crate::front::mir) fn fold_int_to_ptr_of_ref_load(
     graph: &mut FunctionGraph,
     guard_words: &std::collections::HashSet<Variable>,
@@ -343,6 +345,9 @@ pub(in crate::front::mir) fn ref_load_root(
     var: &Variable,
     guard_words: &std::collections::HashSet<Variable>,
 ) -> bool {
+    if guard_words.contains(var) {
+        return true;
+    }
     let Some((block_id, idx)) = resolve_to_producer_op(graph, var) else {
         return false;
     };
@@ -354,16 +359,29 @@ pub(in crate::front::mir) fn ref_load_root(
     else {
         return false;
     };
-    matches!(
-        op.kind,
+    match &op.kind {
         OpKind::FieldRead {
             ty: ValueType::Ref(_),
             ..
+        } if op
+            .result
+            .as_ref()
+            .is_some_and(|result| guard_words.contains(result)) =>
+        {
+            true
         }
-    ) && op
-        .result
-        .as_ref()
-        .is_some_and(|result| guard_words.contains(result))
+        OpKind::Input {
+            class_root: Some(root),
+            ty: ValueType::Ref(_),
+            ..
+        } if frame_box::owner_is_frame_box(root) || owner_is_error_carrier(root) => true,
+        OpKind::UnaryOp { op, operand, .. }
+            if matches!(op.as_str(), "same_as" | "int_copy" | "int_same_as") =>
+        {
+            ref_load_root(graph, operand, guard_words)
+        }
+        _ => false,
+    }
 }
 
 /// Whether `target` is `lltype::malloc` / `malloc_typed` / the managed and
